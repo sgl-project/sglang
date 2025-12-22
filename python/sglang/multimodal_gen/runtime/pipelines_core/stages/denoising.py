@@ -64,7 +64,6 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     VerificationResult,
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
-from sglang.multimodal_gen.runtime.platforms.interface import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.perf_logger import StageProfiler
@@ -133,18 +132,10 @@ class DenoisingStage(PipelineStage):
         self.vae = vae
         self.pipeline = weakref.ref(pipeline) if pipeline else None
 
+        # TODO(will): hack, should use the actual one in dit
         self.attn_backend = get_attn_backend(
             head_size=attn_head_size,
-            dtype=torch.float16,  # TODO(will): hack
-            supported_attention_backends={
-                AttentionBackendEnum.SLIDING_TILE_ATTN,
-                AttentionBackendEnum.AITER,
-                AttentionBackendEnum.VIDEO_SPARSE_ATTN,
-                AttentionBackendEnum.VMOBA_ATTN,
-                AttentionBackendEnum.FA,
-                AttentionBackendEnum.TORCH_SDPA,
-                AttentionBackendEnum.SAGE_ATTN_3,
-            },  # hack
+            dtype=torch.float16,
         )
 
         # cfg
@@ -727,6 +718,17 @@ class DenoisingStage(PipelineStage):
         batch.latents = self.server_args.pipeline_config.post_denoising_loop(
             latents, batch
         )
+
+        offload_mgr = getattr(self.transformer, "_layerwise_offload_manager", None)
+        if offload_mgr is not None and getattr(offload_mgr, "enabled", False):
+            offload_mgr.release_all()
+
+        if self.transformer_2 is not None:
+            offload_mgr_2 = getattr(
+                self.transformer_2, "_layerwise_offload_manager", None
+            )
+            if offload_mgr_2 is not None and getattr(offload_mgr_2, "enabled", False):
+                offload_mgr_2.release_all()
 
         # Save STA mask search results if needed
         if (

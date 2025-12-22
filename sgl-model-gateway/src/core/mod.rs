@@ -22,6 +22,7 @@ pub mod worker;
 pub mod worker_builder;
 pub mod worker_manager;
 pub mod worker_registry;
+pub mod worker_service;
 
 pub use circuit_breaker::{
     CircuitBreaker, CircuitBreakerConfig, CircuitBreakerStats, CircuitState,
@@ -38,3 +39,4 @@ pub use worker::{
 pub use worker_builder::{BasicWorkerBuilder, DPAwareWorkerBuilder};
 pub use worker_manager::{LoadMonitor, WorkerManager};
 pub use worker_registry::{WorkerId, WorkerRegistry, WorkerRegistryStats};
+pub use worker_service::{WorkerService, WorkerServiceError};

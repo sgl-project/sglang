@@ -17,7 +17,7 @@ from enum import Enum, auto
 from typing import Any
 
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.multimodal_gen.utils import StoreBoolean, align_to
+from sglang.multimodal_gen.utils import StoreBoolean
 
 logger = init_logger(__name__)
 
@@ -340,7 +340,6 @@ class SamplingParams:
                 self.num_frames = new_num_frames
 
         self._set_output_file_name()
-        self.log(pipeline_config=server_args.pipeline_config)
 
     @classmethod
     def from_pretrained(cls, model_path: str, **kwargs) -> "SamplingParams":
@@ -679,37 +678,6 @@ class SamplingParams:
 
     def output_file_path(self):
         return os.path.join(self.output_path, self.output_file_name)
-
-    def log(self, pipeline_config):
-        # TODO: in some cases (e.g., TI2I), height and weight might be undecided at this moment
-        if self.height:
-            target_height = align_to(self.height, 16)
-        else:
-            target_height = -1
-        if self.width:
-            target_width = align_to(self.width, 16)
-        else:
-            target_width = -1
-
-        # Log sampling parameters
-        debug_str = f"""Sampling params:
-                       width: {target_width}
-                      height: {target_height}
-                  num_frames: {self.num_frames}
-                      prompt: {self.prompt}
-                  neg_prompt: {self.negative_prompt}
-                        seed: {self.seed}
-                 infer_steps: {self.num_inference_steps}
-      num_outputs_per_prompt: {self.num_outputs_per_prompt}
-              guidance_scale: {self.guidance_scale}
-     embedded_guidance_scale: {pipeline_config.embedded_cfg_scale}
-                    n_tokens: {self.n_tokens}
-                  flow_shift: {pipeline_config.flow_shift}
-                  image_path: {self.image_path}
-                 save_output: {self.save_output}
-            output_file_path: {self.output_file_path()}
-        """  # type: ignore[attr-defined]
-        logger.info(debug_str)
 
 
 @dataclass

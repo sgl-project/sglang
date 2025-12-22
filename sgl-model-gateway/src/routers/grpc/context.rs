@@ -368,6 +368,25 @@ impl WorkerSelection {
         }
     }
 
+    /// Record circuit breaker outcome for all workers
+    pub fn record_outcome(&self, success: bool) {
+        match self {
+            Self::Single { worker } => worker.record_outcome(success),
+            Self::Dual { prefill, decode } => {
+                prefill.record_outcome(success);
+                decode.record_outcome(success);
+            }
+        }
+    }
+
+    /// Record circuit breaker outcomes for dual dispatch (individual tracking)
+    pub fn record_dual_outcomes(&self, prefill_success: bool, decode_success: bool) {
+        if let Self::Dual { prefill, decode } = self {
+            prefill.record_outcome(prefill_success);
+            decode.record_outcome(decode_success);
+        }
+    }
+
     #[allow(clippy::type_complexity)]
     pub fn dual(&self) -> Option<(&Arc<dyn Worker>, &Arc<dyn Worker>)> {
         match self {

@@ -14,7 +14,7 @@ High-performance model routing control and data plane for large-scale LLM deploy
 ### Architecture at a Glance
 **Control Plane**
 - Worker Manager validates workers, discovers capabilities, and keeps the registry in sync.
-- Job Queue serializes background operations (add/remove) and exposes status via `/workers/{url}`.
+- Job Queue serializes background operations (add/remove) and exposes status via `/workers/{worker_id}`.
 - Background health checker and load monitor keep circuit breakers and policies informed.
 - Optional Kubernetes service discovery keeps the registry aligned with pods.
 
@@ -30,7 +30,7 @@ High-performance model routing control and data plane for large-scale LLM deploy
 - Multiple load balancing strategies (`random`, `round_robin`, `cache_aware`, `power_of_two`, `bucket`) with DP-aware scheduling.
 - Multi-model HTTP serving and inference gateway routing with model-specific policies.
 - Prefill/decode disaggregation, including bootstrap port handling and cache-aware merging.
-- gRPC routing with fully Rust tokenizer loading, reasoning parser selection, and tool parser integration for OpenAI-compatible endpoints—supporting streaming and non-streaming modes across DeepSeek, Llama, Kimi K2, Qwen, GPT-OSS, Mistral, Step-3, GLM4, and other reasoning-capable models.
+- gRPC routing with fully Rust tokenizer loading, reasoning parser selection, and tool parser integration for OpenAI-compatible endpoints—supporting streaming and non-streaming modes across DeepSeek, Llama, Kimi K2, Qwen, GPT-OSS, Mistral, Step-3, GLM4, GLM4.7 and other reasoning-capable models.
 - OpenAI-compatible `/v1/chat/completions`, `/v1/responses`, `/v1/conversations`, `/v1/embeddings`, and `/v1/rerank` endpoints.
 - Native MCP client integration supporting all MCP transport protocols (STDIO, HTTP, SSE, and Streamable) for tool execution loops.
 - Pluggable history connectors: in-memory, disabled, or Oracle ATP (with pooling and credential support).
@@ -43,6 +43,13 @@ High-performance model routing control and data plane for large-scale LLM deploy
 - Additional guides, API references, and deployment patterns are continuously updated alongside SGLang releases.
 
 ## Installation
+
+### Docker
+Pre-built Docker images are available on Docker Hub with multi-architecture support (x86_64 and ARM64):
+```bash
+docker pull lmsysorg/sgl-model-gateway:latest
+```
+
 ### Prerequisites
 - **Rust and Cargo**
   ```bash
@@ -186,8 +193,8 @@ Sample response (http workers):
 ```json
 {
   "workers": [
-    {"id":"http://0.0.0.0:31378","url":"http://0.0.0.0:31378","model_id":"mistral","priority":50,"cost":1.0,"worker_type":"regular","is_healthy":true,"load":0,"connection_mode":"Http"},
-    {"id":"http://0.0.0.0:34881","url":"http://0.0.0.0:34881","model_id":"llama3","priority":50,"cost":1.0,"worker_type":"regular","is_healthy":true,"load":0,"connection_mode":"Http"}
+    {"id":"2f3a0c3e-3a7b-4c3f-8c70-1b7d4c3a6e1f","url":"http://0.0.0.0:31378","model_id":"mistral","priority":50,"cost":1.0,"worker_type":"regular","is_healthy":true,"load":0,"connection_mode":"Http"},
+    {"id":"9b0f6c2a-1c4f-4c2a-9f4a-1f2a6c0b9d3e","url":"http://0.0.0.0:34881","model_id":"llama3","priority":50,"cost":1.0,"worker_type":"regular","is_healthy":true,"load":0,"connection_mode":"Http"}
   ],
   "total": 2,
   "stats": {
@@ -197,7 +204,7 @@ Sample response (http workers):
   }
 }
 ```
-Add more workers with the same API; include optional `labels` (for per-model policies) or `tokenizer_path` / `reasoning_parser` / `tool_parser` fields as needed. `/workers/{url}` exposes queued job status while background jobs finalize registration.
+Add more workers with the same API; include optional `labels` (for per-model policies) or `tokenizer_path` / `reasoning_parser` / `tool_parser` fields as needed. `/workers/{worker_id}` exposes queued job status while background jobs finalize registration.
 
 ### gRPC Routing
 - **Rust binary**
@@ -217,7 +224,7 @@ Add more workers with the same API; include optional `labels` (for per-model pol
     --port 8080
   ```
 The gRPC router tokenizes inputs locally, supports tool-call parsing, and streams responses. It supports both regular HTTP-equivalent serving and PD (prefill/decode) serving when the worker registry contains PD workers. Provide `--model-path` or `--tokenizer-path` (HuggingFace ID or local directory) whenever connection mode resolves to gRPC.
-Use `--reasoning-parser` to select built-in reasoning pipelines (DeepSeek-R1, Qwen3, Step-3, GLM4, etc.) and `--tool-call-parser` for JSON/Pythonic/XML tool contracts in streaming or non-streaming modes.
+Use `--reasoning-parser` to select built-in reasoning pipelines (DeepSeek-R1, Qwen3, Step-3, GLM4, GLM4.7, etc.) and `--tool-call-parser` for JSON/Pythonic/XML tool contracts in streaming or non-streaming modes.
 
 ### OpenAI Backend Mode
 Route requests to OpenAI or OpenAI-compatible endpoints:
@@ -406,8 +413,9 @@ Use upstream SGLang binaries to start dedicated worker processes.
 |----------|------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------|
 | `POST`   | `/workers`       | Queue worker registration (prefill/decode/regular). Body matches `WorkerConfigRequest`. Returns `202 Accepted` while the job queue processes the request. |
 | `GET`    | `/workers`       | List workers with health, load, policy metadata, and queued job status.                                                                                   |
-| `GET`    | `/workers/{url}` | Inspect a specific worker or job queue entry.                                                                                                             |
-| `DELETE` | `/workers/{url}` | Queue worker removal.                                                                                                                                     |
+| `GET`    | `/workers/{worker_id}` | Inspect a specific worker or job queue entry (UUID).                                                                                                   |
+| `PUT`    | `/workers/{worker_id}` | Queue worker update by UUID.                                                                                                                           |
+| `DELETE` | `/workers/{worker_id}` | Queue worker removal by UUID.                                                                                                                          |
 | `POST`   | `/flush_cache`   | Trigger cache flush across HTTP workers with success/failure breakdown.                                                                                   |
 | `GET`    | `/get_loads`     | Sample current load reported by each worker.                                                                                                              |
 
@@ -448,7 +456,7 @@ The HTTP router exposes the full OpenAI-compatible surface area (`/generate`, `/
 - Industry-first fully Rust implementation of an OpenAI-compatible gRPC inference gateway, including tokenizer, reasoning parser, and tool parser execution in-process for maximum throughput.
 - Supports both single-stage and PD (prefill/decode) worker topologies; the router automatically selects the appropriate pipeline per model.
 - Provides the same `/v1/*` APIs as the HTTP router while streaming tokenized requests/responses directly to SRT gRPC workers.
-- Built-in reasoning parsers for DeepSeek, Qwen, Llama, Mistral, GPT-OSS, Step-3, GLM4, Kimi K2, and other structured-thought models.
+- Built-in reasoning parsers for DeepSeek, Qwen, Llama, Mistral, GPT-OSS, Step-3, GLM4, GLM4.7, Kimi K2, and other structured-thought models.
 - Tool-call parsers for JSON, Pythonic, XML, and custom schemas with streaming and non-streaming execution loops.
 - Tokenizer factory supporting HuggingFace models, local tokenizer.json files, and chat template overrides (see `src/tokenizer`).
 - Explore the code paths in `src/reasoning_parser`, `src/tool_parser`, and `src/tokenizer` for the end-to-end Rust implementations that power gRPC mode.
@@ -616,6 +624,27 @@ cd ../..  # Back to sgl-model-gateway root
 pytest py_test/
 ```
 For production builds, use `maturin build --release --out dist` from the `bindings/python/` directory to create optimized wheels. During development, `maturin develop` rebuilds and installs instantly without creating wheel files. Use `python -m sglang_router.launch_server` to co-launch router and SGLang workers in small clusters for local validation.
+
+### Build Caching
+
+**Local development** uses incremental compilation by default (configured in `.cargo/config.toml`), which is optimal for the edit-compile-test cycle.
+
+**For release builds or CI**, you can optionally use [sccache](https://github.com/mozilla/sccache) to cache compilation artifacts:
+
+```bash
+# Install sccache
+cargo install sccache
+
+# Option 1: Set environment variable (per-session)
+export RUSTC_WRAPPER=sccache
+cargo build --release
+
+# Option 2: Add to your global cargo config (~/.cargo/config.toml)
+# [build]
+# rustc-wrapper = "sccache"
+```
+
+> **Note:** sccache and incremental compilation are mutually exclusive—sccache cannot cache incrementally compiled crates. The project defaults to incremental compilation for faster local iteration. Use sccache for clean/release builds where caching across builds matters more.
 
 ---
 

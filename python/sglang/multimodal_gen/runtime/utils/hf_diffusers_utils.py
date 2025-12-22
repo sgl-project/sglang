@@ -33,10 +33,7 @@ from transformers import AutoConfig, PretrainedConfig
 from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_NAMES
 
 from sglang.multimodal_gen.runtime.loader.weight_utils import get_lock
-from sglang.multimodal_gen.runtime.utils.logging_utils import (
-    init_logger,
-    suppress_other_loggers,
-)
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 _CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = {
@@ -394,10 +391,7 @@ def maybe_download_model(
         logger.info(
             "Downloading model snapshot from HF Hub for %s...", model_name_or_path
         )
-        with (
-            suppress_other_loggers(not_suppress_on_main_rank=False),
-            get_lock(model_name_or_path).acquire(poll_interval=2),
-        ):
+        with get_lock(model_name_or_path).acquire(poll_interval=2):
             local_path = snapshot_download(
                 repo_id=model_name_or_path,
                 ignore_patterns=["*.onnx", "*.msgpack"],
@@ -409,10 +403,7 @@ def maybe_download_model(
                 "Downloaded model at %s is incomplete, retrying with force_download=True",
                 local_path,
             )
-            with (
-                get_lock(model_name_or_path).acquire(poll_interval=2),
-                suppress_other_loggers(not_suppress_on_main_rank=True),
-            ):
+            with get_lock(model_name_or_path).acquire(poll_interval=2):
                 local_path = snapshot_download(
                     repo_id=model_name_or_path,
                     ignore_patterns=["*.onnx", "*.msgpack"],

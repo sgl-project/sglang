@@ -115,10 +115,10 @@ def _video_job_from_sampling(
 
 
 async def _dispatch_job_async(job_id: str, batch: Req) -> None:
-    from sglang.multimodal_gen.runtime.scheduler_client import scheduler_client
+    from sglang.multimodal_gen.runtime.scheduler_client import async_scheduler_client
 
     try:
-        await process_generation_batch(scheduler_client, batch)
+        await process_generation_batch(async_scheduler_client, batch)
         await VIDEO_STORE.update_fields(
             job_id,
             {"status": "completed", "progress": 100, "completed_at": int(time.time())},

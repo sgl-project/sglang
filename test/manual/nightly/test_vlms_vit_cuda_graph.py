@@ -19,6 +19,7 @@ from sglang.test.test_utils import (
 
 MODELS = [
     SimpleNamespace(model="Qwen/Qwen2.5-VL-7B-Instruct", mmmu_accuracy=0.60),
+    SimpleNamespace(model="Qwen/Qwen3-VL-8B-Instruct", mmmu_accuracy=0.60),
 ]
 
 
