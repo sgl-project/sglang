@@ -712,6 +712,7 @@ class DeepseekV2MoE(nn.Module):
                     dict(tp_rank=0, tp_size=1)
                     if get_moe_a2a_backend().is_deepep()
                     or get_moe_a2a_backend().is_mooncake()
+                    or get_moe_a2a_backend().is_flashinfer()
                     or get_moe_a2a_backend().is_ascend_fuseep()
                     or should_use_flashinfer_cutlass_moe_fp4_allgather()
                     else {}
@@ -774,6 +775,7 @@ class DeepseekV2MoE(nn.Module):
         self._enable_a2a_moe = (
             get_moe_a2a_backend().is_deepep()
             or get_moe_a2a_backend().is_mooncake()
+            or get_moe_a2a_backend().is_flashinfer()
             or get_moe_a2a_backend().is_ascend_fuseep()
         )
         self._fuse_shared_experts_inside_sbo = SboFlags.fuse_shared_experts_inside_sbo()
