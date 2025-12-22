@@ -39,6 +39,7 @@ class BaseTestSoftWatchdog:
         cls.stderr.close()
 
     def test_watchdog_triggers(self):
+        print("Start call /generate API", flush=True)
         requests.post(
             DEFAULT_URL_FOR_TEST + "/generate",
             json={
@@ -47,6 +48,7 @@ class BaseTestSoftWatchdog:
             },
             timeout=30,
         )
+        print("End call /generate API", flush=True)
 
         time.sleep(180)
 
