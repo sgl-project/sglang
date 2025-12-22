@@ -457,6 +457,11 @@ def fused_experts_impl(
     intermediate_cache3 = cache[: M * topk * w2.shape[1]].view(
         (M, topk, w2.shape[1]),
     )
+    intermediate_cache2 = torch.empty(
+        (total_tokens, N // 2),
+        device=hidden_states.device,
+        dtype=hidden_states.dtype,
+    )
 
     compute_type = tl.bfloat16 if hidden_states.dtype == torch.bfloat16 else tl.float16
 
@@ -505,11 +510,7 @@ def fused_experts_impl(
         intermediate_cache1 = cache[: total_tokens * N].view(
             (total_tokens, N),
         )
-        intermediate_cache2 = torch.empty(
-            (total_tokens, N // 2),
-            device=hidden_states.device,
-            dtype=hidden_states.dtype,
-        )
+        curr_intermediate_cache2 = intermediate_cache2[:total_tokens]
 
         curr_topk_ids = topk_ids[begin_chunk_idx:end_chunk_idx]
         curr_topk_weights = topk_weights[begin_chunk_idx:end_chunk_idx]
@@ -548,38 +549,38 @@ def fused_experts_impl(
         if activation == "silu" and is_gated:
             if gemm1_alpha is not None:
                 assert gemm1_limit is not None
-                intermediate_cache2 = swiglu_with_alpha_and_limit(
+                curr_intermediate_cache2 = swiglu_with_alpha_and_limit(
                     intermediate_cache1.view(-1, N),
                     gemm1_alpha,
                     gemm1_limit,
                 )
             elif _is_cuda or _is_hip:
-                silu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
+                silu_and_mul(intermediate_cache1.view(-1, N), curr_intermediate_cache2)
             else:
                 vllm_ops.silu_and_mul(
-                    intermediate_cache2, intermediate_cache1.view(-1, N)
+                    curr_intermediate_cache2, intermediate_cache1.view(-1, N)
                 )
         elif activation == "gelu" and is_gated:
             assert gemm1_alpha is None, "gemm1_alpha is not supported for gelu"
             assert gemm1_limit is None, "gemm1_limit is not supported for gelu"
             if _is_cuda or _is_hip:
-                gelu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
+                gelu_and_mul(intermediate_cache1.view(-1, N), curr_intermediate_cache2)
             else:
                 vllm_ops.gelu_and_mul(
-                    intermediate_cache2, intermediate_cache1.view(-1, N)
+                    curr_intermediate_cache2, intermediate_cache1.view(-1, N)
                 )
         # Activation function without multiplication
         elif activation == "silu" and not is_gated:
-            intermediate_cache2 = F.silu(intermediate_cache1.view(-1, N))
+            curr_intermediate_cache2 = F.silu(intermediate_cache1.view(-1, N))
         elif activation == "gelu" and not is_gated:
-            intermediate_cache2 = F.gelu(intermediate_cache1.view(-1, N))
+            curr_intermediate_cache2 = F.gelu(intermediate_cache1.view(-1, N))
         elif activation == "relu2" and not is_gated:
-            intermediate_cache2 = torch.square(F.relu(intermediate_cache1.view(-1, N)))
+            curr_intermediate_cache2 = torch.square(F.relu(intermediate_cache1.view(-1, N)))
         else:
             raise ValueError(f"Unsupported activation: {activation=}, with {is_gated=}")
 
         invoke_fused_moe_kernel(
-            intermediate_cache2,
+            curr_intermediate_cache2,
             w2,
             b2,
             (
