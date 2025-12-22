@@ -16,16 +16,19 @@ use crate::protocols::{
     completion::CompletionRequest,
     embedding::EmbeddingRequest,
     generate::GenerateRequest,
+    parser::{ParseFunctionCallRequest, SeparateReasoningRequest},
     rerank::RerankRequest,
     responses::{ResponsesGetParams, ResponsesRequest},
 };
 
 pub mod conversations;
+pub mod error;
 pub mod factory;
 pub mod grpc;
 pub mod header_utils;
 pub mod http;
 pub mod openai;
+pub mod parse;
 pub mod router_manager;
 
 pub use factory::RouterFactory;
@@ -188,6 +191,16 @@ pub trait RouterTrait: Send + Sync + Debug {
         _model_id: Option<&str>,
     ) -> Response {
         (StatusCode::NOT_IMPLEMENTED, "Rerank not implemented").into_response()
+    }
+
+    /// Parse function calls from text
+    async fn parse_function_call(&self, req: &ParseFunctionCallRequest) -> Response {
+        parse::parse_function_call(None, req).await
+    }
+
+    /// Separate reasoning from normal text
+    async fn parse_reasoning(&self, req: &SeparateReasoningRequest) -> Response {
+        parse::parse_reasoning(None, req).await
     }
 
     /// Get router type name
