@@ -191,7 +191,7 @@ jobs:
         timeout-minutes: 120
         run: |
           cd test
-          python3 run_suite.py --hw cuda --suite nightly-eval-text-2-gpu --nightly --continue-on-error --timeout-per-file 7200
+          python3 run_suite.py --hw cuda --suite nightly-eval-text-2-gpu --nightly --continue-on-error
 
   # Text model performance tests
   nightly-test-text-perf-2-gpu-runner:
@@ -244,7 +244,7 @@ jobs:
         timeout-minutes: 240
         run: |
           cd test
-          python3 run_suite.py --hw cuda --suite nightly-eval-vlm-2-gpu --nightly --continue-on-error --timeout-per-file 14400
+          python3 run_suite.py --hw cuda --suite nightly-eval-vlm-2-gpu --nightly --continue-on-error
 
   # VLM performance tests
   nightly-test-vlm-perf-2-gpu-runner:
