@@ -141,7 +141,7 @@ impl ManualPolicy {
 impl LoadBalancingPolicy for ManualPolicy {
     fn select_worker(&self, workers: &[Arc<dyn Worker>], info: &SelectWorkerInfo) -> Option<usize> {
         let (result, branch) = self.select_worker_impl(workers, info);
-        Metrics::record_policy_manual_branch(branch.as_str());
+        Metrics::record_worker_manual_policy_branch(branch.as_str());
         result
     }
 
