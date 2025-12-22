@@ -1864,7 +1864,8 @@ class FlashAttentionBackend(AttentionBackend):
                             page_size=self.page_size,
                         )
                     else:
-                        metadata_expand.page_table[: cache_loc.shape[0]].copy_(
+                        num_seqs = cache_loc.shape[0]
+                        metadata_expand.page_table[:num_seqs, :decode_length].copy_(
                             cache_loc[:, :decode_length]
                         )
                 # TODO: Handle local attention metadata for draft decode when llama4 eagle is supported
