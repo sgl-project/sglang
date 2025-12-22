@@ -28,16 +28,13 @@ from sglang.multimodal_gen.runtime.entrypoints.utils import (
 from sglang.multimodal_gen.runtime.launch_server import launch_server
 from sglang.multimodal_gen.runtime.pipelines_core import Req
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
+from sglang.multimodal_gen.runtime.scheduler_client import sync_scheduler_client
 from sglang.multimodal_gen.runtime.server_args import PortArgs, ServerArgs
-from sglang.multimodal_gen.runtime.sync_scheduler_client import sync_scheduler_client
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
     init_logger,
     log_batch_completion,
     log_generation_timer,
-    suppress_loggers,
 )
-
-suppress_loggers(["imageio", "imageio_ffmpeg", "PIL", "PIL_Image"])
 
 logger = init_logger(__name__)
 
@@ -52,7 +49,6 @@ except RuntimeError:
     pass
 
 
-# TODO: rename
 class DiffGenerator:
     """
     A unified class for generating images/videos using diffusion models.
@@ -213,6 +209,7 @@ class DiffGenerator:
 
         results = []
         total_start_time = time.perf_counter()
+
         # 2. send requests to scheduler, one at a time
         # TODO: send batch when supported
         for request_idx, req in enumerate(requests):
@@ -236,6 +233,7 @@ class DiffGenerator:
                             sample,
                             fps=req.fps,
                             save_output=req.save_output,
+                            # TODO: output file path for req should be determined
                             save_file_path=req.output_file_path(
                                 num_outputs, output_idx
                             ),
@@ -248,6 +246,7 @@ class DiffGenerator:
                             "prompts": req.prompt,
                             "size": (req.height, req.width, req.num_frames),
                             "generation_time": timer.duration,
+                            "peak_memory_mb": output_batch.peak_memory_mb,
                             "timings": (
                                 output_batch.timings.to_dict()
                                 if output_batch.timings
@@ -264,6 +263,16 @@ class DiffGenerator:
 
         total_gen_time = time.perf_counter() - total_start_time
         log_batch_completion(logger, len(results), total_gen_time)
+
+        if results:
+            peak_memories = [r.get("peak_memory_mb", 0) for r in results]
+            if peak_memories:
+                max_peak_memory = max(peak_memories)
+                avg_peak_memory = sum(peak_memories) / len(peak_memories)
+                logger.info(
+                    f"Memory usage - Max peak: {max_peak_memory:.2f} MB, "
+                    f"Avg peak: {avg_peak_memory:.2f} MB"
+                )
 
         if len(results) == 0:
             return None
@@ -387,9 +396,11 @@ class DiffGenerator:
             lora_path=lora_path, lora_nickname=lora_nickname, merge_lora=merge_lora
         )
         return self.generate(
-            prompt=prompt,
-            sampling_params=sampling_params,
-            **kwargs,
+            sampling_params_kwargs=dict(
+                prompt=prompt,
+                sampling_params=sampling_params,
+                **kwargs,
+            )
         )
 
     def shutdown(self):
@@ -412,9 +423,6 @@ class DiffGenerator:
         if self.owns_scheduler_client:
             sync_scheduler_client.close()
             self.owns_scheduler_client = False
-
-    def __enter__(self):
-        return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.shutdown()
