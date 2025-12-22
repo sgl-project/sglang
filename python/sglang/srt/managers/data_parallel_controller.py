@@ -60,7 +60,7 @@ from sglang.srt.utils.common import (
     maybe_reindex_device_id,
 )
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
-from sglang.srt.utils.watchdog import WatchdogRaw
+from sglang.srt.utils.watchdog import Watchdog
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 
 logger = logging.getLogger(__name__)
@@ -173,8 +173,12 @@ class DataParallelController:
 
         self.init_dispatcher()
 
-        self.dispatch_ct = 0
-        self.is_processing = False
+        self.watchdog = Watchdog.create(
+            debug_name="DataParallelController",
+            watchdog_timeout=server_args.soft_watchdog_timeout,
+            soft=True,
+            test_stuck_time=envs.SGLANG_TEST_STUCK_DP_CONTROLLER.get(),
+        )
 
     def send_to_all_workers(self, obj):
         for worker in self.workers:
@@ -508,19 +512,14 @@ class DataParallelController:
         self.round_robin_scheduler(req)
 
     def event_loop(self):
-        test_stuck = envs.SGLANG_TEST_STUCK_DP_CONTROLLER.get()
         while True:
             while True:
                 try:
                     recv_req = self.recv_from_tokenizer.recv_pyobj(zmq.NOBLOCK)
                 except zmq.ZMQError:
                     break
-                self.is_processing = True
-                if test_stuck > 0:
-                    time.sleep(test_stuck)
                 self._request_dispatcher(recv_req)
-                self.is_processing = False
-                self.dispatch_ct += 1
+                self.watchdog.feed()
 
 
 def run_data_parallel_controller_process(
@@ -555,15 +554,6 @@ def run_data_parallel_controller_process(
                 "max_req_input_len": controller.max_req_input_len,
             }
         )
-
-        if (timeout := server_args.soft_watchdog_timeout) is not None:
-            WatchdogRaw(
-                debug_name="DataParallelController",
-                get_counter=lambda: controller.dispatch_ct,
-                is_active=lambda: controller.is_processing,
-                watchdog_timeout=timeout,
-                soft=True,
-            )
 
         if server_args.node_rank == 0:
             controller.event_loop()
