@@ -1,5 +1,32 @@
 #pragma once
 
+// ref: https://forums.developer.nvidia.com/t/c-20s-source-location-compilation-error-when-using-nvcc-12-1/258026/3
+#ifdef __CUDACC__
+#pragma push_macro("__cpp_consteval")
+#pragma push_macro("_NODISCARD")
+#pragma push_macro("__builtin_LINE")
+
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wbuiltin-macro-redefined"
+#define __cpp_consteval 201811L
+#pragma clang diagnostic pop
+
+#ifdef _NODISCARD
+#undef _NODISCARD
+#define _NODISCARD
+#endif
+
+#define consteval constexpr
+
+#include <source_location>
+
+#undef consteval
+#pragma pop_macro("__cpp_consteval")
+#pragma pop_macro("_NODISCARD")
+#else
+#include <source_location>
+#endif
+
 #include <dlpack/dlpack.h>
 
 #include <concepts>
