@@ -257,6 +257,10 @@ def _initialize_model(
     quant_config = _get_quantization_config(
         model_config, load_config, packed_modules_mapping, remap_prefix
     )
+    hf_to_sglang_mapper = getattr(model_class, "hf_to_sglang_mapper", None)
+    # pass mappings by reference to quant_config
+    if hf_to_sglang_mapper is not None and quant_config is not None:
+        quant_config.apply_sglang_mapper(hf_to_sglang_mapper)
 
     # Build kwargs conditionally
     kwargs = {
@@ -266,7 +270,7 @@ def _initialize_model(
 
     # Only add sparse head kwargs if envs.SGLANG_EMBEDDINGS_SPARSE_HEAD.is_set()
     if envs.SGLANG_EMBEDDINGS_SPARSE_HEAD.is_set():
-        kwargs["sparse_head"] = envs.SGLANG_EMBEDDINGS_SPARSE_HEAD.value
+        kwargs["sparse_head"] = envs.SGLANG_EMBEDDINGS_SPARSE_HEAD.get()
         kwargs["model_path"] = model_config.model_path
 
     return model_class(**kwargs)
@@ -493,6 +497,23 @@ class DefaultModelLoader(BaseModelLoader):
                 )
             else:
                 weights_iterator = pt_weights_iterator(hf_weights_files)
+
+        if self.load_config.draft_model_idx is not None:
+            import re
+
+            pattern = r"model.mtp.layers.(\d+)."
+            filtered_weights = []
+            for name, tensor in weights_iterator:
+                group = re.match(pattern, name)
+                if group is not None:
+                    idx = int(group.group(1))
+                    if idx != self.load_config.draft_model_idx:
+                        continue
+                    new_name = name.replace(group.group(), "model.mtp.layers.0.")
+                else:
+                    new_name = name
+                filtered_weights.append((source.prefix + new_name, tensor))
+            return tuple(filtered_weights)
 
         # Apply the prefix.
         return ((source.prefix + name, tensor) for (name, tensor) in weights_iterator)
