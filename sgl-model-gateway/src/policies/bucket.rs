@@ -921,8 +921,9 @@ mod tests {
         }
 
         // Send requests with char_count 20
-        let text20 = "a".repeat(20);
-        policy.select_worker(&prefill_workers, &info(&text20)).unwrap();
+        policy
+            .select_worker(&prefill_workers, Some(&*"a".repeat(20)))
+            .unwrap();
 
         tokio::time::sleep(Duration::from_secs(4)).await;
         {
@@ -947,8 +948,9 @@ mod tests {
             }
         }
 
-        let text7 = "a".repeat(7);
-        policy.select_worker(&prefill_workers, &info(&text7)).unwrap();
+        policy
+            .select_worker(&prefill_workers, Some(&*"a".repeat(7)))
+            .unwrap();
 
         tokio::time::sleep(Duration::from_secs(4)).await;
         {
@@ -1029,18 +1031,24 @@ mod tests {
             }
         }
 
-        let text5 = "a".repeat(5);
-        let text10 = "a".repeat(10);
-        let text15 = "a".repeat(15);
-        let text20 = "a".repeat(20);
-        let text24 = "a".repeat(24);
-        let text26 = "a".repeat(26);
-        policy.select_worker(&prefill_workers, &info(&text5)).unwrap();
-        policy.select_worker(&prefill_workers, &info(&text10)).unwrap();
-        policy.select_worker(&prefill_workers, &info(&text15)).unwrap();
-        policy.select_worker(&prefill_workers, &info(&text20)).unwrap();
-        policy.select_worker(&prefill_workers, &info(&text24)).unwrap();
-        policy.select_worker(&prefill_workers, &info(&text26)).unwrap();
+        policy
+            .select_worker(&prefill_workers, Some(&*"a".repeat(5)))
+            .unwrap();
+        policy
+            .select_worker(&prefill_workers, Some(&*"a".repeat(10)))
+            .unwrap();
+        policy
+            .select_worker(&prefill_workers, Some(&*"a".repeat(15)))
+            .unwrap();
+        policy
+            .select_worker(&prefill_workers, Some(&*"a".repeat(20)))
+            .unwrap();
+        policy
+            .select_worker(&prefill_workers, Some(&*"a".repeat(24)))
+            .unwrap();
+        policy
+            .select_worker(&prefill_workers, Some(&*"a".repeat(26)))
+            .unwrap();
 
         tokio::time::sleep(Duration::from_secs(4)).await;
         {
@@ -1065,16 +1073,24 @@ mod tests {
             }
         }
 
-        let text30 = "a".repeat(30);
-        let text32 = "a".repeat(32);
-        let text45 = "a".repeat(45);
-        let text55 = "a".repeat(55);
-        policy.select_worker(&prefill_workers, &info(&text10)).unwrap();
-        policy.select_worker(&prefill_workers, &info(&text20)).unwrap();
-        policy.select_worker(&prefill_workers, &info(&text30)).unwrap();
-        policy.select_worker(&prefill_workers, &info(&text32)).unwrap();
-        policy.select_worker(&prefill_workers, &info(&text45)).unwrap();
-        policy.select_worker(&prefill_workers, &info(&text55)).unwrap();
+        policy
+            .select_worker(&prefill_workers, Some(&*"a".repeat(10)))
+            .unwrap();
+        policy
+            .select_worker(&prefill_workers, Some(&*"a".repeat(20)))
+            .unwrap();
+        policy
+            .select_worker(&prefill_workers, Some(&*"a".repeat(30)))
+            .unwrap();
+        policy
+            .select_worker(&prefill_workers, Some(&*"a".repeat(32)))
+            .unwrap();
+        policy
+            .select_worker(&prefill_workers, Some(&*"a".repeat(45)))
+            .unwrap();
+        policy
+            .select_worker(&prefill_workers, Some(&*"a".repeat(55)))
+            .unwrap();
 
         tokio::time::sleep(Duration::from_secs(4)).await;
         {
