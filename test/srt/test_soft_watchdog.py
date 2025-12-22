@@ -28,7 +28,11 @@ class BaseTestSoftWatchdog:
                 "Qwen/Qwen3-0.6B",
                 DEFAULT_URL_FOR_TEST,
                 timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-                other_args=("--soft-watchdog-timeout", "20"),
+                other_args=[
+                    "--soft-watchdog-timeout",
+                    "20",
+                    "--skip-server-warmup",
+                ],
                 return_stdout_stderr=(cls.stdout, cls.stderr),
             )
 
