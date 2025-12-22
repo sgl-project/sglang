@@ -46,6 +46,7 @@ impl ManualPolicy {
         }
     }
 
+    // TODO: use load-aware selection later
     fn random_select(healthy_indices: &[usize]) -> usize {
         let mut rng = rand::rng();
         let random_idx = rng.random_range(0..healthy_indices.len());
