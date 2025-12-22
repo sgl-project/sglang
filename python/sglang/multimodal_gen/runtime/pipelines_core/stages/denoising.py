@@ -18,10 +18,6 @@ import torch
 from einops import rearrange
 from tqdm.auto import tqdm
 
-from sglang.multimodal_gen.runtime.utils.common import is_cuda
-
-_is_cuda = is_cuda()
-
 from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType, STA_Mode
 from sglang.multimodal_gen.configs.pipeline_configs.wan import (

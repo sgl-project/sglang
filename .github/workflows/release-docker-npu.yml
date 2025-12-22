@@ -57,11 +57,6 @@ jobs:
           version=$(cat python/sglang/version.py | cut -d'"' -f2)
           echo "TAG=lmsysorg/sglang:v$version-cann${{ matrix.cann_version }}-${{ matrix.device_type }}" >> $GITHUB_OUTPUT
 
-      - name: Get PR name
-        id: pr_name
-        run: |
-          echo "BRANCH_NAME=${{ github.head_ref }}" >> $GITHUB_ENV
-
       - name: Build and push Docker image
         id: build-and-push
         uses: docker/build-push-action@v6
