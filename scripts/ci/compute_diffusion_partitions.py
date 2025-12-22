@@ -25,6 +25,8 @@ BASELINE_PATH = "python/sglang/multimodal_gen/test/server/perf_baselines.json"
 
 # Default estimated time for cases without baseline (5 minutes)
 DEFAULT_EST_TIME_SECONDS = 300.0
+# Fixed overhead for server startup when estimated_full_test_time_s is not set
+STARTUP_OVERHEAD_SECONDS = 120.0
 
 # Mapping from suite name to list variable names in testcase_configs.py
 SUITE_LISTS = {
@@ -106,8 +108,16 @@ def load_baselines(path: Path) -> Dict[str, float]:
     baselines = {}
     scenarios = data.get("scenarios", {})
     for case_id, scenario in scenarios.items():
-        expected_e2e_ms = scenario.get("expected_e2e_ms", 0)
-        baselines[case_id] = expected_e2e_ms / 1000.0  # Convert to seconds
+        # 优先使用 estimated_full_test_time_s
+        if (
+            "estimated_full_test_time_s" in scenario
+            and scenario["estimated_full_test_time_s"] is not None
+        ):
+            baselines[case_id] = scenario["estimated_full_test_time_s"]
+        else:
+            # 回退：E2E时间 + 启动开销
+            expected_e2e_ms = scenario.get("expected_e2e_ms", 0)
+            baselines[case_id] = expected_e2e_ms / 1000.0 + STARTUP_OVERHEAD_SECONDS
 
     return baselines
 
@@ -198,8 +208,8 @@ def main():
     parser.add_argument(
         "--target-time",
         type=float,
-        default=600.0,
-        help="Target time per partition in seconds (default: 600 = 10 minutes)",
+        default=1200.0,
+        help="Target time per partition in seconds (default: 1200 = 20 minutes)",
     )
     parser.add_argument(
         "--min-partitions",

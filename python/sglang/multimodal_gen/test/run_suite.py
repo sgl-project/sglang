@@ -55,17 +55,29 @@ SUITE_FILES = {
 
 # Default estimated time for cases without baseline (5 minutes)
 DEFAULT_EST_TIME_SECONDS = 300.0
+# Fixed overhead for server startup when estimated_full_test_time_s is not set
+STARTUP_OVERHEAD_SECONDS = 120.0
 
 
 def get_case_est_time(case_id: str) -> float:
     """
     Get estimated time in seconds from perf_baselines.json.
-    Returns default value if case has no baseline.
+
+    Priority:
+    1. estimated_full_test_time_s (if set)
+    2. expected_e2e_ms / 1000 + STARTUP_OVERHEAD_SECONDS (fallback)
+    3. DEFAULT_EST_TIME_SECONDS (if no baseline)
     """
     scenario = BASELINE_CONFIG.scenarios.get(case_id)
     if scenario is None:
         return DEFAULT_EST_TIME_SECONDS
-    return scenario.expected_e2e_ms / 1000.0
+
+    # 优先使用显式设置的完整测试时间
+    if scenario.estimated_full_test_time_s is not None:
+        return scenario.estimated_full_test_time_s
+
+    # 回退：E2E时间 + 启动开销
+    return scenario.expected_e2e_ms / 1000.0 + STARTUP_OVERHEAD_SECONDS
 
 
 def auto_partition(

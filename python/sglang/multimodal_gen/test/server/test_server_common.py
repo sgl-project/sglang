@@ -8,6 +8,7 @@ If the actual run is significantly better than the baseline, the improved cases 
 from __future__ import annotations
 
 import os
+import time
 from pathlib import Path
 from typing import Any, Callable
 
@@ -19,7 +20,10 @@ from openai import OpenAI
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.perf_logger import RequestPerfRecord
-from sglang.multimodal_gen.test.server.conftest import _GLOBAL_PERF_RESULTS
+from sglang.multimodal_gen.test.server.conftest import (
+    _GLOBAL_PERF_RESULTS,
+    _GLOBAL_TIMING_SUGGESTIONS,
+)
 from sglang.multimodal_gen.test.server.test_server_utils import (
     VALIDATOR_REGISTRY,
     PerformanceValidator,
@@ -47,6 +51,7 @@ logger = init_logger(__name__)
 @pytest.fixture
 def diffusion_server(case: DiffusionTestCase) -> ServerContext:
     """Start a diffusion server for a single case and tear it down afterwards."""
+    _fixture_start_time = time.perf_counter()  # 记录开始时间
     server_args = case.server_args
 
     # Skip ring attention tests on AMD/ROCm - Ring Attention requires Flash Attention
@@ -151,6 +156,19 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
         yield ctx
     finally:
         ctx.cleanup()
+        # 计算完整测试时间并检查是否缺失 estimated_full_test_time_s
+        _fixture_end_time = time.perf_counter()
+        _measured_full_time = _fixture_end_time - _fixture_start_time
+
+        # 检查是否缺失 estimated_full_test_time_s
+        scenario = BASELINE_CONFIG.scenarios.get(case.id)
+        if scenario is None or scenario.estimated_full_test_time_s is None:
+            _GLOBAL_TIMING_SUGGESTIONS.append(
+                {
+                    "case_id": case.id,
+                    "measured_time": _measured_full_time,
+                }
+            )
 
 
 class DiffusionServerBase:
@@ -373,6 +391,7 @@ Consider updating perf_baselines.json with the snippets below:
         case: DiffusionTestCase,
         summary: "PerformanceSummary",
         missing_scenario: bool = False,
+        measured_full_time: float | None = None,
     ) -> None:
         """Dump performance metrics as a JSON scenario for baselines."""
         import json
@@ -389,6 +408,10 @@ Consider updating perf_baselines.json with the snippets below:
             "expected_avg_denoise_ms": round(summary.avg_denoise_ms, 2),
             "expected_median_denoise_ms": round(summary.median_denoise_ms, 2),
         }
+
+        # 添加 estimated_full_test_time_s（如果有测量值）
+        if measured_full_time is not None:
+            baseline["estimated_full_test_time_s"] = round(measured_full_time, 1)
 
         # Video-specific metrics
         if case.server_args.modality == "video":
