@@ -39,7 +39,6 @@ from typing import Any, Dict, List, Optional
 import aiohttp
 import numpy as np
 import requests
-import torch
 from tqdm.asyncio import tqdm
 
 
@@ -336,9 +335,6 @@ async def async_request_image_sglang(
     output = RequestFuncOutput()
     output.start_time = time.perf_counter()
 
-    if torch.cuda.is_available():
-        torch.cuda.reset_peak_memory_stats()
-
     # Check if we need to use multipart (for image edits with input images)
     if input.image_paths and len(input.image_paths) > 0:
         # Use multipart/form-data for image edits
@@ -376,6 +372,8 @@ async def async_request_image_sglang(
                     resp_json = await response.json()
                     output.response_body = resp_json
                     output.success = True
+                    if "peak_memory_mb" in resp_json:
+                        output.peak_memory_mb = resp_json["peak_memory_mb"]
                 else:
                     output.error = f"HTTP {response.status}: {await response.text()}"
                     output.success = False
@@ -403,6 +401,8 @@ async def async_request_image_sglang(
                     resp_json = await response.json()
                     output.response_body = resp_json
                     output.success = True
+                    if "peak_memory_mb" in resp_json:
+                        output.peak_memory_mb = resp_json["peak_memory_mb"]
                 else:
                     output.error = f"HTTP {response.status}: {await response.text()}"
                     output.success = False
@@ -411,10 +411,6 @@ async def async_request_image_sglang(
             output.success = False
 
     output.latency = time.perf_counter() - output.start_time
-
-    if torch.cuda.is_available():
-        peak_memory_bytes = torch.cuda.max_memory_allocated()
-        output.peak_memory_mb = peak_memory_bytes / (1024**2)
 
     if pbar:
         pbar.update(1)
@@ -428,9 +424,6 @@ async def async_request_video_sglang(
 ) -> RequestFuncOutput:
     output = RequestFuncOutput()
     output.start_time = time.perf_counter()
-
-    if torch.cuda.is_available():
-        torch.cuda.reset_peak_memory_stats()
 
     # 1. Submit Job
     job_id = None
@@ -550,6 +543,8 @@ async def async_request_video_sglang(
                     if status == "completed":
                         output.success = True
                         output.response_body = status_data
+                        if "peak_memory_mb" in status_data:
+                            output.peak_memory_mb = status_data["peak_memory_mb"]
                         break
                     elif status == "failed":
                         output.success = False
@@ -570,10 +565,6 @@ async def async_request_video_sglang(
             break
 
     output.latency = time.perf_counter() - output.start_time
-
-    if torch.cuda.is_available():
-        peak_memory_bytes = torch.cuda.max_memory_allocated()
-        output.peak_memory_mb = peak_memory_bytes / (1024**2)
 
     if pbar:
         pbar.update(1)

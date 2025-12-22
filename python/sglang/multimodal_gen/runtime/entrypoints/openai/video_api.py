@@ -118,10 +118,15 @@ async def _dispatch_job_async(job_id: str, batch: Req) -> None:
     from sglang.multimodal_gen.runtime.scheduler_client import async_scheduler_client
 
     try:
-        await process_generation_batch(async_scheduler_client, batch)
+        _, result = await process_generation_batch(async_scheduler_client, batch)
         await VIDEO_STORE.update_fields(
             job_id,
-            {"status": "completed", "progress": 100, "completed_at": int(time.time())},
+            {
+                "status": "completed",
+                "progress": 100,
+                "completed_at": int(time.time()),
+                "peak_memory_mb": result.peak_memory_mb,
+            },
         )
     except Exception as e:
         logger.error(f"{e}")

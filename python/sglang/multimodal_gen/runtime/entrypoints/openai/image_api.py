@@ -122,7 +122,7 @@ async def generations(
     )
 
     # Run synchronously for images and save to disk
-    save_file_path = await process_generation_batch(async_scheduler_client, batch)
+    save_file_path, result = await process_generation_batch(async_scheduler_client, batch)
 
     await IMAGE_STORE.upsert(
         request_id,
@@ -143,7 +143,8 @@ async def generations(
                     b64_json=b64,
                     revised_prompt=request.prompt,
                 )
-            ]
+            ],
+            peak_memory_mb=result.peak_memory_mb,
         )
     else:
         # Return error, not supported
@@ -219,7 +220,7 @@ async def edits(
     )
     batch = _build_req_from_sampling(sampling)
 
-    save_file_path = await process_generation_batch(async_scheduler_client, batch)
+    save_file_path, result = await process_generation_batch(async_scheduler_client, batch)
 
     await IMAGE_STORE.upsert(
         request_id,
@@ -237,11 +238,15 @@ async def edits(
         with open(save_file_path, "rb") as f:
             b64 = base64.b64encode(f.read()).decode("utf-8")
         return ImageResponse(
-            data=[ImageResponseData(b64_json=b64, revised_prompt=prompt)]
+            data=[ImageResponseData(b64_json=b64, revised_prompt=prompt)],
+            peak_memory_mb=result.peak_memory_mb,
         )
     else:
         url = f"/v1/images/{request_id}/content"
-        return ImageResponse(data=[ImageResponseData(url=url, revised_prompt=prompt)])
+        return ImageResponse(
+            data=[ImageResponseData(url=url, revised_prompt=prompt)],
+            peak_memory_mb=result.peak_memory_mb,
+        )
 
 
 @router.get("/{image_id}/content")
