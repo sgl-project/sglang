@@ -1,11 +1,11 @@
-"""Nightly performance benchmark for DeepSeek-V3 model.
+"""Nightly performance benchmark for DeepSeek-V3.1 model.
 
-This test benchmarks the DeepSeek-V3 model with basic and MTP configurations on 8 GPUs.
+This test benchmarks the DeepSeek-V3.1 model with basic and MTP configurations on 8 GPUs.
 
-The model path can be configured via DEEPSEEK_V3_MODEL_PATH environment variable.
+The model path can be configured via DEEPSEEK_V31_MODEL_PATH environment variable.
 
 Example usage:
-    DEEPSEEK_V3_MODEL_PATH=deepseek-ai/DeepSeek-V3-0324 python -m pytest test_deepseek_v3_perf.py -v
+    DEEPSEEK_V31_MODEL_PATH=deepseek-ai/DeepSeek-V3.1 python -m pytest test_deepseek_v31_perf.py -v
 """
 
 import os
@@ -40,27 +40,27 @@ def generate_simple_markdown_report(results: List[BenchmarkResult]) -> str:
 
 
 # Model path can be overridden via environment variable
-DEEPSEEK_V3_MODEL_PATH = os.environ.get(
-    "DEEPSEEK_V3_MODEL_PATH", "deepseek-ai/DeepSeek-V3-0324"
+DEEPSEEK_V31_MODEL_PATH = os.environ.get(
+    "DEEPSEEK_V31_MODEL_PATH", "deepseek-ai/DeepSeek-V3.1"
 )
-PROFILE_DIR = "performance_profiles_deepseek_v3"
+PROFILE_DIR = "performance_profiles_deepseek_v31"
 
 
-class TestNightlyDeepseekV3Performance(unittest.TestCase):
-    """Nightly performance benchmark for DeepSeek-V3 model.
+class TestNightlyDeepseekV31Performance(unittest.TestCase):
+    """Nightly performance benchmark for DeepSeek-V3.1 model.
 
-    Tests the DeepSeek-V3 model with both basic and MTP configurations on TP=8.
+    Tests the DeepSeek-V3.1 model with both basic and MTP configurations on TP=8.
     """
 
     @classmethod
     def setUpClass(cls):
-        cls.model = DEEPSEEK_V3_MODEL_PATH
+        cls.model = DEEPSEEK_V31_MODEL_PATH
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.batch_sizes = [1, 1, 8, 16, 64]
         cls.input_lens = tuple(_parse_int_list_env("NIGHTLY_INPUT_LENS", "4096"))
         cls.output_lens = tuple(_parse_int_list_env("NIGHTLY_OUTPUT_LENS", "512"))
 
-        # Define variant configurations for DeepSeek-V3
+        # Define variant configurations for DeepSeek-V3.1
         cls.variants = [
             {
                 "name": "basic",
