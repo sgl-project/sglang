@@ -188,7 +188,15 @@ class FlashinferDispatcher(BaseDispatcher):
 
         global_scale = self.quant_config.get("input_global_scale", None)
         if global_scale is not None:
-            x, x_sf = fp4_quantize(x, global_scale, is_sf_swizzled_layout=False)
+            if x.shape[0] > 0:
+                x, x_sf = fp4_quantize(x, global_scale, is_sf_swizzled_layout=False)
+            else:
+                x = torch.zeros(
+                    0, self.hidden_size // 2, dtype=torch.uint8, device=x.device
+                )
+                x_sf = torch.zeros(
+                    0, self.hidden_size // 16, dtype=torch.uint8, device=x.device
+                )
 
         payloads = []
         payloads.append(x)
