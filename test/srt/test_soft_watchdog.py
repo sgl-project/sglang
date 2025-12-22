@@ -6,12 +6,12 @@ python -m pytest test/srt/test_soft_watchdog.py -v -s
 """
 
 import io
-import os
 import time
 import unittest
 
 import requests
 
+from sglang.srt.environ import envs
 from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
@@ -32,20 +32,17 @@ class TestSoftWatchdogDetokenizer(CustomTestCase):
         cls.stdout = io.StringIO()
         cls.stderr = io.StringIO()
 
-        env = os.environ.copy()
-        env["SGLANG_TEST_WATCHDOG_SLOW_DETOKENIZER"] = "5"
-
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=(
-                "--soft-watchdog-timeout",
-                "2",
-            ),
-            env=env,
-            return_stdout_stderr=(cls.stdout, cls.stderr),
-        )
+        with envs.SGLANG_TEST_WATCHDOG_SLOW_DETOKENIZER.override(5):
+            cls.process = popen_launch_server(
+                cls.model,
+                cls.base_url,
+                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+                other_args=(
+                    "--soft-watchdog-timeout",
+                    "2",
+                ),
+                return_stdout_stderr=(cls.stdout, cls.stderr),
+            )
 
     @classmethod
     def tearDownClass(cls):
@@ -82,20 +79,17 @@ class TestSoftWatchdogTokenizer(CustomTestCase):
         cls.stdout = io.StringIO()
         cls.stderr = io.StringIO()
 
-        env = os.environ.copy()
-        env["SGLANG_TEST_WATCHDOG_SLOW_TOKENIZER"] = "5"
-
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=(
-                "--soft-watchdog-timeout",
-                "2",
-            ),
-            env=env,
-            return_stdout_stderr=(cls.stdout, cls.stderr),
-        )
+        with envs.SGLANG_TEST_WATCHDOG_SLOW_TOKENIZER.override(5):
+            cls.process = popen_launch_server(
+                cls.model,
+                cls.base_url,
+                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+                other_args=(
+                    "--soft-watchdog-timeout",
+                    "2",
+                ),
+                return_stdout_stderr=(cls.stdout, cls.stderr),
+            )
 
     @classmethod
     def tearDownClass(cls):
