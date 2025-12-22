@@ -1229,7 +1229,10 @@ impl RouterTrait for PDRouter {
         let return_logprob = body.return_logprob.unwrap_or(false);
 
         let request_text = if self.policies_need_request_text() {
-            body.text.as_deref().map(|s| s.to_string())
+            // Use routing_id if available, otherwise use text
+            body.routing_id
+                .clone()
+                .or_else(|| body.text.as_deref().map(|s| s.to_string()))
         } else {
             None
         };
@@ -1258,17 +1261,20 @@ impl RouterTrait for PDRouter {
         let return_logprob = body.logprobs;
 
         let request_text = if self.policies_need_request_text() {
-            body.messages.first().and_then(|msg| match msg {
-                ChatMessage::User { content, .. } => match content {
-                    MessageContent::Text(text) => Some(text.clone()),
-                    MessageContent::Parts(_) => None,
-                },
-                ChatMessage::Developer { content, .. } => match content {
-                    MessageContent::Text(text) => Some(text.clone()),
-                    MessageContent::Parts(_) => None,
-                },
-                ChatMessage::System { content, .. } => Some(content.to_simple_string()),
-                _ => None,
+            // Use routing_id if available, otherwise extract from messages
+            body.routing_id.clone().or_else(|| {
+                body.messages.first().and_then(|msg| match msg {
+                    ChatMessage::User { content, .. } => match content {
+                        MessageContent::Text(text) => Some(text.clone()),
+                        MessageContent::Parts(_) => None,
+                    },
+                    ChatMessage::Developer { content, .. } => match content {
+                        MessageContent::Text(text) => Some(text.clone()),
+                        MessageContent::Parts(_) => None,
+                    },
+                    ChatMessage::System { content, .. } => Some(content.to_simple_string()),
+                    _ => None,
+                })
             })
         } else {
             None
@@ -1299,10 +1305,11 @@ impl RouterTrait for PDRouter {
         let return_logprob = body.logprobs.is_some();
 
         let request_text = if self.policies_need_request_text() {
-            match &body.prompt {
+            // Use routing_id if available, otherwise use prompt
+            body.routing_id.clone().or_else(|| match &body.prompt {
                 StringOrArray::String(s) => Some(s.clone()),
                 StringOrArray::Array(v) => v.first().map(|s| s.to_string()),
-            }
+            })
         } else {
             None
         };
@@ -1329,8 +1336,9 @@ impl RouterTrait for PDRouter {
         model_id: Option<&str>,
     ) -> Response {
         // Extract text for cache-aware routing
+        // Use routing_id if available, otherwise use query
         let req_text = if self.policies_need_request_text() {
-            Some(body.query.clone())
+            body.routing_id.clone().or_else(|| Some(body.query.clone()))
         } else {
             None
         };

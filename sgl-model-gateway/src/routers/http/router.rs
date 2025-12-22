@@ -177,7 +177,9 @@ impl Router {
     ) -> Response {
         let start = Instant::now();
         let is_stream = typed_req.is_stream();
-        let text = typed_req.extract_text_for_routing();
+        // Use routing_id for manual policy, fall back to text for other policies
+        let routing_id = typed_req.get_routing_id().map(|s| s.to_string());
+        let text = routing_id.unwrap_or_else(|| typed_req.extract_text_for_routing());
         let model = model_id.unwrap_or("default");
         let endpoint = route_to_endpoint(route);
 
