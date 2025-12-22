@@ -179,6 +179,10 @@ impl Router {
         let is_stream = typed_req.is_stream();
         let text = typed_req.extract_text_for_routing();
         let routing_id = typed_req.get_routing_id().map(|s| s.to_string());
+        let info = crate::policies::SelectWorkerInfo {
+            request_text: Some(&text),
+            routing_id: routing_id.as_deref(),
+        };
         let model = model_id.unwrap_or("default");
         let endpoint = route_to_endpoint(route);
 
@@ -196,16 +200,8 @@ impl Router {
             &self.retry_config,
             // operation per attempt
             |_: u32| async {
-                self.route_typed_request_once(
-                    headers,
-                    typed_req,
-                    route,
-                    model_id,
-                    is_stream,
-                    &text,
-                    routing_id.as_deref(),
-                )
-                .await
+                self.route_typed_request_once(headers, typed_req, route, model_id, is_stream, &info)
+                    .await
             },
             // should_retry predicate
             |res, _attempt| is_retryable_status(res.status()),
@@ -253,14 +249,9 @@ impl Router {
         route: &'static str,
         model_id: Option<&str>,
         is_stream: bool,
-        text: &str,
-        routing_id: Option<&str>,
+        info: &crate::policies::SelectWorkerInfo<'_>,
     ) -> Response {
-        let info = crate::policies::SelectWorkerInfo {
-            request_text: Some(text),
-            routing_id,
-        };
-        let worker = match self.select_worker_for_model(model_id, &info) {
+        let worker = match self.select_worker_for_model(model_id, info) {
             Some(w) => w,
             None => {
                 return error::service_unavailable(
