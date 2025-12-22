@@ -786,9 +786,7 @@ impl PDRouter {
         let selected_idx = policy
             .select_worker(
                 &available_workers,
-                &SelectWorkerInfo {
-                    request_text: request_text,
-                },
+                &SelectWorkerInfo { request_text },
             )
             .ok_or_else(|| {
                 format!(
