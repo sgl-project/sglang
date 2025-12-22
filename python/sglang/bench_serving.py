@@ -1761,6 +1761,7 @@ def sample_generated_shared_prefix_requests(
             f"Average question length: {sum(len(tokenizer.encode(q)) for q in questions) / len(questions):.1f} tokens\n"
         )
 
+    # Save to cache
     if should_cache:
         cache_path.parent.mkdir(parents=True, exist_ok=True)
         print(f"Caching generated input data to {cache_path}")
