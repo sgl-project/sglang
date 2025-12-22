@@ -71,6 +71,7 @@ class XGrammarGrammar(BaseGrammarObject):
         self.grammar_stats = grammar_stats
 
     def accept_token(self, token: int):
+        print(f"accept_token: {token}, string: {self.ctx.tokenizer_info.decoded_vocab[token]}")
         if not self.is_terminated():
             self.current_token = token
             accepted = self.matcher.accept_token(token)

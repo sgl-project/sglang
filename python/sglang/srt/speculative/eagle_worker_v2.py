@@ -704,6 +704,11 @@ class EAGLEWorkerV2(BaseSpecWorker):
         )
         logits_output = forward_batch_output.logits_output
 
+        # Process pending accept tokens from last batch (overlapped with GPU forward)
+        # This updates grammar state before generating bitmask for current batch
+        if batch.pending_accept_info is not None:
+            self._process_pending_accept_tokens(batch.pending_accept_info)
+
         # Generate vocab mask for constrained decoding
         vocab_mask = None
         if batch.has_grammar:
@@ -762,6 +767,41 @@ class EAGLEWorkerV2(BaseSpecWorker):
             next_draft_input=next_draft_input,
             accept_lens=accept_length,
         )
+
+    def _process_pending_accept_tokens(self, pending_accept_info):
+        """
+        Process pending accept tokens from the last batch.
+        This is called during verify forward to overlap CPU grammar operations with GPU compute.
+
+        Args:
+            pending_accept_info: Tuple of (last_batch, last_result) from the previous batch
+        """
+        last_batch, last_result = pending_accept_info
+
+        # Wait for the copy_done event to ensure tensors are on CPU
+        # This is necessary because pop_and_process hasn't run yet
+        if last_result.copy_done is not None:
+            last_result.copy_done.synchronize()
+
+        # Get the accepted tokens from last result
+        # Similar to _resolve_spec_overlap_token_ids logic
+        next_token_ids = last_result.next_token_ids.tolist()
+        accept_lens = last_result.accept_lens.tolist()
+        stride = self.speculative_num_draft_tokens
+
+        for i, req in enumerate(last_batch.reqs):
+            if req.grammar is not None and not req.finished() and not req.is_retracted:
+                # Get the accepted tokens for this request
+                accepted_tokens = next_token_ids[
+                    i * stride : i * stride + accept_lens[i]
+                ]
+                try:
+                    for token_id in accepted_tokens:
+                        req.grammar.accept_token(token_id)
+                except ValueError as e:
+                    logger.error(
+                        f"Grammar accept_token failed for req {req.rid} with tokens {accepted_tokens}: {e}"
+                    )
 
     def move_accepted_tokens_to_target_kvcache(
         self,
