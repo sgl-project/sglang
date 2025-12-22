@@ -480,10 +480,14 @@ mod tests {
         policy.init_workers(&workers);
 
         // First request should be distributed
-        let idx1 = policy.select_worker(&workers, Some("hello world"), None).unwrap();
+        let idx1 = policy
+            .select_worker(&workers, Some("hello world"), None)
+            .unwrap();
 
         // Same request should go to same worker (cache hit)
-        let idx2 = policy.select_worker(&workers, Some("hello world"), None).unwrap();
+        let idx2 = policy
+            .select_worker(&workers, Some("hello world"), None)
+            .unwrap();
         assert_eq!(idx1, idx2);
 
         // Similar request should also go to same worker
