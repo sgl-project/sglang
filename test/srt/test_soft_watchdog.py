@@ -44,14 +44,17 @@ class BaseTestSoftWatchdog:
 
     def test_watchdog_triggers(self):
         print("Start call /generate API", flush=True)
-        requests.post(
-            DEFAULT_URL_FOR_TEST + "/generate",
-            json={
-                "text": "Hello, please repeat this sentence for 1000 times.",
-                "sampling_params": {"max_new_tokens": 100, "temperature": 0},
-            },
-            timeout=30,
-        )
+        try:
+            requests.post(
+                DEFAULT_URL_FOR_TEST + "/generate",
+                json={
+                    "text": "Hello, please repeat this sentence for 1000 times.",
+                    "sampling_params": {"max_new_tokens": 100, "temperature": 0},
+                },
+                timeout=30,
+            )
+        except requests.exceptions.ReadTimeout as e:
+            print(f"requests.post timeout (but expected): {e}")
         print("End call /generate API", flush=True)
 
         time.sleep(40)
