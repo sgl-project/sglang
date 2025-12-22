@@ -188,13 +188,14 @@ class NPUCompressedTensorsW8A8Int8(CompressedTensorsW8A8Int8):
             raise NotImplementedError(
                 "Static compressed-tensors scheme is not yet supported on NPU."
             )
+        self.kernel = NPUW8A8Int8DynamicLinearMethod()
 
     @classmethod
     def get_min_capability(cls) -> int:
         return NotImplementedError
 
     def process_weights_after_loading(self, layer):
-        return NPUW8A8Int8DynamicLinearMethod.process_weights_after_loading(layer)
+        return self.kernel.process_weights_after_loading(layer)
 
     def apply_weights(self, layer, x, bias):
-        return NPUW8A8Int8DynamicLinearMethod.apply(layer, x, bias)
+        return self.kernel.apply(layer, x, bias)
