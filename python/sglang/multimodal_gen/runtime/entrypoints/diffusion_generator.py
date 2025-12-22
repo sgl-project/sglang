@@ -265,7 +265,7 @@ class DiffGenerator:
         total_gen_time = time.perf_counter() - total_start_time
         log_batch_completion(logger, len(results), total_gen_time)
 
-        if results and torch.cuda.is_available():
+        if results:
             peak_memories = [r.get("peak_memory_mb", 0) for r in results]
             if peak_memories:
                 max_peak_memory = max(peak_memories)

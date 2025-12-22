@@ -97,7 +97,7 @@ class GPUWorker:
         req = batch[0]
         output_batch = None
         try:
-            if torch.cuda.is_available():
+            if self.rank == 0:
                 torch.cuda.reset_peak_memory_stats()
 
             start_time = time.monotonic()
@@ -107,7 +107,7 @@ class GPUWorker:
             output_batch = self.pipeline.forward(req, self.server_args)
             duration_ms = (time.monotonic() - start_time) * 1000
 
-            if torch.cuda.is_available():
+            if self.rank == 0:
                 peak_memory_bytes = torch.cuda.max_memory_allocated()
                 output_batch.peak_memory_mb = peak_memory_bytes / (1024**2)
 
