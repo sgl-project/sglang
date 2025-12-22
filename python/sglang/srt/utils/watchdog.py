@@ -60,11 +60,8 @@ class ProcessWatchdog:
             time.sleep(self.watchdog_timeout / 2)
 
         if self.dump_info is not None:
-            try:
-                info_msg = self.dump_info()
-                logger.error(f"{self.process_name} debug info:\n{info_msg}")
-            except Exception as e:
-                logger.error(f"Failed to dump debug info: {e}")
+            info_msg = self.dump_info()
+            logger.error(f"{self.process_name} debug info:\n{info_msg}")
 
         pyspy_dump_schedulers()
         logger.error(
