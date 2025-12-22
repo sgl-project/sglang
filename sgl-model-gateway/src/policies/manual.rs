@@ -41,6 +41,17 @@ impl ManualPolicy {
         healthy_indices: &[usize],
     ) -> usize {
         let key = RoutingId::new(routing_id);
+
+        if let Some(info) = self.routing_map.get(&key) {
+            for url in &info.worker_urls {
+                if let Some(idx) = find_worker_index_by_url(workers, url) {
+                    if healthy_indices.contains(&idx) {
+                        return idx;
+                    }
+                }
+            }
+        }
+
         match self.routing_map.entry(key) {
             Entry::Occupied(mut entry) => {
                 for url in &entry.get().worker_urls {
