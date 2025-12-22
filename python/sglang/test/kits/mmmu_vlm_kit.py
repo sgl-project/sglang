@@ -16,8 +16,109 @@ from sglang.test.test_utils import (
 DEFAULT_MEM_FRACTION_STATIC = 0.8
 
 
-class MMMUVLMTestBase(CustomTestCase):
-    # TODO: split the MMMUVLMTestBase into a fixture and a mixin
+class MMMUMixin:
+    """Mixin for MMMU evaluation.
+
+    Use with MMMUServerBase for single-model tests:
+        class TestMyModel(MMMUMixin, MMMUServerBase):
+            model = "my/model"
+            accuracy = 0.4
+    """
+
+    accuracy: float
+    mmmu_args: list[str] = []
+
+    def run_mmmu_eval(
+        self: CustomTestCase,
+        model_version: str,
+        output_path: str,
+    ):
+        """
+        Evaluate a VLM on the MMMU validation set with lmms-eval.
+        Only `model_version` (checkpoint) and `chat_template` vary;
+        We are focusing only on the validation set due to resource constraints.
+        """
+        # -------- fixed settings --------
+        model = "openai_compatible"
+        tp = 1
+        tasks = "mmmu_val"
+        batch_size = 64
+        log_suffix = "openai_compatible"
+        os.makedirs(output_path, exist_ok=True)
+
+        # -------- compose --model_args --------
+        model_args = f'model_version="{model_version}",' f"tp={tp}"
+
+        # -------- build command list --------
+        cmd = [
+            "python3",
+            "-m",
+            "lmms_eval",
+            "--model",
+            model,
+            "--model_args",
+            model_args,
+            "--tasks",
+            tasks,
+            "--batch_size",
+            str(batch_size),
+            "--log_samples",
+            "--log_samples_suffix",
+            log_suffix,
+            "--output_path",
+            str(output_path),
+            *self.mmmu_args,
+        ]
+
+        subprocess.run(
+            cmd,
+            check=True,
+            timeout=3600,
+        )
+
+    def test_mmmu(self: CustomTestCase):
+        """Run MMMU evaluation test."""
+        output_path = "./logs"
+        os.makedirs(output_path, exist_ok=True)
+
+        # Run evaluation
+        self.run_mmmu_eval(self.model, output_path)
+
+        # Get the result file
+        # Search recursively for JSON result files (lmms-eval v0.4.1+ creates subdirectories)
+        result_files = glob.glob(f"{output_path}/**/*.json", recursive=True)
+        if not result_files:
+            result_files = glob.glob(f"{output_path}/*.json")
+
+        if not result_files:
+            raise FileNotFoundError(f"No JSON result files found in {output_path}")
+
+        result_file_path = result_files[0]
+
+        with open(result_file_path, "r") as f:
+            result = json.load(f)
+            print(f"Result: {result}")
+
+        # Process the result
+        mmmu_accuracy = result["results"]["mmmu_val"]["mmmu_acc,none"]
+        print(f"Model {self.model} achieved accuracy: {mmmu_accuracy:.4f}")
+
+        # Assert performance meets expected threshold
+        self.assertGreaterEqual(
+            mmmu_accuracy,
+            self.accuracy,
+            f"Model {self.model} accuracy ({mmmu_accuracy:.4f}) below expected threshold ({self.accuracy:.4f})",
+        )
+
+
+class MMMUMultiModelTestBase(CustomTestCase):
+    """Base class for multi-model MMMU tests.
+
+    This class is for tests that need to evaluate multiple models,
+    starting and stopping a server for each model within the test method.
+    For single-model tests, use MMMUMixin with MMMUServerBase instead.
+    """
+
     parsed_args = None  # Class variable to store args
     other_args = []
     mmmu_args = []
@@ -46,7 +147,7 @@ class MMMUVLMTestBase(CustomTestCase):
         env: dict | None = None,
     ):
         """
-        Evaluate a VLM on the MMMU validation set with lmms‑eval.
+        Evaluate a VLM on the MMMU validation set with lmms-eval.
         Only `model_version` (checkpoint) and `chat_template` vary;
         We are focusing only on the validation set due to resource constraints.
         """
@@ -232,3 +333,7 @@ class MMMUVLMTestBase(CustomTestCase):
                 print(f"Error reading {tag.lower()} file: {e}")
 
         return "\n".join(output_lines)
+
+
+# Backward compatibility alias
+MMMUVLMTestBase = MMMUMultiModelTestBase
