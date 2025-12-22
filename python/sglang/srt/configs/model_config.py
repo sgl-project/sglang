@@ -252,7 +252,7 @@ class ModelConfig:
             sampling_defaults=server_args.sampling_defaults,
             quantize_and_serve=server_args.quantize_and_serve,
             override_config_file=server_args.decrypted_config_file,
-            is_mtp=server_args.enable_mtp,
+            is_mtp=server_args.enable_multi_layer_eagle,
             language_only=server_args.language_only,
             encoder_only=server_args.encoder_only,
             is_draft_model=is_draft_model,

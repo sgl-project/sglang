@@ -275,7 +275,7 @@ class Scheduler(
         self.spec_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
         )
-        self.enable_mtp = server_args.enable_mtp
+        self.enable_mtp = server_args.enable_multi_layer_eagle
         self.gpu_id = gpu_id
         self.page_size = server_args.page_size
         self.enable_hierarchical_cache = server_args.enable_hierarchical_cache

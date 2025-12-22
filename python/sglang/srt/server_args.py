@@ -439,10 +439,7 @@ class ServerArgs:
     speculative_ngram_match_type: Literal["BFS", "PROB"] = "BFS"
     speculative_ngram_branch_length: int = 18
     speculative_ngram_capacity: int = 10 * 1000 * 1000
-
-    # For Multi-Layer MTP
-    # FIXME: rename -> enable_multi_layer_mtp
-    enable_mtp: bool = False
+    enable_multi_layer_eagle: bool = False
 
     # Expert parallelism
     ep_size: int = 1
@@ -3470,11 +3467,11 @@ class ServerArgs:
             help="The cache capacity for ngram speculative decoding.",
         )
 
-        # Speculative decoding (MTP)
+        # Multi-layer MTP speculative decoding
         parser.add_argument(
-            "--enable-mtp",
+            "--enable-multi-layer-eagle",
             action="store_true",
-            help="Enable multi-layer MTP speculative decoding.",
+            help="Enable multi-layer Eagle speculative decoding.",
         )
 
         # Expert parallelism
