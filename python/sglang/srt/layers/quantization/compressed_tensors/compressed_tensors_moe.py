@@ -115,8 +115,13 @@ class CompressedTensorsMoEMethod(FusedMoEMethodBase):
                 logger.info_once("Using CompressedTensorsWNA16MarlinMoEMethod")
                 return CompressedTensorsWNA16MoEMethod(quant_config)
             else:
-                if quant_config._is_dynamic_token_w4(weight_quant, input_quant) and input_quant is None:
-                    logger.info_once("Using NPUCompressedTensorsW4A16Int4DynamicMoEMethod")
+                if (
+                    quant_config._is_dynamic_token_w4(weight_quant, input_quant)
+                    and input_quant is None
+                ):
+                    logger.info_once(
+                        "Using NPUCompressedTensorsW4A16Int4DynamicMoEMethod"
+                    )
                     return NPUCompressedTensorsW4A16Int4DynamicMoEMethod(quant_config)
         elif quant_config._is_fp4a4_nvfp4(weight_quant, input_quant):
             logger.info_once("Using CompressedTensorsW4A4Nvfp4MoEMethod")

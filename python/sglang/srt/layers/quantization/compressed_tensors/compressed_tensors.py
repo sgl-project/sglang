@@ -42,9 +42,9 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsScheme,
     CompressedTensorsW4A4Fp4,
     CompressedTensorsW8A8Fp8,
+    CompressedTensorsW8A8Int8,
     CompressedTensorsW8A16Fp8,
     CompressedTensorsWNA16,
-    CompressedTensorsW8A8Int8,
     NPUCompressedTensorsW8A8Int8,
 )
 from sglang.srt.layers.quantization.compressed_tensors.utils import (
