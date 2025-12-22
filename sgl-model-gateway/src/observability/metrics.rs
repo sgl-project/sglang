@@ -187,7 +187,7 @@ pub fn init_metrics() {
         "Worker-level errors by worker_type, connection_mode, error_type"
     );
     describe_counter!(
-        "smg_policy_manual_branch_total",
+        "smg_worker_manual_policy_branch_total",
         "Manual policy execution branch by branch type"
     );
 
@@ -814,7 +814,7 @@ impl Metrics {
     /// Record manual policy execution branch
     pub fn record_policy_manual_branch(branch: &'static str) {
         counter!(
-            "smg_policy_manual_branch_total",
+            "smg_worker_manual_policy_branch_total",
             "branch" => branch
         )
         .increment(1);
