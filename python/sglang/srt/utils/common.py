@@ -3790,6 +3790,7 @@ def get_current_device_numa_node() -> int:
         RuntimeError: If nvidia-smi fails, is not found, or output cannot be parsed.
     """
     import torch
+
     device_id = torch.cuda.current_device()
 
     try:

@@ -46,10 +46,9 @@ class HiRadixCache(RadixCache):
 
         if server_args.hicache_numa_detect:
             bind_to_closest_numa_node()
-        
+
         self.page_size = params.page_size
         self.kv_cache = params.token_to_kv_pool_allocator.get_kvcache()
-
 
         if isinstance(self.kv_cache, MHATokenToKVPool):
             self.token_to_kv_pool_host = MHATokenToKVPoolHost(
