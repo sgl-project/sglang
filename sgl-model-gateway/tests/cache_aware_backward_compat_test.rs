@@ -156,6 +156,9 @@ fn test_remove_worker_by_url_backward_compat() {
     policy.remove_worker_by_url("http://worker1:8080");
 
     let workers: Vec<Arc<dyn Worker>> = vec![Arc::new(worker2.clone())];
-    let selected = policy.select_worker(&workers, Some("test"));
+    let selected = policy.select_worker(&workers, &SelectWorkerInfo {
+        request_text: Some("test"),
+        ..Default::default()
+    });
     assert_eq!(selected, Some(0), "Should only have worker2 left");
 }
