@@ -7,6 +7,8 @@ from typing import Any
 
 
 class EnvField:
+    _allow_set_name = True
+
     def __init__(self, default: Any):
         self.default = default
         # NOTE: we use None to indicate whether the value is set or not
@@ -15,6 +17,7 @@ class EnvField:
         self._set_to_none = False
 
     def __set_name__(self, owner, name):
+        assert EnvField._allow_set_name, "Usage like `a = envs.A` is not allowed"
         self.name = name
 
     def parse(self, value: str) -> Any:
@@ -147,6 +150,9 @@ class Envs:
     # Test & Debug
     SGLANG_IS_IN_CI = EnvBool(False)
     SGLANG_IS_IN_CI_AMD = EnvBool(False)
+    SGLANG_TEST_STUCK_DETOKENIZER = EnvFloat(0)
+    SGLANG_TEST_STUCK_DP_CONTROLLER = EnvFloat(0)
+    SGLANG_TEST_STUCK_TOKENIZER = EnvFloat(0)
     IS_BLACKWELL = EnvBool(False)
     SGLANG_SET_CPU_AFFINITY = EnvBool(False)
     SGLANG_PROFILE_WITH_STACK = EnvBool(True)
@@ -379,6 +385,7 @@ class Envs:
 
 
 envs = Envs()
+EnvField._allow_set_name = False
 
 
 def _print_deprecated_env(new_name: str, old_name: str):
