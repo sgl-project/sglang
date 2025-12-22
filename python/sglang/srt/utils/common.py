@@ -341,11 +341,6 @@ def support_triton(backend: str) -> bool:
     return backend not in ["torch_native", "intel_amx"]
 
 
-_ENABLE_TORCH_INFERENCE_MODE = get_bool_env_var(
-    "SGLANG_ENABLE_TORCH_INFERENCE_MODE", "false"
-)
-
-
 class DynamicGradMode(_DecoratorContextManager):
     """
     A combination of torch.no_grad and torch.inference_mode,
@@ -355,27 +350,29 @@ class DynamicGradMode(_DecoratorContextManager):
     @staticmethod
     def set_inference_mode(mode: bool):
         if isinstance(mode, bool):
-            global _ENABLE_TORCH_INFERENCE_MODE
-
-            _ENABLE_TORCH_INFERENCE_MODE = mode
+            envs.SGLANG_ENABLE_TORCH_INFERENCE_MODE.set(mode)
         else:
             logger.warning("mode is not a boolean object")
 
     def __init__(self, mode=True):
         if not torch._jit_internal.is_scripting():
             super().__init__()
-        if _ENABLE_TORCH_INFERENCE_MODE:
+        if envs.SGLANG_ENABLE_TORCH_INFERENCE_MODE.get():
             self.mode = mode
         else:
             self.prev = False
 
-    def __new__(cls, mode_or_orig_func=True if _ENABLE_TORCH_INFERENCE_MODE else None):
+    def __new__(cls, mode_or_orig_func=None):
+        if mode_or_orig_func is None:
+            mode_or_orig_func = (
+                True if envs.SGLANG_ENABLE_TORCH_INFERENCE_MODE.get() else None
+            )
         if mode_or_orig_func is None or isinstance(mode_or_orig_func, bool):
             return super().__new__(cls)
         return cls()(mode_or_orig_func)
 
     def __enter__(self) -> None:
-        if _ENABLE_TORCH_INFERENCE_MODE:
+        if envs.SGLANG_ENABLE_TORCH_INFERENCE_MODE.get():
             self._inference_mode_context = torch._C._InferenceMode(self.mode)
             self._inference_mode_context.__enter__()
         else:
@@ -383,7 +380,7 @@ class DynamicGradMode(_DecoratorContextManager):
             torch.set_grad_enabled(False)
 
     def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> None:
-        if _ENABLE_TORCH_INFERENCE_MODE:
+        if envs.SGLANG_ENABLE_TORCH_INFERENCE_MODE.get():
             self._inference_mode_context.__exit__(exc_type, exc_value, traceback)
         else:
             torch.set_grad_enabled(self.prev)
@@ -392,7 +389,7 @@ class DynamicGradMode(_DecoratorContextManager):
         r"""
         Create a copy of this class
         """
-        if _ENABLE_TORCH_INFERENCE_MODE:
+        if envs.SGLANG_ENABLE_TORCH_INFERENCE_MODE.get():
             return self.__class__(self.mode)
         else:
             return self.__class__()
