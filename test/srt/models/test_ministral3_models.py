@@ -3,12 +3,13 @@ from types import SimpleNamespace
 
 from sglang.test.kits.gsm8k_accuracy_kit import GSM8KMixin
 from sglang.test.mmmu_vlm_mixin import MMMUVLMMixin
+from sglang.test.server_fixtures.default_fixture import DefaultServerBase
 from sglang.test.test_utils import CustomTestCase
 
 MODEL = "mistralai/Ministral-3-3B-Instruct-2512"
 
 
-class TestMinistral3TextOnly(GSM8KMixin, CustomTestCase):
+class TestMinistral3TextOnly(GSM8KMixin, DefaultServerBase):
     accuracy = 0.6
     model = MODEL
     other_args = ["--trust-remote-code"]
