@@ -347,13 +347,29 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
                     audio_item.feature_attention_mask, dim=1
                 )
 
-        second_per_grid_ts = getattr(ret, "second_per_grid_ts", None) or getattr(
-            ret, "video_second_per_grid", None
-        )
+        second_per_grid_ts = getattr(ret, "second_per_grid_ts", None)
+        if second_per_grid_ts is None:
+            second_per_grid_ts = getattr(ret, "video_second_per_grid", None)
 
         process_time = time.perf_counter()
 
         input_ids = input_ids.flatten()
+
+        image_grid_thw = None
+        if hasattr(ret, "image_grid_thw"):
+            image_grid_thw = ret.image_grid_thw
+
+        if image_grid_thw is None and image_data and isinstance(image_data[0], dict):
+            image_grid_thw = image_data[0].get("image_grid_thw")
+
+        video_grid_thw = None
+        if hasattr(ret, "video_grid_thw"):
+            video_grid_thw = ret.video_grid_thw
+
+        if video_grid_thw is None and request_obj.video_data:
+            first_video = request_obj.video_data[0]
+            if isinstance(first_video, dict):
+                video_grid_thw = first_video.get("video_grid_thw")
 
         mrope_positions, mrope_position_delta = MRotaryEmbedding.get_rope_index(
             spatial_merge_size=self.hf_config.vision_config.spatial_merge_size,
@@ -364,6 +380,7 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
             tokens_per_second=getattr(
                 self.hf_config.vision_config, "tokens_per_second", None
             ),
+            # use the expanded token ids
             input_ids=input_ids.unsqueeze(0),
             image_grid_thw=getattr(ret, "image_grid_thw", None),
             video_grid_thw=getattr(ret, "video_grid_thw", None),
