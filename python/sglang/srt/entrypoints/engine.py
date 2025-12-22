@@ -63,6 +63,9 @@ from sglang.srt.managers.multi_tokenizer_mixin import MultiTokenizerRouter
 from sglang.srt.managers.scheduler import run_scheduler_process
 from sglang.srt.managers.template_manager import TemplateManager
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
+from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
+    parse_remote_instance_transfer_engine_info_from_scheduler_infos,
+)
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.tracing.trace import process_tracing_init, trace_set_thread_info
 from sglang.srt.utils import (
@@ -173,10 +176,9 @@ def _launch_subprocesses(
         scheduler_infos.append(data)
 
     # Get back some info from scheduler to tokenizer_manager
-    scheduler_info = scheduler_infos[0]
-    tokenizer_manager.max_req_input_len = scheduler_info["max_req_input_len"]
+    tokenizer_manager.max_req_input_len = scheduler_infos[0]["max_req_input_len"]
 
-    return tokenizer_manager, template_manager, scheduler_info, port_args
+    return tokenizer_manager, template_manager, scheduler_infos, port_args
 
 
 class Engine(EngineBase):
@@ -221,13 +223,18 @@ class Engine(EngineBase):
         atexit.register(self.shutdown)
 
         # Launch subprocesses
-        tokenizer_manager, template_manager, scheduler_info, port_args = (
+        tokenizer_manager, template_manager, scheduler_infos, port_args = (
             self.launch_subprocesses_func(server_args=server_args)
         )
         self.tokenizer_manager = tokenizer_manager
         self.template_manager = template_manager
-        self.scheduler_info = scheduler_info
+        self.scheduler_info = scheduler_infos[0]
         self.port_args = port_args
+        self.remote_instance_transfer_engine_info = (
+            parse_remote_instance_transfer_engine_info_from_scheduler_infos(
+                scheduler_infos
+            )
+        )
 
         # Initialize ZMQ sockets
         context = zmq.Context(2)
@@ -266,6 +273,8 @@ class Engine(EngineBase):
         # - Single image for a single request
         # - List of images (one per request in a batch)
         # - List of lists of images (multiple images per request)
+        # - List of preprocessed outputs from a Huggingface processor, each as a dict containing `format`: 'processor_output' and other data
+        # - List of precomputed image embeddings, each as a dict containing field `format`: 'precomputed_embedding' and `feature`: the precomputed embedding
         # See also python/sglang/srt/utils.py:load_image for more details.
         image_data: Optional[MultimodalDataInputFormat] = None,
         audio_data: Optional[MultimodalDataInputFormat] = None,
@@ -277,6 +286,7 @@ class Engine(EngineBase):
         lora_path: Optional[List[Optional[str]]] = None,
         custom_logit_processor: Optional[Union[List[str], str]] = None,
         return_hidden_states: bool = False,
+        return_routed_experts: bool = False,
         stream: bool = False,
         bootstrap_host: Optional[Union[List[str], str]] = None,
         bootstrap_port: Optional[Union[List[int], int]] = None,
@@ -312,6 +322,7 @@ class Engine(EngineBase):
             lora_path=lora_path,
             custom_logit_processor=custom_logit_processor,
             return_hidden_states=return_hidden_states,
+            return_routed_experts=return_routed_experts,
             stream=stream,
             bootstrap_host=bootstrap_host,
             bootstrap_port=bootstrap_port,
@@ -348,6 +359,8 @@ class Engine(EngineBase):
         # - Single image for a single request
         # - List of images (one per request in a batch)
         # - List of lists of images (multiple images per request)
+        # - List of preprocessed outputs from a Huggingface processor, each as a dict containing `format`: 'processor_output' and other data
+        # - List of precomputed image embeddings, each as a dict containing field `format`: 'precomputed_embedding' and `feature`: the precomputed embedding
         # See also python/sglang/srt/utils.py:load_image for more details.
         image_data: Optional[MultimodalDataInputFormat] = None,
         audio_data: Optional[MultimodalDataInputFormat] = None,

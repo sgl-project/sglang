@@ -59,6 +59,8 @@ class RouterArgs:
     request_id_headers: Optional[List[str]] = None
     # Request timeout in seconds
     request_timeout_secs: int = 1800
+    # Grace period in seconds to wait for in-flight requests during shutdown
+    shutdown_grace_period_secs: int = 180
     # Max concurrent requests for rate limiting (-1 to disable)
     max_concurrent_requests: int = -1
     # Queue size for pending requests when max concurrent limit reached
@@ -363,6 +365,12 @@ class RouterArgs:
             type=int,
             default=RouterArgs.request_timeout_secs,
             help="Request timeout in seconds",
+        )
+        parser.add_argument(
+            f"--{prefix}shutdown-grace-period-secs",
+            type=int,
+            default=RouterArgs.shutdown_grace_period_secs,
+            help="Grace period in seconds to wait for in-flight requests during shutdown",
         )
         # Retry configuration
         parser.add_argument(
