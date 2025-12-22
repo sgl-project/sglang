@@ -43,8 +43,8 @@ class BaseTestSoftWatchdog:
         requests.post(
             DEFAULT_URL_FOR_TEST + "/generate",
             json={
-                "text": "Hello",
-                "sampling_params": {"max_new_tokens": 1, "temperature": 0},
+                "text": "Hello, please repeat this sentence for 1000 times.",
+                "sampling_params": {"max_new_tokens": 100, "temperature": 0},
             },
             timeout=30,
         )

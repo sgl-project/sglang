@@ -53,6 +53,8 @@ class _WatchdogReal(Watchdog):
             watchdog_timeout=watchdog_timeout,
             soft=soft,
         )
+        if self._test_stuck_time > 0:
+            logger.info(f"Watchdog {self._raw.debug_name} is configured to use {test_stuck_time=}.")
 
     def feed(self):
         if self._test_stuck_time > 0:
