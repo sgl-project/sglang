@@ -39,7 +39,7 @@ class TestNightlyTextModelsPerformance(unittest.TestCase):
 
         for model_setup in self.models:
             with self.subTest(model=model_setup.model_path):
-                results, success = self.runner.run_benchmark_for_model(
+                results, success, _ = self.runner.run_benchmark_for_model(
                     model_path=model_setup.model_path,
                     batch_sizes=self.batch_sizes,
                     input_lens=self.input_lens,
