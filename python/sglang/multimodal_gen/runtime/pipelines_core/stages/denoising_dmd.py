@@ -89,7 +89,6 @@ class DmdDenoisingStage(DenoisingStage):
         )
 
         pos_cond_kwargs = prepared_vars["pos_cond_kwargs"]
-        prompt_embeds = prepared_vars["prompt_embeds"]
 
         denoising_loop_start_time = time.time()
         with self.progress_bar(total=len(timesteps)) as progress_bar:
@@ -142,9 +141,8 @@ class DmdDenoisingStage(DenoisingStage):
                         ):
                             # Run transformer
                             pred_noise = self.transformer(
-                                latent_model_input.permute(0, 2, 1, 3, 4),
-                                prompt_embeds,
-                                t_expand,
+                                hidden_states=latent_model_input.permute(0, 2, 1, 3, 4),
+                                timestep=t_expand,
                                 guidance=guidance_expand,
                                 **image_kwargs,
                                 **pos_cond_kwargs,
