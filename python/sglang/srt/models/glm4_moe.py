@@ -300,7 +300,8 @@ class Glm4MoeAttention(nn.Module):
             self._used_fused_qk_norm_rope_last_call = True
         else:
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-            q, k = self._apply_qk_norm(q, k)
+            if self.use_qk_norm:
+                q, k = self._apply_qk_norm(q, k)
             q, k = self.rotary_emb(
                 positions,
                 q,
