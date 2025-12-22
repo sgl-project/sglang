@@ -227,6 +227,7 @@ impl ConfigValidator {
                     });
                 }
             }
+            PolicyConfig::Manual => {}
         }
         Ok(())
     }
