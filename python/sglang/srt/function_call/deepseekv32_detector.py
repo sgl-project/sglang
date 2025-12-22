@@ -2,6 +2,8 @@ import json
 import logging
 import re
 
+from partial_json_parser.core.options import Allow
+
 from sglang.srt.entrypoints.openai.protocol import Tool
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
 from sglang.srt.function_call.core_types import (
@@ -10,7 +12,7 @@ from sglang.srt.function_call.core_types import (
     ToolCallItem,
     _GetInfoFunc,
 )
-from sglang.srt.function_call.utils import _find_common_prefix
+from sglang.srt.function_call.utils import _find_common_prefix, _partial_json_loads
 
 logger = logging.getLogger(__name__)
 
@@ -82,6 +84,7 @@ class DeepSeekV32Detector(BaseFormatDetector):
         self.invoke_regex = (
             r'<｜DSML｜invoke\s+name="([^"]+)"\s*>(.*?)(</｜DSML｜invoke>|$)'
         )
+        self.prefix_parameter_end_call = ["</", "｜DSML｜", "parameter"]
         self.current_tool_id = -1
 
     def has_tool_call(self, text: str) -> bool:
@@ -139,16 +142,25 @@ class DeepSeekV32Detector(BaseFormatDetector):
         # If allowed, try to parse a partial parameter at the end
         if allow_partial:
             remaining_content = invoke_content[last_match_end:]
+
+            # Remove incomplete parameter_end_call prefix in case they are captured by param
+            for token in reversed(self.prefix_parameter_end_call):
+                remaining_content = remaining_content.rstrip(token)
+
             # Match start of a parameter tag + value (potentially incomplete)
             # Regex: <tag name="..." string="...">VALUE... (no end tag)
             partial_match = re.search(
                 self.partial_parameter_regex, remaining_content, re.DOTALL
             )
 
-            if partial_match:
+            if partial_match and (param_value := partial_match.group(3)):
                 param_name = partial_match.group(1)
-                param_value = partial_match.group(3)
-                parameters[param_name] = param_value
+                if partial_match.group(2) == "true":
+                    parameters[param_name] = param_value.strip()
+                else:
+                    parameters[param_name] = _partial_json_loads(
+                        param_value, Allow.ALL
+                    )[0]
 
         return parameters
 
@@ -237,22 +249,13 @@ class DeepSeekV32Detector(BaseFormatDetector):
                     string=current_text,
                     flags=re.DOTALL,
                 )
-                func_name = invoke_match.group(1).strip()
-                invoke_content = invoke_match.group(2)
-
-                if any(
-                    invoke_content.endswith(end)
-                    for end in self.invoke_end_token_prefixes
-                ):
+                if not invoke_match:
                     break
 
+                func_name = invoke_match.group(1).strip()
+                invoke_content = invoke_match.group(2)
                 # group(3) is either "</｜DSML｜invoke>" (complete) or "" (incomplete, matched with $)
                 is_tool_end = bool(invoke_match.group(3))
-
-                func_args_raw, format = self._parse_parameters_partially(invoke_content)
-
-                if is_tool_end and format == "xml":
-                    func_args_raw += "}"
 
                 # Initialize state if this is the first tool call
                 if self.current_tool_id == -1:
