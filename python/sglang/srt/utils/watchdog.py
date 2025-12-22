@@ -32,7 +32,7 @@ class Watchdog:
 
     @contextmanager
     def disable(self):
-        raise NotImplementedError
+        yield
 
 
 class _WatchdogReal(Watchdog):
