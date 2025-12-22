@@ -564,30 +564,18 @@ class ModelRunner:
         )
 
         # Init max running requests
-        token_pool_size = self.req_to_token_pool.size
-        if server_args.max_running_requests is None:
-            running_limit = self.max_total_num_tokens // 2
-            log_info_on_rank0(
-                logger,
-                f"max_running_requests: no arg, token_limit=total_tokens//2={self.max_total_num_tokens}//2={running_limit}",
-            )
-        else:
-            dp_divisor = server_args.dp_size if server_args.enable_dp_attention else 1
-            running_limit = server_args.max_running_requests // dp_divisor
-            log_info_on_rank0(
-                logger,
-                f"max_running_requests: arg=({server_args.max_running_requests})//dp_divisor({dp_divisor})={running_limit}",
-            )
-        self.max_running_requests = min(running_limit, token_pool_size)
-        log_info_on_rank0(
-            logger,
-            f"max_running_requests: effective=min(running_limit={running_limit}, req_to_token_pool.size={token_pool_size})={self.max_running_requests}",
+        # Heuristic: if not specified, use half of total tokens as the limit.
+        # Then clamp by req_to_token_pool.size (the number of slots available).
+        # For DP attention, divide by dp_size since requests are distributed.
+        self.max_running_requests = min(
+            (
+                self.max_total_num_tokens // 2
+                if server_args.max_running_requests is None
+                else server_args.max_running_requests
+                // (server_args.dp_size if server_args.enable_dp_attention else 1)
+            ),
+            self.req_to_token_pool.size,
         )
-        if self.max_running_requests < running_limit:
-            log_info_on_rank0(
-                logger,
-                f"max_running_requests: clamped by req_to_token_pool.size {running_limit} -> {self.max_running_requests}",
-            )
 
         # Init routed experts capturer
         self.init_routed_experts_capturer()
@@ -1907,6 +1895,7 @@ class ModelRunner:
             self.max_total_num_tokens = small_kv_size
 
         if max_running_requests is None:
+            # Heuristic: scale slots by (max_tokens / context_len * 512), clamped to [2048, 4096].
             minimum_slots = 2048
             maximum_slots = 4096
             heuristic = int(
@@ -1916,9 +1905,7 @@ class ModelRunner:
             log_info_on_rank0(
                 logger,
                 f"req_to_token_pool: slots={max_running_requests} "
-                f"(heuristic={heuristic}, clamp=[{minimum_slots},{maximum_slots}], "
-                f"profiled_max_total_num_tokens={self.max_total_num_tokens}, "
-                f"context_len={self.model_config.context_len}), "
+                f"(heuristic={heuristic}, clamp=[{minimum_slots},{maximum_slots}]), "
                 f"mem={max_running_requests * self.model_config.context_len * 4 / 1e9:.2f}GB",
             )
         else:
@@ -1948,17 +1935,17 @@ class ModelRunner:
         if self.spec_algorithm.is_eagle() or self.spec_algorithm.is_standalone():
             if self.is_draft_worker:
                 self.max_total_num_tokens = self.server_args.draft_runner_cache_size
-                max_num_reqs = self.server_args.max_num_reqs
+                max_running_requests = self.server_args.max_num_reqs
             else:
                 # We are sharing the `token_to_kv_pool`, and both verify and draft tokens
                 # can be concurrently allocated, so we should give a headroom for it.
                 extra_tokens = (
                     # draft
-                    max_num_reqs
+                    max_running_requests
                     * self.server_args.speculative_num_steps
                     * self.server_args.speculative_eagle_topk
                     # verify
-                    + max_num_reqs
+                    + max_running_requests
                     * self.server_args.speculative_num_draft_tokens
                     # buffer
                     + 100
@@ -1968,13 +1955,9 @@ class ModelRunner:
                 self.max_total_num_tokens += extra_tokens
                 self.server_args.draft_runner_cache_size = self.max_total_num_tokens
 
-                self.server_args.max_num_reqs = max_num_reqs
+                self.server_args.max_num_reqs = max_running_requests
 
         if max_total_tokens is not None:
-            log_info_on_rank0(
-                logger,
-                f"max_total_num_tokens: arg={max_total_tokens} vs profiled={self.max_total_num_tokens}, using min",
-            )
             if max_total_tokens > self.max_total_num_tokens:
                 logging.warning(
                     f"max_total_tokens={max_total_tokens} is larger than the profiled value "
@@ -1982,18 +1965,6 @@ class ModelRunner:
                     f"Use the profiled value instead."
                 )
             self.max_total_num_tokens = min(self.max_total_num_tokens, max_total_tokens)
-            # Clarify the common confusion: req_to_token_pool slots control concurrent request slots,
-            # while max_total_num_tokens controls KV capacity (and later scheduler limits).
-            log_info_on_rank0(
-                logger,
-                f"note: req_to_token_pool slots={max_running_requests}; "
-                f"effective scheduler max_running_requests will be computed later and clamped by slots if needed",
-            )
-        else:
-            log_info_on_rank0(
-                logger,
-                f"max_total_num_tokens: arg=None, profiled={self.max_total_num_tokens}",
-            )
 
         self.max_total_num_tokens = (
             self.max_total_num_tokens
