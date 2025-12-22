@@ -2,7 +2,7 @@ import unittest
 from types import SimpleNamespace
 
 from sglang.test.kits.gsm8k_accuracy_kit import GSM8KMixin
-from sglang.test.kits.mmmu_vlm_mixin import MMMUVLMMixin
+from sglang.test.kits.mmmu_vlm_kit import MMMUVLMMixin
 from sglang.test.server_fixtures.default_fixture import DefaultServerBase
 from sglang.test.test_utils import CustomTestCase
 
