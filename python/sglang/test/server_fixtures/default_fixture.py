@@ -50,6 +50,9 @@ class DefaultServerBase(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         assert cls.model is not None, "Please set cls.model in subclass"
+
+        # Set OpenAI API key and base URL environment variables.
+        # Needed for lmm-evals to work.
         with openai_api_env(cls.api_key):
             cls.process = popen_launch_server(
                 cls.model,
