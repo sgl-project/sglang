@@ -1033,7 +1033,7 @@ class StorageMetricsCollector:
         self,
         labels: Dict[str, str],
     ):
-        from prometheus_client import Counter, Histogram
+        from prometheus_client import Counter, Gauge, Histogram
 
         self.labels = labels
 
@@ -1066,16 +1066,7 @@ class StorageMetricsCollector:
             50,
             100,
         ]
-        bucket_prefetch_occupied_ratio = [
-            0.0,
-            0.3,
-            0.5,
-            0.8,
-            0.9,
-            1.0,
-            1.2,
-            1.5,
-        ]
+
         self.histogram_prefetch_pgs = Histogram(
             name="sglang:prefetch_pgs",
             documentation="Histogram of prefetch pages of batches.",
@@ -1103,11 +1094,10 @@ class StorageMetricsCollector:
             labelnames=labels.keys(),
             buckets=bucket_bandwidth,
         )
-        self.histogram_prefetch_occupied_ratio = Histogram(
+        self.gauge_prefetch_occupied_ratio = Gauge(
             name="sglang:prefetch_occupied_ratio",
-            documentation="Histogram of prefetch occupied ratio.",
+            documentation="Current prefetch occupied ratio (0-1, >1 means rate limited).",
             labelnames=labels.keys(),
-            buckets=bucket_prefetch_occupied_ratio,
         )
 
     def log_prefetched_tokens(self, prefetched_tokens: int):
@@ -1120,6 +1110,10 @@ class StorageMetricsCollector:
 
     def _log_histogram(self, histogram, data: Union[int, float]):
         histogram.labels(**self.labels).observe(data)
+
+    def _log_gauge(self, gauge, data: Union[int, float]) -> None:
+        # Convenience function for logging to gauge.
+        gauge.labels(**self.labels).set(data)
 
     def log_storage_metrics(self, storage_metrics: Optional[StorageMetrics] = None):
         if storage_metrics is None:
@@ -1135,8 +1129,10 @@ class StorageMetricsCollector:
             self._log_histogram(self.histogram_prefetch_bandwidth, v)
         for v in storage_metrics.backup_bandwidth:
             self._log_histogram(self.histogram_backup_bandwidth, v)
-        for v in storage_metrics.prefetch_occupied_ratios:
-            self._log_histogram(self.histogram_prefetch_occupied_ratio, v)
+
+        self._log_gauge(
+            self.gauge_prefetch_occupied_ratio, storage_metrics.prefetch_occupied_ratios
+        )
 
 
 class ExpertDispatchCollector:

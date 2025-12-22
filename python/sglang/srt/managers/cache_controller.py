@@ -370,7 +370,7 @@ class HiCacheController:
             self.prefetch_thread.start()
             self.backup_thread.start()
 
-        self.prefetch_occupied_ratio = []
+        self.prefetch_occupied_ratio = 0.0
 
     def _generate_storage_config(
         self,
@@ -670,7 +670,7 @@ class HiCacheController:
         Rate limit the prefetching operations to avoid overwhelming the storage backend.
         """
         # metrics collection
-        self.prefetch_occupied_ratio.append(
+        self.prefetch_occupied_ratio = (
             self.prefetch_tokens_occupied / self.prefetch_capacity_limit
         )
         # cancel prefetch if too much memory is occupied
@@ -836,11 +836,8 @@ class HiCacheController:
         """
         Collect cache controller metrics and merge with storage backend stats.
         """
-        # Get storage backend stats
+        # Get storage backend stats and add prefetch occupied ratio
         storage_stats = self.storage_backend.get_stats()
-
-        # Add prefetch occupied ratio
-        storage_stats.prefetch_occupied_ratios.extend(self.prefetch_occupied_ratio)
-        self.prefetch_occupied_ratio.clear()
+        storage_stats.prefetch_occupied_ratios = self.prefetch_occupied_ratio
 
         return storage_stats
