@@ -150,6 +150,9 @@ class Envs:
     # Test & Debug
     SGLANG_IS_IN_CI = EnvBool(False)
     SGLANG_IS_IN_CI_AMD = EnvBool(False)
+    SGLANG_TEST_STUCK_DETOKENIZER = EnvFloat(0)
+    SGLANG_TEST_STUCK_DP_CONTROLLER = EnvFloat(0)
+    SGLANG_TEST_STUCK_TOKENIZER = EnvFloat(0)
     IS_BLACKWELL = EnvBool(False)
     SGLANG_SET_CPU_AFFINITY = EnvBool(False)
     SGLANG_PROFILE_WITH_STACK = EnvBool(True)
@@ -339,9 +342,10 @@ class Envs:
     SGLANG_RESIZE_RESAMPLE = EnvStr("")
     SGLANG_MM_BUFFER_SIZE_MB = EnvInt(0)
     SGLANG_MM_PRECOMPUTE_HASH = EnvBool(False)
+    SGLANG_VIT_ENABLE_CUDA_GRAPH = EnvBool(False)
 
     # VLM Item CUDA IPC Transport
-    SGLANG_USE_CUDA_IPC_TRANSPORT=EnvBool(False)
+    SGLANG_USE_CUDA_IPC_TRANSPORT = EnvBool(False)
     SGLANG_MM_FEATURE_CACHE_MB = EnvInt(4 * 1024)
     SGLANG_MM_ITEM_MEM_POOL_RECYCLE_INTERVAL_SEC = EnvFloat(0.05)
 
