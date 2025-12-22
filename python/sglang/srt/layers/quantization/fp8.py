@@ -185,7 +185,7 @@ class Fp8Config(QuantizationConfig):
             return Fp8MoEMethod(self)
         elif isinstance(layer, RadixAttention):
             return Fp8KVCacheMethod(self)
-        return Fp8LinearMethod(self)
+        return None
 
     def get_scaled_act_names(self) -> List[str]:
         return []
@@ -238,8 +238,7 @@ class Fp8LinearMethod(LinearMethodBase):
         output_size_per_partition = sum(output_partition_sizes)
         weight_loader = extra_weight_attrs.get("weight_loader")
 
-        # tp_size = get_tensor_model_parallel_world_size()
-        tp_size = 1
+        tp_size = get_tensor_model_parallel_world_size()
         if self.block_quant:
             block_n, block_k = (
                 self.quant_config.weight_block_size[0],

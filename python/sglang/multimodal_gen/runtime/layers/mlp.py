@@ -7,7 +7,7 @@ import torch.nn as nn
 
 from sglang.multimodal_gen.runtime.layers.activation import get_act_fn
 from sglang.multimodal_gen.runtime.layers.linear import ReplicatedLinear
-from sglang.srt.layers.quantization import QuantizationConfig
+from sglang.multimodal_gen.runtime.layers.quantization import QuantizationConfig
 
 
 class MLP(nn.Module):
