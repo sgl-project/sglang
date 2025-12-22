@@ -51,14 +51,16 @@ from sglang.srt.utils import (
 )
 
 if TYPE_CHECKING:
-    from sglang.srt.speculative.multi_layer_eagle_worker_v2 import MTPDraftWorker
+    from sglang.srt.speculative.multi_layer_eagle_worker_v2 import (
+        MultiLayerEagleDraftWorker,
+    )
 
 
 logger = logging.getLogger(__name__)
 
 
 class MultiLayerEagleDraftExtendCudaGraphRunner:
-    def __init__(self, mtp_worker: MTPDraftWorker, step: int):
+    def __init__(self, mtp_worker: MultiLayerEagleDraftWorker, step: int):
         # Parse args
         self.step = step
         self.mtp_worker = mtp_worker
@@ -541,7 +543,7 @@ class MultiLayerEagleDraftExtendCudaGraphRunner:
 
 
 class MultiLayerEagleMultiStepDraftExtendCudaGraphRunner:
-    def __init__(self, mtp_worker: MTPDraftWorker):
+    def __init__(self, mtp_worker: MultiLayerEagleDraftWorker):
         self.mtp_worker = mtp_worker
         self.device = mtp_worker.device
         self.gpu_id = mtp_worker.gpu_id

@@ -66,7 +66,7 @@ def _get_plan_stream(
         return None, contextlib.nullcontext()
 
 
-class MTPDraftWorker(BaseDraftWorker):
+class MultiLayerEagleDraftWorker(BaseDraftWorker):
     def __init__(
         self,
         server_args: ServerArgs,
@@ -560,7 +560,7 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
         # Override the context length of the draft model to be the same as the target model.
         server_args.context_length = target_worker.model_runner.model_config.context_len
 
-        self._draft_worker = MTPDraftWorker(
+        self._draft_worker = MultiLayerEagleDraftWorker(
             server_args, gpu_id, tp_rank, dp_rank, moe_ep_rank, nccl_port, target_worker
         )
 
