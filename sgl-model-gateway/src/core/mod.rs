@@ -9,11 +9,8 @@
 //! - Workflow steps for multi-step operations
 //! - Common utilities
 
-/// Default model identifier used when no model is specified.
-///
-/// This constant should be used instead of hardcoded "unknown" strings
-/// throughout the codebase for consistency.
-pub const UNKNOWN_MODEL_ID: &str = "unknown";
+// Re-export UNKNOWN_MODEL_ID from protocols for use throughout core
+pub use crate::protocols::UNKNOWN_MODEL_ID;
 
 pub mod circuit_breaker;
 pub mod error;
