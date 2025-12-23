@@ -92,6 +92,15 @@ class SchedulerPPMixin:
                 next_pp_outputs = None
                 next_batch_result = None
                 d2h_event = None
+                if self.server_args.pp_async_batch_depth > 0:
+                    (
+                        next_pp_outputs,
+                        next_batch_result,
+                        d2h_event,
+                    ) = self._pp_commit_send_output_work_and_preprocess_output_tensors(
+                        next_first_rank_mb_id,
+                        next_mb_id,
+                    )
                 self._pp_commit_comm_work(self.send_proxy_work)
                 if self.cur_batch:
                     result, self.launch_event = self._pp_launch_batch(
@@ -100,12 +109,15 @@ class SchedulerPPMixin:
                         self.mb_metadata,
                         self.last_rank_comm_queue,
                     )
-                next_pp_outputs, next_batch_result, d2h_event = (
-                    self._pp_commit_send_output_work_and_preprocess_output_tensors(
+                if self.server_args.pp_async_batch_depth == 0:
+                    (
+                        next_pp_outputs,
+                        next_batch_result,
+                        d2h_event,
+                    ) = self._pp_commit_send_output_work_and_preprocess_output_tensors(
                         next_first_rank_mb_id,
                         next_mb_id,
                     )
-                )
                 if self.mbs[next_mb_id] is not None:
                     d2h_event.synchronize()
                     with torch.profiler.record_function("process_batch_result"):
@@ -223,6 +235,15 @@ class SchedulerPPMixin:
                     pp_proxy_tensors = self._pp_recv_proxy_tensors()
                     self._pp_record_proxy_tensor_lifetime(pp_proxy_tensors)
 
+                if self.server_args.pp_async_batch_depth > 0:
+                    (
+                        next_pp_outputs,
+                        next_batch_result,
+                        d2h_event,
+                    ) = self._pp_commit_send_output_work_and_preprocess_output_tensors(
+                        next_first_rank_mb_id,
+                        next_mb_id,
+                    )
                 self._pp_commit_comm_work(self.send_proxy_work)
                 if self.cur_batch:
                     result, self.launch_event = self._pp_launch_batch(
@@ -231,12 +252,15 @@ class SchedulerPPMixin:
                         self.mb_metadata,
                         self.last_rank_comm_queue,
                     )
-                next_pp_outputs, next_batch_result, d2h_event = (
-                    self._pp_commit_send_output_work_and_preprocess_output_tensors(
+                if self.server_args.pp_async_batch_depth == 0:
+                    (
+                        next_pp_outputs,
+                        next_batch_result,
+                        d2h_event,
+                    ) = self._pp_commit_send_output_work_and_preprocess_output_tensors(
                         next_first_rank_mb_id,
                         next_mb_id,
                     )
-                )
                 send_consensus_bootstrapped_work, consensus_bootstrapped_rids = (
                     self._pp_pd_send_consensus_bootstrapped_ids(
                         bmbs,
@@ -364,6 +388,15 @@ class SchedulerPPMixin:
                     if not self.cur_batch.forward_mode.is_prebuilt():
                         pp_proxy_tensors = self._pp_recv_proxy_tensors()
                         self._pp_record_proxy_tensor_lifetime(pp_proxy_tensors)
+                if self.server_args.pp_async_batch_depth > 0:
+                    (
+                        next_pp_outputs,
+                        next_batch_result,
+                        d2h_event,
+                    ) = self._pp_commit_send_output_work_and_preprocess_output_tensors(
+                        next_first_rank_mb_id,
+                        next_mb_id,
+                    )
                 self._pp_commit_comm_work(self.send_proxy_work)
 
                 if self.cur_batch:
@@ -374,12 +407,15 @@ class SchedulerPPMixin:
                         self.last_rank_comm_queue,
                     )
 
-                next_pp_outputs, next_batch_result, d2h_event = (
-                    self._pp_commit_send_output_work_and_preprocess_output_tensors(
+                if self.server_args.pp_async_batch_depth == 0:
+                    (
+                        next_pp_outputs,
+                        next_batch_result,
+                        d2h_event,
+                    ) = self._pp_commit_send_output_work_and_preprocess_output_tensors(
                         next_first_rank_mb_id,
                         next_mb_id,
                     )
-                )
 
                 # reach consensus on last rank and send to PP=0
                 # otherwise, just pass along previous consensus
