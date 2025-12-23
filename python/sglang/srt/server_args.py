@@ -782,6 +782,11 @@ class ServerArgs:
         elif self.speculative_draft_model_quantization == "unquant":
             self.speculative_draft_model_quantization = None
 
+        if self.compilation_config:
+            if isinstance(self.compilation_config, str):
+                args_dict = json.loads(self.compilation_config)
+                self.compilation_config = CompilationConfig(**args_dict)
+
     def _handle_hpu_backends(self):
         if self.device == "hpu":
             self.attention_backend = "torch_native"
@@ -2422,11 +2427,6 @@ class ServerArgs:
                 self.preferred_sampling_params = json.loads(
                     self.preferred_sampling_params
                 )
-
-        if self.compilation_config:
-            if isinstance(self.compilation_config, str):
-                args_dict = json.loads(self.compilation_config)
-                self.compilation_config = CompilationConfig(**args_dict)
 
     def _handle_two_batch_overlap(self):
         if self.enable_two_batch_overlap and self.moe_a2a_backend == "none":
