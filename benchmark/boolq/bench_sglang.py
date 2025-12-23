@@ -4,7 +4,7 @@ import time
 
 import numpy as np
 
-from sglang.api import set_default_backend
+from sglang.lang.api import set_default_backend
 from sglang.test.test_utils import (
     add_common_sglang_args_and_parse,
     select_sglang_backend,
@@ -52,12 +52,12 @@ def main(args):
     ######### SGL Program Begin #########
     #####################################
 
-    import sglang as sgl
+    from sglang.lang.api import function, gen
 
-    @sgl.function
+    @function
     def few_shot_boolq(s, question):
         s += few_shots + question
-        s += sgl.gen("answer", max_tokens=5, stop=["\n"])
+        s += gen("answer", max_tokens=5, stop=["\n"])
 
     #####################################
     ########## SGL Program End ##########
