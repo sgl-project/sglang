@@ -52,9 +52,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Force enable TileLang GEMM
-os.environ["SGLANG_ENABLE_TILELANG_GEMM"] = "1"
-
 
 def tflops(M: int, N: int, K: int, latency_ms: float) -> float:
     """Calculate TFLOPS."""

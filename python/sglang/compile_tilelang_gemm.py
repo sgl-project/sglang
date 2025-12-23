@@ -35,9 +35,6 @@ import torch
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
-# Force enable TileLang GEMM for compilation
-os.environ["SGLANG_ENABLE_TILELANG_GEMM"] = "1"
-
 
 def get_model_weight_shapes(
     model_path: str,
