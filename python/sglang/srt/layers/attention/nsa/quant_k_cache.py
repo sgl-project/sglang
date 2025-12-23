@@ -104,7 +104,9 @@ def quantize_k_cache_separate(
             )
 
         nope_part = packed_bytes[:, :nope_part_bytes].unsqueeze(1)
-        rope_part = packed_bytes[:, nope_part_bytes : nope_part_bytes + rope_part_bytes].unsqueeze(1)
+        rope_part = packed_bytes[
+            :, nope_part_bytes : nope_part_bytes + rope_part_bytes
+        ].unsqueeze(1)
 
     return nope_part, rope_part
 
@@ -308,8 +310,12 @@ def _quantize_k_cache_fast_separate(k_nope, k_rope, group_size: int = 128):
     # Calculate byte sizes based on validated dimensions
     # nope_part: [FP8 quantized data (dim_nope bytes)] + [FP32 scales (num_tiles * 4 bytes)]
     # rope_part: [BF16 raw data (dim_rope * 2 bytes)]
-    nope_part_bytes = dim_nope + num_tiles * 4  # e.g., 512 + 4*4 = 528 for dim_nope=512, group_size=128
-    rope_part_bytes = dim_rope * k_rope.element_size()  # e.g., 64 * 2 = 128 for dim_rope=64, BF16
+    nope_part_bytes = (
+        dim_nope + num_tiles * 4
+    )  # e.g., 512 + 4*4 = 528 for dim_nope=512, group_size=128
+    rope_part_bytes = (
+        dim_rope * k_rope.element_size()
+    )  # e.g., 64 * 2 = 128 for dim_rope=64, BF16
 
     # Sanity check for typed view alignment
     # FP32 scales view requires 4-byte alignment at offset dim_nope
@@ -491,8 +497,12 @@ if __name__ == "__main__":
         dim_nope = 512
         dim_rope = 64
 
-        k_nope = torch.randn(num_tokens, 1, dim_nope, dtype=torch.bfloat16, device="cuda")
-        k_rope = torch.randn(num_tokens, 1, dim_rope, dtype=torch.bfloat16, device="cuda")
+        k_nope = torch.randn(
+            num_tokens, 1, dim_nope, dtype=torch.bfloat16, device="cuda"
+        )
+        k_rope = torch.randn(
+            num_tokens, 1, dim_rope, dtype=torch.bfloat16, device="cuda"
+        )
 
         # Old path: concat then quantize
         k_concat = torch.cat([k_nope, k_rope], dim=-1).squeeze(1)  # (num_tokens, 576)
@@ -507,7 +517,9 @@ if __name__ == "__main__":
         old_bytes = old_output.view(torch.uint8)
 
         if old_bytes.shape != new_bytes.shape:
-            raise RuntimeError(f"Shape mismatch: {old_bytes.shape} vs {new_bytes.shape}")
+            raise RuntimeError(
+                f"Shape mismatch: {old_bytes.shape} vs {new_bytes.shape}"
+            )
 
         diff_bytes = (old_bytes != new_bytes).sum().item()
         if diff_bytes > 0:
