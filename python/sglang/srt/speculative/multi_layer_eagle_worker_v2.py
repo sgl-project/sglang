@@ -33,10 +33,10 @@ from sglang.srt.speculative.eagle_info_v2 import (
     fill_new_verified_id,
 )
 from sglang.srt.speculative.eagle_utils import TreeMaskMode, build_tree_kernel_efficient
-from sglang.srt.speculative.mtp_draft_extend_cuda_graph_runner import (
-    MTPMultiStepDraftExtendCudaGraphRunner,
+from sglang.srt.speculative.multi_layer_eagle_draft_extend_cuda_graph_runner import (
+    MultiLayerEagleMultiStepDraftExtendCudaGraphRunner,
 )
-from sglang.srt.speculative.mtp_utils import (
+from sglang.srt.speculative.multi_layer_eagle_utils import (
     assign_hidden_states_pool_triton,
     rotate_input_ids_triton,
 )
@@ -66,7 +66,7 @@ def _get_plan_stream(
         return None, contextlib.nullcontext()
 
 
-class MTPDraftWorker(BaseDraftWorker):
+class MultiLayerEagleDraftWorker(BaseDraftWorker):
     def __init__(
         self,
         server_args: ServerArgs,
@@ -125,7 +125,7 @@ class MTPDraftWorker(BaseDraftWorker):
                 is_draft_worker=True,
                 req_to_token_pool=self.req_to_token_pool,
                 token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-                is_mtp_worker=True,
+                is_multi_layer_eagle=True,
             )
 
         # Alias for better readability
@@ -200,7 +200,7 @@ class MTPDraftWorker(BaseDraftWorker):
             return
 
         self.cuda_graph_runner_for_draft_extend = (
-            MTPMultiStepDraftExtendCudaGraphRunner(self)
+            MultiLayerEagleMultiStepDraftExtendCudaGraphRunner(self)
         )
 
     def reset_cuda_graph_buffers(self, forward_batch, batch_result):
@@ -528,7 +528,7 @@ class MTPDraftWorker(BaseDraftWorker):
         )
 
 
-class MTPWorkerV2(BaseSpecWorker):
+class MultiLayerEagleWorkerV2(BaseSpecWorker):
     def __init__(
         self,
         server_args: ServerArgs,
@@ -560,7 +560,7 @@ class MTPWorkerV2(BaseSpecWorker):
         # Override the context length of the draft model to be the same as the target model.
         server_args.context_length = target_worker.model_runner.model_config.context_len
 
-        self._draft_worker = MTPDraftWorker(
+        self._draft_worker = MultiLayerEagleDraftWorker(
             server_args, gpu_id, tp_rank, dp_rank, moe_ep_rank, nccl_port, target_worker
         )
 
