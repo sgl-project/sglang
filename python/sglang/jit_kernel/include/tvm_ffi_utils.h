@@ -9,6 +9,10 @@ inline constexpr int64_t encode_dlpack_dtype(DLDataType dtype) {
   return (dtype.code << 16) | (dtype.bits << 8) | dtype.lanes;
 }
 
+inline constexpr int64_t encode_dlpack_dtype(DLDataType dtype, int32_t extra) {
+  return ((int64_t)extra << 32) | encode_dlpack_dtype(dtype);
+}
+
 constexpr DLDataType dl_float16 = DLDataType{kDLFloat, 16, 1};
 constexpr DLDataType dl_float32 = DLDataType{kDLFloat, 32, 1};
 constexpr DLDataType dl_float64 = DLDataType{kDLFloat, 64, 1};
@@ -21,6 +25,8 @@ constexpr int64_t float32_code = encode_dlpack_dtype(dl_float32);
 constexpr int64_t float64_code = encode_dlpack_dtype(dl_float64);
 constexpr int64_t bfloat16_code = encode_dlpack_dtype(dl_bfloat16);
 constexpr int64_t int32_code = encode_dlpack_dtype(dl_int32);
+constexpr int64_t uint8_code = encode_dlpack_dtype(dl_uint8);
+constexpr int64_t u8b128_code = encode_dlpack_dtype(dl_uint8, 128);
 
 #define _DISPATCH_CASE_F16(c_type, ...) \
   case float16_code: {                  \

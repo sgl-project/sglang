@@ -21,7 +21,7 @@
 
 namespace MARLIN_NAMESPACE_NAME {
 
-template <typename scalar_t>
+template <typename scalar_t, bool has_zp, bool is_zp_float>
 void marlin_mm(
     const void* A,
     const void* B,
@@ -50,7 +50,6 @@ void marlin_mm(
     bool has_bias,
     bool has_act_order,
     bool is_k_full,
-    bool has_zp,
     int num_groups,
     int group_size,
     int dev,
@@ -59,9 +58,9 @@ void marlin_mm(
     int thread_n,
     int sms,
     bool use_atomic_add,
-    bool use_fp32_reduce,
-    bool is_zp_float) {}
+    bool use_fp32_reduce) {}
 
+template <bool has_zp, bool is_zp_float>
 void moe_wna16_marlin_gemm(
     const tvm::ffi::TensorView& a,
     const tvm::ffi::TensorView& c,
@@ -81,14 +80,13 @@ void moe_wna16_marlin_gemm(
     int64_t top_k,
     bool mul_topk_weights,
     bool is_ep,
-    DLDataType b_q_type,
     int64_t size_m,
     int64_t size_n,
     int64_t size_k,
     bool is_k_full,
     bool use_atomic_add,
-    bool use_fp32_reduce,
-    bool is_zp_float) {
+    bool use_fp32_reduce) {
+  const DLDataType b_q_type = b_q_weight.dtype();
   int pack_factor = 32 / b_q_type.bits;
 
   if (moe_block_size != 8) {
@@ -130,7 +128,7 @@ void moe_wna16_marlin_gemm(
   int thread_n = -1;
   // sms: number of SMs to use for the kernel
   int sms = -1;
-  cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, a.device().device_id);
+  CHECK_CUDA_SUCCESS(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, a.device().device_id));
 
   // Verify C
   TVM_FFI_ICHECK(c.device().device_type == kDLCUDA) << "c is not on GPU";
@@ -139,17 +137,19 @@ void moe_wna16_marlin_gemm(
       << "Shape mismatch: c.size(0) = " << c.size(0) << ", size_m * topk = " << size_m * top_k;
   TVM_FFI_ICHECK(c.size(1) == size_n) << "Shape mismatch: c.size(1) = " << c.size(1) << ", size_n = " << size_n;
 
+  const auto empty_tensor =
+      tvm::ffi::Tensor::FromEnvAlloc(TVMFFIEnvTensorAlloc, {0}, dl_float32, c.device());
+
   // Alloc C tmp buffer that is going to be used for the global reduce
-  tvm::ffi::Tensor c_tmp;
+  tvm::ffi::TensorView c_tmp = empty_tensor;
   if (use_fp32_reduce && !use_atomic_add) {
     // max num of threadblocks is sms * 4
     long max_c_tmp_size = min(
         (long)size_n * sorted_token_ids.size(0), (long)sms * 4 * moe_block_size * MARLIN_NAMESPACE_NAME::max_thread_n);
     if (moe_block_size == 8) max_c_tmp_size *= 2;
-    c_tmp =
-        tvm::ffi::Tensor::FromEnvAlloc(TVMFFIEnvTensorAlloc, {max_c_tmp_size}, DLDataType{kDLFloat, 32, 4}, c.device());
-  } else {
-    c_tmp = tvm::ffi::Tensor::FromEnvAlloc(TVMFFIEnvTensorAlloc, {0}, DLDataType{kDLFloat, 32, 4}, c.device());
+    const auto c_tmp_tensor =
+        tvm::ffi::Tensor::FromEnvAlloc(TVMFFIEnvTensorAlloc, {max_c_tmp_size}, dl_float32, c.device());
+    c_tmp = c_tmp_tensor;
   }
 
   // Detect groupsize and act_order
@@ -162,7 +162,6 @@ void moe_wna16_marlin_gemm(
       << "b_scales dim 2 = " << b_scales.size(2) << " is not size_n = " << size_n;
   num_groups = b_scales.size(1);
 
-  const auto empty_tensor = tvm::ffi::Tensor::FromEnvAlloc(TVMFFIEnvTensorAlloc, {0}, DLDataType{2, 32, 4}, c.device());
   tvm::ffi::TensorView g_idx = empty_tensor, perm = empty_tensor, a_tmp = empty_tensor;
 
   if (g_idx_or_none.has_value() && perm_or_none.has_value()) {
@@ -228,7 +227,7 @@ void moe_wna16_marlin_gemm(
     TVM_FFI_ICHECK(b_zeros.device().device_type == kDLCUDA) << "b_zeros is not on GPU";
     TVM_FFI_ICHECK(b_zeros.is_contiguous()) << "b_zeros is not contiguous";
   }
-  bool has_zp = b_zeros.size(-1) > 0;
+  TVM_FFI_ICHECK(has_zp == b_zeros.size(-1) > 0) << "has_zp = " << has_zp << " is not equal to b_zeros.size(-1) = " << b_zeros.size(-1);
   if (has_zp) {
     TVM_FFI_ICHECK(b_q_type.code == kDLUInt && (b_q_type.bits == 4 || b_q_type.bits == 8))
         << "b_q_type must be u4 or u8 when has_zp = True. Got = " << b_q_type;
@@ -278,7 +277,7 @@ void moe_wna16_marlin_gemm(
     }
     void* scales_ptr = b_scales.data_ptr();
 
-    marlin_mm<scalar_t>(
+    marlin_mm<scalar_t, has_zp, is_zp_float>(
         a.data_ptr(),
         b_q_weight.data_ptr(),
         c.data_ptr(),
@@ -306,7 +305,6 @@ void moe_wna16_marlin_gemm(
         has_bias,
         has_act_order,
         is_k_full,
-        has_zp,
         num_groups,
         group_size,
         dev,
@@ -315,8 +313,7 @@ void moe_wna16_marlin_gemm(
         thread_n,
         sms,
         use_atomic_add,
-        use_fp32_reduce,
-        is_zp_float);
+        use_fp32_reduce);
   });
 }
 

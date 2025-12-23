@@ -12,12 +12,16 @@ if TYPE_CHECKING:
 
 
 @lru_cache(maxsize=None)
-def _jit_merlin_module() -> Module:
+def _jit_merlin_module(has_zp: bool, is_zp_float: bool) -> Module:
+    args = make_cpp_args(
+        has_zp,
+        is_zp_float,
+    )
     return load_jit(
         "merlin",
         cuda_files=["marlin_moe_wna16/ops.cuh"],
         cuda_wrappers=[
-            ("moe_wna16_marlin_gemm", f"marlin::moe_wna16_marlin_gemm"),
+            ("moe_wna16_marlin_gemm", f"marlin::moe_wna16_marlin_gemm<{args}>"),
         ],
     )
 
@@ -41,7 +45,6 @@ def moe_wna16_marlin_gemm(
     top_k: int,
     mul_topk_weights: bool,
     is_ep: bool,
-    b_q_type_id: int,
     size_m: int,
     size_n: int,
     size_k: int,
@@ -55,7 +58,7 @@ def moe_wna16_marlin_gemm(
         if c_or_none is not None
         else torch.empty((size_m * top_k, size_n), device=a.device, dtype=a.dtype)
     )
-    _jit_merlin_module().moe_wna16_marlin_gemm(
+    _jit_merlin_module(b_zeros_or_none is not None, is_zp_float).moe_wna16_marlin_gemm(
         a,
         c,
         b_q_weight,
@@ -74,13 +77,11 @@ def moe_wna16_marlin_gemm(
         top_k,
         mul_topk_weights,
         is_ep,
-        b_q_weight.dtype,
         size_m,
         size_n,
         size_k,
         is_k_full,
         use_atomic_add,
         use_fp32_reduce,
-        is_zp_float,
     )
     return c

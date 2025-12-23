@@ -143,6 +143,7 @@ sglang = "sglang.cli.main:main"
   "srt/speculative/cpp_ngram/*.h",
   "jit_kernel/include/sgl_kernel/*.h",
   "jit_kernel/include/sgl_kernel/*.cuh",
+  "jit_kernel/include/sgl_kernel/*.hpp",
   "jit_kernel/csrc/*.cuh",
   "jit_kernel/include/*.h",
   "jit_kernel/csrc/marlin_moe_wna16/*.cuh"
