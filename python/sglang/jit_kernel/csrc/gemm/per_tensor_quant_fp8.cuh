@@ -1,5 +1,5 @@
-#include <sgl_kernel/fp8_utils.cuh>
 #include <sgl_kernel/tensor.h>
+#include <sgl_kernel/fp8_utils.cuh>
 #include <sgl_kernel/utils.cuh>
 #include <sgl_kernel/utils.h>
 
@@ -8,6 +8,22 @@
 
 #include <cstddef>
 #include <cstdint>
+
+namespace host {
+namespace details {
+
+template <>
+struct dtype_trait<c10::Half> {
+  inline static constexpr DLDataType value = {.code = DLDataTypeCode::kDLFloat, .bits = 16, .lanes = 1};
+};
+
+template <>
+struct dtype_trait<c10::BFloat16> {
+  inline static constexpr DLDataType value = {.code = DLDataTypeCode::kDLBfloat, .bits = 16, .lanes = 1};
+};
+
+}  // namespace details
+}  // namespace host
 
 namespace {
 
