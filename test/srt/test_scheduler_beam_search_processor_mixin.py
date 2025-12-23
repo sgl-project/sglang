@@ -211,7 +211,7 @@ class TestProcessDecodeResult(unittest.TestCase):
     )
     @patch.object(SchedulerBeamSearchProcessorMixin, "_process_beam_search_expansion")
     @patch.object(SchedulerBeamSearchProcessorMixin, "_extract_beam_topk_data")
-    def test_process_decode_result_finished_request_without_incompleted(
+    def test_process_decode_result_finished_request_without_incomplete(
         self,
         mock_extract_topk,
         mock_process_expansion,
@@ -239,7 +239,7 @@ class TestProcessDecodeResult(unittest.TestCase):
         req.beam_width = 2
         req.beam_candidates = 4
         req.beam_list = Mock()
-        req.beam_list.incompleted = []
+        req.beam_list.incomplete = []
         req.beam_list.completed = []
         req.stop_token_ids = set()
 
@@ -262,7 +262,7 @@ class TestProcessDecodeResult(unittest.TestCase):
     )
     @patch.object(SchedulerBeamSearchProcessorMixin, "_process_beam_search_expansion")
     @patch.object(SchedulerBeamSearchProcessorMixin, "_extract_beam_topk_data")
-    def test_process_decode_result_finished_with_incompleted_beams(
+    def test_process_decode_result_finished_with_incomplete_beams(
         self,
         mock_extract_topk,
         mock_process_expansion,
@@ -270,7 +270,7 @@ class TestProcessDecodeResult(unittest.TestCase):
         mock_cache_finished,
         mock_handle_kv,
     ):
-        """Test decode result processing with a finished request that has incompleted beams."""
+        """Test decode result processing with a finished request that has incomplete beams."""
         device = torch.device("cpu")
 
         mock_extract_topk.return_value = (
@@ -294,7 +294,7 @@ class TestProcessDecodeResult(unittest.TestCase):
         beam1.beam_score = None
         beam2 = Mock()
         beam2.beam_score = None
-        req.beam_list.incompleted = [beam1, beam2]
+        req.beam_list.incomplete = [beam1, beam2]
         req.beam_list.completed = []
         req.stop_token_ids = set()
 
@@ -714,7 +714,7 @@ class TestCreateCompletedBeamsForInsufficientCandidates(unittest.TestCase):
         )
 
         self.assertEqual(len(req.beam_list.completed), 2)
-        self.assertEqual(len(req.beam_list.incompleted), 0)
+        self.assertEqual(len(req.beam_list.incomplete), 0)
 
         # Check first beam (finished with stop token)
         first_beam = req.beam_list.completed[0]
@@ -757,7 +757,7 @@ class TestCreateCompletedBeamsForInsufficientCandidates(unittest.TestCase):
             req, top_logprobs_val, top_logprobs_idx, finish_mask_cpu, device
         )
 
-        self.assertEqual(len(req.beam_list.incompleted), 3)
+        self.assertEqual(len(req.beam_list.incomplete), 3)
         self.assertEqual(len(req.beam_list.completed), 1)
 
         completed_beam = req.beam_list.completed[0]
@@ -771,20 +771,20 @@ class TestCreateCompletedBeamsForInsufficientCandidates(unittest.TestCase):
         self.assertIsInstance(completed_beam.finish_reason, FINISH_MATCHED_TOKEN)
         self.assertEqual(completed_beam.finish_reason.matched, 100)
 
-        # Verify incompleted beams don't have beam_score
-        for i, beam in enumerate(req.beam_list.incompleted):
+        # Verify incomplete beams don't have beam_score
+        for i, beam in enumerate(req.beam_list.incomplete):
             self.assertIsNone(
-                beam.beam_score, f"Incompleted beam {i} should not have beam_score"
+                beam.beam_score, f"Incomplete beam {i} should not have beam_score"
             )
             self.assertIsNone(
                 beam.finish_reason,
-                f"Incompleted beam {i} should not have finish_reason",
+                f"Incomplete beam {i} should not have finish_reason",
             )
 
-        # Verify incompleted beams have correct tokens
-        self.assertEqual(req.beam_list.incompleted[0].tokens, [200])
-        self.assertEqual(req.beam_list.incompleted[1].tokens, [300])
-        self.assertEqual(req.beam_list.incompleted[2].tokens, [400])
+        # Verify incomplete beams have correct tokens
+        self.assertEqual(req.beam_list.incomplete[0].tokens, [200])
+        self.assertEqual(req.beam_list.incomplete[1].tokens, [300])
+        self.assertEqual(req.beam_list.incomplete[2].tokens, [400])
 
 
 class TestCreateInitialBeamSequences(unittest.TestCase):
@@ -812,10 +812,10 @@ class TestCreateInitialBeamSequences(unittest.TestCase):
             req, top_logprobs_val, top_logprobs_idx, finish_mask_cpu, device
         )
 
-        self.assertEqual(len(req.beam_list.incompleted), 2)
+        self.assertEqual(len(req.beam_list.incomplete), 2)
         self.assertEqual(len(req.beam_list.completed), 0)
-        self.assertEqual(req.beam_list.incompleted[0].tokens, [100])
-        self.assertEqual(req.beam_list.incompleted[1].tokens, [200])
+        self.assertEqual(req.beam_list.incomplete[0].tokens, [100])
+        self.assertEqual(req.beam_list.incomplete[1].tokens, [200])
         self.assertEqual(len(req.beam_list.prompt_lens), 2)
         self.assertEqual(len(req.beam_list.last_tokens), 2)
         self.assertEqual(len(req.beam_list.cum_logprobs), 2)
@@ -1079,7 +1079,7 @@ class TestProcessBeamSearchExpansion(unittest.TestCase):
         req.beam_width = 2
         req.beam_candidates = 4
         req.beam_list = Mock()
-        req.beam_list.incompleted = [
+        req.beam_list.incomplete = [
             BeamSearchSequence(tokens=[1, 2], cum_logprob=-2.0),
             BeamSearchSequence(tokens=[3, 4], cum_logprob=-3.0),
         ]
@@ -1125,7 +1125,7 @@ class TestProcessBeamSearchExpansion(unittest.TestCase):
         req.beam_width = 2
         req.beam_candidates = 4
         req.beam_list = Mock()
-        req.beam_list.incompleted = [
+        req.beam_list.incomplete = [
             BeamSearchSequence(tokens=[1, 2, 3, 4, 5, 6, 7, 8, 9], cum_logprob=-2.0),
             BeamSearchSequence(tokens=[3, 4, 5, 6, 7, 8, 9, 10, 11], cum_logprob=-3.0),
         ]
@@ -1168,7 +1168,7 @@ class TestProcessBeamSearchExpansion(unittest.TestCase):
         req.beam_width = 2
         req.beam_candidates = 4
         req.beam_list = Mock()
-        req.beam_list.incompleted = [
+        req.beam_list.incomplete = [
             BeamSearchSequence(tokens=[1, 2], cum_logprob=-2.0),
             BeamSearchSequence(tokens=[3, 4], cum_logprob=-3.0),
         ]
@@ -1213,7 +1213,7 @@ class TestProcessBeamSearchExpansion(unittest.TestCase):
         req.beam_width = 2
         req.beam_candidates = 4
         req.beam_list = Mock()
-        req.beam_list.incompleted = [
+        req.beam_list.incomplete = [
             BeamSearchSequence(tokens=[1, 2], cum_logprob=-2.0),
             BeamSearchSequence(tokens=[3, 4], cum_logprob=-3.0),
         ]
@@ -1261,7 +1261,7 @@ class TestExpandAndPruneBeams(unittest.TestCase):
         req.sampling_params.stop_strs = []
         req.stop_token_ids = set()
         req.beam_list = Mock()
-        req.beam_list.incompleted = [
+        req.beam_list.incomplete = [
             BeamSearchSequence(tokens=[1, 2], cum_logprob=-2.0),
             BeamSearchSequence(tokens=[3, 4], cum_logprob=-3.0),
         ]
@@ -1285,15 +1285,15 @@ class TestExpandAndPruneBeams(unittest.TestCase):
 
         self.assertIsNotNone(result)
         self.assertEqual(len(result), beam_width)
-        self.assertEqual(len(req.beam_list.incompleted), beam_width)
+        self.assertEqual(len(req.beam_list.incomplete), beam_width)
         # First beam: tokens=[1, 2] + token_id=100, cum_logprob=-2.5
-        self.assertEqual(req.beam_list.incompleted[0].tokens, [1, 2, 100])
-        self.assertAlmostEqual(req.beam_list.incompleted[0].cum_logprob, -2.5)
-        self.assertIsNone(req.beam_list.incompleted[0].finish_reason)
+        self.assertEqual(req.beam_list.incomplete[0].tokens, [1, 2, 100])
+        self.assertAlmostEqual(req.beam_list.incomplete[0].cum_logprob, -2.5)
+        self.assertIsNone(req.beam_list.incomplete[0].finish_reason)
         # Second beam: tokens=[1, 2] + token_id=200, cum_logprob=-3.0
-        self.assertEqual(req.beam_list.incompleted[1].tokens, [1, 2, 200])
-        self.assertAlmostEqual(req.beam_list.incompleted[1].cum_logprob, -3.0)
-        self.assertIsNone(req.beam_list.incompleted[1].finish_reason)
+        self.assertEqual(req.beam_list.incomplete[1].tokens, [1, 2, 200])
+        self.assertAlmostEqual(req.beam_list.incomplete[1].cum_logprob, -3.0)
+        self.assertIsNone(req.beam_list.incomplete[1].finish_reason)
 
         self.assertEqual(len(req.beam_list.completed), 0)
 
@@ -1325,7 +1325,7 @@ class TestExpandAndPruneBeams(unittest.TestCase):
         req.sampling_params.stop_strs = []
         req.stop_token_ids = {50256}
         req.beam_list = Mock()
-        req.beam_list.incompleted = [
+        req.beam_list.incomplete = [
             BeamSearchSequence(tokens=[1, 2], cum_logprob=-2.0),
             BeamSearchSequence(tokens=[3, 4], cum_logprob=-3.0),
         ]
@@ -1357,11 +1357,11 @@ class TestExpandAndPruneBeams(unittest.TestCase):
         )
         self.assertEqual(req.beam_list.completed[0].beam_score, 0.5)
 
-        self.assertEqual(len(req.beam_list.incompleted), beam_width)
-        self.assertEqual(req.beam_list.incompleted[0].tokens, [1, 2, 200])
-        self.assertEqual(req.beam_list.incompleted[0].cum_logprob, -3.0)
-        self.assertEqual(req.beam_list.incompleted[1].tokens, [3, 4, 500])
-        self.assertEqual(req.beam_list.incompleted[1].cum_logprob, -3.5)
+        self.assertEqual(len(req.beam_list.incomplete), beam_width)
+        self.assertEqual(req.beam_list.incomplete[0].tokens, [1, 2, 200])
+        self.assertEqual(req.beam_list.incomplete[0].cum_logprob, -3.0)
+        self.assertEqual(req.beam_list.incomplete[1].tokens, [3, 4, 500])
+        self.assertEqual(req.beam_list.incomplete[1].cum_logprob, -3.5)
 
         mock_calc_score.assert_called_once()
 
@@ -1383,7 +1383,7 @@ class TestExpandAndPruneBeams(unittest.TestCase):
         req.sampling_params.stop_strs = ["STOP"]  # Trigger sequential check
         req.stop_token_ids = set()
         req.beam_list = Mock()
-        req.beam_list.incompleted = [
+        req.beam_list.incomplete = [
             BeamSearchSequence(tokens=[1, 2], cum_logprob=-2.0),
             BeamSearchSequence(tokens=[3, 4], cum_logprob=-3.0),
         ]
@@ -1432,13 +1432,13 @@ class TestExpandAndPruneBeams(unittest.TestCase):
         )
         self.assertEqual(req.beam_list.completed[0].beam_score, 0.8)
 
-        self.assertEqual(len(req.beam_list.incompleted), beam_width)
-        self.assertEqual(req.beam_list.incompleted[0].tokens, [3, 4, 700])
-        self.assertAlmostEqual(req.beam_list.incompleted[0].cum_logprob, -5.5)
-        self.assertIsNone(req.beam_list.incompleted[0].finish_reason)
-        self.assertEqual(req.beam_list.incompleted[1].tokens, [3, 4, 800])
-        self.assertAlmostEqual(req.beam_list.incompleted[1].cum_logprob, -6.0)
-        self.assertIsNone(req.beam_list.incompleted[1].finish_reason)
+        self.assertEqual(len(req.beam_list.incomplete), beam_width)
+        self.assertEqual(req.beam_list.incomplete[0].tokens, [3, 4, 700])
+        self.assertAlmostEqual(req.beam_list.incomplete[0].cum_logprob, -5.5)
+        self.assertIsNone(req.beam_list.incomplete[0].finish_reason)
+        self.assertEqual(req.beam_list.incomplete[1].tokens, [3, 4, 800])
+        self.assertAlmostEqual(req.beam_list.incomplete[1].cum_logprob, -6.0)
+        self.assertIsNone(req.beam_list.incomplete[1].finish_reason)
 
         self.assertTrue(
             torch.equal(
@@ -1472,7 +1472,7 @@ class TestExpandAndPruneBeams(unittest.TestCase):
         req.sampling_params.stop_strs = []
         req.stop_token_ids = {50256}
         req.beam_list = Mock()
-        req.beam_list.incompleted = [
+        req.beam_list.incomplete = [
             BeamSearchSequence(tokens=[1, 2], cum_logprob=-2.0),
         ]
         req.beam_list.completed = []
@@ -1493,7 +1493,7 @@ class TestExpandAndPruneBeams(unittest.TestCase):
 
         self.assertIsNone(result)
         self.assertEqual(len(req.beam_list.completed), 6)
-        self.assertEqual(len(req.beam_list.incompleted), 0)
+        self.assertEqual(len(req.beam_list.incomplete), 0)
         self.assertEqual(mock_calc_score.call_count, 6)
         for beam in req.beam_list.completed:
             self.assertEqual(beam.beam_score, -1.0)
@@ -1512,7 +1512,7 @@ class TestCreateCompletedBeamsForFinishedRequest(unittest.TestCase):
 
         req = Mock()
         req.beam_list = Mock()
-        req.beam_list.incompleted = [
+        req.beam_list.incomplete = [
             BeamSearchSequence(tokens=[1, 2], cum_logprob=-2.0),
             BeamSearchSequence(tokens=[3, 4], cum_logprob=-3.0),
         ]
@@ -1546,7 +1546,7 @@ class TestCreateCompletedBeamsForFinishedRequest(unittest.TestCase):
         )
 
         self.assertEqual(len(req.beam_list.completed), 3)
-        self.assertEqual(len(req.beam_list.incompleted), 0)
+        self.assertEqual(len(req.beam_list.incomplete), 0)
 
         self.assertEqual(req.beam_list.completed[0], existing_beam)
 

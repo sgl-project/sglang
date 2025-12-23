@@ -132,15 +132,15 @@ class SchedulerBeamSearchProcessorMixin:
                 last_batch_slot_indices_list.append(last_batch_slot_indices)
 
             if req.finished():
-                for beam in req.beam_list.incompleted:
+                for beam in req.beam_list.incomplete:
                     beam.beam_score = self._calculate_beam_score_with_eos_check(
                         beam, req.stop_token_ids
                     )
 
-                completed = req.beam_list.completed + req.beam_list.incompleted
+                completed = req.beam_list.completed + req.beam_list.incomplete
                 completed = sorted(completed, key=lambda x: x.beam_score, reverse=True)
                 req.beam_list.completed = completed[: req.beam_width]
-                req.beam_list.incompleted = []
+                req.beam_list.incomplete = []
 
         self.stream_output(batch.reqs, batch.return_logprob)
 
@@ -330,7 +330,7 @@ class SchedulerBeamSearchProcessorMixin:
             )
         ]
         req.beam_list.completed = completed
-        req.beam_list.incompleted = []
+        req.beam_list.incomplete = []
         if req.finished_reason is None:
             req.finished_reason = completed[0].finish_reason
 
@@ -346,7 +346,7 @@ class SchedulerBeamSearchProcessorMixin:
 
         When there are enough unfinished candidates (>= beam_width) during prefill,
         this function creates initial beam sequences, separating them into completed
-        and incompleted lists, and initializes the beam_list state.
+        and incomplete lists, and initializes the beam_list state.
 
         Args:
             req: Request object
@@ -356,7 +356,7 @@ class SchedulerBeamSearchProcessorMixin:
             device: Device where tensors are located
         """
         completed_beams = []
-        incompleted_beams = []
+        incomplete_beams = []
         last_token_ids = []
         cum_logprobs = []
 
@@ -378,14 +378,14 @@ class SchedulerBeamSearchProcessorMixin:
                 completed_beams.append(beam_sequence)
                 logger.debug(f"completed beam: {beam_sequence}")
             else:
-                incompleted_beams.append(beam_sequence)
+                incomplete_beams.append(beam_sequence)
                 cum_logprobs.append(top_logprob)
                 last_token_ids.append(top_token)
-                if len(incompleted_beams) == req.beam_width:
+                if len(incomplete_beams) == req.beam_width:
                     break
 
         req.beam_list.completed = completed_beams
-        req.beam_list.incompleted = incompleted_beams
+        req.beam_list.incomplete = incomplete_beams
         req.beam_list.prompt_lens = torch.tensor(
             [len(req.origin_input_ids)] * req.beam_width,
             dtype=torch.long,
@@ -544,7 +544,7 @@ class SchedulerBeamSearchProcessorMixin:
         )
 
         # Determine if length is sufficient by checking the first beam request
-        current_generated = len(req.beam_list.incompleted[0].tokens)
+        current_generated = len(req.beam_list.incomplete[0].tokens)
         will_finish_reason = (
             req.to_finish
             if req.to_finish
@@ -623,26 +623,26 @@ class SchedulerBeamSearchProcessorMixin:
         top_tokens_cpu = top_tokens.cpu().tolist()
         topk_values_cpu = topk_values.cpu().tolist()
 
-        incompleted = []
+        incomplete = []
         completed = []
         keep_last_beam_indices = []
         last_token_ids = []
-        incompleted_cum_logprobs = []
+        incomplete_cum_logprobs = []
 
         if not has_stop_strs and (ignore_eos or not req.stop_token_ids):
             for last_beam_idx, top_token, cum_logprob in zip(
                 last_beam_indices_cpu, top_tokens_cpu, topk_values_cpu
             ):
-                beam_seq = req.beam_list.incompleted[last_beam_idx]
+                beam_seq = req.beam_list.incomplete[last_beam_idx]
                 new_beam = BeamSearchSequence(
                     tokens=beam_seq.tokens + [top_token],
                     cum_logprob=cum_logprob,
                 )
-                incompleted.append(new_beam)
+                incomplete.append(new_beam)
                 keep_last_beam_indices.append(last_beam_idx)
                 last_token_ids.append(top_token)
-                incompleted_cum_logprobs.append(cum_logprob)
-                if len(incompleted) >= beam_width:
+                incomplete_cum_logprobs.append(cum_logprob)
+                if len(incomplete) >= beam_width:
                     break
         elif not has_stop_strs and not ignore_eos and req.stop_token_ids:
             stop_token_ids_tensor = torch.tensor(
@@ -657,7 +657,7 @@ class SchedulerBeamSearchProcessorMixin:
                 topk_values_cpu,
                 eos_mask_cpu,
             ):
-                beam_seq = req.beam_list.incompleted[last_beam_idx]
+                beam_seq = req.beam_list.incomplete[last_beam_idx]
                 new_beam = BeamSearchSequence(
                     tokens=beam_seq.tokens + [top_token],
                     cum_logprob=cum_logprob,
@@ -669,17 +669,17 @@ class SchedulerBeamSearchProcessorMixin:
                     )
                     completed.append(new_beam)
                 else:
-                    incompleted.append(new_beam)
+                    incomplete.append(new_beam)
                     keep_last_beam_indices.append(last_beam_idx)
                     last_token_ids.append(top_token)
-                    incompleted_cum_logprobs.append(cum_logprob)
-                    if len(incompleted) >= beam_width:
+                    incomplete_cum_logprobs.append(cum_logprob)
+                    if len(incomplete) >= beam_width:
                         break
         else:
             for last_beam_idx, top_token, cum_logprob in zip(
                 last_beam_indices_cpu, top_tokens_cpu, topk_values_cpu
             ):
-                beam_seq = req.beam_list.incompleted[last_beam_idx]
+                beam_seq = req.beam_list.incomplete[last_beam_idx]
                 new_beam = BeamSearchSequence(
                     tokens=beam_seq.tokens + [top_token],
                     cum_logprob=cum_logprob,
@@ -690,18 +690,18 @@ class SchedulerBeamSearchProcessorMixin:
                     )
                     completed.append(new_beam)
                 else:
-                    incompleted.append(new_beam)
+                    incomplete.append(new_beam)
                     keep_last_beam_indices.append(last_beam_idx)
                     last_token_ids.append(top_token)
-                    incompleted_cum_logprobs.append(cum_logprob)
-                    if len(incompleted) >= beam_width:
+                    incomplete_cum_logprobs.append(cum_logprob)
+                    if len(incomplete) >= beam_width:
                         break
 
-        req.beam_list.incompleted = incompleted
+        req.beam_list.incomplete = incomplete
         req.beam_list.completed += completed
 
         # Early termination condition: incomplete beams less than beam_width (many paths ended)
-        if len(req.beam_list.incompleted) < beam_width:
+        if len(req.beam_list.incomplete) < beam_width:
             req.finished_reason = req.beam_list.completed[0].finish_reason
             return None
 
@@ -709,9 +709,9 @@ class SchedulerBeamSearchProcessorMixin:
             last_token_ids,
             device=req.beam_list.last_tokens.device,
         )
-        if req.beam_list.incompleted:
+        if req.beam_list.incomplete:
             req.beam_list.cum_logprobs = torch.tensor(
-                incompleted_cum_logprobs,
+                incomplete_cum_logprobs,
                 dtype=torch.float32,
                 device=req.beam_list.cum_logprobs.device,
             )
@@ -755,10 +755,10 @@ class SchedulerBeamSearchProcessorMixin:
         # Terminated due to length, no need to check stop tokens during scoring
         completed = [
             BeamSearchSequence(
-                tokens=req.beam_list.incompleted[last_beam_idx].tokens + [top_token],
+                tokens=req.beam_list.incomplete[last_beam_idx].tokens + [top_token],
                 beam_score=self._calculate_beam_score(
                     cum_logprob,
-                    len(req.beam_list.incompleted[last_beam_idx].tokens) + 1,
+                    len(req.beam_list.incomplete[last_beam_idx].tokens) + 1,
                 ),
                 cum_logprob=cum_logprob,
                 finish_reason=will_finish_reason,
@@ -769,7 +769,7 @@ class SchedulerBeamSearchProcessorMixin:
         ]
 
         req.beam_list.completed += completed
-        req.beam_list.incompleted = []
+        req.beam_list.incomplete = []
         req.beam_list.cum_logprobs = torch.empty(
             0, dtype=torch.float32, device=req.beam_list.cum_logprobs.device
         )

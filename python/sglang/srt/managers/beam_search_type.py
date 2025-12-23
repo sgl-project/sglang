@@ -49,24 +49,24 @@ class BeamSearchList:
         batch_slot_start_idx: Starting index in batch.req_pool_indices array where
             this beam group's incomplete beams are stored (consecutive beam_width slots)
         completed: List of finished beam sequences
-        incompleted: List of active beam sequences still being explored
+        incomplete: List of active beam sequences still being explored
 
         # Tensor-based state for parallel operations on incomplete beams:
-        cum_logprobs: Cumulative log probabilities, Shape: [num_incompleted_beams]
-        last_tokens: Last token of each beam (updated when incompleted refreshes),
-            Shape: [num_incompleted_beams]
+        cum_logprobs: Cumulative log probabilities, Shape: [num_incomplete_beams]
+        last_tokens: Last token of each beam (updated when incomplete refreshes),
+            Shape: [num_incomplete_beams]
         prompt_lens: Prompt lengths for KV cache (set only at beamlist construction),
-            Shape: [num_incompleted_beams]
+            Shape: [num_incomplete_beams]
     """
 
     batch_slot_start_idx: int = -1
     completed: List[BeamSearchSequence] = field(default_factory=list)
-    incompleted: List[BeamSearchSequence] = field(default_factory=list)
+    incomplete: List[BeamSearchSequence] = field(default_factory=list)
 
-    # Tensor-based state for parallel operations (only for incompleted beams)
+    # Tensor-based state for parallel operations (only for incomplete beams)
     cum_logprobs: Optional[torch.Tensor] = None
     last_tokens: Optional[torch.Tensor] = None
     prompt_lens: Optional[torch.Tensor] = None
 
     def empty(self):
-        return len(self.completed) + len(self.incompleted) == 0
+        return len(self.completed) + len(self.incomplete) == 0
