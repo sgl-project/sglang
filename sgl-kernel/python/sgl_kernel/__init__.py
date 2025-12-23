@@ -124,6 +124,11 @@ from sgl_kernel.speculative import (
     tree_speculative_sampling_target_only,
     verify_tree_greedy,
 )
+from sgl_kernel.svdquant import (
+    svdq_gemm_w4a4,
+    svdq_gemv_awq,
+    svdq_quantize_w4a4_act_fuse_lora,
+)
 from sgl_kernel.top_k import (
     fast_topk,
     fast_topk_transform_fused,

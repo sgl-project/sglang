@@ -622,6 +622,29 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "float scale,"
       "int max_period) -> Tensor");
   m.impl("timestep_embedding", torch::kCUDA, &timestep_embedding);
+
+  /*
+   * From csrc/sgl_diffusion/svdquant
+   */
+  m.def(
+      "svdq_gemv_awq(Tensor in_feats, Tensor kernel, Tensor scaling_factors, Tensor zeros, "
+      "int m, int n, int k, int group_size) -> Tensor");
+  m.impl("svdq_gemv_awq", torch::kCUDA, &svdq_gemv_awq);
+
+  m.def(
+      "svdq_gemm_w4a4(Tensor? act, Tensor? wgt, Tensor? out, Tensor? qout, "
+      "Tensor? ascales, Tensor? wscales, Tensor? oscales, Tensor? poolout, "
+      "Tensor? lora_act_in, Tensor? lora_up, Tensor? lora_down, Tensor? lora_act_out, "
+      "Tensor? norm_q, Tensor? norm_k, Tensor? rotary_emb, Tensor? bias, Tensor? smooth_factor, "
+      "bool act_unsigned, float[] lora_scales, bool fuse_silu, bool fp4, float alpha, "
+      "Tensor? wcscales, Tensor? out_q, Tensor? out_k, Tensor? out_v, int attn_tokens) -> ()");
+  m.impl("svdq_gemm_w4a4", torch::kCUDA, &svdq_gemm_w4a4);
+
+  m.def(
+      "svdq_quantize_w4a4_act_fuse_lora(Tensor input, Tensor? output, Tensor? oscales, "
+      "Tensor? lora_down, Tensor? lora_act_out, Tensor? smooth, bool fuse_glu, bool fp4, "
+      "int pad_size) -> Tensor[]");
+  m.impl("svdq_quantize_w4a4_act_fuse_lora", torch::kCUDA, &svdq_quantize_w4a4_act_fuse_lora);
 }
 
 REGISTER_EXTENSION(common_ops)

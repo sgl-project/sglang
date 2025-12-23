@@ -1018,3 +1018,53 @@ torch::Tensor timestep_embedding(
     double downscale_freq_shift,
     double scale,
     int64_t max_period);
+
+torch::Tensor svdq_gemv_awq(
+    torch::Tensor in_feats,
+    torch::Tensor kernel,
+    torch::Tensor scaling_factors,
+    torch::Tensor zeros,
+    int64_t m,
+    int64_t n,
+    int64_t k,
+    int64_t group_size);
+
+void svdq_gemm_w4a4(
+    std::optional<torch::Tensor> act,
+    std::optional<torch::Tensor> wgt,
+    std::optional<torch::Tensor> out,
+    std::optional<torch::Tensor> qout,
+    std::optional<torch::Tensor> ascales,
+    std::optional<torch::Tensor> wscales,
+    std::optional<torch::Tensor> oscales,
+    std::optional<torch::Tensor> poolout,
+    std::optional<torch::Tensor> lora_act_in,
+    std::optional<torch::Tensor> lora_up,
+    std::optional<torch::Tensor> lora_down,
+    std::optional<torch::Tensor> lora_act_out,
+    std::optional<torch::Tensor> norm_q,
+    std::optional<torch::Tensor> norm_k,
+    std::optional<torch::Tensor> rotary_emb,
+    std::optional<torch::Tensor> bias,
+    std::optional<torch::Tensor> smooth_factor,
+    bool act_unsigned,
+    std::vector<double> lora_scales,
+    bool fuse_silu,
+    bool fp4,
+    double alpha,
+    std::optional<torch::Tensor> wcscales,
+    std::optional<torch::Tensor> out_q,
+    std::optional<torch::Tensor> out_k,
+    std::optional<torch::Tensor> out_v,
+    int64_t attn_tokens);
+
+std::vector<torch::Tensor> svdq_quantize_w4a4_act_fuse_lora(
+    torch::Tensor input,
+    std::optional<torch::Tensor> output,
+    std::optional<torch::Tensor> oscales,
+    std::optional<torch::Tensor> lora_down,
+    std::optional<torch::Tensor> lora_act_out,
+    std::optional<torch::Tensor> smooth,
+    bool fuse_glu,
+    bool fp4,
+    int64_t pad_size);
