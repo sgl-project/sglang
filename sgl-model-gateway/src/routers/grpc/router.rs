@@ -96,11 +96,8 @@ impl GrpcRouter {
         );
 
         // Create Embedding pipeline
-        let embedding_pipeline = RequestPipeline::new_embeddings(
-            worker_registry.clone(),
-            _policy_registry.clone(),
-            tokenizer.clone(),
-        );
+        let embedding_pipeline =
+            RequestPipeline::new_embeddings(worker_registry.clone(), _policy_registry.clone());
 
         // Extract shared dependencies for responses contexts
         let mcp_manager = ctx

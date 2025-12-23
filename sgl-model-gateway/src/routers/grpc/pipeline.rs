@@ -203,7 +203,6 @@ impl RequestPipeline {
     pub fn new_embeddings(
         worker_registry: Arc<WorkerRegistry>,
         policy_registry: Arc<PolicyRegistry>,
-        _tokenizer: Arc<dyn Tokenizer>,
     ) -> Self {
         let stages: Vec<Box<dyn PipelineStage>> = vec![
             Box::new(EmbeddingPreparationStage::new()),
