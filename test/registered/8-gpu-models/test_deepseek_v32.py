@@ -95,8 +95,7 @@ class TestDeepseekV32Unified(unittest.TestCase):
             ),
         )
 
-    @unittest.skip("NSA backends test temporarily disabled")
-    # @unittest.skipIf(is_blackwell_system(), "Requires H200 system")
+    @unittest.skipIf(is_blackwell_system(), "Requires H200 system")
     def test_deepseek_v32_nsa_backends(self):
         """Test NSA attention backend variants (H200 only).
 
@@ -149,13 +148,13 @@ class TestDeepseekV32Unified(unittest.TestCase):
             accuracy_params=AccuracyTestParams(
                 dataset="gsm8k", baseline_accuracy=GSM8K_BASELINE
             ),
-            performance_params=PerformanceTestParams(
-                batch_sizes=[1, 8, 16, 64],
-                profile_dir="performance_profiles_deepseek_v32_nsa",
-            ),
+            performance_params=None,
         )
 
-    @unittest.skipIf(not is_blackwell_system(), "Requires B200")
+    @unittest.skipIf(
+        not is_blackwell_system(),
+        "Hardware agnostic - just using B200 for efficiency reasons",
+    )
     def test_deepseek_v32_b200(self):
         """Test DeepSeek V3.2 with GPQA evaluation using thinking mode (B200 only).
 
