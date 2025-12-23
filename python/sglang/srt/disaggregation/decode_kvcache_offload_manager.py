@@ -10,6 +10,7 @@ import torch
 from sglang.srt.managers.cache_controller import HiCacheController
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
+from sglang.srt.mem_cache.hicache_storage import configure_hash_algorithm
 from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKVPool,
     MLATokenToKVPool,
@@ -68,8 +69,6 @@ class DecodeKVCacheOffloadManager:
         self.tp_world_size = torch.distributed.get_world_size(group=self.tp_group)
 
         # Configure hash algorithm before creating HiCacheController
-        from sglang.srt.mem_cache.hicache_storage import configure_hash_algorithm
-
         configure_hash_algorithm(server_args.prefix_caching_hash_algo)
         self.cache_controller = HiCacheController(
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,

@@ -2,7 +2,6 @@
 Multi-modality utils
 """
 
-import hashlib
 import pickle
 from abc import abstractmethod
 from typing import Any, Callable, Dict, List, Literal, Optional, Tuple
@@ -24,6 +23,7 @@ from sglang.srt.mem_cache.multimodal_cache import MultiModalStaticCache
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import flatten_nested_list, is_npu, print_warning_once
+from sglang.srt.utils.hashing import hash_bytes_to_int64
 from sglang.utils import logger
 
 _is_npu = is_npu()
@@ -1150,12 +1150,12 @@ def get_multimodal_data_bounds(
     return valid_pairs_tensor
 
 
-def data_hash(data) -> int:
-    hash_bytes = hashlib.sha256(data).digest()[:8]
-    return int.from_bytes(hash_bytes, byteorder="big", signed=False)
+def data_hash(data, algorithm: str = "sha256") -> int:
+    """Hash raw bytes with configurable algorithm."""
+    return hash_bytes_to_int64(data, algorithm=algorithm)
 
 
-def tensor_hash(tensor_list) -> int:
+def tensor_hash(tensor_list, algorithm: str = "sha256") -> int:
     """
     hash a tensor or a tensor list
     """
@@ -1178,89 +1178,33 @@ def tensor_hash(tensor_list) -> int:
     tensor_cpu = tensor.cpu()
 
     mv = memoryview(tensor_cpu.numpy())
-    return data_hash(mv.tobytes())
+    return data_hash(mv.tobytes(), algorithm=algorithm)
 
 
-def hash_feature(f):
+def hash_feature(f, algorithm: str = "sha256"):
+    """Hash feature using the configured hash algorithm from server args.
+
+    Args:
+        f: The feature to hash
+        algorithm: The hash algorithm to use, default is "sha256"
+
+    Returns:
+        The hash of the feature
+    """
     if isinstance(f, list):
         if isinstance(f[0], torch.Tensor):
-            return tensor_hash(f)
-        return data_hash(tuple(flatten_nested_list(f)))
+            return tensor_hash(f, algorithm=algorithm)
+        return data_hash(tuple(flatten_nested_list(f)), algorithm=algorithm)
     elif isinstance(f, np.ndarray):
         arr = np.ascontiguousarray(f)
         arr_bytes = arr.tobytes()
-        return data_hash(arr_bytes)
+        return data_hash(arr_bytes, algorithm=algorithm)
     elif isinstance(f, torch.Tensor):
-        return tensor_hash([f])
+        return tensor_hash([f], algorithm=algorithm)
     elif isinstance(f, CudaIpcTensorTransportProxy):
         reconstruct_t = f.reconstruct_on_target_device(torch.cuda.current_device())
-        return tensor_hash([reconstruct_t])
-    return data_hash(f)
-
-
-def hash_feature_with_configurable_algorithm(f) -> int:
-    """Hash feature using the configured hash algorithm from server args.
-
-    This function is used by set_pad_value to support xxHash for better performance.
-    It maintains the same interface as hash_feature but uses configurable hash algorithm.
-    """
-    # Get hash algorithm from server args
-    try:
-        server_args = get_global_server_args()
-        algorithm = server_args.prefix_caching_hash_algo
-    except (RuntimeError, AttributeError):
-        # Fallback to SHA-256 if server args not available
-        algorithm = "sha256"
-
-    # Convert feature to bytes based on type
-    if isinstance(f, list):
-        if isinstance(f[0], torch.Tensor):
-            # For tensor lists, use tensor_hash logic but with configurable algorithm
-            tensor = torch.concat(
-                [
-                    x.flatten() if isinstance(x, torch.Tensor) else x
-                    for x in flatten_nested_list(f)
-                ]
-            )
-            if tensor.is_cuda:
-                # GPU tensor hash uses custom kernel, fallback to CPU
-                tensor = tensor.cpu()
-            tensor = tensor.detach().contiguous()
-            if tensor.dtype == torch.bfloat16:
-                tensor = tensor.float()
-            mv = memoryview(tensor.cpu().numpy())
-            data_bytes = mv.tobytes()
-        else:
-            # For non-tensor lists, use pickle
-            data_bytes = pickle.dumps(tuple(flatten_nested_list(f)))
-    elif isinstance(f, np.ndarray):
-        arr = np.ascontiguousarray(f)
-        data_bytes = arr.tobytes()
-    elif isinstance(f, torch.Tensor):
-        if f.is_cuda:
-            f = f.cpu()
-        f = f.detach().contiguous()
-        if f.dtype == torch.bfloat16:
-            f = f.float()
-        mv = memoryview(f.cpu().numpy())
-        data_bytes = mv.tobytes()
-    elif isinstance(f, CudaIpcTensorTransportProxy):
-        reconstruct_t = f.reconstruct_on_target_device(torch.cuda.current_device())
-        if reconstruct_t.is_cuda:
-            reconstruct_t = reconstruct_t.cpu()
-        reconstruct_t = reconstruct_t.detach().contiguous()
-        if reconstruct_t.dtype == torch.bfloat16:
-            reconstruct_t = reconstruct_t.float()
-        mv = memoryview(reconstruct_t.cpu().numpy())
-        data_bytes = mv.tobytes()
-    else:
-        # Fallback: use pickle for other types
-        data_bytes = pickle.dumps(f)
-
-    # Use configurable hash algorithm
-    from sglang.srt.utils.hashing import hash_bytes_to_int64
-
-    return hash_bytes_to_int64(data_bytes, algorithm=algorithm)
+        return tensor_hash([reconstruct_t], algorithm=algorithm)
+    return data_hash(f, algorithm=algorithm)
 
 
 def extend_mrope_positions_for_retracted_request(
