@@ -27,6 +27,7 @@ import psutil
 import setproctitle
 import zmq
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.managers.io_struct import (
     BlockReqInput,
@@ -59,6 +60,7 @@ from sglang.srt.utils.common import (
     maybe_reindex_device_id,
 )
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
+from sglang.srt.utils.watchdog import Watchdog
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 
 logger = logging.getLogger(__name__)
@@ -172,6 +174,13 @@ class DataParallelController:
             self.control_message_step = 1
 
         self.init_dispatcher()
+
+        self.watchdog = Watchdog.create(
+            debug_name="DataParallelController",
+            watchdog_timeout=server_args.soft_watchdog_timeout,
+            soft=True,
+            test_stuck_time=envs.SGLANG_TEST_STUCK_DP_CONTROLLER.get(),
+        )
 
     def send_to_all_workers(self, obj):
         for worker in self.workers:
@@ -519,6 +528,7 @@ class DataParallelController:
     def event_loop(self):
         while True:
             while True:
+                self.watchdog.feed()
                 try:
                     recv_req = self.recv_from_tokenizer.recv_pyobj(zmq.NOBLOCK)
                 except zmq.ZMQError:
