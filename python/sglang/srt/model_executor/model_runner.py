@@ -2365,8 +2365,9 @@ class ModelRunner:
         backend_str = self.server_args.moe_runner_backend
         if backend_str not in [
             "flashinfer_trtllm",
-            "flashinfer_cutlass",
             "flashinfer_mxfp4",
+            # TODO: flashinfer_cutlass will cause some flashinfer compilation errors. To be fixed.
+            # "flashinfer_cutlass",
         ]:
             return False
 
