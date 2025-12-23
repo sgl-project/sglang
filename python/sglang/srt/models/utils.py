@@ -12,6 +12,11 @@
 # limitations under the License.
 # ==============================================================================
 
+from collections.abc import Iterable, Mapping
+from dataclasses import dataclass, field
+from functools import lru_cache
+from typing import Any, Optional
+
 import numpy as np
 import torch
 
@@ -24,6 +29,74 @@ _is_cuda = is_cuda()
 
 if _is_cuda:
     from sgl_kernel import FusedSetKVBufferArg
+
+WeightsMapping = Mapping[str, Optional[str]]
+"""If a key maps to a value of `None`, the corresponding weight is ignored."""
+
+
+@dataclass
+class WeightsMapper:
+    """Maps the name of each weight if they match the following patterns."""
+
+    orig_to_new_substr: WeightsMapping = field(default_factory=dict)
+    orig_to_new_prefix: WeightsMapping = field(default_factory=dict)
+    orig_to_new_suffix: WeightsMapping = field(default_factory=dict)
+
+    def _map_name(self, key: str) -> Optional[str]:
+        for substr, new_key in sorted(
+            self.orig_to_new_substr.items(), key=lambda i: len(i[0]), reverse=True
+        ):
+            if substr in key:
+                if new_key is None:
+                    return None
+
+                key = key.replace(substr, new_key, 1)
+                break
+
+        for prefix, new_key in sorted(
+            self.orig_to_new_prefix.items(), key=lambda i: len(i[0]), reverse=True
+        ):
+            if key.startswith(prefix):
+                if new_key is None:
+                    return None
+
+                key = key.replace(prefix, new_key, 1)
+                break
+
+        for suffix, new_key in sorted(
+            self.orig_to_new_suffix.items(), key=lambda i: len(i[0]), reverse=True
+        ):
+            if key.endswith(suffix):
+                if new_key is None:
+                    return None
+
+                key = new_key.join(key.rsplit(suffix, 1))
+                break
+
+        return key
+
+    def apply(
+        self, weights: Iterable[tuple[str, torch.Tensor]]
+    ) -> Iterable[tuple[str, torch.Tensor]]:
+        return (
+            (out_name, data)
+            for name, data in weights
+            if (out_name := self._map_name(name)) is not None
+        )
+
+    def apply_list(self, values: list[str]) -> list[str]:
+        return [
+            out_name
+            for name in values
+            if (out_name := self._map_name(name)) is not None
+        ]
+
+    def apply_dict(self, values: dict[str, Any]) -> dict[str, Any]:
+        return {
+            out_name: value
+            for name, value in values.items()
+            if (out_name := self._map_name(name)) is not None
+        }
 
 
 def enable_fused_set_kv_buffer(forward_batch: ForwardBatch):
@@ -82,3 +155,39 @@ def compute_cu_seqlens_from_grid_numpy(grid_thw: torch.Tensor) -> torch.Tensor:
     cu_seqlens = np.concatenate([np.zeros(1, dtype=np.int32), cu_seqlens])
     cu_seqlens = torch.from_numpy(cu_seqlens)
     return cu_seqlens
+
+
+class RotaryPosMixin:
+
+    @staticmethod
+    @lru_cache(maxsize=1024)
+    def rot_pos_ids(h: int, w: int, spatial_merge_size: int) -> torch.Tensor:
+        if isinstance(h, torch.Tensor):
+            h = int(h.item())
+        if isinstance(w, torch.Tensor):
+            w = int(w.item())
+        if isinstance(spatial_merge_size, torch.Tensor):
+            spatial_merge_size = int(spatial_merge_size.item())
+        hpos_ids = np.broadcast_to(np.arange(h).reshape(h, 1), (h, w))
+        h_div = h // spatial_merge_size
+        w_div = w // spatial_merge_size
+        hpos_ids = hpos_ids.reshape(
+            h_div,
+            spatial_merge_size,
+            w_div,
+            spatial_merge_size,
+        )
+        hpos_ids = hpos_ids.transpose(0, 2, 1, 3)
+        hpos_ids = hpos_ids.flatten()
+
+        wpos_ids = np.broadcast_to(np.arange(w).reshape(1, w), (h, w))
+        wpos_ids = wpos_ids.reshape(
+            h_div,
+            spatial_merge_size,
+            w_div,
+            spatial_merge_size,
+        )
+        wpos_ids = wpos_ids.transpose(0, 2, 1, 3)
+        wpos_ids = wpos_ids.flatten()
+
+        return torch.from_numpy(np.stack([hpos_ids, wpos_ids], axis=-1))

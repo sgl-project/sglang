@@ -46,15 +46,16 @@ def prepare_mu(batch: Req, server_args: ServerArgs):
     height = batch.height
     width = batch.width
     vae_scale_factor = server_args.pipeline_config.vae_config.vae_scale_factor
-    image_seq_len = (int(height) // vae_scale_factor) * (int(width) // vae_scale_factor)
-
+    image_seq_len = (int(height) // vae_scale_factor // 2) * (
+        int(width) // vae_scale_factor // 2
+    )
     mu = calculate_shift(
         image_seq_len,
         # hard code, since scheduler_config is not in PipelineConfig now
         256,
-        4096,
+        8192,
         0.5,
-        1.15,
+        0.9,
     )
     return "mu", mu
 
@@ -136,7 +137,13 @@ class QwenImageEditPipeline(LoRAPipeline, ComposedPipelineBase):
         """Set up pipeline stages with proper dependency injection."""
 
         self.add_stage(
-            stage_name="input_validation_stage", stage=InputValidationStage()
+            stage_name="input_validation_stage",
+            stage=InputValidationStage(
+                vae_image_processor=VaeImageProcessor(
+                    vae_scale_factor=server_args.pipeline_config.vae_config.arch_config.vae_scale_factor
+                    * 2
+                )
+            ),
         )
 
         self.add_stage(
@@ -144,10 +151,6 @@ class QwenImageEditPipeline(LoRAPipeline, ComposedPipelineBase):
             stage=ImageEncodingStage(
                 image_processor=self.get_module("processor"),
                 text_encoder=self.get_module("text_encoder"),
-                vae_image_processor=VaeImageProcessor(
-                    vae_scale_factor=server_args.pipeline_config.vae_config.arch_config.vae_scale_factor
-                    * 2
-                ),
             ),
         )
 
@@ -189,4 +192,8 @@ class QwenImageEditPipeline(LoRAPipeline, ComposedPipelineBase):
         )
 
 
-EntryClass = [QwenImagePipeline, QwenImageEditPipeline]
+class QwenImageEditPlusPipeline(QwenImageEditPipeline):
+    pipeline_name = "QwenImageEditPlusPipeline"
+
+
+EntryClass = [QwenImagePipeline, QwenImageEditPipeline, QwenImageEditPlusPipeline]

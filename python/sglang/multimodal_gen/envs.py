@@ -37,6 +37,27 @@ if TYPE_CHECKING:
     VERBOSE: bool = False
     SGLANG_DIFFUSION_SERVER_DEV_MODE: bool = False
     SGLANG_DIFFUSION_STAGE_LOGGING: bool = False
+    # cache-dit env vars (primary transformer)
+    SGLANG_CACHE_DIT_ENABLED: bool = False
+    SGLANG_CACHE_DIT_FN: int = 1
+    SGLANG_CACHE_DIT_BN: int = 0
+    SGLANG_CACHE_DIT_WARMUP: int = 4
+    SGLANG_CACHE_DIT_RDT: float = 0.24
+    SGLANG_CACHE_DIT_MC: int = 3
+    SGLANG_CACHE_DIT_TAYLORSEER: bool = False
+    SGLANG_CACHE_DIT_TS_ORDER: int = 1
+    SGLANG_CACHE_DIT_SCM_PRESET: str = "none"
+    SGLANG_CACHE_DIT_SCM_COMPUTE_BINS: str | None = None
+    SGLANG_CACHE_DIT_SCM_CACHE_BINS: str | None = None
+    SGLANG_CACHE_DIT_SCM_POLICY: str = "dynamic"
+    # cache-dit env vars (secondary transformer, e.g., Wan2.2 low-noise expert)
+    SGLANG_CACHE_DIT_SECONDARY_FN: int = 1
+    SGLANG_CACHE_DIT_SECONDARY_BN: int = 0
+    SGLANG_CACHE_DIT_SECONDARY_WARMUP: int = 4
+    SGLANG_CACHE_DIT_SECONDARY_RDT: float = 0.24
+    SGLANG_CACHE_DIT_SECONDARY_MC: int = 3
+    SGLANG_CACHE_DIT_SECONDARY_TAYLORSEER: bool = False
+    SGLANG_CACHE_DIT_SECONDARY_TS_ORDER: int = 1
 
 
 def _is_hip():
@@ -264,6 +285,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
         if os.getenv("SGLANG_DIFFUSION_ATTENTION_CONFIG", None) is None
         else os.path.expanduser(os.getenv("SGLANG_DIFFUSION_ATTENTION_CONFIG", "."))
     ),
+    # Optional override to force a specific attention backend (e.g. "aiter")
+    "SGLANG_DIFFUSION_ATTENTION_BACKEND": lambda: os.getenv(
+        "SGLANG_DIFFUSION_ATTENTION_BACKEND"
+    ),
     # Use dedicated multiprocess context for workers.
     # Both spawn and fork work
     "SGLANG_DIFFUSION_WORKER_MULTIPROC_METHOD": lambda: os.getenv(
@@ -286,6 +311,90 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # taken for each stage
     "SGLANG_DIFFUSION_STAGE_LOGGING": lambda: get_bool_env_var(
         "SGLANG_DIFFUSION_STAGE_LOGGING"
+    ),
+    # ================== cache-dit Env Vars ==================
+    # Enable cache-dit acceleration for DiT inference
+    "SGLANG_CACHE_DIT_ENABLED": lambda: get_bool_env_var("SGLANG_CACHE_DIT_ENABLED"),
+    # Number of first blocks to always compute (DBCache F parameter)
+    "SGLANG_CACHE_DIT_FN": lambda: int(os.getenv("SGLANG_CACHE_DIT_FN", "1")),
+    # Number of last blocks to always compute (DBCache B parameter)
+    "SGLANG_CACHE_DIT_BN": lambda: int(os.getenv("SGLANG_CACHE_DIT_BN", "0")),
+    # Warmup steps before caching (DBCache W parameter)
+    "SGLANG_CACHE_DIT_WARMUP": lambda: int(os.getenv("SGLANG_CACHE_DIT_WARMUP", "4")),
+    # Residual difference threshold (DBCache R parameter)
+    "SGLANG_CACHE_DIT_RDT": lambda: float(os.getenv("SGLANG_CACHE_DIT_RDT", "0.24")),
+    # Maximum continuous cached steps (DBCache MC parameter)
+    "SGLANG_CACHE_DIT_MC": lambda: int(os.getenv("SGLANG_CACHE_DIT_MC", "3")),
+    # Enable TaylorSeer calibrator
+    "SGLANG_CACHE_DIT_TAYLORSEER": lambda: get_bool_env_var(
+        "SGLANG_CACHE_DIT_TAYLORSEER", default="false"
+    ),
+    # TaylorSeer order (1 or 2)
+    "SGLANG_CACHE_DIT_TS_ORDER": lambda: int(
+        os.getenv("SGLANG_CACHE_DIT_TS_ORDER", "1")
+    ),
+    # SCM preset: none, slow, medium, fast, ultra
+    "SGLANG_CACHE_DIT_SCM_PRESET": lambda: os.getenv(
+        "SGLANG_CACHE_DIT_SCM_PRESET", "none"
+    ),
+    # SCM custom compute bins (e.g., "8,3,3,2,2")
+    "SGLANG_CACHE_DIT_SCM_COMPUTE_BINS": lambda: os.getenv(
+        "SGLANG_CACHE_DIT_SCM_COMPUTE_BINS", None
+    ),
+    # SCM custom cache bins (e.g., "1,2,2,2,3")
+    "SGLANG_CACHE_DIT_SCM_CACHE_BINS": lambda: os.getenv(
+        "SGLANG_CACHE_DIT_SCM_CACHE_BINS", None
+    ),
+    # SCM policy: dynamic or static
+    "SGLANG_CACHE_DIT_SCM_POLICY": lambda: os.getenv(
+        "SGLANG_CACHE_DIT_SCM_POLICY", "dynamic"
+    ),
+    # ================== cache-dit Secondary Transformer Env Vars ==================
+    # For dual-transformer models like Wan2.2 (high-noise + low-noise experts)
+    # These parameters configure the secondary transformer (transformer_2)
+    # If not set, they inherit from the primary transformer settings
+    # Number of first blocks to always compute for secondary transformer
+    "SGLANG_CACHE_DIT_SECONDARY_FN": lambda: int(
+        os.getenv(
+            "SGLANG_CACHE_DIT_SECONDARY_FN", os.getenv("SGLANG_CACHE_DIT_FN", "1")
+        )
+    ),
+    # Number of last blocks to always compute for secondary transformer
+    "SGLANG_CACHE_DIT_SECONDARY_BN": lambda: int(
+        os.getenv(
+            "SGLANG_CACHE_DIT_SECONDARY_BN", os.getenv("SGLANG_CACHE_DIT_BN", "0")
+        )
+    ),
+    # Warmup steps before caching for secondary transformer
+    "SGLANG_CACHE_DIT_SECONDARY_WARMUP": lambda: int(
+        os.getenv(
+            "SGLANG_CACHE_DIT_SECONDARY_WARMUP",
+            os.getenv("SGLANG_CACHE_DIT_WARMUP", "4"),
+        )
+    ),
+    # Residual difference threshold for secondary transformer
+    "SGLANG_CACHE_DIT_SECONDARY_RDT": lambda: float(
+        os.getenv(
+            "SGLANG_CACHE_DIT_SECONDARY_RDT", os.getenv("SGLANG_CACHE_DIT_RDT", "0.24")
+        )
+    ),
+    # Maximum continuous cached steps for secondary transformer
+    "SGLANG_CACHE_DIT_SECONDARY_MC": lambda: int(
+        os.getenv(
+            "SGLANG_CACHE_DIT_SECONDARY_MC", os.getenv("SGLANG_CACHE_DIT_MC", "3")
+        )
+    ),
+    # Enable TaylorSeer for secondary transformer
+    "SGLANG_CACHE_DIT_SECONDARY_TAYLORSEER": lambda: get_bool_env_var(
+        "SGLANG_CACHE_DIT_SECONDARY_TAYLORSEER",
+        default=os.getenv("SGLANG_CACHE_DIT_TAYLORSEER", "false"),
+    ),
+    # TaylorSeer order for secondary transformer
+    "SGLANG_CACHE_DIT_SECONDARY_TS_ORDER": lambda: int(
+        os.getenv(
+            "SGLANG_CACHE_DIT_SECONDARY_TS_ORDER",
+            os.getenv("SGLANG_CACHE_DIT_TS_ORDER", "1"),
+        )
     ),
 }
 
