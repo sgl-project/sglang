@@ -102,7 +102,7 @@ class ModelConfig:
         model_impl: Union[str, ModelImpl] = ModelImpl.AUTO,
         sampling_defaults: str = "openai",
         quantize_and_serve: bool = False,
-        is_mtp: bool = False,
+        is_multi_layer_eagle: bool = False,
         encoder_only: bool = False,
         language_only: bool = False,
     ) -> None:
@@ -114,7 +114,7 @@ class ModelConfig:
         self.model_impl = model_impl
         self.sampling_defaults = sampling_defaults
         self.quantize_and_serve = quantize_and_serve
-        self.is_mtp = is_mtp
+        self.is_multi_layer_eagle = is_multi_layer_eagle
 
         # Validate quantize_and_serve configuration
         self._validate_quantize_and_serve_config()
@@ -254,7 +254,7 @@ class ModelConfig:
             sampling_defaults=server_args.sampling_defaults,
             quantize_and_serve=server_args.quantize_and_serve,
             override_config_file=server_args.decrypted_config_file,
-            is_mtp=server_args.enable_mtp,
+            is_multi_layer_eagle=server_args.enable_multi_layer_eagle,
             language_only=server_args.language_only,
             encoder_only=server_args.encoder_only,
             is_draft_model=is_draft_model,
@@ -1072,6 +1072,7 @@ multimodal_model_archs = [
     "Gemma3nForConditionalGeneration",
     "Glm4vForConditionalGeneration",
     "Glm4vMoeForConditionalGeneration",
+    "GlmasrForConditionalGeneration",
     "Grok1VForCausalLM",
     "Grok1AForCausalLM",
     "LlavaLlamaForCausalLM",

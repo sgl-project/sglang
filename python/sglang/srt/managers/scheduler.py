@@ -275,7 +275,6 @@ class Scheduler(
         self.spec_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
         )
-        self.enable_mtp = server_args.enable_mtp
         self.gpu_id = gpu_id
         self.page_size = server_args.page_size
         self.enable_hierarchical_cache = server_args.enable_hierarchical_cache
@@ -485,11 +484,13 @@ class Scheduler(
             draft_worker_kwargs["enable_overlap"] = self.enable_overlap
 
         # FIXME: refactor the draft worker registration logic
-        if self.enable_mtp:
+        if self.server_args.enable_multi_layer_eagle:
             if self.enable_overlap:
-                from sglang.srt.speculative.mtp_worker_v2 import MTPWorkerV2
+                from sglang.srt.speculative.multi_layer_eagle_worker_v2 import (
+                    MultiLayerEagleWorkerV2,
+                )
 
-                self.draft_worker = MTPWorkerV2(
+                self.draft_worker = MultiLayerEagleWorkerV2(
                     gpu_id=self.gpu_id,
                     tp_rank=self.tp_rank,
                     moe_ep_rank=self.moe_ep_rank,
@@ -499,9 +500,11 @@ class Scheduler(
                     dp_rank=self.dp_rank,
                 )
             else:
-                from sglang.srt.speculative.mtp_worker import MTPWorker
+                from sglang.srt.speculative.multi_layer_eagle_worker import (
+                    MultiLayerEagleWorker,
+                )
 
-                self.draft_worker = MTPWorker(
+                self.draft_worker = MultiLayerEagleWorker(
                     gpu_id=self.gpu_id,
                     tp_rank=self.tp_rank,
                     moe_ep_rank=self.moe_ep_rank,
@@ -834,7 +837,7 @@ class Scheduler(
         if self.draft_worker is None or self.spec_algorithm.is_ngram():
             draft_token_to_kv_pool = None
         elif self.spec_algorithm.is_eagle() and self.enable_overlap:
-            if self.enable_mtp:
+            if self.server_args.enable_multi_layer_eagle:
                 draft_runner = self.draft_worker.draft_worker.draft_runner_list[0]
             else:
                 draft_runner = self.draft_worker.draft_worker.draft_runner
@@ -952,6 +955,7 @@ class Scheduler(
                 hf_config=self.model_config.hf_config,
                 tp_rank=self.tp_rank,
                 pp_rank=self.pp_rank,
+                tp_group=self.tp_group,
             )
 
     def init_overlap(self):
@@ -1236,6 +1240,14 @@ class Scheduler(
                 src=self.tp_group.ranks[0],
             )
 
+        # Process MM requests under EPD-disaggregation mode
+        if (
+            self.pp_rank == 0
+            and self.server_args.language_only
+            and self.server_args.encoder_transfer_backend == "zmq_to_scheduler"
+        ):
+            recv_reqs = self.mm_receiver.process_waiting_requests(recv_reqs)
+
         if self.enable_trace:
             for req in recv_reqs:
                 if isinstance(
@@ -1276,12 +1288,6 @@ class Scheduler(
         return work_reqs, control_reqs
 
     def process_input_requests(self, recv_reqs: List):
-        # Process MM requests under EPD-disaggregation mode
-        if (
-            self.server_args.language_only
-            and self.server_args.encoder_transfer_backend == "zmq_to_scheduler"
-        ):
-            recv_reqs = self.mm_receiver.process_waiting_requests(recv_reqs)
 
         for recv_req in recv_reqs:
             # If it is a health check generation request and there are running requests, ignore it.
