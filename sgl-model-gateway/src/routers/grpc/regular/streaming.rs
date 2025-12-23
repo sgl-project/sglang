@@ -167,6 +167,18 @@ impl StreamingProcessor {
                     let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n")));
                 });
             }
+            context::ExecutionResult::Embedding { .. } => {
+                let error_chunk = format!(
+                    "data: {}\n\n",
+                    json!({
+                        "error": {
+                            "message": "Embeddings not supported in streaming mode",
+                            "type": "invalid_request_error"
+                        }
+                    })
+                );
+                let _ = tx.send(Ok(Bytes::from(error_chunk)));
+            }
         }
 
         // Return SSE response
@@ -702,6 +714,11 @@ impl StreamingProcessor {
 
                     let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n")));
                 });
+            }
+            context::ExecutionResult::Embedding { .. } => {
+                let error_chunk =
+                    "data: {\"error\": \"Embeddings not supported in streaming generate\"}\n\n";
+                let _ = tx.send(Ok(Bytes::from(error_chunk)));
             }
         }
 
