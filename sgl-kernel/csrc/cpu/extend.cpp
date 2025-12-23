@@ -289,10 +289,9 @@ void extend_attention_kernel_impl(
         const int padded_n_size = div_up(n_size, TILE_K) * TILE_K;
 
         // get key and pack
-        pack_vnni<scalar_t, index_t>(
+        pack_vnni<scalar_t>(
             /*    dst */ Btmp,
             /*    src */ k_extend + (seq_extend_start_loc + n) * ke_strideN + head_kv_id * ke_strideH,
-            /*    ind */ nullptr,
             /*     N  */ n_size,
             /*     K  */ head_size,
             /* ld_src */ ke_strideN,
@@ -368,10 +367,9 @@ void extend_attention_kernel_impl(
         }
 
         // get value and pack
-        pack_vnni2<scalar_t, index_t>(
+        pack_vnni2<scalar_t>(
             /*    dst */ Btmp,
             /*    src */ v_extend + (seq_extend_start_loc + n) * ve_strideN + head_kv_id * ve_strideH,
-            /*    ind */ nullptr,
             /*     K  */ n_size,
             /*     N  */ head_size_v,
             /* ld_src */ ve_strideN,

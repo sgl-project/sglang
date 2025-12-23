@@ -64,16 +64,6 @@ inline void copy_stub(scalar_t* __restrict__ out, const float* __restrict__ acc,
   }
 }
 
-template <typename scalar_t>
-void print_array(const scalar_t* data, int M, int N, int ld) {
-  for (int m = 0; m < M; ++m) {
-    for (int n = 0; n < N; ++n) {
-      std::cout << " " << float(data[m * ld + n]);
-    }
-    std::cout << std::endl;
-  }
-}
-
 template <typename scalar_t, int BLOCK_M, int BLOCK_N>
 void flash_attn_varlen_kernel_impl(
     scalar_t* __restrict__ out,
@@ -134,13 +124,10 @@ void flash_attn_varlen_kernel_impl(
   TORCH_CHECK(num_groups * num_heads_kv == num_heads);
 
   // parallel on [MB, num_heads]
-  // at::parallel_for(0, MB * num_heads, 0, [&](int begin, int end) {
   parallel_for(num_heads * MB, [&](int begin, int end) {
-    int mb{0}, head_id{0};
-    // data_index_init(begin, mb, MB, head_id, num_heads);
+    int head_id{0}, mb{0};
     data_index_init(begin, head_id, num_heads, mb, MB);
 
-    // int tid = at::get_thread_num();
     int tid = get_thread_num();
     // s_i and s_delta: [BLOCK_M, BLOCK_N]
     float* __restrict__ s_i = reinterpret_cast<float*>((char*)(buffer) + tid * buffer_size_per_thread);
@@ -192,10 +179,9 @@ void flash_attn_varlen_kernel_impl(
         const int padded_n_size = div_up(n_size, TILE_K) * TILE_K;
 
         // get key and pack
-        pack_vnni<scalar_t, int32_t>(
+        pack_vnni<scalar_t>(
             /*    dst */ Btmp,
             /*    src */ k + (seq_k_start_loc + n) * k_strideN + head_kv_id * k_strideH,
-            /*    ind */ nullptr,
             /*     N  */ n_size,
             /*     K  */ head_size,
             /* ld_src */ k_strideN,
@@ -213,12 +199,6 @@ void flash_attn_varlen_kernel_impl(
             /* A     */ q_ptr,
             /* B     */ Btmp,
             /* C     */ s_i);
-
-        // q: [m_size, head_size
-        // print_array(q_ptr, m_size, head_size, q_strideM);
-
-        // std::cout << "### Btmp: " << std::endl;
-        // print_array(Btmp, head_size, n_size, BLOCK_N);
 
         // apply causal mask
         if (causal && num_keys - n <= BLOCK_N) {
@@ -268,19 +248,13 @@ void flash_attn_varlen_kernel_impl(
         }
 
         // get value and pack
-        pack_vnni2<scalar_t, int32_t>(
+        pack_vnni2<scalar_t>(
             /*    dst */ Btmp,
             /*    src */ v + (seq_k_start_loc + n) * v_strideN + head_kv_id * v_strideH,
-            /*    ind */ nullptr,
             /*     K  */ n_size,
             /*     N  */ head_size_v,
             /* ld_src */ v_strideN,
             /* ld_dst */ head_size_v);
-
-        // std::cout << "### Btmp before: " << std::endl;
-        // print_array(v + (seq_k_start_loc + n) * v_strideN + head_kv_id * v_strideH, n_size, head_size_v, v_strideN);
-        // std::cout << "### Btmp after: " << std::endl;
-        // print_array(Btmp, n_size, head_size_v, head_size_v);
 
         // calculate V' <- s_delta @ V + V'
         at::native::cpublas::brgemm(
@@ -303,7 +277,6 @@ void flash_attn_varlen_kernel_impl(
       }
 
       // move to the next index
-      // data_index_step(mb, MB, head_id, num_heads);
       data_index_step(head_id, num_heads, mb, MB);
     }
     at::native::cpublas::brgemm_release();
