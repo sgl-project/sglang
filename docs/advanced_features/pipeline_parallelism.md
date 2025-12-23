@@ -47,7 +47,7 @@ python3 -m sglang.launch_server \
   --port 30000 --dist-init-addr 192.168.0.137:62001 \
   --disable-radix-cache --mem-fraction-static 0.8  \
   --attention-backend fa3 --host 0.0.0.0 --watchdog-timeout 3600 \
-  --max-running-requests 128 --chunked-prefill-size 4096 --enable-dynamic-chunking
+  --max-running-requests 128 --chunked-prefill-size 4096
 ```
 
 ```bash
