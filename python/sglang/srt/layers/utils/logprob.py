@@ -390,9 +390,9 @@ def add_logprob_values(
                 req.output_token_logprobs_idx.append(verified_ids[pt])
                 if req.top_logprobs_num > 0:
                     req.output_top_logprobs_val.append(
-                        res.logits_output.next_token_top_logprobs_val[pt]
+                        logits_output.next_token_top_logprobs_val[pt]
                     )
                     req.output_top_logprobs_idx.append(
-                        res.logits_output.next_token_top_logprobs_idx[pt]
+                        logits_output.next_token_top_logprobs_idx[pt]
                     )
             pt += 1
