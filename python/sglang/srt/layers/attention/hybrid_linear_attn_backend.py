@@ -977,9 +977,10 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 dtype=torch.bool,
                 device=forward_batch.input_ids.device,
             )
-            # intermediate_state_indices = torch.arange(
-            #     cache_indices.shape[0], dtype=torch.int32, device=cache_indices.device
-            # )
+            intermediate_state_cache = torch.zeros(cache_indices.shape[0], forward_batch.spec_info.draft_token_num, ssm_states.shape[-3], ssm_states.shape[-2], ssm_states.shape[-1], dtype=ssm_states.dtype, device=ssm_states.device)
+            intermediate_state_indices = torch.arange(
+                cache_indices.shape[0], dtype=torch.int32, device=cache_indices.device
+            )
         else:
             has_initial_states = forward_batch.extend_prefix_lens > 0
 
@@ -1068,8 +1069,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 intermediate_g=intermediate_g,
                 intermediate_beta=intermediate_beta,
                 intermediate_accepted_steps=intermediate_accepted_steps,
-                # intermediate_states_buffer=intermediate_state_cache,
-                # intermediate_state_indices=intermediate_state_indices,
+                intermediate_states_buffer=intermediate_state_cache,
+                intermediate_state_indices=intermediate_state_indices,
                 cache_steps=forward_batch.spec_info.draft_token_num,
                 retrieve_parent_token=retrieve_parent_token,
             )
@@ -1359,7 +1360,7 @@ class HybridLinearAttnBackend(AttentionBackend):
         #     torch.int64
         # )  # [N]
         # last_steps = accepted_steps[valid_mask]  # [N]
-        mamba_caches.intermediate_accepted_steps[state_indices_tensor] = accepted_steps
+        mamba_caches.intermediate_accepted_steps[state_indices_tensor] = accepted_steps.to(mamba_caches.intermediate_accepted_steps.dtype, copy=False)
 
         # # scatter into ssm_states at the chosen cache lines
         # # ssm_states[:, dst_state_indices, :] = intermediate_state_cache[

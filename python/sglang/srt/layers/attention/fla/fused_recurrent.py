@@ -357,6 +357,8 @@ def fused_recurrent_gated_delta_rule_update_fwd_kernel(
     intermediate_g_ptr,
     intermediate_beta_ptr,
     intermediate_accepted_steps_ptr,
+    intermediate_states_buffer_ptr,
+    intermediate_state_indices_ptr,
     cache_steps,
     retrieve_parent_token_ptr,
     stride_retrieve_parent_token_seq: tl.constexpr,
@@ -403,6 +405,16 @@ def fused_recurrent_gated_delta_rule_update_fwd_kernel(
         p_beta = beta + bos * HV + i_hv
     p_g = g + bos * HV + i_hv
     p_o = o + ((i_k * all + bos) * HV + i_hv) * V + o_v
+
+    if HAS_EAGLE_TREE_CUSTOM_ATTN_MASK:
+        token_indices = tl.arange(0, NP2_T)
+        mask_retrieve = token_indices < T
+        retrieve_parent_token_base = (
+            retrieve_parent_token_ptr
+            + (i_n * stride_retrieve_parent_token_seq)
+            + token_indices * stride_retrieve_parent_token_token
+        )
+        parent_idx_tokens = tl.load(retrieve_parent_token_base, mask_retrieve)
 
     mask_k = o_k < K
     mask_v = o_v < V
@@ -462,6 +474,7 @@ def fused_recurrent_gated_delta_rule_update_fwd_kernel(
             # Store final state back to h0_source with bounds checking
             tl.store(p_h0, b_h.to(p_h0.dtype.element_ty), mask=mask_h)
 
+    b_hs = tl.zeros([NP2_T, BK, BV], dtype=tl.float32)
     step_idx = 0
     for _ in range(0, T):
         b_q = tl.load(p_q, mask=mask_k, other=0).to(tl.float32)
@@ -493,6 +506,23 @@ def fused_recurrent_gated_delta_rule_update_fwd_kernel(
         if USE_QK_L2NORM_IN_KERNEL:
             b_q = b_q / (tl.sqrt(tl.sum(b_q * b_q) + 1e-6))
             b_k = b_k / (tl.sqrt(tl.sum(b_k * b_k) + 1e-6))
+
+        if HAS_EAGLE_TREE_CUSTOM_ATTN_MASK:
+            # step_idx = 0 should use the b_h from USE_INITIAL_STATE
+            if step_idx != 0:
+                # when calculating current step's attention, load the state from the parent token
+                parent_step_idx = tl.sum(
+                    tl.where(token_indices == step_idx, parent_idx_tokens, 0)
+                )
+                p_h = (
+                    intermediate_states_buffer_ptr
+                    + (i_n * cache_steps + parent_step_idx) * HV * K * V
+                    + i_hv * K * V
+                    + o_k[:, None] * V
+                    + o_v[None, :]
+                )
+                b_h = tl.load(p_h, mask=mask_h)
+
         b_q = b_q * scale
         # [BK, BV]
         b_h *= exp(b_g)
@@ -501,6 +531,15 @@ def fused_recurrent_gated_delta_rule_update_fwd_kernel(
         b_v *= b_beta
         # [BK, BV]
         b_h += b_k[:, None] * b_v[None, :]
+        if HAS_EAGLE_TREE_CUSTOM_ATTN_MASK:
+            p_h = (
+                intermediate_states_buffer_ptr
+                + (i_n * cache_steps + step_idx) * HV * K * V
+                + i_hv * K * V
+                + o_k[:, None] * V
+                + o_v[None, :]
+            )
+            tl.store(p_h, b_h, mask=mask_h)
         # [BV]
         if not DISABLE_OUTPUT_CALCULATION:
             b_o = tl.sum(b_h * b_q[:, None], 0)
@@ -547,6 +586,8 @@ def fused_recurrent_gated_delta_rule_update_fwd(
     intermediate_g: Optional[torch.Tensor] = None,
     intermediate_beta: Optional[torch.Tensor] = None,
     intermediate_accepted_steps: Optional[torch.Tensor] = None,
+    intermediate_states_buffer: Optional[torch.Tensor] = None,
+    intermediate_state_indices: Optional[torch.Tensor] = None,
     cache_steps: Optional[int] = None,
     retrieve_parent_token: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
@@ -576,7 +617,7 @@ def fused_recurrent_gated_delta_rule_update_fwd(
     else:
         stride_retrieve_parent_token_seq = stride_retrieve_parent_token_token = 0
 
-    NP2_T = triton.next_power_of_2(T)
+    NP2_T = triton.next_power_of_2(cache_steps) if cache_steps is not None else triton.next_power_of_2(T)
     fused_recurrent_gated_delta_rule_update_fwd_kernel[grid](
         q=q,
         k=k,
@@ -593,6 +634,8 @@ def fused_recurrent_gated_delta_rule_update_fwd(
         intermediate_g_ptr=intermediate_g,
         intermediate_beta_ptr=intermediate_beta,
         intermediate_accepted_steps_ptr=intermediate_accepted_steps,
+        intermediate_states_buffer_ptr=intermediate_states_buffer,
+        intermediate_state_indices_ptr=intermediate_state_indices,
         cache_steps=0 if cache_steps is None else cache_steps,
         retrieve_parent_token_ptr=retrieve_parent_token,
         stride_retrieve_parent_token_seq=stride_retrieve_parent_token_seq,
@@ -644,6 +687,8 @@ class FusedRecurrentUpdateFunction(torch.autograd.Function):
         intermediate_g: Optional[torch.Tensor] = None,
         intermediate_beta: Optional[torch.Tensor] = None,
         intermediate_accepted_steps: Optional[torch.Tensor] = None,
+        intermediate_states_buffer: Optional[torch.Tensor] = None,
+        intermediate_state_indices: Optional[torch.Tensor] = None,
         cache_steps: Optional[int] = None,
         retrieve_parent_token: Optional[torch.Tensor] = None,
     ):
@@ -665,6 +710,8 @@ class FusedRecurrentUpdateFunction(torch.autograd.Function):
             intermediate_g=intermediate_g,
             intermediate_beta=intermediate_beta,
             intermediate_accepted_steps=intermediate_accepted_steps,
+            intermediate_states_buffer=intermediate_states_buffer,
+            intermediate_state_indices=intermediate_state_indices,
             cache_steps=cache_steps,
             retrieve_parent_token=retrieve_parent_token,
         )
@@ -699,6 +746,8 @@ def fused_recurrent_gated_delta_rule_update(
     intermediate_g: Optional[torch.Tensor] = None,
     intermediate_beta: Optional[torch.Tensor] = None,
     intermediate_accepted_steps: Optional[torch.Tensor] = None,
+    intermediate_states_buffer: Optional[torch.Tensor] = None,
+    intermediate_state_indices: Optional[torch.Tensor] = None,
     cache_steps: Optional[int] = None,
     retrieve_parent_token: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
@@ -738,6 +787,8 @@ def fused_recurrent_gated_delta_rule_update(
         intermediate_g,
         intermediate_beta,
         intermediate_accepted_steps,
+        intermediate_states_buffer,
+        intermediate_state_indices,
         cache_steps,
         retrieve_parent_token,
     )
