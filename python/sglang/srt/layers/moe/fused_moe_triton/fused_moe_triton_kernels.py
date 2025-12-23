@@ -23,6 +23,7 @@ from sglang.srt.utils import (
     is_cpu,
     is_cuda,
     is_hip,
+    is_sm90_supported,
 )
 
 try:
@@ -360,6 +361,7 @@ def fused_moe_kernel(
     even_Ks: tl.constexpr,
     c_sorted: tl.constexpr,
     filter_expert: tl.constexpr,
+    swap_ab: tl.constexpr,
 ):
     """
     Implements the fused computation for a Mixture of Experts (MOE) using
@@ -498,7 +500,10 @@ def fused_moe_kernel(
     # We accumulate into a `[BLOCK_SIZE_M, BLOCK_SIZE_N]` block
     # of fp32 values for higher accuracy.
     # `accumulator` will be converted back to fp16 after the loop.
-    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    if swap_ab:
+        accumulator = tl.zeros((BLOCK_SIZE_N, BLOCK_SIZE_M), dtype=tl.float32)
+    else:
+        accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
 
     for k_start in range(0, K, BLOCK_SIZE_K):
         # Load the next block of A and B, generate a mask by checking the
@@ -539,12 +544,17 @@ def fused_moe_kernel(
                     a_scale_ptrs + offs_ks * stride_ask, mask=token_mask, other=0.0
                 )
                 b_scale = tl.load(b_scale_ptrs + offs_ks * stride_bsk)
+                if swap_ab:
+                    a, b = tl.trans(b, (1, 0)), tl.trans(a, (1, 0))
+                    a_scale, b_scale = b_scale, a_scale
                 if BLOCK_SIZE_N > group_n:
                     accumulator += tl.dot(a, b) * a_scale[:, None] * b_scale[None, :]
                 else:
                     accumulator += tl.dot(a, b) * (a_scale[:, None] * b_scale)
             else:
                 if use_fp8_w8a8:
+                    if swap_ab:
+                        a, b = tl.trans(b, (1, 0)), tl.trans(a, (1, 0))
                     accumulator = tl.dot(a, b, acc=accumulator)
                 else:
                     accumulator += tl.dot(a, b)
@@ -555,6 +565,9 @@ def fused_moe_kernel(
             a_ptrs += BLOCK_SIZE_K * stride_ak
         if b_desc is None:
             b_ptrs += BLOCK_SIZE_K * stride_bk
+
+    if swap_ab:
+        accumulator = tl.trans(accumulator, (1, 0))
 
     if use_int8_w8a16:
         accumulator *= b_scale
@@ -614,6 +627,10 @@ def invoke_fused_moe_kernel(
 ) -> None:
     assert topk_weights.stride(1) == 1
     assert sorted_token_ids.stride(0) == 1
+
+    swap_ab = False
+    if use_fp8_w8a8 and is_sm90_supported() and config["BLOCK_SIZE_M"] < 64 and config["BLOCK_SIZE_N"] >= 64:
+        swap_ab = True
 
     padded_size = 0
     if use_fp8_w8a8:
@@ -786,6 +803,7 @@ def invoke_fused_moe_kernel(
             even_Ks=even_Ks,
             c_sorted=c_sorted,
             filter_expert=filter_expert,
+            swap_ab=swap_ab,
             **config,
         )
 
