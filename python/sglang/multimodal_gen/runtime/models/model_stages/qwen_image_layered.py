@@ -75,6 +75,9 @@ def retrieve_timesteps(
         `Tuple[torch.Tensor, int]`: A tuple where the first element is the timestep schedule from the scheduler and the
         second element is the number of inference steps.
     """
+    print(f"78 {timesteps=}", flush=True)
+    print(f"79 {sigmas=}", flush=True)
+    print(f"80 {kwargs=}")
     if timesteps is not None and sigmas is not None:
         raise ValueError(
             "Only one of `timesteps` or `sigmas` can be passed. Please choose one to set custom values"
@@ -100,6 +103,7 @@ def retrieve_timesteps(
                 f"The current scheduler class {scheduler.__class__}'s `set_timesteps` does not support custom"
                 f" sigmas schedules. Please check whether you are using the correct scheduler."
             )
+        print(f"106 {kwargs=}")
         scheduler.set_timesteps(sigmas=sigmas, device=device, **kwargs)
         timesteps = scheduler.timesteps
         num_inference_steps = len(timesteps)
@@ -504,6 +508,7 @@ the image\n<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>as
         image_seq_len = latents.shape[1]
         base_seqlen = 256 * 256 / 16 / 16
         mu = (image_latents.shape[1] / base_seqlen) ** 0.5
+        print(f"778 {image_latents.shape=}, {base_seqlen=}, {mu=}")
         timesteps, num_inference_steps = retrieve_timesteps(
             self.scheduler,
             num_inference_steps,

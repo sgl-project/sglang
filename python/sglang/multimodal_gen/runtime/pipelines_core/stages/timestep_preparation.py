@@ -92,7 +92,7 @@ class TimestepPreparationStage(PipelineStage):
             raise ValueError(
                 "Only one of `timesteps` or `sigmas` can be passed. Please choose one to set custom values"
             )
-
+        print(f"95 {extra_set_timesteps_kwargs=}")
         if timesteps is not None:
             accepts_timesteps = (
                 "timesteps" in inspect.signature(scheduler.set_timesteps).parameters
