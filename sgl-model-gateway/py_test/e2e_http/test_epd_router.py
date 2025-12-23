@@ -21,7 +21,6 @@ import grpc
 import pytest
 import requests
 from grpc_health.v1 import health_pb2, health_pb2_grpc
-
 from sglang.test.run_eval import run_eval
 
 logger = logging.getLogger(__name__)
@@ -367,7 +366,11 @@ def epd_cluster(epd_vlm_model: str):
 @pytest.fixture(scope="module")
 def epd_cluster_multiworker(epd_vlm_model: str):
     """Start a larger EPD cluster (6 encode + 1 prefill + 1 decode)."""
-    # Environment checks omitted for brevity (same as above)
+    try:
+        import torch
+    except Exception as e:
+        pytest.fail(f"EPD e2e requires torch: {e}")
+
     gpu_count = torch.cuda.device_count()
     if gpu_count < 8:
         pytest.skip(f"Multi-worker EPD test requires 8 GPUs, found {gpu_count}")
