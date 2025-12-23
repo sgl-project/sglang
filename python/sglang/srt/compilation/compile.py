@@ -190,7 +190,7 @@ def install_torch_compiled(
 
         bound = types.MethodType(unbound_fwd, self)
         compiled_callable = torch.compile(
-            torch.no_grad()(bound), fullgraph=fullgraph, backend=backend_factory
+            bound, fullgraph=fullgraph, backend=backend_factory
         )
 
         # Trigger Dynamo so bytecode hook can capture
