@@ -11,12 +11,13 @@ use serde_json::Value;
 
 use super::{
     client::GrpcClient,
-    proto_wrapper::{ProtoGenerateComplete, ProtoGenerateRequest, ProtoStream},
+    proto_wrapper::{ProtoEmbedComplete, ProtoGenerateComplete, ProtoRequest, ProtoStream},
 };
 use crate::{
     core::{attach_guards_to_response, Worker, WorkerLoadGuard},
     protocols::{
         chat::{ChatCompletionRequest, ChatCompletionResponse},
+        embedding::{EmbeddingRequest, EmbeddingResponse},
         generate::{GenerateRequest, GenerateResponse},
         responses::ResponsesRequest,
     },
@@ -49,6 +50,7 @@ pub enum RequestType {
     Chat(Arc<ChatCompletionRequest>),
     Generate(Arc<GenerateRequest>),
     Responses(Arc<ResponsesRequest>),
+    Embedding(Arc<EmbeddingRequest>),
 }
 
 /// Shared components (injected once at creation)
@@ -71,7 +73,7 @@ pub struct ProcessingState {
     pub clients: Option<ClientSelection>,
 
     // Stage 4: Request building outputs
-    pub proto_request: Option<ProtoGenerateRequest>,
+    pub proto_request: Option<ProtoRequest>,
 
     // Stage 5: Dispatch metadata
     pub dispatch: Option<DispatchMetadata>,
@@ -202,6 +204,9 @@ pub struct ResponseState {
     /// Collected responses (non-streaming)
     pub collected: Option<Vec<ProtoGenerateComplete>>,
 
+    /// Collected embeddings (non-streaming)
+    pub collected_embeddings: Option<Vec<ProtoEmbedComplete>>,
+
     /// Execution result (streams from workers)
     pub execution_result: Option<ExecutionResult>,
 
@@ -293,6 +298,24 @@ impl RequestContext {
         }
     }
 
+    /// Create context for embedding request
+    pub fn for_embedding(
+        request: Arc<EmbeddingRequest>,
+        headers: Option<HeaderMap>,
+        model_id: Option<String>,
+        components: Arc<SharedComponents>,
+    ) -> Self {
+        Self {
+            input: RequestInput {
+                request_type: RequestType::Embedding(request),
+                headers,
+                model_id,
+            },
+            components,
+            state: ProcessingState::default(),
+        }
+    }
+
     /// Get reference to original request (type-safe)
     pub fn request(&self) -> &RequestType {
         &self.input.request_type
@@ -346,12 +369,29 @@ impl RequestContext {
         }
     }
 
+    /// Get embedding request (panics if not embedding)
+    pub fn embedding_request(&self) -> &EmbeddingRequest {
+        match &self.input.request_type {
+            RequestType::Embedding(req) => req.as_ref(),
+            _ => panic!("Expected embedding request"),
+        }
+    }
+
+    /// Get Arc clone of embedding request (panics if not embedding)
+    pub fn embedding_request_arc(&self) -> Arc<EmbeddingRequest> {
+        match &self.input.request_type {
+            RequestType::Embedding(req) => Arc::clone(req),
+            _ => panic!("Expected embedding request"),
+        }
+    }
+
     /// Check if request is streaming
     pub fn is_streaming(&self) -> bool {
         match &self.input.request_type {
             RequestType::Chat(req) => req.stream,
             RequestType::Generate(req) => req.stream,
             RequestType::Responses(req) => req.stream.unwrap_or(false),
+            RequestType::Embedding(_) => false, // Embeddings are never streaming
         }
     }
 }
@@ -482,11 +522,18 @@ pub enum ExecutionResult {
         prefill: ProtoStream,
         decode: Box<ProtoStream>,
     },
+    /// Embedding requests return a single response, not a stream
+    Embedding {
+        response: ProtoEmbedComplete,
+    },
 }
 
 /// Final processed response
+#[derive(Debug)]
 pub enum FinalResponse {
     Chat(ChatCompletionResponse),
     /// Generate response is a Vec of GenerateResponse (n=1 returns single item, n>1 returns multiple)
     Generate(Vec<GenerateResponse>),
+    /// Embedding response
+    Embedding(EmbeddingResponse),
 }
