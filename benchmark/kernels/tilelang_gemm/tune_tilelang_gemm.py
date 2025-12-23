@@ -29,6 +29,9 @@ from typing import Set, Tuple
 
 import torch
 
+from sglang.srt.layers.tilelang_gemm_wrapper.core.config_loader import DEFAULT_M_VALUES
+from sglang.compile_tilelang_gemm import get_model_weight_shapes
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s"
@@ -44,71 +47,6 @@ DEFAULT_CONFIG_DIR = str(
     SGLANG_ROOT / "python" / "sglang" / "srt" / "layers" / 
     "tilelang_gemm_wrapper" / "core" / "config"
 )
-
-# Default M values (common batch sizes)
-DEFAULT_M_VALUES = [
-    1, 2, 4, 8, 16, 24, 32, 48, 64, 96, 128, 
-    256, 512, 1024, 1536, 2048, 3072, 4096
-]
-
-
-def get_model_weight_shapes(
-    model_path: str,
-    tp_size: int = 1,
-    trust_remote_code: bool = False,
-) -> Set[Tuple[int, int]]:
-    """Extract (N, K) weight shapes from a model configuration."""
-    try:
-        from transformers import AutoConfig
-    except ImportError:
-        logger.error("transformers required. Install: pip install transformers")
-        sys.exit(1)
-    
-    config = AutoConfig.from_pretrained(model_path, trust_remote_code=trust_remote_code)
-    shapes = set()
-    
-    hidden_size = getattr(config, "hidden_size", None)
-    intermediate_size = getattr(config, "intermediate_size", None)
-    num_attention_heads = getattr(config, "num_attention_heads", None)
-    num_key_value_heads = getattr(config, "num_key_value_heads", num_attention_heads)
-    head_dim = getattr(config, "head_dim", None)
-    vocab_size = getattr(config, "vocab_size", None)
-    moe_intermediate_size = getattr(config, "moe_intermediate_size", intermediate_size)
-    n_routed_experts = getattr(config, "n_routed_experts", None)
-    
-    if head_dim is None and hidden_size and num_attention_heads:
-        head_dim = hidden_size // num_attention_heads
-    
-    def add_shape(n: int, k: int):
-        # Round to block size (128)
-        n_aligned = ((n + 127) // 128) * 128
-        k_aligned = ((k + 127) // 128) * 128
-        if n_aligned > 0 and k_aligned > 0:
-            shapes.add((n_aligned, k_aligned))
-    
-    if hidden_size:
-        if num_attention_heads and head_dim:
-            q_size = num_attention_heads * head_dim // tp_size
-            kv_size = num_key_value_heads * head_dim // tp_size
-            add_shape(q_size, hidden_size)
-            add_shape(kv_size, hidden_size)
-            add_shape(hidden_size, num_attention_heads * head_dim // tp_size)
-        
-        if intermediate_size:
-            mlp_size = intermediate_size // tp_size
-            add_shape(mlp_size, hidden_size)
-            add_shape(hidden_size, mlp_size)
-        
-        if n_routed_experts and moe_intermediate_size:
-            moe_size = moe_intermediate_size // tp_size
-            add_shape(moe_size, hidden_size)
-            add_shape(hidden_size, moe_size)
-        
-        if vocab_size:
-            add_shape(vocab_size // tp_size, hidden_size)
-    
-    logger.info(f"Extracted {len(shapes)} unique (N, K) shapes from {model_path}")
-    return shapes
 
 
 def main():

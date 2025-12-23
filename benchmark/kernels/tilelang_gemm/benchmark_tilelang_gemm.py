@@ -26,6 +26,8 @@ from typing import Dict, List, Optional, Tuple
 import torch
 import triton
 
+from sglang.srt.layers.tilelang_gemm_wrapper.core.config_loader import DEFAULT_M_VALUES
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s"
@@ -34,9 +36,6 @@ logger = logging.getLogger(__name__)
 
 # Force enable TileLang GEMM
 os.environ["SGLANG_ENABLE_TILELANG_GEMM"] = "1"
-
-# Default M values
-DEFAULT_M_VALUES = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096]
 
 
 def tflops(M: int, N: int, K: int, latency_ms: float) -> float:
