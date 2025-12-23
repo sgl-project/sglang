@@ -137,7 +137,9 @@ class Sampler(nn.Module):
                 if get_global_server_args().sampling_backend == "flashinfer":
                     if sampling_info.need_min_p_sampling:
                         sampling_probs = top_k_renorm_prob(probs, sampling_info.top_ks)
-                        sampling_probs = top_p_renorm_prob(sampling_probs, sampling_info.top_ps)
+                        sampling_probs = top_p_renorm_prob(
+                            sampling_probs, sampling_info.top_ps
+                        )
                         batch_next_token_ids = min_p_sampling_from_probs(
                             sampling_probs, sampling_info.min_ps
                         )
