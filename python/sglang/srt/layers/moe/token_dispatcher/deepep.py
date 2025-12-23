@@ -612,6 +612,10 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         elif not envs.SGLANG_DEEPEP_BF16_DISPATCH.get():
             use_fp8 = True
 
+        quant_config_name = self.quant_config.get("quant_config_name", None)
+        if quant_config_name == "fp8":
+            use_fp8 = True
+
         buffer = self._get_buffer()
         packed_recv_hidden, self.packed_recv_count, self.handle, event, hook = (
             buffer.low_latency_dispatch(
