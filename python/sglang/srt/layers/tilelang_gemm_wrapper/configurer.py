@@ -11,15 +11,15 @@ def _compute_enable_tilelang_gemm() -> bool:
     """Compute whether to enable TileLang GEMM.
 
     Enable conditions:
-    1. GPU SM version >= 90 (Hopper+)
+    1. GPU SM version >= 89 (Ada Lovelace+)
     2. tilelang package installed
     3. SGLANG_ENABLE_TILELANG_GEMM=1
     """
     try:
         sm_version = get_device_sm()
-        if sm_version < 90:
+        if sm_version < 89:
             logger.debug(
-                f"TileLang GEMM disabled: SM version {sm_version} < 90 (requires Hopper+)"
+                f"TileLang GEMM disabled: SM version {sm_version} < 89 (requires Ada Lovelace+)"
             )
             return False
     except Exception as e:

@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-Benchmark TileLang GEMM vs DeepGEMM
+Benchmark TileLang GEMM vs DeepGEMM vs SGL-Kernel
 
-This script compares the performance of TileLang FP8 blockwise GEMM against DeepGEMM.
+This script compares the performance of TileLang FP8 blockwise GEMM against DeepGEMM
+and SGL-Kernel baselines.
 
 Usage:
     # Benchmark specific (N, K)
@@ -27,7 +28,22 @@ import torch
 import triton
 
 from sglang.srt.layers.tilelang_gemm_wrapper.core.config_loader import DEFAULT_M_VALUES
-from deep_gemm.utils.layout import get_mn_major_tma_aligned_tensor
+
+# Optional deep_gemm import
+try:
+    from deep_gemm.utils.layout import get_mn_major_tma_aligned_tensor
+    DEEP_GEMM_AVAILABLE = True
+except ImportError:
+    get_mn_major_tma_aligned_tensor = None
+    DEEP_GEMM_AVAILABLE = False
+
+# Optional sgl_kernel import
+try:
+    from sgl_kernel import fp8_blockwise_scaled_mm
+    SGL_KERNEL_AVAILABLE = True
+except ImportError:
+    fp8_blockwise_scaled_mm = None
+    SGL_KERNEL_AVAILABLE = False
 
 logging.basicConfig(
     level=logging.INFO,
@@ -54,7 +70,12 @@ def prepare_data(M: int, N: int, K: int):
     B = torch.randn(N, K, dtype=torch.bfloat16, device="cuda")
     
     A_fp8, B_fp8, A_scale, B_scale = prepare_gemm_inputs(A, B)
-    A_scale_deepgemm = get_mn_major_tma_aligned_tensor(A_scale.clone())
+    
+    # Prepare DeepGEMM scale if available
+    if DEEP_GEMM_AVAILABLE:
+        A_scale_deepgemm = get_mn_major_tma_aligned_tensor(A_scale.clone())
+    else:
+        A_scale_deepgemm = None
     
     return A_fp8, B_fp8, A_scale, B_scale, A_scale_deepgemm
 
@@ -109,6 +130,34 @@ def benchmark_deepgemm(
     return ms, min_ms, max_ms
 
 
+def benchmark_sglkernel(
+    A_fp8: torch.Tensor,
+    B_fp8: torch.Tensor,
+    A_scale: torch.Tensor,
+    B_scale: torch.Tensor,
+    M: int,
+    N: int,
+    rep: int = 100,
+) -> Tuple[float, float, float]:
+    """Benchmark SGL-Kernel fp8_blockwise_scaled_mm."""
+    # Prepare data in the format expected by sgl_kernel
+    # A_scale needs to be transposed and made contiguous
+    A_scale_sgl = A_scale.t().contiguous().t()
+    # B and B_scale need to be transposed (K, N layout)
+    B_fp8_sgl = B_fp8.t().contiguous()
+    B_scale_sgl = B_scale.t().contiguous()
+    
+    def fn():
+        return fp8_blockwise_scaled_mm(A_fp8, B_fp8_sgl, A_scale_sgl, B_scale_sgl, torch.bfloat16)
+    
+    quantiles = [0.5, 0.2, 0.8]
+    try:
+        ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(fn, rep=rep, quantiles=quantiles)
+    except Exception:
+        ms, min_ms, max_ms = triton.testing.do_bench(fn, rep=rep, quantiles=quantiles)
+    return ms, min_ms, max_ms
+
+
 def run_benchmark(
     N: int,
     K: int,
@@ -117,9 +166,8 @@ def run_benchmark(
     rep: int = 100,
     output_file: Optional[str] = None,
 ) -> List[Dict]:
-    """Run benchmark comparing TileLang vs DeepGEMM."""
+    """Run benchmark comparing TileLang vs DeepGEMM vs SGL-Kernel."""
     from sglang.srt.layers.tilelang_gemm_wrapper.core import TileLangGEMMWrapper
-    from sglang.srt.layers import deep_gemm_wrapper
     
     # Initialize TileLang wrapper
     wrapper = TileLangGEMMWrapper(config_dir=config_dir)
@@ -131,18 +179,26 @@ def run_benchmark(
         return []
     
     # Check DeepGEMM availability
-    deepgemm_available = deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+    deepgemm_available = False
+    if DEEP_GEMM_AVAILABLE:
+        try:
+            from sglang.srt.layers import deep_gemm_wrapper
+            deepgemm_available = deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+        except ImportError:
+            pass
     
-    print(f"\n{'='*90}")
-    print(f"Benchmark: TileLang vs DeepGEMM")
+    print(f"\n{'='*120}")
+    print(f"Benchmark: TileLang vs DeepGEMM vs SGL-Kernel")
     print(f"N={N}, K={K}")
     print(f"DeepGEMM available: {deepgemm_available}")
-    print(f"{'='*90}\n")
+    print(f"SGL-Kernel available: {SGL_KERNEL_AVAILABLE}")
+    print(f"{'='*120}\n")
     
     # Print header
     header = (
-        f"{'M':>6} | {'TileLang (ms)':>14} | {'DeepGEMM (ms)':>14} | "
-        f"{'TL TFLOPS':>10} | {'DG TFLOPS':>10} | {'Speedup':>8} | {'Kernel Type':>15}"
+        f"{'M':>6} | {'TileLang (ms)':>14} | {'DeepGEMM (ms)':>14} | {'SGL-Kernel (ms)':>15} | "
+        f"{'TL TFLOPS':>10} | {'DG TFLOPS':>10} | {'SK TFLOPS':>10} | "
+        f"{'TL/DG':>7} | {'TL/SK':>7} | {'Kernel Type':>15}"
     )
     print(header)
     print("-" * len(header))
@@ -173,24 +229,39 @@ def run_benchmark(
                         A_fp8, B_fp8, A_scale_deepgemm, B_scale, M, N, rep
                     )
                     dg_tflops = tflops(M, N, K, dg_ms)
-                    speedup = dg_ms / tl_ms
+                    speedup_vs_dg = dg_ms / tl_ms
                 except Exception as e:
-                    dg_ms = dg_tflops = speedup = float('nan')
+                    dg_ms = dg_tflops = speedup_vs_dg = float('nan')
             else:
-                dg_ms = dg_tflops = speedup = float('nan')
+                dg_ms = dg_tflops = speedup_vs_dg = float('nan')
+            
+            # Benchmark SGL-Kernel
+            if SGL_KERNEL_AVAILABLE:
+                try:
+                    sk_ms, _, _ = benchmark_sglkernel(
+                        A_fp8, B_fp8, A_scale, B_scale, M, N, rep
+                    )
+                    sk_tflops = tflops(M, N, K, sk_ms)
+                    speedup_vs_sk = sk_ms / tl_ms
+                except Exception as e:
+                    logger.warning(f"M={M}: SGL-Kernel failed: {e}")
+                    sk_ms = sk_tflops = speedup_vs_sk = float('nan')
+            else:
+                sk_ms = sk_tflops = speedup_vs_sk = float('nan')
             
             # Print result
             print(
-                f"{M:>6} | {tl_ms:>14.4f} | {dg_ms:>14.4f} | "
-                f"{tl_tflops:>10.2f} | {dg_tflops:>10.2f} | "
-                f"{speedup:>7.2f}x | {kernel_type:>15}"
+                f"{M:>6} | {tl_ms:>14.4f} | {dg_ms:>14.4f} | {sk_ms:>15.4f} | "
+                f"{tl_tflops:>10.2f} | {dg_tflops:>10.2f} | {sk_tflops:>10.2f} | "
+                f"{speedup_vs_dg:>6.2f}x | {speedup_vs_sk:>6.2f}x | {kernel_type:>15}"
             )
             
             results.append({
                 "M": M, "N": N, "K": K,
-                "tl_ms": tl_ms, "dg_ms": dg_ms,
-                "tl_tflops": tl_tflops, "dg_tflops": dg_tflops,
-                "speedup": speedup, "kernel_type": kernel_type,
+                "tl_ms": tl_ms, "dg_ms": dg_ms, "sk_ms": sk_ms,
+                "tl_tflops": tl_tflops, "dg_tflops": dg_tflops, "sk_tflops": sk_tflops,
+                "speedup_vs_dg": speedup_vs_dg, "speedup_vs_sk": speedup_vs_sk,
+                "kernel_type": kernel_type,
             })
             
         except Exception as e:
@@ -200,10 +271,16 @@ def run_benchmark(
     
     # Summary
     if results:
-        valid_speedups = [r["speedup"] for r in results if r["speedup"] == r["speedup"]]
-        if valid_speedups:
-            avg_speedup = sum(valid_speedups) / len(valid_speedups)
-            print(f"\nAverage Speedup: {avg_speedup:.2f}x (TileLang vs DeepGEMM)")
+        valid_speedups_dg = [r["speedup_vs_dg"] for r in results if r["speedup_vs_dg"] == r["speedup_vs_dg"]]
+        valid_speedups_sk = [r["speedup_vs_sk"] for r in results if r["speedup_vs_sk"] == r["speedup_vs_sk"]]
+        
+        print("\nSummary:")
+        if valid_speedups_dg:
+            avg_speedup_dg = sum(valid_speedups_dg) / len(valid_speedups_dg)
+            print(f"  Average Speedup vs DeepGEMM: {avg_speedup_dg:.2f}x")
+        if valid_speedups_sk:
+            avg_speedup_sk = sum(valid_speedups_sk) / len(valid_speedups_sk)
+            print(f"  Average Speedup vs SGL-Kernel: {avg_speedup_sk:.2f}x")
     
     # Save to file
     if output_file and results:
@@ -218,7 +295,7 @@ def run_benchmark(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Benchmark TileLang GEMM vs DeepGEMM",
+        description="Benchmark TileLang GEMM vs DeepGEMM vs SGL-Kernel",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__
     )
