@@ -91,7 +91,7 @@ class MultiModalEmbeddingData(EmbeddingData):
         return mm_data
 
     def __repr__(self):
-        return f"MultiModalEmbeddingData(req_id={self.req_id}, num_parts={self.num_parts}, part_idx={self.part_idx}, modality={self.modality}"
+        return f"MultiModalEmbeddingData(req_id={self.req_id}, num_parts={self.num_parts}, part_idx={self.part_idx}, modality={self.modality})"
 
     def _get_mm_grid(self, modality):
         if modality == Modality.IMAGE:

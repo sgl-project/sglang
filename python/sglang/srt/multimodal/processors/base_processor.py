@@ -10,6 +10,7 @@ from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
 import numpy as np
 import torch
 from PIL import Image
+from transformers import BaseImageProcessorFast
 
 from sglang.srt.managers.schedule_batch import (
     Modality,
@@ -23,7 +24,6 @@ from sglang.srt.utils.cuda_ipc_transport_utils import (
     CudaIpcTensorTransportProxy,
     MmItemMemoryPool,
 )
-from transformers import BaseImageProcessorFast
 
 _is_npu = is_npu()
 
@@ -290,6 +290,7 @@ class BaseMultimodalProcessor(ABC):
         input_ids, offsets, modality_list = self.build_input_ids(
             prompt, img_grid_thw, video_grid_thw
         )
+        assert all(isinstance(modality, Modality) for modality in modality_list)
 
         mm_items = []
         embedding_index = 0

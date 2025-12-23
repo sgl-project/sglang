@@ -12,7 +12,7 @@ from torchvision.transforms import InterpolationMode
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
-from sglang.srt.managers.schedule_batch import MultimodalDataItem
+from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
 from sglang.srt.models.qwen2_5_vl import Qwen2_5_VLForConditionalGeneration
 from sglang.srt.models.qwen2_vl import Qwen2VLForConditionalGeneration
 from sglang.srt.models.qwen3_omni_moe import Qwen3OmniMoeForConditionalGeneration
@@ -265,6 +265,8 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
         input_ids, offsets, modality_list = self.build_input_ids(
             prompt, img_grid_thw, video_grid_thw
         )
+        assert all(isinstance(modality, Modality) for modality in modality_list)
+
         mrope_positions, mrope_position_delta = MRotaryEmbedding.get_rope_index(
             spatial_merge_size=self.hf_config.vision_config.spatial_merge_size,
             image_token_id=self.mm_tokens.image_token_id,
