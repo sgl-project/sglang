@@ -2812,7 +2812,7 @@ def run_scheduler_process(
     numa_node = None
     if (numa_nodes := server_args.numa_node) is not None:
         numa_node = numa_nodes[gpu_id]
-    elif get_bool_env_var("SGLANG_AUTO_NUMA_BIND"):
+    elif envs.SGLANG_AUTO_NUMA_BIND.get():
         numa_node = get_numa_node(gpu_id)
         logger.info(f"auto get NUMA node {numa_node} for GPU {gpu_id}")
     if numa_node is not None and not envs.SGLANG_NUMA_BIND_V2.get():
