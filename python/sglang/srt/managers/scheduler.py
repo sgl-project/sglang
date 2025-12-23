@@ -147,7 +147,7 @@ from sglang.srt.managers.scheduler_profiler_mixin import SchedulerProfilerMixin
 from sglang.srt.managers.scheduler_recv_skipper import SchedulerRecvSkipper
 from sglang.srt.managers.scheduler_runtime_checker_mixin import (
     SchedulerRuntimeCheckerMixin,
-    SchedulerWatchdog,
+    create_scheduler_watchdog,
 )
 from sglang.srt.managers.scheduler_update_weights_mixin import (
     SchedulerUpdateWeightsMixin,
@@ -291,13 +291,8 @@ class Scheduler(
             )
         )
 
-        # Init model config
-        self.model_config = ModelConfig.from_server_args(server_args)
-        self.dllm_config = (  # For diffusion LLM
-            DllmConfig.from_server_args(server_args)
-            if server_args.dllm_algorithm is not None
-            else None
-        )
+        # Init model configs
+        self.init_model_config()
 
         # Init metrics stats
         self.init_metrics(tp_rank, pp_rank, dp_rank)
@@ -305,7 +300,7 @@ class Scheduler(
         # Init inter-process communication
         self.init_sockets(server_args, port_args)
 
-        # Init pdmux context
+        # Init PD-multiplexing context
         if self.enable_pdmux:
             self.init_pdmux()
 
@@ -315,10 +310,10 @@ class Scheduler(
         # Init moe config and GEMM config (FP8 GEMM, etc.)
         self.init_moe_gemm_config()
 
-        # Launch a tensor parallel worker
+        # Launch a model worker and draft model worker if using speculative decoding
         self.init_model_worker()
 
-        # Init cache using the existing memory pool
+        # Init cache and memory pool
         self.init_cache_with_memory_pool()
 
         # Init running status
@@ -339,10 +334,10 @@ class Scheduler(
         # Init profiler
         self.init_profiler()
 
-        # Init disaggregation
+        # Init prefill-decodedisaggregation
         self.init_disaggregation()
 
-        # Init overlap
+        # Init overlap schedule
         self.init_overlap()
 
         # Init prefill kv split size when deterministic inference is enabled with various attention backends
@@ -350,6 +345,14 @@ class Scheduler(
 
         # Init request dispatcher
         self.init_request_dispatcher()
+
+    def init_model_config(self):
+        self.model_config = ModelConfig.from_server_args(self.server_args)
+        self.dllm_config = (  # For diffusion LLM
+            DllmConfig.from_server_args(self.server_args)
+            if self.server_args.dllm_algorithm is not None
+            else None
+        )
 
     def init_sockets(self, server_args: ServerArgs, port_args: PortArgs):
         context = zmq.Context(2)
@@ -479,9 +482,41 @@ class Scheduler(
         # algorithms should register their factory instead of patching this code.
         if self.spec_algorithm.is_eagle():
             draft_worker_kwargs["enable_overlap"] = self.enable_overlap
-        self.draft_worker = self.spec_algorithm.create_draft_worker(
-            **draft_worker_kwargs
-        )
+
+        # FIXME: refactor the draft worker registration logic
+        if self.server_args.enable_multi_layer_eagle:
+            if self.enable_overlap:
+                from sglang.srt.speculative.multi_layer_eagle_worker_v2 import (
+                    MultiLayerEagleWorkerV2,
+                )
+
+                self.draft_worker = MultiLayerEagleWorkerV2(
+                    gpu_id=self.gpu_id,
+                    tp_rank=self.tp_rank,
+                    moe_ep_rank=self.moe_ep_rank,
+                    server_args=self.server_args,
+                    nccl_port=self.nccl_port,
+                    target_worker=self.tp_worker,
+                    dp_rank=self.dp_rank,
+                )
+            else:
+                from sglang.srt.speculative.multi_layer_eagle_worker import (
+                    MultiLayerEagleWorker,
+                )
+
+                self.draft_worker = MultiLayerEagleWorker(
+                    gpu_id=self.gpu_id,
+                    tp_rank=self.tp_rank,
+                    moe_ep_rank=self.moe_ep_rank,
+                    server_args=self.server_args,
+                    nccl_port=self.nccl_port,
+                    target_worker=self.tp_worker,
+                    dp_rank=self.dp_rank,
+                )
+        else:
+            self.draft_worker = self.spec_algorithm.create_draft_worker(
+                **draft_worker_kwargs
+            )
 
         # Dispatch the model worker
         if self.spec_algorithm.is_none():
@@ -548,7 +583,7 @@ class Scheduler(
     def init_cache_with_memory_pool(self):
         server_args = self.server_args
 
-        # Hybrid memory pool configs
+        # Hybrid memory pool
         self.is_hybrid_swa = self.tp_worker.is_hybrid_swa
         self.is_hybrid_ssm = (
             self.tp_worker.model_runner.hybrid_gdn_config is not None
@@ -592,8 +627,12 @@ class Scheduler(
 
                 self.tree_cache = ChunkCache(params)
             else:
-
                 from sglang.srt.mem_cache.chunk_cache import SWAChunkCache
+
+                params.is_local_attention = (
+                    "Llama4ForConditionalGeneration"
+                    in self.model_config.hf_config.architectures
+                )
 
                 self.tree_cache = SWAChunkCache(params)
         else:
@@ -761,11 +800,13 @@ class Scheduler(
 
     def init_watch_dog_memory_saver_input_blocker(self):
         # Start watchdog thread
-        self.watchdog = SchedulerWatchdog(
+        self.watchdog = create_scheduler_watchdog(
             self, watchdog_timeout=self.server_args.watchdog_timeout
         )
         if (x := self.server_args.soft_watchdog_timeout) is not None:
-            self.soft_watchdog = SchedulerWatchdog(self, watchdog_timeout=x, soft=True)
+            self.soft_watchdog = create_scheduler_watchdog(
+                self, watchdog_timeout=x, soft=True
+            )
 
         # Init memory saver, profiler and metric stats
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
@@ -796,11 +837,14 @@ class Scheduler(
         if self.draft_worker is None or self.spec_algorithm.is_ngram():
             draft_token_to_kv_pool = None
         elif self.spec_algorithm.is_eagle() and self.enable_overlap:
-            draft_token_to_kv_pool = (
-                self.draft_worker.draft_worker.draft_runner.token_to_kv_pool
-            )
-            model_config = self.draft_worker.draft_worker.draft_runner.model_config
+            if self.server_args.enable_multi_layer_eagle:
+                draft_runner = self.draft_worker.draft_worker.draft_runner_list[0]
+            else:
+                draft_runner = self.draft_worker.draft_worker.draft_runner
+            draft_token_to_kv_pool = draft_runner.token_to_kv_pool
+            model_config = draft_runner.model_config
         else:
+            # todo: should we fix this when enabling mtp or it doesn't matter since we only enable mtp in decode node thus we don't transfer draft kvs between P and D?
             draft_token_to_kv_pool = self.draft_worker.model_runner.token_to_kv_pool
             model_config = self.draft_worker.model_config
 
@@ -911,6 +955,7 @@ class Scheduler(
                 hf_config=self.model_config.hf_config,
                 tp_rank=self.tp_rank,
                 pp_rank=self.pp_rank,
+                tp_group=self.tp_group,
             )
 
     def init_overlap(self):
@@ -1195,6 +1240,14 @@ class Scheduler(
                 src=self.tp_group.ranks[0],
             )
 
+        # Process MM requests under EPD-disaggregation mode
+        if (
+            self.pp_rank == 0
+            and self.server_args.language_only
+            and self.server_args.encoder_transfer_backend == "zmq_to_scheduler"
+        ):
+            recv_reqs = self.mm_receiver.process_waiting_requests(recv_reqs)
+
         if self.enable_trace:
             for req in recv_reqs:
                 if isinstance(
@@ -1235,12 +1288,6 @@ class Scheduler(
         return work_reqs, control_reqs
 
     def process_input_requests(self, recv_reqs: List):
-        # Process MM requests under EPD-disaggregation mode
-        if (
-            self.server_args.language_only
-            and self.server_args.encoder_transfer_backend == "zmq_to_scheduler"
-        ):
-            recv_reqs = self.mm_receiver.process_waiting_requests(recv_reqs)
 
         for recv_req in recv_reqs:
             # If it is a health check generation request and there are running requests, ignore it.
@@ -1374,6 +1421,7 @@ class Scheduler(
                 custom_logit_processor=recv_req.custom_logit_processor,
                 require_reasoning=recv_req.require_reasoning,
                 return_hidden_states=recv_req.return_hidden_states,
+                return_routed_experts=recv_req.return_routed_experts,
                 eos_token_ids=self.model_config.hf_eos_token_id,
                 bootstrap_host=recv_req.bootstrap_host,
                 bootstrap_port=recv_req.bootstrap_port,
@@ -1834,13 +1882,11 @@ class Scheduler(
 
         # Determine chunked_prefill_size for this batch
         chunked_prefill_size = self.chunked_prefill_size
-        if self.chunked_req is not None:
-            self.chunked_req.init_next_round_input()
-            if self.enable_dynamic_chunking:
-                history_len = len(self.chunked_req.prefix_indices)
-                dynamic_size = self.predict_next_chunk_size(history_len)
-                if dynamic_size is not None:
-                    chunked_prefill_size = dynamic_size
+        if self.chunked_req is not None and self.enable_dynamic_chunking:
+            history_len = len(self.chunked_req.prefix_indices)
+            dynamic_size = self.predict_next_chunk_size(history_len)
+            if dynamic_size is not None:
+                chunked_prefill_size = dynamic_size
 
         # Prefill policy
         adder = PrefillAdder(
