@@ -177,7 +177,6 @@ class ServerArgs:
 
     # Attention
     attention_backend: str = None
-    hybrid_sage_attn: bool = False
 
     # Running mode
     mode: ExecutionMode = ExecutionMode.INFERENCE
