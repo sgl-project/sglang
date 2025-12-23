@@ -6,13 +6,25 @@
 use std::{sync::Arc, time::Instant};
 
 use axum::response::{IntoResponse, Response};
-use tracing::error;
+use tracing::{debug, error};
 
+// Import embedding-specific stages
+use super::regular::stages::embedding::preparation::EmbeddingPreparationStage;
 use super::{
     common::stages::*,
     context::*,
     harmony,
-    regular::{processor, stages::*, streaming},
+    regular::{
+        processor,
+        stages::{
+            embedding::{
+                request_building::EmbeddingRequestBuildingStage,
+                response_processing::EmbeddingResponseProcessingStage,
+            },
+            *,
+        },
+        streaming,
+    },
     utils::error_type_from_status,
 };
 use crate::{
@@ -21,6 +33,7 @@ use crate::{
     policies::PolicyRegistry,
     protocols::{
         chat::{ChatCompletionRequest, ChatCompletionResponse},
+        embedding::EmbeddingRequest,
         generate::GenerateRequest,
     },
     reasoning_parser::ParserFactory as ReasoningParserFactory,
@@ -186,6 +199,32 @@ impl RequestPipeline {
         }
     }
 
+    /// Create an embeddings pipeline
+    pub fn new_embeddings(
+        worker_registry: Arc<WorkerRegistry>,
+        policy_registry: Arc<PolicyRegistry>,
+        _tokenizer: Arc<dyn Tokenizer>,
+    ) -> Self {
+        let stages: Vec<Box<dyn PipelineStage>> = vec![
+            Box::new(EmbeddingPreparationStage::new()),
+            Box::new(WorkerSelectionStage::new(
+                worker_registry,
+                policy_registry,
+                WorkerSelectionMode::Regular, // Embeddings are always single
+            )),
+            Box::new(ClientAcquisitionStage),
+            Box::new(EmbeddingRequestBuildingStage::new()),
+            Box::new(DispatchMetadataStage),
+            Box::new(RequestExecutionStage::new(ExecutionMode::Single)),
+            Box::new(EmbeddingResponseProcessingStage::new()),
+        ];
+
+        Self {
+            stages: Arc::new(stages),
+            backend_type: metrics_labels::BACKEND_REGULAR, // Embeddings are regular for now
+        }
+    }
+
     /// Execute the complete pipeline for a chat request
     pub async fn execute_chat(
         &self,
@@ -257,10 +296,10 @@ impl RequestPipeline {
                 );
                 axum::Json(response).into_response()
             }
-            Some(FinalResponse::Generate(_)) => {
+            Some(FinalResponse::Generate(_)) | Some(FinalResponse::Embedding(_)) => {
                 error!(
                     function = "execute_chat",
-                    "Wrong response type: expected Chat, got Generate"
+                    "Wrong response type: expected Chat, got Generate/Embedding"
                 );
                 Metrics::record_router_error(
                     metrics_labels::ROUTER_GRPC,
@@ -361,10 +400,10 @@ impl RequestPipeline {
                 );
                 axum::Json(response).into_response()
             }
-            Some(FinalResponse::Chat(_)) => {
+            Some(FinalResponse::Chat(_)) | Some(FinalResponse::Embedding(_)) => {
                 error!(
                     function = "execute_generate",
-                    "Wrong response type: expected Generate, got Chat"
+                    "Wrong response type: expected Generate, got Chat/Embedding"
                 );
                 Metrics::record_router_error(
                     metrics_labels::ROUTER_GRPC,
@@ -388,6 +427,112 @@ impl RequestPipeline {
                     model_for_metrics.as_deref().unwrap_or("unknown"),
                     metrics_labels::ENDPOINT_GENERATE,
                     metrics_labels::ERROR_INTERNAL,
+                );
+                error::internal_error("no_response_produced", "No response produced")
+            }
+        }
+    }
+
+    /// Execute the complete pipeline for an embedding request
+    pub async fn execute_embeddings(
+        &self,
+        request: Arc<EmbeddingRequest>,
+        headers: Option<http::HeaderMap>,
+        model_id: Option<String>,
+        components: Arc<SharedComponents>,
+    ) -> Response {
+        debug!(
+            "execute_embeddings: Starting execution for model: {:?}",
+            model_id
+        );
+        let start = Instant::now();
+
+        // Record request start
+        Metrics::record_router_request(
+            metrics_labels::ROUTER_GRPC,
+            self.backend_type,
+            metrics_labels::CONNECTION_GRPC,
+            model_id.as_deref().unwrap_or("unknown"),
+            metrics_labels::ENDPOINT_EMBEDDINGS,
+            bool_to_static_str(false),
+        );
+
+        let mut ctx = RequestContext::for_embedding(request, headers, model_id.clone(), components);
+
+        for stage in self.stages.iter() {
+            debug!("execute_embeddings: Executing stage: {}", stage.name());
+            match stage.execute(&mut ctx).await {
+                Ok(Some(response)) => {
+                    debug!(
+                        "execute_embeddings: Stage {} returned final response.",
+                        stage.name()
+                    );
+                    Metrics::record_router_duration(
+                        metrics_labels::ROUTER_GRPC,
+                        self.backend_type,
+                        metrics_labels::CONNECTION_GRPC,
+                        model_id.as_deref().unwrap_or("unknown"),
+                        metrics_labels::ENDPOINT_EMBEDDINGS,
+                        start.elapsed(),
+                    );
+                    return response;
+                }
+                Ok(None) => {
+                    debug!(
+                        "execute_embeddings: Stage {} completed, continuing to next stage.",
+                        stage.name()
+                    );
+                    continue;
+                }
+                Err(response) => {
+                    error!(
+                        "execute_embeddings: Stage {} failed with status {:?}, returning error response.",
+                        stage.name(),
+                        response.status()
+                    );
+                    Metrics::record_router_error(
+                        metrics_labels::ROUTER_GRPC,
+                        self.backend_type,
+                        metrics_labels::CONNECTION_GRPC,
+                        model_id.as_deref().unwrap_or("unknown"),
+                        metrics_labels::ENDPOINT_EMBEDDINGS,
+                        error_type_from_status(response.status()),
+                    );
+                    return response;
+                }
+            }
+        }
+
+        debug!(
+            "execute_embeddings: Pipeline finished, processing final_response. Current state: {:?}",
+            ctx.state.response.final_response
+        );
+        match ctx.state.response.final_response {
+            Some(FinalResponse::Embedding(_)) => {
+                error!("execute_embeddings: Embedding FinalResponse found, but pipeline finished without returning response directly. This should be handled by the last stage.");
+                // Already handled in ResponseProcessingStage, but just in case
+                Metrics::record_router_duration(
+                    metrics_labels::ROUTER_GRPC,
+                    self.backend_type,
+                    metrics_labels::CONNECTION_GRPC,
+                    model_id.as_deref().unwrap_or("unknown"),
+                    metrics_labels::ENDPOINT_EMBEDDINGS,
+                    start.elapsed(),
+                );
+                // The response should have been returned by the last stage
+                error::internal_error(
+                    "pipeline_fallthrough",
+                    "Pipeline finished without returning response",
+                )
+            }
+            Some(_) => {
+                error!(function = "execute_embeddings", "Wrong response type");
+                error::internal_error("wrong_response_type", "Internal error: wrong response type")
+            }
+            None => {
+                error!(
+                    function = "execute_embeddings",
+                    "No final response produced by pipeline."
                 );
                 error::internal_error("no_response_produced", "No response produced")
             }
@@ -440,10 +585,10 @@ impl RequestPipeline {
 
         match ctx.state.response.final_response {
             Some(FinalResponse::Chat(response)) => Ok(response),
-            Some(FinalResponse::Generate(_)) => {
+            Some(FinalResponse::Generate(_)) | Some(FinalResponse::Embedding(_)) => {
                 error!(
                     function = "execute_chat_for_responses",
-                    "Wrong response type: expected Chat, got Generate"
+                    "Wrong response type: expected Chat, got Generate/Embedding"
                 );
                 Err(error::internal_error(
                     "wrong_response_type",
