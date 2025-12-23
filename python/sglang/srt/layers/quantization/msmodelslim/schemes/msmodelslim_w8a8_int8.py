@@ -106,7 +106,7 @@ class ModelSlimW8A8Int8(ModelSlimScheme):
             layer.register_parameter("deq_scale", deq_scale)
 
     def process_weights_after_loading(self, layer: torch.nn.Module):
-            self.kernel.process_weights_after_loading(layer)
+        self.kernel.process_weights_after_loading(layer)
 
     def apply_weights(
         self,
@@ -114,4 +114,4 @@ class ModelSlimW8A8Int8(ModelSlimScheme):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-            return self.kernel.apply(layer, x, bias)
+        return self.kernel.apply(layer, x, bias)
