@@ -85,6 +85,7 @@ class BaseLayerWithLoRA(nn.Module):
                 delta = delta * (
                     self.lora_alpha / self.lora_rank  # type: ignore
                 )  # type: ignore
+            delta = delta * self.strength
             out, output_bias = self.base_layer(x)
             return out + delta, output_bias
         else:
@@ -407,6 +408,7 @@ class LinearWithLoRA(BaseLayerWithLoRA):
                 delta = delta * (
                     self.lora_alpha / self.lora_rank  # type: ignore
                 )  # type: ignore
+            delta = delta * self.strength
             # nn.Linear.forward() returns a single tensor, not a tuple
             out = self.base_layer(x)
             return out + delta
