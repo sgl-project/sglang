@@ -486,7 +486,7 @@ class ServerArgs:
     hicache_storage_backend: Optional[str] = None
     hicache_storage_prefetch_policy: str = "best_effort"
     hicache_storage_backend_extra_config: Optional[str] = None
-    prefix_caching_hash_algo: str = "sha256"
+    multimodal_hash_algo: str = "sha256"
     # LMCache
     enable_lmcache: bool = False
 
@@ -1877,12 +1877,12 @@ class ServerArgs:
             )
 
     def _handle_hicache(self):
-        # Validate hash algorithm selection
+        # Validate multimodal hash algorithm selection
         from sglang.srt.utils.hashing import HashAlgorithm
 
-        if not HashAlgorithm.is_available(self.prefix_caching_hash_algo):
+        if not HashAlgorithm.is_available(self.multimodal_hash_algo):
             raise ValueError(
-                f"Hash algorithm '{self.prefix_caching_hash_algo}' is not available. "
+                f"Multimodal hash algorithm '{self.multimodal_hash_algo}' is not available. "
                 f"Available options: {HashAlgorithm.choices()}. "
                 "If using 'xxhash', please install it with: pip install xxhash"
             )
@@ -3715,12 +3715,12 @@ class ServerArgs:
             help="A dictionary in JSON string format containing extra configuration for the storage backend.",
         )
         parser.add_argument(
-            "--prefix-caching-hash-algo",
+            "--multimodal-hash-algo",
             type=str,
             choices=["sha256", "xxhash"],
-            default=ServerArgs.prefix_caching_hash_algo,
+            default=ServerArgs.multimodal_hash_algo,
             help=(
-                "Hash algorithm for prefix caching and internal operations. "
+                "Hash algorithm for multimodal feature hashing (used by set_pad_value). "
                 "Options: 'sha256' (cryptographic, default), 'xxhash' (non-cryptographic, faster). "
                 "Note: xxhash requires the 'xxhash' package to be installed."
             ),

@@ -1157,7 +1157,10 @@ def data_hash(data, algorithm: str = "sha256") -> int:
 
 def tensor_hash(tensor_list, algorithm: str = "sha256") -> int:
     """
-    hash a tensor or a tensor list
+    Hash a tensor or a tensor list using the specified algorithm.
+
+    For CUDA tensors with SHA-256, uses fast GPU hash (gpu_tensor_hash).
+    For other algorithms or CPU tensors, converts to bytes and uses configurable hash.
     """
     tensor = tensor_list
     if isinstance(tensor_list, list):
@@ -1182,7 +1185,7 @@ def tensor_hash(tensor_list, algorithm: str = "sha256") -> int:
 
 
 def hash_feature(f, algorithm: str = "sha256"):
-    """Hash feature using the configured hash algorithm from server args.
+    """Hash feature using the specified hash algorithm.
 
     Args:
         f: The feature to hash

@@ -10,31 +10,12 @@ from sglang.srt.mem_cache.memory_pool_host import HostKVCache
 
 logger = logging.getLogger(__name__)
 
-# Import hashing utilities (for backward compatibility, default to SHA-256)
-# The actual hash algorithm will be set via configure_hash_algorithm()
-_hash_algorithm = "sha256"
-
-
-def configure_hash_algorithm(algorithm: str = "sha256"):
-    """Configure the hash algorithm for prefix caching.
-
-    Args:
-        algorithm: Hash algorithm to use ('sha256' or 'xxhash')
-    """
-    global _hash_algorithm
-    _hash_algorithm = algorithm
-    logger.info(f"Configured prefix caching hash algorithm: {algorithm}")
-
 
 def get_hash_str(token_ids: List[int], prior_hash: str = None) -> str:
-    """Compute hash string for token IDs using the configured algorithm.
-
-    This function maintains backward compatibility by defaulting to SHA-256.
-    Use configure_hash_algorithm() to change the hash algorithm.
-    """
+    """Compute SHA-256 hash string for token IDs (used for prefix caching)."""
     from sglang.srt.utils.hashing import get_hash_str as _get_hash_str
 
-    return _get_hash_str(token_ids, prior_hash, algorithm=_hash_algorithm)
+    return _get_hash_str(token_ids, prior_hash)
 
 
 def hash_str_to_int64(hash_str: str) -> int:

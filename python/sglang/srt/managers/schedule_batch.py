@@ -266,7 +266,7 @@ class MultimodalDataItem:
 
             server_args = get_global_server_args()
             self.hash = hash_feature(
-                hashed_feature, algorithm=server_args.prefix_caching_hash_algo
+                hashed_feature, algorithm=server_args.multimodal_hash_algo
             )
         assert self.hash is not None
         self.pad_value = self.hash % (1 << 30)

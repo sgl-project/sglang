@@ -11,7 +11,6 @@ import torch
 
 from sglang.srt.managers.cache_controller import HiCacheController, PrefetchOperation
 from sglang.srt.mem_cache.base_prefix_cache import MatchResult
-from sglang.srt.mem_cache.hicache_storage import configure_hash_algorithm
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, MLATokenToKVPool
 from sglang.srt.mem_cache.memory_pool_host import (
     MHATokenToKVPoolHost,
@@ -90,8 +89,6 @@ class HiRadixCache(RadixCache):
         self.prefetch_stop_policy = server_args.hicache_storage_prefetch_policy
 
         self.load_cache_event = threading.Event()
-        # Configure hash algorithm before creating HiCacheController
-        configure_hash_algorithm(server_args.prefix_caching_hash_algo)
         self.cache_controller = HiCacheController(
             params.token_to_kv_pool_allocator,
             self.token_to_kv_pool_host,

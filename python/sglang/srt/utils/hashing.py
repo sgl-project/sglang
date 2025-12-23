@@ -1,8 +1,8 @@
 """
-Hash utility functions for prefix caching.
+Hash utility functions for prefix caching and multimodal features.
 
-This module provides configurable hashing algorithms for prefix caching.
-It supports SHA-256 (cryptographic, default) and xxHash (non-cryptographic, faster).
+This module provides hashing functions for prefix caching (SHA-256) and
+multimodal feature hashing (supports SHA-256 and xxHash).
 """
 
 import hashlib
@@ -11,28 +11,23 @@ from typing import List, Optional
 
 logger = logging.getLogger(__name__)
 
-# Try to import xxhash, but make it optional
+# Try to import xxhash, but make it optional (used only for multimodal features)
 try:
     import xxhash
 
     _XXHASH_AVAILABLE = True
-    # Check if xxh3_128_digest is available (for compatibility with older versions)
-    _XXHASH_V3_AVAILABLE = hasattr(xxhash, "xxh3_128") and hasattr(
-        xxhash.xxh3_128(), "digest"
-    )
     # Check if xxh3_64 with intdigest is available
     _XXHASH_V3_64_AVAILABLE = hasattr(xxhash, "xxh3_64") and hasattr(
         xxhash.xxh3_64(), "intdigest"
     )
 except ImportError:
     _XXHASH_AVAILABLE = False
-    _XXHASH_V3_AVAILABLE = False
     _XXHASH_V3_64_AVAILABLE = False
     xxhash = None  # type: ignore
 
 
 class HashAlgorithm:
-    """Hash algorithm options for prefix caching."""
+    """Hash algorithm options for multimodal features."""
 
     SHA256 = "sha256"
     XXHASH = "xxhash"
@@ -55,45 +50,16 @@ class HashAlgorithm:
         return False
 
 
-def get_hash_str(
-    token_ids: List[int],
-    prior_hash: Optional[str] = None,
-    algorithm: str = HashAlgorithm.SHA256,
-) -> str:
-    """Compute hash string for token IDs.
+def get_hash_str(token_ids: List[int], prior_hash: Optional[str] = None) -> str:
+    """Compute SHA-256 hash string for token IDs (used for prefix caching).
 
     Args:
         token_ids: List of token IDs to hash
         prior_hash: Optional prior hash value for chaining (hex string)
-        algorithm: Hash algorithm to use ('sha256' or 'xxhash')
 
     Returns:
         Hexadecimal hash string
-
-    Raises:
-        ValueError: If the requested algorithm is not available
     """
-    if algorithm == HashAlgorithm.SHA256:
-        return _get_hash_str_sha256(token_ids, prior_hash)
-    elif algorithm == HashAlgorithm.XXHASH:
-        if not _XXHASH_AVAILABLE:
-            raise ValueError(
-                "xxhash is not available. Please install it with: pip install xxhash"
-            )
-        if not _XXHASH_V3_AVAILABLE:
-            raise ValueError(
-                "xxhash version is too old. Please upgrade to xxhash>=3.0.0"
-            )
-        return _get_hash_str_xxhash(token_ids, prior_hash)
-    else:
-        raise ValueError(
-            f"Unknown hash algorithm: {algorithm}. "
-            f"Available options: {HashAlgorithm.choices()}"
-        )
-
-
-def _get_hash_str_sha256(token_ids: List[int], prior_hash: Optional[str] = None) -> str:
-    """Compute SHA-256 hash string for token IDs."""
     hasher = hashlib.sha256()
 
     if prior_hash:
@@ -111,41 +77,10 @@ def _get_hash_str_sha256(token_ids: List[int], prior_hash: Optional[str] = None)
     return hasher.hexdigest()
 
 
-def _get_hash_str_xxhash(token_ids: List[int], prior_hash: Optional[str] = None) -> str:
-    """Compute xxHash hash string for token IDs.
-
-    Uses xxh3_128 for 128-bit output to match SHA-256 output length.
-    """
-    if prior_hash:
-        # For chaining, we need to incorporate the prior hash.
-        # Convert prior hash hex string to bytes and use as seed
-        prior_bytes = bytes.fromhex(prior_hash)
-        # Use first 8 bytes as seed (xxhash uses 64-bit seed)
-        seed = int.from_bytes(prior_bytes[:8], byteorder="little")
-        hasher = xxhash.xxh3_128(seed=seed)
-        # Update with remaining bytes if any
-        if len(prior_bytes) > 8:
-            hasher.update(prior_bytes[8:])
-    else:
-        hasher = xxhash.xxh3_128()
-
-    for t in token_ids:
-        if isinstance(t, tuple):
-            # EAGLE bigram mode: hash both elements to uniquely identify the bigram
-            for elem in t:
-                hasher.update(elem.to_bytes(4, byteorder="little", signed=False))
-        else:
-            # Regular mode: single integer token
-            hasher.update(t.to_bytes(4, byteorder="little", signed=False))
-
-    return hasher.hexdigest()
-
-
 def hash_str_to_int64(hash_str: str) -> int:
     """Convert hash hex string to signed 64-bit integer for events.
 
     Takes first 16 hex characters (64 bits) and converts to signed int64 range.
-    Works with both SHA-256 and xxHash outputs.
     """
     # Take first 16 hex chars to get 64-bit value
     uint64_val = int(hash_str[:16], 16)
