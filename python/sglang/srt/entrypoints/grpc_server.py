@@ -694,22 +694,25 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
                 except Exception as e:
                     logger.warning(f"Failed to encode routed_experts: {e}")
 
+        complete_kwargs = dict(
+            output_ids=output.get("token_ids", []),
+            finish_reason=finish_reason,
+            prompt_tokens=meta_info.get("prompt_tokens", 0),
+            completion_tokens=meta_info.get(
+                "completion_tokens", len(output.get("token_ids", []))
+            ),
+            cached_tokens=meta_info.get("cached_tokens", 0),
+            output_logprobs=output_logprobs_proto,
+            input_logprobs=input_logprobs_proto,
+            index=output.get("index", 0),
+            **matched_stop_kwargs,
+        )
+        if routed_experts_proto is not None:
+            complete_kwargs["routed_experts"] = routed_experts_proto
+
         return sglang_scheduler_pb2.GenerateResponse(
             request_id=request_id,
-            complete=sglang_scheduler_pb2.GenerateComplete(
-                output_ids=output.get("token_ids", []),
-                finish_reason=finish_reason,
-                prompt_tokens=meta_info.get("prompt_tokens", 0),
-                completion_tokens=meta_info.get(
-                    "completion_tokens", len(output.get("token_ids", []))
-                ),
-                cached_tokens=meta_info.get("cached_tokens", 0),
-                output_logprobs=output_logprobs_proto,
-                input_logprobs=input_logprobs_proto,
-                index=output.get("index", 0),
-                routed_experts=routed_experts_proto,
-                **matched_stop_kwargs,
-            ),
+            complete=sglang_scheduler_pb2.GenerateComplete(**complete_kwargs),
         )
 
     async def shutdown(self):
