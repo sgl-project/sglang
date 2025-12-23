@@ -46,7 +46,7 @@ python3 -m sglang.launch_server \
   --nnodes 4 --node-rank 0 --tp 8 --pp-size 4 \
   --port 30000 --dist-init-addr 192.168.0.137:62001 \
   --disable-radix-cache --mem-fraction-static 0.8  \
-  --attention-backend fa3 --watchdog-timeout 3600  --host 0.0.0.0 --watchdog-timeout 3600 \
+  --attention-backend fa3 --host 0.0.0.0 --watchdog-timeout 3600 \
   --max-running-requests 128 --chunked-prefill-size 4096 --enable-dynamic-chunking
 ```
 
@@ -58,7 +58,7 @@ python3 -m sglang.launch_server \
   --nnodes 4 --node-rank 0 --tp 8 --pp-size 4 \
   --port 30000 --dist-init-addr 192.168.0.137:62001 \
   --disable-radix-cache --mem-fraction-static 0.8  \
-  --attention-backend fa3 --watchdog-timeout 3600  --host 0.0.0.0 --watchdog-timeout 3600 \
+  --attention-backend fa3 --host 0.0.0.0 --watchdog-timeout 3600 \
   --max-running-requests 128 --chunked-prefill-size 12288 --enable-dynamic-chunking
 ```
 
@@ -70,7 +70,7 @@ python3 -m sglang.launch_server \
   --nnodes 2 --node-rank 0 --tp 4 --pp-size 2 \
   --port 30000 --dist-init-addr 192.168.0.137:62001 \
   --disable-radix-cache --mem-fraction-static 0.8  \
-  --attention-backend fa3 --watchdog-timeout 3600  --host 0.0.0.0 --watchdog-timeout 3600 \
+  --attention-backend fa3 --host 0.0.0.0 --watchdog-timeout 3600 \
   --max-running-requests 128 --chunked-prefill-size 6144
 ```
 
@@ -78,13 +78,15 @@ python3 -m sglang.launch_server \
 # prefill node 0 (with dynamic chunking)
 export SGLANG_DYNAMIC_CHUNKING_SMOOTH_FACTOR=0.8
 python3 -m sglang.launch_server \
-  --model-path deepseek-ai/DeepSeek-V3.1 --trust-remote-code \
+  --model-path Qwen/Qwen3-235B-A22B-Thinking-2507-FP8 --trust-remote-code \
   --nnodes 2 --node-rank 0 --tp 4 --pp-size 2 \
   --port 30000 --dist-init-addr 192.168.0.137:62001 \
   --disable-radix-cache --mem-fraction-static 0.8  \
-  --attention-backend fa3 --watchdog-timeout 3600  --host 0.0.0.0 --watchdog-timeout 3600 \
+  --attention-backend fa3 --host 0.0.0.0 --watchdog-timeout 3600 \
   --max-running-requests 128 --chunked-prefill-size 18432 --enable-dynamic-chunking
 ```
+
+Note: `--disable-radix-cache` is only for benchmarking reproduction purposes. It is not recommended to use it in production.
 
 ## Best Practice for Pipeline Parallelism with PD Disaggregation
 To be added. Stay tuned for the latest updates on Pipeline Parallelism with PD Disaggregation.
