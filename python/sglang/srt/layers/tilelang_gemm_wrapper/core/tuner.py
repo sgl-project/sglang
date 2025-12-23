@@ -192,7 +192,7 @@ def _create_benchmark_worker_class():
                     def bench_fn():
                         kernel(A_fp8, B_fp8, C, A_scale, B_scale)
 
-            ms, _, _ = triton.testing.do_bench(bench_fn, rep=self.bench_rep)
+            ms, _, _ = triton.testing.do_bench_cudagraph(bench_fn, rep=self.bench_rep, quantiles=[0.5, 0.2, 0.8])
             return ms
 
         def clear_cache(self):

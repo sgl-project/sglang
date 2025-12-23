@@ -95,11 +95,7 @@ def benchmark_tilelang(
         tilelang_gemm_wrapper.gemm_nt_f8f8bf16((A_fp8, A_scale), (B_fp8, B_scale), C)
     
     quantiles = [0.5, 0.2, 0.8]
-    try:
-        ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(fn, rep=rep, quantiles=quantiles)
-    except Exception:
-        # Fallback if cudagraph not available
-        ms, min_ms, max_ms = triton.testing.do_bench(fn, rep=rep, quantiles=quantiles)
+    ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(fn, rep=rep, quantiles=quantiles)
     return ms, min_ms, max_ms
 
 
@@ -121,10 +117,7 @@ def benchmark_deepgemm(
         deep_gemm_wrapper.gemm_nt_f8f8bf16((A_fp8, A_scale), (B_fp8, B_scale), C)
     
     quantiles = [0.5, 0.2, 0.8]
-    try:
-        ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(fn, rep=rep, quantiles=quantiles)
-    except Exception:
-        ms, min_ms, max_ms = triton.testing.do_bench(fn, rep=rep, quantiles=quantiles)
+    ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(fn, rep=rep, quantiles=quantiles)
     return ms, min_ms, max_ms
 
 
@@ -149,10 +142,7 @@ def benchmark_sglkernel(
         return fp8_blockwise_scaled_mm(A_fp8, B_fp8_sgl, A_scale_sgl, B_scale_sgl, torch.bfloat16)
     
     quantiles = [0.5, 0.2, 0.8]
-    try:
-        ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(fn, rep=rep, quantiles=quantiles)
-    except Exception:
-        ms, min_ms, max_ms = triton.testing.do_bench(fn, rep=rep, quantiles=quantiles)
+    ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(fn, rep=rep, quantiles=quantiles)
     return ms, min_ms, max_ms
 
 
