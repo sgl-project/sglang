@@ -42,9 +42,9 @@ python -m sglang.launch_server \
     --tp-size 8 \
     --ep-size 8 \
     --tool-call-parser minimax-m2 \
-    --trust-remote-code \
-    --host 0.0.0.0 \
     --reasoning-parser minimax-append-think \
+    --host 0.0.0.0 \
+    --trust-remote-code \
     --port 8000 \
     --mem-fraction-static 0.85
 ```
