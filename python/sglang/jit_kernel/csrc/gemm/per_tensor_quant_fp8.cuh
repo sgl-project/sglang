@@ -153,12 +153,12 @@ void per_tensor_quant_fp8(tvm::ffi::TensorView input,
         static_cast<int64_t>(total_elements));
   };
 
-  const DLDataTypeCode dtype_code = input_dtype.unwrap();
-  if (dtype_code == kDLFloat) {
+  const DLDataType dtype = input_dtype.unwrap();
+  if (dtype == host::details::dtype_trait<float>::value) {
     launch_kernels.template operator()<float>();
-  } else if (dtype_code == kDLBfloat) {
+  } else if (dtype == host::details::dtype_trait<c10::BFloat16>::value) {
     launch_kernels.template operator()<c10::BFloat16>();
-  } else if (dtype_code == kDLFloat + 2) {  // kDLFloat16
+  } else if (dtype == host::details::dtype_trait<c10::Half>::value) {
     launch_kernels.template operator()<c10::Half>();
   } else {
     RuntimeCheck(false, "Unsupported input dtype");

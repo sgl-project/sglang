@@ -4,6 +4,8 @@
 #include <c10/util/Float8_e4m3fn.h>
 #include <c10/util/Half.h>
 
+#include <dlpack/dlpack.h>
+
 #include <limits>
 
 #ifdef USE_ROCM
@@ -16,6 +18,22 @@
 #endif
 #endif
 #endif
+
+namespace host {
+namespace details {
+
+template <>
+struct dtype_trait<c10::Half> {
+  inline static constexpr DLDataType value = {.code = DLDataTypeCode::kDLFloat, .bits = 16, .lanes = 1};
+};
+
+template <>
+struct dtype_trait<c10::BFloat16> {
+  inline static constexpr DLDataType value = {.code = DLDataTypeCode::kDLBfloat, .bits = 16, .lanes = 1};
+};
+
+}  // namespace details
+}  // namespace host
 
 namespace device {
 
