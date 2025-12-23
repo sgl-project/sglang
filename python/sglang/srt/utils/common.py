@@ -3446,14 +3446,14 @@ def check_cuda_result(raw_output):
 def get_physical_device_id(pytorch_device_id: int) -> int:
     """
     Convert PyTorch logical device ID to physical device ID.
-    
+
     When CUDA_VISIBLE_DEVICES is set, maps the logical device ID (as seen by PyTorch)
     to the actual physical device ID. If CUDA_VISIBLE_DEVICES is not set, returns
     the device ID unchanged.
-    
+
     Args:
         pytorch_device_id: The logical device ID from PyTorch (e.g., torch.cuda.current_device())
-        
+
     Returns:
         The physical device ID
     """
