@@ -21,7 +21,7 @@ use crate::{
         responses::ResponsesRequest,
     },
     reasoning_parser::ParserFactory as ReasoningParserFactory,
-    tokenizer::{stop::StopSequenceDecoder, traits::Tokenizer},
+    tokenizer::{stop::StopSequenceDecoder, TokenizerRegistry},
     tool_parser::ParserFactory as ToolParserFactory,
 };
 
@@ -53,7 +53,7 @@ pub enum RequestType {
 
 /// Shared components (injected once at creation)
 pub struct SharedComponents {
-    pub tokenizer: Arc<dyn Tokenizer>,
+    pub tokenizer_registry: Arc<TokenizerRegistry>,
     pub tool_parser_factory: ToolParserFactory,
     pub reasoning_parser_factory: ReasoningParserFactory,
 }
@@ -365,6 +365,25 @@ impl WorkerSelection {
         match self {
             Self::Single { worker } => Some(worker),
             _ => None,
+        }
+    }
+
+    /// Record circuit breaker outcome for all workers
+    pub fn record_outcome(&self, success: bool) {
+        match self {
+            Self::Single { worker } => worker.record_outcome(success),
+            Self::Dual { prefill, decode } => {
+                prefill.record_outcome(success);
+                decode.record_outcome(success);
+            }
+        }
+    }
+
+    /// Record circuit breaker outcomes for dual dispatch (individual tracking)
+    pub fn record_dual_outcomes(&self, prefill_success: bool, decode_success: bool) {
+        if let Self::Dual { prefill, decode } = self {
+            prefill.record_outcome(prefill_success);
+            decode.record_outcome(decode_success);
         }
     }
 

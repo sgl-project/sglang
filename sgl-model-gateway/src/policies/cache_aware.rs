@@ -160,10 +160,10 @@ impl CacheAwarePolicy {
         let mut model_workers: std::collections::HashMap<String, Vec<&Arc<dyn Worker>>> =
             std::collections::HashMap::new();
         for worker in workers {
-            // Use "default" for unknown/empty model_ids for backward compatibility
+            // Use "unknown" for empty model_ids
             let model_id = worker.model_id();
-            let tree_key = if model_id.is_empty() || model_id == "unknown" {
-                "default"
+            let tree_key = if model_id.is_empty() {
+                "unknown"
             } else {
                 model_id
             };
@@ -190,8 +190,8 @@ impl CacheAwarePolicy {
         // For backward compatibility: if model_id is "unknown" or empty,
         // use a default tree. This preserves existing behavior for single-model routers.
         let model_id = worker.model_id();
-        let tree_key = if model_id.is_empty() || model_id == "unknown" {
-            "default"
+        let tree_key = if model_id.is_empty() {
+            "unknown"
         } else {
             model_id
         };
@@ -215,8 +215,8 @@ impl CacheAwarePolicy {
     pub fn remove_worker(&self, worker: &dyn Worker) {
         // Use same logic as add_worker for consistency
         let model_id = worker.model_id();
-        let tree_key = if model_id.is_empty() || model_id == "unknown" {
-            "default"
+        let tree_key = if model_id.is_empty() {
+            "unknown"
         } else {
             model_id
         };
@@ -314,8 +314,8 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
         // Determine the model for this set of workers (router pre-filters by model)
         // All workers should be from the same model
         let first_model = workers[healthy_indices[0]].model_id();
-        let model_id = if first_model.is_empty() || first_model == "unknown" {
-            "default"
+        let model_id = if first_model.is_empty() {
+            "unknown"
         } else {
             first_model
         };
