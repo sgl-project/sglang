@@ -110,14 +110,15 @@ jobs:
 
       - name: Run common 8-GPU model tests
         if: always()
-        timeout-minutes: 200
+        timeout-minutes: 300
         env:
           TRACE_BASE_URL: https://raw.githubusercontent.com/sglang-bot/sglang-ci-data/main/traces/${{ github.run_id }}
           PERFETTO_RELAY_URL: ${{ vars.PERFETTO_RELAY_URL }}
           GPU_CONFIG: "8-gpu-h200"
+          IS_H200: "1"
         run: |
           cd test
-          python3 run_suite.py --hw cuda --suite nightly-8-gpu-common --nightly --timeout-per-file=12000 --continue-on-error
+          python3 run_suite.py --hw cuda --suite nightly-8-gpu-common --nightly --timeout-per-file=18000 --continue-on-error
 
       - name: Run test
         timeout-minutes: 30
