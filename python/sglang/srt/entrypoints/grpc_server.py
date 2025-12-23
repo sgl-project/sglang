@@ -12,10 +12,9 @@ import threading
 import time
 from concurrent import futures
 from typing import AsyncIterator, Dict, Optional
-import pybase64
-
 
 import grpc
+import pybase64
 from google.protobuf.json_format import MessageToDict
 from google.protobuf.struct_pb2 import Struct
 from google.protobuf.timestamp_pb2 import Timestamp
@@ -680,17 +679,21 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
             elif isinstance(routed_experts_data, dict):
                 routed_experts_proto = Struct()
                 routed_experts_proto.update(routed_experts_data)
-            elif hasattr(routed_experts_data, '__iter__') and not isinstance(routed_experts_data, (str, dict)):
+            elif hasattr(routed_experts_data, "__iter__") and not isinstance(
+                routed_experts_data, (str, dict)
+            ):
                 try:
-                    if hasattr(routed_experts_data, 'numpy'):
+                    if hasattr(routed_experts_data, "numpy"):
                         routed_experts_bytes = routed_experts_data.numpy().tobytes()
                     else:
                         routed_experts_bytes = routed_experts_data
                     routed_experts_proto = Struct()
-                    routed_experts_proto["routed_experts_base64"] = pybase64.b64encode(routed_experts_bytes).decode("utf-8")
+                    routed_experts_proto["routed_experts_base64"] = pybase64.b64encode(
+                        routed_experts_bytes
+                    ).decode("utf-8")
                 except Exception as e:
                     logger.warning(f"Failed to encode routed_experts: {e}")
-        
+
         return sglang_scheduler_pb2.GenerateResponse(
             request_id=request_id,
             complete=sglang_scheduler_pb2.GenerateComplete(

@@ -584,7 +584,7 @@ class GrpcRequestManager:
                     ),
                 },
             }
-            
+
             if (
                 state.obj.return_routed_experts
                 and batch_out.output_routed_experts

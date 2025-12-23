@@ -337,7 +337,7 @@ impl ProtoGenerateComplete {
     pub fn routed_experts(&self) -> Option<&Struct> {
         match self {
             Self::Sglang(c) => c.routed_experts.as_ref(),
-            Self::Vllm(_) => None, // vLLM doesn't have routed_experts
+            Self::Vllm(c) => c.routed_experts.as_ref(),
         }
     }
 }
