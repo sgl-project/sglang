@@ -59,15 +59,15 @@ namespace device {
 
 #ifndef USE_ROCM
 using FP8_TYPE = c10::Float8_e4m3fn;
-C10_HOST_DEVICE constexpr auto FP8_E4M3_MAX = std::numeric_limits<FP8_TYPE>::max();
+constexpr float FP8_E4M3_MAX = 448.0f;
 #else
 #if HIP_FP8_TYPE_FNUZ
 using FP8_TYPE = c10::Float8_e4m3fnuz;
-constexpr auto FP8_E4M3_MAX = 224.0f;
+constexpr float FP8_E4M3_MAX = 224.0f;
 #else
 #if HIP_FP8_TYPE_E4M3
 using FP8_TYPE = c10::Float8_e4m3fn;
-C10_HOST_DEVICE constexpr auto FP8_E4M3_MAX = std::numeric_limits<FP8_TYPE>::max();
+constexpr float FP8_E4M3_MAX = 448.0f;
 #endif
 #endif
 #endif
