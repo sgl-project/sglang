@@ -21,7 +21,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-os.environ['SGLANG_USE_MODELSCOPE'] = 'true'
+os.environ["SGLANG_USE_MODELSCOPE"] = "true"
 
 if "ASCEND_RT_VISIBLE_DEVICES" not in os.environ:
     os.environ["ASCEND_RT_VISIBLE_DEVICES"] = "0,1"
