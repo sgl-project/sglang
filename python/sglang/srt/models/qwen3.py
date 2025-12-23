@@ -30,7 +30,7 @@ from sglang.srt.model_loader.weight_utils import (
 from sglang.srt.models.qwen2 import Qwen2MLP as Qwen3MLP
 from sglang.srt.models.qwen2 import Qwen2Model
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import add_prefix, is_cuda, is_npu
+from sglang.srt.utils import add_prefix, is_cuda, is_npu, is_cpu
 
 Qwen3Config = None
 
@@ -38,6 +38,7 @@ logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
 _is_npu = is_npu()
 
+_is_cpu = is_cpu()
 if _is_npu:
     from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope import split_qkv_rmsnorm_rope
 
@@ -162,8 +163,24 @@ class Qwen3Attention(nn.Module):
 
     def forward_prepare_native(self, positions, hidden_states):
         qkv, _ = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        q, k = self._apply_qk_norm(q, k)
+        if _is_cpu: # is_cpu:
+            # Performing view operations first and then slice ensures that
+            # the last dimension is continuous, allowing torch.compile to
+            # generate vectorized kernels as much as possible.
+            batch_dims = qkv.shape[:-1]
+            qkv_view = qkv.view(*batch_dims, -1, self.head_dim)
+            q_view = qkv_view[..., :self.num_heads, :]
+            k_view = qkv_view[..., self.num_heads:self.num_heads + self.num_kv_heads, :]
+            v_view = qkv_view[..., self.num_heads + self.num_kv_heads:, :]
+            q_by_head = self.q_norm(q_view.reshape(-1, self.head_dim))
+            k_by_head = self.k_norm(k_view.reshape(-1, self.head_dim))
+            q = q_by_head.view(*batch_dims, self.q_size)
+            k = k_by_head.view(*batch_dims, self.kv_size)
+            v = v_view.view(*batch_dims, self.kv_size)
+        else:
+            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+            q, k = self._apply_qk_norm(q, k)
+
         q, k = self.rotary_emb(positions, q, k)
         return q, k, v
 

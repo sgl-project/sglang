@@ -185,6 +185,7 @@ from sglang.srt.weight_sync.tensor_bucket import (
     FlattenedTensorBucket,
     FlattenedTensorMetadata,
 )
+from dataclasses import is_dataclass, asdict
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
@@ -252,6 +253,34 @@ def resolve_language_model(model: nn.Module) -> nn.Module:
         return model.thinker.model
     return model.model
 
+def dump_forward_batch(fb, name="forward_batch"):
+    print(f"\n==== {name} ====")
+
+    # 1. 拿到所有字段
+    if is_dataclass(fb):
+        # ForwardBatch 基本是 dataclass，这样最保险
+        fields = {k: getattr(fb, k) for k in fb.__dataclass_fields__}
+    else:
+        fields = vars(fb)
+
+    # 2. 按字段名排序，方便对比两次的差异
+    for k in sorted(fields.keys()):
+        v = fields[k]
+        if torch.is_tensor(v):
+            print(
+                f"{k}: "
+                f"Tensor(shape={tuple(v.shape)}, dtype={v.dtype}, device={v.device}, "
+                f"requires_grad={v.requires_grad})",
+                flush=True
+            )
+        elif isinstance(v, (list, tuple)) and v and torch.is_tensor(v[0]):
+            print(
+                f"{k}: list[Tensor] (len={len(v)}), "
+                f"first.shape={tuple(v[0].shape)}, first.dtype={v[0].dtype}",
+                flush=True
+            )
+        else:
+            print(f"{k}: {type(v).__name__} = {v!r}", flush=True)
 
 class RankZeroFilter(logging.Filter):
     """Filter that only allows INFO level logs from rank 0, but allows all other levels from any rank."""
@@ -2420,7 +2449,8 @@ class ModelRunner:
         self.graph_runner = None
         self.graph_mem_usage = 0
 
-        if not self.is_generation:
+        # return
+        if not self.is_generation and self.device != "cpu":
             # TODO: Currently, cuda graph only captures decode steps, which only exists for generation models
             return
 
@@ -2597,12 +2627,21 @@ class ModelRunner:
         if not skip_attn_backend_init:
             self.attn_backend.init_forward_metadata(forward_batch)
 
+        # with torch.profiler.profile(
+        #                 activities=[
+        #                     torch.profiler.ProfilerActivity.CPU,
+        #                 ]
+        #             ) as perf:
         return self.model.forward(
             forward_batch.input_ids,
             forward_batch.positions,
             forward_batch,
             **kwargs,
         )
+        # print("--------------eager---------------", flush=True)
+        # print("forward_batch.input_ids shape: ", forward_batch.input_ids.shape, flush=True)
+        # print(perf.key_averages().table(sort_by="self_cpu_time_total", row_limit=-1), flush=True)
+        # return ret
 
     def forward_idle(
         self, forward_batch: ForwardBatch, pp_proxy_tensors=None
@@ -2685,6 +2724,20 @@ class ModelRunner:
         )
 
         if can_run_graph:
+            # dump_forward_batch(forward_batch)
+            # print("--------------------------------------------------------", flush=True)
+            # forward_batch.sampling_info=None
+            # dump_forward_batch(forward_batch)
+            # print("forward_batch: ", forward_batch, flush=True)
+            # print("forward input id shape: ", forward_batch.input_ids.shape, flush=True)
+            # print("fowward seq_lens: ", forward_batch.seq_lens, flush=True)
+            # print("fowward seq_lens shape: ", forward_batch.seq_lens.shape, flush=True)
+            # print("forward extend_prefix_lens : ", forward_batch.extend_prefix_lens, flush=True)
+            # print("forward extend_prefix_lens shape: ", forward_batch.extend_prefix_lens.shape, flush=True)
+            # print("forward positions shape: ", forward_batch.positions.shape, flush=True)
+            # print("forward req_pool_indices shape: ", forward_batch.req_pool_indices.shape, flush=True)
+            
+                    
             ret = self.graph_runner.replay(
                 forward_batch,
                 skip_attn_backend_init=skip_attn_backend_init,

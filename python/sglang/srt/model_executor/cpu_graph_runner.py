@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import bisect
 import logging
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Callable, Optional, Union
@@ -33,7 +34,9 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
     PPProxyTensors,
+    enable_num_token_non_padded,
 )
+from sglang.srt.model_executor.input_buffers import GraphInputBuffers
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
     log_info_on_rank0,
@@ -43,6 +46,9 @@ from sglang.srt.utils import (
     require_mlp_tp_gather,
 )
 from sglang.srt.utils.patch_torch import monkey_patch_torch_compile
+from torch._dynamo import mark_dynamic
+from dataclasses import is_dataclass, asdict
+from sglang.srt.layers.pooler import EmbeddingPoolerOutput
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +62,7 @@ def patch_model(
     enable_compile: bool,
     num_tokens: int,
     tp_group: GroupCoordinator,
+    dynamic:bool,
 ):
     """Patch the model to make it compatible with torch.compile"""
     backup_ca_comm = None
@@ -69,7 +76,7 @@ def patch_model(
             # tp_group.ca_comm = None
             yield torch.compile(
                 torch.no_grad()(model.forward),
-                dynamic=False,
+                dynamic=dynamic,
             )
         else:
             yield model.forward
@@ -94,7 +101,8 @@ def get_batch_sizes_to_capture(model_runner: ModelRunner):
     server_args = model_runner.server_args
     # cpu torch compile only speeds up decoding by
     # reducing python overhead when bs is small
-    capture_bs = list(range(1, 17))
+    # capture_bs = list(range(1, 16)) + list(range(18, 31, 2)) + list(range(32, 81, 4)) + list(range(80, 129, 8))
+    capture_bs = [1,]
     capture_bs = [bs for bs in capture_bs if bs <= server_args.torch_compile_max_bs]
     capture_bs = [bs for bs in capture_bs if bs <= model_runner.req_to_token_pool.size]
     capture_bs = list(sorted(set(capture_bs)))
@@ -338,6 +346,35 @@ def register_fake_ops():
         return mat1.new_empty(M, N, dtype=out_dtype)
 
 
+def dump_forward_batch(fb, name="forward_batch"):
+    print(f"\n==== {name} ====", flush=True)
+
+    # 1. 拿到所有字段
+    if is_dataclass(fb):
+        # ForwardBatch 基本是 dataclass，这样最保险
+        fields = {k: getattr(fb, k) for k in fb.__dataclass_fields__}
+    else:
+        fields = vars(fb)
+
+    # 2. 按字段名排序，方便对比两次的差异
+    for k in sorted(fields.keys()):
+        v = fields[k]
+        if torch.is_tensor(v):
+            print(
+                f"{k}: "
+                f"Tensor(shape={tuple(v.shape)}, dtype={v.dtype}, device={v.device}, "
+                f"requires_grad={v.requires_grad})",
+                flush=True
+            )
+        elif isinstance(v, (list, tuple)) and v and torch.is_tensor(v[0]):
+            print(
+                f"{k}: list[Tensor] (len={len(v)}), "
+                f"first.shape={tuple(v[0].shape)}, first.dtype={v[0].dtype}",
+                flush=True
+            )
+        else:
+            print(f"{k}: {type(v).__name__} = {v!r}", flush=True)
+
 # TODO Remove unnecessary settings for CPUGraphRunner.
 # Re-abstract the graph runner and restructure CPUGraphRunner to reuse the same logic.
 class CPUGraphRunner:
@@ -347,8 +384,12 @@ class CPUGraphRunner:
         # Parse args
         self.model_runner = model_runner
         self.device = model_runner.device
-        self.graphs = {}
-        self.output_buffers = {}
+        self.decode_graphs = {}
+        self.prefill_graph = None
+        self.captured_decode_forward_batches = {}
+        self.captured_prefill_forward_batches = {}
+        self.enable_prefill_cpu_graph = model_runner.server_args.enable_prefill_cpu_graph
+        print("----------self.enable_prefill_cpu_graph ---------- ", self.enable_prefill_cpu_graph, flush=True)
         self.enable_torch_compile = model_runner.server_args.enable_torch_compile
         self.disable_padding = model_runner.server_args.disable_cuda_graph_padding
         self.is_encoder_decoder = model_runner.model_config.is_encoder_decoder
@@ -367,7 +408,8 @@ class CPUGraphRunner:
         self.dp_size = model_runner.server_args.dp_size
         self.pp_size = model_runner.server_args.pp_size
 
-        self.capture_forward_mode = ForwardMode.DECODE
+        self.capture_decode_forward_mode = ForwardMode.DECODE
+        self.capture_prefill_forward_mode = ForwardMode.EXTEND
         self.capture_hidden_mode = CaptureHiddenMode.NULL
         self.num_tokens_per_bs = 1
 
@@ -407,6 +449,9 @@ class CPUGraphRunner:
         self.max_bs = max(self.capture_bs)
         self.max_num_token = self.max_bs * self.num_tokens_per_bs
 
+        self.prefill_max_num_token = self.max_num_token * 4
+        self.max_extend_seq_lens_cpu = model_runner.server_args.torch_compile_max_bs
+
         self.seq_len_fill_value = (
             self.model_runner.attn_backend.get_graph_seq_len_fill_value()
         )
@@ -416,24 +461,8 @@ class CPUGraphRunner:
             set_torch_compile_config()
 
         # Graph inputs
-        with torch.device(self.device):
-            self.input_ids = torch.zeros((self.max_num_token,), dtype=torch.int64)
-            self.req_pool_indices = torch.zeros((self.max_bs,), dtype=torch.int64)
-            self.seq_lens = torch.full(
-                (self.max_bs,), self.seq_len_fill_value, dtype=torch.int64
-            )
-            self.out_cache_loc = torch.zeros((self.max_num_token,), dtype=torch.int64)
-            self.positions = torch.zeros((self.max_num_token,), dtype=torch.int64)
-            self.mrope_positions = torch.zeros((3, self.max_bs), dtype=torch.int64)
-            self.num_token_non_padded = torch.zeros((1,), dtype=torch.int64)
-            self.custom_mask = torch.ones(
-                (
-                    (self.seq_lens.sum().item() + self.max_num_token)
-                    * self.num_tokens_per_bs
-                ),
-                dtype=torch.bool,
-                device=self.device,
-            )
+        self.decode_inputs = self.make_fake_inputs(self.max_bs, self.max_num_token)
+        self.prefill_inputs = self.make_fake_inputs(self.max_bs, self.prefill_max_num_token)
 
         # Capture
         try:
@@ -443,8 +472,51 @@ class CPUGraphRunner:
                 f"Capture CPU graph failed: {e}\n{CPU_GRAPH_CAPTURE_FAILED_MSG}"
             )
 
+    def make_fake_inputs(self, max_bs: int, max_num_token: int) -> dict:
+        # Graph inputs
+        with torch.device(self.device):
+            input_ids = torch.zeros((max_num_token,), dtype=torch.int64)
+            req_pool_indices = torch.zeros((max_bs,), dtype=torch.int64)
+            seq_lens = torch.full(
+                (max_bs,), self.seq_len_fill_value, dtype=torch.int64
+            )
+            out_cache_loc = torch.zeros((max_num_token,), dtype=torch.int64)
+            positions = torch.zeros((max_num_token,), dtype=torch.int64)
+            mrope_positions = torch.zeros((3, max_bs), dtype=torch.int64)
+            num_token_non_padded = torch.zeros((1,), dtype=torch.int64)
+            custom_mask = torch.ones(
+                (
+                    (seq_lens.sum().item() + max_num_token)
+                    * self.num_tokens_per_bs
+                ),
+                dtype=torch.bool,
+                device=self.device,
+            )
+        return GraphInputBuffers(
+            input_ids=input_ids,
+            req_pool_indices=req_pool_indices,
+            seq_lens=seq_lens,
+            out_cache_loc=out_cache_loc,
+            positions=positions,
+            mrope_positions=mrope_positions,
+            num_token_non_padded=num_token_non_padded,
+            custom_mask=custom_mask,
+            input_embeds=None,
+            seq_lens_cpu=None,
+            next_token_logits_buffer=None,
+            global_num_tokens_gpu=None,
+            global_num_tokens_for_logprob_gpu=None,
+            encoder_lens=None,
+            pp_proxy_tensors=None,
+        )
+
+
     def can_run(self, forward_batch: ForwardBatch):
-        is_bs_supported = forward_batch.batch_size in self.graphs
+
+        if not self.enable_prefill_cpu_graph and forward_batch.forward_mode == ForwardMode.EXTEND:
+            return False
+
+        is_bs_supported = forward_batch.batch_size in self.decode_graphs if forward_batch.forward_mode == ForwardMode.DECODE else True
 
         requested_capture_hidden_mode = max(
             forward_batch.capture_hidden_mode,
@@ -475,30 +547,55 @@ class CPUGraphRunner:
                     f"Capturing batches ({bs=} {avail_mem=:.2f} GB)"
                 )
 
+            if self.model_runner.is_generation:
+                # capture decode
+                with patch_model(
+                    self.model_runner.model,
+                    bs in self.capture_bs,
+                    num_tokens=bs * self.num_tokens_per_bs,
+                    tp_group=self.model_runner.tp_group,
+                    dynamic=False,
+                ) as forward:
+                    print("decode capture bs: ", bs, flush=True)
+                    graph = self.capture_one_batch_size(bs, forward)
+                    self.decode_graphs[bs] = graph
+
+
+        if self.enable_prefill_cpu_graph:
+            # capture extend
             with patch_model(
                 self.model_runner.model,
-                bs in self.capture_bs,
+                True,
                 num_tokens=bs * self.num_tokens_per_bs,
                 tp_group=self.model_runner.tp_group,
+                dynamic=True,
             ) as forward:
-                (
-                    graph,
-                    output_buffers,
-                ) = self.capture_one_batch_size(bs, forward)
-                self.graphs[bs] = graph
-                self.output_buffers[bs] = output_buffers
+                print("extend capture bs: ", bs, flush=True)
+                graph = self.capture_one_batch_size(1, forward, True)
+                self.prefill_graph = graph
 
-    def capture_one_batch_size(self, bs: int, forward: Callable):
-        num_tokens = bs * self.num_tokens_per_bs
 
+    def make_graph_forward_batch(self, bs: int, num_tokens: int, is_prefill:bool=False):
         # Graph inputs
-        input_ids = self.input_ids[:num_tokens]
-        req_pool_indices = self.req_pool_indices[:bs]
-        seq_lens = self.seq_lens[:bs]
-        out_cache_loc = self.out_cache_loc[:num_tokens]
-        positions = self.positions[:num_tokens]
-        mrope_positions = self.mrope_positions[:, :bs]
-        self.num_token_non_padded[...] = num_tokens
+        print("make_graph_inputs bs: ", bs, flush=True)
+        print("num_tokens: ", num_tokens, flush=True)
+        if is_prefill:
+            input_ids = torch.zeros((num_tokens,), dtype=torch.int64)
+            req_pool_indices = self.prefill_inputs.req_pool_indices[:bs]
+            seq_lens = torch.full((bs,), num_tokens, dtype=torch.int64)
+            orig_seq_lens=torch.full((bs,), num_tokens, dtype=torch.int32)
+            out_cache_loc=self.prefill_inputs.out_cache_loc[:num_tokens]
+            positions = torch.zeros((num_tokens,), dtype=torch.int64)
+            # mrope_positions = self.mrope_positions[:, :bs]
+            mrope_positions = None
+            # self.prefill_inputs.num_token_non_padded[...] = num_tokens
+        else:
+            input_ids = self.decode_inputs.input_ids[:num_tokens]
+            req_pool_indices = self.decode_inputs.req_pool_indices[:bs]
+            seq_lens = self.decode_inputs.seq_lens[:bs]
+            out_cache_loc = self.decode_inputs.out_cache_loc[:num_tokens]
+            positions = self.decode_inputs.positions[:num_tokens]
+            mrope_positions = self.decode_inputs.mrope_positions[:, :bs]
 
         spec_info = self.get_spec_info(num_tokens)
         if self.capture_hidden_mode != CaptureHiddenMode.FULL:
@@ -506,27 +603,81 @@ class CPUGraphRunner:
                 spec_info.capture_hidden_mode if spec_info else CaptureHiddenMode.NULL
             )
 
-        forward_batch = ForwardBatch(
-            forward_mode=self.capture_forward_mode,
-            batch_size=bs,
-            input_ids=input_ids,
-            req_pool_indices=req_pool_indices,
-            seq_lens=seq_lens,
-            req_to_token_pool=self.model_runner.req_to_token_pool,
-            token_to_kv_pool=self.model_runner.token_to_kv_pool,
-            attn_backend=self.model_runner.attn_backend,
-            out_cache_loc=out_cache_loc,
-            seq_lens_sum=seq_lens.sum().item(),
-            return_logprob=False,
-            positions=positions,
-            mrope_positions=mrope_positions,
-            spec_algorithm=self.model_runner.spec_algorithm,
-            spec_info=spec_info,
-            capture_hidden_mode=self.capture_hidden_mode,
-            num_token_non_padded=self.num_token_non_padded,
-            global_forward_mode=self.capture_forward_mode,
-        )
+        if is_prefill:
+            mark_dynamic(input_ids, 0)
+            mark_dynamic(positions, 0)
+            mark_dynamic(out_cache_loc, 0)
+            mark_dynamic(seq_lens, 0)
+            mark_dynamic(orig_seq_lens, 0)
 
+            forward_batch = ForwardBatch(
+                forward_mode=self.capture_prefill_forward_mode if is_prefill else self.capture_decode_forward_mode,
+                batch_size=bs,
+                input_ids=input_ids,
+                req_pool_indices=torch.arange(bs, dtype=torch.int64),
+                seq_lens=torch.full((bs,), num_tokens, dtype=torch.int64),
+                seq_lens_cpu=torch.full((bs,), num_tokens, dtype=torch.int64),
+                req_to_token_pool=self.model_runner.req_to_token_pool,
+                token_to_kv_pool=self.model_runner.token_to_kv_pool,
+                attn_backend=self.model_runner.attn_backend,
+                out_cache_loc=out_cache_loc,
+                seq_lens_sum=num_tokens,
+                return_logprob=False,
+                orig_seq_lens=orig_seq_lens,
+                extend_num_tokens=bs,
+                extend_seq_lens=torch.full((bs,), num_tokens // bs, dtype=torch.int32),
+                extend_prefix_lens=torch.full((bs,), num_tokens - num_tokens // bs, dtype=torch.int32),
+                extend_start_loc=torch.zeros((bs,), dtype=torch.int32),
+                extend_prefix_lens_cpu=[num_tokens // bs] * self.max_extend_seq_lens_cpu,
+                extend_seq_lens_cpu=[num_tokens // bs] * self.max_extend_seq_lens_cpu,
+                extend_logprob_start_lens_cpu=[num_tokens // bs - 1] * self.max_extend_seq_lens_cpu,
+                positions=positions,
+                mrope_positions=mrope_positions,
+                spec_algorithm=self.model_runner.spec_algorithm,
+                spec_info=spec_info,
+                capture_hidden_mode=self.capture_hidden_mode,
+                num_token_non_padded=None,
+                num_token_non_padded_cpu=num_tokens,
+                # global_forward_mode=self.capture_forward_mode,
+                # is_prefill_only=True,
+                global_forward_mode=None,
+                mm_inputs=[None],
+                lora_ids=[None],
+            )
+        else:
+            forward_batch = ForwardBatch(
+                forward_mode=self.capture_decode_forward_mode,
+                batch_size=bs,
+                input_ids=input_ids,
+                req_pool_indices=req_pool_indices,
+                seq_lens=seq_lens,
+                req_to_token_pool=self.model_runner.req_to_token_pool,
+                token_to_kv_pool=self.model_runner.token_to_kv_pool,
+                attn_backend=self.model_runner.attn_backend,
+                out_cache_loc=out_cache_loc,
+                seq_lens_sum=seq_lens.sum().item(),
+                return_logprob=False,
+                positions=positions,
+                mrope_positions=mrope_positions,
+                spec_algorithm=self.model_runner.spec_algorithm,
+                spec_info=spec_info,
+                capture_hidden_mode=self.capture_hidden_mode,
+                num_token_non_padded=self.decode_inputs.num_token_non_padded,
+                global_forward_mode=self.capture_decode_forward_mode,
+            )
+
+        return forward_batch
+
+    def capture_one_batch_size(self, bs: int, forward: Callable, is_prefill:bool=False):
+        num_tokens = bs * self.num_tokens_per_bs
+        if is_prefill:
+            forward_batch = self.make_graph_forward_batch(bs, num_tokens + 1, is_prefill)
+        else:
+            forward_batch = self.make_graph_forward_batch(bs, num_tokens)
+
+        kwargs = {}
+        if not self.model_runner.is_generation:
+            kwargs["get_embedding"] = True
         # Attention backend
         self.model_runner.attn_backend.init_forward_metadata(forward_batch)
         # Do infernence to avoid setting attr at runtime, e.g.,
@@ -535,24 +686,43 @@ class CPUGraphRunner:
             forward_batch.input_ids,
             forward_batch.positions,
             forward_batch,
+            **kwargs,
         )
 
         # Run and capture
-        def run_once():
+        def run_once(forward_batch):
             # Clean intermediate result cache for DP attention
             forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = None
+            self.model_runner.attn_backend.init_forward_metadata(forward_batch)
             logits_output_or_pp_proxy_tensors = forward(
-                input_ids,
+                forward_batch.input_ids,
                 forward_batch.positions,
                 forward_batch,
+                **kwargs,
             )
             return logits_output_or_pp_proxy_tensors
 
-        with torch.no_grad():
-            for _ in range(2):
-                self.model_runner.tp_group.barrier()
-                out = run_once()
-            return forward, out
+        if is_prefill:
+            with torch.no_grad():
+                for new_num in reversed(range(bs, 4*bs + 1, bs)):
+                    forward_batch = self.make_graph_forward_batch(new_num, new_num, is_prefill)
+                    for _ in range(2):
+                        self.model_runner.tp_group.barrier()
+                        out = run_once(forward_batch)
+                        
+                for new_num in reversed(range(bs, 4*bs + 1, bs)):
+                    forward_batch = self.make_graph_forward_batch(bs, new_num, is_prefill)
+                    for _ in range(2):
+                        self.model_runner.tp_group.barrier()
+                        out = run_once(forward_batch)
+        else:
+            with torch.no_grad():
+                for _ in range(2):
+                    self.model_runner.tp_group.barrier()
+                    out = run_once(forward_batch)
+                # # Save the captured forward_batches
+                # self.captured_decode_forward_batches[bs] = forward_batch
+        return forward
 
     def recapture_if_needed(self, forward_batch: ForwardBatch):
 
@@ -585,24 +755,79 @@ class CPUGraphRunner:
             self.capture_hidden_mode = required_capture_hidden_mode
             self.capture()
 
+    def prepare_replay(
+        self,
+        forward_batch: ForwardBatch,
+    ):
+        self.recapture_if_needed(forward_batch)
+        is_prefill = forward_batch.forward_mode == ForwardMode.EXTEND
+        if is_prefill:
+            extend_prefix_lens_cpu = [0] * self.max_extend_seq_lens_cpu
+            extend_seq_lens_cpu = [0] * self.max_extend_seq_lens_cpu
+            extend_logprob_start_lens_cpu = [0] * self.max_extend_seq_lens_cpu
+
+            extend_prefix_lens_cpu[:forward_batch.batch_size] = forward_batch.extend_prefix_lens_cpu
+            extend_seq_lens_cpu[:forward_batch.batch_size] = forward_batch.extend_seq_lens_cpu
+            extend_logprob_start_lens_cpu[:forward_batch.batch_size] = forward_batch.extend_logprob_start_lens_cpu
+
+            forward_batch.extend_prefix_lens_cpu = extend_prefix_lens_cpu
+            forward_batch.extend_seq_lens_cpu = extend_seq_lens_cpu
+            forward_batch.extend_logprob_start_lens_cpu = extend_logprob_start_lens_cpu
+
+        self.model_runner.attn_backend.init_forward_metadata(forward_batch)
+
+
     # TODO add padding support for CPUGraphRunner
     def replay(
         self,
         forward_batch: ForwardBatch,
         skip_attn_backend_init: bool = False,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
-    ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
+    ) -> Union[LogitsProcessorOutput, PPProxyTensors, EmbeddingPoolerOutput]:
+        # print("replay: ", forward_batch.batch_size, flush=True)
+        # print("forward_batch.forward_mode: ", forward_batch.forward_mode, flush=True)
+        kwargs = {}
+        if not self.model_runner.is_generation:
+            kwargs["get_embedding"] = True
+
         assert (
             pp_proxy_tensors is None
         ), "PPProxyTensors is not supported in CPUGraphRunner yet."
-        self.recapture_if_needed(forward_batch)
-        self.model_runner.attn_backend.init_forward_metadata(forward_batch)
-        output = self.graphs[forward_batch.batch_size](
+        assert (
+            forward_batch.forward_mode == ForwardMode.EXTEND
+            or forward_batch.forward_mode == ForwardMode.DECODE
+        ), "Only EXTEND and DECODE are supported in CPUGraphRunner."
+        self.prepare_replay(forward_batch)
+        # with torch.profiler.profile(
+        #         activities=[
+        #             torch.profiler.ProfilerActivity.CPU,
+        #         ]
+        #     ) as perf:
+        captured_graph = self.prefill_graph if forward_batch.forward_mode == ForwardMode.EXTEND else self.decode_graphs[forward_batch.batch_size]
+        output = captured_graph(
             forward_batch.input_ids,
             forward_batch.positions,
             forward_batch,
+            **kwargs,
         )
+        # print("--------------replay---------------", flush=True)
+        # print("forward_batch.input_ids shape: ", forward_batch.input_ids.shape, flush=True)
+        # print(perf.key_averages().table(sort_by="self_cpu_time_total", row_limit=-1), flush=True)
+        # if forward_batch.batch_size in self.graphs:
         return output
+
+        if isinstance(output, LogitsProcessorOutput):
+            return LogitsProcessorOutput(
+                next_token_logits=output.next_token_logits[: self.raw_num_token],
+                hidden_states=(
+                    output.hidden_states[: self.raw_num_token]
+                    if output.hidden_states is not None
+                    else None
+                ),
+            )
+        else:
+            assert isinstance(output, PPProxyTensors)
+            return PPProxyTensors({k: v[: self.bs] for k, v in output.tensors.items()})
 
     def get_spec_info(self, num_tokens: int):
         spec_info = None
