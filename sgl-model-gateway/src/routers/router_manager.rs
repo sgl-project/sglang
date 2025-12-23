@@ -180,6 +180,52 @@ impl RouterManager {
         self.routers.len()
     }
 
+    /// Resolve model_id for a request, inferring from available workers if not specified
+    /// - If model_id is provided, use it directly
+    /// - If not provided and only one model exists, use it as implicit default
+    /// - If not provided and multiple models exist, return error requiring specification
+    /// - If no models exist, return service unavailable error
+    fn resolve_model_id(&self, model_id: Option<&str>) -> Result<String, Box<Response>> {
+        // If model_id is provided, use it
+        if let Some(id) = model_id {
+            return Ok(id.to_string());
+        }
+
+        // Get all available models from worker registry
+        let available_models = self.worker_registry.get_models();
+
+        match available_models.len() {
+            0 => Err(Box::new(
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "No models available - no workers registered",
+                )
+                    .into_response(),
+            )),
+            1 => {
+                // Single model: use it as implicit default
+                debug!(
+                    "Model not specified, using implicit default: {}",
+                    available_models[0]
+                );
+                Ok(available_models[0].clone())
+            }
+            _ => {
+                // Multiple models: require explicit model specification
+                Err(Box::new(
+                    (
+                        StatusCode::BAD_REQUEST,
+                        format!(
+                            "Model must be specified. Available models: {}",
+                            available_models.join(", ")
+                        ),
+                    )
+                        .into_response(),
+                ))
+            }
+        }
+    }
+
     pub fn get_router_for_model(&self, model_id: &str) -> Option<Arc<dyn RouterTrait>> {
         let workers = self.worker_registry.get_by_model(model_id);
 
@@ -385,10 +431,18 @@ impl RouterTrait for RouterManager {
         body: &GenerateRequest,
         model_id: Option<&str>,
     ) -> Response {
-        let router = self.select_router_for_request(headers, model_id);
+        // Resolve model_id intelligently instead of falling back to "unknown"
+        let resolved_model_id = match self.resolve_model_id(model_id) {
+            Ok(id) => id,
+            Err(err_response) => return *err_response,
+        };
+
+        let router = self.select_router_for_request(headers, Some(&resolved_model_id));
 
         if let Some(router) = router {
-            router.route_generate(headers, body, model_id).await
+            router
+                .route_generate(headers, body, Some(&resolved_model_id))
+                .await
         } else {
             (
                 StatusCode::NOT_FOUND,
