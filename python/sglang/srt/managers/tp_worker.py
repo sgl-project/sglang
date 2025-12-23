@@ -217,7 +217,7 @@ class TpModelWorker(BaseTpWorker):
         is_draft_worker: bool = False,
         req_to_token_pool: Optional[ReqToTokenPool] = None,
         token_to_kv_pool_allocator: Optional[BaseTokenToKVPoolAllocator] = None,
-        is_mtp_worker: bool = False,
+        is_multi_layer_eagle: bool = False,
     ):
         # Parse args
         self.tp_size = server_args.tp_size
@@ -266,9 +266,9 @@ class TpModelWorker(BaseTpWorker):
             is_draft_worker=is_draft_worker,
             req_to_token_pool=req_to_token_pool,
             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
-            draft_model_idx=0 if is_mtp_worker else None,
+            draft_model_idx=0 if is_multi_layer_eagle else None,
         )
-        if is_mtp_worker:
+        if is_multi_layer_eagle:
             self.model_runner_list.append(self.model_runner)
             for i in range(1, server_args.speculative_num_steps):
                 self.model_runner_list.append(
