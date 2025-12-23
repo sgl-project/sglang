@@ -343,9 +343,6 @@ class BaseMultimodalProcessor(ABC):
         try:
             if modality == Modality.IMAGE:
                 img_tensor, _ = load_image_tensor(data, discard_alpha_channel)
-                # if discard_alpha_channel and img.mode != "RGB":
-                #     img = img.convert("RGB")
-                # img_tensor = F.pil_to_tensor(img)
                 return img_tensor
             elif modality == Modality.VIDEO:
                 return load_video(data, frame_count_limit)

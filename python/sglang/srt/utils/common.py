@@ -880,8 +880,8 @@ def load_image_tensor(
     discard_alpha_channel: bool = True,
 ) -> tuple[Image.Image, tuple[int, int]]:
     """
-    加载图像，优先使用 torchvision 进行硬件加速解码
-    返回 PIL Image 以保持向后兼容性
+    Load image, prioritize using torchvision for hardware-accelerated decoding
+    Return PIL Image for backward compatibility
     """
     if isinstance(image_file, ImageData):
         image_file = image_file.url
@@ -889,20 +889,20 @@ def load_image_tensor(
     image = image_size = None
 
     if isinstance(image_file, Image.Image):
-        # 已经是 PIL Image 对象
+        # Already a PIL Image object
         image = image_file
         image_size = (image.width, image.height)
         img_tensor = F.pil_to_tensor(image)
 
     elif isinstance(image_file, bytes):
-        # bytes 格式 - 优先使用 torchvision 解码
+        # bytes format - prioritize torchvision decoding
         try:
             img_tensor_bytes = torch.frombuffer(
                 bytearray(image_file), dtype=torch.uint8
             )
             img_tensor = decode_image(img_tensor_bytes, mode=ImageReadMode.RGB)
         except Exception:
-            # 回退到 PIL
+            # Fallback to PIL
             image = Image.open(BytesIO(image_file))
             if discard_alpha_channel and image.mode != "RGB":
                 image = image.convert("RGB")
@@ -914,7 +914,7 @@ def load_image_tensor(
         response = requests.get(image_file, stream=True, timeout=timeout)
         try:
             response.raise_for_status()
-            # 读取到内存后使用 torchvision 解码
+            # Read to memory and decode with torchvision
             img_bytes = response.content
             try:
                 img_tensor_bytes = torch.frombuffer(
@@ -922,7 +922,7 @@ def load_image_tensor(
                 )
                 img_tensor = decode_image(img_tensor_bytes, mode=ImageReadMode.RGB)
             except Exception:
-                # 回退到 PIL
+                # Fallback to PIL
                 image = Image.open(BytesIO(img_bytes))
                 if discard_alpha_channel and image.mode != "RGB":
                     image = image.convert("RGB")
@@ -931,41 +931,41 @@ def load_image_tensor(
             response.close()
 
     elif image_file.lower().endswith(("png", "jpg", "jpeg", "webp", "gif")):
-        # 本地文件路径 - 使用 torchvision 直接读取（最快）
+        # Local file path - use torchvision for direct reading (fastest)
         try:
             img_tensor = read_image(image_file, mode=ImageReadMode.RGB)
         except Exception:
-            # 回退到 PIL
+            # Fallback to PIL
             image = Image.open(image_file)
             if discard_alpha_channel and image.mode != "RGB":
                 image = image.convert("RGB")
             img_tensor = F.pil_to_tensor(image)
 
     elif image_file.startswith("data:"):
-        # data URL 格式: data:image/jpeg;base64,/9j/4AAQ...
+        # data URL format: data:image/jpeg;base64,/9j/4AAQ...
         base64_str = image_file.split(",")[1]
         img_bytes = pybase64.b64decode(base64_str, validate=True)
 
-        # 使用 torchvision 解码
+        # Decode with torchvision
         try:
             img_tensor_bytes = torch.frombuffer(bytearray(img_bytes), dtype=torch.uint8)
             img_tensor = decode_image(img_tensor_bytes, mode=ImageReadMode.RGB)
         except Exception:
-            # 回退到 PIL
+            # Fallback to PIL
             image = Image.open(BytesIO(img_bytes))
             if discard_alpha_channel and image.mode != "RGB":
                 image = image.convert("RGB")
             img_tensor = F.pil_to_tensor(image)
     elif isinstance(image_file, str):
-        # 纯 base64 字符串
+        # Pure base64 string
         img_bytes = pybase64.b64decode(image_file, validate=True)
 
-        # 使用 torchvision 解码
+        # Decode with torchvision
         try:
             img_tensor_bytes = torch.frombuffer(bytearray(img_bytes), dtype=torch.uint8)
             img_tensor = decode_image(img_tensor_bytes, mode=ImageReadMode.RGB)
         except Exception:
-            # 回退到 PIL
+            # Fallback to PIL
             image = Image.open(BytesIO(img_bytes))
             if discard_alpha_channel and image.mode != "RGB":
                 image = image.convert("RGB")
