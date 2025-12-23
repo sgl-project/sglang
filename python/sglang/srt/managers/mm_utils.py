@@ -1169,6 +1169,8 @@ def tensor_hash(tensor_list, algorithm: str = "sha256") -> int:
             x.flatten() if isinstance(x, torch.Tensor) else x for x in tensor_list
         ]
         tensor = torch.concat(tensor_list)
+
+    # keep original hash method for cuda tensor
     if tensor.is_cuda:
         return gpu_tensor_hash(tensor.cuda())
     tensor = tensor.detach().contiguous()

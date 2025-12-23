@@ -1877,16 +1877,6 @@ class ServerArgs:
             )
 
     def _handle_hicache(self):
-        # Validate multimodal hash algorithm selection
-        from sglang.srt.utils.hashing import HashAlgorithm
-
-        if not HashAlgorithm.is_available(self.multimodal_hash_algo):
-            raise ValueError(
-                f"Multimodal hash algorithm '{self.multimodal_hash_algo}' is not available. "
-                f"Available options: {HashAlgorithm.choices()}. "
-                "If using 'xxhash', please install it with: pip install xxhash"
-            )
-
         if self.hicache_storage_backend == "mooncake":
             if self.hicache_mem_layout == "layer_first":
                 if self.hicache_io_backend == "direct":
@@ -2372,6 +2362,16 @@ class ServerArgs:
             self.pp_size = 1
 
     def _handle_other_validations(self):
+        # Validate multimodal hash algorithm selection
+        from sglang.srt.utils.hashing import HashAlgorithm
+
+        if not HashAlgorithm.is_available(self.multimodal_hash_algo):
+            raise ValueError(
+                f"Multimodal hash algorithm '{self.multimodal_hash_algo}' is not available. "
+                f"Available options: {HashAlgorithm.choices()}. "
+                "If using 'xxhash', please install it with: pip install xxhash"
+            )
+
         # Handle model inference tensor dump.
         if self.debug_tensor_dump_output_folder is not None:
             logger.warning(

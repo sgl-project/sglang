@@ -5,51 +5,52 @@ This benchmark compares the performance of SHA-256 and xxHash algorithms
 for multimodal feature hashing in SGLang (used by set_pad_value).
 
 Example:
-    python benchmark_multimodal_hash.py --num-features 10000 --feature-size 1024
+    python benchmark_multimodal_hash.py --num-features 8 --feature-size 32768 --trials 10
 """
 
 from __future__ import annotations
 
 import argparse
-import random
 import statistics
 import sys
 import time
 from typing import List
 
-import numpy as np
+import torch
 
-from sglang.srt.utils.hashing import HashAlgorithm, hash_bytes_to_int64
+from sglang.srt.managers.mm_utils import hash_feature
+from sglang.srt.utils.hashing import HashAlgorithm
 
 
 def _generate_feature_data(
     num_features: int, feature_size: int, seed: int
-) -> List[bytes]:
+) -> List[torch.Tensor]:
     """Generate random feature data (simulating multimodal features)."""
-    rng = random.Random(seed)
+    torch.manual_seed(seed)
     features = []
     for _ in range(num_features):
-        # Generate random float16 array and convert to bytes
-        feature_array = np.random.rand(feature_size).astype(np.float16)
-        features.append(feature_array.tobytes())
+        # Generate random float16 tensor (more realistic for multimodal features)
+        feature_tensor = torch.randn(feature_size, dtype=torch.float16)
+        features.append(feature_tensor)
     return features
 
 
 def _hash_all_features(
     algorithm: str,
-    features: List[bytes],
+    features: List[torch.Tensor],
 ) -> float:
     """Hash all features (simulating set_pad_value behavior)."""
+
     start = time.perf_counter()
-    for feature_bytes in features:
-        hash_bytes_to_int64(feature_bytes, algorithm=algorithm)
+    for feature_tensor in features:
+        hash_feature(feature_tensor, algorithm=algorithm)
     end = time.perf_counter()
     return end - start
 
 
 def _benchmark_multimodal_features(
     hash_algo: str,
-    features: List[bytes],
+    features: List[torch.Tensor],
     trials: int,
 ) -> tuple[float, float, float] | None:
     """Benchmark multimodal feature hashing (used by set_pad_value)."""
@@ -124,8 +125,8 @@ def main() -> None:
         f"Benchmarking {len(algorithms_to_test)} algorithm(s) on "
         f"{args.num_features} features (feature size={args.feature_size})."
     )
-    feature_bytes = len(features[0])
-    print(f"Total data: {args.num_features * feature_bytes / 1024 / 1024:.2f} MB")
+    feature_size_bytes = features[0].numel() * features[0].element_size()
+    print(f"Total data: {args.num_features * feature_size_bytes / 1024 / 1024:.2f} MB")
     print()
 
     results = []
