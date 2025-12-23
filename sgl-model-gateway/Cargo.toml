@@ -145,9 +145,6 @@ opentelemetry-proto = { version = "0.27", features = ["gen-tonic"] }
 tonic-v12 = { version = "0.12.3", package = "tonic" }
 serial_test = "3.0"
 
-[[bench]]
-name = "router_bench"
-harness = false
 
 [[bench]]
 name = "request_processing"
