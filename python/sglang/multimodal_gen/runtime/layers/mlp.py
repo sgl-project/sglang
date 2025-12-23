@@ -32,17 +32,17 @@ class MLP(nn.Module):
             input_dim,
             mlp_hidden_dim,
             bias=True,
-            gather_output=True,
+            gather_output=False,
         )
 
         self.act = get_act_fn(act_type)
         if output_dim is None:
             output_dim = input_dim
-        self.fc_out = ColumnParallelLinear(
+        self.fc_out = RowParallelLinear(
             mlp_hidden_dim,
             output_dim,
             bias=True,
-            gather_output=True,
+            input_is_parallel=True,
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
