@@ -29,6 +29,12 @@ namespace host {
 
 namespace details {
 
+inline constexpr auto kAnyDeviceID = -1;
+inline constexpr auto kAnySize = static_cast<int64_t>(-1);
+inline constexpr auto kNullSize = static_cast<int64_t>(-1);
+inline constexpr auto kNullDType = static_cast<DLDataTypeCode>(18u);
+inline constexpr auto kNullDevice = static_cast<DLDeviceType>(-1);
+
 struct SizeRef;
 struct DTypeRef;
 struct DeviceRef;
@@ -63,14 +69,8 @@ struct dtype_trait<__nv_bfloat16> {
 
 template <DLDeviceType Code>
 struct device_trait {
-  inline static constexpr DLDevice value = {.device_type = Code, .device_id = 0};
+  inline static constexpr DLDevice value = {.device_type = Code, .device_id = kAnyDeviceID};
 };
-
-inline constexpr auto kAnyDeviceID = -1;
-inline constexpr auto kAnySize = static_cast<int64_t>(-1);
-inline constexpr auto kNullSize = static_cast<int64_t>(-1);
-inline constexpr auto kNullDType = static_cast<DLDataTypeCode>(18u);
-inline constexpr auto kNullDevice = static_cast<DLDeviceType>(-1);
 
 template <typename... Ts>
 inline constexpr auto kDTypeList = std::array<DLDataType, sizeof...(Ts)>{dtype_trait<Ts>::value...};

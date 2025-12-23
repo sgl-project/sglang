@@ -22,8 +22,8 @@ def _jit_test_module() -> Module:
 
 def main() -> None:
     module = _jit_test_module()
-    a = torch.empty((3, 4), device="cuda")
-    b = torch.empty((4, 4), device="cuda")
+    a = torch.empty((3, 4), device="cuda:1", dtype=torch.float32)
+    b = torch.empty((4, 4), device="cuda:1", dtype=torch.float32)
     # OK, same shape
     module.assert_same_shape(a, a)
     try:
@@ -32,6 +32,7 @@ def main() -> None:
         print(f"Expected error: {e}")
     else:
         raise RuntimeError("Expected an error due to shape mismatch")
+    print("All tests passed.")
 
 
 if __name__ == "__main__":
