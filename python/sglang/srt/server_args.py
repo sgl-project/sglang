@@ -439,10 +439,7 @@ class ServerArgs:
     speculative_ngram_match_type: Literal["BFS", "PROB"] = "BFS"
     speculative_ngram_branch_length: int = 18
     speculative_ngram_capacity: int = 10 * 1000 * 1000
-
-    # For Multi-Layer MTP
-    # FIXME: rename -> enable_multi_layer_mtp
-    enable_mtp: bool = False
+    enable_multi_layer_eagle: bool = False
 
     # Expert parallelism
     ep_size: int = 1
@@ -573,6 +570,7 @@ class ServerArgs:
     disable_fast_image_processor: bool = False
     keep_mm_feature_on_device: bool = False
     enable_return_hidden_states: bool = False
+    enable_return_routed_experts: bool = False
     scheduler_recv_interval: int = 1
     numa_node: Optional[List[int]] = None
     enable_deterministic_inference: bool = False
@@ -725,6 +723,12 @@ class ServerArgs:
 
         # Handle any other necessary validations.
         self._handle_other_validations()
+
+        # Handle two-batch overlap settings.
+        self._handle_two_batch_overlap()
+
+        # Handle debug utilities.
+        self._handle_debug_utils()
 
     def _handle_deprecated_args(self):
         # Handle deprecated tool call parsers
@@ -1182,6 +1186,8 @@ class ServerArgs:
             self.disable_hybrid_swa_memory = True
 
         elif "MiMoV2FlashForCausalLM" in model_arch:
+            self.enable_multi_layer_eagle = True
+            logger.info("Enable multi-layer eagle for MiMoV2FlashForCausalLM model")
             self.swa_full_tokens_ratio = 1.0
             logger.warning(
                 "Reset swa_full_tokens_ratio to 1.0 for MiMoV2FlashForCausalLM model"
@@ -2391,6 +2397,17 @@ class ServerArgs:
                     self.preferred_sampling_params
                 )
 
+    def _handle_two_batch_overlap(self):
+        if self.enable_two_batch_overlap and self.moe_a2a_backend == "none":
+            raise ValueError(
+                "When enabling two batch overlap, moe_a2a_backend cannot be 'none'."
+            )
+
+    def _handle_debug_utils(self):
+        if is_in_ci() and self.soft_watchdog_timeout is None:
+            logger.info("Set soft_watchdog_timeout since in CI")
+            self.soft_watchdog_timeout = 300
+
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
 
@@ -3126,6 +3143,7 @@ class ServerArgs:
             help="The load balancing strategy for data parallelism.",
             choices=[
                 "round_robin",
+                "decode_round_robin",
                 "shortest_queue",
                 "minimum_tokens",
             ],
@@ -3459,11 +3477,11 @@ class ServerArgs:
             help="The cache capacity for ngram speculative decoding.",
         )
 
-        # Speculative decoding (MTP)
+        # Multi-layer Eagle speculative decoding
         parser.add_argument(
-            "--enable-mtp",
+            "--enable-multi-layer-eagle",
             action="store_true",
-            help="Enable multi-layer MTP speculative decoding.",
+            help="Enable multi-layer Eagle speculative decoding.",
         )
 
         # Expert parallelism
@@ -4100,6 +4118,11 @@ class ServerArgs:
             "--enable-return-hidden-states",
             action="store_true",
             help="Enable returning hidden states with responses.",
+        )
+        parser.add_argument(
+            "--enable-return-routed-experts",
+            action="store_true",
+            help="Enable returning routed experts of each layer with responses.",
         )
         parser.add_argument(
             "--scheduler-recv-interval",
