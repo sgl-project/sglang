@@ -115,12 +115,12 @@ void per_tensor_quant_fp8(tvm::ffi::TensorView input,
   SymbolicDevice device_;
   SymbolicDType input_dtype;
 
-  TensorMatcher({-1})
+  TensorMatcher({num_elements})
       .with_dtype<float, c10::Half, c10::BFloat16>(input_dtype)
       .with_device<kDLCUDA>(device_)
       .verify(input);
 
-  TensorMatcher({-1})  //
+  TensorMatcher({num_elements})
       .with_dtype<__nv_fp8_e4m3>()
       .with_device<kDLCUDA>(device_)
       .verify(output_q);
@@ -130,7 +130,7 @@ void per_tensor_quant_fp8(tvm::ffi::TensorView input,
       .with_device<kDLCUDA>(device_)
       .verify(output_s);
 
-  const size_t total_elements = input.size();
+  const size_t total_elements = num_elements.unwrap();
   const size_t num_blocks = std::min((total_elements + kBlockSize - 1) / kBlockSize, size_t(1024));
   const DLDevice device = device_.unwrap();
 
@@ -153,18 +153,15 @@ void per_tensor_quant_fp8(tvm::ffi::TensorView input,
         static_cast<int64_t>(total_elements));
   };
 
-  switch (input_dtype.unwrap()) {
-    case kDLFloat:
-      launch_kernels.template operator()<float>();
-      break;
-    case kDLBfloat:
-      launch_kernels.template operator()<c10::BFloat16>();
-      break;
-    case kDLFloat16:
-      launch_kernels.template operator()<c10::Half>();
-      break;
-    default:
-      RuntimeCheck(false, "Unsupported input dtype");
+  const DLDataTypeCode dtype_code = input_dtype.unwrap();
+  if (dtype_code == kDLFloat) {
+    launch_kernels.template operator()<float>();
+  } else if (dtype_code == kDLBfloat) {
+    launch_kernels.template operator()<c10::BFloat16>();
+  } else if (dtype_code == kDLFloat + 2) {  // kDLFloat16
+    launch_kernels.template operator()<c10::Half>();
+  } else {
+    RuntimeCheck(false, "Unsupported input dtype");
   }
 }
 
