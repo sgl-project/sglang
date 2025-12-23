@@ -10,7 +10,7 @@ use rand::Rng;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-use super::{get_healthy_worker_indices, BucketConfig, LoadBalancingPolicy};
+use super::{get_healthy_worker_indices, normalize_model_key, BucketConfig, LoadBalancingPolicy};
 use crate::core::Worker;
 
 #[derive(Debug)]
@@ -79,13 +79,7 @@ impl BucketPolicy {
         // Group workers by model
         let mut model_workers: HashMap<String, Vec<&Arc<dyn Worker>>> = HashMap::new();
         for worker in prefill_workers {
-            // Use "unknown" for empty model_ids
-            let model_id = worker.model_id();
-            let model_key = if model_id.is_empty() {
-                "unknown"
-            } else {
-                model_id
-            };
+            let model_key = normalize_model_key(worker.model_id());
             model_workers
                 .entry(model_key.to_string())
                 .or_default()
@@ -118,12 +112,7 @@ impl BucketPolicy {
     }
 
     pub fn add_prefill_url(&self, worker: &dyn Worker) {
-        let model_id = worker.model_id();
-        let model_key = if model_id.is_empty() {
-            "unknown"
-        } else {
-            model_id
-        };
+        let model_key = normalize_model_key(worker.model_id());
         let bucket = self
             .buckets
             .entry(model_key.to_string())
@@ -166,12 +155,7 @@ impl BucketPolicy {
     }
 
     pub fn remove_prefill_url(&self, worker: &dyn Worker) {
-        let model_id = worker.model_id();
-        let model_key = if model_id.is_empty() {
-            "unknown"
-        } else {
-            model_id
-        };
+        let model_key = normalize_model_key(worker.model_id());
 
         if let Some(bucket_entry) = self.buckets.get(model_key) {
             let bucket = bucket_entry.value();
@@ -235,12 +219,7 @@ impl LoadBalancingPolicy for BucketPolicy {
 
         // Determine the model for this set of workers (router pre-filters by model)
         // All workers should be from the same model
-        let first_model = workers[healthy_indices[0]].model_id();
-        let model_key = if first_model.is_empty() {
-            "unknown"
-        } else {
-            first_model
-        };
+        let model_key = normalize_model_key(workers[healthy_indices[0]].model_id());
 
         let bucket = self
             .buckets
