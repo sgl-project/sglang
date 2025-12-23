@@ -1,10 +1,29 @@
+// Include c10 headers BEFORE sgl_kernel/tensor.h to avoid std::source_location issues
+#include <c10/util/BFloat16.h>
+#include <c10/util/Float8_e4m3fn.h>
+#include <c10/util/Half.h>
+
+#ifdef USE_ROCM
+#include <hip/hip_runtime.h>
+#if HIP_FP8_TYPE_FNUZ
+#include <c10/util/Float8_e4m3fnuz.h>
+#else
+#if HIP_FP8_TYPE_E4M3
+#include <c10/util/Float8_e4m3fn.h>
+#endif
+#endif
+#endif
+
+#ifdef __CUDACC__
+#include <cuda_fp8.h>
+#endif
+
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.cuh>
 #include <sgl_kernel/utils.h>
 
 #include <cub/block/block_reduce.cuh>
 #include <flashinfer/vec_dtypes.cuh>
-#include <sgl_kernel/fp8_utils.cuh>
 
 #include <cstddef>
 #include <cstdint>
@@ -38,11 +57,74 @@ struct dtype_trait<__nv_fp8_e4m3> {
 }  // namespace details
 }  // namespace host
 
+// FP8 constants and device functions
+namespace device {
+
+#ifndef USE_ROCM
+using FP8_TYPE = c10::Float8_e4m3fn;
+constexpr float FP8_E4M3_MAX = 448.0f;
+#else
+#if HIP_FP8_TYPE_FNUZ
+using FP8_TYPE = c10::Float8_e4m3fnuz;
+constexpr float FP8_E4M3_MAX = 224.0f;
+#else
+#if HIP_FP8_TYPE_E4M3
+using FP8_TYPE = c10::Float8_e4m3fn;
+constexpr float FP8_E4M3_MAX = 448.0f;
+#endif
+#endif
+#endif
+
+}  // namespace device
+
 namespace {
 
 using device::FP8_E4M3_MAX;
-using device::atomicMaxFloat;
-using device::blockReduceMax;
+
+constexpr unsigned int FULL_MASK = 0xffffffff;
+constexpr int WARP_SIZE = 32;
+
+__device__ __forceinline__ float atomicMaxFloat(float* addr, float value) {
+#ifndef USE_ROCM
+  float old;
+  old = (value >= 0) ? __int_as_float(atomicMax((int*)addr, __float_as_int(value)))
+                     : __uint_as_float(atomicMin((unsigned int*)addr, __float_as_uint(value)));
+  return old;
+#else
+  int* addr_as_i = (int*)addr;
+  int old = *addr_as_i, assumed;
+  do {
+    assumed = old;
+    old = atomicCAS(addr_as_i, assumed, __float_as_int(fmaxf(value, __int_as_float(assumed))));
+  } while (assumed != old);
+  return __int_as_float(old);
+#endif
+}
+
+__device__ __forceinline__ float warpReduceMax(float value) {
+  value = fmaxf(value, __shfl_xor_sync(FULL_MASK, value, 16));
+  value = fmaxf(value, __shfl_xor_sync(FULL_MASK, value, 8));
+  value = fmaxf(value, __shfl_xor_sync(FULL_MASK, value, 4));
+  value = fmaxf(value, __shfl_xor_sync(FULL_MASK, value, 2));
+  value = fmaxf(value, __shfl_xor_sync(FULL_MASK, value, 1));
+  return value;
+}
+
+__device__ __forceinline__ float blockReduceMax(float value) {
+  static __shared__ float warpLevelMaxs[WARP_SIZE];
+  const int laneId = threadIdx.x % WARP_SIZE;
+  const int warpId = threadIdx.x / WARP_SIZE;
+
+  value = warpReduceMax(value);
+
+  if (laneId == 0) warpLevelMaxs[warpId] = value;
+  __syncthreads();
+
+  value = (threadIdx.x < blockDim.x / WARP_SIZE) ? warpLevelMaxs[laneId] : 0;
+  if (warpId == 0) value = warpReduceMax(value);
+
+  return value;
+}
 
 template <typename T>
 __global__ void per_tensor_absmax_kernel(const T* __restrict__ input,
