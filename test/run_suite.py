@@ -43,6 +43,11 @@ NIGHTLY_SUITES = {
         "nightly-8-gpu-h200-basic",  # Basic tests for large models on H200
         "nightly-8-gpu-b200-basic",  # Basic tests for large models on B200
         "nightly-8-gpu-common",  # Common tests that run on both H200 and B200
+        # Eval and perf suites (2-gpu)
+        "nightly-eval-text-2-gpu",
+        "nightly-eval-vlm-2-gpu",
+        "nightly-perf-text-2-gpu",
+        "nightly-perf-vlm-2-gpu",
     ],
     HWBackend.AMD: ["nightly-amd", "nightly-amd-8-gpu"],
     HWBackend.CPU: [],
@@ -149,14 +154,10 @@ def run_a_suite(args):
     auto_partition_id = args.auto_partition_id
     auto_partition_size = args.auto_partition_size
 
-    # Temporary: search broadly for nightly tests during migration to registered/
-    if nightly:
-        files = glob.glob("**/*.py", recursive=True)
-        sanity_check = False  # Allow files without registration during migration
-    else:
-        files = glob.glob("registered/**/*.py", recursive=True)
-        # Strict: all registered files must have proper registration
-        sanity_check = True
+    # All tests (per-commit and nightly) are now in registered/
+    files = glob.glob("registered/**/*.py", recursive=True)
+    # Strict: all registered files must have proper registration
+    sanity_check = True
 
     all_tests = collect_tests(files, sanity_check=sanity_check)
     ci_tests, skipped_tests = filter_tests(all_tests, hw, suite, nightly)
