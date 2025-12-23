@@ -15,6 +15,7 @@ from sglang.srt.layers.parameter import (
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsScheme,
 )
+from sglang.srt.layers.quantization.compressed_tensors.utils import AiterHipblaslt
 from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.layers.quantization.fp8_utils import (
     apply_fp8_linear,
@@ -84,12 +85,27 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsScheme):
                 weight_scale = layer.weight_scale.data
 
             if _use_aiter:
-                from aiter.ops.shuffle import shuffle_weight
-
+                # keep the weight as (N, K)
                 layer.weight = Parameter(
                     shuffle_weight(weight, (16, 16)), requires_grad=False
                 )
+                # FP8HIPB need to keep the weight as (K, N)
+                if get_bool_env_var("SGLANG_ROCM_USE_AITER_LINEAR_FP8HIPB"):
+                    AiterHipblaslt._initialize_hipblaslt()
+                    layout = (16, 16)
+                    if AiterHipblaslt.can_shuffle(
+                        weight.shape[0], weight.shape[1], layout
+                    ):
+                        shuffled_weight = shuffle_weight(weight, layout).t()
+                        self._aiter_trans_weight = False
+                    else:
+                        shuffled_weight = weight
+                        self._aiter_trans_weight = True
+
+                    layer.weight = Parameter(shuffled_weight.data, requires_grad=False)
+                    weight_scale = weight_scale.t()
             else:
+                # keep the weight as (K, N)
                 layer.weight = Parameter(weight.t(), requires_grad=False)
 
             # required by torch.compile to be torch.nn.Parameter
@@ -103,17 +119,6 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsScheme):
             layer.input_scale = Parameter(layer.input_scale.max(), requires_grad=False)
         else:
             layer.input_scale = None
-
-        if _use_aiter:
-            from aiter.ops.shuffle import shuffle_weight
-
-            # keep the weight as (N, K)
-            layer.weight = Parameter(
-                shuffle_weight(weight, layout=(16, 16)), requires_grad=False
-            )
-        else:
-            # keep the weight as (K, N)
-            layer.weight = Parameter(weight.t(), requires_grad=False)
 
     def create_weights(
         self,

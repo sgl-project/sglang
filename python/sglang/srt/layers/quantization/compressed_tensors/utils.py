@@ -9,7 +9,7 @@ import torch
 from compressed_tensors import CompressionFormat
 from torch.nn import Module
 
-from sglang.srt.utils import get_bool_env_var, is_hip
+from sglang.srt.utils import is_hip
 
 _is_hip = is_hip()
 
@@ -233,7 +233,7 @@ class AiterHipblaslt:
 
     @classmethod
     def _initialize_hipblaslt(cls) -> None:
-        if not _is_hip or not get_bool_env_var("SGLANG_ROCM_USE_AITER_LINEAR_SHUFFLE"):
+        if not _is_hip:
             return
         if cls._HIPBLASLT_INITIALIZED:
             return
@@ -297,4 +297,20 @@ def rocm_aiter_swizzle_hipb_unquantized_gemm(
     bias: torch.Tensor | None = None,
 ):
     output = AiterHipblaslt.hip_bpreshuffle_gemm(x, weight, bias=bias)
+    return output
+
+
+def rocm_aiter_swizzle_hipb_fp8_gemm(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    scale_a: torch.Tensor | None = None,
+    scale_b: torch.Tensor | None = None,
+    bias: torch.Tensor | None = None,
+    out_dtype: torch.dtype | None = None,
+):
+    output = AiterHipblaslt.hip_bpreshuffle_gemm(
+        input, weight, out_dtype=out_dtype, scale_a=scale_a, scale_b=scale_b
+    )
+    if bias is not None:
+        output = output + bias
     return output
