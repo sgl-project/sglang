@@ -1,5 +1,5 @@
 _GLOBAL_PERF_RESULTS = []
-_GLOBAL_TIMING_SUGGESTIONS = []  # 收集缺失 estimated_full_test_time_s 的建议
+_GLOBAL_TIMING_SUGGESTIONS = []
 
 
 def pytest_sessionfinish(session):
