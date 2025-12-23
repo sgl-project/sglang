@@ -564,6 +564,7 @@ def sort_weights(q_w: torch.Tensor, g_idx: torch.Tensor):
         sort_indices.to(device=orig_device),
     )
 
+
 def swizzle_blockscale(scale: torch.Tensor):
     """
     Swizzle the scale tensor into a blockwise interleaved format for NVFP4 quantization.
