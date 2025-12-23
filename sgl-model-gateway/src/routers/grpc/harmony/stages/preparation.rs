@@ -112,7 +112,7 @@ impl HarmonyPreparationStage {
             )
             .map_err(|e| {
                 error!(function = "prepare_chat", error = %e, "Invalid tool configuration");
-                error::bad_request(format!("Invalid tool configuration: {}", e))
+                error::bad_request("invalid_tool_configuration", format!("Invalid tool configuration: {}", e))
             })?
         } else {
             None
@@ -183,7 +183,7 @@ impl HarmonyPreparationStage {
             )
             .map_err(|e| {
                 error!(function = "prepare_responses", error = %e, "Invalid tool configuration");
-                error::bad_request(format!("Invalid tool configuration: {}", e))
+                error::bad_request("invalid_tool_configuration", format!("Invalid tool configuration: {}", e))
             })?
         } else {
             None

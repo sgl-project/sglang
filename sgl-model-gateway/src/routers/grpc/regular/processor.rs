@@ -126,13 +126,6 @@ impl ResponseProcessor {
             Some(ToolChoice::Value(ToolChoiceValue::None))
         );
 
-        // #region agent log
-        let _ = std::fs::OpenOptions::new().create(true).append(true).open("/sgl-workspace/sglang/.cursor/debug.log").and_then(|mut f| {
-            use std::io::Write;
-            writeln!(f, "{{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"H2\",\"location\":\"processor.rs:131\",\"message\":\"Tool call parsing check\",\"data\":{{\"tool_choice_enabled\":{},\"tools_available\":{},\"tool_parser_available\":{},\"processed_text_len\":{},\"processed_text_preview\":\"{}\"}},\"timestamp\":{}}}", tool_choice_enabled, original_request.tools.is_some(), tool_parser_available, processed_text.len(), if processed_text.len() > 100 { format!("{}...", &processed_text[..100]) } else { processed_text.clone() }, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis())
-        });
-        // #endregion
-
         if tool_choice_enabled && original_request.tools.is_some() {
             // Check if JSON schema constraint was used (specific function or required mode)
             let used_json_schema = match &original_request.tool_choice {
@@ -142,13 +135,6 @@ impl ResponseProcessor {
                 _ => false,
             };
 
-            // #region agent log
-            let _ = std::fs::OpenOptions::new().create(true).append(true).open("/sgl-workspace/sglang/.cursor/debug.log").and_then(|mut f| {
-                use std::io::Write;
-                writeln!(f, "{{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"H1\",\"location\":\"processor.rs:147\",\"message\":\"Parser selection\",\"data\":{{\"used_json_schema\":{},\"tool_parser_available\":{},\"model\":\"{}\"}},\"timestamp\":{}}}", used_json_schema, tool_parser_available, original_request.model, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis())
-            });
-            // #endregion
-
             if used_json_schema {
                 (tool_calls, processed_text) = utils::parse_json_schema_response(
                     &processed_text,
@@ -157,13 +143,6 @@ impl ResponseProcessor {
                     history_tool_calls_count,
                 );
             } else if tool_parser_available {
-                // #region agent log
-                let _ = std::fs::OpenOptions::new().create(true).append(true).open("/sgl-workspace/sglang/.cursor/debug.log").and_then(|mut f| {
-                    use std::io::Write;
-                    writeln!(f, "{{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"H3\",\"location\":\"processor.rs:155\",\"message\":\"Before parse_tool_calls\",\"data\":{{\"processed_text\":\"{}\"}},\"timestamp\":{}}}", processed_text, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis())
-                });
-                // #endregion
-
                 (tool_calls, processed_text) = self
                     .parse_tool_calls(
                         &processed_text,
@@ -171,13 +150,6 @@ impl ResponseProcessor {
                         history_tool_calls_count,
                     )
                     .await;
-
-                // #region agent log
-                let _ = std::fs::OpenOptions::new().create(true).append(true).open("/sgl-workspace/sglang/.cursor/debug.log").and_then(|mut f| {
-                    use std::io::Write;
-                    writeln!(f, "{{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"H5\",\"location\":\"processor.rs:162\",\"message\":\"After parse_tool_calls\",\"data\":{{\"tool_calls_count\":{},\"processed_text_after\":\"{}\"}},\"timestamp\":{}}}", tool_calls.as_ref().map(|v| v.len()).unwrap_or(0), processed_text, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis())
-                });
-                // #endregion
             }
         }
 
@@ -273,13 +245,6 @@ impl ResponseProcessor {
                 &chat_request.model,
             );
 
-        // #region agent log
-        let _ = std::fs::OpenOptions::new().create(true).append(true).open("/sgl-workspace/sglang/.cursor/debug.log").and_then(|mut f| {
-            use std::io::Write;
-            writeln!(f, "{{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"H2\",\"location\":\"processor.rs:247\",\"message\":\"Tool parser availability check\",\"data\":{{\"tool_choice_enabled\":{},\"tools_available\":{},\"tool_parser_available\":{},\"model\":\"{}\",\"configured_parser\":\"{}\"}},\"timestamp\":{}}}", tool_choice_enabled, chat_request.tools.is_some(), tool_parser_available, chat_request.model, self.configured_tool_parser.as_deref().unwrap_or("none"), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis())
-        });
-        // #endregion
-
         // Log once per request (not per choice)
         if chat_request.separate_reasoning && !reasoning_parser_available {
             tracing::debug!(
@@ -349,23 +314,9 @@ impl ResponseProcessor {
             model,
         );
 
-        // #region agent log
-        let configured_parser_name = self.configured_tool_parser.as_deref().unwrap_or("auto");
-        let _ = std::fs::OpenOptions::new().create(true).append(true).open("/sgl-workspace/sglang/.cursor/debug.log").and_then(|mut f| {
-            use std::io::Write;
-            writeln!(f, "{{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"H1\",\"location\":\"processor.rs:311\",\"message\":\"Parser selection\",\"data\":{{\"configured_parser\":\"{}\",\"model\":\"{}\"}},\"timestamp\":{}}}", configured_parser_name, model, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis())
-        });
-        // #endregion
-
         // Try parsing directly (parser will handle detection internally)
         let result = {
             let parser = pooled_parser.lock().await;
-            // #region agent log
-            let _ = std::fs::OpenOptions::new().create(true).append(true).open("/sgl-workspace/sglang/.cursor/debug.log").and_then(|mut f| {
-                use std::io::Write;
-                writeln!(f, "{{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"H1\",\"location\":\"processor.rs:320\",\"message\":\"Calling parser.parse_complete\",\"data\":{{\"input_text\":\"{}\"}},\"timestamp\":{}}}", processed_text, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis())
-            });
-            // #endregion
             parser.parse_complete(processed_text).await
             // Lock is dropped here
         };

@@ -86,7 +86,7 @@ impl ChatPreparationStage {
             )
             .map_err(|e| {
                 error!(function = "ChatPreparationStage::execute", error = %e, "Invalid tool configuration");
-                error::bad_request(format!("Invalid tool configuration: {}", e))
+                error::bad_request("invalid_tool_configuration", format!("Invalid tool configuration: {}", e))
             })?
         } else {
             None

@@ -163,9 +163,12 @@ pub fn process_content_format(
 ) -> Result<Vec<Value>, String> {
     messages
         .iter()
-        .map(|message| {
+        .enumerate()
+        .map(|(idx, message)| {
             let mut message_json = serde_json::to_value(message)
-                .map_err(|e| format!("Failed to serialize message: {}", e))?;
+                .map_err(|e| {
+                    format!("Failed to serialize message at index {}: {}", idx, e)
+                })?;
 
             if let Some(obj) = message_json.as_object_mut() {
                 if let Some(content_value) = obj.get_mut("content") {
@@ -417,6 +420,7 @@ pub fn process_chat_messages(
         });
 
     let formatted_text = if let Some(hf_tokenizer) = hf_tokenizer {
+
         // Get content format and transform messages accordingly
         let content_format = hf_tokenizer.chat_template_content_format();
         let mut transformed_messages = process_content_format(&request.messages, content_format)?;
@@ -425,17 +429,30 @@ pub fn process_chat_messages(
         process_tool_call_arguments(&mut transformed_messages)?;
 
         // Convert tools to JSON values for template processing
-        let tools_json: Option<Vec<Value>> = request
-            .tools
-            .as_ref()
-            .map(|tools| {
-                tools
-                    .iter()
-                    .map(serde_json::to_value)
-                    .collect::<Result<Vec<_>, _>>()
-            })
-            .transpose()
-            .map_err(|e| format!("Failed to serialize tools: {}", e))?;
+        // Match Python behavior: when tool_choice is "none", set tools to None
+        // (Python code: `tools = None` if `request.tool_choice != "none"` is False)
+        let tools_json: Option<Vec<Value>> = {
+            let should_include_tools = !matches!(
+                &request.tool_choice,
+                Some(ToolChoice::Value(ToolChoiceValue::None))
+            );
+
+            if should_include_tools {
+                request
+                    .tools
+                    .as_ref()
+                    .map(|tools| {
+                        tools
+                            .iter()
+                            .map(serde_json::to_value)
+                            .collect::<Result<Vec<_>, _>>()
+                    })
+                    .transpose()
+                    .map_err(|e| format!("Failed to serialize tools: {}", e))?
+            } else {
+                None
+            }
+        };
 
         let kwargs_capacity = 1 + request.chat_template_kwargs.as_ref().map_or(0, |k| k.len());
         let mut combined_template_kwargs = HashMap::with_capacity(kwargs_capacity);
@@ -490,7 +507,9 @@ pub fn process_chat_messages(
         // Apply chat template with the (now possibly shorter) list of messages
         let rendered = hf_tokenizer
             .apply_chat_template(&transformed_messages, params)
-            .map_err(|e| format!("Failed to apply chat template: {}", e))?;
+            .map_err(|e| {
+                format!("Chat template application failed: {}", e)
+            })?;
 
         // Append assistant prefix if we have one
         if let Some(prefix) = assistant_prefix {
