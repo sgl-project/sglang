@@ -46,6 +46,7 @@ class LoRAPipeline(ComposedPipelineBase):
     # Track current adapter per module: {"transformer": "high_lora", "transformer_2": "low_lora"}
     cur_adapter_name: dict[str, str]
     cur_adapter_path: dict[str, str]
+    cur_adapter_strength: dict[str, float]  # Track current strength per module
     # [dit_layer_name] = wrapped_lora_layer
     lora_layers: dict[str, BaseLayerWithLoRA]
     lora_layers_critic: dict[str, BaseLayerWithLoRA]
@@ -71,6 +72,7 @@ class LoRAPipeline(ComposedPipelineBase):
         self.loaded_adapter_paths = {}
         self.cur_adapter_name = {}
         self.cur_adapter_path = {}
+        self.cur_adapter_strength = {}
         self.lora_layers = {}
         self.lora_layers_critic = {}
         self.lora_layers_transformer_2 = {}
@@ -418,11 +420,12 @@ class LoRAPipeline(ComposedPipelineBase):
             adapter_updated = True
             self.load_lora_adapter(lora_path, lora_nickname, rank)
 
-        # Check if we can skip (same adapter already applied to all target modules)
+        # Check if we can skip (same adapter already applied to all target modules with same strength)
         all_already_applied = all(
             not adapter_updated
             and self.cur_adapter_name.get(module_name) == lora_nickname
             and self.is_lora_merged.get(module_name, False)
+            and self.cur_adapter_strength.get(module_name) == strength
             for module_name, _ in target_modules
         )
         if all_already_applied:
@@ -440,6 +443,7 @@ class LoRAPipeline(ComposedPipelineBase):
                 lora_path or self.loaded_adapter_paths.get(lora_nickname, "")
             )
             self.is_lora_merged[module_name] = True
+            self.cur_adapter_strength[module_name] = strength
 
         logger.info(
             "Rank %d: LoRA adapter %s applied to %d layers (target: %s, strength: %s)",
@@ -484,6 +488,7 @@ class LoRAPipeline(ComposedPipelineBase):
                     logger.warning("Could not merge layer %s: %s", name, e)
                     continue
             self.is_lora_merged[module_name] = True
+            self.cur_adapter_strength[module_name] = strength
             logger.info(
                 "LoRA weights merged for %s (strength: %s)", module_name, strength
             )
@@ -531,4 +536,5 @@ class LoRAPipeline(ComposedPipelineBase):
                         layer.disable_lora = True
                     continue
             self.is_lora_merged[module_name] = False
+            self.cur_adapter_strength.pop(module_name, None)
             logger.info("LoRA weights unmerged for %s", module_name)
