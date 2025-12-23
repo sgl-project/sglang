@@ -20,10 +20,7 @@ from openai import OpenAI
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.perf_logger import RequestPerfRecord
-from sglang.multimodal_gen.test.server.conftest import (
-    _GLOBAL_PERF_RESULTS,
-    _GLOBAL_TIMING_SUGGESTIONS,
-)
+from sglang.multimodal_gen.test.server.conftest import _GLOBAL_PERF_RESULTS
 from sglang.multimodal_gen.test.server.test_server_utils import (
     VALIDATOR_REGISTRY,
     PerformanceValidator,
@@ -161,12 +158,13 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
         _measured_full_time = _fixture_end_time - _fixture_start_time
 
         scenario = BASELINE_CONFIG.scenarios.get(case.id)
-        if scenario is None or scenario.estimated_full_test_time_s is None:
-            _GLOBAL_TIMING_SUGGESTIONS.append(
-                {
-                    "case_id": case.id,
-                    "measured_time": _measured_full_time,
-                }
+        if scenario is not None and scenario.estimated_full_test_time_s is None:
+            logger.error(
+                f'\nadd "estimated_full_test_time_s" to scenario "{case.id}" in perf_baselines.json:\n\n'
+                f'"{case.id}": {{\n'
+                f"    ...\n"
+                f'    "estimated_full_test_time_s": {_measured_full_time:.1f}\n'
+                f"}}\n"
             )
 
 

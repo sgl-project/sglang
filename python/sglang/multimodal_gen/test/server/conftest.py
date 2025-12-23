@@ -1,5 +1,4 @@
 _GLOBAL_PERF_RESULTS = []
-_GLOBAL_TIMING_SUGGESTIONS = []
 
 
 def pytest_sessionfinish(session):
@@ -51,19 +50,3 @@ def pytest_sessionfinish(session):
                 )
                 print(f"    Sampled Steps: {step_report}")
         print("=" * 91)
-
-    # 输出缺失 estimated_full_test_time_s 的建议
-    if _GLOBAL_TIMING_SUGGESTIONS:
-        print("\n\n" + "=" * 30 + " Missing estimated_full_test_time_s " + "=" * 30)
-        print(
-            "The following test cases are missing 'estimated_full_test_time_s' field.\n"
-            "Please add the measured values to the corresponding scenario in perf_baselines.json:\n"
-        )
-        for item in _GLOBAL_TIMING_SUGGESTIONS:
-            print(f'"{item["case_id"]}": {{')
-            print(f"    ...")
-            print(
-                f'    "estimated_full_test_time_s": {item["measured_time"]:.1f},  // <-- ADD THIS'
-            )
-            print(f"}},\n")
-        print("=" * 96)
