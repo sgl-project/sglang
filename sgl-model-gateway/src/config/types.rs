@@ -261,6 +261,20 @@ pub enum RoutingMode {
         #[serde(skip_serializing_if = "Option::is_none")]
         decode_policy: Option<PolicyConfig>,
     },
+    #[serde(rename = "encode_prefill_decode")]
+    EncodePrefillDecode {
+        /// Encode workers (optional bootstrap port)
+        #[serde(default)]
+        encode_urls: Vec<(String, Option<u16>)>,
+        prefill_urls: Vec<(String, Option<u16>)>,
+        decode_urls: Vec<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        encode_policy: Option<PolicyConfig>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        prefill_policy: Option<PolicyConfig>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        decode_policy: Option<PolicyConfig>,
+    },
     #[serde(rename = "openai")]
     OpenAI { worker_urls: Vec<String> },
 }
@@ -268,6 +282,10 @@ pub enum RoutingMode {
 impl RoutingMode {
     pub fn is_pd_mode(&self) -> bool {
         matches!(self, RoutingMode::PrefillDecode { .. })
+    }
+
+    pub fn is_epd_mode(&self) -> bool {
+        matches!(self, RoutingMode::EncodePrefillDecode { .. })
     }
 
     pub fn worker_count(&self) -> usize {
@@ -278,6 +296,12 @@ impl RoutingMode {
                 decode_urls,
                 ..
             } => prefill_urls.len() + decode_urls.len(),
+            RoutingMode::EncodePrefillDecode {
+                encode_urls,
+                prefill_urls,
+                decode_urls,
+                ..
+            } => encode_urls.len() + prefill_urls.len() + decode_urls.len(),
             RoutingMode::OpenAI { .. } => 1,
         }
     }
@@ -288,6 +312,16 @@ impl RoutingMode {
         match self {
             RoutingMode::PrefillDecode { prefill_policy, .. } => {
                 prefill_policy.as_ref().unwrap_or(main_policy)
+            }
+            _ => main_policy,
+        }
+    }
+
+    /// Get the effective encode policy for EPD mode
+    pub fn get_encode_policy<'a>(&'a self, main_policy: &'a PolicyConfig) -> &'a PolicyConfig {
+        match self {
+            RoutingMode::EncodePrefillDecode { encode_policy, .. } => {
+                encode_policy.as_ref().unwrap_or(main_policy)
             }
             _ => main_policy,
         }
@@ -364,6 +398,8 @@ pub struct DiscoveryConfig {
     pub prefill_selector: HashMap<String, String>,
     /// PD mode decode
     pub decode_selector: HashMap<String, String>,
+    /// EPD mode encode
+    pub encode_selector: HashMap<String, String>,
     pub bootstrap_port_annotation: String,
 }
 
@@ -375,6 +411,7 @@ impl Default for DiscoveryConfig {
             port: 8000,
             check_interval_secs: 120,
             selector: HashMap::new(),
+            encode_selector: HashMap::new(),
             prefill_selector: HashMap::new(),
             decode_selector: HashMap::new(),
             bootstrap_port_annotation: "sglang.ai/bootstrap-port".to_string(),
@@ -555,6 +592,7 @@ impl RouterConfig {
         match self.mode {
             RoutingMode::Regular { .. } => "regular",
             RoutingMode::PrefillDecode { .. } => "prefill_decode",
+            RoutingMode::EncodePrefillDecode { .. } => "encode_prefill_decode",
             RoutingMode::OpenAI { .. } => "openai",
         }
     }
@@ -882,6 +920,7 @@ mod tests {
             selector: selector.clone(),
             prefill_selector: selector.clone(),
             decode_selector: selector.clone(),
+            encode_selector: selector.clone(),
             bootstrap_port_annotation: "custom.io/port".to_string(),
         };
 
@@ -1157,7 +1196,8 @@ mod tests {
                 check_interval_secs: 120,
                 selector: selectors.clone(),
                 prefill_selector: selectors.clone(),
-                decode_selector: selectors,
+                decode_selector: selectors.clone(),
+                encode_selector: selectors,
                 bootstrap_port_annotation: "mycompany.io/bootstrap".to_string(),
             })
             .enable_metrics("::", 9999) // IPv6 any

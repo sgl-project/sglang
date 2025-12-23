@@ -322,14 +322,14 @@ def _log_and_assert_gpu_thresholds(
     )
 
     if mean_th is not None:
-        assert mean_v >= float(
-            mean_th
-        ), f"GPU utilization mean below threshold: {mean_v:.2f}% < {mean_th}%"
+        assert mean_v >= float(mean_th), (
+            f"GPU utilization mean below threshold: {mean_v:.2f}% < {mean_th}%"
+        )
     if p50_th is not None and p50_v is not None:
         p50_f = float(p50_v)
-        assert p50_f >= float(
-            p50_th
-        ), f"GPU utilization p50 below threshold: {p50_f:.2f}% < {p50_th}%"
+        assert p50_f >= float(p50_th), (
+            f"GPU utilization p50 below threshold: {p50_f:.2f}% < {p50_th}%"
+        )
 
 
 def _gpu_monitor_proc_entry(bench_pid: int, out_file: str, interval: float) -> None:
@@ -639,18 +639,18 @@ def genai_bench_runner() -> Callable[..., None]:
                 )
 
                 if th is not None:
-                    assert (
-                        ttft_mean <= th["ttft_mean_max"]
-                    ), f"TTFT validation failed: {ttft_mean} > {th['ttft_mean_max']} (file={jf.name})"
-                    assert (
-                        e2e_latency_mean <= th["e2e_latency_mean_max"]
-                    ), f"E2E latency validation failed: {e2e_latency_mean} > {th['e2e_latency_mean_max']} (file={jf.name})"
-                    assert (
-                        input_tp_mean >= th["input_throughput_mean_min"]
-                    ), f"Input throughput validation failed: {input_tp_mean} < {th['input_throughput_mean_min']} (file={jf.name})"
-                    assert (
-                        output_tp_mean >= th["output_throughput_mean_min"]
-                    ), f"Output throughput validation failed: {output_tp_mean} < {th['output_throughput_mean_min']} (file={jf.name})"
+                    assert ttft_mean <= th["ttft_mean_max"], (
+                        f"TTFT validation failed: {ttft_mean} > {th['ttft_mean_max']} (file={jf.name})"
+                    )
+                    assert e2e_latency_mean <= th["e2e_latency_mean_max"], (
+                        f"E2E latency validation failed: {e2e_latency_mean} > {th['e2e_latency_mean_max']} (file={jf.name})"
+                    )
+                    assert input_tp_mean >= th["input_throughput_mean_min"], (
+                        f"Input throughput validation failed: {input_tp_mean} < {th['input_throughput_mean_min']} (file={jf.name})"
+                    )
+                    assert output_tp_mean >= th["output_throughput_mean_min"], (
+                        f"Output throughput validation failed: {output_tp_mean} < {th['output_throughput_mean_min']} (file={jf.name})"
+                    )
 
             # Validate optional GPU utilization threshold if provided
             if want_gpu_monitor:
@@ -689,6 +689,9 @@ def genai_bench_runner() -> Callable[..., None]:
 
 def pytest_configure(config):
     config.addinivalue_line("markers", "e2e: mark as end-to-end test")
+    config.addinivalue_line(
+        "markers", "epd: EPD (Encode-Prefill-Decode) disaggregation tests"
+    )
 
 
 @pytest.fixture(scope="session")

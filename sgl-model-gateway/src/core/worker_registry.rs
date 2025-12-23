@@ -227,10 +227,18 @@ impl WorkerRegistry {
             .iter()
             .filter_map(|entry| {
                 let worker = entry.value();
-                match worker.worker_type() {
-                    WorkerType::Prefill { .. } => Some(worker.clone()),
-                    _ => None,
-                }
+                matches!(worker.worker_type(), WorkerType::Prefill { .. }).then_some(worker.clone())
+            })
+            .collect()
+    }
+
+    /// Get all encode workers
+    pub fn get_encode_workers(&self) -> Vec<Arc<dyn Worker>> {
+        self.workers
+            .iter()
+            .filter_map(|entry| {
+                let worker = entry.value();
+                matches!(worker.worker_type(), WorkerType::Encode { .. }).then_some(worker.clone())
             })
             .collect()
     }
@@ -377,6 +385,7 @@ impl WorkerRegistry {
         let mut regular_count = 0;
         let mut prefill_count = 0;
         let mut decode_count = 0;
+        let mut encode_count = 0;
 
         // Iterate DashMap directly to avoid cloning all workers via get_all()
         for entry in self.workers.iter() {
@@ -390,6 +399,7 @@ impl WorkerRegistry {
                 WorkerType::Regular => regular_count += 1,
                 WorkerType::Prefill { .. } => prefill_count += 1,
                 WorkerType::Decode => decode_count += 1,
+                WorkerType::Encode { .. } => encode_count += 1,
             }
         }
 
@@ -401,6 +411,7 @@ impl WorkerRegistry {
             regular_workers: regular_count,
             prefill_workers: prefill_count,
             decode_workers: decode_count,
+            encode_workers: encode_count,
         }
     }
 
@@ -487,6 +498,7 @@ pub struct WorkerRegistryStats {
     pub healthy_workers: usize,
     pub total_load: usize,
     pub regular_workers: usize,
+    pub encode_workers: usize,
     pub prefill_workers: usize,
     pub decode_workers: usize,
 }
