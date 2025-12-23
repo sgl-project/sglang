@@ -235,19 +235,6 @@ impl RouterManager {
             }
         }
 
-        // Multi-router mode logic follows
-        let _priority_threshold = headers.and_then(|h| {
-            h.get("x-worker-priority")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|s| s.parse::<u32>().ok())
-        });
-
-        let _max_cost = headers.and_then(|h| {
-            h.get("x-max-cost")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|s| s.parse::<f32>().ok())
-        });
-
         let prefer_pd = headers
             .and_then(|h| {
                 h.get("x-prefer-pd")
@@ -260,12 +247,14 @@ impl RouterManager {
         let mut best_router = None;
         let mut best_score = -1.0;
 
+        // Extract router validity check into a closure to reduce redundancy
+        let is_router_valid =
+            |is_pd: bool| (is_pd && num_pd_workers > 0) || (!is_pd && num_regular_workers > 0);
+
         if let Some(model) = model_id {
             // Efficient Single Lookup for Specific Model
             if let Some(router) = self.get_router_for_model(model) {
-                let is_pd = router.is_pd_mode();
-                let valid = (is_pd && num_pd_workers > 0) || (!is_pd && num_regular_workers > 0);
-                if valid {
+                if is_router_valid(router.is_pd_mode()) {
                     return Some(router);
                 }
             }
@@ -282,15 +271,12 @@ impl RouterManager {
                 } else if !prefer_pd && !is_pd {
                     score += 1.0;
                 }
-
                 // TODO: Once routers expose worker stats, we can evaluate:
                 // - Average worker priority vs priority_threshold
                 // - Average worker cost vs max_cost
                 // - Current load and health status
 
-                let valid_router =
-                    (is_pd && num_pd_workers > 0) || (!is_pd && num_regular_workers > 0);
-                if score > best_score && valid_router {
+                if score > best_score && is_router_valid(is_pd) {
                     best_score = score;
                     best_router = Some(Arc::clone(router));
                 }
