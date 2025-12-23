@@ -6,6 +6,7 @@
 
 use std::sync::Arc;
 
+use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use axum::{
     body::Body,
@@ -50,6 +51,7 @@ impl RouterId {
 pub struct RouterManager {
     worker_registry: Arc<WorkerRegistry>,
     routers: Arc<DashMap<RouterId, Arc<dyn RouterTrait>>>,
+    routers_snapshot: ArcSwap<Vec<Arc<dyn RouterTrait>>>,
     default_router: Arc<std::sync::RwLock<Option<RouterId>>>,
     enable_igw: bool,
 }
@@ -59,6 +61,7 @@ impl RouterManager {
         Self {
             worker_registry,
             routers: Arc::new(DashMap::new()),
+            routers_snapshot: ArcSwap::from_pointee(Vec::new()),
             default_router: Arc::new(std::sync::RwLock::new(None)),
             enable_igw: false, // Will be set properly in from_config
         }
@@ -163,6 +166,10 @@ impl RouterManager {
 
     pub fn register_router(&self, id: RouterId, router: Arc<dyn RouterTrait>) {
         self.routers.insert(id.clone(), router);
+
+        // Update the lock-free snapshot for fast per-request iteration
+        let new_snapshot: Vec<_> = self.routers.iter().map(|e| e.value().clone()).collect();
+        self.routers_snapshot.store(Arc::new(new_snapshot));
 
         let mut default_router = self.default_router.write().unwrap();
         if default_router.is_none() {
@@ -274,19 +281,6 @@ impl RouterManager {
             }
         }
 
-        // Multi-router mode logic follows
-        let _priority_threshold = headers.and_then(|h| {
-            h.get("x-worker-priority")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|s| s.parse::<u32>().ok())
-        });
-
-        let _max_cost = headers.and_then(|h| {
-            h.get("x-max-cost")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|s| s.parse::<f32>().ok())
-        });
-
         let prefer_pd = headers
             .and_then(|h| {
                 h.get("x-prefer-pd")
@@ -295,49 +289,43 @@ impl RouterManager {
             })
             .unwrap_or(false);
 
-        let candidate_routers = if let Some(model) = model_id {
+        let (num_regular_workers, num_pd_workers) = self.worker_registry.get_worker_distribution();
+        let mut best_router = None;
+        let mut best_score = -1.0;
+
+        // Extract router validity check into a closure to reduce redundancy
+        let is_router_valid =
+            |is_pd: bool| (is_pd && num_pd_workers > 0) || (!is_pd && num_regular_workers > 0);
+
+        if let Some(model) = model_id {
+            // Efficient Single Lookup for Specific Model
             if let Some(router) = self.get_router_for_model(model) {
-                vec![router]
-            } else {
-                Vec::new()
+                if is_router_valid(router.is_pd_mode()) {
+                    return Some(router);
+                }
             }
         } else {
-            self.routers
-                .iter()
-                .map(|entry| entry.value().clone())
-                .collect::<Vec<_>>()
-        };
+            // ZERO-ALLOCATION Snapshot Iteration (Hot Path Optimization)
+            // Atomic load avoids heap allocations and DashMap shard locks per-request
+            let routers_snapshot = self.routers_snapshot.load();
+            for router in routers_snapshot.iter() {
+                let mut score = 1.0;
 
-        if candidate_routers.is_empty() {
-            return None;
-        }
+                let is_pd = router.is_pd_mode();
+                if prefer_pd && is_pd {
+                    score += 2.0;
+                } else if !prefer_pd && !is_pd {
+                    score += 1.0;
+                }
+                // TODO: Once routers expose worker stats, we can evaluate:
+                // - Average worker priority vs priority_threshold
+                // - Average worker cost vs max_cost
+                // - Current load and health status
 
-        let mut best_router = None;
-        let mut best_score = 0.0;
-
-        //  Uses O(1) lookups instead of allocating a full vector of workers via get_all()
-        let (num_regular_workers, num_pd_workers) = self.worker_registry.get_worker_distribution();
-
-        for router in candidate_routers {
-            let mut score = 1.0;
-
-            let is_pd = router.is_pd_mode();
-            if prefer_pd && is_pd {
-                score += 2.0;
-            } else if !prefer_pd && !is_pd {
-                score += 1.0;
-            }
-
-            // TODO: Once routers expose worker stats, we can evaluate:
-            // - Average worker priority vs priority_threshold
-            // - Average worker cost vs max_cost
-            // - Current load and health status
-
-            let valid_router = (router.is_pd_mode() && num_pd_workers > 0)
-                || (!router.is_pd_mode() && num_regular_workers > 0);
-            if score > best_score && valid_router {
-                best_score = score;
-                best_router = Some(router);
+                if score > best_score && is_router_valid(is_pd) {
+                    best_score = score;
+                    best_router = Some(Arc::clone(router));
+                }
             }
         }
 
