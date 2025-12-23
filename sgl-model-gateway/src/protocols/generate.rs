@@ -90,6 +90,10 @@ pub struct GenerateRequest {
     #[serde(default)]
     pub return_hidden_states: bool,
 
+    /// Return routed experts information
+    #[serde(default)]
+    pub return_routed_experts: bool,
+
     /// The modalities of the image data [image, multi-images, video]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub modalities: Option<Vec<String>>,

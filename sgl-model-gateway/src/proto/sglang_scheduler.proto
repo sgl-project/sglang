@@ -130,6 +130,9 @@ message GenerateRequest {
 
   // Whether client wants streaming response
   bool stream = 17;
+
+  // Return routed experts information
+  bool return_routed_experts = 18;
 }
 
 message TokenizedInput {
