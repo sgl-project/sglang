@@ -350,7 +350,7 @@ class Envs:
     SGLANG_MM_ITEM_MEM_POOL_RECYCLE_INTERVAL_SEC = EnvFloat(0.05)
 
     # MM splitting behavior control
-    SGLANG_ENABLE_MM_SPLITTING = EnvBool(True)
+    SGLANG_ENABLE_MM_SPLITTING = EnvBool(False)
 
     # Release & Resume Memory
     SGLANG_MEMORY_SAVER_CUDA_GRAPH = EnvBool(False)
