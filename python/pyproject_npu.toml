@@ -101,8 +101,10 @@ test = [
   "sentence_transformers",
   "tabulate",
 ]
-all_npu = ["sglang[srt_npu, diffusion]"]
 
+# https://docs.sglang.io/platforms/ascend_npu.html
+srt_npu = ["sglang[runtime_common]"]
+all_npu = ["sglang[srt_npu, diffusion]"]
 dev_npu = ["sglang[all_npu]", "sglang[test]"]
 
 [project.urls]
