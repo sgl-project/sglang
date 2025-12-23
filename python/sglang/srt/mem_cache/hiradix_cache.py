@@ -44,7 +44,7 @@ class HiRadixCache(RadixCache):
                     "Page first layout is not supported with direct IO backend, switching to page first direct layout"
                 )
 
-        if server_args.hicache_numa_detect and torch.cuda.is_available():
+        if not server_args.disable_hicache_numa_detect and torch.cuda.is_available():
             bind_to_closest_numa_node()
 
         self.page_size = params.page_size

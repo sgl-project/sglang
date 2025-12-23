@@ -3446,16 +3446,23 @@ def check_cuda_result(raw_output):
 def get_physical_device_id(pytorch_device_id: int) -> int:
     """
     Convert PyTorch logical device ID to physical device ID.
+    
+    When CUDA_VISIBLE_DEVICES is set, maps the logical device ID (as seen by PyTorch)
+    to the actual physical device ID. If CUDA_VISIBLE_DEVICES is not set, returns
+    the device ID unchanged.
+    
+    Args:
+        pytorch_device_id: The logical device ID from PyTorch (e.g., torch.cuda.current_device())
+        
+    Returns:
+        The physical device ID
     """
     cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES", None)
-    assert (
-        cuda_visible_devices is not None
-    ), "CUDA_VISIBLE_DEVICES should be set in a scheduler"
-    device_list = cuda_visible_devices.split(",")
-    assert (
-        len(device_list) == 1
-    ), "CUDA_VISIBLE_DEVICES should be set to a single device in a scheduler"
-    return int(device_list[0])
+    if cuda_visible_devices:
+        device_list = cuda_visible_devices.split(",")
+        return int(device_list[pytorch_device_id])
+    else:
+        return pytorch_device_id
 
 
 def get_device_sm_nvidia_smi():
@@ -3791,11 +3798,12 @@ def get_current_device_numa_node() -> int:
     """
     import torch
 
-    device_id = torch.cuda.current_device()
+    logical_device_id = torch.cuda.current_device()
+    physical_device_id = get_physical_device_id(logical_device_id)
 
     try:
         result = subprocess.run(
-            ["nvidia-smi", "topo", "-C", "-i", str(device_id)],
+            ["nvidia-smi", "topo", "-C", "-i", str(physical_device_id)],
             capture_output=True,
             text=True,
             check=True,
