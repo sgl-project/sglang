@@ -955,6 +955,7 @@ class Scheduler(
                 hf_config=self.model_config.hf_config,
                 tp_rank=self.tp_rank,
                 pp_rank=self.pp_rank,
+                tp_group=self.tp_group,
             )
 
     def init_overlap(self):
@@ -1239,6 +1240,14 @@ class Scheduler(
                 src=self.tp_group.ranks[0],
             )
 
+        # Process MM requests under EPD-disaggregation mode
+        if (
+            self.pp_rank == 0
+            and self.server_args.language_only
+            and self.server_args.encoder_transfer_backend == "zmq_to_scheduler"
+        ):
+            recv_reqs = self.mm_receiver.process_waiting_requests(recv_reqs)
+
         if self.enable_trace:
             for req in recv_reqs:
                 if isinstance(
@@ -1279,12 +1288,6 @@ class Scheduler(
         return work_reqs, control_reqs
 
     def process_input_requests(self, recv_reqs: List):
-        # Process MM requests under EPD-disaggregation mode
-        if (
-            self.server_args.language_only
-            and self.server_args.encoder_transfer_backend == "zmq_to_scheduler"
-        ):
-            recv_reqs = self.mm_receiver.process_waiting_requests(recv_reqs)
 
         for recv_req in recv_reqs:
             # If it is a health check generation request and there are running requests, ignore it.
