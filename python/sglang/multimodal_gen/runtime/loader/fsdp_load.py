@@ -247,6 +247,8 @@ def load_model_from_full_model_state_dict(
         NotImplementedError: If got FSDP with more than 1D.
     """
     meta_sd = model.state_dict()
+    # Build a dict of parameter names to actual Parameter objects
+    param_dict = dict(model.named_parameters())
     sharded_sd = {}
     custom_param_sd, reverse_param_names_mapping = hf_to_custom_state_dict(
         full_sd_iterator, param_names_mapping
@@ -259,17 +261,17 @@ def load_model_from_full_model_state_dict(
             )
         if not hasattr(meta_sharded_param, "device_mesh"):
             full_tensor = full_tensor.to(device=device, dtype=param_dtype)
-            # Check if parameter has a weight_loader for TP sharding
-            weight_loader = getattr(meta_sharded_param, "weight_loader", None)
+            # Get the actual Parameter object to access weight_loader
+            actual_param = param_dict.get(target_param_name)
+            weight_loader = getattr(actual_param, "weight_loader", None) if actual_param is not None else None
             if weight_loader is not None:
                 # Use weight_loader for TP sharding
-                # Create a temporary parameter with the correct shape
                 sharded_tensor = torch.empty_like(meta_sharded_param, device=device, dtype=param_dtype)
                 temp_param = nn.Parameter(sharded_tensor)
-                # Copy attributes from meta param
+                # Copy attributes from actual param
                 for attr in ["output_dim", "input_dim", "is_sharded_weight"]:
-                    if hasattr(meta_sharded_param, attr):
-                        setattr(temp_param, attr, getattr(meta_sharded_param, attr))
+                    if hasattr(actual_param, attr):
+                        setattr(temp_param, attr, getattr(actual_param, attr))
                 # Call weight_loader to shard the weight
                 weight_loader(temp_param, full_tensor)
                 sharded_tensor = temp_param.data
