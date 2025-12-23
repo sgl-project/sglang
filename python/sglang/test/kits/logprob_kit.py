@@ -5,7 +5,8 @@ import requests
 import torch
 from transformers import AutoTokenizer
 
-from sglang.test.runners import HFRunner
+from sglang.srt.utils.common import kill_process_tree
+from sglang.test.runners import HFRunner, ModelOutput, check_close_model_outputs
 from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -19,7 +20,7 @@ def run_hf_logprob(
     max_new_tokens: int,
     token_ids_logprob: List[int],
     torch_dtype: torch.dtype,
-) -> Dict[str, Any]:
+) -> ModelOutput:
     with HFRunner(
         model_path,
         torch_dtype=torch_dtype,
@@ -89,7 +90,12 @@ class LogprobTestBase(CustomTestCase):
             "logprob_start_len": 0,
         }
         res = requests.post(base_url + "/generate", json=payload).json()
-        return res
+        kill_process_tree(process.pid)
+
+        output_strs = [choice["text"] for choice in res]
+        output_ids = [choice["output_ids"] for choice in res]
+        output = ModelOutput(output_strs=output_strs, output_ids=output_ids)
+        return output
 
 
 if __name__ == "__main__":
@@ -99,7 +105,16 @@ if __name__ == "__main__":
 
     testcase = LogprobTestLlama()
     testcase.setUpClass()
-    # hf_output = testcase.get_hf_logprob_outputs()
-    # print(f"{hf_output=}")
+    hf_output = testcase.get_hf_logprob_outputs()
+    print(f"{hf_output=}")
     sglang_output = testcase.get_sglang_logprob_outputs()
     print(f"{sglang_output=}")
+
+    check_close_model_outputs(
+        hf_outputs=hf_output,
+        srt_outputs=sglang_output,
+        prefill_tolerance=1e-4,
+        decode_tolerance=1e-4,
+        rouge_l_tolerance=1e-4,
+        debug_text="LogprobTestLlama",
+    )
