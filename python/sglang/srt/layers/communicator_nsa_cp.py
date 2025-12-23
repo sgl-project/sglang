@@ -19,8 +19,8 @@ from typing import Callable, Optional
 import torch
 
 from sglang.srt.layers.attention.nsa.utils import (
-    enable_prefill_cp,
     is_nsa_enable_prefill_cp,
+    nsa_use_prefill_cp,
 )
 from sglang.srt.layers.communicator import (
     CommunicateContext,
@@ -151,7 +151,7 @@ class NSACPCommunicateWithAllReduceAndLayerNormFn(
             hidden_states, residual = layernorm(hidden_states, residual)
         # for prefill: attn tp scattered -> full
         # for decode: attn tp full -> full
-        if enable_prefill_cp(forward_batch):
+        if nsa_use_prefill_cp(forward_batch):
             assert context.attn_dp_size == 1
             hidden_states, local_hidden_states = (
                 get_local_dp_buffer(),
@@ -200,7 +200,7 @@ class NSACPCommunicateSummableTensorPairFn(CommunicateSummableTensorPairFn):
     ):
         # for prefill: full -> attn tp scattered
         # for decode: full -> attn tp full
-        if enable_prefill_cp(forward_batch):
+        if nsa_use_prefill_cp(forward_batch):
             assert context.attn_dp_size == 1
             input_hidden_states = hidden_states
             hidden_states = hidden_states.tensor_split(context.attn_tp_size)[
