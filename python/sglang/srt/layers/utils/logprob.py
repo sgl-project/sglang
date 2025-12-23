@@ -348,12 +348,17 @@ def add_logprob_values(
     num_tokens_per_req = [accept + 1 for accept in accept_length_per_req_cpu]
 
     # We should repeat top_logprobs_nums to match num_tokens_per_req.
-    top_logprobs_nums_repeat_interleaved = []
-    token_ids_logprobs_repeat_interleaved = []
-    for num, num_tokens in zip(top_logprobs_nums, num_tokens_per_req):
-        top_logprobs_nums_repeat_interleaved.extend([num] * num_tokens)
-    for token_ids, num_tokens in zip(token_ids_logprobs, num_tokens_per_req):
-        token_ids_logprobs_repeat_interleaved.extend([token_ids] * num_tokens)
+    top_logprobs_nums_repeat_interleaved = [
+        num
+        for num, num_tokens in zip(top_logprobs_nums, num_tokens_per_req)
+        for _ in range(num_tokens)
+    ]
+
+    token_ids_logprobs_repeat_interleaved = [
+        token_ids
+        for token_ids, num_tokens in zip(token_ids_logprobs, num_tokens_per_req)
+        for _ in range(num_tokens)
+    ]
 
     # Extract logprobs
     if any(x > 0 for x in top_logprobs_nums):
@@ -383,16 +388,14 @@ def add_logprob_values(
     pt = 0
     next_token_logprobs = logits_output.next_token_logprobs.tolist()
     verified_ids = batch_next_token_ids.tolist()
+    token_top_logprobs_val = logits_output.next_token_top_logprobs_val
+    token_top_logprobs_idx = logits_output.next_token_top_logprobs_idx
     for req, num_tokens in zip(batch.reqs, num_tokens_per_req, strict=True):
         for _ in range(num_tokens):
             if req.return_logprob:
                 req.output_token_logprobs_val.append(next_token_logprobs[pt])
                 req.output_token_logprobs_idx.append(verified_ids[pt])
                 if req.top_logprobs_num > 0:
-                    req.output_top_logprobs_val.append(
-                        logits_output.next_token_top_logprobs_val[pt]
-                    )
-                    req.output_top_logprobs_idx.append(
-                        logits_output.next_token_top_logprobs_idx[pt]
-                    )
+                    req.output_top_logprobs_val.append(token_top_logprobs_val[pt])
+                    req.output_top_logprobs_idx.append(token_top_logprobs_idx[pt])
             pt += 1
