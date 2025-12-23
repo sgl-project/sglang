@@ -208,11 +208,11 @@ class FluxSingleTransformerBlock(nn.Module):
 
         self.norm = AdaLayerNormZeroSingle(dim)
         self.proj_mlp = ColumnParallelLinear(
-            dim, self.mlp_hidden_dim, bias=True, gather_output=False
+            dim, self.mlp_hidden_dim, bias=True, gather_output=True
         )
         self.act_mlp = nn.GELU(approximate="tanh")
-        self.proj_out = RowParallelLinear(
-            dim + self.mlp_hidden_dim, dim, bias=True, input_is_parallel=True
+        self.proj_out = ColumnParallelLinear(
+            dim + self.mlp_hidden_dim, dim, bias=True, gather_output=True
         )
 
         self.attn = FluxAttention(
@@ -453,11 +453,11 @@ class FluxTransformer2DModel(CachableDiT):
         self.norm_out = AdaLayerNormContinuous(
             self.inner_dim, self.inner_dim, elementwise_affine=False, eps=1e-6
         )
-        self.proj_out = RowParallelLinear(
+        self.proj_out = ColumnParallelLinear(
             self.inner_dim,
             self.config.patch_size * self.config.patch_size * self.out_channels,
             bias=True,
-            input_is_parallel=True,
+            gather_output=True,
         )
 
     def forward(
