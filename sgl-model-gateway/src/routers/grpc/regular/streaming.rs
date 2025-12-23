@@ -39,7 +39,6 @@ use crate::{
 /// Shared streaming processor for both single and dual dispatch modes
 #[derive(Clone)]
 pub struct StreamingProcessor {
-    tokenizer: Arc<dyn Tokenizer>,
     tool_parser_factory: ToolParserFactory,
     reasoning_parser_factory: ReasoningParserFactory,
     configured_tool_parser: Option<String>,
@@ -58,7 +57,6 @@ struct GenerateStreamContext {
 
 impl StreamingProcessor {
     pub fn new(
-        tokenizer: Arc<dyn Tokenizer>,
         tool_parser_factory: ToolParserFactory,
         reasoning_parser_factory: ReasoningParserFactory,
         configured_tool_parser: Option<String>,
@@ -66,7 +64,6 @@ impl StreamingProcessor {
         backend_type: &'static str,
     ) -> Self {
         Self {
-            tokenizer,
             tool_parser_factory,
             reasoning_parser_factory,
             configured_tool_parser,
@@ -89,6 +86,7 @@ impl StreamingProcessor {
         execution_result: context::ExecutionResult,
         chat_request: Arc<ChatCompletionRequest>,
         dispatch: context::DispatchMetadata,
+        tokenizer: Arc<dyn Tokenizer>,
     ) -> Response {
         use bytes::Bytes;
         use tokio::sync::mpsc;
@@ -108,11 +106,13 @@ impl StreamingProcessor {
             context::ExecutionResult::Single { stream } => {
                 let processor = self.clone();
                 let dispatch_clone = dispatch.clone();
+                let tokenizer_clone = tokenizer.clone();
                 tokio::spawn(async move {
                     let result = processor
                         .process_streaming_chunks(
                             stream,
                             dispatch_clone,
+                            tokenizer_clone,
                             stop_params,
                             chat_request,
                             &tx,
@@ -137,12 +137,14 @@ impl StreamingProcessor {
             }
             context::ExecutionResult::Dual { prefill, decode } => {
                 let processor = self.clone();
+                let tokenizer_clone = tokenizer.clone();
                 tokio::spawn(async move {
                     let result = processor
                         .process_dual_streaming_chunks(
                             prefill,
                             *decode,
                             dispatch,
+                            tokenizer_clone,
                             stop_params,
                             chat_request,
                             &tx,
@@ -176,6 +178,7 @@ impl StreamingProcessor {
         &self,
         mut grpc_stream: ProtoStream,
         dispatch: context::DispatchMetadata,
+        tokenizer: Arc<dyn Tokenizer>,
         stop_params: (Option<StringOrArray>, Option<Vec<u32>>, bool, bool),
         original_request: Arc<ChatCompletionRequest>,
         tx: &UnboundedSender<Result<Bytes, io::Error>>,
@@ -285,7 +288,7 @@ impl StreamingProcessor {
                         let (ref stop, ref stop_token_ids, skip_special_tokens, no_stop_trim) =
                             stop_params;
                         utils::create_stop_decoder(
-                            &self.tokenizer,
+                            &tokenizer,
                             stop.as_ref(),
                             stop_token_ids.as_ref(),
                             skip_special_tokens,
@@ -303,10 +306,7 @@ impl StreamingProcessor {
 
                     // Process logprobs if present
                     let choice_logprobs = if let Some(proto_logprobs) = chunk.output_logprobs() {
-                        match utils::convert_proto_to_openai_logprobs(
-                            proto_logprobs,
-                            &self.tokenizer,
-                        ) {
+                        match utils::convert_proto_to_openai_logprobs(proto_logprobs, &tokenizer) {
                             Ok(logprobs) => Some(logprobs),
                             Err(e) => {
                                 warn!("Failed to process logprobs: {}", e);
@@ -591,11 +591,13 @@ impl StreamingProcessor {
     }
 
     /// Process dual streaming chunks (prefill + decode) - PD mode
+    #[allow(clippy::too_many_arguments)]
     pub async fn process_dual_streaming_chunks(
         &self,
         mut prefill_stream: ProtoStream,
         decode_stream: ProtoStream,
         dispatch: context::DispatchMetadata,
+        tokenizer: Arc<dyn Tokenizer>,
         stop_params: (Option<StringOrArray>, Option<Vec<u32>>, bool, bool),
         original_request: Arc<ChatCompletionRequest>,
         tx: &UnboundedSender<Result<Bytes, io::Error>>,
@@ -621,7 +623,14 @@ impl StreamingProcessor {
         // Phase 2-5: Process decode stream (same as single mode)
         // Note: decode_stream will be marked completed inside process_streaming_chunks
         let result = self
-            .process_streaming_chunks(decode_stream, dispatch, stop_params, original_request, tx)
+            .process_streaming_chunks(
+                decode_stream,
+                dispatch,
+                tokenizer,
+                stop_params,
+                original_request,
+                tx,
+            )
             .await;
 
         // Mark prefill stream as completed AFTER decode completes successfully
@@ -644,6 +653,7 @@ impl StreamingProcessor {
         execution_result: context::ExecutionResult,
         generate_request: Arc<GenerateRequest>,
         dispatch: context::DispatchMetadata,
+        tokenizer: Arc<dyn Tokenizer>,
     ) -> Response {
         // Create SSE channel
         let (tx, rx) = mpsc::unbounded_channel::<Result<Bytes, io::Error>>();
@@ -663,7 +673,7 @@ impl StreamingProcessor {
         // Spawn background task based on execution mode
         match execution_result {
             context::ExecutionResult::Single { stream } => {
-                let tokenizer = self.tokenizer.clone();
+                let tokenizer = tokenizer.clone();
                 tokio::spawn(async move {
                     let result =
                         Self::process_generate_streaming(tokenizer, stream, ctx, &tx).await;
@@ -677,7 +687,8 @@ impl StreamingProcessor {
                 });
             }
             context::ExecutionResult::Dual { prefill, decode } => {
-                let tokenizer = self.tokenizer.clone();
+                // For PD mode, need to handle prefill stream for input_logprobs
+                let tokenizer = tokenizer.clone();
                 tokio::spawn(async move {
                     let result = Self::process_generate_streaming_dual(
                         tokenizer, prefill, *decode, ctx, &tx,
