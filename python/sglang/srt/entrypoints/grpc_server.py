@@ -441,6 +441,7 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
             bootstrap_host=bootstrap_host,
             bootstrap_port=bootstrap_port,
             bootstrap_room=bootstrap_room,
+            return_routed_experts=grpc_req.return_routed_experts,
         )
 
     def _convert_embed_request(
