@@ -21,13 +21,14 @@ import csv
 import logging
 import os
 import sys
-from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+from tqdm import tqdm
 
 import torch
 import triton
 
 from sglang.srt.layers.tilelang_gemm_wrapper.core.config_loader import DEFAULT_M_VALUES
+from sglang.srt.layers import tilelang_gemm_wrapper
 
 # Optional deep_gemm import
 try:
@@ -81,7 +82,6 @@ def prepare_data(M: int, N: int, K: int):
 
 
 def benchmark_tilelang(
-    wrapper,
     A_fp8: torch.Tensor,
     B_fp8: torch.Tensor,
     A_scale: torch.Tensor,
@@ -90,11 +90,12 @@ def benchmark_tilelang(
     N: int,
     rep: int = 100,
 ) -> Tuple[float, float, float]:
-    """Benchmark TileLang kernel."""
+    """Benchmark TileLang kernel using entrypoint API."""
+    
     C = torch.zeros(M, N, dtype=torch.bfloat16, device="cuda")
     
     def fn():
-        wrapper.gemm(A_fp8, B_fp8, A_scale, B_scale, C)
+        tilelang_gemm_wrapper.gemm_nt_f8f8bf16((A_fp8, A_scale), (B_fp8, B_scale), C)
     
     quantiles = [0.5, 0.2, 0.8]
     try:
@@ -162,18 +163,19 @@ def run_benchmark(
     N: int,
     K: int,
     m_values: List[int],
-    config_dir: Optional[str] = None,
     rep: int = 100,
     output_file: Optional[str] = None,
 ) -> List[Dict]:
     """Run benchmark comparing TileLang vs DeepGEMM vs SGL-Kernel."""
-    from sglang.srt.layers.tilelang_gemm_wrapper.core import TileLangGEMMWrapper
     
-    # Initialize TileLang wrapper
-    wrapper = TileLangGEMMWrapper(config_dir=config_dir)
+    # Check TileLang availability
+    if not tilelang_gemm_wrapper.is_available():
+        logger.error("TileLang GEMM is not available")
+        return []
     
-    # Check if config exists
-    if not wrapper.config_loader.config_exists(N, K):
+    # Check if config exists for this (N, K)
+    available_configs = tilelang_gemm_wrapper.list_available_configs()
+    if (N, K) not in available_configs:
         logger.error(f"Config not found for N={N}, K={K}")
         logger.error(f"Run tuning first: python tune_tilelang_gemm.py --N {N} --K {K}")
         return []
@@ -189,7 +191,7 @@ def run_benchmark(
     
     results = []
     
-    for M in m_values:
+    for M in tqdm(m_values, desc="Benchmarking TileLang"):
         try:
             # Prepare data
             A_fp8, B_fp8, A_scale, B_scale, A_scale_deepgemm = prepare_data(M, N, K)
@@ -197,11 +199,11 @@ def run_benchmark(
             # Benchmark TileLang
             try:
                 tl_ms, _, _ = benchmark_tilelang(
-                    wrapper, A_fp8, B_fp8, A_scale, B_scale, M, N, rep
+                    A_fp8, B_fp8, A_scale, B_scale, M, N, rep
                 )
                 tl_tflops = tflops(M, N, K, tl_ms)
-                info = wrapper.get_kernel_info(M, N, K)
-                kernel_type = info["kernel_type"]
+                info = tilelang_gemm_wrapper.get_kernel_info(M, N, K)
+                kernel_type = info["kernel_type"] if info else "unknown"
             except Exception as e:
                 logger.warning(f"M={M}: TileLang failed: {e}")
                 continue
@@ -298,10 +300,6 @@ def main():
         help=f"M values to benchmark (default: {DEFAULT_M_VALUES})"
     )
     parser.add_argument(
-        "--config-dir", type=str, default=None,
-        help="TileLang config directory"
-    )
-    parser.add_argument(
         "--rep", type=int, default=100,
         help="Benchmark repetitions (default: 100)"
     )
@@ -314,19 +312,17 @@ def main():
     
     if args.all:
         # Benchmark all available configs
-        from sglang.srt.layers.tilelang_gemm_wrapper.core import TileLangGEMMWrapper
-        wrapper = TileLangGEMMWrapper(config_dir=args.config_dir)
-        shapes = wrapper.list_available_configs()
+        shapes = tilelang_gemm_wrapper.list_available_configs()
         
         if not shapes:
             logger.error("No configurations found. Run tuning first.")
             sys.exit(1)
         
         for N, K in sorted(shapes):
-            run_benchmark(N, K, args.m_values, args.config_dir, args.rep, args.output)
+            run_benchmark(N, K, args.m_values, args.rep, args.output)
     
     elif args.N and args.K:
-        run_benchmark(args.N, args.K, args.m_values, args.config_dir, args.rep, args.output)
+        run_benchmark(args.N, args.K, args.m_values, args.rep, args.output)
     
     else:
         parser.error("Either --N and --K, or --all must be specified")

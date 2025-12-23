@@ -5,6 +5,7 @@ Output: C (N, M) transposed
 """
 import tilelang
 import tilelang.language as T
+from tilelang import tvm as tvm
 
 
 @tilelang.jit
@@ -23,6 +24,7 @@ def kernel_factory(
     c_scale_local=False,
     b_scale_shm=False,
 ):
+    N = tvm.te.var("n")
     group_size = 128
     A_scale_shape = (T.ceildiv(M, group_size), T.ceildiv(K, group_size))
     B_scale_shape = (N, T.ceildiv(K, group_size))

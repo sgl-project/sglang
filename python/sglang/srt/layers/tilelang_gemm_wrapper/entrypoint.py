@@ -1,6 +1,6 @@
 """TileLang GEMM Wrapper entry point."""
 import logging
-from typing import List, Optional, Tuple
+from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 
@@ -8,6 +8,9 @@ from sglang.srt.layers.tilelang_gemm_wrapper.configurer import (
     ENABLE_TILELANG_GEMM,
     TILELANG_GEMM_CONFIG_DIR,
 )
+
+if TYPE_CHECKING:
+    from sglang.srt.server_args import ServerArgs
 
 try:
     from sglang.srt.entrypoints.warmup import warmup as warmup_decorator
@@ -18,36 +21,44 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
-_wrapper = None
 _wrapper_initialized = False
 
 
 def _get_wrapper():
-    """Get or initialize TileLangGEMMWrapper instance."""
-    global _wrapper, _wrapper_initialized
-
-    if _wrapper_initialized:
-        return _wrapper
+    """Get or initialize TileLangGEMMWrapper instance.
+    
+    Uses the global wrapper from core.wrapper to ensure kernel cache is shared
+    with tilelang_execution_hook.
+    """
+    global _wrapper_initialized
 
     if not ENABLE_TILELANG_GEMM:
-        _wrapper_initialized = True
         return None
 
+    if _wrapper_initialized:
+        from sglang.srt.layers.tilelang_gemm_wrapper.core.wrapper import (
+            get_global_wrapper,
+        )
+        return get_global_wrapper()
+
     try:
-        from sglang.srt.layers.tilelang_gemm_wrapper.core import TileLangGEMMWrapper
+        from sglang.srt.layers.tilelang_gemm_wrapper.core.wrapper import (
+            get_global_wrapper,
+            set_global_wrapper_config,
+        )
 
         config_dir = TILELANG_GEMM_CONFIG_DIR if TILELANG_GEMM_CONFIG_DIR else None
-        _wrapper = TileLangGEMMWrapper(config_dir=config_dir)
+        set_global_wrapper_config(config_dir)
+        wrapper = get_global_wrapper()
         logger.info(f"TileLangGEMMWrapper initialized (config_dir={config_dir})")
+        _wrapper_initialized = True
+        return wrapper
     except ImportError as e:
         logger.warning(f"Failed to import TileLangGEMMWrapper: {e}")
-        _wrapper = None
+        return None
     except Exception as e:
         logger.warning(f"Failed to initialize TileLangGEMMWrapper: {e}")
-        _wrapper = None
-
-    _wrapper_initialized = True
-    return _wrapper
+        return None
 
 
 def gemm_nt_f8f8bf16(
@@ -62,6 +73,10 @@ def gemm_nt_f8f8bf16(
         rhs: (B_fp8, B_scale) tuple
         out: (M, N), bfloat16, output buffer
     """
+    from sglang.srt.layers.tilelang_gemm_wrapper.core.wrapper import (
+        tilelang_execution_hook,
+    )
+    
     wrapper = _get_wrapper()
     if wrapper is None:
         raise RuntimeError(
@@ -71,7 +86,10 @@ def gemm_nt_f8f8bf16(
 
     A_fp8, A_scale = lhs
     B_fp8, B_scale = rhs
-    wrapper.gemm(A_fp8, B_fp8, A_scale, B_scale, out)
+    n, k = B_fp8.shape
+    
+    with tilelang_execution_hook(n, k):
+        wrapper.gemm(A_fp8, B_fp8, A_scale, B_scale, out)
 
 
 def warmup(shapes: List[Tuple[int, int, int]]) -> None:
@@ -105,6 +123,14 @@ def clear_cache() -> None:
 def is_available() -> bool:
     """Check if TileLang GEMM is available."""
     return ENABLE_TILELANG_GEMM and _get_wrapper() is not None
+
+
+def update_tilelang_config(gpu_id: int, server_args: "ServerArgs"):
+    """Update TileLang config based on server args (similar to DeepGEMM)."""
+    from sglang.srt.layers.tilelang_gemm_wrapper.core.wrapper import (
+        update_tilelang_config as _update_config,
+    )
+    _update_config(gpu_id, server_args)
 
 
 def list_available_configs() -> List[Tuple[int, int]]:

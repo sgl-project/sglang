@@ -11,7 +11,13 @@ from sglang.srt.layers.tilelang_gemm_wrapper.core.quant_utils import (
     prepare_gemm_inputs,
 )
 from sglang.srt.layers.tilelang_gemm_wrapper.core.tuner import GEMMTuner
-from sglang.srt.layers.tilelang_gemm_wrapper.core.wrapper import TileLangGEMMWrapper
+from sglang.srt.layers.tilelang_gemm_wrapper.core.wrapper import (
+    TileLangGEMMWrapper,
+    get_global_wrapper,
+    set_global_wrapper_config,
+    tilelang_execution_hook,
+    update_tilelang_config,
+)
 
 __all__ = [
     "TileLangGEMMWrapper",
@@ -22,4 +28,8 @@ __all__ = [
     "per_block_cast_to_fp8_weight",
     "prepare_gemm_inputs",
     "GEMMTuner",
+    "get_global_wrapper",
+    "set_global_wrapper_config",
+    "tilelang_execution_hook",
+    "update_tilelang_config",
 ]

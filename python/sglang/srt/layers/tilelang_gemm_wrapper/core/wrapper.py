@@ -1,7 +1,8 @@
 """TileLang GEMM Wrapper - unified calling interface."""
 import logging
 import os
-from typing import Dict, List, Tuple
+from contextlib import contextmanager
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 import torch
 
@@ -11,7 +12,38 @@ from sglang.srt.layers.tilelang_gemm_wrapper.core.kernel_registry import (
     is_registry_available,
 )
 
+if TYPE_CHECKING:
+    from sglang.srt.server_args import ServerArgs
+
 logger = logging.getLogger(__name__)
+
+# Global config (similar to DeepGEMM's _BUILTIN_M_LIST)
+_M_MAX = 1024 * 16  # Default m_max
+_DO_COMPILE_ALL = True
+_INITIALIZATION_DICT: Dict[Tuple[int, int], bool] = dict()
+
+
+def update_tilelang_config(gpu_id: int, server_args: "ServerArgs"):
+    """Update TileLang config based on server args (similar to DeepGEMM).
+    
+    Args:
+        gpu_id: Current GPU ID
+        server_args: Server arguments
+    """
+    global _M_MAX, _DO_COMPILE_ALL
+    
+    # Generate m_max (same logic as DeepGEMM)
+    m_max = 1024 * 16
+    if server_args.chunked_prefill_size < 1:
+        m_max = 1024 * 64
+    elif server_args.chunked_prefill_size > 8192:
+        m_max = server_args.chunked_prefill_size * 2
+    _M_MAX = min(1024 * 128, m_max)
+    
+    # Only first rank on node does compilation
+    _DO_COMPILE_ALL = server_args.base_gpu_id == gpu_id
+    
+    logger.info(f"TileLang config updated: m_max={_M_MAX}, do_compile_all={_DO_COMPILE_ALL}")
 
 
 class TileLangGEMMWrapper:
@@ -66,11 +98,17 @@ class TileLangGEMMWrapper:
         return compile_config
 
     def _get_kernel(self, M: int, N: int, K: int):
-        """Get or compile kernel for given dimensions."""
+        """Get or compile kernel for given dimensions.
+        
+        Finds the closest tuned M config and uses that kernel.
+        Since M is dynamic (tvm.te.var), kernels compiled with tuned_M
+        can handle any actual M value.
+        """
         config = self.config_loader.find_config(M, N, K)
         tuned_M = self.config_loader.get_tuned_M(M, N, K)
         kernel_type = config["kernel_type"]
 
+        # Cache key uses tuned_M (kernel is compiled with dynamic M)
         cache_key = (tuned_M, N, K, kernel_type)
         if cache_key in self._kernel_cache:
             return self._kernel_cache[cache_key]
@@ -79,7 +117,7 @@ class TileLangGEMMWrapper:
         factory = info["factory"]
         compile_config = self._build_compile_config(config, tuned_M, N, K)
 
-        logger.debug(f"Compiling kernel: M={M}, N={N}, K={K}, type={kernel_type}")
+        logger.debug(f"Compiling kernel: tuned_M={tuned_M}, N={N}, K={K}, type={kernel_type}")
         kernel = factory.par_compile([compile_config], num_workers=16)[0]
 
         result = (kernel, config, info)
@@ -150,6 +188,79 @@ class TileLangGEMMWrapper:
             except Exception as e:
                 logger.warning(f"Warmup failed for M={M}, N={N}, K={K}: {e}")
 
+    def warmup_all_m(self, N: int, K: int, m_max: Optional[int] = None) -> None:
+        """Pre-compile all tuned M kernels for specified (N, K).
+        
+        Since M is dynamic (tvm.te.var), we only need to compile kernels for
+        the tuned M values in config. At runtime, any actual M will use the
+        closest tuned_M kernel.
+        Uses parallel compilation for better performance.
+        
+        Args:
+            N: Weight N dimension
+            K: Weight K dimension  
+            m_max: Maximum M value to warmup. If specified, only compile
+                   tuned M values <= m_max.
+        """
+        # Check if config exists for this (N, K)
+        if not self.config_loader.config_exists(N, K):
+            logger.warning(f"No config found for N={N}, K={K}, skipping warmup")
+            return
+        
+        # Get tuned M values from config (not all M from 1 to m_max)
+        tuned_m_values = self.config_loader.get_available_M_values(N, K)
+        
+        # Filter by m_max if specified
+        if m_max is not None:
+            tuned_m_values = [m for m in tuned_m_values if m <= m_max]
+        
+        # Filter out already cached kernels and group by kernel_type for parallel compilation
+        # Structure: {kernel_type: [(cache_key, compile_config, config, info), ...]}
+        to_compile: Dict[str, List[Tuple]] = {}
+        
+        for tuned_M in tuned_m_values:
+            config = self.config_loader.find_config(tuned_M, N, K)
+            kernel_type = config["kernel_type"]
+            
+            # Cache key uses tuned_M (kernel handles dynamic M at runtime)
+            cache_key = (tuned_M, N, K, kernel_type)
+            if cache_key in self._kernel_cache:
+                continue
+            
+            info = get_kernel_factory(kernel_type)
+            compile_config = self._build_compile_config(config, tuned_M, N, K)
+            
+            if kernel_type not in to_compile:
+                to_compile[kernel_type] = []
+            to_compile[kernel_type].append((cache_key, compile_config, config, info))
+        
+        if not to_compile:
+            logger.info(f"TileLang warmup: N={N}, K={K}, all kernels already cached")
+            return
+        
+        total_kernels = sum(len(v) for v in to_compile.values())
+        logger.info(f"TileLang warmup: N={N}, K={K}, compiling {total_kernels} kernels in parallel...")
+        
+        # Parallel compile for each kernel_type
+        for kernel_type, items in to_compile.items():
+            if not items:
+                continue
+            
+            info = items[0][3]  # All items have same info for same kernel_type
+            factory = info["factory"]
+            compile_configs = [item[1] for item in items]
+            
+            try:
+                kernels = factory.par_compile(compile_configs, num_workers=128)
+                
+                # Store compiled kernels in cache
+                for (cache_key, _, config, info), kernel in zip(items, kernels):
+                    self._kernel_cache[cache_key] = (kernel, config, info)
+            except Exception as e:
+                logger.warning(f"Parallel compile failed for kernel_type={kernel_type}: {e}")
+        
+        logger.info(f"TileLang warmup: N={N}, K={K}, compilation complete")
+
     def get_kernel_info(self, M: int, N: int, K: int) -> dict:
         """Get kernel info for given shape (for debugging)."""
         config = self.config_loader.find_config(M, N, K)
@@ -178,3 +289,62 @@ class TileLangGEMMWrapper:
     def list_available_configs(self) -> List[Tuple[int, int]]:
         """List all available (N, K) configurations."""
         return self.config_loader.list_available_configs()
+
+
+# Global wrapper instance for warmup hook
+_global_wrapper: Optional[TileLangGEMMWrapper] = None
+_global_wrapper_config_dir: Optional[str] = None
+
+
+def set_global_wrapper_config(config_dir: Optional[str] = None) -> None:
+    """Set config directory for global wrapper before initialization."""
+    global _global_wrapper_config_dir
+    _global_wrapper_config_dir = config_dir
+
+
+def get_global_wrapper() -> TileLangGEMMWrapper:
+    """Get or create global TileLangGEMMWrapper instance."""
+    global _global_wrapper
+    if _global_wrapper is None:
+        _global_wrapper = TileLangGEMMWrapper(config_dir=_global_wrapper_config_dir)
+    return _global_wrapper
+
+
+def _maybe_compile_tilelang_all(n: int, k: int) -> None:
+    """Compile all M kernels for (N, K) if not already done.
+    
+    Similar to DeepGEMM's _maybe_compile_deep_gemm_one_type_all.
+    """
+    global _INITIALIZATION_DICT
+    
+    cache_key = (n, k)
+    if cache_key in _INITIALIZATION_DICT:
+        return
+    
+    if not _DO_COMPILE_ALL:
+        _INITIALIZATION_DICT[cache_key] = True
+        return
+    
+    wrapper = get_global_wrapper()
+    wrapper.warmup_all_m(n, k, m_max=_M_MAX)
+    _INITIALIZATION_DICT[cache_key] = True
+
+
+@contextmanager
+def tilelang_execution_hook(n: int, k: int):
+    """Pre-compile all M kernels for (N, K) before execution.
+    
+    Similar to DeepGEMM's deep_gemm_execution_hook, this ensures all
+    kernels are compiled before the actual execution begins.
+    
+    Args:
+        n: Weight N dimension
+        k: Weight K dimension
+    
+    Usage:
+        with tilelang_execution_hook(N, K):
+            # All M kernels for (N, K) are now compiled
+            ...
+    """
+    _maybe_compile_tilelang_all(n, k)
+    yield

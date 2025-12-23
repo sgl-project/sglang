@@ -5,6 +5,7 @@ A_scale: (M, K//128) per-token-group, B_scale: (N//128, K//128) per-block
 """
 import tilelang
 import tilelang.language as T
+from tilelang import tvm as tvm
 
 
 @tilelang.jit
@@ -23,6 +24,7 @@ def kernel_factory(
     c_scale_local=False,
     a_scale_shm=False,
 ):
+    M = tvm.te.var("m")
     group_size = 128
     A_scale_shape = (M, T.ceildiv(K, group_size))
     B_scale_shape = (T.ceildiv(N, group_size), T.ceildiv(K, group_size))
