@@ -133,6 +133,8 @@ void per_tensor_quant_fp8(tvm::ffi::TensorView input,
   const size_t num_blocks = std::min((total_elements + kBlockSize - 1) / kBlockSize, size_t(1024));
   const DLDevice device = device_.unwrap();
 
+  RuntimeCheck(total_elements > 0, "Input tensor must be non-empty");
+
   auto launch_kernels = [&]<typename T>() {
     if constexpr (!kIsStatic) {
       LaunchKernel(num_blocks, kBlockSize, device)(
@@ -157,6 +159,8 @@ void per_tensor_quant_fp8(tvm::ffi::TensorView input,
     launch_kernels.template operator()<c10::BFloat16>();
   } else if (dtype.code == kDLFloat && dtype.bits == 16) {
     launch_kernels.template operator()<c10::Half>();
+  } else {
+    RuntimeCheck(false, "Unsupported input dtype");
   }
 }
 
