@@ -23,6 +23,8 @@ ${PIP_INSTALL} --upgrade pip
 # Pin wheel to 0.45.1, REF: https://github.com/pypa/wheel/issues/662
 ${PIP_INSTALL} wheel==0.45.1 pybind11
 
+find / -name "libascend_hal.so"
+
 
 ### Install MemFabric
 ${PIP_INSTALL} mf-adapter==1.0.0
