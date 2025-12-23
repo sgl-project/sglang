@@ -68,20 +68,12 @@ def get_model_weight_shapes(
     num_attention_heads = getattr(config, "num_attention_heads", None)
     num_key_value_heads = getattr(config, "num_key_value_heads", num_attention_heads)
     head_dim = getattr(config, "head_dim", None)
-    vocab_size = getattr(config, "vocab_size", None)
     
     if head_dim is None and hidden_size and num_attention_heads:
         head_dim = hidden_size // num_attention_heads
     
-    # MoE dimensions (for models like DeepSeek)
-    moe_intermediate_size = getattr(config, "moe_intermediate_size", intermediate_size)
-    n_routed_experts = getattr(config, "n_routed_experts", None)
-    
     logger.info(f"Model config: hidden_size={hidden_size}, intermediate_size={intermediate_size}")
-    logger.info(f"  num_attention_heads={num_attention_heads}, num_key_value_heads={num_key_value_heads}")
-    logger.info(f"  head_dim={head_dim}, vocab_size={vocab_size}")
-    if n_routed_experts:
-        logger.info(f"  MoE: n_routed_experts={n_routed_experts}, moe_intermediate_size={moe_intermediate_size}")
+    logger.info(f"  num_attention_heads={num_attention_heads}, num_key_value_heads={num_key_value_heads}, head_dim={head_dim}")
     
     # Calculate shapes with TP
     def add_shape(n: int, k: int, name: str = ""):
@@ -95,13 +87,11 @@ def get_model_weight_shapes(
     if hidden_size:
         # Attention projections (Q, K, V, O)
         if num_attention_heads and head_dim:
-            # Q projection
+            # QKV projection
             q_size = num_attention_heads * head_dim // tp_size
-            add_shape(q_size, hidden_size, "q_proj")
-            
-            # K, V projections
             kv_size = num_key_value_heads * head_dim // tp_size
-            add_shape(kv_size, hidden_size, "k_proj/v_proj")
+            
+            add_shape(q_size + 2 * kv_size, hidden_size, "qkv_proj")
             
             # O projection
             add_shape(hidden_size, num_attention_heads * head_dim // tp_size, "o_proj")
@@ -110,22 +100,13 @@ def get_model_weight_shapes(
         if intermediate_size:
             mlp_size = intermediate_size // tp_size
             # gate_proj, up_proj
-            add_shape(mlp_size, hidden_size, "gate_proj/up_proj")
+            add_shape(mlp_size * 2, hidden_size, "gate_up_proj")
             # down_proj
             add_shape(hidden_size, mlp_size, "down_proj")
         
-        # MoE projections
-        if n_routed_experts and moe_intermediate_size:
-            moe_size = moe_intermediate_size // tp_size
-            add_shape(moe_size, hidden_size, "moe_gate/up_proj")
-            add_shape(hidden_size, moe_size, "moe_down_proj")
-        
-        # LM head
-        if vocab_size:
-            lm_head_size = vocab_size // tp_size
-            add_shape(lm_head_size, hidden_size, "lm_head")
+        #TODO: add MoE projections
     
-    logger.info(f"Extracted {len(shapes)} unique (N, K) shapes")
+    logger.info(f"Extracted {len(shapes)} unique (N, K) shapes: {shapes}")
     return shapes
 
 
