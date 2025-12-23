@@ -280,6 +280,10 @@ def _find_local_hf_snapshot_dir_unlocked(
     if os.path.isdir(model_name_or_path):
         return None
 
+    # Skip cache validation entirely outside CI to avoid unnecessary overhead
+    if not is_in_ci():
+        return None
+
     found_local_snapshot_dir = None
 
     # Check custom cache_dir (if provided)
@@ -428,18 +432,8 @@ def _find_local_hf_snapshot_dir_unlocked(
                         return None
 
     if len(local_weight_files) > 0:
-        log_info_on_rank0(
-            logger,
-            f"Found local HF snapshot for {model_name_or_path} at "
-            f"{found_local_snapshot_dir}; skipping download.",
-        )
         return found_local_snapshot_dir
     else:
-        log_info_on_rank0(
-            logger,
-            f"Local HF snapshot at {found_local_snapshot_dir} has no files matching "
-            f"{allow_patterns}; will attempt download.",
-        )
         return None
 
 
