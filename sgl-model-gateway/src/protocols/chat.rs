@@ -356,6 +356,10 @@ pub struct ChatCompletionRequest {
     #[serde(default)]
     pub return_hidden_states: bool,
 
+    /// Return routed experts information
+    #[serde(default)]
+    pub return_routed_experts: bool,
+
     /// Random seed for sampling for deterministic outputs
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sampling_seed: Option<u64>,
