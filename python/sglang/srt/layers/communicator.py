@@ -30,8 +30,8 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
 from sglang.srt.layers.attention.nsa.utils import (
-    enable_prefill_cp,
     is_nsa_enable_prefill_cp,
+    nsa_use_prefill_cp,
 )
 from sglang.srt.layers.dp_attention import (
     attn_tp_all_gather_into_tensor,
@@ -549,7 +549,7 @@ class LayerCommunicator:
             and forward_batch.dp_padding_mode.is_max_len()
         ):
             return True
-        if enable_prefill_cp(forward_batch):
+        if nsa_use_prefill_cp(forward_batch):
             return True
         if get_attn_tp_context().input_scattered and not self.is_last_layer:
             return True

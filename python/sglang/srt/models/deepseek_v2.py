@@ -63,12 +63,12 @@ from sglang.srt.layers.attention.nsa.utils import (
     cp_all_gather_rerange_output,
     cp_split_and_rebuild_data,
     cp_split_and_rebuild_position,
-    enable_prefill_cp,
     is_nsa_enable_prefill_cp,
+    nsa_use_prefill_cp,
     prepare_input_dp_with_cp_dsa,
 )
-from sglang.srt.layers.attention.trtllm_mla_backend import _concat_mla_absorb_q_general
 from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
+from sglang.srt.layers.attention.trtllm_mla_backend import _concat_mla_absorb_q_general
 from sglang.srt.layers.attention.utils import concat_and_cast_mha_k_triton
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
@@ -575,9 +575,7 @@ class MoEGate(nn.Module):
         if get_global_server_args().enable_deterministic_inference:
             return F.linear(hidden_states, self.weight, None)
 
-        if forward_batch is not None and enable_prefill_cp(
-            forward_batch, self.nsa_enable_prefill_cp
-        ):
+        if forward_batch is not None and nsa_use_prefill_cp(forward_batch):
             logits = F.linear(hidden_states, self.weight, None)
         else:
             # NOTE: For some unknown reason, router_gemm seems degrade accept length.
@@ -2009,7 +2007,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         ):
             q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
 
-        if enable_prefill_cp(forward_batch, self.nsa_enable_prefill_cp):
+        if nsa_use_prefill_cp(forward_batch):
             # support allgather+rerrange
             k_nope, k_pe = self.rebuild_cp_kv_cache(forward_batch, k_nope, k_pe)
         topk_indices = None
@@ -3169,7 +3167,7 @@ class DeepseekV2Model(nn.Module):
             hidden_states = pp_proxy_tensors["hidden_states"]
             residual = pp_proxy_tensors["residual"]
 
-        if enable_prefill_cp(forward_batch, self.nsa_enable_prefill_cp):
+        if nsa_use_prefill_cp(forward_batch):
             if self.pp_group.is_first_rank:
                 hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states)
             positions = cp_split_and_rebuild_position(forward_batch, positions)
@@ -3246,9 +3244,7 @@ class DeepseekV2Model(nn.Module):
                 else:
                     hidden_states, _ = self.norm(hidden_states, residual)
 
-        if self.pp_group.is_last_rank and enable_prefill_cp(
-            forward_batch, self.nsa_enable_prefill_cp
-        ):
+        if self.pp_group.is_last_rank and nsa_use_prefill_cp(forward_batch):
             # allgather + rerrange
             hidden_states = cp_all_gather_rerange_output(
                 hidden_states,

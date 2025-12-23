@@ -73,6 +73,7 @@ def can_nsa_prefill_cp_continuous_split(forward_batch: "ForwardBatch"):
 
 
 def nsa_cp_continuous_split_data(input_: Union[torch.Tensor, List]):
+    # Split the tokens evenly according to the rule of token_idx % cp_size.
     cp_size = get_attention_tp_size()
     cp_rank = get_attention_tp_rank()
     if isinstance(input_, (tuple, list)) or len(input_) % cp_size != 0:
@@ -80,6 +81,22 @@ def nsa_cp_continuous_split_data(input_: Union[torch.Tensor, List]):
         return input_[indices]
     # for torch device tensor
     return input_.view(-1, cp_size, *input_.shape[1:])[:, cp_rank].contiguous()
+
+
+def pad_nsa_cache_seqlens(forward_batch: "ForwardBatch", nsa_cache_seqlens):
+    attn_tp_size = get_attention_tp_size()
+    if attn_tp_size == 1 or not can_nsa_prefill_cp_continuous_split(forward_batch):
+        return nsa_cache_seqlens
+    tokens = sum(forward_batch.extend_seq_lens_cpu)
+    pad_len = (tokens - 1) // attn_tp_size + 1 - nsa_cache_seqlens.shape[0]
+    if pad_len > 0:
+        nsa_cache_seqlens = torch.cat(
+            [
+                nsa_cache_seqlens,
+                nsa_cache_seqlens.new_zeros(pad_len, *nsa_cache_seqlens.shape[1:]),
+            ]
+        )
+    return nsa_cache_seqlens
 
 
 @dataclass
@@ -161,7 +178,22 @@ def cp_split_and_rebuild_position(forward_batch, positions: torch.Tensor):
     return positions
 
 
-def enable_prefill_cp(forward_batch, nsa_enable_prefill_cp=None):
+def nsa_cp_continuous_split_q_seqs(extend_seqs):
+    cp_size = get_attention_tp_size()
+    cp_id = get_attention_tp_rank()
+    extra_seq = 0
+    q_seqs = []
+    for bs, cur_len in enumerate(extend_seqs):
+        cur_len += extra_seq
+        cur_seq = cur_len // cp_size + int(cur_len % cp_size > cp_id)
+        q_seqs.append(cur_seq)
+        extra_seq = cur_len - cur_seq * cp_size
+    bs_idx = list([i for i, x in enumerate(q_seqs) if x > 0])
+    q_seqs = [q_len for q_len in q_seqs if q_len > 0]
+    return q_seqs, bs_idx
+
+
+def nsa_use_prefill_cp(forward_batch, nsa_enable_prefill_cp=None):
     if nsa_enable_prefill_cp is None:
         nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
     if (
