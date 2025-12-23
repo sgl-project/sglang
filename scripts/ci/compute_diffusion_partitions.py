@@ -109,14 +109,14 @@ def load_baselines(path: Path) -> Dict[str, float]:
     baselines = {}
     scenarios = data.get("scenarios", {})
     for case_id, scenario in scenarios.items():
-        # 优先使用 estimated_full_test_time_s
+
         if (
             "estimated_full_test_time_s" in scenario
             and scenario["estimated_full_test_time_s"] is not None
         ):
             baselines[case_id] = scenario["estimated_full_test_time_s"]
         else:
-            # 回退：E2E时间 + 启动开销
+
             expected_e2e_ms = scenario.get("expected_e2e_ms", 0)
             baselines[case_id] = expected_e2e_ms / 1000.0 + STARTUP_OVERHEAD_SECONDS
 
