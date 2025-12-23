@@ -346,7 +346,6 @@ impl SglangSchedulerClient {
             logprob_start_len: -1,
             top_logprobs_num: body.top_logprobs.unwrap_or(0) as i32,
             return_hidden_states: false,
-            return_routed_experts: body.return_routed_experts,
             stream: body.stream.unwrap_or(false),
             ..Default::default()
         };

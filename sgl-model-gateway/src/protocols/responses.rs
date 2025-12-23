@@ -616,10 +616,6 @@ pub struct ResponsesRequest {
     #[serde(default = "default_repetition_penalty")]
     #[validate(range(min = 0.0, max = 2.0))]
     pub repetition_penalty: f32,
-
-    /// Return routed experts information
-    #[serde(default)]
-    pub return_routed_experts: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -663,7 +659,6 @@ impl Default for ResponsesRequest {
             top_k: default_top_k(),
             min_p: 0.0,
             repetition_penalty: default_repetition_penalty(),
-            return_routed_experts: false,
         }
     }
 }
