@@ -549,7 +549,7 @@ class ServerArgs:
     enable_piecewise_cuda_graph: bool = False
     enable_torch_compile_debug_mode: bool = False
     torch_compile_max_bs: int = 32
-    piecewise_cuda_graph_max_tokens: int = 4096
+    piecewise_cuda_graph_max_tokens: Optional[int] = None
     piecewise_cuda_graph_tokens: Optional[List[int]] = None
     piecewise_cuda_graph_compiler: str = "eager"
     torchao_config: str = ""
@@ -896,6 +896,9 @@ class ServerArgs:
             self.cuda_graph_bs = self._generate_cuda_graph_batch_sizes()
         else:
             self.cuda_graph_max_bs = max(self.cuda_graph_bs)
+
+        if self.piecewise_cuda_graph_max_tokens is None:
+            self.piecewise_cuda_graph_max_tokens = self.chunked_prefill_size
 
         if self.piecewise_cuda_graph_tokens is None:
             self.piecewise_cuda_graph_tokens = (
