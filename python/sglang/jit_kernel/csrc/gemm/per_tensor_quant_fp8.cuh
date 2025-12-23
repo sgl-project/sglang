@@ -1,5 +1,5 @@
-#include <sgl_kernel/tensor.h>
 #include <sgl_kernel/fp8_utils.cuh>
+#include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.cuh>
 #include <sgl_kernel/utils.h>
 
@@ -8,22 +8,6 @@
 
 #include <cstddef>
 #include <cstdint>
-
-namespace host {
-namespace details {
-
-template <>
-struct dtype_trait<c10::Half> {
-  inline static constexpr DLDataType value = {.code = DLDataTypeCode::kDLFloat, .bits = 16, .lanes = 1};
-};
-
-template <>
-struct dtype_trait<c10::BFloat16> {
-  inline static constexpr DLDataType value = {.code = DLDataTypeCode::kDLBfloat, .bits = 16, .lanes = 1};
-};
-
-}  // namespace details
-}  // namespace host
 
 namespace {
 
@@ -170,11 +154,11 @@ void per_tensor_quant_fp8(tvm::ffi::TensorView input,
   };
 
   const DLDataType dtype = input_dtype.unwrap();
-  if (dtype == host::details::dtype_trait<float>::value) {
+  if (dtype.code == kDLFloat && dtype.bits == 32) {
     launch_kernels.template operator()<float>();
-  } else if (dtype == host::details::dtype_trait<c10::BFloat16>::value) {
+  } else if (dtype.code == kDLBfloat && dtype.bits == 16) {
     launch_kernels.template operator()<c10::BFloat16>();
-  } else if (dtype == host::details::dtype_trait<c10::Half>::value) {
+  } else if (dtype.code == kDLFloat && dtype.bits == 16) {
     launch_kernels.template operator()<c10::Half>();
   } else {
     RuntimeCheck(false, "Unsupported input dtype");
