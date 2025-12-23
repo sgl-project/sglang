@@ -127,12 +127,7 @@ inline auto offset(const T* ptr, U... offset) -> const void* {
 
 }  // namespace pointer
 
-template <std::signed_integral T, std::signed_integral U>
-inline constexpr auto div_ceil(T a, U b) {
-  return (a + b - 1) / b;
-}
-
-template <std::unsigned_integral T, std::unsigned_integral U>
+template <std::integral T, std::integral U>
 inline constexpr auto div_ceil(T a, U b) {
   return (a + b - 1) / b;
 }

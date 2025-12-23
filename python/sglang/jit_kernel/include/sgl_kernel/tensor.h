@@ -418,6 +418,7 @@ struct TensorMatcher {
   auto with_dtype(DTypeRef&& dtype) && -> TensorMatcher&& {
     m_init_dtype();
     m_dtype.rebind(*dtype);
+    m_dtype->set_options<Ts...>();
     return std::move(*this);
   }
 
@@ -433,6 +434,7 @@ struct TensorMatcher {
   auto with_device(DeviceRef&& device) && -> TensorMatcher&& {
     m_init_device();
     m_device.rebind(*device);
+    m_device->set_options<Codes...>();
     return std::move(*this);
   }
 

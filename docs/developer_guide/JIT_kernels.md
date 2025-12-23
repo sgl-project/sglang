@@ -12,7 +12,7 @@ Consequently, a static `compile_commands.json` cannot be generated.
 To enable code completion with `clangd`, run `python -m sglang.jit_kernel` to generate a `.clangd` configuration file in your current directory.
 After generating the file, restart the clangd language server. It should now recognize all JIT kernel files.
 
-## Adding a New Kernel
+## Code Structure
 
 ### C++ Implementation
 
@@ -134,3 +134,125 @@ void test() {
 }
 
 ```
+
+## Add new kernels
+
+This section walks through a complete, end-to-end example of adding a new JIT kernel to the system.
+We use a simple add_constant kernel as a running example, which adds a constant integer value to every element of an input tensor.
+
+Conceptually, the Python interface looks like this:
+
+```python
+def add_constant(src: torch.Tensor, c: int):
+    return src + c
+```
+
+### STEP 1: Write the C++ kernel
+
+Write your CUDA kernel in [jit_kernel/csrc/add_constant.cuh](../../python/sglang/jit_kernel/csrc/add_constant.cuh). For demonstration purposes, we pass the constant value as a template parameter.
+
+```cpp
+#include <sgl_kernel/tensor.h>   // For TensorMatcher, SymbolicSize, SymbolicDevice
+#include <sgl_kernel/utils.cuh>  // For LaunchKernel
+#include <sgl_kernel/utils.h>    // For div_ceil, RuntimeCheck
+
+#include <dlpack/dlpack.h>
+#include <tvm/ffi/container/tensor.h>
+
+#include <cstddef>
+#include <cstdint>
+
+namespace {
+
+template <int32_t kConstant>
+__global__ void add_constant_kernel(int32_t* dst, const int32_t* src, size_t length) {
+  size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx < length) {
+    dst[idx] = src[idx] + kConstant;
+  }
+}
+
+constexpr size_t kBlockSize = 256;
+
+// You can also use struct with static method as an alternative
+template <int32_t kConstant>
+void add_constant(tvm::ffi::TensorView dst, tvm::ffi::TensorView src) {
+  using namespace host;
+
+  // 1. Validate input tensors
+  SymbolicSize N = {"num_elements"};
+  SymbolicDevice device_;
+  TensorMatcher({N})                  // 1D tensor, must be contiguous
+      .with_dtype<int32_t>()          // must be int32
+      .with_device<kDLCUDA>(device_)  // must be on CUDA device
+      .verify(dst)                    // check tensor dst
+      .verify(src);                   // check tensor src
+
+  // 2. Extract required parameters, prepare for kernel launch
+  const size_t num_elements = N.unwrap();
+  const size_t grid_size = div_ceil(num_elements, kBlockSize);
+  const DLDevice device = device_.unwrap();
+  // some extra runtime checks using host::RuntimeCheck
+  RuntimeCheck(num_elements > 0, "We only support non-empty tensors, got num_elements = ", num_elements);
+
+  // 3. Launch the kernel. Error code will be automatically checked.
+  LaunchKernel(grid_size, kBlockSize, device /*, dynamic_smem*/)(
+      // kernel function
+      add_constant_kernel<kConstant>,
+      // kernel arguments
+      static_cast<int32_t*>(dst.data_ptr()),
+      static_cast<int32_t*>(src.data_ptr()),
+      num_elements);
+}
+
+}  // namespace
+
+```
+
+### STEP 2: Create Python Interfaces
+
+Next, expose the kernel through a Python wrapper.
+Create a new file at [jit_kernel/add_constant.py](../../python/sglang/jit_kernel/add_constant.py) and expose the needed interfaces.
+
+```python
+from __future__ import annotations
+
+import functools
+from typing import TYPE_CHECKING
+
+import torch
+
+from sglang.jit_kernel.utils import load_jit, make_cpp_args
+
+if TYPE_CHECKING:
+    from tvm_ffi.module import Module
+
+
+@functools.cache
+def _jit_add_constant_module(constant: int) -> Module:
+    args = make_cpp_args(constant)  # pass all the template argument
+    return load_jit(
+        "add_constant",
+        *args,
+        cuda_files=["add_constant.cuh"],
+        cuda_wrappers=[("add_constant", f"add_constant<{args}>")],
+    )
+
+
+def add_constant(src: torch.Tensor, constant: int) -> torch.Tensor:
+    dst = torch.empty_like(src)
+    module = _jit_add_constant_module(constant)
+    module.add_constant(dst, src)
+    return dst
+
+```
+
+### STEP 3: Use your kernel
+
+Finally, import and use the kernel like a regular Python function:
+
+```python
+from sglang.jit_kernel.add_constant import add_constant
+```
+
+For a complete, runnable example, refer to [test_add_constant.py](../../python/sglang/jit_kernel/test_add_constant.py).
