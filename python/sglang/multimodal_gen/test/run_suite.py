@@ -353,7 +353,7 @@ def main():
 
     # 4. Build pytest filter expression from case IDs
     case_ids = [case.id for case in my_cases]
-    partition_filter = " or ".join(case_ids)
+    partition_filter = " or ".join([f"[{cid}]" for cid in case_ids])
 
     # Combine with additional filter if provided
     if args.filter:
