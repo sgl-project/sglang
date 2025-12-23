@@ -75,6 +75,9 @@ ARG TILELANG_COMMIT="ae938cf885743f165a19656d1122ad42bb0e30b8"
 ARG FHT_REPO="https://github.com/jeffdaily/fast-hadamard-transform.git"
 ARG FHT_BRANCH="rocm"
 ARG FHT_COMMIT="46efb7d776d38638fc39f3c803eaee3dd7016bd1"
+
+ARG AINIC_VERSION="1.117.5"
+ARG UBUNTU_CODENAME=jammy
 USER root
 
 # Install some basic utilities
@@ -292,6 +295,26 @@ RUN /bin/bash -lc 'set -euo pipefail; \
 RUN python3 -m pip install --no-cache-dir \
     py-spy \
     pre-commit
+
+
+# -----------------------
+# AINIC libraries
+
+RUN curl -fsSL https://repo.radeon.com/rocm/rocm.gpg.key \
+    | gpg --dearmor > /etc/apt/keyrings/amdainic.gpg
+
+RUN echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/amdainic.gpg] \
+https://repo.radeon.com/amdainic/pensando/ubuntu/${AINIC_VERSION} ${UBUNTU_CODENAME} main" \
+    > /etc/apt/sources.list.d/amdainic.list
+
+RUN apt-get update \
+&& apt-get install -y --no-install-recommends \
+      libionic-dev \
+      ionic-common \
+      ionic-dkms \
+      pds-dkms \
+&& rm -rf /var/lib/apt/lists/*
+
 
 # -----------------------
 # Performance environment variable.
