@@ -67,8 +67,6 @@ from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 logger = logging.getLogger(__name__)
 
-NOTIFY_DP_RANK = envs.SGLANG_DISAGGREGATION_NOTIFY_DP_RANK.get()
-
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.managers.scheduler import Scheduler
@@ -231,6 +229,7 @@ class DecodePreallocQueue:
         self.queue: List[DecodeRequest] = []
         self.retracted_queue: List[Req] = []
         self.prefill_pp_size = prefill_pp_size
+        self.should_notify_dp_rank = envs.SGLANG_DISAGGREGATION_NOTIFY_DP_RANK.get()
         self.kv_manager = self._init_kv_manager()
 
     def _init_kv_manager(self) -> BaseKVManager:
@@ -459,7 +458,7 @@ class DecodePreallocQueue:
 
         # Then, preallocate the remaining requests if possible
         for i, decode_req in enumerate(self.queue):
-            if NOTIFY_DP_RANK:
+            if self.should_notify_dp_rank:
                 if hasattr(decode_req.kv_receiver, "_get_prefill_dp_rank_from_server"):
                     if bootstrap_table is None:
                         bootstrap_table = (

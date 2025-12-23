@@ -146,6 +146,33 @@ class CommonKVManager(BaseKVManager):
                 f"Prefill instance failed to register to bootstrap server: {e}"
             )
 
+    def _register_prefill_dp_rank(self, bootstrap_room: int, bootstrap_addr: str):
+        """Register request's prefill dp rank to bootstrap server via HTTP POST."""
+
+        url = f"http://{bootstrap_addr}/route"
+        payload = {
+            "role": "Prefill",
+            "attn_dp_rank": self.attn_dp_rank,
+            "rank_ip": self.local_ip,
+            "rank_port": self.rank_port,
+            "bootstrap_room": bootstrap_room,
+        }
+
+        try:
+            response = requests.put(url, json=payload, timeout=5)
+            if response.status_code == 200:
+                logger.debug(
+                    "Prefill dp rank successfully registered to bootstrap server."
+                )
+            else:
+                logger.error(
+                    f"Prefill instance failed to connect to bootstrap server: {response.status_code}, {response.text}"
+                )
+        except Exception as e:
+            logger.error(
+                f"Prefill instance failed to register to bootstrap server: {e}"
+            )
+
     @cache
     def _connect(self, endpoint: str, is_ipv6: bool = False):
         socket = zmq.Context().socket(zmq.PUSH)
@@ -206,33 +233,8 @@ class CommonKVSender(BaseKVSender):
         self.curr_idx = 0
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Bootstrapping)
         if self.kv_mgr.should_notify_dp_rank:
-            self._register_prefill_dp_rank()
-
-    def _register_prefill_dp_rank(self):
-        """Register request's prefill dp rank to bootstrap server via HTTP POST."""
-
-        url = f"http://{self.bootstrap_server_url}/route"
-        payload = {
-            "role": "Prefill",
-            "attn_dp_rank": self.kv_mgr.attn_dp_rank,
-            "rank_ip": self.kv_mgr.local_ip,
-            "rank_port": self.kv_mgr.rank_port,
-            "bootstrap_room": self.bootstrap_room,
-        }
-
-        try:
-            response = requests.put(url, json=payload, timeout=5)
-            if response.status_code == 200:
-                logger.debug(
-                    "Prefill dp rank successfully registered to bootstrap server."
-                )
-            else:
-                logger.error(
-                    f"Prefill instance failed to connect to bootstrap server: {response.status_code}, {response.text}"
-                )
-        except Exception as e:
-            logger.error(
-                f"Prefill instance failed to register to bootstrap server: {e}"
+            self.kv_mgr._register_prefill_dp_rank(
+                self.bootstrap_room, self.bootstrap_server_url
             )
 
     def init(self, num_kv_indices: int, aux_index: Optional[int] = None):
@@ -542,7 +544,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         self.prefill_port_table: Dict[
             int, Dict[int, Dict[int, Dict[str, Union[str, int]]]]
         ] = {}
-        self.prefill_dp_rank_table: Dict[int, Dict[str], Union[str, int]] = {}
+        self.prefill_dp_rank_table: Dict[int, Dict[str, Union[str, int, float]]] = {}
         self.should_notify_dp_rank = envs.SGLANG_DISAGGREGATION_NOTIFY_DP_RANK.get()
         self.entry_cleanup_interval = (
             envs.SGLANG_DISAGGREGATION_BOOTSTRAP_ENTRY_CLEANUP_INTERVAL.get()
@@ -635,15 +637,15 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
 
     async def _handle_route_get(self, request: web.Request):
         bootstrap_room = request.query.get("bootstrap_room")
+        # Use real bootstrap_room id to get prefill dp rank
+        if int(bootstrap_room) != -1:
+            return web.json_response(self.prefill_dp_rank_table, status=200)
+
         engine_rank = request.query.get("engine_rank")
         target_dp_group = request.query.get("target_dp_group")
         target_pp_rank = request.query.get("target_pp_rank")
         if not engine_rank or not target_dp_group or not target_pp_rank:
             return web.Response(text="Missing inputs for bootstrap server.", status=400)
-
-        # Use real bootstrap_room id to get prefill dp rank
-        if int(bootstrap_room) != -1:
-            return web.json_response(self.prefill_dp_rank_table, status=200)
 
         # Currently we use engine_rank == -1 and target_dp_group == -1 to sync dp size
         if (
@@ -686,9 +688,10 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                         if key in self.prefill_dp_rank_table:
                             del self.prefill_dp_rank_table[key]
                 consumed_time = time.time() - start_time
+                # Check if cleanup took longer than 1ms
                 if consumed_time > 0.001:
                     logger.warning(
-                        f"Cleaned up {len(expired_keys)} expired entries from prefill_dp_rank_table. It takes too long {consumed_time=}"
+                        f"Cleaned up {len(expired_keys)} expired entries from prefill_dp_rank_table. It takes too long {consumed_time=} secs"
                     )
                 else:
                     logger.debug(
