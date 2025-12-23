@@ -68,8 +68,6 @@ class TimeStats:
     alloc_waiting_duration: float = 0.0
     prefill_start_time_host: float = 0.0
     prefill_end_time_host: float = 0.0
-    transfer_speed_gb_s: float = 0.0
-    transfer_total_mb: float = 0.0
 
     # Timestamp when prefill phase finishes, obtained from `time.time()`.
     # Note that this differs from the other `_time` fields tracked by the
@@ -134,9 +132,7 @@ class TimeStats:
                 f"+ other({self.format_duration(other)}); "
                 f"queue_duration={self.format_duration(queue_duration)}, "
                 f"forward_duration={self.format_duration(forward_duration)}, "
-                f"start={self.prefill_bootstrap_queue_entry_time:.3f}, "
-                f"transfer_speed={self.transfer_speed_gb_s:.2f}GB/s, "
-                f"transfer_total={self.transfer_total_mb:.2f}MB"
+                f"start={self.prefill_bootstrap_queue_entry_time:.3f}"
             )
         elif self.disagg_mode == DisaggregationMode.DECODE:
             prealloc_duration = (
@@ -225,7 +221,6 @@ class SchedulerStats:
     kv_transfer_latency_ms: float = 0.0
     kv_transfer_bootstrap_ms: float = 0.0
     kv_transfer_alloc_ms: float = 0.0
-    kv_transfer_total_mb: float = 0.0
 
     # Utilization
     utilization: float = 0.0
@@ -421,12 +416,6 @@ class SchedulerMetricsCollector:
         self.kv_transfer_alloc_ms = Gauge(
             name="sglang:kv_transfer_alloc_ms",
             documentation="The allocation waiting time of the KV transfer in ms.",
-            labelnames=labels.keys(),
-            multiprocess_mode="mostrecent",
-        )
-        self.kv_transfer_total_mb = Gauge(
-            name="sglang:kv_transfer_total_mb",
-            documentation="The total number of tokens transferred in the KV cache.",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
@@ -782,7 +771,6 @@ class SchedulerMetricsCollector:
         self._log_gauge(self.kv_transfer_latency_ms, stats.kv_transfer_latency_ms)
         self._log_gauge(self.kv_transfer_bootstrap_ms, stats.kv_transfer_bootstrap_ms)
         self._log_gauge(self.kv_transfer_alloc_ms, stats.kv_transfer_alloc_ms)
-        self._log_gauge(self.kv_transfer_total_mb, stats.kv_transfer_total_mb)
 
         # Retract
         self._log_gauge(self.num_retracted_reqs, stats.num_retracted_reqs)
@@ -1243,7 +1231,7 @@ class RadixCacheMetricsCollector:
         labels: Dict[str, str],
     ) -> None:
         # We need to import prometheus_client after setting the env variable `PROMETHEUS_MULTIPROC_DIR`
-        from prometheus_client import Counter, Histogram
+        from prometheus_client import Counter, Gauge, Histogram
 
         self.labels = labels
 
@@ -1321,6 +1309,21 @@ class RadixCacheMetricsCollector:
             labelnames=labels.keys(),
         )
 
+        # Cache monitoring metrics
+        self.cache_entry_count = Gauge(
+            name="sglang:cache_entry_count",
+            documentation="Number of entries in the prefix cache.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+
+        self.cache_total_tokens = Gauge(
+            name="sglang:cache_total_tokens",
+            documentation="Total tokens stored in the prefix cache.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+
     def increment_eviction_num_tokens(self, num_tokens: int) -> None:
         self.eviction_num_tokens.labels(**self.labels).inc(num_tokens)
 
@@ -1332,3 +1335,9 @@ class RadixCacheMetricsCollector:
 
     def observe_load_back_duration(self, duration_seconds: float) -> None:
         self.load_back_duration_seconds.labels(**self.labels).observe(duration_seconds)
+
+    def set_cache_entry_count(self, count: int) -> None:
+        self.cache_entry_count.labels(**self.labels).set(count)
+
+    def set_cache_total_tokens(self, tokens: int) -> None:
+        self.cache_total_tokens.labels(**self.labels).set(tokens)

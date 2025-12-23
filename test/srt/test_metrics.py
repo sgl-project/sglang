@@ -66,6 +66,9 @@ class TestEnableMetrics(CustomTestCase):
                 "sglang:time_to_first_token_seconds",
                 "sglang:inter_token_latency_seconds",
                 "sglang:e2e_request_latency_seconds",
+                # Cache monitoring metrics
+                "sglang:cache_entry_count",
+                "sglang:cache_total_tokens",
             ]
 
             for metric in essential_metrics:

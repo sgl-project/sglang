@@ -64,7 +64,6 @@ class SchedulerMetricsMixin:
         self.kv_transfer_latency_ms: float = 0.0
         self.kv_transfer_bootstrap_ms: float = 0.0
         self.kv_transfer_alloc_ms: float = 0.0
-        self.kv_transfer_total_mb: float = 0.0
 
         self.stats = SchedulerStats()
 
@@ -222,7 +221,6 @@ class SchedulerMetricsMixin:
                 self.stats.kv_transfer_latency_ms = self.kv_transfer_latency_ms
                 self.stats.kv_transfer_bootstrap_ms = self.kv_transfer_bootstrap_ms
                 self.stats.kv_transfer_alloc_ms = self.kv_transfer_alloc_ms
-                self.stats.kv_transfer_total_mb = self.kv_transfer_total_mb
             elif self.disaggregation_mode == DisaggregationMode.DECODE:
                 self.stats.num_decode_prealloc_queue_reqs = len(
                     self.disagg_decode_prealloc_queue.queue
@@ -235,6 +233,20 @@ class SchedulerMetricsMixin:
                 prefill_compute_tokens=adder.log_input_tokens,
                 prefill_cache_tokens=adder.log_hit_tokens,
             )
+
+            # Cache monitoring metrics
+            if (
+                hasattr(self, "tree_cache")
+                and self.tree_cache is not None
+                and self.tree_cache.metrics_collector is not None
+            ):
+                cache_stats = self.tree_cache.get_cache_stats()
+                self.tree_cache.metrics_collector.set_cache_entry_count(
+                    cache_stats["entry_count"]
+                )
+                self.tree_cache.metrics_collector.set_cache_total_tokens(
+                    cache_stats["total_tokens"]
+                )
 
             # Others
             self.calculate_utilization()
