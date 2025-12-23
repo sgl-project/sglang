@@ -141,6 +141,9 @@ class DiffusionSamplingParams:
     num_frames: int | None = None  # for video: number of frames
     fps: int | None = None  # for video: frames per second
 
+    # URL direct test flag - if True, don't pre-download URL images
+    direct_url_test: bool = False
+
 
 @dataclass(frozen=True)
 class DiffusionTestCase:
@@ -233,6 +236,7 @@ MULTI_IMAGE_TI2I_sampling_params = DiffusionSamplingParams(
         "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-Image/edit2509/edit2509_1.jpg",
         "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-Image/edit2509/edit2509_2.jpg",
     ],
+    direct_url_test=True,
 )
 
 T2V_PROMPT = "A curious raccoon"
@@ -240,6 +244,7 @@ T2V_PROMPT = "A curious raccoon"
 TI2V_sampling_params = DiffusionSamplingParams(
     prompt="The man in the picture slowly turns his head, his expression enigmatic and otherworldly. The camera performs a slow, cinematic dolly out, focusing on his face. Moody lighting, neon signs glowing in the background, shallow depth of field.",
     image_path="https://is1-ssl.mzstatic.com/image/thumb/Music114/v4/5f/fa/56/5ffa56c2-ea1f-7a17-6bad-192ff9b6476d/825646124206.jpg/600x600bb.jpg",
+    direct_url_test=True,
 )
 
 # All test cases with clean default values
