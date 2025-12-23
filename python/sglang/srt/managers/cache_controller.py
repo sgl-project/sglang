@@ -41,6 +41,7 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
+from sglang.srt.mem_cache.session_cache import SessionCache
 from sglang.srt.utils import get_device_module
 
 logger = logging.getLogger(__name__)
@@ -212,6 +213,18 @@ class StorageOperation:
         return self.id < other.id
 
 
+class SessionOperation:
+    def __init__(
+        self,
+        session_id: str,
+        old_kv_cache: SessionCache,
+    ):
+        self.session_id = session_id
+        self.old_kv_cache = old_kv_cache
+        self.done = False
+        self.ok = False
+
+
 class PrefetchOperation(StorageOperation):
     def __init__(
         self,
@@ -256,6 +269,7 @@ class HiCacheController:
         write_policy: str = "write_through_selective",
         io_backend: str = "",
         storage_backend: Optional[str] = None,
+        enable_session_cache: bool = False,
         prefetch_threshold: int = 256,
         model_name: Optional[str] = None,
         storage_backend_extra_config: Optional[dict] = None,
@@ -267,6 +281,7 @@ class HiCacheController:
         self.page_size = page_size
         self.io_backend = io_backend
         self.enable_storage = False
+        self.enable_session_cache = enable_session_cache
 
         if storage_backend is not None:
             self.storage_backend_type = storage_backend
@@ -369,6 +384,80 @@ class HiCacheController:
             self.prefetch_thread.start()
             self.backup_thread.start()
 
+        elif self.enable_session_cache:
+            self.prefetch_thread = threading.Thread(
+                target=self.prefetch_session_cache_func, daemon=True
+            )
+            self.backup_thread = threading.Thread(
+                target=self.backup_session_cache_func, daemon=True
+            )
+
+            self.prefetch_queue = Queue()
+            self.backup_queue = Queue()
+
+            self.prefetch_thread.start()
+            self.backup_thread.start()
+
+            self.storage_config = self._generate_storage_config(model_name, None)
+
+    def prefetch_from_session_cache(
+        self,
+        session_id: str,
+        old_kv_cache: SessionCache,
+    ):
+        operation = SessionOperation(
+            session_id,
+            old_kv_cache,
+        )
+        self.prefetch_queue.put(operation)
+        return operation
+
+    def append_session_cache(
+        self,
+        session_id: str,
+        new_kv_cache: SessionCache,
+    ):
+        self.backup_queue.put((session_id, new_kv_cache))
+
+    def prefetch_session_cache_func(self):
+        while not self.stop_event.is_set() or not self.prefetch_queue.empty():
+            op: Optional[SessionOperation] = None
+            try:
+                op = self.prefetch_queue.get(block=True, timeout=1)
+                if op is None:
+                    continue
+
+                op.old_kv_cache.prefetch(self.mem_pool_host, self.storage_config)
+
+                op.done = True
+                op.ok = True
+            except Empty:
+                continue
+            except Exception as e:
+                if op is not None:
+                    logger.error(
+                        f"Prefetch session cache failed for op {op}: {e}", exc_info=True
+                    )
+                    op.done = True
+                    op.ok = False
+                else:
+                    logger.error(
+                        f"Unexpected error in prefetch thread: {e}", exc_info=True
+                    )
+                continue
+
+    def backup_session_cache_func(self):
+        while not self.stop_event.is_set():
+            try:
+                _, new_kv_cache = self.backup_queue.get(block=True, timeout=1)
+
+                new_kv_cache.backup(
+                    self.mem_pool_device, self.mem_pool_host, self.storage_config
+                )
+
+            except Empty:
+                continue
+
     def _generate_storage_config(
         self,
         model_name: Optional[str] = None,
@@ -412,6 +501,11 @@ class HiCacheController:
             self.backup_queue.queue.clear()
             self.prefetch_revoke_queue.queue.clear()
             self.ack_backup_queue.queue.clear()
+        elif self.enable_session_cache:
+            self.prefetch_thread.join()
+            self.backup_thread.join()
+            self.prefetch_queue.queue.clear()
+            self.backup_queue.queue.clear()
 
         self.stop_event.clear()
 
@@ -422,6 +516,17 @@ class HiCacheController:
             self.backup_thread = threading.Thread(
                 target=self.backup_thread_func, daemon=True
             )
+            self.prefetch_thread.start()
+            self.backup_thread.start()
+
+        elif self.enable_session_cache:
+            self.prefetch_thread = threading.Thread(
+                target=self.prefetch_session_cache_func, daemon=True
+            )
+            self.backup_thread = threading.Thread(
+                target=self.backup_session_cache_func, daemon=True
+            )
+
             self.prefetch_thread.start()
             self.backup_thread.start()
 

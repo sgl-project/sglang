@@ -44,7 +44,7 @@ import time
 from enum import Enum, auto
 from http import HTTPStatus
 from itertools import chain
-from typing import TYPE_CHECKING, Any, List, Optional, Set, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple, Union
 
 import numpy as np
 import torch
@@ -73,6 +73,7 @@ from sglang.srt.mem_cache.common import (
 from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.session_cache import SessionCache
 from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
 from sglang.srt.metrics.collector import SchedulerMetricsCollector, TimeStats
 from sglang.srt.model_executor.forward_batch_info import (
@@ -129,7 +130,7 @@ class FINISH_MATCHED_STR(BaseFinishReason):
         }
 
 
-class FINISHED_MATCHED_REGEX(BaseFinishReason):
+class FINISH_MATCHED_REGEX(BaseFinishReason):
     def __init__(self, matched: str):
         super().__init__()
         self.matched = matched
@@ -486,6 +487,8 @@ class Req:
         input_embeds: Optional[List[List[float]]] = None,
         token_type_ids: List[int] = None,
         session_id: Optional[str] = None,
+        old_kv_cache: Optional[List[Dict]] = None,
+        new_kv_cache: Optional[List[Dict]] = None,
         custom_logit_processor: Optional[str] = None,
         require_reasoning: bool = False,
         return_hidden_states: bool = False,
@@ -517,6 +520,9 @@ class Req:
         # fill_ids = origin_input_ids + output_ids. Updated if chunked.
         self.fill_ids = []
         self.session_id = session_id
+        self.old_kv_cache = SessionCache(old_kv_cache)
+        self.new_kv_cache = SessionCache(new_kv_cache)
+
         self.input_embeds = input_embeds
 
         # For req-level memory management
@@ -989,7 +995,7 @@ class Req:
             if len(self.sampling_params.stop_regex_strs) > 0:
                 for stop_regex_str in self.sampling_params.stop_regex_strs:
                     if re.search(stop_regex_str, tail_str):
-                        self.finished_reason = FINISHED_MATCHED_REGEX(
+                        self.finished_reason = FINISH_MATCHED_REGEX(
                             matched=stop_regex_str
                         )
                         return True

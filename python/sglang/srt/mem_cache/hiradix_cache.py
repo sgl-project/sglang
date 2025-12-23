@@ -23,6 +23,7 @@ from sglang.srt.mem_cache.radix_cache import (
     compute_node_hash_values,
     split_node_hash_value,
 )
+from sglang.srt.mem_cache.session_cache import SessionCache
 from sglang.srt.metrics.collector import StorageMetricsCollector
 
 if TYPE_CHECKING:
@@ -68,6 +69,7 @@ class HiRadixCache(RadixCache):
         self.tp_world_size = torch.distributed.get_world_size(group=self.tp_group)
         self.enable_storage = server_args.hicache_storage_backend is not None
         self.enable_storage_metrics = self.enable_storage and params.enable_metrics
+        self.enable_session_cache = server_args.enable_session_cache
 
         (
             extra_config,
@@ -98,6 +100,7 @@ class HiRadixCache(RadixCache):
             write_policy=server_args.hicache_write_policy,
             io_backend=server_args.hicache_io_backend,
             storage_backend=server_args.hicache_storage_backend,
+            enable_session_cache=server_args.enable_session_cache,
             prefetch_threshold=self.prefetch_threshold,
             model_name=server_args.served_model_name,
             storage_backend_extra_config=extra_config,
@@ -118,6 +121,10 @@ class HiRadixCache(RadixCache):
         # record the ongoing prefetch requests
         self.ongoing_prefetch = {}
         self.ongoing_backup = {}
+        if self.enable_session_cache:
+            self.ongoing_session_append = {}
+            self.ongoing_session_prefetch = {}
+
         # todo: dynamically adjust the threshold
         self.write_through_threshold = (
             1 if server_args.hicache_write_policy == "write_through" else 2
@@ -181,6 +188,9 @@ class HiRadixCache(RadixCache):
         TreeNode.counter = 0
         self.cache_controller.reset()
         self.token_to_kv_pool_host.clear()
+        if self.enable_session_cache:
+            self.ongoing_session_append.clear()
+            self.ongoing_session_prefetch.clear()
         super().reset()
 
     def get_height(self, node: TreeNode):
@@ -498,12 +508,128 @@ class HiRadixCache(RadixCache):
     def check_hicache_events(self):
         self.writing_check()
         self.loading_check()
+        if self.enable_session_cache:
+            self.check_session_cache_events()
         if self.enable_storage:
             self.drain_storage_control_queues()
         if self.enable_storage_metrics:
             self.storage_metrics_collector.log_storage_metrics(
                 self.cache_controller.storage_backend.get_stats()
             )
+
+    def check_session_cache_events(self):
+        # todo: handle TP synchronization if needed
+        to_finalize = []
+        for session_id, (node, new_kv_cache) in list(
+            self.ongoing_session_append.items()
+        ):
+            if not new_kv_cache.backup_done():
+                continue
+            to_finalize.append(session_id)
+            self.dec_lock_ref(node)
+        for session_id in to_finalize:
+            del self.ongoing_session_append[session_id]
+
+    def prefetch_from_session_cache(
+        self,
+        session_id: Optional[str],
+        last_host_node: TreeNode,
+        old_kv_cache: SessionCache,
+    ):
+        if (
+            not self.enable_session_cache
+            or session_id is None
+            or old_kv_cache.token_length <= self.prefetch_threshold
+        ):
+            return
+
+        last_host_node.protect_host()
+
+        prefetch_length = old_kv_cache.real_token_length
+
+        host_indices = self.cache_controller.mem_pool_host.alloc(prefetch_length)
+        if host_indices is None:
+            self.evict_host(prefetch_length)
+            host_indices = self.cache_controller.mem_pool_host.alloc(prefetch_length)
+        if host_indices is None:
+            last_host_node.release_host()
+            # no sufficient host memory for prefetch
+            return
+
+        old_kv_cache = old_kv_cache.bind_mem_indices(host_indices)
+
+        operation = self.cache_controller.prefetch_from_session_cache(
+            session_id,
+            old_kv_cache,
+        )
+        self.ongoing_session_prefetch[session_id] = (last_host_node, operation)
+
+    def check_session_prefetch_progress(self, session_id: str) -> bool:
+        if session_id not in self.ongoing_session_prefetch:
+            return True
+
+        last_host_node, operation = self.ongoing_session_prefetch[session_id]
+
+        if operation.done == True:
+            old_kv_cache: SessionCache = operation.old_kv_cache
+            need_free = len(old_kv_cache.mem_indices)
+
+            if operation.ok:
+                from sglang.srt.mem_cache.hicache_storage import get_hash_str
+
+                insert_token_ids = old_kv_cache.token_ids
+                insert_host_value = old_kv_cache.mem_indices
+
+                hash_value = []
+                last_hash = last_host_node.get_last_hash_value()
+                for i in range(0, len(insert_token_ids), self.page_size):
+                    last_hash = get_hash_str(
+                        insert_token_ids[i : i + self.page_size], last_hash
+                    )
+                    hash_value.append(last_hash)
+
+                need_free = self._insert_helper_host(
+                    last_host_node,
+                    RadixKey(
+                        token_ids=insert_token_ids,
+                        extra_key=last_host_node.key.extra_key,
+                    ),
+                    host_value=insert_host_value,
+                    hash_value=hash_value,
+                )
+
+            self.cache_controller.mem_pool_host.free(
+                old_kv_cache.real_mem_indices_prefix(need_free)
+            )
+
+            last_host_node.release_host()
+            del self.ongoing_session_prefetch[session_id]
+            return True
+        return False
+
+    def write_backup_session(
+        self, session_id: Optional[str], new_kv_cache: SessionCache, radix_key: RadixKey
+    ) -> SessionCache:
+        if not self.enable_session_cache or session_id is None:
+            return SessionCache()
+
+        device_indices, last_node, _, _, _ = self.match_prefix(radix_key)
+        new_kv_cache = new_kv_cache.truncate_suffix(
+            len(device_indices),
+            kv_length_per_token=self.cache_controller.mem_pool_host.get_size_per_token(),
+        )
+
+        if new_kv_cache.token_length == 0:
+            return SessionCache()
+
+        new_indices = device_indices[new_kv_cache.token_start : new_kv_cache.token_end]
+        new_kv_cache = new_kv_cache.bind_mem_indices(new_indices)
+
+        self.inc_lock_ref(last_node)
+        self.cache_controller.append_session_cache(session_id, new_kv_cache)
+        self.ongoing_session_append[session_id] = (last_node, new_kv_cache)
+
+        return new_kv_cache
 
     def drain_storage_control_queues(self):
         """

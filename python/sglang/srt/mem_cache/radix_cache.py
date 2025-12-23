@@ -50,6 +50,7 @@ from sglang.srt.mem_cache.evict_policy import (
     PriorityStrategy,
 )
 from sglang.srt.mem_cache.hicache_storage import get_hash_str, hash_str_to_int64
+from sglang.srt.mem_cache.session_cache import SessionCache
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -426,6 +427,11 @@ class RadixCache(BasePrefixCache):
         page_aligned_len = len(key) // self.page_size * self.page_size
         return key[:page_aligned_len]
 
+    def write_backup_session(
+        self, session_id: Optional[str], new_kv_cache: SessionCache, radix_key: RadixKey
+    ) -> SessionCache:
+        return SessionCache()
+
     def cache_finished_req(self, req: Req, is_insert: bool = True):
         """Cache request when it finishes."""
         # In deterministic mode, disable finished request insertion to radix cache
@@ -460,6 +466,11 @@ class RadixCache(BasePrefixCache):
             self.token_to_kv_pool_allocator.free(
                 kv_indices[req.cache_protected_len : new_prefix_len]
             )
+
+            req.new_kv_cache = self.write_backup_session(
+                req.session_id, req.new_kv_cache, radix_key
+            )
+
         else:
             self.token_to_kv_pool_allocator.free(
                 kv_indices[req.cache_protected_len : len(keys)]
