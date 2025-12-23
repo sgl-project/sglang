@@ -69,6 +69,19 @@ else()
   message(FATAL_ERROR "Unsupported AMDGPU_TARGET '${AMDGPU_TARGETS}'. Expected 'gfx942' or 'gfx950' or both.")
 endif()
 
+# TopK dynamic smem bytes
+# Dynamic shared-memory budget for the TopK kernels.
+# - gfx942 (MI300/MI325): LDS is typically 64KB per workgroup -> keep dynamic smem <= ~48KB
+#   (leaves room for static shared allocations in the kernel).
+# - gfx95x (MI350): LDS is larger (e.g. 160KB per CU) -> allow the original 128KB dynamic smem.
+if(AMDGPU_TARGET_ONE STREQUAL "gfx942")
+  math(EXPR SGL_TOPK_DYNAMIC_SMEM_BYTES "48 * 1024")
+else()
+  math(EXPR SGL_TOPK_DYNAMIC_SMEM_BYTES "32 * 1024 * 4")
+endif()
+
+set(SGL_TOPK_MACROS "-DSGL_TOPK_DYNAMIC_SMEM_BYTES=${SGL_TOPK_DYNAMIC_SMEM_BYTES}")
+
 # Paths / includes
 set(PROJ_ROOT ${CMAKE_CURRENT_LIST_DIR})
 set(SGL_INCLUDE_DIRS
@@ -84,17 +97,19 @@ link_directories(${PLAT_LIB_DIR})
 
 # Sources
 set(SOURCES
+${PROJ_ROOT}/csrc/allreduce/custom_all_reduce.hip
+${PROJ_ROOT}/csrc/allreduce/deterministic_all_reduce.hip
+${PROJ_ROOT}/csrc/allreduce/quick_all_reduce.hip
+${PROJ_ROOT}/csrc/common_extension_rocm.cc
+${PROJ_ROOT}/csrc/elementwise/activation.hip
+${PROJ_ROOT}/csrc/elementwise/topk.hip
+${PROJ_ROOT}/csrc/grammar/apply_token_bitmask_inplace_hip.hip
 ${PROJ_ROOT}/csrc/moe/moe_align_kernel.hip
 ${PROJ_ROOT}/csrc/moe/moe_topk_softmax_kernels.hip
 ${PROJ_ROOT}/csrc/moe/moe_topk_sigmoid_kernels.hip
-${PROJ_ROOT}/csrc/kvcacheio/transfer.hip
 ${PROJ_ROOT}/csrc/speculative/eagle_utils.hip
-${PROJ_ROOT}/csrc/allreduce/custom_all_reduce.hip
-${PROJ_ROOT}/csrc/grammar/apply_token_bitmask_inplace_hip.hip
-${PROJ_ROOT}/csrc/elementwise/activation.hip
+${PROJ_ROOT}/csrc/kvcacheio/transfer.hip
 ${PROJ_ROOT}/csrc/elementwise/pos_enc.hip
-${PROJ_ROOT}/csrc/common_extension_rocm.cc
-${PROJ_ROOT}/csrc/allreduce/quick_all_reduce.hip
 )
 set_source_files_properties(
   ${SOURCES}
@@ -115,6 +130,7 @@ set(SGL_HIP_FLAGS
   ${SGL_FP8_MACROS}
   -Wno-pass-failed
   -Wundefined-internal
+  ${SGL_TOPK_MACROS}
 )
 
 # Python extension
