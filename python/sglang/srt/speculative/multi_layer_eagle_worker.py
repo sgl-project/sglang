@@ -48,8 +48,8 @@ from sglang.srt.speculative.eagle_utils import (
     organize_draft_results,
 )
 from sglang.srt.speculative.eagle_worker import get_last_loc_large_page_size_top_k_1
-from sglang.srt.speculative.mtp_draft_extend_cuda_graph_runner import (
-    MTPDraftExtendCudaGraphRunner,
+from sglang.srt.speculative.multi_layer_eagle_draft_extend_cuda_graph_runner import (
+    MultiLayerEagleDraftExtendCudaGraphRunner,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
@@ -80,7 +80,7 @@ logger = logging.getLogger(__name__)
 SGLANG_RETURN_ORIGINAL_LOGPROB = get_bool_env_var("SGLANG_RETURN_ORIGINAL_LOGPROB")
 
 
-class MTPWorker(TpModelWorker):
+class MultiLayerEagleWorker(TpModelWorker):
 
     def __init__(
         self,
@@ -152,7 +152,7 @@ class MTPWorker(TpModelWorker):
                 is_draft_worker=True,
                 req_to_token_pool=self.req_to_token_pool,
                 token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-                is_mtp_worker=True,
+                is_multi_layer_eagle=True,
             )
 
         embed, head = self.target_worker.model_runner.model.get_embed_and_head()
@@ -235,7 +235,7 @@ class MTPWorker(TpModelWorker):
                     f"Capture draft extend cuda graph begin. This can take up to several minutes. avail mem={before_mem:.2f} GB"
                 )
                 self.cuda_graph_runner_for_draft_extend_list.append(
-                    MTPDraftExtendCudaGraphRunner(self, step)
+                    MultiLayerEagleDraftExtendCudaGraphRunner(self, step)
                 )
                 after_mem = get_available_gpu_memory(self.device, self.gpu_id)
                 logger.info(
