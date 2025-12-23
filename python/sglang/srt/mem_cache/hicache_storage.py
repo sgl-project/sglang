@@ -69,6 +69,10 @@ class HiCacheStorage(ABC):
 
     # todo, the page size of storage backend does not have to be the same as the same as host memory pool
 
+    @classmethod
+    def parse_uri(cls, uri: str) -> tuple[Optional[dict], str]:
+        raise NotImplementedError
+
     def register_mem_pool_host(self, mem_pool_host: HostKVCache):
         self.mem_pool_host = mem_pool_host
 
@@ -180,6 +184,12 @@ class HiCacheStorage(ABC):
     def get_stats(self):
         return None
 
+    def load(self, filepath: str, offset: int, data: torch.Tensor) -> None:
+        raise NotImplementedError
+
+    def save(self, filepath: str, offset: int, data: torch.Tensor) -> None:
+        raise NotImplementedError
+
 
 class HiCacheFile(HiCacheStorage):
 
@@ -203,6 +213,10 @@ class HiCacheFile(HiCacheStorage):
         if not os.path.exists(self.file_path) and tp_rank == 0:
             os.makedirs(self.file_path)
             logger.info(f"Created HiCacheFile storage directory at {self.file_path}")
+
+    @classmethod
+    def parse_uri(cls, uri: str) -> tuple[Optional[dict], str]:
+        return None, uri.removeprefix("file://")
 
     def _get_suffixed_key(self, key: str) -> str:
         return key + self.config_suffix
@@ -287,3 +301,18 @@ class HiCacheFile(HiCacheStorage):
         except Exception as e:
             logger.error(f"Failed to clear HiCacheFile storage: {e}")
             return False
+
+    def load(self, filepath: str, offset: int, data: torch.Tensor) -> None:
+        tensor_path = os.path.join(self.file_path, filepath.lstrip("/"))
+        expected = data.numel() * data.element_size()
+        with open(tensor_path, "rb", buffering=0) as f:
+            f.seek(offset)
+            buf = memoryview(data.contiguous().view(torch.uint8).numpy())
+            if f.readinto(buf) != expected:
+                raise IOError(f"Short read for {filepath}")
+
+    def save(self, filepath: str, offset: int, data: torch.Tensor) -> None:
+        tensor_path = os.path.join(self.file_path, filepath.lstrip("/"))
+        with open(tensor_path, "r+b", buffering=0) as f:
+            f.seek(offset)
+            data.contiguous().view(dtype=torch.uint8).numpy().tofile(f)

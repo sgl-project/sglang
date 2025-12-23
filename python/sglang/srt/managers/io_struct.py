@@ -29,6 +29,7 @@ import torch
 
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.schedule_batch import BaseFinishReason
+from sglang.srt.mem_cache.session_cache import SessionCache
 from sglang.srt.multimodal.mm_utils import has_valid_data
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.utils import ImageData
@@ -143,6 +144,21 @@ class SessionParams:
     offset: Optional[int] = None
     replace: Optional[bool] = None
     drop_previous_output: Optional[bool] = None
+    # The session cache segments.
+    # Each segment is a dict with 'token_start', 'token_length',
+    # 'kv_uri', 'kv_start', and 'kv_length' keys.
+    stored_kv_cache: Optional[List[Dict]] = None
+    fresh_kv_cache: Optional[List[Dict]] = None
+
+    def __post_init__(self):
+        old = SessionCache(self.stored_kv_cache)
+        new = SessionCache(self.fresh_kv_cache)
+        if len(old) > 0 and len(new) > 0 and old.token_end != new.token_start:
+            raise ValueError(
+                f"KV cache segments are not contiguous: "
+                f"old ends at token {old.token_end}, "
+                f"but new starts at token {new.token_start}."
+            )
 
 
 # Type definitions for multimodal input data
@@ -993,6 +1009,9 @@ class BatchTokenIDOutput(
     # Number of times each request was retracted.
     retraction_counts: List[int]
 
+    # session params
+    session_params: List[Optional[SessionParams]]
+
     # The trainer step id. Used to know which step's weights are used for sampling.
     token_steps: List[List[int]] = None
 
@@ -1079,6 +1098,9 @@ class BatchStrOutput(
 
     # Number of times each request was retracted.
     retraction_counts: List[int]
+
+    # session params
+    session_params: List[Optional[SessionParams]]
 
     # The trainer step id. Used to know which step's weights are used for sampling.
     token_steps: List[List[int]] = None

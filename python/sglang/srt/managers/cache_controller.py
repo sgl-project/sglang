@@ -41,6 +41,7 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
+from sglang.srt.mem_cache.session_cache import SessionCache
 from sglang.srt.utils import get_device_module
 
 logger = logging.getLogger(__name__)
@@ -212,6 +213,18 @@ class StorageOperation:
         return self.id < other.id
 
 
+class SessionOperation:
+    def __init__(
+        self,
+        session_id: str,
+        kv_cache: SessionCache,
+    ):
+        self.session_id = session_id
+        self.kv_cache = kv_cache
+        self.done = False
+        self.ok = False
+
+
 class PrefetchOperation(StorageOperation):
     def __init__(
         self,
@@ -256,6 +269,7 @@ class HiCacheController:
         write_policy: str = "write_through_selective",
         io_backend: str = "",
         storage_backend: Optional[str] = None,
+        enable_session_cache: bool = False,
         prefetch_threshold: int = 256,
         model_name: Optional[str] = None,
         storage_backend_extra_config: Optional[dict] = None,
@@ -271,6 +285,7 @@ class HiCacheController:
         self.enable_storage = False
         self.pp_rank = pp_rank
         self.pp_size = pp_size
+        self.enable_session_cache = enable_session_cache
 
         if storage_backend is not None:
             self.storage_backend_type = storage_backend
@@ -377,6 +392,104 @@ class HiCacheController:
             self.prefetch_thread.start()
             self.backup_thread.start()
 
+        elif self.enable_session_cache:
+            self.prefetch_thread = threading.Thread(
+                target=self.prefetch_session_cache_func, daemon=True
+            )
+            self.backup_thread = threading.Thread(
+                target=self.backup_session_cache_func, daemon=True
+            )
+
+            self.prefetch_queue = Queue()
+            self.backup_queue = Queue()
+
+            self.prefetch_thread.start()
+            self.backup_thread.start()
+
+            self.storage_config = self._generate_storage_config(model_name, None)
+
+    def prefetch_from_session_cache(
+        self,
+        session_id: str,
+        stored_kv_cache: SessionCache,
+    ):
+        operation = SessionOperation(
+            session_id,
+            stored_kv_cache,
+        )
+        self.prefetch_queue.put(operation)
+        return operation
+
+    def append_session_cache(
+        self,
+        session_id: str,
+        fresh_kv_cache: SessionCache,
+    ):
+        operation = SessionOperation(
+            session_id,
+            fresh_kv_cache,
+        )
+        self.backup_queue.put(operation)
+        return operation
+
+    def prefetch_session_cache_func(self):
+        while not self.stop_event.is_set() or not self.prefetch_queue.empty():
+            prefetch_op: Optional[SessionOperation] = None
+            try:
+                prefetch_op = self.prefetch_queue.get(block=True, timeout=1)
+                if prefetch_op is None:
+                    continue
+
+                prefetch_op.kv_cache.prefetch(self.mem_pool_host, self.storage_config)
+
+                prefetch_op.done = True
+                prefetch_op.ok = True
+            except Empty:
+                continue
+            except Exception as e:
+                if prefetch_op is not None:
+                    logger.error(
+                        f"Prefetch session cache failed for op {prefetch_op}: {e}",
+                        exc_info=True,
+                    )
+                    prefetch_op.done = True
+                    prefetch_op.ok = False
+                else:
+                    logger.error(
+                        f"Unexpected error in prefetch thread: {e}", exc_info=True
+                    )
+                continue
+
+    def backup_session_cache_func(self):
+        while not self.stop_event.is_set() or not self.backup_queue.empty():
+            backup_op: Optional[SessionOperation] = None
+            try:
+                backup_op = self.backup_queue.get(block=True, timeout=1)
+                if backup_op is None:
+                    continue
+
+                backup_op.kv_cache.backup(
+                    self.mem_pool_device, self.mem_pool_host, self.storage_config
+                )
+
+                backup_op.done = True
+                backup_op.ok = True
+            except Empty:
+                continue
+            except Exception as e:
+                if backup_op is not None:
+                    logger.error(
+                        f"Backup session cache failed for op {backup_op}: {e}",
+                        exc_info=True,
+                    )
+                    backup_op.done = True
+                    backup_op.ok = False
+                else:
+                    logger.error(
+                        f"Unexpected error in backup thread: {e}", exc_info=True
+                    )
+                continue
+
     def _generate_storage_config(
         self,
         model_name: Optional[str] = None,
@@ -422,6 +535,11 @@ class HiCacheController:
             self.backup_queue.queue.clear()
             self.prefetch_revoke_queue.queue.clear()
             self.ack_backup_queue.queue.clear()
+        elif self.enable_session_cache:
+            self.prefetch_thread.join()
+            self.backup_thread.join()
+            self.prefetch_queue.queue.clear()
+            self.backup_queue.queue.clear()
 
         self.stop_event.clear()
 
@@ -432,6 +550,17 @@ class HiCacheController:
             self.backup_thread = threading.Thread(
                 target=self.backup_thread_func, daemon=True
             )
+            self.prefetch_thread.start()
+            self.backup_thread.start()
+
+        elif self.enable_session_cache:
+            self.prefetch_thread = threading.Thread(
+                target=self.prefetch_session_cache_func, daemon=True
+            )
+            self.backup_thread = threading.Thread(
+                target=self.backup_session_cache_func, daemon=True
+            )
+
             self.prefetch_thread.start()
             self.backup_thread.start()
 
