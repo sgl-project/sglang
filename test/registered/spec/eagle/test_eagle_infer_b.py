@@ -338,16 +338,11 @@ class TestEAGLEServerPageSizeTopkFA3(TestEAGLEServerBasic):
     spec_topk = 5
     spec_steps = 8
     spec_tokens = 64
-    spec_algo = "EAGLE3"
-    draft_model = "lmsys/sglang-EAGLE3-LLaMA3.1-Instruct-8B"
-    target_model = "meta-llama/Llama-3.1-8B-Instruct"
 
     extra_args = [
         "--page-size=256",
         "--attention-backend=fa3",
         "--cuda-graph-max-bs=5",
-        "--skip-server-warmup",
-        "--trust-remote-code",
         "--dtype=float16",
         "--max-running-requests=8",
     ]
