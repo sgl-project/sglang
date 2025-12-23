@@ -14,7 +14,6 @@ import concurrent.futures
 import pytest
 import requests
 
-
 # =============================================================================
 # EPD Router Configuration Tests
 # =============================================================================
@@ -547,7 +546,6 @@ def test_epd_asymmetric_worker_counts(router_manager, mock_workers):
     response = requests.get(f"{rh.url}/health", timeout=10)
     assert response.status_code == 200
 
-    # Send some requests to verify it works
     for i in range(10):
         r = requests.post(
             f"{rh.url}/v1/completions",
@@ -618,7 +616,6 @@ def test_epd_invalid_request(router_manager, mock_workers):
         extra={"worker_startup_check_interval": 1},
     )
 
-    # Empty messages
     response = requests.post(
         f"{rh.url}/v1/chat/completions",
         json={
@@ -628,7 +625,6 @@ def test_epd_invalid_request(router_manager, mock_workers):
         },
         timeout=30,
     )
-    # Should return error (4xx) or be handled
     assert response.status_code in (200, 400, 422)
 
 
@@ -652,7 +648,6 @@ def test_epd_missing_model(router_manager, mock_workers):
         extra={"worker_startup_check_interval": 1},
     )
 
-    # Request without model field
     response = requests.post(
         f"{rh.url}/v1/chat/completions",
         json={
@@ -661,5 +656,4 @@ def test_epd_missing_model(router_manager, mock_workers):
         },
         timeout=30,
     )
-    # Should be handled (may succeed with default model or return error)
     assert response.status_code in (200, 400, 422)
