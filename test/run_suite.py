@@ -168,10 +168,18 @@ def run_a_suite(args):
 
     pretty_print_tests(args, ci_tests, skipped_tests)
 
+    # Add extra timeout when retry is enabled
+    timeout = args.timeout_per_file
+    if args.enable_retry:
+        timeout += args.retry_timeout_increase
+
     return run_unittest_files(
         ci_tests,
-        timeout_per_file=args.timeout_per_file,
+        timeout_per_file=timeout,
         continue_on_error=args.continue_on_error,
+        enable_retry=args.enable_retry,
+        max_attempts=args.max_attempts,
+        retry_wait_seconds=args.retry_wait_seconds,
     )
 
 
@@ -213,6 +221,30 @@ def main():
         "--auto-partition-size",
         type=int,
         help="Use auto load balancing. The number of parts.",
+    )
+    parser.add_argument(
+        "--enable-retry",
+        action="store_true",
+        default=False,
+        help="Enable smart retry for accuracy/performance assertion failures (not code errors)",
+    )
+    parser.add_argument(
+        "--max-attempts",
+        type=int,
+        default=2,
+        help="Maximum number of attempts per file including initial run (default: 2)",
+    )
+    parser.add_argument(
+        "--retry-wait-seconds",
+        type=int,
+        default=60,
+        help="Seconds to wait between retries (default: 60)",
+    )
+    parser.add_argument(
+        "--retry-timeout-increase",
+        type=int,
+        default=600,
+        help="Additional timeout in seconds when retry is enabled (default: 600)",
     )
     args = parser.parse_args()
 
