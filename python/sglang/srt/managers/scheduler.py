@@ -950,6 +950,7 @@ class Scheduler(
                 hf_config=self.model_config.hf_config,
                 tp_rank=self.tp_rank,
                 pp_rank=self.pp_rank,
+                tp_group=self.tp_group,
             )
 
     def init_overlap(self):
