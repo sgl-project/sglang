@@ -89,9 +89,7 @@ class ScenarioConfig:
     expected_e2e_ms: float
     expected_avg_denoise_ms: float
     expected_median_denoise_ms: float
-    estimated_full_test_time_s: float | None = (
-        None  # 完整测试时间（秒），包含服务器启动
-    )
+    estimated_full_test_time_s: float | None = None
 
 
 @dataclass
