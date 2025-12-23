@@ -12,9 +12,13 @@ import os
 import unittest
 from typing import List
 
+from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.nightly_bench_utils import BenchmarkResult
 from sglang.test.nightly_utils import NightlyBenchmarkRunner
 from sglang.test.test_utils import DEFAULT_URL_FOR_TEST, _parse_int_list_env
+
+# Register for AMD CI - DeepSeek-V3.1 benchmark (basic + MTP, ~300 min)
+register_amd_ci(est_time=18000, suite="nightly-perf-8-gpu-deepseek-v31", nightly=True)
 
 
 def generate_simple_markdown_report(results: List[BenchmarkResult]) -> str:
