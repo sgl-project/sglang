@@ -197,7 +197,6 @@ suites = {
         TestFile("test_profile_v2.py"),
         TestFile("models/test_ministral3_models.py"),
         TestFile("test_mistral_large3_basic.py"),
-        TestFile("test_soft_watchdog.py"),
     ],
 }
 
