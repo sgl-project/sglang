@@ -784,37 +784,38 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 self.speculative_num_steps + 1,
             )
 
-            tree_size = self.speculative_num_draft_tokens
             is_tree_mode = self.topk > 1
 
             if is_tree_mode:
-                # Tree mode: compact accepted KV cache to the front of the per-request
-                # speculative region so subsequent decode reads contiguous KV.
-                # This replaces the old req_to_token permutation approach.
-                if _is_cuda or _is_hip:
-                    accept_index_len = self.speculative_num_steps + 1
-                    src_cache_loc = torch.empty(
-                        (bs * accept_index_len,),
-                        dtype=batch.out_cache_loc.dtype,
-                        device=batch.out_cache_loc.device,
-                    )
-                    tgt_cache_loc = torch.empty_like(src_cache_loc)
-                    build_compact_kv_src_tgt_cache_loc[(bs,)](
-                        accept_index,
-                        accept_length,
-                        batch.out_cache_loc,
-                        src_cache_loc,
-                        tgt_cache_loc,
-                        self.speculative_num_draft_tokens,
-                        accept_index_len,
-                        next_power_of_2(accept_index_len),
-                    )
-                    self.token_to_kv_pool_allocator.get_kvcache().move_kv_cache(
-                        tgt_loc=tgt_cache_loc,
-                        src_loc=src_cache_loc,
-                    )
+                # Tree mode requires CUDA/HIP for Triton kernels
+                if not (_is_cuda or _is_hip):
+                    raise RuntimeError("Tree mode speculative decoding (topk > 1) requires CUDA or HIP.")
 
-                # Tree mode: compact scattered acceptance to prefix
+                # Compact accepted KV cache to the front of the per-request
+                # speculative region so subsequent decode reads contiguous KV.
+                accept_index_len = self.speculative_num_steps + 1
+                src_cache_loc = torch.empty(
+                    (bs * accept_index_len,),
+                    dtype=batch.out_cache_loc.dtype,
+                    device=batch.out_cache_loc.device,
+                )
+                tgt_cache_loc = torch.empty_like(src_cache_loc)
+                build_compact_kv_src_tgt_cache_loc[(bs,)](
+                    accept_index,
+                    accept_length,
+                    batch.out_cache_loc,
+                    src_cache_loc,
+                    tgt_cache_loc,
+                    self.speculative_num_draft_tokens,
+                    accept_index_len,
+                    next_power_of_2(accept_index_len),
+                )
+                self.token_to_kv_pool_allocator.get_kvcache().move_kv_cache(
+                    tgt_loc=tgt_cache_loc,
+                    src_loc=src_cache_loc,
+                )
+
+                # Compact scattered acceptance to prefix
                 (
                     padded_predict,
                     packed_hidden,
@@ -822,7 +823,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 ) = compact_data_tensors_func(
                     accept_index,
                     accept_length,
-                    tree_size,
+                    self.speculative_num_draft_tokens,
                     predict,
                     logits_output.hidden_states,
                     batch.out_cache_loc,
