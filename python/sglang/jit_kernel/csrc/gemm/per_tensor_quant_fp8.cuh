@@ -1,3 +1,4 @@
+#include <sgl_kernel/fp8_utils.cuh>
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.cuh>
 #include <sgl_kernel/utils.h>
