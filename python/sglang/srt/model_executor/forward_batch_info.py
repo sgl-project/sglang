@@ -687,7 +687,7 @@ class ForwardBatch:
                     )
                 else:
                     mrope_positions = self._expand_mrope_from_input(
-                        mm_input, self.seq_lens_cpu[batch_idx], model_runner.device
+                        mm_input, self.seq_lens_cpu[batch_idx]
                     )
                     mrope_positions_list[batch_idx] = mrope_positions
             elif self.forward_mode.is_extend():
