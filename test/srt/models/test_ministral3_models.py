@@ -1,20 +1,20 @@
 import unittest
 from types import SimpleNamespace
 
-from sglang.test.gsm8k_mixin import GSM8KMixin
-from sglang.test.mmmu_vlm_mixin import MMMUVLMMixin
-from sglang.test.test_utils import CustomTestCase
+from sglang.test.kits.gsm8k_accuracy_kit import GSM8KMixin
+from sglang.test.kits.mmmu_vlm_kit import MMMUVLMTestBase
+from sglang.test.server_fixtures.default_fixture import DefaultServerBase
 
 MODEL = "mistralai/Ministral-3-3B-Instruct-2512"
 
 
-class TestMinistral3TextOnly(GSM8KMixin, CustomTestCase):
+class TestMinistral3TextOnly(GSM8KMixin, DefaultServerBase):
     accuracy = 0.6
     model = MODEL
     other_args = ["--trust-remote-code"]
 
 
-class TestMinistral3MMMU(MMMUVLMMixin, CustomTestCase):
+class TestMinistral3MMMU(MMMUVLMTestBase):
     accuracy = 0.3
     model = MODEL
     other_args = ["--trust-remote-code"]

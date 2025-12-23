@@ -20,7 +20,7 @@ from sglang.test.test_utils import (
     run_logprob_check,
 )
 
-register_cuda_ci(est_time=473, suite="stage-b-test-small-1-gpu")
+register_cuda_ci(est_time=1100, suite="stage-b-test-small-1-gpu")
 
 
 class TestEAGLEServerBasic(EagleServerBase):
