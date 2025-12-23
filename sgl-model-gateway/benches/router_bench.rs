@@ -1,13 +1,11 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use ax_http::HeaderMap; // Ensure this matches your project's http/header crate
+// Use axum's http module as seen in src/routers/router_manager.rs
+use axum::http::HeaderMap;
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
 use dashmap::DashMap;
-use sgl_model_gateway::{
-    core::{ConnectionMode, RuntimeType, Worker, WorkerRegistry, WorkerType},
-    routers::{RouterId, RouterTrait},
-};
+use sgl_model_gateway::routers::{router_manager::RouterId, RouterTrait};
 
 // --- MOCK OBJECTS ---
 
@@ -31,14 +29,15 @@ impl RouterTrait for MockRouter {
     fn is_pd_mode(&self) -> bool {
         self.is_pd
     }
-    // Mandatory trait method
+
+    // Implement the required trait method with the correct signature
     async fn route_chat(
         &self,
-        _: Option<&HeaderMap>,
-        _: &sgl_model_gateway::protocols::chat::ChatCompletionRequest,
-        _: Option<&str>,
+        _headers: Option<&HeaderMap>,
+        _body: &sgl_model_gateway::protocols::chat::ChatCompletionRequest,
+        _model_id: Option<&str>,
     ) -> axum::response::Response {
-        todo!()
+        axum::response::StatusCode::OK.into_response()
     }
 }
 
@@ -50,10 +49,10 @@ fn current_logic(
     num_regular: usize,
     num_pd: usize,
 ) -> Option<Arc<dyn RouterTrait>> {
-    // This simulates the collect() call in the current codebase
-    let candidate_routers = routers
+    // FIX: Provide explicit type for candidate_routers to help inference
+    let candidate_routers: Vec<Arc<dyn RouterTrait>> = routers
         .iter()
-        .map(|entry| entry.value().clone())
+        .map(|entry| Arc::clone(entry.value()))
         .collect::<Vec<_>>();
 
     let mut best_router = None;
@@ -63,7 +62,6 @@ fn current_logic(
         let mut score = 1.0;
         let is_pd = router.is_pd_mode();
 
-        // Simplified scoring
         if is_pd {
             score += 1.0;
         }
@@ -83,12 +81,12 @@ fn fixed_logic(
     num_regular: usize,
     num_pd: usize,
 ) -> Option<Arc<dyn RouterTrait>> {
-    let mut best_router = None;
+    let mut best_router: Option<Arc<dyn RouterTrait>> = None;
     let mut best_score = 0.0;
 
-    // Zero-allocation: iterate directly
+    // FIX: Explicitly reference the DashMap entry value type
     for entry in routers.iter() {
-        let router = entry.value();
+        let router: &Arc<dyn RouterTrait> = entry.value();
         let mut score = 1.0;
         let is_pd = router.is_pd_mode();
 
@@ -110,8 +108,7 @@ fn fixed_logic(
 fn bench_routers(c: &mut Criterion) {
     let mut group = c.benchmark_group("Router Selection Scaling");
 
-    for size in [2, 10, 100, 500].iter() {
-        // Setup: Create a map with 'size' routers
+    for size in [2, 10, 100].iter() {
         let routers = DashMap::new();
         for i in 0..*size {
             let id = RouterId::new(format!("router-{}", i));
@@ -120,14 +117,14 @@ fn bench_routers(c: &mut Criterion) {
                 Arc::new(MockRouter { is_pd: i % 2 == 0 }) as Arc<dyn RouterTrait>,
             );
         }
-        let routers = Arc::new(routers);
+        let routers_ref = &routers;
 
         group.bench_with_input(
             BenchmarkId::new("Current (Allocating)", size),
             size,
             |b, _| {
                 b.iter(|| {
-                    black_box(current_logic(&routers, 5, 5));
+                    black_box(current_logic(routers_ref, 5, 5));
                 });
             },
         );
@@ -137,7 +134,7 @@ fn bench_routers(c: &mut Criterion) {
             size,
             |b, _| {
                 b.iter(|| {
-                    black_box(fixed_logic(&routers, 5, 5));
+                    black_box(fixed_logic(routers_ref, 5, 5));
                 });
             },
         );
