@@ -63,6 +63,7 @@ Its core features include:
    advanced_features/deterministic_inference.md
    advanced_features/observability.md
    advanced_features/checkpoint_engine.md
+   advanced_features/session_cache.md
 
 .. toctree::
    :maxdepth: 1
