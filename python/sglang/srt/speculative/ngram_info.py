@@ -206,10 +206,12 @@ class NgramVerifyInput(SpecInput):
         bs = batch.batch_size()
         # Free the KV cache for unaccepted tokens
         if page_size == 1:
-            # TODO: boolean array index leads to a device sync. Remove it.
+            # Use torch.nonzero to avoid boolean indexing device sync
             evict_mask = torch.full_like(self.draft_token, True, dtype=torch.bool)
             evict_mask[self.accept_index] = False
-            batch.token_to_kv_pool_allocator.free(batch.out_cache_loc[evict_mask])
+            evict_indices = torch.nonzero(evict_mask, as_tuple=True)[0]
+            if evict_indices.numel() > 0:
+                batch.token_to_kv_pool_allocator.free(batch.out_cache_loc[evict_indices])
             batch.out_cache_loc = batch.out_cache_loc[self.accept_index]
         else:
             # Shift the accepted tokens to the beginning.

@@ -440,8 +440,10 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
         accept_length_list = accept_length_cpu.tolist()
 
         if page_size == 1:
-            # TODO: boolean array index leads to a device sync. Remove it.
-            token_to_kv_pool_allocator.free(batch.out_cache_loc[evict_mask])
+            # Use torch.nonzero to avoid boolean indexing device sync
+            evict_indices = torch.nonzero(evict_mask, as_tuple=True)[0]
+            if evict_indices.numel() > 0:
+                token_to_kv_pool_allocator.free(batch.out_cache_loc[evict_indices])
             for i, req in enumerate(batch.reqs):
                 req.kv_committed_len += accept_length_list[i] + 1
                 req.kv_allocated_len = req.kv_committed_len
@@ -455,7 +457,10 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                     self.draft_token_num,
                     next_power_of_2(self.draft_token_num),
                 )
-                token_to_kv_pool_allocator.free(batch.out_cache_loc[evict_mask])
+                # Use torch.nonzero to avoid boolean indexing device sync
+                evict_indices = torch.nonzero(evict_mask, as_tuple=True)[0]
+                if evict_indices.numel() > 0:
+                    token_to_kv_pool_allocator.free(batch.out_cache_loc[evict_indices])
                 for i, req in enumerate(batch.reqs):
                     req.kv_committed_len += accept_length_list[i] + 1
                     req.kv_allocated_len = req.kv_committed_len
