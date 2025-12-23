@@ -235,6 +235,19 @@ impl RouterManager {
             }
         }
 
+        // Multi-router mode logic follows
+        let _priority_threshold = headers.and_then(|h| {
+            h.get("x-worker-priority")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse::<u32>().ok())
+        });
+
+        let _max_cost = headers.and_then(|h| {
+            h.get("x-max-cost")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse::<f32>().ok())
+        });
+
         let prefer_pd = headers
             .and_then(|h| {
                 h.get("x-prefer-pd")
@@ -269,6 +282,11 @@ impl RouterManager {
                 } else if !prefer_pd && !is_pd {
                     score += 1.0;
                 }
+
+                // TODO: Once routers expose worker stats, we can evaluate:
+                // - Average worker priority vs priority_threshold
+                // - Average worker cost vs max_cost
+                // - Current load and health status
 
                 let valid_router =
                     (is_pd && num_pd_workers > 0) || (!is_pd && num_regular_workers > 0);

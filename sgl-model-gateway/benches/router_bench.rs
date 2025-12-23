@@ -10,7 +10,6 @@ use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criteri
 use dashmap::DashMap;
 use sgl_model_gateway::routers::{router_manager::RouterId, RouterTrait};
 
-// --- MOCK OBJECTS ---
 #[derive(Debug)]
 struct MockRouter {
     is_pd: bool,
@@ -41,7 +40,7 @@ impl RouterTrait for MockRouter {
     }
 }
 
-// --- BEFORE OPTIMIZATION (Allocating) ---
+// BEFORE OPTIMIZATION
 fn current_logic(
     routers: &DashMap<RouterId, Arc<dyn RouterTrait>>,
 ) -> Option<Arc<dyn RouterTrait>> {
@@ -63,7 +62,7 @@ fn current_logic(
     best_router
 }
 
-// --- AFTER OPTIMIZATION (Snapshot) ---
+//  AFTER OPTIMIZATION (Snapshot)
 fn snapshot_logic(snapshot: &ArcSwap<Vec<Arc<dyn RouterTrait>>>) -> Option<Arc<dyn RouterTrait>> {
     // Atomic load: Zero allocation, lock-free
     let routers = snapshot.load();
@@ -80,7 +79,7 @@ fn snapshot_logic(snapshot: &ArcSwap<Vec<Arc<dyn RouterTrait>>>) -> Option<Arc<d
     best_router
 }
 
-// --- BENCHMARK RUNNER ---
+//  BENCHMARK RUNNER
 fn bench_router_optimization(c: &mut Criterion) {
     let mut group = c.benchmark_group("Router Selection Improvement");
 
