@@ -29,7 +29,7 @@ from sglang.srt.speculative.spec_utils import (
     SIMULATE_ACC_LEN,
     generate_simulated_accept_index,
 )
-from sglang.srt.utils.common import is_cuda, is_hip, is_npu, next_power_of_2
+from sglang.srt.utils.common import is_cuda, is_hip, is_npu, next_power_of_2, ceil_div
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
@@ -97,13 +97,41 @@ class EagleDraftInputV2Mixin:
         cur_kv_lens_cpu = []
         nxt_kv_lens_cpu = []
         num_needed_tokens = 0
-        for r in batch.reqs:
-            # Over-allocation happens here
-            x = r.kv_committed_len + 2 * self.ALLOC_LEN_PER_DECODE - r.kv_allocated_len
-            cur_kv_lens_cpu.append(r.kv_allocated_len)
-            nxt_kv_lens_cpu.append(r.kv_allocated_len + x)
+        
+        # paged(topk>1) alloc lower bound
+        # TODO Simply Getattr... Think of optimizing it later
+        seq_lens_cpu = getattr(batch, "seq_lens_cpu", batch.seq_lens.cpu())
+        page_size = batch.token_to_kv_pool_allocator.page_size
+        server_args = get_global_server_args()
+        topk = int(getattr(server_args, "speculative_eagle_topk", 1))
+        num_steps = int(getattr(server_args, "speculative_num_steps", 0))
+        self.page_size = page_size                                      # for later use...
+
+        for i, r in enumerate(batch.reqs):
+            x_dense = int(r.kv_committed_len + 2 * self.ALLOC_LEN_PER_DECODE - r.kv_allocated_len)
+            if x_dense < 0:
+                x_dense = 0
+
+            x_paged_min = 0
+            if page_size > 1 and topk > 1:
+                prefix_len = int(seq_lens_cpu[i])
+                last = prefix_len % page_size
+                base = prefix_len - last
+                num_new_pages = (last + num_steps + page_size - 1) // page_size
+
+                # abs lower_bound ：token_pool covers for base + topk*num_new_pages*page_size
+                required_min = base + topk * num_new_pages * page_size
+
+                x_paged_min = required_min - int(r.kv_allocated_len)
+                if x_paged_min < 0:
+                    x_paged_min = 0
+
+            x = x_dense if x_dense > x_paged_min else x_paged_min
+
+            cur_kv_lens_cpu.append(int(r.kv_allocated_len))
+            r.kv_allocated_len = int(r.kv_allocated_len) + x
+            nxt_kv_lens_cpu.append(int(r.kv_allocated_len))
             num_needed_tokens += x
-            r.kv_allocated_len += x
 
         cur_kv_lens_cpu = torch.tensor(cur_kv_lens_cpu, dtype=torch.int32, device="cpu")
         nxt_kv_lens_cpu = torch.tensor(nxt_kv_lens_cpu, dtype=torch.int32, device="cpu")
@@ -153,22 +181,50 @@ class EagleDraftInputV2Mixin:
         if not batch.forward_mode.is_idle():
             bs = len(batch.seq_lens)
 
-            # Assign cache locations
-            batch.out_cache_loc = torch.empty(
-                (bs * topk * num_steps,),
-                dtype=torch.int64,
-                device=batch.input_ids.device,
-            )
-            # FIXME(lsyin): align with the default code path
-            assign_draft_cache_locs_page_size_1[(bs,)](
-                batch.req_pool_indices,
-                req_to_token_pool.req_to_token,
-                batch.seq_lens,
-                batch.out_cache_loc,
-                req_to_token_pool.req_to_token.shape[1],
-                topk,
-                num_steps,
-            )
+            # Assign cache locations (page_size==1 or topk==1 => dense; else paged gather)
+            page_size = int(self.page_size)
+            topk = int(topk)
+            num_steps = int(num_steps)
+
+            if page_size == 1 or topk == 1:
+                batch.out_cache_loc = torch.empty(
+                    (bs * topk * num_steps,),
+                    device=batch.device,
+                    dtype=torch.int64,
+                )
+                assign_draft_cache_locs_page_size_1[(bs,)](
+                    batch.req_pool_indices,
+                    req_to_token_pool.req_to_token,
+                    batch.seq_lens,
+                    batch.out_cache_loc,
+                    req_to_token_pool.req_to_token.shape[1],
+                    topk,
+                    num_steps,
+                )
+
+            else:
+                # --- paged(topk>1) gather out_cache_loc from req_to_token ---
+                idx = batch.req_pool_indices.to(torch.int64)
+                rows = req_to_token_pool.req_to_token[idx]
+                pool_len = rows.size(1)
+
+                seq_lens = batch.seq_lens.to(rows.device, dtype=torch.int64)
+                last_page = seq_lens % page_size
+                prefix_base = seq_lens - last_page
+                num_new_pages = (last_page + num_steps + page_size - 1) // page_size  # (bs,)
+
+                topk_ids = torch.arange(topk, device=rows.device, dtype=torch.int64).view(1, topk)  # (1,topk)
+                starts = prefix_base.view(bs, 1) + topk_ids * (num_new_pages.view(bs, 1) * page_size) + last_page.view(bs, 1)
+                steps = torch.arange(num_steps, device=rows.device, dtype=torch.int64).view(1, 1, num_steps)
+
+                pos = (starts.view(bs, topk, 1) + steps).reshape(bs, topk * num_steps)
+
+                # TODO assertion should be removed into unit test
+                # assert int(pos.max()) < int(pool_len), f"paged out_cache_loc OOB: max_pos={int(pos.max())}, pool_len={int(pool_len)}"
+                # assert int(pos.min()) >= 0, f"paged out_cache_loc negative pos: min_pos={int(pos.min())}"
+
+                out = torch.gather(rows, 1, pos)  # (bs, topk*S)
+                batch.out_cache_loc = out.to(torch.int64).reshape(-1)
 
         # Get a forward batch
         self.num_tokens_per_batch = topk
