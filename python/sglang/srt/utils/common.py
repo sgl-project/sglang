@@ -3443,7 +3443,7 @@ def check_cuda_result(raw_output):
     return results
 
 
-def get_physical_device_id(pytorch_device_id: int) -> int:
+def get_physical_device_id() -> int:
     """
     Convert PyTorch logical device ID to physical device ID.
     """
