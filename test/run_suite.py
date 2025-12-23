@@ -24,6 +24,7 @@ PER_COMMIT_SUITES = {
         "stage-b-test-small-1-gpu",
         "stage-b-test-large-1-gpu",
         "stage-b-test-large-2-gpu",
+        "stage-c-test-large-4-gpu",
         "stage-b-test-4-gpu-b200",
     ],
     HWBackend.NPU: [],

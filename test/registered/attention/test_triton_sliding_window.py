@@ -4,6 +4,7 @@ from types import SimpleNamespace
 import requests
 
 from sglang.srt.utils import kill_process_tree
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -12,6 +13,9 @@ from sglang.test.test_utils import (
     is_in_ci,
     popen_launch_server,
 )
+
+# Sliding window attention with Triton backend (Gemma-3 model)
+register_cuda_ci(est_time=100, suite="stage-b-test-small-1-gpu")
 
 
 class TestSlidingWindowAttentionTriton(CustomTestCase):

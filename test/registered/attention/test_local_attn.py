@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import requests
 
 from sglang.srt.utils import get_device_sm, kill_process_tree
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST_LOCAL_ATTENTION,
@@ -13,6 +14,9 @@ from sglang.test.test_utils import (
     CustomTestCase,
     popen_launch_server,
 )
+
+# Local attention with FA3 (requires SM 90+ / H100, tp=4)
+register_cuda_ci(est_time=200, suite="stage-c-test-large-4-gpu")
 
 
 @unittest.skipIf(get_device_sm() < 90, "Test requires CUDA SM 90 or higher")

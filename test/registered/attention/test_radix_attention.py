@@ -1,6 +1,7 @@
 import unittest
 
 from sglang.srt.environ import envs
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.radix_cache_server_kit import run_radix_attention_test
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
@@ -11,6 +12,9 @@ from sglang.test.test_utils import (
     kill_process_tree,
     popen_launch_server,
 )
+
+# RadixAttention server integration tests
+register_cuda_ci(est_time=100, suite="stage-b-test-small-1-gpu")
 
 
 class TestRadixCacheFCFS(CustomTestCase):
