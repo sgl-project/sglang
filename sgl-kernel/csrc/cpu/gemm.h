@@ -67,6 +67,16 @@ inline int64_t get_row_size(int64_t K, bool use_int8_w8a8) {
   return use_int8_w8a8 ? K + sizeof(int32_t) : K;
 }
 
+enum class CPUAcTMethod : int { silu_and_mul = 0, swiglu = 1 };
+
+constexpr bool operator==(CPUAcTMethod a, int b) {
+  return static_cast<int>(a) == b;
+}
+
+constexpr bool operator==(int a, CPUAcTMethod b) {
+  return a == static_cast<int>(b);
+}
+
 // pack weight to vnni format
 at::Tensor convert_weight_packed(at::Tensor& weight);
 
@@ -109,6 +119,8 @@ void fused_experts_fp_kernel_impl(
     const scalar_t* __restrict__ input,
     const packed_t* __restrict__ packed_w1,
     const packed_t* __restrict__ packed_w2,
+    const scalar_t* __restrict__ w1_bias,
+    const scalar_t* __restrict__ w2_bias,
     const param_t* __restrict__ w1s,
     const param_t* __restrict__ w2s,
     int64_t block_size_N,
@@ -122,7 +134,11 @@ void fused_experts_fp_kernel_impl(
     int64_t K,
     int64_t E,
     int64_t topk,
-    int64_t num_tokens_post_pad);
+    int64_t num_tokens_post_pad,
+    float alpha,
+    float limit,
+    CPUAcTMethod act_func,
+    bool with_bias);
 
 // shared expert implementation for int8 w8a8
 template <typename scalar_t>

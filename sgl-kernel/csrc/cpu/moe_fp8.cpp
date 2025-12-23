@@ -147,6 +147,8 @@ void fused_experts_fp_kernel_impl(
     const scalar_t* __restrict__ input,
     const packed_t* __restrict__ packed_w1,
     const packed_t* __restrict__ packed_w2,
+    const scalar_t* __restrict__ w1_bias,
+    const scalar_t* __restrict__ w2_bias,
     const param_t* __restrict__ w1s,
     const param_t* __restrict__ w2s,
     int64_t block_size_N,
@@ -160,7 +162,11 @@ void fused_experts_fp_kernel_impl(
     int64_t K,
     int64_t E,
     int64_t topk,
-    int64_t num_tokens_post_pad) {
+    int64_t num_tokens_post_pad,
+    float alpha,
+    float limit,
+    CPUAcTMethod act_func,
+    bool with_bias) {
   constexpr int64_t BLOCK_M = block_size_m();
   constexpr int64_t BLOCK_N = block_size_n();
 
@@ -334,6 +340,8 @@ void fused_experts_fp_kernel_impl(
       const TYPE1* __restrict__ input,                                       \
       const TYPE2* __restrict__ packed_w1,                                   \
       const TYPE2* __restrict__ packed_w2,                                   \
+      const TYPE1* __restrict__ w1_bias,                                     \
+      const TYPE1* __restrict__ w2_bias,                                     \
       const TYPE3* __restrict__ w1s,                                         \
       const TYPE3* __restrict__ w2s,                                         \
       int64_t block_size_N,                                                  \
@@ -347,7 +355,11 @@ void fused_experts_fp_kernel_impl(
       int64_t K,                                                             \
       int64_t E,                                                             \
       int64_t topk,                                                          \
-      int64_t num_tokens_post_pad)
+      int64_t num_tokens_post_pad,                                           \
+      float alpha,                                                           \
+      float limit,                                                           \
+      CPUAcTMethod act_func,                                                 \
+      bool with_bias)
 
 INSTANTIATE_MOE_FP_TEMPLATE(at::BFloat16, at::Float8_e4m3fn, float, false);
 INSTANTIATE_MOE_FP_TEMPLATE(at::Half, at::Float8_e4m3fn, float, false);

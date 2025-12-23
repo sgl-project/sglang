@@ -25,16 +25,6 @@ namespace {
 //     3. abstract at::native::cpublas::brgemm with WoQ gemm (M = 1 & M != 1)
 //
 
-enum class CPUAcTMethod : int { silu_and_mul = 0, swiglu = 1 };
-
-constexpr bool operator==(CPUAcTMethod a, int b) {
-  return static_cast<int>(a) == b;
-}
-
-constexpr bool operator==(int a, CPUAcTMethod b) {
-  return a == static_cast<int>(b);
-}
-
 template <typename scalar_t>
 inline void fill_stub(scalar_t* __restrict__ out, scalar_t val, int64_t size) {
   using Vec = at::vec::Vectorized<scalar_t>;
@@ -1261,6 +1251,8 @@ at::Tensor fused_experts_cpu(
       float* __restrict__ C_tmp = (float*)((void*)(A_tmp + num_threads * BLOCK_M * K));
       scalar_t* __restrict__ intermediate_cache0 = (scalar_t*)((void*)(C_tmp + num_threads * 2 * BLOCK_M * BLOCK_N));
       scalar_t* __restrict__ B_tmp = (scalar_t*)((void*)(intermediate_cache0 + M * topk * 2 * N));
+      bool with_bias = w1_bias.has_value();
+      auto act_func = alpha.has_value() && limit.has_value() ? CPUAcTMethod::swiglu : CPUAcTMethod::silu_and_mul;
 
       CHECK_MOE_SCALES_FP8(1, 2);
       fused_experts_fp_kernel_impl<scalar_t, at::Float8_e4m3fn, float, false>(
@@ -1274,6 +1266,8 @@ at::Tensor fused_experts_cpu(
           hidden_states.data_ptr<scalar_t>(),
           packed_w1.data_ptr<at::Float8_e4m3fn>(),
           packed_w2.data_ptr<at::Float8_e4m3fn>(),
+          with_bias ? w1_bias.value().data_ptr<scalar_t>() : nullptr,
+          with_bias ? w2_bias.value().data_ptr<scalar_t>() : nullptr,
           w1s.data_ptr<float>(),
           w2s.data_ptr<float>(),
           block_size_N,
@@ -1287,12 +1281,19 @@ at::Tensor fused_experts_cpu(
           K,
           E,
           topk,
-          num_tokens_post_pad);
+          num_tokens_post_pad,
+          alpha.has_value() ? float(alpha.value()) : 0,
+          limit.has_value() ? float(limit.value()) : 0,
+          act_func,
+          with_bias);
     } else if (use_mxfp4) {
       scalar_t* __restrict__ A_tmp = (scalar_t*)((void*)(intermediate_cache2 + M * topk * K));
       float* __restrict__ C_tmp = (float*)((void*)(A_tmp + num_threads * BLOCK_M * K));
       scalar_t* __restrict__ intermediate_cache0 = (scalar_t*)((void*)(C_tmp + num_threads * 2 * BLOCK_M * BLOCK_N));
       scalar_t* __restrict__ B_tmp = (scalar_t*)((void*)(intermediate_cache0 + M * topk * 2 * N));
+      bool with_bias = w1_bias.has_value();
+      auto act_func = alpha.has_value() && limit.has_value() ? CPUAcTMethod::swiglu : CPUAcTMethod::silu_and_mul;
+
       // mxfp4 supports only group size of 32 (2^5)
       constexpr int64_t group_size = 32;
       auto w1s = w1_scale.value();
@@ -1310,6 +1311,8 @@ at::Tensor fused_experts_cpu(
           hidden_states.data_ptr<scalar_t>(),
           packed_w1.data_ptr<uint8_t>(),
           packed_w2.data_ptr<uint8_t>(),
+          with_bias ? w1_bias.value().data_ptr<scalar_t>() : nullptr,
+          with_bias ? w2_bias.value().data_ptr<scalar_t>() : nullptr,
           w1s.data_ptr<uint8_t>(),
           w2s.data_ptr<uint8_t>(),
           /*block_size_N*/ 1,
@@ -1323,7 +1326,11 @@ at::Tensor fused_experts_cpu(
           K,
           E,
           topk,
-          num_tokens_post_pad);
+          num_tokens_post_pad,
+          alpha.has_value() ? float(alpha.value()) : 0,
+          limit.has_value() ? float(limit.value()) : 0,
+          act_func,
+          with_bias);
     } else {
       scalar_t* __restrict__ A_tmp = intermediate_cache2 + M * topk * K;
       float* __restrict__ C_tmp = (float*)((void*)(A_tmp + num_threads * BLOCK_M * K));
