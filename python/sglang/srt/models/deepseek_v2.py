@@ -167,7 +167,6 @@ from sglang.srt.utils import (
     log_info_on_rank0,
     make_layers,
     use_intel_amx_backend,
-    get_torch_compile_disable_decorator,
     disable_duck_shaping,
 )
 
@@ -1842,7 +1841,6 @@ class DeepseekV2AttentionMLA(nn.Module):
             llama_4_scaling,
         )
 
-    #@get_torch_compile_disable_decorator(_is_hip)
     def forward_absorb_core(
         self,
         q_pe,
