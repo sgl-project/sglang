@@ -67,55 +67,44 @@ def quantize_k_cache_separate(
             f"k_nope and k_rope must have same num_tokens, got {num_tokens} vs {k_rope_2d.shape[0]}"
         )
 
-    # Call quantization kernel
+    # Call fast kernel that directly produces two separate outputs (single Triton kernel)
     if NSA_QUANT_K_CACHE_FAST:
-        # Direct call to fast kernel with separate inputs (avoids concat)
-        packed_output = _quantize_k_cache_fast(
+        nope_part, rope_part = _quantize_k_cache_fast_separate(
             k_nope=k_nope_2d, k_rope=k_rope_2d, group_size=tile_size
         )
-        # packed_output shape: (num_tokens, 656) as fp8/bf16 mix
-        # Layout: [nope_fp8(512) | nope_scales_fp32(16) | rope_bf16(128)]
     else:
-        # Fallback: use existing slow wrapper
+        # Fallback: use existing slow path with post-processing
         cache_k_concat = torch.cat([k_nope_2d, k_rope_2d], dim=-1)
         packed_output_4d = quantize_k_cache(cache_k_concat.unsqueeze(1).unsqueeze(1))
         packed_output = packed_output_4d.squeeze(1).squeeze(1)
 
-    # Convert to uint8 bytes view, handling dtype conversions safely
-    if packed_output.dtype == torch.uint8:
-        packed_bytes = packed_output
-    else:
-        # View as uint8 - this may change the last dimension size
+        # Convert to uint8 bytes view, ensuring contiguous layout
+        if not packed_output.is_contiguous():
+            packed_output = packed_output.contiguous()
         packed_bytes = packed_output.view(torch.uint8)
 
-    # Validate packed bytes dimension matches expected layout
-    # Expected: 512 (nope_fp8) + 16 (scales) + 128 (rope_bf16) = 656 bytes
-    expected_bytes = 656
-    if packed_bytes.shape[1] != expected_bytes:
-        raise ValueError(
-            f"Packed output has {packed_bytes.shape[1]} bytes, expected {expected_bytes}. "
-            f"Original dtype: {packed_output.dtype}, shape: {packed_output.shape}"
-        )
+        # Strict byte-size validation
+        expected_total_bytes = 656  # 512 (nope_fp8) + 16 (scales) + 128 (rope_bf16)
+        if packed_bytes.shape[1] != expected_total_bytes:
+            raise ValueError(
+                f"Packed output has {packed_bytes.shape[1]} bytes, expected {expected_total_bytes}. "
+                f"Original dtype: {packed_output.dtype}, shape: {packed_output.shape}"
+            )
 
-    # Split into nope and rope parts using layout constants
-    num_tiles = dim_nope // tile_size  # 4
-    nope_part_bytes = dim_nope + num_tiles * 4  # 512 + 16 = 528
-    # Derive rope_part_bytes from packed total to avoid hardcoding input element size
-    rope_part_bytes = packed_bytes.shape[1] - nope_part_bytes  # Should be 128
+        # Split into nope and rope parts with strict layout validation
+        num_tiles = dim_nope // tile_size  # 4
+        nope_part_bytes = dim_nope + num_tiles * 4  # 512 + 16 = 528
+        rope_part_bytes = 128
 
-    # Sanity check rope part size
-    expected_rope_bytes = 128
-    if rope_part_bytes != expected_rope_bytes:
-        raise ValueError(
-            f"Rope part has {rope_part_bytes} bytes, expected {expected_rope_bytes}"
-        )
+        if nope_part_bytes != 528:
+            raise ValueError(f"Expected nope_part_bytes=528, got {nope_part_bytes}")
+        if nope_part_bytes + rope_part_bytes != expected_total_bytes:
+            raise ValueError(
+                f"Layout mismatch: {nope_part_bytes} + {rope_part_bytes} != {expected_total_bytes}"
+            )
 
-    nope_part = packed_bytes[:, :nope_part_bytes].unsqueeze(1)  # (num_tokens, 1, 528)
-    rope_part = packed_bytes[
-        :, nope_part_bytes : nope_part_bytes + rope_part_bytes
-    ].unsqueeze(
-        1
-    )  # (num_tokens, 1, 128)
+        nope_part = packed_bytes[:, :nope_part_bytes].unsqueeze(1)
+        rope_part = packed_bytes[:, nope_part_bytes : nope_part_bytes + rope_part_bytes].unsqueeze(1)
 
     return nope_part, rope_part
 
@@ -252,6 +241,139 @@ def _quantize_k_cache_fast(k_nope, k_rope, group_size: int = 128):
     return output
 
 
+def _quantize_k_cache_fast_separate(k_nope, k_rope, group_size: int = 128):
+    """
+    Quantize k_nope and k_rope in a single Triton kernel, directly outputting two separate tensors.
+
+    This avoids packing/unpacking and enables direct use with set_mla_kv_buffer_triton.
+
+    :param k_nope: (num_tokens, dim_nope 512) bfloat16
+    :param k_rope: (num_tokens, dim_rope 64) bfloat16
+    :param group_size: quantization tile size (default 128, kernel is tuned for this value)
+    :return: Tuple of (nope_part_u8, rope_part_u8)
+        - nope_part_u8: (num_tokens, 1, nope_part_bytes) uint8, layout [nope_fp8(dim_nope) | scales(num_tiles*4)]
+        - rope_part_u8: (num_tokens, 1, rope_part_bytes) uint8, layout [rope_bf16_bytes(dim_rope*2)]
+    """
+    # Device validation
+    if not k_nope.is_cuda:
+        raise ValueError(f"k_nope must be on CUDA, got device={k_nope.device}")
+    if not k_rope.is_cuda:
+        raise ValueError(f"k_rope must be on CUDA, got device={k_rope.device}")
+    if k_nope.device != k_rope.device:
+        raise ValueError(
+            f"k_nope and k_rope must be on same device: {k_nope.device} vs {k_rope.device}"
+        )
+
+    # Dtype validation
+    if k_nope.dtype != torch.bfloat16:
+        raise ValueError(f"Expected k_nope.dtype=bfloat16, got {k_nope.dtype}")
+    if k_rope.dtype != torch.bfloat16:
+        raise ValueError(f"Expected k_rope.dtype=bfloat16, got {k_rope.dtype}")
+
+    # Shape validation
+    if k_nope.ndim != 2:
+        raise ValueError(f"Expected k_nope.ndim=2, got {k_nope.ndim}")
+    if k_rope.ndim != 2:
+        raise ValueError(f"Expected k_rope.ndim=2, got {k_rope.ndim}")
+
+    num_tokens, dim_nope = k_nope.shape
+    num_tokens_, dim_rope = k_rope.shape
+
+    if num_tokens != num_tokens_:
+        raise ValueError(
+            f"k_nope and k_rope must have same num_tokens: {num_tokens} vs {num_tokens_}"
+        )
+    if dim_nope != 512:
+        raise ValueError(f"Expected dim_nope=512, got {dim_nope}")
+    if dim_rope != 64:
+        raise ValueError(f"Expected dim_rope=64, got {dim_rope}")
+
+    # Group size validation
+    # Note: Current kernel is tuned for group_size=128
+    if group_size <= 0:
+        raise ValueError(f"group_size must be positive, got {group_size}")
+    if dim_nope % group_size != 0:
+        raise ValueError(
+            f"dim_nope ({dim_nope}) must be divisible by group_size ({group_size})"
+        )
+
+    # Ensure contiguous tensors for kernel (auto-fix if needed)
+    if not k_nope.is_contiguous():
+        k_nope = k_nope.contiguous()
+    if not k_rope.is_contiguous():
+        k_rope = k_rope.contiguous()
+
+    num_tiles = dim_nope // group_size
+
+    # Calculate byte sizes based on validated dimensions
+    # nope_part: [FP8 quantized data (dim_nope bytes)] + [FP32 scales (num_tiles * 4 bytes)]
+    # rope_part: [BF16 raw data (dim_rope * 2 bytes)]
+    nope_part_bytes = dim_nope + num_tiles * 4  # e.g., 512 + 4*4 = 528 for dim_nope=512, group_size=128
+    rope_part_bytes = dim_rope * k_rope.element_size()  # e.g., 64 * 2 = 128 for dim_rope=64, BF16
+
+    # Sanity check for typed view alignment
+    # FP32 scales view requires 4-byte alignment at offset dim_nope
+    # BF16 view requires 2-byte alignment for rope_part_bytes
+    scale_offset = dim_nope
+    if scale_offset % 4 != 0:
+        raise ValueError(
+            f"scale_offset ({scale_offset}) must be 4-byte aligned for FP32 scales view"
+        )
+    if rope_part_bytes % 2 != 0:
+        raise ValueError(
+            f"rope_part_bytes ({rope_part_bytes}) must be 2-byte aligned for BF16 view"
+        )
+
+    # Allocate two separate output buffers (as uint8 for direct byte-level access)
+    nope_part_u8 = torch.empty(
+        (num_tokens, nope_part_bytes), dtype=torch.uint8, device=k_nope.device
+    )
+    rope_part_u8 = torch.empty(
+        (num_tokens, rope_part_bytes), dtype=torch.uint8, device=k_rope.device
+    )
+
+    # Create typed views for the kernel to write into
+    # Fixed byte layout for nope_part: [nope_fp8 (dim_nope bytes) | scales_fp32 (num_tiles*4 bytes)]
+    # Fixed byte layout for rope_part: [rope_bf16 (dim_rope*2 bytes)]
+    nope_q_view = nope_part_u8[:, :dim_nope].view(torch.float8_e4m3fn)
+    nope_s_view = nope_part_u8[:, dim_nope:].view(torch.float32)
+    rope_view = rope_part_u8.view(torch.bfloat16)
+
+    # Kernel launch parameters
+    num_blocks_per_token = triton.cdiv(dim_nope + dim_rope, group_size)
+    NUM_NOPE_BLOCKS = dim_nope // group_size
+
+    # Validate kernel grid size
+    expected_blocks = NUM_NOPE_BLOCKS + 1  # nope blocks + 1 rope block
+    if num_blocks_per_token != expected_blocks:
+        raise ValueError(
+            f"Unexpected num_blocks_per_token: {num_blocks_per_token}, expected {expected_blocks}"
+        )
+
+    # Use the same kernel as _quantize_k_cache_fast (reuse existing implementation)
+    _quantize_k_cache_fast_kernel[(num_tokens, num_blocks_per_token)](
+        nope_q_view,
+        nope_s_view,
+        rope_view,
+        k_nope,
+        k_rope,
+        nope_q_view.stride(0),
+        nope_s_view.stride(0),
+        rope_view.stride(0),
+        k_nope.stride(0),
+        k_rope.stride(0),
+        NUM_NOPE_BLOCKS=NUM_NOPE_BLOCKS,
+        GROUP_SIZE=group_size,
+        DIM_NOPE=dim_nope,
+        DIM_ROPE=dim_rope,
+        FP8_MIN=torch.finfo(torch.float8_e4m3fn).min,
+        FP8_MAX=torch.finfo(torch.float8_e4m3fn).max,
+    )
+
+    # Add middle dimension for compatibility with set_mla_kv_buffer_triton
+    return nope_part_u8.unsqueeze(1), rope_part_u8.unsqueeze(1)
+
+
 @triton.jit
 def _quantize_k_cache_fast_kernel(
     output_nope_q_ptr,
@@ -362,7 +484,44 @@ if __name__ == "__main__":
         )
 
     print("Passed")
-    print("Do benchmark...")
+
+    # Test quantize_k_cache_separate: verify output matches concat path
+    print("\nTesting quantize_k_cache_separate...")
+    for num_tokens in [64, 100]:
+        dim_nope = 512
+        dim_rope = 64
+
+        k_nope = torch.randn(num_tokens, 1, dim_nope, dtype=torch.bfloat16, device="cuda")
+        k_rope = torch.randn(num_tokens, 1, dim_rope, dtype=torch.bfloat16, device="cuda")
+
+        # Old path: concat then quantize
+        k_concat = torch.cat([k_nope, k_rope], dim=-1).squeeze(1)  # (num_tokens, 576)
+        old_output = quantize_k_cache(k_concat.unsqueeze(1).unsqueeze(1))  # 4D input
+        old_output = old_output.squeeze(1).squeeze(1)  # Back to (num_tokens, 656)
+
+        # New path: quantize separately
+        nope_part, rope_part = quantize_k_cache_separate(k_nope, k_rope)
+        new_bytes = torch.cat([nope_part.squeeze(1), rope_part.squeeze(1)], dim=-1)
+
+        # Compare byte-level equality
+        old_bytes = old_output.view(torch.uint8)
+
+        if old_bytes.shape != new_bytes.shape:
+            raise RuntimeError(f"Shape mismatch: {old_bytes.shape} vs {new_bytes.shape}")
+
+        diff_bytes = (old_bytes != new_bytes).sum().item()
+        if diff_bytes > 0:
+            max_diff = (old_bytes.float() - new_bytes.float()).abs().max().item()
+            raise RuntimeError(
+                f"quantize_k_cache_separate output doesn't match concat path: "
+                f"{diff_bytes} differing bytes, max_diff={max_diff}"
+            )
+
+        print(f"  num_tokens={num_tokens}: PASSED (outputs match byte-wise)")
+
+    print("quantize_k_cache_separate tests passed!")
+
+    print("\nDo benchmark...")
 
     for num_blocks, block_size in [
         (1, 64),
