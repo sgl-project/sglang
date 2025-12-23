@@ -1,8 +1,11 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-// Use axum's http module as seen in src/routers/router_manager.rs
-use axum::http::HeaderMap;
+// FIX: Correct imports for StatusCode and IntoResponse trait
+use axum::{
+    http::{HeaderMap, StatusCode},
+    response::IntoResponse,
+};
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
 use dashmap::DashMap;
 use sgl_model_gateway::routers::{router_manager::RouterId, RouterTrait};
@@ -37,7 +40,8 @@ impl RouterTrait for MockRouter {
         _body: &sgl_model_gateway::protocols::chat::ChatCompletionRequest,
         _model_id: Option<&str>,
     ) -> axum::response::Response {
-        axum::response::StatusCode::OK.into_response()
+        // FIX: StatusCode::OK now works because the trait IntoResponse is in scope
+        StatusCode::OK.into_response()
     }
 }
 
@@ -49,7 +53,7 @@ fn current_logic(
     num_regular: usize,
     num_pd: usize,
 ) -> Option<Arc<dyn RouterTrait>> {
-    // FIX: Provide explicit type for candidate_routers to help inference
+    // Explicit type to help compiler inference
     let candidate_routers: Vec<Arc<dyn RouterTrait>> = routers
         .iter()
         .map(|entry| Arc::clone(entry.value()))
@@ -75,7 +79,7 @@ fn current_logic(
     best_router
 }
 
-/// Fixed implementation using Single-Pass Iterator
+/// Fixed implementation using Single-Pass Iterator (Zero Allocation)
 fn fixed_logic(
     routers: &DashMap<RouterId, Arc<dyn RouterTrait>>,
     num_regular: usize,
@@ -84,7 +88,7 @@ fn fixed_logic(
     let mut best_router: Option<Arc<dyn RouterTrait>> = None;
     let mut best_score = 0.0;
 
-    // FIX: Explicitly reference the DashMap entry value type
+    // Zero-allocation: iterate directly over the DashMap
     for entry in routers.iter() {
         let router: &Arc<dyn RouterTrait> = entry.value();
         let mut score = 1.0;
@@ -108,6 +112,7 @@ fn fixed_logic(
 fn bench_routers(c: &mut Criterion) {
     let mut group = c.benchmark_group("Router Selection Scaling");
 
+    // Test scaling from 2 to 100 routers
     for size in [2, 10, 100].iter() {
         let routers = DashMap::new();
         for i in 0..*size {
