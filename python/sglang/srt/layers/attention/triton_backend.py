@@ -99,9 +99,9 @@ class TritonAttnBackend(AttentionBackend):
             # For hybrid linear models, layer_id = 0 may not be full attention
             self.v_head_dim = model_runner.token_to_kv_pool.get_v_head_dim()
         else:
-            self.v_head_dim = model_runner.token_to_kv_pool.get_value_buffer(0).shape[
-                -1
-            ]
+            self.v_head_dim = model_runner.token_to_kv_pool.get_value_buffer(
+                model_runner.start_layer
+            ).shape[-1]
         self.max_context_len = model_runner.model_config.context_len
         self.device = model_runner.device
         self.device_core_count = get_device_core_count(model_runner.gpu_id)
