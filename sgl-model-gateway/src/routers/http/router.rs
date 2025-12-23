@@ -40,7 +40,7 @@ use crate::{
         responses::{ResponsesGetParams, ResponsesRequest},
     },
     routers::{
-        error,
+        error::{self, extract_error_code_from_response},
         grpc::utils::{error_type_from_status, route_to_endpoint},
         header_utils, parse, RouterTrait,
     },
@@ -212,8 +212,18 @@ impl Router {
             &self.retry_config,
             // operation per attempt
             |_: u32| async {
-                self.route_typed_request_once(headers, typed_req, route, model_id, is_stream, &text)
-                    .await
+                let res = self
+                    .route_typed_request_once(headers, typed_req, route, model_id, is_stream, &text)
+                    .await;
+
+                // Need to be outside `route_typed_request_once` because that function has multiple return paths
+                Metrics::record_router_upstream_response(
+                    metrics_labels::ROUTER_HTTP,
+                    res.status().as_u16(),
+                    extract_error_code_from_response(&res),
+                );
+
+                res
             },
             // should_retry predicate
             |res, _attempt| is_retryable_status(res.status()),
