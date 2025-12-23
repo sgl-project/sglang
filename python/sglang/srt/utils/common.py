@@ -3825,8 +3825,9 @@ def get_current_device_numa_node() -> int:
         )
 
     try:
-        numa_id_str = output_line[len(prefix) :].strip()
-        return int(numa_id_str)
+        numa_str_raw = output_line[len(prefix) :].strip()
+        first_numa_node = numa_str_raw.replace(',', '-').split('-')[0]
+        return int(first_numa_node)
     except ValueError as e:
         raise RuntimeError(f"Failed to parse NUMA ID from: '{output_line}'") from e
 
