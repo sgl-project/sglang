@@ -95,7 +95,7 @@ class TestDeepseekV32Unified(unittest.TestCase):
             ),
         )
 
-    @unittest.skip()
+    @unittest.skip("NSA backends test temporarily disabled")
     # @unittest.skipIf(is_blackwell_system(), "Requires H200 system")
     def test_deepseek_v32_nsa_backends(self):
         """Test NSA attention backend variants (H200 only).
