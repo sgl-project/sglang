@@ -25,7 +25,6 @@ use crate::{
     },
     reasoning_parser::ParserFactory as ReasoningParserFactory,
     routers::error,
-    tokenizer::traits::Tokenizer,
     tool_parser::ParserFactory as ToolParserFactory,
 };
 
@@ -45,14 +44,12 @@ impl RequestPipeline {
     pub fn new_regular(
         worker_registry: Arc<WorkerRegistry>,
         policy_registry: Arc<PolicyRegistry>,
-        tokenizer: Arc<dyn Tokenizer>,
         tool_parser_factory: ToolParserFactory,
         reasoning_parser_factory: ReasoningParserFactory,
         configured_tool_parser: Option<String>,
         configured_reasoning_parser: Option<String>,
     ) -> Self {
         let processor = processor::ResponseProcessor::new(
-            tokenizer.clone(),
             tool_parser_factory.clone(),
             reasoning_parser_factory.clone(),
             configured_tool_parser.clone(),
@@ -60,7 +57,6 @@ impl RequestPipeline {
         );
 
         let streaming_processor = Arc::new(streaming::StreamingProcessor::new(
-            tokenizer,
             tool_parser_factory,
             reasoning_parser_factory,
             configured_tool_parser,
@@ -92,7 +88,6 @@ impl RequestPipeline {
     pub fn new_harmony(
         worker_registry: Arc<WorkerRegistry>,
         policy_registry: Arc<PolicyRegistry>,
-        _tokenizer: Arc<dyn Tokenizer>,
         _tool_parser_factory: ToolParserFactory,
         _reasoning_parser_factory: ReasoningParserFactory,
         _configured_tool_parser: Option<String>,
@@ -122,7 +117,6 @@ impl RequestPipeline {
     pub fn new_harmony_pd(
         worker_registry: Arc<WorkerRegistry>,
         policy_registry: Arc<PolicyRegistry>,
-        _tokenizer: Arc<dyn Tokenizer>,
         _tool_parser_factory: ToolParserFactory,
         _reasoning_parser_factory: ReasoningParserFactory,
         _configured_tool_parser: Option<String>,
@@ -152,14 +146,12 @@ impl RequestPipeline {
     pub fn new_pd(
         worker_registry: Arc<WorkerRegistry>,
         policy_registry: Arc<PolicyRegistry>,
-        tokenizer: Arc<dyn Tokenizer>,
         tool_parser_factory: ToolParserFactory,
         reasoning_parser_factory: ReasoningParserFactory,
         configured_tool_parser: Option<String>,
         configured_reasoning_parser: Option<String>,
     ) -> Self {
         let processor = processor::ResponseProcessor::new(
-            tokenizer.clone(),
             tool_parser_factory.clone(),
             reasoning_parser_factory.clone(),
             configured_tool_parser.clone(),
@@ -167,7 +159,6 @@ impl RequestPipeline {
         );
 
         let streaming_processor = Arc::new(streaming::StreamingProcessor::new(
-            tokenizer,
             tool_parser_factory,
             reasoning_parser_factory,
             configured_tool_parser,

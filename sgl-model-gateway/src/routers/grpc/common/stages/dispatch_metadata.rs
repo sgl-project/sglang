@@ -31,11 +31,11 @@ impl PipelineStage for DispatchMetadataStage {
             RequestType::Chat(req) => req.model.clone(),
             RequestType::Generate(_req) => {
                 // Generate requests don't have a model field
-                // Use model_id from input or default
+                // Use model_id from input or unknown
                 ctx.input
                     .model_id
                     .clone()
-                    .unwrap_or_else(|| "default".to_string())
+                    .unwrap_or_else(|| "unknown".to_string())
             }
             RequestType::Responses(req) => req.model.clone(),
         };
