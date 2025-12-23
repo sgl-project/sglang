@@ -3494,7 +3494,7 @@ def numa_bind_to_node(node: int):
         raise SystemError("numa not available on this system")
 
     libnuma.numa_run_on_node(ctypes.c_int(node))
-    libnuma.numa_set_localalloc()
+    libnuma.numa_set_preferred(ctypes.c_int(node))
 
 
 def json_list_type(value):
