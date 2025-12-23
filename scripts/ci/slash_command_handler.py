@@ -2,6 +2,7 @@ import json
 import os
 import sys
 
+import requests
 from github import Auth, Github
 
 # Configuration
@@ -118,7 +119,7 @@ def handle_rerun_failed_ci(gh_repo, pr, comment, user_perms, react_on_success=Tr
 
 
 def handle_rerun_stage(
-    gh_repo, pr, comment, user_perms, stage_name, react_on_success=True
+    gh_repo, pr, comment, user_perms, stage_name, token, react_on_success=True
 ):
     """
     Handles the /rerun-stage <stage-name> command.
@@ -144,11 +145,14 @@ def handle_rerun_stage(
     nvidia_stages = [
         "stage-a-test-1",
         "stage-b-test-small-1-gpu",
+        "stage-b-test-large-1-gpu",
+        "stage-b-test-large-2-gpu",
         "multimodal-gen-test-1-gpu",
         "multimodal-gen-test-2-gpu",
         "quantization-test",
         "unit-test-backend-1-gpu",
         "unit-test-backend-2-gpu",
+        "stage-b-test-4-gpu-b200",
         "unit-test-backend-4-gpu",
         "unit-test-backend-8-gpu-h200",
         "unit-test-backend-8-gpu-h20",
@@ -218,10 +222,19 @@ def handle_rerun_stage(
         else:
             inputs = {"version": "release", "target_stage": stage_name}
 
-        success = target_workflow.create_dispatch(
-            ref=ref,
-            inputs=inputs,
+        # Use requests directly as PyGithub's create_dispatch only accepts HTTP 204
+        dispatch_url = f"https://api.github.com/repos/{gh_repo.full_name}/actions/workflows/{target_workflow.id}/dispatches"
+        dispatch_resp = requests.post(
+            dispatch_url,
+            json={"ref": ref, "inputs": inputs},
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Accept": "application/vnd.github+json",
+            },
         )
+        success = dispatch_resp.status_code in (200, 204)
+        if not success:
+            print(f"Dispatch failed: {dispatch_resp.status_code} {dispatch_resp.text}")
 
         if success:
             print(f"Successfully triggered workflow for stage '{stage_name}'")
@@ -229,7 +242,7 @@ def handle_rerun_stage(
                 comment.create_reaction("+1")
                 pr.create_issue_comment(
                     f"✅ Triggered `{stage_name}` to run independently (skipping dependencies).\n\n"
-                    f"Check the [Actions tab](https://github.com/{gh_repo.full_name}/actions) for progress."
+                    f"It will not be shown in this page. Check the [Actions tab](https://github.com/{gh_repo.full_name}/actions) for progress."
                 )
             return True
         else:
@@ -301,7 +314,7 @@ def main():
         # Extract stage name from command
         parts = first_line.split(maxsplit=1)
         stage_name = parts[1].strip() if len(parts) > 1 else None
-        handle_rerun_stage(repo, pr, comment, user_perms, stage_name)
+        handle_rerun_stage(repo, pr, comment, user_perms, stage_name, token)
 
     else:
         print(f"Unknown or ignored command: {first_line}")
