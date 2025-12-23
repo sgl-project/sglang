@@ -282,6 +282,10 @@ class Envs:
     SGLANG_DG_USE_NVRTC = EnvBool(False)
     SGLANG_USE_DEEPGEMM_BMM = EnvBool(False)
 
+    # TileLang GEMM
+    SGLANG_ENABLE_TILELANG_GEMM = EnvBool(False)
+    SGLANG_TILELANG_GEMM_CONFIG_DIR = EnvStr("")
+
     # DeepEP
     SGLANG_DEEPEP_BF16_DISPATCH = EnvBool(False)
     SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)

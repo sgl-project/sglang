@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, Callable, List, Optional, Tuple
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.layers import deep_gemm_wrapper
+from sglang.srt.layers import deep_gemm_wrapper, tilelang_gemm_wrapper
 from sglang.srt.layers.quantization.fp8_kernel import sglang_per_token_group_quant_fp8
 from sglang.srt.layers.quantization.mxfp4_tensor import MXFP4QuantizeUtil
 
@@ -146,6 +146,7 @@ class Fp8GemmRunnerBackend(Enum):
     DEEP_GEMM = "deep_gemm"
     TRITON = "triton"
     AITER = "aiter"
+    TILELANG = "tilelang"
 
     def is_auto(self) -> bool:
         return self == Fp8GemmRunnerBackend.AUTO
@@ -164,6 +165,9 @@ class Fp8GemmRunnerBackend(Enum):
 
     def is_aiter(self) -> bool:
         return self == Fp8GemmRunnerBackend.AITER
+
+    def is_tilelang(self) -> bool:
+        return self == Fp8GemmRunnerBackend.TILELANG
 
 
 FP8_GEMM_RUNNER_BACKEND: Fp8GemmRunnerBackend | None = None
@@ -236,6 +240,15 @@ def _dispatch_explicit_backend(backend: Fp8GemmRunnerBackend) -> Callable:
 
     elif backend.is_triton():
         return triton_w8a8_block_fp8_linear
+
+    elif backend.is_tilelang():
+        if not tilelang_gemm_wrapper.ENABLE_TILELANG_GEMM:
+            raise RuntimeError(
+                "TileLang GEMM backend requested via --fp8-gemm-backend=tilelang, "
+                "but TileLang GEMM is not available. Please ensure tilelang is installed "
+                "and SGLANG_ENABLE_TILELANG_GEMM=1 environment variable is set."
+            )
+        return tilelang_w8a8_block_fp8_linear_with_fallback
 
     else:
         raise ValueError(f"Unknown FP8 GEMM backend: {backend}")
@@ -418,6 +431,72 @@ def deepgemm_w8a8_block_fp8_linear_with_fallback(
     )
     if bias is not None:
         output += bias
+    return output.to(dtype=output_dtype).view(*output_shape)
+
+
+def tilelang_w8a8_block_fp8_linear_with_fallback(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    block_size: List[int],
+    weight_scale: torch.Tensor,
+    input_scale: Optional[torch.Tensor] = None,
+    bias: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """
+    TileLang-based FP8 block linear with fallback to Triton.
+    
+    This function performs FP8 blockwise quantized linear operation using TileLang kernels.
+    Falls back to Triton for unsupported shapes or dtypes.
+    
+    Args:
+        input: Input tensor (M, K) or (batch, M, K)
+        weight: Weight tensor (N, K), float8_e4m3
+        block_size: [block_n, block_k] for blockwise quantization (e.g., [128, 128])
+        weight_scale: Per-block weight scales (N//block_n, K//block_k)
+        input_scale: Not used, must be None (quantization happens inside)
+        bias: Optional bias tensor
+    
+    Returns:
+        Output tensor with same dtype as input
+    """
+    assert input_scale is None
+
+    output_dtype = input.dtype
+    dtype_supported = output_dtype == torch.bfloat16
+
+    # TileLang requires specific alignment
+    shape_supported = block_size[0] == 128 and block_size[1] == 128
+
+    if not (shape_supported and dtype_supported):
+        # Fall back to triton for unsupported shapes/dtypes
+        return triton_w8a8_block_fp8_linear(
+            input, weight, block_size, weight_scale, input_scale, bias
+        )
+
+    input_2d = input.view(-1, input.shape[-1])
+    output_shape = [*input.shape[:-1], weight.shape[0]]
+    M = input_2d.shape[0]
+    N, K = weight.shape
+
+    # Quantize input using per-token-group quantization
+    # TileLang expects: A_scale (M, K//128), B_scale (N//128, K//128)
+    q_input, x_scale = per_token_group_quant_fp8(
+        input_2d, block_size[1], column_major_scales=False
+    )
+
+    # Prepare output buffer
+    output = torch.empty(M, N, dtype=torch.bfloat16, device=input.device)
+
+    # Call TileLang GEMM: C = A @ B^T
+    tilelang_gemm_wrapper.gemm_nt_f8f8bf16(
+        (q_input, x_scale),
+        (weight, weight_scale),
+        output
+    )
+
+    if bias is not None:
+        output = output + bias
+
     return output.to(dtype=output_dtype).view(*output_shape)
 
 
