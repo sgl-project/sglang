@@ -145,8 +145,9 @@ def _create_benchmark_worker_class():
                         "latency_ms": latency_ms,
                         "tflops": _tflops(M, N, K, latency_ms),
                     })
-                except Exception:
+                except Exception as e:
                     results.append(None)
+                    print(f"[Worker GPU {self.gpu_id}] Benchmark failed: {e}")
 
             del kernels
             torch.cuda.empty_cache()
@@ -170,18 +171,13 @@ def _create_benchmark_worker_class():
         ) -> float:
             if has_split_k:
                 split_k = cfg["split_k"]
+                C_partial = torch.zeros(
+                    split_k, M, N, device="cuda", dtype=torch.float32
+                )
                 if is_swap_ab:
-                    C_partial = torch.zeros(
-                        split_k, N, M, device="cuda", dtype=torch.float32
-                    )
-
                     def bench_fn():
                         kernel(B_fp8, A_fp8, C_partial, C, B_scale, A_scale)
                 else:
-                    C_partial = torch.zeros(
-                        split_k, M, N, device="cuda", dtype=torch.float32
-                    )
-
                     def bench_fn():
                         kernel(A_fp8, B_fp8, C_partial, C, A_scale, B_scale)
             else:
