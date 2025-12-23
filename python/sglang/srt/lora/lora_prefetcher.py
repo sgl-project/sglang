@@ -52,7 +52,7 @@ class LoRAPrefetcher:
                 self.loaded_loras | self.lora_to_prefetch_future.keys() | {req.lora_id}
             )
             if self.tp_worker.can_run_lora_batch(new_lora_set):
-                # TODO (glenliu21): instead of creating a ScheduleBatch, we should use a LoRAFetchRequest with minimal fields
+                # TODO (glenliu21): instead of going through tp_worker, this module should directly interact with LoRAManager
                 fetch_lora_batch = ScheduleBatch.init_new(
                     [req],
                     req_to_token_pool,

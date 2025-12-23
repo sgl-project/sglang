@@ -191,12 +191,13 @@ class BaseTpWorker(ABC):
         result = self.model_runner.unload_lora_adapter(recv_req.to_ref())
         return result
 
+    def can_run_lora_batch(self, lora_ids: list[str]) -> bool:
+        lora_ids_set = set(lora_ids) if isinstance(lora_ids, list) else lora_ids
+        return self.model_runner.lora_manager.validate_lora_batch(lora_ids_set)
+
     def fetch_lora_batch(self, fetch_batch: ModelWorkerBatch):
         fetch_fwd_batch = ForwardBatch.init_new(fetch_batch, self.model_runner)
         self.model_runner.lora_manager.prepare_lora_batch(fetch_fwd_batch)
-
-    def can_run_lora_batch(self, lora_ids: set[str]) -> bool:
-        return self.model_runner.lora_manager.validate_lora_batch(lora_ids)
 
     def forward_batch_embedding(self, model_worker_batch: ModelWorkerBatch):
         forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
@@ -220,7 +221,7 @@ class TpModelWorker(BaseTpWorker):
         is_draft_worker: bool = False,
         req_to_token_pool: Optional[ReqToTokenPool] = None,
         token_to_kv_pool_allocator: Optional[BaseTokenToKVPoolAllocator] = None,
-        is_mtp_worker: bool = False,
+        is_multi_layer_eagle: bool = False,
     ):
         # Parse args
         self.tp_size = server_args.tp_size
@@ -269,9 +270,9 @@ class TpModelWorker(BaseTpWorker):
             is_draft_worker=is_draft_worker,
             req_to_token_pool=req_to_token_pool,
             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
-            draft_model_idx=0 if is_mtp_worker else None,
+            draft_model_idx=0 if is_multi_layer_eagle else None,
         )
-        if is_mtp_worker:
+        if is_multi_layer_eagle:
             self.model_runner_list.append(self.model_runner)
             for i in range(1, server_args.speculative_num_steps):
                 self.model_runner_list.append(
@@ -321,15 +322,7 @@ class TpModelWorker(BaseTpWorker):
         # Profile number of tokens
         self.max_total_num_tokens = self.model_runner.max_total_num_tokens
         self.max_prefill_tokens = server_args.max_prefill_tokens
-        self.max_running_requests = min(
-            (
-                self.max_total_num_tokens // 2
-                if server_args.max_running_requests is None
-                else server_args.max_running_requests
-                // (server_args.dp_size if server_args.enable_dp_attention else 1)
-            ),
-            self.model_runner.req_to_token_pool.size,
-        )
+        self.max_running_requests = self.model_runner.max_running_requests
         assert self.max_running_requests > 0, "max_running_request is zero"
         self.max_queued_requests = server_args.max_queued_requests
         assert (
