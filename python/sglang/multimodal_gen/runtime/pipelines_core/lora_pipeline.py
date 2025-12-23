@@ -473,8 +473,19 @@ class LoRAPipeline(ComposedPipelineBase):
 
         for module_name, lora_layers_dict in target_modules:
             if self.is_lora_merged.get(module_name, False):
-                logger.warning("LoRA weights are already merged for %s", module_name)
-                continue
+                # Check if strength is the same - if so, skip (idempotent)
+                if self.cur_adapter_strength.get(module_name) == strength:
+                    logger.warning(
+                        "LoRA weights are already merged for %s with same strength",
+                        module_name,
+                    )
+                    continue
+                # Different strength requested - allow re-merge (layer handles unmerge internally)
+                logger.info(
+                    "Re-merging LoRA weights for %s with new strength %s",
+                    module_name,
+                    strength,
+                )
             for name, layer in lora_layers_dict.items():
                 # Only re-enable LoRA for layers that actually have LoRA weights
                 has_lora_weights = hasattr(layer, "lora_A") and layer.lora_A is not None
