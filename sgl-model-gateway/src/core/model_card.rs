@@ -335,7 +335,7 @@ impl ModelCard {
 
 impl Default for ModelCard {
     fn default() -> Self {
-        Self::new("default")
+        Self::new("unknown")
     }
 }
 
