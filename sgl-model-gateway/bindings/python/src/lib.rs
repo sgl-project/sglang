@@ -1,5 +1,6 @@
 use pyo3::prelude::*;
 use sgl_model_gateway::*;
+use once_cell::sync::OnceCell;
 use std::collections::HashMap;
 
 // Define the enums with PyO3 bindings
@@ -176,7 +177,9 @@ struct Router {
     bootstrap_port_annotation: String,
     prometheus_port: Option<u16>,
     prometheus_host: Option<String>,
+    prometheus_duration_buckets: Option<Vec<f64>>,
     request_timeout_secs: u64,
+    shutdown_grace_period_secs: u64,
     request_id_headers: Option<Vec<String>>,
     pd_disaggregation: bool,
     bucket_adjust_interval_secs: usize,
@@ -224,6 +227,8 @@ struct Router {
     client_cert_path: Option<String>,
     client_key_path: Option<String>,
     ca_cert_paths: Vec<String>,
+    server_cert_path: Option<String>,
+    server_key_path: Option<String>,
     enable_trace: bool,
     otlp_traces_endpoint: String,
 }
@@ -405,6 +410,10 @@ impl Router {
                 self.client_key_path.as_ref(),
             )
             .add_ca_certificates(self.ca_cert_paths.clone())
+            .maybe_server_cert_and_key(
+                self.server_cert_path.as_ref(),
+                self.server_key_path.as_ref(),
+            )
             .build()
     }
 }
@@ -438,7 +447,9 @@ impl Router {
         bootstrap_port_annotation = String::from("sglang.ai/bootstrap-port"),
         prometheus_port = None,
         prometheus_host = None,
+        prometheus_duration_buckets = None,
         request_timeout_secs = 1800,
+        shutdown_grace_period_secs = 180,
         request_id_headers = None,
         pd_disaggregation = false,
         bucket_adjust_interval_secs = 5,
@@ -485,6 +496,8 @@ impl Router {
         client_cert_path = None,
         client_key_path = None,
         ca_cert_paths = vec![],
+        server_cert_path = None,
+        server_key_path = None,
         enable_trace = false,
         otlp_traces_endpoint = String::from("localhost:4317"),
     ))]
@@ -515,7 +528,9 @@ impl Router {
         bootstrap_port_annotation: String,
         prometheus_port: Option<u16>,
         prometheus_host: Option<String>,
+        prometheus_duration_buckets: Option<Vec<f64>>,
         request_timeout_secs: u64,
+        shutdown_grace_period_secs: u64,
         request_id_headers: Option<Vec<String>>,
         pd_disaggregation: bool,
         bucket_adjust_interval_secs: usize,
@@ -562,6 +577,8 @@ impl Router {
         client_cert_path: Option<String>,
         client_key_path: Option<String>,
         ca_cert_paths: Vec<String>,
+        server_cert_path: Option<String>,
+        server_key_path: Option<String>,
         enable_trace: bool,
         otlp_traces_endpoint: String,
     ) -> PyResult<Self> {
@@ -605,7 +622,9 @@ impl Router {
             bootstrap_port_annotation,
             prometheus_port,
             prometheus_host,
+            prometheus_duration_buckets,
             request_timeout_secs,
+            shutdown_grace_period_secs,
             request_id_headers,
             pd_disaggregation,
             bucket_adjust_interval_secs,
@@ -653,6 +672,8 @@ impl Router {
             client_cert_path,
             client_key_path,
             ca_cert_paths,
+            server_cert_path,
+            server_key_path,
             enable_trace,
             otlp_traces_endpoint,
         })
@@ -694,6 +715,7 @@ impl Router {
                 .prometheus_host
                 .clone()
                 .unwrap_or_else(|| "127.0.0.1".to_string()),
+            duration_buckets: self.prometheus_duration_buckets.clone(),
         });
 
         let runtime = tokio::runtime::Runtime::new()
@@ -711,6 +733,7 @@ impl Router {
                 prometheus_config,
                 request_timeout_secs: self.request_timeout_secs,
                 request_id_headers: self.request_id_headers.clone(),
+                shutdown_grace_period_secs: self.shutdown_grace_period_secs,
             })
             .await
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
@@ -730,6 +753,18 @@ fn get_verbose_version_string() -> String {
     version::get_verbose_version_string()
 }
 
+/// Get the list of available tool call parsers from the Rust factory.
+#[pyfunction]
+fn get_available_tool_call_parsers() -> Vec<String> {
+    static PARSERS: OnceCell<Vec<String>> = OnceCell::new();
+    PARSERS
+        .get_or_init(|| {
+            let factory = tool_parser::ParserFactory::new();
+            factory.list_parsers()
+        })
+        .clone()
+}
+
 #[pymodule]
 fn sglang_router_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PolicyType>()?;
@@ -740,5 +775,6 @@ fn sglang_router_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Router>()?;
     m.add_function(wrap_pyfunction!(get_version_string, m)?)?;
     m.add_function(wrap_pyfunction!(get_verbose_version_string, m)?)?;
+    m.add_function(wrap_pyfunction!(get_available_tool_call_parsers, m)?)?;
     Ok(())
 }

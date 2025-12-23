@@ -30,6 +30,7 @@ from PIL import Image
 
 from sglang.bench_serving import run_benchmark
 from sglang.global_config import global_config
+from sglang.srt.environ import envs
 from sglang.srt.utils import (
     get_bool_env_var,
     get_device,
@@ -56,6 +57,10 @@ DEFAULT_MLA_MODEL_NAME_FOR_TEST = "deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct"
 DEFAULT_MLA_FP8_MODEL_NAME_FOR_TEST = "neuralmagic/DeepSeek-Coder-V2-Lite-Instruct-FP8"
 DEFAULT_MODEL_NAME_FOR_TEST_MLA = "lmsys/sglang-ci-dsv3-test"
 DEFAULT_MODEL_NAME_FOR_TEST_MLA_NEXTN = "lmsys/sglang-ci-dsv3-test-NextN"
+
+# VL test models
+DEFAULT_MODEL_NAME_FOR_TEST_VL_PP = "Qwen/Qwen3-VL-2B-Thinking"
+DEFAULT_MODEL_NAME_FOR_TEST_GLM_41V_PP = "zai-org/GLM-4.1V-9B-Thinking"
 
 # NVFP4 models
 DEFAULT_DEEPSEEK_NVFP4_MODEL_FOR_TEST = "nvidia/DeepSeek-V3-0324-FP4"
@@ -115,6 +120,7 @@ DEFAULT_AWQ_MOE_MODEL_NAME_FOR_TEST = (
 )
 DEFAULT_ENABLE_THINKING_MODEL_NAME_FOR_TEST = "Qwen/Qwen3-30B-A3B"
 DEFAULT_DEEPSEEK_W4AFP8_MODEL_FOR_TEST = "Barrrrry/DeepSeek-R1-W4AFP8"
+DEFAULT_ENABLE_ROUTED_EXPERTS_MODEL_NAME_FOR_TEST = "Qwen/Qwen3-30B-A3B"
 
 # Nightly tests
 DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP1 = "meta-llama/Llama-3.1-8B-Instruct,mistralai/Mistral-7B-Instruct-v0.3,deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct,google/gemma-2-27b-it"
@@ -125,7 +131,7 @@ DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_QUANT_TP1 = "hugging-quants/Meta-Llama-3.1-8
 DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN = "Qwen/Qwen2.5-1.5B-Instruct"
 DEFAULT_SMALL_VLM_MODEL_NAME_FOR_TEST = "Qwen/Qwen2.5-VL-3B-Instruct"
 
-DEFAULT_IMAGE_URL = "https://github.com/sgl-project/sglang/blob/main/examples/assets/example_image.png?raw=true"
+DEFAULT_IMAGE_URL = "https://raw.githubusercontent.com/sgl-project/sglang/main/examples/assets/example_image.png"
 DEFAULT_VIDEO_URL = "https://raw.githubusercontent.com/EvolvingLMMs-Lab/sglang/dev/onevision_local/assets/jobs.mp4"
 
 DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH = 600
@@ -159,7 +165,12 @@ def is_in_amd_ci():
 
 def is_blackwell_system():
     """Return whether it is running on a Blackwell (B200) system."""
-    return get_bool_env_var("IS_BLACKWELL")
+    return envs.IS_BLACKWELL.get()
+
+
+def is_h200_system():
+    """Return whether it is running on an H200 system."""
+    return envs.IS_H200.get()
 
 
 def _use_cached_default_models(model_repo: str):
@@ -186,6 +197,9 @@ if is_in_amd_ci():
 
 if is_blackwell_system():
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH = 3000
+
+if is_h200_system():
+    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH = 3600
 
 
 def call_generate_lightllm(prompt, temperature, max_tokens, stop=None, url=None):
@@ -767,6 +781,7 @@ def get_benchmark_args(
         disable_tqdm=False,
         disable_stream=disable_stream,
         return_logprob=False,
+        return_routed_experts=False,
         seed=seed,
         disable_ignore_eos=disable_ignore_eos,
         extra_request_body=None,
@@ -1198,21 +1213,20 @@ def run_bench_one_batch(model, other_args):
 
     try:
         stdout, stderr = process.communicate()
-        output = stdout.decode()
-        error = stderr.decode()
+        output = stdout.decode(errors="backslashreplace")
+        error = stderr.decode(errors="backslashreplace")
         print(f"Output: {output}", flush=True)
         print(f"Error: {error}", flush=True)
 
         # Return prefill_latency, decode_throughput, decode_latency
-        prefill_line = output.split("\n")[-9]
-        decode_line = output.split("\n")[-3]
-        pattern = (
-            r"latency: (?P<latency>\d+\.\d+).*?throughput:\s*(?P<throughput>\d+\.\d+)"
-        )
-        match = re.search(pattern, prefill_line)
+        pattern = r"Benchmark[\s\S]*Total"
+        match = re.search(pattern, output)
+        bench_output = match[0] if match else ""
+        pattern = r".*?latency: (?P<latency>\d+\.\d+).*?throughput:\s*(?P<throughput>\d+\.\d+)"
+        match = re.search(r"Prefill." + pattern, bench_output)
         if match:
             prefill_latency = float(match.group("latency"))
-        match = re.search(pattern, decode_line)
+        match = re.search(r"Decode." + pattern, bench_output)
         if match:
             decode_latency = float(match.group("latency"))
             decode_throughput = float(match.group("throughput"))
@@ -1783,17 +1797,19 @@ def check_evaluation_test_results(
     model_count=None,
 ):
     """
-    results: list of tuple of (model_path, accuracy, latency)
+    results: list of tuple of (model_path, accuracy, latency) or (model_path, accuracy, latency, error)
     """
     failed_models = []
     if model_latency_thresholds is not None:
-        summary = " | model | status | score | score_threshold | latency | latency_threshold | \n"
-        summary += "| ----- | ------ | ----- | --------------- | ------- | ----------------- | \n"
+        summary = " | model | status | score | score_threshold | latency | latency_threshold | error | \n"
+        summary += "| ----- | ------ | ----- | --------------- | ------- | ----------------- | ----- | \n"
     else:
-        summary = " | model | status | score | score_threshold | \n"
-        summary += "| ----- | ------ | ----- | --------------- | \n"
+        summary = " | model | status | score | score_threshold | error | \n"
+        summary += "| ----- | ------ | ----- | --------------- | ----- | \n"
 
-    results_dict = {res[0]: (res[1], res[2]) for res in results}
+    results_dict = {
+        res[0]: (res[1], res[2], res[3] if len(res) == 4 else None) for res in results
+    }
 
     for model, accuracy_threshold in sorted(model_accuracy_thresholds.items()):
         latency_threshold = (
@@ -1802,8 +1818,15 @@ def check_evaluation_test_results(
             else 1e9
         )
 
-        if model in results_dict:
-            accuracy, latency = results_dict[model]
+        # check for error here
+        error = (
+            results_dict.get(model, (None, None, None))[2]
+            if model in results_dict
+            else None
+        )
+
+        if model in results_dict and error is None:
+            accuracy, latency, _ = results_dict[model]
             is_success = accuracy >= accuracy_threshold and latency <= latency_threshold
             status_emoji = "✅" if is_success else "❌"
 
@@ -1820,18 +1843,17 @@ def check_evaluation_test_results(
                     )
 
             if model_latency_thresholds is not None:
-                line = f"| {model} | {status_emoji} | {accuracy} | {accuracy_threshold} | {latency} | {latency_threshold}\n"
+                line = f"| {model} | {status_emoji} | {accuracy} | {accuracy_threshold} | {latency} | {latency_threshold} | - |\n"
             else:
-                line = (
-                    f"| {model} | {status_emoji} | {accuracy} | {accuracy_threshold}\n"
-                )
+                line = f"| {model} | {status_emoji} | {accuracy} | {accuracy_threshold} | - |\n"
         else:
             status_emoji = "❌"
+            error_display = error if error else "Model not evaluated"
             failed_models.append(f"Model failed to launch or be evaluated: {model}")
             if model_latency_thresholds is not None:
-                line = f"| {model} | {status_emoji} | N/A | {accuracy_threshold} | N/A | {latency_threshold}\n"
+                line = f"| {model} | {status_emoji} | N/A | {accuracy_threshold} | N/A | {latency_threshold} | {error_display} |\n"
             else:
-                line = f"| {model} | {status_emoji} | N/A | {accuracy_threshold}\n"
+                line = f"| {model} | {status_emoji} | N/A | {accuracy_threshold} | {error_display} |\n"
 
         summary += line
 

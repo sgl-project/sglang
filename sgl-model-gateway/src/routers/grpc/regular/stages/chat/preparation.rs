@@ -8,10 +8,13 @@ use tracing::error;
 
 use crate::{
     protocols::chat::ChatCompletionRequest,
-    routers::grpc::{
-        common::stages::PipelineStage,
-        context::{PreparationOutput, RequestContext},
-        error, utils,
+    routers::{
+        error,
+        grpc::{
+            common::stages::PipelineStage,
+            context::{PreparationOutput, RequestContext},
+            utils,
+        },
     },
 };
 
@@ -51,7 +54,7 @@ impl ChatPreparationStage {
             Ok(msgs) => msgs,
             Err(e) => {
                 error!(function = "ChatPreparationStage::execute", error = %e, "Failed to process chat messages");
-                return Err(error::bad_request(e));
+                return Err(error::bad_request("process_messages_failed", e));
             }
         };
 
@@ -60,7 +63,10 @@ impl ChatPreparationStage {
             Ok(encoding) => encoding,
             Err(e) => {
                 error!(function = "ChatPreparationStage::execute", error = %e, "Tokenization failed");
-                return Err(error::internal_error(format!("Tokenization failed: {}", e)));
+                return Err(error::internal_error(
+                    "tokenization_failed",
+                    format!("Tokenization failed: {}", e),
+                ));
             }
         };
 
@@ -71,7 +77,7 @@ impl ChatPreparationStage {
             utils::generate_tool_constraints(tools, &request.tool_choice, &request.model)
                 .map_err(|e| {
                     error!(function = "ChatPreparationStage::execute", error = %e, "Invalid tool configuration");
-                    error::bad_request(format!("Invalid tool configuration: {}", e))
+                    error::bad_request("invalid_tool_configuration", format!("Invalid tool configuration: {}", e))
                 })?
         } else {
             None
