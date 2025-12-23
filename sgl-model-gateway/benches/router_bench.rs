@@ -1,22 +1,133 @@
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use ax_http::HeaderMap; // Ensure this matches your project's http/header crate
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
-// Import your types here (you may need to make them public or move logic to a lib)
-// use sgl_model_gateway::routers::RouterManager;
+use dashmap::DashMap;
+use sgl_model_gateway::{
+    core::{ConnectionMode, RuntimeType, Worker, WorkerRegistry, WorkerType},
+    routers::{RouterId, RouterTrait},
+};
 
-fn bench_router_selection(c: &mut Criterion) {
-    let mut group = c.benchmark_group("Router Selection");
+// --- MOCK OBJECTS ---
 
-    // Simulate different scales: 2 routers (normal) up to 100 routers (stress)
-    for size in [2, 10, 50, 100].iter() {
+#[derive(Debug)]
+struct MockRouter {
+    is_pd: bool,
+}
+
+#[async_trait]
+impl RouterTrait for MockRouter {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+    fn router_type(&self) -> &'static str {
+        if self.is_pd {
+            "pd"
+        } else {
+            "regular"
+        }
+    }
+    fn is_pd_mode(&self) -> bool {
+        self.is_pd
+    }
+    // Mandatory trait method
+    async fn route_chat(
+        &self,
+        _: Option<&HeaderMap>,
+        _: &sgl_model_gateway::protocols::chat::ChatCompletionRequest,
+        _: Option<&str>,
+    ) -> axum::response::Response {
+        todo!()
+    }
+}
+
+// --- LOGIC PATHS ---
+
+/// Current implementation with Vec allocation
+fn current_logic(
+    routers: &DashMap<RouterId, Arc<dyn RouterTrait>>,
+    num_regular: usize,
+    num_pd: usize,
+) -> Option<Arc<dyn RouterTrait>> {
+    // This simulates the collect() call in the current codebase
+    let candidate_routers = routers
+        .iter()
+        .map(|entry| entry.value().clone())
+        .collect::<Vec<_>>();
+
+    let mut best_router = None;
+    let mut best_score = 0.0;
+
+    for router in candidate_routers {
+        let mut score = 1.0;
+        let is_pd = router.is_pd_mode();
+
+        // Simplified scoring
+        if is_pd {
+            score += 1.0;
+        }
+
+        let valid_router = (is_pd && num_pd > 0) || (!is_pd && num_regular > 0);
+        if score > best_score && valid_router {
+            best_score = score;
+            best_router = Some(router);
+        }
+    }
+    best_router
+}
+
+/// Fixed implementation using Single-Pass Iterator
+fn fixed_logic(
+    routers: &DashMap<RouterId, Arc<dyn RouterTrait>>,
+    num_regular: usize,
+    num_pd: usize,
+) -> Option<Arc<dyn RouterTrait>> {
+    let mut best_router = None;
+    let mut best_score = 0.0;
+
+    // Zero-allocation: iterate directly
+    for entry in routers.iter() {
+        let router = entry.value();
+        let mut score = 1.0;
+        let is_pd = router.is_pd_mode();
+
+        if is_pd {
+            score += 1.0;
+        }
+
+        let valid_router = (is_pd && num_pd > 0) || (!is_pd && num_regular > 0);
+        if score > best_score && valid_router {
+            best_score = score;
+            best_router = Some(Arc::clone(router));
+        }
+    }
+    best_router
+}
+
+// --- BENCHMARK RUNNER ---
+
+fn bench_routers(c: &mut Criterion) {
+    let mut group = c.benchmark_group("Router Selection Scaling");
+
+    for size in [2, 10, 100, 500].iter() {
+        // Setup: Create a map with 'size' routers
+        let routers = DashMap::new();
+        for i in 0..*size {
+            let id = RouterId::new(format!("router-{}", i));
+            routers.insert(
+                id,
+                Arc::new(MockRouter { is_pd: i % 2 == 0 }) as Arc<dyn RouterTrait>,
+            );
+        }
+        let routers = Arc::new(routers);
+
         group.bench_with_input(
             BenchmarkId::new("Current (Allocating)", size),
             size,
-            |b, &s| {
-                // SETUP: Create a RouterManager with 's' number of routers
-                // let manager = setup_mock_manager(s);
+            |b, _| {
                 b.iter(|| {
-                    // We use black_box to prevent the compiler from
-                    // optimizing away the "unused" return value.
-                    black_box(/* manager.select_router_for_request(None, None) */);
+                    black_box(current_logic(&routers, 5, 5));
                 });
             },
         );
@@ -24,10 +135,9 @@ fn bench_router_selection(c: &mut Criterion) {
         group.bench_with_input(
             BenchmarkId::new("Fixed (Zero-Alloc)", size),
             size,
-            |b, &s| {
-                // SETUP: Create the optimized version
+            |b, _| {
                 b.iter(|| {
-                    black_box(/* optimized_selection_logic() */);
+                    black_box(fixed_logic(&routers, 5, 5));
                 });
             },
         );
@@ -35,5 +145,5 @@ fn bench_router_selection(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_router_selection);
+criterion_group!(benches, bench_routers);
 criterion_main!(benches);
