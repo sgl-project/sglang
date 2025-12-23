@@ -6,6 +6,7 @@
 
 use std::sync::Arc;
 
+use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use axum::{
     body::Body,
@@ -50,6 +51,7 @@ impl RouterId {
 pub struct RouterManager {
     worker_registry: Arc<WorkerRegistry>,
     routers: Arc<DashMap<RouterId, Arc<dyn RouterTrait>>>,
+    routers_snapshot: ArcSwap<Vec<Arc<dyn RouterTrait>>>,
     default_router: Arc<std::sync::RwLock<Option<RouterId>>>,
     enable_igw: bool,
 }
@@ -163,6 +165,8 @@ impl RouterManager {
 
     pub fn register_router(&self, id: RouterId, router: Arc<dyn RouterTrait>) {
         self.routers.insert(id.clone(), router);
+        let new_snapshot: Vec<_> = self.routers.iter().map(|e| e.value().clone()).collect();
+        self.routers_snapshot.store(Arc::new(new_snapshot));
 
         let mut default_router = self.default_router.write().unwrap();
         if default_router.is_none() {
@@ -265,9 +269,9 @@ impl RouterManager {
         if candidate_routers.is_empty() {
             return None;
         }
-
+        let routers = self.routers_snapshot.load();
         let mut best_router = None;
-        let mut best_score = 0.0;
+        let mut best_score = -1.0;
 
         //  Uses O(1) lookups instead of allocating a full vector of workers via get_all()
         let (num_regular_workers, num_pd_workers) = self.worker_registry.get_worker_distribution();

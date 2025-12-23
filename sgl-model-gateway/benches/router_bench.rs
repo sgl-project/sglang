@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
+use arc_swap::ArcSwap;
 use async_trait::async_trait;
-// FIX: Correct imports for StatusCode and IntoResponse trait
 use axum::{
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
@@ -11,7 +11,6 @@ use dashmap::DashMap;
 use sgl_model_gateway::routers::{router_manager::RouterId, RouterTrait};
 
 // --- MOCK OBJECTS ---
-
 #[derive(Debug)]
 struct MockRouter {
     is_pd: bool,
@@ -32,28 +31,21 @@ impl RouterTrait for MockRouter {
     fn is_pd_mode(&self) -> bool {
         self.is_pd
     }
-
-    // Implement the required trait method with the correct signature
     async fn route_chat(
         &self,
-        _headers: Option<&HeaderMap>,
-        _body: &sgl_model_gateway::protocols::chat::ChatCompletionRequest,
-        _model_id: Option<&str>,
+        _: Option<&HeaderMap>,
+        _: &sgl_model_gateway::protocols::chat::ChatCompletionRequest,
+        _: Option<&str>,
     ) -> axum::response::Response {
-        // FIX: StatusCode::OK now works because the trait IntoResponse is in scope
         StatusCode::OK.into_response()
     }
 }
 
-// --- LOGIC PATHS ---
-
-/// Current implementation with Vec allocation
+// --- BEFORE OPTIMIZATION (Allocating) ---
 fn current_logic(
     routers: &DashMap<RouterId, Arc<dyn RouterTrait>>,
-    num_regular: usize,
-    num_pd: usize,
 ) -> Option<Arc<dyn RouterTrait>> {
-    // Explicit type to help compiler inference
+    // This represents the per-request heap allocation in the current code
     let candidate_routers: Vec<Arc<dyn RouterTrait>> = routers
         .iter()
         .map(|entry| Arc::clone(entry.value()))
@@ -61,17 +53,9 @@ fn current_logic(
 
     let mut best_router = None;
     let mut best_score = 0.0;
-
     for router in candidate_routers {
-        let mut score = 1.0;
-        let is_pd = router.is_pd_mode();
-
-        if is_pd {
-            score += 1.0;
-        }
-
-        let valid_router = (is_pd && num_pd > 0) || (!is_pd && num_regular > 0);
-        if score > best_score && valid_router {
+        let score = if router.is_pd_mode() { 2.0 } else { 1.0 };
+        if score > best_score {
             best_score = score;
             best_router = Some(router);
         }
@@ -79,27 +63,16 @@ fn current_logic(
     best_router
 }
 
-/// Fixed implementation using Single-Pass Iterator (Zero Allocation)
-fn fixed_logic(
-    routers: &DashMap<RouterId, Arc<dyn RouterTrait>>,
-    num_regular: usize,
-    num_pd: usize,
-) -> Option<Arc<dyn RouterTrait>> {
-    let mut best_router: Option<Arc<dyn RouterTrait>> = None;
+// --- AFTER OPTIMIZATION (Snapshot) ---
+fn snapshot_logic(snapshot: &ArcSwap<Vec<Arc<dyn RouterTrait>>>) -> Option<Arc<dyn RouterTrait>> {
+    // Atomic load: Zero allocation, lock-free
+    let routers = snapshot.load();
+
+    let mut best_router = None;
     let mut best_score = 0.0;
-
-    // Zero-allocation: iterate directly over the DashMap
-    for entry in routers.iter() {
-        let router: &Arc<dyn RouterTrait> = entry.value();
-        let mut score = 1.0;
-        let is_pd = router.is_pd_mode();
-
-        if is_pd {
-            score += 1.0;
-        }
-
-        let valid_router = (is_pd && num_pd > 0) || (!is_pd && num_regular > 0);
-        if score > best_score && valid_router {
+    for router in routers.iter() {
+        let score = if router.is_pd_mode() { 2.0 } else { 1.0 };
+        if score > best_score {
             best_score = score;
             best_router = Some(Arc::clone(router));
         }
@@ -108,44 +81,37 @@ fn fixed_logic(
 }
 
 // --- BENCHMARK RUNNER ---
+fn bench_router_optimization(c: &mut Criterion) {
+    let mut group = c.benchmark_group("Router Selection Improvement");
 
-fn bench_routers(c: &mut Criterion) {
-    let mut group = c.benchmark_group("Router Selection Scaling");
-
-    // Test scaling from 2 to 100 routers
-    for size in [2, 10, 100].iter() {
-        let routers = DashMap::new();
-        for i in 0..*size {
+    for size in [2, 10, 100] {
+        // Setup mock data
+        let routers_map = DashMap::new();
+        let mut routers_vec = Vec::new();
+        for i in 0..size {
             let id = RouterId::new(format!("router-{}", i));
-            routers.insert(
-                id,
-                Arc::new(MockRouter { is_pd: i % 2 == 0 }) as Arc<dyn RouterTrait>,
-            );
+            let router = Arc::new(MockRouter { is_pd: i % 2 == 0 }) as Arc<dyn RouterTrait>;
+            routers_map.insert(id, router.clone());
+            routers_vec.push(router);
         }
-        let routers_ref = &routers;
+        let snapshot = ArcSwap::from_pointee(routers_vec);
 
+        // Run "Before"
         group.bench_with_input(
-            BenchmarkId::new("Current (Allocating)", size),
-            size,
+            BenchmarkId::new("Before (Allocating)", size),
+            &size,
             |b, _| {
-                b.iter(|| {
-                    black_box(current_logic(routers_ref, 5, 5));
-                });
+                b.iter(|| black_box(current_logic(&routers_map)));
             },
         );
 
-        group.bench_with_input(
-            BenchmarkId::new("Fixed (Zero-Alloc)", size),
-            size,
-            |b, _| {
-                b.iter(|| {
-                    black_box(fixed_logic(routers_ref, 5, 5));
-                });
-            },
-        );
+        // Run "After"
+        group.bench_with_input(BenchmarkId::new("After (Snapshot)", size), &size, |b, _| {
+            b.iter(|| black_box(snapshot_logic(&snapshot)));
+        });
     }
     group.finish();
 }
 
-criterion_group!(benches, bench_routers);
+criterion_group!(benches, bench_router_optimization);
 criterion_main!(benches);
