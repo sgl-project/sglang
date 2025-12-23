@@ -2078,21 +2078,17 @@ class Scheduler(
                     AbortReq(abort_message=abort_reason.message, rid=req.rid), req
                 )
 
+            msg_prefix = (
+                "KV cache pool is full. Retract requests. "
+                if kv_full_retract_flag
+                else "Testing retraction. "
+            )
+            msg_details = f"#retracted_reqs: {len(retracted_reqs)}, #new_tokens_gained: {new_token_gained}"
             if kv_full_retract_flag:
-                msg = (
-                    "KV cache pool is full. Retract requests. "
-                    f"#retracted_reqs: {len(retracted_reqs)}, "
-                    f"#new_tokens_gained: {new_token_gained}, "
-                    f"#new_token_ratio: {old_ratio:.4f} -> {new_token_ratio:.4f}"
+                msg_details += (
+                    f", #new_token_ratio: {old_ratio:.4f} -> {new_token_ratio:.4f}"
                 )
-            else:
-                msg = (
-                    "Testing retraction. "
-                    f"#retracted_reqs: {len(retracted_reqs)}, "
-                    f"#new_tokens_gained: {new_token_gained}"
-                )
-
-            logger.warning(msg)
+            logger.warning(msg_prefix + msg_details)
 
             for req in retracted_reqs:
                 self._add_request_to_queue(req, is_retracted=True)
