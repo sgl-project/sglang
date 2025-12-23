@@ -45,15 +45,25 @@ impl GeneratePreparationStage {
         request: &GenerateRequest,
     ) -> Result<(), Response> {
         // Get model_id from context (normalized by router_manager)
-        let model_id = ctx.input.model_id.as_deref().unwrap();
+        let model_id = ctx.input.model_id.as_deref().ok_or_else(|| {
+            error!(
+                function = "GeneratePreparationStage::prepare_generate",
+                "model_id not set in request context"
+            );
+            error::internal_error(
+                "model_id_not_set",
+                "model_id not set in request context - this is a bug in request routing",
+            )
+        })?;
 
+        // Resolve tokenizer from registry (cached for reuse in response processing)
         let tokenizer = ctx
             .components
             .tokenizer_registry
             .get(model_id)
             .ok_or_else(|| {
                 error!(
-                    function = "GeneratePreparationStage::execute",
+                    function = "GeneratePreparationStage::prepare_generate",
                     model = %model_id,
                     "Tokenizer not found for model"
                 );
@@ -62,6 +72,9 @@ impl GeneratePreparationStage {
                     format!("Tokenizer not found for model: {}", model_id),
                 )
             })?;
+
+        // Cache tokenizer in context for reuse in response processing stage
+        ctx.state.tokenizer = Some(tokenizer.clone());
 
         let (original_text, token_ids) = match self.resolve_generate_input(request, &tokenizer) {
             Ok(res) => res,

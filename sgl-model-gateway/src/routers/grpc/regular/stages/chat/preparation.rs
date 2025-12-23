@@ -43,8 +43,17 @@ impl ChatPreparationStage {
         ctx: &mut RequestContext,
         request: &ChatCompletionRequest,
     ) -> Result<(), Response> {
-        // Step 0: Resolve tokenizer from registry
-        let model_id = ctx.input.model_id.as_deref().unwrap();
+        // Step 0: Resolve tokenizer from registry (cached for reuse in response processing)
+        let model_id = ctx.input.model_id.as_deref().ok_or_else(|| {
+            error!(
+                function = "ChatPreparationStage::prepare_chat",
+                "model_id not set in request context"
+            );
+            error::internal_error(
+                "model_id_not_set",
+                "model_id not set in request context - this is a bug in request routing",
+            )
+        })?;
         let tokenizer = ctx
             .components
             .tokenizer_registry
@@ -60,6 +69,9 @@ impl ChatPreparationStage {
                     format!("Tokenizer not found for model: {}", model_id),
                 )
             })?;
+
+        // Cache tokenizer in context for reuse in response processing stage
+        ctx.state.tokenizer = Some(tokenizer.clone());
 
         // Step 1: Filter tools if needed
         let body_ref = utils::filter_chat_request_by_tool_choice(request);
