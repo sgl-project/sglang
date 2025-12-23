@@ -1347,18 +1347,10 @@ class HybridLinearAttnBackend(AttentionBackend):
                 :request_number
             ]
         )
-        # intermediate_state_indices = torch.arange(
-        #     request_number, dtype=torch.int32, device=state_indices_tensor.device
-        # )
 
         mamba_caches = (
             self.linear_attn_backend.req_to_token_pool.get_speculative_mamba2_params_all_layers()
         )
-
-        # conv_states = mamba_caches.conv[0]
-        # # ssm_states = mamba_caches.temporal
-        # # intermediate_state_cache = mamba_caches.intermediate_ssm
-        # intermediate_conv_window_cache = mamba_caches.intermediate_conv_window[0]
 
         # # Compute common indices once to avoid duplication
         # valid_mask = accepted_steps >= 0
@@ -1380,22 +1372,37 @@ class HybridLinearAttnBackend(AttentionBackend):
         # ].to(conv_states.dtype, copy=False)
 
         # # Track indices used for tracking mamba states for prefix cache
-        # if mamba_track_indices is not None:
-        #     assert mamba_steps_to_track is not None
-        #     track_mask = mamba_steps_to_track >= 0
-        #     track_steps = mamba_steps_to_track[track_mask].to(torch.int64)  # [N]
-        #     if track_steps.numel() == 0:
-        #         # No track indices to update
-        #         return
-        #     dst_track_indices = mamba_track_indices[track_mask].to(torch.int64)
-        #     src_track_indices = intermediate_state_indices[track_mask].to(torch.int64)
+        if mamba_track_indices is not None:
+            assert mamba_steps_to_track is not None
+            track_mask = mamba_steps_to_track >= 0
+            track_steps = mamba_steps_to_track[track_mask].to(torch.int64)  # [N]
+            if track_steps.numel() == 0:
+                # No track indices to update
+                return
+            dst_track_indices = mamba_track_indices[track_mask].to(torch.int64)
+            src_track_indices = state_indices_tensor[track_mask].to(torch.int64)  # [N]
 
-        #     # scatter into ssm_states at the chosen track states
-        #     # ssm_states[:, dst_track_indices, :] = intermediate_state_cache[
-        #     #     :, src_track_indices, track_steps
-        #     # ].to(ssm_states.dtype, copy=False)
+            conv_states = mamba_caches.conv[0]
+            ssm_states = mamba_caches.temporal
 
-        #     # scatter into conv_states at the chosen track states
-        #     conv_states[:, dst_track_indices, :] = intermediate_conv_window_cache[
-        #         :, src_track_indices, track_steps
-        #     ].to(conv_states.dtype, copy=False)
+            # scatter from source track indices to destination
+            conv_states[:, dst_track_indices] = conv_states[
+                :, src_track_indices
+            ]
+            ssm_states[:, dst_track_indices] = ssm_states[
+                :, src_track_indices
+            ]
+            mamba_caches.intermediate_k[:, dst_track_indices] = mamba_caches.intermediate_k[
+                :, src_track_indices
+            ]
+            mamba_caches.intermediate_v[:, dst_track_indices] = mamba_caches.intermediate_v[
+                :, src_track_indices
+            ]
+            mamba_caches.intermediate_g[:, dst_track_indices] = mamba_caches.intermediate_g[
+                :, src_track_indices
+            ]
+            mamba_caches.intermediate_beta[:, dst_track_indices] = mamba_caches.intermediate_beta[
+                :, src_track_indices
+            ]
+            print(track_steps, mamba_caches.intermediate_accepted_steps[src_track_indices])
+            mamba_caches.intermediate_accepted_steps[dst_track_indices] = track_steps.to(mamba_caches.intermediate_accepted_steps.dtype, copy=False)
