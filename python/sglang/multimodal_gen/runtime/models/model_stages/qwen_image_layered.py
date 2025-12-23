@@ -529,7 +529,7 @@ the image\n<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>as
         batch.negative_prompt_embeds = [negative_prompt_embeds]
         batch.negative_prompt_embeds_mask = [negative_prompt_embeds_mask]
         batch.latents = latents
-        batch.image_latents = [image_latents]
+        batch.image_latent = image_latents
         batch.num_inference_steps = num_inference_steps
         batch.sigmas = sigmas.tolist()  # Convert numpy array to list for validation
         batch.generator = torch.manual_seed(0)

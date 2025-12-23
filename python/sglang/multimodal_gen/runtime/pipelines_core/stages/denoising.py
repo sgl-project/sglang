@@ -1000,6 +1000,8 @@ class DenoisingStage(PipelineStage):
         timesteps_cpu = timesteps.cpu()
         num_timesteps = timesteps_cpu.shape[0]
         print(f"1002 {latents.shape=}")
+        latents = torch.load("/sgl-workspace/latents.pt")
+        batch.image_latent = torch.load("/sgl-workspace/image_latents.pt")
         with torch.autocast(
             device_type=current_platform.device_type,
             dtype=target_dtype,
@@ -1099,6 +1101,10 @@ class DenoisingStage(PipelineStage):
                 "average time per step: %.4f seconds",
                 (denoising_end_time - denoising_start_time) / len(timesteps),
             )
+
+        print(f"528 {latents.shape=}", flush=True)
+        # latents = torch.load("/sgl-workspace/latents.pt")
+        print(f"530 {latents.shape=}", flush=True)
 
         self._post_denoising_loop(
             batch=batch,

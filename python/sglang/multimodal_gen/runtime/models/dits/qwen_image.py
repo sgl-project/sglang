@@ -738,9 +738,14 @@ class QwenImageTransformer2DModel(CachableDiT):
             config.arch_config, "use_layer3d_rope", False
         )  # For qwen-image-layered now
 
-        self.rotary_emb = QwenEmbedRope(
-            theta=10000, axes_dim=list(axes_dims_rope), scale_rope=True
-        )
+        if not self.use_layer3d_rope:
+            self.rotary_emb = QwenEmbedRope(
+                theta=10000, axes_dim=list(axes_dims_rope), scale_rope=True
+            )
+        else:
+            self.rotary_emb = QwenEmbedLayer3DRope(
+                theta=10000, axes_dim=list(axes_dims_rope), scale_rope=True
+            )
 
         if not self.use_layer3d_rope:
             self.pos_embed = QwenEmbedRope(
@@ -851,7 +856,7 @@ class QwenImageTransformer2DModel(CachableDiT):
 
         encoder_hidden_states = self.txt_norm(encoder_hidden_states)
         encoder_hidden_states = self.txt_in(encoder_hidden_states)
-
+        print(f"859 {additional_t_cond=}")
         temb = self.time_text_embed(timestep, hidden_states, additional_t_cond)
 
         image_rotary_emb = freqs_cis
