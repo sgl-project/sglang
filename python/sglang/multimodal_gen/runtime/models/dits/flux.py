@@ -422,10 +422,10 @@ class FluxTransformer2DModel(CachableDiT):
             self.config.joint_attention_dim,
             self.inner_dim,
             bias=True,
-            gather_output=False,
+            gather_output=True,
         )
         self.x_embedder = ColumnParallelLinear(
-            self.config.in_channels, self.inner_dim, bias=True, gather_output=False
+            self.config.in_channels, self.inner_dim, bias=True, gather_output=True
         )
         self.transformer_blocks = nn.ModuleList(
             [
