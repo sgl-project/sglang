@@ -1,7 +1,10 @@
 """Config loading and M-value lookup for TileLang GEMM."""
 import json
 import os
-from typing import Dict, List, Tuple
+import re
+from typing import Dict, List, Optional, Tuple
+
+from sglang.srt.utils import get_device_name
 
 DEFAULT_M_VALUES = [
     1, 
@@ -24,11 +27,23 @@ DEFAULT_M_VALUES = [
     4096,
 ]
 
+# Fixed values for TileLang FP8 GEMM
+DEFAULT_DTYPE = "fp8_w8a8"
+DEFAULT_BLOCK_SHAPE = (128, 128)
+
+
+def _get_current_device_name() -> str:
+    """Get current device name, replacing spaces with underscores."""
+    return get_device_name().replace(" ", "_")
+
 
 class ConfigLoader:
     """Config loader for GEMM configurations.
 
-    Config file format (N={N}_K={K}.json):
+    Config file format:
+    N={N},K={K},device_name={device_name},dtype=fp8_w8a8,block_shape=[128, 128].json
+    
+    Content:
     {
         "1": {"kernel_type": "splitK_swapAB", "block_M": 64, ...},
         "128": {...},
@@ -36,12 +51,20 @@ class ConfigLoader:
     }
     """
 
-    def __init__(self, config_dir: str):
+    def __init__(self, config_dir: str, device_name: Optional[str] = None):
         self.config_dir = config_dir
         self._config_cache: Dict[Tuple[int, int], Dict[int, dict]] = {}
+        self._device_name = device_name or _get_current_device_name()
+        self._dtype = DEFAULT_DTYPE
+        self._block_shape = DEFAULT_BLOCK_SHAPE
+
+    def _get_config_filename(self, N: int, K: int) -> str:
+        """Generate config filename."""
+        block_n, block_k = self._block_shape
+        return f"N={N},K={K},device_name={self._device_name},dtype={self._dtype},block_shape=[{block_n}, {block_k}].json"
 
     def _get_config_path(self, N: int, K: int) -> str:
-        return os.path.join(self.config_dir, f"N={N}_K={K}.json")
+        return os.path.join(self.config_dir, self._get_config_filename(N, K))
 
     def config_exists(self, N: int, K: int) -> bool:
         return os.path.exists(self._get_config_path(N, K))
@@ -98,20 +121,23 @@ class ConfigLoader:
         self._config_cache.clear()
 
     def list_available_configs(self) -> List[Tuple[int, int]]:
-        """List all available (N, K) configs."""
+        """List all available (N, K) configs for current device."""
         configs = []
         if not os.path.exists(self.config_dir):
             return configs
 
+        # Pattern to match config files for current device
+        pattern = re.compile(
+            rf"N=(\d+),K=(\d+),device_name={re.escape(self._device_name)},"
+            rf"dtype={re.escape(self._dtype)},block_shape=\[\d+, \d+\]\.json"
+        )
+
         for filename in os.listdir(self.config_dir):
-            if filename.startswith("N=") and filename.endswith(".json"):
-                try:
-                    parts = filename[:-5].split("_")
-                    N = int(parts[0].split("=")[1])
-                    K = int(parts[1].split("=")[1])
-                    configs.append((N, K))
-                except (IndexError, ValueError):
-                    continue
+            match = pattern.match(filename)
+            if match:
+                N = int(match.group(1))
+                K = int(match.group(2))
+                configs.append((N, K))
 
         return sorted(configs)
 

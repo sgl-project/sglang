@@ -1,6 +1,8 @@
 """TileLang GEMM core module."""
 
 from sglang.srt.layers.tilelang_gemm_wrapper.core.config_loader import (
+    DEFAULT_BLOCK_SHAPE,
+    DEFAULT_DTYPE,
     DEFAULT_M_VALUES,
     ConfigLoader,
     get_default_m_values,
@@ -22,6 +24,8 @@ from sglang.srt.layers.tilelang_gemm_wrapper.core.wrapper import (
 __all__ = [
     "TileLangGEMMWrapper",
     "ConfigLoader",
+    "DEFAULT_BLOCK_SHAPE",
+    "DEFAULT_DTYPE",
     "DEFAULT_M_VALUES",
     "get_default_m_values",
     "per_token_cast_to_fp8",

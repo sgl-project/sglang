@@ -4,9 +4,18 @@ This directory contains pre-tuned kernel configurations for TileLang GEMM.
 
 ## File Format
 
-Each configuration file is named `N={N}_K={K}.json`, where N and K are the weight matrix dimensions.
+Each configuration file is named with the following format:
+```
+N={N},K={K},device_name={device_name},dtype=fp8_w8a8,block_shape=[128, 128].json
+```
 
-Example: `N=4096_K=8192.json`
+Where:
+- `N`, `K`: Weight matrix dimensions
+- `device_name`: GPU device name (e.g., `NVIDIA_H100_80GB_HBM3`)
+- `dtype`: Data type, fixed to `fp8_w8a8`
+- `block_shape`: Block shape for quantization, fixed to `[128, 128]`
+
+Example: `N=4096,K=8192,device_name=NVIDIA_H100_80GB_HBM3,dtype=fp8_w8a8,block_shape=[128, 128].json`
 
 ## Configuration Structure
 
@@ -50,4 +59,3 @@ python -m tilelang_gemm.tuner --N 4096 --K 8192 --num_gpus 4
 - `swapAB`: Swapped A/B, A_scale (M//128, K//128), B_scale (N, K//128)
 - `splitK`: Split-K parallelism, uses C_partial buffer
 - `splitK_swapAB`: Combined Split-K and SwapAB
-
