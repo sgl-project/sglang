@@ -1,0 +1,2222 @@
+[
+  {
+    "timestamp": "2025-12-20T22:37:12.722813",
+    "model": "deepseek-ai/Janus-Pro-7B",
+    "metrics": {
+      "Overall-Art and Design": {
+        "num": 120,
+        "acc": 0.525
+      },
+      "Art": {
+        "num": 30,
+        "acc": 0.567
+      },
+      "Art_Theory": {
+        "num": 30,
+        "acc": 0.567
+      },
+      "Design": {
+        "num": 30,
+        "acc": 0.7
+      },
+      "Music": {
+        "num": 30,
+        "acc": 0.267
+      },
+      "Overall-Business": {
+        "num": 150,
+        "acc": 0.367
+      },
+      "Accounting": {
+        "num": 30,
+        "acc": 0.467
+      },
+      "Economics": {
+        "num": 30,
+        "acc": 0.4
+      },
+      "Finance": {
+        "num": 30,
+        "acc": 0.267
+      },
+      "Manage": {
+        "num": 30,
+        "acc": 0.333
+      },
+      "Marketing": {
+        "num": 30,
+        "acc": 0.367
+      },
+      "Overall-Science": {
+        "num": 140,
+        "acc": 0.314
+      },
+      "Biology": {
+        "num": 30,
+        "acc": 0.3
+      },
+      "Chemistry": {
+        "num": 30,
+        "acc": 0.167
+      },
+      "Geography": {
+        "num": 30,
+        "acc": 0.367
+      },
+      "Math": {
+        "num": 30,
+        "acc": 0.4
+      },
+      "Physics": {
+        "num": 20,
+        "acc": 0.35
+      },
+      "Overall-Health and Medicine": {
+        "num": 120,
+        "acc": 0.333
+      },
+      "Basic_Medical_Science": {
+        "num": 30,
+        "acc": 0.433
+      },
+      "Clinical_Medicine": {
+        "num": 30,
+        "acc": 0.367
+      },
+      "Diagnostics_and_Laboratory_Medicine": {
+        "num": 30,
+        "acc": 0.2
+      },
+      "Pharmacy": {
+        "num": 30,
+        "acc": 0.333
+      },
+      "Overall-Humanities and Social Science": {
+        "num": 60,
+        "acc": 0.467
+      },
+      "History": {
+        "num": 30,
+        "acc": 0.4
+      },
+      "Literature": {
+        "num": 30,
+        "acc": 0.533
+      },
+      "Overall-Tech and Engineering": {
+        "num": 210,
+        "acc": 0.324
+      },
+      "Agriculture": {
+        "num": 30,
+        "acc": 0.4
+      },
+      "Architecture_and_Engineering": {
+        "num": 30,
+        "acc": 0.233
+      },
+      "Computer_Science": {
+        "num": 30,
+        "acc": 0.4
+      },
+      "Electronics": {
+        "num": 30,
+        "acc": 0.333
+      },
+      "Energy_and_Power": {
+        "num": 30,
+        "acc": 0.3
+      },
+      "Materials": {
+        "num": 30,
+        "acc": 0.333
+      },
+      "Mechanical_Engineering": {
+        "num": 30,
+        "acc": 0.267
+      },
+      "Overall": {
+        "num": 800,
+        "acc": 0.373
+      },
+      "score": 0.3725,
+      "latency": 209.8493
+    },
+    "score": 0.3725,
+    "latency": [
+      209.8493
+    ]
+  },
+  {
+    "timestamp": "2025-12-20T22:42:26.908571",
+    "model": "Efficient-Large-Model/NVILA-8B-hf",
+    "metrics": {
+      "Overall-Art and Design": {
+        "num": 120,
+        "acc": 0.467
+      },
+      "Art": {
+        "num": 30,
+        "acc": 0.533
+      },
+      "Art_Theory": {
+        "num": 30,
+        "acc": 0.667
+      },
+      "Design": {
+        "num": 30,
+        "acc": 0.467
+      },
+      "Music": {
+        "num": 30,
+        "acc": 0.2
+      },
+      "Overall-Business": {
+        "num": 150,
+        "acc": 0.527
+      },
+      "Accounting": {
+        "num": 30,
+        "acc": 0.567
+      },
+      "Economics": {
+        "num": 30,
+        "acc": 0.7
+      },
+      "Finance": {
+        "num": 30,
+        "acc": 0.567
+      },
+      "Manage": {
+        "num": 30,
+        "acc": 0.467
+      },
+      "Marketing": {
+        "num": 30,
+        "acc": 0.333
+      },
+      "Overall-Science": {
+        "num": 140,
+        "acc": 0.3
+      },
+      "Biology": {
+        "num": 30,
+        "acc": 0.267
+      },
+      "Chemistry": {
+        "num": 30,
+        "acc": 0.267
+      },
+      "Geography": {
+        "num": 30,
+        "acc": 0.233
+      },
+      "Math": {
+        "num": 30,
+        "acc": 0.433
+      },
+      "Physics": {
+        "num": 20,
+        "acc": 0.3
+      },
+      "Overall-Health and Medicine": {
+        "num": 120,
+        "acc": 0.433
+      },
+      "Basic_Medical_Science": {
+        "num": 30,
+        "acc": 0.533
+      },
+      "Clinical_Medicine": {
+        "num": 30,
+        "acc": 0.433
+      },
+      "Diagnostics_and_Laboratory_Medicine": {
+        "num": 30,
+        "acc": 0.367
+      },
+      "Pharmacy": {
+        "num": 30,
+        "acc": 0.4
+      },
+      "Overall-Humanities and Social Science": {
+        "num": 60,
+        "acc": 0.584
+      },
+      "History": {
+        "num": 30,
+        "acc": 0.667
+      },
+      "Literature": {
+        "num": 30,
+        "acc": 0.5
+      },
+      "Overall-Tech and Engineering": {
+        "num": 210,
+        "acc": 0.362
+      },
+      "Agriculture": {
+        "num": 30,
+        "acc": 0.467
+      },
+      "Architecture_and_Engineering": {
+        "num": 30,
+        "acc": 0.3
+      },
+      "Computer_Science": {
+        "num": 30,
+        "acc": 0.433
+      },
+      "Electronics": {
+        "num": 30,
+        "acc": 0.333
+      },
+      "Energy_and_Power": {
+        "num": 30,
+        "acc": 0.4
+      },
+      "Materials": {
+        "num": 30,
+        "acc": 0.3
+      },
+      "Mechanical_Engineering": {
+        "num": 30,
+        "acc": 0.3
+      },
+      "Overall": {
+        "num": 800,
+        "acc": 0.425
+      },
+      "score": 0.425,
+      "latency": 167.1675
+    },
+    "score": 0.425,
+    "latency": [
+      167.1675
+    ]
+  },
+  {
+    "timestamp": "2025-12-20T22:45:14.634023",
+    "model": "Efficient-Large-Model/NVILA-Lite-2B-hf",
+    "metrics": {
+      "Overall-Art and Design": {
+        "num": 120,
+        "acc": 0.233
+      },
+      "Art": {
+        "num": 30,
+        "acc": 0.233
+      },
+      "Art_Theory": {
+        "num": 30,
+        "acc": 0.167
+      },
+      "Design": {
+        "num": 30,
+        "acc": 0.367
+      },
+      "Music": {
+        "num": 30,
+        "acc": 0.167
+      },
+      "Overall-Business": {
+        "num": 150,
+        "acc": 0.293
+      },
+      "Accounting": {
+        "num": 30,
+        "acc": 0.367
+      },
+      "Economics": {
+        "num": 30,
+        "acc": 0.467
+      },
+      "Finance": {
+        "num": 30,
+        "acc": 0.2
+      },
+      "Manage": {
+        "num": 30,
+        "acc": 0.233
+      },
+      "Marketing": {
+        "num": 30,
+        "acc": 0.2
+      },
+      "Overall-Science": {
+        "num": 140,
+        "acc": 0.286
+      },
+      "Biology": {
+        "num": 30,
+        "acc": 0.267
+      },
+      "Chemistry": {
+        "num": 30,
+        "acc": 0.133
+      },
+      "Geography": {
+        "num": 30,
+        "acc": 0.2
+      },
+      "Math": {
+        "num": 30,
+        "acc": 0.433
+      },
+      "Physics": {
+        "num": 20,
+        "acc": 0.45
+      },
+      "Overall-Health and Medicine": {
+        "num": 120,
+        "acc": 0.283
+      },
+      "Basic_Medical_Science": {
+        "num": 30,
+        "acc": 0.367
+      },
+      "Clinical_Medicine": {
+        "num": 30,
+        "acc": 0.2
+      },
+      "Diagnostics_and_Laboratory_Medicine": {
+        "num": 30,
+        "acc": 0.233
+      },
+      "Pharmacy": {
+        "num": 30,
+        "acc": 0.333
+      },
+      "Overall-Humanities and Social Science": {
+        "num": 60,
+        "acc": 0.317
+      },
+      "History": {
+        "num": 30,
+        "acc": 0.333
+      },
+      "Literature": {
+        "num": 30,
+        "acc": 0.3
+      },
+      "Overall-Tech and Engineering": {
+        "num": 210,
+        "acc": 0.248
+      },
+      "Agriculture": {
+        "num": 30,
+        "acc": 0.167
+      },
+      "Architecture_and_Engineering": {
+        "num": 30,
+        "acc": 0.267
+      },
+      "Computer_Science": {
+        "num": 30,
+        "acc": 0.3
+      },
+      "Electronics": {
+        "num": 30,
+        "acc": 0.233
+      },
+      "Energy_and_Power": {
+        "num": 30,
+        "acc": 0.3
+      },
+      "Materials": {
+        "num": 30,
+        "acc": 0.267
+      },
+      "Mechanical_Engineering": {
+        "num": 30,
+        "acc": 0.2
+      },
+      "Overall": {
+        "num": 800,
+        "acc": 0.271
+      },
+      "score": 0.2713,
+      "latency": 30.1851
+    },
+    "score": 0.2713,
+    "latency": [
+      30.1851
+    ]
+  },
+  {
+    "timestamp": "2025-12-20T22:49:16.395044",
+    "model": "google/gemma-3-4b-it",
+    "metrics": {
+      "Overall-Art and Design": {
+        "num": 120,
+        "acc": 0.259
+      },
+      "Art": {
+        "num": 30,
+        "acc": 0.2
+      },
+      "Art_Theory": {
+        "num": 30,
+        "acc": 0.267
+      },
+      "Design": {
+        "num": 30,
+        "acc": 0.367
+      },
+      "Music": {
+        "num": 30,
+        "acc": 0.2
+      },
+      "Overall-Business": {
+        "num": 150,
+        "acc": 0.407
+      },
+      "Accounting": {
+        "num": 30,
+        "acc": 0.567
+      },
+      "Economics": {
+        "num": 30,
+        "acc": 0.433
+      },
+      "Finance": {
+        "num": 30,
+        "acc": 0.333
+      },
+      "Manage": {
+        "num": 30,
+        "acc": 0.267
+      },
+      "Marketing": {
+        "num": 30,
+        "acc": 0.433
+      },
+      "Overall-Science": {
+        "num": 140,
+        "acc": 0.25
+      },
+      "Biology": {
+        "num": 30,
+        "acc": 0.2
+      },
+      "Chemistry": {
+        "num": 30,
+        "acc": 0.1
+      },
+      "Geography": {
+        "num": 30,
+        "acc": 0.233
+      },
+      "Math": {
+        "num": 30,
+        "acc": 0.433
+      },
+      "Physics": {
+        "num": 20,
+        "acc": 0.3
+      },
+      "Overall-Health and Medicine": {
+        "num": 120,
+        "acc": 0.283
+      },
+      "Basic_Medical_Science": {
+        "num": 30,
+        "acc": 0.4
+      },
+      "Clinical_Medicine": {
+        "num": 30,
+        "acc": 0.267
+      },
+      "Diagnostics_and_Laboratory_Medicine": {
+        "num": 30,
+        "acc": 0.167
+      },
+      "Pharmacy": {
+        "num": 30,
+        "acc": 0.3
+      },
+      "Overall-Humanities and Social Science": {
+        "num": 60,
+        "acc": 0.317
+      },
+      "History": {
+        "num": 30,
+        "acc": 0.4
+      },
+      "Literature": {
+        "num": 30,
+        "acc": 0.233
+      },
+      "Overall-Tech and Engineering": {
+        "num": 210,
+        "acc": 0.329
+      },
+      "Agriculture": {
+        "num": 30,
+        "acc": 0.3
+      },
+      "Architecture_and_Engineering": {
+        "num": 30,
+        "acc": 0.3
+      },
+      "Computer_Science": {
+        "num": 30,
+        "acc": 0.4
+      },
+      "Electronics": {
+        "num": 30,
+        "acc": 0.2
+      },
+      "Energy_and_Power": {
+        "num": 30,
+        "acc": 0.433
+      },
+      "Materials": {
+        "num": 30,
+        "acc": 0.3
+      },
+      "Mechanical_Engineering": {
+        "num": 30,
+        "acc": 0.367
+      },
+      "Overall": {
+        "num": 800,
+        "acc": 0.311
+      },
+      "score": 0.3113,
+      "latency": 114.1445
+    },
+    "score": 0.3113,
+    "latency": [
+      114.1445
+    ]
+  },
+  {
+    "timestamp": "2025-12-20T22:53:22.664649",
+    "model": "google/gemma-3n-E4B-it",
+    "metrics": {
+      "Overall-Art and Design": {
+        "num": 120,
+        "acc": 0.375
+      },
+      "Art": {
+        "num": 30,
+        "acc": 0.467
+      },
+      "Art_Theory": {
+        "num": 30,
+        "acc": 0.367
+      },
+      "Design": {
+        "num": 30,
+        "acc": 0.433
+      },
+      "Music": {
+        "num": 30,
+        "acc": 0.233
+      },
+      "Overall-Business": {
+        "num": 150,
+        "acc": 0.413
+      },
+      "Accounting": {
+        "num": 30,
+        "acc": 0.5
+      },
+      "Economics": {
+        "num": 30,
+        "acc": 0.433
+      },
+      "Finance": {
+        "num": 30,
+        "acc": 0.3
+      },
+      "Manage": {
+        "num": 30,
+        "acc": 0.267
+      },
+      "Marketing": {
+        "num": 30,
+        "acc": 0.567
+      },
+      "Overall-Science": {
+        "num": 140,
+        "acc": 0.343
+      },
+      "Biology": {
+        "num": 30,
+        "acc": 0.267
+      },
+      "Chemistry": {
+        "num": 30,
+        "acc": 0.2
+      },
+      "Geography": {
+        "num": 30,
+        "acc": 0.3
+      },
+      "Math": {
+        "num": 30,
+        "acc": 0.567
+      },
+      "Physics": {
+        "num": 20,
+        "acc": 0.4
+      },
+      "Overall-Health and Medicine": {
+        "num": 120,
+        "acc": 0.342
+      },
+      "Basic_Medical_Science": {
+        "num": 30,
+        "acc": 0.433
+      },
+      "Clinical_Medicine": {
+        "num": 30,
+        "acc": 0.467
+      },
+      "Diagnostics_and_Laboratory_Medicine": {
+        "num": 30,
+        "acc": 0.133
+      },
+      "Pharmacy": {
+        "num": 30,
+        "acc": 0.333
+      },
+      "Overall-Humanities and Social Science": {
+        "num": 60,
+        "acc": 0.417
+      },
+      "History": {
+        "num": 30,
+        "acc": 0.467
+      },
+      "Literature": {
+        "num": 30,
+        "acc": 0.367
+      },
+      "Overall-Tech and Engineering": {
+        "num": 210,
+        "acc": 0.362
+      },
+      "Agriculture": {
+        "num": 30,
+        "acc": 0.333
+      },
+      "Architecture_and_Engineering": {
+        "num": 30,
+        "acc": 0.267
+      },
+      "Computer_Science": {
+        "num": 30,
+        "acc": 0.467
+      },
+      "Electronics": {
+        "num": 30,
+        "acc": 0.367
+      },
+      "Energy_and_Power": {
+        "num": 30,
+        "acc": 0.4
+      },
+      "Materials": {
+        "num": 30,
+        "acc": 0.367
+      },
+      "Mechanical_Engineering": {
+        "num": 30,
+        "acc": 0.333
+      },
+      "Overall": {
+        "num": 800,
+        "acc": 0.371
+      },
+      "score": 0.3713,
+      "latency": 97.559
+    },
+    "score": 0.3713,
+    "latency": [
+      97.559
+    ]
+  },
+  {
+    "timestamp": "2025-12-20T22:58:11.281734",
+    "model": "mistral-community/pixtral-12b",
+    "metrics": {
+      "Overall-Art and Design": {
+        "num": 120,
+        "acc": 0.475
+      },
+      "Art": {
+        "num": 30,
+        "acc": 0.467
+      },
+      "Art_Theory": {
+        "num": 30,
+        "acc": 0.633
+      },
+      "Design": {
+        "num": 30,
+        "acc": 0.6
+      },
+      "Music": {
+        "num": 30,
+        "acc": 0.2
+      },
+      "Overall-Business": {
+        "num": 150,
+        "acc": 0.447
+      },
+      "Accounting": {
+        "num": 30,
+        "acc": 0.333
+      },
+      "Economics": {
+        "num": 30,
+        "acc": 0.567
+      },
+      "Finance": {
+        "num": 30,
+        "acc": 0.467
+      },
+      "Manage": {
+        "num": 30,
+        "acc": 0.433
+      },
+      "Marketing": {
+        "num": 30,
+        "acc": 0.433
+      },
+      "Overall-Science": {
+        "num": 140,
+        "acc": 0.307
+      },
+      "Biology": {
+        "num": 30,
+        "acc": 0.333
+      },
+      "Chemistry": {
+        "num": 30,
+        "acc": 0.2
+      },
+      "Geography": {
+        "num": 30,
+        "acc": 0.4
+      },
+      "Math": {
+        "num": 30,
+        "acc": 0.367
+      },
+      "Physics": {
+        "num": 20,
+        "acc": 0.2
+      },
+      "Overall-Health and Medicine": {
+        "num": 120,
+        "acc": 0.392
+      },
+      "Basic_Medical_Science": {
+        "num": 30,
+        "acc": 0.5
+      },
+      "Clinical_Medicine": {
+        "num": 30,
+        "acc": 0.4
+      },
+      "Diagnostics_and_Laboratory_Medicine": {
+        "num": 30,
+        "acc": 0.233
+      },
+      "Pharmacy": {
+        "num": 30,
+        "acc": 0.433
+      },
+      "Overall-Humanities and Social Science": {
+        "num": 60,
+        "acc": 0.617
+      },
+      "History": {
+        "num": 30,
+        "acc": 0.633
+      },
+      "Literature": {
+        "num": 30,
+        "acc": 0.6
+      },
+      "Overall-Tech and Engineering": {
+        "num": 210,
+        "acc": 0.314
+      },
+      "Agriculture": {
+        "num": 30,
+        "acc": 0.4
+      },
+      "Architecture_and_Engineering": {
+        "num": 30,
+        "acc": 0.3
+      },
+      "Computer_Science": {
+        "num": 30,
+        "acc": 0.433
+      },
+      "Electronics": {
+        "num": 30,
+        "acc": 0.2
+      },
+      "Energy_and_Power": {
+        "num": 30,
+        "acc": 0.4
+      },
+      "Materials": {
+        "num": 30,
+        "acc": 0.233
+      },
+      "Mechanical_Engineering": {
+        "num": 30,
+        "acc": 0.233
+      },
+      "Overall": {
+        "num": 800,
+        "acc": 0.396
+      },
+      "score": 0.3962,
+      "latency": 75.4589
+    },
+    "score": 0.3962,
+    "latency": [
+      75.4589
+    ]
+  },
+  {
+    "timestamp": "2025-12-20T23:02:17.327515",
+    "model": "openbmb/MiniCPM-v-2_6",
+    "metrics": {
+      "Overall-Art and Design": {
+        "num": 120,
+        "acc": 0.342
+      },
+      "Art": {
+        "num": 30,
+        "acc": 0.267
+      },
+      "Art_Theory": {
+        "num": 30,
+        "acc": 0.3
+      },
+      "Design": {
+        "num": 30,
+        "acc": 0.5
+      },
+      "Music": {
+        "num": 30,
+        "acc": 0.3
+      },
+      "Overall-Business": {
+        "num": 150,
+        "acc": 0.293
+      },
+      "Accounting": {
+        "num": 30,
+        "acc": 0.333
+      },
+      "Economics": {
+        "num": 30,
+        "acc": 0.433
+      },
+      "Finance": {
+        "num": 30,
+        "acc": 0.3
+      },
+      "Manage": {
+        "num": 30,
+        "acc": 0.2
+      },
+      "Marketing": {
+        "num": 30,
+        "acc": 0.2
+      },
+      "Overall-Science": {
+        "num": 140,
+        "acc": 0.314
+      },
+      "Biology": {
+        "num": 30,
+        "acc": 0.233
+      },
+      "Chemistry": {
+        "num": 30,
+        "acc": 0.2
+      },
+      "Geography": {
+        "num": 30,
+        "acc": 0.2
+      },
+      "Math": {
+        "num": 30,
+        "acc": 0.5
+      },
+      "Physics": {
+        "num": 20,
+        "acc": 0.5
+      },
+      "Overall-Health and Medicine": {
+        "num": 120,
+        "acc": 0.275
+      },
+      "Basic_Medical_Science": {
+        "num": 30,
+        "acc": 0.4
+      },
+      "Clinical_Medicine": {
+        "num": 30,
+        "acc": 0.233
+      },
+      "Diagnostics_and_Laboratory_Medicine": {
+        "num": 30,
+        "acc": 0.2
+      },
+      "Pharmacy": {
+        "num": 30,
+        "acc": 0.267
+      },
+      "Overall-Humanities and Social Science": {
+        "num": 60,
+        "acc": 0.35
+      },
+      "History": {
+        "num": 30,
+        "acc": 0.4
+      },
+      "Literature": {
+        "num": 30,
+        "acc": 0.3
+      },
+      "Overall-Tech and Engineering": {
+        "num": 210,
+        "acc": 0.314
+      },
+      "Agriculture": {
+        "num": 30,
+        "acc": 0.233
+      },
+      "Architecture_and_Engineering": {
+        "num": 30,
+        "acc": 0.267
+      },
+      "Computer_Science": {
+        "num": 30,
+        "acc": 0.467
+      },
+      "Electronics": {
+        "num": 30,
+        "acc": 0.267
+      },
+      "Energy_and_Power": {
+        "num": 30,
+        "acc": 0.267
+      },
+      "Materials": {
+        "num": 30,
+        "acc": 0.233
+      },
+      "Mechanical_Engineering": {
+        "num": 30,
+        "acc": 0.467
+      },
+      "Overall": {
+        "num": 800,
+        "acc": 0.311
+      },
+      "score": 0.3113,
+      "latency": 53.2697
+    },
+    "score": 0.3113,
+    "latency": [
+      53.2697
+    ]
+  },
+  {
+    "timestamp": "2025-12-20T23:05:14.725731",
+    "model": "OpenGVLab/InternVL2_5-2B",
+    "metrics": {
+      "Overall-Art and Design": {
+        "num": 120,
+        "acc": 0.325
+      },
+      "Art": {
+        "num": 30,
+        "acc": 0.3
+      },
+      "Art_Theory": {
+        "num": 30,
+        "acc": 0.3
+      },
+      "Design": {
+        "num": 30,
+        "acc": 0.467
+      },
+      "Music": {
+        "num": 30,
+        "acc": 0.233
+      },
+      "Overall-Business": {
+        "num": 150,
+        "acc": 0.273
+      },
+      "Accounting": {
+        "num": 30,
+        "acc": 0.367
+      },
+      "Economics": {
+        "num": 30,
+        "acc": 0.467
+      },
+      "Finance": {
+        "num": 30,
+        "acc": 0.2
+      },
+      "Manage": {
+        "num": 30,
+        "acc": 0.233
+      },
+      "Marketing": {
+        "num": 30,
+        "acc": 0.1
+      },
+      "Overall-Science": {
+        "num": 140,
+        "acc": 0.343
+      },
+      "Biology": {
+        "num": 30,
+        "acc": 0.3
+      },
+      "Chemistry": {
+        "num": 30,
+        "acc": 0.2
+      },
+      "Geography": {
+        "num": 30,
+        "acc": 0.4
+      },
+      "Math": {
+        "num": 30,
+        "acc": 0.433
+      },
+      "Physics": {
+        "num": 20,
+        "acc": 0.4
+      },
+      "Overall-Health and Medicine": {
+        "num": 120,
+        "acc": 0.317
+      },
+      "Basic_Medical_Science": {
+        "num": 30,
+        "acc": 0.4
+      },
+      "Clinical_Medicine": {
+        "num": 30,
+        "acc": 0.333
+      },
+      "Diagnostics_and_Laboratory_Medicine": {
+        "num": 30,
+        "acc": 0.233
+      },
+      "Pharmacy": {
+        "num": 30,
+        "acc": 0.3
+      },
+      "Overall-Humanities and Social Science": {
+        "num": 60,
+        "acc": 0.367
+      },
+      "History": {
+        "num": 30,
+        "acc": 0.367
+      },
+      "Literature": {
+        "num": 30,
+        "acc": 0.367
+      },
+      "Overall-Tech and Engineering": {
+        "num": 210,
+        "acc": 0.3
+      },
+      "Agriculture": {
+        "num": 30,
+        "acc": 0.3
+      },
+      "Architecture_and_Engineering": {
+        "num": 30,
+        "acc": 0.333
+      },
+      "Computer_Science": {
+        "num": 30,
+        "acc": 0.367
+      },
+      "Electronics": {
+        "num": 30,
+        "acc": 0.333
+      },
+      "Energy_and_Power": {
+        "num": 30,
+        "acc": 0.3
+      },
+      "Materials": {
+        "num": 30,
+        "acc": 0.267
+      },
+      "Mechanical_Engineering": {
+        "num": 30,
+        "acc": 0.2
+      },
+      "Overall": {
+        "num": 800,
+        "acc": 0.314
+      },
+      "score": 0.3137,
+      "latency": 55.8175
+    },
+    "score": 0.3137,
+    "latency": [
+      55.8175
+    ]
+  },
+  {
+    "timestamp": "2025-12-20T23:08:48.631970",
+    "model": "Qwen/Qwen2-VL-7B-Instruct",
+    "metrics": {
+      "Overall-Art and Design": {
+        "num": 120,
+        "acc": 0.308
+      },
+      "Art": {
+        "num": 30,
+        "acc": 0.267
+      },
+      "Art_Theory": {
+        "num": 30,
+        "acc": 0.3
+      },
+      "Design": {
+        "num": 30,
+        "acc": 0.5
+      },
+      "Music": {
+        "num": 30,
+        "acc": 0.167
+      },
+      "Overall-Business": {
+        "num": 150,
+        "acc": 0.38
+      },
+      "Accounting": {
+        "num": 30,
+        "acc": 0.433
+      },
+      "Economics": {
+        "num": 30,
+        "acc": 0.433
+      },
+      "Finance": {
+        "num": 30,
+        "acc": 0.267
+      },
+      "Manage": {
+        "num": 30,
+        "acc": 0.4
+      },
+      "Marketing": {
+        "num": 30,
+        "acc": 0.367
+      },
+      "Overall-Science": {
+        "num": 140,
+        "acc": 0.264
+      },
+      "Biology": {
+        "num": 30,
+        "acc": 0.333
+      },
+      "Chemistry": {
+        "num": 30,
+        "acc": 0.2
+      },
+      "Geography": {
+        "num": 30,
+        "acc": 0.2
+      },
+      "Math": {
+        "num": 30,
+        "acc": 0.333
+      },
+      "Physics": {
+        "num": 20,
+        "acc": 0.25
+      },
+      "Overall-Health and Medicine": {
+        "num": 120,
+        "acc": 0.309
+      },
+      "Basic_Medical_Science": {
+        "num": 30,
+        "acc": 0.433
+      },
+      "Clinical_Medicine": {
+        "num": 30,
+        "acc": 0.267
+      },
+      "Diagnostics_and_Laboratory_Medicine": {
+        "num": 30,
+        "acc": 0.167
+      },
+      "Pharmacy": {
+        "num": 30,
+        "acc": 0.367
+      },
+      "Overall-Humanities and Social Science": {
+        "num": 60,
+        "acc": 0.467
+      },
+      "History": {
+        "num": 30,
+        "acc": 0.633
+      },
+      "Literature": {
+        "num": 30,
+        "acc": 0.3
+      },
+      "Overall-Tech and Engineering": {
+        "num": 210,
+        "acc": 0.324
+      },
+      "Agriculture": {
+        "num": 30,
+        "acc": 0.3
+      },
+      "Architecture_and_Engineering": {
+        "num": 30,
+        "acc": 0.333
+      },
+      "Computer_Science": {
+        "num": 30,
+        "acc": 0.433
+      },
+      "Electronics": {
+        "num": 30,
+        "acc": 0.367
+      },
+      "Energy_and_Power": {
+        "num": 30,
+        "acc": 0.333
+      },
+      "Materials": {
+        "num": 30,
+        "acc": 0.2
+      },
+      "Mechanical_Engineering": {
+        "num": 30,
+        "acc": 0.3
+      },
+      "Overall": {
+        "num": 800,
+        "acc": 0.33
+      },
+      "score": 0.33,
+      "latency": 82.5729
+    },
+    "score": 0.33,
+    "latency": [
+      82.5729
+    ]
+  },
+  {
+    "timestamp": "2025-12-20T23:12:11.795083",
+    "model": "Qwen/Qwen2.5-VL-7B-Instruct",
+    "metrics": {
+      "Overall-Art and Design": {
+        "num": 120,
+        "acc": 0.558
+      },
+      "Art": {
+        "num": 30,
+        "acc": 0.567
+      },
+      "Art_Theory": {
+        "num": 30,
+        "acc": 0.8
+      },
+      "Design": {
+        "num": 30,
+        "acc": 0.633
+      },
+      "Music": {
+        "num": 30,
+        "acc": 0.233
+      },
+      "Overall-Business": {
+        "num": 150,
+        "acc": 0.453
+      },
+      "Accounting": {
+        "num": 30,
+        "acc": 0.4
+      },
+      "Economics": {
+        "num": 30,
+        "acc": 0.6
+      },
+      "Finance": {
+        "num": 30,
+        "acc": 0.467
+      },
+      "Manage": {
+        "num": 30,
+        "acc": 0.467
+      },
+      "Marketing": {
+        "num": 30,
+        "acc": 0.333
+      },
+      "Overall-Science": {
+        "num": 140,
+        "acc": 0.336
+      },
+      "Biology": {
+        "num": 30,
+        "acc": 0.333
+      },
+      "Chemistry": {
+        "num": 30,
+        "acc": 0.267
+      },
+      "Geography": {
+        "num": 30,
+        "acc": 0.367
+      },
+      "Math": {
+        "num": 30,
+        "acc": 0.4
+      },
+      "Physics": {
+        "num": 20,
+        "acc": 0.3
+      },
+      "Overall-Health and Medicine": {
+        "num": 120,
+        "acc": 0.45
+      },
+      "Basic_Medical_Science": {
+        "num": 30,
+        "acc": 0.5
+      },
+      "Clinical_Medicine": {
+        "num": 30,
+        "acc": 0.4
+      },
+      "Diagnostics_and_Laboratory_Medicine": {
+        "num": 30,
+        "acc": 0.4
+      },
+      "Pharmacy": {
+        "num": 30,
+        "acc": 0.5
+      },
+      "Overall-Humanities and Social Science": {
+        "num": 60,
+        "acc": 0.634
+      },
+      "History": {
+        "num": 30,
+        "acc": 0.667
+      },
+      "Literature": {
+        "num": 30,
+        "acc": 0.6
+      },
+      "Overall-Tech and Engineering": {
+        "num": 210,
+        "acc": 0.305
+      },
+      "Agriculture": {
+        "num": 30,
+        "acc": 0.333
+      },
+      "Architecture_and_Engineering": {
+        "num": 30,
+        "acc": 0.3
+      },
+      "Computer_Science": {
+        "num": 30,
+        "acc": 0.3
+      },
+      "Electronics": {
+        "num": 30,
+        "acc": 0.4
+      },
+      "Energy_and_Power": {
+        "num": 30,
+        "acc": 0.267
+      },
+      "Materials": {
+        "num": 30,
+        "acc": 0.267
+      },
+      "Mechanical_Engineering": {
+        "num": 30,
+        "acc": 0.267
+      },
+      "Overall": {
+        "num": 800,
+        "acc": 0.423
+      },
+      "score": 0.4226,
+      "latency": 71.5153
+    },
+    "score": 0.4226,
+    "latency": [
+      71.5153
+    ]
+  },
+  {
+    "timestamp": "2025-12-20T23:18:13.342085",
+    "model": "Qwen/Qwen3-VL-30B-A3B-Instruct",
+    "metrics": {
+      "Overall-Art and Design": {
+        "num": 120,
+        "acc": 0.575
+      },
+      "Art": {
+        "num": 30,
+        "acc": 0.567
+      },
+      "Art_Theory": {
+        "num": 30,
+        "acc": 0.633
+      },
+      "Design": {
+        "num": 30,
+        "acc": 0.733
+      },
+      "Music": {
+        "num": 30,
+        "acc": 0.367
+      },
+      "Overall-Business": {
+        "num": 150,
+        "acc": 0.687
+      },
+      "Accounting": {
+        "num": 30,
+        "acc": 0.833
+      },
+      "Economics": {
+        "num": 30,
+        "acc": 0.767
+      },
+      "Finance": {
+        "num": 30,
+        "acc": 0.5
+      },
+      "Manage": {
+        "num": 30,
+        "acc": 0.567
+      },
+      "Marketing": {
+        "num": 30,
+        "acc": 0.767
+      },
+      "Overall-Science": {
+        "num": 140,
+        "acc": 0.471
+      },
+      "Biology": {
+        "num": 30,
+        "acc": 0.5
+      },
+      "Chemistry": {
+        "num": 30,
+        "acc": 0.267
+      },
+      "Geography": {
+        "num": 30,
+        "acc": 0.5
+      },
+      "Math": {
+        "num": 30,
+        "acc": 0.633
+      },
+      "Physics": {
+        "num": 20,
+        "acc": 0.45
+      },
+      "Overall-Health and Medicine": {
+        "num": 120,
+        "acc": 0.475
+      },
+      "Basic_Medical_Science": {
+        "num": 30,
+        "acc": 0.567
+      },
+      "Clinical_Medicine": {
+        "num": 30,
+        "acc": 0.567
+      },
+      "Diagnostics_and_Laboratory_Medicine": {
+        "num": 30,
+        "acc": 0.333
+      },
+      "Pharmacy": {
+        "num": 30,
+        "acc": 0.433
+      },
+      "Overall-Humanities and Social Science": {
+        "num": 60,
+        "acc": 0.633
+      },
+      "History": {
+        "num": 30,
+        "acc": 0.567
+      },
+      "Literature": {
+        "num": 30,
+        "acc": 0.7
+      },
+      "Overall-Tech and Engineering": {
+        "num": 210,
+        "acc": 0.433
+      },
+      "Agriculture": {
+        "num": 30,
+        "acc": 0.567
+      },
+      "Architecture_and_Engineering": {
+        "num": 30,
+        "acc": 0.333
+      },
+      "Computer_Science": {
+        "num": 30,
+        "acc": 0.467
+      },
+      "Electronics": {
+        "num": 30,
+        "acc": 0.533
+      },
+      "Energy_and_Power": {
+        "num": 30,
+        "acc": 0.533
+      },
+      "Materials": {
+        "num": 30,
+        "acc": 0.333
+      },
+      "Mechanical_Engineering": {
+        "num": 30,
+        "acc": 0.267
+      },
+      "Overall": {
+        "num": 800,
+        "acc": 0.53
+      },
+      "score": 0.53,
+      "latency": 190.0179
+    },
+    "score": 0.53,
+    "latency": [
+      190.0179
+    ]
+  },
+  {
+    "timestamp": "2025-12-20T23:23:19.190224",
+    "model": "unsloth/Mistral-Small-3.1-24B-Instruct-2503",
+    "metrics": {
+      "Overall-Art and Design": {
+        "num": 120,
+        "acc": 0.625
+      },
+      "Art": {
+        "num": 30,
+        "acc": 0.633
+      },
+      "Art_Theory": {
+        "num": 30,
+        "acc": 0.833
+      },
+      "Design": {
+        "num": 30,
+        "acc": 0.733
+      },
+      "Music": {
+        "num": 30,
+        "acc": 0.3
+      },
+      "Overall-Business": {
+        "num": 150,
+        "acc": 0.62
+      },
+      "Accounting": {
+        "num": 30,
+        "acc": 0.567
+      },
+      "Economics": {
+        "num": 30,
+        "acc": 0.6
+      },
+      "Finance": {
+        "num": 30,
+        "acc": 0.633
+      },
+      "Manage": {
+        "num": 30,
+        "acc": 0.6
+      },
+      "Marketing": {
+        "num": 30,
+        "acc": 0.7
+      },
+      "Overall-Science": {
+        "num": 140,
+        "acc": 0.407
+      },
+      "Biology": {
+        "num": 30,
+        "acc": 0.5
+      },
+      "Chemistry": {
+        "num": 30,
+        "acc": 0.3
+      },
+      "Geography": {
+        "num": 30,
+        "acc": 0.433
+      },
+      "Math": {
+        "num": 30,
+        "acc": 0.467
+      },
+      "Physics": {
+        "num": 20,
+        "acc": 0.3
+      },
+      "Overall-Health and Medicine": {
+        "num": 120,
+        "acc": 0.425
+      },
+      "Basic_Medical_Science": {
+        "num": 30,
+        "acc": 0.433
+      },
+      "Clinical_Medicine": {
+        "num": 30,
+        "acc": 0.5
+      },
+      "Diagnostics_and_Laboratory_Medicine": {
+        "num": 30,
+        "acc": 0.267
+      },
+      "Pharmacy": {
+        "num": 30,
+        "acc": 0.5
+      },
+      "Overall-Humanities and Social Science": {
+        "num": 60,
+        "acc": 0.6
+      },
+      "History": {
+        "num": 30,
+        "acc": 0.5
+      },
+      "Literature": {
+        "num": 30,
+        "acc": 0.7
+      },
+      "Overall-Tech and Engineering": {
+        "num": 210,
+        "acc": 0.357
+      },
+      "Agriculture": {
+        "num": 30,
+        "acc": 0.367
+      },
+      "Architecture_and_Engineering": {
+        "num": 30,
+        "acc": 0.267
+      },
+      "Computer_Science": {
+        "num": 30,
+        "acc": 0.467
+      },
+      "Electronics": {
+        "num": 30,
+        "acc": 0.367
+      },
+      "Energy_and_Power": {
+        "num": 30,
+        "acc": 0.467
+      },
+      "Materials": {
+        "num": 30,
+        "acc": 0.367
+      },
+      "Mechanical_Engineering": {
+        "num": 30,
+        "acc": 0.2
+      },
+      "Overall": {
+        "num": 800,
+        "acc": 0.484
+      },
+      "score": 0.4838,
+      "latency": 93.8087
+    },
+    "score": 0.4838,
+    "latency": [
+      93.8087
+    ]
+  },
+  {
+    "timestamp": "2025-12-20T23:31:57.461131",
+    "model": "XiaomiMiMo/MiMo-VL-7B-RL",
+    "metrics": {
+      "Overall-Art and Design": {
+        "num": 120,
+        "acc": 0.225
+      },
+      "Art": {
+        "num": 30,
+        "acc": 0.233
+      },
+      "Art_Theory": {
+        "num": 30,
+        "acc": 0.133
+      },
+      "Design": {
+        "num": 30,
+        "acc": 0.367
+      },
+      "Music": {
+        "num": 30,
+        "acc": 0.167
+      },
+      "Overall-Business": {
+        "num": 150,
+        "acc": 0.28
+      },
+      "Accounting": {
+        "num": 30,
+        "acc": 0.333
+      },
+      "Economics": {
+        "num": 30,
+        "acc": 0.467
+      },
+      "Finance": {
+        "num": 30,
+        "acc": 0.2
+      },
+      "Manage": {
+        "num": 30,
+        "acc": 0.2
+      },
+      "Marketing": {
+        "num": 30,
+        "acc": 0.2
+      },
+      "Overall-Science": {
+        "num": 140,
+        "acc": 0.279
+      },
+      "Biology": {
+        "num": 30,
+        "acc": 0.267
+      },
+      "Chemistry": {
+        "num": 30,
+        "acc": 0.133
+      },
+      "Geography": {
+        "num": 30,
+        "acc": 0.2
+      },
+      "Math": {
+        "num": 30,
+        "acc": 0.433
+      },
+      "Physics": {
+        "num": 20,
+        "acc": 0.4
+      },
+      "Overall-Health and Medicine": {
+        "num": 120,
+        "acc": 0.25
+      },
+      "Basic_Medical_Science": {
+        "num": 30,
+        "acc": 0.3
+      },
+      "Clinical_Medicine": {
+        "num": 30,
+        "acc": 0.2
+      },
+      "Diagnostics_and_Laboratory_Medicine": {
+        "num": 30,
+        "acc": 0.233
+      },
+      "Pharmacy": {
+        "num": 30,
+        "acc": 0.267
+      },
+      "Overall-Humanities and Social Science": {
+        "num": 60,
+        "acc": 0.333
+      },
+      "History": {
+        "num": 30,
+        "acc": 0.333
+      },
+      "Literature": {
+        "num": 30,
+        "acc": 0.333
+      },
+      "Overall-Tech and Engineering": {
+        "num": 210,
+        "acc": 0.243
+      },
+      "Agriculture": {
+        "num": 30,
+        "acc": 0.167
+      },
+      "Architecture_and_Engineering": {
+        "num": 30,
+        "acc": 0.267
+      },
+      "Computer_Science": {
+        "num": 30,
+        "acc": 0.2
+      },
+      "Electronics": {
+        "num": 30,
+        "acc": 0.233
+      },
+      "Energy_and_Power": {
+        "num": 30,
+        "acc": 0.3
+      },
+      "Materials": {
+        "num": 30,
+        "acc": 0.3
+      },
+      "Mechanical_Engineering": {
+        "num": 30,
+        "acc": 0.233
+      },
+      "Overall": {
+        "num": 800,
+        "acc": 0.261
+      },
+      "score": 0.2612,
+      "latency": 366.2807
+    },
+    "score": 0.2612,
+    "latency": [
+      366.2807
+    ]
+  },
+  {
+    "timestamp": "2025-12-20T23:36:31.601350",
+    "model": "zai-org/GLM-4.1V-9B-Thinking",
+    "metrics": {
+      "Overall-Art and Design": {
+        "num": 120,
+        "acc": 0.617
+      },
+      "Art": {
+        "num": 30,
+        "acc": 0.567
+      },
+      "Art_Theory": {
+        "num": 30,
+        "acc": 0.8
+      },
+      "Design": {
+        "num": 30,
+        "acc": 0.8
+      },
+      "Music": {
+        "num": 30,
+        "acc": 0.3
+      },
+      "Overall-Business": {
+        "num": 150,
+        "acc": 0.627
+      },
+      "Accounting": {
+        "num": 30,
+        "acc": 0.667
+      },
+      "Economics": {
+        "num": 30,
+        "acc": 0.733
+      },
+      "Finance": {
+        "num": 30,
+        "acc": 0.633
+      },
+      "Manage": {
+        "num": 30,
+        "acc": 0.467
+      },
+      "Marketing": {
+        "num": 30,
+        "acc": 0.633
+      },
+      "Overall-Science": {
+        "num": 140,
+        "acc": 0.486
+      },
+      "Biology": {
+        "num": 30,
+        "acc": 0.467
+      },
+      "Chemistry": {
+        "num": 30,
+        "acc": 0.467
+      },
+      "Geography": {
+        "num": 30,
+        "acc": 0.367
+      },
+      "Math": {
+        "num": 30,
+        "acc": 0.567
+      },
+      "Physics": {
+        "num": 20,
+        "acc": 0.6
+      },
+      "Overall-Health and Medicine": {
+        "num": 120,
+        "acc": 0.575
+      },
+      "Basic_Medical_Science": {
+        "num": 30,
+        "acc": 0.6
+      },
+      "Clinical_Medicine": {
+        "num": 30,
+        "acc": 0.567
+      },
+      "Diagnostics_and_Laboratory_Medicine": {
+        "num": 30,
+        "acc": 0.367
+      },
+      "Pharmacy": {
+        "num": 30,
+        "acc": 0.767
+      },
+      "Overall-Humanities and Social Science": {
+        "num": 60,
+        "acc": 0.8
+      },
+      "History": {
+        "num": 30,
+        "acc": 0.8
+      },
+      "Literature": {
+        "num": 30,
+        "acc": 0.8
+      },
+      "Overall-Tech and Engineering": {
+        "num": 210,
+        "acc": 0.462
+      },
+      "Agriculture": {
+        "num": 30,
+        "acc": 0.633
+      },
+      "Architecture_and_Engineering": {
+        "num": 30,
+        "acc": 0.4
+      },
+      "Computer_Science": {
+        "num": 30,
+        "acc": 0.633
+      },
+      "Electronics": {
+        "num": 30,
+        "acc": 0.5
+      },
+      "Energy_and_Power": {
+        "num": 30,
+        "acc": 0.267
+      },
+      "Materials": {
+        "num": 30,
+        "acc": 0.4
+      },
+      "Mechanical_Engineering": {
+        "num": 30,
+        "acc": 0.4
+      },
+      "Overall": {
+        "num": 800,
+        "acc": 0.563
+      },
+      "score": 0.5626,
+      "latency": 140.657
+    },
+    "score": 0.5626,
+    "latency": [
+      140.657
+    ]
+  },
+  {
+    "timestamp": "2025-12-20T23:43:42.673314",
+    "model": "zai-org/GLM-4.5V-FP8",
+    "metrics": {
+      "Overall-Art and Design": {
+        "num": 120,
+        "acc": 0.567
+      },
+      "Art": {
+        "num": 30,
+        "acc": 0.5
+      },
+      "Art_Theory": {
+        "num": 30,
+        "acc": 0.733
+      },
+      "Design": {
+        "num": 30,
+        "acc": 0.767
+      },
+      "Music": {
+        "num": 30,
+        "acc": 0.267
+      },
+      "Overall-Business": {
+        "num": 150,
+        "acc": 0.613
+      },
+      "Accounting": {
+        "num": 30,
+        "acc": 0.6
+      },
+      "Economics": {
+        "num": 30,
+        "acc": 0.7
+      },
+      "Finance": {
+        "num": 30,
+        "acc": 0.5
+      },
+      "Manage": {
+        "num": 30,
+        "acc": 0.6
+      },
+      "Marketing": {
+        "num": 30,
+        "acc": 0.667
+      },
+      "Overall-Science": {
+        "num": 140,
+        "acc": 0.543
+      },
+      "Biology": {
+        "num": 30,
+        "acc": 0.467
+      },
+      "Chemistry": {
+        "num": 30,
+        "acc": 0.5
+      },
+      "Geography": {
+        "num": 30,
+        "acc": 0.6
+      },
+      "Math": {
+        "num": 30,
+        "acc": 0.567
+      },
+      "Physics": {
+        "num": 20,
+        "acc": 0.6
+      },
+      "Overall-Health and Medicine": {
+        "num": 120,
+        "acc": 0.525
+      },
+      "Basic_Medical_Science": {
+        "num": 30,
+        "acc": 0.467
+      },
+      "Clinical_Medicine": {
+        "num": 30,
+        "acc": 0.467
+      },
+      "Diagnostics_and_Laboratory_Medicine": {
+        "num": 30,
+        "acc": 0.5
+      },
+      "Pharmacy": {
+        "num": 30,
+        "acc": 0.667
+      },
+      "Overall-Humanities and Social Science": {
+        "num": 60,
+        "acc": 0.666
+      },
+      "History": {
+        "num": 30,
+        "acc": 0.8
+      },
+      "Literature": {
+        "num": 30,
+        "acc": 0.533
+      },
+      "Overall-Tech and Engineering": {
+        "num": 210,
+        "acc": 0.409
+      },
+      "Agriculture": {
+        "num": 30,
+        "acc": 0.433
+      },
+      "Architecture_and_Engineering": {
+        "num": 30,
+        "acc": 0.233
+      },
+      "Computer_Science": {
+        "num": 30,
+        "acc": 0.7
+      },
+      "Electronics": {
+        "num": 30,
+        "acc": 0.467
+      },
+      "Energy_and_Power": {
+        "num": 30,
+        "acc": 0.433
+      },
+      "Materials": {
+        "num": 30,
+        "acc": 0.4
+      },
+      "Mechanical_Engineering": {
+        "num": 30,
+        "acc": 0.2
+      },
+      "Overall": {
+        "num": 800,
+        "acc": 0.531
+      },
+      "score": 0.5313,
+      "latency": 257.0079
+    },
+    "score": 0.5313,
+    "latency": [
+      257.0079
+    ]
+  }
+]
