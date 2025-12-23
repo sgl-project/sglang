@@ -421,29 +421,26 @@ class SchedulerBeamSearchProcessorMixin:
                 return True
 
         if (
-            len(req.sampling_params.stop_strs) > 0
-            or len(req.sampling_params.stop_regex_strs) > 0
-        ):
-            tail_str = self._tail_str(req, beam.tokens)
+            len(req.sampling_params.stop_strs) == 0
+            and len(req.sampling_params.stop_regex_strs) == 0
+        ) or req.tokenizer is None:
+            return False
 
-            if not tail_str:
-                return False
+        tail_str = self._tail_str(req, beam.tokens)
+        if not tail_str:
+            return False
 
-            if len(req.sampling_params.stop_strs) > 0:
-                for stop_str in req.sampling_params.stop_strs:
-                    if stop_str in tail_str or stop_str in beam.text:
-                        beam.finish_reason = FINISH_MATCHED_STR(matched=stop_str)
-                        return True
+        if len(req.sampling_params.stop_strs) > 0:
+            for stop_str in req.sampling_params.stop_strs:
+                if stop_str in tail_str:
+                    beam.finish_reason = FINISH_MATCHED_STR(matched=stop_str)
+                    return True
 
-            if len(req.sampling_params.stop_regex_strs) > 0:
-                for stop_regex_str in req.sampling_params.stop_regex_strs:
-                    if re.search(stop_regex_str, tail_str):
-                        beam.finish_reason = FINISHED_MATCHED_REGEX(
-                            matched=stop_regex_str
-                        )
-                        return True
-
-        return False
+        if len(req.sampling_params.stop_regex_strs) > 0:
+            for stop_regex_str in req.sampling_params.stop_regex_strs:
+                if re.search(stop_regex_str, tail_str):
+                    beam.finish_reason = FINISHED_MATCHED_REGEX(matched=stop_regex_str)
+                    return True
 
     def _tail_str(self: Scheduler, req, tokens: List[int]) -> str:
         """Get tail string from token sequence for stop condition checking.
@@ -456,20 +453,17 @@ class SchedulerBeamSearchProcessorMixin:
             tokens: List of token IDs
 
         Returns:
-            str: Decoded tail string, empty string if tokenizer is None
+            str: Decoded tail string
+
+        Note:
+            Caller must ensure that either req.sampling_params.stop_strs or
+            req.sampling_params.stop_regex_strs is non-empty, and req.tokenizer
+            is not None.
         """
-        if req.tokenizer is None:
-            return ""
-
-        if (
-            len(req.sampling_params.stop_strs) > 0
-            or len(req.sampling_params.stop_regex_strs) > 0
-        ):
-            max_len_tail_str = max(
-                req.sampling_params.stop_str_max_len + 1,
-                req.sampling_params.stop_regex_max_len + 1,
-            )
-
+        max_len_tail_str = max(
+            req.sampling_params.stop_str_max_len + 1,
+            req.sampling_params.stop_regex_max_len + 1,
+        )
         tail_len = min((max_len_tail_str + 1), len(tokens))
         return req.tokenizer.decode(tokens[-tail_len:])
 
