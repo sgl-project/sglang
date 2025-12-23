@@ -136,7 +136,7 @@ class SchedulerPPMixin:
 
             # When the server is idle, self-check and re-init some states
             if server_is_idle:
-                self.check_during_pp_idle()
+                self.self_check_during_idle()
 
     @DynamicGradMode()
     def event_loop_pp_disagg_prefill(self: Scheduler):
@@ -312,7 +312,7 @@ class SchedulerPPMixin:
 
             # When the server is idle, self-check and re-init some states
             if server_is_idle and len(self.disagg_prefill_inflight_queue) == 0:
-                self.check_during_pp_idle()
+                self.self_check_during_idle()
 
     @DynamicGradMode()
     def event_loop_pp_disagg_decode(self: Scheduler):
@@ -501,7 +501,7 @@ class SchedulerPPMixin:
                 queue_size += len(self.decode_offload_manager.ongoing_offload)
 
             if server_is_idle and queue_size == 0:
-                self.check_during_pp_idle()
+                self.self_check_during_idle()
 
     def init_pp_loop_state(self: Scheduler):
         self.pp_loop_size: int = self.pp_size + self.server_args.pp_async_batch_depth
@@ -614,7 +614,7 @@ class SchedulerPPMixin:
                 forward_batch = ForwardBatch.init_new(
                     model_worker_batch, self.tp_worker.model_runner
                 )
-                _, _ = self.tp_worker.model_runner.forward(
+                _ = self.tp_worker.model_runner.forward(
                     forward_batch=forward_batch, pp_proxy_tensors=pp_proxy
                 )
 
@@ -699,12 +699,6 @@ class SchedulerPPMixin:
             )
 
         return predicted_size
-
-    def check_during_pp_idle(self: Scheduler):
-        self.check_memory()
-        self.check_tree_cache()
-        self.new_token_ratio = self.init_new_token_ratio
-        self.maybe_sleep_on_idle()
 
     def process_bootstrapped_queue(
         self: Scheduler, bootstrapped_rids: Optional[List[str]]

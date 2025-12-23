@@ -46,6 +46,7 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
 )
 from sglang.srt.distributed.parallel_state import get_pp_group
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -74,7 +75,7 @@ from sglang.srt.models.utils import RotaryPosMixin, WeightsMapper, permute_inv
 from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
 from sglang.srt.multimodal.vit_cuda_graph_runner import ViTCudaGraphRunner
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import add_prefix, get_bool_env_var
+from sglang.srt.utils import add_prefix
 
 logger = logging.getLogger(__name__)
 
@@ -170,7 +171,6 @@ class Qwen2_5_VisionBlock(nn.Module):
         position_embeddings: torch.Tensor,
         output_ws=None,
     ) -> torch.Tensor:
-        ws = output_ws
         S, B, H = x.shape
         # norm1: flatten to 2D -> [S*B, H], then reshape back
         x2d = x.reshape(-1, H)
@@ -182,7 +182,7 @@ class Qwen2_5_VisionBlock(nn.Module):
             hidden_states,
             cu_seqlens=cu_seqlens,
             position_embeddings=position_embeddings,
-            output_ws=ws,
+            output_ws=output_ws,
         )
         attn = rearrange(attn, "b s h -> s b h")
 
@@ -390,7 +390,7 @@ class Qwen2_5_VisionTransformer(nn.Module, RotaryPosMixin):
         x: torch.Tensor,
         grid_thw: torch.Tensor,
     ) -> torch.Tensor:
-        if get_bool_env_var("SGLANG_VIT_ENABLE_CUDA_GRAPH") and self.tp_size == 1:
+        if envs.SGLANG_VIT_ENABLE_CUDA_GRAPH.get():
             return self.forward_with_cuda_graph(x, grid_thw)
 
         # patchify
@@ -447,7 +447,10 @@ class Qwen2_5_VisionTransformer(nn.Module, RotaryPosMixin):
         # transformers
         x = x.unsqueeze(1)
         for layer_num, blk in enumerate(self.blocks):
-            if layer_num in self.fullatt_block_indexes:
+            fullatt_indexes = self.fullatt_block_indexes
+            if isinstance(fullatt_indexes, torch.Tensor):
+                fullatt_indexes = fullatt_indexes.tolist()
+            if layer_num in fullatt_indexes:
                 cu_seqlens_now = cu_seqlens
             else:
                 cu_seqlens_now = cu_window_seqlens
@@ -630,6 +633,25 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
             self.visual.dtype
         )
         image_grid_thw = torch.concat([item.image_grid_thw for item in items], dim=0)
+
+        expected_dim = getattr(self.visual, "embed_dim", -1)
+
+        if expected_dim == -1:
+            vision_conf = self.config.vision_config
+            expected_dim = getattr(
+                vision_conf, "embed_dim", getattr(vision_conf, "hidden_size", -1)
+            )
+
+        raw_patch_dim = 1176
+
+        if pixel_values.dim() == 2:
+            current_dim = pixel_values.shape[-1]
+            if current_dim == expected_dim:
+                return pixel_values
+            if current_dim != raw_patch_dim:
+
+                return pixel_values
+
         assert pixel_values.dim() == 2, pixel_values.dim()
         assert image_grid_thw.dim() == 2, image_grid_thw.dim()
         if self.use_data_parallel:
