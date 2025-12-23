@@ -243,9 +243,10 @@ def _per_token_group_quant_8bit_raw(
     if _is_hip:
         if dtype == torch.int8:
             bit8_max = 127.0
+            bit8_min = -128.0
         else:
             bit8_max = 224.0
-        bit8_min = -bit8_max  # TODO incorrect for int8
+            bit8_min = -bit8_max
     else:
         if dtype == torch.int8:
             info = torch.iinfo(dtype)
