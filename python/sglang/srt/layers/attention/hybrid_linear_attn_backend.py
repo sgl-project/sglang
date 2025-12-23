@@ -1404,5 +1404,4 @@ class HybridLinearAttnBackend(AttentionBackend):
             mamba_caches.intermediate_beta[:, dst_track_indices] = mamba_caches.intermediate_beta[
                 :, src_track_indices
             ]
-            print(track_steps, mamba_caches.intermediate_accepted_steps[src_track_indices])
             mamba_caches.intermediate_accepted_steps[dst_track_indices] = track_steps.to(mamba_caches.intermediate_accepted_steps.dtype, copy=False)
