@@ -199,6 +199,12 @@ class QwenImageEditPlusPipeline(QwenImageEditPipeline):
     pipeline_name = "QwenImageEditPlusPipeline"
 
 
+def prepare_mu_layered(batch: Req, server_args: ServerArgs):
+    base_seqlen = 256 * 256 / 16 / 16
+    mu = (batch.image_latent.shape[1] / base_seqlen) ** 0.5
+    return "mu", mu
+
+
 class QwenImageLayeredPipeline(QwenImageEditPipeline):
     pipeline_name = "QwenImageLayeredPipeline"
 
@@ -230,7 +236,7 @@ class QwenImageLayeredPipeline(QwenImageEditPipeline):
             stage_name="timestep_preparation_stage",
             stage=TimestepPreparationStage(
                 scheduler=self.get_module("scheduler"),
-                prepare_extra_set_timesteps_kwargs=[prepare_mu],
+                prepare_extra_set_timesteps_kwargs=[prepare_mu_layered],
             ),
         )
 

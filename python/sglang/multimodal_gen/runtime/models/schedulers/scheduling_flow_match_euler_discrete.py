@@ -300,7 +300,10 @@ class FlowMatchEulerDiscreteScheduler(SchedulerMixin, ConfigMixin, BaseScheduler
                 Custom values for timesteps to be used for each diffusion step. If `None`, the timesteps are computed
                 automatically.
         """
+        print(f"303 {mu=}")
+        import traceback
 
+        traceback.print_stack()
         if self.config.use_dynamic_shifting and mu is None:
             raise ValueError(
                 "`mu` must be passed when `use_dynamic_shifting` is set to be `True`"
@@ -357,6 +360,7 @@ class FlowMatchEulerDiscreteScheduler(SchedulerMixin, ConfigMixin, BaseScheduler
         #    "exponential" or "linear" type is applied
         if self.config.use_dynamic_shifting:
             assert mu is not None, "mu cannot be None when use_dynamic_shifting is True"
+            print(f"371 {mu=}, {sigmas_array=}")
             sigmas_array = self.time_shift(mu, 1.0, sigmas_array)
         else:
             sigmas_array = (
@@ -364,6 +368,8 @@ class FlowMatchEulerDiscreteScheduler(SchedulerMixin, ConfigMixin, BaseScheduler
             )
 
         # 3. If required, stretch the sigmas schedule to terminate at the configured `shift_terminal` value
+        print(f"367 {self.config.shift_terminal=}")
+        print(f"368 {self.config.time_shift_type}")
         if self.config.shift_terminal:
             sigmas_tensor = torch.from_numpy(sigmas_array).to(dtype=torch.float32)
             sigmas_tensor = self.stretch_shift_to_terminal(sigmas_tensor)
@@ -393,6 +399,7 @@ class FlowMatchEulerDiscreteScheduler(SchedulerMixin, ConfigMixin, BaseScheduler
         sigmas_tensor = torch.from_numpy(sigmas_array).to(
             dtype=torch.float32, device=device
         )
+        print(f"398 {sigmas_tensor=}")
         if not is_timesteps_provided:
             timesteps_tensor = sigmas_tensor * self.config.num_train_timesteps
         else:
