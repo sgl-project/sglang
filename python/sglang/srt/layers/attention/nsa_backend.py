@@ -24,7 +24,6 @@ from sglang.srt.layers.attention.nsa.utils import (
 )
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.mem_cache.allocator import is_enable_hierarchical_nsa
-from sglang.srt.mem_cache.memory_pool import NSAReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.utils import is_hip
 
@@ -669,9 +668,7 @@ class NativeSparseAttnBackend(AttentionBackend):
         real_page_table = self._transform_table_1_to_real(page_table_1)
         index_real_page_table = None
 
-        if isinstance(self.req_to_token_pool, NSAReqToTokenPool) or isinstance(
-            self.req_to_token_pool, NSADecodeReqToTokenPool
-        ):
+        if isinstance(self.req_to_token_pool, NSADecodeReqToTokenPool):
             index_real_page_table = torch.zeros_like(real_page_table)
         else:
             index_real_page_table = None

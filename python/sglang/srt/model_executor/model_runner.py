@@ -106,7 +106,6 @@ from sglang.srt.mem_cache.memory_pool import (
     HybridReqToTokenPool,
     MHATokenToKVPool,
     MLATokenToKVPool,
-    NSAReqToTokenPool,
     NSATokenToKVPool,
     ReqToTokenPool,
     SWAKVPool,
@@ -1704,27 +1703,13 @@ class ModelRunner:
                     speculative_num_draft_tokens=self.server_args.speculative_num_draft_tokens,
                 )
             else:
-                # Check if we should use NSA ReqToTokenPool
-                if (
-                    self.server_args.enable_hierarchical_nsa
-                    # and self.server_args.enable_sparse_attn
-                    and is_deepseek_nsa(self.model_config.hf_config)
-                ):
-                    self.req_to_token_pool = NSAReqToTokenPool(
-                        size=max_num_reqs,
-                        max_context_len=self.model_config.context_len
-                        + extra_max_context_len,
-                        device=self.device,
-                        enable_memory_saver=self.server_args.enable_memory_saver,
-                    )
-                else:
-                    self.req_to_token_pool = ReqToTokenPool(
-                        size=max_num_reqs,
-                        max_context_len=self.model_config.context_len
-                        + extra_max_context_len,
-                        device=self.device,
-                        enable_memory_saver=self.server_args.enable_memory_saver,
-                    )
+                self.req_to_token_pool = ReqToTokenPool(
+                    size=max_num_reqs,
+                    max_context_len=self.model_config.context_len
+                    + extra_max_context_len,
+                    device=self.device,
+                    enable_memory_saver=self.server_args.enable_memory_saver,
+                )
         else:
             # Draft worker shares req_to_token_pool with the target worker.
             assert self.is_draft_worker

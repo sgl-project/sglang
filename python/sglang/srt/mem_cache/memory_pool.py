@@ -337,35 +337,6 @@ class MambaPool:
         return data_ptrs, data_lens, item_lens
 
 
-class NSAReqToTokenPool(ReqToTokenPool):
-    """NSA ReqToTokenPool: separate mapping for KV cache and nsa indexer_k"""
-
-    def __init__(
-        self,
-        size: int,
-        max_context_len: int,
-        device: str,
-        enable_memory_saver: bool,
-    ):
-        super().__init__(size, max_context_len, device, enable_memory_saver)
-
-        memory_saver_adapter = TorchMemorySaverAdapter.create(
-            enable=enable_memory_saver
-        )
-        with memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
-            self.req_to_nsa_index_k = torch.zeros(
-                (size * 4, max_context_len), dtype=torch.int32, device=device
-            )
-
-    def write_index_token(self, indices, values):
-        """Write indexer_k mapping"""
-        self.req_to_nsa_index_k[indices] = values
-
-    def clear(self):
-        super().clear()
-        self.req_to_nsa_index_k.zero_()
-
-
 class HybridReqToTokenPool(ReqToTokenPool):
     """A memory pool that maps a request to its token locations."""
 
@@ -1702,11 +1673,9 @@ class NSATokenToKVPool(MLATokenToKVPool):
 
     def get_kv_size_bytes(self):
         kv_size_bytes = super().get_kv_size_bytes()
-        index_k_size_bytes = 0
         for index_k_cache in self.index_k_with_scale_buffer:
-            index_k_size_bytes += get_tensor_size_bytes(index_k_cache)
-        logger.info(f"NSA Index_K size: {index_k_size_bytes / GB:.2f} GB")
-        return kv_size_bytes + index_k_size_bytes
+            kv_size_bytes += get_tensor_size_bytes(index_k_cache)
+        return kv_size_bytes
 
 
 class AscendMLAPagedTokenToKVPool(MLATokenToKVPool):
