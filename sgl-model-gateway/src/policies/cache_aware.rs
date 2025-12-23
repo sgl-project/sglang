@@ -60,6 +60,7 @@
 */
 
 use std::{
+    collections::HashMap,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -72,7 +73,9 @@ use dashmap::DashMap;
 use rand::Rng;
 use tracing::debug;
 
-use super::{get_healthy_worker_indices, tree::Tree, CacheAwareConfig, LoadBalancingPolicy};
+use super::{
+    get_healthy_worker_indices, tree::Tree, CacheAwareConfig, DPLoadManager, LoadBalancingPolicy,
+};
 use crate::core::Worker;
 
 /// Cache-aware routing policy
@@ -88,6 +91,7 @@ pub struct CacheAwarePolicy {
     eviction_handle: Option<thread::JoinHandle<()>>,
     /// Flag to signal the eviction thread to stop
     shutdown_flag: Arc<AtomicBool>,
+    dp_load_manager: DPLoadManager,
 }
 
 impl CacheAwarePolicy {
@@ -151,14 +155,14 @@ impl CacheAwarePolicy {
             trees,
             eviction_handle,
             shutdown_flag,
+            dp_load_manager: DPLoadManager::new(),
         }
     }
 
     /// Initialize the tree with worker URLs (used only during initial setup)
     pub fn init_workers(&self, workers: &[Arc<dyn Worker>]) {
         // Group workers by model
-        let mut model_workers: std::collections::HashMap<String, Vec<&Arc<dyn Worker>>> =
-            std::collections::HashMap::new();
+        let mut model_workers: HashMap<String, Vec<&Arc<dyn Worker>>> = HashMap::new();
         for worker in workers {
             // Use "default" for unknown/empty model_ids for backward compatibility
             let model_id = worker.model_id();
@@ -422,6 +426,18 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
 
     fn as_any(&self) -> &dyn std::any::Any {
         self
+    }
+
+    fn update_dp_loads(&self, loads: &HashMap<String, HashMap<isize, isize>>) {
+        self.dp_load_manager.update_dp_loads(loads);
+    }
+
+    fn get_lowest_dp_load(&self, worker: &dyn Worker) -> Option<isize> {
+        self.dp_load_manager.get_lowest_dp_load(worker)
+    }
+
+    fn load_increment(&self, worker: &dyn Worker, dp_rank: isize, tokens: isize) {
+        self.dp_load_manager.load_increment(worker, dp_rank, tokens);
     }
 }
 

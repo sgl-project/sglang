@@ -1420,6 +1420,7 @@ class Scheduler(
                 bootstrap_room=recv_req.bootstrap_room,
                 disagg_mode=self.disaggregation_mode,
                 data_parallel_rank=recv_req.data_parallel_rank,
+                data_parallel_rank_decode=recv_req.data_parallel_rank_decode,
                 vocab_size=self.model_config.vocab_size,
                 priority=recv_req.priority,
                 metrics_collector=(

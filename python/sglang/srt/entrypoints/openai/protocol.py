@@ -536,6 +536,7 @@ class ChatCompletionRequest(BaseModel):
 
     # For data parallel rank routing
     data_parallel_rank: Optional[int] = None
+    data_parallel_rank_decode: Optional[int] = None
 
     # OpenAI/SGLang default sampling parameters
     _DEFAULT_SAMPLING_PARAMS = {

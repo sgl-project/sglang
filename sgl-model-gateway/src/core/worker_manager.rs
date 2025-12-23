@@ -221,15 +221,23 @@ impl WorkerManager {
                 let client = client.clone();
 
                 async move {
-                    let load = if is_http {
+                    let dp_rank_loads = if is_http {
                         Self::parse_load_response(&client, &url, api_key.as_deref()).await
+                    } else {
+                        HashMap::new()
+                    };
+
+                    let load = if !dp_rank_loads.is_empty() {
+                        dp_rank_loads.values().sum::<isize>()
                     } else {
                         -1
                     };
+
                     WorkerLoadInfo {
                         worker: url,
                         worker_type,
                         load,
+                        dp_rank_loads,
                     }
                 }
             })
@@ -251,7 +259,7 @@ impl WorkerManager {
         client: &reqwest::Client,
         url: &str,
         api_key: Option<&str>,
-    ) -> isize {
+    ) -> HashMap<isize, isize> {
         let load_url = format!("{}/get_load", url);
         let mut req = client.get(&load_url).timeout(REQUEST_TIMEOUT);
         if let Some(key) = api_key {
@@ -260,15 +268,27 @@ impl WorkerManager {
 
         match req.send().await {
             Ok(r) if r.status().is_success() => match r.json::<Value>().await {
-                Ok(json) if json.is_array() => json
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .filter_map(|e| e.get("num_tokens").and_then(|v| v.as_i64()))
-                    .sum::<i64>() as isize,
-                _ => -1,
+                Ok(json) if json.is_array() => {
+                    let mut load_map = HashMap::new();
+
+                    for element in json.as_array().unwrap().iter() {
+                        if let (Some(dp_rank_value), Some(num_tokens_value)) = (
+                            element.get("dp_rank"),
+                            element.get("num_tokens")
+                        ) {
+                            if let (Some(dp_rank), Some(num_tokens)) = (
+                                dp_rank_value.as_i64(),
+                                num_tokens_value.as_i64()
+                            ) {
+                                load_map.insert(dp_rank as isize, num_tokens as isize);
+                            }
+                        }
+                    }
+                    load_map
+                }
+                _ => HashMap::new(),
             },
-            _ => -1,
+            _ => HashMap::new(),
         }
     }
 
@@ -389,19 +409,23 @@ impl LoadMonitor {
 
         loop {
             interval_timer.tick().await;
-
             let power_of_two_policies = policy_registry.get_all_power_of_two_policies();
 
-            if power_of_two_policies.is_empty() {
+            if power_of_two_policies.is_empty()
+                && !policy_registry.is_dp_minimum_tokens_scheduler_enabled()
+            {
                 debug!("No PowerOfTwo policies found, skipping load fetch");
                 continue;
             }
 
+            let all_policies = policy_registry.get_all_policies();
             let result = WorkerManager::get_all_worker_loads(&worker_registry, &client).await;
 
             let mut loads = HashMap::new();
+            let mut dp_rank_loads = HashMap::new();
             for load_info in result.loads {
-                loads.insert(load_info.worker, load_info.load);
+                loads.insert(load_info.worker.clone(), load_info.load);
+                dp_rank_loads.insert(load_info.worker, load_info.dp_rank_loads);
             }
 
             if !loads.is_empty() {
@@ -412,6 +436,9 @@ impl LoadMonitor {
                 );
                 for policy in &power_of_two_policies {
                     policy.update_loads(&loads);
+                }
+                for policy in &all_policies {
+                    policy.update_dp_loads(&dp_rank_loads)
                 }
                 let _ = tx.send(loads);
             } else {
