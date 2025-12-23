@@ -89,6 +89,7 @@ if _is_hip:
             err
         )
 
+
 def _swizzle_mxfp4(quant_tensor, scale, num_warps):
     """weight swizzle for mxfp4 moe, used for OAI mxfp4 kernel"""
     import triton_kernels.matmul_ogs_details.opt_flags as opt_flags
