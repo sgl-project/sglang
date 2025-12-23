@@ -1857,7 +1857,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         return self.enable_overlap and self.spec_algorithm.is_eagle()
 
     @property
-    def is_v2_standalone(self):
+    def is_standalone_v2(self):
         return self.enable_overlap and self.spec_algorithm.is_standalone()
 
     def prepare_for_decode(self):
