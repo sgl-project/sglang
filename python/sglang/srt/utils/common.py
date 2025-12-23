@@ -1509,29 +1509,32 @@ def add_prometheus_track_response_middleware(app):
 
     @app.middleware("http")
     async def track_http_status_code(request, call_next):
-        route = request.scope.get("route")
-        endpoint = route.path if route else request.url.path
+        method = request.method
+        path, is_handled_path = _get_fastapi_request_path(request)
 
-        http_request_counter.labels(
-            endpoint=endpoint,
-            method=request.method,
-        ).inc()
+        http_request_counter.labels(endpoint=path, method=method).inc()
 
         response = await call_next(request)
 
-        response_endpoint = (
-            route.path
-            if route
-            else ("unknown_route" if response.status_code == 404 else request.url.path)
-        )
-
         http_response_counter.labels(
-            endpoint=response_endpoint,
+            endpoint=path,
+            method=method,
             status_code=str(response.status_code),
-            method=request.method,
         ).inc()
 
         return response
+
+
+# https://github.com/blueswen/fastapi-observability/blob/132a3c576f8b09e5311c68bd553215013bc75685/fastapi_app/utils.py#L98
+def _get_fastapi_request_path(request) -> Tuple[str, bool]:
+    from starlette.routing import Match
+
+    for route in request.app.routes:
+        match, child_scope = route.matches(request.scope)
+        if match == Match.FULL:
+            return route.path, True
+
+    return request.url.path, False
 
 
 def bind_port(port):
