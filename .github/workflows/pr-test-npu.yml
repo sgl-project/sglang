@@ -247,5 +247,5 @@ jobs:
           STREAMS_PER_DEVICE: 32
         run: |
           export PATH="/usr/local/Ascend/8.3.RC1/compiler/bishengir/bin:${PATH}"
-          cd python/sglang/multimodal_gen/test/
-          python3 run_suite.py --suite 1-npu
+          cd python
+          python3 sglang/multimodal_gen/test/run_suite.py --suite 1-npu
