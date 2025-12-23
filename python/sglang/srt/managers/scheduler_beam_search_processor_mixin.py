@@ -355,8 +355,8 @@ class SchedulerBeamSearchProcessorMixin:
             finish_mask_cpu: Boolean mask indicating which candidates are finished
             device: Device where tensors are located
         """
-        completed_seqs = []
-        incompleted_seqs = []
+        completed_beams = []
+        incompleted_beams = []
         last_token_ids = []
         cum_logprobs = []
 
@@ -364,7 +364,7 @@ class SchedulerBeamSearchProcessorMixin:
             zip(top_logprobs_val, top_logprobs_idx)
         ):
             is_finished = finish_mask_cpu[i]
-            seq = BeamSearchSequence(
+            beam_sequence = BeamSearchSequence(
                 tokens=[top_token],
                 cum_logprob=top_logprob,
                 finish_reason=(
@@ -374,17 +374,18 @@ class SchedulerBeamSearchProcessorMixin:
                 ),
             )
             if is_finished:
-                completed_seqs.append(seq)
-                logger.info(f"completed seq: {seq}")
+                beam_sequence.beam_score = self._calculate_beam_score(top_logprob, 1)
+                completed_beams.append(beam_sequence)
+                logger.debug(f"completed beam: {beam_sequence}")
             else:
-                incompleted_seqs.append(seq)
+                incompleted_beams.append(beam_sequence)
                 cum_logprobs.append(top_logprob)
                 last_token_ids.append(top_token)
-                if len(incompleted_seqs) == req.beam_width:
+                if len(incompleted_beams) == req.beam_width:
                     break
 
-        req.beam_list.completed = completed_seqs
-        req.beam_list.incompleted = incompleted_seqs
+        req.beam_list.completed = completed_beams
+        req.beam_list.incompleted = incompleted_beams
         req.beam_list.prompt_lens = torch.tensor(
             [len(req.origin_input_ids)] * req.beam_width,
             dtype=torch.long,

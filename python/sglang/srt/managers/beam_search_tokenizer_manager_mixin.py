@@ -84,6 +84,10 @@ class BeamSearchTokenizerManagerMixin:
         state: Any,
         meta_info: Dict[str, Any],
     ) -> bool:
+        # Only support BatchTokenIDOutput or BatchStrOutput for beam search
+        if not isinstance(recv_obj, (BatchTokenIDOutput, BatchStrOutput)):
+            return False
+
         beam_search_output = (
             recv_obj.beam_search_output[i]
             if i < len(recv_obj.beam_search_output)

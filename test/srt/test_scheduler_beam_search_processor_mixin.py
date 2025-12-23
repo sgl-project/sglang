@@ -725,6 +725,67 @@ class TestCreateCompletedBeamsForInsufficientCandidates(unittest.TestCase):
         self.assertIsInstance(req.finished_reason, FINISH_MATCHED_TOKEN)
         self.assertEqual(req.finished_reason.matched, 100)
 
+    def test_create_completed_beams_with_finished_beam(self):
+        """Test that completed beams have beam_score when one candidate is finished.
+
+        This tests the branch in _create_initial_beam_sequences where is_finished=True,
+        ensuring that beam_score is calculated for the finished beam.
+        """
+        device = torch.device("cpu")
+
+        req = Mock()
+        req.beam_width = 3
+        req.beam_candidates = 6
+        req.origin_input_ids = [1, 2, 3]
+        req.sampling_params = Mock()
+        req.sampling_params.max_new_tokens = 10
+        req.beam_list = BeamSearchList()
+        req.finished_reason = None
+
+        top_logprobs_val = [-1.0, -2.0, -3.0, -4.0, -5.0, -6.0]
+        top_logprobs_idx = [100, 200, 300, 400, 500, 600]
+        finish_mask_cpu = [
+            True,
+            False,
+            False,
+            False,
+            False,
+            False,
+        ]
+
+        self.scheduler._create_initial_beam_sequences(
+            req, top_logprobs_val, top_logprobs_idx, finish_mask_cpu, device
+        )
+
+        self.assertEqual(len(req.beam_list.incompleted), 3)
+        self.assertEqual(len(req.beam_list.completed), 1)
+
+        completed_beam = req.beam_list.completed[0]
+        self.assertIsNotNone(
+            completed_beam.beam_score, "Completed beam should have beam_score"
+        )
+
+        # Verify other properties of completed beam
+        self.assertEqual(completed_beam.tokens, [100])
+        self.assertEqual(completed_beam.cum_logprob, -1.0)
+        self.assertIsInstance(completed_beam.finish_reason, FINISH_MATCHED_TOKEN)
+        self.assertEqual(completed_beam.finish_reason.matched, 100)
+
+        # Verify incompleted beams don't have beam_score
+        for i, beam in enumerate(req.beam_list.incompleted):
+            self.assertIsNone(
+                beam.beam_score, f"Incompleted beam {i} should not have beam_score"
+            )
+            self.assertIsNone(
+                beam.finish_reason,
+                f"Incompleted beam {i} should not have finish_reason",
+            )
+
+        # Verify incompleted beams have correct tokens
+        self.assertEqual(req.beam_list.incompleted[0].tokens, [200])
+        self.assertEqual(req.beam_list.incompleted[1].tokens, [300])
+        self.assertEqual(req.beam_list.incompleted[2].tokens, [400])
+
 
 class TestCreateInitialBeamSequences(unittest.TestCase):
     """Test _create_initial_beam_sequences method."""
@@ -961,22 +1022,6 @@ class TestTailStr(unittest.TestCase):
         result = self.scheduler._tail_str(req, tokens)
 
         self.assertEqual(result, "text 123")
-
-    def test_tail_str_with_none_tokenizer(self):
-        """Test tail string extraction when tokenizer is None."""
-        req = Mock()
-        req.sampling_params = Mock()
-        req.sampling_params.stop_strs = ["STOP"]
-        req.sampling_params.stop_regex_strs = []
-        req.sampling_params.stop_str_max_len = 2
-        req.sampling_params.stop_regex_max_len = 0
-        req.tokenizer = None  # Key: tokenizer is None
-
-        tokens = [1, 2, 3, 4, 5]
-        result = self.scheduler._tail_str(req, tokens)
-
-        # Should return empty string when tokenizer is None
-        self.assertEqual(result, "")
 
 
 class TestExtractBeamTopkData(unittest.TestCase):

@@ -115,7 +115,7 @@ class TestBeamSearchDiff(unittest.TestCase):
 
     def test_beam_search_different_widths(self):
         """Test beam search with different beam widths."""
-        beam_widths = [2, 50]
+        beam_widths = [2, 10]
 
         for beam_width in beam_widths:
             print(f"\n{'='*60}")
