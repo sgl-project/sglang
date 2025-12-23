@@ -333,5 +333,20 @@ class TestEAGLEServerPageSizeTopk(TestEAGLEServerBasic):
     ]
 
 
+class TestEAGLEServerPageSizeTopkFA3(TestEAGLEServerBasic):
+    # default topk=8 and tokens=64
+    spec_topk = 5
+    spec_steps = 8
+    spec_tokens = 64
+
+    extra_args = [
+        "--page-size=256",
+        "--attention-backend=fa3",
+        "--cuda-graph-max-bs=5",
+        "--dtype=float16",
+        "--max-running-requests=8",
+    ]
+
+
 if __name__ == "__main__":
     unittest.main()
