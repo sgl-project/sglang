@@ -27,6 +27,7 @@ import torch
 import triton
 
 from sglang.srt.layers.tilelang_gemm_wrapper.core.config_loader import DEFAULT_M_VALUES
+from deep_gemm.utils.layout import get_mn_major_tma_aligned_tensor
 
 logging.basicConfig(
     level=logging.INFO,
@@ -53,8 +54,9 @@ def prepare_data(M: int, N: int, K: int):
     B = torch.randn(N, K, dtype=torch.bfloat16, device="cuda")
     
     A_fp8, B_fp8, A_scale, B_scale = prepare_gemm_inputs(A, B)
+    A_scale_deepgemm = get_mn_major_tma_aligned_tensor(A_scale.clone())
     
-    return A_fp8, B_fp8, A_scale, B_scale
+    return A_fp8, B_fp8, A_scale, B_scale, A_scale_deepgemm
 
 
 def benchmark_tilelang(
@@ -150,7 +152,7 @@ def run_benchmark(
     for M in m_values:
         try:
             # Prepare data
-            A_fp8, B_fp8, A_scale, B_scale = prepare_data(M, N, K)
+            A_fp8, B_fp8, A_scale, B_scale, A_scale_deepgemm = prepare_data(M, N, K)
             
             # Benchmark TileLang
             try:
@@ -168,7 +170,7 @@ def run_benchmark(
             if deepgemm_available:
                 try:
                     dg_ms, _, _ = benchmark_deepgemm(
-                        A_fp8, B_fp8, A_scale, B_scale, M, N, rep
+                        A_fp8, B_fp8, A_scale_deepgemm, B_scale, M, N, rep
                     )
                     dg_tflops = tflops(M, N, K, dg_ms)
                     speedup = dg_ms / tl_ms
