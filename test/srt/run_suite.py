@@ -491,6 +491,30 @@ def main():
         default=False,
         help="Continue running remaining tests even if one fails (useful for nightly tests)",
     )
+    arg_parser.add_argument(
+        "--enable-retry",
+        action="store_true",
+        default=False,
+        help="Enable smart retry for accuracy/performance assertion failures (not code errors)",
+    )
+    arg_parser.add_argument(
+        "--max-attempts",
+        type=int,
+        default=2,
+        help="Maximum number of attempts per file including initial run (default: 2)",
+    )
+    arg_parser.add_argument(
+        "--retry-wait-seconds",
+        type=int,
+        default=60,
+        help="Seconds to wait between retries (default: 60)",
+    )
+    arg_parser.add_argument(
+        "--retry-timeout-increase",
+        type=int,
+        default=600,
+        help="Additional timeout in seconds when retry is enabled (default: 600)",
+    )
     args = arg_parser.parse_args()
     print(f"{args=}")
 
@@ -506,7 +530,19 @@ def main():
 
     print("The running tests are ", [f.name for f in files])
 
-    exit_code = run_unittest_files(files, args.timeout_per_file, args.continue_on_error)
+    # Add extra timeout when retry is enabled
+    timeout = args.timeout_per_file
+    if args.enable_retry:
+        timeout += args.retry_timeout_increase
+
+    exit_code = run_unittest_files(
+        files,
+        timeout,
+        args.continue_on_error,
+        args.enable_retry,
+        args.max_attempts,
+        args.retry_wait_seconds,
+    )
     exit(exit_code)
 
 
