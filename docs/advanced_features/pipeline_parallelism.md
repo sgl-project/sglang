@@ -32,7 +32,7 @@ Optimizing the chunked prefill size is crucial for balancing pipeline efficiency
 ### Enable Dynamic Chunking and Adjust Smoothing Factor (Experimental feature)
 SGLang also offers a dynamic chunking solution that could further improve performance. This feature is currently an experimental feature that requires a certain amount of tuning experimentation and may not be suitable for all workloads. In addition, fine-tuning the smoothing factor can help optimize performance for specific workloads and model characteristics.
 
-### Case Study
+### Case Study on NVIDIA H20
 
 When evaluating pipeline parallelism with fixed chunked prefill sizes from 2K to 16K, experiment results show that a 4K chunk size delivered optimal prefill TTFT performance for the DeepSeek-V3.1, and a 6K chunk size delivered optimal prefill TTFT performance for the Qwen3-235B-A22B-Thinking-2507-FP8.
 
