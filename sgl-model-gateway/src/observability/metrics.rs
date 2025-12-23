@@ -102,7 +102,7 @@ pub fn init_metrics() {
     // Layer 1: HTTP metrics
     describe_counter!(
         "smg_http_requests_total",
-        "Total HTTP requests by method, path, and status"
+        "Total HTTP requests by method and path"
     );
     describe_histogram!(
         "smg_http_request_duration_seconds",
