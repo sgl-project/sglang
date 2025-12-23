@@ -31,6 +31,7 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
+    tensor_model_parallel_tree_all_reduce,
 )
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
@@ -62,7 +63,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTe
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen2_moe import Qwen2MoeMLP as Qwen3MoeMLP
 from sglang.srt.models.qwen2_moe import Qwen2MoeModel
-from sglang.srt.models.utils import (
+from sglang.srt.models.utpils import (
     create_fused_set_kv_buffer_arg,
     enable_fused_set_kv_buffer,
 )
@@ -301,7 +302,14 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             and not use_reduce_scatter
             and not should_use_flashinfer_cutlass_moe_fp4_allgather()
         ):
-            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+            if get_global_server_args().rl_on_policy_target == "fsdp_tp":
+                final_hidden_states = tensor_model_parallel_tree_all_reduce(
+                    final_hidden_states
+                )
+            else:
+                final_hidden_states = tensor_model_parallel_all_reduce(
+                    final_hidden_states
+                )
 
         return final_hidden_states.view(num_tokens, hidden_dim)
 
@@ -473,7 +481,7 @@ class Qwen3MoeAttention(nn.Module):
             dual_chunk_attention_config=dual_chunk_attention_config,
         )
         self.compatible_with_fused_kv_buffer = (
-            False if isinstance(self.rotary_emb, MRotaryEmbedding) else True
+            False  # if isinstance(self.rotary_emb, MRotaryEmbedding) else True
         )
         self.compatible_with_fused_qk_norm_rope = (
             not isinstance(self.rotary_emb, MRotaryEmbedding)

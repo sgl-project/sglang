@@ -371,3 +371,63 @@ def set_tp_invariant_mode(enabled=True):
         yield
     finally:
         _tp_inv_MODE = old_state
+
+
+def scatter_input_by_local_expert(
+    topk: torch.Tensor, input: torch.Tensor, E: int
+) -> torch.Tensor:
+    """
+    Args:
+        topk: [M, topk], long, -1 means remote expert
+        input: [M, topk, hidden_size], float
+        E: int, number of local experts (expert ids in [0, E))
+    Returns:
+        output: [M, E, hidden_size]
+    """
+    M, _, hidden_size = input.shape
+
+    # Mask out remote experts in output
+    valid = (topk != -1).unsqueeze(-1)  # [M, topk, 1]
+    output_masked = input * valid.to(input.dtype)  # [M, topk, hidden_size]
+
+    # Replace -1 with 0 for safe indexing (value doesn't matter because output is zero)
+    topk_index = topk.clamp(min=0)  # turns -1 → 0, others unchanged
+
+    # Expand index to match output
+    index = topk_index.unsqueeze(-1).expand(
+        -1, -1, hidden_size
+    )  # [M, topk, hidden_size]
+
+    # Initialize result
+    output = torch.zeros(M, E, hidden_size, device=input.device, dtype=input.dtype)
+
+    # Scatter add
+    output.scatter_add_(1, index, output_masked)
+
+    return output
+
+
+def moe_sum_tree_reduce(
+    input: torch.Tensor,  # [M, topk, hidden_dim]
+    output: torch.Tensor,  # [M, hidden_dim]
+    curr_topk_ids: torch.Tensor,  # [M, topk]
+    routed_scaling_factor: float,
+    E: int,
+):
+    assert input.is_contiguous()
+    assert output.is_contiguous()
+
+    token_num, _, hidden_dim = input.shape
+    assert output.shape[0] == token_num and output.shape[1] == hidden_dim
+    input_masked = scatter_input_by_local_expert(
+        topk=curr_topk_ids,
+        input=input,
+        E=E,
+    )  # [M, E, hidden_dim]
+
+    for level in range(1, E.bit_length()):
+        for left in range(0, E, 1 << level):
+            right = left + (1 << (level - 1))
+            input_masked[:, left] += input_masked[:, right]
+    output.copy_(input_masked[:, 0] * routed_scaling_factor)
+    return

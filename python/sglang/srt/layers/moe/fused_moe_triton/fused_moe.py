@@ -14,6 +14,8 @@ import torch.nn.functional as F
 import triton.language as tl
 
 from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
+from sglang.srt.server_args import get_global_server_args
+from sglang.srt.tp_invariant_ops.tp_invariant_ops import moe_sum_tree_reduce
 from sglang.srt.utils import (
     cpu_has_amx_support,
     direct_register_custom_op,
@@ -624,6 +626,14 @@ def fused_experts_impl(
                     intermediate_cache3[:, 1],
                     out=out_hidden_states[begin_chunk_idx:end_chunk_idx],
                 ).squeeze(dim=1)
+            elif get_global_server_args().rl_on_policy_target == "fsdp_tp":
+                moe_sum_tree_reduce(
+                    intermediate_cache3.view(*intermediate_cache3.shape),
+                    out_hidden_states[begin_chunk_idx:end_chunk_idx],
+                    curr_topk_ids,
+                    routed_scaling_factor,
+                    E,
+                )
             else:
                 # According to micro benchmark results, torch.compile can get better performance for small token.
                 if tokens_in_chunk <= 32:
