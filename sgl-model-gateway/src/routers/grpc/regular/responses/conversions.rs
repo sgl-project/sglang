@@ -171,7 +171,7 @@ pub fn responses_to_chat(req: &ResponsesRequest) -> Result<ChatCompletionRequest
     Ok(ChatCompletionRequest {
         messages,
         model: if req.model.is_empty() {
-            "default".to_string()
+            "unknown".to_string()
         } else {
             req.model.clone()
         },

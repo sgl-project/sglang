@@ -21,9 +21,11 @@ from collections import OrderedDict
 from typing import Dict, List, Union
 
 import psutil
+import pybase64
 import setproctitle
 import zmq
 
+from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import (
     BatchEmbeddingOutput,
     BatchMultimodalDecodeReq,
@@ -40,6 +42,7 @@ from sglang.srt.utils import (
     kill_itself_when_parent_died,
 )
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
+from sglang.srt.utils.watchdog import Watchdog
 from sglang.utils import (
     TypeBasedDispatcher,
     find_printable_text,
@@ -110,13 +113,22 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             ]
         )
 
+        self.watchdog = Watchdog.create(
+            debug_name="DetokenizerManager",
+            watchdog_timeout=server_args.soft_watchdog_timeout,
+            soft=True,
+            test_stuck_time=envs.SGLANG_TEST_STUCK_DETOKENIZER.get(),
+        )
+
     def event_loop(self):
         """The event loop that handles requests"""
         while True:
-            recv_obj = self.recv_from_scheduler.recv_pyobj()
+            with self.watchdog.disable():
+                recv_obj = self.recv_from_scheduler.recv_pyobj()
             output = self._request_dispatcher(recv_obj)
             if output is not None:
                 self.send_to_tokenizer.send_pyobj(output)
+            self.watchdog.feed()
 
     def trim_matched_stop(
         self, output: Union[str, List[int]], finished_reason: Dict, no_stop_trim: bool
@@ -266,8 +278,24 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
 
         return output_strs
 
+    def _extract_routed_experts(self, recv_obj: BatchTokenIDOutput) -> List[List[int]]:
+        output_routed_experts = None
+        if recv_obj.output_routed_experts is not None:
+            output_routed_experts = [
+                (
+                    pybase64.b64encode(output_routed_experts.numpy().tobytes()).decode(
+                        "utf-8"
+                    )
+                    if output_routed_experts is not None
+                    else []
+                )
+                for output_routed_experts in recv_obj.output_routed_experts
+            ]
+        return output_routed_experts
+
     def handle_batch_token_id_out(self, recv_obj: BatchTokenIDOutput):
         output_strs = self._decode_batch_token_id_output(recv_obj)
+        output_routed_experts = self._extract_routed_experts(recv_obj)
 
         return BatchStrOutput(
             rids=recv_obj.rids,
@@ -294,6 +322,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             output_token_ids_logprobs_idx=recv_obj.output_token_ids_logprobs_idx,
             output_token_entropy_val=recv_obj.output_token_entropy_val,
             output_hidden_states=recv_obj.output_hidden_states,
+            output_routed_experts=output_routed_experts,
             placeholder_tokens_idx=None,
             placeholder_tokens_val=None,
             retraction_counts=recv_obj.retraction_counts,
@@ -302,6 +331,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             forward_entry_time=recv_obj.forward_entry_time,
             prefill_launch_delay=recv_obj.prefill_launch_delay,
             prefill_launch_latency=recv_obj.prefill_launch_latency,
+            prefill_finished_ts=recv_obj.prefill_finished_ts,
         )
 
     def handle_multimodal_decode_req(self, recv_obj: BatchMultimodalDecodeReq):
