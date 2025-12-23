@@ -221,6 +221,9 @@ message GenerateComplete {
 
   // Index for ordering when n>1 (for parallel request multiplexing)
   uint32 index = 11;
+
+  // Routed experts information
+  google.protobuf.Struct routed_experts = 12;
 }
 
 message GenerateError {

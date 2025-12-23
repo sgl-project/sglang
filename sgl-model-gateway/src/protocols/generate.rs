@@ -286,6 +286,8 @@ pub struct GenerateMetaInfo {
     pub e2e_latency: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub matched_stop: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub routed_experts: Option<Value>,
 }
 
 /// Finish reason for generate endpoint
