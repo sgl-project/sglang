@@ -195,7 +195,7 @@ class BaseTpWorker(ABC):
         fetch_fwd_batch = ForwardBatch.init_new(fetch_batch, self.model_runner)
         self.model_runner.lora_manager.prepare_lora_batch(fetch_fwd_batch)
 
-    def can_run_lora_batch(self, lora_ids: list[str]) -> bool:
+    def can_run_lora_batch(self, lora_ids: set[str]) -> bool:
         return self.model_runner.lora_manager.validate_lora_batch(lora_ids)
 
     def forward_batch_embedding(self, model_worker_batch: ModelWorkerBatch):
