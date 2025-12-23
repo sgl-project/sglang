@@ -2063,8 +2063,12 @@ class Scheduler(
             if self.enable_metrics and len(retracted_reqs) > 0:
                 self.metrics_collector.increment_retracted_reqs(
                     num_retracted_reqs=len(retracted_reqs),
-                    num_retracted_input_tokens=sum(len(r.origin_input_ids) for r in retracted_reqs),
-                    num_retracted_output_tokens=sum(len(r.output_ids) for r in retracted_reqs),
+                    num_retracted_input_tokens=sum(
+                        len(r.origin_input_ids) for r in retracted_reqs
+                    ),
+                    num_retracted_output_tokens=sum(
+                        len(r.output_ids) for r in retracted_reqs
+                    ),
                 )
             self.new_token_ratio = new_token_ratio
             for req in reqs_to_abort:
