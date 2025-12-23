@@ -419,6 +419,8 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
     ):
         created_time = obj.received_time if obj.received_time else time.time()
         self.auto_create_handle_loop()
+
+        obj.validate()
         obj.normalize_batch_and_arguments()
         if (
             self.server_args.language_only
