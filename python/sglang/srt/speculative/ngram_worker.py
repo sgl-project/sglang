@@ -196,6 +196,20 @@ class NGRAMWorker:
         )
         batch.spec_info.prepare_for_verify(batch, self.page_size)
 
+    def _update_ngram_cache(self, batch: ScheduleBatch):
+        batch_tokens = []
+        for req in batch.reqs:
+            # FIXME: Whether to insert 'extend' into the cache or not, after testing,
+            # there is not much difference, so we will not insert it for now.
+            # if batch.forward_mode.is_extend():
+            #     put_ids = req.origin_input_ids + req.output_ids
+            # else:
+            put_ids = self._efficient_concat_last_n(
+                req.origin_input_ids, req.output_ids, self.branch_length
+            )
+            batch_tokens.append(put_ids)
+        self.ngram_cache.batch_put(batch_tokens)
+
     def forward_batch_generation(self, batch: ScheduleBatch) -> GenerationBatchResult:
         self._prepare_for_speculative_decoding(batch)
         model_worker_batch = batch.get_model_worker_batch()
