@@ -66,4 +66,4 @@ git clone https://github.com/feifeibear/long-context-attention.git long-context-
 
 ### Install SGLang
 rm -rf python/pyproject.toml && mv python/pyproject_npu.toml python/pyproject.toml
-${PIP_INSTALL} -v -e "python[srt_npu]"
+${PIP_INSTALL} -v -e "python[all_npu]"
