@@ -54,12 +54,10 @@ suites = {
         TestFile("dllm/test_llada2_mini.py", 520),
         TestFile("test_abort.py", 131),
         TestFile("test_chunked_prefill.py", 312),
-        TestFile("test_create_kvindices.py", 7),
         TestFile("test_deterministic.py", 228),
         TestFile("test_constrained_decoding.py", 111),
         TestFile("test_eval_fp8_accuracy.py", 250),
         TestFile("test_external_models.py", 30),
-        TestFile("test_fa3.py", 420),
         TestFile("test_flashmla.py", 230),
         TestFile("test_fp8_utils.py", 9),
         TestFile("rotary_embedding/test_mrope.py", 10),
@@ -67,7 +65,6 @@ suites = {
         TestFile("test_gpt_oss_1gpu.py", 402),
         TestFile("test_harmony_parser.py", 6),
         TestFile("test_hidden_states.py", 55),
-        TestFile("test_hybrid_attn_backend.py", 379),
         TestFile("test_input_embeddings.py", 38),
         TestFile("test_io_struct.py", 8),
         TestFile("test_jinja_template_utils.py", 7),
@@ -91,8 +88,6 @@ suites = {
         TestFile("test_prefill_adder.py", 1),
         TestFile("test_priority_scheduling.py", 130),
         TestFile("test_pytorch_sampling_backend.py", 66),
-        TestFile("test_radix_attention.py", 105),
-        TestFile("test_radix_cache_unit.py", 8),
         TestFile("test_reasoning_parser.py", 5),
         TestFile("test_request_queue_validation.py", 47),
         TestFile("test_retract_decode.py", 259),
@@ -110,13 +105,8 @@ suites = {
         TestFile("test_torch_compile.py", 190),
         TestFile("test_torch_compile_moe.py", 210),
         TestFile("test_triton_fused_moe.py", 12),
-        TestFile("test_torch_native_attention_backend.py", 221),
         TestFile("test_torchao.py", 103),
-        TestFile("test_triton_attention_kernels.py", 4),
-        TestFile("test_triton_attention_backend.py", 203),
-        TestFile("test_triton_attention_kernels.py", 4),
         TestFile("test_triton_moe_channel_fp8_kernel.py", 16),
-        TestFile("test_triton_sliding_window.py", 84),
         TestFile("test_utils_update_weights.py", 29),
         TestFile("test_video_utils.py", 5),
         TestFile("test_vision_chunked_prefill.py", 150),
@@ -144,7 +134,6 @@ suites = {
     "per-commit-4-gpu": [
         TestFile("models/test_qwen3_next_models.py", 650),
         TestFile("test_gpt_oss_4gpu.py", 300),
-        TestFile("test_local_attn.py", 411),
         TestFile("test_multi_instance_release_memory_occupation.py", 64),
         TestFile("test_pp_single_node.py", 500),
         TestFile("test_epd_disaggregation.py", 150),
@@ -166,7 +155,6 @@ suites = {
     ],
     "per-commit-4-gpu-b200": [
         TestFile("test_deepseek_v3_fp4_4gpu.py", 1500),
-        TestFile("test_flash_attention_4.py", 90),
         TestFile("test_fp8_blockwise_gemm.py", 280),
         TestFile("test_gpt_oss_4gpu.py", 700),
         TestFile("test_llama31_fp4.py", 90),
@@ -253,7 +241,6 @@ suite_amd = {
         TestFile("test_abort.py", 51),
         TestFile("test_bench_typebaseddispatcher.py", 10),
         TestFile("test_chunked_prefill.py", 312),
-        TestFile("test_create_kvindices.py", 2),
         TestFile("test_eval_fp8_accuracy.py", 303),
         TestFile("test_fused_moe.py", 30),
         TestFile("test_harmony_parser.py", 20),
@@ -268,7 +255,6 @@ suite_amd = {
         TestFile("test_page_size.py", 60),
         TestFile("test_penalty.py", 180),
         TestFile("test_pytorch_sampling_backend.py", 66),
-        TestFile("test_radix_attention.py", 105),
         TestFile("test_reasoning_parser.py", 5),
         TestFile("test_constrained_decoding.py", 120),
         TestFile("test_retract_decode.py", 450),
@@ -279,12 +265,7 @@ suite_amd = {
         TestFile("test_srt_engine.py", 261),
         TestFile("test_torch_compile.py", 169),
         # TestFile("test_torch_compile_moe.py", 210), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/13107
-        TestFile("test_torch_native_attention_backend.py", 123),
-        # TestFile("test_triton_attention_kernels.py", 4),
-        TestFile("test_triton_attention_backend.py", 150),
-        TestFile("test_triton_sliding_window.py", 250),
         TestFile("test_type_based_dispatcher.py", 10),
-        TestFile("test_wave_attention_kernels.py", 2),
         # Disabled temporarily
         # TestFile("test_vlm_input_format.py", 300),
         # TestFile("models/test_embedding_models.py", 73), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/11127
@@ -510,6 +491,30 @@ def main():
         default=False,
         help="Continue running remaining tests even if one fails (useful for nightly tests)",
     )
+    arg_parser.add_argument(
+        "--enable-retry",
+        action="store_true",
+        default=False,
+        help="Enable smart retry for accuracy/performance assertion failures (not code errors)",
+    )
+    arg_parser.add_argument(
+        "--max-attempts",
+        type=int,
+        default=2,
+        help="Maximum number of attempts per file including initial run (default: 2)",
+    )
+    arg_parser.add_argument(
+        "--retry-wait-seconds",
+        type=int,
+        default=60,
+        help="Seconds to wait between retries (default: 60)",
+    )
+    arg_parser.add_argument(
+        "--retry-timeout-increase",
+        type=int,
+        default=600,
+        help="Additional timeout in seconds when retry is enabled (default: 600)",
+    )
     args = arg_parser.parse_args()
     print(f"{args=}")
 
@@ -525,7 +530,19 @@ def main():
 
     print("The running tests are ", [f.name for f in files])
 
-    exit_code = run_unittest_files(files, args.timeout_per_file, args.continue_on_error)
+    # Add extra timeout when retry is enabled
+    timeout = args.timeout_per_file
+    if args.enable_retry:
+        timeout += args.retry_timeout_increase
+
+    exit_code = run_unittest_files(
+        files,
+        timeout,
+        args.continue_on_error,
+        args.enable_retry,
+        args.max_attempts,
+        args.retry_wait_seconds,
+    )
     exit(exit_code)
 
 

@@ -154,6 +154,7 @@ class Envs:
     SGLANG_TEST_STUCK_DP_CONTROLLER = EnvFloat(0)
     SGLANG_TEST_STUCK_TOKENIZER = EnvFloat(0)
     IS_BLACKWELL = EnvBool(False)
+    IS_H200 = EnvBool(False)
     SGLANG_SET_CPU_AFFINITY = EnvBool(False)
     SGLANG_PROFILE_WITH_STACK = EnvBool(True)
     SGLANG_PROFILE_RECORD_SHAPES = EnvBool(True)
