@@ -4,7 +4,16 @@
 from dataclasses import dataclass, field
 from typing import Tuple
 
+import torch.nn as nn
+
 from sglang.multimodal_gen.configs.models.dits.base import DiTArchConfig, DiTConfig
+
+
+def _is_transformer_block(module_name: str, module: nn.Module) -> bool:
+    return (
+        "transformer_blocks" in module_name
+        or "single_transformer_blocks" in module_name
+    )
 
 
 @dataclass
@@ -20,6 +29,10 @@ class FluxArchConfig(DiTArchConfig):
     pooled_projection_dim: int = 768
     guidance_embeds: bool = False
     axes_dims_rope: Tuple[int, int, int] = (16, 56, 56)
+
+    _fsdp_shard_conditions: list = field(
+        default_factory=lambda: [_is_transformer_block]
+    )
 
     stacked_params_mapping: list[tuple[str, str, str]] = field(
         default_factory=lambda: [

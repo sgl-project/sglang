@@ -36,7 +36,10 @@ from sglang.multimodal_gen.runtime.layers.attention import USPAttention
 
 # from sglang.multimodal_gen.runtime.layers.layernorm import LayerNorm as LayerNorm
 from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm
-from sglang.multimodal_gen.runtime.layers.linear import ReplicatedLinear
+from sglang.multimodal_gen.runtime.layers.linear import (
+    ColumnParallelLinear,
+    RowParallelLinear,
+)
 from sglang.multimodal_gen.runtime.layers.mlp import MLP
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
     NDRotaryEmbedding,
@@ -96,13 +99,16 @@ class FluxAttention(torch.nn.Module, AttentionModuleMixin):
         self.norm_q = RMSNorm(dim_head, eps=eps)
         self.norm_k = RMSNorm(dim_head, eps=eps)
 
-        # Use ReplicatedLinear for fused QKV projections
-        self.to_qkv = ReplicatedLinear(query_dim, self.inner_dim * 3, bias=bias)
+        self.to_qkv = ColumnParallelLinear(
+            query_dim, self.inner_dim * 3, bias=bias, gather_output=False
+        )
 
         if not self.pre_only:
             self.to_out = torch.nn.ModuleList([])
             self.to_out.append(
-                ReplicatedLinear(self.inner_dim, self.out_dim, bias=out_bias)
+                RowParallelLinear(
+                    self.inner_dim, self.out_dim, bias=out_bias, input_is_parallel=True
+                )
             )
             if dropout != 0.0:
                 self.to_out.append(torch.nn.Dropout(dropout))
@@ -110,11 +116,15 @@ class FluxAttention(torch.nn.Module, AttentionModuleMixin):
         if added_kv_proj_dim is not None:
             self.norm_added_q = RMSNorm(dim_head, eps=eps)
             self.norm_added_k = RMSNorm(dim_head, eps=eps)
-            # Use ReplicatedLinear for added (encoder) QKV projections
-            self.to_added_qkv = ReplicatedLinear(
-                added_kv_proj_dim, self.inner_dim * 3, bias=added_proj_bias
+            self.to_added_qkv = ColumnParallelLinear(
+                added_kv_proj_dim,
+                self.inner_dim * 3,
+                bias=added_proj_bias,
+                gather_output=False,
             )
-            self.to_add_out = ReplicatedLinear(self.inner_dim, query_dim, bias=out_bias)
+            self.to_add_out = RowParallelLinear(
+                self.inner_dim, query_dim, bias=out_bias, input_is_parallel=True
+            )
 
         self.attn = USPAttention(
             num_heads=num_heads,
@@ -196,9 +206,13 @@ class FluxSingleTransformerBlock(nn.Module):
         self.mlp_hidden_dim = int(dim * mlp_ratio)
 
         self.norm = AdaLayerNormZeroSingle(dim)
-        self.proj_mlp = ReplicatedLinear(dim, self.mlp_hidden_dim)
+        self.proj_mlp = ColumnParallelLinear(
+            dim, self.mlp_hidden_dim, bias=False, gather_output=False
+        )
         self.act_mlp = nn.GELU(approximate="tanh")
-        self.proj_out = ReplicatedLinear(dim + self.mlp_hidden_dim, dim)
+        self.proj_out = RowParallelLinear(
+            dim + self.mlp_hidden_dim, dim, bias=False, input_is_parallel=True
+        )
 
         self.attn = FluxAttention(
             query_dim=dim,
@@ -404,10 +418,15 @@ class FluxTransformer2DModel(CachableDiT):
             pooled_projection_dim=self.config.pooled_projection_dim,
         )
 
-        self.context_embedder = ReplicatedLinear(
-            self.config.joint_attention_dim, self.inner_dim
+        self.context_embedder = ColumnParallelLinear(
+            self.config.joint_attention_dim,
+            self.inner_dim,
+            bias=False,
+            gather_output=False,
         )
-        self.x_embedder = ReplicatedLinear(self.config.in_channels, self.inner_dim)
+        self.x_embedder = ColumnParallelLinear(
+            self.config.in_channels, self.inner_dim, bias=False, gather_output=False
+        )
         self.transformer_blocks = nn.ModuleList(
             [
                 FluxTransformerBlock(
@@ -433,10 +452,11 @@ class FluxTransformer2DModel(CachableDiT):
         self.norm_out = AdaLayerNormContinuous(
             self.inner_dim, self.inner_dim, elementwise_affine=False, eps=1e-6
         )
-        self.proj_out = ReplicatedLinear(
+        self.proj_out = RowParallelLinear(
             self.inner_dim,
             self.config.patch_size * self.config.patch_size * self.out_channels,
             bias=True,
+            input_is_parallel=True,
         )
 
     def forward(
