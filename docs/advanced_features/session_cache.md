@@ -49,6 +49,7 @@ SGLang provides the `--enable-session-cache` parameter (which requires combinati
 ### Supported storage backend
 
 - **Local file**: A simple file-based storage backend for demonstration purposes.
+- **GD2FS**: GPU Direct Distributed File System is a high-performance distributed file system for LLM. Try [GD2FS](https://github.com/sgl-project/sglang/tree/main/python/sglang/srt/mem_cache/storage/gd2fs).
 
 ### Advanced features
 

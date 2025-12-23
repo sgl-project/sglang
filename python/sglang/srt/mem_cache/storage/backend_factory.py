@@ -211,6 +211,8 @@ class StorageBackendFactory:
             return backend_class.from_env_config(bytes_per_page, dtype, storage_config)
         elif backend_name == "eic":
             return backend_class(storage_config, mem_pool_host)
+        elif backend_name == "gd2fs":
+            return backend_class(storage_config)
         else:
             raise ValueError(f"Unknown built-in backend: {backend_name}")
 
@@ -248,4 +250,10 @@ StorageBackendFactory.register_backend(
     "eic",
     "sglang.srt.mem_cache.storage.eic.eic_storage",
     "EICStorage",
+)
+
+StorageBackendFactory.register_backend(
+    "gd2fs",
+    "sglang.srt.mem_cache.storage.gd2fs.gd2fs_storage",
+    "GD2FSStorage",
 )
