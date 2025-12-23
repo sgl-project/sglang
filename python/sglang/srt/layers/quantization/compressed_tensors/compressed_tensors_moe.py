@@ -1311,7 +1311,7 @@ class NPUCompressedTensorsW4A16Int4DynamicMoEMethod(CompressedTensorsMoEMethod):
             ].group_size
         else:
             self.group_size = 128
-        
+
         self.kernel = NPUW4A16Int4DynamicMoEMethod()
 
     # TODO: See if we can merge this method's logic
