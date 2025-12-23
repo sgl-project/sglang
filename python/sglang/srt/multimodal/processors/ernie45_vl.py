@@ -1,7 +1,5 @@
-import asyncio
 import math
 import os
-import time
 from typing import List, Union
 
 import numpy as np
@@ -365,7 +363,6 @@ class Ernie4_5_VLImageProcessor(SGLangBaseProcessor):
         *args,
         **kwargs,
     ):
-        entry_time = time.perf_counter()
         base_output = self.load_mm_data(
             prompt=input_text,
             image_data=image_data,
@@ -375,9 +372,12 @@ class Ernie4_5_VLImageProcessor(SGLangBaseProcessor):
         )
 
         # resize images if they are raw Image objects
+        resized_images = []
         if base_output.images and isinstance(base_output.images[0], Image.Image):
-            resize_tasks = [resize_image_async(image) for image in base_output.images]
-            base_output.images = await asyncio.gather(*resize_tasks)
+            for image in base_output.images:
+                resized_image = resize_image(image)
+                resized_images.append(resized_image)
+            base_output.images = resized_images
 
         if base_output.videos:
             videos_processed = [
@@ -398,6 +398,10 @@ class Ernie4_5_VLImageProcessor(SGLangBaseProcessor):
             video_grid_thw=getattr(ret, "video_grid_thw", None),
         )
         mrope_positions = mrope_positions.squeeze(1)
+
+        assert (
+            input_ids.shape[0] == mrope_positions.shape[-1]
+        ), "input_ids and mrope_positions should have the same length"
 
         mm_inputs = {
             "input_ids": input_ids.tolist(),

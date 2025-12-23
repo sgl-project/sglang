@@ -1,14 +1,4 @@
-# coding=utf-8
-# Adapted from
-# https://huggingface.co/baidu/ERNIE-4.5-VL-28B-A3B-PT/blob/main/modeling_ernie4_5_vl.py
-# Copyright 2024 The Baidu team.
-# Copyright 2022 EleutherAI and the HuggingFace Inc. team. All rights reserved.
-#
-# This code is based on EleutherAI's GPT-NeoX library and the GPT-NeoX
-# and OPT implementations in this library. It has been modified from its
-# original forms to accommodate minor architectural differences compared
-# to GPT-NeoX and OPT used by the Meta AI team that trained the model.
-#
+# Copyright 2023-2025 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -391,7 +381,6 @@ class Ernie4_5_VisionTransformer(nn.Module):
         super().__init__()
 
         patch_size: int = vision_config.patch_size
-        # temporal_patch_size: int = vision_config.temporal_patch_size
         spatial_merge_size: int = vision_config.spatial_merge_size
         in_chans: int = vision_config.in_chans
         hidden_size: int = vision_config.hidden_size
@@ -565,7 +554,6 @@ class Ernie4_5_VLMoeForConditionalGeneration(nn.Module):
 
         self.is_mrope_enabled = "mrope_section" in self.config.rope_scaling
         self.logits_processor = LogitsProcessor(config)
-        # self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
 
         if getattr(self.config, "im_patch_id", None):
             visual_token_ids = [
@@ -673,7 +661,32 @@ class Ernie4_5_VLMoeForConditionalGeneration(nn.Module):
                     "multimodal section rotary embedding requires "
                     f"(3, seq_len) positions, but got {positions.size()}"
                 )
-        # TODO 计算 视觉mask
+        if input_ids.numel() != positions.shape[-1]:
+            true_seq_len = input_ids.shape[-1]
+            pos_len = positions.shape[-1]
+            if pos_len < true_seq_len:
+                logger.warning(
+                    f"input_ids({input_ids.shape}) != positions({positions.shape}). Token count mismatch. Positions will be padded."
+                )
+                if positions.dim() == 2:  # mRoPE: (3, seq_len)
+                    last_pos = positions[:, -1:]  # (3, 1)
+                    delta = torch.arange(
+                        1,
+                        true_seq_len - pos_len + 1,
+                        device=positions.device,
+                    )
+                    delta = delta.unsqueeze(0).expand(3, -1)
+                    pad_pos = last_pos + delta
+                    positions = torch.cat([positions, pad_pos], dim=1)
+                else:  # 1D RoPE
+                    last_pos = positions[-1]
+                    pad_pos = last_pos + torch.arange(
+                        1,
+                        true_seq_len - pos_len + 1,
+                        device=positions.device,
+                    )
+                    positions = torch.cat([positions, pad_pos], dim=0)
+
         if self._visual_token_ids_tensor_cache is None:
             visual_token_mask = None
         else:
@@ -702,18 +715,9 @@ class Ernie4_5_VLMoeForConditionalGeneration(nn.Module):
                 input_ids, pad_visual_token_ids_tensor
             ).reshape(-1, 1)
 
-        if visual_token_mask is not None:
-            assert visual_token_mask.dtype == torch.bool, visual_token_mask.dtype
-            assert visual_token_mask.numel() > 0
-            if visual_token_mask.shape[0] != input_ids.shape[0]:
-                padding_len = input_ids.shape[0] - visual_token_mask.shape[0]
-                # right pad False
-                pad = torch.zeros(
-                    (padding_len, visual_token_mask.shape[1]),
-                    dtype=visual_token_mask.dtype,
-                    device=visual_token_mask.device,
-                )
-                visual_token_mask = torch.cat([visual_token_mask, pad], dim=0)
+        assert (
+            input_ids.numel() == positions.shape[-1]
+        ), f"input_ids {input_ids.shape} and position_ids {positions.shape} should have the same length"
 
         hidden_states = general_mm_embed_routine(
             input_ids=input_ids,

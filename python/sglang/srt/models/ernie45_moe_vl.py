@@ -12,7 +12,7 @@
 # limitations under the License.
 # ==============================================================================
 
-""" Inference-only Ernie4.5 model compatible with baidu/ERNIE-4.5-*-PT weights. """
+""" Inference-only Ernie4.5 VL model compatible with baidu/ERNIE-4.5-VL-*-PT weights. """
 
 import logging
 from itertools import islice
@@ -43,8 +43,6 @@ from sglang.srt.layers.utils import PPMissingLayer
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.models.deepseek_v2 import DeepseekV2MLP as Ernie4_5_VLMoeMLP
-
-# from sglang.srt.models.llama import LlamaAttention as Ernie4_5_VLMoeAttention
 from sglang.srt.utils import add_prefix, make_layers
 
 logger = logging.getLogger(__name__)
@@ -258,7 +256,6 @@ class Ernie4_5_VLMoeMoE(nn.Module):
             intermediate_size = (
                 config.moe_intermediate_size[0] * config.moe_num_shared_experts
             )
-            # disable tp for shared experts when enable deepep moe
             self.shared_experts = Ernie4_5_VLMoeMLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=intermediate_size,
@@ -306,7 +303,6 @@ class Ernie4_5_VLMoeMoE(nn.Module):
                 hidden_states=hidden_states, topk_output=vision_topk_output
             )
         elif any_visual:
-            # assert visual_token_mask.shape[0] != hidden_states.shape[0]
             visual_token_mask = visual_token_mask.repeat(1, self.hidden_size).bool()
             text_token_mask = ~visual_token_mask
             final_hidden_states = torch.zeros_like(hidden_states)
@@ -476,8 +472,6 @@ class Ernie4_5_VLMoeModel(nn.Module):
     ) -> None:
         super().__init__()
         self.config = config
-        # self.padding_idx = config.pad_token_id
-        # self.vocab_size = config.vocab_size
         self.pp_group = get_pp_group()
 
         if self.pp_group.is_first_rank:

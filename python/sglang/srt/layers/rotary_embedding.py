@@ -2404,7 +2404,6 @@ class MRotaryEmbedding(RotaryEmbedding):
 class Ernie4_5_VLRotaryEmbedding(MRotaryEmbedding):
     """3D rotary positional embedding. [h w h w h w h w... t t t...]"""
 
-    @torch.compile(dynamic=True, backend=get_compiler_backend())
     def forward_native(  # type: ignore[override]
         self,
         positions: torch.Tensor,
