@@ -86,7 +86,7 @@ python3 -m sglang.launch_server \
   --max-running-requests 128 --chunked-prefill-size 18432 --enable-dynamic-chunking
 ```
 
-Note: `--disable-radix-cache` is only for benchmarking reproduction purposes. It is not recommended to use it in production.
+Note: `--disable-radix-cache` is enabled only for reproducible benchmarking purposes. It is not recommended to use it in production.
 
 ## Best Practice for Pipeline Parallelism with PD Disaggregation
 To be added. Stay tuned for the latest updates on Pipeline Parallelism with PD Disaggregation.
