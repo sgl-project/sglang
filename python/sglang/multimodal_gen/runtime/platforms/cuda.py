@@ -233,16 +233,19 @@ class CudaPlatformBase(Platform):
             target_backend = AttentionBackendEnum.FA
             if is_sm120():
                 try:
-                    from sglang.multimodal_gen.runtime.layers.attention.backends.sage_attn3 import (  # noqa: F401
-                        SageAttention3Backend,
+                    from sageattention import sageattn  # noqa: F401
+
+                    from sglang.multimodal_gen.runtime.layers.attention.backends.sage_attn import (  # noqa: F401
+                        SageAttentionBackend,
                     )
 
-                    logger.info("Using Sage Attention 3 backend")
-                    return "sglang.multimodal_gen.runtime.layers.attention.backends.sage_attn3.SageAttention3Backend"
+                    logger.info("Using Sage Attention backend")
+
+                    return "sglang.multimodal_gen.runtime.layers.attention.backends.sage_attn.SageAttentionBackend"
                 except ImportError as e:
                     logger.info(e)
                     logger.info(
-                        "Sage Attention 3 backend is not installed, Falling back to Torch SDPA (To install it, see https://github.com/thu-ml/SageAttention/tree/main/sageattention3_blackwell#installation)"
+                        "Sage Attention backend is not installed (To install it, run `pip install sageattention==2.2.0 --no-build-isolation`). Falling back to Flash Attention."
                     )
                     target_backend = AttentionBackendEnum.TORCH_SDPA
 
