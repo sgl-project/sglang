@@ -11,6 +11,7 @@ use crate::{
         grpc::{
             common::stages::PipelineStage,
             context::{PreparationOutput, RequestContext, RequestType},
+            utils,
         },
     },
 };
@@ -55,10 +56,12 @@ impl PipelineStage for EmbeddingPreparationStage {
             ));
         }
 
+        // Resolve tokenizer from registry (cached for potential reuse)
+        let tokenizer =
+            utils::resolve_tokenizer(ctx, "EmbeddingPreparationStage::execute").map_err(|e| *e)?;
+
         // Tokenize
-        let token_ids = ctx
-            .components
-            .tokenizer
+        let token_ids = tokenizer
             .encode(&text)
             .map_err(|e| {
                 error!(

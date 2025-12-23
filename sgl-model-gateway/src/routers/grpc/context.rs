@@ -22,7 +22,7 @@ use crate::{
         responses::ResponsesRequest,
     },
     reasoning_parser::ParserFactory as ReasoningParserFactory,
-    tokenizer::{stop::StopSequenceDecoder, TokenizerRegistry},
+    tokenizer::{stop::StopSequenceDecoder, traits::Tokenizer, TokenizerRegistry},
     tool_parser::ParserFactory as ToolParserFactory,
 };
 
@@ -65,6 +65,10 @@ pub struct SharedComponents {
 pub struct ProcessingState {
     // Stage 1: Preparation outputs
     pub preparation: Option<PreparationOutput>,
+
+    /// Resolved tokenizer (set once in preparation, reused in response processing)
+    /// This avoids redundant registry lookups across pipeline stages.
+    pub tokenizer: Option<Arc<dyn Tokenizer>>,
 
     // Stage 2: Worker selection outputs
     pub workers: Option<WorkerSelection>,
@@ -393,6 +397,14 @@ impl RequestContext {
             RequestType::Responses(req) => req.stream.unwrap_or(false),
             RequestType::Embedding(_) => false, // Embeddings are never streaming
         }
+    }
+
+    /// Get the cached tokenizer, cloning the Arc (cheap 8-byte clone)
+    ///
+    /// Returns None if tokenizer hasn't been resolved yet.
+    /// The tokenizer is resolved once in the preparation stage and cached for reuse.
+    pub fn tokenizer_arc(&self) -> Option<Arc<dyn Tokenizer>> {
+        self.state.tokenizer.clone()
     }
 }
 
