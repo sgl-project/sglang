@@ -308,6 +308,8 @@ impl<B> OnRequest<B> for RequestLogger {
             span.record("request_id", request_id.0.as_str());
         }
 
+        Metrics::record_http_request(method, &path);
+
         // Log the request start
         info!(
             target: "sgl_model_gateway::request",
@@ -665,7 +667,6 @@ where
             let duration = start.elapsed();
             let status_class = status_to_class(response.status().as_u16());
 
-            Metrics::record_http_request(method, &path, status_class);
             Metrics::record_http_duration(method, &path, duration);
 
             Ok(response)
