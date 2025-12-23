@@ -259,8 +259,23 @@ def load_model_from_full_model_state_dict(
             )
         if not hasattr(meta_sharded_param, "device_mesh"):
             full_tensor = full_tensor.to(device=device, dtype=param_dtype)
-            # In cases where parts of the model aren't sharded, some parameters will be plain tensors
-            sharded_tensor = full_tensor
+            # Check if parameter has a weight_loader for TP sharding
+            weight_loader = getattr(meta_sharded_param, "weight_loader", None)
+            if weight_loader is not None:
+                # Use weight_loader for TP sharding
+                # Create a temporary parameter with the correct shape
+                sharded_tensor = torch.empty_like(meta_sharded_param, device=device, dtype=param_dtype)
+                temp_param = nn.Parameter(sharded_tensor)
+                # Copy attributes from meta param
+                for attr in ["output_dim", "input_dim", "is_sharded_weight"]:
+                    if hasattr(meta_sharded_param, attr):
+                        setattr(temp_param, attr, getattr(meta_sharded_param, attr))
+                # Call weight_loader to shard the weight
+                weight_loader(temp_param, full_tensor)
+                sharded_tensor = temp_param.data
+            else:
+                # No weight_loader, use full tensor
+                sharded_tensor = full_tensor
         else:
             full_tensor = full_tensor.to(device=device, dtype=param_dtype)
             sharded_tensor = distribute_tensor(
