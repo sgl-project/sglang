@@ -53,7 +53,7 @@ if TYPE_CHECKING:
 
 from torch._dynamo.eval_frame import DisableContext
 
-from sglang.srt.compilation.custom_ops import (
+from sglang.srt.hardware_backend.npu.custom_ops import (
     _set_dp_buffer_len,
     _set_is_extend_in_batch,
 )

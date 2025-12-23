@@ -2423,6 +2423,11 @@ class ServerArgs:
                     self.preferred_sampling_params
                 )
 
+        if self.compilation_config:
+            if isinstance(self.compilation_config, str):
+                args_dict = json.loads(self.compilation_config)
+                self.compilation_config = CompilationConfig(**args_dict)
+
     def _handle_two_batch_overlap(self):
         if self.enable_two_batch_overlap and self.moe_a2a_backend == "none":
             raise ValueError(
@@ -3359,7 +3364,7 @@ class ServerArgs:
 
         parser.add_argument(
             "--compilation-config",
-            type=CompilationConfig.from_cli,
+            type=str,
             default=None,
             help="Compilation config.",
         )

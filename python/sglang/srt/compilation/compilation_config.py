@@ -1,6 +1,5 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.10.0/vllm/compilation/compilation_config.py
 
-import json
 from typing import List
 
 
@@ -32,11 +31,6 @@ class CompilationConfig:
 
     def get_capture_sizes(self):
         return self.capture_sizes
-
-    @classmethod
-    def from_cli(cls, args) -> "CompilationConfig":
-        args_dict = json.loads(args)
-        return CompilationConfig(**args_dict)
 
     def get_enable_debug_mode(self):
         return self.enable_debug_mode
