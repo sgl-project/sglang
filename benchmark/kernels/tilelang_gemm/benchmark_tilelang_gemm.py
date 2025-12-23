@@ -141,11 +141,11 @@ def benchmark_sglkernel(
 ) -> Tuple[float, float, float]:
     """Benchmark SGL-Kernel fp8_blockwise_scaled_mm."""
     # Prepare data in the format expected by sgl_kernel
-    # A_scale needs to be transposed and made contiguous
+    # A_scale needs to be transposed and made contiguous, then transposed back
     A_scale_sgl = A_scale.t().contiguous().t()
-    # B and B_scale need to be transposed (K, N layout)
-    B_fp8_sgl = B_fp8.t().contiguous()
-    B_scale_sgl = B_scale.t().contiguous()
+    # B and B_scale need to be transposed (column major layout)
+    B_fp8_sgl = B_fp8.t()
+    B_scale_sgl = B_scale.t()
     
     def fn():
         return fp8_blockwise_scaled_mm(A_fp8, B_fp8_sgl, A_scale_sgl, B_scale_sgl, torch.bfloat16)
@@ -186,22 +186,6 @@ def run_benchmark(
             deepgemm_available = deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
         except ImportError:
             pass
-    
-    print(f"\n{'='*120}")
-    print(f"Benchmark: TileLang vs DeepGEMM vs SGL-Kernel")
-    print(f"N={N}, K={K}")
-    print(f"DeepGEMM available: {deepgemm_available}")
-    print(f"SGL-Kernel available: {SGL_KERNEL_AVAILABLE}")
-    print(f"{'='*120}\n")
-    
-    # Print header
-    header = (
-        f"{'M':>6} | {'TileLang (ms)':>14} | {'DeepGEMM (ms)':>14} | {'SGL-Kernel (ms)':>15} | "
-        f"{'TL TFLOPS':>10} | {'DG TFLOPS':>10} | {'SK TFLOPS':>10} | "
-        f"{'TL/DG':>7} | {'TL/SK':>7} | {'Kernel Type':>15}"
-    )
-    print(header)
-    print("-" * len(header))
     
     results = []
     
@@ -249,13 +233,6 @@ def run_benchmark(
             else:
                 sk_ms = sk_tflops = speedup_vs_sk = float('nan')
             
-            # Print result
-            print(
-                f"{M:>6} | {tl_ms:>14.4f} | {dg_ms:>14.4f} | {sk_ms:>15.4f} | "
-                f"{tl_tflops:>10.2f} | {dg_tflops:>10.2f} | {sk_tflops:>10.2f} | "
-                f"{speedup_vs_dg:>6.2f}x | {speedup_vs_sk:>6.2f}x | {kernel_type:>15}"
-            )
-            
             results.append({
                 "M": M, "N": N, "K": K,
                 "tl_ms": tl_ms, "dg_ms": dg_ms, "sk_ms": sk_ms,
@@ -267,20 +244,30 @@ def run_benchmark(
         except Exception as e:
             logger.warning(f"M={M}: Error: {e}")
     
+    # Print all results at the end (to avoid interleaving with compilation logs)
+    print(f"\n{'='*120}")
+    print(f"Benchmark: TileLang vs DeepGEMM vs SGL-Kernel")
+    print(f"N={N}, K={K}")
+    print(f"DeepGEMM available: {deepgemm_available}")
+    print(f"SGL-Kernel available: {SGL_KERNEL_AVAILABLE}")
+    print(f"{'='*120}\n")
+    
+    header = (
+        f"{'M':>6} | {'TileLang (ms)':>14} | {'DeepGEMM (ms)':>14} | {'SGL-Kernel (ms)':>15} | "
+        f"{'TL TFLOPS':>10} | {'DG TFLOPS':>10} | {'SK TFLOPS':>10} | "
+        f"{'TL/DG':>7} | {'TL/SK':>7} | {'Kernel Type':>15}"
+    )
+    print(header)
     print("-" * len(header))
     
-    # Summary
-    if results:
-        valid_speedups_dg = [r["speedup_vs_dg"] for r in results if r["speedup_vs_dg"] == r["speedup_vs_dg"]]
-        valid_speedups_sk = [r["speedup_vs_sk"] for r in results if r["speedup_vs_sk"] == r["speedup_vs_sk"]]
-        
-        print("\nSummary:")
-        if valid_speedups_dg:
-            avg_speedup_dg = sum(valid_speedups_dg) / len(valid_speedups_dg)
-            print(f"  Average Speedup vs DeepGEMM: {avg_speedup_dg:.2f}x")
-        if valid_speedups_sk:
-            avg_speedup_sk = sum(valid_speedups_sk) / len(valid_speedups_sk)
-            print(f"  Average Speedup vs SGL-Kernel: {avg_speedup_sk:.2f}x")
+    for r in results:
+        print(
+            f"{r['M']:>6} | {r['tl_ms']:>14.4f} | {r['dg_ms']:>14.4f} | {r['sk_ms']:>15.4f} | "
+            f"{r['tl_tflops']:>10.2f} | {r['dg_tflops']:>10.2f} | {r['sk_tflops']:>10.2f} | "
+            f"{r['speedup_vs_dg']:>6.2f}x | {r['speedup_vs_sk']:>6.2f}x | {r['kernel_type']:>15}"
+        )
+    
+    print("-" * len(header))
     
     # Save to file
     if output_file and results:
