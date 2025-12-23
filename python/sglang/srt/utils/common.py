@@ -88,6 +88,8 @@ from torch import nn
 from torch.library import Library
 from torch.profiler import ProfilerActivity, profile, record_function
 from torch.utils._contextlib import _DecoratorContextManager
+from torchvision.io import ImageReadMode, decode_image, read_image
+from torchvision.transforms.v2 import functional as F
 from typing_extensions import Literal
 
 from sglang.srt.environ import envs
@@ -871,6 +873,107 @@ def load_image(
         raise ValueError(f"Invalid image: {image_file}")
 
     return image, image_size
+
+
+def load_image_tensor(
+    image_file: Union[Image.Image, str, ImageData, bytes],
+    discard_alpha_channel: bool = True,
+) -> tuple[Image.Image, tuple[int, int]]:
+    """
+    加载图像，优先使用 torchvision 进行硬件加速解码
+    返回 PIL Image 以保持向后兼容性
+    """
+    if isinstance(image_file, ImageData):
+        image_file = image_file.url
+
+    image = image_size = None
+
+    if isinstance(image_file, Image.Image):
+        # 已经是 PIL Image 对象
+        image = image_file
+        image_size = (image.width, image.height)
+        img_tensor = F.pil_to_tensor(image)
+
+    elif isinstance(image_file, bytes):
+        # bytes 格式 - 优先使用 torchvision 解码
+        try:
+            img_tensor_bytes = torch.frombuffer(
+                bytearray(image_file), dtype=torch.uint8
+            )
+            img_tensor = decode_image(img_tensor_bytes, mode=ImageReadMode.RGB)
+        except Exception:
+            # 回退到 PIL
+            image = Image.open(BytesIO(image_file))
+            if discard_alpha_channel and image.mode != "RGB":
+                image = image.convert("RGB")
+            img_tensor = F.pil_to_tensor(image)
+
+    elif image_file.startswith("http://") or image_file.startswith("https://"):
+        # HTTP/HTTPS URL
+        timeout = int(os.getenv("REQUEST_TIMEOUT", "3"))
+        response = requests.get(image_file, stream=True, timeout=timeout)
+        try:
+            response.raise_for_status()
+            # 读取到内存后使用 torchvision 解码
+            img_bytes = response.content
+            try:
+                img_tensor_bytes = torch.frombuffer(
+                    bytearray(img_bytes), dtype=torch.uint8
+                )
+                img_tensor = decode_image(img_tensor_bytes, mode=ImageReadMode.RGB)
+            except Exception:
+                # 回退到 PIL
+                image = Image.open(BytesIO(img_bytes))
+                if discard_alpha_channel and image.mode != "RGB":
+                    image = image.convert("RGB")
+                img_tensor = F.pil_to_tensor(image)
+        finally:
+            response.close()
+
+    elif image_file.lower().endswith(("png", "jpg", "jpeg", "webp", "gif")):
+        # 本地文件路径 - 使用 torchvision 直接读取（最快）
+        try:
+            img_tensor = read_image(image_file, mode=ImageReadMode.RGB)
+        except Exception:
+            # 回退到 PIL
+            image = Image.open(image_file)
+            if discard_alpha_channel and image.mode != "RGB":
+                image = image.convert("RGB")
+            img_tensor = F.pil_to_tensor(image)
+
+    elif image_file.startswith("data:"):
+        # data URL 格式: data:image/jpeg;base64,/9j/4AAQ...
+        base64_str = image_file.split(",")[1]
+        img_bytes = pybase64.b64decode(base64_str, validate=True)
+
+        # 使用 torchvision 解码
+        try:
+            img_tensor_bytes = torch.frombuffer(bytearray(img_bytes), dtype=torch.uint8)
+            img_tensor = decode_image(img_tensor_bytes, mode=ImageReadMode.RGB)
+        except Exception:
+            # 回退到 PIL
+            image = Image.open(BytesIO(img_bytes))
+            if discard_alpha_channel and image.mode != "RGB":
+                image = image.convert("RGB")
+            img_tensor = F.pil_to_tensor(image)
+    elif isinstance(image_file, str):
+        # 纯 base64 字符串
+        img_bytes = pybase64.b64decode(image_file, validate=True)
+
+        # 使用 torchvision 解码
+        try:
+            img_tensor_bytes = torch.frombuffer(bytearray(img_bytes), dtype=torch.uint8)
+            img_tensor = decode_image(img_tensor_bytes, mode=ImageReadMode.RGB)
+        except Exception:
+            # 回退到 PIL
+            image = Image.open(BytesIO(img_bytes))
+            if discard_alpha_channel and image.mode != "RGB":
+                image = image.convert("RGB")
+            img_tensor = F.pil_to_tensor(image)
+    else:
+        raise ValueError(f"Invalid image: {image_file}")
+
+    return img_tensor, image_size
 
 
 def get_image_bytes(image_file: Union[str, bytes]):
@@ -3584,15 +3687,15 @@ def distribute_requests_via_mq(
 ) -> List[Any]:
     """
     Distribute requests via MessageQueue (shared memory).
-    
+
     Replaces broadcast_pyobj with zero-copy communication.
-    
+
     Args:
         reqs: Request list (only writer has valid data)
         mq: MessageQueue instance
         rank: Current rank
         writer_rank: Writer's rank
-    
+
     Returns:
         Request list (all ranks get the same data)
     """
@@ -3641,7 +3744,7 @@ def distribute_requests_via_mq(
             feature_list = []
             for idx in range(num_feat):
                 req_id, inner_id, *shape = tensor_metadata[idx]
-                tensor = torch.empty(shape, dtype=torch.float, device='cuda')
+                tensor = torch.empty(shape, dtype=torch.float, device="cuda")
                 dist.broadcast(tensor, src=writer_rank, group=device_workgroup)
                 feature_list.append((req_id, inner_id, tensor))
             for idx, feature in enumerate(feature_list):

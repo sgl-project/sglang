@@ -10,7 +10,6 @@ from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
 import numpy as np
 import torch
 from PIL import Image
-from torchvision.transforms.v2 import functional as F
 from transformers import BaseImageProcessorFast
 
 from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
@@ -18,7 +17,7 @@ from sglang.srt.utils import (
     get_bool_env_var,
     is_npu,
     load_audio,
-    load_image,
+    load_image_tensor,
     load_video,
     logger,
 )
@@ -343,11 +342,11 @@ class BaseMultimodalProcessor(ABC):
             return data
         try:
             if modality == Modality.IMAGE:
-                img, _ = load_image(data)
-                if discard_alpha_channel and img.mode != "RGB":
-                    img = img.convert("RGB")
-                img_tenosr = F.pil_to_tensor(img)
-                return img_tenosr
+                img_tensor, _ = load_image_tensor(data, discard_alpha_channel)
+                # if discard_alpha_channel and img.mode != "RGB":
+                #     img = img.convert("RGB")
+                # img_tensor = F.pil_to_tensor(img)
+                return img_tensor
             elif modality == Modality.VIDEO:
                 return load_video(data, frame_count_limit)
             elif modality == Modality.AUDIO:
