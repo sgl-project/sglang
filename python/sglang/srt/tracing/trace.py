@@ -463,7 +463,7 @@ def trace_req_start(
     if str(bootstrap_room) not in remote_trace_contexts:
         attrs = {"bootstrap_room": str(hex(bootstrap_room))}
         external_trace_context = _trace_context_propagator.extract(
-            external_trace_header
+            external_trace_header if external_trace_header is not None else {}
         )
         bootstrap_room_span = tracer.start_span(
             name=f"Bootstrap Room {hex(bootstrap_room)}",
