@@ -134,10 +134,9 @@ __global__ void per_tensor_quant_fp8_kernel(const T* __restrict__ input,
 
 constexpr size_t kBlockSize = 256;
 
-template <bool kIsStatic>
-void per_tensor_quant_fp8(tvm::ffi::TensorView input,
-                          tvm::ffi::TensorView output_q,
-                          tvm::ffi::TensorView output_s) {
+void per_tensor_quant_fp8_dynamic(tvm::ffi::TensorView input,
+                                   tvm::ffi::TensorView output_q,
+                                   tvm::ffi::TensorView output_s) {
   using namespace host;
 
   SymbolicSize num_elements = {"num_elements"};
@@ -163,16 +162,12 @@ void per_tensor_quant_fp8(tvm::ffi::TensorView input,
   const size_t num_blocks = std::min((total_elements + kBlockSize - 1) / kBlockSize, size_t(1024));
   const DLDevice device = device_.unwrap();
 
-  RuntimeCheck(total_elements > 0, "Input tensor must be non-empty");
-
   auto launch_kernels = [&]<typename T>() {
-    if constexpr (!kIsStatic) {
-      LaunchKernel(num_blocks, kBlockSize, device)(
-          per_tensor_absmax_kernel<T>,
-          static_cast<const T*>(input.data_ptr()),
-          static_cast<float*>(output_s.data_ptr()),
-          static_cast<int64_t>(total_elements));
-    }
+    LaunchKernel(num_blocks, kBlockSize, device)(
+        per_tensor_absmax_kernel<T>,
+        static_cast<const T*>(input.data_ptr()),
+        static_cast<float*>(output_s.data_ptr()),
+        static_cast<int64_t>(total_elements));
 
     LaunchKernel(num_blocks, kBlockSize, device)(
         per_tensor_quant_fp8_kernel<T, __nv_fp8_e4m3>,
@@ -189,8 +184,53 @@ void per_tensor_quant_fp8(tvm::ffi::TensorView input,
     launch_kernels.template operator()<c10::BFloat16>();
   } else if (dtype.code == kDLFloat && dtype.bits == 16) {
     launch_kernels.template operator()<c10::Half>();
-  } else {
-    RuntimeCheck(false, "Unsupported input dtype");
+  }
+}
+
+void per_tensor_quant_fp8_static(tvm::ffi::TensorView input,
+                                  tvm::ffi::TensorView output_q,
+                                  tvm::ffi::TensorView output_s) {
+  using namespace host;
+
+  SymbolicSize num_elements = {"num_elements"};
+  SymbolicDevice device_;
+  SymbolicDType input_dtype;
+
+  TensorMatcher({num_elements})
+      .with_dtype<float, c10::Half, c10::BFloat16>(input_dtype)
+      .with_device<kDLCUDA>(device_)
+      .verify(input);
+
+  TensorMatcher({num_elements})
+      .with_dtype<__nv_fp8_e4m3>()
+      .with_device<kDLCUDA>(device_)
+      .verify(output_q);
+
+  TensorMatcher({})
+      .with_dtype<float>()
+      .with_device<kDLCUDA>(device_)
+      .verify(output_s);
+
+  const size_t total_elements = num_elements.unwrap();
+  const size_t num_blocks = std::min((total_elements + kBlockSize - 1) / kBlockSize, size_t(1024));
+  const DLDevice device = device_.unwrap();
+
+  auto launch_kernels = [&]<typename T>() {
+    LaunchKernel(num_blocks, kBlockSize, device)(
+        per_tensor_quant_fp8_kernel<T, __nv_fp8_e4m3>,
+        static_cast<const T*>(input.data_ptr()),
+        static_cast<__nv_fp8_e4m3*>(output_q.data_ptr()),
+        static_cast<const float*>(output_s.data_ptr()),
+        static_cast<int64_t>(total_elements));
+  };
+
+  const DLDataType dtype = input_dtype.unwrap();
+  if (dtype.code == kDLFloat && dtype.bits == 32) {
+    launch_kernels.template operator()<float>();
+  } else if (dtype.code == kDLBfloat && dtype.bits == 16) {
+    launch_kernels.template operator()<c10::BFloat16>();
+  } else if (dtype.code == kDLFloat && dtype.bits == 16) {
+    launch_kernels.template operator()<c10::Half>();
   }
 }
 

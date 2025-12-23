@@ -16,17 +16,16 @@ if TYPE_CHECKING:
 
 @functools.cache
 def _jit_per_tensor_quant_fp8_module(is_static: bool) -> Module:
-    args = make_cpp_args(is_static)
-    
     flashinfer_include = os.path.join(os.path.dirname(flashinfer.__file__), "data", "include")
     cub_include = os.path.join(CUDA_HOME, "include")
     torch_include = os.path.join(os.path.dirname(torch.__file__), "include")
     
+    kernel_name = "per_tensor_quant_fp8_static" if is_static else "per_tensor_quant_fp8_dynamic"
+    
     return load_jit(
-        "per_tensor_quant_fp8",
-        *args,
+        f"per_tensor_quant_fp8_{'static' if is_static else 'dynamic'}",
         cuda_files=["gemm/per_tensor_quant_fp8.cuh"],
-        cuda_wrappers=[("per_tensor_quant_fp8", f"per_tensor_quant_fp8<{args}>")],
+        cuda_wrappers=[("per_tensor_quant_fp8", kernel_name)],
         extra_include_paths=[flashinfer_include, cub_include, torch_include],
     )
 
