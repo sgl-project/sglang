@@ -421,11 +421,14 @@ class SchedulerBeamSearchProcessorMixin:
                 return True
 
         if (
-            req.sampling_params.stop_strs
-            and len(req.sampling_params.stop_strs) > 0
-            and req.tokenizer is not None
+            len(req.sampling_params.stop_strs) > 0
+            or len(req.sampling_params.stop_regex_strs) > 0
         ):
             tail_str = self._tail_str(req, beam.tokens)
+
+            if not tail_str:
+                return False
+
             if len(req.sampling_params.stop_strs) > 0:
                 for stop_str in req.sampling_params.stop_strs:
                     if stop_str in tail_str or stop_str in beam.text:
@@ -453,9 +456,11 @@ class SchedulerBeamSearchProcessorMixin:
             tokens: List of token IDs
 
         Returns:
-            str: Decoded tail string
+            str: Decoded tail string, empty string if tokenizer is None
         """
-        # Check both stop strings and stop regex patterns
+        if req.tokenizer is None:
+            return ""
+
         if (
             len(req.sampling_params.stop_strs) > 0
             or len(req.sampling_params.stop_regex_strs) > 0

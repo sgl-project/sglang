@@ -419,7 +419,7 @@ class OpenAIBeamSearchMixin:
                 choices=[stream_choice],
                 model=request.model,
             )
-            yield f"data: {chunk.model_dump_json()}\n\n"
+            yield f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
 
         if request.stream_options and request.stream_options.include_usage:
             usage = UsageProcessor.calculate_response_usage(

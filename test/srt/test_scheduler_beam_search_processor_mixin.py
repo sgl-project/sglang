@@ -895,6 +895,32 @@ class TestCheckBeamFinished(unittest.TestCase):
         self.assertIsNone(beam.finish_reason)
         mock_tail_str.assert_called_once_with(req, beam.tokens)
 
+    @patch.object(SchedulerBeamSearchProcessorMixin, "_tail_str")
+    def test_check_beam_finished_with_empty_tail_str(self, mock_tail_str):
+        """Test beam finish check when tail_str is empty (returns False early)."""
+        mock_tail_str.return_value = ""  # Key: empty tail_str
+
+        req = Mock()
+        req.sampling_params = Mock()
+        req.sampling_params.ignore_eos = False
+        req.sampling_params.stop_strs = ["STOP"]
+        req.sampling_params.stop_regex_strs = [r"\d{3}-\d{4}"]
+        req.stop_token_ids = set()
+        req.tokenizer = Mock()
+
+        beam = BeamSearchSequence(
+            tokens=[1, 2, 3, 4],
+            cum_logprob=-5.0,
+            text="some text",
+        )
+
+        is_finished = self.scheduler._check_beam_finished(req, beam)
+
+        # Should return False early when tail_str is empty
+        self.assertFalse(is_finished)
+        self.assertIsNone(beam.finish_reason)
+        mock_tail_str.assert_called_once_with(req, beam.tokens)
+
 
 class TestTailStr(unittest.TestCase):
     """Test _tail_str method."""
@@ -935,6 +961,22 @@ class TestTailStr(unittest.TestCase):
         result = self.scheduler._tail_str(req, tokens)
 
         self.assertEqual(result, "text 123")
+
+    def test_tail_str_with_none_tokenizer(self):
+        """Test tail string extraction when tokenizer is None."""
+        req = Mock()
+        req.sampling_params = Mock()
+        req.sampling_params.stop_strs = ["STOP"]
+        req.sampling_params.stop_regex_strs = []
+        req.sampling_params.stop_str_max_len = 2
+        req.sampling_params.stop_regex_max_len = 0
+        req.tokenizer = None  # Key: tokenizer is None
+
+        tokens = [1, 2, 3, 4, 5]
+        result = self.scheduler._tail_str(req, tokens)
+
+        # Should return empty string when tokenizer is None
+        self.assertEqual(result, "")
 
 
 class TestExtractBeamTopkData(unittest.TestCase):
