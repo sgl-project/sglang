@@ -308,6 +308,8 @@ impl<B> OnRequest<B> for RequestLogger {
             span.record("request_id", request_id.0.as_str());
         }
 
+        let method = method_to_static_str(request.method().as_str());
+        let path = normalize_path_for_metrics(request.uri().path());
         Metrics::record_http_request(method, &path);
 
         // Log the request start
