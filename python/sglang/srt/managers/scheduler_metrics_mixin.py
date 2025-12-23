@@ -3,7 +3,8 @@ from __future__ import annotations
 import logging
 import time
 from collections import defaultdict
-from typing import TYPE_CHECKING, List, Optional
+from contextlib import contextmanager
+from typing import TYPE_CHECKING, List, Optional, Union
 
 from sglang.srt.disaggregation.kv_events import EventPublisherFactory, KVEventBatch
 from sglang.srt.disaggregation.utils import DisaggregationMode
@@ -11,16 +12,19 @@ from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import GetLoadReqInput, GetLoadReqOutput
 from sglang.srt.managers.schedule_policy import PrefillAdder
 from sglang.srt.managers.scheduler import Req, ScheduleBatch
+from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.metrics.collector import SchedulerMetricsCollector, SchedulerStats
 from sglang.srt.utils import get_bool_env_var
+from sglang.srt.utils.device_timer import DeviceTimer
 
 if TYPE_CHECKING:
-    from sglang.srt.managers.scheduler import Scheduler
+    from sglang.srt.managers.scheduler import EmbeddingBatchResult, Scheduler
 
 logger = logging.getLogger(__name__)
 
 RECORD_STEP_TIME = get_bool_env_var("SGLANG_RECORD_STEP_TIME")
 LOG_FORWARD_ITERS = envs.SGLANG_LOG_FORWARD_ITERS.get()
+ENABLE_METRICS_DEVICE_TIMER = envs.SGLANG_ENABLE_METRICS_DEVICE_TIMER.get()
 
 
 class KvMetrics:
@@ -39,9 +43,11 @@ class SchedulerMetricsMixin:
     def init_metrics(
         self: Scheduler, tp_rank: int, pp_rank: int, dp_rank: Optional[int]
     ):
+        # Basic stats
+        self.forward_ct_decode = 0
+        self.num_generated_tokens = 0
         self.last_decode_stats_tic = time.perf_counter()
         self.last_prefill_stats_tic = time.perf_counter()
-
         self.last_gen_throughput: float = 0.0
         self.last_input_throughput: float = 0.0
         self.step_time_dict = defaultdict(list)  # Dict[batch size -> step time]
@@ -52,12 +58,19 @@ class SchedulerMetricsMixin:
         # The total number of accepted tokens and forward ct for the whole server lifetime
         self.spec_total_num_accepted_tokens = 0
         self.spec_total_num_forward_ct = 0
+
+        # For PD disaggregation
         self.kv_transfer_speed_gb_s: float = 0.0
         self.kv_transfer_latency_ms: float = 0.0
         self.kv_transfer_bootstrap_ms: float = 0.0
         self.kv_transfer_alloc_ms: float = 0.0
 
         self.stats = SchedulerStats()
+
+        # Metrics
+        self.current_scheduler_metrics_enabled = (
+            self.attn_tp_rank == 0 or self.enable_metrics_for_all_schedulers
+        )
 
         if self.enable_metrics:
             engine_type = "unified"
@@ -66,10 +79,19 @@ class SchedulerMetricsMixin:
                 "engine_type": engine_type,
                 "tp_rank": tp_rank,
                 "pp_rank": pp_rank,
+                "moe_ep_rank": self.moe_ep_rank,
             }
             if dp_rank is not None:
                 labels["dp_rank"] = dp_rank
             self.metrics_collector = SchedulerMetricsCollector(labels=labels)
+
+            if ENABLE_METRICS_DEVICE_TIMER:
+                self.forward_pass_device_timer = DeviceTimer(
+                    reporter=self.metrics_collector.increment_gpu_execution_seconds
+                )
+
+        if self.enable_kv_cache_events:
+            self.init_kv_events(self.server_args.kv_events_config)
 
     def init_kv_events(self: Scheduler, kv_events_config: Optional[str]):
         if self.enable_kv_cache_events:
@@ -81,6 +103,14 @@ class SchedulerMetricsMixin:
         self.spec_num_accepted_tokens += num_accepted_tokens + bs
         self.spec_num_forward_ct += bs
         self.num_generated_tokens += num_accepted_tokens
+
+    def reset_metrics(self):
+        self.forward_ct_decode = 0
+        self.num_generated_tokens = 0
+        self.spec_num_accepted_tokens = 0
+        self.spec_num_forward_ct = 0
+        self.spec_total_num_accepted_tokens = 0
+        self.spec_total_num_forward_ct = 0
 
     def log_prefill_stats(
         self: Scheduler,
@@ -199,6 +229,11 @@ class SchedulerMetricsMixin:
                     self.disagg_decode_transfer_queue.queue
                 )
 
+            self.metrics_collector.increment_realtime_tokens(
+                prefill_compute_tokens=adder.log_input_tokens,
+                prefill_cache_tokens=adder.log_hit_tokens,
+            )
+
             # Others
             self.calculate_utilization()
             self.metrics_collector.log_stats(self.stats)
@@ -210,6 +245,7 @@ class SchedulerMetricsMixin:
     ):
         batch = running_batch or self.running_batch
 
+        last_num_generated_tokens = self.num_generated_tokens
         gap_latency = time.perf_counter() - self.last_decode_stats_tic
         self.last_decode_stats_tic = time.perf_counter()
         self.last_gen_throughput = self.num_generated_tokens / gap_latency
@@ -350,11 +386,31 @@ class SchedulerMetricsMixin:
                     self.disagg_decode_transfer_queue.queue
                 )
 
+            self.metrics_collector.increment_realtime_tokens(
+                decode_tokens=last_num_generated_tokens
+            )
+
             # Others
             self.calculate_utilization()
             self.metrics_collector.log_stats(self.stats)
             self._emit_kv_metrics()
         self._publish_kv_events()
+
+    def log_batch_result_stats(
+        self: Scheduler,
+        batch: ScheduleBatch,
+        result: Union[GenerationBatchResult, EmbeddingBatchResult],
+    ):
+        if not self.enable_metrics:
+            return
+        if not isinstance(result, GenerationBatchResult):
+            return
+
+        if (m := result.expert_distribution_metrics) is not None:
+            self.metrics_collector.increment_eplb_balancedness(
+                forward_mode=batch.forward_mode.name.lower(),
+                balancedness=m.eplb_balancedness.item(),
+            )
 
     def _emit_kv_metrics(self: Scheduler):
         if not self.enable_kv_cache_events:
@@ -425,3 +481,13 @@ class SchedulerMetricsMixin:
             num_waiting_reqs=num_waiting_reqs,
             num_tokens=num_tokens,
         )
+
+    @contextmanager
+    def record_forward_metrics(self: Scheduler, batch):
+        if not (self.enable_metrics and ENABLE_METRICS_DEVICE_TIMER):
+            yield
+            return
+
+        category = "forward_" + batch.forward_mode.name.lower()
+        with self.forward_pass_device_timer.wrap(category=category):
+            yield
