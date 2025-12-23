@@ -415,21 +415,6 @@ class QwenImageCrossAttention(nn.Module):
         return img_attn_output, txt_attn_output
 
 
-class _ReplicatedLinearForMod(ReplicatedLinear):
-    """ReplicatedLinear wrapper for modulation MLPs that returns only the
-    tensor output (drops the auxiliary bias output).
-
-    This keeps the module hierarchy (and hence state_dict parameter names)
-    identical to using ``ReplicatedLinear`` directly, but matches the
-    expected ``nn.Sequential`` semantics used for ``img_mod`` / ``txt_mod``
-    (which assume the last module returns a plain tensor).
-    """
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:  # type: ignore[override]
-        out, _ = super().forward(x)
-        return out
-
-
 class QwenImageTransformerBlock(nn.Module):
     def __init__(
         self,
@@ -452,7 +437,7 @@ class QwenImageTransformerBlock(nn.Module):
         # Image processing modules
         self.img_mod = nn.Sequential(
             nn.SiLU(),
-            _ReplicatedLinearForMod(
+            ReplicatedLinear(
                 dim,
                 6 * dim,
                 bias=True,
@@ -479,7 +464,7 @@ class QwenImageTransformerBlock(nn.Module):
         # Text processing modules
         self.txt_mod = nn.Sequential(
             nn.SiLU(),
-            _ReplicatedLinearForMod(
+            ReplicatedLinear(
                 dim,
                 6 * dim,
                 bias=True,
@@ -538,8 +523,8 @@ class QwenImageTransformerBlock(nn.Module):
         image_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         joint_attention_kwargs: Optional[Dict[str, Any]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        img_mod_params = self.img_mod(temb)  # [B, 6*dim]
-        txt_mod_params = self.txt_mod(temb)  # [B, 6*dim]
+        img_mod_params, _ = self.img_mod(temb)  # [B, 6*dim]
+        txt_mod_params, _ = self.txt_mod(temb)  # [B, 6*dim]
 
         if (
             self.quant_config is not None
