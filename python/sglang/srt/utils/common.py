@@ -1006,17 +1006,30 @@ def read_video_frames_opencv(vc, frame_idx: List[int]):
 
         video_np = np.empty((n_frames, height, width, 3), dtype=np.uint8)
         mx_idx = min(total_frames, max(frame_idx) + 1)
-        i = 0
+        frame_idx_st = set(frame_idx)
+        cnt = 0
         for idx in range(mx_idx):
             ok = vc.grab()
             if not ok:
-                break
-            if idx in frame_idx:
+                if idx in frame_idx_st:
+                    logger.warning(
+                        f"Failed to read frame {idx}, skipped. The video may be corrupted."
+                    )
+                continue
+            if idx in frame_idx_st:
                 ret, frame = vc.retrieve()
                 if ret:
-                    video_np[i] = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                    i += 1
-        return video_np
+                    video_np[cnt] = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    cnt += 1
+                else:
+                    logger.warning(
+                        f"Failed to retrieve frame {idx}, skipped. The video may be corrupted."
+                    )
+        if cnt != n_frames:
+            logger.warning(
+                f"Expected {n_frames} frames, but only got {cnt}. The video may be corrupted."
+            )
+        return video_np[:cnt]
     finally:
         vc.release()
 
