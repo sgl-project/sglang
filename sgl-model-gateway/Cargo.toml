@@ -145,6 +145,10 @@ tonic-v12 = { version = "0.12.3", package = "tonic" }
 serial_test = "3.0"
 
 [[bench]]
+name = "router_bench"
+harness = false
+
+[[bench]]
 name = "request_processing"
 harness = false
 path = "benches/request_processing.rs"
