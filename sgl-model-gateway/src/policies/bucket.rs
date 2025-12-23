@@ -58,7 +58,7 @@ impl BucketPolicy {
                             bucket_guard.adjust_boundary();
                         }
                         Err(e) => {
-                            eprintln!(
+                            error!(
                                 "Failed to acquire write lock for bucket {}: {}",
                                 model_id, e
                             );
@@ -79,10 +79,10 @@ impl BucketPolicy {
         // Group workers by model
         let mut model_workers: HashMap<String, Vec<&Arc<dyn Worker>>> = HashMap::new();
         for worker in prefill_workers {
-            // Use "default" for unknown/empty model_ids for backward compatibility
+            // Use "unknown" for empty model_ids
             let model_id = worker.model_id();
-            let model_key = if model_id.is_empty() || model_id == "unknown" {
-                "default"
+            let model_key = if model_id.is_empty() {
+                "unknown"
             } else {
                 model_id
             };
@@ -112,15 +112,15 @@ impl BucketPolicy {
             if let Ok(mut bucket_guard) = lock_result {
                 bucket_guard.init_prefill_worker_urls(worker_urls);
             } else {
-                eprintln!("Failed to acquire write lock for bucket initialization");
+                error!("Failed to acquire write lock for bucket initialization");
             }
         }
     }
 
     pub fn add_prefill_url(&self, worker: &dyn Worker) {
         let model_id = worker.model_id();
-        let model_key = if model_id.is_empty() || model_id == "unknown" {
-            "default"
+        let model_key = if model_id.is_empty() {
+            "unknown"
         } else {
             model_id
         };
@@ -167,8 +167,8 @@ impl BucketPolicy {
 
     pub fn remove_prefill_url(&self, worker: &dyn Worker) {
         let model_id = worker.model_id();
-        let model_key = if model_id.is_empty() || model_id == "unknown" {
-            "default"
+        let model_key = if model_id.is_empty() {
+            "unknown"
         } else {
             model_id
         };
@@ -236,8 +236,8 @@ impl LoadBalancingPolicy for BucketPolicy {
         // Determine the model for this set of workers (router pre-filters by model)
         // All workers should be from the same model
         let first_model = workers[healthy_indices[0]].model_id();
-        let model_key = if first_model.is_empty() || first_model == "unknown" {
-            "default"
+        let model_key = if first_model.is_empty() {
+            "unknown"
         } else {
             first_model
         };

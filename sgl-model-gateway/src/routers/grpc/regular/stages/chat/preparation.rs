@@ -8,10 +8,13 @@ use tracing::error;
 
 use crate::{
     protocols::chat::ChatCompletionRequest,
-    routers::grpc::{
-        common::stages::PipelineStage,
-        context::{PreparationOutput, RequestContext},
-        error, utils,
+    routers::{
+        error,
+        grpc::{
+            common::stages::PipelineStage,
+            context::{PreparationOutput, RequestContext},
+            utils,
+        },
     },
 };
 
@@ -40,27 +43,45 @@ impl ChatPreparationStage {
         ctx: &mut RequestContext,
         request: &ChatCompletionRequest,
     ) -> Result<(), Response> {
+        // Step 0: Resolve tokenizer from registry
+        let model_id = ctx.input.model_id.as_deref().unwrap();
+        let tokenizer = ctx
+            .components
+            .tokenizer_registry
+            .get(model_id)
+            .ok_or_else(|| {
+                error!(
+                    function = "ChatPreparationStage::prepare_chat",
+                    model = %model_id,
+                    "Tokenizer not found for model"
+                );
+                error::internal_error(
+                    "tokenizer_not_found",
+                    format!("Tokenizer not found for model: {}", model_id),
+                )
+            })?;
+
         // Step 1: Filter tools if needed
         let body_ref = utils::filter_chat_request_by_tool_choice(request);
 
         // Step 2: Process messages and apply chat template
-        let processed_messages = match utils::process_chat_messages(
-            &body_ref,
-            &*ctx.components.tokenizer,
-        ) {
+        let processed_messages = match utils::process_chat_messages(&body_ref, &*tokenizer) {
             Ok(msgs) => msgs,
             Err(e) => {
                 error!(function = "ChatPreparationStage::execute", error = %e, "Failed to process chat messages");
-                return Err(error::bad_request(e));
+                return Err(error::bad_request("process_messages_failed", e));
             }
         };
 
         // Step 3: Tokenize the processed text
-        let encoding = match ctx.components.tokenizer.encode(&processed_messages.text) {
+        let encoding = match tokenizer.encode(&processed_messages.text) {
             Ok(encoding) => encoding,
             Err(e) => {
                 error!(function = "ChatPreparationStage::execute", error = %e, "Tokenization failed");
-                return Err(error::internal_error(format!("Tokenization failed: {}", e)));
+                return Err(error::internal_error(
+                    "tokenization_failed",
+                    format!("Tokenization failed: {}", e),
+                ));
             }
         };
 
@@ -71,7 +92,7 @@ impl ChatPreparationStage {
             utils::generate_tool_constraints(tools, &request.tool_choice, &request.model)
                 .map_err(|e| {
                     error!(function = "ChatPreparationStage::execute", error = %e, "Invalid tool configuration");
-                    error::bad_request(format!("Invalid tool configuration: {}", e))
+                    error::bad_request("invalid_tool_configuration", format!("Invalid tool configuration: {}", e))
                 })?
         } else {
             None
@@ -79,7 +100,7 @@ impl ChatPreparationStage {
 
         // Step 5: Create stop sequence decoder (build once, reuse in non-stream)
         let stop_decoder = utils::create_stop_decoder(
-            &ctx.components.tokenizer,
+            &tokenizer,
             request.stop.as_ref(),
             request.stop_token_ids.as_ref(),
             request.skip_special_tokens,

@@ -73,7 +73,7 @@ use rand::Rng;
 use tracing::debug;
 
 use super::{get_healthy_worker_indices, tree::Tree, CacheAwareConfig, LoadBalancingPolicy};
-use crate::{core::Worker, observability::metrics::RouterMetrics};
+use crate::core::Worker;
 
 /// Cache-aware routing policy
 ///
@@ -134,6 +134,7 @@ impl CacheAwarePolicy {
                         let model_id = tree_ref.key();
                         let tree = tree_ref.value();
                         tree.evict_tenant_by_size(max_tree_size);
+
                         debug!(
                             "Cache eviction completed for model {}, max_size: {}",
                             model_id, max_tree_size
@@ -159,10 +160,10 @@ impl CacheAwarePolicy {
         let mut model_workers: std::collections::HashMap<String, Vec<&Arc<dyn Worker>>> =
             std::collections::HashMap::new();
         for worker in workers {
-            // Use "default" for unknown/empty model_ids for backward compatibility
+            // Use "unknown" for empty model_ids
             let model_id = worker.model_id();
-            let tree_key = if model_id.is_empty() || model_id == "unknown" {
-                "default"
+            let tree_key = if model_id.is_empty() {
+                "unknown"
             } else {
                 model_id
             };
@@ -189,8 +190,8 @@ impl CacheAwarePolicy {
         // For backward compatibility: if model_id is "unknown" or empty,
         // use a default tree. This preserves existing behavior for single-model routers.
         let model_id = worker.model_id();
-        let tree_key = if model_id.is_empty() || model_id == "unknown" {
-            "default"
+        let tree_key = if model_id.is_empty() {
+            "unknown"
         } else {
             model_id
         };
@@ -214,8 +215,8 @@ impl CacheAwarePolicy {
     pub fn remove_worker(&self, worker: &dyn Worker) {
         // Use same logic as add_worker for consistency
         let model_id = worker.model_id();
-        let tree_key = if model_id.is_empty() || model_id == "unknown" {
-            "default"
+        let tree_key = if model_id.is_empty() {
+            "unknown"
         } else {
             model_id
         };
@@ -268,9 +269,6 @@ impl CacheAwarePolicy {
             max_load, min_load, worker_loads
         );
 
-        RouterMetrics::record_load_balancing_event();
-        RouterMetrics::set_load_range(max_load, min_load);
-
         // Use shortest queue when imbalanced
         let min_load_idx = healthy_indices
             .iter()
@@ -296,8 +294,6 @@ impl CacheAwarePolicy {
 
         // Increment processed counter
         workers[min_load_idx].increment_processed();
-        RouterMetrics::record_processed_request(workers[min_load_idx].url());
-        RouterMetrics::record_policy_decision(self.name(), workers[min_load_idx].url());
 
         Some(min_load_idx)
     }
@@ -318,8 +314,8 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
         // Determine the model for this set of workers (router pre-filters by model)
         // All workers should be from the same model
         let first_model = workers[healthy_indices[0]].model_id();
-        let model_id = if first_model.is_empty() || first_model == "unknown" {
-            "default"
+        let model_id = if first_model.is_empty() {
+            "unknown"
         } else {
             first_model
         };
@@ -363,10 +359,8 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
             };
 
             let selected_url = if match_rate > self.config.cache_threshold {
-                RouterMetrics::record_cache_hit();
                 matched_worker.to_string()
             } else {
-                RouterMetrics::record_cache_miss();
                 let min_load_idx = *healthy_indices
                     .iter()
                     .min_by_key(|&&idx| workers[idx].load())?;
@@ -382,8 +376,6 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
 
                     // Increment processed counter
                     workers[selected_idx].increment_processed();
-                    RouterMetrics::record_processed_request(&selected_url);
-                    RouterMetrics::record_policy_decision(self.name(), &selected_url);
 
                     return Some(selected_idx);
                 }
