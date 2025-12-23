@@ -1,12 +1,42 @@
-#include <sgl_kernel/fp8_utils.cuh>
+#include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.cuh>
 #include <sgl_kernel/utils.h>
 
 #include <cub/block/block_reduce.cuh>
 #include <flashinfer/vec_dtypes.cuh>
+#include <sgl_kernel/fp8_utils.cuh>
 
 #include <cstddef>
 #include <cstdint>
+
+namespace host {
+namespace details {
+
+// dtype_trait specializations for c10 types
+template <>
+struct dtype_trait<c10::Half> {
+  inline static constexpr DLDataType value = {.code = DLDataTypeCode::kDLFloat, .bits = 16, .lanes = 1};
+};
+
+template <>
+struct dtype_trait<c10::BFloat16> {
+  inline static constexpr DLDataType value = {.code = DLDataTypeCode::kDLBfloat, .bits = 16, .lanes = 1};
+};
+
+template <>
+struct dtype_trait<c10::Float8_e4m3fn> {
+  inline static constexpr DLDataType value = {.code = DLDataTypeCode::kDLFloat, .bits = 8, .lanes = 1};
+};
+
+#ifdef __CUDACC__
+template <>
+struct dtype_trait<__nv_fp8_e4m3> {
+  inline static constexpr DLDataType value = {.code = DLDataTypeCode::kDLFloat, .bits = 8, .lanes = 1};
+};
+#endif
+
+}  // namespace details
+}  // namespace host
 
 namespace {
 

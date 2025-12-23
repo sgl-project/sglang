@@ -1,7 +1,5 @@
 #pragma once
 
-#include <sgl_kernel/tensor.h>
-
 #include <c10/util/BFloat16.h>
 #include <c10/util/Float8_e4m3fn.h>
 #include <c10/util/Half.h>
@@ -24,36 +22,6 @@
 #ifdef __CUDACC__
 #include <cuda_fp8.h>
 #endif
-
-namespace host {
-namespace details {
-
-// dtype_trait specializations for c10 types
-template <>
-struct dtype_trait<c10::Half> {
-  inline static constexpr DLDataType value = {.code = DLDataTypeCode::kDLFloat, .bits = 16, .lanes = 1};
-};
-
-template <>
-struct dtype_trait<c10::BFloat16> {
-  inline static constexpr DLDataType value = {.code = DLDataTypeCode::kDLBfloat, .bits = 16, .lanes = 1};
-};
-
-template <>
-struct dtype_trait<c10::Float8_e4m3fn> {
-  inline static constexpr DLDataType value = {.code = DLDataTypeCode::kDLFloat, .bits = 8, .lanes = 1};
-};
-
-#ifdef __CUDACC__
-// Alias for __nv_fp8_e4m3 which is the same as c10::Float8_e4m3fn
-template <>
-struct dtype_trait<__nv_fp8_e4m3> {
-  inline static constexpr DLDataType value = {.code = DLDataTypeCode::kDLFloat, .bits = 8, .lanes = 1};
-};
-#endif
-
-}  // namespace details
-}  // namespace host
 
 namespace device {
 
