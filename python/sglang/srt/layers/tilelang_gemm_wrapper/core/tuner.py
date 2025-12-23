@@ -24,79 +24,48 @@ def _tflops(M: int, N: int, K: int, latency_ms: float) -> float:
 
 def _matmul_configs(M: int, N: int, K: int) -> List[dict]:
     """Generate config search space for standard GEMM."""
-    configs = []
-
-    block_m_options = [64, 128] if M >= 64 else [M] if M >= 32 else [32]
-    block_n_options = [64, 128, 256]
-    block_k_options = [64, 128]
-    num_stages_options = [2, 3, 4]
-    threads_options = [128, 256]
-
-    for block_m in block_m_options:
-        for block_n in block_n_options:
-            for block_k in block_k_options:
-                for num_stages in num_stages_options:
-                    for threads in threads_options:
-                        if block_m > M and M < 128:
-                            continue
-                        if block_n > N:
-                            continue
-                        if block_k > K:
-                            continue
-
-                        configs.append({
-                            "block_M": block_m,
-                            "block_N": block_n,
-                            "block_K": block_k,
-                            "num_stages": num_stages,
-                            "threads": threads,
-                        })
-
-    return configs
+    tiles_M = [64] if M < 128 else [64, 128]
+    tiles_N = [16, 32, 64, 128]
+    tiles_K = [128]
+    stages = [1, 2, 3, 4]
+    threads = [128, 256]
+    return [
+        dict(block_M=BM, block_N=BN, block_K=BK, num_stages=S, threads=TH)
+        for BM in tiles_M
+        for BN in tiles_N
+        for BK in tiles_K
+        for S in stages
+        for TH in threads 
+        if (BM * BK + BN * BK) * S < 256 * 1024   # check for shared memory
+    ]
 
 
 def _matmul_splitk_configs(M: int, N: int, K: int) -> List[dict]:
     """Generate config search space for Split-K GEMM."""
+    tiles_M = [64] if M < 128 else [64, 128]
+    tiles_N = [16, 32, 64, 128]
+    tiles_K = [128]
+    stages = [0, 1, 2]
+    threads = [128, 256]
+    split_ks = [2, 4, 8]
+    
     configs = []
-
-    block_m_options = [64, 128] if M >= 64 else [32, 64]
-    block_n_options = [64, 128, 256]
-    block_k_options = [64, 128]
-
-    split_k_options = []
-    for sk in [2, 4, 8, 16]:
-        if K % (sk * 128) == 0:
-            split_k_options.append(sk)
-
-    if not split_k_options:
-        return []
-
-    num_stages_options = [2, 3]
-    threads_options = [128, 256]
-
-    for block_m in block_m_options:
-        for block_n in block_n_options:
-            for block_k in block_k_options:
-                for split_k in split_k_options:
-                    for num_stages in num_stages_options:
-                        for threads in threads_options:
-                            K_per_split = K // split_k
-                            if block_k > K_per_split:
+    for BM in tiles_M:
+        for BN in tiles_N:
+            for BK in tiles_K:
+                for S in stages:
+                    for TH in threads:
+                        for SK in split_ks:
+                            if K % SK != 0:
                                 continue
-                            if block_m > M and M < 64:
+                            K_per_split = K // SK
+                            if K_per_split % BK != 0:
                                 continue
-                            if block_n > N:
-                                continue
-
-                            configs.append({
-                                "block_M": block_m,
-                                "block_N": block_n,
-                                "block_K": block_k,
-                                "split_k": split_k,
-                                "num_stages": num_stages,
-                                "threads": threads,
-                            })
-
+                            if (BM * BK + BN * BK) * max(S, 1) < 256 * 1024:    # check for shared memory
+                                configs.append(dict(
+                                    block_M=BM, block_N=BN, block_K=BK,
+                                    num_stages=S, threads=TH, split_k=SK
+                                ))
     return configs
 
 
