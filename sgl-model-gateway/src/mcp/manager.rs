@@ -487,7 +487,7 @@ impl McpManager {
             Ok(ts) => {
                 info!("Discovered {} tools from '{}'", ts.len(), server_key);
                 for t in ts {
-                    let qualified_tool_name: String = format!("{}.{}", server_key, t.name);
+                    let qualified_tool_name: String = format!("{}_{}", server_key, t.name);
                     inventory.insert_tool(qualified_tool_name, server_key.to_string(), t);
                 }
             }
@@ -499,7 +499,7 @@ impl McpManager {
             Ok(ps) => {
                 info!("Discovered {} prompts from '{}'", ps.len(), server_key);
                 for p in ps {
-                    let qualified_prompt_name: String = format!("{}.{}", server_key, p.name);
+                    let qualified_prompt_name: String = format!("{}_{}", server_key, p.name);
                     inventory.insert_prompt(qualified_prompt_name, server_key.to_string(), p);
                 }
             }
@@ -525,7 +525,7 @@ impl McpManager {
             Ok(ts) => {
                 info!("Discovered {} tools from '{}'", ts.len(), server_name);
                 for t in ts {
-                    let qualified_tool_name: String = format!("{}.{}", server_name, t.name);
+                    let qualified_tool_name: String = format!("{}_{}", server_name, t.name);
                     self.inventory
                         .insert_tool(qualified_tool_name, server_name.to_string(), t);
                 }
@@ -538,7 +538,7 @@ impl McpManager {
             Ok(ps) => {
                 info!("Discovered {} prompts from '{}'", ps.len(), server_name);
                 for p in ps {
-                    let qualified_prompt_name: String = format!("{}.{}", server_name, p.name);
+                    let qualified_prompt_name: String = format!("{}_{}", server_name, p.name);
                     self.inventory
                         .insert_prompt(qualified_prompt_name, server_name.to_string(), p);
                 }

@@ -274,12 +274,12 @@ mod tests {
         let tool = create_test_tool("test_tool");
 
         inventory.insert_tool(
-            "server1.test_tool".to_string(),
+            "server1_test_tool".to_string(),
             "server1".to_string(),
             tool.clone(),
         );
 
-        let result = inventory.get_tool("server1.test_tool");
+        let result = inventory.get_tool("server1_test_tool");
         assert!(result.is_some());
 
         let (server_name, retrieved_tool) = result.unwrap();
@@ -292,15 +292,15 @@ mod tests {
         let inventory = ToolInventory::new();
         let tool = create_test_tool("check_tool");
 
-        assert!(!inventory.has_tool("server1.check_tool"));
+        assert!(!inventory.has_tool("server1_check_tool"));
 
         inventory.insert_tool(
-            "server1.check_tool".to_string(),
+            "server1_check_tool".to_string(),
             "server1".to_string(),
             tool,
         );
 
-        assert!(inventory.has_tool("server1.check_tool"));
+        assert!(inventory.has_tool("server1_check_tool"));
     }
 
     #[test]
@@ -308,17 +308,17 @@ mod tests {
         let inventory = ToolInventory::new();
 
         inventory.insert_tool(
-            "server1.tool1".to_string(),
+            "server1_tool1".to_string(),
             "server1".to_string(),
             create_test_tool("tool1"),
         );
         inventory.insert_tool(
-            "server1.tool2".to_string(),
+            "server1_tool2".to_string(),
             "server1".to_string(),
             create_test_tool("tool2"),
         );
         inventory.insert_tool(
-            "server2.tool3".to_string(),
+            "server2_tool3".to_string(),
             "server2".to_string(),
             create_test_tool("tool3"),
         );
@@ -332,12 +332,12 @@ mod tests {
         let inventory = ToolInventory::new();
 
         inventory.insert_tool(
-            "server1.tool1".to_string(),
+            "server1_tool1".to_string(),
             "server1".to_string(),
             create_test_tool("tool1"),
         );
         inventory.insert_tool(
-            "server2.tool2".to_string(),
+            "server2_tool2".to_string(),
             "server2".to_string(),
             create_test_tool("tool2"),
         );
@@ -348,7 +348,7 @@ mod tests {
 
         let tools = inventory.list_tools();
         assert_eq!(tools.len(), 1);
-        assert_eq!(tools[0].0, "server2.tool2");
+        assert_eq!(tools[0].0, "server2_tool2");
     }
 
     #[test]
@@ -357,14 +357,14 @@ mod tests {
         let prompt = create_test_prompt("test_prompt");
 
         inventory.insert_prompt(
-            "server1.test_prompt".to_string(),
+            "server1_test_prompt".to_string(),
             "server1".to_string(),
             prompt.clone(),
         );
 
-        assert!(inventory.has_prompt("server1.test_prompt"));
+        assert!(inventory.has_prompt("server1_test_prompt"));
 
-        let result = inventory.get_prompt("server1.test_prompt");
+        let result = inventory.get_prompt("server1_test_prompt");
         assert!(result.is_some());
 
         let (server_name, retrieved_prompt) = result.unwrap();
@@ -406,7 +406,7 @@ mod tests {
             let handle = tokio::spawn(async move {
                 let tool = create_test_tool(&format!("tool_{}", i));
                 let server_name = format!("server_{}", i % 3);
-                let qualified_tool_name = format!("{}.tool_{}", server_name, i);
+                let qualified_tool_name = format!("{}_tool_{}", server_name, i);
                 inv.insert_tool(qualified_tool_name, server_name, tool);
             });
             handles.push(handle);
@@ -427,12 +427,12 @@ mod tests {
         let inventory = ToolInventory::new();
 
         inventory.insert_tool(
-            "server1.tool1".to_string(),
+            "_tool1".to_string(),
             "server1".to_string(),
             create_test_tool("tool1"),
         );
         inventory.insert_prompt(
-            "server1.prompt1".to_string(),
+            "server1_prompt1".to_string(),
             "server1".to_string(),
             create_test_prompt("prompt1"),
         );

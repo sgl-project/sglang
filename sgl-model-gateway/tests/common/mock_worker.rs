@@ -658,7 +658,7 @@ async fn responses_handler(
                 })
                 .and_then(|t| t.get("server_label").and_then(|l| l.as_str()))
                 .unwrap_or("mock");
-            let qualified_tool_name = format!("{}.brave_web_search", server_label);
+            let qualified_tool_name = format!("{}_brave_web_search", server_label);
 
             let events = vec![
                 // response.created
@@ -1025,7 +1025,7 @@ async fn responses_handler(
                 })
                 .and_then(|t| t.get("server_label").and_then(|l| l.as_str()))
                 .unwrap_or("mock");
-            let qualified_tool_name = format!("{}.brave_web_search", server_label);
+            let qualified_tool_name = format!("{}_brave_web_search", server_label);
 
             let rid = format!("resp-{}", Uuid::new_v4());
             Json(json!({
