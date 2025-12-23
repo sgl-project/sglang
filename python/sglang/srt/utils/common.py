@@ -1495,6 +1495,12 @@ def add_prometheus_middleware(app):
 def add_prometheus_track_response_middleware(app):
     from prometheus_client import Counter
 
+    http_request_counter = Counter(
+        name="sglang:http_requests_total",
+        documentation="Total number of HTTP requests by endpoint and method",
+        labelnames=["endpoint", "method"],
+    )
+
     http_response_counter = Counter(
         name="sglang:http_responses_total",
         documentation="Total number of HTTP responses by endpoint and status code",
@@ -1503,17 +1509,24 @@ def add_prometheus_track_response_middleware(app):
 
     @app.middleware("http")
     async def track_http_status_code(request, call_next):
+        route = request.scope.get("route")
+        endpoint = route.path if route else request.url.path
+
+        http_request_counter.labels(
+            endpoint=endpoint,
+            method=request.method,
+        ).inc()
+
         response = await call_next(request)
 
-        route = request.scope.get("route")
-        endpoint = (
+        response_endpoint = (
             route.path
             if route
             else ("unknown_route" if response.status_code == 404 else request.url.path)
         )
 
         http_response_counter.labels(
-            endpoint=endpoint,
+            endpoint=response_endpoint,
             status_code=str(response.status_code),
             method=request.method,
         ).inc()
