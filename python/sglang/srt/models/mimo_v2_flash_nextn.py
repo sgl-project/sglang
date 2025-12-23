@@ -61,6 +61,7 @@ class MiMoV2MTPLayer(nn.Module):
             num_kv_heads=config.swa_num_key_value_heads,
             head_dim=config.swa_head_dim,
             v_head_dim=getattr(config, "swa_v_head_dim", None),
+            v_scale=getattr(config, "attention_value_scale", None),
             sliding_window_size=config.sliding_window_size,
             attention_bias=config.attention_bias,
             attention_sink_bias=getattr(config, "add_swa_attention_sink_bias", False),
@@ -291,6 +292,7 @@ class MiMoV2MTP(MiMoV2FlashForCausalLM):
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue
+
                 if "mtp_block" not in name and (
                     "embed_tokens" not in name
                     and "lm_head" not in name
