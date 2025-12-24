@@ -27,6 +27,12 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+_json_logger = logging.getLogger(__name__ + ".json")
+_json_logger.propagate = False
+_json_handler = logging.StreamHandler()
+_json_handler.setFormatter(logging.Formatter("%(message)s"))
+_json_logger.addHandler(_json_handler)
+
 
 class RequestLogger:
     def __init__(
@@ -159,14 +165,13 @@ def disable_request_logging() -> bool:
     return get_bool_env_var("SGLANG_DISABLE_REQUEST_LOGGING")
 
 
-# TODO unify logging, e.g. allow normal logs to be JSON as well
 def _log_json(event: str, data: dict) -> None:
     log_data = {
         "timestamp": datetime.now().isoformat(),
         "event": event,
         **data,
     }
-    print(json.dumps(log_data, ensure_ascii=False))
+    _json_logger.info(json.dumps(log_data, ensure_ascii=False))
 
 
 # TODO unify this w/ `_transform_data_for_logging` if we find performance enough
