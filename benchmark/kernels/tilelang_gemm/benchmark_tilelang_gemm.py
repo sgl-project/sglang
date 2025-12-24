@@ -31,13 +31,15 @@ from sglang.srt.layers.tilelang_gemm_wrapper.core.config_loader import DEFAULT_M
 from sglang.srt.layers import tilelang_gemm_wrapper
 
 # Optional deep_gemm import
-try:
-    from sglang.srt.layers import deep_gemm_wrapper
-    from deep_gemm.utils.layout import get_mn_major_tma_aligned_tensor
-    DEEP_GEMM_AVAILABLE = True
-except ImportError:
-    get_mn_major_tma_aligned_tensor = None
-    DEEP_GEMM_AVAILABLE = False
+from sglang.srt.layers.deep_gemm_wrapper.configurer import ENABLE_JIT_DEEPGEMM
+
+if ENABLE_JIT_DEEPGEMM:
+    try:
+        from sglang.srt.layers import deep_gemm_wrapper
+        from deep_gemm.utils.layout import get_mn_major_tma_aligned_tensor
+    except ImportError:
+        get_mn_major_tma_aligned_tensor = None
+        ENABLE_JIT_DEEPGEMM = False
 
 # Optional sgl_kernel import
 try:
@@ -71,7 +73,7 @@ def prepare_data(M: int, N: int, K: int):
     A_fp8, B_fp8, A_scale, B_scale = prepare_gemm_inputs(A, B)
     
     # Prepare DeepGEMM scale if available
-    if DEEP_GEMM_AVAILABLE:
+    if ENABLE_JIT_DEEPGEMM:
         A_scale_deepgemm = get_mn_major_tma_aligned_tensor(A_scale.clone())
     else:
         A_scale_deepgemm = None
@@ -187,7 +189,7 @@ def run_benchmark(
                 continue
             
             # Benchmark DeepGEMM
-            if DEEP_GEMM_AVAILABLE:
+            if ENABLE_JIT_DEEPGEMM:
                 try:
                     dg_ms, _, _ = benchmark_deepgemm(
                         A_fp8, B_fp8, A_scale_deepgemm, B_scale, M, N, rep
@@ -228,7 +230,7 @@ def run_benchmark(
     print(f"\n{'='*120}")
     print(f"Benchmark: TileLang vs DeepGEMM vs SGL-Kernel")
     print(f"N={N}, K={K}")
-    print(f"DeepGEMM available: {DEEP_GEMM_AVAILABLE}")
+    print(f"DeepGEMM available: {ENABLE_JIT_DEEPGEMM}")
     print(f"SGL-Kernel available: {SGL_KERNEL_AVAILABLE}")
     print(f"{'='*120}\n")
     
