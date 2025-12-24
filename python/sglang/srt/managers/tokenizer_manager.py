@@ -1226,7 +1226,7 @@ class TokenizerManager(
         if not is_stream:
             outputs = await asyncio.gather(*(gen.__anext__() for gen in generators))
             # Flatten beam search results: if each output is a list (beam search), flatten [[]] to []
-            if isinstance(outputs[0], list):
+            if outputs and isinstance(outputs[0], list):
                 flattened_outputs = []
                 for output in outputs:
                     flattened_outputs.extend(output)
@@ -1245,7 +1245,7 @@ class TokenizerManager(
                     gen = task_map.pop(task)
                     try:
                         result = task.result()
-                        if isinstance(result, list):
+                        if isinstance(result, list) and result:
                             # For beam search, only the first element has complete meta_info with id
                             # All beams in the list belong to the same request
                             request_id = result[0]["meta_info"]["id"]
