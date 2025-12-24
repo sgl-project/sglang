@@ -1254,7 +1254,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     dllm_config: Optional[DllmConfig] = None
 
     # Metrics
-    dp_cooperation_info = Optional[DPCooperationInfo] = None
+    dp_cooperation_info: Optional[DPCooperationInfo] = None
 
     @classmethod
     def init_new(
