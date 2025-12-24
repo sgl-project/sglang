@@ -80,7 +80,7 @@ class TestEnableMetrics(CustomTestCase):
                 ("sglang:dp_cooperation_gpu_execution_seconds_total", {"category": "forward_decode"}),
             ]
             for metric_name, labels in metrics_to_check:
-                value = _get_metric_value(metrics, metric_name, labels)
+                value = _get_metric_value(metrics[metric_name], labels)
                 self.assertGreater(value, 0, f"{metric_name} {labels}")
 
             num_prefill_ranks_values = {s.labels["num_prefill_ranks"] for s in metrics["sglang:dp_cooperation_realtime_tokens_total"]}
@@ -146,17 +146,11 @@ def _parse_prometheus_metrics(metrics_text: str) -> Dict[str, List[Sample]]:
     return result
 
 
-def _get_metric_value(
-    metrics: Dict[str, List[Sample]],
-    metric_name: str,
-    labels: Dict[str, str],
-) -> float:
-    if metric_name not in metrics:
-        raise KeyError(f"Metric {metric_name} not found")
-    for sample in metrics[metric_name]:
+def _get_metric_value(samples: List[Sample], labels: Dict[str, str]) -> float:
+    for sample in samples:
         if all(sample.labels.get(k) == v for k, v in labels.items()):
             return sample.value
-    raise KeyError(f"Metric {metric_name} with labels {labels} not found")
+    raise KeyError(f"No sample found with labels {labels}")
 
 
 
