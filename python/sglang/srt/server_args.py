@@ -413,6 +413,7 @@ class ServerArgs:
     fp8_gemm_runner_backend: str = "auto"
     nsa_prefill_backend: str = "flashmla_sparse"
     nsa_decode_backend: str = "fa3"
+    enable_nsa_decode_hybrid_pool: bool = False
     disable_flashinfer_autotune: bool = False
 
     # Speculative decoding
@@ -2163,6 +2164,11 @@ class ServerArgs:
                     "Cuda graph is disabled for prefill server when piecewise cuda graph is not enabled."
                 )
 
+            if self.enable_nsa_decode_hybrid_pool:
+                raise ValueError(
+                    f"enable_nsa_decode_hybrid_pool requires decode role, got '{self.disaggregation_mode}'"
+                )
+
     def _handle_encoder_disaggregation(self):
         if self.enable_prefix_mm_cache and not self.encoder_only:
             raise ValueError(
@@ -3304,6 +3310,12 @@ class ServerArgs:
             default=ServerArgs.nsa_decode_backend,
             type=str,
             choices=NSA_CHOICES,
+        )
+        parser.add_argument(
+            "--enable-nsa-decode-hybrid-pool",
+            action="store_true",
+            default=ServerArgs.enable_nsa_decode_hybrid_pool,
+            help="Enable hybrid pool for NSA decode (separate KV and index_k pools).",
         )
         parser.add_argument(
             "--fp8-gemm-backend",

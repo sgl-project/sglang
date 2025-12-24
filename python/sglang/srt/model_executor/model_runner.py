@@ -1929,6 +1929,7 @@ class ModelRunner:
                 f"Current value: {self.server_args.mem_fraction_static=}"
             )
 
+        is_nsa_model = is_deepseek_nsa(self.model_config.hf_config)
         # Initialize req_to_token_pool
         if self.req_to_token_pool is None:
             # FIXME(lsyin): this is the temporary fix for the context length issue when using speculative decoding
@@ -1958,14 +1959,28 @@ class ModelRunner:
                         pre_alloc_size=pre_alloc_size,
                     )
                 else:
-                    self.req_to_token_pool = DecodeReqToTokenPool(
-                        size=max_num_reqs,
-                        max_context_len=self.model_config.context_len
-                        + extra_max_context_len,
-                        device=self.device,
-                        enable_memory_saver=self.server_args.enable_memory_saver,
-                        pre_alloc_size=pre_alloc_size,
-                    )
+                    if self.server_args.enable_nsa_decode_hybrid_pool and is_nsa_model:
+                        from sglang.srt.disaggregation.decode import (
+                            NSADecodeReqToTokenPool,
+                        )
+
+                        self.req_to_token_pool = NSADecodeReqToTokenPool(
+                            size=max_num_reqs,
+                            max_context_len=self.model_config.context_len
+                            + extra_max_context_len,
+                            device=self.device,
+                            enable_memory_saver=self.server_args.enable_memory_saver,
+                            pre_alloc_size=pre_alloc_size,
+                        )
+                    else:
+                        self.req_to_token_pool = DecodeReqToTokenPool(
+                            size=max_num_reqs,
+                            max_context_len=self.model_config.context_len
+                            + extra_max_context_len,
+                            device=self.device,
+                            enable_memory_saver=self.server_args.enable_memory_saver,
+                            pre_alloc_size=pre_alloc_size,
+                        )
             elif config := self.mambaish_config:
                 self.req_to_token_pool = HybridReqToTokenPool(
                     size=max_num_reqs,
@@ -1992,7 +2007,6 @@ class ModelRunner:
             assert self.is_draft_worker
 
         # Initialize token_to_kv_pool
-        is_nsa_model = is_deepseek_nsa(self.model_config.hf_config)
         if self.server_args.attention_backend == "ascend":
             if self.use_mla_backend:
                 from sglang.srt.hardware_backend.npu.memory_pool_npu import (
@@ -2221,14 +2235,31 @@ class ModelRunner:
                         )
                 else:
                     assert not self.is_hybrid_swa
-                    self.token_to_kv_pool_allocator = PagedTokenToKVPoolAllocator(
-                        self.max_total_num_tokens,
-                        page_size=self.page_size,
-                        dtype=self.kv_cache_dtype,
-                        device=self.device,
-                        kvcache=self.token_to_kv_pool,
-                        need_sort=need_sort,
-                    )
+                    if self.server_args.enable_nsa_decode_hybrid_pool and is_nsa_model:
+                        from sglang.srt.mem_cache.allocator import (
+                            NSAHybridTokenToKVPoolAllocator,
+                        )
+
+                        self.token_to_kv_pool_allocator = (
+                            NSAHybridTokenToKVPoolAllocator(
+                                kv_size=self.max_total_num_tokens,
+                                index_k_size=self.max_total_num_tokens,
+                                page_size=self.page_size,
+                                dtype=self.kv_cache_dtype,
+                                device=self.device,
+                                kvcache=self.token_to_kv_pool,
+                                need_sort=need_sort,
+                            )
+                        )
+                    else:
+                        self.token_to_kv_pool_allocator = PagedTokenToKVPoolAllocator(
+                            self.max_total_num_tokens,
+                            page_size=self.page_size,
+                            dtype=self.kv_cache_dtype,
+                            device=self.device,
+                            kvcache=self.token_to_kv_pool,
+                            need_sort=need_sort,
+                        )
         else:
             assert self.is_draft_worker
             if self.is_hybrid_swa:
