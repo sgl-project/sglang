@@ -874,6 +874,7 @@ class ForwardBatch:
 
     def _pad_inputs_to_size(self, model_runner: ModelRunner, num_tokens, bs):
         # padding
+        num_pad = num_tokens - self.input_ids.shape[0]
         self.input_ids = self._pad_tensor_to_size(self.input_ids, num_tokens)
         self.req_pool_indices = self._pad_tensor_to_size(self.req_pool_indices, bs)
         self.lora_ids.extend((bs - len(self.lora_ids)) * [None])
@@ -887,10 +888,14 @@ class ForwardBatch:
         self.seq_lens = self._pad_tensor_to_size(
             self.seq_lens, bs, value=seq_len_fill_value
         )
+        if self.forward_mode.is_extend() and len(self.seq_lens) > 0:
+            self.seq_lens[-1] += num_pad
         if self.seq_lens_cpu is not None:
             self.seq_lens_cpu = self._pad_tensor_to_size(
                 self.seq_lens_cpu, bs, value=seq_len_fill_value
             )
+            if self.forward_mode.is_extend() and len(self.seq_lens_cpu) > 0:
+                self.seq_lens_cpu[-1] += num_pad
 
         self.out_cache_loc = self._pad_tensor_to_size(self.out_cache_loc, num_tokens)
         if self.encoder_lens is not None:
