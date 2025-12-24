@@ -35,6 +35,7 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
 )
 from sglang.multimodal_gen.test.slack_utils import upload_file_to_slack
 from sglang.multimodal_gen.test.test_utils import (
+    get_expected_image_format,
     is_image_url,
     prepare_perf_log,
     validate_image,
@@ -787,6 +788,10 @@ def get_generate_fn(
         if not sampling_params.prompt:
             pytest.skip(f"{id}: no text prompt configured")
 
+        # Request parameters that affect output format
+        req_output_format = None  # Not specified in current request
+        req_background = None  # Not specified in current request
+
         response = client.images.with_raw_response.generate(
             model=model_path,
             prompt=sampling_params.prompt,
@@ -798,7 +803,9 @@ def get_generate_fn(
         validate_image(result.data[0].b64_json)
 
         img_data = base64.b64decode(result.data[0].b64_json)
-        expected_filename = f"{result.created}.png"
+        # Infer expected format from request parameters
+        expected_ext = get_expected_image_format(req_output_format, req_background)
+        expected_filename = f"{result.created}.{expected_ext}"
         tmp_path = expected_filename
         with open(tmp_path, "wb") as f:
             f.write(img_data)
@@ -810,7 +817,12 @@ def get_generate_fn(
             if len(parts) == 2:
                 expected_width, expected_height = int(parts[0]), int(parts[1])
         validate_image_file(
-            tmp_path, expected_filename, expected_width, expected_height
+            tmp_path,
+            expected_filename,
+            expected_width,
+            expected_height,
+            output_format=req_output_format,
+            background=req_background,
         )
 
         upload_file_to_slack(
@@ -844,6 +856,10 @@ def get_generate_fn(
 
         image_paths = new_image_paths
 
+        # Request parameters that affect output format
+        req_output_format = None  # Not specified in current request
+        req_background = None  # Not specified in current request
+
         images = [open(image_path, "rb") for image_path in image_paths]
         try:
             response = client.images.with_raw_response.edit(
@@ -864,7 +880,9 @@ def get_generate_fn(
         validate_image(result.data[0].b64_json)
 
         img_data = base64.b64decode(result.data[0].b64_json)
-        tmp_path = f"{rid}.png"
+        # Infer expected format from request parameters
+        expected_ext = get_expected_image_format(req_output_format, req_background)
+        tmp_path = f"{rid}.{expected_ext}"
         with open(tmp_path, "wb") as f:
             f.write(img_data)
         upload_file_to_slack(
@@ -895,6 +913,10 @@ def get_generate_fn(
                     f"{id}: image_path must be a URL for URL direct test: {url}"
                 )
 
+        # Request parameters that affect output format
+        req_output_format = None  # Not specified in current request
+        req_background = None  # Not specified in current request
+
         response = client.images.with_raw_response.edit(
             model=model_path,
             prompt=sampling_params.prompt,
@@ -911,7 +933,9 @@ def get_generate_fn(
 
         # Save and upload result for verification
         img_data = base64.b64decode(result.data[0].b64_json)
-        tmp_path = f"{rid}.png"
+        # Infer expected format from request parameters
+        expected_ext = get_expected_image_format(req_output_format, req_background)
+        tmp_path = f"{rid}.{expected_ext}"
         with open(tmp_path, "wb") as f:
             f.write(img_data)
         upload_file_to_slack(

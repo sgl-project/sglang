@@ -105,6 +105,35 @@ def is_png(data):
     return data.startswith(b"\x89PNG\r\n\x1a\n")
 
 
+def is_webp(data: bytes) -> bool:
+    # WebP files start with: RIFF....WEBP
+    return data[:4] == b"RIFF" and data[8:12] == b"WEBP"
+
+
+def get_expected_image_format(
+    output_format: str | None = None,
+    background: str | None = None,
+) -> str:
+    """Infer expected image format based on request parameters.
+
+    This replicates the server-side logic in image_api._choose_ext()
+    to determine what format the server will produce.
+
+    Args:
+        output_format: The output_format parameter from the request (png/jpeg/webp/jpg)
+        background: The background parameter from the request (transparent/opaque/auto)
+
+    Returns:
+        Expected file extension: "jpg", "png", or "webp"
+    """
+    fmt = (output_format or "").lower()
+    if fmt in {"png", "webp", "jpeg", "jpg"}:
+        return "jpg" if fmt == "jpeg" else fmt
+    if (background or "auto").lower() == "transparent":
+        return "png"
+    return "jpg"  # Default
+
+
 def wait_for_port(host="127.0.0.1", port=30010, deadline=300.0, interval=0.5):
     end = time.time() + deadline
     last_err = None
@@ -229,20 +258,29 @@ def validate_image_file(
     expected_filename: str,
     expected_width: int | None = None,
     expected_height: int | None = None,
+    output_format: str | None = None,
+    background: str | None = None,
 ) -> None:
-    """Validate image output file: existence, extension, size, filename, dimensions.
+    """Validate image output file: existence, extension, size, filename, format, dimensions.
 
     Args:
         file_path: Path to the image file
-        expected_filename: Expected filename (e.g., "1234567890.png")
+        expected_filename: Expected filename (e.g., "1234567890.jpg")
         expected_width: Expected image width (optional)
         expected_height: Expected image height (optional)
+        output_format: The output_format from request (to infer expected format)
+        background: The background from request (to infer expected format)
     """
+    # Infer expected format from request parameters
+    expected_ext = get_expected_image_format(output_format, background)
+
     # 1. File existence
     assert os.path.exists(file_path), f"Image file does not exist: {file_path}"
 
     # 2. Extension check
-    assert file_path.endswith(".png"), f"Expected .png extension, got: {file_path}"
+    assert file_path.endswith(
+        f".{expected_ext}"
+    ), f"Expected .{expected_ext} extension, got: {file_path}"
 
     # 3. File size > 0
     file_size = os.path.getsize(file_path)
@@ -254,10 +292,15 @@ def validate_image_file(
         actual_filename == expected_filename
     ), f"Filename mismatch: expected '{expected_filename}', got '{actual_filename}'"
 
-    # 5. Image format validation (reuse is_png)
+    # 5. Image format validation (magic bytes check based on expected format)
     with open(file_path, "rb") as f:
-        header = f.read(8)
-        assert is_png(header), f"File is not a valid PNG: {file_path}"
+        header = f.read(12)  # Read enough bytes for webp detection
+        if expected_ext == "png":
+            assert is_png(header), f"File is not a valid PNG: {file_path}"
+        elif expected_ext == "jpg":
+            assert is_jpeg(header), f"File is not a valid JPEG: {file_path}"
+        elif expected_ext == "webp":
+            assert is_webp(header), f"File is not a valid WebP: {file_path}"
 
     # 6. Image dimension validation (reuse PIL)
     if expected_width is not None and expected_height is not None:
