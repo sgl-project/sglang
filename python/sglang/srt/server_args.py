@@ -2098,8 +2098,8 @@ class ServerArgs:
                     "Install via: pip install arctic-inference==0.1.1"
                 )
 
-            if not self.device.startswith("cuda"):
-                raise ValueError("Suffix decoding only supports CUDA device.")
+            if not self.device.startswith("cuda") or not is_npu():
+                raise ValueError("Suffix decoding only supports CUDA device or NPU device.")
 
             if self.max_running_requests is None:
                 self.max_running_requests = 48

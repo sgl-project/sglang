@@ -33,7 +33,7 @@ from sglang.srt.speculative.spec_utils import (
     get_src_tgt_cache_loc,
     get_target_cache_loc,
 )
-from sglang.srt.utils import is_cuda, is_hip, next_power_of_2
+from sglang.srt.utils import is_cuda, is_hip, is_npu, next_power_of_2
 
 if is_cuda():
     from sgl_kernel import (
@@ -42,6 +42,8 @@ if is_cuda():
         tree_speculative_sampling_target_only,
         verify_tree_greedy,
     )
+elif is_npu():
+    from sgl_kernel_npu.sample.verify_tree_greedy import verify_tree_greedy
 elif is_hip():
     from sgl_kernel import verify_tree_greedy
 
@@ -252,9 +254,17 @@ class NgramVerifyInput(SpecInput):
             batch.token_to_kv_pool_allocator.free(to_free_slots)
 
             # Copy the kv cache
-            batch.token_to_kv_pool_allocator.get_kvcache().move_kv_cache(
-                tgt_cache_loc, src_cache_loc
-            )
+            if is_npu:
+                kvcache = batch.token_to_kv_pool_allocator.get_kvcache()
+
+                if getattr(kvcache, "enable_kv_cache_copy", False):
+                    kvcache.move_kv_cache(tgt_cache_loc, src_cache_loc)
+            else:
+                batch.token_to_kv_pool_allocator.get_kvcache().move_kv_cache(
+                    tgt_cache_loc, src_cache_loc
+                )
+
+
             batch.out_cache_loc = tgt_cache_loc
 
         accept_length_list = accept_length_cpu.tolist()
