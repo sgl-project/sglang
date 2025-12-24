@@ -20,7 +20,7 @@ from sglang.test.test_utils import (
     run_logprob_check,
 )
 
-register_cuda_ci(est_time=473, suite="stage-b-test-small-1-gpu")
+register_cuda_ci(est_time=1100, suite="stage-b-test-small-1-gpu")
 
 
 class TestEAGLEServerBasic(EagleServerBase):
@@ -295,9 +295,9 @@ class TestEAGLERetract(TestEAGLEServerBasic):
     @classmethod
     def setUpClass(cls):
         # These config helps find a leak.
-        # FIXME(lsyin): use override context manager
-        envs.SGLANG_CI_SMALL_KV_SIZE.set(4500)
-        with envs.SGLANG_TEST_RETRACT.override(True):
+        with envs.SGLANG_TEST_RETRACT.override(
+            True
+        ), envs.SGLANG_CI_SMALL_KV_SIZE.override(4500):
             super().setUpClass()
 
 
@@ -330,6 +330,21 @@ class TestEAGLEServerPageSizeTopk(TestEAGLEServerBasic):
         "--max-running-requests=8",
         "--page-size=4",
         "--attention-backend=flashinfer",
+    ]
+
+
+class TestEAGLEServerPageSizeTopkFA3(TestEAGLEServerBasic):
+    # default topk=8 and tokens=64
+    spec_topk = 5
+    spec_steps = 8
+    spec_tokens = 64
+
+    extra_args = [
+        "--page-size=256",
+        "--attention-backend=fa3",
+        "--cuda-graph-max-bs=5",
+        "--dtype=float16",
+        "--max-running-requests=8",
     ]
 
 
