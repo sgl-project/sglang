@@ -55,6 +55,22 @@ class RMSNorm(CustomOp):
         x: torch.Tensor,
         residual: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        if get_bool_env_var("SGLANG_FORCE_NATIVE_RMSNORM"):
+            return self.forward_native(x, residual)
+
+        if get_bool_env_var("SGLANG_FORCE_TRITON_RMSNORM"):
+            shape = x.shape
+            x2 = x.reshape(-1, shape[-1])
+            residual2 = None
+            residual_shape = None
+            if residual is not None:
+                residual_shape = residual.shape
+                residual2 = residual.view(-1, shape[-1])
+            out = self.forward_triton(x2, residual2)
+            if residual is None:
+                return out.view(shape)
+            return out[0].view(shape), out[1].view(residual_shape)
+
         shape = x.shape
         x = x.reshape(-1, shape[-1])
         if residual is not None:
@@ -189,6 +205,18 @@ class LayerNorm(CustomOp):
         self,
         x: torch.Tensor,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        if get_bool_env_var("SGLANG_FORCE_TORCH_LAYERNORM"):
+            return F.layer_norm(
+                x,
+                (self.hidden_size,),
+                self.weight,
+                self.bias,
+                self.eps,
+            )
+
+        if get_bool_env_var("SGLANG_FORCE_NATIVE_LAYERNORM"):
+            return self.forward_native(x)
+
         shape = x.shape
         x = x.view(-1, self.hidden_size)
         return self.forward_triton(x).view(shape)
