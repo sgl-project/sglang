@@ -179,3 +179,101 @@ def concat_and_cast_mha_k_triton(
         nope_dim,
         rope_dim,
     )
+
+
+@triton.jit
+def pad_sequence_with_mask_kernel(
+    input_ptr,  # (total_tokens, hidden)
+    offsets_ptr,  # (B,)
+    lengths_ptr,  # (B,)
+    output_ptr,  # (B, max_len, hidden)
+    mask_ptr,  # (B, max_len)
+    max_len,
+    hidden_dim,
+    BLOCK_M: tl.constexpr,  # seq block
+    BLOCK_D: tl.constexpr,  # hidden block
+):
+    b = tl.program_id(0)  # batch index
+    m = tl.program_id(1)  # seq block index
+
+    offset = tl.load(offsets_ptr + b)
+    length = tl.load(lengths_ptr + b)
+
+    seq_ids = m * BLOCK_M + tl.arange(0, BLOCK_M)
+    hid_ids = tl.arange(0, BLOCK_D)
+
+    seq_mask = seq_ids < max_len
+    valid_token = seq_ids < length
+
+    # input index
+    in_token = offset + seq_ids
+    in_ptr = input_ptr + in_token[:, None] * hidden_dim + hid_ids[None, :]
+
+    # output index
+    out_ptr = (
+        output_ptr
+        + b * max_len * hidden_dim
+        + seq_ids[:, None] * hidden_dim
+        + hid_ids[None, :]
+    )
+
+    values = tl.load(
+        in_ptr,
+        mask=valid_token[:, None] & (hid_ids[None, :] < hidden_dim),
+        other=0.0,
+    )
+
+    tl.store(
+        out_ptr,
+        values,
+        mask=seq_mask[:, None] & (hid_ids[None, :] < hidden_dim),
+    )
+
+    # attention mask
+    if tl.program_id(2) == 0:
+        mask_out_ptr = mask_ptr + b * max_len + seq_ids
+        tl.store(mask_out_ptr, valid_token, mask=seq_mask)
+
+
+def pad_sequence_with_mask(
+    input_emb,  # (total_tokens, hidden)
+    offsets,  # (B,)
+    lengths,  # (B,)
+    max_len,
+):
+    B = offsets.shape[0]
+    hidden_dim = input_emb.shape[1]
+
+    output = torch.zeros(
+        (B, max_len, hidden_dim),
+        device=input_emb.device,
+        dtype=input_emb.dtype,
+    )
+    attn_mask = torch.empty(
+        (B * max_len),
+        device=input_emb.device,
+        dtype=torch.bool,
+    )
+
+    BLOCK_M = 32
+    BLOCK_D = triton.next_power_of_2(hidden_dim)
+
+    grid = (
+        B,
+        triton.cdiv(max_len, BLOCK_M),
+        1,
+    )
+
+    pad_sequence_with_mask_kernel[grid](
+        input_emb,
+        offsets,
+        lengths,
+        output,
+        attn_mask,
+        max_len,
+        hidden_dim,
+        BLOCK_M=BLOCK_M,
+        BLOCK_D=BLOCK_D,
+    )
+
+    return B, output, attn_mask

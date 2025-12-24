@@ -25,6 +25,7 @@ from sglang.srt.utils import (
 
 from .fused_moe_triton_config import get_config_dtype_str, try_get_optimal_moe_config
 from .fused_moe_triton_kernels import (
+    act_and_mul_triton,
     invoke_fused_moe_kernel,
     moe_sum_reduce_triton,
     support_tensor_descriptor,
@@ -325,6 +326,7 @@ def fused_experts(
             b1,
             b2,
             moe_runner_config.activation,
+            moe_runner_config.is_gated,
             moe_runner_config.apply_router_weight_on_input,
             use_fp8_w8a8,
             use_int8_w8a8,
@@ -433,6 +435,7 @@ def fused_experts_impl(
         topk_ids.shape[1],
         config_dtype,
         block_shape=block_shape,
+        per_channel_quant=per_channel_quant,
         return_down_config=True,
     )
 
@@ -542,6 +545,7 @@ def fused_experts_impl(
             c_sorted=down_moe_use_tma,
             filter_expert=filter_expert,
         )
+
         # Activation function with multiplication
         if activation == "silu" and is_gated:
             if gemm1_alpha is not None:
@@ -551,8 +555,19 @@ def fused_experts_impl(
                     gemm1_alpha,
                     gemm1_limit,
                 )
-            elif _is_cuda or _is_hip:
-                silu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
+            elif _is_hip or _is_cuda:
+                if not filter_expert:
+                    silu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
+                else:
+                    act_and_mul_triton(
+                        intermediate_cache1.view(-1, N),
+                        intermediate_cache2,
+                        config,
+                        topk_ids,
+                        expert_ids,
+                        down_moe_use_tma,
+                        activation,
+                    )
             else:
                 vllm_ops.silu_and_mul(
                     intermediate_cache2, intermediate_cache1.view(-1, N)
@@ -560,8 +575,19 @@ def fused_experts_impl(
         elif activation == "gelu" and is_gated:
             assert gemm1_alpha is None, "gemm1_alpha is not supported for gelu"
             assert gemm1_limit is None, "gemm1_limit is not supported for gelu"
-            if _is_cuda or _is_hip:
-                gelu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
+            if _is_hip or _is_cuda:
+                if not filter_expert:
+                    gelu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
+                else:
+                    act_and_mul_triton(
+                        intermediate_cache1.view(-1, N),
+                        intermediate_cache2,
+                        config,
+                        topk_ids,
+                        expert_ids,
+                        down_moe_use_tma,
+                        activation,
+                    )
             else:
                 vllm_ops.gelu_and_mul(
                     intermediate_cache2, intermediate_cache1.view(-1, N)

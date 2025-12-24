@@ -14,7 +14,6 @@ from sglang.test.test_utils import (
 )
 
 
-@unittest.skip("See https://github.com/sgl-project/sglang/issues/12533")
 class TestDeepseekR1Nvfp4CuteDSLDeepEP(CustomTestCase):
     @classmethod
     def setUpClass(cls):
@@ -24,7 +23,7 @@ class TestDeepseekR1Nvfp4CuteDSLDeepEP(CustomTestCase):
             "--trust-remote-code",
             "--disable-radix-cache",
             "--mem-fraction-static",
-            "0.89",
+            "0.8",
             "--max-prefill-tokens",
             "16384",
             "--max-running-requests",
@@ -60,7 +59,7 @@ class TestDeepseekR1Nvfp4CuteDSLDeepEP(CustomTestCase):
                 **os.environ,
                 "SGLANG_DEEPEP_BF16_DISPATCH": "1",
                 "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "256",
-                "SGLANG_CUTEDSL_MOE_NVFP4_DISPATCH": "0",
+                "SGLANG_MOE_NVFP4_DISPATCH": "0",
             },
         )
 
@@ -136,7 +135,7 @@ class TestDummyWithSBO(CustomTestCase):
                 **os.environ,
                 "SGLANG_DEEPEP_BF16_DISPATCH": "1",
                 "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "256",
-                "SGLANG_CUTEDSL_MOE_NVFP4_DISPATCH": "0",
+                "SGLANG_MOE_NVFP4_DISPATCH": "0",
             },
         )
 

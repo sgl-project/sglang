@@ -11,6 +11,7 @@ in a functional manner, reducing the need for explicit parameter passing.
 
 from __future__ import annotations
 
+import os
 import pprint
 from dataclasses import asdict, dataclass, field
 from typing import TYPE_CHECKING, Any, Optional
@@ -18,17 +19,21 @@ from typing import TYPE_CHECKING, Any, Optional
 import PIL.Image
 import torch
 
-from sglang.multimodal_gen.configs.sample.base import DataType
+from sglang.multimodal_gen.configs.sample.sampling_params import DataType
 from sglang.multimodal_gen.configs.sample.teacache import (
     TeaCacheParams,
     WanTeaCacheParams,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.utils import align_to
 
 if TYPE_CHECKING:
-    from torchcodec.decoders import VideoDecoder
 
     from sglang.multimodal_gen.runtime.utils.perf_logger import RequestTimings
+
+
+logger = init_logger(__name__)
 
 
 @dataclass
@@ -51,10 +56,13 @@ class Req:
     generator: torch.Generator | list[torch.Generator] | None = None
 
     # Image inputs
-    image_path: str | None = None
+    image_path: str | list[str] | None = None
     # Image encoder hidden states
     image_embeds: list[torch.Tensor] = field(default_factory=list)
-    pil_image: torch.Tensor | PIL.Image.Image | None = None
+
+    original_condition_image_size: tuple[int, int] = None
+    condition_image: torch.Tensor | PIL.Image.Image | None = None
+    vae_image: torch.Tensor | PIL.Image.Image | None = None
     pixel_values: torch.Tensor | PIL.Image.Image | None = None
     preprocessed_image: torch.Tensor | None = None
 
@@ -86,15 +94,23 @@ class Req:
     num_outputs_per_prompt: int = 1
     seed: int | None = None
     seeds: list[int] | None = None
+    generator_device: str = (
+        "cuda"  # Device for random generator: "cuda", "musa" or "cpu"
+    )
 
     # Tracking if embeddings are already processed
     is_prompt_processed: bool = False
 
     # Latent tensors
     latents: torch.Tensor | None = None
+    # Flux-2
+    latent_ids: torch.Tensor | None = None
+
     raw_latent_shape: torch.Tensor | None = None
     noise_pred: torch.Tensor | None = None
-    image_latent: torch.Tensor | None = None
+    # vae-encoded condition image
+    image_latent: torch.Tensor | list[torch.Tensor] | None = None
+    condition_image_latent_ids: torch.Tensor | list[torch.Tensor] | None = None
 
     # Latent dimensions
     height_latents: list[int] | int | None = None
@@ -118,7 +134,10 @@ class Req:
     boundary_ratio: float | None = None
 
     # Scheduler parameters
-    num_inference_steps: int = 50
+    # Can be overridden via SGLANG_TEST_NUM_INFERENCE_STEPS env var for faster testing
+    num_inference_steps: int = int(
+        os.environ.get("SGLANG_TEST_NUM_INFERENCE_STEPS", "50")
+    )
     guidance_scale: float = 1.0
     guidance_scale_2: float | None = None
     guidance_rescale: float = 0.0
@@ -163,7 +182,8 @@ class Req:
 
     # profile
     profile: bool = False
-    num_profiled_timesteps: int = 8
+    profile_all_stages: bool = False
+    num_profiled_timesteps: int = None
 
     # debugging
     debug: bool = False
@@ -187,6 +207,18 @@ class Req:
         batch_size *= self.num_outputs_per_prompt
         return batch_size
 
+    def output_file_path(self, num_outputs=1, output_idx=None):
+        output_file_name = self.output_file_name
+        if num_outputs > 1 and output_file_name:
+            base, ext = os.path.splitext(output_file_name)
+            output_file_name = f"{base}_{output_idx}{ext}"
+
+        return (
+            os.path.join(self.output_path, output_file_name)
+            if output_file_name
+            else None
+        )
+
     def __post_init__(self):
         """Initialize dependent fields after dataclass initialization."""
         # Set do_classifier_free_guidance based on guidance scale and negative prompt
@@ -197,19 +229,42 @@ class Req:
         if self.guidance_scale_2 is None:
             self.guidance_scale_2 = self.guidance_scale
 
-    def set_width_and_height(self, server_args: ServerArgs):
-        if self.height is None or self.width is None:
-            width, height = server_args.pipeline_config.adjust_size(
-                self.width, self.height, self.pil_image
-            )
-            self.width = width
-            self.height = height
-        if self.height is None or self.width is None:
-            self.width = 1280
-            self.height = 720
+    def adjust_size(self, server_args: ServerArgs):
+        pass
 
     def __str__(self):
         return pprint.pformat(asdict(self), indent=2, width=120)
+
+    def log(self, server_args: ServerArgs):
+        # TODO: in some cases (e.g., TI2I), height and weight might be undecided at this moment
+        if self.height:
+            target_height = align_to(self.height, 16)
+        else:
+            target_height = -1
+        if self.width:
+            target_width = align_to(self.width, 16)
+        else:
+            target_width = -1
+
+        # Log sampling parameters
+        debug_str = f"""Sampling params:
+                       width: {target_width}
+                      height: {target_height}
+                  num_frames: {self.num_frames}
+                      prompt: {self.prompt}
+                  neg_prompt: {self.negative_prompt}
+                        seed: {self.seed}
+                 infer_steps: {self.num_inference_steps}
+      num_outputs_per_prompt: {self.num_outputs_per_prompt}
+              guidance_scale: {self.guidance_scale}
+     embedded_guidance_scale: {server_args.pipeline_config.embedded_cfg_scale}
+                    n_tokens: {self.n_tokens}
+                  flow_shift: {server_args.pipeline_config.flow_shift}
+                  image_path: {self.image_path}
+                 save_output: {self.save_output}
+            output_file_path: {self.output_file_path()}
+        """  # type: ignore[attr-defined]
+        logger.info(debug_str)
 
 
 @dataclass
@@ -226,9 +281,4 @@ class OutputBatch:
 
     # logged timings info, directly from Req.timings
     timings: Optional["RequestTimings"] = None
-
-
-@dataclass
-class PreprocessBatch(Req):
-    video_loader: list["VideoDecoder"] | list[str] = field(default_factory=list)
-    video_file_name: list[str] = field(default_factory=list)
+    peak_memory_mb: float = 0.0

@@ -3,7 +3,7 @@
 import unittest
 from pathlib import Path
 
-from sglang.multimodal_gen.configs.sample.base import DataType
+from sglang.multimodal_gen.configs.sample.sampling_params import DataType
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.test.test_utils import TestGenerateBase
 
@@ -15,8 +15,15 @@ class TestFlux_T2V(TestGenerateBase):
     extra_args = []
     data_type: DataType = DataType.IMAGE
     thresholds = {
-        "test_single_gpu": 6.90 * 1.05,
+        "test_single_gpu": 6.5 * 1.05,
+        "test_usp": 8.3 * 1.05,
     }
+
+    def test_cfg_parallel(self):
+        pass
+
+    def test_mixed(self):
+        pass
 
 
 class TestQwenImage(TestGenerateBase):
@@ -24,8 +31,15 @@ class TestQwenImage(TestGenerateBase):
     extra_args = []
     data_type: DataType = DataType.IMAGE
     thresholds = {
-        "test_single_gpu": 11.7 * 1.05,
+        "test_single_gpu": 10.4 * 1.05,
+        "test_usp": 20.2 * 1.05,
     }
+
+    def test_cfg_parallel(self):
+        pass
+
+    def test_mixed(self):
+        pass
 
 
 class TestQwenImageEdit(TestGenerateBase):
@@ -33,7 +47,8 @@ class TestQwenImageEdit(TestGenerateBase):
     extra_args = []
     data_type: DataType = DataType.IMAGE
     thresholds = {
-        "test_single_gpu": 43.5 * 1.05,
+        "test_single_gpu": 33.4 * 1.05,
+        "test_usp": 26.9 * 1.05,
     }
 
     prompt: str | None = (
@@ -57,13 +72,59 @@ class TestQwenImageEdit(TestGenerateBase):
             f"--output-path={self.output_path}",
         ] + [f"--image-path={img_path}"]
 
-    def test_single_gpu(self):
-        self._run_test(
-            name=f"{self.model_name()}_single_gpu",
-            args=None,
-            model_path=self.model_path,
-            test_key="test_single_gpu",
-        )
+    def test_cfg_parallel(self):
+        pass
+
+    def test_mixed(self):
+        pass
+
+
+class TestQwenImageEditPlusMultiImageURL(TestGenerateBase):
+    """CLI-level test for multi-image URL input with Qwen-Image-Edit."""
+
+    model_path = "Qwen/Qwen-Image-Edit-2509"
+    extra_args = []
+    data_type: DataType = DataType.IMAGE
+
+    thresholds = {
+        "test_single_gpu": 33.4 * 1.05,
+    }
+
+    prompt: str | None = (
+        "The magician bear is on the left, the alchemist bear is on the right, facing each other in the central park square."
+    )
+
+    def setUp(self):
+        super().setUp()
+
+        img_urls = [
+            "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-Image/edit2509/edit2509_1.jpg",
+            "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-Image/edit2509/edit2509_2.jpg",
+        ]
+
+        self.base_command = [
+            "sglang",
+            "generate",
+            "--text-encoder-cpu-offload",
+            "--pin-cpu-memory",
+            "--prompt",
+            f"{self.prompt}",
+            "--save-output",
+            "--log-level=debug",
+            f"--width={self.width}",
+            f"--height={self.height}",
+            f"--output-path={self.output_path}",
+        ]
+        self.base_command += [
+            "--image-path",
+            *img_urls,
+        ]
+
+    def test_cfg_parallel(self):
+        pass
+
+    def test_mixed(self):
+        pass
 
 
 if __name__ == "__main__":

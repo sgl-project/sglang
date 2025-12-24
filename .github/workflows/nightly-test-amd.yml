@@ -9,18 +9,47 @@ on:
     paths:
       - "python/sglang/version.py"
   workflow_dispatch:
+    inputs:
+      job_filter:
+        description: 'Select which job to run (leave empty or "all" to run all jobs)'
+        required: false
+        type: choice
+        default: 'all'
+        options:
+          - 'all'
+          - 'nightly-test-2-gpu'
+          - 'nightly-test-2-gpu-vlm'
+          - 'nightly-test-8-gpu-gpt-oss'
+          - 'nightly-test-8-gpu-grok'
+          - 'nightly-test-8-gpu-deepseek-r1'
+          - 'nightly-test-8-gpu-deepseek-v3-dp'
+          - 'nightly-test-8-gpu-deepseek-v3-tc'
+          - 'nightly-test-8-gpu-deepseek-v3-mtp'
+          - 'nightly-perf-8-gpu-grok'
+          - 'nightly-perf-8-gpu-deepseek-v3'
+          - 'nightly-perf-8-gpu-deepseek-v31'
+  workflow_call:
+    inputs:
+      ref:
+        description: 'Git ref (branch, tag, or SHA) to test. If not provided, uses the default branch.'
+        required: false
+        type: string
+        default: ''
+      job_filter:
+        description: 'Select which job to run (leave empty or "all" to run all jobs)'
+        required: false
+        type: string
+        default: 'all'
 
 concurrency:
   group: nightly-test-amd-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  nightly-test:
-    if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
-    strategy:
-      matrix:
-        runner: [linux-mi300-gpu-2, linux-mi325-gpu-2-nightly]
-    runs-on: ${{matrix.runner}}
+  # 2-GPU tests (TP=2)
+  nightly-test-2-gpu:
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-test-2-gpu')
+    runs-on: linux-mi325-gpu-2
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -35,15 +64,270 @@ jobs:
       - name: Install dependencies
         run: bash scripts/ci/amd_ci_install_dependency.sh
 
-      - name: Nightly Test
+      - name: Nightly Test (2-GPU)
         run: |
-          bash scripts/ci/amd_ci_exec.sh -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" python3 run_suite.py --suite nightly-amd --timeout-per-file 7200
-          echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY
+          bash scripts/ci/amd_ci_exec.sh -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" python3 run_suite.py --suite nightly-amd --timeout-per-file 7200 || TEST_EXIT_CODE=$?
+          echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
+          exit ${TEST_EXIT_CODE:-0}
+
+  # 2-GPU VLM tests - Vision-Language Models MMMU evaluation
+  nightly-test-2-gpu-vlm:
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-test-2-gpu-vlm')
+    runs-on: linux-mi325-gpu-2
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup docker
+        run: |
+          touch github_summary.md
+          bash scripts/ci/amd_ci_start_container.sh
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+
+      - name: Install dependencies
+        run: bash scripts/ci/amd_ci_install_dependency.sh
+
+      - name: Nightly Test (2-GPU VLM MMMU)
+        timeout-minutes: 180
+        run: |
+          bash scripts/ci/amd_ci_exec.sh -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" python3 run_suite.py --suite nightly-amd-vlm --timeout-per-file 7200 || TEST_EXIT_CODE=$?
+          echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
+          exit ${TEST_EXIT_CODE:-0}
+
+  # 8-GPU tests (TP=8) - GPT-OSS models
+  nightly-test-8-gpu-gpt-oss:
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-test-8-gpu-gpt-oss')
+    runs-on: linux-mi325-gpu-8
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup docker
+        run: |
+          touch github_summary.md
+          bash scripts/ci/amd_ci_start_container.sh
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+
+      - name: Install dependencies
+        run: bash scripts/ci/amd_ci_install_dependency.sh
+
+      - name: Nightly Test (8-GPU GPT-OSS)
+        run: |
+          bash scripts/ci/amd_ci_exec.sh -e AMD_TEST_MODEL_GROUP=gpt-oss -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" python3 run_suite.py --suite nightly-amd-8-gpu --timeout-per-file 7200 || TEST_EXIT_CODE=$?
+          echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
+          exit ${TEST_EXIT_CODE:-0}
+
+  # 8-GPU tests (TP=8) - GROK models (GROK1-FP8, GROK1-IN4, GROK2.5)
+  nightly-test-8-gpu-grok:
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-test-8-gpu-grok')
+    runs-on: linux-mi325-gpu-8
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup docker
+        run: |
+          touch github_summary.md
+          bash scripts/ci/amd_ci_start_container.sh
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+
+      - name: Install dependencies
+        run: bash scripts/ci/amd_ci_install_dependency.sh
+
+      - name: Nightly Test (8-GPU GROK)
+        run: |
+          bash scripts/ci/amd_ci_exec.sh -e AMD_TEST_MODEL_GROUP=grok -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" python3 run_suite.py --suite nightly-amd-8-gpu --timeout-per-file 7200 || TEST_EXIT_CODE=$?
+          echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
+          exit ${TEST_EXIT_CODE:-0}
+
+  # 8-GPU tests (TP=8) - DeepSeek-R1 (reasoning model)
+  nightly-test-8-gpu-deepseek-r1:
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-test-8-gpu-deepseek-r1')
+    runs-on: linux-mi325-gpu-8
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup docker
+        run: |
+          touch github_summary.md
+          bash scripts/ci/amd_ci_start_container.sh
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+
+      - name: Install dependencies
+        run: bash scripts/ci/amd_ci_install_dependency.sh
+
+      - name: Nightly Test (8-GPU DeepSeek-R1)
+        run: |
+          bash scripts/ci/amd_ci_exec.sh -e AMD_TEST_MODEL_GROUP=deepseek-r1 -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" python3 run_suite.py --suite nightly-amd-8-gpu --timeout-per-file 7200 || TEST_EXIT_CODE=$?
+          echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
+          exit ${TEST_EXIT_CODE:-0}
+
+  # 8-GPU tests (TP=8) - DeepSeek-V3 + DP Attention (requires ROCm 7.0+)
+  nightly-test-8-gpu-deepseek-v3-dp:
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-test-8-gpu-deepseek-v3-dp')
+    runs-on: linux-mi325-gpu-8
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup docker
+        run: |
+          touch github_summary.md
+          bash scripts/ci/amd_ci_start_container.sh
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+
+      - name: Install dependencies
+        run: bash scripts/ci/amd_ci_install_dependency.sh
+
+      - name: Nightly Test (8-GPU DeepSeek-V3 + DP Attention)
+        run: |
+          bash scripts/ci/amd_ci_exec.sh -e AMD_TEST_MODEL_GROUP=deepseek-v3-dp -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" python3 run_suite.py --suite nightly-amd-8-gpu --timeout-per-file 7200 || TEST_EXIT_CODE=$?
+          echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
+          exit ${TEST_EXIT_CODE:-0}
+
+  # 8-GPU tests (TP=8) - DeepSeek-V3 + Torch Compile (requires ROCm 7.0+)
+  nightly-test-8-gpu-deepseek-v3-tc:
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-test-8-gpu-deepseek-v3-tc')
+    runs-on: linux-mi325-gpu-8
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup docker
+        run: |
+          touch github_summary.md
+          bash scripts/ci/amd_ci_start_container.sh
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+
+      - name: Install dependencies
+        run: bash scripts/ci/amd_ci_install_dependency.sh
+
+      - name: Nightly Test (8-GPU DeepSeek-V3 + Torch Compile)
+        run: |
+          bash scripts/ci/amd_ci_exec.sh -e AMD_TEST_MODEL_GROUP=deepseek-v3-tc -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" python3 run_suite.py --suite nightly-amd-8-gpu --timeout-per-file 7200 || TEST_EXIT_CODE=$?
+          echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
+          exit ${TEST_EXIT_CODE:-0}
+
+  # 8-GPU tests (TP=8) - DeepSeek-V3 + MTP/EAGLE (requires ROCm 7.0+)
+  nightly-test-8-gpu-deepseek-v3-mtp:
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-test-8-gpu-deepseek-v3-mtp')
+    runs-on: linux-mi325-gpu-8
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup docker
+        run: |
+          touch github_summary.md
+          bash scripts/ci/amd_ci_start_container.sh
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+
+      - name: Install dependencies
+        run: bash scripts/ci/amd_ci_install_dependency.sh
+
+      - name: Nightly Test (8-GPU DeepSeek-V3 + MTP)
+        run: |
+          bash scripts/ci/amd_ci_exec.sh -e AMD_TEST_MODEL_GROUP=deepseek-v3-mtp -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" python3 run_suite.py --suite nightly-amd-8-gpu --timeout-per-file 7200 || TEST_EXIT_CODE=$?
+          echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
+          exit ${TEST_EXIT_CODE:-0}
+
+  # 8-GPU Performance Tests (TP=8) - Grok (Grok-1 + Grok-2) performance benchmarks
+  nightly-perf-8-gpu-grok:
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-perf-8-gpu-grok')
+    runs-on: linux-mi325-gpu-8
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup docker
+        run: |
+          touch github_summary.md
+          bash scripts/ci/amd_ci_start_container.sh
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+
+      - name: Install dependencies
+        run: bash scripts/ci/amd_ci_install_dependency.sh
+
+      - name: Nightly Perf Test (8-GPU Grok-1 + Grok-2)
+        timeout-minutes: 60
+        run: |
+          bash scripts/ci/amd_ci_exec.sh -w /sglang-checkout/test -e RCCL_MSCCL_ENABLE=0 -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" python3 registered/test_grok_perf.py || TEST_EXIT_CODE=$?
+          echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
+          exit ${TEST_EXIT_CODE:-0}
+
+  # 8-GPU Performance Tests (TP=8) - DeepSeek-V3 performance benchmarks
+  nightly-perf-8-gpu-deepseek-v3:
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-perf-8-gpu-deepseek-v3')
+    runs-on: linux-mi325-gpu-8
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup docker
+        run: |
+          touch github_summary.md
+          bash scripts/ci/amd_ci_start_container.sh
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+
+      - name: Install dependencies
+        run: bash scripts/ci/amd_ci_install_dependency.sh
+
+      - name: Nightly Perf Test (8-GPU DeepSeek-V3)
+        timeout-minutes: 300
+        run: |
+          bash scripts/ci/amd_ci_exec.sh -w /sglang-checkout/test -e SGLANG_USE_ROCM700A=1 -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" python3 registered/test_deepseek_v3_perf.py || TEST_EXIT_CODE=$?
+          echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
+          exit ${TEST_EXIT_CODE:-0}
+
+  # 8-GPU Performance Tests (TP=8) - DeepSeek-V3.1 performance benchmarks
+  nightly-perf-8-gpu-deepseek-v31:
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-perf-8-gpu-deepseek-v31')
+    runs-on: linux-mi325-gpu-8
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup docker
+        run: |
+          touch github_summary.md
+          bash scripts/ci/amd_ci_start_container.sh
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+
+      - name: Install dependencies
+        run: bash scripts/ci/amd_ci_install_dependency.sh
+
+      - name: Nightly Perf Test (8-GPU DeepSeek-V3.1)
+        timeout-minutes: 300
+        run: |
+          bash scripts/ci/amd_ci_exec.sh -w /sglang-checkout/test -e SGLANG_USE_ROCM700A=1 -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" python3 registered/test_deepseek_v31_perf.py || TEST_EXIT_CODE=$?
+          echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
+          exit ${TEST_EXIT_CODE:-0}
 
   check-all-jobs:
     if: always() && (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
     needs:
-      - nightly-test
+      - nightly-test-2-gpu
+      - nightly-test-2-gpu-vlm
+      - nightly-test-8-gpu-gpt-oss
+      - nightly-test-8-gpu-grok
+      - nightly-test-8-gpu-deepseek-v3-dp
+      - nightly-test-8-gpu-deepseek-v3-tc
+      - nightly-test-8-gpu-deepseek-v3-mtp
+      - nightly-test-8-gpu-deepseek-r1
+      - nightly-perf-8-gpu-grok
+      - nightly-perf-8-gpu-deepseek-v3
+      - nightly-perf-8-gpu-deepseek-v31
     runs-on: ubuntu-latest
     steps:
       - name: Check if any job failed

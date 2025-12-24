@@ -21,12 +21,13 @@ import threading
 import time
 from collections import deque
 from enum import Enum, auto
-from typing import List, Optional
+from typing import Callable, List, Optional
 
 import psutil
 import setproctitle
 import zmq
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.managers.io_struct import (
     BlockReqInput,
@@ -49,6 +50,7 @@ from sglang.srt.tracing.trace import (
     trace_slice_end,
     trace_slice_start,
 )
+from sglang.srt.utils import numa_utils
 from sglang.srt.utils.common import (
     bind_port,
     configure_ipv6,
@@ -58,6 +60,7 @@ from sglang.srt.utils.common import (
     maybe_reindex_device_id,
 )
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
+from sglang.srt.utils.watchdog import Watchdog
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 
 logger = logging.getLogger(__name__)
@@ -67,6 +70,7 @@ class LoadBalanceMethod(Enum):
     """Load balance method."""
 
     ROUND_ROBIN = auto()
+    DECODE_ROUND_ROBIN = auto()
     SHORTEST_QUEUE = auto()
     MINIMUM_TOKENS = auto()
 
@@ -118,14 +122,19 @@ class DPBudget:
 class DataParallelController:
     """A controller that dispatches requests to multiple data parallel workers."""
 
-    def __init__(self, server_args: ServerArgs, port_args: PortArgs) -> None:
+    def __init__(
+        self,
+        server_args: ServerArgs,
+        port_args: PortArgs,
+        run_scheduler_process_func: Callable,
+    ) -> None:
         # Parse args
         self.server_args = server_args
         self.port_args = port_args
         self.load_balance_method = LoadBalanceMethod.from_str(
             server_args.load_balance_method
         )
-        self.run_scheduler_process = run_scheduler_process
+        self.run_scheduler_process_func = run_scheduler_process_func
 
         # For DP balance
         self.global_balance_id = 0
@@ -141,6 +150,7 @@ class DataParallelController:
         self.round_robin_counter = 0
         dispatch_lookup = {
             LoadBalanceMethod.ROUND_ROBIN: self.round_robin_scheduler,
+            LoadBalanceMethod.DECODE_ROUND_ROBIN: self.decode_round_robin_scheduler,
             LoadBalanceMethod.SHORTEST_QUEUE: self.shortest_queue_scheduler,
             LoadBalanceMethod.MINIMUM_TOKENS: self.minimum_tokens_scheduler,
         }
@@ -164,6 +174,13 @@ class DataParallelController:
             self.control_message_step = 1
 
         self.init_dispatcher()
+
+        self.watchdog = Watchdog.create(
+            debug_name="DataParallelController",
+            watchdog_timeout=server_args.soft_watchdog_timeout,
+            soft=True,
+            test_stuck_time=envs.SGLANG_TEST_STUCK_DP_CONTROLLER.get(),
+        )
 
     def send_to_all_workers(self, obj):
         for worker in self.workers:
@@ -428,7 +445,7 @@ class DataParallelController:
                 moe_ep_rank = tp_rank // (server_args.tp_size // server_args.ep_size)
                 with self.env_lock, maybe_reindex_device_id(gpu_id) as gpu_id:
                     proc = mp.Process(
-                        target=self.run_scheduler_process,
+                        target=self.run_scheduler_process_func,
                         args=(
                             server_args,
                             rank_port_args,
@@ -440,7 +457,9 @@ class DataParallelController:
                             writer,
                         ),
                     )
-                    with memory_saver_adapter.configure_subprocess():
+                    with memory_saver_adapter.configure_subprocess(), numa_utils.configure_subprocess(
+                        server_args, gpu_id
+                    ):
                         proc.start()
                 self.scheduler_procs.append(proc)
                 scheduler_pipe_readers.append(reader)
@@ -470,10 +489,32 @@ class DataParallelController:
                 self.workers
             )
         else:
+            # Set default bootstrap_room if in FAKE auto mode and room is None
+            if (
+                req.bootstrap_room is None
+                and self.server_args.disaggregation_decode_enable_fake_auto
+            ):
+                req.bootstrap_room = self.round_robin_counter
+                self.round_robin_counter = (self.round_robin_counter + 1) % len(
+                    self.workers
+                )
+
             assert (
                 req.bootstrap_room is not None
             ), "req.bootstrap_room should not be None. Do not send requests directly to prefill or decode instances, but send to the router instead."
             self.workers[req.bootstrap_room % len(self.workers)].send_pyobj(req)
+
+    def decode_round_robin_scheduler(self, req: Req):
+        if self.maybe_external_dp_rank_routing(req):
+            return
+
+        if self.server_args.disaggregation_mode == "decode":
+            self.workers[self.round_robin_counter].send_pyobj(req)
+            self.round_robin_counter = (self.round_robin_counter + 1) % len(
+                self.workers
+            )
+            return
+        self.round_robin_scheduler(req)
 
     def shortest_queue_scheduler(self, req):
         if self.maybe_external_dp_rank_routing(req):
@@ -497,6 +538,7 @@ class DataParallelController:
     def event_loop(self):
         while True:
             while True:
+                self.watchdog.feed()
                 try:
                     recv_req = self.recv_from_tokenizer.recv_pyobj(zmq.NOBLOCK)
                 except zmq.ZMQError:
@@ -508,7 +550,7 @@ def run_data_parallel_controller_process(
     server_args: ServerArgs,
     port_args: PortArgs,
     pipe_writer,
-    data_parallel_controller_class=DataParallelController,
+    run_scheduler_process_func: Callable = run_scheduler_process,
 ):
     setproctitle.setproctitle("sglang::data_parallel_controller")
     faulthandler.enable()
@@ -526,7 +568,9 @@ def run_data_parallel_controller_process(
         trace_set_thread_info(thread_label)
 
     try:
-        controller = data_parallel_controller_class(server_args, port_args)
+        controller = DataParallelController(
+            server_args, port_args, run_scheduler_process_func
+        )
         pipe_writer.send(
             {
                 "status": "ready",

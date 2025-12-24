@@ -1,0 +1,54 @@
+package sgl:model-gateway;
+
+interface middleware-types {
+  record header { name: string, value: string }
+
+  // onRequest
+  record request {
+    method: string,
+    path: string,
+    query: string,
+    headers: list<header>,
+    body: list<u8>,
+    request-id: string,
+    now-epoch-ms: u64,
+  }
+
+  // onResponse
+  record response {
+    status: u16,
+    headers: list<header>,
+    body: list<u8>,
+  }
+
+  // modify action
+  record modify-action {
+    status: option<u16>,
+    headers-set: list<header>,
+    headers-add: list<header>,
+    headers-remove: list<string>,
+    body-replace: option<list<u8>>,
+  }
+
+  // return actions
+  variant action {
+    continue,
+    reject(u16), // status code
+    modify(modify-action),
+  }
+}
+
+interface middleware-on-request {
+  use middleware-types.{request, action};
+  on-request: func(req: request) -> action;
+}
+
+interface middleware-on-response {
+  use middleware-types.{response, action};
+  on-response: func(resp: response) -> action;
+}
+
+world sgl-model-gateway {
+  export middleware-on-request;
+  export middleware-on-response;
+}

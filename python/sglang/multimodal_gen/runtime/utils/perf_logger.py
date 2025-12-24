@@ -1,7 +1,6 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 import dataclasses
 import json
-import logging
 import os
 import subprocess
 import sys
@@ -15,7 +14,13 @@ from dateutil.tz import UTC
 
 import sglang
 import sglang.multimodal_gen.envs as envs
-from sglang.multimodal_gen.runtime.utils.logging_utils import _SGLDiffusionLogger
+from sglang.multimodal_gen.runtime.utils.logging_utils import (
+    _SGLDiffusionLogger,
+    get_is_main_process,
+    init_logger,
+)
+
+logger = init_logger(__name__)
 
 
 @dataclasses.dataclass
@@ -163,7 +168,7 @@ class StageProfiler:
 
         if self.simple_log:
             self.logger.info(
-                f"[{self.stage_name}] finished in {execution_time_s:.4f} seconds"
+                f"[{self.stage_name}] finished in {execution_time_s:.4f} seconds",
             )
 
         if self.metrics_enabled and self.timings:
@@ -202,6 +207,11 @@ class PerformanceLogger:
             for name, duration_ms in timings.stages.items()
         ]
 
+        denoise_steps_ms = [
+            {"step": idx, "duration_ms": duration_ms}
+            for idx, duration_ms in enumerate(timings.steps)
+        ]
+
         report = {
             "timestamp": datetime.now(UTC).isoformat(),
             "request_id": timings.request_id,
@@ -209,6 +219,7 @@ class PerformanceLogger:
             "tag": tag,
             "total_duration_ms": timings.total_duration_ms,
             "steps": formatted_steps,
+            "denoise_steps_ms": denoise_steps_ms,
             "meta": meta or {},
         }
 
@@ -217,10 +228,9 @@ class PerformanceLogger:
             os.makedirs(os.path.dirname(abs_path), exist_ok=True)
             with open(abs_path, "w", encoding="utf-8") as f:
                 json.dump(report, f, indent=2)
-            print(f"[Performance] Metrics dumped to: {abs_path}")
+            logger.info(f"[Performance] Metrics dumped to: {abs_path}")
         except IOError as e:
-            print(f"[Performance] Failed to dump metrics to {abs_path}: {e}")
-            logging.getLogger(__name__).error(f"Dump failed: {e}")
+            logger.error(f"[Performance] Failed to dump metrics to {abs_path}: {e}")
 
     @classmethod
     def log_request_summary(
@@ -246,14 +256,15 @@ class PerformanceLogger:
         )
 
         try:
-            log_dir = get_diffusion_perf_log_dir()
-            if not os.path.exists(log_dir):
-                os.makedirs(log_dir, exist_ok=True)
+            if get_is_main_process():
+                log_dir = get_diffusion_perf_log_dir()
+                if not os.path.exists(log_dir):
+                    os.makedirs(log_dir, exist_ok=True)
 
-            log_file = os.path.join(log_dir, "performance.log")
+                log_file = os.path.join(log_dir, "performance.log")
 
-            with open(log_file, "a", encoding="utf-8") as f:
-                f.write(json.dumps(dataclasses.asdict(record)) + "\n")
+                with open(log_file, "a", encoding="utf-8") as f:
+                    f.write(json.dumps(dataclasses.asdict(record)) + "\n")
 
         except (OSError, PermissionError) as e:
             print(f"WARNING: Failed to log performance record: {e}", file=sys.stderr)

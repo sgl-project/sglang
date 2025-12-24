@@ -116,7 +116,7 @@ def maybe_load_fsdp_model(
             hsdp_shard_dim = 1
 
         device_mesh = init_device_mesh(
-            "cuda",
+            current_platform.device_type,
             # (Replicate(), Shard(dim=0))
             mesh_shape=(hsdp_replicate_dim, hsdp_shard_dim),
             mesh_dim_names=("replicate", "shard"),
@@ -269,7 +269,7 @@ def load_model_from_full_model_state_dict(
                 meta_sharded_param.placements,
             )
             if cpu_offload:
-                sharded_tensor = sharded_tensor.cpu()
+                sharded_tensor = sharded_tensor.to("cpu")
         sharded_sd[target_param_name] = nn.Parameter(sharded_tensor)
 
     model.reverse_param_names_mapping = reverse_param_names_mapping

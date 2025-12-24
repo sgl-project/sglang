@@ -117,6 +117,18 @@ find_latest_image() {
     fi
   done
 
+  # If still not found, try finding any image matching ROCm+arch from remote registry
+  echo "Exact version not found. Searching remote registry for any ${ROCM_VERSION}-${gpu_arch} image…" >&2
+  for days_back in {0..6}; do
+    local target_date=$(date -d "${days_back} days ago" +%Y%m%d)
+    local remote_tags=$(curl -s "https://registry.hub.docker.com/v2/repositories/rocm/sgl-dev/tags?page_size=100&name=${ROCM_VERSION}-${gpu_arch}-${target_date}" 2>/dev/null | grep -o '"name":"[^"]*"' | cut -d'"' -f4 | head -n 1)
+    if [[ -n "$remote_tags" ]]; then
+      echo "Found available image: rocm/sgl-dev:${remote_tags}" >&2
+      echo "rocm/sgl-dev:${remote_tags}"
+      return 0
+    fi
+  done
+
   echo "No recent images found. Searching any cached local images matching ROCm+arch…" >&2
   local any_local
   any_local=$(docker images --format '{{.Repository}}:{{.Tag}}' --filter "reference=rocm/sgl-dev:*${ROCM_VERSION}*${gpu_arch}*" | sort -r | head -n 1)
@@ -151,11 +163,15 @@ echo "Launching container: ci_sglang"
 docker run -dt --user root --device=/dev/kfd ${DEVICE_FLAG} \
   -v "${GITHUB_WORKSPACE:-$PWD}:/sglang-checkout" \
   $CACHE_VOLUME \
-  --ipc=host --group-add video \
+  --group-add video \
   --shm-size 32g \
   --cap-add=SYS_PTRACE \
   -e HF_TOKEN="${HF_TOKEN:-}" \
   -e HF_HOME=/sgl-data/hf-cache \
+  -e HF_HUB_ETAG_TIMEOUT=300 \
+  -e HF_HUB_DOWNLOAD_TIMEOUT=300 \
+  -e MIOPEN_USER_DB_PATH=/sgl-data/miopen-cache \
+  -e MIOPEN_CUSTOM_CACHE_DIR=/sgl-data/miopen-cache \
   --security-opt seccomp=unconfined \
   -w /sglang-checkout \
   --name ci_sglang \
