@@ -11,7 +11,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.executors.pipeline_executor im
     SGLDiffusionProfiler,
     Timer,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req, OutputBatch
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages import PipelineStage
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 
