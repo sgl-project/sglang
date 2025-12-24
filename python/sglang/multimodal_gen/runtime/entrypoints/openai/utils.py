@@ -93,11 +93,11 @@ async def _save_url_image_to_path(image_url: str, target_path: str) -> str:
             # Determine file extension from content type or URL after downloading
             if not os.path.splitext(target_path)[1]:
                 content_type = response.headers.get("content-type", "").lower()
-                
+
                 url_path = image_url.split("?")[0]
                 _, url_ext = os.path.splitext(url_path)
                 url_ext = url_ext.lower()
-                
+
                 if url_ext in {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp"}:
                     ext = ".jpg" if url_ext == ".jpeg" else url_ext
                 elif content_type.startswith("image/"):
