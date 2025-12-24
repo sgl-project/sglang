@@ -14,6 +14,9 @@ from sglang.test.test_utils import (
 from python.sglang.srt.environ import envs
 
 
+_MODEL_NAME = "Qwen/Qwen3-0.6B"
+
+
 class TestEnableMetrics(CustomTestCase):
     def test_metrics_1gpu(self):
         """Test that metrics endpoint returns data when enabled"""
@@ -42,7 +45,7 @@ class TestEnableMetrics(CustomTestCase):
                 self.assertIn(metric, metrics_content, f"Missing metric: {metric}")
 
             # Verify model name label is present and correct
-            expected_model_name = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
+            expected_model_name = _MODEL_NAME
             self.assertIn(f'model_name="{expected_model_name}"', metrics_content)
 
             # Verify metrics have values (not empty)
@@ -75,7 +78,7 @@ class TestEnableMetrics(CustomTestCase):
             envs.SGLANG_ENABLE_METRICS_DEVICE_TIMER.override(True),
         ):
             process = popen_launch_server(
-                "Qwen/Qwen3-0.6B",
+                _MODEL_NAME,
                 DEFAULT_URL_FOR_TEST,
                 timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
                 other_args=["--enable-metrics", "--cuda-graph-max-bs", 2, *other_args],
