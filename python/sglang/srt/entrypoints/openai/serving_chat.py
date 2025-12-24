@@ -98,8 +98,101 @@ class OpenAIServingChat(OpenAIServingBase):
     def _request_id_prefix(self) -> str:
         return "chatcmpl-"
 
+    def _get_template_stop_strings(self, request: ChatCompletionRequest) -> List[str]:
+        """Get stop strings from conversation template if available."""
+        if self.template_manager.chat_template_name is None:
+            # Jinja template doesn't have built-in stop strings
+            return []
+
+        if request.ignore_eos:
+            return []
+
+        # Import chat_templates to get template stop strings directly
+        from sglang.srt.parser.conversation import chat_templates
+
+        template_name = self.template_manager.chat_template_name
+        if template_name in chat_templates:
+            template = chat_templates[template_name]
+            return copy.copy(template.stop_str or [])
+
+        return []
+
+    def _merge_stop_strings(
+        self, template_stop: List[str], request_stop: Optional[Union[str, List[str]]]
+    ) -> List[str]:
+        """Merge template stop strings with user-provided stop strings."""
+        stop = copy.copy(template_stop) if template_stop else []
+
+        if request_stop:
+            if isinstance(request_stop, str):
+                stop.append(request_stop)
+            else:
+                stop.extend(request_stop)
+
+        return stop
+
+    def _validate_request_max_tokens(
+        self, request: ChatCompletionRequest
+    ) -> Optional[str]:
+        """Validate that max_tokens is within server context length."""
+        max_output_tokens = request.max_completion_tokens or request.max_tokens
+        server_context_length = self.tokenizer_manager.server_args.context_length
+        if (
+            max_output_tokens
+            and server_context_length
+            and max_output_tokens > server_context_length
+        ):
+            return (
+                f"max_completion_tokens is too large: {max_output_tokens}."
+                f"This model supports at most {server_context_length} completion tokens."
+            )
+        return None
+
+    def _process_tool_call_constraint(
+        self, request: ChatCompletionRequest
+    ) -> Optional[tuple]:
+        """Process tool call constraint from request.
+
+        Returns tool_call_constraint tuple or None if no tools/tool_choice.
+        This logic works on OUTPUT, so it's compatible with both input_ids and messages.
+        """
+        if not request.tools or request.tool_choice == "none":
+            return None
+
+        tool_call_constraint = None
+
+        # Try to get constraint from parser first
+        if self.tool_call_parser:
+            parser = FunctionCallParser(request.tools, self.tool_call_parser)
+            tool_call_constraint = parser.get_structure_constraint(request.tool_choice)
+
+        # Handle JSON schema constraint for required or named tool choice
+        if request.tool_choice == "required" or isinstance(
+            request.tool_choice, ToolChoice
+        ):
+            json_schema = get_json_schema_constraint(request.tools, request.tool_choice)
+            tool_call_constraint = ("json_schema", json_schema)
+
+        return tool_call_constraint
+
     def _validate_request(self, request: ChatCompletionRequest) -> Optional[str]:
         """Validate that the input is valid."""
+
+        # When using input_ids, skip message-related validations
+        if request.input_ids:
+            # Validate input_ids is not empty
+            if not isinstance(request.input_ids, list) or len(request.input_ids) == 0:
+                return "input_ids must be a non-empty list of integers."
+
+            # Validate max_tokens
+            error = self._validate_request_max_tokens(request)
+            if error:
+                return error
+
+            # Note: Tool calling and reasoning parsing work on OUTPUT, so they are supported with input_ids
+            return None
+
+        # Original message-based validations
         if not request.messages:
             return "Messages cannot be empty."
 
@@ -127,17 +220,10 @@ class OpenAIServingChat(OpenAIServingBase):
             except SchemaError as e:
                 return f"Tool {i} function has invalid 'parameters' schema: {str(e)}"
 
-        max_output_tokens = request.max_completion_tokens or request.max_tokens
-        server_context_length = self.tokenizer_manager.server_args.context_length
-        if (
-            max_output_tokens
-            and server_context_length
-            and max_output_tokens > server_context_length
-        ):
-            return (
-                f"max_completion_tokens is too large: {max_output_tokens}."
-                f"This model supports at most {server_context_length} completion tokens."
-            )
+        # Validate max_tokens
+        error = self._validate_request_max_tokens(request)
+        if error:
+            return error
 
         if request.response_format and request.response_format.type == "json_schema":
             schema = getattr(request.response_format.json_schema, "schema_", None)
@@ -162,29 +248,50 @@ class OpenAIServingChat(OpenAIServingBase):
         """Convert OpenAI chat completion request to internal format"""
         is_multimodal = self.tokenizer_manager.model_config.is_multimodal
 
-        # Process messages and apply chat template
-        processed_messages = self._process_messages(request, is_multimodal)
+        # Determine prompt_kwargs, tool_call_constraint, stop, and multimodal data
+        if request.input_ids:
+            # Direct input_ids case: skip message processing
+            prompt_kwargs = {"input_ids": request.input_ids}
+
+            # Merge template stop strings with user-provided stop strings
+            template_stop = self._get_template_stop_strings(request)
+            stop = self._merge_stop_strings(template_stop, request.stop)
+
+            image_data = None
+            video_data = None
+            audio_data = None
+            modalities = []
+
+            # Process tool call constraint (works on OUTPUT, compatible with input_ids)
+            tool_call_constraint = self._process_tool_call_constraint(request)
+        else:
+            # Message-based processing: apply chat template
+            processed_messages = self._process_messages(request, is_multimodal)
+            stop = processed_messages.stop
+            tool_call_constraint = processed_messages.tool_call_constraint
+            image_data = processed_messages.image_data
+            video_data = processed_messages.video_data
+            audio_data = processed_messages.audio_data
+            modalities = processed_messages.modalities
+
+            # Build prompt_kwargs based on modality
+            if is_multimodal:
+                prompt_kwargs = {"text": processed_messages.prompt}
+            else:
+                if isinstance(processed_messages.prompt_ids, str):
+                    prompt_kwargs = {"text": processed_messages.prompt_ids}
+                else:
+                    prompt_kwargs = {"input_ids": processed_messages.prompt_ids}
 
         # Build sampling parameters
         sampling_params = request.to_sampling_params(
-            stop=processed_messages.stop,
+            stop=stop,
             model_generation_config=self.default_sampling_params,
-            tool_call_constraint=processed_messages.tool_call_constraint,
+            tool_call_constraint=tool_call_constraint,
         )
 
-        # Handle single vs multiple requests
-        if is_multimodal:
-            prompt_kwargs = {"text": processed_messages.prompt}
-        else:
-            if isinstance(processed_messages.prompt_ids, str):
-                prompt_kwargs = {"text": processed_messages.prompt_ids}
-            else:
-                prompt_kwargs = {"input_ids": processed_messages.prompt_ids}
-
-        # Extract custom labels from raw request headers
         custom_labels = self.extract_custom_labels(raw_request)
 
-        # Resolve LoRA adapter from model parameter or explicit lora_path
         lora_path = self._resolve_lora_path(request.model, request.lora_path)
         if lora_path:
             first_adapter = (
@@ -197,16 +304,16 @@ class OpenAIServingChat(OpenAIServingBase):
 
         adapted_request = GenerateReqInput(
             **prompt_kwargs,
-            image_data=processed_messages.image_data,
-            video_data=processed_messages.video_data,
-            audio_data=processed_messages.audio_data,
+            image_data=image_data,
+            video_data=video_data,
+            audio_data=audio_data,
             sampling_params=sampling_params,
             return_logprob=request.logprobs,
             logprob_start_len=-1,
             top_logprobs_num=request.top_logprobs or 0,
             stream=request.stream,
             return_text_in_logprobs=True,
-            modalities=processed_messages.modalities,
+            modalities=modalities,
             lora_path=lora_path,
             bootstrap_host=request.bootstrap_host,
             bootstrap_port=request.bootstrap_port,
@@ -231,8 +338,6 @@ class OpenAIServingChat(OpenAIServingBase):
         if self.is_gpt_oss:
             request.skip_special_tokens = False
 
-        tool_call_constraint = None
-
         # Apply chat template and its stop strings
         tools = None
         if request.tools and request.tool_choice != "none":
@@ -245,19 +350,6 @@ class OpenAIServingChat(OpenAIServingBase):
                 ]
             else:
                 tools = [item.function.model_dump() for item in request.tools]
-            if self.tool_call_parser:
-                parser = FunctionCallParser(request.tools, self.tool_call_parser)
-                tool_call_constraint = parser.get_structure_constraint(
-                    request.tool_choice
-                )
-            # Handle JSON schema constraint directly for required or named tool choice
-            if request.tool_choice == "required" or isinstance(
-                request.tool_choice, ToolChoice
-            ):
-                json_schema = get_json_schema_constraint(
-                    request.tools, request.tool_choice
-                )
-                tool_call_constraint = ("json_schema", json_schema)
 
         # Use chat template
         if self.template_manager.chat_template_name is None:
@@ -265,7 +357,8 @@ class OpenAIServingChat(OpenAIServingBase):
         else:
             result = self._apply_conversation_template(request, is_multimodal)
 
-        result.tool_call_constraint = tool_call_constraint
+        # Process tool call constraint
+        result.tool_call_constraint = self._process_tool_call_constraint(request)
         return result
 
     def _apply_jinja_template(
@@ -458,13 +551,10 @@ class OpenAIServingChat(OpenAIServingBase):
         video_data = conv.video_data if conv.video_data else None
         audio_data = conv.audio_data if conv.audio_data else None
         modalities = conv.modalities if conv.modalities else []
-        stop = copy.copy(conv.stop_str or [] if not request.ignore_eos else [])
 
-        if request.stop:
-            if isinstance(request.stop, str):
-                stop.append(request.stop)
-            else:
-                stop.extend(request.stop)
+        # Merge template stop strings with user-provided stop strings
+        stop = copy.copy(conv.stop_str or [] if not request.ignore_eos else [])
+        stop = self._merge_stop_strings(stop, request.stop)
 
         if not is_multimodal:
             prompt_ids = self.tokenizer_manager.tokenizer.encode(prompt)

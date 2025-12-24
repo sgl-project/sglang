@@ -455,7 +455,11 @@ class ToolChoice(BaseModel):
 class ChatCompletionRequest(BaseModel):
     # Ordered by official OpenAI API documentation
     # https://platform.openai.com/docs/api-reference/chat/create
-    messages: List[ChatCompletionMessageParam]
+    messages: Optional[List[ChatCompletionMessageParam]] = None
+    input_ids: Optional[List[int]] = Field(
+        default=None,
+        description="Direct token IDs input. If provided, messages will be ignored.",
+    )
     model: str = Field(
         default=DEFAULT_MODEL_NAME,
         description="Model name. Supports LoRA adapters via 'base-model:adapter-name' syntax.",
@@ -554,6 +558,23 @@ class ChatCompletionRequest(BaseModel):
                 values["tool_choice"] = "none"
             else:
                 values["tool_choice"] = "auto"
+        return values
+
+    @model_validator(mode="before")
+    @classmethod
+    def validate_messages_or_input_ids(cls, values: Dict):
+        """Ensure either messages or input_ids is provided, but not both."""
+        messages = values.get("messages")
+        input_ids = values.get("input_ids")
+
+        if messages is None and input_ids is None:
+            raise ValueError("Either 'messages' or 'input_ids' must be provided")
+
+        if messages is not None and input_ids is not None:
+            logger.warning(
+                "Both 'messages' and 'input_ids' provided. 'input_ids' will take precedence and 'messages' will be ignored."
+            )
+
         return values
 
     @model_validator(mode="before")
