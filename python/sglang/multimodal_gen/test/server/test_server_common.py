@@ -166,7 +166,7 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
         )
 
         if needs_estimated_time:
-            _MISSING_ESTIMATED_TIME_CASES.discard(case.id)
+            _MISSING_ESTIMATED_TIME_CASES.add(case.id)
             logger.info(
                 f'\n{"=" * 60}\n'
                 f'Add "estimated_full_test_time_s" to scenario "{case.id}":\n\n'
