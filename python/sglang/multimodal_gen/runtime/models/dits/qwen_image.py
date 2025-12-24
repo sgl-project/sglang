@@ -699,7 +699,7 @@ class QwenImageTransformer2DModel(CachableDiT):
         temb_img_silu = F.silu(temb)
         if self.zero_cond_t:
             temb_txt = temb.chunk(2, dim=0)[0]
-            temb_txt_silu = F.silu(temb_txt)
+            temb_txt_silu = temb_img_silu.chunk(2, dim=0)[0]
         else:
             temb_txt = temb
             temb_txt_silu = temb_img_silu
