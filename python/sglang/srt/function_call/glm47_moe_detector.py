@@ -179,8 +179,10 @@ class Glm47MoeDetector(BaseFormatDetector):
             for match_result in match_result_list:
                 # Get function name
                 func_detail = self.func_detail_regex.search(match_result)
-                func_name = func_detail.group(1)
-                func_args = func_detail.group(2)
+                if func_detail is None:
+                    continue
+                func_name = func_detail.group(1) if func_detail.group(1) else ""
+                func_args = func_detail.group(2) if func_detail.group(2) else ""
                 arguments = {}
                 if func_args:
                     pairs = self.func_arg_regex.findall(func_args)
@@ -212,7 +214,11 @@ class Glm47MoeDetector(BaseFormatDetector):
             return arg_type
 
         # Auto-detect type from value (best effort)
-        first_chars = self._current_value.strip()[:10] if self._current_value else ""
+        first_chars = (
+            self._current_value.strip()[:10]
+            if self._current_value and self._current_value.strip()
+            else ""
+        )
         if first_chars:
             first_char = first_chars[0]
             if first_char.isdigit() or first_char in ["-", "."]:
@@ -237,14 +243,14 @@ class Glm47MoeDetector(BaseFormatDetector):
             return json.dumps(value, ensure_ascii=False)
         elif value_type == "number":
             try:
-                num = _convert_to_number(value.strip())
+                num = _convert_to_number(value.strip() if value else "")
                 return str(num)
             except (ValueError, AttributeError):
                 # Fallback to string if not a valid number
                 logger.warning(
                     f"Failed to parse '{value}' as number, treating as string"
                 )
-                return json.dumps(str(value), ensure_ascii=False)
+                return json.dumps(str(value) if value else "", ensure_ascii=False)
         else:
             # For object/array types, return as-is (should already be valid JSON)
             return value
@@ -416,9 +422,14 @@ class Glm47MoeDetector(BaseFormatDetector):
                 string=current_text,
                 flags=re.DOTALL,
             )
-            if partial_match:
-                func_name = partial_match.group(1).strip()
-                func_args_raw = partial_match.group(2).strip()
+            # Only proceed if we have a non-empty function name
+            if partial_match and (func_name := partial_match.group(1)) is not None:
+                # Check if we have a valid function name before proceeding
+                func_name = func_name.strip()
+                func_args_raw = partial_match.group(2)
+                func_args_raw = (
+                    func_args_raw.strip() if func_args_raw is not None else ""
+                )
                 is_tool_end = partial_match.group(3)
 
                 # Initialize state if this is the first tool call
@@ -438,7 +449,12 @@ class Glm47MoeDetector(BaseFormatDetector):
 
                 # Send tool name first if not sent yet
                 if not self.current_tool_name_sent:
-                    assert func_name, "func_name should not be empty"
+                    # Additional safety check for func_name
+                    if not func_name:
+                        logger.warning(
+                            "Empty function name detected, skipping tool call"
+                        )
+                        return StreamingParseResult(normal_text="", calls=[])
                     calls.append(
                         ToolCallItem(
                             tool_index=self.current_tool_id,
@@ -509,14 +525,16 @@ class Glm47MoeDetector(BaseFormatDetector):
                             ] += closing_brace
 
                         try:
-                            pairs = self.func_arg_regex.findall(func_args_raw)
-                            if pairs:
-                                arguments = self._parse_argument_pairs(
-                                    pairs, func_name, tools
-                                )
-                                self.prev_tool_call_arr[self.current_tool_id][
-                                    "arguments"
-                                ] = arguments
+                            # Only try to parse if func_args_raw is not empty
+                            if func_args_raw:
+                                pairs = self.func_arg_regex.findall(func_args_raw)
+                                if pairs:
+                                    arguments = self._parse_argument_pairs(
+                                        pairs, func_name, tools
+                                    )
+                                    self.prev_tool_call_arr[self.current_tool_id][
+                                        "arguments"
+                                    ] = arguments
                         except Exception as e:
                             logger.debug(
                                 f"Failed to parse arguments: {e}", exc_info=True
