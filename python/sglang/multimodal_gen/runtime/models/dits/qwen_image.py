@@ -348,9 +348,15 @@ class QwenImageCrossAttention(nn.Module):
 
         # Apply RoPE (fewer kernel launches): do RoPE on joint q/k once each.
         if image_rotary_emb is not None:
-            (img_cos, img_sin), (txt_cos, txt_sin) = image_rotary_emb
-            joint_cos = torch.cat([txt_cos, img_cos], dim=0)
-            joint_sin = torch.cat([txt_sin, img_sin], dim=0)
+            # image_rotary_emb can be either:
+            # - ((img_cos, img_sin), (txt_cos, txt_sin))  (legacy)
+            # - (joint_cos, joint_sin)                    (pre-concatenated)
+            if isinstance(image_rotary_emb[0], torch.Tensor):
+                joint_cos, joint_sin = image_rotary_emb
+            else:
+                (img_cos, img_sin), (txt_cos, txt_sin) = image_rotary_emb
+                joint_cos = torch.cat([txt_cos, img_cos], dim=0)
+                joint_sin = torch.cat([txt_sin, img_sin], dim=0)
             joint_query = apply_rotary_embedding(
                 joint_query, joint_cos, joint_sin, interleaved=True
             )
@@ -701,6 +707,11 @@ class QwenImageTransformer2DModel(CachableDiT):
             temb_txt_silu = temb_img_silu
 
         image_rotary_emb = freqs_cis
+        if freqs_cis is not None:
+            (img_cos, img_sin), (txt_cos, txt_sin) = freqs_cis
+            joint_cos = torch.cat([txt_cos, img_cos], dim=0)
+            joint_sin = torch.cat([txt_sin, img_sin], dim=0)
+            image_rotary_emb = (joint_cos, joint_sin)
         for index_block, block in enumerate(self.transformer_blocks):
             encoder_hidden_states, hidden_states = block(
                 hidden_states=hidden_states,
