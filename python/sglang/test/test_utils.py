@@ -1705,9 +1705,9 @@ async def send_concurrent_generate_requests_with_custom_params(
 
 class CustomTestCase(unittest.TestCase):
     def _callTestMethod(self, method):
-        max_retry = int(
-            os.environ.get("SGLANG_TEST_MAX_RETRY", "1" if is_in_ci() else "0")
-        )
+        max_retry = envs.SGLANG_TEST_MAX_RETRY.get()
+        if max_retry is None:
+            max_retry = 1 if is_in_ci() else 0
         retry(
             lambda: super(CustomTestCase, self)._callTestMethod(method),
             max_retry=max_retry,
