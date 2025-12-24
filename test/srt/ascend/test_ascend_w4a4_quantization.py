@@ -34,7 +34,7 @@ DEFAULT_URL_FOR_TEST = f"http://127.0.0.1:{DEFAULT_PORT_FOR_SRT_TEST_RUNNER + 10
 class TestAscendW4A4(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = "Eco-Tech/Qwen3-8B-w4a4-QuaRot"
+        cls.model = "/root/.cache/modelscope/hub/models/Eco-Tech/Qwen3-8B-w4a4-QuaRot"
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,
