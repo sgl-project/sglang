@@ -174,6 +174,10 @@ pub fn init_metrics() {
         "smg_worker_requests_active",
         "Currently running requests per worker"
     );
+    describe_gauge!(
+        "smg_worker_health",
+        "Worker health status (1=healthy, 0=unhealthy)"
+    );
     describe_counter!(
         "smg_worker_health_checks_total",
         "Health check results by worker_type and result"
@@ -807,6 +811,15 @@ impl Metrics {
         .set(count as f64);
     }
 
+    /// Set worker health status
+    pub fn set_worker_health(worker_url: &str, healthy: bool) {
+        gauge!(
+            "smg_worker_health",
+            "worker" => worker_url.to_string()
+        )
+        .set(if healthy { 1.0 } else { 0.0 });
+    }
+
     // ========================================================================
     // Layer 3: Worker resilience metrics (circuit breaker)
     // ========================================================================
@@ -1031,6 +1044,21 @@ impl Metrics {
             "storage_type" => storage_type
         )
         .increment(1);
+    }
+
+    // ========================================================================
+    // Worker cleanup
+    // ========================================================================
+
+    pub fn remove_worker_metrics(worker_url: &str) {
+        gauge!("smg_worker_cb_consecutive_failures", "worker" => worker_url.to_string()).set(0.0);
+        gauge!("smg_worker_cb_consecutive_successes", "worker" => worker_url.to_string()).set(0.0);
+        gauge!("smg_worker_requests_active", "worker" => worker_url.to_string()).set(0.0);
+
+        // Zero for these metrics have special valid meaning, thus we set to -1 temporarily
+        // (and will remove them completely after https://github.com/metrics-rs/metrics/issues/653)
+        gauge!("smg_worker_cb_state", "worker" => worker_url.to_string()).set(-1.0);
+        gauge!("smg_worker_health","worker" => worker_url.to_string()).set(-1.0);
     }
 }
 

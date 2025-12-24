@@ -418,7 +418,7 @@ impl QueueProcessor {
     }
 
     pub async fn run(mut self) {
-        info!("Starting concurrency queue processor");
+        debug!("Starting concurrency queue processor");
 
         // Process requests in a single task to reduce overhead
         while let Some(queued) = self.queue_rx.recv().await {
@@ -599,7 +599,7 @@ pub async fn concurrency_limit_middleware(
 // HTTP Metrics Layer (Layer 1: SMG metrics)
 // ============================================================================
 
-/// Global counter for active HTTP connections
+/// Global counter for active HTTP connections (handlers currently executing)
 static ACTIVE_HTTP_CONNECTIONS: AtomicU64 = AtomicU64::new(0);
 
 /// Tower Layer for HTTP metrics collection (SMG Layer 1 metrics)

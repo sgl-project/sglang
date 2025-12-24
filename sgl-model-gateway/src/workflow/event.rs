@@ -74,12 +74,11 @@ impl EventBus {
         self.subscribers.write().await.push(subscriber);
     }
 
-    /// Publish an event to all subscribers
+    /// Publish an event to all subscribers concurrently
     pub async fn publish(&self, event: WorkflowEvent) {
         let subscribers = self.subscribers.read().await;
-        for subscriber in subscribers.iter() {
-            subscriber.on_event(&event).await;
-        }
+        let futures: Vec<_> = subscribers.iter().map(|s| s.on_event(&event)).collect();
+        futures::future::join_all(futures).await;
     }
 }
 

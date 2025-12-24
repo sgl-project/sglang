@@ -8,6 +8,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use futures_util::StreamExt;
+use memchr::memmem;
 use reqwest::Client;
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -337,8 +338,8 @@ impl PDRouter {
                                 headers,
                                 json_request,
                                 context,
-                                prefill.as_ref(),
-                                decode.as_ref(),
+                                Arc::clone(&prefill),
+                                Arc::clone(&decode),
                                 start_time,
                             )
                             .await;
@@ -410,8 +411,8 @@ impl PDRouter {
         &self,
         res: reqwest::Response,
         context: &PDRequestContext<'_>,
-        prefill: &dyn Worker,
-        decode: &dyn Worker,
+        prefill: Arc<dyn Worker>,
+        decode: Arc<dyn Worker>,
     ) -> Response {
         let status = res.status();
 
@@ -526,17 +527,14 @@ impl PDRouter {
         headers: Option<&HeaderMap>,
         json_request: Value,
         context: PDRequestContext<'_>,
-        prefill: &dyn Worker,
-        decode: &dyn Worker,
+        prefill: Arc<dyn Worker>,
+        decode: Arc<dyn Worker>,
         _start_time: Instant,
     ) -> Response {
         // For non-streaming: use guard for automatic load management
         // For streaming: load will be managed in create_streaming_response
-        let _guard = if !context.is_stream {
-            Some(WorkerLoadGuard::new_multi(vec![prefill, decode]))
-        } else {
-            None
-        };
+        let _prefill_guard = (!context.is_stream).then(|| WorkerLoadGuard::new(prefill.clone()));
+        let _decode_guard = (!context.is_stream).then(|| WorkerLoadGuard::new(decode.clone()));
 
         let mut headers_with_trace = headers.cloned().unwrap_or_default();
         inject_trace_context_http(&mut headers_with_trace);
@@ -807,30 +805,19 @@ impl PDRouter {
         return_logprob: bool,
         decode_url: Option<String>,
         headers: Option<HeaderMap>,
-        prefill: &dyn Worker,
-        decode: &dyn Worker,
+        prefill: Arc<dyn Worker>,
+        decode: Arc<dyn Worker>,
     ) -> Response {
-        prefill.increment_load();
-        decode.increment_load();
-
-        let prefill_url = prefill.url().to_string();
-        let decode_url_str = decode.url().to_string();
+        use crate::core::attach_guards_to_response;
 
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
 
-        let registry = self.worker_registry.clone();
-
         tokio::spawn(async move {
-            let mut stream_completed = false;
-
             futures_util::pin_mut!(stream);
             while let Some(chunk_result) = stream.next().await {
                 match chunk_result {
                     Ok(chunk) => {
-                        let is_done = chunk
-                            .as_ref()
-                            .windows(12)
-                            .any(|window| window == b"data: [DONE]");
+                        let is_done = memmem::find(&chunk, b"data: [DONE]").is_some();
 
                         let result = if return_logprob && prefill_logprobs.is_some() {
                             Self::merge_streaming_logprobs(prefill_logprobs.clone(), &chunk)
@@ -844,7 +831,6 @@ impl PDRouter {
                         }
 
                         if is_done {
-                            stream_completed = true;
                             break;
                         }
                     }
@@ -856,22 +842,6 @@ impl PDRouter {
                         break;
                     }
                 }
-            }
-
-            if let Some(worker) = registry.get_by_url(&prefill_url) {
-                worker.decrement_load();
-                debug!(
-                    "Decremented load for prefill worker: {} (stream_completed: {})",
-                    prefill_url, stream_completed
-                );
-            }
-
-            if let Some(worker) = registry.get_by_url(&decode_url_str) {
-                worker.decrement_load();
-                debug!(
-                    "Decremented load for decode worker: {} (stream_completed: {})",
-                    decode_url_str, stream_completed
-                );
             }
         });
 
@@ -885,7 +855,10 @@ impl PDRouter {
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
         *response.headers_mut() = headers;
 
-        response
+        // Attach load guards to response body for proper RAII lifecycle
+        // Guards are dropped when response body is consumed or client disconnects
+        let guards = vec![WorkerLoadGuard::new(prefill), WorkerLoadGuard::new(decode)];
+        attach_guards_to_response(guards, response)
     }
 
     // Helper to process non-streaming decode response with logprob merging
@@ -1453,23 +1426,27 @@ mod tests {
 
     #[test]
     fn test_worker_load_metrics() {
-        let prefill_worker = create_test_worker(
+        let prefill_worker: Arc<dyn Worker> = Arc::from(create_test_worker(
             "http://prefill".to_string(),
             WorkerType::Prefill {
                 bootstrap_port: None,
             },
             true,
-        );
-        let decode_worker =
-            create_test_worker("http://decode".to_string(), WorkerType::Decode, true);
+        ));
+        let decode_worker: Arc<dyn Worker> = Arc::from(create_test_worker(
+            "http://decode".to_string(),
+            WorkerType::Decode,
+            true,
+        ));
 
-        let _guard =
-            WorkerLoadGuard::new_multi(vec![prefill_worker.as_ref(), decode_worker.as_ref()]);
+        let _prefill_guard = WorkerLoadGuard::new(prefill_worker.clone());
+        let _decode_guard = WorkerLoadGuard::new(decode_worker.clone());
 
         assert_eq!(prefill_worker.load(), 1);
         assert_eq!(decode_worker.load(), 1);
 
-        drop(_guard);
+        drop(_prefill_guard);
+        drop(_decode_guard);
 
         assert_eq!(prefill_worker.load(), 0);
         assert_eq!(decode_worker.load(), 0);
@@ -1507,31 +1484,37 @@ mod tests {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let stream = UnboundedReceiverStream::new(rx);
 
-        let _response = router.create_streaming_response(
-            stream.map(Ok),
-            StatusCode::OK,
-            None,
-            false,
-            None,
-            None,
-            prefill_ref.as_ref(),
-            decode_ref.as_ref(),
-        );
+        {
+            let response = router.create_streaming_response(
+                stream.map(Ok),
+                StatusCode::OK,
+                None,
+                false,
+                None,
+                None,
+                prefill_ref.clone(),
+                decode_ref.clone(),
+            );
 
-        assert_eq!(prefill_ref.load(), 1);
-        assert_eq!(decode_ref.load(), 1);
+            // Guards are now attached to response body, so load should be 1
+            assert_eq!(prefill_ref.load(), 1);
+            assert_eq!(decode_ref.load(), 1);
 
-        tx.send(bytes::Bytes::from("test data")).unwrap();
+            tx.send(bytes::Bytes::from("test data")).unwrap();
 
-        sleep(Duration::from_millis(10)).await;
+            sleep(Duration::from_millis(10)).await;
 
-        assert_eq!(prefill_ref.load(), 1);
-        assert_eq!(decode_ref.load(), 1);
+            // Load still 1 while response body exists
+            assert_eq!(prefill_ref.load(), 1);
+            assert_eq!(decode_ref.load(), 1);
 
-        drop(tx);
+            drop(tx);
 
-        sleep(Duration::from_millis(100)).await;
+            // Response (and its body with guards) dropped here
+            drop(response);
+        }
 
+        // Guards dropped when response dropped
         assert_eq!(prefill_ref.load(), 0);
         assert_eq!(decode_ref.load(), 0);
     }

@@ -245,6 +245,7 @@ class LongcatFlashMoE(nn.Module):
             renormalize=False,
             use_grouped_topk=False,
             correction_bias=self.router.e_score_correction_bias.data,
+            layer_id=layer_id,
         )
         self.topk.forward = self.topk.forward_native
 

@@ -1,7 +1,7 @@
 use std::{fs::File, io::Read, path::Path, sync::Arc};
 
 use anyhow::{Error, Result};
-use tracing::{debug, info};
+use tracing::debug;
 
 use super::{huggingface::HuggingFaceTokenizer, tiktoken::TiktokenTokenizer, traits};
 use crate::tokenizer::hub::download_tokenizer_from_hf;
@@ -215,10 +215,10 @@ fn resolve_and_log_chat_template(
 
     match (&provided_path, &final_chat_template) {
         (Some(provided), _) => {
-            info!("Using provided chat template: {}", provided);
+            debug!("Using provided chat template: {}", provided);
         }
         (None, Some(discovered)) => {
-            info!(
+            debug!(
                 "Auto-discovered chat template in '{}': {}",
                 discovery_dir.display(),
                 discovered

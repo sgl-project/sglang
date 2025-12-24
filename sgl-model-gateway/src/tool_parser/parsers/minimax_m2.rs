@@ -181,7 +181,7 @@ impl MinimaxM2Parser {
                 }
                 Ok(None) => continue,
                 Err(e) => {
-                    tracing::warn!("Failed to parse tool call: {}", e);
+                    tracing::debug!("Failed to parse tool call: {}", e);
                     continue;
                 }
             }
@@ -455,7 +455,7 @@ impl ToolParser for MinimaxM2Parser {
                         continue;
                     } else {
                         // Invalid function name, reset state
-                        tracing::warn!("Invalid function name: {}", function_name);
+                        tracing::debug!("Invalid function name: {}", function_name);
                         self.in_tool_call = false;
                         normal_text.push_str(&self.buffer);
                         self.buffer.clear();

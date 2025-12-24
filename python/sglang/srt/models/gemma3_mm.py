@@ -290,15 +290,26 @@ class Gemma3ForConditionalGeneration(PreTrainedModel):
     def get_image_feature(self, items: List[MultimodalDataItem]):
         """
         Projects the last hidden state from the vision model into language model space.
+        Supports both raw image pixel values and precomputed embeddings.
 
         Returns:
             image_features (`torch.Tensor`): Image feature tensor of shape `(num_images, image_length, embed_dim)`).
         """
         # Process images one by one to handle flatten_batch=True constraint in vision_tower
         all_pixel_values = flatten_nested_list([item.feature for item in items])
-        vision_outputs_list = []
+
+        final_features_list = []
 
         for pixel_values_batch in all_pixel_values:
+            if (
+                pixel_values_batch.dim() == 3
+                and pixel_values_batch.shape[-1] == self.config.text_config.hidden_size
+            ):
+                final_features_list.append(
+                    pixel_values_batch.to(self.language_model.device)
+                )
+                continue
+
             # Normalize input shape to [batch_size, channels, height, width]
             if pixel_values_batch.dim() == 5:
                 pixel_values_batch = pixel_values_batch.squeeze(0)
@@ -309,20 +320,29 @@ class Gemma3ForConditionalGeneration(PreTrainedModel):
                     f"Unexpected pixel_values shape: {pixel_values_batch.shape}"
                 )
 
-            # Process each image in the batch
+            # Process each image in the batch through Vision Tower
+            batch_vision_outputs = []
             batch_size = pixel_values_batch.shape[0]
+
             for i in range(batch_size):
                 pixel_value = pixel_values_batch[i : i + 1]  # Keep batch dimension as 1
                 pixel_value = pixel_value.to(
                     device=self.vision_tower.device, dtype=self.language_model.dtype()
                 )
                 vision_output = self.vision_tower(pixel_values=pixel_value)
-                vision_outputs_list.append(vision_output)
+                batch_vision_outputs.append(vision_output)
 
-        # Concatenate all vision outputs
-        vision_outputs = torch.cat(vision_outputs_list, dim=0)
-        image_features = self.multi_modal_projector(vision_outputs)
-        return image_features
+            if batch_vision_outputs:
+                vision_outputs_cat = torch.cat(batch_vision_outputs, dim=0)
+
+                projected_features = self.multi_modal_projector(vision_outputs_cat)
+                final_features_list.append(projected_features)
+
+        # Concatenate all features (all are now in text space)
+        if final_features_list:
+            return torch.cat(final_features_list, dim=0)
+        else:
+            return torch.tensor([], device=self.language_model.device)
 
     @torch.no_grad()
     def forward(
