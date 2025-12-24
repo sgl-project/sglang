@@ -60,6 +60,7 @@ from sglang.srt.utils.common import (
     maybe_reindex_device_id,
 )
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
+from sglang.srt.utils.watchdog import Watchdog
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 
 logger = logging.getLogger(__name__)
@@ -69,6 +70,7 @@ class LoadBalanceMethod(Enum):
     """Load balance method."""
 
     ROUND_ROBIN = auto()
+    DECODE_ROUND_ROBIN = auto()
     SHORTEST_QUEUE = auto()
     MINIMUM_TOKENS = auto()
 
@@ -173,6 +175,7 @@ class DataParallelController:
         self.round_robin_counter = 0
         dispatch_lookup = {
             LoadBalanceMethod.ROUND_ROBIN: self.round_robin_scheduler,
+            LoadBalanceMethod.DECODE_ROUND_ROBIN: self.decode_round_robin_scheduler,
             LoadBalanceMethod.SHORTEST_QUEUE: self.shortest_queue_scheduler,
             LoadBalanceMethod.MINIMUM_TOKENS: self.minimum_tokens_scheduler,
         }
@@ -196,6 +199,13 @@ class DataParallelController:
             self.control_message_step = 1
 
         self.init_dispatcher()
+
+        self.watchdog = Watchdog.create(
+            debug_name="DataParallelController",
+            watchdog_timeout=server_args.soft_watchdog_timeout,
+            soft=True,
+            test_stuck_time=envs.SGLANG_TEST_STUCK_DP_CONTROLLER.get(),
+        )
 
     def send_to_all_workers(self, obj):
         for worker in self.workers:
@@ -504,11 +514,33 @@ class DataParallelController:
                 self.workers
             )
         else:
+            # Set default bootstrap_room if in FAKE auto mode and room is None
+            if (
+                req.bootstrap_room is None
+                and self.server_args.disaggregation_decode_enable_fake_auto
+            ):
+                req.bootstrap_room = self.round_robin_counter
+                self.round_robin_counter = (self.round_robin_counter + 1) % len(
+                    self.workers
+                )
+
             assert (
                 req.bootstrap_room is not None
             ), "req.bootstrap_room should not be None. Do not send requests directly to prefill or decode instances, but send to the router instead."
             target_rank = req.bootstrap_room % len(self.workers)
             self.workers[target_rank].send_pyobj(req)
+
+    def decode_round_robin_scheduler(self, req: Req):
+        if self.maybe_external_dp_rank_routing(req):
+            return
+
+        if self.server_args.disaggregation_mode == "decode":
+            self.workers[self.round_robin_counter].send_pyobj(req)
+            self.round_robin_counter = (self.round_robin_counter + 1) % len(
+                self.workers
+            )
+            return
+        self.round_robin_scheduler(req)
 
     def shortest_queue_scheduler(self, req):
         if self.maybe_external_dp_rank_routing(req):
@@ -532,6 +564,7 @@ class DataParallelController:
     def event_loop(self):
         while True:
             while True:
+                self.watchdog.feed()
                 try:
                     recv_req = self.recv_from_tokenizer.recv_pyobj(zmq.NOBLOCK)
                 except zmq.ZMQError:

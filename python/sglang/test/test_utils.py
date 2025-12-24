@@ -59,6 +59,7 @@ DEFAULT_MODEL_NAME_FOR_TEST_MLA = "lmsys/sglang-ci-dsv3-test"
 DEFAULT_MODEL_NAME_FOR_TEST_MLA_NEXTN = "lmsys/sglang-ci-dsv3-test-NextN"
 
 # VL test models
+DEFAULT_MODEL_NAME_FOR_TEST_VL_PP = "Qwen/Qwen3-VL-2B-Thinking"
 DEFAULT_MODEL_NAME_FOR_TEST_GLM_41V_PP = "zai-org/GLM-4.1V-9B-Thinking"
 
 # NVFP4 models
@@ -119,6 +120,7 @@ DEFAULT_AWQ_MOE_MODEL_NAME_FOR_TEST = (
 )
 DEFAULT_ENABLE_THINKING_MODEL_NAME_FOR_TEST = "Qwen/Qwen3-30B-A3B"
 DEFAULT_DEEPSEEK_W4AFP8_MODEL_FOR_TEST = "Barrrrry/DeepSeek-R1-W4AFP8"
+DEFAULT_ENABLE_ROUTED_EXPERTS_MODEL_NAME_FOR_TEST = "Qwen/Qwen3-30B-A3B"
 
 # Nightly tests
 DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP1 = "meta-llama/Llama-3.1-8B-Instruct,mistralai/Mistral-7B-Instruct-v0.3,deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct,google/gemma-2-27b-it"
@@ -166,6 +168,11 @@ def is_blackwell_system():
     return envs.IS_BLACKWELL.get()
 
 
+def is_h200_system():
+    """Return whether it is running on an H200 system."""
+    return envs.IS_H200.get()
+
+
 def _use_cached_default_models(model_repo: str):
     cache_dir = os.getenv("DEFAULT_MODEL_CACHE_DIR")
     if cache_dir and model_repo:
@@ -190,6 +197,9 @@ if is_in_amd_ci():
 
 if is_blackwell_system():
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH = 3000
+
+if is_h200_system():
+    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH = 3600
 
 
 def call_generate_lightllm(prompt, temperature, max_tokens, stop=None, url=None):
@@ -771,6 +781,7 @@ def get_benchmark_args(
         disable_tqdm=False,
         disable_stream=disable_stream,
         return_logprob=False,
+        return_routed_experts=False,
         seed=seed,
         disable_ignore_eos=disable_ignore_eos,
         extra_request_body=None,

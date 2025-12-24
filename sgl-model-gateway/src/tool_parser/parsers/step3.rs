@@ -181,7 +181,7 @@ impl Step3Parser {
                     });
                 } else {
                     // Invalid function name
-                    tracing::warn!("Invalid function name: {}", func_name);
+                    tracing::debug!("Invalid function name: {}", func_name);
                     self.reset_streaming_state();
                     return Ok(StreamingParseResult {
                         normal_text: String::new(),
@@ -433,7 +433,7 @@ impl ToolParser for Step3Parser {
                 Ok(Some(tool)) => tools.push(tool),
                 Ok(None) => continue,
                 Err(e) => {
-                    tracing::warn!("Failed to parse tool call: {}", e);
+                    tracing::debug!("Failed to parse tool call: {}", e);
                     continue;
                 }
             }
