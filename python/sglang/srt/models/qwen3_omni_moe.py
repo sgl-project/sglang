@@ -471,7 +471,8 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(Qwen3VLMoeForConditionalGenera
         self.audio_tower = Qwen3OmniMoeAudioEncoder(config.audio_config, self.use_data_parallel)
         self.visual = Qwen3OmniMoeVisionEncoder(
             config.vision_config,
-            quant_config=quant_config,
+            #quant_config=quant_config,
+            quant_config=None,  # Workaround: pass None to quant_config to force Qwen3-Omni VIT with BF16 instead of FP8
             norm_eps=getattr(config, "rms_norm_eps", 1e-6),
             prefix=add_prefix("visual", prefix),
             use_data_parallel=self.use_data_parallel
