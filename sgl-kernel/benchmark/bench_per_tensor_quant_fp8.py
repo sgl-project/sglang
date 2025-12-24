@@ -90,7 +90,6 @@ else:
 configs = list(itertools.product(batch_size_range, seq_len_range))
 
 
-
 if VLLM_AVAILABLE:
     line_vals = ["vllm", "sglang"]
     line_names = ["VLLM", "SGL Kernel"]

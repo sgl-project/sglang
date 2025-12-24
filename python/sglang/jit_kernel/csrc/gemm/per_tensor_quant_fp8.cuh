@@ -1,13 +1,12 @@
+#include <sgl_kernel/fp8_utils.cuh>
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.cuh>
 #include <sgl_kernel/utils.h>
 
-#include <cub/block/block_reduce.cuh>
-#include <flashinfer/vec_dtypes.cuh>
-#include <sgl_kernel/fp8_utils.cuh>
-
 #include <cstddef>
 #include <cstdint>
+#include <cub/block/block_reduce.cuh>
+#include <flashinfer/vec_dtypes.cuh>
 
 namespace host {
 namespace details {
@@ -22,14 +21,13 @@ struct dtype_trait<__nv_fp8_e4m3> {
 
 namespace {
 
-using device::FP8_E4M3_MAX;
 using device::atomicMaxFloat;
 using device::blockReduceMax;
+using device::FP8_E4M3_MAX;
 
 template <typename T>
-__global__ void per_tensor_absmax_kernel(const T* __restrict__ input,
-                                         float* __restrict__ output_s,
-                                         const int64_t num_elements) {
+__global__ void
+per_tensor_absmax_kernel(const T* __restrict__ input, float* __restrict__ output_s, const int64_t num_elements) {
   float max_value = 0.0f;
   unsigned int tid = threadIdx.x;
   unsigned int gid = blockIdx.x * blockDim.x + threadIdx.x;
@@ -65,10 +63,11 @@ __global__ void per_tensor_absmax_kernel(const T* __restrict__ input,
 }
 
 template <typename T, typename DST_DTYPE>
-__global__ void per_tensor_quant_fp8_kernel(const T* __restrict__ input,
-                                            DST_DTYPE* __restrict__ output,
-                                            const float* __restrict__ scale,
-                                            const int64_t num_elements) {
+__global__ void per_tensor_quant_fp8_kernel(
+    const T* __restrict__ input,
+    DST_DTYPE* __restrict__ output,
+    const float* __restrict__ scale,
+    const int64_t num_elements) {
   const int gid = blockIdx.x * blockDim.x + threadIdx.x;
   const int grid_size = blockDim.x * gridDim.x;
   const float scale_val = 1.0f / (*scale);
@@ -85,14 +84,12 @@ __global__ void per_tensor_quant_fp8_kernel(const T* __restrict__ input,
     DST_DTYPE output_arr[VEC_SIZE];
 #pragma unroll
     for (uint32_t j = 0; j < VEC_SIZE; ++j) {
-      float val = fmax(fmin(static_cast<float>(input_vec[j]) * scale_val, FP8_E4M3_MAX),
-                       -FP8_E4M3_MAX);
+      float val = fmax(fmin(static_cast<float>(input_vec[j]) * scale_val, FP8_E4M3_MAX), -FP8_E4M3_MAX);
 #if !defined(USE_ROCM) || defined(HIP_FP8_TYPE_E4M3)
       output_arr[j] = static_cast<DST_DTYPE>(val);
 #else
       output_arr[j] = c10::Float8_e4m3fnuz(
-          __hip_cvt_float_to_fp8(val, fp8::fp8_type::__default_saturation,
-                                 fp8::fp8_type::__default_interpret),
+          __hip_cvt_float_to_fp8(val, fp8::fp8_type::__default_saturation, fp8::fp8_type::__default_interpret),
           c10::Float8_e4m3fnuz::from_bits());
 #endif
     }
@@ -101,14 +98,12 @@ __global__ void per_tensor_quant_fp8_kernel(const T* __restrict__ input,
 
   const int32_t remaining_start = num_vec_elems * VEC_SIZE;
   for (int32_t idx = remaining_start + gid; idx < num_elements; idx += grid_size) {
-    float val = fmax(-FP8_E4M3_MAX,
-                     fmin(static_cast<float>(input[idx]) * scale_val, FP8_E4M3_MAX));
+    float val = fmax(-FP8_E4M3_MAX, fmin(static_cast<float>(input[idx]) * scale_val, FP8_E4M3_MAX));
 #if !defined(USE_ROCM) || defined(HIP_FP8_TYPE_E4M3)
     output[idx] = static_cast<DST_DTYPE>(val);
 #else
     output[idx] = c10::Float8_e4m3fnuz(
-        __hip_cvt_float_to_fp8(val, fp8::fp8_type::__default_saturation,
-                               fp8::fp8_type::__default_interpret),
+        __hip_cvt_float_to_fp8(val, fp8::fp8_type::__default_saturation, fp8::fp8_type::__default_interpret),
         c10::Float8_e4m3fnuz::from_bits());
 #endif
   }
@@ -117,9 +112,7 @@ __global__ void per_tensor_quant_fp8_kernel(const T* __restrict__ input,
 constexpr size_t kBlockSize = 256;
 
 template <bool kIsStatic>
-void per_tensor_quant_fp8(tvm::ffi::TensorView input,
-                          tvm::ffi::TensorView output_q,
-                          tvm::ffi::TensorView output_s) {
+void per_tensor_quant_fp8(tvm::ffi::TensorView input, tvm::ffi::TensorView output_q, tvm::ffi::TensorView output_s) {
   using namespace host;
 
   SymbolicSize num_tokens = {"num_tokens"};
@@ -132,15 +125,9 @@ void per_tensor_quant_fp8(tvm::ffi::TensorView input,
       .with_device<kDLCUDA>(device_)
       .verify(input);
 
-  TensorMatcher({num_tokens, hidden_dim})
-      .with_dtype<__nv_fp8_e4m3>()
-      .with_device<kDLCUDA>(device_)
-      .verify(output_q);
+  TensorMatcher({num_tokens, hidden_dim}).with_dtype<__nv_fp8_e4m3>().with_device<kDLCUDA>(device_).verify(output_q);
 
-  TensorMatcher({1})
-      .with_dtype<float>()
-      .with_device<kDLCUDA>(device_)
-      .verify(output_s);
+  TensorMatcher({1}).with_dtype<float>().with_device<kDLCUDA>(device_).verify(output_s);
 
   const size_t total_elements = num_tokens.unwrap() * hidden_dim.unwrap();
   const size_t num_blocks = std::min((total_elements + kBlockSize - 1) / kBlockSize, size_t(1024));

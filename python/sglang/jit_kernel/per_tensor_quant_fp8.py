@@ -17,10 +17,12 @@ if TYPE_CHECKING:
 @functools.cache
 def _jit_per_tensor_quant_fp8_module(is_static: bool) -> Module:
     args = make_cpp_args(is_static)
-    
-    flashinfer_include = os.path.join(os.path.dirname(flashinfer.__file__), "data", "include")
+
+    flashinfer_include = os.path.join(
+        os.path.dirname(flashinfer.__file__), "data", "include"
+    )
     cub_include = os.path.join(CUDA_HOME, "include")
-    
+
     return load_jit(
         "per_tensor_quant_fp8",
         *args,
@@ -31,11 +33,14 @@ def _jit_per_tensor_quant_fp8_module(is_static: bool) -> Module:
 
 
 def per_tensor_quant_fp8(
-    input: torch.Tensor, output_q: torch.Tensor, output_s: torch.Tensor, is_static: bool = False
+    input: torch.Tensor,
+    output_q: torch.Tensor,
+    output_s: torch.Tensor,
+    is_static: bool = False,
 ) -> None:
     """
     Per-tensor quantization to FP8 format.
-    
+
     Args:
         input: Input tensor to quantize (float, half, or bfloat16)
         output_q: Output quantized tensor (fp8_e4m3)
