@@ -124,15 +124,10 @@ class RequestLogger:
         return max_length, skip_names, out_skip_names
 
 
-# Public functions for backward compatibility (re-exported from common.py)
-
-
+# TODO remove this?
 @lru_cache(maxsize=2)
 def disable_request_logging() -> bool:
     return get_bool_env_var("SGLANG_DISABLE_REQUEST_LOGGING")
-
-
-# Private helper functions
 
 
 def _dataclass_to_string_truncated(
