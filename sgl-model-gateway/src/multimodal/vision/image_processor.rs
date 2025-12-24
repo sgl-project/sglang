@@ -207,8 +207,11 @@ impl PreprocessedImages {
     }
 
     /// Get pixel values as a flat f32 slice (row-major order).
-    pub fn pixel_values_flat(&self) -> Vec<f32> {
-        self.pixel_values.iter().copied().collect()
+    pub fn pixel_values_flat(&self) -> std::borrow::Cow<'_, [f32]> {
+        match self.pixel_values.as_slice() {
+            Some(slice) => std::borrow::Cow::Borrowed(slice),
+            None => std::borrow::Cow::Owned(self.pixel_values.iter().copied().collect()),
+        }
     }
 
     /// Get the shape of pixel values as a vector.
