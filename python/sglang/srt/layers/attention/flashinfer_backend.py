@@ -22,7 +22,7 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.utils import (
     cp_lse_ag_out_rs,
-    create_flashinfer_kv_indices_triton,
+    create_flashinfer_kv_indices_for_dcp_triton,
 )
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.radix_attention import AttentionType
@@ -1127,6 +1127,10 @@ class FlashInferIndicesUpdaterDecode:
             dcp_rank = 0
         if spec_info is None:
             bs = len(req_pool_indices)
+            if dcp_size > 1:
+                paged_kernel_lens = paged_kernel_lens // dcp_size + (
+                    dcp_rank < paged_kernel_lens % dcp_size
+                )
             kv_indptr[1 : bs + 1] = torch.cumsum(paged_kernel_lens, dim=0)
             kv_indptr = kv_indptr[: bs + 1]
 
@@ -1138,7 +1142,7 @@ class FlashInferIndicesUpdaterDecode:
                     paged_kernel_lens_sum, dtype=torch.int32, device="cuda"
                 )
 
-            create_flashinfer_kv_indices_triton[(bs,)](
+            create_flashinfer_kv_indices_for_dcp_triton[(bs,)](
                 self.req_to_token,
                 req_pool_indices,
                 paged_kernel_lens,
@@ -1146,17 +1150,9 @@ class FlashInferIndicesUpdaterDecode:
                 kv_start_idx,
                 kv_indices,
                 self.req_to_token.shape[1],
+                dcp_size,
+                dcp_rank,
             )
-            # Update kv_indptr and kv_indices for dcp
-            # TODO Do this in create_flashinfer_kv_indices_triton
-            if dcp_size > 1:
-                paged_kernel_lens_dcp = paged_kernel_lens // dcp_size + (
-                    dcp_rank < paged_kernel_lens % dcp_size
-                )
-                kv_indptr[1 : bs + 1] = torch.cumsum(paged_kernel_lens_dcp, dim=0)
-                kv_indices = kv_indices[kv_indices % dcp_size == dcp_rank] // dcp_size
-                if wrapper.is_cuda_graph_enabled:
-                    wrapper._paged_kv_indices_buf[: len(kv_indices)].copy_(kv_indices)
         else:
             kv_indptr, kv_indices = spec_info.kv_indptr, spec_info.kv_indices
             bs = kv_indptr.shape[0] - 1
@@ -1441,6 +1437,9 @@ class FlashInferIndicesUpdaterPrefill:
     ):
         if dcp_size is not None and dcp_size > 1:
             assert use_ragged, "dcp only supports ragged wrapper"
+            paged_kernel_lens = paged_kernel_lens // dcp_size + (
+                dcp_rank < paged_kernel_lens % dcp_size
+            )
         else:
             dcp_size = 1
             dcp_rank = 0
@@ -1456,7 +1455,7 @@ class FlashInferIndicesUpdaterPrefill:
                 dtype=torch.int32,
                 device=req_pool_indices.device,
             )
-            create_flashinfer_kv_indices_triton[(bs,)](
+            create_flashinfer_kv_indices_for_dcp_triton[(bs,)](
                 self.req_to_token,
                 req_pool_indices,
                 paged_kernel_lens,
@@ -1464,18 +1463,12 @@ class FlashInferIndicesUpdaterPrefill:
                 kv_start_idx,
                 kv_indices,
                 self.req_to_token.shape[1],
+                dcp_size,
+                dcp_rank,
             )
             qo_indptr[1 : bs + 1] = torch.cumsum(seq_lens - prefix_lens, dim=0)
             qo_indptr = qo_indptr[: bs + 1]
             custom_mask = None
-            # Update kv_indptr and kv_indices for dcp
-            # TODO Do this in create_flashinfer_kv_indices_triton
-            if dcp_size > 1:
-                paged_kernel_lens_dcp = paged_kernel_lens // dcp_size + (
-                    dcp_rank < paged_kernel_lens % dcp_size
-                )
-                kv_indptr[1 : bs + 1] = torch.cumsum(paged_kernel_lens_dcp, dim=0)
-                kv_indices = kv_indices[kv_indices % dcp_size == dcp_rank] // dcp_size
         else:
             assert isinstance(spec_info, SpecInput)
             kv_indices, kv_indptr, qo_indptr, custom_mask = (
