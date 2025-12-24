@@ -28,7 +28,6 @@ import torch
 from numpy import float64
 
 from sglang.srt.distributed import get_tensor_model_parallel_rank
-from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.mem_cache.allocator import (
     PagedTokenToKVPoolAllocator,
     TokenToKVPoolAllocator,
@@ -41,6 +40,7 @@ from sglang.srt.mem_cache.radix_cache import (
     _key_match_paged,
     get_child_key,
 )
+from sglang.srt.server_args import get_global_server_args
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -366,6 +366,7 @@ class MambaRadixCache(BasePrefixCache):
         ) or isinstance(params.token_to_kv_pool_allocator, PagedTokenToKVPoolAllocator)
         self.req_to_token_pool: HybridReqToTokenPool = params.req_to_token_pool
         self.token_to_kv_pool_allocator = params.token_to_kv_pool_allocator
+        self.mamba_track_interval = get_global_server_args().mamba_track_interval
 
         self.page_size = params.page_size
         self.disable = params.disable
@@ -610,7 +611,7 @@ class MambaRadixCache(BasePrefixCache):
 
         assert page_aligned_len == len(
             kv_indices
-        ), f"page_aligned_len != len(kv_indices), {page_aligned_len=}, {len(kv_indices)=}, {cache_len=}, {self.page_size=}, {FLA_CHUNK_SIZE=}"
+        ), f"page_aligned_len != len(kv_indices), {page_aligned_len=}, {len(kv_indices)=}, {cache_len=}, {self.page_size=}, {self.mamba_track_interval=}"
 
         page_aligned_token_ids = token_ids[:page_aligned_len]
 
@@ -955,11 +956,11 @@ class MambaRadixCache(BasePrefixCache):
         # Calculate the branching point. It is defined as the last aligned position that
         # does not have a mamba value.
         if len(value) > best_value_len:
-            fla_chunk_aligned_seqlen = (
-                sum(len(v) for v in value) // FLA_CHUNK_SIZE
-            ) * FLA_CHUNK_SIZE
+            chunk_aligned_seqlen = (
+                sum(len(v) for v in value) // self.mamba_track_interval
+            ) * self.mamba_track_interval
             mamba_branching_seqlen = (
-                fla_chunk_aligned_seqlen if fla_chunk_aligned_seqlen > 0 else None
+                chunk_aligned_seqlen if chunk_aligned_seqlen > 0 else None
             )
         else:
             mamba_branching_seqlen = None

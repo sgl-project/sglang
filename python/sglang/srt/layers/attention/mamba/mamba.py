@@ -25,6 +25,7 @@ from sglang.srt.layers.linear import (
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.mem_cache.memory_pool import MambaPool
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import (
     composed_weight_loader,
     sharded_weight_loader,
@@ -354,6 +355,7 @@ class MambaMixer2(torch.nn.Module):
         output: torch.Tensor,
         layer_cache: MambaPool.State,
         metadata: Mamba2Metadata,
+        forward_batch: ForwardBatch,
         mup_vector: Optional[torch.Tensor] = None,
         use_triton_causal_conv: bool = False,
     ):
@@ -364,6 +366,7 @@ class MambaMixer2(torch.nn.Module):
         state_indices_tensor = metadata.mamba_cache_indices
         conv_state = layer_cache.conv[0]
         ssm_state = layer_cache.temporal
+        intermediate_states = None
 
         query_start_loc = metadata.query_start_loc
 
@@ -461,6 +464,14 @@ class MambaMixer2(torch.nn.Module):
             x = hidden_states_B_C_p.transpose(
                 0, 1
             )  # this is the form that causal-conv see
+            if (
+                forward_batch.mamba_track_mask is not None
+                and forward_batch.mamba_track_mask.any()
+                and metadata.track_conv_indices is not None
+            ):
+                x_to_track = x[:, metadata.track_conv_indices].transpose(0, 1)
+                mask_indices = forward_batch.mamba_track_mask.nonzero(as_tuple=True)[0]
+                conv_state[forward_batch.mamba_track_indices[mask_indices]] = x_to_track
             ccfn = (
                 causal_conv1d_fn
                 if not use_triton_causal_conv
@@ -490,7 +501,7 @@ class MambaMixer2(torch.nn.Module):
                 )
 
             # NOTE: final output is an in-place update of out tensor
-            varlen_state = mamba_chunk_scan_combined(
+            intermediate_states, varlen_state = mamba_chunk_scan_combined(
                 hidden_states_p.view(
                     1, num_prefill_tokens, self.num_heads // self.tp_size, self.head_dim
                 ),
@@ -509,6 +520,7 @@ class MambaMixer2(torch.nn.Module):
                 initial_states=initial_states,
                 return_varlen_states=True,
                 return_final_states=False,
+                return_intermediate_states=True,
                 dt_softplus=True,
                 dt_limit=(0.0, float("inf")),
                 out=preallocated_ssm_out_p.view(
@@ -524,6 +536,12 @@ class MambaMixer2(torch.nn.Module):
         # Process decode requests
         if has_decode:
             is_target_verify = metadata.is_target_verify
+            if is_target_verify:
+                intermediate_state_indices = torch.arange(
+                    num_decodes,
+                    dtype=torch.int32,
+                    device=state_indices_tensor_d.device,
+                )
 
             # 2. Convolution sequence transformation
             if is_target_verify:
@@ -548,6 +566,7 @@ class MambaMixer2(torch.nn.Module):
                     self.activation,
                     conv_state_indices=state_indices_tensor_d[:num_decodes],
                     intermediate_conv_window=layer_cache.intermediate_conv_window[0],
+                    intermediate_state_indices=intermediate_state_indices,
                     retrieve_next_token=metadata.retrieve_next_token,
                     retrieve_next_sibling=metadata.retrieve_next_sibling,
                     retrieve_parent_token=metadata.retrieve_parent_token,
@@ -619,6 +638,7 @@ class MambaMixer2(torch.nn.Module):
                     ),
                     disable_state_update=True,
                     intermediate_states_buffer=layer_cache.intermediate_ssm,
+                    intermediate_state_indices=intermediate_state_indices,
                     cache_steps=draft_token_num,
                     retrieve_parent_token=metadata.retrieve_parent_token,
                 )
@@ -646,6 +666,8 @@ class MambaMixer2(torch.nn.Module):
 
         # 5. Final linear projection
         output[:num_actual_tokens], _ = self.out_proj(hidden_states)
+
+        return intermediate_states
 
     @property
     def mamba_type(self) -> str:

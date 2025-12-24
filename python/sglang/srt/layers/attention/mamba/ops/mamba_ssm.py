@@ -72,6 +72,7 @@ def _selective_scan_update_kernel(
     state_batch_indices_ptr,
     pad_slot_id,
     intermediate_states_buffer,
+    intermediate_state_indices,
     cache_steps,
     retrieve_parent_token_ptr,
     # Matrix dimensions
@@ -177,10 +178,7 @@ def _selective_scan_update_kernel(
 
     cache_idx = -1
     if CACHE_INTERMEDIATE_STATES:
-        if HAS_STATE_BATCH_INDICES:
-            cache_idx = state_batch_idx
-        else:
-            cache_idx = pid_b
+        cache_idx = tl.load(intermediate_state_indices + pid_b).to(tl.int64)
 
     current_step_idx = 0
     for _ in range(T):
@@ -246,20 +244,17 @@ def _selective_scan_update_kernel(
         state = state * dA + dB * x[:, None]
 
         if CACHE_INTERMEDIATE_STATES:
-            if HAS_STATE_BATCH_INDICES:
-                if state_batch_idx != pad_slot_id:
-                    cache_ptr_base = (
-                        intermediate_states_buffer
-                        + state_batch_idx * cache_steps * nheads * dim * dstate
-                        + current_step_idx * nheads * dim * dstate
-                        + pid_h * dim * dstate
-                    )
-                    cache_ptrs = cache_ptr_base + (
-                        offs_m[:, None] * dstate + offs_n[None, :]
-                    )
-                    tl.store(
-                        cache_ptrs, state.to(cache_ptrs.dtype.element_ty), mask=mask
-                    )
+            if cache_idx >= 0:
+                cache_ptr_base = (
+                    intermediate_states_buffer
+                    + cache_idx * cache_steps * nheads * dim * dstate
+                    + current_step_idx * nheads * dim * dstate
+                    + pid_h * dim * dstate
+                )
+                cache_ptrs = cache_ptr_base + (
+                    offs_m[:, None] * dstate + offs_n[None, :]
+                )
+                tl.store(cache_ptrs, state.to(cache_ptrs.dtype.element_ty), mask=mask)
 
         out = tl.sum(state * C[None, :], axis=1)
         if HAS_D:
@@ -298,6 +293,7 @@ def selective_state_update(
     out=None,
     disable_state_update=False,
     intermediate_states_buffer=None,
+    intermediate_state_indices=None,
     cache_steps=None,
     retrieve_parent_token=None,
 ):
@@ -424,6 +420,7 @@ def selective_state_update(
             state_batch_indices,
             pad_slot_id,
             intermediate_states_buffer,
+            intermediate_state_indices,
             cache_steps if cache_steps is not None else 0,
             retrieve_parent_token,
             batch,
