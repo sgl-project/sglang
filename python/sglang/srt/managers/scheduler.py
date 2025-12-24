@@ -716,6 +716,7 @@ class Scheduler(
         self.last_batch: Optional[ScheduleBatch] = None
         self.forward_ct = 0
         self.last_prefill_tokens = 0
+        self.last_prefill_cache_tokens = 0
         self.return_health_check_ct = 0
         self.num_retracted_reqs: int = 0
         self.num_paused_reqs: int = 0
@@ -1829,6 +1830,8 @@ class Scheduler(
 
         if ret:
             trace_event_batch("schedule", ret.reqs)
+
+        self.log_prefill_stats_late(ret)
 
         return ret
 

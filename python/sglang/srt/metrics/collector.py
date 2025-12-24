@@ -12,6 +12,7 @@
 # limitations under the License.
 # ==============================================================================
 """Utilities for Prometheus Metrics Collection."""
+import dataclasses
 import logging
 import os
 import time
@@ -21,6 +22,7 @@ from typing import Dict, List, Optional, Union
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.metrics.utils import exponential_buckets, generate_buckets
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import get_bool_env_var
 
@@ -238,6 +240,24 @@ class SchedulerStats:
 
     # CUDA graph
     is_cuda_graph: float = 0.0
+
+
+@dataclass
+class DPCooperationInfo:
+    # Users can derive that, except for cases with idle, num_decode_ranks=world_size-num_prefill_ranks
+    # We do not provide `num_decode_ranks` to avoid cardinality explosion.
+    num_prefill_ranks: int
+
+    @staticmethod
+    def create(forward_modes: List[int]):
+        return DPCooperationInfo(
+            num_prefill_ranks=sum(
+                1 for mode in forward_modes if mode == ForwardMode.EXTEND.value
+            ),
+        )
+
+    def to_labels(self):
+        return dataclasses.asdict(self)
 
 
 class SchedulerMetricsCollector:
@@ -680,6 +700,17 @@ class SchedulerMetricsCollector:
             labelnames=list(labels.keys()) + ["category"],
         )
 
+        self.dp_cooperation_realtime_tokens_total = Counter(
+            name="sglang:dp_cooperation_realtime_tokens_total",
+            documentation="Total number of tokens processed with labels about DP cooperation.",
+            labelnames=list(labels.keys()) + ["mode", "num_prefill_ranks"],
+        )
+        self.dp_cooperation_gpu_execution_seconds_total = Counter(
+            name="sglang:dp_cooperation_gpu_execution_seconds_total",
+            documentation="Total time that GPU is busy executing a workload with labels about DP cooperation.",
+            labelnames=list(labels.keys()) + ["category", "num_prefill_ranks"],
+        )
+
     def _log_gauge(self, gauge, data: Union[int, float]) -> None:
         # Convenience function for logging to gauge.
         gauge.labels(**self.labels).set(data)
@@ -716,7 +747,11 @@ class SchedulerMetricsCollector:
         )
 
     def increment_realtime_tokens(
-        self, prefill_compute_tokens=0, prefill_cache_tokens=0, decode_tokens=0
+        self,
+        dp_cooperation_info: Optional[DPCooperationInfo],
+        prefill_compute_tokens=0,
+        prefill_cache_tokens=0,
+        decode_tokens=0,
     ):
         for mode, delta in [
             ("prefill_compute", prefill_compute_tokens),
@@ -724,10 +759,27 @@ class SchedulerMetricsCollector:
             ("decode", decode_tokens),
         ]:
             self.realtime_tokens_total.labels(**self.labels, mode=mode).inc(delta)
+            if dp_cooperation_info is not None:
+                self.dp_cooperation_realtime_tokens_total.labels(
+                    **self.labels,
+                    mode=mode,
+                    **dp_cooperation_info.to_labels(),
+                ).inc(delta)
 
-    def increment_gpu_execution_seconds(self, category: str, t: float):
+    def increment_gpu_execution_seconds(
+        self,
+        category: str,
+        t: float,
+        dp_cooperation_info: Optional[DPCooperationInfo],
+    ):
         logger.debug(f"GPU execution seconds: {category=} {t=:.3f}")
         self.gpu_execution_seconds_total.labels(**self.labels, category=category).inc(t)
+        if dp_cooperation_info is not None:
+            self.dp_cooperation_gpu_execution_seconds_total.labels(
+                **self.labels,
+                category=category,
+                **dp_cooperation_info.to_labels(),
+            ).inc(t)
 
     def log_stats(self, stats: SchedulerStats) -> None:
         self._log_gauge(self.num_running_reqs, stats.num_running_reqs)

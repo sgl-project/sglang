@@ -88,7 +88,7 @@ class SchedulerMetricsMixin:
 
             if ENABLE_METRICS_DEVICE_TIMER:
                 self.forward_pass_device_timer = DeviceTimer(
-                    reporter=self.metrics_collector.increment_gpu_execution_seconds
+                    reporter=self.metrics_collector.increment_gpu_execution_seconds,
                 )
 
         if self.enable_kv_cache_events:
@@ -124,6 +124,7 @@ class SchedulerMetricsMixin:
         self.last_prefill_stats_tic = time.perf_counter()
         self.last_input_throughput = self.last_prefill_tokens / gap_latency
         self.last_prefill_tokens = adder.log_input_tokens
+        self.last_prefill_cache_tokens = adder.log_hit_tokens
 
         # TODO: generalize this for various memory pools
         if self.is_hybrid_swa:
@@ -231,23 +232,26 @@ class SchedulerMetricsMixin:
                     self.disagg_decode_transfer_queue.queue
                 )
 
-            self.metrics_collector.increment_realtime_tokens(
-                prefill_compute_tokens=adder.log_input_tokens,
-                prefill_cache_tokens=adder.log_hit_tokens,
-            )
-
             # Others
             self.calculate_utilization()
             self.metrics_collector.log_stats(self.stats)
             self._emit_kv_metrics()
         self._publish_kv_events()
 
+    def log_prefill_stats_late(self: Scheduler, batch: Optional[ScheduleBatch]):
+        """This should be called after `batch` has gathered enough metadata."""
+        if self.enable_metrics and batch is not None:
+            self.metrics_collector.increment_realtime_tokens(
+                prefill_compute_tokens=self.last_prefill_tokens,
+                prefill_cache_tokens=self.last_prefill_cache_tokens,
+                dp_cooperation_info=batch.dp_cooperation_info,
+            )
+
     def log_decode_stats(
         self: Scheduler, can_run_cuda_graph: bool, running_batch: ScheduleBatch = None
     ):
         batch = running_batch or self.running_batch
 
-        last_num_generated_tokens = self.num_generated_tokens
         gap_latency = time.perf_counter() - self.last_decode_stats_tic
         self.last_decode_stats_tic = time.perf_counter()
         self.last_gen_throughput = self.num_generated_tokens / gap_latency
@@ -388,15 +392,20 @@ class SchedulerMetricsMixin:
                     self.disagg_decode_transfer_queue.queue
                 )
 
-            self.metrics_collector.increment_realtime_tokens(
-                decode_tokens=last_num_generated_tokens
-            )
-
             # Others
             self.calculate_utilization()
             self.metrics_collector.log_stats(self.stats)
             self._emit_kv_metrics()
         self._publish_kv_events()
+
+    def log_decode_stats_every_iteration(
+        self: Scheduler, batch: ScheduleBatch, num_accepted_tokens: int
+    ):
+        self.metrics_collector.increment_realtime_tokens(
+            # TODO unify this w/ the bumping logic in `Scheduler.num_generated_tokens` accumulator
+            decode_tokens=batch.batch_size() + num_accepted_tokens,
+            dp_cooperation_info=batch.dp_cooperation_info,
+        )
 
     def log_batch_result_stats(
         self: Scheduler,
@@ -491,5 +500,10 @@ class SchedulerMetricsMixin:
             return
 
         category = "forward_" + batch.forward_mode.name.lower()
-        with self.forward_pass_device_timer.wrap(category=category):
+        with self.forward_pass_device_timer.wrap(
+            metadata=dict(
+                category=category,
+                dp_cooperation_info=batch.dp_cooperation_info,
+            ),
+        ):
             yield
