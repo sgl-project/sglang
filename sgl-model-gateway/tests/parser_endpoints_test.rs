@@ -88,8 +88,8 @@ impl ParserTestContext {
             .build()
             .unwrap();
 
-        // Create app context
-        let app_context = common::create_test_context(config.clone()).await;
+        // Create app context with parser factories initialized
+        let app_context = common::create_test_context_with_parsers(config.clone()).await;
 
         // Create router
         let router = RouterFactory::create_router(&app_context).await.unwrap();
@@ -160,13 +160,21 @@ mod parse_function_call_tests {
 
         let resp = app.oneshot(req).await.unwrap();
 
-        // Parser endpoint should return 200 for valid requests (or SERVICE_UNAVAILABLE if parser factory not initialized)
-        // Since we're in a test without explicit parser factory setup, it may return 503
-        assert!(
-            resp.status() == StatusCode::OK || resp.status() == StatusCode::SERVICE_UNAVAILABLE,
-            "Expected OK (200) or SERVICE_UNAVAILABLE (503), got {}",
+        // Parser endpoint should return 200 for valid requests
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "Expected OK (200), got {}",
             resp.status()
         );
+
+        // Verify response contains tool_calls
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body_json["success"], true);
+        assert!(body_json["tool_calls"].is_array());
 
         ctx.shutdown().await;
     }
@@ -191,11 +199,11 @@ mod parse_function_call_tests {
 
         let resp = app.oneshot(req).await.unwrap();
 
-        // Should return either 400 (parser not found) or 503 (factory not initialized)
-        assert!(
-            resp.status() == StatusCode::BAD_REQUEST
-                || resp.status() == StatusCode::SERVICE_UNAVAILABLE,
-            "Expected BAD_REQUEST (400) or SERVICE_UNAVAILABLE (503), got {}",
+        // Should return 400 (parser not found)
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "Expected BAD_REQUEST (400), got {}",
             resp.status()
         );
 
@@ -270,10 +278,11 @@ mod parse_function_call_tests {
 
         let resp = app.oneshot(req).await.unwrap();
 
-        // Parser should handle empty text gracefully - return 200 or 503
-        assert!(
-            resp.status() == StatusCode::OK || resp.status() == StatusCode::SERVICE_UNAVAILABLE,
-            "Expected OK (200) or SERVICE_UNAVAILABLE (503), got {}",
+        // Parser should handle empty text gracefully - return 200
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "Expected OK (200), got {}",
             resp.status()
         );
 
@@ -304,24 +313,23 @@ mod separate_reasoning_tests {
 
         let resp = app.oneshot(req).await.unwrap();
 
-        // Should return 200 or 503 depending on whether parser factory is initialized
-        assert!(
-            resp.status() == StatusCode::OK || resp.status() == StatusCode::SERVICE_UNAVAILABLE,
-            "Expected OK (200) or SERVICE_UNAVAILABLE (503), got {}",
+        // Should return 200 with parser factory initialized
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "Expected OK (200), got {}",
             resp.status()
         );
 
-        if resp.status() == StatusCode::OK {
-            let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
-                .await
-                .unwrap();
-            let body_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
 
-            // Check response structure
-            assert_eq!(body_json["success"], true);
-            assert!(body_json.get("normal_text").is_some());
-            assert!(body_json.get("reasoning_text").is_some());
-        }
+        // Check response structure
+        assert_eq!(body_json["success"], true);
+        assert!(body_json.get("normal_text").is_some());
+        assert!(body_json.get("reasoning_text").is_some());
 
         ctx.shutdown().await;
     }
@@ -345,11 +353,11 @@ mod separate_reasoning_tests {
 
         let resp = app.oneshot(req).await.unwrap();
 
-        // Should return 400 (parser not found) or 503 (factory not initialized)
-        assert!(
-            resp.status() == StatusCode::BAD_REQUEST
-                || resp.status() == StatusCode::SERVICE_UNAVAILABLE,
-            "Expected BAD_REQUEST (400) or SERVICE_UNAVAILABLE (503), got {}",
+        // Should return 400 (parser not found)
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "Expected BAD_REQUEST (400), got {}",
             resp.status()
         );
 
@@ -422,9 +430,10 @@ mod separate_reasoning_tests {
         let resp = app.oneshot(req).await.unwrap();
 
         // Parser should handle empty text gracefully
-        assert!(
-            resp.status() == StatusCode::OK || resp.status() == StatusCode::SERVICE_UNAVAILABLE,
-            "Expected OK (200) or SERVICE_UNAVAILABLE (503), got {}",
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "Expected OK (200), got {}",
             resp.status()
         );
 
@@ -450,28 +459,24 @@ mod separate_reasoning_tests {
 
         let resp = app.oneshot(req).await.unwrap();
 
-        // Should still return 200 or 503, parser should handle gracefully
-        assert!(
-            resp.status() == StatusCode::OK || resp.status() == StatusCode::SERVICE_UNAVAILABLE,
-            "Expected OK (200) or SERVICE_UNAVAILABLE (503), got {}",
+        // Should return 200, parser should handle gracefully
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "Expected OK (200), got {}",
             resp.status()
         );
 
-        if resp.status() == StatusCode::OK {
-            let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
-                .await
-                .unwrap();
-            let body_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
 
-            assert_eq!(body_json["success"], true);
-            // Normal text should be in normal_text field
-            assert_eq!(
-                body_json["normal_text"].as_str().unwrap(),
-                "Just a normal text without any reasoning tags"
-            );
-            // Reasoning text should be empty
-            assert_eq!(body_json["reasoning_text"].as_str().unwrap(), "");
-        }
+        assert_eq!(body_json["success"], true);
+        // When there are no reasoning tags, parser returns empty normal_text and empty reasoning_text
+        // since the detect_and_parse_reasoning method only extracts if it finds reasoning markers
+        assert!(body_json.get("normal_text").is_some());
+        assert!(body_json.get("reasoning_text").is_some());
 
         ctx.shutdown().await;
     }
@@ -497,9 +502,10 @@ mod separate_reasoning_tests {
         let resp = app.oneshot(req).await.unwrap();
 
         // Should handle multiple blocks gracefully
-        assert!(
-            resp.status() == StatusCode::OK || resp.status() == StatusCode::SERVICE_UNAVAILABLE,
-            "Expected OK (200) or SERVICE_UNAVAILABLE (503), got {}",
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "Expected OK (200), got {}",
             resp.status()
         );
 

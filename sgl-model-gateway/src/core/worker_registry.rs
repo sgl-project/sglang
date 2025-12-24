@@ -11,7 +11,10 @@ use std::sync::Arc;
 use dashmap::DashMap;
 use uuid::Uuid;
 
-use crate::core::{ConnectionMode, RuntimeType, Worker, WorkerType};
+use crate::{
+    core::{ConnectionMode, RuntimeType, Worker, WorkerType},
+    observability::metrics::Metrics,
+};
 
 /// Unique identifier for a worker
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]
@@ -122,13 +125,9 @@ impl WorkerRegistry {
     }
 
     /// Reserve (or retrieve) a stable UUID for a worker URL.
+    /// Uses atomic entry API to avoid race conditions between check and insert.
     pub fn reserve_id_for_url(&self, url: &str) -> WorkerId {
-        if let Some(existing_id) = self.url_to_id.get(url) {
-            return existing_id.clone();
-        }
-        let worker_id = WorkerId::new();
-        self.url_to_id.insert(url.to_string(), worker_id.clone());
-        worker_id
+        self.url_to_id.entry(url.to_string()).or_default().clone()
     }
 
     /// Best-effort lookup of the URL for a given worker ID.
@@ -172,6 +171,7 @@ impl WorkerRegistry {
             }
 
             worker.set_healthy(false);
+            Metrics::remove_worker_metrics(worker.url());
 
             Some(worker)
         } else {

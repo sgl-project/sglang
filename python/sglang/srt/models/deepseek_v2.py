@@ -67,6 +67,7 @@ from sglang.srt.layers.attention.nsa.utils import (
     is_nsa_enable_prefill_cp,
     prepare_input_dp_with_cp_dsa,
 )
+from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
 from sglang.srt.layers.attention.utils import concat_and_cast_mha_k_triton
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
@@ -147,7 +148,6 @@ from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
     get_device_sm,
-    get_int_env_var,
     is_cpu,
     is_cuda,
     is_gfx95_supported,
@@ -425,7 +425,10 @@ def handle_attention_nsa(attn, forward_batch):
     Dispatch logic is centralized in NativeSparseAttnBackend.set_nsa_prefill_impl and executed
     in init_forward_metadata. Read the decision from backend.use_mha.
     """
+
     backend = forward_batch.attn_backend
+    if isinstance(backend, TboAttnBackend):  # if enable tbo, get primary backend
+        backend = backend.primary
     if hasattr(backend, "use_mha") and backend.use_mha:
         return AttnForwardMethod.MHA_ONE_SHOT
     return AttnForwardMethod.MLA
@@ -1462,8 +1465,8 @@ class DeepseekV2AttentionMLA(nn.Module):
         )
 
         # TODO: Design a finer way to determine the threshold
-        self.chunked_prefix_cache_threshold = get_int_env_var(
-            "SGLANG_CHUNKED_PREFIX_CACHE_THRESHOLD", 8192
+        self.chunked_prefix_cache_threshold = (
+            envs.SGLANG_CHUNKED_PREFIX_CACHE_THRESHOLD.get()
         )
 
         # If we have self.fused_qkv_a_proj_with_mqa and we're running on CPU, we will choose the torch.ops.sgl_kernel.qkv_proj_with_rope_fused_weight kernel
@@ -2670,7 +2673,10 @@ class DeepseekV2AttentionMLA(nn.Module):
 
         Returns: (kv_a, k_pe) both in BF16
         """
-        kv_indices = forward_batch.attn_backend.forward_metadata.page_table_1_flattened
+        backend = forward_batch.attn_backend
+        if isinstance(backend, TboAttnBackend):  # if enable tbo, get primary backend
+            backend = backend.primary
+        kv_indices = backend.forward_metadata.page_table_1_flattened
         assert (
             kv_indices is not None
         ), "page_table_1_flattened should have been generated for FP8 MHA path"
