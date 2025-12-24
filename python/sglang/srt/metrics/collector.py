@@ -251,7 +251,9 @@ class DPCooperationInfo:
     @staticmethod
     def create(forward_modes: List[int]):
         return DPCooperationInfo(
-            num_prefill_ranks=sum(1 for mode in forward_modes if mode == ForwardMode.PREFILL.value),
+            num_prefill_ranks=sum(
+                1 for mode in forward_modes if mode == ForwardMode.PREFILL.value
+            ),
         )
 
     def to_labels(self):
@@ -701,14 +703,12 @@ class SchedulerMetricsCollector:
         self.dp_cooperation_realtime_tokens_total = Counter(
             name="sglang:dp_cooperation_realtime_tokens_total",
             documentation="Total number of tokens processed with labels about DP cooperation.",
-            labelnames=list(labels.keys())
-            + ["mode", "num_prefill_ranks"],
+            labelnames=list(labels.keys()) + ["mode", "num_prefill_ranks"],
         )
         self.dp_cooperation_gpu_execution_seconds_total = Counter(
             name="sglang:dp_cooperation_gpu_execution_seconds_total",
             documentation="Total time that GPU is busy executing a workload with labels about DP cooperation.",
-            labelnames=list(labels.keys())
-            + ["category", "num_prefill_ranks"],
+            labelnames=list(labels.keys()) + ["category", "num_prefill_ranks"],
         )
 
     def _log_gauge(self, gauge, data: Union[int, float]) -> None:

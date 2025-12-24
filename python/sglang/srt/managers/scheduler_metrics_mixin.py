@@ -244,7 +244,9 @@ class SchedulerMetricsMixin:
                 prefill_compute_tokens=self.last_prefill_tokens,
                 prefill_cache_tokens=self.last_prefill_cache_tokens,
                 # The info is only available after `prepare_mlp_sync_batch`
-                dp_cooperation_info=batch.dp_cooperation_info if batch is not None else None,
+                dp_cooperation_info=(
+                    batch.dp_cooperation_info if batch is not None else None
+                ),
             )
 
     def log_decode_stats(
