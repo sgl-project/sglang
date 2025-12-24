@@ -4,13 +4,14 @@ import requests
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
-    DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     popen_launch_server,
     is_in_ci,
 )
+
+from python.sglang.srt.environ import envs
 
 
 class TestEnableMetrics(CustomTestCase):
@@ -50,7 +51,7 @@ class TestEnableMetrics(CustomTestCase):
             self.assertIn("_bucket{", metrics_content)
 
         self._execute_core(
-            model_name=DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
+            other_args=[],
             verify_metrics=_verify_metrics,
         )
 
@@ -60,14 +61,24 @@ class TestEnableMetrics(CustomTestCase):
             print("Skip test_metrics_2gpu since in 1-gpu CI")
             return
 
-        TODO
-        
-    def _execute_core(self, model_name: str, verify_metrics):
+        def _verify_metrics(metrics_content):
+            TODO
+
+        with (
+            envs.SGLANG_ENABLE_METRICS_DP_ATTENTION.override(True),
+            envs.SGLANG_ENABLE_METRICS_DEVICE_TIMER.override(True),
+        ):
+            self._execute_core(
+                other_args=["--tp", "2", "--dp", "2", "--enable-dp-attention"],
+                verify_metrics=_verify_metrics,
+            )
+
+    def _execute_core(self, other_args, verify_metrics):
         process = popen_launch_server(
-            model_name,
+            "Qwen/Qwen3-0.6B",
             DEFAULT_URL_FOR_TEST,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=["--enable-metrics", "--cuda-graph-max-bs", 2],
+            other_args=["--enable-metrics", "--cuda-graph-max-bs", 2, *other_args],
         )
 
         try:
