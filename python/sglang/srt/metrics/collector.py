@@ -379,6 +379,16 @@ class SchedulerMetricsCollector:
             documentation="Total number of retracted requests.",
             labelnames=labels.keys(),
         )
+        self.num_retracted_input_tokens_total = Counter(
+            name="sglang:num_retracted_input_tokens_total",
+            documentation="Total number of retracted input tokens.",
+            labelnames=labels.keys(),
+        )
+        self.num_retracted_output_tokens_total = Counter(
+            name="sglang:num_retracted_output_tokens_total",
+            documentation="Total number of retracted output tokens.",
+            labelnames=labels.keys(),
+        )
         self.num_paused_reqs = Gauge(
             name="sglang:num_paused_reqs",
             documentation="The number of paused requests by async weight sync.",
@@ -731,8 +741,19 @@ class SchedulerMetricsCollector:
     def observe_queue_time(self, latency: float) -> None:
         self._log_histogram(self.queue_time, latency)
 
-    def increment_num_retracted_reqs(self, num: int) -> None:
-        self.num_retracted_reqs_total.labels(**self.labels).inc(num)
+    def increment_retracted_reqs(
+        self,
+        num_retracted_reqs: int,
+        num_retracted_input_tokens: int,
+        num_retracted_output_tokens: int,
+    ) -> None:
+        self.num_retracted_reqs_total.labels(**self.labels).inc(num_retracted_reqs)
+        self.num_retracted_input_tokens_total.labels(**self.labels).inc(
+            num_retracted_input_tokens
+        )
+        self.num_retracted_output_tokens_total.labels(**self.labels).inc(
+            num_retracted_output_tokens
+        )
 
     def increment_cuda_graph_pass(self, value: bool) -> None:
         # leave room for piecewise cuda graph, etc
