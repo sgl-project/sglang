@@ -333,10 +333,7 @@ impl McpManager {
             (server_id.to_string(), label)
         };
 
-        let identity = ServerIdentity {
-            key,
-            label,
-        };
+        let identity = ServerIdentity { key, label };
 
         // Clear old inventory and reload.
         self.inventory.clear_server_tools(&identity.key);
@@ -540,10 +537,7 @@ impl McpManager {
                     inventory.insert_tool(qualified_tool_name, identity.key.clone(), t);
                 }
             }
-            Err(e) => warn!(
-                "Failed to list tools from server '{}': {}",
-                identity.key, e
-            ),
+            Err(e) => warn!("Failed to list tools from server '{}': {}", identity.key, e),
         }
 
         // Prompts
