@@ -95,7 +95,7 @@ class TestDeepseekV3FP4MTP(CustomTestCase):
             )
 
         self.assertGreater(metrics["accuracy"], 0.94)
-        self.assertGreater(avg_spec_accept_length, 2.04)
+        self.assertGreater(avg_spec_accept_length, 2.7)
 
     def test_bs_1_speed(self):
         args = BenchArgs(port=int(self.base_url.split(":")[-1]), max_new_tokens=2048)
