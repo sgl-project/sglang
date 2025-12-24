@@ -943,11 +943,12 @@ class ServerArgs:
                     reserved_mem += 2 * 1024
 
             # For piecewise cuda graphs
-            if (
-                self.enable_piecewise_cuda_graph
-                and self.piecewise_cuda_graph_tokens < self.chunked_prefill_size
-            ):
-                reserved_mem += self.piecewise_cuda_graph_max_tokens // 4
+            if self.enable_piecewise_cuda_graph:
+                if self.piecewise_cuda_graph_tokens < self.chunked_prefill_size:
+                    reserved_mem += self.piecewise_cuda_graph_max_tokens // 8
+                else:
+                    # In this case, we do not need to allocate additional memory for activations.
+                    reserved_mem += self.piecewise_cuda_graph_max_tokens // 32
 
             self.mem_fraction_static = (
                 round((gpu_mem - reserved_mem) / gpu_mem, 3)
