@@ -13,7 +13,7 @@ from sglang.test.test_utils import (
 )
 
 
-class TestDPAttentionMetrics(CustomTestCase):
+class TestMetrics2GPU(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_MLA_MODEL_NAME_FOR_TEST
@@ -29,7 +29,7 @@ class TestDPAttentionMetrics(CustomTestCase):
                 other_args=[
                     "--trust-remote-code",
                     "--tp",
-                    "1",
+                    "2",
                     "--dp",
                     "2",
                     "--enable-dp-attention",
@@ -43,7 +43,7 @@ class TestDPAttentionMetrics(CustomTestCase):
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
 
-    def test_dp_attention_metrics(self):
+    def test_metrics_2gpu(self):
         response = requests.get(f"{self.base_url}/health_generate")
         self.assertEqual(response.status_code, 200)
 
