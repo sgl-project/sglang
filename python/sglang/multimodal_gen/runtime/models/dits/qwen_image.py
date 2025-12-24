@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from diffusers.models.attention import FeedForward
 from diffusers.models.embeddings import TimestepEmbedding, Timesteps
 from diffusers.models.modeling_outputs import Transformer2DModelOutput
@@ -492,17 +493,15 @@ class QwenImageTransformerBlock(nn.Module):
         hidden_states: torch.Tensor,
         encoder_hidden_states: torch.Tensor,
         encoder_hidden_states_mask: torch.Tensor,
-        temb: torch.Tensor,
+        temb_img_silu: torch.Tensor,
+        temb_txt_silu: torch.Tensor,
         image_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         joint_attention_kwargs: Optional[Dict[str, Any]] = None,
         modulate_index: Optional[List[int]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # Get modulation parameters for both streams
-        img_mod_params = self.img_mod(temb)  # [B, 6*dim]
-
-        if self.zero_cond_t:
-            temb = torch.chunk(temb, 2, dim=0)[0]
-        txt_mod_params = self.txt_mod(temb)  # [B, 6*dim]
+        img_mod_params = self.img_mod[1](temb_img_silu)  # [B, 6*dim]
+        txt_mod_params = self.txt_mod[1](temb_txt_silu)  # [B, 6*dim]
 
         # Split modulation parameters for norm1 and norm2
         img_mod1, img_mod2 = img_mod_params.chunk(2, dim=-1)  # Each [B, 3*dim]
@@ -697,13 +696,22 @@ class QwenImageTransformer2DModel(CachableDiT):
 
         temb = self.time_text_embed(timestep, hidden_states)
 
+        temb_img_silu = F.silu(temb)
+        if self.zero_cond_t:
+            temb_txt = temb.chunk(2, dim=0)[0]
+            temb_txt_silu = F.silu(temb_txt)
+        else:
+            temb_txt = temb
+            temb_txt_silu = temb_img_silu
+
         image_rotary_emb = freqs_cis
         for index_block, block in enumerate(self.transformer_blocks):
             encoder_hidden_states, hidden_states = block(
                 hidden_states=hidden_states,
                 encoder_hidden_states=encoder_hidden_states,
                 encoder_hidden_states_mask=encoder_hidden_states_mask,
-                temb=temb,
+                temb_img_silu=temb_img_silu,
+                temb_txt_silu=temb_txt_silu,
                 image_rotary_emb=image_rotary_emb,
                 joint_attention_kwargs=attention_kwargs,
                 modulate_index=modulate_index,
@@ -719,10 +727,8 @@ class QwenImageTransformer2DModel(CachableDiT):
                     hidden_states
                     + controlnet_block_samples[index_block // interval_control]
                 )
-        if self.zero_cond_t:
-            temb = temb.chunk(2, dim=0)[0]
         # Use only the image part (hidden_states) from the dual-stream blocks
-        hidden_states = self.norm_out(hidden_states, temb)
+        hidden_states = self.norm_out(hidden_states, temb_txt)
 
         output = self.proj_out(hidden_states)
         return output
