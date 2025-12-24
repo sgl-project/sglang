@@ -67,7 +67,7 @@ class RequestLogger:
         if self.log_requests_format == "json":
             log_data = {
                 "rid": obj.rid,
-                "obj": _dataclass_to_dict(obj, max_length, skip_names),
+                "obj": _transform_data_for_logging(obj, max_length, skip_names),
             }
             _log_json("request.received", log_data)
         else:
@@ -99,10 +99,10 @@ class RequestLogger:
         if self.log_requests_format == "json":
             log_data = {
                 "rid": obj.rid,
-                "obj": _dataclass_to_dict(obj, max_length, skip_names),
+                "obj": _transform_data_for_logging(obj, max_length, skip_names),
             }
             if not is_multimodal_gen:
-                log_data["out"] = _dataclass_to_dict(out, max_length, out_skip_names)
+                log_data["out"] = _transform_data_for_logging(out, max_length, out_skip_names)
             _log_json("request.finished", log_data)
         else:
             if is_multimodal_gen:
@@ -168,6 +168,7 @@ def _log_json(event: str, data: dict) -> None:
     print(json.dumps(log_data, ensure_ascii=False))
 
 
+# TODO unify this w/ `_transform_data_for_logging` if we find performance enough
 def _dataclass_to_string_truncated(
     data: Any, max_length: int = 2048, skip_names: Optional[Set[str]] = None
 ) -> str:
@@ -211,7 +212,7 @@ def _dataclass_to_string_truncated(
 
 
 
-def _dataclass_to_dict(
+def _transform_data_for_logging(
     data: Any, max_length: int = 2048, skip_names: Optional[Set[str]] = None
 ) -> Any:
     if skip_names is None:
@@ -225,17 +226,17 @@ def _dataclass_to_dict(
         if len(data) > max_length:
             half_length = max_length // 2
             return list(data[:half_length]) + ["..."] + list(data[-half_length:])
-        return [_dataclass_to_dict(v, max_length) for v in data]
+        return [_transform_data_for_logging(v, max_length) for v in data]
     elif isinstance(data, dict):
         return {
-            k: _dataclass_to_dict(v, max_length)
+            k: _transform_data_for_logging(v, max_length)
             for k, v in data.items()
             if k not in skip_names
         }
     elif dataclasses.is_dataclass(data):
         fields = dataclasses.fields(data)
         return {
-            f.name: _dataclass_to_dict(getattr(data, f.name), max_length)
+            f.name: _transform_data_for_logging(getattr(data, f.name), max_length)
             for f in fields
             if f.name not in skip_names
         }
