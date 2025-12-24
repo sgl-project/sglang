@@ -247,11 +247,14 @@ class DPCooperationInfo:
     num_prefill_ranks: int
     num_decode_ranks: int
 
+    # TODO handle more modes (e.g. speculative decoding)
     @staticmethod
     def create(forward_modes: List[int]):
-        # TODO handle more modes (e.g. speculative decoding)
-        ans = DPCooperationInfo(num_prefill_ranks=0, num_decode_ranks=0)
-        return TODO
+        counter = TODO
+        return DPCooperationInfo(
+            num_prefill_ranks=counter.get(ForwardMode.PREFILL.value, 0),
+            num_decode_ranks=counter.get(ForwardMode.DECODE.value, 0),
+        )
 
     def to_labels(self):
         return dataclasses.asdict(self)
