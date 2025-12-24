@@ -1266,10 +1266,36 @@ class ServerArgs:
                 f"Using {self.attention_backend} as attention backend for {model_arch}."
             )
         elif model_arch in ["KimiLinearForCausalLM"]:
-            logger.warning(
-                f"Disabling Radix Cache for {model_arch} as it is not yet supported."
-            )
-            self.disable_radix_cache = True
+            # Mamba radix cache v2
+            if self.enable_mamba_extra_buffer():
+                assert (
+                    is_cuda()
+                ), "Mamba extra_buffer is only supported on CUDA devices with FLA backend"
+                if self.speculative_num_draft_tokens is not None:
+                    assert (
+                        self.mamba_track_interval >= self.speculative_num_draft_tokens
+                    ), f"mamba_track_interval {self.mamba_track_interval} must be greater than or equal to speculative_num_draft_tokens {self.speculative_num_draft_tokens}"
+
+                if self.page_size is not None:
+                    assert (
+                        self.mamba_track_interval % self.page_size == 0
+                    ), f"mamba_track_interval {self.mamba_track_interval} must be divisible by page_size {self.page_size}"
+                    assert (
+                        FLA_CHUNK_SIZE % self.page_size == 0
+                    ), f"Page size for KimiLinear model must be divisible by {FLA_CHUNK_SIZE}, got {self.page_size}"
+            elif not self.disable_radix_cache:
+                logger.warning(
+                    "Disabling overlap schedule since MambaRadixCache no_buffer is not compatible with "
+                    "overlap schedule currently, try to use --mamba-scheduler-strategy extra_buffer to enable overlap schedule"
+                )
+                self.disable_overlap_schedule = True
+                if self.attention_backend == "trtllm_mha":
+                    logger.warning(
+                        "Disabling radix cache since trtllm_mha does not support page_size = 1, which is required by MambaRadixCache. "
+                        "Try to use --attention-backend triton if radix cache is necessary."
+                    )
+                    self.disable_radix_cache = True
+                    self.disable_overlap_schedule = False
         elif model_arch in ["NemotronHForCausalLM"]:
             assert (
                 not self.enable_mamba_extra_buffer()
