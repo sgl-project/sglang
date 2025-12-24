@@ -13,6 +13,7 @@
 
 #include "kernel.h"
 #include "marlin.cuh"
+#include "marlin_template.h"
 
 #ifndef MARLIN_NAMESPACE_NAME
 #define MARLIN_NAMESPACE_NAME marlin

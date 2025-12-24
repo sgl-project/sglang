@@ -154,8 +154,10 @@ constexpr int64_t fp8_e4m3fn_code = encode_dlpack_dtype(dl_fp8_e4m3fn);
     _TVM_FFI_UTILS_INLINE bool operator>(const dtype &lh, const other &rh) { return lh > dtype(rh); }
 // clang-format on
 
-#define _TVM_FFI_UTILS_HABS(dtype) \
-  _TVM_FFI_UTILS_INLINE dtype abs(dtype v) { return __habs(v); }
+#define _TVM_FFI_UTILS_HABS(dtype)           \
+  _TVM_FFI_UTILS_INLINE dtype abs(dtype v) { \
+    return __habs(v);                        \
+  }
 
 // ATen
 // 1. rely on implicitly conversion to float for comparisons

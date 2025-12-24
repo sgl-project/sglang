@@ -21,22 +21,22 @@
 
 namespace MARLIN_NAMESPACE_NAME {
 template <
-    typename scalar_t,                     // compute dtype, half or nv_float16
+    typename scalar_t,           // compute dtype, half or nv_float16
     const DLDataType w_type_id,  // weight ScalarType id
     const DLDataType s_type_id,  // weight scale ScalarType id
-    const int threads,                     // number of threads in a threadblock
-    const int thread_m_blocks,             // number of 16x16 blocks in the m
-                                           // dimension (batchsize) of the
-                                           // threadblock
-    const int thread_n_blocks,             // same for n dimension (output)
-    const int thread_k_blocks,             // same for k dimension (reduction)
-    const bool m_block_size_8,             // whether m_block_size == 8
-                                           // only works when thread_m_blocks == 1
-    const int stages,                      // number of stages for the async global->shared
-                                           // fetch pipeline
-    const int group_blocks,                // number of consecutive 16x16 blocks
-                                           // with a separate quantization scale
-    const bool is_zp_float                 // is zero point of float16 type?
+    const int threads,           // number of threads in a threadblock
+    const int thread_m_blocks,   // number of 16x16 blocks in the m
+                                 // dimension (batchsize) of the
+                                 // threadblock
+    const int thread_n_blocks,   // same for n dimension (output)
+    const int thread_k_blocks,   // same for k dimension (reduction)
+    const bool m_block_size_8,   // whether m_block_size == 8
+                                 // only works when thread_m_blocks == 1
+    const int stages,            // number of stages for the async global->shared
+                                 // fetch pipeline
+    const int group_blocks,      // number of consecutive 16x16 blocks
+                                 // with a separate quantization scale
+    const bool is_zp_float       // is zero point of float16 type?
     >
 __global__ void Marlin(MARLIN_KERNEL_PARAMS);
 
