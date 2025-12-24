@@ -882,9 +882,26 @@ def get_generate_fn(
         img_data = base64.b64decode(result.data[0].b64_json)
         # Infer expected format from request parameters
         expected_ext = get_expected_image_format(req_output_format, req_background)
-        tmp_path = f"{rid}.{expected_ext}"
+        expected_filename = f"{rid}.{expected_ext}"
+        tmp_path = expected_filename
         with open(tmp_path, "wb") as f:
             f.write(img_data)
+
+        # Validate output file
+        expected_width, expected_height = None, None
+        if output_size:
+            parts = output_size.split("x")
+            if len(parts) == 2:
+                expected_width, expected_height = int(parts[0]), int(parts[1])
+        validate_image_file(
+            tmp_path,
+            expected_filename,
+            expected_width,
+            expected_height,
+            output_format=req_output_format,
+            background=req_background,
+        )
+
         upload_file_to_slack(
             case_id=case_id,
             model=model_path,
@@ -935,9 +952,26 @@ def get_generate_fn(
         img_data = base64.b64decode(result.data[0].b64_json)
         # Infer expected format from request parameters
         expected_ext = get_expected_image_format(req_output_format, req_background)
-        tmp_path = f"{rid}.{expected_ext}"
+        expected_filename = f"{rid}.{expected_ext}"
+        tmp_path = expected_filename
         with open(tmp_path, "wb") as f:
             f.write(img_data)
+
+        # Validate output file
+        expected_width, expected_height = None, None
+        if sampling_params.output_size:
+            parts = sampling_params.output_size.split("x")
+            if len(parts) == 2:
+                expected_width, expected_height = int(parts[0]), int(parts[1])
+        validate_image_file(
+            tmp_path,
+            expected_filename,
+            expected_width,
+            expected_height,
+            output_format=req_output_format,
+            background=req_background,
+        )
+
         upload_file_to_slack(
             case_id=case_id,
             model=model_path,
