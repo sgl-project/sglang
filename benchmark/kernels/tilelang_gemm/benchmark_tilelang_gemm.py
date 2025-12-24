@@ -32,6 +32,7 @@ from sglang.srt.layers import tilelang_gemm_wrapper
 
 # Optional deep_gemm import
 try:
+    from sglang.srt.layers import deep_gemm_wrapper
     from deep_gemm.utils.layout import get_mn_major_tma_aligned_tensor
     DEEP_GEMM_AVAILABLE = True
 except ImportError:
@@ -109,7 +110,6 @@ def benchmark_deepgemm(
     rep: int = 100,
 ) -> Tuple[float, float, float]:
     """Benchmark DeepGEMM kernel."""
-    from sglang.srt.layers import deep_gemm_wrapper
     
     C = torch.zeros(M, N, dtype=torch.bfloat16, device="cuda")
     
@@ -167,15 +167,6 @@ def run_benchmark(
         logger.error(f"Run tuning first: python tune_tilelang_gemm.py --N {N} --K {K}")
         return []
     
-    # Check DeepGEMM availability
-    deepgemm_available = False
-    if DEEP_GEMM_AVAILABLE:
-        try:
-            from sglang.srt.layers import deep_gemm_wrapper
-            deepgemm_available = deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
-        except ImportError:
-            pass
-    
     results = []
     
     for M in tqdm(m_values, desc="Benchmarking TileLang"):
@@ -196,7 +187,7 @@ def run_benchmark(
                 continue
             
             # Benchmark DeepGEMM
-            if deepgemm_available:
+            if DEEP_GEMM_AVAILABLE:
                 try:
                     dg_ms, _, _ = benchmark_deepgemm(
                         A_fp8, B_fp8, A_scale_deepgemm, B_scale, M, N, rep
@@ -237,7 +228,7 @@ def run_benchmark(
     print(f"\n{'='*120}")
     print(f"Benchmark: TileLang vs DeepGEMM vs SGL-Kernel")
     print(f"N={N}, K={K}")
-    print(f"DeepGEMM available: {deepgemm_available}")
+    print(f"DeepGEMM available: {DEEP_GEMM_AVAILABLE}")
     print(f"SGL-Kernel available: {SGL_KERNEL_AVAILABLE}")
     print(f"{'='*120}\n")
     
