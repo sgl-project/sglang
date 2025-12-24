@@ -68,11 +68,9 @@ def get_case_est_time(case_id: str) -> float:
     if scenario is None:
         return DEFAULT_EST_TIME_SECONDS
 
-    # 优先使用显式设置的完整测试时间
     if scenario.estimated_full_test_time_s is not None:
         return scenario.estimated_full_test_time_s
 
-    # 回退：E2E时间 + 启动开销
     return scenario.expected_e2e_ms / 1000.0 + STARTUP_OVERHEAD_SECONDS
 
 
