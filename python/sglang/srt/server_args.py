@@ -1454,9 +1454,39 @@ class ServerArgs:
             )
             self.disable_radix_cache = True
         elif model_arch in ["NemotronHForCausalLM"]:
-            assert (
-                not self.enable_mamba_extra_buffer()
-            ), f"mamba extra_buffer is not supported for {model_arch} model"
+            if self.enable_mamba_extra_buffer():
+                assert is_cuda(), "Mamba extra_buffer is only supported on CUDA devices"
+                if self.speculative_num_draft_tokens is not None:
+                    assert (
+                        self.mamba_track_interval >= self.speculative_num_draft_tokens
+                    ), "mamba_track_interval must be >= to speculative_num_draft_tokens"
+                if self.page_size is not None:
+                    assert (
+                        self.mamba_track_interval % self.page_size == 0
+                    ), "mamba_track_interval must be divisible by page_size"
+            elif not self.disable_radix_cache:
+                logger.warning(
+                    "Disabling overlap schedule since MambaRadixCache no_buffer is not compatible with "
+                    "overlap schedule currently, try to use --mamba-scheduler-strategy extra_buffer to enable overlap schedule"
+                )
+                self.disable_overlap_schedule = True
+                if is_sm100_supported():
+                    if self.attention_backend is None:
+                        self.attention_backend = "flashinfer"
+                        logger.info(
+                            "Use flashinfer as attention backend on sm100 for NemotronHForCausalLM"
+                        )
+                    if self.attention_backend == "trtllm_mha":
+                        logger.warning(
+                            "Disabling radix cache since trtllm_mha does not support page_size = 1, which is required by MambaRadixCache. "
+                            "Try to use --attention-backend flashinfer if radix cache is necessary."
+                        )
+                        self.disable_radix_cache = True
+                        self.disable_overlap_schedule = False
+            assert self.attention_backend != "triton", (
+                "NemotronHForCausalLM does not support triton attention backend,"
+                "as the first layer might not be an attention layer"
+            )
             model_config = self.get_model_config()
             if model_config.quantization in [
                 "modelopt",
@@ -1474,35 +1504,6 @@ class ServerArgs:
                 else:
                     self.quantization = model_config.quantization
                 self.moe_runner_backend = "flashinfer_cutlass"
-
-            if not self.disable_radix_cache and self.speculative_algorithm is not None:
-                logger.warning(
-                    "Disabling radix cache since speculative decoding for NemotronHForCausalLM is not supported with radix cache yet."
-                )
-                self.disable_radix_cache = True
-            elif not self.disable_radix_cache:
-                logger.warning(
-                    "Disabling overlap schedule since MambaRadixCache is not compatible with "
-                    "overlap schedule currently, try to use --disable-radix-cache if overlap schedule is necessary"
-                )
-                self.disable_overlap_schedule = True
-                if is_sm100_supported():
-                    if self.attention_backend is None:
-                        self.attention_backend = "flashinfer"
-                        logger.info(
-                            "Use flashinfer as attention backend on sm100 for NemotronHForCausalLM"
-                        )
-                    if self.attention_backend == "trtllm_mha":
-                        logger.warning(
-                            "Disabling radix cache since trtllm_mha does not support page_size = 1, which is required by MambaRadixCache. "
-                            "Try to use --attention-backend triton if radix cache is necessary."
-                        )
-                        self.disable_radix_cache = True
-                        self.disable_overlap_schedule = False
-            assert self.attention_backend != "triton", (
-                "NemotronHForCausalLM does not support triton attention backend,"
-                "as the first layer might not be an attention layer"
-            )
         elif model_arch in [
             "Qwen3MoeForCausalLM",
             "Qwen3VLMoeForConditionalGeneration",
@@ -1610,13 +1611,20 @@ class ServerArgs:
             "JetNemotronForCausalLM",
             "JetVLMForConditionalGeneration",
         ]:
-            assert (
-                not self.enable_mamba_extra_buffer()
-            ), f"mamba extra_buffer is not supported for {model_arch} model"
-            if not self.disable_radix_cache:
+            if self.enable_mamba_extra_buffer():
+                assert is_cuda(), "Mamba extra_buffer is only supported on CUDA devices"
+                if self.speculative_num_draft_tokens is not None:
+                    assert (
+                        self.mamba_track_interval >= self.speculative_num_draft_tokens
+                    ), "mamba_track_interval must be >= to speculative_num_draft_tokens"
+                if self.page_size is not None:
+                    assert (
+                        self.mamba_track_interval % self.page_size == 0
+                    ), "mamba_track_interval must be divisible by page_size"
+            elif not self.disable_radix_cache:
                 logger.warning(
-                    "Disabling overlap schedule since mamba no_buffer is not compatible with "
-                    "overlap schedule, try to use --disable-radix-cache if overlap schedule is necessary"
+                    "Disabling overlap schedule since MambaRadixCache no_buffer is not compatible with "
+                    "overlap schedule currently, try to use --mamba-scheduler-strategy extra_buffer to enable overlap schedule"
                 )
                 self.disable_overlap_schedule = True
                 if is_sm100_supported():

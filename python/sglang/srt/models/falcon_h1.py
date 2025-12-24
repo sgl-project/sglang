@@ -348,6 +348,7 @@ class FalconH1HybridAttentionDecoderLayer(nn.Module):
                 hidden_states * self.ssm_in_multiplier,
                 mamba_hidden_states,
                 layer_id=self.layer_id,
+                forward_batch=forward_batch,
                 mup_vector=self.mup_vector,
             )
             mamba_hidden_states = mamba_hidden_states * self.ssm_out_multiplier
