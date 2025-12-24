@@ -83,10 +83,7 @@ class TestEnableMetrics(CustomTestCase):
                 value = _get_metric_value(metrics, metric_name, labels)
                 self.assertGreater(value, 0, f"{metric_name} {labels}")
 
-            num_prefill_ranks_values = {
-                sample.labels["num_prefill_ranks"]
-                for sample in metrics["sglang:dp_cooperation_realtime_tokens_total"]
-            }
+            num_prefill_ranks_values = {s.labels["num_prefill_ranks"] for s in metrics["sglang:dp_cooperation_realtime_tokens_total"]}
             self.assertIn("0", num_prefill_ranks_values)
             self.assertIn("1", num_prefill_ranks_values)
 
