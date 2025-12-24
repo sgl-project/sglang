@@ -1085,6 +1085,126 @@ class MHATokenToKVPoolFP4(MHATokenToKVPool):
             self.v_scale_buffer[layer_id - self.start_layer][loc] = cache_v_fp4_sf
 
 
+class MHATokenToKVPoolCPUFP8(MHATokenToKVPool):
+
+    def _create_buffers(self):
+        with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
+            with (
+                torch.cuda.use_mem_pool(self.custom_mem_pool)
+                if self.enable_custom_mem_pool
+                else nullcontext()
+            ):
+                # [size, head_num, head_dim] for each layer
+                # The padded slot 0 is used for writing dummy outputs from padded tokens.
+                self.k_buffer = [
+                    torch.zeros(
+                        (self.size + self.page_size, self.head_num, self.head_dim),
+                        dtype=self.store_dtype,
+                        device=self.device,
+                    )
+                    for _ in range(self.layer_num)
+                ]
+                self.v_buffer = [
+                    torch.zeros(
+                        (self.size + self.page_size, self.head_num, self.head_dim),
+                        dtype=self.store_dtype,
+                        device=self.device,
+                    )
+                    for _ in range(self.layer_num)
+                ]
+
+        self.k_data_ptrs = torch.tensor(
+            [x.data_ptr() for x in self.k_buffer],
+            dtype=torch.uint64,
+            device=self.device,
+        )
+        self.v_data_ptrs = torch.tensor(
+            [x.data_ptr() for x in self.v_buffer],
+            dtype=torch.uint64,
+            device=self.device,
+        )
+        self.data_ptrs = torch.cat([self.k_data_ptrs, self.v_data_ptrs], dim=0)
+        self.data_strides = torch.tensor(
+            [
+                np.prod(x.shape[1:]) * x.dtype.itemsize
+                for x in self.k_buffer + self.v_buffer
+            ],
+            device=self.device,
+        )
+
+        self.k_scale_buffer = [
+            torch.zeros(
+                (self.size + self.page_size, 1, 1),
+                dtype=torch.float32,
+                device=self.device,
+            )
+            for _ in range(self.layer_num)
+        ]
+        self.v_scale_buffer = [
+            torch.zeros(
+                (self.size + self.page_size, 1, 1),
+                dtype=torch.float32,
+                device=self.device,
+            )
+            for _ in range(self.layer_num)
+        ]
+
+    def _clear_buffers(self):
+        del self.k_buffer
+        del self.v_buffer
+        del self.k_scale_buffer
+        del self.v_scale_buffer
+
+    def _get_key_buffer(self, layer_id: int):
+        # for internal use of referencing
+        if self.store_dtype != self.dtype:
+            return (
+                self.k_buffer[layer_id - self.start_layer].view(self.dtype),
+                self.k_scale_buffer[layer_id - self.start_layer],
+            )
+        return self.k_buffer[layer_id - self.start_layer]
+
+    def _get_value_buffer(self, layer_id: int):
+        # for internal use of referencing
+        if self.store_dtype != self.dtype:
+            return (
+                self.v_buffer[layer_id - self.start_layer].view(self.dtype),
+                self.v_scale_buffer[layer_id - self.start_layer],
+            )
+        return self.v_buffer[layer_id - self.start_layer]
+
+    def set_kv_buffer(
+        self,
+        layer: RadixAttention,
+        loc: torch.Tensor,
+        cache_k: torch.Tensor,
+        cache_v: torch.Tensor,
+        k_scale: Optional[float] = None,
+        v_scale: Optional[float] = None,
+        layer_id_override: Optional[int] = None,
+    ):
+        if layer_id_override is not None:
+            layer_id = layer_id_override
+        else:
+            layer_id = layer.layer_id
+        if cache_k.dtype != self.dtype:
+            from sglang.srt.layers.quantization.fp8_utils import input_to_float8
+
+            cache_k_fp8, cache_k_scale = input_to_float8(cache_k, dtype=self.dtype)
+            cache_k = cache_k_fp8
+            cache_v_fp8, cache_v_scale = input_to_float8(cache_v, dtype=self.dtype)
+            cache_v = cache_v_fp8
+
+        if self.store_dtype != self.dtype:
+            cache_k = cache_k.view(self.store_dtype)
+            cache_v = cache_v.view(self.store_dtype)
+
+        self.k_buffer[layer_id - self.start_layer][loc] = cache_k
+        self.k_scale_buffer[layer_id - self.start_layer][loc] = cache_k_scale
+        self.v_buffer[layer_id - self.start_layer][loc] = cache_v
+        self.v_scale_buffer[layer_id - self.start_layer][loc] = cache_v_scale
+
+
 class HybridLinearKVPool(KVCache):
     """KV cache with separate pools for full and linear attention layers."""
 
@@ -1796,6 +1916,95 @@ class MLATokenToKVPoolFP4(MLATokenToKVPool):
                 cache_k_nope_fp4_sf,
                 cache_k_rope_fp4_sf,
             )
+
+
+class MLATokenToKVPoolCPUFP8(MLATokenToKVPool):
+
+    def _create_buffers(self):
+        with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
+            with (
+                torch.cuda.use_mem_pool(self.custom_mem_pool)
+                if self.custom_mem_pool
+                else nullcontext()
+            ):
+                # The padded slot 0 is used for writing dummy outputs from padded tokens.
+                self.kv_buffer = [
+                    torch.zeros(
+                        (self.size + self.page_size, 1, self.kv_cache_dim),
+                        dtype=self.store_dtype,
+                        device=self.device,
+                    )
+                    for _ in range(self.layer_num)
+                ]
+                self.kv_scale_buffer = [
+                    torch.zeros(
+                        (self.size + self.page_size, 1, 1),
+                        dtype=torch.float32,
+                        device=self.device,
+                    )
+                    for _ in range(self.layer_num)
+                ]
+
+        self.data_ptrs = torch.tensor(
+            [x.data_ptr() for x in self.kv_buffer],
+            dtype=torch.uint64,
+            device=self.device,
+        )
+
+    def _clear_buffers(self):
+        del self.kv_buffer
+        del self.kv_scale_buffer
+
+    def get_key_buffer(self, layer_id: int):
+        if self.layer_transfer_counter is not None:
+            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+
+        if self.store_dtype != self.dtype:
+            return (
+                self.kv_buffer[layer_id - self.start_layer].view(self.dtype),
+                self.kv_scale_buffer[layer_id - self.start_layer],
+            )
+
+        return self.kv_buffer[layer_id - self.start_layer]
+
+    def get_value_buffer(self, layer_id):
+        if self.layer_transfer_counter is not None:
+            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+
+        if self.store_dtype != self.dtype:
+            return (
+                self.kv_buffer[layer_id - self.start_layer][
+                    ..., : self.kv_lora_rank
+                ].view(self.dtype),
+                self.kv_scale_buffer[layer_id - self.start_layer],
+            )
+
+        return self.kv_buffer[layer_id - self.start_layer][..., : self.kv_lora_rank]
+
+    def set_kv_buffer(
+        self,
+        layer: RadixAttention,
+        loc: torch.Tensor,
+        cache_k: torch.Tensor,
+        cache_v: torch.Tensor,
+    ):
+        layer_id = layer.layer_id
+        assert not (self.use_nsa and self.nsa_kv_cache_store_fp8)
+        if cache_k.dtype != self.dtype:
+            from sglang.srt.layers.quantization.fp8_utils import input_to_float8
+
+            cache_k_fp8, cache_k_scale = input_to_float8(cache_k, dtype=self.dtype)
+            cache_k = cache_k_fp8
+
+        if self.store_dtype != self.dtype:
+            self.kv_buffer[layer_id - self.start_layer][loc] = cache_k.view(
+                self.store_dtype
+            )
+            self.kv_scale_buffer[layer_id - self.start_layer][loc] = cache_k_scale.view(
+                torch.float32
+            )
+        else:
+            self.kv_buffer[layer_id - self.start_layer][loc] = cache_k
 
 
 class NSATokenToKVPool(MLATokenToKVPool):
