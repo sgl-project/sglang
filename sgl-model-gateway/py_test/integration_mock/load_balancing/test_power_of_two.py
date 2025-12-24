@@ -22,7 +22,7 @@ def test_power_of_two_prefers_less_loaded(mock_workers, router_manager):
     rh = router_manager.start_router(
         worker_urls=urls,
         policy="power_of_two",
-        extra={"worker_startup_check_interval": 1},
+        extra={"worker_load_check_interval": 1},
     )
 
     # Prime: fire a burst to create measurable load on slow worker, then wait for monitor tick

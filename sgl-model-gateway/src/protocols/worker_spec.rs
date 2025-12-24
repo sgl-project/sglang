@@ -358,4 +358,6 @@ pub struct WorkerLoadInfo {
     pub worker_type: Option<String>,
     /// Current load (-1 indicates failure to fetch)
     pub load: isize,
+    /// Current dp rand load
+    pub dp_rank_loads: HashMap<isize, isize>,
 }
