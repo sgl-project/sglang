@@ -206,7 +206,7 @@ def _log_json(event: str, data: dict) -> None:
         "event": event,
         **data,
     }
-    print(json.dumps(log_data, ensure_ascii=False), file=sys.stderr, flush=True)
+    print(json.dumps(log_data, ensure_ascii=False), file=sys.stderr)
 
 
 def _dataclass_to_dict(
