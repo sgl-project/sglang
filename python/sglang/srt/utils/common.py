@@ -3827,7 +3827,10 @@ def get_current_device_numa_node() -> int:
     """
     Retrieve the NUMA node ID of the CPU socket closest to the currently active CUDA device.
 
-    Distributes GPUs evenly across NUMA nodes based on GPU ID.
+    First tries to query nvidia-smi topology. If it returns a single NUMA ID, uses that directly.
+    If it returns multiple NUMA IDs (comma/dash separated), falls back to distributing GPUs
+    evenly across NUMA nodes based on GPU ID intervals.
+
     For example, with 8 GPUs and 2 NUMA nodes: GPUs 0-3 -> node 0, GPUs 4-7 -> node 1.
 
     Returns:
@@ -3841,6 +3844,29 @@ def get_current_device_numa_node() -> int:
     logical_device_id = torch.cuda.current_device()
     physical_device_id = get_physical_device_id(logical_device_id)
 
+    # Try to get NUMA topology from nvidia-smi
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "topo", "-C", "-i", str(physical_device_id)],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+
+        output_line = result.stdout.strip()
+        prefix = "NUMA IDs of closest CPU:"
+
+        if output_line.startswith(prefix):
+            numa_id_str = output_line[len(prefix) :].strip()
+
+            # Check if it's a single NUMA ID (no comma or dash)
+            if "," not in numa_id_str and "-" not in numa_id_str:
+                return int(numa_id_str)
+
+    except (FileNotFoundError, subprocess.CalledProcessError, ValueError):
+        pass
+
+    # Fall back: distribute GPUs evenly across NUMA nodes
     numa_count = get_numa_node_count()
     gpu_count = get_system_gpu_count()
 
