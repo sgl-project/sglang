@@ -37,9 +37,11 @@ TILE_K = 128
 TILE_V = 32
 TILE_V_SMALL = 16
 NUM_STAGES = 2
-NUM_THREADS_BIG = 256
-NUM_THREADS_SMALL = 128
+NUM_THREADS = 128
 NUM_BLOCKS_PER_STATE_SMALL = 8
+
+# Big batch: 8 warps for bank-conflict-free access
+NUM_THREADS_BIG = 256
 NUM_WARPS_BIG = 8
 V_PER_WARP = 4
 ROWS_PER_ITER = 8
@@ -217,11 +219,11 @@ def _define_kernels():
                 sum_k += cute.arch.shuffle_sync_bfly(
                     sum_k, offset=offset, mask=-1, mask_and_clamp=31
                 )
-            norm_q = cute.sqrt(sum_q + 1e-6)
-            norm_k = cute.sqrt(sum_k + 1e-6)
+            inv_norm_q = cute.rsqrt(sum_q + 1e-6)
+            inv_norm_k = cute.rsqrt(sum_k + 1e-6)
             for i in range(vec_size):
-                r_q[i] = r_q[i] / norm_q
-                r_k[i] = r_k[i] / norm_k
+                r_q[i] = r_q[i] * inv_norm_q
+                r_k[i] = r_k[i] * inv_norm_k
 
         for i in range(vec_size):
             r_q[i] = r_q[i] * scale
@@ -302,7 +304,7 @@ def _define_kernels():
     def cpasync_swizzle_kernel_big_batch(
         tiled_copy_load: cute.TiledCopy,
         h0_source: cute.Tensor,
-        smem_layout_staged: cute.ComposedLayout,
+        smem_layout_staged: cute.Layout,
         num_v_tiles: cutlass.Constexpr[int],
         cu_seqlens: cute.Tensor,
         q: cute.Tensor,
@@ -327,7 +329,7 @@ def _define_kernels():
         use_qk_l2norm: cutlass.Constexpr[bool],
         is_varlen: cutlass.Constexpr[bool],
     ):
-        """Big Batch CP.ASYNC Kernel with BANK-CONFLICT-FREE access pattern."""
+        """Big Batch CP.ASYNC Kernel with PADDING for reduced bank conflict."""
         tidx, _, _ = cute.arch.thread_idx()
         in_warp_tid = tidx % 32
         warp_idx = cute.arch.warp_idx()
@@ -421,22 +423,32 @@ def _define_kernels():
                 smem_o[warp_idx + 8] = sum_k_partial
             cute.arch.barrier()
 
-            total_sum_q = 0.0
-            total_sum_k = 0.0
-            if tidx == 0:
-                for w in range(NUM_WARPS_BIG):
-                    total_sum_q += smem_o[w]
-                    total_sum_k += smem_o[w + 8]
-                smem_o[0] = cute.sqrt(total_sum_q + 1e-6)
-                smem_o[1] = cute.sqrt(total_sum_k + 1e-6)
+            inv_norm_q = 0.0
+            inv_norm_k = 0.0
+            if warp_idx == 0:
+                local_sum_q = 0.0
+                local_sum_k = 0.0
+                if in_warp_tid < NUM_WARPS_BIG:
+                    local_sum_q = smem_o[in_warp_tid]
+                    local_sum_k = smem_o[in_warp_tid + 8]
+                for offset in [4, 2, 1]:
+                    local_sum_q += cute.arch.shuffle_sync_bfly(
+                        local_sum_q, offset=offset, mask=-1, mask_and_clamp=31
+                    )
+                    local_sum_k += cute.arch.shuffle_sync_bfly(
+                        local_sum_k, offset=offset, mask=-1, mask_and_clamp=31
+                    )
+                if in_warp_tid == 0:
+                    smem_o[0] = cute.rsqrt(local_sum_q + 1e-6)
+                    smem_o[1] = cute.rsqrt(local_sum_k + 1e-6)
             cute.arch.barrier()
 
-            norm_q = smem_o[0]
-            norm_k = smem_o[1]
+            inv_norm_q = smem_o[0]
+            inv_norm_k = smem_o[1]
 
             if tidx < TILE_K:
-                sK[tidx] = sK[tidx] / norm_k
-                sQ[tidx] = sQ[tidx] * scale / norm_q
+                sK[tidx] = sK[tidx] * inv_norm_k
+                sQ[tidx] = sQ[tidx] * scale * inv_norm_q
             cute.arch.barrier()
         else:
             if tidx < TILE_K:
@@ -494,13 +506,10 @@ def _define_kernels():
                 )
 
             if k_local == 0:
-                smem_o[v_idx] = sum_hq
+                v_global_out = v_tile * TILE_V + v_idx
+                o[(i_n, i_t, i_hv, v_global_out)] = cutlass.BFloat16(sum_hq)
 
             cute.arch.barrier()
-
-            if tidx < TILE_V:
-                v_global_out = v_tile * TILE_V + tidx
-                o[(i_n, i_t, i_hv, v_global_out)] = cutlass.BFloat16(smem_o[tidx])
 
             for elem in range(16):
                 flat_idx = tidx + elem * 256
@@ -613,7 +622,7 @@ def _create_jit_functions():
             is_varlen,
         ).launch(
             grid=(batch_size * NUM_BLOCKS_PER_STATE_SMALL, 1, 1),
-            block=[NUM_THREADS_SMALL, 1, 1],
+            block=[NUM_THREADS, 1, 1],
             smem=smem_bytes_small,
             stream=stream,
         )
@@ -660,14 +669,19 @@ def _create_jit_functions():
 
         num_v_tiles = cute.ceil_div(v_dim, TILE_V)
 
-        base_smem_layout = cute.make_layout(
-            (TILE_K, TILE_V, NUM_STAGES), stride=(TILE_V, 1, TILE_K * TILE_V)
+        PADDING = 4
+        TILE_V_PADDED = TILE_V + PADDING
+        smem_layout_big = cute.make_layout(
+            (TILE_K, TILE_V, NUM_STAGES),
+            stride=(TILE_V_PADDED, 1, TILE_K * TILE_V_PADDED),
         )
-        swizzle_big = cute.make_swizzle(3, 2, 5)
-        smem_layout_big = cute.make_composed_layout(swizzle_big, 0, base_smem_layout)
 
         smem_bytes_big = (
-            4 * TILE_K * TILE_V * NUM_STAGES + 4 * TILE_V + 4 * TILE_K + 4 * TILE_K + 64
+            4 * TILE_K * TILE_V_PADDED * NUM_STAGES
+            + 4 * TILE_V
+            + 4 * TILE_K
+            + 4 * TILE_K
+            + 64
         )
 
         big_kernel(
@@ -849,31 +863,35 @@ def cutedsl_fused_sigmoid_gating_delta_rule_update(
     from_dlpack = _from_dlpack
     cuda = _cuda
 
-    # Get dimensions
-    B, T, H, K = q.shape
+    # Get dimensions from tensors
+    B_q, T, H, K = q.shape
     HV = v.shape[2]
     V = v.shape[3]
+
+    # In varlen mode, B from q.shape is 1, but actual batch size is len(initial_state_indices)
+    # N is the number of requests (for indexing state), B is the batch dim of q (usually 1 in varlen)
+    N = initial_state_indices.shape[0]
+    B = B_q  # Keep original B for output shape compatibility with Triton version
 
     if scale is None:
         scale = K**-0.5
 
-    # Determine batch size type
-    use_small_batch = B < SMALL_BATCH_THRESHOLD
+    # Determine batch size type based on number of requests
+    use_small_batch = N < SMALL_BATCH_THRESHOLD
 
-    # Reshape h0_source from [pool_size, HV, K, V] or flat to [B*HV, K, V]
-    # The kernel expects h0_source to be [B*HV, K, V] without transpose
+    # Reshape h0_source from [pool_size, HV, K, V] to [N*HV, K, V]
+    # where N is the number of requests (from initial_state_indices)
+    # The kernel expects h0_source to be [N*HV, K, V] without transpose
     if initial_state_source.dim() == 1:
         # Flat tensor - reshape based on indices
-        # This assumes the tensor is laid out as [pool_size * HV * K * V]
-        # We need to extract the relevant states
         pool_size = initial_state_source.numel() // (HV * K * V)
         h0_full = initial_state_source.view(pool_size, HV, K, V)
-        h0_source = h0_full[initial_state_indices].reshape(B * HV, K, V).contiguous()
+        h0_source = h0_full[initial_state_indices].reshape(N * HV, K, V).contiguous()
     elif initial_state_source.dim() == 4:
         # [pool_size, HV, K, V] - extract relevant states
         h0_source = (
             initial_state_source[initial_state_indices]
-            .reshape(B * HV, K, V)
+            .reshape(N * HV, K, V)
             .contiguous()
         )
     else:
@@ -888,26 +906,26 @@ def cutedsl_fused_sigmoid_gating_delta_rule_update(
     if cu_seqlens is None:
         cu_seqlens = torch.zeros(B + 1, dtype=torch.int32, device=q.device)
 
-    # Convert tensors to CuTe format
-    cu_seqlens_tensor = from_dlpack(cu_seqlens, assumed_align=16)
-    q_tensor = from_dlpack(q.contiguous(), assumed_align=16)
-    k_tensor = from_dlpack(k.contiguous(), assumed_align=16)
-    v_tensor = from_dlpack(v.contiguous(), assumed_align=16)
-    a_tensor = from_dlpack(a.contiguous(), assumed_align=16)
-    b_tensor = from_dlpack(b.contiguous(), assumed_align=16)
-    A_log_tensor = from_dlpack(A_log.contiguous(), assumed_align=16)
-    dt_bias_tensor = from_dlpack(dt_bias.contiguous(), assumed_align=16)
-    h0_source_tensor = from_dlpack(h0_source, assumed_align=16)
+    # Convert tensors to CuTe format (detach to remove gradient tracking for dlpack)
+    cu_seqlens_tensor = from_dlpack(cu_seqlens.detach(), assumed_align=16)
+    q_tensor = from_dlpack(q.detach().contiguous(), assumed_align=16)
+    k_tensor = from_dlpack(k.detach().contiguous(), assumed_align=16)
+    v_tensor = from_dlpack(v.detach().contiguous(), assumed_align=16)
+    a_tensor = from_dlpack(a.detach().contiguous(), assumed_align=16)
+    b_tensor = from_dlpack(b.detach().contiguous(), assumed_align=16)
+    A_log_tensor = from_dlpack(A_log.detach().contiguous(), assumed_align=16)
+    dt_bias_tensor = from_dlpack(dt_bias.detach().contiguous(), assumed_align=16)
+    h0_source_tensor = from_dlpack(h0_source.detach(), assumed_align=16)
     h0_indices_tensor = from_dlpack(
-        initial_state_indices.contiguous(), assumed_align=16
+        initial_state_indices.detach().contiguous(), assumed_align=16
     )
-    o_tensor = from_dlpack(o, assumed_align=16)
+    o_tensor = from_dlpack(o.detach(), assumed_align=16)
 
     # Get CUDA stream
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
-    # Get compiled kernel
-    compiled_kernel = _get_compiled_kernel(B, T, H, HV, K, V, use_small_batch)
+    # Get compiled kernel (N is the actual batch size for state operations)
+    compiled_kernel = _get_compiled_kernel(N, T, H, HV, K, V, use_small_batch)
 
     # Run the kernel
     compiled_kernel(
@@ -928,12 +946,12 @@ def cutedsl_fused_sigmoid_gating_delta_rule_update(
     # Write back the updated states to the original tensor
     if initial_state_source.dim() == 1:
         # Flat tensor
-        h0_updated = h0_source.view(B, HV, K, V)
+        h0_updated = h0_source.view(N, HV, K, V)
         pool_size = initial_state_source.numel() // (HV * K * V)
         h0_full = initial_state_source.view(pool_size, HV, K, V)
         h0_full[initial_state_indices] = h0_updated
     elif initial_state_source.dim() == 4:
-        h0_updated = h0_source.view(B, HV, K, V)
+        h0_updated = h0_source.view(N, HV, K, V)
         initial_state_source[initial_state_indices] = h0_updated
 
     return o
