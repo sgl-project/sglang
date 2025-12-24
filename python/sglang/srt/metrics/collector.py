@@ -729,7 +729,11 @@ class SchedulerMetricsCollector:
         )
 
     def increment_realtime_tokens(
-        self, prefill_compute_tokens=0, prefill_cache_tokens=0, decode_tokens=0
+        self,
+        prefill_compute_tokens=0,
+        prefill_cache_tokens=0,
+        decode_tokens=0,
+        dp_cooperation_info=None,
     ):
         for mode, delta in [
             ("prefill_compute", prefill_compute_tokens),
@@ -737,10 +741,27 @@ class SchedulerMetricsCollector:
             ("decode", decode_tokens),
         ]:
             self.realtime_tokens_total.labels(**self.labels, mode=mode).inc(delta)
+            if dp_cooperation_info is not None:
+                self.dp_cooperation_realtime_tokens_total.labels(
+                    **self.labels,
+                    mode=mode,
+                    **dp_cooperation_info,
+                ).inc(delta)
 
-    def increment_gpu_execution_seconds(self, category: str, t: float):
+    def increment_gpu_execution_seconds(
+        self,
+        category: str,
+        t: float,
+        dp_cooperation_info=None,
+    ):
         logger.debug(f"GPU execution seconds: {category=} {t=:.3f}")
         self.gpu_execution_seconds_total.labels(**self.labels, category=category).inc(t)
+        if dp_cooperation_info is not None:
+            self.dp_cooperation_gpu_execution_seconds_total.labels(
+                **self.labels,
+                category=category,
+                **dp_cooperation_info,
+            ).inc(t)
 
     def log_stats(self, stats: SchedulerStats) -> None:
         self._log_gauge(self.num_running_reqs, stats.num_running_reqs)
