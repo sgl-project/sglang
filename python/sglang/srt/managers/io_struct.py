@@ -255,7 +255,6 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
 
     need_wait_for_mm_inputs: Optional[bool] = None
     num_items_assigned: Optional[Dict[Union[str, int], List[int]]] = None
-    embedding_ports: Optional[List] = None
 
     def contains_mm_input(self) -> bool:
         return (
@@ -742,7 +741,6 @@ class TokenizedGenerateReqInput(BaseReq):
 
     need_wait_for_mm_inputs: bool = False
     num_items_assigned: Optional[Dict[Union[str, int], List[int]]] = None
-    embedding_ports: Optional[List] = None
 
 
 @dataclass
