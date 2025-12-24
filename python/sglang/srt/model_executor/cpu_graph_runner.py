@@ -101,8 +101,7 @@ def get_batch_sizes_to_capture(model_runner: ModelRunner):
     server_args = model_runner.server_args
     # cpu torch compile only speeds up decoding by
     # reducing python overhead when bs is small
-    # capture_bs = list(range(1, 16)) + list(range(18, 31, 2)) + list(range(32, 81, 4)) + list(range(80, 129, 8))
-    capture_bs = [1,]
+    capture_bs = list(range(1, 17))
     capture_bs = [bs for bs in capture_bs if bs <= server_args.torch_compile_max_bs]
     capture_bs = [bs for bs in capture_bs if bs <= model_runner.req_to_token_pool.size]
     capture_bs = list(sorted(set(capture_bs)))
@@ -368,35 +367,6 @@ def register_fake_ops():
     # def _(input):
     #     return
 
-
-def dump_forward_batch(fb, name="forward_batch"):
-    print(f"\n==== {name} ====", flush=True)
-
-    # 1. 拿到所有字段
-    if is_dataclass(fb):
-        # ForwardBatch 基本是 dataclass，这样最保险
-        fields = {k: getattr(fb, k) for k in fb.__dataclass_fields__}
-    else:
-        fields = vars(fb)
-
-    # 2. 按字段名排序，方便对比两次的差异
-    for k in sorted(fields.keys()):
-        v = fields[k]
-        if torch.is_tensor(v):
-            print(
-                f"{k}: "
-                f"Tensor(shape={tuple(v.shape)}, dtype={v.dtype}, device={v.device}, "
-                f"requires_grad={v.requires_grad})",
-                flush=True
-            )
-        elif isinstance(v, (list, tuple)) and v and torch.is_tensor(v[0]):
-            print(
-                f"{k}: list[Tensor] (len={len(v)}), "
-                f"first.shape={tuple(v[0].shape)}, first.dtype={v[0].dtype}",
-                flush=True
-            )
-        else:
-            print(f"{k}: {type(v).__name__} = {v!r}", flush=True)
 
 # TODO Remove unnecessary settings for CPUGraphRunner.
 # Re-abstract the graph runner and restructure CPUGraphRunner to reuse the same logic.

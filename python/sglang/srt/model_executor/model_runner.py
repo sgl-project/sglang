@@ -253,34 +253,6 @@ def resolve_language_model(model: nn.Module) -> nn.Module:
         return model.thinker.model
     return model.model
 
-def dump_forward_batch(fb, name="forward_batch"):
-    print(f"\n==== {name} ====")
-
-    # 1. 拿到所有字段
-    if is_dataclass(fb):
-        # ForwardBatch 基本是 dataclass，这样最保险
-        fields = {k: getattr(fb, k) for k in fb.__dataclass_fields__}
-    else:
-        fields = vars(fb)
-
-    # 2. 按字段名排序，方便对比两次的差异
-    for k in sorted(fields.keys()):
-        v = fields[k]
-        if torch.is_tensor(v):
-            print(
-                f"{k}: "
-                f"Tensor(shape={tuple(v.shape)}, dtype={v.dtype}, device={v.device}, "
-                f"requires_grad={v.requires_grad})",
-                flush=True
-            )
-        elif isinstance(v, (list, tuple)) and v and torch.is_tensor(v[0]):
-            print(
-                f"{k}: list[Tensor] (len={len(v)}), "
-                f"first.shape={tuple(v[0].shape)}, first.dtype={v[0].dtype}",
-                flush=True
-            )
-        else:
-            print(f"{k}: {type(v).__name__} = {v!r}", flush=True)
 
 class RankZeroFilter(logging.Filter):
     """Filter that only allows INFO level logs from rank 0, but allows all other levels from any rank."""
@@ -2725,19 +2697,6 @@ class ModelRunner:
 
         # print("self.spec_algorithm.is_eagle3(): ", self.spec_algorithm.is_eagle3())
         if can_run_graph:
-            # dump_forward_batch(forward_batch)
-            # print("--------------------------------------------------------", flush=True)
-            # forward_batch.sampling_info=None
-            # dump_forward_batch(forward_batch)
-            # print("forward_batch: ", forward_batch, flush=True)
-            # print("forward input id shape: ", forward_batch.input_ids.shape, flush=True)
-            # print("fowward seq_lens: ", forward_batch.seq_lens, flush=True)
-            # print("fowward seq_lens shape: ", forward_batch.seq_lens.shape, flush=True)
-            # print("forward extend_prefix_lens : ", forward_batch.extend_prefix_lens, flush=True)
-            # print("forward extend_prefix_lens shape: ", forward_batch.extend_prefix_lens.shape, flush=True)
-            # print("forward positions shape: ", forward_batch.positions.shape, flush=True)
-            # print("forward req_pool_indices shape: ", forward_batch.req_pool_indices.shape, flush=True)
-
             ret = self.graph_runner.replay(
                 forward_batch,
                 skip_attn_backend_init=skip_attn_backend_init,

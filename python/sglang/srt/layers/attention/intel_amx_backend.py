@@ -46,7 +46,7 @@ class IntelAMXAttnBackend(AttentionBackend):
         if forward_batch.forward_mode.is_decode_or_idle():
             max_extend_len = None
         else:
-            max_extend_len = torch.max(forward_batch.extend_seq_lens)#.item()
+            max_extend_len = torch.max(forward_batch.extend_seq_lens)
         self.forward_metadata = (attn_logits, max_extend_len)
 
     def get_graph_seq_len_fill_value(self):
