@@ -702,10 +702,10 @@ class GroupCoordinator:
 
         chunk_size = input_tensor.shape[0] // world_size
         output_shape = (chunk_size,) + input_tensor.shape[1:]
-
-        output_tensor = torch.empty(
-            output_shape, dtype=input_tensor.dtype, device=input_tensor.device
-        )
+        with self.use_symmetric_memory(self):
+            output_tensor = torch.empty(
+                output_shape, dtype=input_tensor.dtype, device=input_tensor.device
+            )
 
         # Perform reduce-scatter operation
         self.reduce_scatter_tensor(output_tensor, input_tensor)
@@ -1481,7 +1481,9 @@ def graph_capture(stream: Optional[torch.cuda.Stream] = None):
     """
     with get_tp_group().graph_capture(
         stream=stream
-    ) as context, get_pp_group().graph_capture(context):
+    ) as context, get_pp_group().graph_capture(context), get_dcp_group().graph_capture(
+        context
+    ):
         yield context
 
 
