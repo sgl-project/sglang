@@ -236,6 +236,20 @@ class SchedulerMetricsMixin:
                 prefill_cache_tokens=adder.log_hit_tokens,
             )
 
+            # Cache monitoring metrics
+            if (
+                hasattr(self, "tree_cache")
+                and self.tree_cache is not None
+                and self.tree_cache.metrics_collector is not None
+            ):
+                cache_stats = self.tree_cache.get_cache_stats()
+                self.tree_cache.metrics_collector.set_cache_entry_count(
+                    cache_stats["entry_count"]
+                )
+                self.tree_cache.metrics_collector.set_cache_total_tokens(
+                    cache_stats["total_tokens"]
+                )
+
             # Others
             self.calculate_utilization()
             self.metrics_collector.log_stats(self.stats)
