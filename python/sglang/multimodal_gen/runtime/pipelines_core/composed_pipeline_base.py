@@ -372,4 +372,4 @@ class ComposedPipelineBase(ABC):
             main_process_only=True,
         )
 
-        return self.executor.execute(self.stages, batch, server_args)
+        return self.executor.execute_with_profiling(self.stages, batch, server_args)
