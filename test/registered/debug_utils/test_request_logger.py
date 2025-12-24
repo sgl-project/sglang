@@ -77,10 +77,7 @@ class TestRequestLoggerJson(BaseTestRequestLogger, CustomTestCase):
         for line in combined_output.splitlines():
             if not line.startswith("{"):
                 continue
-            try:
-                data = json.loads(line)
-            except json.JSONDecodeError:
-                continue
+            data = json.loads(line)
             if data.get("event") == "request.received":
                 self.assertIn("rid", data)
                 self.assertIn("obj", data)

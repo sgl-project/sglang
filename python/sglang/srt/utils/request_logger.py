@@ -165,7 +165,7 @@ def _log_json(event: str, data: dict) -> None:
         "event": event,
         **data,
     }
-    print(json.dumps(log_data, ensure_ascii=False))
+    print(json.dumps(log_data, ensure_ascii=False), flush=True)
 
 
 # TODO unify this w/ `_transform_data_for_logging` if we find performance enough
