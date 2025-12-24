@@ -874,7 +874,6 @@ class TokenizerManager(
                 extra_key=obj.extra_key,
                 need_wait_for_image=obj.need_wait_for_image,
                 num_items_assigned=obj.num_items_assigned,
-                embedding_ports=obj.embedding_ports,
             )
         elif isinstance(obj, EmbeddingReqInput):
             tokenized_obj = TokenizedEmbeddingReqInput(
@@ -1029,6 +1028,8 @@ class TokenizerManager(
         request: Optional[fastapi.Request] = None,
     ):
         """Wait for the response of one request."""
+        # Not all request types have `stream` (e.g., EmbeddingReqInput). Default to non-streaming.
+        is_stream = getattr(obj, "stream", False)
         while True:
             try:
                 await asyncio.wait_for(state.event.wait(), timeout=4)
@@ -1084,7 +1085,7 @@ class TokenizerManager(
                         finish_reason.get("type") == "abort"
                         and finish_reason.get("status_code") == HTTPStatus.BAD_REQUEST
                     ):
-                        if not obj.stream:
+                        if not is_stream:
                             raise ValueError(finish_reason["message"])
                         else:
                             yield out
@@ -1105,7 +1106,7 @@ class TokenizerManager(
                         # Mark ongoing LoRA request as finished.
                         if self.server_args.enable_lora and state.obj.lora_path:
                             await self.lora_registry.release(state.obj.lora_id)
-                        if not obj.stream:
+                        if not is_stream:
                             raise fastapi.HTTPException(
                                 status_code=finish_reason["status_code"],
                                 detail=finish_reason["message"],
@@ -1118,11 +1119,11 @@ class TokenizerManager(
 
             state.event.clear()
 
-            if obj.stream:
+            if is_stream:
                 # For beam search, skip intermediate results and only yield when finished
                 if out.get("beam_results"):
                     continue
-
+              
                 # Record response sent time right before we send response.
                 if not state.response_sent_to_client_ts:
                     state.response_sent_to_client_ts = time.time()
@@ -1644,7 +1645,9 @@ class TokenizerManager(
 
             if isinstance(recv_obj, BatchStrOutput):
                 state.text += recv_obj.output_strs[i]
-                if self.server_args.stream_output and state.obj.stream:
+                # Not all request types have `stream` (e.g., EmbeddingReqInput). Default to non-streaming.
+                is_stream = getattr(state.obj, "stream", False)
+                if self.server_args.stream_output and is_stream:
                     state.output_ids.extend(recv_obj.output_ids[i])
                     output_token_ids = state.output_ids[state.last_output_offset :]
                     state.last_output_offset = len(state.output_ids)
@@ -1658,7 +1661,8 @@ class TokenizerManager(
                     "meta_info": meta_info,
                 }
             elif isinstance(recv_obj, BatchTokenIDOutput):
-                if self.server_args.stream_output and state.obj.stream:
+                is_stream = getattr(state.obj, "stream", False)
+                if self.server_args.stream_output and is_stream:
                     state.output_ids.extend(recv_obj.output_ids[i])
                     output_token_ids = state.output_ids[state.last_output_offset :]
                     state.last_output_offset = len(state.output_ids)
