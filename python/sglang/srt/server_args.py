@@ -634,6 +634,7 @@ class ServerArgs:
     mm_per_request_timeout: float = 10.0
     enable_broadcast_mm_inputs_process: bool = False
     enable_prefix_mm_cache: bool = False
+    enable_clear_mm_features_for_decode: bool = False
     mm_enable_dp_encoder: bool = False
     mm_process_config: Optional[Dict[str, Any]] = None
 
@@ -4391,6 +4392,13 @@ class ServerArgs:
             action="store_true",
             default=ServerArgs.enable_broadcast_mm_inputs_process,
             help="Enable broadcast mm-inputs process in scheduler.",
+        )
+
+        parser.add_argument(
+            "--enable-clear-mm-features-for-decode",
+            action="store_true",
+            default=ServerArgs.enable_clear_mm_features_for_decode,
+            help="Clear multimodal features before sending to scheduler to reduce transfer overhead.",
         )
         parser.add_argument(
             "--mm-process-config",
