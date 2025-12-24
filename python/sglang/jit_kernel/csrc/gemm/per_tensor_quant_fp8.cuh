@@ -8,17 +8,6 @@
 #include <cub/block/block_reduce.cuh>
 #include <flashinfer/vec_dtypes.cuh>
 
-namespace host {
-namespace details {
-
-template <>
-struct dtype_trait<__nv_fp8_e4m3> {
-  inline static constexpr DLDataType value = {.code = DLDataTypeCode::kDLFloat8_e4m3fn, .bits = 8, .lanes = 1};
-};
-
-}  // namespace details
-}  // namespace host
-
 namespace {
 
 using device::atomicMaxFloat;
@@ -120,7 +109,7 @@ void per_tensor_quant_fp8(tvm::ffi::TensorView input, tvm::ffi::TensorView outpu
   SymbolicDevice device_;
   SymbolicDType input_dtype;
 
-  TensorMatcher({num_tokens, hidden_dim})
+  TensorMatcher({num_tokens, hidden_dim})  //
       .with_dtype<float, __half, __nv_bfloat16>(input_dtype)
       .with_device<kDLCUDA>(device_)
       .verify(input);

@@ -8,6 +8,6 @@
 
 namespace device {
 
-constexpr float FP8_E4M3_MAX = 448.0f;
+inline constexpr float FP8_E4M3_MAX = 448.0f;
 
 }  // namespace device
