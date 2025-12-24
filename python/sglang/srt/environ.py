@@ -7,6 +7,8 @@ from typing import Any
 
 
 class EnvField:
+    _allow_set_name = True
+
     def __init__(self, default: Any):
         self.default = default
         # NOTE: we use None to indicate whether the value is set or not
@@ -15,6 +17,7 @@ class EnvField:
         self._set_to_none = False
 
     def __set_name__(self, owner, name):
+        assert EnvField._allow_set_name, "Usage like `a = envs.A` is not allowed"
         self.name = name
 
     def parse(self, value: str) -> Any:
@@ -147,7 +150,11 @@ class Envs:
     # Test & Debug
     SGLANG_IS_IN_CI = EnvBool(False)
     SGLANG_IS_IN_CI_AMD = EnvBool(False)
+    SGLANG_TEST_STUCK_DETOKENIZER = EnvFloat(0)
+    SGLANG_TEST_STUCK_DP_CONTROLLER = EnvFloat(0)
+    SGLANG_TEST_STUCK_TOKENIZER = EnvFloat(0)
     IS_BLACKWELL = EnvBool(False)
+    IS_H200 = EnvBool(False)
     SGLANG_SET_CPU_AFFINITY = EnvBool(False)
     SGLANG_PROFILE_WITH_STACK = EnvBool(True)
     SGLANG_PROFILE_RECORD_SHAPES = EnvBool(True)
@@ -281,6 +288,7 @@ class Envs:
     SGLANG_DG_CACHE_DIR = EnvStr(os.path.expanduser("~/.cache/deep_gemm"))
     SGLANG_DG_USE_NVRTC = EnvBool(False)
     SGLANG_USE_DEEPGEMM_BMM = EnvBool(False)
+    SGLANG_CHUNKED_PREFIX_CACHE_THRESHOLD = EnvInt(8192)
 
     # DeepEP
     SGLANG_DEEPEP_BF16_DISPATCH = EnvBool(False)
@@ -336,11 +344,15 @@ class Envs:
     SGLANG_RESIZE_RESAMPLE = EnvStr("")
     SGLANG_MM_BUFFER_SIZE_MB = EnvInt(0)
     SGLANG_MM_PRECOMPUTE_HASH = EnvBool(False)
+    SGLANG_VIT_ENABLE_CUDA_GRAPH = EnvBool(False)
 
     # VLM Item CUDA IPC Transport
-    SGLANG_USE_CUDA_IPC_TRANSPORT=EnvBool(False)
+    SGLANG_USE_CUDA_IPC_TRANSPORT = EnvBool(False)
     SGLANG_MM_FEATURE_CACHE_MB = EnvInt(4 * 1024)
     SGLANG_MM_ITEM_MEM_POOL_RECYCLE_INTERVAL_SEC = EnvFloat(0.05)
+
+    # MM splitting behavior control
+    SGLANG_ENABLE_MM_SPLITTING = EnvBool(False)
 
     # Release & Resume Memory
     SGLANG_MEMORY_SAVER_CUDA_GRAPH = EnvBool(False)
@@ -379,6 +391,7 @@ class Envs:
 
 
 envs = Envs()
+EnvField._allow_set_name = False
 
 
 def _print_deprecated_env(new_name: str, old_name: str):
