@@ -210,7 +210,7 @@ impl PreprocessedImages {
     pub fn pixel_values_flat(&self) -> Cow<'_, [f32]> {
         match self.pixel_values.as_slice() {
             Some(slice) => Cow::Borrowed(slice),
-            None => Cow::Owned(self.pixel_values.iter().copied().collect()),
+            None => Cow::Owned(self.pixel_values.to_vec()),
         }
     }
 
