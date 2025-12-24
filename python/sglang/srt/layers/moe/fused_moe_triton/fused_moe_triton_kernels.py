@@ -629,7 +629,12 @@ def invoke_fused_moe_kernel(
     assert sorted_token_ids.stride(0) == 1
 
     swap_ab = False
-    if use_fp8_w8a8 and is_sm90_supported() and config["BLOCK_SIZE_M"] < 64 and config["BLOCK_SIZE_N"] >= 64:
+    if (
+        use_fp8_w8a8
+        and is_sm90_supported()
+        and config["BLOCK_SIZE_M"] < 64
+        and config["BLOCK_SIZE_N"] >= 64
+    ):
         swap_ab = True
 
     padded_size = 0
