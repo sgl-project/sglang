@@ -284,6 +284,8 @@ class Envs:
 
     # TileLang GEMM
     SGLANG_TILELANG_GEMM_CONFIG_DIR = EnvStr("")
+    SGLANG_TILELANG_GEMM_PRECOMPILE = EnvBool(True)
+    SGLANG_IN_TILELANG_PRECOMPILE_STAGE = EnvBool(False)
 
     # DeepEP
     SGLANG_DEEPEP_BF16_DISPATCH = EnvBool(False)

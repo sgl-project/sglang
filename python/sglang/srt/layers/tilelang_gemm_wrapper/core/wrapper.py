@@ -7,11 +7,17 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 import torch
 
+from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+    disable_symmetric_memory_context,
+    restore_symmetric_memory_context,
+)
+from sglang.srt.environ import envs
 from sglang.srt.layers.tilelang_gemm_wrapper.core.config_loader import ConfigLoader
 from sglang.srt.layers.tilelang_gemm_wrapper.core.kernel_registry import (
     get_kernel_factory,
     is_registry_available,
 )
+from sglang.srt.utils import get_bool_env_var
 
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
@@ -21,6 +27,9 @@ logger = logging.getLogger(__name__)
 # Global config (similar to DeepGEMM's _BUILTIN_M_LIST)
 _M_MAX = 1024 * 16  # Default m_max
 _DO_COMPILE_ALL = True
+_IS_FIRST_RANK_ON_NODE = get_bool_env_var("SGLANG_IS_FIRST_RANK_ON_NODE", "true")
+_IN_PRECOMPILE_STAGE = get_bool_env_var("SGLANG_IN_TILELANG_PRECOMPILE_STAGE", "false")
+_ENABLE_TILELANG_PRECOMPILE = envs.SGLANG_TILELANG_GEMM_PRECOMPILE.get()
 _INITIALIZATION_DICT: Dict[Tuple[int, int], bool] = dict()
 
 
@@ -31,7 +40,7 @@ def update_tilelang_config(gpu_id: int, server_args: "ServerArgs"):
         gpu_id: Current GPU ID
         server_args: Server arguments
     """
-    global _M_MAX, _DO_COMPILE_ALL
+    global _M_MAX, _DO_COMPILE_ALL, _IS_FIRST_RANK_ON_NODE
 
     # Generate m_max (same logic as DeepGEMM)
     m_max = 1024 * 16
@@ -41,8 +50,12 @@ def update_tilelang_config(gpu_id: int, server_args: "ServerArgs"):
         m_max = server_args.chunked_prefill_size * 2
     _M_MAX = min(1024 * 128, m_max)
 
-    # Only first rank on node does compilation
-    _DO_COMPILE_ALL = server_args.base_gpu_id == gpu_id
+    _IS_FIRST_RANK_ON_NODE = server_args.base_gpu_id == gpu_id
+
+    # Check if is the first rank on node.
+    # Default each rank will try compile all Ms to load all symbols at the launch stages.
+    # Avoid loading symbols at the serving stages.
+    _DO_COMPILE_ALL = _IS_FIRST_RANK_ON_NODE
 
     logger.info(
         f"TileLang config updated: m_max={_M_MAX}, do_compile_all={_DO_COMPILE_ALL}"
@@ -313,20 +326,55 @@ def _maybe_compile_tilelang_all(n: int, k: int) -> None:
     """Compile all M kernels for (N, K) if not already done.
 
     Similar to DeepGEMM's _maybe_compile_deep_gemm_one_type_all.
+    This ensures all kernel compilation happens BEFORE cudagraph capture.
     """
     global _INITIALIZATION_DICT
 
     cache_key = (n, k)
-    if cache_key in _INITIALIZATION_DICT:
-        return
-
-    if not _DO_COMPILE_ALL:
+    if (
+        _ENABLE_TILELANG_PRECOMPILE
+        and _DO_COMPILE_ALL
+        and _INITIALIZATION_DICT.get(cache_key) is None
+    ):
         _INITIALIZATION_DICT[cache_key] = True
-        return
 
-    wrapper = get_global_wrapper()
-    wrapper.warmup_all_m(n, k, m_max=_M_MAX)
-    _INITIALIZATION_DICT[cache_key] = True
+        if not _IN_PRECOMPILE_STAGE and _IS_FIRST_RANK_ON_NODE:
+            logger.warning(
+                "Entering TileLang GEMM JIT Pre-Compile session. "
+                "It may take a long time if you have not run `sglang.compile_tilelang_gemm`. "
+                "It is recommended to run `sglang.compile_tilelang_gemm` with same args as `sglang.launch_server` "
+                "for pre-compilation to reduce the overhead if you have not run it before. "
+                "For example: "
+                "`python3 -m sglang.compile_tilelang_gemm --model Qwen/Qwen3-0.6B-FP8 --tp 1`"
+            )
+
+        logger.info(
+            f"Try TileLang GEMM JIT Compiling for N={n}, K={k} with all Ms."
+            f"{' It only takes a little time if you have run `python3 -m sglang.compile_tilelang_gemm`. ' if not _IN_PRECOMPILE_STAGE else ''}"
+        )
+
+        _compile_tilelang_all(n, k, m_max=_M_MAX)
+
+
+def _compile_tilelang_all(n: int, k: int, m_max: int) -> None:
+    """Compile all M kernels for (N, K).
+
+    Similar to DeepGEMM's _compile_deep_gemm_one_type_all.
+    Handles symmetric memory context to avoid collective operations during compilation.
+    """
+    # Symmetric memory allocation performs a collective operation across all the GPUs.
+    # Temporary disable symmetric memory during compilation since it only runs on the first rank.
+    saved_context = disable_symmetric_memory_context()
+    try:
+        wrapper = get_global_wrapper()
+        wrapper.warmup_all_m(n, k, m_max=m_max)
+
+        # Synchronize cuda stream and clean up cache
+        torch.cuda.current_stream().synchronize()
+        torch.cuda.empty_cache()
+    finally:
+        # Restore symmetric memory context
+        restore_symmetric_memory_context(saved_context)
 
 
 @contextmanager

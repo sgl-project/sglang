@@ -29,6 +29,11 @@ import sys
 import time
 from typing import Dict, List, Optional, Set, Tuple
 
+from sglang.srt.environ import envs
+
+# Set precompile stage flag before other imports
+envs.SGLANG_IN_TILELANG_PRECOMPILE_STAGE.set(True)
+
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
 )
