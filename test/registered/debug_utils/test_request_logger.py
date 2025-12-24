@@ -16,12 +16,13 @@ from sglang.test.test_utils import (
 register_cuda_ci(est_time=120, suite="nightly-1-gpu", nightly=True)
 
 
-class TestRequestLoggerText(CustomTestCase):
+class BaseTestRequestLogger:
+    log_requests_format = None
+
     @classmethod
     def setUpClass(cls):
         cls.stdout = io.StringIO()
         cls.stderr = io.StringIO()
-
         cls.process = popen_launch_server(
             "Qwen/Qwen3-0.6B",
             DEFAULT_URL_FOR_TEST,
@@ -31,7 +32,7 @@ class TestRequestLoggerText(CustomTestCase):
                 "--log-requests-level",
                 "2",
                 "--log-requests-format",
-                "text",
+                cls.log_requests_format,
                 "--skip-server-warmup",
             ],
             return_stdout_stderr=(cls.stdout, cls.stderr),
@@ -43,7 +44,7 @@ class TestRequestLoggerText(CustomTestCase):
         cls.stdout.close()
         cls.stderr.close()
 
-    def test_text_format_logging(self):
+    def _send_request(self):
         response = requests.post(
             DEFAULT_URL_FOR_TEST + "/generate",
             json={
@@ -53,72 +54,43 @@ class TestRequestLoggerText(CustomTestCase):
             timeout=30,
         )
         self.assertEqual(response.status_code, 200)
+        return self.stdout.getvalue() + self.stderr.getvalue()
 
-        combined_output = self.stdout.getvalue() + self.stderr.getvalue()
+
+class TestRequestLoggerText(BaseTestRequestLogger, CustomTestCase):
+    log_requests_format = "text"
+
+    def test_text_format_logging(self):
+        combined_output = self._send_request()
         self.assertIn("Receive:", combined_output)
         self.assertIn("Finish:", combined_output)
 
 
-class TestRequestLoggerJson(CustomTestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.stdout = io.StringIO()
-        cls.stderr = io.StringIO()
-
-        cls.process = popen_launch_server(
-            "Qwen/Qwen3-0.6B",
-            DEFAULT_URL_FOR_TEST,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=[
-                "--log-requests",
-                "--log-requests-level",
-                "2",
-                "--log-requests-format",
-                "json",
-                "--skip-server-warmup",
-            ],
-            return_stdout_stderr=(cls.stdout, cls.stderr),
-        )
-
-    @classmethod
-    def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
-        cls.stdout.close()
-        cls.stderr.close()
+class TestRequestLoggerJson(BaseTestRequestLogger, CustomTestCase):
+    log_requests_format = "json"
 
     def test_json_format_logging(self):
-        response = requests.post(
-            DEFAULT_URL_FOR_TEST + "/generate",
-            json={
-                "text": "Hello",
-                "sampling_params": {"max_new_tokens": 8, "temperature": 0},
-            },
-            timeout=30,
-        )
-        self.assertEqual(response.status_code, 200)
-
-        combined_output = self.stdout.getvalue() + self.stderr.getvalue()
+        combined_output = self._send_request()
 
         received_found = False
         finished_found = False
         for line in combined_output.splitlines():
-            if '{"event": "request.received"' in line:
-                json_start = line.find("{")
-                if json_start != -1:
-                    data = json.loads(line[json_start:])
-                    self.assertEqual(data["event"], "request.received")
-                    self.assertIn("rid", data)
-                    self.assertIn("obj", data)
-                    received_found = True
-            elif '{"event": "request.finished"' in line:
-                json_start = line.find("{")
-                if json_start != -1:
-                    data = json.loads(line[json_start:])
-                    self.assertEqual(data["event"], "request.finished")
-                    self.assertIn("rid", data)
-                    self.assertIn("obj", data)
-                    self.assertIn("out", data)
-                    finished_found = True
+            json_start = line.find("{")
+            if json_start == -1:
+                continue
+            if '"event": "request.received"' in line:
+                data = json.loads(line[json_start:])
+                self.assertEqual(data["event"], "request.received")
+                self.assertIn("rid", data)
+                self.assertIn("obj", data)
+                received_found = True
+            elif '"event": "request.finished"' in line:
+                data = json.loads(line[json_start:])
+                self.assertEqual(data["event"], "request.finished")
+                self.assertIn("rid", data)
+                self.assertIn("obj", data)
+                self.assertIn("out", data)
+                finished_found = True
 
         self.assertTrue(received_found, "request.received event not found in logs")
         self.assertTrue(finished_found, "request.finished event not found in logs")
