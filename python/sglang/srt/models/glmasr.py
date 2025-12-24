@@ -46,7 +46,7 @@ from sglang.srt.utils import add_prefix
 logger = logging.getLogger(__name__)
 
 
-class GlmasrForConditionalGeneration(nn.Module):
+class GlmAsrForConditionalGeneration(nn.Module):
     # BitandBytes specific attributes
     default_bitsandbytes_target_modules = [
         ".gate_proj.",
@@ -168,4 +168,4 @@ class GlmasrForConditionalGeneration(nn.Module):
                 weight_loader(param, loaded_weight)
 
 
-EntryClass = GlmasrForConditionalGeneration
+EntryClass = GlmAsrForConditionalGeneration
