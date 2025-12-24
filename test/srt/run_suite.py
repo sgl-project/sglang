@@ -294,6 +294,10 @@ suite_amd = {
     "nightly-amd": [
         TestFile("nightly/test_gsm8k_eval_amd.py"),
     ],
+    # AMD VLM tests using MMMU benchmark (2-GPU runner)
+    "nightly-amd-vlm": [
+        TestFile("nightly/test_vlms_mmmu_eval_amd.py"),
+    ],
     # AMD 8-GPU tests for base models using gsm8k completion benchmark
     "nightly-amd-8-gpu": [
         TestFile("nightly/test_gsm8k_completion_eval_amd.py"),
