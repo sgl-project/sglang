@@ -338,6 +338,7 @@ class ServerArgs:
     log_level_http: Optional[str] = None
     log_requests: bool = False
     log_requests_level: int = 2
+    log_requests_format: str = "text"
     crash_dump_folder: Optional[str] = None
     show_time_cost: bool = False
     enable_metrics: bool = False
@@ -2907,6 +2908,13 @@ class ServerArgs:
             default=ServerArgs.log_requests_level,
             help="0: Log metadata (no sampling parameters). 1: Log metadata and sampling parameters. 2: Log metadata, sampling parameters and partial input/output. 3: Log every input/output.",
             choices=[0, 1, 2, 3],
+        )
+        parser.add_argument(
+            "--log-requests-format",
+            type=str,
+            default=ServerArgs.log_requests_format,
+            choices=["text", "json"],
+            help="Format for request logging: 'text' (human-readable) or 'json' (structured)",
         )
         parser.add_argument(
             "--crash-dump-folder",
