@@ -62,6 +62,9 @@ from sglang.srt.utils.hf_transformers_utils import get_processor
 _is_hip = is_hip()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
+if _use_aiter:
+    from aiter import gelu_fast_vec
+
 logger = logging.getLogger(__name__)
 
 
@@ -107,7 +110,12 @@ class Qwen3_VisionMLP(nn.Module):
 
     def forward(self, x: torch.Tensor):
         x_fc1, _ = self.linear_fc1(x)
-        mlp_output, _ = self.linear_fc2(self.act(x_fc1))
+        if _use_aiter:
+            gelu_output= torch.empty_like(x_fc1)
+            gelu_fast_vec(gelu_output, x_fc1)
+            mlp_output, _ = self.linear_fc2(gelu_output)
+        else:
+            mlp_output, _ = self.linear_fc2(self.act(x_fc1))
         return mlp_output
 
 
