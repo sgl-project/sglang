@@ -21,6 +21,20 @@ def _check_nunchaku_available() -> bool:
         return False
 
 
+# Import nunchaku ops at module level
+try:
+    from nunchaku.ops.gemm import svdq_gemm_w4a4_cuda
+    from nunchaku.ops.gemv import awq_gemv_w4a16_cuda
+    from nunchaku.ops.quantize import svdq_quantize_w4a4_act_fuse_lora_cuda
+
+    _NUNCHAKU_OPS_AVAILABLE = True
+except ImportError:
+    svdq_gemm_w4a4_cuda = None
+    awq_gemv_w4a16_cuda = None
+    svdq_quantize_w4a4_act_fuse_lora_cuda = None
+    _NUNCHAKU_OPS_AVAILABLE = False
+
+
 class NunchakuSVDQLinearMethod(LinearMethodBase):
     def __init__(
         self,
@@ -174,11 +188,6 @@ class NunchakuSVDQLinearMethod(LinearMethodBase):
                 "Install with: pip install nunchaku"
             )
 
-        from nunchaku.ops.gemm import svdq_gemm_w4a4_cuda
-        from nunchaku.ops.quantize import (
-            svdq_quantize_w4a4_act_fuse_lora_cuda,
-        )
-
         orig_shape = x.shape
         x_2d = x.reshape(-1, orig_shape[-1])
         quantized_x, ascales, lora_act_out = svdq_quantize_w4a4_act_fuse_lora_cuda(
@@ -287,8 +296,6 @@ class NunchakuAWQLinearMethod(LinearMethodBase):
                 "nunchaku is required for AWQ linear method. "
                 "Install with: pip install nunchaku"
             )
-
-        from nunchaku.ops.gemv import awq_gemv_w4a16_cuda
 
         orig_shape = x.shape
         x_2d = x.reshape(-1, orig_shape[-1])
