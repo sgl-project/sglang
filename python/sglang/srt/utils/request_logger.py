@@ -11,7 +11,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Request logging utilities."""
 from __future__ import annotations
 
 import dataclasses
@@ -57,6 +56,8 @@ class RequestLogger:
             f"Receive: obj={_dataclass_to_string_truncated(obj, max_length, skip_names=skip_names)}"
         )
 
+        # FIXME: This is a temporary fix to get the text from the input ids.
+        # We should remove this once we have a proper way.
         if (
             self.log_requests_level >= 2
             and obj.text is None
