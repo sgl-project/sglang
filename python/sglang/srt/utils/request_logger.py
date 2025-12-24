@@ -31,13 +31,9 @@ class RequestLogger:
     def __init__(self, log_requests: bool, log_requests_level: int):
         self.log_requests = log_requests
         self.log_requests_level = log_requests_level
-        self._metadata: Tuple[Optional[int], Optional[Set[str]], Optional[Set[str]]] = (
+        self.metadata: Tuple[Optional[int], Optional[Set[str]], Optional[Set[str]]] = (
             self._compute_metadata()
         )
-
-    @property
-    def metadata(self) -> Tuple[Optional[int], Optional[Set[str]], Optional[Set[str]]]:
-        return self._metadata
 
     def configure(
         self,
@@ -48,7 +44,7 @@ class RequestLogger:
             self.log_requests = log_requests
         if log_requests_level is not None:
             self.log_requests_level = log_requests_level
-        self._metadata = self._compute_metadata()
+        self.metadata = self._compute_metadata()
 
     def log_received_request(
         self, obj: Union["GenerateReqInput", "EmbeddingReqInput"], tokenizer: Any = None
@@ -56,7 +52,7 @@ class RequestLogger:
         if not self.log_requests:
             return
 
-        max_length, skip_names, _ = self._metadata
+        max_length, skip_names, _ = self.metadata
         logger.info(
             f"Receive: obj={_dataclass_to_string_truncated(obj, max_length, skip_names=skip_names)}"
         )
@@ -79,7 +75,7 @@ class RequestLogger:
         if not self.log_requests:
             return
 
-        max_length, skip_names, out_skip_names = self._metadata
+        max_length, skip_names, out_skip_names = self.metadata
         if is_multimodal_gen:
             msg = f"Finish: obj={_dataclass_to_string_truncated(obj, max_length, skip_names=skip_names)}"
         else:
