@@ -45,7 +45,7 @@ class TestNvidiaNemotronNanoV2SpeculativeDecoding(GSM8KMixin, DefaultServerBase)
         "--max-total-tokens",
         "2048",
         "--json-model-override-args",
-        '{"vocab_size": 131072,"hidden_size": 4480}',
+        '{"vocab_size": 131072, "hidden_size": 4480}',
     ]
 
 
@@ -72,7 +72,7 @@ class TestNvidiaNemotronNanoV2SpeculativeDecodingBF16Cache(
         "--max-total-tokens",
         "2048",
         "--json-model-override-args",
-        '{"vocab_size": 131072,"hidden_size": 4480}',
+        '{"vocab_size": 131072, "hidden_size": 4480}',
         "--mamba-ssm-dtype",
         "bfloat16",
     ]
