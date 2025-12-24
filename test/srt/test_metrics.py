@@ -138,7 +138,7 @@ class TestEnableMetrics(CustomTestCase):
         metrics_to_check = [
             ("sglang:realtime_tokens_total", {"mode": "prefill_compute"}),
             ("sglang:realtime_tokens_total", {"mode": "decode"}),
-            ("sglang:gpu_execution_seconds_total", {"category": "forward_prefill"}),
+            ("sglang:gpu_execution_seconds_total", {"category": "forward_extend"}),
             ("sglang:gpu_execution_seconds_total", {"category": "forward_decode"}),
         ]
         _check_metrics_positive(self, metrics, metrics_to_check)
