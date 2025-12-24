@@ -89,14 +89,24 @@ else:
 configs = list(itertools.product(batch_size_range, seq_len_range))
 
 
+if VLLM_AVAILABLE:
+    line_vals = ["vllm", "sglang"]
+    line_names = ["VLLM", "SGL Kernel"]
+    styles = [("blue", "-"), ("green", "-")]
+else:
+    line_vals = ["sglang"]
+    line_names = ["SGL Kernel"]
+    styles = [("green", "-")]
+
+
 @triton.testing.perf_report(
     triton.testing.Benchmark(
         x_names=["batch_size", "seq_len"],
         x_vals=configs,
         line_arg="provider",
-        line_vals=["vllm", "sglang"],
-        line_names=["VLLM", "SGL Kernel"],
-        styles=[("blue", "-"), ("green", "-")],
+        line_vals=line_vals,
+        line_names=line_names,
+        styles=styles,
         ylabel="us",
         plot_name="per-tensor-quant-fp8-performance",
         args={},
@@ -114,6 +124,8 @@ def benchmark(batch_size, seq_len, provider):
         fn = lambda: vllm_scaled_fp8_quant(x.clone())
     elif provider == "sglang":
         fn = lambda: sglang_scaled_fp8_quant(x.clone())
+    else:
+        raise ValueError(f"Unknown provider: {provider}")
 
     ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(fn, quantiles=quantiles)
 
