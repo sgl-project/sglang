@@ -6,15 +6,6 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
-
-if TYPE_CHECKING:
-    from sglang.multimodal_gen.configs.pipeline_configs import PipelineConfig
-    from sglang.multimodal_gen.configs.sample import SamplingParams
-    from sglang.multimodal_gen.runtime.entrypoints.diffusion_generator import (
-        DiffGenerator,
-    )
-
 __all__ = ["DiffGenerator", "PipelineConfig", "SamplingParams"]
 
 
