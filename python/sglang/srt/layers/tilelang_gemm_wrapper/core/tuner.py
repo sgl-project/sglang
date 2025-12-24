@@ -7,6 +7,9 @@ from typing import Dict, List, Optional, Tuple
 import torch
 import triton
 
+from sglang.srt.layers.quantization.fp8_kernel import sglang_per_token_group_quant_fp8
+from sglang.srt.layers.quantization.fp8_utils import per_block_cast_to_fp8
+
 logger = logging.getLogger(__name__)
 
 ray = None
@@ -96,16 +99,15 @@ def _create_benchmark_worker_class():
             print(f"[Worker] Initialized on GPU {self.gpu_id}")
 
         def _get_data(self, M: int, N: int, K: int):
-            from sglang.srt.layers.tilelang_gemm_wrapper.core.quant_utils import (
-                prepare_gemm_inputs,
-            )
-
             key = (M, N, K)
             if key not in self._data_cache:
                 A = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
                 B = torch.randn(N, K, dtype=torch.bfloat16, device="cuda")
 
-                A_fp8, B_fp8, A_scale, B_scale = prepare_gemm_inputs(A, B)
+                A_fp8, A_scale = sglang_per_token_group_quant_fp8(
+                    A.contiguous(), group_size=128, column_major_scales=False
+                )
+                B_fp8, B_scale = per_block_cast_to_fp8(B.contiguous())
                 C = torch.zeros(M, N, dtype=torch.bfloat16, device="cuda")
 
                 self._data_cache[key] = (A_fp8, B_fp8, A_scale, B_scale, C)

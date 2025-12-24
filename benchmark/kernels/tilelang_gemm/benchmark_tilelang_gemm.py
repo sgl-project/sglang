@@ -28,6 +28,8 @@ import triton
 from tqdm import tqdm
 
 from sglang.srt.layers import tilelang_gemm_wrapper
+from sglang.srt.layers.quantization.fp8_kernel import sglang_per_token_group_quant_fp8
+from sglang.srt.layers.quantization.fp8_utils import per_block_cast_to_fp8
 from sglang.srt.layers.tilelang_gemm_wrapper.core.config_loader import DEFAULT_M_VALUES
 
 
@@ -96,14 +98,13 @@ def tflops(M: int, N: int, K: int, latency_ms: float) -> float:
 
 def prepare_data(M: int, N: int, K: int):
     """Prepare FP8 test data using sglang's quantization functions."""
-    from sglang.srt.layers.tilelang_gemm_wrapper.core.quant_utils import (
-        prepare_gemm_inputs,
-    )
-
     A = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
     B = torch.randn(N, K, dtype=torch.bfloat16, device="cuda")
 
-    A_fp8, B_fp8, A_scale, B_scale = prepare_gemm_inputs(A, B)
+    A_fp8, A_scale = sglang_per_token_group_quant_fp8(
+        A.contiguous(), group_size=128, column_major_scales=False
+    )
+    B_fp8, B_scale = per_block_cast_to_fp8(B.contiguous())
 
     # Prepare DeepGEMM scale if on Hopper
     if GPU_ARCH == "hopper" and BASELINE_AVAILABLE:

@@ -29,7 +29,6 @@ import sys
 import time
 from typing import Dict, List, Optional, Set, Tuple
 
-
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
 )
