@@ -75,11 +75,7 @@ def _apply_rotary_emb(
     if is_neox_style:
         cos = cos.unsqueeze(-2)
         sin = sin.unsqueeze(-2)
-        if is_neox_style:
-            x1, x2 = torch.chunk(x, 2, dim=-1)
-        else:
-            x1 = x[..., ::2]
-            x2 = x[..., 1::2]
+        x1, x2 = torch.chunk(x, 2, dim=-1)
         o1 = (x1.float() * cos - x2.float() * sin).type_as(x)
         o2 = (x2.float() * cos + x1.float() * sin).type_as(x)
         return torch.cat((o1, o2), dim=-1)
@@ -109,14 +105,8 @@ def _apply_qk_rotary_emb(
     if is_neox_style:
         cos = cos.unsqueeze(-2)
         sin = sin.unsqueeze(-2)
-        if is_neox_style:
-            q1, q2 = torch.chunk(q, 2, dim=-1)
-            k1, k2 = torch.chunk(k, 2, dim=-1)
-        else:
-            q1 = q[..., ::2]
-            q2 = q[..., 1::2]
-            k1 = k[..., ::2]
-            k2 = k[..., 1::2]
+        q1, q2 = torch.chunk(q, 2, dim=-1)
+        k1, k2 = torch.chunk(k, 2, dim=-1)
         oq1 = (q1.float() * cos - q2.float() * sin).type_as(q1)
         oq2 = (q2.float() * cos + q1.float() * sin).type_as(q2)
         ok1 = (k1.float() * cos - k2.float() * sin).type_as(k1)

@@ -425,6 +425,7 @@ def _rotary_embedding_kernel(
     interleaved: tl.constexpr,
     BLOCK_HS_HALF: tl.constexpr,
 ):
+    tl.static_assert(interleaved)
     row_idx = tl.program_id(0)
     token_idx = (row_idx // num_heads) % num_tokens
 
@@ -530,6 +531,7 @@ def _qk_rotary_embedding_kernel(
     interleaved: tl.constexpr,
     BLOCK_HS_HALF: tl.constexpr,
 ):
+    tl.static_assert(interleaved)
     row_idx = tl.program_id(0)
     token_idx = (row_idx // num_heads) % num_tokens
 
