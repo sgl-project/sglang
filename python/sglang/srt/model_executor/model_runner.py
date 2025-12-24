@@ -1836,6 +1836,9 @@ class ModelRunner:
         log_info_on_rank0(logger, f"Using KV cache dtype: {self.kv_cache_dtype}")
 
         self.max_total_num_tokens = self.profile_max_num_token(total_gpu_memory)
+        logger.info(
+            f"Profiled max_total_num_tokens={self.max_total_num_tokens} for the model"
+        )
 
         if (small_kv_size := envs.SGLANG_CI_SMALL_KV_SIZE.get()) > 0:
             logger.info(
@@ -1876,10 +1879,6 @@ class ModelRunner:
                 self.max_total_num_tokens = self.server_args.draft_runner_cache_size
                 max_num_reqs = self.server_args.max_num_reqs
             else:
-                # We are sharing the `token_to_kv_pool`, and both verify and draft tokens
-                # can be concurrently allocated, so we should give a headroom for it.
-                # Target worker and draft worker shares the same indices for the
-                # token_to_kv_pool, so we should make sure to match max_total_num_tokens.
                 self.server_args.draft_runner_cache_size = self.max_total_num_tokens
                 self.server_args.max_num_reqs = max_num_reqs
 
