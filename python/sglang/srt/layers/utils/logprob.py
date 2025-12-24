@@ -311,7 +311,7 @@ def get_token_ids_logprobs_chunk(
     return next_split_pruned_len
 
 
-def add_logprob_values(
+def add_output_logprobs_for_spec_v1(
     batch: ScheduleBatch,
     res: Union[EagleVerifyOutput, NgramVerifyInput],
     logits_output: Optional[LogitsProcessorOutput] = None,

@@ -14,7 +14,7 @@ from sglang.srt.layers.moe.utils import (
     speculative_moe_a2a_backend_context,
     speculative_moe_backend_context,
 )
-from sglang.srt.layers.utils.logprob import add_logprob_values
+from sglang.srt.layers.utils.logprob import add_output_logprobs_for_spec_v1
 from sglang.srt.managers.io_struct import UpdateWeightsFromTensorReqInput
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
@@ -754,7 +754,7 @@ class EAGLEWorker(TpModelWorker):
             )
 
         if batch.return_logprob:
-            add_logprob_values(batch, res, logits_output)
+            add_output_logprobs_for_spec_v1(batch, res, logits_output)
 
         # Prepare the batch for the next draft forwards.
         batch.forward_mode = (
