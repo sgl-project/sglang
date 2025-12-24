@@ -14,6 +14,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.executors.pipeline_executor im
     PipelineExecutor,
     Timer,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
     PipelineStage,
     StageParallelismType,
@@ -56,7 +57,7 @@ class ParallelExecutor(PipelineExecutor):
         stages: List[PipelineStage],
         batch: Req,
         server_args: ServerArgs,
-    ) -> Req:
+    ) -> OutputBatch:
         """
         Execute all pipeline stages respecting their declared parallelism type.
         """
@@ -94,7 +95,6 @@ class ParallelExecutor(PipelineExecutor):
         stages: List[PipelineStage],
         batch: Req,
         server_args: ServerArgs,
-    ) -> Req:
+    ) -> OutputBatch:
         batch = self._execute(stages, batch, server_args)
-
         return batch
