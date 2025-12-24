@@ -25,9 +25,9 @@ use crate::{
     core::{
         steps::{
             create_external_worker_registration_workflow, create_mcp_registration_workflow,
-            create_wasm_module_registration_workflow, create_wasm_module_removal_workflow,
-            create_worker_registration_workflow, create_worker_removal_workflow,
-            create_worker_update_workflow,
+            create_tokenizer_registration_workflow, create_wasm_module_registration_workflow,
+            create_wasm_module_removal_workflow, create_worker_registration_workflow,
+            create_worker_removal_workflow, create_worker_update_workflow,
         },
         Job, JobQueue, JobQueueConfig, WorkerManager, WorkerType,
     },
@@ -46,10 +46,11 @@ use crate::{
         parser::{ParseFunctionCallRequest, SeparateReasoningRequest},
         rerank::{RerankRequest, V1RerankReqInput},
         responses::{ResponsesGetParams, ResponsesRequest},
+        tokenize::{AddTokenizerRequest, DetokenizeRequest, TokenizeRequest},
         validated::ValidatedJson,
         worker_spec::{WorkerConfigRequest, WorkerUpdateRequest},
     },
-    routers::{conversations, router_manager::RouterManager, RouterTrait},
+    routers::{conversations, router_manager::RouterManager, tokenize, RouterTrait},
     service_discovery::{start_service_discovery, ServiceDiscoveryConfig},
     wasm::route::{add_wasm_module, list_wasm_modules, remove_wasm_module},
     workflow::{LoggingSubscriber, WorkflowEngine},
@@ -461,6 +462,56 @@ async fn update_worker(
     }
 }
 
+// ============================================================================
+// Tokenize / Detokenize Handlers
+// ============================================================================
+
+async fn v1_tokenize(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<TokenizeRequest>,
+) -> Response {
+    tokenize::tokenize(&state.context.tokenizer_registry, request).await
+}
+
+async fn v1_detokenize(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<DetokenizeRequest>,
+) -> Response {
+    tokenize::detokenize(&state.context.tokenizer_registry, request).await
+}
+
+async fn v1_tokenizers_add(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<AddTokenizerRequest>,
+) -> Response {
+    tokenize::add_tokenizer(&state.context, request).await
+}
+
+async fn v1_tokenizers_list(State(state): State<Arc<AppState>>) -> Response {
+    tokenize::list_tokenizers(&state.context.tokenizer_registry).await
+}
+
+async fn v1_tokenizers_get(
+    State(state): State<Arc<AppState>>,
+    Path(tokenizer_id): Path<String>,
+) -> Response {
+    tokenize::get_tokenizer_info(&state.context, &tokenizer_id).await
+}
+
+async fn v1_tokenizers_status(
+    State(state): State<Arc<AppState>>,
+    Path(tokenizer_id): Path<String>,
+) -> Response {
+    tokenize::get_tokenizer_status(&state.context, &tokenizer_id).await
+}
+
+async fn v1_tokenizers_remove(
+    State(state): State<Arc<AppState>>,
+    Path(tokenizer_id): Path<String>,
+) -> Response {
+    tokenize::remove_tokenizer(&state.context, &tokenizer_id).await
+}
+
 pub struct ServerConfig {
     pub host: String,
     pub port: u16,
@@ -516,6 +567,9 @@ pub fn build_app(
             "/v1/conversations/{conversation_id}/items/{item_id}",
             get(v1_conversations_get_item).delete(v1_conversations_delete_item),
         )
+        // Tokenize / Detokenize endpoints
+        .route("/v1/tokenize", post(v1_tokenize))
+        .route("/v1/detokenize", post(v1_detokenize))
         .route_layer(axum::middleware::from_fn_with_state(
             app_state.clone(),
             middleware::concurrency_limit_middleware,
@@ -547,6 +601,19 @@ pub fn build_app(
         .route("/wasm", post(add_wasm_module))
         .route("/wasm/{module_uuid}", delete(remove_wasm_module))
         .route("/wasm", get(list_wasm_modules))
+        // Tokenizer management endpoints
+        .route(
+            "/v1/tokenizers",
+            post(v1_tokenizers_add).get(v1_tokenizers_list),
+        )
+        .route(
+            "/v1/tokenizers/{tokenizer_id}",
+            get(v1_tokenizers_get).delete(v1_tokenizers_remove),
+        )
+        .route(
+            "/v1/tokenizers/{tokenizer_id}/status",
+            get(v1_tokenizers_status),
+        )
         .route_layer(axum::middleware::from_fn_with_state(
             auth_config.clone(),
             middleware::auth_middleware,
@@ -669,6 +736,9 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     engine
         .register_workflow(create_wasm_module_removal_workflow())
         .expect("wasm_module_removal workflow should be valid");
+    engine
+        .register_workflow(create_tokenizer_registration_workflow())
+        .expect("tokenizer_registration workflow should be valid");
     app_context
         .workflow_engine
         .set(engine)
