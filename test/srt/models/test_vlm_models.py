@@ -1,12 +1,14 @@
 import argparse
 import random
+import shutil
 import sys
+import tempfile
 import unittest
 from types import SimpleNamespace
 
 from sglang.srt.utils import is_hip
-from sglang.test.mmmu_vlm_mixin import DEFAULT_MEM_FRACTION_STATIC, MMMUVLMMixin
-from sglang.test.test_utils import CustomTestCase, is_in_ci
+from sglang.test.kits.mmmu_vlm_kit import DEFAULT_MEM_FRACTION_STATIC, MMMUVLMTestBase
+from sglang.test.test_utils import is_in_ci
 
 _is_hip = is_hip()
 # VLM models for testing
@@ -20,7 +22,7 @@ else:
     ]
 
 
-class TestVLMModels(MMMUVLMMixin, CustomTestCase):
+class TestVLMModels(MMMUVLMTestBase):
     def test_vlm_mmmu_benchmark(self):
         """Test VLM models against MMMU benchmark."""
         models_to_test = MODELS
@@ -29,7 +31,14 @@ class TestVLMModels(MMMUVLMMixin, CustomTestCase):
             models_to_test = [random.choice(MODELS)]
 
         for model in models_to_test:
-            self._run_vlm_mmmu_test(model, "./logs")
+            # Use a unique temporary directory for each model to avoid reading
+            # cached results from previous runs (fixes #14760)
+            output_dir = tempfile.mkdtemp(prefix="sglang_vlm_test_")
+            try:
+                self._run_vlm_mmmu_test(model, output_dir)
+            finally:
+                # Clean up the temporary directory
+                shutil.rmtree(output_dir, ignore_errors=True)
 
 
 if __name__ == "__main__":
