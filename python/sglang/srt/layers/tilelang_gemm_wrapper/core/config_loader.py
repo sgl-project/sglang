@@ -1,11 +1,14 @@
 """Config loading and M-value lookup for TileLang GEMM."""
 
 import json
+import logging
 import os
 import re
 from typing import Dict, List, Optional, Tuple
 
 from sglang.srt.utils import get_device_name
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_M_VALUES = [
     1,
@@ -33,6 +36,32 @@ DEFAULT_DTYPE = "fp8_w8a8"
 DEFAULT_BLOCK_SHAPE = (128, 128)
 
 
+def _get_default_config(M: int) -> dict:
+    """Get default config for M value. Use swapAB for M <= 32, base otherwise."""
+    if M <= 32:
+        return {
+            "kernel_type": "swapAB",
+            "block_M": 64,
+            "block_N": 64,
+            "block_K": 128,
+            "num_stages": 2,
+            "threads": 128,
+            "c_scale_local": False,
+            "b_scale_shm": False,
+        }
+    else:
+        return {
+            "kernel_type": "base",
+            "block_M": 128,
+            "block_N": 128,
+            "block_K": 128,
+            "num_stages": 2,
+            "threads": 128,
+            "c_scale_local": False,
+            "a_scale_shm": False,
+        }
+
+
 def _get_current_device_name() -> str:
     """Get current device name, replacing spaces with underscores."""
     return get_device_name().replace(" ", "_")
@@ -58,6 +87,7 @@ class ConfigLoader:
         self._device_name = device_name or _get_current_device_name()
         self._dtype = DEFAULT_DTYPE
         self._block_shape = DEFAULT_BLOCK_SHAPE
+        self._warned_nk: set = set()  # Track warned (N, K) to avoid duplicate logs
 
     def _get_config_filename(self, N: int, K: int) -> str:
         """Generate config filename."""
@@ -71,17 +101,25 @@ class ConfigLoader:
         return os.path.exists(self._get_config_path(N, K))
 
     def load_config(self, N: int, K: int) -> Dict[int, dict]:
-        """Load config for (N, K)."""
+        """Load config for (N, K). Returns default config if file not found."""
         cache_key = (N, K)
         if cache_key in self._config_cache:
             return self._config_cache[cache_key]
 
         config_path = self._get_config_path(N, K)
         if not os.path.exists(config_path):
-            raise FileNotFoundError(
-                f"Config not found: {config_path}. "
-                f"Please run tuner first for N={N}, K={K}"
-            )
+            # Warn once per (N, K) to avoid log spam
+            if cache_key not in self._warned_nk:
+                logger.warning(
+                    f"TileLang config not found for N={N}, K={K}. "
+                    f"Using default config. Run tuner for optimal performance: "
+                    f"python tune_tilelang_gemm.py --N {N} --K {K}"
+                )
+                self._warned_nk.add(cache_key)
+            # Generate default configs for all M values
+            config = {m: _get_default_config(m) for m in DEFAULT_M_VALUES}
+            self._config_cache[cache_key] = config
+            return config
 
         with open(config_path, "r") as f:
             raw_config = json.load(f)
