@@ -252,3 +252,9 @@ outputs/
 
 # Eval Cache
 .longbench_cache/
+
+# CUDA kernel develop, profile and debug
+.clangd
+*.nsys-rep
+*.ncu-rep
+*.nvcudmp
