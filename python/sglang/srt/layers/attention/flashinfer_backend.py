@@ -146,7 +146,8 @@ class FlashInferAttnBackend(AttentionBackend):
         self.decode_use_tensor_cores = should_use_tensor_core(
             kv_cache_dtype=model_runner.kv_cache_dtype,
             num_attention_heads=model_runner.model_config.num_attention_heads
-            // get_attention_tp_size(),
+            // get_attention_tp_size()
+            * self.dcp_size,
             num_kv_heads=model_runner.model_config.get_num_kv_heads(
                 get_attention_tp_size()
             ),
