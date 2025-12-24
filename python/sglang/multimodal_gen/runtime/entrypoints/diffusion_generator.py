@@ -209,6 +209,7 @@ class DiffGenerator:
 
         results = []
         total_start_time = time.perf_counter()
+
         # 2. send requests to scheduler, one at a time
         # TODO: send batch when supported
         for request_idx, req in enumerate(requests):
@@ -245,6 +246,7 @@ class DiffGenerator:
                             "prompts": req.prompt,
                             "size": (req.height, req.width, req.num_frames),
                             "generation_time": timer.duration,
+                            "peak_memory_mb": output_batch.peak_memory_mb,
                             "timings": (
                                 output_batch.timings.to_dict()
                                 if output_batch.timings
@@ -261,6 +263,16 @@ class DiffGenerator:
 
         total_gen_time = time.perf_counter() - total_start_time
         log_batch_completion(logger, len(results), total_gen_time)
+
+        if results:
+            peak_memories = [r.get("peak_memory_mb", 0) for r in results]
+            if peak_memories:
+                max_peak_memory = max(peak_memories)
+                avg_peak_memory = sum(peak_memories) / len(peak_memories)
+                logger.info(
+                    f"Memory usage - Max peak: {max_peak_memory:.2f} MB, "
+                    f"Avg peak: {avg_peak_memory:.2f} MB"
+                )
 
         if len(results) == 0:
             return None

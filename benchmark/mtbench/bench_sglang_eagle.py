@@ -38,7 +38,7 @@ def write_answers(filename, model_id, questions, answers):
                 "model_id": model_id,
                 "choices": {
                     "index": 0,
-                    "prompt": [answers[i][0], answers[i][1]],
+                    "turns": [answers[i][0], answers[i][1]],
                 },
                 "tstamp": time.time(),
             }
@@ -60,7 +60,7 @@ def main(args):
     # Construct prompts
     questions = load_questions(args.question_file)[: args.num_questions]
     arguments = [
-        {"question_1": q["prompt"][0], "question_2": q["prompt"][1]} for q in questions
+        {"question_1": q["turns"][0], "question_2": q["turns"][1]} for q in questions
     ]
 
     # Select backend

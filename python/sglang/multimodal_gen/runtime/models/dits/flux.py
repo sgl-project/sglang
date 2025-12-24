@@ -391,6 +391,10 @@ class FluxTransformer2DModel(CachableDiT):
         self.inner_dim = (
             self.config.num_attention_heads * self.config.attention_head_dim
         )
+        self.dit_module_names = [
+            "transformer_blocks",
+            "single_transformer_blocks",
+        ]
 
         self.rotary_emb = FluxPosEmbed(theta=10000, axes_dim=self.config.axes_dims_rope)
 
@@ -496,23 +500,46 @@ class FluxTransformer2DModel(CachableDiT):
             ip_hidden_states = self.encoder_hid_proj(ip_adapter_image_embeds)
             joint_attention_kwargs.update({"ip_hidden_states": ip_hidden_states})
 
-        for index_block, block in enumerate(self.transformer_blocks):
-            encoder_hidden_states, hidden_states = block(
-                hidden_states=hidden_states,
-                encoder_hidden_states=encoder_hidden_states,
-                temb=temb,
-                freqs_cis=freqs_cis,
-                joint_attention_kwargs=joint_attention_kwargs,
-            )
-
-        for index_block, block in enumerate(self.single_transformer_blocks):
-            encoder_hidden_states, hidden_states = block(
-                hidden_states=hidden_states,
-                encoder_hidden_states=encoder_hidden_states,
-                temb=temb,
-                freqs_cis=freqs_cis,
-                joint_attention_kwargs=joint_attention_kwargs,
-            )
+        offload_mgr = getattr(self, "_layerwise_offload_manager", None)
+        if offload_mgr is not None and getattr(offload_mgr, "enabled", False):
+            for i, block in enumerate(self.transformer_blocks):
+                with offload_mgr.layer_scope(
+                    prefetch_layer_idx=i + 1,
+                    release_layer_idx=i,
+                    non_blocking=True,
+                ):
+                    encoder_hidden_states, hidden_states = block(
+                        hidden_states=hidden_states,
+                        encoder_hidden_states=encoder_hidden_states,
+                        temb=temb,
+                        freqs_cis=freqs_cis,
+                        joint_attention_kwargs=joint_attention_kwargs,
+                    )
+            for block in self.single_transformer_blocks:
+                encoder_hidden_states, hidden_states = block(
+                    hidden_states=hidden_states,
+                    encoder_hidden_states=encoder_hidden_states,
+                    temb=temb,
+                    freqs_cis=freqs_cis,
+                    joint_attention_kwargs=joint_attention_kwargs,
+                )
+        else:
+            for block in self.transformer_blocks:
+                encoder_hidden_states, hidden_states = block(
+                    hidden_states=hidden_states,
+                    encoder_hidden_states=encoder_hidden_states,
+                    temb=temb,
+                    freqs_cis=freqs_cis,
+                    joint_attention_kwargs=joint_attention_kwargs,
+                )
+            for block in self.single_transformer_blocks:
+                encoder_hidden_states, hidden_states = block(
+                    hidden_states=hidden_states,
+                    encoder_hidden_states=encoder_hidden_states,
+                    temb=temb,
+                    freqs_cis=freqs_cis,
+                    joint_attention_kwargs=joint_attention_kwargs,
+                )
 
         hidden_states = self.norm_out(hidden_states, temb)
 

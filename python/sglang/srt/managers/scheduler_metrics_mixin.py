@@ -64,6 +64,7 @@ class SchedulerMetricsMixin:
         self.kv_transfer_latency_ms: float = 0.0
         self.kv_transfer_bootstrap_ms: float = 0.0
         self.kv_transfer_alloc_ms: float = 0.0
+        self.kv_transfer_total_mb: float = 0.0
 
         self.stats = SchedulerStats()
 
@@ -221,6 +222,7 @@ class SchedulerMetricsMixin:
                 self.stats.kv_transfer_latency_ms = self.kv_transfer_latency_ms
                 self.stats.kv_transfer_bootstrap_ms = self.kv_transfer_bootstrap_ms
                 self.stats.kv_transfer_alloc_ms = self.kv_transfer_alloc_ms
+                self.stats.kv_transfer_total_mb = self.kv_transfer_total_mb
             elif self.disaggregation_mode == DisaggregationMode.DECODE:
                 self.stats.num_decode_prealloc_queue_reqs = len(
                     self.disagg_decode_prealloc_queue.queue

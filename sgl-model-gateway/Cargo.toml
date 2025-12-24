@@ -104,6 +104,7 @@ ndarray = "0.16"
 base64 = "0.22"
 openai-harmony = { git = "https://github.com/openai/harmony", tag = "v0.0.4" }
 openmetrics-parser = "0.4.4"
+arc-swap = "1.7.1"
 
 # gRPC and Protobuf dependencies
 tonic = { version = "0.14.2", features = ["gzip", "transport"] }
@@ -143,6 +144,7 @@ npyz = { version = "0.8", features = ["npz"] }  # For reading numpy .npz files i
 opentelemetry-proto = { version = "0.27", features = ["gen-tonic"] }
 tonic-v12 = { version = "0.12.3", package = "tonic" }
 serial_test = "3.0"
+
 
 [[bench]]
 name = "request_processing"
