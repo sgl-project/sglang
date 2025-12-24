@@ -37,7 +37,6 @@ from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.common import (
     format_tcp_address,
-    get_free_port,
     get_int_env_var,
     get_local_ip_auto,
     is_valid_ipv6_address,
@@ -214,14 +213,13 @@ class MoriKVManager(CommonKVManager):
         if self.kv_args.ib_device:
             os.environ["MORI_RDMA_DEVICES"] = self.kv_args.ib_device
 
-        port = get_free_port()
         self.local_ip = get_local_ip_auto()
-        config = IOEngineConfig(host=self.local_ip, port=port)
+        config = IOEngineConfig(host=self.local_ip, port=0)
 
         engine_key = (
             f"io-{self.disaggregation_mode.value}-"
             f"dp{self.system_dp_rank}-tp{self.attn_tp_rank}-"
-            f"{self.local_ip}:{port}"
+            f"pid{os.getpid()}-{self.local_ip}"
         )
 
         engine = IOEngine(engine_key, config)
@@ -238,11 +236,13 @@ class MoriKVManager(CommonKVManager):
             False,
         )
         engine.create_backend(BackendType.RDMA, rdma_cfg)
+        actual_port = engine.get_engine_desc().port
+        assert actual_port > 0, f"Failed to bind port for engine {engine_key}"
         logger.debug(
             "Initialized Mori IOEngine %s at %s:%s (qp_per_transfer=%s, workers=%s, poll_mode=%s)",
             engine_key,
             self.local_ip,
-            port,
+            actual_port,
             qp_per_transfer,
             num_worker_threads,
             poll_mode.name,

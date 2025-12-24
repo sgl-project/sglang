@@ -377,7 +377,7 @@ RUN echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/amdainic.gpg] \
 https://repo.radeon.com/amdainic/pensando/ubuntu/${AINIC_VERSION} ${UBUNTU_CODENAME} main" \
     > /etc/apt/sources.list.d/amdainic.list
 
-    
+
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
       libionic-dev \
