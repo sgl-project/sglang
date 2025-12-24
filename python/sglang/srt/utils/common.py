@@ -2060,51 +2060,11 @@ def set_gpu_proc_affinity(
     logger.info(f"Process {pid} gpu_id {gpu_id} is running on CPUs: {p.cpu_affinity()}")
 
 
-@lru_cache(maxsize=2)
-def disable_request_logging() -> bool:
-    return get_bool_env_var("SGLANG_DISABLE_REQUEST_LOGGING")
-
-
-def dataclass_to_string_truncated(
-    data, max_length=2048, skip_names: Optional[Set[str]] = None
-):
-    if skip_names is None:
-        skip_names = set()
-    if isinstance(data, str):
-        if len(data) > max_length:
-            half_length = max_length // 2
-            return f"{repr(data[:half_length])} ... {repr(data[-half_length:])}"
-        else:
-            return f"{repr(data)}"
-    elif isinstance(data, (list, tuple)):
-        if len(data) > max_length:
-            half_length = max_length // 2
-            return str(data[:half_length]) + " ... " + str(data[-half_length:])
-        else:
-            return str(data)
-    elif isinstance(data, dict):
-        return (
-            "{"
-            + ", ".join(
-                f"'{k}': {dataclass_to_string_truncated(v, max_length)}"
-                for k, v in data.items()
-                if k not in skip_names
-            )
-            + "}"
-        )
-    elif dataclasses.is_dataclass(data):
-        fields = dataclasses.fields(data)
-        return (
-            f"{data.__class__.__name__}("
-            + ", ".join(
-                f"{f.name}={dataclass_to_string_truncated(getattr(data, f.name), max_length)}"
-                for f in fields
-                if f.name not in skip_names
-            )
-            + ")"
-        )
-    else:
-        return str(data)
+# Re-export from request_logger for backward compatibility
+from sglang.srt.utils.request_logger import (
+    dataclass_to_string_truncated,
+    disable_request_logging,
+)
 
 
 def permute_weight(x: torch.Tensor) -> torch.Tensor:
