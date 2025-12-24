@@ -417,6 +417,7 @@ class ServerArgs:
     # Speculative decoding
     speculative_algorithm: Optional[str] = None
     speculative_draft_model_path: Optional[str] = None
+    speculative_draft_model_update: bool = False
     speculative_draft_model_revision: Optional[str] = None
     speculative_draft_load_format: Optional[str] = None
     speculative_num_steps: Optional[int] = None
@@ -3411,6 +3412,12 @@ class ServerArgs:
             "--speculative-draft-model",
             type=str,
             help="The path of the draft model weights. This can be a local folder or a Hugging Face repo ID.",
+        )
+        parser.add_argument(
+            "--enable-draft-model-update",
+            action="store_true",
+            dest="speculative_draft_model_update",
+            help="Enable online update for the draft model.",
         )
         parser.add_argument(
             "--speculative-draft-model-revision",
