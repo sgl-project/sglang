@@ -174,6 +174,10 @@ pub fn init_metrics() {
         "smg_worker_requests_active",
         "Currently running requests per worker"
     );
+    describe_gauge!(
+        "smg_worker_health",
+        "Worker health status (1=healthy, 0=unhealthy)"
+    );
     describe_counter!(
         "smg_worker_health_checks_total",
         "Health check results by worker_type and result"
@@ -805,6 +809,15 @@ impl Metrics {
             "worker" => worker.to_string()
         )
         .set(count as f64);
+    }
+
+    /// Set worker health status
+    pub fn set_worker_health(worker_url: &str, healthy: bool) {
+        gauge!(
+            "smg_worker_health",
+            "worker" => worker_url.to_string()
+        )
+        .set(if healthy { 1.0 } else { 0.0 });
     }
 
     // ========================================================================
