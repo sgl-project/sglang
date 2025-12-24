@@ -1044,7 +1044,11 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                     out["meta_info"][
                         "response_sent_to_client_ts"
                     ] = state.response_sent_to_client_ts
-                if self.log_requests:
+                exceeded_ms = envs.SGLANG_LOG_REQUEST_EXCEEDED_MS.get()
+                if self.log_requests and (
+                    exceeded_ms < 0
+                    or exceeded_ms < out["meta_info"]["e2e_latency"] * 1000
+                ):
                     max_length, skip_names, out_skip_names = self.log_request_metadata
                     if self.model_config.is_multimodal_gen:
                         msg = f"Finish: obj={dataclass_to_string_truncated(obj, max_length, skip_names=skip_names)}"
