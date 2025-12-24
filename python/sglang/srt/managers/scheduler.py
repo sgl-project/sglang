@@ -716,6 +716,7 @@ class Scheduler(
         self.last_batch: Optional[ScheduleBatch] = None
         self.forward_ct = 0
         self.last_prefill_tokens = 0
+        self.last_prefill_cache_tokens = 0
         self.return_health_check_ct = 0
         self.num_retracted_reqs: int = 0
         self.num_paused_reqs: int = 0
@@ -1830,6 +1831,8 @@ class Scheduler(
         if ret:
             trace_event_batch("schedule", ret.reqs)
 
+        self.log_prefill_stats_late(ret)
+
         return ret
 
     def get_num_allocatable_reqs(self, running_bs):
@@ -2074,8 +2077,16 @@ class Scheduler(
             new_token_gained = new_available_tokens - old_available_tokens
 
             self.num_retracted_reqs = len(retracted_reqs)
-            if self.enable_metrics and (x := len(retracted_reqs)) > 0:
-                self.metrics_collector.increment_num_retracted_reqs(x)
+            if self.enable_metrics and len(retracted_reqs) > 0:
+                self.metrics_collector.increment_retracted_reqs(
+                    num_retracted_reqs=len(retracted_reqs),
+                    num_retracted_input_tokens=sum(
+                        len(r.origin_input_ids) for r in retracted_reqs
+                    ),
+                    num_retracted_output_tokens=sum(
+                        len(r.output_ids) for r in retracted_reqs
+                    ),
+                )
             self.new_token_ratio = new_token_ratio
             for req in reqs_to_abort:
                 abort_reason: FINISH_ABORT = req.to_finish
