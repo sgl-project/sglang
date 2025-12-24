@@ -268,6 +268,7 @@ class GroupCoordinator:
         pynccl_use_current_stream: bool = False,
         torch_compile: Optional[bool] = None,
         gloo_timeout: timedelta = timedelta(seconds=120 * 60),
+        extend_group: bool = False,
     ):
         # Set group info
         group_name = group_name or "anonymous"
@@ -287,15 +288,19 @@ class GroupCoordinator:
             if "mooncake" in torch_distributed_backend:
                 from mooncake.ep import MooncakeBackendOptions
 
+                if len(ranks) == 1:
+                    # Bypass the extension procedure
+                    extend_group = False
+
                 device_group = torch.distributed.new_group(
                     ranks,
                     backend="mooncake",
-                    pg_options=MooncakeBackendOptions(active_ranks),
+                    pg_options=MooncakeBackendOptions(active_ranks, extend_group),
                 )
                 cpu_group = torch.distributed.new_group(
                     ranks,
                     backend="mooncake-cpu",
-                    pg_options=MooncakeBackendOptions(active_ranks_cpu),
+                    pg_options=MooncakeBackendOptions(active_ranks_cpu, extend_group),
                 )
             else:
                 device_group = torch.distributed.new_group(
@@ -1387,7 +1392,7 @@ def get_world_group() -> GroupCoordinator:
 
 
 def init_world_group(
-    ranks: List[int], local_rank: int, backend: str
+    ranks: List[int], local_rank: int, backend: str, extend_group: bool = False
 ) -> GroupCoordinator:
     return GroupCoordinator(
         group_ranks=[ranks],
@@ -1401,6 +1406,7 @@ def init_world_group(
         use_xpu_communicator=False,
         use_npu_communicator=False,
         group_name="world",
+        extend_group=extend_group,
     )
 
 
@@ -1415,6 +1421,7 @@ def init_model_parallel_group(
     pynccl_use_current_stream: bool = True,
     use_torch_symm_mem_allreduce: Optional[bool] = None,
     torch_compile: Optional[bool] = None,
+    extend_group: bool = False,
 ) -> GroupCoordinator:
     if use_custom_allreduce is None:
         use_custom_allreduce = _ENABLE_CUSTOM_ALL_REDUCE
@@ -1437,6 +1444,7 @@ def init_model_parallel_group(
         group_name=group_name,
         pynccl_use_current_stream=pynccl_use_current_stream,
         torch_compile=torch_compile,
+        extend_group=extend_group,
     )
 
 
@@ -1542,6 +1550,7 @@ def init_distributed_environment(
     local_rank: int = -1,
     backend: str = "nccl",
     timeout: Optional[int] = None,
+    extend_group: bool = False,
 ):
     logger.debug(
         "world_size=%d rank=%d local_rank=%d " "distributed_init_method=%s backend=%s",
@@ -1572,6 +1581,8 @@ def init_distributed_environment(
             assert timeout > 0, "timeout must be positive"
             timeout = timedelta(seconds=timeout)
 
+        from mooncake.ep import MooncakeBackendOptions
+        active_ranks = torch.ones(world_size, dtype=torch.int32, device="cuda")
         # this backend is used for WORLD
         torch.distributed.init_process_group(
             backend=backend,
@@ -1579,6 +1590,7 @@ def init_distributed_environment(
             world_size=world_size,
             rank=rank,
             timeout=timeout,
+            pg_options=MooncakeBackendOptions(active_ranks, extend_group),
         )
 
     # set the local rank
@@ -1594,7 +1606,7 @@ def init_distributed_environment(
     global _WORLD
     if _WORLD is None:
         ranks = list(range(torch.distributed.get_world_size()))
-        _WORLD = init_world_group(ranks, local_rank, backend)
+        _WORLD = init_world_group(ranks, local_rank, backend, extend_group=extend_group)
     else:
         assert (
             _WORLD.world_size == torch.distributed.get_world_size()
@@ -1608,6 +1620,7 @@ def initialize_model_parallel(
     backend: Optional[str] = None,
     duplicate_tp_group: bool = False,
     torch_compile: Optional[bool] = None,
+    extend_group: bool = False,
 ) -> None:
     """
     Initialize model parallel groups.
@@ -1665,6 +1678,7 @@ def initialize_model_parallel(
         group_name="tp",
         pynccl_use_current_stream=duplicate_tp_group,
         torch_compile=torch_compile,
+        extend_group=extend_group,
     )
 
     if duplicate_tp_group:
@@ -1682,6 +1696,7 @@ def initialize_model_parallel(
             group_name="pdmux_prefill_tp",
             pynccl_use_current_stream=True,
             torch_compile=torch_compile,
+            extend_group=extend_group,
         )
         if _TP.pynccl_comm:
             _TP.pynccl_comm.disabled = False
@@ -1728,6 +1743,7 @@ def initialize_model_parallel(
             get_world_group().local_rank,
             backend,
             group_name="moe_tp",
+            extend_group=extend_group,
         )
 
     # Build the pipeline model-parallel groups.
@@ -1745,6 +1761,7 @@ def initialize_model_parallel(
         backend,
         use_custom_allreduce=False,
         group_name="pp",
+        extend_group=extend_group,
     )
 
 
