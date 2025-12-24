@@ -756,7 +756,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
             if is_tree_mode:
                 # Tree mode requires CUDA/HIP for Triton kernels
                 if not (_is_cuda or _is_hip):
-                    raise RuntimeError("Tree mode speculative decoding (topk > 1) requires CUDA or HIP.")
+                    raise RuntimeError(
+                        "Tree mode speculative decoding (topk > 1) requires CUDA or HIP."
+                    )
 
                 # Compact accepted KV cache to the front of the per-request
                 # speculative region so subsequent decode reads contiguous KV.

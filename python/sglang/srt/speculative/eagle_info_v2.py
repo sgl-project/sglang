@@ -29,7 +29,7 @@ from sglang.srt.speculative.spec_utils import (
     SIMULATE_ACC_LEN,
     generate_simulated_accept_index,
 )
-from sglang.srt.utils.common import is_cuda, is_hip, is_npu, next_power_of_2, ceil_div
+from sglang.srt.utils.common import is_cuda, is_hip, is_npu, next_power_of_2
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
@@ -97,7 +97,7 @@ class EagleDraftInputV2Mixin:
         cur_kv_lens_cpu = []
         nxt_kv_lens_cpu = []
         num_needed_tokens = 0
-        
+
         # paged(topk>1) alloc lower bound
         # TODO Simply Getattr... Think of optimizing it later
         seq_lens_cpu = getattr(batch, "seq_lens_cpu", batch.seq_lens.cpu())
@@ -105,10 +105,12 @@ class EagleDraftInputV2Mixin:
         server_args = get_global_server_args()
         topk = int(getattr(server_args, "speculative_eagle_topk", 1))
         num_steps = int(getattr(server_args, "speculative_num_steps", 0))
-        self.page_size = page_size                                      # for later use...
+        self.page_size = page_size  # for later use...
 
         for i, r in enumerate(batch.reqs):
-            x_dense = int(r.kv_committed_len + 2 * self.ALLOC_LEN_PER_DECODE - r.kv_allocated_len)
+            x_dense = int(
+                r.kv_committed_len + 2 * self.ALLOC_LEN_PER_DECODE - r.kv_allocated_len
+            )
             if x_dense < 0:
                 x_dense = 0
 
@@ -211,11 +213,23 @@ class EagleDraftInputV2Mixin:
                 seq_lens = batch.seq_lens.to(rows.device, dtype=torch.int64)
                 last_page = seq_lens % page_size
                 prefix_base = seq_lens - last_page
-                num_new_pages = (last_page + num_steps + page_size - 1) // page_size  # (bs,)
+                num_new_pages = (
+                    last_page + num_steps + page_size - 1
+                ) // page_size  # (bs,)
 
-                topk_ids = torch.arange(topk, device=rows.device, dtype=torch.int64).view(1, topk)  # (1,topk)
-                starts = prefix_base.view(bs, 1) + topk_ids * (num_new_pages.view(bs, 1) * page_size) + last_page.view(bs, 1)
-                steps = torch.arange(num_steps, device=rows.device, dtype=torch.int64).view(1, 1, num_steps)
+                topk_ids = torch.arange(
+                    topk, device=rows.device, dtype=torch.int64
+                ).view(
+                    1, topk
+                )  # (1,topk)
+                starts = (
+                    prefix_base.view(bs, 1)
+                    + topk_ids * (num_new_pages.view(bs, 1) * page_size)
+                    + last_page.view(bs, 1)
+                )
+                steps = torch.arange(
+                    num_steps, device=rows.device, dtype=torch.int64
+                ).view(1, 1, num_steps)
 
                 pos = (starts.view(bs, topk, 1) + steps).reshape(bs, topk * num_steps)
 
@@ -467,7 +481,6 @@ def fill_accepted_out_cache_loc(
     if src > -1:
         value = tl.load(out_cache_loc + src)
         tl.store(accepted_out_cache_loc + dst, value)
-
 
 
 @triton.jit
