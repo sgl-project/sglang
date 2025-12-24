@@ -69,12 +69,23 @@ class OpenAIServingChat(OpenAIServingBase):
         self.reasoning_parser = self.tokenizer_manager.server_args.reasoning_parser
 
         # Get default sampling parameters from model's generation config
-        self.default_sampling_params = (
-            self.tokenizer_manager.model_config.get_default_sampling_params()
+        # and merge with preferred_sampling_params from CLI args
+        # Priority: user value > preferred_sampling_params > model generation_config > OpenAI defaults
+        model_generation_config = (
+            self.tokenizer_manager.model_config.get_default_sampling_params() or {}
         )
-        if self.default_sampling_params:
+        preferred_params = self.tokenizer_manager.preferred_sampling_params or {}
+
+        # Merge: preferred_sampling_params takes precedence over model generation config
+        self.default_sampling_params = {**model_generation_config, **preferred_params}
+
+        if model_generation_config:
             logger.info(
-                f"Using default chat sampling params from model generation config: {self.default_sampling_params}",
+                f"Using default chat sampling params from model generation config: {model_generation_config}",
+            )
+        if preferred_params:
+            logger.info(
+                f"Using preferred sampling params from CLI: {preferred_params}",
             )
 
         # Check if the model is a GPT-OSS model
@@ -91,7 +102,7 @@ class OpenAIServingChat(OpenAIServingBase):
             self.tokenizer_manager.tokenizer is not None
             and self.tokenizer_manager.tokenizer.chat_template is not None
         )
-        architectures = self.tokenizer_manager.server_args.get_hf_config().architectures
+        architectures = self.tokenizer_manager.model_config.hf_config.architectures
         is_dpsk_v32 = "DeepseekV3" in architectures[0] if architectures else False
         return not has_chat_template and is_dpsk_v32
 
@@ -293,11 +304,13 @@ class OpenAIServingChat(OpenAIServingBase):
             )
             messages = request.messages
             messages = [msg.model_dump() for msg in messages]
+
+            if messages[0]["role"] != "system":
+                # insert an empty system prompt to help render tool system prompt
+                messages.insert(0, {"role": "system", "content": ""})
             if request.tools:
                 messages[0]["tools"] = [tool.model_dump() for tool in request.tools]
-            real_input = encode_messages(
-                messages, thinking_mode=thinking_mode, drop_thinking=False
-            )
+            real_input = encode_messages(messages, thinking_mode=thinking_mode)
             prompt_ids = self.tokenizer_manager.tokenizer.encode(real_input)
         else:
             for message in request.messages:
@@ -1067,8 +1080,8 @@ class OpenAIServingChat(OpenAIServingBase):
                 request.chat_template_kwargs is not None
                 and request.chat_template_kwargs.get("thinking") is True
             )
-        if self.reasoning_parser in ["qwen3", "glm45"]:
-            # qwen3 and glm45 are reasoning by default
+        if self.reasoning_parser in ["qwen3", "glm45", "nano_v3", "interns1"]:
+            # qwen3, glm45, nano_v3, and interns1 are reasoning by default
             return (
                 not request.chat_template_kwargs
                 or request.chat_template_kwargs.get("enable_thinking", True) is True
