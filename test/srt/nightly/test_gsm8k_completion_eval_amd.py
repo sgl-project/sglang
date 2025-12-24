@@ -237,7 +237,6 @@ AMD_DEEPSEEK_V3_TC_MODELS = [
             "--cuda-graph-max-bs",
             "16",  # Required for torch compile MoE
             "--enable-torch-compile",
-            "--disable-cuda-graph",
             "--trust-remote-code",
         ],
         env_vars={

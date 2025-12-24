@@ -74,8 +74,10 @@ git_clone_with_retry() {
     if [ -n "$dest_dir" ] && [ -d "$dest_dir" ]; then
       rm -rf "$dest_dir"
     fi
-
-    if git \
+    if [ $attempt -eq 1 ]; then
+      echo "Simulating failure on first attempt"
+      git clone https://github.com/this-repo-does-not-exist.git "$dest_dir" || true
+    else git \
       -c http.lowSpeedLimit=1000 \
       -c http.lowSpeedTime=30 \
       clone --depth 1 ${branch_args:+$branch_args} "$repo_url" "$dest_dir"; then
