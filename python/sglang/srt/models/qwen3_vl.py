@@ -71,7 +71,14 @@ from sglang.srt.models.utils import (
 from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
 from sglang.srt.multimodal.vit_cuda_graph_runner import ViTCudaGraphRunner
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import add_prefix, get_int_env_var, is_cpu, is_npu, round_up
+from sglang.srt.utils import (
+    add_prefix,
+    cpu_has_amx_support,
+    get_int_env_var,
+    is_cpu,
+    is_npu,
+    round_up,
+)
 from sglang.srt.utils.hf_transformers_utils import get_processor
 
 logger = logging.getLogger(__name__)
@@ -79,6 +86,7 @@ logger = logging.getLogger(__name__)
 
 # === Vision Encoder === #
 _is_cpu = is_cpu()
+_is_cpu_amx_available = cpu_has_amx_support()
 
 
 class Qwen3_VisionMLP(nn.Module):

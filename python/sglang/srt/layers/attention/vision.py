@@ -16,9 +16,11 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size
 from sglang.srt.models.utils import apply_qk_norm
 from sglang.srt.utils import (
+    cpu_has_amx_support,
     get_bool_env_var,
     get_device_capability,
     is_blackwell_supported,
+    is_cpu,
     is_cuda,
     is_hip,
     is_npu,
@@ -29,13 +31,17 @@ from sglang.srt.utils.multi_stream_utils import (
     with_multi_stream,
 )
 
+_is_cpu = is_cpu()
 _is_cuda = is_cuda()
 _is_npu = is_npu()
 _is_hip = is_hip()
+_is_cpu_amx_available = cpu_has_amx_support()
 
 if _is_cuda:
     from flashinfer.prefill import cudnn_batch_prefill_with_kv_cache
     from sgl_kernel.flash_attn import flash_attn_varlen_func
+if _is_cpu and _is_cpu_amx_available:
+    flash_attn_varlen_func = torch.ops.sgl_kernel.flash_attn_varlen_func
 
 if _is_npu:
     import torch_npu
@@ -273,8 +279,6 @@ class VisionSdpaAttention(nn.Module):
             del attn_weights, v
         else:
             # SDPA
-            if attention_mask.dim() == 3:
-                attention_mask = attention_mask.squeeze(0)  # [s, s]
             # [b, h, s, head_size]
             output = F.scaled_dot_product_attention(
                 q,
@@ -690,6 +694,60 @@ class VisionAscendAttention(nn.Module):
         return output
 
 
+class VisionAMXAttention(nn.Module):
+    def __init__(
+        self,
+        **kwargs,
+    ):
+        if not _is_cpu or not _is_cpu_amx_available:
+            raise Exception(
+                "VisionAMXAttention is only available for cpu with amx support"
+            )
+        super().__init__()
+
+    def forward(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        cu_seqlens: torch.Tensor | SingletonCache | None,
+        bsz: int,
+        seq_len: int,
+        **kwargs,
+    ) -> torch.Tensor:
+        r"""
+        Args:
+            cu_seqlens: [b]
+        Returns:
+             [b * s, h, head_size]
+        """
+        if cu_seqlens is None:
+            cu_seqlens = _get_cu_seqlens_for_shape(bsz, seq_len, device=q.device)
+        elif isinstance(cu_seqlens, SingletonCache):
+            if cu_seqlens.empty():
+                cu_seqlens.set_data(
+                    _get_cu_seqlens_for_shape(bsz, seq_len, device=q.device)
+                )
+            cu_seqlens = cu_seqlens.get_data()
+
+        cu_seqlens = cu_seqlens.to(dtype=torch.int32).to(q.device)
+        seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
+        max_seqlen = seq_lens.max().item()
+
+        output = flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_k=cu_seqlens,
+            max_seqlen_q=max_seqlen,
+            max_seqlen_k=max_seqlen,
+            causal=False,
+        )
+
+        return output
+
+
 QKV_BACKEND_IMPL = {
     "triton_attn": VisionTritonAttention,
     "sdpa": VisionSdpaAttention,
@@ -698,6 +756,7 @@ QKV_BACKEND_IMPL = {
     "flashinfer_cudnn": VisionFlashInferAttention,
     "ascend_attn": VisionAscendAttention,
     "aiter_attn": VisionAiterAttention,
+    "amx_attn": VisionAMXAttention,
 }
 
 
@@ -891,6 +950,8 @@ class VisionAttention(nn.Module):
                 backend = "aiter_attn"
             else:
                 backend = "triton_attn"
+        elif _is_cpu and _is_cpu_amx_available:
+            backend = "amx_attn"
         else:
             backend = "sdpa"
         if backend == "fa3" and is_blackwell_supported():
