@@ -643,7 +643,9 @@ async def generate_request(obj: GenerateReqInput, request: Request):
             ret = await _global_state.tokenizer_manager.generate_request(
                 obj, request
             ).__anext__()
-            return ret
+            # Use ORJSONResponse to handle -inf/inf/nan values in logprobs
+            # (fixes https://github.com/sgl-project/sglang/issues/4097)
+            return ORJSONResponse(ret)
         except ValueError as e:
             logger.error(f"[http_server] Error: {e}")
             return _create_error_response(e)
@@ -667,7 +669,7 @@ async def generate_from_file_request(file: UploadFile, request: Request):
         ret = await _global_state.tokenizer_manager.generate_request(
             obj, request
         ).__anext__()
-        return ret
+        return ORJSONResponse(ret)
     except ValueError as e:
         logger.error(f"Error: {e}")
         return _create_error_response(e)
@@ -680,7 +682,7 @@ async def encode_request(obj: EmbeddingReqInput, request: Request):
         ret = await _global_state.tokenizer_manager.generate_request(
             obj, request
         ).__anext__()
-        return ret
+        return ORJSONResponse(ret)
     except ValueError as e:
         return _create_error_response(e)
 
@@ -692,7 +694,7 @@ async def classify_request(obj: EmbeddingReqInput, request: Request):
         ret = await _global_state.tokenizer_manager.generate_request(
             obj, request
         ).__anext__()
-        return ret
+        return ORJSONResponse(ret)
     except ValueError as e:
         return _create_error_response(e)
 
