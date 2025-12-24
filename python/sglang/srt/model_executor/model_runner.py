@@ -1836,9 +1836,6 @@ class ModelRunner:
         log_info_on_rank0(logger, f"Using KV cache dtype: {self.kv_cache_dtype}")
 
         self.max_total_num_tokens = self.profile_max_num_token(total_gpu_memory)
-        logger.info(
-            f"Profiled max_total_num_tokens={self.max_total_num_tokens} for the model"
-        )
 
         if (small_kv_size := envs.SGLANG_CI_SMALL_KV_SIZE.get()) > 0:
             logger.info(
