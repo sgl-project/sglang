@@ -41,8 +41,6 @@ def apply_nemotron_h_defaults(server_args: "ServerArgs", model_arch: str) -> Non
 
     server_args._handle_mamba_radix_cache(
         model_arch=model_arch,
-        support_mamba_cache=True,
-        support_mamba_cache_extra_buffer=False,
         sm100_default_attention_backend="flashinfer",
     )
     assert server_args.attention_backend != "triton", (
