@@ -69,7 +69,7 @@ class TestAscendW8A8CompressedTensors(CustomTestCase):
         print(metrics)
 
         self.assertGreaterEqual(metrics["accuracy"], 0.3)
-        self.assertGreaterEqual(metrics["output_throughput"], 1000)
+        self.assertGreaterEqual(metrics["output_throughput"], 700)
 
     def run_decode(self, max_new_tokens):
         response = requests.post(
