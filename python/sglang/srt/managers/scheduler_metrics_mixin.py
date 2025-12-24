@@ -3,7 +3,8 @@ from __future__ import annotations
 import logging
 import time
 from collections import defaultdict
-from typing import TYPE_CHECKING, List, Optional
+from contextlib import contextmanager
+from typing import TYPE_CHECKING, List, Optional, Union
 
 from sglang.srt.disaggregation.kv_events import EventPublisherFactory, KVEventBatch
 from sglang.srt.disaggregation.utils import DisaggregationMode
@@ -11,16 +12,19 @@ from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import GetLoadReqInput, GetLoadReqOutput
 from sglang.srt.managers.schedule_policy import PrefillAdder
 from sglang.srt.managers.scheduler import Req, ScheduleBatch
+from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.metrics.collector import SchedulerMetricsCollector, SchedulerStats
 from sglang.srt.utils import get_bool_env_var
+from sglang.srt.utils.device_timer import DeviceTimer
 
 if TYPE_CHECKING:
-    from sglang.srt.managers.scheduler import Scheduler
+    from sglang.srt.managers.scheduler import EmbeddingBatchResult, Scheduler
 
 logger = logging.getLogger(__name__)
 
 RECORD_STEP_TIME = get_bool_env_var("SGLANG_RECORD_STEP_TIME")
 LOG_FORWARD_ITERS = envs.SGLANG_LOG_FORWARD_ITERS.get()
+ENABLE_METRICS_DEVICE_TIMER = envs.SGLANG_ENABLE_METRICS_DEVICE_TIMER.get()
 
 
 class KvMetrics:
@@ -60,6 +64,7 @@ class SchedulerMetricsMixin:
         self.kv_transfer_latency_ms: float = 0.0
         self.kv_transfer_bootstrap_ms: float = 0.0
         self.kv_transfer_alloc_ms: float = 0.0
+        self.kv_transfer_total_mb: float = 0.0
 
         self.stats = SchedulerStats()
 
@@ -75,10 +80,19 @@ class SchedulerMetricsMixin:
                 "engine_type": engine_type,
                 "tp_rank": tp_rank,
                 "pp_rank": pp_rank,
+                "moe_ep_rank": self.moe_ep_rank,
             }
             if dp_rank is not None:
                 labels["dp_rank"] = dp_rank
             self.metrics_collector = SchedulerMetricsCollector(labels=labels)
+
+            if ENABLE_METRICS_DEVICE_TIMER:
+                self.forward_pass_device_timer = DeviceTimer(
+                    reporter=self.metrics_collector.increment_gpu_execution_seconds,
+                )
+
+        if self.enable_kv_cache_events:
+            self.init_kv_events(self.server_args.kv_events_config)
 
     def init_kv_events(self: Scheduler, kv_events_config: Optional[str]):
         if self.enable_kv_cache_events:
@@ -110,6 +124,7 @@ class SchedulerMetricsMixin:
         self.last_prefill_stats_tic = time.perf_counter()
         self.last_input_throughput = self.last_prefill_tokens / gap_latency
         self.last_prefill_tokens = adder.log_input_tokens
+        self.last_prefill_cache_tokens = adder.log_hit_tokens
 
         # TODO: generalize this for various memory pools
         if self.is_hybrid_swa:
@@ -208,6 +223,7 @@ class SchedulerMetricsMixin:
                 self.stats.kv_transfer_latency_ms = self.kv_transfer_latency_ms
                 self.stats.kv_transfer_bootstrap_ms = self.kv_transfer_bootstrap_ms
                 self.stats.kv_transfer_alloc_ms = self.kv_transfer_alloc_ms
+                self.stats.kv_transfer_total_mb = self.kv_transfer_total_mb
             elif self.disaggregation_mode == DisaggregationMode.DECODE:
                 self.stats.num_decode_prealloc_queue_reqs = len(
                     self.disagg_decode_prealloc_queue.queue
@@ -221,6 +237,15 @@ class SchedulerMetricsMixin:
             self.metrics_collector.log_stats(self.stats)
             self._emit_kv_metrics()
         self._publish_kv_events()
+
+    def log_prefill_stats_late(self: Scheduler, batch: Optional[ScheduleBatch]):
+        """This should be called after `batch` has gathered enough metadata."""
+        if self.enable_metrics and batch is not None:
+            self.metrics_collector.increment_realtime_tokens(
+                prefill_compute_tokens=self.last_prefill_tokens,
+                prefill_cache_tokens=self.last_prefill_cache_tokens,
+                dp_cooperation_info=batch.dp_cooperation_info,
+            )
 
     def log_decode_stats(
         self: Scheduler, can_run_cuda_graph: bool, running_batch: ScheduleBatch = None
@@ -373,6 +398,31 @@ class SchedulerMetricsMixin:
             self._emit_kv_metrics()
         self._publish_kv_events()
 
+    def log_decode_stats_every_iteration(
+        self: Scheduler, batch: ScheduleBatch, num_accepted_tokens: int
+    ):
+        self.metrics_collector.increment_realtime_tokens(
+            # TODO unify this w/ the bumping logic in `Scheduler.num_generated_tokens` accumulator
+            decode_tokens=batch.batch_size() + num_accepted_tokens,
+            dp_cooperation_info=batch.dp_cooperation_info,
+        )
+
+    def log_batch_result_stats(
+        self: Scheduler,
+        batch: ScheduleBatch,
+        result: Union[GenerationBatchResult, EmbeddingBatchResult],
+    ):
+        if not self.enable_metrics:
+            return
+        if not isinstance(result, GenerationBatchResult):
+            return
+
+        if (m := result.expert_distribution_metrics) is not None:
+            self.metrics_collector.increment_eplb_balancedness(
+                forward_mode=batch.forward_mode.name.lower(),
+                balancedness=m.eplb_balancedness.item(),
+            )
+
     def _emit_kv_metrics(self: Scheduler):
         if not self.enable_kv_cache_events:
             return
@@ -442,3 +492,18 @@ class SchedulerMetricsMixin:
             num_waiting_reqs=num_waiting_reqs,
             num_tokens=num_tokens,
         )
+
+    @contextmanager
+    def record_forward_metrics(self: Scheduler, batch):
+        if not (self.enable_metrics and ENABLE_METRICS_DEVICE_TIMER):
+            yield
+            return
+
+        category = "forward_" + batch.forward_mode.name.lower()
+        with self.forward_pass_device_timer.wrap(
+            metadata=dict(
+                category=category,
+                dp_cooperation_info=batch.dp_cooperation_info,
+            ),
+        ):
+            yield
