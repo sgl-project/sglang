@@ -14,7 +14,7 @@ namespace details {
 
 template <>
 struct dtype_trait<__nv_fp8_e4m3> {
-  inline static constexpr DLDataType value = {.code = DLDataTypeCode::kDLFloat, .bits = 8, .lanes = 1};
+  inline static constexpr DLDataType value = {.code = DLDataTypeCode::kDLFloat8_e4m3fn, .bits = 8, .lanes = 1};
 };
 
 }  // namespace details
@@ -122,26 +122,27 @@ void per_tensor_quant_fp8(tvm::ffi::TensorView input,
                           tvm::ffi::TensorView output_s) {
   using namespace host;
 
-  SymbolicSize num_elements = {"num_elements"};
+  SymbolicSize num_tokens = {"num_tokens"};
+  SymbolicSize hidden_dim = {"hidden_dim"};
   SymbolicDevice device_;
   SymbolicDType input_dtype;
 
-  TensorMatcher({num_elements})
+  TensorMatcher({num_tokens, hidden_dim})
       .with_dtype<float, __half, __nv_bfloat16>(input_dtype)
       .with_device<kDLCUDA>(device_)
       .verify(input);
 
-  TensorMatcher({num_elements})
+  TensorMatcher({num_tokens, hidden_dim})
       .with_dtype<__nv_fp8_e4m3>()
       .with_device<kDLCUDA>(device_)
       .verify(output_q);
 
-  TensorMatcher({})
+  TensorMatcher({1})
       .with_dtype<float>()
       .with_device<kDLCUDA>(device_)
       .verify(output_s);
 
-  const size_t total_elements = num_elements.unwrap();
+  const size_t total_elements = num_tokens.unwrap() * hidden_dim.unwrap();
   const size_t num_blocks = std::min((total_elements + kBlockSize - 1) / kBlockSize, size_t(1024));
   const DLDevice device = device_.unwrap();
 
@@ -171,9 +172,9 @@ void per_tensor_quant_fp8(tvm::ffi::TensorView input,
     launch_kernels.template operator()<__nv_bfloat16>();
   } else if (dtype.code == kDLFloat && dtype.bits == 16) {
     launch_kernels.template operator()<__half>();
-  } else {
-    RuntimeCheck(false, "Unsupported input dtype");
   }
+  // You can also manually check the last CUDA error code via:
+  // RuntimeDeviceCheck();
 }
 
 }  // namespace
