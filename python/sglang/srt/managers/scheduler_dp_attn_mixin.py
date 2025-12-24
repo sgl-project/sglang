@@ -187,6 +187,9 @@ def prepare_mlp_sync_batch_raw(
             batch_to_gather, mlp_sync_info, require_mlp_tp_gather, skip_all_gather
         )
 
+    if _ENABLE_METRICS_DP_ATTENTION:
+        local_batch.dp_cooperation_info = mlp_sync_info.dp_cooperation_info
+
     return local_batch
 
 
