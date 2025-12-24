@@ -197,6 +197,8 @@ suites = {
         TestFile("test_profile_v2.py"),
         TestFile("models/test_ministral3_models.py"),
         TestFile("test_mistral_large3_basic.py"),
+        # TODO: Add it to nightly after we have 2-gpu in nightly
+        TestFile("test_metrics_2gpu.py"),
     ],
 }
 
