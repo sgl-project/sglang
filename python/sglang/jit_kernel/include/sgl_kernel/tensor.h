@@ -153,6 +153,11 @@ inline auto& operator<<(std::ostream& os, PrintAbleSpan<T> span) {
 
 }  // namespace details
 
+template <typename T>
+inline bool holds_dtype(DLDataType dtype) {
+  return dtype == details::dtype_trait<T>::value;
+}
+
 struct SymbolicSize {
  public:
   SymbolicSize(std::string_view annotation = {}) : m_value(details::kNullSize), m_annotation(annotation) {}
@@ -257,6 +262,11 @@ struct SymbolicDType {
     } else {
       this->set_value(dtype);
     }
+  }
+
+  template <typename T>
+  auto holds_value() const -> bool {
+    return holds_dtype<T>(m_value);
   }
 
  private:
