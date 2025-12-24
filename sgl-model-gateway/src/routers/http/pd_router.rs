@@ -168,6 +168,12 @@ impl PDRouter {
 
     fn handle_server_selection_error(error: String) -> Response {
         error!("Failed to select PD pair error={}", error);
+        if error.contains("workload_aware") {
+            return error::too_many_requests(
+                "too_many_requests",
+                "limited by workload_aware policy",
+            );
+        }
         error::service_unavailable(
             "server_selection_failed",
             format!("No available servers: {}", error),

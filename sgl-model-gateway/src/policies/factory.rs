@@ -5,7 +5,7 @@ use std::sync::Arc;
 use super::{
     BucketConfig, BucketPolicy, CacheAwareConfig, CacheAwarePolicy, ConsistentHashingPolicy,
     LoadBalancingPolicy, ManualConfig, ManualPolicy, PowerOfTwoPolicy, PrefixHashConfig,
-    PrefixHashPolicy, RandomPolicy, RoundRobinPolicy,
+    PrefixHashPolicy, RandomPolicy, RoundRobinPolicy, WorkloadAwareConfig, WorkloadAwarePolicy,
 };
 use crate::config::PolicyConfig;
 
@@ -68,6 +68,16 @@ impl PolicyFactory {
                 };
                 Arc::new(PrefixHashPolicy::new(config))
             }
+            PolicyConfig::WorkloadAware {
+                num_waiting_reqs,
+                api_key,
+            } => {
+                let config = WorkloadAwareConfig {
+                    num_waiting_reqs: *num_waiting_reqs,
+                    api_key: api_key.clone(),
+                };
+                Arc::new(WorkloadAwarePolicy::with_config(config))
+            }
         }
     }
 
@@ -84,6 +94,7 @@ impl PolicyFactory {
                 Some(Arc::new(ConsistentHashingPolicy::new()))
             }
             "prefix_hash" | "prefixhash" => Some(Arc::new(PrefixHashPolicy::with_defaults())),
+            "workload_aware" | "workloadaware" => Some(Arc::new(WorkloadAwarePolicy::new())),
             _ => None,
         }
     }
@@ -130,6 +141,12 @@ mod tests {
 
         let policy = PolicyFactory::create_from_config(&PolicyConfig::ConsistentHashing);
         assert_eq!(policy.name(), "consistent_hashing");
+
+        let policy = PolicyFactory::create_from_config(&PolicyConfig::WorkloadAware {
+            num_waiting_reqs: 15,
+            api_key: None,
+        });
+        assert_eq!(policy.name(), "workload_aware");
     }
 
     #[tokio::test]
@@ -148,6 +165,8 @@ mod tests {
         assert!(PolicyFactory::create_by_name("Manual").is_some());
         assert!(PolicyFactory::create_by_name("consistent_hashing").is_some());
         assert!(PolicyFactory::create_by_name("ConsistentHashing").is_some());
+        assert!(PolicyFactory::create_by_name("workload_aware").is_some());
+        assert!(PolicyFactory::create_by_name("WorkloadAware").is_some());
         assert!(PolicyFactory::create_by_name("unknown").is_none());
     }
 }

@@ -19,6 +19,8 @@ mod registry;
 mod round_robin;
 pub mod tree;
 pub(crate) mod utils;
+mod workload_aware;
+
 pub use bucket::BucketPolicy;
 pub use cache_aware::CacheAwarePolicy;
 pub use consistent_hashing::ConsistentHashingPolicy;
@@ -30,6 +32,7 @@ pub use random::RandomPolicy;
 pub use registry::PolicyRegistry;
 pub use round_robin::RoundRobinPolicy;
 pub use tree::PrefixMatchResult;
+pub use workload_aware::WorkloadAwarePolicy;
 
 /// Core trait for load balancing policies
 ///
@@ -98,6 +101,21 @@ impl Default for CacheAwareConfig {
             balance_rel_threshold: 1.1,
             eviction_interval_secs: 30,
             max_tree_size: 10000,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct WorkloadAwareConfig {
+    pub num_waiting_reqs: usize,
+    pub api_key: Option<String>,
+}
+
+impl Default for WorkloadAwareConfig {
+    fn default() -> Self {
+        Self {
+            num_waiting_reqs: 10,
+            api_key: None,
         }
     }
 }

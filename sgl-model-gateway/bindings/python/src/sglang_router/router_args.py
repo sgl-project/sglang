@@ -136,6 +136,8 @@ class RouterArgs:
     jwt_audience: Optional[str] = None
     jwt_jwks_uri: Optional[str] = None
     jwt_role_mapping: Dict[str, str] = dataclasses.field(default_factory=dict)
+    # Workload aware configuration
+    max_waiting_per_worker: int = 10
 
     @staticmethod
     def add_cli_args(
@@ -252,6 +254,7 @@ class RouterArgs:
                 "power_of_two",
                 "manual",
                 "bucket",
+                "workload_aware",
             ],
             help="Specific policy for prefill nodes in PD mode. If not specified, uses the main policy",
         )
@@ -777,6 +780,12 @@ class RouterArgs:
             type=str,
             default="localhost:4317",
             help="Config opentelemetry collector endpoint if --enable-trace is set. format: <ip>:<port>",
+        )
+        parser.add_argument(
+            f"--{prefix}max-waiting-per-worker",
+            type=int,
+            default=RouterArgs.max_waiting_per_worker,
+            help="Maximum number of waiting requests per worker for workload aware policy (default: 10)",
         )
 
         # Control plane authentication

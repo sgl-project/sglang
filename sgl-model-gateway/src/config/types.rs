@@ -337,6 +337,14 @@ pub enum PolicyConfig {
         bucket_adjust_interval_secs: usize,
     },
 
+    #[serde(rename = "workload_aware")]
+    WorkloadAware {
+        /// Threshold for num_waiting_reqs - workers above this are considered busy
+        num_waiting_reqs: usize,
+        /// API key for authentication (optional)
+        api_key: Option<String>,
+    },
+
     /// Manual routing policy with sticky sessions using DashMap.
     /// - X-SMG-Routing-Key: Routes to a cached worker or assigns a new one
     /// - Provides true sticky sessions with zero key redistribution on worker add
@@ -403,6 +411,7 @@ impl PolicyConfig {
             PolicyConfig::Manual { .. } => "manual",
             PolicyConfig::ConsistentHashing => "consistent_hashing",
             PolicyConfig::PrefixHash { .. } => "prefix_hash",
+            PolicyConfig::WorkloadAware { .. } => "workload_aware",
         }
     }
 }
