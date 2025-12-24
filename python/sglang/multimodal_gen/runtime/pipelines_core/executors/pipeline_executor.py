@@ -50,14 +50,8 @@ class PipelineExecutor(ABC):
         batch: Req,
         server_args: ServerArgs,
     ) -> OutputBatch:
-        rank = get_world_rank()
 
-        if batch.profile and batch.profile_all_stages:
-            world_rank = get_world_rank()
-        else:
-            world_rank = 0
-
-        with self.profile_execution(batch, check_rank=rank, dump_rank=world_rank):
+        with self.profile_execution(batch, dump_rank=0):
             batch = self.execute(stages, batch, server_args)
 
         return batch
@@ -83,20 +77,23 @@ class PipelineExecutor(ABC):
         raise NotImplementedError
 
     @contextlib.contextmanager
-    def profile_execution(self, batch: Req, check_rank: int = 0, dump_rank: int = 0):
+    def profile_execution(self, batch: Req, dump_rank: int = 0):
         """
         Context manager for profiling execution.
         """
         do_profile = batch.profile
 
         if not do_profile:
+            # fast forward
             yield
             return
 
         request_id = batch.request_id
+        rank = get_world_rank()
+
         profiler = SGLDiffusionProfiler(
             request_id=request_id,
-            rank=check_rank,
+            rank=rank,
             full_profile=batch.profile_all_stages,
             num_steps=batch.num_profiled_timesteps,
             num_inference_steps=batch.num_inference_steps,
@@ -104,5 +101,4 @@ class PipelineExecutor(ABC):
         try:
             yield
         finally:
-            should_export = check_rank == 0
-            profiler.stop(export_trace=should_export, dump_rank=dump_rank)
+            profiler.stop(dump_rank=dump_rank)
