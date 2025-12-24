@@ -147,6 +147,7 @@ def handle_rerun_stage(
         "stage-b-test-small-1-gpu",
         "stage-b-test-large-1-gpu",
         "stage-b-test-large-2-gpu",
+        "stage-c-test-large-4-gpu",
         "multimodal-gen-test-1-gpu",
         "multimodal-gen-test-2-gpu",
         "quantization-test",
