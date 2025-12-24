@@ -85,8 +85,10 @@ class OpenAIServingResponses(OpenAIServingChat):
         self.enable_prompt_tokens_details = enable_prompt_tokens_details
         self.enable_force_include_usage = enable_force_include_usage
 
-        # Get default sampling params from model config if available
-        self.default_sampling_params = {}
+        # Use default sampling params from parent class (model config + preferred_sampling_params)
+        # If not set by parent, initialize as empty dict
+        if not hasattr(self, "default_sampling_params") or self.default_sampling_params is None:
+            self.default_sampling_params = {}
 
         self.supports_browsing = (
             tool_server.has_tool("browser") if tool_server else False
