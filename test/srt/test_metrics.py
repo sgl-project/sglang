@@ -64,22 +64,22 @@ class TestEnableMetrics(CustomTestCase):
         def _verify_metrics(metrics_content):
             TODO
 
+        self._execute_core(
+            other_args=["--tp", "2", "--dp", "2", "--enable-dp-attention"],
+            verify_metrics=_verify_metrics,
+        )
+
+    def _execute_core(self, other_args, verify_metrics):
         with (
             envs.SGLANG_ENABLE_METRICS_DP_ATTENTION.override(True),
             envs.SGLANG_ENABLE_METRICS_DEVICE_TIMER.override(True),
         ):
-            self._execute_core(
-                other_args=["--tp", "2", "--dp", "2", "--enable-dp-attention"],
-                verify_metrics=_verify_metrics,
+            process = popen_launch_server(
+                "Qwen/Qwen3-0.6B",
+                DEFAULT_URL_FOR_TEST,
+                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+                other_args=["--enable-metrics", "--cuda-graph-max-bs", 2, *other_args],
             )
-
-    def _execute_core(self, other_args, verify_metrics):
-        process = popen_launch_server(
-            "Qwen/Qwen3-0.6B",
-            DEFAULT_URL_FOR_TEST,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=["--enable-metrics", "--cuda-graph-max-bs", 2, *other_args],
-        )
 
         try:
             # Make some requests to generate some metrics
