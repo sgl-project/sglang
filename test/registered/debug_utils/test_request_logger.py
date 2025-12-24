@@ -78,15 +78,15 @@ class TestRequestLoggerJson(BaseTestRequestLogger, CustomTestCase):
             json_start = line.find("{")
             if json_start == -1:
                 continue
-            if '"event": "request.received"' in line:
+            try:
                 data = json.loads(line[json_start:])
-                self.assertEqual(data["event"], "request.received")
+            except json.JSONDecodeError:
+                continue
+            if data.get("event") == "request.received":
                 self.assertIn("rid", data)
                 self.assertIn("obj", data)
                 received_found = True
-            elif '"event": "request.finished"' in line:
-                data = json.loads(line[json_start:])
-                self.assertEqual(data["event"], "request.finished")
+            elif data.get("event") == "request.finished":
                 self.assertIn("rid", data)
                 self.assertIn("obj", data)
                 self.assertIn("out", data)
