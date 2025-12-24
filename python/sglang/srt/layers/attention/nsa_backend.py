@@ -374,7 +374,7 @@ class NativeSparseAttnBackend(
         # Centralized dispatch: decide all strategies for this batch
         self.set_nsa_prefill_impl(forward_batch)
         topk_transform_method = self.get_topk_transform_method()
-        bs_idx = None
+        bs_idx_cpu = None
         indexer_seq_lens_cpu = forward_batch.seq_lens_cpu
 
         if forward_batch.forward_mode.is_decode_or_idle():
@@ -491,13 +491,10 @@ class NativeSparseAttnBackend(
 
             if can_nsa_prefill_cp_continuous_split(forward_batch):
                 seqlens_expanded = nsa_cp_continuous_split_data(seqlens_expanded)
-                extend_seq_lens_cpu, bs_idx = nsa_cp_continuous_split_q_seqs(
-                    extend_seq_lens_cpu
+                extend_seq_lens_cpu, extend_seq_lens, bs_idx_cpu, bs_idx = (
+                    nsa_cp_continuous_split_q_seqs(extend_seq_lens_cpu, extend_seq_lens)
                 )
-                extend_seq_lens = torch.tensor(
-                    extend_seq_lens_cpu, device=self.device, dtype=extend_seq_lens.dtype
-                )
-                indexer_seq_lens_cpu = indexer_seq_lens_cpu[bs_idx]
+                indexer_seq_lens_cpu = indexer_seq_lens_cpu[bs_idx_cpu]
                 cache_seqlens_int32 = cache_seqlens_int32[bs_idx]
                 cu_seqlens_k = compute_cu_seqlens(cache_seqlens_int32)
                 max_seqlen_k = (
@@ -510,7 +507,7 @@ class NativeSparseAttnBackend(
             if (
                 any(forward_batch.extend_prefix_lens_cpu)
                 or forward_batch.forward_mode == ForwardMode.DRAFT_EXTEND
-                or bs_idx is not None
+                or bs_idx_cpu is not None
             ):
                 max_seqlen_q = (
                     max(extend_seq_lens_cpu) if len(extend_seq_lens_cpu) != 0 else 1
@@ -567,7 +564,7 @@ class NativeSparseAttnBackend(
             assert False, f"Unsupported {forward_batch.forward_mode = }"
 
         indexer_k_start_end, token_to_batch_idx = self._cal_indexer_k_start_end(
-            forward_batch, bs_idx
+            forward_batch, bs_idx_cpu
         )
         # 1D, expanded seqlens (1D means cheap to compute, so always compute it)
         nsa_cache_seqlens_int32 = compute_nsa_seqlens(

@@ -5,6 +5,8 @@ from typing import TYPE_CHECKING, List, Union
 
 import torch
 import torch.nn.functional as F
+import triton
+import triton.language as tl
 
 from sglang.srt.layers.dp_attention import (
     attn_tp_all_gather_into_tensor,
@@ -87,9 +89,18 @@ def nsa_cp_continuous_split_data(input_: Union[torch.Tensor, List]):
     """
     cp_size = get_attention_tp_size()
     cp_rank = get_attention_tp_rank()
-    if isinstance(input_, (tuple, list)) or len(input_) % cp_size != 0:
+    if isinstance(input_, (tuple, list)):
         indices = range(cp_rank, len(input_), cp_size)
         return input_[indices]
+
+    tokens = len(input_)
+    if tokens % cp_size != 0:
+        cur_len = tokens // cp_size + (tokens % cp_size > cp_rank)
+        if cur_len == 0:
+            return input_.new_empty(0, *input_.shape[1:])
+        indices = torch.arange(cp_rank, tokens, cp_size, device=input_.device)
+        return input_[indices]
+
     # for torch device tensor
     return input_.view(-1, cp_size, *input_.shape[1:])[:, cp_rank].contiguous()
 
@@ -189,19 +200,58 @@ def cp_split_and_rebuild_position(forward_batch, positions: torch.Tensor):
     return positions
 
 
-def nsa_cp_continuous_split_q_seqs(extend_seqs):
+@triton.jit
+def nsa_cp_continuous_split_q_seqs_kernel(
+    in_seqs_ptr,
+    out_seqs_ptr,
+    bs_idx_ptr,
+    tokens: tl.constexpr,
+    cp_size: tl.constexpr,
+    cp_rank: tl.constexpr,
+):
+    extra_seq = 0
+    bs_idx = 0
+    for bs in range(tokens):
+        cur_len = tl.load(in_seqs_ptr + bs)
+        cur_len += extra_seq
+        cur_seq = cur_len // cp_size + (cur_len % cp_size > cp_rank)
+        if cur_seq > 0:
+            tl.store(bs_idx_ptr + bs_idx, bs)
+            tl.store(out_seqs_ptr + bs_idx, cur_seq)
+            bs_idx += 1
+        extra_seq = cur_len - cur_seq * cp_size
+
+
+def nsa_cp_continuous_split_q_seqs_cpu(extend_seqs):
     cp_size = get_attention_tp_size()
-    cp_id = get_attention_tp_rank()
+    cp_rank = get_attention_tp_rank()
     extra_seq = 0
     q_seqs = []
     for bs, cur_len in enumerate(extend_seqs):
         cur_len += extra_seq
-        cur_seq = cur_len // cp_size + int(cur_len % cp_size > cp_id)
+        cur_seq = cur_len // cp_size + int(cur_len % cp_size > cp_rank)
         q_seqs.append(cur_seq)
         extra_seq = cur_len - cur_seq * cp_size
     bs_idx = list([i for i, x in enumerate(q_seqs) if x > 0])
     q_seqs = [q_len for q_len in q_seqs if q_len > 0]
     return q_seqs, bs_idx
+
+
+def nsa_cp_continuous_split_q_seqs(extend_seqs_cpu, extend_seqs):
+    cp_size = get_attention_tp_size()
+    cp_rank = get_attention_tp_rank()
+    ret_q_lens_cpu, bs_idx_cpu = nsa_cp_continuous_split_q_seqs_cpu(extend_seqs_cpu)
+    ret_q_lens = torch.empty(
+        (len(bs_idx_cpu),), device=extend_seqs.device, dtype=extend_seqs.dtype
+    )
+    bs_idx = torch.empty(
+        (len(bs_idx_cpu),), device=extend_seqs.device, dtype=torch.int32
+    )
+    grid = (1,)
+    nsa_cp_continuous_split_q_seqs_kernel[grid](
+        extend_seqs, ret_q_lens, bs_idx, len(extend_seqs), cp_size, cp_rank
+    )
+    return ret_q_lens_cpu, ret_q_lens, bs_idx_cpu, bs_idx
 
 
 def nsa_use_prefill_cp(forward_batch, nsa_enable_prefill_cp=None):
