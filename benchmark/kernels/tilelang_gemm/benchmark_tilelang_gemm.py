@@ -21,7 +21,7 @@ Usage:
 import argparse
 import csv
 import logging
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 import torch
 import triton
@@ -115,78 +115,6 @@ def prepare_data(M: int, N: int, K: int):
     return A_fp8, B_fp8, A_scale, B_scale, A_scale_deepgemm
 
 
-def benchmark_tilelang(
-    A_fp8: torch.Tensor,
-    B_fp8: torch.Tensor,
-    A_scale: torch.Tensor,
-    B_scale: torch.Tensor,
-    M: int,
-    N: int,
-    rep: int = 100,
-) -> Tuple[float, float, float]:
-    """Benchmark TileLang kernel using entrypoint API."""
-
-    C = torch.zeros(M, N, dtype=torch.bfloat16, device="cuda")
-
-    def fn():
-        tilelang_gemm_wrapper.gemm_nt_f8f8bf16((A_fp8, A_scale), (B_fp8, B_scale), C)
-
-    quantiles = [0.5, 0.2, 0.8]
-    ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(
-        fn, rep=rep, quantiles=quantiles
-    )
-    return ms, min_ms, max_ms
-
-
-def benchmark_deepgemm(
-    A_fp8: torch.Tensor,
-    B_fp8: torch.Tensor,
-    A_scale: torch.Tensor,
-    B_scale: torch.Tensor,
-    M: int,
-    N: int,
-    rep: int = 100,
-) -> Tuple[float, float, float]:
-    """Benchmark DeepGEMM kernel (Hopper baseline)."""
-
-    C = torch.zeros(M, N, dtype=torch.bfloat16, device="cuda")
-
-    def fn():
-        deep_gemm_wrapper.gemm_nt_f8f8bf16((A_fp8, A_scale), (B_fp8, B_scale), C)
-
-    quantiles = [0.5, 0.2, 0.8]
-    ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(
-        fn, rep=rep, quantiles=quantiles
-    )
-    return ms, min_ms, max_ms
-
-
-def benchmark_triton(
-    A_fp8: torch.Tensor,
-    B_fp8: torch.Tensor,
-    A_scale: torch.Tensor,
-    B_scale: torch.Tensor,
-    M: int,
-    N: int,
-    K: int,
-    rep: int = 100,
-) -> Tuple[float, float, float]:
-    """Benchmark Triton kernel (Ada baseline)."""
-
-    block_size = [128, 128]
-
-    def fn():
-        return w8a8_block_fp8_matmul_triton(
-            A_fp8, B_fp8, A_scale, B_scale, block_size, output_dtype=torch.bfloat16
-        )
-
-    quantiles = [0.5, 0.2, 0.8]
-    ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(
-        fn, rep=rep, quantiles=quantiles
-    )
-    return ms, min_ms, max_ms
-
-
 def run_benchmark(
     N: int,
     K: int,
@@ -214,11 +142,22 @@ def run_benchmark(
         try:
             # Prepare data
             A_fp8, B_fp8, A_scale, B_scale, A_scale_deepgemm = prepare_data(M, N, K)
+            C_tl = torch.zeros(M, N, dtype=torch.bfloat16, device="cuda")
+            C_bl = torch.zeros(M, N, dtype=torch.bfloat16, device="cuda")
 
-            # Benchmark TileLang
+            # TileLang
             try:
-                tl_ms, _, _ = benchmark_tilelang(
-                    A_fp8, B_fp8, A_scale, B_scale, M, N, rep
+                tilelang_gemm_wrapper.gemm_nt_f8f8bf16(
+                    (A_fp8, A_scale), (B_fp8, B_scale), C_tl
+                )
+
+                def tl_fn():
+                    tilelang_gemm_wrapper.gemm_nt_f8f8bf16(
+                        (A_fp8, A_scale), (B_fp8, B_scale), C_tl
+                    )
+
+                tl_ms, _, _ = triton.testing.do_bench_cudagraph(
+                    tl_fn, rep=rep, quantiles=[0.5, 0.2, 0.8]
                 )
                 tl_tflops = tflops(M, N, K, tl_ms)
                 info = tilelang_gemm_wrapper.get_kernel_info(M, N, K)
@@ -227,26 +166,56 @@ def run_benchmark(
                 logger.warning(f"M={M}: TileLang failed: {e}")
                 continue
 
-            # Benchmark baseline based on architecture
+            # Baseline and accuracy check
+            acc_pass, max_diff = False, float("nan")
+            bl_ms, bl_tflops, speedup = float("nan"), float("nan"), float("nan")
+
             if BASELINE_AVAILABLE:
                 try:
                     if GPU_ARCH == "hopper":
-                        bl_ms, _, _ = benchmark_deepgemm(
-                            A_fp8, B_fp8, A_scale_deepgemm, B_scale, M, N, rep
+                        deep_gemm_wrapper.gemm_nt_f8f8bf16(
+                            (A_fp8, A_scale_deepgemm), (B_fp8, B_scale), C_bl
+                        )
+
+                        def bl_fn():
+                            deep_gemm_wrapper.gemm_nt_f8f8bf16(
+                                (A_fp8, A_scale_deepgemm), (B_fp8, B_scale), C_bl
+                            )
+
+                        bl_ms, _, _ = triton.testing.do_bench_cudagraph(
+                            bl_fn, rep=rep, quantiles=[0.5, 0.2, 0.8]
                         )
                     elif GPU_ARCH == "ada":
-                        bl_ms, _, _ = benchmark_triton(
-                            A_fp8, B_fp8, A_scale, B_scale, M, N, K, rep
+                        C_bl = w8a8_block_fp8_matmul_triton(
+                            A_fp8,
+                            B_fp8,
+                            A_scale,
+                            B_scale,
+                            [128, 128],
+                            output_dtype=torch.bfloat16,
                         )
-                    else:
-                        bl_ms = float("nan")
+
+                        def bl_fn():
+                            return w8a8_block_fp8_matmul_triton(
+                                A_fp8,
+                                B_fp8,
+                                A_scale,
+                                B_scale,
+                                [128, 128],
+                                output_dtype=torch.bfloat16,
+                            )
+
+                        bl_ms, _, _ = triton.testing.do_bench_cudagraph(
+                            bl_fn, rep=rep, quantiles=[0.5, 0.2, 0.8]
+                        )
+
+                    # Accuracy check
+                    acc_pass = torch.allclose(C_tl, C_bl, rtol=1e-2, atol=1e-2)
+                    max_diff = (C_tl - C_bl).abs().max().item()
                     bl_tflops = tflops(M, N, K, bl_ms)
                     speedup = bl_ms / tl_ms
                 except Exception as e:
                     logger.warning(f"M={M}: {BASELINE_NAME} failed: {e}")
-                    bl_ms = bl_tflops = speedup = float("nan")
-            else:
-                bl_ms = bl_tflops = speedup = float("nan")
 
             results.append(
                 {
@@ -259,6 +228,8 @@ def run_benchmark(
                     "bl_tflops": bl_tflops,
                     "speedup": speedup,
                     "kernel_type": kernel_type,
+                    "acc_pass": acc_pass,
+                    "max_diff": max_diff,
                 }
             )
 
@@ -276,16 +247,17 @@ def run_benchmark(
     header = (
         f"{'M':>6} | {'TileLang (ms)':>14} | {BASELINE_NAME + ' (ms)':>14} | "
         f"{'TL TFLOPS':>10} | {'BL TFLOPS':>10} | "
-        f"{'Speedup':>8} | {'Kernel Type':>15}"
+        f"{'Speedup':>8} | {'Kernel Type':>15} | {'Acc':>4} | {'MaxDiff':>10}"
     )
     print(header)
     print("-" * len(header))
 
     for r in results:
+        acc_str = "✓" if r["acc_pass"] else "✗"
         print(
             f"{r['M']:>6} | {r['tl_ms']:>14.4f} | {r['bl_ms']:>14.4f} | "
             f"{r['tl_tflops']:>10.2f} | {r['bl_tflops']:>10.2f} | "
-            f"{r['speedup']:>7.2f}x | {r['kernel_type']:>15}"
+            f"{r['speedup']:>7.2f}x | {r['kernel_type']:>15} | {acc_str:>4} | {r['max_diff']:>10.6f}"
         )
 
     print("-" * len(header))
