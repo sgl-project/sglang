@@ -64,7 +64,6 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     VerificationResult,
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
-from sglang.multimodal_gen.runtime.platforms.interface import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.perf_logger import StageProfiler
@@ -133,18 +132,10 @@ class DenoisingStage(PipelineStage):
         self.vae = vae
         self.pipeline = weakref.ref(pipeline) if pipeline else None
 
+        # TODO(will): hack, should use the actual one in dit
         self.attn_backend = get_attn_backend(
             head_size=attn_head_size,
-            dtype=torch.float16,  # TODO(will): hack
-            supported_attention_backends={
-                AttentionBackendEnum.SLIDING_TILE_ATTN,
-                AttentionBackendEnum.AITER,
-                AttentionBackendEnum.VIDEO_SPARSE_ATTN,
-                AttentionBackendEnum.VMOBA_ATTN,
-                AttentionBackendEnum.FA,
-                AttentionBackendEnum.TORCH_SDPA,
-                AttentionBackendEnum.SAGE_ATTN_3,
-            },  # hack
+            dtype=torch.float16,
         )
 
         # cfg
@@ -728,6 +719,17 @@ class DenoisingStage(PipelineStage):
             latents, batch
         )
 
+        offload_mgr = getattr(self.transformer, "_layerwise_offload_manager", None)
+        if offload_mgr is not None and getattr(offload_mgr, "enabled", False):
+            offload_mgr.release_all()
+
+        if self.transformer_2 is not None:
+            offload_mgr_2 = getattr(
+                self.transformer_2, "_layerwise_offload_manager", None
+            )
+            if offload_mgr_2 is not None and getattr(offload_mgr_2, "enabled", False):
+                offload_mgr_2.release_all()
+
         # Save STA mask search results if needed
         if (
             st_attn_available
@@ -751,20 +753,6 @@ class DenoisingStage(PipelineStage):
                 "Memory after deallocating transformer: %s",
                 torch.mps.current_allocated_memory(),
             )
-
-        # In offline local mode (`sglang generate`), offload transformer weights to CPU
-        # after denoising to reduce peak VRAM during VAE decoding.
-        if current_platform.is_cuda_alike() and server_args.is_local_mode:
-            for model in (self.transformer, self.transformer_2):
-                if model is not None:
-                    model.to("cpu")
-            logger.info(
-                "Offloaded denoiser transformer weights to CPU after denoising to reduce peak VRAM during VAE decoding."
-            )
-            try:
-                torch.cuda.empty_cache()
-            except Exception:
-                pass
 
     def _preprocess_sp_latents(self, batch: Req, server_args: ServerArgs):
         """Shard latents for Sequence Parallelism if applicable."""
