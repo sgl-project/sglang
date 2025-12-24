@@ -14,6 +14,7 @@ from diffusers import AutoModel
 from torch import nn
 from transformers import AutoImageProcessor, AutoProcessor, AutoTokenizer
 
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.models import ModelConfig
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.loader.utils import (
@@ -73,6 +74,7 @@ class ComponentLoader(ABC):
         server_args: ServerArgs,
         component_name: str,
         transformers_or_diffusers: str,
+        use_runai_model_streamer: bool = True,
     ) -> tuple[AutoModel, float]:
         """
         Template method that standardizes logging around the core load implementation.
@@ -91,7 +93,7 @@ class ComponentLoader(ABC):
         )
         try:
             component = self.load_customized(
-                component_model_path, server_args, component_name
+                component_model_path, server_args, component_name,use_runai_model_streamer
             )
             source = "sgl-diffusion"
         except Exception as e:
@@ -172,7 +174,11 @@ class ComponentLoader(ABC):
             raise ValueError(f"Unsupported library: {transformers_or_diffusers}")
 
     def load_customized(
-        self, component_model_path: str, server_args: ServerArgs, component_name: str
+        self,
+        component_model_path: str,
+        server_args: ServerArgs,
+        component_name: str,
+        use_runai_model_streamer: bool = True,
     ):
         """
         Load the customized version component, implemented and optimized in SGL-diffusion
@@ -265,7 +271,11 @@ class ImageProcessorLoader(ComponentLoader):
     expected_library = "transformers"
 
     def load_customized(
-        self, component_model_path: str, server_args: ServerArgs, component_name: str
+        self,
+        component_model_path: str,
+        server_args: ServerArgs,
+        component_name: str,
+        **kwargs,
     ) -> Any:
         return AutoImageProcessor.from_pretrained(component_model_path, use_fast=True)
 
@@ -277,7 +287,11 @@ class AutoProcessorLoader(ComponentLoader):
     expected_library = "transformers"
 
     def load_customized(
-        self, component_model_path: str, server_args: ServerArgs, component_name: str
+        self,
+        component_model_path: str,
+        server_args: ServerArgs,
+        component_name: str,
+        **kwargs,
     ) -> Any:
         return AutoProcessor.from_pretrained(component_model_path)
 
@@ -289,7 +303,11 @@ class TokenizerLoader(ComponentLoader):
     expected_library = "transformers"
 
     def load_customized(
-        self, component_model_path: str, server_args: ServerArgs, component_name: str
+        self,
+        component_model_path: str,
+        server_args: ServerArgs,
+        component_name: str,
+        **kwargs,
     ) -> Any:
         return AutoTokenizer.from_pretrained(
             component_model_path,
@@ -316,6 +334,7 @@ class PipelineComponentLoader:
         component_model_path: str,
         transformers_or_diffusers: str,
         server_args: ServerArgs,
+        use_runai_model_streamer: bool = envs.SGLANG_USE_RUNAI_MODEL_STREAMER,
     ):
         """
         Load a pipeline component.
@@ -324,6 +343,7 @@ class PipelineComponentLoader:
             component_name: Name of the component (e.g., "vae", "text_encoder", "transformer", "scheduler")
             component_model_path: Path to the component model
             transformers_or_diffusers: Whether the component is from transformers or diffusers
+            use_runai_model_streamer: Whether to use run_ai_model_streamer to load the component,
 
         """
 
@@ -339,6 +359,7 @@ class PipelineComponentLoader:
                 server_args,
                 component_name,
                 transformers_or_diffusers,
+                use_runai_model_streamer=use_runai_model_streamer,
             )
         except Exception as e:
             logger.error(

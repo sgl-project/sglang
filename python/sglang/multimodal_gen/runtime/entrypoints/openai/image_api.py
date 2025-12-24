@@ -231,7 +231,7 @@ async def edits(
         )
 
     # Save all input images; additional images beyond the first are saved for potential future use
-    uploads_dir = os.path.join("outputs", "uploads")
+    uploads_dir = os.path.join("inputs", "uploads")
     os.makedirs(uploads_dir, exist_ok=True)
     image_list = merge_image_input_list(images, urls)
 

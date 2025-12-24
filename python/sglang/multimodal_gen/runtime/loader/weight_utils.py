@@ -149,7 +149,7 @@ def _validate_safetensors_file(file_path: str) -> bool:
 def safetensors_weights_iterator(
     hf_weights_files: list[str],
     to_cpu: bool = True,
-    use_runai_model_streamer: bool = HAS_RUNAI_MODEL_STREAMER,
+    use_runai_model_streamer: bool = True,
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
     """Iterate over the weights in the model safetensor files."""
     enable_tqdm = (
@@ -193,7 +193,7 @@ def safetensors_weights_iterator(
             "Please retry - the files will be re-downloaded automatically."
         )
 
-    if use_runai_model_streamer:
+    if use_runai_model_streamer and HAS_RUNAI_MODEL_STREAMER:
         with SafetensorsStreamer() as streamer:
             streamer.stream_files(hf_weights_files)
             for name, tensor in streamer.get_tensors():
@@ -202,6 +202,7 @@ def safetensors_weights_iterator(
                 else:
                     yield name, tensor.to(device)
     else:
+        # Fallback to standard safetensors loading
         for st_file in tqdm(
             hf_weights_files,
             desc="Loading safetensors checkpoint shards",

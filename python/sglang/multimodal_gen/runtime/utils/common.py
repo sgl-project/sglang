@@ -239,6 +239,9 @@ def get_zmq_socket(
     return socket, endpoint
 
 
+# hardware
+
+
 # https://pytorch.org/docs/stable/notes/hip.html#checking-for-hip
 
 

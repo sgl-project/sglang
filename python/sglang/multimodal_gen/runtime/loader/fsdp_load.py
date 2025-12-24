@@ -62,6 +62,7 @@ def maybe_load_fsdp_model(
     output_dtype: torch.dtype | None = None,
     pin_cpu_memory: bool = True,
     strict: bool = True,
+    use_runai_model_streamer: bool = True,
 ) -> torch.nn.Module:
     """
     Load the model with FSDP if is training, else load the model without FSDP.
@@ -114,7 +115,9 @@ def maybe_load_fsdp_model(
             pin_cpu_memory=pin_cpu_memory,
         )
 
-    weight_iterator = safetensors_weights_iterator(weight_dir_list)
+    weight_iterator = safetensors_weights_iterator(
+        weight_dir_list, use_runai_model_streamer=use_runai_model_streamer
+    )
     param_names_mapping_fn = get_param_names_mapping(model.param_names_mapping)
     load_model_from_full_model_state_dict(
         model,
