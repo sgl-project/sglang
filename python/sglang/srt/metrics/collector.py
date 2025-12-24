@@ -22,6 +22,7 @@ from typing import Dict, List, Optional, Union
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.metrics.utils import exponential_buckets, generate_buckets
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import get_bool_env_var
 
@@ -248,6 +249,8 @@ class DPCooperationInfo:
 
     @staticmethod
     def create(forward_modes: List[int]):
+        # TODO handle more modes (e.g. speculative decoding)
+        ans = DPCooperationInfo(num_prefill_ranks=0, num_decode_ranks=0)
         return TODO
 
     def to_labels(self):
