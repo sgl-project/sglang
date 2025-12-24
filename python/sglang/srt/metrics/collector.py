@@ -250,7 +250,10 @@ class DPCooperationInfo:
     # TODO handle more modes (e.g. speculative decoding)
     @staticmethod
     def create(forward_modes: List[int]):
-        counter = TODO
+        counter = {}
+        for mode in forward_modes:
+            counter[mode] = counter.get(mode, 0) + 1
+
         return DPCooperationInfo(
             num_prefill_ranks=counter.get(ForwardMode.PREFILL.value, 0),
             num_decode_ranks=counter.get(ForwardMode.DECODE.value, 0),
