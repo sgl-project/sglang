@@ -412,6 +412,7 @@ class Glm4vVisionModel(nn.Module):
                     num_heads=self.num_heads,
                     quant_config=quant_config,
                     prefix=add_prefix(f"blocks.{layer_idx}", prefix),
+                    num_dummy_heads=vision_config.num_dummy_heads,
                     rms_norm_eps=vision_config.rms_norm_eps,
                     attn_qkv_bias=vision_config.attention_bias,
                     use_data_parallel=use_data_parallel,
@@ -547,14 +548,13 @@ class Glm4vForConditionalGeneration(nn.Module):
         self.pp_group = get_pp_group()
         self.config = config
         self.use_data_parallel = get_global_server_args().mm_enable_dp_encoder
+        vision_utils.update_vit_attn_dummy_heads_config(self.config)
         self.visual = Glm4vVisionModel(
             config.vision_config,
             quant_config=quant_config,
             prefix=add_prefix("visual", prefix),
             use_data_parallel=self.use_data_parallel,
         )
-
-        vision_utils.update_vit_attn_dummy_heads_config(self.config)
 
         self.model = Glm4Model(
             config,

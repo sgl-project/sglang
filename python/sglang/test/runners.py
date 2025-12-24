@@ -121,7 +121,8 @@ def _get_sentence_transformer_embedding_model(
             modules=[word_embedding_model, pooling_model], truncate_dim=matryoshka_dim
         )
 
-    return model.cuda()
+    device = "npu" if is_npu() else "cuda"
+    return model.to(device)
 
 
 @dataclass
@@ -286,11 +287,12 @@ class HFRunner:
         elif self.model_type == "reward" or self.model_type == "cross_encoder":
             from transformers import AutoModelForSequenceClassification
 
+            device = "npu" if is_npu() else "cuda"
             self.model = AutoModelForSequenceClassification.from_pretrained(
                 model_path,
                 torch_dtype=torch_dtype,
                 trust_remote_code=self.needs_trust_remote_code(model_path),
-            ).cuda()
+            ).to(device)
         else:
             raise Exception(f"Unrecognized model type {self.model_type}")
         self.tokenizer = get_tokenizer(
@@ -347,9 +349,10 @@ class HFRunner:
                         logits = self.model.encode(prompts).tolist()
                     out_queue.put(ModelOutput(embed_logits=logits))
                 elif self.model_type == "cross_encoder":
+                    device = "npu" if is_npu() else "cuda"
                     inputs = self.tokenizer(
                         prompts, padding=True, return_tensors="pt"
-                    ).to("cuda")
+                    ).to(device)
                     scores = self.model(**inputs).logits
                     scores = scores.squeeze().tolist()
                     if not isinstance(scores, list):
@@ -358,13 +361,14 @@ class HFRunner:
 
                 elif self.model_type == "reward":
                     scores = []
+                    device = "npu" if is_npu() else "cuda"
                     for conv in prompts:
                         conv_formatted = self.tokenizer.apply_chat_template(
                             conv, tokenize=False, return_dict=False
                         )
                         conv_tokenized = self.tokenizer(
                             conv_formatted, return_tensors="pt"
-                        ).to("cuda")
+                        ).to(device)
                         scores.append(
                             float(self.model(**conv_tokenized).logits[0][0].item())
                         )

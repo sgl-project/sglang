@@ -273,6 +273,9 @@ class RotaryEmbedding(CustomOp):
         assert (
             fused_set_kv_buffer_arg is None
         ), "fused_set_kv_buffer_arg is not supported for npu implementation"
+
+        if query.dtype == torch.bfloat16 and self.cos_sin_cache.dtype == torch.float:
+            return self.forward_native(positions, query, key, offsets)
         if self.head_size == 128:
             self.get_cos_sin_with_position(positions)
             query = query.contiguous().view(query.shape[0], 1, -1, self.head_size)
