@@ -1,10 +1,25 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
+import logging
+
 import torch
 
 from sglang.srt.layers.moe.topk import TopKOutput
 
 GEMM_STREAM = torch.cuda.Stream()
+
+@dataclass
+class PeoOverlapArgs:
+    use_expert_overlap: bool
+    num_rounds: int
+    round_id: int
+    send_num_sms: int
+    recv_num_sms: int
+    hook_use_comm_stream: bool = False
+    start_idx: torch.Tensor = None
+    end_idx: torch.Tensor = None
+    is_x_in_round: bool = True
 
 def forward_overlap_1(
     experts,
@@ -19,17 +34,23 @@ def forward_overlap_1(
 
     # dispatch send
     for round_id in range(experts.num_rounds):
-        send_num_sms = experts.num_device_sms
-        recv_num_sms = experts.num_device_sms if round_id == 0 else experts.num_deepep_sms
-        state = experts.dispatcher.dispatch_a_peo(
-            hidden_states=hidden_states,
-            topk_output=topk_output,
+        num_experts_per_round = experts.num_experts // experts.num_ranks // experts.num_rounds
+        start_idx = num_experts_per_round * round_id
+        end_idx = start_idx + num_experts_per_round
+        peo_overlap_args = PeoOverlapArgs(
             use_expert_overlap=True,
             num_rounds=experts.num_rounds,
             round_id=round_id,
-            send_num_sms=send_num_sms,
-            recv_num_sms=recv_num_sms,
+            send_num_sms=experts.num_device_sms,
+            recv_num_sms=experts.num_device_sms if round_id == 0 else experts.num_deepep_sms,
             hook_use_comm_stream=False,
+            start_idx=start_idx,
+            end_idx=end_idx,
+        )
+        state = experts.dispatcher.dispatch_a_peo(
+            hidden_states=hidden_states,
+            topk_output=topk_output,
+            peo_overlap_args=peo_overlap_args,
         )
         states.append(state)
 
@@ -51,27 +72,24 @@ def forward_overlap_1(
 
     # combine send
     for round_id in range(experts.num_rounds):
-        send_num_sms = experts.num_device_sms if round_id == (experts.num_rounds - 1) else experts.num_deepep_sms
-        recv_num_sms = experts.num_device_sms
-        current_stream.wait_event(gemm_done_events[round_id])
-        combine_state = experts.dispatcher.combine_a_peo(
-            hidden_states=moe_hidden_states[round_id],
-            topk_idx=dispatch_output.topk_idx,
-            topk_weights=dispatch_output.topk_weights,
+        peo_overlap_args = PeoOverlapArgs(
             use_expert_overlap=True,
             num_rounds=experts.num_rounds,
             round_id=round_id,
-            send_num_sms=send_num_sms,
-            recv_num_sms=recv_num_sms,
+            send_num_sms=experts.num_device_sms if round_id == (experts.num_rounds - 1) else experts.num_deepep_sms,
+            recv_num_sms=experts.num_device_sms,
+            hook_use_comm_stream=False,
+            is_x_in_round=True,
+        )
+        current_stream.wait_event(gemm_done_events[round_id])
+        combine_state = experts.dispatcher.combine_a_peo(
+            combine_input=moe_hidden_states[round_id],
+            peo_overlap_args=peo_overlap_args,
         )
 
-        if round_id == experts.num_rounds - 1:
-            del experts.down_output
-
     # combine recv
-    combined_x = experts.dispatcher.combine_b_peo(
-        forward_batch=combine_state[0], inner_state=combine_state[1])
-
+    combined_x = experts.dispatcher.combine_b_peo(inner_state=combine_state)
+    logging.info("combine send finished", flush=True)
     current_stream.wait_stream(GEMM_STREAM)
     return combined_x
 
@@ -93,6 +111,9 @@ def forward_overlap_2_3(
         # dispatch send
         send_num_sms = experts.num_device_sms if round_id == 0 else experts.num_deepep_sms
         recv_num_sms = experts.num_deepep_sms if round_id != 0 else experts.num_device_sms if hook_use_default_stream else experts.num_device_sms // 2
+        num_experts_per_round = experts.num_experts // experts.num_ranks // experts.num_rounds
+        start_idx = num_experts_per_round * round_id
+        end_idx = start_idx + num_experts_per_round
         state = experts.dispatcher.dispatch_a_peo(
             hidden_states=hidden_states,
             topk_output=topk_output,
@@ -102,6 +123,8 @@ def forward_overlap_2_3(
             send_num_sms=send_num_sms,
             recv_num_sms=recv_num_sms,
             hook_use_comm_stream=False,
+            start_idx=start_idx,
+            end_idx=end_idx,
         )
         states.append(state)
 
@@ -134,20 +157,21 @@ def forward_overlap_2_3(
 
     # combine send
     for round_id in range(experts.num_rounds):
-        send_num_sms = experts.num_device_sms if round_id == (experts.num_rounds - 1) else experts.num_deepep_sms
-        recv_num_sms = experts.num_device_sms
+        peo_overlap_args = PeoOverlapArgs(
+            use_expert_overlap=True,
+            num_rounds=experts.num_rounds,
+            round_id=round_id,
+            send_num_sms=experts.num_device_sms if round_id == (experts.num_rounds - 1) else experts.num_deepep_sms,
+            recv_num_sms=experts.num_device_sms,
+            hook_use_comm_stream=False,
+            is_x_in_round=True,
+        )
         current_stream.wait_event(gemm_done_events[round_id])
         if not hook_use_default_stream:
             current_stream.wait_stream(experts.comm_stream)
         combine_state = experts.dispatcher.combine_a_peo(
-            hidden_states=moe_hidden_states[round_id],
-            topk_idx=dispatch_output.topk_idx,
-            topk_weights=dispatch_output.topk_weights,
-            use_expert_overlap=True,
-            num_rounds=experts.num_rounds,
-            round_id=round_id,
-            send_num_sms=send_num_sms,
-            recv_num_sms=recv_num_sms,
+            combine_input=moe_hidden_states[round_id],
+            peo_overlap_args=peo_overlap_args,
         )
 
     # combine recv
@@ -189,17 +213,18 @@ def forward_overlap_4(
     # combine send
     with torch.cuda.stream(current_stream):
         for round_id in range(experts.num_rounds):
-            send_num_sms = experts.num_device_sms if round_id == (experts.num_rounds - 1) else experts.num_deepep_sms
-            recv_num_sms = experts.num_device_sms
-            combine_state = experts.dispatcher.combine_a_peo(
-                hidden_states=moe_hidden_states[round_id],
-                topk_idx=dispatch_output.topk_idx,
-                topk_weights=dispatch_output.topk_weights,
+            peo_overlap_args = PeoOverlapArgs(
                 use_expert_overlap=True,
                 num_rounds=experts.num_rounds,
                 round_id=round_id,
-                send_num_sms=send_num_sms,
-                recv_num_sms=recv_num_sms,
+                send_num_sms=experts.num_device_sms if round_id == (experts.num_rounds - 1) else experts.num_deepep_sms,
+                recv_num_sms=experts.num_device_sms,
+                hook_use_comm_stream=False,
+                is_x_in_round=True,
+            )
+            combine_state = experts.dispatcher.combine_a_peo(
+                combine_input=moe_hidden_states[round_id],
+                peo_overlap_args=peo_overlap_args,
             )
 
         # combine recv

@@ -17,7 +17,6 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 
 from sglang.srt.layers.moe.utils import is_peo_enabled
-from sglang.srt.per_expert_overlap import GemmArgs
 
 try:
     from vllm.model_executor.layers.quantization.utils.marlin_utils_fp8 import (

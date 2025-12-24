@@ -21,6 +21,8 @@ from sglang.srt.layers.moe.token_dispatcher.deepep import (
 from sglang.srt.layers.moe.topk import TopKOutput
 from sglang.srt.layers.moe.utils import (
     is_peo_enabled,
+    get_peo_overlap_method,
+    get_peo_num_rounds,
     get_peo_deepep_num_sms,
     get_peo_up_deepgemm_num_sms,
     get_peo_down_deepgemm_num_sms,
@@ -31,8 +33,6 @@ from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.layers.quantization.w4afp8 import W4AFp8Config, W4AFp8MoEMethod
 from sglang.srt.single_batch_overlap import DownGemmOverlapArgs
 from sglang.srt.utils import get_bool_env_var, is_hip, is_npu
-
-from sglang.srt.per_expert_overlap import GemmArgs
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
@@ -521,35 +521,21 @@ class PeoDeepEPMoE(DeepEPMoE):
         prefix: str = "",
         activation: str = "silu",
         routed_scaling_factor: Optional[float] = None,
-        # peo params
-        num_rounds: int = 2,
-        overlap_method: int = 4,
-        num_deepep_send_sms: int = -1,
-        num_deepep_recv_sms: int = -1,
-        num_up_deepgemm_sms: int = -1,
-        num_down_deepgemm_sms: int = -1,
     ):
         super().__init__(num_experts, top_k, hidden_size, intermediate_size,
                          layer_id, num_fused_shared_experts, params_dtype, quant_config, prefix, activation,
                          routed_scaling_factor)
-        self.overlap_method = overlap_method
-
-        self.num_rounds = num_rounds
+        self.overlap_method = get_peo_overlap_method()
+        self.num_rounds = get_peo_num_rounds()
         self.num_device_sms = get_num_device_sms()
         self.num_deepep_sms = get_peo_deepep_num_sms()
         self.num_up_deepgemm_sms = get_peo_up_deepgemm_num_sms()
         self.num_down_deepgemm_sms = get_peo_down_deepgemm_num_sms()
         self.num_ranks = dist.get_world_size()
 
-        assert self.num_deepep_send_sms <= self.num_device_sms, f"num_deepep_send_sms {self.num_deepep_send_sms} > num_device_sms {self.num_device_sms}"
-        assert self.num_deepep_recv_sms <= self.num_device_sms, f"num_deepep_recv_sms {self.num_deepep_recv_sms} > num_device_sms {self.num_device_sms}"
-        assert self.num_up_deepgemm_sms <= self.num_device_sms, f"num_up_deepgemm_sms {self.num_up_deepgemm_sms} > num_device_sms {self.num_device_sms}"
-        assert self.num_down_deepgemm_sms <= self.num_device_sms, f"num_down_deepgemm_sms {self.num_down_deepgemm_sms} > num_device_sms {self.num_device_sms}"
-
-        self.gateup_output: torch.Tensor = None
-        self.down_input: torch.Tensor = None
-        self.down_input_scale: torch.Tensor = None
-        self.down_output: torch.Tensor = None
+        assert self.num_deepep_sms <= self.num_device_sms, f"num_deepep_sms {self.num_deepep_sms} > num_device_sms {self.num_device_sms}"
+        assert self.num_up_deepgemm_sms is None or self.num_up_deepgemm_sms <= self.num_device_sms, f"num_up_deepgemm_sms {self.num_up_deepgemm_sms} > num_device_sms {self.num_device_sms}"
+        assert self.num_down_deepgemm_sms is None or self.num_down_deepgemm_sms <= self.num_device_sms, f"num_down_deepgemm_sms {self.num_down_deepgemm_sms} > num_device_sms {self.num_device_sms}"
 
         self.comm_stream = self.dispatcher.get_buffer().get_comm_stream()
 
@@ -569,28 +555,6 @@ class PeoDeepEPMoE(DeepEPMoE):
             )
         else:
             raise NotImplementedError("Not supported for PEO")
-
-    def forward_flashinfer_cutedsl_peo(
-        self,
-        dispatch_output: DeepEPLLDispatchOutput,
-        down_gemm_overlap_args: Optional[DownGemmOverlapArgs],
-        start_idx: torch.Tensor,
-        end_idx: torch.Tensor,
-    ):
-        hidden_states, hidden_states_scale, _, _, masked_m, _ = dispatch_output
-        assert self.quant_method is not None
-        assert self.moe_runner_config.activation == "silu"
-
-        output = self.quant_method.apply_without_routing_weights_peo(
-            layer=self,
-            x=(hidden_states, hidden_states_scale),
-            masked_m=masked_m,
-            moe_runner_config=self.moe_runner_config,
-            down_gemm_overlap_args=down_gemm_overlap_args,
-            start_idx=start_idx,
-            end_idx=end_idx,
-        )
-        return output
 
     def forward(
         self,

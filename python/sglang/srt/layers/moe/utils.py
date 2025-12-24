@@ -125,6 +125,7 @@ TBO_TOKEN_DISTRIBUTION_THRESHOLD: Optional[float] = None
 DEEPEP_CONFIG: Optional[str] = None
 DISABLE_FLASHINFER_CUTLASS_MOE_FP4_ALLGATHER: Optional[bool] = None
 IS_PEO_ENABLED: Optional[bool] = None
+PEO_OVERLAP_METHOD: Optional[int] = None
 PEO_NUM_ROUNDS: Optional[int] = None
 PEO_DEEPEP_NUM_SMS: Optional[int] = None
 PEO_UP_DEEPGEMM_NUM_SMS: Optional[int] = None
@@ -142,6 +143,7 @@ def initialize_moe_config(server_args: ServerArgs):
     global TBO_TOKEN_DISTRIBUTION_THRESHOLD
     global DISABLE_FLASHINFER_CUTLASS_MOE_FP4_ALLGATHER
     global IS_PEO_ENABLED
+    global PEO_OVERLAP_METHOD
     global PEO_NUM_ROUNDS
     global PEO_DEEPEP_NUM_SMS
     global PEO_UP_DEEPGEMM_NUM_SMS
@@ -163,6 +165,7 @@ def initialize_moe_config(server_args: ServerArgs):
         server_args.disable_flashinfer_cutlass_moe_fp4_allgather
     )
     IS_PEO_ENABLED = server_args.enable_per_expert_overlap
+    PEO_OVERLAP_METHOD = server_args.peo_overlap_method
     PEO_NUM_ROUNDS = server_args.peo_num_rounds
     PEO_DEEPEP_NUM_SMS = server_args.peo_deepep_num_sms
     PEO_UP_DEEPGEMM_NUM_SMS = server_args.peo_up_deepgemm_num_sms
@@ -243,28 +246,46 @@ def is_peo_enabled() -> bool:
         IS_PEO_ENABLED = False
     return IS_PEO_ENABLED
 
+def get_peo_overlap_method() -> int:
+    global PEO_OVERLAP_METHOD
+    if PEO_OVERLAP_METHOD is None:
+        logger.warning(
+            "PEO_OVERLAP_METHOD is not initialized, using 4"
+        )
+        PEO_OVERLAP_METHOD = 4
+    return PEO_OVERLAP_METHOD
+
 def get_peo_num_rounds() -> int:
     global PEO_NUM_ROUNDS
     if PEO_NUM_ROUNDS is None:
-        PEO_NUM_ROUNDS = 2
+        PEO_NUM_ROUNDS = 1
     return PEO_NUM_ROUNDS
 
 def get_peo_deepep_num_sms() -> int:
     global PEO_DEEPEP_NUM_SMS
-    if PEO_DEEPEP_NUM_SMS is None:
-        PEO_DEEPEP_NUM_SMS = -1
+    if PEO_DEEPEP_NUM_SMS is None or PEO_DEEPEP_NUM_SMS < 1:
+        logger.warning(
+            "PEO_DEEPEP_NUM_SMS is not initialized, using 16"
+        )
+        PEO_DEEPEP_NUM_SMS = 16
     return PEO_DEEPEP_NUM_SMS
 
 def get_peo_up_deepgemm_num_sms() -> int:
     global PEO_UP_DEEPGEMM_NUM_SMS
-    if PEO_UP_DEEPGEMM_NUM_SMS is None:
-        PEO_UP_DEEPGEMM_NUM_SMS = -1
+    if PEO_UP_DEEPGEMM_NUM_SMS is not None and PEO_UP_DEEPGEMM_NUM_SMS < 1:
+        logger.warning(
+            "PEO_UP_DEEPGEMM_NUM_SMS is not initialized, using None"
+        )
+        PEO_UP_DEEPGEMM_NUM_SMS = None
     return PEO_UP_DEEPGEMM_NUM_SMS
 
 def get_peo_down_deepgemm_num_sms() -> int:
     global PEO_DOWN_DEEPGEMM_NUM_SMS
-    if PEO_DOWN_DEEPGEMM_NUM_SMS is None:
-        PEO_DOWN_DEEPGEMM_NUM_SMS = -1
+    if PEO_DOWN_DEEPGEMM_NUM_SMS is not None and PEO_DOWN_DEEPGEMM_NUM_SMS < 1:
+        logger.warning(
+            "PEO_DOWN_DEEPGEMM_NUM_SMS is not initialized, using None"
+        )
+        PEO_DOWN_DEEPGEMM_NUM_SMS = None
     return PEO_DOWN_DEEPGEMM_NUM_SMS
 
 

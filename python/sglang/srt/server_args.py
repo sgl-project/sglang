@@ -531,10 +531,10 @@ class ServerArgs:
     # PEO(Per-Expert-Overlap)
     enable_per_expert_overlap: Optional[bool] = False
     peo_overlap_method: Optional[int] = 4
-    peo_num_rounds: Optional[int] = 2
-    peo_deepep_num_sms: Optional[int] = -1
-    peo_up_deepgemm_num_sms: Optional[int] = -1
-    peo_down_deepgemm_num_sms: Optional[int] = -1
+    peo_num_rounds: Optional[int] = 1
+    peo_deepep_num_sms: Optional[int] = None
+    peo_up_deepgemm_num_sms: Optional[int] = None
+    peo_down_deepgemm_num_sms: Optional[int] = None
 
     # Dynamic batch tokenizer
     enable_dynamic_batch_tokenizer: bool = False

@@ -19,9 +19,7 @@ from sglang.srt.layers.moe.utils import MoeRunnerBackend, get_peo_down_deepgemm_
 from sglang.srt.utils import ceil_div, dispose_tensor, get_bool_env_var, is_hip, is_npu
 from sglang.srt.utils.offloader import get_offloader
 
-from sglang.srt.per_expert_overlap import GemmArgs
-
-from python.sglang.srt.layers.moe.utils import get_peo_up_deepgemm_num_sms
+from sglang.srt.layers.moe.utils import get_peo_up_deepgemm_num_sms
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher.deepep import (
