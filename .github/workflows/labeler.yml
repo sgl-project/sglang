@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   label:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-slim
     steps:
       - name: Auto-label by file changes
         uses: actions/labeler@v5

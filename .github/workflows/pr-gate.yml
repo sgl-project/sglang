@@ -14,7 +14,7 @@ jobs:
   pr-gate:
     # 1. for commits on main: no gating needed
     # 2. for workflow_dispatch: this can only be triggered by users with write access
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-slim
     steps:
       - name: Fetch latest PR info
         if: github.event_name == 'pull_request'

@@ -19,7 +19,7 @@ jobs:
        startsWith(github.event.comment.body, '/rerun-failed-ci') ||
        startsWith(github.event.comment.body, '/tag-and-rerun-ci') ||
        startsWith(github.event.comment.body, '/rerun-stage'))
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-slim
 
     steps:
       - name: Checkout code

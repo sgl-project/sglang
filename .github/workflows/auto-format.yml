@@ -11,7 +11,7 @@ permissions:
 jobs:
   auto-format:
     if: github.event.label.name == 'format'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-slim
     steps:
       - name: Checkout PR branch
         uses: actions/checkout@v4

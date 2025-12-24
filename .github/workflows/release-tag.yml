@@ -1,4 +1,4 @@
-name: Release Fake Tag
+name: Release Tag
 on:
   push:
     branches:
@@ -13,7 +13,7 @@ permissions:
 jobs:
   publish:
     if: github.repository == 'sgl-project/sglang'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-slim
     environment: 'prod'
     steps:
       - name: Checkout repository
