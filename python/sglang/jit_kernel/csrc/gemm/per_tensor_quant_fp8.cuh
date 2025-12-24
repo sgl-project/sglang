@@ -12,17 +12,6 @@
 namespace host {
 namespace details {
 
-// dtype_trait specializations for CUDA native types
-template <>
-struct dtype_trait<__half> {
-  inline static constexpr DLDataType value = {.code = DLDataTypeCode::kDLFloat, .bits = 16, .lanes = 1};
-};
-
-template <>
-struct dtype_trait<__nv_bfloat16> {
-  inline static constexpr DLDataType value = {.code = DLDataTypeCode::kDLBfloat, .bits = 16, .lanes = 1};
-};
-
 template <>
 struct dtype_trait<__nv_fp8_e4m3> {
   inline static constexpr DLDataType value = {.code = DLDataTypeCode::kDLFloat, .bits = 8, .lanes = 1};
