@@ -16,7 +16,6 @@ from __future__ import annotations
 import dataclasses
 import json
 import logging
-import sys
 from datetime import datetime
 from functools import lru_cache
 from typing import TYPE_CHECKING, Any, Optional, Set, Tuple, Union
@@ -102,7 +101,9 @@ class RequestLogger:
                 "obj": _transform_data_for_logging(obj, max_length, skip_names),
             }
             if not is_multimodal_gen:
-                log_data["out"] = _transform_data_for_logging(out, max_length, out_skip_names)
+                log_data["out"] = _transform_data_for_logging(
+                    out, max_length, out_skip_names
+                )
             _log_json("request.finished", log_data)
         else:
             if is_multimodal_gen:
@@ -209,7 +210,6 @@ def _dataclass_to_string_truncated(
         )
     else:
         return str(data)
-
 
 
 def _transform_data_for_logging(
