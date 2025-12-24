@@ -340,29 +340,23 @@ class QwenImageCrossAttention(nn.Module):
         if self.norm_added_k is not None:
             txt_key = self.norm_added_k(txt_key)
 
+        # Apply RoPE
+        if image_rotary_emb is not None:
+            (img_cos, img_sin), (txt_cos, txt_sin) = image_rotary_emb
+            img_query = apply_rotary_embedding(
+                img_query, img_cos, img_sin, interleaved=True
+            )
+            img_key = apply_rotary_embedding(img_key, img_cos, img_sin, interleaved=True)
+            txt_query = apply_rotary_embedding(
+                txt_query, txt_cos, txt_sin, interleaved=True
+            )
+            txt_key = apply_rotary_embedding(txt_key, txt_cos, txt_sin, interleaved=True)
+
         # Concatenate for joint attention
         # Order: [text, image]
         joint_query = torch.cat([txt_query, img_query], dim=1)
         joint_key = torch.cat([txt_key, img_key], dim=1)
         joint_value = torch.cat([txt_value, img_value], dim=1)
-
-        # Apply RoPE (fewer kernel launches): do RoPE on joint q/k once each.
-        if image_rotary_emb is not None:
-            # image_rotary_emb can be either:
-            # - ((img_cos, img_sin), (txt_cos, txt_sin))  (legacy)
-            # - (joint_cos, joint_sin)                    (pre-concatenated)
-            if isinstance(image_rotary_emb[0], torch.Tensor):
-                joint_cos, joint_sin = image_rotary_emb
-            else:
-                (img_cos, img_sin), (txt_cos, txt_sin) = image_rotary_emb
-                joint_cos = torch.cat([txt_cos, img_cos], dim=0)
-                joint_sin = torch.cat([txt_sin, img_sin], dim=0)
-            joint_query = apply_rotary_embedding(
-                joint_query, joint_cos, joint_sin, interleaved=True
-            )
-            joint_key = apply_rotary_embedding(
-                joint_key, joint_cos, joint_sin, interleaved=True
-            )
 
         # Compute joint attention
         joint_hidden_states = self.attn(
@@ -707,11 +701,6 @@ class QwenImageTransformer2DModel(CachableDiT):
             temb_txt_silu = temb_img_silu
 
         image_rotary_emb = freqs_cis
-        if freqs_cis is not None:
-            (img_cos, img_sin), (txt_cos, txt_sin) = freqs_cis
-            joint_cos = torch.cat([txt_cos, img_cos], dim=0)
-            joint_sin = torch.cat([txt_sin, img_sin], dim=0)
-            image_rotary_emb = (joint_cos, joint_sin)
         for index_block, block in enumerate(self.transformer_blocks):
             encoder_hidden_states, hidden_states = block(
                 hidden_states=hidden_states,

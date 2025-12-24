@@ -7,6 +7,7 @@ from typing import Any
 import torch
 
 from sglang.multimodal_gen.runtime.managers.forward_context import get_forward_context
+from sglang.multimodal_gen.runtime.utils.common import get_bool_env_var
 
 try:
     from sgl_kernel.flash_attn import flash_attn_varlen_func
@@ -16,6 +17,14 @@ try:
     flash_attn_func = flash_attn_varlen_func
 except ImportError as e:
     raise e
+
+
+try:
+    # Align with LightX2V: use upstream flash-attn v3 varlen interface if available.
+    # This is optional and can be enabled via env var to avoid changing default behavior.
+    from flash_attn_interface import flash_attn_varlen_func as flash_attn_varlen_func_upstream
+except Exception:
+    flash_attn_varlen_func_upstream = None
 
 from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
     AttentionBackend,
@@ -123,6 +132,40 @@ class FlashAttentionImpl(AttentionImpl):
         else:
             max_seqlen_q = query.shape[1]
             max_seqlen_k = key.shape[1]
+        # Optional: use upstream flash-attn interface (to match LightX2V kernels).
+        # Enable with: SGLANG_MM_USE_UPSTREAM_FLASH_ATTN=1
+        use_upstream = (
+            flash_attn_varlen_func_upstream is not None
+            and get_bool_env_var("SGLANG_MM_USE_UPSTREAM_FLASH_ATTN")
+        )
+
+        if use_upstream:
+            # Upstream varlen expects [total_tokens, nheads, headdim] + cu_seqlens.
+            # Our inputs are [B, S, H, D]. For diffusion, S is typically fixed per batch.
+            bsz, seqlen, nheads, d = query.shape
+            q_ = query.contiguous().reshape(bsz * seqlen, nheads, d)
+            k_ = key.contiguous().reshape(bsz * seqlen, nheads, d)
+            v_ = value.contiguous().reshape(bsz * seqlen, nheads, d)
+
+            # Fixed-length cu_seqlens: [0, S, 2S, ..., BS]
+            cu = torch.arange(
+                0,
+                (bsz + 1) * seqlen,
+                step=seqlen,
+                device=q_.device,
+                dtype=torch.int32,
+            )
+            out = flash_attn_varlen_func_upstream(
+                q_,
+                k_,
+                v_,
+                cu,
+                cu,
+                seqlen,
+                seqlen,
+            )
+            return out.reshape(bsz, seqlen, nheads, d)
+
         output = flash_attn_func(
             q=query,  # type: ignore[no-untyped-call]
             k=key,

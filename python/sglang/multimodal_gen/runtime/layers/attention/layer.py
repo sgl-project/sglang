@@ -115,14 +115,6 @@ class UlyssesAttention(nn.Module):
         forward_context: ForwardContext = get_forward_context()
         ctx_attn_metadata = forward_context.attn_metadata
 
-        # Fast-path for single GPU / no sequence-parallelism. This avoids an extra
-        # qkv stack + (no-op) all_to_all + chunk + (no-op) all_to_all, which can be
-        # noticeable in the RoPE->Attention region for diffusion models.
-        if world_size == 1 and replicated_q is None:
-            output = self.attn_impl.forward(q, k, v, ctx_attn_metadata)
-            output = self.attn_impl.postprocess_output(output, ctx_attn_metadata)
-            return output, None
-
         # Stack QKV
         qkv = torch.cat([q, k, v], dim=0)  # [3, seq_len, num_heads, head_dim]
 
