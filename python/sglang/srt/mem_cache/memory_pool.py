@@ -676,6 +676,9 @@ class MHATokenToKVPool(KVCache):
         else:
             bytes_per_tile = _KV_COPY_TILE_SIZE_SMALL
 
+        # Calculate num_locs_upper to avoid large Triton specialization (e.g. 8192)
+        chunk_upper = 128 if bytes_per_tile >= _KV_COPY_TILE_SIZE_LARGE else 256
+
         self._kv_copy_config = {
             "bytes_per_tile": bytes_per_tile,
             "byte_tiles": (stride_bytes + bytes_per_tile - 1) // bytes_per_tile,
@@ -684,9 +687,10 @@ class MHATokenToKVPool(KVCache):
                 if bytes_per_tile <= _KV_COPY_TILE_SIZE_MEDIUM
                 else _KV_COPY_NUM_WARPS_LARGE_TILE
             ),
+            "num_locs_upper": chunk_upper,
         }
 
-        dummy_loc = torch.zeros(1, dtype=torch.int32, device=self.device)
+        dummy_loc = torch.zeros(chunk_upper, dtype=torch.int64, device=self.device)
         grid = (self.data_ptrs.numel(), self._kv_copy_config["byte_tiles"])
 
         copy_all_layer_kv_cache_tiled[grid](
@@ -695,7 +699,7 @@ class MHATokenToKVPool(KVCache):
             dummy_loc,
             dummy_loc,
             1,
-            1,
+            chunk_upper,
             BYTES_PER_TILE=self._kv_copy_config["bytes_per_tile"],
             num_warps=self._kv_copy_config["num_warps"],
             num_stages=2,
@@ -905,20 +909,40 @@ class MHATokenToKVPool(KVCache):
         ), "KV copy not initialized. Set enable_kv_cache_copy=True in __init__"
 
         cfg = self._kv_copy_config
-        N_upper = next_power_of_2(N)
+        cap = int(cfg.get("num_locs_upper", 256))
         grid = (self.data_ptrs.numel(), cfg["byte_tiles"])
 
-        copy_all_layer_kv_cache_tiled[grid](
-            self.data_ptrs,
-            self.data_strides,
-            tgt_loc,
-            src_loc,
-            N,
-            N_upper,
-            BYTES_PER_TILE=cfg["bytes_per_tile"],
-            num_warps=cfg["num_warps"],
-            num_stages=2,
-        )
+        if N <= cap:
+            upper = next_power_of_2(N)
+            copy_all_layer_kv_cache_tiled[grid](
+                self.data_ptrs,
+                self.data_strides,
+                tgt_loc,
+                src_loc,
+                N,
+                upper,
+                BYTES_PER_TILE=cfg["bytes_per_tile"],
+                num_warps=cfg["num_warps"],
+                num_stages=2,
+            )
+            return
+
+        # Huge N: chunk, but each chunk's upper is still pow2(<= cap)
+        for start in range(0, N, cap):
+            end = min(start + cap, N)
+            chunk_len = end - start
+            upper = next_power_of_2(chunk_len)
+            copy_all_layer_kv_cache_tiled[grid](
+                self.data_ptrs,
+                self.data_strides,
+                tgt_loc[start:end],
+                src_loc[start:end],
+                chunk_len,
+                upper,
+                BYTES_PER_TILE=cfg["bytes_per_tile"],
+                num_warps=cfg["num_warps"],
+                num_stages=2,
+            )
 
 
 class MHATokenToKVPoolFP4(MHATokenToKVPool):
