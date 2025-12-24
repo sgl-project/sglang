@@ -3,6 +3,7 @@
 from dataclasses import dataclass, field
 from typing import Callable
 
+import os
 import torch
 
 from sglang.multimodal_gen.configs.models import DiTConfig, EncoderConfig, VAEConfig
@@ -155,6 +156,21 @@ class QwenImagePipelineConfig(ImagePipelineConfig):
         # img_shapes: for global entire image
         img_freqs, txt_freqs = rotary_emb(img_shapes, txt_seq_lens, device=device)
 
+        use_flashinfer_rope = (
+            os.environ.get("SGLANG_MM_QWEN_IMAGE_ROPE_IMPL", "").lower()
+            == "flashinfer"
+        )
+
+        if use_flashinfer_rope:
+            img_cos_half = img_freqs.real.to(dtype=dtype).contiguous()
+            img_sin_half = img_freqs.imag.to(dtype=dtype).contiguous()
+            txt_cos_half = txt_freqs.real.to(dtype=dtype).contiguous()
+            txt_sin_half = txt_freqs.imag.to(dtype=dtype).contiguous()
+
+            img_cos_sin_cache = torch.cat([img_cos_half, img_sin_half], dim=-1)
+            txt_cos_sin_cache = torch.cat([txt_cos_half, txt_sin_half], dim=-1)
+            return img_cos_sin_cache, txt_cos_sin_cache
+
         img_cos, img_sin = (
             img_freqs.real.to(dtype=dtype),
             img_freqs.imag.to(dtype=dtype),
@@ -183,10 +199,17 @@ class QwenImagePipelineConfig(ImagePipelineConfig):
         ] * batch_size
         txt_seq_lens = [prompt_embeds[0].shape[1]]
 
-        (img_cos, img_sin), (txt_cos, txt_sin) = self.get_freqs_cis(
-            img_shapes, txt_seq_lens, rotary_emb, device, dtype
-        )
+        freqs_cis = self.get_freqs_cis(img_shapes, txt_seq_lens, rotary_emb, device, dtype)
 
+        if isinstance(freqs_cis[0], torch.Tensor) and freqs_cis[0].dim() == 2:
+            img_cache, txt_cache = freqs_cis
+            img_cache = shard_rotary_emb_for_sp(img_cache)
+            return {
+                "txt_seq_lens": txt_seq_lens,
+                "freqs_cis": (img_cache, txt_cache),
+            }
+
+        (img_cos, img_sin), (txt_cos, txt_sin) = freqs_cis
         img_cos = shard_rotary_emb_for_sp(img_cos)
         img_sin = shard_rotary_emb_for_sp(img_sin)
         return {
@@ -251,7 +274,7 @@ class QwenImageEditPipelineConfig(QwenImagePipelineConfig):
             ],
         ] * batch_size
         txt_seq_lens = [prompt_embeds[0].shape[1]]
-        (img_cos, img_sin), (txt_cos, txt_sin) = QwenImagePipelineConfig.get_freqs_cis(
+        freqs_cis = QwenImagePipelineConfig.get_freqs_cis(
             img_shapes, txt_seq_lens, rotary_emb, device, dtype
         )
 
@@ -260,6 +283,18 @@ class QwenImageEditPipelineConfig(QwenImagePipelineConfig):
             1 * (height // vae_scale_factor // 2) * (width // vae_scale_factor // 2)
         )
 
+        if isinstance(freqs_cis[0], torch.Tensor) and freqs_cis[0].dim() == 2:
+            img_cache, txt_cache = freqs_cis
+            noisy_img_cache = shard_rotary_emb_for_sp(img_cache[:noisy_img_seq_len, :])
+            img_cache = torch.cat(
+                [noisy_img_cache, img_cache[noisy_img_seq_len:, :]], dim=0
+            ).to(device=device)
+            return {
+                "txt_seq_lens": txt_seq_lens,
+                "freqs_cis": (img_cache, txt_cache),
+            }
+
+        (img_cos, img_sin), (txt_cos, txt_sin) = freqs_cis
         noisy_img_cos = shard_rotary_emb_for_sp(img_cos[:noisy_img_seq_len, :])
         noisy_img_sin = shard_rotary_emb_for_sp(img_sin[:noisy_img_seq_len, :])
 

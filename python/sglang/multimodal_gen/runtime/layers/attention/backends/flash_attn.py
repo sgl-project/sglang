@@ -20,8 +20,6 @@ except ImportError as e:
 
 
 try:
-    # Align with LightX2V: use upstream flash-attn v3 varlen interface if available.
-    # This is optional and can be enabled via env var to avoid changing default behavior.
     from flash_attn_interface import flash_attn_varlen_func as flash_attn_varlen_func_upstream
 except Exception:
     flash_attn_varlen_func_upstream = None
@@ -132,16 +130,12 @@ class FlashAttentionImpl(AttentionImpl):
         else:
             max_seqlen_q = query.shape[1]
             max_seqlen_k = key.shape[1]
-        # Optional: use upstream flash-attn interface (to match LightX2V kernels).
-        # Enable with: SGLANG_MM_USE_UPSTREAM_FLASH_ATTN=1
         use_upstream = (
             flash_attn_varlen_func_upstream is not None
             and get_bool_env_var("SGLANG_MM_USE_UPSTREAM_FLASH_ATTN")
         )
 
         if use_upstream:
-            # Upstream varlen expects [total_tokens, nheads, headdim] + cu_seqlens.
-            # Our inputs are [B, S, H, D]. For diffusion, S is typically fixed per batch.
             if query.dim() != 4 or key.dim() != 4 or value.dim() != 4:
                 use_upstream = False
             else:
@@ -164,12 +158,9 @@ class FlashAttentionImpl(AttentionImpl):
                     use_upstream = False
 
             if use_upstream:
-                # Note: Qwen2.5-VL uses GQA/MQA, so K/V may have fewer heads than Q.
                 q_ = query.contiguous().reshape(bsz * seqlen, nheads_q, d)
                 k_ = key.contiguous().reshape(bsz * seqlen, nheads_k, d)
                 v_ = value.contiguous().reshape(bsz * seqlen, nheads_v, d)
-
-                # Fixed-length cu_seqlens: [0, S, 2S, ..., BS]
                 cu = torch.arange(
                     0,
                     (bsz + 1) * seqlen,
@@ -190,7 +181,6 @@ class FlashAttentionImpl(AttentionImpl):
                         causal=self.causal,
                     )
                 except TypeError:
-                    # Older interfaces may not expose these kwargs.
                     out = flash_attn_varlen_func_upstream(
                         q_,
                         k_,

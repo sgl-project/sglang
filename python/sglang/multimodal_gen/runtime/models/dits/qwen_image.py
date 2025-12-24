@@ -31,6 +31,12 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 logger = init_logger(__name__)  # pylint: disable=invalid-name
 
 
+try:
+    from flashinfer.rope import apply_rope_with_cos_sin_cache_inplace
+except Exception:
+    apply_rope_with_cos_sin_cache_inplace = None
+
+
 def _get_qkv_projections(
     attn: "QwenImageCrossAttention", hidden_states, encoder_hidden_states=None
 ):
@@ -342,15 +348,71 @@ class QwenImageCrossAttention(nn.Module):
 
         # Apply RoPE
         if image_rotary_emb is not None:
-            (img_cos, img_sin), (txt_cos, txt_sin) = image_rotary_emb
-            img_query = apply_rotary_embedding(
-                img_query, img_cos, img_sin, interleaved=True
-            )
-            img_key = apply_rotary_embedding(img_key, img_cos, img_sin, interleaved=True)
-            txt_query = apply_rotary_embedding(
-                txt_query, txt_cos, txt_sin, interleaved=True
-            )
-            txt_key = apply_rotary_embedding(txt_key, txt_cos, txt_sin, interleaved=True)
+            if (
+                isinstance(image_rotary_emb[0], torch.Tensor)
+                and image_rotary_emb[0].dim() == 2
+            ):
+                if apply_rope_with_cos_sin_cache_inplace is None:
+                    raise RuntimeError(
+                        "flashinfer is required for SGLANG_MM_QWEN_IMAGE_ROPE_IMPL=flashinfer"
+                    )
+                img_cache, txt_cache = image_rotary_emb
+
+                def _apply_flashinfer_rope(q_4d: torch.Tensor, k_4d: torch.Tensor, cache: torch.Tensor):
+                    bsz, seqlen, nheads, d = q_4d.shape
+                    if bsz == 1:
+                        q2 = q_4d.squeeze(0).reshape(seqlen, nheads * d).contiguous()
+                        k2 = k_4d.squeeze(0).reshape(seqlen, nheads * d).contiguous()
+                        positions = torch.arange(seqlen, device="cpu", dtype=torch.long).to(
+                            q2.device, non_blocking=True
+                        )
+                        apply_rope_with_cos_sin_cache_inplace(
+                            positions=positions,
+                            query=q2,
+                            key=k2,
+                            head_size=d,
+                            cos_sin_cache=cache,
+                            is_neox=False,
+                        )
+                        return q2.view(1, seqlen, nheads, d), k2.view(1, seqlen, nheads, d)
+
+                    q_out = torch.empty_like(q_4d)
+                    k_out = torch.empty_like(k_4d)
+                    positions = torch.arange(seqlen, device="cpu", dtype=torch.long).to(
+                        q_4d.device, non_blocking=True
+                    )
+                    for b in range(bsz):
+                        q2 = q_4d[b].reshape(seqlen, nheads * d).contiguous()
+                        k2 = k_4d[b].reshape(seqlen, nheads * d).contiguous()
+                        apply_rope_with_cos_sin_cache_inplace(
+                            positions=positions,
+                            query=q2,
+                            key=k2,
+                            head_size=d,
+                            cos_sin_cache=cache,
+                            is_neox=False,
+                        )
+                        q_out[b] = q2.view(seqlen, nheads, d)
+                        k_out[b] = k2.view(seqlen, nheads, d)
+                    return q_out, k_out
+
+                img_query, img_key = _apply_flashinfer_rope(img_query, img_key, img_cache)
+                txt_query, txt_key = _apply_flashinfer_rope(txt_query, txt_key, txt_cache)
+
+            else:
+                (img_cos, img_sin), (txt_cos, txt_sin) = image_rotary_emb
+                img_query = apply_rotary_embedding(
+                    img_query, img_cos, img_sin, interleaved=True
+                )
+                img_key = apply_rotary_embedding(
+                    img_key, img_cos, img_sin, interleaved=True
+                )
+                txt_query = apply_rotary_embedding(
+                    txt_query, txt_cos, txt_sin, interleaved=True
+                )
+                txt_key = apply_rotary_embedding(
+                    txt_key, txt_cos, txt_sin, interleaved=True
+                )
 
         # Concatenate for joint attention
         # Order: [text, image]
