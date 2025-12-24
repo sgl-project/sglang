@@ -246,6 +246,10 @@ class DPCooperationInfo:
     num_prefill_ranks: int
     num_decode_ranks: int
 
+    @staticmethod
+    def create(forward_modes: List[int]):
+        return TODO
+
     def to_labels(self):
         return dataclasses.asdict(self)
 
