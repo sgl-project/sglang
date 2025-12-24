@@ -93,6 +93,23 @@ impl RouterManager {
                 }
             }
 
+            // Always create gRPC Regular router in IGW mode
+            match RouterFactory::create_grpc_router(app_context).await {
+                Ok(grpc_regular) => {
+                    info!("Created gRPC Regular router");
+                    manager.register_router(
+                        RouterId::new("grpc-regular".to_string()),
+                        Arc::from(grpc_regular),
+                    );
+                }
+                Err(e) => {
+                    warn!("Failed to create gRPC Regular router: {e}");
+                }
+            }
+
+            info!("PD disaggregation auto-enabled for IGW mode, creating PD routers");
+
+            // Create HTTP PD router
             match RouterFactory::create_pd_router(
                 None,
                 None,
@@ -111,11 +128,28 @@ impl RouterManager {
                 }
             }
 
-            // TODO: Add gRPC routers once we have dynamic tokenizer loading
+            // Create gRPC PD router
+            match RouterFactory::create_grpc_pd_router(
+                None,
+                None,
+                &config.router_config.policy,
+                app_context,
+            )
+            .await
+            {
+                Ok(grpc_pd) => {
+                    info!("Created gRPC PD router");
+                    manager
+                        .register_router(RouterId::new("grpc-pd".to_string()), Arc::from(grpc_pd));
+                }
+                Err(e) => {
+                    warn!("Failed to create gRPC PD router: {e}");
+                }
+            }
 
             info!(
                 "RouterManager initialized with {} routers for multi-router mode",
-                manager.router_count()
+                manager.router_count(),
             );
         } else {
             info!("Initializing RouterManager in single-router mode");
@@ -236,25 +270,40 @@ impl RouterManager {
     pub fn get_router_for_model(&self, model_id: &str) -> Option<Arc<dyn RouterTrait>> {
         let workers = self.worker_registry.get_by_model(model_id);
 
-        if !workers.is_empty() {
-            let has_pd_workers = workers.iter().any(|w| {
-                matches!(
+        // Find the best worker type and derive router ID from it
+        // Priority: grpc-pd (3) > http-pd (2) > grpc-regular (1) > http-regular (0)
+        let best_score = workers
+            .iter()
+            .map(|w| {
+                let is_pd = matches!(
                     w.worker_type(),
                     WorkerType::Prefill { .. } | WorkerType::Decode
-                )
-            });
+                );
+                let is_grpc = matches!(w.connection_mode(), ConnectionMode::Grpc { .. });
 
-            let router_id = if has_pd_workers {
-                RouterId::new("http-pd".to_string())
-            } else {
-                RouterId::new("http-regular".to_string())
+                match (is_grpc, is_pd) {
+                    (true, true) => 3,   // grpc-pd (best)
+                    (false, true) => 2,  // http-pd
+                    (true, false) => 1,  // grpc-regular
+                    (false, false) => 0, // http-regular
+                }
+            })
+            .max();
+
+        if let Some(score) = best_score {
+            let router_id = match score {
+                3 => "grpc-pd",
+                2 => "http-pd",
+                1 => "grpc-regular",
+                _ => "http-regular",
             };
 
-            if let Some(router) = self.routers.get(&router_id) {
+            if let Some(router) = self.routers.get(&RouterId::new(router_id.to_string())) {
                 return Some(router.clone());
             }
         }
 
+        // Fallback to default router
         let default_router = self.default_router.read().unwrap();
         if let Some(ref default_id) = *default_router {
             self.routers.get(default_id).map(|r| r.clone())
@@ -340,12 +389,22 @@ impl RouterTrait for RouterManager {
     }
 
     async fn health_generate(&self, _req: Request<Body>) -> Response {
-        // TODO: Should check if any router has healthy workers
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "No routers with healthy workers available",
-        )
-            .into_response()
+        // IGW readiness: return 200 if at least one router has healthy workers
+        let has_healthy_workers = self
+            .worker_registry
+            .get_all()
+            .iter()
+            .any(|w| w.is_healthy());
+
+        if has_healthy_workers {
+            (StatusCode::OK, "At least one router has healthy workers").into_response()
+        } else {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "No routers with healthy workers available",
+            )
+                .into_response()
+        }
     }
 
     async fn get_server_info(&self, _req: Request<Body>) -> Response {

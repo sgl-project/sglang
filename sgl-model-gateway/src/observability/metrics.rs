@@ -102,7 +102,7 @@ pub fn init_metrics() {
     // Layer 1: HTTP metrics
     describe_counter!(
         "smg_http_requests_total",
-        "Total HTTP requests by method, path, and status"
+        "Total HTTP requests by method and path"
     );
     describe_histogram!(
         "smg_http_request_duration_seconds",
@@ -413,14 +413,13 @@ pub struct StreamingMetricsParams<'a> {
 
 impl Metrics {
     /// Record an HTTP request.
-    /// For best performance, pass static strings (use `method_to_static_str` for method,
-    /// `status_to_class` for status_class returns static, and cache normalized paths).
-    pub fn record_http_request(method: &'static str, path: &str, status_class: &'static str) {
+    /// Here we want a metric to directly reflect user's experience ("I am sending a request")
+    /// when viewing the router as a blackbox, and is bumped immediately when the request arrives.
+    pub fn record_http_request(method: &'static str, path: &str) {
         counter!(
             "smg_http_requests_total",
             "method" => method,
             "path" => path.to_string(),
-            "status" => status_class
         )
         .increment(1);
     }
