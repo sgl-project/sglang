@@ -361,7 +361,9 @@ def add_logprob_values(
     ]
 
     # Extract logprobs
-    if any(x > 0 for x in top_logprobs_nums):
+    should_top_logprobs = any(x > 0 for x in top_logprobs_nums)
+    should_token_ids_logprobs = any(x is not None for x in token_ids_logprobs)
+    if should_top_logprobs:
         (
             logits_output.next_token_top_logprobs_val,
             logits_output.next_token_top_logprobs_idx,
@@ -370,7 +372,7 @@ def add_logprob_values(
             top_logprobs_nums_repeat_interleaved,
         )
 
-    if any(x is not None for x in token_ids_logprobs):
+    if should_token_ids_logprobs:
         (
             logits_output.next_token_token_ids_logprobs_val,
             logits_output.next_token_token_ids_logprobs_idx,
@@ -392,10 +394,14 @@ def add_logprob_values(
     token_top_logprobs_idx = logits_output.next_token_top_logprobs_idx
     for req, num_tokens in zip(batch.reqs, num_tokens_per_req, strict=True):
         for _ in range(num_tokens):
+            # TODO: add token_ids_logprobs to each request
             if req.return_logprob:
                 req.output_token_logprobs_val.append(next_token_logprobs[pt])
                 req.output_token_logprobs_idx.append(verified_ids[pt])
                 if req.top_logprobs_num > 0:
+                    assert (
+                        should_top_logprobs
+                    ), "Inconsistent state: should_top_logprobs is False"
                     req.output_top_logprobs_val.append(token_top_logprobs_val[pt])
                     req.output_top_logprobs_idx.append(token_top_logprobs_idx[pt])
             pt += 1
