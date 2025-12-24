@@ -3785,19 +3785,20 @@ def get_or_create_event_loop():
 def get_numa_node_count() -> int:
     """
     Get the number of NUMA nodes available on the system.
-
+    Must be called after is_numa_available() is True.
     Returns:
         int: The number of NUMA nodes.
     """
     libnuma = ctypes.CDLL("libnuma.so")
-    if libnuma.numa_available() < 0:
-        raise SystemError("numa not available on this system")
     return libnuma.numa_max_node() + 1
 
 
 def is_numa_available() -> bool:
-    libnuma = ctypes.CDLL("libnuma.so")
-    return libnuma.numa_available() >= 0
+    try:
+        libnuma = ctypes.CDLL("libnuma.so")
+        return libnuma.numa_available() >= 0
+    except Exception:
+        return False
 
 
 def get_system_gpu_count() -> int:
