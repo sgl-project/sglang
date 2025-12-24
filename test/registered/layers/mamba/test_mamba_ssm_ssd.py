@@ -33,7 +33,15 @@ def segsum(x):
     return x_segsum
 
 
-def ssd_minimal_discrete(X, A, B, C, block_len, initial_states=None):
+def ssd_minimal_discrete(
+    X,
+    A,
+    B,
+    C,
+    block_len,
+    initial_states=None,
+    return_intermediate_states=False,
+):
     """
     Arguments:
         X: (batch, length, n_heads, d_head)
@@ -81,6 +89,8 @@ def ssd_minimal_discrete(X, A, B, C, block_len, initial_states=None):
     # Add output of intra-chunk and inter-chunk terms
     # (diagonal and off-diagonal blocks)
     Y = rearrange(Y_diag + Y_off, "b c l h p -> b (c l) h p")
+    if return_intermediate_states:
+        return Y, final_state, states
     return Y, final_state
 
 
@@ -605,6 +615,68 @@ def test_mamba_chunk_scan_cont_batch_prefill_chunking(chunk_size, seqlens):
             rtol=rtol,
             msg=lambda x: f"seq{i} state " + x,
         )  # noqa: B023
+
+
+@pytest.mark.parametrize("itype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("n_heads", [4, 16])
+@pytest.mark.parametrize("d_head", [32, 64])
+@pytest.mark.parametrize("seq_len_chunk_size", [(128, 32), (256, 64)])
+def test_mamba_chunk_scan_intermediate_states(
+    d_head,
+    n_heads,
+    seq_len_chunk_size,
+    itype,
+):
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA device not available")
+
+    if itype == torch.bfloat16:
+        atol, rtol = 5e-2, 5e-2
+    else:
+        atol, rtol = 8e-3, 5e-3
+
+    batch_size = 1
+    seqlen, chunk_size = seq_len_chunk_size
+
+    A, dt, X, B, C = generate_random_inputs(batch_size, seqlen, n_heads, d_head, itype)
+
+    _, ref_final_state, ref_states = ssd_minimal_discrete(
+        X * dt.unsqueeze(-1), A * dt, B, C, chunk_size, return_intermediate_states=True
+    )
+
+    Y = torch.empty_like(X)
+    states, final_state = mamba_chunk_scan_combined(
+        X,
+        dt,
+        A,
+        B,
+        C,
+        chunk_size,
+        D=None,
+        return_intermediate_states=True,
+        return_final_states=True,
+        out=Y,
+    )
+
+    num_chunks = seqlen // chunk_size
+    assert states.shape == (batch_size, num_chunks, n_heads, d_head, d_head)
+    assert ref_states.shape == states.shape
+
+    torch.testing.assert_close(
+        final_state[:, -1],
+        ref_final_state[:, -1].to(torch.float32),
+        atol=atol,
+        rtol=rtol,
+    )
+
+    for chunk_idx in range(num_chunks):
+        torch.testing.assert_close(
+            states[:, chunk_idx, -1],
+            ref_states[:, chunk_idx, -1].to(states.dtype),
+            atol=atol,
+            rtol=rtol,
+            msg=lambda x: f"chunk {chunk_idx} " + x,
+        )
 
 
 if __name__ == "__main__":
