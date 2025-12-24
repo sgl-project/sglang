@@ -2,7 +2,6 @@
 
 # SPDX-License-Identifier: Apache-2.0
 from dataclasses import dataclass
-import os
 from typing import Any
 
 import torch
@@ -148,9 +147,6 @@ class FlashAttentionImpl(AttentionImpl):
             cu_seqlens_q = attn_metadata.cu_seqlens_q
             cu_seqlens_k = attn_metadata.cu_seqlens_k
 
-        num_splits_env = os.getenv("SGLANG_MM_FA_NUM_SPLITS", "")
-        num_splits = 1 if num_splits_env == "" else int(num_splits_env)
-
         query_3d = query.reshape(-1, num_heads, head_dim)
         key_3d = key.reshape(-1, num_heads, head_dim)
         value_3d = value.reshape(-1, num_heads, head_dim)
@@ -164,7 +160,6 @@ class FlashAttentionImpl(AttentionImpl):
             max_seqlen_k=max_seqlen_k,
             softmax_scale=self.softmax_scale,
             causal=self.causal,
-            num_splits=num_splits,
             return_softmax_lse=return_softmax_lse,
             ver=fa_ver,
         )
