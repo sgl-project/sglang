@@ -20,6 +20,7 @@ from sglang.multimodal_gen.runtime.layers.layernorm import LayerNorm, RMSNorm
 from sglang.multimodal_gen.runtime.layers.linear import ReplicatedLinear
 from sglang.multimodal_gen.runtime.layers.triton_ops import (
     apply_rotary_embedding,
+    fuse_scale_shift_gate_select01_kernel,
     fuse_scale_shift_kernel,
 )
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
@@ -440,15 +441,51 @@ class QwenImageTransformerBlock(nn.Module):
     def _modulate(self, x, mod_params, index=None):
         shift, scale, gate = mod_params.chunk(3, dim=-1)
         if index is not None:
-            shift_result = shift[index]
-            scale_result = scale[index]
-            gate_result = gate[index]
-        else:
-            shift_result = shift
-            scale_result = scale
-            gate_result = gate[:1].unsqueeze(1)
+            actual_batch = x.shape[0]
+            shift0, shift1 = (
+                shift[:actual_batch],
+                shift[actual_batch : 2 * actual_batch],
+            )
+            scale0, scale1 = (
+                scale[:actual_batch],
+                scale[actual_batch : 2 * actual_batch],
+            )
+            gate0, gate1 = gate[:actual_batch], gate[actual_batch : 2 * actual_batch]
 
-        return fuse_scale_shift_kernel(x, scale_result, shift_result), gate_result
+            if x.is_cuda:
+                if not x.is_contiguous():
+                    x = x.contiguous()
+                if not index.is_contiguous():
+                    index = index.contiguous()
+                x, gate_result = fuse_scale_shift_gate_select01_kernel(
+                    x,
+                    scale0=scale0.contiguous(),
+                    shift0=shift0.contiguous(),
+                    gate0=gate0.contiguous(),
+                    scale1=scale1.contiguous(),
+                    shift1=shift1.contiguous(),
+                    gate1=gate1.contiguous(),
+                    index=index,
+                )
+                return x, gate_result
+            else:
+                mask = (index == 0).unsqueeze(-1)
+                shift_result = torch.where(
+                    mask, shift0.unsqueeze(1), shift1.unsqueeze(1)
+                )
+                scale_result = torch.where(
+                    mask, scale0.unsqueeze(1), scale1.unsqueeze(1)
+                )
+                gate_result = torch.where(mask, gate0.unsqueeze(1), gate1.unsqueeze(1))
+                return (
+                    fuse_scale_shift_kernel(x, scale_result, shift_result),
+                    gate_result,
+                )
+        else:
+            shift_result = shift.unsqueeze(1)
+            scale_result = scale.unsqueeze(1)
+            gate_result = gate.unsqueeze(1)
+            return fuse_scale_shift_kernel(x, scale_result, shift_result), gate_result
 
     def forward(
         self,
