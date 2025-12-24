@@ -142,29 +142,65 @@ class FlashAttentionImpl(AttentionImpl):
         if use_upstream:
             # Upstream varlen expects [total_tokens, nheads, headdim] + cu_seqlens.
             # Our inputs are [B, S, H, D]. For diffusion, S is typically fixed per batch.
-            bsz, seqlen, nheads, d = query.shape
-            q_ = query.contiguous().reshape(bsz * seqlen, nheads, d)
-            k_ = key.contiguous().reshape(bsz * seqlen, nheads, d)
-            v_ = value.contiguous().reshape(bsz * seqlen, nheads, d)
+            if query.dim() != 4 or key.dim() != 4 or value.dim() != 4:
+                use_upstream = False
+            else:
+                bsz, seqlen, nheads_q, d = query.shape
+                bsz_k, seqlen_k, nheads_k, d_k = key.shape
+                bsz_v, seqlen_v, nheads_v, d_v = value.shape
 
-            # Fixed-length cu_seqlens: [0, S, 2S, ..., BS]
-            cu = torch.arange(
-                0,
-                (bsz + 1) * seqlen,
-                step=seqlen,
-                device=q_.device,
-                dtype=torch.int32,
-            )
-            out = flash_attn_varlen_func_upstream(
-                q_,
-                k_,
-                v_,
-                cu,
-                cu,
-                seqlen,
-                seqlen,
-            )
-            return out.reshape(bsz, seqlen, nheads, d)
+                if (
+                    bsz != bsz_k
+                    or bsz != bsz_v
+                    or seqlen != seqlen_k
+                    or seqlen != seqlen_v
+                    or d != d_k
+                    or d != d_v
+                ):
+                    use_upstream = False
+                elif nheads_k != nheads_v:
+                    use_upstream = False
+                elif nheads_k == 0 or (nheads_q % nheads_k) != 0:
+                    use_upstream = False
+
+            if use_upstream:
+                # Note: Qwen2.5-VL uses GQA/MQA, so K/V may have fewer heads than Q.
+                q_ = query.contiguous().reshape(bsz * seqlen, nheads_q, d)
+                k_ = key.contiguous().reshape(bsz * seqlen, nheads_k, d)
+                v_ = value.contiguous().reshape(bsz * seqlen, nheads_v, d)
+
+                # Fixed-length cu_seqlens: [0, S, 2S, ..., BS]
+                cu = torch.arange(
+                    0,
+                    (bsz + 1) * seqlen,
+                    step=seqlen,
+                    device=q_.device,
+                    dtype=torch.int32,
+                )
+                try:
+                    out = flash_attn_varlen_func_upstream(
+                        q_,
+                        k_,
+                        v_,
+                        cu,
+                        cu,
+                        seqlen,
+                        seqlen,
+                        softmax_scale=self.softmax_scale,
+                        causal=self.causal,
+                    )
+                except TypeError:
+                    # Older interfaces may not expose these kwargs.
+                    out = flash_attn_varlen_func_upstream(
+                        q_,
+                        k_,
+                        v_,
+                        cu,
+                        cu,
+                        seqlen,
+                        seqlen,
+                    )
+                return out.reshape(bsz, seqlen, nheads_q, d)
 
         output = flash_attn_func(
             q=query,  # type: ignore[no-untyped-call]
