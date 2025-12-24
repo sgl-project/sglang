@@ -132,12 +132,6 @@ def disable_request_logging() -> bool:
     return get_bool_env_var("SGLANG_DISABLE_REQUEST_LOGGING")
 
 
-def dataclass_to_string_truncated(
-    data: Any, max_length: int = 2048, skip_names: Optional[Set[str]] = None
-) -> str:
-    return _dataclass_to_string_truncated(data, max_length, skip_names)
-
-
 # Private helper functions
 
 
