@@ -10,12 +10,18 @@ from sglang.srt.custom_op import CustomOp
 from sglang.srt.layers.layernorm import LayerNorm
 from sglang.srt.utils import add_prefix, ceil_align, is_cuda, is_hip, is_npu
 
+global _use_multi_stream
+
 if is_cuda():
     try:
         import deep_gemm
     except ImportError as e:
         deep_gemm = e
 
+if is_npu():
+    import custom_ops  # noqa: F401
+    import torch_npu
+    from sglang.srt.hardware_backend.npu.utils import get_indexer_weight_stream
 
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.attention.nsa.utils import (
@@ -289,15 +295,18 @@ class Indexer(CustomOp):
         blocksize = page_size
         if (
             forward_batch.forward_mode.is_target_verify()
-            or forward_batch.forward_mode.is_draft_extend()
+            or forward_batch.forward_mode.is_draft_extend(include_v2=True)
         ):
             seqlens_32 = metadata.get_seqlens_expanded()
         else:
             seqlens_32 = metadata.get_seqlens_int32()
-        # NOTE(dark): 132 is SM count on H200/B200, not magic number
-        schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
-            seqlens_32, blocksize, self.sm_count
-        )
+        # Reuse pre-computed schedule metadata if available (from init_forward_metadata),
+        # otherwise fall back to computing it here.
+        schedule_metadata = getattr(metadata, "paged_mqa_schedule_metadata", None)
+        if schedule_metadata is None:
+            schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
+                seqlens_32, blocksize, self.sm_count
+            )
 
         assert len(q_fp8.shape) == 3
         q_fp8 = q_fp8.unsqueeze(1)  # the next_n dim is 1 now
@@ -894,7 +903,7 @@ class Indexer(CustomOp):
             if (
                 forward_batch.forward_mode.is_decode_or_idle()
                 or forward_batch.forward_mode.is_target_verify()
-                or forward_batch.forward_mode.is_draft_extend()
+                or forward_batch.forward_mode.is_draft_extend(include_v2=True)
             ):
                 topk_result = self._get_topk_paged(
                     forward_batch, layer_id, q_fp8, weights, metadata
@@ -980,19 +989,47 @@ class Indexer(CustomOp):
         sin = sin.repeat(1, 2).view(-1, 1, 1, self.rope_head_dim)
 
         bs = x.shape[0]
-        q = self.wq_b(q_lora)[0]  # [bs, 1536] @ [1536, 64 * 128] = [bs, 64 * 128]
-        q = q.view(bs, self.n_heads, self.head_dim)  # [bs, 64, 128]
-        q_pe, q_nope = torch.split(
-            q,
-            [self.rope_head_dim, self.head_dim - self.rope_head_dim],
-            dim=-1,
-        )  # [bs, 64, 64 + 64]
+        if self.alt_stream is not None:
+            self.alt_stream.wait_stream(torch.npu.current_stream())
+            with torch.npu.stream(self.alt_stream):
+                q = self.wq_b(q_lora)[
+                    0
+                ]  # [bs, 1536] @ [1536, 64 * 128] = [bs, 64 * 128]
+                wq_b_event = self.alt_stream.record_event()
+                q = q.view(bs, self.n_heads, self.head_dim)  # [bs, 64, 128]
+                q_pe, q_nope = torch.split(
+                    q,
+                    [self.rope_head_dim, self.head_dim - self.rope_head_dim],
+                    dim=-1,
+                )  # [bs, 64, 64 + 64]
+                q_pe = q_pe.view(bs, self.n_heads, 1, self.rope_head_dim)
+                q_pe = torch_npu.npu_rotary_mul(q_pe, cos, sin).view(
+                    bs, self.n_heads, self.rope_head_dim
+                )  # [bs, n, d]
+                q = torch.cat([q_pe, q_nope], dim=-1)
+                q.record_stream(self.alt_stream)
+                q_rope_event = self.alt_stream.record_event()
+        else:
+            q = self.wq_b(q_lora)[0]  # [bs, 1536] @ [1536, 64 * 128] = [bs, 64 * 128]
+            q = q.view(bs, self.n_heads, self.head_dim)  # [bs, 64, 128]
+            q_pe, q_nope = torch.split(
+                q,
+                [self.rope_head_dim, self.head_dim - self.rope_head_dim],
+                dim=-1,
+            )  # [bs, 64, 64 + 64]
+            q_pe = q_pe.view(bs, self.n_heads, 1, self.rope_head_dim)
+            q_pe = torch_npu.npu_rotary_mul(q_pe, cos, sin).view(
+                bs, self.n_heads, self.rope_head_dim
+            )  # [bs, n, d]
+            q = torch.cat([q_pe, q_nope], dim=-1)
 
-        q_pe = q_pe.view(bs, self.n_heads, 1, self.rope_head_dim)
-        q_pe = torch.ops.npu.npu_rotary_mul(q_pe, cos, sin).view(
-            bs, self.n_heads, self.rope_head_dim
-        )  # [bs, n, d]
-        q = torch.cat([q_pe, q_nope], dim=-1)
+        indexer_weight_stream = get_indexer_weight_stream()
+        indexer_weight_stream.wait_stream(torch.npu.current_stream())
+        with torch.npu.stream(indexer_weight_stream):
+            x = x.view(-1, self.hidden_size)
+            weights = self.weights_proj(x.float())[0].to(torch.bfloat16)
+            weights.record_stream(indexer_weight_stream)
+            weights_event = indexer_weight_stream.record_event()
 
         k_proj = self.wk(x)[0]  # [b, s, 7168] @ [7168, 128] = [b, s, 128]
         k = self.k_norm(k_proj)
@@ -1072,8 +1109,10 @@ class Indexer(CustomOp):
 
         past_key_states = forward_batch.token_to_kv_pool.get_index_k_buffer(layer_id)
 
-        x = x.view(-1, self.hidden_size)
-        weights = self.weights_proj(x.float())[0].to(torch.bfloat16)
+        if self.alt_stream is not None:
+            torch.npu.current_stream().wait_event(q_rope_event)
+        torch.npu.current_stream().wait_event(weights_event)
+
         block_table = forward_batch.attn_backend.forward_metadata.block_tables
         if (
             is_prefill
