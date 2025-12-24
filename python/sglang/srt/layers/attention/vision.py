@@ -42,8 +42,8 @@ _is_cuda = is_cuda()
 _is_musa = is_musa()
 _is_npu = is_npu()
 _is_hip = is_hip()
-_is_cpu_amx_available = cpu_has_amx_support()
 _is_xpu = is_xpu()
+_is_cpu_amx_available = cpu_has_amx_support()
 
 if _is_cuda:
     from flashinfer.prefill import cudnn_batch_prefill_with_kv_cache
