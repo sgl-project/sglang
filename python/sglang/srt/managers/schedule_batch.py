@@ -2168,6 +2168,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             mamba_track_indices=self.mamba_track_indices,
             mamba_track_mask=self.mamba_track_mask,
             mamba_track_seqlens=self.mamba_track_seqlens,
+            dp_cooperation_info=self.dp_cooperation_info,
         )
 
     def _is_available_size_sufficient(self, num_tokens: int) -> bool:
