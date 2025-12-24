@@ -667,8 +667,6 @@ where
             let response = result?;
 
             let duration = start.elapsed();
-            let status_class = status_to_class(response.status().as_u16());
-
             Metrics::record_http_duration(method, &path, duration);
 
             Ok(response)
