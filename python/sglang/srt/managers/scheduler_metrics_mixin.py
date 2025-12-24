@@ -88,8 +88,7 @@ class SchedulerMetricsMixin:
 
             if ENABLE_METRICS_DEVICE_TIMER:
                 self.forward_pass_device_timer = DeviceTimer(
-                    reporter=lambda category, t: self.metrics_collector.increment_gpu_execution_seconds(
-                        category, t, dp_cooperation_info=TODO)
+                    reporter=self.metrics_collector.increment_gpu_execution_seconds,
                 )
 
         if self.enable_kv_cache_events:

@@ -7,7 +7,7 @@ import torch
 
 
 class DeviceTimer:
-    def __init__(self, reporter: Callable[[Dict, float], None]):
+    def __init__(self, reporter: Callable):
         self._intervals: Deque[_TimingInterval] = deque()
         self._reporter = reporter
 
@@ -27,7 +27,7 @@ class DeviceTimer:
                 break
 
             self._intervals.popleft()
-            self._reporter(interval.metadata, interval.elapsed_time() / 1000.0)
+            self._reporter(t=interval.elapsed_time() / 1000.0, **interval.metadata)
 
 
 @dataclass
