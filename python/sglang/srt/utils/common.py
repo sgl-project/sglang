@@ -2058,10 +2058,6 @@ def set_gpu_proc_affinity(
     logger.info(f"Process {pid} gpu_id {gpu_id} is running on CPUs: {p.cpu_affinity()}")
 
 
-# Re-export from request_logger for backward compatibility
-from sglang.srt.utils.request_logger import disable_request_logging
-
-
 def permute_weight(x: torch.Tensor) -> torch.Tensor:
     b_ = x.shape[0]
     n_ = x.shape[1]
