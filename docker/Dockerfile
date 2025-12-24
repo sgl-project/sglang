@@ -282,7 +282,8 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     scikit-build-core \
     nixl \
     py-spy \
-    cubloaty
+    cubloaty \
+    google-cloud-storage
 
 # Build and install sgl-model-gateway (install Rust, build, then remove to save space)
 RUN --mount=type=cache,target=/root/.cache/pip \
