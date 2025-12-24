@@ -847,7 +847,6 @@ mod tests {
             client: Client::new(),
             retry_config: RetryConfig::default(),
             enable_igw: false,
-            context: None,
         }
     }
 
