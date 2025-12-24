@@ -99,11 +99,11 @@ class RequestLogger:
         out: Any,
         is_multimodal_gen: bool = False,
     ) -> None:
-        if (
-            not self.log_requests
-            or self.log_exceeded_ms > 0
-            and self.log_exceeded_ms > out["meta_info"]["e2e_latency"] * 1000
-        ):
+        if not self.log_requests:
+            return
+
+        e2e_latency_ms = out["meta_info"]["e2e_latency"] * 1000
+        if self.log_exceeded_ms > 0 and e2e_latency_ms < self.log_exceeded_ms:
             return
 
         max_length, skip_names, out_skip_names = self.metadata
