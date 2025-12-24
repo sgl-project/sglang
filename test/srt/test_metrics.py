@@ -9,11 +9,12 @@ from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     popen_launch_server,
+    is_in_ci,
 )
 
 
 class TestEnableMetrics(CustomTestCase):
-    def test_metrics_enabled(self):
+    def test_metrics_1gpu(self):
         """Test that metrics endpoint returns data when enabled"""
 
         def _verify_metrics(metrics_content):
@@ -53,6 +54,14 @@ class TestEnableMetrics(CustomTestCase):
             verify_metrics=_verify_metrics,
         )
 
+    def test_metrics_2gpu(self):
+        # TODO enable when we have 2-gpu runner in nightly CI
+        if is_in_ci():
+            print("Skip test_metrics_2gpu since in 1-gpu CI")
+            return
+
+        TODO
+        
     def _execute_core(self, model_name: str, verify_metrics):
         process = popen_launch_server(
             model_name,
