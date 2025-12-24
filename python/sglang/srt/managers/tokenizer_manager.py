@@ -104,13 +104,13 @@ from sglang.srt.utils import (
     get_zmq_socket,
     kill_process_tree,
 )
-from sglang.srt.utils.request_logger import RequestLogger
 from sglang.srt.utils.aio_rwlock import RWLock
 from sglang.srt.utils.hf_transformers_utils import (
     get_processor,
     get_tokenizer,
     get_tokenizer_from_processor,
 )
+from sglang.srt.utils.request_logger import RequestLogger
 from sglang.srt.utils.watchdog import Watchdog
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 

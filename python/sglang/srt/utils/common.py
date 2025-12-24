@@ -18,7 +18,6 @@ import argparse
 import asyncio
 import builtins
 import ctypes
-import dataclasses
 import functools
 import importlib
 import inspect
@@ -66,7 +65,6 @@ from typing import (
     Optional,
     Protocol,
     Sequence,
-    Set,
     Tuple,
     TypeVar,
     Union,
@@ -2061,10 +2059,7 @@ def set_gpu_proc_affinity(
 
 
 # Re-export from request_logger for backward compatibility
-from sglang.srt.utils.request_logger import (
-    dataclass_to_string_truncated,
-    disable_request_logging,
-)
+from sglang.srt.utils.request_logger import disable_request_logging
 
 
 def permute_weight(x: torch.Tensor) -> torch.Tensor:
