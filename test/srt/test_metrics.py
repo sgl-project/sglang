@@ -89,18 +89,18 @@ class TestEnableMetrics(CustomTestCase):
             # Get metrics
             metrics_response = requests.get(f"{DEFAULT_URL_FOR_TEST}/metrics")
             self.assertEqual(metrics_response.status_code, 200)
-            metrics_content = metrics_response.text
+            metrics_text = metrics_response.text
 
-            print(f"metrics_content=\n{metrics_content}")
+            print(f"metrics_text=\n{metrics_text}")
 
-            metrics = _parse_prometheus_metrics(metrics_content)
-            self._verify_metrics_common(metrics_content, metrics)
+            metrics = _parse_prometheus_metrics(metrics_text)
+            self._verify_metrics_common(metrics_text, metrics)
             if verify_metrics_extra is not None:
                 verify_metrics_extra(metrics)
         finally:
             kill_process_tree(process.pid)
 
-    def _verify_metrics_common(self, metrics_content, metrics):
+    def _verify_metrics_common(self, metrics_text, metrics):
         essential_metrics = [
             "sglang:num_running_reqs",
             "sglang:num_used_tokens",
@@ -119,12 +119,12 @@ class TestEnableMetrics(CustomTestCase):
             "sglang:e2e_request_latency_seconds",
         ]
         for metric in essential_metrics:
-            self.assertIn(metric, metrics_content, f"Missing metric: {metric}")
+            self.assertIn(metric, metrics_text, f"Missing metric: {metric}")
 
-        self.assertIn(f'model_name="{_MODEL_NAME}"', metrics_content)
-        self.assertIn("_sum{", metrics_content)
-        self.assertIn("_count{", metrics_content)
-        self.assertIn("_bucket{", metrics_content)
+        self.assertIn(f'model_name="{_MODEL_NAME}"', metrics_text)
+        self.assertIn("_sum{", metrics_text)
+        self.assertIn("_count{", metrics_text)
+        self.assertIn("_bucket{", metrics_text)
 
         metrics_to_check = [
             ("sglang:realtime_tokens_total", {"mode": "prefill_compute"}),
