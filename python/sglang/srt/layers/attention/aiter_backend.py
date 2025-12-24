@@ -1006,26 +1006,9 @@ class AiterAttnBackend(AttentionBackend):
 
             bs0 = forward_batch.batch_size + 1
 
-            # FP8 dtype set for checking
-            FP8_DTYPES = (
-                torch.float8_e4m3fn,
-                torch.float8_e4m3fnuz,
-                torch.float8_e5m2,
-                torch.float8_e5m2fnuz,
-            )
-            FP8_SCALE = torch.tensor(1.0)
-            
-            # Helper function to quantize tensor to FP8 if not already FP8
-            def quantize_to_fp8_if_needed(tensor):
-                return tensor if tensor.dtype in FP8_DTYPES else per_tensor_quant(
-                    tensor, scale=FP8_SCALE, quant_dtype=dtypes.fp8
-                )[0]
-            
-            # Convert q, k, v to FP8 format
-            q_reshaped = q.view(-1, layer.tp_q_head_num, layer.head_dim)
-            q_fp8, _ = per_tensor_quant(q_reshaped, scale=FP8_SCALE, quant_dtype=dtypes.fp8)
-            k_fp8 = quantize_to_fp8_if_needed(k)
-            v_fp8 = quantize_to_fp8_if_needed(v)
+            q_fp8 = q.to(dtypes.fp8)
+            k_fp8 = k.to(dtypes.fp8)
+            v_fp8 = v.to(dtypes.fp8)
 
             o = flash_attn_varlen_fp8_pertensor_func(
                 q=q_fp8,
