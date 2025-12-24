@@ -1,4 +1,5 @@
 """Config loading and M-value lookup for TileLang GEMM."""
+
 import json
 import os
 import re
@@ -7,23 +8,23 @@ from typing import Dict, List, Optional, Tuple
 from sglang.srt.utils import get_device_name
 
 DEFAULT_M_VALUES = [
-    1, 
-    2, 
-    4, 
-    8, 
-    16, 
-    24, 
-    32, 
+    1,
+    2,
+    4,
+    8,
+    16,
+    24,
+    32,
     48,
-    64, 
-    96, 
+    64,
+    96,
     128,
-    256, 
-    512, 
-    1024, 
-    1536, 
-    2048, 
-    3072, 
+    256,
+    512,
+    1024,
+    1536,
+    2048,
+    3072,
     4096,
 ]
 
@@ -42,7 +43,7 @@ class ConfigLoader:
 
     Config file format:
     N={N},K={K},device_name={device_name},dtype=fp8_w8a8,block_shape=[128, 128].json
-    
+
     Content:
     {
         "1": {"kernel_type": "splitK_swapAB", "block_M": 64, ...},

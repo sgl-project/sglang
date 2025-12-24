@@ -3,6 +3,7 @@
 A_scale: (M//128, K//128) per-block, B_scale: (N, K//128) per-token-group
 Output: C (N, M) transposed
 """
+
 import tilelang
 import tilelang.language as T
 from tilelang import tvm as tvm

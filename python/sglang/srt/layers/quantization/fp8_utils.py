@@ -444,10 +444,10 @@ def tilelang_w8a8_block_fp8_linear_with_fallback(
 ) -> torch.Tensor:
     """
     TileLang-based FP8 block linear with fallback to Triton.
-    
+
     This function performs FP8 blockwise quantized linear operation using TileLang kernels.
     Falls back to Triton for unsupported shapes or dtypes.
-    
+
     Args:
         input: Input tensor (M, K) or (batch, M, K)
         weight: Weight tensor (N, K), float8_e4m3
@@ -455,7 +455,7 @@ def tilelang_w8a8_block_fp8_linear_with_fallback(
         weight_scale: Per-block weight scales (N//block_n, K//block_k)
         input_scale: Not used, must be None (quantization happens inside)
         bias: Optional bias tensor
-    
+
     Returns:
         Output tensor with same dtype as input
     """
@@ -489,9 +489,7 @@ def tilelang_w8a8_block_fp8_linear_with_fallback(
 
     # Call TileLang GEMM: C = A @ B^T
     tilelang_gemm_wrapper.gemm_nt_f8f8bf16(
-        (q_input, x_scale),
-        (weight, weight_scale),
-        output
+        (q_input, x_scale), (weight, weight_scale), output
     )
 
     if bias is not None:

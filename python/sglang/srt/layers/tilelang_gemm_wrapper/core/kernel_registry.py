@@ -1,4 +1,5 @@
 """TileLang GEMM kernel registry."""
+
 import logging
 from typing import Any, Dict, List
 
@@ -30,32 +31,34 @@ def _initialize_registry():
             swapAB_kernel_factory,
         )
 
-        KERNEL_REGISTRY.update({
-            "base": {
-                "factory": base_kernel_factory,
-                "has_split_k": False,
-                "is_swap_ab": False,
-                "scale_shm_key": "a_scale_shm",
-            },
-            "swapAB": {
-                "factory": swapAB_kernel_factory,
-                "has_split_k": False,
-                "is_swap_ab": True,
-                "scale_shm_key": "b_scale_shm",
-            },
-            "splitK": {
-                "factory": splitK_kernel_factory,
-                "has_split_k": True,
-                "is_swap_ab": False,
-                "scale_shm_key": "a_scale_shm",
-            },
-            "splitK_swapAB": {
-                "factory": splitK_swapAB_kernel_factory,
-                "has_split_k": True,
-                "is_swap_ab": True,
-                "scale_shm_key": "b_scale_shm",
-            },
-        })
+        KERNEL_REGISTRY.update(
+            {
+                "base": {
+                    "factory": base_kernel_factory,
+                    "has_split_k": False,
+                    "is_swap_ab": False,
+                    "scale_shm_key": "a_scale_shm",
+                },
+                "swapAB": {
+                    "factory": swapAB_kernel_factory,
+                    "has_split_k": False,
+                    "is_swap_ab": True,
+                    "scale_shm_key": "b_scale_shm",
+                },
+                "splitK": {
+                    "factory": splitK_kernel_factory,
+                    "has_split_k": True,
+                    "is_swap_ab": False,
+                    "scale_shm_key": "a_scale_shm",
+                },
+                "splitK_swapAB": {
+                    "factory": splitK_swapAB_kernel_factory,
+                    "has_split_k": True,
+                    "is_swap_ab": True,
+                    "scale_shm_key": "b_scale_shm",
+                },
+            }
+        )
 
         logger.info(f"Loaded {len(KERNEL_REGISTRY)} kernel types")
 

@@ -1,14 +1,11 @@
 """Quantization utilities for TileLang GEMM."""
+
 from typing import Tuple
 
 import torch
 
-from sglang.srt.layers.quantization.fp8_kernel import (
-    sglang_per_token_group_quant_fp8,
-)
-from sglang.srt.layers.quantization.fp8_utils import (
-    per_block_cast_to_fp8,
-)
+from sglang.srt.layers.quantization.fp8_kernel import sglang_per_token_group_quant_fp8
+from sglang.srt.layers.quantization.fp8_utils import per_block_cast_to_fp8
 
 
 def per_token_cast_to_fp8(
@@ -20,9 +17,9 @@ def per_token_cast_to_fp8(
     Returns (x_fp8, x_scale) where x_scale is row-major.
     """
     assert x.dim() == 2, f"Expected 2D tensor, got {x.dim()}D"
-    assert x.shape[-1] % group_size == 0, (
-        f"K={x.shape[-1]} must be divisible by group_size={group_size}"
-    )
+    assert (
+        x.shape[-1] % group_size == 0
+    ), f"K={x.shape[-1]} must be divisible by group_size={group_size}"
 
     x_fp8, x_scale = sglang_per_token_group_quant_fp8(
         x.contiguous(),

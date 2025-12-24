@@ -1,4 +1,5 @@
 """TileLang GEMM Wrapper entry point."""
+
 import logging
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
@@ -14,6 +15,7 @@ if TYPE_CHECKING:
 
 try:
     from sglang.srt.entrypoints.warmup import warmup as warmup_decorator
+
     _WARMUP_DECORATOR_AVAILABLE = True
 except ImportError:
     _WARMUP_DECORATOR_AVAILABLE = False
@@ -26,7 +28,7 @@ _wrapper_initialized = False
 
 def _get_wrapper():
     """Get or initialize TileLangGEMMWrapper instance.
-    
+
     Uses the global wrapper from core.wrapper to ensure kernel cache is shared
     with tilelang_execution_hook.
     """
@@ -39,6 +41,7 @@ def _get_wrapper():
         from sglang.srt.layers.tilelang_gemm_wrapper.core.wrapper import (
             get_global_wrapper,
         )
+
         return get_global_wrapper()
 
     try:
@@ -76,7 +79,7 @@ def gemm_nt_f8f8bf16(
     from sglang.srt.layers.tilelang_gemm_wrapper.core.wrapper import (
         tilelang_execution_hook,
     )
-    
+
     wrapper = _get_wrapper()
     if wrapper is None:
         raise RuntimeError(
@@ -87,7 +90,7 @@ def gemm_nt_f8f8bf16(
     A_fp8, A_scale = lhs
     B_fp8, B_scale = rhs
     n, k = B_fp8.shape
-    
+
     with tilelang_execution_hook(n, k):
         wrapper.gemm(A_fp8, B_fp8, A_scale, B_scale, out)
 
@@ -130,6 +133,7 @@ def update_tilelang_config(gpu_id: int, server_args: "ServerArgs"):
     from sglang.srt.layers.tilelang_gemm_wrapper.core.wrapper import (
         update_tilelang_config as _update_config,
     )
+
     _update_config(gpu_id, server_args)
 
 
@@ -163,14 +167,17 @@ def warmup_common_shapes(
 
     shapes = [(M, N, K) for N, K in nk_shapes for M in m_values]
 
-    logger.info(f"TileLang GEMM warming up {len(shapes)} shapes "
-                f"({len(nk_shapes)} (N,K) x {len(m_values)} M values)...")
+    logger.info(
+        f"TileLang GEMM warming up {len(shapes)} shapes "
+        f"({len(nk_shapes)} (N,K) x {len(m_values)} M values)..."
+    )
 
     wrapper.warmup(shapes)
     logger.info("TileLang GEMM warmup complete")
 
 
 if _WARMUP_DECORATOR_AVAILABLE:
+
     @warmup_decorator("compile-tilelang-gemm")
     async def _sglang_warmup_tilelang_gemm(disaggregation_mode: str, tokenizer_manager):
         """Warmup function for sglang's warmup system."""

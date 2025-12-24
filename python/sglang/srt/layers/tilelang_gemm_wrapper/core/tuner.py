@@ -1,4 +1,5 @@
 """TileLang GEMM Tuner with Ray multi-GPU support."""
+
 import logging
 import os
 from typing import Dict, List, Optional, Tuple
@@ -15,6 +16,7 @@ def _ensure_ray():
     global ray
     if ray is None:
         import ray as _ray
+
         ray = _ray
 
 
@@ -35,8 +37,8 @@ def _matmul_configs(M: int, N: int, K: int) -> List[dict]:
         for BN in tiles_N
         for BK in tiles_K
         for S in stages
-        for TH in threads 
-        if (BM * BK + BN * BK) * S < 256 * 1024   # check for shared memory
+        for TH in threads
+        if (BM * BK + BN * BK) * S < 256 * 1024  # check for shared memory
     ]
 
 
@@ -48,7 +50,7 @@ def _matmul_splitk_configs(M: int, N: int, K: int) -> List[dict]:
     stages = [0, 1, 2]
     threads = [128, 256]
     split_ks = [2, 4, 8]
-    
+
     configs = []
     for BM in tiles_M:
         for BN in tiles_N:
@@ -61,11 +63,19 @@ def _matmul_splitk_configs(M: int, N: int, K: int) -> List[dict]:
                             K_per_split = K // SK
                             if K_per_split % BK != 0:
                                 continue
-                            if (BM * BK + BN * BK) * max(S, 1) < 256 * 1024:    # check for shared memory
-                                configs.append(dict(
-                                    block_M=BM, block_N=BN, block_K=BK,
-                                    num_stages=S, threads=TH, split_k=SK
-                                ))
+                            if (BM * BK + BN * BK) * max(
+                                S, 1
+                            ) < 256 * 1024:  # check for shared memory
+                                configs.append(
+                                    dict(
+                                        block_M=BM,
+                                        block_N=BN,
+                                        block_K=BK,
+                                        num_stages=S,
+                                        threads=TH,
+                                        split_k=SK,
+                                    )
+                                )
     return configs
 
 
@@ -134,17 +144,29 @@ def _create_benchmark_worker_class():
             for kernel, cfg, config_idx in zip(kernels, cfgs, indices):
                 try:
                     latency_ms = self._benchmark_kernel(
-                        kernel, cfg, has_split_k, is_swap_ab,
-                        M, N, K, A_fp8, B_fp8, A_scale, B_scale, C_tl
+                        kernel,
+                        cfg,
+                        has_split_k,
+                        is_swap_ab,
+                        M,
+                        N,
+                        K,
+                        A_fp8,
+                        B_fp8,
+                        A_scale,
+                        B_scale,
+                        C_tl,
                     )
 
-                    results.append({
-                        "config_idx": config_idx,
-                        "kernel_type": kernel_type,
-                        "cfg": cfg,
-                        "latency_ms": latency_ms,
-                        "tflops": _tflops(M, N, K, latency_ms),
-                    })
+                    results.append(
+                        {
+                            "config_idx": config_idx,
+                            "kernel_type": kernel_type,
+                            "cfg": cfg,
+                            "latency_ms": latency_ms,
+                            "tflops": _tflops(M, N, K, latency_ms),
+                        }
+                    )
                 except Exception as e:
                     results.append(None)
                     print(f"[Worker GPU {self.gpu_id}] Benchmark failed: {e}")
@@ -175,20 +197,29 @@ def _create_benchmark_worker_class():
                     split_k, M, N, device="cuda", dtype=torch.float32
                 )
                 if is_swap_ab:
+
                     def bench_fn():
                         kernel(B_fp8, A_fp8, C_partial, C, B_scale, A_scale)
+
                 else:
+
                     def bench_fn():
                         kernel(A_fp8, B_fp8, C_partial, C, A_scale, B_scale)
+
             else:
                 if is_swap_ab:
+
                     def bench_fn():
                         kernel(B_fp8, A_fp8, C, B_scale, A_scale)
+
                 else:
+
                     def bench_fn():
                         kernel(A_fp8, B_fp8, C, A_scale, B_scale)
 
-            ms, _, _ = triton.testing.do_bench_cudagraph(bench_fn, rep=self.bench_rep, quantiles=[0.5, 0.2, 0.8])
+            ms, _, _ = triton.testing.do_bench_cudagraph(
+                bench_fn, rep=self.bench_rep, quantiles=[0.5, 0.2, 0.8]
+            )
             return ms
 
         def clear_cache(self):
@@ -235,8 +266,7 @@ class GEMMTuner:
 
         BenchmarkWorker = _create_benchmark_worker_class()
         self.workers = [
-            BenchmarkWorker.remote(bench_rep=bench_rep)
-            for _ in range(self.num_gpus)
+            BenchmarkWorker.remote(bench_rep=bench_rep) for _ in range(self.num_gpus)
         ]
 
     def tune_single(
@@ -336,14 +366,22 @@ class GEMMTuner:
         compile_N = M if is_swap_ab else N
 
         compile_cfgs = [
-            {**cfg, "M": compile_M, "N": compile_N, "K": K,
-             "out_dtype": "bfloat16", "accum_dtype": "float32"}
+            {
+                **cfg,
+                "M": compile_M,
+                "N": compile_N,
+                "K": K,
+                "out_dtype": "bfloat16",
+                "accum_dtype": "float32",
+            }
             for cfg in cfgs
         ]
 
         if verbose:
-            print(f"  [{kernel_type}] Distributing {len(cfgs)} configs "
-                  f"to {self.num_gpus} GPUs...")
+            print(
+                f"  [{kernel_type}] Distributing {len(cfgs)} configs "
+                f"to {self.num_gpus} GPUs..."
+            )
 
         chunks: List[List[dict]] = [[] for _ in range(self.num_gpus)]
         chunk_compile_cfgs: List[List[dict]] = [[] for _ in range(self.num_gpus)]
@@ -363,7 +401,9 @@ class GEMMTuner:
                     chunks[worker_idx],
                     chunk_compile_cfgs[worker_idx],
                     chunk_indices[worker_idx],
-                    M, N, K,
+                    M,
+                    N,
+                    K,
                 )
                 futures.append(future)
 
@@ -373,13 +413,17 @@ class GEMMTuner:
 
         if verbose:
             success_rate = len(all_results) / len(cfgs) * 100 if cfgs else 0
-            print(f"  [{kernel_type}] {len(all_results)}/{len(cfgs)} "
-                  f"configs succeeded ({success_rate:.1f}%)")
+            print(
+                f"  [{kernel_type}] {len(all_results)}/{len(cfgs)} "
+                f"configs succeeded ({success_rate:.1f}%)"
+            )
 
             if all_results:
                 best = min(all_results, key=lambda x: x["latency_ms"])
-                print(f"  [{kernel_type}] Best: latency={best['latency_ms']:.4f}ms, "
-                      f"tflops={best['tflops']:.2f}")
+                print(
+                    f"  [{kernel_type}] Best: latency={best['latency_ms']:.4f}ms, "
+                    f"tflops={best['tflops']:.2f}"
+                )
 
         return all_results
 
@@ -405,10 +449,12 @@ class GEMMTuner:
                 configs[M] = result
 
                 if verbose:
-                    print(f"\n[tune] Best for M={M}: "
-                          f"{result['kernel_type']}, "
-                          f"latency={result['latency_ms']:.4f}ms, "
-                          f"tflops={result['tflops']:.2f}")
+                    print(
+                        f"\n[tune] Best for M={M}: "
+                        f"{result['kernel_type']}, "
+                        f"latency={result['latency_ms']:.4f}ms, "
+                        f"tflops={result['tflops']:.2f}"
+                    )
             else:
                 if verbose:
                     print(f"\n[tune] No valid config found for M={M}")
