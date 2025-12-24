@@ -71,6 +71,7 @@ suites = {
         TestFile("test_mamba_unittest.py", 9),
         TestFile("test_metrics.py", 32),
         TestFile("test_metrics_utils.py", 1),
+        TestFile("test_mm_process_config.py", 150),
         TestFile("test_mla.py", 194),
         TestFile("test_mla_deepseek_v3.py", 442),
         TestFile("test_mla_flashinfer.py", 302),
