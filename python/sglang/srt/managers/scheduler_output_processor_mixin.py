@@ -445,6 +445,12 @@ class SchedulerOutputProcessorMixin:
             and self.forward_ct_decode % self.server_args.decode_log_interval == 0
         ):
             self.log_decode_stats(can_run_cuda_graph, running_batch=batch)
+        if self.enable_metrics:
+            self.metrics_collector.increment_realtime_tokens(
+                # TODO unify this w/ `Scheduler.num_generated_tokens` accumulator
+                decode_tokens=batch.batch_size() + result.num_accepted_tokens,
+                dp_cooperation_info=batch.dp_cooperation_info,
+            )
 
     def _mamba_prefix_cache_update(
         self, req: Req, batch: ScheduleBatch, result: GenerationBatchResult, i: int
