@@ -14,7 +14,7 @@ permissions:
 
 jobs:
   bump-sglang-version:
-    runs-on: ubuntu-slim
+    runs-on: ubuntu-latest
     outputs:
       branch_name: ${{ steps.set_output.outputs.branch_name }}
     steps:

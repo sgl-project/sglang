@@ -9,7 +9,7 @@ permissions:
 
 jobs:
   bump-kernel-version-to-sglang:
-    runs-on: ubuntu-slim
+    runs-on: ubuntu-latest
     outputs:
       branch_name: ${{ steps.set_output.outputs.branch_name }}
       needs_sync: ${{ steps.check_sync.outputs.needs_sync }}

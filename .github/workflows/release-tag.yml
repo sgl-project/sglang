@@ -13,7 +13,7 @@ permissions:
 jobs:
   publish:
     if: github.repository == 'sgl-project/sglang'
-    runs-on: ubuntu-slim
+    runs-on: ubuntu-latest
     environment: 'prod'
     steps:
       - name: Checkout repository
