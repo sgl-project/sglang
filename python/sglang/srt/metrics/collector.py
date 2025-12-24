@@ -669,22 +669,11 @@ class SchedulerMetricsCollector:
             multiprocess_mode="mostrecent",
         )
 
-        self.realtime_prefill_compute_tokens_total = Counter(
-            name="sglang:realtime_prefill_compute_tokens_total",
-            documentation="Total number of prefill compute tokens processed (updated on each log interval).",
-            labelnames=labels.keys(),
+        self.realtime_tokens_total = Counter(
+            name="sglang:realtime_tokens_total",
+            documentation="Total number of tokens processed (updated on each log interval).",
+            labelnames=list(labels.keys()) + ["mode"],
         )
-        self.realtime_prefill_cache_tokens_total = Counter(
-            name="sglang:realtime_prefill_cache_tokens_total",
-            documentation="Total number of prefill cache tokens processed (updated on each log interval).",
-            labelnames=labels.keys(),
-        )
-        self.realtime_decode_tokens_total = Counter(
-            name="sglang:realtime_decode_tokens_total",
-            documentation="Total number of decode tokens processed (updated on each log interval).",
-            labelnames=labels.keys(),
-        )
-
         self.gpu_execution_seconds_total = Counter(
             name="sglang:gpu_execution_seconds_total",
             documentation="Total time that GPU is busy executing a workload.",
@@ -729,13 +718,12 @@ class SchedulerMetricsCollector:
     def increment_realtime_tokens(
         self, prefill_compute_tokens=0, prefill_cache_tokens=0, decode_tokens=0
     ):
-        self.realtime_prefill_compute_tokens_total.labels(**self.labels).inc(
-            prefill_compute_tokens
-        )
-        self.realtime_prefill_cache_tokens_total.labels(**self.labels).inc(
-            prefill_cache_tokens
-        )
-        self.realtime_decode_tokens_total.labels(**self.labels).inc(decode_tokens)
+        for mode, delta in [
+            ("prefill_compute", prefill_compute_tokens),
+            ("prefill_cache", prefill_cache_tokens),
+            ("decode", decode_tokens),
+        ]:
+            self.realtime_tokens_total.labels(**self.labels, mode=mode).inc(delta)
 
     def increment_gpu_execution_seconds(self, category: str, t: float):
         logger.debug(f"GPU execution seconds: {category=} {t=:.3f}")
