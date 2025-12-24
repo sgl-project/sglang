@@ -66,6 +66,7 @@ class TestEnableMetrics(CustomTestCase):
                 "sglang:time_to_first_token_seconds",
                 "sglang:inter_token_latency_seconds",
                 "sglang:e2e_request_latency_seconds",
+                "sglang:request_output_throughput_tokens_per_second",
             ]
 
             for metric in essential_metrics:

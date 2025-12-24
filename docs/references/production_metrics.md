@@ -123,6 +123,15 @@ sglang:gen_throughput{model_name="meta-llama/Llama-3.1-8B-Instruct"} 86.50814177
 # HELP sglang:num_queue_reqs The number of requests in the waiting queue
 # TYPE sglang:num_queue_reqs gauge
 sglang:num_queue_reqs{model_name="meta-llama/Llama-3.1-8B-Instruct"} 2826.0
+# HELP sglang:request_output_throughput_tokens_per_second Histogram of per-request output throughput in tokens per second.
+# TYPE sglang:request_output_throughput_tokens_per_second histogram
+sglang:request_output_throughput_tokens_per_second_sum{model_name="meta-llama/Llama-3.1-8B-Instruct"} 495230.5
+sglang:request_output_throughput_tokens_per_second_bucket{le="10",model_name="meta-llama/Llama-3.1-8B-Instruct"} 120.0
+sglang:request_output_throughput_tokens_per_second_bucket{le="20",model_name="meta-llama/Llama-3.1-8B-Instruct"} 580.0
+sglang:request_output_throughput_tokens_per_second_bucket{le="50",model_name="meta-llama/Llama-3.1-8B-Instruct"} 4500.0
+sglang:request_output_throughput_tokens_per_second_bucket{le="100",model_name="meta-llama/Llama-3.1-8B-Instruct"} 8200.0
+sglang:request_output_throughput_tokens_per_second_bucket{le="+Inf",model_name="meta-llama/Llama-3.1-8B-Instruct"} 11008.0
+sglang:request_output_throughput_tokens_per_second_count{model_name="meta-llama/Llama-3.1-8B-Instruct"} 11008.0
 ```
 
 ## Setup Guide
