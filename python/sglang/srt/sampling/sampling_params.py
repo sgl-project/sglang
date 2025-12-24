@@ -16,7 +16,8 @@
 import logging
 from typing import Any, Dict, List, Optional, Union
 
-# sre_parse is deprecated in Python 3.11+ and moved to re._parser
+# sre_parse was moved to re._parser in Python 3.11+ and deprecated
+# Use try/except for compatibility with both old and new Python versions
 try:
     import re._parser as sre_parse
 except ImportError:
