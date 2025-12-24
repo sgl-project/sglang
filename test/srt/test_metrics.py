@@ -1,8 +1,9 @@
 import unittest
-from typing import Dict, List, Tuple
+from typing import Dict, List
 
 import requests
 from prometheus_client.parser import text_string_to_metric_families
+from prometheus_client.samples import Sample
 
 from sglang.srt.environ import envs
 from sglang.srt.utils import kill_process_tree
@@ -169,35 +170,26 @@ class TestEnableMetrics(CustomTestCase):
             kill_process_tree(process.pid)
 
 
-def _parse_prometheus_metrics(
-    metrics_text: str,
-) -> Dict[str, List[Tuple[Dict[str, str], float]]]:
-    """Parse Prometheus metrics text into a dictionary.
-
-    Returns:
-        Dict mapping metric_name -> list of (labels_dict, value) tuples
-    """
+def _parse_prometheus_metrics(metrics_text: str) -> Dict[str, List[Sample]]:
     result = {}
     for family in text_string_to_metric_families(metrics_text):
         for sample in family.samples:
-            metric_name = sample.name
-            if metric_name not in result:
-                result[metric_name] = []
-            result[metric_name].append((dict(sample.labels), sample.value))
+            if sample.name not in result:
+                result[sample.name] = []
+            result[sample.name].append(sample)
     return result
 
 
 def _get_metric_value(
-    metrics: Dict[str, List[Tuple[Dict[str, str], float]]],
+    metrics: Dict[str, List[Sample]],
     metric_name: str,
     labels: Dict[str, str],
 ) -> float:
-    """Get metric value matching the given labels."""
     if metric_name not in metrics:
         raise KeyError(f"Metric {metric_name} not found")
-    for sample_labels, value in metrics[metric_name]:
-        if all(sample_labels.get(k) == v for k, v in labels.items()):
-            return value
+    for sample in metrics[metric_name]:
+        if all(sample.labels.get(k) == v for k, v in labels.items()):
+            return sample.value
     raise KeyError(f"Metric {metric_name} with labels {labels} not found")
 
 
