@@ -1123,7 +1123,7 @@ class TokenizerManager(
                 # For beam search, skip intermediate results and only yield when finished
                 if out.get("beam_results"):
                     continue
-              
+
                 # Record response sent time right before we send response.
                 if not state.response_sent_to_client_ts:
                     state.response_sent_to_client_ts = time.time()
