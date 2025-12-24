@@ -83,10 +83,10 @@ class TestEnableMetrics(CustomTestCase):
             response = requests.post(
                 f"{DEFAULT_URL_FOR_TEST}/generate",
                 json={
-                    "text": "The capital of France is",
+                    "text": [f"{i}+1=" for i in range(20)],
                     "sampling_params": {
                         "temperature": 0,
-                        "max_new_tokens": 100,
+                        "max_new_tokens": 50,
                     },
                     "stream": True,
                     "ignore_eos": True,
