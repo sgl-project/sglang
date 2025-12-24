@@ -83,15 +83,51 @@ class DiffusionLoRAManager:
         weights: Dict[str, torch.Tensor] = {}
 
         if self.server_args is not None and self.modules:
-            config = self.server_args.pipeline_config.dit_config.arch_config
-
-            param_names_mapping_fn = get_param_names_mapping(
-                config.param_names_mapping
-                or self.modules.get("transformer", {}).param_names_mapping
+            # Prefer mapping dicts from pipeline config; fall back to transformer attributes if present.
+            # Be defensive: pipeline configs/modules evolve across upstream versions.
+            arch_config = getattr(
+                getattr(
+                    getattr(self.server_args, "pipeline_config", None),
+                    "dit_config",
+                    None,
+                ),
+                "arch_config",
+                None,
             )
+            transformer = self.modules.get("transformer")
+
+            param_names_mapping_dict = None
+            lora_param_names_mapping_dict = None
+            if arch_config is not None:
+                param_names_mapping_dict = getattr(
+                    arch_config, "param_names_mapping", None
+                )
+                lora_param_names_mapping_dict = getattr(
+                    arch_config, "lora_param_names_mapping", None
+                )
+            if not param_names_mapping_dict and transformer is not None:
+                param_names_mapping_dict = getattr(
+                    transformer, "param_names_mapping", None
+                )
+            if not lora_param_names_mapping_dict and transformer is not None:
+                lora_param_names_mapping_dict = getattr(
+                    transformer, "lora_param_names_mapping", None
+                )
+
+            # If we don't have both mappings, fall back to the simple name mapping below.
+            if not param_names_mapping_dict or not lora_param_names_mapping_dict:
+                logger.warning(
+                    "LoRA name mapping not found in pipeline config/modules; falling back to simple mapping."
+                )
+                for name, weight in lora_state_dict.items():
+                    name = name.replace("diffusion_model.", "")
+                    name = name.replace(".weight", "")
+                    weights[name] = weight.to(self.device)
+                return weights
+
+            param_names_mapping_fn = get_param_names_mapping(param_names_mapping_dict)
             lora_param_names_mapping_fn = get_param_names_mapping(
-                config.lora_param_names_mapping
-                or self.modules.get("transformer", {}).lora_param_names_mapping
+                lora_param_names_mapping_dict
             )
 
             to_merge_params: Dict[str, Dict[int, torch.Tensor]] = defaultdict(dict)
