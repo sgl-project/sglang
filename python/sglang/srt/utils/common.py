@@ -3794,6 +3794,7 @@ def get_numa_node_count() -> int:
         raise SystemError("numa not available on this system")
     return libnuma.numa_max_node() + 1
 
+
 def get_system_gpu_count() -> int:
     """
     Get the total number of GPUs in the system (not affected by CUDA_VISIBLE_DEVICES).
@@ -3802,13 +3803,16 @@ def get_system_gpu_count() -> int:
         int: The total number of physical GPUs.
     """
     result = subprocess.run(
-            ["nvidia-smi", "--list-gpus"],
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-    gpu_lines = [line for line in result.stdout.strip().split('\n') 
-                     if line.strip().startswith("GPU")]
+        ["nvidia-smi", "--list-gpus"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    gpu_lines = [
+        line
+        for line in result.stdout.strip().split("\n")
+        if line.strip().startswith("GPU")
+    ]
     return len(gpu_lines)
 
 
@@ -3830,17 +3834,19 @@ def get_current_device_numa_node() -> int:
 
     logical_device_id = torch.cuda.current_device()
     physical_device_id = get_physical_device_id(logical_device_id)
-    
+
     numa_count = get_numa_node_count()
     gpu_count = get_system_gpu_count()
-    
+
     if gpu_count >= numa_count:
-        gpus_per_numa = gpu_count // numa_count # >= 1
-        numa_node = physical_device_id // gpus_per_numa # 0 ~ numa_count - 1
+        gpus_per_numa = gpu_count // numa_count  # >= 1
+        numa_node = physical_device_id // gpus_per_numa  # 0 ~ numa_count - 1
     else:
-        logger.warning(f"GPU count {gpu_count} is less than NUMA count {numa_count}. Using first NUMA node.")
+        logger.warning(
+            f"GPU count {gpu_count} is less than NUMA count {numa_count}. Using first NUMA node."
+        )
         numa_node = 0
-    
+
     return numa_node
 
 
