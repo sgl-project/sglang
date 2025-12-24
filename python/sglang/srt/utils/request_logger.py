@@ -20,6 +20,7 @@ from datetime import datetime
 from functools import lru_cache
 from typing import TYPE_CHECKING, Any, Optional, Set, Tuple, Union
 
+from sglang.srt.environ import envs
 from sglang.srt.utils.common import get_bool_env_var
 
 if TYPE_CHECKING:
@@ -47,6 +48,7 @@ class RequestLogger:
         self.metadata: Tuple[Optional[int], Optional[Set[str]], Optional[Set[str]]] = (
             self._compute_metadata()
         )
+        self.log_exceeded_ms = envs.SGLANG_LOG_REQUEST_EXCEEDED_MS.get()
 
     def configure(
         self,
@@ -97,7 +99,11 @@ class RequestLogger:
         out: Any,
         is_multimodal_gen: bool = False,
     ) -> None:
-        if not self.log_requests:
+        if (
+            not self.log_requests
+            or self.log_exceeded_ms < 0
+            or self.log_exceeded_ms > out["meta_info"]["e2e_latency"] * 1000
+        ):
             return
 
         max_length, skip_names, out_skip_names = self.metadata
