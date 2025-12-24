@@ -75,11 +75,10 @@ class TestRequestLoggerJson(BaseTestRequestLogger, CustomTestCase):
         received_found = False
         finished_found = False
         for line in combined_output.splitlines():
-            json_start = line.find("{")
-            if json_start == -1:
+            if not line.startswith("{"):
                 continue
             try:
-                data = json.loads(line[json_start:])
+                data = json.loads(line)
             except json.JSONDecodeError:
                 continue
             if data.get("event") == "request.received":
