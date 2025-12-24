@@ -224,6 +224,103 @@ def validate_openai_video(video_bytes: bytes) -> None:
     assert is_mp4 or is_webm, "Video must be MP4 or WebM"
 
 
+def validate_image_file(
+    file_path: str,
+    expected_filename: str,
+    expected_width: int | None = None,
+    expected_height: int | None = None,
+) -> None:
+    """Validate image output file: existence, extension, size, filename, dimensions.
+
+    Args:
+        file_path: Path to the image file
+        expected_filename: Expected filename (e.g., "1234567890.png")
+        expected_width: Expected image width (optional)
+        expected_height: Expected image height (optional)
+    """
+    # 1. File existence
+    assert os.path.exists(file_path), f"Image file does not exist: {file_path}"
+
+    # 2. Extension check
+    assert file_path.endswith(".png"), f"Expected .png extension, got: {file_path}"
+
+    # 3. File size > 0
+    file_size = os.path.getsize(file_path)
+    assert file_size > 0, f"Image file is empty: {file_path}"
+
+    # 4. Filename validation
+    actual_filename = os.path.basename(file_path)
+    assert (
+        actual_filename == expected_filename
+    ), f"Filename mismatch: expected '{expected_filename}', got '{actual_filename}'"
+
+    # 5. Image format validation (reuse is_png)
+    with open(file_path, "rb") as f:
+        header = f.read(8)
+        assert is_png(header), f"File is not a valid PNG: {file_path}"
+
+    # 6. Image dimension validation (reuse PIL)
+    if expected_width is not None and expected_height is not None:
+        with Image.open(file_path) as img:
+            width, height = img.size
+            assert (
+                width == expected_width
+            ), f"Width mismatch: expected {expected_width}, got {width}"
+            assert (
+                height == expected_height
+            ), f"Height mismatch: expected {expected_height}, got {height}"
+
+
+def validate_video_file(
+    file_path: str,
+    expected_filename: str,
+    expected_width: int | None = None,
+    expected_height: int | None = None,
+) -> None:
+    """Validate video output file: existence, extension, size, filename, format, dimensions.
+
+    Args:
+        file_path: Path to the video file
+        expected_filename: Expected filename (e.g., "abc123-def456.mp4")
+        expected_width: Expected video width (optional)
+        expected_height: Expected video height (optional)
+    """
+    import imageio.v3 as iio
+
+    # 1. File existence
+    assert os.path.exists(file_path), f"Video file does not exist: {file_path}"
+
+    # 2. Extension check
+    assert file_path.endswith(".mp4"), f"Expected .mp4 extension, got: {file_path}"
+
+    # 3. File size > 0
+    file_size = os.path.getsize(file_path)
+    assert file_size > 0, f"Video file is empty: {file_path}"
+
+    # 4. Filename validation
+    actual_filename = os.path.basename(file_path)
+    assert (
+        actual_filename == expected_filename
+    ), f"Filename mismatch: expected '{expected_filename}', got '{actual_filename}'"
+
+    # 5. Video format validation (reuse is_mp4)
+    with open(file_path, "rb") as f:
+        header = f.read(32)
+        assert is_mp4(header), f"File is not a valid MP4: {file_path}"
+
+    # 6. Video dimension validation (using imageio)
+    if expected_width is not None and expected_height is not None:
+        props = iio.improps(file_path, plugin="pyav")
+        # props.shape is (num_frames, height, width, channels)
+        actual_height, actual_width = props.shape[1], props.shape[2]
+        assert (
+            actual_width == expected_width
+        ), f"Video width mismatch: expected {expected_width}, got {actual_width}"
+        assert (
+            actual_height == expected_height
+        ), f"Video height mismatch: expected {expected_height}, got {actual_height}"
+
+
 @dataclasses.dataclass
 class TestResult:
     name: str

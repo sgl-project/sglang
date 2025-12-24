@@ -38,7 +38,9 @@ from sglang.multimodal_gen.test.test_utils import (
     is_image_url,
     prepare_perf_log,
     validate_image,
+    validate_image_file,
     validate_openai_video,
+    validate_video_file,
 )
 
 logger = init_logger(__name__)
@@ -752,9 +754,21 @@ def get_generate_fn(
         content = resp.read()
         validate_openai_video(content)
 
-        tmp_path = f"{video_id}.mp4"
+        expected_filename = f"{video_id}.mp4"
+        tmp_path = expected_filename
         with open(tmp_path, "wb") as f:
             f.write(content)
+
+        # Validate output file
+        expected_width, expected_height = None, None
+        if size:
+            parts = size.split("x")
+            if len(parts) == 2:
+                expected_width, expected_height = int(parts[0]), int(parts[1])
+        validate_video_file(
+            tmp_path, expected_filename, expected_width, expected_height
+        )
+
         upload_file_to_slack(
             case_id=case_id,
             model=model_path,
@@ -784,9 +798,21 @@ def get_generate_fn(
         validate_image(result.data[0].b64_json)
 
         img_data = base64.b64decode(result.data[0].b64_json)
-        tmp_path = f"{result.created}.png"
+        expected_filename = f"{result.created}.png"
+        tmp_path = expected_filename
         with open(tmp_path, "wb") as f:
             f.write(img_data)
+
+        # Validate output file
+        expected_width, expected_height = None, None
+        if output_size:
+            parts = output_size.split("x")
+            if len(parts) == 2:
+                expected_width, expected_height = int(parts[0]), int(parts[1])
+        validate_image_file(
+            tmp_path, expected_filename, expected_width, expected_height
+        )
+
         upload_file_to_slack(
             case_id=case_id,
             model=model_path,
