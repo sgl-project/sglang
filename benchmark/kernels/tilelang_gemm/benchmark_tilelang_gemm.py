@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """
-Benchmark TileLang GEMM vs DeepGEMM vs SGL-Kernel
+Benchmark TileLang GEMM vs Baseline (DeepGEMM on Hopper, Triton on Ada)
 
-This script compares the performance of TileLang FP8 blockwise GEMM against DeepGEMM
-and SGL-Kernel baselines.
+This script compares the performance of TileLang FP8 blockwise GEMM against
+architecture-specific baselines:
+- Hopper (sm90): DeepGEMM as baseline
+- Ada (sm89): Triton as baseline
 
 Usage:
     # Benchmark specific (N, K)
@@ -30,24 +32,50 @@ import triton
 from sglang.srt.layers.tilelang_gemm_wrapper.core.config_loader import DEFAULT_M_VALUES
 from sglang.srt.layers import tilelang_gemm_wrapper
 
-# Optional deep_gemm import
-from sglang.srt.layers.deep_gemm_wrapper.configurer import ENABLE_JIT_DEEPGEMM
+# Detect GPU architecture
+def get_gpu_arch() -> str:
+    """Detect GPU architecture and return 'hopper', 'ada', or 'unknown'."""
+    if not torch.cuda.is_available():
+        return "unknown"
+    
+    major, minor = torch.cuda.get_device_capability()
+    sm_version = major * 10 + minor
+    
+    if sm_version >= 90:
+        return "hopper"  # sm90+
+    elif sm_version == 89:
+        return "ada"  # sm89
+    else:
+        return "unknown"
 
-if ENABLE_JIT_DEEPGEMM:
+GPU_ARCH = get_gpu_arch()
+
+# Import baseline based on architecture
+if GPU_ARCH == "hopper":
+    from sglang.srt.layers.deep_gemm_wrapper.configurer import ENABLE_JIT_DEEPGEMM
+    if ENABLE_JIT_DEEPGEMM:
+        try:
+            from sglang.srt.layers import deep_gemm_wrapper
+            from deep_gemm.utils.layout import get_mn_major_tma_aligned_tensor
+            BASELINE_AVAILABLE = True
+            BASELINE_NAME = "DeepGEMM"
+        except ImportError:
+            BASELINE_AVAILABLE = False
+            BASELINE_NAME = "DeepGEMM (unavailable)"
+    else:
+        BASELINE_AVAILABLE = False
+        BASELINE_NAME = "DeepGEMM (disabled)"
+elif GPU_ARCH == "ada":
     try:
-        from sglang.srt.layers import deep_gemm_wrapper
-        from deep_gemm.utils.layout import get_mn_major_tma_aligned_tensor
+        from sglang.srt.layers.quantization.fp8_kernel import w8a8_block_fp8_matmul_triton
+        BASELINE_AVAILABLE = True
+        BASELINE_NAME = "Triton"
     except ImportError:
-        get_mn_major_tma_aligned_tensor = None
-        ENABLE_JIT_DEEPGEMM = False
-
-# Optional sgl_kernel import
-try:
-    from sgl_kernel import fp8_blockwise_scaled_mm
-    SGL_KERNEL_AVAILABLE = True
-except ImportError:
-    fp8_blockwise_scaled_mm = None
-    SGL_KERNEL_AVAILABLE = False
+        BASELINE_AVAILABLE = False
+        BASELINE_NAME = "Triton (unavailable)"
+else:
+    BASELINE_AVAILABLE = False
+    BASELINE_NAME = f"Unknown arch ({GPU_ARCH})"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -72,8 +100,8 @@ def prepare_data(M: int, N: int, K: int):
     
     A_fp8, B_fp8, A_scale, B_scale = prepare_gemm_inputs(A, B)
     
-    # Prepare DeepGEMM scale if available
-    if ENABLE_JIT_DEEPGEMM:
+    # Prepare DeepGEMM scale if on Hopper
+    if GPU_ARCH == "hopper" and BASELINE_AVAILABLE:
         A_scale_deepgemm = get_mn_major_tma_aligned_tensor(A_scale.clone())
     else:
         A_scale_deepgemm = None
@@ -111,7 +139,7 @@ def benchmark_deepgemm(
     N: int,
     rep: int = 100,
 ) -> Tuple[float, float, float]:
-    """Benchmark DeepGEMM kernel."""
+    """Benchmark DeepGEMM kernel (Hopper baseline)."""
     
     C = torch.zeros(M, N, dtype=torch.bfloat16, device="cuda")
     
@@ -123,25 +151,24 @@ def benchmark_deepgemm(
     return ms, min_ms, max_ms
 
 
-def benchmark_sglkernel(
+def benchmark_triton(
     A_fp8: torch.Tensor,
     B_fp8: torch.Tensor,
     A_scale: torch.Tensor,
     B_scale: torch.Tensor,
     M: int,
     N: int,
+    K: int,
     rep: int = 100,
 ) -> Tuple[float, float, float]:
-    """Benchmark SGL-Kernel fp8_blockwise_scaled_mm."""
-    # Prepare data in the format expected by sgl_kernel
-    # A_scale needs to be transposed and made contiguous, then transposed back
-    A_scale_sgl = A_scale.t().contiguous().t()
-    # B and B_scale need to be transposed (column major layout)
-    B_fp8_sgl = B_fp8.t()
-    B_scale_sgl = B_scale.t()
+    """Benchmark Triton kernel (Ada baseline)."""
+    
+    block_size = [128, 128]
     
     def fn():
-        return fp8_blockwise_scaled_mm(A_fp8, B_fp8_sgl, A_scale_sgl, B_scale_sgl, torch.bfloat16)
+        return w8a8_block_fp8_matmul_triton(
+            A_fp8, B_fp8, A_scale, B_scale, block_size, output_dtype=torch.bfloat16
+        )
     
     quantiles = [0.5, 0.2, 0.8]
     ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(fn, rep=rep, quantiles=quantiles)
@@ -155,7 +182,7 @@ def run_benchmark(
     rep: int = 100,
     output_file: Optional[str] = None,
 ) -> List[Dict]:
-    """Run benchmark comparing TileLang vs DeepGEMM vs SGL-Kernel."""
+    """Run benchmark comparing TileLang vs architecture-specific baseline."""
     
     # Check TileLang availability
     if not tilelang_gemm_wrapper.is_available():
@@ -188,38 +215,32 @@ def run_benchmark(
                 logger.warning(f"M={M}: TileLang failed: {e}")
                 continue
             
-            # Benchmark DeepGEMM
-            if ENABLE_JIT_DEEPGEMM:
+            # Benchmark baseline based on architecture
+            if BASELINE_AVAILABLE:
                 try:
-                    dg_ms, _, _ = benchmark_deepgemm(
-                        A_fp8, B_fp8, A_scale_deepgemm, B_scale, M, N, rep
-                    )
-                    dg_tflops = tflops(M, N, K, dg_ms)
-                    speedup_vs_dg = dg_ms / tl_ms
+                    if GPU_ARCH == "hopper":
+                        bl_ms, _, _ = benchmark_deepgemm(
+                            A_fp8, B_fp8, A_scale_deepgemm, B_scale, M, N, rep
+                        )
+                    elif GPU_ARCH == "ada":
+                        bl_ms, _, _ = benchmark_triton(
+                            A_fp8, B_fp8, A_scale, B_scale, M, N, K, rep
+                        )
+                    else:
+                        bl_ms = float('nan')
+                    bl_tflops = tflops(M, N, K, bl_ms)
+                    speedup = bl_ms / tl_ms
                 except Exception as e:
-                    dg_ms = dg_tflops = speedup_vs_dg = float('nan')
+                    logger.warning(f"M={M}: {BASELINE_NAME} failed: {e}")
+                    bl_ms = bl_tflops = speedup = float('nan')
             else:
-                dg_ms = dg_tflops = speedup_vs_dg = float('nan')
-            
-            # Benchmark SGL-Kernel
-            if SGL_KERNEL_AVAILABLE:
-                try:
-                    sk_ms, _, _ = benchmark_sglkernel(
-                        A_fp8, B_fp8, A_scale, B_scale, M, N, rep
-                    )
-                    sk_tflops = tflops(M, N, K, sk_ms)
-                    speedup_vs_sk = sk_ms / tl_ms
-                except Exception as e:
-                    logger.warning(f"M={M}: SGL-Kernel failed: {e}")
-                    sk_ms = sk_tflops = speedup_vs_sk = float('nan')
-            else:
-                sk_ms = sk_tflops = speedup_vs_sk = float('nan')
+                bl_ms = bl_tflops = speedup = float('nan')
             
             results.append({
                 "M": M, "N": N, "K": K,
-                "tl_ms": tl_ms, "dg_ms": dg_ms, "sk_ms": sk_ms,
-                "tl_tflops": tl_tflops, "dg_tflops": dg_tflops, "sk_tflops": sk_tflops,
-                "speedup_vs_dg": speedup_vs_dg, "speedup_vs_sk": speedup_vs_sk,
+                "tl_ms": tl_ms, "bl_ms": bl_ms,
+                "tl_tflops": tl_tflops, "bl_tflops": bl_tflops,
+                "speedup": speedup,
                 "kernel_type": kernel_type,
             })
             
@@ -227,26 +248,26 @@ def run_benchmark(
             logger.warning(f"M={M}: Error: {e}")
     
     # Print all results at the end (to avoid interleaving with compilation logs)
-    print(f"\n{'='*120}")
-    print(f"Benchmark: TileLang vs DeepGEMM vs SGL-Kernel")
+    print(f"\n{'='*100}")
+    print(f"Benchmark: TileLang vs {BASELINE_NAME}")
+    print(f"GPU Architecture: {GPU_ARCH.upper()}")
     print(f"N={N}, K={K}")
-    print(f"DeepGEMM available: {ENABLE_JIT_DEEPGEMM}")
-    print(f"SGL-Kernel available: {SGL_KERNEL_AVAILABLE}")
-    print(f"{'='*120}\n")
+    print(f"{BASELINE_NAME} available: {BASELINE_AVAILABLE}")
+    print(f"{'='*100}\n")
     
     header = (
-        f"{'M':>6} | {'TileLang (ms)':>14} | {'DeepGEMM (ms)':>14} | {'SGL-Kernel (ms)':>15} | "
-        f"{'TL TFLOPS':>10} | {'DG TFLOPS':>10} | {'SK TFLOPS':>10} | "
-        f"{'TL/DG':>7} | {'TL/SK':>7} | {'Kernel Type':>15}"
+        f"{'M':>6} | {'TileLang (ms)':>14} | {BASELINE_NAME + ' (ms)':>14} | "
+        f"{'TL TFLOPS':>10} | {'BL TFLOPS':>10} | "
+        f"{'Speedup':>8} | {'Kernel Type':>15}"
     )
     print(header)
     print("-" * len(header))
     
     for r in results:
         print(
-            f"{r['M']:>6} | {r['tl_ms']:>14.4f} | {r['dg_ms']:>14.4f} | {r['sk_ms']:>15.4f} | "
-            f"{r['tl_tflops']:>10.2f} | {r['dg_tflops']:>10.2f} | {r['sk_tflops']:>10.2f} | "
-            f"{r['speedup_vs_dg']:>6.2f}x | {r['speedup_vs_sk']:>6.2f}x | {r['kernel_type']:>15}"
+            f"{r['M']:>6} | {r['tl_ms']:>14.4f} | {r['bl_ms']:>14.4f} | "
+            f"{r['tl_tflops']:>10.2f} | {r['bl_tflops']:>10.2f} | "
+            f"{r['speedup']:>7.2f}x | {r['kernel_type']:>15}"
         )
     
     print("-" * len(header))
@@ -264,7 +285,7 @@ def run_benchmark(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Benchmark TileLang GEMM vs DeepGEMM vs SGL-Kernel",
+        description="Benchmark TileLang GEMM vs Baseline (DeepGEMM on Hopper, Triton on Ada)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__
     )
@@ -289,6 +310,11 @@ def main():
     )
     
     args = parser.parse_args()
+    
+    # Print architecture info
+    print(f"Detected GPU Architecture: {GPU_ARCH.upper()}")
+    print(f"Baseline: {BASELINE_NAME}")
+    print()
     
     if args.all:
         # Benchmark all available configs
