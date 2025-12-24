@@ -124,6 +124,7 @@ class SchedulerMetricsMixin:
         self.last_prefill_stats_tic = time.perf_counter()
         self.last_input_throughput = self.last_prefill_tokens / gap_latency
         self.last_prefill_tokens = adder.log_input_tokens
+        self.last_prefill_cache_tokens = adder.log_hit_tokens
 
         # TODO: generalize this for various memory pools
         if self.is_hybrid_swa:
@@ -231,17 +232,20 @@ class SchedulerMetricsMixin:
                     self.disagg_decode_transfer_queue.queue
                 )
 
-            self.metrics_collector.increment_realtime_tokens(
-                prefill_compute_tokens=adder.log_input_tokens,
-                prefill_cache_tokens=adder.log_hit_tokens,
-                dp_cooperation_info=TODO,
-            )
-
             # Others
             self.calculate_utilization()
             self.metrics_collector.log_stats(self.stats)
             self._emit_kv_metrics()
         self._publish_kv_events()
+
+    def log_prefill_token_stats(self: Scheduler, batch: Optional[ScheduleBatch]):
+        if self.enable_metrics:
+            self.metrics_collector.increment_realtime_tokens(
+                prefill_compute_tokens=self.last_prefill_tokens,
+                prefill_cache_tokens=self.last_prefill_cache_tokens,
+                # The info is only available after `prepare_mlp_sync_batch`
+                dp_cooperation_info=batch.dp_cooperation_info if batch is not None else None,
+            )
 
     def log_decode_stats(
         self: Scheduler, can_run_cuda_graph: bool, running_batch: ScheduleBatch = None
