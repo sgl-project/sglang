@@ -3,7 +3,7 @@
 //! This module defines the interface for model-specific image processors
 //! and the common output format for preprocessed images.
 
-use std::collections::HashMap;
+use std::{borrow::Cow, collections::HashMap};
 
 use image::DynamicImage;
 use ndarray::{Array4, ArrayD};
@@ -206,11 +206,11 @@ impl PreprocessedImages {
         self.num_img_tokens.iter().sum()
     }
 
-    /// Get pixel values as a flat f32 slice (row-major order).
-    pub fn pixel_values_flat(&self) -> std::borrow::Cow<'_, [f32]> {
+    /// Get pixel values as a flat f32 slice without copying if possible.
+    pub fn pixel_values_flat(&self) -> Cow<'_, [f32]> {
         match self.pixel_values.as_slice() {
-            Some(slice) => std::borrow::Cow::Borrowed(slice),
-            None => std::borrow::Cow::Owned(self.pixel_values.iter().copied().collect()),
+            Some(slice) => Cow::Borrowed(slice),
+            None => Cow::Owned(self.pixel_values.iter().copied().collect()),
         }
     }
 
