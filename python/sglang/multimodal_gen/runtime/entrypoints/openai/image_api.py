@@ -28,7 +28,7 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
 )
 from sglang.multimodal_gen.runtime.entrypoints.utils import prepare_request
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
-from sglang.multimodal_gen.runtime.scheduler_client import scheduler_client
+from sglang.multimodal_gen.runtime.scheduler_client import async_scheduler_client
 from sglang.multimodal_gen.runtime.server_args import get_global_server_args
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.utils import shallow_asdict
@@ -56,7 +56,7 @@ def _build_sampling_params_from_request(
     size: Optional[str],
     output_format: Optional[str],
     background: Optional[str],
-    image_path: Optional[str] = None,
+    image_path: Optional[list[str]] = None,
     seed: Optional[int] = None,
     generator_device: Optional[str] = None,
     negative_prompt: Optional[str] = None,
@@ -121,8 +121,11 @@ async def generations(
         server_args=get_global_server_args(),
         sampling_params=sampling,
     )
+
     # Run synchronously for images and save to disk
-    save_file_path = await process_generation_batch(scheduler_client, batch)
+    save_file_path, result = await process_generation_batch(
+        async_scheduler_client, batch
+    )
 
     resp_format = (request.response_format or "b64_json").lower()
     b64_data = None
@@ -147,34 +150,38 @@ async def generations(
     )
 
     # 4. Return Response
-    if b64_data:
-        return ImageResponse(
-            data=[
+    if resp_format == "b64_json":
+        response_kwargs = {
+            "data": [
                 ImageResponseData(
                     b64_json=b64_data,
                     revised_prompt=request.prompt,
                 )
             ]
-        )
+        }
     elif resp_format == "url":
         if not cloud_url:
             raise HTTPException(
                 status_code=400,
                 detail="response_format='url' requires cloud storage to be configured.",
             )
-        return ImageResponse(
-            data=[
+        response_kwargs = {
+            "data": [
                 ImageResponseData(
                     url=cloud_url,
                     revised_prompt=request.prompt,
                 )
             ]
-        )
+        }
     else:
         # Return error, not supported
         raise HTTPException(
             status_code=400, detail=f"response_format={resp_format} is not supported"
         )
+
+    if result.peak_memory_mb and result.peak_memory_mb > 0:
+        response_kwargs["peak_memory_mb"] = result.peak_memory_mb
+    return ImageResponse(**response_kwargs)
 
 
 @router.post("/edits", response_model=ImageResponse)
@@ -244,7 +251,9 @@ async def edits(
     )
     batch = _build_req_from_sampling(sampling)
 
-    save_file_path = await process_generation_batch(scheduler_client, batch)
+    save_file_path, result = await process_generation_batch(
+        async_scheduler_client, batch
+    )
 
     resp_format = (response_format or "b64_json").lower()
     b64_data = None
@@ -271,19 +280,23 @@ async def edits(
     )
 
     # 4. Return Response
-    if b64_data:
-        return ImageResponse(
-            data=[ImageResponseData(b64_json=b64_data, revised_prompt=prompt)]
-        )
+    if (response_format or "b64_json").lower() == "b64_json":
+        response_kwargs = {
+            "data": [ImageResponseData(b64_json=b64_data, revised_prompt=prompt)]
+        }
     else:
-        if response_format == "url" and not cloud_url:
+        if not cloud_url:
             raise HTTPException(
                 status_code=400,
                 detail="response_format='url' requires cloud storage to be configured.",
             )
-        return ImageResponse(
-            data=[ImageResponseData(url=cloud_url, revised_prompt=prompt)]
-        )
+        response_kwargs = {
+            "data": [ImageResponseData(url=cloud_url, revised_prompt=prompt)]
+        }
+
+    if result.peak_memory_mb and result.peak_memory_mb > 0:
+        response_kwargs["peak_memory_mb"] = result.peak_memory_mb
+    return ImageResponse(**response_kwargs)
 
 
 @router.get("/{image_id}/content")

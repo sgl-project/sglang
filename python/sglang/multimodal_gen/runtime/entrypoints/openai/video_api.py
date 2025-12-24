@@ -116,23 +116,25 @@ def _video_job_from_sampling(
 
 
 async def _dispatch_job_async(job_id: str, batch: Req) -> None:
-    from sglang.multimodal_gen.runtime.scheduler_client import scheduler_client
+    from sglang.multimodal_gen.runtime.scheduler_client import async_scheduler_client
 
     try:
-        save_file_path = await process_generation_batch(scheduler_client, batch)
+        save_file_path, result = await process_generation_batch(
+            async_scheduler_client, batch
+        )
 
         cloud_url = await cloud_storage.upload_and_cleanup(save_file_path)
 
-        await VIDEO_STORE.update_fields(
-            job_id,
-            {
-                "status": "completed",
-                "progress": 100,
-                "completed_at": int(time.time()),
-                "url": cloud_url,
-                "file_path": save_file_path if not cloud_url else None,
-            },
-        )
+        update_fields = {
+            "status": "completed",
+            "progress": 100,
+            "completed_at": int(time.time()),
+            "url": cloud_url,
+            "file_path": save_file_path if not cloud_url else None,
+        }
+        if result.peak_memory_mb and result.peak_memory_mb > 0:
+            update_fields["peak_memory_mb"] = result.peak_memory_mb
+        await VIDEO_STORE.update_fields(job_id, update_fields)
     except Exception as e:
         logger.error(f"{e}")
         await VIDEO_STORE.update_fields(

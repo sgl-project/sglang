@@ -202,7 +202,7 @@ impl ToolParser for JsonParser {
 
             match parsed {
                 Ok(tools) => return Ok((normal_text, tools)),
-                Err(e) => tracing::warn!("parse_complete failed: {:?}", e),
+                Err(e) => tracing::debug!("parse_complete failed: {:?}", e),
             }
         }
 
