@@ -61,17 +61,6 @@ class RequestLogger:
         if not self.log_requests:
             return
 
-        # FIXME: This is a temporary fix to get the text from the input ids.
-        # We should remove this once we have a proper way.
-        if (
-            self.log_requests_level >= 2
-            and obj.text is None
-            and obj.input_ids is not None
-            and tokenizer is not None
-        ):
-            decoded = tokenizer.decode(obj.input_ids, skip_special_tokens=False)
-            obj.text = decoded
-
         max_length, skip_names, _ = self.metadata
         if self.log_requests_format == "json":
             log_data = {
@@ -84,6 +73,17 @@ class RequestLogger:
             logger.info(
                 f"Receive: obj={_dataclass_to_string_truncated(obj, max_length, skip_names=skip_names)}"
             )
+
+        # FIXME: This is a temporary fix to get the text from the input ids.
+        # We should remove this once we have a proper way.
+        if (
+            self.log_requests_level >= 2
+            and obj.text is None
+            and obj.input_ids is not None
+            and tokenizer is not None
+        ):
+            decoded = tokenizer.decode(obj.input_ids, skip_special_tokens=False)
+            obj.text = decoded
 
     def log_finished_request(
         self,
