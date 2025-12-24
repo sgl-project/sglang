@@ -1,17 +1,18 @@
 import unittest
+from typing import Dict, List, Tuple
 
 import requests
+from prometheus_client.parser import text_string_to_metric_families
 
+from sglang.srt.environ import envs
 from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
-    popen_launch_server,
     is_in_ci,
+    popen_launch_server,
 )
-
-from python.sglang.srt.environ import envs
 
 
 _MODEL_NAME = "Qwen/Qwen3-0.6B"
@@ -65,7 +66,59 @@ class TestEnableMetrics(CustomTestCase):
             return
 
         def _verify_metrics(metrics_content):
-            TODO
+            metrics = _parse_prometheus_metrics(metrics_content)
+
+            prefill_compute_tokens = _get_metric_value(
+                metrics,
+                "sglang:realtime_tokens_total",
+                {"mode": "prefill_compute"},
+            )
+            decode_tokens = _get_metric_value(
+                metrics,
+                "sglang:realtime_tokens_total",
+                {"mode": "decode"},
+            )
+            self.assertGreater(prefill_compute_tokens, 0)
+            self.assertGreater(decode_tokens, 0)
+
+            forward_prefill_seconds = _get_metric_value(
+                metrics,
+                "sglang:gpu_execution_seconds_total",
+                {"category": "forward_prefill"},
+            )
+            forward_decode_seconds = _get_metric_value(
+                metrics,
+                "sglang:gpu_execution_seconds_total",
+                {"category": "forward_decode"},
+            )
+            self.assertGreater(forward_prefill_seconds, 0)
+            self.assertGreater(forward_decode_seconds, 0)
+
+            dp_prefill_compute_tokens = _get_metric_value(
+                metrics,
+                "sglang:dp_cooperation_realtime_tokens_total",
+                {"mode": "prefill_compute"},
+            )
+            dp_decode_tokens = _get_metric_value(
+                metrics,
+                "sglang:dp_cooperation_realtime_tokens_total",
+                {"mode": "decode"},
+            )
+            self.assertGreater(dp_prefill_compute_tokens, 0)
+            self.assertGreater(dp_decode_tokens, 0)
+
+            dp_forward_prefill_seconds = _get_metric_value(
+                metrics,
+                "sglang:dp_cooperation_gpu_execution_seconds_total",
+                {"category": "forward_prefill"},
+            )
+            dp_forward_decode_seconds = _get_metric_value(
+                metrics,
+                "sglang:dp_cooperation_gpu_execution_seconds_total",
+                {"category": "forward_decode"},
+            )
+            self.assertGreater(dp_forward_prefill_seconds, 0)
+            self.assertGreater(dp_forward_decode_seconds, 0)
 
         self._execute_core(
             other_args=["--tp", "2", "--dp", "2", "--enable-dp-attention"],
@@ -114,6 +167,39 @@ class TestEnableMetrics(CustomTestCase):
             verify_metrics(metrics_content)
         finally:
             kill_process_tree(process.pid)
+
+
+def _parse_prometheus_metrics(
+    metrics_text: str,
+) -> Dict[str, List[Tuple[Dict[str, str], float]]]:
+    """Parse Prometheus metrics text into a dictionary.
+
+    Returns:
+        Dict mapping metric_name -> list of (labels_dict, value) tuples
+    """
+    result = {}
+    for family in text_string_to_metric_families(metrics_text):
+        for sample in family.samples:
+            metric_name = sample.name
+            if metric_name not in result:
+                result[metric_name] = []
+            result[metric_name].append((dict(sample.labels), sample.value))
+    return result
+
+
+def _get_metric_value(
+    metrics: Dict[str, List[Tuple[Dict[str, str], float]]],
+    metric_name: str,
+    labels: Dict[str, str],
+) -> float:
+    """Get metric value matching the given labels."""
+    if metric_name not in metrics:
+        raise KeyError(f"Metric {metric_name} not found")
+    for sample_labels, value in metrics[metric_name]:
+        if all(sample_labels.get(k) == v for k, v in labels.items()):
+            return value
+    raise KeyError(f"Metric {metric_name} with labels {labels} not found")
+
 
 
 if __name__ == "__main__":
