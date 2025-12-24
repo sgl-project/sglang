@@ -12,6 +12,7 @@
 # limitations under the License.
 # ==============================================================================
 """Utilities for Prometheus Metrics Collection."""
+import dataclasses
 import logging
 import os
 import time
@@ -238,6 +239,15 @@ class SchedulerStats:
 
     # CUDA graph
     is_cuda_graph: float = 0.0
+
+
+@dataclass
+class DPCooperationInfo:
+    num_prefill_ranks: int
+    num_decode_ranks: int
+
+    def to_labels(self):
+        return dataclasses.asdict(self)
 
 
 class SchedulerMetricsCollector:
@@ -730,7 +740,7 @@ class SchedulerMetricsCollector:
 
     def increment_realtime_tokens(
         self,
-        dp_cooperation_info,
+        dp_cooperation_info: DPCooperationInfo,
         prefill_compute_tokens=0,
         prefill_cache_tokens=0,
         decode_tokens=0,
@@ -745,14 +755,14 @@ class SchedulerMetricsCollector:
                 self.dp_cooperation_realtime_tokens_total.labels(
                     **self.labels,
                     mode=mode,
-                    **dp_cooperation_info,
+                    **dp_cooperation_info.to_labels(),
                 ).inc(delta)
 
     def increment_gpu_execution_seconds(
         self,
         category: str,
         t: float,
-        dp_cooperation_info,
+        dp_cooperation_info: DPCooperationInfo,
     ):
         logger.debug(f"GPU execution seconds: {category=} {t=:.3f}")
         self.gpu_execution_seconds_total.labels(**self.labels, category=category).inc(t)
@@ -760,7 +770,7 @@ class SchedulerMetricsCollector:
             self.dp_cooperation_gpu_execution_seconds_total.labels(
                 **self.labels,
                 category=category,
-                **dp_cooperation_info,
+                **dp_cooperation_info.to_labels(),
             ).inc(t)
 
     def log_stats(self, stats: SchedulerStats) -> None:
