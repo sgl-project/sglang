@@ -31,6 +31,7 @@ def run_sgl_diffusion_webui(server_args: ServerArgs):
     def gradio_generate(
         prompt,
         negative_prompt,
+        reference_image_paths_str,
         seed,
         num_frames,
         frames_per_second,
@@ -45,9 +46,15 @@ def run_sgl_diffusion_webui(server_args: ServerArgs):
         So we use global variable sampling_params_kwargs to avoid pass this param, because gradio does not support this.
         return [ np.ndarray, None ] | [None, np.ndarray]
         """
+        if reference_image_paths_str is not "" and reference_image_paths_str is not None:
+            image_path = [path.strip() for path in reference_image_paths_str.split(",")]
+        else:
+            image_path = None
+    
         sampling_params_kwargs = dict(
             prompt=prompt,
             negative_prompt=negative_prompt,
+            image_path=image_path,
             seed=seed,
             num_frames=num_frames,
             fps=frames_per_second,
@@ -104,6 +111,7 @@ def run_sgl_diffusion_webui(server_args: ServerArgs):
                 frames_per_second = gr.Slider(
                     minimum=4, maximum=60, value=16, step=1, label="frames_per_second"
                 )
+                reference_image_paths_str = gr.Textbox(label="reference images", placeholder="Examples: 'image1.png, image2.png' or 'https://example.com/image1.png, https://example.com/image2.png'")
                 width = gr.Number(label="width", precision=0, value=720)
                 height = gr.Number(label="height", precision=0, value=480)
                 num_inference_steps = gr.Slider(
@@ -127,6 +135,7 @@ def run_sgl_diffusion_webui(server_args: ServerArgs):
             inputs=[
                 prompt,
                 negative_prompt,
+                reference_image_paths_str,
                 seed,
                 num_frames,
                 frames_per_second,
