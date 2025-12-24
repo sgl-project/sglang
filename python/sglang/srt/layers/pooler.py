@@ -9,7 +9,6 @@ import torch
 import torch.nn as nn
 from transformers import PretrainedConfig
 
-from sglang.srt.layers.activation import get_cross_encoder_activation_function
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
@@ -96,6 +95,11 @@ class CrossEncodingPooler(nn.Module):
         super().__init__()
         self.classifier = classifier
         self.pooler = pooler
+
+        # Lazy import to avoid strict hardware dependency at module load time
+        # This allows importing pooler.py on CPU-only environments without vllm
+        from sglang.srt.layers.activation import get_cross_encoder_activation_function
+
         self.default_activation_function = get_cross_encoder_activation_function(config)
 
     def forward(
