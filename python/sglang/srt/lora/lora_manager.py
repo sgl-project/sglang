@@ -228,11 +228,9 @@ class LoRAManager:
         # counting the number of pinned LoRA adapters in the batch.
         pinned_loras_in_batch = 0
         for lora_id in active_lora_ids:
-                lora_ref = self.lora_refs.get(lora_id)
-                assert (
-                    lora_ref is not None
-                ), f"LoRA ID {lora_id} not found in lora_refs."
-                pinned_loras_in_batch += int(lora_ref.pinned)
+            lora_ref = self.lora_refs.get(lora_id)
+            assert lora_ref is not None, f"LoRA ID {lora_id} not found in lora_refs."
+            pinned_loras_in_batch += int(lora_ref.pinned)
 
         assert pinned_loras_in_batch <= self.num_pinned_loras, (
             f"Number of pinned LoRA adapters in the batch ({pinned_loras_in_batch}) exceeds the total number of pinned adapters "

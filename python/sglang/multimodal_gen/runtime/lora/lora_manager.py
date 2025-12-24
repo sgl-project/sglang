@@ -8,19 +8,22 @@ in a single batch, similar to SRT's multi-LoRA batching for LLMs.
 
 from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Set, Tuple, TypedDict
+from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple, TypedDict
 
 import torch
 import torch.distributed as dist
 from safetensors.torch import load_file
 
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
-from sglang.multimodal_gen.runtime.loader.utils import get_param_names_mapping
 from sglang.multimodal_gen.runtime.layers.lora.linear import BaseLayerWithLoRA
+from sglang.multimodal_gen.runtime.loader.utils import get_param_names_mapping
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import maybe_download_lora
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
+
+if TYPE_CHECKING:
+    from sglang.multimodal_gen.runtime.pipelines_core import Req
 
 
 class LoRAAdapterConfig(TypedDict):
@@ -259,7 +262,10 @@ class DiffusionLoRAManager:
         lora_adapter_configs: Dict[str, LoRAAdapterConfig] = {}
         for nickname in active_loras:
             adapter = self.lora_adapters[nickname]
-            lora_adapter_configs[nickname] = {"alpha": adapter.alpha, "rank": adapter.rank}
+            lora_adapter_configs[nickname] = {
+                "alpha": adapter.alpha,
+                "rank": adapter.rank,
+            }
 
         self.request_lora_map = request_lora_map
         return batch_lora_weights, lora_nickname_to_index, lora_adapter_configs
@@ -272,5 +278,3 @@ class DiffusionLoRAManager:
             del self.lora_adapters[lora_nickname]
             rank = dist.get_rank() if dist.is_initialized() else 0
             logger.info("Rank %d: Unloaded LoRA adapter: %s", rank, lora_nickname)
-
-

@@ -79,8 +79,12 @@ class BaseLayerWithLoRA(nn.Module):
         self.lora_B = None
 
         # Multi-LoRA support
-        self.lora_weights_pool: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}  # nickname -> (lora_A, lora_B)
-        self.lora_adapter_configs: dict[str, LoRAAdapterConfig] = {}  # nickname -> {alpha, rank} for per-adapter config
+        self.lora_weights_pool: dict[str, tuple[torch.Tensor, torch.Tensor]] = (
+            {}
+        )  # nickname -> (lora_A, lora_B)
+        self.lora_adapter_configs: dict[str, LoRAAdapterConfig] = (
+            {}
+        )  # nickname -> {alpha, rank} for per-adapter config
         self.active_lora_indices: torch.Tensor | None = None  # Per-sample LoRA index
         self.lora_nickname_to_index: dict[str, int] = {}  # Mapping nickname to index
         self.max_loras: int = 8
@@ -202,7 +206,11 @@ class BaseLayerWithLoRA(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         out, output_bias = self.base_layer(x)
 
-        if self.use_multi_lora and self.active_lora_indices is not None and not self.disable_lora:
+        if (
+            self.use_multi_lora
+            and self.active_lora_indices is not None
+            and not self.disable_lora
+        ):
             out, output_bias = self._apply_multi_lora(x, out, output_bias)
             return out, output_bias
 

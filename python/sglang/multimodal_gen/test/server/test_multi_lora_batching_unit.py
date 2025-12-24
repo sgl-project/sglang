@@ -7,7 +7,10 @@ from dataclasses import dataclass
 import torch
 
 from sglang.multimodal_gen.runtime.layers.lora.linear import BaseLayerWithLoRA
-from sglang.multimodal_gen.runtime.lora.lora_manager import DiffusionLoRAManager, LoRAAdapter
+from sglang.multimodal_gen.runtime.lora.lora_manager import (
+    DiffusionLoRAManager,
+    LoRAAdapter,
+)
 
 
 class _DummyBaseLayer(torch.nn.Module):
@@ -143,5 +146,3 @@ def test_diffusion_lora_manager_prepare_lora_batch_raises_when_too_many_loras():
         assert False, "Expected ValueError for too many LoRAs in batch"
     except ValueError as e:
         assert "Too many LoRAs in batch" in str(e)
-
-

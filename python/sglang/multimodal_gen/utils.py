@@ -27,7 +27,6 @@ import torch
 import torchvision
 import yaml
 from einops import rearrange
-from remote_pdb import RemotePdb
 from torch.distributed.fsdp import MixedPrecisionPolicy
 
 import sglang.multimodal_gen.envs as envs
@@ -37,6 +36,11 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import (
 )
 
 logger = init_logger(__name__)
+
+try:
+    from remote_pdb import RemotePdb
+except ModuleNotFoundError:  # optional dependency
+    RemotePdb = None  # type: ignore[assignment]
 
 T = TypeVar("T")
 
@@ -550,6 +554,10 @@ class TypeBasedDispatcher:
 
 # For non-torch.distributed debugging
 def remote_breakpoint() -> None:
+    if RemotePdb is None:
+        raise ModuleNotFoundError(
+            "remote-pdb is required for remote_breakpoint(); install it via `pip install remote-pdb`."
+        )
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         s.bind(("localhost", 0))  # Let the OS pick an ephemeral port.

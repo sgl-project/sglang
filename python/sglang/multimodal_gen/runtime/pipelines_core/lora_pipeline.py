@@ -4,7 +4,7 @@
 import os
 from collections import defaultdict
 from collections.abc import Hashable
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.distributed as dist
@@ -32,6 +32,9 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 logger = init_logger(__name__)
+
+if TYPE_CHECKING:
+    from sglang.multimodal_gen.runtime.pipelines_core import Req
 
 
 class LoRAPipeline(ComposedPipelineBase):
