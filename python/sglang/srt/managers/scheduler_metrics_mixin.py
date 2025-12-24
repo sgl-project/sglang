@@ -88,7 +88,8 @@ class SchedulerMetricsMixin:
 
             if ENABLE_METRICS_DEVICE_TIMER:
                 self.forward_pass_device_timer = DeviceTimer(
-                    reporter=self.metrics_collector.increment_gpu_execution_seconds
+                    reporter=lambda category, t: self.metrics_collector.increment_gpu_execution_seconds(
+                        category, t, dp_cooperation_info=TODO)
                 )
 
         if self.enable_kv_cache_events:
@@ -234,6 +235,7 @@ class SchedulerMetricsMixin:
             self.metrics_collector.increment_realtime_tokens(
                 prefill_compute_tokens=adder.log_input_tokens,
                 prefill_cache_tokens=adder.log_hit_tokens,
+                dp_cooperation_info=TODO,
             )
 
             # Others
@@ -389,7 +391,8 @@ class SchedulerMetricsMixin:
                 )
 
             self.metrics_collector.increment_realtime_tokens(
-                decode_tokens=last_num_generated_tokens
+                decode_tokens=last_num_generated_tokens,
+                dp_cooperation_info=TODO,
             )
 
             # Others
