@@ -244,19 +244,14 @@ class SchedulerStats:
 
 @dataclass
 class DPCooperationInfo:
+    # Users can derive that, except for cases with idle, num_decode_ranks=world_size-num_prefill_ranks
+    # We do not provide `num_decode_ranks` to avoid cardinality explosion.
     num_prefill_ranks: int
-    num_decode_ranks: int
 
-    # TODO handle more modes (e.g. speculative decoding)
     @staticmethod
     def create(forward_modes: List[int]):
-        counter = {}
-        for mode in forward_modes:
-            counter[mode] = counter.get(mode, 0) + 1
-
         return DPCooperationInfo(
-            num_prefill_ranks=counter.get(ForwardMode.PREFILL.value, 0),
-            num_decode_ranks=counter.get(ForwardMode.DECODE.value, 0),
+            num_prefill_ranks=sum(1 for mode in forward_modes if mode == ForwardMode.PREFILL.value),
         )
 
     def to_labels(self):
@@ -707,13 +702,13 @@ class SchedulerMetricsCollector:
             name="sglang:dp_cooperation_realtime_tokens_total",
             documentation="Total number of tokens processed with labels about DP cooperation.",
             labelnames=list(labels.keys())
-            + ["mode", "num_prefill_ranks", "num_decode_ranks"],
+            + ["mode", "num_prefill_ranks"],
         )
         self.dp_cooperation_gpu_execution_seconds_total = Counter(
             name="sglang:dp_cooperation_gpu_execution_seconds_total",
             documentation="Total time that GPU is busy executing a workload with labels about DP cooperation.",
             labelnames=list(labels.keys())
-            + ["category", "num_prefill_ranks", "num_decode_ranks"],
+            + ["category", "num_prefill_ranks"],
         )
 
     def _log_gauge(self, gauge, data: Union[int, float]) -> None:
