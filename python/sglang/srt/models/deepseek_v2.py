@@ -68,7 +68,6 @@ from sglang.srt.layers.attention.nsa.utils import (
     prepare_input_dp_with_cp_dsa,
 )
 from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
-from sglang.srt.layers.attention.trtllm_mla_backend import _concat_mla_absorb_q_general
 from sglang.srt.layers.attention.utils import concat_and_cast_mha_k_triton
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
@@ -1835,11 +1834,12 @@ class DeepseekV2AttentionMLA(nn.Module):
             and forward_batch.attn_backend.data_type == torch.float8_e4m3fn
         )
 
-    def rebuild_cp_kv_cache(self, forward_batch, k_nope, k_pe):
+    def rebuild_cp_kv_cache(self, latent_cache, forward_batch, k_nope, k_pe):
         # support allgather+rerrange
-        latent_cache = _concat_mla_absorb_q_general(k_nope, k_pe).squeeze(1)
+        latent_cache[..., : self.kv_lora_rank] = k_nope.squeeze(1)
+        latent_cache[..., self.kv_lora_rank :] = k_pe.squeeze(1)
         latent_cache_output = cp_all_gather_rerange_output(
-            latent_cache,
+            latent_cache.contiguous(),
             self.cp_size,
             forward_batch,
             torch.cuda.current_stream(),
@@ -2008,7 +2008,9 @@ class DeepseekV2AttentionMLA(nn.Module):
 
         if nsa_use_prefill_cp(forward_batch):
             # support allgather+rerrange
-            k_nope, k_pe = self.rebuild_cp_kv_cache(forward_batch, k_nope, k_pe)
+            k_nope, k_pe = self.rebuild_cp_kv_cache(
+                latent_cache, forward_batch, k_nope, k_pe
+            )
         topk_indices = None
         if q_lora is not None:
             topk_indices = self.indexer(

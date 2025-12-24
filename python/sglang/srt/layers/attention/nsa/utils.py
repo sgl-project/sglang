@@ -73,7 +73,18 @@ def can_nsa_prefill_cp_continuous_split(forward_batch: "ForwardBatch"):
 
 
 def nsa_cp_continuous_split_data(input_: Union[torch.Tensor, List]):
-    # Split the tokens evenly according to the rule of token_idx % cp_size.
+    """
+    # for continuous-split, split the tokens evenly according to the rule of token_idx % cp_size.
+    |   +-----------before split------------+|
+    | token0, token1, token2, token3, token4, token5, token6, token7, ...
+    |
+    |   +--------------result-------------------+
+    | dp_atten_tp0: token0, token4, token8, token12, token16, ... |
+    | dp_atten_tp1: token1, token5, token9, token13, token17, ... |
+    | dp_atten_tp2: token2, token6, token10, token14, token18, ... |
+    | dp_atten_tp3: token3, token7, token11, token15, token19, ... |
+    |   +-------------------------+
+    """
     cp_size = get_attention_tp_size()
     cp_rank = get_attention_tp_rank()
     if isinstance(input_, (tuple, list)) or len(input_) % cp_size != 0:
@@ -249,6 +260,7 @@ def cp_attn_tp_all_gather_reorganazied_into_tensor(
 
 def cp_all_gather_rerange_output(input_tensor, cp_size, forward_batch, stream):
     """
+    # for in-seq-split
     |   +-----------before allgather------------+|
     |   | dp_atten_tp0: block0, block7 |
     |   | dp_atten_tp1: block1, block6 |
@@ -260,6 +272,17 @@ def cp_all_gather_rerange_output(input_tensor, cp_size, forward_batch, stream):
     |
     |   +--------------result-------------------+
     | block0 | block1 | block2 | block3 | block4 | block5 | block6 | block7 |
+    |   +-------------------------+
+
+    # for continuous-split
+    |   +-----------before allgather------------+|
+    | dp_atten_tp0: token0, token4, token8, token12, token16, ... |
+    | dp_atten_tp1: token1, token5, token9, token13, token17, ... |
+    | dp_atten_tp2: token2, token6, token10, token14, token18, ... |
+    | dp_atten_tp3: token3, token7, token11, token15, token19, ... |
+    |
+    |   +--------------result-------------------+
+    | token0, token1, token2, token3, token4, token5, token6, token7, ...
     |   +-------------------------+
     """
     if is_nsa_prefill_cp_continuous_split():
