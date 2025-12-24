@@ -183,7 +183,8 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         self.server_args = server_args
         self.enable_metrics = server_args.enable_metrics
         self.request_logger = RequestLogger(
-            server_args.log_requests, server_args.log_requests_level
+            log_requests=server_args.log_requests,
+            log_requests_level=server_args.log_requests_level,
         )
         self.preferred_sampling_params = server_args.preferred_sampling_params
         self.crash_dump_folder = server_args.crash_dump_folder
