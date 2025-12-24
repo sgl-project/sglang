@@ -308,6 +308,10 @@ impl<B> OnRequest<B> for RequestLogger {
             span.record("request_id", request_id.0.as_str());
         }
 
+        let method = method_to_static_str(request.method().as_str());
+        let path = normalize_path_for_metrics(request.uri().path());
+        Metrics::record_http_request(method, &path);
+
         // Log the request start
         info!(
             target: "sgl_model_gateway::request",
@@ -663,25 +667,10 @@ where
             let response = result?;
 
             let duration = start.elapsed();
-            let status_class = status_to_class(response.status().as_u16());
-
-            Metrics::record_http_request(method, &path, status_class);
             Metrics::record_http_duration(method, &path, duration);
 
             Ok(response)
         })
-    }
-}
-
-#[inline]
-fn status_to_class(status: u16) -> &'static str {
-    match status {
-        100..=199 => "1xx",
-        200..=299 => "2xx",
-        300..=399 => "3xx",
-        400..=499 => "4xx",
-        500..=599 => "5xx",
-        _ => "unknown",
     }
 }
 

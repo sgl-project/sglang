@@ -18,7 +18,6 @@ import argparse
 import asyncio
 import builtins
 import ctypes
-import dataclasses
 import functools
 import importlib
 import inspect
@@ -66,7 +65,6 @@ from typing import (
     Optional,
     Protocol,
     Sequence,
-    Set,
     Tuple,
     TypeVar,
     Union,
@@ -2078,53 +2076,6 @@ def set_gpu_proc_affinity(
     logger.info(f"Process {pid} gpu_id {gpu_id} is running on CPUs: {p.cpu_affinity()}")
 
 
-@lru_cache(maxsize=2)
-def disable_request_logging() -> bool:
-    return get_bool_env_var("SGLANG_DISABLE_REQUEST_LOGGING")
-
-
-def dataclass_to_string_truncated(
-    data, max_length=2048, skip_names: Optional[Set[str]] = None
-):
-    if skip_names is None:
-        skip_names = set()
-    if isinstance(data, str):
-        if len(data) > max_length:
-            half_length = max_length // 2
-            return f"{repr(data[:half_length])} ... {repr(data[-half_length:])}"
-        else:
-            return f"{repr(data)}"
-    elif isinstance(data, (list, tuple)):
-        if len(data) > max_length:
-            half_length = max_length // 2
-            return str(data[:half_length]) + " ... " + str(data[-half_length:])
-        else:
-            return str(data)
-    elif isinstance(data, dict):
-        return (
-            "{"
-            + ", ".join(
-                f"'{k}': {dataclass_to_string_truncated(v, max_length)}"
-                for k, v in data.items()
-                if k not in skip_names
-            )
-            + "}"
-        )
-    elif dataclasses.is_dataclass(data):
-        fields = dataclasses.fields(data)
-        return (
-            f"{data.__class__.__name__}("
-            + ", ".join(
-                f"{f.name}={dataclass_to_string_truncated(getattr(data, f.name), max_length)}"
-                for f in fields
-                if f.name not in skip_names
-            )
-            + ")"
-        )
-    else:
-        return str(data)
-
-
 def permute_weight(x: torch.Tensor) -> torch.Tensor:
     b_ = x.shape[0]
     n_ = x.shape[1]
@@ -3461,7 +3412,7 @@ def check_cuda_result(raw_output):
     return results
 
 
-def get_physical_device_id(pytorch_device_id: int) -> int:
+def get_physical_device_id() -> int:
     """
     Convert PyTorch logical device ID to physical device ID.
     """

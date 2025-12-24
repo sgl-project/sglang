@@ -716,6 +716,7 @@ class Scheduler(
         self.last_batch: Optional[ScheduleBatch] = None
         self.forward_ct = 0
         self.last_prefill_tokens = 0
+        self.last_prefill_cache_tokens = 0
         self.return_health_check_ct = 0
         self.num_retracted_reqs: int = 0
         self.num_paused_reqs: int = 0
@@ -955,6 +956,7 @@ class Scheduler(
                 hf_config=self.model_config.hf_config,
                 tp_rank=self.tp_rank,
                 pp_rank=self.pp_rank,
+                tp_group=self.tp_group,
             )
 
     def init_overlap(self):
@@ -1239,6 +1241,14 @@ class Scheduler(
                 src=self.tp_group.ranks[0],
             )
 
+        # Process MM requests under EPD-disaggregation mode
+        if (
+            self.pp_rank == 0
+            and self.server_args.language_only
+            and self.server_args.encoder_transfer_backend == "zmq_to_scheduler"
+        ):
+            recv_reqs = self.mm_receiver.process_waiting_requests(recv_reqs)
+
         if self.enable_trace:
             for req in recv_reqs:
                 if isinstance(
@@ -1279,12 +1289,6 @@ class Scheduler(
         return work_reqs, control_reqs
 
     def process_input_requests(self, recv_reqs: List):
-        # Process MM requests under EPD-disaggregation mode
-        if (
-            self.server_args.language_only
-            and self.server_args.encoder_transfer_backend == "zmq_to_scheduler"
-        ):
-            recv_reqs = self.mm_receiver.process_waiting_requests(recv_reqs)
 
         for recv_req in recv_reqs:
             # If it is a health check generation request and there are running requests, ignore it.
@@ -1707,9 +1711,14 @@ class Scheduler(
         if recv_req.image_inputs is not None:
             image_inputs = self._get_multimodal_inputs(recv_req.image_inputs)
             # Expand a single image token into multiple dummy tokens for receiving image embeddings
-            req.origin_input_ids = self.pad_input_ids_func(
-                req.origin_input_ids, image_inputs
-            )
+            # The `pad_input_ids_func` is model-specific and may be None for
+            # embedding models or models not requiring special padding.
+            # If None, `req.origin_input_ids` is expected to be correctly populated already.
+            if self.pad_input_ids_func:
+                req.origin_input_ids = self.pad_input_ids_func(
+                    req.origin_input_ids, image_inputs
+                )
+
             req.extend_image_inputs(image_inputs)
 
             if len(req.origin_input_ids) >= self.max_req_input_len:
@@ -1821,6 +1830,8 @@ class Scheduler(
 
         if ret:
             trace_event_batch("schedule", ret.reqs)
+
+        self.log_prefill_stats_late(ret)
 
         return ret
 
@@ -2052,13 +2063,19 @@ class Scheduler(
             return batch
 
         # Check if decode out of memory
-        if not batch.check_decode_mem(self.decode_mem_cache_buf_multiplier) or (
-            TEST_RETRACT and self.forward_ct % TEST_RETRACT_INTERVAL == 0
-        ):
+        if (
+            kv_full_retract_flag := not batch.check_decode_mem(
+                self.decode_mem_cache_buf_multiplier
+            )
+        ) or (TEST_RETRACT and self.forward_ct % TEST_RETRACT_INTERVAL == 0):
+            old_available_tokens = self.token_to_kv_pool_allocator.available_size()
             old_ratio = self.new_token_ratio
             retracted_reqs, new_token_ratio, reqs_to_abort = batch.retract_decode(
                 self.server_args, self.decode_mem_cache_buf_multiplier
             )
+            new_available_tokens = self.token_to_kv_pool_allocator.available_size()
+            new_token_gained = new_available_tokens - old_available_tokens
+
             self.num_retracted_reqs = len(retracted_reqs)
             if self.enable_metrics and len(retracted_reqs) > 0:
                 self.metrics_collector.increment_retracted_reqs(
@@ -2077,11 +2094,17 @@ class Scheduler(
                     AbortReq(abort_message=abort_reason.message, rid=req.rid), req
                 )
 
-            logger.info(
+            msg_prefix = (
                 "KV cache pool is full. Retract requests. "
-                f"#retracted_reqs: {len(retracted_reqs)}, "
-                f"#new_token_ratio: {old_ratio:.4f} -> {new_token_ratio:.4f}"
+                if kv_full_retract_flag
+                else "Testing retraction. "
             )
+            msg_details = f"#retracted_reqs: {len(retracted_reqs)}, #new_tokens_gained: {new_token_gained}"
+            if kv_full_retract_flag:
+                msg_details += (
+                    f", #new_token_ratio: {old_ratio:.4f} -> {new_token_ratio:.4f}"
+                )
+            logger.warning(msg_prefix + msg_details)
 
             for req in retracted_reqs:
                 self._add_request_to_queue(req, is_retracted=True)
