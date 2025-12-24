@@ -94,6 +94,17 @@ class SchedulerMetricsMixin:
         if self.enable_kv_cache_events:
             self.init_kv_events(self.server_args.kv_events_config)
 
+        # reocord iter time
+        self.iter_start_time = 0
+        self.iter_forward_start_time = 0
+        self.iter_forward_finish_time = 0
+        self.iter_finish_time = 0
+
+        if self.enable_metrics:
+            self.stats.num_max_batchs = server_args.max_running_requests \
+                if server_args.max_running_requests is not None else 0
+            self.stats.max_total_num_tokens = self.max_total_num_tokens
+
     def init_kv_events(self: Scheduler, kv_events_config: Optional[str]):
         if self.enable_kv_cache_events:
             self.kv_event_publisher = EventPublisherFactory.create(
@@ -124,6 +135,11 @@ class SchedulerMetricsMixin:
         self.last_prefill_stats_tic = time.perf_counter()
         self.last_input_throughput = self.last_prefill_tokens / gap_latency
         self.last_prefill_tokens = adder.log_input_tokens
+
+        # In PREFILL disaggregation, `self.running_batch` is decode-only;
+        # use the current prefill batch size to compute running_bs.
+        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            running_bs = len(can_run_list)
 
         # TODO: generalize this for various memory pools
         if self.is_hybrid_swa:
@@ -190,6 +206,8 @@ class SchedulerMetricsMixin:
             cache_hit_rate = (
                 adder.log_hit_tokens / total_tokens if total_tokens > 0 else 0.0
             )
+            cache_hit = adder.log_hit_tokens
+            cache_all = total_tokens
 
             self.stats.num_running_reqs = running_bs
             self.stats.num_running_reqs_offline_batch = running_bs_offline_batch
@@ -204,6 +222,8 @@ class SchedulerMetricsMixin:
             self.stats.cache_hit_rate = cache_hit_rate
 
             self.stats.max_total_num_tokens = self.max_total_num_tokens
+            self.stats.cache_hit = cache_hit
+            self.stats.cache_all = cache_all
 
             # Retract
             self.stats.num_retracted_reqs = self.num_retracted_reqs
@@ -242,6 +262,58 @@ class SchedulerMetricsMixin:
             self._emit_kv_metrics()
         self._publish_kv_events()
 
+    def log_prefill_dp_balance_stats(self: Scheduler, batch: ScheduleBatch) -> None:
+        """Log DP-level load-balancing metrics for the prefill stage."""
+        tokens_list = None
+        total_dp = None
+        total_tokens = None
+        dp_balance = 0.0
+        idle_batch_ratio = 1.0
+        prefill_chunk_util = 0.0
+        
+        if batch is not None and self.dp_rank == 0 and self.chunked_prefill_size is not None:
+            # Prepare per-DP worker token counts
+            tokens_list = batch.dp_global_num_tokens_for_metric
+
+            if tokens_list:
+                total_dp = len(tokens_list)
+                total_tokens = sum(tokens_list)
+                token_sorted = sorted(tokens_list)
+
+                # Compute idle ratio and utilization metrics in a unified way
+                idle_batch_ratio = tokens_list.count(0) / total_dp
+                prefill_chunk_util = total_tokens / total_dp / self.chunked_prefill_size
+
+                if total_dp > 1 and total_tokens > 0:
+                    # Compute Gini coefficient and DP balance in the general case
+                    acc = 0
+                    for i, val in enumerate(token_sorted, start=1):
+                        acc += (2 * i - total_dp - 1) * val
+                    gini = acc / (total_dp * total_tokens)
+                    # Derive DP balance score from Gini coefficient
+                    dp_balance = 1.0 - gini
+                else:
+                    # When there is only one DP or no tokens, use a fixed DP balance value
+                    # while keeping idle_batch_ratio and prefill_chunk_util as computed above
+                    dp_balance = 1.0 if total_dp == 1 else 0.0
+
+            logger.info(
+                f"Prefill tokens_list: {tokens_list}, "
+                f"#total_dp: {total_dp}, "
+                f"total_tokens: {total_tokens}, "
+                f"#dp_balance: {dp_balance:.2f}, "
+                f"#idle_batch_ratio: {idle_batch_ratio:.2f}, "
+                f"#prefill_chunk_util: {prefill_chunk_util:.2f}, "
+            )
+
+        if self.enable_metrics:
+            # DP balance
+            self.stats.dp_balance = dp_balance
+            self.stats.idle_batch_ratio = idle_batch_ratio
+            self.stats.prefill_chunk_util = prefill_chunk_util
+            # Others
+            self.metrics_collector.log_stats(self.stats)
+
     def log_decode_stats(
         self: Scheduler, can_run_cuda_graph: bool, running_batch: ScheduleBatch = None
     ):
@@ -255,6 +327,57 @@ class SchedulerMetricsMixin:
         self.num_generated_tokens = 0
         num_running_reqs = len(batch.reqs)
         num_running_reqs_offline_batch = 0
+
+        self.iter_finish_time = time.time()
+        generation_time = self.iter_finish_time - self.iter_start_time
+        run_batch_time = self.iter_forward_finish_time - self.iter_forward_start_time
+        iter_token_process_time = generation_time - run_batch_time
+
+        # Add metrics related to DP balancing
+        tokens_list = None
+        total_dp = None
+        total_tokens = None
+        dp_balance = 0.0
+        idle_batch_ratio = 1.0
+        decode_bs_util = 0.0
+        # DP all_gather latency
+        all_gather_latency_us = 0.0
+
+        if batch is not None and self.dp_rank == 0:
+            # Prepare per-DP worker token counts
+            tokens_list = batch.dp_global_num_tokens_for_metric
+            all_gather_latency_us = batch.all_gather_latency
+
+            if tokens_list:
+                total_dp = len(tokens_list)
+                total_tokens = sum(tokens_list)
+                token_sorted = sorted(tokens_list)
+
+                # Compute idle ratio and utilization metrics in a unified way.
+                idle_batch_ratio = tokens_list.count(0) / total_dp
+                decode_bs_util = total_tokens / total_dp / self.max_running_requests
+
+                if total_dp > 1 and total_tokens > 0:
+                    # Compute Gini coefficient and DP balance in the general case.
+                    acc = 0
+                    for i, val in enumerate(token_sorted, start=1):
+                        acc += (2 * i - total_dp - 1) * val
+                    gini = acc / (total_dp * total_tokens)
+                    # Derive DP balance score from Gini coefficient
+                    dp_balance = 1.0 - gini
+                else:
+                    # When there is only one DP or no tokens, use a fixed DP balance value
+                    # while keeping idle_batch_ratio and decode_bs_util as computed above.
+                    dp_balance = 1.0 if total_dp == 1 else 0.0
+
+            logger.info(
+                f"Decode tokens_list: {tokens_list}, "
+                f"#total_dp: {total_dp}, "
+                f"total_tokens: {total_tokens}, "
+                f"#dp_balance: {dp_balance:.2f}, "
+                f"#idle_batch_ratio: {idle_batch_ratio:.2f}, "
+                f"#decode_bs_util: {decode_bs_util:.2f}, "
+            )
 
         # TODO: generalize this for various memory pools
         if self.is_hybrid_swa:
@@ -362,6 +485,19 @@ class SchedulerMetricsMixin:
             self.stats.cache_hit_rate = cache_hit_rate
 
             self.stats.max_total_num_tokens = self.max_total_num_tokens
+
+            # Run batch
+            self.stats.generation_time = generation_time
+            self.stats.run_batch_time = run_batch_time
+            self.stats.iter_token_process_time = iter_token_process_time
+
+            # DP balance
+            self.stats.dp_balance = dp_balance
+            self.stats.idle_batch_ratio = idle_batch_ratio
+            self.stats.decode_bs_util = decode_bs_util
+
+            # DP all_gather latency
+            self.stats.all_gather_latency_us = all_gather_latency_us
 
             # Speculative decoding
             self.stats.spec_accept_rate = spec_accept_rate

@@ -416,6 +416,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
         request: Optional[fastapi.Request] = None,
+        tokenizer_rev_request_time: Optional[float] = None,
     ):
         created_time = obj.received_time if obj.received_time else time.time()
         self.auto_create_handle_loop()
@@ -443,7 +444,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 await self._resolve_lora_path(obj)
 
             if obj.is_single:
-                tokenized_obj = await self._tokenize_one_request(obj)
+                tokenized_obj = await self._tokenize_one_request(obj, tokenizer_rev_request_time)
                 state = self._send_one_request(obj, tokenized_obj, created_time)
                 async for response in self._wait_one_response(obj, state, request):
                     yield response
@@ -594,6 +595,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
     async def _tokenize_one_request(
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
+        tokenizer_rev_request_time: Optional[float] = None,
     ):
         """Tokenize one request."""
         # Tokenize
@@ -624,6 +626,13 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
 
             input_ids, token_type_ids = await self._tokenize_texts(
                 input_text, is_cross_encoder_request
+            )
+
+        # Record tokenize request ready time
+        tokenizer_ready_time = time.time()
+        if tokenizer_rev_request_time is not None and tokenizer_rev_request_time > 0 and self.enable_metrics:
+            self.metrics_collector.observe_request_time_to_tokenizer_ready(
+                tokenizer_ready_time - tokenizer_rev_request_time
             )
 
         if self.mm_processor and obj.contains_mm_input():
@@ -975,6 +984,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
     ):
         trace_slice_start(RequestStage.TOKENIZER_DISPATCH, obj.rid)
         tokenized_obj.trace_context = trace_get_proc_propagate_context(obj.rid)
+        tokenized_obj.dispatch_to_scheduler_time = time.perf_counter()
         self.send_to_scheduler.send_pyobj(tokenized_obj)
         state = ReqState([], False, asyncio.Event(), obj, created_time=created_time)
         state.request_sent_to_scheduler_ts = time.time()

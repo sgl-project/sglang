@@ -1057,6 +1057,7 @@ class Scheduler(
         """A normal scheduler loop."""
         while True:
             # Receive requests
+            self.iter_start_time = time.time()
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
             if self._engine_paused:
@@ -1091,6 +1092,7 @@ class Scheduler(
 
         while True:
             # Receive requests
+            self.iter_start_time = time.time()
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
             if self._engine_paused:
@@ -1423,6 +1425,7 @@ class Scheduler(
                 return_hidden_states=recv_req.return_hidden_states,
                 return_routed_experts=recv_req.return_routed_experts,
                 eos_token_ids=self.model_config.hf_eos_token_id,
+                dispatch_to_scheduler_time=recv_req.dispatch_to_scheduler_time,
                 bootstrap_host=recv_req.bootstrap_host,
                 bootstrap_port=recv_req.bootstrap_port,
                 bootstrap_room=recv_req.bootstrap_room,
@@ -1437,6 +1440,10 @@ class Scheduler(
                 dllm_config=self.dllm_config,
             )
             req.tokenizer = self.tokenizer
+            if getattr(recv_req, "dispatch_to_scheduler_time", 0.0):
+                # Keep dispatch timestamp only when present, clamp to zero to avoid negative values
+                req.time_stats.dispatch_to_scheduler_time = max(0.0, recv_req.dispatch_to_scheduler_time)
+            req.time_stats.arrive_scheduler_time = time.perf_counter()
 
             if self.disaggregation_mode != DisaggregationMode.NULL:
                 # Invalid request for disaggregated mode
@@ -1699,6 +1706,7 @@ class Scheduler(
             recv_req.input_text,
             recv_req.input_ids,
             recv_req.sampling_params,
+            dispatch_to_scheduler_time=recv_req.dispatch_to_scheduler_time,
             token_type_ids=recv_req.token_type_ids,
             priority=recv_req.priority,
             dimensions=recv_req.dimensions,
@@ -2006,8 +2014,14 @@ class Scheduler(
             if req.time_stats.forward_entry_time == 0:
                 req.time_stats.forward_entry_time = time.perf_counter()
                 if self.enable_metrics:
+                    self.metrics_collector.observe_request_zmq_time(
+                        req.time_stats.get_request_zmq_time(),
+                    )
                     self.metrics_collector.observe_queue_time(
                         req.time_stats.get_queueing_time(),
+                    )
+                    self.metrics_collector.observe_request_waiting_time(
+                        req.time_stats.get_request_waiting_time(),
                     )
 
         # Create a new batch
@@ -2126,6 +2140,7 @@ class Scheduler(
     ) -> Union[GenerationBatchResult, EmbeddingBatchResult]:
         """Run a batch."""
         self.forward_ct += 1
+        self.iter_forward_start_time = time.time()
 
         # Whether to run the profiler
         self._profile_batch_predicate(batch)

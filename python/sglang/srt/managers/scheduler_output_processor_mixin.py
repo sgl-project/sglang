@@ -105,6 +105,12 @@ class SchedulerOutputProcessorMixin:
                     logits_output.input_token_logprobs = tuple(
                         logits_output.input_token_logprobs.tolist()
                     )
+            
+            if self.tp_rank == 0 and self.enable_metrics:
+                self.iter_forward_finish_time = time.time()
+                run_batch_time = self.iter_forward_finish_time - self.iter_forward_start_time
+                self.stats.run_batch_time = run_batch_time
+                self.metrics_collector.log_stats(self.stats)
 
             hidden_state_offset = 0
 
@@ -128,6 +134,10 @@ class SchedulerOutputProcessorMixin:
                         self.maybe_collect_routed_experts(req)
                         release_kv_cache(req, self.tree_cache)
                         req.time_stats.completion_time = time.perf_counter()
+                        if self.tp_rank == 0 and self.enable_metrics:
+                            self.metrics_collector.observe_request_first_token_forward_time(
+                                req.time_stats.get_request_first_token_forward_time()
+                            )
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
                         # This updates radix so others can match
                         self.tree_cache.cache_unfinished_req(req)
@@ -268,6 +278,9 @@ class SchedulerOutputProcessorMixin:
                     auto_next_anon=not req.finished(),
                     thread_finish_flag=req.finished(),
                 )
+        # Log DP-level prefill load-balancing metrics
+        if self.current_scheduler_metrics_enabled():
+            self.log_prefill_dp_balance_stats(batch)
 
         self.stream_output(batch.reqs, batch.return_logprob, skip_stream_req)
 
@@ -353,6 +366,7 @@ class SchedulerOutputProcessorMixin:
         if self.enable_metrics:
             self.metrics_collector.increment_cuda_graph_pass(value=can_run_cuda_graph)
 
+        self.iter_forward_finish_time = time.time()
         self.token_to_kv_pool_allocator.free_group_begin()
 
         # NOTE: in any case, we should check finish here

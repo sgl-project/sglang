@@ -440,6 +440,13 @@ class SchedulerDisaggregationPrefillMixin:
                     logits_output.input_token_logprobs.tolist()
                 )
 
+        if self.tp_rank == 0 and self.enable_metrics:
+            self.iter_forward_finish_time = time.time()
+            run_batch_time = self.iter_forward_finish_time - self.iter_forward_start_time
+            self.stats.run_batch_time = run_batch_time
+            self.metrics_collector.log_stats(self.stats)
+
+        hidden_state_offset = 0
         for i, (req, next_token_id) in enumerate(
             zip(batch.reqs, next_token_ids, strict=True)
         ):
@@ -520,6 +527,9 @@ class SchedulerDisaggregationPrefillMixin:
                     RequestStage.PREFILL_CHUNKED_FORWARD, req.rid, auto_next_anon=True
                 )
 
+        # Log DP-level prefill load-balancing metrics
+        if self.current_scheduler_metrics_enabled():
+            self.log_prefill_dp_balance_stats(batch)
         self.maybe_send_health_check_signal()
 
     def process_disagg_prefill_inflight_queue(
@@ -578,6 +588,10 @@ class SchedulerDisaggregationPrefillMixin:
 
         for req in done_reqs:
             req.time_stats.completion_time = time.perf_counter()
+            if self.tp_rank == 0 and self.enable_metrics:
+                self.metrics_collector.observe_request_first_token_forward_time(
+                    req.time_stats.get_request_first_token_forward_time()
+                )
 
         # Stream requests which have finished transfer
         self.stream_output(
