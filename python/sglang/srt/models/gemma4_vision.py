@@ -30,7 +30,7 @@ from sglang.srt.layers.clippable_linear import (
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.layernorm import Gemma4RMSNorm
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.utils import add_prefix, get_device_capability, is_cuda, is_hip
+from sglang.srt.utils import add_prefix, get_device_capability, is_cpu, is_cuda, is_hip
 
 # ---------------------------------------------------------------------------
 # 2-D Multidimensional RoPE (matches HF Gemma4RotaryEmbedding for vision)
@@ -199,6 +199,8 @@ class Gemma4VisionAttention(nn.Module):
             # ROCm: use triton_attn to avoid SDPA flatten_batch issues
             # with multi-image/video inputs
             return "triton_attn"
+        if is_cpu():
+            return "amx_attn"
         return "sdpa"
 
     def forward(
