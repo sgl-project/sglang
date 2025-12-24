@@ -27,6 +27,18 @@ if _is_npu:
 
 logger = logging.getLogger(__name__)
 
+def _get_arch_from_config(config):
+    mindspore_models = import_model_classes("sgl_mindspore.models")
+    architectures = getattr(config, "architectures", [])
+    if isinstance(architectures, str):
+        architectures = [architectures]
+    if not architectures:
+        logger.warning("No model architectures are specified")
+    for arch in architectures:
+        if arch in mindspore_models:
+            return mindspore_models[arch]
+    raise ValueError(f"Unsupported arch {architectures}")
+
 
 def tensor_torch2ms(x: torch.Tensor):
     if x is None or not isinstance(x, torch.Tensor):
@@ -185,21 +197,7 @@ class MindSporeForCausalLM(torch.nn.Module):
         self.value_cache = []
 
     def get_arch(self, config):
-        # Get all implemented models
-        mindspore_models = import_model_classes("sgl_mindspore.models")
-
-        # Get arch from config
-        architectures = config.architectures
-        if isinstance(architectures, str):
-            architectures = [architectures]
-        if not architectures:
-            logger.warning("No model architectures are specified")
-
-        for arch in architectures:
-            if arch in mindspore_models:
-                return mindspore_models[arch]
-        if arch is None:
-            raise ValueError(f"Unsupported arch {architectures}")
+        return _get_arch_from_config(config)
 
     @property
     def use_mla(self):
@@ -303,5 +301,15 @@ class MindSporeForCausalLM(torch.nn.Module):
         logits_result = LogitsProcessorOutput(next_token_logits=tensor_ms2torch(logits))
         return logits_result
 
+    @classmethod
+    def get_model_config_for_expert_location(cls, config):
+        try:
+            arch_cls = _get_arch_from_config(config)
+            method = getattr(arch_cls, "get_model_config_for_expert_location", None)
+            if method is None:
+                return None
+            return method(config)
+        except Exception:
+            return None
 
 EntryClass = [MindSporeForCausalLM]
