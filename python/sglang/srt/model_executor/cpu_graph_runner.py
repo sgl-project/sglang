@@ -344,6 +344,29 @@ def register_fake_ops():
         M = mat1.shape[0]
         N = mat2.shape[0]
         return mat1.new_empty(M, N, dtype=out_dtype)
+    
+    # @torch.library.register_fake("python_kernel::split_qkv_rmsnorm_rope_cpu")
+    # def _(
+    #     qkv,
+    #     q_weight,
+    #     k_weight,
+    #     q_variance_epsilon,
+    #     k_variance_epsilon,
+    #     q_size,
+    #     kv_size,
+    #     head_dim,
+    #     residual,
+    # ):
+    #     q, k, v = qkv.split([q_size, kv_size, kv_size], dim=-1)
+    #     q_by_head = q.reshape(-1, head_dim)
+    #     k_by_head = k.reshape(-1, head_dim)
+    #     q = q_by_head.view(q.shape)
+    #     k = k_by_head.view(k.shape)
+    #     return q, k, v
+    
+    # @torch.library.register_fake("python_kernel::print_kernel_cpu")
+    # def _(input):
+    #     return
 
 
 def dump_forward_batch(fb, name="forward_batch"):
@@ -389,7 +412,6 @@ class CPUGraphRunner:
         self.captured_decode_forward_batches = {}
         self.captured_prefill_forward_batches = {}
         self.enable_prefill_cpu_graph = model_runner.server_args.enable_prefill_cpu_graph
-        print("----------self.enable_prefill_cpu_graph ---------- ", self.enable_prefill_cpu_graph, flush=True)
         self.enable_torch_compile = model_runner.server_args.enable_torch_compile
         self.disable_padding = model_runner.server_args.disable_cuda_graph_padding
         self.is_encoder_decoder = model_runner.model_config.is_encoder_decoder
@@ -813,21 +835,7 @@ class CPUGraphRunner:
         # print("--------------replay---------------", flush=True)
         # print("forward_batch.input_ids shape: ", forward_batch.input_ids.shape, flush=True)
         # print(perf.key_averages().table(sort_by="self_cpu_time_total", row_limit=-1), flush=True)
-        # if forward_batch.batch_size in self.graphs:
         return output
-
-        if isinstance(output, LogitsProcessorOutput):
-            return LogitsProcessorOutput(
-                next_token_logits=output.next_token_logits[: self.raw_num_token],
-                hidden_states=(
-                    output.hidden_states[: self.raw_num_token]
-                    if output.hidden_states is not None
-                    else None
-                ),
-            )
-        else:
-            assert isinstance(output, PPProxyTensors)
-            return PPProxyTensors({k: v[: self.bs] for k, v in output.tensors.items()})
 
     def get_spec_info(self, num_tokens: int):
         spec_info = None

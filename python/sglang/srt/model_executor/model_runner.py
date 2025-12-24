@@ -2723,6 +2723,7 @@ class ModelRunner:
             and self.graph_runner.can_run(forward_batch)
         )
 
+        # print("self.spec_algorithm.is_eagle3(): ", self.spec_algorithm.is_eagle3())
         if can_run_graph:
             # dump_forward_batch(forward_batch)
             # print("--------------------------------------------------------", flush=True)
@@ -2736,8 +2737,7 @@ class ModelRunner:
             # print("forward extend_prefix_lens shape: ", forward_batch.extend_prefix_lens.shape, flush=True)
             # print("forward positions shape: ", forward_batch.positions.shape, flush=True)
             # print("forward req_pool_indices shape: ", forward_batch.req_pool_indices.shape, flush=True)
-            
-                    
+
             ret = self.graph_runner.replay(
                 forward_batch,
                 skip_attn_backend_init=skip_attn_backend_init,
