@@ -202,6 +202,14 @@ impl McpConnectionPool {
             .get(server_key)
             .map(|cached| Arc::clone(&cached.client))
     }
+
+    /// Get the server configuration for a cached connection
+    pub fn get_config(&self, server_key: &str) -> Option<McpServerConfig> {
+        self.connections
+            .lock()
+            .get(server_key)
+            .map(|cached| cached.config.clone())
+    }
 }
 
 impl Default for McpConnectionPool {
