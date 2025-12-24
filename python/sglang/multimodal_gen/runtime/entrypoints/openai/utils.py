@@ -182,7 +182,10 @@ async def process_generation_batch(
     total_time = time.perf_counter() - total_start_time
     log_batch_completion(logger, 1, total_time)
 
-    return save_file_path
+    if result.peak_memory_mb and result.peak_memory_mb > 0:
+        logger.info(f"Peak memory usage: {result.peak_memory_mb:.2f} MB")
+
+    return save_file_path, result
 
 
 def merge_image_input_list(*inputs: Union[List, Any, None]) -> List:
