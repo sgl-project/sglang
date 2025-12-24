@@ -22,10 +22,10 @@ from typing import Any, Iterable, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
-from transformers import GlmasrConfig, GlmasrEncoderConfig
+from transformers import GlmAsrConfig, GlmAsrEncoderConfig
 from transformers.models.glmasr.modeling_glmasr import (
-    GlmasrEncoder,
-    GlmasrMultiModalProjector,
+    GlmAsrEncoder,
+    GlmAsrMultiModalProjector,
 )
 
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -68,7 +68,7 @@ class GlmAsrForConditionalGeneration(nn.Module):
 
     def __init__(
         self,
-        config: GlmasrConfig,
+        config: GlmAsrConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ) -> None:
@@ -77,12 +77,12 @@ class GlmAsrForConditionalGeneration(nn.Module):
         self.config = config
 
         if getattr(self.config, "audio_config", None) is None:
-            self.config.audio_config = GlmasrEncoderConfig(self.config._name_or_path)
+            self.config.audio_config = GlmAsrEncoderConfig(self.config._name_or_path)
 
-        self.audio_tower = GlmasrEncoder(
+        self.audio_tower = GlmAsrEncoder(
             config.audio_config,
         )
-        self.multi_modal_projector = GlmasrMultiModalProjector(config)
+        self.multi_modal_projector = GlmAsrMultiModalProjector(config)
         self.language_model = LlamaForCausalLM(
             config.text_config, quant_config, prefix=add_prefix("model", prefix)
         )
