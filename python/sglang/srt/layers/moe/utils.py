@@ -24,6 +24,7 @@ class MoeA2ABackend(Enum):
     DEEPEP = "deepep"
     MOONCAKE = "mooncake"
     ASCEND_FUSEEP = "ascend_fuseep"
+    PPLX = "pplx"
 
     @classmethod
     def _missing_(cls, value):
@@ -45,6 +46,9 @@ class MoeA2ABackend(Enum):
 
     def is_ascend_fuseep(self):
         return self == MoeA2ABackend.ASCEND_FUSEEP
+
+    def is_pplx(self):
+        return self == MoeA2ABackend.PPLX
 
 
 class MoeRunnerBackend(Enum):
