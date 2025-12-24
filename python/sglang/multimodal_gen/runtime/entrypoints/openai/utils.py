@@ -64,7 +64,7 @@ async def _save_upload_to_path(upload: UploadFile, target_path: str) -> str:
     return target_path
 
 
-async def _maybe_url_image(img_url: str, target_path: str) -> str:
+async def _maybe_url_image(img_url: str, target_path: str) -> str | None:
     if not isinstance(img_url, str):
         return None
 
