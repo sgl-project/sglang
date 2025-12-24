@@ -14,14 +14,11 @@ def _compute_enable_tilelang_gemm() -> bool:
     Enable conditions:
     1. GPU SM version >= 89 (Ada Lovelace+)
     2. tilelang package installed
-    3. SGLANG_ENABLE_TILELANG_GEMM is True (default: True)
     """
     try:
         sm_version = get_device_sm()
         if sm_version < 89:
-            logger.debug(
-                f"TileLang GEMM disabled: SM version {sm_version} < 89 (requires Ada Lovelace+)"
-            )
+            logger.debug(f"TileLang GEMM disabled: SM version {sm_version} < 89")
             return False
     except Exception as e:
         logger.debug(f"TileLang GEMM disabled: failed to get SM version: {e}")
@@ -33,13 +30,8 @@ def _compute_enable_tilelang_gemm() -> bool:
         logger.debug("TileLang GEMM disabled: tilelang package not installed")
         return False
 
-    enabled = envs.SGLANG_ENABLE_TILELANG_GEMM.get()
-    if enabled:
-        logger.info("TileLang GEMM enabled")
-    else:
-        logger.debug("TileLang GEMM disabled via SGLANG_ENABLE_TILELANG_GEMM=0")
-
-    return enabled
+    logger.info("TileLang GEMM enabled")
+    return True
 
 
 ENABLE_TILELANG_GEMM = _compute_enable_tilelang_gemm()

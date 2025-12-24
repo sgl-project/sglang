@@ -283,7 +283,6 @@ class Envs:
     SGLANG_USE_DEEPGEMM_BMM = EnvBool(False)
 
     # TileLang GEMM
-    SGLANG_ENABLE_TILELANG_GEMM = EnvBool(True)
     SGLANG_TILELANG_GEMM_CONFIG_DIR = EnvStr("")
 
     # DeepEP

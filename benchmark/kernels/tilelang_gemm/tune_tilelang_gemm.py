@@ -165,7 +165,6 @@ def main():
             logger.info(f"\n[{i+1}/{len(shapes)}] Tuning N={N}, K={K}")
 
             try:
-                # Create tuner (lazy initialization)
                 if tuner is None:
                     tuner = GEMMTuner(
                         config_dir=args.config_dir,

@@ -57,5 +57,5 @@ python -m tilelang_gemm.tuner --N 4096 --K 8192 --num_gpus 4
 
 - `base`: Standard GEMM, A_scale (M, K//128), B_scale (N//128, K//128)
 - `swapAB`: Swapped A/B, A_scale (M//128, K//128), B_scale (N, K//128)
-- `splitK`: Split-K parallelism, uses C_partial buffer
+- `splitK`: Split-K parallelism, needs extra C_partial buffer
 - `splitK_swapAB`: Combined Split-K and SwapAB

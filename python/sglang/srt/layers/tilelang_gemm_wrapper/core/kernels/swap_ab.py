@@ -24,6 +24,11 @@ def kernel_factory(
     c_scale_local=False,
     b_scale_shm=False,
 ):
+    """
+    input: A (M, K), B (N, K)
+    compute: C(M, N) = A @ B^T
+    output: C^T (N, M)
+    """
     N = tvm.te.var("n")
     group_size = 128
     A_scale_shape = (T.ceildiv(M, group_size), T.ceildiv(K, group_size))

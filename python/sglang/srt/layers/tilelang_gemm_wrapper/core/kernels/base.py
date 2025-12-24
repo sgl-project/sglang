@@ -60,7 +60,9 @@ def kernel_factory(
                 if a_scale_shm:
                     for i in T.Parallel(block_M):
                         A_scale_shared[i] = a_scale[by * block_M + i, k]
-                    B_scale = b_scale[bx * block_N // group_size, k]
+                    B_scale = b_scale[
+                        bx * block_N // group_size, k
+                    ]  # NOTE: load B_scale after A_scale gains better performance
                     for i in T.Parallel(block_M):
                         C_scale[i] = A_scale_shared[i] * B_scale
                 else:
