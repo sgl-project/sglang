@@ -36,17 +36,18 @@ SUITES = {
     "2-gpu": TWO_GPU_CASES,
 }
 
-# Mapping from suite to test files
-SUITE_FILES = {
-    "1-gpu": [
-        "test_server_1_gpu.py",
-        "test_lora_format_adapter.py",
+# Parametrized test files (use case ID filter)
+PARAMETRIZED_FILES = {
+    "1-gpu": ["test_server_1_gpu.py"],
+    "2-gpu": ["test_server_2_gpu.py"],
+}
+
+# Standalone test files (each gets its own partition, no filter, run last)
+STANDALONE_FILES = {
+    "1-gpu": ["test_lora_format_adapter.py",
         # cli test
-        "../cli/test_generate_t2i_perf.py",
-    ],
-    "2-gpu": [
-        "test_server_2_gpu.py",
-    ],
+        "../cli/test_generate_t2i_perf.py"],
+    "2-gpu": [],
 }
 
 # Default estimated time for cases without baseline (5 minutes)
@@ -117,9 +118,9 @@ def auto_partition(
     return []
 
 
-def get_suite_files(suite: str, target_dir: Path) -> List[str]:
+def get_parametrized_files(suite: str, target_dir: Path) -> List[str]:
     """
-    Get test file paths for the specified suite.
+    Get parametrized test file paths for the specified suite.
 
     Args:
         suite: Suite name (e.g., "1-gpu", "2-gpu")
@@ -128,7 +129,7 @@ def get_suite_files(suite: str, target_dir: Path) -> List[str]:
     Returns:
         List of absolute file paths
     """
-    files = SUITE_FILES.get(suite, [])
+    files = PARAMETRIZED_FILES.get(suite, [])
     result = []
     for f in files:
         f_path = target_dir / f
@@ -137,6 +138,28 @@ def get_suite_files(suite: str, target_dir: Path) -> List[str]:
         else:
             logger.warning(f"Test file {f} not found in {target_dir}")
     return result
+
+
+def get_standalone_file(suite: str, target_dir: Path, index: int) -> str | None:
+    """
+    Get a standalone test file path by index.
+
+    Args:
+        suite: Suite name (e.g., "1-gpu", "2-gpu")
+        target_dir: Base directory for test files
+        index: Index of the standalone file (0-based)
+
+    Returns:
+        Absolute file path, or None if not found
+    """
+    files = STANDALONE_FILES.get(suite, [])
+    if index < 0 or index >= len(files):
+        return None
+    f_path = target_dir / files[index]
+    if f_path.exists():
+        return str(f_path)
+    logger.warning(f"Standalone test file {files[index]} not found in {target_dir}")
+    return None
 
 
 def parse_args():
@@ -322,44 +345,7 @@ def run_pytest(files, filter_expr=None):
 def main():
     args = parse_args()
 
-    # 1. Get all cases for the suite
-    all_cases = SUITES.get(args.suite, [])
-
-    if not all_cases:
-        print(f"No cases found for suite '{args.suite}'.")
-        sys.exit(0)
-
-    # 2. Use LPT algorithm for partitioning
-    my_cases = auto_partition(all_cases, args.partition_id, args.total_partitions)
-
-    if not my_cases:
-        print(f"No cases assigned to partition {args.partition_id}. Exiting success.")
-        sys.exit(0)
-
-    # 3. Print partition info
-    print(
-        f"Suite: {args.suite} | Partition: {args.partition_id + 1}/{args.total_partitions}"
-    )
-    print(f"Running {len(my_cases)} cases in this partition:")
-    total_est_time = 0.0
-    for case in my_cases:
-        est = get_case_est_time(case.id)
-        total_est_time += est
-        print(f"  - {case.id} (est: {est:.1f}s)")
-    print(f"Total estimated time: {total_est_time:.1f}s ({total_est_time/60:.1f} min)")
-    print()
-
-    # 4. Build pytest filter expression from case IDs
-    case_ids = [case.id for case in my_cases]
-    partition_filter = " or ".join([f"[{cid}]" for cid in case_ids])
-
-    # Combine with additional filter if provided
-    if args.filter:
-        filter_expr = f"({partition_filter}) and ({args.filter})"
-    else:
-        filter_expr = partition_filter
-
-    # 5. Get test files for the suite
+    # 1. Resolve base path
     current_file_path = Path(__file__).resolve()
     test_root_dir = current_file_path.parent
     target_dir = test_root_dir / args.base_dir
@@ -368,57 +354,95 @@ def main():
         print(f"Error: Target directory {target_dir} does not exist.")
         sys.exit(1)
 
-    suite_files = get_suite_files(args.suite, target_dir)
+    # 2. Calculate partition allocation
+    standalone_files = STANDALONE_FILES.get(args.suite, [])
+    num_standalone = len(standalone_files)
+    parametrized_partitions = args.total_partitions - num_standalone
 
-    if not suite_files:
-        print(f"No valid test files found for suite '{args.suite}'.")
-        sys.exit(0)
+    if parametrized_partitions < 0:
+        print(
+            f"Error: total_partitions ({args.total_partitions}) must be >= "
+            f"standalone files ({num_standalone})"
+        )
+        sys.exit(1)
 
-    # 3. collect all test items and partition by items (not files)
-    all_test_items = collect_test_items(suite_files_abs, filter_expr=args.filter)
+    # 3. Determine partition type and execute
+    if args.partition_id < parametrized_partitions:
+        # === Parametrized test partition ===
+        all_cases = SUITES.get(args.suite, [])
 
-    if not all_test_items:
-        print(f"No test items found for suite '{args.suite}'.")
-        sys.exit(0)
+        if not all_cases:
+            print(f"No cases found for suite '{args.suite}'.")
+            sys.exit(0)
 
-    # Partition by test items
-    my_items = [
-        item
-        for i, item in enumerate(all_test_items)
-        if i % args.total_partitions == args.partition_id
-    ]
+        # Use LPT algorithm to partition cases among parametrized partitions
+        my_cases = auto_partition(all_cases, args.partition_id, parametrized_partitions)
 
-    # Print test info at beginning (similar to test/run_suite.py pretty_print_tests)
-    partition_info = f"{args.partition_id + 1}/{args.total_partitions} (0-based id={args.partition_id})"
-    headers = ["Suite", "Partition"]
-    rows = [[args.suite, partition_info]]
-    msg = tabulate.tabulate(rows, headers=headers, tablefmt="psql") + "\n"
-    msg += f"✅ Enabled {len(my_items)} test(s):\n"
-    for item in my_items:
-        msg += f"  - {item}\n"
-    print(msg, flush=True)
-    print(
-        f"Suite: {args.suite} | Partition: {args.partition_id}/{args.total_partitions}"
-    )
-    print(f"Selected {len(suite_files_abs)} files:")
-    for f in suite_files_abs:
-        print(f"  - {os.path.basename(f)}")
+        if not my_cases:
+            print(
+                f"No cases assigned to partition {args.partition_id}. Exiting success."
+            )
+            sys.exit(0)
 
-    if not my_items:
-        print("No items assigned to this partition. Exiting success.")
-        sys.exit(0)
+        # Print partition info
+        print(
+            f"Suite: {args.suite} | Partition: {args.partition_id + 1}/{args.total_partitions} (parametrized)"
+        )
+        print(f"Running {len(my_cases)} cases in this partition:")
+        total_est_time = 0.0
+        for case in my_cases:
+            est = get_case_est_time(case.id)
+            total_est_time += est
+            print(f"  - {case.id} (est: {est:.1f}s)")
+        print(
+            f"Total estimated time: {total_est_time:.1f}s ({total_est_time/60:.1f} min)"
+        )
+        print()
 
-    print(f"Running {len(my_items)} items in this shard: {', '.join(my_items)}")
+        # Build pytest filter expression from case IDs
+        case_ids = [case.id for case in my_cases]
+        partition_filter = " or ".join([f"[{cid}]" for cid in case_ids])
 
-    # 4. execute with the specific test items
-    exit_code = run_pytest(my_items)
+        # Combine with additional filter if provided
+        if args.filter:
+            filter_expr = f"({partition_filter}) and ({args.filter})"
+        else:
+            filter_expr = partition_filter
 
-    # Print tests again at the end for visibility
-    msg = "\n" + tabulate.tabulate(rows, headers=headers, tablefmt="psql") + "\n"
-    msg += f"✅ Executed {len(my_items)} test(s):\n"
-    for item in my_items:
-        msg += f"  - {item}\n"
-    print(msg, flush=True)
+        # Get parametrized test files
+        suite_files = get_parametrized_files(args.suite, target_dir)
+
+        if not suite_files:
+            print(f"No valid parametrized test files found for suite '{args.suite}'.")
+            sys.exit(0)
+
+        print(f"Test files: {[os.path.basename(f) for f in suite_files]}")
+        print(f"Filter expression: {filter_expr}")
+        print()
+
+        exit_code = run_pytest(suite_files, filter_expr=filter_expr)
+
+    else:
+        # === Standalone test partition ===
+        standalone_idx = args.partition_id - parametrized_partitions
+
+        print(
+            f"Suite: {args.suite} | Partition: {args.partition_id + 1}/{args.total_partitions} (standalone)"
+        )
+
+        standalone_file = get_standalone_file(args.suite, target_dir, standalone_idx)
+
+        if not standalone_file:
+            print(
+                f"No standalone file at index {standalone_idx} for suite '{args.suite}'."
+            )
+            sys.exit(0)
+
+        print(f"Running standalone test file: {os.path.basename(standalone_file)}")
+        print()
+
+        # Run without case ID filter (standalone tests are not parametrized)
+        exit_code = run_pytest([standalone_file], filter_expr=args.filter)
 
     sys.exit(exit_code)
 
