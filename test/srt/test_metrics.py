@@ -66,6 +66,7 @@ class TestEnableMetrics(CustomTestCase):
         with (
             envs.SGLANG_ENABLE_METRICS_DP_ATTENTION.override(True),
             envs.SGLANG_ENABLE_METRICS_DEVICE_TIMER.override(True),
+            envs.SGLANG_TEST_RETRACT.override(True),
         ):
             process = popen_launch_server(
                 _MODEL_NAME,
@@ -85,9 +86,10 @@ class TestEnableMetrics(CustomTestCase):
                     "text": "The capital of France is",
                     "sampling_params": {
                         "temperature": 0,
-                        "max_new_tokens": 32,
+                        "max_new_tokens": 100,
                     },
                     "stream": True,
+                    "ignore_eos": True,
                 },
                 stream=True,
             )
