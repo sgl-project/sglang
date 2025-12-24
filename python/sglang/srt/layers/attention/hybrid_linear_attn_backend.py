@@ -1184,14 +1184,17 @@ class HybridLinearAttnBackend(AttentionBackend):
 
     def __init__(
         self,
+        model_runner: "ModelRunner",
         full_attn_backend: AttentionBackend,
         linear_attn_backend: MambaAttnBackendBase,
         full_attn_layers: list[int],
     ):
+        self.model_runner = model_runner
         self.full_attn_layers = full_attn_layers
         self.full_attn_backend = full_attn_backend
         self.linear_attn_backend = linear_attn_backend
         self.attn_backend_list = [full_attn_backend, linear_attn_backend]
+        self.data_type = model_runner.kv_cache_dtype
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         for attn_backend in self.attn_backend_list:
