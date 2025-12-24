@@ -72,7 +72,10 @@ use dashmap::DashMap;
 use rand::Rng;
 use tracing::debug;
 
-use super::{get_healthy_worker_indices, tree::Tree, CacheAwareConfig, LoadBalancingPolicy};
+use super::{
+    get_healthy_worker_indices, normalize_model_key, tree::Tree, CacheAwareConfig,
+    LoadBalancingPolicy,
+};
 use crate::core::Worker;
 
 /// Cache-aware routing policy
@@ -160,13 +163,7 @@ impl CacheAwarePolicy {
         let mut model_workers: std::collections::HashMap<String, Vec<&Arc<dyn Worker>>> =
             std::collections::HashMap::new();
         for worker in workers {
-            // Use "unknown" for empty model_ids
-            let model_id = worker.model_id();
-            let tree_key = if model_id.is_empty() {
-                "unknown"
-            } else {
-                model_id
-            };
+            let tree_key = normalize_model_key(worker.model_id());
             model_workers
                 .entry(tree_key.to_string())
                 .or_default()
@@ -187,14 +184,7 @@ impl CacheAwarePolicy {
 
     /// Add a single worker to the tree (incremental update)
     pub fn add_worker(&self, worker: &dyn Worker) {
-        // For backward compatibility: if model_id is "unknown" or empty,
-        // use a default tree. This preserves existing behavior for single-model routers.
-        let model_id = worker.model_id();
-        let tree_key = if model_id.is_empty() {
-            "unknown"
-        } else {
-            model_id
-        };
+        let tree_key = normalize_model_key(worker.model_id());
         let tree = self
             .trees
             .entry(tree_key.to_string())
@@ -213,13 +203,7 @@ impl CacheAwarePolicy {
 
     /// Remove a worker from the tree
     pub fn remove_worker(&self, worker: &dyn Worker) {
-        // Use same logic as add_worker for consistency
-        let model_id = worker.model_id();
-        let tree_key = if model_id.is_empty() {
-            "unknown"
-        } else {
-            model_id
-        };
+        let tree_key = normalize_model_key(worker.model_id());
         if let Some(tree) = self.trees.get(tree_key) {
             tree.remove_tenant(worker.url());
         }
@@ -313,12 +297,7 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
 
         // Determine the model for this set of workers (router pre-filters by model)
         // All workers should be from the same model
-        let first_model = workers[healthy_indices[0]].model_id();
-        let model_id = if first_model.is_empty() {
-            "unknown"
-        } else {
-            first_model
-        };
+        let model_id = normalize_model_key(workers[healthy_indices[0]].model_id());
 
         // Get current load statistics - compute min/max in single pass without allocation
         let (min_load, max_load) = workers.iter().fold((usize::MAX, 0usize), |(min, max), w| {
