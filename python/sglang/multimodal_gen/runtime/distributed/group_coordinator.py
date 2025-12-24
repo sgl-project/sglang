@@ -180,8 +180,6 @@ class GroupCoordinator:
         # TODO: fix it for other platforms
         self.device = current_platform.get_local_torch_device()
 
-        from sglang.multimodal_gen.runtime.platforms import current_platform
-
         self.use_device_communicator = use_device_communicator
 
         self.device_communicator: DeviceCommunicatorBase = None  # type: ignore
