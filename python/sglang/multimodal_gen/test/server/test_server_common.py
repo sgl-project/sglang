@@ -160,14 +160,22 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
         _fixture_end_time = time.perf_counter()
         _measured_full_time = _fixture_end_time - _fixture_start_time
 
-        if case.id in _MISSING_ESTIMATED_TIME_CASES:
+        scenario = BASELINE_CONFIG.scenarios.get(case.id)
+        needs_estimated_time = (
+            scenario is None or scenario.estimated_full_test_time_s is None
+        )
+
+        if needs_estimated_time:
             _MISSING_ESTIMATED_TIME_CASES.discard(case.id)
             logger.info(
-                f'\nadd "estimated_full_test_time_s" to scenario "{case.id}" in perf_baselines.json:\n\n'
-                f'"{case.id}": {{\n'
-                f"    ...\n"
-                f'    "estimated_full_test_time_s": {_measured_full_time:.1f}\n'
-                f"}}\n"
+                f'\n{"=" * 60}\n'
+                f'Add "estimated_full_test_time_s" to scenario "{case.id}":\n\n'
+                f"File: python/sglang/multimodal_gen/test/server/perf_baselines.json\n\n"
+                f'    "{case.id}": {{\n'
+                f"        ...\n"
+                f'        "estimated_full_test_time_s": {_measured_full_time:.1f}\n'
+                f"    }}\n"
+                f'{"=" * 60}\n'
             )
 
 
@@ -281,15 +289,16 @@ Consider updating perf_baselines.json with the snippets below:
 
         summary = validator.collect_metrics(perf_record)
 
-        if is_baseline_generation_mode or missing_scenario or missing_estimated_time:
+        if is_baseline_generation_mode or missing_scenario:
             self._dump_baseline_for_testcase(case, summary, missing_scenario)
             if missing_scenario:
                 pytest.fail(f"Testcase '{case.id}' not found in perf_baselines.json")
-            if missing_estimated_time:
-                pytest.fail(
-                    f"Testcase '{case.id}' is missing \"estimated_full_test_time_s\" in perf_baselines.json"
-                )
             return
+
+        if missing_estimated_time:
+            pytest.fail(
+                f"Testcase '{case.id}' is missing \"estimated_full_test_time_s\" in perf_baselines.json"
+            )
 
         self._check_for_improvement(case, summary, scenario)
 
