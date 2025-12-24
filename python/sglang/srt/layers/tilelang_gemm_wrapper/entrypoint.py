@@ -81,7 +81,7 @@ def gemm_nt_f8f8bf16(
     if wrapper is None:
         raise RuntimeError(
             "TileLang GEMM is not available. "
-            "Please ensure tilelang is installed and SGLANG_ENABLE_TILELANG_GEMM=1"
+            "Please ensure tilelang is installed and configs are tuned."
         )
 
     A_fp8, A_scale = lhs

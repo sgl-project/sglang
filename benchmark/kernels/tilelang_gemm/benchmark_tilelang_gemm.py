@@ -293,10 +293,6 @@ def main():
     parser.add_argument("--N", type=int, help="N dimension")
     parser.add_argument("--K", type=int, help="K dimension")
     parser.add_argument(
-        "--all", action="store_true",
-        help="Benchmark all available configurations"
-    )
-    parser.add_argument(
         "--m-values", type=int, nargs="+", default=DEFAULT_M_VALUES,
         help=f"M values to benchmark (default: {DEFAULT_M_VALUES})"
     )
@@ -316,22 +312,7 @@ def main():
     print(f"Baseline: {BASELINE_NAME}")
     print()
     
-    if args.all:
-        # Benchmark all available configs
-        shapes = tilelang_gemm_wrapper.list_available_configs()
-        
-        if not shapes:
-            logger.error("No configurations found. Run tuning first.")
-            sys.exit(1)
-        
-        for N, K in sorted(shapes):
-            run_benchmark(N, K, args.m_values, args.rep, args.output)
-    
-    elif args.N and args.K:
-        run_benchmark(args.N, args.K, args.m_values, args.rep, args.output)
-    
-    else:
-        parser.error("Either --N and --K, or --all must be specified")
+    run_benchmark(args.N, args.K, args.m_values, args.rep, args.output)
 
 
 if __name__ == "__main__":

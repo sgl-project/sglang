@@ -22,16 +22,13 @@ python tune_tilelang_gemm.py --N 4096 --K 8192
 python tune_tilelang_gemm.py --N 4096 --K 8192 --num-gpus 4
 
 # Tune for a model's weight shapes
-python tune_tilelang_gemm.py --model deepseek-ai/DeepSeek-V3 --tp 8
+python tune_tilelang_gemm.py --model Qwen/Qwen3-4B-FP8 --tp 1
 ```
 
-### 2. Benchmark against DeepGEMM
+### 2. Benchmark (baseline: DeepGEMM on Hopper, Triton on Ada)
 
 ```bash
 python benchmark_tilelang_gemm.py --N 4096 --K 8192
-
-# Benchmark all available configurations
-python benchmark_tilelang_gemm.py --all
 
 # Output to CSV
 python benchmark_tilelang_gemm.py --N 4096 --K 8192 --output results.csv
@@ -42,8 +39,8 @@ python benchmark_tilelang_gemm.py --N 4096 --K 8192 --output results.csv
 Tuned configurations are saved to:
 ```
 python/sglang/srt/layers/tilelang_gemm_wrapper/core/config/
-├── N=4096_K=8192.json
-├── N=4096_K=14336.json
+├── N=4096,K=8192,device_name=NVIDIA_H100,dtype=fp8_w8a8,block_shape=[128, 128].json
+├── N=4096,K=14336,device_name=NVIDIA_H100,dtype=fp8_w8a8,block_shape=[128, 128].json
 └── ...
 ```
 

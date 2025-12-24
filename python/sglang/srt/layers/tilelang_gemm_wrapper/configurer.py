@@ -43,8 +43,4 @@ def _compute_enable_tilelang_gemm() -> bool:
 
 ENABLE_TILELANG_GEMM = _compute_enable_tilelang_gemm()
 
-TILELANG_GEMM_CONFIG_DIR = (
-    envs.SGLANG_TILELANG_GEMM_CONFIG_DIR.get()
-    if hasattr(envs, "SGLANG_TILELANG_GEMM_CONFIG_DIR")
-    else ""
-)
+TILELANG_GEMM_CONFIG_DIR = envs.SGLANG_TILELANG_GEMM_CONFIG_DIR.get()
