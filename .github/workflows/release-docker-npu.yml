@@ -57,14 +57,19 @@ jobs:
           version=$(cat python/sglang/version.py | cut -d'"' -f2)
           echo "TAG=lmsysorg/sglang:v$version-cann${{ matrix.cann_version }}-${{ matrix.device_type }}" >> $GITHUB_OUTPUT
 
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
       - name: Build and push Docker image
         id: build-and-push
         uses: docker/build-push-action@v6
         with:
           context: docker
           file: docker/npu.Dockerfile
-          # TODO: need add x86 platforms support when memfabric is ready
-          platforms: linux/arm64
+          platforms: linux/arm64,linux/amd64
           labels: ${{ steps.meta.outputs.labels }}
           tags: ${{ steps.meta.outputs.tags || steps.get_version.outputs.TAG }}
           push: ${{ github.repository == 'sgl-project/sglang' && github.event_name != 'pull_request' }}
