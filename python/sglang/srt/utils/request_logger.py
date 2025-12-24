@@ -16,6 +16,8 @@ from __future__ import annotations
 import dataclasses
 import json
 import logging
+import sys
+from datetime import datetime
 from functools import lru_cache
 from typing import TYPE_CHECKING, Any, Optional, Set, Tuple, Union
 
@@ -64,11 +66,10 @@ class RequestLogger:
         max_length, skip_names, _ = self.metadata
         if self.log_requests_format == "json":
             log_data = {
-                "event": "request.received",
                 "rid": obj.rid,
                 "obj": _dataclass_to_dict(obj, max_length, skip_names),
             }
-            logger.info(json.dumps(log_data, ensure_ascii=False))
+            _log_json("request.received", log_data)
         else:
             logger.info(
                 f"Receive: obj={_dataclass_to_string_truncated(obj, max_length, skip_names=skip_names)}"
@@ -97,13 +98,12 @@ class RequestLogger:
         max_length, skip_names, out_skip_names = self.metadata
         if self.log_requests_format == "json":
             log_data = {
-                "event": "request.finished",
                 "rid": obj.rid,
                 "obj": _dataclass_to_dict(obj, max_length, skip_names),
             }
             if not is_multimodal_gen:
                 log_data["out"] = _dataclass_to_dict(out, max_length, out_skip_names)
-            logger.info(json.dumps(log_data, ensure_ascii=False))
+            _log_json("request.finished", log_data)
         else:
             if is_multimodal_gen:
                 msg = f"Finish: obj={_dataclass_to_string_truncated(obj, max_length, skip_names=skip_names)}"
@@ -198,6 +198,15 @@ def _dataclass_to_string_truncated(
         )
     else:
         return str(data)
+
+
+def _log_json(event: str, data: dict) -> None:
+    log_data = {
+        "timestamp": datetime.now().isoformat(),
+        "event": event,
+        **data,
+    }
+    print(json.dumps(log_data, ensure_ascii=False), file=sys.stderr, flush=True)
 
 
 def _dataclass_to_dict(
