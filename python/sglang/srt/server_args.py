@@ -84,6 +84,7 @@ LOAD_FORMAT_CHOICES = [
     "flash_rl",
     "remote",
     "remote_instance",
+    "fastsafetensors",
     "private",
 ]
 
@@ -337,6 +338,7 @@ class ServerArgs:
     log_level_http: Optional[str] = None
     log_requests: bool = False
     log_requests_level: int = 2
+    log_requests_format: str = "text"
     crash_dump_folder: Optional[str] = None
     show_time_cost: bool = False
     enable_metrics: bool = False
@@ -602,6 +604,8 @@ class ServerArgs:
     disaggregation_prefill_pp: Optional[int] = 1
     disaggregation_ib_device: Optional[str] = None
     disaggregation_decode_enable_offload_kvcache: bool = False
+    # Enable auto FAKE mode for decode node testing, no need to pass bootstrap_host in request
+    disaggregation_decode_enable_fake_auto: bool = False
     num_reserved_decode_tokens: int = 512  # used for decode kv cache offload in PD
     # FIXME: hack to reduce ITL when decode bs is small
     disaggregation_decode_polling_interval: int = 1
@@ -721,14 +725,11 @@ class ServerArgs:
         # Handle diffusion LLM inference.
         self._handle_dllm_inference()
 
-        # Handle any other necessary validations.
-        self._handle_other_validations()
-
-        # Handle two-batch overlap settings.
-        self._handle_two_batch_overlap()
-
         # Handle debug utilities.
         self._handle_debug_utils()
+
+        # Handle any other necessary validations.
+        self._handle_other_validations()
 
     def _handle_deprecated_args(self):
         # Handle deprecated tool call parsers
@@ -2171,12 +2172,6 @@ class ServerArgs:
             raise ValueError(
                 "Cannot set --encoder-only and --disaggregation-mode prefill/decode together"
             )
-        if (
-            self.language_only
-            and self.encoder_transfer_backend == "zmq_to_scheduler"
-            and self.pp_size > 1
-        ):
-            raise ValueError("zmq_to_scheduler not support pp_size > 1")
 
         if self.language_only and len(self.encoder_urls) == 0:
             raise ValueError(
@@ -2396,12 +2391,6 @@ class ServerArgs:
                 self.preferred_sampling_params = json.loads(
                     self.preferred_sampling_params
                 )
-
-    def _handle_two_batch_overlap(self):
-        if self.enable_two_batch_overlap and self.moe_a2a_backend == "none":
-            raise ValueError(
-                "When enabling two batch overlap, moe_a2a_backend cannot be 'none'."
-            )
 
     def _handle_debug_utils(self):
         if is_in_ci() and self.soft_watchdog_timeout is None:
@@ -2919,6 +2908,13 @@ class ServerArgs:
             default=ServerArgs.log_requests_level,
             help="0: Log metadata (no sampling parameters). 1: Log metadata and sampling parameters. 2: Log metadata, sampling parameters and partial input/output. 3: Log every input/output.",
             choices=[0, 1, 2, 3],
+        )
+        parser.add_argument(
+            "--log-requests-format",
+            type=str,
+            default=ServerArgs.log_requests_format,
+            choices=["text", "json"],
+            help="Format for request logging: 'text' (human-readable) or 'json' (structured)",
         )
         parser.add_argument(
             "--crash-dump-folder",
@@ -4262,6 +4258,12 @@ class ServerArgs:
             help="Enable async KV cache offloading on decode server (PD mode).",
         )
         parser.add_argument(
+            "--disaggregation-decode-enable-fake-auto",
+            action="store_true",
+            help="Auto enable FAKE mode for decode node testing, "
+            "no need to pass bootstrap_host and bootstrap_room in request.",
+        )
+        parser.add_argument(
             "--num-reserved-decode-tokens",
             type=int,
             default=ServerArgs.num_reserved_decode_tokens,
@@ -4612,6 +4614,12 @@ class ServerArgs:
         if self.export_metrics_to_file and self.export_metrics_to_file_dir is None:
             raise ValueError(
                 "--export-metrics-to-file-dir is required when --export-metrics-to-file is enabled"
+            )
+
+        # Check two batch overlap
+        if self.enable_two_batch_overlap and self.moe_a2a_backend == "none":
+            raise ValueError(
+                "When enabling two batch overlap, moe_a2a_backend cannot be 'none'."
             )
 
     def check_torch_2_9_1_cudnn_compatibility(self):
