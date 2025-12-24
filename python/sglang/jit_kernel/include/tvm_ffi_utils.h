@@ -19,6 +19,9 @@ constexpr DLDataType dl_float64 = DLDataType{kDLFloat, 64, 1};
 constexpr DLDataType dl_bfloat16 = DLDataType{kDLBfloat, 16, 1};
 constexpr DLDataType dl_int32 = DLDataType{kDLInt, 32, 1};
 constexpr DLDataType dl_uint8 = DLDataType{kDLUInt, 8, 1};
+constexpr DLDataType dl_uint4 = DLDataType{kDLUInt, 4, 1};
+constexpr DLDataType dl_fp4_e2m1fn = DLDataType{kDLFloat4_e2m1fn, 4, 2};
+constexpr DLDataType dl_fp8_e4m3fn = DLDataType{kDLFloat8_e4m3fn, 8, 1};
 
 constexpr int64_t float16_code = encode_dlpack_dtype(dl_float16);
 constexpr int64_t float32_code = encode_dlpack_dtype(dl_float32);

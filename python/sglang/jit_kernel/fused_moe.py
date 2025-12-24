@@ -12,8 +12,9 @@ if TYPE_CHECKING:
 
 
 @lru_cache(maxsize=None)
-def _jit_merlin_module(has_zp: bool, is_zp_float: bool) -> Module:
+def _jit_merlin_module(moe_block_size, has_zp: bool, is_zp_float: bool) -> Module:
     args = make_cpp_args(
+        moe_block_size,
         has_zp,
         is_zp_float,
     )
@@ -58,7 +59,7 @@ def moe_wna16_marlin_gemm(
         if c_or_none is not None
         else torch.empty((size_m * top_k, size_n), device=a.device, dtype=a.dtype)
     )
-    _jit_merlin_module(b_zeros_or_none is not None, is_zp_float).moe_wna16_marlin_gemm(
+    _jit_merlin_module(moe_block_size, b_zeros_or_none is not None, is_zp_float).moe_wna16_marlin_gemm(
         a,
         c,
         b_q_weight,
@@ -73,7 +74,6 @@ def moe_wna16_marlin_gemm(
         expert_ids,
         num_tokens_post_padded,
         topk_weights,
-        moe_block_size,
         top_k,
         mul_topk_weights,
         is_ep,
