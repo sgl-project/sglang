@@ -3795,6 +3795,11 @@ def get_numa_node_count() -> int:
     return libnuma.numa_max_node() + 1
 
 
+def is_numa_available() -> bool:
+    libnuma = ctypes.CDLL("libnuma.so")
+    return libnuma.numa_available() >= 0
+
+
 def get_system_gpu_count() -> int:
     """
     Get the total number of GPUs in the system (not affected by CUDA_VISIBLE_DEVICES).
