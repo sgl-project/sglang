@@ -183,9 +183,9 @@ class HostKVCache(abc.ABC):
         raise NotImplementedError()
 
     @abc.abstractmethod
-    def get_dummy_flat_data_page(self) -> torch.Tensor:
+    def get_dummy_flat_data_page(self, count: int = 1) -> torch.Tensor:
         """
-        Get a dummy flat data page from the host memory pool.
+        Get `count` dummy flat data page from the host memory pool.
         This is used for prefetching or initializing empty pages.
         """
         raise NotImplementedError()
@@ -195,6 +195,12 @@ class HostKVCache(abc.ABC):
         """
         Set a flat data page to the host memory pool.
         """
+        raise NotImplementedError()
+
+    @abc.abstractmethod
+    def set_from_flat_data(
+        self, indices: torch.Tensor, flat_data: torch.Tensor
+    ) -> None:
         raise NotImplementedError()
 
     @synchronized
@@ -528,9 +534,15 @@ class MHATokenToKVPoolHost(HostKVCache):
             data_page = data_page.flatten()
         return data_page
 
-    def get_dummy_flat_data_page(self) -> torch.Tensor:
+    def get_dummy_flat_data_page(self, count: int = 1) -> torch.Tensor:
         return torch.zeros(
-            (2, self.layer_num, self.page_size, self.head_num, self.head_dim),
+            (
+                2,
+                self.layer_num,
+                self.page_size * count,
+                self.head_num,
+                self.head_dim,
+            ),
             dtype=self.dtype,
             device=self.device,
             pin_memory=self.pin_memory,
@@ -566,6 +578,20 @@ class MHATokenToKVPoolHost(HostKVCache):
                 data_page.reshape(
                     2, 1, self.head_num, self.page_size, self.layer_num, self.head_dim
                 )
+            )
+        else:
+            raise ValueError(f"Unsupported layout: {self.layout}")
+
+    def set_from_flat_data(
+        self, indices: torch.Tensor, flat_data: torch.Tensor
+    ) -> None:
+        if self.layout == "layer_first":
+            self.kv_buffer[:, :, indices, :, :] = flat_data.reshape(
+                2,
+                self.layer_num,
+                len(indices),
+                self.head_num,
+                self.head_dim,
             )
         else:
             raise ValueError(f"Unsupported layout: {self.layout}")
@@ -876,11 +902,11 @@ class MLATokenToKVPoolHost(HostKVCache):
             data_page = data_page.flatten()
         return data_page
 
-    def get_dummy_flat_data_page(self) -> torch.Tensor:
+    def get_dummy_flat_data_page(self, count: int = 1) -> torch.Tensor:
         return torch.zeros(
             (
                 self.layer_num,
-                self.page_size,
+                self.page_size * count,
                 1,
                 self.kv_lora_rank + self.qk_rope_head_dim,
             ),
@@ -910,6 +936,19 @@ class MLATokenToKVPoolHost(HostKVCache):
                 1,
                 self.layer_num,
                 self.page_size,
+                1,
+                self.kv_lora_rank + self.qk_rope_head_dim,
+            )
+        else:
+            raise ValueError(f"Unsupported layout: {self.layout}")
+
+    def set_from_flat_data(
+        self, indices: torch.Tensor, flat_data: torch.Tensor
+    ) -> None:
+        if self.layout == "layer_first":
+            self.kv_buffer[:, indices, :, :] = flat_data.reshape(
+                self.layer_num,
+                len(indices),
                 1,
                 self.kv_lora_rank + self.qk_rope_head_dim,
             )

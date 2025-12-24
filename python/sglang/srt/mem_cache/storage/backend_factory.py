@@ -17,6 +17,7 @@ class StorageBackendFactory:
     """Factory for creating storage backend instances with support for dynamic loading."""
 
     _registry: Dict[str, Dict[str, Any]] = {}
+    _loaded_class: Dict[str, type[HiCacheStorage]] = {}
 
     @staticmethod
     def _load_backend_class(
@@ -54,13 +55,40 @@ class StorageBackendFactory:
 
         def loader() -> type[HiCacheStorage]:
             """Lazy loader function to import the backend class."""
-            return cls._load_backend_class(module_path, class_name, name)
+            if name not in cls._loaded_class:
+                cls._loaded_class[name] = cls._load_backend_class(
+                    module_path, class_name, name
+                )
+            return cls._loaded_class[name]
 
         cls._registry[name] = {
             "loader": loader,
             "module_path": module_path,
             "class_name": class_name,
         }
+
+    @classmethod
+    def get_backend_class(cls, name: str) -> type[HiCacheStorage]:
+        """Get the storage backend class for the given backend name.
+
+        Args:
+            name: Backend identifier
+
+        Returns:
+            The backend class
+
+        Raises:
+            ValueError: If the backend is not registered
+        """
+        if name not in cls._registry:
+            available_backends = list(cls._registry.keys())
+            raise ValueError(
+                f"Unknown storage backend '{name}'. "
+                f"Registered backends: {available_backends}. "
+            )
+
+        registry_entry = cls._registry[name]
+        return registry_entry["loader"]()
 
     @classmethod
     def create_backend(
@@ -183,6 +211,8 @@ class StorageBackendFactory:
             return backend_class.from_env_config(bytes_per_page, dtype, storage_config)
         elif backend_name == "eic":
             return backend_class(storage_config, mem_pool_host)
+        elif backend_name == "gd2fs":
+            return backend_class(storage_config)
         else:
             raise ValueError(f"Unknown built-in backend: {backend_name}")
 
@@ -220,4 +250,10 @@ StorageBackendFactory.register_backend(
     "eic",
     "sglang.srt.mem_cache.storage.eic.eic_storage",
     "EICStorage",
+)
+
+StorageBackendFactory.register_backend(
+    "gd2fs",
+    "sglang.srt.mem_cache.storage.gd2fs.gd2fs_storage",
+    "GD2FSStorage",
 )
