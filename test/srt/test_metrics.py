@@ -15,8 +15,47 @@ from sglang.test.test_utils import (
 class TestEnableMetrics(CustomTestCase):
     def test_metrics_enabled(self):
         """Test that metrics endpoint returns data when enabled"""
+
+        def _verify_metrics(metrics_content):
+            # Verify essential metrics are present
+            essential_metrics = [
+                "sglang:num_running_reqs",
+                "sglang:num_used_tokens",
+                "sglang:token_usage",
+                "sglang:gen_throughput",
+                "sglang:num_queue_reqs",
+                "sglang:num_grammar_queue_reqs",
+                "sglang:cache_hit_rate",
+                "sglang:spec_accept_length",
+                "sglang:prompt_tokens_total",
+                "sglang:generation_tokens_total",
+                "sglang:cached_tokens_total",
+                "sglang:num_requests_total",
+                "sglang:time_to_first_token_seconds",
+                "sglang:inter_token_latency_seconds",
+                "sglang:e2e_request_latency_seconds",
+            ]
+
+            for metric in essential_metrics:
+                self.assertIn(metric, metrics_content, f"Missing metric: {metric}")
+
+            # Verify model name label is present and correct
+            expected_model_name = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
+            self.assertIn(f'model_name="{expected_model_name}"', metrics_content)
+
+            # Verify metrics have values (not empty)
+            self.assertIn("_sum{", metrics_content)
+            self.assertIn("_count{", metrics_content)
+            self.assertIn("_bucket{", metrics_content)
+
+        self._execute_core(
+            model_name=DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
+            verify_metrics=_verify_metrics,
+        )
+
+    def _execute_core(self, model_name: str, verify_metrics):
         process = popen_launch_server(
-            DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
+            model_name,
             DEFAULT_URL_FOR_TEST,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=["--enable-metrics", "--cuda-graph-max-bs", 2],
@@ -49,37 +88,7 @@ class TestEnableMetrics(CustomTestCase):
 
             print(f"metrics_content=\n{metrics_content}")
 
-            # Verify essential metrics are present
-            essential_metrics = [
-                "sglang:num_running_reqs",
-                "sglang:num_used_tokens",
-                "sglang:token_usage",
-                "sglang:gen_throughput",
-                "sglang:num_queue_reqs",
-                "sglang:num_grammar_queue_reqs",
-                "sglang:cache_hit_rate",
-                "sglang:spec_accept_length",
-                "sglang:prompt_tokens_total",
-                "sglang:generation_tokens_total",
-                "sglang:cached_tokens_total",
-                "sglang:num_requests_total",
-                "sglang:time_to_first_token_seconds",
-                "sglang:inter_token_latency_seconds",
-                "sglang:e2e_request_latency_seconds",
-            ]
-
-            for metric in essential_metrics:
-                self.assertIn(metric, metrics_content, f"Missing metric: {metric}")
-
-            # Verify model name label is present and correct
-            expected_model_name = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
-            self.assertIn(f'model_name="{expected_model_name}"', metrics_content)
-
-            # Verify metrics have values (not empty)
-            self.assertIn("_sum{", metrics_content)
-            self.assertIn("_count{", metrics_content)
-            self.assertIn("_bucket{", metrics_content)
-
+            verify_metrics(metrics_content)
         finally:
             kill_process_tree(process.pid)
 
