@@ -265,8 +265,6 @@ class ServerArgs:
     quantization_rank: int = 32
     # Whether to use unsigned activations for INT4.
     quantization_act_unsigned: bool = False
-    # Whether to enable CPU offloading inside Nunchaku models.
-    quantization_enable_offloading: bool = False
 
     # Master port for distributed inference
     # TODO: do not hard code
@@ -596,7 +594,7 @@ class ServerArgs:
             type=str,
             default=ServerArgs.quantization_precision,
             choices=["int4", "nvfp4"],
-            help="Nunchaku quantization precision to use for weights/activations.",
+            help="int4, nvfp4 for Nunchaku SVDQuant quantization precision to use for weights/activations.",
         )
         parser.add_argument(
             "--quantization-rank",
@@ -608,13 +606,7 @@ class ServerArgs:
             "--quantization-act-unsigned",
             action=StoreBoolean,
             default=ServerArgs.quantization_act_unsigned,
-            help="Use unsigned activation quantization for INT4 (recommended for many models).",
-        )
-        parser.add_argument(
-            "--quantization-enable-offloading",
-            action=StoreBoolean,
-            default=ServerArgs.quantization_enable_offloading,
-            help="Enable CPU offloading for Nunchaku quantized models to reduce GPU memory.",
+            help="Use unsigned activation quantization for INT4 (recommended for many models) in Nunchaku SVDQuant.",
         )
 
         # Master port for distributed inference

@@ -43,7 +43,6 @@ class NunchakuConfig(QuantizationConfig):
         group_size: Quantization group size (automatically set based on precision)
         act_unsigned: Use unsigned activation quantization 
         quantized_model_path: Path to pre-quantized model weights (.safetensors)
-        enable_offloading: Enable CPU offloading for low memory
     """
 
     precision: str = "int4"  # "int4" or "nvfp4"
@@ -51,7 +50,6 @@ class NunchakuConfig(QuantizationConfig):
     group_size: Optional[int] = None
     act_unsigned: bool = False
     quantized_model_path: Optional[str] = None
-    enable_offloading: bool = False
 
     @classmethod
     def get_name(cls) -> str:
@@ -78,7 +76,6 @@ class NunchakuConfig(QuantizationConfig):
             group_size=config.get("group_size"),
             act_unsigned=bool(config.get("act_unsigned", False)),
             quantized_model_path=config.get("quantized_model_path"),
-            enable_offloading=bool(config.get("enable_offloading", False)),
         )
 
     def get_quant_method(
@@ -148,7 +145,6 @@ class NunchakuConfig(QuantizationConfig):
             "group_size": self.group_size,
             "act_unsigned": self.act_unsigned,
             "quantized_model_path": self.quantized_model_path,
-            "enable_offloading": self.enable_offloading,
         }
 
     @classmethod

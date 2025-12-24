@@ -38,5 +38,4 @@ def create_nunchaku_config_from_server_args(server_args) -> NunchakuConfig:
         rank=getattr(server_args, "quantization_rank", 32),
         act_unsigned=getattr(server_args, "quantization_act_unsigned", False),
         quantized_model_path=getattr(server_args, "quantized_model_path", None),
-        enable_offloading=getattr(server_args, "quantization_enable_offloading", False),
     )
