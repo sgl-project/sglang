@@ -2,6 +2,7 @@
 
 # SPDX-License-Identifier: Apache-2.0
 from dataclasses import dataclass
+import os
 from typing import Any
 
 import torch
@@ -115,25 +116,56 @@ class FlashAttentionImpl(AttentionImpl):
         return_softmax_lse: bool = False,
     ):
         attn_metadata: FlashAttentionMetadata = get_forward_context().attn_metadata
+        bsz, seqlen_q, num_heads, head_dim = query.shape
+        seqlen_k = key.shape[1]
         if attn_metadata is not None and attn_metadata.max_seqlen_q is None:
-            attn_metadata.max_seqlen_q = query.shape[1]
-            attn_metadata.max_seqlen_k = key.shape[1]
+            attn_metadata.max_seqlen_q = seqlen_q
+            attn_metadata.max_seqlen_k = seqlen_k
             max_seqlen_q = attn_metadata.max_seqlen_q
             max_seqlen_k = attn_metadata.max_seqlen_k
         else:
-            max_seqlen_q = query.shape[1]
-            max_seqlen_k = key.shape[1]
+            max_seqlen_q = seqlen_q
+            max_seqlen_k = seqlen_k
+
+        if (
+            attn_metadata is not None
+            and (attn_metadata.cu_seqlens_q is None or attn_metadata.cu_seqlens_k is None)
+        ):
+            cu_q = (
+                torch.arange(bsz + 1, device=query.device, dtype=torch.int32)
+                * seqlen_q
+            )
+            cu_k = (
+                torch.arange(bsz + 1, device=query.device, dtype=torch.int32)
+                * seqlen_k
+            )
+            attn_metadata.cu_seqlens_q = cu_q
+            attn_metadata.cu_seqlens_k = cu_k
+
+        cu_seqlens_q = None
+        cu_seqlens_k = None
+        if attn_metadata is not None:
+            cu_seqlens_q = attn_metadata.cu_seqlens_q
+            cu_seqlens_k = attn_metadata.cu_seqlens_k
+
+        num_splits_env = os.getenv("SGLANG_MM_FA_NUM_SPLITS", "")
+        num_splits = 1 if num_splits_env == "" else int(num_splits_env)
+
+        query_3d = query.reshape(-1, num_heads, head_dim)
+        key_3d = key.reshape(-1, num_heads, head_dim)
+        value_3d = value.reshape(-1, num_heads, head_dim)
         output = flash_attn_func(
-            q=query,  # type: ignore[no-untyped-call]
-            k=key,
-            v=value,
-            cu_seqlens_q=None,
-            cu_seqlens_k=None,
+            q=query_3d,  # type: ignore[no-untyped-call]
+            k=key_3d,
+            v=value_3d,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
             max_seqlen_q=max_seqlen_q,
             max_seqlen_k=max_seqlen_k,
             softmax_scale=self.softmax_scale,
             causal=self.causal,
+            num_splits=num_splits,
             return_softmax_lse=return_softmax_lse,
             ver=fa_ver,
         )
-        return output
+        return output.view(bsz, seqlen_q, num_heads, head_dim)
