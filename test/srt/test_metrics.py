@@ -33,31 +33,14 @@ class TestEnableMetrics(CustomTestCase):
             print("Skip test_metrics_2gpu since in 1-gpu CI")
             return
 
-        def _verify_metrics_extra(metrics_content):
-            metrics = _parse_prometheus_metrics(metrics_content)
-
+        def _verify_metrics_extra(metrics):
             metrics_to_check = [
-                ("sglang:realtime_tokens_total", {"mode": "prefill_compute"}),
-                ("sglang:realtime_tokens_total", {"mode": "decode"}),
-                ("sglang:gpu_execution_seconds_total", {"category": "forward_prefill"}),
-                ("sglang:gpu_execution_seconds_total", {"category": "forward_decode"}),
-                (
-                    "sglang:dp_cooperation_realtime_tokens_total",
-                    {"mode": "prefill_compute"},
-                ),
+                ("sglang:dp_cooperation_realtime_tokens_total", {"mode": "prefill_compute"}),
                 ("sglang:dp_cooperation_realtime_tokens_total", {"mode": "decode"}),
-                (
-                    "sglang:dp_cooperation_gpu_execution_seconds_total",
-                    {"category": "forward_prefill"},
-                ),
-                (
-                    "sglang:dp_cooperation_gpu_execution_seconds_total",
-                    {"category": "forward_decode"},
-                ),
+                ("sglang:dp_cooperation_gpu_execution_seconds_total", {"category": "forward_prefill"}),
+                ("sglang:dp_cooperation_gpu_execution_seconds_total", {"category": "forward_decode"}),
             ]
-            for metric_name, labels in metrics_to_check:
-                value = _get_sample_value_by_labels(metrics[metric_name], labels)
-                self.assertGreater(value, 0, f"{metric_name} {labels}")
+            _check_metrics_positive(self, metrics, metrics_to_check)
 
             num_prefill_ranks_values = {
                 s.labels["num_prefill_ranks"]
@@ -110,14 +93,14 @@ class TestEnableMetrics(CustomTestCase):
 
             print(f"metrics_content=\n{metrics_content}")
 
-            self._verify_metrics_common(metrics_content)
+            metrics = _parse_prometheus_metrics(metrics_content)
+            self._verify_metrics_common(metrics_content, metrics)
             if verify_metrics_extra is not None:
-                verify_metrics_extra(metrics_content)
+                verify_metrics_extra(metrics)
         finally:
             kill_process_tree(process.pid)
 
-    def _verify_metrics_common(self, metrics_content):
-        # Verify essential metrics are present
+    def _verify_metrics_common(self, metrics_content, metrics):
         essential_metrics = [
             "sglang:num_running_reqs",
             "sglang:num_used_tokens",
@@ -135,18 +118,21 @@ class TestEnableMetrics(CustomTestCase):
             "sglang:inter_token_latency_seconds",
             "sglang:e2e_request_latency_seconds",
         ]
-
         for metric in essential_metrics:
             self.assertIn(metric, metrics_content, f"Missing metric: {metric}")
 
-        # Verify model name label is present and correct
-        expected_model_name = _MODEL_NAME
-        self.assertIn(f'model_name="{expected_model_name}"', metrics_content)
-
-        # Verify metrics have values (not empty)
+        self.assertIn(f'model_name="{_MODEL_NAME}"', metrics_content)
         self.assertIn("_sum{", metrics_content)
         self.assertIn("_count{", metrics_content)
         self.assertIn("_bucket{", metrics_content)
+
+        metrics_to_check = [
+            ("sglang:realtime_tokens_total", {"mode": "prefill_compute"}),
+            ("sglang:realtime_tokens_total", {"mode": "decode"}),
+            ("sglang:gpu_execution_seconds_total", {"category": "forward_prefill"}),
+            ("sglang:gpu_execution_seconds_total", {"category": "forward_decode"}),
+        ]
+        _check_metrics_positive(self, metrics, metrics_to_check)
 
 
 def _parse_prometheus_metrics(metrics_text: str) -> Dict[str, List[Sample]]:
@@ -164,6 +150,12 @@ def _get_sample_value_by_labels(samples: List[Sample], labels: Dict[str, str]) -
         if all(sample.labels.get(k) == v for k, v in labels.items()):
             return sample.value
     raise KeyError(f"No sample found with labels {labels}")
+
+
+def _check_metrics_positive(test_case, metrics, metrics_to_check):
+    for metric_name, labels in metrics_to_check:
+        value = _get_sample_value_by_labels(metrics[metric_name], labels)
+        test_case.assertGreater(value, 0, f"{metric_name} {labels}")
 
 
 if __name__ == "__main__":
