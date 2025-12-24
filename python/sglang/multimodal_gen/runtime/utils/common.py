@@ -240,6 +240,9 @@ def get_zmq_socket(
     return socket, endpoint
 
 
+# hardware
+
+
 # https://pytorch.org/docs/stable/notes/hip.html#checking-for-hip
 @lru_cache(maxsize=1)
 def is_hip() -> bool:
@@ -261,6 +264,25 @@ def is_blackwell():
     if not is_cuda():
         return False
     return torch.cuda.get_device_capability()[0] == 10
+
+
+def _is_hip():
+    return torch.version.hip is not None
+
+
+def _is_cuda():
+    return torch.version.cuda is not None
+
+
+def _is_musa():
+    try:
+        return hasattr(torch, "musa") and torch.musa.is_available()
+    except ModuleNotFoundError:
+        return False
+
+
+def _is_mps():
+    return torch.backends.mps.is_available()
 
 
 @lru_cache(maxsize=1)
@@ -298,6 +320,19 @@ def is_host_cpu_x86() -> bool:
 @lru_cache(maxsize=1)
 def is_cpu() -> bool:
     return os.getenv("SGLANG_USE_CPU_ENGINE", "0") == "1" and is_host_cpu_x86()
+
+
+def get_torch_distributed_backend() -> str:
+    if _is_cuda():
+        return "nccl"
+    elif _is_musa():
+        return "mccl"
+    elif _is_mps():
+        return "gloo"
+    else:
+        raise NotImplementedError(
+            "No Accelerators(AMD/NV/MTT GPU, AMD MI instinct accelerators) available"
+        )
 
 
 # cuda
