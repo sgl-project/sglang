@@ -88,10 +88,10 @@ class SchedulerUpdateWeightsMixin:
         self: Scheduler, recv_req: UpdateWeightsFromTensorReqInput
     ):
         """Update the online model parameter from tensors."""
-        if self.server_args.speculative_draft_model_update:
+        if self.server_args.speculative_draft_model_frozen:
             worker = self.tp_worker
         else:
-            worker = self.draft_worker or self.tp_workerc
+            worker = self.draft_worker or self.tp_worker
         success, message = worker.update_weights_from_tensor(recv_req)
         # TODO extract common code b/t update_weights_from_distributed and update_weights_from_tensor later
         if success:
