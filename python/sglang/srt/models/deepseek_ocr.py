@@ -39,6 +39,7 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek import DeepseekForCausalLM
 from sglang.srt.models.deepseek_v2 import DeepseekV2ForCausalLM, DeepseekV3ForCausalLM
 from sglang.srt.models.transformers import maybe_prefix
+from sglang.srt.utils import DynamicGradMode
 
 NestedTensors: TypeAlias = Union[
     list["NestedTensors"],
@@ -1250,7 +1251,7 @@ class DeepseekOCRForCausalLM(nn.Module):
 
         images_in_this_batch = []
 
-        with torch.no_grad():
+        with DynamicGradMode():
             for jdx in range(images_spatial_crop.size(0)):
                 patches = images_crop[jdx][0].to(torch.bfloat16)
                 image_ori = pixel_values[jdx]

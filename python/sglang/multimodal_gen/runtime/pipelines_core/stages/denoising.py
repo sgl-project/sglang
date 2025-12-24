@@ -69,6 +69,7 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.perf_logger import StageProfiler
 from sglang.multimodal_gen.runtime.utils.profiler import SGLDiffusionProfiler
 from sglang.multimodal_gen.utils import dict_to_3d_list, masks_like
+from sglang.srt.utils import DynamicGradMode
 
 try:
     from sglang.multimodal_gen.runtime.layers.attention.backends.sliding_tile_attn import (
@@ -937,7 +938,7 @@ class DenoisingStage(PipelineStage):
 
         return latents
 
-    @torch.no_grad()
+    @DynamicGradMode()
     def forward(
         self,
         batch: Req,

@@ -24,6 +24,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.srt.utils import DynamicGradMode
 
 logger = init_logger(__name__)
 
@@ -45,7 +46,7 @@ class TextEncodingStage(PipelineStage):
         self.tokenizers = tokenizers
         self.text_encoders = text_encoders
 
-    @torch.no_grad()
+    @DynamicGradMode()
     def forward(
         self,
         batch: Req,
@@ -136,7 +137,7 @@ class TextEncodingStage(PipelineStage):
 
         return tok_kwargs
 
-    @torch.no_grad()
+    @DynamicGradMode()
     def encode_text(
         self,
         text: str | list[str],

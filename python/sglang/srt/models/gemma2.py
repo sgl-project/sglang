@@ -39,7 +39,7 @@ from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
 )
-from sglang.srt.utils import add_prefix, make_layers
+from sglang.srt.utils import DynamicGradMode, add_prefix, make_layers
 
 
 # Aligned with HF's implementation, using sliding window inclusive with the last token
@@ -368,7 +368,7 @@ class Gemma2ForCausalLM(nn.Module):
         )
         self.logits_processor = LogitsProcessor(config)
 
-    @torch.no_grad()
+    @DynamicGradMode()
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -381,7 +381,7 @@ class Gemma2ForCausalLM(nn.Module):
             input_ids, hidden_states, self.model.embed_tokens, forward_batch
         )
 
-    @torch.no_grad()
+    @DynamicGradMode()
     def forward_split_prefill(
         self,
         input_ids: torch.Tensor,

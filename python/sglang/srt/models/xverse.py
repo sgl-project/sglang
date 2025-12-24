@@ -40,7 +40,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.model_runner import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.utils import add_prefix
+from sglang.srt.utils import DynamicGradMode, add_prefix
 
 
 class XverseMLP(nn.Module):
@@ -316,7 +316,7 @@ class XverseForCausalLM(nn.Module):
         )
         self.logits_processor = LogitsProcessor(config)
 
-    @torch.no_grad()
+    @DynamicGradMode()
     def forward(
         self,
         input_ids: torch.Tensor,

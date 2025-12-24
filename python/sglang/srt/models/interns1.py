@@ -22,6 +22,7 @@ from sglang.srt.models.internvl import InternVisionModel
 from sglang.srt.models.qwen2 import Qwen2ForCausalLM
 from sglang.srt.models.qwen3 import Qwen3ForCausalLM
 from sglang.srt.models.qwen3_moe import Qwen3MoeForCausalLM
+from sglang.srt.utils import DynamicGradMode
 from sglang.utils import logger
 
 
@@ -133,7 +134,7 @@ class InternS1ForConditionalGeneration(nn.Module):
         image_features = self.extract_feature(pixel_values)
         return image_features
 
-    @torch.no_grad()
+    @DynamicGradMode()
     def forward(
         self,
         input_ids: torch.Tensor,

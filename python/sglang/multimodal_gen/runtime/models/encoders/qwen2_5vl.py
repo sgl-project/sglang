@@ -28,6 +28,7 @@ from sglang.multimodal_gen.runtime.loader.weight_utils import default_weight_loa
 from sglang.multimodal_gen.runtime.models.encoders.base import TextEncoder
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.utils.common import add_prefix
+from sglang.srt.utils import DynamicGradMode
 
 # coding=utf-8
 # Adapted from
@@ -1069,7 +1070,7 @@ class Qwen2_5_VLForConditionalGeneration(TextEncoder):
     def get_input_embeddings(self):
         return self.model.embed_tokens
 
-    @torch.no_grad()
+    @DynamicGradMode()
     def forward(
         self,
         input_ids: torch.LongTensor = None,

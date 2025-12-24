@@ -4,9 +4,10 @@
 # type: ignore
 import os
 
-import torch
 import torch.nn as nn
 from transformers import BertModel, BertTokenizer
+
+from sglang.srt.utils import DynamicGradMode
 
 
 class HunyuanClip(nn.Module):
@@ -26,7 +27,7 @@ class HunyuanClip(nn.Module):
             os.path.join(model_dir, "clip_text_encoder")
         )
 
-    @torch.no_grad
+    @DynamicGradMode()
     def forward(self, prompts, with_mask=True):
         self.device = next(self.text_encoder.parameters()).device
         text_inputs = self.tokenizer(

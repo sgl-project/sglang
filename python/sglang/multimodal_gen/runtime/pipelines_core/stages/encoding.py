@@ -21,6 +21,7 @@ from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
+from sglang.srt.utils import DynamicGradMode
 
 logger = init_logger(__name__)
 
@@ -36,7 +37,7 @@ class EncodingStage(PipelineStage):
     def __init__(self, vae: ParallelTiledVAE) -> None:
         self.vae: ParallelTiledVAE = vae
 
-    @torch.no_grad()
+    @DynamicGradMode()
     def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
         """Verify encoding stage inputs."""
         result = VerificationResult()

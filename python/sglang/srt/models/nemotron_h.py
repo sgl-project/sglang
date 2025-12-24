@@ -62,6 +62,7 @@ from sglang.srt.model_loader.weight_utils import (
 )
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
+    DynamicGradMode,
     add_prefix,
     get_current_device_stream_fast,
     is_cuda,
@@ -641,7 +642,7 @@ class NemotronHForCausalLM(nn.Module):
     def get_input_embeddings(self) -> VocabParallelEmbedding:
         return self.model.embed_tokens
 
-    @torch.no_grad()
+    @DynamicGradMode()
     def forward(
         self,
         input_ids: torch.Tensor,

@@ -39,6 +39,7 @@ from sglang.srt.models.phi4mm_utils import (
     get_offset,
     unfold_tensor,
 )
+from sglang.srt.utils import DynamicGradMode
 
 _AUDIO_PLACEHOLDER_TOKEN_ID = 200011  # <|endoftext11|>
 
@@ -1196,7 +1197,7 @@ class AudioEmbedding(nn.Module):
             input_embeds: audio features (B, T, D)  B: num audios in a sequence
         """
         if self.freeze_audio_processor:
-            with torch.no_grad():
+            with DynamicGradMode():
                 audio_features, masks = self.encoder(input_embeds, audio_attention_mask)
         else:
             audio_features, masks = self.encoder(input_embeds, audio_attention_mask)

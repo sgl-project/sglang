@@ -34,7 +34,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.glm4_moe import Glm4MoeDecoderLayer, Glm4MoeForCausalLM
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import add_prefix
+from sglang.srt.utils import DynamicGradMode, add_prefix
 
 logger = logging.getLogger(__name__)
 
@@ -143,7 +143,7 @@ class Glm4MoeForCausalLMNextN(Glm4MoeForCausalLM):
             0 if get_global_server_args().disable_shared_experts_fusion else 1
         )
 
-    @torch.no_grad()
+    @DynamicGradMode()
     def forward(
         self,
         input_ids: torch.Tensor,

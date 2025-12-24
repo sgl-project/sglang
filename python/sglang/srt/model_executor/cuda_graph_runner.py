@@ -62,6 +62,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.model_executor.input_buffers import GraphInputBuffers
 from sglang.srt.multiplex.pdmux_context import get_current_stream_idx, get_stream_groups
 from sglang.srt.utils import (
+    DynamicGradMode,
     empty_context,
     get_available_gpu_memory,
     get_bool_env_var,
@@ -156,7 +157,7 @@ def patch_model(
             # even with ENABLE_INTRA_NODE_COMM=1.
             # tp_group.ca_comm = None
             yield torch.compile(
-                torch.no_grad()(model.forward),
+                DynamicGradMode()(model.forward),
                 mode=os.environ.get(
                     "SGLANG_TORCH_COMPILE_MODE", "max-autotune-no-cudagraphs"
                 ),

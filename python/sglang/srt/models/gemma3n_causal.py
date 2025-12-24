@@ -25,7 +25,7 @@ from sglang.srt.model_loader.weight_utils import (
     maybe_remap_kv_scale_name,
 )
 from sglang.srt.models.gemma3_causal import Gemma3TextScaledWordEmbedding
-from sglang.srt.utils import add_prefix, make_layers
+from sglang.srt.utils import DynamicGradMode, add_prefix, make_layers
 
 
 # Aligned with HF's implementation, using sliding window inclusive with the last token
@@ -933,7 +933,7 @@ class Gemma3nForCausalLM(PreTrainedModel):
     def dtype(self) -> torch.dtype:
         return next(self.parameters()).dtype
 
-    @torch.no_grad()
+    @DynamicGradMode()
     def forward(
         self,
         input_ids: torch.Tensor,

@@ -36,7 +36,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.nemotron_h import NemotronHForCausalLM
 from sglang.srt.models.radio import RadioModel
-from sglang.srt.utils import add_prefix
+from sglang.srt.utils import DynamicGradMode, add_prefix
 
 logger = logging.getLogger(__name__)
 
@@ -161,7 +161,7 @@ class NemotronH_Nano_VL_V2(nn.Module):
         video_features = self.extract_feature(pixel_values)
         return video_features
 
-    @torch.no_grad()
+    @DynamicGradMode()
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -206,7 +206,7 @@ class NemotronH_Nano_VL_V2(nn.Module):
                 # Load vision-language adapter weights directly
                 trimmed_name = ".".join(name.split(".")[1:])
                 param = adapter_dict[trimmed_name]
-                with torch.no_grad():
+                with DynamicGradMode():
                     default_weight_loader(param, w)
             elif is_vision_weights(name):
                 # Convert: vision_model.radio_model.* → radio_model.*

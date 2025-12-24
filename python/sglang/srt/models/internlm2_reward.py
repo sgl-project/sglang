@@ -22,7 +22,7 @@ from sglang.srt.layers.pooler import EmbeddingPoolerOutput, Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.internlm2 import InternLM2ForCausalLM, InternLM2Model
-from sglang.srt.utils import add_prefix
+from sglang.srt.utils import DynamicGradMode, add_prefix
 
 
 class InternLM2ForRewardModel(nn.Module):
@@ -42,7 +42,7 @@ class InternLM2ForRewardModel(nn.Module):
         self.v_head = nn.Linear(config.hidden_size, 1, bias=False)
         self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=False)
 
-    @torch.no_grad()
+    @DynamicGradMode()
     def forward(
         self,
         input_ids: torch.Tensor,

@@ -41,7 +41,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.utils import add_prefix
+from sglang.srt.utils import DynamicGradMode, add_prefix
 
 LoraConfig = None
 
@@ -393,7 +393,7 @@ class ChatGLMForCausalLM(nn.Module):
         self.lm_head = self.transformer.output_layer
         self.logits_processor = LogitsProcessor(config)
 
-    @torch.no_grad()
+    @DynamicGradMode()
     def forward(
         self,
         input_ids: torch.Tensor,

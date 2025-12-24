@@ -70,7 +70,13 @@ from sglang.srt.models.utils import (
     enable_fused_set_kv_buffer,
 )
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import LazyValue, add_prefix, is_cuda, make_layers
+from sglang.srt.utils import (
+    DynamicGradMode,
+    LazyValue,
+    add_prefix,
+    is_cuda,
+    make_layers,
+)
 
 _is_cuda = is_cuda()
 
@@ -602,7 +608,7 @@ class GptOssForCausalLM(nn.Module):
     def routed_experts_weights_of_layer(self):
         return self._routed_experts_weights_of_layer.value
 
-    @torch.no_grad()
+    @DynamicGradMode()
     def forward(
         self,
         input_ids: torch.Tensor,

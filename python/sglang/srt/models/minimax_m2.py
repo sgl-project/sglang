@@ -64,6 +64,7 @@ from sglang.srt.model_loader.weight_utils import (
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     BumpAllocator,
+    DynamicGradMode,
     add_prefix,
     get_compiler_backend,
     is_non_idle_and_non_empty,
@@ -783,7 +784,7 @@ class MiniMaxM2ForCausalLM(nn.Module):
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight
 
-    @torch.no_grad()
+    @DynamicGradMode()
     def forward(
         self,
         input_ids: torch.Tensor,

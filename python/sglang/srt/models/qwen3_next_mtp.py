@@ -28,7 +28,7 @@ from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.qwen3_next import Qwen3NextForCausalLM, Qwen3NextModel
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import add_prefix
+from sglang.srt.utils import DynamicGradMode, add_prefix
 
 logger = logging.getLogger(__name__)
 
@@ -72,7 +72,7 @@ class Qwen3NextForCausalLMMTP(Qwen3NextForCausalLM):
         )
         self.logits_processor = LogitsProcessor(config)
 
-    @torch.no_grad()
+    @DynamicGradMode()
     def forward(
         self,
         input_ids: torch.Tensor,

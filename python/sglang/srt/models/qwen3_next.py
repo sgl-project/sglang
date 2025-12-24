@@ -59,7 +59,7 @@ import triton
 import triton.language as tl
 
 from sglang.srt.compilation.piecewise_context_manager import get_forward_context
-from sglang.srt.utils import direct_register_custom_op
+from sglang.srt.utils import DynamicGradMode, direct_register_custom_op
 
 
 @triton.jit
@@ -899,7 +899,7 @@ class Qwen3NextForCausalLM(nn.Module):
     def routed_experts_weights_of_layer(self):
         return self._routed_experts_weights_of_layer.value
 
-    @torch.no_grad()
+    @DynamicGradMode()
     def forward(
         self,
         input_ids: torch.Tensor,

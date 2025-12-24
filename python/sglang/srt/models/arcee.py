@@ -49,7 +49,7 @@ from sglang.srt.model_loader.weight_utils import (
     maybe_remap_kv_scale_name,
 )
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import add_prefix, make_layers
+from sglang.srt.utils import DynamicGradMode, add_prefix, make_layers
 
 logger = logging.getLogger(__name__)
 
@@ -428,7 +428,7 @@ class ArceeForCausalLM(nn.Module):
     ):
         return ArceeModel(config, quant_config=quant_config, prefix=prefix)
 
-    @torch.no_grad()
+    @DynamicGradMode()
     def forward(
         self,
         input_ids: torch.Tensor,

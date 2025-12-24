@@ -42,7 +42,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_v2 import DeepseekV2MLP as Ernie4MLP
 from sglang.srt.models.llama import LlamaAttention as Ernie4Attention
-from sglang.srt.utils import add_prefix, make_layers
+from sglang.srt.utils import DynamicGradMode, add_prefix, make_layers
 
 
 class MoEGate(nn.Module):
@@ -261,7 +261,7 @@ class Ernie4Model(nn.Module):
 
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-    @torch.no_grad()
+    @DynamicGradMode()
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -321,7 +321,7 @@ class Ernie4_5_ForCausalLM(nn.Module):
             )
         self.logits_processor = LogitsProcessor(config)
 
-    @torch.no_grad()
+    @DynamicGradMode()
     def forward(
         self,
         input_ids: torch.Tensor,

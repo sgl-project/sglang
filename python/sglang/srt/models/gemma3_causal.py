@@ -43,7 +43,7 @@ from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
 )
-from sglang.srt.utils import add_prefix, make_layers
+from sglang.srt.utils import DynamicGradMode, add_prefix, make_layers
 
 
 # Aligned with HF's implementation, using sliding window inclusive with the last token
@@ -419,7 +419,7 @@ class Gemma3RotaryEmbedding(nn.Module):
             self.register_buffer("inv_freq", self.original_inv_freq, persistent=False)
             self.max_seq_len_cached = self.original_max_seq_len
 
-    @torch.no_grad()
+    @DynamicGradMode()
     def forward(self, x, position_ids):
         if "dynamic" in self.rope_type:
             self._dynamic_frequency_update(position_ids, device=x.device)
@@ -635,7 +635,7 @@ class Gemma3ForCausalLM(PreTrainedModel):
     def dtype(self) -> torch.dtype:
         return next(self.parameters()).dtype
 
-    @torch.no_grad()
+    @DynamicGradMode()
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -652,7 +652,7 @@ class Gemma3ForCausalLM(PreTrainedModel):
             input_ids, hidden_states, self.model.embed_tokens, forward_batch
         )
 
-    @torch.no_grad()
+    @DynamicGradMode()
     def forward_split_prefill(
         self,
         input_ids: torch.Tensor,

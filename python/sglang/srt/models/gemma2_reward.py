@@ -22,7 +22,7 @@ from sglang.srt.layers.pooler import EmbeddingPoolerOutput, Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.gemma2 import Gemma2ForCausalLM, Gemma2Model
-from sglang.srt.utils import add_prefix
+from sglang.srt.utils import DynamicGradMode, add_prefix
 
 
 class Gemma2ForSequenceClassification(nn.Module):
@@ -44,7 +44,7 @@ class Gemma2ForSequenceClassification(nn.Module):
 
         self.eos_token_id = config.eos_token_id
 
-    @torch.no_grad()
+    @DynamicGradMode()
     def forward(
         self,
         input_ids: torch.Tensor,

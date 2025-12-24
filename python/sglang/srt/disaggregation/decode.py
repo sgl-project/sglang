@@ -61,7 +61,7 @@ from sglang.srt.mem_cache.memory_pool import (
     SWAKVPool,
 )
 from sglang.srt.tracing.trace import trace_event_batch, trace_slice_end
-from sglang.srt.utils import get_int_env_var
+from sglang.srt.utils import DynamicGradMode, get_int_env_var
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 logger = logging.getLogger(__name__)
@@ -829,7 +829,7 @@ class DecodeTransferQueue:
 
 class SchedulerDisaggregationDecodeMixin:
 
-    @torch.no_grad()
+    @DynamicGradMode()
     def event_loop_normal_disagg_decode(self: Scheduler):
         """A normal scheduler loop for decode worker in disaggregation mode."""
 
@@ -855,7 +855,7 @@ class SchedulerDisaggregationDecodeMixin:
             # Update last_batch
             self.last_batch = batch
 
-    @torch.no_grad()
+    @DynamicGradMode()
     def event_loop_overlap_disagg_decode(self: Scheduler):
         self.result_queue = deque()
         self.last_batch: Optional[ScheduleBatch] = None

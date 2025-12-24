@@ -51,7 +51,7 @@ from sglang.srt.multimodal.mm_utils import (
     unpad_image,
     unpad_image_shape,
 )
-from sglang.srt.utils import add_prefix, flatten_nested_list, logger
+from sglang.srt.utils import DynamicGradMode, add_prefix, flatten_nested_list, logger
 
 
 class LlavaBaseForCausalLM(nn.Module):
@@ -147,7 +147,7 @@ class LlavaBaseForCausalLM(nn.Module):
         image_features = self.multi_modal_projector(selected_image_feature)
         return image_features
 
-    @torch.no_grad()
+    @DynamicGradMode()
     def forward(
         self,
         input_ids: torch.LongTensor,

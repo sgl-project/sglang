@@ -42,7 +42,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.utils import add_prefix
+from sglang.srt.utils import DynamicGradMode, add_prefix
 from sglang.utils import get_exception_traceback
 
 logger = logging.getLogger(__name__)
@@ -345,7 +345,7 @@ class GraniteForCausalLM(nn.Module):
             (".gate_up_proj", ".up_proj", 1),
         ]
 
-    @torch.no_grad()
+    @DynamicGradMode()
     def forward(
         self,
         input_ids: torch.Tensor,
