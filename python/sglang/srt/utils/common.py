@@ -3782,54 +3782,66 @@ def get_or_create_event_loop():
         return loop
 
 
+def get_numa_node_count() -> int:
+    """
+    Get the number of NUMA nodes available on the system.
+
+    Returns:
+        int: The number of NUMA nodes.
+    """
+    libnuma = ctypes.CDLL("libnuma.so")
+    if libnuma.numa_available() < 0:
+        raise SystemError("numa not available on this system")
+    return libnuma.numa_max_node() + 1
+
+def get_system_gpu_count() -> int:
+    """
+    Get the total number of GPUs in the system (not affected by CUDA_VISIBLE_DEVICES).
+
+    Returns:
+        int: The total number of physical GPUs.
+    """
+    result = subprocess.run(
+            ["nvidia-smi", "--list-gpus"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    gpu_lines = [line for line in result.stdout.strip().split('\n') 
+                     if line.strip().startswith("GPU")]
+    return len(gpu_lines)
+
+
 @lru_cache(maxsize=1)
 def get_current_device_numa_node() -> int:
     """
     Retrieve the NUMA node ID of the CPU socket closest to the currently active CUDA device.
 
-    Executes `nvidia-smi topo -C -i <device_id>` and parses the single-line output.
-    The result is cached since system topology does not change at runtime.
+    Distributes GPUs evenly across NUMA nodes based on GPU ID.
+    For example, with 8 GPUs and 2 NUMA nodes: GPUs 0-3 -> node 0, GPUs 4-7 -> node 1.
 
     Returns:
         int: The NUMA node ID (e.g., 0, 1).
 
     Raises:
-        RuntimeError: If nvidia-smi fails, is not found, or output cannot be parsed.
+        RuntimeError: If device information cannot be retrieved.
     """
     import torch
 
     logical_device_id = torch.cuda.current_device()
     physical_device_id = get_physical_device_id(logical_device_id)
-
-    try:
-        result = subprocess.run(
-            ["nvidia-smi", "topo", "-C", "-i", str(physical_device_id)],
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-    except FileNotFoundError:
-        raise RuntimeError("nvidia-smi not found. Ensure NVIDIA drivers are installed.")
-    except subprocess.CalledProcessError as e:
-        raise RuntimeError(
-            f"nvidia-smi failed (code {e.returncode}): {e.stderr.strip()}"
-        ) from e
-
-    output_line = result.stdout.strip()
-    prefix = "NUMA IDs of closest CPU:"
-
-    if not output_line.startswith(prefix):
-        raise RuntimeError(
-            f"Unexpected nvidia-smi output: '{output_line}'. "
-            f"Expected line starting with '{prefix}'."
-        )
-
-    try:
-        numa_str_raw = output_line[len(prefix) :].strip()
-        first_numa_node = numa_str_raw.replace(',', '-').split('-')[0]
-        return int(first_numa_node)
-    except ValueError as e:
-        raise RuntimeError(f"Failed to parse NUMA ID from: '{output_line}'") from e
+    
+    numa_count = get_numa_node_count()
+    gpu_count = get_system_gpu_count()
+    
+    if gpu_count >= numa_count:
+        gpus_per_numa = gpu_count // numa_count # >= 1
+        numa_node = physical_device_id // gpus_per_numa # 0 ~ numa_count - 1
+    else:
+        logger.warning(f"GPU count {gpu_count} is less than NUMA count {numa_count}. Using first NUMA node.")
+        numa_node = 0
+    
+    return numa_node
 
 
 def bind_to_closest_numa_node():
