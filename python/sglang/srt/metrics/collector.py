@@ -718,15 +718,12 @@ class SchedulerMetricsCollector:
     def increment_realtime_tokens(
         self, prefill_compute_tokens=0, prefill_cache_tokens=0, decode_tokens=0
     ):
-        self.realtime_tokens_total.labels(**self.labels, mode="prefill_compute").inc(
-            prefill_compute_tokens
-        )
-        self.realtime_tokens_total.labels(**self.labels, mode="prefill_cache").inc(
-            prefill_cache_tokens
-        )
-        self.realtime_tokens_total.labels(**self.labels, mode="decode").inc(
-            decode_tokens
-        )
+        for mode, delta in [
+            ("prefill_compute", prefill_compute_tokens),
+            ("prefill_cache", prefill_cache_tokens),
+            ("decode", decode_tokens),
+        ]:
+            self.realtime_tokens_total.labels(**self.labels, mode=mode).inc(delta)
 
     def increment_gpu_execution_seconds(self, category: str, t: float):
         logger.debug(f"GPU execution seconds: {category=} {t=:.3f}")
