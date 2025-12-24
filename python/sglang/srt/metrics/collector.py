@@ -680,6 +680,19 @@ class SchedulerMetricsCollector:
             labelnames=list(labels.keys()) + ["category"],
         )
 
+        self.dp_cooperation_realtime_tokens_total = Counter(
+            name="sglang:dp_cooperation_realtime_tokens_total",
+            documentation="Total number of tokens processed with labels about DP cooperation.",
+            labelnames=list(labels.keys())
+            + ["mode", "num_prefill_ranks", "num_decode_ranks"],
+        )
+        self.dp_cooperation_gpu_execution_seconds_total = Counter(
+            name="sglang:dp_cooperation_gpu_execution_seconds_total",
+            documentation="Total time that GPU is busy executing a workload with labels about DP cooperation.",
+            labelnames=list(labels.keys())
+            + ["category", "num_prefill_ranks", "num_decode_ranks"],
+        )
+
     def _log_gauge(self, gauge, data: Union[int, float]) -> None:
         # Convenience function for logging to gauge.
         gauge.labels(**self.labels).set(data)
