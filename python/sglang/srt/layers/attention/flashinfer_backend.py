@@ -16,6 +16,10 @@ from typing import TYPE_CHECKING, Callable, List, Optional, Union
 
 import torch
 
+from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+    SymmetricMemoryContext,
+    use_symmetric_memory,
+)
 from sglang.srt.distributed.parallel_state import get_dcp_group
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.environ import envs
@@ -905,6 +909,9 @@ class FlashInferAttnBackend(AttentionBackend):
 
         q = q.contiguous()
         if self.dcp_size > 1:
+            with use_symmetric_memory(get_dcp_group()) as sm_context:
+                if isinstance(sm_context, SymmetricMemoryContext):
+                    q = q.clone()
             q = get_dcp_group().all_gather(q, dim=1)
 
         if k is not None:
@@ -931,6 +938,10 @@ class FlashInferAttnBackend(AttentionBackend):
             v_scale=layer.v_scale_float,
         )
         if self.dcp_size > 1:
+            with use_symmetric_memory(get_dcp_group()) as sm_context:
+                if isinstance(sm_context, SymmetricMemoryContext):
+                    o = o.clone()
+                    s = s.clone()
             o = cp_lse_ag_out_rs(o, s, get_dcp_group())
 
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
