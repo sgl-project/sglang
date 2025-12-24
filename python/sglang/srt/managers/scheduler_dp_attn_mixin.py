@@ -15,6 +15,9 @@ if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
 
 
+_ENABLE_METRICS_DP_ATTENTION = envs.SGLANG_ENABLE_METRICS_DP_ATTENTION.get()
+
+
 @dataclass
 class MLPSyncBatchInfo:
     dp_size: int
