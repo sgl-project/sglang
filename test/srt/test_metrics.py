@@ -35,10 +35,19 @@ class TestEnableMetrics(CustomTestCase):
 
         def _verify_metrics_extra(metrics):
             metrics_to_check = [
-                ("sglang:dp_cooperation_realtime_tokens_total", {"mode": "prefill_compute"}),
+                (
+                    "sglang:dp_cooperation_realtime_tokens_total",
+                    {"mode": "prefill_compute"},
+                ),
                 ("sglang:dp_cooperation_realtime_tokens_total", {"mode": "decode"}),
-                ("sglang:dp_cooperation_gpu_execution_seconds_total", {"category": "forward_prefill"}),
-                ("sglang:dp_cooperation_gpu_execution_seconds_total", {"category": "forward_decode"}),
+                (
+                    "sglang:dp_cooperation_gpu_execution_seconds_total",
+                    {"category": "forward_prefill"},
+                ),
+                (
+                    "sglang:dp_cooperation_gpu_execution_seconds_total",
+                    {"category": "forward_decode"},
+                ),
             ]
             _check_metrics_positive(self, metrics, metrics_to_check)
 
