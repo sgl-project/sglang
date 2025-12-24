@@ -48,6 +48,7 @@ from torch.distributed import ProcessGroup
 import sglang.multimodal_gen.envs as envs
 from sglang.multimodal_gen.envs import get_torch_distributed_backend
 from sglang.multimodal_gen.runtime.distributed.utils import StatelessProcessGroup
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 from ..utils.distributed import RankGenerator
@@ -55,7 +56,6 @@ from .group_coordinator import (
     GroupCoordinator,
     PipelineGroupCoordinator,
     SequenceParallelGroupCoordinator,
-    get_local_torch_device,
 )
 
 logger = init_logger(__name__)
@@ -222,9 +222,6 @@ def init_distributed_environment(
     backend: str = "nccl",
     device_id: torch.device | None = None,
 ):
-    # Determine the appropriate backend based on the platform
-    from sglang.multimodal_gen.runtime.platforms import current_platform
-
     if backend == "nccl" and not current_platform.is_cuda_alike():
         # Use gloo backend for non-CUDA platforms (MPS, CPU)
         backend = "gloo"
@@ -575,8 +572,6 @@ def maybe_init_distributed_environment_and_model_parallel(
     dp_size: int = 1,
     distributed_init_method: str = "env://",
 ):
-    from sglang.multimodal_gen.runtime.platforms import current_platform
-
     if _WORLD is not None and model_parallel_is_initialized():
         # make sure the tp and sp sizes are correct
         assert (
@@ -589,7 +584,7 @@ def maybe_init_distributed_environment_and_model_parallel(
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     world_size = int(os.environ.get("WORLD_SIZE", 1))
     rank = int(os.environ.get("RANK", 0))
-    device = get_local_torch_device()
+    device = current_platform.get_local_torch_device()
     logger.info(
         "Initializing distributed environment with world_size=%d, device=%s",
         world_size,

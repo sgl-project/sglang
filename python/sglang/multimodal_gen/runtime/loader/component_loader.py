@@ -23,7 +23,6 @@ from transformers import AutoImageProcessor, AutoProcessor, AutoTokenizer
 from transformers.utils import SAFE_WEIGHTS_INDEX_NAME
 
 from sglang.multimodal_gen.configs.models import EncoderConfig, ModelConfig
-from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.loader.fsdp_load import (
     maybe_load_fsdp_model,
     shard_model,
@@ -108,7 +107,7 @@ class ComponentLoader(ABC):
                 else torch.device("cpu")
             )
         else:
-            return get_local_torch_device()
+            return current_platform.get_local_torch_device()
 
     def load(
         self,
@@ -427,7 +426,7 @@ class TextEncoderLoader(ComponentLoader):
     ):
         # Determine CPU offload behavior and target device
 
-        local_torch_device = get_local_torch_device()
+        local_torch_device = current_platform.get_local_torch_device()
         should_offload = self.should_offload(server_args, model_config)
         with set_default_torch_dtype(PRECISION_TO_TYPE[dtype]):
             with local_torch_device, skip_init_modules():
@@ -690,7 +689,7 @@ class TransformerLoader(ComponentLoader):
             model_cls=model_cls,
             init_params={"config": dit_config, "hf_config": hf_config},
             weight_dir_list=safetensors_list,
-            device=get_local_torch_device(),
+            device=current_platform.get_local_torch_device(),
             hsdp_replicate_dim=server_args.hsdp_replicate_dim,
             hsdp_shard_dim=server_args.hsdp_shard_dim,
             cpu_offload=server_args.dit_cpu_offload,

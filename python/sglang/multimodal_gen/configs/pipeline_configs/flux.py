@@ -30,7 +30,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.hunyuan import (
     clip_preprocess_text,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import _pack_latents
-from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
+from sglang.multimodal_gen.runtime.platforms import current_platform
 
 
 def t5_postprocess_text(outputs: BaseEncoderOutput, _text_inputs) -> torch.Tensor:
@@ -487,7 +487,9 @@ class Flux2PipelineConfig(FluxPipelineConfig):
         # get image_latent_ids right after scale & shift
         image_latent_ids = _prepare_image_ids([latent_condition])
         image_latent_ids = image_latent_ids.repeat(batch_size, 1, 1)
-        image_latent_ids = image_latent_ids.to(get_local_torch_device())
+        image_latent_ids = image_latent_ids.to(
+            current_platform.get_local_torch_device()
+        )
         batch.condition_image_latent_ids = image_latent_ids
 
         # latent: (1, 128, 32, 32)

@@ -116,6 +116,10 @@ class Platform:
         return self._enum == PlatformEnum.MPS
 
     @classmethod
+    def get_local_torch_device(cls) -> torch.device:
+        raise NotImplementedError
+
+    @classmethod
     def get_attn_backend_cls_str(
         cls,
         selected_backend: AttentionBackendEnum | None,

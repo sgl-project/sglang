@@ -6,7 +6,6 @@ Latent preparation stage for diffusion pipelines.
 """
 from diffusers.utils.torch_utils import randn_tensor
 
-from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
@@ -15,6 +14,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     VerificationResult,
 )
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
@@ -59,7 +59,7 @@ class LatentPreparationStage(PipelineStage):
 
         # Get required parameters
         dtype = batch.prompt_embeds[0].dtype
-        device = get_local_torch_device()
+        device = current_platform.get_local_torch_device()
         generator = batch.generator
         latents = batch.latents
         num_frames = (

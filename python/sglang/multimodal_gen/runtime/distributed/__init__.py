@@ -3,9 +3,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from sglang.multimodal_gen.runtime.distributed.communication_op import *
-from sglang.multimodal_gen.runtime.distributed.group_coordinator import (
-    get_local_torch_device,
-)
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     cleanup_dist_env_and_memory,
     get_dp_group,
@@ -50,6 +47,4 @@ __all__ = [
     "get_tp_group",
     "get_tp_rank",
     "get_tp_world_size",
-    # Get torch device
-    "get_local_torch_device",
 ]

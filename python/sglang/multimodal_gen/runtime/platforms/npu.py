@@ -5,6 +5,7 @@ import os
 
 import torch
 
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.platforms.interface import (
     AttentionBackendEnum,
     DeviceCapability,
@@ -37,6 +38,10 @@ class NPUPlatformBase(Platform):
     device_type: str = "npu"
     dispatch_key: str = "NPU"
     device_control_env_var: str = "ASCEND_RT_VISIBLE_DEVICES"
+
+    @classmethod
+    def get_local_torch_device(cls) -> torch.device:
+        return torch.device(f"npu:{envs.LOCAL_RANK}")
 
     @classmethod
     def get_device_capability(cls, device_id: int = 0) -> DeviceCapability:

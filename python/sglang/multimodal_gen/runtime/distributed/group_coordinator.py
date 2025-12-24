@@ -23,6 +23,7 @@ from sglang.multimodal_gen.runtime.distributed.device_communicators.base_device_
 from sglang.multimodal_gen.runtime.distributed.device_communicators.cpu_communicator import (
     CpuCommunicator,
 )
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
     init_logger,
     suppress_stdout,
@@ -40,19 +41,6 @@ TensorMetadata = namedtuple("TensorMetadata", ["device", "dtype", "size"])
 
 
 _group_name_counter: dict[str, int] = {}
-
-
-def get_local_torch_device() -> torch.device:
-    """Return the torch device for the current rank."""
-    from sglang.multimodal_gen.runtime.platforms import current_platform
-
-    if current_platform.is_cuda_alike():
-        return torch.device(f"cuda:{envs.LOCAL_RANK}")
-
-    if current_platform.is_npu():
-        return torch.device(f"npu:{envs.LOCAL_RANK}")
-
-    return torch.device("mps")
 
 
 def _get_unique_name(name: str) -> str:
@@ -190,7 +178,7 @@ class GroupCoordinator:
         assert self.device_group is not None
 
         # TODO: fix it for other platforms
-        self.device = get_local_torch_device()
+        self.device = current_platform.get_local_torch_device()
 
         from sglang.multimodal_gen.runtime.platforms import current_platform
 
@@ -289,9 +277,6 @@ class GroupCoordinator:
 
     @contextmanager
     def graph_capture(self, graph_capture_context: GraphCaptureContext | None = None):
-        # Platform-aware graph capture
-        from sglang.multimodal_gen.runtime.platforms import current_platform
-
         if current_platform.is_cuda_alike():
             if graph_capture_context is None:
                 stream = torch.cuda.Stream()

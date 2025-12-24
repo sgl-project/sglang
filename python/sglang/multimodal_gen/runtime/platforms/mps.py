@@ -23,6 +23,10 @@ class MpsPlatform(Platform):
     device_control_env_var: str = "MPS_VISIBLE_DEVICES"
 
     @classmethod
+    def get_local_torch_device(cls) -> torch.device:
+        return torch.device("mps")
+
+    @classmethod
     def get_device_capability(cls, device_id: int = 0) -> DeviceCapability | None:
         raise NotImplementedError
 

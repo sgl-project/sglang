@@ -28,7 +28,7 @@ except ImportError:
 if torch.version.hip is not None:
     HAS_RUNAI_MODEL_STREAMER = False
 
-from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
@@ -160,7 +160,7 @@ def safetensors_weights_iterator(
     enable_tqdm = (
         not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
     )
-    device = "cpu" if to_cpu else str(get_local_torch_device())
+    device = "cpu" if to_cpu else str(current_platform.get_local_torch_device())
 
     # Validate files before loading
     corrupted_files = [
@@ -224,7 +224,7 @@ def pt_weights_iterator(
     to_cpu: bool = True,
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
     """Iterate over the weights in the model bin/pt files."""
-    device = "cpu" if to_cpu else str(get_local_torch_device())
+    device = "cpu" if to_cpu else str(current_platform.get_local_torch_device())
     enable_tqdm = (
         not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
     )

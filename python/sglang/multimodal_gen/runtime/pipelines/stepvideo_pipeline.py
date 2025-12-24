@@ -16,7 +16,6 @@ from typing import Any
 import torch
 from huggingface_hub import hf_hub_download
 
-from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.loader.component_loader import (
     PipelineComponentLoader,
 )
@@ -36,6 +35,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages import (
     StepvideoPromptEncodingStage,
     TimestepPreparationStage,
 )
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
@@ -101,7 +101,7 @@ class StepVideoPipeline(LoRAPipeline, ComposedPipelineBase):
         """
         Initialize the pipeline.
         """
-        target_device = get_local_torch_device()
+        target_device = current_platform.get_local_torch_device()
         llm_dir = os.path.join(self.model_path, "step_llm")
         clip_dir = os.path.join(self.model_path, "hunyuan_clip")
         text_enc = self.build_llm(llm_dir, target_device)

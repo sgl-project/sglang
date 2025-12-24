@@ -26,7 +26,6 @@ from sglang.multimodal_gen.configs.pipeline_configs.wan import (
 )
 from sglang.multimodal_gen.runtime.distributed import (
     cfg_model_parallel_all_reduce,
-    get_local_torch_device,
     get_sp_parallel_rank,
     get_sp_world_size,
     get_world_group,
@@ -408,7 +407,7 @@ class DenoisingStage(PipelineStage):
             1.0 - reserved_frames_mask
         ) * z + reserved_frames_mask * latent_model_input
         assert latents.ndim == 5
-        latents = latents.to(get_local_torch_device())
+        latents = latents.to(current_platform.get_local_torch_device())
         batch.latents = latents
 
         F = batch.num_frames
@@ -792,7 +791,9 @@ class DenoisingStage(PipelineStage):
                 # trajectory_tensor shapes:
                 # - video: [b, num_steps, c, t_local, h, w] -> gather on dim=3
                 # - image: [b, num_steps, s_local, d] -> gather on dim=2
-                trajectory_tensor = trajectory_tensor.to(get_local_torch_device())
+                trajectory_tensor = trajectory_tensor.to(
+                    current_platform.get_local_torch_device()
+                )
                 gather_dim = 3 if trajectory_tensor.dim() >= 5 else 2
                 trajectory_tensor = sequence_model_parallel_all_gather(
                     trajectory_tensor, dim=gather_dim
@@ -832,7 +833,7 @@ class DenoisingStage(PipelineStage):
             model_to_use is not None
             and next(model_to_use.parameters()).device.type == "cpu"
         ):
-            model_to_use.to(get_local_torch_device())
+            model_to_use.to(current_platform.get_local_torch_device())
 
     def _select_and_manage_model(
         self,
@@ -1195,7 +1196,7 @@ class DenoisingStage(PipelineStage):
                 patch_size=server_args.pipeline_config.dit_config.patch_size,
                 STA_param=batch.STA_param,
                 VSA_sparsity=server_args.VSA_sparsity,
-                device=get_local_torch_device(),
+                device=current_platform.get_local_torch_device(),
             )
         elif vmoba_attn_available and self.attn_backend == VMOBAAttentionBackend:
             moba_params = server_args.moba_config.copy()
@@ -1204,7 +1205,7 @@ class DenoisingStage(PipelineStage):
                     "current_timestep": i,
                     "raw_latent_shape": batch.raw_latent_shape[2:5],
                     "patch_size": server_args.pipeline_config.dit_config.patch_size,
-                    "device": get_local_torch_device(),
+                    "device": current_platform.get_local_torch_device(),
                 }
             )
         elif self.attn_backend == FlashAttentionBackend:
