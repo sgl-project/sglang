@@ -21,7 +21,7 @@ from __future__ import annotations
 import json
 import os
 import statistics
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Sequence
 
@@ -350,6 +350,9 @@ ONE_GPU_CASES_B: list[DiffusionTestCase] = [
         DiffusionSamplingParams(
             prompt="csetiarcane Nfj1nx with blue hair, a woman walking in a cyberpunk city at night",
             num_frames=8,
+            width=832,
+            height=480,
+            num_inference_steps=12,
         ),
     ),
     # NOTE(mick): flaky
@@ -384,6 +387,11 @@ ONE_GPU_CASES_B: list[DiffusionTestCase] = [
         ),
         DiffusionSamplingParams(
             prompt=T2V_PROMPT,
+            width=544,
+            height=960,
+            num_inference_steps=4,
+            fps=8,
+            num_frames=8,
         ),
     ),
     # === Text and Image to Video (TI2V) ===
@@ -396,7 +404,12 @@ ONE_GPU_CASES_B: list[DiffusionTestCase] = [
             warmup_edit=0,
             custom_validator="video",
         ),
-        TI2V_sampling_params,
+        replace(
+            TI2V_sampling_params,
+            width=832,
+            height=480,
+            num_inference_steps=12,
+        ),
     ),
     DiffusionTestCase(
         "fastwan2_2_ti2v_5b",
@@ -407,7 +420,12 @@ ONE_GPU_CASES_B: list[DiffusionTestCase] = [
             warmup_edit=0,
             custom_validator="video",
         ),
-        TI2V_sampling_params,
+        replace(
+            TI2V_sampling_params,
+            width=832,
+            height=480,
+            num_inference_steps=12,
+        ),
     ),
 ]
 
