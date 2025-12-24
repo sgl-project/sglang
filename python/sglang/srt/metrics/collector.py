@@ -748,8 +748,12 @@ class SchedulerMetricsCollector:
         num_retracted_output_tokens: int,
     ) -> None:
         self.num_retracted_reqs_total.labels(**self.labels).inc(num_retracted_reqs)
-        self.num_retracted_input_tokens_total.labels(**self.labels).inc(num_retracted_input_tokens)
-        self.num_retracted_output_tokens_total.labels(**self.labels).inc(num_retracted_output_tokens)
+        self.num_retracted_input_tokens_total.labels(**self.labels).inc(
+            num_retracted_input_tokens
+        )
+        self.num_retracted_output_tokens_total.labels(**self.labels).inc(
+            num_retracted_output_tokens
+        )
 
     def increment_cuda_graph_pass(self, value: bool) -> None:
         # leave room for piecewise cuda graph, etc
