@@ -100,6 +100,34 @@ __global__ void permute_cols_kernel(
   }
 }
 
+typedef struct {
+  int thread_k;
+  int thread_n;
+  int num_threads;
+} thread_config_t;
+
+typedef struct {
+  int blocks_per_sm;
+  thread_config_t tb_cfg;
+} exec_config_t;
+
+template <typename scalar_t, bool has_zp>
+exec_config_t determine_exec_config(
+    const DLDataType q_type,
+    int prob_m,
+    int prob_n,
+    int prob_k,
+    int thread_m_blocks,
+    bool m_block_size_8,
+    int num_bits,
+    int group_size,
+    bool has_act_order,
+    bool is_k_full,
+    bool is_zp_float,
+    int max_shared_mem) {
+  return exec_config_t{1, thread_config_t{-1, -1, -1}};
+}
+
 template <typename scalar_t, int moe_block_size, bool has_zp, bool is_zp_float>
 void marlin_mm(
     const void* A,
@@ -207,6 +235,65 @@ void marlin_mm(
 
     if (is_k_full) has_act_order = false;
   }
+
+  int max_shared_mem = 0;
+  CHECK_CUDA_SUCCESS(cudaDeviceGetAttribute(&max_shared_mem, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev));
+  TVM_FFI_ICHECK(max_shared_mem > 0) << "max_shared_mem must be > 0";
+
+  // Set thread config
+  exec_config_t exec_cfg;
+  thread_config_t thread_tfg;
+  if (thread_k != -1 && thread_n != -1) {
+    thread_tfg = thread_config_t{thread_k, thread_n, default_threads};
+    exec_cfg = exec_config_t{1, thread_tfg};
+    TVM_FFI_ICHECK(prob_n % thread_n == 0) << "prob_n = " << prob_n << " is not divisible by thread_n = " << thread_n;
+    TVM_FFI_ICHECK(prob_k % thread_k == 0) << "prob_k = " << prob_k << " is not divisible by thread_k = " << thread_k;
+  } else {
+    // Auto config
+    exec_cfg = determine_exec_config<scalar_t, has_zp>(
+        q_type,
+        prob_m,
+        prob_n,
+        prob_k,
+        thread_m_blocks,
+        m_block_size_8,
+        num_bits,
+        group_size,
+        has_act_order,
+        is_k_full,
+        is_zp_float,
+        max_shared_mem);
+    thread_tfg = exec_cfg.tb_cfg;
+  }
+
+  int num_threads = thread_tfg.num_threads;
+  thread_k = thread_tfg.thread_k;
+  thread_n = thread_tfg.thread_n;
+  int blocks = sms * exec_cfg.blocks_per_sm;
+  if (exec_cfg.blocks_per_sm > 1) max_shared_mem = max_shared_mem / exec_cfg.blocks_per_sm - 1024;
+
+  int thread_k_blocks = thread_k / 16;
+  int thread_n_blocks = thread_n / 16;
+
+  TVM_FFI_ICHECK(is_valid_config(
+      thread_tfg,
+      m_block_size_8,
+      thread_m_blocks,
+      prob_m,
+      prob_n,
+      prob_k,
+      num_bits,
+      group_size,
+      has_act_order,
+      is_k_full,
+      has_zp,
+      is_zp_float,
+      max_shared_mem))
+      << "Invalid thread config: thread_m_blocks = " << thread_m_blocks << ", thread_k = " << thread_k
+      << ", thread_n = " << thread_n << ", num_threads = " << num_threads << " for MKN = [" << prob_m << ", " << prob_k
+      << ", " << prob_n << "] and num_bits = " << num_bits << ", group_size = " << group_size
+      << ", has_act_order = " << has_act_order << ", is_k_full = " << is_k_full << ", has_zp = " << has_zp
+      << ", is_zp_float = " << is_zp_float << ", max_shared_mem = " << max_shared_mem;
 }
 
 template <int moe_block_size, bool has_zp, bool is_zp_float>
