@@ -121,6 +121,12 @@ class TestEnableMetrics(CustomTestCase):
             self.assertGreater(dp_forward_prefill_seconds, 0)
             self.assertGreater(dp_forward_decode_seconds, 0)
 
+            num_prefill_ranks_values = set()
+            for sample in metrics["sglang:dp_cooperation_realtime_tokens_total"]:
+                num_prefill_ranks_values.add(sample.labels["num_prefill_ranks"])
+            self.assertIn("0", num_prefill_ranks_values)
+            self.assertIn("1", num_prefill_ranks_values)
+
         self._execute_core(
             other_args=["--tp", "2", "--dp", "2", "--enable-dp-attention"],
             verify_metrics=_verify_metrics,
