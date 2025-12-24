@@ -69,61 +69,24 @@ class TestEnableMetrics(CustomTestCase):
         def _verify_metrics(metrics_content):
             metrics = _parse_prometheus_metrics(metrics_content)
 
-            prefill_compute_tokens = _get_metric_value(
-                metrics,
-                "sglang:realtime_tokens_total",
-                {"mode": "prefill_compute"},
-            )
-            decode_tokens = _get_metric_value(
-                metrics,
-                "sglang:realtime_tokens_total",
-                {"mode": "decode"},
-            )
-            self.assertGreater(prefill_compute_tokens, 0)
-            self.assertGreater(decode_tokens, 0)
+            metrics_to_check = [
+                ("sglang:realtime_tokens_total", {"mode": "prefill_compute"}),
+                ("sglang:realtime_tokens_total", {"mode": "decode"}),
+                ("sglang:gpu_execution_seconds_total", {"category": "forward_prefill"}),
+                ("sglang:gpu_execution_seconds_total", {"category": "forward_decode"}),
+                ("sglang:dp_cooperation_realtime_tokens_total", {"mode": "prefill_compute"}),
+                ("sglang:dp_cooperation_realtime_tokens_total", {"mode": "decode"}),
+                ("sglang:dp_cooperation_gpu_execution_seconds_total", {"category": "forward_prefill"}),
+                ("sglang:dp_cooperation_gpu_execution_seconds_total", {"category": "forward_decode"}),
+            ]
+            for metric_name, labels in metrics_to_check:
+                value = _get_metric_value(metrics, metric_name, labels)
+                self.assertGreater(value, 0, f"{metric_name} {labels}")
 
-            forward_prefill_seconds = _get_metric_value(
-                metrics,
-                "sglang:gpu_execution_seconds_total",
-                {"category": "forward_prefill"},
-            )
-            forward_decode_seconds = _get_metric_value(
-                metrics,
-                "sglang:gpu_execution_seconds_total",
-                {"category": "forward_decode"},
-            )
-            self.assertGreater(forward_prefill_seconds, 0)
-            self.assertGreater(forward_decode_seconds, 0)
-
-            dp_prefill_compute_tokens = _get_metric_value(
-                metrics,
-                "sglang:dp_cooperation_realtime_tokens_total",
-                {"mode": "prefill_compute"},
-            )
-            dp_decode_tokens = _get_metric_value(
-                metrics,
-                "sglang:dp_cooperation_realtime_tokens_total",
-                {"mode": "decode"},
-            )
-            self.assertGreater(dp_prefill_compute_tokens, 0)
-            self.assertGreater(dp_decode_tokens, 0)
-
-            dp_forward_prefill_seconds = _get_metric_value(
-                metrics,
-                "sglang:dp_cooperation_gpu_execution_seconds_total",
-                {"category": "forward_prefill"},
-            )
-            dp_forward_decode_seconds = _get_metric_value(
-                metrics,
-                "sglang:dp_cooperation_gpu_execution_seconds_total",
-                {"category": "forward_decode"},
-            )
-            self.assertGreater(dp_forward_prefill_seconds, 0)
-            self.assertGreater(dp_forward_decode_seconds, 0)
-
-            num_prefill_ranks_values = set()
-            for sample in metrics["sglang:dp_cooperation_realtime_tokens_total"]:
-                num_prefill_ranks_values.add(sample.labels["num_prefill_ranks"])
+            num_prefill_ranks_values = {
+                sample.labels["num_prefill_ranks"]
+                for sample in metrics["sglang:dp_cooperation_realtime_tokens_total"]
+            }
             self.assertIn("0", num_prefill_ranks_values)
             self.assertIn("1", num_prefill_ranks_values)
 
