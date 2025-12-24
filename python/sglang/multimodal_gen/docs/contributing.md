@@ -29,12 +29,12 @@ For PRs that impact **latency**, **throughput**, or **memory usage**, you **shou
 
 1.  **Baseline**: run the benchmark (for a single generation task)
     ```bash
-    $ sglang generate --model-path <model> --prompt "A benchmark prompt" --perf-dump-path baseline.json
+    $ python python/sglang/multimodal_gen/benchmarks/run_perf.py --model-path <model> --warmup 10 --perf-dump-path baseline.json
     ```
 
 2.  **New**: run the same benchmark, without modifying any server_args or sampling_params
     ```bash
-    $ sglang generate --model-path <model> --prompt "A benchmark prompt" --perf-dump-path new.json
+    $ python python/sglang/multimodal_gen/benchmarks/run_perf.py --model-path <model> --warmup 10 --perf-dump-path new.json
     ```
 
 3.  **Compare**: run the compare script, which will print a Markdown table to the console
