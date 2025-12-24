@@ -99,11 +99,7 @@ def is_mp4(data: bytes) -> bool:
     """
     if len(data) < 8:
         return False
-    return (
-        data[:4] == b"\x00\x00\x00\x18"
-        or data[:4] == b"\x00\x00\x00\x1c"
-        or data[4:8] == b"ftyp"
-    )
+    return data[4:8] == b"ftyp"
 
 
 def is_jpeg(data: bytes) -> bool:
