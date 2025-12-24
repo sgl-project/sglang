@@ -15,7 +15,6 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-
 _MODEL_NAME = "Qwen/Qwen3-0.6B"
 
 
@@ -74,16 +73,28 @@ class TestEnableMetrics(CustomTestCase):
                 ("sglang:realtime_tokens_total", {"mode": "decode"}),
                 ("sglang:gpu_execution_seconds_total", {"category": "forward_prefill"}),
                 ("sglang:gpu_execution_seconds_total", {"category": "forward_decode"}),
-                ("sglang:dp_cooperation_realtime_tokens_total", {"mode": "prefill_compute"}),
+                (
+                    "sglang:dp_cooperation_realtime_tokens_total",
+                    {"mode": "prefill_compute"},
+                ),
                 ("sglang:dp_cooperation_realtime_tokens_total", {"mode": "decode"}),
-                ("sglang:dp_cooperation_gpu_execution_seconds_total", {"category": "forward_prefill"}),
-                ("sglang:dp_cooperation_gpu_execution_seconds_total", {"category": "forward_decode"}),
+                (
+                    "sglang:dp_cooperation_gpu_execution_seconds_total",
+                    {"category": "forward_prefill"},
+                ),
+                (
+                    "sglang:dp_cooperation_gpu_execution_seconds_total",
+                    {"category": "forward_decode"},
+                ),
             ]
             for metric_name, labels in metrics_to_check:
                 value = _get_sample_value_by_labels(metrics[metric_name], labels)
                 self.assertGreater(value, 0, f"{metric_name} {labels}")
 
-            num_prefill_ranks_values = {s.labels["num_prefill_ranks"] for s in metrics["sglang:dp_cooperation_realtime_tokens_total"]}
+            num_prefill_ranks_values = {
+                s.labels["num_prefill_ranks"]
+                for s in metrics["sglang:dp_cooperation_realtime_tokens_total"]
+            }
             self.assertIn("0", num_prefill_ranks_values)
             self.assertIn("1", num_prefill_ranks_values)
 
@@ -151,7 +162,6 @@ def _get_sample_value_by_labels(samples: List[Sample], labels: Dict[str, str]) -
         if all(sample.labels.get(k) == v for k, v in labels.items()):
             return sample.value
     raise KeyError(f"No sample found with labels {labels}")
-
 
 
 if __name__ == "__main__":
