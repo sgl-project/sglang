@@ -87,7 +87,10 @@ class OpenAIServingResponses(OpenAIServingChat):
 
         # Use default sampling params from parent class (model config + preferred_sampling_params)
         # If not set by parent, initialize as empty dict
-        if not hasattr(self, "default_sampling_params") or self.default_sampling_params is None:
+        if (
+            not hasattr(self, "default_sampling_params")
+            or self.default_sampling_params is None
+        ):
             self.default_sampling_params = {}
 
         self.supports_browsing = (
