@@ -2147,7 +2147,7 @@ class ScheduleBatch(
             mamba_track_indices=self.mamba_track_indices,
             mamba_track_mask=self.mamba_track_mask,
             mamba_track_seqlens=self.mamba_track_seqlens,
-            is_beam_search=self.reqs[0].is_beam_search,
+            is_beam_search=len(self.reqs) > 0 and self.reqs[0].is_beam_search,
         )
 
     def copy(self):
