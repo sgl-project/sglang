@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import dataclasses
+import json
 import logging
 from functools import lru_cache
 from typing import TYPE_CHECKING, Any, Optional, Set, Tuple, Union
@@ -27,9 +28,15 @@ logger = logging.getLogger(__name__)
 
 
 class RequestLogger:
-    def __init__(self, log_requests: bool, log_requests_level: int):
+    def __init__(
+        self,
+        log_requests: bool,
+        log_requests_level: int,
+        log_requests_format: str,
+    ):
         self.log_requests = log_requests
         self.log_requests_level = log_requests_level
+        self.log_requests_format = log_requests_format
         self.metadata: Tuple[Optional[int], Optional[Set[str]], Optional[Set[str]]] = (
             self._compute_metadata()
         )
@@ -38,11 +45,14 @@ class RequestLogger:
         self,
         log_requests: Optional[bool] = None,
         log_requests_level: Optional[int] = None,
+        log_requests_format: Optional[str] = None,
     ) -> None:
         if log_requests is not None:
             self.log_requests = log_requests
         if log_requests_level is not None:
             self.log_requests_level = log_requests_level
+        if log_requests_format is not None:
+            self.log_requests_format = log_requests_format
         self.metadata = self._compute_metadata()
 
     def log_received_request(
@@ -50,11 +60,6 @@ class RequestLogger:
     ) -> None:
         if not self.log_requests:
             return
-
-        max_length, skip_names, _ = self.metadata
-        logger.info(
-            f"Receive: obj={_dataclass_to_string_truncated(obj, max_length, skip_names=skip_names)}"
-        )
 
         # FIXME: This is a temporary fix to get the text from the input ids.
         # We should remove this once we have a proper way.
@@ -67,6 +72,19 @@ class RequestLogger:
             decoded = tokenizer.decode(obj.input_ids, skip_special_tokens=False)
             obj.text = decoded
 
+        max_length, skip_names, _ = self.metadata
+        if self.log_requests_format == "json":
+            log_data = {
+                "event": "request.received",
+                "rid": obj.rid,
+                "obj": _dataclass_to_dict(obj, max_length, skip_names),
+            }
+            logger.info(json.dumps(log_data, ensure_ascii=False))
+        else:
+            logger.info(
+                f"Receive: obj={_dataclass_to_string_truncated(obj, max_length, skip_names=skip_names)}"
+            )
+
     def log_finished_request(
         self,
         obj: Union["GenerateReqInput", "EmbeddingReqInput"],
@@ -77,11 +95,21 @@ class RequestLogger:
             return
 
         max_length, skip_names, out_skip_names = self.metadata
-        if is_multimodal_gen:
-            msg = f"Finish: obj={_dataclass_to_string_truncated(obj, max_length, skip_names=skip_names)}"
+        if self.log_requests_format == "json":
+            log_data = {
+                "event": "request.finished",
+                "rid": obj.rid,
+                "obj": _dataclass_to_dict(obj, max_length, skip_names),
+            }
+            if not is_multimodal_gen:
+                log_data["out"] = _dataclass_to_dict(out, max_length, out_skip_names)
+            logger.info(json.dumps(log_data, ensure_ascii=False))
         else:
-            msg = f"Finish: obj={_dataclass_to_string_truncated(obj, max_length, skip_names=skip_names)}, out={_dataclass_to_string_truncated(out, max_length, skip_names=out_skip_names)}"
-        logger.info(msg)
+            if is_multimodal_gen:
+                msg = f"Finish: obj={_dataclass_to_string_truncated(obj, max_length, skip_names=skip_names)}"
+            else:
+                msg = f"Finish: obj={_dataclass_to_string_truncated(obj, max_length, skip_names=skip_names)}, out={_dataclass_to_string_truncated(out, max_length, skip_names=out_skip_names)}"
+            logger.info(msg)
 
     def _compute_metadata(
         self,
@@ -168,5 +196,39 @@ def _dataclass_to_string_truncated(
             )
             + ")"
         )
+    else:
+        return str(data)
+
+
+def _dataclass_to_dict(
+    data: Any, max_length: int = 2048, skip_names: Optional[Set[str]] = None
+) -> Any:
+    if skip_names is None:
+        skip_names = set()
+    if isinstance(data, str):
+        if len(data) > max_length:
+            half_length = max_length // 2
+            return data[:half_length] + "..." + data[-half_length:]
+        return data
+    elif isinstance(data, (list, tuple)):
+        if len(data) > max_length:
+            half_length = max_length // 2
+            return list(data[:half_length]) + ["..."] + list(data[-half_length:])
+        return [_dataclass_to_dict(v, max_length) for v in data]
+    elif isinstance(data, dict):
+        return {
+            k: _dataclass_to_dict(v, max_length)
+            for k, v in data.items()
+            if k not in skip_names
+        }
+    elif dataclasses.is_dataclass(data):
+        fields = dataclasses.fields(data)
+        return {
+            f.name: _dataclass_to_dict(getattr(data, f.name), max_length)
+            for f in fields
+            if f.name not in skip_names
+        }
+    elif isinstance(data, (int, float, bool, type(None))):
+        return data
     else:
         return str(data)

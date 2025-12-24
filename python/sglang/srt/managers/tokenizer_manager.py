@@ -185,6 +185,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         self.request_logger = RequestLogger(
             log_requests=server_args.log_requests,
             log_requests_level=server_args.log_requests_level,
+            log_requests_format=server_args.log_requests_format,
         )
         self.preferred_sampling_params = server_args.preferred_sampling_params
         self.crash_dump_folder = server_args.crash_dump_folder
@@ -1314,6 +1315,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         self.request_logger.configure(
             log_requests=obj.log_requests,
             log_requests_level=obj.log_requests_level,
+            log_requests_format=obj.log_requests_format,
         )
         if obj.dump_requests_folder is not None:
             self.dump_requests_folder = obj.dump_requests_folder
