@@ -252,7 +252,7 @@ class DPCooperationInfo:
     def create(forward_modes: List[int]):
         return DPCooperationInfo(
             num_prefill_ranks=sum(
-                1 for mode in forward_modes if mode == ForwardMode.PREFILL.value
+                1 for mode in forward_modes if mode == ForwardMode.EXTEND.value
             ),
         )
 
