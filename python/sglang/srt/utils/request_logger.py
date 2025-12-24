@@ -158,6 +158,16 @@ def disable_request_logging() -> bool:
     return get_bool_env_var("SGLANG_DISABLE_REQUEST_LOGGING")
 
 
+# TODO unify logging, e.g. allow normal logs to be JSON as well
+def _log_json(event: str, data: dict) -> None:
+    log_data = {
+        "timestamp": datetime.now().isoformat(),
+        "event": event,
+        **data,
+    }
+    print(json.dumps(log_data, ensure_ascii=False))
+
+
 def _dataclass_to_string_truncated(
     data: Any, max_length: int = 2048, skip_names: Optional[Set[str]] = None
 ) -> str:
@@ -199,14 +209,6 @@ def _dataclass_to_string_truncated(
     else:
         return str(data)
 
-
-def _log_json(event: str, data: dict) -> None:
-    log_data = {
-        "timestamp": datetime.now().isoformat(),
-        "event": event,
-        **data,
-    }
-    print(json.dumps(log_data, ensure_ascii=False))
 
 
 def _dataclass_to_dict(
