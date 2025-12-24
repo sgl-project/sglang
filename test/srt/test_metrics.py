@@ -22,41 +22,9 @@ class TestEnableMetrics(CustomTestCase):
     def test_metrics_1gpu(self):
         """Test that metrics endpoint returns data when enabled"""
 
-        def _verify_metrics(metrics_content):
-            # Verify essential metrics are present
-            essential_metrics = [
-                "sglang:num_running_reqs",
-                "sglang:num_used_tokens",
-                "sglang:token_usage",
-                "sglang:gen_throughput",
-                "sglang:num_queue_reqs",
-                "sglang:num_grammar_queue_reqs",
-                "sglang:cache_hit_rate",
-                "sglang:spec_accept_length",
-                "sglang:prompt_tokens_total",
-                "sglang:generation_tokens_total",
-                "sglang:cached_tokens_total",
-                "sglang:num_requests_total",
-                "sglang:time_to_first_token_seconds",
-                "sglang:inter_token_latency_seconds",
-                "sglang:e2e_request_latency_seconds",
-            ]
-
-            for metric in essential_metrics:
-                self.assertIn(metric, metrics_content, f"Missing metric: {metric}")
-
-            # Verify model name label is present and correct
-            expected_model_name = _MODEL_NAME
-            self.assertIn(f'model_name="{expected_model_name}"', metrics_content)
-
-            # Verify metrics have values (not empty)
-            self.assertIn("_sum{", metrics_content)
-            self.assertIn("_count{", metrics_content)
-            self.assertIn("_bucket{", metrics_content)
-
         self._execute_core(
             other_args=[],
-            verify_metrics=_verify_metrics,
+            verify_metrics_extra=None,
         )
 
     def test_metrics_2gpu(self):
@@ -65,7 +33,7 @@ class TestEnableMetrics(CustomTestCase):
             print("Skip test_metrics_2gpu since in 1-gpu CI")
             return
 
-        def _verify_metrics(metrics_content):
+        def _verify_metrics_extra(metrics_content):
             metrics = _parse_prometheus_metrics(metrics_content)
 
             metrics_to_check = [
@@ -100,10 +68,10 @@ class TestEnableMetrics(CustomTestCase):
 
         self._execute_core(
             other_args=["--tp", "2", "--dp", "2", "--enable-dp-attention"],
-            verify_metrics=_verify_metrics,
+            verify_metrics_extra=_verify_metrics_extra,
         )
 
-    def _execute_core(self, other_args, verify_metrics):
+    def _execute_core(self, other_args, verify_metrics_extra):
         with (
             envs.SGLANG_ENABLE_METRICS_DP_ATTENTION.override(True),
             envs.SGLANG_ENABLE_METRICS_DEVICE_TIMER.override(True),
@@ -142,9 +110,43 @@ class TestEnableMetrics(CustomTestCase):
 
             print(f"metrics_content=\n{metrics_content}")
 
-            verify_metrics(metrics_content)
+            self._verify_metrics_common(metrics_content)
+            if verify_metrics_extra is not None:
+                verify_metrics_extra(metrics_content)
         finally:
             kill_process_tree(process.pid)
+
+    def _verify_metrics_common(self, metrics_content):
+        # Verify essential metrics are present
+        essential_metrics = [
+            "sglang:num_running_reqs",
+            "sglang:num_used_tokens",
+            "sglang:token_usage",
+            "sglang:gen_throughput",
+            "sglang:num_queue_reqs",
+            "sglang:num_grammar_queue_reqs",
+            "sglang:cache_hit_rate",
+            "sglang:spec_accept_length",
+            "sglang:prompt_tokens_total",
+            "sglang:generation_tokens_total",
+            "sglang:cached_tokens_total",
+            "sglang:num_requests_total",
+            "sglang:time_to_first_token_seconds",
+            "sglang:inter_token_latency_seconds",
+            "sglang:e2e_request_latency_seconds",
+        ]
+
+        for metric in essential_metrics:
+            self.assertIn(metric, metrics_content, f"Missing metric: {metric}")
+
+        # Verify model name label is present and correct
+        expected_model_name = _MODEL_NAME
+        self.assertIn(f'model_name="{expected_model_name}"', metrics_content)
+
+        # Verify metrics have values (not empty)
+        self.assertIn("_sum{", metrics_content)
+        self.assertIn("_count{", metrics_content)
+        self.assertIn("_bucket{", metrics_content)
 
 
 def _parse_prometheus_metrics(metrics_text: str) -> Dict[str, List[Sample]]:
