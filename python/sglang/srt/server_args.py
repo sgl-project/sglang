@@ -898,6 +898,9 @@ class ServerArgs:
             self.cuda_graph_max_bs = max(self.cuda_graph_bs)
 
         if self.piecewise_cuda_graph_max_tokens is None:
+            # Capture piecewise cuda graph tokens up to the chunked prefill size. Two benefits:
+            # 1. cuda graph acceleration for all prefill lengths.
+            # 2. do not need more temporary memory for activations. Less fragmentation.
             self.piecewise_cuda_graph_max_tokens = self.chunked_prefill_size
 
         if self.piecewise_cuda_graph_tokens is None:
@@ -940,7 +943,10 @@ class ServerArgs:
                     reserved_mem += 2 * 1024
 
             # For piecewise cuda graphs
-            if self.enable_piecewise_cuda_graph:
+            if (
+                self.enable_piecewise_cuda_graph
+                and self.piecewise_cuda_graph_tokens < self.chunked_prefill_size
+            ):
                 reserved_mem += self.piecewise_cuda_graph_max_tokens // 4
 
             self.mem_fraction_static = (
