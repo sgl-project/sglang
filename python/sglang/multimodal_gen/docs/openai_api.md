@@ -104,14 +104,15 @@ curl -sS -X POST "http://localhost:30010/v1/images/generations" \
 
 **Endpoint:** `POST /v1/images/edits`
 
-This endpoint accepts a multipart form upload with an input image and a text prompt. The server can return either a base64-encoded image or a URL to download the image.
+This endpoint accepts a multipart form upload with input images and a text prompt. The server can return either a base64-encoded image or a URL to download the image.
 
 **Curl Example (b64_json response):**
 
 ```bash
 curl -sS -X POST "http://localhost:30010/v1/images/edits" \
   -H "Authorization: Bearer sk-proj-1234567890" \
-  -F "image=@input.png" \
+  -F "image=@local_input_image.png" \
+  -F "url=image_url.jpg" \
   -F "prompt=A calico cat playing a piano on stage" \
   -F "size=1024x1024" \
   -F "response_format=b64_json"
@@ -122,7 +123,8 @@ curl -sS -X POST "http://localhost:30010/v1/images/edits" \
 ```bash
 curl -sS -X POST "http://localhost:30010/v1/images/edits" \
   -H "Authorization: Bearer sk-proj-1234567890" \
-  -F "image=@input.png" \
+  -F "image=@local_input_image.png" \
+  -F "url=image_url.jpg" \
   -F "prompt=A calico cat playing a piano on stage" \
   -F "size=1024x1024" \
   -F "response_format=url"
