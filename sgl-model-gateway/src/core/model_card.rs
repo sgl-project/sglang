@@ -9,7 +9,10 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::model_type::{Endpoint, ModelType};
+use super::{
+    model_type::{Endpoint, ModelType},
+    UNKNOWN_MODEL_ID,
+};
 
 /// Provider type for external API transformations.
 ///
@@ -335,7 +338,7 @@ impl ModelCard {
 
 impl Default for ModelCard {
     fn default() -> Self {
-        Self::new("unknown")
+        Self::new(UNKNOWN_MODEL_ID)
     }
 }
 
