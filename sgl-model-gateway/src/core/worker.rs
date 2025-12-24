@@ -15,6 +15,7 @@ use tokio::{sync::OnceCell, time};
 
 use super::{
     CircuitBreaker, Endpoint, ModelCard, ModelType, ProviderType, WorkerError, WorkerResult,
+    UNKNOWN_MODEL_ID,
 };
 use crate::{
     core::{BasicWorkerBuilder, DPAwareWorkerBuilder},
@@ -180,7 +181,7 @@ pub trait Worker: Send + Sync + fmt::Debug {
                 // Fall back to labels
                 self.metadata().labels.get("model_id").map(|s| s.as_str())
             })
-            .unwrap_or("unknown")
+            .unwrap_or(UNKNOWN_MODEL_ID)
     }
 
     /// Get the priority of this worker (higher value = higher priority)
