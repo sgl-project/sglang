@@ -83,7 +83,8 @@ class TestEnableMetrics(CustomTestCase):
             response = requests.post(
                 f"{DEFAULT_URL_FOR_TEST}/generate",
                 json={
-                    "text": [f"{i}+1=" for i in range(20)],
+                    # Have some prefix to have `cached_tokens_total` metric
+                    "text": [f"1+2+3+4+5+{i}=" for i in range(20)],
                     "sampling_params": {
                         "temperature": 0,
                         "max_new_tokens": 50,
