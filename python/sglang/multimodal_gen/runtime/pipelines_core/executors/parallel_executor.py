@@ -8,7 +8,6 @@ from sglang.multimodal_gen.runtime.distributed import get_sp_group
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_cfg_group,
     get_classifier_free_guidance_rank,
-    get_world_rank,
 )
 from sglang.multimodal_gen.runtime.pipelines_core import Req
 from sglang.multimodal_gen.runtime.pipelines_core.executors.pipeline_executor import (
@@ -96,14 +95,6 @@ class ParallelExecutor(PipelineExecutor):
         batch: Req,
         server_args: ServerArgs,
     ) -> Req:
-        rank = get_classifier_free_guidance_rank()
-
-        if batch.profile and batch.profile_all_stages:
-            world_rank = get_world_rank()
-        else:
-            world_rank = 0
-
-        with self.profile_execution(batch, check_rank=rank, dump_rank=world_rank):
-            batch = self._execute(stages, batch, server_args)
+        batch = self._execute(stages, batch, server_args)
 
         return batch

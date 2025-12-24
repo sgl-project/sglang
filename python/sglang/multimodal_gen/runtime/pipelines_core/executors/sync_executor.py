@@ -49,7 +49,6 @@ class SyncExecutor(PipelineExecutor):
         Execute the pipeline stages sequentially.
         """
 
-        with self.profile_execution(batch, check_rank=0, dump_rank=0):
-            batch = self.run_profile_all_stages(stages, batch, server_args)
+        batch = self.run_profile_all_stages(stages, batch, server_args)
 
         return batch

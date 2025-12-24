@@ -9,6 +9,7 @@ import contextlib
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, List
 
+from sglang.multimodal_gen.runtime.distributed import get_world_rank
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -42,6 +43,24 @@ class PipelineExecutor(ABC):
 
     def __init__(self, server_args):
         self.server_args = server_args
+
+    def execute_with_profiling(
+        self,
+        stages: List["PipelineStage"],
+        batch: Req,
+        server_args: ServerArgs,
+    ) -> OutputBatch:
+        rank = get_world_rank()
+
+        if batch.profile and batch.profile_all_stages:
+            world_rank = get_world_rank()
+        else:
+            world_rank = 0
+
+        with self.profile_execution(batch, check_rank=rank, dump_rank=world_rank):
+            batch = self.execute(stages, batch, server_args)
+
+        return batch
 
     @abstractmethod
     def execute(
@@ -77,7 +96,8 @@ class PipelineExecutor(ABC):
         request_id = batch.request_id
         profiler = SGLDiffusionProfiler(
             request_id=request_id,
-            rank=check_rank,
+            # rank=check_rank,
+            rank=2,
             full_profile=batch.profile_all_stages,
             num_steps=batch.num_profiled_timesteps,
             num_inference_steps=batch.num_inference_steps,
