@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-import logging
 from functools import lru_cache
 from typing import TYPE_CHECKING, Optional
 
 import torch
+
 from sglang.jit_kernel.utils import load_jit, make_cpp_args
 
 if TYPE_CHECKING:
@@ -59,7 +59,9 @@ def moe_wna16_marlin_gemm(
         if c_or_none is not None
         else torch.empty((size_m * top_k, size_n), device=a.device, dtype=a.dtype)
     )
-    _jit_merlin_module(moe_block_size, b_zeros_or_none is not None, is_zp_float).moe_wna16_marlin_gemm(
+    _jit_merlin_module(
+        moe_block_size, b_zeros_or_none is not None, is_zp_float
+    ).moe_wna16_marlin_gemm(
         a,
         c,
         b_q_weight,

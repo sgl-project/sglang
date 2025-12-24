@@ -1,8 +1,6 @@
-
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.cuh>
 #include <sgl_kernel/utils.h>
-#include <sgl_kernel/warp.cuh>
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -13,6 +11,7 @@
 
 #include <optional>
 
+#include "kernel.h"
 #include "marlin.cuh"
 
 #ifndef MARLIN_NAMESPACE_NAME
@@ -20,6 +19,36 @@
 #endif
 
 namespace MARLIN_NAMESPACE_NAME {
+
+using MarlinFuncPtr = void (*)(MARLIN_KERNEL_PARAMS);
+
+#define _GET_IF(                                                                                                       \
+    W_TYPE, THREAD_M_BLOCKS, THREAD_N_BLOCKS, THREAD_K_BLOCKS, M_BLOCK_SIZE_8, GROUP_BLOCKS, NUM_THREADS, IS_ZP_FLOAT) \
+  else if (                                                                                                            \
+      q_type == W_TYPE && thread_m_blocks == THREAD_M_BLOCKS && thread_n_blocks == THREAD_N_BLOCKS &&                  \
+      thread_k_blocks == THREAD_K_BLOCKS && m_block_size_8 == M_BLOCK_SIZE_8 && group_blocks == GROUP_BLOCKS &&        \
+      num_threads == NUM_THREADS && is_zp_float == IS_ZP_FLOAT) {                                                      \
+    constexpr auto S_TYPE = W_TYPE == sglang::kFE2M1f                                                                  \
+                                ? (GROUP_BLOCKS == 1 ? sglang::kFE4M3fn : sglang::kFE8M0fnu)                           \
+                                : (std::is_same<scalar_t, half>::value ? sglang::kFloat16 : sglang::kBFloat16);        \
+    kernel = Marlin<                                                                                                   \
+        scalar_t,                                                                                                      \
+        W_TYPE.id(),                                                                                                   \
+        S_TYPE.id(),                                                                                                   \
+        NUM_THREADS,                                                                                                   \
+        THREAD_M_BLOCKS,                                                                                               \
+        THREAD_N_BLOCKS,                                                                                               \
+        THREAD_K_BLOCKS,                                                                                               \
+        M_BLOCK_SIZE_8,                                                                                                \
+        pipe_stages,                                                                                                   \
+        GROUP_BLOCKS,                                                                                                  \
+        IS_ZP_FLOAT>;                                                                                                  \
+  }
+
+template <typename scalar_t>
+MarlinFuncPtr get_marlin_kernel() {
+  return nullptr;
+}
 
 // For a given "a" of size [M,K] performs a permutation of the K columns based
 // on the given "perm" indices.
@@ -128,6 +157,21 @@ exec_config_t determine_exec_config(
   return exec_config_t{1, thread_config_t{-1, -1, -1}};
 }
 
+template <bool m_block_size_8, bool has_zp, bool is_zp_float>
+bool is_valid_config(
+    thread_config_t const& th_config,
+    int thread_m_blocks,
+    int prob_m,
+    int prob_n,
+    int prob_k,
+    int num_bits,
+    int group_size,
+    bool has_act_order,
+    bool is_k_full,
+    int max_shared_mem) {
+  return true;
+}
+
 template <typename scalar_t, int moe_block_size, bool has_zp, bool is_zp_float>
 void marlin_mm(
     const void* A,
@@ -165,8 +209,8 @@ void marlin_mm(
     int sms,
     bool use_atomic_add,
     bool use_fp32_reduce) {
-  int thread_m_blocks = div_ceil(moe_block_size, 16);
-  bool m_block_size_8 = moe_block_size == 8;
+  constexpr int thread_m_blocks = div_ceil(moe_block_size, 16);
+  constexpr bool m_block_size_8 = moe_block_size == 8;
   if (has_zp) {
     TVM_FFI_ICHECK(q_type == dl_uint8 || q_type == dl_uint8)
         << "q_type must be u4 or u8 when has_zp = True. Got = " << q_type;
@@ -243,11 +287,40 @@ void marlin_mm(
   // Set thread config
   exec_config_t exec_cfg;
   thread_config_t thread_tfg;
+
+  int num_threads = -1;
+  int blocks = -1;
+
+  int thread_k_blocks = -1;
+  int thread_n_blocks = -1;
+
   if (thread_k != -1 && thread_n != -1) {
     thread_tfg = thread_config_t{thread_k, thread_n, default_threads};
     exec_cfg = exec_config_t{1, thread_tfg};
     TVM_FFI_ICHECK(prob_n % thread_n == 0) << "prob_n = " << prob_n << " is not divisible by thread_n = " << thread_n;
     TVM_FFI_ICHECK(prob_k % thread_k == 0) << "prob_k = " << prob_k << " is not divisible by thread_k = " << thread_k;
+
+    num_threads = default_threads;
+    blocks = sms;
+    thread_k_blocks = thread_k / 16;
+    thread_n_blocks = thread_n / 16;
+
+    TVM_FFI_ICHECK((is_valid_config<m_block_size_8, has_zp, is_zp_float>(
+        thread_tfg,
+        thread_m_blocks,
+        prob_m,
+        prob_n,
+        prob_k,
+        num_bits,
+        group_size,
+        has_act_order,
+        is_k_full,
+        max_shared_mem)))
+        << "Invalid thread config: thread_m_blocks = " << thread_m_blocks << ", thread_k = " << thread_k
+        << ", thread_n = " << thread_n << ", num_threads = " << num_threads << " for MKN = [" << prob_m << ", "
+        << prob_k << ", " << prob_n << "] and num_bits = " << num_bits << ", group_size = " << group_size
+        << ", has_act_order = " << has_act_order << ", is_k_full = " << is_k_full << ", has_zp = " << has_zp
+        << ", is_zp_float = " << is_zp_float << ", max_shared_mem = " << max_shared_mem;
   } else {
     // Auto config
     exec_cfg = determine_exec_config<scalar_t, has_zp>(
@@ -264,36 +337,16 @@ void marlin_mm(
         is_zp_float,
         max_shared_mem);
     thread_tfg = exec_cfg.tb_cfg;
+
+    num_threads = thread_tfg.num_threads;
+    thread_k = thread_tfg.thread_k;
+    thread_n = thread_tfg.thread_n;
+    blocks = sms * exec_cfg.blocks_per_sm;
+    if (exec_cfg.blocks_per_sm > 1) max_shared_mem = max_shared_mem / exec_cfg.blocks_per_sm - 1024;
+
+    thread_k_blocks = thread_k / 16;
+    thread_n_blocks = thread_n / 16;
   }
-
-  int num_threads = thread_tfg.num_threads;
-  thread_k = thread_tfg.thread_k;
-  thread_n = thread_tfg.thread_n;
-  int blocks = sms * exec_cfg.blocks_per_sm;
-  if (exec_cfg.blocks_per_sm > 1) max_shared_mem = max_shared_mem / exec_cfg.blocks_per_sm - 1024;
-
-  int thread_k_blocks = thread_k / 16;
-  int thread_n_blocks = thread_n / 16;
-
-  TVM_FFI_ICHECK(is_valid_config(
-      thread_tfg,
-      m_block_size_8,
-      thread_m_blocks,
-      prob_m,
-      prob_n,
-      prob_k,
-      num_bits,
-      group_size,
-      has_act_order,
-      is_k_full,
-      has_zp,
-      is_zp_float,
-      max_shared_mem))
-      << "Invalid thread config: thread_m_blocks = " << thread_m_blocks << ", thread_k = " << thread_k
-      << ", thread_n = " << thread_n << ", num_threads = " << num_threads << " for MKN = [" << prob_m << ", " << prob_k
-      << ", " << prob_n << "] and num_bits = " << num_bits << ", group_size = " << group_size
-      << ", has_act_order = " << has_act_order << ", is_k_full = " << is_k_full << ", has_zp = " << has_zp
-      << ", is_zp_float = " << is_zp_float << ", max_shared_mem = " << max_shared_mem;
 }
 
 template <int moe_block_size, bool has_zp, bool is_zp_float>

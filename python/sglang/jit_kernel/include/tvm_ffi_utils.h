@@ -4,6 +4,7 @@
 #include <tvm/ffi/container/tensor.h>
 #include <tvm/ffi/error.h>
 #include <tvm/ffi/extra/c_env_api.h>
+#include <vector_types.h>
 
 inline constexpr int64_t encode_dlpack_dtype(DLDataType dtype) {
   return (dtype.code << 16) | (dtype.bits << 8) | dtype.lanes;
@@ -28,8 +29,10 @@ constexpr int64_t float32_code = encode_dlpack_dtype(dl_float32);
 constexpr int64_t float64_code = encode_dlpack_dtype(dl_float64);
 constexpr int64_t bfloat16_code = encode_dlpack_dtype(dl_bfloat16);
 constexpr int64_t int32_code = encode_dlpack_dtype(dl_int32);
+constexpr int64_t uint4_code = encode_dlpack_dtype(dl_uint4);
 constexpr int64_t uint8_code = encode_dlpack_dtype(dl_uint8);
-constexpr int64_t u8b128_code = encode_dlpack_dtype(dl_uint8, 128);
+constexpr int64_t fp4_e2m1fn_code = encode_dlpack_dtype(dl_fp4_e2m1fn);
+constexpr int64_t fp8_e4m3fn_code = encode_dlpack_dtype(dl_fp8_e4m3fn);
 
 #define _DISPATCH_CASE_F16(c_type, ...) \
   case float16_code: {                  \
@@ -55,7 +58,6 @@ constexpr int64_t u8b128_code = encode_dlpack_dtype(dl_uint8, 128);
     __VA_ARGS__();                       \
     return true;                         \
   }
-
 #define DISPATCH_DLPACK_DTYPE_TO_CTYPE_FLOAT(dlpack_dtype, c_type, ...)                                              \
   [&]() -> bool {                                                                                                    \
     switch (encode_dlpack_dtype(dlpack_dtype)) {                                                                     \
@@ -74,6 +76,46 @@ constexpr int64_t u8b128_code = encode_dlpack_dtype(dl_uint8, 128);
     switch (encode_dlpack_dtype(dlpack_dtype)) {                                                                     \
       _DISPATCH_CASE_F16(c_type, __VA_ARGS__)                                                                        \
       _DISPATCH_CASE_BF16(c_type, __VA_ARGS__)                                                                       \
+      default:                                                                                                       \
+        TVM_FFI_ICHECK(false) << __PRETTY_FUNCTION__ << " failed to dispatch data type " << (int)(dlpack_dtype).code \
+                              << " " << (int)(dlpack_dtype).bits;                                                    \
+        return false;                                                                                                \
+    }                                                                                                                \
+  }()
+
+#define _DISPATCH_ORIG_CASE_UINT4(c_type, ...) \
+  case uint4_code: {                           \
+    constexpr auto c_type = dl_uint4;          \
+    __VA_ARGS__();                             \
+    return true;                               \
+  }
+#define _DISPATCH_ORIG_CASE_UINT8(c_type, ...) \
+  case uint8_code: {                           \
+    constexpr auto c_type = dl_uint8;          \
+    __VA_ARGS__();                             \
+    return true;                               \
+  }
+#define _DISPATCH_ORIG_CASE_FP4_E2M1FN(c_type, ...) \
+  case fp4_e2m1fn_code: {                           \
+    constexpr auto c_type = dl_fp4_e2m1fn;          \
+    __VA_ARGS__();                                  \
+    return true;                                    \
+  }
+
+#define _DISPATCH_ORIG_CASE_FP8_E4M3FN(c_type, ...) \
+  case fp8_e4m3fn_code: {                           \
+    constexpr auto c_type = dl_fp8_e4m3fn;          \
+    __VA_ARGS__();                                  \
+    return true;                                    \
+  }
+
+#define DISPATCH_DLPACK_DTYPE_TO_MARLIN(dlpack_dtype, c_type, ...)                                                   \
+  [&]() -> bool {                                                                                                    \
+    switch (encode_dlpack_dtype(dlpack_dtype)) {                                                                     \
+      _DISPATCH_ORIG_CASE_UINT4(c_type, __VA_ARGS__)                                                                 \
+      _DISPATCH_ORIG_CASE_UINT8(c_type, __VA_ARGS__)                                                                 \
+      _DISPATCH_ORIG_CASE_FP4_E2M1FN(c_type, __VA_ARGS__)                                                            \
+      _DISPATCH_ORIG_CASE_FP8_E4M3FN(c_type, __VA_ARGS__)                                                            \
       default:                                                                                                       \
         TVM_FFI_ICHECK(false) << __PRETTY_FUNCTION__ << " failed to dispatch data type " << (int)(dlpack_dtype).code \
                               << " " << (int)(dlpack_dtype).bits;                                                    \
