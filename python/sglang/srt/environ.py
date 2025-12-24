@@ -7,6 +7,8 @@ from typing import Any
 
 
 class EnvField:
+    _allow_set_name = True
+
     def __init__(self, default: Any):
         self.default = default
         # NOTE: we use None to indicate whether the value is set or not
@@ -15,6 +17,7 @@ class EnvField:
         self._set_to_none = False
 
     def __set_name__(self, owner, name):
+        assert EnvField._allow_set_name, "Usage like `a = envs.A` is not allowed"
         self.name = name
 
     def parse(self, value: str) -> Any:
@@ -69,10 +72,6 @@ class EnvField:
     def clear(self):
         os.environ.pop(self.name, None)
         self._set_to_none = False
-
-    @property
-    def value(self):
-        return self.get()
 
     def __bool__(self):
         raise RuntimeError(
@@ -148,9 +147,17 @@ class Envs:
     SGLANG_LOG_MS = EnvBool(False)
     SGLANG_DISABLE_REQUEST_LOGGING = EnvBool(False)
 
-    # Test & Debug
+    # SGLang CI
     SGLANG_IS_IN_CI = EnvBool(False)
     SGLANG_IS_IN_CI_AMD = EnvBool(False)
+    SGLANG_TEST_MAX_RETRY = EnvInt(None)
+
+    # Test & Debug
+    SGLANG_TEST_STUCK_DETOKENIZER = EnvFloat(0)
+    SGLANG_TEST_STUCK_DP_CONTROLLER = EnvFloat(0)
+    SGLANG_TEST_STUCK_TOKENIZER = EnvFloat(0)
+    IS_BLACKWELL = EnvBool(False)
+    IS_H200 = EnvBool(False)
     SGLANG_SET_CPU_AFFINITY = EnvBool(False)
     SGLANG_PROFILE_WITH_STACK = EnvBool(True)
     SGLANG_PROFILE_RECORD_SHAPES = EnvBool(True)
@@ -165,6 +172,7 @@ class Envs:
     SGLANG_TORCH_PROFILER_DIR = EnvStr("/tmp")
     SGLANG_OTLP_EXPORTER_SCHEDULE_DELAY_MILLIS = EnvInt(500)
     SGLANG_OTLP_EXPORTER_MAX_EXPORT_BATCH_SIZE = EnvInt(64)
+    SGLANG_NATIVE_MOVE_KV_CACHE = EnvBool(False)
 
     # Scheduler: memory leak test
     SGLANG_TEST_RETRACT = EnvBool(False)
@@ -172,6 +180,7 @@ class Envs:
     SGLANG_TEST_RETRACT_NO_PREFILL_BS = EnvInt(2 ** 31)
     SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY = EnvInt(0)
     SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE = EnvBool(True)
+    SGLANG_CI_SMALL_KV_SIZE = EnvInt(-1)
 
     # Scheduler: new token ratio hyperparameters
     SGLANG_INIT_NEW_TOKEN_RATIO = EnvFloat(0.7)
@@ -192,6 +201,9 @@ class Envs:
     SGLANG_DISABLE_CONSECUTIVE_PREFILL_OVERLAP = EnvBool(False)
     SGLANG_SCHEDULER_MAX_RECV_PER_POLL = EnvInt(-1)
     SGLANG_EXPERIMENTAL_CPP_RADIX_TREE = EnvBool(False)
+    SGLANG_DYNAMIC_CHUNKING_SMOOTH_FACTOR = EnvFloat(0.75)
+    SGLANG_SCHEDULER_SKIP_ALL_GATHER = EnvBool(False)
+    SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE = EnvBool(False)
 
     # Test: pd-disaggregation
     SGLANG_TEST_PD_DISAGG_BACKEND = EnvStr("mooncake")
@@ -234,6 +246,7 @@ class Envs:
 
     # NPU
     SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT = EnvBool(False)
+    SGLANG_NPU_USE_MULTI_STREAM = EnvBool(False)
 
     # Quantization
     SGLANG_INT4_WEIGHT = EnvBool(False)
@@ -265,6 +278,7 @@ class Envs:
     SGLANG_LOG_EXPERT_LOCATION_METADATA = EnvBool(False)
     SGLANG_EXPERT_DISTRIBUTION_RECORDER_DIR = EnvStr("/tmp")
     SGLANG_EPLB_HEATMAP_COLLECTION_INTERVAL = EnvInt(0)
+    SGLANG_ENABLE_EPLB_BALANCEDNESS_METRIC = EnvBool(False)
 
     # TBO
     SGLANG_TBO_DEBUG = EnvBool(False)
@@ -277,6 +291,7 @@ class Envs:
     SGLANG_DG_CACHE_DIR = EnvStr(os.path.expanduser("~/.cache/deep_gemm"))
     SGLANG_DG_USE_NVRTC = EnvBool(False)
     SGLANG_USE_DEEPGEMM_BMM = EnvBool(False)
+    SGLANG_CHUNKED_PREFIX_CACHE_THRESHOLD = EnvInt(8192)
 
     # DeepEP
     SGLANG_DEEPEP_BF16_DISPATCH = EnvBool(False)
@@ -304,6 +319,11 @@ class Envs:
 
     # Deterministic inference
     SGLANG_ENABLE_DETERMINISTIC_INFERENCE = EnvBool(False)
+    # Use 1-stage all-reduce kernel on AMD (deterministic, fixed accumulation order)
+    # If not set: auto (enabled when --enable-deterministic-inference is on)
+    # Set to 1: force enable (even without --enable-deterministic-inference)
+    # Set to 0: force disable (use default Aiter AR even with --enable-deterministic-inference)
+    SGLANG_USE_1STAGE_ALLREDUCE = EnvBool(False)
     SGLANG_FLASHINFER_PREFILL_SPLIT_TILE_SIZE = EnvInt(4096)
     SGLANG_FLASHINFER_DECODE_SPLIT_TILE_SIZE = EnvInt(2048)
     SGLANG_TRITON_PREFILL_TRUNCATION_ALIGN_SIZE = EnvInt(4096)
@@ -318,11 +338,24 @@ class Envs:
     SGLANG_ENABLE_SPEC_V2 = EnvBool(False)
     SGLANG_ENABLE_OVERLAP_PLAN_STREAM = EnvBool(False)
 
+    # Spec Config
+    SGLANG_SPEC_ENABLE_STRICT_FILTER_CHECK = EnvBool(True)
+
     # VLM
     SGLANG_VLM_CACHE_SIZE_MB = EnvInt(100)
     SGLANG_IMAGE_MAX_PIXELS = EnvInt(16384 * 28 * 28)
     SGLANG_RESIZE_RESAMPLE = EnvStr("")
     SGLANG_MM_BUFFER_SIZE_MB = EnvInt(0)
+    SGLANG_MM_PRECOMPUTE_HASH = EnvBool(False)
+    SGLANG_VIT_ENABLE_CUDA_GRAPH = EnvBool(False)
+
+    # VLM Item CUDA IPC Transport
+    SGLANG_USE_CUDA_IPC_TRANSPORT = EnvBool(False)
+    SGLANG_MM_FEATURE_CACHE_MB = EnvInt(4 * 1024)
+    SGLANG_MM_ITEM_MEM_POOL_RECYCLE_INTERVAL_SEC = EnvFloat(0.05)
+
+    # MM splitting behavior control
+    SGLANG_ENABLE_MM_SPLITTING = EnvBool(False)
 
     # Release & Resume Memory
     SGLANG_MEMORY_SAVER_CUDA_GRAPH = EnvBool(False)
@@ -354,10 +387,15 @@ class Envs:
     # Numa
     SGLANG_NUMA_BIND_V2 = EnvBool(True)
 
+    # Metrics
+    SGLANG_ENABLE_METRICS_DEVICE_TIMER = EnvBool(False)
+    SGLANG_ENABLE_METRICS_DP_ATTENTION = EnvBool(False)
+
     # fmt: on
 
 
 envs = Envs()
+EnvField._allow_set_name = False
 
 
 def _print_deprecated_env(new_name: str, old_name: str):
@@ -415,9 +453,9 @@ def example_with_exit_stack():
     # Use this style of context manager in unit test
     exit_stack = ExitStack()
     exit_stack.enter_context(envs.SGLANG_TEST_RETRACT.override(False))
-    assert envs.SGLANG_TEST_RETRACT.value is False
+    assert envs.SGLANG_TEST_RETRACT.get() is False
     exit_stack.close()
-    assert envs.SGLANG_TEST_RETRACT.value is None
+    assert envs.SGLANG_TEST_RETRACT.get() is None
 
 
 def example_with_subprocess():
@@ -462,29 +500,29 @@ def example_with_implicit_bool_avoidance():
 def examples():
     # Example usage for envs
     envs.SGLANG_TEST_RETRACT.clear()
-    assert envs.SGLANG_TEST_RETRACT.value is False
+    assert envs.SGLANG_TEST_RETRACT.get() is False
 
     envs.SGLANG_TEST_RETRACT.set(None)
-    assert envs.SGLANG_TEST_RETRACT.is_set() and envs.SGLANG_TEST_RETRACT.value is None
+    assert envs.SGLANG_TEST_RETRACT.is_set() and envs.SGLANG_TEST_RETRACT.get() is None
 
     envs.SGLANG_TEST_RETRACT.clear()
     assert not envs.SGLANG_TEST_RETRACT.is_set()
 
     envs.SGLANG_TEST_RETRACT.set(True)
-    assert envs.SGLANG_TEST_RETRACT.value is True
+    assert envs.SGLANG_TEST_RETRACT.get() is True
 
     with envs.SGLANG_TEST_RETRACT.override(None):
         assert (
-            envs.SGLANG_TEST_RETRACT.is_set() and envs.SGLANG_TEST_RETRACT.value is None
+            envs.SGLANG_TEST_RETRACT.is_set() and envs.SGLANG_TEST_RETRACT.get() is None
         )
 
-    assert envs.SGLANG_TEST_RETRACT.value is True
+    assert envs.SGLANG_TEST_RETRACT.get() is True
 
     envs.SGLANG_TEST_RETRACT.set(None)
     with envs.SGLANG_TEST_RETRACT.override(True):
-        assert envs.SGLANG_TEST_RETRACT.value is True
+        assert envs.SGLANG_TEST_RETRACT.get() is True
 
-    assert envs.SGLANG_TEST_RETRACT.is_set() and envs.SGLANG_TEST_RETRACT.value is None
+    assert envs.SGLANG_TEST_RETRACT.is_set() and envs.SGLANG_TEST_RETRACT.get() is None
 
     example_with_exit_stack()
     example_with_subprocess()

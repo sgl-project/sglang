@@ -227,6 +227,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             top_k=config.num_experts_per_tok,
             renormalize=config.norm_topk_prob,
             use_grouped_topk=False,
+            layer_id=layer_id,
         )
 
         self.experts = get_moe_impl_class(quant_config)(
@@ -541,7 +542,7 @@ class Qwen3MoeAttention(nn.Module):
         forward_batch: ForwardBatch,
     ):
         qkv, _ = self.qkv_proj(hidden_states)
-        if self.attn.layer_id == 0:
+        if self.attn.layer_id == forward_batch.token_to_kv_pool.start_layer:
             self.rotary_emb.get_cos_sin_with_position(positions)
         q, k, v = split_qkv_rmsnorm_rope(
             qkv,
@@ -728,12 +729,14 @@ class Qwen3MoeDecoderLayer(nn.Module):
         # Qwen3MoE all layers are sparse and have no nextn now
         self.is_layer_sparse = True
         is_previous_layer_sparse = True
+        is_next_layer_sparse = True
 
         self.layer_scatter_modes = LayerScatterModes.init_new(
             layer_id=layer_id,
             num_layers=config.num_hidden_layers,
             is_layer_sparse=self.is_layer_sparse,
             is_previous_layer_sparse=is_previous_layer_sparse,
+            is_next_layer_sparse=is_next_layer_sparse,
         )
 
         if self.is_layer_sparse:

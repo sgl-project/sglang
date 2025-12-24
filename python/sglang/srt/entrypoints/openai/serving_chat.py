@@ -7,6 +7,7 @@ import time
 import uuid
 from typing import TYPE_CHECKING, Any, AsyncGenerator, Dict, List, Optional, Union
 
+import jinja2
 import orjson
 from fastapi import Request
 from fastapi.responses import ORJSONResponse, StreamingResponse
@@ -90,7 +91,7 @@ class OpenAIServingChat(OpenAIServingBase):
             self.tokenizer_manager.tokenizer is not None
             and self.tokenizer_manager.tokenizer.chat_template is not None
         )
-        architectures = self.tokenizer_manager.server_args.get_hf_config().architectures
+        architectures = self.tokenizer_manager.model_config.hf_config.architectures
         is_dpsk_v32 = "DeepseekV3" in architectures[0] if architectures else False
         return not has_chat_template and is_dpsk_v32
 
@@ -214,7 +215,7 @@ class OpenAIServingChat(OpenAIServingBase):
             return_hidden_states=request.return_hidden_states,
             rid=request.rid,
             extra_key=self._compute_extra_key(request),
-            reasoning=self._get_reasoning_from_request(request),
+            require_reasoning=self._get_reasoning_from_request(request),
             priority=request.priority,
             custom_labels=custom_labels,
             custom_logit_processor=request.custom_logit_processor,
@@ -285,23 +286,20 @@ class OpenAIServingChat(OpenAIServingBase):
         template_content_format = self.template_manager.jinja_template_content_format
 
         if self.use_dpsk_v32_encoding:
-            if request.chat_template_kwargs and request.chat_template_kwargs.get(
+            thinking_mode = (
                 "thinking"
-            ):
-                thinking_mode = "thinking"
-            else:
-                thinking_mode = "chat"
+                if (request.chat_template_kwargs or {}).get("thinking")
+                else "chat"
+            )
             messages = request.messages
             messages = [msg.model_dump() for msg in messages]
+
             if messages[0]["role"] != "system":
-                messages.insert(
-                    0, {"role": "system", "content": "You are a helpful Assistant."}
-                )
+                # insert an empty system prompt to help render tool system prompt
+                messages.insert(0, {"role": "system", "content": ""})
             if request.tools:
                 messages[0]["tools"] = [tool.model_dump() for tool in request.tools]
-            real_input = encode_messages(
-                messages, thinking_mode=thinking_mode, drop_thinking=False
-            )
+            real_input = encode_messages(messages, thinking_mode=thinking_mode)
             prompt_ids = self.tokenizer_manager.tokenizer.encode(real_input)
         else:
             for message in request.messages:
@@ -362,27 +360,32 @@ class OpenAIServingChat(OpenAIServingBase):
                         else {}
                     ),
                 )
-            except Exception:
-                # This except branch will be triggered when the chosen model
-                # has a different tools input format that is not compatible
-                # with openAI's apply_chat_template tool_call format, like Mistral.
+            except Exception as e:
+                # If the first attempt fails, try transforming the tools format
+                # This handles models like Mistral that have a different tools input format
+                # that is not compatible with OpenAI's apply_chat_template tool_call format
                 tools = (
                     [t if "function" in t else {"function": t} for t in tools]
                     if tools
                     else None
                 )
-                prompt_ids = self.tokenizer_manager.tokenizer.apply_chat_template(
-                    openai_compatible_messages,
-                    tokenize=True,
-                    add_generation_prompt=True,
-                    tools=tools,
-                    reasoning_effort=request.reasoning_effort,
-                    **(
-                        request.chat_template_kwargs
-                        if request.chat_template_kwargs
-                        else {}
-                    ),
-                )
+                try:
+                    prompt_ids = self.tokenizer_manager.tokenizer.apply_chat_template(
+                        openai_compatible_messages,
+                        tokenize=True,
+                        add_generation_prompt=True,
+                        tools=tools,
+                        reasoning_effort=request.reasoning_effort,
+                        **(
+                            request.chat_template_kwargs
+                            if request.chat_template_kwargs
+                            else {}
+                        ),
+                    )
+                except jinja2.TemplateError as template_error:
+                    # Template errors (e.g., from raise_exception in Jinja templates)
+                    # should be treated as client errors (400 BadRequest)
+                    raise ValueError(str(template_error)) from template_error
 
             if assistant_prefix:
                 encoded = self.tokenizer_manager.tokenizer.encode(assistant_prefix)
@@ -1066,8 +1069,8 @@ class OpenAIServingChat(OpenAIServingBase):
                 request.chat_template_kwargs is not None
                 and request.chat_template_kwargs.get("thinking") is True
             )
-        if self.reasoning_parser in ["qwen3", "glm45"]:
-            # qwen3 and glm45 are reasoning by default
+        if self.reasoning_parser in ["qwen3", "glm45", "nano_v3", "interns1"]:
+            # qwen3, glm45, nano_v3, and interns1 are reasoning by default
             return (
                 not request.chat_template_kwargs
                 or request.chat_template_kwargs.get("enable_thinking", True) is True
