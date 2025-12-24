@@ -238,7 +238,8 @@ class SchedulerMetricsMixin:
             self._emit_kv_metrics()
         self._publish_kv_events()
 
-    def log_prefill_token_stats(self: Scheduler, batch: Optional[ScheduleBatch]):
+    def log_prefill_stats_late(self: Scheduler, batch: Optional[ScheduleBatch]):
+        """This should be called after `batch` has gathered enough metadata."""
         if self.enable_metrics:
             self.metrics_collector.increment_realtime_tokens(
                 prefill_compute_tokens=self.last_prefill_tokens,
@@ -399,6 +400,13 @@ class SchedulerMetricsMixin:
             self.metrics_collector.log_stats(self.stats)
             self._emit_kv_metrics()
         self._publish_kv_events()
+
+    def log_decode_stats_every_iteration(self: Scheduler, batch: ScheduleBatch, num_accepted_tokens: int):
+        self.metrics_collector.increment_realtime_tokens(
+            # TODO unify this w/ `Scheduler.num_generated_tokens` accumulator
+            decode_tokens=batch.batch_size() + num_accepted_tokens,
+            dp_cooperation_info=batch.dp_cooperation_info,
+        )
 
     def log_batch_result_stats(
         self: Scheduler,

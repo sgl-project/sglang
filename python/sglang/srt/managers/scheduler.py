@@ -1831,7 +1831,7 @@ class Scheduler(
         if ret:
             trace_event_batch("schedule", ret.reqs)
 
-        self.log_prefill_token_stats(ret)
+        self.log_prefill_stats_late(ret)
 
         return ret
 
