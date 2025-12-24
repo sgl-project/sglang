@@ -79,7 +79,6 @@ suites = {
         TestFile("test_model_hooks.py", 6),
         TestFile("test_modelopt_loader.py", 11),
         TestFile("test_multi_tokenizer.py", 230),
-        TestFile("test_ngram_speculative_decoding.py", 177),
         TestFile("test_no_chunked_prefill.py", 108),
         TestFile("test_no_overlap_scheduler.py", 217),
         TestFile("test_original_logprobs.py", 41),
@@ -198,7 +197,6 @@ suites = {
         TestFile("test_profile_v2.py"),
         TestFile("models/test_ministral3_models.py"),
         TestFile("test_mistral_large3_basic.py"),
-        TestFile("test_soft_watchdog.py"),
     ],
 }
 
@@ -295,6 +293,10 @@ suite_amd = {
     ],
     "nightly-amd": [
         TestFile("nightly/test_gsm8k_eval_amd.py"),
+    ],
+    # AMD VLM tests using MMMU benchmark (2-GPU runner)
+    "nightly-amd-vlm": [
+        TestFile("nightly/test_vlms_mmmu_eval_amd.py"),
     ],
     # AMD 8-GPU tests for base models using gsm8k completion benchmark
     "nightly-amd-8-gpu": [
