@@ -226,17 +226,29 @@ def create_grammar_backend(
             whitespace_pattern=server_args.constrained_json_whitespace_pattern,
         )
     elif name == "xgrammar":
-        from sglang.srt.constrained.xgrammar_backend import XGrammarGrammarBackend
+        from sglang.srt.constrained.xgrammar_backend import (
+            TokenizerNotSupportedError,
+            XGrammarGrammarBackend,
+        )
 
         # Convert Set[int] to List[int] if needed
         eos_list = list(eos_token_ids) if eos_token_ids else None
 
-        grammar_backend = XGrammarGrammarBackend(
-            tokenizer,
-            vocab_size=vocab_size,
-            model_eos_token_ids=eos_list,
-            any_whitespace=not server_args.constrained_json_disable_any_whitespace,
-        )
+        try:
+            grammar_backend = XGrammarGrammarBackend(
+                tokenizer,
+                vocab_size=vocab_size,
+                model_eos_token_ids=eos_list,
+                any_whitespace=not server_args.constrained_json_disable_any_whitespace,
+            )
+        except TokenizerNotSupportedError as e:
+            logger.warning(
+                f"Grammar backend disabled because tokenizer is not supported by XGrammar: {e}. "
+                "Falling back to grammar_backend='none'. "
+                "Structured outputs (JSON schema, regex, EBNF) will not be available."
+            )
+            server_args.grammar_backend = "none"
+            return None
     elif name == "llguidance":
         from sglang.srt.constrained.llguidance_backend import GuidanceBackend
 

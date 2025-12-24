@@ -614,6 +614,10 @@ class MHATokenToKVPool(KVCache):
         layer_num: int,
         device: str,
         enable_memory_saver: bool,
+        v_head_dim: Optional[int] = None,
+        swa_head_num: Optional[int] = None,
+        swa_head_dim: Optional[int] = None,
+        swa_v_head_dim: Optional[int] = None,
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
         enable_alt_stream: bool = True,
@@ -629,8 +633,13 @@ class MHATokenToKVPool(KVCache):
             start_layer,
             end_layer,
         )
-        self.head_num = head_num
-        self.head_dim = head_dim
+        self.head_num = swa_head_num if swa_head_num is not None else head_num
+        self.head_dim = swa_head_dim if swa_head_dim is not None else head_dim
+        self.v_head_dim = (
+            swa_v_head_dim
+            if swa_v_head_dim is not None
+            else v_head_dim if v_head_dim is not None else head_dim
+        )
 
         self._create_buffers()
 
@@ -664,6 +673,9 @@ class MHATokenToKVPool(KVCache):
         else:
             bytes_per_tile = _KV_COPY_TILE_SIZE_SMALL
 
+        # Calculate num_locs_upper to avoid large Triton specialization (e.g. 8192)
+        chunk_upper = 128 if bytes_per_tile >= _KV_COPY_TILE_SIZE_LARGE else 256
+
         self._kv_copy_config = {
             "bytes_per_tile": bytes_per_tile,
             "byte_tiles": (stride_bytes + bytes_per_tile - 1) // bytes_per_tile,
@@ -672,9 +684,10 @@ class MHATokenToKVPool(KVCache):
                 if bytes_per_tile <= _KV_COPY_TILE_SIZE_MEDIUM
                 else _KV_COPY_NUM_WARPS_LARGE_TILE
             ),
+            "num_locs_upper": chunk_upper,
         }
 
-        dummy_loc = torch.zeros(1, dtype=torch.int32, device=self.device)
+        dummy_loc = torch.zeros(chunk_upper, dtype=torch.int64, device=self.device)
         grid = (self.data_ptrs.numel(), self._kv_copy_config["byte_tiles"])
 
         copy_all_layer_kv_cache_tiled[grid](
@@ -683,7 +696,7 @@ class MHATokenToKVPool(KVCache):
             dummy_loc,
             dummy_loc,
             1,
-            1,
+            chunk_upper,
             BYTES_PER_TILE=self._kv_copy_config["bytes_per_tile"],
             num_warps=self._kv_copy_config["num_warps"],
             num_stages=2,
@@ -708,7 +721,7 @@ class MHATokenToKVPool(KVCache):
                 ]
                 self.v_buffer = [
                     torch.zeros(
-                        (self.size + self.page_size, self.head_num, self.head_dim),
+                        (self.size + self.page_size, self.head_num, self.v_head_dim),
                         dtype=self.store_dtype,
                         device=self.device,
                     )
@@ -893,20 +906,40 @@ class MHATokenToKVPool(KVCache):
         ), "KV copy not initialized. Set enable_kv_cache_copy=True in __init__"
 
         cfg = self._kv_copy_config
-        N_upper = next_power_of_2(N)
+        cap = int(cfg.get("num_locs_upper", 256))
         grid = (self.data_ptrs.numel(), cfg["byte_tiles"])
 
-        copy_all_layer_kv_cache_tiled[grid](
-            self.data_ptrs,
-            self.data_strides,
-            tgt_loc,
-            src_loc,
-            N,
-            N_upper,
-            BYTES_PER_TILE=cfg["bytes_per_tile"],
-            num_warps=cfg["num_warps"],
-            num_stages=2,
-        )
+        if N <= cap:
+            upper = next_power_of_2(N)
+            copy_all_layer_kv_cache_tiled[grid](
+                self.data_ptrs,
+                self.data_strides,
+                tgt_loc,
+                src_loc,
+                N,
+                upper,
+                BYTES_PER_TILE=cfg["bytes_per_tile"],
+                num_warps=cfg["num_warps"],
+                num_stages=2,
+            )
+            return
+
+        # Huge N: chunk, but each chunk's upper is still pow2(<= cap)
+        for start in range(0, N, cap):
+            end = min(start + cap, N)
+            chunk_len = end - start
+            upper = next_power_of_2(chunk_len)
+            copy_all_layer_kv_cache_tiled[grid](
+                self.data_ptrs,
+                self.data_strides,
+                tgt_loc[start:end],
+                src_loc[start:end],
+                chunk_len,
+                upper,
+                BYTES_PER_TILE=cfg["bytes_per_tile"],
+                num_warps=cfg["num_warps"],
+                num_stages=2,
+            )
 
 
 class MHATokenToKVPoolFP4(MHATokenToKVPool):
@@ -1289,6 +1322,9 @@ class SWAKVPool(KVCache):
             layer_num=self.swa_layer_nums,
             **kwargs,
         )
+        kwargs.pop("swa_head_num", None)
+        kwargs.pop("swa_head_dim", None)
+        kwargs.pop("swa_v_head_dim", None)
         self.full_kv_pool = token_to_kv_pool_class(
             size=size,
             dtype=dtype,
@@ -1306,7 +1342,7 @@ class SWAKVPool(KVCache):
         k_size, v_size = self.get_kv_size_bytes()
         self.mem_usage = (k_size + v_size) / GB
         logger.info(
-            f"SWAKVPool mem usage: {self.mem_usage} GB, swa size: {self.size_swa}, full size: {self.size}"
+            f"SWAKVPool mem usage: {self.mem_usage:.2f} GB, swa size: {self.size_swa}, full size: {self.size}"
         )
 
     def get_kv_size_bytes(self):
@@ -1391,6 +1427,35 @@ class SWAKVPool(KVCache):
                 v_scale,
                 layer_id_override=layer_id_pool,
             )
+
+    def get_cpu_copy(self, indices):
+        # For SWA, we need to copy KV cache from both full and SWA pools
+        # The indices are for the full pool, and we use mapping to get SWA indices
+        full_kv_cpu = self.full_kv_pool.get_cpu_copy(indices)
+
+        # Get SWA indices through the mapping
+        # Note: SWA allocation always creates 1:1 mapping, so no need to filter
+        if self.full_to_swa_index_mapping is not None:
+            swa_indices = self.full_to_swa_index_mapping[indices]
+            swa_kv_cpu = self.swa_kv_pool.get_cpu_copy(swa_indices)
+        else:
+            swa_kv_cpu = None
+
+        return {"full": full_kv_cpu, "swa": swa_kv_cpu}
+
+    def load_cpu_copy(self, kv_cache_cpu, indices):
+        # Load KV cache back from CPU to both full and SWA pools
+        # Note: indices here are NEW indices (newly allocated), different from get_cpu_copy indices
+        full_kv_cpu = kv_cache_cpu["full"]
+        swa_kv_cpu = kv_cache_cpu["swa"]
+
+        # Load full KV cache to the new indices
+        self.full_kv_pool.load_cpu_copy(full_kv_cpu, indices)
+
+        # Load SWA KV cache if it exists
+        if swa_kv_cpu is not None and self.full_to_swa_index_mapping is not None:
+            swa_indices = self.full_to_swa_index_mapping[indices]
+            self.swa_kv_pool.load_cpu_copy(swa_kv_cpu, swa_indices)
 
 
 class MLATokenToKVPool(KVCache):

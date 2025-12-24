@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Any, Dict, Optional, Union
 
 import torch
 
+from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cuda_graph
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.quantization.fused_moe_method_npu import (
     NPUW4A16Int4DynamicMoEMethod,
@@ -20,7 +21,7 @@ from sglang.srt.layers.moe.token_dispatcher.deepep import (
     DeepEPLLCombineInput,
     DeepEPNormalCombineInput,
 )
-from sglang.srt.layers.moe.topk import TopKOutput
+from sglang.srt.layers.moe.topk import TopKOutput, TopKOutputChecker
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
@@ -90,7 +91,6 @@ class DeepEPMoE(FusedMoE):
             routed_scaling_factor=routed_scaling_factor,
             **kwargs,
         )
-
         if _use_aiter or _is_npu:
             self.deprecate_flag = False
         elif deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and isinstance(
@@ -152,9 +152,28 @@ class DeepEPMoE(FusedMoE):
         hidden_states: torch.Tensor,
         topk_output: TopKOutput,
     ):
+        if is_in_piecewise_cuda_graph():
+            assert TopKOutputChecker.format_is_standard(
+                topk_output
+            ), "Only standard topk output is supported for piecewise cuda graph"
+            return torch.ops.sglang.moe_forward_piecewise_cuda_graph_impl(
+                hidden_states,
+                topk_output.topk_weights,
+                topk_output.topk_ids,
+                topk_output.router_logits,
+                self.layer_id,
+            )
+        else:
+            return self.forward_impl(hidden_states, topk_output)
+
+    def forward_impl(
+        self,
+        hidden_states: torch.Tensor,
+        topk_output: TopKOutput,
+    ):
 
         if self.deprecate_flag:
-            return super().forward(
+            return super().forward_impl(
                 hidden_states,
                 topk_output,
             )
@@ -548,8 +567,9 @@ def get_moe_impl_class(quant_config: Optional[QuantizationConfig]):
             quant_config is None
             or quant_config.get_name() == "fp8"
             or quant_config.get_name() == "modelopt_fp8"
+            or quant_config.get_name() == "compressed_tensors"
         ):
-            # FlashInferFusedMoE support bf16 and fp8
+            # FlashInferFusedMoE support bf16, fp8 and compressed_tensors
             return FlashInferFusedMoE
 
     if get_moe_runner_backend().is_flashinfer_cutlass():
