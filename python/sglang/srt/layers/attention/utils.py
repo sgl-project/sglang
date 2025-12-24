@@ -321,6 +321,7 @@ def pad_sequence_with_mask(
     return B, output, attn_mask
 
 
+# Adapted from vllm: https://github.com/vllm-project/vllm/blob/v0.12.0/vllm/attention/ops/common.py
 @triton.jit
 def _correct_attn_cp_out_kernel(
     outputs_ptr,
