@@ -3844,27 +3844,21 @@ def get_current_device_numa_node() -> int:
     logical_device_id = torch.cuda.current_device()
     physical_device_id = get_physical_device_id(logical_device_id)
 
-    # Try to get NUMA topology from nvidia-smi
-    try:
-        result = subprocess.run(
-            ["nvidia-smi", "topo", "-C", "-i", str(physical_device_id)],
-            capture_output=True,
-            text=True,
-            check=True,
-        )
+    # Query NUMA topology from nvidia-smi
+    result = subprocess.run(
+        ["nvidia-smi", "topo", "-C", "-i", str(physical_device_id)],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
 
-        output_line = result.stdout.strip()
-        prefix = "NUMA IDs of closest CPU:"
+    output_line = result.stdout.strip()
+    prefix = "NUMA IDs of closest CPU:"
 
-        if output_line.startswith(prefix):
-            numa_id_str = output_line[len(prefix) :].strip()
-
-            # Check if it's a single NUMA ID (no comma or dash)
-            if "," not in numa_id_str and "-" not in numa_id_str:
-                return int(numa_id_str)
-
-    except (FileNotFoundError, subprocess.CalledProcessError, ValueError):
-        pass
+    if output_line.startswith(prefix):
+        numa_id_str = output_line[len(prefix) :].strip()
+        if numa_id_str.isdigit():
+            return int(numa_id_str)
 
     # Fall back: distribute GPUs evenly across NUMA nodes
     numa_count = get_numa_node_count()
