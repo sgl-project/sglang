@@ -101,8 +101,8 @@ class RequestLogger:
     ) -> None:
         if (
             not self.log_requests
-            or self.log_exceeded_ms < 0
-            or self.log_exceeded_ms > out["meta_info"]["e2e_latency"] * 1000
+            or self.log_exceeded_ms > 0
+            and self.log_exceeded_ms > out["meta_info"]["e2e_latency"] * 1000
         ):
             return
 
