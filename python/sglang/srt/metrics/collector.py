@@ -740,7 +740,7 @@ class SchedulerMetricsCollector:
 
     def increment_realtime_tokens(
         self,
-        dp_cooperation_info: DPCooperationInfo,
+        dp_cooperation_info: Optional[DPCooperationInfo],
         prefill_compute_tokens=0,
         prefill_cache_tokens=0,
         decode_tokens=0,
@@ -762,7 +762,7 @@ class SchedulerMetricsCollector:
         self,
         category: str,
         t: float,
-        dp_cooperation_info: DPCooperationInfo,
+        dp_cooperation_info: Optional[DPCooperationInfo],
     ):
         logger.debug(f"GPU execution seconds: {category=} {t=:.3f}")
         self.gpu_execution_seconds_total.labels(**self.labels, category=category).inc(t)
