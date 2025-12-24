@@ -470,6 +470,49 @@ impl WorkerRegistry {
                     })
                     .collect();
                 futures::future::join_all(health_futures).await;
+
+                // After health checks complete, emit worker pool size metrics with healthy label
+                // Key: (worker_type, connection_mode, model_id, is_healthy) -> count
+                let mut counts: std::collections::HashMap<
+                    (&'static str, &'static str, String, bool),
+                    usize,
+                > = std::collections::HashMap::new();
+
+                // First pass: collect unique configs and initialize both healthy states to 0
+                for worker in &workers {
+                    let worker_type = worker.worker_type().as_metric_label();
+                    let connection_mode = worker.connection_mode().as_metric_label();
+                    let model_id = worker.model_id().to_string();
+
+                    // Initialize both healthy=true and healthy=false to 0
+                    counts
+                        .entry((worker_type, connection_mode, model_id.clone(), true))
+                        .or_insert(0);
+                    counts
+                        .entry((worker_type, connection_mode, model_id, false))
+                        .or_insert(0);
+                }
+
+                // Second pass: increment the appropriate counter based on actual health status
+                for worker in &workers {
+                    let key = (
+                        worker.worker_type().as_metric_label(),
+                        worker.connection_mode().as_metric_label(),
+                        worker.model_id().to_string(),
+                        worker.is_healthy(),
+                    );
+                    *counts.get_mut(&key).unwrap() += 1;
+                }
+
+                for ((worker_type, connection_mode, model_id, healthy), count) in counts {
+                    Metrics::set_worker_pool_size(
+                        worker_type,
+                        connection_mode,
+                        &model_id,
+                        healthy,
+                        count,
+                    );
+                }
             }
         });
 
