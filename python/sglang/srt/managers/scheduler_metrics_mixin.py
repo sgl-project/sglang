@@ -391,7 +391,7 @@ class SchedulerMetricsMixin:
 
             self.metrics_collector.increment_realtime_tokens(
                 decode_tokens=last_num_generated_tokens,
-                dp_cooperation_info=TODO,
+                dp_cooperation_info=batch.dp_cooperation_info,
             )
 
             # Others
