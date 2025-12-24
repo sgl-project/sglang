@@ -208,6 +208,7 @@ class RotaryEmbedding(CustomOp):
         )
 
     def get_cos_sin_with_position(self, positions):
+        assert positions.ndim == 1 or positions.ndim == 2
         if positions.ndim == 1:
             cos_sin = self.cos_sin_cache.index_select(0, positions.flatten())
             last_dim = cos_sin.size()[-1]
