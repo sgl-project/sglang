@@ -52,7 +52,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     USE_G: tl.constexpr,
     USE_GK: tl.constexpr,
     USE_INITIAL_STATE: tl.constexpr,
-    STORE_FINAL_STATE: tl.constexpr,
+    INPLACE_UPDATE: tl.constexpr,
     SAVE_NEW_VALUE: tl.constexpr,
     IS_VARLEN: tl.constexpr,
 ):
@@ -91,12 +91,12 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     stride_k = Hg * K
     stride_w = H * K
 
-    indice = tl.load(initial_state_indices + i_n).to(tl.int32)
-    h0 = initial_state + indice * stride_h
-    ht = initial_state + indice * stride_h
+    index = tl.load(initial_state_indices + i_n).to(tl.int32)
+    h0 = initial_state + index * stride_h
+    ht = initial_state + index * stride_h
     if USE_INITIAL_STATE:
         h0 = h0 + i_h * K * V
-    if STORE_FINAL_STATE:
+    if INPLACE_UPDATE:
         ht = ht + i_h * K * V
 
     # load initial state
@@ -251,7 +251,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
             b_h4 += tl.dot(b_k, b_v)
 
     # epilogue
-    if STORE_FINAL_STATE:
+    if INPLACE_UPDATE:
         p_ht = tl.make_block_ptr(ht, (K, V), (V, 1), (0, i_v * BV), (64, BV), (1, 0))
         tl.store(p_ht, b_h1.to(p_ht.dtype.element_ty), boundary_check=(0, 1))
         if K > 64:
@@ -279,7 +279,6 @@ def chunk_gated_delta_rule_fwd_h(
     gk: Optional[torch.Tensor] = None,
     initial_state: Optional[torch.Tensor] = None,
     initial_state_indices: Optional[torch.Tensor] = None,
-    output_final_state: bool = False,
     save_new_value: bool = True,
     cu_seqlens: Optional[torch.LongTensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -332,7 +331,7 @@ def chunk_gated_delta_rule_fwd_h(
         USE_G=g is not None,
         USE_GK=gk is not None,
         USE_INITIAL_STATE=initial_state is not None,
-        STORE_FINAL_STATE=True,
+        INPLACE_UPDATE=True,
         SAVE_NEW_VALUE=v_new is not None,
         IS_VARLEN=cu_seqlens is not None,
         num_warps=4,

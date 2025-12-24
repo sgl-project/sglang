@@ -1208,7 +1208,6 @@ def chunk_kda(
     scale: float = None,
     initial_state: torch.Tensor = None,
     initial_state_indices: torch.Tensor = None,
-    output_final_state: bool = False,
     use_qk_l2norm_in_kernel: bool = False,
     cu_seqlens: torch.LongTensor | None = None,
     **kwargs,
@@ -1229,7 +1228,6 @@ def chunk_kda(
         scale=scale,
         initial_state=initial_state,
         initial_state_indices=initial_state_indices,
-        output_final_state=output_final_state,
         cu_seqlens=cu_seqlens,
     )
     return o
