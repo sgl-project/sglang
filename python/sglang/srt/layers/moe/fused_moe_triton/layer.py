@@ -8,6 +8,10 @@ import torch
 
 from sglang.srt.batch_overlap.single_batch_overlap import DownGemmOverlapArgs
 from sglang.srt.batch_overlap.two_batch_overlap import MaybeTboDeepEPDispatcher
+from sglang.srt.compilation.piecewise_context_manager import (
+    get_forward_context,
+    is_in_piecewise_cuda_graph,
+)
 from sglang.srt.distributed import (
     get_moe_expert_parallel_rank,
     get_moe_expert_parallel_world_size,
@@ -37,7 +41,13 @@ from sglang.srt.layers.moe.token_dispatcher.standard import (
     StandardDispatcher,
     StandardDispatchOutput,
 )
-from sglang.srt.layers.moe.topk import TopKOutput, TopKOutputChecker
+from sglang.srt.layers.moe.topk import (
+    BypassedTopKOutput,
+    StandardTopKOutput,
+    TopKConfig,
+    TopKOutput,
+    TopKOutputChecker,
+)
 from sglang.srt.layers.moe.utils import RoutingMethodType
 from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
@@ -54,8 +64,10 @@ from sglang.srt.utils import (
     is_cpu,
     is_flashinfer_available,
     is_hip,
+    next_power_of_2,
     round_up,
 )
+from sglang.srt.utils.common import direct_register_custom_op
 
 if is_flashinfer_available():
     from flashinfer import fp4_quantize
@@ -192,6 +204,7 @@ class FusedMoE(torch.nn.Module):
         self.use_presharded_weights = use_presharded_weights
 
         self.use_triton_kernels = get_moe_runner_backend().is_triton_kernels()
+        self.use_flashinfer_trtllm_moe = get_moe_runner_backend().is_flashinfer_trtllm()
 
         self.quant_config = quant_config
         self.use_flashinfer_mxfp4_moe = get_moe_runner_backend().is_flashinfer_mxfp4()
@@ -236,7 +249,9 @@ class FusedMoE(torch.nn.Module):
             if quant_config is not None:
                 self.quant_method = quant_config.get_quant_method(self, prefix)
             if self.quant_method is None:
-                self.quant_method = UnquantizedFusedMoEMethod(self.use_triton_kernels)
+                self.quant_method = UnquantizedFusedMoEMethod(
+                    self.use_triton_kernels, self.use_flashinfer_trtllm_moe
+                )
 
         self.quant_method.create_weights(
             layer=self,
@@ -640,9 +655,10 @@ class FusedMoE(torch.nn.Module):
             raise ValueError(f"shard_id must be ['w1','w2','w3'] but got {shard_id}.")
 
         # Flashinfer assumes w31 format for w13_weight. Same for the scales.
-        if get_moe_runner_backend().is_flashinfer_trtllm() and (
+        if self.use_flashinfer_trtllm_moe and (
             isinstance(self.quant_method, ModelOptNvFp4FusedMoEMethod)
             or isinstance(self.quant_method, Fp8MoEMethod)
+            or isinstance(self.quant_method, UnquantizedFusedMoEMethod)
         ):
             shard_id = {"w1": "w3", "w3": "w1", "w2": "w2"}[shard_id]
 
@@ -877,6 +893,21 @@ class FusedMoE(torch.nn.Module):
             )
 
     def forward(self, hidden_states: torch.Tensor, topk_output: TopKOutput):
+        if is_in_piecewise_cuda_graph():
+            assert TopKOutputChecker.format_is_standard(
+                topk_output
+            ), "Only standard topk output is supported for piecewise cuda graph"
+            return torch.ops.sglang.moe_forward_piecewise_cuda_graph_impl(
+                hidden_states,
+                topk_output.topk_weights,
+                topk_output.topk_ids,
+                topk_output.router_logits,
+                self.layer_id,
+            )
+        else:
+            return self.forward_impl(hidden_states, topk_output)
+
+    def forward_impl(self, hidden_states: torch.Tensor, topk_output: TopKOutput):
         origin_hidden_states_dim = hidden_states.shape[-1]
         assert self.quant_method is not None
 
@@ -1034,31 +1065,83 @@ class FlashInferFusedMoE(FusedMoE):
         super().__init__(*args, **kwargs)
 
     def forward(self, hidden_states: torch.Tensor, topk_output: TopKOutput):
+        if is_in_piecewise_cuda_graph():
+            assert TopKOutputChecker.format_is_standard(
+                topk_output
+            ), "Only standard topk output is supported for piecewise cuda graph"
+            return torch.ops.sglang.moe_forward_piecewise_cuda_graph_impl(
+                hidden_states,
+                topk_output.topk_weights,
+                topk_output.topk_ids,
+                topk_output.router_logits,
+                self.layer_id,
+            )
+        else:
+            return self.forward_impl(hidden_states, topk_output)
+
+    def forward_impl(self, hidden_states: torch.Tensor, topk_output: TopKOutput):
         assert (
             self.moe_runner_config.activation == "silu"
-        ), "Only silu is supported for flashinfer blockscale fp8 moe"
+        ), "Only silu is supported for flashinfer trtllm moe"
         assert self.quant_method is not None
         assert (
             topk_output.topk_config.renormalize
-        ), "Renormalize is required for flashinfer blockscale fp8 moe"
+        ), "Renormalize is required for flashinfer trtllm moe"
         assert (
             self.num_fused_shared_experts == 0
-        ), "Fused shared experts are not supported for flashinfer blockscale fp8 moe"
+        ), "Fused shared experts are not supported for flashinfer trtllm moe"
         assert (
             self.moe_runner_config.is_gated
-        ), "Only gated MoEs are supported for flashinfer blockscale fp8 moe"
+        ), "Only gated MoEs are supported for flashinfer trtllm moe"
 
         assert TopKOutputChecker.format_is_bypassed(topk_output)
 
-        # Matrix multiply.
-        final_hidden_states = self.quant_method.apply_with_router_logits(
-            layer=self,
-            dispatch_output=StandardDispatchOutput(
-                hidden_states=hidden_states,
-                hidden_states_scale=None,
-                topk_output=topk_output,
-            ),
-        )
+        router_logits = topk_output.router_logits
+        topk_config = topk_output.topk_config
+        correction_bias = topk_config.correction_bias
+
+        if isinstance(self.quant_method, UnquantizedFusedMoEMethod):
+            # lazy import
+            try:
+                from flashinfer.fused_moe import trtllm_bf16_moe
+            except ImportError as e:
+                raise ImportError(
+                    "Can't import trtllm_bf16_moe from flashinfer. "
+                    "Please check flashinfer version to use bf16 with flashinfer_trtllm backend."
+                ) from e
+
+            with use_symmetric_memory(
+                get_tp_group(), disabled=not is_allocation_symmetric()
+            ):
+                # TODO: Now trtllm_bf16_moe doesn't support inplace output,
+                # we can move this out when it support that.
+                final_hidden_states = trtllm_bf16_moe(
+                    routing_logits=router_logits,
+                    routing_bias=correction_bias,
+                    hidden_states=hidden_states,
+                    gemm1_weights=self.w13_weight,
+                    gemm2_weights=self.w2_weight,
+                    num_experts=self.num_experts,
+                    top_k=topk_config.top_k,
+                    n_group=topk_config.num_expert_group,
+                    topk_group=topk_config.topk_group,
+                    intermediate_size=self.intermediate_size_per_partition,
+                    local_expert_offset=self.moe_ep_rank * self.num_local_experts,
+                    local_num_experts=self.num_local_experts,
+                    routing_method_type=self.routing_method_type,
+                    tune_max_num_tokens=next_power_of_2(hidden_states.shape[0]),
+                )
+
+        else:
+
+            final_hidden_states = self.quant_method.apply_with_router_logits(
+                layer=self,
+                dispatch_output=StandardDispatchOutput(
+                    hidden_states=hidden_states,
+                    hidden_states_scale=None,
+                    topk_output=topk_output,
+                ),
+            )
 
         # NOTE for symmetric memory tagging:
         # We do not create the context in this function.
@@ -1100,14 +1183,36 @@ class FlashInferFP4MoE(FusedMoE):
             False,  # is_sf_swizzled_layout
         )
 
-        hs_fp4 = hs_fp4_bytes.reshape(
-            hidden_states.shape[0], hidden_states.shape[1] // 2
+        seq_len, hidden_size = hidden_states.shape
+        hs_fp4 = hs_fp4_bytes.reshape(seq_len, hidden_size // 2)
+        # TRT-LLM expects hidden state scales shaped as [seq_len, hidden_size // 16]
+        hs_sf = hs_sf_bytes.view(torch.float8_e4m3fn).reshape(
+            seq_len, hidden_size // 16
         )
-        hs_sf = hs_sf_bytes.view(torch.float8_e4m3fn).reshape(-1)
 
         return hs_fp4, hs_sf
 
     def forward(self, hidden_states: torch.Tensor, topk_output: TopKOutput):
+        assert TopKOutputChecker.format_is_bypassed(
+            topk_output
+        ), "Only bypassed topk output is supported for flashinfer fp4 moe"
+
+        if is_in_piecewise_cuda_graph():
+            return (
+                torch.ops.sglang.flashinfer_fp4_moe_forward_piecewise_cuda_graph_impl(
+                    hidden_states,
+                    topk_output.router_logits,
+                    topk_output.topk_config.top_k,
+                    topk_output.topk_config.topk_group,
+                    topk_output.topk_config.num_expert_group,
+                    topk_output.topk_config.correction_bias,
+                    self.layer_id,
+                )
+            )
+        else:
+            return self.forward_impl(hidden_states, topk_output)
+
+    def forward_impl(self, hidden_states: torch.Tensor, topk_output: TopKOutput):
         """Forward pass using FP4 TRTLLM kernel.
 
         Args:
@@ -1185,9 +1290,93 @@ class FlashInferFP4MoE(FusedMoE):
             local_num_experts=self.num_local_experts,
             routed_scaling_factor=self.moe_runner_config.routed_scaling_factor,
             tile_tokens_dim=None,
-            routing_method_type=routing_method_type,
+            # Respect the routing method configured for this layer (e.g., Renormalize for Qwen3),
+            # instead of always assuming DeepSeekV3.
+            routing_method_type=(
+                self.routing_method_type
+                if self.routing_method_type is not None
+                else RoutingMethodType.Default
+            ),
             do_finalize=True,
+            tune_max_num_tokens=next_power_of_2(hs_fp4.shape[0]),
             output=symm_output,
         )[0]
 
         return result
+
+
+def moe_forward_piecewise_cuda_graph_impl(
+    hidden_states: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    router_logits: torch.Tensor,
+    layer_id: int,
+) -> torch.Tensor:
+    # only standard topk output is supported for piecewise cuda graph
+    topk_output = StandardTopKOutput(
+        topk_weights=topk_weights, topk_ids=topk_ids, router_logits=router_logits
+    )
+    forward_context = get_forward_context()
+    moe_layer = forward_context.moe_layers[layer_id]
+    return moe_layer.forward_impl(hidden_states, topk_output)
+
+
+def moe_forward_piecewise_cuda_graph_impl_fake(
+    hidden_states: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    router_logits: torch.Tensor,
+    layer_id: int,
+) -> torch.Tensor:
+    return torch.empty_like(hidden_states)
+
+
+def flashinfer_fp4_moe_forward_piecewise_cuda_graph_impl(
+    hidden_states: torch.Tensor,
+    router_logits: torch.Tensor,
+    top_k: int,
+    topk_group: Optional[int],
+    num_expert_group: Optional[int],
+    correction_bias: Optional[torch.Tensor],
+    layer_id: int,
+) -> torch.Tensor:
+    topk_output = BypassedTopKOutput(
+        hidden_states=hidden_states,
+        router_logits=router_logits,
+        topk_config=TopKConfig(
+            top_k=top_k,
+            topk_group=topk_group,
+            num_expert_group=num_expert_group,
+            correction_bias=correction_bias,
+        ),
+    )
+    forward_context = get_forward_context()
+    moe_layer = forward_context.moe_layers[layer_id]
+    return moe_layer.forward_impl(hidden_states, topk_output)
+
+
+def flashinfer_fp4_moe_forward_piecewise_cuda_graph_impl_fake(
+    hidden_states: torch.Tensor,
+    router_logits: torch.Tensor,
+    top_k: int,
+    topk_group: Optional[int],
+    num_expert_group: Optional[int],
+    correction_bias: Optional[torch.Tensor],
+    layer_id: int,
+) -> torch.Tensor:
+    return torch.empty_like(hidden_states)
+
+
+direct_register_custom_op(
+    op_name="moe_forward_piecewise_cuda_graph_impl",
+    op_func=moe_forward_piecewise_cuda_graph_impl,
+    mutates_args=[],
+    fake_impl=moe_forward_piecewise_cuda_graph_impl_fake,
+)
+
+direct_register_custom_op(
+    op_name="flashinfer_fp4_moe_forward_piecewise_cuda_graph_impl",
+    op_func=flashinfer_fp4_moe_forward_piecewise_cuda_graph_impl,
+    mutates_args=[],
+    fake_impl=flashinfer_fp4_moe_forward_piecewise_cuda_graph_impl_fake,
+)

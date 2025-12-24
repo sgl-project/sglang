@@ -39,7 +39,7 @@ def run_eval_once(args, base_url: str, eval_obj: Eval) -> dict:
         base_url=base_url,
         temperature=getattr(args, "temperature", 0.0),
         reasoning_effort=getattr(args, "reasoning_effort", None),
-        extra_body=thinking_kwargs,
+        extra_body=thinking_kwargs if thinking_kwargs else None,
     )
 
     # Run eval
@@ -115,12 +115,23 @@ def run_eval(args):
         # VLM MMMU evaluation with fixed 100 examples by default
         from sglang.test.simple_eval_mmmu_vlm import MMMUVLMEval
 
-        eval_obj = MMMUVLMEval(args.num_examples, args.num_threads)
+        eval_obj = MMMUVLMEval(
+            args.num_examples,
+            args.num_threads,
+            response_answer_regex=getattr(args, "response_answer_regex", None),
+        )
+    elif args.eval_name == "aime25":
+        from sglang.test.simple_eval_aime25 import AIME25Eval
+
+        eval_obj = AIME25Eval(args.num_examples, args.num_threads)
     else:
         raise ValueError(f"Invalid eval name: {args.eval_name}")
 
     if getattr(args, "repeat", 1) == 1:
         result, latency, sampler = run_eval_once(args, base_url, eval_obj)
+        metrics = result.metrics | {"score": result.score}
+        print(f"Total latency: {latency:.3f} s")
+        print(f"Score: {metrics['score']:.3f}")
     else:
         from concurrent.futures import ThreadPoolExecutor
 
@@ -143,26 +154,22 @@ def run_eval(args):
         print(f"Repeat: {args.repeat}, mean: {mean_score:.3f}")
         print(f"Scores: {scores_repeat}")
         print("=" * 20)
+        metrics = result.metrics | {"scores": scores_repeat}
+        metrics = metrics | {"mean_score": mean_score}
 
         executor.shutdown()
 
     # Dump reports
-    metrics = result.metrics | {"score": result.score}
     file_stem = f"{args.eval_name}_{sampler.model.replace('/', '_')}"
     report_filename = f"/tmp/{file_stem}.html"
     print(f"Writing report to {report_filename}")
     with open(report_filename, "w") as fh:
         fh.write(make_report(result))
-    metrics = result.metrics | {"score": result.score}
     print(metrics)
     result_filename = f"/tmp/{file_stem}.json"
     with open(result_filename, "w") as f:
         f.write(json.dumps(metrics, indent=2))
     print(f"Writing results to {result_filename}")
-
-    # Print results
-    print(f"Total latency: {latency:.3f} s")
-    print(f"Score: {metrics['score']:.3f}")
 
     if getattr(args, "return_latency", False):
         return metrics, latency

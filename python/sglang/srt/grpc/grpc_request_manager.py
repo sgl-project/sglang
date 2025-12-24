@@ -688,7 +688,9 @@ class GrpcRequestManager:
                     batch_out.prompt_tokens[i] if batch_out.prompt_tokens else 0
                 ),
                 "finish_reason": (
-                    batch_out.finish_reason[i] if batch_out.finish_reason else None
+                    batch_out.finished_reasons[i]
+                    if batch_out.finished_reasons
+                    else None
                 ),
             }
 

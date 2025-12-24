@@ -16,12 +16,14 @@ use crate::{
         generate::{GenerateMetaInfo, GenerateRequest, GenerateResponse},
     },
     reasoning_parser::ParserFactory as ReasoningParserFactory,
-    routers::grpc::{
-        common::{response_collection, response_formatting},
-        context::{DispatchMetadata, ExecutionResult},
+    routers::{
         error,
-        proto_wrapper::ProtoGenerateComplete,
-        utils,
+        grpc::{
+            common::{response_collection, response_formatting},
+            context::{DispatchMetadata, ExecutionResult},
+            proto_wrapper::ProtoGenerateComplete,
+            utils,
+        },
     },
     tokenizer::{
         stop::{SequenceDecoderOutput, StopSequenceDecoder},
@@ -33,7 +35,6 @@ use crate::{
 /// Unified response processor for both routers
 #[derive(Clone)]
 pub struct ResponseProcessor {
-    pub tokenizer: Arc<dyn Tokenizer>,
     pub tool_parser_factory: ToolParserFactory,
     pub reasoning_parser_factory: ReasoningParserFactory,
     pub configured_tool_parser: Option<String>,
@@ -42,14 +43,12 @@ pub struct ResponseProcessor {
 
 impl ResponseProcessor {
     pub fn new(
-        tokenizer: Arc<dyn Tokenizer>,
         tool_parser_factory: ToolParserFactory,
         reasoning_parser_factory: ReasoningParserFactory,
         configured_tool_parser: Option<String>,
         configured_reasoning_parser: Option<String>,
     ) -> Self {
         Self {
-            tokenizer,
             tool_parser_factory,
             reasoning_parser_factory,
             configured_tool_parser,
@@ -64,6 +63,7 @@ impl ResponseProcessor {
         complete: &ProtoGenerateComplete,
         index: usize,
         original_request: &ChatCompletionRequest,
+        tokenizer: &Arc<dyn Tokenizer>,
         stop_decoder: &mut StopSequenceDecoder,
         history_tool_calls_count: usize,
         reasoning_parser_available: bool,
@@ -174,7 +174,7 @@ impl ResponseProcessor {
 
         // Step 4: Convert output logprobs if present
         let logprobs = if let Some(proto_logprobs) = complete.output_logprobs() {
-            match utils::convert_proto_to_openai_logprobs(proto_logprobs, &self.tokenizer) {
+            match utils::convert_proto_to_openai_logprobs(proto_logprobs, tokenizer) {
                 Ok(logprobs) => Some(logprobs),
                 Err(e) => {
                     error!("Failed to convert logprobs: {}", e);
@@ -214,6 +214,7 @@ impl ResponseProcessor {
         execution_result: ExecutionResult,
         chat_request: Arc<ChatCompletionRequest>,
         dispatch: DispatchMetadata,
+        tokenizer: Arc<dyn Tokenizer>,
         stop_decoder: &mut StopSequenceDecoder,
         request_logprobs: bool,
     ) -> Result<ChatCompletionResponse, axum::response::Response> {
@@ -267,6 +268,7 @@ impl ResponseProcessor {
                     complete,
                     index,
                     &chat_request,
+                    &tokenizer,
                     stop_decoder,
                     history_tool_calls_count,
                     reasoning_parser_available,
@@ -276,10 +278,10 @@ impl ResponseProcessor {
             {
                 Ok(choice) => choices.push(choice),
                 Err(e) => {
-                    return Err(error::internal_error(format!(
-                        "Failed to process choice {}: {}",
-                        index, e
-                    )));
+                    return Err(error::internal_error(
+                        "process_choice_failed",
+                        format!("Failed to process choice {}: {}", index, e),
+                    ));
                 }
             }
         }
@@ -378,10 +380,10 @@ impl ResponseProcessor {
             let outputs = match stop_decoder.process_tokens(complete.output_ids()) {
                 Ok(outputs) => outputs,
                 Err(e) => {
-                    return Err(error::internal_error(format!(
-                        "Failed to process tokens: {}",
-                        e
-                    )))
+                    return Err(error::internal_error(
+                        "process_tokens_failed",
+                        format!("Failed to process tokens: {}", e),
+                    ))
                 }
             };
 

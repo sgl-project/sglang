@@ -12,17 +12,22 @@
 # limitations under the License.
 # ==============================================================================
 """Utilities for Prometheus Metrics Collection."""
+import logging
 import os
 import time
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Union
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.environ import envs
 from sglang.srt.metrics.utils import exponential_buckets, generate_buckets
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import get_bool_env_var
 
 SGLANG_TEST_REQUEST_TIME_STATS = get_bool_env_var("SGLANG_TEST_REQUEST_TIME_STATS")
+
+
+logger = logging.getLogger(__name__)
 
 
 def get_histogram_conf_from_env(env_var_name: str) -> Optional[List[float]]:
@@ -63,6 +68,15 @@ class TimeStats:
     alloc_waiting_duration: float = 0.0
     prefill_start_time_host: float = 0.0
     prefill_end_time_host: float = 0.0
+    transfer_speed_gb_s: float = 0.0
+    transfer_total_mb: float = 0.0
+
+    # Timestamp when prefill phase finishes, obtained from `time.time()`.
+    # Note that this differs from the other `_time` fields tracked by the
+    # `TimeStats` class, which are obtained from `time.perf_counter()`.
+    # We use `time.time()` instead of `time.perf_counter()` here in order to
+    # maintain unit consistency with other timestamp fields tracked by the `ReqState` class.
+    prefill_finished_ts: float = 0.0
 
     def get_queueing_time(self) -> float:
         return self.forward_entry_time - self.wait_queue_entry_time
@@ -75,6 +89,11 @@ class TimeStats:
     def get_prefill_launch_latency(self) -> Optional[float]:
         if self.prefill_start_time_host > 0.0 and self.prefill_end_time_host > 0.0:
             return self.prefill_end_time_host - self.prefill_start_time_host
+        return None
+
+    def get_prefill_finished_ts(self) -> Optional[float]:
+        if self.prefill_finished_ts > 0.0:
+            return self.prefill_finished_ts
         return None
 
     def convert_to_duration(self) -> str:
@@ -115,7 +134,9 @@ class TimeStats:
                 f"+ other({self.format_duration(other)}); "
                 f"queue_duration={self.format_duration(queue_duration)}, "
                 f"forward_duration={self.format_duration(forward_duration)}, "
-                f"start={self.prefill_bootstrap_queue_entry_time:.3f}"
+                f"start={self.prefill_bootstrap_queue_entry_time:.3f}, "
+                f"transfer_speed={self.transfer_speed_gb_s:.2f}GB/s, "
+                f"transfer_total={self.transfer_total_mb:.2f}MB"
             )
         elif self.disagg_mode == DisaggregationMode.DECODE:
             prealloc_duration = (
@@ -178,6 +199,7 @@ class SchedulerStats:
     pending_prealloc_token_usage: float = 0.0
     swa_token_usage: float = 0.0
     mamba_usage: float = 0.0
+    decode_sum_seq_lens: int = 0
     gen_throughput: float = 0.0
     num_queue_reqs: int = 0
     num_grammar_queue_reqs: int = 0
@@ -203,6 +225,7 @@ class SchedulerStats:
     kv_transfer_latency_ms: float = 0.0
     kv_transfer_bootstrap_ms: float = 0.0
     kv_transfer_alloc_ms: float = 0.0
+    kv_transfer_total_mb: float = 0.0
 
     # Utilization
     utilization: float = 0.0
@@ -224,7 +247,7 @@ class SchedulerMetricsCollector:
         labels: Dict[str, str],
     ) -> None:
         # We need to import prometheus_client after setting the env variable `PROMETHEUS_MULTIPROC_DIR`
-        from prometheus_client import Counter, Gauge, Histogram
+        from prometheus_client import Counter, Gauge, Histogram, Summary
 
         self.labels = labels
         self.last_log_time = time.perf_counter()
@@ -262,6 +285,12 @@ class SchedulerMetricsCollector:
         self.mamba_usage = Gauge(
             name="sglang:mamba_usage",
             documentation="The token usage for Mamba layers.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.decode_sum_seq_lens = Gauge(
+            name="sglang:decode_sum_seq_lens",
+            documentation="The sum of all sequence lengths in decode.",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
@@ -318,9 +347,16 @@ class SchedulerMetricsCollector:
         )
 
         # Retract
+        # TODO maybe remove this old gauge in favor of the new counter
         self.num_retracted_reqs = Gauge(
             name="sglang:num_retracted_reqs",
             documentation="The number of retracted requests.",
+            labelnames=labels.keys(),
+        )
+        self.num_retracted_reqs_total = Counter(
+            # The name is `requests` instead of `reqs` to avoid dup name error
+            name="sglang:num_retracted_requests_total",
+            documentation="Total number of retracted requests.",
             labelnames=labels.keys(),
         )
         self.num_paused_reqs = Gauge(
@@ -385,6 +421,12 @@ class SchedulerMetricsCollector:
         self.kv_transfer_alloc_ms = Gauge(
             name="sglang:kv_transfer_alloc_ms",
             documentation="The allocation waiting time of the KV transfer in ms.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.kv_transfer_total_mb = Gauge(
+            name="sglang:kv_transfer_total_mb",
+            documentation="The total number of tokens transferred in the KV cache.",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
@@ -598,18 +640,55 @@ class SchedulerMetricsCollector:
             labelnames=list(labels.keys()) + ["stage"],
         )
 
+        # TODO maybe remove this old gauge in favor of the new counter
         self.is_cuda_graph = Gauge(
             name="sglang:is_cuda_graph",
             documentation="Whether the batch is using CUDA graph.",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
+        self.cuda_graph_passes_total = Counter(
+            name="sglang:cuda_graph_passes_total",
+            documentation="Total number of forward passes categorized by CUDA graph.",
+            labelnames=list(labels.keys()) + ["mode"],
+        )
+
+        if (
+            labels["moe_ep_rank"] == 0
+        ) and envs.SGLANG_ENABLE_EPLB_BALANCEDNESS_METRIC.get():
+            self.eplb_balancedness = Summary(
+                name="sglang:eplb_balancedness",
+                documentation="Balancedness of MoE in expert parallelism.",
+                labelnames=list(labels.keys()) + ["forward_mode"],
+            )
 
         self.new_token_ratio = Gauge(
             name="sglang:new_token_ratio",
             documentation="The new token ratio.",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
+        )
+
+        self.realtime_prefill_compute_tokens_total = Counter(
+            name="sglang:realtime_prefill_compute_tokens_total",
+            documentation="Total number of prefill compute tokens processed (updated on each log interval).",
+            labelnames=labels.keys(),
+        )
+        self.realtime_prefill_cache_tokens_total = Counter(
+            name="sglang:realtime_prefill_cache_tokens_total",
+            documentation="Total number of prefill cache tokens processed (updated on each log interval).",
+            labelnames=labels.keys(),
+        )
+        self.realtime_decode_tokens_total = Counter(
+            name="sglang:realtime_decode_tokens_total",
+            documentation="Total number of decode tokens processed (updated on each log interval).",
+            labelnames=labels.keys(),
+        )
+
+        self.gpu_execution_seconds_total = Counter(
+            name="sglang:gpu_execution_seconds_total",
+            documentation="Total time that GPU is busy executing a workload.",
+            labelnames=list(labels.keys()) + ["category"],
         )
 
     def _log_gauge(self, gauge, data: Union[int, float]) -> None:
@@ -632,6 +711,36 @@ class SchedulerMetricsCollector:
     def observe_queue_time(self, latency: float) -> None:
         self._log_histogram(self.queue_time, latency)
 
+    def increment_num_retracted_reqs(self, num: int) -> None:
+        self.num_retracted_reqs_total.labels(**self.labels).inc(num)
+
+    def increment_cuda_graph_pass(self, value: bool) -> None:
+        # leave room for piecewise cuda graph, etc
+        mode = "decode_cuda_graph" if value else "decode_none"
+        self.cuda_graph_passes_total.labels(**self.labels, mode=mode).inc(1)
+
+    def increment_eplb_balancedness(
+        self, forward_mode: str, balancedness: float
+    ) -> None:
+        self.eplb_balancedness.labels(**self.labels, forward_mode=forward_mode).observe(
+            balancedness
+        )
+
+    def increment_realtime_tokens(
+        self, prefill_compute_tokens=0, prefill_cache_tokens=0, decode_tokens=0
+    ):
+        self.realtime_prefill_compute_tokens_total.labels(**self.labels).inc(
+            prefill_compute_tokens
+        )
+        self.realtime_prefill_cache_tokens_total.labels(**self.labels).inc(
+            prefill_cache_tokens
+        )
+        self.realtime_decode_tokens_total.labels(**self.labels).inc(decode_tokens)
+
+    def increment_gpu_execution_seconds(self, category: str, t: float):
+        logger.debug(f"GPU execution seconds: {category=} {t=:.3f}")
+        self.gpu_execution_seconds_total.labels(**self.labels, category=category).inc(t)
+
     def log_stats(self, stats: SchedulerStats) -> None:
         self._log_gauge(self.num_running_reqs, stats.num_running_reqs)
         self._log_gauge(self.num_used_tokens, stats.num_used_tokens)
@@ -641,6 +750,7 @@ class SchedulerMetricsCollector:
         )
         self._log_gauge(self.swa_token_usage, stats.swa_token_usage)
         self._log_gauge(self.mamba_usage, stats.mamba_usage)
+        self._log_gauge(self.decode_sum_seq_lens, stats.decode_sum_seq_lens)
         self._log_gauge(self.gen_throughput, stats.gen_throughput)
         self._log_gauge(self.num_queue_reqs, stats.num_queue_reqs)
         self._log_gauge(self.num_grammar_queue_reqs, stats.num_grammar_queue_reqs)
@@ -672,6 +782,7 @@ class SchedulerMetricsCollector:
         self._log_gauge(self.kv_transfer_latency_ms, stats.kv_transfer_latency_ms)
         self._log_gauge(self.kv_transfer_bootstrap_ms, stats.kv_transfer_bootstrap_ms)
         self._log_gauge(self.kv_transfer_alloc_ms, stats.kv_transfer_alloc_ms)
+        self._log_gauge(self.kv_transfer_total_mb, stats.kv_transfer_total_mb)
 
         # Retract
         self._log_gauge(self.num_retracted_reqs, stats.num_retracted_reqs)

@@ -8,6 +8,7 @@ import argparse
 import dataclasses
 import inspect
 import json
+import os
 import random
 import sys
 import tempfile
@@ -16,12 +17,7 @@ from dataclasses import field
 from enum import Enum
 from typing import Any, Optional
 
-from sglang.multimodal_gen.configs.pipeline_configs import FluxPipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig, STA_Mode
-from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
-    QwenImageEditPipelineConfig,
-    QwenImagePipelineConfig,
-)
 from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
     current_platform,
@@ -174,35 +170,6 @@ class ExecutionMode(str, Enum):
         return [mode.value for mode in cls]
 
 
-class WorkloadType(str, Enum):
-    """
-    Enumeration for different workload types.
-
-    Inherits from str to allow string comparison for backward compatibility.
-    """
-
-    I2V = "i2v"  # Image to Video
-    T2V = "t2v"  # Text to Video
-    T2I = "t2i"  # Text to Image
-    I2I = "i2i"  # Image to Image
-
-    @classmethod
-    def from_string(cls, value: str) -> "WorkloadType":
-        """Convert string to WorkloadType enum."""
-        try:
-            return cls(value.lower())
-        except ValueError:
-            raise ValueError(
-                f"Invalid workload type: {value}. Must be one of: {', '.join([m.value for m in cls])}"
-            ) from None
-
-    @classmethod
-    def choices(cls) -> list[str]:
-        """Get all available choices as strings for argparse."""
-        return [workload.value for workload in cls]
-
-
-# args for sgl_diffusion framework
 @dataclasses.dataclass
 class ServerArgs:
     # Model and path configuration (for convenience)
@@ -213,9 +180,6 @@ class ServerArgs:
 
     # Running mode
     mode: ExecutionMode = ExecutionMode.INFERENCE
-
-    # Workload type
-    workload_type: WorkloadType = WorkloadType.T2V
 
     # Cache strategy
     cache_strategy: str = "none"
@@ -265,6 +229,7 @@ class ServerArgs:
     # CPU offload parameters
     dit_cpu_offload: bool = True
     use_fsdp_inference: bool = False
+    dit_layerwise_offload: bool = False
     text_encoder_cpu_offload: bool = True
     image_encoder_cpu_offload: bool = True
     vae_cpu_offload: bool = True
@@ -278,7 +243,7 @@ class ServerArgs:
     # Compilation
     enable_torch_compile: bool = False
 
-    disable_autocast: bool = False
+    disable_autocast: bool | None = None
 
     # VSA parameters
     VSA_sparsity: float = 0.0  # inference/validation sparsity
@@ -294,6 +259,10 @@ class ServerArgs:
     # http server endpoint config, would be ignored in local mode
     host: str | None = None
     port: int | None = None
+
+    # TODO: webui and their endpoint, check if webui_port is available.
+    webui: bool = False
+    webui_port: int | None = 12312
 
     scheduler_port: int = 5555
 
@@ -401,15 +370,6 @@ class ServerArgs:
             choices=ExecutionMode.choices(),
             default=ServerArgs.mode.value,
             help="The mode to run SGLang-diffusion",
-        )
-
-        # Workload type
-        parser.add_argument(
-            "--workload-type",
-            type=str,
-            choices=WorkloadType.choices(),
-            default=ServerArgs.workload_type.value,
-            help="The workload type",
         )
 
         # distributed_executor_backend
@@ -549,6 +509,13 @@ class ServerArgs:
             help="Use CPU offload for DiT inference. Enable if run out of memory with FSDP.",
         )
         parser.add_argument(
+            "--dit-layerwise-offload",
+            action=StoreBoolean,
+            default=ServerArgs.dit_layerwise_offload,
+            help="Enable layerwise CPU offload with async H2D prefetch overlap for supported DiT models (e.g., Wan). "
+            "Cannot be used together with cache-dit (SGLANG_CACHE_DIT_ENABLED), dit_cpu_offload, or use_fsdp_inference.",
+        )
+        parser.add_argument(
             "--use-fsdp-inference",
             action=StoreBoolean,
             help="Use FSDP for inference by sharding the model weights. Latency is very low due to prefetch--enable if run out of memory.",
@@ -612,6 +579,19 @@ class ServerArgs:
             type=int,
             default=ServerArgs.port,
             help="Port for the HTTP API server.",
+        )
+        parser.add_argument(
+            "--webui",
+            action=StoreBoolean,
+            default=ServerArgs.webui,
+            help="Whether to use webui for better display",
+        )
+
+        parser.add_argument(
+            "--webui-port",
+            type=int,
+            default=ServerArgs.webui_port,
+            help="Whether to use webui for better display",
         )
 
         # Stage verification
@@ -778,10 +758,6 @@ class ServerArgs:
         if "mode" in kwargs and isinstance(kwargs["mode"], str):
             kwargs["mode"] = ExecutionMode.from_string(kwargs["mode"])
 
-        # Convert workload_type string to enum if necessary
-        if "workload_type" in kwargs and isinstance(kwargs["workload_type"], str):
-            kwargs["workload_type"] = WorkloadType.from_string(kwargs["workload_type"])
-
         kwargs["pipeline_config"] = PipelineConfig.from_kwargs(kwargs)
         return cls(**kwargs)
 
@@ -876,15 +852,32 @@ class ServerArgs:
         """Validate inference arguments for consistency"""
         if current_platform.is_mps():
             self.use_fsdp_inference = False
+            self.dit_layerwise_offload = False
+
+        if self.dit_layerwise_offload:
+            if self.use_fsdp_inference:
+                logger.warning(
+                    "dit_layerwise_offload is enabled, automatically disabling use_fsdp_inference."
+                )
+                self.use_fsdp_inference = False
+            if self.dit_cpu_offload:
+                logger.warning(
+                    "dit_layerwise_offload is enabled, automatically disabling dit_cpu_offload."
+                )
+                self.dit_cpu_offload = False
+            if os.getenv("SGLANG_CACHE_DIT_ENABLED", "").lower() == "true":
+                raise ValueError(
+                    "dit_layerwise_offload cannot be enabled together with cache-dit. "
+                    "cache-dit may reuse skipped blocks whose weights have been released by layerwise offload, "
+                    "causing shape mismatch errors. "
+                    "Please disable either --dit-layerwise-offload or SGLANG_CACHE_DIT_ENABLED."
+                )
 
         # autocast
-        is_flux = (
-            isinstance(self.pipeline_config, FluxPipelineConfig)
-            or isinstance(self.pipeline_config, QwenImagePipelineConfig)
-            or isinstance(self.pipeline_config, QwenImageEditPipelineConfig)
-        )
-        if is_flux:
-            self.disable_autocast = True
+        if self.disable_autocast is None:
+            self.disable_autocast = not self.pipeline_config.enable_autocast
+        else:
+            self.disable_autocast = False
 
         # Validate mode consistency
         assert isinstance(
@@ -893,14 +886,6 @@ class ServerArgs:
         assert (
             self.mode in ExecutionMode.choices()
         ), f"Invalid execution mode: {self.mode}"
-
-        # Validate workload type
-        assert isinstance(
-            self.workload_type, WorkloadType
-        ), f"Workload type must be a WorkloadType enum, got {type(self.workload_type)}"
-        assert (
-            self.workload_type in WorkloadType.choices()
-        ), f"Invalid workload type: {self.workload_type}"
 
         if self.tp_size == -1:
             self.tp_size = 1
@@ -927,6 +912,8 @@ class ServerArgs:
             raise ValueError("pipeline_config is not set in ServerArgs")
 
         self.pipeline_config.check_pipeline_config()
+        if self.attention_backend is None:
+            self._set_default_attention_backend()
 
         # parallelism
         self.check_server_dp_args()
@@ -938,6 +925,26 @@ class ServerArgs:
                 raise ValueError(
                     "CFG Parallelism is enabled via `--enable-cfg-parallel`, while -num-gpus==1"
                 )
+
+        if os.getenv("SGLANG_CACHE_DIT_ENABLED", "").lower() == "true":
+            has_sp = self.sp_degree > 1
+            has_tp = self.tp_size > 1
+            if has_sp and has_tp:
+                raise ValueError(
+                    "cache-dit does not support hybrid parallelism (SP + TP). "
+                    "Please use either sequence parallelism or tensor parallelism, not both."
+                )
+
+    def _set_default_attention_backend(self) -> None:
+        """Configure ROCm defaults when users do not specify an attention backend."""
+        if current_platform.is_rocm():
+            default_backend = AttentionBackendEnum.AITER.name.lower()
+            self.attention_backend = default_backend
+            logger.info(
+                "Attention backend not specified. Using '%s' by default on ROCm "
+                "to match SGLang SRT defaults.",
+                default_backend,
+            )
 
 
 @dataclasses.dataclass

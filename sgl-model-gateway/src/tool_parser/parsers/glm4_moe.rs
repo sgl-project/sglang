@@ -14,8 +14,9 @@ use crate::{
 
 /// GLM-4 MoE format parser for tool calls
 ///
-/// Handles the GLM-4 MoE specific format:
-/// `<tool_call>{name}\n<arg_key>{key}</arg_key>\n<arg_value>{value}</arg_value>\n</tool_call>`
+/// Handles both GLM-4 MoE and GLM-4.7 MoE formats:
+/// - GLM-4: `<tool_call>{name}\n<arg_key>{key}</arg_key>\n<arg_value>{value}</arg_value>\n</tool_call>`
+/// - GLM-4.7: `<tool_call>{name}<arg_key>{key}</arg_key><arg_value>{value}</arg_value></tool_call>`
 ///
 /// Features:
 /// - XML-style tags for tool calls
@@ -47,13 +48,17 @@ pub struct Glm4MoeParser {
 }
 
 impl Glm4MoeParser {
-    /// Create a new GLM-4 MoE parser
-    pub fn new() -> Self {
+    /// Create a new generic GLM MoE parser with a custom func_detail_extractor pattern
+    ///
+    /// # Arguments
+    /// - `func_detail_pattern`: Regex pattern for extracting function name and arguments
+    ///   - For GLM-4: `r"(?s)<tool_call>([^\n]*)\n(.*)</tool_call>"`
+    ///   - For GLM-4.7: `r"(?s)<tool_call>\s*([^<\s]+)\s*(.*?)</tool_call>"`
+    pub(crate) fn new(func_detail_pattern: &str) -> Self {
         // Use (?s) flag for DOTALL mode to handle newlines
         let tool_call_pattern = r"(?s)<tool_call>.*?</tool_call>";
         let tool_call_extractor = Regex::new(tool_call_pattern).expect("Valid regex pattern");
 
-        let func_detail_pattern = r"(?s)<tool_call>([^\n]*)\n(.*)</tool_call>";
         let func_detail_extractor = Regex::new(func_detail_pattern).expect("Valid regex pattern");
 
         let arg_pattern = r"(?s)<arg_key>(.*?)</arg_key>\s*<arg_value>(.*?)</arg_value>";
@@ -70,6 +75,16 @@ impl Glm4MoeParser {
             bot_token: "<tool_call>",
             eot_token: "</tool_call>",
         }
+    }
+
+    /// Create a new GLM-4.5/4.6 MoE parser (with newline-based format)
+    pub fn glm45() -> Self {
+        Self::new(r"(?s)<tool_call>([^\n]*)\n(.*)</tool_call>")
+    }
+
+    /// Create a new GLM-4.7 MoE parser (with whitespace-based format)
+    pub fn glm47() -> Self {
+        Self::new(r"(?s)<tool_call>\s*([^<\s]+)\s*(.*?)</tool_call>")
     }
 
     /// Parse arguments from key-value pairs
@@ -136,7 +151,6 @@ impl Glm4MoeParser {
         }
     }
 
-    /// Parse and return StreamingParseResult (mirrors Python's detect_and_parse)
     /// Parse all tool calls from text (shared logic for complete and incremental parsing)
     fn parse_tool_calls_from_text(&self, text: &str) -> ParserResult<Vec<ToolCall>> {
         let mut tools = Vec::new();
@@ -146,7 +160,7 @@ impl Glm4MoeParser {
                 Ok(Some(tool)) => tools.push(tool),
                 Ok(None) => continue,
                 Err(e) => {
-                    tracing::warn!("Failed to parse tool call: {}", e);
+                    tracing::debug!("Failed to parse tool call: {}", e);
                     continue;
                 }
             }
@@ -158,7 +172,7 @@ impl Glm4MoeParser {
 
 impl Default for Glm4MoeParser {
     fn default() -> Self {
-        Self::new()
+        Self::glm45()
     }
 }
 
@@ -254,10 +268,10 @@ impl ToolParser for Glm4MoeParser {
                 // Validate tool name
                 if !tool_indices.contains_key(&tool_call.function.name) {
                     // Invalid tool name - skip this tool, preserve indexing for next tool
-                    tracing::warn!("Invalid tool name '{}' - skipping", tool_call.function.name);
+                    tracing::debug!("Invalid tool name '{}' - skipping", tool_call.function.name);
                     helpers::reset_current_tool_state(
                         &mut self.buffer,
-                        &mut false, // glm4_moe doesn't track name_sent per tool
+                        &mut false, // glm45_moe/glm47_moe doesn't track name_sent per tool
                         &mut self.streamed_args_for_tool,
                         &self.prev_tool_call_arr,
                     );

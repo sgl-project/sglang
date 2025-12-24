@@ -91,7 +91,7 @@ pip install ./custom_ops-1.0.$DEVICE_TYPE-cp311-cp311-linux_aarch64.whl
 
 ```shell
 # Use the last release branch
-git clone -b v0.5.6.post1 https://github.com/sgl-project/sglang.git
+git clone -b v0.5.6.post2 https://github.com/sgl-project/sglang.git
 cd sglang
 mv python/pyproject_other.toml python/pyproject.toml
 pip install -e python[srt_npu]

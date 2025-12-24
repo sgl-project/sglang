@@ -129,6 +129,7 @@ class Step3TextMoEMLP(nn.Module):
             top_k=config.moe_top_k,
             renormalize=config.norm_expert_weight,
             use_grouped_topk=False,
+            layer_id=layer_id,
         )
 
         self.experts = get_moe_impl_class(quant_config)(
@@ -337,12 +338,14 @@ class Step3TextDecoderLayer(nn.Module):
         self.is_previous_layer_sparse = (
             True if layer_id - 1 in moe_layers_idx else False
         )
+        self.is_next_layer_sparse = True if layer_id + 1 in moe_layers_idx else False
 
         self.layer_scatter_modes = LayerScatterModes.init_new(
             layer_id=layer_id,
             num_layers=config.num_hidden_layers,
             is_layer_sparse=self.is_layer_sparse,
             is_previous_layer_sparse=self.is_previous_layer_sparse,
+            is_next_layer_sparse=self.is_next_layer_sparse,
         )
 
         if not self.is_layer_sparse:

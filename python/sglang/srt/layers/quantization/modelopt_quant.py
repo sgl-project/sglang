@@ -22,6 +22,7 @@ from sglang.srt.layers.moe import (
 )
 from sglang.srt.layers.moe.cutlass_moe_params import CutlassMoEParams, CutlassMoEType
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
+from sglang.srt.layers.moe.utils import should_use_flashinfer_cutlass_moe_fp4_allgather
 from sglang.srt.layers.parameter import ModelWeightParameter, PerTensorScaleParameter
 from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
@@ -41,7 +42,9 @@ from sglang.srt.layers.quantization.utils import (
     convert_to_channelwise,
     is_layer_skipped,
     per_tensor_dequantize,
+    prepare_static_weights_for_trtllm_fp4_moe,
     requantize_with_max_scale,
+    swizzle_blockscale,
 )
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.utils.common import (
@@ -784,6 +787,7 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
                     use_routing_scales_on_input=use_routing_scales_on_input,
                     tile_tokens_dim=None,
                     routing_method_type=routing_method_type,
+                    tune_max_num_tokens=next_power_of_2(x.shape[0]),
                 )
 
             from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
@@ -946,12 +950,22 @@ class ModelOptFp4Config(ModelOptQuantConfig):
             if not kv_cache_quant_algo:
                 # For config.json format, derive from kv_cache_scheme if available
                 kv_cache_scheme = config.get("kv_cache_scheme")
-                if (
-                    kv_cache_scheme
-                    and kv_cache_scheme.get("type") == "float"
-                    and kv_cache_scheme.get("num_bits") == 8
-                ):
-                    kv_cache_quant_algo = "FP8"
+                if isinstance(kv_cache_scheme, dict):
+                    if (
+                        kv_cache_scheme.get("type") == "float"
+                        and kv_cache_scheme.get("num_bits") == 8
+                    ):
+                        kv_cache_quant_algo = "FP8"
+                    else:
+                        kv_cache_quant_algo = "auto"
+                elif isinstance(kv_cache_scheme, str):
+                    scheme_name = kv_cache_scheme.strip().upper()
+                    if scheme_name in ("FP8", "FLOAT8"):
+                        kv_cache_quant_algo = "FP8"
+                    elif scheme_name in ("FP4", "FLOAT4", "NVFP4"):
+                        kv_cache_quant_algo = "NVFP4"
+                    else:
+                        kv_cache_quant_algo = "auto"
                 else:
                     kv_cache_quant_algo = "auto"
 
@@ -1215,7 +1229,7 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         backend = (
             FLASHINFER_FP4_GEMM_BACKEND if FLASHINFER_FP4_GEMM_BACKEND else "cutlass"
         )
-        out = _sglang_fp4_gemm(
+        out = torch.ops.sglang.fp4_gemm(
             x_fp4,
             w,
             x_scale_interleaved,
@@ -1333,7 +1347,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
         # Only use `swizzle_blockscale` for shapes, not for real content
         layer.w13_blockscale_swizzled = Parameter(
-            self.swizzle_blockscale(layer.w13_weight_scale), requires_grad=False
+            swizzle_blockscale(layer.w13_weight_scale), requires_grad=False
         )
 
         w2_weight_scale = ModelWeightParameter(
@@ -1350,7 +1364,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         layer.register_parameter("w2_weight_scale", w2_weight_scale)
 
         layer.w2_blockscale_swizzled = Parameter(
-            self.swizzle_blockscale(layer.w2_weight_scale), requires_grad=False
+            swizzle_blockscale(layer.w2_weight_scale), requires_grad=False
         )
 
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
@@ -1394,155 +1408,6 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         )
         w2_input_scale._sglang_require_global_experts = True
         layer.register_parameter("w2_input_scale", w2_input_scale)
-
-    def swizzle_blockscale(self, scale: torch.Tensor):
-        assert scale.dtype == torch.float8_e4m3fn
-        # Pad and blockwise interleave weight_scale
-        scale_ndim = scale.ndim
-        if scale.ndim == 2:
-            scale = scale.unsqueeze(0)
-        assert scale.ndim == 3
-        B, M, K = scale.shape
-        round_up_multiple = lambda x, m: (x + m - 1) // m * m
-        M_padded = round_up_multiple(M, 128)
-        K_padded = round_up_multiple(K, 4)
-        padded_scale = torch.zeros((B, M_padded, K_padded), dtype=scale.dtype)
-        padded_scale[:B, :M, :K] = scale
-        batches, rows, cols = padded_scale.shape
-        assert rows % 128 == 0
-        assert cols % 4 == 0
-        padded_scale = padded_scale.reshape(batches, rows // 128, 4, 32, cols // 4, 4)
-        swizzled_scale = padded_scale.permute((0, 1, 4, 3, 2, 5))
-        swizzled_scale = swizzled_scale.contiguous().cuda()
-        return (
-            swizzled_scale.reshape(M_padded, K_padded)
-            if scale_ndim == 2
-            else swizzled_scale.reshape(B, M_padded, K_padded)
-        )
-
-    def prepare_static_weights_for_kernel(
-        self,
-        # args_dequant,
-        # args,
-        gemm1_weights,
-        gemm2_weights,
-        gemm1_scales_linear_fp4_bytes,
-        gemm2_scales_linear_fp4_bytes,
-        hidden_size,
-        intermediate_size,
-        num_experts,
-    ):
-        from flashinfer import nvfp4_block_scale_interleave
-        from flashinfer.fused_moe.core import (
-            _maybe_get_cached_w3_w1_permute_indices,
-            get_w2_permute_indices_with_cache,
-        )
-
-        """Prepare quantized weights for kernel (done offline with weights)."""
-        epilogue_tile_m = 128  # FIXME: this depends on the kernel internals
-
-        # Convert quantized weights to proper formats
-        gemm1_weights_fp4 = gemm1_weights.view(torch.float8_e4m3fn).reshape(
-            num_experts, 2 * intermediate_size, hidden_size // 2
-        )  # packed fp4
-        gemm1_scales_linear_fp4 = gemm1_scales_linear_fp4_bytes.view(
-            torch.float8_e4m3fn
-        ).reshape(
-            num_experts, 2 * intermediate_size, hidden_size // 16
-        )  # fp8 scaling factors
-
-        gemm2_weights_fp4 = gemm2_weights.view(torch.float8_e4m3fn).reshape(
-            num_experts, hidden_size, intermediate_size // 2
-        )  # packed fp4
-        gemm2_scales_linear_fp4 = gemm2_scales_linear_fp4_bytes.view(
-            torch.float8_e4m3fn
-        ).reshape(
-            num_experts, hidden_size, intermediate_size // 16
-        )  # fp8 scaling factors
-
-        gemm1_weights_fp4_shuffled = []
-        gemm1_scales_fp4_shuffled = []
-        gemm2_weights_fp4_shuffled = []
-        gemm2_scales_fp4_shuffled = []
-        for i in range(num_experts):
-            # Calculate the permute indices for the following:
-            # 1. Reorder rows of W1 and scales for fused gated activation
-            # 2. Shuffle weights and scaling factors for transposed mma output
-            # for both w3_w1 and w2 weights and scale factors
-            permute_indices = _maybe_get_cached_w3_w1_permute_indices(
-                self._cache_permute_indices,
-                gemm1_weights_fp4[i].view(torch.uint8),
-                epilogue_tile_m,
-            )
-            gemm1_weights_fp4_shuffled.append(
-                gemm1_weights_fp4[i]
-                .view(torch.uint8)[permute_indices.to(gemm1_weights_fp4.device)]
-                .contiguous()
-            )
-
-            permute_sf_indices = _maybe_get_cached_w3_w1_permute_indices(
-                self._cache_permute_indices,
-                gemm1_scales_linear_fp4[i].view(torch.uint8),
-                epilogue_tile_m,
-                num_elts_per_sf=16,
-            )
-            gemm1_scales_fp4_shuffled.append(
-                nvfp4_block_scale_interleave(
-                    gemm1_scales_linear_fp4[i]
-                    .view(torch.uint8)[
-                        permute_sf_indices.to(gemm1_scales_linear_fp4.device)
-                    ]
-                    .contiguous()
-                )
-            )
-
-            permute_indices = get_w2_permute_indices_with_cache(
-                self._cache_permute_indices,
-                gemm2_weights_fp4[i].view(torch.uint8),
-                epilogue_tile_m,
-            )
-            gemm2_weights_fp4_shuffled.append(
-                gemm2_weights_fp4[i]
-                .view(torch.uint8)[permute_indices.to(gemm2_weights_fp4.device)]
-                .contiguous()
-            )
-
-            permute_sf_indices = get_w2_permute_indices_with_cache(
-                self._cache_permute_indices,
-                gemm2_scales_linear_fp4[i].view(torch.uint8),
-                epilogue_tile_m,
-                num_elts_per_sf=16,
-            )
-            gemm2_scales_fp4_shuffled.append(
-                nvfp4_block_scale_interleave(
-                    gemm2_scales_linear_fp4[i]
-                    .view(torch.uint8)[
-                        permute_sf_indices.to(gemm2_scales_linear_fp4.device)
-                    ]
-                    .contiguous()
-                )
-            )
-
-        # Stack weights for all experts
-        gemm1_weights_fp4_shuffled = torch.stack(gemm1_weights_fp4_shuffled)
-        gemm1_scales_fp4_shuffled = (
-            torch.stack(gemm1_scales_fp4_shuffled)
-            .view(torch.float8_e4m3fn)
-            .reshape(num_experts, 2 * intermediate_size, hidden_size // 16)
-        )
-
-        gemm2_weights_fp4_shuffled = torch.stack(gemm2_weights_fp4_shuffled)
-        gemm2_scales_fp4_shuffled = (
-            torch.stack(gemm2_scales_fp4_shuffled)
-            .view(torch.float8_e4m3fn)
-            .reshape(num_experts, hidden_size, intermediate_size // 16)
-        )
-        return (
-            gemm1_weights_fp4_shuffled,
-            gemm1_scales_fp4_shuffled,
-            gemm2_weights_fp4_shuffled,
-            gemm2_scales_fp4_shuffled,
-        )
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         """Process FP4 MoE weights after loading from serialized checkpoint.
@@ -1623,19 +1488,34 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         layer.dispatcher.set_quant_config(
             {
                 "input_global_scale": (
-                    layer.w13_input_scale_quant if MOE_NVFP4_DISPATCH else None
+                    layer.w13_input_scale_quant
+                    if MOE_NVFP4_DISPATCH
+                    or should_use_flashinfer_cutlass_moe_fp4_allgather()
+                    else None
                 )
             }
         )
+        block_size = 16
         # Validate weight scales
         assert_dim = 2 if layer.moe_runner_config.is_gated else 1
         for name, weight_scale in [
             ("w13", layer.w13_weight_scale),
             ("w2", layer.w2_weight_scale),
         ]:
-            assert (
-                weight_scale.shape[assert_dim] % 16 == 0
-            ), f"Expected {name}_weight_scale.dim({assert_dim}) to be divisible by 16"
+            # For NVFP4 TRTLLM we require one scale per 16 inputs (last dim == expected_blocks[name]).
+            if get_moe_runner_backend().is_flashinfer_trtllm():
+                expected_blocks = {
+                    "w13": layer.w13_weight.shape[2] * 2 // block_size,
+                    "w2": layer.w2_weight.shape[2] * 2 // block_size,
+                }
+                assert (
+                    weight_scale.shape[-1] == expected_blocks[name]
+                ), f"Expected {name}_weight_scale.dim(2) == {expected_blocks[name]}, got {weight_scale.shape[-1]}"
+            else:
+                # For other backends, ensure the per-input block dimension is aligned to 16.
+                assert (
+                    weight_scale.shape[assert_dim] % block_size == 0
+                ), f"Expected {name}_weight_scale.dim({assert_dim}) to be divisible by {block_size}"
             assert (
                 weight_scale.dtype == torch.float8_e4m3fn
             ), f"{name} Weight Blockscale must be represented as FP8-E4M3"
@@ -1652,7 +1532,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 gemm1_scales_fp4_shuffled,
                 gemm2_weights_fp4_shuffled,
                 gemm2_scales_fp4_shuffled,
-            ) = self.prepare_static_weights_for_kernel(
+            ) = prepare_static_weights_for_trtllm_fp4_moe(
                 layer.w13_weight,
                 layer.w2_weight,
                 layer.w13_weight_scale,
@@ -1694,7 +1574,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             # CUTLASS processing - handle w13 and w2 separately
 
             # Process w13 weights
-            w13_blockscale_swizzled = self.swizzle_blockscale(layer.w13_weight_scale)
+            w13_blockscale_swizzled = swizzle_blockscale(layer.w13_weight_scale)
             del layer.w13_weight_scale
             layer.w13_blockscale_swizzled.data.copy_(w13_blockscale_swizzled)
 
@@ -1727,13 +1607,13 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                     requires_grad=False,
                 )
                 layer.w2_blockscale_swizzled = Parameter(
-                    self.swizzle_blockscale(layer.w2_weight_scale), requires_grad=False
+                    swizzle_blockscale(layer.w2_weight_scale), requires_grad=False
                 )
 
             layer.w13_weight = Parameter(layer.w13_weight.data, requires_grad=False)
 
             # Process w2 weights
-            w2_blockscale_swizzled = self.swizzle_blockscale(layer.w2_weight_scale)
+            w2_blockscale_swizzled = swizzle_blockscale(layer.w2_weight_scale)
             del layer.w2_weight_scale
             layer.w2_blockscale_swizzled.data.copy_(w2_blockscale_swizzled)
 

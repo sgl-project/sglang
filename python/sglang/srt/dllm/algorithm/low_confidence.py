@@ -35,9 +35,8 @@ class LowConfidence(DllmAlgorithm):
             if torch.sum(mask_index).item() == 0:
                 break
 
-            logits_output, can_run_cuda_graph = model_runner.forward(
-                forward_batch, pp_proxy_tensors=None
-            )
+            out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
+            logits_output, can_run_cuda_graph = out.logits_output, out.can_run_graph
 
             x = torch.argmax(logits_output.full_logits, dim=-1)
             p = torch.squeeze(
@@ -58,9 +57,8 @@ class LowConfidence(DllmAlgorithm):
 
             forward_batch.input_ids[transfer_index] = x[transfer_index]
 
-        logits_output, can_run_cuda_graph = model_runner.forward(
-            forward_batch, pp_proxy_tensors=None
-        )
+        out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
+        logits_output, can_run_cuda_graph = out.logits_output, out.can_run_graph
 
         next_token_ids = forward_batch.input_ids[start:]
         return logits_output, next_token_ids, can_run_cuda_graph

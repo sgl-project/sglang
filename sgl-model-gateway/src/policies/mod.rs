@@ -14,7 +14,7 @@ mod power_of_two;
 mod random;
 mod registry;
 mod round_robin;
-mod tree;
+pub mod tree;
 
 pub use bucket::BucketPolicy;
 pub use cache_aware::CacheAwarePolicy;
@@ -120,6 +120,19 @@ pub(crate) fn get_healthy_worker_indices(workers: &[Arc<dyn Worker>]) -> Vec<usi
         .filter(|(_, w)| w.is_healthy() && w.circuit_breaker().can_execute())
         .map(|(idx, _)| idx)
         .collect()
+}
+
+/// Helper function to normalize model_id to a key for policy lookups.
+///
+/// Returns UNKNOWN_MODEL_ID for empty model_ids to ensure consistent behavior
+/// across single-model and multi-model deployments.
+#[inline]
+pub(crate) fn normalize_model_key(model_id: &str) -> &str {
+    if model_id.is_empty() {
+        crate::core::UNKNOWN_MODEL_ID
+    } else {
+        model_id
+    }
 }
 
 #[cfg(test)]

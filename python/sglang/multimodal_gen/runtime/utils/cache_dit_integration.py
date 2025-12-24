@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from typing import List, Optional
 
 import torch
+import torch.distributed as dist
 
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
@@ -25,6 +26,105 @@ from cache_dit import (
     steps_mask,
 )
 from cache_dit.caching.block_adapters import BlockAdapterRegister
+from cache_dit.parallelism import ParallelismBackend, ParallelismConfig
+
+_original_similarity = None
+
+
+def _patch_cache_dit_similarity():
+    from cache_dit.caching.cache_contexts import cache_manager
+
+    global _original_similarity
+    if _original_similarity is not None:
+        return
+
+    _original_similarity = cache_manager.CachedContextManager.similarity
+
+    def patched_similarity(self, t1, t2, *, threshold, parallelized=False, prefix="Fn"):
+        if not parallelized:
+            return _original_similarity(
+                self,
+                t1,
+                t2,
+                threshold=threshold,
+                parallelized=parallelized,
+                prefix=prefix,
+            )
+
+        sp_group = getattr(self, "_sglang_sp_group", None)
+        tp_group = getattr(self, "_sglang_tp_group", None)
+        target_group = sp_group or tp_group
+
+        if target_group is None:
+            return _original_similarity(
+                self,
+                t1,
+                t2,
+                threshold=threshold,
+                parallelized=parallelized,
+                prefix=prefix,
+            )
+
+        # Adapted from https://github.com/vipshop/cache-dit/blob/main/src/cache_dit/caching/cache_contexts/cache_manager.py#L495-L523
+        condition_thresh = self.get_important_condition_threshold()
+        if condition_thresh > 0.0:
+            raw_diff = (t1 - t2).abs()
+            token_m_df = raw_diff.mean(dim=-1)
+            token_m_t1 = t1.abs().mean(dim=-1)
+            token_diff = token_m_df / token_m_t1
+            condition = token_diff > condition_thresh
+            if condition.sum() > 0:
+                condition = condition.unsqueeze(-1).expand_as(raw_diff)
+                mean_diff = raw_diff[condition].mean()
+                mean_t1 = t1[condition].abs().mean()
+            else:
+                mean_diff = (t1 - t2).abs().mean()
+                mean_t1 = t1.abs().mean()
+        else:
+            mean_diff = (t1 - t2).abs().mean()
+            mean_t1 = t1.abs().mean()
+
+        dist.all_reduce(mean_diff, op=dist.ReduceOp.AVG, group=target_group)
+        dist.all_reduce(mean_t1, op=dist.ReduceOp.AVG, group=target_group)
+
+        diff = (mean_diff / mean_t1).item()
+        self.add_residual_diff(diff)
+        return diff < threshold
+
+    cache_manager.CachedContextManager.similarity = patched_similarity
+
+
+def _build_parallelism_config(
+    sp_group: Optional[torch.distributed.ProcessGroup],
+    tp_group: Optional[torch.distributed.ProcessGroup],
+):
+    if sp_group is None and tp_group is None:
+        return None
+
+    ulysses_size = None
+    ring_size = None
+    if sp_group is not None:
+        ulysses_size = getattr(sp_group, "ulysses_world_size", None)
+        ring_size = getattr(sp_group, "ring_world_size", None)
+
+    tp_size = None
+    if tp_group is not None:
+        tp_size = dist.get_world_size(tp_group)
+
+    return ParallelismConfig(
+        backend=ParallelismBackend.NATIVE_PYTORCH,
+        ulysses_size=ulysses_size,
+        ring_size=ring_size,
+        tp_size=tp_size,
+    )
+
+
+def _mark_transformer_parallelized(transformer, config, sp_group, tp_group):
+    if config is None:
+        return
+
+    transformer._is_parallelized = True
+    transformer._parallelism_config = config
 
 
 def get_scm_mask(
@@ -118,6 +218,8 @@ def enable_cache_on_transformer(
     transformer: torch.nn.Module,
     config: CacheDitConfig,
     model_name: str = "transformer",
+    sp_group: Optional[torch.distributed.ProcessGroup] = None,
+    tp_group: Optional[torch.distributed.ProcessGroup] = None,
 ) -> torch.nn.Module:
     """Enable cache-dit on a transformer module, by wrapping the module with cache-dit
 
@@ -126,6 +228,8 @@ def enable_cache_on_transformer(
 
     Args:
         model_name: Name of the model for logging purposes.
+        sp_group: Sequence parallel process group (for Ulysses/Ring).
+        tp_group: Tensor parallel process group.
 
     """
     if not config.enabled:
@@ -194,11 +298,24 @@ def enable_cache_on_transformer(
             config.steps_computation_policy,
         )
 
+    parallelism_config = _build_parallelism_config(sp_group, tp_group)
+    if parallelism_config is not None:
+        _patch_cache_dit_similarity()
+
+    _mark_transformer_parallelized(transformer, parallelism_config, sp_group, tp_group)
+
     cache_dit.enable_cache(
         transformer,
         cache_config=cache_config,
         calibrator_config=calibrator_config,
+        parallelism_config=None,
     )
+
+    if parallelism_config is not None:
+        context_manager = getattr(transformer, "_context_manager", None)
+        if context_manager is not None:
+            context_manager._sglang_sp_group = sp_group
+            context_manager._sglang_tp_group = tp_group
 
     return transformer
 
@@ -209,6 +326,8 @@ def enable_cache_on_dual_transformer(
     primary_config: CacheDitConfig,
     secondary_config: CacheDitConfig,
     model_name: str = "wan2.2",
+    sp_group: Optional[torch.distributed.ProcessGroup] = None,
+    tp_group: Optional[torch.distributed.ProcessGroup] = None,
 ) -> tuple[torch.nn.Module, torch.nn.Module]:
     """Enable cache-dit on dual transformers using BlockAdapter.
 
@@ -219,6 +338,8 @@ def enable_cache_on_dual_transformer(
     Args:
         primary_config: CacheDitConfig for primary transformer.
         secondary_config: CacheDitConfig for secondary transformer.
+        sp_group: Sequence parallel process group (for Ulysses/Ring).
+        tp_group: Tensor parallel process group.
     """
     _supported_dual_transformer_models = [
         "wan2.2",  # Currently, only Wan2.2 will run into dual-transformer case
@@ -320,6 +441,15 @@ def enable_cache_on_dual_transformer(
             primary_config.steps_computation_policy,
         )
 
+    parallelism_config = _build_parallelism_config(sp_group, tp_group)
+    if parallelism_config is not None:
+        _patch_cache_dit_similarity()
+
+    _mark_transformer_parallelized(transformer, parallelism_config, sp_group, tp_group)
+    _mark_transformer_parallelized(
+        transformer_2, parallelism_config, sp_group, tp_group
+    )
+
     # Get blocks attribute - Wan transformers use 'blocks' attribute
     transformer_blocks = getattr(transformer, "blocks", None)
     transformer_2_blocks = getattr(transformer_2, "blocks", None)
@@ -345,10 +475,18 @@ def enable_cache_on_dual_transformer(
                 params_modifiers=[primary_modifier, secondary_modifier],
                 has_separate_cfg=True,
             ),
+            parallelism_config=None,
         )
     else:
         raise ValueError(
             f"Dual-transformer is not implemented for model {model_name} yet."
         )
+
+    if parallelism_config is not None:
+        for t in [transformer, transformer_2]:
+            context_manager = getattr(t, "_context_manager", None)
+            if context_manager is not None:
+                context_manager._sglang_sp_group = sp_group
+                context_manager._sglang_tp_group = tp_group
 
     return transformer, transformer_2

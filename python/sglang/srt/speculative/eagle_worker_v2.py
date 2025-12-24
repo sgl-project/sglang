@@ -35,7 +35,6 @@ from sglang.srt.speculative.eagle_info_v2 import (
     assign_extend_cache_locs,
     fill_accepted_out_cache_loc,
     fill_new_verified_id,
-    select_top_k_tokens_tmp,
 )
 from sglang.srt.speculative.eagle_utils import TreeMaskMode, build_tree_kernel_efficient
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -44,6 +43,7 @@ from sglang.srt.speculative.spec_utils import (
     draft_tp_context,
     generate_token_bitmask,
     load_token_map,
+    select_top_k_tokens,
 )
 from sglang.srt.utils.common import (
     MultiprocessingSerializer,
@@ -372,7 +372,7 @@ class EagleDraftWorker(BaseDraftWorker):
         # Forward multiple steps
         scores = None
         for i in range(self.speculative_num_steps):
-            input_ids, hidden_states, scores, tree_info = select_top_k_tokens_tmp(
+            input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
                 i, topk_p, topk_index, hidden_states, scores, self.topk
             )
             score_list.append(tree_info[0])
@@ -391,9 +391,9 @@ class EagleDraftWorker(BaseDraftWorker):
             spec_info.hidden_states = hidden_states
 
             # Run forward
-            logits_output, _ = self.draft_runner.forward(
+            logits_output = self.draft_runner.forward(
                 forward_batch, skip_attn_backend_init=True
-            )
+            ).logits_output
             if self.server_args.enable_nan_detection:
                 detect_nan(logits_output)
             probs = torch.softmax(logits_output.next_token_logits, dim=-1)
@@ -465,7 +465,7 @@ class EagleDraftWorker(BaseDraftWorker):
 
         # Run forward
         forward_batch = ForwardBatch.init_new(batch, self.draft_runner)
-        logits_output, _ = self.draft_runner.forward(forward_batch)
+        logits_output = self.draft_runner.forward(forward_batch).logits_output
 
         # Update spec_info for the next draft step
         probs = torch.softmax(logits_output.next_token_logits, dim=-1)
@@ -516,9 +516,9 @@ class EagleDraftWorker(BaseDraftWorker):
                 forward_batch
             )
         else:
-            draft_logits_output, _ = self.draft_runner.forward(
+            draft_logits_output = self.draft_runner.forward(
                 forward_batch, skip_attn_backend_init=True
-            )
+            ).logits_output
 
         # Reorganize the spec info for the next batch
         draft_logits_output.next_token_logits = draft_logits_output.next_token_logits[

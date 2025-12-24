@@ -11,6 +11,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size
 from sglang.srt.utils import (
     get_bool_env_var,
@@ -51,7 +52,7 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.quantization import QuantizationConfig
 from sglang.srt.layers.rotary_embedding import apply_rotary_pos_emb
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import add_prefix
+from sglang.srt.utils import add_prefix, get_bool_env_var
 
 ROTARY_EMBED_CLASSES = {
     "normal": apply_rotary_pos_emb,
@@ -273,6 +274,10 @@ class VisionTritonAttention(nn.Module):
         **kwargs,
     ):
         super().__init__()
+        use_data_parallel = (
+            kwargs["use_data_parallel"] if "use_data_parallel" in kwargs else False
+        )
+        self.tp_size = 1 if use_data_parallel else get_attention_tp_size()
 
     def forward(
         self,
@@ -290,22 +295,42 @@ class VisionTritonAttention(nn.Module):
         Returns:
              [b * s, h, head_size]
         """
-        cu_seqlens = resolve_seqlens(cu_seqlens, bsz, seq_len, device=q.device)
+        if envs.SGLANG_VIT_ENABLE_CUDA_GRAPH.get():
+            if "output_ws" not in kwargs:
+                raise RuntimeError("output_ws should be prepared for cuda-graph mode")
 
-        # [b * s, head, head_size]
-        output = torch.empty_like(q)
-        seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
-        max_seqlen = seq_lens.max().item()
-        context_attention_fwd(
-            q,
-            k,
-            v,
-            output,
-            cu_seqlens.cuda(),
-            seq_lens.cuda(),
-            max_seqlen,
-            is_causal=False,
-        )
+            if not isinstance(cu_seqlens, list):
+                raise RuntimeError("cuda-graph mode cu_seqlens should be a list")
+
+            output = kwargs["output_ws"]
+            context_attention_fwd(
+                q,
+                k,
+                v,
+                output,
+                cu_seqlens[0],
+                cu_seqlens[1],
+                cu_seqlens[2],
+                is_causal=False,
+            )
+        else:
+            cu_seqlens = resolve_seqlens(cu_seqlens, bsz, seq_len, device=q.device)
+
+            # [b * s, head, head_size]
+            output = torch.empty_like(q)
+
+            seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
+            max_seqlen = seq_lens.max().item()
+            context_attention_fwd(
+                q,
+                k,
+                v,
+                output,
+                cu_seqlens.cuda(),
+                seq_lens.cuda(),
+                max_seqlen,
+                is_causal=False,
+            )
 
         return output
 
@@ -318,6 +343,10 @@ class VisionFlash3Attention(nn.Module):
         if not _is_cuda:
             raise Exception("VisionFlash3Attention is only available for cuda")
         super().__init__()
+        use_data_parallel = (
+            kwargs["use_data_parallel"] if "use_data_parallel" in kwargs else False
+        )
+        self.tp_size = 1 if use_data_parallel else get_attention_tp_size()
 
     def forward(
         self,
@@ -335,21 +364,32 @@ class VisionFlash3Attention(nn.Module):
         Returns:
              [b * s, h, head_size]
         """
-        cu_seqlens = resolve_seqlens(cu_seqlens, bsz, seq_len, device=q.device)
+        if envs.SGLANG_VIT_ENABLE_CUDA_GRAPH.get():
+            max_seqlen = cu_seqlens[1]
+            output = flash_attn_varlen_func(
+                q,
+                k,
+                v,
+                cu_seqlens_q=cu_seqlens[0],
+                cu_seqlens_k=cu_seqlens[0],
+                max_seqlen_q=max_seqlen,
+                max_seqlen_k=max_seqlen,
+            )
+        else:
+            cu_seqlens = resolve_seqlens(cu_seqlens, bsz, seq_len, device=q.device)
+            cu_seqlens = cu_seqlens.to(dtype=torch.int32).to(q.device)
+            seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
+            max_seqlen = seq_lens.max().item()
 
-        cu_seqlens = cu_seqlens.to(dtype=torch.int32).to(q.device)
-        seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
-        max_seqlen = seq_lens.max().item()
-
-        output = flash_attn_varlen_func(
-            q,
-            k,
-            v,
-            cu_seqlens_q=cu_seqlens,
-            cu_seqlens_k=cu_seqlens,
-            max_seqlen_q=max_seqlen,
-            max_seqlen_k=max_seqlen,
-        )
+            output = flash_attn_varlen_func(
+                q,
+                k,
+                v,
+                cu_seqlens_q=cu_seqlens,
+                cu_seqlens_k=cu_seqlens,
+                max_seqlen_q=max_seqlen,
+                max_seqlen_k=max_seqlen,
+            )
 
         return output
 
@@ -545,6 +585,7 @@ class VisionAttention(nn.Module):
             dropout=dropout,
             flatten_batch=flatten_batch,
             softmax_in_single_precision=softmax_in_single_precision,
+            use_data_parallel=use_data_parallel,
         )
 
         self.use_qkv_parallel = use_qkv_parallel
@@ -635,6 +676,8 @@ class VisionAttention(nn.Module):
         x: torch.Tensor,
         cu_seqlens: Optional[torch.Tensor] = None,
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        rotary_pos_emb_cos: Optional[torch.Tensor] = None,
+        rotary_pos_emb_sin: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor:
@@ -652,6 +695,8 @@ class VisionAttention(nn.Module):
         bsz, s, _ = x_shape
         head = self.num_attention_heads_per_partition
         kv_head = self.num_attention_kv_heads_per_partition
+
+        attn_output_ws = kwargs["output_ws"] if "output_ws" in kwargs else None
         if self.use_qkv_parallel:
             # [b, s, embed_dim] --> [b, s, embed_dim]
             qkv, _ = self.qkv_proj(x)
@@ -682,26 +727,34 @@ class VisionAttention(nn.Module):
                 rearrange(x, "s b ... -> b s ...").contiguous() for x in (q, k, v)
             ]
 
-        if position_embeddings is not None:
-            original_shape = q.shape
+        cos = None
+        sin = None
 
+        if position_embeddings is not None:
             if self.customized_position_embedding_applier is not None:
                 q, k = self.customized_position_embedding_applier(
                     q, k, position_embeddings, x_shape
                 )
-                q = q.view(original_shape)
-                k = k.view(original_shape)
             else:
                 cos, sin = position_embeddings
+        elif rotary_pos_emb_cos is not None and rotary_pos_emb_sin is not None:
+            cos = rotary_pos_emb_cos
+            sin = rotary_pos_emb_sin
 
-                # [total_tokens, head, head_size]
-                q = q.view(-1, head, self.head_size)
-                k = k.view(-1, head, self.head_size)
+        if cos is not None and sin is not None:
+            original_shape = q.shape
 
-                q, k = apply_rotary_pos_emb(q, k, cos, sin)
+            # [total_tokens, head, head_size]
+            q = q.view(-1, head, self.head_size)
+            k = k.view(-1, head, self.head_size)
 
-                q = q.view(original_shape)
-                k = k.view(original_shape)
+            if cos.size(-1) * 2 == self.head_size:
+                cos = torch.cat([cos, cos], dim=-1)
+                sin = torch.cat([sin, sin], dim=-1)
+
+            q, k = apply_rotary_pos_emb(q, k, cos, sin)
+            q = q.view(original_shape)
+            k = k.view(original_shape)
 
         if q.dim() == 4:
             # [b, s, head, head_size] --> [b * s, head, head_size]
@@ -729,6 +782,7 @@ class VisionAttention(nn.Module):
             seq_len=s,
             cu_seqlens=cu_seqlens,
             attention_mask=attention_mask,
+            output_ws=attn_output_ws,
         )
 
         assert output.dim() == 3, output.shape
