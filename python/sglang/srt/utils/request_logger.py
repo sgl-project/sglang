@@ -165,6 +165,7 @@ def disable_request_logging() -> bool:
     return get_bool_env_var("SGLANG_DISABLE_REQUEST_LOGGING")
 
 
+# TODO unify logging, e.g. allow normal logs to be JSON as well
 def _log_json(event: str, data: dict) -> None:
     log_data = {
         "timestamp": datetime.now().isoformat(),
