@@ -674,18 +674,6 @@ where
     }
 }
 
-#[inline]
-fn status_to_class(status: u16) -> &'static str {
-    match status {
-        100..=199 => "1xx",
-        200..=299 => "2xx",
-        300..=399 => "3xx",
-        400..=499 => "4xx",
-        500..=599 => "5xx",
-        _ => "unknown",
-    }
-}
-
 /// Normalize path for metrics to avoid high cardinality.
 /// Replaces dynamic segments (IDs, UUIDs) with `{id}` placeholder.
 /// Only allocates when normalization is needed; uses single-pass with byte offsets.
