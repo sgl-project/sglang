@@ -190,6 +190,12 @@ class Modality(Enum):
         return [Modality.IMAGE, Modality.VIDEO, Modality.AUDIO]
 
 
+class MultimodalInputFormat(Enum):
+    NORMAL = auto()
+    PROCESSOR_OUTPUT = auto()
+    PRECOMPUTED_EMBEDDING = auto()
+
+
 @dataclasses.dataclass
 class MultimodalDataItem:
     """
@@ -204,6 +210,8 @@ class MultimodalDataItem:
     hash: int = None
     pad_value: int = None
     offsets: Optional[list] = None
+
+    format: MultimodalInputFormat = MultimodalInputFormat.NORMAL
 
     # the raw features returned by processor, e.g. pixel_values or audio_features
     feature: Union[torch.Tensor, np.ndarray] = None
@@ -244,6 +252,9 @@ class MultimodalDataItem:
         """
         Set the pad value after first hashing the data
         """
+        if self.pad_value is not None:
+            return
+
         from sglang.srt.managers.mm_utils import hash_feature
 
         if self.hash is None:
@@ -273,6 +284,9 @@ class MultimodalDataItem:
     def validate(self):
         ...
         # TODO
+
+    def is_precomputed_embedding(self):
+        return self.format == MultimodalInputFormat.PRECOMPUTED_EMBEDDING
 
     @staticmethod
     def from_dict(obj: dict):
@@ -321,8 +335,18 @@ class MultimodalInputs:
 
     @staticmethod
     def from_dict(obj: dict):
+        # Check if MM splitting is enabled
+        if not envs.SGLANG_ENABLE_MM_SPLITTING.get():
+            mm_items = obj["mm_items"]
+        else:
+            from sglang.srt.managers.mm_utils import get_new_expanded_mm_items
+
+            original_mm_items = obj["mm_items"]
+            # Now, `mm_items` contains one item per image.
+            mm_items = get_new_expanded_mm_items(original_mm_items)
+
         ret = MultimodalInputs(
-            mm_items=obj["mm_items"],
+            mm_items=mm_items,
         )
 
         assert isinstance(ret.mm_items, list)
@@ -476,6 +500,7 @@ class Req:
         custom_logit_processor: Optional[str] = None,
         require_reasoning: bool = False,
         return_hidden_states: bool = False,
+        return_routed_experts: bool = False,
         eos_token_ids: Optional[Set[int]] = None,
         bootstrap_host: Optional[str] = None,
         bootstrap_port: Optional[int] = None,
@@ -666,6 +691,12 @@ class Req:
         self.output_topk_p = None
         self.output_topk_index = None
 
+        # capture routed experts
+        self.return_routed_experts = return_routed_experts
+        self.routed_experts: Optional[torch.Tensor] = (
+            None  # cpu tensor: shape (seqlen, topk)
+        )
+
         # Embedding (return values)
         self.embedding = None
 
@@ -721,6 +752,7 @@ class Req:
         self.dimensions = dimensions
 
         # For diffusion LLM
+        self.dllm_ids = []
         self.dllm_block_offset = 0
         self.dllm_config = dllm_config
 
@@ -797,14 +829,15 @@ class Req:
         return self.dllm_config is not None
 
     def _init_fill_ids_for_dllm(self):
-        if not self.fill_ids:
-            self.fill_ids = (
+        if not self.dllm_ids:
+            self.dllm_ids = (
                 self.origin_input_ids
                 + [self.dllm_config.mask_id] * self.dllm_config.block_size
             )
         else:
             self.dllm_block_offset += self.dllm_config.block_size
-            self.fill_ids += [self.dllm_config.mask_id] * self.dllm_config.block_size
+            self.dllm_ids += [self.dllm_config.mask_id] * self.dllm_config.block_size
+        self.fill_ids = self.dllm_ids
 
     def init_next_round_input(self, tree_cache: Optional[BasePrefixCache] = None):
         if self.is_dllm():
@@ -1028,6 +1061,7 @@ class Req:
         self.retraction_count += 1
 
         self.prefix_indices = torch.empty((0,), dtype=torch.int64)
+        self.routed_experts = None
         self.last_node = None
         self.swa_uuid_for_lock = None
         self.extend_input_len = 0
@@ -1204,6 +1238,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # Whether to return hidden states
     return_hidden_states: bool = False
 
+    # Whether to return captured experts
+    return_routed_experts: bool = False
+
     # Whether this batch is prefill-only (no token generation needed)
     is_prefill_only: bool = False
 
@@ -1251,6 +1288,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             device=req_to_token_pool.device,
             spec_algorithm=spec_algorithm,
             return_hidden_states=any(req.return_hidden_states for req in reqs),
+            return_routed_experts=any(req.return_routed_experts for req in reqs),
             is_prefill_only=all(req.is_prefill_only for req in reqs),
             chunked_req=chunked_req,
             dllm_config=dllm_config,
@@ -1732,21 +1770,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             not self.check_decode_mem(selected_indices=sorted_indices)
         ):
             if len(sorted_indices) == 1:
-                # Corner case: only one request left
-                if self.is_hybrid_swa:
-                    full_available_size = (
-                        self.token_to_kv_pool_allocator.full_available_size()
-                    )
-                    swa_available_size = (
-                        self.token_to_kv_pool_allocator.swa_available_size()
-                    )
-                    assert (
-                        full_available_size > 0 and swa_available_size > 0
-                    ), f"No space left for only one request in SWA mode {full_available_size=}, {swa_available_size=}"
-                else:
-                    assert (
-                        self.token_to_kv_pool_allocator.available_size() > 0
-                    ), f"No space left for only one request, {self.token_to_kv_pool_allocator.available_size()=}"
+                # Always keep at least one request
                 break
 
             first_iter = False
@@ -1756,11 +1780,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             # release memory and don't insert into the tree because we need the space instantly
             self.release_req(idx, len(sorted_indices), server_args)
 
-            if len(retracted_reqs) == 0:
-                # Corner case: only one request left
-                raise ValueError(
-                    "Failed to retract any request. No space left for only one request."
-                )
+        if len(sorted_indices) <= 1 and not self.check_decode_mem(
+            selected_indices=sorted_indices
+        ):
+            # Retracting loops ends and still not enough memory
+            raise ValueError(
+                "Out of memory even after retracting all other requests in the decode batch."
+            )
 
         self.filter_batch(keep_indices=sorted_indices)
 
@@ -1813,15 +1839,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         )
 
     @property
-    def is_v2_eagle(self):
-        # FIXME: finally deprecate is_v2_eagle
+    def is_eagle_v2(self):
+        # FIXME: finally deprecate is_eagle_v2
         return self.enable_overlap and self.spec_algorithm.is_eagle()
 
     def prepare_for_decode(self):
         self.forward_mode = ForwardMode.DECODE
         bs = len(self.reqs)
 
-        if self.is_v2_eagle:
+        if self.is_eagle_v2:
             # TODO(spec-v2): all v2 spec should go through this path
             draft_input: EagleDraftInput = self.spec_info
             draft_input.prepare_for_decode(self)
@@ -1901,7 +1927,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             )
 
     def maybe_wait_verify_done(self):
-        if self.is_v2_eagle:
+        if self.is_eagle_v2:
             draft_input: EagleDraftInput = self.spec_info
             if draft_input.verify_done is not None:
                 draft_input.verify_done.synchronize()
@@ -1974,7 +2000,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # NOTE: spec_info filtered before batch filtering only happens in:
         # - Spec v1's verify phase
         # - Only for decode batch (running_batch)
-        has_been_filtered = v1_spec_info_filtered and not self.is_v2_eagle
+        has_been_filtered = v1_spec_info_filtered and not self.is_eagle_v2
 
         if self.spec_info:
             self.spec_info.filter_batch(
@@ -2230,6 +2256,9 @@ class ModelWorkerBatch:
     # FIXME(lsyin): remove this after fully overlap grammar
     reqs: Optional[List[Req]] = None
     has_grammar: bool = False
+
+    # For hidden states before normal
+    return_hidden_states_before_norm: bool = False
 
     # For mamba state tracking
     mamba_track_indices: Optional[torch.Tensor] = None  # shape: [b], int64
