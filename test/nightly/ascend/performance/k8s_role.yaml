@@ -1,0 +1,24 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: ascend-sglang-single-pod-access
+  namespace: ascend-sglang-single
+rules:
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "list"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: ascend-sglang-pod-binding
+  namespace: ascend-sglang-single
+subjects:
+- kind: ServiceAccount
+  name: default
+  namespace: ascend-sglang-single
+roleRef:
+  kind: Role
+  name: ascend-sglang-single-pod-access
+  apiGroup: rbac.authorization.k8s.io
