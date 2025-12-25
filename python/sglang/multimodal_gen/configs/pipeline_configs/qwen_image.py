@@ -487,7 +487,7 @@ class QwenImageLayeredPipelineConfig(QwenImageEditPipelineConfig):
 
         img_shapes = batch.img_shapes
         txt_seq_lens = batch.txt_seq_lens
-        
+
         (img_cos, img_sin), (txt_cos, txt_sin) = (
             QwenImageEditPlusPipelineConfig.get_freqs_cis(
                 img_shapes, txt_seq_lens, rotary_emb, device, dtype
