@@ -417,29 +417,85 @@ class Glm47MoeDetector(BaseFormatDetector):
         calls: list[ToolCallItem] = []
         try:
             # Try to match a partial or complete tool call
+            # Match function name up to <arg_key or end token, without including <arg_key in the function name
+            # First try to match with <arg_key present
             partial_match = re.search(
-                pattern=r"<tool_call>(.*?)(<arg_key>.*?)?(</tool_call>|$)",
+                pattern=r"<tool_call>(.*?)(<arg_key.*?)(</tool_call>|$)",
                 string=current_text,
                 flags=re.DOTALL,
             )
+
+            # If no match with <arg_key, try matching with end token
+            if not partial_match:
+                partial_match = re.search(
+                    pattern=r"<tool_call>(.*?)(</tool_call>|$)",
+                    string=current_text,
+                    flags=re.DOTALL,
+                )
             # Only proceed if we have a non-empty function name
-            if partial_match and (func_name := partial_match.group(1)) is not None:
+            if partial_match:
+                # Determine how many groups were captured based on which pattern matched
+                if (
+                    len(partial_match.groups()) == 3
+                ):  # First pattern matched: func_name, args, end
+                    func_name = partial_match.group(1)
+                    func_args_raw = partial_match.group(2)
+                    is_tool_end = partial_match.group(3)
+                elif (
+                    len(partial_match.groups()) == 2
+                ):  # Second pattern matched: func_name, end
+                    func_name = partial_match.group(1)
+                    func_args_raw = None
+                    is_tool_end = partial_match.group(2)
+                else:  # Fallback case
+                    lastindex = partial_match.lastindex
+                    func_name = (
+                        partial_match.group(1) if lastindex and lastindex >= 1 else ""
+                    )
+                    func_args_raw = (
+                        partial_match.group(2) if lastindex and lastindex >= 2 else None
+                    )
+                    is_tool_end = (
+                        partial_match.group(3) if lastindex and lastindex >= 3 else ""
+                    )
+
                 # Check if we have a valid function name before proceeding
                 func_name = func_name.strip()
-                func_args_raw = partial_match.group(2)
                 func_args_raw = (
                     func_args_raw.strip() if func_args_raw is not None else ""
                 )
-                is_tool_end = partial_match.group(3)
 
-                # Initialize state if this is the first tool call
+                # Determine if function name is complete by checking for <arg_key> in the full text
+                # This is important for streaming scenarios where args come in later chunks
+                has_arg_key_in_text = "<arg_key" in current_text
+
+                # Initialize state if this is the first tool call or a new tool call
                 if self.current_tool_id == -1:
                     self.current_tool_id = 0
                     self.prev_tool_call_arr = []
                     self.streamed_args_for_tool = [""]
                     self._streamed_raw_length = 0
-                    self.current_tool_name_sent = False
+                    self.current_tool_name_sent = False  # Reset for new tool call
                     self._reset_streaming_state()
+                # Check if this is a continuation of an existing tool call or a new one
+                elif not self.current_tool_name_sent:
+                    # If we're starting a new tool call (not continuing an existing one)
+                    # This check might need to be refined based on the context
+                    # For now, let's just reset when we detect a new tool call start
+                    potential_new_call = self.bot_token in new_text
+                    if potential_new_call and not self._buffer.startswith(
+                        self.bot_token
+                    ):
+                        # This appears to be a new tool call
+                        self.current_tool_id += 1
+                        self.current_tool_name_sent = False
+                        self._streamed_raw_length = 0
+                        self._reset_streaming_state()
+                        # Ensure arrays are large enough
+                        while len(self.prev_tool_call_arr) <= self.current_tool_id:
+                            self.prev_tool_call_arr.append({})
+                        while len(self.streamed_args_for_tool) <= self.current_tool_id:
+                            self.streamed_args_for_tool.append("")
 
                 # Ensure we have enough entries in our tracking arrays
                 while len(self.prev_tool_call_arr) <= self.current_tool_id:
@@ -449,28 +505,41 @@ class Glm47MoeDetector(BaseFormatDetector):
 
                 # Send tool name first if not sent yet
                 if not self.current_tool_name_sent:
-                    # Additional safety check for func_name
-                    if not func_name:
-                        logger.warning(
-                            "Empty function name detected, skipping tool call"
-                        )
-                        return StreamingParseResult(normal_text="", calls=[])
-                    calls.append(
-                        ToolCallItem(
-                            tool_index=self.current_tool_id,
-                            name=func_name,
-                            parameters="",
-                        )
+                    # Only send the tool name when we have a complete function name
+                    # A function name is complete when we encounter <arg_key> or the end token
+                    # Check if we have encountered the first <arg_key> anywhere in the current text or the end token
+                    has_arg_key_in_text = "<arg_key" in current_text
+                    is_func_name_complete = (
+                        has_arg_key_in_text or is_tool_end == self.eot_token
                     )
-                    self.current_tool_name_sent = True
-                    self._streamed_raw_length = 0
-                    self._reset_streaming_state()
-                    # Store the tool call info
-                    self.prev_tool_call_arr[self.current_tool_id] = {
-                        "name": func_name,
-                        "arguments": {},
-                    }
-                else:
+
+                    if is_func_name_complete:
+                        # Additional safety check for func_name
+                        if not func_name:
+                            logger.warning(
+                                "Empty function name detected, skipping tool call"
+                            )
+                            return StreamingParseResult(normal_text="", calls=[])
+                        calls.append(
+                            ToolCallItem(
+                                tool_index=self.current_tool_id,
+                                name=func_name,
+                                parameters="",
+                            )
+                        )
+                        self.current_tool_name_sent = True
+                        self._streamed_raw_length = 0
+                        self._reset_streaming_state()
+                        # Store the tool call info
+                        self.prev_tool_call_arr[self.current_tool_id] = {
+                            "name": func_name,
+                            "arguments": {},
+                        }
+                # Process XML to JSON streaming (whether tool name was sent or not)
+                # This handles both streaming args and end-of-tool processing
+                if (
+                    self.current_tool_name_sent
+                ):  # Only process args if tool name has been sent
                     # Process XML to JSON streaming
                     current_raw_length = len(func_args_raw)
 
@@ -541,11 +610,24 @@ class Glm47MoeDetector(BaseFormatDetector):
                             )
 
                         # Remove the completed tool call from buffer
-                        self._buffer = current_text[partial_match.end(3) :]
+                        # Use the correct end position based on which pattern matched
+                        if len(partial_match.groups()) == 3:  # First pattern matched
+                            self._buffer = current_text[partial_match.end(3) :]
+                        elif len(partial_match.groups()) == 2:  # Second pattern matched
+                            self._buffer = current_text[partial_match.end(2) :]
+                        else:  # Fallback
+                            lastindex = partial_match.lastindex
+                            if lastindex:
+                                self._buffer = current_text[
+                                    partial_match.end(lastindex) :
+                                ]
+                            else:
+                                self._buffer = ""
 
                         result = StreamingParseResult(normal_text="", calls=calls)
                         self.current_tool_id += 1
                         self._last_arguments = ""
+                        # Reset current_tool_name_sent for the next tool call
                         self.current_tool_name_sent = False
                         self._streamed_raw_length = 0
                         self._reset_streaming_state()

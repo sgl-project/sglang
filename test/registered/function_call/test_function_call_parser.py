@@ -2234,20 +2234,280 @@ class TestGlm4MoeDetector(unittest.TestCase):
         )
         check_single_todos(result, expected_output)
 
-    def test_empty_function_name_handling(self):
-        """Test that empty function name is handled gracefully without assertion error."""
-        # This test simulates the issue where the model outputs only the start token without a function name
-        chunks = [
-            "<tool_call>",  # Start token only, no function name yet
-            "\n",  # More content without function name
-        ]
 
-        for chunk in chunks:
-            # Should not raise AssertionError: func_name should not be empty
-            result = self.detector.parse_streaming_increment(chunk, self.tools)
-            # Should return empty calls without error
-            self.assertIsInstance(result, StreamingParseResult)
-            self.assertEqual(result.calls, [])
+def test_empty_function_name_handling(self):
+    """Test that empty function name is handled gracefully without assertion error."""
+    # This test simulates the issue where the model outputs only the start token without a function name
+    chunks = [
+        "<tool_call>",  # Start token only, no function name yet
+        "\n",  # More content without function name
+    ]
+
+    for chunk in chunks:
+        # Should not raise AssertionError: func_name should not be empty
+        result = self.detector.parse_streaming_increment(chunk, self.tools)
+        # Should return empty calls without error
+        self.assertIsInstance(result, StreamingParseResult)
+        self.assertEqual(result.calls, [])
+
+
+def test_function_name_not_truncated_when_incomplete(self):
+    """Test that function name is not sent when it's incomplete."""
+    # Simulate receiving partial function name "ask" without args
+    self.detector._buffer = "<tool_call>ask"
+
+    # Parse streaming increment - should not send function name yet
+    result = self.detector.parse_streaming_increment("", self.tools)
+
+    # Should not have sent the incomplete function name
+    self.assertEqual(len(result.calls), 0)
+    self.assertFalse(self.detector.current_tool_name_sent)
+
+
+def test_function_name_sent_when_complete_with_args(self):
+    """Test that function name is sent when complete with args."""
+    # Reset detector state
+    self.detector._buffer = ""
+    self.detector.current_tool_id = -1
+    self.detector.current_tool_name_sent = False
+
+    # Add a test tool with the target function name
+    test_tools = self.tools + [
+        Tool(
+            type="function",
+            function=Function(
+                name="ask_followup_question",
+                description="Ask a follow-up question",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "question": {
+                            "type": "string",
+                            "description": "The question to ask",
+                        },
+                    },
+                    "required": ["question"],
+                },
+            ),
+        )
+    ]
+
+    # Simulate receiving complete function name with args
+    new_text = "<tool_call>ask_followup_question<arg_key>question</arg_key><arg_value>How are you?</arg_value></tool_call>"
+
+    result = self.detector.parse_streaming_increment(new_text, test_tools)
+
+    # Should have sent the complete function name and arguments
+    self.assertTrue(len(result.calls) >= 1)  # Function name + arguments + closing brace
+    self.assertTrue(self.detector.current_tool_name_sent)
+    # Find the call with the function name
+    func_calls = [call for call in result.calls if call.name]
+    self.assertTrue(any(call.name == "ask_followup_question" for call in func_calls))
+
+
+def test_function_name_sent_when_complete_with_end_token(self):
+    """Test that function name is sent when complete with end token (no args)."""
+    # Reset detector state
+    self.detector._buffer = ""
+    self.detector.current_tool_id = -1
+    self.detector.current_tool_name_sent = False
+
+    # Add a test tool with a simple function name
+    test_tools = self.tools + [
+        Tool(
+            type="function",
+            function=Function(
+                name="simple_function",
+                description="A simple function",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "param": {"type": "string", "description": "A parameter"},
+                    },
+                    "required": ["param"],
+                },
+            ),
+        )
+    ]
+
+    # Simulate receiving complete function name with end token but no arguments
+    new_text = "<tool_call>simple_function</tool_call>"
+
+    result = self.detector.parse_streaming_increment(new_text, test_tools)
+
+    # Should have sent the complete function name
+    self.assertTrue(len(result.calls) >= 1)  # Function name + empty object
+    self.assertTrue(self.detector.current_tool_name_sent)
+    # Find the call with the function name
+    func_calls = [call for call in result.calls if call.name]
+    self.assertTrue(any(call.name == "simple_function" for call in func_calls))
+
+
+def test_streaming_function_name_complete_detection(self):
+    """Test streaming scenario where function name becomes complete."""
+    # Reset detector state
+    self.detector._buffer = ""
+    self.detector.current_tool_id = -1
+    self.detector.current_tool_name_sent = False
+
+    # Add a test tool
+    test_tools = self.tools + [
+        Tool(
+            type="function",
+            function=Function(
+                name="ask_followup_question",
+                description="Ask a follow-up question",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "question": {
+                            "type": "string",
+                            "description": "The question to ask",
+                        },
+                    },
+                    "required": ["question"],
+                },
+            ),
+        )
+    ]
+
+    # Send initial partial function name
+    result1 = self.detector.parse_streaming_increment("<tool_call>ask", test_tools)
+    self.assertEqual(len(result1.calls), 0)
+    self.assertFalse(self.detector.current_tool_name_sent)
+
+    # Send more text that completes the function name with args
+    result2 = self.detector.parse_streaming_increment(
+        "_followup_question<arg_key", test_tools
+    )
+    self.assertTrue(self.detector.current_tool_name_sent)
+    self.assertTrue(len(result2.calls) >= 1)
+    # Find the call with the function name
+    func_calls = [call for call in result2.calls if call.name]
+    self.assertTrue(any(call.name == "ask_followup_question" for call in func_calls))
+
+
+def test_multiple_function_calls(self):
+    """Test multiple function calls in sequence."""
+    # Reset detector state
+    self.detector._buffer = ""
+    self.detector.current_tool_id = -1
+    self.detector.current_tool_name_sent = False
+
+    # Add test tools
+    test_tools = self.tools + [
+        Tool(
+            type="function",
+            function=Function(
+                name="get_weather",
+                description="Get weather information",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "city": {"type": "string", "description": "The city name"},
+                        "unit": {"type": "string", "description": "Temperature unit"},
+                    },
+                    "required": ["city", "unit"],
+                },
+            ),
+        ),
+        Tool(
+            type="function",
+            function=Function(
+                name="ask_followup_question",
+                description="Ask a follow-up question",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "question": {
+                            "type": "string",
+                            "description": "The question to ask",
+                        },
+                    },
+                    "required": ["question"],
+                },
+            ),
+        ),
+    ]
+
+    # Send first function call
+    text1 = "<tool_call>get_weather<arg_key>city</arg_key><arg_value>Beijing</arg_value><arg_key>unit</arg_key><arg_value>celsius</arg_value></tool_call>"
+    result1 = self.detector.parse_streaming_increment(text1, test_tools)
+
+    # Verify first function call
+    self.assertTrue(self.detector.current_tool_name_sent)
+    func_calls1 = [call.name for call in result1.calls if call.name]
+    self.assertIn("get_weather", func_calls1)
+
+    # Reset for second call - the detector should automatically handle this
+    self.detector.current_tool_name_sent = False
+    self.detector.current_tool_id = -1
+
+    # Send second function call
+    text2 = "<tool_call>ask_followup_question<arg_key>question</arg_key><arg_value>How are you?</arg_value></tool_call>"
+    result2 = self.detector.parse_streaming_increment(text2, test_tools)
+
+    # Verify second function call
+    self.assertTrue(self.detector.current_tool_name_sent)
+    func_calls2 = [call.name for call in result2.calls if call.name]
+    self.assertIn("ask_followup_question", func_calls2)
+
+
+def test_function_name_truncation_fix(self):
+    """Test the specific issue: function name truncation is fixed."""
+    # Reset detector state
+    self.detector._buffer = ""
+    self.detector.current_tool_id = -1
+    self.detector.current_tool_name_sent = False
+
+    # Add a test tool with a longer function name
+    test_tools = self.tools + [
+        Tool(
+            type="function",
+            function=Function(
+                name="ask_followup_question",
+                description="Ask a follow-up question",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "question": {
+                            "type": "string",
+                            "description": "The question to ask",
+                        },
+                    },
+                    "required": ["question"],
+                },
+            ),
+        )
+    ]
+
+    # Simulate the problematic scenario: receiving "ask" followed by more text
+    # Before the fix, "ask" would be sent as the function name
+    # After the fix, it should wait until the complete name is available
+
+    # Send partial function name
+    result1 = self.detector.parse_streaming_increment("<tool_call>ask", test_tools)
+    # Should not have sent anything yet
+    self.assertEqual(len(result1.calls), 0)
+    self.assertFalse(self.detector.current_tool_name_sent)
+
+    # Send the rest that makes it a complete function name
+    result2 = self.detector.parse_streaming_increment(
+        "_followup_question<arg_key>question</arg_key><arg_value>Hello</arg_value></tool_call>",
+        test_tools,
+    )
+    # Should now send the complete function name
+    self.assertTrue(self.detector.current_tool_name_sent)
+    func_calls = [call.name for call in result2.calls if call.name]
+    # Should contain the complete function name
+    complete_function_names = [name for name in func_calls if name]
+    self.assertTrue(
+        any("ask_followup_question" in name for name in complete_function_names)
+    )
+    # Should NOT contain truncated "ask"
+    for name in complete_function_names:
+        if name:  # Check only non-None names
+            self.assertNotEqual(name, "ask")
 
 
 class TestGlm47MoeDetector(unittest.TestCase):
