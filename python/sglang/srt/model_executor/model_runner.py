@@ -164,11 +164,9 @@ from sglang.srt.utils import (
     dynamic_import,
     enable_show_time_cost,
     get_available_gpu_memory,
-    get_bool_env_var,
     get_cpu_ids_by_node,
     get_local_ip_auto,
     init_custom_process_group,
-    is_cuda,
     is_float4_e2m1fn_x2,
     is_hip,
     is_npu,
@@ -180,7 +178,6 @@ from sglang.srt.utils import (
     reserve_rope_cache_for_long_sequences,
     set_cuda_arch,
     slow_rank_detector,
-    xpu_has_xmx_support,
 )
 from sglang.srt.utils.nvtx_pytorch_hooks import PytHooks
 from sglang.srt.utils.offloader import (
@@ -199,11 +196,9 @@ from sglang.srt.weight_sync.tensor_bucket import (
     FlattenedTensorMetadata,
 )
 
-_is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_npu = is_npu()
 _is_cpu_amx_available = cpu_has_amx_support()
-_is_xpu_xmx_available = xpu_has_xmx_support()
 
 if _is_npu:
     from sglang.srt.hardware_backend.npu.utils import init_npu_backend
@@ -339,7 +334,6 @@ class ModelRunner:
         self.attention_chunk_size = model_config.attention_chunk_size
         self.forward_pass_id = 0
         self.init_new_workspace = False
-        self.kv_cache_memory = 0
         self.draft_model_idx = draft_model_idx
 
         self.remote_instance_transfer_engine = None
@@ -372,8 +366,9 @@ class ModelRunner:
 
         self._weight_checker = WeightChecker(model_runner=self)
 
-        if get_bool_env_var("SGLANG_DETECT_SLOW_RANK"):
+        if envs.SGLANG_DETECT_SLOW_RANK.get():
             slow_rank_detector.execute()
+
         # Init mindspore running environment when model impl is "mindspore"
         self.init_mindspore_runner()
 
@@ -431,9 +426,7 @@ class ModelRunner:
                     moe_ep_rank=self.moe_ep_rank,
                 )
             )
-            if self.tp_rank == 0 and get_bool_env_var(
-                "SGLANG_LOG_EXPERT_LOCATION_METADATA"
-            ):
+            if self.tp_rank == 0 and envs.SGLANG_LOG_EXPERT_LOCATION_METADATA.get():
                 logger.info(
                     f"Initial expert_location_metadata: {get_global_expert_location_metadata()}"
                 )
@@ -556,12 +549,11 @@ class ModelRunner:
 
             enable_batch_invariant_mode()
 
+        # Deduce KV cache dtype
+        self.configure_kv_cache_dtype()
+
         # Init memory pool and attention backends
-        self.init_memory_pool(
-            min_per_gpu_memory,
-            server_args.max_running_requests,
-            server_args.max_total_tokens,
-        )
+        self.init_memory_pool(min_per_gpu_memory, server_args)
 
         # Init max running requests
         self.max_running_requests = min(
@@ -834,16 +826,12 @@ class ModelRunner:
         local_gpu_memory = get_available_gpu_memory(self.device, self.gpu_id)
         if self.tp_size > 1 and not self.is_draft_worker:
             if min_per_gpu_memory < local_gpu_memory * 0.9:
-                if get_bool_env_var("SGL_DISABLE_TP_MEMORY_INBALANCE_CHECK"):
-                    logger.warning(
-                        "The memory capacity is unbalanced. Some GPUs may be occupied by other processes. "
-                        f"{min_per_gpu_memory=}, {local_gpu_memory=}, {local_gpu_memory * 0.9=}"
-                    )
+                msg = "The memory capacity is unbalanced. Some GPUs may be occupied by other processes. "
+                msg += f"{min_per_gpu_memory=}, {local_gpu_memory=}, {local_gpu_memory * 0.9=}"
+                if envs.SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK.get():
+                    raise RuntimeError(msg)
                 else:
-                    raise ValueError(
-                        "The memory capacity is unbalanced. Some GPUs may be occupied by other processes. "
-                        f"{min_per_gpu_memory=}, {local_gpu_memory=}, {local_gpu_memory * 0.9=}"
-                    )
+                    logger.warning(msg)
 
         logger.info(
             f"Init torch distributed ends. mem usage={(before_avail_memory - local_gpu_memory):.2f} GB"
@@ -1500,30 +1488,13 @@ class ModelRunner:
 
         return result
 
-    def profile_max_num_token(self, total_gpu_memory: int):
-        available_gpu_memory = get_available_gpu_memory(
-            self.device,
-            self.gpu_id,
-            distributed=get_world_group().world_size > 1,
-            cpu_group=get_world_group().cpu_group,
-        )
-        if self.is_draft_worker:
-            num_layers = getattr(
-                self.model_config.hf_config,
-                "num_nextn_predict_layers",
-                self.num_effective_layers,
-            )
-        elif config := self.mambaish_config:
-            num_layers = len(config.full_attention_layer_ids)
-        elif self.model_config.full_attention_layer_ids:
-            num_layers = len(self.model_config.full_attention_layer_ids)
-        else:
-            num_layers = self.num_effective_layers
+    def get_cell_size_per_token(self, num_layers: int) -> int:
+        kv_size = torch._utils._element_size(self.kv_cache_dtype)
         if self.use_mla_backend:
             cell_size = (
                 (self.model_config.kv_lora_rank + self.model_config.qk_rope_head_dim)
                 * num_layers
-                * torch._utils._element_size(self.kv_cache_dtype)
+                * kv_size
             )
             if is_float4_e2m1fn_x2(self.kv_cache_dtype):
                 # kv_scale_buffer
@@ -1537,7 +1508,7 @@ class ModelRunner:
                         // scale_block_size
                     )
                     * num_layers
-                    * torch._utils._element_size(self.kv_cache_dtype)
+                    * kv_size
                 )
 
             # Add indexer KV cache overhead for NSA models (DeepSeek V3.2)
@@ -1556,7 +1527,7 @@ class ModelRunner:
                 self.model_config.get_num_kv_heads(get_attention_tp_size())
                 * (self.model_config.head_dim + self.model_config.v_head_dim)
                 * num_layers
-                * torch._utils._element_size(self.kv_cache_dtype)
+                * kv_size
             )
 
             if is_float4_e2m1fn_x2(self.kv_cache_dtype):
@@ -1566,14 +1537,7 @@ class ModelRunner:
                 n = self.model_config.get_num_kv_heads(get_attention_tp_size())
                 k = self.model_config.head_dim
                 cell_size = (cell_size // 2) + (
-                    (
-                        n
-                        * k
-                        * num_layers
-                        * 2
-                        * torch._utils._element_size(self.kv_cache_dtype)
-                    )
-                    // scale_block_size
+                    (n * k * num_layers * 2 * kv_size) // scale_block_size
                 )
 
             if self.model_config.hf_config.architectures[0] == "MiMoV2FlashForCausalLM":
@@ -1584,17 +1548,42 @@ class ModelRunner:
                         + self.model_config.hf_text_config.swa_v_head_dim
                     )
                     * len(self.model_config.swa_attention_layer_ids)
-                    * torch._utils._element_size(self.kv_cache_dtype)
+                    * kv_size
                 )
+        return cell_size
+
+    def profile_max_num_token(self, total_gpu_memory: int):
+        available_gpu_memory = get_available_gpu_memory(
+            self.device,
+            self.gpu_id,
+            distributed=get_world_group().world_size > 1,
+            cpu_group=get_world_group().cpu_group,
+        )
+
+        # Get the number of layers used for KV cache calculation
+        if self.is_draft_worker:
+            num_layers = getattr(
+                self.model_config.hf_config,
+                "num_nextn_predict_layers",
+                self.num_effective_layers,
+            )
+        elif mambaish := self.mambaish_config:
+            num_layers = len(mambaish.full_attention_layer_ids)
+        elif self.model_config.full_attention_layer_ids:
+            num_layers = len(self.model_config.full_attention_layer_ids)
+        else:
+            num_layers = self.num_effective_layers
+
+        cell_size = self.get_cell_size_per_token(num_layers)
+
         rest_memory = available_gpu_memory - total_gpu_memory * (
             1 - self.mem_fraction_static
         )
         if self.mambaish_config is not None:
             rest_memory = self.handle_max_mamba_cache(rest_memory)
-        self.kv_cache_memory = int(rest_memory * (1 << 30))
-        max_num_token = int(self.kv_cache_memory // cell_size)
+
         logger.info(f"The available memory for KV cache is {rest_memory:.2f} GB.")
-        return max_num_token
+        return int(rest_memory * (1 << 30)) // cell_size
 
     def handle_max_mamba_cache(self, total_rest_memory):
         config = self.mambaish_config
@@ -1728,14 +1717,6 @@ class ModelRunner:
                 self.max_total_num_tokens // page_size * page_size
             )
             self.max_total_num_tokens = self.swa_max_total_num_tokens
-        elif self.model_config.hf_config.architectures[0] == "MiMoV2FlashForCausalLM":
-            self.full_max_total_num_tokens = (
-                self.max_total_num_tokens // page_size * page_size
-            )
-            self.swa_max_total_num_tokens = (
-                self.max_total_num_tokens // page_size * page_size
-            )
-            self.max_total_num_tokens = self.full_max_total_num_tokens
         else:
             assert self.sliding_window_size is not None and self.sliding_window_size > 0
             full_layers_num = len(self.model_config.full_attention_layer_ids)
@@ -1758,6 +1739,14 @@ class ModelRunner:
             self.swa_max_total_num_tokens = int(
                 self.full_max_total_num_tokens * swa_full_tokens_ratio
             )
+
+            self.full_max_total_num_tokens = (
+                self.full_max_total_num_tokens // page_size * page_size
+            )
+            self.swa_max_total_num_tokens = (
+                self.swa_max_total_num_tokens // page_size * page_size
+            )
+
             self.max_total_num_tokens = self.full_max_total_num_tokens
 
         logger.info(
@@ -1787,13 +1776,7 @@ class ModelRunner:
             return False
         return True
 
-    def init_memory_pool(
-        self,
-        total_gpu_memory: int,
-        max_num_reqs: Optional[int] = None,
-        max_total_tokens: Optional[int] = None,
-    ):
-        # Determine the kv cache dtype
+    def configure_kv_cache_dtype(self):
         if self.server_args.kv_cache_dtype == "auto":
             quant_config = getattr(self.model, "quant_config", None)
             kv_cache_quant_algo = getattr(quant_config, "kv_cache_quant_algo", None)
@@ -1835,13 +1818,10 @@ class ModelRunner:
 
         log_info_on_rank0(logger, f"Using KV cache dtype: {self.kv_cache_dtype}")
 
+    def init_memory_pool(self, total_gpu_memory: int, server_args: ServerArgs):
+        max_num_reqs = server_args.max_running_requests
+        max_total_tokens = server_args.max_total_tokens
         self.max_total_num_tokens = self.profile_max_num_token(total_gpu_memory)
-
-        if (small_kv_size := envs.SGLANG_CI_SMALL_KV_SIZE.get()) > 0:
-            logger.info(
-                f"Use a small KV cache pool size ({small_kv_size}) for local tests"
-            )
-            self.max_total_num_tokens = small_kv_size
 
         if max_num_reqs is None:
             max_num_reqs = min(
@@ -1876,23 +1856,7 @@ class ModelRunner:
                 self.max_total_num_tokens = self.server_args.draft_runner_cache_size
                 max_num_reqs = self.server_args.max_num_reqs
             else:
-                # We are sharing the `token_to_kv_pool`, and both verify and draft tokens
-                # can be concurrently allocated, so we should give a headroom for it.
-                extra_tokens = (
-                    # draft
-                    max_num_reqs
-                    * self.server_args.speculative_num_steps
-                    * self.server_args.speculative_eagle_topk
-                    # verify
-                    + max_num_reqs * self.server_args.speculative_num_draft_tokens
-                    # buffer
-                    + 100
-                )
-                # Target worker and draft worker shares the same indices for the
-                # token_to_kv_pool, so we should make sure to match max_total_num_tokens.
-                self.max_total_num_tokens += extra_tokens
                 self.server_args.draft_runner_cache_size = self.max_total_num_tokens
-
                 self.server_args.max_num_reqs = max_num_reqs
 
         if max_total_tokens is not None:

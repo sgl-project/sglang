@@ -22,7 +22,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=470, suite="stage-b-test-small-1-gpu")
+register_cuda_ci(est_time=500, suite="stage-b-test-small-1-gpu")
 
 torch_dtype = torch.float16
 prefill_tolerance = 5e-2
@@ -228,9 +228,9 @@ class TestEAGLERadixCache(CustomTestCase):
             # Chunked prefill & Page Size > 1
             {**self.BASE_CONFIG, "chunked_prefill_size": 64, "page_size": 4},
             {**self.BASE_CONFIG, "page_size": 4},
+            # Large page size tend to expose IMA bugs.
+            {**self.BASE_CONFIG, "page_size": 256},
             {**self.BASE_CONFIG, "cuda_graph_bs": [5], "page_size": 4},
-            # Preferred by some kernels
-            {**self.BASE_CONFIG, "page_size": 64},
             # Disable CUDA Graph
             {
                 **self.BASE_CONFIG,

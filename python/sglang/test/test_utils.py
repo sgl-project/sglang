@@ -168,6 +168,11 @@ def is_blackwell_system():
     return envs.IS_BLACKWELL.get()
 
 
+def is_h200_system():
+    """Return whether it is running on an H200 system."""
+    return envs.IS_H200.get()
+
+
 def _use_cached_default_models(model_repo: str):
     cache_dir = os.getenv("DEFAULT_MODEL_CACHE_DIR")
     if cache_dir and model_repo:
@@ -192,6 +197,9 @@ if is_in_amd_ci():
 
 if is_blackwell_system():
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH = 3000
+
+if is_h200_system():
+    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH = 3600
 
 
 def call_generate_lightllm(prompt, temperature, max_tokens, stop=None, url=None):
@@ -1697,16 +1705,19 @@ async def send_concurrent_generate_requests_with_custom_params(
 
 class CustomTestCase(unittest.TestCase):
     def _callTestMethod(self, method):
-        max_retry = int(
-            os.environ.get("SGLANG_TEST_MAX_RETRY", "1" if is_in_ci() else "0")
-        )
+        max_retry = envs.SGLANG_TEST_MAX_RETRY.get()
+        if max_retry is None:
+            max_retry = 1 if is_in_ci() else 0
         retry(
             lambda: super(CustomTestCase, self)._callTestMethod(method),
             max_retry=max_retry,
         )
 
     def setUp(self):
-        print(f"[CI Test Method] {self.__class__.__name__}.{self._testMethodName}")
+        print(
+            f"[CI Test Method] {self.__class__.__name__}.{self._testMethodName}",
+            flush=True,
+        )
 
 
 def dump_bench_raw_result(
