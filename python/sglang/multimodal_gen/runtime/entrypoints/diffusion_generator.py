@@ -215,9 +215,7 @@ class DiffGenerator:
                 with log_generation_timer(
                     logger, req.prompt, request_idx + 1, len(requests)
                 ) as timer:
-                    print(f"218")
                     output_batch = self._send_to_scheduler_and_wait_for_response([req])
-                    print(f"220")
                     if output_batch.error:
                         raise Exception(f"{output_batch.error}")
 

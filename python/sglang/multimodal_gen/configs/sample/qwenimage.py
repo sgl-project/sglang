@@ -35,4 +35,3 @@ class QwenImageLayeredSamplingParams(QwenImageSamplingParams):
     num_inference_steps: int = 50
     cfg_normalize: bool = True
     use_en_prompt: bool = True
-    resolution: bool = 640

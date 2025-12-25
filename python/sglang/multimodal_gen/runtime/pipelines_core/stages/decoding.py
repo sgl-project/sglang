@@ -126,7 +126,6 @@ class DecodingStage(PipelineStage):
         ) and not server_args.disable_autocast
 
         # scale and shift
-        print(f"129 {latents.dtype=}")
         latents = self.scale_and_shift(latents, server_args)
         # Preprocess latents before decoding (e.g., unpatchify for standard Flux2 VAE)
         latents = server_args.pipeline_config.preprocess_decoding(
@@ -134,7 +133,6 @@ class DecodingStage(PipelineStage):
         )
 
         # Decode latents
-        print(f"136 {latents.dtype=}")
         with torch.autocast(
             device_type=current_platform.device_type,
             dtype=vae_dtype,
@@ -147,9 +145,7 @@ class DecodingStage(PipelineStage):
             except Exception:
                 pass
             if not vae_autocast_enabled:
-                print(f"150 {latents.dtype=}")
                 latents = latents.to(vae_dtype)
-            print(f"152 {latents.dtype=}")
             decode_output = self.vae.decode(latents)
             image = _ensure_tensor_decode_output(decode_output)
 
