@@ -27,7 +27,7 @@ use crate::{
         metrics::{bool_to_static_str, metrics_labels, Metrics},
         otel_trace::inject_trace_context_http,
     },
-    policies::PolicyRegistry,
+    policies::{PolicyRegistry, SelectWorkerInfo},
     protocols::{
         chat::ChatCompletionRequest,
         classify::ClassifyRequest,
@@ -168,7 +168,7 @@ impl Router {
             None => self.policy_registry.get_default_policy(),
         };
 
-        let idx = policy.select_worker(&available, text)?;
+        let idx = policy.select_worker(&available, &SelectWorkerInfo { request_text: text })?;
 
         // Record worker selection metric (Layer 3)
         Metrics::record_worker_selection(

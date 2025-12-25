@@ -33,11 +33,11 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
     ///
     /// This is used for regular routing mode where requests go to a single worker.
     /// Now uses Arc<dyn Worker> for better performance and to avoid unnecessary cloning.
-    fn select_worker(
-        &self,
-        workers: &[Arc<dyn Worker>],
-        request_text: Option<&str>,
-    ) -> Option<usize>;
+    ///
+    /// # Arguments
+    /// * `workers` - Available workers to select from
+    /// * `info` - Additional information for routing decisions
+    fn select_worker(&self, workers: &[Arc<dyn Worker>], info: &SelectWorkerInfo) -> Option<usize>;
 
     /// Update policy state after request completion
     ///
@@ -133,6 +133,13 @@ pub(crate) fn normalize_model_key(model_id: &str) -> &str {
     } else {
         model_id
     }
+}
+
+/// Information passed to policy for worker selection
+#[derive(Debug, Default, Clone)]
+pub struct SelectWorkerInfo<'a> {
+    /// Request text for cache-aware routing
+    pub request_text: Option<&'a str>,
 }
 
 #[cfg(test)]
