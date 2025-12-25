@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 TileLang GEMM Tuning Script
 

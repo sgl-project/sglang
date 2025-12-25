@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Benchmark TileLang GEMM vs Baseline (DeepGEMM on Hopper, Triton on Ada)
 
