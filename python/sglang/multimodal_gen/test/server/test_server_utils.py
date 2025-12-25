@@ -89,11 +89,6 @@ def parse_dimensions(size_string: str | None) -> tuple[int | None, int | None]:
 
     Returns:
         Tuple of (width, height) as integers if parsing succeeds, (None, None) otherwise.
-        Returns (None, None) if:
-        - size_string is None or empty
-        - size_string doesn't contain exactly one "x" separator
-        - width or height cannot be converted to int
-        - width or height is <= 0
     """
     if not size_string:
         return (None, None)

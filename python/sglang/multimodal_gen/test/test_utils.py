@@ -92,12 +92,7 @@ def get_dynamic_server_port() -> int:
 
 
 def is_mp4(data: bytes) -> bool:
-    """Check if data represents a valid MP4 file by magic bytes.
-
-    MP4 files start with an 'ftyp' atom. Common patterns:
-    - First 4 bytes indicate box size (e.g., 0x18=24, 0x1c=28)
-    - Bytes 4-8 contain the box type 'ftyp'
-    """
+    """Check if data represents a valid MP4 file by magic bytes."""
     if len(data) < 8:
         return False
     return data[4:8] == b"ftyp"
@@ -123,14 +118,9 @@ def get_expected_image_format(
     background: str | None = None,
 ) -> str:
     """Infer expected image format based on request parameters.
-
-    This replicates the server-side logic in image_api._choose_ext()
-    to determine what format the server will produce.
-
     Args:
         output_format: The output_format parameter from the request (png/jpeg/webp/jpg)
         background: The background parameter from the request (transparent/opaque/auto)
-
     Returns:
         Expected file extension: "jpg", "png", or "webp"
     """
@@ -261,16 +251,7 @@ def validate_image_file(
     output_format: str | None = None,
     background: str | None = None,
 ) -> None:
-    """Validate image output file: existence, extension, size, filename, format, dimensions.
-
-    Args:
-        file_path: Path to the image file
-        expected_filename: Expected filename (e.g., "1234567890.jpg")
-        expected_width: Expected image width (optional)
-        expected_height: Expected image height (optional)
-        output_format: The output_format from request (to infer expected format)
-        background: The background from request (to infer expected format)
-    """
+    """Validate image output file: existence, extension, size, filename, format, dimensions."""
     # Infer expected format from request parameters
     expected_ext = get_expected_image_format(output_format, background)
 
@@ -388,14 +369,7 @@ def validate_video_file(
     expected_width: int | None = None,
     expected_height: int | None = None,
 ) -> None:
-    """Validate video output file: existence, extension, size, filename, format, dimensions.
-
-    Args:
-        file_path: Path to the video file
-        expected_filename: Expected filename (e.g., "abc123-def456.mp4")
-        expected_width: Expected video width (optional)
-        expected_height: Expected video height (optional)
-    """
+    """Validate video output file: existence, extension, size, filename, format, dimensions."""
     # 1. File existence
     assert os.path.exists(file_path), f"Video file does not exist: {file_path}"
 
