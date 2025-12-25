@@ -23,7 +23,7 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     _parse_size,
     merge_image_input_list,
     process_generation_batch,
-    save_image_to_path,
+    save_image_to_path, add_common_data_to_response,
 )
 from sglang.multimodal_gen.runtime.entrypoints.utils import prepare_request
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
@@ -147,8 +147,7 @@ async def generations(
                 )
             ]
         }
-        if result.peak_memory_mb and result.peak_memory_mb > 0:
-            response_kwargs["peak_memory_mb"] = result.peak_memory_mb
+        response_kwargs = add_common_data_to_response(response_kwargs, request_id=request_id, result=result)
         return ImageResponse(**response_kwargs)
     else:
         # Return error, not supported
@@ -246,15 +245,13 @@ async def edits(
         response_kwargs = {
             "data": [ImageResponseData(b64_json=b64, revised_prompt=prompt)]
         }
-        if result.peak_memory_mb and result.peak_memory_mb > 0:
-            response_kwargs["peak_memory_mb"] = result.peak_memory_mb
-        return ImageResponse(**response_kwargs)
     else:
         url = f"/v1/images/{request_id}/content"
         response_kwargs = {"data": [ImageResponseData(url=url, revised_prompt=prompt)]}
-        if result.peak_memory_mb and result.peak_memory_mb > 0:
-            response_kwargs["peak_memory_mb"] = result.peak_memory_mb
-        return ImageResponse(**response_kwargs)
+
+    response_kwargs = add_common_data_to_response(response_kwargs, request_id=request_id, result=result)
+
+    return ImageResponse(**response_kwargs)
 
 
 @router.get("/{image_id}/content")

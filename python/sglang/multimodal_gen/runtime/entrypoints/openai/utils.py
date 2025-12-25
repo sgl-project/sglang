@@ -1,15 +1,16 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
-import base64
-import dataclasses
-import os
-import re
-import time
-from typing import Any, List, Optional, Union
 
-import httpx
+import os
+
+import imageio
+import numpy as np
+import torch
+import torchvision
+from einops import rearrange
 from fastapi import UploadFile
 
 from sglang.multimodal_gen.runtime.entrypoints.utils import post_process_sample
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 from sglang.multimodal_gen.runtime.scheduler_client import AsyncSchedulerClient
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
     init_logger,
@@ -20,26 +21,48 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import (
 logger = init_logger(__name__)
 
 
-@dataclasses.dataclass
-class SetLoraReq:
-    lora_nickname: str
-    lora_path: Optional[str] = None
-    target: str = "all"  # "all", "transformer", "transformer_2", "critic"
-    strength: float = 1.0  # LoRA strength for merge, default 1.0
+def post_process_sample(
+    sample: torch.Tensor,
+    data_type: DataType,
+    fps: int,
+    save_output: bool = True,
+    save_file_path: str = None,
+):
+    """
+    Process sample output and save video if necessary
+    """
+    # Process outputs
+    if sample.dim() == 3:
+        # for images, dim t is missing
+        sample = sample.unsqueeze(1)
+    videos = rearrange(sample, "c t h w -> t c h w")
+    frames = []
+    for x in videos:
+        x = torchvision.utils.make_grid(x, nrow=6)
+        x = x.transpose(0, 1).transpose(1, 2).squeeze(-1)
+        frames.append((x * 255).numpy().astype(np.uint8))
+
+    # Save outputs if requested
+    if save_output:
+        if save_file_path:
+            os.makedirs(os.path.dirname(save_file_path), exist_ok=True)
+            if data_type == DataType.VIDEO:
+                imageio.mimsave(
+                    save_file_path,
+                    frames,
+                    fps=fps,
+                    format=data_type.get_default_extension(),
+                )
+            else:
+                imageio.imwrite(save_file_path, frames[0])
+            logger.info(f"Saved output to {save_file_path}")
+        else:
+            logger.info(f"No output path provided, output not saved")
+
+    return frames
 
 
-@dataclasses.dataclass
-class MergeLoraWeightsReq:
-    target: str = "all"  # "all", "transformer", "transformer_2", "critic"
-    strength: float = 1.0  # LoRA strength for merge, default 1.0
-
-
-@dataclasses.dataclass
-class UnmergeLoraWeightsReq:
-    target: str = "all"  # "all", "transformer", "transformer_2", "critic"
-
-
-def _parse_size(size: str) -> tuple[int, int] | tuple[None, None]:
+def _parse_size(size: str) -> tuple[int, int]:
     try:
         parts = size.lower().replace(" ", "").split("x")
         if len(parts) != 2:
@@ -47,14 +70,8 @@ def _parse_size(size: str) -> tuple[int, int] | tuple[None, None]:
         w, h = int(parts[0]), int(parts[1])
         return w, h
     except Exception:
-        return None, None
-
-
-async def save_image_to_path(image: Union[UploadFile, str], target_path: str) -> str:
-    input_path = await _maybe_url_image(image, target_path)
-    if input_path is None:
-        input_path = await _save_upload_to_path(image, target_path)
-    return input_path
+        # Fallback to default portrait 720x1280
+        return 720, 1280
 
 
 # Helpers
@@ -172,7 +189,7 @@ async def _save_base64_image_to_path(base64_data: str, target_path: str) -> str:
 async def process_generation_batch(
     scheduler_client: AsyncSchedulerClient,
     batch,
-):
+) -> tuple[str, OutputBatch]:
     total_start_time = time.perf_counter()
     with log_generation_timer(logger, batch.prompt):
         result = await scheduler_client.forward([batch])
@@ -227,3 +244,12 @@ def merge_image_input_list(*inputs: Union[List, Any, None]) -> List:
             else:
                 result.append(input_item)
     return result
+
+
+def add_common_data_to_response(response: dict, request_id: str, result: OutputBatch) -> dict:
+    if result.peak_memory_mb and result.peak_memory_mb > 0:
+        response["peak_memory_mb"] = result.peak_memory_mb
+
+    response.update(dict(rid=request_id))
+
+    return response

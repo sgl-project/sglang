@@ -38,7 +38,6 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
 from sglang.multimodal_gen.test.test_utils import (
     get_dynamic_server_port,
     is_image_url,
-    read_perf_logs,
     wait_for_req_perf_record,
 )
 
@@ -187,15 +186,13 @@ Consider updating perf_baselines.json with the snippets below:
     ) -> RequestPerfRecord:
         """Run generation and collect performance records."""
         log_path = ctx.perf_log_path
-        prev_len = len(read_perf_logs(log_path))
         log_wait_timeout = 30
 
         client = self._client(ctx)
         rid = generate_fn(case_id, client)
 
-        req_perf_record, _ = wait_for_req_perf_record(
+        req_perf_record = wait_for_req_perf_record(
             rid,
-            prev_len,
             log_path,
             timeout=log_wait_timeout,
         )
@@ -300,8 +297,8 @@ Consider updating perf_baselines.json with the snippets below:
             is_sig_faster(summary.e2e_ms, scenario.expected_e2e_ms)
             or is_sig_faster(summary.avg_denoise_ms, scenario.expected_avg_denoise_ms)
             or is_sig_faster(
-                summary.median_denoise_ms, scenario.expected_median_denoise_ms
-            )
+            summary.median_denoise_ms, scenario.expected_median_denoise_ms
+        )
         ):
             is_improved = True
         # Combine metrics, always taking the better (lower) value
@@ -318,7 +315,7 @@ Consider updating perf_baselines.json with the snippets below:
                 safe_get_metric(scenario.denoise_step_ms, step),
             )
             for step in set(summary.all_denoise_steps.keys())
-            | set(scenario.denoise_step_ms)
+                        | set(scenario.denoise_step_ms)
         }
 
         # Check for stage-level improvements
