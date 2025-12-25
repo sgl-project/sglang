@@ -1493,28 +1493,7 @@ class ModelRunner:
 
         return result
 
-    def profile_max_num_token(self, total_gpu_memory: int):
-        available_gpu_memory = get_available_gpu_memory(
-            self.device,
-            self.gpu_id,
-            distributed=get_world_group().world_size > 1,
-            cpu_group=get_world_group().cpu_group,
-        )
-
-        # Get the number of layers used for KV cache calculation
-        if self.is_draft_worker:
-            num_layers = getattr(
-                self.model_config.hf_config,
-                "num_nextn_predict_layers",
-                self.num_effective_layers,
-            )
-        elif mambaish := self.mambaish_config:
-            num_layers = len(mambaish.full_attention_layer_ids)
-        elif self.model_config.full_attention_layer_ids:
-            num_layers = len(self.model_config.full_attention_layer_ids)
-        else:
-            num_layers = self.num_effective_layers
-
+    def get_kv_cache_cell_size(self, num_layers: int) -> int:
         if self.use_mla_backend:
             cell_size = (
                 (self.model_config.kv_lora_rank + self.model_config.qk_rope_head_dim)
@@ -1582,6 +1561,32 @@ class ModelRunner:
                     * len(self.model_config.swa_attention_layer_ids)
                     * torch._utils._element_size(self.kv_cache_dtype)
                 )
+        return cell_size
+
+    def profile_max_num_token(self, total_gpu_memory: int):
+        available_gpu_memory = get_available_gpu_memory(
+            self.device,
+            self.gpu_id,
+            distributed=get_world_group().world_size > 1,
+            cpu_group=get_world_group().cpu_group,
+        )
+
+        # Get the number of layers used for KV cache calculation
+        if self.is_draft_worker:
+            num_layers = getattr(
+                self.model_config.hf_config,
+                "num_nextn_predict_layers",
+                self.num_effective_layers,
+            )
+        elif mambaish := self.mambaish_config:
+            num_layers = len(mambaish.full_attention_layer_ids)
+        elif self.model_config.full_attention_layer_ids:
+            num_layers = len(self.model_config.full_attention_layer_ids)
+        else:
+            num_layers = self.num_effective_layers
+
+        cell_size = self.get_kv_cache_cell_size(num_layers)
+
         rest_memory = available_gpu_memory - total_gpu_memory * (
             1 - self.mem_fraction_static
         )
