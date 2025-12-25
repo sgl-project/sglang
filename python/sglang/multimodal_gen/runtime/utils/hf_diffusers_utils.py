@@ -390,6 +390,10 @@ def maybe_download_model(
         logger.info("Found model in cache at %s", local_path)
         return str(local_path)
     except LocalEntryNotFoundError:
+        if not download:
+            raise ValueError(
+                f"Model {model_name_or_path} not found in local cache and download=False."
+            )
         logger.info("Model not found in cache, will download from HF Hub")
     except Exception as e:
         logger.warning(
@@ -397,7 +401,10 @@ def maybe_download_model(
             model_name_or_path,
             e,
         )
-
+        if not download:
+            raise ValueError(
+                f"Error checking cache for {model_name_or_path} and download=False: {e}"
+            ) from e
     # 3. Download strategy (with retry mechanism)
     MAX_RETRIES = 3
     for attempt in range(MAX_RETRIES):
