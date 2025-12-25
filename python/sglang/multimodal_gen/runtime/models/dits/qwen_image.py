@@ -778,7 +778,6 @@ class QwenImageTransformer2DModel(CachableDiT):
             self.rotary_emb = QwenEmbedLayer3DRope(
                 theta=10000, axes_dim=list(axes_dims_rope), scale_rope=True
             )
-            print(f"749 {self.rotary_emb=}", flush=True)
 
         self.time_text_embed = QwenTimestepProjEmbeddings(embedding_dim=self.inner_dim)
         self.time_text_embed = QwenTimestepProjEmbeddings(

@@ -1051,7 +1051,6 @@ class DenoisingStage(PipelineStage):
                 (denoising_end_time - denoising_start_time) / len(timesteps),
             )
 
-
         self._post_denoising_loop(
             batch=batch,
             latents=latents,

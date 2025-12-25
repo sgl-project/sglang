@@ -487,7 +487,6 @@ class QwenImageLayeredPipelineConfig(QwenImageEditPipelineConfig):
 
         img_shapes = batch.img_shapes
         txt_seq_lens = batch.txt_seq_lens
-        print(f"494 {device=}", flush=True)
         
         (img_cos, img_sin), (txt_cos, txt_sin) = (
             QwenImageEditPlusPipelineConfig.get_freqs_cis(
@@ -550,12 +549,8 @@ class QwenImageLayeredPipelineConfig(QwenImageEditPipelineConfig):
             height,
             width,
         ) = self._unpad_and_unpack_latents(latents, batch)
-        print(f"515 {latents.shape=}", flush=True)
         b, c, f, h, w = latents.shape
-        print(f"517 {b=}, {c=}, {f=}, {h=}, {w=}", flush=True)
         latents = latents[:, :, 1:]  # remove the first frame as it is the origin input
-        print(f"519 {latents.shape=}", flush=True)
         latents = latents.permute(0, 2, 1, 3, 4).view(-1, c, 1, h, w)
-        print(f"521 {latents.shape=}", flush=True)
         # latents = latents.reshape(batch_size, channels // (2 * 2), 1, height, width)
         return latents
