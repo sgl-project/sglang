@@ -3420,7 +3420,7 @@ def check_cuda_result(raw_output):
     return results
 
 
-def get_physical_device_id() -> int:
+def get_physical_device_id(pytorch_device_id: int) -> int:
     """
     Convert PyTorch logical device ID to physical device ID.
 
@@ -3434,12 +3434,13 @@ def get_physical_device_id() -> int:
     Returns:
         The physical device ID
     """
+    device_idx = int(pytorch_device_id)
     cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES", None)
     if cuda_visible_devices:
         device_list = cuda_visible_devices.split(",")
-        return int(device_list[pytorch_device_id])
+        return int(device_list[device_idx])
     else:
-        return pytorch_device_id
+        return device_idx
 
 
 def get_device_sm_nvidia_smi():
