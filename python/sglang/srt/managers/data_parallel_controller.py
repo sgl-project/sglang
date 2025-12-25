@@ -533,7 +533,10 @@ class DataParallelController:
                 req.bootstrap_room is not None
             ), "req.bootstrap_room should not be None. Do not send requests directly to prefill or decode instances, but send to the router instead."
             target_rank = req.bootstrap_room % len(self.workers)
-            self.workers[target_rank].send_pyobj(req)
+            self.workers[target_rank].send_multipart(
+                msg, copy=False
+            )
+
 
     def decode_round_robin_scheduler(self, req: Req):
         if self.maybe_external_dp_rank_routing(req):
