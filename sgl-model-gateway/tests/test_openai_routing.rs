@@ -89,6 +89,7 @@ fn create_minimal_completion_request() -> CompletionRequest {
         return_hidden_states: false,
         sampling_seed: None,
         other: serde_json::Map::new(),
+        routing_id: None,
     }
 }
 
@@ -639,6 +640,7 @@ async fn test_unsupported_endpoints() {
         return_bytes: false,
         return_entropy: false,
         rid: None,
+        routing_id: None,
     };
 
     let response = router.route_generate(None, &generate_request, None).await;
