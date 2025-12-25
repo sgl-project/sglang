@@ -10,6 +10,7 @@ import httpx
 from fastapi import UploadFile
 
 from sglang.multimodal_gen.runtime.entrypoints.utils import post_process_sample
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 from sglang.multimodal_gen.runtime.scheduler_client import AsyncSchedulerClient
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
     init_logger,
