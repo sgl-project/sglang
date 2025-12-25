@@ -15,8 +15,8 @@ class SchedulerEnhancer:
         self.cpu_group = tp_worker.get_tp_group().cpu_group
         self.max_running_requests = max_running_requests
         self.stable_count = 0
-        # If scheduling is performed 30 times and some dp units are still at full load, the prefill-prioritized scheduling strategy will still be used.
-        self.max_stable_count = 30
+        # If scheduling is performed 200 times and some dp units are still at full load, the prefill-prioritized scheduling strategy will still be used.
+        self.max_stable_count = 200
         assert (
             server_args.schedule_policy == "fcfs"
         ), f"To use SCHEDULER_DECREASE_PREFILL_IDLE, schedule_policy must be 'fcfs'. '{self.schedule_policy}' is not supported."
