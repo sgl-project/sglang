@@ -125,8 +125,6 @@ class DiffusionServerArgs:
     lora_path: str | None = None  # LoRA adapter path (HF repo or local path)
     # torch compile
     enable_torch_compile: bool = False  # enable torch.compile optimization
-    # testing
-    force_lazy_loading: bool = False  # force lazy-loading mode for testing
 
 
 @dataclass(frozen=True)
@@ -252,24 +250,13 @@ ONE_GPU_CASES_A: list[DiffusionTestCase] = [
         T2I_sampling_params,
     ),
     DiffusionTestCase(
-        "flux_image_t2i_torch_compile",
-        DiffusionServerArgs(
-            model_path="black-forest-labs/FLUX.1-dev",
-            modality="image",
-            warmup_text=1,
-            warmup_edit=0,
-            enable_torch_compile=True,
-            force_lazy_loading=True,
-        ),
-        T2I_sampling_params,
-    ),
-    DiffusionTestCase(
         "flux_image_t2i",
         DiffusionServerArgs(
             model_path="black-forest-labs/FLUX.1-dev",
             modality="image",
             warmup_text=1,
             warmup_edit=0,
+            enable_torch_compile=True,
         ),
         T2I_sampling_params,
     ),

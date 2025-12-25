@@ -317,9 +317,6 @@ class ServerArgs:
     )
     override_transformer_cls_name: str | None = None
 
-    # Testing and debugging
-    force_lazy_loading: bool = False  # Force lazy-loading mode for testing
-
     # # DMD parameters
     # dmd_denoising_steps: List[int] | None = field(default=None)
 
@@ -360,14 +357,6 @@ class ServerArgs:
                     "Failed to load V-MoBA config from %s: %s", self.moba_config_path, e
                 )
                 raise
-
-        # Force lazy-loading mode for testing
-        if self.force_lazy_loading:
-            self.model_loaded = {
-                "transformer": False,
-                "vae": False,
-            }
-            logger.info("Forced lazy-loading mode enabled for testing")
 
         self.check_server_args()
 
@@ -558,12 +547,6 @@ class ServerArgs:
             default=ServerArgs.enable_torch_compile,
             help="Use torch.compile to speed up DiT inference."
             + "However, will likely cause precision drifts. See (https://github.com/pytorch/pytorch/issues/145213)",
-        )
-        parser.add_argument(
-            "--force-lazy-loading",
-            action=StoreBoolean,
-            default=ServerArgs.force_lazy_loading,
-            help="Force lazy-loading mode for testing (sets model_loaded to False)",
         )
         parser.add_argument(
             "--dit-cpu-offload",
