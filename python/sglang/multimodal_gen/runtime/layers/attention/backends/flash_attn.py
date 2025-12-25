@@ -166,28 +166,15 @@ class FlashAttentionImpl(AttentionImpl):
                     device=q_.device,
                     dtype=torch.int32,
                 )
-                try:
-                    out = flash_attn_varlen_func_upstream(
-                        q_,
-                        k_,
-                        v_,
-                        cu,
-                        cu,
-                        seqlen,
-                        seqlen,
-                        softmax_scale=self.softmax_scale,
-                        causal=self.causal,
-                    )
-                except TypeError:
-                    out = flash_attn_varlen_func_upstream(
-                        q_,
-                        k_,
-                        v_,
-                        cu,
-                        cu,
-                        seqlen,
-                        seqlen,
-                    )
+                out = flash_attn_varlen_func_upstream(
+                    q_,
+                    k_,
+                    v_,
+                    cu,
+                    cu,
+                    seqlen,
+                    seqlen,
+                )
                 return out.reshape(bsz, seqlen, nheads_q, d)
 
         output = flash_attn_func(

@@ -350,20 +350,24 @@ class QwenImageCrossAttention(nn.Module):
             alt_stream = _get_qwen_image_qk_norm_alt_stream(device_index)
             cur_stream = torch.cuda.current_stream(device=img_query.device)
 
-            alt_stream.wait_stream(cur_stream)
+            start_event = torch.cuda.Event()
+            done_event = torch.cuda.Event()
+            start_event.record(cur_stream)
+            alt_stream.wait_event(start_event)
 
             with torch.cuda.stream(alt_stream):
+                if self.norm_added_q is not None:
+                    txt_query = self.norm_added_q(txt_query)
                 if self.norm_added_k is not None:
                     txt_key = self.norm_added_k(txt_key)
-                if self.norm_k is not None:
-                    img_key = self.norm_k(img_key)
+                done_event.record(alt_stream)
 
             if self.norm_q is not None:
                 img_query = self.norm_q(img_query)
-            if self.norm_added_q is not None:
-                txt_query = self.norm_added_q(txt_query)
+            if self.norm_k is not None:
+                img_key = self.norm_k(img_key)
 
-            cur_stream.wait_stream(alt_stream)
+            cur_stream.wait_event(done_event)
         else:
             if self.norm_q is not None:
                 img_query = self.norm_q(img_query)
@@ -391,11 +395,10 @@ class QwenImageCrossAttention(nn.Module):
                 q_4d: torch.Tensor, k_4d: torch.Tensor, cache: torch.Tensor
             ):
                 bsz, seqlen, nheads, d = q_4d.shape
-                positions = torch.arange(seqlen, device="cpu", dtype=torch.long).to(
-                    q_4d.device, non_blocking=True
-                )
 
+                pos_1d = torch.arange(seqlen, device="cpu", dtype=torch.long)
                 if bsz == 1:
+                    positions = pos_1d.to(q_4d.device, non_blocking=True)
                     q2 = q_4d.squeeze(0).reshape(seqlen, nheads * d).contiguous()
                     k2 = k_4d.squeeze(0).reshape(seqlen, nheads * d).contiguous()
                     apply_rope_with_cos_sin_cache_inplace(
@@ -408,57 +411,27 @@ class QwenImageCrossAttention(nn.Module):
                     )
                     return q2.view(1, seqlen, nheads, d), k2.view(1, seqlen, nheads, d)
 
-                q_out = torch.empty_like(q_4d)
-                k_out = torch.empty_like(k_4d)
-                for b in range(bsz):
-                    q2 = q_4d[b].reshape(seqlen, nheads * d).contiguous()
-                    k2 = k_4d[b].reshape(seqlen, nheads * d).contiguous()
-                    apply_rope_with_cos_sin_cache_inplace(
-                        positions=positions,
-                        query=q2,
-                        key=k2,
-                        head_size=d,
-                        cos_sin_cache=cache,
-                        is_neox=False,
-                    )
-                    q_out[b] = q2.view(seqlen, nheads, d)
-                    k_out[b] = k2.view(seqlen, nheads, d)
-                return q_out, k_out
+                positions = pos_1d.repeat(bsz).to(q_4d.device, non_blocking=True)
+                q2 = q_4d.reshape(bsz * seqlen, nheads * d).contiguous()
+                k2 = k_4d.reshape(bsz * seqlen, nheads * d).contiguous()
+                apply_rope_with_cos_sin_cache_inplace(
+                    positions=positions,
+                    query=q2,
+                    key=k2,
+                    head_size=d,
+                    cos_sin_cache=cache,
+                    is_neox=False,
+                )
+                return q2.view(bsz, seqlen, nheads, d), k2.view(bsz, seqlen, nheads, d)
 
             img_query, img_key = _apply_flashinfer_rope(img_query, img_key, img_cache)
             txt_query, txt_key = _apply_flashinfer_rope(txt_query, txt_key, txt_cache)
 
         # Concatenate for joint attention
         # Order: [text, image]
-        bsz = img_query.shape[0]
-        if bsz == 1:
-            txt_q3 = txt_query.squeeze(0)
-            img_q3 = img_query.squeeze(0)
-            txt_k3 = txt_key.squeeze(0)
-            img_k3 = img_key.squeeze(0)
-            txt_v3 = txt_value.squeeze(0)
-            img_v3 = img_value.squeeze(0)
-
-            if not txt_q3.is_contiguous():
-                txt_q3 = txt_q3.contiguous()
-            if not img_q3.is_contiguous():
-                img_q3 = img_q3.contiguous()
-            if not txt_k3.is_contiguous():
-                txt_k3 = txt_k3.contiguous()
-            if not img_k3.is_contiguous():
-                img_k3 = img_k3.contiguous()
-            if not txt_v3.is_contiguous():
-                txt_v3 = txt_v3.contiguous()
-            if not img_v3.is_contiguous():
-                img_v3 = img_v3.contiguous()
-
-            joint_query = torch.cat([txt_q3, img_q3], dim=0).unsqueeze(0)
-            joint_key = torch.cat([txt_k3, img_k3], dim=0).unsqueeze(0)
-            joint_value = torch.cat([txt_v3, img_v3], dim=0).unsqueeze(0)
-        else:
-            joint_query = torch.cat([txt_query, img_query], dim=1)
-            joint_key = torch.cat([txt_key, img_key], dim=1)
-            joint_value = torch.cat([txt_value, img_value], dim=1)
+        joint_query = torch.cat([txt_query, img_query], dim=1)
+        joint_key = torch.cat([txt_key, img_key], dim=1)
+        joint_value = torch.cat([txt_value, img_value], dim=1)
 
         # Compute joint attention
         joint_hidden_states = self.attn(
