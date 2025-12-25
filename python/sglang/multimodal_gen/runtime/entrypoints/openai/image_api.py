@@ -1,6 +1,7 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
 import base64
+import dataclasses
 import os
 import time
 from typing import List, Optional
@@ -20,14 +21,16 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
 from sglang.multimodal_gen.runtime.entrypoints.openai.stores import IMAGE_STORE
 from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     _parse_size,
-    _save_upload_to_path,
+    merge_image_input_list,
     process_generation_batch,
+    save_image_to_path,
 )
 from sglang.multimodal_gen.runtime.entrypoints.utils import prepare_request
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
-from sglang.multimodal_gen.runtime.scheduler_client import scheduler_client
+from sglang.multimodal_gen.runtime.scheduler_client import async_scheduler_client
 from sglang.multimodal_gen.runtime.server_args import get_global_server_args
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.utils import shallow_asdict
 
 router = APIRouter(prefix="/v1/images", tags=["images"])
 logger = init_logger(__name__)
@@ -52,7 +55,13 @@ def _build_sampling_params_from_request(
     size: Optional[str],
     output_format: Optional[str],
     background: Optional[str],
-    image_path: Optional[str] = None,
+    image_path: Optional[list[str]] = None,
+    seed: Optional[int] = None,
+    generator_device: Optional[str] = None,
+    negative_prompt: Optional[str] = None,
+    guidance_scale: Optional[float] = None,
+    num_inference_steps: Optional[int] = None,
+    enable_teacache: Optional[bool] = None,
 ) -> SamplingParams:
     if size is None:
         width, height = None, None
@@ -73,26 +82,19 @@ def _build_sampling_params_from_request(
         save_output=True,
         server_args=server_args,
         output_file_name=f"{request_id}.{ext}",
+        seed=seed,
+        generator_device=generator_device,
+        guidance_scale=guidance_scale,
+        num_inference_steps=num_inference_steps,
+        enable_teacache=enable_teacache,
+        **({"negative_prompt": negative_prompt} if negative_prompt is not None else {}),
     )
     return sampling_params
 
 
 def _build_req_from_sampling(s: SamplingParams) -> Req:
-    return Req(
-        request_id=s.request_id,
-        data_type=s.data_type,
-        prompt=s.prompt,
-        image_path=s.image_path,
-        height=s.height,
-        width=s.width,
-        fps=1,
-        num_frames=s.num_frames,
-        seed=s.seed,
-        output_path=s.output_path,
-        output_file_name=s.output_file_name,
-        num_outputs_per_prompt=s.num_outputs_per_prompt,
-        save_output=s.save_output,
-    )
+    req_fields = {f.name for f in dataclasses.fields(Req)}
+    return Req(**{k: v for k, v in shallow_asdict(s).items() if k in req_fields})
 
 
 @router.post("/generations", response_model=ImageResponse)
@@ -107,13 +109,22 @@ async def generations(
         size=request.size,
         output_format=request.output_format,
         background=request.background,
+        seed=request.seed,
+        generator_device=request.generator_device,
+        negative_prompt=request.negative_prompt,
+        guidance_scale=request.guidance_scale,
+        num_inference_steps=request.num_inference_steps,
+        enable_teacache=request.enable_teacache,
     )
     batch = prepare_request(
         server_args=get_global_server_args(),
         sampling_params=sampling,
     )
+
     # Run synchronously for images and save to disk
-    save_file_path = await process_generation_batch(scheduler_client, batch)
+    save_file_path, result = await process_generation_batch(
+        async_scheduler_client, batch
+    )
 
     await IMAGE_STORE.upsert(
         request_id,
@@ -128,14 +139,17 @@ async def generations(
     if resp_format == "b64_json":
         with open(save_file_path, "rb") as f:
             b64 = base64.b64encode(f.read()).decode("utf-8")
-        return ImageResponse(
-            data=[
+        response_kwargs = {
+            "data": [
                 ImageResponseData(
                     b64_json=b64,
                     revised_prompt=request.prompt,
                 )
             ]
-        )
+        }
+        if result.peak_memory_mb and result.peak_memory_mb > 0:
+            response_kwargs["peak_memory_mb"] = result.peak_memory_mb
+        return ImageResponse(**response_kwargs)
     else:
         # Return error, not supported
         raise HTTPException(
@@ -147,6 +161,8 @@ async def generations(
 async def edits(
     image: Optional[List[UploadFile]] = File(None),
     image_array: Optional[List[UploadFile]] = File(None, alias="image[]"),
+    url: Optional[List[str]] = Form(None),
+    url_array: Optional[List[str]] = Form(None, alias="url[]"),
     prompt: str = Form(...),
     mask: Optional[UploadFile] = File(None),
     model: Optional[str] = Form(None),
@@ -155,20 +171,41 @@ async def edits(
     size: Optional[str] = Form(None),
     output_format: Optional[str] = Form(None),
     background: Optional[str] = Form("auto"),
+    seed: Optional[int] = Form(1024),
+    generator_device: Optional[str] = Form("cuda"),
     user: Optional[str] = Form(None),
+    negative_prompt: Optional[str] = Form(None),
+    guidance_scale: Optional[float] = Form(None),
+    num_inference_steps: Optional[int] = Form(None),
+    enable_teacache: Optional[bool] = Form(False),
 ):
     request_id = generate_request_id()
     # Resolve images from either `image` or `image[]` (OpenAI SDK sends `image[]` when list is provided)
     images = image or image_array
-    if not images or len(images) == 0:
-        raise HTTPException(status_code=422, detail="Field 'image' is required")
+    urls = url or url_array
 
-    # Save first input image; additional images or mask are not yet used by the pipeline
+    if (not images or len(images) == 0) and (not urls or len(urls) == 0):
+        raise HTTPException(
+            status_code=422, detail="Field 'image' or 'url' is required"
+        )
+
+    # Save all input images; additional images beyond the first are saved for potential future use
     uploads_dir = os.path.join("outputs", "uploads")
     os.makedirs(uploads_dir, exist_ok=True)
-    first_image = images[0]
-    input_path = os.path.join(uploads_dir, f"{request_id}_{first_image.filename}")
-    await _save_upload_to_path(first_image, input_path)
+    image_list = merge_image_input_list(images, urls)
+
+    input_paths = []
+    try:
+        for idx, img in enumerate(image_list):
+            filename = img.filename if hasattr(img, "filename") else f"image_{idx}"
+            input_path = await save_image_to_path(
+                img, os.path.join(uploads_dir, f"{request_id}_{idx}_{filename}")
+            )
+            input_paths.append(input_path)
+    except Exception as e:
+        raise HTTPException(
+            status_code=400, detail=f"Failed to process image source: {str(e)}"
+        )
 
     sampling = _build_sampling_params_from_request(
         request_id=request_id,
@@ -177,11 +214,19 @@ async def edits(
         size=size,
         output_format=output_format,
         background=background,
-        image_path=input_path,
+        image_path=input_paths,
+        seed=seed,
+        generator_device=generator_device,
+        negative_prompt=negative_prompt,
+        guidance_scale=guidance_scale,
+        num_inference_steps=num_inference_steps,
+        enable_teacache=enable_teacache,
     )
     batch = _build_req_from_sampling(sampling)
 
-    save_file_path = await process_generation_batch(scheduler_client, batch)
+    save_file_path, result = await process_generation_batch(
+        async_scheduler_client, batch
+    )
 
     await IMAGE_STORE.upsert(
         request_id,
@@ -189,6 +234,8 @@ async def edits(
             "id": request_id,
             "created_at": int(time.time()),
             "file_path": save_file_path,
+            "input_image_paths": input_paths,  # Store all input image paths
+            "num_input_images": len(input_paths),
         },
     )
 
@@ -196,12 +243,18 @@ async def edits(
     if (response_format or "b64_json").lower() == "b64_json":
         with open(save_file_path, "rb") as f:
             b64 = base64.b64encode(f.read()).decode("utf-8")
-        return ImageResponse(
-            data=[ImageResponseData(b64_json=b64, revised_prompt=prompt)]
-        )
+        response_kwargs = {
+            "data": [ImageResponseData(b64_json=b64, revised_prompt=prompt)]
+        }
+        if result.peak_memory_mb and result.peak_memory_mb > 0:
+            response_kwargs["peak_memory_mb"] = result.peak_memory_mb
+        return ImageResponse(**response_kwargs)
     else:
         url = f"/v1/images/{request_id}/content"
-        return ImageResponse(data=[ImageResponseData(url=url, revised_prompt=prompt)])
+        response_kwargs = {"data": [ImageResponseData(url=url, revised_prompt=prompt)]}
+        if result.peak_memory_mb and result.peak_memory_mb > 0:
+            response_kwargs["peak_memory_mb"] = result.peak_memory_mb
+        return ImageResponse(**response_kwargs)
 
 
 @router.get("/{image_id}/content")

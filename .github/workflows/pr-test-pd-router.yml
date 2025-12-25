@@ -6,19 +6,23 @@ on:
     paths:
       - 'python/sglang/srt/disaggregation/**'
       - 'scripts/ci/ci_start_disaggregation_servers.sh'
-      - 'sgl-router/**'
+      - 'sgl-model-gateway/**'
   pull_request:
     branches: [ main ]
     types: [opened, synchronize, reopened, labeled]
     paths:
       - 'python/sglang/srt/disaggregation/**'
       - 'scripts/ci/ci_start_disaggregation_servers.sh'
-      - 'sgl-router/**'
+      - 'sgl-model-gateway/**'
   workflow_dispatch:
 
 concurrency:
   group: test-disaggregation-${{ github.ref }}
   cancel-in-progress: true
+
+env:
+  RUSTC_WRAPPER: sccache
+  SCCACHE_GHA_ENABLED: "true"
 
 permissions:
   contents: read
@@ -50,18 +54,19 @@ jobs:
       run: |
         bash scripts/ci/ci_install_rust.sh
 
-    - name: Cache Rust dependencies
-      uses: actions/cache@v4
+    - name: Configure sccache
+      uses: mozilla-actions/sccache-action@v0.0.9
       with:
-        path: |
-          ~/.cargo/bin/
-          ~/.cargo/registry/index/
-          ~/.cargo/registry/cache/
-          ~/.cargo/git/db/
-          sgl-router/target/
-        key: ${{ runner.os }}-cargo-${{ hashFiles('sgl-router/Cargo.lock') }}
-        restore-keys: |
-          ${{ runner.os }}-cargo-
+        version: "v0.12.0"
+
+    - name: Rust cache
+      uses: Swatinem/rust-cache@v2
+      with:
+        workspaces: sgl-model-gateway
+        shared-key: "rust-cache"
+        cache-all-crates: true
+        cache-on-failure: true
+        save-if: true
 
     - name: Cache pip dependencies
       uses: actions/cache@v4
@@ -147,11 +152,11 @@ jobs:
         python3 -m pip --no-cache-dir install mooncake-transfer-engine==0.3.7.post2
         python3 -m pip --no-cache-dir install --user --force-reinstall genai-bench==0.0.2
 
-    - name: Build and install sgl-router
+    - name: Build and install sgl-model-gateway
       run: |
         source "$HOME/.cargo/env"
-        echo "Building sgl-router..."
-        cd sgl-router/bindings/python
+        echo "Building sgl-model-gateway..."
+        cd sgl-model-gateway/bindings/python
         pip install maturin
         maturin build --release --out dist --features vendored-openssl
         pip install --force-reinstall dist/*.whl

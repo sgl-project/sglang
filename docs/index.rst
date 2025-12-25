@@ -23,6 +23,7 @@ Its core features include:
 
    basic_usage/send_request.ipynb
    basic_usage/openai_api.rst
+   basic_usage/ollama_api.md
    basic_usage/offline_engine_api.ipynb
    basic_usage/native_api.ipynb
    basic_usage/sampling_params.md
@@ -41,14 +42,17 @@ Its core features include:
    advanced_features/tool_parser.ipynb
    advanced_features/separate_reasoning.ipynb
    advanced_features/quantization.md
+   advanced_features/quantized_kv_cache.md
    advanced_features/expert_parallelism.md
    advanced_features/lora.ipynb
    advanced_features/pd_disaggregation.md
+   advanced_features/epd_disaggregation.md
+   advanced_features/pipeline_parallelism.md
    advanced_features/hicache.rst
    advanced_features/pd_multiplexing.md
    advanced_features/vlm_query.ipynb
    advanced_features/dp_for_multi_modal_encoder.md
-   advanced_features/router.md
+   advanced_features/sgl_model_gateway.md
    advanced_features/deterministic_inference.md
    advanced_features/observability.md
    advanced_features/checkpoint_engine.md
@@ -59,6 +63,7 @@ Its core features include:
 
    supported_models/generative_models.md
    supported_models/multimodal_language_models.md
+   supported_models/diffusion_language_models.md
    supported_models/embedding_models.md
    supported_models/reward_models.md
    supported_models/rerank_models.md
@@ -66,6 +71,7 @@ Its core features include:
    supported_models/support_new_models.md
    supported_models/transformers_fallback.md
    supported_models/modelscope.md
+   supported_models/mindspore_models.md
 
 .. toctree::
    :maxdepth: 1

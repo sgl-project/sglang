@@ -16,12 +16,16 @@ The definition of objects transferred between different
 processes (TokenizerManager, DetokenizerManager, Scheduler).
 """
 
+from __future__ import annotations
+
 import copy
 import uuid
 from abc import ABC
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Union
+
+import torch
 
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.schedule_batch import BaseFinishReason
@@ -93,6 +97,10 @@ class RequestTimingMetricsMixin:
     # Calculated as: prefill_end_time_host - prefill_start_time_host
     prefill_launch_latency: Optional[List[Optional[float]]]
 
+    # Prefill finished time: timestamp when prefill phase completes (wall clock time).
+    # This marks when the prefill computation finishes.
+    prefill_finished_ts: Optional[List[Optional[float]]]
+
 
 @dataclass
 class SpeculativeDecodingMetricsMixin:
@@ -108,6 +116,23 @@ class SpeculativeDecodingMetricsMixin:
 
     # Accepted tokens: Number of accepted tokens during speculative decoding
     spec_accepted_tokens: List[int]
+
+
+@dataclass
+class APIServingTimingMixin:
+    # Validation step duration
+    validation_time: Optional[float] = None
+
+    # For metrics
+    received_time: Optional[float] = None
+
+    # Perf_counter equivalents for accurate time calculations
+    received_time_perf: Optional[float] = None
+
+
+_API_SERVING_TIMING_MIXIN_FIELDS = tuple(
+    APIServingTimingMixin.__dataclass_fields__.keys()
+)
 
 
 # Parameters for a session
@@ -138,7 +163,7 @@ MultimodalDataInputFormat = Union[
 
 
 @dataclass
-class GenerateReqInput(BaseReq):
+class GenerateReqInput(BaseReq, APIServingTimingMixin):
     # The input prompt. It can be a single prompt or a batch of prompts.
     text: Optional[Union[List[str], str]] = None
     # The token ids for text; one can specify either text or input_ids
@@ -175,6 +200,8 @@ class GenerateReqInput(BaseReq):
     log_metrics: bool = True
     # Whether to return hidden states
     return_hidden_states: Union[List[bool], bool] = False
+    # Whether to return captured routed experts
+    return_routed_experts: bool = False
 
     # The modalities of the image data [image, multi-images, video]
     modalities: Optional[List[str]] = None
@@ -196,9 +223,10 @@ class GenerateReqInput(BaseReq):
     bootstrap_port: Optional[Union[List[Optional[int]], int]] = None
     bootstrap_room: Optional[Union[List[int], int]] = None
     bootstrap_pair_key: Optional[Union[List[str], str]] = None
+    decode_tp_size: Optional[Union[List[Optional[int]], int]] = None
 
-    # Validation step duration
-    validation_time: Optional[float] = None
+    # Require reasoning for the request (hybrid reasoning model only)
+    require_reasoning: bool = False
 
     # For data parallel rank routing
     data_parallel_rank: Optional[int] = None
@@ -226,6 +254,10 @@ class GenerateReqInput(BaseReq):
 
     # Whether to return entropy
     return_entropy: bool = False
+
+    # For EPD-disaggregated inference
+    need_wait_for_image: Optional[bool] = None
+    num_items_assigned: Optional[List] = None
 
     def contains_mm_input(self) -> bool:
         return (
@@ -592,6 +624,7 @@ class GenerateReqInput(BaseReq):
                 if isinstance(self.return_hidden_states, list)
                 else self.return_hidden_states
             ),
+            return_routed_experts=self.return_routed_experts,
             modalities=self.modalities[i] if self.modalities else None,
             session_params=self.session_params,
             lora_path=self.lora_path[i] if self.lora_path is not None else None,
@@ -616,7 +649,9 @@ class GenerateReqInput(BaseReq):
                 if self.bootstrap_pair_key is not None
                 else None
             ),
-            validation_time=self.validation_time,
+            decode_tp_size=(
+                self.decode_tp_size[i] if self.decode_tp_size is not None else None
+            ),
             data_parallel_rank=(
                 self.data_parallel_rank if self.data_parallel_rank is not None else None
             ),
@@ -628,6 +663,10 @@ class GenerateReqInput(BaseReq):
             return_bytes=self.return_bytes,
             return_entropy=self.return_entropy,
             http_worker_ipc=self.http_worker_ipc,
+            **{
+                field: getattr(self, field)
+                for field in _API_SERVING_TIMING_MIXIN_FIELDS
+            },
         )
 
 
@@ -655,6 +694,9 @@ class TokenizedGenerateReqInput(BaseReq):
     # Whether to return hidden states
     return_hidden_states: bool = False
 
+    # Whether to return captured routed experts
+    return_routed_experts: bool = False
+
     # The input embeds
     input_embeds: Optional[Union[List[List[List[float]]], List[List[float]]]] = None
 
@@ -674,6 +716,10 @@ class TokenizedGenerateReqInput(BaseReq):
     bootstrap_port: Optional[int] = None
     bootstrap_room: Optional[int] = None
     bootstrap_pair_key: Optional[str] = None
+    decode_tp_size: Optional[int] = None
+
+    # Require reasoning for the request (hybrid reasoning model only)
+    require_reasoning: bool = False
 
     # For data parallel rank routing
     data_parallel_rank: Optional[int] = None
@@ -696,6 +742,9 @@ class TokenizedGenerateReqInput(BaseReq):
     # Whether to return entropy
     return_entropy: bool = False
 
+    need_wait_for_image: bool = False
+    num_items_assigned: Optional[List] = None
+
 
 @dataclass
 class BatchTokenizedGenerateReqInput(BaseBatchReq):
@@ -713,7 +762,7 @@ class BatchTokenizedGenerateReqInput(BaseBatchReq):
 
 
 @dataclass
-class EmbeddingReqInput(BaseReq):
+class EmbeddingReqInput(BaseReq, APIServingTimingMixin):
     # The input prompt. It can be a single prompt or a batch of prompts.
     text: Optional[Union[List[List[str]], List[str], str]] = None
     # The image input. It can be an image instance, file name, URL, or base64 encoded string.
@@ -829,9 +878,12 @@ class EmbeddingReqInput(BaseReq):
             video_data=self.video_data[i] if self.video_data is not None else None,
             sampling_params=self.sampling_params[i],
             rid=self.rid[i],
-            validation_time=self.validation_time,
             dimensions=self.dimensions,
             http_worker_ipc=self.http_worker_ipc,
+            **{
+                field: getattr(self, field)
+                for field in _API_SERVING_TIMING_MIXIN_FIELDS
+            },
         )
 
 
@@ -910,6 +962,9 @@ class BatchTokenIDOutput(
     # Hidden states
     output_hidden_states: List[List[float]]
 
+    # The routed experts for each output token
+    output_routed_experts: List[torch.Tensor]
+
     # The information of placeholder tokens (e.g., image token)
     # idx is the index of the token in the prompt after expansion.
     # val is the length of padded tokens after expansion.
@@ -921,6 +976,9 @@ class BatchTokenIDOutput(
 
     # The trainer step id. Used to know which step's weights are used for sampling.
     token_steps: List[List[int]] = None
+
+    # Load for DP balance
+    load: GetLoadReqOutput = None
 
 
 @dataclass
@@ -989,6 +1047,9 @@ class BatchStrOutput(
     # Hidden states
     output_hidden_states: List[List[float]]
 
+    # The routed experts for each output token
+    output_routed_experts: List[List[int]]
+
     # The information of placeholder tokens (e.g., image token)
     # idx is the index of the token in the prompt after expansion.
     # val is the length of padded tokens after expansion.
@@ -1000,6 +1061,9 @@ class BatchStrOutput(
 
     # The trainer step id. Used to know which step's weights are used for sampling.
     token_steps: List[List[int]] = None
+
+    # Load for DP balance
+    load: GetLoadReqOutput = None
 
 
 @dataclass
@@ -1429,6 +1493,7 @@ class FreezeGCReq(BaseReq):
 class ConfigureLoggingReq(BaseReq):
     log_requests: Optional[bool] = None
     log_requests_level: Optional[int] = None
+    log_requests_format: Optional[str] = None
     dump_requests_folder: Optional[str] = None
     dump_requests_threshold: Optional[int] = None
     crash_dump_folder: Optional[str] = None
@@ -1585,6 +1650,7 @@ class GetLoadReqOutput(BaseReq):
     num_reqs: int
     num_waiting_reqs: int
     num_tokens: int
+    ts_tic: float
 
 
 @dataclass

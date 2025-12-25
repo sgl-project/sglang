@@ -6,7 +6,6 @@ Uses GrpcRequestManager for orchestration without tokenization.
 import asyncio
 import dataclasses
 import logging
-import multiprocessing as mp
 import os
 import signal
 import threading
@@ -22,6 +21,7 @@ from grpc_health.v1 import health_pb2_grpc
 from grpc_reflection.v1alpha import reflection
 
 import sglang
+from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST, DisaggregationMode
 from sglang.srt.grpc import sglang_scheduler_pb2, sglang_scheduler_pb2_grpc
 from sglang.srt.grpc.grpc_request_manager import GrpcRequestManager
@@ -321,7 +321,8 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
             max_context_length=self.model_info["max_context_length"],
             vocab_size=self.model_info["vocab_size"],
             supports_vision=self.model_info["supports_vision"],
-            model_type=self.model_info["model_type"],
+            model_type=self.model_info.get("model_type") or "",
+            architectures=self.model_info.get("architectures") or [],
             eos_token_ids=self.model_info["eos_token_ids"],
             pad_token_id=self.model_info["pad_token_id"],
             bos_token_id=self.model_info["bos_token_id"],
@@ -454,10 +455,22 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
         input_text = grpc_req.tokenized.original_text
         input_ids = list(grpc_req.tokenized.input_ids)
 
+        # Convert sampling params
+        sampling_params = self._convert_sampling_params(grpc_req.sampling_params)
+
+        # For embedding requests, max_new_tokens should be 0.
+        # The scheduler logic expects an integer, not None.
+        sampling_params.max_new_tokens = 0
+
+        sampling_params.normalize(tokenizer=None)
+
         return TokenizedEmbeddingReqInput(
             rid=grpc_req.request_id,
             input_text=input_text,
             input_ids=input_ids,
+            image_inputs={"mm_items": []},
+            token_type_ids=list(grpc_req.token_type_ids),
+            sampling_params=sampling_params,
         )
 
     def _convert_sampling_params(
@@ -718,7 +731,10 @@ async def serve_grpc(
         server_args=server_args,
     )
 
-    # Update model info from scheduler info
+    # Load model config to get HF config info (same as TokenizerManager does)
+    model_config = ModelConfig.from_server_args(server_args)
+
+    # Update model info from scheduler info and model config
     if model_info is None:
         model_info = {
             "model_name": server_args.model_path,
@@ -727,7 +743,8 @@ async def serve_grpc(
             ),
             "vocab_size": scheduler_info.get("vocab_size", 128256),
             "supports_vision": scheduler_info.get("supports_vision", False),
-            "model_type": scheduler_info.get("model_type", "transformer"),
+            "model_type": getattr(model_config.hf_config, "model_type", None),
+            "architectures": getattr(model_config.hf_config, "architectures", None),
             "max_req_input_len": scheduler_info.get("max_req_input_len", 8192),
             "eos_token_ids": scheduler_info.get("eos_token_ids", []),
             "pad_token_id": scheduler_info.get("pad_token_id", 0),
@@ -786,7 +803,7 @@ async def serve_grpc(
     # Start warmup in a separate thread
     warmup_thread = threading.Thread(
         target=_wait_and_warmup_grpc,
-        args=(server_args, None, health_servicer),
+        args=(server_args, health_servicer),
     )
     warmup_thread.start()
 
@@ -834,10 +851,7 @@ async def serve_grpc(
         logger.info("All scheduler processes terminated")
 
 
-def _execute_grpc_server_warmup(
-    server_args: ServerArgs,
-    pipe_finish_writer: Optional[mp.connection.Connection],
-):
+def _execute_grpc_server_warmup(server_args: ServerArgs):
     """Execute warmup for gRPC server by checking health and sending test request."""
     try:
         # Connect to the gRPC server
@@ -868,8 +882,6 @@ def _execute_grpc_server_warmup(
         if not success:
             error_msg = f"gRPC server warmup failed: Could not connect to server after 120 seconds. Last error: {last_error}"
             logger.error(error_msg)
-            if pipe_finish_writer is not None:
-                pipe_finish_writer.send(error_msg)
             channel.close()
             kill_process_tree(os.getpid())
             return False
@@ -932,8 +944,6 @@ def _execute_grpc_server_warmup(
             except Exception as e:
                 error_msg = f"gRPC warmup request failed: {e}"
                 logger.error(error_msg)
-                if pipe_finish_writer is not None:
-                    pipe_finish_writer.send(error_msg)
                 channel.close()
                 kill_process_tree(os.getpid())
                 return False
@@ -960,8 +970,6 @@ def _execute_grpc_server_warmup(
             except Exception as e:
                 error_msg = f"gRPC warmup request failed: {e}"
                 logger.error(error_msg)
-                if pipe_finish_writer is not None:
-                    pipe_finish_writer.send(error_msg)
                 channel.close()
                 kill_process_tree(os.getpid())
                 return False
@@ -974,8 +982,6 @@ def _execute_grpc_server_warmup(
             f"gRPC warmup failed with exception: {e}\n{get_exception_traceback()}"
         )
         logger.error(error_msg)
-        if pipe_finish_writer is not None:
-            pipe_finish_writer.send(error_msg)
         try:
             channel.close()
         except Exception:
@@ -986,12 +992,11 @@ def _execute_grpc_server_warmup(
 
 def _wait_and_warmup_grpc(
     server_args: ServerArgs,
-    pipe_finish_writer: Optional[mp.connection.Connection],
     health_servicer: Optional[SGLangHealthServicer] = None,
 ):
     """Wait for gRPC server to be ready and execute warmup."""
     if not server_args.skip_server_warmup:
-        if not _execute_grpc_server_warmup(server_args, pipe_finish_writer):
+        if not _execute_grpc_server_warmup(server_args):
             return
     else:
         logger.info("Skipping gRPC server warmup (skip_server_warmup=True)")
@@ -1001,6 +1006,3 @@ def _wait_and_warmup_grpc(
         health_servicer.set_serving()
 
     logger.info("The server is fired up and ready to roll!")
-
-    if pipe_finish_writer is not None:
-        pipe_finish_writer.send("ready")

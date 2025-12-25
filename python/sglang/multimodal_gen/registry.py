@@ -11,7 +11,6 @@ import dataclasses
 import importlib
 import os
 import pkgutil
-import re
 from functools import lru_cache
 from typing import Any, Callable, Dict, List, Optional, Tuple, Type
 
@@ -30,6 +29,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.flux import Flux2PipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
     QwenImageEditPipelineConfig,
+    QwenImageEditPlusPipelineConfig,
     QwenImagePipelineConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.wan import (
@@ -44,7 +44,10 @@ from sglang.multimodal_gen.configs.sample.hunyuan import (
     FastHunyuanSamplingParam,
     HunyuanSamplingParams,
 )
-from sglang.multimodal_gen.configs.sample.qwenimage import QwenImageSamplingParams
+from sglang.multimodal_gen.configs.sample.qwenimage import (
+    QwenImageEditPlusSamplingParams,
+    QwenImageSamplingParams,
+)
 from sglang.multimodal_gen.configs.sample.stepvideo import StepVideoT2VSamplingParams
 from sglang.multimodal_gen.configs.sample.wan import (
     FastWanT2V480PConfig,
@@ -158,6 +161,13 @@ def register_configs(
             _MODEL_NAME_DETECTORS.append((model_id, detector))
 
 
+def get_model_short_name(model_id: str) -> str:
+    if "/" in model_id:
+        return model_id.split("/")[-1]
+    else:
+        return model_id
+
+
 def _get_config_info(model_path: str) -> Optional[ConfigInfo]:
     """
     Gets the ConfigInfo for a given model path using mappings and detectors.
@@ -169,14 +179,16 @@ def _get_config_info(model_path: str) -> Optional[ConfigInfo]:
         return _CONFIG_REGISTRY.get(model_id)
 
     # 2. Partial match: find the best (longest) match against all registered model hf paths.
-    cleaned_model_path = re.sub(r"--", "/", model_path.lower())
+    model_name = get_model_short_name(model_path.lower())
     all_model_hf_paths = sorted(_MODEL_HF_PATH_TO_NAME.keys(), key=len, reverse=True)
-    for model_hf_path in all_model_hf_paths:
-        if model_hf_path.lower() in cleaned_model_path:
+    for registered_model_hf_id in all_model_hf_paths:
+        registered_model_name = get_model_short_name(registered_model_hf_id.lower())
+
+        if registered_model_name == model_name:
             logger.debug(
-                f"Resolved model name '{model_hf_path}' from partial path match."
+                f"Resolved model name '{registered_model_hf_id}' from partial path match."
             )
-            model_id = _MODEL_HF_PATH_TO_NAME[model_hf_path]
+            model_id = _MODEL_HF_PATH_TO_NAME[registered_model_hf_id]
             return _CONFIG_REGISTRY.get(model_id)
 
     # 3. Use detectors
@@ -417,6 +429,18 @@ def _register_configs():
         sampling_param_cls=QwenImageSamplingParams,
         pipeline_config_cls=QwenImageEditPipelineConfig,
         hf_model_paths=["Qwen/Qwen-Image-Edit"],
+    )
+
+    register_configs(
+        sampling_param_cls=QwenImageEditPlusSamplingParams,
+        pipeline_config_cls=QwenImageEditPlusPipelineConfig,
+        hf_model_paths=["Qwen/Qwen-Image-Edit-2509"],
+    )
+
+    register_configs(
+        sampling_param_cls=QwenImageEditPlusSamplingParams,
+        pipeline_config_cls=QwenImageEditPlusPipelineConfig,
+        hf_model_paths=["Qwen/Qwen-Image-Edit-2511"],
     )
 
 

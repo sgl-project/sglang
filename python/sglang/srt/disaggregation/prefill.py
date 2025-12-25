@@ -55,7 +55,6 @@ from sglang.srt.mem_cache.memory_pool import (
     SWAKVPool,
 )
 from sglang.srt.tracing.trace import trace_event_batch, trace_slice, trace_slice_end
-from sglang.srt.utils import broadcast_pyobj, point_to_point_pyobj
 
 if TYPE_CHECKING:
     from torch.distributed import ProcessGroup
@@ -109,6 +108,13 @@ class PrefillBootstrapQueue:
         self.scheduler = scheduler
         self.transfer_backend = transfer_backend
         self.kv_manager = self._init_kv_manager()
+
+        if self.scheduler.tp_worker.is_hybrid_swa:
+            # FIXME: current SWA allocation allocate full kv cache size in prefill
+            self.max_total_num_tokens = min(
+                self.max_total_num_tokens,
+                self.scheduler.tp_worker.model_runner.swa_max_total_num_tokens,
+            )
 
     def _init_kv_manager(self) -> BaseKVManager:
         kv_args_class = get_kv_class(self.transfer_backend, KVClassType.KVARGS)
@@ -252,8 +258,6 @@ class PrefillBootstrapQueue:
                 # if req not in reqs_info_to_check, skip
                 if req.rid not in rids_to_check:
                     continue
-                # Either waiting for input or failed
-                assert poll == KVPoll.WaitingForInput or poll == KVPoll.Failed
 
             if poll == KVPoll.Bootstrapping:
                 continue
@@ -314,6 +318,10 @@ class SchedulerDisaggregationPrefillMixin:
     def get_next_disagg_prefill_batch_to_run(
         self: Scheduler,
     ) -> Optional[ScheduleBatch]:
+        # HACK (byronhsu): reset the batch_is_full flag because we never enter update_running_batch which resets it
+        # Otherwise, it hangs under high concurrency
+        self.running_batch.batch_is_full = False
+
         self.process_prefill_chunk()
 
         batch = self.get_new_batch_prefill()
@@ -330,14 +338,18 @@ class SchedulerDisaggregationPrefillMixin:
         """A normal scheduler loop for prefill worker in disaggregation mode."""
 
         while True:
+            # Receive requests
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
             self.waiting_queue.extend(
                 self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
             )
+
+            # Get the next batch to run
             batch = self.get_next_disagg_prefill_batch_to_run()
             self.cur_batch = batch
 
+            # Launch the current batch
             if batch:
                 result = self.run_batch(batch)
                 self.process_batch_result_disagg_prefill(batch, result)
@@ -346,43 +358,48 @@ class SchedulerDisaggregationPrefillMixin:
 
             self.process_disagg_prefill_inflight_queue()
 
+            # Update last_batch
             self.last_batch = batch
-            # HACK (byronhsu): reset the batch_is_full flag because we never enter update_running_batch which resets it
-            # Otherwise, it hangs under high concurrency
-            self.running_batch.batch_is_full = False
 
     @torch.no_grad()
     def event_loop_overlap_disagg_prefill(self: Scheduler) -> None:
         self.result_queue = deque()
 
         while True:
+            # Receive requests
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
             self.waiting_queue.extend(
                 self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
             )
+
+            # Get the next batch to run
             batch = self.get_next_disagg_prefill_batch_to_run()
             self.cur_batch = batch
 
-            batch_result = None
+            # Launch the current batch
             if batch:
                 batch_result = self.run_batch(batch)
                 self.result_queue.append((batch.copy(), batch_result))
+            else:
+                batch_result = None
 
+            # Process the last batch
             if self.last_batch:
                 tmp_batch, tmp_result = self.result_queue.popleft()
                 self.process_batch_result_disagg_prefill(tmp_batch, tmp_result)
             elif batch is None:
+                # When the server is idle, do self-check and re-init some states
                 self.self_check_during_idle()
 
             self.process_disagg_prefill_inflight_queue()
 
+            # Run sample of the current batch
+            # It depends on the result of the last batch (e.g., grammar), so we run it after the last batch is processed.
             self.launch_batch_sample_if_needed(batch_result)
 
+            # Update last_batch
             self.last_batch = batch
-            # HACK (byronhsu): reset the batch_is_full flag because we never enter update_running_batch which resets it
-            # Otherwise, it hangs under high concurrency
-            self.running_batch.batch_is_full = False
 
     def process_batch_result_disagg_prefill(
         self: Scheduler,
@@ -423,11 +440,13 @@ class SchedulerDisaggregationPrefillMixin:
                     logits_output.input_token_logprobs.tolist()
                 )
 
-        hidden_state_offset = 0
         for i, (req, next_token_id) in enumerate(
             zip(batch.reqs, next_token_ids, strict=True)
         ):
             if req.is_chunked <= 0:
+                if req.time_stats.prefill_finished_ts == 0.0:
+                    req.time_stats.prefill_finished_ts = time.time()
+
                 # There is no output_ids for prefill
                 req.output_ids.append(next_token_id)
                 self.tree_cache.cache_unfinished_req(req)  # update the tree and lock
@@ -710,36 +729,3 @@ class SchedulerDisaggregationPrefillMixin:
             )
             return
         req.disagg_kv_sender.send(page_indices, state_indices)
-
-    def send_pyobj_to_next_stage(self, data):
-        if self.attn_tp_rank == 0:
-            dp_offset = self.attn_dp_rank * self.attn_tp_size
-            point_to_point_pyobj(
-                data,
-                self.pp_rank * self.tp_size + dp_offset,
-                self.world_group.device_group,
-                self.pp_rank * self.tp_size + dp_offset,
-                ((self.pp_rank + 1) % self.pp_size) * self.tp_size + dp_offset,
-            )
-
-    def recv_pyobj_from_prev_stage(self):
-        if self.attn_tp_rank == 0:
-            dp_offset = self.attn_dp_rank * self.attn_tp_size
-            data = point_to_point_pyobj(
-                [],
-                self.pp_rank * self.tp_size + dp_offset,
-                self.world_group.device_group,
-                ((self.pp_rank - 1) % self.pp_size) * self.tp_size + dp_offset,
-                self.pp_rank * self.tp_size + dp_offset,
-            )
-        else:
-            data = None
-
-        if self.attn_tp_size != 1:
-            data = broadcast_pyobj(
-                data,
-                self.attn_tp_group.rank,
-                self.attn_tp_cpu_group,
-                src=self.attn_tp_group.ranks[0],
-            )
-        return data

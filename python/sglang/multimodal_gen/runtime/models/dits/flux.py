@@ -43,53 +43,27 @@ from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
     _apply_rotary_emb,
 )
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
-from sglang.multimodal_gen.runtime.platforms import (
-    AttentionBackendEnum,
-    current_platform,
-)
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)  # pylint: disable=invalid-name
 
 
-def _get_projections(attn: "FluxAttention", hidden_states, encoder_hidden_states=None):
-    query, _ = attn.to_q(hidden_states)
-    key, _ = attn.to_k(hidden_states)
-    value, _ = attn.to_v(hidden_states)
-
-    encoder_query = encoder_key = encoder_value = None
-    if encoder_hidden_states is not None and attn.added_kv_proj_dim is not None:
-        encoder_query, _ = attn.add_q_proj(encoder_hidden_states)
-        encoder_key, _ = attn.add_k_proj(encoder_hidden_states)
-        encoder_value, _ = attn.add_v_proj(encoder_hidden_states)
-
-    return query, key, value, encoder_query, encoder_key, encoder_value
-
-
-def _get_fused_projections(
-    attn: "FluxAttention", hidden_states, encoder_hidden_states=None
-):
-    query, key, value = attn.to_qkv(hidden_states).chunk(3, dim=-1)
-
-    encoder_query = encoder_key = encoder_value = None
-    if encoder_hidden_states is not None and hasattr(attn, "to_added_qkv"):
-        encoder_query, encoder_key, encoder_value = attn.to_added_qkv(
-            encoder_hidden_states
-        ).chunk(3, dim=-1)
-
-    return query, key, value, encoder_query, encoder_key, encoder_value
-
-
 def _get_qkv_projections(
     attn: "FluxAttention", hidden_states, encoder_hidden_states=None
 ):
-    if attn.fused_projections:
-        return _get_fused_projections(attn, hidden_states, encoder_hidden_states)
-    return _get_projections(attn, hidden_states, encoder_hidden_states)
+    qkv, _ = attn.to_qkv(hidden_states)
+    query, key, value = qkv.chunk(3, dim=-1)
+
+    encoder_query = encoder_key = encoder_value = None
+    if encoder_hidden_states is not None and attn.added_kv_proj_dim is not None:
+        added_qkv, _ = attn.to_added_qkv(encoder_hidden_states)
+        encoder_query, encoder_key, encoder_value = added_qkv.chunk(3, dim=-1)
+
+    return query, key, value, encoder_query, encoder_key, encoder_value
 
 
 class FluxAttention(torch.nn.Module, AttentionModuleMixin):
-
     def __init__(
         self,
         query_dim: int,
@@ -120,11 +94,10 @@ class FluxAttention(torch.nn.Module, AttentionModuleMixin):
         self.added_proj_bias = added_proj_bias
 
         self.norm_q = RMSNorm(dim_head, eps=eps)
-
         self.norm_k = RMSNorm(dim_head, eps=eps)
-        self.to_q = ReplicatedLinear(query_dim, self.inner_dim, bias=bias)
-        self.to_k = ReplicatedLinear(query_dim, self.inner_dim, bias=bias)
-        self.to_v = ReplicatedLinear(query_dim, self.inner_dim, bias=bias)
+
+        # Use ReplicatedLinear for fused QKV projections
+        self.to_qkv = ReplicatedLinear(query_dim, self.inner_dim * 3, bias=bias)
 
         if not self.pre_only:
             self.to_out = torch.nn.ModuleList([])
@@ -137,14 +110,9 @@ class FluxAttention(torch.nn.Module, AttentionModuleMixin):
         if added_kv_proj_dim is not None:
             self.norm_added_q = RMSNorm(dim_head, eps=eps)
             self.norm_added_k = RMSNorm(dim_head, eps=eps)
-            self.add_q_proj = ReplicatedLinear(
-                added_kv_proj_dim, self.inner_dim, bias=added_proj_bias
-            )
-            self.add_k_proj = ReplicatedLinear(
-                added_kv_proj_dim, self.inner_dim, bias=added_proj_bias
-            )
-            self.add_v_proj = ReplicatedLinear(
-                added_kv_proj_dim, self.inner_dim, bias=added_proj_bias
+            # Use ReplicatedLinear for added (encoder) QKV projections
+            self.to_added_qkv = ReplicatedLinear(
+                added_kv_proj_dim, self.inner_dim * 3, bias=added_proj_bias
             )
             self.to_add_out = ReplicatedLinear(self.inner_dim, query_dim, bias=out_bias)
 
@@ -154,11 +122,6 @@ class FluxAttention(torch.nn.Module, AttentionModuleMixin):
             dropout_rate=0,
             softmax_scale=None,
             causal=False,
-            supported_attention_backends={
-                AttentionBackendEnum.FA,
-                AttentionBackendEnum.TORCH_SDPA,
-                AttentionBackendEnum.SAGE_ATTN,
-            },
         )
 
     def forward(
@@ -403,7 +366,8 @@ class FluxPosEmbed(nn.Module):
 
     def forward(self, ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         pos = ids.float()
-        # freqs_cos, freqs_sin = self.rope.forward(positions=pos)
+        # TODO: potential error: flux use n_axes = ids.shape[-1]
+        # see: https://github.com/huggingface/diffusers/blob/17c0e79dbdf53fb6705e9c09cc1a854b84c39249/src/diffusers/models/transformers/transformer_flux.py#L509
         freqs_cos, freqs_sin = self.rope.forward_uncached(pos=pos)
         return freqs_cos.contiguous().float(), freqs_sin.contiguous().float()
 
@@ -415,6 +379,8 @@ class FluxTransformer2DModel(CachableDiT):
     Reference: https://blackforestlabs.ai/announcing-black-forest-labs/
     """
 
+    param_names_mapping = FluxConfig().arch_config.param_names_mapping
+
     def __init__(self, config: FluxConfig, hf_config: dict[str, Any]) -> None:
         super().__init__(config=config, hf_config=hf_config)
         self.config = config.arch_config
@@ -425,6 +391,10 @@ class FluxTransformer2DModel(CachableDiT):
         self.inner_dim = (
             self.config.num_attention_heads * self.config.attention_head_dim
         )
+        self.dit_module_names = [
+            "transformer_blocks",
+            "single_transformer_blocks",
+        ]
 
         self.rotary_emb = FluxPosEmbed(theta=10000, axes_dim=self.config.axes_dims_rope)
 
@@ -530,23 +500,46 @@ class FluxTransformer2DModel(CachableDiT):
             ip_hidden_states = self.encoder_hid_proj(ip_adapter_image_embeds)
             joint_attention_kwargs.update({"ip_hidden_states": ip_hidden_states})
 
-        for index_block, block in enumerate(self.transformer_blocks):
-            encoder_hidden_states, hidden_states = block(
-                hidden_states=hidden_states,
-                encoder_hidden_states=encoder_hidden_states,
-                temb=temb,
-                freqs_cis=freqs_cis,
-                joint_attention_kwargs=joint_attention_kwargs,
-            )
-
-        for index_block, block in enumerate(self.single_transformer_blocks):
-            encoder_hidden_states, hidden_states = block(
-                hidden_states=hidden_states,
-                encoder_hidden_states=encoder_hidden_states,
-                temb=temb,
-                freqs_cis=freqs_cis,
-                joint_attention_kwargs=joint_attention_kwargs,
-            )
+        offload_mgr = getattr(self, "_layerwise_offload_manager", None)
+        if offload_mgr is not None and getattr(offload_mgr, "enabled", False):
+            for i, block in enumerate(self.transformer_blocks):
+                with offload_mgr.layer_scope(
+                    prefetch_layer_idx=i + 1,
+                    release_layer_idx=i,
+                    non_blocking=True,
+                ):
+                    encoder_hidden_states, hidden_states = block(
+                        hidden_states=hidden_states,
+                        encoder_hidden_states=encoder_hidden_states,
+                        temb=temb,
+                        freqs_cis=freqs_cis,
+                        joint_attention_kwargs=joint_attention_kwargs,
+                    )
+            for block in self.single_transformer_blocks:
+                encoder_hidden_states, hidden_states = block(
+                    hidden_states=hidden_states,
+                    encoder_hidden_states=encoder_hidden_states,
+                    temb=temb,
+                    freqs_cis=freqs_cis,
+                    joint_attention_kwargs=joint_attention_kwargs,
+                )
+        else:
+            for block in self.transformer_blocks:
+                encoder_hidden_states, hidden_states = block(
+                    hidden_states=hidden_states,
+                    encoder_hidden_states=encoder_hidden_states,
+                    temb=temb,
+                    freqs_cis=freqs_cis,
+                    joint_attention_kwargs=joint_attention_kwargs,
+                )
+            for block in self.single_transformer_blocks:
+                encoder_hidden_states, hidden_states = block(
+                    hidden_states=hidden_states,
+                    encoder_hidden_states=encoder_hidden_states,
+                    temb=temb,
+                    freqs_cis=freqs_cis,
+                    joint_attention_kwargs=joint_attention_kwargs,
+                )
 
         hidden_states = self.norm_out(hidden_states, temb)
 

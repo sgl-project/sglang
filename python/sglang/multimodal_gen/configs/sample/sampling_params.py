@@ -6,6 +6,7 @@ import dataclasses
 import hashlib
 import json
 import math
+import os
 import os.path
 import re
 import time
@@ -15,9 +16,8 @@ from dataclasses import dataclass
 from enum import Enum, auto
 from typing import Any
 
-from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.multimodal_gen.utils import align_to
+from sglang.multimodal_gen.utils import StoreBoolean
 
 logger = init_logger(__name__)
 
@@ -87,7 +87,7 @@ class SamplingParams:
     # All fields below are copied from ForwardBatch
 
     # Image inputs
-    image_path: str | None = None
+    image_path: str | list[str] | None = None
 
     # Text inputs
     prompt: str | list[str] | None = None
@@ -101,6 +101,7 @@ class SamplingParams:
     # Batch info
     num_outputs_per_prompt: int = 1
     seed: int = 1024
+    generator_device: str = "cuda"  # Device for random generator: "cuda" or "cpu"
 
     # Original dimensions (before VAE scaling)
     num_frames: int = 125
@@ -114,9 +115,15 @@ class SamplingParams:
     width_not_provided: bool = False
     fps: int = 24
 
+    # Resolution validation
+    supported_resolutions: list[tuple[int, int]] | None = (
+        None  # None means all resolutions allowed
+    )
+
     # Denoising parameters
-    num_inference_steps: int = 50
-    guidance_scale: float = 1.0
+    num_inference_steps: int = None
+    guidance_scale: float = None
+    guidance_scale_2: float = None
     guidance_rescale: float = 0.0
     boundary_ratio: float | None = None
 
@@ -125,7 +132,8 @@ class SamplingParams:
 
     # Profiling
     profile: bool = False
-    num_profiled_timesteps: int = 2
+    num_profiled_timesteps: int = 5
+    profile_all_stages: bool = False
 
     # Debugging
     debug: bool = False
@@ -136,6 +144,10 @@ class SamplingParams:
     return_frames: bool = False
     return_trajectory_latents: bool = False  # returns all latents for each timestep
     return_trajectory_decoded: bool = False  # returns decoded latents for each timestep
+    # if True, disallow user params to override subclass-defined protected fields
+    no_override_protected_fields: bool = False
+    # whether to adjust num_frames for multi-GPU friendly splitting (default: True)
+    adjust_frames: bool = True
 
     def _set_output_file_ext(self):
         # add extension if needed
@@ -182,29 +194,54 @@ class SamplingParams:
 
     def __post_init__(self) -> None:
         assert self.num_frames >= 1
-        self.data_type = DataType.VIDEO if self.num_frames > 1 else DataType.IMAGE
 
         if self.width is None:
             self.width_not_provided = True
-            self.width = 1280
         if self.height is None:
             self.height_not_provided = True
-            self.height = 720
+
+        self._validate()
+
+        # Allow env var to override num_inference_steps (for faster CI testing on AMD)
+        env_steps = os.environ.get("SGLANG_TEST_NUM_INFERENCE_STEPS")
+        if env_steps is not None and self.num_inference_steps is not None:
+            self.num_inference_steps = int(env_steps)
+
+    def _validate(self):
+        """
+        check if the sampling params is correct by itself
+        """
+        if self.prompt_path and not self.prompt_path.endswith(".txt"):
+            raise ValueError("prompt_path must be a txt file")
 
     def check_sampling_param(self):
         if self.prompt_path and not self.prompt_path.endswith(".txt"):
             raise ValueError("prompt_path must be a txt file")
 
+    def _validate_with_pipeline_config(self, pipeline_config):
+        """
+        check if the sampling params is compatible and valid with server_args
+        """
+        if pipeline_config.task_type.requires_image_input():
+            # requires image input
+            if self.image_path is None:
+                raise ValueError(
+                    f"Served model with task type '{pipeline_config.task_type.name}' requires an 'image_path' input, but none was provided"
+                )
+
     def _adjust(
         self,
-        server_args: ServerArgs,
+        server_args,
     ):
         """
         final adjustment, called after merged with user params
         """
+        # TODO: SamplingParams should not rely on ServerArgs
         pipeline_config = server_args.pipeline_config
         if not isinstance(self.prompt, str):
             raise TypeError(f"`prompt` must be a string, but got {type(self.prompt)}")
+
+        self.data_type = server_args.pipeline_config.task_type.data_type()
 
         # Process negative prompt
         if self.negative_prompt is not None and not self.negative_prompt.isspace():
@@ -219,12 +256,32 @@ class SamplingParams:
                 f"num_frames={self.num_frames}"
             )
 
+        # Validate resolution against pipeline-specific supported resolutions
+        if self.height is None and self.width is None:
+            if self.supported_resolutions is not None:
+                self.width, self.height = self.supported_resolutions[0]
+                logger.info(
+                    f"Resolution unspecified, using default: {self.supported_resolutions[0]}"
+                )
+
+        if self.height is not None and self.width is not None:
+            if self.supported_resolutions is not None:
+                if (self.width, self.height) not in self.supported_resolutions:
+                    supported_str = ", ".join(
+                        [f"{w}x{h}" for w, h in self.supported_resolutions]
+                    )
+                    error_msg = (
+                        f"Unsupported resolution: {self.width}x{self.height}. "
+                        f"Supported resolutions: {supported_str}"
+                    )
+                    logger.error(error_msg)
+                    raise ValueError(error_msg)
+
         if pipeline_config.task_type.is_image_gen():
             # settle num_frames
-            logger.debug(f"Setting num_frames to 1 because this is a image-gen model")
+            logger.debug(f"num_frames set to 1 for image generation model")
             self.num_frames = 1
-            self.data_type = DataType.IMAGE
-        else:
+        elif self.adjust_frames:
             # NOTE: We must apply adjust_num_frames BEFORE the SP alignment logic below.
             # If we apply it after, adjust_num_frames might modify the frame count
             # and break the divisibility constraint (alignment) required by num_gpus.
@@ -283,16 +340,6 @@ class SamplingParams:
                 self.num_frames = new_num_frames
 
         self._set_output_file_name()
-        self.log(server_args=server_args)
-
-    def update(self, source_dict: dict[str, Any]) -> None:
-        for key, value in source_dict.items():
-            if hasattr(self, key):
-                setattr(self, key, value)
-            else:
-                logger.exception("%s has no attribute %s", type(self).__name__, key)
-
-        self.__post_init__()
 
     @classmethod
     def from_pretrained(cls, model_path: str, **kwargs) -> "SamplingParams":
@@ -310,6 +357,8 @@ class SamplingParams:
         # TODO: refactor
         sampling_params._merge_with_user_params(user_sampling_params)
         sampling_params._adjust(server_args)
+
+        sampling_params._validate_with_pipeline_config(server_args.pipeline_config)
 
         return sampling_params
 
@@ -333,6 +382,8 @@ class SamplingParams:
             action="store_true",
             default=SamplingParams.enable_teacache,
         )
+
+        # profiling
         parser.add_argument(
             "--profile",
             action="store_true",
@@ -340,17 +391,26 @@ class SamplingParams:
             help="Enable torch profiler for denoising stage",
         )
         parser.add_argument(
-            "--debug",
-            action="store_true",
-            default=SamplingParams.debug,
-            help="",
-        )
-        parser.add_argument(
             "--num-profiled-timesteps",
             type=int,
             default=SamplingParams.num_profiled_timesteps,
             help="Number of timesteps to profile after warmup",
         )
+        parser.add_argument(
+            "--profile-all-stages",
+            action="store_true",
+            dest="profile_all_stages",
+            default=SamplingParams.profile_all_stages,
+            help="Used with --profile, profile all pipeline stages",
+        )
+
+        parser.add_argument(
+            "--debug",
+            action="store_true",
+            default=SamplingParams.debug,
+            help="",
+        )
+
         parser.add_argument(
             "--prompt",
             type=str,
@@ -392,6 +452,13 @@ class SamplingParams:
             type=int,
             default=SamplingParams.seed,
             help="Random seed for generation",
+        )
+        parser.add_argument(
+            "--generator-device",
+            type=str,
+            default=SamplingParams.generator_device,
+            choices=["cuda", "musa", "cpu"],
+            help="Device for random generator (cuda, musa or cpu). Default: cuda",
         )
         parser.add_argument(
             "--num-frames",
@@ -456,6 +523,13 @@ class SamplingParams:
             help="Classifier-free guidance scale",
         )
         parser.add_argument(
+            "--guidance-scale-2",
+            type=float,
+            default=SamplingParams.guidance_scale_2,
+            dest="guidance_scale_2",
+            help="Secondary guidance scale for dual-guidance models (e.g., Wan low-noise expert)",
+        )
+        parser.add_argument(
             "--guidance-rescale",
             type=float,
             default=SamplingParams.guidance_rescale,
@@ -488,8 +562,14 @@ class SamplingParams:
         parser.add_argument(
             "--image-path",
             type=str,
+            nargs="+",
             default=SamplingParams.image_path,
-            help="Path to input image for image-to-video generation",
+            help=(
+                "Path(s) to input image(s) for image-to-image / image-to-video "
+                "generation. For multiple images, pass them as space-separated "
+                "values, e.g.: "
+                '--image-path "img1.png" "img2.png"'
+            ),
         )
         parser.add_argument(
             "--moba-config-path",
@@ -509,6 +589,24 @@ class SamplingParams:
             default=SamplingParams.return_trajectory_decoded,
             help="Whether to return the decoded trajectory",
         )
+        parser.add_argument(
+            "--no-override-protected-fields",
+            action="store_true",
+            default=SamplingParams.no_override_protected_fields,
+            help=(
+                "If set, disallow user params to override fields defined in subclasses."
+            ),
+        )
+        parser.add_argument(
+            "--adjust-frames",
+            action=StoreBoolean,
+            default=SamplingParams.adjust_frames,
+            help=(
+                "Enable/disable adjusting num_frames to evenly split latent frames across GPUs "
+                "and satisfy model temporal constraints. If disabled, tokens might be padded for SP."
+                "Default: true. Examples: --adjust-frames, --adjust-frames true, --adjust-frames false."
+            ),
+        )
         return parser
 
     @classmethod
@@ -527,50 +625,39 @@ class SamplingParams:
             args.width = 1280
             args.height = 720
 
-        attrs = [attr.name for attr in dataclasses.fields(cls)]
+        sampling_params_fields = {attr.name for attr in dataclasses.fields(cls)}
+        args_attrs = set(vars(args).keys())
+        attrs = sampling_params_fields & args_attrs
         args.height_not_provided = False
         args.width_not_provided = False
-        return {attr: getattr(args, attr) for attr in attrs}
+        return {attr: getattr(args, attr) for attr in attrs if hasattr(args, attr)}
 
     def output_file_path(self):
         return os.path.join(self.output_path, self.output_file_name)
 
-    def _merge_with_user_params(self, user_params):
+    def _merge_with_user_params(self, user_params: "SamplingParams"):
         """
         Merges parameters from a user-provided SamplingParams object.
-
-        This method updates the current object with values from `user_params`,
-        but skips any fields that are explicitly defined in the current object's
-        subclass. This is to preserve model-specific optimal parameters.
-        It also skips fields that the user has not changed from the default
-        in `user_params`.
         """
         if user_params is None:
             return
 
-        # user is not allowed to modify any param defined in the SamplingParams subclass
-        subclass_defined_fields = set(type(self).__annotations__.keys())
+        predefined_fields = set(type(self).__annotations__.keys())
 
-        # Compare against current instance to avoid constructing a default instance
-        default_params = SamplingParams()
-
+        # global switch: if True, allow overriding protected fields
+        allow_override_protected = not user_params.no_override_protected_fields
         for field in dataclasses.fields(user_params):
             field_name = field.name
             user_value = getattr(user_params, field_name)
-            default_value = getattr(default_params, field_name)
+            default_class_value = getattr(SamplingParams, field_name)
 
-            # A field is considered user-modified if its value is different from
-            # the default, with an exception for `output_file_name` which is
-            # auto-generated with a random component.
-            is_user_modified = (
-                user_value != default_value
-                if field_name != "output_file_name"
-                else user_params.output_file_path is not None
-            )
-            if is_user_modified and field_name not in subclass_defined_fields:
-                if hasattr(self, field_name):
-                    setattr(self, field_name, user_value)
-
+            # A field is considered user-modified if its value is different from the default
+            is_user_modified = user_value != default_class_value
+            is_protected_field = field_name in predefined_fields
+            if is_user_modified and (
+                allow_override_protected or not is_protected_field
+            ):
+                setattr(self, field_name, user_value)
         self.height_not_provided = user_params.height_not_provided
         self.width_not_provided = user_params.width_not_provided
         self.__post_init__()
@@ -591,37 +678,6 @@ class SamplingParams:
 
     def output_file_path(self):
         return os.path.join(self.output_path, self.output_file_name)
-
-    def log(self, server_args: ServerArgs):
-        # TODO: in some cases (e.g., TI2I), height and weight might be undecided at this moment
-        if self.height:
-            target_height = align_to(self.height, 16)
-        else:
-            target_height = -1
-        if self.width:
-            target_width = align_to(self.width, 16)
-        else:
-            target_width = -1
-
-        # Log sampling parameters
-        debug_str = f"""Sampling params:
-                       width: {target_width}
-                      height: {target_height}
-                  num_frames: {self.num_frames}
-                      prompt: {self.prompt}
-                  neg_prompt: {self.negative_prompt}
-                        seed: {self.seed}
-                 infer_steps: {self.num_inference_steps}
-      num_outputs_per_prompt: {self.num_outputs_per_prompt}
-              guidance_scale: {self.guidance_scale}
-     embedded_guidance_scale: {server_args.pipeline_config.embedded_cfg_scale}
-                    n_tokens: {self.n_tokens}
-                  flow_shift: {server_args.pipeline_config.flow_shift}
-                  image_path: {self.image_path}
-                 save_output: {self.save_output}
-            output_file_path: {self.output_file_path()}
-        """  # type: ignore[attr-defined]
-        logger.info(debug_str)
 
 
 @dataclass
