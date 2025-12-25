@@ -1388,6 +1388,8 @@ def get_zmq_socket_on_host(
     socket = context.socket(socket_type)
     # Bind to random TCP port
     config_socket(socket, socket_type)
+    if host and host.find("[") != -1:
+        socket.setsockopt(zmq.IPV6, 1)
     bind_host = f"tcp://{host}" if host else "tcp://*"
     port = socket.bind_to_random_port(bind_host)
     return port, socket

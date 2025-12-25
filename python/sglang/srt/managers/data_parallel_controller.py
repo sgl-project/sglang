@@ -56,6 +56,7 @@ from sglang.srt.utils.common import (
     configure_ipv6,
     configure_logger,
     get_zmq_socket,
+    get_zmq_socket_on_host,
     kill_itself_when_parent_died,
     maybe_reindex_device_id,
 )
@@ -397,7 +398,13 @@ class DataParallelController:
         worker_ports = []
         if server_args.node_rank == 0:
             for dp_rank in range(server_args.dp_size):
-                port_and_socket = get_zmq_socket(self.context, zmq.PUSH)
+                if server_args.dist_init_addr is not None:
+                    dist_init_host_port = server_args.dist_init_addr.rsplit(":", 1)
+                    assert len(dist_init_host_port) == 2 and dist_init_host_port[1].isdigit(), "please provide --dist-init-addr as host:port of head node"
+                    port_and_socket = get_zmq_socket_on_host(self.context, zmq.PUSH, dist_init_host_port[0])
+                    del dist_init_host_port
+                else:
+                    port_and_socket = get_zmq_socket(self.context, zmq.PUSH)
                 worker_ports.append(port_and_socket[0])
                 self.workers[dp_rank] = port_and_socket[1]
                 logger.debug(f"Assigned port {port_and_socket[0]} to worker {dp_rank}")
