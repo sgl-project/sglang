@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 from dataclasses import dataclass
 from typing import Any
+from functools import lru_cache
 
 import torch
 
@@ -36,6 +37,17 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 logger = init_logger(__name__)
 
 fa_ver = 3
+
+
+@lru_cache(maxsize=128)
+def _get_cu_seqlens(device_index: int, bsz: int, seqlen: int) -> torch.Tensor:
+    return torch.arange(
+        0,
+        (bsz + 1) * seqlen,
+        step=seqlen,
+        device=torch.device("cuda", device_index),
+        dtype=torch.int32,
+    )
 
 
 def set_fa_ver(ver: int):
@@ -109,9 +121,19 @@ class FlashAttentionImpl(AttentionImpl):
         prefix: str = "",
         **extra_impl_args,
     ) -> None:
+        self.num_heads = num_heads
+        self.num_kv_heads = num_kv_heads
+        self.head_size = head_size
         self.causal = causal
         self.softmax_scale = softmax_scale
         self.attention_metadata = FlashAttentionMetadata()
+        if self.num_kv_heads is None:
+            self._upstream_heads_ok = True
+        else:
+            # For gqa, the num_heads must be a multiple of num_kv_heads
+            self._upstream_heads_ok = (
+                self.num_kv_heads > 0 and (self.num_heads % self.num_kv_heads) == 0
+            )
 
     def forward(
         self,
@@ -131,7 +153,9 @@ class FlashAttentionImpl(AttentionImpl):
         else:
             max_seqlen_q = query.shape[1]
             max_seqlen_k = key.shape[1]
-        use_upstream = flash_attn_varlen_func_upstream is not None
+        use_upstream = (
+            flash_attn_varlen_func_upstream is not None and self._upstream_heads_ok
+        )
 
         if use_upstream:
             if query.dim() != 4 or key.dim() != 4 or value.dim() != 4:
@@ -159,13 +183,7 @@ class FlashAttentionImpl(AttentionImpl):
                 q_ = query.contiguous().reshape(bsz * seqlen, nheads_q, d)
                 k_ = key.contiguous().reshape(bsz * seqlen, nheads_k, d)
                 v_ = value.contiguous().reshape(bsz * seqlen, nheads_v, d)
-                cu = torch.arange(
-                    0,
-                    (bsz + 1) * seqlen,
-                    step=seqlen,
-                    device=q_.device,
-                    dtype=torch.int32,
-                )
+                cu = _get_cu_seqlens(q_.device.index, bsz, seqlen)
                 out = flash_attn_varlen_func_upstream(
                     q_,
                     k_,
