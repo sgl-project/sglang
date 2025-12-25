@@ -335,6 +335,17 @@ def get_torch_distributed_backend() -> str:
         )
 
 
+def get_device(local_rank: int) -> torch.device:
+    if torch.cuda.is_available():
+        return torch.device("cuda", local_rank)
+    elif _is_musa():
+        return torch.device("musa", local_rank)
+    elif _is_mps():
+        return torch.device("mps")
+    else:
+        return torch.device("cpu")
+
+
 # cuda
 
 
