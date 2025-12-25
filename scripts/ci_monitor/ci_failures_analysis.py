@@ -881,8 +881,10 @@ class SGLangFailuresAnalyzer:
                 short_title = title.split("(")[0].strip()
                 if short_title and short_title[0].isdigit():
                     short_title = short_title.split(".", 1)[-1].strip()
+                # Get the max total_runs from recently_failed jobs to show the analysis window
+                max_total_runs = max(d["total_runs"] for _, d in recently_failed)
                 print(
-                    f"\n   📋 [{short_title}] No current failure streak, but had failures in recent runs: {len(recently_failed)} jobs"
+                    f"\n   📋 [{short_title}] No current failure streak, but had failures in the past {max_total_runs} runs - {len(recently_failed)} jobs"
                 )
                 print(
                     f"   {'Job Name':<38} {'Failures':<12} {'Fail Rate':<12} {'Total Runs':<12} {'Recent Runs (oldest → latest)':<30}"
@@ -1341,9 +1343,11 @@ class SGLangFailuresAnalyzer:
                     # Remove the leading number and period if present
                     if short_title and short_title[0].isdigit():
                         short_title = short_title.split(".", 1)[-1].strip()
+                    # Get the max total_runs from recently_failed jobs to show the analysis window
+                    max_total_runs = max(d["total_runs"] for _, d in recently_failed)
                     summary_lines.append("<details>")
                     summary_lines.append(
-                        f"<summary>📋 [{short_title}] No current failure streak, but had failures in recent runs - {len(recently_failed)} jobs</summary>"
+                        f"<summary>📋 [{short_title}] No current failure streak, but had failures in the past {max_total_runs} runs - {len(recently_failed)} jobs</summary>"
                     )
                     summary_lines.append("")
                     summary_lines.append(
