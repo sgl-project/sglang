@@ -5,7 +5,6 @@ from typing import ClassVar, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
-
 from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
