@@ -26,7 +26,7 @@ use crate::{
         metrics::{bool_to_static_str, metrics_labels, Metrics},
         otel_trace::inject_trace_context_http,
     },
-    policies::{LoadBalancingPolicy, PolicyRegistry, SelectWorkerInfo},
+    policies::{LoadBalancingPolicy, PolicyRegistry},
     protocols::{
         chat::{ChatCompletionRequest, ChatMessage, MessageContent},
         common::{InputIds, StringOrArray},
@@ -58,6 +58,7 @@ struct PDRequestContext<'a> {
     is_stream: bool,
     return_logprob: bool,
     request_text: Option<String>,
+    routing_id: Option<String>,
     model_id: Option<&'a str>,
 }
 
@@ -303,7 +304,11 @@ impl PDRouter {
                     let context = context.clone();
                     async move {
                         let (prefill, decode) = match self
-                            .select_pd_pair(context.request_text.as_deref(), context.model_id)
+                            .select_pd_pair(
+                                context.request_text.as_deref(),
+                                context.routing_id.as_deref(),
+                                context.model_id,
+                            )
                             .await
                         {
                             Ok(pair) => pair,
@@ -691,6 +696,7 @@ impl PDRouter {
     async fn select_pd_pair(
         &self,
         request_text: Option<&str>,
+        routing_id: Option<&str>,
         model_id: Option<&str>,
     ) -> Result<(Arc<dyn Worker>, Arc<dyn Worker>), String> {
         let effective_model_id = if !self.enable_igw { None } else { model_id };
@@ -725,19 +731,16 @@ impl PDRouter {
         let prefill_policy = self.policy_registry.get_prefill_policy();
         let decode_policy = self.policy_registry.get_decode_policy();
 
-        let prefill = Self::pick_worker_by_policy_arc(
-            &prefill_workers,
-            &*prefill_policy,
+        let info = crate::policies::SelectWorkerInfo {
             request_text,
-            "prefill",
-        )?;
+            routing_id,
+        };
 
-        let decode = Self::pick_worker_by_policy_arc(
-            &decode_workers,
-            &*decode_policy,
-            request_text,
-            "decode",
-        )?;
+        let prefill =
+            Self::pick_worker_by_policy_arc(&prefill_workers, &*prefill_policy, &info, "prefill")?;
+
+        let decode =
+            Self::pick_worker_by_policy_arc(&decode_workers, &*decode_policy, &info, "decode")?;
 
         // Record worker selection metrics (Layer 3)
         let model = model_id.unwrap_or("default");
@@ -760,7 +763,7 @@ impl PDRouter {
     fn pick_worker_by_policy_arc(
         workers: &[Arc<dyn Worker>],
         policy: &dyn LoadBalancingPolicy,
-        request_text: Option<&str>,
+        info: &crate::policies::SelectWorkerInfo,
         worker_type: &str,
     ) -> Result<Arc<dyn Worker>, String> {
         if workers.is_empty() {
@@ -784,7 +787,7 @@ impl PDRouter {
         }
 
         let selected_idx = policy
-            .select_worker(&available_workers, &SelectWorkerInfo { request_text })
+            .select_worker(&available_workers, info)
             .ok_or_else(|| {
                 format!(
                     "Policy {} failed to select a {} worker",
@@ -1120,7 +1123,7 @@ impl RouterTrait for PDRouter {
         // Note: This endpoint actually causes the model to generate tokens, so we only test one pair
 
         // Select a random worker pair using the policy
-        let (prefill, decode) = match self.select_pd_pair(None, None).await {
+        let (prefill, decode) = match self.select_pd_pair(None, None, None).await {
             Ok(pair) => pair,
             Err(e) => {
                 return error::service_unavailable(
@@ -1242,6 +1245,7 @@ impl RouterTrait for PDRouter {
             is_stream,
             return_logprob,
             request_text,
+            routing_id: body.routing_id.clone(),
             model_id,
         };
 
@@ -1283,6 +1287,7 @@ impl RouterTrait for PDRouter {
             is_stream,
             return_logprob,
             request_text,
+            routing_id: body.routing_id.clone(),
             model_id,
         };
 
@@ -1316,6 +1321,7 @@ impl RouterTrait for PDRouter {
             is_stream,
             return_logprob,
             request_text,
+            routing_id: body.routing_id.clone(),
             model_id,
         };
 
@@ -1328,7 +1334,6 @@ impl RouterTrait for PDRouter {
         body: &RerankRequest,
         model_id: Option<&str>,
     ) -> Response {
-        // Extract text for cache-aware routing
         let req_text = if self.policies_need_request_text() {
             Some(body.query.clone())
         } else {
@@ -1341,6 +1346,7 @@ impl RouterTrait for PDRouter {
             is_stream: false,
             return_logprob: false,
             request_text: req_text,
+            routing_id: body.routing_id.clone(),
             model_id,
         };
 
@@ -1405,7 +1411,7 @@ mod tests {
         router.worker_registry.register(Arc::from(healthy_worker));
         router.worker_registry.register(Arc::from(decode_worker));
 
-        let result = router.select_pd_pair(None, None).await;
+        let result = router.select_pd_pair(None, None, None).await;
 
         assert!(result.is_ok());
         let (prefill, _decode) = result.unwrap();
@@ -1418,7 +1424,7 @@ mod tests {
     async fn test_empty_worker_lists() {
         let router = create_test_pd_router();
 
-        let result = router.select_pd_pair(None, None).await;
+        let result = router.select_pd_pair(None, None, None).await;
 
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("No prefill workers available"));

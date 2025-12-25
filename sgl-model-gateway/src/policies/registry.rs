@@ -11,7 +11,7 @@ use tracing::{debug, info, warn};
 /// When the last worker of a model is removed, the policy mapping is cleaned up.
 use super::{
     BucketConfig, BucketPolicy, CacheAwareConfig, CacheAwarePolicy, LoadBalancingPolicy,
-    PowerOfTwoPolicy, RandomPolicy, RoundRobinPolicy,
+    ManualPolicy, PowerOfTwoPolicy, RandomPolicy, RoundRobinPolicy,
 };
 use crate::{config::types::PolicyConfig, core::Worker};
 
@@ -209,6 +209,7 @@ impl PolicyRegistry {
                 };
                 Arc::new(BucketPolicy::with_config(config))
             }
+            PolicyConfig::Manual => Arc::new(ManualPolicy::new()),
         }
     }
 
