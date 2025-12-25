@@ -440,11 +440,9 @@ impl ResponseProcessor {
             let routed_experts = complete.routed_experts().and_then(|bytes| {
                 match serde_json::from_slice::<Value>(bytes) {
                     Ok(value) => Some(value),
-                    Err(_) => {
-                        Some(serde_json::json!({
-                            "raw_bytes": general_purpose::STANDARD.encode(bytes)
-                        }))
-                    }
+                    Err(_) => Some(serde_json::json!({
+                        "raw_bytes": general_purpose::STANDARD.encode(bytes)
+                    })),
                 }
             });
 
