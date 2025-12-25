@@ -18,6 +18,9 @@ from sglang.multimodal_gen.configs.models.dits.qwenimage import QwenImageDitConf
 from sglang.multimodal_gen.runtime.layers.attention import USPAttention
 from sglang.multimodal_gen.runtime.layers.layernorm import LayerNorm, RMSNorm
 from sglang.multimodal_gen.runtime.layers.linear import ReplicatedLinear
+from sglang.multimodal_gen.runtime.layers.quantization.base_config import (
+    QuantizationConfig,
+)
 from sglang.multimodal_gen.runtime.layers.triton_ops import (
     apply_rotary_embedding,
     fuse_scale_shift_kernel,
@@ -247,6 +250,8 @@ class QwenImageCrossAttention(nn.Module):
         context_pre_only: bool = False,
         parallel_attention=False,
         out_dim: int = None,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ) -> None:
         assert dim % num_heads == 0
         super().__init__()
@@ -258,10 +263,17 @@ class QwenImageCrossAttention(nn.Module):
         self.eps = eps
         self.parallel_attention = parallel_attention
         self.added_kv_proj_dim = added_kv_proj_dim
+        self.prefix = prefix
 
         # Use ReplicatedLinear for fused QKV projections
         qkv_dim = num_heads * head_dim * 3
-        self.to_qkv = ReplicatedLinear(dim, qkv_dim, bias=True)
+        self.to_qkv = ReplicatedLinear(
+            dim,
+            qkv_dim,
+            bias=True,
+            quant_config=quant_config,
+            prefix=f"{prefix}.to_qkv",
+        )
 
         if self.qk_norm:
             self.norm_q = RMSNorm(head_dim, eps=eps) if qk_norm else nn.Identity()
@@ -272,17 +284,35 @@ class QwenImageCrossAttention(nn.Module):
 
         if added_kv_proj_dim is not None:
             # Use ReplicatedLinear for added (encoder) QKV projections
-            self.to_added_qkv = ReplicatedLinear(added_kv_proj_dim, qkv_dim, bias=True)
+            self.to_added_qkv = ReplicatedLinear(
+                added_kv_proj_dim,
+                qkv_dim,
+                bias=True,
+                quant_config=quant_config,
+                prefix=f"{prefix}.to_added_qkv",
+            )
 
         if context_pre_only is not None and not context_pre_only:
-            self.to_add_out = ReplicatedLinear(self.inner_dim, self.dim, bias=out_bias)
+            self.to_add_out = ReplicatedLinear(
+                self.inner_dim,
+                self.dim,
+                bias=out_bias,
+                quant_config=quant_config,
+                prefix=f"{prefix}.to_add_out",
+            )
         else:
             self.to_add_out = None
 
         if not pre_only:
             self.to_out = nn.ModuleList([])
             self.to_out.append(
-                ReplicatedLinear(self.inner_dim, self.dim, bias=out_bias)
+                ReplicatedLinear(
+                    self.inner_dim,
+                    self.dim,
+                    bias=out_bias,
+                    quant_config=quant_config,
+                    prefix=f"{prefix}.to_out.0",
+                )
             )
         else:
             self.to_out = None
@@ -318,7 +348,6 @@ class QwenImageCrossAttention(nn.Module):
         img_query, img_key, img_value, txt_query, txt_key, txt_value = (
             _get_qkv_projections(self, hidden_states, encoder_hidden_states)
         )
-
         # Reshape for multi-head attention
         img_query = img_query.unflatten(-1, (self.num_heads, -1))
         img_key = img_key.unflatten(-1, (self.num_heads, -1))
@@ -393,20 +422,28 @@ class QwenImageTransformerBlock(nn.Module):
         attention_head_dim: int,
         qk_norm: str = "rms_norm",
         eps: float = 1e-6,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
         zero_cond_t: bool = False,
     ):
         super().__init__()
+        self.prefix = prefix
 
         self.dim = dim
         self.num_attention_heads = num_attention_heads
         self.attention_head_dim = attention_head_dim
+        self.quant_config = quant_config
         self.zero_cond_t = zero_cond_t
 
         # Image processing modules
         self.img_mod = nn.Sequential(
             nn.SiLU(),
-            nn.Linear(
-                dim, 6 * dim, bias=True
+            ReplicatedLinear(
+                dim,
+                6 * dim,
+                bias=True,
+                quant_config=quant_config,
+                prefix=f"{prefix}.img_mod",
             ),  # For scale, shift, gate for norm1 and norm2
         )
         self.img_norm1 = LayerNorm(dim, elementwise_affine=False, eps=eps)
@@ -417,6 +454,8 @@ class QwenImageTransformerBlock(nn.Module):
             added_kv_proj_dim=dim,
             context_pre_only=False,
             head_dim=attention_head_dim,
+            quant_config=quant_config,
+            prefix=f"{prefix}.attn",
         )
         self.img_norm2 = LayerNorm(dim, eps=eps, elementwise_affine=False)
         self.img_mlp = FeedForward(
@@ -426,8 +465,12 @@ class QwenImageTransformerBlock(nn.Module):
         # Text processing modules
         self.txt_mod = nn.Sequential(
             nn.SiLU(),
-            nn.Linear(
-                dim, 6 * dim, bias=True
+            ReplicatedLinear(
+                dim,
+                6 * dim,
+                bias=True,
+                quant_config=quant_config,
+                prefix=f"{prefix}.txt_mod",
             ),  # For scale, shift, gate for norm1 and norm2
         )
         self.txt_norm1 = LayerNorm(dim, elementwise_affine=False, eps=eps)
@@ -436,6 +479,29 @@ class QwenImageTransformerBlock(nn.Module):
         self.txt_mlp = FeedForward(
             dim=dim, dim_out=dim, activation_fn="gelu-approximate"
         )
+
+        if (
+            quant_config is not None
+            and hasattr(quant_config, "get_name")
+            and quant_config.get_name() == "svdquant"
+        ):
+            try:
+                from nunchaku.models.attention import (  # type: ignore[import]
+                    NunchakuFeedForward,
+                )
+            except ImportError:
+                logger.warning(
+                    "NunchakuConfig provided but `nunchaku` package is not available; "
+                    "keeping standard FeedForward layers."
+                )
+            else:
+                nunchaku_kwargs = {
+                    "precision": quant_config.precision,
+                    "rank": quant_config.rank,
+                    "act_unsigned": quant_config.act_unsigned,
+                }
+                self.img_mlp = NunchakuFeedForward(self.img_mlp, **nunchaku_kwargs)
+                self.txt_mlp = NunchakuFeedForward(self.txt_mlp, **nunchaku_kwargs)
 
     def _modulate(self, x, mod_params, index=None):
         shift, scale, gate = mod_params.chunk(3, dim=-1)
@@ -460,17 +526,31 @@ class QwenImageTransformerBlock(nn.Module):
         joint_attention_kwargs: Optional[Dict[str, Any]] = None,
         modulate_index: Optional[List[int]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        # Get modulation parameters for both streams
-        img_mod_params = self.img_mod(temb)  # [B, 6*dim]
-
+        img_mod_params, _ = self.img_mod(temb)  # [B, 6*dim]
         if self.zero_cond_t:
             temb = torch.chunk(temb, 2, dim=0)[0]
-        txt_mod_params = self.txt_mod(temb)  # [B, 6*dim]
+        txt_mod_params, _ = self.txt_mod(temb)  # [B, 6*dim]
+
+        if (
+            self.quant_config is not None
+            and hasattr(self.quant_config, "get_name")
+            and self.quant_config.get_name() == "svdquant"
+        ):
+            # nunchaku's mod_params is [B, 6*dim] instead of [B, dim*6]
+            img_mod_params = (
+                img_mod_params.view(img_mod_params.shape[0], -1, 6)
+                .transpose(1, 2)
+                .reshape(img_mod_params.shape[0], -1)
+            )
+            txt_mod_params = (
+                txt_mod_params.view(txt_mod_params.shape[0], -1, 6)
+                .transpose(1, 2)
+                .reshape(txt_mod_params.shape[0], -1)
+            )
 
         # Split modulation parameters for norm1 and norm2
         img_mod1, img_mod2 = img_mod_params.chunk(2, dim=-1)  # Each [B, 3*dim]
         txt_mod1, txt_mod2 = txt_mod_params.chunk(2, dim=-1)  # Each [B, 3*dim]
-
         # Process image stream - norm1 + modulation
 
         img_normed = self.img_norm1(hidden_states)
@@ -543,6 +623,7 @@ class QwenImageTransformer2DModel(CachableDiT):
         self,
         config: QwenImageDitConfig,
         hf_config: dict[str, Any],
+        quant_config: Optional[QuantizationConfig] = None,
     ):
         super().__init__(config=config, hf_config=hf_config)
         patch_size = config.arch_config.patch_size
@@ -575,9 +656,11 @@ class QwenImageTransformer2DModel(CachableDiT):
                     dim=self.inner_dim,
                     num_attention_heads=num_attention_heads,
                     attention_head_dim=attention_head_dim,
+                    quant_config=quant_config,
+                    prefix=f"transformer_blocks.{layer_idx}",
                     zero_cond_t=zero_cond_t,
                 )
-                for _ in range(num_layers)
+                for layer_idx in range(num_layers)
             ]
         )
 

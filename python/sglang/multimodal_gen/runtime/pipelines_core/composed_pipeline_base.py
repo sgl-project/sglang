@@ -272,7 +272,6 @@ class ComposedPipelineBase(ABC):
         # all the component models used by the pipeline
         required_modules = self.required_config_modules
         logger.info("Loading required components: %s", required_modules)
-
         components = {}
         for module_name, (
             transformers_or_diffusers,
@@ -300,10 +299,10 @@ class ComposedPipelineBase(ABC):
             else:
                 load_module_name = module_name
 
-            # Use custom VAE path if provided, otherwise use default path
+            # Use custom VAE path if provided, otherwise use default path.
             if module_name == "vae" and server_args.vae_path is not None:
                 component_model_path = server_args.vae_path
-                # Download from HuggingFace Hub if path doesn't exist locally
+                # Download from HuggingFace Hub if path doesn't exist locally.
                 if not os.path.exists(component_model_path):
                     component_model_path = maybe_download_model(component_model_path)
                 logger.info(
@@ -313,12 +312,14 @@ class ComposedPipelineBase(ABC):
                 )
             else:
                 component_model_path = os.path.join(self.model_path, load_module_name)
+
             module = PipelineComponentLoader.load_module(
                 module_name=load_module_name,
                 component_model_path=component_model_path,
                 transformers_or_diffusers=transformers_or_diffusers,
                 server_args=server_args,
             )
+            logger.info("Loaded module %s from %s", module_name, component_model_path)
 
             if module_name in components:
                 logger.warning("Overwriting module %s", module_name)

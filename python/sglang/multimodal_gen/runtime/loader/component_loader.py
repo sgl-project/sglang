@@ -5,6 +5,7 @@
 import dataclasses
 import glob
 import importlib.util
+import inspect
 import json
 import os
 import time
@@ -624,6 +625,126 @@ class VAELoader(ComponentLoader):
 class TransformerLoader(ComponentLoader):
     """Loader for transformer."""
 
+    def _patch_nunchaku_wtscale(
+        self,
+        model: nn.Module,
+        safetensors_list: list[str],
+        quant_config: Any,
+    ) -> None:
+        """Patch SVDQW4A4Linear.wtscale from Nunchaku safetensors checkpoints.
+        Nunchaku stores wtscale as a Python attribute (not nn.Parameter), so we
+        manually load and assign it after FSDP loading.
+        """
+        if not self._is_svdquant_config(quant_config):
+            return
+
+        if not safetensors_list:
+            return
+
+        if len(safetensors_list) != 1:
+            logger.warning(
+                "Nunchaku wtscale patch expects a single safetensors file, "
+                "but got %d files. Skipping.",
+                len(safetensors_list),
+            )
+            return
+
+        try:
+            from nunchaku.models.linear import SVDQW4A4Linear  # type: ignore[import]
+
+            from sglang.multimodal_gen.runtime.layers.quantization.nunchaku_linear import (
+                NunchakuSVDQLinearMethod,
+            )
+        except ImportError:
+            logger.warning("Nunchaku is not available; skipping wtscale patch.")
+            return
+
+        state_dict = self._load_state_dict_safe(safetensors_list[0])
+        if state_dict is None:
+            return
+
+        num_patched = 0
+        for name, module in model.named_modules():
+            tensor = state_dict.get(f"{name}.wtscale")
+            if tensor is None:
+                continue
+
+            if self._patch_native_svdq_linear(module, tensor, SVDQW4A4Linear):
+                num_patched += 1
+            elif self._patch_sglang_svdq_linear(
+                module, tensor, NunchakuSVDQLinearMethod
+            ):
+                num_patched += 1
+
+        if num_patched > 0:
+            logger.info("Patched wtscale for %d SVDQW4A4Linear layers", num_patched)
+
+    def _is_svdquant_config(self, quant_config: Any) -> bool:
+        """Check if the quant config is SVDQuant."""
+        return (
+            hasattr(quant_config, "get_name") and quant_config.get_name() == "svdquant"
+        )
+
+    def _load_state_dict_safe(self, weights_path: str) -> dict | None:
+        """Load state dict from safetensors file, returning None on failure."""
+        try:
+            return safetensors_load_file(weights_path)
+        except Exception as exc:
+            logger.warning(
+                "Failed to load weights from %s for wtscale patch: %s",
+                weights_path,
+                exc,
+            )
+            return None
+
+    def _patch_native_svdq_linear(
+        self, module: nn.Module, tensor: Any, svdq_linear_cls: type
+    ) -> bool:
+        """Patch native Nunchaku SVDQW4A4Linear module."""
+        if (
+            isinstance(module, svdq_linear_cls)
+            and getattr(module, "wtscale", None) is not None
+        ):
+            module.wtscale = tensor
+            return True
+        return False
+
+    def _patch_sglang_svdq_linear(
+        self, module: nn.Module, tensor: Any, svdq_method_cls: type
+    ) -> bool:
+        """Patch SGLang LinearBase layers using NunchakuSVDQLinearMethod."""
+        quant_method = getattr(module, "quant_method", None)
+        if not isinstance(quant_method, svdq_method_cls):
+            return False
+
+        existing = getattr(module, "wtscale", None)
+        if isinstance(existing, nn.Parameter):
+            with torch.no_grad():
+                existing.data.copy_(tensor.to(existing.data.dtype))
+        else:
+            module.wtscale = tensor
+
+        try:
+            module._nunchaku_alpha = float(tensor.detach().cpu().item())
+        except Exception:
+            module._nunchaku_alpha = None
+
+        return True
+
+    def _get_quant_config(self, server_args: ServerArgs) -> Any:
+        """Get quantization config from server args."""
+        if not getattr(server_args, "enable_svdquant", False):
+            return None
+
+        if not getattr(server_args, "quantized_model_path", None):
+            return None
+
+        from sglang.multimodal_gen.runtime.loader.nunchaku_loader import (
+            create_nunchaku_config_from_server_args,
+        )
+
+        return create_nunchaku_config_from_server_args(server_args)
+
     def load_customized(
         self, component_model_path: str, server_args: ServerArgs, *args
     ):
@@ -643,39 +764,50 @@ class TransformerLoader(ComponentLoader):
 
         server_args.model_paths["transformer"] = component_model_path
 
-        # Config from Diffusers supersedes sgl_diffusion's model config
         dit_config = server_args.pipeline_config.dit_config
         dit_config.update_model_arch(config)
 
+        default_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.dit_precision]
+
+        quant_config = self._get_quant_config(server_args)
+        if quant_config is not None:
+            logger.info(
+                "Loading transformer with layer-by-layer quantization (quant_config=%s)",
+                quant_config,
+            )
+
         model_cls, _ = ModelRegistry.resolve_model_cls(cls_name)
 
-        # Find all safetensors files
-        safetensors_list = _list_safetensors_files(component_model_path)
-        if not safetensors_list:
-            raise ValueError(f"No safetensors files found in {component_model_path}")
+        if quant_config is not None and quant_config.quantized_model_path:
+            weights_path = quant_config.quantized_model_path
+            logger.info("Using quantized model weights from: %s", weights_path)
+            if os.path.isfile(weights_path) and weights_path.endswith(".safetensors"):
+                safetensors_list = [weights_path]
+            else:
+                safetensors_list = _list_safetensors_files(weights_path)
+        else:
+            weights_path = component_model_path
+            safetensors_list = _list_safetensors_files(weights_path)
 
-        # Check if we should use custom initialization weights
+        if not safetensors_list:
+            raise ValueError(f"No safetensors files found in {weights_path}")
+
         custom_weights_path = getattr(
             server_args, "init_weights_from_safetensors", None
         )
-        use_custom_weights = False
-
-        if use_custom_weights:
+        if custom_weights_path is not None:
             logger.info(
                 "Using custom initialization weights from: %s", custom_weights_path
             )
-            assert (
-                custom_weights_path is not None
-            ), "Custom initialization weights must be provided"
             if os.path.isdir(custom_weights_path):
                 safetensors_list = _list_safetensors_files(custom_weights_path)
-            else:
-                assert custom_weights_path.endswith(
-                    ".safetensors"
-                ), "Custom initialization weights must be a safetensors file"
+            elif custom_weights_path.endswith(".safetensors"):
                 safetensors_list = [custom_weights_path]
-
-        default_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.dit_precision]
+            else:
+                raise ValueError(
+                    f"Custom initialization weights must be a .safetensors file or directory, "
+                    f"got: {custom_weights_path}"
+                )
 
         logger.info(
             "Loading %s from %s safetensors files, default_dtype: %s",
@@ -686,9 +818,17 @@ class TransformerLoader(ComponentLoader):
 
         # Load the model using FSDP loader
         assert server_args.hsdp_shard_dim is not None
+
+        init_params: dict[str, Any] = {"config": dit_config, "hf_config": hf_config}
+        if (
+            quant_config is not None
+            and "quant_config" in inspect.signature(model_cls.__init__).parameters
+        ):
+            init_params["quant_config"] = quant_config
+
         model = maybe_load_fsdp_model(
             model_cls=model_cls,
-            init_params={"config": dit_config, "hf_config": hf_config},
+            init_params=init_params,
             weight_dir_list=safetensors_list,
             device=get_local_torch_device(),
             hsdp_replicate_dim=server_args.hsdp_replicate_dim,
@@ -702,6 +842,9 @@ class TransformerLoader(ComponentLoader):
             reduce_dtype=torch.float32,
             output_dtype=None,
         )
+
+        if quant_config is not None:
+            self._patch_nunchaku_wtscale(model, safetensors_list, quant_config)
 
         total_params = sum(p.numel() for p in model.parameters())
         logger.info("Loaded model with %.2fB parameters", total_params / 1e9)

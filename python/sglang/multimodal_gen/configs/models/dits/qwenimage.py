@@ -45,6 +45,10 @@ class QwenImageArchConfig(DiTArchConfig):
             r"(.*)\.add_v_proj\.(weight|bias)$": (r"\1.to_added_qkv.\2", 2, 3),
             # LoRA mappings
             r"^(transformer_blocks\.\d+\.attn\..*\.lora_[AB])\.default$": r"\1",
+            # SVDquant mappings
+            r"(.*)\.add_qkv_proj\.(.+)$": r"\1.to_added_qkv.\2",
+            r"(transformer_blocks\.\d+\.(img_mlp|txt_mlp)\..*\.(smooth_factor_orig|wcscales))$": r"\1",
+            r".*\.wtscale$": r"",
         }
     )
 
