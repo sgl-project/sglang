@@ -10,7 +10,7 @@ use crate::routers::{
     grpc::{
         common::stages::{helpers, PipelineStage},
         context::{ClientSelection, RequestContext, RequestType, WorkerSelection},
-        proto_wrapper::ProtoGenerateRequest,
+        proto_wrapper::{ProtoGenerateRequest, ProtoRequest},
     },
 };
 
@@ -80,6 +80,16 @@ impl PipelineStage for HarmonyRequestBuildingStage {
                     "Generate requests are not supported with Harmony models".to_string(),
                 ));
             }
+            RequestType::Embedding(_) => {
+                error!(
+                    function = "HarmonyRequestBuildingStage::execute",
+                    "Embedding requests not supported for Harmony models"
+                );
+                return Err(error::bad_request(
+                    "harmony_embedding_not_supported",
+                    "Embedding requests are not supported with Harmony models".to_string(),
+                ));
+            }
         };
 
         // Build gRPC request using token_ids directly (Harmony encoding already handled message rendering)
@@ -133,7 +143,17 @@ impl PipelineStage for HarmonyRequestBuildingStage {
                         format!("Invalid request parameters: {}", e),
                     )
                 })?,
-            _ => unreachable!(),
+            RequestType::Embedding(_) => {
+                error!(
+                    function = "HarmonyRequestBuildingStage::execute",
+                    "Embedding requests not supported for Harmony models"
+                );
+                return Err(error::bad_request(
+                    "harmony_embedding_not_supported",
+                    "Embedding requests are not supported with Harmony models".to_string(),
+                ));
+            }
+            _ => unreachable!(), // All other request types should be handled above
         };
 
         let mut proto_request = ProtoGenerateRequest::Sglang(Box::new(proto_request_inner));
@@ -159,7 +179,7 @@ impl PipelineStage for HarmonyRequestBuildingStage {
             }
         }
 
-        ctx.state.proto_request = Some(proto_request);
+        ctx.state.proto_request = Some(ProtoRequest::Generate(proto_request));
         Ok(None)
     }
 

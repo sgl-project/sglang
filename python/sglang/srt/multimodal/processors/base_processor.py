@@ -299,6 +299,7 @@ class BaseMultimodalProcessor(ABC):
         if audios:
             if self._processor.__class__.__name__ in {
                 "Gemma3nProcessor",
+                "GlmAsrProcessor",
                 "Qwen2AudioProcessor",
                 "Qwen3OmniMoeProcessor",
             }:
@@ -800,7 +801,6 @@ class BaseMultimodalProcessor(ABC):
         # Process items and get input_ids
         all_collected_items: list[MultimodalDataItem] = []
         input_ids = None
-
         # Handle raw items (need processing)
         if raw_images or raw_audios or raw_videos:
             collected_items, input_ids, ret = self._process_and_collect_mm_items(

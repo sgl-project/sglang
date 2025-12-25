@@ -74,7 +74,11 @@ from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
-from sglang.srt.metrics.collector import SchedulerMetricsCollector, TimeStats
+from sglang.srt.metrics.collector import (
+    DPCooperationInfo,
+    SchedulerMetricsCollector,
+    TimeStats,
+)
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -334,8 +338,18 @@ class MultimodalInputs:
 
     @staticmethod
     def from_dict(obj: dict):
+        # Check if MM splitting is enabled
+        if not envs.SGLANG_ENABLE_MM_SPLITTING.get():
+            mm_items = obj["mm_items"]
+        else:
+            from sglang.srt.managers.mm_utils import get_new_expanded_mm_items
+
+            original_mm_items = obj["mm_items"]
+            # Now, `mm_items` contains one item per image.
+            mm_items = get_new_expanded_mm_items(original_mm_items)
+
         ret = MultimodalInputs(
-            mm_items=obj["mm_items"],
+            mm_items=mm_items,
         )
 
         assert isinstance(ret.mm_items, list)
@@ -1087,13 +1101,15 @@ class Req:
 
     def log_time_stats(self):
         # If overlap schedule, we schedule one decode batch ahead so this gets called twice.
-        if self.has_log_time_stats is True:
+        if self.has_log_time_stats:
             return
 
-        if self.bootstrap_room is not None:
-            prefix = f"Req Time Stats(rid={self.rid}, bootstrap_room={self.bootstrap_room}, input len={len(self.origin_input_ids)}, output len={len(self.output_ids)}, type={self.time_stats.disagg_mode_str()})"
-        else:
-            prefix = f"Req Time Stats(rid={self.rid}, input len={len(self.origin_input_ids)}, output len={len(self.output_ids)}, type={self.time_stats.disagg_mode_str()})"
+        bootstrap_info = (
+            f", bootstrap_room={self.bootstrap_room}"
+            if self.bootstrap_room is not None
+            else ""
+        )
+        prefix = f"Req Time Stats(rid={self.rid}{bootstrap_info}, input len={len(self.origin_input_ids)}, output len={len(self.output_ids)}, type={self.time_stats.disagg_mode_str()})"
         logger.info(f"{prefix}: {self.time_stats.convert_to_duration()}")
         self.has_log_time_stats = True
 
@@ -1238,6 +1254,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     # Diffusion LLM
     dllm_config: Optional[DllmConfig] = None
+
+    # Metrics
+    dp_cooperation_info: Optional[DPCooperationInfo] = None
 
     @classmethod
     def init_new(
@@ -1977,7 +1996,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.orig_seq_lens = self.orig_seq_lens[keep_indices_device]
         self.out_cache_loc = None
         self.seq_lens_sum = self.seq_lens.sum().item()
-        self.output_ids = self.output_ids[keep_indices_device]
+
+        if self.output_ids is not None:
+            self.output_ids = self.output_ids[keep_indices_device]
+
         self.mamba_track_indices = None
         self.mamba_track_mask = None
         self.mamba_track_seqlens = None
@@ -2151,6 +2173,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             mamba_track_indices=self.mamba_track_indices,
             mamba_track_mask=self.mamba_track_mask,
             mamba_track_seqlens=self.mamba_track_seqlens,
+            dp_cooperation_info=self.dp_cooperation_info,
         )
 
     def _is_available_size_sufficient(self, num_tokens: int) -> bool:

@@ -27,6 +27,7 @@ use crate::{
     observability::metrics::{metrics_labels, Metrics},
     protocols::{
         chat::ChatCompletionRequest,
+        embedding::EmbeddingRequest,
         generate::GenerateRequest,
         responses::{ResponsesGetParams, ResponsesRequest},
     },
@@ -40,6 +41,7 @@ pub struct GrpcRouter {
     worker_registry: Arc<WorkerRegistry>,
     pipeline: RequestPipeline,
     harmony_pipeline: RequestPipeline,
+    embedding_pipeline: RequestPipeline, // New field for embedding pipeline
     shared_components: Arc<SharedComponents>,
     responses_context: responses::ResponsesContext,
     harmony_responses_context: responses::ResponsesContext,
@@ -49,12 +51,9 @@ pub struct GrpcRouter {
 impl GrpcRouter {
     /// Create a new gRPC router
     pub async fn new(ctx: &Arc<AppContext>) -> Result<Self, String> {
-        // Extract necessary components from context
-        let tokenizer = ctx
-            .tokenizer
-            .as_ref()
-            .ok_or_else(|| "gRPC router requires tokenizer".to_string())?
-            .clone();
+        // Get tokenizer registry (no longer requires pre-loaded tokenizer)
+        let tokenizer_registry = ctx.tokenizer_registry.clone();
+
         let reasoning_parser_factory = ctx
             .reasoning_parser_factory
             .as_ref()
@@ -71,7 +70,7 @@ impl GrpcRouter {
 
         // Create shared components for pipeline
         let shared_components = Arc::new(SharedComponents {
-            tokenizer: tokenizer.clone(),
+            tokenizer_registry: tokenizer_registry.clone(),
             tool_parser_factory: tool_parser_factory.clone(),
             reasoning_parser_factory: reasoning_parser_factory.clone(),
         });
@@ -80,7 +79,6 @@ impl GrpcRouter {
         let pipeline = RequestPipeline::new_regular(
             worker_registry.clone(),
             _policy_registry.clone(),
-            tokenizer.clone(),
             tool_parser_factory.clone(),
             reasoning_parser_factory.clone(),
             ctx.configured_tool_parser.clone(),
@@ -91,12 +89,15 @@ impl GrpcRouter {
         let harmony_pipeline = RequestPipeline::new_harmony(
             worker_registry.clone(),
             _policy_registry.clone(),
-            tokenizer.clone(),
             tool_parser_factory.clone(),
             reasoning_parser_factory.clone(),
             ctx.configured_tool_parser.clone(),
             ctx.configured_reasoning_parser.clone(),
         );
+
+        // Create Embedding pipeline
+        let embedding_pipeline =
+            RequestPipeline::new_embeddings(worker_registry.clone(), _policy_registry.clone());
 
         // Extract shared dependencies for responses contexts
         let mcp_manager = ctx
@@ -126,6 +127,7 @@ impl GrpcRouter {
             worker_registry,
             pipeline,
             harmony_pipeline,
+            embedding_pipeline,
             shared_components,
             responses_context,
             harmony_responses_context,
@@ -303,6 +305,25 @@ impl GrpcRouter {
             .await
         }
     }
+
+    /// Main route_embeddings implementation
+    async fn route_embeddings_impl(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &EmbeddingRequest,
+        model_id: Option<&str>,
+    ) -> Response {
+        debug!("Processing embedding request for model: {:?}", model_id);
+
+        self.embedding_pipeline
+            .execute_embeddings(
+                Arc::new(body.clone()),
+                headers.cloned(),
+                model_id.map(|s| s.to_string()),
+                self.shared_components.clone(),
+            )
+            .await
+    }
 }
 
 impl std::fmt::Debug for GrpcRouter {
@@ -358,6 +379,15 @@ impl RouterTrait for GrpcRouter {
 
     async fn cancel_response(&self, _headers: Option<&HeaderMap>, response_id: &str) -> Response {
         cancel_response_impl(&self.responses_context, response_id).await
+    }
+
+    async fn route_embeddings(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &EmbeddingRequest,
+        model_id: Option<&str>,
+    ) -> Response {
+        self.route_embeddings_impl(headers, body, model_id).await
     }
 
     fn router_type(&self) -> &'static str {

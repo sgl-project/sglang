@@ -145,6 +145,10 @@ pub struct CompletionRequest {
     /// Additional fields including bootstrap info for PD routing
     #[serde(flatten)]
     pub other: Map<String, Value>,
+
+    /// Routing ID for manual routing policy
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub routing_id: Option<String>,
 }
 
 impl GenerationRequest for CompletionRequest {
@@ -161,6 +165,10 @@ impl GenerationRequest for CompletionRequest {
             StringOrArray::String(s) => s.clone(),
             StringOrArray::Array(v) => v.join(" "),
         }
+    }
+
+    fn get_routing_id(&self) -> Option<&str> {
+        self.routing_id.as_deref()
     }
 }
 

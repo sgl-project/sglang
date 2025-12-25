@@ -12,6 +12,7 @@ pub enum PolicyType {
     CacheAware,
     PowerOfTwo,
     Bucket,
+    Manual,
 }
 
 #[pyclass(eq)]
@@ -267,6 +268,7 @@ impl Router {
                     balance_rel_threshold: self.balance_rel_threshold,
                     bucket_adjust_interval_secs: self.bucket_adjust_interval_secs,
                 },
+                PolicyType::Manual => ConfigPolicyConfig::Manual,
             }
         };
 

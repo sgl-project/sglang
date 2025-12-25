@@ -22,27 +22,41 @@ from sglang.test.test_utils import (
 )
 
 MODEL_SCORE_THRESHOLDS = {
+    # Llama 3.1 series
     "meta-llama/Llama-3.1-8B-Instruct": 0.82,
-    "mistralai/Mistral-7B-Instruct-v0.3": 0.58,
-    "deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct": 0.85,
     "meta-llama/Llama-3.1-70B-Instruct": 0.95,
+    # Llama 3.2 series (smaller models)
+    "meta-llama/Llama-3.2-3B-Instruct": 0.55,
+    # Mistral series
+    "mistralai/Mistral-7B-Instruct-v0.3": 0.58,
     "mistralai/Mixtral-8x7B-Instruct-v0.1": 0.61,
+    # DeepSeek series
+    "deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct": 0.85,
+    # Qwen2 series
     "Qwen/Qwen2-57B-A14B-Instruct": 0.86,
-    "Qwen/Qwen3-30B-A3B-Thinking-2507": 0.84,  # MoE model from sanity_check.py - TP2 verified on MI300X
+    "Qwen/Qwen2.5-7B-Instruct": 0.85,
+    # Qwen3 series
+    "Qwen/Qwen3-30B-A3B-Thinking-2507": 0.84,  # MoE model verified on MI300X
+    "Qwen/Qwen3-8B": 0.80,
+    # Google Gemma
+    "google/gemma-2-27b-it": 0.91,
+    "google/gemma-2-9b-it": 0.72,
+    # "neuralmagic/gemma-2-2b-it-FP8": 0.4,  # Small 2B model - OOM on single GPU
+    # FP8 quantized models
     "neuralmagic/Meta-Llama-3.1-8B-Instruct-FP8": 0.8,
     "neuralmagic/Mistral-7B-Instruct-v0.3-FP8": 0.54,
     "neuralmagic/Meta-Llama-3.1-70B-Instruct-FP8": 0.94,
     "neuralmagic/Qwen2-72B-Instruct-FP8": 0.94,
     "neuralmagic/Qwen2-57B-A14B-Instruct-FP8": 0.86,
     "neuralmagic/Mixtral-8x7B-Instruct-v0.1-FP8": 0.62,
-    "google/gemma-2-27b-it": 0.91,
     "neuralmagic/DeepSeek-Coder-V2-Lite-Instruct-FP8": 0.84,
 }
 
 failing_models = {
-    "neuralmagic/gemma-2-2b-it-FP8",
     "neuralmagic/DeepSeek-Coder-V2-Lite-Instruct-FP8",  # RuntimeError: This GEMM is not supported!
     "zai-org/GLM-4.5-Air-FP8",  # TypeError: cannot unpack non-iterable ForwardMetadata object
+    "google/gemma-2-9b-it",  # OOM on single GPU (exit code -9)
+    "neuralmagic/gemma-2-2b-it-FP8",  # OOM on single GPU (exit code -9)
 }
 
 
@@ -65,7 +79,12 @@ DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP2 = remove_failing_models(
     DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP2
 )
 
-# AMD-specific models verified on MI300X with tp=2
+# AMD-specific models verified on MI300X
+# TP1 models - smaller models that fit on single GPU
+AMD_MODEL_NAME_FOR_NIGHTLY_EVAL_TP1 = remove_failing_models(
+    "meta-llama/Llama-3.2-3B-Instruct,Qwen/Qwen2.5-7B-Instruct,Qwen/Qwen3-8B,google/gemma-2-9b-it"
+)
+# TP2 models - larger models requiring 2 GPUs
 AMD_MODEL_NAME_FOR_NIGHTLY_EVAL_TP2 = remove_failing_models(
     "Qwen/Qwen3-30B-A3B-Thinking-2507"
 )
@@ -178,6 +197,7 @@ class TestNightlyGsm8KEval(unittest.TestCase):
             (parse_models(DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP1), True, False),
             (parse_models(DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP2), True, True),
             # AMD-specific models verified on MI300X
+            (parse_models(AMD_MODEL_NAME_FOR_NIGHTLY_EVAL_TP1), False, False),
             (parse_models(AMD_MODEL_NAME_FOR_NIGHTLY_EVAL_TP2), False, True),
         ]
         cls.base_url = DEFAULT_URL_FOR_TEST

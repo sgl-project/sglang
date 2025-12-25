@@ -294,7 +294,12 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         return output_routed_experts
 
     def handle_batch_token_id_out(self, recv_obj: BatchTokenIDOutput):
-        output_strs = self._decode_batch_token_id_output(recv_obj)
+        # If handling idle batch, set output_strs to [].
+        output_strs = (
+            self._decode_batch_token_id_output(recv_obj)
+            if len(recv_obj.rids) > 0
+            else []
+        )
         output_routed_experts = self._extract_routed_experts(recv_obj)
 
         return BatchStrOutput(
@@ -331,6 +336,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             forward_entry_time=recv_obj.forward_entry_time,
             prefill_launch_delay=recv_obj.prefill_launch_delay,
             prefill_launch_latency=recv_obj.prefill_launch_latency,
+            load=recv_obj.load,
             prefill_finished_ts=recv_obj.prefill_finished_ts,
         )
 

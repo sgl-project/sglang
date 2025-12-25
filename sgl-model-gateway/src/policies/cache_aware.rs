@@ -72,7 +72,10 @@ use dashmap::DashMap;
 use rand::Rng;
 use tracing::debug;
 
-use super::{get_healthy_worker_indices, tree::Tree, CacheAwareConfig, LoadBalancingPolicy};
+use super::{
+    get_healthy_worker_indices, normalize_model_key, tree::Tree, CacheAwareConfig,
+    LoadBalancingPolicy, SelectWorkerInfo,
+};
 use crate::core::Worker;
 
 /// Cache-aware routing policy
@@ -160,13 +163,7 @@ impl CacheAwarePolicy {
         let mut model_workers: std::collections::HashMap<String, Vec<&Arc<dyn Worker>>> =
             std::collections::HashMap::new();
         for worker in workers {
-            // Use "default" for unknown/empty model_ids for backward compatibility
-            let model_id = worker.model_id();
-            let tree_key = if model_id.is_empty() || model_id == "unknown" {
-                "default"
-            } else {
-                model_id
-            };
+            let tree_key = normalize_model_key(worker.model_id());
             model_workers
                 .entry(tree_key.to_string())
                 .or_default()
@@ -187,14 +184,7 @@ impl CacheAwarePolicy {
 
     /// Add a single worker to the tree (incremental update)
     pub fn add_worker(&self, worker: &dyn Worker) {
-        // For backward compatibility: if model_id is "unknown" or empty,
-        // use a default tree. This preserves existing behavior for single-model routers.
-        let model_id = worker.model_id();
-        let tree_key = if model_id.is_empty() || model_id == "unknown" {
-            "default"
-        } else {
-            model_id
-        };
+        let tree_key = normalize_model_key(worker.model_id());
         let tree = self
             .trees
             .entry(tree_key.to_string())
@@ -213,13 +203,7 @@ impl CacheAwarePolicy {
 
     /// Remove a worker from the tree
     pub fn remove_worker(&self, worker: &dyn Worker) {
-        // Use same logic as add_worker for consistency
-        let model_id = worker.model_id();
-        let tree_key = if model_id.is_empty() || model_id == "unknown" {
-            "default"
-        } else {
-            model_id
-        };
+        let tree_key = normalize_model_key(worker.model_id());
         if let Some(tree) = self.trees.get(tree_key) {
             tree.remove_tenant(worker.url());
         }
@@ -300,11 +284,8 @@ impl CacheAwarePolicy {
 }
 
 impl LoadBalancingPolicy for CacheAwarePolicy {
-    fn select_worker(
-        &self,
-        workers: &[Arc<dyn Worker>],
-        request_text: Option<&str>,
-    ) -> Option<usize> {
+    fn select_worker(&self, workers: &[Arc<dyn Worker>], info: &SelectWorkerInfo) -> Option<usize> {
+        let request_text = info.request_text;
         let healthy_indices = get_healthy_worker_indices(workers);
 
         if healthy_indices.is_empty() {
@@ -313,12 +294,7 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
 
         // Determine the model for this set of workers (router pre-filters by model)
         // All workers should be from the same model
-        let first_model = workers[healthy_indices[0]].model_id();
-        let model_id = if first_model.is_empty() || first_model == "unknown" {
-            "default"
-        } else {
-            first_model
-        };
+        let model_id = normalize_model_key(workers[healthy_indices[0]].model_id());
 
         // Get current load statistics - compute min/max in single pass without allocation
         let (min_load, max_load) = workers.iter().fold((usize::MAX, 0usize), |(min, max), w| {
@@ -479,14 +455,38 @@ mod tests {
         policy.init_workers(&workers);
 
         // First request should be distributed
-        let idx1 = policy.select_worker(&workers, Some("hello world")).unwrap();
+        let idx1 = policy
+            .select_worker(
+                &workers,
+                &SelectWorkerInfo {
+                    request_text: Some("hello world"),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
 
         // Same request should go to same worker (cache hit)
-        let idx2 = policy.select_worker(&workers, Some("hello world")).unwrap();
+        let idx2 = policy
+            .select_worker(
+                &workers,
+                &SelectWorkerInfo {
+                    request_text: Some("hello world"),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
         assert_eq!(idx1, idx2);
 
         // Similar request should also go to same worker
-        let idx3 = policy.select_worker(&workers, Some("hello")).unwrap();
+        let idx3 = policy
+            .select_worker(
+                &workers,
+                &SelectWorkerInfo {
+                    request_text: Some("hello"),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
         assert_eq!(idx1, idx3);
     }
 
@@ -518,7 +518,15 @@ mod tests {
 
         // Should select worker2 (lower load) despite cache affinity
         for _ in 0..5 {
-            let idx = policy.select_worker(&workers, Some("test")).unwrap();
+            let idx = policy
+                .select_worker(
+                    &workers,
+                    &SelectWorkerInfo {
+                        request_text: Some("test"),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
             assert_eq!(idx, 1); // Should always pick worker2
         }
     }
@@ -546,15 +554,35 @@ mod tests {
         policy.init_workers(&workers);
 
         // Route some requests
-        policy.select_worker(&workers, Some("test1"));
-        policy.select_worker(&workers, Some("test2"));
+        policy.select_worker(
+            &workers,
+            &SelectWorkerInfo {
+                request_text: Some("test1"),
+                ..Default::default()
+            },
+        );
+        policy.select_worker(
+            &workers,
+            &SelectWorkerInfo {
+                request_text: Some("test2"),
+                ..Default::default()
+            },
+        );
 
         // Remove a worker
         policy.remove_worker_by_url("http://w1:8000");
         workers[0].set_healthy(false);
 
         // All requests should now go to worker2
-        let idx = policy.select_worker(&workers, Some("test1")).unwrap();
+        let idx = policy
+            .select_worker(
+                &workers,
+                &SelectWorkerInfo {
+                    request_text: Some("test1"),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
         assert_eq!(idx, 1);
     }
 }

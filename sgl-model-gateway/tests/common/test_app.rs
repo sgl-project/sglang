@@ -16,6 +16,7 @@ use sgl_model_gateway::{
     policies::PolicyRegistry,
     routers::RouterTrait,
     server::{build_app, AppState},
+    tokenizer::registry::TokenizerRegistry,
 };
 
 /// Create a test Axum application using the actual server's build_app function
@@ -67,7 +68,7 @@ pub fn create_test_app(
             .router_config(router_config.clone())
             .client(client)
             .rate_limiter(rate_limiter)
-            .tokenizer(None) // tokenizer
+            .tokenizer_registry(Arc::new(TokenizerRegistry::new())) // tokenizer
             .reasoning_parser_factory(None) // reasoning_parser_factory
             .tool_parser_factory(None) // tool_parser_factory
             .worker_registry(worker_registry)
@@ -195,7 +196,7 @@ pub async fn create_test_app_context() -> Arc<AppContext> {
             .router_config(router_config)
             .client(client)
             .rate_limiter(None)
-            .tokenizer(None)
+            .tokenizer_registry(Arc::new(TokenizerRegistry::new()))
             .reasoning_parser_factory(None)
             .tool_parser_factory(None)
             .worker_registry(worker_registry)
