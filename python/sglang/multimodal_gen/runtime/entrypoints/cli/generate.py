@@ -6,6 +6,7 @@
 import argparse
 import dataclasses
 import os
+from tqdm import tqdm
 from typing import cast
 
 from sglang.multimodal_gen import DiffGenerator
@@ -93,6 +94,10 @@ def generate_cmd(args: argparse.Namespace):
     generator = DiffGenerator.from_pretrained(
         model_path=server_args.model_path, server_args=server_args
     )
+
+    if args.perf_dump_path:
+        for _ in tqdm(range(10)):
+            generator.generate(sampling_params_kwargs={**sampling_params_kwargs, "save_output": False})
 
     results = generator.generate(sampling_params_kwargs=sampling_params_kwargs)
 
