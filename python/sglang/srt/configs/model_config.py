@@ -20,8 +20,6 @@ from enum import Enum, IntEnum, auto
 from typing import Any, List, Optional, Set, Union
 
 import torch
-from transformers import PretrainedConfig
-
 from sglang.srt.environ import envs
 from sglang.srt.layers.quantization import QUANTIZATION_METHODS
 from sglang.srt.server_args import ServerArgs
@@ -34,6 +32,7 @@ from sglang.srt.utils.hf_transformers_utils import (
     get_sparse_attention_config,
 )
 from sglang.utils import is_in_ci
+from transformers import PretrainedConfig
 
 logger = logging.getLogger(__name__)
 
@@ -423,6 +422,7 @@ class ModelConfig:
             self.qk_rope_head_dim = self.hf_text_config.qk_rope_head_dim
             self.v_head_dim = self.hf_text_config.v_head_dim
             self.qk_nope_head_dim = self.hf_text_config.qk_nope_head_dim
+            self.scaling = 1 / math.sqrt(self.qk_nope_head_dim + self.qk_rope_head_dim)
         elif "KimiLinearForCausalLM" in self.hf_config.architectures:
             self.head_dim = 72
             self.attention_arch = AttentionArch.MLA
@@ -430,6 +430,7 @@ class ModelConfig:
             self.qk_rope_head_dim = self.hf_config.qk_rope_head_dim
             self.v_head_dim = self.hf_config.v_head_dim
             self.qk_nope_head_dim = self.hf_config.qk_nope_head_dim
+            self.scaling = 1 / math.sqrt(self.qk_nope_head_dim + self.qk_rope_head_dim)
         else:
             if (
                 "MistralModel" in self.hf_config.architectures
