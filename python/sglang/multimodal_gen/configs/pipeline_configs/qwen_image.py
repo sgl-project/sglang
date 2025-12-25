@@ -162,10 +162,10 @@ class QwenImagePipelineConfig(ImagePipelineConfig):
         )
 
         if use_flashinfer_rope:
-            img_cos_half = img_freqs.real.to(dtype=dtype).contiguous()
-            img_sin_half = img_freqs.imag.to(dtype=dtype).contiguous()
-            txt_cos_half = txt_freqs.real.to(dtype=dtype).contiguous()
-            txt_sin_half = txt_freqs.imag.to(dtype=dtype).contiguous()
+            img_cos_half = img_freqs.real.to(dtype=torch.float32).contiguous()
+            img_sin_half = img_freqs.imag.to(dtype=torch.float32).contiguous()
+            txt_cos_half = txt_freqs.real.to(dtype=torch.float32).contiguous()
+            txt_sin_half = txt_freqs.imag.to(dtype=torch.float32).contiguous()
 
             img_cos_sin_cache = torch.cat([img_cos_half, img_sin_half], dim=-1)
             txt_cos_sin_cache = torch.cat([txt_cos_half, txt_sin_half], dim=-1)
