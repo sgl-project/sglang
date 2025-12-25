@@ -292,6 +292,8 @@ class Scheduler(
             )
         )
 
+        self.max_prefill_bs = 0
+
         # Init model configs
         self.init_model_config()
 
@@ -1828,7 +1830,7 @@ class Scheduler(
 
     def get_new_batch_prefill(self) -> Optional[ScheduleBatch]:
         if self.schedule_enhancer and not self.schedule_enhancer.get_schedule_decision(
-            self.running_batch
+            self.running_batch, self.max_prefill_bs
         ):
             # Decrease prefill idle as much as possible during high dp load.
             return None
@@ -1960,6 +1962,7 @@ class Scheduler(
                         self.running_batch.batch_is_full = True
                 break
 
+        self.max_prefill_bs = max(self.max_prefill_bs, len(adder.can_run_list))
         # Update waiting queue
         can_run_list: List[Req] = adder.can_run_list
         if len(can_run_list) == 0:
