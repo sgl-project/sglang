@@ -52,6 +52,10 @@ pub struct RerankRequest {
 
     /// User identifier
     pub user: Option<String>,
+
+    /// Routing ID for manual routing policy
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub routing_id: Option<String>,
 }
 
 impl GenerationRequest for RerankRequest {
@@ -65,6 +69,10 @@ impl GenerationRequest for RerankRequest {
 
     fn extract_text_for_routing(&self) -> String {
         self.query.clone()
+    }
+
+    fn get_routing_id(&self) -> Option<&str> {
+        self.routing_id.as_deref()
     }
 }
 
@@ -207,6 +215,7 @@ impl From<V1RerankReqInput> for RerankRequest {
             return_documents: true,
             rid: None,
             user: None,
+            routing_id: None,
         }
     }
 }
