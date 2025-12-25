@@ -10,7 +10,10 @@ use rand::Rng;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-use super::{get_healthy_worker_indices, normalize_model_key, BucketConfig, LoadBalancingPolicy, SelectWorkerInfo};
+use super::{
+    get_healthy_worker_indices, normalize_model_key, BucketConfig, LoadBalancingPolicy,
+    SelectWorkerInfo,
+};
 use crate::core::Worker;
 
 #[derive(Debug)]
