@@ -1,20 +1,4 @@
 # SPDX-License-Identifier: Apache-2.0
-"""
-Nunchaku quantization helpers for multimodal_gen.
-
-This module currently exposes a single public helper:
-
-- ``create_nunchaku_config_from_server_args``: construct :class:`NunchakuConfig`
-  from ``ServerArgs`` so that layer-wise Nunchaku quantization can be enabled
-  in the standard SGLang transformer loaders.
-
-Historically this file also contained helpers for full-transformer replacement
-(``load_nunchaku_model``, ``should_use_nunchaku``), but the multimodal_gen
-pipeline now always uses **per-layer** quantization instead of swapping the
-entire transformer implementation. Those legacy entry points have been removed
-to avoid confusion.
-"""
-
 from sglang.multimodal_gen.runtime.layers.quantization.nunchaku_config import (
     NunchakuConfig,
 )

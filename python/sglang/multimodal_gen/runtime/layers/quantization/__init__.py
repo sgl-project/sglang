@@ -63,7 +63,6 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
     return method_to_config[quantization]
 
 
-# Register Nunchaku SVDQuant
 try:
     from sglang.multimodal_gen.runtime.layers.quantization.nunchaku_config import (
         NunchakuConfig,
@@ -79,13 +78,11 @@ try:
 
         pass
 
-except Exception:
-    # Nunchaku is an optional dependency; if it's not available we simply
-    # don't register the config and leave QUANTIZATION_METHODS unchanged.
-    _RegisteredNunchakuConfig = None  # type: ignore[assignment]
-    NunchakuConfig = None  # type: ignore[assignment]
-    NunchakuSVDQLinearMethod = None  # type: ignore[assignment]
-    NunchakuAWQLinearMethod = None  # type: ignore[assignment]
+except ImportError:
+    _RegisteredNunchakuConfig = None
+    NunchakuConfig = None
+    NunchakuSVDQLinearMethod = None
+    NunchakuAWQLinearMethod = None
 
 
 __all__ = [

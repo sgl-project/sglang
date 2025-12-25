@@ -16,7 +16,6 @@ import torch
 from tqdm import tqdm
 
 from sglang.multimodal_gen.configs.pipeline_configs import PipelineConfig
-from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.loader.component_loader import (
     PipelineComponentLoader,
 )
@@ -31,7 +30,6 @@ from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
     verify_model_config_and_directory,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
 
 logger = init_logger(__name__)
 
@@ -274,26 +272,6 @@ class ComposedPipelineBase(ABC):
         # all the component models used by the pipeline
         required_modules = self.required_config_modules
         logger.info("Loading required components: %s", required_modules)
-
-        # Lazy imports for optional Nunchaku integration to avoid hard dependency.
-        try:
-            from sglang.multimodal_gen.runtime.loader.nunchaku_loader import (
-                create_nunchaku_config_from_server_args,
-                load_nunchaku_model,
-                should_use_nunchaku,
-            )
-            from sglang.multimodal_gen.runtime.models.dits.nunchaku_flux import (
-                create_nunchaku_flux_model,
-            )
-
-            _nunchaku_available = True
-        except Exception:
-            create_nunchaku_config_from_server_args = None  # type: ignore[assignment]
-            load_nunchaku_model = None  # type: ignore[assignment]
-            should_use_nunchaku = None  # type: ignore[assignment]
-            create_nunchaku_flux_model = None  # type: ignore[assignment]
-            _nunchaku_available = False
-
         components = {}
         for module_name, (
             transformers_or_diffusers,
@@ -321,10 +299,10 @@ class ComposedPipelineBase(ABC):
             else:
                 load_module_name = module_name
 
-            # Use custom VAE path if provided, otherwise use default path
+            # Use custom VAE path if provided, otherwise use default path.
             if module_name == "vae" and server_args.vae_path is not None:
                 component_model_path = server_args.vae_path
-                # Download from HuggingFace Hub if path doesn't exist locally
+                # Download from HuggingFace Hub if path doesn't exist locally.
                 if not os.path.exists(component_model_path):
                     component_model_path = maybe_download_model(component_model_path)
                 logger.info(
@@ -335,18 +313,13 @@ class ComposedPipelineBase(ABC):
             else:
                 component_model_path = os.path.join(self.model_path, load_module_name)
 
-            # Always use the standard sglang transformer implementation and rely
-            # on layer-wise quantization via quant_config where applicable.
-            # Nunchaku full-transformer replacement is disabled for all models.
-                module = PipelineComponentLoader.load_module(
-                    module_name=load_module_name,
-                    component_model_path=component_model_path,
-                    transformers_or_diffusers=transformers_or_diffusers,
-                    server_args=server_args,
-                )
-                logger.info(
-                    "Loaded module %s from %s", module_name, component_model_path
-                )
+            module = PipelineComponentLoader.load_module(
+                module_name=load_module_name,
+                component_model_path=component_model_path,
+                transformers_or_diffusers=transformers_or_diffusers,
+                server_args=server_args,
+            )
+            logger.info("Loaded module %s from %s", module_name, component_model_path)
 
             if module_name in components:
                 logger.warning("Overwriting module %s", module_name)

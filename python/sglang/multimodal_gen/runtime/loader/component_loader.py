@@ -632,7 +632,6 @@ class TransformerLoader(ComponentLoader):
         quant_config: Any,
     ) -> None:
         """Patch SVDQW4A4Linear.wtscale from Nunchaku safetensors checkpoints.
-
         Nunchaku stores wtscale as a Python attribute (not nn.Parameter), so we
         manually load and assign it after FSDP loading.
         """
@@ -720,13 +719,11 @@ class TransformerLoader(ComponentLoader):
 
         existing = getattr(module, "wtscale", None)
         if isinstance(existing, nn.Parameter):
-            # Copy into existing Parameter to avoid nn.Module.__setattr__ TypeError.
             with torch.no_grad():
                 existing.data.copy_(tensor.to(existing.data.dtype))
         else:
             module.wtscale = tensor
 
-        # Cache float alpha to avoid Tensor.item() calls (GPU sync + graph breaks).
         try:
             module._nunchaku_alpha = float(tensor.detach().cpu().item())
         except Exception:
@@ -767,15 +764,11 @@ class TransformerLoader(ComponentLoader):
 
         server_args.model_paths["transformer"] = component_model_path
 
-        # Config from Diffusers supersedes sgl_diffusion's model config
         dit_config = server_args.pipeline_config.dit_config
         dit_config.update_model_arch(config)
 
         default_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.dit_precision]
 
-        # Check for quantization configuration (AWQ-style pattern / Nunchaku).
-        # For multimodal_gen we currently only support layer-wise quantization
-        # and do not use full-transformer replacement in this loader.
         quant_config = self._get_quant_config(server_args)
         if quant_config is not None:
             logger.info(
@@ -785,13 +778,9 @@ class TransformerLoader(ComponentLoader):
 
         model_cls, _ = ModelRegistry.resolve_model_cls(cls_name)
 
-        # Find all safetensors files
-        # If quantization is enabled and quantized_model_path is set, use that path
-        # for loading weights (Nunchaku quantized weights have different parameter names)
         if quant_config is not None and quant_config.quantized_model_path:
             weights_path = quant_config.quantized_model_path
             logger.info("Using quantized model weights from: %s", weights_path)
-            # quantized_model_path can be a single .safetensors file or a directory
             if os.path.isfile(weights_path) and weights_path.endswith(".safetensors"):
                 safetensors_list = [weights_path]
             else:
@@ -803,7 +792,6 @@ class TransformerLoader(ComponentLoader):
         if not safetensors_list:
             raise ValueError(f"No safetensors files found in {weights_path}")
 
-        # Override with custom initialization weights if specified
         custom_weights_path = getattr(
             server_args, "init_weights_from_safetensors", None
         )
@@ -831,9 +819,6 @@ class TransformerLoader(ComponentLoader):
         # Load the model using FSDP loader
         assert server_args.hsdp_shard_dim is not None
 
-        # Prepare init params for model construction. Some models (e.g.
-        # QwenImageTransformer2DModel) accept an optional `quant_config`
-        # argument to enable per-layer quantization (Nunchaku, etc.).
         init_params: dict[str, Any] = {"config": dit_config, "hf_config": hf_config}
         if (
             quant_config is not None
@@ -858,9 +843,6 @@ class TransformerLoader(ComponentLoader):
             output_dtype=None,
         )
 
-        # After FSDP loading, apply Nunchaku-specific post-processing to patch
-        # SVDQW4A4Linear.wtscale attributes from the quantized checkpoint, so we
-        # fully mirror Nunchaku's own loader behavior.
         if quant_config is not None:
             self._patch_nunchaku_wtscale(model, safetensors_list, quant_config)
 

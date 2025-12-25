@@ -81,10 +81,6 @@ def hf_to_custom_state_dict(
         target_param_name, merge_index, num_params_to_merge = param_names_mapping(
             source_param_name
         )
-        # Allow the mapping function to signal that a parameter should be skipped
-        # entirely by returning an empty target name. This is useful for keys that
-        # exist in the checkpoint but have no corresponding parameter/buffer in the
-        # custom model (e.g., auxiliary metadata such as wtscale in Nunchaku models).
         if target_param_name == "" or target_param_name is None:  # type: ignore[comparison-overlap]
             continue
         reverse_param_names_mapping[target_param_name] = (

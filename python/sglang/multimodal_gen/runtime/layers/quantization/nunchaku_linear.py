@@ -11,28 +11,17 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 
-
-def _check_nunchaku_available() -> bool:
-    try:
-        import nunchaku
-
-        return True
-    except ImportError:
-        return False
-
-
-# Import nunchaku ops at module level
 try:
     from nunchaku.ops.gemm import svdq_gemm_w4a4_cuda
     from nunchaku.ops.gemv import awq_gemv_w4a16_cuda
     from nunchaku.ops.quantize import svdq_quantize_w4a4_act_fuse_lora_cuda
-
-    _NUNCHAKU_OPS_AVAILABLE = True
 except ImportError:
     svdq_gemm_w4a4_cuda = None
     awq_gemv_w4a16_cuda = None
     svdq_quantize_w4a4_act_fuse_lora_cuda = None
     _NUNCHAKU_OPS_AVAILABLE = False
+else:
+    _NUNCHAKU_OPS_AVAILABLE = True
 
 
 class NunchakuSVDQLinearMethod(LinearMethodBase):
@@ -111,9 +100,9 @@ class NunchakuSVDQLinearMethod(LinearMethodBase):
                 requires_grad=False,
             )
             wtscale = Parameter(
-                    torch.empty(1, dtype=params_dtype),
-                    requires_grad=False,
-                )
+                torch.empty(1, dtype=params_dtype),
+                requires_grad=False,
+            )
         else:
             wcscales = None
             wtscale = None
@@ -163,8 +152,6 @@ class NunchakuSVDQLinearMethod(LinearMethodBase):
         if hasattr(layer, "wtscale") and layer.wtscale is not None:
             layer.wtscale = Parameter(layer.wtscale.data, requires_grad=False)
 
-        # Cache a Python float alpha for kernels to avoid calling .item()
-        # inside the hot path (which would introduce GPU syncs / graph breaks).
         alpha: float | None = None
         wtscale = getattr(layer, "wtscale", None)
         if wtscale is not None:
@@ -182,10 +169,14 @@ class NunchakuSVDQLinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        if not _check_nunchaku_available():
+        if (
+            not _NUNCHAKU_OPS_AVAILABLE
+            or svdq_quantize_w4a4_act_fuse_lora_cuda is None
+            or svdq_gemm_w4a4_cuda is None
+        ):
             raise ImportError(
                 "nunchaku is required for SVDQ linear method. "
-                "Install with: pip install nunchaku"
+                "Please ensure nunchaku is installed correctly."
             )
 
         orig_shape = x.shape
@@ -203,9 +194,6 @@ class NunchakuSVDQLinearMethod(LinearMethodBase):
             dtype=x_2d.dtype,
             device=x_2d.device,
         )
-        # Prefer a cached Python float computed after weight loading; this
-        # avoids calling Tensor.item() during the forward, which would cause
-        # GPU syncs and TorchDynamo graph breaks.
         alpha: float | None = getattr(layer, "_nunchaku_alpha", None)
         wcscales = getattr(layer, "wcscales", None)
 
@@ -291,7 +279,7 @@ class NunchakuAWQLinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        if not _check_nunchaku_available():
+        if not _NUNCHAKU_OPS_AVAILABLE or awq_gemv_w4a16_cuda is None:
             raise ImportError(
                 "nunchaku is required for AWQ linear method. "
                 "Install with: pip install nunchaku"
@@ -318,4 +306,3 @@ class NunchakuAWQLinearMethod(LinearMethodBase):
 
         out = out_2d.reshape(*orig_shape[:-1], out_features)
         return out
-

@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
+import json
+import os
 from dataclasses import dataclass
 from typing import Any, Optional
 
 import torch
-import json
-import os
 
 from .base_config import QuantizationConfig, QuantizeMethodBase
 
@@ -38,10 +38,10 @@ class NunchakuConfig(QuantizationConfig):
     Attributes:
         precision: Quantization precision type. Options:
             - "int4": Standard INT4 quantization
-            - "nvfp4": FP4 quantization 
+            - "nvfp4": FP4 quantization
         rank: SVD low-rank dimension for absorbing outliers
         group_size: Quantization group size (automatically set based on precision)
-        act_unsigned: Use unsigned activation quantization 
+        act_unsigned: Use unsigned activation quantization
         quantized_model_path: Path to pre-quantized model weights (.safetensors)
     """
 
@@ -93,6 +93,7 @@ class NunchakuConfig(QuantizationConfig):
         for pattern in SVDQ_W4A4_LAYER_PATTERNS:
             if pattern in prefix:
                 from .nunchaku_linear import NunchakuSVDQLinearMethod
+
                 return NunchakuSVDQLinearMethod(
                     precision=self.precision,
                     rank=self.rank,
@@ -102,11 +103,13 @@ class NunchakuConfig(QuantizationConfig):
         for pattern in AWQ_W4A16_LAYER_PATTERNS:
             if pattern in prefix:
                 from .nunchaku_linear import NunchakuAWQLinearMethod
+
                 return NunchakuAWQLinearMethod(
                     group_size=64,
                 )
 
         from .nunchaku_linear import NunchakuSVDQLinearMethod
+
         return NunchakuSVDQLinearMethod(
             precision=self.precision,
             rank=self.rank,
@@ -157,4 +160,3 @@ class NunchakuConfig(QuantizationConfig):
                 if config_dict.get("quant_method") == cls.get_name():
                     return cls.from_config(config_dict)
         return None
-

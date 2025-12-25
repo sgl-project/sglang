@@ -17,14 +17,10 @@ from diffusers.models.normalization import AdaLayerNormContinuous
 from sglang.multimodal_gen.configs.models.dits.qwenimage import QwenImageDitConfig
 from sglang.multimodal_gen.runtime.layers.attention import USPAttention
 from sglang.multimodal_gen.runtime.layers.layernorm import LayerNorm, RMSNorm
-from sglang.multimodal_gen.runtime.layers.linear import (
-    QKVParallelLinear,
-    ReplicatedLinear,
-)
+from sglang.multimodal_gen.runtime.layers.linear import ReplicatedLinear
 from sglang.multimodal_gen.runtime.layers.quantization.base_config import (
     QuantizationConfig,
 )
-from sglang.multimodal_gen.runtime.layers.linear import ReplicatedLinear
 from sglang.multimodal_gen.runtime.layers.triton_ops import (
     apply_rotary_embedding,
     fuse_scale_shift_kernel,
@@ -271,8 +267,13 @@ class QwenImageCrossAttention(nn.Module):
 
         # Use ReplicatedLinear for fused QKV projections
         qkv_dim = num_heads * head_dim * 3
-        self.to_qkv = ReplicatedLinear(dim, qkv_dim, bias=True, quant_config=quant_config,
-                prefix=f"{prefix}.to_qkv",)
+        self.to_qkv = ReplicatedLinear(
+            dim,
+            qkv_dim,
+            bias=True,
+            quant_config=quant_config,
+            prefix=f"{prefix}.to_qkv",
+        )
 
         if self.qk_norm:
             self.norm_q = RMSNorm(head_dim, eps=eps) if qk_norm else nn.Identity()
@@ -283,8 +284,13 @@ class QwenImageCrossAttention(nn.Module):
 
         if added_kv_proj_dim is not None:
             # Use ReplicatedLinear for added (encoder) QKV projections
-            self.to_added_qkv = ReplicatedLinear(added_kv_proj_dim, qkv_dim, bias=True, quant_config=quant_config,
-                prefix=f"{prefix}.to_added_qkv",)
+            self.to_added_qkv = ReplicatedLinear(
+                added_kv_proj_dim,
+                qkv_dim,
+                bias=True,
+                quant_config=quant_config,
+                prefix=f"{prefix}.to_added_qkv",
+            )
 
         if context_pre_only is not None and not context_pre_only:
             self.to_add_out = ReplicatedLinear(
@@ -474,28 +480,21 @@ class QwenImageTransformerBlock(nn.Module):
             dim=dim, dim_out=dim, activation_fn="gelu-approximate"
         )
 
-        # Optionally replace FeedForward with NunchakuFeedForward when using NunchakuConfig.
-        # This mirrors Nunchaku's own transformer_qwenimage implementation where the MLP
-        # is quantized with SVDQ W4A4.
         if (
             quant_config is not None
             and hasattr(quant_config, "get_name")
             and quant_config.get_name() == "svdquant"
         ):
             try:
-                # Nunchaku is an optional dependency.
                 from nunchaku.models.attention import (  # type: ignore[import]
                     NunchakuFeedForward,
                 )
-            except Exception:  # ImportError and others
+            except ImportError:
                 logger.warning(
                     "NunchakuConfig provided but `nunchaku` package is not available; "
                     "keeping standard FeedForward layers."
                 )
             else:
-                # Use parameters directly from NunchakuConfig so that precision/rank
-                # and activation quantization behavior are consistent with the
-                # quantized linear layers.
                 nunchaku_kwargs = {
                     "precision": quant_config.precision,
                     "rank": quant_config.rank,
@@ -504,8 +503,6 @@ class QwenImageTransformerBlock(nn.Module):
                 self.img_mlp = NunchakuFeedForward(self.img_mlp, **nunchaku_kwargs)
                 self.txt_mlp = NunchakuFeedForward(self.txt_mlp, **nunchaku_kwargs)
 
-    def _modulate(self, x, mod_params):
-        """Apply modulation to input tensor"""
     def _modulate(self, x, mod_params, index=None):
         shift, scale, gate = mod_params.chunk(3, dim=-1)
         if index is not None:
@@ -570,7 +567,6 @@ class QwenImageTransformerBlock(nn.Module):
         # 3. Concatenates and runs joint attention
         # 4. Splits results back to separate streams
         joint_attention_kwargs = joint_attention_kwargs or {}
-
         attn_output = self.attn(
             hidden_states=img_modulated,  # Image stream (will be processed as "sample")
             encoder_hidden_states=txt_modulated,  # Text stream (will be processed as "context")
@@ -598,7 +594,6 @@ class QwenImageTransformerBlock(nn.Module):
         # Process text stream - norm2 + MLP
         txt_normed2 = self.txt_norm2(encoder_hidden_states)
         txt_modulated2, txt_gate2 = self._modulate(txt_normed2, txt_mod2)
-
         txt_mlp_output = self.txt_mlp(txt_modulated2)
         encoder_hidden_states = encoder_hidden_states + txt_gate2 * txt_mlp_output
 
@@ -714,7 +709,6 @@ class QwenImageTransformer2DModel(CachableDiT):
             If `return_dict` is True, an [`~models.transformer_2d.Transformer2DModelOutput`] is returned, otherwise a
             `tuple` where the first element is the sample tensor.
         """
-
         if (
             attention_kwargs is not None
             and attention_kwargs.get("scale", None) is not None
@@ -725,7 +719,9 @@ class QwenImageTransformer2DModel(CachableDiT):
 
         if isinstance(encoder_hidden_states, list):
             encoder_hidden_states = encoder_hidden_states[0]
+
         hidden_states = self.img_in(hidden_states)
+
         timestep = (timestep / 1000).to(hidden_states.dtype)
 
         if self.zero_cond_t:

@@ -257,9 +257,10 @@ def load_model_from_full_model_state_dict(
             raise ValueError(
                 f"Parameter {target_param_name} not found in custom model state dict. The hf to custom mapping may be incorrect."
             )
+
         # Preserve original dtypes for parameters where it matters (e.g.,
-        # quantized weights and metadata such as int8/FP8). Only cast to
-        # ``param_dtype`` when the checkpoint tensor already uses that dtype.
+        # quantized weights and metadata such as int8/FP8).
+        # tensor's dtype differs from `param_dtype`, its original dtype is preserved.
         if full_tensor.dtype == param_dtype:
             target_dtype = param_dtype
         else:
@@ -291,10 +292,6 @@ def load_model_from_full_model_state_dict(
     if unused_keys:
         logger.warning("Found unloaded parameters in meta state dict: %s", unused_keys)
 
-    # List of allowed parameter name patterns. For these, we will create
-    # parameters even if they are not present in the checkpoint. This is used
-    # for newly introduced parameters that have reasonable defaults, such as
-    # gate compressors or FP4 per-channel scales (wcscales).
     ALLOWED_NEW_PARAM_PATTERNS = [
         "gate_compress",
         "wcscales",
@@ -313,8 +310,7 @@ def load_model_from_full_model_state_dict(
             )
 
         meta_sharded_param = meta_sd.get(new_param_name)
-        # Initialize defaults: for wcscales we follow Nunchaku's behavior and
-        # use ones; for other patterns we use zeros.
+
         if "wcscales" in new_param_name or "wtscale" in new_param_name:
             init_like = torch.ones_like
         else:
