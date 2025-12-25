@@ -148,7 +148,6 @@ from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
     get_device_sm,
-    get_int_env_var,
     is_cpu,
     is_cuda,
     is_gfx95_supported,
@@ -1466,8 +1465,8 @@ class DeepseekV2AttentionMLA(nn.Module):
         )
 
         # TODO: Design a finer way to determine the threshold
-        self.chunked_prefix_cache_threshold = get_int_env_var(
-            "SGLANG_CHUNKED_PREFIX_CACHE_THRESHOLD", 8192
+        self.chunked_prefix_cache_threshold = (
+            envs.SGLANG_CHUNKED_PREFIX_CACHE_THRESHOLD.get()
         )
 
         # If we have self.fused_qkv_a_proj_with_mqa and we're running on CPU, we will choose the torch.ops.sgl_kernel.qkv_proj_with_rope_fused_weight kernel
