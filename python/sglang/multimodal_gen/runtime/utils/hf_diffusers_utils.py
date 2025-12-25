@@ -371,31 +371,12 @@ def maybe_download_model(
         Local path to the model
     """
 
-    def _verify_model_complete(path: str) -> bool:
-        """Check if model directory has required subdirectories."""
-        transformer_dir = os.path.join(path, "transformer")
-        vae_dir = os.path.join(path, "vae")
-        config_path = os.path.join(path, "model_index.json")
-        return (
-            os.path.exists(config_path)
-            and os.path.exists(transformer_dir)
-            and os.path.exists(vae_dir)
-        )
-
-    # If the path exists locally, verify it's complete
+    # 1. Local path check: if path exists locally, trust and return it
     if os.path.exists(model_name_or_path):
-        if _verify_model_complete(model_name_or_path):
-            logger.info("Model already exists locally and is complete")
-            return model_name_or_path
-        else:
-            logger.warning(
-                "Local model at %s appears incomplete (missing transformer/ or vae/), "
-                "will attempt re-download",
-                model_name_or_path,
-            )
+        return model_name_or_path
 
-    # Otherwise, assume it's a HF Hub model ID and try to download it
-    # First, try to use local cache if available (fast path)
+    # 2. Cache-first strategy (Fast Path)
+    # Try to read from HF cache without network access
     try:
         logger.info(
             "Checking for cached model in HF Hub cache for %s...", model_name_or_path
@@ -406,9 +387,8 @@ def maybe_download_model(
             local_dir=local_dir,
             local_files_only=True,
         )
-        if _verify_model_complete(local_path):
-            logger.info("Found complete model in cache at %s", local_path)
-            return str(local_path)
+        logger.info("Found model in cache at %s", local_path)
+        return str(local_path)
     except LocalEntryNotFoundError:
         logger.info("Model not found in cache, will download from HF Hub")
     except Exception as e:
@@ -418,7 +398,7 @@ def maybe_download_model(
             e,
         )
 
-    # Download with retry mechanism
+    # 3. Download strategy (with retry mechanism)
     MAX_RETRIES = 3
     for attempt in range(MAX_RETRIES):
         try:
@@ -434,38 +414,16 @@ def maybe_download_model(
                     ignore_patterns=["*.onnx", "*.msgpack"],
                     local_dir=local_dir,
                 )
-            # Verify downloaded model is complete
-            if not _verify_model_complete(local_path):
-                logger.warning(
-                    "Downloaded model at %s is incomplete, retrying with force_download=True",
-                    local_path,
-                )
-                with get_lock(model_name_or_path).acquire(poll_interval=2):
-                    local_path = snapshot_download(
-                        repo_id=model_name_or_path,
-                        ignore_patterns=["*.onnx", "*.msgpack"],
-                        local_dir=local_dir,
-                        force_download=True,
-                    )
-                if not _verify_model_complete(local_path):
-                    raise ValueError(
-                        f"Downloaded model at {local_path} is still incomplete after forced re-download. "
-                        "The model repository may be missing required components (model_index.json, transformer/, or vae/)."
-                    )
 
             logger.info("Downloaded model to %s", local_path)
             return str(local_path)
+
         except (RepositoryNotFoundError, RevisionNotFoundError) as e:
-            # Model doesn't exist - don't retry
             raise ValueError(
                 f"Model or revision not found at {model_name_or_path}. "
                 f"Please check the model ID or ensure you have access to the repository. Error: {e}"
             ) from e
-        except (
-            RequestException,
-            RequestsConnectionError,
-        ) as e:
-            # Network-related errors - retry with exponential backoff
+        except (RequestException, RequestsConnectionError) as e:
             if attempt == MAX_RETRIES - 1:
                 raise ValueError(
                     f"Could not find model at {model_name_or_path} and failed to download from HF Hub "
@@ -482,7 +440,8 @@ def maybe_download_model(
             )
             time.sleep(wait_time)
         except Exception as e:
-            # Other unexpected errors - don't retry
             raise ValueError(
                 f"Could not find model at {model_name_or_path} and failed to download from HF Hub: {e}"
             ) from e
+
+    raise ValueError(f"Failed to load model {model_name_or_path}")
