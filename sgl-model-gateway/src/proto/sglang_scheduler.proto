@@ -223,7 +223,7 @@ message GenerateComplete {
   uint32 index = 11;
 
   // Routed experts information
-  google.protobuf.Struct routed_experts = 12;
+  bytes routed_experts = 12;
 }
 
 message GenerateError {

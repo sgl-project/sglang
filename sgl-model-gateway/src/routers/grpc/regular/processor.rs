@@ -5,6 +5,7 @@
 
 use std::{sync::Arc, time::Instant};
 
+use base64::{engine::general_purpose, Engine as _};
 use serde_json::Value;
 use tracing::error;
 
@@ -436,23 +437,15 @@ impl ResponseProcessor {
                 None
             };
 
-            let routed_experts = complete.routed_experts().map(|proto_struct| {
-                let mut obj = serde_json::json!({});
-                if let Value::Object(ref mut map) = obj {
-                    for (key, value) in &proto_struct.fields {
-                        if let Some(prost_value) = value.kind.as_ref() {
-                            let json_value = match prost_value {
-                                prost_types::value::Kind::NullValue(_) => serde_json::json!(null),
-                                prost_types::value::Kind::NumberValue(n) => serde_json::json!(n),
-                                prost_types::value::Kind::StringValue(s) => serde_json::json!(s),
-                                prost_types::value::Kind::BoolValue(b) => serde_json::json!(b),
-                                _ => serde_json::json!({}),
-                            };
-                            map.insert(key.clone(), json_value);
-                        }
+            let routed_experts = complete.routed_experts().and_then(|bytes| {
+                match serde_json::from_slice::<Value>(bytes) {
+                    Ok(value) => Some(value),
+                    Err(_) => {
+                        Some(serde_json::json!({
+                            "raw_bytes": general_purpose::STANDARD.encode(bytes)
+                        }))
                     }
                 }
-                obj
             });
 
             // Build GenerateResponse struct

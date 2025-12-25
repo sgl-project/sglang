@@ -4,7 +4,6 @@
 //! allowing the router to work with either backend transparently.
 
 use futures_util::StreamExt;
-use prost_types::Struct;
 
 use crate::grpc_client::{
     sglang_proto::{self as sglang, generate_complete::MatchedStop},
@@ -334,10 +333,16 @@ impl ProtoGenerateComplete {
     }
 
     /// Get routed_experts
-    pub fn routed_experts(&self) -> Option<&Struct> {
+    pub fn routed_experts(&self) -> Option<&[u8]> {
         match self {
-            Self::Sglang(c) => c.routed_experts.as_ref(),
-            Self::Vllm(c) => c.routed_experts.as_ref(),
+            Self::Sglang(c) => {
+                if c.routed_experts.is_empty() {
+                    None
+                } else {
+                    Some(&c.routed_experts)
+                }
+            }
+            Self::Vllm(_) => None, // vLLM doesn't have routed_experts field
         }
     }
 }
