@@ -42,7 +42,7 @@ def test_manual_routing_without_header(mock_workers, router_manager):
 
 
 def send_completion(session, base_url, routing_key=None):
-    headers = {ROUTING_KEY_HEADER: routing_key} if routing_key else {}
+    headers = {ROUTING_KEY_HEADER: routing_key} if routing_key is not None else {}
     r = session.post(
         f"{base_url}/v1/completions",
         json={"model": "test", "prompt": "hi", "max_tokens": 1, "stream": False},
