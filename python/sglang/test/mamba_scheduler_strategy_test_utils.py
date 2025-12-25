@@ -20,7 +20,7 @@ CACHE_DIR = os.path.join(os.path.dirname(__file__), ".longbench_cache")
 _cached_input_ids = {}
 
 
-class KLTestMixin:
+class MambaSchedulerStrategyMixin:
     @classmethod
     def format_longbench_v2_example(cls, example):
         """Format a LongBench V2 example into a single text string (context + question only)."""
