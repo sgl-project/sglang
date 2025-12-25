@@ -51,7 +51,7 @@ wget -O "${BISHENG_NAME}" "${BISHENG_URL}" && chmod a+x "${BISHENG_NAME}" && "./
 ### Install sgl-kernel-npu
 mkdir sgl-kernel-npu
 cd sgl-kernel-npu
-https://github.com/sgl-project/sgl-kernel-npu/releases/download/2025.12.24/sgl-kernel-npu_2025.12.24_8.3.rc2_910b.zip
+wget https://github.com/sgl-project/sgl-kernel-npu/releases/download/2025.12.24/sgl-kernel-npu_2025.12.24_8.3.rc2_910b.zip
 unzip sgl-kernel-npu_2025.12.24_8.3.rc2_910b.zip
 ${PIP_INSTALL} output/deep_ep*.whl output/sgl_kernel_npu*.whl
 cd .. && rm -rf sgl-kernel-npu
