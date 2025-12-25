@@ -3,7 +3,6 @@ import collections
 import pytest
 import requests
 
-
 ROUTING_KEY_HEADER = "X-SMG-Routing-Key"
 
 
