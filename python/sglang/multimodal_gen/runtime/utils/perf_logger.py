@@ -138,20 +138,24 @@ class StageProfiler:
         self.simple_log = simple_log
         self.start_time = 0.0
 
+        self._metrics_enabled = StageProfiler.metrics_enabled()
+
+    @staticmethod
+    def metrics_enabled():
         # Check env var at runtime to ensure we pick up changes (e.g. from CLI args)
-        self.metrics_enabled = envs.SGLANG_DIFFUSION_STAGE_LOGGING
+        return envs.SGLANG_DIFFUSION_STAGE_LOGGING
 
     def __enter__(self):
         if self.simple_log:
             self.logger.info(f"[{self.stage_name}] started...")
 
-        if (self.metrics_enabled and self.timings) or self.simple_log:
+        if (self._metrics_enabled and self.timings) or self.simple_log:
             self.start_time = time.perf_counter()
 
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        if not ((self.metrics_enabled and self.timings) or self.simple_log):
+        if not ((self._metrics_enabled and self.timings) or self.simple_log):
             return False
 
         execution_time_s = time.perf_counter() - self.start_time
@@ -171,7 +175,7 @@ class StageProfiler:
                 f"[{self.stage_name}] finished in {execution_time_s:.4f} seconds",
             )
 
-        if self.metrics_enabled and self.timings:
+        if self._metrics_enabled and self.timings:
             if "denoising_step_" in self.stage_name:
                 index = int(self.stage_name[len("denoising_step_") :])
                 self.timings.record_steps(index, execution_time_s)
@@ -240,6 +244,8 @@ class PerformanceLogger:
     ):
         """logs the stage metrics and total duration for a completed request
         to the performance_log file.
+
+        Note that this accords to the time spent internally in server, postprocess is not included
         """
         formatted_stages = [
             {"name": name, "execution_time_ms": duration_ms}

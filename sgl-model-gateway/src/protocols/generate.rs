@@ -167,6 +167,10 @@ pub struct GenerateRequest {
     /// Request ID for tracking (inherited from BaseReq in Python)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rid: Option<String>,
+
+    /// Routing ID for manual routing policy
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub routing_id: Option<String>,
 }
 
 impl Normalizable for GenerateRequest {
@@ -234,6 +238,10 @@ impl GenerationRequest for GenerateRequest {
 
         // No text input found
         String::new()
+    }
+
+    fn get_routing_id(&self) -> Option<&str> {
+        self.routing_id.as_deref()
     }
 }
 

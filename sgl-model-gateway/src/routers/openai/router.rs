@@ -291,6 +291,14 @@ impl OpenAIRouter {
             .min_by_key(|w| w.load())
     }
 
+    /// Check if any worker supports the model (regardless of circuit breaker state)
+    fn any_worker_supports_model(&self, model_id: &str) -> bool {
+        self.worker_registry
+            .get_workers_filtered(None, None, None, Some(RuntimeType::External), true)
+            .into_iter()
+            .any(|w| w.supports_model(model_id))
+    }
+
     async fn select_worker_for_model(
         &self,
         model_id: &str,
@@ -308,8 +316,17 @@ impl OpenAIRouter {
         );
         self.refresh_external_models(auth_header).await;
 
-        self.find_best_worker_for_model(model_id)
-            .ok_or_else(|| error_responses::model_not_found(model_id))
+        self.find_best_worker_for_model(model_id).ok_or_else(|| {
+            // Check if the model exists but all workers are circuit-broken
+            if self.any_worker_supports_model(model_id) {
+                error_responses::service_unavailable(format!(
+                    "All workers for model '{}' are temporarily unavailable",
+                    model_id
+                ))
+            } else {
+                error_responses::model_not_found(model_id)
+            }
+        })
     }
 
     /// Deserialize ResponseInputOutputItems from a JSON array value
