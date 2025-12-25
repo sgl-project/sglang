@@ -465,13 +465,6 @@ class Glm4MoeDetector(BaseFormatDetector):
                             parameters="",
                         )
                     )
-                    calls.append(
-                        ToolCallItem(
-                            tool_index=self.current_tool_id,
-                            name=func_name,
-                            parameters="",
-                        )
-                    )
                     self.current_tool_name_sent = True
                     self._streamed_raw_length = 0
                     self._reset_streaming_state()
