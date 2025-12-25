@@ -152,6 +152,7 @@ class ConfigLoader:
 
         with open(config_path, "w") as f:
             json.dump(sorted_config, f, indent=4)
+            f.write("\n")
 
         self._config_cache[(N, K)] = config
         return config_path
