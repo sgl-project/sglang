@@ -1493,7 +1493,7 @@ class ModelRunner:
 
         return result
 
-    def get_kv_cache_cell_size(self, num_layers: int) -> int:
+    def get_cell_size_per_token(self, num_layers: int) -> int:
         kv_size = torch._utils._element_size(self.kv_cache_dtype)
         if self.use_mla_backend:
             cell_size = (
@@ -1579,7 +1579,7 @@ class ModelRunner:
         else:
             num_layers = self.num_effective_layers
 
-        cell_size = self.get_kv_cache_cell_size(num_layers)
+        cell_size = self.get_cell_size_per_token(num_layers)
 
         rest_memory = available_gpu_memory - total_gpu_memory * (
             1 - self.mem_fraction_static
