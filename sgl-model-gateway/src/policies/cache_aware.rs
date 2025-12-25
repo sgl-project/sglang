@@ -73,7 +73,8 @@ use rand::Rng;
 use tracing::debug;
 
 use super::{
-    get_healthy_worker_indices, normalize_model_key, tree::Tree, CacheAwareConfig, LoadBalancingPolicy, SelectWorkerInfo,
+    get_healthy_worker_indices, normalize_model_key, tree::Tree, CacheAwareConfig,
+    LoadBalancingPolicy, SelectWorkerInfo,
 };
 use crate::core::Worker;
 
