@@ -64,7 +64,6 @@ class QwenTimestepProjEmbeddings(nn.Module):
         )  # (N, D)
 
         conditioning = timesteps_emb
-        assert self.use_additional_t_cond is not None
         if self.use_additional_t_cond:
             if addition_t_cond is None:
                 raise ValueError(
@@ -779,7 +778,6 @@ class QwenImageTransformer2DModel(CachableDiT):
                 theta=10000, axes_dim=list(axes_dims_rope), scale_rope=True
             )
 
-        self.time_text_embed = QwenTimestepProjEmbeddings(embedding_dim=self.inner_dim)
         self.time_text_embed = QwenTimestepProjEmbeddings(
             embedding_dim=self.inner_dim,
             use_additional_t_cond=self.use_additional_t_cond,
