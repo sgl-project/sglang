@@ -489,9 +489,9 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
         # cu_seqlens must be on cpu because of npu_flash_attention_unpad operator restriction
         if is_npu():
             cu_seqlens = cu_seqlens.to("cpu")
-
+        else:
+            cu_seqlens = cu_seqlens.to(self.device, non_blocking=True)
         x = x.unsqueeze(1)
-        cu_seqlens = cu_seqlens.to(self.device, non_blocking=True)
 
         deepstack_feature_lists = []
         num_deepstack_captured = 0
