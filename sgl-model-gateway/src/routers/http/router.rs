@@ -16,6 +16,7 @@ use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::{debug, error};
 
 use crate::{
+    app_context::AppContext,
     config::types::RetryConfig,
     core::{
         is_retryable_status, ConnectionMode, RetryExecutor, Worker, WorkerLoadGuard,
@@ -45,7 +46,6 @@ use crate::{
 };
 
 /// Regular router that uses injected load balancing policies
-#[derive(Debug)]
 pub struct Router {
     worker_registry: Arc<WorkerRegistry>,
     policy_registry: Arc<PolicyRegistry>,
@@ -55,9 +55,22 @@ pub struct Router {
     retry_config: RetryConfig,
 }
 
+impl std::fmt::Debug for Router {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Router")
+            .field("worker_registry", &self.worker_registry)
+            .field("policy_registry", &self.policy_registry)
+            .field("client", &self.client)
+            .field("dp_aware", &self.dp_aware)
+            .field("enable_igw", &self.enable_igw)
+            .field("retry_config", &self.retry_config)
+            .finish()
+    }
+}
+
 impl Router {
     /// Create a new router with injected policy and client
-    pub async fn new(ctx: &Arc<crate::app_context::AppContext>) -> Result<Self, String> {
+    pub async fn new(ctx: &Arc<AppContext>) -> Result<Self, String> {
         Ok(Router {
             worker_registry: ctx.worker_registry.clone(),
             policy_registry: ctx.policy_registry.clone(),
@@ -127,7 +140,7 @@ impl Router {
     fn select_worker_for_model(
         &self,
         model_id: Option<&str>,
-        text: Option<&str>,
+        info: &crate::policies::SelectWorkerInfo,
     ) -> Option<Arc<dyn Worker>> {
         let effective_model_id = if !self.enable_igw { None } else { model_id };
 
@@ -155,7 +168,7 @@ impl Router {
             None => self.policy_registry.get_default_policy(),
         };
 
-        let idx = policy.select_worker(&available, text)?;
+        let idx = policy.select_worker(&available, info)?;
 
         // Record worker selection metric (Layer 3)
         Metrics::record_worker_selection(
@@ -178,6 +191,11 @@ impl Router {
         let start = Instant::now();
         let is_stream = typed_req.is_stream();
         let text = typed_req.extract_text_for_routing();
+        let routing_id = typed_req.get_routing_id().map(|s| s.to_string());
+        let info = crate::policies::SelectWorkerInfo {
+            request_text: Some(&text),
+            routing_id: routing_id.as_deref(),
+        };
         let model = model_id.unwrap_or("default");
         let endpoint = route_to_endpoint(route);
 
@@ -195,8 +213,18 @@ impl Router {
             &self.retry_config,
             // operation per attempt
             |_: u32| async {
-                self.route_typed_request_once(headers, typed_req, route, model_id, is_stream, &text)
-                    .await
+                let res = self
+                    .route_typed_request_once(headers, typed_req, route, model_id, is_stream, &info)
+                    .await;
+
+                // Need to be outside `route_typed_request_once` because that function has multiple return paths
+                Metrics::record_router_upstream_response(
+                    metrics_labels::ROUTER_HTTP,
+                    res.status().as_u16(),
+                    extract_error_code_from_response(&res),
+                );
+
+                res
             },
             // should_retry predicate
             |res, _attempt| is_retryable_status(res.status()),
@@ -244,9 +272,9 @@ impl Router {
         route: &'static str,
         model_id: Option<&str>,
         is_stream: bool,
-        text: &str,
+        info: &crate::policies::SelectWorkerInfo<'_>,
     ) -> Response {
-        let worker = match self.select_worker_for_model(model_id, Some(text)) {
+        let worker = match self.select_worker_for_model(model_id, info) {
             Some(w) => w,
             None => {
                 return error::service_unavailable(
@@ -667,6 +695,8 @@ fn convert_reqwest_error(e: reqwest::Error) -> Response {
 }
 
 use async_trait::async_trait;
+
+use crate::routers::error::extract_error_code_from_response;
 
 #[async_trait]
 impl RouterTrait for Router {
