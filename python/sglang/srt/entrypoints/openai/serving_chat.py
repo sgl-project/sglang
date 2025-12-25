@@ -91,7 +91,7 @@ class OpenAIServingChat(OpenAIServingBase):
             self.tokenizer_manager.tokenizer is not None
             and self.tokenizer_manager.tokenizer.chat_template is not None
         )
-        architectures = self.tokenizer_manager.server_args.get_hf_config().architectures
+        architectures = self.tokenizer_manager.model_config.hf_config.architectures
         is_dpsk_v32 = "DeepseekV3" in architectures[0] if architectures else False
         return not has_chat_template and is_dpsk_v32
 
