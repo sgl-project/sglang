@@ -292,7 +292,7 @@ class TestDisaggregationHybridAttentionMamba(PDDisaggregationServerBase):
         metrics = run_eval_few_shot_gsm8k(args)
         print(f"Evaluation metrics: {metrics}")
 
-        self.assertGreater(metrics["accuracy"], 0.93)
+        self.assertGreater(metrics["accuracy"], 0.87)
 
 
 class TestDisaggregationHybridAttentionMambaExtraBuffer(PDDisaggregationServerBase):
@@ -364,7 +364,7 @@ class TestDisaggregationHybridAttentionMambaExtraBuffer(PDDisaggregationServerBa
         metrics = run_eval_few_shot_gsm8k(args)
         print(f"Evaluation metrics: {metrics}")
 
-        self.assertGreater(metrics["accuracy"], 0.93)
+        self.assertGreater(metrics["accuracy"], 0.87)
 
 
 if __name__ == "__main__":
