@@ -470,10 +470,43 @@ class TestTritonAttention(CustomTestCase):
             sm_scale,
         )
 
-    def test_decode_attention(self):
-        # Here we just to ensure there is no error
-        # TODO: correctness test
+        # Correctness reference (float32, stable softmax)
+        assert H_Q % H_KV == 0, "H_Q must be divisible by H_KV for GQA"
+        group_size = H_Q // H_KV
 
+        o_ref = torch.empty((B, H_Q, D), dtype=torch.float32, device=device)
+
+        for b in range(B):
+            start = int(kv_indptr[b].item())
+            end = int(kv_indptr[b + 1].item())
+            idx = kv_indices[start:end]
+
+            k_seq = k_buffer.index_select(0, idx)  # [L, H_KV, D]
+            v_seq = v_buffer.index_select(0, idx)  # [L, H_KV, D]
+
+            if H_KV != H_Q:
+                k_seq = k_seq.repeat_interleave(group_size, dim=1)  # [L, H_Q, D]
+                v_seq = v_seq.repeat_interleave(group_size, dim=1)  # [L, H_Q, D]
+
+            q_f32 = q[b].to(torch.float32)  # [H_Q, D]
+            k_f32 = k_seq.to(torch.float32)  # [L, H_Q, D]
+            v_f32 = v_seq.to(torch.float32)  # [L, H_Q, D]
+
+            # logits: [H_Q, L]
+            logits = torch.einsum("hd,lhd->hl", q_f32, k_f32) * float(sm_scale)
+            logits = logits - logits.max(dim=-1, keepdim=True).values
+            p = torch.softmax(logits, dim=-1)  # [H_Q, L]
+
+            # out: [H_Q, D]
+            o_ref[b] = torch.einsum("hl,lhd->hd", p, v_f32)
+
+        max_abs_err = (o.to(torch.float32) - o_ref).abs().max().item()
+        self.assertTrue(
+            torch.allclose(o.to(torch.float32), o_ref, atol=2e-2, rtol=1e-2),
+            msg=f"decode_attention mismatch, max_abs_err={max_abs_err}",
+        )
+
+    def test_decode_attention(self):
         # Test configurations
         configs = [
             (2, 4, 4, 64),  # MHA
