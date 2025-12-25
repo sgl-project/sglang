@@ -1,15 +1,13 @@
 import itertools
-import math
 import os
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Optional, Tuple
 
-import numpy as np
 import torch
 import triton
 import triton.testing
-from sgl_kernel import sgl_per_tensor_quant_fp8
 
-# Optional imports
+from sglang.jit_kernel.per_tensor_quant_fp8 import per_tensor_quant_fp8
+
 try:
     from vllm import _custom_ops as ops
 
@@ -18,11 +16,13 @@ except ImportError:
     ops = None
     VLLM_AVAILABLE = False
 
-from sglang.srt.utils import is_hip
+try:
+    from sglang.srt.utils import is_hip
 
-_is_hip = is_hip()
+    _is_hip = is_hip()
+except ImportError:
+    _is_hip = False
 
-# CI environment detection
 IS_CI = (
     os.getenv("CI", "false").lower() == "true"
     or os.getenv("GITHUB_ACTIONS", "false").lower() == "true"
@@ -36,7 +36,6 @@ def vllm_scaled_fp8_quant(
     scale: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     if not VLLM_AVAILABLE:
-        # Fallback to SGLang implementation
         return sglang_scaled_fp8_quant(input, scale)
     return ops.scaled_fp8_quant(input, scale)
 
@@ -51,18 +50,17 @@ def sglang_scaled_fp8_quant(
     if scale is None:
         scale = torch.zeros(1, device=input.device, dtype=torch.float32)
         is_static = False
-    sgl_per_tensor_quant_fp8(input, output, scale, is_static)
+    per_tensor_quant_fp8(input, output, scale, is_static)
 
     return output, scale
 
 
 def calculate_diff(batch_size: int, seq_len: int):
-    """Calculate difference between VLLM and SGLang implementations."""
     device = torch.device("cuda")
     x = torch.rand((batch_size, seq_len), dtype=torch.float16, device=device)
 
     if not VLLM_AVAILABLE:
-        print("⚠️ vLLM not available, skipping comparison")
+        print("vLLM not available, skipping comparison")
         return
 
     vllm_out, vllm_scale = vllm_scaled_fp8_quant(x)
@@ -74,15 +72,14 @@ def calculate_diff(batch_size: int, seq_len: int):
     if torch.allclose(
         vllm_out.to(torch.float32), sglang_out.to(torch.float32), rtol=1e-3, atol=1e-5
     ) and torch.allclose(vllm_scale, sglang_scale, rtol=1e-3, atol=1e-5):
-        print("✅ All implementations match")
+        print("All implementations match")
     else:
-        print("❌ Implementations differ")
+        print("Implementations differ")
 
 
-# CI environment uses simplified parameters
 if IS_CI:
-    batch_size_range = [16]  # Single batch size for CI
-    seq_len_range = [64]  # Single sequence length for CI
+    batch_size_range = [16]
+    seq_len_range = [64]
 else:
     batch_size_range = [16, 32, 64, 128]
     seq_len_range = [64, 128, 256, 512, 1024, 2048]
@@ -125,6 +122,8 @@ def benchmark(batch_size, seq_len, provider):
         fn = lambda: vllm_scaled_fp8_quant(x.clone())
     elif provider == "sglang":
         fn = lambda: sglang_scaled_fp8_quant(x.clone())
+    else:
+        raise ValueError(f"Unknown provider: {provider}")
 
     ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(fn, quantiles=quantiles)
 
