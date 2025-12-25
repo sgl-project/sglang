@@ -80,6 +80,54 @@ def download_image_from_url(url: str) -> Path:
         raise
 
 
+def parse_dimensions(size_string: str | None) -> tuple[int | None, int | None]:
+    """Parse a size string in "widthxheight" format to (width, height) tuple.
+
+    Args:
+        size_string: Size string in "widthxheight" format (e.g., "1024x1024") or None.
+                    Spaces are automatically stripped.
+
+    Returns:
+        Tuple of (width, height) as integers if parsing succeeds, (None, None) otherwise.
+        Returns (None, None) if:
+        - size_string is None or empty
+        - size_string doesn't contain exactly one "x" separator
+        - width or height cannot be converted to int
+        - width or height is <= 0
+    """
+    if not size_string:
+        return (None, None)
+
+    # Strip spaces from the entire string
+    size_string = size_string.strip()
+    if not size_string:
+        return (None, None)
+
+    # Split by "x"
+    parts = size_string.split("x")
+    if len(parts) != 2:
+        return (None, None)
+
+    # Strip spaces from each part and try to convert to int
+    try:
+        width_str = parts[0].strip()
+        height_str = parts[1].strip()
+
+        if not width_str or not height_str:
+            return (None, None)
+
+        width = int(width_str)
+        height = int(height_str)
+
+        # Validate that both are positive
+        if width <= 0 or height <= 0:
+            return (None, None)
+
+        return (width, height)
+    except ValueError:
+        return (None, None)
+
+
 @dataclass
 class ServerContext:
     """Context for a running diffusion server."""
@@ -761,11 +809,7 @@ def get_generate_fn(
             f.write(content)
 
         # Validate output file
-        expected_width, expected_height = None, None
-        if size:
-            parts = size.split("x")
-            if len(parts) == 2:
-                expected_width, expected_height = int(parts[0]), int(parts[1])
+        expected_width, expected_height = parse_dimensions(size)
         validate_video_file(
             tmp_path, expected_filename, expected_width, expected_height
         )
@@ -811,11 +855,7 @@ def get_generate_fn(
             f.write(img_data)
 
         # Validate output file
-        expected_width, expected_height = None, None
-        if output_size:
-            parts = output_size.split("x")
-            if len(parts) == 2:
-                expected_width, expected_height = int(parts[0]), int(parts[1])
+        expected_width, expected_height = parse_dimensions(output_size)
         validate_image_file(
             tmp_path,
             expected_filename,
@@ -888,11 +928,7 @@ def get_generate_fn(
             f.write(img_data)
 
         # Validate output file
-        expected_width, expected_height = None, None
-        if output_size:
-            parts = output_size.split("x")
-            if len(parts) == 2:
-                expected_width, expected_height = int(parts[0]), int(parts[1])
+        expected_width, expected_height = parse_dimensions(output_size)
         validate_image_file(
             tmp_path,
             expected_filename,
@@ -958,11 +994,7 @@ def get_generate_fn(
             f.write(img_data)
 
         # Validate output file
-        expected_width, expected_height = None, None
-        if sampling_params.output_size:
-            parts = sampling_params.output_size.split("x")
-            if len(parts) == 2:
-                expected_width, expected_height = int(parts[0]), int(parts[1])
+        expected_width, expected_height = parse_dimensions(sampling_params.output_size)
         validate_image_file(
             tmp_path,
             expected_filename,
