@@ -26,7 +26,7 @@ use crate::{
         metrics::{bool_to_static_str, metrics_labels, Metrics},
         otel_trace::inject_trace_context_http,
     },
-    policies::{LoadBalancingPolicy, PolicyRegistry},
+    policies::{LoadBalancingPolicy, PolicyRegistry, SelectWorkerInfo},
     protocols::{
         chat::{ChatCompletionRequest, ChatMessage, MessageContent},
         common::{InputIds, StringOrArray},
@@ -784,7 +784,7 @@ impl PDRouter {
         }
 
         let selected_idx = policy
-            .select_worker(&available_workers, request_text)
+            .select_worker(&available_workers, &SelectWorkerInfo { request_text })
             .ok_or_else(|| {
                 format!(
                     "Policy {} failed to select a {} worker",
