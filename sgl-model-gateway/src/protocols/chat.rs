@@ -363,6 +363,10 @@ pub struct ChatCompletionRequest {
     /// Random seed for sampling for deterministic outputs
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sampling_seed: Option<u64>,
+
+    /// Routing ID for manual routing policy
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub routing_id: Option<String>,
 }
 
 // ============================================================================
@@ -699,6 +703,10 @@ impl GenerationRequest for ChatCompletionRequest {
         }
 
         buffer
+    }
+
+    fn get_routing_id(&self) -> Option<&str> {
+        self.routing_id.as_deref()
     }
 }
 

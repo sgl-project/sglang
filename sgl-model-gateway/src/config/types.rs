@@ -336,6 +336,9 @@ pub enum PolicyConfig {
         /// Interval between bucket boundary adjustment cycles (seconds)
         bucket_adjust_interval_secs: usize,
     },
+
+    #[serde(rename = "manual")]
+    Manual,
 }
 
 impl PolicyConfig {
@@ -346,6 +349,7 @@ impl PolicyConfig {
             PolicyConfig::CacheAware { .. } => "cache_aware",
             PolicyConfig::PowerOfTwo { .. } => "power_of_two",
             PolicyConfig::Bucket { .. } => "bucket",
+            PolicyConfig::Manual => "manual",
         }
     }
 }

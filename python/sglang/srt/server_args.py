@@ -84,6 +84,7 @@ LOAD_FORMAT_CHOICES = [
     "flash_rl",
     "remote",
     "remote_instance",
+    "fastsafetensors",
     "private",
 ]
 
@@ -264,7 +265,6 @@ class ServerArgs:
     context_length: Optional[int] = None
     is_embedding: bool = False
     enable_multimodal: Optional[bool] = None
-    limit_mm_data_per_request: Optional[Union[str, Dict[str, int]]] = None
     revision: Optional[str] = None
     model_impl: str = "auto"
 
@@ -337,6 +337,7 @@ class ServerArgs:
     log_level_http: Optional[str] = None
     log_requests: bool = False
     log_requests_level: int = 2
+    log_requests_format: str = "text"
     crash_dump_folder: Optional[str] = None
     show_time_cost: bool = False
     enable_metrics: bool = False
@@ -376,7 +377,6 @@ class ServerArgs:
     # Data parallelism
     dp_size: int = 1
     load_balance_method: str = "round_robin"
-    load_watch_interval: float = 0.1
     # FIXME: remove this after dp rank scheduling is fully supported with PD-Disaggregation
     prefill_round_robin_balance: bool = False
 
@@ -548,7 +548,7 @@ class ServerArgs:
     enable_piecewise_cuda_graph: bool = False
     enable_torch_compile_debug_mode: bool = False
     torch_compile_max_bs: int = 32
-    piecewise_cuda_graph_max_tokens: int = 4096
+    piecewise_cuda_graph_max_tokens: Optional[int] = None
     piecewise_cuda_graph_tokens: Optional[List[int]] = None
     piecewise_cuda_graph_compiler: str = "eager"
     torchao_config: str = ""
@@ -602,6 +602,8 @@ class ServerArgs:
     disaggregation_prefill_pp: Optional[int] = 1
     disaggregation_ib_device: Optional[str] = None
     disaggregation_decode_enable_offload_kvcache: bool = False
+    # Enable auto FAKE mode for decode node testing, no need to pass bootstrap_host in request
+    disaggregation_decode_enable_fake_auto: bool = False
     num_reserved_decode_tokens: int = 512  # used for decode kv cache offload in PD
     # FIXME: hack to reduce ITL when decode bs is small
     disaggregation_decode_polling_interval: int = 1
@@ -633,6 +635,7 @@ class ServerArgs:
     enable_prefix_mm_cache: bool = False
     mm_enable_dp_encoder: bool = False
     mm_process_config: Optional[Dict[str, Any]] = None
+    limit_mm_data_per_request: Optional[Union[str, Dict[str, int]]] = None
 
     # For checkpoint decryption
     decrypted_config_file: Optional[str] = None
@@ -721,14 +724,11 @@ class ServerArgs:
         # Handle diffusion LLM inference.
         self._handle_dllm_inference()
 
-        # Handle any other necessary validations.
-        self._handle_other_validations()
-
-        # Handle two-batch overlap settings.
-        self._handle_two_batch_overlap()
-
         # Handle debug utilities.
         self._handle_debug_utils()
+
+        # Handle any other necessary validations.
+        self._handle_other_validations()
 
     def _handle_deprecated_args(self):
         # Handle deprecated tool call parsers
@@ -894,6 +894,12 @@ class ServerArgs:
         else:
             self.cuda_graph_max_bs = max(self.cuda_graph_bs)
 
+        if self.piecewise_cuda_graph_max_tokens is None:
+            # Capture piecewise cuda graph tokens up to the chunked prefill size. Two benefits:
+            # 1. cuda graph acceleration for all prefill lengths.
+            # 2. do not need more temporary memory for activations. Less fragmentation.
+            self.piecewise_cuda_graph_max_tokens = self.chunked_prefill_size
+
         if self.piecewise_cuda_graph_tokens is None:
             self.piecewise_cuda_graph_tokens = (
                 self._generate_piecewise_cuda_graph_tokens()
@@ -935,7 +941,7 @@ class ServerArgs:
 
             # For piecewise cuda graphs
             if self.enable_piecewise_cuda_graph:
-                reserved_mem += self.piecewise_cuda_graph_max_tokens // 4
+                reserved_mem += self.piecewise_cuda_graph_max_tokens // 8
 
             self.mem_fraction_static = (
                 round((gpu_mem - reserved_mem) / gpu_mem, 3)
@@ -1424,9 +1430,11 @@ class ServerArgs:
                         self.disable_radix_cache = True
                         self.disable_overlap_schedule = False
 
-        if not self.get_model_config().is_generation:
+        if envs.SGLANG_EMBEDDINGS_SPARSE_HEAD.is_set():
             self.disable_overlap_schedule = True
-            logger.warning("Overlap scheduler is disabled for embedding models.")
+            logger.warning(
+                f"Overlap scheduler is disabled when using sparse head for embedding model."
+            )
 
         # TRTLLM AllReduce Fusion supports SM90/100/120, enable it by default
         # for models with explicit support (DeepseekV3, GptOss, Glm4Moe, Qwen3Moe)
@@ -2171,12 +2179,6 @@ class ServerArgs:
             raise ValueError(
                 "Cannot set --encoder-only and --disaggregation-mode prefill/decode together"
             )
-        if (
-            self.language_only
-            and self.encoder_transfer_backend == "zmq_to_scheduler"
-            and self.pp_size > 1
-        ):
-            raise ValueError("zmq_to_scheduler not support pp_size > 1")
 
         if self.language_only and len(self.encoder_urls) == 0:
             raise ValueError(
@@ -2397,12 +2399,6 @@ class ServerArgs:
                     self.preferred_sampling_params
                 )
 
-    def _handle_two_batch_overlap(self):
-        if self.enable_two_batch_overlap and self.moe_a2a_backend == "none":
-            raise ValueError(
-                "When enabling two batch overlap, moe_a2a_backend cannot be 'none'."
-            )
-
     def _handle_debug_utils(self):
         if is_in_ci() and self.soft_watchdog_timeout is None:
             logger.info("Set soft_watchdog_timeout since in CI")
@@ -2495,13 +2491,6 @@ class ServerArgs:
             default=ServerArgs.enable_multimodal,
             action="store_true",
             help="Enable the multimodal functionality for the served model. If the model being served is not multimodal, nothing will happen",
-        )
-        parser.add_argument(
-            "--limit-mm-data-per-request",
-            type=json.loads,
-            default=ServerArgs.limit_mm_data_per_request,
-            help="Limit the number of multimodal inputs per request. "
-            'e.g. \'{"image": 1, "video": 1, "audio": 1}\'',
         )
         parser.add_argument(
             "--revision",
@@ -2921,6 +2910,13 @@ class ServerArgs:
             choices=[0, 1, 2, 3],
         )
         parser.add_argument(
+            "--log-requests-format",
+            type=str,
+            default=ServerArgs.log_requests_format,
+            choices=["text", "json"],
+            help="Format for request logging: 'text' (human-readable) or 'json' (structured)",
+        )
+        parser.add_argument(
             "--crash-dump-folder",
             type=str,
             default=ServerArgs.crash_dump_folder,
@@ -3147,12 +3143,6 @@ class ServerArgs:
                 "shortest_queue",
                 "minimum_tokens",
             ],
-        )
-        parser.add_argument(
-            "--load-watch-interval",
-            type=float,
-            default=ServerArgs.load_watch_interval,
-            help="The interval of load watching in seconds.",
         )
         parser.add_argument(
             "--prefill-round-robin-balance",
@@ -4262,6 +4252,12 @@ class ServerArgs:
             help="Enable async KV cache offloading on decode server (PD mode).",
         )
         parser.add_argument(
+            "--disaggregation-decode-enable-fake-auto",
+            action="store_true",
+            help="Auto enable FAKE mode for decode node testing, "
+            "no need to pass bootstrap_host and bootstrap_room in request.",
+        )
+        parser.add_argument(
             "--num-reserved-decode-tokens",
             type=int,
             default=ServerArgs.num_reserved_decode_tokens,
@@ -4400,6 +4396,13 @@ class ServerArgs:
             action="store_true",
             default=ServerArgs.mm_enable_dp_encoder,
             help="Enabling data parallelism for mm encoder. The dp size will be set to the tp size automatically.",
+        )
+        parser.add_argument(
+            "--limit-mm-data-per-request",
+            type=json.loads,
+            default=ServerArgs.limit_mm_data_per_request,
+            help="Limit the number of multimodal inputs per request. "
+            'e.g. \'{"image": 1, "video": 1, "audio": 1}\'',
         )
 
         # For checkpoint decryption
@@ -4612,6 +4615,12 @@ class ServerArgs:
         if self.export_metrics_to_file and self.export_metrics_to_file_dir is None:
             raise ValueError(
                 "--export-metrics-to-file-dir is required when --export-metrics-to-file is enabled"
+            )
+
+        # Check two batch overlap
+        if self.enable_two_batch_overlap and self.moe_a2a_backend == "none":
+            raise ValueError(
+                "When enabling two batch overlap, moe_a2a_backend cannot be 'none'."
             )
 
     def check_torch_2_9_1_cudnn_compatibility(self):
