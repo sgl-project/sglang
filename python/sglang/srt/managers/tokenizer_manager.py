@@ -182,11 +182,6 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         # Parse args
         self.server_args = server_args
         self.enable_metrics = server_args.enable_metrics
-        self.request_logger = RequestLogger(
-            log_requests=server_args.log_requests,
-            log_requests_level=server_args.log_requests_level,
-            log_requests_format=server_args.log_requests_format,
-        )
         self.preferred_sampling_params = server_args.preferred_sampling_params
         self.crash_dump_folder = server_args.crash_dump_folder
         self.enable_trace = server_args.enable_trace
@@ -210,6 +205,36 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         )
 
         set_global_server_args_for_tokenizer(server_args)
+
+        # Initialize tokenizer and multimodalprocessor
+        self.init_tokenizer_and_processor()
+
+        # Init inter-process communication
+        self.init_ipc_channels(port_args)
+
+        # Init running status
+        self.init_running_status()
+
+        # Init logging and dumping
+        self.init_request_logging_and_dumping()
+
+        # Init weight update
+        self.init_weight_update()
+
+        # Init LoRA status
+        self.init_lora()
+
+        # Init PD disaggregation and encoder disaggregation
+        self.init_disaggregation()
+
+        # Init metric collector and watchdog
+        self.init_metric_collector_watchdog()
+
+        # Init request dispatcher
+        self.init_request_dispatcher()
+
+    def init_tokenizer_and_processor(self):
+        server_args = self.server_args
 
         # Initialize tokenizer and processor
         if self.model_config.is_multimodal:
@@ -265,7 +290,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         else:
             self.async_dynamic_batch_tokenizer = None
 
-        # Init inter-process communication
+    def init_ipc_channels(self, port_args: PortArgs):
         context = zmq.asyncio.Context(2)
         self.recv_from_detokenizer = get_zmq_socket(
             context, zmq.PULL, port_args.tokenizer_ipc_name, True
@@ -285,13 +310,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             # Make sure that each request carries the tokenizer_ipc_name for response routing
             self.send_to_scheduler = SenderWrapper(port_args, send_to_scheduler)
 
-        # E Disaggregation
-        if self.server_args.language_only:
-            self.mm_receiver = MMReceiver(
-                server_args,
-                dtype=self.model_config.dtype,
-            )
-
+    def init_running_status(self):
         # Request states
         self._chosen_loop = None
         self.rid_to_state: Dict[str, ReqState] = {}
@@ -302,10 +321,17 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         self.gracefully_exit = False
         self.last_receive_tstamp = 0
 
-        # Initial weights status
-        self.initial_weights_loaded = True
-        if server_args.checkpoint_engine_wait_weights_before_ready:
-            self.initial_weights_loaded = False
+        # For load balancing
+        self.current_load = 0
+        self.current_load_lock = asyncio.Lock()
+
+    def init_request_logging_and_dumping(self):
+        # Request logging
+        self.request_logger = RequestLogger(
+            log_requests=self.server_args.log_requests,
+            log_requests_level=self.server_args.log_requests_level,
+            log_requests_format=self.server_args.log_requests_format,
+        )
 
         # Dumping
         self.dump_requests_folder = ""  # By default do not dump
@@ -320,6 +346,12 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             self.server_args, obj_skip_names, out_skip_names
         )
 
+    def init_weight_update(self):
+        # Initial weights status
+        self.initial_weights_loaded = True
+        if self.server_args.checkpoint_engine_wait_weights_before_ready:
+            self.initial_weights_loaded = False
+
         # Session
         self.session_futures = {}  # session_id -> asyncio event
 
@@ -332,6 +364,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         self.is_pause = False
         self.is_pause_cond = asyncio.Condition()
 
+    def init_lora(self):
         # LoRA
         # Initialize the `LoRARegistry` with initial LoRA adapter paths provided in `server_args`.
         # The registry dynamically updates as adapters are loaded / unloaded during runtime. It
@@ -350,27 +383,32 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             for lora_ref in self.server_args.lora_paths:
                 self.lora_ref_cache[lora_ref.lora_name] = lora_ref
 
-        # Disaggregation
+    def init_disaggregation(self):
+        # PD Disaggregation
         self.disaggregation_mode = DisaggregationMode(
             self.server_args.disaggregation_mode
         )
         self.bootstrap_server = start_disagg_service(self.server_args)
 
-        # For load balancing
-        self.current_load = 0
-        self.current_load_lock = asyncio.Lock()
+        # Encoder Disaggregation
+        if self.server_args.language_only:
+            self.mm_receiver = MMReceiver(
+                self.server_args,
+                dtype=self.model_config.dtype,
+            )
 
+    def init_metric_collector_watchdog(self):
         # Metrics
         if self.enable_metrics:
             labels = {
                 "model_name": self.server_args.served_model_name,
                 # TODO: Add lora name/path in the future,
             }
-            if server_args.tokenizer_metrics_allowed_custom_labels:
-                for label in server_args.tokenizer_metrics_allowed_custom_labels:
+            if self.server_args.tokenizer_metrics_allowed_custom_labels:
+                for label in self.server_args.tokenizer_metrics_allowed_custom_labels:
                     labels[label] = ""
             self.metrics_collector = TokenizerMetricsCollector(
-                server_args=server_args,
+                server_args=self.server_args,
                 labels=labels,
                 bucket_time_to_first_token=self.server_args.bucket_time_to_first_token,
                 bucket_e2e_request_latency=self.server_args.bucket_e2e_request_latency,
@@ -378,11 +416,16 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 collect_tokens_histogram=self.server_args.collect_tokens_histogram,
             )
 
-        # Configure GC warning
         if self.server_args.gc_warning_threshold_secs > 0.0:
             configure_gc_warning(self.server_args.gc_warning_threshold_secs)
+        self.watchdog = Watchdog.create(
+            debug_name="TokenizerManager",
+            watchdog_timeout=self.server_args.soft_watchdog_timeout,
+            soft=True,
+            test_stuck_time=envs.SGLANG_TEST_STUCK_TOKENIZER.get(),
+        )
 
-        # Dispatcher and communicators
+    def init_request_dispatcher(self):
         self._result_dispatcher = TypeBasedDispatcher(
             [
                 (
@@ -405,14 +448,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 (HealthCheckOutput, lambda x: None),
             ]
         )
-        self.init_communicators(server_args)
-
-        self.watchdog = Watchdog.create(
-            debug_name="TokenizerManager",
-            watchdog_timeout=server_args.soft_watchdog_timeout,
-            soft=True,
-            test_stuck_time=envs.SGLANG_TEST_STUCK_TOKENIZER.get(),
-        )
+        self.init_communicators(self.server_args)
 
     async def generate_request(
         self,
@@ -422,18 +458,21 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         created_time = obj.received_time if obj.received_time else time.time()
         self.auto_create_handle_loop()
         obj.normalize_batch_and_arguments()
+
+        if self.enable_trace:
+            self._trace_request_start(obj, created_time, request)
         if (
             self.server_args.language_only
             and isinstance(obj, GenerateReqInput)
             and self.server_args.encoder_transfer_backend == "zmq_to_scheduler"
             and obj.contains_mm_input()
         ):
+            # For EPD-disaggregation mode
             self.mm_receiver.send_encode_request(obj)
-
-        if self.enable_trace:
-            self._trace_request_start(obj, created_time, request)
         if self.server_args.tokenizer_worker_num > 1:
             self._attach_multi_http_worker_info(obj)
+
+        # Log the request
         self.request_logger.log_received_request(obj, self.tokenizer)
 
         async with self.is_pause_cond:
