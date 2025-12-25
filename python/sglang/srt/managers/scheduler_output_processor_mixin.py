@@ -234,6 +234,9 @@ class SchedulerOutputProcessorMixin:
                     )
 
         else:  # embedding or reward model
+            if result.copy_done is not None:
+                result.copy_done.synchronize()
+
             is_sparse = envs.SGLANG_EMBEDDINGS_SPARSE_HEAD.is_set()
 
             embeddings = result.embeddings
@@ -308,6 +311,18 @@ class SchedulerOutputProcessorMixin:
             req.spec_accepted_tokens += accept_lens[i] - 1
 
         return predict_tokens
+
+    def process_batch_result_idle(
+        self: Scheduler,
+        batch: ScheduleBatch,
+        result: GenerationBatchResult,
+    ):
+        if result.copy_done is not None:
+            result.copy_done.synchronize()
+
+        self.stream_output_generation(
+            batch.reqs, batch.return_logprob, is_idle_batch=True
+        )
 
     def process_batch_result_dllm(
         self: Scheduler,
@@ -459,6 +474,10 @@ class SchedulerOutputProcessorMixin:
             and self.forward_ct_decode % self.server_args.decode_log_interval == 0
         ):
             self.log_decode_stats(can_run_cuda_graph, running_batch=batch)
+        if self.enable_metrics:
+            self.log_decode_stats_every_iteration(
+                batch, num_accepted_tokens=result.num_accepted_tokens
+            )
 
     def _mamba_prefix_cache_update(
         self, req: Req, batch: ScheduleBatch, result: GenerationBatchResult, i: int
@@ -797,6 +816,7 @@ class SchedulerOutputProcessorMixin:
         reqs: List[Req],
         return_logprob: bool,
         skip_req: Optional[Req] = None,
+        is_idle_batch: bool = False,
     ):
         rids = []
         http_worker_ipcs = []
@@ -817,6 +837,7 @@ class SchedulerOutputProcessorMixin:
         spec_accepted_tokens = []
         retraction_counts = []
         output_hidden_states = None
+        load = self.get_load()
         output_routed_experts = None
 
         queue_times = []
@@ -1025,7 +1046,7 @@ class SchedulerOutputProcessorMixin:
                 req.log_time_stats()
 
         # Send to detokenizer
-        if rids:
+        if reqs or is_idle_batch:
             if self.model_config.is_multimodal_gen:
                 return
 
@@ -1069,6 +1090,7 @@ class SchedulerOutputProcessorMixin:
                     placeholder_tokens_idx=None,
                     placeholder_tokens_val=None,
                     retraction_counts=retraction_counts,
+                    load=load,
                 )
             )
 

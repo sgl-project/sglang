@@ -84,11 +84,13 @@ class SchedulerMetricsMixin:
             }
             if dp_rank is not None:
                 labels["dp_rank"] = dp_rank
-            self.metrics_collector = SchedulerMetricsCollector(labels=labels)
+            self.metrics_collector = SchedulerMetricsCollector(
+                labels=labels, enable_lora=self.enable_lora
+            )
 
             if ENABLE_METRICS_DEVICE_TIMER:
                 self.forward_pass_device_timer = DeviceTimer(
-                    reporter=self.metrics_collector.increment_gpu_execution_seconds
+                    reporter=self.metrics_collector.increment_gpu_execution_seconds,
                 )
 
         if self.enable_kv_cache_events:
@@ -135,7 +137,7 @@ class SchedulerMetricsMixin:
         self.last_prefill_stats_tic = time.perf_counter()
         self.last_input_throughput = self.last_prefill_tokens / gap_latency
         self.last_prefill_tokens = adder.log_input_tokens
-
+        self.last_prefill_cache_tokens = adder.log_hit_tokens
         # In PREFILL disaggregation, `self.running_batch` is decode-only;
         # use the current prefill batch size to compute running_bs.
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
@@ -247,16 +249,21 @@ class SchedulerMetricsMixin:
                     self.disagg_decode_transfer_queue.queue
                 )
 
-            self.metrics_collector.increment_realtime_tokens(
-                prefill_compute_tokens=adder.log_input_tokens,
-                prefill_cache_tokens=adder.log_hit_tokens,
-            )
-
             # Others
             self.calculate_utilization()
+            self.update_lora_metrics()
             self.metrics_collector.log_stats(self.stats)
             self._emit_kv_metrics()
         self._publish_kv_events()
+
+    def log_prefill_stats_late(self: Scheduler, batch: Optional[ScheduleBatch]):
+        """This should be called after `batch` has gathered enough metadata."""
+        if self.enable_metrics and batch is not None:
+            self.metrics_collector.increment_realtime_tokens(
+                prefill_compute_tokens=self.last_prefill_tokens,
+                prefill_cache_tokens=self.last_prefill_cache_tokens,
+                dp_cooperation_info=batch.dp_cooperation_info,
+            )
 
     def log_prefill_dp_balance_stats(self: Scheduler, batch: ScheduleBatch) -> None:
         """Log DP-level load-balancing metrics for the prefill stage."""
@@ -315,7 +322,6 @@ class SchedulerMetricsMixin:
     ):
         batch = running_batch or self.running_batch
 
-        last_num_generated_tokens = self.num_generated_tokens
         gap_latency = time.perf_counter() - self.last_decode_stats_tic
         self.last_decode_stats_tic = time.perf_counter()
         self.last_gen_throughput = self.num_generated_tokens / gap_latency
@@ -520,15 +526,21 @@ class SchedulerMetricsMixin:
                     self.disagg_decode_transfer_queue.queue
                 )
 
-            self.metrics_collector.increment_realtime_tokens(
-                decode_tokens=last_num_generated_tokens
-            )
-
             # Others
             self.calculate_utilization()
+            self.update_lora_metrics()
             self.metrics_collector.log_stats(self.stats)
             self._emit_kv_metrics()
         self._publish_kv_events()
+
+    def log_decode_stats_every_iteration(
+        self: Scheduler, batch: ScheduleBatch, num_accepted_tokens: int
+    ):
+        self.metrics_collector.increment_realtime_tokens(
+            # TODO unify this w/ the bumping logic in `Scheduler.num_generated_tokens` accumulator
+            decode_tokens=batch.batch_size() + num_accepted_tokens,
+            dp_cooperation_info=batch.dp_cooperation_info,
+        )
 
     def log_batch_result_stats(
         self: Scheduler,
@@ -574,6 +586,50 @@ class SchedulerMetricsMixin:
             batch = KVEventBatch(ts=time.time(), events=events)
             self.kv_event_publisher.publish(batch)
 
+    def update_lora_metrics(self: Scheduler):
+        """Update LoRA pool metrics for monitoring and autoscaling."""
+        if not self.enable_lora:
+            return
+
+        try:
+            # Get LoRA memory pool stats
+            lora_manager = self.tp_worker.model_runner.lora_manager
+            if lora_manager is None or lora_manager.memory_pool is None:
+                return
+
+            mem_pool = lora_manager.memory_pool
+            slots_total = mem_pool.max_loras_per_batch
+
+            # Calculate active adapters from running batch
+            # This gives a true measure of current load for autoscaling purposes
+            active_lora_ids = set()
+
+            # For PP mode, check all running micro batches
+            if hasattr(self, "running_mbs") and self.running_mbs:
+                for batch in self.running_mbs:
+                    if batch and hasattr(batch, "reqs"):
+                        for req in batch.reqs:
+                            if hasattr(req, "lora_id") and req.lora_id is not None:
+                                active_lora_ids.add(req.lora_id)
+            # For normal mode, check running_batch
+            elif hasattr(self, "running_batch") and self.running_batch:
+                if hasattr(self.running_batch, "reqs"):
+                    for req in self.running_batch.reqs:
+                        if hasattr(req, "lora_id") and req.lora_id is not None:
+                            active_lora_ids.add(req.lora_id)
+
+            # Count active adapters (excluding None for base model)
+            slots_used = len(active_lora_ids)
+            utilization = slots_used / slots_total if slots_total > 0 else 0.0
+
+            # Update stats
+            self.stats.lora_pool_slots_used = slots_used
+            self.stats.lora_pool_slots_total = slots_total
+            self.stats.lora_pool_utilization = utilization
+
+        except Exception as e:
+            logger.warning(f"Failed to update LoRA metrics: {e}")
+
     def calculate_utilization(self):
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self.stats.utilization = -1
@@ -614,6 +670,7 @@ class SchedulerMetricsMixin:
             num_reqs=len(self.running_batch.reqs) + num_waiting_reqs,
             num_waiting_reqs=num_waiting_reqs,
             num_tokens=num_tokens,
+            ts_tic=time.perf_counter(),
         )
 
     @contextmanager
@@ -623,5 +680,10 @@ class SchedulerMetricsMixin:
             return
 
         category = "forward_" + batch.forward_mode.name.lower()
-        with self.forward_pass_device_timer.wrap(category=category):
+        with self.forward_pass_device_timer.wrap(
+            metadata=dict(
+                category=category,
+                dp_cooperation_info=batch.dp_cooperation_info,
+            ),
+        ):
             yield
