@@ -877,8 +877,12 @@ class SGLangFailuresAnalyzer:
 
             # Show recently failed jobs in a collapsed section (terminal doesn't support collapse, so just show as separate section)
             if recently_failed:
+                # Extract just the workflow name without the run count for cleaner display
+                short_title = title.split("(")[0].strip()
+                if short_title and short_title[0].isdigit():
+                    short_title = short_title.split(".", 1)[-1].strip()
                 print(
-                    f"\n   [{title}] No current failure streak, but had failures in recent runs: {len(recently_failed)} jobs"
+                    f"\n   📋 [{short_title}] No current failure streak, but had failures in recent runs: {len(recently_failed)} jobs"
                 )
                 print(
                     f"   {'Job Name':<38} {'Failures':<12} {'Fail Rate':<12} {'Total Runs':<12} {'Recent Runs (oldest → latest)':<30}"
@@ -1331,9 +1335,15 @@ class SGLangFailuresAnalyzer:
 
                 # Show recently failed jobs in a collapsible section
                 if recently_failed:
+                    # Extract just the workflow name without the run count for cleaner display
+                    # e.g., "1. PR Test NVIDIA - Scheduled (latest 12 runs)" -> "PR Test NVIDIA - Scheduled"
+                    short_title = title.split("(")[0].strip()
+                    # Remove the leading number and period if present
+                    if short_title and short_title[0].isdigit():
+                        short_title = short_title.split(".", 1)[-1].strip()
                     summary_lines.append("<details>")
                     summary_lines.append(
-                        f"<summary>[{title}] No current failure streak, but had failures in recent runs - {len(recently_failed)} jobs</summary>"
+                        f"<summary>📋 [{short_title}] No current failure streak, but had failures in recent runs - {len(recently_failed)} jobs</summary>"
                     )
                     summary_lines.append("")
                     summary_lines.append(
