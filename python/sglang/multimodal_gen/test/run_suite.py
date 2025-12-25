@@ -32,6 +32,14 @@ SUITES = {
     ],
 }
 
+suites_ascend = {
+    "1-npu": [
+        "ascend/test_server_1_npu.py",
+        # add new 1-npu test files here
+    ]
+}
+
+SUITES.update(suites_ascend)
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Run multimodal_gen test suite")
@@ -196,7 +204,8 @@ def main():
 
     # 3. collect all test items and partition by items (not files)
     all_test_items = collect_test_items(suite_files_abs, filter_expr=args.filter)
-
+    logger.info(suite_files_rel)
+    logger.info(all_test_items)
     if not all_test_items:
         print(f"No test items found for suite '{args.suite}'.")
         sys.exit(0)
