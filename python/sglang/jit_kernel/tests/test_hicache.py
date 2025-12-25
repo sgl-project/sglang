@@ -120,10 +120,13 @@ def main() -> None:
     assert stride == host_kv.stride(-2)
     stride_bytes = stride * DTYPE.itemsize
 
-    for N_HEAD in [1, 2, 4, 8]:
+    BS_LIST = [2**n for n in range(6, 15)]  # 64 to 16384
+    BS_LIST += [x + i + 1 for i, x in enumerate(BS_LIST)]  # some unaligned sizes
+    N_HEAD_LIST = [1, 2, 4, 8]
+    for N_HEAD in N_HEAD_LIST:
         ELEM_SIZE = 128 * N_HEAD
         assert ELEM_SIZE <= 1024
-        for BS in [2**n for n in range(6, 14)]:  # 64 to 8192
+        for BS in BS_LIST:
             test_hicache_correctness_one_layer(
                 host_kv=host_kv[:, :, :, :ELEM_SIZE],
                 cuda_kv=cuda_kv[:, :, :, :ELEM_SIZE],
