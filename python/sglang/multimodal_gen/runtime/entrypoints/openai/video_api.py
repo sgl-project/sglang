@@ -31,7 +31,7 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.stores import VIDEO_STORE
 from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     _parse_size,
     _save_upload_to_path,
-    post_process_sample, add_common_data_to_response,
+    add_common_data_to_response,
 )
 from sglang.multimodal_gen.runtime.entrypoints.utils import prepare_request
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
@@ -96,7 +96,6 @@ def _video_job_from_sampling(
 
 
 async def _dispatch_job_async(job_id: str, batch: Req) -> None:
-    from sglang.multimodal_gen.runtime.scheduler_client import scheduler_client
 
     try:
         _, result = await process_generation_batch(async_scheduler_client, batch)
@@ -105,7 +104,9 @@ async def _dispatch_job_async(job_id: str, batch: Req) -> None:
             "progress": 100,
             "completed_at": int(time.time()),
         }
-        update_fields = add_common_data_to_response(update_fields, request_id=job_id, result=result)
+        update_fields = add_common_data_to_response(
+            update_fields, request_id=job_id, result=result
+        )
         await VIDEO_STORE.update_fields(job_id, update_fields)
     except Exception as e:
         logger.error(f"{e}")

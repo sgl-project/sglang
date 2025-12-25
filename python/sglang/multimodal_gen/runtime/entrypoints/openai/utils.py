@@ -246,7 +246,9 @@ def merge_image_input_list(*inputs: Union[List, Any, None]) -> List:
     return result
 
 
-def add_common_data_to_response(response: dict, request_id: str, result: OutputBatch) -> dict:
+def add_common_data_to_response(
+    response: dict, request_id: str, result: OutputBatch
+) -> dict:
     if result.peak_memory_mb and result.peak_memory_mb > 0:
         response["peak_memory_mb"] = result.peak_memory_mb
 

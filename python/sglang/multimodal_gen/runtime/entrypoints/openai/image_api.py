@@ -21,9 +21,10 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
 from sglang.multimodal_gen.runtime.entrypoints.openai.stores import IMAGE_STORE
 from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     _parse_size,
+    add_common_data_to_response,
     merge_image_input_list,
     process_generation_batch,
-    save_image_to_path, add_common_data_to_response,
+    save_image_to_path,
 )
 from sglang.multimodal_gen.runtime.entrypoints.utils import prepare_request
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
@@ -147,7 +148,9 @@ async def generations(
                 )
             ]
         }
-        response_kwargs = add_common_data_to_response(response_kwargs, request_id=request_id, result=result)
+        response_kwargs = add_common_data_to_response(
+            response_kwargs, request_id=request_id, result=result
+        )
         return ImageResponse(**response_kwargs)
     else:
         # Return error, not supported
@@ -249,7 +252,9 @@ async def edits(
         url = f"/v1/images/{request_id}/content"
         response_kwargs = {"data": [ImageResponseData(url=url, revised_prompt=prompt)]}
 
-    response_kwargs = add_common_data_to_response(response_kwargs, request_id=request_id, result=result)
+    response_kwargs = add_common_data_to_response(
+        response_kwargs, request_id=request_id, result=result
+    )
 
     return ImageResponse(**response_kwargs)
 
