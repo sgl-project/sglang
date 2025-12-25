@@ -23,6 +23,7 @@ Its core features include:
 
    basic_usage/send_request.ipynb
    basic_usage/openai_api.rst
+   basic_usage/ollama_api.md
    basic_usage/offline_engine_api.ipynb
    basic_usage/native_api.ipynb
    basic_usage/sampling_params.md
@@ -51,7 +52,7 @@ Its core features include:
    advanced_features/pd_multiplexing.md
    advanced_features/vlm_query.ipynb
    advanced_features/dp_for_multi_modal_encoder.md
-   advanced_features/router.md
+   advanced_features/sgl_model_gateway.md
    advanced_features/deterministic_inference.md
    advanced_features/observability.md
    advanced_features/checkpoint_engine.md
