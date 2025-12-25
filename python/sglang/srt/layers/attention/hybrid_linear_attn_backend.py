@@ -42,13 +42,10 @@ from sglang.srt.utils import is_cuda, is_npu
 
 logger = logging.getLogger(__name__)
 
-# Environment variable to enable CuTe DSL GDN decode kernel
-# Set SGLANG_USE_CUTEDSL_GDN_DECODE=1 to enable
 USE_CUTEDSL_GDN_DECODE = os.environ.get("SGLANG_USE_CUTEDSL_GDN_DECODE", "0") == "1"
-
-# Lazy import for CuTe DSL GDN kernel
 _cutedsl_gdn_available = None
 _cutedsl_fused_sigmoid_gating_delta_rule_update = None
+_cutedsl_gdn_logged = False
 
 
 def _check_cutedsl_gdn_available():
@@ -944,11 +941,13 @@ class GDNAttnBackend(MambaAttnBackendBase):
         key = key.view(1, seq_len, num_heads, head_k_dim)
         value = value.view(1, seq_len, value.shape[1] // head_v_dim, head_v_dim)
 
-        # Choose between CuTe DSL and Triton kernel for decode
+        global _cutedsl_gdn_logged
         use_cutedsl = USE_CUTEDSL_GDN_DECODE and _check_cutedsl_gdn_available()
+        if not _cutedsl_gdn_logged and USE_CUTEDSL_GDN_DECODE:
+            logger.info(f"Using CuTe DSL GDN kernel for decode: {use_cutedsl}")
+            _cutedsl_gdn_logged = True
 
         if use_cutedsl:
-            # Use CuTe DSL kernel for decode
             core_attn_out = _cutedsl_fused_sigmoid_gating_delta_rule_update(
                 A_log=A_log,
                 dt_bias=dt_bias,
@@ -965,7 +964,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 softplus_threshold=20.0,
             )
         else:
-            # Use Triton kernel for decode (default)
             core_attn_out = fused_sigmoid_gating_delta_rule_update(
                 A_log=A_log,
                 dt_bias=dt_bias,
