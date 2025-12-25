@@ -1114,7 +1114,9 @@ def sample_mmmu_requests(
 
     try:
         print("Attempting to load MMMU Math dataset...")
-        mmmu_dataset = load_dataset("MMMU/MMMU", "Math", split="test")
+        mmmu_dataset = load_dataset(
+            "MMMU/MMMU", "Math", split="test", download_mode="force_redownload"
+        )
         print(
             f"Successfully loaded MMMU Math dataset from HuggingFace with {len(mmmu_dataset)} examples"
         )
