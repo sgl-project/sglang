@@ -67,11 +67,12 @@ docker run --rm \
    # Setting these flags to reduce OOM chance only on ARM
    export CMAKE_BUILD_PARALLEL_LEVEL=$(( $(nproc)/3 < 48 ? $(nproc)/3 : 48 ))
    if [ \"${ARCH}\" = \"aarch64\" ]; then
-      export CUDA_NVCC_FLAGS=\"-Xcudafe --threads=2\"
-      export MAKEFLAGS='-j2'
-      export CMAKE_BUILD_PARALLEL_LEVEL=2
-      export NINJAFLAGS='-j2'
-      echo \"ARM detected: Using extra conservative settings (2 parallel jobs)\"
+      PARALLEL_AARCH64=$(( (j = ($(nproc) + 7) / 8) < 32 ? j : 32 ))
+      export CUDA_NVCC_FLAGS=\"-Xcudafe --threads=\${PARALLEL_AARCH64}\"
+      export MAKEFLAGS=\"-j\${PARALLEL_AARCH64}\"
+      export CMAKE_BUILD_PARALLEL_LEVEL=\"\${PARALLEL_AARCH64}\"
+      export NINJAFLAGS=\"-j\${PARALLEL_AARCH64}\"
+      echo \"ARM detected: Using extra conservative settings (\${PARALLEL_AARCH64} parallel jobs)\"
    fi
 
    CMAKE_TARBALL=\"cmake-\${CMAKE_VERSION_MAJOR}.\${CMAKE_VERSION_MINOR}-linux-${ARCH}.tar.gz\"
