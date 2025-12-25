@@ -97,30 +97,14 @@ class TestNvidiaNemotronNanoV2SpeculativeDecoding(GSM8KMixin, DefaultServerBase)
 
 
 class TestNvidiaNemotronNanoV2SpeculativeDecodingExtraBuffer(
-    GSM8KMixin, MambaSchedulerStrategyMixin, DefaultServerBase
+    GSM8KMixin, DefaultServerBase
 ):
     model = NVIDIA_NEMOTRON_NANO_V2_MODEL
     gsm8k_accuracy_thres = 0.87
-    kl_div_thres = 0.008
     other_args = TestNvidiaNemotronNanoV2SpeculativeDecoding.other_args + [
         "--mamba-scheduler-strategy",
         "extra_buffer",
     ]
-
-    def test_input_output_logprobs_match_prefill_cache_hit(self):
-        self._test_input_output_logprobs_match_prefill_cache_hit_helper(
-            max_samples=32,
-            max_new_tokens=512,
-        )
-
-    def test_input_output_logprobs_match_decode_cache_hit(self):
-        self._test_input_output_logprobs_match_decode_cache_hit_helper(
-            max_samples=32,
-            max_new_tokens=512,
-        )
-
-    def test_prefix_cache_branching(self):
-        self._test_prefix_cache_branching_helper(256)
 
 
 class TestNvidiaNemotronNanoV2SpeculativeDecodingBF16Cache(

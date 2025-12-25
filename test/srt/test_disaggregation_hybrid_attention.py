@@ -13,11 +13,225 @@ from sglang.test.test_utils import (
 
 
 @unittest.skipIf(is_in_ci(), "Temporarily disable the flaky test.")
-class TestDisaggregationHybridAttentionMamba(PDDisaggregationServerBase):
+class TestDisaggregationHybridAttentionGDN(PDDisaggregationServerBase):
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
         cls.model = "Qwen/Qwen3-Next-80B-A3B-Instruct"
+
+        # Non blocking start servers
+        cls.start_prefill()
+        cls.start_decode()
+
+        # Block until both
+        cls.wait_server_ready(cls.prefill_url + "/health")
+        cls.wait_server_ready(cls.decode_url + "/health")
+
+        cls.launch_lb()
+
+    @classmethod
+    def start_prefill(cls):
+        prefill_args = [
+            "--trust-remote-code",
+            "--disaggregation-mode",
+            "prefill",
+            "--tp",
+            "4",
+        ]
+        prefill_args += cls.transfer_backend + cls.rdma_devices
+        cls.process_prefill = popen_launch_pd_server(
+            cls.model,
+            cls.prefill_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=prefill_args,
+        )
+
+    @classmethod
+    def start_decode(cls):
+        decode_args = [
+            "--trust-remote-code",
+            "--disaggregation-mode",
+            "decode",
+            "--tp",
+            "4",
+            "--base-gpu-id",
+            "4",
+        ]
+        decode_args += cls.transfer_backend + cls.rdma_devices
+        cls.process_decode = popen_launch_pd_server(
+            cls.model,
+            cls.decode_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=decode_args,
+        )
+
+    def test_gsm8k(self):
+        args = SimpleNamespace(
+            num_shots=5,
+            data_path=None,
+            num_questions=200,
+            max_new_tokens=512,
+            parallel=128,
+            host=f"http://{self.base_host}",
+            port=int(self.lb_port),
+        )
+        metrics = run_eval_few_shot_gsm8k(args)
+        print(f"Evaluation metrics: {metrics}")
+
+        self.assertGreater(metrics["accuracy"], 0.93)
+
+
+class TestDisaggregationHybridAttentionGDNExtraBuffer(PDDisaggregationServerBase):
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.model = "Qwen/Qwen3-Next-80B-A3B-Instruct"
+
+        # Non blocking start servers
+        cls.start_prefill()
+        cls.start_decode()
+
+        # Block until both
+        cls.wait_server_ready(cls.prefill_url + "/health")
+        cls.wait_server_ready(cls.decode_url + "/health")
+
+        cls.launch_lb()
+
+    @classmethod
+    def start_prefill(cls):
+        prefill_args = [
+            "--trust-remote-code",
+            "--disaggregation-mode",
+            "prefill",
+            "--tp",
+            "4",
+            "--mamba-scheduler-strategy",
+            "extra_buffer",
+        ]
+        prefill_args += cls.transfer_backend + cls.rdma_devices
+        cls.process_prefill = popen_launch_pd_server(
+            cls.model,
+            cls.prefill_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=prefill_args,
+        )
+
+    @classmethod
+    def start_decode(cls):
+        decode_args = [
+            "--trust-remote-code",
+            "--disaggregation-mode",
+            "decode",
+            "--tp",
+            "4",
+            "--base-gpu-id",
+            "4",
+            "--mamba-scheduler-strategy",
+            "extra_buffer",
+        ]
+        decode_args += cls.transfer_backend + cls.rdma_devices
+        cls.process_decode = popen_launch_pd_server(
+            cls.model,
+            cls.decode_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=decode_args,
+        )
+
+    def test_gsm8k(self):
+        args = SimpleNamespace(
+            num_shots=5,
+            data_path=None,
+            num_questions=200,
+            max_new_tokens=512,
+            parallel=128,
+            host=f"http://{self.base_host}",
+            port=int(self.lb_port),
+        )
+        metrics = run_eval_few_shot_gsm8k(args)
+        print(f"Evaluation metrics: {metrics}")
+
+        self.assertGreater(metrics["accuracy"], 0.93)
+
+
+class TestDisaggregationHybridAttentionGDNDPDecode(PDDisaggregationServerBase):
+    """Test with prefill tp=2 and decode tp=2/dp=2 with dp-attention enabled."""
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.model = "Qwen/Qwen3-Next-80B-A3B-Instruct"
+
+        # Non blocking start servers
+        cls.start_prefill()
+        cls.start_decode()
+
+        # Block until both
+        cls.wait_server_ready(cls.prefill_url + "/health")
+        cls.wait_server_ready(cls.decode_url + "/health")
+
+        cls.launch_lb()
+
+    @classmethod
+    def start_prefill(cls):
+        prefill_args = [
+            "--trust-remote-code",
+            "--disaggregation-mode",
+            "prefill",
+            "--tp",
+            "2",
+        ]
+        prefill_args += cls.transfer_backend + cls.rdma_devices
+        cls.process_prefill = popen_launch_pd_server(
+            cls.model,
+            cls.prefill_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=prefill_args,
+        )
+
+    @classmethod
+    def start_decode(cls):
+        decode_args = [
+            "--trust-remote-code",
+            "--disaggregation-mode",
+            "decode",
+            "--tp",
+            "2",
+            "--dp",
+            "2",
+            "--enable-dp-attention",
+            "--enable-dp-lm-head",
+            "--base-gpu-id",
+            "2",
+        ]
+        decode_args += cls.transfer_backend + cls.rdma_devices
+        cls.process_decode = popen_launch_pd_server(
+            cls.model,
+            cls.decode_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=decode_args,
+        )
+
+    def test_gsm8k(self):
+        args = SimpleNamespace(
+            num_shots=5,
+            data_path=None,
+            num_questions=200,
+            max_new_tokens=512,
+            parallel=128,
+            host=f"http://{self.base_host}",
+            port=int(self.lb_port),
+        )
+        metrics = run_eval_few_shot_gsm8k(args)
+        print(f"Evaluation metrics: {metrics}")
+
+        self.assertGreater(metrics["accuracy"], 0.93)
+
+
+class TestDisaggregationHybridAttentionMamba(PDDisaggregationServerBase):
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.model = "nvidia/NVIDIA-Nemotron-Nano-9B-v2"
 
         # Non blocking start servers
         cls.start_prefill()
@@ -85,7 +299,7 @@ class TestDisaggregationHybridAttentionMambaExtraBuffer(PDDisaggregationServerBa
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
-        cls.model = "Qwen/Qwen3-Next-80B-A3B-Instruct"
+        cls.model = "nvidia/NVIDIA-Nemotron-Nano-9B-v2"
 
         # Non blocking start servers
         cls.start_prefill()
@@ -128,80 +342,6 @@ class TestDisaggregationHybridAttentionMambaExtraBuffer(PDDisaggregationServerBa
             "4",
             "--mamba-scheduler-strategy",
             "extra_buffer",
-        ]
-        decode_args += cls.transfer_backend + cls.rdma_devices
-        cls.process_decode = popen_launch_pd_server(
-            cls.model,
-            cls.decode_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=decode_args,
-        )
-
-    def test_gsm8k(self):
-        args = SimpleNamespace(
-            num_shots=5,
-            data_path=None,
-            num_questions=200,
-            max_new_tokens=512,
-            parallel=128,
-            host=f"http://{self.base_host}",
-            port=int(self.lb_port),
-        )
-        metrics = run_eval_few_shot_gsm8k(args)
-        print(f"Evaluation metrics: {metrics}")
-
-        self.assertGreater(metrics["accuracy"], 0.93)
-
-
-class TestDisaggregationHybridAttentionMambaDPDecode(PDDisaggregationServerBase):
-    """Test with prefill tp=2 and decode tp=2/dp=2 with dp-attention enabled."""
-
-    @classmethod
-    def setUpClass(cls):
-        super().setUpClass()
-        cls.model = "Qwen/Qwen3-Next-80B-A3B-Instruct"
-
-        # Non blocking start servers
-        cls.start_prefill()
-        cls.start_decode()
-
-        # Block until both
-        cls.wait_server_ready(cls.prefill_url + "/health")
-        cls.wait_server_ready(cls.decode_url + "/health")
-
-        cls.launch_lb()
-
-    @classmethod
-    def start_prefill(cls):
-        prefill_args = [
-            "--trust-remote-code",
-            "--disaggregation-mode",
-            "prefill",
-            "--tp",
-            "2",
-        ]
-        prefill_args += cls.transfer_backend + cls.rdma_devices
-        cls.process_prefill = popen_launch_pd_server(
-            cls.model,
-            cls.prefill_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=prefill_args,
-        )
-
-    @classmethod
-    def start_decode(cls):
-        decode_args = [
-            "--trust-remote-code",
-            "--disaggregation-mode",
-            "decode",
-            "--tp",
-            "2",
-            "--dp",
-            "2",
-            "--enable-dp-attention",
-            "--enable-dp-lm-head",
-            "--base-gpu-id",
-            "2",
         ]
         decode_args += cls.transfer_backend + cls.rdma_devices
         cls.process_decode = popen_launch_pd_server(
