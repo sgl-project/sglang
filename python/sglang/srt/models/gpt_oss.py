@@ -70,13 +70,17 @@ from sglang.srt.models.utils import (
     enable_fused_set_kv_buffer,
 )
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import LazyValue, add_prefix, is_cuda, make_layers
+from sglang.srt.utils import LazyValue, add_prefix, is_cuda, is_npu, make_layers
 
 _is_cuda = is_cuda()
+_is_npu = is_npu()
 
 
 if _is_cuda:
     from sgl_kernel import FusedSetKVBufferArg  # noqa: F401
+
+if _is_npu:
+    from sgl_kernel_npu.activation.swiglu_oai import swiglu_oai
 
 
 class GptOssConfig(PretrainedConfig):
@@ -128,6 +132,13 @@ class GptOssSparseMoeBlock(nn.Module):
                 "use_weight_loader_fused": quant_config_name
                 != "mxfp4"
             }
+        custom_act_fn = None
+        if _is_npu:
+            if self.layer_id == 0:
+                logger.warning(
+                    "Warning: GPT-OSS use custom activate function on FusedMoE when using ascend backend."
+                )
+            custom_act_fn = swiglu_oai
         self.experts = experts_type(
             num_experts=config.num_local_experts
             + get_global_server_args().ep_num_redundant_experts,
@@ -141,6 +152,7 @@ class GptOssSparseMoeBlock(nn.Module):
             gemm1_clamp_limit=self.gemm1_clamp_limit,
             with_bias=True,
             prefix=add_prefix("experts", prefix),
+            custom_act_fn=custom_act_fn,
             **extra_kwargs,
         )
 
@@ -301,20 +313,20 @@ class GptOssAttention(nn.Module):
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
-        q, k = self.rotary_emb(
-            positions,
-            q,
-            k,
-            fused_set_kv_buffer_arg=(
-                create_fused_set_kv_buffer_arg(
-                    value=v,
-                    layer=self.attn,
-                    forward_batch=forward_batch,
-                )
-                if enable_fused_set_kv_buffer(forward_batch)
-                else None
-            ),
-        )
+        extra_args = {}
+        if _is_cuda:
+            extra_args = {
+                "fused_set_kv_buffer_arg": (
+                    create_fused_set_kv_buffer_arg(
+                        value=v,
+                        layer=self.attn,
+                        forward_batch=forward_batch,
+                    )
+                    if enable_fused_set_kv_buffer(forward_batch)
+                    else None
+                ),
+            }
+        q, k = self.rotary_emb(positions, q, k, **extra_args)
         inner_state = q, k, v, forward_batch
         return None, forward_batch, inner_state
 

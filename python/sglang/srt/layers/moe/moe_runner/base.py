@@ -37,6 +37,7 @@ class MoeRunnerConfig:
     # Runner configuration
     activation: str = "silu"
     is_gated: bool = True
+    custom_act_fn: Optional[Callable] = None
     apply_router_weight_on_input: bool = False
     inplace: bool = True
     no_combine: bool = False
