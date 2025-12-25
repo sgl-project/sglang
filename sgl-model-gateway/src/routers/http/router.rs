@@ -27,7 +27,7 @@ use crate::{
         metrics::{bool_to_static_str, metrics_labels, Metrics},
         otel_trace::inject_trace_context_http,
     },
-    policies::PolicyRegistry,
+    policies::{PolicyRegistry, SelectWorkerInfo},
     protocols::{
         chat::ChatCompletionRequest,
         classify::ClassifyRequest,
@@ -39,7 +39,7 @@ use crate::{
         responses::{ResponsesGetParams, ResponsesRequest},
     },
     routers::{
-        error,
+        error::{self, extract_error_code_from_response},
         grpc::utils::{error_type_from_status, route_to_endpoint},
         header_utils, RouterTrait,
     },
@@ -140,7 +140,8 @@ impl Router {
     fn select_worker_for_model(
         &self,
         model_id: Option<&str>,
-        info: &crate::policies::SelectWorkerInfo,
+        text: Option<&str>,
+        headers: Option<&HeaderMap>,
     ) -> Option<Arc<dyn Worker>> {
         let effective_model_id = if !self.enable_igw { None } else { model_id };
 
@@ -168,7 +169,13 @@ impl Router {
             None => self.policy_registry.get_default_policy(),
         };
 
-        let idx = policy.select_worker(&available, info)?;
+        let idx = policy.select_worker(
+            &available,
+            &SelectWorkerInfo {
+                request_text: text,
+                headers,
+            },
+        )?;
 
         // Record worker selection metric (Layer 3)
         Metrics::record_worker_selection(
@@ -191,11 +198,6 @@ impl Router {
         let start = Instant::now();
         let is_stream = typed_req.is_stream();
         let text = typed_req.extract_text_for_routing();
-        let routing_id = header_utils::extract_routing_id(headers);
-        let info = crate::policies::SelectWorkerInfo {
-            request_text: Some(&text),
-            routing_id: routing_id.as_deref(),
-        };
         let model = model_id.unwrap_or("default");
         let endpoint = route_to_endpoint(route);
 
@@ -214,7 +216,7 @@ impl Router {
             // operation per attempt
             |_: u32| async {
                 let res = self
-                    .route_typed_request_once(headers, typed_req, route, model_id, is_stream, &info)
+                    .route_typed_request_once(headers, typed_req, route, model_id, is_stream, &text)
                     .await;
 
                 // Need to be outside `route_typed_request_once` because that function has multiple return paths
@@ -272,9 +274,9 @@ impl Router {
         route: &'static str,
         model_id: Option<&str>,
         is_stream: bool,
-        info: &crate::policies::SelectWorkerInfo<'_>,
+        text: &str,
     ) -> Response {
-        let worker = match self.select_worker_for_model(model_id, info) {
+        let worker = match self.select_worker_for_model(model_id, Some(text), headers) {
             Some(w) => w,
             None => {
                 return error::service_unavailable(
@@ -695,8 +697,6 @@ fn convert_reqwest_error(e: reqwest::Error) -> Response {
 }
 
 use async_trait::async_trait;
-
-use crate::routers::error::extract_error_code_from_response;
 
 #[async_trait]
 impl RouterTrait for Router {
