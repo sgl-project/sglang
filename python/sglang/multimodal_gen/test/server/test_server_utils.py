@@ -913,7 +913,6 @@ def get_generate_fn(
             for img in images:
                 img.close()
 
-
         result = response.parse()
         validate_image(result.data[0].b64_json)
 
