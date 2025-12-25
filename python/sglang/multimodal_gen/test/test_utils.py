@@ -12,6 +12,7 @@ import unittest
 from pathlib import Path
 from typing import Optional
 
+import cv2
 from PIL import Image
 
 from sglang.multimodal_gen.configs.sample.sampling_params import DataType
@@ -313,6 +314,74 @@ def validate_image_file(
             ), f"Height mismatch: expected {expected_height}, got {height}"
 
 
+def _get_video_dimensions_from_metadata(
+    cap: cv2.VideoCapture,
+) -> tuple[int, int] | None:
+    """Get video dimensions from metadata properties.
+
+    Args:
+        cap: OpenCV VideoCapture object
+
+    Returns:
+        Tuple of (width, height) if successful, None if metadata is invalid
+    """
+    width = cap.get(cv2.CAP_PROP_FRAME_WIDTH)
+    height = cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
+
+    if width == 0 or height == 0:
+        return None
+
+    return (int(width), int(height))
+
+
+def _get_video_dimensions_from_frame(cap: cv2.VideoCapture) -> tuple[int, int]:
+    """Get video dimensions by reading the first frame.
+
+    Args:
+        cap: OpenCV VideoCapture object
+
+    Returns:
+        Tuple of (width, height)
+
+    Raises:
+        ValueError: If unable to read a frame from the video
+    """
+    ret, frame = cap.read()
+    if not ret or frame is None:
+        raise ValueError("Unable to read video frame to get dimensions")
+
+    # frame.shape is (height, width, channels)
+    height, width = frame.shape[:2]
+    return (int(width), int(height))
+
+
+def get_video_dimensions(file_path: str) -> tuple[int, int]:
+    """Get video dimensions (width, height) from a video file.
+
+    Tries to get dimensions from metadata first, falls back to reading first frame.
+
+    Args:
+        file_path: Path to the video file
+
+    Returns:
+        Tuple of (width, height)
+
+    Raises:
+        ValueError: If unable to get video dimensions
+    """
+    cap = cv2.VideoCapture(file_path)
+    try:
+        # Try to get dimensions from metadata first
+        dimensions = _get_video_dimensions_from_metadata(cap)
+        if dimensions is not None:
+            return dimensions
+
+        # Fall back to reading first frame
+        return _get_video_dimensions_from_frame(cap)
+    finally:
+        cap.release()
+
+
 def validate_video_file(
     file_path: str,
     expected_filename: str,
@@ -327,8 +396,6 @@ def validate_video_file(
         expected_width: Expected video width (optional)
         expected_height: Expected video height (optional)
     """
-    import imageio.v3 as iio
-
     # 1. File existence
     assert os.path.exists(file_path), f"Video file does not exist: {file_path}"
 
@@ -350,11 +417,9 @@ def validate_video_file(
         header = f.read(32)
         assert is_mp4(header), f"File is not a valid MP4: {file_path}"
 
-    # 6. Video dimension validation (using imageio)
+    # 6. Video dimension validation (using OpenCV)
     if expected_width is not None and expected_height is not None:
-        props = iio.improps(file_path, plugin="pyav")
-        # props.shape is (num_frames, height, width, channels)
-        actual_height, actual_width = props.shape[1], props.shape[2]
+        actual_width, actual_height = get_video_dimensions(file_path)
         assert (
             actual_width == expected_width
         ), f"Video width mismatch: expected {expected_width}, got {actual_width}"
