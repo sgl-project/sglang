@@ -164,7 +164,6 @@ from sglang.srt.utils import (
     dynamic_import,
     enable_show_time_cost,
     get_available_gpu_memory,
-    get_bool_env_var,
     get_cpu_ids_by_node,
     get_local_ip_auto,
     init_custom_process_group,
@@ -432,9 +431,7 @@ class ModelRunner:
                     moe_ep_rank=self.moe_ep_rank,
                 )
             )
-            if self.tp_rank == 0 and get_bool_env_var(
-                "SGLANG_LOG_EXPERT_LOCATION_METADATA"
-            ):
+            if self.tp_rank == 0 and envs.SGLANG_LOG_EXPERT_LOCATION_METADATA.get():
                 logger.info(
                     f"Initial expert_location_metadata: {get_global_expert_location_metadata()}"
                 )
@@ -834,16 +831,12 @@ class ModelRunner:
         local_gpu_memory = get_available_gpu_memory(self.device, self.gpu_id)
         if self.tp_size > 1 and not self.is_draft_worker:
             if min_per_gpu_memory < local_gpu_memory * 0.9:
-                if get_bool_env_var("SGL_DISABLE_TP_MEMORY_INBALANCE_CHECK"):
-                    logger.warning(
-                        "The memory capacity is unbalanced. Some GPUs may be occupied by other processes. "
-                        f"{min_per_gpu_memory=}, {local_gpu_memory=}, {local_gpu_memory * 0.9=}"
-                    )
+                msg = "The memory capacity is unbalanced. Some GPUs may be occupied by other processes. "
+                msg += f"{min_per_gpu_memory=}, {local_gpu_memory=}, {local_gpu_memory * 0.9=}"
+                if envs.SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK.get():
+                    raise RuntimeError(msg)
                 else:
-                    raise ValueError(
-                        "The memory capacity is unbalanced. Some GPUs may be occupied by other processes. "
-                        f"{min_per_gpu_memory=}, {local_gpu_memory=}, {local_gpu_memory * 0.9=}"
-                    )
+                    logger.warning(msg)
 
         logger.info(
             f"Init torch distributed ends. mem usage={(before_avail_memory - local_gpu_memory):.2f} GB"

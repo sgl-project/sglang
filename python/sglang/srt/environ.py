@@ -167,6 +167,7 @@ class Envs:
     SGLANG_OTLP_EXPORTER_SCHEDULE_DELAY_MILLIS = EnvInt(500)
     SGLANG_OTLP_EXPORTER_MAX_EXPORT_BATCH_SIZE = EnvInt(64)
     SGLANG_NATIVE_MOVE_KV_CACHE = EnvBool(False)
+    SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK = EnvBool(True)
 
     # Scheduler: memory leak test
     SGLANG_TEST_RETRACT = EnvBool(False)
@@ -416,6 +417,10 @@ def _convert_SGL_to_SGLANG():
     )
     _print_deprecated_env(
         "SGLANG_MOE_NVFP4_DISPATCH", "SGLANG_CUTEDSL_MOE_NVFP4_DISPATCH"
+    )
+    _print_deprecated_env(
+        "SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK",
+        "SGL_DISABLE_TP_MEMORY_INBALANCE_CHECK",
     )
 
     for key, value in os.environ.items():
