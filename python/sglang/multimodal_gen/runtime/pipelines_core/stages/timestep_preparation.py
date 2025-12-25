@@ -128,8 +128,7 @@ class TimestepPreparationStage(PipelineStage):
 
         # Update batch with prepared timesteps
         batch.timesteps = timesteps
-        if logger.level == logging.DEBUG:
-            self.log_debug(f"timesteps: {timesteps}")
+        self.log_debug("timesteps: %s", timesteps)
         return batch
 
     def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:

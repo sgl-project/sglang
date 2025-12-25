@@ -175,7 +175,7 @@ class StageProfiler:
                 f"[{self.stage_name}] finished in {execution_time_s:.4f} seconds",
             )
 
-        if self.metrics_enabled and self.timings:
+        if self._metrics_enabled and self.timings:
             if "denoising_step_" in self.stage_name:
                 index = int(self.stage_name[len("denoising_step_") :])
                 self.timings.record_steps(index, execution_time_s)
