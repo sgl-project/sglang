@@ -57,7 +57,6 @@ from sglang.srt.managers.io_struct import (
     EmbeddingReqInput,
     FreezeGCReq,
     GenerateReqInput,
-    GetLoadReqInput,
     HealthCheckOutput,
     LoadLoRAAdapterReqInput,
     OpenSessionReqOutput,
@@ -1379,9 +1378,6 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         self.asyncio_tasks.add(
             loop.create_task(print_exception_wrapper(self.sigterm_watchdog))
         )
-        self.asyncio_tasks.add(
-            loop.create_task(print_exception_wrapper(self.watch_load_thread))
-        )
 
     def dump_requests_before_crash(self):
         if self.crash_dump_performed:
@@ -1614,6 +1610,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                     "output_ids": output_token_ids,
                     "meta_info": meta_info,
                 }
+
             elif isinstance(recv_obj, BatchTokenIDOutput):
                 is_stream = getattr(state.obj, "stream", False)
                 if self.server_args.stream_output and is_stream:
@@ -1666,6 +1663,15 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 self.dump_requests(state, out_dict)
             if self.crash_dump_folder and state.finished and state.obj.log_metrics:
                 self.record_request_for_crash_dump(state, out_dict)
+
+        # When skip_tokenizer_init is enabled, tokensizer_manager receives
+        # BatchTokenIDOutput.
+        if self.server_args.dp_size > 1 and (
+            isinstance(recv_obj, BatchStrOutput)
+            or isinstance(recv_obj, BatchTokenIDOutput)
+        ):
+            load_update_req = WatchLoadUpdateReq(loads=[recv_obj.load])
+            self.send_to_scheduler.send_pyobj(load_update_req)
 
     def add_logprob_to_meta_info(
         self,
@@ -2076,21 +2082,6 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 if token_id in label_token_ids:
                     logprobs[token_id] = logprob
         return logprobs
-
-    async def watch_load_thread(self):
-        # Only for dp_controller when dp_size > 1
-        if (
-            self.server_args.dp_size == 1
-            or self.server_args.load_balance_method == "round_robin"
-            or self.server_args.load_balance_method == "decode_round_robin"
-        ):
-            return
-
-        while True:
-            await asyncio.sleep(self.server_args.load_watch_interval)
-            loads = await self.get_load_communicator(GetLoadReqInput())
-            load_udpate_req = WatchLoadUpdateReq(loads=loads)
-            self.send_to_scheduler.send_pyobj(load_udpate_req)
 
     async def _resolve_lora_path(self, obj: Union[GenerateReqInput, EmbeddingReqInput]):
         if isinstance(obj.lora_path, str):
