@@ -82,22 +82,33 @@ class SWAChunkCache(ChunkCache):
     def __init__(self, params: CacheInitParams):
         assert isinstance(params.token_to_kv_pool_allocator, SWATokenToKVPoolAllocator)
         super().__init__(params)
-        self.is_local_attention = params.is_local_attention
+
+        assert (
+            params.sliding_window_size is not None
+            or params.attention_chunk_size is not None
+        ), "Sliding window size or attention chunk size must be set for SWAChunkCache"
+
+        self.sliding_window_size = params.sliding_window_size
+        self.attention_chunk_size = params.attention_chunk_size
 
     def evict_swa(
         self,
         req: Req,
         prelen: int,
-        attention_chunk_size: int,
     ):
-        thresh = req.evicted_seqlen_local + attention_chunk_size * 2
-        if self.is_local_attention:
-            thresh -= attention_chunk_size
+        if self.sliding_window_size is not None:
+            # Sliding window attention (e.g. mimo-v2-flash, gpt-oss)
+            new_evicted_seqlen_local = max(
+                req.evicted_seqlen_local, prelen - self.sliding_window_size
+            )
+        elif self.attention_chunk_size is not None:
+            # Local attention (e.g. llama4)
+            new_evicted_seqlen_local = max(
+                req.evicted_seqlen_local,
+                prelen // self.attention_chunk_size * self.attention_chunk_size,
+            )
 
-        if prelen >= thresh:
-            new_evicted_seqlen_local = (
-                prelen // attention_chunk_size * attention_chunk_size
-            ) - (attention_chunk_size if not self.is_local_attention else 0)
+        if new_evicted_seqlen_local > req.evicted_seqlen_local:
             free_slots = self.req_to_token_pool.req_to_token[
                 req.req_pool_idx, req.evicted_seqlen_local : new_evicted_seqlen_local
             ]
