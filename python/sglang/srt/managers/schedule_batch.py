@@ -1117,6 +1117,59 @@ class Req:
         )
 
 
+class DllmReqs:
+    def __init__(self, dllm_config: Optional[DllmConfig] = None):
+        self.dllm_config = dllm_config
+        self.max_running_reqs = (
+            dllm_config.max_running_requests if dllm_config is not None else 1
+        )
+        self.reqs: List[Req] = []
+
+    def add_reqs(self, req: Union[Req, List[Req], "DllmReqs"]):
+        assert self.dllm_config is not None, "Diffusion LLM config is not set."
+
+        if isinstance(req, DllmReqs):
+            reqs_to_add = req.reqs
+        elif isinstance(req, list):
+            reqs_to_add = req
+        else:
+            reqs_to_add = [req]
+
+        num_to_add = len(reqs_to_add)
+
+        # Sanity check:
+        if self.check_redundant_reqs(reqs_to_add):
+            raise RuntimeError("Redundant requests detected in dLLM requests.")
+
+        if len(self.reqs) + num_to_add > self.max_running_reqs:
+            raise RuntimeError(
+                f"Exceeding maximum number of concurrent diffusion LLM requests: {self.max_running_reqs}"
+            )
+
+        self.reqs.extend(reqs_to_add)
+
+    def check_redundant_reqs(self, reqs: List[Req]) -> bool:
+        existing_rids: Set[str] = {r.rid for r in self.reqs}
+        return any(req.rid in existing_rids for req in reqs)
+
+    def init_next_round(self):
+        for req in self.reqs:
+            req.init_next_round_input()
+
+    def has_running_reqs(self) -> bool:
+        return self.dllm_config is not None and len(self.reqs) > 0
+
+    def update_chunked_status(self):
+        for req in self.reqs:
+            req.is_chunked += 1
+
+    def flush_finished_reqs(self):
+        self.reqs = [req for req in self.reqs if not req.finished()]
+
+    def __iter__(self):
+        return iter(self.reqs)
+
+
 @dataclasses.dataclass
 class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     """Store all information of a batch on the scheduler."""
@@ -1237,6 +1290,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     hicache_consumer_index: int = -1
 
     # Diffusion LLM
+    dllm_reqs: Optional[DllmReqs] = None
     dllm_config: Optional[DllmConfig] = None
 
     @classmethod
@@ -1250,6 +1304,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         enable_overlap: bool,
         spec_algorithm: SpeculativeAlgorithm,
         chunked_req: Optional[Req] = None,
+        dllm_reqs: Optional[DllmReqs] = None,
         dllm_config: Optional[DllmConfig] = None,
     ):
         return_logprob = any(req.return_logprob for req in reqs)
@@ -1280,6 +1335,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             return_routed_experts=any(req.return_routed_experts for req in reqs),
             is_prefill_only=all(req.is_prefill_only for req in reqs),
             chunked_req=chunked_req,
+            dllm_reqs=dllm_reqs,
             dllm_config=dllm_config,
         )
 
