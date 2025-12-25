@@ -229,6 +229,8 @@ class Req:
         if self.guidance_scale_2 is None:
             self.guidance_scale_2 = self.guidance_scale
 
+        self.timings = RequestTimings(request_id=self.request_id)
+
     def adjust_size(self, server_args: ServerArgs):
         pass
 
