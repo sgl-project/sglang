@@ -1826,7 +1826,6 @@ class ModelRunner:
         max_num_reqs = server_args.max_running_requests
         max_total_tokens = server_args.max_total_tokens
         self.max_total_num_tokens = self.profile_max_num_token(total_gpu_memory)
-        print(f"\x1b[31m{self.max_total_num_tokens=}\x1b[0m")
 
         if max_num_reqs is None:
             max_num_reqs = min(
