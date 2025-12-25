@@ -30,11 +30,6 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 logger = init_logger(__name__)  # pylint: disable=invalid-name
 
 
-@functools.lru_cache(maxsize=None)
-def _get_qwen_image_qk_norm_alt_stream(device_index: int) -> torch.cuda.Stream:
-    return torch.cuda.Stream(device=device_index)
-
-
 try:
     from flashinfer.rope import apply_rope_with_cos_sin_cache_inplace
 except Exception:
@@ -44,13 +39,15 @@ except Exception:
 def _get_qkv_projections(
     attn: "QwenImageCrossAttention", hidden_states, encoder_hidden_states=None
 ):
-    img_qkv, _ = attn.to_qkv(hidden_states)
-    img_query, img_key, img_value = img_qkv.chunk(3, dim=-1)
+    img_query, _ = attn.to_q(hidden_states)
+    img_key, _ = attn.to_k(hidden_states)
+    img_value, _ = attn.to_v(hidden_states)
 
     txt_query = txt_key = txt_value = None
     if encoder_hidden_states is not None and attn.added_kv_proj_dim is not None:
-        txt_qkv, _ = attn.to_added_qkv(encoder_hidden_states)
-        txt_query, txt_key, txt_value = txt_qkv.chunk(3, dim=-1)
+        txt_query, _ = attn.add_q_proj(encoder_hidden_states)
+        txt_key, _ = attn.add_k_proj(encoder_hidden_states)
+        txt_value, _ = attn.add_v_proj(encoder_hidden_states)
 
     return img_query, img_key, img_value, txt_query, txt_key, txt_value
 
@@ -271,20 +268,27 @@ class QwenImageCrossAttention(nn.Module):
         self.parallel_attention = parallel_attention
         self.added_kv_proj_dim = added_kv_proj_dim
 
-        # Use ReplicatedLinear for fused QKV projections
-        qkv_dim = num_heads * head_dim * 3
-        self.to_qkv = ReplicatedLinear(dim, qkv_dim, bias=True)
+        # Use separate Q/K/V projections
+        self.inner_dim = out_dim if out_dim is not None else head_dim * num_heads
+        self.inner_kv_dim = self.inner_dim
+        self.to_q = ReplicatedLinear(dim, self.inner_dim, bias=True)
+        self.to_k = ReplicatedLinear(dim, self.inner_dim, bias=True)
+        self.to_v = ReplicatedLinear(dim, self.inner_dim, bias=True)
 
         if self.qk_norm:
             self.norm_q = RMSNorm(head_dim, eps=eps) if qk_norm else nn.Identity()
             self.norm_k = RMSNorm(head_dim, eps=eps) if qk_norm else nn.Identity()
 
-        self.inner_dim = out_dim if out_dim is not None else head_dim * num_heads
-        self.inner_kv_dim = self.inner_dim
-
         if added_kv_proj_dim is not None:
-            # Use ReplicatedLinear for added (encoder) QKV projections
-            self.to_added_qkv = ReplicatedLinear(added_kv_proj_dim, qkv_dim, bias=True)
+            self.add_q_proj = ReplicatedLinear(
+                added_kv_proj_dim, self.inner_dim, bias=True
+            )
+            self.add_k_proj = ReplicatedLinear(
+                added_kv_proj_dim, self.inner_dim, bias=True
+            )
+            self.add_v_proj = ReplicatedLinear(
+                added_kv_proj_dim, self.inner_dim, bias=True
+            )
 
         if context_pre_only is not None and not context_pre_only:
             self.to_add_out = ReplicatedLinear(self.inner_dim, self.dim, bias=out_bias)
@@ -341,38 +345,14 @@ class QwenImageCrossAttention(nn.Module):
         txt_value = txt_value.unflatten(-1, (self.num_heads, -1))
 
         # Apply QK normalization
-        if img_query.is_cuda:
-            device_index = (
-                img_query.device.index
-                if img_query.device.index is not None
-                else torch.cuda.current_device()
-            )
-            alt_stream = _get_qwen_image_qk_norm_alt_stream(device_index)
-            current_stream = torch.cuda.current_stream(device=img_query.device)
-
-            alt_stream.wait_stream(current_stream)
-
-            with torch.cuda.stream(alt_stream):
-                if self.norm_k is not None:
-                    img_key = self.norm_k(img_key)
-                if self.norm_added_k is not None:
-                    txt_key = self.norm_added_k(txt_key)
-
-            if self.norm_q is not None:
-                img_query = self.norm_q(img_query)
-            if self.norm_added_q is not None:
-                txt_query = self.norm_added_q(txt_query)
-
-            current_stream.wait_stream(alt_stream)
-        else:
-            if self.norm_q is not None:
-                img_query = self.norm_q(img_query)
-            if self.norm_k is not None:
-                img_key = self.norm_k(img_key)
-            if self.norm_added_q is not None:
-                txt_query = self.norm_added_q(txt_query)
-            if self.norm_added_k is not None:
-                txt_key = self.norm_added_k(txt_key)
+        if self.norm_q is not None:
+            img_query = self.norm_q(img_query)
+        if self.norm_k is not None:
+            img_key = self.norm_k(img_key)
+        if self.norm_added_q is not None:
+            txt_query = self.norm_added_q(txt_query)
+        if self.norm_added_k is not None:
+            txt_key = self.norm_added_k(txt_key)
 
         # Apply RoPE
         if image_rotary_emb is not None:
