@@ -144,7 +144,15 @@ def is_xpu() -> bool:
 
 @lru_cache(maxsize=1)
 def is_npu() -> bool:
-    return hasattr(torch, "npu") and torch.npu.is_available()
+    if not hasattr(torch, "npu"):
+        return False
+
+    if not torch.npu.is_available():
+        raise RuntimeError(
+            "torch_npu detected, but NPU device is not available or visible."
+        )
+
+    return True
 
 
 @lru_cache(maxsize=1)
@@ -1854,7 +1862,7 @@ def get_device(device_id: Optional[int] = None) -> str:
             return "xpu"
         return "xpu:{}".format(device_id)
 
-    if hasattr(torch, "npu") and torch.npu.is_available():
+    if is_npu():
         if device_id == None:
             return "npu"
         return "npu:{}".format(device_id)
