@@ -26,7 +26,7 @@ use crate::{
         metrics::{bool_to_static_str, metrics_labels, Metrics},
         otel_trace::inject_trace_context_http,
     },
-    policies::{LoadBalancingPolicy, PolicyRegistry, SelectWorkerInfo},
+    policies::{LoadBalancingPolicy, PolicyRegistry},
     protocols::{
         chat::{ChatCompletionRequest, ChatMessage, MessageContent},
         common::{InputIds, StringOrArray},

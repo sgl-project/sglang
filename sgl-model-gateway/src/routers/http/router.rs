@@ -27,7 +27,7 @@ use crate::{
         metrics::{bool_to_static_str, metrics_labels, Metrics},
         otel_trace::inject_trace_context_http,
     },
-    policies::{PolicyRegistry, SelectWorkerInfo},
+    policies::PolicyRegistry,
     protocols::{
         chat::ChatCompletionRequest,
         classify::ClassifyRequest,
@@ -39,7 +39,7 @@ use crate::{
         responses::{ResponsesGetParams, ResponsesRequest},
     },
     routers::{
-        error::{self, extract_error_code_from_response},
+        error,
         grpc::utils::{error_type_from_status, route_to_endpoint},
         header_utils, RouterTrait,
     },
