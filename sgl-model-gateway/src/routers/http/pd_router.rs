@@ -1245,7 +1245,7 @@ impl RouterTrait for PDRouter {
             is_stream,
             return_logprob,
             request_text,
-            routing_id: body.routing_id.clone(),
+            routing_id: header_utils::extract_routing_id(headers),
             model_id,
         };
 
@@ -1287,7 +1287,7 @@ impl RouterTrait for PDRouter {
             is_stream,
             return_logprob,
             request_text,
-            routing_id: body.routing_id.clone(),
+            routing_id: header_utils::extract_routing_id(headers),
             model_id,
         };
 
@@ -1321,7 +1321,7 @@ impl RouterTrait for PDRouter {
             is_stream,
             return_logprob,
             request_text,
-            routing_id: body.routing_id.clone(),
+            routing_id: header_utils::extract_routing_id(headers),
             model_id,
         };
 
@@ -1346,7 +1346,7 @@ impl RouterTrait for PDRouter {
             is_stream: false,
             return_logprob: false,
             request_text: req_text,
-            routing_id: body.routing_id.clone(),
+            routing_id: header_utils::extract_routing_id(headers),
             model_id,
         };
 
