@@ -2,7 +2,7 @@ import unittest
 
 from sglang.srt.utils import is_blackwell
 from sglang.test.kits.gsm8k_accuracy_kit import GSM8KMixin
-from sglang.test.kl_test_utils import KLTestMixin
+from sglang.test.mamba_scheduler_strategy_test_utils import MambaSchedulerStrategyMixin
 from sglang.test.server_fixtures.default_fixture import DefaultServerBase
 
 NVIDIA_NEMOTRON_NANO_V2_MODEL = "nvidia/NVIDIA-Nemotron-Nano-9B-v2"
@@ -15,7 +15,7 @@ class TestNvidiaNemotronNanoV2BF16(GSM8KMixin, DefaultServerBase):
 
 
 class TestNvidiaNemotronNanoV2BF16ExtraBuffer(
-    GSM8KMixin, KLTestMixin, DefaultServerBase
+    GSM8KMixin, MambaSchedulerStrategyMixin, DefaultServerBase
 ):
     model = NVIDIA_NEMOTRON_NANO_V2_MODEL
     gsm8k_accuracy_thres = 0.87
@@ -82,7 +82,7 @@ class TestNvidiaNemotronNanoV2SpeculativeDecoding(GSM8KMixin, DefaultServerBase)
 
 
 class TestNvidiaNemotronNanoV2SpeculativeDecodingExtraBuffer(
-    GSM8KMixin, KLTestMixin, DefaultServerBase
+    GSM8KMixin, MambaSchedulerStrategyMixin, DefaultServerBase
 ):
     model = NVIDIA_NEMOTRON_NANO_V2_MODEL
     gsm8k_accuracy_thres = 0.87
