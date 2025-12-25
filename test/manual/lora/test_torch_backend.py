@@ -1,10 +1,10 @@
 import unittest
 
 import torch
-from utils import reference_sgmv_expand, reference_sgmv_shrink
 
 from sglang.srt.lora.backend.torch_backend import TorchNativeLoRABackend
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.test.lora_utils import reference_sgmv_expand, reference_sgmv_shrink
 from sglang.test.test_utils import CustomTestCase
 
 

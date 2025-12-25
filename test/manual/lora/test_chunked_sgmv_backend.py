@@ -4,7 +4,6 @@ from enum import Enum
 from typing import List, Optional, Tuple
 
 import torch
-from utils import reference_sgmv_expand, reference_sgmv_shrink
 
 from sglang.srt.lora.backend.chunked_backend import ChunkedSgmvLoRABackend
 from sglang.srt.lora.triton_ops import (
@@ -14,6 +13,7 @@ from sglang.srt.lora.triton_ops import (
 from sglang.srt.lora.triton_ops.chunked_sgmv_expand import _chunked_lora_expand_kernel
 from sglang.srt.lora.triton_ops.chunked_sgmv_shrink import _chunked_lora_shrink_kernel
 from sglang.srt.lora.utils import LoRABatchInfo
+from sglang.test.lora_utils import reference_sgmv_expand, reference_sgmv_shrink
 
 CHUNK_SIZE = 16
 
