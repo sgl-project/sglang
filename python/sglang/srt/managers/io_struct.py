@@ -229,6 +229,11 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
     # For data parallel rank routing
     data_parallel_rank: Optional[int] = None
 
+    # In PD-Disaggregation mode, requests are scheduled to different DP group based on the load conditions of prefill and decode.
+    # `data_parallel_rank_decode` indicates which DP group the current request need to be dispatched to for decode
+    # `data_parallel_rank` indicates which DP group the request will be scheduled to on the prefill.
+    data_parallel_rank_decode: Optional[int] = None
+
     # For background responses (OpenAI responses API)
     background: bool = False
 
@@ -653,6 +658,11 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
             data_parallel_rank=(
                 self.data_parallel_rank if self.data_parallel_rank is not None else None
             ),
+            data_parallel_rank_decode=(
+                self.data_parallel_rank_decode
+                if self.data_parallel_rank_decode is not None
+                else None
+            ),
             conversation_id=self.conversation_id,
             priority=self.priority,
             extra_key=self.extra_key,
@@ -721,6 +731,8 @@ class TokenizedGenerateReqInput(BaseReq):
 
     # For data parallel rank routing
     data_parallel_rank: Optional[int] = None
+
+    data_parallel_rank_decode: Optional[int] = None
 
     # Priority for the request
     priority: Optional[int] = None

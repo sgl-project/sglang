@@ -211,7 +211,9 @@ class OpenAIServingChat(OpenAIServingBase):
             bootstrap_host=request.bootstrap_host,
             bootstrap_port=request.bootstrap_port,
             bootstrap_room=request.bootstrap_room,
+            # For data parallel rank routing
             data_parallel_rank=request.data_parallel_rank,
+            data_parallel_rank_decode=request.data_parallel_rank_decode,
             return_hidden_states=request.return_hidden_states,
             rid=request.rid,
             extra_key=self._compute_extra_key(request),

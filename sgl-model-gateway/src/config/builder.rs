@@ -185,6 +185,10 @@ impl RouterConfigBuilder {
         self
     }
 
+    pub fn worker_load_check_interval_secs(mut self, interval: u64) -> Self {
+        self.config.worker_load_check_interval_secs = interval;
+        self
+    }
     // ==================== Rate Limiting ====================
 
     pub fn max_concurrent_requests(mut self, max: i32) -> Self {
@@ -460,6 +464,11 @@ impl RouterConfigBuilder {
 
     pub fn igw(mut self, enable: bool) -> Self {
         self.config.enable_igw = enable;
+        self
+    }
+
+    pub fn dp_minimum_tokens_scheduler(mut self, enable: bool) -> Self {
+        self.config.dp_minimum_tokens_scheduler = enable;
         self
     }
 
