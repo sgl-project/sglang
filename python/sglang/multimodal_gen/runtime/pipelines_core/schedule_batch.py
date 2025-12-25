@@ -28,9 +28,7 @@ from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.utils import align_to
 
-if TYPE_CHECKING:
-
-    from sglang.multimodal_gen.runtime.utils.perf_logger import RequestTimings
+from sglang.multimodal_gen.runtime.utils.perf_logger import RequestTimings
 
 
 logger = init_logger(__name__)
