@@ -155,8 +155,6 @@ void per_tensor_quant_fp8(tvm::ffi::TensorView input, tvm::ffi::TensorView outpu
   } else if (dtype.code == kDLFloat && dtype.bits == 16) {
     launch_kernels.template operator()<__half>();
   }
-  // You can also manually check the last CUDA error code via:
-  // RuntimeDeviceCheck();
 }
 
 }  // namespace
