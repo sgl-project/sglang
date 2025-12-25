@@ -346,7 +346,7 @@ class EagleVerifyInputV2Mixin:
 
             kernel = (
                 tree_speculative_sampling_target_only_rejmask
-                if self.topk <= 4
+                if self.topk >= 1 and self.topk <= 4
                 else tree_speculative_sampling_target_only
             )
             kernel(
