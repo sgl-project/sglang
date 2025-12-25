@@ -1861,15 +1861,9 @@ class ModelRunner:
             if self.is_draft_worker:
                 self.max_total_num_tokens = self.server_args.draft_runner_cache_size
                 max_num_reqs = self.server_args.max_num_reqs
-                print(
-                    f"\x1b[31mDraft worker: {self.max_total_num_tokens=}, {max_num_reqs=}\x1b[0m"
-                )
             else:
                 self.server_args.draft_runner_cache_size = self.max_total_num_tokens
                 self.server_args.max_num_reqs = max_num_reqs
-                print(
-                    f"\x1b[31mTarget worker: {self.max_total_num_tokens=}, {max_num_reqs=}\x1b[0m"
-                )
 
         if max_total_tokens is not None:
             if max_total_tokens > self.max_total_num_tokens:
