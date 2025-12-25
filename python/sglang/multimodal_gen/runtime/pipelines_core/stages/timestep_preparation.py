@@ -8,7 +8,6 @@ This module contains implementations of timestep preparation stages for diffusio
 """
 
 import inspect
-import logging
 from typing import Any, Callable, Tuple
 
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
