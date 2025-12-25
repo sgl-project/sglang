@@ -994,7 +994,7 @@ class BatchTokenIDOutput(
     retraction_counts: List[int]
 
     # beam search
-    beam_search_output: List[BeamSearchOutput]
+    beam_search_output: List[BeamSearchOutput] = None
 
     # The trainer step id. Used to know which step's weights are used for sampling.
     token_steps: List[List[int]] = None
@@ -1079,7 +1079,7 @@ class BatchStrOutput(
     retraction_counts: List[int]
 
     # beam search
-    beam_search_output: List[BeamSearchOutput]
+    beam_search_output: List[BeamSearchOutput] = None
 
     # The trainer step id. Used to know which step's weights are used for sampling.
     token_steps: List[List[int]] = None

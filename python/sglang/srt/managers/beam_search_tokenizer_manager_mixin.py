@@ -90,10 +90,14 @@ class BeamSearchTokenizerManagerMixin:
 
         beam_search_output = (
             recv_obj.beam_search_output[i]
-            if i < len(recv_obj.beam_search_output)
+            if recv_obj.beam_search_output and i < len(recv_obj.beam_search_output)
             else None
         )
-        has_beam_search = self._has_beam_search_output(beam_search_output)
+        has_beam_search = (
+            beam_search_output is not None
+            and hasattr(beam_search_output, "sequences")
+            and beam_search_output.sequences
+        )
         if not has_beam_search or recv_obj.finished_reasons[i] is None:
             return False
 
@@ -135,13 +139,6 @@ class BeamSearchTokenizerManagerMixin:
             self.record_request_for_crash_dump(state, state.out_list[-1])
 
         return True
-
-    def _has_beam_search_output(self, beam_search_output: Any) -> bool:
-        return (
-            beam_search_output is not None
-            and hasattr(beam_search_output, "sequences")
-            and beam_search_output.sequences
-        )
 
     def _process_beam_search_outputs(
         self,

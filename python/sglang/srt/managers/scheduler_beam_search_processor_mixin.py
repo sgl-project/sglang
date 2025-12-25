@@ -169,11 +169,11 @@ class SchedulerBeamSearchProcessorMixin:
     def convert_beam_sequences_to_output(req: Req):
         """Convert beam search completed sequences to output format."""
         sequences_with_json_finish_reason = []
-        for seq in req.beam_list.completed:
+        for beam in req.beam_list.completed:
             seq_with_json = replace(
-                seq,
+                beam,
                 finish_reason=(
-                    seq.finish_reason.to_json() if seq.finish_reason else None
+                    beam.finish_reason.to_json() if beam.finish_reason else None
                 ),
             )
             sequences_with_json_finish_reason.append(seq_with_json)
