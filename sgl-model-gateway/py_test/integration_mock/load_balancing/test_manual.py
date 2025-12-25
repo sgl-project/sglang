@@ -1,11 +1,3 @@
-"""
-Integration tests for Manual routing policy with X-SMG-Routing-Key header.
-
-The manual routing policy routes requests to workers based on the routing key
-provided in the X-SMG-Routing-Key HTTP header. Requests with the same routing
-key should consistently route to the same worker.
-"""
-
 import collections
 
 import pytest
