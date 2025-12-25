@@ -56,6 +56,14 @@ pub enum ChatMessage {
     },
     #[serde(rename = "function")]
     Function { content: String, name: String },
+    #[serde(rename = "developer")]
+    Developer {
+        content: MessageContent,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        tools: Option<Vec<Tool>>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
@@ -351,6 +359,10 @@ pub struct ChatCompletionRequest {
     /// Random seed for sampling for deterministic outputs
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sampling_seed: Option<u64>,
+
+    /// Routing ID for manual routing policy
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub routing_id: Option<String>,
 }
 
 // ============================================================================
@@ -638,7 +650,10 @@ impl GenerationRequest for ChatCompletionRequest {
 
         for msg in &self.messages {
             match msg {
-                ChatMessage::System { content, .. } | ChatMessage::User { content, .. } => {
+                ChatMessage::System { content, .. }
+                | ChatMessage::User { content, .. }
+                | ChatMessage::Tool { content, .. }
+                | ChatMessage::Developer { content, .. } => {
                     if has_content && content.has_text() {
                         buffer.push(' ');
                     }
@@ -671,14 +686,6 @@ impl GenerationRequest for ChatCompletionRequest {
                         }
                     }
                 }
-                ChatMessage::Tool { content, .. } => {
-                    if has_content && content.has_text() {
-                        buffer.push(' ');
-                    }
-                    if content.append_text_to(&mut buffer) {
-                        has_content = true;
-                    }
-                }
                 ChatMessage::Function { content, .. } => {
                     if !content.is_empty() {
                         if has_content {
@@ -692,6 +699,10 @@ impl GenerationRequest for ChatCompletionRequest {
         }
 
         buffer
+    }
+
+    fn get_routing_id(&self) -> Option<&str> {
+        self.routing_id.as_deref()
     }
 }
 

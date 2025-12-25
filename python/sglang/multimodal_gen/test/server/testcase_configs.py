@@ -119,6 +119,9 @@ class DiffusionServerArgs:
     custom_validator: str | None = None  # optional custom validator name
     # resources
     num_gpus: int = 1
+    tp_size: int | None = None
+    ulysses_degree: int | None = None
+    ring_degree: int | None = None
     # LoRA
     lora_path: str | None = None  # LoRA adapter path (HF repo or local path)
 
@@ -137,6 +140,9 @@ class DiffusionSamplingParams:
     seconds: int = 1  # for video: duration in seconds
     num_frames: int | None = None  # for video: number of frames
     fps: int | None = None  # for video: frames per second
+
+    # URL direct test flag - if True, don't pre-download URL images
+    direct_url_test: bool = False
 
 
 @dataclass(frozen=True)
@@ -224,12 +230,21 @@ TI2I_sampling_params = DiffusionSamplingParams(
     image_path="https://github.com/lm-sys/lm-sys.github.io/releases/download/test/TI2I_Qwen_Image_Edit_Input.jpg",
 )
 
+MULTI_IMAGE_TI2I_sampling_params = DiffusionSamplingParams(
+    prompt="The magician bear is on the left, the alchemist bear is on the right, facing each other in the central park square.",
+    image_path=[
+        "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-Image/edit2509/edit2509_1.jpg",
+        "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-Image/edit2509/edit2509_2.jpg",
+    ],
+    direct_url_test=True,
+)
+
 T2V_PROMPT = "A curious raccoon"
 
 TI2V_sampling_params = DiffusionSamplingParams(
-    output_size="832x1104",
     prompt="The man in the picture slowly turns his head, his expression enigmatic and otherworldly. The camera performs a slow, cinematic dolly out, focusing on his face. Moody lighting, neon signs glowing in the background, shallow depth of field.",
     image_path="https://is1-ssl.mzstatic.com/image/thumb/Music114/v4/5f/fa/56/5ffa56c2-ea1f-7a17-6bad-192ff9b6476d/825646124206.jpg/600x600bb.jpg",
+    direct_url_test=True,
 )
 
 # All test cases with clean default values
@@ -287,6 +302,16 @@ ONE_GPU_CASES_A: list[DiffusionTestCase] = [
         ),
         TI2I_sampling_params,
     ),
+    DiffusionTestCase(
+        "qwen_image_edit_2509_ti2i",
+        DiffusionServerArgs(
+            model_path="Qwen/Qwen-Image-Edit-2509",
+            modality="image",
+            warmup_text=0,
+            warmup_edit=1,
+        ),
+        MULTI_IMAGE_TI2I_sampling_params,
+    ),
 ]
 
 ONE_GPU_CASES_B: list[DiffusionTestCase] = [
@@ -302,7 +327,6 @@ ONE_GPU_CASES_B: list[DiffusionTestCase] = [
         ),
         DiffusionSamplingParams(
             prompt=T2V_PROMPT,
-            output_size="848x480",
         ),
     ),
     # LoRA test case for single transformer + merge/unmerge API test
@@ -319,7 +343,6 @@ ONE_GPU_CASES_B: list[DiffusionTestCase] = [
         ),
         DiffusionSamplingParams(
             prompt="csetiarcane Nfj1nx with blue hair, a woman walking in a cyberpunk city at night",
-            output_size="480x320",
             num_frames=8,
         ),
     ),
@@ -355,7 +378,6 @@ ONE_GPU_CASES_B: list[DiffusionTestCase] = [
         ),
         DiffusionSamplingParams(
             prompt=T2V_PROMPT,
-            output_size="720x480",
         ),
     ),
     # === Text and Image to Video (TI2V) ===
@@ -384,7 +406,6 @@ ONE_GPU_CASES_B: list[DiffusionTestCase] = [
 ]
 
 TWO_GPU_CASES_A = [
-    # TODO: Timeout with Torch2.9. Add back when it can pass CI
     DiffusionTestCase(
         "wan2_2_i2v_a14b_2gpu",
         DiffusionServerArgs(
@@ -408,7 +429,6 @@ TWO_GPU_CASES_A = [
         ),
         DiffusionSamplingParams(
             prompt=T2V_PROMPT,
-            output_size="720x480",
         ),
     ),
     # LoRA test case for transformer_2 support
@@ -425,7 +445,6 @@ TWO_GPU_CASES_A = [
         ),
         DiffusionSamplingParams(
             prompt="Nfj1nx with blue hair, a woman walking in a cyberpunk city at night",
-            output_size="720x480",
         ),
     ),
     DiffusionTestCase(
@@ -440,7 +459,7 @@ TWO_GPU_CASES_A = [
         ),
         DiffusionSamplingParams(
             prompt=T2V_PROMPT,
-            output_size="720x480",
+            output_size="832x480",
         ),
     ),
 ]
@@ -492,6 +511,9 @@ TWO_GPU_CASES_B = [
             warmup_text=1,
             warmup_edit=0,
             num_gpus=2,
+            # test ring attn
+            ulysses_degree=1,
+            ring_degree=2,
         ),
         T2I_sampling_params,
     ),
@@ -502,6 +524,19 @@ TWO_GPU_CASES_B = [
             modality="image",
             warmup_text=1,
             warmup_edit=0,
+            num_gpus=2,
+        ),
+        T2I_sampling_params,
+    ),
+    DiffusionTestCase(
+        "flux_2_image_t2i_2_gpus",
+        DiffusionServerArgs(
+            model_path="black-forest-labs/FLUX.2-dev",
+            modality="image",
+            warmup_text=1,
+            warmup_edit=0,
+            num_gpus=2,
+            tp_size=2,
         ),
         T2I_sampling_params,
     ),

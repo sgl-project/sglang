@@ -49,6 +49,21 @@ from sglang.srt.model_loader.weight_validation import (
 from sglang.srt.utils import find_local_repo_dir, log_info_on_rank0, print_warning_once
 from sglang.utils import is_in_ci
 
+try:
+    from fastsafetensors import SafeTensorsFileLoader, SingleGroup
+except ImportError:
+
+    class PlaceholderModule:
+        def __init__(self, name):
+            self.name = name
+
+        def __getattr__(self, name):
+            raise ImportError(f"Please install {self.name}")
+
+    fastsafetensors = PlaceholderModule("fastsafetensors")
+    SafeTensorsFileLoader = None
+    SingleGroup = None
+
 logger = logging.getLogger(__name__)
 
 # use system-level temp directory for file locks, so that multiple users
@@ -393,14 +408,17 @@ def _find_local_hf_snapshot_dir_unlocked(
                     )
                     return None
                 else:
-                    # Cannot selectively clean (e.g., missing shards) - remove entire cache
+                    # Missing shards (not corruption) - let snapshot_download handle it.
+                    # IMPORTANT: Do NOT delete the entire cache here, as other processes
+                    # (TP/EP ranks) may already be loading weights from these files.
+                    # Deleting the cache while other processes are using it causes
+                    # FileNotFoundError race conditions. Instead, just return None
+                    # to trigger a download - snapshot_download will only fetch
+                    # missing files without disturbing existing ones.
                     log_info_on_rank0(
                         logger,
                         f"Validation failed for {model_name_or_path}: {error_msg}. "
-                        "Will remove entire cache and re-download.",
-                    )
-                    _cleanup_corrupted_model_cache(
-                        model_name_or_path, found_local_snapshot_dir, error_msg
+                        "Will attempt to download missing files.",
                     )
                     return None
 
@@ -821,6 +839,61 @@ def safetensors_weights_iterator(
             with safetensors.safe_open(st_file, framework="pt", device="cpu") as f:
                 for name in f.keys():
                     yield name, f.get_tensor(name)
+
+
+def fastsafetensors_weights_iterator(
+    hf_weights_files: List[str],
+) -> Generator[Tuple[str, torch.Tensor], None, None]:
+    """
+    Iterate over the weights in the model safetensor files
+    using fastsafetensor library to accelerate loading via GPU Direct Storage (if available).
+    """
+    if SafeTensorsFileLoader is None:
+        raise ImportError(
+            "Please install fastsafetensors via `pip install fastsafetensors`"
+        )
+
+    if torch.distributed.is_initialized():
+        pg = torch.distributed.group.WORLD
+    else:
+        pg = SingleGroup()
+
+    try:
+        rank = pg.rank()
+    except Exception:
+        rank = 0
+
+    device = torch.device(f"cuda:{rank}")
+
+    weight_files_sub_lists = [
+        hf_weights_files[i : i + pg.size()]
+        for i in range(0, len(hf_weights_files), pg.size())
+    ]
+
+    _BAR_FORMAT = (
+        "{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]"
+    )
+
+    for f_list in tqdm(
+        weight_files_sub_lists,
+        desc="Loading safetensors using Fastsafetensor loader",
+        disable=False,
+        bar_format=_BAR_FORMAT,
+    ):
+        loader = SafeTensorsFileLoader(pg, device)
+        rank_file_map = {i: [f] for i, f in enumerate(f_list)}
+        loader.add_filenames(rank_file_map)
+        try:
+            fb = loader.copy_files_to_device()
+            try:
+                keys = list(fb.key_to_rank_lidx.keys())
+                for k in keys:
+                    t = fb.get_tensor(k)
+                    yield k, t
+            finally:
+                pass
+        finally:
+            loader.close()
 
 
 def multi_thread_safetensors_weights_iterator(

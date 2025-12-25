@@ -20,6 +20,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     VerificationResult,
 )
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs, get_global_server_args
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
@@ -133,7 +134,9 @@ class DecodingStage(PipelineStage):
 
         # Decode latents
         with torch.autocast(
-            device_type="cuda", dtype=vae_dtype, enabled=vae_autocast_enabled
+            device_type=current_platform.device_type,
+            dtype=vae_dtype,
+            enabled=vae_autocast_enabled,
         ):
             try:
                 # TODO: make it more specific

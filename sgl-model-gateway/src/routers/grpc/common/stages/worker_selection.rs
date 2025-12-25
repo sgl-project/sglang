@@ -9,10 +9,11 @@ use tracing::{error, warn};
 use super::PipelineStage;
 use crate::{
     core::{ConnectionMode, Worker, WorkerRegistry, WorkerType},
-    policies::PolicyRegistry,
-    routers::grpc::{
-        context::{RequestContext, WorkerSelection},
+    observability::metrics::{metrics_labels, Metrics},
+    policies::{PolicyRegistry, SelectWorkerInfo},
+    routers::{
         error,
+        grpc::context::{RequestContext, WorkerSelection},
     },
 };
 
@@ -52,20 +53,26 @@ impl PipelineStage for WorkerSelectionStage {
                 function = "WorkerSelectionStage::execute",
                 "Preparation stage not completed"
             );
-            error::internal_error("Preparation stage not completed")
+            error::internal_error(
+                "preparation_stage_not_completed",
+                "Preparation stage not completed",
+            )
         })?;
 
         // For Harmony, use selection_text produced during Harmony encoding
         // Otherwise, use original_text from regular preparation
-        let text = if prep.harmony_mode {
-            prep.selection_text.as_deref()
-        } else {
-            prep.original_text.as_deref()
+        let info = SelectWorkerInfo {
+            request_text: if prep.harmony_mode {
+                prep.selection_text.as_deref()
+            } else {
+                prep.original_text.as_deref()
+            },
+            routing_id: prep.routing_id.as_deref(),
         };
 
         let workers = match self.mode {
             WorkerSelectionMode::Regular => {
-                match self.select_single_worker(ctx.input.model_id.as_deref(), text) {
+                match self.select_single_worker(ctx.input.model_id.as_deref(), &info) {
                     Some(w) => WorkerSelection::Single { worker: w },
                     None => {
                         error!(
@@ -74,15 +81,15 @@ impl PipelineStage for WorkerSelectionStage {
                             model_id = ?ctx.input.model_id,
                             "No available workers for model"
                         );
-                        return Err(error::service_unavailable(format!(
-                            "No available workers for model: {:?}",
-                            ctx.input.model_id
-                        )));
+                        return Err(error::service_unavailable(
+                            "no_available_workers",
+                            format!("No available workers for model: {:?}", ctx.input.model_id),
+                        ));
                     }
                 }
             }
             WorkerSelectionMode::PrefillDecode => {
-                match self.select_pd_pair(ctx.input.model_id.as_deref(), text) {
+                match self.select_pd_pair(ctx.input.model_id.as_deref(), &info) {
                     Some((prefill, decode)) => WorkerSelection::Dual { prefill, decode },
                     None => {
                         error!(
@@ -91,10 +98,13 @@ impl PipelineStage for WorkerSelectionStage {
                             model_id = ?ctx.input.model_id,
                             "No available PD worker pairs for model"
                         );
-                        return Err(error::service_unavailable(format!(
-                            "No available PD worker pairs for model: {:?}",
-                            ctx.input.model_id
-                        )));
+                        return Err(error::service_unavailable(
+                            "no_available_pd_worker_pairs",
+                            format!(
+                                "No available PD worker pairs for model: {:?}",
+                                ctx.input.model_id
+                            ),
+                        ));
                     }
                 }
             }
@@ -113,7 +123,7 @@ impl WorkerSelectionStage {
     fn select_single_worker(
         &self,
         model_id: Option<&str>,
-        text: Option<&str>,
+        info: &SelectWorkerInfo,
     ) -> Option<Arc<dyn Worker>> {
         // Get workers for the specified model, filtered by connection mode
         let workers = self.worker_registry.get_workers_filtered(
@@ -139,14 +149,24 @@ impl WorkerSelectionStage {
         };
 
         // Select worker using the policy
-        let idx = policy.select_worker(&available, text)?;
-        Some(available[idx].clone())
+        let idx = policy.select_worker(&available, info)?;
+        let selected = available[idx].clone();
+
+        // Record worker selection metric
+        Metrics::record_worker_selection(
+            metrics_labels::WORKER_REGULAR,
+            metrics_labels::CONNECTION_GRPC,
+            model_id.unwrap_or("default"),
+            policy.name(),
+        );
+
+        Some(selected)
     }
 
     fn select_pd_pair(
         &self,
         model_id: Option<&str>,
-        text: Option<&str>,
+        info: &SelectWorkerInfo,
     ) -> Option<(Arc<dyn Worker>, Arc<dyn Worker>)> {
         let all_workers = self.worker_registry.get_workers_filtered(
             model_id,
@@ -186,8 +206,25 @@ impl WorkerSelectionStage {
             None => self.policy_registry.get_default_policy(),
         };
 
-        let prefill_idx = policy.select_worker(&available_prefill, text)?;
-        let decode_idx = policy.select_worker(&available_decode, text)?;
+        let prefill_idx = policy.select_worker(&available_prefill, info)?;
+        let decode_idx = policy.select_worker(&available_decode, info)?;
+
+        let model = model_id.unwrap_or("default");
+        let policy_name = policy.name();
+
+        // Record worker selection metrics for both prefill and decode
+        Metrics::record_worker_selection(
+            metrics_labels::WORKER_PREFILL,
+            metrics_labels::CONNECTION_GRPC,
+            model,
+            policy_name,
+        );
+        Metrics::record_worker_selection(
+            metrics_labels::WORKER_DECODE,
+            metrics_labels::CONNECTION_GRPC,
+            model,
+            policy_name,
+        );
 
         Some((
             available_prefill[prefill_idx].clone(),
