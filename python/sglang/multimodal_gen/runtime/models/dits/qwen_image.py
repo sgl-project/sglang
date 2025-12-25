@@ -275,10 +275,17 @@ class QwenEmbedLayer3DRope(nn.Module):
         Args:
             index: [0, 1, 2, 3] 1D Tensor representing the position index of the token
         """
+        device = index.device
         assert dim % 2 == 0
         freqs = torch.outer(
             index,
-            1.0 / torch.pow(theta, torch.arange(0, dim, 2).to(torch.float32).div(dim)),
+            (
+                1.0
+                / torch.pow(
+                    theta,
+                    torch.arange(0, dim, 2, device=device).to(torch.float32).div(dim),
+                )
+            ).to(device=device),
         )
         freqs = torch.polar(torch.ones_like(freqs), freqs)
         return freqs
@@ -288,7 +295,31 @@ class QwenEmbedLayer3DRope(nn.Module):
         Args: video_fhw: [frame, height, width] a list of 3 integers representing the shape of the video Args:
         txt_length: [bs] a list of 1 integers representing the length of the text
         """
-        if self.pos_freqs.device != device:
+
+        # When models are initialized under a "meta" device context (e.g. init_empty_weights),
+        # tensors created during __init__ become meta tensors. Calling .to(...) on a meta tensor
+        # raises "Cannot copy out of meta tensor". Rebuild the frequencies on the target device
+        # in that case; otherwise move them if just on a different device.
+        if getattr(self.pos_freqs, "device", torch.device("meta")).type == "meta":
+            pos_index = torch.arange(4096, device=device)
+            neg_index = torch.arange(4096, device=device).flip(0) * -1 - 1
+            self.pos_freqs = torch.cat(
+                [
+                    self.rope_params(pos_index, self.axes_dim[0], self.theta),
+                    self.rope_params(pos_index, self.axes_dim[1], self.theta),
+                    self.rope_params(pos_index, self.axes_dim[2], self.theta),
+                ],
+                dim=1,
+            ).to(device=device)
+            self.neg_freqs = torch.cat(
+                [
+                    self.rope_params(neg_index, self.axes_dim[0], self.theta),
+                    self.rope_params(neg_index, self.axes_dim[1], self.theta),
+                    self.rope_params(neg_index, self.axes_dim[2], self.theta),
+                ],
+                dim=1,
+            ).to(device=device)
+        elif self.pos_freqs.device != device:
             self.pos_freqs = self.pos_freqs.to(device)
             self.neg_freqs = self.neg_freqs.to(device)
 
@@ -794,6 +825,16 @@ class QwenImageTransformer2DModel(CachableDiT):
         controlnet_block_samples=None,
         return_dict: bool = True,
     ) -> Union[torch.Tensor, Transformer2DModelOutput]:
+        print(f"828 {img_shapes=}", flush=True)
+        print(f"829 {additional_t_cond=}", flush=True)
+        print(f"830 {timestep=}", flush=True)
+        print(f"831 {hidden_states=}", flush=True)
+        print(f"832 {encoder_hidden_states=}", flush=True)
+        print(f"833 {encoder_hidden_states_mask=}", flush=True)
+        print(f"834 {freqs_cis=}", flush=True)
+        print(f"835 {guidance=}", flush=True)
+        print(f"836 {attention_kwargs=}", flush=True)
+        print(f"837 {txt_seq_lens=}", flush=True)
         """
         The [`QwenTransformer2DModel`] forward method.
 
