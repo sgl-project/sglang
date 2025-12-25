@@ -2,6 +2,7 @@ from __future__ import annotations
 
 """Cache for chunked prefill, used when RadixCache is disabled."""
 
+import logging
 from typing import TYPE_CHECKING, Any, Optional
 
 import torch
@@ -12,6 +13,9 @@ from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, MatchResult
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+
+
+logger = logging.getLogger(__name__)
 
 
 class ChunkCache(BasePrefixCache):
@@ -87,6 +91,14 @@ class SWAChunkCache(ChunkCache):
             params.sliding_window_size is not None
             or params.attention_chunk_size is not None
         ), "Sliding window size or attention chunk size must be set for SWAChunkCache"
+
+        if (
+            params.sliding_window_size is not None
+            and params.attention_chunk_size is not None
+        ):
+            logger.warning(
+                "Sliding window size and attention chunk size are both set, use sliding window size for chunk cache eviction."
+            )
 
         self.sliding_window_size = params.sliding_window_size
         self.attention_chunk_size = params.attention_chunk_size
