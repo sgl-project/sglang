@@ -879,6 +879,7 @@ class QwenImageTransformer2DModel(CachableDiT):
 
         encoder_hidden_states = self.txt_norm(encoder_hidden_states)
         encoder_hidden_states = self.txt_in(encoder_hidden_states)
+        
         temb = self.time_text_embed(timestep, hidden_states, additional_t_cond)
 
         image_rotary_emb = freqs_cis
