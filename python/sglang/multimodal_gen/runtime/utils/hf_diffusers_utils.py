@@ -464,7 +464,6 @@ def maybe_download_model(
         except (
             RequestException,
             RequestsConnectionError,
-            LocalEntryNotFoundError,
         ) as e:
             # Network-related errors - retry with exponential backoff
             if attempt == MAX_RETRIES - 1:
