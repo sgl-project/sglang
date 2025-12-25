@@ -191,7 +191,7 @@ impl Router {
         let start = Instant::now();
         let is_stream = typed_req.is_stream();
         let text = typed_req.extract_text_for_routing();
-        let routing_id = typed_req.get_routing_id().map(|s| s.to_string());
+        let routing_id = header_utils::extract_routing_id(headers);
         let info = crate::policies::SelectWorkerInfo {
             request_text: Some(&text),
             routing_id: routing_id.as_deref(),

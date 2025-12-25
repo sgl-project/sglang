@@ -15,6 +15,7 @@ use crate::{
             context::{PreparationOutput, RequestContext},
             utils,
         },
+        header_utils,
     },
 };
 
@@ -96,7 +97,7 @@ impl ChatPreparationStage {
         // Store results in context
         ctx.state.preparation = Some(PreparationOutput {
             original_text: Some(processed_messages.text.clone()),
-            routing_id: request.routing_id.clone(),
+            routing_id: header_utils::extract_routing_id(ctx.input.headers.as_ref()),
             token_ids,
             processed_messages: Some(processed_messages),
             tool_constraints: tool_call_constraint,

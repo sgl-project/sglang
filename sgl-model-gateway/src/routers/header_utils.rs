@@ -157,6 +157,17 @@ pub fn apply_provider_headers(
     req
 }
 
+/// Header name for routing key used by manual routing policy
+pub const ROUTING_KEY_HEADER: &str = "X-SMG-Routing-Key";
+
+/// Extract routing ID from HTTP headers for manual routing policy
+pub fn extract_routing_id(headers: Option<&HeaderMap>) -> Option<String> {
+    headers
+        .and_then(|h| h.get(ROUTING_KEY_HEADER))
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string())
+}
+
 /// Extract auth header with passthrough semantics.
 ///
 /// Passthrough mode: User's Authorization header takes priority.
@@ -182,4 +193,32 @@ pub fn extract_auth_header(
             .as_ref()
             .and_then(|k| HeaderValue::from_str(&format!("Bearer {}", k)).ok())
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_extract_routing_id_with_header() {
+        let mut headers = HeaderMap::new();
+        headers.insert(ROUTING_KEY_HEADER, HeaderValue::from_static("user-123"));
+        let result = extract_routing_id(Some(&headers));
+        assert_eq!(result, Some("user-123".to_string()));
+    }
+
+    #[test]
+    fn test_extract_routing_id_without_header() {
+        let headers = HeaderMap::new();
+        let result = extract_routing_id(Some(&headers));
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_extract_routing_id_empty_value() {
+        let mut headers = HeaderMap::new();
+        headers.insert(ROUTING_KEY_HEADER, HeaderValue::from_static(""));
+        let result = extract_routing_id(Some(&headers));
+        assert_eq!(result, Some("".to_string()));
+    }
 }
