@@ -202,10 +202,7 @@ mod tests {
     #[test]
     fn test_extract_routing_id_with_header() {
         let mut headers = HeaderMap::new();
-        headers.insert(
-            ROUTING_KEY_HEADER,
-            HeaderValue::from_static("user-123"),
-        );
+        headers.insert(ROUTING_KEY_HEADER, HeaderValue::from_static("user-123"));
         let result = extract_routing_id(Some(&headers));
         assert_eq!(result, Some("user-123".to_string()));
     }
@@ -220,10 +217,7 @@ mod tests {
     #[test]
     fn test_extract_routing_id_empty_value() {
         let mut headers = HeaderMap::new();
-        headers.insert(
-            ROUTING_KEY_HEADER,
-            HeaderValue::from_static(""),
-        );
+        headers.insert(ROUTING_KEY_HEADER, HeaderValue::from_static(""));
         let result = extract_routing_id(Some(&headers));
         assert_eq!(result, Some("".to_string()));
     }
