@@ -1465,7 +1465,9 @@ class Scheduler(
             req.tokenizer = self.tokenizer
             if getattr(recv_req, "dispatch_to_scheduler_time", 0.0):
                 # Keep dispatch timestamp only when present, clamp to zero to avoid negative values
-                req.time_stats.dispatch_to_scheduler_time = max(0.0, recv_req.dispatch_to_scheduler_time)
+                req.time_stats.dispatch_to_scheduler_time = max(
+                    0.0, recv_req.dispatch_to_scheduler_time
+                )
             req.time_stats.arrive_scheduler_time = time.perf_counter()
 
             if self.disaggregation_mode != DisaggregationMode.NULL:

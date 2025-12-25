@@ -442,7 +442,9 @@ class SchedulerDisaggregationPrefillMixin:
 
         if self.tp_rank == 0 and self.enable_metrics:
             self.iter_forward_finish_time = time.time()
-            run_batch_time = self.iter_forward_finish_time - self.iter_forward_start_time
+            run_batch_time = (
+                self.iter_forward_finish_time - self.iter_forward_start_time
+            )
             self.stats.run_batch_time = run_batch_time
             self.metrics_collector.log_stats(self.stats)
 

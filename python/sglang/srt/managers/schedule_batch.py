@@ -729,7 +729,7 @@ class Req:
         self.time_stats: TimeStats = TimeStats(disagg_mode=disagg_mode)
         self.has_log_time_stats: bool = False
         self.last_tic = time.monotonic()
-        
+
         # Timestamp when tokenizer dispatches the request to the scheduler
         self.dispatch_to_scheduler_time = dispatch_to_scheduler_time
         # TODO (suhang): Move the dispatch_to_scheduler_time synchronization into Req’s own initializer:

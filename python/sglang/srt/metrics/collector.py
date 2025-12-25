@@ -85,7 +85,7 @@ class TimeStats:
     def get_request_zmq_time(self) -> float:
         """get_request_zmq_time"""
         # Avoid pushing uninitialized values into metrics
-        if (self.dispatch_to_scheduler_time <= 0.0 or self.arrive_scheduler_time <= 0.0):
+        if self.dispatch_to_scheduler_time <= 0.0 or self.arrive_scheduler_time <= 0.0:
             return 0.0
         return max(0.0, self.arrive_scheduler_time - self.dispatch_to_scheduler_time)
 
@@ -662,7 +662,7 @@ class SchedulerMetricsCollector:
         )
         self.request_waiting_time = Histogram(
             name="sglang:request_waiting_time",
-            documentation="Histogram of request waitting time in seconds",
+            documentation="Histogram of request waiting time in seconds",
             labelnames=labels.keys(),
             buckets=[
                 0.01,
@@ -1039,7 +1039,7 @@ class SchedulerMetricsCollector:
         self._log_gauge(self.idle_batch_ratio, stats.idle_batch_ratio)
         self._log_gauge(self.prefill_chunk_util, stats.prefill_chunk_util)
         self._log_gauge(self.decode_bs_util, stats.decode_bs_util)
-        
+
         # DP all_gather latency
         self._log_gauge(self.all_gather_latency_us, stats.all_gather_latency_us)
 
@@ -1433,7 +1433,9 @@ class TokenizerMetricsCollector:
 
     def observe_request_time_to_tokenizer_ready(self, latency: float) -> None:
         """Observe the time it took to generate a request from HTTP receipt to tokenizer-ready input."""
-        self.histogram_request_time_to_tokenizer_ready.labels(**self.labels).observe(latency)
+        self.histogram_request_time_to_tokenizer_ready.labels(**self.labels).observe(
+            latency
+        )
 
 
 @dataclass

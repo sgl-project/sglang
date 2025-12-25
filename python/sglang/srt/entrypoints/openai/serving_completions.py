@@ -180,7 +180,9 @@ class OpenAIServingCompletion(OpenAIServingBase):
     ) -> StreamingResponse:
         """Handle streaming completion request"""
         return StreamingResponse(
-            self._generate_completion_stream(adapted_request, request, raw_request, tokenizer_rev_request_time),
+            self._generate_completion_stream(
+                adapted_request, request, raw_request, tokenizer_rev_request_time
+            ),
             media_type="text/event-stream",
             background=self.tokenizer_manager.create_abort_task(adapted_request),
         )
