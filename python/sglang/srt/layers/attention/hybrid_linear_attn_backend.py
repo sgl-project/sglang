@@ -1174,17 +1174,12 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
 
             if self.forward_metadata.num_decodes > 0:
                 num_decodes = self.forward_metadata.num_decodes
-                mamba_cache_indices = self.forward_metadata.mamba_cache_indices[
-                    -num_decodes:
-                ]
-                mamba_track_mask = forward_batch.mamba_track_mask[-num_decodes:]
-                mamba_track_indices = forward_batch.mamba_track_indices[-num_decodes:]
                 track_mamba_states_if_needed(
                     layer_cache.conv[0],
                     layer_cache.temporal,
-                    mamba_cache_indices,
-                    mamba_track_mask,
-                    mamba_track_indices,
+                    self.forward_metadata.mamba_cache_indices[-num_decodes:],
+                    forward_batch.mamba_track_mask[-num_decodes:],
+                    forward_batch.mamba_track_indices[-num_decodes:],
                     num_decodes,
                 )
 
