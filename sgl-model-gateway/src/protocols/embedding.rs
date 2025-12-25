@@ -31,6 +31,10 @@ pub struct EmbeddingRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rid: Option<String>,
 
+    /// Routing ID for manual routing policy
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub routing_id: Option<String>,
+
     /// SGLang extension: enable/disable logging of metrics for this request
     #[serde(skip_serializing_if = "Option::is_none")]
     pub log_metrics: Option<bool>,
@@ -57,6 +61,10 @@ impl GenerationRequest for EmbeddingRequest {
                 .join(" "),
             _ => String::new(),
         }
+    }
+
+    fn get_routing_id(&self) -> Option<&str> {
+        self.routing_id.as_deref()
     }
 }
 

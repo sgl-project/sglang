@@ -492,6 +492,7 @@ pub(super) async fn execute_tool_loop(
                 top_k: current_request.top_k,
                 min_p: current_request.min_p,
                 repetition_penalty: current_request.repetition_penalty,
+                routing_id: current_request.routing_id.clone(),
             };
 
             // Continue to next iteration
@@ -1070,6 +1071,7 @@ async fn execute_tool_loop_streaming_internal(
                 top_k: current_request.top_k,
                 min_p: current_request.min_p,
                 repetition_penalty: current_request.repetition_penalty,
+                routing_id: current_request.routing_id.clone(),
             };
 
             continue;

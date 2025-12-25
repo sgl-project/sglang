@@ -516,26 +516,20 @@ impl CliArgs {
         &self,
         prefill_urls: Vec<(String, Option<u16>)>,
     ) -> ConfigResult<RouterConfig> {
-        let mode = if self.enable_igw {
-            RoutingMode::Regular {
-                worker_urls: vec![],
-            }
-        } else if matches!(self.backend, Backend::Openai) {
+        // Determine routing mode based on backend type and PD disaggregation flag
+        // IGW mode doesn't change routing mode, only affects router initialization
+        let mode = if matches!(self.backend, Backend::Openai) {
             RoutingMode::OpenAI {
                 worker_urls: self.worker_urls.clone(),
             }
         } else if self.pd_disaggregation {
-            let decode_urls = self.decode.clone();
-
-            // Allow empty URLs to support dynamic worker addition
             RoutingMode::PrefillDecode {
                 prefill_urls,
-                decode_urls,
+                decode_urls: self.decode.clone(),
                 prefill_policy: self.prefill_policy.as_ref().map(|p| self.parse_policy(p)),
                 decode_policy: self.decode_policy.as_ref().map(|p| self.parse_policy(p)),
             }
         } else {
-            // Allow empty URLs to support dynamic worker addition
             RoutingMode::Regular {
                 worker_urls: self.worker_urls.clone(),
             }
@@ -762,10 +756,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse_from(filtered_args);
 
     // Handle subcommands or use direct args
-    let cli_args = match cli.command {
+    let mut cli_args = match cli.command {
         Some(Commands::Launch { args }) => args,
         None => cli.router_args,
     };
+
+    // Automatically enable IGW mode when service discovery is turned on
+    if cli_args.service_discovery && !cli_args.enable_igw {
+        println!("INFO: IGW mode automatically enabled because service discovery is turned on");
+        cli_args.enable_igw = true;
+    }
 
     println!("SGLang Router starting...");
     println!("Host: {}:{}", cli_args.host, cli_args.port);

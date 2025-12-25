@@ -616,6 +616,10 @@ pub struct ResponsesRequest {
     #[serde(default = "default_repetition_penalty")]
     #[validate(range(min = 0.0, max = 2.0))]
     pub repetition_penalty: f32,
+
+    /// Routing ID for manual routing policy
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub routing_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -659,6 +663,7 @@ impl Default for ResponsesRequest {
             top_k: default_top_k(),
             min_p: 0.0,
             repetition_penalty: default_repetition_penalty(),
+            routing_id: None,
         }
     }
 }
@@ -769,6 +774,10 @@ impl GenerationRequest for ResponsesRequest {
                 .collect::<Vec<String>>()
                 .join(" "),
         }
+    }
+
+    fn get_routing_id(&self) -> Option<&str> {
+        self.routing_id.as_deref()
     }
 }
 

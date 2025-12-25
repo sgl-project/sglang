@@ -96,6 +96,7 @@ impl ChatPreparationStage {
         // Store results in context
         ctx.state.preparation = Some(PreparationOutput {
             original_text: Some(processed_messages.text.clone()),
+            routing_id: request.routing_id.clone(),
             token_ids,
             processed_messages: Some(processed_messages),
             tool_constraints: tool_call_constraint,

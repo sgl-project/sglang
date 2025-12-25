@@ -126,26 +126,27 @@ def pretty_print_tests(
 
     headers = ["Hardware", "Suite", "Nightly", "Partition"]
     rows = [[hw.name, suite, str(nightly), partition_info]]
-    msg = tabulate.tabulate(rows, headers=headers, tablefmt="psql")
-    print(msg + "\n")
+    msg = tabulate.tabulate(rows, headers=headers, tablefmt="psql") + "\n"
 
     if skipped_tests:
-        print(f"⚠️  Skipped {len(skipped_tests)} test(s):")
+        msg += f"⚠️  Skipped {len(skipped_tests)} test(s):\n"
         for t in skipped_tests:
             reason = t.disabled or "disabled"
-            print(f"  - {t.filename} (reason: {reason})")
-
-        print()
+            msg += f"  - {t.filename} (reason: {reason})\n"
+        msg += "\n"
 
     if len(ci_tests) == 0:
-        print(f"No tests found for hw={hw.name}, suite={suite}, nightly={nightly}")
-        print("This is expected during incremental migration. Skipping.")
-        return
+        msg += f"No tests found for hw={hw.name}, suite={suite}, nightly={nightly}\n"
+        msg += "This is expected during incremental migration. Skipping.\n"
+    else:
+        total_est_time = sum(t.est_time for t in ci_tests)
+        msg += (
+            f"✅ Enabled {len(ci_tests)} test(s) (est total {total_est_time:.1f}s):\n"
+        )
+        for t in ci_tests:
+            msg += f"  - {t.filename} (est_time={t.est_time})\n"
 
-    total_est_time = sum(t.est_time for t in ci_tests)
-    print(f"✅ Enabled {len(ci_tests)} test(s) (est total {total_est_time:.1f}s):")
-    for t in ci_tests:
-        print(f"  - {t.filename} (est_time={t.est_time})")
+    print(msg, flush=True)
 
 
 def run_a_suite(args):

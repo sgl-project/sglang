@@ -35,14 +35,13 @@ use crate::{
         completion::CompletionRequest,
         embedding::EmbeddingRequest,
         generate::GenerateRequest,
-        parser::{ParseFunctionCallRequest, SeparateReasoningRequest},
         rerank::{RerankRequest, RerankResponse, RerankResult},
         responses::{ResponsesGetParams, ResponsesRequest},
     },
     routers::{
-        error::{self, extract_error_code_from_response},
+        error,
         grpc::utils::{error_type_from_status, route_to_endpoint},
-        header_utils, parse, RouterTrait,
+        header_utils, RouterTrait,
     },
 };
 
@@ -54,7 +53,6 @@ pub struct Router {
     dp_aware: bool,
     enable_igw: bool,
     retry_config: RetryConfig,
-    context: Option<Arc<AppContext>>,
 }
 
 impl std::fmt::Debug for Router {
@@ -66,7 +64,6 @@ impl std::fmt::Debug for Router {
             .field("dp_aware", &self.dp_aware)
             .field("enable_igw", &self.enable_igw)
             .field("retry_config", &self.retry_config)
-            .field("context", &"<AppContext>")
             .finish()
     }
 }
@@ -81,7 +78,6 @@ impl Router {
             dp_aware: ctx.router_config.dp_aware,
             enable_igw: ctx.router_config.enable_igw,
             retry_config: ctx.router_config.effective_retry_config(),
-            context: Some(ctx.clone()),
         })
     }
 
@@ -144,7 +140,7 @@ impl Router {
     fn select_worker_for_model(
         &self,
         model_id: Option<&str>,
-        text: Option<&str>,
+        info: &crate::policies::SelectWorkerInfo,
     ) -> Option<Arc<dyn Worker>> {
         let effective_model_id = if !self.enable_igw { None } else { model_id };
 
@@ -172,7 +168,7 @@ impl Router {
             None => self.policy_registry.get_default_policy(),
         };
 
-        let idx = policy.select_worker(&available, text)?;
+        let idx = policy.select_worker(&available, info)?;
 
         // Record worker selection metric (Layer 3)
         Metrics::record_worker_selection(
@@ -195,6 +191,11 @@ impl Router {
         let start = Instant::now();
         let is_stream = typed_req.is_stream();
         let text = typed_req.extract_text_for_routing();
+        let routing_id = typed_req.get_routing_id().map(|s| s.to_string());
+        let info = crate::policies::SelectWorkerInfo {
+            request_text: Some(&text),
+            routing_id: routing_id.as_deref(),
+        };
         let model = model_id.unwrap_or("default");
         let endpoint = route_to_endpoint(route);
 
@@ -213,7 +214,7 @@ impl Router {
             // operation per attempt
             |_: u32| async {
                 let res = self
-                    .route_typed_request_once(headers, typed_req, route, model_id, is_stream, &text)
+                    .route_typed_request_once(headers, typed_req, route, model_id, is_stream, &info)
                     .await;
 
                 // Need to be outside `route_typed_request_once` because that function has multiple return paths
@@ -271,9 +272,9 @@ impl Router {
         route: &'static str,
         model_id: Option<&str>,
         is_stream: bool,
-        text: &str,
+        info: &crate::policies::SelectWorkerInfo<'_>,
     ) -> Response {
-        let worker = match self.select_worker_for_model(model_id, Some(text)) {
+        let worker = match self.select_worker_for_model(model_id, info) {
             Some(w) => w,
             None => {
                 return error::service_unavailable(
@@ -695,6 +696,8 @@ fn convert_reqwest_error(e: reqwest::Error) -> Response {
 
 use async_trait::async_trait;
 
+use crate::routers::error::extract_error_code_from_response;
+
 #[async_trait]
 impl RouterTrait for Router {
     fn as_any(&self) -> &dyn std::any::Any {
@@ -817,14 +820,6 @@ impl RouterTrait for Router {
         }
     }
 
-    async fn parse_function_call(&self, req: &ParseFunctionCallRequest) -> Response {
-        parse::parse_function_call(self.context.as_ref(), req).await
-    }
-
-    async fn parse_reasoning(&self, req: &SeparateReasoningRequest) -> Response {
-        parse::parse_reasoning(self.context.as_ref(), req).await
-    }
-
     fn router_type(&self) -> &'static str {
         "regular"
     }
@@ -859,7 +854,6 @@ mod tests {
             client: Client::new(),
             retry_config: RetryConfig::default(),
             enable_igw: false,
-            context: None,
         }
     }
 

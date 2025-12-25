@@ -50,7 +50,7 @@ use crate::{
         validated::ValidatedJson,
         worker_spec::{WorkerConfigRequest, WorkerUpdateRequest},
     },
-    routers::{conversations, router_manager::RouterManager, tokenize, RouterTrait},
+    routers::{conversations, parse, router_manager::RouterManager, tokenize, RouterTrait},
     service_discovery::{start_service_discovery, ServiceDiscoveryConfig},
     wasm::route::{add_wasm_module, list_wasm_modules, remove_wasm_module},
     workflow::{LoggingSubscriber, WorkflowEngine},
@@ -67,14 +67,14 @@ async fn parse_function_call(
     State(state): State<Arc<AppState>>,
     Json(req): Json<ParseFunctionCallRequest>,
 ) -> Response {
-    state.router.parse_function_call(&req).await
+    parse::parse_function_call(&state.context, &req).await
 }
 
 async fn parse_reasoning(
     State(state): State<Arc<AppState>>,
     Json(req): Json<SeparateReasoningRequest>,
 ) -> Response {
-    state.router.parse_reasoning(&req).await
+    parse::parse_reasoning(&state.context, &req).await
 }
 
 async fn sink_handler() -> Response {

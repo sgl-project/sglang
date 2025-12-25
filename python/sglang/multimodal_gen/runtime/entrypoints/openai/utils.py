@@ -25,11 +25,13 @@ class SetLoraReq:
     lora_nickname: str
     lora_path: Optional[str] = None
     target: str = "all"  # "all", "transformer", "transformer_2", "critic"
+    strength: float = 1.0  # LoRA strength for merge, default 1.0
 
 
 @dataclasses.dataclass
 class MergeLoraWeightsReq:
     target: str = "all"  # "all", "transformer", "transformer_2", "critic"
+    strength: float = 1.0  # LoRA strength for merge, default 1.0
 
 
 @dataclasses.dataclass
@@ -64,7 +66,7 @@ async def _save_upload_to_path(upload: UploadFile, target_path: str) -> str:
     return target_path
 
 
-async def _maybe_url_image(img_url: str, target_path: str) -> str:
+async def _maybe_url_image(img_url: str, target_path: str) -> str | None:
     if not isinstance(img_url, str):
         return None
 
@@ -86,25 +88,36 @@ async def _save_url_image_to_path(image_url: str, target_path: str) -> str:
     os.makedirs(os.path.dirname(target_path), exist_ok=True)
 
     try:
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(follow_redirects=True) as client:
             response = await client.get(image_url, timeout=10.0)
             response.raise_for_status()
 
             # Determine file extension from content type or URL after downloading
             if not os.path.splitext(target_path)[1]:
-                content_type = response.headers.get("content-type", "")
-                if not content_type.startswith("image/"):
+                content_type = response.headers.get("content-type", "").lower()
+
+                url_path = image_url.split("?")[0]
+                _, url_ext = os.path.splitext(url_path)
+                url_ext = url_ext.lower()
+
+                if url_ext in {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp"}:
+                    ext = ".jpg" if url_ext == ".jpeg" else url_ext
+                elif content_type.startswith("image/"):
+                    if "jpeg" in content_type or "jpg" in content_type:
+                        ext = ".jpg"
+                    elif "png" in content_type:
+                        ext = ".png"
+                    elif "webp" in content_type:
+                        ext = ".webp"
+                    else:
+                        ext = ".jpg"  # Default to jpg
+                elif content_type == "application/octet-stream":
+                    # for octet-stream, if we couldn't get it from URL, default to jpg
+                    ext = ".jpg"
+                else:
                     raise ValueError(
                         f"URL does not point to an image. Content-Type: {content_type}"
                     )
-                if "jpeg" in content_type or "jpg" in content_type:
-                    ext = ".jpg"
-                elif "png" in content_type:
-                    ext = ".png"
-                elif "webp" in content_type:
-                    ext = ".webp"
-                else:
-                    ext = ".jpg"  # Default to jpg
                 target_path = f"{target_path}{ext}"
 
             with open(target_path, "wb") as f:

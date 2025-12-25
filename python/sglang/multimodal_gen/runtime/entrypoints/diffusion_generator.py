@@ -303,7 +303,11 @@ class DiffGenerator:
             raise RuntimeError(f"{failure_msg}: {error_msg}")
 
     def set_lora(
-        self, lora_nickname: str, lora_path: str | None = None, target: str = "all"
+        self,
+        lora_nickname: str,
+        lora_path: str | None = None,
+        target: str = "all",
+        strength: float = 1.0,
     ) -> None:
         """
         Set a LoRA adapter for the specified transformer(s).
@@ -316,13 +320,17 @@ class DiffGenerator:
                 - "transformer": Apply only to the primary transformer (high noise for Wan2.2)
                 - "transformer_2": Apply only to transformer_2 (low noise for Wan2.2)
                 - "critic": Apply only to the critic model
+            strength: LoRA strength for merge, default 1.0.
         """
         req = SetLoraReq(
-            lora_nickname=lora_nickname, lora_path=lora_path, target=target
+            lora_nickname=lora_nickname,
+            lora_path=lora_path,
+            target=target,
+            strength=strength,
         )
         self._send_lora_request(
             req,
-            f"Successfully set LoRA adapter: {lora_nickname} (target: {target})",
+            f"Successfully set LoRA adapter: {lora_nickname} (target: {target}, strength: {strength})",
             "Failed to set LoRA adapter",
         )
 
@@ -340,17 +348,18 @@ class DiffGenerator:
             "Failed to unmerge LoRA weights",
         )
 
-    def merge_lora_weights(self, target: str = "all") -> None:
+    def merge_lora_weights(self, target: str = "all", strength: float = 1.0) -> None:
         """
         Merge LoRA weights into the base model.
 
         Args:
             target: Which transformer(s) to merge.
+            strength: LoRA strength for merge, default 1.0.
         """
-        req = MergeLoraWeightsReq(target=target)
+        req = MergeLoraWeightsReq(target=target, strength=strength)
         self._send_lora_request(
             req,
-            f"Successfully merged LoRA weights (target: {target})",
+            f"Successfully merged LoRA weights (target: {target}, strength: {strength})",
             "Failed to merge LoRA weights",
         )
 

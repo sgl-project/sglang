@@ -94,6 +94,9 @@ pub struct PreparationOutput {
     /// Original text (for chat) or resolved text (for generate)
     pub original_text: Option<String>,
 
+    /// Routing ID for manual routing policy
+    pub routing_id: Option<String>,
+
     /// Tokenized input
     pub token_ids: Vec<u32>,
 

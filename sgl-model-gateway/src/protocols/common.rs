@@ -36,6 +36,9 @@ pub trait GenerationRequest: Send + Sync {
 
     /// Extract text content for routing decisions
     fn extract_text_for_routing(&self) -> String;
+
+    /// Get routing ID for manual routing policy
+    fn get_routing_id(&self) -> Option<&str>;
 }
 
 // ============================================================================
