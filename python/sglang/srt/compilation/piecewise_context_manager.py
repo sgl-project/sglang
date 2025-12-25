@@ -26,6 +26,8 @@ class ForwardContext:
     def __init__(self):
         self.forward_batch = None
         self.attention_layer = None
+        self.quant_config = None
+        self.moe_layers = None
 
     def set_forward_batch(self, forward_batch: ForwardBatch):
         self.forward_batch = forward_batch
@@ -35,6 +37,9 @@ class ForwardContext:
 
     def set_quant_config(self, quant_config: Any):
         self.quant_config = quant_config
+
+    def set_moe_layers(self, layers: List[Any]):
+        self.moe_layers = layers
 
 
 _forward_context: Optional[ForwardContext] = None
@@ -48,13 +53,17 @@ def get_forward_context() -> Optional[ForwardContext]:
 
 @contextmanager
 def set_forward_context(
-    forward_batch: ForwardBatch, attention_layers: List[Any], quant_config: Any
+    forward_batch: ForwardBatch,
+    attention_layers: List[Any],
+    quant_config: Any,
+    moe_layers: List[Any],
 ):
     global _forward_context
     _forward_context = ForwardContext()
     _forward_context.set_forward_batch(forward_batch)
     _forward_context.set_attention_layers(attention_layers)
     _forward_context.set_quant_config(quant_config)
+    _forward_context.set_moe_layers(moe_layers)
     try:
         yield
     finally:

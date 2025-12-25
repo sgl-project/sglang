@@ -31,7 +31,6 @@ from http import HTTPStatus
 from typing import Any, Awaitable, Dict, List, Optional, Tuple, Union
 
 import fastapi
-import orjson
 import uvloop
 import zmq
 import zmq.asyncio
@@ -73,7 +72,7 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.managers.mm_utils import TensorTransportMode
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
 from sglang.srt.managers.request_metrics_exporter import RequestMetricsExporterManager
-from sglang.srt.managers.schedule_batch import RequestStage
+from sglang.srt.managers.schedule_batch import MultimodalDataItem, RequestStage
 from sglang.srt.managers.scheduler import is_health_check_generate_req
 from sglang.srt.managers.scheduler_input_blocker import input_blocker_guard_region
 from sglang.srt.managers.tokenizer_communicator_mixin import TokenizerCommunicatorMixin
@@ -99,7 +98,6 @@ from sglang.srt.tracing.trace import (
 )
 from sglang.srt.utils import (
     configure_gc_warning,
-    dataclass_to_string_truncated,
     freeze_gc,
     get_bool_env_var,
     get_or_create_event_loop,
@@ -112,6 +110,8 @@ from sglang.srt.utils.hf_transformers_utils import (
     get_tokenizer,
     get_tokenizer_from_processor,
 )
+from sglang.srt.utils.request_logger import RequestLogger
+from sglang.srt.utils.watchdog import Watchdog
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
@@ -182,13 +182,12 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         # Parse args
         self.server_args = server_args
         self.enable_metrics = server_args.enable_metrics
-        self.log_requests = server_args.log_requests
-        self.log_requests_level = server_args.log_requests_level
-        self.preferred_sampling_params = (
-            orjson.loads(server_args.preferred_sampling_params)
-            if server_args.preferred_sampling_params
-            else None
+        self.request_logger = RequestLogger(
+            log_requests=server_args.log_requests,
+            log_requests_level=server_args.log_requests_level,
+            log_requests_format=server_args.log_requests_format,
         )
+        self.preferred_sampling_params = server_args.preferred_sampling_params
         self.crash_dump_folder = server_args.crash_dump_folder
         self.enable_trace = server_args.enable_trace
 
@@ -312,12 +311,11 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         self.dump_requests_folder = ""  # By default do not dump
         self.dump_requests_threshold = 1000
         self.dump_request_list: List[Tuple] = []
-        self.log_request_metadata = self.get_log_request_metadata()
         self.crash_dump_request_list: deque[Tuple] = deque()
         self.crash_dump_performed = False  # Flag to ensure dump is only called once
 
         # Initialize performance metrics loggers with proper skip names
-        _, obj_skip_names, out_skip_names = self.log_request_metadata
+        _, obj_skip_names, out_skip_names = self.request_logger.metadata
         self.request_metrics_exporter_manager = RequestMetricsExporterManager(
             self.server_args, obj_skip_names, out_skip_names
         )
@@ -409,6 +407,13 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         )
         self.init_communicators(server_args)
 
+        self.watchdog = Watchdog.create(
+            debug_name="TokenizerManager",
+            watchdog_timeout=server_args.soft_watchdog_timeout,
+            soft=True,
+            test_stuck_time=envs.SGLANG_TEST_STUCK_TOKENIZER.get(),
+        )
+
     async def generate_request(
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
@@ -429,8 +434,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             self._trace_request_start(obj, created_time, request)
         if self.server_args.tokenizer_worker_num > 1:
             self._attach_multi_http_worker_info(obj)
-        if self.log_requests:
-            self._log_received_request(obj)
+        self.request_logger.log_received_request(obj, self.tokenizer)
 
         async with self.is_pause_cond:
             await self.is_pause_cond.wait_for(lambda: not self.is_pause)
@@ -628,6 +632,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 obj.image_data = [obj.image_data]
             if obj.audio_data is not None and not isinstance(obj.audio_data, list):
                 obj.audio_data = [obj.audio_data]
+            self._validate_mm_limits(obj)
 
             mm_inputs = None
 
@@ -653,6 +658,14 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
 
             if mm_inputs and "input_ids" in mm_inputs:
                 input_ids = mm_inputs["input_ids"]
+            if (
+                envs.SGLANG_MM_PRECOMPUTE_HASH.get()
+                and mm_inputs
+                and "mm_items" in mm_inputs
+            ):
+                for item in mm_inputs["mm_items"]:
+                    if isinstance(item, MultimodalDataItem):
+                        item.set_pad_value()
         else:
             mm_inputs = None
 
@@ -739,6 +752,21 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                     "The server is not configured to enable custom logit processor. "
                     "Please set `--enable-custom-logit-processor` to enable this feature."
                 )
+
+    def _validate_mm_limits(
+        self, obj: Union[GenerateReqInput, EmbeddingReqInput]
+    ) -> None:
+        if not self.server_args.limit_mm_data_per_request:
+            return
+
+        for modality, limit in self.server_args.limit_mm_data_per_request.items():
+            data = getattr(obj, f"{modality}_data", None)
+            if data:
+                count = len(data) if isinstance(data, list) else 1
+                if count > limit:
+                    raise ValueError(
+                        f"{modality.capitalize()} count {count} exceeds limit {limit} per request."
+                    )
 
     def _validate_for_matryoshka_dim(self, obj: EmbeddingReqInput) -> None:
         """Validate the request for Matryoshka dim if it has the field set."""
@@ -827,12 +855,12 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 custom_logit_processor=obj.custom_logit_processor,
                 require_reasoning=obj.require_reasoning,
                 return_hidden_states=obj.return_hidden_states,
+                return_routed_experts=obj.return_routed_experts,
                 data_parallel_rank=obj.data_parallel_rank,
                 priority=obj.priority,
                 extra_key=obj.extra_key,
                 need_wait_for_image=obj.need_wait_for_image,
                 num_items_assigned=obj.num_items_assigned,
-                embedding_ports=obj.embedding_ports,
             )
         elif isinstance(obj, EmbeddingReqInput):
             tokenized_obj = TokenizedEmbeddingReqInput(
@@ -987,6 +1015,8 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         request: Optional[fastapi.Request] = None,
     ):
         """Wait for the response of one request."""
+        # Not all request types have `stream` (e.g., EmbeddingReqInput). Default to non-streaming.
+        is_stream = getattr(obj, "stream", False)
         while True:
             try:
                 await asyncio.wait_for(state.event.wait(), timeout=4)
@@ -1015,13 +1045,9 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                     out["meta_info"][
                         "response_sent_to_client_ts"
                     ] = state.response_sent_to_client_ts
-                if self.log_requests:
-                    max_length, skip_names, out_skip_names = self.log_request_metadata
-                    if self.model_config.is_multimodal_gen:
-                        msg = f"Finish: obj={dataclass_to_string_truncated(obj, max_length, skip_names=skip_names)}"
-                    else:
-                        msg = f"Finish: obj={dataclass_to_string_truncated(obj, max_length, skip_names=skip_names)}, out={dataclass_to_string_truncated(out, max_length, skip_names=out_skip_names)}"
-                    logger.info(msg)
+                self.request_logger.log_finished_request(
+                    obj, out, is_multimodal_gen=self.model_config.is_multimodal_gen
+                )
 
                 if self.request_metrics_exporter_manager.exporter_enabled():
                     # Asynchronously write metrics for this request using the exporter manager.
@@ -1036,7 +1062,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                         finish_reason.get("type") == "abort"
                         and finish_reason.get("status_code") == HTTPStatus.BAD_REQUEST
                     ):
-                        if not obj.stream:
+                        if not is_stream:
                             raise ValueError(finish_reason["message"])
                         else:
                             yield out
@@ -1057,7 +1083,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                         # Mark ongoing LoRA request as finished.
                         if self.server_args.enable_lora and state.obj.lora_path:
                             await self.lora_registry.release(state.obj.lora_id)
-                        if not obj.stream:
+                        if not is_stream:
                             raise fastapi.HTTPException(
                                 status_code=finish_reason["status_code"],
                                 detail=finish_reason["message"],
@@ -1070,7 +1096,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
 
             state.event.clear()
 
-            if obj.stream:
+            if is_stream:
                 # Record response sent time right before we send response.
                 if not state.response_sent_to_client_ts:
                     state.response_sent_to_client_ts = time.time()
@@ -1257,6 +1283,12 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
 
         return success, message, num_paused_requests
 
+    def _update_model_path_info(self, model_path: str, load_format: str):
+        self.served_model_name = model_path
+        self.server_args.model_path = model_path
+        self.server_args.load_format = load_format
+        self.model_path = model_path
+
     async def _wait_for_model_update_from_disk(
         self, obj: UpdateWeightFromDiskReqInput
     ) -> Tuple[bool, str]:
@@ -1265,10 +1297,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         if self.server_args.dp_size == 1:
             result = await self.model_update_result
             if result.success:
-                self.served_model_name = obj.model_path
-                self.server_args.model_path = obj.model_path
-                self.server_args.load_format = obj.load_format
-                self.model_path = obj.model_path
+                self._update_model_path_info(obj.model_path, obj.load_format)
             return result.success, result.message, result.num_paused_requests
         else:  # self.server_args.dp_size > 1
             self.model_update_tmp = []
@@ -1276,19 +1305,18 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
 
             all_success = all([r.success for r in result])
             if all_success is True:
-                self.server_args.model_path = obj.model_path
-                self.server_args.load_format = obj.load_format
-                self.model_path = obj.model_path
+                self._update_model_path_info(obj.model_path, obj.load_format)
             all_message = [r.message for r in result]
             all_message = " | ".join(all_message)
             all_paused_requests = [r.num_paused_requests for r in result]
             return all_success, all_message, all_paused_requests
 
     def configure_logging(self, obj: ConfigureLoggingReq):
-        if obj.log_requests is not None:
-            self.log_requests = obj.log_requests
-        if obj.log_requests_level is not None:
-            self.log_requests_level = obj.log_requests_level
+        self.request_logger.configure(
+            log_requests=obj.log_requests,
+            log_requests_level=obj.log_requests_level,
+            log_requests_format=obj.log_requests_format,
+        )
         if obj.dump_requests_folder is not None:
             self.dump_requests_folder = obj.dump_requests_folder
         if obj.dump_requests_threshold is not None:
@@ -1296,7 +1324,6 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         if obj.crash_dump_folder is not None:
             self.crash_dump_folder = obj.crash_dump_folder
         logging.info(f"Config logging: {obj=}")
-        self.log_request_metadata = self.get_log_request_metadata()
 
     async def freeze_gc(self):
         """Send a freeze_gc message to the scheduler first, then freeze locally."""
@@ -1478,9 +1505,11 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
     async def handle_loop(self):
         """The event loop that handles requests"""
         while True:
-            recv_obj = await self.recv_from_detokenizer.recv_pyobj()
+            with self.watchdog.disable():
+                recv_obj = await self.recv_from_detokenizer.recv_pyobj()
             self._result_dispatcher(recv_obj)
             self.last_receive_tstamp = time.time()
+            self.watchdog.feed()
 
     def _add_metric_if_present(
         self,
@@ -1565,9 +1594,14 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             if getattr(recv_obj, "output_hidden_states", None):
                 meta_info["hidden_states"] = recv_obj.output_hidden_states[i]
 
+            if getattr(recv_obj, "output_routed_experts", None):
+                meta_info["routed_experts"] = recv_obj.output_routed_experts[i]
+
             if isinstance(recv_obj, BatchStrOutput):
                 state.text += recv_obj.output_strs[i]
-                if self.server_args.stream_output and state.obj.stream:
+                # Not all request types have `stream` (e.g., EmbeddingReqInput). Default to non-streaming.
+                is_stream = getattr(state.obj, "stream", False)
+                if self.server_args.stream_output and is_stream:
                     state.output_ids.extend(recv_obj.output_ids[i])
                     output_token_ids = state.output_ids[state.last_output_offset :]
                     state.last_output_offset = len(state.output_ids)
@@ -1581,7 +1615,8 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                     "meta_info": meta_info,
                 }
             elif isinstance(recv_obj, BatchTokenIDOutput):
-                if self.server_args.stream_output and state.obj.stream:
+                is_stream = getattr(state.obj, "stream", False)
+                if self.server_args.stream_output and is_stream:
                     state.output_ids.extend(recv_obj.output_ids[i])
                     output_token_ids = state.output_ids[state.last_output_offset :]
                     state.last_output_offset = len(state.output_ids)
@@ -2047,6 +2082,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         if (
             self.server_args.dp_size == 1
             or self.server_args.load_balance_method == "round_robin"
+            or self.server_args.load_balance_method == "decode_round_robin"
         ):
             return
 
@@ -2104,23 +2140,6 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
 
         # Look up the LoRA ID from the registry and start tracking ongoing LoRA requests.
         obj.lora_id = await self.lora_registry.acquire(obj.lora_path)
-
-    def _log_received_request(self, obj: Union[GenerateReqInput, EmbeddingReqInput]):
-        max_length, skip_names, _ = self.log_request_metadata
-        logger.info(
-            f"Receive: obj={dataclass_to_string_truncated(obj, max_length, skip_names=skip_names)}"
-        )
-
-        # FIXME: This is a temporary fix to get the text from the input ids.
-        # We should remove this once we have a proper way.
-        if (
-            self.log_requests_level >= 2
-            and obj.text is None
-            and obj.input_ids is not None
-            and self.tokenizer is not None
-        ):
-            decoded = self.tokenizer.decode(obj.input_ids, skip_special_tokens=False)
-            obj.text = decoded
 
     def _trace_request_start(
         self,
