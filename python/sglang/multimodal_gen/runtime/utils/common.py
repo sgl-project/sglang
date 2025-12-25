@@ -15,6 +15,8 @@ import psutil
 import torch
 import zmq
 
+from sglang.multimodal_gen.runtime.platforms import current_platform
+
 # use the native logger to avoid circular import
 logger = logging.getLogger(__name__)
 
@@ -241,48 +243,7 @@ def get_zmq_socket(
 
 
 # https://pytorch.org/docs/stable/notes/hip.html#checking-for-hip
-@lru_cache(maxsize=1)
-def is_hip() -> bool:
-    return torch.version.hip is not None
 
-
-@lru_cache(maxsize=1)
-def is_cuda():
-    return torch.cuda.is_available() and torch.version.cuda
-
-
-@lru_cache(maxsize=1)
-def is_cuda_alike():
-    return is_cuda() or is_hip()
-
-
-@lru_cache(maxsize=1)
-def is_blackwell():
-    if not is_cuda():
-        return False
-    return torch.cuda.get_device_capability()[0] == 10
-
-
-@lru_cache(maxsize=1)
-def is_sm120():
-    if not is_cuda():
-        return False
-    return torch.cuda.get_device_capability()[0] == 12
-
-
-@lru_cache(maxsize=1)
-def is_hpu() -> bool:
-    return hasattr(torch, "hpu") and torch.hpu.is_available()
-
-
-@lru_cache(maxsize=1)
-def is_xpu() -> bool:
-    return hasattr(torch, "xpu") and torch.xpu.is_available()
-
-
-@lru_cache(maxsize=1)
-def is_npu() -> bool:
-    return hasattr(torch, "npu") and torch.npu.is_available()
 
 
 @lru_cache(maxsize=1)
@@ -293,11 +254,6 @@ def is_host_cpu_x86() -> bool:
         and hasattr(torch, "cpu")
         and torch.cpu.is_available()
     )
-
-
-@lru_cache(maxsize=1)
-def is_cpu() -> bool:
-    return os.getenv("SGLANG_USE_CPU_ENGINE", "0") == "1" and is_host_cpu_x86()
 
 
 # cuda

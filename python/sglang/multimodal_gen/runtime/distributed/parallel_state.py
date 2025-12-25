@@ -48,14 +48,14 @@ from torch.distributed import ProcessGroup
 import sglang.multimodal_gen.envs as envs
 from sglang.multimodal_gen.runtime.distributed.utils import StatelessProcessGroup
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-
-from ..utils.distributed import RankGenerator
 from .group_coordinator import (
     GroupCoordinator,
     PipelineGroupCoordinator,
     SequenceParallelGroupCoordinator,
     get_local_torch_device,
 )
+from ..platforms import current_platform
+from ..utils.distributed import RankGenerator
 
 logger = init_logger(__name__)
 
@@ -341,7 +341,7 @@ def initialize_model_parallel(
     """
 
     if backend is None:
-        backend = envs.get_torch_distributed_backend()
+        backend = current_platform.get_torch_distributed_backend_str()
     # Get world size and rank. Ensure some consistencies.
     assert torch.distributed.is_initialized()
     world_size: int = torch.distributed.get_world_size()
