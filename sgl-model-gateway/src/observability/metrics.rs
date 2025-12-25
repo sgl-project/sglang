@@ -102,7 +102,7 @@ pub fn init_metrics() {
     // Layer 1: HTTP metrics
     describe_counter!(
         "smg_http_requests_total",
-        "Total HTTP requests by method, path, and status"
+        "Total HTTP requests by method and path"
     );
     describe_histogram!(
         "smg_http_request_duration_seconds",
@@ -174,6 +174,10 @@ pub fn init_metrics() {
         "smg_worker_requests_active",
         "Currently running requests per worker"
     );
+    describe_gauge!(
+        "smg_worker_health",
+        "Worker health status (1=healthy, 0=unhealthy)"
+    );
     describe_counter!(
         "smg_worker_health_checks_total",
         "Health check results by worker_type and result"
@@ -185,6 +189,10 @@ pub fn init_metrics() {
     describe_counter!(
         "smg_worker_errors_total",
         "Worker-level errors by worker_type, connection_mode, error_type"
+    );
+    describe_counter!(
+        "smg_worker_manual_policy_branch_total",
+        "Manual policy execution branch by branch type"
     );
 
     // Layer 3: Worker resilience metrics (circuit breaker)
@@ -409,14 +417,13 @@ pub struct StreamingMetricsParams<'a> {
 
 impl Metrics {
     /// Record an HTTP request.
-    /// For best performance, pass static strings (use `method_to_static_str` for method,
-    /// `status_to_class` for status_class returns static, and cache normalized paths).
-    pub fn record_http_request(method: &'static str, path: &str, status_class: &'static str) {
+    /// Here we want a metric to directly reflect user's experience ("I am sending a request")
+    /// when viewing the router as a blackbox, and is bumped immediately when the request arrives.
+    pub fn record_http_request(method: &'static str, path: &str) {
         counter!(
             "smg_http_requests_total",
             "method" => method,
             "path" => path.to_string(),
-            "status" => status_class
         )
         .increment(1);
     }
@@ -807,6 +814,24 @@ impl Metrics {
         .set(count as f64);
     }
 
+    /// Record manual policy execution branch
+    pub fn record_worker_manual_policy_branch(branch: &'static str) {
+        counter!(
+            "smg_worker_manual_policy_branch_total",
+            "branch" => branch
+        )
+        .increment(1);
+    }
+
+    /// Set worker health status
+    pub fn set_worker_health(worker_url: &str, healthy: bool) {
+        gauge!(
+            "smg_worker_health",
+            "worker" => worker_url.to_string()
+        )
+        .set(if healthy { 1.0 } else { 0.0 });
+    }
+
     // ========================================================================
     // Layer 3: Worker resilience metrics (circuit breaker)
     // ========================================================================
@@ -1031,6 +1056,21 @@ impl Metrics {
             "storage_type" => storage_type
         )
         .increment(1);
+    }
+
+    // ========================================================================
+    // Worker cleanup
+    // ========================================================================
+
+    pub fn remove_worker_metrics(worker_url: &str) {
+        gauge!("smg_worker_cb_consecutive_failures", "worker" => worker_url.to_string()).set(0.0);
+        gauge!("smg_worker_cb_consecutive_successes", "worker" => worker_url.to_string()).set(0.0);
+        gauge!("smg_worker_requests_active", "worker" => worker_url.to_string()).set(0.0);
+
+        // Zero for these metrics have special valid meaning, thus we set to -1 temporarily
+        // (and will remove them completely after https://github.com/metrics-rs/metrics/issues/653)
+        gauge!("smg_worker_cb_state", "worker" => worker_url.to_string()).set(-1.0);
+        gauge!("smg_worker_health","worker" => worker_url.to_string()).set(-1.0);
     }
 }
 

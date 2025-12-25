@@ -10,6 +10,7 @@ use crate::core::Worker;
 mod bucket;
 mod cache_aware;
 mod factory;
+mod manual;
 mod power_of_two;
 mod random;
 mod registry;
@@ -19,6 +20,7 @@ pub mod tree;
 pub use bucket::BucketPolicy;
 pub use cache_aware::CacheAwarePolicy;
 pub use factory::PolicyFactory;
+pub use manual::ManualPolicy;
 pub use power_of_two::PowerOfTwoPolicy;
 pub use random::RandomPolicy;
 pub use registry::PolicyRegistry;
@@ -33,11 +35,11 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
     ///
     /// This is used for regular routing mode where requests go to a single worker.
     /// Now uses Arc<dyn Worker> for better performance and to avoid unnecessary cloning.
-    fn select_worker(
-        &self,
-        workers: &[Arc<dyn Worker>],
-        request_text: Option<&str>,
-    ) -> Option<usize>;
+    ///
+    /// # Arguments
+    /// * `workers` - Available workers to select from
+    /// * `info` - Additional information for routing decisions
+    fn select_worker(&self, workers: &[Arc<dyn Worker>], info: &SelectWorkerInfo) -> Option<usize>;
 
     /// Update policy state after request completion
     ///
@@ -53,6 +55,11 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
     /// Check if this policy needs request text for routing decisions
     fn needs_request_text(&self) -> bool {
         false // Default: most policies don't need request text
+    }
+
+    /// Check if this policy needs routing_id for routing decisions
+    fn needs_routing_id(&self) -> bool {
+        false // Default: most policies don't need routing_id
     }
 
     /// Update worker load information
@@ -120,6 +127,28 @@ pub(crate) fn get_healthy_worker_indices(workers: &[Arc<dyn Worker>]) -> Vec<usi
         .filter(|(_, w)| w.is_healthy() && w.circuit_breaker().can_execute())
         .map(|(idx, _)| idx)
         .collect()
+}
+
+/// Helper function to normalize model_id to a key for policy lookups.
+///
+/// Returns UNKNOWN_MODEL_ID for empty model_ids to ensure consistent behavior
+/// across single-model and multi-model deployments.
+#[inline]
+pub(crate) fn normalize_model_key(model_id: &str) -> &str {
+    if model_id.is_empty() {
+        crate::core::UNKNOWN_MODEL_ID
+    } else {
+        model_id
+    }
+}
+
+/// Information passed to policy for worker selection
+#[derive(Debug, Default, Clone)]
+pub struct SelectWorkerInfo<'a> {
+    /// Request text for cache-aware routing
+    pub request_text: Option<&'a str>,
+    /// Routing ID for manual routing policy (consistent hashing)
+    pub routing_id: Option<&'a str>,
 }
 
 #[cfg(test)]
