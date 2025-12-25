@@ -443,5 +443,3 @@ def maybe_download_model(
             raise ValueError(
                 f"Could not find model at {model_name_or_path} and failed to download from HF Hub: {e}"
             ) from e
-
-    raise ValueError(f"Failed to load model {model_name_or_path}")
