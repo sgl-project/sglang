@@ -694,8 +694,9 @@ fn convert_reqwest_error(e: reqwest::Error) -> Response {
     error::create_error(status, code, message)
 }
 
-use crate::routers::error::extract_error_code_from_response;
 use async_trait::async_trait;
+
+use crate::routers::error::extract_error_code_from_response;
 
 #[async_trait]
 impl RouterTrait for Router {
