@@ -20,7 +20,7 @@ from sglang.multimodal_gen.test.server.testcase_configs import DiffusionTestCase
 logger = init_logger(__name__)
 
 
-class TestDiffusionServerOneGpu(DiffusionServerBase):
+class TestDiffusionServerOneNpu(DiffusionServerBase):
     """Performance tests for 1-NPU diffusion cases."""
 
     @pytest.fixture(params=ONE_NPU_CASES, ids=lambda c: c.id)
