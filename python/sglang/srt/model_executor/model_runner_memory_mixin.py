@@ -200,7 +200,7 @@ class ModelRunnerMemoryMixin:
         )
         return total_rest_memory - mamba_state_memory
 
-    def set_num_token_hybrid(self: ModelRunner):
+    def set_num_tokens_hybrid_swa(self: ModelRunner):
         page_size = self.server_args.page_size
         if (
             "Llama4ForConditionalGeneration"
@@ -339,7 +339,7 @@ class ModelRunnerMemoryMixin:
 
         # create token size for hybrid cache
         if self.is_hybrid_swa:
-            self.set_num_token_hybrid()
+            self.set_num_tokens_hybrid_swa()
 
         if self.max_total_num_tokens <= 0:
             raise RuntimeError(
