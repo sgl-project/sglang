@@ -198,22 +198,28 @@ class DecodingStage(PipelineStage):
 
         # decode trajectory latents if needed
         if batch.return_trajectory_decoded:
-            trajectory_decoded = []
             assert (
                 batch.trajectory_latents is not None
             ), "batch should have trajectory latents"
-            for idx in range(batch.trajectory_latents.shape[1]):
-                # batch.trajectory_latents is [batch_size, timesteps, channels, frames, height, width]
-                cur_latent = batch.trajectory_latents[:, idx, :, :, :, :]
-                cur_timestep = batch.trajectory_timesteps[idx]
-                logger.info("decoding trajectory latent for timestep: %s", cur_timestep)
-                decoded_frames = self.decode(cur_latent, server_args)
-                trajectory_decoded.append(decoded_frames.cpu().float())
+
+            # 1. Batch trajectory decoding to improve GPU utilization
+            # batch.trajectory_latents is [batch_size, timesteps, channels, frames, height, width]
+            B, T, C, F, H, W = batch.trajectory_latents.shape
+            flat_latents = batch.trajectory_latents.view(B * T, C, F, H, W)
+
+            logger.info("decoding %s trajectory latents in batch", B * T)
+            # Use the optimized batch decode
+            all_decoded = self.decode(flat_latents, server_args)
+
+            # 2. Reshape back
+            # Keep on GPU to allow faster vectorized post-processing
+            decoded_tensor = all_decoded.view(B, T, *all_decoded.shape[1:])
+
+            # Convert to list of tensors (per timestep) as expected by OutputBatch
+            # Each element in list is [B, channels, frames, H_out, W_out]
+            trajectory_decoded = [decoded_tensor[:, i] for i in range(T)]
         else:
             trajectory_decoded = None
-
-        # Convert to CPU float32 for compatibility
-        frames = frames.cpu().float()
 
         # Update batch with decoded image
         output_batch = OutputBatch(
