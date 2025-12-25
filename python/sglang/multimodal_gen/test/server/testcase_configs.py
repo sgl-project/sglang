@@ -108,10 +108,9 @@ class BaselineConfig:
 
     def update(self, path: Path):
         """Load baseline configuration from JSON file."""
-        print("path", path)
         with path.open("r", encoding="utf-8") as fh:
             data = json.load(fh)
-        print("data", data)
+
         scenarios_new = {}
         for name, cfg in data["scenarios"].items():
             scenarios_new[name] = ScenarioConfig(
@@ -122,7 +121,6 @@ class BaselineConfig:
                 expected_median_denoise_ms=float(cfg["expected_median_denoise_ms"]),
             )
 
-        print("scenarios_new", scenarios_new)
         self.scenarios.update(scenarios_new)
         return self
 
