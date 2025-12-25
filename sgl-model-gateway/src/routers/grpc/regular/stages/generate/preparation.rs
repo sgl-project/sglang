@@ -44,8 +44,11 @@ impl GeneratePreparationStage {
         ctx: &mut RequestContext,
         request: &GenerateRequest,
     ) -> Result<(), Response> {
-        // Resolve input (text, prompt, or input_ids)
-        let (original_text, token_ids) = match self.resolve_generate_input(ctx, request) {
+        // Resolve tokenizer from registry (cached for reuse in response processing)
+        let tokenizer = utils::resolve_tokenizer(ctx, "GeneratePreparationStage::prepare_generate")
+            .map_err(|e| *e)?;
+
+        let (original_text, token_ids) = match self.resolve_generate_input(request, &tokenizer) {
             Ok(res) => res,
             Err(msg) => {
                 error!(function = "GeneratePreparationStage::execute", error = %msg, "Failed to resolve generate input");
@@ -56,7 +59,7 @@ impl GeneratePreparationStage {
         // Create stop sequence decoder for generate requests
         let params = request.sampling_params.as_ref();
         let stop_decoder = utils::create_stop_decoder(
-            &ctx.components.tokenizer,
+            &tokenizer,
             params.and_then(|p| p.stop.as_ref()),
             params.and_then(|p| p.stop_token_ids.as_ref()),
             params.and_then(|p| p.skip_special_tokens).unwrap_or(true),
@@ -84,12 +87,12 @@ impl GeneratePreparationStage {
 
     fn resolve_generate_input(
         &self,
-        ctx: &RequestContext,
         request: &GenerateRequest,
+        tokenizer: &Arc<dyn Tokenizer>,
     ) -> Result<(Option<String>, Vec<u32>), String> {
         if let Some(text) = &request.text {
             return self
-                .tokenize_single_text(&ctx.components.tokenizer, text)
+                .tokenize_single_text(tokenizer, text)
                 .map(|(original, ids)| (Some(original), ids));
         }
 
