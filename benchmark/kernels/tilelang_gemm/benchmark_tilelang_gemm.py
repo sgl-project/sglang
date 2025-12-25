@@ -11,9 +11,6 @@ Usage:
     # Benchmark specific (N, K)
     python benchmark_tilelang_gemm.py --N 4096 --K 8192
 
-    # Benchmark all available configs
-    python benchmark_tilelang_gemm.py --all
-
     # Output to CSV
     python benchmark_tilelang_gemm.py --N 4096 --K 8192 --output results.csv
 """
@@ -280,8 +277,8 @@ def main():
         epilog=__doc__,
     )
 
-    parser.add_argument("--N", type=int, help="N dimension")
-    parser.add_argument("--K", type=int, help="K dimension")
+    parser.add_argument("--N", type=int, required=True, help="N dimension")
+    parser.add_argument("--K", type=int, required=True, help="K dimension")
     parser.add_argument(
         "--m-values",
         type=int,
