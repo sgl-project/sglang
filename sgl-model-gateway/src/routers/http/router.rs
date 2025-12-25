@@ -213,8 +213,18 @@ impl Router {
             &self.retry_config,
             // operation per attempt
             |_: u32| async {
-                self.route_typed_request_once(headers, typed_req, route, model_id, is_stream, &info)
-                    .await
+                let res = self
+                    .route_typed_request_once(headers, typed_req, route, model_id, is_stream, &info)
+                    .await;
+
+                // Need to be outside `route_typed_request_once` because that function has multiple return paths
+                Metrics::record_router_upstream_response(
+                    metrics_labels::ROUTER_HTTP,
+                    res.status().as_u16(),
+                    extract_error_code_from_response(&res),
+                );
+
+                res
             },
             // should_retry predicate
             |res, _attempt| is_retryable_status(res.status()),
@@ -684,6 +694,7 @@ fn convert_reqwest_error(e: reqwest::Error) -> Response {
     error::create_error(status, code, message)
 }
 
+use crate::routers::error::extract_error_code_from_response;
 use async_trait::async_trait;
 
 #[async_trait]
