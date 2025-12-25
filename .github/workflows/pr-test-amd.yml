@@ -49,7 +49,8 @@ jobs:
         with:
           filters: |
             main_package:
-              - "python/**"
+              - "python/sglang/!(multimodal_gen)/**"
+              - "python/*.toml"
               - "scripts/ci/**"
               - "test/**"
               - ".github/workflows/pr-test-amd.yml"
@@ -59,7 +60,6 @@ jobs:
               - "python/sglang/multimodal_gen/**"
               - "python/sglang/cli/**"
               - "python/*.toml"
-              - ".github/workflows/pr-test-amd.yml"
 
   # =============================================== sgl-kernel ====================================================
   sgl-kernel-unit-test-amd:

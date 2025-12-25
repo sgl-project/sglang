@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::common::GenerationRequest;
+use super::common::{GenerationRequest, UsageInfo};
 
 // ============================================================================
 // Embedding API
@@ -34,6 +34,10 @@ pub struct EmbeddingRequest {
     /// Routing ID for manual routing policy
     #[serde(skip_serializing_if = "Option::is_none")]
     pub routing_id: Option<String>,
+
+    /// SGLang extension: enable/disable logging of metrics for this request
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub log_metrics: Option<bool>,
 }
 
 impl GenerationRequest for EmbeddingRequest {
@@ -62,4 +66,19 @@ impl GenerationRequest for EmbeddingRequest {
     fn get_routing_id(&self) -> Option<&str> {
         self.routing_id.as_deref()
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EmbeddingObject {
+    pub object: String, // "embedding"
+    pub embedding: Vec<f32>,
+    pub index: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EmbeddingResponse {
+    pub object: String, // "list"
+    pub data: Vec<EmbeddingObject>,
+    pub model: String,
+    pub usage: UsageInfo,
 }
