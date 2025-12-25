@@ -45,7 +45,7 @@ logger = logging.getLogger(__name__)
 _is_npu = is_npu()
 
 
-class ModelRunnerMemoryMixin:
+class ModelRunnerKVCacheMixin:
     def get_cell_size_per_token(self: ModelRunner, num_layers: int) -> int:
         kv_size = torch._utils._element_size(self.kv_cache_dtype)
         if self.use_mla_backend:
