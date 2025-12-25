@@ -157,6 +157,17 @@ pub fn apply_provider_headers(
     req
 }
 
+/// Header name for routing key used by manual routing policy
+pub const ROUTING_KEY_HEADER: &str = "X-SMG-Routing-Key";
+
+/// Extract routing ID from HTTP headers for manual routing policy
+pub fn extract_routing_id(headers: Option<&HeaderMap>) -> Option<String> {
+    headers
+        .and_then(|h| h.get(ROUTING_KEY_HEADER))
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string())
+}
+
 /// Extract auth header with passthrough semantics.
 ///
 /// Passthrough mode: User's Authorization header takes priority.

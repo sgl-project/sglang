@@ -19,6 +19,7 @@ use crate::{
             context::{PreparationOutput, RequestContext, RequestType},
             utils,
         },
+        header_utils,
     },
 };
 
@@ -123,7 +124,7 @@ impl HarmonyPreparationStage {
         // Step 4: Store results
         ctx.state.preparation = Some(PreparationOutput {
             original_text: None,
-            routing_id: request.routing_id.clone(),
+            routing_id: header_utils::extract_routing_id(ctx.input.headers.as_ref()),
             token_ids: build_output.input_ids,
             processed_messages: None,
             tool_constraints,
@@ -204,7 +205,7 @@ impl HarmonyPreparationStage {
         // Step 4: Store results with constraint
         ctx.state.preparation = Some(PreparationOutput {
             original_text: None,
-            routing_id: request.routing_id.clone(),
+            routing_id: header_utils::extract_routing_id(ctx.input.headers.as_ref()),
             token_ids: build_output.input_ids,
             processed_messages: None,
             tool_constraints: constraint,
