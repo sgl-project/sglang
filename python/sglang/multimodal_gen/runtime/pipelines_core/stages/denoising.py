@@ -1001,8 +1001,8 @@ class DenoisingStage(PipelineStage):
         print(f"1001 {timesteps_cpu=}")
         num_timesteps = timesteps_cpu.shape[0]
         print(f"1002 {latents.shape=}")
-        latents = torch.load("/sgl-workspace/latents.pt")
-        batch.image_latent = torch.load("/sgl-workspace/image_latents.pt")
+        # latents = torch.load("/sgl-workspace/latents.pt")
+        # batch.image_latent = torch.load("/sgl-workspace/image_latents.pt")
         with torch.autocast(
             device_type=current_platform.device_type,
             dtype=target_dtype,
@@ -1104,7 +1104,6 @@ class DenoisingStage(PipelineStage):
             )
 
         print(f"528 {latents.shape=}", flush=True)
-        # latents = torch.load("/sgl-workspace/latents.pt")
         print(f"530 {latents.shape=}", flush=True)
 
         self._post_denoising_loop(
@@ -1298,9 +1297,6 @@ class DenoisingStage(PipelineStage):
         cfg_rank = get_classifier_free_guidance_rank()
         # positive pass
         # if timestep_index > 1:
-        latent_model_input = torch.load(
-            f"/sgl-workspace/diff/latent_model_input_{timestep_index}.pt"
-        )
         if not (server_args.enable_cfg_parallel and cfg_rank != 0):
             batch.is_cfg_negative = False
             with set_forward_context(
@@ -1316,13 +1312,6 @@ class DenoisingStage(PipelineStage):
                     guidance=guidance,
                     **image_kwargs,
                     **pos_cond_kwargs,
-                )
-                torch.save(
-                    noise_pred_cond,
-                    f"/sgl-workspace/sgl/noise_pred_cond_{timestep_index}.pt",
-                )
-                noise_pred_cond = torch.load(
-                    f"/sgl-workspace/diff/noise_pred_{timestep_index}.pt"
                 )
                 # TODO: can it be moved to after _predict_noise_with_cfg?
                 noise_pred_cond = server_args.pipeline_config.slice_noise_pred(
@@ -1348,13 +1337,6 @@ class DenoisingStage(PipelineStage):
                     guidance=guidance,
                     **image_kwargs,
                     **neg_cond_kwargs,
-                )
-                torch.save(
-                    noise_pred_uncond,
-                    f"/sgl-workspace/sgl/noise_pred_uncond_{timestep_index}.pt",
-                )
-                noise_pred_uncond = torch.load(
-                    f"/sgl-workspace/diff/neg_noise_pred_{timestep_index}.pt"
                 )
                 noise_pred_uncond = server_args.pipeline_config.slice_noise_pred(
                     noise_pred_uncond, latents

@@ -155,7 +155,6 @@ class QwenImagePipelineConfig(ImagePipelineConfig):
     def get_freqs_cis(img_shapes, txt_seq_lens, rotary_emb, device, dtype):
         # img_shapes: for global entire image
         img_freqs, txt_freqs = rotary_emb(img_shapes, txt_seq_lens, device=device)
-        img_freqs, txt_freqs = torch.load("/sgl-workspace/image_rotary_emb.pt")
         img_cos, img_sin = (
             img_freqs.real.to(dtype=dtype),
             img_freqs.imag.to(dtype=dtype),
@@ -477,7 +476,45 @@ class QwenImageLayeredPipelineConfig(QwenImageEditPipelineConfig):
     def _prepare_edit_cond_kwargs(
         self, batch, prompt_embeds, rotary_emb, device, dtype
     ):
-        return {"additional_t_cond": torch.tensor([0], device=device, dtype=torch.long)}
+        batch_size = batch.latents.shape[0]
+        assert batch_size == 1
+        height = batch.height
+        width = batch.width
+        image_size = batch.original_condition_image_size
+
+        vae_scale_factor = self.get_vae_scale_factor()
+
+        img_shapes = batch.img_shapes
+        txt_seq_lens = batch.txt_seq_lens
+        print(f"494 {device=}", flush=True)
+        
+        (img_cos, img_sin), (txt_cos, txt_sin) = (
+            QwenImageEditPlusPipelineConfig.get_freqs_cis(
+                img_shapes, txt_seq_lens, rotary_emb, device, dtype
+            )
+        )
+
+        # perform sp shard on noisy image tokens
+        noisy_img_seq_len = (
+            1 * (height // vae_scale_factor // 2) * (width // vae_scale_factor // 2)
+        )
+        noisy_img_cos = shard_rotary_emb_for_sp(img_cos[:noisy_img_seq_len, :])
+        noisy_img_sin = shard_rotary_emb_for_sp(img_sin[:noisy_img_seq_len, :])
+
+        # concat back the img_cos for input image (since it is not sp-shared later)
+        img_cos = torch.cat([noisy_img_cos, img_cos[noisy_img_seq_len:, :]], dim=0).to(
+            device=device
+        )
+        img_sin = torch.cat([noisy_img_sin, img_sin[noisy_img_seq_len:, :]], dim=0).to(
+            device=device
+        )
+
+        return {
+            "txt_seq_lens": txt_seq_lens,
+            "img_shapes": img_shapes,
+            "freqs_cis": ((img_cos, img_sin), (txt_cos, txt_sin)),
+            "additional_t_cond": torch.tensor([0], device=device, dtype=torch.long),
+        }
 
     def _unpad_and_unpack_latents(self, latents, batch):
         vae_scale_factor = self.vae_config.arch_config.vae_scale_factor
