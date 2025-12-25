@@ -130,7 +130,7 @@ class ImageEncodingStage(PipelineStage):
 
             neg_image_inputs = self.image_processor(
                 images=image, return_tensors="pt", **neg_image_processor_kwargs
-            ).to(get_local_torch_device())
+            ).to(cuda_device)
 
             with set_forward_context(current_timestep=0, attn_metadata=None):
                 outputs = self.text_encoder(

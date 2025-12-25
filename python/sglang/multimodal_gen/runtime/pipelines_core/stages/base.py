@@ -96,6 +96,18 @@ class PipelineStage(ABC):
     def maybe_free_model_hooks(self):
         pass
 
+    def load_model(self, server_args: ServerArgs):
+        """
+        Load the model for the stage.
+        """
+        pass
+
+    def offload_model(self, server_args: ServerArgs):
+        """
+        Offload the model for the stage.
+        """
+        pass
+
     # execute on all ranks by default
     @property
     def parallelism_type(self) -> StageParallelismType:
