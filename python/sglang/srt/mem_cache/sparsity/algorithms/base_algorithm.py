@@ -1,5 +1,5 @@
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING
 
 import torch
 
@@ -93,7 +93,6 @@ class BaseSparseAlgorithm(ABC):
         - self.states.last_constructed_page[req_id]: Last constructed page index
         - Current seq_lens: To detect new tokens/pages
 
-
         Algorithm-specific implementations:
             - ChunkKV: Incrementally compute importance scores for newly generated chunks during decode
             - Quest: Incrementally compute representations for newly generated pages during decode
@@ -110,7 +109,6 @@ class BaseSparseAlgorithm(ABC):
         layer_id: int,
         req_pool_indices: torch.Tensor,
         sparse_mask: torch.Tensor,
-        attn_metadata: Optional[Any],
         **kwargs,
     ) -> tuple:
         """
@@ -164,7 +162,7 @@ class BaseSparseAlgorithmImpl(BaseSparseAlgorithm):
 
     def __init__(self, config, device: torch.device, **kwargs):
         super().__init__(config, device, **kwargs)
-        self.compression_ratio = getattr(config, "compression_ratio", 0.2)
+        self.compression_ratio = getattr(config, "compression_ratio", 0.3)
         self.page_size = getattr(config, "page_size", 64)
         self.num_recent_pages = getattr(config, "num_recent_pages", 4)
 
@@ -267,7 +265,6 @@ class BaseSparseAlgorithmImpl(BaseSparseAlgorithm):
         layer_id: int,
         req_pool_indices: torch.Tensor,
         sparse_mask: torch.Tensor,
-        attn_metadata: Optional[Any],
         **kwargs,
     ) -> tuple:
         """
@@ -279,66 +276,81 @@ class BaseSparseAlgorithmImpl(BaseSparseAlgorithm):
             2. Support CUDA Graph
         """
         bs, device = queries.shape[0], queries.device
-        seq_lens = attn_metadata.cache_seqlens_int32
-        num_pages = (seq_lens + self.page_size - 1) // self.page_size
-        max_pages = max(int(num_pages.max().item()), 1)
 
-        out_indices = torch.full((bs, max_pages), -1, dtype=torch.int32, device=device)
+        seq_lens_source = kwargs.get("forward_batch", None)
+        if seq_lens_source is None or not hasattr(seq_lens_source, "seq_lens"):
+            raise ValueError(
+                "forward_batch with seq_lens is required for TopK retrieval"
+            )
+        seq_lens = seq_lens_source.seq_lens.to(device)
+
+        req_to_token = self.req_to_token_pool.req_to_token
+        max_req_tokens = req_to_token.shape[1]
+
+        per_request_indices = []
+        per_request_lengths = []
+
+        for i in range(bs):
+            if not sparse_mask[i]:
+                per_request_indices.append(
+                    torch.empty(0, device=device, dtype=torch.int32)
+                )
+                per_request_lengths.append(0)
+                continue
+
+            num_pages = int((seq_lens[i].item() + self.page_size - 1) // self.page_size)
+            if num_pages <= self.num_recent_pages:
+                per_request_indices.append(
+                    torch.empty(0, device=device, dtype=torch.int32)
+                )
+                per_request_lengths.append(0)
+                continue
+
+            page_idx = torch.arange(num_pages, device=device)
+            page_start_token = req_to_token[
+                req_pool_indices[i],
+                (page_idx * self.page_size).clamp(0, max_req_tokens - 1),
+            ]
+            phys_pages = (page_start_token // self.page_size).unsqueeze(0)
+
+            scores = self._retrieve_page_scores(
+                layer_id,
+                phys_pages,
+                req_pool_indices[i : i + 1],
+                queries[i : i + 1],
+            )
+
+            recent_start = max(num_pages - self.num_recent_pages, 0)
+            scores = scores.clone()
+            scores[:, recent_start:] = float("-inf")
+
+            history_pages = max(recent_start, 1)
+            k = max(int(history_pages * (1 - self.compression_ratio)), 1)
+            k = min(k, history_pages)
+            topk_idx = torch.topk(scores, k=k, dim=1, sorted=False)[1].squeeze(0)
+
+            recent_idx = torch.arange(
+                recent_start, recent_start + self.num_recent_pages, device=device
+            )
+            recent_idx = recent_idx[recent_idx < num_pages]
+
+            combined = (
+                torch.cat([topk_idx, recent_idx], dim=0).sort()[0].to(torch.int32)
+            )
+
+            per_request_indices.append(combined)
+            per_request_lengths.append(int(combined.numel()))
+
+        max_len = max(max(per_request_lengths, default=0), 1)
+        out_indices = torch.full((bs, max_len), -1, dtype=torch.int32, device=device)
         out_lengths = torch.zeros(bs, dtype=torch.int32, device=device)
 
-        mask = sparse_mask & (num_pages > self.num_recent_pages)
-        if not mask.any():
-            return out_indices, out_lengths
-
-        # Map logical page indices to physical page indices
-        # page_idx -> logical page indices [0, 1, 2, ...]
-        # phys_pages: [bs, max_pages] -> physical page indices in KV cache
-        page_idx = torch.arange(max_pages, device=device).unsqueeze(0)
-        page_start_token = self.req_to_token_pool.req_to_token[
-            req_pool_indices.unsqueeze(1).expand(bs, max_pages),
-            (page_idx * self.page_size).clamp(
-                0, self.req_to_token_pool.req_to_token.shape[1] - 1
-            ),
-        ]
-        phys_pages = page_start_token // self.page_size
-
-        # Get pre-computed page scores from subclass
-        scores = self._retrieve_page_scores(
-            layer_id, phys_pages, req_pool_indices, queries
-        )
-
-        # Mask out recent pages from TopK selection (they will be added separately)
-        # Layout: [history pages ... | recent pages (always kept)]
-        recent_start = (num_pages - self.num_recent_pages).clamp(min=0)
-        scores.masked_fill_(page_idx >= recent_start.unsqueeze(1), float("-inf"))
-
-        # Select TopK from history pages based on compression_ratio
-        k = max(
-            int((recent_start.float() * (1 - self.compression_ratio)).max().item()), 1
-        )
-        topk_idx = torch.topk(scores, k=k, dim=1, sorted=False)[1]
-        topk_mask = torch.arange(k, device=device).unsqueeze(0) < (
-            recent_start * (1 - self.compression_ratio)
-        ).int().clamp(min=1).unsqueeze(1)
-
-        recent_idx = recent_start.unsqueeze(1) + torch.arange(
-            self.num_recent_pages, device=device
-        )
-        recent_mask = recent_idx < num_pages.unsqueeze(1)
-
-        # Combine TopK history pages + recent pages, sort for sequential access
-        combined = torch.cat(
-            [
-                torch.where(topk_mask, topk_idx, -1),
-                torch.where(recent_mask, recent_idx, -1),
-            ],
-            dim=1,
-        ).sort(dim=1)[0]
-
-        out_lengths[:] = torch.where(mask, (combined >= 0).sum(dim=1).int(), 0)
-        out_indices[:, : combined.shape[1]] = torch.where(
-            mask.unsqueeze(1), combined, -1
-        )
+        for i, selected in enumerate(per_request_indices):
+            length = per_request_lengths[i]
+            if length == 0:
+                continue
+            out_indices[i, :length] = selected
+            out_lengths[i] = length
 
         return out_indices, out_lengths
 
