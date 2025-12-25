@@ -26,10 +26,7 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import (
     globally_suppress_loggers,
     init_logger,
 )
-from sglang.multimodal_gen.runtime.utils.perf_logger import (
-    PerformanceLogger,
-    RequestTimings,
-)
+from sglang.multimodal_gen.runtime.utils.perf_logger import PerformanceLogger
 
 logger = init_logger(__name__)
 
@@ -101,19 +98,18 @@ class GPUWorker:
                 torch.cuda.reset_peak_memory_stats()
 
             start_time = time.monotonic()
-            timings = RequestTimings(request_id=req.request_id)
-            req.timings = timings
 
             output_batch = self.pipeline.forward(req, self.server_args)
-            duration_ms = (time.monotonic() - start_time) * 1000
 
             if self.rank == 0:
                 peak_memory_bytes = torch.cuda.max_memory_allocated()
                 output_batch.peak_memory_mb = peak_memory_bytes / (1024**2)
 
             if output_batch.timings:
+                duration_ms = (time.monotonic() - start_time) * 1000
                 output_batch.timings.total_duration_ms = duration_ms
-                PerformanceLogger.log_request_summary(timings=output_batch.timings)
+                if req.perf_dump_path is not None:
+                    PerformanceLogger.log_request_summary(timings=output_batch.timings)
         except Exception as e:
             logger.error(
                 f"Error executing request {req.request_id}: {e}", exc_info=True
