@@ -307,7 +307,6 @@ class ModelRunner(ModelRunnerMemoryMixin):
         self.attention_chunk_size = model_config.attention_chunk_size
         self.forward_pass_id = 0
         self.init_new_workspace = False
-        self.kv_cache_memory = 0
         self.draft_model_idx = draft_model_idx
 
         self.remote_instance_transfer_engine = None
