@@ -379,12 +379,6 @@ class SchedulerMetricsCollector:
         )
 
         # Run batch
-        self.prefill_run_batch_time = Gauge(
-            name="sglang:prefill_run_batch_time",
-            documentation="The prefill run batch time",
-            labelnames=labels.keys(),
-            multiprocess_mode="mostrecent",
-        )
         self.generation_time = Gauge(
             name="sglang:generation_time",
             documentation="The generation time",
