@@ -7,6 +7,7 @@ DEVICE_TYPE=$1
 
 # Install the required dependencies in CI.
 apt update -y && apt install -y \
+    unzip \
     build-essential \
     cmake \
     wget \
