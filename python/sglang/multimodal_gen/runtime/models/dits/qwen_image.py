@@ -348,26 +348,22 @@ class QwenImageCrossAttention(nn.Module):
                 else torch.cuda.current_device()
             )
             alt_stream = _get_qwen_image_qk_norm_alt_stream(device_index)
-            cur_stream = torch.cuda.current_stream(device=img_query.device)
+            current_stream = torch.cuda.current_stream(device=img_query.device)
 
-            start_event = torch.cuda.Event()
-            done_event = torch.cuda.Event()
-            start_event.record(cur_stream)
-            alt_stream.wait_event(start_event)
+            alt_stream.wait_stream(current_stream)
 
             with torch.cuda.stream(alt_stream):
-                if self.norm_added_q is not None:
-                    txt_query = self.norm_added_q(txt_query)
+                if self.norm_k is not None:
+                    img_key = self.norm_k(img_key)
                 if self.norm_added_k is not None:
                     txt_key = self.norm_added_k(txt_key)
-                done_event.record(alt_stream)
 
             if self.norm_q is not None:
                 img_query = self.norm_q(img_query)
-            if self.norm_k is not None:
-                img_key = self.norm_k(img_key)
+            if self.norm_added_q is not None:
+                txt_query = self.norm_added_q(txt_query)
 
-            cur_stream.wait_event(done_event)
+            current_stream.wait_stream(alt_stream)
         else:
             if self.norm_q is not None:
                 img_query = self.norm_q(img_query)
