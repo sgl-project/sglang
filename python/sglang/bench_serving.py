@@ -234,10 +234,9 @@ async def async_request_openai_completions(
         if request_func_input.image_data:
             payload.update({"image_data": request_func_input.image_data})
 
-        if request_func_input.routing_id:
-            payload["routing_id"] = request_func_input.routing_id
-
         headers = get_auth_headers()
+        if request_func_input.routing_id:
+            headers["X-SMG-Routing-Key"] = request_func_input.routing_id
 
         output = RequestFuncOutput.init_new(request_func_input)
 
@@ -374,10 +373,9 @@ async def async_request_openai_chat_completions(
             payload["model"] = request_func_input.lora_name
             payload["lora_path"] = request_func_input.lora_name
 
-        if request_func_input.routing_id:
-            payload["routing_id"] = request_func_input.routing_id
-
         headers = get_auth_headers()
+        if request_func_input.routing_id:
+            headers["X-SMG-Routing-Key"] = request_func_input.routing_id
 
         output = RequestFuncOutput.init_new(request_func_input)
 
@@ -581,10 +579,9 @@ async def async_request_sglang_generate(
         if request_func_input.image_data:
             payload["image_data"] = request_func_input.image_data
 
-        if request_func_input.routing_id:
-            payload["routing_id"] = request_func_input.routing_id
-
         headers = get_auth_headers()
+        if request_func_input.routing_id:
+            headers["X-SMG-Routing-Key"] = request_func_input.routing_id
 
         output = RequestFuncOutput.init_new(request_func_input)
 
