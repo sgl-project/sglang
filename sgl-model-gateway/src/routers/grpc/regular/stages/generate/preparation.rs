@@ -15,7 +15,6 @@ use crate::{
             context::{PreparationOutput, RequestContext},
             utils,
         },
-        header_utils,
     },
     tokenizer::traits::Tokenizer,
 };
@@ -69,7 +68,6 @@ impl GeneratePreparationStage {
 
         ctx.state.preparation = Some(PreparationOutput {
             original_text,
-            routing_id: header_utils::extract_routing_id(ctx.input.headers.as_ref()),
             token_ids,
             processed_messages: None,
             tool_constraints: None,

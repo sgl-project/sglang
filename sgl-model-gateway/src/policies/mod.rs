@@ -57,11 +57,6 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
         false // Default: most policies don't need request text
     }
 
-    /// Check if this policy needs routing_id for routing decisions
-    fn needs_routing_id(&self) -> bool {
-        false // Default: most policies don't need routing_id
-    }
-
     /// Update worker load information
     ///
     /// This is called periodically with current load information for load-aware policies.
@@ -147,8 +142,11 @@ pub(crate) fn normalize_model_key(model_id: &str) -> &str {
 pub struct SelectWorkerInfo<'a> {
     /// Request text for cache-aware routing
     pub request_text: Option<&'a str>,
-    /// Routing ID for manual routing policy (consistent hashing)
-    pub routing_id: Option<&'a str>,
+    /// HTTP headers for header-based routing policies
+    /// Policies can extract routing information from headers like:
+    /// - X-Target-Worker: Direct routing to a specific worker by URL
+    /// - X-Routing-Key: Consistent hash routing for session affinity
+    pub headers: Option<&'a http::HeaderMap>,
 }
 
 #[cfg(test)]
