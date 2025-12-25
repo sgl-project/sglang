@@ -10,7 +10,6 @@ import logging
 import os
 import sys
 import time
-import warnings
 from contextlib import contextmanager
 from functools import lru_cache, partial
 from logging import Logger
@@ -24,6 +23,8 @@ SGLANG_DIFFUSION_LOGGING_CONFIG_PATH = envs.SGLANG_DIFFUSION_LOGGING_CONFIG_PATH
 SGLANG_DIFFUSION_LOGGING_LEVEL = envs.SGLANG_DIFFUSION_LOGGING_LEVEL
 SGLANG_DIFFUSION_LOGGING_PREFIX = envs.SGLANG_DIFFUSION_LOGGING_PREFIX
 
+# color
+CYAN = "\033[1;36m"
 RED = "\033[91m"
 GREEN = "\033[92m"
 YELLOW = "\033[93m"
@@ -394,44 +395,20 @@ def suppress_loggers(loggers_to_suppress: list[str], level: int = logging.WARNIN
     return original_levels
 
 
-@contextmanager
-def suppress_other_loggers(not_suppress_on_main_rank: bool = False):
-    """
-    A context manager to temporarily suppress specified loggers.
-
-    Args:
-        not_suppress_on_main_rank (bool): If True, loggers will not be
-            suppressed on the main process (rank 0).
-    """
-    # This is a global setting that we want to apply to all ranks
-    warnings.filterwarnings(
-        "ignore", category=UserWarning, message="The given NumPy array is not writable"
-    )
-
-    should_suppress = True
-    if not_suppress_on_main_rank:
-        if get_is_main_process():
-            should_suppress = False
-
-    loggers_to_suppress = [
-        "urllib3",
+def globally_suppress_loggers():
+    # globally suppress some obsessive loggers
+    target_names = [
         "imageio",
         "imageio_ffmpeg",
         "PIL",
         "PIL_Image",
-    ]
-    filelock_loggers = [
+        "python_multipart.multipart",
         "filelock",
+        "urllib3",
     ]
-    original_levels = suppress_loggers(loggers_to_suppress)
-    original_levels.update(suppress_loggers(filelock_loggers, level=logging.ERROR))
 
-    try:
-        yield
-    finally:
-        if should_suppress:
-            for logger_name, level in original_levels.items():
-                logging.getLogger(logger_name).setLevel(level)
+    for name in target_names:
+        logging.getLogger(name).setLevel(logging.ERROR)
 
 
 # source: https://github.com/vllm-project/vllm/blob/a11f4a81e027efd9ef783b943489c222950ac989/vllm/utils/system_utils.py#L60
@@ -484,10 +461,6 @@ def log_generation_timer(
             total_requests,
             prompt[:100],
         )
-    else:
-        max_len = 100
-        suffix = "..." if len(prompt) > max_len else ""
-        logger.info(f"Processing prompt: {prompt[:100]}{suffix}")
 
     timer = GenerationTimer()
     timer.start_time = time.perf_counter()

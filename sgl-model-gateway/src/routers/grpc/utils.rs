@@ -3,18 +3,21 @@
 use std::{collections::HashMap, sync::Arc};
 
 use axum::response::Response;
+use http::StatusCode;
 use serde_json::{json, Map, Value};
 use tracing::{error, warn};
 use uuid::Uuid;
 
 use super::{
     client::GrpcClient,
+    context::RequestContext,
     proto_wrapper::{ProtoGenerateComplete, ProtoStream},
     ProcessedMessages,
 };
 use crate::{
     core::Worker,
     grpc_client::sglang_proto::{InputLogProbs, OutputLogProbs},
+    observability::metrics::metrics_labels,
     protocols::{
         chat::{ChatCompletionRequest, ChatMessage},
         common::{
@@ -39,6 +42,49 @@ use crate::{
         ParserFactory as ToolParserFactory, PooledParser as ToolPooledParser, ToolParser,
     },
 };
+
+/// Resolve tokenizer from registry and cache it in request context.
+///
+/// This is a helper to avoid duplicating tokenizer resolution logic across
+/// preparation stages (chat, generate, embedding).
+///
+/// Returns the tokenizer Arc, which is also cached in `ctx.state.tokenizer`.
+pub fn resolve_tokenizer(
+    ctx: &mut RequestContext,
+    stage_name: &str,
+) -> Result<Arc<dyn Tokenizer>, Box<Response>> {
+    let model_id = ctx.input.model_id.as_deref().ok_or_else(|| {
+        error!(
+            function = %stage_name,
+            "model_id not set in request context"
+        );
+        Box::new(error::internal_error(
+            "model_id_not_set",
+            "model_id not set in request context - this is a bug in request routing",
+        ))
+    })?;
+
+    let tokenizer = ctx
+        .components
+        .tokenizer_registry
+        .get(model_id)
+        .ok_or_else(|| {
+            error!(
+                function = %stage_name,
+                model = %model_id,
+                "Tokenizer not found for model"
+            );
+            Box::new(error::internal_error(
+                "tokenizer_not_found",
+                format!("Tokenizer not found for model: {}", model_id),
+            ))
+        })?;
+
+    // Cache tokenizer in context for reuse in response processing stage
+    ctx.state.tokenizer = Some(tokenizer.clone());
+
+    Ok(tokenizer)
+}
 
 /// Get gRPC client from worker, returning appropriate error response on failure
 pub async fn get_grpc_client_from_worker(worker: &Arc<dyn Worker>) -> Result<GrpcClient, Response> {
@@ -954,6 +1000,33 @@ pub fn parse_finish_reason(reason_str: &str, completion_tokens: i32) -> Generate
             Ok(json_value) => GenerateFinishReason::Other(json_value),
             Err(_) => GenerateFinishReason::Other(Value::String(reason_str.to_string())),
         },
+    }
+}
+
+// ============================================================================
+// Metrics helper functions (shared by HTTP routers and gRPC pipeline)
+// ============================================================================
+
+/// Map route path to endpoint label for metrics
+pub fn route_to_endpoint(route: &str) -> &'static str {
+    match route {
+        "/v1/chat/completions" => metrics_labels::ENDPOINT_CHAT,
+        "/generate" => metrics_labels::ENDPOINT_GENERATE,
+        "/v1/completions" => metrics_labels::ENDPOINT_COMPLETIONS,
+        "/v1/rerank" => metrics_labels::ENDPOINT_RERANK,
+        "/v1/responses" => metrics_labels::ENDPOINT_RESPONSES,
+        _ => "other",
+    }
+}
+
+/// Map HTTP status code to error type label for metrics
+pub fn error_type_from_status(status: StatusCode) -> &'static str {
+    match status.as_u16() {
+        400 => metrics_labels::ERROR_VALIDATION,
+        404 => metrics_labels::ERROR_NO_WORKERS,
+        408 | 504 => metrics_labels::ERROR_TIMEOUT,
+        500..=599 => metrics_labels::ERROR_BACKEND,
+        _ => metrics_labels::ERROR_INTERNAL,
     }
 }
 

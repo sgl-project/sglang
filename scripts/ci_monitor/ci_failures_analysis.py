@@ -12,7 +12,7 @@ Features:
 - Generates detailed reports with actionable recommendations
 
 Usage:
-    python ci_failures_analysis.py --token <GITHUB_TOKEN> --limit 500 --threshold 3
+    python ci_failures_analysis.py --token <GITHUB_TOKEN> --limit 100
 """
 
 import argparse
@@ -30,9 +30,8 @@ import requests
 class SGLangFailuresAnalyzer:
     """Analyzes consecutive failures in GitHub Actions workflows."""
 
-    def __init__(self, token: str, alert_threshold: int = 3):
+    def __init__(self, token: str):
         self.token = token
-        self.alert_threshold = alert_threshold
         self.base_url = "https://api.github.com"
         self.repo = "sgl-project/sglang"
         self.headers = {
@@ -103,14 +102,32 @@ class SGLangFailuresAnalyzer:
         return all_runs
 
     def get_jobs_for_run(self, run_id: int) -> List[Dict]:
-        """Get all jobs for a specific workflow run."""
+        """Get all jobs for a specific workflow run, handling pagination."""
         try:
+            all_jobs = []
             url = f"{self.base_url}/repos/{self.repo}/actions/runs/{run_id}/jobs"
-            response = self.session.get(url, timeout=30)
-            response.raise_for_status()
-            data = response.json()
-            jobs = data.get("jobs", [])
-            return jobs
+            params = {"per_page": 100}  # Max per page
+
+            while url:
+                response = self.session.get(url, params=params, timeout=30)
+                response.raise_for_status()
+                data = response.json()
+                jobs = data.get("jobs", [])
+                all_jobs.extend(jobs)
+
+                # Check for next page in Link header
+                link_header = response.headers.get("Link", "")
+                next_url = None
+                if link_header:
+                    links = link_header.split(", ")
+                    for link in links:
+                        if 'rel="next"' in link:
+                            next_url = link.split(";")[0].strip("<>")
+                            break
+                url = next_url
+                params = {}  # Clear params for subsequent requests (URL has them)
+
+            return all_jobs
         except requests.exceptions.RequestException as e:
             print(f"Error fetching jobs for run {run_id}: {e}")
             return []
@@ -1105,7 +1122,6 @@ class SGLangFailuresAnalyzer:
                     1 for j in sorted_jobs if j[1]["current_streak"] > 0
                 ),
                 "total_runners": len(runner_stats) if runner_stats else 0,
-                "alert_threshold": self.alert_threshold,
                 "analysis_timestamp": datetime.now().isoformat(),
                 "avg_queue_time_seconds": overall_avg_queue,
                 "p90_queue_time_seconds": overall_p90_queue,
@@ -1169,9 +1185,7 @@ class SGLangFailuresAnalyzer:
             summary_lines.append(
                 f"**Analysis Timestamp:** {report_data['summary']['analysis_timestamp']}"
             )
-            summary_lines.append(
-                f"**Alert Threshold:** {report_data['summary']['alert_threshold']} consecutive failures"
-            )
+            summary_lines.append("_Note: Recent runs are shown left to right_")
             summary_lines.append("")
 
             # Summary stats - COLLAPSIBLE
@@ -1563,12 +1577,6 @@ def main():
         help="Number of workflow runs to analyze per workflow for general analysis (default: 100)",
     )
     parser.add_argument(
-        "--threshold",
-        type=int,
-        default=3,
-        help="Alert threshold for consecutive failures (default: 3)",
-    )
-    parser.add_argument(
         "--output",
         default=None,
         help="Output JSON file (optional, only writes if specified)",
@@ -1576,7 +1584,7 @@ def main():
 
     args = parser.parse_args()
 
-    analyzer = SGLangFailuresAnalyzer(args.token, alert_threshold=args.threshold)
+    analyzer = SGLangFailuresAnalyzer(args.token)
 
     try:
         # Fetch runs for each category separately

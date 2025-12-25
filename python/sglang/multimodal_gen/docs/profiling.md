@@ -42,10 +42,12 @@ sglang generate \
 
 ### Output Location
 
-By default, trace files are saved in the ./logs/ directory. The exact output file path will be shown in the console output, for example:
+By default, trace files are saved in the ./logs/ directory.
+
+The exact output file path will be shown in the console output, for example:
 
 ```bash
-[mm-dd hh:mm:ss] Saving profiler traces to: /sgl-workspace/sglang/logs/mocked_fake_id_for_offline_generate-5_steps-global-rank0.trace.json.gz
+[mm-dd hh:mm:ss] Saved profiler traces to: /sgl-workspace/sglang/logs/mocked_fake_id_for_offline_generate-5_steps-global-rank0.trace.json.gz
 ```
 
 ### View Traces
@@ -55,6 +57,26 @@ Load and visualize trace files at:
 - chrome://tracing (Chrome only)
 
 For large trace files, reduce `--num-profiled-timesteps` or avoid using `--profile-all-stages`.
+
+
+### `--perf-dump-path` (Stage/Step Timing Dump)
+
+Besides profiler traces, you can also dump a lightweight JSON report that contains:
+- stage-level timing breakdown for the full pipeline
+- step-level timing breakdown for the denoising stage (per diffusion step)
+
+This is useful to quickly identify which stage dominates end-to-end latency, and whether denoising steps have uniform runtimes (and if not, which step has an abnormal spike).
+
+The dumped JSON contains a `denoise_steps_ms` field formatted as an array of objects, each with a `step` key (the step index) and a `duration_ms` key.
+
+Example:
+
+```bash
+sglang generate \
+  --model-path <MODEL_PATH_OR_ID> \
+  --prompt "<PROMPT>" \
+  --perf-dump-path perf.json
+```
 
 ## Nsight Systems
 
