@@ -43,12 +43,20 @@ def get_argument_type(
     if func_name not in name2tool:
         return None
     tool = name2tool[func_name]
-    properties = (tool.function.parameters or {}).get("properties", {})
-    if not isinstance(properties, dict):
-        properties = {}
-    if arg_key not in properties:
+    # Access parameters with safe attribute access
+    function_obj = tool.function
+    if not hasattr(function_obj, "parameters"):
         return None
-    return properties[arg_key].get("type", None)
+    params = function_obj.parameters
+    if params is None:
+        return None
+    # Safely access properties
+    if isinstance(params, dict) and "properties" in params:
+        properties = params["properties"]
+        if isinstance(properties, dict) and arg_key in properties:
+            if isinstance(properties[arg_key], dict) and "type" in properties[arg_key]:
+                return properties[arg_key]["type"]
+    return None
 
 
 def _convert_to_number(value: str) -> Any:
@@ -143,6 +151,7 @@ class Glm47MoeDetector(BaseFormatDetector):
         self.current_tool_id = -1
         self.current_tool_name_sent = False
         self._streamed_raw_length = 0
+        self._tool_call_completed = False  # Track if tool call has been completed
         self._reset_streaming_state()
 
     def _reset_streaming_state(self) -> None:
@@ -156,6 +165,7 @@ class Glm47MoeDetector(BaseFormatDetector):
         self._cached_value_type: Optional[str] = (
             None  # Cache the value type for consistency
         )
+        self._tool_call_completed = False  # Reset tool call completion status
 
     def has_tool_call(self, text: str) -> bool:
         """Check if the text contains a glm-4.5 / glm-4.6 format tool call."""
@@ -568,7 +578,7 @@ class Glm47MoeDetector(BaseFormatDetector):
                         # Update the streamed length
                         self._streamed_raw_length = current_raw_length
 
-                    if is_tool_end == self.eot_token:
+                    if is_tool_end == self.eot_token and not self._tool_call_completed:
                         if self._is_first_param:
                             empty_object = "{}"
                             calls.append(
@@ -623,6 +633,9 @@ class Glm47MoeDetector(BaseFormatDetector):
                                 ]
                             else:
                                 self._buffer = ""
+
+                        # Mark the tool call as completed to prevent duplicate processing
+                        self._tool_call_completed = True
 
                         result = StreamingParseResult(normal_text="", calls=calls)
                         self.current_tool_id += 1
