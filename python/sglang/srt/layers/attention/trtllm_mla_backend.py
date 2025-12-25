@@ -549,8 +549,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             else:
                 metadata.max_seq_len_q = 1
                 metadata.sum_seq_lens_q = bs
-            # Note: The actual tokens per sequence is accept_length + 1 (accepted tokens + current token)
-            # We need to add 1 to match the actual q tensor shape
+            # draft_extend uses (accept_length + 1) query tokens per sequence
             extend_seq_lens = accept_length + 1
             metadata.cu_seqlens_q[1:].copy_(
                 torch.cumsum(extend_seq_lens, dim=0, dtype=torch.int32)
@@ -1050,40 +1049,27 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 q = q.view(bs, -1, layer.tp_q_head_num, layer.head_dim)
                 needs_unpad = False
             else:
-                # For draft_extend, sequences may have varying accept_lengths
-                max_seq_len_q = metadata.max_seq_len_q
+                # draft_extend: handle varying accept_lengths. If total_tokens % bs == 0,
+                # we can directly reshape q; otherwise, pad to max_seq_len_q.
                 total_tokens = q.shape[0]
                 tokens_per_seq = total_tokens // bs if bs > 0 else 0
-
-                # Check if q can be directly reshaped to (bs, tokens_per_seq, ...)
-                # This is true when total_tokens is evenly divisible by bs
-                # (e.g., during CUDA graph capture/replay where all sequences have same length)
-                can_direct_view = (total_tokens % bs == 0) if bs > 0 else False
+                can_direct_view = bs > 0 and (total_tokens % bs == 0)
 
                 if can_direct_view:
-                    # Use actual tokens_per_seq from q tensor shape
                     max_seq_len = metadata.max_seq_len_k + tokens_per_seq
                     q = q.view(bs, tokens_per_seq, layer.tp_q_head_num, layer.head_dim)
                     needs_unpad = False
-                    unpad_seq_lens_q = None
-                    unpad_cu_seqlens_q = None
-                    unpad_sum_seq_lens_q = None
                 else:
-                    # Sequences have varying lengths, need to pad the query
-                    # Use values from forward_batch instead of metadata to ensure consistency
+                    # Varying lengths: pad q to (bs, max_seq_len_q, ...)
                     actual_seq_lens_q = forward_batch.extend_seq_lens
                     actual_max_seq_len_q = max(forward_batch.extend_seq_lens_cpu)
-                    actual_sum_seq_lens_q = total_tokens  # Use actual input token count
-
                     max_seq_len = metadata.max_seq_len_k + actual_max_seq_len_q
 
-                    # Compute cu_seqlens_q from actual seq_lens
                     actual_cu_seqlens_q = torch.nn.functional.pad(
                         torch.cumsum(actual_seq_lens_q, dim=0, dtype=torch.int32),
                         (1, 0),
                     )
 
-                    # Use pre-allocated buffer for CUDA graph compatibility
                     if self.padded_q_buffer is not None:
                         padded_q = self.padded_q_buffer[:bs, :actual_max_seq_len_q, :, :].to(
                             dtype=q.dtype
@@ -1097,15 +1083,12 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                         )
 
                     q = self.pad_draft_extend_query(
-                        q,
-                        padded_q,
-                        actual_seq_lens_q,
-                        actual_cu_seqlens_q,
+                        q, padded_q, actual_seq_lens_q, actual_cu_seqlens_q
                     )
                     needs_unpad = True
                     unpad_seq_lens_q = actual_seq_lens_q
                     unpad_cu_seqlens_q = actual_cu_seqlens_q
-                    unpad_sum_seq_lens_q = actual_sum_seq_lens_q
+                    unpad_sum_seq_lens_q = total_tokens
 
             assert kv_cache.dtype == self.data_type
 
