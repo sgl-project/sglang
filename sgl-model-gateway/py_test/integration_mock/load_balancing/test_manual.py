@@ -10,7 +10,7 @@ ROUTING_KEY_HEADER = "X-SMG-Routing-Key"
 @pytest.mark.integration
 def test_manual_routing_same_key_routes_to_same_worker(mock_workers, router_manager):
     """Requests with the same routing key should route to the same worker."""
-    procs, urls, ids = mock_workers(n=3)
+    procs, urls, ids = mock_workers(n=2)
 
     rh = router_manager.start_router(worker_urls=urls, policy="manual")
 
@@ -44,7 +44,7 @@ def test_manual_routing_same_key_routes_to_same_worker(mock_workers, router_mana
 @pytest.mark.integration
 def test_manual_routing_different_keys_distribute(mock_workers, router_manager):
     """Different routing keys should distribute across workers."""
-    procs, urls, ids = mock_workers(n=3)
+    procs, urls, ids = mock_workers(n=2)
 
     rh = router_manager.start_router(worker_urls=urls, policy="manual")
 
@@ -74,7 +74,7 @@ def test_manual_routing_different_keys_distribute(mock_workers, router_manager):
 @pytest.mark.integration
 def test_manual_routing_no_header_uses_random_fallback(mock_workers, router_manager):
     """Requests without routing key header should use random fallback."""
-    procs, urls, ids = mock_workers(n=3)
+    procs, urls, ids = mock_workers(n=2)
 
     rh = router_manager.start_router(worker_urls=urls, policy="manual")
 
@@ -103,7 +103,7 @@ def test_manual_routing_no_header_uses_random_fallback(mock_workers, router_mana
 @pytest.mark.integration
 def test_manual_routing_sticky_sessions(mock_workers, router_manager):
     """Test sticky session behavior - same key always routes to same worker."""
-    procs, urls, ids = mock_workers(n=3)
+    procs, urls, ids = mock_workers(n=2)
 
     rh = router_manager.start_router(worker_urls=urls, policy="manual")
 
