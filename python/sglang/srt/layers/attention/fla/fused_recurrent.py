@@ -352,8 +352,13 @@ def fused_recurrent_gated_delta_rule_update_fwd_kernel(
     h0_indices,
     cu_seqlens,
     scale,
-    intermediate_states_buffer,
-    intermediate_state_indices,
+    intermediate_k_ptr,
+    intermediate_v_ptr,
+    intermediate_g_ptr,
+    intermediate_beta_ptr,
+    intermediate_accepted_steps_ptr,
+    intermediate_states_buffer_ptr,
+    intermediate_state_indices_ptr,
     cache_steps,
     retrieve_parent_token_ptr,
     stride_retrieve_parent_token_seq: tl.constexpr,
@@ -416,84 +421,130 @@ def fused_recurrent_gated_delta_rule_update_fwd_kernel(
     mask_h = mask_k[:, None] & mask_v[None, :]
 
     b_h = tl.zeros([BK, BV], dtype=tl.float32)
-    if USE_INITIAL_STATE:
-        idx = tl.load(h0_indices + i_n)
-        # Add bounds checking for idx
-        if idx >= 0:  # Assuming negative indices are invalid
-            p_h0 = (
-                h0_source
-                + idx * HV * K * V
-                + i_hv * K * V
-                + o_k[:, None] * V
-                + o_v[None, :]
-            )
-            b_h += tl.load(p_h0, mask=mask_h, other=0).to(tl.float32)
+    idx = tl.load(h0_indices + i_n)
+    p_h0 = (
+        h0_source
+        + idx * HV * K * V
+        + i_hv * K * V
+        + o_k[:, None] * V
+        + o_v[None, :]
+    )
+    if idx < 0:
+        return
+    # Add bounds checking for idx
+    if USE_INITIAL_STATE:  # Assuming negative indices are invalid
+        b_h += tl.load(p_h0, mask=mask_h, other=0).to(tl.float32)
 
     # Prepare intermediate state cache variables if enabled
-    cache_idx = -1
     if CACHE_INTERMEDIATE_STATES:
-        cache_idx = tl.load(intermediate_state_indices + i_n)
+        accepted_step = tl.load(intermediate_accepted_steps_ptr + idx)
+        # should lazy update b_h
+        if accepted_step != -1:
+            p_interm_k = intermediate_k_ptr + idx * cache_steps * H * K + i_h * K + o_k
+            p_interm_v = intermediate_v_ptr + idx * cache_steps * HV * V + i_hv * V + o_v
+            if IS_BETA_HEADWISE:
+                p_interm_beta = intermediate_beta_ptr + idx * cache_steps * HV * V + i_hv * V + o_v
+            else:
+                p_interm_beta = intermediate_beta_ptr + idx * cache_steps * HV + i_hv
+            p_interm_g = intermediate_g_ptr + idx * cache_steps * HV + i_hv
+            for _ in range(0, accepted_step + 1):
+                b_k = tl.load(p_interm_k, mask=mask_k, other=0).to(tl.float32)
+                b_v = tl.load(p_interm_v, mask=mask_v, other=0).to(tl.float32)
+                b_g = tl.load(p_interm_g).to(tl.float32)
+                if IS_BETA_HEADWISE:
+                    b_beta = tl.load(p_interm_beta, mask=mask_v, other=0).to(tl.float32)
+                else:
+                    b_beta = tl.load(p_interm_beta).to(tl.float32)
 
+                if USE_QK_L2NORM_IN_KERNEL:
+                    b_k = b_k / (tl.sqrt(tl.sum(b_k * b_k) + 1e-6))
+                # [BK, BV]
+                b_h *= exp(b_g)
+                # [BV]
+                b_v -= tl.sum(b_h * b_k[:, None], 0)
+                b_v *= b_beta
+                # [BK, BV]
+                b_h += b_k[:, None] * b_v[None, :]
+
+                p_interm_k += H * K
+                p_interm_v += HV * V
+                p_interm_g += HV
+                p_interm_beta += HV * (V if IS_BETA_HEADWISE else 1)
+
+            # Store final state back to h0_source with bounds checking
+            tl.store(p_h0, b_h.to(p_h0.dtype.element_ty), mask=mask_h)
+
+    b_hs = tl.zeros([NP2_T, BK, BV], dtype=tl.float32)
     step_idx = 0
     for _ in range(0, T):
-        if HAS_EAGLE_TREE_CUSTOM_ATTN_MASK:
-            # step_idx = 0 should use the b_h from USE_INITIAL_STATE
-            if step_idx != 0 and cache_idx >= 0:
-                # when calculating current step's attention, load the state from the parent token
-                parent_step_idx = tl.sum(
-                    tl.where(token_indices == step_idx, parent_idx_tokens, 0)
-                )
-                step_offset = parent_step_idx * HV * K * V
-                cache_ptr = (
-                    intermediate_states_buffer
-                    + cache_idx * cache_steps * HV * K * V
-                    + step_offset
-                    + i_hv * K * V
-                    + o_k[:, None] * V
-                    + o_v[None, :]
-                )
-                b_h = tl.load(cache_ptr, mask=mask_h, other=0).to(tl.float32)
-
         b_q = tl.load(p_q, mask=mask_k, other=0).to(tl.float32)
         b_k = tl.load(p_k, mask=mask_k, other=0).to(tl.float32)
         b_v = tl.load(p_v, mask=mask_v, other=0).to(tl.float32)
         b_g = tl.load(p_g).to(tl.float32)
+        if IS_BETA_HEADWISE:
+            b_beta = tl.load(p_beta, mask=mask_v, other=0).to(tl.float32)
+        else:
+            b_beta = tl.load(p_beta).to(tl.float32)
+
+        # store intermediate states if enabled
+        if CACHE_INTERMEDIATE_STATES:
+            p_interm_k = intermediate_k_ptr + (idx * cache_steps + step_idx) * H * K + i_h * K + o_k
+            p_interm_v = intermediate_v_ptr + (idx * cache_steps + step_idx) * HV * V + i_hv * V + o_v
+            if IS_BETA_HEADWISE:
+                p_interm_beta = intermediate_beta_ptr + (idx * cache_steps + step_idx) * HV * V + i_hv * V + o_v
+            else:
+                p_interm_beta = intermediate_beta_ptr + (idx * cache_steps + step_idx) * HV + i_hv
+            p_interm_g = intermediate_g_ptr + (idx * cache_steps + step_idx) * HV + i_hv
+            tl.store(p_interm_k, b_k.to(p_interm_k.dtype.element_ty), mask=mask_k)
+            tl.store(p_interm_v, b_v.to(p_interm_v.dtype.element_ty), mask=mask_v)
+            tl.store(p_interm_g, b_g.to(p_interm_g.dtype.element_ty))
+            if IS_BETA_HEADWISE:
+                tl.store(p_interm_beta, b_beta.to(p_interm_beta.dtype.element_ty), mask=mask_v)
+            else:
+                tl.store(p_interm_beta, b_beta.to(p_interm_beta.dtype.element_ty))
 
         if USE_QK_L2NORM_IN_KERNEL:
             b_q = b_q / (tl.sqrt(tl.sum(b_q * b_q) + 1e-6))
             b_k = b_k / (tl.sqrt(tl.sum(b_k * b_k) + 1e-6))
+
+        if HAS_EAGLE_TREE_CUSTOM_ATTN_MASK:
+            # step_idx = 0 should use the b_h from USE_INITIAL_STATE
+            if step_idx != 0:
+                # when calculating current step's attention, load the state from the parent token
+                parent_step_idx = tl.sum(
+                    tl.where(token_indices == step_idx, parent_idx_tokens, 0)
+                )
+                p_h = (
+                    intermediate_states_buffer_ptr
+                    + (i_n * cache_steps + parent_step_idx) * HV * K * V
+                    + i_hv * K * V
+                    + o_k[:, None] * V
+                    + o_v[None, :]
+                )
+                b_h = tl.load(p_h, mask=mask_h)
+
         b_q = b_q * scale
         # [BK, BV]
         b_h *= exp(b_g)
         # [BV]
         b_v -= tl.sum(b_h * b_k[:, None], 0)
-        if IS_BETA_HEADWISE:
-            b_beta = tl.load(p_beta, mask=mask_v, other=0).to(tl.float32)
-        else:
-            b_beta = tl.load(p_beta).to(tl.float32)
         b_v *= b_beta
         # [BK, BV]
         b_h += b_k[:, None] * b_v[None, :]
+        if HAS_EAGLE_TREE_CUSTOM_ATTN_MASK:
+            p_h = (
+                intermediate_states_buffer_ptr
+                + (i_n * cache_steps + step_idx) * HV * K * V
+                + i_hv * K * V
+                + o_k[:, None] * V
+                + o_v[None, :]
+            )
+            tl.store(p_h, b_h, mask=mask_h)
         # [BV]
         if not DISABLE_OUTPUT_CALCULATION:
             b_o = tl.sum(b_h * b_q[:, None], 0)
             # core attn output
             tl.store(p_o, b_o.to(p_o.dtype.element_ty), mask=mask_v)
-
-        # store intermediate states if enabled
-        if CACHE_INTERMEDIATE_STATES:
-            if cache_idx >= 0:
-                # Compute cache pointer for this step
-                step_offset = step_idx * HV * K * V
-                cache_ptr = (
-                    intermediate_states_buffer
-                    + cache_idx * cache_steps * HV * K * V
-                    + step_offset
-                    + i_hv * K * V
-                    + o_k[:, None] * V
-                    + o_v[None, :]
-                )
-                tl.store(cache_ptr, b_h.to(cache_ptr.dtype.element_ty), mask=mask_h)
 
         step_idx += 1
 
@@ -507,16 +558,14 @@ def fused_recurrent_gated_delta_rule_update_fwd_kernel(
     # Store final state back to h0_source with bounds checking
     # ssm states
     if not DISABLE_STATE_UPDATE:
-        idx = tl.load(h0_indices + i_n)
-        if idx >= 0:  # Add bounds checking
-            p_h0 = (
-                h0_source
-                + idx * HV * K * V
-                + i_hv * K * V
-                + o_k[:, None] * V
-                + o_v[None, :]
-            )
-            tl.store(p_h0, b_h.to(p_h0.dtype.element_ty), mask=mask_h)
+        p_h0 = (
+            h0_source
+            + idx * HV * K * V
+            + i_hv * K * V
+            + o_k[:, None] * V
+            + o_v[None, :]
+        )
+        tl.store(p_h0, b_h.to(p_h0.dtype.element_ty), mask=mask_h)
 
 
 def fused_recurrent_gated_delta_rule_update_fwd(
@@ -532,6 +581,11 @@ def fused_recurrent_gated_delta_rule_update_fwd(
     cu_seqlens: Optional[torch.LongTensor] = None,
     disable_state_update: bool = False,
     disable_output_calculation: bool = False,
+    intermediate_k: Optional[torch.Tensor] = None,
+    intermediate_v: Optional[torch.Tensor] = None,
+    intermediate_g: Optional[torch.Tensor] = None,
+    intermediate_beta: Optional[torch.Tensor] = None,
+    intermediate_accepted_steps: Optional[torch.Tensor] = None,
     intermediate_states_buffer: Optional[torch.Tensor] = None,
     intermediate_state_indices: Optional[torch.Tensor] = None,
     cache_steps: Optional[int] = None,
@@ -563,7 +617,7 @@ def fused_recurrent_gated_delta_rule_update_fwd(
     else:
         stride_retrieve_parent_token_seq = stride_retrieve_parent_token_token = 0
 
-    NP2_T = triton.next_power_of_2(T)
+    NP2_T = triton.next_power_of_2(cache_steps) if cache_steps is not None else triton.next_power_of_2(T)
     fused_recurrent_gated_delta_rule_update_fwd_kernel[grid](
         q=q,
         k=k,
@@ -575,8 +629,13 @@ def fused_recurrent_gated_delta_rule_update_fwd(
         h0_indices=initial_state_indices,
         cu_seqlens=cu_seqlens,
         scale=scale,
-        intermediate_states_buffer=intermediate_states_buffer,
-        intermediate_state_indices=intermediate_state_indices,
+        intermediate_k_ptr=intermediate_k,
+        intermediate_v_ptr=intermediate_v,
+        intermediate_g_ptr=intermediate_g,
+        intermediate_beta_ptr=intermediate_beta,
+        intermediate_accepted_steps_ptr=intermediate_accepted_steps,
+        intermediate_states_buffer_ptr=intermediate_states_buffer,
+        intermediate_state_indices_ptr=intermediate_state_indices,
         cache_steps=0 if cache_steps is None else cache_steps,
         retrieve_parent_token_ptr=retrieve_parent_token,
         stride_retrieve_parent_token_seq=stride_retrieve_parent_token_seq,
@@ -592,7 +651,7 @@ def fused_recurrent_gated_delta_rule_update_fwd(
         BV=BV,
         USE_INITIAL_STATE=initial_state_source is not None,
         IS_VARLEN=cu_seqlens is not None,
-        CACHE_INTERMEDIATE_STATES=intermediate_states_buffer is not None,
+        CACHE_INTERMEDIATE_STATES=intermediate_k is not None,
         HAS_EAGLE_TREE_CUSTOM_ATTN_MASK=retrieve_parent_token is not None,
         IS_BETA_HEADWISE=beta.ndim == v.ndim,
         USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
@@ -623,6 +682,11 @@ class FusedRecurrentUpdateFunction(torch.autograd.Function):
         use_qk_l2norm_in_kernel: bool = False,
         disable_state_update: bool = False,
         disable_output_calculation: bool = False,
+        intermediate_k: Optional[torch.Tensor] = None,
+        intermediate_v: Optional[torch.Tensor] = None,
+        intermediate_g: Optional[torch.Tensor] = None,
+        intermediate_beta: Optional[torch.Tensor] = None,
+        intermediate_accepted_steps: Optional[torch.Tensor] = None,
         intermediate_states_buffer: Optional[torch.Tensor] = None,
         intermediate_state_indices: Optional[torch.Tensor] = None,
         cache_steps: Optional[int] = None,
@@ -641,6 +705,11 @@ class FusedRecurrentUpdateFunction(torch.autograd.Function):
             cu_seqlens=cu_seqlens,
             disable_state_update=disable_state_update,
             disable_output_calculation=disable_output_calculation,
+            intermediate_k=intermediate_k,
+            intermediate_v=intermediate_v,
+            intermediate_g=intermediate_g,
+            intermediate_beta=intermediate_beta,
+            intermediate_accepted_steps=intermediate_accepted_steps,
             intermediate_states_buffer=intermediate_states_buffer,
             intermediate_state_indices=intermediate_state_indices,
             cache_steps=cache_steps,
@@ -672,6 +741,11 @@ def fused_recurrent_gated_delta_rule_update(
     use_qk_l2norm_in_kernel: bool = False,
     disable_state_update: bool = False,
     disable_output_calculation: bool = False,
+    intermediate_k: Optional[torch.Tensor] = None,
+    intermediate_v: Optional[torch.Tensor] = None,
+    intermediate_g: Optional[torch.Tensor] = None,
+    intermediate_beta: Optional[torch.Tensor] = None,
+    intermediate_accepted_steps: Optional[torch.Tensor] = None,
     intermediate_states_buffer: Optional[torch.Tensor] = None,
     intermediate_state_indices: Optional[torch.Tensor] = None,
     cache_steps: Optional[int] = None,
@@ -688,11 +762,6 @@ def fused_recurrent_gated_delta_rule_update(
                 raise ValueError(
                     f"The number of initial states is expected to be equal to the number of input sequences, "
                     f"i.e., {len(cu_seqlens) - 1} rather than {initial_state_indices.shape[0]}."
-                )
-            if initial_state_indices.shape[0] != intermediate_state_indices.shape[0]:
-                raise ValueError(
-                    f"The number of intermediate state indices is expected to be equal to the number of input sequences, "
-                    f"i.e., {initial_state_indices.shape[0]} != {intermediate_state_indices.shape[0]}."
                 )
     if scale is None:
         scale = k.shape[-1] ** -0.5
@@ -713,6 +782,11 @@ def fused_recurrent_gated_delta_rule_update(
         use_qk_l2norm_in_kernel,
         disable_state_update,
         disable_output_calculation,
+        intermediate_k,
+        intermediate_v,
+        intermediate_g,
+        intermediate_beta,
+        intermediate_accepted_steps,
         intermediate_states_buffer,
         intermediate_state_indices,
         cache_steps,
