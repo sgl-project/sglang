@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from typing import Any, Callable, NamedTuple
 
 import torch
@@ -207,6 +208,12 @@ def test_hicache_kernel(args: HicacheBenchArgs) -> None:
     print("=" * 70)
 
 
+IS_CI = (
+    os.getenv("CI", "false").lower() == "true"
+    or os.getenv("GITHUB_ACTIONS", "false").lower() == "true"
+)
+
+
 def main() -> None:
     torch.cuda.set_device(0)
     stream = torch.cuda.Stream()
@@ -234,8 +241,8 @@ def main() -> None:
     dur = tic.elapsed_time(toc)
     print(f"Peak D->H Bandwidth: {(BUF_SIZE / (1024**3)) / (dur / 1000):.2f} GB/s")
 
-    for block_quota in [1, 2, 3, 4]:
-        for cache_item_size in [128, 256, 512, 1024]:
+    for block_quota in [2] if IS_CI else [1, 2, 3, 4]:
+        for cache_item_size in [128] if IS_CI else [128, 256, 512, 1024]:
             args = HicacheBenchArgs(
                 cache_item_size=cache_item_size,
                 dtype=torch.float16,
