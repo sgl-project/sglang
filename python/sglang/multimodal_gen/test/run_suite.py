@@ -85,8 +85,9 @@ def collect_test_items(files, filter_expr=None):
     if filter_expr:
         cmd.extend(["-k", filter_expr])
     cmd.extend(files)
-
+    print("cmd", cmd)
     result = subprocess.run(cmd, capture_output=True, text=True)
+    print("result", result)
 
     # Parse the output to extract test node IDs
     # pytest -q outputs lines like: test_file.py::TestClass::test_method[param]
@@ -202,7 +203,7 @@ def main():
     if not suite_files_abs:
         print(f"No valid test files found for suite '{args.suite}'.")
         sys.exit(0)
-
+    print("suite_files_abs", suite_files_abs)
     # 3. collect all test items and partition by items (not files)
     all_test_items = collect_test_items(suite_files_abs, filter_expr=args.filter)
 
