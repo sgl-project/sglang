@@ -345,9 +345,6 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
             self.base_layer, input_parallel
         )
 
-        if self.set_lora:
-            output_parallel = self.apply_lora(output_parallel, input_parallel)
-
         if self.base_layer.reduce_results and self.base_layer.tp_size > 1:
             output_ = tensor_model_parallel_all_reduce(output_parallel)
         else:

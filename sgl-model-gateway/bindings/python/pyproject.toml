@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "sglang-router"
-version = "0.2.4"
+version = "0.3.0"
 description = "High-performance Rust-based load balancer for SGLang with multiple routing algorithms and prefill-decode disaggregation support"
 authors = [
     {name = "Simo Lin", email = "linsimo.mark@gmail.com"},
