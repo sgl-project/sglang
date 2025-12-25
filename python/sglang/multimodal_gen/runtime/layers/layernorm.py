@@ -37,7 +37,6 @@ class RMSNorm(CustomOp):
     ) -> None:
         super().__init__()
         self.weight = nn.Parameter(torch.ones(hidden_size))
-        self._weight_cache = None
         self.variance_epsilon = eps
         self.hidden_size = hidden_size
         self.variance_size_override = (
@@ -56,19 +55,6 @@ class RMSNorm(CustomOp):
         x: torch.Tensor,
         residual: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        weight = self.weight
-        if x.dtype != torch.float:
-            weight_cache = getattr(self, "_weight_cache", None)
-            if (
-                weight_cache is None
-                or weight_cache.device != x.device
-                or weight_cache.dtype != x.dtype
-                or weight_cache.numel() != self.weight.numel()
-            ):
-                weight_cache = self.weight.to(device=x.device, dtype=x.dtype)
-                self._weight_cache = weight_cache
-            weight = weight_cache
-
         shape = x.shape
         x = x.reshape(-1, shape[-1])
         if residual is not None:
@@ -81,10 +67,10 @@ class RMSNorm(CustomOp):
         elif self.variance_size_override is not None:
             return self.forward_native(x, residual)
         elif residual is not None:
-            fused_add_rmsnorm(x, residual, weight.data, self.variance_epsilon)
+            fused_add_rmsnorm(x, residual, self.weight.data, self.variance_epsilon)
             return x.view(shape), residual.view(residual_shape)
         else:
-            out = rmsnorm(x, weight.data, self.variance_epsilon)
+            out = rmsnorm(x, self.weight.data, self.variance_epsilon)
         out = out.view(shape)
         return out
 

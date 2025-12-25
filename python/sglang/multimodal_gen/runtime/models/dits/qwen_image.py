@@ -20,7 +20,6 @@ from sglang.multimodal_gen.runtime.layers.attention import USPAttention
 from sglang.multimodal_gen.runtime.layers.layernorm import LayerNorm, RMSNorm
 from sglang.multimodal_gen.runtime.layers.linear import ReplicatedLinear
 from sglang.multimodal_gen.runtime.layers.triton_ops import (
-    apply_rotary_embedding,
     fuse_scale_shift_gate_select01_kernel,
     fuse_scale_shift_kernel,
 )
@@ -29,6 +28,11 @@ from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)  # pylint: disable=invalid-name
+
+
+@functools.lru_cache(maxsize=None)
+def _get_qwen_image_qk_norm_alt_stream(device_index: int) -> torch.cuda.Stream:
+    return torch.cuda.Stream(device=device_index)
 
 
 try:
@@ -337,114 +341,124 @@ class QwenImageCrossAttention(nn.Module):
         txt_value = txt_value.unflatten(-1, (self.num_heads, -1))
 
         # Apply QK normalization
-        if self.norm_q is not None:
-            img_query = self.norm_q(img_query)
-        if self.norm_k is not None:
-            img_key = self.norm_k(img_key)
-        if self.norm_added_q is not None:
-            txt_query = self.norm_added_q(txt_query)
-        if self.norm_added_k is not None:
-            txt_key = self.norm_added_k(txt_key)
+        if img_query.is_cuda:
+            device_index = (
+                img_query.device.index
+                if img_query.device.index is not None
+                else torch.cuda.current_device()
+            )
+            alt_stream = _get_qwen_image_qk_norm_alt_stream(device_index)
+            cur_stream = torch.cuda.current_stream(device=img_query.device)
+
+            alt_stream.wait_stream(cur_stream)
+
+            with torch.cuda.stream(alt_stream):
+                if self.norm_added_k is not None:
+                    txt_key = self.norm_added_k(txt_key)
+                if self.norm_k is not None:
+                    img_key = self.norm_k(img_key)
+
+            if self.norm_q is not None:
+                img_query = self.norm_q(img_query)
+            if self.norm_added_q is not None:
+                txt_query = self.norm_added_q(txt_query)
+
+            cur_stream.wait_stream(alt_stream)
+        else:
+            if self.norm_q is not None:
+                img_query = self.norm_q(img_query)
+            if self.norm_k is not None:
+                img_key = self.norm_k(img_key)
+            if self.norm_added_q is not None:
+                txt_query = self.norm_added_q(txt_query)
+            if self.norm_added_k is not None:
+                txt_key = self.norm_added_k(txt_key)
 
         # Apply RoPE
         if image_rotary_emb is not None:
-            if (
+            if apply_rope_with_cos_sin_cache_inplace is None:
+                raise RuntimeError("flashinfer is required")
+
+            if not (
                 isinstance(image_rotary_emb[0], torch.Tensor)
                 and image_rotary_emb[0].dim() == 2
             ):
-                if apply_rope_with_cos_sin_cache_inplace is None:
-                    raise RuntimeError(
-                        "flashinfer is required for SGLANG_MM_QWEN_IMAGE_ROPE_IMPL=flashinfer"
+                raise RuntimeError("image_rotary_emb must be cos_sin_cache tensors")
+
+            img_cache, txt_cache = image_rotary_emb
+
+            def _apply_flashinfer_rope(
+                q_4d: torch.Tensor, k_4d: torch.Tensor, cache: torch.Tensor
+            ):
+                bsz, seqlen, nheads, d = q_4d.shape
+                positions = torch.arange(seqlen, device="cpu", dtype=torch.long).to(
+                    q_4d.device, non_blocking=True
+                )
+
+                if bsz == 1:
+                    q2 = q_4d.squeeze(0).reshape(seqlen, nheads * d).contiguous()
+                    k2 = k_4d.squeeze(0).reshape(seqlen, nheads * d).contiguous()
+                    apply_rope_with_cos_sin_cache_inplace(
+                        positions=positions,
+                        query=q2,
+                        key=k2,
+                        head_size=d,
+                        cos_sin_cache=cache,
+                        is_neox=False,
                     )
-                img_cache, txt_cache = image_rotary_emb
+                    return q2.view(1, seqlen, nheads, d), k2.view(1, seqlen, nheads, d)
 
-                def _apply_flashinfer_rope(q_4d: torch.Tensor, k_4d: torch.Tensor, cache: torch.Tensor):
-                    bsz, seqlen, nheads, d = q_4d.shape
-                    if bsz == 1:
-                        q2 = q_4d.squeeze(0).reshape(seqlen, nheads * d).contiguous()
-                        k2 = k_4d.squeeze(0).reshape(seqlen, nheads * d).contiguous()
-                        positions = torch.arange(seqlen, device="cpu", dtype=torch.long).to(
-                            q2.device, non_blocking=True
-                        )
-                        apply_rope_with_cos_sin_cache_inplace(
-                            positions=positions,
-                            query=q2,
-                            key=k2,
-                            head_size=d,
-                            cos_sin_cache=cache,
-                            is_neox=False,
-                        )
-                        return q2.view(1, seqlen, nheads, d), k2.view(1, seqlen, nheads, d)
-
-                    q_out = torch.empty_like(q_4d)
-                    k_out = torch.empty_like(k_4d)
-                    positions = torch.arange(seqlen, device="cpu", dtype=torch.long).to(
-                        q_4d.device, non_blocking=True
+                q_out = torch.empty_like(q_4d)
+                k_out = torch.empty_like(k_4d)
+                for b in range(bsz):
+                    q2 = q_4d[b].reshape(seqlen, nheads * d).contiguous()
+                    k2 = k_4d[b].reshape(seqlen, nheads * d).contiguous()
+                    apply_rope_with_cos_sin_cache_inplace(
+                        positions=positions,
+                        query=q2,
+                        key=k2,
+                        head_size=d,
+                        cos_sin_cache=cache,
+                        is_neox=False,
                     )
-                    for b in range(bsz):
-                        q2 = q_4d[b].reshape(seqlen, nheads * d).contiguous()
-                        k2 = k_4d[b].reshape(seqlen, nheads * d).contiguous()
-                        apply_rope_with_cos_sin_cache_inplace(
-                            positions=positions,
-                            query=q2,
-                            key=k2,
-                            head_size=d,
-                            cos_sin_cache=cache,
-                            is_neox=False,
-                        )
-                        q_out[b] = q2.view(seqlen, nheads, d)
-                        k_out[b] = k2.view(seqlen, nheads, d)
-                    return q_out, k_out
+                    q_out[b] = q2.view(seqlen, nheads, d)
+                    k_out[b] = k2.view(seqlen, nheads, d)
+                return q_out, k_out
 
-                img_query, img_key = _apply_flashinfer_rope(img_query, img_key, img_cache)
-                txt_query, txt_key = _apply_flashinfer_rope(txt_query, txt_key, txt_cache)
-
-            else:
-                (img_cos, img_sin), (txt_cos, txt_sin) = image_rotary_emb
-                img_query = apply_rotary_embedding(
-                    img_query, img_cos, img_sin, interleaved=True
-                )
-                img_key = apply_rotary_embedding(
-                    img_key, img_cos, img_sin, interleaved=True
-                )
-                txt_query = apply_rotary_embedding(
-                    txt_query, txt_cos, txt_sin, interleaved=True
-                )
-                txt_key = apply_rotary_embedding(
-                    txt_key, txt_cos, txt_sin, interleaved=True
-                )
+            img_query, img_key = _apply_flashinfer_rope(img_query, img_key, img_cache)
+            txt_query, txt_key = _apply_flashinfer_rope(txt_query, txt_key, txt_cache)
 
         # Concatenate for joint attention
         # Order: [text, image]
-        bsz, img_len, nheads, d = img_query.shape
-        txt_len = txt_query.shape[1]
-        joint_len = txt_len + img_len
+        bsz = img_query.shape[0]
+        if bsz == 1:
+            txt_q3 = txt_query.squeeze(0)
+            img_q3 = img_query.squeeze(0)
+            txt_k3 = txt_key.squeeze(0)
+            img_k3 = img_key.squeeze(0)
+            txt_v3 = txt_value.squeeze(0)
+            img_v3 = img_value.squeeze(0)
 
-        joint_query_3d = torch.cat(
-            [
-                txt_query.reshape(bsz, txt_len, nheads * d),
-                img_query.reshape(bsz, img_len, nheads * d),
-            ],
-            dim=1,
-        )
-        joint_key_3d = torch.cat(
-            [
-                txt_key.reshape(bsz, txt_len, nheads * d),
-                img_key.reshape(bsz, img_len, nheads * d),
-            ],
-            dim=1,
-        )
-        joint_value_3d = torch.cat(
-            [
-                txt_value.reshape(bsz, txt_len, nheads * d),
-                img_value.reshape(bsz, img_len, nheads * d),
-            ],
-            dim=1,
-        )
+            if not txt_q3.is_contiguous():
+                txt_q3 = txt_q3.contiguous()
+            if not img_q3.is_contiguous():
+                img_q3 = img_q3.contiguous()
+            if not txt_k3.is_contiguous():
+                txt_k3 = txt_k3.contiguous()
+            if not img_k3.is_contiguous():
+                img_k3 = img_k3.contiguous()
+            if not txt_v3.is_contiguous():
+                txt_v3 = txt_v3.contiguous()
+            if not img_v3.is_contiguous():
+                img_v3 = img_v3.contiguous()
 
-        joint_query = joint_query_3d.view(bsz, joint_len, nheads, d)
-        joint_key = joint_key_3d.view(bsz, joint_len, nheads, d)
-        joint_value = joint_value_3d.view(bsz, joint_len, nheads, d)
+            joint_query = torch.cat([txt_q3, img_q3], dim=0).unsqueeze(0)
+            joint_key = torch.cat([txt_k3, img_k3], dim=0).unsqueeze(0)
+            joint_value = torch.cat([txt_v3, img_v3], dim=0).unsqueeze(0)
+        else:
+            joint_query = torch.cat([txt_query, img_query], dim=1)
+            joint_key = torch.cat([txt_key, img_key], dim=1)
+            joint_value = torch.cat([txt_value, img_value], dim=1)
 
         # Compute joint attention
         joint_hidden_states = self.attn(

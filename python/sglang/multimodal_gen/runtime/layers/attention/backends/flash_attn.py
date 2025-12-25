@@ -7,7 +7,6 @@ from typing import Any
 import torch
 
 from sglang.multimodal_gen.runtime.managers.forward_context import get_forward_context
-from sglang.multimodal_gen.runtime.utils.common import get_bool_env_var
 
 try:
     from sgl_kernel.flash_attn import flash_attn_varlen_func
@@ -20,7 +19,9 @@ except ImportError as e:
 
 
 try:
-    from flash_attn_interface import flash_attn_varlen_func as flash_attn_varlen_func_upstream
+    from flash_attn_interface import (
+        flash_attn_varlen_func as flash_attn_varlen_func_upstream,
+    )
 except Exception:
     flash_attn_varlen_func_upstream = None
 
@@ -130,10 +131,7 @@ class FlashAttentionImpl(AttentionImpl):
         else:
             max_seqlen_q = query.shape[1]
             max_seqlen_k = key.shape[1]
-        use_upstream = (
-            flash_attn_varlen_func_upstream is not None
-            and get_bool_env_var("SGLANG_MM_USE_UPSTREAM_FLASH_ATTN")
-        )
+        use_upstream = flash_attn_varlen_func_upstream is not None
 
         if use_upstream:
             if query.dim() != 4 or key.dim() != 4 or value.dim() != 4:
