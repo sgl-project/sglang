@@ -8,9 +8,7 @@ use tracing::{debug, info};
 
 use crate::{
     config::RouterConfig,
-    core::{
-        ConnectionMode, JobQueue, LoadMonitor, WorkerRegistry, WorkerService, UNKNOWN_MODEL_ID,
-    },
+    core::{JobQueue, LoadMonitor, WorkerRegistry, WorkerService, UNKNOWN_MODEL_ID},
     data_connector::{
         create_storage, ConversationItemStorage, ConversationStorage, ResponseStorage,
     },
@@ -290,8 +288,8 @@ impl AppContextBuilder {
             .with_client(&router_config, request_timeout_secs)?
             .maybe_rate_limiter(&router_config)
             .with_tokenizer_registry(&router_config)?
-            .maybe_reasoning_parser_factory(&router_config)
-            .maybe_tool_parser_factory(&router_config)
+            .with_reasoning_parser_factory()
+            .with_tool_parser_factory()
             .with_worker_registry()
             .with_policy_registry(&router_config)
             .with_storage(&router_config)?
@@ -435,19 +433,17 @@ impl AppContextBuilder {
         Ok(Some(tokenizer))
     }
 
-    /// Create reasoning parser factory for gRPC mode
-    fn maybe_reasoning_parser_factory(mut self, config: &RouterConfig) -> Self {
-        if matches!(config.connection_mode, ConnectionMode::Grpc { .. }) {
-            self.reasoning_parser_factory = Some(ReasoningParserFactory::new());
-        }
+    /// Create reasoning parser factory for gRPC mode or IGW mode
+    fn with_reasoning_parser_factory(mut self) -> Self {
+        // Initialize reasoning parser factory
+        self.reasoning_parser_factory = Some(ReasoningParserFactory::new());
         self
     }
 
-    /// Create tool parser factory for gRPC mode
-    fn maybe_tool_parser_factory(mut self, config: &RouterConfig) -> Self {
-        if matches!(config.connection_mode, ConnectionMode::Grpc { .. }) {
-            self.tool_parser_factory = Some(ToolParserFactory::new());
-        }
+    /// Create tool parser factory for gRPC mode or IGW mode
+    fn with_tool_parser_factory(mut self) -> Self {
+        // Initialize tool parser factory
+        self.tool_parser_factory = Some(ToolParserFactory::new());
         self
     }
 
