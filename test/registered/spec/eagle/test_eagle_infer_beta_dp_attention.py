@@ -5,6 +5,7 @@ import requests
 
 from sglang.srt.environ import envs
 from sglang.srt.utils import kill_process_tree
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST_MLA,
@@ -14,6 +15,9 @@ from sglang.test.test_utils import (
     CustomTestCase,
     popen_launch_server,
 )
+
+# EAGLE with DP attention on B200 (tp=2, dp=2, requires 4 B200 GPUs)
+register_cuda_ci(est_time=300, suite="stage-c-test-large-4-gpu-b200")
 
 
 def test_gsm8k(base_url: str):
