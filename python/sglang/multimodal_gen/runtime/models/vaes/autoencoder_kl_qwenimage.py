@@ -789,7 +789,6 @@ class AutoencoderKLQwenImage(nn.Module):
         self.latents_mean = config.arch_config.latents_mean
         self.config = config.arch_config
 
-        print(f"787 {config.arch_config.input_channels=}")
 
         self.encoder = QwenImageEncoder3d(
             base_dim, z_dim * 2, dim_mult, num_res_blocks, attn_scales, self.temperal_downsample, dropout, input_channels=self.input_channels

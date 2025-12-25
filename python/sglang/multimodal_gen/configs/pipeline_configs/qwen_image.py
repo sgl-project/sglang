@@ -155,6 +155,7 @@ class QwenImagePipelineConfig(ImagePipelineConfig):
     def get_freqs_cis(img_shapes, txt_seq_lens, rotary_emb, device, dtype):
         # img_shapes: for global entire image
         img_freqs, txt_freqs = rotary_emb(img_shapes, txt_seq_lens, device=device)
+
         img_cos, img_sin = (
             img_freqs.real.to(dtype=dtype),
             img_freqs.imag.to(dtype=dtype),
@@ -558,84 +559,3 @@ class QwenImageLayeredPipelineConfig(QwenImageEditPipelineConfig):
         print(f"521 {latents.shape=}", flush=True)
         # latents = latents.reshape(batch_size, channels // (2 * 2), 1, height, width)
         return latents
-
-
-#     image_caption_prompt_cn: str = """<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\n# 图像标注器\n你是一个专业的图像标注器。请基于输入图像，撰写图注:\n1.
-# 使用自然、描述性的语言撰写图注，不要使用结构化形式或富文本形式。\n2. 通过加入以下内容，丰富图注细节：\n - 对象的属性：如数量、颜色、形状、大小、位置、材质、状态、动作等\n -
-# 对象间的视觉关系：如空间关系、功能关系、动作关系、从属关系、比较关系、因果关系等\n - 环境细节：例如天气、光照、颜色、纹理、气氛等\n - 文字内容：识别图像中清晰可见的文字，不做翻译和解释，用引号在图注中强调\n3.
-# 保持真实性与准确性：\n - 不要使用笼统的描述\n -
-# 描述图像中所有可见的信息，但不要加入没有在图像中出现的内容\n<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>assistant\n"""
-
-#     image_caption_prompt_en: str = """<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\n# Image Annotator\nYou are a professional
-# image annotator. Please write an image caption based on the input image:\n1. Write the caption using natural,
-# descriptive language without structured formats or rich text.\n2. Enrich caption details by including: \n - Object
-# attributes, such as quantity, color, shape, size, material, state, position, actions, and so on\n - Vision Relations
-# between objects, such as spatial relations, functional relations, possessive relations, attachment relations, action
-# relations, comparative relations, causal relations, and so on\n - Environmental details, such as weather, lighting,
-# colors, textures, atmosphere, and so on\n - Identify the text clearly visible in the image, without translation or
-# explanation, and highlight it in the caption with quotation marks\n3. Maintain authenticity and accuracy:\n - Avoid
-# generalizations\n - Describe all visible information in the image, while do not add information not explicitly shown in
-# the image\n<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>assistant\n"""
-
-
-#     def get_image_caption(self, prompt_image, use_en_prompt=True, device=None):
-#         image_caption_prompt_en = """
-#         """
-
-
-#         if use_en_prompt:
-#             prompt = self.image_caption_prompt_en
-#         else:
-#             prompt = self.image_caption_prompt_cn
-#         model_inputs = self.vl_processor(
-#             text=prompt,
-#             images=prompt_image,
-#             padding=True,
-#             return_tensors="pt",
-#         ).to(device)
-#         generated_ids = self.text_encoder.generate(**model_inputs, max_new_tokens=512)
-#         generated_ids_trimmed = [
-#             out_ids[len(in_ids) :] for in_ids, out_ids in zip(model_inputs.input_ids, generated_ids)
-#         ]
-#         output_text = self.vl_processor.batch_decode(
-#             generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
-#         )[0]
-#         return output_text.strip()
-
-#     def calculate_condition_image_size(self, image, width, height) -> tuple[int, int]:
-#         calculated_width, calculated_height, _ = calculate_dimensions(
-#             self.resolution * self.resolution, width / height
-#         )
-#         return calculated_width, calculated_height
-
-#     def preprocess_condition_image(
-#         self, image, target_width, target_height, _vae_image_processor
-#     ):
-#         image = self.image_processor.resize(image, target_height, target_width)
-#         image = self.image_processor.preprocess(image, target_height, target_width)
-#         image = image.unsqueeze(2)
-#         # image = image.to(dtype=self.text_encoder.dtype)
-#         return image, (target_width, target_height)
-
-
-#     def prepare_image_processor_kwargs(self, batch, neg=False) -> dict:
-#         prompt = batch.prompt if not neg else batch.negative_prompt
-#         prompt_list = [prompt] if isinstance(prompt, str) else prompt
-#         image_list = batch.condition_image
-
-#         prompt_template_encode = (
-#             "<|im_start|>system\nDescribe the key features of the input image "
-#             "(color, shape, size, texture, objects, background), then explain how "
-#             "the user's text instruction should alter or modify the image. Generate "
-#             "a new image that meets the user's requirements while maintaining "
-#             "consistency with the original input where appropriate.<|im_end|>\n"
-#             "<|im_start|>user\n{}<|im_end|>\n"
-#             "<|im_start|>assistant\n"
-#         )
-#         img_prompt_template = "Picture {}: <|vision_start|><|image_pad|><|vision_end|>"
-#         if isinstance(image_list, list):
-#             base_img_prompt = ""
-#             for i, img in enumerate(image_list):
-#                 base_img_prompt += img_prompt_template.format(i + 1)
-#         txt = [prompt_template_encode.format(base_img_prompt + p) for p in prompt_list]
-#         return dict(text=txt, padding=True)

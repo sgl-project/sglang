@@ -68,9 +68,6 @@ def run_sgl_diffusion_webui(server_args: ServerArgs):
         )
         result = sync_scheduler_client.forward([batch])
         save_file_path = str(os.path.join(batch.output_path, batch.output_file_name))
-        print(f"70 {batch.output_path=}", flush=True)
-        print(f"70 {batch.output_file_name=}", flush=True)
-        print(f"71 {save_file_path=}", flush=True)
         frames = post_process_sample(
             result.output[0],
             batch.data_type,

@@ -543,6 +543,4 @@ the image\n<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>as
         batch.txt_seq_lens = txt_seq_lens
         batch.img_shapes = img_shapes
 
-        print(f"528 {latents.dtype=}", flush=True)
-
         return batch

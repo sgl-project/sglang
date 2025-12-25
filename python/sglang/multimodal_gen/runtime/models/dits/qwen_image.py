@@ -825,16 +825,6 @@ class QwenImageTransformer2DModel(CachableDiT):
         controlnet_block_samples=None,
         return_dict: bool = True,
     ) -> Union[torch.Tensor, Transformer2DModelOutput]:
-        print(f"828 {img_shapes=}", flush=True)
-        print(f"829 {additional_t_cond=}", flush=True)
-        print(f"830 {timestep=}", flush=True)
-        print(f"831 {hidden_states=}", flush=True)
-        print(f"832 {encoder_hidden_states=}", flush=True)
-        print(f"833 {encoder_hidden_states_mask=}", flush=True)
-        print(f"834 {freqs_cis=}", flush=True)
-        print(f"835 {guidance=}", flush=True)
-        print(f"836 {attention_kwargs=}", flush=True)
-        print(f"837 {txt_seq_lens=}", flush=True)
         """
         The [`QwenTransformer2DModel`] forward method.
 
@@ -890,7 +880,6 @@ class QwenImageTransformer2DModel(CachableDiT):
 
         encoder_hidden_states = self.txt_norm(encoder_hidden_states)
         encoder_hidden_states = self.txt_in(encoder_hidden_states)
-        print(f"859 {additional_t_cond=}")
         temb = self.time_text_embed(timestep, hidden_states, additional_t_cond)
 
         image_rotary_emb = freqs_cis

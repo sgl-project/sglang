@@ -613,7 +613,6 @@ class DenoisingStage(PipelineStage):
                 )
             ),
         )
-        print(f"657 {pos_cond_kwargs=}", flush=True)
 
         if batch.do_classifier_free_guidance:
             neg_cond_kwargs = self.prepare_extra_func_kwargs(
@@ -933,8 +932,6 @@ class DenoisingStage(PipelineStage):
         image_kwargs = prepared_vars["image_kwargs"]
         pos_cond_kwargs = prepared_vars["pos_cond_kwargs"]
         neg_cond_kwargs = prepared_vars["neg_cond_kwargs"]
-        print(f"981 {pos_cond_kwargs=}", flush=True)
-        print(f"982 {neg_cond_kwargs=}", flush=True)
         latents = prepared_vars["latents"]
         boundary_timestep = prepared_vars["boundary_timestep"]
         z = prepared_vars["z"]
@@ -953,11 +950,7 @@ class DenoisingStage(PipelineStage):
 
         self.scheduler.set_begin_index(0)
         timesteps_cpu = timesteps.cpu()
-        print(f"1001 {timesteps_cpu=}")
         num_timesteps = timesteps_cpu.shape[0]
-        print(f"1002 {latents.shape=}")
-        # latents = torch.load("/sgl-workspace/latents.pt")
-        # batch.image_latent = torch.load("/sgl-workspace/image_latents.pt")
         with torch.autocast(
             device_type=current_platform.device_type,
             dtype=target_dtype,
@@ -1058,8 +1051,6 @@ class DenoisingStage(PipelineStage):
                 (denoising_end_time - denoising_start_time) / len(timesteps),
             )
 
-        print(f"528 {latents.shape=}", flush=True)
-        print(f"530 {latents.shape=}", flush=True)
 
         self._post_denoising_loop(
             batch=batch,
@@ -1252,7 +1243,6 @@ class DenoisingStage(PipelineStage):
         noise_pred_uncond: torch.Tensor | None = None
         cfg_rank = get_classifier_free_guidance_rank()
         # positive pass
-        # if timestep_index > 1:
         if not (server_args.enable_cfg_parallel and cfg_rank != 0):
             batch.is_cfg_negative = False
             with set_forward_context(
@@ -1334,20 +1324,16 @@ class DenoisingStage(PipelineStage):
         else:
             # Serial CFG: both cond and uncond are available locally
             assert noise_pred_cond is not None and noise_pred_uncond is not None
-            # noise_pred = noise_pred_uncond + current_guidance_scale * (
-            #     noise_pred_cond - noise_pred_uncond
-            # )
+            noise_pred = noise_pred_uncond + current_guidance_scale * (
+                noise_pred_cond - noise_pred_uncond
+            )
 
-            comb_pred = noise_pred_cond + 4.0 * (noise_pred_cond - noise_pred_uncond)
-            cond_norm = torch.norm(noise_pred_cond, dim=-1, keepdim=True)
-            noise_norm = torch.norm(comb_pred, dim=-1, keepdim=True)
-            noise_pred = comb_pred * (cond_norm / noise_norm)
-            # if batch.guidance_rescale > 0.0:
-            #     noise_pred = self.rescale_noise_cfg(
-            #         noise_pred,
-            #         noise_pred_cond,
-            #         guidance_rescale=batch.guidance_rescale,
-            #     )
+            if batch.guidance_rescale > 0.0:
+                noise_pred = self.rescale_noise_cfg(
+                    noise_pred,
+                    noise_pred_cond,
+                    guidance_rescale=batch.guidance_rescale,
+                )
             return noise_pred
 
     def prepare_sta_param(self, batch: Req, server_args: ServerArgs):

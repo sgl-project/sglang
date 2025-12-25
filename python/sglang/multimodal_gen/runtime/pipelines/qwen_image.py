@@ -219,7 +219,6 @@ class QwenImageLayeredPipeline(QwenImageEditPipeline):
     def create_pipeline_stages(self, server_args: ServerArgs):
         """Set up pipeline stages with proper dependency injection."""
 
-        print(f"11111")
         self.add_stage(
             stage_name="QwenImageLayeredBeforeDenoisingStage",
             stage=QwenImageLayeredBeforeDenoisingStage(
