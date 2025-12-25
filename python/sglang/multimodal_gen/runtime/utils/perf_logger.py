@@ -244,6 +244,8 @@ class PerformanceLogger:
     ):
         """logs the stage metrics and total duration for a completed request
         to the performance_log file.
+
+        Note that this accords to the time spent internally in server, postprocess is not included
         """
         formatted_stages = [
             {"name": name, "execution_time_ms": duration_ms}
