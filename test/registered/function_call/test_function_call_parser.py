@@ -2868,6 +2868,61 @@ class TestGlm47MoeDetector(unittest.TestCase):
             if name:  # Check only non-None names
                 self.assertNotEqual(name, "ask")
 
+    def test_no_duplicate_empty_objects_for_no_arg_function_streaming(self):
+        """Test that streaming of no-argument functions doesn't produce duplicate empty objects."""
+        # Add a no-argument function to test with
+        tools_with_no_args = self.tools + [
+            Tool(
+                type="function",
+                function=Function(
+                    name="list_filenames",
+                    description="List filenames",
+                    parameters={
+                        "type": "object",
+                        "properties": {},
+                    },
+                ),
+            ),
+        ]
+
+        # Test the specific scenario that was problematic: streaming no-argument function
+        # This should only send one "{}" for the empty parameters, not two
+        chunks = [
+            "<tool_call>list_",
+            "filenames</tool_call>",
+        ]  # Split to trigger streaming behavior
+
+        all_calls = []
+        for chunk in chunks:
+            result = self.detector.parse_streaming_increment(chunk, tools_with_no_args)
+            all_calls.extend(result.calls)
+
+        # Count how many times "{}" appears as parameters (should be at most 1 for a no-arg function)
+        empty_object_calls = [call for call in all_calls if call.parameters == "{}"]
+
+        # We expect at most one empty object for a no-argument function call
+        self.assertLessEqual(
+            len(empty_object_calls),
+            1,
+            f"Expected at most 1 empty object, but got {len(empty_object_calls)}. "
+            f"Found calls with parameters: {[call.parameters for call in empty_object_calls]}",
+        )
+
+        # Find the function name call
+        function_calls = [call for call in all_calls if call.name == "list_filenames"]
+        self.assertEqual(
+            len(function_calls), 1, "Should have exactly one function name call"
+        )
+
+        # Verify that the complete function call works properly
+        result = self.detector.detect_and_parse(
+            "<tool_call>list_filenames</tool_call>", tools_with_no_args
+        )
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(result.calls[0].name, "list_filenames")
+        params = json.loads(result.calls[0].parameters)
+        self.assertEqual(params, {})
+
 
 class TestJsonArrayParser(unittest.TestCase):
     def setUp(self):

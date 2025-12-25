@@ -152,6 +152,9 @@ class Glm47MoeDetector(BaseFormatDetector):
         self.current_tool_name_sent = False
         self._streamed_raw_length = 0
         self._tool_call_completed = False  # Track if tool call has been completed
+        self._sent_empty_object = (
+            False  # Track if empty object has been sent for no-arg functions
+        )
         self._reset_streaming_state()
 
     def _reset_streaming_state(self) -> None:
@@ -166,6 +169,7 @@ class Glm47MoeDetector(BaseFormatDetector):
             None  # Cache the value type for consistency
         )
         self._tool_call_completed = False  # Reset tool call completion status
+        self._sent_empty_object = False  # Reset empty object sent status
 
     def has_tool_call(self, text: str) -> bool:
         """Check if the text contains a glm-4.5 / glm-4.6 format tool call."""
@@ -579,7 +583,8 @@ class Glm47MoeDetector(BaseFormatDetector):
                         self._streamed_raw_length = current_raw_length
 
                     if is_tool_end == self.eot_token and not self._tool_call_completed:
-                        if self._is_first_param:
+                        # Only send empty object if we haven't sent it yet for no-arg functions
+                        if self._is_first_param and not self._sent_empty_object:
                             empty_object = "{}"
                             calls.append(
                                 ToolCallItem(
@@ -589,7 +594,16 @@ class Glm47MoeDetector(BaseFormatDetector):
                                 )
                             )
                             self._last_arguments += empty_object
-                        elif not self._last_arguments.endswith("}"):
+                            self.streamed_args_for_tool[
+                                self.current_tool_id
+                            ] += empty_object
+                            self._sent_empty_object = (
+                                True  # Mark that we've sent the empty object
+                            )
+                        elif (
+                            not self._last_arguments.endswith("}")
+                            and not self._sent_empty_object
+                        ):
                             closing_brace = "}"
                             calls.append(
                                 ToolCallItem(
@@ -602,6 +616,9 @@ class Glm47MoeDetector(BaseFormatDetector):
                             self.streamed_args_for_tool[
                                 self.current_tool_id
                             ] += closing_brace
+                            self._sent_empty_object = (
+                                True  # Mark that we've sent the closing brace
+                            )
 
                         try:
                             # Only try to parse if func_args_raw is not empty
