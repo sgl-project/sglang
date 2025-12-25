@@ -174,6 +174,8 @@ class FlashAttentionImpl(AttentionImpl):
                     cu,
                     seqlen,
                     seqlen,
+                    softmax_scale=self.softmax_scale,
+                    causal=self.causal,
                 )
                 return out.reshape(bsz, seqlen, nheads_q, d)
 
