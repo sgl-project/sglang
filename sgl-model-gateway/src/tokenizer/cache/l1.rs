@@ -185,23 +185,31 @@ impl L1Cache {
 
         // Calculate how much memory we need and tokenize each prefix
         let mut entries_to_insert = Vec::with_capacity(boundaries.len());
+        let mut hasher = blake3::Hasher::new();
+        let mut accumulated_tokens = Vec::new();
+        let mut last_pos = 0;
+        let bos_id = tokenizer.encode("")?.token_ids().first().copied();
         for &boundary_pos in &boundaries {
-            // Extract prefix up to this special token boundary
-            let prefix = &input[0..boundary_pos];
-            let prefix_bytes = prefix.as_bytes();
-            let hash = blake3::hash(prefix_bytes);
-            let hash_bytes: Blake3Hash = *hash.as_bytes();
+            let segment = &input[last_pos..boundary_pos];
+            // Update hash incrementally (O(segment_len))
+            hasher.update(segment.as_bytes());
+            let hash_bytes: Blake3Hash = *hasher.finalize().as_bytes();
 
-            // Re-tokenize the prefix for guaranteed correctness
-            // This is the only way to know the exact token boundaries
-            let prefix_encoding = tokenizer.encode(prefix)?;
-            // Convert to Arc<[TokenIdType]> for zero-copy sharing
-            let prefix_tokens: Arc<[TokenIdType]> = prefix_encoding.token_ids().into();
+            let segment_encoding = tokenizer.encode(segment)?;
+            let mut segment_ids = segment_encoding.token_ids();
 
-            // Size = text bytes + token storage
+            if last_pos > 0 {
+                if let (Some(bos), Some(&first)) = (bos_id, segment_ids.first()) {
+                    if bos == first {
+                        segment_ids = &segment_ids[1..];
+                    }
+                }
+            }
+            accumulated_tokens.extend_from_slice(segment_ids);
+            let prefix_tokens: Arc<[TokenIdType]> = accumulated_tokens.as_slice().into();
             let size_bytes = boundary_pos + prefix_tokens.len() * size_of::<TokenIdType>();
-
             entries_to_insert.push((hash_bytes, prefix_tokens, size_bytes));
+            last_pos = boundary_pos;
         }
 
         if entries_to_insert.is_empty() {

@@ -1,8 +1,7 @@
 use std::sync::Arc;
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
-use sgl_model_gateway::tokenizer::cache::L1Cache;
-use sgl_model_gateway::tokenizer::mock::MockTokenizer;
+use sgl_model_gateway::tokenizer::{cache::L1Cache, mock::MockTokenizer};
 
 fn bench_l1_insertion_scaling(c: &mut Criterion) {
     let cache = L1Cache::new(100 * 1024 * 1024); // 100MB
