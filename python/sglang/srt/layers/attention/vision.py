@@ -32,7 +32,11 @@ _is_npu = is_npu()
 _is_hip = is_hip()
 
 if _is_cuda:
-    from sgl_kernel.flash_attn import flash_attn_varlen_func
+    try:
+        from sgl_kernel.flash_attn import flash_attn_varlen_func
+    except ImportError:
+        # FA3 not available (e.g., on Blackwell/SM121) - will use triton_attn instead
+        flash_attn_varlen_func = None
 
 if _is_npu:
     import torch_npu
@@ -346,6 +350,8 @@ class VisionFlash3Attention(nn.Module):
     ):
         if not _is_cuda:
             raise Exception("VisionFlash3Attention is only available for cuda")
+        if flash_attn_varlen_func is None:
+            raise Exception("VisionFlash3Attention requires FA3 which is not available on this GPU")
         super().__init__()
         use_data_parallel = (
             kwargs["use_data_parallel"] if "use_data_parallel" in kwargs else False
@@ -655,8 +661,11 @@ class VisionAttention(nn.Module):
                 backend = "triton_attn"
         else:
             backend = "sdpa"
-        if backend == "fa3" and is_blackwell():
-            raise ValueError("The 'fa3' backend is not supported on Blackwell GPUs")
+        if backend == "fa3":
+            if is_blackwell():
+                raise ValueError("The 'fa3' backend is not supported on Blackwell GPUs")
+            if flash_attn_varlen_func is None:
+                raise ValueError("The 'fa3' backend is not available (FA3 not compiled for this GPU)")
 
         return backend
 
