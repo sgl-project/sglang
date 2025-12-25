@@ -539,7 +539,6 @@ class SchedulerMetricsMixin:
             num_reqs=len(self.running_batch.reqs) + num_waiting_reqs,
             num_waiting_reqs=num_waiting_reqs,
             num_tokens=num_tokens,
-            ts_tic=time.perf_counter(),
         )
 
     @contextmanager

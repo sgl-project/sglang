@@ -299,18 +299,6 @@ class SchedulerOutputProcessorMixin:
 
         return predict_tokens
 
-    def process_batch_result_idle(
-        self: Scheduler,
-        batch: ScheduleBatch,
-        result: GenerationBatchResult,
-    ):
-        if result.copy_done is not None:
-            result.copy_done.synchronize()
-
-        self.stream_output_generation(
-            batch.reqs, batch.return_logprob, is_idle_batch=True
-        )
-
     def process_batch_result_dllm(
         self: Scheduler,
         batch: ScheduleBatch,
@@ -802,7 +790,6 @@ class SchedulerOutputProcessorMixin:
         reqs: List[Req],
         return_logprob: bool,
         skip_req: Optional[Req] = None,
-        is_idle_batch: bool = False,
     ):
         rids = []
         http_worker_ipcs = []
@@ -823,7 +810,6 @@ class SchedulerOutputProcessorMixin:
         spec_accepted_tokens = []
         retraction_counts = []
         output_hidden_states = None
-        load = self.get_load()
         output_routed_experts = None
 
         queue_times = []
@@ -1032,7 +1018,7 @@ class SchedulerOutputProcessorMixin:
                 req.log_time_stats()
 
         # Send to detokenizer
-        if reqs or is_idle_batch:
+        if rids:
             if self.model_config.is_multimodal_gen:
                 return
 
@@ -1076,7 +1062,6 @@ class SchedulerOutputProcessorMixin:
                     placeholder_tokens_idx=None,
                     placeholder_tokens_val=None,
                     retraction_counts=retraction_counts,
-                    load=load,
                 )
             )
 

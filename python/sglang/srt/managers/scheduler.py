@@ -2324,7 +2324,9 @@ class Scheduler(
         elif batch.forward_mode.is_prebuilt():
             self.process_batch_result_prebuilt(batch)
         elif batch.forward_mode.is_idle():
-            self.process_batch_result_idle(batch, result)
+            if self.enable_overlap:
+                if result.copy_done is not None:
+                    result.copy_done.synchronize()
 
         self.log_batch_result_stats(batch, result)
         self.maybe_send_health_check_signal()
