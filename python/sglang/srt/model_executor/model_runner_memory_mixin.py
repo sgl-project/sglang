@@ -98,7 +98,7 @@ class ModelRunnerMemoryMixin:
                     (n * k * num_layers * 2 * kv_size) // scale_block_size
                 )
 
-            if self.model_config.hf_config.architectures[0] == "MiMoV2FlashForCausalLM":
+            if "MiMoV2FlashForCausalLM" in self.model_config.hf_config.architectures:
                 cell_size += (
                     self.model_config.get_swa_num_kv_heads(get_attention_tp_size())
                     * (
