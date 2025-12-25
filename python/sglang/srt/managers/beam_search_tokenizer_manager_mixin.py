@@ -15,7 +15,6 @@ from sglang.srt.managers.io_struct import (
     BatchTokenIDOutput,
 )
 from sglang.srt.tracing.trace import trace_req_finish
-from sglang.srt.utils import dataclass_to_string_truncated
 
 logger = logging.getLogger(__name__)
 
@@ -32,10 +31,15 @@ class BeamSearchTokenizerManagerMixin:
         if not state.response_sent_to_client_ts:
             state.response_sent_to_client_ts = time.time()
 
-        if self.log_requests:
-            max_length, skip_names, out_skip_names = self.log_request_metadata
-            msg = f"Finish: obj={dataclass_to_string_truncated(obj, max_length, skip_names=skip_names)}, beam_search=True"
-            logger.info(msg)
+        self.request_logger.log_finished_request(
+            obj, out, is_multimodal_gen=self.model_config.is_multimodal_gen
+        )
+
+        if self.request_metrics_exporter_manager.exporter_enabled():
+            # Asynchronously write metrics for this request using the exporter manager.
+            asyncio.create_task(
+                self.request_metrics_exporter_manager.write_record(obj, out)
+            )
 
         beam_results = out.get("beam_results", [])
         if beam_results:
