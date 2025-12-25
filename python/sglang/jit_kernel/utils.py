@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import functools
 import pathlib
 from functools import lru_cache
 from typing import TYPE_CHECKING, List, Tuple, TypeAlias, Union
@@ -131,3 +132,11 @@ def load_jit(
         extra_include_paths=DEFAULT_INCLUDE + extra_include_paths,
         build_directory=build_directory,
     )
+
+
+@functools.cache
+def is_arch_support_pdl() -> bool:
+    import torch
+
+    device = torch.cuda.current_device()
+    return torch.cuda.get_device_capability(device)[0] >= 9

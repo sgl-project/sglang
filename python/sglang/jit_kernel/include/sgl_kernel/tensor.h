@@ -154,7 +154,7 @@ inline auto& operator<<(std::ostream& os, PrintAbleSpan<T> span) {
 }  // namespace details
 
 template <typename T>
-inline bool holds_dtype(DLDataType dtype) {
+inline bool is_type(DLDataType dtype) {
   return dtype == details::dtype_trait<T>::value;
 }
 
@@ -265,8 +265,8 @@ struct SymbolicDType {
   }
 
   template <typename T>
-  auto holds_value() const -> bool {
-    return holds_dtype<T>(m_value);
+  auto is_type() const -> bool {
+    return ::host::is_type<T>(m_value);
   }
 
  private:

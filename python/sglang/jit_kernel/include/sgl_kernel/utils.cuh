@@ -79,6 +79,24 @@ struct device_vec {
   T data[N];
 };
 
+template <bool kUsePDL>
+__forceinline__ __device__ void PDLWaitPrimary() {
+#ifndef USE_ROCM
+  if constexpr (kUsePDL) {
+    asm volatile("griddepcontrol.wait;");
+  }
+#endif
+}
+
+template <bool kUsePDL>
+__forceinline__ __device__ void PDLTriggerSecondary() {
+#ifndef USE_ROCM
+  if constexpr (kUsePDL) {
+    asm volatile("griddepcontrol.launch_dependents;");
+  }
+#endif
+}
+
 }  // namespace device
 
 namespace host {

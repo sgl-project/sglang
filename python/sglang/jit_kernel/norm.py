@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import functools
+import logging
 from typing import TYPE_CHECKING
 
 import torch
 
-from sglang.jit_kernel.utils import load_jit, make_cpp_args
+from sglang.jit_kernel.utils import is_arch_support_pdl, load_jit, make_cpp_args
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
@@ -13,7 +14,7 @@ if TYPE_CHECKING:
 
 @functools.cache
 def _jit_norm_module(head_dims: int) -> Module:
-    args = make_cpp_args(head_dims)  # pass all the template argument
+    args = make_cpp_args(head_dims, is_arch_support_pdl())
     return load_jit(
         "norm",
         *args,
@@ -22,7 +23,21 @@ def _jit_norm_module(head_dims: int) -> Module:
     )
 
 
-def fused_qknorm(
+@functools.cache
+def can_use_fused_inplace_qknorm(head_dim: int) -> bool:
+    logger = logging.getLogger(__name__)
+    if head_dim not in [64, 128, 256]:
+        logger.warning(f"Unsupported head_dim={head_dim} for JIT QK-Norm kernel")
+        return False
+    try:
+        _jit_norm_module(head_dim)
+        return True
+    except Exception as e:
+        logger.warning(f"Failed to load JIT QK-Norm kernel: {e}")
+        return False
+
+
+def fused_inplace_qknorm(
     q: torch.Tensor,
     k: torch.Tensor,
     q_weight: torch.Tensor,
