@@ -88,6 +88,8 @@ def collect_test_items(files, filter_expr=None):
 
     result = subprocess.run(cmd, capture_output=True, text=True)
 
+    print("Result from run cmd", cmd, "to collect test items", result)
+
     # Parse the output to extract test node IDs
     # pytest -q outputs lines like: test_file.py::TestClass::test_method[param]
     test_items = []
