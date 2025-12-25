@@ -203,6 +203,7 @@ def main():
         sys.exit(0)
 
     print("suite_files_abs", suite_files_abs)
+    logger.info(suite_files_abs)
     # 3. collect all test items and partition by items (not files)
     all_test_items = collect_test_items(suite_files_abs, filter_expr=args.filter)
     logger.info(suite_files_rel)
