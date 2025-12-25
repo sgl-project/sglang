@@ -4,13 +4,15 @@ import logging
 
 from torch import fx as fx
 
+from sglang.srt.compilation.collective_fusion import AllReduceFusionPass
 from sglang.srt.compilation.fix_functionalization import FixFunctionalizationPass
 from sglang.srt.compilation.inductor_pass import (
     CustomGraphPass,
     InductorPass,
-    SGLangInductorPass,
     get_pass_context,
 )
+from sglang.srt.compilation.sglang_config import SGLangConfig, set_current_sglang_config
+from sglang.srt.compilation.sglang_inductor_pass import SGLangInductorPass
 
 logger = logging.getLogger(__name__)
 
@@ -42,11 +44,13 @@ class PostGradPassManager(CustomGraphPass):
         # always run fix_functionalization last
         self.fix_functionalization(graph)
 
-    def configure(
-        self,
-    ):
-        self.pass_config = dict()
-        self.fix_functionalization = FixFunctionalizationPass()
+    def configure(self, config: SGLangConfig):
+        self.pass_config = config.compilation_config.pass_config
+
+        with set_current_sglang_config(config, check_compile=False):
+            if self.pass_config.enable_fi_allreduce_fusion:
+                self.passes += [AllReduceFusionPass(config)]
+            self.fix_functionalization = FixFunctionalizationPass(config)
 
     def add(self, pass_: InductorPass):
         assert isinstance(pass_, InductorPass)

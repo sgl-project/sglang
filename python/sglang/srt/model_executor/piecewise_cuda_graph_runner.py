@@ -33,6 +33,8 @@ from sglang.srt.compilation.piecewise_context_manager import (
     set_forward_context,
     set_pcg_capture_stream,
 )
+from sglang.srt.compilation.sglang_config import SGLangConfig
+from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.custom_op import CustomOp
 from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
@@ -160,6 +162,14 @@ class PiecewiseCudaGraphRunner:
                 "sglang.moe_forward_piecewise_cuda_graph_impl"
             )
 
+        self.model_config = self.model_runner.model_config
+        self.sglang_config = SGLangConfig(
+            model_config=self.model_config,
+            device_config=DeviceConfig(
+                self.model_runner.device, self.model_runner.gpu_id
+            ),
+            compilation_config=self.compile_config,
+        )
         self.quant_config = getattr(self.model_runner.model, "quant_config", None)
 
         # Batch sizes to capture
@@ -223,7 +233,7 @@ class PiecewiseCudaGraphRunner:
                     patched_model,
                     fullgraph=True,
                     dynamic_arg_dims=None,
-                    compile_config=self.compile_config,
+                    sglang_config=self.sglang_config,
                     graph_pool=get_global_graph_memory_pool(),
                 )
 
