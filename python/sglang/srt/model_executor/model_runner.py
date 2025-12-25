@@ -556,12 +556,11 @@ class ModelRunner:
 
             enable_batch_invariant_mode()
 
+        # Deduce KV cache dtype
+        self.configure_kv_cache_dtype()
+
         # Init memory pool and attention backends
-        self.init_memory_pool(
-            min_per_gpu_memory,
-            server_args.max_running_requests,
-            server_args.max_total_tokens,
-        )
+        self.init_memory_pool(min_per_gpu_memory, server_args)
 
         # Init max running requests
         self.max_running_requests = min(
@@ -1787,13 +1786,7 @@ class ModelRunner:
             return False
         return True
 
-    def init_memory_pool(
-        self,
-        total_gpu_memory: int,
-        max_num_reqs: Optional[int] = None,
-        max_total_tokens: Optional[int] = None,
-    ):
-        # Determine the kv cache dtype
+    def configure_kv_cache_dtype(self):
         if self.server_args.kv_cache_dtype == "auto":
             quant_config = getattr(self.model, "quant_config", None)
             kv_cache_quant_algo = getattr(quant_config, "kv_cache_quant_algo", None)
@@ -1835,6 +1828,9 @@ class ModelRunner:
 
         log_info_on_rank0(logger, f"Using KV cache dtype: {self.kv_cache_dtype}")
 
+    def init_memory_pool(self, total_gpu_memory: int, server_args: ServerArgs):
+        max_num_reqs = server_args.max_running_requests
+        max_total_tokens = server_args.max_total_tokens
         self.max_total_num_tokens = self.profile_max_num_token(total_gpu_memory)
 
         if max_num_reqs is None:
