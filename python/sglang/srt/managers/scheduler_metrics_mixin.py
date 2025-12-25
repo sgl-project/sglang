@@ -103,8 +103,11 @@ class SchedulerMetricsMixin:
         self.iter_finish_time = 0
 
         if self.enable_metrics:
-            self.stats.num_max_batchs = server_args.max_running_requests \
-                if server_args.max_running_requests is not None else 0
+            self.stats.num_max_batchs = (
+                self.server_args.max_running_requests
+                if self.server_args.max_running_requests is not None
+                else 0
+            )
             self.stats.max_total_num_tokens = self.max_total_num_tokens
 
     def init_kv_events(self: Scheduler, kv_events_config: Optional[str]):
@@ -273,8 +276,12 @@ class SchedulerMetricsMixin:
         dp_balance = 0.0
         idle_batch_ratio = 1.0
         prefill_chunk_util = 0.0
-        
-        if batch is not None and self.dp_rank == 0 and self.chunked_prefill_size is not None:
+
+        if (
+            batch is not None
+            and self.dp_rank == 0
+            and self.chunked_prefill_size is not None
+        ):
             # Prepare per-DP worker token counts
             tokens_list = batch.dp_global_num_tokens_for_metric
 
