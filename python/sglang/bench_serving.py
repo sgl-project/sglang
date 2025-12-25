@@ -50,6 +50,7 @@ from transformers import (
 )
 
 ASSISTANT_SUFFIX = "Assistant:"
+_ROUTING_KEY_HEADER = "X-SMG-Routing-Key"
 
 TERM_PLOTLIB_AVAILABLE = (importlib.util.find_spec("termplotlib") is not None) and (
     shutil.which("gnuplot") is not None
@@ -236,7 +237,7 @@ async def async_request_openai_completions(
 
         headers = get_auth_headers()
         if request_func_input.routing_key:
-            headers["X-SMG-Routing-Key"] = request_func_input.routing_key
+            headers[_ROUTING_KEY_HEADER] = request_func_input.routing_key
 
         output = RequestFuncOutput.init_new(request_func_input)
 
@@ -375,7 +376,7 @@ async def async_request_openai_chat_completions(
 
         headers = get_auth_headers()
         if request_func_input.routing_key:
-            headers["X-SMG-Routing-Key"] = request_func_input.routing_key
+            headers[_ROUTING_KEY_HEADER] = request_func_input.routing_key
 
         output = RequestFuncOutput.init_new(request_func_input)
 
@@ -581,7 +582,7 @@ async def async_request_sglang_generate(
 
         headers = get_auth_headers()
         if request_func_input.routing_key:
-            headers["X-SMG-Routing-Key"] = request_func_input.routing_key
+            headers[_ROUTING_KEY_HEADER] = request_func_input.routing_key
 
         output = RequestFuncOutput.init_new(request_func_input)
 
