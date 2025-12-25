@@ -416,9 +416,35 @@ class QwenImageCrossAttention(nn.Module):
 
         # Concatenate for joint attention
         # Order: [text, image]
-        joint_query = torch.cat([txt_query, img_query], dim=1)
-        joint_key = torch.cat([txt_key, img_key], dim=1)
-        joint_value = torch.cat([txt_value, img_value], dim=1)
+        bsz, img_len, nheads, d = img_query.shape
+        txt_len = txt_query.shape[1]
+        joint_len = txt_len + img_len
+
+        joint_query_3d = torch.cat(
+            [
+                txt_query.reshape(bsz, txt_len, nheads * d),
+                img_query.reshape(bsz, img_len, nheads * d),
+            ],
+            dim=1,
+        )
+        joint_key_3d = torch.cat(
+            [
+                txt_key.reshape(bsz, txt_len, nheads * d),
+                img_key.reshape(bsz, img_len, nheads * d),
+            ],
+            dim=1,
+        )
+        joint_value_3d = torch.cat(
+            [
+                txt_value.reshape(bsz, txt_len, nheads * d),
+                img_value.reshape(bsz, img_len, nheads * d),
+            ],
+            dim=1,
+        )
+
+        joint_query = joint_query_3d.view(bsz, joint_len, nheads, d)
+        joint_key = joint_key_3d.view(bsz, joint_len, nheads, d)
+        joint_value = joint_value_3d.view(bsz, joint_len, nheads, d)
 
         # Compute joint attention
         joint_hidden_states = self.attn(
