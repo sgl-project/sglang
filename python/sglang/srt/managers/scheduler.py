@@ -66,7 +66,7 @@ from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_r
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.layers.moe import initialize_moe_config
 from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
-from sglang.srt.lora.lora_prefetcher import LoRAPrefetcher
+from sglang.srt.lora.lora_prefetcher import LoRAPrefetcher, LoRAPrefetchStatus
 from sglang.srt.managers.io_struct import (
     AbortReq,
     BaseBatchReq,
@@ -348,7 +348,10 @@ class Scheduler(
         self.init_request_dispatcher()
 
         if self.enable_lora:
-            self.lora_prefetcher = LoRAPrefetcher(self.tp_worker, self.device)
+            self.lora_prefetcher = LoRAPrefetcher(
+                self.tp_worker.model_runner.lora_manager,
+                self.device,
+            )
 
     def init_model_config(self):
         self.model_config = ModelConfig.from_server_args(self.server_args)
@@ -1916,21 +1919,25 @@ class Scheduler(
             self.chunked_req = adder.add_chunked_req(self.chunked_req)
 
         if self.enable_lora:
-            self.lora_prefetcher.prepare_for_prefill(self.running_batch)
+            running_loras = {req.lora_id for req in self.running_batch.reqs}
 
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
-            if self.enable_lora:
-                res = self.lora_prefetcher.check_loaded_and_maybe_prefetch(
-                    req,
-                    self.req_to_token_pool,
-                    self.token_to_kv_pool_allocator,
-                    self.tree_cache,
-                    self.model_config,
-                    self.enable_overlap,
-                    self.spec_algorithm,
+            if (
+                self.enable_lora
+                # Non-LoRA requests should always be scheduled
+                and req.lora_id is not None
+                and req.lora_id not in running_loras
+            ):
+                lora_prefetch_status = self.lora_prefetcher.check_prefetch_status(
+                    req.lora_id
                 )
-                if not res:
+                if lora_prefetch_status == LoRAPrefetchStatus.PREFETCHING:
+                    continue
+                elif lora_prefetch_status == LoRAPrefetchStatus.NOT_PREFETCHED:
+                    res = self.lora_prefetcher.try_start_prefetch(
+                        req.lora_id, running_loras
+                    )
                     continue
 
             running_bs = len(self.running_batch.reqs)
@@ -1960,6 +1967,8 @@ class Scheduler(
                 has_chunked_req=(self.chunked_req is not None),
                 truncation_align_size=self.truncation_align_size,
             )
+
+            running_loras.add(req.lora_id)
 
             if res != AddReqResult.CONTINUE:
                 if res == AddReqResult.NO_TOKEN:
