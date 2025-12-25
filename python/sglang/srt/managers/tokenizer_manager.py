@@ -57,7 +57,6 @@ from sglang.srt.managers.io_struct import (
     EmbeddingReqInput,
     FreezeGCReq,
     GenerateReqInput,
-    GetLoadReqInput,
     HealthCheckOutput,
     LoadLoRAAdapterReqInput,
     OpenSessionReqOutput,
@@ -97,7 +96,6 @@ from sglang.srt.tracing.trace_metric_wrapper import (
 )
 from sglang.srt.utils import (
     configure_gc_warning,
-    dataclass_to_string_truncated,
     freeze_gc,
     get_bool_env_var,
     get_or_create_event_loop,
@@ -110,6 +108,7 @@ from sglang.srt.utils.hf_transformers_utils import (
     get_tokenizer,
     get_tokenizer_from_processor,
 )
+from sglang.srt.utils.request_logger import RequestLogger
 from sglang.srt.utils.watchdog import Watchdog
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 
@@ -181,8 +180,11 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         # Parse args
         self.server_args = server_args
         self.enable_metrics = server_args.enable_metrics
-        self.log_requests = server_args.log_requests
-        self.log_requests_level = server_args.log_requests_level
+        self.request_logger = RequestLogger(
+            log_requests=server_args.log_requests,
+            log_requests_level=server_args.log_requests_level,
+            log_requests_format=server_args.log_requests_format,
+        )
         self.preferred_sampling_params = server_args.preferred_sampling_params
         self.crash_dump_folder = server_args.crash_dump_folder
 
@@ -306,12 +308,11 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         self.dump_requests_folder = ""  # By default do not dump
         self.dump_requests_threshold = 1000
         self.dump_request_list: List[Tuple] = []
-        self.log_request_metadata = self.get_log_request_metadata()
         self.crash_dump_request_list: deque[Tuple] = deque()
         self.crash_dump_performed = False  # Flag to ensure dump is only called once
 
         # Initialize performance metrics loggers with proper skip names
-        _, obj_skip_names, out_skip_names = self.log_request_metadata
+        _, obj_skip_names, out_skip_names = self.request_logger.metadata
         self.request_metrics_exporter_manager = RequestMetricsExporterManager(
             self.server_args, obj_skip_names, out_skip_names
         )
@@ -430,8 +431,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             self._req_trace_metric_ctx_init(obj, created_time, request)
         if self.server_args.tokenizer_worker_num > 1:
             self._attach_multi_http_worker_info(obj)
-        if self.log_requests:
-            self._log_received_request(obj)
+        self.request_logger.log_received_request(obj, self.tokenizer)
 
         async with self.is_pause_cond:
             await self.is_pause_cond.wait_for(lambda: not self.is_pause)
@@ -1059,13 +1059,9 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                     out["meta_info"][
                         "response_sent_to_client_ts"
                     ] = state.response_sent_to_client_ts
-                if self.log_requests:
-                    max_length, skip_names, out_skip_names = self.log_request_metadata
-                    if self.model_config.is_multimodal_gen:
-                        msg = f"Finish: obj={dataclass_to_string_truncated(obj, max_length, skip_names=skip_names)}"
-                    else:
-                        msg = f"Finish: obj={dataclass_to_string_truncated(obj, max_length, skip_names=skip_names)}, out={dataclass_to_string_truncated(out, max_length, skip_names=out_skip_names)}"
-                    logger.info(msg)
+                self.request_logger.log_finished_request(
+                    obj, out, is_multimodal_gen=self.model_config.is_multimodal_gen
+                )
 
                 if self.request_metrics_exporter_manager.exporter_enabled():
                     # Asynchronously write metrics for this request using the exporter manager.
@@ -1330,10 +1326,11 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             return all_success, all_message, all_paused_requests
 
     def configure_logging(self, obj: ConfigureLoggingReq):
-        if obj.log_requests is not None:
-            self.log_requests = obj.log_requests
-        if obj.log_requests_level is not None:
-            self.log_requests_level = obj.log_requests_level
+        self.request_logger.configure(
+            log_requests=obj.log_requests,
+            log_requests_level=obj.log_requests_level,
+            log_requests_format=obj.log_requests_format,
+        )
         if obj.dump_requests_folder is not None:
             self.dump_requests_folder = obj.dump_requests_folder
         if obj.dump_requests_threshold is not None:
@@ -1341,7 +1338,6 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         if obj.crash_dump_folder is not None:
             self.crash_dump_folder = obj.crash_dump_folder
         logging.info(f"Config logging: {obj=}")
-        self.log_request_metadata = self.get_log_request_metadata()
 
     async def freeze_gc(self):
         """Send a freeze_gc message to the scheduler first, then freeze locally."""
@@ -1396,9 +1392,6 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             )
         self.asyncio_tasks.add(
             loop.create_task(print_exception_wrapper(self.sigterm_watchdog))
-        )
-        self.asyncio_tasks.add(
-            loop.create_task(print_exception_wrapper(self.watch_load_thread))
         )
 
     def dump_requests_before_crash(self):
@@ -1632,6 +1625,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                     "output_ids": output_token_ids,
                     "meta_info": meta_info,
                 }
+
             elif isinstance(recv_obj, BatchTokenIDOutput):
                 is_stream = getattr(state.obj, "stream", False)
                 if self.server_args.stream_output and is_stream:
@@ -1686,6 +1680,15 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 self.dump_requests(state, out_dict)
             if self.crash_dump_folder and state.finished and state.obj.log_metrics:
                 self.record_request_for_crash_dump(state, out_dict)
+
+        # When skip_tokenizer_init is enabled, tokensizer_manager receives
+        # BatchTokenIDOutput.
+        if self.server_args.dp_size > 1 and (
+            isinstance(recv_obj, BatchStrOutput)
+            or isinstance(recv_obj, BatchTokenIDOutput)
+        ):
+            load_update_req = WatchLoadUpdateReq(loads=[recv_obj.load])
+            self.send_to_scheduler.send_pyobj(load_update_req)
 
     def add_logprob_to_meta_info(
         self,
@@ -2097,21 +2100,6 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                     logprobs[token_id] = logprob
         return logprobs
 
-    async def watch_load_thread(self):
-        # Only for dp_controller when dp_size > 1
-        if (
-            self.server_args.dp_size == 1
-            or self.server_args.load_balance_method == "round_robin"
-            or self.server_args.load_balance_method == "decode_round_robin"
-        ):
-            return
-
-        while True:
-            await asyncio.sleep(self.server_args.load_watch_interval)
-            loads = await self.get_load_communicator(GetLoadReqInput())
-            load_udpate_req = WatchLoadUpdateReq(loads=loads)
-            self.send_to_scheduler.send_pyobj(load_udpate_req)
-
     async def _resolve_lora_path(self, obj: Union[GenerateReqInput, EmbeddingReqInput]):
         if isinstance(obj.lora_path, str):
             unique_lora_paths = set([obj.lora_path])
@@ -2160,23 +2148,6 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
 
         # Look up the LoRA ID from the registry and start tracking ongoing LoRA requests.
         obj.lora_id = await self.lora_registry.acquire(obj.lora_path)
-
-    def _log_received_request(self, obj: Union[GenerateReqInput, EmbeddingReqInput]):
-        max_length, skip_names, _ = self.log_request_metadata
-        logger.info(
-            f"Receive: obj={dataclass_to_string_truncated(obj, max_length, skip_names=skip_names)}"
-        )
-
-        # FIXME: This is a temporary fix to get the text from the input ids.
-        # We should remove this once we have a proper way.
-        if (
-            self.log_requests_level >= 2
-            and obj.text is None
-            and obj.input_ids is not None
-            and self.tokenizer is not None
-        ):
-            decoded = self.tokenizer.decode(obj.input_ids, skip_special_tokens=False)
-            obj.text = decoded
 
     def _req_trace_metric_ctx_init(
         self,
