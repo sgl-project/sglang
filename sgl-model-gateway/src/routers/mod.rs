@@ -16,7 +16,6 @@ use crate::protocols::{
     completion::CompletionRequest,
     embedding::EmbeddingRequest,
     generate::GenerateRequest,
-    parser::{ParseFunctionCallRequest, SeparateReasoningRequest},
     rerank::RerankRequest,
     responses::{ResponsesGetParams, ResponsesRequest},
 };
@@ -192,16 +191,6 @@ pub trait RouterTrait: Send + Sync + Debug {
         _model_id: Option<&str>,
     ) -> Response {
         (StatusCode::NOT_IMPLEMENTED, "Rerank not implemented").into_response()
-    }
-
-    /// Parse function calls from text
-    async fn parse_function_call(&self, req: &ParseFunctionCallRequest) -> Response {
-        parse::parse_function_call(None, req).await
-    }
-
-    /// Separate reasoning from normal text
-    async fn parse_reasoning(&self, req: &SeparateReasoningRequest) -> Response {
-        parse::parse_reasoning(None, req).await
     }
 
     /// Get router type name
