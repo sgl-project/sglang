@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import base64
 import io
+import os
 import re
 from typing import List, Optional, Tuple
 
@@ -97,6 +98,10 @@ class MMMUVLMEval(Eval):
             subjects.extend(subs)
 
         # Load validation split of each subject
+        # Force redownload in CI to avoid stale cache issues
+        download_mode = (
+            "force_redownload" if os.environ.get("SGLANG_IS_IN_CI") else None
+        )
         datasets = []
         for subj in subjects:
             try:
@@ -104,7 +109,7 @@ class MMMUVLMEval(Eval):
                     "MMMU/MMMU",
                     subj,
                     split="validation",
-                    download_mode="force_redownload",
+                    download_mode=download_mode,
                 )
                 # attach subject info via transform
                 d = d.add_column("__subject__", [subj] * len(d))

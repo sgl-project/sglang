@@ -1114,8 +1114,12 @@ def sample_mmmu_requests(
 
     try:
         print("Attempting to load MMMU Math dataset...")
+        # Force redownload in CI to avoid stale cache issues
+        download_mode = (
+            "force_redownload" if os.environ.get("SGLANG_IS_IN_CI") else None
+        )
         mmmu_dataset = load_dataset(
-            "MMMU/MMMU", "Math", split="test", download_mode="force_redownload"
+            "MMMU/MMMU", "Math", split="test", download_mode=download_mode
         )
         print(
             f"Successfully loaded MMMU Math dataset from HuggingFace with {len(mmmu_dataset)} examples"
