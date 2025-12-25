@@ -364,7 +364,7 @@ class SchedulerMetricsCollector:
             name="sglang:num_max_batchs",
             documentation="The number of max running requests",
             labelnames=labels.keys(),
-            multiprocess_mode="sum",
+            multiprocess_mode="mostrecent",
         )
         self.cache_hit_rate = Gauge(
             name="sglang:cache_hit_rate",
@@ -383,13 +383,13 @@ class SchedulerMetricsCollector:
             name="sglang:cache_hit",
             documentation="The cache hit tokens num",
             labelnames=labels.keys(),
-            multiprocess_mode="sum",
+            multiprocess_mode="mostrecent",
         )
         self.cache_all = Gauge(
             name="sglang:cache_all",
             documentation="The cached tokens num",
             labelnames=labels.keys(),
-            multiprocess_mode="sum",
+            multiprocess_mode="mostrecent",
         )
 
         # Run batch
@@ -397,25 +397,25 @@ class SchedulerMetricsCollector:
             name="sglang:prefill_run_batch_time",
             documentation="The prefill run batch time",
             labelnames=labels.keys(),
-            multiprocess_mode="sum",
+            multiprocess_mode="mostrecent",
         )
         self.generation_time = Gauge(
             name="sglang:generation_time",
             documentation="The generation time",
             labelnames=labels.keys(),
-            multiprocess_mode="sum",
+            multiprocess_mode="mostrecent",
         )
         self.run_batch_time = Gauge(
             name="sglang:run_batch_time",
             documentation="The run batch time",
             labelnames=labels.keys(),
-            multiprocess_mode="sum",
+            multiprocess_mode="mostrecent",
         )
         self.iter_token_process_time = Gauge(
             name="sglang:iter_token_process_time",
             documentation="The time between token",
             labelnames=labels.keys(),
-            multiprocess_mode="sum",
+            multiprocess_mode="mostrecent",
         )
 
         # DP balance
@@ -445,7 +445,7 @@ class SchedulerMetricsCollector:
             name="sglang:all_gather_latency_us",
             documentation="The dp prepare allgather time",
             labelnames=labels.keys(),
-            multiprocess_mode="sum",
+            multiprocess_mode="mostrecent",
         )
 
         # Speculative decoding
