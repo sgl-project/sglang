@@ -454,21 +454,16 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
         request: Optional[fastapi.Request] = None,
+        trace_parent: Optional[str] = None,
     ):
         created_time = obj.received_time if obj.received_time else time.time()
         self.auto_create_handle_loop()
         obj.normalize_batch_and_arguments()
 
         if self.enable_trace:
-            self._trace_request_start(obj, created_time, request)
-        if (
-            self.server_args.language_only
-            and isinstance(obj, GenerateReqInput)
-            and self.server_args.encoder_transfer_backend == "zmq_to_scheduler"
-            and obj.contains_mm_input()
-        ):
-            # For EPD-disaggregation mode
-            self.mm_receiver.send_encode_request(obj)
+            self._trace_request_start(obj, created_time, request, trace_parent)
+        if self.server_args.language_only:
+            self._handle_epd_disaggregation_encode_request(obj)
         if self.server_args.tokenizer_worker_num > 1:
             self._attach_multi_http_worker_info(obj)
 
@@ -2185,6 +2180,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         obj: Union[GenerateReqInput, EmbeddingReqInput],
         created_time: Optional[float] = None,
         request: Optional[fastapi.Request] = None,
+        trace_parent: Optional[str] = None,
     ):
         external_trace_header = None
         if request:
@@ -2192,6 +2188,11 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 trace_set_remote_propagate_context(request.headers["trace_context"])
             else:
                 external_trace_header = extract_trace_headers(request.headers)
+        elif trace_parent:
+            # When the request comes form the rust grpc server there isn't a
+            # real request object but we still need to propagate the traceparent from
+            # the traceparent that is explicitly passed in
+            external_trace_header = {"trace_parent": trace_parent}
 
         if obj.is_single:
             bootstrap_room = (
@@ -2222,6 +2223,17 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 trace_slice_start(
                     "", obj.rid[i], ts=int(created_time * 1e9), anonymous=True
                 )
+
+    def _handle_epd_disaggregation_encode_request(
+        self, obj: Union[GenerateReqInput, EmbeddingReqInput]
+    ):
+        """Handle EPD-disaggregation mode encoding request."""
+        if (
+            isinstance(obj, GenerateReqInput)
+            and self.server_args.encoder_transfer_backend == "zmq_to_scheduler"
+            and obj.contains_mm_input()
+        ):
+            self.mm_receiver.send_encode_request(obj)
 
 
 class ServerStatus(Enum):
