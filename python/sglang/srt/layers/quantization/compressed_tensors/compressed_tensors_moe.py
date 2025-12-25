@@ -24,7 +24,11 @@ from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     WNA16_SUPPORTED_BITS,
 )
-from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz, scaled_fp8_quant
+from sglang.srt.layers.quantization.fp8_kernel import (
+    is_fp8_fnuz,
+    per_token_group_quant_fp8,
+    scaled_fp8_quant,
+)
 from sglang.srt.layers.quantization.fp8_utils import (
     is_blackwell_supported,
     normalize_e4m3fn_to_e4m3fnuz,
@@ -82,6 +86,12 @@ __all__ = [
     "CompressedTensorsW8A8Fp8MoEMethod",
     "CompressedTensorsWNA16MoEMethod",
 ]
+
+
+def swap_w13_to_w31(x: torch.Tensor) -> torch.Tensor:
+    return (
+        x.reshape(-1, 2, x.shape[-2] // 2, x.shape[-1]).flip(dims=[1]).reshape(x.shape)
+    )
 
 
 class CompressedTensorsMoEMethod(FusedMoEMethodBase):
@@ -501,7 +511,6 @@ class CompressedTensorsW4A4Nvfp4MoEMethod(CompressedTensorsMoEMethod):
             local_expert_offset=layer.moe_ep_rank * layer.num_local_experts,
             local_num_experts=layer.num_local_experts,
             routed_scaling_factor=routed_scaling_factor,
-            tile_tokens_dim=None,
             routing_method_type=layer.routing_method_type,
             do_finalize=True,
             tune_max_num_tokens=next_power_of_2(hs_fp4.shape[0]),
@@ -540,6 +549,8 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
                 "For FP8 Fused MoE layer, we require either per tensor or "
                 "channelwise, dynamic per token quantization."
             )
+        
+        self.use_flashinfer_trtllm = get_moe_runner_backend().is_flashinfer_trtllm()
 
     def create_weights(
         self,
@@ -773,6 +784,16 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
                     requires_grad=False,
                 )
                 torch.cuda.empty_cache()
+        
+        if self.weight_quant.strategy == QuantizationStrategy.BLOCK and self.use_flashinfer_trtllm:
+            layer.w13_weight = torch.nn.Parameter(
+                swap_w13_to_w31(layer.w13_weight.data),
+                requires_grad=False,
+            )
+            layer.w13_weight_scale = torch.nn.Parameter(
+                swap_w13_to_w31(layer.w13_weight_scale.data),
+                requires_grad=False,
+            )
 
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
@@ -851,6 +872,75 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
                 a2_scale=layer.w2_input_scale,
             )
             return self.runner.run(dispatch_output, quant_info)
+
+    def apply_with_router_logits(
+        self,
+        layer: torch.nn.Module,
+        dispatch_output: StandardDispatchOutput,
+    ) -> torch.Tensor:
+        assert self.use_flashinfer_trtllm
+        assert (
+            self.block_quant is not None
+        ), "Currently only block quantization is supported for FlashInferFusedMoE"
+
+        x = dispatch_output.hidden_states
+        topk_output = dispatch_output.topk_output
+
+        from flashinfer.fused_moe import trtllm_fp8_block_scale_moe
+
+        from sglang.srt.layers.moe.utils import RoutingMethodType
+
+        router_logits = topk_output.router_logits
+        topk_config = topk_output.topk_config
+
+        a_q, a_sf = per_token_group_quant_fp8(x, self.quant_config.weight_block_size[1])
+        # NOTE: scales of hidden states have to be transposed!
+        a_sf_t = a_sf.t().contiguous()
+
+        correction_bias = (
+            None
+            if topk_config.correction_bias is None
+            else topk_config.correction_bias.to(x.dtype)
+        )
+
+        assert layer.routing_method_type is not None
+
+        # DeepSeekV3 style routing requires float32 router logits
+        if layer.routing_method_type == RoutingMethodType.DeepSeekV3:
+            router_logits = router_logits.to(torch.float32)
+
+        routed_scaling_factor = self.moe_runner_config.routed_scaling_factor
+
+        with use_symmetric_memory(
+            get_tp_group(), disabled=not is_allocation_symmetric()
+        ):
+
+            # FIXME: there is a bug in the trtllm_fp8_block_scale_moe.
+            # It ignored the `output`` argument. https://github.com/flashinfer-ai/flashinfer/blob/da01b1bd8f9f22aec8c0eea189ad54860b034947/flashinfer/fused_moe/core.py#L1323-L1325
+            # so we put the whole function under the ``use_symmetric_memory`` context manager.
+            # If the bug is fixed, we can only put the output tensor allocation under the context manager.
+            return trtllm_fp8_block_scale_moe(
+                routing_logits=router_logits,
+                routing_bias=correction_bias,
+                hidden_states=a_q,
+                hidden_states_scale=a_sf_t,
+                gemm1_weights=layer.w13_weight,
+                gemm1_weights_scale=layer.w13_weight_scale,
+                gemm2_weights=layer.w2_weight,
+                gemm2_weights_scale=layer.w2_weight_scale,
+                num_experts=layer.num_experts,
+                top_k=topk_config.top_k,
+                n_group=None,
+                topk_group=None,
+                intermediate_size=layer.intermediate_size_per_partition,
+                local_expert_offset=layer.moe_ep_rank * layer.num_local_experts,
+                local_num_experts=layer.num_local_experts,
+                routed_scaling_factor=(
+                    routed_scaling_factor if routed_scaling_factor is not None else 1.0
+                ),
+                routing_method_type=layer.routing_method_type,
+                use_shuffled_weight=False,
+            )
 
 
 class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
