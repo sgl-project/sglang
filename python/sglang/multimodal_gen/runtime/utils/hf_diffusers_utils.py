@@ -21,6 +21,7 @@
 import contextlib
 import json
 import os
+import time
 from functools import reduce
 from pathlib import Path
 from typing import Any, Optional, cast
@@ -29,6 +30,13 @@ from diffusers.loaders.lora_base import (
     _best_guess_weight_name,  # watch out for potetential removal from diffusers
 )
 from huggingface_hub import snapshot_download
+from huggingface_hub.errors import (
+    LocalEntryNotFoundError,
+    RepositoryNotFoundError,
+    RevisionNotFoundError,
+)
+from requests.exceptions import ConnectionError as RequestsConnectionError
+from requests.exceptions import RequestException
 from transformers import AutoConfig, PretrainedConfig
 from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_NAMES
 
@@ -387,33 +395,90 @@ def maybe_download_model(
             )
 
     # Otherwise, assume it's a HF Hub model ID and try to download it
+    # First, try to use local cache if available (fast path)
     try:
         logger.info(
-            "Downloading model snapshot from HF Hub for %s...", model_name_or_path
+            "Checking for cached model in HF Hub cache for %s...", model_name_or_path
         )
-        with get_lock(model_name_or_path).acquire(poll_interval=2):
-            local_path = snapshot_download(
-                repo_id=model_name_or_path,
-                ignore_patterns=["*.onnx", "*.msgpack"],
-                local_dir=local_dir,
-            )
-        # Verify downloaded model is complete
-        if not _verify_model_complete(local_path):
-            logger.warning(
-                "Downloaded model at %s is incomplete, retrying with force_download=True",
-                local_path,
+        local_path = snapshot_download(
+            repo_id=model_name_or_path,
+            ignore_patterns=["*.onnx", "*.msgpack"],
+            local_dir=local_dir,
+            local_files_only=True,
+        )
+        if _verify_model_complete(local_path):
+            logger.info("Found complete model in cache at %s", local_path)
+            return str(local_path)
+    except LocalEntryNotFoundError:
+        logger.info("Model not found in cache, will download from HF Hub")
+    except Exception as e:
+        logger.warning(
+            "Unexpected error while checking cache for %s: %s, will attempt download",
+            model_name_or_path,
+            e,
+        )
+
+    # Download with retry mechanism
+    MAX_RETRIES = 3
+    for attempt in range(MAX_RETRIES):
+        try:
+            logger.info(
+                "Downloading model snapshot from HF Hub for %s (attempt %d/%d)...",
+                model_name_or_path,
+                attempt + 1,
+                MAX_RETRIES,
             )
             with get_lock(model_name_or_path).acquire(poll_interval=2):
                 local_path = snapshot_download(
                     repo_id=model_name_or_path,
                     ignore_patterns=["*.onnx", "*.msgpack"],
                     local_dir=local_dir,
-                    force_download=True,
                 )
+            # Verify downloaded model is complete
+            if not _verify_model_complete(local_path):
+                logger.warning(
+                    "Downloaded model at %s is incomplete, retrying with force_download=True",
+                    local_path,
+                )
+                with get_lock(model_name_or_path).acquire(poll_interval=2):
+                    local_path = snapshot_download(
+                        repo_id=model_name_or_path,
+                        ignore_patterns=["*.onnx", "*.msgpack"],
+                        local_dir=local_dir,
+                        force_download=True,
+                    )
 
-        logger.info("Downloaded model to %s", local_path)
-        return str(local_path)
-    except Exception as e:
-        raise ValueError(
-            f"Could not find model at {model_name_or_path} and failed to download from HF Hub: {e}"
-        ) from e
+            logger.info("Downloaded model to %s", local_path)
+            return str(local_path)
+        except (RepositoryNotFoundError, RevisionNotFoundError) as e:
+            # Model doesn't exist - don't retry
+            raise ValueError(
+                f"Model or revision not found at {model_name_or_path}. "
+                f"Please check the model ID or ensure you have access to the repository. Error: {e}"
+            ) from e
+        except (
+            RequestException,
+            RequestsConnectionError,
+            LocalEntryNotFoundError,
+        ) as e:
+            # Network-related errors - retry with exponential backoff
+            if attempt == MAX_RETRIES - 1:
+                raise ValueError(
+                    f"Could not find model at {model_name_or_path} and failed to download from HF Hub "
+                    f"after {MAX_RETRIES} attempts due to network error: {e}"
+                ) from e
+            wait_time = 2**attempt
+            logger.warning(
+                "Download failed (attempt %d/%d) due to network error: %s. "
+                "Retrying in %d seconds...",
+                attempt + 1,
+                MAX_RETRIES,
+                e,
+                wait_time,
+            )
+            time.sleep(wait_time)
+        except Exception as e:
+            # Other unexpected errors - don't retry
+            raise ValueError(
+                f"Could not find model at {model_name_or_path} and failed to download from HF Hub: {e}"
+            ) from e
