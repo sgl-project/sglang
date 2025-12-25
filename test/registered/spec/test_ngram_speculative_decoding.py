@@ -1,11 +1,9 @@
 import unittest
-from types import SimpleNamespace
-
-import requests
 
 from sglang.srt.environ import envs
 from sglang.srt.utils import kill_process_tree
-from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
+from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.kits.gsm8k_accuracy_kit import GSM8KMixin
 from sglang.test.test_utils import (
     DEFAULT_NGRAM_SPECULATIVE_TARGET_MODEL_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -13,6 +11,8 @@ from sglang.test.test_utils import (
     CustomTestCase,
     popen_launch_server,
 )
+
+register_cuda_ci(est_time=117, suite="stage-b-test-small-1-gpu")
 
 GSM_DATASET_PATH = None
 
@@ -31,12 +31,11 @@ DEFAULT_SERVER_ARGS = [
 ]
 
 
-class TestNgramSpeculativeDecodingBase(CustomTestCase):
-
+class TestNgramSpeculativeDecodingBase(GSM8KMixin, CustomTestCase):
     model = DEFAULT_NGRAM_SPECULATIVE_TARGET_MODEL_FOR_TEST
     base_url = DEFAULT_URL_FOR_TEST
-    accuracy_threshold = 0.79  # derived tests need to override this
-    spec_decode_threshold = 1.8  # derived spec decoding tests need to override this
+    gsm8k_accuracy_thres = 0.79  # derived tests need to override this
+    gsm8k_accept_length_thres = 1.8  # derived spec decoding tests need to override this
 
     @classmethod
     def get_server_args(cls):
@@ -60,32 +59,6 @@ class TestNgramSpeculativeDecodingBase(CustomTestCase):
     @classmethod
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
-
-    def test_gsm8k(self):
-        requests.get(self.base_url + "/flush_cache")
-
-        args = SimpleNamespace(
-            num_shots=4,
-            num_questions=100,
-            max_new_tokens=512,
-            parallel=128,
-            host="http://127.0.0.1",
-            port=int(self.base_url.split(":")[-1]),
-            data_path=GSM_DATASET_PATH,
-        )
-        metrics = run_eval_few_shot_gsm8k(args)
-        print(f"{metrics=}")
-
-        # Use the appropriate metric key based on the test class
-        metric_key = "accuracy"
-        self.assertGreater(metrics[metric_key], self.accuracy_threshold)
-
-        server_info = requests.get(self.base_url + "/get_server_info")
-        avg_spec_accept_length = server_info.json()["internal_states"][0][
-            "avg_spec_accept_length"
-        ]
-        print(f"{avg_spec_accept_length=}")
-        self.assertGreater(avg_spec_accept_length, self.spec_decode_threshold)
 
 
 class TestNgramSpeculativeDecodingTriton(TestNgramSpeculativeDecodingBase):
