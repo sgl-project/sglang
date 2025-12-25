@@ -1,6 +1,7 @@
 """
 Multi-modality utils
 """
+
 import copy
 import pickle
 from abc import abstractmethod
