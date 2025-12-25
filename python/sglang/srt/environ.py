@@ -146,6 +146,7 @@ class Envs:
     SGLANG_TEST_MAX_RETRY = EnvInt(None)
 
     # Test & Debug
+    SGLANG_DETECT_SLOW_RANK = EnvBool(False)
     SGLANG_TEST_STUCK_DETOKENIZER = EnvFloat(0)
     SGLANG_TEST_STUCK_DP_CONTROLLER = EnvFloat(0)
     SGLANG_TEST_STUCK_TOKENIZER = EnvFloat(0)

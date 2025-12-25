@@ -372,8 +372,9 @@ class ModelRunner:
 
         self._weight_checker = WeightChecker(model_runner=self)
 
-        if get_bool_env_var("SGLANG_DETECT_SLOW_RANK"):
+        if envs.SGLANG_DETECT_SLOW_RANK.get():
             slow_rank_detector.execute()
+
         # Init mindspore running environment when model impl is "mindspore"
         self.init_mindspore_runner()
 
@@ -1832,6 +1833,7 @@ class ModelRunner:
         max_num_reqs = server_args.max_running_requests
         max_total_tokens = server_args.max_total_tokens
         self.max_total_num_tokens = self.profile_max_num_token(total_gpu_memory)
+        print(f"\x1b[31m{self.max_total_num_tokens=}\x1b[0m")
 
         if max_num_reqs is None:
             max_num_reqs = min(
