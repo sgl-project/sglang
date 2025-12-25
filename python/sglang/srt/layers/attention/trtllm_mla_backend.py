@@ -1071,13 +1071,18 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                     )
 
                     if self.padded_q_buffer is not None:
-                        padded_q = self.padded_q_buffer[:bs, :actual_max_seq_len_q, :, :].to(
-                            dtype=q.dtype
-                        )
+                        padded_q = self.padded_q_buffer[
+                            :bs, :actual_max_seq_len_q, :, :
+                        ].to(dtype=q.dtype)
                         padded_q.zero_()
                     else:
                         padded_q = torch.zeros(
-                            (bs, actual_max_seq_len_q, layer.tp_q_head_num, layer.head_dim),
+                            (
+                                bs,
+                                actual_max_seq_len_q,
+                                layer.tp_q_head_num,
+                                layer.head_dim,
+                            ),
                             dtype=q.dtype,
                             device=q.device,
                         )
