@@ -125,8 +125,8 @@ class HiRadixCache(RadixCache):
         )
         self.load_back_threshold = 10
 
-        self._should_log_load: bool = envs.SGLANG_HICACHE_LOG_LOAD_BANDWIDTH.value
-        self._should_log_write: bool = envs.SGLANG_HICACHE_LOG_WRITE_BANDWIDTH.value
+        self._should_log_load: bool = envs.SGLANG_HICACHE_LOG_LOAD_BANDWIDTH.get()
+        self._should_log_write: bool = envs.SGLANG_HICACHE_LOG_WRITE_BANDWIDTH.get()
 
         self.token_size = self.token_to_kv_pool_host.get_size_per_token()
         super().__init__(params=params)

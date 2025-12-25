@@ -53,7 +53,7 @@ class LayerLoadingEvent:
     def __init__(self, num_layers: int):
         self._num_layers = num_layers
         self.load_events = [device_module.Event() for _ in range(num_layers)]
-        if envs.SGLANG_HICACHE_LOG_LOAD_BANDWIDTH.value:
+        if envs.SGLANG_HICACHE_LOG_LOAD_BANDWIDTH.get():
             self.start_event = device_module.Event(enable_timing=True)
             self.load_events[-1] = device_module.Event(enable_timing=True)
         else:
@@ -457,7 +457,7 @@ class HiCacheController:
         host_indices, device_indices = self.move_indices(op)
         self.write_queue.clear()
 
-        enable_timing = envs.SGLANG_HICACHE_LOG_WRITE_BANDWIDTH.value
+        enable_timing = envs.SGLANG_HICACHE_LOG_WRITE_BANDWIDTH.get()
         start_event = device_module.Event(enable_timing=enable_timing)
         finish_event = device_module.Event(enable_timing=enable_timing)
 
