@@ -1837,12 +1837,6 @@ class ModelRunner:
 
         self.max_total_num_tokens = self.profile_max_num_token(total_gpu_memory)
 
-        if (small_kv_size := envs.SGLANG_CI_SMALL_KV_SIZE.get()) > 0:
-            logger.info(
-                f"Use a small KV cache pool size ({small_kv_size}) for local tests"
-            )
-            self.max_total_num_tokens = small_kv_size
-
         if max_num_reqs is None:
             max_num_reqs = min(
                 max(
@@ -1875,9 +1869,11 @@ class ModelRunner:
             if self.is_draft_worker:
                 self.max_total_num_tokens = self.server_args.draft_runner_cache_size
                 max_num_reqs = self.server_args.max_num_reqs
+                print(f"Draft worker: {self.max_total_num_tokens=}, {max_num_reqs=}")
             else:
                 self.server_args.draft_runner_cache_size = self.max_total_num_tokens
                 self.server_args.max_num_reqs = max_num_reqs
+                print(f"Target worker: {self.max_total_num_tokens=}, {max_num_reqs=}")
 
         if max_total_tokens is not None:
             if max_total_tokens > self.max_total_num_tokens:
