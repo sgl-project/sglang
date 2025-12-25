@@ -68,5 +68,5 @@ pip install ./custom_ops-1.0.$DEVICE_TYPE-cp311-cp311-linux_aarch64.whl
 pwd && ls
 
 ### Install SGLang
-rm -rf python/pyproject.toml && mv python/pyproject_other.toml python/pyproject.toml
-${PIP_INSTALL} -v -e "python[srt_npu]"
+rm -rf python/pyproject.toml && mv python/pyproject_npu.toml python/pyproject.toml
+${PIP_INSTALL} -v -e "python[all_npu]"
