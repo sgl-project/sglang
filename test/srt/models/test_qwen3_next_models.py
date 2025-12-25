@@ -1,13 +1,13 @@
 import unittest
 
 from sglang.test.kits.gsm8k_accuracy_kit import GSM8KMixin
-from sglang.test.kl_test_utils import KLTestMixin
+from sglang.test.mamba_scheduler_strategy_test_utils import MambaSchedulerStrategyMixin
 from sglang.test.server_fixtures.default_fixture import DefaultServerBase
 
 QWEN3_NEXT_MODEL = "Qwen/Qwen3-Next-80B-A3B-Instruct"
 
 
-class TestQwen3Next(GSM8KMixin, KLTestMixin, DefaultServerBase):
+class TestQwen3Next(GSM8KMixin, MambaSchedulerStrategyMixin, DefaultServerBase):
     model = QWEN3_NEXT_MODEL
     gsm8k_accuracy_thres = 0.93
     kl_div_thres = 0.0025
