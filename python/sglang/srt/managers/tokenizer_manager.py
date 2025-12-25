@@ -1515,6 +1515,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                     "Signal SIGTERM received while health check failed. Force exiting."
                 )
                 self.dump_requests_before_crash()
+                self.force_exit_handler()
                 break
 
             elif get_bool_env_var("SGL_FORCE_SHUTDOWN"):
@@ -1522,6 +1523,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 logger.error(
                     "Signal SIGTERM received while force shutdown flag set. Force exiting."
                 )
+                self.force_exit_handler()
                 break
 
             logger.info(
@@ -1535,6 +1537,10 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
 
         kill_process_tree(os.getpid(), include_parent=True)
         sys.exit(0)
+
+    def force_exit_handler(self):
+        """Put some custom force exit logic here."""
+        pass
 
     async def handle_loop(self):
         """The event loop that handles requests"""
