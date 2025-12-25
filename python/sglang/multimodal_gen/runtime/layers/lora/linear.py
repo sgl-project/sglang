@@ -14,6 +14,7 @@ from torch.distributed._composable.fsdp import (
 from torch.distributed.tensor import DTensor
 
 from sglang.multimodal_gen.runtime.distributed import (
+    get_local_torch_device,
     get_tp_rank,
     split_tensor_along_last_dim,
     tensor_model_parallel_all_gather,
@@ -30,7 +31,6 @@ from sglang.multimodal_gen.runtime.layers.linear import (
 from sglang.multimodal_gen.runtime.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
-from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.common import is_npu
 from sglang.multimodal_gen.utils import get_mixed_precision_state
 
@@ -144,7 +144,7 @@ class BaseLayerWithLoRA(nn.Module):
             # Using offload param is on CPU, so current_device is for "CPU -> GPU -> merge -> CPU"
             current_device = self.base_layer.weight.data.device
             data = self.base_layer.weight.data.to(
-                current_platform.get_local_torch_device()
+                get_local_torch_device()
             ).full_tensor()
             lora_delta = self.slice_lora_b_weights(self.lora_B).to(
                 data
@@ -157,9 +157,7 @@ class BaseLayerWithLoRA(nn.Module):
             unsharded_base_layer.weight = nn.Parameter(data.to(current_device))
             if isinstance(getattr(self.base_layer, "bias", None), DTensor):
                 unsharded_base_layer.bias = nn.Parameter(
-                    self.base_layer.bias.to(
-                        current_platform.get_local_torch_device(), non_blocking=True
-                    )
+                    self.base_layer.bias.to(get_local_torch_device(), non_blocking=True)
                     .full_tensor()
                     .to(current_device)
                 )
@@ -177,9 +175,7 @@ class BaseLayerWithLoRA(nn.Module):
             )
         else:
             current_device = self.base_layer.weight.data.device
-            data = self.base_layer.weight.data.to(
-                current_platform.get_local_torch_device()
-            )
+            data = self.base_layer.weight.data.to(get_local_torch_device())
             lora_delta = self.slice_lora_b_weights(
                 self.lora_B.to(data)
             ) @ self.slice_lora_a_weights(self.lora_A.to(data))

@@ -10,6 +10,7 @@ import torch
 import torch.distributed as dist
 from safetensors.torch import load_file
 
+from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.layers.lora.linear import (
     BaseLayerWithLoRA,
     replace_submodule,
@@ -22,7 +23,6 @@ from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import 
 from sglang.multimodal_gen.runtime.pipelines_core.lora_format_adapter import (
     normalize_lora_state_dict,
 )
-from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import maybe_download_lora
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -84,7 +84,7 @@ class LoRAPipeline(ComposedPipelineBase):
         self.lora_nickname = "default"
 
         # Initialize from server_args
-        self.device = current_platform.get_local_torch_device()
+        self.device = get_local_torch_device()
         self.exclude_lora_layers = (
             self.server_args.pipeline_config.dit_config.arch_config.exclude_lora_layers
         )

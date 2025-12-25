@@ -4,6 +4,7 @@ import time
 
 import torch
 
+from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.models.schedulers.scheduling_flow_match_euler_discrete import (
     FlowMatchEulerDiscreteScheduler,
@@ -71,7 +72,7 @@ class DmdDenoisingStage(DenoisingStage):
         timesteps = torch.tensor(
             server_args.pipeline_config.dmd_denoising_steps,
             dtype=torch.long,
-            device=current_platform.get_local_torch_device(),
+            device=get_local_torch_device(),
         )
 
         # prepare image_kwargs
@@ -121,7 +122,7 @@ class DmdDenoisingStage(DenoisingStage):
                     guidance_expand = self.get_or_build_guidance(
                         latent_model_input.shape[0],
                         target_dtype,
-                        current_platform.get_local_torch_device(),
+                        get_local_torch_device(),
                     )
 
                     # Predict noise residual

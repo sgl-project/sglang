@@ -14,6 +14,7 @@ from diffusers.models.autoencoders.vae import DiagonalGaussianDistribution
 from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
     qwen_image_postprocess_text,
 )
+from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.models.vaes.common import ParallelTiledVAE
 from sglang.multimodal_gen.runtime.models.vision_utils import (
@@ -96,7 +97,7 @@ class ImageEncodingStage(PipelineStage):
 
         if batch.condition_image is None:
             return batch
-        cuda_device = current_platform.get_local_torch_device()
+        cuda_device = get_local_torch_device()
         self.move_to_device(cuda_device)
 
         image = batch.condition_image
@@ -129,7 +130,7 @@ class ImageEncodingStage(PipelineStage):
 
             neg_image_inputs = self.image_processor(
                 images=image, return_tensors="pt", **neg_image_processor_kwargs
-            ).to(current_platform.get_local_torch_device())
+            ).to(get_local_torch_device())
 
             with set_forward_context(current_timestep=0, attn_metadata=None):
                 outputs = self.text_encoder(
@@ -208,7 +209,7 @@ class ImageVAEEncodingStage(PipelineStage):
 
         num_frames = batch.num_frames
 
-        self.vae = self.vae.to(current_platform.get_local_torch_device())
+        self.vae = self.vae.to(get_local_torch_device())
 
         images = (
             batch.vae_image if batch.vae_image is not None else batch.condition_image
@@ -220,7 +221,7 @@ class ImageVAEEncodingStage(PipelineStage):
         for image in images:
             image = self.preprocess(
                 image,
-            ).to(current_platform.get_local_torch_device(), dtype=torch.float32)
+            ).to(get_local_torch_device(), dtype=torch.float32)
 
             # (B, C, H, W) -> (B, C, 1, H, W)
             image = image.unsqueeze(2)
@@ -242,7 +243,7 @@ class ImageVAEEncodingStage(PipelineStage):
                     dim=2,
                 )
             video_condition = video_condition.to(
-                device=current_platform.get_local_torch_device(), dtype=torch.float32
+                device=get_local_torch_device(), dtype=torch.float32
             )
 
             # Setup VAE precision

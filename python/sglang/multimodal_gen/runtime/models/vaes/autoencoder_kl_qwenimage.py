@@ -13,7 +13,7 @@ from diffusers.models.autoencoders.vae import (
 from diffusers.models.modeling_outputs import AutoencoderKLOutput
 
 from sglang.multimodal_gen.configs.models.vaes.qwenimage import QwenImageVAEConfig
-from sglang.multimodal_gen.runtime.platforms import current_platform
+from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)  # pylint: disable=invalid-name
@@ -822,7 +822,7 @@ class AutoencoderKLQwenImage(nn.Module):
             if self.encoder is not None
             else 0,
         }
-        cuda_device = current_platform.get_local_torch_device()
+        cuda_device = get_local_torch_device()
         # FIXME: hardcode
         dtype = torch.bfloat16
         latent_channels = config.arch_config.z_dim

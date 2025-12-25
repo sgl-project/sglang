@@ -7,6 +7,7 @@ Encoding stage for diffusion pipelines.
 
 import torch
 
+from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.models.vaes.common import ParallelTiledVAE
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
@@ -67,7 +68,7 @@ class EncodingStage(PipelineStage):
         """
         assert batch.latents is not None and isinstance(batch.latents, torch.Tensor)
 
-        self.vae = self.vae.to(current_platform.get_local_torch_device())
+        self.vae = self.vae.to(get_local_torch_device())
 
         # Setup VAE precision
         vae_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.vae_precision]
@@ -79,7 +80,7 @@ class EncodingStage(PipelineStage):
         latents = (batch.latents * 2.0 - 1.0).clamp(-1, 1)
 
         # Move to appropriate device and dtype
-        latents = latents.to(current_platform.get_local_torch_device())
+        latents = latents.to(get_local_torch_device())
 
         # Encode image to latents
         with torch.autocast(

@@ -2,6 +2,7 @@
 
 import torch  # type: ignore
 
+from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.models.utils import pred_noise_to_pred_video
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
@@ -78,7 +79,7 @@ class CausalDMDDenoisingStage(DenoisingStage):
                 (self.scheduler.timesteps.cpu(), torch.tensor([0], dtype=torch.float32))
             )
             timesteps = scheduler_timesteps[1000 - timesteps]
-        timesteps = timesteps.to(current_platform.get_local_torch_device())
+        timesteps = timesteps.to(get_local_torch_device())
         logger.info("Using timesteps: %s", timesteps)
 
         # Image kwargs (kept empty unless caller provides compatible args)
@@ -270,7 +271,7 @@ class CausalDMDDenoisingStage(DenoisingStage):
                                 patch_size=server_args.pipeline_config.dit_config.patch_size,  # type: ignore
                                 STA_param=batch.STA_param,  # type: ignore
                                 VSA_sparsity=server_args.VSA_sparsity,  # type: ignore
-                                device=current_platform.get_local_torch_device(),  # type: ignore
+                                device=get_local_torch_device(),  # type: ignore
                             )  # type: ignore
                             assert (
                                 attn_metadata is not None

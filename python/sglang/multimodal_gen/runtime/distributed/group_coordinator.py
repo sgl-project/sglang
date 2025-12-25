@@ -43,6 +43,12 @@ TensorMetadata = namedtuple("TensorMetadata", ["device", "dtype", "size"])
 _group_name_counter: dict[str, int] = {}
 
 
+def get_local_torch_device() -> torch.device:
+    """Return the torch device for the current rank."""
+
+    return current_platform.get_local_torch_device()
+
+
 def _get_unique_name(name: str) -> str:
     """Get a unique name for the group.
     Example:
@@ -178,7 +184,7 @@ class GroupCoordinator:
         assert self.device_group is not None
 
         # TODO: fix it for other platforms
-        self.device = current_platform.get_local_torch_device()
+        self.device = get_local_torch_device()
 
         self.use_device_communicator = use_device_communicator
 
