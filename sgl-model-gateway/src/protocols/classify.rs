@@ -30,10 +30,6 @@ pub struct ClassifyRequest {
     /// SGLang extension: request id for tracking
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rid: Option<String>,
-
-    /// Routing ID for manual routing policy
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub routing_id: Option<String>,
 }
 
 impl GenerationRequest for ClassifyRequest {
@@ -57,9 +53,5 @@ impl GenerationRequest for ClassifyRequest {
                 .join(" "),
             _ => String::new(),
         }
-    }
-
-    fn get_routing_id(&self) -> Option<&str> {
-        self.routing_id.as_deref()
     }
 }

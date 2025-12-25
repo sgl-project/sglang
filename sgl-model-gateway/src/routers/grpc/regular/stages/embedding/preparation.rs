@@ -13,6 +13,7 @@ use crate::{
             context::{PreparationOutput, RequestContext, RequestType},
             utils,
         },
+        header_utils,
     },
 };
 
@@ -47,9 +48,9 @@ impl PipelineStage for EmbeddingPreparationStage {
             ));
         };
 
-        // Extract text and routing_id from request before borrowing ctx mutably
+        // Extract text from request before borrowing ctx mutably
         let text = request.extract_text_for_routing();
-        let routing_id = request.routing_id.clone();
+        let routing_id = header_utils::extract_routing_id(ctx.input.headers.as_ref());
         if text.is_empty() {
             return Err(error::bad_request(
                 "empty_input",
