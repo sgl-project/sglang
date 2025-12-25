@@ -2,6 +2,9 @@
 
 // ref: https://forums.developer.nvidia.com/t/c-20s-source-location-compilation-error-when-using-nvcc-12-1/258026/3
 #ifdef __CUDACC__
+#include <cuda.h>
+#if CUDA_VERSION <= 12010
+
 #pragma push_macro("__cpp_consteval")
 #pragma push_macro("_NODISCARD")
 #pragma push_macro("__builtin_LINE")
@@ -23,7 +26,10 @@
 #undef consteval
 #pragma pop_macro("__cpp_consteval")
 #pragma pop_macro("_NODISCARD")
-#else
+#else  // __CUDACC__ && CUDA_VERSION > 12010
+#include <source_location>
+#endif
+#else  // no __CUDACC__
 #include <source_location>
 #endif
 
@@ -33,7 +39,6 @@
 #include <cstddef>
 #include <ostream>
 #include <ranges>
-#include <source_location>
 #include <sstream>
 #include <utility>
 
