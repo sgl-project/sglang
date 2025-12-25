@@ -217,7 +217,9 @@ def maybe_download_lora(
         Local path to the model
     """
 
-    local_path = maybe_download_model(model_name_or_path, local_dir, download)
+    local_path = maybe_download_model(
+        model_name_or_path, local_dir, download, is_lora=True
+    )
     # return directly if local_path is a file
     if os.path.isfile(local_path):
         return local_path
@@ -357,7 +359,10 @@ def maybe_download_model_index(model_name_or_path: str) -> dict[str, Any]:
 
 
 def maybe_download_model(
-    model_name_or_path: str, local_dir: str | None = None, download: bool = True
+    model_name_or_path: str,
+    local_dir: str | None = None,
+    download: bool = True,
+    is_lora: bool = False,
 ) -> str:
     """
     Check if the model path is a Hugging Face Hub model ID and download it if needed.
@@ -366,14 +371,34 @@ def maybe_download_model(
         model_name_or_path: Local path or Hugging Face Hub model ID
         local_dir: Local directory to save the model
         download: Whether to download the model from Hugging Face Hub
+        is_lora: If True, skip model completeness verification (LoRA models don't have transformer/vae directories)
 
     Returns:
         Local path to the model
     """
 
-    # 1. Local path check: if path exists locally, trust and return it
+    def _verify_model_complete(path: str) -> bool:
+        """Check if model directory has required subdirectories."""
+        transformer_dir = os.path.join(path, "transformer")
+        vae_dir = os.path.join(path, "vae")
+        config_path = os.path.join(path, "model_index.json")
+        return (
+            os.path.exists(config_path)
+            and os.path.exists(transformer_dir)
+            and os.path.exists(vae_dir)
+        )
+
+    # 1. Local path check: if path exists locally, verify it's complete (skip for LoRA)
     if os.path.exists(model_name_or_path):
-        return model_name_or_path
+        if is_lora or _verify_model_complete(model_name_or_path):
+            logger.info("Model already exists locally and is complete")
+            return model_name_or_path
+        else:
+            logger.warning(
+                "Local model at %s appears incomplete (missing transformer/ or vae/), "
+                "will attempt re-download",
+                model_name_or_path,
+            )
 
     # 2. Cache-first strategy (Fast Path)
     # Try to read from HF cache without network access
@@ -387,8 +412,9 @@ def maybe_download_model(
             local_dir=local_dir,
             local_files_only=True,
         )
-        logger.info("Found model in cache at %s", local_path)
-        return str(local_path)
+        if is_lora or _verify_model_complete(local_path):
+            logger.info("Found complete model in cache at %s", local_path)
+            return str(local_path)
     except LocalEntryNotFoundError:
         if not download:
             raise ValueError(
@@ -405,6 +431,7 @@ def maybe_download_model(
             raise ValueError(
                 f"Error checking cache for {model_name_or_path} and download=False: {e}"
             ) from e
+
     # 3. Download strategy (with retry mechanism)
     MAX_RETRIES = 3
     for attempt in range(MAX_RETRIES):
@@ -421,6 +448,25 @@ def maybe_download_model(
                     ignore_patterns=["*.onnx", "*.msgpack"],
                     local_dir=local_dir,
                 )
+
+            # Verify downloaded model is complete (skip for LoRA)
+            if not is_lora and not _verify_model_complete(local_path):
+                logger.warning(
+                    "Downloaded model at %s is incomplete, retrying with force_download=True",
+                    local_path,
+                )
+                with get_lock(model_name_or_path).acquire(poll_interval=2):
+                    local_path = snapshot_download(
+                        repo_id=model_name_or_path,
+                        ignore_patterns=["*.onnx", "*.msgpack"],
+                        local_dir=local_dir,
+                        force_download=True,
+                    )
+                if not _verify_model_complete(local_path):
+                    raise ValueError(
+                        f"Downloaded model at {local_path} is still incomplete after forced re-download. "
+                        "The model repository may be missing required components (model_index.json, transformer/, or vae/)."
+                    )
 
             logger.info("Downloaded model to %s", local_path)
             return str(local_path)
