@@ -102,7 +102,7 @@ def _video_job_from_sampling(
     size_str = f"{sampling.width}x{sampling.height}"
     seconds = int(round((sampling.num_frames or 0) / float(sampling.fps or 24)))
     return {
-        "id": request_id,
+        "rid": request_id,
         "object": "video",
         "model": req.model or "sora-2",
         "status": "queued",
@@ -137,6 +137,7 @@ async def _dispatch_job_async(job_id: str, batch: Req) -> None:
 
 
 # TODO: support image to video generation
+# TODO: this is currently not used
 @router.post("", response_model=VideoResponse)
 async def create_video(
     request: Request,
