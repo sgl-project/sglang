@@ -11,9 +11,8 @@ class EnvField:
 
     def __init__(self, default: Any):
         self.default = default
-        # NOTE: we use None to indicate whether the value is set or not
-        # If the value is manually set to None, we need mark it as _set_to_none.
-        # Always use clear() to reset the value, which leads to the default fallback.
+        # NOTE: environ can only accept str values, so we need a flag to indicate
+        # whether the env var is explicitly set to None.
         self._set_to_none = False
 
     def __set_name__(self, owner, name):
@@ -25,10 +24,13 @@ class EnvField:
 
     def get(self) -> Any:
         value = os.getenv(self.name)
+
+        # Explicitly set to None
         if self._set_to_none:
-            assert value is None
+            assert value == str(None)
             return None
 
+        # Not set, return default
         if value is None:
             return self.default
 
@@ -41,20 +43,11 @@ class EnvField:
             return self.default
 
     def is_set(self):
-        # NOTE: If None is manually set, it is considered as set.
-        return self.name in os.environ or self._set_to_none
-
-    def get_set_value_or(self, or_value: Any):
-        # NOTE: Ugly usage, but only way to get custom default value.
-        return self.get() if self.is_set() else or_value
+        return self.name in os.environ
 
     def set(self, value: Any):
-        if value is None:
-            self._set_to_none = True
-            os.environ.pop(self.name, None)
-        else:
-            self._set_to_none = False
-            os.environ[self.name] = str(value)
+        self._set_to_none = value is None
+        os.environ[self.name] = str(value)
 
     @contextmanager
     def override(self, value: Any):
@@ -147,9 +140,12 @@ class Envs:
     SGLANG_LOG_MS = EnvBool(False)
     SGLANG_DISABLE_REQUEST_LOGGING = EnvBool(False)
 
-    # Test & Debug
+    # SGLang CI
     SGLANG_IS_IN_CI = EnvBool(False)
     SGLANG_IS_IN_CI_AMD = EnvBool(False)
+    SGLANG_TEST_MAX_RETRY = EnvInt(None)
+
+    # Test & Debug
     SGLANG_TEST_STUCK_DETOKENIZER = EnvFloat(0)
     SGLANG_TEST_STUCK_DP_CONTROLLER = EnvFloat(0)
     SGLANG_TEST_STUCK_TOKENIZER = EnvFloat(0)
@@ -201,6 +197,7 @@ class Envs:
     SGLANG_DYNAMIC_CHUNKING_SMOOTH_FACTOR = EnvFloat(0.75)
     SGLANG_SCHEDULER_SKIP_ALL_GATHER = EnvBool(False)
     SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE = EnvBool(False)
+    SGLANG_DATA_PARALLEL_BUDGET_INTERVAL = EnvInt(1)
 
     # Test: pd-disaggregation
     SGLANG_TEST_PD_DISAGG_BACKEND = EnvStr("mooncake")
@@ -288,6 +285,7 @@ class Envs:
     SGLANG_DG_CACHE_DIR = EnvStr(os.path.expanduser("~/.cache/deep_gemm"))
     SGLANG_DG_USE_NVRTC = EnvBool(False)
     SGLANG_USE_DEEPGEMM_BMM = EnvBool(False)
+    SGLANG_CHUNKED_PREFIX_CACHE_THRESHOLD = EnvInt(8192)
 
     # DeepEP
     SGLANG_DEEPEP_BF16_DISPATCH = EnvBool(False)
@@ -350,6 +348,9 @@ class Envs:
     SGLANG_MM_FEATURE_CACHE_MB = EnvInt(4 * 1024)
     SGLANG_MM_ITEM_MEM_POOL_RECYCLE_INTERVAL_SEC = EnvFloat(0.05)
 
+    # MM splitting behavior control
+    SGLANG_ENABLE_MM_SPLITTING = EnvBool(False)
+
     # Release & Resume Memory
     SGLANG_MEMORY_SAVER_CUDA_GRAPH = EnvBool(False)
 
@@ -382,6 +383,7 @@ class Envs:
 
     # Metrics
     SGLANG_ENABLE_METRICS_DEVICE_TIMER = EnvBool(False)
+    SGLANG_ENABLE_METRICS_DP_ATTENTION = EnvBool(False)
 
     # fmt: on
 
