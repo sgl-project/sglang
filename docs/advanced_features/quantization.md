@@ -353,6 +353,8 @@ python3 -m sglang.launch_server \
 
 Our team is working on supporting more online quantization methods. SGLang will soon support methods including but not limited to `["awq", "gptq", "marlin", "gptq_marlin", "awq_marlin", "bitsandbytes", "gguf"]`.
 
+### torchao online quantization method
+
 SGLang also supports quantization methods based on [torchao](https://github.com/pytorch/ao). You can simply specify `--torchao-config` in the command line to support this feature. For example, if you want to enable `int4wo-128` for model `meta-llama/Meta-Llama-3.1-8B-Instruct`, you can launch the server with the following command:
 
 ```bash
@@ -373,6 +375,12 @@ python3 -m sglang.launch_server \
     --disable-cuda-graph \
     --port 30000 --host 0.0.0.0
 ```
+
+### `quark_int4fp8_moe` online quantization method
+
+SGLang running on AMD GPUs (CDNA3 or CDNA4 architecture) supports the quantization method `--quantization quark_int4fp8_moe`, that will replace [MoE layers](https://github.com/sgl-project/sglang/blob/v0.4.8/python/sglang/srt/layers/moe/fused_moe_triton/layer.py#L271) originally in high precision (bfloat16, float16 or float32) to use weights dynamically quantized to int4, that are upcasted to float8 during inference to run compute in float8 precision with activations dynamically quantized on the fly to float8.
+
+Other layers (e.g. projections in the attention layers) have their weights quantized online to float8 directly.
 
 ## Reference
 
