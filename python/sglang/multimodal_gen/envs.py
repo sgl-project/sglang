@@ -169,35 +169,12 @@ def _lazy_int(key: str, default: str | int | None = None) -> Callable[[], int | 
     return _getter
 
 
-def _lazy_int_with_keys(keys: list[str], default: str | int | None = None) -> Callable[[], int | None]:
-    for key in keys:
-        val = _lazy_int(key, default)
-        if val:
-            return val
-    return None
-
-def _lazy_float_with_keys(keys: list[str], default: str | float | None = None) -> Callable[[], float | None]:
-    for key in keys:
-        val = _lazy_float(key, default)
-        if val:
-            return val
-    return None
-
-
 def _lazy_float(key: str, default: str | float) -> Callable[[], float]:
     return lambda: float(os.getenv(key, str(default)))
 
 
 def _lazy_bool(key: str, default: str = "false") -> Callable[[], bool]:
     return lambda: get_bool_env_var(key, default)
-
-def _lazy_bool_with_keys(keys: list[str], default: str | bool | None = None) -> Callable[[], bool | None]:
-    for key in keys:
-        val = _lazy_bool(key, default)
-        if val:
-            return val
-    return None
-
 
 
 def _lazy_path(key: str, default_func: Callable[[], str]) -> Callable[[], str]:
@@ -227,7 +204,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "SGLANG_DIFFUSION_USE_PRECOMPILED": lambda: bool(
         os.environ.get("SGLANG_DIFFUSION_USE_PRECOMPILED")
     )
-                                                or bool(os.environ.get("SGLANG_DIFFUSION_PRECOMPILED_WHEEL_LOCATION")),
+    or bool(os.environ.get("SGLANG_DIFFUSION_PRECOMPILED_WHEEL_LOCATION")),
     # CMake build type
     # If not set, defaults to "Debug" or "RelWithDebInfo"
     # Available options: "Debug", "Release", "RelWithDebInfo"
@@ -352,46 +329,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "SGLANG_CACHE_DIT_SCM_CACHE_BINS": _lazy_str("SGLANG_CACHE_DIT_SCM_CACHE_BINS"),
     # SCM policy: dynamic or static
     "SGLANG_CACHE_DIT_SCM_POLICY": _lazy_str("SGLANG_CACHE_DIT_SCM_POLICY", "dynamic"),
-
-    # ================== cache-dit Secondary Transformer Env Vars ==================
-    # For dual-transformer models like Wan2.2 (high-noise + low-noise experts)
-    # These parameters configure the secondary transformer (transformer_2)
-    # If not set, they inherit from the primary transformer settings
-    # Number of first blocks to always compute for secondary transformer
-    "SGLANG_CACHE_DIT_SECONDARY_FN": _lazy_int_with_keys(
-        ["SGLANG_CACHE_DIT_SECONDARY_FN", "SGLANG_CACHE_DIT_FN"], 1
-    ),
-    # Number of last blocks to always compute for secondary transformer
-    "SGLANG_CACHE_DIT_SECONDARY_BN": _lazy_int_with_keys(
-        ["SGLANG_CACHE_DIT_SECONDARY_BN", "SGLANG_CACHE_DIT_BN"], 0
-    ),
-    # Warmup steps before caching for secondary transformer
-    "SGLANG_CACHE_DIT_SECONDARY_WARMUP": _lazy_int_with_keys(
-       [ "SGLANG_CACHE_DIT_SECONDARY_WARMUP", "SGLANG_CACHE_DIT_WARMUP"], 4
-    ),
-    # Residual difference threshold for secondary transformer
-    "SGLANG_CACHE_DIT_SECONDARY_RDT": _lazy_float_with_keys(
-        ["SGLANG_CACHE_DIT_SECONDARY_RDT", "SGLANG_CACHE_DIT_RDT"], 0.24
-    ),
-    # Maximum continuous cached steps for secondary transformer
-    "SGLANG_CACHE_DIT_SECONDARY_MC": _lazy_int_with_keys(
-        ["SGLANG_CACHE_DIT_SECONDARY_MC", "SGLANG_CACHE_DIT_MC"], 3
-    ),
-    # Enable TaylorSeer for secondary transformer
-    "SGLANG_CACHE_DIT_SECONDARY_TAYLORSEER": _lazy_bool_with_keys(
-        ["SGLANG_CACHE_DIT_SECONDARY_TAYLORSEER", "SGLANG_CACHE_DIT_TAYLORSEER"],false
-    ),
-    # TaylorSeer order for secondary transformer
-    "SGLANG_CACHE_DIT_SECONDARY_TS_ORDER": _lazy_int_with_keys(
-        ["SGLANG_CACHE_DIT_SECONDARY_TS_ORDER", "SGLANG_CACHE_DIT_TS_ORDER"], 1
-    ),
     # model loading
     "SGLANG_USE_RUNAI_MODEL_STREAMER": _lazy_bool(
-        "SGLANG_USE_RUNAI_MODEL_STREAMER", "dynamic"
+        "SGLANG_USE_RUNAI_MODEL_STREAMER", "true"
     ),
 }
 
-# Add cache-dit Secondary Transformer Env Vars via programmatic generation to reduce duplication
+# add cache-dit secondary transformer env vars via programmatic generation to reduce duplication
 _CACHE_DIT_SECONDARY_CONFIGS = [
     ("FN", int, "1"),
     ("BN", int, "0"),
@@ -445,3 +389,4 @@ def __getattr__(name: str):
 
 def __dir__():
     return list(environment_variables.keys())
+
