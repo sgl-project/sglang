@@ -1554,6 +1554,8 @@ class Scheduler(
                 if self.grammar_backend is None:
                     error_msg = "Grammar-based generation (json_schema, regex, ebnf, structural_tag) is not supported when the server is launched with --grammar-backend none"
                     req.set_finish_with_abort(error_msg)
+                    if self.tp_size > 1:
+                        add_to_grammar_queue = True
                 else:
                     if req.sampling_params.json_schema is not None:
                         key = ("json", req.sampling_params.json_schema)
@@ -2358,21 +2360,25 @@ class Scheduler(
 
         num_ready_reqs = 0
         num_timeout_reqs = 0
+
+        if self.server_args.enable_dp_attention:
+            tp_size = self.attn_tp_size
+        else:
+            tp_size = self.tp_size
+
         for req in self.grammar_queue:
             try:
                 if req.finished():  # It is aborted by AbortReq
                     num_ready_reqs += 1
                     continue
 
-                # On non-rank-0, req.grammar is None
-                if req.grammar is None:
-                    num_ready_reqs += 1
-                    continue
-
-                # On rank 0 with cache hit, req.grammar is already compiled
-                if not isinstance(req.grammar, futures.Future):
-                    num_ready_reqs += 1
-                    continue
+                if tp_size > 1:
+                    if req.grammar is None:
+                        num_ready_reqs += 1
+                        continue
+                    if not isinstance(req.grammar, futures.Future):
+                        num_ready_reqs += 1
+                        continue
 
                 req.grammar = req.grammar.result(timeout=0.03)
                 self.grammar_backend.set_cache(req.grammar_key, req.grammar.copy())
@@ -2397,42 +2403,45 @@ class Scheduler(
             tp_group = self.tp_cpu_group
 
         if tp_size > 1:
-            # Sync across TP ranks to make sure they have the same number of ready requests
+            # Rank 0 broadcasts to other ranks.
             tensor = torch.tensor([num_ready_reqs, num_timeout_reqs], dtype=torch.int32)
-            torch.distributed.all_reduce(
-                tensor, op=torch.distributed.ReduceOp.MAX, group=tp_group
-            )
+
+            if self.server_args.enable_dp_attention:
+                root_rank = self.attn_tp_group.ranks[0]
+            else:
+                root_rank = self.tp_group.ranks[0]
+
+            torch.distributed.broadcast(tensor, src=root_rank, group=tp_group)
             num_ready_reqs_max, num_timeout_reqs_max = tensor.tolist()
 
-            for i in range(num_ready_reqs, num_ready_reqs_max):
-                req = self.grammar_queue[i]
-                if req.finished():  # It is aborted by AbortReq
-                    continue
-                # On non-rank-0, req.grammar is None
-                if req.grammar is None:
-                    continue
-                # On rank 0 with cache hit, req.grammar is already compiled
-                if not isinstance(req.grammar, futures.Future):
-                    continue
-                req.grammar = req.grammar.result()
-                self.grammar_backend.set_cache(req.grammar_key, req.grammar.copy())
-                if req.grammar is INVALID_GRAMMAR_OBJ:
-                    error_msg = f"Invalid grammar request: {req.grammar_key=}"
-                    req.set_finish_with_abort(error_msg)
+            # Only rank 0 needs to finish compiling remaining grammars
+            if self.tp_rank == 0:
+                for i in range(num_ready_reqs, num_ready_reqs_max):
+                    req = self.grammar_queue[i]
+                    if req.finished():
+                        continue
+                    # On cache hit, req.grammar is already compiled.
+                    if not isinstance(req.grammar, futures.Future):
+                        continue
+                    req.grammar = req.grammar.result()
+                    self.grammar_backend.set_cache(req.grammar_key, req.grammar.copy())
+                    if req.grammar is INVALID_GRAMMAR_OBJ:
+                        error_msg = f"Invalid grammar request: {req.grammar_key=}"
+                        req.set_finish_with_abort(error_msg)
         else:
             num_ready_reqs_max = num_ready_reqs
             num_timeout_reqs_max = num_timeout_reqs
 
-        for i in range(num_ready_reqs, num_ready_reqs + num_timeout_reqs_max):
-            req = self.grammar_queue[i]
-            # On non-rank-0, req.grammar is None, skip timeout handling
-            # Or if we have a cache hit, the grammar is already compiled.
-            if req.grammar is None or not isinstance(req.grammar, futures.Future):
-                continue
-            req.grammar.cancel()
-            self.grammar_backend.set_cache(req.grammar_key, INVALID_GRAMMAR_OBJ)
-            error_msg = f"Grammar preprocessing timed out for {req.grammar_key=}"
-            req.set_finish_with_abort(error_msg)
+        # Only rank 0 handles timeouts.
+        if self.tp_rank == 0:
+            for i in range(num_ready_reqs, num_ready_reqs + num_timeout_reqs_max):
+                req = self.grammar_queue[i]
+                if not isinstance(req.grammar, futures.Future):
+                    continue
+                req.grammar.cancel()
+                self.grammar_backend.set_cache(req.grammar_key, INVALID_GRAMMAR_OBJ)
+                error_msg = f"Grammar preprocessing timed out for {req.grammar_key=}"
+                req.set_finish_with_abort(error_msg)
 
         num_ready_reqs = num_ready_reqs_max + num_timeout_reqs_max
 
