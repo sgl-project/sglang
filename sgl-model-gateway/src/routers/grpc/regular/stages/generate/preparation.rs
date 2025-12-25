@@ -68,6 +68,7 @@ impl GeneratePreparationStage {
 
         ctx.state.preparation = Some(PreparationOutput {
             original_text,
+            routing_id: request.routing_id.clone(),
             token_ids,
             processed_messages: None,
             tool_constraints: None,
