@@ -14,6 +14,7 @@
 """Utilities for Huggingface Transformers."""
 
 import contextlib
+import glob
 import json
 import logging
 import os
@@ -22,6 +23,7 @@ import warnings
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Type, Union
 
+import huggingface_hub
 import torch
 from huggingface_hub import snapshot_download
 
@@ -67,7 +69,14 @@ from sglang.srt.configs.deepseek_ocr import DeepseekVLV2Config
 from sglang.srt.configs.internvl import InternVLChatConfig
 from sglang.srt.connector import create_remote_connector
 from sglang.srt.multimodal.customized_mm_processor_utils import _CUSTOMIZED_MM_PROCESSOR
-from sglang.srt.utils import is_remote_url, logger, lru_cache_frozenset, mistral_utils
+from sglang.srt.utils import (
+    find_local_repo_dir,
+    is_remote_url,
+    logger,
+    lru_cache_frozenset,
+    mistral_utils,
+)
+from sglang.utils import is_in_ci
 
 _CONFIG_REGISTRY: List[Type[PretrainedConfig]] = [
     ChatGLMConfig,
@@ -414,10 +423,179 @@ def get_context_length(config):
 _FAST_LLAMA_TOKENIZER = "hf-internal-testing/llama-tokenizer"
 
 
+def find_local_tokenizer_snapshot_dir(
+    model_name_or_path: str,
+    cache_dir: Optional[str],
+    allow_patterns: List[str],
+    revision: Optional[str] = None,
+) -> Optional[str]:
+    """If the tokenizer files are already local, skip downloading and return the path.
+    Only applied in CI.
+    """
+    if not is_in_ci():
+        return None
+
+    if os.path.isdir(model_name_or_path):
+        logger.info(
+            "Tokenizer path %s is already a local directory, skipping cache check",
+            model_name_or_path,
+        )
+        return None
+
+    logger.info("Checking for cached tokenizer: %s", model_name_or_path)
+    found_local_snapshot_dir = None
+
+    # Check custom cache_dir (if provided)
+    if cache_dir:
+        try:
+            repo_folder = os.path.join(
+                cache_dir,
+                huggingface_hub.constants.REPO_ID_SEPARATOR.join(
+                    ["models", *model_name_or_path.split("/")]
+                ),
+            )
+            rev_to_use = revision
+            if not rev_to_use:
+                ref_main = os.path.join(repo_folder, "refs", "main")
+                if os.path.isfile(ref_main):
+                    with open(ref_main) as f:
+                        rev_to_use = f.read().strip()
+            if rev_to_use:
+                rev_dir = os.path.join(repo_folder, "snapshots", rev_to_use)
+                if os.path.isdir(rev_dir):
+                    found_local_snapshot_dir = rev_dir
+        except Exception as e:
+            logger.warning(
+                "Failed to find local snapshot in custom cache_dir %s: %s",
+                cache_dir,
+                e,
+            )
+
+    # Check default HF cache as well
+    if not found_local_snapshot_dir:
+        try:
+            rev_dir = find_local_repo_dir(model_name_or_path, revision)
+            if rev_dir and os.path.isdir(rev_dir):
+                found_local_snapshot_dir = rev_dir
+        except Exception as e:
+            logger.warning("Failed to find local snapshot in default HF cache: %s", e)
+
+    # If local snapshot exists, validate it contains at least one tokenizer file
+    # matching allow_patterns before skipping download.
+    if found_local_snapshot_dir is None:
+        return None
+
+    # Layer 0: Check for incomplete files (corruption indicator)
+    repo_folder = os.path.abspath(os.path.join(found_local_snapshot_dir, "..", ".."))
+    blobs_dir = os.path.join(repo_folder, "blobs")
+    if os.path.isdir(blobs_dir) and glob.glob(os.path.join(blobs_dir, "*.incomplete")):
+        logger.info(
+            "Found .incomplete files in %s for %s. Considering local snapshot incomplete.",
+            blobs_dir,
+            model_name_or_path,
+        )
+        return None
+
+    local_tokenizer_files: List[str] = []
+    try:
+        for pattern in allow_patterns:
+            matched_files = glob.glob(os.path.join(found_local_snapshot_dir, pattern))
+            for f in matched_files:
+                # Layer 1: Check symlink target exists (broken symlink check)
+                if not os.path.exists(f):
+                    continue
+                local_tokenizer_files.append(f)
+    except Exception as e:
+        logger.warning(
+            "Failed to scan local snapshot %s with patterns %s: %s",
+            found_local_snapshot_dir,
+            allow_patterns,
+            e,
+        )
+        local_tokenizer_files = []
+
+    if len(local_tokenizer_files) > 0:
+        logger.info(
+            "Found local HF snapshot for tokenizer %s at %s; skipping download.",
+            model_name_or_path,
+            found_local_snapshot_dir,
+        )
+        return found_local_snapshot_dir
+    else:
+        logger.info(
+            "Local HF snapshot at %s has no files matching %s; will attempt download.",
+            found_local_snapshot_dir,
+            allow_patterns,
+        )
+    return None
+
+
 # Filter warnings like: https://github.com/sgl-project/sglang/issues/8082
 class TokenizerWarningsFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
         return "Calling super().encode with" not in record.getMessage()
+
+
+def _check_tokenizer_cache(
+    tokenizer_name: str,
+    cache_dir: Optional[str],
+    revision: Optional[str],
+    include_processor_files: bool = False,
+) -> str:
+    """Check local cache for tokenizer files and return local path if found.
+
+    Args:
+        tokenizer_name: Model name or path
+        cache_dir: Optional custom cache directory
+        revision: Optional model revision
+        include_processor_files: Whether to include processor-specific files (*.py, preprocessor_config.json)
+
+    Returns:
+        Local path if found in cache, otherwise returns original tokenizer_name
+    """
+    allow_patterns = [
+        "*.json",
+        "*.model",
+        "*.txt",
+        "tokenizer.model",
+        "tokenizer_config.json",
+    ]
+    if include_processor_files:
+        allow_patterns.extend(["*.py", "preprocessor_config.json"])
+
+    local_path = find_local_tokenizer_snapshot_dir(
+        tokenizer_name, cache_dir, allow_patterns, revision
+    )
+    return local_path if local_path is not None else tokenizer_name
+
+
+def _handle_tokenizer_load_error(e: Exception, trust_remote_code: bool) -> None:
+    """Handle tokenizer loading errors with helpful messages."""
+    if isinstance(e, TypeError):
+        # The LLaMA tokenizer causes a protobuf error in some environments.
+        err_msg = (
+            "Failed to load the tokenizer. If you are using a LLaMA V1 model "
+            f"consider using '{_FAST_LLAMA_TOKENIZER}' instead of the "
+            "original tokenizer."
+        )
+        raise RuntimeError(err_msg) from e
+    elif (
+        isinstance(e, ValueError)
+        and not trust_remote_code
+        and (
+            "does not exist or is not currently imported." in str(e)
+            or "requires you to execute the tokenizer file" in str(e)
+        )
+    ):
+        err_msg = (
+            "Failed to load the tokenizer. If the tokenizer is a custom "
+            "tokenizer not yet available in the HuggingFace transformers "
+            "library, consider setting `trust_remote_code=True` in LLM "
+            "or using the `--trust-remote-code` flag in the CLI."
+        )
+        raise RuntimeError(err_msg) from e
+    else:
+        raise e
 
 
 def get_tokenizer(
@@ -456,43 +634,70 @@ def get_tokenizer(
         client.pull_files(ignore_pattern=["*.pt", "*.safetensors", "*.bin"])
         tokenizer_name = client.get_local_dir()
 
-    try:
-        tokenizer = AutoTokenizer.from_pretrained(
-            tokenizer_name,
-            *args,
-            trust_remote_code=trust_remote_code,
-            tokenizer_revision=tokenizer_revision,
-            clean_up_tokenization_spaces=False,
-            **kwargs,
-        )
-        # Filter tokenizer warnings
-        logging.getLogger(tokenizer.__class__.__module__).addFilter(
-            TokenizerWarningsFilter()
-        )
-    except TypeError as e:
-        # The LLaMA tokenizer causes a protobuf error in some environments.
-        err_msg = (
-            "Failed to load the tokenizer. If you are using a LLaMA V1 model "
-            f"consider using '{_FAST_LLAMA_TOKENIZER}' instead of the "
-            "original tokenizer."
-        )
-        raise RuntimeError(err_msg) from e
-    except ValueError as e:
-        # If the error pertains to the tokenizer class not existing or not
-        # currently being imported, suggest using the --trust-remote-code flag.
-        if not trust_remote_code and (
-            "does not exist or is not currently imported." in str(e)
-            or "requires you to execute the tokenizer file" in str(e)
-        ):
-            err_msg = (
-                "Failed to load the tokenizer. If the tokenizer is a custom "
-                "tokenizer not yet available in the HuggingFace transformers "
-                "library, consider setting `trust_remote_code=True` in LLM "
-                "or using the `--trust-remote-code` flag in the CLI."
+    # Check if tokenizer files are already in local cache (CI only)
+    original_tokenizer_name = tokenizer_name
+    tokenizer_name = _check_tokenizer_cache(
+        tokenizer_name, kwargs.get("cache_dir"), tokenizer_revision
+    )
+
+    # Layer 2: Separate handling for cached vs non-cached paths
+    if tokenizer_name != original_tokenizer_name:
+        # We're using a cached path, try it but fallback to force_download if it fails
+        try:
+            tokenizer = AutoTokenizer.from_pretrained(
+                tokenizer_name,
+                *args,
+                trust_remote_code=trust_remote_code,
+                tokenizer_revision=tokenizer_revision,
+                clean_up_tokenization_spaces=False,
+                **kwargs,
             )
-            raise RuntimeError(err_msg) from e
-        else:
-            raise e
+            # Filter tokenizer warnings
+            logging.getLogger(tokenizer.__class__.__module__).addFilter(
+                TokenizerWarningsFilter()
+            )
+        except Exception as e:
+            # Cache load failed, retry with force_download to bypass corrupted cache
+            logger.warning(
+                "Failed to load tokenizer from cached path %s: %s. "
+                "Retrying with force_download to bypass potentially corrupted cache.",
+                tokenizer_name,
+                e,
+            )
+            try:
+                tokenizer = AutoTokenizer.from_pretrained(
+                    original_tokenizer_name,
+                    *args,
+                    trust_remote_code=trust_remote_code,
+                    tokenizer_revision=tokenizer_revision,
+                    clean_up_tokenization_spaces=False,
+                    force_download=True,
+                    **kwargs,
+                )
+                # Filter tokenizer warnings
+                logging.getLogger(tokenizer.__class__.__module__).addFilter(
+                    TokenizerWarningsFilter()
+                )
+            except Exception:
+                # Force download also failed, handle with helpful error messages
+                _handle_tokenizer_load_error(e, trust_remote_code)
+    else:
+        # No cache, load normally with error handling
+        try:
+            tokenizer = AutoTokenizer.from_pretrained(
+                tokenizer_name,
+                *args,
+                trust_remote_code=trust_remote_code,
+                tokenizer_revision=tokenizer_revision,
+                clean_up_tokenization_spaces=False,
+                **kwargs,
+            )
+            # Filter tokenizer warnings
+            logging.getLogger(tokenizer.__class__.__module__).addFilter(
+                TokenizerWarningsFilter()
+            )
+        except Exception as e:
+            _handle_tokenizer_load_error(e, trust_remote_code)
 
     if not isinstance(tokenizer, PreTrainedTokenizerFast):
         warnings.warn(
@@ -522,6 +727,7 @@ def get_processor(
 ):
     # pop 'revision' from kwargs if present.
     revision = kwargs.pop("revision", tokenizer_revision)
+
     if "mistral-large-3" in str(tokenizer_name).lower():
         config = _load_mistral_large_3_for_causal_LM(
             tokenizer_name,
