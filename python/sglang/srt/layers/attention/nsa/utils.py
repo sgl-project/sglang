@@ -1,7 +1,7 @@
 # temp NSA debugging environ
 from dataclasses import dataclass
 from itertools import accumulate
-from typing import TYPE_CHECKING, List, Union
+from typing import TYPE_CHECKING, List, Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -59,24 +59,24 @@ def is_nsa_prefill_cp_in_seq_split():
     )
 
 
-def is_nsa_prefill_cp_continuous_split():
+def is_nsa_prefill_cp_round_robin_split():
     return (
         is_nsa_enable_prefill_cp()
-        and get_global_server_args().nsa_prefill_cp_mode == "continuous-split"
+        and get_global_server_args().nsa_prefill_cp_mode == "round-robin-split"
     )
 
 
-def can_nsa_prefill_cp_continuous_split(forward_batch: "ForwardBatch"):
+def can_nsa_prefill_cp_round_robin_split(forward_batch: "ForwardBatch"):
     if not forward_batch.forward_mode.is_context_parallel_extend():
         return False
     cp_size = get_attention_tp_size()
     seq_len = sum(forward_batch.extend_seq_lens_cpu)
-    return is_nsa_prefill_cp_continuous_split() and seq_len > 0 and cp_size > 1
+    return is_nsa_prefill_cp_round_robin_split() and seq_len > 0 and cp_size > 1
 
 
-def nsa_cp_continuous_split_data(input_: Union[torch.Tensor, List]):
+def nsa_cp_round_robin_split_data(input_: Union[torch.Tensor, List]):
     """
-    # for continuous-split, split the tokens evenly according to the rule of token_idx % cp_size.
+    # for round-robin-split, split the tokens evenly according to the rule of token_idx % cp_size.
     |   +-----------before split------------+|
     | token0, token1, token2, token3, token4, token5, token6, token7, ...
     |
@@ -107,7 +107,7 @@ def nsa_cp_continuous_split_data(input_: Union[torch.Tensor, List]):
 
 def pad_nsa_cache_seqlens(forward_batch: "ForwardBatch", nsa_cache_seqlens):
     attn_tp_size = get_attention_tp_size()
-    if attn_tp_size == 1 or not can_nsa_prefill_cp_continuous_split(forward_batch):
+    if attn_tp_size == 1 or not can_nsa_prefill_cp_round_robin_split(forward_batch):
         return nsa_cache_seqlens
     tokens = sum(forward_batch.extend_seq_lens_cpu)
     pad_len = (tokens - 1) // attn_tp_size + 1 - nsa_cache_seqlens.shape[0]
@@ -142,11 +142,11 @@ class NSAContextParallelMetadata:
 
 
 def can_cp_split(seq_len: int, cp_size: int, use_nsa: bool, forward_batch):
-    if is_nsa_prefill_cp_continuous_split():
+    if is_nsa_prefill_cp_round_robin_split():
         cur_cp_seq_len = seq_len // cp_size
         assert (
             seq_len % cp_size == 0
-        ), f"seq_len {seq_len} is not divisible by cp_size {cp_size} when nsa_prefill_cp_mode is continuous-split"
+        ), f"seq_len {seq_len} is not divisible by cp_size {cp_size} when nsa_prefill_cp_mode is round-robin-split"
     else:
         # TODO current just support prefill batch=1 and len(input_ids) > self.cp_size * 2
         # Note: (self.cp_size * 2) To achieve load balancing for seq computation,
@@ -165,12 +165,12 @@ def can_cp_split(seq_len: int, cp_size: int, use_nsa: bool, forward_batch):
 
 
 def cp_split_and_rebuild_data(forward_batch, input_: torch.Tensor):
-    if is_nsa_prefill_cp_continuous_split():
+    if is_nsa_prefill_cp_round_robin_split():
         cp_size = get_attention_tp_size()
         assert (
             input_.shape[0] % cp_size == 0
         ), f"Expect input shape 0 can divided by cp size, but got input shape {input_.shape}, cp size {cp_size}"
-        return nsa_cp_continuous_split_data(input_)
+        return nsa_cp_round_robin_split_data(input_)
 
     input_list = list(
         torch.split(input_, forward_batch.nsa_cp_metadata.split_list, dim=0)
@@ -182,13 +182,13 @@ def cp_split_and_rebuild_data(forward_batch, input_: torch.Tensor):
 
 
 def cp_split_and_rebuild_position(forward_batch, positions: torch.Tensor):
-    if is_nsa_prefill_cp_continuous_split():
+    if is_nsa_prefill_cp_round_robin_split():
         cp_size = get_attention_tp_size()
         assert positions.shape[0] % cp_size == 0, (
             f"Expect positions shape 0 can divided by cp size, but got positions shape {positions.shape}, "
             f"cp size {cp_size}"
         )
-        return nsa_cp_continuous_split_data(positions)
+        return nsa_cp_round_robin_split_data(positions)
 
     position_id_list = list(
         torch.split(positions, forward_batch.nsa_cp_metadata.split_list, dim=-1)
@@ -201,7 +201,7 @@ def cp_split_and_rebuild_position(forward_batch, positions: torch.Tensor):
 
 
 @triton.jit
-def nsa_cp_continuous_split_q_seqs_kernel(
+def nsa_cp_round_robin_split_q_seqs_kernel(
     in_seqs_ptr,
     out_seqs_ptr,
     bs_idx_ptr,
@@ -222,7 +222,7 @@ def nsa_cp_continuous_split_q_seqs_kernel(
         extra_seq = cur_len - cur_seq * cp_size
 
 
-def nsa_cp_continuous_split_q_seqs_cpu(extend_seqs):
+def nsa_cp_round_robin_split_q_seqs_cpu(extend_seqs):
     cp_size = get_attention_tp_size()
     cp_rank = get_attention_tp_rank()
     extra_seq = 0
@@ -237,10 +237,22 @@ def nsa_cp_continuous_split_q_seqs_cpu(extend_seqs):
     return q_seqs, bs_idx
 
 
-def nsa_cp_continuous_split_q_seqs(extend_seqs_cpu, extend_seqs):
+def nsa_cp_round_robin_split_q_seqs(
+    extend_seqs_cpu, extend_seqs
+) -> Tuple[List, torch.Tensor, List, torch.Tensor]:
+    """
+    round-robin-split distributes tokens across ranks based on token_idx % cp_size.
+
+    Return:
+    ret_q_lens_cpu(List) and ret_q_lens(torch.Tensor): the partitioned length (excluding zeros) on the current cp rank
+        for each sequence after distribution across cp ranks.
+    bs_idx_cpu(List) and bs_idx(torch.Tensor): marks which sequences are ultimately selected,
+        i.e., those with a partitioned length greater than zero.
+    """
     cp_size = get_attention_tp_size()
     cp_rank = get_attention_tp_rank()
-    ret_q_lens_cpu, bs_idx_cpu = nsa_cp_continuous_split_q_seqs_cpu(extend_seqs_cpu)
+    # len(ret_q_lens_cpu) == len(bs_idx_cpu)
+    ret_q_lens_cpu, bs_idx_cpu = nsa_cp_round_robin_split_q_seqs_cpu(extend_seqs_cpu)
     ret_q_lens = torch.empty(
         (len(bs_idx_cpu),), device=extend_seqs.device, dtype=extend_seqs.dtype
     )
@@ -248,7 +260,7 @@ def nsa_cp_continuous_split_q_seqs(extend_seqs_cpu, extend_seqs):
         (len(bs_idx_cpu),), device=extend_seqs.device, dtype=torch.int32
     )
     grid = (1,)
-    nsa_cp_continuous_split_q_seqs_kernel[grid](
+    nsa_cp_round_robin_split_q_seqs_kernel[grid](
         extend_seqs, ret_q_lens, bs_idx, len(extend_seqs), cp_size, cp_rank
     )
     return ret_q_lens_cpu, ret_q_lens, bs_idx_cpu, bs_idx
@@ -324,7 +336,7 @@ def cp_all_gather_rerange_output(input_tensor, cp_size, forward_batch, stream):
     | block0 | block1 | block2 | block3 | block4 | block5 | block6 | block7 |
     |   +-------------------------+
 
-    # for continuous-split
+    # for round-robin-split
     |   +-----------before allgather------------+|
     | dp_atten_tp0: token0, token4, token8, token12, token16, ... |
     | dp_atten_tp1: token1, token5, token9, token13, token17, ... |
@@ -335,7 +347,7 @@ def cp_all_gather_rerange_output(input_tensor, cp_size, forward_batch, stream):
     | token0, token1, token2, token3, token4, token5, token6, token7, ...
     |   +-------------------------+
     """
-    if is_nsa_prefill_cp_continuous_split():
+    if is_nsa_prefill_cp_round_robin_split():
         output_tensor = input_tensor.new_empty(
             (input_tensor.shape[0] * cp_size, *input_tensor.shape[1:]),
         )
@@ -425,7 +437,7 @@ def prepare_input_dp_with_cp_dsa(
     cp_size,
     seqs_len,
 ):
-    if is_nsa_prefill_cp_continuous_split():
+    if is_nsa_prefill_cp_round_robin_split():
         return True
     """prepare_input_dp_with_cp_dsa-zigzag index
     Example (DP_ATTENT_TP == CP_SIZE == 4):

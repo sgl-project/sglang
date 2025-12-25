@@ -25,11 +25,11 @@ from sglang.srt.layers.attention.nsa.utils import (
     NSA_ENABLE_MTP_PRECOMPUTE_METADATA,
     NSA_FLASHMLA_BACKEND_DECODE_COMPUTE_FP8,
     NSA_FUSE_TOPK,
-    can_nsa_prefill_cp_continuous_split,
+    can_nsa_prefill_cp_round_robin_split,
     compute_nsa_seqlens,
     is_nsa_enable_prefill_cp,
-    nsa_cp_continuous_split_data,
-    nsa_cp_continuous_split_q_seqs,
+    nsa_cp_round_robin_split_data,
+    nsa_cp_round_robin_split_q_seqs,
     pad_nsa_cache_seqlens,
 )
 from sglang.srt.layers.attention.trtllm_mla_backend import _concat_mla_absorb_q_general
@@ -374,7 +374,12 @@ class NativeSparseAttnBackend(
         # Centralized dispatch: decide all strategies for this batch
         self.set_nsa_prefill_impl(forward_batch)
         topk_transform_method = self.get_topk_transform_method()
+        # Batch indices selected when cp enabled: After splitting multiple sequences,
+        # a certain cp rank may not have some of these sequences.
+        # We use bs_idx_cpu to mark which sequences are finally selected by the current cp rank,
+        # a default value of None indicates that all sequences are selected.
         bs_idx_cpu = None
+        # seq_len_cpu of selected sequences
         indexer_seq_lens_cpu = forward_batch.seq_lens_cpu
 
         if forward_batch.forward_mode.is_decode_or_idle():
@@ -489,10 +494,12 @@ class NativeSparseAttnBackend(
                 ]
             )
 
-            if can_nsa_prefill_cp_continuous_split(forward_batch):
-                seqlens_expanded = nsa_cp_continuous_split_data(seqlens_expanded)
+            if can_nsa_prefill_cp_round_robin_split(forward_batch):
+                seqlens_expanded = nsa_cp_round_robin_split_data(seqlens_expanded)
                 extend_seq_lens_cpu, extend_seq_lens, bs_idx_cpu, bs_idx = (
-                    nsa_cp_continuous_split_q_seqs(extend_seq_lens_cpu, extend_seq_lens)
+                    nsa_cp_round_robin_split_q_seqs(
+                        extend_seq_lens_cpu, extend_seq_lens
+                    )
                 )
                 indexer_seq_lens_cpu = indexer_seq_lens_cpu[bs_idx_cpu]
                 cache_seqlens_int32 = cache_seqlens_int32[bs_idx]
@@ -691,6 +698,7 @@ class NativeSparseAttnBackend(
             ks_list.append(ks)
             ke_list.append(ke)
 
+            # bi: The index within the selected batch bs_idx. Entries that were not selected are ignored.
             bi = bs_idx.index(i) if (bs_idx is not None and i in bs_idx) else i
             tb = torch.full(
                 (extend_seq_len,), bi, dtype=torch.int32, device=self.device
@@ -705,10 +713,10 @@ class NativeSparseAttnBackend(
         ke = torch.cat(ke_list, dim=0)
         token_to_batch_idx = torch.cat(token_to_batch_idx, dim=0)
         if bs_idx is not None:
-            assert can_nsa_prefill_cp_continuous_split(forward_batch)
-            ks = nsa_cp_continuous_split_data(ks)
-            ke = nsa_cp_continuous_split_data(ke)
-            token_to_batch_idx = nsa_cp_continuous_split_data(token_to_batch_idx)
+            assert can_nsa_prefill_cp_round_robin_split(forward_batch)
+            ks = nsa_cp_round_robin_split_data(ks)
+            ke = nsa_cp_round_robin_split_data(ke)
+            token_to_batch_idx = nsa_cp_round_robin_split_data(token_to_batch_idx)
         return (ks, ke), token_to_batch_idx
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
