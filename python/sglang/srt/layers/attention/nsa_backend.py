@@ -277,7 +277,7 @@ class NativeSparseAttnBackend(
         assert model_runner.req_to_token_pool is not None
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self.req_to_token_pool = model_runner.req_to_token_pool
-        self.is_hybrid_nsa_pool = enable_nsa_hybrid_indexer_pool(
+        self.enable_nsa_hybrid_indexer_pool = enable_nsa_hybrid_indexer_pool(
             req_to_token_pool=self.req_to_token_pool
         )
 
@@ -359,7 +359,7 @@ class NativeSparseAttnBackend(
         ]
         # Build indexer_page_table for indexer_k
         indexer_page_table = None
-        if self.is_hybrid_nsa_pool:
+        if self.enable_nsa_hybrid_indexer_pool:
             indexer_page_table = self.req_to_token_pool.req_to_nsa_index_k[
                 forward_batch.req_pool_indices, :max_seqlen_k
             ]
@@ -621,7 +621,7 @@ class NativeSparseAttnBackend(
         to avoid memory allocations.
         """
         indexer_page_table = None
-        if self.is_hybrid_nsa_pool:
+        if self.enable_nsa_hybrid_indexer_pool:
             indexer_page_table = torch.zeros(
                 max_num_tokens,
                 self.max_context_len,
@@ -794,7 +794,7 @@ class NativeSparseAttnBackend(
             except (ImportError, ModuleNotFoundError):
                 paged_mqa_schedule_metadata = None
 
-        if self.is_hybrid_nsa_pool:
+        if self.enable_nsa_hybrid_indexer_pool:
             indexer_page_table_1 = self.decode_cuda_graph_metadata[
                 "indexer_page_table"
             ][:bs, :]
@@ -999,7 +999,7 @@ class NativeSparseAttnBackend(
             assert metadata.real_page_table is metadata.page_table_1
 
         # Copy indexer page table
-        if self.is_hybrid_nsa_pool:
+        if self.enable_nsa_hybrid_indexer_pool:
             if forward_mode.is_decode_or_idle():
                 indexer_page_indices = self.req_to_token_pool.req_to_nsa_index_k[
                     req_pool_indices, :max_len
@@ -1113,7 +1113,10 @@ class NativeSparseAttnBackend(
             pass
 
         # Copy indexer real page table
-        if self.is_hybrid_nsa_pool and precomputed.indexer_real_page_table is not None:
+        if (
+            self.enable_nsa_hybrid_indexer_pool
+            and precomputed.indexer_real_page_table is not None
+        ):
             rows, cols = precomputed.indexer_real_page_table.shape
             metadata.indexer_real_page_table[:rows, :cols].copy_(
                 precomputed.indexer_real_page_table
