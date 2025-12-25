@@ -1494,11 +1494,12 @@ class ModelRunner:
         return result
 
     def get_kv_cache_cell_size(self, num_layers: int) -> int:
+        kv_size = torch._utils._element_size(self.kv_cache_dtype)
         if self.use_mla_backend:
             cell_size = (
                 (self.model_config.kv_lora_rank + self.model_config.qk_rope_head_dim)
                 * num_layers
-                * torch._utils._element_size(self.kv_cache_dtype)
+                * kv_size
             )
             if is_float4_e2m1fn_x2(self.kv_cache_dtype):
                 # kv_scale_buffer
@@ -1512,7 +1513,7 @@ class ModelRunner:
                         // scale_block_size
                     )
                     * num_layers
-                    * torch._utils._element_size(self.kv_cache_dtype)
+                    * kv_size
                 )
 
             # Add indexer KV cache overhead for NSA models (DeepSeek V3.2)
@@ -1531,7 +1532,7 @@ class ModelRunner:
                 self.model_config.get_num_kv_heads(get_attention_tp_size())
                 * (self.model_config.head_dim + self.model_config.v_head_dim)
                 * num_layers
-                * torch._utils._element_size(self.kv_cache_dtype)
+                * kv_size
             )
 
             if is_float4_e2m1fn_x2(self.kv_cache_dtype):
@@ -1541,14 +1542,7 @@ class ModelRunner:
                 n = self.model_config.get_num_kv_heads(get_attention_tp_size())
                 k = self.model_config.head_dim
                 cell_size = (cell_size // 2) + (
-                    (
-                        n
-                        * k
-                        * num_layers
-                        * 2
-                        * torch._utils._element_size(self.kv_cache_dtype)
-                    )
-                    // scale_block_size
+                    (n * k * num_layers * 2 * kv_size) // scale_block_size
                 )
 
             if self.model_config.hf_config.architectures[0] == "MiMoV2FlashForCausalLM":
@@ -1559,7 +1553,7 @@ class ModelRunner:
                         + self.model_config.hf_text_config.swa_v_head_dim
                     )
                     * len(self.model_config.swa_attention_layer_ids)
-                    * torch._utils._element_size(self.kv_cache_dtype)
+                    * kv_size
                 )
         return cell_size
 
