@@ -1658,10 +1658,10 @@ def sample_generated_shared_prefix_requests(
     args: argparse.Namespace,
 ) -> List[DatasetRow]:
     """Generate benchmark requests with shared system prompts using random tokens and caching."""
-    send_routing_id = getattr(args, "gsp_send_routing_id", False)
+    send_routing_key = getattr(args, "gsp_send_routing_key", False)
 
     cache_path = get_gen_prefix_cache_path(args, tokenizer)
-    should_cache = (range_ratio == 1) and not send_routing_id
+    should_cache = (range_ratio == 1) and not send_routing_key
 
     # Try to load from cache first
     if cache_path.exists() and should_cache:
@@ -1715,7 +1715,7 @@ def sample_generated_shared_prefix_requests(
         system_prompt = system_prompts[group_idx]
         routing_id = (
             f"{run_random_str}_{run_start_timestamp}_{group_idx}"
-            if send_routing_id
+            if send_routing_key
             else None
         )
         for prompt_idx in tqdm(
@@ -3002,9 +3002,9 @@ if __name__ == "__main__":
         help="Speedup preparing by removing statistics computation, which will make some output statistics inaccurate but suitable for pressure tests.",
     )
     group.add_argument(
-        "--gsp-send-routing-id",
+        "--gsp-send-routing-key",
         action="store_true",
-        help="Send routing_id in requests. Requests with the same prefix share the same routing_id.",
+        help="Send routing key in requests via X-SMG-Routing-Key header. Requests with the same prefix share the same routing key.",
     )
     mooncake_group = parser.add_argument_group("mooncake dataset arguments")
     mooncake_group.add_argument(
