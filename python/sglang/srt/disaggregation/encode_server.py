@@ -16,6 +16,8 @@ import zmq
 import zmq.asyncio
 from fastapi import FastAPI
 from fastapi.responses import ORJSONResponse, Response
+from transformers import AutoProcessor
+from transformers.image_utils import load_images
 
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig
@@ -37,8 +39,6 @@ from sglang.srt.server_args import (
     set_global_server_args_for_scheduler,
 )
 from sglang.srt.utils import get_local_ip_auto, get_zmq_socket, load_video, random_uuid
-from transformers import AutoProcessor
-from transformers.image_utils import load_images
 
 logger = logging.getLogger(__name__)
 
@@ -147,6 +147,9 @@ class MMEncoder:
             remote_instance_weight_loader_seed_instance_service_port=server_args.remote_instance_weight_loader_seed_instance_service_port,
             remote_instance_weight_loader_send_weights_group_ports=server_args.remote_instance_weight_loader_send_weights_group_ports,
         )
+        self.model_type = getattr(
+            self.model_config.hf_config, "model_type", "unknown"
+        ).lower()
 
         self.device = server_args.device
         self.gpu_id = server_args.base_gpu_id + rank
@@ -210,7 +213,12 @@ class MMEncoder:
             modality = Modality.IMAGE
             get_feature_method = self.model.get_image_feature
         elif modality == Modality.VIDEO:
-            # mainly follows qwen_vl.py
+            # mainly follows qwen_vl.py: only support qwen series models for video processing
+            if "qwen" not in self.model_type:
+                raise ValueError(
+                    f"Video modality processing is currently only supported for Qwen series models with EPD enabled, "
+                    f"but got model_type: {self.model_type}"
+                )
             video_items = [load_video(video_item) for video_item in mm_items]
             videos_processed = [
                 await preprocess_video(video, video_config=self.video_config)
