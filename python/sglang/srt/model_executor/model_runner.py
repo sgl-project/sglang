@@ -152,7 +152,6 @@ from sglang.srt.utils import (
     get_cpu_ids_by_node,
     get_local_ip_auto,
     init_custom_process_group,
-    is_cuda,
     is_float4_e2m1fn_x2,
     is_hip,
     is_npu,
@@ -164,7 +163,6 @@ from sglang.srt.utils import (
     reserve_rope_cache_for_long_sequences,
     set_cuda_arch,
     slow_rank_detector,
-    xpu_has_xmx_support,
 )
 from sglang.srt.utils.nvtx_pytorch_hooks import PytHooks
 from sglang.srt.utils.offloader import (
@@ -183,11 +181,9 @@ from sglang.srt.weight_sync.tensor_bucket import (
     FlattenedTensorMetadata,
 )
 
-_is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_npu = is_npu()
 _is_cpu_amx_available = cpu_has_amx_support()
-_is_xpu_xmx_available = xpu_has_xmx_support()
 
 if _is_npu:
     from sglang.srt.hardware_backend.npu.utils import init_npu_backend
