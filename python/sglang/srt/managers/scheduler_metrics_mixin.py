@@ -206,7 +206,6 @@ class SchedulerMetricsMixin:
             cache_hit_rate = (
                 adder.log_hit_tokens / total_tokens if total_tokens > 0 else 0.0
             )
-            cache_hit = adder.log_hit_tokens
             cache_all = total_tokens
 
             self.stats.num_running_reqs = running_bs
@@ -222,7 +221,6 @@ class SchedulerMetricsMixin:
             self.stats.cache_hit_rate = cache_hit_rate
 
             self.stats.max_total_num_tokens = self.max_total_num_tokens
-            self.stats.cache_hit = cache_hit
             self.stats.cache_all = cache_all
 
             # Retract

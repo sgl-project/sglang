@@ -233,7 +233,6 @@ class SchedulerStats:
     cache_hit_rate: float = 0.0
 
     max_total_num_tokens: int = 0
-    cache_hit: int = 0
     cache_all: int = 0
 
     # Run batch
@@ -376,12 +375,6 @@ class SchedulerMetricsCollector:
         self.max_total_num_tokens = Gauge(
             name="sglang:max_total_num_tokens",
             documentation="Maximum total number of tokens in the KV cache pool.",
-            labelnames=labels.keys(),
-            multiprocess_mode="mostrecent",
-        )
-        self.cache_hit = Gauge(
-            name="sglang:cache_hit",
-            documentation="The cache hit tokens num",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
@@ -959,7 +952,6 @@ class SchedulerMetricsCollector:
         self._log_gauge(self.cache_hit_rate, stats.cache_hit_rate)
 
         self._log_gauge(self.max_total_num_tokens, stats.max_total_num_tokens)
-        self._log_gauge(self.cache_hit, stats.cache_hit)
         self._log_gauge(self.cache_all, stats.cache_all)
 
         # Run batch
