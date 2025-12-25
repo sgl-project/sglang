@@ -61,11 +61,17 @@ from sglang.srt.utils.hf_transformers_utils import get_processor
 
 _is_hip = is_hip()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
-
-if _use_aiter:
-    from aiter import gelu_fast_vec
+_use_aiter_fast_gelu = False
 
 logger = logging.getLogger(__name__)
+
+if _use_aiter:
+    try:
+        from aiter import gelu_fast_vec
+        _use_aiter_fast_gelu = True
+    except Exception:
+        logger.warning("WARNING: from aiter import gelu_fast_vec failed, fallback to default torch ops")
+        _use_aiter_fast_gelu = False
 
 
 # === Vision Encoder === #
@@ -110,7 +116,7 @@ class Qwen3_VisionMLP(nn.Module):
 
     def forward(self, x: torch.Tensor):
         x_fc1, _ = self.linear_fc1(x)
-        if _use_aiter:
+        if _use_aiter and _use_aiter_fast_gelu:
             gelu_output= torch.empty_like(x_fc1)
             gelu_fast_vec(gelu_output, x_fc1)
             mlp_output, _ = self.linear_fc2(gelu_output)
