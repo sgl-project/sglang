@@ -1431,9 +1431,11 @@ class ServerArgs:
                         self.disable_radix_cache = True
                         self.disable_overlap_schedule = False
 
-        if not self.get_model_config().is_generation:
+        if envs.SGLANG_EMBEDDINGS_SPARSE_HEAD.is_set():
             self.disable_overlap_schedule = True
-            logger.warning("Overlap scheduler is disabled for embedding models.")
+            logger.warning(
+                f"Overlap scheduler is disabled when using sparse head for embedding model."
+            )
 
         # TRTLLM AllReduce Fusion supports SM90/100/120, enable it by default
         # for models with explicit support (DeepseekV3, GptOss, Glm4Moe, Qwen3Moe)
