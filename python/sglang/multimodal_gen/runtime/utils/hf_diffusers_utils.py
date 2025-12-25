@@ -447,6 +447,11 @@ def maybe_download_model(
                         local_dir=local_dir,
                         force_download=True,
                     )
+                if not _verify_model_complete(local_path):
+                    raise ValueError(
+                        f"Downloaded model at {local_path} is still incomplete after forced re-download. "
+                        "The model repository may be missing required components (model_index.json, transformer/, or vae/)."
+                    )
 
             logger.info("Downloaded model to %s", local_path)
             return str(local_path)
