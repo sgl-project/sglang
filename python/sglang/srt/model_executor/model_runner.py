@@ -1500,18 +1500,21 @@ class ModelRunner:
             distributed=get_world_group().world_size > 1,
             cpu_group=get_world_group().cpu_group,
         )
+
+        # Get the number of layers used for KV cache calculation
         if self.is_draft_worker:
             num_layers = getattr(
                 self.model_config.hf_config,
                 "num_nextn_predict_layers",
                 self.num_effective_layers,
             )
-        elif config := self.mambaish_config:
-            num_layers = len(config.full_attention_layer_ids)
+        elif mambaish := self.mambaish_config:
+            num_layers = len(mambaish.full_attention_layer_ids)
         elif self.model_config.full_attention_layer_ids:
             num_layers = len(self.model_config.full_attention_layer_ids)
         else:
             num_layers = self.num_effective_layers
+
         if self.use_mla_backend:
             cell_size = (
                 (self.model_config.kv_lora_rank + self.model_config.qk_rope_head_dim)
