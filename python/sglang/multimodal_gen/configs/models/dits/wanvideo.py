@@ -87,6 +87,8 @@ class WanVideoArchConfig(DiTArchConfig):
     )
     num_frames_per_block: int = 3
     sliding_window_num_frames: int = 21
+    attention_type: str = "original"
+    sla_topk: float = 0.1
 
     def __post_init__(self):
         super().__post_init__()
