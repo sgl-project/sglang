@@ -1,4 +1,5 @@
 # This file is copied from https://github.com/deepseek-ai/EPLB/blob/main/eplb.py since that one is not a pypi package
+import heapq
 from typing import Tuple
 
 import torch
@@ -34,18 +35,27 @@ def balanced_packing(
     pack_index = torch.full_like(weight, fill_value=-1, dtype=torch.int64, device="cpu")
     rank_in_pack = torch.full_like(pack_index, fill_value=-1)
     for i in range(num_layers):
-        pack_weights = [0] * num_packs
-        pack_items = [0] * num_packs
+        # initialize heap: (current_weight, pack_id, num_packed_items)
+        heap = [(0.0, pack_id, 0) for pack_id in range(num_packs)]
         for group in indices[i]:
-            pack = min(
-                (i for i in range(num_packs) if pack_items[i] < groups_per_pack),
-                key=pack_weights.__getitem__,
-            )
-            assert pack_items[pack] < groups_per_pack
-            pack_index[i, group] = pack
-            rank_in_pack[i, group] = pack_items[pack]
-            pack_weights[pack] += weight[i, group]
-            pack_items[pack] += 1
+            # select the pack with the least weight
+            current_weight, pack_id, num_packed_items = heapq.heappop(heap)
+            assert num_packed_items < groups_per_pack
+
+            # assign the group to this pack
+            pack_index[i, group] = pack_id
+            rank_in_pack[i, group] = num_packed_items
+
+            # push back this pack if still not full
+            if num_packed_items + 1 < groups_per_pack:
+                heapq.heappush(
+                    heap,
+                    (
+                        current_weight + weight[i, group].item(),
+                        pack_id,
+                        num_packed_items + 1,
+                    ),
+                )
     return pack_index, rank_in_pack
 
 
