@@ -265,7 +265,6 @@ class ServerArgs:
     context_length: Optional[int] = None
     is_embedding: bool = False
     enable_multimodal: Optional[bool] = None
-    limit_mm_data_per_request: Optional[Union[str, Dict[str, int]]] = None
     revision: Optional[str] = None
     model_impl: str = "auto"
 
@@ -338,6 +337,7 @@ class ServerArgs:
     log_level_http: Optional[str] = None
     log_requests: bool = False
     log_requests_level: int = 2
+    log_requests_format: str = "text"
     crash_dump_folder: Optional[str] = None
     show_time_cost: bool = False
     enable_metrics: bool = False
@@ -549,7 +549,7 @@ class ServerArgs:
     enable_piecewise_cuda_graph: bool = False
     enable_torch_compile_debug_mode: bool = False
     torch_compile_max_bs: int = 32
-    piecewise_cuda_graph_max_tokens: int = 4096
+    piecewise_cuda_graph_max_tokens: Optional[int] = None
     piecewise_cuda_graph_tokens: Optional[List[int]] = None
     piecewise_cuda_graph_compiler: str = "eager"
     torchao_config: str = ""
@@ -636,6 +636,7 @@ class ServerArgs:
     enable_prefix_mm_cache: bool = False
     mm_enable_dp_encoder: bool = False
     mm_process_config: Optional[Dict[str, Any]] = None
+    limit_mm_data_per_request: Optional[Union[str, Dict[str, int]]] = None
 
     # For checkpoint decryption
     decrypted_config_file: Optional[str] = None
@@ -894,6 +895,12 @@ class ServerArgs:
         else:
             self.cuda_graph_max_bs = max(self.cuda_graph_bs)
 
+        if self.piecewise_cuda_graph_max_tokens is None:
+            # Capture piecewise cuda graph tokens up to the chunked prefill size. Two benefits:
+            # 1. cuda graph acceleration for all prefill lengths.
+            # 2. do not need more temporary memory for activations. Less fragmentation.
+            self.piecewise_cuda_graph_max_tokens = self.chunked_prefill_size
+
         if self.piecewise_cuda_graph_tokens is None:
             self.piecewise_cuda_graph_tokens = (
                 self._generate_piecewise_cuda_graph_tokens()
@@ -935,7 +942,7 @@ class ServerArgs:
 
             # For piecewise cuda graphs
             if self.enable_piecewise_cuda_graph:
-                reserved_mem += self.piecewise_cuda_graph_max_tokens // 4
+                reserved_mem += self.piecewise_cuda_graph_max_tokens // 8
 
             self.mem_fraction_static = (
                 round((gpu_mem - reserved_mem) / gpu_mem, 3)
@@ -2485,13 +2492,6 @@ class ServerArgs:
             help="Enable the multimodal functionality for the served model. If the model being served is not multimodal, nothing will happen",
         )
         parser.add_argument(
-            "--limit-mm-data-per-request",
-            type=json.loads,
-            default=ServerArgs.limit_mm_data_per_request,
-            help="Limit the number of multimodal inputs per request. "
-            'e.g. \'{"image": 1, "video": 1, "audio": 1}\'',
-        )
-        parser.add_argument(
             "--revision",
             type=str,
             default=None,
@@ -2907,6 +2907,13 @@ class ServerArgs:
             default=ServerArgs.log_requests_level,
             help="0: Log metadata (no sampling parameters). 1: Log metadata and sampling parameters. 2: Log metadata, sampling parameters and partial input/output. 3: Log every input/output.",
             choices=[0, 1, 2, 3],
+        )
+        parser.add_argument(
+            "--log-requests-format",
+            type=str,
+            default=ServerArgs.log_requests_format,
+            choices=["text", "json"],
+            help="Format for request logging: 'text' (human-readable) or 'json' (structured)",
         )
         parser.add_argument(
             "--crash-dump-folder",
@@ -4394,6 +4401,13 @@ class ServerArgs:
             action="store_true",
             default=ServerArgs.mm_enable_dp_encoder,
             help="Enabling data parallelism for mm encoder. The dp size will be set to the tp size automatically.",
+        )
+        parser.add_argument(
+            "--limit-mm-data-per-request",
+            type=json.loads,
+            default=ServerArgs.limit_mm_data_per_request,
+            help="Limit the number of multimodal inputs per request. "
+            'e.g. \'{"image": 1, "video": 1, "audio": 1}\'',
         )
 
         # For checkpoint decryption
