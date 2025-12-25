@@ -8,6 +8,7 @@ This module contains implementations of timestep preparation stages for diffusio
 """
 
 import inspect
+import logging
 from typing import Any, Callable, Tuple
 
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
@@ -127,7 +128,7 @@ class TimestepPreparationStage(PipelineStage):
 
         # Update batch with prepared timesteps
         batch.timesteps = timesteps
-        if server_args.log_level == "debug":
+        if logger.level == logging.DEBUG:
             self.log_debug(f"timesteps: {timesteps}")
         return batch
 
