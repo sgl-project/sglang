@@ -77,6 +77,7 @@ impl ProtoGenerateRequest {
 }
 
 /// Unified GenerateResponse from stream
+#[allow(clippy::large_enum_variant)]
 pub enum ProtoGenerateResponse {
     Sglang(sglang::GenerateResponse),
     Vllm(vllm::GenerateResponse),
@@ -210,6 +211,7 @@ impl ProtoGenerateStreamChunk {
 
 /// Unified GenerateComplete response
 #[derive(Clone)]
+#[allow(clippy::large_enum_variant)]
 pub enum ProtoGenerateComplete {
     Sglang(sglang::GenerateComplete),
     Vllm(vllm::GenerateComplete),
