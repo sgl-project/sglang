@@ -14,7 +14,6 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 logger = init_logger(__name__)
 
 
-
 class CustomOp(nn.Module):
     """
     Base class for custom ops.

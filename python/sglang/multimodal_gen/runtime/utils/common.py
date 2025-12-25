@@ -245,7 +245,6 @@ def get_zmq_socket(
 # https://pytorch.org/docs/stable/notes/hip.html#checking-for-hip
 
 
-
 @lru_cache(maxsize=1)
 def is_host_cpu_x86() -> bool:
     machine = platform.machine().lower()
@@ -272,7 +271,10 @@ def is_flashinfer_available():
     """
     # if not get_bool_env_var("SGLANG_IS_FLASHINFER_AVAILABLE", default="true"):
     #     return False
-    return importlib.util.find_spec("flashinfer") is not None and is_cuda()
+    return (
+        importlib.util.find_spec("flashinfer") is not None
+        and current_platform.is_cuda()
+    )
 
 
 # env var managements

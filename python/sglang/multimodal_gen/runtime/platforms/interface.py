@@ -107,13 +107,11 @@ class Platform:
     def is_cpu(self) -> bool:
         return self._enum == PlatformEnum.CPU
 
-
     @lru_cache(maxsize=1)
     def is_blackwell(self):
         if not self.is_cuda():
             return False
         return torch.cuda.get_device_capability()[0] == 10
-
 
     @lru_cache(maxsize=1)
     def is_sm120(self):
@@ -121,11 +119,9 @@ class Platform:
             return False
         return torch.cuda.get_device_capability()[0] == 12
 
-
     @lru_cache(maxsize=1)
     def is_hpu(self) -> bool:
         return hasattr(torch, "hpu") and torch.hpu.is_available()
-
 
     @lru_cache(maxsize=1)
     def is_xpu(self) -> bool:
@@ -137,7 +133,6 @@ class Platform:
 
     def is_out_of_tree(self) -> bool:
         return self._enum == PlatformEnum.OOT
-
 
     @lru_cache(maxsize=1)
     def is_cuda_alike(self) -> bool:
@@ -216,7 +211,6 @@ class Platform:
     def get_device_total_memory(cls, device_id: int = 0) -> int:
         """Get the total memory of a device in bytes."""
         raise NotImplementedError
-
 
     @lru_cache(maxsize=1)
     def get_device(self, local_rank: int) -> torch.device:

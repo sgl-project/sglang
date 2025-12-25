@@ -52,7 +52,11 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
 
     # Skip ring attention tests on AMD/ROCm - Ring Attention requires Flash Attention
     # which is not available on AMD. Use Ulysses parallelism instead.
-    if current_platform.is_hip() and server_args.ring_degree is not None and server_args.ring_degree > 1:
+    if (
+        current_platform.is_hip()
+        and server_args.ring_degree is not None
+        and server_args.ring_degree > 1
+    ):
         pytest.skip(
             f"Skipping {case.id}: Ring Attention (ring_degree={server_args.ring_degree}) "
             "requires Flash Attention which is not available on AMD/ROCm"

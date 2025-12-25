@@ -13,9 +13,7 @@ import torch
 from packaging import version
 
 from sglang.multimodal_gen.runtime.platforms import current_platform
-from sglang.multimodal_gen.runtime.utils.common import (
-    get_bool_env_var,
-)
+from sglang.multimodal_gen.runtime.utils.common import get_bool_env_var
 
 logger = logging.getLogger(__name__)
 
@@ -203,7 +201,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "SGLANG_DIFFUSION_USE_PRECOMPILED": lambda: bool(
         os.environ.get("SGLANG_DIFFUSION_USE_PRECOMPILED")
     )
-                                                or bool(os.environ.get("SGLANG_DIFFUSION_PRECOMPILED_WHEEL_LOCATION")),
+    or bool(os.environ.get("SGLANG_DIFFUSION_PRECOMPILED_WHEEL_LOCATION")),
     # CMake build type
     # If not set, defaults to "Debug" or "RelWithDebInfo"
     # Available options: "Debug", "Release", "RelWithDebInfo"

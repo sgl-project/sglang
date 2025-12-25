@@ -22,7 +22,7 @@ from openai import Client, OpenAI
 
 from sglang.multimodal_gen.benchmarks.compare_perf import calculate_upper_bound
 from sglang.multimodal_gen.runtime.platforms import current_platform
-from sglang.multimodal_gen.runtime.utils.common import  kill_process_tree
+from sglang.multimodal_gen.runtime.utils.common import kill_process_tree
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
     globally_suppress_loggers,
     init_logger,
