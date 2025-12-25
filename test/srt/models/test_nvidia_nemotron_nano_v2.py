@@ -7,19 +7,19 @@ from sglang.test.server_fixtures.default_fixture import DefaultServerBase
 
 class TestNvidiaNemotronNanoV2BF16(GSM8KMixin, DefaultServerBase):
     model = "nvidia/NVIDIA-Nemotron-Nano-9B-v2"
-    accuracy = 0.87
+    gsm8k_accuracy_thres = 0.87
     other_args = ["--max-mamba-cache-size", "256"]
 
 
 class TestNvidiaNemotronNanoV2FP8(GSM8KMixin, DefaultServerBase):
-    accuracy = 0.87
+    gsm8k_accuracy_thres = 0.87
     model = "nvidia/NVIDIA-Nemotron-Nano-9B-v2-FP8"
     other_args = ["--max-mamba-cache-size", "256"]
 
 
 @unittest.skipIf(not is_blackwell(), "NVFP4 only supported on blackwell")
 class TestNvidiaNemotronNanoV2NVFP4(GSM8KMixin, DefaultServerBase):
-    accuracy = 0.855
+    gsm8k_accuracy_thres = 0.855
     model = "nvidia/NVIDIA-Nemotron-Nano-9B-v2-NVFP4"
     other_args = ["--max-mamba-cache-size", "256"]
 
@@ -29,7 +29,7 @@ class TestNvidiaNemotronNanoV2NVFP4(GSM8KMixin, DefaultServerBase):
     "with different hidden sizes (Nemotron-9B: 4480, Llama-3.2-1B: 2048)"
 )
 class TestNvidiaNemotronNanoV2SpeculativeDecoding(GSM8KMixin, DefaultServerBase):
-    accuracy = 0.87
+    gsm8k_accuracy_thres = 0.87
     model = "nvidia/NVIDIA-Nemotron-Nano-9B-v2"
     other_args = [
         "--speculative-algorithm",
@@ -60,7 +60,7 @@ class TestNvidiaNemotronNanoV2SpeculativeDecoding(GSM8KMixin, DefaultServerBase)
 class TestNvidiaNemotronNanoV2SpeculativeDecodingBF16Cache(
     GSM8KMixin, DefaultServerBase
 ):
-    accuracy = 0.87
+    gsm8k_accuracy_thres = 0.87
     model = "nvidia/NVIDIA-Nemotron-Nano-9B-v2"
     other_args = [
         "--speculative-algorithm",
