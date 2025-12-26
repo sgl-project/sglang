@@ -21,6 +21,7 @@ def policy_from_str(policy_str: Optional[str]) -> PolicyType:
         "cache_aware": PolicyType.CacheAware,
         "power_of_two": PolicyType.PowerOfTwo,
         "bucket": PolicyType.Bucket,
+        "manual": PolicyType.Manual,
     }
     return policy_map[policy_str]
 
@@ -135,6 +136,8 @@ class Router:
         health_check_endpoint: Health check endpoint path. Default: '/health'
         model_path: Model path for loading tokenizer (HuggingFace model ID or local path). Default: None
         tokenizer_path: Explicit tokenizer path (overrides model_path tokenizer if provided). Default: None
+        server_cert_path: Path to server TLS certificate (PEM format). Default: None
+        server_key_path: Path to server TLS private key (PEM format). Default: None
     """
 
     def __init__(self, router: _Router):

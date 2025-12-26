@@ -408,6 +408,22 @@ class GemmaRMSNorm(CustomOp):
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         return self._forward_impl(x, residual)
 
+    def forward_cpu(
+        self,
+        x: torch.Tensor,
+        residual: Optional[torch.Tensor] = None,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        if _is_cpu_amx_available:
+            if residual is not None:
+                torch.ops.sgl_kernel.gemma_fused_add_rmsnorm_cpu(
+                    x, residual, self.weight.data, self.variance_epsilon
+                )
+                return x, residual
+            return torch.ops.sgl_kernel.gemma_rmsnorm_cpu(
+                x, self.weight.data, self.variance_epsilon
+            )
+        return self.forward_native(x, residual)
+
     def forward_npu(
         self,
         x: torch.Tensor,
@@ -444,6 +460,11 @@ class Gemma3RMSNorm(CustomOp):
         # See https://github.com/huggingface/transformers/pull/29402
         output = output * (1.0 + self.weight.float())
         return output.type_as(x)
+
+    def forward_cpu(self, x):
+        if _is_cpu_amx_available and x.stride(-1) == 1:
+            return torch.ops.sgl_kernel.gemma3_rmsnorm_cpu(x, self.weight, self.eps)
+        return self.forward_native(x)
 
     def forward_cuda(self, x):
         return self.forward_native(x)

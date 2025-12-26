@@ -40,6 +40,7 @@ except ImportError:
     )
 
 from sglang.srt.configs.model_config import AttentionArch
+from sglang.srt.layers.attention.utils import pad_sequence_with_mask
 from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype
 from sglang.srt.utils import get_bool_env_var
 
@@ -77,7 +78,7 @@ class ForwardMetadata:
     reduce_final_map: Optional[torch.Tensor] = None
     reduce_partial_map: Optional[torch.Tensor] = None
     num_kv_splits: Optional[int] = None
-    # num_kv_splits_indptr: Optional[torch.Tensor] = None
+    run_graph: Optional[bool] = True
 
 
 global_workspace_buffer = None
@@ -178,11 +179,18 @@ class AiterAttnBackend(AttentionBackend):
         self.forward_metadata: ForwardMetadata = None
 
         if self.use_mla:
+            self.enable_dp_attention = is_dp_attention_enabled()
             self.qo_indptr_ = torch.zeros(
                 (max_bs + 1,), dtype=torch.int32, device=model_runner.device
             )
+            global _use_mla_ps_kernel, fast_mode, intra_batch_mode
 
-            self.enable_dp_attention = is_dp_attention_enabled()
+            # current persist a16w16 mla_decode kernel does not support head_num = 128
+            # need to fall back to non-persist
+            if self.kv_cache_dtype is not fp8_dtype and self.enable_dp_attention:
+                _use_mla_ps_kernel = False
+                fast_mode = False
+                intra_batch_mode = False
 
             self.max_split_per_batch = 32 if _use_mla_ps_kernel else None
 
@@ -383,6 +391,7 @@ class AiterAttnBackend(AttentionBackend):
                 reduce_final_map=reduce_final_map,
                 reduce_partial_map=reduce_partial_map,
                 num_kv_splits=num_kv_splits,
+                run_graph=False,
             )
 
         elif forward_batch.forward_mode.is_draft_extend():
@@ -439,7 +448,7 @@ class AiterAttnBackend(AttentionBackend):
                     reduce_final_map=reduce_final_map,
                     reduce_partial_map=reduce_partial_map,
                     num_kv_splits=num_kv_splits,
-                    # num_kv_splits_indptr=num_kv_splits_indptr,
+                    run_graph=False,
                 )
             else:
                 self.indices_updater_prefill.update(
@@ -534,7 +543,7 @@ class AiterAttnBackend(AttentionBackend):
                     reduce_final_map=reduce_final_map,
                     reduce_partial_map=reduce_partial_map,
                     num_kv_splits=num_kv_splits,
-                    # num_kv_splits_indptr=num_kv_splits_indptr,
+                    run_graph=False,
                 )
             else:
                 self.indices_updater_prefill.update(
@@ -1169,10 +1178,6 @@ class AiterAttnBackend(AttentionBackend):
                 )
                 return o
             elif forward_batch.forward_mode.is_draft_extend():
-                o = q.new_empty(
-                    (q.shape[0], layer.tp_q_head_num, layer.v_head_dim),
-                    dtype=self.input_dtype,
-                )
 
                 work_metadata = self.forward_metadata.work_metadata
                 work_indptr = self.forward_metadata.work_indptr
@@ -1200,29 +1205,75 @@ class AiterAttnBackend(AttentionBackend):
                         intra_batch_mode=intra_batch_mode,
                     )
 
-                mla_decode_fwd(
-                    q,
-                    K_Buffer.view(-1, 1, 1, layer.qk_head_dim),
-                    o,
-                    self.forward_metadata.qo_indptr,
-                    self.forward_metadata.kv_indptr,
-                    self.forward_metadata.kv_indices,
-                    self.forward_metadata.kv_last_page_len,
-                    self.forward_metadata.max_q_len,
-                    layer.scaling,
-                    layer.logit_cap,
-                    work_meta_data=work_metadata,
-                    work_indptr=work_indptr,
-                    work_info_set=work_info_set,
-                    reduce_indptr=reduce_indptr,
-                    reduce_final_map=reduce_final_map,
-                    reduce_partial_map=reduce_partial_map,
-                    q_scale=layer.k_scale,
-                    kv_scale=layer.k_scale,
-                    intra_batch_mode=intra_batch_mode,
-                    num_kv_splits=num_kv_splits,
-                )
-                return o
+                if self.forward_metadata.run_graph is not True:
+
+                    bs, q_pad, q_mask = pad_sequence_with_mask(
+                        q.view(q.shape[0], -1),
+                        qo_indptr[:-1],
+                        forward_batch.extend_seq_lens,
+                        self.forward_metadata.max_q_len,
+                    )
+                    o = q.new_empty(
+                        (
+                            bs * self.forward_metadata.max_q_len,
+                            layer.tp_q_head_num,
+                            layer.v_head_dim,
+                        ),
+                        dtype=self.input_dtype,
+                    )
+                    mla_decode_fwd(
+                        q_pad.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+                        K_Buffer.view(-1, 1, 1, layer.qk_head_dim),
+                        o,
+                        self.forward_metadata.qo_indptr,
+                        self.forward_metadata.kv_indptr,
+                        self.forward_metadata.kv_indices,
+                        self.forward_metadata.kv_last_page_len,
+                        self.forward_metadata.max_q_len,
+                        layer.scaling,
+                        layer.logit_cap,
+                        work_meta_data=work_metadata,
+                        work_indptr=work_indptr,
+                        work_info_set=work_info_set,
+                        reduce_indptr=reduce_indptr,
+                        reduce_final_map=reduce_final_map,
+                        reduce_partial_map=reduce_partial_map,
+                        q_scale=layer.k_scale,
+                        kv_scale=layer.k_scale,
+                        intra_batch_mode=intra_batch_mode,
+                        num_kv_splits=num_kv_splits,
+                    )
+
+                    return o[q_mask]
+                else:
+                    o = q.new_empty(
+                        (q.shape[0], layer.tp_q_head_num, layer.v_head_dim),
+                        dtype=self.input_dtype,
+                    )
+
+                    mla_decode_fwd(
+                        q,
+                        K_Buffer.view(-1, 1, 1, layer.qk_head_dim),
+                        o,
+                        self.forward_metadata.qo_indptr,
+                        self.forward_metadata.kv_indptr,
+                        self.forward_metadata.kv_indices,
+                        self.forward_metadata.kv_last_page_len,
+                        self.forward_metadata.max_q_len,
+                        layer.scaling,
+                        layer.logit_cap,
+                        work_meta_data=work_metadata,
+                        work_indptr=work_indptr,
+                        work_info_set=work_info_set,
+                        reduce_indptr=reduce_indptr,
+                        reduce_final_map=reduce_final_map,
+                        reduce_partial_map=reduce_partial_map,
+                        q_scale=layer.k_scale,
+                        kv_scale=layer.k_scale,
+                        intra_batch_mode=intra_batch_mode,
+                        num_kv_splits=num_kv_splits,
+                    )
+                    return o
             else:
                 raise ValueError(
                     f"Invalid forward mode for MLA prefill: {forward_batch.forward_mode=}"
