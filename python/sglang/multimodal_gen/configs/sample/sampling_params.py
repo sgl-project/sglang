@@ -69,7 +69,7 @@ class DataType(Enum):
 
     def get_default_extension(self) -> str:
         if self == DataType.IMAGE:
-            return "jpg"
+            return "png"
         else:
             return "mp4"
 
@@ -279,8 +279,10 @@ class SamplingParams:
 
         if pipeline_config.task_type.is_image_gen():
             # settle num_frames
-            logger.debug(f"num_frames set to 1 for image generation model")
-            self.num_frames = 1
+            if not server_args.pipeline_config.allow_set_num_frames():
+                logger.debug(f"num_frames set to 1 for image generation model")
+                self.num_frames = 1
+
         elif self.adjust_frames:
             # NOTE: We must apply adjust_num_frames BEFORE the SP alignment logic below.
             # If we apply it after, adjust_num_frames might modify the frame count
