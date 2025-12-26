@@ -733,6 +733,8 @@ def get_generate_fn(
         """
         Create a video job via /v1/videos, poll until completion,
         then download the binary content and validate it.
+
+        Returns request-id
         """
 
         create_kwargs: dict[str, Any] = {
@@ -842,6 +844,8 @@ def get_generate_fn(
         result = response.parse()
         validate_image(result.data[0].b64_json)
 
+        rid = result.id
+
         img_data = base64.b64decode(result.data[0].b64_json)
         # Infer expected format from request parameters
         expected_ext = get_expected_image_format(req_output_format, req_background)
@@ -869,7 +873,7 @@ def get_generate_fn(
         )
         os.remove(tmp_path)
 
-        return str(result.created)
+        return rid
 
     def generate_image_edit(case_id, client) -> str:
         """TI2I: Text + Image ? Image edit."""
@@ -910,12 +914,12 @@ def get_generate_fn(
             for img in images:
                 img.close()
 
-        rid = response.headers.get("x-request-id", "")
-
         result = response.parse()
         validate_image(result.data[0].b64_json)
 
         img_data = base64.b64decode(result.data[0].b64_json)
+        rid = result.id
+
         # Infer expected format from request parameters
         expected_ext = get_expected_image_format(req_output_format, req_background)
         expected_filename = f"{rid}.{expected_ext}"
@@ -976,8 +980,9 @@ def get_generate_fn(
             extra_body={"url": image_urls},
         )
 
-        rid = response.headers.get("x-request-id", "")
         result = response.parse()
+        rid = result.id
+
         validate_image(result.data[0].b64_json)
 
         # Save and upload result for verification
