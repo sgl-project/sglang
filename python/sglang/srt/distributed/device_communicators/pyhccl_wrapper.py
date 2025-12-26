@@ -141,10 +141,8 @@ class HCCLLibrary:
     exported_functions = [
         # const char* HcclGetErrorString(HcclResult code);
         Function("HcclGetErrorString", ctypes.c_char_p, [hcclResult_t]),
-
         # HcclResult HcclGetRootInfo(HcclRootInfo *rootInfo);
         Function("HcclGetRootInfo", hcclResult_t, [ctypes.POINTER(hcclUniqueId)]),
-
         # HcclResult HcclCommInitRootInfo(
         #   uint32_t nRanks, const HcclRootInfo *rootInfo, uint32_t rank, HcclComm *comm);
         # note that HcclComm is a pointer type, so the last argument is a pointer to a pointer
@@ -336,7 +334,7 @@ class HCCLLibrary:
         stream: aclrtStream_t,
     ) -> None:
         self.HCCL_CHECK(
-            self._funcs["HcclBroadcast"](buf, count, datatype,root, comm, stream)
+            self._funcs["HcclBroadcast"](buf, count, datatype, root, comm, stream)
         )
 
     def hcclAllGather(
