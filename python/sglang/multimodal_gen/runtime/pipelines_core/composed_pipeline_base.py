@@ -22,7 +22,7 @@ from sglang.multimodal_gen.runtime.loader.component_loader import (
 from sglang.multimodal_gen.runtime.pipelines_core.executors.pipeline_executor import (
     PipelineExecutor,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages import PipelineStage
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
@@ -345,7 +345,7 @@ class ComposedPipelineBase(ABC):
         self,
         batch: Req,
         server_args: ServerArgs,
-    ) -> Req:
+    ) -> OutputBatch:
         """
         Generate a video or image using the pipeline.
 
@@ -372,4 +372,4 @@ class ComposedPipelineBase(ABC):
             main_process_only=True,
         )
 
-        return self.executor.execute(self.stages, batch, server_args)
+        return self.executor.execute_with_profiling(self.stages, batch, server_args)
