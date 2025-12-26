@@ -1129,6 +1129,38 @@ class FlushCacheReqOutput(BaseReq):
 
 
 @dataclass
+class AttachHiCacheStorageReqInput(BaseReq):
+    """Dynamically attach (enable) HiCache storage backend at runtime.
+
+    Note: `storage_backend_extra_config_json` is a JSON string. It may contain both:
+    - backend-specific configs (e.g., mooncake master address)
+    - prefetch-related knobs (prefetch_threshold, prefetch_timeout_*, hicache_storage_pass_prefix_keys)
+    """
+
+    storage_backend: str
+    storage_backend_extra_config_json: Optional[str] = None
+
+
+@dataclass
+class AttachHiCacheStorageReqOutput(BaseReq):
+    success: bool
+    message: str = ""
+
+
+@dataclass
+class DetachHiCacheStorageReqInput(BaseReq):
+    """Dynamically detach (disable) HiCache storage backend at runtime."""
+
+    pass
+
+
+@dataclass
+class DetachHiCacheStorageReqOutput(BaseReq):
+    success: bool
+    message: str = ""
+
+
+@dataclass
 class PauseGenerationReqInput(BaseReq):
     """
     Note that the PauseGenerationRequests is only supported in SGLang Server.

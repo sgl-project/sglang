@@ -23,6 +23,8 @@ import fastapi
 import zmq
 
 from sglang.srt.managers.io_struct import (
+    AttachHiCacheStorageReqInput,
+    AttachHiCacheStorageReqOutput,
     CheckWeightsReqInput,
     CheckWeightsReqOutput,
     ClearHiCacheReqInput,
@@ -30,6 +32,8 @@ from sglang.srt.managers.io_struct import (
     CloseSessionReqInput,
     DestroyWeightsUpdateGroupReqInput,
     DestroyWeightsUpdateGroupReqOutput,
+    DetachHiCacheStorageReqInput,
+    DetachHiCacheStorageReqOutput,
     ExpertDistributionReq,
     ExpertDistributionReqOutput,
     ExpertDistributionReqType,
@@ -198,6 +202,12 @@ class TokenizerCommunicatorMixin:
         self.clear_hicache_storage_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
+        self.attach_hicache_storage_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
+        self.detach_hicache_storage_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
         self.profile_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
@@ -275,6 +285,14 @@ class TokenizerCommunicatorMixin:
                     self.clear_hicache_storage_communicator.handle_recv,
                 ),
                 (
+                    AttachHiCacheStorageReqOutput,
+                    self.attach_hicache_storage_communicator.handle_recv,
+                ),
+                (
+                    DetachHiCacheStorageReqOutput,
+                    self.detach_hicache_storage_communicator.handle_recv,
+                ),
+                (
                     FlushCacheReqOutput,
                     self.flush_cache_communicator.handle_recv,
                 ),
@@ -314,6 +332,46 @@ class TokenizerCommunicatorMixin:
         return (await self.clear_hicache_storage_communicator(ClearHiCacheReqInput()))[
             0
         ]
+
+    async def attach_hicache_storage(
+        self: TokenizerManager,
+        storage_backend: str,
+        storage_backend_extra_config_json: Optional[str] = None,
+    ) -> AttachHiCacheStorageReqOutput:
+        """Attach (enable) HiCache storage backend at runtime."""
+        results = await self.attach_hicache_storage_communicator(
+            AttachHiCacheStorageReqInput(
+                storage_backend=storage_backend,
+                storage_backend_extra_config_json=storage_backend_extra_config_json,
+            )
+        )
+
+        all_success, all_message = _Communicator.merge_results(results)
+        out = AttachHiCacheStorageReqOutput(success=all_success, message=all_message)
+        # TODO: partial rollback if failed
+        if all_success:
+            # Keep tokenizer side server_info consistent with scheduler side.
+            self.server_args.hicache_storage_backend = storage_backend
+            self.server_args.hicache_storage_backend_extra_config = (
+                storage_backend_extra_config_json
+            )
+        return out
+
+    async def detach_hicache_storage(
+        self: TokenizerManager,
+    ) -> DetachHiCacheStorageReqOutput:
+        """Detach (disable) HiCache storage backend at runtime."""
+        results = await self.detach_hicache_storage_communicator(
+            DetachHiCacheStorageReqInput()
+        )
+
+        all_success, all_message = _Communicator.merge_results(results)
+        out = DetachHiCacheStorageReqOutput(success=all_success, message=all_message)
+        # TODO: partial rollback if failed
+        if all_success:
+            self.server_args.hicache_storage_backend = None
+            self.server_args.hicache_storage_backend_extra_config = None
+        return out
 
     async def start_profile(
         self: TokenizerManager,
