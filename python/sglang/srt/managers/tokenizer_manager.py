@@ -20,6 +20,7 @@ import logging
 import os
 import pickle
 import signal
+import socket
 import sys
 import threading
 import time
@@ -1918,30 +1919,23 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
 
         asyncio.create_task(asyncio.to_thread(background_task))
 
-    def dump_requests_before_crash(self):
+    def dump_requests_before_crash(
+        self, hostname: str = os.getenv("HOSTNAME", socket.gethostname())
+    ):
+        if not self.crash_dump_folder:
+            return
+
         if self.crash_dump_performed:
             logger.info(
                 "SIGTERM/SIGQUIT/Exception triggered, but crash dump already performed, skipping."
             )
             return
-
-        if not self.crash_dump_folder:
-            return
+        else:
+            self.crash_dump_performed = True
 
         logger.error(f"Dumping requests before crash. {self.crash_dump_folder=}")
-        self.crash_dump_performed = True
 
-        # Check if NFS directory is available
-        # expected_nfs_dir = "/" + self.crash_dump_folder.lstrip("/").split("/")[0]
-        # use_nfs_dir = os.path.isdir(expected_nfs_dir) and os.access(
-        #     expected_nfs_dir, os.W_OK
-        # )
-        use_nfs_dir = False
-        if not use_nfs_dir:
-            logger.error(
-                f"Expected NFS directory is not available or writable. Uploading to GCS."
-            )
-
+        # Add finished requests from crash_dump_request_list
         data_to_dump = []
         if self.crash_dump_request_list:
             data_to_dump.extend(self.crash_dump_request_list)
@@ -1964,17 +1958,17 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         if not data_to_dump:
             return
 
-        object_name = f'crash_dump_{datetime.now().strftime("%Y-%m-%d_%H-%M-%S")}.pkl'
+        # Create a file
         filename = os.path.join(
             self.crash_dump_folder,
-            os.getenv("HOSTNAME", None),
-            object_name,
+            hostname,
+            f'crash_dump_{datetime.now().strftime("%Y-%m-%d_%H-%M-%S")}.pkl',
         )
-
         os.makedirs(os.path.dirname(filename), exist_ok=True)
-        # Include server_args in the dump
+
+        # Write the data to the file
         data_to_dump_with_server_args = {
-            "server_args": self.server_args,
+            "server_args": self.server_args,  # Include server_args in the dump
             "requests": data_to_dump,
         }
         with open(filename, "wb") as f:
@@ -1982,24 +1976,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         logger.error(
             f"Dumped {len(self.crash_dump_request_list)} finished and {len(unfinished_requests)} unfinished requests before crash to {filename}"
         )
-
-        def _upload_file_to_gcs(bucket_name, source_file_path, object_name):
-            from google.cloud import storage
-
-            client = storage.Client()
-            bucket = client.bucket(bucket_name)
-            blob = bucket.blob(object_name)
-            blob.upload_from_filename(source_file_path, if_generation_match=0)
-            logger.error(
-                f"Successfully uploaded {source_file_path} to gs://{bucket_name}/{object_name}"
-            )
-
-        if not use_nfs_dir:
-            _upload_file_to_gcs(
-                "sglang_crash_dump",
-                filename,
-                os.getenv("HOSTNAME", None) + "/" + object_name,
-            )
+        return filename
 
     async def sigterm_watchdog(self):
         while not self.gracefully_exit:
