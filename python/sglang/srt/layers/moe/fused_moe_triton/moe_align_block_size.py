@@ -54,7 +54,10 @@ def moe_align_block_size(
     - The padding ensures that the total number of tokens is now divisible
         by block_size for proper block matrix operations.
     """
-    max_num_tokens_padded = topk_ids.numel() + (num_experts + 1) * (block_size - 1)
+    if topk_ids.numel() < num_experts + 1:
+        max_num_tokens_padded = topk_ids.numel() * block_size
+    else:
+        max_num_tokens_padded = topk_ids.numel() + (num_experts + 1) * (block_size - 1)
     sorted_ids = torch.empty(
         (max_num_tokens_padded,), dtype=torch.int32, device=topk_ids.device
     )
@@ -69,11 +72,6 @@ def moe_align_block_size(
         (num_experts + 2,), dtype=torch.int32, device=topk_ids.device
     )
 
-    # Threshold based on benchmark results
-    fuse_sorted_ids_padding = sorted_ids.shape[0] <= 4096
-    if not fuse_sorted_ids_padding:
-        sorted_ids.fill_(topk_ids.numel())
-
     sgl_moe_align_block_size(
         topk_ids,
         num_experts + 1,
@@ -82,6 +80,6 @@ def moe_align_block_size(
         expert_ids,
         num_tokens_post_pad,
         cumsum_buffer,
-        fuse_sorted_ids_padding,
+        True,
     )
     return sorted_ids, expert_ids, num_tokens_post_pad

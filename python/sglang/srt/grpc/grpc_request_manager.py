@@ -28,7 +28,7 @@ from sglang.srt.managers.io_struct import (
     TokenizedGenerateReqInput,
 )
 from sglang.srt.server_args import PortArgs, ServerArgs
-from sglang.srt.utils import get_zmq_socket, kill_process_tree
+from sglang.srt.utils import get_or_create_event_loop, get_zmq_socket, kill_process_tree
 from sglang.utils import get_exception_traceback
 
 logger = logging.getLogger(__name__)
@@ -79,6 +79,10 @@ class GrpcReqState:
     first_token_time: float = 0.0
     last_time: float = 0.0
     last_completion_tokens: int = 1
+
+    # perf_counter equivalents for accurate time calculations
+    finished_time_perf: float = 0.0
+    first_token_time_perf: float = 0.0
 
     # Streaming state
     stream_finished: bool = False
@@ -536,6 +540,7 @@ class GrpcRequestManager:
         put_tasks = []
         cleanup_tasks = []
         now = time.time()
+        now_perf_counter = time.perf_counter()
 
         # Process each request in the batch
         for i, rid in enumerate(batch_out.rids):
@@ -552,6 +557,7 @@ class GrpcRequestManager:
             # Update metrics
             if state.first_token_time == 0.0:
                 state.first_token_time = now
+                state.first_token_time_perf = now_perf_counter
             state.last_time = now
 
             # Extract output for this request
@@ -650,6 +656,7 @@ class GrpcRequestManager:
             if output_data["finished"]:
                 state.finished = True
                 state.finished_time = now
+                state.finished_time_perf = now_perf_counter
                 state.stream_finished = True
                 state.event.set()
 
@@ -681,7 +688,9 @@ class GrpcRequestManager:
                     batch_out.prompt_tokens[i] if batch_out.prompt_tokens else 0
                 ),
                 "finish_reason": (
-                    batch_out.finish_reason[i] if batch_out.finish_reason else None
+                    batch_out.finished_reasons[i]
+                    if batch_out.finished_reasons
+                    else None
                 ),
             }
 
@@ -691,6 +700,7 @@ class GrpcRequestManager:
             # Mark as finished
             state.finished = True
             state.finished_time = time.time()
+            state.finished_time_perf = time.perf_counter()
             state.event.set()
 
     async def _handle_health_check_output(self, health_out: HealthCheckOutput):
@@ -723,6 +733,7 @@ class GrpcRequestManager:
         # Mark as finished
         state.finished = True
         state.finished_time = time.time()
+        state.finished_time_perf = time.perf_counter()
         state.event.set()
 
     async def _handle_abort_req(self, recv_obj: AbortReq):
@@ -867,7 +878,7 @@ class GrpcRequestManager:
             return
 
         self.no_create_loop = True
-        loop = asyncio.get_event_loop()
+        loop = get_or_create_event_loop()
         self.asyncio_tasks.add(
             loop.create_task(print_exception_wrapper(self.handle_loop))
         )

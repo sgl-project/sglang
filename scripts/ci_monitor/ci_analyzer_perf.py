@@ -477,9 +477,9 @@ class SGLangPerfAnalyzer:
     def get_job_logs(self, run_id: int, job_name: str) -> Optional[str]:
         """Get logs for specific job with early exit optimization"""
         try:
-            # First get job list
+            # First get job list with pagination to ensure we get all jobs
             jobs_url = f"{self.base_url}/repos/{self.repo}/actions/runs/{run_id}/jobs"
-            response = self.session.get(jobs_url)
+            response = self.session.get(jobs_url, params={"per_page": 100})
             response.raise_for_status()
             jobs_data = response.json()
 
