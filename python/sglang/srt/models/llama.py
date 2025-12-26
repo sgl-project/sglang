@@ -52,7 +52,7 @@ from sglang.srt.model_loader.weight_utils import (
     maybe_remap_kv_scale_name,
 )
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import add_prefix, is_npu, make_layers
+from sglang.srt.utils import add_prefix, is_npu, make_layers, is_npu
 from sglang.utils import get_exception_traceback
 
 logger = logging.getLogger(__name__)
