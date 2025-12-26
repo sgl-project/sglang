@@ -12,7 +12,7 @@ from sglang.test.test_utils import (
 )
 
 TEST_MODEL_MATRIX = {
-    "/root/.cache/modelscope/hub/models/Qwen/Qwen3-1.7B-GPTQ-Int8": {
+    "Qwen/Qwen3-1.7B-GPTQ-Int8": {
         "accuracy": 0.65,
     },
 }
