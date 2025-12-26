@@ -2,19 +2,13 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.layers.attention.nsa.utils import NSA_QUANT_K_CACHE_FAST
-
 
 def quantize_k_cache(cache_k):
-    # TODO upstream can skip concat([k_nope, k_pe]) since we split them here
-    if NSA_QUANT_K_CACHE_FAST:
-        return _quantize_k_cache_fast_wrapped(cache_k)
-    else:
-        return _quantize_k_cache_slow(cache_k)
+    return _quantize_k_cache_fast_wrapped(cache_k)
 
 
 # Copied from original
-def _quantize_k_cache_slow(
+def _quantize_k_cache_ref(
     input_k_cache: torch.Tensor,  # (num_blocks, block_size, h_k, d)
     dv: int = 512,
     tile_size: int = 128,
@@ -220,7 +214,7 @@ if __name__ == "__main__":
             device="cuda",
         )
 
-        ref_quant = _quantize_k_cache_slow(input_k_cache)
+        ref_quant = _quantize_k_cache_ref(input_k_cache)
         actual_quant = _quantize_k_cache_fast_wrapped(input_k_cache)
 
         ref_ref_dequant = dequant_k_cache._dequantize_k_cache_slow(ref_quant)
