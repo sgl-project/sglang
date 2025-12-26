@@ -15,34 +15,21 @@ logger = logging.getLogger(__name__)
 
 
 class HierarchyBlock(DllmAlgorithm):
-    """
-    Fast dLLM v2 hierarchical block decoding.
-    
-    Process sub-blocks sequentially: only unmask tokens in current sub-block.
-    Token shift: [L0, L1, ..., LN-1] -> [L0, L0, L1, ..., LN-2]
-    
-    Key feature: Maintains inherited tokens across blocks to ensure correct
-    prediction of each block's first token (like Fast dLLM prefill).
-    """
+    """Fast dLLM v2 hierarchical block decoding with token inheritance."""
 
     def __init__(self, config: DllmConfig):
         super().__init__(config)
-        self.threshold = config.algorithm_config.get("threshold", 0.95)
+        self.threshold = config.algorithm_config.get("threshold", 0.90)
         self.sub_block_size = config.algorithm_config.get("sub_block_size", 8)
         self.token_shift = config.algorithm_config.get("token_shift", 1)
         self.debug = config.algorithm_config.get("debug", True)
+        self.use_AR_for_first_token = config.algorithm_config.get("use_AR_for_first_token", True)
         
-        # Maintain inherited first token from previous block
         self.last_inherited_token = None
-        
-        # Track last block end position for continuity checks
         self.last_block_end_position = None
-        
-        # Tokenizer for decoding (loaded lazily)
         self.tokenizer = None
     
     def _decode_tokens(self, token_ids, model_runner):
-        """Helper method to decode token IDs to text."""
         if self.tokenizer is None:
             try:
                 from transformers import AutoTokenizer
@@ -53,7 +40,7 @@ class HierarchyBlock(DllmAlgorithm):
                     )
             except Exception as e:
                 logger.warning(f"[HierarchyBlock] Failed to load tokenizer: {e}")
-                self.tokenizer = False  # Mark as failed to avoid retry
+                self.tokenizer = False
         
         if self.tokenizer and self.tokenizer is not False:
             try:
@@ -73,54 +60,46 @@ class HierarchyBlock(DllmAlgorithm):
         block_mask = forward_batch.input_ids == self.mask_id
         num_masked = block_mask.sum().item()
         block_start = total_len - num_masked
-
         num_sub_blocks = (num_masked + self.sub_block_size - 1) // self.sub_block_size
 
         if self.debug:
             logger.info(f"[HierarchyBlock] total_len={total_len}, num_masked={num_masked}, "
-                       f"block_start={block_start}, block_size={self.block_size}, "
-                       f"sub_block_size={self.sub_block_size}, num_sub_blocks={num_sub_blocks}, "
-                       f"token_shift={self.token_shift}")
+                       f"block_start={block_start}, num_sub_blocks={num_sub_blocks}")
             logger.info(f"[HierarchyBlock] input_ids[:5]={forward_batch.input_ids[:5].tolist()}, "
                        f"input_ids[-5:]={forward_batch.input_ids[-5:].tolist()}")
             if hasattr(forward_batch, 'positions') and forward_batch.positions is not None:
                 positions_list = forward_batch.positions.tolist()
                 logger.info(f"[HierarchyBlock] positions[:5]={positions_list[:5]}, "
                            f"positions[-5:]={positions_list[-5:]}")
-                # Check position continuity for all-mask blocks
-                if block_start == 0 and len(positions_list) > 0:
-                    expected_start = self.last_block_end_position + 1 if self.last_block_end_position is not None else 0
-                    actual_start = positions_list[0]
-                    if expected_start != actual_start:
-                        logger.warning(f"[HierarchyBlock] Position discontinuity detected! "
-                                     f"Expected start={expected_start}, actual start={actual_start}. "
-                                     f"This will cause incorrect generation!")
 
-        # Step 1: Handle first token inheritance for all-mask blocks
-        # If first token in input_ids is mask AND we have inherited token, replace it
-        first_token_is_mask = forward_batch.input_ids[0] == self.mask_id
+        # Detect new request (positions start from 0) and clear inheritance
+        is_new_request = False
+        if hasattr(forward_batch, 'positions') and forward_batch.positions is not None:
+            if forward_batch.positions[0] == 0:
+                is_new_request = True
+                if self.last_inherited_token is not None and self.debug:
+                    logger.info(f"[HierarchyBlock] New request detected, clearing inheritance")
+                self.last_inherited_token = None
+                self.last_block_end_position = None
         
-        if first_token_is_mask and self.last_inherited_token is not None:
-            # All-mask block: use inherited token from previous block
-            inherited_token = self.last_inherited_token
-            # Replace the first mask token with inherited token
-            # Note: block_start is the absolute position, for all-mask block it's 0
-            forward_batch.input_ids[0] = inherited_token
+        # Handle token inheritance for all-mask blocks
+        first_token_is_mask = forward_batch.input_ids[0] == self.mask_id
+        if first_token_is_mask and self.last_inherited_token is not None and not is_new_request:
+            forward_batch.input_ids[0] = self.last_inherited_token
             if self.debug:
-                logger.info(f"[HierarchyBlock] INHERITED first token: position=0, "
-                           f"token_id={inherited_token} (from previous block)")
-                logger.info(f"[HierarchyBlock] After inheritance: input_ids[:5]={forward_batch.input_ids[:5].tolist()}")
-        elif self.debug:
-            if first_token_is_mask:
-                logger.info(f"[HierarchyBlock] First token is MASK but no inherited token available (first block)")
-            else:
-                logger.info(f"[HierarchyBlock] First token is real token (prompt in block), "
-                           f"token_id={forward_batch.input_ids[0].item()}")
+                logger.info(f"[HierarchyBlock] Inherited token: {self.last_inherited_token}")
+        elif self.debug and first_token_is_mask:
+            logger.info(f"[HierarchyBlock] First mask, no inheritance")
 
-        # Step 2: Process sub-blocks sequentially (remaining tokens)
+        # Find first mask position for AR strategy
+        block_mask_full = forward_batch.input_ids[block_start:] == self.mask_id
+        first_mask_rel_pos = block_mask_full.nonzero(as_tuple=True)[0][0].item() if block_mask_full.any() else -1
+        
+        # Process sub-blocks
         for sub_idx in range(num_sub_blocks):
             rel_start = sub_idx * self.sub_block_size
             rel_end = min(rel_start + self.sub_block_size, num_masked)
+            contains_first_mask = (first_mask_rel_pos >= rel_start and first_mask_rel_pos < rel_end) if first_mask_rel_pos >= 0 else False
 
             while True:
                 block_mask = forward_batch.input_ids[block_start:] == self.mask_id
@@ -130,75 +109,55 @@ class HierarchyBlock(DllmAlgorithm):
 
                 out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
                 logits_output, can_run_cuda_graph = out.logits_output, out.can_run_graph
-                
                 full_logits = logits_output.full_logits
                 assert full_logits is not None
-                if full_logits.dim() == 3:
-                    full_logits = full_logits.reshape(-1, full_logits.shape[-1])
-
-                logits_len = full_logits.shape[0]
-                
-                if self.debug:
-                    logger.info(f"[HierarchyBlock] sub_idx={sub_idx}, rel_start={rel_start}, "
-                               f"rel_end={rel_end}, full_logits.shape={full_logits.shape}, "
-                               f"logits_len={logits_len}")
-                
-                # Extract block logits and apply token shift
-                # For token shift: logits[i] predicts token[i+1]
-                # Like Fast dLLM v2, we need to shift logits: [L0, L0, L1, ..., LN-2]
-                # Note: full_logits is 2D [seq_len, vocab_size] after reshape
-                
-                if logits_len == total_len:
-                    # We have full logits
-                    block_logits = full_logits[block_start:]
-                elif logits_len >= num_masked:
-                    # We have enough logits for the block
-                    block_logits = full_logits[-num_masked:]
-                else:
-                    block_logits = full_logits
 
                 if self.debug:
-                    logger.info(f"[HierarchyBlock] block_logits.shape={block_logits.shape} (before shift)")
+                    logger.info(f"[HierarchyBlock] sub_idx={sub_idx}, logits.shape={full_logits.shape}")
                 
-                # Apply token shift: [L0, L0, L1, ..., LN-2]
-                # This aligns logits[i] to predict token[i] instead of token[i+1]
-                # block_logits is 2D: [seq_len, vocab_size]
+                # Token shift: [L0, L0, L1, ..., LN-2]
                 if self.token_shift > 0:
-                    # Duplicate first logit and drop last logit
-                    first_logit = block_logits[:1, :]  # [1, vocab]
-                    rest_logits = block_logits[:-1, :]  # [N-1, vocab]
-                    shifted = torch.cat([first_logit, rest_logits], dim=0)
-                    
-                    if self.debug:
-                        logger.info(f"[HierarchyBlock] Token shift applied: [L0, L0, L1, ..., L{block_logits.shape[0]-2}], "
-                                   f"shifted.shape={shifted.shape}")
+                    shifted_full = torch.cat([full_logits[:1], full_logits[:-1]], dim=0)
                 else:
-                    shifted = block_logits
+                    shifted_full = full_logits
                 
-                # Take only current sub-block logits
-                # shifted[i] predicts token[block_start + i]
-                sub_logits = shifted[rel_start:rel_end, :]
-
-                if self.debug:
-                    logger.info(f"[HierarchyBlock] shifted.shape={shifted.shape}, "
-                               f"sub_logits.shape={sub_logits.shape}, sub_mask.shape={sub_mask.shape}")
+                # Extract block and sub-block logits
+                logits_len = full_logits.shape[0]
+                if logits_len == total_len:
+                    shifted_block = shifted_full[block_start:]
+                elif logits_len >= num_masked:
+                    shifted_block = shifted_full[-num_masked:]
+                else:
+                    shifted_block = shifted_full
+                
+                sub_logits = shifted_block[rel_start:rel_end, :]
                 
                 # Compute predictions and confidence
-                # sub_logits shape: [sub_block_len, vocab_size]
                 preds = sub_logits.argmax(dim=-1)
                 probs = F.softmax(sub_logits, dim=-1)
                 conf = probs.gather(dim=-1, index=preds.unsqueeze(-1)).squeeze(-1)
-                
-                # Only consider masked positions
                 conf = torch.where(sub_mask, conf, torch.tensor(-np.inf, device=conf.device))
 
-                # Select tokens to unmask
-                unmask = conf > self.threshold
-                if unmask.sum().item() == 0:
-                    unmask[conf.argmax()] = True
-                unmask = unmask & sub_mask
+                # Select unmask strategy
+                first_mask_still_masked = (first_mask_rel_pos >= 0 and 
+                                          forward_batch.input_ids[block_start + first_mask_rel_pos] == self.mask_id)
+                
+                if self.use_AR_for_first_token and contains_first_mask and first_mask_still_masked:
+                    # AR: unmask first token only
+                    unmask = torch.zeros_like(sub_mask, dtype=torch.bool)
+                    first_mask_idx_in_sub = first_mask_rel_pos - rel_start
+                    if 0 <= first_mask_idx_in_sub < len(sub_mask) and sub_mask[first_mask_idx_in_sub]:
+                        unmask[first_mask_idx_in_sub] = True
+                    if self.debug:
+                        logger.info(f"[HierarchyBlock] AR unmask first token at rel_pos={first_mask_rel_pos}")
+                else:
+                    # Confidence-based unmask
+                    unmask = conf > self.threshold
+                    if unmask.sum().item() == 0:
+                        unmask[conf.argmax()] = True
+                    unmask = unmask & sub_mask
 
-                # Update input_ids
+                # Update tokens
                 abs_start = block_start + rel_start
                 abs_end = block_start + rel_end
                 forward_batch.input_ids[abs_start:abs_end] = torch.where(
@@ -206,75 +165,41 @@ class HierarchyBlock(DllmAlgorithm):
                 )
 
                 if self.debug:
-                    # Show which positions are being unmasked and their predictions
-                    unmask_positions_rel = unmask.nonzero(as_tuple=True)[0].tolist()
-                    # Convert to absolute positions in input_ids
-                    unmask_positions_abs = [abs_start + pos for pos in unmask_positions_rel]
+                    unmask_positions = [abs_start + i for i in unmask.nonzero(as_tuple=True)[0].tolist()]
                     unmask_tokens = preds[unmask].tolist()
-                    logger.info(f"[HierarchyBlock] unmask_count={unmask.sum().item()}, "
-                               f"positions(rel)={unmask_positions_rel}, positions(abs)={unmask_positions_abs}, "
-                               f"token_ids={unmask_tokens}")
+                    logger.info(f"[HierarchyBlock] Unmasked {unmask.sum().item()} tokens at {unmask_positions}: {unmask_tokens}")
                     
-                    # Decode current state (prompt + generation)
-                    all_token_ids = forward_batch.input_ids.tolist()
-                    decoded_all = self._decode_tokens(all_token_ids, model_runner)
-                    if decoded_all:
-                        # Also show just the block part for clarity
-                        block_token_ids = forward_batch.input_ids[block_start:].tolist()
-                        decoded_block = self._decode_tokens(block_token_ids, model_runner)
-                        logger.info(f"[HierarchyBlock] Current block state: {repr(decoded_block)}")
-                        if block_start > 0:
-                            # Has prompt, show full sequence
-                            logger.info(f"[HierarchyBlock] Full sequence (prompt+block): {repr(decoded_all)}")
+                    decoded_block = self._decode_tokens(forward_batch.input_ids[block_start:].tolist(), model_runner)
+                    if decoded_block:
+                        logger.info(f"[HierarchyBlock] Block: {repr(decoded_block)}")
 
-        # Final forward
+        # Final forward to get inherited token for next block
         out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
         logits_output, can_run_cuda_graph = out.logits_output, out.can_run_graph
-
-        # Step 3: Compute and store inherited token for next block
-        # Use the last token's logits to predict next block's first token
         full_logits = logits_output.full_logits
-        if full_logits is not None:
-            if full_logits.dim() == 3:
-                full_logits = full_logits.reshape(-1, full_logits.shape[-1])
-            
-            # Last position's logits predict next token
-            next_block_first_token = full_logits[-1].argmax().item()
-            self.last_inherited_token = next_block_first_token
-            
-            if self.debug:
-                logger.info(f"[HierarchyBlock] Stored inherited token for next block: "
-                           f"token_id={next_block_first_token}")
         
-        # Step 4: Decode and print block tokens after processing
+        if full_logits is not None:
+            self.last_inherited_token = full_logits[-1].argmax().item()
+            if self.debug:
+                logger.info(f"[HierarchyBlock] Stored inherited token: {self.last_inherited_token}")
+        
+        # Debug: print final block state
         if self.debug:
             logger.info(f"[HierarchyBlock] ===== BLOCK COMPLETED =====")
-            
-            # Decode block part
             block_token_ids = forward_batch.input_ids[block_start:].tolist()
             decoded_block = self._decode_tokens(block_token_ids, model_runner)
-            logger.info(f"[HierarchyBlock] Block token IDs: {block_token_ids}")
+            logger.info(f"[HierarchyBlock] Block IDs: {block_token_ids}")
             if decoded_block:
-                logger.info(f"[HierarchyBlock] Block decoded text: {repr(decoded_block)}")
+                logger.info(f"[HierarchyBlock] Block text: {repr(decoded_block)}")
             
-            # Decode full sequence (prompt + block)
             if block_start > 0:
-                all_token_ids = forward_batch.input_ids.tolist()
-                prompt_token_ids = forward_batch.input_ids[:block_start].tolist()
-                decoded_all = self._decode_tokens(all_token_ids, model_runner)
-                decoded_prompt = self._decode_tokens(prompt_token_ids, model_runner)
-                
-                logger.info(f"[HierarchyBlock] Prompt token IDs: {prompt_token_ids}")
-                if decoded_prompt:
-                    logger.info(f"[HierarchyBlock] Prompt decoded text: {repr(decoded_prompt)}")
-                if decoded_all:
-                    logger.info(f"[HierarchyBlock] Full sequence (prompt+block): {repr(decoded_all)}")
+                decoded_full = self._decode_tokens(forward_batch.input_ids.tolist(), model_runner)
+                if decoded_full:
+                    logger.info(f"[HierarchyBlock] Full: {repr(decoded_full)}")
         
-        # Step 5: Update last block end position for next block continuity check
+        # Update position tracking
         if hasattr(forward_batch, 'positions') and forward_batch.positions is not None:
             self.last_block_end_position = forward_batch.positions[-1].item()
-            if self.debug:
-                logger.info(f"[HierarchyBlock] Updated last_block_end_position={self.last_block_end_position}")
 
         return logits_output, forward_batch.input_ids[block_start:], can_run_cuda_graph
 
