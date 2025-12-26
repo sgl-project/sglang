@@ -379,6 +379,7 @@ class ModelConfig:
             or "DeepseekV32ForCausalLM" in self.hf_config.architectures
             or "DeepseekV3ForCausalLM" in self.hf_config.architectures
             or "DeepseekV3ForCausalLMNextN" in self.hf_config.architectures
+            or "Glm4MoeLiteForCausalLM" in self.hf_config.architectures
             or "LongcatFlashForCausalLM" in self.hf_config.architectures
             or "LongcatFlashForCausalLMNextN" in self.hf_config.architectures
             or "DotsVLMForCausalLM" in self.hf_config.architectures
@@ -414,6 +415,13 @@ class ModelConfig:
             self.kv_lora_rank = self.hf_config.kv_lora_rank
             self.qk_rope_head_dim = self.hf_config.qk_rope_head_dim
         elif "DeepseekVL2ForCausalLM" in self.hf_config.architectures and getattr(
+            self.hf_text_config, "use_mla", True
+        ):
+            self.head_dim = 256
+            self.attention_arch = AttentionArch.MLA
+            self.kv_lora_rank = self.hf_text_config.kv_lora_rank
+            self.qk_rope_head_dim = self.hf_text_config.qk_rope_head_dim
+        elif "Glm4MoeLiteForCausalLM" in self.hf_config.architectures and getattr(
             self.hf_text_config, "use_mla", True
         ):
             self.head_dim = 256

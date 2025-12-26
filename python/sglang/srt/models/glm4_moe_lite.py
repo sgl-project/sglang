@@ -28,6 +28,7 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
+from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
     LayerScatterModes,
@@ -40,6 +41,7 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
+    MergedColumnParallelLinear,
     QKVParallelLinear,
     RowParallelLinear,
 )
@@ -49,7 +51,6 @@ from sglang.srt.layers.moe import (
     should_use_flashinfer_cutlass_moe_fp4_allgather,
 )
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
-from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK, TopKOutputFormat
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
@@ -59,15 +60,8 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from sglang.srt.layers.linear import (
-    MergedColumnParallelLinear,
-    QKVParallelLinear,
-    RowParallelLinear,
-)
 from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.layers.activation import SiluAndMul
-from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_v2 import (
     DeepseekV2AttentionMLA,
     DeepseekV2DecoderLayer,
@@ -132,6 +126,7 @@ class Glm4MoeLiteMLP(nn.Module):
                 f"Unsupported activation: {hidden_act}. Only silu is supported for now."
             )
         self.act_fn = SiluAndMul()
+
 
 class Glm4MoeLiteAttention(nn.Module):
     def __init__(
@@ -329,6 +324,7 @@ class Glm4MoeLiteGate(nn.Module):
             and _device_sm >= 90
         ):
             from sgl_kernel import dsv3_router_gemm
+
             logits = dsv3_router_gemm(hidden_states, self.weight).to(
                 hidden_states.dtype
             )
@@ -499,7 +495,7 @@ class Glm4MoeLiteDecoderLayer(DeepseekV2DecoderLayer):
             quant_config=quant_config,
             reduce_results=False,
             layer_id=layer_id,
-            prefix=add_prefix("self_attn", prefix)
+            prefix=add_prefix("self_attn", prefix),
         )
 
         self.is_layer_sparse = self._is_layer_sparse(layer_id, is_nextn=is_nextn)
@@ -658,5 +654,6 @@ class Glm4MoeLiteForCausalLM(DeepseekV2ForCausalLM):
             return
 
         self.num_fused_shared_experts = self.config.n_shared_experts
+
 
 EntryClass = [Glm4MoeLiteForCausalLM]
