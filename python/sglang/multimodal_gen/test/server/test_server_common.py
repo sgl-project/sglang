@@ -38,7 +38,6 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
 from sglang.multimodal_gen.test.test_utils import (
     get_dynamic_server_port,
     is_image_url,
-    read_perf_logs,
     wait_for_req_perf_record,
 )
 
@@ -191,15 +190,13 @@ Consider updating perf_baselines.json with the snippets below:
     ) -> RequestPerfRecord:
         """Run generation and collect performance records."""
         log_path = ctx.perf_log_path
-        prev_len = len(read_perf_logs(log_path))
         log_wait_timeout = 30
 
         client = self._client(ctx)
         rid = generate_fn(case_id, client)
 
-        req_perf_record, _ = wait_for_req_perf_record(
+        req_perf_record = wait_for_req_perf_record(
             rid,
-            prev_len,
             log_path,
             timeout=log_wait_timeout,
         )
