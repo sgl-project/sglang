@@ -189,7 +189,7 @@ def register_fake_ops():
         cos_sin_cache,
         mrope_section,
         mrope_interleaved,
-        is_neox
+        is_neox,
     ):
         return query, key
 
