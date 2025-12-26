@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from enum import Enum, auto
 from typing import Any
 
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.utils import StoreBoolean
 
@@ -206,6 +207,10 @@ class SamplingParams:
         env_steps = os.environ.get("SGLANG_TEST_NUM_INFERENCE_STEPS")
         if env_steps is not None and self.num_inference_steps is not None:
             self.num_inference_steps = int(env_steps)
+
+        # Auto-enable stage logging if dump path is provided
+        if self.perf_dump_path:
+            envs.SGLANG_DIFFUSION_STAGE_LOGGING = True
 
     def _validate(self):
         """

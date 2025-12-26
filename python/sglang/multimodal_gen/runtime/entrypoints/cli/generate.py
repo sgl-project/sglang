@@ -8,7 +8,6 @@ import dataclasses
 import os
 from typing import cast
 
-import sglang.multimodal_gen.envs as envs
 from sglang.multimodal_gen import DiffGenerator
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.runtime.entrypoints.cli.cli_types import CLISubcommand
@@ -88,11 +87,6 @@ def maybe_dump_performance(args: argparse.Namespace, server_args, prompt: str, r
 def generate_cmd(args: argparse.Namespace):
     """The entry point for the generate command."""
     args.request_id = "mocked_fake_id_for_offline_generate"
-
-    # Auto-enable stage logging if dump path is provided
-    if args.perf_dump_path:
-        os.environ["SGLANG_DIFFUSION_STAGE_LOGGING"] = "True"
-        envs.SGLANG_DIFFUSION_STAGE_LOGGING = True
 
     server_args = ServerArgs.from_cli_args(args)
     sampling_params_kwargs = SamplingParams.get_cli_args(args)
