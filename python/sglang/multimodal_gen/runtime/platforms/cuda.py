@@ -251,6 +251,14 @@ class CudaPlatformBase(Platform):
                 "Cannot use FlashAttention backend for Volta and Turing " "GPUs."
             )
             target_backend = AttentionBackendEnum.TORCH_SDPA
+        elif is_sm120():
+            # SM120 (Blackwell workstation/consumer GPUs like RTX PRO 6000) is not
+            # supported by sgl-kernel's flash_attn, which only supports SM90/SM100.
+            logger.info(
+                "Cannot use FlashAttention backend for SM120 GPUs. "
+                "sgl-kernel flash_attn only supports SM90 (Hopper) and SM100 (Blackwell Ultra)."
+            )
+            target_backend = AttentionBackendEnum.TORCH_SDPA
         elif dtype not in (torch.float16, torch.bfloat16):
             logger.info(
                 "Cannot use FlashAttention backend for dtype other than "
