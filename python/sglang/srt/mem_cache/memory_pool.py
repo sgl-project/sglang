@@ -817,13 +817,29 @@ class MHATokenToKVPool(KVCache):
         return kv_cache_cpu
 
     def get_flat_data(self, indices: torch.Tensor) -> torch.Tensor:
-        k_caches = []
-        v_caches = []
+        if self.head_dim != self.v_head_dim:
+            raise ValueError(
+                f"head_dim({self.head_dim}) is not equal to v_head_dim({self.v_head_dim})"
+            )
+
+        kv_host = torch.zeros(
+            (2, self.layer_num, len(indices), self.head_num, self.head_dim),
+            dtype=self.store_dtype,
+            device="cpu",
+            pin_memory=True,
+        )
+
+        torch.cuda.synchronize()
         for layer_id in range(self.layer_num):
-            k_caches.append(self.k_buffer[layer_id][indices])
-            v_caches.append(self.v_buffer[layer_id][indices])
-        kv_caches = [torch.stack(k_caches, dim=0), torch.stack(v_caches, dim=0)]
-        return torch.stack(kv_caches, dim=0).to("cpu")
+            kv_host[0, layer_id, :].copy_(
+                self.k_buffer[layer_id][indices], non_blocking=True
+            )
+            kv_host[1, layer_id, :].copy_(
+                self.v_buffer[layer_id][indices], non_blocking=True
+            )
+        torch.cuda.synchronize()
+
+        return kv_host
 
     def load_cpu_copy(self, kv_cache_cpu, indices):
         torch.cuda.synchronize()
@@ -1686,9 +1702,13 @@ class MLATokenToKVPool(KVCache):
 
     def get_flat_data(self, indices: torch.Tensor) -> torch.Tensor:
         kv_caches = []
+        torch.cuda.synchronize()
         for layer_id in range(self.layer_num):
-            kv_caches.append(self.kv_buffer[layer_id][indices])
-        return torch.stack(kv_caches, dim=0).to("cpu")
+            kv_caches.append(
+                self.kv_buffer[layer_id][indices].to("cpu", non_blocking=True)
+            )
+        torch.cuda.synchronize()
+        return torch.stack(kv_caches, dim=0)
 
     def load_cpu_copy(self, kv_cache_cpu, indices):
         torch.cuda.synchronize()
