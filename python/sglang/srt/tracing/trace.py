@@ -206,9 +206,8 @@ def process_tracing_init(otlp_endpoint, server_name):
     global opentelemetry_initialized
     global get_cur_time_ns
     if not opentelemetry_imported:
-        logger.warning("opentelemetry package is not installed!!! audo disable tracing")
         opentelemetry_initialized = False
-        return
+        raise RuntimeError("opentelemetry package is not installed!!! Please not enable tracing or install opentelemetry")
 
     try:
         resource = Resource.create(
@@ -235,10 +234,7 @@ def process_tracing_init(otlp_endpoint, server_name):
         tracer_provider.add_span_processor(processor)
         trace.set_tracer_provider(tracer_provider)
     except Exception as e:
-        logger.error(f": initialize opentelemetry error:{e}")
-        logger.warning("pelease set correct otlp endpoint")
-        opentelemetry_initialized = False
-        return
+        raise RuntimeError(f"initialize opentelemetry error:{e}")
 
     opentelemetry_initialized = True
 
