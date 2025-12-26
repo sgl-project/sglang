@@ -26,7 +26,7 @@ use crate::{
         metrics::{bool_to_static_str, metrics_labels, Metrics},
         otel_trace::inject_trace_context_http,
     },
-    policies::{LoadBalancingPolicy, PolicyRegistry, SelectWorkerInfo},
+    policies::{LoadBalancingPolicy, PolicyRegistry},
     protocols::{
         chat::{ChatCompletionRequest, ChatMessage, MessageContent},
         common::{InputIds, StringOrArray},
@@ -58,8 +58,8 @@ struct PDRequestContext<'a> {
     is_stream: bool,
     return_logprob: bool,
     request_text: Option<String>,
+    routing_id: Option<String>,
     model_id: Option<&'a str>,
-    headers: Option<HeaderMap>,
 }
 
 impl PDRouter {
@@ -306,8 +306,8 @@ impl PDRouter {
                         let (prefill, decode) = match self
                             .select_pd_pair(
                                 context.request_text.as_deref(),
+                                context.routing_id.as_deref(),
                                 context.model_id,
-                                context.headers.as_ref(),
                             )
                             .await
                         {
@@ -696,8 +696,8 @@ impl PDRouter {
     async fn select_pd_pair(
         &self,
         request_text: Option<&str>,
+        routing_id: Option<&str>,
         model_id: Option<&str>,
-        headers: Option<&HeaderMap>,
     ) -> Result<(Arc<dyn Worker>, Arc<dyn Worker>), String> {
         let effective_model_id = if !self.enable_igw { None } else { model_id };
 
@@ -731,21 +731,16 @@ impl PDRouter {
         let prefill_policy = self.policy_registry.get_prefill_policy();
         let decode_policy = self.policy_registry.get_decode_policy();
 
-        let prefill = Self::pick_worker_by_policy_arc(
-            &prefill_workers,
-            &*prefill_policy,
+        let info = crate::policies::SelectWorkerInfo {
             request_text,
-            headers,
-            "prefill",
-        )?;
+            routing_id,
+        };
 
-        let decode = Self::pick_worker_by_policy_arc(
-            &decode_workers,
-            &*decode_policy,
-            request_text,
-            headers,
-            "decode",
-        )?;
+        let prefill =
+            Self::pick_worker_by_policy_arc(&prefill_workers, &*prefill_policy, &info, "prefill")?;
+
+        let decode =
+            Self::pick_worker_by_policy_arc(&decode_workers, &*decode_policy, &info, "decode")?;
 
         // Record worker selection metrics (Layer 3)
         let model = model_id.unwrap_or("default");
@@ -768,8 +763,7 @@ impl PDRouter {
     fn pick_worker_by_policy_arc(
         workers: &[Arc<dyn Worker>],
         policy: &dyn LoadBalancingPolicy,
-        request_text: Option<&str>,
-        headers: Option<&HeaderMap>,
+        info: &crate::policies::SelectWorkerInfo,
         worker_type: &str,
     ) -> Result<Arc<dyn Worker>, String> {
         if workers.is_empty() {
@@ -793,13 +787,7 @@ impl PDRouter {
         }
 
         let selected_idx = policy
-            .select_worker(
-                &available_workers,
-                &SelectWorkerInfo {
-                    request_text,
-                    headers,
-                },
-            )
+            .select_worker(&available_workers, info)
             .ok_or_else(|| {
                 format!(
                     "Policy {} failed to select a {} worker",
@@ -1257,8 +1245,8 @@ impl RouterTrait for PDRouter {
             is_stream,
             return_logprob,
             request_text,
+            routing_id: header_utils::extract_routing_id(headers),
             model_id,
-            headers: headers.cloned(),
         };
 
         self.execute_dual_dispatch(headers, body, context).await
@@ -1299,8 +1287,8 @@ impl RouterTrait for PDRouter {
             is_stream,
             return_logprob,
             request_text,
+            routing_id: header_utils::extract_routing_id(headers),
             model_id,
-            headers: headers.cloned(),
         };
 
         self.execute_dual_dispatch(headers, body, context).await
@@ -1333,8 +1321,8 @@ impl RouterTrait for PDRouter {
             is_stream,
             return_logprob,
             request_text,
+            routing_id: header_utils::extract_routing_id(headers),
             model_id,
-            headers: headers.cloned(),
         };
 
         self.execute_dual_dispatch(headers, body, context).await
@@ -1346,7 +1334,6 @@ impl RouterTrait for PDRouter {
         body: &RerankRequest,
         model_id: Option<&str>,
     ) -> Response {
-        // Extract text for cache-aware routing
         let req_text = if self.policies_need_request_text() {
             Some(body.query.clone())
         } else {
@@ -1359,8 +1346,8 @@ impl RouterTrait for PDRouter {
             is_stream: false,
             return_logprob: false,
             request_text: req_text,
+            routing_id: header_utils::extract_routing_id(headers),
             model_id,
-            headers: headers.cloned(),
         };
 
         self.execute_dual_dispatch(headers, body, context).await

@@ -96,6 +96,9 @@ mod tests {
             bucket_adjust_interval_secs: 5,
         });
         assert_eq!(policy.name(), "bucket");
+
+        let policy = PolicyFactory::create_from_config(&PolicyConfig::Manual);
+        assert_eq!(policy.name(), "manual");
     }
 
     #[tokio::test]
@@ -110,6 +113,8 @@ mod tests {
         assert!(PolicyFactory::create_by_name("CacheAware").is_some());
         assert!(PolicyFactory::create_by_name("bucket").is_some());
         assert!(PolicyFactory::create_by_name("Bucket").is_some());
+        assert!(PolicyFactory::create_by_name("manual").is_some());
+        assert!(PolicyFactory::create_by_name("Manual").is_some());
         assert!(PolicyFactory::create_by_name("unknown").is_none());
     }
 }
