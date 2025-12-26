@@ -16,11 +16,11 @@ fn bench_cache_aware_selection(c: &mut Criterion) {
     let policy = CacheAwarePolicy::with_config(config);
 
     let mut workers: Vec<Arc<dyn Worker>> = Vec::new();
-    for i in 0..50 {
+    for i in 0..1000 {
         let model_card = ModelCard::new("test-model");
 
         workers.push(Arc::new(
-            BasicWorkerBuilder::new(&format!("http://worker-{}:8000", i))
+            BasicWorkerBuilder::new(format!("http://worker-{}:8000", i))
                 .worker_type(WorkerType::Regular)
                 .model(model_card)
                 .build(),
@@ -38,7 +38,7 @@ fn bench_cache_aware_selection(c: &mut Criterion) {
 
     let mut group = c.benchmark_group("LoadBalancer");
 
-    group.bench_function("cache_aware_selection_50_workers", |b| {
+    group.bench_function("cache_aware_selection_1000_workers", |b| {
         b.iter(|| {
             // Measure the performance of the selection decision
             let _result = policy.select_worker(black_box(&workers), black_box(&info));
