@@ -843,7 +843,7 @@ def get_generate_fn(
         result = response.parse()
         validate_image(result.data[0].b64_json)
 
-        rid = result.data[0].rid
+        rid = result.rid
 
         img_data = base64.b64decode(result.data[0].b64_json)
         # Infer expected format from request parameters
@@ -917,7 +917,7 @@ def get_generate_fn(
         validate_image(result.data[0].b64_json)
 
         img_data = base64.b64decode(result.data[0].b64_json)
-        rid = result.data[0].rid
+        rid = result.rid
 
         # Infer expected format from request parameters
         expected_ext = get_expected_image_format(req_output_format, req_background)
@@ -980,7 +980,7 @@ def get_generate_fn(
         )
 
         result = response.parse()
-        rid = result.data[0].rid
+        rid = result.rid
 
         validate_image(result.data[0].b64_json)
 
