@@ -201,7 +201,7 @@ impl CacheAwarePolicy {
     }
 
     /// Add a worker by URL and model (for backward compatibility)
-    pub fn add_worker_by_url(&self, url: &str, model_id: &str) {
+    pub fn add_worker_by_url(&self, url: &str, model_id: &str, index: usize) {
         let tree = self
             .trees
             .entry(model_id.to_string())
