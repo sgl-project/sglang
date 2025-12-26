@@ -66,6 +66,7 @@ from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_r
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.layers.moe import initialize_moe_config
 from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
+from sglang.srt.lora.lora_prefetcher import LoRAPrefetcher
 from sglang.srt.managers.io_struct import (
     AbortReq,
     BaseBatchReq,
@@ -364,6 +365,9 @@ class Scheduler(
 
         # Init request dispatcher
         self.init_request_dispatcher()
+
+        if self.enable_lora:
+            self.lora_prefetcher = LoRAPrefetcher(self.tp_worker, self.device)
 
     def init_model_config(self):
         self.model_config = ModelConfig.from_server_args(self.server_args)
@@ -1933,26 +1937,22 @@ class Scheduler(
             self.chunked_req = adder.add_chunked_req(self.chunked_req)
 
         if self.enable_lora:
-            lora_set = set([req.lora_id for req in self.running_batch.reqs])
+            self.lora_prefetcher.prepare_for_prefill(self.running_batch)
 
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
-
             if self.enable_lora:
-                new_lora_set = (
-                    lora_set
-                    | set([req.lora_id for req in adder.can_run_list])
-                    | set([req.lora_id])
+                res = self.lora_prefetcher.check_loaded_and_maybe_prefetch(
+                    req,
+                    self.req_to_token_pool,
+                    self.token_to_kv_pool_allocator,
+                    self.tree_cache,
+                    self.model_config,
+                    self.enable_overlap,
+                    self.spec_algorithm,
                 )
-                if not self.tp_worker.can_run_lora_batch(new_lora_set):
-                    # If this is a LoRA request that would exceed the LoRA slot limit,
-                    # skip it and continue to try scheduling non-LoRA requests.
-                    # Non-LoRA requests (lora_id=None) share a single reserved slot
-                    # and should never cause this check to fail.
-                    if req.lora_id is not None:
-                        # Skip this LoRA request - it would trigger adapter eviction/loading
-                        # which is slow. We'll try to schedule it in a future iteration.
-                        continue
+                if not res:
+                    continue
 
             running_bs = len(self.running_batch.reqs)
             if len(adder.can_run_list) >= self.get_num_allocatable_reqs(running_bs):
