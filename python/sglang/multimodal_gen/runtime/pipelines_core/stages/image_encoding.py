@@ -62,8 +62,11 @@ class ImageEncodingStage(PipelineStage):
         self.image_processor = image_processor
         self.image_encoder = image_encoder
         self.text_encoder = text_encoder
+        self._current_device = None
 
     def move_to_device(self, device):
+        if device is None or device == self._current_device:
+            return
         fields = [
             "image_processor",
             "image_encoder",
@@ -72,6 +75,7 @@ class ImageEncodingStage(PipelineStage):
             processor = getattr(self, field, None)
             if processor and hasattr(processor, "to"):
                 setattr(self, field, processor.to(device))
+        self._current_device = device
 
     def encoding_qwen_image_edit(self, outputs, image_inputs):
         # encoder hidden state
@@ -155,7 +159,8 @@ class ImageEncodingStage(PipelineStage):
                 self.encoding_qwen_image_edit(neg_outputs, neg_image_inputs)
             )
 
-        self.move_to_device("cpu")
+        if server_args.image_encoder_cpu_offload:
+            self.move_to_device("cpu")
 
         return batch
 
@@ -328,7 +333,6 @@ class ImageVAEEncodingStage(PipelineStage):
         self,
         image: torch.Tensor | PIL.Image.Image,
     ) -> torch.Tensor:
-
         if isinstance(image, PIL.Image.Image):
             image = pil_to_numpy(image)  # to np
             image = numpy_to_pt(image)  # to pt

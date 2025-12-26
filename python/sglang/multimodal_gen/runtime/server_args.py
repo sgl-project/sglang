@@ -231,7 +231,7 @@ class ServerArgs:
     use_fsdp_inference: bool = False
     dit_layerwise_offload: bool = False
     text_encoder_cpu_offload: bool = True
-    image_encoder_cpu_offload: bool = True
+    image_encoder_cpu_offload: bool = False
     vae_cpu_offload: bool = True
     pin_cpu_memory: bool = True
 
@@ -880,12 +880,12 @@ class ServerArgs:
             self.disable_autocast = False
 
         # Validate mode consistency
-        assert isinstance(
-            self.mode, ExecutionMode
-        ), f"Mode must be an ExecutionMode enum, got {type(self.mode)}"
-        assert (
-            self.mode in ExecutionMode.choices()
-        ), f"Invalid execution mode: {self.mode}"
+        assert isinstance(self.mode, ExecutionMode), (
+            f"Mode must be an ExecutionMode enum, got {type(self.mode)}"
+        )
+        assert self.mode in ExecutionMode.choices(), (
+            f"Invalid execution mode: {self.mode}"
+        )
 
         if self.tp_size == -1:
             self.tp_size = 1
