@@ -60,6 +60,11 @@ SGLang supports various environment variables that can be used to configure its 
 | `SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK` | The maximum number of dispatched tokens on each GPU | `"128"` |
 | `SGLANG_DEEPEP_LL_COMBINE_SEND_NUM_SMS` | Number of SMs used for DeepEP combine when single batch overlap is enabled | `"32"` |
 
+## NSA Backend Configuration (For DeepSeek V3.2)
+
+<!-- # Environment variable to control mtp precomputing of metadata for multi-step speculative decoding -->
+
+
 ## Memory Management
 
 | Environment Variable | Description | Default Value |
