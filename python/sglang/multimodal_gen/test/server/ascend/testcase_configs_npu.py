@@ -10,7 +10,7 @@ ONE_NPU_CASES: list[DiffusionTestCase] = [
     DiffusionTestCase(
         "wan2_1_t2v_1.3b_1_npu",
         DiffusionServerArgs(
-            model_path="root/.cache/modelscope/hub/models/Wan-AI/Wan2.1-1.3B-Diffusers",
+            model_path="/root/.cache/modelscope/hub/models/Wan-AI/Wan2.1-1.3B-Diffusers",
             modality="video",
             warmup_text=0,
             warmup_edit=0,
