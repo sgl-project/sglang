@@ -51,7 +51,6 @@ def per_tensor_quant_fp8(
     # The JIT kernel expects a 1D tensor
     if output_s.ndim == 0:
         output_s = output_s.reshape(1)
-    
+
     module = _jit_per_tensor_quant_fp8_module(is_static)
     module.per_tensor_quant_fp8(input, output_q, output_s)
-
