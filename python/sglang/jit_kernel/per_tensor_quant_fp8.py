@@ -44,8 +44,14 @@ def per_tensor_quant_fp8(
     Args:
         input: Input tensor to quantize (float, half, or bfloat16)
         output_q: Output quantized tensor (fp8_e4m3)
-        output_s: Output scale tensor (float scalar)
+        output_s: Output scale tensor (float scalar or 1D tensor with 1 element)
         is_static: If True, assumes scale is pre-computed and skips absmax computation
     """
+    # Ensure output_s has shape [1] instead of being a 0D scalar
+    # The JIT kernel expects a 1D tensor
+    if output_s.ndim == 0:
+        output_s = output_s.reshape(1)
+    
     module = _jit_per_tensor_quant_fp8_module(is_static)
     module.per_tensor_quant_fp8(input, output_q, output_s)
+
