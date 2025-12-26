@@ -57,7 +57,7 @@ def find_hccl_library() -> str:
 
 def current_stream() -> torch.npu.Stream:
     """
-    replace `torch.npu.current_stream()` with `vllm.utils.current_stream()`.
+    replace `torch.npu.current_stream()` with `pyhccl_wrapper.current_stream()`.
     it turns out that `torch.npu.current_stream()` is quite expensive,
     as it will construct a new stream object at each call.
     here we patch `torch.npu.set_stream` to keep track of the current stream

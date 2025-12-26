@@ -74,7 +74,7 @@ class PyHcclCommunicator:
         self.available = True
         self.disabled = False
 
-        logger.info("vLLM is using pyhccl")
+        logger.info("sglang is using pyhccl")
 
         if isinstance(device, int):
             device = torch.device(f"npu:{device}")
@@ -155,10 +155,7 @@ class PyHcclCommunicator:
         )
         if stream is None:
             stream = current_stream()
-        if src == self.rank:
-            buffer = buffer_type(tensor.data_ptr())
-        else:
-            buffer = buffer_type(tensor.data_ptr())
+        buffer = buffer_type(tensor.data_ptr())
         self.hccl.hcclBroadcast(
             buffer,
             tensor.numel(),
