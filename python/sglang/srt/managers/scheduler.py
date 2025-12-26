@@ -648,10 +648,8 @@ class Scheduler(
             else:
                 from sglang.srt.mem_cache.chunk_cache import SWAChunkCache
 
-                params.is_local_attention = (
-                    "Llama4ForConditionalGeneration"
-                    in self.model_config.hf_config.architectures
-                )
+                params.sliding_window_size = self.model_config.sliding_window_size
+                params.attention_chunk_size = self.model_config.attention_chunk_size
 
                 self.tree_cache = SWAChunkCache(params)
         else:
@@ -734,8 +732,6 @@ class Scheduler(
         # The last forward batch
         self.last_batch: Optional[ScheduleBatch] = None
         self.forward_ct = 0
-        self.last_prefill_tokens = 0
-        self.last_prefill_cache_tokens = 0
         self.return_health_check_ct = 0
         self.num_retracted_reqs: int = 0
         self.num_paused_reqs: int = 0
