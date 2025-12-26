@@ -8,6 +8,8 @@ import dataclasses
 import os
 from typing import cast
 
+from tqdm import tqdm
+
 import sglang.multimodal_gen.envs as envs
 from sglang.multimodal_gen import DiffGenerator
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
@@ -99,6 +101,12 @@ def generate_cmd(args: argparse.Namespace):
     generator = DiffGenerator.from_pretrained(
         model_path=server_args.model_path, server_args=server_args
     )
+
+    if args.perf_dump_path:
+        for _ in tqdm(range(10)):
+            generator.generate(
+                sampling_params_kwargs={**sampling_params_kwargs, "save_output": False}
+            )
 
     results = generator.generate(sampling_params_kwargs=sampling_params_kwargs)
 
