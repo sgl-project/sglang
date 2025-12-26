@@ -647,30 +647,40 @@ std::tuple<at::Tensor, at::Tensor> multimodal_rotary_embedding_cpu(
   } else {  // positions.dim() == 1
     AT_DISPATCH_REDUCED_FLOATING_TYPES(input_dtype, "rotary_embedding_cpu", [&] {
       if (is_neox) {
-        rotary_embedding_neox_2D_kernel_impl<scalar_t>(
+        rotary_embedding_neox_4D_kernel_impl<scalar_t>(
             positions.data_ptr<int64_t>(),
             query.data_ptr<scalar_t>(),
             key.data_ptr<scalar_t>(),
             cos_sin_cache.data_ptr<scalar_t>(),
             rotary_dim,
+            0,
             query_stride_s,
+            head_size,
+            0,
             key_stride_s,
+            head_size,
             num_heads,
             num_kv_heads,
             head_size,
+            1,
             num_tokens);
       } else {
-        rotary_embedding_2D_kernel_impl<scalar_t>(
+        rotary_embedding_4D_kernel_impl<scalar_t>(
             positions.data_ptr<int64_t>(),
             query.data_ptr<scalar_t>(),
             key.data_ptr<scalar_t>(),
             cos_sin_cache.data_ptr<scalar_t>(),
             rotary_dim,
+            0,
             query_stride_s,
+            head_size,
+            0,
             key_stride_s,
+            head_size,
             num_heads,
             num_kv_heads,
             head_size,
+            1,
             num_tokens);
       }
     });
