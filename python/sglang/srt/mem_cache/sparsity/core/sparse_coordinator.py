@@ -53,7 +53,7 @@ class RequestTrackers:
             device=device,
         )
         self.curr_device_indices = torch.full(
-            (max_pool_size, self.top_k + 1),
+            (max_pool_size, self.top_k),
             -1,
             dtype=torch.int32,
             device=device,
@@ -78,7 +78,7 @@ class RequestTrackers:
             device=device,
         )
         self.prev_device_indices = torch.full(
-            (max_pool_size, num_layers, self.top_k + 1),
+            (max_pool_size, num_layers, self.top_k),
             -1,
             dtype=torch.int64,
             device=device,
@@ -192,8 +192,11 @@ class SparseCoordinator:
 
         # Store previous device indices
         indices_len = self.config.min_sparse_prompt_len
-        self.states.prev_device_indices[req.req_pool_idx][:, :-1] = (
+        self.states.prev_device_indices[req.req_pool_idx] = (
             self.req_to_token_pool.req_to_token[req.req_pool_idx, :indices_len]
+        )
+        self.states.prev_top_k_result[req.req_pool_idx, :] = torch.arange(
+            indices_len, device=self.device
         )
 
     def on_request_end(self, req: "Req") -> None:
