@@ -5,6 +5,7 @@ import requests
 import torch
 
 from sglang.srt.utils import kill_process_tree
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -13,6 +14,9 @@ from sglang.test.test_utils import (
     is_in_ci,
     popen_launch_server,
 )
+
+# DeepSeek-V3 INT8 quantization tests (channel and block INT8)
+register_cuda_ci(est_time=300, suite="stage-b-test-small-1-gpu")
 
 
 class TestMLADeepseekV3ChannelInt8(CustomTestCase):

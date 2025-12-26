@@ -79,6 +79,18 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         port_args: PortArgs,
     ):
         # Init inter-process communication
+        self.init_ipc_channels(port_args)
+
+        # Init tokenizer
+        self.init_tokenizer(server_args)
+
+        # Init running status
+        self.init_running_status(server_args)
+
+        # Init dispatcher
+        self.init_request_dispatcher()
+
+    def init_ipc_channels(self, port_args: PortArgs):
         context = zmq.Context(2)
         self.recv_from_scheduler = get_zmq_socket(
             context, zmq.PULL, port_args.detokenizer_ipc_name, True
@@ -87,7 +99,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             context, zmq.PUSH, port_args.tokenizer_ipc_name, False
         )
 
-        # Init tokenizer
+    def init_tokenizer(self, server_args: ServerArgs):
         if server_args.skip_tokenizer_init:
             self.tokenizer = None
         else:
@@ -98,12 +110,20 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
                 revision=server_args.revision,
             )
 
+    def init_running_status(self, server_args: ServerArgs):
         self.decode_status = LimitedCapacityDict(capacity=DETOKENIZER_MAX_STATES)
         self.is_dummy = False
         self.is_tool_call_parser_gpt_oss = server_args.tool_call_parser == "gpt-oss"
         self.disable_tokenizer_batch_decode = server_args.disable_tokenizer_batch_decode
 
-        # Init dispatcher
+        self.watchdog = Watchdog.create(
+            debug_name="DetokenizerManager",
+            watchdog_timeout=server_args.soft_watchdog_timeout,
+            soft=True,
+            test_stuck_time=envs.SGLANG_TEST_STUCK_DETOKENIZER.get(),
+        )
+
+    def init_request_dispatcher(self):
         self._request_dispatcher = TypeBasedDispatcher(
             [
                 (BatchEmbeddingOutput, self.handle_batch_embedding_out),
@@ -111,13 +131,6 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
                 (BatchMultimodalDecodeReq, self.handle_multimodal_decode_req),
                 (FreezeGCReq, self.handle_freeze_gc_req),
             ]
-        )
-
-        self.watchdog = Watchdog.create(
-            debug_name="DetokenizerManager",
-            watchdog_timeout=server_args.soft_watchdog_timeout,
-            soft=True,
-            test_stuck_time=envs.SGLANG_TEST_STUCK_DETOKENIZER.get(),
         )
 
     def event_loop(self):
