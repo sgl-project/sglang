@@ -14,7 +14,7 @@ class SpecDecodingMixin:
 
         if is_in_ci():
             write_github_step_summary(
-                f"### test_bs_1_speed (deepseek-v32 mtp)\n"
+                f"### test_bs_1_speed ({self.model})\n"
                 f"{acc_length=:.2f}\n"
                 f"{speed=:.2f} token/s\n"
             )
