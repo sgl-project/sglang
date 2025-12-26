@@ -2375,66 +2375,36 @@ class Scheduler(
 
         num_ready_reqs = 0
         num_timeout_reqs = 0
-        invalid_req_indices = (
-            []
-        )  # Track which requests have invalid grammars (rank 0 only)
+        invalid_req_indices = []
 
         if self.server_args.enable_dp_attention:
             tp_size = self.attn_tp_size
         else:
             tp_size = self.tp_size
 
-        logger.info(
-            f"[TP{self.tp_rank}] move_ready_grammar_requests: queue_len={len(self.grammar_queue)}, tp_size={tp_size}"
-        )
-
         for idx, req in enumerate(self.grammar_queue):
             try:
-                logger.info(
-                    f"[TP{self.tp_rank}] Processing req {req.rid}: finished={req.finished()}, grammar={req.grammar}, grammar_backend={self.grammar_backend is not None}"
-                )
-
                 if req.finished():  # It is aborted by AbortReq
-                    logger.info(
-                        f"[TP{self.tp_rank}] Req {req.rid} already finished, incrementing ready count"
-                    )
                     num_ready_reqs += 1
                     continue
 
                 if tp_size > 1:
                     if req.grammar is None:
-                        logger.info(
-                            f"[TP{self.tp_rank}] Req {req.rid} has grammar=None, incrementing ready count"
-                        )
                         num_ready_reqs += 1
                         continue
                     if not isinstance(req.grammar, futures.Future):
-                        logger.info(
-                            f"[TP{self.tp_rank}] Req {req.rid} grammar is not Future, incrementing ready count"
-                        )
                         num_ready_reqs += 1
                         continue
 
-                logger.info(
-                    f"[TP{self.tp_rank}] Req {req.rid} waiting for grammar compilation..."
-                )
                 req.grammar = req.grammar.result(timeout=0.03)
                 self.grammar_backend.set_cache(req.grammar_key, req.grammar.copy())
                 if req.grammar is INVALID_GRAMMAR_OBJ:
                     error_msg = f"Invalid grammar request: {req.grammar_key=}"
                     req.set_finish_with_abort(error_msg)
-                    invalid_req_indices.append(
-                        idx
-                    )  # Track this for propagation to other ranks
+                    invalid_req_indices.append(idx)
 
                 num_ready_reqs += 1
-                logger.info(
-                    f"[TP{self.tp_rank}] Req {req.rid} grammar ready, num_ready_reqs={num_ready_reqs}"
-                )
             except futures._base.TimeoutError:
-                logger.info(
-                    f"[TP{self.tp_rank}] Req {req.rid} grammar timeout, wait_ct={req.grammar_wait_ct}"
-                )
                 req.grammar_wait_ct += 1
                 # NOTE(lianmin): this timeout is the waiting time of the above line. It is
                 # not the waiting time from it enters the grammar queue.
@@ -2449,10 +2419,6 @@ class Scheduler(
             tp_size = self.tp_size
             tp_group = self.tp_cpu_group
 
-        logger.info(
-            f"[TP{self.tp_rank}] Before broadcast: num_ready_reqs={num_ready_reqs}, num_timeout_reqs={num_timeout_reqs}"
-        )
-
         if tp_size > 1:
             # Rank 0 broadcasts to other ranks.
             tensor = torch.tensor([num_ready_reqs, num_timeout_reqs], dtype=torch.int32)
@@ -2462,21 +2428,13 @@ class Scheduler(
             else:
                 root_rank = self.tp_group.ranks[0]
 
-            logger.info(f"[TP{self.tp_rank}] About to broadcast, root_rank={root_rank}")
             torch.distributed.broadcast(tensor, src=root_rank, group=tp_group)
-            logger.info(f"[TP{self.tp_rank}] Broadcast complete")
             num_ready_reqs_max, num_timeout_reqs_max = tensor.tolist()
-            logger.info(
-                f"[TP{self.tp_rank}] After broadcast: num_ready_reqs_max={num_ready_reqs_max}, num_timeout_reqs_max={num_timeout_reqs_max}"
-            )
 
             # Only rank 0 needs to finish compiling remaining grammars
             if self.tp_rank == 0:
                 for i in range(num_ready_reqs, num_ready_reqs_max):
                     req = self.grammar_queue[i]
-                    logger.info(
-                        f"[TP{self.tp_rank}] Compiling remaining grammar for req {req.rid}"
-                    )
                     if req.finished():
                         continue
                     # On cache hit, req.grammar is already compiled.
@@ -2507,14 +2465,10 @@ class Scheduler(
 
         num_ready_reqs = num_ready_reqs_max + num_timeout_reqs_max
 
-        # Propagate invalid grammar status to all ranks (TP > 1 only)
+        # When TP > 1, we have to handle invalid grammars by broadcasting from rank 0
         if tp_size > 1:
-            # Broadcast the number of invalid requests from rank 0
             if self.tp_rank == 0:
                 num_invalid = len(invalid_req_indices)
-                logger.info(
-                    f"[TP{self.tp_rank}] Broadcasting {num_invalid} invalid grammar indices: {invalid_req_indices}"
-                )
             else:
                 num_invalid = 0
 
@@ -2524,7 +2478,6 @@ class Scheduler(
             )
             num_invalid = invalid_count_tensor.item()
 
-            # Broadcast the actual invalid indices if there are any
             if num_invalid > 0:
                 if self.tp_rank == 0:
                     invalid_indices_tensor = torch.tensor(
@@ -2544,20 +2497,10 @@ class Scheduler(
                             req = self.grammar_queue[idx]
                             error_msg = f"Invalid grammar request (detected by rank 0)"
                             req.set_finish_with_abort(error_msg)
-                            logger.info(
-                                f"[TP{self.tp_rank}] Aborting req {req.rid} at index {idx} due to invalid grammar"
-                            )
-
-        logger.info(
-            f"[TP{self.tp_rank}] Moving {num_ready_reqs} requests from grammar_queue to waiting_queue"
-        )
 
         for req in self.grammar_queue[:num_ready_reqs]:
             self._add_request_to_queue(req)
         self.grammar_queue = self.grammar_queue[num_ready_reqs:]
-        logger.info(
-            f"[TP{self.tp_rank}] move_ready_grammar_requests complete, remaining queue_len={len(self.grammar_queue)}"
-        )
 
     def flush_cache_wrapped(self, recv_req: FlushCacheReqInput):
         success = self.flush_cache()
