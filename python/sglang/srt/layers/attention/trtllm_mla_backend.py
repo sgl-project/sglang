@@ -1036,7 +1036,11 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 if getattr(layer, "k_scale_float", None) is not None
                 else 1.0
             )
-            q = q.to(self.data_type)
+            # FP4 KV cache is stored as FP4 but accessed as dequantized (bfloat16),
+            # so don't convert q to FP4
+            is_fp4_kv_cache = float4_dtype is not None and self.data_type == float4_dtype
+            if not is_fp4_kv_cache:
+                q = q.to(self.data_type)
 
             bmm1_scale = q_scale * k_scale * layer.scaling
             if forward_batch.forward_mode.is_target_verify():
@@ -1046,7 +1050,9 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             else:
                 max_seq_len = metadata.max_seq_len_k + metadata.max_seq_len_q
             q = q.view(bs, -1, layer.tp_q_head_num, layer.head_dim)
-            assert kv_cache.dtype == self.data_type
+            # FP4 KV cache is dequantized, so skip dtype assertion for FP4
+            if not is_fp4_kv_cache:
+                assert kv_cache.dtype == self.data_type
 
             raw_out = flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
                 query=q,
