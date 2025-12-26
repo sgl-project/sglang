@@ -3,7 +3,7 @@ use std::sync::Arc;
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use sgl_model_gateway::{
     core::{BasicWorkerBuilder, Worker, WorkerType},
-    policies::{CacheAwareConfig, CacheAwarePolicy, LoadBalancingPolicy},
+    policies::{CacheAwareConfig, CacheAwarePolicy, LoadBalancingPolicy, SelectWorkerInfo},
 };
 
 fn bench_cache_aware_selection(c: &mut Criterion) {
@@ -25,10 +25,11 @@ fn bench_cache_aware_selection(c: &mut Criterion) {
 
     policy.init_workers(&workers);
     let prompt = "This is a standard prompt used to test the overhead of string traversal in the selection logic.";
+    let info = SelectWorkerInfo { text: Some(prompt) };
 
     c.bench_function("cache_aware_selection_50_workers", |b| {
         b.iter(|| {
-            let _ = policy.select_worker(black_box(&workers), Some(black_box(prompt)));
+            let _ = policy.select_worker(black_box(&workers), black_box(&info));
         })
     });
 }
