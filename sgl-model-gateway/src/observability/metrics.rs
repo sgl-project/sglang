@@ -190,10 +190,6 @@ pub fn init_metrics() {
         "smg_worker_errors_total",
         "Worker-level errors by worker_type, connection_mode, error_type"
     );
-    describe_counter!(
-        "smg_worker_manual_policy_branch_total",
-        "Manual policy execution branch by branch type"
-    );
 
     // Layer 3: Worker resilience metrics (circuit breaker)
     describe_gauge!(
@@ -805,6 +801,15 @@ impl Metrics {
         .increment(1);
     }
 
+    /// Record manual policy execution branch for routing decisions
+    pub fn record_worker_manual_policy_branch(branch: &'static str) {
+        counter!(
+            "smg_manual_policy_branch_total",
+            "branch" => branch
+        )
+        .increment(1);
+    }
+
     /// Set running requests per worker
     pub fn set_worker_requests_active(worker: &str, count: usize) {
         gauge!(
@@ -812,15 +817,6 @@ impl Metrics {
             "worker" => worker.to_string()
         )
         .set(count as f64);
-    }
-
-    /// Record manual policy execution branch
-    pub fn record_worker_manual_policy_branch(branch: &'static str) {
-        counter!(
-            "smg_worker_manual_policy_branch_total",
-            "branch" => branch
-        )
-        .increment(1);
     }
 
     /// Set worker health status
