@@ -32,6 +32,14 @@ SUITES = {
     ],
 }
 
+suites_ascend = {
+    "1-npu": [
+        "ascend/test_server_1_npu.py",
+        # add new 1-npu test files here
+    ]
+}
+
+SUITES.update(suites_ascend)
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Run multimodal_gen test suite")
@@ -83,7 +91,11 @@ def collect_test_items(files, filter_expr=None):
         cmd.extend(["-k", filter_expr])
     cmd.extend(files)
 
+    logger.info(cmd)
+
     result = subprocess.run(cmd, capture_output=True, text=True)
+
+    logger.info(result)
 
     # Parse the output to extract test node IDs
     # pytest -q outputs lines like: test_file.py::TestClass::test_method[param]
@@ -97,6 +109,7 @@ def collect_test_items(files, filter_expr=None):
             if "::" in test_id:
                 test_items.append(test_id)
 
+    logger.info(test_items)
     return test_items
 
 
@@ -200,9 +213,12 @@ def main():
         print(f"No valid test files found for suite '{args.suite}'.")
         sys.exit(0)
 
+    print("suite_files_abs", suite_files_abs)
+    logger.info(suite_files_abs)
     # 3. collect all test items and partition by items (not files)
     all_test_items = collect_test_items(suite_files_abs, filter_expr=args.filter)
-
+    logger.info(suite_files_rel)
+    logger.info(all_test_items)
     if not all_test_items:
         print(f"No test items found for suite '{args.suite}'.")
         sys.exit(0)
