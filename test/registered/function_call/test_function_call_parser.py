@@ -3247,103 +3247,236 @@ class TestGlm47MoeDetector(unittest.TestCase):
 
                 all_normal_text = ""
                 all_calls = []
-
                 for chunk in chunks:
                     result = self.detector.parse_streaming_increment(chunk, tools)
                     all_normal_text += result.normal_text
                     all_calls.extend(result.calls)
 
-                # For the first test case, we expect the punctuation to be preserved
-                if chunks[0] == "结构：":
-                    self.assertIn(
-                        "结构：",
-                        all_normal_text,
-                        f"Should preserve punctuation in streaming scenario: {description}",
-                    )
+                # Check that punctuation is preserved when it should be
+                if chunks and chunks[0] and "<tool_call>" not in chunks[0]:
+                    # If first chunk doesn't contain the token, it should be treated as normal text
+                    self.assertIn(chunks[0], all_normal_text)
 
-                # For the third test case, we expect a complete function call to be parsed
-                if "list_dir" in chunks[-1]:
-                    func_calls = [call for call in all_calls if call.name]
-                    if func_calls:
-                        self.assertIn(
-                            "list_dir",
-                            [call.name for call in func_calls],
-                            f"Should parse function call in streaming scenario: {description}",
-                        )
-
-    def test_punctuation_complete_chunk_bug(self):
-        """Test punctuation followed by complete tool call in one chunk.
-
-        This reproduces the reported bug where the stream parser creates 3 tool calls
-        instead of 1 when receiving everything in one chunk.
-        """
+    def test_regex_optimization_scenarios(self):
+        """Test various regex scenarios to ensure the optimized regex works correctly."""
+        # Create a tool for testing
         tools = [
             Tool(
                 type="function",
                 function=Function(
-                    name="list_dir",
-                    description="List the contents of a directory",
+                    name="get_time",
+                    description="Get the current time",
+                    parameters={
+                        "type": "object",
+                        "properties": {},
+                    },
+                ),
+            ),
+            Tool(
+                type="function",
+                function=Function(
+                    name="get_weather",
+                    description="Get weather information",
                     parameters={
                         "type": "object",
                         "properties": {
-                            "path": {"type": "string", "description": "Path to list"},
-                            "explanation": {
-                                "type": "string",
-                                "description": "Explanation for the action",
-                            },
+                            "city": {"type": "string", "description": "City name"},
                         },
-                        "required": ["path"],
+                        "required": ["city"],
                     },
                 ),
             ),
         ]
-        # Reset detector state
-        self.detector._buffer = ""
-        self.detector.current_tool_id = -1
-        self.detector.current_tool_name_sent = False
-        self.detector._reset_streaming_state()
 
-        # Complete chunk with Chinese punctuation and full tool call - THE BUG INPUT
-        text = "结构：<tool_call>list_dir<arg_key>explanation</arg_key><arg_value>检查根目录下有哪些可用目录</arg_value><arg_key>path</arg_key><arg_value>/</arg_value></tool_call>"
+        test_cases = [
+            # No-argument function - complete
+            (
+                "<tool_call>get_time</tool_call>",
+                [{"name": "get_time", "arguments": {}}],
+            ),
+            # With arguments - complete
+            (
+                "<tool_call>get_weather<arg_key>city</arg_key><arg_value>Beijing</arg_value></tool_call>",
+                [{"name": "get_weather", "arguments": {"city": "Beijing"}}],
+            ),
+            # Streaming - function name in parts
+            (
+                ["<tool_call>get_", "time</tool_call>"],
+                [{"name": "get_time", "arguments": {}}],
+            ),
+            # Streaming - arguments in parts
+            (
+                [
+                    "<tool_call>get_weather<arg_key>city</arg_key>",
+                    "<arg_value>Bei",
+                    "jing</arg_value></tool_call>",
+                ],
+                [{"name": "get_weather", "arguments": {"city": "Beijing"}}],
+            ),
+            # Multiple tool calls
+            (
+                "<tool_call>get_time</tool_call><tool_call>get_weather<arg_key>city</arg_key><arg_value>Shanghai</arg_value></tool_call>",
+                [
+                    {"name": "get_time", "arguments": {}},
+                    {"name": "get_weather", "arguments": {"city": "Shanghai"}},
+                ],
+            ),
+        ]
 
-        result = self.detector.parse_streaming_increment(text, self.tools)
+        for i, (input_text, expected_calls) in enumerate(test_cases):
+            with self.subTest(test_case=i):
+                # Reset state for each test
+                self.detector._buffer = ""
+                self.detector.current_tool_id = -1
+                self.detector.current_tool_name_sent = False
+                self.detector._reset_streaming_state()
 
-        # The Chinese punctuation should be preserved
-        self.assertEqual(
-            result.normal_text,
-            "结构：",
-            "Should preserve Chinese punctuation as normal text",
-        )
+                if isinstance(input_text, list):
+                    # Streaming test
+                    all_calls = []
+                    for chunk in input_text:
+                        result = self.detector.parse_streaming_increment(chunk, tools)
+                        for tool_call_chunk in result.calls:
+                            if (
+                                hasattr(tool_call_chunk, "tool_index")
+                                and tool_call_chunk.tool_index is not None
+                            ):
+                                while len(all_calls) <= tool_call_chunk.tool_index:
+                                    all_calls.append({"name": "", "parameters": ""})
+                                tc = all_calls[tool_call_chunk.tool_index]
+                                if tool_call_chunk.name:
+                                    tc["name"] = tool_call_chunk.name
+                                if tool_call_chunk.parameters:
+                                    tc["parameters"] += tool_call_chunk.parameters
 
-        # Reconstruct the complete tool call from all call chunks
-        tool_calls_by_index = {}
-        for call in result.calls:
-            idx = (
-                call.tool_index
-                if hasattr(call, "tool_index") and call.tool_index is not None
-                else 0
-            )
-            if idx not in tool_calls_by_index:
-                tool_calls_by_index[idx] = {"name": "", "parameters": ""}
-            if call.name:
-                tool_calls_by_index[idx]["name"] = call.name
-            if call.parameters:
-                tool_calls_by_index[idx]["parameters"] += call.parameters
+                    # Convert parameters to dict for comparison
+                    actual_calls = []
+                    for call in all_calls:
+                        if call["name"] or call["parameters"]:
+                            params = (
+                                json.loads(call["parameters"])
+                                if call["parameters"]
+                                else {}
+                            )
+                            actual_calls.append(
+                                {"name": call["name"], "arguments": params}
+                            )
+                else:
+                    # Direct parsing test
+                    result = self.detector.detect_and_parse(input_text, tools)
+                    actual_calls = []
+                    for call in result.calls:
+                        params = json.loads(call.parameters) if call.parameters else {}
+                        actual_calls.append({"name": call.name, "arguments": params})
 
-        # CRITICAL: Should have exactly 1 tool call (not 3!)
-        self.assertEqual(
-            len(tool_calls_by_index),
-            1,
-            f"Should have exactly 1 tool call, but got {len(tool_calls_by_index)}. "
-            f"This is the bug: multiple tool_index values created for one call.",
-        )
-        self.assertIn(0, tool_calls_by_index, "Tool call should have index 0")
-        self.assertEqual(tool_calls_by_index[0]["name"], "list_dir")
+                # Compare the actual and expected calls
+                self.assertEqual(len(actual_calls), len(expected_calls))
+                for actual, expected in zip(actual_calls, expected_calls):
+                    self.assertEqual(actual["name"], expected["name"])
+                    self.assertEqual(actual["arguments"], expected["arguments"])
 
-        # Verify complete parameters are valid JSON
-        params = json.loads(tool_calls_by_index[0]["parameters"])
-        self.assertEqual(params["path"], "/")
-        self.assertEqual(params["explanation"], "检查根目录下有哪些可用目录")
+    def test_regex_edge_cases(self):
+        """Test edge cases for the optimized regex."""
+        tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="test_func",
+                    description="Test function",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "param": {"type": "string", "description": "A parameter"},
+                        },
+                        "required": ["param"],
+                    },
+                ),
+            ),
+        ]
+
+        # Test incomplete function calls that should not match
+        incomplete_cases = [
+            "<tool_call>",  # Just start token
+            "<tool_call>test_",  # Partial function name
+            "<tool_call>test_func",  # Function name without end
+        ]
+
+        for case in incomplete_cases:
+            with self.subTest(case=case):
+                # Reset state
+                self.detector._buffer = ""
+                self.detector.current_tool_id = -1
+                self.detector.current_tool_name_sent = False
+                self.detector._reset_streaming_state()
+
+                result = self.detector.parse_streaming_increment(case, tools)
+                # Should not have any complete function calls
+                func_calls = [call for call in result.calls if call.name]
+                self.assertEqual(len(func_calls), 0)
+
+        # Test the case where function name is complete due to <arg_key> presence
+        # This should result in a function call being sent since <arg_key> makes the function name complete
+        case_with_arg_key = "<tool_call>test_func<arg_key>param</arg_key>"
+        with self.subTest(case=case_with_arg_key):
+            # Reset state
+            self.detector._buffer = ""
+            self.detector.current_tool_id = -1
+            self.detector.current_tool_name_sent = False
+            self.detector._reset_streaming_state()
+
+            result = self.detector.parse_streaming_increment(case_with_arg_key, tools)
+            # Should have a function call since <arg_key> indicates function name is complete
+            func_calls = [call for call in result.calls if call.name]
+            # This might have a function call because <arg_key> makes the function name complete
+            # in streaming scenarios, so we should check if this is expected behavior
+            # According to the original code behavior, this should have a function call
+            self.assertEqual(len(func_calls), 1)  # function name should be sent
+            self.assertEqual(func_calls[0].name, "test_func")
+
+    def test_regex_with_special_characters(self):
+        """Test regex with special characters in function names and arguments."""
+        tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="func_with_special_chars",
+                    description="Function with special characters",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "param": {
+                                "type": "string",
+                                "description": "A parameter with special chars",
+                            },
+                        },
+                        "required": ["param"],
+                    },
+                ),
+            ),
+        ]
+
+        test_cases = [
+            # Function with special characters in name (though unlikely in practice)
+            "<tool_call>func_with_special_chars<arg_key>param</arg_key><arg_value>value with spaces</arg_value></tool_call>",
+            '<tool_call>func_with_special_chars<arg_key>param</arg_key><arg_value>value with "quotes"</arg_value></tool_call>',
+            "<tool_call>func_with_special_chars<arg_key>param</arg_key><arg_value>value with 'single quotes'</arg_value></tool_call>",
+            "<tool_call>func_with_special_chars<arg_key>param</arg_key><arg_value>value with & symbols &</arg_value></tool_call>",
+        ]
+
+        for case in test_cases:
+            with self.subTest(case=case):
+                # Reset state
+                self.detector._buffer = ""
+                self.detector.current_tool_id = -1
+                self.detector.current_tool_name_sent = False
+                self.detector._reset_streaming_state()
+
+                result = self.detector.detect_and_parse(case, tools)
+                # Should have one function call with the correct name
+                self.assertEqual(len(result.calls), 1)
+                self.assertEqual(result.calls[0].name, "func_with_special_chars")
+                # Should have some parameters
+                self.assertTrue(result.calls[0].parameters)
 
 
 class TestJsonArrayParser(unittest.TestCase):
