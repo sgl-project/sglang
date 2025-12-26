@@ -144,6 +144,7 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
         enable_memory_saver: bool,
         cache_params: "Mamba2CacheParams",
         speculative_num_draft_tokens: int,
+        enable_mamba_extra_buffer: bool,
         pre_alloc_size: int,
     ):
         DecodeReqToTokenPool.__init__(
@@ -154,9 +155,18 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
             enable_memory_saver=enable_memory_saver,
             pre_alloc_size=pre_alloc_size,
         )
+        self.mamba_ping_pong_track_buffer_size = (
+            2 if speculative_num_draft_tokens is None else 1
+        )
+        self.enable_mamba_extra_buffer = enable_mamba_extra_buffer
         self.enable_memory_saver = enable_memory_saver
         self._init_mamba_pool(
-            size + pre_alloc_size, cache_params, device, speculative_num_draft_tokens
+            size=size + pre_alloc_size,
+            mamba_spec_state_size=size + pre_alloc_size,
+            cache_params=cache_params,
+            device=device,
+            enable_mamba_extra_buffer=self.enable_mamba_extra_buffer,
+            speculative_num_draft_tokens=speculative_num_draft_tokens,
         )
 
     def clear(self):
@@ -229,6 +239,13 @@ class DecodePreallocQueue:
         self.retracted_queue: List[Req] = []
         self.prefill_pp_size = prefill_pp_size
         self.kv_manager = self._init_kv_manager()
+
+        if self.scheduler.tp_worker.is_hybrid_swa:
+            # FIXME: current SWA allocation allocate full kv cache size in prefill
+            self.max_total_num_tokens = min(
+                self.max_total_num_tokens,
+                self.scheduler.tp_worker.model_runner.swa_max_total_num_tokens,
+            )
 
     def _init_kv_manager(self) -> BaseKVManager:
         kv_args_class = get_kv_class(self.transfer_backend, KVClassType.KVARGS)
@@ -306,7 +323,11 @@ class DecodePreallocQueue:
             req.retraction_mb_id = None
             self.retracted_queue.append(req)
         else:
-            if req.bootstrap_host == FAKE_BOOTSTRAP_HOST:
+            # Auto enable FAKE mode if configured
+            if req.bootstrap_host == FAKE_BOOTSTRAP_HOST or (
+                req.bootstrap_host is None
+                and self.scheduler.server_args.disaggregation_decode_enable_fake_auto
+            ):
                 kv_receiver_class = get_kv_class(
                     TransferBackend.FAKE, KVClassType.RECEIVER
                 )
@@ -813,20 +834,25 @@ class SchedulerDisaggregationDecodeMixin:
         """A normal scheduler loop for decode worker in disaggregation mode."""
 
         while True:
+            # Receive requests
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
             # polling and allocating kv cache
             self.process_decode_queue()
+
+            # Get the next batch to run
             batch = self.get_next_disagg_decode_batch_to_run()
             self.cur_batch = batch
 
+            # Launch the current batch
             if batch:
-                # Generate fake extend output.
                 result = self.run_batch(batch)
                 self.process_batch_result(batch, result)
             else:
+                # When the server is idle, do self-check and re-init some states
                 self.self_check_during_idle()
 
+            # Update last_batch
             self.last_batch = batch
 
     @torch.no_grad()
@@ -835,26 +861,35 @@ class SchedulerDisaggregationDecodeMixin:
         self.last_batch: Optional[ScheduleBatch] = None
 
         while True:
-
+            # Receive requests
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
             # polling and allocating kv cache
             self.process_decode_queue()
+
+            # Get the next batch to run
             batch = self.get_next_disagg_decode_batch_to_run()
             self.cur_batch = batch
 
-            batch_result = None
+            # Launch the current batch
             if batch:
                 batch_result = self.run_batch(batch)
                 self.result_queue.append((batch.copy(), batch_result))
+            else:
+                batch_result = None
 
+            # Process the last batch
             if self.last_batch:
                 tmp_batch, tmp_result = self.result_queue.popleft()
                 self.process_batch_result(tmp_batch, tmp_result)
             elif batch is None:
                 self.self_check_during_idle()
 
+            # Run sample of the current batch
+            # It depends on the result of the last batch (e.g., grammar), so we run it after the last batch is processed.
             self.launch_batch_sample_if_needed(batch_result)
+
+            # Update last_batch
             self.last_batch = batch
 
     def _run_batch_prebuilt(

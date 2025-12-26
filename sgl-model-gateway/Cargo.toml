@@ -1,6 +1,6 @@
 [package]
 name = "sgl-model-gateway"
-version = "0.2.4"
+version = "0.3.0"
 edition = "2021"
 
 [features]
@@ -31,8 +31,8 @@ path = "src/main.rs"
 
 [dependencies]
 clap = { version = "4", features = ["derive", "env"] }
-axum = { version = "0.8.4", features = ["macros", "ws", "tracing"] }
-axum-server = { version = "0.7.3", default_features = false, features = ["tls-rustls"] }
+axum = { version = "0.8.6", features = ["macros", "ws", "tracing"] }
+axum-server = { version = "0.8.0", default-features = false, features = ["tls-rustls"] }
 tower = { version = "0.5", features = ["full"] }
 tower-http = { version = "0.6", features = ["trace", "compression-gzip", "cors", "timeout", "limit", "request-id", "util"] }
 serde = { version = "1.0", features = ["derive"] }
@@ -104,6 +104,7 @@ ndarray = "0.16"
 base64 = "0.22"
 openai-harmony = { git = "https://github.com/openai/harmony", tag = "v0.0.4" }
 openmetrics-parser = "0.4.4"
+arc-swap = "1.7.1"
 
 # gRPC and Protobuf dependencies
 tonic = { version = "0.14.2", features = ["gzip", "transport"] }
@@ -143,6 +144,7 @@ npyz = { version = "0.8", features = ["npz"] }  # For reading numpy .npz files i
 opentelemetry-proto = { version = "0.27", features = ["gen-tonic"] }
 tonic-v12 = { version = "0.12.3", package = "tonic" }
 serial_test = "3.0"
+
 
 [[bench]]
 name = "request_processing"

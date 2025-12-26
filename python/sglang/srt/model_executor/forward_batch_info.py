@@ -249,6 +249,12 @@ class ForwardBatch:
     # The indices of output tokens in the token_to_kv_pool_swa
     # TODO(shiyang, biao): integrate out_cache_loc_swa into multiple attention backends
     out_cache_loc_swa: Optional[torch.Tensor] = None
+    # The indices to track mamba state with
+    mamba_track_indices: Optional[torch.Tensor] = None  # shape: [b], int64
+    # The mask to track mamba state if needed
+    mamba_track_mask: Optional[torch.Tensor] = None  # shape: [b], bool
+    # The seqlens to track mamba state if masked, prefill only.
+    mamba_track_seqlens: Optional[torch.Tensor] = None  # shape: [b], int64
 
     # Optional seq_lens on cpu
     seq_lens_cpu: Optional[torch.Tensor] = None
@@ -342,6 +348,7 @@ class ForwardBatch:
     attn_backend: AttentionBackend = None
 
     # For DP attention
+    original_global_num_tokens_cpu: Optional[List[int]] = None
     global_num_tokens_cpu: Optional[List[int]] = None
     global_num_tokens_gpu: Optional[torch.Tensor] = None
     # Has to be None when cuda graph is captured.
@@ -387,6 +394,9 @@ class ForwardBatch:
     # Record the split metadata of the sequence number of NSA context parallels.
     nsa_cp_metadata: Optional[NSAContextParallelMetadata] = None
 
+    # For hidden states before normal
+    return_hidden_states_before_norm: bool = False
+
     @classmethod
     def init_new(
         cls,
@@ -400,6 +410,9 @@ class ForwardBatch:
             req_pool_indices=batch.req_pool_indices,
             seq_lens=batch.seq_lens,
             out_cache_loc=batch.out_cache_loc,
+            mamba_track_indices=batch.mamba_track_indices,
+            mamba_track_mask=batch.mamba_track_mask,
+            mamba_track_seqlens=batch.mamba_track_seqlens,
             mm_inputs=batch.multimodal_inputs,
             encoder_cached=batch.encoder_cached,
             encoder_lens=batch.encoder_lens,
@@ -427,6 +440,7 @@ class ForwardBatch:
             token_type_ids=batch.token_type_ids,
             tbo_split_seq_index=batch.tbo_split_seq_index,
             dimensions=batch.dimensions,
+            return_hidden_states_before_norm=batch.return_hidden_states_before_norm,
         )
         device = model_runner.device
 
@@ -455,6 +469,7 @@ class ForwardBatch:
                 global_num_tokens = batch.global_num_tokens
                 global_num_tokens_for_logprob = batch.global_num_tokens_for_logprob
 
+            ret.original_global_num_tokens_cpu = batch.global_num_tokens
             ret.global_num_tokens_cpu = global_num_tokens
             ret.global_num_tokens_gpu = torch.tensor(
                 global_num_tokens, dtype=torch.int64
@@ -883,6 +898,16 @@ class ForwardBatch:
         if self.encoder_lens is not None:
             self.encoder_lens = self._pad_tensor_to_size(self.encoder_lens, bs)
         self.positions = self._pad_tensor_to_size(self.positions, num_tokens)
+        if self.mamba_track_indices is not None:
+            self.mamba_track_indices = self._pad_tensor_to_size(
+                self.mamba_track_indices, bs
+            )
+        if self.mamba_track_mask is not None:
+            self.mamba_track_mask = self._pad_tensor_to_size(self.mamba_track_mask, bs)
+        if self.mamba_track_seqlens is not None:
+            self.mamba_track_seqlens = self._pad_tensor_to_size(
+                self.mamba_track_seqlens, bs
+            )
 
         if self.mrope_positions is not None:
             self.mrope_positions = self._pad_tensor_to_size(self.mrope_positions, bs)

@@ -20,7 +20,6 @@ from sglang.multimodal_gen.runtime.platforms.interface import (
     Platform,
     PlatformEnum,
 )
-from sglang.multimodal_gen.runtime.utils.common import is_blackwell
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.utils import import_pynvml
 
@@ -162,7 +161,6 @@ class CudaPlatformBase(Platform):
                 )
 
                 logger.info("Using Sage Attention 3 backend")
-
                 return "sglang.multimodal_gen.runtime.layers.attention.backends.sage_attn3.SageAttention3Backend"
             except ImportError as e:
                 logger.info(e)
@@ -214,7 +212,7 @@ class CudaPlatformBase(Platform):
         elif selected_backend in [
             AttentionBackendEnum.FA,
         ]:
-            if is_blackwell():
+            if cls.is_blackwell():
                 from sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn import (
                     set_fa_ver,
                 )
@@ -224,13 +222,28 @@ class CudaPlatformBase(Platform):
         elif selected_backend:
             raise ValueError(f"Invalid attention backend for {cls.device_name}")
         else:
-            if is_blackwell():
+
+            if cls.is_blackwell():
                 from sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn import (
                     set_fa_ver,
                 )
 
                 set_fa_ver(4)
             target_backend = AttentionBackendEnum.FA
+            if cls.is_sm120():
+                try:
+                    from sglang.multimodal_gen.runtime.layers.attention.backends.sage_attn3 import (  # noqa: F401
+                        SageAttention3Backend,
+                    )
+
+                    logger.info("Using Sage Attention 3 backend")
+                    return "sglang.multimodal_gen.runtime.layers.attention.backends.sage_attn3.SageAttention3Backend"
+                except ImportError as e:
+                    logger.info(e)
+                    logger.info(
+                        "Sage Attention 3 backend is not installed, Falling back to Torch SDPA (To install it, see https://github.com/thu-ml/SageAttention/tree/main/sageattention3_blackwell#installation)"
+                    )
+                    target_backend = AttentionBackendEnum.TORCH_SDPA
 
         if not cls.has_device_capability(80):
             logger.info(
@@ -243,7 +256,6 @@ class CudaPlatformBase(Platform):
                 "torch.float16 or torch.bfloat16."
             )
             target_backend = AttentionBackendEnum.TORCH_SDPA
-
         # FlashAttn is valid for the model, checking if the package is
         # installed.
         if target_backend == AttentionBackendEnum.FA:
