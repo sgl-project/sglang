@@ -1192,13 +1192,22 @@ class ServerArgs:
             self.disable_hybrid_swa_memory = True
 
         elif "MiMoV2FlashForCausalLM" in model_arch:
-            self.enable_multi_layer_eagle = True
-            logger.info("Enable multi-layer eagle for MiMoV2FlashForCausalLM model")
-            self.swa_full_tokens_ratio = 1.0
-            logger.warning(
-                "Reset swa_full_tokens_ratio to 1.0 for MiMoV2FlashForCausalLM model"
-            )
+            if self.speculative_algorithm == "EAGLE":
+                self.enable_multi_layer_eagle = True
+                logger.info(
+                    "Enable multi-layer EAGLE speculative decoding for MiMoV2FlashForCausalLM model."
+                )
+                if not envs.SGLANG_ENABLE_SPEC_V2.get():
+                    envs.SGLANG_ENABLE_SPEC_V2.set(True)
+                    logger.warning(
+                        "Spec v2 is enabled for multi-layer EAGLE speculative decoding."
+                    )
+
             if self.enable_hierarchical_cache:
+                self.swa_full_tokens_ratio = 1.0
+                logger.warning(
+                    "Reset swa_full_tokens_ratio to 1.0 for MiMoV2FlashForCausalLM model with hierarchical cache"
+                )
                 self.disable_hybrid_swa_memory = True
                 logger.warning(
                     "Disable hybrid SWA memory for MiMoV2FlashForCausalLM model with hierarchical cache"
@@ -1967,19 +1976,24 @@ class ServerArgs:
                 )
 
             if (
-                self.speculative_algorithm == "EAGLE"
+                self.speculative_algorithm in ["EAGLE", "EAGLE3"]
                 and envs.SGLANG_ENABLE_SPEC_V2.get()
             ):
                 self.disable_overlap_schedule = False
                 logger.warning(
-                    "Beta spec is enabled for eagle speculative decoding and overlap schedule is turned on."
+                    "Beta spec is enabled for eagle/eagle3 speculative decoding and overlap schedule is turned on."
                 )
-
-            if not envs.SGLANG_ENABLE_SPEC_V2.get():
+                if (
+                    self.speculative_eagle_topk is not None
+                    and self.speculative_eagle_topk > 1
+                ):
+                    raise ValueError(
+                        "Beta spec currently only supports topk = 1 for speculative decoding."
+                    )
+            else:
                 self.disable_overlap_schedule = True
                 logger.warning(
-                    "Overlap scheduler is disabled because of using eagle3 or standalone speculative decoding."
-                    "You can set env SGLANG_ENABLE_SPEC_V2=True to enable the experimental overlap scheduler."
+                    "Overlap scheduler is disabled when beta spec is off or using unsupported speculative algorithm."
                 )
 
             if self.enable_mixed_chunk:
@@ -2249,6 +2263,8 @@ class ServerArgs:
                 raise ValueError(
                     "Spec v2 and decode offload kv cache are incompatible and cannot be enabled together."
                 )
+        if not (0 < self.swa_full_tokens_ratio <= 1.0):
+            raise ValueError("--swa-full-tokens-ratio should be in range (0, 1.0].")
 
     def _handle_deterministic_inference(self):
         if self.rl_on_policy_target is not None:
@@ -5128,8 +5144,8 @@ def auto_choose_speculative_params(self: ServerArgs):
         "BailingMoeV2ForCausalLM",
         "MistralLarge3ForCausalLM",
         "PixtralForConditionalGeneration",
+        "MiMoV2FlashForCausalLM",
     ]:
-        # The default value for deepseek and gpt-oss
         return (3, 1, 4)
     elif arch in ["Grok1ForCausalLM", "Grok1VForCausalLM"]:
         return (5, 4, 8)

@@ -12,10 +12,7 @@ import dataclasses
 import os
 
 import imageio
-import numpy as np
 import torch
-import torchvision
-from einops import rearrange
 
 from sglang.multimodal_gen.configs.sample.sampling_params import (
     DataType,
@@ -66,31 +63,46 @@ def post_process_sample(
     """
     Process sample output and save video if necessary
     """
-    # Process outputs
+    # 1. Vectorized processing on GPU/CPU tensor
     if sample.dim() == 3:
         # for images, dim t is missing
         sample = sample.unsqueeze(1)
-    videos = rearrange(sample, "c t h w -> t c h w")
-    frames = []
-    # TODO: this can be batched
-    for x in videos:
-        x = torchvision.utils.make_grid(x, nrow=6)
-        x = x.transpose(0, 1).transpose(1, 2).squeeze(-1)
-        frames.append((x * 255).numpy().astype(np.uint8))
 
-    # Save outputs if requested
+    # Convert to uint8 and move to CPU in bulk
+    # Shape: [C, T, H, W] -> [T, H, W, C]
+    sample = (sample * 255).clamp(0, 255).to(torch.uint8)
+    videos = sample.permute(1, 2, 3, 0).cpu().numpy()
+
+    # Convert to list of frames for imageio
+    frames = list(videos)
+
+    # 2. Save outputs if requested
     if save_output:
         if save_file_path:
             os.makedirs(os.path.dirname(save_file_path), exist_ok=True)
             if data_type == DataType.VIDEO:
+                # TODO: make this configurable
+                quality = 5
                 imageio.mimsave(
                     save_file_path,
                     frames,
                     fps=fps,
                     format=data_type.get_default_extension(),
+                    codec="libx264",
+                    quality=quality,
                 )
             else:
-                imageio.imwrite(save_file_path, frames[0])
+                quality = 75
+                if len(frames) > 1:
+                    for i, image in enumerate(frames):
+                        parts = save_file_path.rsplit(".", 1)
+                        if len(parts) == 2:
+                            indexed_path = f"{parts[0]}_{i}.{parts[1]}"
+                        else:
+                            indexed_path = f"{save_file_path}_{i}"
+                        imageio.imwrite(indexed_path, image, quality=quality)
+                else:
+                    imageio.imwrite(save_file_path, frames[0], quality=quality)
             logger.info(f"Output saved to {CYAN}{save_file_path}{RESET}")
         else:
             logger.info(f"No output path provided, output not saved")
