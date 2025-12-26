@@ -22,7 +22,6 @@ from sglang.srt.layers.attention.nsa.transform_index import (
     transform_index_page_table_prefill,
 )
 from sglang.srt.layers.attention.nsa.utils import (
-    NSA_ENABLE_MTP_PRECOMPUTE_METADATA,
     compute_nsa_seqlens,
     is_nsa_enable_prefill_cp,
 )
@@ -1732,7 +1731,7 @@ class NativeSparseAttnMultiStepBackend:
     def init_forward_metadata_replay_cuda_graph(
         self, forward_batch: ForwardBatch, bs: int
     ):
-        if NSA_ENABLE_MTP_PRECOMPUTE_METADATA:
+        if envs.NSA_ENABLE_MTP_PRECOMPUTE_METADATA.get():
             # Precompute metadata once (shared across all backends)
             precomputed = self.attn_backends[0]._precompute_replay_metadata(
                 bs=bs,
