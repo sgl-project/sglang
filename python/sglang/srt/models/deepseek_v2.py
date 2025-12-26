@@ -1417,6 +1417,7 @@ class DeepseekV2AttentionMLA(nn.Module):
                 self.rotary_emb.forward = self.rotary_emb.forward_native
         else:
             self.rotary_emb = None
+        self.use_deepseek_yarn_rope = rope_scaling is not None
 
         self.attn_mqa = RadixAttention(
             self.num_local_heads,
