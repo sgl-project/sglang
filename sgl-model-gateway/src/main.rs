@@ -136,7 +136,7 @@ struct CliArgs {
     #[arg(long, num_args = 0..)]
     worker_urls: Vec<String>,
 
-    #[arg(long, default_value = "cache_aware", value_parser = ["random", "round_robin", "cache_aware", "power_of_two"])]
+    #[arg(long, default_value = "cache_aware", value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "manual"])]
     policy: String,
 
     #[arg(long, default_value_t = false)]
@@ -145,10 +145,10 @@ struct CliArgs {
     #[arg(long, action = ArgAction::Append)]
     decode: Vec<String>,
 
-    #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "power_of_two"])]
+    #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "manual"])]
     prefill_policy: Option<String>,
 
-    #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "power_of_two"])]
+    #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "manual"])]
     decode_policy: Option<String>,
 
     #[arg(long, default_value_t = 1800)]
@@ -415,6 +415,7 @@ impl CliArgs {
             "power_of_two" => PolicyConfig::PowerOfTwo {
                 load_check_interval_secs: 5,
             },
+            "manual" => PolicyConfig::Manual,
             _ => PolicyConfig::RoundRobin,
         }
     }
