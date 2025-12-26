@@ -34,7 +34,7 @@ from sglang.lang.choices import (
 )
 
 # Lazy import some libraries
-from sglang.utils import LazyImport
+from sglang.lazy import LazyImport
 from sglang.version import __version__
 
 Anthropic = LazyImport("sglang.lang.backend.anthropic", "Anthropic")
