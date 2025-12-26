@@ -1554,14 +1554,8 @@ class Scheduler(
                 if self.server_args.grammar_backend == "none":
                     error_msg = "Grammar-based generation (json_schema, regex, ebnf, structural_tag) is not supported when the server is launched with --grammar-backend none"
                     req.set_finish_with_abort(error_msg)
-                    logger.info(
-                        f"[TP{self.tp_rank}] Rank 0: set_finish_with_abort for req {req.rid}, grammar_backend is none"
-                    )
                     if self.tp_size > 1:
                         add_to_grammar_queue = True
-                        logger.info(
-                            f"[TP{self.tp_rank}] Rank 0: will add to grammar_queue for TP sync"
-                        )
                 else:
                     if req.sampling_params.json_schema is not None:
                         key = ("json", req.sampling_params.json_schema)
@@ -1597,15 +1591,9 @@ class Scheduler(
                 if self.server_args.grammar_backend == "none":
                     error_msg = "Grammar-based generation (json_schema, regex, ebnf, structural_tag) is not supported when the server is launched with --grammar-backend none"
                     req.set_finish_with_abort(error_msg)
-                    logger.info(
-                        f"[TP{self.tp_rank}] Non-rank-0: set_finish_with_abort for req {req.rid}, grammar_backend is none"
-                    )
                 add_to_grammar_queue = True
 
         if add_to_grammar_queue:
-            logger.info(
-                f"[TP{self.tp_rank}] Adding req {req.rid} to grammar_queue (grammar={req.grammar}, finished={req.finished()})"
-            )
             self.grammar_queue.append(req)
         else:
             self._add_request_to_queue(req)
