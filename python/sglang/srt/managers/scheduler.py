@@ -732,8 +732,6 @@ class Scheduler(
         # The last forward batch
         self.last_batch: Optional[ScheduleBatch] = None
         self.forward_ct = 0
-        self.last_prefill_tokens = 0
-        self.last_prefill_cache_tokens = 0
         self.return_health_check_ct = 0
         self.num_retracted_reqs: int = 0
         self.num_paused_reqs: int = 0
@@ -2088,12 +2086,24 @@ class Scheduler(
                 self.decode_mem_cache_buf_multiplier
             )
         ) or (TEST_RETRACT and self.forward_ct % TEST_RETRACT_INTERVAL == 0):
-            old_available_tokens = self.token_to_kv_pool_allocator.available_size()
+            if self.is_hybrid_swa:
+                old_available_tokens = min(
+                    self.token_to_kv_pool_allocator.full_available_size(),
+                    self.token_to_kv_pool_allocator.swa_available_size(),
+                )
+            else:
+                old_available_tokens = self.token_to_kv_pool_allocator.available_size()
             old_ratio = self.new_token_ratio
             retracted_reqs, new_token_ratio, reqs_to_abort = batch.retract_decode(
                 self.server_args, self.decode_mem_cache_buf_multiplier
             )
-            new_available_tokens = self.token_to_kv_pool_allocator.available_size()
+            if self.is_hybrid_swa:
+                new_available_tokens = min(
+                    self.token_to_kv_pool_allocator.full_available_size(),
+                    self.token_to_kv_pool_allocator.swa_available_size(),
+                )
+            else:
+                new_available_tokens = self.token_to_kv_pool_allocator.available_size()
             new_token_gained = new_available_tokens - old_available_tokens
 
             self.num_retracted_reqs = len(retracted_reqs)
@@ -2573,7 +2583,10 @@ class Scheduler(
                 release_kv_cache(req, self.tree_cache)
 
             # For mamba radix cache
-            if req.mamba_pool_idx is not None:
+            if (
+                req.mamba_pool_idx is not None
+                and self.disaggregation_mode != DisaggregationMode.DECODE
+            ):
                 release_kv_cache(req, self.tree_cache, is_insert=False)
             logger.debug(f"Abort queued request. {req.rid=}")
 

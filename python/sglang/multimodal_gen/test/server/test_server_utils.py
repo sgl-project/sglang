@@ -21,7 +21,8 @@ import pytest
 from openai import Client, OpenAI
 
 from sglang.multimodal_gen.benchmarks.compare_perf import calculate_upper_bound
-from sglang.multimodal_gen.runtime.utils.common import is_hip, kill_process_tree
+from sglang.multimodal_gen.runtime.platforms import current_platform
+from sglang.multimodal_gen.runtime.utils.common import kill_process_tree
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
     globally_suppress_loggers,
     init_logger,
@@ -150,7 +151,7 @@ class ServerContext:
 
         # ROCm/AMD: Extra cleanup to ensure GPU memory is released between tests
         # This is needed because ROCm memory release can be slower than CUDA
-        if is_hip():
+        if current_platform.is_hip():
             self._cleanup_rocm_gpu_memory()
             # Clean up downloaded models if HF cache is not persistent
             # This prevents disk exhaustion in CI when cache is not mounted
@@ -318,7 +319,7 @@ class ServerManager:
         """Start the diffusion server and wait for readiness."""
         # ROCm/AMD: Wait for GPU memory to be clear before starting
         # This prevents OOM when running sequential tests on ROCm
-        if is_hip():
+        if current_platform.is_hip():
             self._wait_for_rocm_gpu_memory_clear()
 
         log_dir, perf_log_path = prepare_perf_log()
@@ -551,7 +552,7 @@ class PerformanceValidator:
         For AMD GPUs, uses 100% higher tolerance and issues warning instead of assertion.
         """
         # Check if running on AMD GPU
-        is_amd = is_hip()
+        is_amd = current_platform.is_hip()
 
         if is_amd:
             # Use 100% higher tolerance for AMD (2x the expected value)
@@ -753,7 +754,7 @@ def get_generate_fn(
         job_completed = False
         is_baseline_generation_mode = os.environ.get("SGLANG_GEN_BASELINE", "0") == "1"
         # Check if running on AMD GPU - use longer timeout
-        is_amd = is_hip()
+        is_amd = current_platform.is_hip()
         if is_baseline_generation_mode:
             timeout = 3600.0
         elif is_amd:
