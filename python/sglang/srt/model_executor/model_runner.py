@@ -2308,14 +2308,20 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         return ModelRunnerOutput(logits_output=ret, can_run_graph=can_run_graph)
 
     def _preprocess_logits(
-        self, logits_output: LogitsProcessorOutput, sampling_info: SamplingBatchInfo
+        self,
+        logits_output: LogitsProcessorOutput,
+        sampling_info: SamplingBatchInfo,
+        apply_vocab_mask: bool = True,
     ):
         # NOTE: In overlap mode, the function update_regex_vocab_mask (in sample)
         #       was executed after we processed last batch's results.
 
         # Calculate logits bias and apply it to next_token_logits.
-        sampling_info.update_regex_vocab_mask()
-        sampling_info.apply_logits_bias(logits_output.next_token_logits)
+        if apply_vocab_mask:
+            sampling_info.update_regex_vocab_mask()
+        sampling_info.apply_logits_bias(
+            logits_output.next_token_logits, apply_vocab_mask=apply_vocab_mask
+        )
 
     def sample(
         self,
@@ -2338,7 +2344,15 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 axis=-1,
             )
 
-        self._preprocess_logits(logits_output, forward_batch.sampling_info)
+        normal_decode = forward_batch.spec_algorithm is None
+        apply_vocab_mask = normal_decode and (
+            self.sampler.tp_size == 1 or self.sampler.tp_rank == 0
+        )
+        self._preprocess_logits(
+            logits_output,
+            forward_batch.sampling_info,
+            apply_vocab_mask=apply_vocab_mask,
+        )
         # Sample the next tokens
         next_token_ids = self.sampler(
             logits_output,
@@ -2352,6 +2366,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 if forward_batch.forward_mode.is_decode()
                 else forward_batch.seq_lens - 1
             ),
+            broadcast_from_rank0=normal_decode,
         )
         return next_token_ids
 

@@ -2369,9 +2369,7 @@ class Scheduler(
         if tp_size > 1:
             # Sync across TP ranks to make sure they have the same number of ready requests
             tensor = torch.tensor([num_ready_reqs, num_timeout_reqs], dtype=torch.int32)
-            torch.distributed.all_reduce(
-                tensor, op=torch.distributed.ReduceOp.MAX, group=tp_group
-            )
+            torch.distributed.broadcast(tensor, src=self.entry_rank, group=tp_group)
             num_ready_reqs_max, num_timeout_reqs_max = tensor.tolist()
 
             for i in range(num_ready_reqs, num_ready_reqs_max):

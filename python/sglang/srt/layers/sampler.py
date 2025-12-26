@@ -40,10 +40,13 @@ class Sampler(nn.Module):
     def __init__(self):
         super().__init__()
         self.use_nan_detection = get_global_server_args().enable_nan_detection
-        self.tp_sync_group = get_tp_group().device_group
-
-        if is_dp_attention_enabled():
-            self.tp_sync_group = get_attention_tp_group().device_group
+        tp_group = (
+            get_attention_tp_group() if is_dp_attention_enabled() else get_tp_group()
+        )
+        self.tp_sync_group = tp_group.device_group
+        self.tp_rank = tp_group.rank_in_group
+        self.tp_root_rank = tp_group.ranks[0]
+        self.tp_size = tp_group.world_size
 
     def _preprocess_logits(
         self, logits: torch.Tensor, sampling_info: SamplingBatchInfo
@@ -72,6 +75,7 @@ class Sampler(nn.Module):
         top_logprobs_nums: List[int],
         token_ids_logprobs: List[List[int]],
         positions: torch.Tensor,
+        broadcast_from_rank0: bool = False,
     ):
         """Run a sampler & compute logprobs and update logits_output accordingly.
 
@@ -205,7 +209,14 @@ class Sampler(nn.Module):
                 batch_next_token_ids,
             ]
 
-        if SYNC_TOKEN_IDS_ACROSS_TP or sampling_info.grammars:
+        if broadcast_from_rank0 and sampling_info.grammars and self.tp_size > 1:
+            # Grammar-aware sampling only runs on rank 0; broadcast its choice to keep ranks in sync.
+            dist.broadcast(
+                batch_next_token_ids,
+                src=self.tp_root_rank,
+                group=self.tp_sync_group,
+            )
+        elif SYNC_TOKEN_IDS_ACROSS_TP or sampling_info.grammars:
             # For performance reasons, SGLang does not sync the final token IDs across TP ranks by default.
             # This saves one all-reduce, but the correctness of this approach depends on the determinism of several operators:
             # the last all-reduce, the last lm_head matmul, and all sampling kernels.
