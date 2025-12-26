@@ -47,9 +47,8 @@ impl PipelineStage for EmbeddingPreparationStage {
             ));
         };
 
-        // Extract text and routing_id from request before borrowing ctx mutably
+        // Extract text from request
         let text = request.extract_text_for_routing();
-        let routing_id = request.routing_id.clone();
         if text.is_empty() {
             return Err(error::bad_request(
                 "empty_input",
@@ -78,7 +77,6 @@ impl PipelineStage for EmbeddingPreparationStage {
         // Store preparation output
         ctx.state.preparation = Some(PreparationOutput {
             original_text: Some(text),
-            routing_id,
             token_ids,
             processed_messages: None,
             tool_constraints: None,
