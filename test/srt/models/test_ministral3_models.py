@@ -9,7 +9,7 @@ MODEL = "mistralai/Ministral-3-3B-Instruct-2512"
 
 
 class TestMinistral3TextOnly(GSM8KMixin, DefaultServerBase):
-    accuracy = 0.6
+    gsm8k_accuracy_thres = 0.6
     model = MODEL
     other_args = ["--trust-remote-code"]
 
