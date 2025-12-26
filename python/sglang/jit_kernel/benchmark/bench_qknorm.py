@@ -19,16 +19,13 @@ def sglang_aot_qknorm(
     k: torch.Tensor,
     q_weight: torch.Tensor,
     k_weight: torch.Tensor,
-    use_alt_stream: bool = True,
 ) -> None:
     from sgl_kernel import rmsnorm
 
-    q = q.view(-1, HEAD_DIM)
-    k = k.view(-1, HEAD_DIM)
-    if not use_alt_stream:
-        rmsnorm(q, q_weight, out=q)
-        rmsnorm(k, k_weight, out=k)
-        return
+    head_dim = q.shape[-1]
+    q = q.view(-1, head_dim)
+    k = k.view(-1, head_dim)
+
     current_stream = torch.cuda.current_stream()
     alt_stream.wait_stream(current_stream)
     rmsnorm(q, q_weight, out=q)
@@ -48,7 +45,7 @@ def sglang_jit_qknorm(
     fused_inplace_qknorm(q, k, q_weight, k_weight)
 
 
-def flashinfer_jit_qknorm(
+def flashinfer_qknorm(
     q: torch.Tensor,
     k: torch.Tensor,
     q_weight: torch.Tensor,
@@ -58,6 +55,22 @@ def flashinfer_jit_qknorm(
 
     rmsnorm(q, q_weight, out=q)
     rmsnorm(k, k_weight, out=k)
+
+
+@torch.compile()
+def torch_impl_qknorm(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    eps: float = 1e-6,
+) -> None:
+    q_mean = q.float().pow(2).mean(dim=-1, keepdim=True)
+    k_mean = k.float().pow(2).mean(dim=-1, keepdim=True)
+    q_norm = (q_mean + eps).rsqrt()
+    k_norm = (k_mean + eps).rsqrt()
+    q.copy_(q.float() * q_norm * q_weight.float())
+    k.copy_(k.float() * k_norm * k_weight.float())
 
 
 HEAD_DIM = 128
@@ -73,9 +86,9 @@ else:
     GQA_RANGE = [4, 8]
     KV_HEAD_RANGE = [1, 2, 4, 8]
 
-LINE_VALS = ["aot", "jit", "flashinfer"]
-LINE_NAMES = ["SGL Kernel", "SGL JIT Kernel", "FlashInfer"]
-STYLES = [("orange", "-"), ("blue", "--"), ("green", "-.")]
+LINE_VALS = ["aot", "jit", "fi", "torch"]
+LINE_NAMES = ["SGL AOT Kernel", "SGL JIT Kernel", "FlashInfer", "PyTorch"]
+STYLES = [("orange", "-"), ("blue", "--"), ("green", "-."), ("red", ":")]
 
 configs = list(itertools.product(GQA_RANGE, KV_HEAD_RANGE, BS_RANGE))
 
@@ -104,7 +117,8 @@ def benchmark(
     FN_MAP = {
         "aot": sglang_aot_qknorm,
         "jit": sglang_jit_qknorm,
-        "flashinfer": flashinfer_jit_qknorm,
+        "fi": flashinfer_qknorm,
+        "torch": torch_impl_qknorm,
     }
     fn = lambda: FN_MAP[provider](q, k, q_weight, k_weight)
     quantiles = [0.5, 0.2, 0.8]

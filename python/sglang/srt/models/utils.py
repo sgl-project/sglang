@@ -22,6 +22,7 @@ import numpy as np
 import torch
 
 from sglang.jit_kernel.norm import can_use_fused_inplace_qknorm, fused_inplace_qknorm
+from sglang.srt.environ import envs
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.utils import is_cuda
@@ -230,6 +231,7 @@ def apply_qk_norm(
         _is_cuda  # TODO(dark): have not tested on ROCm or other backends
         and allow_inplace  # TODO(dark): this can be relaxed if needed
         and (q_eps == k_eps)  # TODO(dark): this can also be relaxed
+        and not envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get()
         and can_use_fused_inplace_qknorm(head_dim)
     ):
         fused_inplace_qknorm(

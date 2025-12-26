@@ -65,7 +65,6 @@ __always_inline __device__ void apply_norm(void* __restrict__ input, const void*
   for (auto i = 0u; i < kLoopCount; ++i) {
     const auto fp16_input = input_vec.data[i];
     const auto fp32_input = to_float2(fp16_input);
-    input_vec.data[i] = fp16_input;
     sum_of_squares += fp32_input.x * fp32_input.x;
     sum_of_squares += fp32_input.y * fp32_input.y;
   }
