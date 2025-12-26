@@ -289,7 +289,7 @@ impl<B> MakeSpan<B> for RequestSpan {
             status_code = Empty,
             latency = Empty,
             error = Empty,
-            module = "sglang::router_rs"
+            module = "sgl_model_gateway"
         )
     }
 }

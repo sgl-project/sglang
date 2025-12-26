@@ -336,6 +336,12 @@ pub enum PolicyConfig {
         /// Interval between bucket boundary adjustment cycles (seconds)
         bucket_adjust_interval_secs: usize,
     },
+
+    /// Manual routing policy supporting header-based routing:
+    /// - X-SMG-Target-Worker: Direct routing to a specific worker by URL
+    /// - X-SMG-Routing-Key: Consistent hash routing for session affinity
+    #[serde(rename = "manual")]
+    Manual,
 }
 
 impl PolicyConfig {
@@ -346,6 +352,7 @@ impl PolicyConfig {
             PolicyConfig::CacheAware { .. } => "cache_aware",
             PolicyConfig::PowerOfTwo { .. } => "power_of_two",
             PolicyConfig::Bucket { .. } => "bucket",
+            PolicyConfig::Manual => "manual",
         }
     }
 }

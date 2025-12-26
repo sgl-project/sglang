@@ -265,7 +265,6 @@ class ServerArgs:
     context_length: Optional[int] = None
     is_embedding: bool = False
     enable_multimodal: Optional[bool] = None
-    limit_mm_data_per_request: Optional[Union[str, Dict[str, int]]] = None
     revision: Optional[str] = None
     model_impl: str = "auto"
 
@@ -378,7 +377,6 @@ class ServerArgs:
     # Data parallelism
     dp_size: int = 1
     load_balance_method: str = "round_robin"
-    load_watch_interval: float = 0.1
     # FIXME: remove this after dp rank scheduling is fully supported with PD-Disaggregation
     prefill_round_robin_balance: bool = False
 
@@ -550,7 +548,7 @@ class ServerArgs:
     enable_piecewise_cuda_graph: bool = False
     enable_torch_compile_debug_mode: bool = False
     torch_compile_max_bs: int = 32
-    piecewise_cuda_graph_max_tokens: int = 4096
+    piecewise_cuda_graph_max_tokens: Optional[int] = None
     piecewise_cuda_graph_tokens: Optional[List[int]] = None
     piecewise_cuda_graph_compiler: str = "eager"
     torchao_config: str = ""
@@ -637,6 +635,7 @@ class ServerArgs:
     enable_prefix_mm_cache: bool = False
     mm_enable_dp_encoder: bool = False
     mm_process_config: Optional[Dict[str, Any]] = None
+    limit_mm_data_per_request: Optional[Union[str, Dict[str, int]]] = None
 
     # For checkpoint decryption
     decrypted_config_file: Optional[str] = None
@@ -895,6 +894,12 @@ class ServerArgs:
         else:
             self.cuda_graph_max_bs = max(self.cuda_graph_bs)
 
+        if self.piecewise_cuda_graph_max_tokens is None:
+            # Capture piecewise cuda graph tokens up to the chunked prefill size. Two benefits:
+            # 1. cuda graph acceleration for all prefill lengths.
+            # 2. do not need more temporary memory for activations. Less fragmentation.
+            self.piecewise_cuda_graph_max_tokens = self.chunked_prefill_size
+
         if self.piecewise_cuda_graph_tokens is None:
             self.piecewise_cuda_graph_tokens = (
                 self._generate_piecewise_cuda_graph_tokens()
@@ -936,7 +941,7 @@ class ServerArgs:
 
             # For piecewise cuda graphs
             if self.enable_piecewise_cuda_graph:
-                reserved_mem += self.piecewise_cuda_graph_max_tokens // 4
+                reserved_mem += self.piecewise_cuda_graph_max_tokens // 8
 
             self.mem_fraction_static = (
                 round((gpu_mem - reserved_mem) / gpu_mem, 3)
@@ -1187,13 +1192,22 @@ class ServerArgs:
             self.disable_hybrid_swa_memory = True
 
         elif "MiMoV2FlashForCausalLM" in model_arch:
-            self.enable_multi_layer_eagle = True
-            logger.info("Enable multi-layer eagle for MiMoV2FlashForCausalLM model")
-            self.swa_full_tokens_ratio = 1.0
-            logger.warning(
-                "Reset swa_full_tokens_ratio to 1.0 for MiMoV2FlashForCausalLM model"
-            )
+            if self.speculative_algorithm == "EAGLE":
+                self.enable_multi_layer_eagle = True
+                logger.info(
+                    "Enable multi-layer EAGLE speculative decoding for MiMoV2FlashForCausalLM model."
+                )
+                if not envs.SGLANG_ENABLE_SPEC_V2.get():
+                    envs.SGLANG_ENABLE_SPEC_V2.set(True)
+                    logger.warning(
+                        "Spec v2 is enabled for multi-layer EAGLE speculative decoding."
+                    )
+
             if self.enable_hierarchical_cache:
+                self.swa_full_tokens_ratio = 1.0
+                logger.warning(
+                    "Reset swa_full_tokens_ratio to 1.0 for MiMoV2FlashForCausalLM model with hierarchical cache"
+                )
                 self.disable_hybrid_swa_memory = True
                 logger.warning(
                     "Disable hybrid SWA memory for MiMoV2FlashForCausalLM model with hierarchical cache"
@@ -1425,9 +1439,11 @@ class ServerArgs:
                         self.disable_radix_cache = True
                         self.disable_overlap_schedule = False
 
-        if not self.get_model_config().is_generation:
+        if envs.SGLANG_EMBEDDINGS_SPARSE_HEAD.is_set():
             self.disable_overlap_schedule = True
-            logger.warning("Overlap scheduler is disabled for embedding models.")
+            logger.warning(
+                f"Overlap scheduler is disabled when using sparse head for embedding model."
+            )
 
         # TRTLLM AllReduce Fusion supports SM90/100/120, enable it by default
         # for models with explicit support (DeepseekV3, GptOss, Glm4Moe, Qwen3Moe)
@@ -1960,19 +1976,24 @@ class ServerArgs:
                 )
 
             if (
-                self.speculative_algorithm == "EAGLE"
+                self.speculative_algorithm in ["EAGLE", "EAGLE3"]
                 and envs.SGLANG_ENABLE_SPEC_V2.get()
             ):
                 self.disable_overlap_schedule = False
                 logger.warning(
-                    "Beta spec is enabled for eagle speculative decoding and overlap schedule is turned on."
+                    "Beta spec is enabled for eagle/eagle3 speculative decoding and overlap schedule is turned on."
                 )
-
-            if not envs.SGLANG_ENABLE_SPEC_V2.get():
+                if (
+                    self.speculative_eagle_topk is not None
+                    and self.speculative_eagle_topk > 1
+                ):
+                    raise ValueError(
+                        "Beta spec currently only supports topk = 1 for speculative decoding."
+                    )
+            else:
                 self.disable_overlap_schedule = True
                 logger.warning(
-                    "Overlap scheduler is disabled because of using eagle3 or standalone speculative decoding."
-                    "You can set env SGLANG_ENABLE_SPEC_V2=True to enable the experimental overlap scheduler."
+                    "Overlap scheduler is disabled when beta spec is off or using unsupported speculative algorithm."
                 )
 
             if self.enable_mixed_chunk:
@@ -2242,6 +2263,8 @@ class ServerArgs:
                 raise ValueError(
                     "Spec v2 and decode offload kv cache are incompatible and cannot be enabled together."
                 )
+        if not (0 < self.swa_full_tokens_ratio <= 1.0):
+            raise ValueError("--swa-full-tokens-ratio should be in range (0, 1.0].")
 
     def _handle_deterministic_inference(self):
         if self.rl_on_policy_target is not None:
@@ -2484,13 +2507,6 @@ class ServerArgs:
             default=ServerArgs.enable_multimodal,
             action="store_true",
             help="Enable the multimodal functionality for the served model. If the model being served is not multimodal, nothing will happen",
-        )
-        parser.add_argument(
-            "--limit-mm-data-per-request",
-            type=json.loads,
-            default=ServerArgs.limit_mm_data_per_request,
-            help="Limit the number of multimodal inputs per request. "
-            'e.g. \'{"image": 1, "video": 1, "audio": 1}\'',
         )
         parser.add_argument(
             "--revision",
@@ -3143,12 +3159,6 @@ class ServerArgs:
                 "shortest_queue",
                 "minimum_tokens",
             ],
-        )
-        parser.add_argument(
-            "--load-watch-interval",
-            type=float,
-            default=ServerArgs.load_watch_interval,
-            help="The interval of load watching in seconds.",
         )
         parser.add_argument(
             "--prefill-round-robin-balance",
@@ -4403,6 +4413,13 @@ class ServerArgs:
             default=ServerArgs.mm_enable_dp_encoder,
             help="Enabling data parallelism for mm encoder. The dp size will be set to the tp size automatically.",
         )
+        parser.add_argument(
+            "--limit-mm-data-per-request",
+            type=json.loads,
+            default=ServerArgs.limit_mm_data_per_request,
+            help="Limit the number of multimodal inputs per request. "
+            'e.g. \'{"image": 1, "video": 1, "audio": 1}\'',
+        )
 
         # For checkpoint decryption
         parser.add_argument(
@@ -5127,8 +5144,8 @@ def auto_choose_speculative_params(self: ServerArgs):
         "BailingMoeV2ForCausalLM",
         "MistralLarge3ForCausalLM",
         "PixtralForConditionalGeneration",
+        "MiMoV2FlashForCausalLM",
     ]:
-        # The default value for deepseek and gpt-oss
         return (3, 1, 4)
     elif arch in ["Grok1ForCausalLM", "Grok1VForCausalLM"]:
         return (5, 4, 8)

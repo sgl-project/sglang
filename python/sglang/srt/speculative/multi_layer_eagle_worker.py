@@ -348,9 +348,7 @@ class MultiLayerEagleWorker(TpModelWorker):
     def _draft_preprocess_decode(self, batch: ScheduleBatch):
         if isinstance(batch.tree_cache, SWAChunkCache):
             for req in batch.reqs:
-                batch.tree_cache.evict_swa(
-                    req, req.seqlen - 1, batch.model_config.attention_chunk_size
-                )
+                batch.tree_cache.evict_swa(req, req.seqlen - 1)
 
         # Parse args
         num_seqs = batch.batch_size()

@@ -242,7 +242,12 @@ def run_accuracy_test(
         )
 
     # Validate against baseline
-    score = metrics.get("score", 0.0)
+    # Handle different metric key names: "score", "mean_score" (for GPQA with repeat), "accuracy"
+    score = (
+        metrics.get("score")
+        or metrics.get("mean_score")
+        or metrics.get("accuracy", 0.0)
+    )
     passed = score >= params.baseline_accuracy
     latency = metrics.get("latency")
 

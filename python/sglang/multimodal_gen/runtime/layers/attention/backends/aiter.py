@@ -11,6 +11,7 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend i
     AttentionMetadata,
     AttentionMetadataBuilder,
 )
+from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 
 
 class AITerBackend(AttentionBackend):
@@ -19,8 +20,8 @@ class AITerBackend(AttentionBackend):
     """
 
     @staticmethod
-    def get_name() -> str:
-        return "AITER"
+    def get_enum() -> AttentionBackendEnum:
+        return AttentionBackendEnum.AITER
 
     @staticmethod
     def get_impl_cls() -> type["AITerImpl"]:
