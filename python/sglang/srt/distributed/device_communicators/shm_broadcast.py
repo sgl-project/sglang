@@ -19,7 +19,7 @@ from zmq import SUB, SUBSCRIBE, XPUB, XPUB_VERBOSE, Context  # type: ignore
 from sglang.srt.utils import (
     format_tcp_address,
     get_local_ip_auto,
-    get_open_port,
+    get_zmq_socket,
     is_valid_ipv6_address,
 )
 
@@ -206,15 +206,15 @@ class MessageQueue:
             # XPUB is very similar to PUB,
             # except that it can receive subscription messages
             # to confirm the number of subscribers
-            self.local_socket = context.socket(XPUB)
+            local_subscribe_port, self.local_socket = get_zmq_socket(
+                context, XPUB, endpoint=None, host="127.0.0.1"
+            )
             # set the verbose option so that we can receive every subscription
             # message. otherwise, we will only receive the first subscription
             # see http://api.zeromq.org/3-3:zmq-setsockopt for more details
             self.local_socket.setsockopt(XPUB_VERBOSE, True)
-            local_subscribe_port = get_open_port()
-            socket_addr = f"tcp://127.0.0.1:{local_subscribe_port}"
-            logger.debug("Binding to %s", socket_addr)
-            self.local_socket.bind(socket_addr)
+            address = format_tcp_address("127.0.0.1", local_subscribe_port)
+            logger.debug(f"class MessageQueue: Binding local socket to {address=}")
             self.current_idx = 0
 
         else:
@@ -226,14 +226,12 @@ class MessageQueue:
         if n_remote_reader > 0:
             # for remote readers, we will:
             # create a publish-subscribe socket to communicate large data
-            self.remote_socket = context.socket(XPUB)
+            remote_subscribe_port, self.remote_socket = get_zmq_socket(
+                context, XPUB, endpoint=None, host=connect_ip
+            )
             self.remote_socket.setsockopt(XPUB_VERBOSE, True)
-            remote_subscribe_port = get_open_port()
-            if is_valid_ipv6_address(connect_ip):
-                self.remote_socket.setsockopt(IPV6, 1)
             address = format_tcp_address(connect_ip, remote_subscribe_port)
             logger.debug(f"class MessageQueue: Binding remote socket to {address=}")
-            self.remote_socket.bind(address)
 
         else:
             remote_subscribe_port = None

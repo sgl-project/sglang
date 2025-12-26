@@ -22,7 +22,7 @@ from sglang.srt.managers.io_struct import TokenizedGenerateReqInput
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import get_local_ip_auto, get_zmq_socket_on_host
+from sglang.srt.utils import get_local_ip_auto, get_zmq_socket
 from sglang.srt.utils.hf_transformers_utils import get_processor
 
 logger = logging.getLogger(__name__)
@@ -129,9 +129,7 @@ class WaitingImageRequest:
         self.host_name = host_name
         self.receive_count = receive_count
         self.num_items_assigned = recv_req.num_items_assigned
-        self.embedding_port, self.recv_socket = get_zmq_socket_on_host(
-            zmq.Context(), zmq.PULL
-        )
+        self.embedding_port, self.recv_socket = get_zmq_socket(zmq.Context(), zmq.PULL)
         logger.info(f"Waiting for input {self.embedding_port = }")
         self.recv_embedding_data = None
         # ok=1 pending=0 fail=-1
@@ -607,7 +605,7 @@ class MMReceiverHTTP(MMReceiverBase):
             if len(self.encode_urls) == 0:
                 return None
             req_id = uuid.uuid4().hex
-            embedding_port, recv_socket = get_zmq_socket_on_host(self.context, zmq.PULL)
+            embedding_port, recv_socket = get_zmq_socket(self.context, zmq.PULL)
             if type(img_data) != list:
                 img_data = [img_data.url]
             else:

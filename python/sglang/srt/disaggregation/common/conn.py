@@ -33,7 +33,7 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
     format_tcp_address,
     get_local_ip_auto,
-    get_zmq_socket_on_host,
+    get_zmq_socket,
     is_valid_ipv6_address,
     maybe_wrap_ipv6_address,
 )
@@ -75,11 +75,11 @@ class CommonKVManager(BaseKVManager):
 
         # bind zmq socket
         context = zmq.Context()
-        zmq_bind_host = maybe_wrap_ipv6_address(self.local_ip)
-        self.rank_port, self.server_socket = get_zmq_socket_on_host(
-            context, zmq.PULL, host=zmq_bind_host
+        self.rank_port, self.server_socket = get_zmq_socket(
+            context, zmq.PULL, host=self.local_ip
         )
-        logger.debug(f"kv manager bind to {zmq_bind_host}:{self.rank_port}")
+        zmq_bind_address = format_tcp_address(self.local_ip, self.rank_port)
+        logger.debug(f"kv manager bind to {zmq_bind_address}")
 
         self.request_status: Dict[int, KVPoll] = {}
 

@@ -1404,62 +1404,86 @@ def get_zmq_socket(
     socket_type: zmq.SocketType,
     endpoint: Optional[str] = None,
     bind: bool = True,
+    host: str = "*",
 ) -> Union[zmq.Socket, Tuple[int, zmq.Socket]]:
     """Create and configure a ZeroMQ socket.
 
     Args:
         context: ZeroMQ context to create the socket from.
         socket_type: Type of ZeroMQ socket to create.
-        endpoint: Optional endpoint to bind/connect to. If None, binds to a random TCP port.
-        bind: Whether to bind (True) or connect (False) to the endpoint. Ignored if endpoint is None.
+        endpoint: Optional endpoint to bind/connect to (e.g., "tcp://127.0.0.1:5555").
+                  If None, binds to a random TCP port on the specified host.
+        bind: Whether to bind (True) or connect (False) to the endpoint.
+              Only used when endpoint is provided; ignored when endpoint is None.
+        host: Host to bind to when endpoint is None. Can be:
+              - "*" (default): Bind to all interfaces
+              - An IPv4 address (e.g., "127.0.0.1")
+              - An IPv6 address, with or without brackets (e.g., "::1" or "[::1]")
+              This parameter is ignored when endpoint is provided.
 
     Returns:
         If endpoint is None: Tuple of (port, socket) where port is the randomly assigned TCP port.
         If endpoint is provided: The configured ZeroMQ socket.
+
+    Examples:
+        # Bind to random port on all interfaces
+        port, sock = get_zmq_socket(ctx, zmq.PULL)
+
+        # Bind to random port on specific IPv4 host
+        port, sock = get_zmq_socket(ctx, zmq.PULL, host="127.0.0.1")
+
+        # Bind to random port on IPv6 host (with or without brackets)
+        port, sock = get_zmq_socket(ctx, zmq.PULL, host="::1")
+        port, sock = get_zmq_socket(ctx, zmq.PULL, host="[::1]")
+
+        # Bind to specific endpoint
+        sock = get_zmq_socket(ctx, zmq.PUSH, endpoint="tcp://127.0.0.1:5555")
+
+        # Connect to specific endpoint
+        sock = get_zmq_socket(ctx, zmq.PUSH, endpoint="tcp://127.0.0.1:5555", bind=False)
     """
     socket = context.socket(socket_type)
 
-    if endpoint is None:
-        # Bind to random TCP port
+    try:
         config_socket(socket, socket_type)
-        port = socket.bind_to_random_port("tcp://*")
-        return port, socket
-    else:
-        # Handle IPv6 if endpoint contains brackets
-        if endpoint.find("[") != -1:
+
+        enable_ipv6 = False
+        if endpoint is not None:
+            # Check if endpoint contains brackets (e.g. "tcp://[::1]:80")
+            if "[" in endpoint:
+                enable_ipv6 = True
+        else:
+            # For host parameter, strip brackets if present before validation
+            # This handles both "::1" and "[::1]" formats
+            host_stripped = host.strip("[]")
+            if is_valid_ipv6_address(host_stripped):
+                enable_ipv6 = True
+
+        if enable_ipv6:
             socket.setsockopt(zmq.IPV6, 1)
 
-        config_socket(socket, socket_type)
+        if endpoint is None:
+            # Bind to random TCP port
+            # ZMQ requires IPv6 addresses to be enclosed in brackets for the URI
+            # Strip any existing brackets from host before adding them
+            host_stripped = host.strip("[]")
+            if is_valid_ipv6_address(host_stripped):
+                uri = f"tcp://[{host_stripped}]"
+            else:
+                uri = f"tcp://{host}"
 
-        if bind:
-            socket.bind(endpoint)
+            port = socket.bind_to_random_port(uri)
+            return port, socket
         else:
-            socket.connect(endpoint)
+            if bind:
+                socket.bind(endpoint)
+            else:
+                socket.connect(endpoint)
+            return socket
 
-        return socket
-
-
-def get_zmq_socket_on_host(
-    context: zmq.Context,
-    socket_type: zmq.SocketType,
-    host: Optional[str] = None,
-) -> Tuple[int, zmq.Socket]:
-    """Create and configure a ZeroMQ socket.
-
-    Args:
-        context: ZeroMQ context to create the socket from.
-        socket_type: Type of ZeroMQ socket to create.
-        host: Optional host to bind/connect to, without "tcp://" prefix. If None, binds to "tcp://*".
-
-    Returns:
-        Tuple of (port, socket) where port is the randomly assigned TCP port.
-    """
-    socket = context.socket(socket_type)
-    # Bind to random TCP port
-    config_socket(socket, socket_type)
-    bind_host = f"tcp://{host}" if host else "tcp://*"
-    port = socket.bind_to_random_port(bind_host)
-    return port, socket
+    except Exception:
+        socket.close()
+        raise
 
 
 def config_socket(socket, socket_type: zmq.SocketType):
@@ -1479,9 +1503,9 @@ def config_socket(socket, socket_type: zmq.SocketType):
         socket.setsockopt(zmq.RCVHWM, 0)
         socket.setsockopt(zmq.RCVBUF, buf_size)
 
-    if socket_type == zmq.PUSH:
+    if socket_type in [zmq.PUSH, zmq.PUB, zmq.XPUB]:
         set_send_opt()
-    elif socket_type == zmq.PULL:
+    elif socket_type in [zmq.PULL, zmq.SUB, zmq.XSUB]:
         set_recv_opt()
     elif socket_type in [zmq.DEALER, zmq.REQ, zmq.REP]:
         set_send_opt()
