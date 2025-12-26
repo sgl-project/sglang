@@ -542,18 +542,18 @@ class Qwen3MoeAttention(nn.Module):
         forward_batch: ForwardBatch,
     ):
         qkv, _ = self.qkv_proj(hidden_states)
-        if self.attn.layer_id == 0:
+        if self.attn.layer_id == forward_batch.token_to_kv_pool.start_layer:
             self.rotary_emb.get_cos_sin_with_position(positions)
         q, k, v = split_qkv_rmsnorm_rope(
             qkv,
             self.rotary_emb.position_sin,
             self.rotary_emb.position_cos,
-            self.q_norm.weight,
-            self.k_norm.weight,
             self.q_size,
             self.kv_size,
             self.head_dim,
-            self.q_norm.variance_epsilon,
+            eps=self.q_norm.variance_epsilon,
+            q_weight=self.q_norm.weight,
+            k_weight=self.k_norm.weight,
             q_bias=getattr(self.q_norm, "bias", None),
             k_bias=getattr(self.k_norm, "bias", None),
         )
