@@ -64,6 +64,12 @@ pub struct RouterConfig {
     pub tool_call_parser: Option<String>,
     #[serde(default)]
     pub tokenizer_cache: TokenizerCacheConfig,
+    /// Server TLS certificate (PEM)
+    #[serde(skip)]
+    pub server_cert: Option<Vec<u8>>,
+    /// Server TLS private key (PEM)
+    #[serde(skip)]
+    pub server_key: Option<Vec<u8>>,
     /// Combined certificate + key in PEM format, loaded from client_cert_path and client_key_path during config creation
     #[serde(skip)]
     pub client_identity: Option<Vec<u8>>,
@@ -330,6 +336,12 @@ pub enum PolicyConfig {
         /// Interval between bucket boundary adjustment cycles (seconds)
         bucket_adjust_interval_secs: usize,
     },
+
+    /// Manual routing policy supporting header-based routing:
+    /// - X-SMG-Target-Worker: Direct routing to a specific worker by URL
+    /// - X-SMG-Routing-Key: Consistent hash routing for session affinity
+    #[serde(rename = "manual")]
+    Manual,
 }
 
 impl PolicyConfig {
@@ -340,6 +352,7 @@ impl PolicyConfig {
             PolicyConfig::CacheAware { .. } => "cache_aware",
             PolicyConfig::PowerOfTwo { .. } => "power_of_two",
             PolicyConfig::Bucket { .. } => "bucket",
+            PolicyConfig::Manual => "manual",
         }
     }
 }
@@ -523,6 +536,8 @@ impl Default for RouterConfig {
             ca_certificates: vec![],
             mcp_config: None,
             enable_wasm: false,
+            server_cert: None,
+            server_key: None,
         }
     }
 }

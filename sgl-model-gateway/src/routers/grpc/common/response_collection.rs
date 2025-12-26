@@ -55,10 +55,20 @@ pub async fn collect_responses(
 
             decode_responses
         }
+        ExecutionResult::Embedding { .. } => {
+            // Embeddings do not support this path (no generate complete response)
+            return Err(error::internal_error(
+                "invalid_execution_mode",
+                "Embedding result encountered in response collection",
+            ));
+        }
     };
 
     if all_responses.is_empty() {
-        return Err(error::internal_error("No responses from server"));
+        return Err(error::internal_error(
+            "no_responses_from_server",
+            "No responses from server",
+        ));
     }
 
     Ok(all_responses)
