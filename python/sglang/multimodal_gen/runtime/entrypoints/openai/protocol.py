@@ -12,6 +12,7 @@ class ImageResponseData(BaseModel):
 
 
 class ImageResponse(BaseModel):
+    id: str
     created: int = Field(default_factory=lambda: int(time.time()))
     data: List[ImageResponseData]
     peak_memory_mb: Optional[float] = None
