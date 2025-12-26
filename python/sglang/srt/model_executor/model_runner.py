@@ -440,11 +440,15 @@ class ModelRunner:
             )
 
         # Expert parallelism
-        self.eplb_manager = (
-            EPLBManager(self)
-            if self.server_args.enable_eplb and (not self.is_draft_worker)
-            else None
-        )
+        if self.server_args.enable_eplb and (not self.is_draft_worker):
+            if self.server_args.enable_async_eplb:
+                from sglang.srt.eplb.async_eplb_manager import AsyncEPLBManager
+
+                self.eplb_manager = AsyncEPLBManager(self)
+            else:
+                self.eplb_manager = EPLBManager(self)
+        else:
+            self.eplb_manager = None
         self.expert_location_updater = ExpertLocationUpdater()
 
         (
@@ -1969,7 +1973,9 @@ class ModelRunner:
                     dtype=self.kv_cache_dtype,
                     kv_lora_rank=self.model_config.kv_lora_rank,
                     qk_rope_head_dim=self.model_config.qk_rope_head_dim,
-                    index_head_dim=self.model_config.index_head_dim,
+                    index_head_dim=(
+                        self.model_config.index_head_dim if is_nsa_model else None
+                    ),
                     layer_num=self.num_effective_layers,
                     device=self.device,
                     enable_memory_saver=self.server_args.enable_memory_saver,

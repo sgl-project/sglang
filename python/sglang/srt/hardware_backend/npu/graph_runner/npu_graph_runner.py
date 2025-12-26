@@ -144,6 +144,10 @@ class NPUGraphRunner(CudaGraphRunner):
         output_dir = os.path.join(
             os.getenv("SGLANG_TORCH_PROFILER_DIR", "/tmp"), "graph_capture_profile"
         )
+        if ".." in output_dir:
+            raise ValueError(
+                "Output directory path contains '..', which is not allowed."
+            )
         if not Path(output_dir).exists():
             Path(output_dir).mkdir(parents=True, exist_ok=True)
         logger.info(
