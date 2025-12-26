@@ -12,6 +12,7 @@
 # limitations under the License.
 # ==============================================================================
 """Utilities for Prometheus Metrics Collection."""
+import dataclasses
 import logging
 import os
 import time
@@ -21,6 +22,7 @@ from typing import Dict, List, Optional, Union
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.metrics.utils import exponential_buckets, generate_buckets
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import get_bool_env_var
 
@@ -239,17 +241,42 @@ class SchedulerStats:
     # CUDA graph
     is_cuda_graph: float = 0.0
 
+    # LoRA pool metrics
+    lora_pool_slots_used: int = 0
+    lora_pool_slots_total: int = 0
+    lora_pool_utilization: float = 0.0
+
+
+@dataclass
+class DPCooperationInfo:
+    # Users can derive that, except for cases with idle, num_decode_ranks=world_size-num_prefill_ranks
+    # We do not provide `num_decode_ranks` to avoid cardinality explosion.
+    num_prefill_ranks: int
+
+    @staticmethod
+    def create(forward_modes: List[int]):
+        return DPCooperationInfo(
+            num_prefill_ranks=sum(
+                1 for mode in forward_modes if mode == ForwardMode.EXTEND.value
+            ),
+        )
+
+    def to_labels(self):
+        return dataclasses.asdict(self)
+
 
 class SchedulerMetricsCollector:
 
     def __init__(
         self,
         labels: Dict[str, str],
+        enable_lora: bool = False,
     ) -> None:
         # We need to import prometheus_client after setting the env variable `PROMETHEUS_MULTIPROC_DIR`
         from prometheus_client import Counter, Gauge, Histogram, Summary
 
         self.labels = labels
+        self.enable_lora = enable_lora
         self.last_log_time = time.perf_counter()
 
         self.num_running_reqs = Gauge(
@@ -357,6 +384,16 @@ class SchedulerMetricsCollector:
             # The name is `requests` instead of `reqs` to avoid dup name error
             name="sglang:num_retracted_requests_total",
             documentation="Total number of retracted requests.",
+            labelnames=labels.keys(),
+        )
+        self.num_retracted_input_tokens_total = Counter(
+            name="sglang:num_retracted_input_tokens_total",
+            documentation="Total number of retracted input tokens.",
+            labelnames=labels.keys(),
+        )
+        self.num_retracted_output_tokens_total = Counter(
+            name="sglang:num_retracted_output_tokens_total",
+            documentation="Total number of retracted output tokens.",
             labelnames=labels.keys(),
         )
         self.num_paused_reqs = Gauge(
@@ -662,6 +699,27 @@ class SchedulerMetricsCollector:
                 labelnames=list(labels.keys()) + ["forward_mode"],
             )
 
+        # LoRA pool metrics (only created when LoRA is enabled)
+        if self.enable_lora:
+            self.lora_pool_slots_used = Gauge(
+                name="sglang:lora_pool_slots_used",
+                documentation="Number of LoRA adapter slots currently occupied in GPU memory.",
+                labelnames=labels.keys(),
+                multiprocess_mode="mostrecent",
+            )
+            self.lora_pool_slots_total = Gauge(
+                name="sglang:lora_pool_slots_total",
+                documentation="Total number of LoRA adapter slots available (max_loras_per_batch).",
+                labelnames=labels.keys(),
+                multiprocess_mode="mostrecent",
+            )
+            self.lora_pool_utilization = Gauge(
+                name="sglang:lora_pool_utilization",
+                documentation="LoRA pool utilization ratio (used/total). 1.0 means pool is full.",
+                labelnames=labels.keys(),
+                multiprocess_mode="mostrecent",
+            )
+
         self.new_token_ratio = Gauge(
             name="sglang:new_token_ratio",
             documentation="The new token ratio.",
@@ -669,26 +727,26 @@ class SchedulerMetricsCollector:
             multiprocess_mode="mostrecent",
         )
 
-        self.realtime_prefill_compute_tokens_total = Counter(
-            name="sglang:realtime_prefill_compute_tokens_total",
-            documentation="Total number of prefill compute tokens processed (updated on each log interval).",
-            labelnames=labels.keys(),
+        self.realtime_tokens_total = Counter(
+            name="sglang:realtime_tokens_total",
+            documentation="Total number of tokens processed (updated on each log interval).",
+            labelnames=list(labels.keys()) + ["mode"],
         )
-        self.realtime_prefill_cache_tokens_total = Counter(
-            name="sglang:realtime_prefill_cache_tokens_total",
-            documentation="Total number of prefill cache tokens processed (updated on each log interval).",
-            labelnames=labels.keys(),
-        )
-        self.realtime_decode_tokens_total = Counter(
-            name="sglang:realtime_decode_tokens_total",
-            documentation="Total number of decode tokens processed (updated on each log interval).",
-            labelnames=labels.keys(),
-        )
-
         self.gpu_execution_seconds_total = Counter(
             name="sglang:gpu_execution_seconds_total",
             documentation="Total time that GPU is busy executing a workload.",
             labelnames=list(labels.keys()) + ["category"],
+        )
+
+        self.dp_cooperation_realtime_tokens_total = Counter(
+            name="sglang:dp_cooperation_realtime_tokens_total",
+            documentation="Total number of tokens processed with labels about DP cooperation.",
+            labelnames=list(labels.keys()) + ["mode", "num_prefill_ranks"],
+        )
+        self.dp_cooperation_gpu_execution_seconds_total = Counter(
+            name="sglang:dp_cooperation_gpu_execution_seconds_total",
+            documentation="Total time that GPU is busy executing a workload with labels about DP cooperation.",
+            labelnames=list(labels.keys()) + ["category", "num_prefill_ranks"],
         )
 
     def _log_gauge(self, gauge, data: Union[int, float]) -> None:
@@ -711,8 +769,19 @@ class SchedulerMetricsCollector:
     def observe_queue_time(self, latency: float) -> None:
         self._log_histogram(self.queue_time, latency)
 
-    def increment_num_retracted_reqs(self, num: int) -> None:
-        self.num_retracted_reqs_total.labels(**self.labels).inc(num)
+    def increment_retracted_reqs(
+        self,
+        num_retracted_reqs: int,
+        num_retracted_input_tokens: int,
+        num_retracted_output_tokens: int,
+    ) -> None:
+        self.num_retracted_reqs_total.labels(**self.labels).inc(num_retracted_reqs)
+        self.num_retracted_input_tokens_total.labels(**self.labels).inc(
+            num_retracted_input_tokens
+        )
+        self.num_retracted_output_tokens_total.labels(**self.labels).inc(
+            num_retracted_output_tokens
+        )
 
     def increment_cuda_graph_pass(self, value: bool) -> None:
         # leave room for piecewise cuda graph, etc
@@ -727,19 +796,39 @@ class SchedulerMetricsCollector:
         )
 
     def increment_realtime_tokens(
-        self, prefill_compute_tokens=0, prefill_cache_tokens=0, decode_tokens=0
+        self,
+        dp_cooperation_info: Optional[DPCooperationInfo],
+        prefill_compute_tokens=0,
+        prefill_cache_tokens=0,
+        decode_tokens=0,
     ):
-        self.realtime_prefill_compute_tokens_total.labels(**self.labels).inc(
-            prefill_compute_tokens
-        )
-        self.realtime_prefill_cache_tokens_total.labels(**self.labels).inc(
-            prefill_cache_tokens
-        )
-        self.realtime_decode_tokens_total.labels(**self.labels).inc(decode_tokens)
+        for mode, delta in [
+            ("prefill_compute", prefill_compute_tokens),
+            ("prefill_cache", prefill_cache_tokens),
+            ("decode", decode_tokens),
+        ]:
+            self.realtime_tokens_total.labels(**self.labels, mode=mode).inc(delta)
+            if dp_cooperation_info is not None:
+                self.dp_cooperation_realtime_tokens_total.labels(
+                    **self.labels,
+                    mode=mode,
+                    **dp_cooperation_info.to_labels(),
+                ).inc(delta)
 
-    def increment_gpu_execution_seconds(self, category: str, t: float):
+    def increment_gpu_execution_seconds(
+        self,
+        category: str,
+        t: float,
+        dp_cooperation_info: Optional[DPCooperationInfo],
+    ):
         logger.debug(f"GPU execution seconds: {category=} {t=:.3f}")
         self.gpu_execution_seconds_total.labels(**self.labels, category=category).inc(t)
+        if dp_cooperation_info is not None:
+            self.dp_cooperation_gpu_execution_seconds_total.labels(
+                **self.labels,
+                category=category,
+                **dp_cooperation_info.to_labels(),
+            ).inc(t)
 
     def log_stats(self, stats: SchedulerStats) -> None:
         self._log_gauge(self.num_running_reqs, stats.num_running_reqs)
@@ -806,6 +895,12 @@ class SchedulerMetricsCollector:
 
         # CUDA graph
         self._log_gauge(self.is_cuda_graph, stats.is_cuda_graph)
+
+        # LoRA pool metrics (only logged if LoRA is enabled)
+        if self.enable_lora:
+            self._log_gauge(self.lora_pool_slots_used, stats.lora_pool_slots_used)
+            self._log_gauge(self.lora_pool_slots_total, stats.lora_pool_slots_total)
+            self._log_gauge(self.lora_pool_utilization, stats.lora_pool_utilization)
 
         self.last_log_time = time.perf_counter()
 
