@@ -41,8 +41,6 @@ _is_npu = is_npu()
 if _is_npu:
     from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope import split_qkv_rmsnorm_rope
 
-    from sglang.srt.hardware_backend.npu.cmo import get_cmo_stream, wait_cmo_stream
-
 
 class Qwen3Attention(nn.Module):
     def __init__(
@@ -308,15 +306,8 @@ class Qwen3DecoderLayer(nn.Module):
             hidden_states,
             residual,
             forward_batch,
-            cache=(
-                [self.mlp.gate_up_proj.weight, self.mlp.down_proj.weight]
-                if _is_npu
-                else None
-            ),
         )
         hidden_states = self.mlp(hidden_states)
-        if _is_npu and get_cmo_stream():
-            wait_cmo_stream()
         hidden_states, residual = self.layer_communicator.postprocess_layer(
             hidden_states, residual, forward_batch
         )

@@ -17,6 +17,7 @@ import threading
 import time
 from abc import ABC, abstractmethod
 from contextlib import contextmanager, suppress
+from functools import wraps
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -86,6 +87,7 @@ DEFAULT_GPU_MEMORY_FRACTION_FOR_CALIBRATION = (
     0.8  # Reserve 20% GPU memory headroom for ModelOpt calibration
 )
 from sglang.srt.environ import envs
+from sglang.srt.hardware_backend.npu.cmo import get_cmo_stream, wait_cmo_stream
 from sglang.srt.model_loader.weight_utils import (
     download_safetensors_index_file_from_hf,
     download_weights_from_hf,
@@ -274,7 +276,45 @@ def _initialize_model(
         kwargs["sparse_head"] = envs.SGLANG_EMBEDDINGS_SPARSE_HEAD.get()
         kwargs["model_path"] = model_config.model_path
 
-    return model_class(**kwargs)
+    mdl = model_class(**kwargs)
+    weight_names = ["gate_up_proj", "gate_proj", "up_proj", "down_proj"]
+    moe_weight_names = ["gate", "gate_up_proj", "gate_proj", "up_proj", "down_proj"]
+    if _is_npu:
+        for layer in mdl.model.layers:
+            if hasattr(layer, "layer_communicator") and hasattr(layer, "mlp"):
+                lmlp = layer.mlp
+                cachelist = [
+                    getattr(lmlp, name).weight
+                    for name in weight_names
+                    if hasattr(lmlp, name)
+                ]
+                if get_global_server_args().enable_moe_weights_prefetching:
+                    cachelist += [
+                        tensor
+                        for tname, tensor in lmlp.named_parameters()
+                        if (
+                            tname.endswith(".weight")
+                            and any(wname in tname for wname in moe_weight_names)
+                        )
+                    ]
+                if get_global_server_args().enable_weights_prefetching and len(
+                    cachelist
+                ):
+                    layer.layer_communicator._context.cache = cachelist
+
+                    def mlpwrap(fwd):
+                        @wraps(fwd)
+                        def mlpwrapper(*args, **kwds):
+                            fwdres = fwd(*args, **kwds)
+                            if _is_npu and get_cmo_stream():
+                                wait_cmo_stream()
+                            return fwdres
+
+                        return mlpwrapper
+
+                    lmlp.forward = mlpwrap(lmlp.forward)
+
+    return mdl
 
 
 class BaseModelLoader(ABC):

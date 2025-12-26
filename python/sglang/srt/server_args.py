@@ -579,6 +579,8 @@ class ServerArgs:
     # Context parallelism used in the long sequence prefill phase of DeepSeek v3.2
     enable_nsa_prefill_context_parallel: bool = False
     enable_fused_qk_norm_rope: bool = False
+    enable_weights_prefetching: bool = False
+    enable_moe_weights_prefetching: bool = False
 
     # Dynamic batch tokenizer
     enable_dynamic_batch_tokenizer: bool = False
@@ -4168,6 +4170,16 @@ class ServerArgs:
             "--enable-fused-qk-norm-rope",
             action="store_true",
             help="Enable fused qk normalization and rope rotary embedding.",
+        )
+        parser.add_argument(
+            "--enable-weights-prefetching",
+            action="store_true",
+            help="Enable prefetching of MLP weights.",
+        )
+        parser.add_argument(
+            "--enable-moe-weights-prefetching",
+            action="store_true",
+            help="Extend set of prefetched weights with experts related.",
         )
 
         # Dynamic batch tokenizer

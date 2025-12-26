@@ -20,7 +20,8 @@ ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 python -m sglang.launch_server \
    --tp-size 4 \
    --model-path Qwen/Qwen3-32B \
    --port 30111 \
-   --mem-fraction-static 0.8
+   --mem-fraction-static 0.8 \
+   --enable-weights-prefetching
 ```
 
 #### Running Qwen3-32B on 1 x Atlas 800I A3 with Qwen3-32B-Eagle3.
@@ -45,6 +46,7 @@ python -m sglang.launch_server \
    --model-path Qwen/Qwen3-32B \
    --port 30111 \
    --mem-fraction-static 0.8 \
+   --enable-weights-prefetching \
    --speculative-algorithm EAGLE3 \
    --speculative-draft-model-path Qwen/Qwen3-32B-Eagle3 \
    --speculative-num-steps 1 \
@@ -120,5 +122,6 @@ ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 python -m sglang.launch_server \
    --tp-size 4 \
    --model-path Qwen/Qwen3-VL-8B-Instruct \
    --port 30111 \
-   --mem-fraction-static 0.8
+   --mem-fraction-static 0.8 \
+   --enable-weights-prefetching
 ```
