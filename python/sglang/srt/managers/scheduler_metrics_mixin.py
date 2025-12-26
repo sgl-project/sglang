@@ -253,13 +253,13 @@ class SchedulerMetricsMixin:
     def log_prefill_stats_late(self: Scheduler, batch: Optional[ScheduleBatch]):
         """This should be called after `batch` has gathered enough metadata."""
 
-        temp_prefill_info = self.temp_prefill_info
+        info = self.temp_prefill_info
         self.temp_prefill_info = None
 
-        if self.enable_metrics and batch is not None and self.temp_prefill_info is not None:
+        if self.enable_metrics and batch is not None and info is not None:
             self.metrics_collector.increment_realtime_tokens(
-                prefill_compute_tokens=temp_prefill_info["adder_log_input_tokens"],
-                prefill_cache_tokens=temp_prefill_info["adder_log_hit_tokens"],
+                prefill_compute_tokens=info["adder_log_input_tokens"],
+                prefill_cache_tokens=info["adder_log_hit_tokens"],
                 dp_cooperation_info=batch.dp_cooperation_info,
             )
 
