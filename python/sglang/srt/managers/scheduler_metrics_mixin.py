@@ -4,7 +4,7 @@ import logging
 import time
 from collections import defaultdict
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, List, Optional, Union
+from typing import TYPE_CHECKING, List, Optional, Union, Dict
 
 from sglang.srt.disaggregation.kv_events import EventPublisherFactory, KVEventBatch
 from sglang.srt.disaggregation.utils import DisaggregationMode
@@ -67,6 +67,9 @@ class SchedulerMetricsMixin:
         self.kv_transfer_alloc_ms: float = 0.0
         self.kv_transfer_total_mb: float = 0.0
 
+        # Only for `log_prefill_stats` to pass information to `log_prefill_stats_late`
+        self.temp_prefill_info: Optional[Dict] = None
+
         self.stats = SchedulerStats()
 
         # Metrics
@@ -127,6 +130,12 @@ class SchedulerMetricsMixin:
         self.last_prefill_stats_tic = time.perf_counter()
         self.last_input_throughput = self.last_prefill_tokens / gap_latency
         self.last_prefill_tokens = adder.log_input_tokens
+
+        assert self.temp_prefill_info is None
+        self.temp_prefill_info = dict(
+            adder_log_input_tokens=adder.log_input_tokens,
+            adder_log_hit_tokens=adder.log_hit_tokens,
+        )
 
         # TODO: generalize this for various memory pools
         if self.is_hybrid_swa:
@@ -243,10 +252,15 @@ class SchedulerMetricsMixin:
 
     def log_prefill_stats_late(self: Scheduler, batch: Optional[ScheduleBatch]):
         """This should be called after `batch` has gathered enough metadata."""
+
+        assert self.temp_prefill_info is not None
+        temp_prefill_info = self.temp_prefill_info
+        self.temp_prefill_info = None
+
         if self.enable_metrics and batch is not None:
             self.metrics_collector.increment_realtime_tokens(
-                prefill_compute_tokens=TODO,
-                prefill_cache_tokens=TODO,
+                prefill_compute_tokens=temp_prefill_info["adder_log_input_tokens"],
+                prefill_cache_tokens=temp_prefill_info["adder_log_hit_tokens"],
                 dp_cooperation_info=batch.dp_cooperation_info,
             )
 
