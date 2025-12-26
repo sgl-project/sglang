@@ -12,6 +12,8 @@
 # limitations under the License.
 # ==============================================================================
 
+import itertools
+import logging
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from functools import lru_cache
@@ -21,9 +23,12 @@ import numpy as np
 import torch
 
 from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.layers.utils import PPMissingLayer
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.utils import is_cuda
 
+logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
 
 
@@ -97,6 +102,194 @@ class WeightsMapper:
             for name, value in values.items()
             if (out_name := self._map_name(name)) is not None
         }
+
+
+class AutoWeightsLoader:
+    """Single-pass weight loader with module/param overrides and strict mismatch checks."""
+
+    ROTARY_EMBEDS_UNUSED_WEIGHTS = [
+        "rotary_emb.inv_freq",
+        "rotary_emb.cos_cached",
+        "rotary_emb.sin_cached",
+    ]
+
+    def __init__(
+        self,
+        module: torch.nn.Module,
+        *,
+        skip_prefixes: Optional[list[str]] = None,
+        skip_substrs: Optional[list[str]] = None,
+        ignore_unexpected_prefixes: Optional[list[str]] = None,
+        ignore_unexpected_suffixes: Optional[list[str]] = None,
+    ) -> None:
+        self.module = module
+        # Copy to avoid mutating caller lists
+        self.skip_prefixes = list(skip_prefixes) if skip_prefixes else []
+        self.skip_substrs = list(skip_substrs) if skip_substrs else []
+        self.ignore_unexpected_prefixes = (
+            list(ignore_unexpected_prefixes) if ignore_unexpected_prefixes else []
+        )
+        self.ignore_unexpected_suffixes = (
+            list(ignore_unexpected_suffixes) if ignore_unexpected_suffixes else []
+        )
+        self.skip_substrs.extend(self.ROTARY_EMBEDS_UNUSED_WEIGHTS)
+
+    def groupby_prefix(
+        self, weights: Iterable[tuple[str, torch.Tensor]]
+    ) -> Iterable[tuple[str, Iterable[tuple[str, torch.Tensor]]]]:
+        weights_by_parts = (
+            (weight_name.split(".", 1), weight_data)
+            for weight_name, weight_data in weights
+        )
+        for prefix, group in itertools.groupby(weights_by_parts, key=lambda x: x[0][0]):
+            yield (
+                prefix,
+                (
+                    ("" if len(parts) == 1 else parts[1], weight_data)
+                    for parts, weight_data in group
+                ),
+            )
+
+    def qualname(self, prefix: str, rest: str) -> str:
+        if not prefix:
+            return rest
+        if not rest:
+            return prefix
+        return f"{prefix}.{rest}"
+
+    def can_skip(self, qualname: str) -> bool:
+        return any(qualname.startswith(p) for p in self.skip_prefixes) or any(
+            substr in qualname for substr in self.skip_substrs
+        )
+
+    def can_ignore_unexpected(self, qualname: str) -> bool:
+        return any(
+            qualname.startswith(p) for p in self.ignore_unexpected_prefixes
+        ) or any(qualname.endswith(s) for s in self.ignore_unexpected_suffixes)
+
+    def load_param(
+        self,
+        prefix: str,
+        param: torch.Tensor,
+        weights: Iterable[tuple[str, torch.Tensor]],
+    ) -> Iterable[str]:
+        for weight_name, weight_tensor in weights:
+            qualname = self.qualname(prefix, weight_name)
+
+            if self.can_skip(qualname):
+                logger.debug("Skipping weight %s", qualname)
+                continue
+
+            if weight_name:
+                if self.can_ignore_unexpected(qualname):
+                    logger.debug("Ignoring unexpected nested weight %s", qualname)
+                    continue
+                raise ValueError(
+                    f"Attempted to load nested weight '{qualname}' into parameter "
+                    f"'{prefix}'"
+                )
+
+            weight_loader = getattr(param, "weight_loader", default_weight_loader)
+            weight_loader(param, weight_tensor)
+            logger.debug("Loaded weight %s with shape %s", qualname, tuple(param.shape))
+            yield qualname
+
+    def add_loadable_non_param_tensors(
+        self, module: torch.nn.Module, child_params: dict[str, torch.Tensor]
+    ) -> None:
+        """Add non-parameter tensors (e.g., batchnorm stats) that may appear in weights."""
+        if isinstance(
+            module,
+            (
+                torch.nn.BatchNorm1d,
+                torch.nn.BatchNorm2d,
+                torch.nn.BatchNorm3d,
+                torch.nn.LazyBatchNorm1d,
+                torch.nn.LazyBatchNorm2d,
+                torch.nn.LazyBatchNorm3d,
+                torch.nn.SyncBatchNorm,
+            ),
+        ):
+            module_state_dict = module.state_dict()
+            for stat_name in ("running_mean", "running_var", "num_batches_tracked"):
+                if stat_name in module_state_dict:
+                    child_params[stat_name] = module_state_dict[stat_name]
+
+    def load_module(
+        self,
+        prefix: str,
+        module: torch.nn.Module,
+        weights: Iterable[tuple[str, torch.Tensor]],
+    ) -> Iterable[str]:
+        if isinstance(module, PPMissingLayer):
+            return
+
+        if module is not self.module:
+            custom_loader = getattr(module, "load_weights", None)
+            if callable(custom_loader):
+                loaded = custom_loader(weights)
+                if loaded is None:
+                    logger.warning(
+                        "Unable to collect loaded parameters for module %s", module
+                    )
+                else:
+                    for name in loaded:
+                        yield self.qualname(prefix, name)
+
+        child_modules = dict(module.named_children())
+        direct_params = dict(module.named_parameters(recurse=False))
+        self.add_loadable_non_param_tensors(module, direct_params)
+
+        for child_prefix, child_weights in self.groupby_prefix(weights):
+            qualname = self.qualname(prefix, child_prefix)
+
+            if child_prefix in child_modules:
+                if self.can_skip(f"{qualname}."):
+                    logger.debug("Skipping module %s", qualname)
+                    continue
+
+                yield from self.load_module(
+                    qualname, child_modules[child_prefix], child_weights
+                )
+                continue
+
+            if child_prefix in direct_params:
+                if self.can_skip(qualname):
+                    logger.debug("Skipping param %s", qualname)
+                    continue
+                yield from self.load_param(
+                    qualname, direct_params[child_prefix], child_weights
+                )
+                continue
+
+            if self.can_skip(f"{qualname}.") or self.can_skip(qualname):
+                logger.debug("Skipping missing %s", qualname)
+                continue
+
+            if self.can_ignore_unexpected(f"{qualname}.") or self.can_ignore_unexpected(
+                qualname
+            ):
+                logger.debug("Ignoring unexpected %s", qualname)
+                continue
+
+            raise ValueError(
+                f"There is no module or parameter named '{qualname}' "
+                f"in {type(self.module).__name__}"
+            )
+
+    def load_weights(
+        self,
+        weights: Iterable[tuple[str, torch.Tensor]],
+        *,
+        mapper: Optional[WeightsMapper] = None,
+    ) -> set[str]:
+        if mapper is not None:
+            weights = mapper.apply(weights)
+
+        filtered = (
+            (name, tensor) for name, tensor in weights if not self.can_skip(name)
+        )
+        return set(self.load_module("", self.module, filtered))
 
 
 def enable_fused_set_kv_buffer(forward_batch: ForwardBatch):
