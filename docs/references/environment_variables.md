@@ -64,6 +64,10 @@ SGLang supports various environment variables that can be used to configure its 
 
 <!-- # Environment variable to control mtp precomputing of metadata for multi-step speculative decoding -->
 
+| Environment Variable | Description | Default Value |
+| --- | --- | --- |
+| `SGLANG_NSA_FUSE_TOPK` | Fuse the operation of picking topk logits and picking topk indices from page table  | `true` |
+
 
 ## Memory Management
 
