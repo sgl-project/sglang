@@ -1588,6 +1588,9 @@ class Scheduler(
                         add_to_grammar_queue = True
             else:
                 # Non-rank-0 workers add to grammar queue for synchronization, but no compilation.
+                if self.grammar_backend is None:
+                    error_msg = "Grammar-based generation (json_schema, regex, ebnf, structural_tag) is not supported when the server is launched with --grammar-backend none"
+                    req.set_finish_with_abort(error_msg)
                 add_to_grammar_queue = True
 
         if add_to_grammar_queue:
