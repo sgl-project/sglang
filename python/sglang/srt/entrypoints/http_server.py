@@ -140,7 +140,6 @@ from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.tracing.trace import process_tracing_init, trace_set_thread_info
 from sglang.srt.utils import (
-    add_api_key_middleware,
     add_prometheus_middleware,
     add_prometheus_track_response_middleware,
     delete_directory,
@@ -157,6 +156,22 @@ asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 # Global constants
 HEALTH_CHECK_TIMEOUT = int(os.getenv("SGLANG_HEALTH_CHECK_TIMEOUT", 20))
 WAIT_WEIGHTS_READY_TIMEOUT = int(os.getenv("SGLANG_WAIT_WEIGHTS_READY_TIMEOUT", 120))
+
+# Endpoint auth categories (enforced by middleware).
+#
+# - NORMAL endpoints: all other paths not listed below.
+# - ADMIN_OPTIONAL_AUTH_PATHS: behavior depends on server config.
+#   - no api_key/admin_api_key: allow
+#   - api_key only: require api_key
+#   - admin_api_key only: require admin_api_key
+#   - both: require admin_api_key (api_key is NOT accepted)
+# - ADMIN_FORCE_AUTH_PATHS: require admin_api_key; if admin_api_key is not set, reject (403).
+#
+# Note: keep these lists small and explicit; extend as needed.
+ADMIN_OPTIONAL_AUTH_PATHS = {
+    "/clear_hicache_storage_backend",
+}
+ADMIN_FORCE_AUTH_PATHS = set()
 
 
 # Store global states
@@ -1729,8 +1744,20 @@ def launch_server(
 
         # Add api key authorization
         # This is only supported in single tokenizer mode.
-        if server_args.api_key:
-            add_api_key_middleware(app, server_args.api_key)
+        #
+        # Backward compatibility:
+        # - api_key only: behavior matches legacy (all endpoints require api_key)
+        # - no keys: legacy had no restriction; we only restrict ADMIN_FORCE_AUTH_PATHS (if any)
+        if server_args.api_key or server_args.admin_api_key or ADMIN_FORCE_AUTH_PATHS:
+            from sglang.srt.utils.auth import add_api_key_middleware
+
+            add_api_key_middleware(
+                app,
+                api_key=server_args.api_key,
+                admin_api_key=server_args.admin_api_key,
+                admin_optional_auth_paths=ADMIN_OPTIONAL_AUTH_PATHS,
+                admin_force_auth_paths=ADMIN_FORCE_AUTH_PATHS,
+            )
     else:
         # If it is multi-tokenizer mode, we need to write the arguments to shared memory
         # for other worker processes to read.
