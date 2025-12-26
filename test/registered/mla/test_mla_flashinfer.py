@@ -1,8 +1,3 @@
-"""
-Usage:
-python3 test/srt/test_flashmla.py
-"""
-
 import unittest
 from types import SimpleNamespace
 
@@ -10,36 +5,39 @@ import requests
 import torch
 
 from sglang.srt.utils import kill_process_tree
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
 from sglang.test.test_utils import (
-    DEFAULT_MODEL_NAME_FOR_TEST_MLA,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     popen_launch_server,
 )
 
+# FlashInfer MLA backend tests with MTP speculative decoding
+register_cuda_ci(est_time=302, suite="stage-b-test-small-1-gpu")
 
-class TestFlashMLAAttnBackend(unittest.TestCase):
+
+class TestFlashinferMLA(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = DEFAULT_MODEL_NAME_FOR_TEST_MLA
+        cls.model = "lmsys/sglang-ci-dsv3-test"
         cls.base_url = DEFAULT_URL_FOR_TEST
         other_args = ["--trust-remote-code"]
         if torch.cuda.is_available() and torch.version.cuda:
             other_args.extend(
                 [
+                    "--enable-torch-compile",
                     "--cuda-graph-max-bs",
-                    "2",
+                    "4",
                     "--attention-backend",
-                    "flashmla",
+                    "flashinfer",
                 ]
             )
-        # Use longer timeout for DeepGEMM JIT compilation which can take 10-20 minutes
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH * 2,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=other_args,
         )
 
@@ -60,10 +58,10 @@ class TestFlashMLAAttnBackend(unittest.TestCase):
         metrics = run_eval_few_shot_gsm8k(args)
         print(metrics)
 
-        self.assertGreater(metrics["accuracy"], 0.60)
+        self.assertGreater(metrics["accuracy"], 0.615)
 
 
-class TestFlashMLAMTP(CustomTestCase):
+class TestFlashinferMLAMTP(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = "lmsys/sglang-ci-dsv3-test"
@@ -74,29 +72,25 @@ class TestFlashMLAMTP(CustomTestCase):
                 [
                     "--cuda-graph-max-bs",
                     "4",
-                    "--disable-radix",
                     "--enable-torch-compile",
                     "--torch-compile-max-bs",
                     "1",
                     "--speculative-algorithm",
                     "EAGLE",
-                    "--speculative-draft-model-path",
-                    "lmsys/sglang-ci-dsv3-test-NextN",
                     "--speculative-num-steps",
-                    "2",
+                    "3",
                     "--speculative-eagle-topk",
                     "1",
                     "--speculative-num-draft-tokens",
-                    "3",
+                    "4",
                     "--attention-backend",
-                    "flashmla",
+                    "flashinfer",
                 ]
             )
-        # Use longer timeout for DeepGEMM JIT compilation which can take 10-20 minutes
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH * 2,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=other_args,
         )
 
@@ -127,7 +121,7 @@ class TestFlashMLAMTP(CustomTestCase):
             "avg_spec_accept_length"
         ]
         print(f"{avg_spec_accept_length=}")
-        self.assertGreater(avg_spec_accept_length, 2.4)
+        self.assertGreater(avg_spec_accept_length, 2.5)
 
 
 if __name__ == "__main__":
