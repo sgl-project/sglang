@@ -127,7 +127,7 @@ async def generations(
     save_file_path_list, result = await process_generation_batch(
         async_scheduler_client, batch
     )
-    save_file_path = save_file_path_list[0]  # Use the first generated image for response
+    save_file_path = save_file_path_list[0]
 
     await IMAGE_STORE.upsert(
         request_id,
@@ -233,7 +233,7 @@ async def edits(
     save_file_path_list, result = await process_generation_batch(
         async_scheduler_client, batch
     )
-    save_file_path = save_file_path_list[0]  # Use the first generated image for response
+    save_file_path = save_file_path_list[0]
     await IMAGE_STORE.upsert(
         request_id,
         {
@@ -247,13 +247,13 @@ async def edits(
 
     # Default to b64_json to align with gpt-image-1 behavior in OpenAI examples
     if (response_format or "b64_json").lower() == "b64_json":
-        response_kwargs = {
-            "data": []
-        }
+        response_kwargs = {"data": []}
         for save_file_path in save_file_path_list:
             with open(save_file_path, "rb") as f:
                 b64 = base64.b64encode(f.read()).decode("utf-8")
-                response_kwargs["data"].append(ImageResponseData(b64_json=b64, revised_prompt=prompt)) 
+                response_kwargs["data"].append(
+                    ImageResponseData(b64_json=b64, revised_prompt=prompt)
+                )
         if result.peak_memory_mb and result.peak_memory_mb > 0:
             response_kwargs["peak_memory_mb"] = result.peak_memory_mb
         return ImageResponse(**response_kwargs)

@@ -185,7 +185,11 @@ async def process_generation_batch(
             )
         save_file_path_list = []
         for idx, output in enumerate(result.output):
-            save_file_path = str(os.path.join(batch.output_path,f"sample_{idx}_" + batch.output_file_name))
+            save_file_path = str(
+                os.path.join(
+                    batch.output_path, f"sample_{idx}_" + batch.output_file_name
+                )
+            )
             post_process_sample(
                 result.output[idx],
                 batch.data_type,
