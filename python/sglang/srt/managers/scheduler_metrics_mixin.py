@@ -4,7 +4,7 @@ import logging
 import time
 from collections import defaultdict
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, List, Optional, Union, Dict
+from typing import TYPE_CHECKING, Dict, List, Optional, Union
 
 from sglang.srt.disaggregation.kv_events import EventPublisherFactory, KVEventBatch
 from sglang.srt.disaggregation.utils import DisaggregationMode
@@ -253,11 +253,10 @@ class SchedulerMetricsMixin:
     def log_prefill_stats_late(self: Scheduler, batch: Optional[ScheduleBatch]):
         """This should be called after `batch` has gathered enough metadata."""
 
-        assert self.temp_prefill_info is not None
         temp_prefill_info = self.temp_prefill_info
         self.temp_prefill_info = None
 
-        if self.enable_metrics and batch is not None:
+        if self.enable_metrics and batch is not None and self.temp_prefill_info is not None:
             self.metrics_collector.increment_realtime_tokens(
                 prefill_compute_tokens=temp_prefill_info["adder_log_input_tokens"],
                 prefill_cache_tokens=temp_prefill_info["adder_log_hit_tokens"],
