@@ -11,6 +11,7 @@ fn bench_cache_aware_selection(c: &mut Criterion) {
     // is exercised during the benchmark.
     let config = CacheAwareConfig {
         balance_abs_threshold: 0,
+        balance_rel_threshold: 0.0,
         ..Default::default()
     };
     let policy = CacheAwarePolicy::with_config(config);
