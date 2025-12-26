@@ -51,6 +51,40 @@ def _get_cu_seqlens(device_index: int, bsz: int, seqlen: int) -> torch.Tensor:
     )
 
 
+@lru_cache(maxsize=256)
+def _should_use_upstream_flash_attention(
+    upstream_available: bool,
+    upstream_heads_ok: bool,
+    q_shape: tuple[int, ...],
+    k_shape: tuple[int, ...],
+    v_shape: tuple[int, ...],
+) -> bool:
+    if not upstream_available or not upstream_heads_ok:
+        return False
+
+    if len(q_shape) != 4 or len(k_shape) != 4 or len(v_shape) != 4:
+        return False
+
+    bsz, seqlen, nheads_q, d = q_shape
+    bsz_k, seqlen_k, nheads_k, d_k = k_shape
+    bsz_v, seqlen_v, nheads_v, d_v = v_shape
+
+    if (
+        bsz != bsz_k
+        or bsz != bsz_v
+        or seqlen != seqlen_k
+        or seqlen != seqlen_v
+        or d != d_k
+        or d != d_v
+    ):
+        return False
+    if nheads_k != nheads_v:
+        return False
+    if nheads_k == 0 or (nheads_q % nheads_k) != 0:
+        return False
+    return True
+
+
 def set_fa_ver(ver: int):
     global fa_ver
     fa_ver = ver
@@ -154,49 +188,37 @@ class FlashAttentionImpl(AttentionImpl):
         else:
             max_seqlen_q = query.shape[1]
             max_seqlen_k = key.shape[1]
-        use_upstream = (
-            flash_attn_varlen_func_upstream is not None and self._upstream_heads_ok
+        q_shape = tuple(query.shape)
+        k_shape = tuple(key.shape)
+        v_shape = tuple(value.shape)
+        use_upstream = _should_use_upstream_flash_attention(
+            flash_attn_varlen_func_upstream is not None,
+            self._upstream_heads_ok,
+            q_shape,
+            k_shape,
+            v_shape,
         )
 
         if use_upstream:
-            if query.dim() != 4 or key.dim() != 4 or value.dim() != 4:
-                use_upstream = False
-            else:
-                bsz, seqlen, nheads_q, d = query.shape
-                bsz_k, seqlen_k, nheads_k, d_k = key.shape
-                bsz_v, seqlen_v, nheads_v, d_v = value.shape
-
-                if (
-                    bsz != bsz_k
-                    or bsz != bsz_v
-                    or seqlen != seqlen_k
-                    or seqlen != seqlen_v
-                    or d != d_k
-                    or d != d_v
-                ):
-                    use_upstream = False
-                elif nheads_k != nheads_v:
-                    use_upstream = False
-                elif nheads_k == 0 or (nheads_q % nheads_k) != 0:
-                    use_upstream = False
-
-            if use_upstream:
-                q_ = query.contiguous().reshape(bsz * seqlen, nheads_q, d)
-                k_ = key.contiguous().reshape(bsz * seqlen, nheads_k, d)
-                v_ = value.contiguous().reshape(bsz * seqlen, nheads_v, d)
-                cu = _get_cu_seqlens(q_.device.index, bsz, seqlen)
-                out = flash_attn_varlen_func_upstream(
-                    q_,
-                    k_,
-                    v_,
-                    cu,
-                    cu,
-                    seqlen,
-                    seqlen,
-                    softmax_scale=self.softmax_scale,
-                    causal=self.causal,
-                )
-                return out.reshape(bsz, seqlen, nheads_q, d)
+            bsz, seqlen, nheads_q, d = q_shape
+            bsz_k, seqlen_k, nheads_k, d_k = k_shape
+            bsz_v, seqlen_v, nheads_v, d_v = v_shape
+            q_ = query.contiguous().reshape(bsz * seqlen, nheads_q, d)
+            k_ = key.contiguous().reshape(bsz * seqlen, nheads_k, d)
+            v_ = value.contiguous().reshape(bsz * seqlen, nheads_v, d)
+            cu = _get_cu_seqlens(q_.device.index, bsz, seqlen)
+            out = flash_attn_varlen_func_upstream(
+                q_,
+                k_,
+                v_,
+                cu,
+                cu,
+                seqlen,
+                seqlen,
+                softmax_scale=self.softmax_scale,
+                causal=self.causal,
+            )
+            return out.reshape(bsz, seqlen, nheads_q, d)
 
         output = flash_attn_func(
             q=query,  # type: ignore[no-untyped-call]
