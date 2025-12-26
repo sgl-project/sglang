@@ -58,7 +58,6 @@ suites = {
         TestFile("test_constrained_decoding.py", 111),
         TestFile("test_eval_fp8_accuracy.py", 250),
         TestFile("test_external_models.py", 30),
-        TestFile("test_flashmla.py", 230),
         TestFile("test_fp8_utils.py", 9),
         TestFile("rotary_embedding/test_mrope.py", 10),
         TestFile("test_fused_moe.py", 80),
@@ -71,11 +70,6 @@ suites = {
         TestFile("test_mamba_unittest.py", 9),
         TestFile("test_metrics.py", 32),
         TestFile("test_metrics_utils.py", 1),
-        TestFile("test_mla.py", 194),
-        TestFile("test_mla_deepseek_v3.py", 442),
-        TestFile("test_mla_flashinfer.py", 302),
-        TestFile("test_mla_fp8.py", 77),
-        TestFile("test_mla_int8_deepseek_v3.py", 300),
         TestFile("test_model_hooks.py", 6),
         TestFile("test_modelopt_loader.py", 11),
         TestFile("test_multi_tokenizer.py", 230),
@@ -247,8 +241,6 @@ suite_amd = {
         TestFile("test_jinja_template_utils.py", 1),
         TestFile("test_metrics.py", 32),
         TestFile("test_metrics_utils.py", 1),
-        # TestFile("test_mla.py", 242), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/13107
-        # TestFile("test_mla_deepseek_v3.py", 221), # Temporarily disabled, see https://github.com/sgl-project/sglang/issues/12574
         TestFile("test_no_chunked_prefill.py", 108),
         TestFile("test_page_size.py", 60),
         TestFile("test_penalty.py", 180),
@@ -275,7 +267,6 @@ suite_amd = {
     ],
     "per-commit-amd-mi35x": [
         TestFile("test_gpt_oss_1gpu.py", 750),
-        TestFile("test_mla.py", 242),
     ],
     "per-commit-2-gpu-amd": [
         # TestFile("lora/test_lora_tp.py", 116), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/13107. Moved to test/registered/lora/

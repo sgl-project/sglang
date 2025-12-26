@@ -317,7 +317,7 @@ class Scheduler(
         self.init_metrics(tp_rank, pp_rank, dp_rank)
 
         # Init inter-process communication
-        self.init_sockets(server_args, port_args)
+        self.init_ipc_channels(port_args)
 
         # Init PD-multiplexing context
         if self.enable_pdmux:
@@ -373,7 +373,7 @@ class Scheduler(
             else None
         )
 
-    def init_sockets(self, server_args: ServerArgs, port_args: PortArgs):
+    def init_ipc_channels(self, port_args: PortArgs):
         context = zmq.Context(2)
         self.idle_sleeper = None
 
@@ -388,7 +388,7 @@ class Scheduler(
             send_to_tokenizer = get_zmq_socket(
                 context, zmq.PUSH, port_args.tokenizer_ipc_name, False
             )
-            if server_args.skip_tokenizer_init:
+            if self.server_args.skip_tokenizer_init:
                 # Directly send to the TokenizerManager
                 send_to_detokenizer = get_zmq_socket(
                     context, zmq.PUSH, port_args.tokenizer_ipc_name, False
@@ -2324,9 +2324,7 @@ class Scheduler(
         elif batch.forward_mode.is_prebuilt():
             self.process_batch_result_prebuilt(batch)
         elif batch.forward_mode.is_idle():
-            if self.enable_overlap:
-                if result.copy_done is not None:
-                    result.copy_done.synchronize()
+            self.process_batch_result_idle(batch, result)
 
         self.log_batch_result_stats(batch, result)
         self.maybe_send_health_check_signal()
