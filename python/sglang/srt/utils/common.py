@@ -144,7 +144,15 @@ def is_xpu() -> bool:
 
 @lru_cache(maxsize=1)
 def is_npu() -> bool:
-    return hasattr(torch, "npu") and torch.npu.is_available()
+    if not hasattr(torch, "npu"):
+        return False
+
+    if not torch.npu.is_available():
+        raise RuntimeError(
+            "torch_npu detected, but NPU device is not available or visible."
+        )
+
+    return True
 
 
 @lru_cache(maxsize=1)
@@ -304,11 +312,13 @@ def get_bool_env_var(name: str, default: str = "false") -> bool:
     falsy_values = ("false", "0")
 
     if (value not in truthy_values) and (value not in falsy_values):
-        if value not in _warned_bool_env_var_keys:
+        # Warn once per env var key (not per value), otherwise different keys that share the
+        # same invalid value may suppress warnings incorrectly.
+        if name not in _warned_bool_env_var_keys:
             logger.warning(
                 f"get_bool_env_var({name}) see non-understandable value={value} and treat as false"
             )
-        _warned_bool_env_var_keys.add(value)
+        _warned_bool_env_var_keys.add(name)
 
     return value in truthy_values
 
@@ -1493,7 +1503,13 @@ def add_prometheus_middleware(app):
 def add_prometheus_track_response_middleware(app):
     from prometheus_client import Counter
 
-    http_response_status_counter = Counter(
+    http_request_counter = Counter(
+        name="sglang:http_requests_total",
+        documentation="Total number of HTTP requests by endpoint and method",
+        labelnames=["endpoint", "method"],
+    )
+
+    http_response_counter = Counter(
         name="sglang:http_responses_total",
         documentation="Total number of HTTP responses by endpoint and status code",
         labelnames=["endpoint", "status_code", "method"],
@@ -1501,22 +1517,34 @@ def add_prometheus_track_response_middleware(app):
 
     @app.middleware("http")
     async def track_http_status_code(request, call_next):
+        # With recording all requests, we have the risk of high cardinality if requests have arbitrary unhandled paths.
+        # But given that SGLang engines with metrics enabled are usually behind routers this looks safe.
+        path, is_handled_path = _get_fastapi_request_path(request)
+        method = request.method
+
+        http_request_counter.labels(endpoint=path, method=method).inc()
+
         response = await call_next(request)
 
-        route = request.scope.get("route")
-        endpoint = (
-            route.path
-            if route
-            else ("unknown_route" if response.status_code == 404 else request.url.path)
-        )
-
-        http_response_status_counter.labels(
-            endpoint=endpoint,
+        http_response_counter.labels(
+            endpoint=path,
+            method=method,
             status_code=str(response.status_code),
-            method=request.method,
         ).inc()
 
         return response
+
+
+# https://github.com/blueswen/fastapi-observability/blob/132a3c576f8b09e5311c68bd553215013bc75685/fastapi_app/utils.py#L98
+def _get_fastapi_request_path(request) -> Tuple[str, bool]:
+    from starlette.routing import Match
+
+    for route in request.app.routes:
+        match, child_scope = route.matches(request.scope)
+        if match == Match.FULL:
+            return route.path, True
+
+    return request.url.path, False
 
 
 def bind_port(port):
@@ -1836,7 +1864,7 @@ def get_device(device_id: Optional[int] = None) -> str:
             return "xpu"
         return "xpu:{}".format(device_id)
 
-    if hasattr(torch, "npu") and torch.npu.is_available():
+    if is_npu():
         if device_id == None:
             return "npu"
         return "npu:{}".format(device_id)
