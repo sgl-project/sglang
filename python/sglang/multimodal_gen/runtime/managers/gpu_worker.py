@@ -26,10 +26,7 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import (
     globally_suppress_loggers,
     init_logger,
 )
-from sglang.multimodal_gen.runtime.utils.perf_logger import (
-    PerformanceLogger,
-    RequestTimings,
-)
+from sglang.multimodal_gen.runtime.utils.perf_logger import PerformanceLogger
 
 logger = init_logger(__name__)
 
@@ -97,16 +94,22 @@ class GPUWorker:
         req = batch[0]
         output_batch = None
         try:
+            if self.rank == 0:
+                torch.cuda.reset_peak_memory_stats()
+
             start_time = time.monotonic()
-            timings = RequestTimings(request_id=req.request_id)
-            req.timings = timings
 
             output_batch = self.pipeline.forward(req, self.server_args)
-            duration_ms = (time.monotonic() - start_time) * 1000
+
+            if self.rank == 0:
+                peak_memory_bytes = torch.cuda.max_memory_allocated()
+                output_batch.peak_memory_mb = peak_memory_bytes / (1024**2)
 
             if output_batch.timings:
+                duration_ms = (time.monotonic() - start_time) * 1000
                 output_batch.timings.total_duration_ms = duration_ms
-                PerformanceLogger.log_request_summary(timings=output_batch.timings)
+                if req.perf_dump_path is not None:
+                    PerformanceLogger.log_request_summary(timings=output_batch.timings)
         except Exception as e:
             logger.error(
                 f"Error executing request {req.request_id}: {e}", exc_info=True
@@ -122,7 +125,11 @@ class GPUWorker:
             return output_batch
 
     def set_lora(
-        self, lora_nickname: str, lora_path: str | None = None, target: str = "all"
+        self,
+        lora_nickname: str,
+        lora_path: str | None = None,
+        target: str = "all",
+        strength: float = 1.0,
     ) -> None:
         """
         Set the LoRA adapter for the pipeline.
@@ -131,19 +138,21 @@ class GPUWorker:
             lora_nickname: The nickname of the adapter.
             lora_path: Path to the LoRA adapter.
             target: Which transformer(s) to apply the LoRA to.
+            strength: LoRA strength for merge, default 1.0.
         """
         assert self.pipeline is not None
-        self.pipeline.set_lora(lora_nickname, lora_path, target)
+        self.pipeline.set_lora(lora_nickname, lora_path, target, strength)
 
-    def merge_lora_weights(self, target: str = "all") -> None:
+    def merge_lora_weights(self, target: str = "all", strength: float = 1.0) -> None:
         """
         Merge LoRA weights.
 
         Args:
             target: Which transformer(s) to merge.
+            strength: LoRA strength for merge, default 1.0.
         """
         assert self.pipeline is not None
-        self.pipeline.merge_lora_weights(target)
+        self.pipeline.merge_lora_weights(target, strength)
 
     def unmerge_lora_weights(self, target: str = "all") -> None:
         """

@@ -27,6 +27,7 @@ use sgl_model_gateway::{
     policies::PolicyRegistry,
     protocols::common::{Function, Tool},
     reasoning_parser::ParserFactory as ReasoningParserFactory,
+    tokenizer::registry::TokenizerRegistry,
     tool_parser::ParserFactory as ToolParserFactory,
 };
 
@@ -76,7 +77,7 @@ pub async fn create_test_context(config: RouterConfig) -> Arc<AppContext> {
             .router_config(config.clone())
             .client(client)
             .rate_limiter(rate_limiter)
-            .tokenizer(None) // tokenizer
+            .tokenizer_registry(Arc::new(TokenizerRegistry::new())) // tokenizer
             .reasoning_parser_factory(None) // reasoning_parser_factory
             .tool_parser_factory(None) // tool_parser_factory
             .worker_registry(worker_registry)
@@ -181,6 +182,7 @@ pub async fn create_test_context_with_parsers(config: RouterConfig) -> Arc<AppCo
     };
 
     // Initialize registries
+    let tokenizer_registry = Arc::new(TokenizerRegistry::new());
     let worker_registry = Arc::new(WorkerRegistry::new());
     let policy_registry = Arc::new(PolicyRegistry::new(config.policy.clone()));
 
@@ -211,7 +213,7 @@ pub async fn create_test_context_with_parsers(config: RouterConfig) -> Arc<AppCo
             .router_config(config.clone())
             .client(client)
             .rate_limiter(rate_limiter)
-            .tokenizer(None) // tokenizer
+            .tokenizer_registry(tokenizer_registry)
             .reasoning_parser_factory(reasoning_parser_factory)
             .tool_parser_factory(tool_parser_factory)
             .worker_registry(worker_registry)
@@ -347,7 +349,7 @@ pub async fn create_test_context_with_mcp_config(
             .router_config(config.clone())
             .client(client)
             .rate_limiter(rate_limiter)
-            .tokenizer(None) // tokenizer
+            .tokenizer_registry(Arc::new(TokenizerRegistry::new())) // tokenizer
             .reasoning_parser_factory(None) // reasoning_parser_factory
             .tool_parser_factory(None) // tool_parser_factory
             .worker_registry(worker_registry)

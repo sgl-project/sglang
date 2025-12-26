@@ -29,13 +29,16 @@ from sglang.srt.compilation.compilation_config import CompilationConfig
 from sglang.srt.compilation.compile import install_torch_compiled, set_compiled
 from sglang.srt.compilation.piecewise_context_manager import (
     enable_piecewise_cuda_graph,
+    enable_piecewise_cuda_graph_compile,
     set_forward_context,
+    set_pcg_capture_stream,
 )
 from sglang.srt.custom_op import CustomOp
 from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     set_graph_pool_id,
 )
+from sglang.srt.distributed.parallel_state import graph_capture
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     get_attention_tp_rank,
@@ -58,50 +61,6 @@ logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
-
-
-@contextmanager
-def disable_ca_comm(tp_group):
-    """
-    Context manager to temporarily disable custom allreduce communication.
-
-    This is used during Piecewise CUDA graph capture to avoid custom allreduce operations
-    that may not be compatible with graph capture.
-
-    TODO(yuwei): Fix this
-    """
-    if tp_group.ca_comm is None:
-        yield
-        return
-
-    original_disabled = tp_group.ca_comm.disabled
-    tp_group.ca_comm.original_disabled = original_disabled
-    try:
-        tp_group.ca_comm.disabled = True
-        yield
-    finally:
-        tp_group.ca_comm.disabled = original_disabled
-
-
-@contextmanager
-def use_original_ca_comm(tp_group):
-    """
-    For the module not in piecewise cuda graph capture, use the original custom allreduce communication.
-    This is a no-op if not using piecewise cuda graph because .disabled == .original_disabled
-
-    TODO(Byron): remove this once custom allreduce is enabled in piecewise cuda graph
-    """
-    if tp_group.ca_comm is None:
-        yield
-        return
-
-    current_disabled = tp_group.ca_comm.disabled
-    original_disabled = tp_group.ca_comm.original_disabled
-    try:
-        tp_group.ca_comm.disabled = original_disabled
-        yield
-    finally:
-        tp_group.ca_comm.disabled = current_disabled
 
 
 @contextmanager
@@ -267,9 +226,25 @@ class PiecewiseCudaGraphRunner:
                     compile_config=self.compile_config,
                     graph_pool=get_global_graph_memory_pool(),
                 )
-                with freeze_gc(self.model_runner.server_args.enable_cudagraph_gc):
-                    with set_compiled(True):
-                        self.warmup_torch_compile()
+
+                with set_compiled(True), enable_piecewise_cuda_graph_compile():
+                    compile_range = (
+                        tqdm.tqdm(list(reversed(self.capture_num_tokens)))
+                        if get_tensor_model_parallel_rank() == 0
+                        else reversed(self.capture_num_tokens)
+                    )
+                    for _, num_tokens in enumerate(compile_range):
+                        if get_tensor_model_parallel_rank() == 0:
+                            compile_range.set_description(
+                                f"Compiling num tokens ({num_tokens=})"
+                            )
+                        self.warmup_torch_compile(num_tokens=num_tokens)
+
+                set_global_graph_memory_pool(self.device_module.graph_pool_handle())
+                set_graph_pool_id(get_global_graph_memory_pool())
+
+                self.device_module.synchronize()
+                self.model_runner.tp_group.barrier()
                 # Capture
                 try:
                     self.capture()
@@ -280,20 +255,19 @@ class PiecewiseCudaGraphRunner:
 
         self.raw_num_tokens = 0
 
-    def warmup_torch_compile(self):
+    def warmup_torch_compile(self, num_tokens: int):
         """Warmup the model with a simple forward pass before CUDA graph capture."""
-        num_tokens = 2
         input_ids = self.input_ids[:num_tokens]
         input_embeds = self.input_embeds[:num_tokens] if self.is_multimodal else None
+        positions = self.positions[:num_tokens]
+        mrope_positions = (
+            self.mrope_positions[:, :num_tokens] if self.is_multimodal else None
+        )
         out_cache_loc = self.out_cache_loc[:num_tokens]
         out_cache_loc_swa = (
             self.out_cache_loc_swa[:num_tokens]
             if self.out_cache_loc_swa is not None
             else None
-        )
-        positions = self.positions[:num_tokens]
-        mrope_positions = (
-            self.mrope_positions[:, :num_tokens] if self.is_multimodal else None
         )
         with torch.device(self.device):
             forward_batch = ForwardBatch(
@@ -337,9 +311,12 @@ class PiecewiseCudaGraphRunner:
 
         # Attention backend
         self.model_runner.attn_backend.init_forward_metadata(forward_batch)
+        forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = None
+        set_dp_buffer_len(None, num_tokens, forward_batch.dp_padding_mode.is_max_len())
+        set_is_extend_in_batch(False)
         with set_forward_context(
             forward_batch, self.attention_layers, self.quant_config, self.moe_layers
-        ), disable_ca_comm(self.model_runner.tp_group):
+        ):
             _ = self.model_runner.model.forward(
                 forward_batch.input_ids,
                 forward_batch.positions,
@@ -351,7 +328,6 @@ class PiecewiseCudaGraphRunner:
 
     def can_run(self, forward_batch: ForwardBatch):
         num_tokens = len(forward_batch.input_ids)
-        # TODO(yuwei): support return input_ids' logprob
         if forward_batch.return_logprob:
             for start_len, seq_len in zip(
                 forward_batch.extend_logprob_start_lens_cpu,
@@ -369,31 +345,33 @@ class PiecewiseCudaGraphRunner:
         # can reuse the memory pool allocated for the large shapes.
         with freeze_gc(
             self.model_runner.server_args.enable_cudagraph_gc
-        ), disable_ca_comm(self.model_runner.tp_group):
-            avail_mem = get_available_gpu_memory(
-                self.model_runner.device,
-                self.model_runner.gpu_id,
-                empty_cache=False,
-            )
-            # Reverse the order to enable better memory sharing across cuda graphs.
-            capture_range = (
-                tqdm.tqdm(list(reversed(self.capture_num_tokens)))
-                if get_tensor_model_parallel_rank() == 0
-                else reversed(self.capture_num_tokens)
-            )
-            for i, num_tokens in enumerate(capture_range):
-                if get_tensor_model_parallel_rank() == 0:
-                    avail_mem = get_available_gpu_memory(
-                        self.model_runner.device,
-                        self.model_runner.gpu_id,
-                        empty_cache=False,
-                    )
-                    capture_range.set_description(
-                        f"Capturing num tokens ({num_tokens=} {avail_mem=:.2f} GB)"
-                    )
+        ), graph_capture() as graph_capture_context:
+            stream = graph_capture_context.stream
+            with set_pcg_capture_stream(stream):
+                avail_mem = get_available_gpu_memory(
+                    self.model_runner.device,
+                    self.model_runner.gpu_id,
+                    empty_cache=False,
+                )
+                # Reverse the order to enable better memory sharing across cuda graphs.
+                capture_range = (
+                    tqdm.tqdm(list(reversed(self.capture_num_tokens)))
+                    if get_tensor_model_parallel_rank() == 0
+                    else reversed(self.capture_num_tokens)
+                )
+                for i, num_tokens in enumerate(capture_range):
+                    if get_tensor_model_parallel_rank() == 0:
+                        avail_mem = get_available_gpu_memory(
+                            self.model_runner.device,
+                            self.model_runner.gpu_id,
+                            empty_cache=False,
+                        )
+                        capture_range.set_description(
+                            f"Capturing num tokens ({num_tokens=} {avail_mem=:.2f} GB)"
+                        )
 
-                with set_compiled(True):
-                    self.capture_one_batch_size(num_tokens)
+                    with set_compiled(True):
+                        self.capture_one_batch_size(num_tokens)
 
     def capture_one_batch_size(self, num_tokens: int):
         bs = 1
@@ -493,7 +471,9 @@ class PiecewiseCudaGraphRunner:
                 )
             return
 
-        for _ in range(3):
+        # run twice for warmup at the first time and cuda graph capture at the second time
+        # detail lies in sglang/python/sglang/srt/compilation/cuda_piecewise_backend.py
+        for _ in range(2):
             self.device_module.synchronize()
             self.model_runner.tp_group.barrier()
             run_once()
@@ -603,7 +583,7 @@ class PiecewiseCudaGraphRunner:
         forward_batch: ForwardBatch,
         **kwargs,
     ) -> Union[LogitsProcessorOutput, PPProxyTensors, EmbeddingPoolerOutput]:
-        with enable_piecewise_cuda_graph(), disable_ca_comm(self.model_runner.tp_group):
+        with enable_piecewise_cuda_graph():
             self.model_runner.attn_backend.init_forward_metadata(forward_batch)
             static_forward_batch = self.replay_prepare(forward_batch, **kwargs)
             # Replay

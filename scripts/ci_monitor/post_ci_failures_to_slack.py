@@ -55,20 +55,28 @@ def post_ci_failures_to_slack(report_file: str) -> bool:
 
         critical_failures = []
 
-        # Map workflow data keys to display names
-        workflow_name_map = {
-            # PR Tests - Scheduled (5 workflows)
-            "pr_test_nvidia_scheduled_data": "PR Test (Nvidia, scheduled)",
-            "pr_test_amd_scheduled_data": "PR Test (AMD, scheduled)",
-            "pr_test_xeon_scheduled_data": "PR Test (Xeon, scheduled)",
-            "pr_test_xpu_scheduled_data": "PR Test (XPU, scheduled)",
-            "pr_test_npu_scheduled_data": "PR Test (NPU, scheduled)",
-            # Nightly Tests - Scheduled (4 workflows)
-            "nightly_nvidia_scheduled_data": "Nightly Test (Nvidia, scheduled)",
-            "nightly_amd_scheduled_data": "Nightly Test (AMD, scheduled)",
-            "nightly_intel_scheduled_data": "Nightly Test (Intel, scheduled)",
-            "nightly_npu_scheduled_data": "Nightly Test (NPU, scheduled)",
+        # Map workflow data keys to display names and hardware category
+        # Format: (display_name, hardware, test_type_order)
+        # test_type_order: 0 = PR Test, 1 = Nightly (so PR Test comes first)
+        workflow_info_map = {
+            # Nvidia
+            "pr_test_nvidia_scheduled_data": ("PR Test", "Nvidia", 0),
+            "nightly_nvidia_scheduled_data": ("Nightly", "Nvidia", 1),
+            # AMD
+            "pr_test_amd_scheduled_data": ("PR Test", "AMD", 0),
+            "nightly_amd_scheduled_data": ("Nightly", "AMD", 1),
+            # Intel/Xeon
+            "pr_test_xeon_scheduled_data": ("PR Test", "Intel", 0),
+            "nightly_intel_scheduled_data": ("Nightly", "Intel", 1),
+            # XPU
+            "pr_test_xpu_scheduled_data": ("PR Test", "XPU", 0),
+            # NPU
+            "pr_test_npu_scheduled_data": ("PR Test", "NPU", 0),
+            "nightly_npu_scheduled_data": ("Nightly", "NPU", 1),
         }
+
+        # Hardware priority order (Nvidia first)
+        hardware_order = ["Nvidia", "AMD", "Intel", "XPU", "NPU"]
 
         # Iterate through each workflow section
         for workflow_key, workflow_data in report_data.items():
@@ -79,12 +87,11 @@ def post_ci_failures_to_slack(report_file: str) -> bool:
             ):
                 continue
 
-            # Get workflow display name
-            workflow_name = workflow_name_map.get(workflow_key, workflow_key)
-
-            # Only process scheduled workflows
-            if "scheduled" not in workflow_key.lower():
+            # Only process scheduled workflows that are in our map
+            if workflow_key not in workflow_info_map:
                 continue
+
+            test_type, hardware, test_order = workflow_info_map[workflow_key]
 
             # Check each job in this workflow
             for job_name, job_data in workflow_data.items():
@@ -100,7 +107,9 @@ def post_ci_failures_to_slack(report_file: str) -> bool:
 
                     critical_failures.append(
                         {
-                            "workflow_name": workflow_name,
+                            "hardware": hardware,
+                            "test_type": test_type,
+                            "test_order": test_order,
                             "job_name": job_name,
                             "consecutive_failures": current_streak,
                             "first_failed_at": (
@@ -124,14 +133,18 @@ def post_ci_failures_to_slack(report_file: str) -> bool:
                         }
                     )
 
-        # Group by workflow
-        workflow_jobs = {}
+        # Group by hardware, then by test type
+        # Structure: {hardware: {test_type: [job_names]}}
+        hardware_jobs = {}
         for job in critical_failures:
-            workflow = job.get("workflow_name", "Unknown")
+            hardware = job.get("hardware", "Unknown")
+            test_type = job.get("test_type", "Unknown")
             job_name = job.get("job_name", "unknown")
-            if workflow not in workflow_jobs:
-                workflow_jobs[workflow] = []
-            workflow_jobs[workflow].append(job_name)
+            if hardware not in hardware_jobs:
+                hardware_jobs[hardware] = {}
+            if test_type not in hardware_jobs[hardware]:
+                hardware_jobs[hardware][test_type] = []
+            hardware_jobs[hardware][test_type].append(job_name)
 
         # Create summary message
         workflow_url = ""
@@ -140,7 +153,7 @@ def post_ci_failures_to_slack(report_file: str) -> bool:
                 f"https://github.com/sgl-project/sglang/actions/runs/{run_id}"
             )
 
-        if not workflow_jobs:
+        if not hardware_jobs:
             summary = "✅ No critical failures detected in scheduled runs"
             if workflow_url:
                 summary += f"\n<{workflow_url}|View CI Monitor Run>"
@@ -149,9 +162,20 @@ def post_ci_failures_to_slack(report_file: str) -> bool:
             # Ping relevant people when there are failures
             mentions = "<@U09RR5TNC94> <@U09ABMCKQPM>"
             summary_lines = [f"{mentions} 🚨 *CI Critical Failures (Scheduled Runs)*"]
-            for workflow, jobs in sorted(workflow_jobs.items()):
-                job_list = ", ".join(jobs)
-                summary_lines.append(f"• *{workflow}*: {job_list}")
+
+            # Iterate in hardware priority order, with PR Test before Nightly
+            test_type_order = ["PR Test", "Nightly"]
+            for hardware in hardware_order:
+                if hardware not in hardware_jobs:
+                    continue
+                summary_lines.append(f"\n*{hardware}:*")
+                for test_type in test_type_order:
+                    if test_type not in hardware_jobs[hardware]:
+                        continue
+                    jobs = hardware_jobs[hardware][test_type]
+                    job_list = ", ".join(jobs)
+                    summary_lines.append(f"  • {test_type}: {job_list}")
+
             if workflow_url:
                 summary_lines.append(f"\n<{workflow_url}|View Full CI Monitor Report>")
             summary = "\n".join(summary_lines)
@@ -174,11 +198,24 @@ def post_ci_failures_to_slack(report_file: str) -> bool:
         thread_ts = response["ts"]
 
         # If there are failures, post detailed breakdown in thread
-        if workflow_jobs:
+        if hardware_jobs:
             details_lines = ["*Detailed Failure Breakdown*\n"]
 
-            for job in critical_failures:
-                workflow = job.get("workflow_name", "Unknown")
+            # Sort critical_failures by hardware order, then test_order
+            hardware_order_map = {hw: i for i, hw in enumerate(hardware_order)}
+            sorted_failures = sorted(
+                critical_failures,
+                key=lambda x: (
+                    hardware_order_map.get(x.get("hardware", ""), 99),
+                    x.get("test_order", 99),
+                    x.get("job_name", ""),
+                ),
+            )
+
+            current_hardware = None
+            for job in sorted_failures:
+                hardware = job.get("hardware", "Unknown")
+                test_type = job.get("test_type", "Unknown")
                 job_name = job.get("job_name", "unknown")
                 consecutive = job.get("consecutive_failures", 0)
                 first_url = job.get("first_failed_url", "")
@@ -186,8 +223,13 @@ def post_ci_failures_to_slack(report_file: str) -> bool:
                 last_url = job.get("last_failed_url", "")
                 last_at = job.get("last_failed_at", "unknown")
 
+                # Add hardware section header
+                if hardware != current_hardware:
+                    details_lines.append(f"\n*━━━ {hardware} ━━━*")
+                    current_hardware = hardware
+
                 details_lines.append(
-                    f"• *{workflow}* → `{job_name}`\n"
+                    f"• *{test_type}* → `{job_name}`\n"
                     f"  Consecutive failures: {consecutive}\n"
                     f"  First failed: <{first_url}|{first_at}>\n"
                     f"  Last failed: <{last_url}|{last_at}>\n"

@@ -14,7 +14,7 @@ from __future__ import annotations
 import os
 import pprint
 from dataclasses import asdict, dataclass, field
-from typing import TYPE_CHECKING, Any, Optional
+from typing import Any, Optional
 
 import PIL.Image
 import torch
@@ -26,12 +26,8 @@ from sglang.multimodal_gen.configs.sample.teacache import (
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.perf_logger import RequestTimings
 from sglang.multimodal_gen.utils import align_to
-
-if TYPE_CHECKING:
-
-    from sglang.multimodal_gen.runtime.utils.perf_logger import RequestTimings
-
 
 logger = init_logger(__name__)
 
@@ -229,6 +225,8 @@ class Req:
         if self.guidance_scale_2 is None:
             self.guidance_scale_2 = self.guidance_scale
 
+        self.timings = RequestTimings(request_id=self.request_id)
+
     def adjust_size(self, server_args: ServerArgs):
         pass
 
@@ -281,3 +279,4 @@ class OutputBatch:
 
     # logged timings info, directly from Req.timings
     timings: Optional["RequestTimings"] = None
+    peak_memory_mb: float = 0.0

@@ -67,6 +67,12 @@ def parse_args():
         default=None,
         help="Pytest filter expression (passed to pytest -k)",
     )
+    parser.add_argument(
+        "--continue-on-error",
+        action="store_true",
+        default=False,
+        help="Continue running remaining tests even if one fails (for CI consistency; pytest already continues by default)",
+    )
     return parser.parse_args()
 
 

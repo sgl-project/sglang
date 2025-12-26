@@ -8,13 +8,13 @@ from sglang.multimodal_gen.runtime.distributed import get_sp_group
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_cfg_group,
     get_classifier_free_guidance_rank,
-    get_world_rank,
 )
 from sglang.multimodal_gen.runtime.pipelines_core import Req
 from sglang.multimodal_gen.runtime.pipelines_core.executors.pipeline_executor import (
     PipelineExecutor,
     Timer,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
     PipelineStage,
     StageParallelismType,
@@ -57,7 +57,7 @@ class ParallelExecutor(PipelineExecutor):
         stages: List[PipelineStage],
         batch: Req,
         server_args: ServerArgs,
-    ) -> Req:
+    ) -> OutputBatch:
         """
         Execute all pipeline stages respecting their declared parallelism type.
         """
@@ -95,15 +95,6 @@ class ParallelExecutor(PipelineExecutor):
         stages: List[PipelineStage],
         batch: Req,
         server_args: ServerArgs,
-    ) -> Req:
-        rank = get_classifier_free_guidance_rank()
-
-        if batch.profile and batch.profile_all_stages:
-            world_rank = get_world_rank()
-        else:
-            world_rank = 0
-
-        with self.profile_execution(batch, check_rank=rank, dump_rank=world_rank):
-            batch = self._execute(stages, batch, server_args)
-
+    ) -> OutputBatch:
+        batch = self._execute(stages, batch, server_args)
         return batch

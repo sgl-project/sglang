@@ -610,6 +610,7 @@ class WanTransformer3DModel(CachableDiT):
         self.num_channels_latents = config.num_channels_latents
         self.patch_size = config.patch_size
         self.text_len = config.text_len
+        self.dit_module_names = ["blocks"]
 
         # 1. Patch & position embedding
         self.patch_embedding = PatchEmbed(

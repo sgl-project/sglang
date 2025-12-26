@@ -100,7 +100,7 @@ class ModelConfig:
         model_impl: Union[str, ModelImpl] = ModelImpl.AUTO,
         sampling_defaults: str = "openai",
         quantize_and_serve: bool = False,
-        is_mtp: bool = False,
+        is_multi_layer_eagle: bool = False,
         encoder_only: bool = False,
         language_only: bool = False,
     ) -> None:
@@ -112,7 +112,7 @@ class ModelConfig:
         self.model_impl = model_impl
         self.sampling_defaults = sampling_defaults
         self.quantize_and_serve = quantize_and_serve
-        self.is_mtp = is_mtp
+        self.is_multi_layer_eagle = is_multi_layer_eagle
 
         # Validate quantize_and_serve configuration
         self._validate_quantize_and_serve_config()
@@ -160,6 +160,7 @@ class ModelConfig:
         self.attention_chunk_size = getattr(
             self.hf_text_config, "attention_chunk_size", None
         )
+        self.sliding_window_size = self._get_sliding_window_size()
         self.is_generation = is_generation_model(
             self.hf_config.architectures, is_embedding
         )
@@ -252,7 +253,7 @@ class ModelConfig:
             sampling_defaults=server_args.sampling_defaults,
             quantize_and_serve=server_args.quantize_and_serve,
             override_config_file=server_args.decrypted_config_file,
-            is_mtp=server_args.enable_mtp,
+            is_multi_layer_eagle=server_args.enable_multi_layer_eagle,
             language_only=server_args.language_only,
             encoder_only=server_args.encoder_only,
             is_draft_model=is_draft_model,
@@ -670,6 +671,12 @@ class ModelConfig:
         else:
             return "fp8"  # Default fallback
 
+    def _get_sliding_window_size(self) -> Optional[int]:
+        sliding_window_size = getattr(self.hf_text_config, "sliding_window_size", None)
+        if sliding_window_size is None:
+            sliding_window_size = getattr(self.hf_text_config, "sliding_window", None)
+        return sliding_window_size
+
     def _validate_quantize_and_serve_config(self):
         """Validate quantize_and_serve configuration."""
         if not self.quantize_and_serve:
@@ -1047,6 +1054,7 @@ multimodal_model_archs = [
     "Gemma3nForConditionalGeneration",
     "Glm4vForConditionalGeneration",
     "Glm4vMoeForConditionalGeneration",
+    "GlmAsrForConditionalGeneration",
     "Grok1VForCausalLM",
     "Grok1AForCausalLM",
     "LlavaLlamaForCausalLM",

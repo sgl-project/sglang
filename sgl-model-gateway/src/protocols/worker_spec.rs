@@ -6,6 +6,8 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
+use super::UNKNOWN_MODEL_ID;
+
 /// Worker configuration for API requests
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct WorkerConfigRequest {
@@ -175,13 +177,13 @@ impl WorkerInfo {
         Self {
             id: worker_id.to_string(),
             url,
-            model_id: "unknown".to_string(),
+            model_id: UNKNOWN_MODEL_ID.to_string(),
             priority: 0,
             cost: 1.0,
-            worker_type: "unknown".to_string(),
+            worker_type: UNKNOWN_MODEL_ID.to_string(),
             is_healthy: false,
             load: 0,
-            connection_mode: "unknown".to_string(),
+            connection_mode: UNKNOWN_MODEL_ID.to_string(),
             runtime_type: None,
             tokenizer_path: None,
             reasoning_parser: None,

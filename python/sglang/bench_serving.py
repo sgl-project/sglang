@@ -50,6 +50,7 @@ from transformers import (
 )
 
 ASSISTANT_SUFFIX = "Assistant:"
+_ROUTING_KEY_HEADER = "X-SMG-Routing-Key"
 
 TERM_PLOTLIB_AVAILABLE = (importlib.util.find_spec("termplotlib") is not None) and (
     shutil.which("gnuplot") is not None
@@ -88,6 +89,7 @@ class RequestFuncInput:
     image_data: Optional[List[str]]
     extra_request_body: Dict[str, Any]
     timestamp: Optional[float] = None
+    routing_key: Optional[str] = None
 
 
 @dataclass
@@ -234,6 +236,8 @@ async def async_request_openai_completions(
             payload.update({"image_data": request_func_input.image_data})
 
         headers = get_auth_headers()
+        if request_func_input.routing_key:
+            headers[_ROUTING_KEY_HEADER] = request_func_input.routing_key
 
         output = RequestFuncOutput.init_new(request_func_input)
 
@@ -371,6 +375,8 @@ async def async_request_openai_chat_completions(
             payload["lora_path"] = request_func_input.lora_name
 
         headers = get_auth_headers()
+        if request_func_input.routing_key:
+            headers[_ROUTING_KEY_HEADER] = request_func_input.routing_key
 
         output = RequestFuncOutput.init_new(request_func_input)
 
@@ -575,6 +581,8 @@ async def async_request_sglang_generate(
             payload["image_data"] = request_func_input.image_data
 
         headers = get_auth_headers()
+        if request_func_input.routing_key:
+            headers[_ROUTING_KEY_HEADER] = request_func_input.routing_key
 
         output = RequestFuncOutput.init_new(request_func_input)
 
@@ -999,6 +1007,7 @@ class DatasetRow:
     vision_prompt_len: Optional[int] = None
     image_data: Optional[List[str]] = None
     timestamp: Optional[float] = None
+    routing_key: Optional[str] = None
 
     def __post_init__(self):
         if self.text_prompt_len is None:
@@ -1650,10 +1659,13 @@ def sample_generated_shared_prefix_requests(
     args: argparse.Namespace,
 ) -> List[DatasetRow]:
     """Generate benchmark requests with shared system prompts using random tokens and caching."""
+    send_routing_key = getattr(args, "gsp_send_routing_key", False)
+
     cache_path = get_gen_prefix_cache_path(args, tokenizer)
+    should_cache = (range_ratio == 1) and not send_routing_key
 
     # Try to load from cache first
-    if cache_path.exists() and range_ratio == 1:
+    if cache_path.exists() and should_cache:
         print(f"\nLoading cached generated input data from {cache_path}")
         with open(cache_path, "rb") as f:
             return pickle.load(f)
@@ -1662,6 +1674,9 @@ def sample_generated_shared_prefix_requests(
         f"\nGenerating new input data... "
         f"({num_groups=}, {prompts_per_group}, {system_prompt_len=}, {question_len=}, {output_len=}, {range_ratio=})"
     )
+
+    run_random_str = uuid.uuid4().hex[:8]
+    run_start_timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
 
     system_prompt_lens = compute_random_lens(
         full_len=system_prompt_len,
@@ -1699,6 +1714,11 @@ def sample_generated_shared_prefix_requests(
 
     for group_idx in tqdm(range(num_groups), desc="Generating system prompt"):
         system_prompt = system_prompts[group_idx]
+        routing_key = (
+            f"{run_random_str}_{run_start_timestamp}_{group_idx}"
+            if send_routing_key
+            else None
+        )
         for prompt_idx in tqdm(
             range(prompts_per_group), desc="Generating questions", leave=False
         ):
@@ -1716,6 +1736,7 @@ def sample_generated_shared_prefix_requests(
                     prompt=full_prompt,
                     prompt_len=prompt_len,
                     output_len=output_lens[flat_index].item(),
+                    routing_key=routing_key,
                 )
             )
             total_input_tokens += prompt_len
@@ -1740,10 +1761,11 @@ def sample_generated_shared_prefix_requests(
         )
 
     # Save to cache
-    cache_path.parent.mkdir(parents=True, exist_ok=True)
-    print(f"Caching generated input data to {cache_path}")
-    with open(cache_path, "wb") as f:
-        pickle.dump(input_requests, f)
+    if should_cache:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        print(f"Caching generated input data to {cache_path}")
+        with open(cache_path, "wb") as f:
+            pickle.dump(input_requests, f)
 
     return input_requests
 
@@ -2151,6 +2173,7 @@ async def benchmark(
             image_data=request.image_data,
             extra_request_body=extra_request_body,
             timestamp=request.timestamp,
+            routing_key=request.routing_key,
         )
 
         tasks.append(
@@ -2978,6 +3001,11 @@ if __name__ == "__main__":
         "--gsp-fast-prepare",
         action="store_true",
         help="Speedup preparing by removing statistics computation, which will make some output statistics inaccurate but suitable for pressure tests.",
+    )
+    group.add_argument(
+        "--gsp-send-routing-key",
+        action="store_true",
+        help="Send routing key in requests via X-SMG-Routing-Key header. Requests with the same prefix share the same routing key.",
     )
     mooncake_group = parser.add_argument_group("mooncake dataset arguments")
     mooncake_group.add_argument(
