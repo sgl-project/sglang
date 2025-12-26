@@ -213,9 +213,9 @@ def handle_rerun_stage(
             print(f"Error: {workflow_name} workflow not found")
             return False
 
-        # Trigger workflow_dispatch on the PR's head commit SHA
-        ref = pr.head.sha
-        print(f"Triggering {workflow_name} workflow on commit: {ref}")
+        # Trigger workflow_dispatch on the PR's head
+        ref = f"refs/pull/{pr.number}/head"
+        print(f"Triggering {workflow_name} workflow on PR #{pr.number} head")
 
         # AMD workflow doesn't have version input, only target_stage
         if is_amd_stage:
