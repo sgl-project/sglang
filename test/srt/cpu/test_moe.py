@@ -306,6 +306,71 @@ class TestFusedExperts(CustomTestCase):
         atol = rtol = precision[dtype]
         torch.testing.assert_close(ref_out.bfloat16(), out, atol=atol, rtol=rtol)
 
+    @parametrize(
+        m=[1, 32], n=[128, 64], k=[128, 64], e=[4], topk=[2], renormalize=[False]
+    )
+    def test_mxfp4_moe_bias(self, m, n, k, e, topk, renormalize):
+        dtype = torch.bfloat16
+
+        a = torch.randn((m, k), device="cpu", dtype=dtype) / 10
+        w1_bf16 = torch.randn((e, 2 * n, k), device="cpu", dtype=dtype) / 10
+        w1q, w1s = MXFP4QuantizeUtil.quantize(w1_bf16)
+        w1s = w1s.reshape(e, 2 * n, k // 32)
+        w1dq = MXFP4QuantizeUtil.dequantize(w1q, dtype, w1s)
+        w1_b = torch.randn((e, 2 * n), device="cpu", dtype=dtype) / 10
+        w2_bf16 = torch.randn((e, k, n), device="cpu", dtype=dtype) / 10
+        w2q, w2s = MXFP4QuantizeUtil.quantize(w2_bf16)
+        w2s = w2s.reshape(e, k, n // 32)
+        w2dq = MXFP4QuantizeUtil.dequantize(w2q, dtype, w2s)
+        w2_b = torch.randn((e, k), device="cpu", dtype=dtype) / 10
+        score = torch.randn((m, e), device="cpu", dtype=dtype)
+        score = torch.softmax(score, dim=-1, dtype=torch.float32)
+        topk_weight, topk_ids = torch.topk(score, topk)
+        alpha = 1.702
+        limit = 7.0
+        torch_output = torch_naive_fused_moe_gptoss(
+            a,
+            w1dq,
+            w2dq,
+            w1_b,
+            w2_b,
+            topk_weight,
+            topk_ids,
+            renormalize,
+            alpha,
+            limit,
+            e,
+        )
+
+        w1 = kernel.convert_weight_packed(w1q)
+        w2 = kernel.convert_weight_packed(w2q)
+        w1s = kernel.convert_scale_packed(w1s)
+        w2s = kernel.convert_scale_packed(w2s)
+
+        fused_output = torch.ops.sgl_kernel.fused_experts_cpu(
+            a,
+            w1,
+            w2,
+            topk_weight,
+            topk_ids.to(torch.int32),
+            False,  # inplace # See [Note] inplace should be False in fused_experts.
+            False,  # use_int8_w8a8
+            False,  # use_fp8_w8a16
+            True,  # use_mxfp4
+            w1s,  # w1_scale
+            w2s,  # w2_scale
+            None,  # block_size
+            None,  # a1_scale
+            None,  # a2_scale
+            w1_b.to(torch.bfloat16),
+            w2_b.to(torch.bfloat16),
+            alpha,
+            limit,
+            True,  # is_vnni
+        )
+        atol = rtol = precision[torch_output.dtype]
+        torch.testing.assert_close(torch_output, fused_output, atol=atol, rtol=rtol)
+
 
 if __name__ == "__main__":
     unittest.main()
