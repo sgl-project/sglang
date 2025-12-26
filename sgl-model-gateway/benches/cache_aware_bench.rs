@@ -1,5 +1,3 @@
-use std::sync::Arc;
-
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use sgl_model_gateway::{
     core::{BasicWorkerBuilder, ModelCard, Worker, WorkerType},
@@ -7,7 +5,6 @@ use sgl_model_gateway::{
 };
 
 fn bench_cache_aware_selection(c: &mut Criterion) {
-    // 1. Setup Configuration
     // Set balance_abs_threshold to 0 to ensure the path with logging overhead
     // is exercised during the benchmark.
     let config = CacheAwareConfig {
@@ -16,8 +13,6 @@ fn bench_cache_aware_selection(c: &mut Criterion) {
     };
     let policy = CacheAwarePolicy::with_config(config);
 
-    // 2. Setup 50 Mock Workers
-    // Using ModelCard to assign models as required by the latest builder API
     let mut workers: Vec<Arc<dyn Worker>> = Vec::new();
     for i in 0..50 {
         let model_card = ModelCard::new("test-model");
@@ -25,7 +20,7 @@ fn bench_cache_aware_selection(c: &mut Criterion) {
         workers.push(Arc::new(
             BasicWorkerBuilder::new(&format!("http://worker-{}:8000", i))
                 .worker_type(WorkerType::Regular)
-                .model(model_card) // Correct method
+                .model(model_card)
                 .build(),
         ));
     }
@@ -33,8 +28,6 @@ fn bench_cache_aware_selection(c: &mut Criterion) {
     // Initialize policy state
     policy.init_workers(&workers);
 
-    // 3. Prepare Selection Info
-    // Use 'request_text' as defined in SelectWorkerInfo
     let prompt = "This is a standard prompt used to test the overhead of string traversal and heap allocations.";
     let info = SelectWorkerInfo {
         request_text: Some(prompt),
@@ -46,7 +39,7 @@ fn bench_cache_aware_selection(c: &mut Criterion) {
     group.bench_function("cache_aware_selection_50_workers", |b| {
         b.iter(|| {
             // Measure the performance of the selection decision
-            let _Result = policy.select_worker(black_box(&workers), black_box(&info));
+            let _result = policy.select_worker(black_box(&workers), black_box(&info));
         })
     });
 
