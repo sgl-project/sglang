@@ -141,12 +141,13 @@ async def generations(
         with open(save_file_path, "rb") as f:
             b64 = base64.b64encode(f.read()).decode("utf-8")
         response_kwargs = {
+            "id": request_id,
             "data": [
                 ImageResponseData(
                     b64_json=b64,
                     revised_prompt=request.prompt,
                 )
-            ]
+            ],
         }
         response_kwargs = add_common_data_to_response(
             response_kwargs, request_id=request_id, result=result
@@ -246,11 +247,15 @@ async def edits(
         with open(save_file_path, "rb") as f:
             b64 = base64.b64encode(f.read()).decode("utf-8")
         response_kwargs = {
-            "data": [ImageResponseData(b64_json=b64, revised_prompt=prompt)]
+            "id": request_id,
+            "data": [ImageResponseData(b64_json=b64, revised_prompt=prompt)],
         }
     else:
         url = f"/v1/images/{request_id}/content"
-        response_kwargs = {"data": [ImageResponseData(url=url, revised_prompt=prompt)]}
+        response_kwargs = {
+            "id": request_id,
+            "data": [ImageResponseData(url=url, revised_prompt=prompt)],
+        }
 
     response_kwargs = add_common_data_to_response(
         response_kwargs, request_id=request_id, result=result
