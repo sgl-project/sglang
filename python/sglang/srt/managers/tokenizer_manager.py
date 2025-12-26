@@ -1666,9 +1666,13 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
 
         # When skip_tokenizer_init is enabled, tokensizer_manager receives
         # BatchTokenIDOutput.
-        if self.server_args.dp_size > 1 and (
-            isinstance(recv_obj, BatchStrOutput)
-            or isinstance(recv_obj, BatchTokenIDOutput)
+        if (
+            self.server_args.dp_size > 1
+            and (
+                isinstance(recv_obj, BatchStrOutput)
+                or isinstance(recv_obj, BatchTokenIDOutput)
+            )
+            and recv_obj.load is not None
         ):
             load_update_req = WatchLoadUpdateReq(loads=[recv_obj.load])
             self.send_to_scheduler.send_pyobj(load_update_req)
