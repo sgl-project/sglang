@@ -12,6 +12,7 @@ from sglang.multimodal_gen.configs.models.vaes.qwenimage import QwenImageVAEConf
 from sglang.multimodal_gen.configs.pipeline_configs.base import (
     ImagePipelineConfig,
     ModelTaskType,
+    maybe_unpad_latents,
     shard_rotary_emb_for_sp,
 )
 from sglang.multimodal_gen.runtime.models.vision_utils import resize
@@ -470,3 +471,90 @@ class QwenImageEditPlusPipelineConfig(QwenImageEditPipelineConfig):
             "freqs_cis": ((img_cos, img_sin), (txt_cos, txt_sin)),
             "img_shapes": img_shapes,
         }
+
+
+@dataclass
+class QwenImageLayeredPipelineConfig(QwenImageEditPipelineConfig):
+    resolution: int = 640  # TODO: allow user to set resolution
+    vae_precision: str = "bf16"
+
+    def _prepare_edit_cond_kwargs(
+        self, batch, prompt_embeds, rotary_emb, device, dtype
+    ):
+        batch_size = batch.latents.shape[0]
+        assert batch_size == 1
+        height = batch.height
+        width = batch.width
+        image_size = batch.original_condition_image_size
+
+        vae_scale_factor = self.get_vae_scale_factor()
+
+        img_shapes = batch.img_shapes
+        txt_seq_lens = batch.txt_seq_lens
+
+        (img_cos, img_sin), (txt_cos, txt_sin) = (
+            QwenImageEditPlusPipelineConfig.get_freqs_cis(
+                img_shapes, txt_seq_lens, rotary_emb, device, dtype
+            )
+        )
+
+        # perform sp shard on noisy image tokens
+        noisy_img_seq_len = (
+            1 * (height // vae_scale_factor // 2) * (width // vae_scale_factor // 2)
+        )
+        noisy_img_cos = shard_rotary_emb_for_sp(img_cos[:noisy_img_seq_len, :])
+        noisy_img_sin = shard_rotary_emb_for_sp(img_sin[:noisy_img_seq_len, :])
+
+        # concat back the img_cos for input image (since it is not sp-shared later)
+        img_cos = torch.cat([noisy_img_cos, img_cos[noisy_img_seq_len:, :]], dim=0).to(
+            device=device
+        )
+        img_sin = torch.cat([noisy_img_sin, img_sin[noisy_img_seq_len:, :]], dim=0).to(
+            device=device
+        )
+
+        return {
+            "txt_seq_lens": txt_seq_lens,
+            "img_shapes": img_shapes,
+            "freqs_cis": ((img_cos, img_sin), (txt_cos, txt_sin)),
+            "additional_t_cond": torch.tensor([0], device=device, dtype=torch.long),
+        }
+
+    def _unpad_and_unpack_latents(self, latents, batch):
+        vae_scale_factor = self.vae_config.arch_config.vae_scale_factor
+        channels = self.dit_config.arch_config.in_channels
+        batch_size = latents.shape[0]
+        layers = batch.num_frames
+
+        height = 2 * (int(batch.height) // (vae_scale_factor * 2))
+        width = 2 * (int(batch.width) // (vae_scale_factor * 2))
+
+        latents = maybe_unpad_latents(latents, batch)
+        latents = latents.view(
+            batch_size, layers + 1, height // 2, width // 2, channels // 4, 2, 2
+        )
+        latents = latents.permute(0, 1, 4, 2, 5, 3, 6)
+
+        latents = latents.reshape(
+            batch_size, layers + 1, channels // (2 * 2), height, width
+        )
+        latents = latents.permute(0, 2, 1, 3, 4)  # (b, c, f, h, w)
+        return latents, batch_size, channels, height, width
+
+    def allow_set_num_frames(self):
+        return True
+
+    def post_denoising_loop(self, latents, batch):
+        # unpack latents for qwen-image
+        (
+            latents,
+            batch_size,
+            channels,
+            height,
+            width,
+        ) = self._unpad_and_unpack_latents(latents, batch)
+        b, c, f, h, w = latents.shape
+        latents = latents[:, :, 1:]  # remove the first frame as it is the origin input
+        latents = latents.permute(0, 2, 1, 3, 4).view(-1, c, 1, h, w)
+        # latents = latents.reshape(batch_size, channels // (2 * 2), 1, height, width)
+        return latents
