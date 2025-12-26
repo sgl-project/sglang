@@ -7,31 +7,48 @@ use sgl_model_gateway::{
 };
 
 fn bench_cache_aware_selection(c: &mut Criterion) {
+    // 1. Setup Configuration
+    // We set balance_abs_threshold to 0 to ensure the "imbalanced" path (with logging overhead)
+    // is exerciseable during the benchmark.
     let config = CacheAwareConfig {
-        balance_abs_threshold: 0, // Force the imbalanced path to show log overhead
+        balance_abs_threshold: 0,
         ..Default::default()
     };
     let policy = CacheAwarePolicy::with_config(config);
 
-    // Setup 50 workers
+    // 2. Setup 50 Mock Workers
+    // A larger number of workers makes the heap allocation overhead for log data more visible.
     let mut workers: Vec<Arc<dyn Worker>> = Vec::new();
     for i in 0..50 {
         workers.push(Arc::new(
             BasicWorkerBuilder::new(&format!("http://worker-{}:8000", i))
                 .worker_type(WorkerType::Regular)
+                .model_id("test-model")
                 .build(),
         ));
     }
 
+    // Initialize policy state
     policy.init_workers(&workers);
-    let prompt = "This is a standard prompt used to test the overhead of string traversal in the selection logic.";
-    let info = SelectWorkerInfo { text: Some(prompt) };
 
-    c.bench_function("cache_aware_selection_50_workers", |b| {
+    // 3. Prepare Selection Info
+    // Use 'request_text' as defined in SelectWorkerInfo
+    let prompt = "This is a standard prompt used to test the overhead of string traversal and heap allocations.";
+    let info = SelectWorkerInfo {
+        request_text: Some(prompt),
+        headers: None,
+    };
+
+    let mut group = c.benchmark_group("LoadBalancer");
+
+    group.bench_function("cache_aware_selection_50_workers", |b| {
         b.iter(|| {
-            let _ = policy.select_worker(black_box(&workers), black_box(&info));
+            // Measure the performance of the selection decision
+            let _Result = policy.select_worker(black_box(&workers), black_box(&info));
         })
     });
+
+    group.finish();
 }
 
 criterion_group!(benches, bench_cache_aware_selection);
