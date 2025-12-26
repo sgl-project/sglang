@@ -502,23 +502,12 @@ class Glm47MoeDetector(BaseFormatDetector):
                     self._reset_streaming_state()
                 # Check if this is a continuation of an existing tool call or a new one
                 elif not self.current_tool_name_sent:
-                    # If we're starting a new tool call (not continuing an existing one)
-                    # This check might need to be refined based on the context
-                    # For now, let's just reset when we detect a new tool call start
-                    potential_new_call = self.bot_token in new_text
-                    if potential_new_call and not self._buffer.startswith(
-                        self.bot_token
-                    ):
-                        # This appears to be a new tool call
-                        self.current_tool_id += 1
-                        self.current_tool_name_sent = False
-                        self._streamed_raw_length = 0
-                        self._reset_streaming_state()
-                        # Ensure arrays are large enough
-                        while len(self.prev_tool_call_arr) <= self.current_tool_id:
-                            self.prev_tool_call_arr.append({})
-                        while len(self.streamed_args_for_tool) <= self.current_tool_id:
-                            self.streamed_args_for_tool.append("")
+                    # Only increment tool_id if we're truly starting a NEW tool call
+                    # Don't increment if this is just the first time we're processing
+                    # a tool call that was received in the buffer
+                    # The key insight: only increment when we've COMPLETED a previous tool call
+                    # and now see another bot_token in new_text
+                    pass  # Remove the problematic auto-increment logic
 
                 # Ensure we have enough entries in our tracking arrays
                 while len(self.prev_tool_call_arr) <= self.current_tool_id:

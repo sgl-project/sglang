@@ -3271,6 +3271,80 @@ class TestGlm47MoeDetector(unittest.TestCase):
                             f"Should parse function call in streaming scenario: {description}",
                         )
 
+    def test_punctuation_complete_chunk_bug(self):
+        """Test punctuation followed by complete tool call in one chunk.
+
+        This reproduces the reported bug where the stream parser creates 3 tool calls
+        instead of 1 when receiving everything in one chunk.
+        """
+        tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="list_dir",
+                    description="List the contents of a directory",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "path": {"type": "string", "description": "Path to list"},
+                            "explanation": {
+                                "type": "string",
+                                "description": "Explanation for the action",
+                            },
+                        },
+                        "required": ["path"],
+                    },
+                ),
+            ),
+        ]
+        # Reset detector state
+        self.detector._buffer = ""
+        self.detector.current_tool_id = -1
+        self.detector.current_tool_name_sent = False
+        self.detector._reset_streaming_state()
+
+        # Complete chunk with Chinese punctuation and full tool call - THE BUG INPUT
+        text = "结构：<tool_call>list_dir<arg_key>explanation</arg_key><arg_value>检查根目录下有哪些可用目录</arg_value><arg_key>path</arg_key><arg_value>/</arg_value></tool_call>"
+
+        result = self.detector.parse_streaming_increment(text, self.tools)
+
+        # The Chinese punctuation should be preserved
+        self.assertEqual(
+            result.normal_text,
+            "结构：",
+            "Should preserve Chinese punctuation as normal text",
+        )
+
+        # Reconstruct the complete tool call from all call chunks
+        tool_calls_by_index = {}
+        for call in result.calls:
+            idx = (
+                call.tool_index
+                if hasattr(call, "tool_index") and call.tool_index is not None
+                else 0
+            )
+            if idx not in tool_calls_by_index:
+                tool_calls_by_index[idx] = {"name": "", "parameters": ""}
+            if call.name:
+                tool_calls_by_index[idx]["name"] = call.name
+            if call.parameters:
+                tool_calls_by_index[idx]["parameters"] += call.parameters
+
+        # CRITICAL: Should have exactly 1 tool call (not 3!)
+        self.assertEqual(
+            len(tool_calls_by_index),
+            1,
+            f"Should have exactly 1 tool call, but got {len(tool_calls_by_index)}. "
+            f"This is the bug: multiple tool_index values created for one call.",
+        )
+        self.assertIn(0, tool_calls_by_index, "Tool call should have index 0")
+        self.assertEqual(tool_calls_by_index[0]["name"], "list_dir")
+
+        # Verify complete parameters are valid JSON
+        params = json.loads(tool_calls_by_index[0]["parameters"])
+        self.assertEqual(params["path"], "/")
+        self.assertEqual(params["explanation"], "检查根目录下有哪些可用目录")
+
 
 class TestJsonArrayParser(unittest.TestCase):
     def setUp(self):
