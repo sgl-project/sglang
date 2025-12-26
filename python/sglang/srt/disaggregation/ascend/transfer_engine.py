@@ -8,7 +8,7 @@ from sglang.srt.disaggregation.mooncake.transfer_engine import MooncakeTransferE
 from sglang.srt.disaggregation.utils import DisaggregationMode
 
 try:
-    from mf_adapter import TransferEngine
+    from memfabric_hybrid import TransferEngine
 
     import_error = None
 except ImportError as e:
@@ -25,7 +25,7 @@ class AscendTransferEngine(MooncakeTransferEngine):
     ):
         if import_error is not None:
             logger.warning(
-                "Please install mf_adapter, for details, see docs/backend/pd_disaggregation.md"
+                "Please install memfabric_hybrid, for details, see docs/backend/pd_disaggregation.md"
             )
             raise import_error
 
