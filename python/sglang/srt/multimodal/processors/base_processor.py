@@ -21,6 +21,7 @@ from sglang.srt.utils import (
     envs,
     is_cpu,
     is_npu,
+    is_xpu,
     load_audio,
     load_image,
     load_video,
@@ -35,6 +36,7 @@ from sglang.srt.utils.cuda_ipc_transport_utils import (
 
 _is_npu = is_npu()
 _is_cpu = is_cpu()
+_is_xpu = is_xpu()
 
 SGL_USE_CUDA_IPC = envs.SGLANG_USE_CUDA_IPC_TRANSPORT.get()
 
@@ -335,6 +337,8 @@ class BaseMultimodalProcessor(ABC):
                 kwargs["device"] = "npu"
             if _is_cpu:
                 kwargs["device"] = "cpu"
+            elif _is_xpu:
+                kwargs["device"] = "xpu"
         result = processor.__call__(
             text=[input_text],
             padding=True,
