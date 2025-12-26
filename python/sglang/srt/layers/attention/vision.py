@@ -626,7 +626,7 @@ class VisionAttention(nn.Module):
             prefix=add_prefix("proj", prefix),
         )
         self.aux_stream = aux_stream
-        self.ln_events = [torch.cuda.Event(), torch.cuda.Event()]
+        self.ln_events = [torch.cuda.Event(), torch.cuda.Event()] if aux_stream else []
 
     def _determine_attention_backend(self, passed_backend: Optional[str]) -> str:
         """Decide the multimodal attention backend string.
@@ -693,8 +693,7 @@ class VisionAttention(nn.Module):
             q, k = maybe_execute_in_parallel(
                 q_l2norm,
                 k_l2norm,
-                self.ln_events[0],
-                self.ln_events[1],
+                self.ln_events,
                 self.aux_stream,
             )
         return q, k
