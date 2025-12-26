@@ -183,10 +183,28 @@ class Glm47MoeDetector(BaseFormatDetector):
         :param tools: List of available tools.
         :return: ParseResult indicating success or failure, consumed text, leftover text, and parsed calls.
         """
-        idx = text.find(self.bot_token)
-        normal_text = text[:idx].strip() if idx != -1 else text
         if self.bot_token not in text:
-            return StreamingParseResult(normal_text=normal_text, calls=[])
+            return StreamingParseResult(normal_text=text, calls=[])
+
+        # Extract all normal text (before, between, and after tool calls)
+        normal_text_parts = []
+        last_end = 0
+
+        # Find all tool call matches
+        for match in re.finditer(self.func_call_regex, text, re.DOTALL):
+            # Add text before this tool call
+            if match.start() > last_end:
+                normal_text_parts.append(text[last_end : match.start()])
+            last_end = match.end()
+
+        # Add any remaining text after the last tool call
+        if last_end < len(text):
+            normal_text_parts.append(text[last_end:])
+
+        # Combine all normal text parts
+        normal_text = "".join(normal_text_parts).strip()
+
+        # Parse tool calls
         match_result_list = re.findall(self.func_call_regex, text, re.DOTALL)
         calls = []
         try:
