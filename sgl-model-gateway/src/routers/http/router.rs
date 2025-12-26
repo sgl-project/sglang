@@ -141,6 +141,7 @@ impl Router {
         &self,
         model_id: Option<&str>,
         text: Option<&str>,
+        headers: Option<&HeaderMap>,
     ) -> Option<Arc<dyn Worker>> {
         let effective_model_id = if !self.enable_igw { None } else { model_id };
 
@@ -168,7 +169,13 @@ impl Router {
             None => self.policy_registry.get_default_policy(),
         };
 
-        let idx = policy.select_worker(&available, &SelectWorkerInfo { request_text: text })?;
+        let idx = policy.select_worker(
+            &available,
+            &SelectWorkerInfo {
+                request_text: text,
+                headers,
+            },
+        )?;
 
         // Record worker selection metric (Layer 3)
         Metrics::record_worker_selection(
@@ -269,7 +276,7 @@ impl Router {
         is_stream: bool,
         text: &str,
     ) -> Response {
-        let worker = match self.select_worker_for_model(model_id, Some(text)) {
+        let worker = match self.select_worker_for_model(model_id, Some(text), headers) {
             Some(w) => w,
             None => {
                 return error::service_unavailable(

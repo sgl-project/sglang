@@ -460,6 +460,7 @@ mod tests {
                 &workers,
                 &SelectWorkerInfo {
                     request_text: Some("hello world"),
+                    ..Default::default()
                 },
             )
             .unwrap();
@@ -470,6 +471,7 @@ mod tests {
                 &workers,
                 &SelectWorkerInfo {
                     request_text: Some("hello world"),
+                    ..Default::default()
                 },
             )
             .unwrap();
@@ -481,6 +483,7 @@ mod tests {
                 &workers,
                 &SelectWorkerInfo {
                     request_text: Some("hello"),
+                    ..Default::default()
                 },
             )
             .unwrap();
@@ -516,6 +519,7 @@ mod tests {
         // Should select worker2 (lower load) despite cache affinity
         let info = SelectWorkerInfo {
             request_text: Some("test"),
+            ..Default::default()
         };
         for _ in 0..5 {
             let idx = policy.select_worker(&workers, &info).unwrap();
@@ -550,12 +554,14 @@ mod tests {
             &workers,
             &SelectWorkerInfo {
                 request_text: Some("test1"),
+                ..Default::default()
             },
         );
         policy.select_worker(
             &workers,
             &SelectWorkerInfo {
                 request_text: Some("test2"),
+                ..Default::default()
             },
         );
 
@@ -569,6 +575,7 @@ mod tests {
                 &workers,
                 &SelectWorkerInfo {
                     request_text: Some("test1"),
+                    ..Default::default()
                 },
             )
             .unwrap();
