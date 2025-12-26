@@ -236,6 +236,6 @@ def add_common_data_to_response(
     if result.peak_memory_mb and result.peak_memory_mb > 0:
         response["peak_memory_mb"] = result.peak_memory_mb
 
-    response["rid"] = request_id
+    response["id"] = request_id
 
     return response

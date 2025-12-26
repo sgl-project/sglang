@@ -141,7 +141,6 @@ async def generations(
         with open(save_file_path, "rb") as f:
             b64 = base64.b64encode(f.read()).decode("utf-8")
         response_kwargs = {
-            "id": request_id,
             "data": [
                 ImageResponseData(
                     b64_json=b64,
@@ -247,13 +246,11 @@ async def edits(
         with open(save_file_path, "rb") as f:
             b64 = base64.b64encode(f.read()).decode("utf-8")
         response_kwargs = {
-            "id": request_id,
             "data": [ImageResponseData(b64_json=b64, revised_prompt=prompt)],
         }
     else:
         url = f"/v1/images/{request_id}/content"
         response_kwargs = {
-            "id": request_id,
             "data": [ImageResponseData(url=url, revised_prompt=prompt)],
         }
 
