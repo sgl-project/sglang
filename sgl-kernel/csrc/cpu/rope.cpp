@@ -249,23 +249,27 @@ void apply_rotary_pos_emb_kernel_impl(
     }
   };
 
-#pragma omp parallel for
-  for (int64_t token_idx = 0; token_idx < num_tokens; ++token_idx) {
-    float* cos_ptr = cos + token_idx * head_size;
-    float* sin_ptr = sin + token_idx * head_size;
+  at::parallel_for(0, num_tokens, 0, [&](int64_t begin, int64_t end) {
+    int64_t token_idx = {0};
+    data_index_init(begin, token_idx, num_tokens);
+    for (int i = begin; i < end; ++i) {
+      float* cos_ptr = cos + token_idx * head_size;
+      float* sin_ptr = sin + token_idx * head_size;
 
-    for (int64_t i = 0; i < num_heads; ++i) {
-      int64_t head_idx = i;
-      int64_t token_head = token_idx * query_stride_s + head_idx * head_size;
-      compute_loop(token_head, cos_ptr, sin_ptr, query);
-    }
+      for (int64_t i = 0; i < num_heads; ++i) {
+        int64_t head_idx = i;
+        int64_t token_head = token_idx * query_stride_s + head_idx * head_size;
+        compute_loop(token_head, cos_ptr, sin_ptr, query);
+      }
 
-    for (int64_t i = 0; i < num_kv_heads; ++i) {
-      int64_t head_idx = i;
-      int64_t token_head = token_idx * key_stride_s + head_idx * head_size;
-      compute_loop(token_head, cos_ptr, sin_ptr, key);
+      for (int64_t i = 0; i < num_kv_heads; ++i) {
+        int64_t head_idx = i;
+        int64_t token_head = token_idx * key_stride_s + head_idx * head_size;
+        compute_loop(token_head, cos_ptr, sin_ptr, key);
+      }
+      data_index_step(token_idx, num_tokens);
     }
-  }
+  });
 }
 
 template <typename scalar_t>
