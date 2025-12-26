@@ -87,6 +87,7 @@ use crate::core::Worker;
 pub struct CacheAwarePolicy {
     config: CacheAwareConfig,
     trees: Arc<DashMap<String, Arc<Tree>>>,
+    url_to_index: DashMap<String, usize>,
     /// Handle to the background eviction thread
     eviction_handle: Option<thread::JoinHandle<()>>,
     /// Flag to signal the eviction thread to stop
@@ -160,8 +161,13 @@ impl CacheAwarePolicy {
     /// Initialize the tree with worker URLs (used only during initial setup)
     pub fn init_workers(&self, workers: &[Arc<dyn Worker>]) {
         // Group workers by model
+        self.url_to_index.clear();
+        for (idx, worker) in workers.iter().enumerate() {
+            self.url_to_index.insert(worker.url().to_string(), idx);
+        }
         let mut model_workers: std::collections::HashMap<String, Vec<&Arc<dyn Worker>>> =
             std::collections::HashMap::new();
+
         for worker in workers {
             let tree_key = normalize_model_key(worker.model_id());
             model_workers
@@ -345,7 +351,7 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
                 };
 
             // Find the index of the selected worker
-            if let Some(selected_idx) = workers.iter().position(|w| w.url() == &*selected_url) {
+            if let Some(selected_idx) = self.url_to_index.get(&*selected_url).map(|v| *v) {
                 // Only proceed if the worker is healthy
                 if workers[selected_idx].is_healthy() {
                     // Update the tree with this request
