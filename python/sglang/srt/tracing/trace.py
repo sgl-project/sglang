@@ -240,7 +240,9 @@ def process_tracing_init(otlp_endpoint, server_name):
         tracer_provider.add_span_processor(processor)
         trace.set_tracer_provider(tracer_provider)
     except Exception as e:
-        logger.error(f"Initialize OpenTelemetry error: {e}. Please set correct otlp endpoint.")
+        logger.error(
+            f"Initialize OpenTelemetry error: {e}. Please set correct otlp endpoint."
+        )
         tracing_enabled = False
         return
 
