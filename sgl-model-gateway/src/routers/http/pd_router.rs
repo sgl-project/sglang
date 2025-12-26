@@ -19,7 +19,8 @@ use super::pd_types::api_path;
 use crate::{
     config::types::RetryConfig,
     core::{
-        is_retryable_status, RetryExecutor, Worker, WorkerLoadGuard, WorkerRegistry, WorkerType,
+        is_retryable_status, HashRing, RetryExecutor, Worker, WorkerLoadGuard, WorkerRegistry,
+        WorkerType, UNKNOWN_MODEL_ID,
     },
     observability::{
         events::{self, Event},
@@ -731,11 +732,17 @@ impl PDRouter {
         let prefill_policy = self.policy_registry.get_prefill_policy();
         let decode_policy = self.policy_registry.get_decode_policy();
 
+        // Get cached hash ring for consistent hashing
+        let hash_ring = self
+            .worker_registry
+            .get_hash_ring(effective_model_id.unwrap_or(UNKNOWN_MODEL_ID));
+
         let prefill = Self::pick_worker_by_policy_arc(
             &prefill_workers,
             &*prefill_policy,
             request_text,
             headers,
+            hash_ring.clone(),
             "prefill",
         )?;
 
@@ -744,6 +751,7 @@ impl PDRouter {
             &*decode_policy,
             request_text,
             headers,
+            hash_ring,
             "decode",
         )?;
 
@@ -770,6 +778,7 @@ impl PDRouter {
         policy: &dyn LoadBalancingPolicy,
         request_text: Option<&str>,
         headers: Option<&HeaderMap>,
+        hash_ring: Option<Arc<HashRing>>,
         worker_type: &str,
     ) -> Result<Arc<dyn Worker>, String> {
         if workers.is_empty() {
@@ -798,6 +807,7 @@ impl PDRouter {
                 &SelectWorkerInfo {
                     request_text,
                     headers,
+                    hash_ring,
                 },
             )
             .ok_or_else(|| {
