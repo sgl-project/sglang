@@ -21,6 +21,7 @@ def policy_from_str(policy_str: Optional[str]) -> PolicyType:
         "cache_aware": PolicyType.CacheAware,
         "power_of_two": PolicyType.PowerOfTwo,
         "bucket": PolicyType.Bucket,
+        "manual": PolicyType.Manual,
     }
     return policy_map[policy_str]
 
