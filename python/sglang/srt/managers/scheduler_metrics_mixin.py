@@ -48,6 +48,8 @@ class SchedulerMetricsMixin:
         self.num_generated_tokens = 0
         self.last_decode_stats_tic = time.perf_counter()
         self.last_prefill_stats_tic = time.perf_counter()
+        self.last_prefill_tokens = 0
+        self.last_prefill_cache_tokens = 0
         self.last_gen_throughput: float = 0.0
         self.last_input_throughput: float = 0.0
         self.step_time_dict = defaultdict(list)  # Dict[batch size -> step time]
