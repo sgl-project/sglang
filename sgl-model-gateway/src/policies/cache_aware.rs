@@ -101,6 +101,7 @@ impl CacheAwarePolicy {
 
     pub fn with_config(config: CacheAwareConfig) -> Self {
         let trees = Arc::new(DashMap::<String, Arc<Tree>>::new());
+        let url_to_index = DashMap::new();
         let shutdown_flag = Arc::new(AtomicBool::new(false));
 
         // Start background eviction thread if configured
@@ -153,6 +154,7 @@ impl CacheAwarePolicy {
         Self {
             config,
             trees,
+            url_to_index,
             eviction_handle,
             shutdown_flag,
         }
@@ -205,6 +207,7 @@ impl CacheAwarePolicy {
             .entry(model_id.to_string())
             .or_insert_with(|| Arc::new(Tree::new()));
         tree.insert("", url);
+        self.url_to_index.insert(worker.url().to_string(), index);
     }
 
     /// Remove a worker from the tree
@@ -213,6 +216,7 @@ impl CacheAwarePolicy {
         if let Some(tree) = self.trees.get(tree_key) {
             tree.remove_tenant(worker.url());
         }
+        self.url_to_index.remove(worker.url());
     }
 
     /// Remove a worker by URL (removes from all model trees for backward compatibility)
@@ -351,9 +355,10 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
                 };
 
             // Find the index of the selected worker
-            if let Some(selected_idx) = self.url_to_index.get(&*selected_url).map(|v| *v) {
+            if let Some(entry) = self.url_to_index.get(&*selected_url) {
+                let selected_idx = *entry.value();
                 // Only proceed if the worker is healthy
-                if workers[selected_idx].is_healthy() {
+                if selected_idx < workers.len() && workers[selected_idx].is_healthy() {
                     // Update the tree with this request
                     tree.insert(text, &selected_url);
 
