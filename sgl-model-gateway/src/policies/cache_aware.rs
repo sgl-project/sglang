@@ -334,21 +334,19 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
                 matched_text.len() as f32 / text.len() as f32
             };
 
-            let selected_url: &str = if match_rate > self.config.cache_threshold {
-                matched_worker
-            } else {
-                let min_load_idx = *healthy_indices
-                    .iter()
-                    .min_by_key(|&&idx| workers[idx].load())?;
-                workers[min_load_idx].url()
-            };
+            let selected_url: std::borrow::Cow<'_, str> =
+                if match_rate > self.config.cache_threshold {
+                    std::borrow::Cow::Owned(matched_worker)
+                } else {
+                    std::borrow::Cow::Borrowed(workers[min_load_idx].url())
+                };
 
             // Find the index of the selected worker
-            if let Some(selected_idx) = workers.iter().position(|w| w.url() == selected_url) {
+            if let Some(selected_idx) = workers.iter().position(|w| w.url() == &*selected_url) {
                 // Only proceed if the worker is healthy
                 if workers[selected_idx].is_healthy() {
                     // Update the tree with this request
-                    tree.insert(text, selected_url);
+                    tree.insert(text, &selected_url);
 
                     // Increment processed counter
                     workers[selected_idx].increment_processed();
