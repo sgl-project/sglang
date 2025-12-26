@@ -46,7 +46,6 @@ import torch.distributed
 from torch.distributed import ProcessGroup
 
 import sglang.multimodal_gen.envs as envs
-from sglang.multimodal_gen.envs import get_torch_distributed_backend
 from sglang.multimodal_gen.runtime.distributed.utils import StatelessProcessGroup
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
@@ -605,7 +604,7 @@ def maybe_init_distributed_environment_and_model_parallel(
         local_rank=local_rank,
         distributed_init_method=distributed_init_method,
         device_id=device,
-        backend=get_torch_distributed_backend(),
+        backend=current_platform.get_torch_distributed_backend_str(),
     )
     initialize_model_parallel(
         data_parallel_size=dp_size,
