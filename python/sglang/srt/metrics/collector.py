@@ -255,6 +255,7 @@ class DPCooperationInfo:
 
     @staticmethod
     def create(forward_modes: List[int]):
+        print(f"hi DPCooperationInfo.create {forward_modes=}")
         return DPCooperationInfo(
             num_prefill_ranks=sum(
                 1 for mode in forward_modes if mode == ForwardMode.EXTEND.value
