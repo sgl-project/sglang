@@ -338,7 +338,10 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
                 if match_rate > self.config.cache_threshold {
                     std::borrow::Cow::Owned(matched_worker)
                 } else {
-                    std::borrow::Cow::Borrowed(workers[min_load_idx].url())
+                    let min_idx = *healthy_indices
+                        .iter()
+                        .min_by_key(|&&idx| workers[idx].load())?;
+                    std::borrow::Cow::Borrowed(workers[min_idx].url())
                 };
 
             // Find the index of the selected worker
@@ -355,8 +358,8 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
                 }
             } else {
                 // Selected worker no longer exists, remove it from tree
-                tree.remove_tenant(selected_url);
-                debug!("Removed stale worker {} from cache tree", selected_url);
+                tree.remove_tenant(&selected_url);
+                debug!("Removed stale worker {} from cache tree", &selected_url);
             }
 
             // Fallback to first healthy worker
