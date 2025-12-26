@@ -19,6 +19,7 @@ import re
 from functools import lru_cache, partial
 from typing import Callable, Iterable, List, Optional, Tuple, Union
 
+import numpy as np
 import torch
 import torch.nn as nn
 from einops import rearrange
@@ -63,7 +64,7 @@ from sglang.srt.models.utils import (
 from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
 from sglang.srt.multimodal.vit_cuda_graph_runner import ViTCudaGraphRunner
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import add_prefix, get_int_env_var, is_npu
+from sglang.srt.utils import add_prefix, get_bool_env_var, get_int_env_var, is_npu
 from sglang.srt.utils.hf_transformers_utils import get_processor
 
 logger = logging.getLogger(__name__)
@@ -446,12 +447,13 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
 
         # compute cu_seqlens
         cu_seqlens = compute_cu_seqlens_from_grid_numpy(grid_thw)
-        # cu_seqlens must be on cpu because of npu_flash_attention_unpad operator restriction
-        if not is_npu():
-            cu_seqlens = cu_seqlens.to(self.device, non_blocking=True)
-        else:
-            cu_seqlens = cu_seqlens.to("cpu")
+
         x = x.unsqueeze(1)
+        # cu_seqlens must be on cpu because of npu_flash_attention_unpad operator restriction
+        if is_npu():
+            cu_seqlens = cu_seqlens.to("cpu")
+        else:
+            cu_seqlens = cu_seqlens.to(self.device, non_blocking=True)
 
         deepstack_feature_lists = []
         num_deepstack_captured = 0
