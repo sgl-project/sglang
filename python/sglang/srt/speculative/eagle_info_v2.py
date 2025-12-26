@@ -82,9 +82,7 @@ class EagleDraftInputV2Mixin:
     def prepare_for_decode(self: EagleDraftInput, batch: ScheduleBatch):
         if isinstance(batch.tree_cache, SWAChunkCache):
             for req in batch.reqs:
-                batch.tree_cache.evict_swa(
-                    req, req.seqlen - 1, batch.model_config.attention_chunk_size
-                )
+                batch.tree_cache.evict_swa(req, req.seqlen - 1)
 
         from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
 
