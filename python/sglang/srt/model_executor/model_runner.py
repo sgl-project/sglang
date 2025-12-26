@@ -941,6 +941,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.sliding_window_size = None
         if hasattr(self.model, "get_attention_sliding_window_size"):
             self.sliding_window_size = self.model.get_attention_sliding_window_size()
+        elif self.model_config.sliding_window_size is not None:
+            self.sliding_window_size = self.model_config.sliding_window_size
         elif self.model_config.attention_chunk_size is not None:
             self.sliding_window_size = self.model_config.attention_chunk_size
             logger.info(
