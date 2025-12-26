@@ -12,7 +12,7 @@ class TestPrefillAdder(CustomTestCase):
         self.mock_tree_cache = self.create_tree_cache()
         self.mock_token_allocator = self.create_token_allocator()
         patcher = patch(
-            "sglang.srt.managers.schedule_policy.is_nsa_enable_prefill_cp",
+            "sglang.srt.managers.schedule_policy.is_nsa_prefill_cp_in_seq_split",
             return_value=False,
         )
         self.mock_is_nsa = patcher.start()
