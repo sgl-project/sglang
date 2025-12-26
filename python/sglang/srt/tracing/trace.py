@@ -207,7 +207,9 @@ def process_tracing_init(otlp_endpoint, server_name):
     global get_cur_time_ns
     if not opentelemetry_imported:
         opentelemetry_initialized = False
-        raise RuntimeError("opentelemetry package is not installed!!! Please not enable tracing or install opentelemetry")
+        raise RuntimeError(
+            "opentelemetry package is not installed!!! Please not enable tracing or install opentelemetry"
+        )
 
     try:
         resource = Resource.create(
