@@ -207,7 +207,7 @@ impl CacheAwarePolicy {
             .entry(model_id.to_string())
             .or_insert_with(|| Arc::new(Tree::new()));
         tree.insert("", url);
-        self.url_to_index.insert(worker.url().to_string(), index);
+        self.url_to_index.insert(url.to_string(), index);
     }
 
     /// Remove a worker from the tree
