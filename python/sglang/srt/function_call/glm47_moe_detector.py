@@ -40,22 +40,26 @@ def get_argument_type(
         The type string (e.g., 'string', 'number', 'object') or None if not found
     """
     name2tool = {tool.function.name: tool for tool in defined_tools}
-    if func_name not in name2tool:
+
+    # Check if function exists
+    tool = name2tool.get(func_name)
+    if not tool:
         return None
-    tool = name2tool[func_name]
-    # Access parameters with safe attribute access
-    function_obj = tool.function
-    if not hasattr(function_obj, "parameters"):
+
+    # Get parameters safely using getattr
+    params = getattr(tool.function, "parameters", None)
+    if not isinstance(params, dict):
         return None
-    params = function_obj.parameters
-    if params is None:
+
+    # Navigate to the type using dict.get() for safe access
+    properties = params.get("properties")
+    if not isinstance(properties, dict):
         return None
-    # Safely access properties
-    if isinstance(params, dict) and "properties" in params:
-        properties = params["properties"]
-        if isinstance(properties, dict) and arg_key in properties:
-            if isinstance(properties[arg_key], dict) and "type" in properties[arg_key]:
-                return properties[arg_key]["type"]
+
+    arg_spec = properties.get(arg_key)
+    if isinstance(arg_spec, dict):
+        return arg_spec.get("type")
+
     return None
 
 
