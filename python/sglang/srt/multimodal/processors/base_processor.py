@@ -17,7 +17,7 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalDataItem,
     MultimodalInputFormat,
 )
-from sglang.srt.utils import envs, is_npu, load_audio, load_image, load_video, logger
+from sglang.srt.utils import envs, is_npu, is_cpu, load_audio, load_image, load_video, logger
 from sglang.srt.utils.cuda_ipc_transport_utils import (
     MM_FEATURE_CACHE_SIZE,
     MM_ITEM_MEMORY_POOL_RECYCLE_INTERVAL,
@@ -26,6 +26,7 @@ from sglang.srt.utils.cuda_ipc_transport_utils import (
 )
 
 _is_npu = is_npu()
+_is_cpu = is_cpu()
 
 SGL_USE_CUDA_IPC = envs.SGLANG_USE_CUDA_IPC_TRANSPORT.get()
 
@@ -324,6 +325,8 @@ class BaseMultimodalProcessor(ABC):
             }:
                 # Note: for qwen-vl, processor has some reshape issue because of dims restriction on Ascend.
                 kwargs["device"] = "npu"
+            if _is_cpu:
+                kwargs["device"] = "cpu"
         result = processor.__call__(
             text=[input_text],
             padding=True,
