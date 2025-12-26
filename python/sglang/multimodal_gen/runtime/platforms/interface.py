@@ -146,8 +146,7 @@ class Platform:
     @lru_cache(maxsize=1)
     def is_musa(self):
         try:
-            if hasattr(torch, "musa") and torch.musa.is_available():
-                return True
+            return hasattr(torch, "musa") and torch.musa.is_available()
         except ModuleNotFoundError:
             return False
 
@@ -214,7 +213,7 @@ class Platform:
 
     @lru_cache(maxsize=1)
     def get_device(self, local_rank: int) -> torch.device:
-        if torch.cuda.is_available():
+        if self.is_cuda() or self.is_rocm():
             return torch.device("cuda", local_rank)
         elif self.is_musa():
             return torch.device("musa", local_rank)
@@ -225,7 +224,7 @@ class Platform:
 
     @lru_cache(maxsize=1)
     def get_torch_distributed_backend_str(self) -> str:
-        if self.is_cuda():
+        if self.is_cuda() or self.is_rocm():
             return "nccl"
         elif self.is_musa():
             return "mccl"

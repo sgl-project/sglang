@@ -3,16 +3,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # Adapted from vllm: https://github.com/vllm-project/vllm/blob/v0.7.3/vllm/envs.py
 
-import importlib.util
 import logging
 import os
 from typing import TYPE_CHECKING, Any, Callable
 
-import diffusers
-import torch
-from packaging import version
-
-from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.common import get_bool_env_var
 
 logger = logging.getLogger(__name__)
@@ -61,76 +55,6 @@ if TYPE_CHECKING:
     SGLANG_CACHE_DIT_SECONDARY_TS_ORDER: int = 1
     # model loading
     SGLANG_USE_RUNAI_MODEL_STREAMER: bool = True
-
-
-class PackagesEnvChecker:
-    def __init__(self):
-        self.packages_info = {
-            "has_aiter": self.check_aiter(),
-            "diffusers_version": self.check_diffusers_version(),
-        }
-
-    def check_aiter(self):
-        """
-        Checks whether ROCm AITER library is installed
-        """
-        try:
-            logger.info("Using AITER as the attention library")
-            return True
-        except Exception:
-            if current_platform.is_hip():
-                logger.warning(
-                    'Using AMD GPUs, but library "aiter" is not installed, '
-                    "defaulting to other attention mechanisms"
-                )
-            return False
-
-    def check_flash_attn(self):
-        if not torch.cuda.is_available():
-            return False
-        if current_platform.is_musa():
-            logger.info(
-                "Flash Attention library is not supported on MUSA for the moment."
-            )
-            return False
-        try:
-            return True
-        except ImportError:
-            logger.warning(
-                'Flash Attention library "flash_attn" not found, '
-                "using pytorch attention implementation"
-            )
-            return False
-
-    def check_long_ctx_attn(self):
-        if not torch.cuda.is_available():
-            return False
-        try:
-            return importlib.util.find_spec("yunchang") is not None
-        except ImportError:
-            logger.warning(
-                'Ring Flash Attention library "yunchang" not found, '
-                "using pytorch attention implementation"
-            )
-            return False
-
-    def check_diffusers_version(self):
-        current_version = version.parse(
-            version.parse(diffusers.__version__).base_version
-        )
-        min_version = version.parse("0.30.0")
-        if current_version < min_version:
-            raise RuntimeError(
-                f"Diffusers version: {current_version} is not supported, "
-                f"please upgrade to version > 0.30.0"
-            )
-        return current_version
-
-    def get_packages_info(self):
-        return self.packages_info
-
-
-PACKAGES_CHECKER = PackagesEnvChecker()
 
 
 def get_default_cache_root() -> str:
