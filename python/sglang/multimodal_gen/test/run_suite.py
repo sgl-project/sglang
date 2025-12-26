@@ -67,6 +67,12 @@ def parse_args():
         default=None,
         help="Pytest filter expression (passed to pytest -k)",
     )
+    parser.add_argument(
+        "--continue-on-error",
+        action="store_true",
+        default=False,
+        help="Continue running remaining tests even if one fails (for CI consistency; pytest already continues by default)",
+    )
     return parser.parse_args()
 
 
@@ -99,7 +105,7 @@ def run_pytest(files, filter_expr=None):
         print("No files to run.")
         return 0
 
-    base_cmd = [sys.executable, "-m", "pytest", "-s", "-v", "--log-cli-level=INFO"]
+    base_cmd = [sys.executable, "-m", "pytest", "-s", "-v"]
 
     # Add pytest -k filter if provided
     if filter_expr:
@@ -124,20 +130,20 @@ def run_pytest(files, filter_expr=None):
             cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
+            bufsize=0,
         )
 
-        output_lines = []
+        output_bytes = bytearray()
         while True:
-            line = process.stdout.readline()
-            if not line and process.poll() is not None:
+            chunk = process.stdout.read(4096)
+            if not chunk:
                 break
-            if line:
-                sys.stdout.write(line)
-                output_lines.append(line)
+            sys.stdout.buffer.write(chunk)
+            sys.stdout.buffer.flush()
+            output_bytes.extend(chunk)
 
-        returncode = process.poll()
+        process.wait()
+        returncode = process.returncode
 
         if returncode == 0:
             return 0
@@ -152,7 +158,7 @@ def run_pytest(files, filter_expr=None):
             return 0
 
         # check if the failure is due to an assertion in test_server_utils.py
-        full_output = "".join(output_lines)
+        full_output = output_bytes.decode("utf-8", errors="replace")
         is_perf_assertion = (
             "multimodal_gen/test/server/test_server_utils.py" in full_output
             and "AssertionError" in full_output

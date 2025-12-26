@@ -23,7 +23,7 @@ from openai import Client, OpenAI
 from sglang.multimodal_gen.benchmarks.compare_perf import calculate_upper_bound
 from sglang.multimodal_gen.runtime.utils.common import is_hip, kill_process_tree
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
-    global_suppress_loggers,
+    globally_suppress_loggers,
     init_logger,
 )
 from sglang.multimodal_gen.runtime.utils.perf_logger import RequestPerfRecord
@@ -35,15 +35,18 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
 )
 from sglang.multimodal_gen.test.slack_utils import upload_file_to_slack
 from sglang.multimodal_gen.test.test_utils import (
+    get_expected_image_format,
     is_image_url,
     prepare_perf_log,
     validate_image,
+    validate_image_file,
     validate_openai_video,
+    validate_video_file,
 )
 
 logger = init_logger(__name__)
 
-global_suppress_loggers()
+globally_suppress_loggers()
 
 
 def download_image_from_url(url: str) -> Path:
@@ -75,6 +78,49 @@ def download_image_from_url(url: str) -> Path:
     except Exception as e:
         logger.error(f"Failed to download image from {url}: {e}")
         raise
+
+
+def parse_dimensions(size_string: str | None) -> tuple[int | None, int | None]:
+    """Parse a size string in "widthxheight" format to (width, height) tuple.
+
+    Args:
+        size_string: Size string in "widthxheight" format (e.g., "1024x1024") or None.
+                    Spaces are automatically stripped.
+
+    Returns:
+        Tuple of (width, height) as integers if parsing succeeds, (None, None) otherwise.
+    """
+    if not size_string:
+        return (None, None)
+
+    # Strip spaces from the entire string
+    size_string = size_string.strip()
+    if not size_string:
+        return (None, None)
+
+    # Split by "x"
+    parts = size_string.split("x")
+    if len(parts) != 2:
+        return (None, None)
+
+    # Strip spaces from each part and try to convert to int
+    try:
+        width_str = parts[0].strip()
+        height_str = parts[1].strip()
+
+        if not width_str or not height_str:
+            return (None, None)
+
+        width = int(width_str)
+        height = int(height_str)
+
+        # Validate that both are positive
+        if width <= 0 or height <= 0:
+            return (None, None)
+
+        return (width, height)
+    except ValueError:
+        return (None, None)
 
 
 @dataclass
@@ -322,6 +368,7 @@ class ServerManager:
                     with pipe:
                         for line in iter(pipe.readline, ""):
                             sys.stdout.write(line)
+                            sys.stdout.flush()
                             file.write(line)
                             file.flush()
                 except Exception as e:
@@ -360,6 +407,8 @@ class ServerManager:
         """Wait for server to become ready."""
         start = time.time()
         ready_message = "Application startup complete."
+        log_period = 30
+        prev_log_period_count = 0
 
         while time.time() - start < self.wait_deadline:
             if process.poll() is not None:
@@ -378,8 +427,10 @@ class ServerManager:
                     logger.debug("Could not read log yet: %s", e)
 
             elapsed = int(time.time() - start)
-            logger.info("[server-test] Waiting for server... elapsed=%ss", elapsed)
-            time.sleep(5)
+            if (elapsed // log_period) > prev_log_period_count:
+                prev_log_period_count = elapsed // log_period
+                logger.info("[server-test] Waiting for server... elapsed=%ss", elapsed)
+            time.sleep(1)
 
         tail = self._get_log_tail(stdout_path)
         raise TimeoutError(f"Server not ready within {self.wait_deadline}s.\n{tail}")
@@ -747,9 +798,17 @@ def get_generate_fn(
         content = resp.read()
         validate_openai_video(content)
 
-        tmp_path = f"{video_id}.mp4"
+        expected_filename = f"{video_id}.mp4"
+        tmp_path = expected_filename
         with open(tmp_path, "wb") as f:
             f.write(content)
+
+        # Validate output file
+        expected_width, expected_height = parse_dimensions(size)
+        validate_video_file(
+            tmp_path, expected_filename, expected_width, expected_height
+        )
+
         upload_file_to_slack(
             case_id=case_id,
             model=model_path,
@@ -768,6 +827,10 @@ def get_generate_fn(
         if not sampling_params.prompt:
             pytest.skip(f"{id}: no text prompt configured")
 
+        # Request parameters that affect output format
+        req_output_format = None  # Not specified in current request
+        req_background = None  # Not specified in current request
+
         response = client.images.with_raw_response.generate(
             model=model_path,
             prompt=sampling_params.prompt,
@@ -779,9 +842,24 @@ def get_generate_fn(
         validate_image(result.data[0].b64_json)
 
         img_data = base64.b64decode(result.data[0].b64_json)
-        tmp_path = f"{result.created}.png"
+        # Infer expected format from request parameters
+        expected_ext = get_expected_image_format(req_output_format, req_background)
+        expected_filename = f"{result.created}.{expected_ext}"
+        tmp_path = expected_filename
         with open(tmp_path, "wb") as f:
             f.write(img_data)
+
+        # Validate output file
+        expected_width, expected_height = parse_dimensions(output_size)
+        validate_image_file(
+            tmp_path,
+            expected_filename,
+            expected_width,
+            expected_height,
+            output_format=req_output_format,
+            background=req_background,
+        )
+
         upload_file_to_slack(
             case_id=case_id,
             model=model_path,
@@ -813,6 +891,10 @@ def get_generate_fn(
 
         image_paths = new_image_paths
 
+        # Request parameters that affect output format
+        req_output_format = None  # Not specified in current request
+        req_background = None  # Not specified in current request
+
         images = [open(image_path, "rb") for image_path in image_paths]
         try:
             response = client.images.with_raw_response.edit(
@@ -833,9 +915,24 @@ def get_generate_fn(
         validate_image(result.data[0].b64_json)
 
         img_data = base64.b64decode(result.data[0].b64_json)
-        tmp_path = f"{rid}.png"
+        # Infer expected format from request parameters
+        expected_ext = get_expected_image_format(req_output_format, req_background)
+        expected_filename = f"{rid}.{expected_ext}"
+        tmp_path = expected_filename
         with open(tmp_path, "wb") as f:
             f.write(img_data)
+
+        # Validate output file
+        expected_width, expected_height = parse_dimensions(output_size)
+        validate_image_file(
+            tmp_path,
+            expected_filename,
+            expected_width,
+            expected_height,
+            output_format=req_output_format,
+            background=req_background,
+        )
+
         upload_file_to_slack(
             case_id=case_id,
             model=model_path,
@@ -864,6 +961,10 @@ def get_generate_fn(
                     f"{id}: image_path must be a URL for URL direct test: {url}"
                 )
 
+        # Request parameters that affect output format
+        req_output_format = None  # Not specified in current request
+        req_background = None  # Not specified in current request
+
         response = client.images.with_raw_response.edit(
             model=model_path,
             prompt=sampling_params.prompt,
@@ -880,9 +981,24 @@ def get_generate_fn(
 
         # Save and upload result for verification
         img_data = base64.b64decode(result.data[0].b64_json)
-        tmp_path = f"{rid}.png"
+        # Infer expected format from request parameters
+        expected_ext = get_expected_image_format(req_output_format, req_background)
+        expected_filename = f"{rid}.{expected_ext}"
+        tmp_path = expected_filename
         with open(tmp_path, "wb") as f:
             f.write(img_data)
+
+        # Validate output file
+        expected_width, expected_height = parse_dimensions(sampling_params.output_size)
+        validate_image_file(
+            tmp_path,
+            expected_filename,
+            expected_width,
+            expected_height,
+            output_format=req_output_format,
+            background=req_background,
+        )
+
         upload_file_to_slack(
             case_id=case_id,
             model=model_path,
