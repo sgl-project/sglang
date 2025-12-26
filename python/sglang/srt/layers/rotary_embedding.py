@@ -297,31 +297,23 @@ class RotaryEmbedding(CustomOp):
 
         if query.dtype == torch.bfloat16 and self.cos_sin_cache.dtype == torch.float:
             return self.forward_native(positions, query, key, offsets)
-        if self.head_size == 128:
-            self.get_cos_sin_with_position(positions)
-            query = query.contiguous().view(query.shape[0], 1, -1, self.head_size)
-            key = key.contiguous().view(key.shape[0], 1, -1, self.head_size)
-            torch_npu.npu_apply_rotary_pos_emb(
-                query, key, self.position_cos, self.position_sin
-            )
-            return query, key
-        else:
+
+        rotary_mode = "half"
+        if self.is_neox_style:
             rotary_mode = "half"
-            if self.is_neox_style:
-                rotary_mode = "half"
-            else:
-                rotary_mode = "interleave"
-            mrope_section = [0, 0, 0]
-            query_out, key_out = torch_npu.npu_mrope(
-                positions,
-                query,
-                key,
-                self.cos_sin_cache,
-                self.head_size,
-                mrope_section=mrope_section,
-                rotary_mode=rotary_mode,
-            )
-            return query_out, key_out
+        else:
+            rotary_mode = "interleave"
+        mrope_section = [0, 0, 0]
+        query_out, key_out = torch_npu.npu_mrope(
+            positions,
+            query,
+            key,
+            self.cos_sin_cache,
+            self.head_size,
+            mrope_section=mrope_section,
+            rotary_mode=rotary_mode,
+        )
+        return query_out, key_out
 
     def forward_cpu(
         self,
