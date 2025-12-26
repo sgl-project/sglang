@@ -8,16 +8,20 @@ from pathlib import Path
 
 from sglang.srt.environ import envs
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.utils import get_numa_node
 
 logger = logging.getLogger(__name__)
 
 
 @contextmanager
 def configure_subprocess(server_args: ServerArgs, gpu_id: int):
-    if (
-        numa_nodes := server_args.numa_node
-    ) is not None and envs.SGLANG_NUMA_BIND_V2.get():
+    numa_node = None
+    if (numa_nodes := server_args.numa_node) is not None:
         numa_node = numa_nodes[gpu_id]
+    elif envs.SGLANG_AUTO_NUMA_BIND.get():
+        numa_node = get_numa_node(gpu_id)
+
+    if numa_node is not None and envs.SGLANG_NUMA_BIND_V2.get():
         numactl_args = f"--cpunodebind={numa_node} --membind={numa_node}"
         executable, debug_str = _create_numactl_executable(numactl_args=numactl_args)
         with _mp_set_executable(executable=executable, debug_str=debug_str):
