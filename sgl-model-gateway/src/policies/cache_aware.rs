@@ -242,16 +242,16 @@ impl CacheAwarePolicy {
     ) -> Option<usize> {
         // Log load balancing trigger
         // TODO may use `&str`
-        let worker_loads: Vec<(String, usize)> = workers
-            .iter()
-            .map(|w| (w.url().to_string(), w.load()))
-            .collect();
-
-        // TODO may change text
-        debug!(
-            "Load balancing triggered | max: {} | min: {} | workers: {:?}",
-            max_load, min_load, worker_loads
-        );
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            let worker_loads: Vec<(String, usize)> = workers
+                .iter()
+                .map(|w| (w.url().to_string(), w.load()))
+                .collect();
+            debug!(
+                "Load balancing triggered | max: {} | min: {} | workers: {:?}",
+                max_load, min_load, worker_loads
+            )
+        }
 
         // Use shortest queue when imbalanced
         let min_load_idx = healthy_indices
@@ -331,11 +331,11 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
             let match_rate = if text.is_empty() {
                 0.0
             } else {
-                matched_text.chars().count() as f32 / text.chars().count() as f32
+                matched_text.len() as f32 / text.len() as f32
             };
 
-            let selected_url = if match_rate > self.config.cache_threshold {
-                matched_worker.to_string()
+            let selected_url: &str = if match_rate > self.config.cache_threshold {
+                matched_worker_url
             } else {
                 let min_load_idx = *healthy_indices
                     .iter()

@@ -1,7 +1,10 @@
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
-use sgl_model_gateway::policies::{CacheAwarePolicy, CacheAwareConfig, LoadBalancingPolicy, SelectWorkerInfo};
-use sgl_model_gateway::core::{Worker, BasicWorkerBuilder, WorkerType, ModelCard};
 use std::sync::Arc;
+
+use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use sgl_model_gateway::{
+    core::{BasicWorkerBuilder, ModelCard, Worker, WorkerType},
+    policies::{CacheAwareConfig, CacheAwarePolicy, LoadBalancingPolicy, SelectWorkerInfo},
+};
 
 fn bench_cache_aware_selection(c: &mut Criterion) {
     // 1. Setup Configuration
@@ -43,10 +46,7 @@ fn bench_cache_aware_selection(c: &mut Criterion) {
     group.bench_function("cache_aware_selection_50_workers", |b| {
         b.iter(|| {
             // Measure the performance of the selection decision
-            let _Result = policy.select_worker(
-                black_box(&workers),
-                black_box(&info)
-            );
+            let _Result = policy.select_worker(black_box(&workers), black_box(&info));
         })
     });
 
