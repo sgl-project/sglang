@@ -1,18 +1,22 @@
 from __future__ import annotations
 
-import functools
 import logging
 from typing import TYPE_CHECKING
 
 import torch
 
-from sglang.jit_kernel.utils import is_arch_support_pdl, load_jit, make_cpp_args
+from sglang.jit_kernel.utils import (
+    cache_once,
+    is_arch_support_pdl,
+    load_jit,
+    make_cpp_args,
+)
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
 
 
-@functools.cache
+@cache_once
 def _jit_norm_module(head_dims: int) -> Module:
     args = make_cpp_args(head_dims, is_arch_support_pdl())
     return load_jit(
@@ -23,7 +27,7 @@ def _jit_norm_module(head_dims: int) -> Module:
     )
 
 
-@functools.cache
+@cache_once
 def can_use_fused_inplace_qknorm(head_dim: int) -> bool:
     logger = logging.getLogger(__name__)
     if head_dim not in [64, 128, 256]:

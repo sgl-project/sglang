@@ -22,6 +22,7 @@ import numpy as np
 import torch
 
 from sglang.jit_kernel.norm import can_use_fused_inplace_qknorm, fused_inplace_qknorm
+from sglang.jit_kernel.utils import register_jit_op
 from sglang.srt.environ import envs
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -261,3 +262,7 @@ def apply_qk_norm(
     q = q_by_head.view(q.shape)
     k = k_by_head.view(k.shape)
     return q, k
+
+
+# Register the inplace op
+fused_inplace_qknorm = register_jit_op(fused_inplace_qknorm, out_args=["q", "k"])
