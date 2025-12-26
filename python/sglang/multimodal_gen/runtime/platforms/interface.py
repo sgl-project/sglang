@@ -223,7 +223,7 @@ class Platform:
 
     @lru_cache(maxsize=1)
     def get_torch_distributed_backend_str(self) -> str:
-        if self.is_cuda() or self.is_rocm():
+        if self.is_cuda_alike():
             return "nccl"
         elif self.is_musa():
             return "mccl"
