@@ -428,6 +428,9 @@ class Envs:
     # TokenizerManager
     SGLANG_REQUEST_STATE_WAIT_TIMEOUT = EnvInt(4)
 
+    # Attention
+    SGLANG_USE_PAGED_ATTENTION = EnvBool(False)
+
     # fmt: on
 
 
