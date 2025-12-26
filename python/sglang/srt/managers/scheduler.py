@@ -1554,10 +1554,82 @@ class Scheduler(
             or req.sampling_params.ebnf is not None
             or req.sampling_params.structural_tag is not None
         ):
-            if self.grammar_backend is None:
-                error_msg = "Grammar-based generation (json_schema, regex, ebnf, structural_tag) is not supported when the server is launched with --grammar-backend none"
-                req.set_finish_with_abort(error_msg)
+            # Normal decode: entry rank compiles then broadcasts a small decision.
+            if self.spec_algorithm.is_none():
+                decision = None
+                if self.is_entry_rank:
+                    if self.grammar_backend is None:
+                        error_msg = "Grammar constraints require a grammar backend; please launch without --grammar-backend none."
+                        decision = ("abort", error_msg, None, False)
+                    else:
+                        key = self._choose_grammar_key(req.sampling_params)
+
+                        value, cache_hit = self.grammar_backend.get_cached_or_future_value(
+                            key, req.require_reasoning
+                        )
+                        req.grammar = value
+
+                        if not cache_hit:
+                            req.grammar_key = key
+                            add_to_grammar_queue = True
+                            decision = ("ok_queue", None, key)
+                        else:
+                            if value is INVALID_GRAMMAR_OBJ:
+                                error_msg = f"Invalid grammar request with cache hit: {key=}"
+                                req.set_finish_with_abort(error_msg)
+                                decision = ("abort", error_msg, key, False)
+                            else:
+                                decision = ("ok_cache", None, key)
+
+                # Broadcast entry rank decision
+                decision = broadcast_pyobj(
+                    decision,
+                    self.cpu_group.rank,
+                    self.cpu_group,
+                    src=self.entry_rank,
+                )
+
+                # Non-entry ranks apply the decision without compiling.
+                if not self.is_entry_rank:
+                    state = decision[0]
+                    if state == "abort":
+                        _, error_msg, _, _ = decision
+                        req.set_finish_with_abort(error_msg)
+                    elif state == "ok_queue":
+                        _, _, grammar_key = decision
+                        req.grammar_key = grammar_key
+                        add_to_grammar_queue = True
+                        req.grammar = None  # rank 0 owns compilation
+                    elif state == "ok_cache":
+                        _, _, grammar_key = decision
+                        req.grammar_key = grammar_key
+                        # Use sentinel to keep control flow; no local compilation.
+                        req.grammar = INVALID_GRAMMAR_OBJ
+
             else:
+                # Speculative decode or fallback: symmetric behavior.
+                if self.grammar_backend is None:
+                    error_msg = "Grammar constraints require a grammar backend; please launch without --grammar-backend none."
+                    req.set_finish_with_abort(error_msg)
+                else:
+                    key = self._choose_grammar_key(req.sampling_params)
+
+                    value, cache_hit = self.grammar_backend.get_cached_or_future_value(
+                        key, req.require_reasoning
+                    )
+                    req.grammar = value
+
+                    if not cache_hit:
+                        req.grammar_key = key
+                        add_to_grammar_queue = True
+                    elif value is INVALID_GRAMMAR_OBJ:  # We hit a cached invalid grammar.
+                        error_msg = f"Invalid grammar request with cache hit: {key=}"
+                        req.set_finish_with_abort(error_msg)
+
+        if add_to_grammar_queue:
+            self.grammar_queue.append(req)
+        else:
+            self._add_request_to_queue(req)
                 if req.sampling_params.json_schema is not None:
                     key = ("json", req.sampling_params.json_schema)
                 elif req.sampling_params.regex is not None:
@@ -2401,6 +2473,15 @@ class Scheduler(
     def flush_cache_wrapped(self, recv_req: FlushCacheReqInput):
         success = self.flush_cache()
         return FlushCacheReqOutput(success=success)
+
+    def _choose_grammar_key(self, sampling_params: SamplingParams):
+        if sampling_params.json_schema is not None:
+            return ("json", sampling_params.json_schema)
+        if sampling_params.regex is not None:
+            return ("regex", sampling_params.regex)
+        if sampling_params.ebnf is not None:
+            return ("ebnf", sampling_params.ebnf)
+        return ("structural_tag", sampling_params.structural_tag)
 
     def clear_hicache_storage_wrapped(self, recv_req: ClearHiCacheReqInput):
         if self.enable_hierarchical_cache:
