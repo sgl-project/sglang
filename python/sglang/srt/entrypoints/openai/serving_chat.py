@@ -812,6 +812,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     finish_reason,
                     request.tool_choice,
                     history_tool_calls_cnt,
+                    parallel_tool_calls=request.parallel_tool_calls,
                 )
 
             choice_data = ChatCompletionResponseChoice(
@@ -928,8 +929,14 @@ class OpenAIServingChat(OpenAIServingBase):
         finish_reason: Dict[str, Any],
         tool_choice: Optional[Union[str, ToolChoice]] = None,
         history_tool_calls_cnt: int = 0,
+        parallel_tool_calls: bool = True,
     ) -> ToolCallProcessingResult:
-        """Process tool calls in the response"""
+        """Process tool calls in the response
+
+        Args:
+            parallel_tool_calls: If False, only the first tool call is returned.
+                This enforces sequential tool execution as per OpenAI API spec.
+        """
 
         # Handle required or named tool choice
         if tool_choice == "required" or (
@@ -965,6 +972,9 @@ class OpenAIServingChat(OpenAIServingBase):
                             ),
                         )
                     )
+                # Enforce parallel_tool_calls=False by keeping only the first tool call
+                if not parallel_tool_calls and len(tool_calls) > 1:
+                    tool_calls = tool_calls[:1]
                 return ToolCallProcessingResult(tool_calls, "", finish_reason)
             except json.JSONDecodeError as e:
                 logger.error(f"Tool call parsing error: {e}")
@@ -992,6 +1002,9 @@ class OpenAIServingChat(OpenAIServingBase):
                             ),
                         )
                     )
+                # Enforce parallel_tool_calls=False by keeping only the first tool call
+                if not parallel_tool_calls and len(tool_calls) > 1:
+                    tool_calls = tool_calls[:1]
                 return ToolCallProcessingResult(tool_calls, text, finish_reason)
             except Exception as e:
                 logger.error(f"Tool call parsing error: {e}")
@@ -1134,6 +1147,11 @@ class OpenAIServingChat(OpenAIServingBase):
         # Yield tool calls
         history_tool_calls_cnt = self._get_history_tool_calls_cnt(request)
         for call_item in calls:
+            # Enforce parallel_tool_calls=False by only yielding the first tool call (tool_index == 0)
+            tool_idx = getattr(call_item, "tool_index", 0) or 0
+            if not request.parallel_tool_calls and tool_idx > 0:
+                continue
+
             # Mark that this choice has tool calls
             has_tool_calls[index] = True
 
