@@ -53,7 +53,7 @@ def run_sgl_diffusion_webui(server_args: ServerArgs):
         ):
             if "，" in reference_image_paths_str:
                 print(
-                    f"Warning: Chinese comma is not supported in reference image paths, and it will be replaced with English comma. The reference image paths is: {reference_image_paths_str}"
+                    f"Warning: please use English comma to separate the reference image paths, and the reference image paths is: {reference_image_paths_str}"
                 )
                 reference_image_paths_str = reference_image_paths_str.replace("，", ",")
             image_path = [path.strip() for path in reference_image_paths_str.split(",")]
