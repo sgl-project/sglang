@@ -396,6 +396,8 @@ class FusedMoE(torch.nn.Module):
             start = 0
 
         if _is_cpu:
+            if loaded_weight.dim() == 2:
+                shard_dim = 1
             expert_data, loaded_weight = narrow_padded_param_and_loaded_weight(
                 expert_data,
                 loaded_weight,
@@ -465,6 +467,9 @@ class FusedMoE(torch.nn.Module):
             shard_size = expert_data.shape[shard_dim]
 
         if _is_cpu:
+
+            if loaded_weight.dim() == 2:
+                shard_dim = 1
             expert_data, loaded_weight = narrow_padded_param_and_loaded_weight(
                 expert_data,
                 loaded_weight,
