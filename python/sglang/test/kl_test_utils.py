@@ -1,6 +1,7 @@
 import inspect
 import json
 import os
+import random
 
 import numpy as np
 import requests
@@ -79,8 +80,9 @@ def get_input_ids(
             break
         text = format_longbench_v2_example(example)
         tokens = tokenizer.encode(text)
-        # Truncate to max_tokens
-        input_ids.append(tokens[:max_prompt_tokens])
+        # Truncate to a random length between 0.5x and 1.5x of max_prompt_tokens
+        truncate_len = int(max_prompt_tokens * random.uniform(0.5, 1.5))
+        input_ids.append(tokens[:truncate_len])
 
     # Save to local cache
     with open(cache_file, "w") as f:

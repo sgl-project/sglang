@@ -4,7 +4,9 @@ python3 -m unittest test_vision_chunked_prefill.TestVisionChunkedPrefill.test_ch
 """
 
 import io
+import logging
 import os
+import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from typing import Union
@@ -22,6 +24,13 @@ from sglang.test.test_utils import (
     calculate_rouge_l,
     popen_launch_server,
 )
+
+# Configure logging to help diagnose CI timeouts
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+)
+logger = logging.getLogger(__name__)
 
 
 class TestVisionChunkedPrefill(CustomTestCase):
@@ -81,6 +90,9 @@ class TestVisionChunkedPrefill(CustomTestCase):
         return text, image_data
 
     def generate(self, text, image_data):
+        num_images = len(image_data) if image_data else 0
+        logger.info(f"Starting generate request with {num_images} images")
+        start_time = time.time()
         response = requests.post(
             self.base_url + "/generate",
             json={
@@ -94,28 +106,45 @@ class TestVisionChunkedPrefill(CustomTestCase):
                 },
                 "modalities": ["multi-images"],
             },
+            timeout=120,  # Add timeout to prevent hanging indefinitely
         ).json()
+        elapsed = time.time() - start_time
+        logger.info(f"Generate request completed in {elapsed:.2f}s")
         return response["text"]
 
     def generate_for_video(self, batch, num_frame) -> Union[str, list[str]]:
+        logger.info(
+            f"generate_for_video called with batch={batch}, num_frame={num_frame}"
+        )
+
         # prepare the video input about Steven introducing ipod nano
         url = "https://raw.githubusercontent.com/evolvinglmms-lab/sglang/dev/onevision_local/assets/jobs.mp4"
         cache_dir = os.path.expanduser("~/.cache")
         file_path = os.path.join(cache_dir, "jobs.mp4")
         os.makedirs(cache_dir, exist_ok=True)
         if not os.path.exists(file_path):
-            response = requests.get(url)
+            logger.info(f"Downloading video from {url}")
+            start_time = time.time()
+            response = requests.get(url, timeout=60)
             response.raise_for_status()
             with open(file_path, "wb") as f:
                 f.write(response.content)
+            elapsed = time.time() - start_time
+            logger.info(
+                f"Video downloaded in {elapsed:.2f}s, size={len(response.content)} bytes"
+            )
+        else:
+            logger.info(f"Using cached video at {file_path}")
 
         if not batch:
             assert isinstance(num_frame, int)
+            logger.info(f"Processing single video with {num_frame} frames")
             messages = self.prepare_video_messages(file_path, max_frames_num=num_frame)
             text, image_data = self.get_prompt_from_messages(messages)
             return self.generate(text, image_data)
         else:
             assert isinstance(num_frame, list)
+            logger.info(f"Processing batch of videos with frame counts: {num_frame}")
             func_args = []
             for max_frames_num in num_frame:
                 messages = self.prepare_video_messages(
@@ -125,8 +154,10 @@ class TestVisionChunkedPrefill(CustomTestCase):
                 text, image_data = self.get_prompt_from_messages(messages)
                 func_args.append((text, image_data))
 
+            logger.info(f"Starting batch generation with {len(func_args)} requests")
             with ThreadPoolExecutor(max_workers=10) as executor:
                 responses = list(executor.map(lambda p: self.generate(*p), func_args))
+            logger.info(f"Batch generation completed")
 
             return responses
 
@@ -147,30 +178,46 @@ class TestVisionChunkedPrefill(CustomTestCase):
         return process.pid
 
     def _test_chunked_prefill(self, batches, num_frames):
+        logger.info("=" * 60)
+        logger.info("Starting chunked prefill test")
+        logger.info("=" * 60)
+
         # Chunked
+        logger.info("Phase 1: Testing with chunked_prefill_size=1024")
         chunked_server_pid = self.launch_server(chunked_prefill_size=1024)
+        logger.info(f"Chunked server started with pid={chunked_server_pid}")
         try:
             outputs_chunked = []
-            for batch, num_frame in zip(batches, num_frames):
+            for i, (batch, num_frame) in enumerate(zip(batches, num_frames)):
+                logger.info(f"Chunked test iteration {i+1}/{len(batches)}")
                 output_chunked = self.generate_for_video(
                     batch=batch, num_frame=num_frame
                 )
                 outputs_chunked += [output_chunked]
+                logger.info(f"Chunked test iteration {i+1} completed")
         finally:
+            logger.info(f"Killing chunked server pid={chunked_server_pid}")
             kill_process_tree(chunked_server_pid)
+            logger.info("Chunked server killed")
 
         # None-chunked
+        logger.info("Phase 2: Testing with chunked_prefill_size=-1 (no chunking)")
         try:
             no_chunked_server_pid = self.launch_server(chunked_prefill_size=-1)
+            logger.info(f"Non-chunked server started with pid={no_chunked_server_pid}")
             outputs_no_chunked = []
-            for batch, num_frame in zip(batches, num_frames):
+            for i, (batch, num_frame) in enumerate(zip(batches, num_frames)):
+                logger.info(f"Non-chunked test iteration {i+1}/{len(batches)}")
                 output_no_chunked = self.generate_for_video(
                     batch=batch, num_frame=num_frame
                 )
                 outputs_no_chunked += [output_no_chunked]
+                logger.info(f"Non-chunked test iteration {i+1} completed")
 
         finally:
+            logger.info(f"Killing non-chunked server pid={no_chunked_server_pid}")
             kill_process_tree(no_chunked_server_pid)
+            logger.info("Non-chunked server killed")
 
         for output_chunked, output_no_chunked in zip(
             outputs_chunked, outputs_no_chunked

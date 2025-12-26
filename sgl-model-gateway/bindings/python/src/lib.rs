@@ -12,6 +12,7 @@ pub enum PolicyType {
     CacheAware,
     PowerOfTwo,
     Bucket,
+    Manual,
 }
 
 #[pyclass(eq)]
@@ -179,6 +180,7 @@ struct Router {
     prometheus_host: Option<String>,
     prometheus_duration_buckets: Option<Vec<f64>>,
     request_timeout_secs: u64,
+    shutdown_grace_period_secs: u64,
     request_id_headers: Option<Vec<String>>,
     pd_disaggregation: bool,
     bucket_adjust_interval_secs: usize,
@@ -266,6 +268,7 @@ impl Router {
                     balance_rel_threshold: self.balance_rel_threshold,
                     bucket_adjust_interval_secs: self.bucket_adjust_interval_secs,
                 },
+                PolicyType::Manual => ConfigPolicyConfig::Manual,
             }
         };
 
@@ -448,6 +451,7 @@ impl Router {
         prometheus_host = None,
         prometheus_duration_buckets = None,
         request_timeout_secs = 1800,
+        shutdown_grace_period_secs = 180,
         request_id_headers = None,
         pd_disaggregation = false,
         bucket_adjust_interval_secs = 5,
@@ -528,6 +532,7 @@ impl Router {
         prometheus_host: Option<String>,
         prometheus_duration_buckets: Option<Vec<f64>>,
         request_timeout_secs: u64,
+        shutdown_grace_period_secs: u64,
         request_id_headers: Option<Vec<String>>,
         pd_disaggregation: bool,
         bucket_adjust_interval_secs: usize,
@@ -621,6 +626,7 @@ impl Router {
             prometheus_host,
             prometheus_duration_buckets,
             request_timeout_secs,
+            shutdown_grace_period_secs,
             request_id_headers,
             pd_disaggregation,
             bucket_adjust_interval_secs,
@@ -729,6 +735,7 @@ impl Router {
                 prometheus_config,
                 request_timeout_secs: self.request_timeout_secs,
                 request_id_headers: self.request_id_headers.clone(),
+                shutdown_grace_period_secs: self.shutdown_grace_period_secs,
             })
             .await
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))

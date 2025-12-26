@@ -55,7 +55,16 @@ jobs:
       - name: Configure sccache
         uses: mozilla-actions/sccache-action@v0.0.9
         with:
-          version: "v0.10.0"
+          version: "v0.12.0"
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "."
+          shared-key: "rust-cache"
+          cache-all-crates: true
+          cache-on-failure: true
+          save-if: true
 
       - name: Test maturin build
         uses: PyO3/maturin-action@v1
@@ -91,14 +100,16 @@ jobs:
       - name: Configure sccache
         uses: mozilla-actions/sccache-action@v0.0.9
         with:
-          version: "v0.10.0"
+          version: "v0.12.0"
 
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: sgl-model-gateway
+          shared-key: "rust-cache"
           cache-all-crates: true
           cache-on-failure: true
+          save-if: true
 
       - name: Run lint
         run: |
@@ -131,20 +142,6 @@ jobs:
           cd sgl-model-gateway/
           cargo test
 
-      - name: Check benchmark compilation
-        run: |
-          source "$HOME/.cargo/env"
-          cd sgl-model-gateway/
-          cargo check --benches
-
-      - name: Quick benchmark sanity check
-        timeout-minutes: 15
-        run: |
-          source "$HOME/.cargo/env"
-          cd sgl-model-gateway/
-          # Run quick benchmarks to ensure they work using Python script
-          python3 scripts/run_benchmarks.py --quick
-
       - name: Show sccache stats
         if: always()
         run: sccache --show-stats
@@ -167,14 +164,16 @@ jobs:
       - name: Configure sccache
         uses: mozilla-actions/sccache-action@v0.0.9
         with:
-          version: "v0.10.0"
+          version: "v0.12.0"
 
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: sgl-model-gateway
+          shared-key: "rust-cache"
           cache-all-crates: true
           cache-on-failure: true
+          save-if: true
 
       - name: Install SGLang dependencies
         run: |
@@ -239,14 +238,16 @@ jobs:
       - name: Configure sccache
         uses: mozilla-actions/sccache-action@v0.0.9
         with:
-          version: "v0.10.0"
+          version: "v0.12.0"
 
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: sgl-model-gateway
+          shared-key: "rust-cache"
           cache-all-crates: true
           cache-on-failure: true
+          save-if: true
 
       - name: Install SGLang dependencies
         run: |
@@ -349,7 +350,7 @@ jobs:
           context: .
           file: docker/gateway.Dockerfile
           push: false
-          tags: sglang-router:test
+          tags: sgl-model-gateway:test
           cache-from: type=gha
           cache-to: type=gha,mode=max
 

@@ -11,6 +11,7 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend i
     AttentionMetadata,
     AttentionMetadataBuilder,
 )
+from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 
 
 class AITerBackend(AttentionBackend):
@@ -19,8 +20,8 @@ class AITerBackend(AttentionBackend):
     """
 
     @staticmethod
-    def get_name() -> str:
-        return "AITER"
+    def get_enum() -> AttentionBackendEnum:
+        return AttentionBackendEnum.AITER
 
     @staticmethod
     def get_impl_cls() -> type["AITerImpl"]:
@@ -52,15 +53,6 @@ class AITerImpl(AttentionImpl):
         dropout_p: float = 0.0,
         **extra_impl_args,
     ) -> None:
-        super().__init__(
-            num_heads=num_heads,
-            head_size=head_size,
-            softmax_scale=softmax_scale,
-            causal=causal,
-            num_kv_heads=num_kv_heads,
-            prefix=prefix,
-            **extra_impl_args,
-        )
         if num_kv_heads is not None and num_kv_heads != num_heads:
             raise NotImplementedError(
                 "AITer backend does not support Grouped Query Attention yet."

@@ -737,44 +737,6 @@ class TokenizerCommunicatorMixin:
     ):
         await self.send_to_scheduler.send_pyobj(obj)
 
-    def get_log_request_metadata(self):
-        max_length = None
-        skip_names = None
-        out_skip_names = None
-        if self.log_requests:
-            if self.log_requests_level == 0:
-                max_length = 1 << 30
-                skip_names = {
-                    "text",
-                    "input_ids",
-                    "input_embeds",
-                    "image_data",
-                    "audio_data",
-                    "lora_path",
-                    "sampling_params",
-                }
-                out_skip_names = {"text", "output_ids", "embedding"}
-            elif self.log_requests_level == 1:
-                max_length = 1 << 30
-                skip_names = {
-                    "text",
-                    "input_ids",
-                    "input_embeds",
-                    "image_data",
-                    "audio_data",
-                    "lora_path",
-                }
-                out_skip_names = {"text", "output_ids", "embedding"}
-            elif self.log_requests_level == 2:
-                max_length = 2048
-            elif self.log_requests_level == 3:
-                max_length = 1 << 30
-            else:
-                raise ValueError(
-                    f"Invalid --log-requests-level: {self.log_requests_level=}"
-                )
-        return max_length, skip_names, out_skip_names
-
     def _update_weight_version_if_provided(self, weight_version: Optional[str]) -> None:
         """Update weight version if provided."""
         if weight_version is not None:

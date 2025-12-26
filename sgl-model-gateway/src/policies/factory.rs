@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use super::{
     BucketConfig, BucketPolicy, CacheAwareConfig, CacheAwarePolicy, LoadBalancingPolicy,
-    PowerOfTwoPolicy, RandomPolicy, RoundRobinPolicy,
+    ManualPolicy, PowerOfTwoPolicy, RandomPolicy, RoundRobinPolicy,
 };
 use crate::config::PolicyConfig;
 
@@ -46,6 +46,7 @@ impl PolicyFactory {
                 };
                 Arc::new(BucketPolicy::with_config(config))
             }
+            PolicyConfig::Manual => Arc::new(ManualPolicy::new()),
         }
     }
 
@@ -57,6 +58,7 @@ impl PolicyFactory {
             "power_of_two" | "poweroftwo" => Some(Arc::new(PowerOfTwoPolicy::new())),
             "cache_aware" | "cacheaware" => Some(Arc::new(CacheAwarePolicy::new())),
             "bucket" => Some(Arc::new(BucketPolicy::new())),
+            "manual" => Some(Arc::new(ManualPolicy::new())),
             _ => None,
         }
     }

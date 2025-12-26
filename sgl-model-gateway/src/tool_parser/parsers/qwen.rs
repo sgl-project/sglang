@@ -133,7 +133,7 @@ impl ToolParser for QwenParser {
                     Ok(Some(tool)) => tools.push(tool),
                     Ok(None) => continue,
                     Err(e) => {
-                        tracing::warn!("Failed to parse tool call: {:?}", e);
+                        tracing::debug!("Failed to parse tool call: {:?}", e);
                         continue;
                     }
                 }

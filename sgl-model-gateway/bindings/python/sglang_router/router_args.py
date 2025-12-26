@@ -59,6 +59,8 @@ class RouterArgs:
     request_id_headers: Optional[List[str]] = None
     # Request timeout in seconds
     request_timeout_secs: int = 1800
+    # Grace period in seconds to wait for in-flight requests during shutdown
+    shutdown_grace_period_secs: int = 180
     # Max concurrent requests for rate limiting (-1 to disable)
     max_concurrent_requests: int = -1
     # Queue size for pending requests when max concurrent limit reached
@@ -169,21 +171,28 @@ class RouterArgs:
             f"--{prefix}policy",
             type=str,
             default=RouterArgs.policy,
-            choices=["random", "round_robin", "cache_aware", "power_of_two"],
+            choices=["random", "round_robin", "cache_aware", "power_of_two", "manual"],
             help="Load balancing policy to use. In PD mode, this is used for both prefill and decode unless overridden",
         )
         parser.add_argument(
             f"--{prefix}prefill-policy",
             type=str,
             default=None,
-            choices=["random", "round_robin", "cache_aware", "power_of_two", "bucket"],
+            choices=[
+                "random",
+                "round_robin",
+                "cache_aware",
+                "power_of_two",
+                "manual",
+                "bucket",
+            ],
             help="Specific policy for prefill nodes in PD mode. If not specified, uses the main policy",
         )
         parser.add_argument(
             f"--{prefix}decode-policy",
             type=str,
             default=None,
-            choices=["random", "round_robin", "cache_aware", "power_of_two"],
+            choices=["random", "round_robin", "cache_aware", "power_of_two", "manual"],
             help="Specific policy for decode nodes in PD mode. If not specified, uses the main policy",
         )
 
@@ -363,6 +372,12 @@ class RouterArgs:
             type=int,
             default=RouterArgs.request_timeout_secs,
             help="Request timeout in seconds",
+        )
+        parser.add_argument(
+            f"--{prefix}shutdown-grace-period-secs",
+            type=int,
+            default=RouterArgs.shutdown_grace_period_secs,
+            help="Grace period in seconds to wait for in-flight requests during shutdown",
         )
         # Retry configuration
         parser.add_argument(

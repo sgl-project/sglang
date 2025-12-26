@@ -119,6 +119,7 @@ class DiffusionServerArgs:
     custom_validator: str | None = None  # optional custom validator name
     # resources
     num_gpus: int = 1
+    tp_size: int | None = None
     ulysses_degree: int | None = None
     ring_degree: int | None = None
     # LoRA
@@ -139,6 +140,9 @@ class DiffusionSamplingParams:
     seconds: int = 1  # for video: duration in seconds
     num_frames: int | None = None  # for video: number of frames
     fps: int | None = None  # for video: frames per second
+
+    # URL direct test flag - if True, don't pre-download URL images
+    direct_url_test: bool = False
 
 
 @dataclass(frozen=True)
@@ -226,11 +230,21 @@ TI2I_sampling_params = DiffusionSamplingParams(
     image_path="https://github.com/lm-sys/lm-sys.github.io/releases/download/test/TI2I_Qwen_Image_Edit_Input.jpg",
 )
 
+MULTI_IMAGE_TI2I_sampling_params = DiffusionSamplingParams(
+    prompt="The magician bear is on the left, the alchemist bear is on the right, facing each other in the central park square.",
+    image_path=[
+        "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-Image/edit2509/edit2509_1.jpg",
+        "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-Image/edit2509/edit2509_2.jpg",
+    ],
+    direct_url_test=True,
+)
+
 T2V_PROMPT = "A curious raccoon"
 
 TI2V_sampling_params = DiffusionSamplingParams(
     prompt="The man in the picture slowly turns his head, his expression enigmatic and otherworldly. The camera performs a slow, cinematic dolly out, focusing on his face. Moody lighting, neon signs glowing in the background, shallow depth of field.",
     image_path="https://is1-ssl.mzstatic.com/image/thumb/Music114/v4/5f/fa/56/5ffa56c2-ea1f-7a17-6bad-192ff9b6476d/825646124206.jpg/600x600bb.jpg",
+    direct_url_test=True,
 )
 
 # All test cases with clean default values
@@ -287,6 +301,16 @@ ONE_GPU_CASES_A: list[DiffusionTestCase] = [
             warmup_edit=1,
         ),
         TI2I_sampling_params,
+    ),
+    DiffusionTestCase(
+        "qwen_image_edit_2509_ti2i",
+        DiffusionServerArgs(
+            model_path="Qwen/Qwen-Image-Edit-2509",
+            modality="image",
+            warmup_text=0,
+            warmup_edit=1,
+        ),
+        MULTI_IMAGE_TI2I_sampling_params,
     ),
 ]
 
@@ -500,6 +524,19 @@ TWO_GPU_CASES_B = [
             modality="image",
             warmup_text=1,
             warmup_edit=0,
+            num_gpus=2,
+        ),
+        T2I_sampling_params,
+    ),
+    DiffusionTestCase(
+        "flux_2_image_t2i_2_gpus",
+        DiffusionServerArgs(
+            model_path="black-forest-labs/FLUX.2-dev",
+            modality="image",
+            warmup_text=1,
+            warmup_edit=0,
+            num_gpus=2,
+            tp_size=2,
         ),
         T2I_sampling_params,
     ),

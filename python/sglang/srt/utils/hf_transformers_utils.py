@@ -232,6 +232,17 @@ def _is_deepseek_ocr_model(config: PretrainedConfig) -> bool:
     )
 
 
+def _override_deepseek_ocr_v_head_dim(config: DeepseekVLV2Config) -> None:
+    # FIXME: deepseek-ocr's v_head_dim is set to 0 in its config file.
+    # https://huggingface.co/deepseek-ai/DeepSeek-OCR/blob/main/config.json#L116
+    if config.text_config.v_head_dim == 0:
+        V_HEAD_DIM_PATCH = 128
+        config.text_config.v_head_dim = V_HEAD_DIM_PATCH
+        logger.warning(
+            f"Overriding deepseek-ocr's v_head_dim from 0 to {V_HEAD_DIM_PATCH} to avoid potential issues."
+        )
+
+
 @lru_cache_frozenset(maxsize=32)
 def get_config(
     model: str,
@@ -303,6 +314,10 @@ def get_config(
                 model_type = "deepseek-ocr"
         config_class = _CONFIG_REGISTRY[model_type]
         config = config_class.from_pretrained(model, revision=revision)
+
+        if _is_deepseek_ocr_model(config):
+            _override_deepseek_ocr_v_head_dim(config)
+
         # NOTE(HandH1998): Qwen2VL requires `_name_or_path` attribute in `config`.
         setattr(config, "_name_or_path", model)
 

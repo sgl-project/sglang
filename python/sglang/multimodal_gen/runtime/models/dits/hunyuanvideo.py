@@ -36,7 +36,10 @@ from sglang.multimodal_gen.runtime.layers.visual_embedding import (
 from sglang.multimodal_gen.runtime.managers.forward_context import get_forward_context
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 from sglang.multimodal_gen.runtime.models.utils import modulate
-from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
+from sglang.multimodal_gen.runtime.platforms import (
+    AttentionBackendEnum,
+    current_platform,
+)
 
 
 class MMDoubleStreamBlock(nn.Module):
@@ -677,7 +680,9 @@ class HunyuanVideoTransformer3DModel(CachableDiT):
         vec_ = torch.distributed.tensor.DTensor.from_local(
             vec_,
             torch.distributed.DeviceMesh(
-                "cuda", list(range(get_sp_world_size())), mesh_dim_names=("dp",)
+                current_platform.device_type,
+                list(range(get_sp_world_size())),
+                mesh_dim_names=("dp",),
             ),
             [torch.distributed.tensor.Replicate()],
         )
@@ -685,7 +690,9 @@ class HunyuanVideoTransformer3DModel(CachableDiT):
         inp = torch.distributed.tensor.DTensor.from_local(
             inp,
             torch.distributed.DeviceMesh(
-                "cuda", list(range(get_sp_world_size())), mesh_dim_names=("dp",)
+                current_platform.device_type,
+                list(range(get_sp_world_size())),
+                mesh_dim_names=("dp",),
             ),
             [torch.distributed.tensor.Replicate()],
         )
@@ -886,6 +893,7 @@ class IndividualTokenRefinerBlock(nn.Module):
             # TODO: remove hardcode; remove STA
             supported_attention_backends=(
                 AttentionBackendEnum.FA,
+                AttentionBackendEnum.AITER,
                 AttentionBackendEnum.TORCH_SDPA,
             ),
         )

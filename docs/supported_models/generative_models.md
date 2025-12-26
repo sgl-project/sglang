@@ -35,7 +35,7 @@ in the GitHub search bar.
 | **MiniCPM** (v3, 4B)               | `openbmb/MiniCPM3-4B`                            | OpenBMB’s series of compact LLMs for edge devices; MiniCPM 3 (4B) achieves GPT-3.5-level results in text tasks. |
 | **OLMo** (2, 3)               | `allenai/OLMo-2-1124-7B-Instruct`                       | Allen AI’s series of Open Language Models designed to enable the science of language models. |
 | **OLMoE** (Open MoE)               | `allenai/OLMoE-1B-7B-0924`                       | Allen AI’s open Mixture-of-Experts model (7B total, 1B active parameters) delivering state-of-the-art results with sparse expert activation. |
-| **MiniMax-M2**                     | `minimax/MiniMax-M2`           | MiniMax’s SOTA LLM for coding & agentic workflows. |
+| **MiniMax-M2** (M2, M2.1)                     | `minimax/MiniMax-M2`, `minimax/MiniMax-M2.1`           | MiniMax’s SOTA LLM for coding & agentic workflows. |
 | **StableLM** (3B, 7B)               | `stabilityai/stablelm-tuned-alpha-7b`            | StabilityAI’s early open-source LLM (3B & 7B) for general text generation; a demonstration model with basic instruction-following ability. |
 | **Command-R** (Cohere)              | `CohereForAI/c4ai-command-r-v01`                 | Cohere’s open conversational LLM (Command series) optimized for long context, retrieval-augmented generation, and tool use. |
 | **DBRX** (Databricks)              | `databricks/dbrx-instruct`                       | Databricks’ 132B-parameter MoE model (36B active) trained on 12T tokens; competes with GPT-3.5 quality as a fully open foundation model. |

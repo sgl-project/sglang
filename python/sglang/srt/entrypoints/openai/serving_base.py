@@ -11,6 +11,7 @@ import orjson
 from fastapi import HTTPException, Request
 from fastapi.responses import ORJSONResponse, StreamingResponse
 
+from sglang.srt.entrypoints.openai.encoding_dsv32 import DS32EncodingError
 from sglang.srt.entrypoints.openai.protocol import ErrorResponse, OpenAIServingRequest
 from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
 from sglang.srt.server_args import ServerArgs
@@ -124,6 +125,13 @@ class OpenAIServingBase(ABC):
                 message=e.detail, err_type=str(e.status_code), status_code=e.status_code
             )
         except ValueError as e:
+            return self.create_error_response(
+                message=str(e),
+                err_type="BadRequest",
+                status_code=400,
+            )
+        except DS32EncodingError as e:
+            logger.info(f"DS32EncodingError: {e}")
             return self.create_error_response(
                 message=str(e),
                 err_type="BadRequest",

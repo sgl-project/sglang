@@ -445,6 +445,7 @@ class QwenImageEncoder3d(nn.Module):
         temperal_downsample=[True, True, False],
         dropout=0.0,
         non_linearity: str = "silu",
+        input_channels: int = 3,
     ):
         super().__init__()
         # dim = config.arch_config.dim
@@ -468,7 +469,7 @@ class QwenImageEncoder3d(nn.Module):
         scale = 1.0
 
         # init block
-        self.conv_in = QwenImageCausalConv3d(3, dims[0], 3, padding=1)
+        self.conv_in = QwenImageCausalConv3d(input_channels, dims[0], 3, padding=1)
 
         # downsample blocks
         self.down_blocks = nn.ModuleList([])
@@ -649,6 +650,7 @@ class QwenImageDecoder3d(nn.Module):
         temperal_upsample=[False, True, True],
         dropout=0.0,
         non_linearity: str = "silu",
+        input_channels=3,
     ):
         super().__init__()
         self.dim = dim
@@ -701,7 +703,7 @@ class QwenImageDecoder3d(nn.Module):
 
         # output blocks
         self.norm_out = QwenImageRMS_norm(out_dim, images=False)
-        self.conv_out = QwenImageCausalConv3d(out_dim, 3, 3, padding=1)
+        self.conv_out = QwenImageCausalConv3d(out_dim, input_channels, 3, padding=1)
 
         self.gradient_checkpointing = False
 
@@ -783,15 +785,19 @@ class AutoencoderKLQwenImage(nn.Module):
         self.z_dim = z_dim
         self.temperal_downsample = temperal_downsample
         self.temperal_upsample = temperal_downsample[::-1]
+        self.input_channels = config.arch_config.input_channels
+        self.latents_mean = config.arch_config.latents_mean
+        self.config = config.arch_config
+
 
         self.encoder = QwenImageEncoder3d(
-            base_dim, z_dim * 2, dim_mult, num_res_blocks, attn_scales, self.temperal_downsample, dropout
+            base_dim, z_dim * 2, dim_mult, num_res_blocks, attn_scales, self.temperal_downsample, dropout, input_channels=self.input_channels
         )
         self.quant_conv = QwenImageCausalConv3d(z_dim * 2, z_dim * 2, 1)
         self.post_quant_conv = QwenImageCausalConv3d(z_dim, z_dim, 1)
 
         self.decoder = QwenImageDecoder3d(
-            base_dim, z_dim, dim_mult, num_res_blocks, attn_scales, self.temperal_upsample, dropout
+            base_dim, z_dim, dim_mult, num_res_blocks, attn_scales, self.temperal_upsample, dropout, input_channels=self.input_channels
         )
 
         self.spatial_compression_ratio = 2 ** len(self.temperal_downsample)

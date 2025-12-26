@@ -27,7 +27,9 @@ pub mod grpc;
 pub mod header_utils;
 pub mod http;
 pub mod openai;
+pub mod parse;
 pub mod router_manager;
+pub mod tokenize;
 
 pub use factory::RouterFactory;
 // Re-export HTTP routers for convenience

@@ -187,9 +187,9 @@ RUN git clone ${SGL_REPO} \
     && cd .. \
     && rm -rf python/pyproject.toml && mv python/pyproject_other.toml python/pyproject.toml \
     && if [ "$BUILD_TYPE" = "srt" ]; then \
-         python -m pip --no-cache-dir install -e "python[srt_hip]" ${NO_DEPS_FLAG}; \
+         python -m pip --no-cache-dir install -e "python[srt_hip,diffusion]" ${NO_DEPS_FLAG}; \
        else \
-         python -m pip --no-cache-dir install -e "python[all_hip]" ${NO_DEPS_FLAG}; \
+         python -m pip --no-cache-dir install -e "python[all_hip,diffusion]" ${NO_DEPS_FLAG}; \
        fi
 
 RUN python -m pip cache purge
