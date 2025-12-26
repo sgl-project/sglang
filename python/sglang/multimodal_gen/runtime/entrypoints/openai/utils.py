@@ -191,7 +191,7 @@ async def process_generation_batch(
                 )
             )
             post_process_sample(
-                result.output[idx],
+                output,
                 batch.data_type,
                 batch.fps,
                 batch.save_output,
