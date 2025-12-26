@@ -158,6 +158,7 @@ from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
+from sglang.srt.multimodal.mm_utils import SharedMMInputBuffer
 from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.server_args import PortArgs, ServerArgs, get_global_server_args
@@ -235,6 +236,7 @@ class Scheduler(
         moe_ep_rank: int,
         pp_rank: int,
         dp_rank: Optional[int],
+        shared_mm_input_buffer: SharedMMInputBuffer = None,
     ):
         # Parse args
         self.server_args = server_args
@@ -249,6 +251,7 @@ class Scheduler(
         self.nccl_port = port_args.nccl_port
         self.schedule_policy = server_args.schedule_policy
         self.enable_priority_scheduling = server_args.enable_priority_scheduling
+        self.shared_mm_input_buffer = shared_mm_input_buffer
         self.abort_on_priority_when_disabled = (
             server_args.abort_on_priority_when_disabled
         )
@@ -1159,6 +1162,28 @@ class Scheduler(
             return False
         return num_recv_reqs >= self.max_recv_per_poll
 
+    def hydrate_multimodal_inputs(self, tokenized_obj):
+        """
+        Retrieves tensors from Shared Memory and releases the reference count.
+        """
+        handles = getattr(tokenized_obj, "mm_resource_handles", None)
+        if not handles:
+            return
+
+        mm_items = tokenized_obj.mm_inputs.get("mm_items", [])
+
+        for handle in handles:
+            idx = handle["idx"]
+            offset = handle["offset"]
+            length = handle["length"]
+            shape = handle["shape"]
+
+            shared_view = self.shared_mm_input_buffer.get_tensor(offset, length, shape)
+
+            if idx < len(mm_items):
+                mm_items[idx].feature = shared_view
+                self.shared_mm_input_buffer.release()
+
     def recv_requests(
         self,
     ) -> List[Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput, Any]]:
@@ -1180,6 +1205,8 @@ class Scheduler(
                         if self.recv_limit_reached(len(recv_reqs)):
                             break
                         recv_req = self.recv_from_tokenizer.recv_pyobj(zmq.NOBLOCK)
+                        if self.server_args.mm_shm_buffer_size_gb > 0:
+                            self.hydrate_multimodal_inputs(recv_req)
                     except zmq.ZMQError:
                         break
                     recv_reqs.append(recv_req)
@@ -2786,6 +2813,7 @@ def run_scheduler_process(
     pp_rank: int,
     dp_rank: Optional[int],
     pipe_writer,
+    shared_mm_input_buffer=None,
 ):
     # Generate the logger prefix
     prefix = ""
@@ -2841,6 +2869,7 @@ def run_scheduler_process(
             moe_ep_rank,
             pp_rank,
             dp_rank,
+            shared_mm_input_buffer,
         )
         result_dict = {
             "status": "ready",

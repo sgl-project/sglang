@@ -29,14 +29,16 @@ LLaVA-Onevision : https://arxiv.org/pdf/2408.03326
 """
 import ast
 import itertools
+import logging
 import math
 import re
 from io import BytesIO
-from typing import Literal
+from typing import Any, Dict, Literal, Optional, Tuple
 
 import numpy as np
 import pybase64
 import torch
+import torch.multiprocessing as mp
 from PIL import Image
 
 from sglang.srt.distributed import (
@@ -45,6 +47,8 @@ from sglang.srt.distributed import (
 )
 from sglang.srt.distributed.communication_op import tensor_model_parallel_all_gather
 from sglang.srt.utils import flatten_nested_list
+
+logger = logging.getLogger(__name__)
 
 
 def has_valid_data(data) -> bool:
@@ -649,3 +653,90 @@ def run_dp_sharded_mrope_vision_model(
             current_idx += count
     out_embeddings = torch.cat(original_order_embeddings, dim=0)
     return out_embeddings
+
+
+class SharedMMInputBuffer:
+    def __init__(
+        self,
+        capacity_gb: int,
+        dtype: torch.dtype = torch.bfloat16,
+    ):
+        self.capacity_gb = capacity_gb
+        self.dtype = dtype
+        self.element_size = torch.tensor([], dtype=dtype).element_size()
+        self.max_elements = (capacity_gb * 1024 * 1024 * 1024) // self.element_size
+
+        self.buffer = (
+            torch.zeros((self.max_elements,), dtype=dtype).pin_memory().share_memory_()
+        )
+
+        self.ctx = mp.get_context("spawn")
+        self.lock = self.ctx.RLock()
+
+        self.write_ptr = self.ctx.Value("i", 0)
+        self.ref_count = self.ctx.Value("i", 0)
+
+    def save_tensor(self, tensor: torch.Tensor) -> Optional[Dict[str, Any]]:
+        num_elements = tensor.numel()
+
+        src = tensor.detach().cpu().flatten() if tensor.is_cuda else tensor.flatten()
+
+        if not self.lock.acquire(timeout=10.0):
+            return None
+
+        try:
+            if self.ref_count.value == 0:
+                self.write_ptr.value = 0
+
+            start = self.write_ptr.value
+            if start + num_elements > self.max_elements:
+                return None
+
+            end = start + num_elements
+            self.write_ptr.value = end
+            self.ref_count.value += 1
+
+            self.buffer[start:end].copy_(src)
+
+            return {
+                "offset": start,
+                "length": num_elements,
+                "shape": tuple(tensor.shape),
+            }
+        finally:
+            self.lock.release()
+
+    def release(self):
+        if not self.lock.acquire(timeout=10.0):
+            return
+
+        try:
+            if self.ref_count.value > 0:
+                self.ref_count.value -= 1
+            else:
+                logger.warning(
+                    "[SHM] [release] Attempted to release but ref_count is 0"
+                )
+        finally:
+            self.lock.release()
+
+    def get_tensor(
+        self, offset: int, length: int, shape: Tuple[int, ...]
+    ) -> torch.Tensor:
+        try:
+            res = self.buffer[offset : offset + length].view(shape)
+            return res
+        finally:
+            pass
+
+    def get_status(self):
+        if not self.lock.acquire(timeout=2.0):
+            return {"error": "lock_timeout"}
+        try:
+            status = {
+                "ref_count": self.ref_count.value,
+                "write_ptr": self.write_ptr.value,
+            }
+            return status
+        finally:
+            self.lock.release()

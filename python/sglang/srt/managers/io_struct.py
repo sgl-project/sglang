@@ -743,6 +743,8 @@ class TokenizedGenerateReqInput(BaseReq):
     need_wait_for_image: bool = False
     num_items_assigned: Optional[List] = None
 
+    mm_resource_handles: Optional[List] = None
+
 
 @dataclass
 class BatchTokenizedGenerateReqInput(BaseBatchReq):
