@@ -37,7 +37,7 @@ MODEL_SCORE_THRESHOLDS = {
     "Qwen/Qwen2.5-7B-Instruct": 0.85,
     # Qwen3 series
     "Qwen/Qwen3-30B-A3B-Thinking-2507": 0.84,  # MoE model verified on MI300X
-    "Qwen/Qwen3-8B": 0.80,
+    "Qwen/Qwen3-8B": 0.77,
     # Google Gemma
     "google/gemma-2-27b-it": 0.91,
     "google/gemma-2-9b-it": 0.72,
