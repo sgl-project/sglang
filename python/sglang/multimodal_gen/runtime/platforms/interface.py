@@ -151,9 +151,8 @@ class Platform:
             return False
 
     @lru_cache(maxsize=1)
-    def is_hip(self):
-        has_rocm = torch.version.hip is not None
-        return has_rocm
+    def is_hip(self) -> bool:
+        return self.is_rocm()
 
     @classmethod
     def get_attn_backend_cls_str(

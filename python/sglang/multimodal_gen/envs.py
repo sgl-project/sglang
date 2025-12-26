@@ -98,8 +98,32 @@ def _lazy_bool(key: str, default: str = "false") -> Callable[[], bool]:
     return lambda: get_bool_env_var(key, default)
 
 
-def _lazy_path(key: str, default_func: Callable[[], str]) -> Callable[[], str]:
-    return lambda: os.path.expanduser(os.getenv(key, default_func()))
+def _lazy_bool_any(keys: list[str], default: str = "false") -> Callable[[], bool]:
+    def _getter():
+        for key in keys:
+            if get_bool_env_var(key, "false"):
+                return True
+        return (
+            get_bool_env_var("", default)
+            if not keys
+            else get_bool_env_var(keys[0], default)
+        )
+
+    return _getter
+
+
+def _lazy_path(
+    key: str, default_func: Callable[[], str] | None = None
+) -> Callable[[], str | None]:
+    def _getter():
+        val = os.getenv(key)
+        if val is None:
+            if default_func is None:
+                return None
+            val = default_func()
+        return os.path.expanduser(val)
+
+    return _getter
 
 
 # The begin-* and end* here are used by the documentation generator
@@ -122,35 +146,33 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # If set, `MAX_JOBS` will be reduced to avoid oversubscribing the CPU.
     "NVCC_THREADS": _lazy_str("NVCC_THREADS"),
     # If set, sgl_diffusion will use precompiled binaries (*.so)
-    "SGLANG_DIFFUSION_USE_PRECOMPILED": lambda: bool(
-        os.environ.get("SGLANG_DIFFUSION_USE_PRECOMPILED")
-    )
-    or bool(os.environ.get("SGLANG_DIFFUSION_PRECOMPILED_WHEEL_LOCATION")),
+    "SGLANG_DIFFUSION_USE_PRECOMPILED": _lazy_bool_any(
+        [
+            "SGLANG_DIFFUSION_USE_PRECOMPILED",
+            "SGLANG_DIFFUSION_PRECOMPILED_WHEEL_LOCATION",
+        ]
+    ),
     # CMake build type
     # If not set, defaults to "Debug" or "RelWithDebInfo"
     # Available options: "Debug", "Release", "RelWithDebInfo"
     "CMAKE_BUILD_TYPE": _lazy_str("CMAKE_BUILD_TYPE"),
     # If set, sgl_diffusion will print verbose logs during installation
-    "VERBOSE": lambda: bool(int(os.getenv("VERBOSE", "0"))),
+    "VERBOSE": _lazy_bool("VERBOSE"),
     # Root directory for SGL-diffusion configuration files
     # Defaults to `~/.config/sgl_diffusion` unless `XDG_CONFIG_HOME` is set
     # Note that this not only affects how sgl_diffusion finds its configuration files
     # during runtime, but also affects how sgl_diffusion installs its configuration
     # files during **installation**.
-    "SGLANG_DIFFUSION_CONFIG_ROOT": lambda: os.path.expanduser(
-        os.getenv(
-            "SGLANG_DIFFUSION_CONFIG_ROOT",
-            os.path.join(get_default_config_root(), "sgl_diffusion"),
-        )
+    "SGLANG_DIFFUSION_CONFIG_ROOT": _lazy_path(
+        "SGLANG_DIFFUSION_CONFIG_ROOT",
+        lambda: os.path.join(get_default_config_root(), "sgl_diffusion"),
     ),
     # ================== Runtime Env Vars ==================
     # Root directory for SGL-diffusion cache files
     # Defaults to `~/.cache/sgl_diffusion` unless `XDG_CACHE_HOME` is set
-    "SGLANG_DIFFUSION_CACHE_ROOT": lambda: os.path.expanduser(
-        os.getenv(
-            "SGLANG_DIFFUSION_CACHE_ROOT",
-            os.path.join(get_default_cache_root(), "sgl_diffusion"),
-        )
+    "SGLANG_DIFFUSION_CACHE_ROOT": _lazy_path(
+        "SGLANG_DIFFUSION_CACHE_ROOT",
+        lambda: os.path.join(get_default_cache_root(), "sgl_diffusion"),
     ),
     # Interval in seconds to log a warning message when the ring buffer is full
     "SGLANG_DIFFUSION_RINGBUFFER_WARNING_INTERVAL": _lazy_int(
@@ -163,8 +185,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # library file in the locations specified by `LD_LIBRARY_PATH`
     "LD_LIBRARY_PATH": _lazy_str("LD_LIBRARY_PATH"),
     # Internal flag to enable Dynamo fullgraph capture
-    "SGLANG_DIFFUSION_TEST_DYNAMO_FULLGRAPH_CAPTURE": lambda: bool(
-        os.environ.get("SGLANG_DIFFUSION_TEST_DYNAMO_FULLGRAPH_CAPTURE", "1") != "0"
+    "SGLANG_DIFFUSION_TEST_DYNAMO_FULLGRAPH_CAPTURE": _lazy_bool(
+        "SGLANG_DIFFUSION_TEST_DYNAMO_FULLGRAPH_CAPTURE", "1"
     ),
     # local rank of the process in the distributed setting, used to determine
     # the GPU device id
@@ -197,10 +219,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "SGLANG_DIFFUSION_TRACE_FUNCTION": _lazy_int("SGLANG_DIFFUSION_TRACE_FUNCTION", 0),
     # Path to the attention configuration file. Only used for sliding tile
     # attention for now.
-    "SGLANG_DIFFUSION_ATTENTION_CONFIG": lambda: (
-        None
-        if os.getenv("SGLANG_DIFFUSION_ATTENTION_CONFIG") is None
-        else os.path.expanduser(os.getenv("SGLANG_DIFFUSION_ATTENTION_CONFIG", "."))
+    "SGLANG_DIFFUSION_ATTENTION_CONFIG": _lazy_path(
+        "SGLANG_DIFFUSION_ATTENTION_CONFIG"
     ),
     # Optional override to force a specific attention backend (e.g. "aiter")
     "SGLANG_DIFFUSION_ATTENTION_BACKEND": _lazy_str(
@@ -213,10 +233,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Enables torch profiler if set. Path to the directory where torch profiler
     # traces are saved. Note that it must be an absolute path.
-    "SGLANG_DIFFUSION_TORCH_PROFILER_DIR": lambda: (
-        None
-        if os.getenv("SGLANG_DIFFUSION_TORCH_PROFILER_DIR") is None
-        else os.path.expanduser(os.getenv("SGLANG_DIFFUSION_TORCH_PROFILER_DIR", "."))
+    "SGLANG_DIFFUSION_TORCH_PROFILER_DIR": _lazy_path(
+        "SGLANG_DIFFUSION_TORCH_PROFILER_DIR"
     ),
     # If set, sgl_diffusion will run in development mode, which will enable
     # some additional endpoints for developing and debugging,
@@ -299,8 +317,6 @@ environment_variables["SGLANG_CACHE_DIT_SECONDARY_TAYLORSEER"] = (
 
 
 # end-env-vars-definition
-
-
 def __getattr__(name: str):
     # lazy evaluation of environment variables
     if name in environment_variables:
