@@ -1,15 +1,12 @@
-use std::sync::Arc;
-
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
-use sgl_model_gateway::{
-    core::{BasicWorkerBuilder, Worker, WorkerType},
-    policies::{CacheAwareConfig, CacheAwarePolicy, LoadBalancingPolicy, SelectWorkerInfo},
-};
+use sgl_model_gateway::policies::{CacheAwarePolicy, CacheAwareConfig, LoadBalancingPolicy, SelectWorkerInfo};
+use sgl_model_gateway::core::{Worker, BasicWorkerBuilder, WorkerType, ModelCard};
+use std::sync::Arc;
 
 fn bench_cache_aware_selection(c: &mut Criterion) {
     // 1. Setup Configuration
-    // We set balance_abs_threshold to 0 to ensure the "imbalanced" path (with logging overhead)
-    // is exerciseable during the benchmark.
+    // Set balance_abs_threshold to 0 to ensure the path with logging overhead
+    // is exercised during the benchmark.
     let config = CacheAwareConfig {
         balance_abs_threshold: 0,
         ..Default::default()
@@ -17,13 +14,15 @@ fn bench_cache_aware_selection(c: &mut Criterion) {
     let policy = CacheAwarePolicy::with_config(config);
 
     // 2. Setup 50 Mock Workers
-    // A larger number of workers makes the heap allocation overhead for log data more visible.
+    // Using ModelCard to assign models as required by the latest builder API
     let mut workers: Vec<Arc<dyn Worker>> = Vec::new();
     for i in 0..50 {
+        let model_card = ModelCard::new("test-model");
+
         workers.push(Arc::new(
             BasicWorkerBuilder::new(&format!("http://worker-{}:8000", i))
                 .worker_type(WorkerType::Regular)
-                .model_id("test-model")
+                .model(model_card) // Correct method
                 .build(),
         ));
     }
@@ -44,7 +43,10 @@ fn bench_cache_aware_selection(c: &mut Criterion) {
     group.bench_function("cache_aware_selection_50_workers", |b| {
         b.iter(|| {
             // Measure the performance of the selection decision
-            let _Result = policy.select_worker(black_box(&workers), black_box(&info));
+            let _Result = policy.select_worker(
+                black_box(&workers),
+                black_box(&info)
+            );
         })
     });
 
