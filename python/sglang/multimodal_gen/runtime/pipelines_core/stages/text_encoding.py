@@ -70,13 +70,21 @@ class TextEncodingStage(PipelineStage):
         assert batch.prompt is not None
         prompt_text: str | list[str] = batch.prompt
 
+        # TODO: debug hard code
+        # TODO: review usage
+        num_condition_images: int = len(batch.image_path)
+
         all_indices: list[int] = list(range(len(self.text_encoders)))
 
+        # NOTE:
+        # len(prompt_embeds_list) == len(encoder_list)
+        # prompt_embeds_list[i].shape = [seqlen, dim]
         prompt_embeds_list, prompt_masks_list, pooler_embeds_list = self.encode_text(
             prompt_text,
             server_args,
             encoder_index=all_indices,
             return_attention_mask=True,
+            num_condition_images=num_condition_images,
         )
 
         for pe in prompt_embeds_list:
@@ -96,6 +104,7 @@ class TextEncodingStage(PipelineStage):
                 server_args,
                 encoder_index=all_indices,
                 return_attention_mask=True,
+                num_condition_images=num_condition_images,
             )
 
             assert batch.negative_prompt_embeds is not None
@@ -149,6 +158,7 @@ class TextEncodingStage(PipelineStage):
         max_length: int | None = None,
         truncation: bool | None = None,
         padding: bool | str | None = None,
+        num_condition_images: int = 0,
         return_overflowing_tokens=None,
         return_length=None,
     ):
@@ -240,10 +250,27 @@ class TextEncodingStage(PipelineStage):
                 else {}
             )
 
-            processed_text_list: list[str] = []
+            processed_text_list: list[str | list[str]] = []
             for prompt_str in texts:
-                preprocessed = preprocess_func(prompt_str)
-                processed_text_list.append(preprocessed)
+                if num_condition_images == 0:
+                    preprocessed = preprocess_func(prompt_str)
+                    processed_text_list.append(preprocessed)
+                else:
+                    # TODO: refactor, hard code for z-image-omni only for now.
+                    # which create a batch of placeholder
+                    prompt_list = ["<|im_start|>user\n<|vision_start|>"]
+                    prompt_list += ["<|vision_end|><|vision_start|>"] * (
+                        num_condition_images - 1
+                    )
+                    prompt_list += [
+                        "<|vision_end|>"
+                        + prompt_str
+                        + "<|im_end|>\n<|im_start|>assistant\n<|vision_start|>"
+                    ]
+                    prompt_list += ["<|vision_end|><|im_end|>"]
+                    # TODO: note review, a list where split by vision block like
+                    # ['<|im_start|>user\n<|vision_start|>', '<|vision_end|><|vision_start|>', '<|vision_end|> USER PROMPT <|im_end|>\n<|im_start|>assistant\n<|vision_start|>', '<|vision_end|><|im_end|> ']
+                    processed_text_list.append(prompt_list)
 
             # Prepare tokenizer args
             tok_kwargs = self.prepare_tokenizer_kwargs(
@@ -251,6 +278,10 @@ class TextEncodingStage(PipelineStage):
                 **text_encoder_extra_arg,
             )
 
+            # TODO: refactor, ugly hard code
+            tok_kwargs["num_condition_images"] = num_condition_images
+
+            # TODO: note: apply_chat_template + tokenize for zimage
             text_inputs: dict = server_args.pipeline_config.tokenize_prompt(
                 processed_text_list, tokenizer, tok_kwargs
             ).to(target_device)
@@ -272,10 +303,13 @@ class TextEncodingStage(PipelineStage):
                     output_hidden_states=True,
                     use_cache=False,
                 )
+            # TODO: note: review postprocess_func
+            # TODO: outputs = [bsz * list_list]
             prompt_embeds = postprocess_func(outputs, text_inputs)
             if dtype is not None:
                 prompt_embeds = prompt_embeds.to(dtype=dtype)
 
+            # NOTE: embeds for encoder i
             embeds_list.append(prompt_embeds)
             if is_flux_v1:
                 pooled_embeds_list.append(outputs.pooler_output)
