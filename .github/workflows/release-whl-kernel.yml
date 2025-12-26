@@ -45,6 +45,8 @@ jobs:
           cd sgl-kernel
           chmod +x ./build.sh
           ./build.sh "${{ matrix.python-version }}" "${{ matrix.cuda-version }}" ${{ matrix.arch == 'aarch64' && 'aarch64' || '' }}
+        env:
+          USE_CCACHE: 0
 
       - name: Upload to PyPI
         working-directory: sgl-kernel
@@ -86,14 +88,14 @@ jobs:
         with:
           tag_name: ${{ steps.set_tag_name.outputs.tag_name }}
           repository: sgl-project/whl
-          token: ${{ secrets.WHL_TOKEN }}
+          token: ${{ secrets.GH_PAT_FOR_WHL_RELEASE }}
           files: |
             sgl-kernel/dist/*
 
       - name: Clone wheel index
         run: git clone https://oauth2:${WHL_TOKEN}@github.com/sgl-project/whl.git sgl-whl
         env:
-          WHL_TOKEN: ${{ secrets.WHL_TOKEN }}
+          WHL_TOKEN: ${{ secrets.GH_PAT_FOR_WHL_RELEASE }}
 
       - name: Update wheel index
         run: python3 scripts/update_kernel_whl_index.py --cuda 129
@@ -136,6 +138,8 @@ jobs:
           cd sgl-kernel
           chmod +x ./build.sh
           ./build.sh "${{ matrix.python-version }}" "${{ matrix.cuda-version }}" ${{ matrix.arch == 'aarch64' && 'aarch64' || '' }}
+        env:
+          USE_CCACHE: 0
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
@@ -171,14 +175,14 @@ jobs:
         with:
           tag_name: ${{ steps.set_tag_name.outputs.tag_name }}
           repository: sgl-project/whl
-          token: ${{ secrets.WHL_TOKEN }}
+          token: ${{ secrets.GH_PAT_FOR_WHL_RELEASE }}
           files: |
             sgl-kernel/dist/*
 
       - name: Clone wheel index
         run: git clone https://oauth2:${WHL_TOKEN}@github.com/sgl-project/whl.git sgl-whl
         env:
-          WHL_TOKEN: ${{ secrets.WHL_TOKEN }}
+          WHL_TOKEN: ${{ secrets.GH_PAT_FOR_WHL_RELEASE }}
 
       - name: Update wheel index
         run: python3 scripts/update_kernel_whl_index.py --cuda 130
