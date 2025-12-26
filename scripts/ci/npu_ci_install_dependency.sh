@@ -69,4 +69,4 @@ pwd && ls
 
 ### Install SGLang
 rm -rf python/pyproject.toml && mv python/pyproject_npu.toml python/pyproject.toml
-${PIP_INSTALL} -v -e "python[all_npu]"
+${PIP_INSTALL} -v -e "python[dev_npu]"
