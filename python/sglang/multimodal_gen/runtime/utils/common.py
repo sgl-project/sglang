@@ -1,6 +1,5 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
-import importlib
 import ipaddress
 import logging
 import os
@@ -241,48 +240,6 @@ def get_zmq_socket(
 
 
 # https://pytorch.org/docs/stable/notes/hip.html#checking-for-hip
-@lru_cache(maxsize=1)
-def is_hip() -> bool:
-    return torch.version.hip is not None
-
-
-@lru_cache(maxsize=1)
-def is_cuda():
-    return torch.cuda.is_available() and torch.version.cuda
-
-
-@lru_cache(maxsize=1)
-def is_cuda_alike():
-    return is_cuda() or is_hip()
-
-
-@lru_cache(maxsize=1)
-def is_blackwell():
-    if not is_cuda():
-        return False
-    return torch.cuda.get_device_capability()[0] == 10
-
-
-@lru_cache(maxsize=1)
-def is_sm120():
-    if not is_cuda():
-        return False
-    return torch.cuda.get_device_capability()[0] == 12
-
-
-@lru_cache(maxsize=1)
-def is_hpu() -> bool:
-    return hasattr(torch, "hpu") and torch.hpu.is_available()
-
-
-@lru_cache(maxsize=1)
-def is_xpu() -> bool:
-    return hasattr(torch, "xpu") and torch.xpu.is_available()
-
-
-@lru_cache(maxsize=1)
-def is_npu() -> bool:
-    return hasattr(torch, "npu") and torch.npu.is_available()
 
 
 @lru_cache(maxsize=1)
@@ -295,11 +252,6 @@ def is_host_cpu_x86() -> bool:
     )
 
 
-@lru_cache(maxsize=1)
-def is_cpu() -> bool:
-    return os.getenv("SGLANG_USE_CPU_ENGINE", "0") == "1" and is_host_cpu_x86()
-
-
 # cuda
 
 
@@ -307,16 +259,6 @@ def set_cuda_arch():
     capability = torch.cuda.get_device_capability()
     arch = f"{capability[0]}.{capability[1]}"
     os.environ["TORCH_CUDA_ARCH_LIST"] = f"{arch}{'+PTX' if arch == '9.0' else ''}"
-
-
-def is_flashinfer_available():
-    """
-    Check whether flashinfer is available.
-    As of Oct. 6, 2024, it is only available on NVIDIA GPUs.
-    """
-    # if not get_bool_env_var("SGLANG_IS_FLASHINFER_AVAILABLE", default="true"):
-    #     return False
-    return importlib.util.find_spec("flashinfer") is not None and is_cuda()
 
 
 # env var managements

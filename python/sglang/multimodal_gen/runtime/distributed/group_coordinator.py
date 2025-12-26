@@ -16,7 +16,6 @@ import torch.distributed
 from torch.cuda import synchronize
 from torch.distributed import Backend, ProcessGroup
 
-from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.distributed.device_communicators.base_device_communicator import (
     DeviceCommunicatorBase,
 )
@@ -837,7 +836,7 @@ class PipelineGroupCoordinator(GroupCoordinator):
         assert self.cpu_group is not None
         assert self.device_group is not None
 
-        self.device = envs.get_device(local_rank)
+        self.device = current_platform.get_device(local_rank)
 
         self.recv_buffer_set: bool = False
         self.recv_tasks_queue: List[Tuple[str, int]] = []
