@@ -8,6 +8,7 @@ import argparse
 import dataclasses
 import inspect
 import json
+import os
 import random
 import sys
 import tempfile
@@ -944,6 +945,8 @@ class ServerArgs:
             raise ValueError("pipeline_config is not set in ServerArgs")
 
         self.pipeline_config.check_pipeline_config()
+        if self.attention_backend is None:
+            self._set_default_attention_backend()
 
         # parallelism
         self.check_server_dp_args()
@@ -955,6 +958,26 @@ class ServerArgs:
                 raise ValueError(
                     "CFG Parallelism is enabled via `--enable-cfg-parallel`, while -num-gpus==1"
                 )
+
+        if os.getenv("SGLANG_CACHE_DIT_ENABLED", "").lower() == "true":
+            has_sp = self.sp_degree > 1
+            has_tp = self.tp_size > 1
+            if has_sp and has_tp:
+                raise ValueError(
+                    "cache-dit does not support hybrid parallelism (SP + TP). "
+                    "Please use either sequence parallelism or tensor parallelism, not both."
+                )
+
+    def _set_default_attention_backend(self) -> None:
+        """Configure ROCm defaults when users do not specify an attention backend."""
+        if current_platform.is_rocm():
+            default_backend = AttentionBackendEnum.AITER.name.lower()
+            self.attention_backend = default_backend
+            logger.info(
+                "Attention backend not specified. Using '%s' by default on ROCm "
+                "to match SGLang SRT defaults.",
+                default_backend,
+            )
 
 
 @dataclasses.dataclass
