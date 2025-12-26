@@ -85,7 +85,11 @@ def collect_test_items(files, filter_expr=None):
         cmd.extend(["-k", filter_expr])
     cmd.extend(files)
 
+    logger.info(cmd)
+
     result = subprocess.run(cmd, capture_output=True, text=True)
+
+    logger.info(result)
 
     # Parse the output to extract test node IDs
     # pytest -q outputs lines like: test_file.py::TestClass::test_method[param]
@@ -99,6 +103,7 @@ def collect_test_items(files, filter_expr=None):
             if "::" in test_id:
                 test_items.append(test_id)
 
+    logger.info(test_items)
     return test_items
 
 
