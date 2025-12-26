@@ -114,6 +114,9 @@ def register_fake_ops():
         "fused_add_rmsnorm_cpu",
         "decode_attention_cpu",
         "extend_attention_cpu",
+        "gemma_fused_add_rmsnorm_cpu",
+        "layernorm_cpu",
+        "fused_add_layernorm_cpu",
     ]
     for op in none_return_ops:
 
@@ -129,6 +132,8 @@ def register_fake_ops():
         "shared_expert_cpu",
         "causal_conv1d_update_cpu",
         "causal_conv1d_fwd_cpu",
+        "gemma_rmsnorm_cpu",
+        "gemma3_rmsnorm_cpu",
     ]:
 
         @torch.library.register_fake(f"sgl_kernel::{op}")
