@@ -878,15 +878,18 @@ class FlashInferAttnBackend(AttentionBackend):
                 o, _ = merge_state(o1, s1, o2, s2)
 
             if save_kv_cache:
-                forward_batch.token_to_kv_pool.set_kv_buffer(
+                args = (
                     layer,
                     cache_loc,
                     k,
                     v,
                     layer.k_scale,
                     layer.v_scale,
-                    dcp_kv_mask=forward_batch.dcp_kv_mask,
                 )
+                kwargs = {}
+                if self.dcp_size > 1:
+                    kwargs["dcp_kv_mask"] = forward_batch.dcp_kv_mask
+                forward_batch.token_to_kv_pool.set_kv_buffer(*args, **kwargs)
 
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 
@@ -918,15 +921,18 @@ class FlashInferAttnBackend(AttentionBackend):
         if k is not None:
             assert v is not None
             if save_kv_cache:
-                forward_batch.token_to_kv_pool.set_kv_buffer(
+                args = (
                     layer,
                     cache_loc,
                     k,
                     v,
                     layer.k_scale,
                     layer.v_scale,
-                    dcp_kv_mask=forward_batch.dcp_kv_mask,
                 )
+                kwargs = {}
+                if self.dcp_size > 1:
+                    kwargs["dcp_kv_mask"] = forward_batch.dcp_kv_mask
+                forward_batch.token_to_kv_pool.set_kv_buffer(*args, **kwargs)
 
         # Call the wrapped function
         o, s = decode_wrapper.forward_return_lse(

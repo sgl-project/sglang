@@ -1800,6 +1800,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             dtype=self.model_config.dtype,
             dp_size=self.server_args.dp_size,
             pp_size=self.server_args.pp_size,
+            dcp_size=self.server_args.dcp_size,
             is_encoder_decoder=self.model_config.is_encoder_decoder,
             require_mlp_tp_gather=require_mlp_tp_gather_,
             seq_len_fill_value=seq_len_fill_value,
