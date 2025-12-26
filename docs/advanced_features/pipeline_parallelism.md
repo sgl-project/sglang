@@ -32,7 +32,7 @@ Optimizing the chunked prefill size is crucial for balancing pipeline efficiency
 ### Enable Dynamic Chunking and Adjust Smoothing Factor (Experimental feature)
 SGLang also offers a dynamic chunking solution that could further improve performance. This feature is currently an experimental feature that requires a certain amount of tuning experimentation and may not be suitable for all workloads. In addition, fine-tuning the smoothing factor can help optimize performance for specific workloads and model characteristics.
 
-### Case Study
+### Case Study on NVIDIA H20
 
 When evaluating pipeline parallelism with fixed chunked prefill sizes from 2K to 16K, experiment results show that a 4K chunk size delivered optimal prefill TTFT performance for the DeepSeek-V3.1, and a 6K chunk size delivered optimal prefill TTFT performance for the Qwen3-235B-A22B-Thinking-2507-FP8.
 
@@ -46,8 +46,8 @@ python3 -m sglang.launch_server \
   --nnodes 4 --node-rank 0 --tp 8 --pp-size 4 \
   --port 30000 --dist-init-addr 192.168.0.137:62001 \
   --disable-radix-cache --mem-fraction-static 0.8  \
-  --attention-backend fa3 --watchdog-timeout 3600  --host 0.0.0.0 --watchdog-timeout 3600 \
-  --max-running-requests 128 --chunked-prefill-size 4096 --enable-dynamic-chunking
+  --attention-backend fa3 --host 0.0.0.0 --watchdog-timeout 3600 \
+  --max-running-requests 128 --chunked-prefill-size 4096
 ```
 
 ```bash
@@ -58,7 +58,7 @@ python3 -m sglang.launch_server \
   --nnodes 4 --node-rank 0 --tp 8 --pp-size 4 \
   --port 30000 --dist-init-addr 192.168.0.137:62001 \
   --disable-radix-cache --mem-fraction-static 0.8  \
-  --attention-backend fa3 --watchdog-timeout 3600  --host 0.0.0.0 --watchdog-timeout 3600 \
+  --attention-backend fa3 --host 0.0.0.0 --watchdog-timeout 3600 \
   --max-running-requests 128 --chunked-prefill-size 12288 --enable-dynamic-chunking
 ```
 
@@ -70,7 +70,7 @@ python3 -m sglang.launch_server \
   --nnodes 2 --node-rank 0 --tp 4 --pp-size 2 \
   --port 30000 --dist-init-addr 192.168.0.137:62001 \
   --disable-radix-cache --mem-fraction-static 0.8  \
-  --attention-backend fa3 --watchdog-timeout 3600  --host 0.0.0.0 --watchdog-timeout 3600 \
+  --attention-backend fa3 --host 0.0.0.0 --watchdog-timeout 3600 \
   --max-running-requests 128 --chunked-prefill-size 6144
 ```
 
@@ -78,13 +78,15 @@ python3 -m sglang.launch_server \
 # prefill node 0 (with dynamic chunking)
 export SGLANG_DYNAMIC_CHUNKING_SMOOTH_FACTOR=0.8
 python3 -m sglang.launch_server \
-  --model-path deepseek-ai/DeepSeek-V3.1 --trust-remote-code \
+  --model-path Qwen/Qwen3-235B-A22B-Thinking-2507-FP8 --trust-remote-code \
   --nnodes 2 --node-rank 0 --tp 4 --pp-size 2 \
   --port 30000 --dist-init-addr 192.168.0.137:62001 \
   --disable-radix-cache --mem-fraction-static 0.8  \
-  --attention-backend fa3 --watchdog-timeout 3600  --host 0.0.0.0 --watchdog-timeout 3600 \
+  --attention-backend fa3 --host 0.0.0.0 --watchdog-timeout 3600 \
   --max-running-requests 128 --chunked-prefill-size 18432 --enable-dynamic-chunking
 ```
+
+Note: `--disable-radix-cache` is enabled only for reproducible benchmarking purposes. It is not recommended to use it in production.
 
 ## Best Practice for Pipeline Parallelism with PD Disaggregation
 To be added. Stay tuned for the latest updates on Pipeline Parallelism with PD Disaggregation.
