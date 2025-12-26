@@ -19,10 +19,9 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
 )
 from sglang.multimodal_gen.runtime.pipelines_core import Req, build_pipeline
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import PortArgs, ServerArgs
-from sglang.multimodal_gen.runtime.utils.common import is_cuda, set_cuda_arch
-
-_is_cuda = is_cuda()
+from sglang.multimodal_gen.runtime.utils.common import set_cuda_arch
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
     configure_logger,
     globally_suppress_loggers,
@@ -193,7 +192,7 @@ def run_scheduler_process(
     """
     configure_logger(server_args)
     globally_suppress_loggers()
-    if _is_cuda:
+    if current_platform.is_cuda():
         set_cuda_arch()
 
     port_args = PortArgs.from_server_args(server_args)
