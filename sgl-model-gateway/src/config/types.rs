@@ -337,6 +337,9 @@ pub enum PolicyConfig {
         bucket_adjust_interval_secs: usize,
     },
 
+    /// Manual routing policy supporting header-based routing:
+    /// - X-SMG-Target-Worker: Direct routing to a specific worker by URL
+    /// - X-SMG-Routing-Key: Consistent hash routing for session affinity
     #[serde(rename = "manual")]
     Manual,
 }

@@ -67,7 +67,6 @@ fn default_generate_request() -> GenerateRequest {
         return_bytes: false,
         return_entropy: false,
         rid: None,
-        routing_id: None,
     }
 }
 
@@ -123,7 +122,6 @@ fn default_completion_request() -> CompletionRequest {
         return_hidden_states: false,
         sampling_seed: None,
         other: serde_json::Map::new(),
-        routing_id: None,
     }
 }
 
