@@ -197,7 +197,11 @@ class SamplingBatchInfo:
             return
 
         # Find a grammar from the list
-        first_grammar = next(grammar for grammar in self.grammars if grammar)
+        first_grammar = next((grammar for grammar in self.grammars if grammar), None)
+        if first_grammar is None:
+            self.vocab_mask = None
+            self.apply_mask_func = None
+            return
 
         # TODO(lianmin): Maybe we can reuse the existing mask?
         self.vocab_mask = first_grammar.allocate_vocab_mask(
