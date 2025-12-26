@@ -229,27 +229,31 @@ void multimodal_rotary_embedding_neox_2D_kernel_impl(
           qk[out_y] = _q_y * _cos + _q_x * _sin;
         }
       };
-#pragma omp parallel for
-  for (int64_t token_idx = 0; token_idx < num_tokens; ++token_idx) {
-    int64_t pos_t = positions[token_idx];
-    int64_t pos_h = positions[positions_stride0 + token_idx];
-    int64_t pos_w = positions[positions_stride0 * 2 + token_idx];
-    scalar_t* cache_t_ptr = cos_sin_cache + pos_t * rotary_dim;
-    scalar_t* cache_h_ptr = cos_sin_cache + pos_h * rotary_dim;
-    scalar_t* cache_w_ptr = cos_sin_cache + pos_w * rotary_dim;
+  at::parallel_for(0, num_tokens, 0, [&](int64_t begin, int64_t end) {
+    int64_t token_idx = {0};
+    data_index_init(begin, token_idx, num_tokens);
+    for (int i = begin; i < end; ++i) {
+      int64_t pos_t = positions[token_idx];
+      int64_t pos_h = positions[positions_stride0 + token_idx];
+      int64_t pos_w = positions[positions_stride0 * 2 + token_idx];
+      scalar_t* cache_t_ptr = cos_sin_cache + pos_t * rotary_dim;
+      scalar_t* cache_h_ptr = cos_sin_cache + pos_h * rotary_dim;
+      scalar_t* cache_w_ptr = cos_sin_cache + pos_w * rotary_dim;
 
-    for (int64_t i = 0; i < num_heads; ++i) {
-      int64_t head_idx = i;
-      int64_t token_head = token_idx * query_stride_s + head_idx * head_size;
-      compute_loop(token_head, cache_t_ptr, cache_h_ptr, cache_w_ptr, query);
-    }
+      for (int64_t i = 0; i < num_heads; ++i) {
+        int64_t head_idx = i;
+        int64_t token_head = token_idx * query_stride_s + head_idx * head_size;
+        compute_loop(token_head, cache_t_ptr, cache_h_ptr, cache_w_ptr, query);
+      }
 
-    for (int64_t i = 0; i < num_kv_heads; ++i) {
-      int64_t head_idx = i;
-      int64_t token_head = token_idx * key_stride_s + head_idx * head_size;
-      compute_loop(token_head, cache_t_ptr, cache_h_ptr, cache_w_ptr, key);
+      for (int64_t i = 0; i < num_kv_heads; ++i) {
+        int64_t head_idx = i;
+        int64_t token_head = token_idx * key_stride_s + head_idx * head_size;
+        compute_loop(token_head, cache_t_ptr, cache_h_ptr, cache_w_ptr, key);
+      }
+      data_index_step(token_idx, num_tokens);
     }
-  }
+  });
 }
 
 template <typename scalar_t>
