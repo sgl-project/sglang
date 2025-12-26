@@ -6,6 +6,9 @@ Latent preparation stage for diffusion pipelines.
 """
 from diffusers.utils.torch_utils import randn_tensor
 
+from sglang.multimodal_gen.configs.pipeline_configs import (
+    StableDiffusion3PipelineConfig,
+)
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
@@ -67,7 +70,25 @@ class LatentPreparationStage(PipelineStage):
         )
         height = batch.height
         width = batch.width
+        if isinstance(server_args.pipeline_config, StableDiffusion3PipelineConfig):
+            vae_scale_factor = (
+                server_args.pipeline_config.vae_config.get_vae_scale_factor()
+                if server_args.pipeline_config.vae_config.get_vae_scale_factor()
+                else 8
+            )
+            shape = (
+                batch_size,
+                server_args.pipeline_config.dit_config.arch_config.in_channels,
+                int(height) // vae_scale_factor,
+                int(width) // vae_scale_factor,
+            )
 
+            latents = randn_tensor(
+                shape, generator=generator, device=device, dtype=dtype
+            )
+            batch.latents = latents
+            batch.raw_latent_shape = latents.shape
+            return batch
         # TODO(will): remove this once we add input/output validation for stages
         if height is None or width is None:
             raise ValueError("Height and width must be provided")

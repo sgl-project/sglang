@@ -84,3 +84,11 @@ class T5Config(TextEncoderConfig):
     arch_config: TextEncoderArchConfig = field(default_factory=T5ArchConfig)
 
     prefix: str = "t5"
+
+
+@dataclass
+class T5ConfigForSD3(T5Config):
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        # SD3 uses 256 for T5 encoder
+        self.tokenizer_kwargs.update({"max_length": 256})
