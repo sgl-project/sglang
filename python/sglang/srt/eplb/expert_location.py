@@ -274,12 +274,15 @@ class ExpertLocationMetadata:
             self_field = getattr(self, field)
             assert (other_field is not None) == (self_field is not None)
             if self_field is not None:
-                mask_update = torch.tensor(
-                    [i in update_layer_ids for i in range(self.num_layers)]
-                )
-                mask_update = mask_update.view(*([-1] + [1] * (self_field.dim() - 1)))
-                mask_update = mask_update.to(self_field.device, non_blocking=True)
-                self_field[...] = torch.where(mask_update, other_field, self_field)
+                if len(update_layer_ids) == 1:
+                    self_field[update_layer_ids] = other_field[update_layer_ids]
+                else:
+                    mask_update = torch.tensor(
+                        [i in update_layer_ids for i in range(self.num_layers)]
+                    )
+                    mask_update = mask_update.view(*([-1] + [1] * (self_field.dim() - 1)))
+                    mask_update = mask_update.to(self_field.device, non_blocking=True)
+                    self_field[...] = torch.where(mask_update, other_field, self_field)
 
     # -------------------------------- usage ------------------------------------
 
