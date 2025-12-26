@@ -12,14 +12,12 @@ import torch.nn.functional as F
 
 # TODO (will): remove this dependency
 from sglang.multimodal_gen.runtime.layers.custom_op import CustomOp
-from sglang.multimodal_gen.runtime.utils.common import is_npu
+from sglang.multimodal_gen.runtime.platforms import current_platform
 
-_is_npu = is_npu()
-
-if not _is_npu:
+if not current_platform.is_npu():
     from sgl_kernel import silu_and_mul
 
-if _is_npu:
+if not current_platform.is_npu():
     import torch_npu
 
 

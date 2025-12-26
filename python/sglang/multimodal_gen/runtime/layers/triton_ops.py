@@ -8,9 +8,7 @@ import triton  # type: ignore
 import triton.language as tl  # type: ignore
 from torch import Tensor
 
-from sglang.multimodal_gen.runtime.utils.common import is_npu
-
-_is_npu = is_npu()
+from sglang.multimodal_gen.runtime.platforms import current_platform
 
 
 @triton.autotune(
@@ -333,7 +331,7 @@ def fuse_scale_shift_kernel(
     return output
 
 
-if _is_npu:
+if current_platform.is_npu():
     # TODO: remove this when triton ascend bug is fixed
     def fuse_scale_shift_native(
         x: torch.Tensor,
@@ -521,7 +519,7 @@ def apply_rotary_embedding(
     return output
 
 
-if _is_npu:
+if current_platform.is_npu():
     # TODO: remove this when triton ascend bug is fixed
     def apply_rotary_embedding_native(
         x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, interleaved: bool = False
