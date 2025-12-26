@@ -21,8 +21,6 @@ _MODEL_NAME = "Qwen/Qwen3-0.6B"
 class TestEnableMetrics(CustomTestCase):
     def test_metrics_1gpu(self):
         """Test that metrics endpoint returns data when enabled"""
-        return
-
         self._execute_core(
             other_args=[],
             verify_metrics_extra=None,
