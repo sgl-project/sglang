@@ -17,7 +17,7 @@ from sglang.multimodal_gen.runtime.platforms import current_platform
 if not current_platform.is_npu():
     from sgl_kernel import silu_and_mul
 
-if not current_platform.is_npu():
+if current_platform.is_npu():
     import torch_npu
 
 
