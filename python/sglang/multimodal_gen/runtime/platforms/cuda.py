@@ -14,7 +14,6 @@ from typing import TypeVar
 import torch
 from typing_extensions import ParamSpec
 
-from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.platforms.interface import (
     AttentionBackendEnum,
     DeviceCapability,
@@ -213,7 +212,7 @@ class CudaPlatformBase(Platform):
         elif selected_backend in [
             AttentionBackendEnum.FA,
         ]:
-            if current_platform.is_blackwell():
+            if cls.is_blackwell():
                 from sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn import (
                     set_fa_ver,
                 )
@@ -224,14 +223,14 @@ class CudaPlatformBase(Platform):
             raise ValueError(f"Invalid attention backend for {cls.device_name}")
         else:
 
-            if current_platform.is_blackwell():
+            if cls.is_blackwell():
                 from sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn import (
                     set_fa_ver,
                 )
 
                 set_fa_ver(4)
             target_backend = AttentionBackendEnum.FA
-            if current_platform.is_sm120():
+            if cls.is_sm120():
                 try:
                     from sglang.multimodal_gen.runtime.layers.attention.backends.sage_attn3 import (  # noqa: F401
                         SageAttention3Backend,

@@ -45,7 +45,6 @@ _group_name_counter: dict[str, int] = {}
 
 def get_local_torch_device() -> torch.device:
     """Return the torch device for the current rank."""
-    from sglang.multimodal_gen.runtime.platforms import current_platform
 
     return (
         torch.device(f"cuda:{envs.LOCAL_RANK}")

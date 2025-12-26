@@ -93,11 +93,11 @@ class Platform:
 
     @lru_cache(maxsize=1)
     def is_cuda(self) -> bool:
-        return self._enum == PlatformEnum.CUDA
+        return self.is_cuda_static()
 
     @lru_cache(maxsize=1)
     def is_rocm(self) -> bool:
-        return self._enum == PlatformEnum.ROCM
+        return self.is_rocm_static()
 
     @lru_cache(maxsize=1)
     def is_tpu(self) -> bool:
@@ -107,17 +107,27 @@ class Platform:
     def is_cpu(self) -> bool:
         return self._enum == PlatformEnum.CPU
 
+    @classmethod
     @lru_cache(maxsize=1)
-    def is_blackwell(self):
-        if not self.is_cuda():
+    def is_blackwell(cls):
+        if not cls.is_cuda_static():
             return False
         return torch.cuda.get_device_capability()[0] == 10
 
+    @classmethod
     @lru_cache(maxsize=1)
-    def is_sm120(self):
-        if not self.is_cuda():
+    def is_sm120(cls):
+        if not cls.is_cuda_static():
             return False
         return torch.cuda.get_device_capability()[0] == 12
+
+    @classmethod
+    def is_cuda_static(cls) -> bool:
+        return getattr(cls, "_enum", None) == PlatformEnum.CUDA
+
+    @classmethod
+    def is_rocm_static(cls) -> bool:
+        return getattr(cls, "_enum", None) == PlatformEnum.ROCM
 
     @lru_cache(maxsize=1)
     def is_hpu(self) -> bool:
