@@ -1089,6 +1089,9 @@ class Scheduler(
 
         import os
         enable_profiling: bool = os.getenv("ENABLE_PROFILING", "0") == "1" and self.tp_rank == 0
+        prof_bs: int = os.getenv("PROFILING_BS", 8)
+        profiling_stage: str = os.getenv("PROFILING_STAGE", "decode")
+        prof_step: int = os.getenv("PROFILING_step", 10)
         if enable_profiling:
             prof_cnt = 0
             import torch_npu
@@ -1114,7 +1117,6 @@ class Scheduler(
                 with_flops=False,
                 with_modules=False,
                 experimental_config=experimental_config)
-        prof_bs = 48    # profiling batch
 
         while True:
             # Receive requests
@@ -1136,20 +1138,23 @@ class Scheduler(
             # Launch the current batch
             if batch:
                 if enable_profiling:
-                    # change batch.forward_mode.is_decode() to batch.forward_mode.is_extend() if profiling prefill 
-                    if len(batch.reqs) >= prof_bs and prof_cnt == 0 and batch.forward_mode.is_decode():
+                    is_prof_stage = False
+                    if (profiling_stage == "decode" and batch.forward_mode.is_decode()) or (profiling_stage == "prefill" and batch.forward_mode.is_extend()):
+                        is_prof_stage = True
+                    
+                    if len(batch.reqs) >= prof_bs and prof_cnt == 0 and is_prof_stage:
                         prof.start()
                         prof_cnt += 1
-                    if prof_cnt > 0 and batch.forward_mode.is_decode():
+                    if prof_cnt > 0 and is_prof_stage:
                         prof_cnt += 1
-                    if prof_cnt == 10 and batch.forward_mode.is_decode():
+                    if prof_cnt == prof_step and is_prof_stage:
                         torch.npu.synchronize()
                         prof.stop()
 
                 batch_result = self.run_batch(batch)
                 self.result_queue.append((batch.copy(), batch_result))
 
-                if enable_profiling and prof_cnt > 0 and prof_cnt < 10 and batch.forward_mode.is_decode():
+                if enable_profiling and prof_cnt > 0 and prof_cnt < prof_step and is_prof_stage:
                     prof.step()
             else:
                 batch_result = None
