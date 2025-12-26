@@ -2967,10 +2967,6 @@ class TestGlm47MoeDetector(unittest.TestCase):
             all_normal_text += result.normal_text
             all_calls.extend(result.calls)
 
-        # The Chinese punctuation "结构：" should be preserved as normal text
-        print(f"Normal text: '{all_normal_text}'")
-        print(f"Calls: {all_calls}")
-
         # The expected behavior is that "结构：" should be in normal_text
         # and the function call should be properly parsed
         self.assertIn(
@@ -3019,9 +3015,6 @@ class TestGlm47MoeDetector(unittest.TestCase):
         text = "结构：<tool_call>list_dir<arg_key>path</arg_key><arg_value>/github/sglang</arg_value></tool_call>"
 
         result = self.detector.parse_streaming_increment(text, tools)
-
-        print(f"Result normal text: '{result.normal_text}'")
-        print(f"Result calls: {result.calls}")
 
         # The main issue was that the Chinese punctuation "结构：" was being lost
         # Now it should be preserved as normal text before the tool call
