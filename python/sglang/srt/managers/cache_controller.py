@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 """
 Copyright 2023-2025 SGLang Team
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -12,6 +10,8 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 """
+
+from __future__ import annotations
 
 import logging
 import threading
@@ -508,7 +508,6 @@ class HiCacheController:
         if self.io_backend == "kernel":
             if not host_indices.is_cuda:
                 host_indices = host_indices.to(self.device, non_blocking=True)
-            host_indices = host_indices.sort().values
             return host_indices, device_indices
         elif self.io_backend == "direct":
             if self.mem_pool_host.layout == "layer_first":
