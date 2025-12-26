@@ -37,6 +37,10 @@ class MMMUServerBase(CustomTestCase):
     def setUpClass(cls):
         assert cls.model is not None, "Please set cls.model in subclass"
 
+        # Save original environment variables for restoration in tearDownClass
+        cls._original_openai_api_key = os.environ.get("OPENAI_API_KEY")
+        cls._original_openai_api_base = os.environ.get("OPENAI_API_BASE")
+
         # Set OpenAI API key and base URL environment variables.
         # Needed for lmms-eval to work.
         os.environ["OPENAI_API_KEY"] = cls.api_key
@@ -74,3 +78,14 @@ class MMMUServerBase(CustomTestCase):
             except Exception as e:
                 logger.error(f"Error killing process: {e}")
         time.sleep(2)
+
+        # Restore original environment variables
+        if cls._original_openai_api_key is not None:
+            os.environ["OPENAI_API_KEY"] = cls._original_openai_api_key
+        elif "OPENAI_API_KEY" in os.environ:
+            del os.environ["OPENAI_API_KEY"]
+
+        if cls._original_openai_api_base is not None:
+            os.environ["OPENAI_API_BASE"] = cls._original_openai_api_base
+        elif "OPENAI_API_BASE" in os.environ:
+            del os.environ["OPENAI_API_BASE"]

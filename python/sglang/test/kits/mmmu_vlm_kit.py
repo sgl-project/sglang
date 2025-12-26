@@ -2,6 +2,7 @@ import glob
 import json
 import os
 import subprocess
+import tempfile
 from types import SimpleNamespace
 
 from sglang.srt.utils import kill_process_tree
@@ -78,37 +79,35 @@ class MMMUMixin:
 
     def test_mmmu(self: CustomTestCase):
         """Run MMMU evaluation test."""
-        output_path = "./logs"
-        os.makedirs(output_path, exist_ok=True)
+        with tempfile.TemporaryDirectory() as output_path:
+            # Run evaluation
+            self.run_mmmu_eval(self.model, output_path)
 
-        # Run evaluation
-        self.run_mmmu_eval(self.model, output_path)
+            # Get the result file
+            # Search recursively for JSON result files (lmms-eval v0.4.1+ creates subdirectories)
+            result_files = glob.glob(f"{output_path}/**/*.json", recursive=True)
+            if not result_files:
+                result_files = glob.glob(f"{output_path}/*.json")
 
-        # Get the result file
-        # Search recursively for JSON result files (lmms-eval v0.4.1+ creates subdirectories)
-        result_files = glob.glob(f"{output_path}/**/*.json", recursive=True)
-        if not result_files:
-            result_files = glob.glob(f"{output_path}/*.json")
+            if not result_files:
+                raise FileNotFoundError(f"No JSON result files found in {output_path}")
 
-        if not result_files:
-            raise FileNotFoundError(f"No JSON result files found in {output_path}")
+            result_file_path = result_files[0]
 
-        result_file_path = result_files[0]
+            with open(result_file_path, "r") as f:
+                result = json.load(f)
+                print(f"Result: {result}")
 
-        with open(result_file_path, "r") as f:
-            result = json.load(f)
-            print(f"Result: {result}")
+            # Process the result
+            mmmu_accuracy = result["results"]["mmmu_val"]["mmmu_acc,none"]
+            print(f"Model {self.model} achieved accuracy: {mmmu_accuracy:.4f}")
 
-        # Process the result
-        mmmu_accuracy = result["results"]["mmmu_val"]["mmmu_acc,none"]
-        print(f"Model {self.model} achieved accuracy: {mmmu_accuracy:.4f}")
-
-        # Assert performance meets expected threshold
-        self.assertGreaterEqual(
-            mmmu_accuracy,
-            self.accuracy,
-            f"Model {self.model} accuracy ({mmmu_accuracy:.4f}) below expected threshold ({self.accuracy:.4f})",
-        )
+            # Assert performance meets expected threshold
+            self.assertGreaterEqual(
+                mmmu_accuracy,
+                self.accuracy,
+                f"Model {self.model} accuracy ({mmmu_accuracy:.4f}) below expected threshold ({self.accuracy:.4f})",
+            )
 
 
 class MMMUMultiModelTestBase(CustomTestCase):
@@ -135,9 +134,26 @@ class MMMUMultiModelTestBase(CustomTestCase):
                 mem_fraction_static=DEFAULT_MEM_FRACTION_STATIC
             )
 
+        # Save original environment variables for restoration in tearDownClass
+        cls._original_openai_api_key = os.environ.get("OPENAI_API_KEY")
+        cls._original_openai_api_base = os.environ.get("OPENAI_API_BASE")
+
         # Set OpenAI API key and base URL environment variables. Needed for lmm-evals to work.
         os.environ["OPENAI_API_KEY"] = cls.api_key
         os.environ["OPENAI_API_BASE"] = f"{cls.base_url}/v1"
+
+    @classmethod
+    def tearDownClass(cls):
+        # Restore original environment variables
+        if cls._original_openai_api_key is not None:
+            os.environ["OPENAI_API_KEY"] = cls._original_openai_api_key
+        elif "OPENAI_API_KEY" in os.environ:
+            del os.environ["OPENAI_API_KEY"]
+
+        if cls._original_openai_api_base is not None:
+            os.environ["OPENAI_API_BASE"] = cls._original_openai_api_base
+        elif "OPENAI_API_BASE" in os.environ:
+            del os.environ["OPENAI_API_BASE"]
 
     def run_mmmu_eval(
         self,
