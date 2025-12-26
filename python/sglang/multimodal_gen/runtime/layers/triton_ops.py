@@ -874,7 +874,7 @@ def norm_infer(
     out: Optional[Tensor] = None,
 ):
     M, N = x.shape
-    assert x.stride(-1) == 1
+    x = x.contiguous()
     if weight is not None:
         assert weight.shape == (N,)
         assert weight.stride(-1) == 1

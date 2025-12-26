@@ -41,7 +41,7 @@ def backend_name_to_enum(backend_name: str) -> AttentionBackendEnum | None:
 
 def get_env_variable_attn_backend() -> AttentionBackendEnum | None:
     """
-    Get the backend override specified by the sgl-diffusion attention
+    Get the backend override specified by the sglang-diffusion attention
     backend environment variable, if one is specified.
 
     Returns:
@@ -91,13 +91,13 @@ def get_attn_backend(
     dtype: torch.dtype,
     supported_attention_backends: set[AttentionBackendEnum] | None = None,
 ) -> type[AttentionBackend]:
-    if supported_attention_backends is not None:
+    if supported_attention_backends is None:
+        be_tuple = tuple()
+    else:
         # Sort the backend names to ensure consistent cache key
         be_tuple = tuple(
             sorted(list(supported_attention_backends), key=lambda b: b.name)
         )
-    else:
-        be_tuple = None
     return _cached_get_attn_backend(head_size, dtype, be_tuple)
 
 
@@ -105,18 +105,16 @@ def get_attn_backend(
 def _cached_get_attn_backend(
     head_size: int,
     dtype: torch.dtype,
-    supported_attention_backends: tuple[AttentionBackendEnum] | None = None,
+    supported_attention_backends: tuple[AttentionBackendEnum],
 ) -> type[AttentionBackend]:
     # Check whether a particular choice of backend was
     # previously forced.
     #
-    # THIS SELECTION OVERRIDES THE SGL_DIFFUSION_ATTENTION_BACKEND
+    # THIS SELECTION OVERRIDES THE SGLANG_DIFFUSION_ATTENTION_BACKEND
     # ENVIRONMENT VARIABLE.
     from sglang.multimodal_gen.runtime.platforms import current_platform
 
     supported_attention_backends = set(supported_attention_backends)
-    if not supported_attention_backends:
-        raise ValueError("supported_attention_backends is empty")
     selected_backend = None
     backend_by_global_setting: AttentionBackendEnum | None = (
         get_global_forced_attn_backend()
@@ -139,12 +137,12 @@ def _cached_get_attn_backend(
                 )
 
     # get device-specific attn_backend
-    if selected_backend is None:
+    if len(supported_attention_backends) == 0:
+        # all attention backends are allowed
+        pass
+    elif selected_backend is None:
         logger.debug(f"Attention backend not specified")
-    elif (
-        not supported_attention_backends
-        or selected_backend not in supported_attention_backends
-    ):
+    elif selected_backend not in supported_attention_backends:
         supported_attention_backends_str = [
             supported_attention_backend.__str__()
             for supported_attention_backend in supported_attention_backends
@@ -169,7 +167,7 @@ def global_force_attn_backend_context_manager(
     attn_backend: AttentionBackendEnum,
 ) -> Generator[None, None, None]:
     """
-    Globally force a sgl-diffusion attention backend override within a
+    Globally force a sglang-diffusion attention backend override within a
     context manager, reverting the global attention backend
     override to its prior state upon exiting the context
     manager.

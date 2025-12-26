@@ -13,7 +13,6 @@ from sglang.multimodal_gen.configs.models.dits import WanVideoConfig
 from sglang.multimodal_gen.configs.sample.wan import WanTeaCacheParams
 from sglang.multimodal_gen.runtime.distributed.parallel_state import get_sp_world_size
 from sglang.multimodal_gen.runtime.layers.attention import (
-    LocalAttention,
     UlyssesAttention_VSA,
     USPAttention,
 )
@@ -138,7 +137,7 @@ class WanSelfAttention(nn.Module):
         self.norm_k = RMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
 
         # Scaled dot product attention
-        self.attn = LocalAttention(
+        self.attn = USPAttention(
             num_heads=num_heads,
             head_size=self.head_dim,
             dropout_rate=0,
@@ -391,7 +390,7 @@ class WanTransformerBlock(nn.Module):
         query, key = _apply_rotary_emb(
             query, cos, sin, is_neox_style=False
         ), _apply_rotary_emb(key, cos, sin, is_neox_style=False)
-        attn_output, _ = self.attn1(query, key, value)
+        attn_output = self.attn1(query, key, value)
         attn_output = attn_output.flatten(2)
         attn_output, _ = self.to_out(attn_output)
         attn_output = attn_output.squeeze(1)
@@ -560,7 +559,7 @@ class WanTransformerBlock_VSA(nn.Module):
             query, cos, sin, is_neox_style=False
         ), _apply_rotary_emb(key, cos, sin, is_neox_style=False)
 
-        attn_output, _ = self.attn1(query, key, value, gate_compress=gate_compress)
+        attn_output = self.attn1(query, key, value, gate_compress=gate_compress)
         attn_output = attn_output.flatten(2)
         attn_output, _ = self.to_out(attn_output)
         attn_output = attn_output.squeeze(1)
@@ -611,6 +610,7 @@ class WanTransformer3DModel(CachableDiT):
         self.num_channels_latents = config.num_channels_latents
         self.patch_size = config.patch_size
         self.text_len = config.text_len
+        self.dit_module_names = ["blocks"]
 
         # 1. Patch & position embedding
         self.patch_embedding = PatchEmbed(
@@ -793,10 +793,25 @@ class WanTransformer3DModel(CachableDiT):
             if enable_teacache:
                 original_hidden_states = hidden_states.clone()
 
-            for block in self.blocks:
-                hidden_states = block(
-                    hidden_states, encoder_hidden_states, timestep_proj, freqs_cis
-                )
+            offload_mgr = getattr(self, "_layerwise_offload_manager", None)
+            if offload_mgr is not None and getattr(offload_mgr, "enabled", False):
+                for i, block in enumerate(self.blocks):
+                    with offload_mgr.layer_scope(
+                        prefetch_layer_idx=i + 1,
+                        release_layer_idx=i,
+                        non_blocking=True,
+                    ):
+                        hidden_states = block(
+                            hidden_states,
+                            encoder_hidden_states,
+                            timestep_proj,
+                            freqs_cis,
+                        )
+            else:
+                for block in self.blocks:
+                    hidden_states = block(
+                        hidden_states, encoder_hidden_states, timestep_proj, freqs_cis
+                    )
             # if teacache is enabled, we need to cache the original hidden states
             if enable_teacache:
                 self.maybe_cache_states(hidden_states, original_hidden_states)

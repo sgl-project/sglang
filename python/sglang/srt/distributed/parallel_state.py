@@ -327,7 +327,7 @@ class GroupCoordinator:
 
         # Lazy import to avoid documentation build error
         from sglang.srt.distributed.device_communicators.custom_all_reduce import (
-            CustomAllreduce,
+            dispatch_custom_allreduce,
         )
         from sglang.srt.distributed.device_communicators.pymscclpp import (
             PyMscclppCommunicator,
@@ -366,15 +366,33 @@ class GroupCoordinator:
                 device=self.device,
             )
 
-        self.ca_comm: Optional[CustomAllreduce] = None
+        self.ca_comm: Optional[Any] = None
         self.qr_comm: Optional[QuickAllReduce] = None
         if use_custom_allreduce and self.world_size > 1:
             # Initialize a custom fast all-reduce implementation.
             try:
-                self.ca_comm = CustomAllreduce(
+                CAClass = dispatch_custom_allreduce()
+                self.ca_comm = CAClass(
                     group=self.cpu_group,
                     device=self.device,
                 )
+                # Log which all-reduce mode will be used
+                if is_hip():
+                    if envs.SGLANG_USE_1STAGE_ALLREDUCE.is_set():
+                        if envs.SGLANG_USE_1STAGE_ALLREDUCE.get():
+                            logger.info(
+                                "[AR] All-reduce: 1-stage kernel (SGLANG_USE_1STAGE_ALLREDUCE=1)"
+                            )
+                        else:
+                            logger.info(
+                                "[AR] All-reduce: default (SGLANG_USE_1STAGE_ALLREDUCE=0)"
+                            )
+                    elif envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get():
+                        logger.info(
+                            "[AR] All-reduce: 1-stage kernel (deterministic inference enabled)"
+                        )
+                    else:
+                        logger.info("[AR] All-reduce: default")
             except Exception as e:
                 logger.warning(
                     f"Setup Custom allreduce failed with {e}. To silence this "
@@ -392,6 +410,8 @@ class GroupCoordinator:
                         )
                 except Exception as e:
                     logger.warning(f"Failed to initialize QuickAllReduce: {e}")
+        elif self.world_size > 1 and is_hip():
+            logger.info("[AR] All-reduce call path: NCCL (custom AR disabled)")
 
         self.torch_symm_mem_comm: Optional[TorchSymmMemCommunicator] = None
         if self.use_torch_symm_mem_all_reduce and self.world_size > 1:
@@ -559,6 +579,26 @@ class GroupCoordinator:
         if self.world_size == 1:
             return input_
 
+        # On AMD, use the deterministic 1-stage kernel when:
+        # - SGLANG_USE_1STAGE_ALLREDUCE=1 (explicitly enabled), OR
+        # - SGLANG_USE_1STAGE_ALLREDUCE not set AND --enable-deterministic-inference is on
+        if envs.SGLANG_USE_1STAGE_ALLREDUCE.is_set():
+            use_1stage_ar = envs.SGLANG_USE_1STAGE_ALLREDUCE.get()
+        else:
+            use_1stage_ar = envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get()
+        use_deterministic_ar = is_hip() and use_1stage_ar
+        if use_deterministic_ar:
+            if not input_.is_cpu and self.ca_comm is not None:
+                inp_size = input_.numel() * input_.element_size()
+                # Try unregistered mode first (faster for smaller tensors)
+                if inp_size < self.ca_comm.max_size:
+                    return self.ca_comm.deterministic_all_reduce(
+                        input_, registered=False
+                    )
+                # Use registered mode for larger tensors
+                self.ca_comm.register_buffer(input_)
+                return self.ca_comm.deterministic_all_reduce(input_, registered=True)
+
         if input_.is_cpu:
             if is_shm_available(input_.dtype, self.world_size, self.local_size):
                 torch.ops.sgl_kernel.shm_allreduce(input_, REDUCE_OP_SUM)
@@ -628,7 +668,7 @@ class GroupCoordinator:
         qr_comm = self.qr_comm
         pymscclpp_comm = self.pymscclpp_comm
         torch_symm_mem_comm = self.torch_symm_mem_comm
-        assert any([qr_comm, ca_comm, pymscclpp_comm])
+        assert any([qr_comm, ca_comm, pymscclpp_comm, torch_symm_mem_comm])
         if outplace_all_reduce_method == "ca":
             assert not ca_comm.disabled
             out = ca_comm.custom_all_reduce(input_)
@@ -746,6 +786,24 @@ class GroupCoordinator:
             torch.ops.sglang.reg_all_gather_into_tensor(
                 output, input, group_name=self.unique_name
             )
+
+    def cp_all_gather_into_tensor_async(
+        self, output: torch.Tensor, input: torch.Tensor, stream=None
+    ):
+        """
+        Implement an asynchronous `allgather` operation on a specified stream.
+        (the default `torch.distributed.all_gather_into_tensor` will trigger event synchronization),
+        eliminating the CPU-side launch-kernel blocking issue caused by synchronization problems.
+        The specific implementation uses the interface provided by pynccl to remove the synchronization logic of events.
+        """
+        assert (
+            stream is not None
+        ), f"Invalid params stream ({stream}, Please specify the stream to use when calling cp_all_gather_into_tensor_async.)"
+        pynccl_comm = self.pynccl_comm
+        if pynccl_comm is None or pynccl_comm.disabled:
+            self.all_gather_into_tensor(output, input)
+        else:
+            pynccl_comm.cp_all_gather_into_tensor(output, input, stream=stream)
 
     def all_gather(
         self,

@@ -69,16 +69,29 @@ class RocmPlatform(Platform):
         dtype: torch.dtype,
     ) -> str:
         logger.info(
-            "Trying SGL_DIFFUSION_ATTENTION_BACKEND=%s",
-            envs.SGL_DIFFUSION_ATTENTION_BACKEND,
+            "Trying SGLANG_DIFFUSION_ATTENTION_BACKEND=%s",
+            envs.SGLANG_DIFFUSION_ATTENTION_BACKEND,
         )
 
         if selected_backend == AttentionBackendEnum.TORCH_SDPA:
             logger.info("Using Torch SDPA backend.")
             return "sglang.multimodal_gen.runtime.layers.attention.backends.sdpa.SDPABackend"
 
-        elif selected_backend in (AttentionBackendEnum.FA3, None):
+        elif selected_backend in (AttentionBackendEnum.FA, None):
             pass
+
+        elif selected_backend == AttentionBackendEnum.AITER:
+            if dtype not in (torch.float16, torch.bfloat16):
+                logger.warning(
+                    "AITer backend only supports fp16/bf16 inputs but got dtype=%s. "
+                    "Falling back to Torch SDPA backend.",
+                    dtype,
+                )
+                # TODO: need to compare triton with sdpa as an alternative backend
+                return "sglang.multimodal_gen.runtime.layers.attention.backends.sdpa.SDPABackend"
+
+            logger.info("Using AITer backend on ROCm.")
+            return "sglang.multimodal_gen.runtime.layers.attention.backends.aiter.AITerBackend"
 
         elif selected_backend in (
             AttentionBackendEnum.SLIDING_TILE_ATTN,
@@ -92,7 +105,7 @@ class RocmPlatform(Platform):
                 f"Invalid attention backend for {cls.device_name}: {selected_backend}"
             )
 
-        target_backend = AttentionBackendEnum.FA3
+        target_backend = AttentionBackendEnum.FA
         if dtype not in (torch.float16, torch.bfloat16):
             logger.info(
                 "Cannot use FlashAttention backend for dtype other than "
@@ -100,7 +113,7 @@ class RocmPlatform(Platform):
             )
             target_backend = AttentionBackendEnum.TORCH_SDPA
 
-        if target_backend == AttentionBackendEnum.FA3:
+        if target_backend == AttentionBackendEnum.FA:
             try:
                 import flash_attn  # noqa: F401
 

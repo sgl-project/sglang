@@ -9,7 +9,6 @@ from typing import Any
 import torch
 
 from sglang.multimodal_gen.configs.models.base import ArchConfig, ModelConfig
-from sglang.multimodal_gen.runtime.models.vision_utils import get_default_height_width
 from sglang.multimodal_gen.utils import StoreBoolean
 
 
@@ -26,7 +25,7 @@ class VAEArchConfig(ArchConfig):
 class VAEConfig(ModelConfig):
     arch_config: VAEArchConfig = field(default_factory=VAEArchConfig)
 
-    # sgl-diffusionVAE-specific parameters
+    # sglang-diffusion VAE-specific parameters
     load_encoder: bool = True
     load_decoder: bool = True
 
@@ -50,13 +49,6 @@ class VAEConfig(ModelConfig):
 
     def post_init(self):
         pass
-
-    # returns width, height
-    def calculate_dimensions(
-        self, image, vae_scale_factor, width, height
-    ) -> tuple[int, int]:
-        height, width = get_default_height_width(image, vae_scale_factor, height, width)
-        return width, height
 
     @staticmethod
     def add_cli_args(parser: Any, prefix: str = "vae-config") -> Any:
@@ -147,6 +139,12 @@ class VAEConfig(ModelConfig):
         )
 
         return parser
+
+    def get_vae_scale_factor(self):
+        return 2 ** (len(self.arch_config.block_out_channels) - 1)
+
+    def encode_sample_mode(self):
+        return "argmax"
 
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace) -> "VAEConfig":

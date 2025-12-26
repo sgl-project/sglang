@@ -182,6 +182,7 @@ python3 -m sglang.launch_server \
   - `backend_name`: Custom backend identifier
   - `module_path`: Python module path to your implementation
   - `class_name`: Your HiCache implementation class name
+  - `interface_v1`: 0 (disable) or 1 (enable) to control usage of batch_get_v1 and batch_set_v1 methods
 
 
 ## Community and Support

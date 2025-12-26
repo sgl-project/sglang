@@ -1,4 +1,3 @@
-import asyncio
 import math
 import os
 import re
@@ -13,6 +12,7 @@ from torchvision.transforms import InterpolationMode
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
+from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
 from sglang.srt.models.qwen2_5_vl import Qwen2_5_VLForConditionalGeneration
 from sglang.srt.models.qwen2_vl import Qwen2VLForConditionalGeneration
 from sglang.srt.models.qwen3_omni_moe import Qwen3OmniMoeForConditionalGeneration
@@ -79,26 +79,6 @@ def smart_resize(
     return h_bar, w_bar
 
 
-def resize_image(
-    image,
-    min_pixels: int = MIN_PIXELS,
-    max_pixels: int = MAX_PIXELS,
-    size_factor: int = IMAGE_FACTOR,
-) -> Image.Image:
-    width, height = image.size
-    min_pixels = min_pixels
-    max_pixels = max_pixels
-    resized_height, resized_width = smart_resize(
-        height,
-        width,
-        factor=size_factor,
-        min_pixels=min_pixels,
-        max_pixels=max_pixels,
-    )
-    image = image.resize((resized_width, resized_height), resample=RESIZE_RESAMPLE)
-    return image
-
-
 def round_by_factor(number: int, factor: int) -> int:
     """Returns the closest integer to 'number' that is divisible by 'factor'."""
     return round(number / factor) * factor
@@ -112,15 +92,6 @@ def ceil_by_factor(number: int, factor: int) -> int:
 def floor_by_factor(number: int, factor: int) -> int:
     """Returns the largest integer less than or equal to 'number' that is divisible by 'factor'."""
     return math.floor(number / factor) * factor
-
-
-async def resize_image_async(
-    image,
-    min_pixels: int = MIN_PIXELS,
-    max_pixels: int = MAX_PIXELS,
-    size_factor: int = IMAGE_FACTOR,
-):
-    return resize_image(image, min_pixels, max_pixels, size_factor)
 
 
 def smart_nframes(
@@ -175,37 +146,44 @@ def smart_nframes(
 async def preprocess_video(
     vr,
     image_factor: int = IMAGE_FACTOR,
-    # vr: VideoReader, image_factor: int = IMAGE_FACTOR
+    video_config: dict = {},
 ) -> torch.Tensor:
     entry_time = time.perf_counter()
-    ele = {}
+
     total_frames, video_fps = len(vr), vr.get_avg_fps()
-    nframes = smart_nframes({}, total_frames=total_frames, video_fps=video_fps)
+    nframes = smart_nframes(
+        video_config, total_frames=total_frames, video_fps=video_fps
+    )
     idx = np.linspace(0, total_frames - 1, num=nframes, dtype=np.int64)
     idx = np.unique(idx)
     video_np = vr.get_batch(idx).asnumpy()
     video = torch.from_numpy(video_np).pin_memory()
     video = video.permute(0, 3, 1, 2)  # Convert to TCHW format
+
     nframes, _, height, width = video.shape
-    min_pixels = ele.get("min_pixels", VIDEO_MIN_PIXELS)
-    total_pixels = ele.get("total_pixels", VIDEO_TOTAL_PIXELS)
+    min_pixels = video_config.get("min_pixels", VIDEO_MIN_PIXELS)
+    total_pixels = video_config.get("total_pixels", VIDEO_TOTAL_PIXELS)
     max_pixels = max(
-        min(VIDEO_MAX_PIXELS, total_pixels / nframes * FRAME_FACTOR),
+        min(
+            video_config.get("max_pixels", VIDEO_MAX_PIXELS),
+            total_pixels / nframes * FRAME_FACTOR,
+        ),
         int(min_pixels * 1.05),
     )
 
     get_batch_time = time.perf_counter()
 
-    max_pixels_supposed = ele.get("max_pixels", max_pixels)
+    max_pixels_supposed = video_config.get("max_pixels", max_pixels)
+
     if max_pixels_supposed > max_pixels:
         logger.warning(
             f"The given max_pixels[{max_pixels_supposed}] exceeds limit[{max_pixels}]."
         )
     max_pixels = min(max_pixels_supposed, max_pixels)
-    if "resized_height" in ele and "resized_width" in ele:
+    if "resized_height" in video_config and "resized_width" in video_config:
         resized_height, resized_width = smart_resize(
-            ele["resized_height"],
-            ele["resized_width"],
+            video_config["resized_height"],
+            video_config["resized_width"],
             factor=image_factor,
         )
     else:
@@ -260,17 +238,17 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
 
         self.IM_START_TOKEN_ID = hf_config.vision_start_token_id
         self.IM_END_TOKEN_ID = hf_config.vision_end_token_id
+        self.IM_TOKEN_ID = hf_config.image_token_id
+
         self.vision_start_token_id = hf_config.vision_start_token_id
-        self.vision_end_token_id = hf_config.vision_end_token_id
+        self.vision_end_token_id = getattr(hf_config, "vision_end_token_id", None)
 
         self.audio_start_token_id = getattr(hf_config, "audio_start_token_id", None)
         self.audio_token_id = getattr(hf_config, "audio_token_id", None)
 
-        self.NUM_TOKEN_PER_FRAME = 770
-        self.IMAGE_FACTOR = 28
-        self.MIN_PIXELS = 4 * 28 * 28
-        self.MAX_PIXELS = 16384 * 28 * 28
-        self.MAX_RATIO = 200
+        self.image_config = server_args.mm_process_config.get("image", {})
+        self.video_config = server_args.mm_process_config.get("video", {})
+
         self.mm_tokens = MultimodalSpecialTokens(
             image_token="<|vision_start|><|image_pad|><|vision_end|>",
             image_token_id=hf_config.image_token_id,
@@ -281,6 +259,42 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
             video_token_id=hf_config.video_token_id,
             audio_token_id=self.audio_token_id,
         ).build(_processor)
+
+    def get_mm_data(self, prompt, embeddings, img_grid_thw):
+        input_ids, offsets = self.build_input_ids(prompt, img_grid_thw)
+        mrope_positions, mrope_position_delta = MRotaryEmbedding.get_rope_index(
+            spatial_merge_size=self.hf_config.vision_config.spatial_merge_size,
+            image_token_id=self.mm_tokens.image_token_id,
+            video_token_id=self.mm_tokens.video_token_id,
+            vision_start_token_id=self.vision_start_token_id,
+            model_type=self.model_type,
+            input_ids=torch.tensor(input_ids, dtype=torch.long).unsqueeze(0),
+            image_grid_thw=img_grid_thw,
+            tokens_per_second=getattr(
+                self.hf_config.vision_config, "tokens_per_second", None
+            ),
+        )
+        mrope_positions = mrope_positions.squeeze(1)
+
+        mm_items = [
+            MultimodalDataItem(
+                modality=Modality.IMAGE,
+                offsets=offsets,
+                precomputed_embeddings=embeddings,
+            )
+        ]
+
+        return {
+            "input_ids": input_ids,
+            "mm_items": mm_items,
+            "im_start_id": self.IM_START_TOKEN_ID,
+            "im_end_id": self.IM_END_TOKEN_ID,
+            "im_token_id": self.mm_tokens.image_token_id,
+            "video_token_id": self.mm_tokens.video_token_id,
+            "audio_token_id": self.mm_tokens.audio_token_id,
+            "mrope_positions": mrope_positions,
+            "mrope_position_delta": mrope_position_delta,
+        }
 
     async def process_mm_data_async(
         self,
@@ -301,15 +315,11 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
         load_time = time.perf_counter()
         rid = getattr(request_obj, "rid", "anonymous_rid")
 
-        # Qwen-specific: resize images if they are raw Image objects
-        if base_output.images and isinstance(base_output.images[0], Image.Image):
-            resize_tasks = [resize_image_async(image) for image in base_output.images]
-            base_output.images = await asyncio.gather(*resize_tasks)
-
         video_metadata = None
         if base_output.videos:
             videos_processed = [
-                await preprocess_video(video) for video in base_output.videos
+                await preprocess_video(video, video_config=self.video_config)
+                for video in base_output.videos
             ]
             base_output.videos, video_metadata = map(list, zip(*videos_processed))
 
@@ -337,13 +347,29 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
                     audio_item.feature_attention_mask, dim=1
                 )
 
-        second_per_grid_ts = getattr(ret, "second_per_grid_ts", None) or getattr(
-            ret, "video_second_per_grid", None
-        )
+        second_per_grid_ts = getattr(ret, "second_per_grid_ts", None)
+        if second_per_grid_ts is None:
+            second_per_grid_ts = getattr(ret, "video_second_per_grid", None)
 
         process_time = time.perf_counter()
 
         input_ids = input_ids.flatten()
+
+        image_grid_thw = None
+        if hasattr(ret, "image_grid_thw"):
+            image_grid_thw = ret.image_grid_thw
+
+        if image_grid_thw is None and image_data and isinstance(image_data[0], dict):
+            image_grid_thw = image_data[0].get("image_grid_thw")
+
+        video_grid_thw = None
+        if hasattr(ret, "video_grid_thw"):
+            video_grid_thw = ret.video_grid_thw
+
+        if video_grid_thw is None and request_obj.video_data:
+            first_video = request_obj.video_data[0]
+            if isinstance(first_video, dict):
+                video_grid_thw = first_video.get("video_grid_thw")
 
         mrope_positions, mrope_position_delta = MRotaryEmbedding.get_rope_index(
             spatial_merge_size=self.hf_config.vision_config.spatial_merge_size,
@@ -354,6 +380,7 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
             tokens_per_second=getattr(
                 self.hf_config.vision_config, "tokens_per_second", None
             ),
+            # use the expanded token ids
             input_ids=input_ids.unsqueeze(0),
             image_grid_thw=getattr(ret, "image_grid_thw", None),
             video_grid_thw=getattr(ret, "video_grid_thw", None),
@@ -380,8 +407,8 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
         return {
             "input_ids": input_ids.tolist(),
             "mm_items": mm_items,
-            "im_start_id": self.IM_START_TOKEN_ID,
-            "im_end_id": self.IM_END_TOKEN_ID,
+            "im_start_id": self.vision_start_token_id,
+            "im_end_id": self.vision_end_token_id,
             "im_token_id": self.mm_tokens.image_token_id,
             "video_token_id": self.mm_tokens.video_token_id,
             "audio_token_id": self.mm_tokens.audio_token_id,

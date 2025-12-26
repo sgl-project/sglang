@@ -1,17 +1,20 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
 import multiprocessing as mp
+import os
+import sys
 
 import uvicorn
 
 from sglang.multimodal_gen.runtime.entrypoints.http_server import create_app
 from sglang.multimodal_gen.runtime.managers.gpu_worker import run_scheduler_process
-from sglang.multimodal_gen.runtime.server_args import ServerArgs, set_global_server_args
-from sglang.multimodal_gen.runtime.utils.logging_utils import (
-    configure_logger,
-    logger,
-    suppress_other_loggers,
+from sglang.multimodal_gen.runtime.server_args import (
+    ServerArgs,
+    prepare_server_args,
+    set_global_server_args,
 )
+from sglang.multimodal_gen.runtime.utils.logging_utils import configure_logger, logger
+from sglang.srt.utils import kill_process_tree
 
 
 def launch_server(server_args: ServerArgs, launch_http_server: bool = True):
@@ -20,7 +23,6 @@ def launch_server(server_args: ServerArgs, launch_http_server: bool = True):
         launch_http_server: False for offline local mode
     """
     configure_logger(server_args)
-    suppress_other_loggers()
 
     # Start a new server with multiple worker processes
     logger.info("Starting server...")
@@ -66,7 +68,7 @@ def launch_server(server_args: ServerArgs, launch_http_server: bool = True):
                     task_pipes_to_slaves_w,
                     result_pipes_from_slaves_r,
                 ),
-                name=f"sgl-diffusionWorker-{i}",
+                name=f"sglang-diffusionWorker-{i}",
                 daemon=True,
             )
         else:  # Slave workers
@@ -83,7 +85,7 @@ def launch_server(server_args: ServerArgs, launch_http_server: bool = True):
                     task_pipes_to_slaves_r[i - 1],
                     result_pipes_from_slaves_w[i - 1],
                 ),
-                name=f"sgl-diffusionWorker-{i}",
+                name=f"sglang-diffusionWorker-{i}",
                 daemon=True,
             )
         scheduler_pipe_readers.append(reader)
@@ -127,16 +129,37 @@ def launch_server(server_args: ServerArgs, launch_http_server: bool = True):
 
     if launch_http_server:
         logger.info("Starting FastAPI server.")
+        if server_args.webui:
+            logger.info("Launch FastAPI server in another process because of webui.")
+            http_server_process = mp.Process(
+                target=launch_http_server_only,
+                args=(server_args,),
+                name=f"sglang-diffusion-webui",
+                daemon=True,
+            )
+            http_server_process.start()
+        else:
+            launch_http_server_only(server_args)
 
-        # set for endpoints to access global_server_args
-        set_global_server_args(server_args)
 
-        app = create_app(server_args)
-        uvicorn.run(
-            app,
-            log_config=None,
-            log_level=server_args.log_level,
-            host=server_args.host,
-            port=server_args.port,
-            reload=False,
-        )
+def launch_http_server_only(server_args):
+    # set for endpoints to access global_server_args
+    set_global_server_args(server_args)
+    app = create_app(server_args)
+    uvicorn.run(
+        app,
+        use_colors=True,
+        log_level=server_args.log_level,
+        host=server_args.host,
+        port=server_args.port,
+        reload=False,
+    )
+
+
+if __name__ == "__main__":
+    server_args = prepare_server_args(sys.argv[1:])
+
+    try:
+        launch_server(server_args)
+    finally:
+        kill_process_tree(os.getpid(), include_parent=False)
