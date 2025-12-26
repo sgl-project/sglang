@@ -1087,6 +1087,35 @@ class Scheduler(
             tmp_batch, tmp_result = self.result_queue.popleft()
             self.process_batch_result(tmp_batch, tmp_result)
 
+        import os
+        enable_profiling: bool = os.getenv("ENABLE_PROFILING", "0") == "1" and self.tp_rank == 0
+        if enable_profiling:
+            prof_cnt = 0
+            import torch_npu
+            experimental_config = torch_npu.profiler._ExperimentalConfig(
+                aic_metrics=torch_npu.profiler.AiCMetrics.PipeUtilization,
+                profiler_level=torch_npu.profiler.ProfilerLevel.Level2,
+                l2_cache=False,
+                data_simplification=False,
+            )
+            profiling_path = "profiling/"
+            prof = torch_npu.profiler.profile(
+                activities=[
+                    torch_npu.profiler.ProfilerActivity.CPU,
+                    torch_npu.profiler.ProfilerActivity.NPU,
+                ],
+                on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(
+                    profiling_path
+                ),
+                schedule=torch_npu.profiler.schedule(wait=1, warmup=1, active=10, repeat=1, skip_first=1),
+                record_shapes=True,
+                profile_memory=True,
+                with_stack=False,
+                with_flops=False,
+                with_modules=False,
+                experimental_config=experimental_config)
+        prof_bs = 48    # profiling batch
+
         while True:
             # Receive requests
             recv_reqs = self.recv_requests()
@@ -1106,8 +1135,22 @@ class Scheduler(
 
             # Launch the current batch
             if batch:
+                if enable_profiling:
+                    # change batch.forward_mode.is_decode() to batch.forward_mode.is_extend() if profiling prefill 
+                    if len(batch.reqs) >= prof_bs and prof_cnt == 0 and batch.forward_mode.is_decode():
+                        prof.start()
+                        prof_cnt += 1
+                    if prof_cnt > 0 and batch.forward_mode.is_decode():
+                        prof_cnt += 1
+                    if prof_cnt == 10 and batch.forward_mode.is_decode():
+                        torch.npu.synchronize()
+                        prof.stop()
+
                 batch_result = self.run_batch(batch)
                 self.result_queue.append((batch.copy(), batch_result))
+
+                if enable_profiling and prof_cnt > 0 and prof_cnt < 10 and batch.forward_mode.is_decode():
+                    prof.step()
             else:
                 batch_result = None
 
