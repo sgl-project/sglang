@@ -1725,7 +1725,8 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
     ) -> None:
         """Calculate speculative decoding metrics, such as acceptance rate and acceptance length metrics."""
         if (
-            recv_obj.spec_verify_ct[i] > 0
+            hasattr(recv_obj, "spec_verify_ct")
+            and recv_obj.spec_verify_ct[i] > 0
             and hasattr(recv_obj, "spec_accepted_tokens")
             and len(recv_obj.spec_accepted_tokens) > i
         ):
