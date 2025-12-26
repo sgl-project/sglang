@@ -602,7 +602,6 @@ jobs:
         timeout-minutes: 15
         run: |
           bash scripts/ci/amd_ci_exec.sh python3 -m unittest test_bench_serving.TestBenchServing.test_offline_throughput_default_fp8
-          
 
   performance-test-2-gpu-amd:
     needs: [check-changes, unit-test-backend-2-gpu-amd]
@@ -670,7 +669,7 @@ jobs:
         timeout-minutes: 15
         run: |
           bash scripts/ci/amd_ci_exec.sh python3 -m unittest test_bench_serving.TestBenchServing.test_pp_long_context_prefill
-          
+
   accuracy-test-1-gpu-amd:
     needs: [check-changes, stage-a-test-1-amd]
     if: |
