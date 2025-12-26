@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use sgl_model_gateway::{
     core::{BasicWorkerBuilder, ModelCard, Worker, WorkerType},
