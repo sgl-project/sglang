@@ -1,15 +1,14 @@
 # Adapted from https://github.com/vllm-project/vllm-ascend/blob/v0.11.0-dev/vllm_ascend/distributed/device_communicators/pyhccl_wrapper.py
 
-import os
-import logging
 import ctypes
+import logging
+import os
 import platform
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 import torch
 from torch.distributed import ReduceOp
-
 
 # export types and functions from hccl to Python ===
 # for the original hccl definition, please check
@@ -22,6 +21,7 @@ hcclComm_t = ctypes.c_void_p
 
 logger = logging.getLogger(__name__)
 
+
 class hcclUniqueId(ctypes.Structure):
     _fields_ = [("internal", ctypes.c_byte * 4108)]
 
@@ -32,6 +32,7 @@ buffer_type = ctypes.c_void_p
 hcclDataType_t = ctypes.c_int
 
 _CURRENT_STREAM = None
+
 
 def find_hccl_library() -> str:
     """
@@ -44,8 +45,7 @@ def find_hccl_library() -> str:
 
     # manually load the hccl library
     if so_file:
-        logger.info("Found hccl from environment variable HCCL_SO_PATH=%s",
-                    so_file)
+        logger.info("Found hccl from environment variable HCCL_SO_PATH=%s", so_file)
     else:
         if torch.version.cann is not None:
             so_file = "libhccl.so"
@@ -53,6 +53,7 @@ def find_hccl_library() -> str:
             raise ValueError("HCCL only supports Ascend NPU backends.")
         logger.info("Found hccl from library %s", so_file)
     return so_file
+
 
 def current_stream() -> torch.npu.Stream:
     """
@@ -69,6 +70,7 @@ def current_stream() -> torch.npu.Stream:
         # we return the default stream.
         _CURRENT_STREAM = torch.npu.current_stream()
     return _CURRENT_STREAM
+
 
 class hcclDataTypeEnum:
     hcclInt8 = 0
@@ -141,81 +143,98 @@ class HCCLLibrary:
         Function("HcclGetErrorString", ctypes.c_char_p, [hcclResult_t]),
 
         # HcclResult HcclGetRootInfo(HcclRootInfo *rootInfo);
-        Function("HcclGetRootInfo", hcclResult_t,
-                 [ctypes.POINTER(hcclUniqueId)]),
+        Function("HcclGetRootInfo", hcclResult_t, [ctypes.POINTER(hcclUniqueId)]),
 
         # HcclResult HcclCommInitRootInfo(
         #   uint32_t nRanks, const HcclRootInfo *rootInfo, uint32_t rank, HcclComm *comm);
         # note that HcclComm is a pointer type, so the last argument is a pointer to a pointer
-        Function("HcclCommInitRootInfo", hcclResult_t, [
-            ctypes.c_int,
-            ctypes.POINTER(hcclUniqueId),
-            ctypes.c_int,
-            ctypes.POINTER(hcclComm_t),
-        ]),
-
+        Function(
+            "HcclCommInitRootInfo",
+            hcclResult_t,
+            [
+                ctypes.c_int,
+                ctypes.POINTER(hcclUniqueId),
+                ctypes.c_int,
+                ctypes.POINTER(hcclComm_t),
+            ],
+        ),
         # HcclResult HcclAllReduce(
         #   void *sendBuf, void *recvBuf, uint64_t count,
         #   HcclDataType dataType, HcclReduceOp op, HcclComm comm,
         #   aclrtStream stream);
-        Function("HcclAllReduce", hcclResult_t, [
-            buffer_type,
-            buffer_type,
-            ctypes.c_size_t,
-            hcclDataType_t,
-            hcclRedOp_t,
-            hcclComm_t,
-            aclrtStream_t,
-        ]),
-
+        Function(
+            "HcclAllReduce",
+            hcclResult_t,
+            [
+                buffer_type,
+                buffer_type,
+                ctypes.c_size_t,
+                hcclDataType_t,
+                hcclRedOp_t,
+                hcclComm_t,
+                aclrtStream_t,
+            ],
+        ),
         # HcclResult HcclBroadcast(
         #   void *buf, uint64_t count,
         #   HcclDataType dataType, uint32_t root,
         #   HcclComm comm, aclrtStream stream);
-        Function("HcclBroadcast", hcclResult_t, [
-            buffer_type,
-            ctypes.c_size_t,
-            hcclDataType_t,
-            ctypes.c_int,
-            hcclComm_t,
-            aclrtStream_t,
-        ]),
-        
+        Function(
+            "HcclBroadcast",
+            hcclResult_t,
+            [
+                buffer_type,
+                ctypes.c_size_t,
+                hcclDataType_t,
+                ctypes.c_int,
+                hcclComm_t,
+                aclrtStream_t,
+            ],
+        ),
         # HcclResult HcclAllGather(
-        #   void *sendBuf, void *recvBuf, 
-        #   uint64_t sendCount, HcclDataType dataType, 
+        #   void *sendBuf, void *recvBuf,
+        #   uint64_t sendCount, HcclDataType dataType,
         #   HcclComm comm, aclrtStream stream);
-        Function("HcclAllGather", hcclResult_t, [
-            buffer_type,
-            buffer_type,
-            ctypes.c_size_t,
-            hcclDataType_t,
-            hcclComm_t,
-            aclrtStream_t,
-        ]),
-        
+        Function(
+            "HcclAllGather",
+            hcclResult_t,
+            [
+                buffer_type,
+                buffer_type,
+                ctypes.c_size_t,
+                hcclDataType_t,
+                hcclComm_t,
+                aclrtStream_t,
+            ],
+        ),
         # HcclResult HcclReduceScatter(
-        #   void *sendBuf, void *recvBuf, 
-        #   uint64_t recvCount, HcclDataType dataType, 
-        #   HcclReduceOp op, HcclComm comm, 
+        #   void *sendBuf, void *recvBuf,
+        #   uint64_t recvCount, HcclDataType dataType,
+        #   HcclReduceOp op, HcclComm comm,
         #   aclrtStream stream);
-        Function("HcclReduceScatter", hcclResult_t, [
-            buffer_type,
-            buffer_type,
-            ctypes.c_size_t,
-            hcclDataType_t,
-            hcclRedOp_t,
-            hcclComm_t,
-            aclrtStream_t,
-        ]),
-
+        Function(
+            "HcclReduceScatter",
+            hcclResult_t,
+            [
+                buffer_type,
+                buffer_type,
+                ctypes.c_size_t,
+                hcclDataType_t,
+                hcclRedOp_t,
+                hcclComm_t,
+                aclrtStream_t,
+            ],
+        ),
         # HcclResult HcclBarrier(
         #   HcclComm comm, aclrtStream stream);
-        Function("HcclBarrier", hcclResult_t, [
-            hcclComm_t,
-            aclrtStream_t,
-        ]),
-
+        Function(
+            "HcclBarrier",
+            hcclResult_t,
+            [
+                hcclComm_t,
+                aclrtStream_t,
+            ],
+        ),
         # HcclResult HcclCommDestroy(HcclComm comm);
         Function("HcclCommDestroy", hcclResult_t, [hcclComm_t]),
     ]
@@ -234,7 +253,7 @@ class HCCLLibrary:
 
         try:
             if so_file not in HCCLLibrary.path_to_dict_mapping:
-                
+
                 lib = ctypes.CDLL(so_file)
                 HCCLLibrary.path_to_library_cache[so_file] = lib
             self.lib = HCCLLibrary.path_to_library_cache[so_file]
@@ -246,8 +265,10 @@ class HCCLLibrary:
                 "or it does not support the current platform %s. "
                 "If you already have the library, please set the "
                 "environment variable HCCL_SO_PATH"
-                " to point to the correct hccl library path.", so_file,
-                platform.platform())
+                " to point to the correct hccl library path.",
+                so_file,
+                platform.platform(),
+            )
             raise e
 
         if so_file not in HCCLLibrary.path_to_dict_mapping:
@@ -270,50 +291,88 @@ class HCCLLibrary:
 
     def hcclGetUniqueId(self) -> hcclUniqueId:
         unique_id = hcclUniqueId()
-        self.HCCL_CHECK(self._funcs["HcclGetRootInfo"](
-            ctypes.byref(unique_id)))
+        self.HCCL_CHECK(self._funcs["HcclGetRootInfo"](ctypes.byref(unique_id)))
         return unique_id
 
-    def hcclCommInitRank(self, world_size: int, unique_id: hcclUniqueId,
-                         rank: int) -> hcclComm_t:
+    def hcclCommInitRank(
+        self, world_size: int, unique_id: hcclUniqueId, rank: int
+    ) -> hcclComm_t:
         comm = hcclComm_t()
-        self.HCCL_CHECK(self._funcs["HcclCommInitRootInfo"](
-            world_size, ctypes.byref(unique_id), rank, ctypes.byref(comm)))
+        self.HCCL_CHECK(
+            self._funcs["HcclCommInitRootInfo"](
+                world_size, ctypes.byref(unique_id), rank, ctypes.byref(comm)
+            )
+        )
         return comm
 
-    def hcclAllReduce(self, sendbuff: buffer_type, recvbuff: buffer_type,
-                      count: int, datatype: int, op: int, comm: hcclComm_t,
-                      stream: aclrtStream_t) -> None:
+    def hcclAllReduce(
+        self,
+        sendbuff: buffer_type,
+        recvbuff: buffer_type,
+        count: int,
+        datatype: int,
+        op: int,
+        comm: hcclComm_t,
+        stream: aclrtStream_t,
+    ) -> None:
         # `datatype` actually should be `hcclDataType_t`
         # and `op` should be `hcclRedOp_t`
         # both are aliases of `ctypes.c_int`
         # when we pass int to a function, it will be converted to `ctypes.c_int`
         # by ctypes automatically
-        self.HCCL_CHECK(self._funcs["HcclAllReduce"](sendbuff, recvbuff, count,
-                                                     datatype, op, comm,
-                                                     stream))
+        self.HCCL_CHECK(
+            self._funcs["HcclAllReduce"](
+                sendbuff, recvbuff, count, datatype, op, comm, stream
+            )
+        )
 
-    def hcclBroadcast(self, buf: buffer_type, count: int, datatype: int,
-                      root: int, comm: hcclComm_t,
-                      stream: aclrtStream_t) -> None:
-        self.HCCL_CHECK(self._funcs["HcclBroadcast"](buf, count, datatype,
-                                                   root, comm, stream))
-  
-    def hcclAllGather(self, sendbuff: buffer_type, recvbuff: buffer_type,
-                      count: int, datatype: int, comm: hcclComm_t,
-                      stream: aclrtStream_t) -> None:
-        self.HCCL_CHECK(self._funcs["HcclAllGather"](sendbuff, recvbuff, count,
-                                                     datatype, comm, stream))
-        
-    def hcclReduceScatter(self, sendbuff: buffer_type, recvbuff: buffer_type,
-                          count: int, datatype: int, op: int, comm: hcclComm_t,
-                          stream: aclrtStream_t) -> None:
-        self.HCCL_CHECK(self._funcs["HcclReduceScatter"](sendbuff, recvbuff, count,
-                                                     datatype, op, comm, stream))
-    
+    def hcclBroadcast(
+        self,
+        buf: buffer_type,
+        count: int,
+        datatype: int,
+        root: int,
+        comm: hcclComm_t,
+        stream: aclrtStream_t,
+    ) -> None:
+        self.HCCL_CHECK(
+            self._funcs["HcclBroadcast"](buf, count, datatype,root, comm, stream)
+        )
+
+    def hcclAllGather(
+        self,
+        sendbuff: buffer_type,
+        recvbuff: buffer_type,
+        count: int,
+        datatype: int,
+        comm: hcclComm_t,
+        stream: aclrtStream_t,
+    ) -> None:
+        self.HCCL_CHECK(
+            self._funcs["HcclAllGather"](
+                sendbuff, recvbuff, count, datatype, comm, stream
+            )
+        )
+
+    def hcclReduceScatter(
+        self,
+        sendbuff: buffer_type,
+        recvbuff: buffer_type,
+        count: int,
+        datatype: int,
+        op: int,
+        comm: hcclComm_t,
+        stream: aclrtStream_t,
+    ) -> None:
+        self.HCCL_CHECK(
+            self._funcs["HcclReduceScatter"](
+                sendbuff, recvbuff, count, datatype, op, comm, stream
+            )
+        )
+
     def hcclBarrier(self, comm: hcclComm_t, stream: aclrtStream_t) -> None:
         self.HCCL_CHECK(self._funcs["HcclBarrier"](comm, stream))
-    
+
     def hcclCommDestroy(self, comm: hcclComm_t) -> None:
         self.HCCL_CHECK(self._funcs["HcclCommDestroy"](comm))
 
