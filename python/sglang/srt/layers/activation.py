@@ -62,7 +62,7 @@ logger = logging.getLogger(__name__)
 class SiluAndMul(CustomOp):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        if get_global_server_args().rl_on_policy_target == "fsdp":
+        if get_global_server_args().rl_on_policy_target is not None:
             self._forward_method = self.forward_native
 
     def forward_native(self, x: torch.Tensor) -> torch.Tensor:

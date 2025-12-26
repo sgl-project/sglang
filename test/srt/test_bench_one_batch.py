@@ -1,4 +1,3 @@
-import os
 import unittest
 
 from sglang.test.test_utils import (

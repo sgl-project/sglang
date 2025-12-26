@@ -654,6 +654,9 @@ std::tuple<at::Tensor, at::Tensor> biased_grouped_topk_cpu(
       case 256:
         LAUNCH_BIASED_GROUPED_TOPK_KERNEL(256, 8);
         break;
+      case 384:
+        LAUNCH_BIASED_GROUPED_TOPK_KERNEL(384, 8);
+        break;
       default:
         TORCH_CHECK(false, "Unexpected num_experts: ", num_experts);
     }
