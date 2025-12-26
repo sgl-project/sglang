@@ -111,7 +111,7 @@ class TileLangGEMMWrapper:
         """Get or compile kernel for given dimensions.
 
         Finds the closest tuned M config and uses that kernel.
-        Since M is dynamic (tvm.te.var), kernels compiled with tuned_M
+        Since M is dynamic (tilelang.language.dynamic), kernels compiled with tuned_M
         can handle any actual M value.
         """
         config = self.config_loader.find_config(M, N, K)
@@ -199,7 +199,7 @@ class TileLangGEMMWrapper:
     def warmup_all_m(self, N: int, K: int, m_max: Optional[int] = None) -> None:
         """Pre-compile all tuned M kernels for specified (N, K).
 
-        Since M is dynamic (tvm.te.var), we only need to compile kernels for
+        Since M is dynamic (tilelang.language.dynamic), we only need to compile kernels for
         the tuned M values in config. At runtime, any actual M will use the
         closest tuned_M kernel.
         Uses parallel compilation for better performance.

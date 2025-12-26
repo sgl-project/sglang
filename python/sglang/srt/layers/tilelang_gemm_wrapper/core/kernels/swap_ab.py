@@ -6,7 +6,6 @@ Output: C (N, M) transposed
 
 import tilelang
 import tilelang.language as T
-from tilelang import tvm as tvm
 
 
 @tilelang.jit
@@ -29,7 +28,9 @@ def kernel_factory(
     compute: C(M, N) = A @ B^T
     output: C^T (N, M)
     """
-    N = tvm.te.var("n")
+    N = T.dynamic("n")
+    out_dtype = T.dtype(out_dtype)
+    accum_dtype = T.dtype(accum_dtype)
     group_size = 128
     A_scale_shape = (T.ceildiv(M, group_size), T.ceildiv(K, group_size))
     B_scale_shape = (N, T.ceildiv(K, group_size))
@@ -37,24 +38,24 @@ def kernel_factory(
 
     @T.prim_func
     def tilelang_fp8_blockwise(
-        A: T.Tensor((M, K), "float8_e4m3"),
-        B: T.Tensor((N, K), "float8_e4m3"),
+        A: T.Tensor((M, K), T.float8_e4m3),
+        B: T.Tensor((N, K), T.float8_e4m3),
         C: T.Tensor((N, M), out_dtype),
-        a_scale: T.Tensor(A_scale_shape, "float32"),
-        b_scale: T.Tensor(B_scale_shape, "float32"),
+        a_scale: T.Tensor(A_scale_shape, T.float32),
+        b_scale: T.Tensor(B_scale_shape, T.float32),
     ):
         with T.Kernel(
             T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=threads
         ) as (bx, by):
-            A_shared = T.alloc_shared((block_M, block_K), "float8_e4m3")
-            B_shared = T.alloc_shared((block_N, block_K), "float8_e4m3")
+            A_shared = T.alloc_shared((block_M, block_K), T.float8_e4m3)
+            B_shared = T.alloc_shared((block_N, block_K), T.float8_e4m3)
             C_shared = T.alloc_shared((block_N, block_M), out_dtype)
-            C_scale = c_scale_alloc((block_N,), "float32")
+            C_scale = c_scale_alloc((block_N,), T.float32)
             C_local = T.alloc_fragment((block_M, block_N), accum_dtype)
             C_local_accum = T.alloc_fragment((block_N, block_M), accum_dtype)
 
             if b_scale_shm:
-                B_scale_shared = T.alloc_shared((block_N,), "float32")
+                B_scale_shared = T.alloc_shared((block_N,), T.float32)
 
             T.clear(C_local)
             T.clear(C_local_accum)
