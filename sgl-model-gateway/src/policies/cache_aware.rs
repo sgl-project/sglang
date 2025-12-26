@@ -517,16 +517,12 @@ mod tests {
         policy.init_workers(&workers);
 
         // Should select worker2 (lower load) despite cache affinity
+        let info = SelectWorkerInfo {
+            request_text: Some("test"),
+            ..Default::default()
+        };
         for _ in 0..5 {
-            let idx = policy
-                .select_worker(
-                    &workers,
-                    &SelectWorkerInfo {
-                        request_text: Some("test"),
-                        ..Default::default()
-                    },
-                )
-                .unwrap();
+            let idx = policy.select_worker(&workers, &info).unwrap();
             assert_eq!(idx, 1); // Should always pick worker2
         }
     }
