@@ -86,7 +86,7 @@ class TorchNativeLoRABackend(BaseLoRABackend):
         *args,
         **kwargs,
     ) -> torch.Tensor:
-        num_slices = len(output_offset_cpu) - 1
+        num_slices = 3
         lora_a_output = sgemm_lora_a_fwd(
             inputs=x,
             weights=qkv_lora_a,
