@@ -215,7 +215,7 @@ class HFRunner:
         **kwargs,
     ) -> torch.Tensor:
         if inputs_embeds is None:
-            inputs_embeds = self.model.model.embed_tokens(input_ids)
+            inputs_embeds = self.model.model.get_input_embeddings()(input_ids)
             if pixel_values is not None:
                 pixel_values = pixel_values.type(self.model.visual.get_dtype())
                 image_embeds = self.model.visual(
