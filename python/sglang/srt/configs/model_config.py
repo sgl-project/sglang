@@ -755,6 +755,7 @@ class ModelConfig:
             "w4afp8",
             "petit_nvfp4",
             "quark",
+            "modelslim",
         ]
         compatible_quantization_methods = {
             "modelopt_fp8": ["modelopt"],
