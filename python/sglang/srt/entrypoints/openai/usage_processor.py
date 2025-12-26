@@ -21,6 +21,9 @@ class UsageProcessor:
         enable_cache_report: bool = False,
     ) -> UsageInfo:
         completion_tokens = sum(r["meta_info"]["completion_tokens"] for r in responses)
+        reasoning_tokens = sum(
+            r["meta_info"].get("reasoning_tokens", 0) for r in responses
+        )
 
         prompt_tokens = sum(
             responses[i]["meta_info"]["prompt_tokens"]
@@ -39,6 +42,7 @@ class UsageProcessor:
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
             cached_tokens=cached_details,
+            reasoning_tokens=reasoning_tokens,
         )
 
     @staticmethod
@@ -47,6 +51,7 @@ class UsageProcessor:
         completion_tokens: Mapping[int, int],
         cached_tokens: Mapping[int, int],
         n_choices: int,
+        reasoning_tokens: Optional[Mapping[int, int]] = None,
         enable_cache_report: bool = False,
     ) -> UsageInfo:
         # index % n_choices == 0 marks the first choice of a prompt
@@ -67,6 +72,7 @@ class UsageProcessor:
             prompt_tokens=total_prompt_tokens,
             completion_tokens=total_completion_tokens,
             cached_tokens=cached_details,
+            reasoning_tokens=sum(reasoning_tokens.values()) if reasoning_tokens else 0,
         )
 
     @staticmethod
@@ -74,6 +80,7 @@ class UsageProcessor:
         prompt_tokens: int,
         completion_tokens: int,
         cached_tokens: Optional[Dict[str, int]] = None,
+        reasoning_tokens: int = 0,
     ) -> UsageInfo:
         """Calculate token usage information"""
         return UsageInfo(
@@ -81,4 +88,5 @@ class UsageProcessor:
             completion_tokens=completion_tokens,
             total_tokens=prompt_tokens + completion_tokens,
             prompt_tokens_details=cached_tokens,
+            reasoning_tokens=reasoning_tokens,
         )

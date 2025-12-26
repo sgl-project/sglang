@@ -514,6 +514,7 @@ class OpenAIServingChat(OpenAIServingBase):
         prompt_tokens = {}
         completion_tokens = {}
         cached_tokens = {}
+        reasoning_text_chunks = {}
         hidden_states = {}
 
         try:
@@ -572,6 +573,9 @@ class OpenAIServingChat(OpenAIServingBase):
                         index, delta, reasoning_parser_dict, content, request
                     )
                     if reasoning_text:
+                        reasoning_text_chunks.setdefault(index, []).append(
+                            reasoning_text
+                        )
                         choice_data = ChatCompletionResponseStreamChoice(
                             index=index,
                             delta=DeltaMessage(reasoning_content=reasoning_text),
@@ -709,11 +713,22 @@ class OpenAIServingChat(OpenAIServingBase):
 
             # Additional usage chunk
             if request.stream_options and request.stream_options.include_usage:
+                reasoning_tokens = {}
+                if self.reasoning_parser and request.separate_reasoning:
+                    tokenizer = self.tokenizer_manager.tokenizer
+                    for idx, chunks in reasoning_text_chunks.items():
+                        if not chunks:
+                            continue
+                        text = "".join(chunks)
+                        reasoning_tokens[idx] = len(
+                            tokenizer.encode(text, add_special_tokens=False)
+                        )
                 usage = UsageProcessor.calculate_streaming_usage(
                     prompt_tokens,
                     completion_tokens,
                     cached_tokens,
                     n_choices=request.n,
+                    reasoning_tokens=reasoning_tokens,
                     enable_cache_report=self.tokenizer_manager.server_args.enable_cache_report,
                 )
                 usage_chunk = ChatCompletionStreamResponse(
@@ -792,6 +807,11 @@ class OpenAIServingChat(OpenAIServingBase):
                         force_reasoning=is_force_reasoning,
                     )
                     reasoning_text, text = parser.parse_non_stream(text)
+                    if reasoning_text and "meta_info" in ret_item:
+                        tokenizer = self.tokenizer_manager.tokenizer
+                        ret_item["meta_info"]["reasoning_tokens"] = len(
+                            tokenizer.encode(reasoning_text, add_special_tokens=False)
+                        )
                 except Exception as e:
                     logger.error(f"Reasoning parsing error: {e}")
                     return self.create_error_response(
