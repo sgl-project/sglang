@@ -30,6 +30,7 @@ from sglang.srt.layers.attention.nsa.utils import (
 )
 from sglang.srt.layers.attention.trtllm_mla_backend import _concat_mla_absorb_q_general
 from sglang.srt.layers.dp_attention import get_attention_tp_size
+from sglang.srt.mem_cache.common import enable_nsa_hybrid_indexer_pool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.utils import is_cuda, is_hip
 
@@ -110,6 +111,9 @@ class NSAMetadata:
     nsa_cu_seqlens_k: torch.Tensor  # cumsum of `nsa_cache_seqlens_int32`
     nsa_extend_seq_lens_list: List[int]
     nsa_seqlens_expanded: torch.Tensor  # expanded, unclipped `seqlens`
+
+    # Separated page table for index_k
+    indexer_real_page_table: Optional[torch.Tensor] = None
     nsa_max_seqlen_q: Literal[1] = 1  # always 1 for decode, variable for extend
 
     flashmla_metadata: Optional[NSAFlashMLAMetadata] = None
@@ -164,6 +168,8 @@ class NSAIndexerMetadata(BaseIndexerMetadata):
         return self.attn_metadata.cache_seqlens_int32
 
     def get_page_table_64(self) -> torch.Tensor:
+        if self.attn_metadata.indexer_real_page_table is not None:
+            return self.attn_metadata.indexer_real_page_table
         return self.attn_metadata.real_page_table
 
     def get_seqlens_expanded(self) -> torch.Tensor:
@@ -270,6 +276,10 @@ class NativeSparseAttnBackend(
 
         assert model_runner.req_to_token_pool is not None
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
+        self.req_to_token_pool = model_runner.req_to_token_pool
+        self.enable_nsa_hybrid_indexer_pool = enable_nsa_hybrid_indexer_pool(
+            req_to_token_pool=self.req_to_token_pool
+        )
 
         self.use_mha: bool = False
         self.nsa_prefill_impl: _NSA_IMPL_T = (
@@ -347,6 +357,12 @@ class NativeSparseAttnBackend(
         page_table = forward_batch.req_to_token_pool.req_to_token[
             forward_batch.req_pool_indices, :max_seqlen_k
         ]
+        # Build indexer_page_table for indexer_k
+        indexer_page_table = None
+        if self.enable_nsa_hybrid_indexer_pool:
+            indexer_page_table = self.req_to_token_pool.req_to_nsa_index_k[
+                forward_batch.req_pool_indices, :max_seqlen_k
+            ]
 
         page_table_1_flattened = None
         topk_indices_offset = None
@@ -584,6 +600,11 @@ class NativeSparseAttnBackend(
             nsa_seqlens_expanded=seqlens_expanded,
             nsa_extend_seq_lens_list=extend_seq_lens_cpu,
             real_page_table=self._transform_table_1_to_real(page_table),
+            indexer_real_page_table=(
+                self._transform_table_1_to_real(indexer_page_table)
+                if indexer_page_table is not None
+                else None
+            ),
             nsa_max_seqlen_q=1,
             topk_indices_offset=topk_indices_offset,
         )
@@ -599,6 +620,15 @@ class NativeSparseAttnBackend(
         This creates fixed-size tensors that will be reused during CUDA graph replay
         to avoid memory allocations.
         """
+        indexer_page_table = None
+        if self.enable_nsa_hybrid_indexer_pool:
+            indexer_page_table = torch.zeros(
+                max_num_tokens,
+                self.max_context_len,
+                dtype=torch.int32,
+                device=self.device,
+            )
+
         self.decode_cuda_graph_metadata: Dict = {
             "cache_seqlens": torch.ones(
                 max_num_tokens, dtype=torch.int32, device=self.device
@@ -616,6 +646,7 @@ class NativeSparseAttnBackend(
                 dtype=torch.int32,
                 device=self.device,
             ),
+            "indexer_page_table": indexer_page_table,
             "flashmla_metadata": (
                 self._compute_flashmla_metadata(
                     cache_seqlens=torch.ones(
@@ -763,6 +794,16 @@ class NativeSparseAttnBackend(
             except (ImportError, ModuleNotFoundError):
                 paged_mqa_schedule_metadata = None
 
+        if self.enable_nsa_hybrid_indexer_pool:
+            indexer_page_table_1 = self.decode_cuda_graph_metadata[
+                "indexer_page_table"
+            ][:bs, :]
+            indexer_real_page_table = self._transform_table_1_to_real(
+                indexer_page_table_1
+            )
+        else:
+            indexer_real_page_table = None
+
         metadata = NSAMetadata(
             page_size=self.real_page_size,
             cache_seqlens_int32=cache_seqlens_int32,
@@ -778,6 +819,7 @@ class NativeSparseAttnBackend(
             nsa_cu_seqlens_k=nsa_cu_seqlens_k,
             nsa_seqlens_expanded=seqlens_expanded,
             real_page_table=real_page_table,
+            indexer_real_page_table=indexer_real_page_table,
             nsa_extend_seq_lens_list=nsa_extend_seq_lens_list,
         )
         self.decode_cuda_graph_metadata[bs] = metadata
@@ -956,6 +998,43 @@ class NativeSparseAttnBackend(
         else:
             assert metadata.real_page_table is metadata.page_table_1
 
+        # Copy indexer page table
+        if self.enable_nsa_hybrid_indexer_pool:
+            if forward_mode.is_decode_or_idle():
+                indexer_page_indices = self.req_to_token_pool.req_to_nsa_index_k[
+                    req_pool_indices, :max_len
+                ]
+            elif forward_mode.is_target_verify():
+                indexer_page_indices = self.req_to_token_pool.req_to_nsa_index_k[
+                    req_pool_indices, :max_seqlen_k
+                ]
+                indexer_page_indices = torch.repeat_interleave(
+                    indexer_page_indices,
+                    repeats=self.speculative_num_draft_tokens,
+                    dim=0,
+                )
+            elif forward_mode.is_draft_extend(include_v2=True):
+                indexer_page_indices = self.req_to_token_pool.req_to_nsa_index_k[
+                    req_pool_indices, :max_seqlen_k
+                ]
+                indexer_page_indices = torch.repeat_interleave(
+                    indexer_page_indices, repeats=extend_seq_lens, dim=0
+                )
+
+            if self.real_page_size > 1:
+                indexer_real_table = self._transform_table_1_to_real(
+                    indexer_page_indices
+                )
+                new_rows = indexer_real_table.shape[0]
+                new_cols = indexer_real_table.shape[1]
+                metadata.indexer_real_page_table[:new_rows, :new_cols].copy_(
+                    indexer_real_table
+                )
+            else:
+                metadata.indexer_real_page_table[
+                    : indexer_page_indices.shape[0], : indexer_page_indices.shape[1]
+                ].copy_(indexer_page_indices)
+
         if self.nsa_decode_impl == "flashmla_kv":
             flashmla_metadata = metadata.flashmla_metadata.slice(
                 slice(0, seqlens_expanded_size + 1)
@@ -1032,6 +1111,16 @@ class NativeSparseAttnBackend(
         else:
             # real_page_table is same as page_table_1 (already copied)
             pass
+
+        # Copy indexer real page table
+        if (
+            self.enable_nsa_hybrid_indexer_pool
+            and precomputed.indexer_real_page_table is not None
+        ):
+            rows, cols = precomputed.indexer_real_page_table.shape
+            metadata.indexer_real_page_table[:rows, :cols].copy_(
+                precomputed.indexer_real_page_table
+            )
 
         # Copy FlashMLA metadata
         if precomputed.flashmla_metadata is not None:
