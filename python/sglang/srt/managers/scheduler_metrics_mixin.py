@@ -49,7 +49,6 @@ class SchedulerMetricsMixin:
         self.last_decode_stats_tic = time.perf_counter()
         self.last_prefill_stats_tic = time.perf_counter()
         self.last_prefill_tokens = 0
-        self.last_prefill_cache_tokens = 0
         self.last_gen_throughput: float = 0.0
         self.last_input_throughput: float = 0.0
         self.step_time_dict = defaultdict(list)  # Dict[batch size -> step time]
@@ -128,7 +127,6 @@ class SchedulerMetricsMixin:
         self.last_prefill_stats_tic = time.perf_counter()
         self.last_input_throughput = self.last_prefill_tokens / gap_latency
         self.last_prefill_tokens = adder.log_input_tokens
-        self.last_prefill_cache_tokens = adder.log_hit_tokens
 
         # TODO: generalize this for various memory pools
         if self.is_hybrid_swa:
@@ -247,8 +245,8 @@ class SchedulerMetricsMixin:
         """This should be called after `batch` has gathered enough metadata."""
         if self.enable_metrics and batch is not None:
             self.metrics_collector.increment_realtime_tokens(
-                prefill_compute_tokens=self.last_prefill_tokens,
-                prefill_cache_tokens=self.last_prefill_cache_tokens,
+                prefill_compute_tokens=TODO,
+                prefill_cache_tokens=TODO,
                 dp_cooperation_info=batch.dp_cooperation_info,
             )
 
