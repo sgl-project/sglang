@@ -290,13 +290,15 @@ class TestEAGLEServerBasic(EagleServerBase):
 
 
 class TestEAGLERetract(TestEAGLEServerBasic):
-    extra_args = ["--chunked-prefill-size", 128, "--max-running-requests", 64]
+    extra_args = [
+        "--chunked-prefill-size=128",
+        "--max-running-requests=64",
+        "--max-total-tokens=4500",  # Set a smaller KV cache to trigger retract more easily
+    ]
 
     @classmethod
     def setUpClass(cls):
         # These config helps find a leak.
-        # FIXME(lsyin): use override context manager
-        envs.SGLANG_CI_SMALL_KV_SIZE.set(4500)
         with envs.SGLANG_TEST_RETRACT.override(True):
             super().setUpClass()
 
