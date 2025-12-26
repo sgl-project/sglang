@@ -107,8 +107,8 @@ class SchedulerOutputProcessorMixin:
                     continue
 
                 if req.is_chunked <= 0:
-                    # req output_ids are set here
-                    req.output_ids.append(next_token_id)
+                    # req output_ids are set here (with reasoning token tracking)
+                    req.append_output_token(next_token_id)
                     req.check_finished()
 
                     if req.finished():
@@ -298,7 +298,7 @@ class SchedulerOutputProcessorMixin:
         req = batch.reqs[0]
 
         for next_token_id in next_token_ids:
-            req.output_ids.append(next_token_id)
+            req.append_output_token(next_token_id)
             req.check_finished()
 
             if req.finished():
@@ -353,10 +353,10 @@ class SchedulerOutputProcessorMixin:
 
             new_accepted_len = 1
             if batch.spec_algorithm.is_none():
-                req.output_ids.append(next_token_id)
+                req.append_output_token(next_token_id)
             elif batch.is_v2_eagle:
                 # Only v2 eagle's output_ids are updated here.
-                req.output_ids.extend(next_token_id)
+                req.extend_output_tokens(next_token_id)
                 new_accepted_len = len(next_token_id)
 
             req.check_finished(new_accepted_len)

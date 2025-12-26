@@ -675,6 +675,11 @@ class Req:
         # This is used to compute the acceptance rate and average acceptance length per request.
         self.spec_accepted_tokens = 0
 
+        # For reasoning token tracking (optimization for issue #13250)
+        # Tracks reasoning tokens incrementally when appending to output_ids
+        self.num_reasoning_tokens = 0
+        self.think_end_seen = False
+
         # The number of times this request has been retracted / preempted.
         self.retraction_count = 0
 
@@ -781,6 +786,32 @@ class Req:
     def finished(self) -> bool:
         # Whether request reached finished condition
         return self.finished_reason is not None
+
+    def append_output_token(self, token_id: int) -> None:
+        """Append a token to output_ids and track reasoning tokens incrementally.
+
+        This optimization (issue #13250) avoids scanning output_ids to count
+        reasoning tokens. Instead, we track them as tokens are appended:
+        - Before think_end_id: all tokens are reasoning tokens
+        - After think_end_id: tokens are NOT reasoning tokens
+        """
+        self.output_ids.append(token_id)
+
+        # Track reasoning tokens if reasoning parser is enabled
+        if self.tokenizer is not None and hasattr(self.tokenizer, "think_end_id"):
+            if not self.think_end_seen:
+                if token_id == self.tokenizer.think_end_id:
+                    self.think_end_seen = True
+                else:
+                    self.num_reasoning_tokens += 1
+
+    def extend_output_tokens(self, token_ids: List[int]) -> None:
+        """Extend output_ids with multiple tokens and track reasoning tokens.
+
+        Used for speculative decoding where multiple tokens are accepted at once.
+        """
+        for token_id in token_ids:
+            self.append_output_token(token_id)
 
     def is_dllm(self):
         return self.dllm_config is not None
