@@ -139,6 +139,7 @@ class Envs:
     SGLANG_LOG_FORWARD_ITERS = EnvBool(False)
     SGLANG_LOG_MS = EnvBool(False)
     SGLANG_DISABLE_REQUEST_LOGGING = EnvBool(False)
+    SGLANG_LOG_REQUEST_EXCEEDED_MS = EnvInt(-1)
 
     # SGLang CI
     SGLANG_IS_IN_CI = EnvBool(False)
