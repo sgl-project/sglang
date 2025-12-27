@@ -179,7 +179,9 @@ def _key_match_paged(key0: RadixKey, key1: RadixKey, page_size: int):
 
 
 def get_child_key(key: RadixKey, page_size: int = 1):
-    if page_size == 1:
+    if not key.token_ids:
+        plain_key = ()
+    elif page_size == 1:
         plain_key = key.token_ids[0]
     else:
         plain_key = tuple(key.token_ids[:page_size])
