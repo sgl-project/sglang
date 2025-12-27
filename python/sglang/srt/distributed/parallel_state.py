@@ -1462,6 +1462,18 @@ def get_moe_tp_group() -> GroupCoordinator:
     return _MOE_TP
 
 
+_O_PROJ_TP: Optional[GroupCoordinator] = None
+_O_PROJ_DP: Optional[GroupCoordinator] = None
+
+
+def get_o_proj_tp_group() -> GroupCoordinator:
+    return _O_PROJ_TP
+
+
+def get_o_proj_dp_group() -> GroupCoordinator:
+    return _O_PROJ_DP
+
+
 # kept for backward compatibility
 get_tensor_model_parallel_group = get_tp_group
 
@@ -1715,6 +1727,55 @@ def initialize_model_parallel(
             group_name="moe_tp",
         )
 
+    o_proj_tp_size = envs.get("SGLANG_O_PROJ_TP_SIZE")
+    if o_proj_tp_size > 1:
+        if world_size % o_proj_tp_size != 0:
+            raise RuntimeError(
+                f"o_proj_tp_size ({o_proj_tp_size}) should be divided by world_size ({world_size})"
+            )
+
+        global _O_PROJ_TP
+        assert (
+            _O_PROJ_TP is None
+        ), "o_proj tensor model parallel group is already initialized"
+        num_o_proj_tensor_model_parallel_groups: int = world_size // o_proj_tp_size
+
+        group_ranks = []
+        for i in range(num_o_proj_tensor_model_parallel_groups):
+            ranks = list(range(i * o_proj_tp_size, (i + 1) * o_proj_tp_size))
+            group_ranks.append(ranks)
+
+        _O_PROJ_TP = init_model_parallel_group(
+            group_ranks,
+            get_world_group().local_rank,
+            backend,
+            use_message_queue_broadcaster=get_bool_env_var(
+                "SGLANG_USE_MESSAGE_QUEUE_BROADCASTER", "true"
+            ),
+            group_name="o_proj_tp",
+            pynccl_use_current_stream=duplicate_tp_group,
+            torch_compile=torch_compile,
+        )
+
+        dp_size = world_size // o_proj_tp_size
+        global _O_PROJ_DP
+        assert _O_PROJ_DP is None, "o_proj data parallel group is already initialized"
+        all_ranks = torch.arange(world_size).reshape(dp_size, o_proj_tp_size)
+        group_ranks = all_ranks.transpose(0, 1)
+        group_ranks = [x.tolist() for x in group_ranks]
+
+        _O_PROJ_DP = init_model_parallel_group(
+            group_ranks,
+            get_world_group().local_rank,
+            backend,
+            use_message_queue_broadcaster=get_bool_env_var(
+                "SGLANG_USE_MESSAGE_QUEUE_BROADCASTER", "true"
+            ),
+            group_name="o_proj_dp",
+            pynccl_use_current_stream=False,
+            torch_compile=torch_compile,
+        )
+
     # Build the pipeline model-parallel groups.
     num_pipeline_model_parallel_groups: int = world_size // pipeline_model_parallel_size
     global _PP
@@ -1847,6 +1908,30 @@ def get_moe_tensor_parallel_world_size():
 def get_moe_tensor_parallel_rank():
     """Return my rank for the moe tensor parallel group."""
     return get_moe_tp_group().rank_in_group
+
+
+def get_o_proj_tensor_parallel_world_size():
+    if get_o_proj_tp_group():
+        return get_o_proj_tp_group().world_size
+    else:
+        return 0
+
+
+def get_o_proj_tensor_parallel_rank():
+    group = get_o_proj_tp_group()
+    return group.rank_in_group if group is not None else 0
+
+
+def get_o_proj_data_parallel_world_size():
+    if get_o_proj_dp_group():
+        return get_o_proj_dp_group().world_size
+    else:
+        return 0
+
+
+def get_o_proj_data_parallel_rank():
+    group = get_o_proj_dp_group()
+    return group.rank_in_group if group is not None else 0
 
 
 def destroy_model_parallel():

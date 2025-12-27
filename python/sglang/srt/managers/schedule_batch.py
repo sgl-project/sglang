@@ -2279,6 +2279,8 @@ class ModelWorkerBatch:
     # For hidden states before normal
     return_hidden_states_before_norm: bool = False
 
+    batch_size_max_across_dp: int = 0
+
     # For mamba state tracking
     mamba_track_indices: Optional[torch.Tensor] = None  # shape: [b], int64
     mamba_track_mask: Optional[torch.Tensor] = None  # shape: [b], bool

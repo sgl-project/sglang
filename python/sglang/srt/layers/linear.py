@@ -11,6 +11,7 @@ from torch.nn.parameter import Parameter, UninitializedParameter
 
 from sglang.srt.distributed import (
     divide,
+    get_o_proj_data_parallel_world_size,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     get_tp_group,
@@ -1326,6 +1327,7 @@ class RowParallelLinear(LinearBase):
         param_data = param.data
         # bitsandbytes loads the weights of the specific portion
         # no need to narrow here
+
         if (
             input_dim is not None
             and not use_bitsandbytes_4bit
@@ -1358,7 +1360,6 @@ class RowParallelLinear(LinearBase):
                     loaded_weight = loaded_weight.narrow(
                         input_dim, start_idx, shard_size
                     )
-
         # Special case for loading scales off disk, which often do not
         # have a shape (such as in the case of AutoFP8).
         if len(loaded_weight.shape) == 0:
@@ -1432,3 +1433,74 @@ class RowParallelLinear(LinearBase):
         s += f", tp_size={self.tp_size}"
         s += f", reduce_results={self.reduce_results}"
         return s
+
+
+class TP2DPandTPRowParallelLinear(RowParallelLinear):
+    def __init__(
+        self,
+        input_size: int,
+        output_size: int,
+        bias: bool = True,
+        input_is_parallel: bool = True,
+        skip_bias_add: bool = False,
+        params_dtype: Optional[torch.dtype] = None,
+        reduce_results: bool = True,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+        tp_rank: Optional[int] = None,
+        tp_size: Optional[int] = None,
+        attn_tp_size: Optional[int] = None,
+        use_presharded_weights: bool = False,
+    ):
+        quant_config = None if _disable_hip_linear_quant else quant_config
+        super().__init__(
+            input_size, output_size, skip_bias_add, params_dtype, quant_config, prefix
+        )
+        self.attn_tp_size = attn_tp_size
+        self.prefix = prefix
+
+    def weight_loader(self, param: Parameter, loaded_weight: torch.Tensor):
+        input_dim = getattr(param, "input_dim", None)
+        use_bitsandbytes_4bit = getattr(param, "use_bitsandbytes_4bit", False)
+
+        # Special case for GGUF
+        is_gguf_weight = getattr(param, "is_gguf_weight", False)
+        is_gguf_weight_type = getattr(param, "is_gguf_weight_type", False)
+        if is_gguf_weight_type:
+            param.weight_type = loaded_weight.item()
+
+        # Materialize GGUF UninitializedParameter
+        if is_gguf_weight and isinstance(param, UninitializedParameter):
+            weight_shape = list(loaded_weight.shape)
+            if input_dim:
+                weight_shape[input_dim] = weight_shape[input_dim] // self.tp_size
+            param.materialize(tuple(weight_shape), dtype=loaded_weight.dtype)
+
+        param_data = param.data
+        # bitsandbytes loads the weights of the specific portion
+        # no need to narrow here
+        rank_list = (
+            torch.arange(torch.distributed.get_world_size()).reshape(-1, self.tp_size).T
+        )
+        o_proj_dp_size = get_o_proj_data_parallel_world_size()
+        assert o_proj_dp_size > 1
+
+        if (
+            input_dim is not None
+            and not use_bitsandbytes_4bit
+            and not self.use_presharded_weights
+        ):
+            shard_size = param_data.shape[input_dim] // o_proj_dp_size
+            res = []
+            for rank in rank_list[self.tp_rank]:
+                start_idx = rank * shard_size
+                tmp_weight = loaded_weight.narrow(input_dim, start_idx, shard_size)
+                res.append(tmp_weight)
+            loaded_weight = torch.cat(res, dim=input_dim)
+        # Special case for loading scales off disk, which often do not
+        # have a shape (such as in the case of AutoFP8).
+        if len(loaded_weight.shape) == 0:
+            loaded_weight = loaded_weight.reshape(1)
+
+        assert param_data.shape == loaded_weight.shape
+        param_data.copy_(loaded_weight)

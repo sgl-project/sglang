@@ -45,6 +45,9 @@ from sglang.srt.configs.model_config import (
 from sglang.srt.distributed import (
     divide,
     get_moe_expert_parallel_world_size,
+    get_o_proj_data_parallel_world_size,
+    get_o_proj_tensor_parallel_rank,
+    get_o_proj_tensor_parallel_world_size,
     get_pp_group,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
@@ -70,6 +73,7 @@ from sglang.srt.layers.attention.nsa.utils import (
 from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
 from sglang.srt.layers.attention.utils import concat_and_cast_mha_k_triton
 from sglang.srt.layers.communicator import (
+    BeforeOproj,
     LayerCommunicator,
     LayerScatterModes,
     enable_moe_dense_fully_dp,
@@ -87,6 +91,7 @@ from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
+    TP2DPandTPRowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import (
@@ -1015,6 +1020,7 @@ class DeepseekV2MoE(nn.Module):
             topk_output = self.topk(
                 hidden_states,
                 router_logits,
+                forward_batch=forward_batch,
                 num_token_non_padded=forward_batch.num_token_non_padded,
                 expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
                     layer_id=self.layer_id,
@@ -1297,6 +1303,12 @@ class DeepseekV2AttentionMLA(nn.Module):
         self.quant_config = quant_config
         attn_tp_rank = get_attention_tp_rank()
         attn_tp_size = get_attention_tp_size()
+        o_proj_tp_size = get_o_proj_tensor_parallel_world_size()
+        o_proj_dp_size = get_o_proj_data_parallel_world_size()
+        self.attn_tp_rank = attn_tp_rank
+        self.attn_tp_size = attn_tp_size
+        self.o_proj_tp_size = o_proj_tp_size
+        self.o_proj_dp_size = o_proj_dp_size
         self.use_nsa = is_deepseek_nsa(config)
         self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
         if self.nsa_enable_prefill_cp:
@@ -1384,16 +1396,29 @@ class DeepseekV2AttentionMLA(nn.Module):
             tp_size=attn_tp_size,
         )
         # O projection.
-        self.o_proj = RowParallelLinear(
-            self.num_heads * self.v_head_dim,
-            self.hidden_size,
-            bias=False,
-            quant_config=quant_config,
-            reduce_results=reduce_results,
-            prefix=add_prefix("o_proj", prefix),
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
-        )
+        if envs.SGLANG_O_PROJ_TP_SIZE.get() > 0:
+            self.o_rpoj = TP2DPandTPRowParallelLinear(
+                self.num_heads * self.v_head_dim,
+                self.hidden_size,
+                bias=False,
+                quant_config=quant_config,
+                reduce_results=reduce_results,
+                prefix=add_prefix("o_proj", prefix),
+                tp_rank=get_o_proj_tensor_parallel_rank(),
+                tp_size=o_proj_tp_size,
+                attn_tp_size=attn_tp_size,
+            )
+        else:
+            self.o_proj = RowParallelLinear(
+                self.num_heads * self.v_head_dim,
+                self.hidden_size,
+                bias=False,
+                quant_config=quant_config,
+                reduce_results=reduce_results,
+                prefix=add_prefix("o_proj", prefix),
+                tp_rank=attn_tp_rank,
+                tp_size=attn_tp_size,
+            )
         self.kv_a_layernorm = RMSNorm(self.kv_lora_rank, eps=config.rms_norm_eps)
 
         if not skip_rope:
@@ -1522,6 +1547,14 @@ class DeepseekV2AttentionMLA(nn.Module):
                 self.weight_block_size = (
                     self.fused_qkv_a_proj_with_mqa.quant_method.quant_config.weight_block_size
                 )
+        self.before_o_proj = BeforeOproj(
+            self.num_heads,
+            self.v_head_dim,
+            attn_tp_size,
+            o_proj_tp_size,
+            o_proj_dp_size,
+            attn_tp_rank,
+        )
 
     def dispatch_attn_forward_method(
         self, forward_batch: ForwardBatch
@@ -1557,6 +1590,28 @@ class DeepseekV2AttentionMLA(nn.Module):
         state.hidden_states_after_attn = self.forward_core(
             state.pop("attn_intermediate_state")
         )
+
+    def process_idle(self, hidden_states, forward_batch: ForwardBatch):
+        forward_batch.attn_backend.init_forward_metadata(forward_batch)
+        bs = forward_batch.batch_size_max_across_dp
+        hidden_states = torch.empty(
+            (bs, self.hidden_states.shape[1]),
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+        )
+        forward_batch.attn_backend.forward_metadata.seq_lens_cpu_int = torch.full(
+            (bs,), 1, dtype=torch.int32
+        )
+        positions = torch.clamp(
+            forward_batch.attn_backend.forward_metadata.seq_lens_cpu_int - 1,
+            min=0,
+            dtype=torch.int64,
+            device=hidden_states.device,
+        )
+        forward_batch.attn_backend.forward_metadata.block_tables = torch.arange(
+            1, bs + 1, dtype=torch.int32, device=hidden_states.device
+        ).reshape(bs, -1)
+        return hidden_states, positions
 
     def forward(
         self,
@@ -1601,10 +1656,15 @@ class DeepseekV2AttentionMLA(nn.Module):
                 not get_attn_tp_context().input_scattered
                 and hidden_states.shape[0] == 0
             ):
-                assert (
-                    not self.o_proj.reduce_results
-                ), "short-circuiting allreduce will lead to hangs"
-                return hidden_states, None, forward_batch, None
+                if self.attn_tp_size == 1 and self.o_proj_tp_size > 1:
+                    hidden_states, positions, forward_batch = self.process_idle(
+                        hidden_states, forward_batch
+                    )
+                else:
+                    assert (
+                        not self.o_proj.reduce_results
+                    ), "short-circuiting allreduce will lead to hangs"
+                    return hidden_states, None, forward_batch, None
 
         attn_forward_method = self.dispatch_attn_forward_method(forward_batch)
         if attn_forward_method == AttnForwardMethod.MHA:

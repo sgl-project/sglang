@@ -34,6 +34,7 @@ from torch.cuda import Stream as CudaStream
 from torch.cuda import StreamContext as CudaStreamContext
 from torch.distributed import barrier
 
+from python.sglang.srt.layers.communicator import get_max_bs_across_dp
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.constrained.base_grammar_backend import (
     INVALID_GRAMMAR_OBJ,
@@ -2203,6 +2204,7 @@ class Scheduler(
                     model_worker_batch.sampling_info.copy_for_forward()
                 )
 
+                get_max_bs_across_dp(model_worker_batch)
                 bs = len(model_worker_batch.seq_lens)
                 future_indices = self.future_map.alloc_future_indices(bs)
 

@@ -5,7 +5,7 @@ from typing import Any, Dict, Optional, Union
 import torch
 import torch.distributed
 
-from .parallel_state import get_tp_group
+from .parallel_state import get_o_proj_dp_group, get_o_proj_tp_group, get_tp_group
 
 
 def tensor_model_parallel_all_reduce(input_: torch.Tensor) -> torch.Tensor:
@@ -33,3 +33,22 @@ def broadcast_tensor_dict(
     if not torch.distributed.is_initialized():
         return tensor_dict
     return get_tp_group().broadcast_tensor_dict(tensor_dict, src)
+
+
+def o_proj_tensor_model_parallel_reduce_scatter_tensor(
+    output: torch.Tensor, input_: torch.Tensor
+) -> torch.Tensor:
+    """Reduce-scatter the input tensor across o_proj tp group."""
+    return get_o_proj_tp_group().reduce_scatter_tensor(output, input_)
+
+
+def o_proj_tensor_model_parallel_all_reduce(input_: torch.Tensor) -> torch.Tensor:
+    """All-reduce the input tensor across o_proj tp group."""
+    return get_o_proj_tp_group().all_reduce(input_)
+
+
+def o_proj_data_model_parallel_all_gather(
+    input_: torch.Tensor, dim: int = -1
+) -> torch.Tensor:
+    """All-gather the input tensor across o_proj dp group."""
+    return get_o_proj_dp_group().all_gather(input_, dim)
