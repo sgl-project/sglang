@@ -1741,6 +1741,12 @@ class ServerArgs:
             assert self.ep_size > 1
 
     def _handle_elastic_ep(self):
+        # Convert CLI string "none" to Python None for proper type handling.
+        # argparse choices=["none", "mooncake"] returns string "none" when user
+        # specifies --elastic-ep-backend none, but the code expects Python None.
+        if isinstance(self.elastic_ep_backend, str) and self.elastic_ep_backend.lower() == "none":
+            self.elastic_ep_backend = None
+
         if self.elastic_ep_backend is not None:
             if self.enable_eplb:
                 if self.eplb_algorithm == "auto":
