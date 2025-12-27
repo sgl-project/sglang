@@ -49,6 +49,8 @@ class DisallowedTokensLogitsProcessor(CustomLogitProcessor):
         logits: torch.Tensor,
         custom_param_list: Optional[List[Dict[str, Any]]] = None,
     ) -> torch.Tensor:
+        if not custom_param_list:
+            return logits
         disallowed_token_ids = custom_param_list[0]["token_ids"]
         assert all(
             disallowed_token_ids == c["token_ids"] for c in custom_param_list
