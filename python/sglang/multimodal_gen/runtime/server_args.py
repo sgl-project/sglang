@@ -343,11 +343,6 @@ class ServerArgs:
             help="The path of the model weights. This can be a local folder or a Hugging Face repo ID.",
         )
         parser.add_argument(
-            "--model-dir",
-            type=str,
-            help="Directory containing StepVideo model",
-        )
-        parser.add_argument(
             "--vae-path",
             type=str,
             default=ServerArgs.vae_path,
