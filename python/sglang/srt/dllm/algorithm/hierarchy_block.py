@@ -64,7 +64,8 @@ class HierarchyBlock(DllmAlgorithm):
 
         if self.debug:
             logger.info(f"[HierarchyBlock] total_len={total_len}, num_masked={num_masked}, "
-                       f"block_start={block_start}, num_sub_blocks={num_sub_blocks}")
+                       f"block_start={block_start}, num_sub_blocks={num_sub_blocks}, "
+                       f"use_AR_for_first={self.use_AR_for_first_token and block_start > 0}")
             logger.info(f"[HierarchyBlock] input_ids[:5]={forward_batch.input_ids[:5].tolist()}, "
                        f"input_ids[-5:]={forward_batch.input_ids[-5:].tolist()}")
             if hasattr(forward_batch, 'positions') and forward_batch.positions is not None:
@@ -91,15 +92,22 @@ class HierarchyBlock(DllmAlgorithm):
         elif self.debug and first_token_is_mask:
             logger.info(f"[HierarchyBlock] First mask, no inheritance")
 
-        # Find first mask position for AR strategy
-        block_mask_full = forward_batch.input_ids[block_start:] == self.mask_id
-        first_mask_rel_pos = block_mask_full.nonzero(as_tuple=True)[0][0].item() if block_mask_full.any() else -1
+        # AR mode should only be used when there's prompt before masks
+        # For all-mask blocks with inheritance, first token is already filled, no need for AR
+        use_AR_mode = self.use_AR_for_first_token and block_start > 0
+        
+        # Find first mask position (only needed for AR mode)
+        first_mask_rel_pos = -1
+        if use_AR_mode:
+            block_mask_full = forward_batch.input_ids[block_start:] == self.mask_id
+            first_mask_rel_pos = block_mask_full.nonzero(as_tuple=True)[0][0].item() if block_mask_full.any() else -1
         
         # Process sub-blocks
         for sub_idx in range(num_sub_blocks):
             rel_start = sub_idx * self.sub_block_size
             rel_end = min(rel_start + self.sub_block_size, num_masked)
-            contains_first_mask = (first_mask_rel_pos >= rel_start and first_mask_rel_pos < rel_end) if first_mask_rel_pos >= 0 else False
+            contains_first_mask = (use_AR_mode and first_mask_rel_pos >= 0 and 
+                                  first_mask_rel_pos >= rel_start and first_mask_rel_pos < rel_end)
 
             while True:
                 block_mask = forward_batch.input_ids[block_start:] == self.mask_id
@@ -139,17 +147,15 @@ class HierarchyBlock(DllmAlgorithm):
                 conf = torch.where(sub_mask, conf, torch.tensor(-np.inf, device=conf.device))
 
                 # Select unmask strategy
-                first_mask_still_masked = (first_mask_rel_pos >= 0 and 
-                                          forward_batch.input_ids[block_start + first_mask_rel_pos] == self.mask_id)
-                
-                if self.use_AR_for_first_token and contains_first_mask and first_mask_still_masked:
-                    # AR: unmask first token only
+                # AR mode: only for first generation token after prompt
+                if contains_first_mask and forward_batch.input_ids[block_start + first_mask_rel_pos] == self.mask_id:
+                    # AR: unmask first generation token (after prompt) only
                     unmask = torch.zeros_like(sub_mask, dtype=torch.bool)
                     first_mask_idx_in_sub = first_mask_rel_pos - rel_start
                     if 0 <= first_mask_idx_in_sub < len(sub_mask) and sub_mask[first_mask_idx_in_sub]:
                         unmask[first_mask_idx_in_sub] = True
                     if self.debug:
-                        logger.info(f"[HierarchyBlock] AR unmask first token at rel_pos={first_mask_rel_pos}")
+                        logger.info(f"[HierarchyBlock] AR unmask first generation token at abs_pos={block_start + first_mask_rel_pos}")
                 else:
                     # Confidence-based unmask
                     unmask = conf > self.threshold
