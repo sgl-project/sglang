@@ -25,6 +25,9 @@ from sglang.srt.function_call.minimax_m2 import MinimaxM2Detector
 from sglang.srt.function_call.mistral_detector import MistralDetector
 from sglang.srt.function_call.pythonic_detector import PythonicDetector
 from sglang.srt.function_call.qwen3_coder_detector import Qwen3CoderDetector
+from sglang.srt.function_call.qwen3_coder_new_detector import (
+    Qwen3CoderDetector as Qwen3CoderNewDetector,
+)
 from sglang.srt.function_call.qwen25_detector import Qwen25Detector
 from sglang.srt.function_call.step3_detector import Step3Detector
 from sglang.srt.function_call.utils import get_json_schema_constraint
@@ -57,6 +60,7 @@ class FunctionCallParser:
         "qwen": Qwen25Detector,
         "qwen25": Qwen25Detector,
         "qwen3_coder": Qwen3CoderDetector,
+        "qwen3_coder_new": Qwen3CoderNewDetector,
         "step3": Step3Detector,
         "minimax-m2": MinimaxM2Detector,
         "interns1": InternlmDetector,
