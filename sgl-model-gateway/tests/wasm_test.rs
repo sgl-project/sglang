@@ -207,6 +207,7 @@ async fn create_test_app_with_wasm() -> (axum::Router, Arc<AppContext>, TempDir)
     let app = build_app(
         app_state,
         sgl_model_gateway::middleware::AuthConfig { api_key: None },
+        None, // No control plane auth for tests
         256 * 1024 * 1024,
         request_id_headers,
         vec![], // cors_allowed_origins
