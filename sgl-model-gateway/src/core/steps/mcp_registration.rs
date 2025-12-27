@@ -6,7 +6,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::{
     app_context::AppContext,
-    mcp::{config::McpServerConfig, manager::McpManager},
+    mcp::{config::McpServerConfig, manager::McpManager, ServerIdentity},
     observability::metrics::Metrics,
     workflow::*,
 };
@@ -111,7 +111,11 @@ impl StepExecutor for DiscoverMcpInventoryStep {
         let inventory = mcp_manager.inventory();
 
         // Use the public load_server_inventory method
-        McpManager::load_server_inventory(&inventory, &config_request.name, &mcp_client).await;
+        let identity = ServerIdentity {
+            key: config_request.name.clone(),
+            label: config_request.name.clone(),
+        };
+        McpManager::load_server_inventory(&inventory, &identity, &mcp_client).await;
 
         info!("Completed inventory discovery for {}", config_request.name);
 
