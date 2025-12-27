@@ -40,6 +40,9 @@ class BaseFormatDetector(ABC):
         # Flag for whether current tool's name has been sent to client.
         # Tool names sent first with empty parameters, then arguments stream incrementally.
         self.current_tool_name_sent: bool = False
+        # Flag indicating if the current tool being streamed is unknown (not in tool list).
+        # Used to return tool_index=-1 for unknown tools when forwarding is enabled.
+        self._current_tool_is_unknown: bool = False
         # Tracks raw JSON string content streamed to client for each tool's arguments.
         # Critical for serving layer to calculate remaining content when streaming ends.
         # Each index corresponds to a tool_id. Example: ['{"location": "San Francisco"', '{"temp": 72']
@@ -186,14 +189,20 @@ class BaseFormatDetector(ABC):
                 )
 
                 # Validate tool name if present
-                if "name" in obj and obj["name"] not in self._tool_indices:
-                    # Invalid tool name - reset state
-                    self._buffer = ""
-                    self.current_tool_id = -1
-                    self.current_tool_name_sent = False
-                    if self.streamed_args_for_tool:
-                        self.streamed_args_for_tool.pop()
-                    return StreamingParseResult()
+                is_unknown_tool = "name" in obj and obj["name"] not in self._tool_indices
+                if is_unknown_tool:
+                    logger.warning(
+                        f"Model attempted to call undefined function: {obj['name']}"
+                    )
+                    if not envs.SGLANG_FORWARD_UNKNOWN_TOOLS.get():
+                        # Invalid tool name - reset state (default legacy behavior)
+                        self._buffer = ""
+                        self.current_tool_id = -1
+                        self.current_tool_name_sent = False
+                        if self.streamed_args_for_tool:
+                            self.streamed_args_for_tool.pop()
+                        return StreamingParseResult()
+                    # When forwarding unknown tools, continue processing below
 
                 # Handle parameters/arguments consistency
                 # NOTE: we assume here that the obj is always partial of a single tool call
@@ -216,7 +225,13 @@ class BaseFormatDetector(ABC):
             if not self.current_tool_name_sent:
                 function_name = current_tool_call.get("name")
 
-                if function_name and function_name in self._tool_indices:
+                # Process tool if it's known OR if we're forwarding unknown tools
+                is_known_tool = function_name and function_name in self._tool_indices
+                should_forward = is_known_tool or (
+                    function_name and envs.SGLANG_FORWARD_UNKNOWN_TOOLS.get()
+                )
+
+                if should_forward:
                     # If this is a new tool (current_tool_id was -1), initialize it
                     if self.current_tool_id == -1:
                         self.current_tool_id = 0
@@ -226,11 +241,18 @@ class BaseFormatDetector(ABC):
                         while len(self.streamed_args_for_tool) <= self.current_tool_id:
                             self.streamed_args_for_tool.append("")
 
+                    # Track if this tool is unknown for argument streaming
+                    self._current_tool_is_unknown = not is_known_tool
+
                     # Send the tool name with empty parameters
+                    # Use -1 as tool_index for unknown tools (consistent with parse_base_json)
+                    tool_index = (
+                        self.current_tool_id if is_known_tool else -1
+                    )
                     res = StreamingParseResult(
                         calls=[
                             ToolCallItem(
-                                tool_index=self.current_tool_id,
+                                tool_index=tool_index,
                                 name=function_name,
                                 parameters="",
                             )
@@ -285,27 +307,37 @@ class BaseFormatDetector(ABC):
                         )
 
                     # Advance to next tool if complete
+                    completing_tool_was_unknown = self._current_tool_is_unknown
                     if is_current_complete:
                         self.current_tool_name_sent = False
+                        self._current_tool_is_unknown = False
                         self.current_tool_id += 1
 
                     # Send the argument diff if there's something new
                     if argument_diff is not None:
-                        # Use the correct tool_index: completing_tool_id for completed tools, current_tool_id for ongoing
-                        tool_index_to_use = (
-                            completing_tool_id
-                            if is_current_complete
-                            else self.current_tool_id
+                        # Internal tracking index for streamed_args_for_tool
+                        internal_tool_id = (
+                            completing_tool_id if is_current_complete else self.current_tool_id
                         )
+                        # External tool_index for ToolCallItem result
+                        # For unknown tools, always use -1 (consistent with parse_base_json)
+                        if is_current_complete:
+                            result_tool_index = (
+                                -1 if completing_tool_was_unknown else completing_tool_id
+                            )
+                        else:
+                            result_tool_index = (
+                                -1 if self._current_tool_is_unknown else self.current_tool_id
+                            )
                         res = StreamingParseResult(
                             calls=[
                                 ToolCallItem(
-                                    tool_index=tool_index_to_use,
+                                    tool_index=result_tool_index,
                                     parameters=argument_diff,
                                 )
                             ],
                         )
-                        self.streamed_args_for_tool[tool_index_to_use] += argument_diff
+                        self.streamed_args_for_tool[internal_tool_id] += argument_diff
 
             return res
 
