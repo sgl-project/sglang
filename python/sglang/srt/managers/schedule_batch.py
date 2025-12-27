@@ -1501,21 +1501,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     req.logprob_start_len - pre_len,
                     req.extend_input_len,
                 )
-                if req.is_prefill_only and req.logprob_start_len == len(
-                    req.origin_input_ids
-                ):
-                    if req.extend_logprob_start_len != req.extend_input_len:
-                        raise ValueError(
-                            f"req.extend_logprob_start_len is not equal to req.extend_input_len, "
-                            f"{req.extend_logprob_start_len=} {req.extend_input_len=} "
-                            f"{req.logprob_start_len=} {pre_len=} {req.extend_input_len=}"
-                        )
-                elif req.extend_logprob_start_len > req.seqlen - 1:
-                    raise ValueError(
-                        f"req.extend_logprob_start_len is greater than req.seqlen - 1,"
-                        f"{req.extend_logprob_start_len=} {req.seqlen=} {req.logprob_start_len=} "
-                        f"{pre_len=} {req.extend_input_len=}"
-                    )
             else:
                 # logprob_start_len is before the current extend batch, so start from beginning
                 req.extend_logprob_start_len = 0
