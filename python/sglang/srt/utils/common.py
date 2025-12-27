@@ -1337,6 +1337,7 @@ def get_zmq_socket(
     socket_type: zmq.SocketType,
     endpoint: Optional[str] = None,
     bind: bool = True,
+    host: str = "*",
 ) -> Union[zmq.Socket, Tuple[int, zmq.Socket]]:
     """Create and configure a ZeroMQ socket.
 
@@ -1345,6 +1346,7 @@ def get_zmq_socket(
         socket_type: Type of ZeroMQ socket to create.
         endpoint: Optional endpoint to bind/connect to. If None, binds to a random TCP port.
         bind: Whether to bind (True) or connect (False) to the endpoint. Ignored if endpoint is None.
+        host: Host to bind/connect to, without "tcp://" prefix.
 
     Returns:
         If endpoint is None: Tuple of (port, socket) where port is the randomly assigned TCP port.
@@ -1355,7 +1357,9 @@ def get_zmq_socket(
     if endpoint is None:
         # Bind to random TCP port
         config_socket(socket, socket_type)
-        port = socket.bind_to_random_port("tcp://*")
+        if is_valid_ipv6_address(host):
+            socket.setsockopt(zmq.IPV6, 1)
+        port = socket.bind_to_random_port(f"tcp://{host}")
         return port, socket
     else:
         # Handle IPv6 if endpoint contains brackets
