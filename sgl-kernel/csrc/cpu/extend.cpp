@@ -433,7 +433,7 @@ void extend_attention_cpu(
     at::Tensor& seq_lens,
     at::Tensor& extend_seq_lens,
     at::Tensor& extend_start_loc,
-    int64_t max_len_extend,
+    at::Tensor& max_len_extend,
     double sm_scale,
     double logit_cap) {
   RECORD_FUNCTION(
@@ -458,6 +458,7 @@ void extend_attention_cpu(
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(k_buffer);
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(v_buffer);
 
+  int64_t max_len_extend_value = max_len_extend.item<int64_t>();
   int num_seqs = seq_lens.size(0);
   int max_num_reqs = req_to_token.size(0);
   int max_context_len = req_to_token.size(1);
@@ -560,7 +561,7 @@ void extend_attention_cpu(
           max_num_reqs,
           max_context_len,
           max_total_num_tokens,
-          max_len_extend,
+          max_len_extend_value,
           size_per_thread,
           is_prefix_skipped);
     });
