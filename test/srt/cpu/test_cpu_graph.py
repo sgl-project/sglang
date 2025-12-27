@@ -12,6 +12,7 @@ from sglang.srt.utils import get_cpu_ids_by_node, kill_process_tree
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_MLA_MODEL_NAME_FOR_TEST,
+    DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -37,6 +38,23 @@ class TestCPUGraph(CustomTestCase):
     )
     def test_latency_torch_compile_cpu(self):
         return DEFAULT_MLA_MODEL_NAME_FOR_TEST
+
+    @intel_amx_benchmark(
+        extra_args=[
+            "--batch-size",
+            "1",
+            "--mem-fraction-static",
+            "0.05",
+            "--enable-torch-compile",
+            "--torch-compile-max-bs",
+            "2",
+            "--cpu-graph-bs",
+            "2",
+        ],
+        min_throughput=40,
+    )
+    def test_padding_latency_torch_compile_cpu(self):
+        return DEFAULT_SMALL_MODEL_NAME_FOR_TEST
 
     def test_mmlu_torch_compile_cpu(self):
         model = DEFAULT_MLA_MODEL_NAME_FOR_TEST

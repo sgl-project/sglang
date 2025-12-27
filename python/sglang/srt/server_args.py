@@ -523,6 +523,7 @@ class ServerArgs:
     disable_radix_cache: bool = False
     cuda_graph_max_bs: Optional[int] = None
     cuda_graph_bs: Optional[List[int]] = None
+    cpu_graph_bs: Optional[List[int]] = None
     disable_cuda_graph: bool = False
     disable_cuda_graph_padding: bool = False
     enable_profile_cuda_graph: bool = False
@@ -3876,6 +3877,12 @@ class ServerArgs:
             type=int,
             nargs="+",
             help="Set the list of batch sizes for cuda graph.",
+        )
+        parser.add_argument(
+            "--cpu-graph-bs",
+            type=int,
+            nargs="+",
+            help="Set the list of batch sizes for cpu graph.",
         )
         parser.add_argument(
             "--disable-cuda-graph",
