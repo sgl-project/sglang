@@ -931,6 +931,7 @@ class SchedulerDisaggregationDecodeMixin:
                 ret = None
             else:
                 self.running_batch = self.update_running_batch(self.running_batch)
+                self.running_batch.prepare_for_decode()
                 ret = self.running_batch if not self.running_batch.is_empty() else None
 
         # 1. decode + None -> decode + idle
