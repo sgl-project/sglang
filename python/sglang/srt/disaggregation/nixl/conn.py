@@ -645,10 +645,9 @@ class NixlKVManager(CommonKVManager):
             return False
         return self.transfer_statuses[room].is_done()
 
-    def _start_bootstrap_thread(self):
-        def bootstrap_thread():
-            """This thread recvs transfer info from the decode engine"""
-            while True:
+    def consume_bootstrap(self):
+        with self.kv_status_lock:
+            while self.server_socket_poller.poll(timeout=0):
                 waiting_req_bytes = self.server_socket.recv_multipart()
                 logger.debug(
                     f"Received multipart with total byte size {sum(len(x) for x in waiting_req_bytes)}"
@@ -679,6 +678,13 @@ class NixlKVManager(CommonKVManager):
                 if len(self.transfer_infos[room]) == required_dst_info_num:
                     logger.debug(f"{room=} is bootstrapped")
                     self.update_status(room, KVPoll.WaitingForInput)
+
+    def _start_bootstrap_thread(self):
+        def bootstrap_thread():
+            """This thread recvs transfer info from the decode engine"""
+            while True:
+                self.consume_bootstrap()
+                time.sleep(0.1)
 
         threading.Thread(target=bootstrap_thread).start()
 

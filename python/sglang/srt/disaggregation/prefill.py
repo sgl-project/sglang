@@ -28,6 +28,7 @@ from typing import TYPE_CHECKING, List, Optional, Type
 import torch
 
 from sglang.srt.disaggregation.base import BaseKVManager, KVPoll
+from sglang.srt.disaggregation.common import CommonKVManager
 from sglang.srt.disaggregation.utils import (
     FAKE_BOOTSTRAP_HOST,
     DisaggregationMode,
@@ -108,7 +109,7 @@ class PrefillBootstrapQueue:
         self.max_total_num_tokens = max_total_num_tokens
         self.scheduler = scheduler
         self.transfer_backend = transfer_backend
-        self.kv_manager = self._init_kv_manager()
+        self.kv_manager: BaseKVManager | CommonKVManager = self._init_kv_manager()
 
     def _init_kv_manager(self) -> BaseKVManager:
         kv_args_class = get_kv_class(self.transfer_backend, KVClassType.KVARGS)
@@ -242,6 +243,8 @@ class PrefillBootstrapQueue:
                 return []
             else:
                 return [], []
+
+        self.kv_manager.consume_bootstrap()
 
         polls = poll_and_all_reduce(
             [req.disagg_kv_sender for req in self.queue], self.gloo_group

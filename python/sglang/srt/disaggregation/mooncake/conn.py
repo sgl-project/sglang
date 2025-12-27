@@ -846,11 +846,9 @@ class MooncakeKVManager(CommonKVManager):
                     f"Transfer thread failed because of {e}. Prefill instance with bootstrap_port={self.bootstrap_port} is dead."
                 )
 
-    def start_prefill_thread(self):
-        def bootstrap_thread():
-            """This thread recvs pre-alloc notification from the decode engine"""
-            # KVPoll.Bootstrapping -> KVPoll.WaitingForInput
-            while True:
+    def consume_bootstrap(self):
+        with self.kv_status_lock:
+            while self.server_socket_poller.poll(timeout=0):
                 waiting_req_bytes = self.server_socket.recv_multipart()
                 room = waiting_req_bytes[0].decode("ascii")
                 mooncake_session_id = waiting_req_bytes[3].decode("ascii")
@@ -866,7 +864,6 @@ class MooncakeKVManager(CommonKVManager):
                     logger.debug(
                         f"Register KVArgs from {mooncake_session_id} successfully"
                     )
-                    continue
                 else:
                     required_dst_info_num = int(waiting_req_bytes[7].decode("ascii"))
                     room = int(room)
@@ -879,6 +876,15 @@ class MooncakeKVManager(CommonKVManager):
                     # NOTE: after bootstrapping we can mark the req as waiting for input
                     if len(self.transfer_infos[room]) == required_dst_info_num:
                         self.update_status(room, KVPoll.WaitingForInput)
+                        logger.debug(f"bootstrap {mooncake_session_id} successfully")
+
+    def start_prefill_thread(self):
+        def bootstrap_thread():
+            """This thread recvs pre-alloc notification from the decode engine"""
+            # KVPoll.Bootstrapping -> KVPoll.WaitingForInput
+            while True:
+                self.consume_bootstrap()
+                time.sleep(0.1)
 
         threading.Thread(target=bootstrap_thread).start()
 

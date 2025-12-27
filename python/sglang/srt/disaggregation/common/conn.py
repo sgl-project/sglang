@@ -77,6 +77,9 @@ class CommonKVManager(BaseKVManager):
             context, zmq.PULL, host=zmq_bind_host
         )
         logger.debug(f"kv manager bind to {zmq_bind_host}:{self.rank_port}")
+        self.server_socket_poller = zmq.Poller()
+        self.server_socket_poller.register(self.server_socket, zmq.POLLIN)
+        self.kv_status_lock = threading.Lock()
 
         self.request_status: Dict[int, KVPoll] = {}
 
@@ -176,6 +179,8 @@ class CommonKVManager(BaseKVManager):
         sliced_dst_kv_ptrs = dst_kv_ptrs[start_layer:end_layer]
         layers_current_pp_stage = len(src_kv_ptrs)
         return src_kv_ptrs, sliced_dst_kv_ptrs, layers_current_pp_stage
+
+    def consume_bootstrap(self): ...
 
 
 class CommonKVSender(BaseKVSender):
