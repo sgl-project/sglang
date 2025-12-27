@@ -69,12 +69,23 @@ class OpenAIServingChat(OpenAIServingBase):
         self.reasoning_parser = self.tokenizer_manager.server_args.reasoning_parser
 
         # Get default sampling parameters from model's generation config
-        self.default_sampling_params = (
-            self.tokenizer_manager.model_config.get_default_sampling_params()
+        # and merge with preferred_sampling_params from CLI args
+        # Priority: user value > preferred_sampling_params > model generation_config > OpenAI defaults
+        model_generation_config = (
+            self.tokenizer_manager.model_config.get_default_sampling_params() or {}
         )
-        if self.default_sampling_params:
+        preferred_params = self.tokenizer_manager.preferred_sampling_params or {}
+
+        # Merge: preferred_sampling_params takes precedence over model generation config
+        self.default_sampling_params = {**model_generation_config, **preferred_params}
+
+        if model_generation_config:
             logger.info(
-                f"Using default chat sampling params from model generation config: {self.default_sampling_params}",
+                f"Using default chat sampling params from model generation config: {model_generation_config}",
+            )
+        if preferred_params:
+            logger.info(
+                f"Using preferred sampling params from CLI: {preferred_params}",
             )
 
         # Check if the model is a GPT-OSS model
