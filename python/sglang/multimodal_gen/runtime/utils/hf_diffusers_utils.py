@@ -415,6 +415,15 @@ def maybe_download_model(
         if is_lora or _verify_model_complete(local_path):
             logger.info("Found complete model in cache at %s", local_path)
             return str(local_path)
+        else:
+            # Model found in cache but incomplete
+            if not download:
+                raise ValueError(
+                    f"Model {model_name_or_path} found in cache but is incomplete and download=False."
+                )
+            logger.info(
+                "Model found in cache but incomplete, will download from HF Hub"
+            )
     except LocalEntryNotFoundError:
         if not download:
             raise ValueError(
