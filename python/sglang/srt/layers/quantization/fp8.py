@@ -14,6 +14,7 @@ from sglang.srt.distributed import get_tensor_model_parallel_world_size, get_tp_
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.amx_utils import _amx_process_weight_after_loading
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
@@ -1176,6 +1177,17 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 symm_output = torch.empty_like(x)
 
             topk_weights, topk_ids, _ = dispatch_output.topk_output
+            enable_es = (False, False)
+            if envs.SGLANG_CUTLASS_MOE_USE_ES.get() and is_sm90_supported():
+                if (
+                    torch.cuda.get_device_name(torch.cuda.current_device())
+                    == "NVIDIA H20"
+                ):
+                    # Enable ES for Gate+Up and Down Layer for H20
+                    enable_es = (True, True)
+                else:
+                    # Enable ES for Down Layer for H100/H200/H800
+                    enable_es = (False, True)
             output = cutlass_fused_experts_fp8(
                 x,
                 layer.w13_weight.transpose(1, 2),
@@ -1199,6 +1211,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 self.problem_sizes2,
                 use_fp8_blockscale=True,
                 output=symm_output,
+                enable_es=enable_es,
             )
             return StandardCombineInput(hidden_states=output)
 
