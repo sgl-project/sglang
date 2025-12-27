@@ -268,6 +268,7 @@ class MessageQueue:
 
         if rank in handle.local_reader_ranks:
             assert handle.buffer is not None
+            assert handle.local_subscribe_port is not None
             self.buffer = handle.buffer
             self.current_idx = 0
             self.local_reader_rank = handle.local_reader_ranks.index(rank)
@@ -290,6 +291,7 @@ class MessageQueue:
 
             self.local_socket = None
 
+            assert handle.remote_subscribe_port is not None
             self.remote_socket = context.socket(SUB)
             self.remote_socket.setsockopt_string(SUBSCRIBE, "")
             if is_valid_ipv6_address(handle.connect_ip):
