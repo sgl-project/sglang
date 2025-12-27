@@ -22,6 +22,7 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.storage import cloud_stora
 from sglang.multimodal_gen.runtime.entrypoints.openai.stores import IMAGE_STORE
 from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     _parse_size,
+    add_common_data_to_response,
     merge_image_input_list,
     process_generation_batch,
     save_image_to_path,
@@ -171,7 +172,7 @@ async def generations(
                     url=cloud_url,
                     revised_prompt=request.prompt,
                 )
-            ]
+            ],
         }
     else:
         # Return error, not supported
@@ -179,8 +180,9 @@ async def generations(
             status_code=400, detail=f"response_format={resp_format} is not supported"
         )
 
-    if result.peak_memory_mb and result.peak_memory_mb > 0:
-        response_kwargs["peak_memory_mb"] = result.peak_memory_mb
+    response_kwargs = add_common_data_to_response(
+        response_kwargs, request_id=request_id, result=result
+    )
     return ImageResponse(**response_kwargs)
 
 
@@ -285,17 +287,18 @@ async def edits(
             "data": [ImageResponseData(b64_json=b64_data, revised_prompt=prompt)]
         }
     else:
-        if not cloud_url:
-            raise HTTPException(
-                status_code=400,
-                detail="response_format='url' requires cloud storage to be configured.",
-            )
         response_kwargs = {
-            "data": [ImageResponseData(url=cloud_url, revised_prompt=prompt)]
+            "data": [
+                ImageResponseData(
+                    url=cloud_url if cloud_url else f"/v1/images/{request_id}/content",
+                    revised_prompt=prompt,
+                )
+            ]
         }
 
-    if result.peak_memory_mb and result.peak_memory_mb > 0:
-        response_kwargs["peak_memory_mb"] = result.peak_memory_mb
+    response_kwargs = add_common_data_to_response(
+        response_kwargs, request_id=request_id, result=result
+    )
     return ImageResponse(**response_kwargs)
 
 
