@@ -483,6 +483,7 @@ class ServerArgs:
     hicache_storage_backend: Optional[str] = None
     hicache_storage_prefetch_policy: str = "best_effort"
     hicache_storage_backend_extra_config: Optional[str] = None
+    multimodal_hash_algo: str = "sha256"
     # LMCache
     enable_lmcache: bool = False
 
@@ -2384,6 +2385,16 @@ class ServerArgs:
             self.pp_size = 1
 
     def _handle_other_validations(self):
+        # Validate multimodal hash algorithm selection
+        from sglang.srt.utils.hashing import HashAlgorithm
+
+        if not HashAlgorithm.is_available(self.multimodal_hash_algo):
+            raise ValueError(
+                f"Multimodal hash algorithm '{self.multimodal_hash_algo}' is not available. "
+                f"Available options: {HashAlgorithm.choices()}. "
+                "If using 'xxhash', please install it with: pip install xxhash"
+            )
+
         # Handle model inference tensor dump.
         if self.debug_tensor_dump_output_folder is not None:
             logger.warning(
@@ -3725,6 +3736,17 @@ class ServerArgs:
             type=str,
             default=ServerArgs.hicache_storage_backend_extra_config,
             help="A dictionary in JSON string format containing extra configuration for the storage backend.",
+        )
+        parser.add_argument(
+            "--multimodal-hash-algo",
+            type=str,
+            choices=["sha256", "xxhash"],
+            default=ServerArgs.multimodal_hash_algo,
+            help=(
+                "Hash algorithm for multimodal feature hashing (used by set_pad_value). "
+                "Options: 'sha256' (cryptographic, default), 'xxhash' (non-cryptographic, faster). "
+                "Note: xxhash requires the 'xxhash' package to be installed."
+            ),
         )
         # LMCache
         parser.add_argument(
