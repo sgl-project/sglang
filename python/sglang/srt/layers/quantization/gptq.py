@@ -236,6 +236,9 @@ class GPTQConfig(QuantizationConfig):
         if _is_npu:
             if isinstance(layer, LinearBase):
                 return GPTQLinearAscendMethod(self)
+            elif isinstance(layer, FusedMoE):
+                # TODO: support GPTQ quantization MoE on npu.
+                raise NotImplementedError("GPTQ Method does not support MoE yet.")
             return None
 
         if isinstance(layer, FusedMoE):
