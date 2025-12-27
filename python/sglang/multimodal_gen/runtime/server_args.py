@@ -309,7 +309,7 @@ class ServerArgs:
             self.vae_cpu_offload = False
 
     def __post_init__(self):
-        # configure logger first to enable logging
+        # configure logger before use
         configure_logger(server_args=self)
 
         self.adjust_offload()
