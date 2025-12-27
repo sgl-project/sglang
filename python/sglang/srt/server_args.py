@@ -1458,6 +1458,7 @@ class ServerArgs:
             and model_arch
             in [
                 "DeepseekV3ForCausalLM",
+                "DeepseekV32ForCausalLM",
                 "GptOssForCausalLM",
                 "Glm4MoeForCausalLM",
                 "Qwen3MoeForCausalLM",
