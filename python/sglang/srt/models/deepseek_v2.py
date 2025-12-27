@@ -3662,6 +3662,28 @@ class DeepseekV2ForCausalLM(nn.Module):
             ]:
                 transform_scale_ue8m0_inplace(w[1], mn=w[0].shape[-2])
 
+    @classmethod
+    def generate_weight_name_filter(cls, logical_experts: List[Tuple[int, List[int]]]):
+        """
+        Generates a filter function that tests whether the (layer_id, expert_id)
+        indicated by a param name lies in the `logical_experts` list
+        Args:
+            logical_experts: a list of (layer_id, expert_ids) tuples. Each tuple
+            specifies a list of expert_ids of a specific layer_id.
+
+        Returns:
+            A function (name: str) -> bool
+        """
+
+        def weight_name_filter(name: str) -> bool:
+            for layer, experts in logical_experts:
+                for expert in experts:
+                    if f"layers.{layer}.mlp.experts.{expert}." in name:
+                        return True
+            return False
+
+        return weight_name_filter
+
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False):
 
         if is_nextn:
