@@ -274,6 +274,9 @@ pub fn init_metrics() {
         "Active database connections by storage_type"
     );
     describe_counter!("smg_db_items_stored", "Total items stored by storage_type");
+
+    // Initialize mesh metrics
+    crate::mesh::metrics::init_mesh_metrics();
 }
 
 pub fn start_prometheus(config: PrometheusConfig) {

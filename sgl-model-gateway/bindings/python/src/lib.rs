@@ -305,6 +305,8 @@ impl Router {
                 prefill_selector: self.prefill_selector.clone(),
                 decode_selector: self.decode_selector.clone(),
                 bootstrap_port_annotation: self.bootstrap_port_annotation.clone(),
+                router_selector: HashMap::new(),
+                router_mesh_port_annotation: "sglang.ai/mesh-port".to_string(),
             })
         } else {
             None
@@ -706,6 +708,8 @@ impl Router {
                 prefill_selector: self.prefill_selector.clone(),
                 decode_selector: self.decode_selector.clone(),
                 bootstrap_port_annotation: self.bootstrap_port_annotation.clone(),
+                router_selector: HashMap::new(),
+                router_mesh_port_annotation: "sglang.ai/mesh-port".to_string(),
             })
         } else {
             None
@@ -736,6 +740,7 @@ impl Router {
                 request_timeout_secs: self.request_timeout_secs,
                 request_id_headers: self.request_id_headers.clone(),
                 shutdown_grace_period_secs: self.shutdown_grace_period_secs,
+                mesh_server_config: None,
             })
             .await
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))

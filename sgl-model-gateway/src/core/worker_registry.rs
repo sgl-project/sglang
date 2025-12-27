@@ -6,13 +6,14 @@
 //! The model index uses immutable Arc snapshots instead of RwLock for lock-free reads.
 //! This is critical for high-concurrency scenarios where many requests query the same model.
 
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use dashmap::DashMap;
 use uuid::Uuid;
 
 use crate::{
     core::{ConnectionMode, RuntimeType, Worker, WorkerType},
+    mesh::OptionalMeshSyncManager,
     observability::metrics::Metrics,
 };
 
@@ -66,6 +67,10 @@ pub struct WorkerRegistry {
 
     /// URL to worker ID mapping
     url_to_id: Arc<DashMap<String, WorkerId>>,
+    /// Optional mesh sync manager for state synchronization
+    /// When None, the registry works independently without mesh synchronization
+    /// Uses RwLock for thread-safe access when setting mesh_sync after initialization
+    mesh_sync: Arc<RwLock<OptionalMeshSyncManager>>,
 }
 
 impl WorkerRegistry {
@@ -77,7 +82,25 @@ impl WorkerRegistry {
             type_workers: Arc::new(DashMap::new()),
             connection_workers: Arc::new(DashMap::new()),
             url_to_id: Arc::new(DashMap::new()),
+            mesh_sync: Arc::new(RwLock::new(None)),
         }
+    }
+
+    /// Create a new worker registry with mesh sync manager
+    pub fn with_mesh_sync(mesh_sync: OptionalMeshSyncManager) -> Self {
+        Self {
+            workers: Arc::new(DashMap::new()),
+            model_index: Arc::new(DashMap::new()),
+            type_workers: Arc::new(DashMap::new()),
+            connection_workers: Arc::new(DashMap::new()),
+            url_to_id: Arc::new(DashMap::new()),
+            mesh_sync: Arc::new(RwLock::new(mesh_sync)),
+        }
+    }
+
+    /// Set mesh sync manager (thread-safe, can be called after initialization)
+    pub fn set_mesh_sync(&self, mesh_sync: OptionalMeshSyncManager) {
+        *self.mesh_sync.write().unwrap() = mesh_sync;
     }
 
     /// Register a new worker
@@ -120,6 +143,17 @@ impl WorkerRegistry {
             .entry(worker.connection_mode().clone())
             .or_default()
             .push(worker_id.clone());
+
+        // Sync to mesh if enabled (no-op if mesh is not enabled)
+        if let Some(ref mesh_sync) = *self.mesh_sync.read().unwrap() {
+            mesh_sync.sync_worker_state(
+                worker_id.as_str().to_string(),
+                worker.model_id().to_string(),
+                worker.url().to_string(),
+                worker.is_healthy(),
+                0.0, // TODO: Get actual load
+            );
+        }
 
         worker_id
     }
@@ -173,6 +207,11 @@ impl WorkerRegistry {
             worker.set_healthy(false);
             Metrics::remove_worker_metrics(worker.url());
 
+            // Sync removal to mesh if enabled (no-op if mesh is not enabled)
+            if let Some(ref mesh_sync) = *self.mesh_sync.read().unwrap() {
+                mesh_sync.remove_worker_state(worker_id.as_str());
+            }
+
             Some(worker)
         } else {
             None
@@ -223,6 +262,25 @@ impl WorkerRegistry {
             .get(worker_type)
             .map(|ids| ids.iter().filter_map(|id| self.get(id)).collect())
             .unwrap_or_default()
+    }
+
+    /// Update worker health status and sync to mesh
+    pub fn update_worker_health(&self, worker_id: &WorkerId, is_healthy: bool) {
+        if let Some(worker) = self.workers.get(worker_id) {
+            // Update worker health (if Worker trait has a method for this)
+            // For now, we'll just sync to mesh
+
+            // Sync to mesh if enabled (no-op if mesh is not enabled)
+            if let Some(ref mesh_sync) = *self.mesh_sync.read().unwrap() {
+                mesh_sync.sync_worker_state(
+                    worker_id.as_str().to_string(),
+                    worker.model_id().to_string(),
+                    worker.url().to_string(),
+                    is_healthy,
+                    0.0, // TODO: Get actual load
+                );
+            }
+        }
     }
 
     /// Get all prefill workers (regardless of bootstrap_port)

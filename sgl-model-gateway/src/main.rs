@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use clap::{ArgAction, Parser, Subcommand, ValueEnum};
+use rand::{distr::Alphanumeric, Rng};
 use sgl_model_gateway::{
     config::{
         CircuitBreakerConfig, ConfigError, ConfigResult, DiscoveryConfig, HealthCheckConfig,
@@ -8,6 +9,7 @@ use sgl_model_gateway::{
         RouterConfig, RoutingMode, TokenizerCacheConfig, TraceConfig,
     },
     core::ConnectionMode,
+    mesh::service::MeshServerConfig,
     observability::{
         metrics::PrometheusConfig,
         otel_trace::{is_otel_enabled, shutdown_otel},
@@ -372,6 +374,21 @@ struct CliArgs {
 
     #[arg(long)]
     tls_key_path: Option<String>,
+
+    #[arg(long, default_value_t = false)]
+    enable_ha: bool,
+
+    #[arg(long)]
+    mesh_server_name: Option<String>,
+
+    #[arg(long, default_value = "0.0.0.0")]
+    mesh_host: String,
+
+    #[arg(long, default_value_t = 39527)]
+    mesh_port: u16,
+
+    #[arg(long, num_args = 0..)]
+    peer_urls: Vec<String>,
 }
 
 enum OracleConnectSource {
@@ -548,6 +565,8 @@ impl CliArgs {
                 prefill_selector: Self::parse_selector(&self.prefill_selector),
                 decode_selector: Self::parse_selector(&self.decode_selector),
                 bootstrap_port_annotation: "sglang.ai/bootstrap-port".to_string(),
+                router_selector: HashMap::new(), // Can be set via config file
+                router_mesh_port_annotation: "sglang.ai/mesh-port".to_string(),
             })
         } else {
             None
@@ -674,6 +693,18 @@ impl CliArgs {
 
     fn to_server_config(&self, router_config: RouterConfig) -> ServerConfig {
         let service_discovery_config = if self.service_discovery {
+            // Get router discovery config from router_config.discovery if available
+            let (router_selector, router_mesh_port_annotation) = router_config
+                .discovery
+                .as_ref()
+                .map(|d| {
+                    (
+                        d.router_selector.clone(),
+                        d.router_mesh_port_annotation.clone(),
+                    )
+                })
+                .unwrap_or_else(|| (HashMap::new(), "sglang.ai/mesh-port".to_string()));
+
             Some(ServiceDiscoveryConfig {
                 enabled: true,
                 selector: Self::parse_selector(&self.selector),
@@ -684,6 +715,8 @@ impl CliArgs {
                 prefill_selector: Self::parse_selector(&self.prefill_selector),
                 decode_selector: Self::parse_selector(&self.decode_selector),
                 bootstrap_port_annotation: "sglang.ai/bootstrap-port".to_string(),
+                router_selector,
+                router_mesh_port_annotation,
             })
         } else {
             None
@@ -698,6 +731,37 @@ impl CliArgs {
                 Some(self.prometheus_duration_buckets.clone())
             },
         });
+
+        let mesh_server_config = if self.enable_ha {
+            let self_name = if let Some(name) = &self.mesh_server_name {
+                name.to_string()
+            } else {
+                // If name is not set, use a random name
+                let mut rng = rand::rng();
+                let random_string: String =
+                    (0..4).map(|_| rng.sample(Alphanumeric) as char).collect();
+                format!("Mesh_{}", random_string)
+            };
+
+            let peer = self
+                .peer_urls
+                .first()
+                .and_then(|url| url.parse::<std::net::SocketAddr>().ok());
+            if let Ok(addr) =
+                format!("{}:{}", self.mesh_host, self.mesh_port).parse::<std::net::SocketAddr>()
+            {
+                Some(MeshServerConfig {
+                    self_name,
+                    self_addr: addr,
+                    init_peer: peer,
+                })
+            } else {
+                tracing::warn!("Invalid HA server address, so HA server will not be started");
+                None
+            }
+        } else {
+            None
+        };
 
         ServerConfig {
             host: self.host.clone(),
@@ -715,6 +779,7 @@ impl CliArgs {
                 Some(self.request_id_headers.clone())
             },
             shutdown_grace_period_secs: self.shutdown_grace_period_secs,
+            mesh_server_config,
         }
     }
 }
