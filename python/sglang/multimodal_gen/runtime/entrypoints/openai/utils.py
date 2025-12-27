@@ -9,6 +9,7 @@ from typing import Any, List, Optional, Union
 import httpx
 from fastapi import UploadFile
 
+from sglang.multimodal_gen.configs.sample.sampling_params import DataType
 from sglang.multimodal_gen.runtime.entrypoints.utils import post_process_sample
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 from sglang.multimodal_gen.runtime.scheduler_client import AsyncSchedulerClient
@@ -184,20 +185,33 @@ async def process_generation_batch(
                 f"Model generation returned no output. Error from scheduler: {error_msg}"
             )
         save_file_path_list = []
-        for idx, output in enumerate(result.output):
+        if batch.data_type == DataType.VIDEO:
             save_file_path = str(
-                os.path.join(
-                    batch.output_path, f"sample_{idx}_" + batch.output_file_name
-                )
+                os.path.join(batch.output_path, batch.output_file_name)
             )
             post_process_sample(
-                output,
+                result.output[0],
                 batch.data_type,
                 batch.fps,
                 batch.save_output,
                 save_file_path,
             )
             save_file_path_list.append(save_file_path)
+        else:
+            for idx, output in enumerate(result.output):
+                save_file_path = str(
+                    os.path.join(
+                        batch.output_path, f"sample_{idx}_" + batch.output_file_name
+                    )
+                )
+                post_process_sample(
+                    output,
+                    batch.data_type,
+                    batch.fps,
+                    batch.save_output,
+                    save_file_path,
+                )
+                save_file_path_list.append(save_file_path)
 
     total_time = time.perf_counter() - total_start_time
     log_batch_completion(logger, 1, total_time)
