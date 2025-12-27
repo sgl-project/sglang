@@ -15,6 +15,7 @@ from diffusers.models.modeling_outputs import Transformer2DModelOutput
 from diffusers.models.normalization import AdaLayerNormContinuous
 
 from sglang.multimodal_gen.configs.models.dits.qwenimage import QwenImageDitConfig
+from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.layers.attention import USPAttention
 from sglang.multimodal_gen.runtime.layers.layernorm import (
     LayerNorm,
@@ -34,7 +35,6 @@ from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)  # pylint: disable=invalid-name
-
 
 def _get_qkv_projections(
     attn: "QwenImageCrossAttention", hidden_states, encoder_hidden_states=None
@@ -873,6 +873,10 @@ class QwenImageTransformer2DModel(CachableDiT):
             self.inner_dim, patch_size * patch_size * self.out_channels, bias=True
         )
 
+        self.timestep_zero = torch.zeros(
+            (1,), dtype=torch.int, device=get_local_torch_device()
+        )
+
     @functools.lru_cache(maxsize=50)
     def build_modulate_index(self, img_shapes: tuple[int, int, int], device):
         modulate_index_list = []
@@ -939,8 +943,7 @@ class QwenImageTransformer2DModel(CachableDiT):
 
         timestep = (timestep / 1000).to(hidden_states.dtype)
         if self.zero_cond_t:
-
-            timestep = torch.cat([timestep, timestep * 0], dim=0)
+            timestep = torch.cat([timestep, self.timestep_zero], dim=0)
             device = timestep.device
             modulate_index = self.build_modulate_index(to_hashable(img_shapes), device)
         else:
