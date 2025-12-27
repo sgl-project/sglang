@@ -43,6 +43,9 @@ from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
     get_diffusers_component_config,
     get_hf_config,
 )
+from sglang.multimodal_gen.runtime.utils.layerwise_offload import (
+    LayerwiseOffloadManager,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
 
@@ -93,9 +96,11 @@ class ComponentLoader(ABC):
     def __init__(self, device=None) -> None:
         self.device = device
 
-    def should_offload(self, server_args, model_config: ModelConfig | None = None):
-        # offload by default
-        return True
+    def should_offload(
+        self, server_args: ServerArgs, model_config: ModelConfig | None = None
+    ):
+        # not offload by default
+        return False
 
     def target_device(self, should_offload):
         if should_offload:
@@ -273,7 +278,15 @@ class TextEncoderLoader(ComponentLoader):
 
     def should_offload(self, server_args, model_config: ModelConfig | None = None):
         should_offload = server_args.text_encoder_cpu_offload
-        fsdp_shard_conditions = getattr(model_config, "_fsdp_shard_conditions", [])
+        if not should_offload:
+            return False
+        # _fsdp_shard_conditions is in arch_config, not directly on model_config
+        arch_config = (
+            getattr(model_config, "arch_config", model_config) if model_config else None
+        )
+        fsdp_shard_conditions = (
+            getattr(arch_config, "_fsdp_shard_conditions", []) if arch_config else []
+        )
         use_cpu_offload = should_offload and len(fsdp_shard_conditions) > 0
         return use_cpu_offload
 
@@ -477,7 +490,15 @@ class TextEncoderLoader(ComponentLoader):
 class ImageEncoderLoader(TextEncoderLoader):
     def should_offload(self, server_args, model_config: ModelConfig | None = None):
         should_offload = server_args.image_encoder_cpu_offload
-        fsdp_shard_conditions = getattr(model_config, "_fsdp_shard_conditions", [])
+        if not should_offload:
+            return False
+        # _fsdp_shard_conditions is in arch_config, not directly on model_config
+        arch_config = (
+            getattr(model_config, "arch_config", model_config) if model_config else None
+        )
+        fsdp_shard_conditions = (
+            getattr(arch_config, "_fsdp_shard_conditions", []) if arch_config else []
+        )
         use_cpu_offload = should_offload and len(fsdp_shard_conditions) > 0
         return use_cpu_offload
 
@@ -543,8 +564,10 @@ class TokenizerLoader(ComponentLoader):
 class VAELoader(ComponentLoader):
     """Loader for VAE."""
 
-    def should_offload(self, server_args, cpu_offload_flag, model_config):
-        return True
+    def should_offload(
+        self, server_args: ServerArgs, model_config: ModelConfig | None = None
+    ):
+        return server_args.vae_cpu_offload
 
     def load_customized(
         self, component_model_path: str, server_args: ServerArgs, *args
@@ -565,7 +588,8 @@ class VAELoader(ComponentLoader):
         # NOTE: some post init logics are only available after updated with config
         vae_config.post_init()
 
-        target_device = self.target_device(server_args.vae_cpu_offload)
+        should_offload = self.should_offload(server_args)
+        target_device = self.target_device(should_offload)
 
         # Check for auto_map first (custom VAE classes)
         auto_map = config.get("auto_map", {})
@@ -697,6 +721,24 @@ class TransformerLoader(ComponentLoader):
 
         model = model.eval()
 
+        if server_args.dit_layerwise_offload and hasattr(model, "dit_module_names"):
+            # TODO(will): support multiple module names
+            module_name = getattr(model, "dit_module_names", ["transformer_blocks"])[0]
+            try:
+                num_layers = len(getattr(model, module_name))
+            except Exception:
+                num_layers = None
+            if isinstance(num_layers, int) and num_layers > 0:
+                mgr = LayerwiseOffloadManager(
+                    model,
+                    module_list_attr=module_name,
+                    num_layers=num_layers,
+                    enabled=True,
+                    pin_cpu_memory=server_args.pin_cpu_memory,
+                    auto_initialize=True,
+                )
+                setattr(model, "_layerwise_offload_manager", mgr)
+
         return model
 
 
@@ -719,8 +761,7 @@ class SchedulerLoader(ComponentLoader):
         scheduler = scheduler_cls(**config)
         if server_args.pipeline_config.flow_shift is not None:
             scheduler.set_shift(server_args.pipeline_config.flow_shift)
-        if server_args.pipeline_config.timesteps_scale is not None:
-            scheduler.set_timesteps_scale(server_args.pipeline_config.timesteps_scale)
+
         return scheduler
 
 
