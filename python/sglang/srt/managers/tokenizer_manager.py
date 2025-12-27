@@ -742,9 +742,10 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
     def _validate_input_ids_in_vocab(
         self, input_ids: List[int], vocab_size: int
     ) -> None:
-        if any(id >= vocab_size for id in input_ids):
+        if any(id < 0 or id >= vocab_size for id in input_ids):
             raise ValueError(
-                f"The input_ids {input_ids} contains values greater than the vocab size ({vocab_size})."
+                f"The input_ids contains invalid token IDs. "
+                f"Token IDs must be in the range [0, {vocab_size})."
             )
 
     def _get_sampling_params(self, sampling_kwargs: Dict) -> SamplingParams:
