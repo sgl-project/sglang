@@ -44,4 +44,3 @@ def test_custom_event_blocks():
 
 if __name__ == "__main__":
     test_custom_event_blocks()
-
