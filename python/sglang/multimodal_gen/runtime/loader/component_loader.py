@@ -17,6 +17,7 @@ from typing import Any, cast
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+from diffusers import AutoModel
 from safetensors.torch import load_file as safetensors_load_file
 from torch.distributed import init_device_mesh
 from transformers import AutoImageProcessor, AutoProcessor, AutoTokenizer
@@ -118,7 +119,7 @@ class ComponentLoader(ABC):
         server_args: ServerArgs,
         module_name: str,
         transformers_or_diffusers: str,
-    ):
+    ) -> tuple[AutoModel, float]:
         """
         Template method that standardizes logging around the core load implementation.
         The priority of loading method is:
@@ -165,23 +166,25 @@ class ComponentLoader(ABC):
 
         if component is None:
             logger.warning("Loaded %s returned None", module_name)
+            consumed = 0.0
         else:
             current_gpu_mem = current_platform.get_available_gpu_memory()
+            consumed = (gpu_mem_before_loading - current_gpu_mem,)
             logger.info(
                 f"Loaded %s: %s from {source}. avail mem: %.2f GB, %.2f GB consumed",
                 module_name,
                 component.__class__.__name__,
                 current_gpu_mem,
-                gpu_mem_before_loading - current_gpu_mem,
+                consumed,
             )
-        return component
+        return component, consumed
 
     def load_native(
         self,
         component_model_path: str,
         server_args: ServerArgs,
         transformers_or_diffusers: str,
-    ):
+    ) -> AutoModel:
         """
         Load the component using the native library (transformers/diffusers).
         """
