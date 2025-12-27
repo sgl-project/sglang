@@ -1,6 +1,8 @@
 import argparse
 import random
+import shutil
 import sys
+import tempfile
 import unittest
 from types import SimpleNamespace
 
@@ -29,7 +31,14 @@ class TestVLMModels(MMMUVLMTestBase):
             models_to_test = [random.choice(MODELS)]
 
         for model in models_to_test:
-            self._run_vlm_mmmu_test(model, "./logs")
+            # Use a unique temporary directory to avoid reading cached results
+            # from previous runs (fixes https://github.com/sgl-project/sglang/issues/14760)
+            output_path = tempfile.mkdtemp(prefix="vlm_mmmu_")
+            try:
+                self._run_vlm_mmmu_test(model, output_path)
+            finally:
+                # Clean up the temporary directory after each test
+                shutil.rmtree(output_path, ignore_errors=True)
 
 
 if __name__ == "__main__":
