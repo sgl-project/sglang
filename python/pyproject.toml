@@ -89,7 +89,7 @@ diffusion = [
   "imageio==2.36.0",
   "imageio-ffmpeg==0.5.1",
   "moviepy>=2.0.0",
-  "opencv-python==4.10.0.84",
+  "opencv-python-headless==4.10.0.84",
   "remote-pdb",
   "st_attn ==0.0.7",
   "vsa==0.0.4",

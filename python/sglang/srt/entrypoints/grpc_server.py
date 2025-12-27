@@ -233,6 +233,9 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
                 rid=rid,
                 input_text="",
                 input_ids=[0],
+                image_inputs={"mm_items": []},
+                token_type_ids=[0],
+                sampling_params=sampling_params,
             )
 
         # Submit health check request

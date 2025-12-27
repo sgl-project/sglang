@@ -77,13 +77,44 @@ def parse_args():
 
 
 def collect_test_items(files, filter_expr=None):
-    """Collect test item node IDs from the given files using pytest --collect-only."""
+    """Collect test item node IDs from the given files using pytest --collect-only.
+
+    Raises:
+        RuntimeError: If pytest collection fails due to errors (e.g., syntax errors,
+            import errors, or other collection failures).
+    """
     cmd = [sys.executable, "-m", "pytest", "--collect-only", "-q"]
     if filter_expr:
         cmd.extend(["-k", filter_expr])
     cmd.extend(files)
 
+    logger.info(f"Collecting tests with command: {' '.join(cmd)}")
     result = subprocess.run(cmd, capture_output=True, text=True)
+
+    # Check for collection errors
+    # pytest exit codes:
+    #   0: success
+    #   1: tests collected but some had errors during collection
+    #   2: test execution interrupted
+    #   3: internal error
+    #   4: command line usage error
+    #   5: no tests collected (may be expected with filters)
+    if result.returncode not in (0, 5):
+        error_msg = (
+            f"pytest --collect-only failed with exit code {result.returncode}\n"
+            f"Command: {' '.join(cmd)}\n"
+        )
+        if result.stderr:
+            error_msg += f"stderr:\n{result.stderr}\n"
+        if result.stdout:
+            error_msg += f"stdout:\n{result.stdout}\n"
+        logger.error(error_msg)
+        raise RuntimeError(error_msg)
+
+    if result.returncode == 5:
+        logger.info(
+            "No tests were collected (exit code 5). This may be expected with filters."
+        )
 
     # Parse the output to extract test node IDs
     # pytest -q outputs lines like: test_file.py::TestClass::test_method[param]
@@ -97,6 +128,7 @@ def collect_test_items(files, filter_expr=None):
             if "::" in test_id:
                 test_items.append(test_id)
 
+    logger.info(f"Collected {len(test_items)} test items")
     return test_items
 
 

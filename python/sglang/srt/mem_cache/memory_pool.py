@@ -276,6 +276,11 @@ class MambaPool:
             self.mamba_cache.conv[i][:, select_index] = 0
         self.mamba_cache.temporal[:, select_index] = 0
 
+        # fill allocated slots with zeros
+        for i in range(len(self.mamba_cache.conv)):
+            self.mamba_cache.conv[i][:, select_index] = 0
+        self.mamba_cache.temporal[:, select_index] = 0
+
         return select_index
 
     def free(self, free_index: torch.Tensor):
@@ -284,12 +289,6 @@ class MambaPool:
         self.free_slots = torch.cat((self.free_slots, free_index))
 
     def clear(self):
-        # Zero the entire mamba cache before resetting free_slots
-        # This ensures that when slots are reallocated, they start with clean state
-        for i in range(len(self.mamba_cache.conv)):
-            self.mamba_cache.conv[i].zero_()
-        self.mamba_cache.temporal.zero_()
-
         self.free_slots = torch.arange(self.size, dtype=torch.int64, device=self.device)
 
     def copy_from(self, src_index: torch.Tensor, dst_index: torch.Tensor):
