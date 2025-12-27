@@ -92,9 +92,6 @@ DEFAULT_MISTRAL_FUNCTION_CALLING_MODEL_PATH = _get_model_path(
 # GPT-OSS models
 DEFAULT_GPT_OSS_MODEL_PATH = _get_model_path("openai/gpt-oss-20b")
 
-# Embedding models
-DEFAULT_EMBEDDING_MODEL_PATH = _get_model_path("intfloat/e5-mistral-7b-instruct")
-
 
 # ============================================================================
 # Process Management

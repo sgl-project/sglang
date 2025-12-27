@@ -10,6 +10,7 @@ import httpx
 from fastapi import UploadFile
 
 from sglang.multimodal_gen.runtime.entrypoints.utils import post_process_sample
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 from sglang.multimodal_gen.runtime.scheduler_client import AsyncSchedulerClient
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
     init_logger,
@@ -172,7 +173,7 @@ async def _save_base64_image_to_path(base64_data: str, target_path: str) -> str:
 async def process_generation_batch(
     scheduler_client: AsyncSchedulerClient,
     batch,
-):
+) -> tuple[str, OutputBatch]:
     total_start_time = time.perf_counter()
     with log_generation_timer(logger, batch.prompt):
         result = await scheduler_client.forward([batch])
@@ -227,3 +228,14 @@ def merge_image_input_list(*inputs: Union[List, Any, None]) -> List:
             else:
                 result.append(input_item)
     return result
+
+
+def add_common_data_to_response(
+    response: dict, request_id: str, result: OutputBatch
+) -> dict:
+    if result.peak_memory_mb and result.peak_memory_mb > 0:
+        response["peak_memory_mb"] = result.peak_memory_mb
+
+    response["id"] = request_id
+
+    return response
