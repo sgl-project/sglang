@@ -668,10 +668,6 @@ class TransformerLoader(ComponentLoader):
                 "Only diffusers format is supported."
             )
 
-        if server_args.override_transformer_cls_name is not None:
-            cls_name = server_args.override_transformer_cls_name
-            logger.info("Overriding transformer cls_name to %s", cls_name)
-
         server_args.model_paths["transformer"] = component_model_path
 
         # Config from Diffusers supersedes sgl_diffusion's model config

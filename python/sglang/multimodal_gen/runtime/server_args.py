@@ -145,31 +145,6 @@ def _sanitize_for_logging(obj: Any, key_hint: str | None = None) -> Any:
         return "<unserializable>"
 
 
-class ExecutionMode(str, Enum):
-    """
-    Enumeration for different pipeline modes.
-
-    Inherits from str to allow string comparison for backward compatibility.
-    """
-
-    INFERENCE = "inference"
-
-    @classmethod
-    def from_string(cls, value: str) -> "ExecutionMode":
-        """Convert string to ExecutionMode enum."""
-        try:
-            return cls(value.lower())
-        except ValueError:
-            raise ValueError(
-                f"Invalid mode: {value}. Must be one of: {', '.join([m.value for m in cls])}"
-            ) from None
-
-    @classmethod
-    def choices(cls) -> list[str]:
-        """Get all available choices as strings for argparse."""
-        return [mode.value for mode in cls]
-
-
 @dataclasses.dataclass
 class ServerArgs:
     # Model and path configuration (for convenience)
@@ -178,14 +153,7 @@ class ServerArgs:
     # Attention
     attention_backend: str = None
 
-    # Running mode
-    mode: ExecutionMode = ExecutionMode.INFERENCE
-
-    # Cache strategy
-    cache_strategy: str = "none"
-
     # Distributed executor backend
-    distributed_executor_backend: str = "mp"
     nccl_port: Optional[int] = None
 
     # HuggingFace specific parameters
@@ -223,8 +191,6 @@ class ServerArgs:
     # can restrict layers to adapt, e.g. ["q_proj"]
     # Will adapt only q, k, v, o by default.
     lora_target_modules: list[str] | None = None
-
-    output_type: str = "pil"
 
     # CPU offload parameters
     dit_cpu_offload: bool = True
@@ -266,9 +232,6 @@ class ServerArgs:
 
     scheduler_port: int = 5555
 
-    # Stage verification
-    enable_stage_verification: bool = True
-
     # Prompt text file for batch processing
     prompt_file_path: str | None = None
 
@@ -280,7 +243,6 @@ class ServerArgs:
             "vae": True,
         }
     )
-    override_transformer_cls_name: str | None = None
 
     # # DMD parameters
     # dmd_denoising_steps: List[int] | None = field(default=None)
@@ -369,24 +331,6 @@ class ServerArgs:
             help="The attention backend to use. If not specified, the backend is automatically selected based on hardware and installed packages.",
         )
 
-        # Running mode
-        parser.add_argument(
-            "--mode",
-            type=str,
-            choices=ExecutionMode.choices(),
-            default=ServerArgs.mode.value,
-            help="The mode to run SGLang-diffusion",
-        )
-
-        # distributed_executor_backend
-        parser.add_argument(
-            "--distributed-executor-backend",
-            type=str,
-            choices=["mp"],
-            default=ServerArgs.distributed_executor_backend,
-            help="The distributed executor backend to use",
-        )
-
         # HuggingFace specific parameters
         parser.add_argument(
             "--trust-remote-code",
@@ -464,15 +408,6 @@ class ServerArgs:
             type=int,
             default=ServerArgs.dist_timeout,
             help="Set timeout for torch.distributed initialization.",
-        )
-
-        # Output type
-        parser.add_argument(
-            "--output-type",
-            type=str,
-            default=ServerArgs.output_type,
-            choices=["pil"],
-            help="Output type for the generated video",
         )
 
         # Prompt text file for batch processing
@@ -600,19 +535,6 @@ class ServerArgs:
             help="Whether to use webui for better display",
         )
 
-        # Stage verification
-        parser.add_argument(
-            "--enable-stage-verification",
-            action=StoreBoolean,
-            default=ServerArgs.enable_stage_verification,
-            help="Enable input/output verification for pipeline stages",
-        )
-        parser.add_argument(
-            "--override-transformer-cls-name",
-            type=str,
-            default=ServerArgs.override_transformer_cls_name,
-            help="Override transformer cls name",
-        )
         # LoRA
         parser.add_argument(
             "--lora-path",
@@ -760,10 +682,6 @@ class ServerArgs:
 
     @classmethod
     def from_kwargs(cls, **kwargs: Any) -> "ServerArgs":
-        # Convert mode string to enum if necessary
-        if "mode" in kwargs and isinstance(kwargs["mode"], str):
-            kwargs["mode"] = ExecutionMode.from_string(kwargs["mode"])
-
         kwargs["pipeline_config"] = PipelineConfig.from_kwargs(kwargs)
         return cls(**kwargs)
 
@@ -884,14 +802,6 @@ class ServerArgs:
             self.disable_autocast = not self.pipeline_config.enable_autocast
         else:
             self.disable_autocast = False
-
-        # Validate mode consistency
-        assert isinstance(
-            self.mode, ExecutionMode
-        ), f"Mode must be an ExecutionMode enum, got {type(self.mode)}"
-        assert (
-            self.mode in ExecutionMode.choices()
-        ), f"Invalid execution mode: {self.mode}"
 
         if self.tp_size == -1:
             self.tp_size = 1
