@@ -475,12 +475,3 @@ class Gemma3RMSNorm(CustomOp):
 
     def extra_repr(self):
         return f"{tuple(self.weight.shape)}, eps={self.eps}"
-
-
-if not (
-    _is_cuda or _is_hip or _is_npu or (_is_cpu and _is_cpu_amx_available) or _is_xpu
-):
-    logger.info(
-        "sgl-kernel layernorm implementation is not available on current platform. Fallback to other kernel libraries."
-    )
-    from vllm.model_executor.layers.layernorm import GemmaRMSNorm, RMSNorm  # noqa: F401
