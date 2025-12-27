@@ -230,6 +230,56 @@ class TraceMetricContext(SGLangTraceReqContext):
         )
 
 
+class TraceMetricScope:
+    def __init__(
+        self,
+        stage: RequestStageConfig,
+        reqs: List,
+        is_propagation_context=False,
+        thread_finish_flag=False,
+    ):
+        self.time_record_enable = (
+            len(reqs) > 0
+            and reqs[0].trace_metric_ctx
+            and reqs[0].trace_metric_ctx.time_record_enable
+        )
+        if not self.time_record_enable:
+            return
+
+        self.reqs = reqs
+        self.stage = stage
+        self.is_propagation_context = is_propagation_context
+        self.orig_trace_metric_ctx = {}
+        self.thread_finish_flag = thread_finish_flag
+
+    def __enter__(self):
+        if not self.time_record_enable:
+            return
+
+        for req in self.reqs:
+            req.trace_metric_ctx.slice_start(self.stage)
+
+        if self.is_propagation_context:
+            for req in self.reqs:
+                self.orig_trace_metric_ctx[req.rid] = req.trace_metric_ctx
+                req.trace_metric_ctx = (
+                    req.trace_metric_ctx.trace_get_proc_propagate_context()
+                )
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        if not self.time_record_enable:
+            return
+
+        if self.is_propagation_context:
+            for req in self.reqs:
+                req.trace_metric_ctx = self.orig_trace_metric_ctx[req.rid]
+
+        for req in self.reqs:
+            req.trace_metric_ctx.slice_end(
+                self.stage, thread_finish_flag=self.thread_finish_flag
+            )
+
+
 class NullContext:
     __slots__ = ()
 
@@ -262,6 +312,15 @@ def metric_trace_slice_batch(
             auto_next_anon=not req.finished(),
             thread_finish_flag=req.finished(),
         )
+
+
+def metric_trace_slice_batch_scope(
+    stage: RequestStageConfig,
+    reqs: List,
+    is_propagation_context: bool = False,
+    thread_finish_flag: bool = False,
+):
+    return TraceMetricScope(stage, reqs, is_propagation_context, thread_finish_flag)
 
 
 def trace_event_batch(
