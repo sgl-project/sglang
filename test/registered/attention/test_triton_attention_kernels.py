@@ -525,7 +525,7 @@ class TestTritonAttention(CustomTestCase):
 
         max_abs_err = (o.to(torch.float32) - o_ref).abs().max().item()
         self.assertTrue(
-            torch.allclose(o.to(torch.float32), o_ref, atol=2e-2, rtol=1e-2),
+            torch.allclose(o.to(torch.float32), o_ref, atol=1e-2, rtol=1e-2),
             msg=f"decode_attention mismatch, max_abs_err={max_abs_err}",
         )
 
