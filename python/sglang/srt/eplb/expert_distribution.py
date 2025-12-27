@@ -744,7 +744,7 @@ class _DequeCollection:
             d.clear()
 
     def mean(self) -> Dict[int, float]:
-        return {d.maxlen: sum(d) / len(d) for d in self._dequeues}
+        return {d.maxlen: sum(d) / len(d) for d in self._dequeues if len(d) > 0}
 
 
 class _DetailAccumulator(_UtilizationRateAccumulatorMixin):
