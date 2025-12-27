@@ -170,6 +170,22 @@ WAIT_WEIGHTS_READY_TIMEOUT = int(os.getenv("SGLANG_WAIT_WEIGHTS_READY_TIMEOUT", 
 # Note: keep these lists small and explicit; extend as needed.
 ADMIN_OPTIONAL_AUTH_PATHS = {
     "/clear_hicache_storage_backend",
+    "/start_expert_distribution_record",
+    "/stop_expert_distribution_record",
+    "/dump_expert_distribution_record",
+    "/init_weights_send_group_for_remote_instance",
+    "/send_weights_to_remote_instance",
+    "/init_weights_update_group",
+    "/destroy_weights_update_group",
+    "/update_weights_from_disk",
+    "/update_weights_from_tensor",
+    "/update_weights_from_distributed",
+    "/update_weights_from_ipc",
+    "/update_weight_version",
+    "/release_memory_occupation",
+    "/resume_memory_occupation",
+    "/slow_down",
+    "/abort_request",
 }
 ADMIN_FORCE_AUTH_PATHS = set()
 
