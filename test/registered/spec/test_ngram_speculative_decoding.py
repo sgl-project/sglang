@@ -5,7 +5,7 @@ from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.gsm8k_accuracy_kit import GSM8KMixin
 from sglang.test.test_utils import (
-    DEFAULT_NGRAM_SPECULATIVE_TARGET_MODEL_FOR_TEST,
+    DEFAULT_TARGET_MODEL_NGRAM,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -32,7 +32,7 @@ DEFAULT_SERVER_ARGS = [
 
 
 class TestNgramSpeculativeDecodingBase(GSM8KMixin, CustomTestCase):
-    model = DEFAULT_NGRAM_SPECULATIVE_TARGET_MODEL_FOR_TEST
+    model = DEFAULT_TARGET_MODEL_NGRAM
     base_url = DEFAULT_URL_FOR_TEST
     gsm8k_accuracy_thres = 0.79  # derived tests need to override this
     gsm8k_accept_length_thres = 1.8  # derived spec decoding tests need to override this
