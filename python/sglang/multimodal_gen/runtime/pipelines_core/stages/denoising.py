@@ -996,6 +996,11 @@ class DenoisingStage(PipelineStage):
                             latent_model_input, t_device
                         )
 
+                        # TODO: zimage omni
+                        # 1. latent_model_input = condition latent + latent_model_input
+                        # 2. image_noise_mask
+                        # TODO:: transformer fwd here
+
                         # Predict noise residual
                         attn_metadata = self._build_attn_metadata(i, batch, server_args)
                         noise_pred = self._predict_noise_with_cfg(
