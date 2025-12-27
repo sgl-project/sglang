@@ -85,11 +85,9 @@ class ComposedPipelineBase(ABC):
 
         if self._required_config_modules is None:
             raise NotImplementedError("Subclass must set _required_config_modules")
-        # temp disable for duplicate initialing tp
-        # maybe_init_distributed_environment_and_model_parallel(
-        #     server_args.tp_size, server_args.sp_size
-        # )
 
+        # [module_name, gpu memory usage]
+        self.memory_usages: dict[str, float] = {}
         # Load modules directly in initialization
         logger.info("Loading pipeline modules...")
         self.modules = self.load_modules(server_args, loaded_modules)
@@ -313,12 +311,14 @@ class ComposedPipelineBase(ABC):
                 )
             else:
                 component_model_path = os.path.join(self.model_path, load_module_name)
-            module = PipelineComponentLoader.load_module(
+            module, memory_usage = PipelineComponentLoader.load_module(
                 module_name=load_module_name,
                 component_model_path=component_model_path,
                 transformers_or_diffusers=transformers_or_diffusers,
                 server_args=server_args,
             )
+
+            self.memory_usages[load_module_name] = memory_usage
 
             if module_name in components:
                 logger.warning("Overwriting module %s", module_name)
@@ -330,6 +330,8 @@ class ComposedPipelineBase(ABC):
                 raise ValueError(
                     f"Required module key: {module_name} value: {components.get(module_name)} was not found in loaded modules {components.keys()}"
                 )
+
+        logger.debug("Memory usage of loaded modules: %s", self.memory_usages)
 
         return components
 
