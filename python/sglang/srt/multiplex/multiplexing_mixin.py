@@ -2,6 +2,8 @@
 Mixin class providing multiplexing scheduling logic
 """
 
+from __future__ import annotations
+
 import logging
 from typing import TYPE_CHECKING
 
