@@ -55,6 +55,7 @@ except ImportError:
 
 from huggingface_hub import HfApi, hf_hub_download
 from torch import nn
+from torch.nn.parameter import Parameter
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 from transformers.utils import SAFE_WEIGHTS_INDEX_NAME
 
@@ -72,6 +73,9 @@ from sglang.srt.distributed import (
 )
 from sglang.srt.layers.modelopt_utils import QUANT_CFG_CHOICES
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.fp8 import Fp8Config
+from sglang.srt.layers.quantization.fp8_kernel import per_token_group_quant_fp8
+from sglang.srt.layers.quantization.fp8_utils import scaled_fp8_blockwise
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     trigger_transferring_weights_request,
 )
@@ -759,19 +763,27 @@ class QuantizedRLModelLoader(DefaultModelLoader):
 
     # Parameters to skip during FP8 quantization (matches FlashRL's exclude_list)
     SKIP_QUANTIZATION_PARAMS = [
+        # Quantization scales
         "weight_scale",
         "input_scale",
         "output_scale",
+        # Bias parameters
         ".bias",
-        "lm_head.weight",
-        "model.norm.weight",
+        # Output layer
+        "lm_head",
+        # Embedding layers
         "embed_tokens",  # BF16 params
+        "embeddings",  # Generic embeddings (adapted from verl PR #4415)
+        # Rotary position encoding
         "rotary_emb.inv_freq",
         "rotary_emb.cos_cached",
         "rotary_emb.sin_cached",
+        # Projector layer
         "projector",
-        "input_layernorm.weight",
-        "post_attention_layernorm.weight",  # LayerNorms
+        # Normalization layers (generic patterns cover all variants)
+        "layernorm",  # LayerNorm
+        "norm",  # Various Norm layers
+        "ln_",  # LayerNorm variants
     ]
 
     # Stacked parameters (Qwen2): shards loaded separately, then combined
@@ -860,12 +872,102 @@ class QuantizedRLModelLoader(DefaultModelLoader):
                         recorded_loader[key][name] = attr
         model.recorded_loader = recorded_loader
 
-        # Apply FP8 quantization (creates new Parameters, loses attributes)
-        for _, module in model.named_modules():
-            quant_method = getattr(module, "quant_method", None)
-            if quant_method is not None:
-                with device_loading_context(module, target_device):
-                    quant_method.process_weights_after_loading(module)
+        # Note: only [128, 128] block size is available for now
+        default_block_size = [128, 128]
+
+        fp8_config = Fp8Config(
+            is_checkpoint_fp8_serialized=True,
+            activation_scheme="dynamic",
+            ignored_layers=None,
+            weight_block_size=default_block_size,
+        )
+
+        # Track which modules were successfully quantized
+        quantized_modules = []
+
+        for name, module in model.named_modules():
+
+            #  Skip modules that should not be quantized (lm_head, embeddings, layer norms, etc.)
+            if any(
+                skip in name for skip in QuantizedRLModelLoader.SKIP_QUANTIZATION_PARAMS
+            ):
+                logger.info(f"[QuantizedRL] Skip quantization for module: {name}")
+                continue
+
+            if not hasattr(module, "weight") or module.weight is None:
+                logger.info(
+                    f"[QuantizedRL] Skip quantization for module: {name} since it does not have a weight tensor"
+                )
+                continue
+
+            with device_loading_context(module, target_device):
+                weight = module.weight
+
+                if weight.dtype not in [
+                    torch.bfloat16,
+                    torch.float16,
+                    torch.float32,
+                ]:
+                    logger.info(
+                        f"[QuantizedRL] Skip quantization for module: {name} since dtype is {weight.dtype} not BF16/FP16/FP32 weights"
+                    )
+                    continue
+
+                try:
+                    qweight, scale = scaled_fp8_blockwise(weight, default_block_size)
+                    # Scale shape is (blk_m, blk_n, 1); squeeze the last dim
+                    scale = scale.squeeze(-1)
+
+                    # Remove existing weight_scale
+                    if hasattr(module, "weight_scale"):
+                        delattr(module, "weight_scale")
+
+                    # Update or create weight_scale_inv using a plain Parameter
+                    if hasattr(module, "weight_scale_inv"):
+                        # Keep the existing Parameter type; just update data if shape matches
+                        if module.weight_scale_inv.data.shape == scale.shape:
+                            module.weight_scale_inv.data.copy_(scale)
+                        else:
+                            logger.warning(
+                                f"[QuantizedRL] Scale shape mismatch for {name}: "
+                                f"expected {module.weight_scale_inv.data.shape}, "
+                                f"got {scale.shape}. Recreating scale parameter as plain Parameter."
+                            )
+                            module.weight_scale_inv = Parameter(
+                                scale, requires_grad=False
+                            )
+                    else:
+                        # No existing weight_scale_inv; create a new plain Parameter
+                        module.register_parameter(
+                            "weight_scale_inv",
+                            Parameter(scale, requires_grad=False),
+                        )
+
+                    module.weight = Parameter(qweight, requires_grad=False)
+
+                    logger.info(
+                        f"[QuantizedRL] Quantize (blockwise, initial load): {name} "
+                        f"{weight.dtype}→FP8 "
+                        f"(shape={weight.shape}, block_size={default_block_size})"
+                    )
+                    quant_method = fp8_config.get_quant_method(module, prefix=name)
+                    if quant_method is not None:
+                        module.quant_method = quant_method
+                        module.weight_block_size = default_block_size
+                        logger.debug(
+                            f"[QuantizedRL] Set quant_method weight_block_size={default_block_size} for module: {name}"
+                        )
+                except Exception as e:
+                    logger.warning(
+                        f"[QuantizedRL] Blockwise quantization failed for {name}: {e}, "
+                    )
+                    # If blockwise is not applicable or fails, fallback to per-channel quantization
+                    quant_method = getattr(module, "quant_method", None)
+                    if quant_method is not None:
+                        quant_method.process_weights_after_loading(module)
+                        logger.info(
+                            f"[QuantizedRL] Fllback to per-channel quantization for module: {name}; "
+                        )
 
         model.flash_rl_initial_load_complete = True
         self._initial_load_complete = True
@@ -929,40 +1031,84 @@ class QuantizedRLModelLoader(DefaultModelLoader):
         tp_rank = get_tensor_model_parallel_rank()
         tp_size = get_tensor_model_parallel_world_size()
 
-        def _get_tp_sharded_scale(full_scale_tensor):
-            """Get tp sharded scale from full scale tensor"""
+        def _get_tp_sharded_scale(full_scale_tensor, is_blockwise=False):
+            """Get tp sharded scale from full scale tensor
+
+            Args:
+                full_scale_tensor: Full scale tensor
+                is_blockwise: If True, scale is 2D (blk_m, blk_n) for blockwise quantization
+                             If False, scale is 1D or 2D (M, k) for perchannel quantization
+            """
             if tp_size == 1:
                 return full_scale_tensor
 
-            full_dim = full_scale_tensor.shape[0]
-            shard_dim = full_dim // tp_size
-            start_idx = tp_rank * shard_dim
-            end_idx = start_idx + shard_dim
-            return full_scale_tensor[start_idx:end_idx]
+            if is_blockwise:
+                # For blockwise: scale shape is (blk_m, blk_n), shard along blk_m dimension
+                full_dim = full_scale_tensor.shape[0]
+                shard_dim = full_dim // tp_size
+                start_idx = tp_rank * shard_dim
+                end_idx = start_idx + shard_dim
+                return full_scale_tensor[start_idx:end_idx, :]
+            else:
+                # For perchannel: scale shape is (M, k), shard along M dimension
+                full_dim = full_scale_tensor.shape[0]
+                shard_dim = full_dim // tp_size
+                start_idx = tp_rank * shard_dim
+                end_idx = start_idx + shard_dim
+                return full_scale_tensor[start_idx:end_idx]
 
+        # Check if this is blockwise (weight_scale_inv) or perchannel (weight_scale)
         if param_name.endswith(".weight"):
-            scale_param_name = f"{param_name[:-7]}.weight_scale"
+            base_name = param_name[:-7]
+            weight_scale_inv_name = f"{base_name}.weight_scale_inv"
+            weight_scale_name = f"{base_name}.weight_scale"
         else:
-            scale_param_name = f"{param_name}.weight_scale"
+            weight_scale_inv_name = f"{param_name}.weight_scale_inv"
+            weight_scale_name = f"{param_name}.weight_scale"
 
-        scale_param = all_params.get(scale_param_name)
-        if scale_param is None:
+        scale_param_inv = all_params.get(weight_scale_inv_name)
+        scale_param = all_params.get(weight_scale_name)
+
+        is_blockwise = scale_param_inv is not None
+        is_perchannel = scale_param is not None
+
+        if not is_blockwise and not is_perchannel:
             logger.warning(
-                "[QuantizedRL] Scale parameter not found: %s", scale_param_name
+                "[QuantizedRL] Neither weight_scale_inv nor weight_scale found for: %s",
+                param_name,
             )
             return
+
         if isinstance(scale_info, torch.Tensor):
-            new_scale = scale_info.t().contiguous()
-            if scale_param.data.shape == new_scale.shape:
-                scale_param.data.copy_(new_scale)
+            # Non-stacked parameter
+            if is_blockwise:
+                # Blockwise: no transpose, direct copy (matching initial load behavior)
+                new_scale = scale_info.contiguous()
+                new_scale = _get_tp_sharded_scale(new_scale, is_blockwise=True)
+                if scale_param_inv.data.shape == new_scale.shape:
+                    scale_param_inv.data.copy_(new_scale)
+                else:
+                    logger.warning(
+                        "[QuantizedRL] Scale shape mismatch for %s: expected %s, got %s",
+                        weight_scale_inv_name,
+                        scale_param_inv.data.shape,
+                        new_scale.shape,
+                    )
             else:
-                logger.warning(
-                    "[QuantizedRL] Scale shape mismatch for %s: expected %s, got %s",
-                    scale_param_name,
-                    scale_param.data.shape,
-                    new_scale.shape,
-                )
+                # Perchannel: transpose needed (matching original behavior)
+                new_scale = scale_info.t().contiguous()
+                new_scale = _get_tp_sharded_scale(new_scale, is_blockwise=False)
+                if scale_param.data.shape == new_scale.shape:
+                    scale_param.data.copy_(new_scale)
+                else:
+                    logger.warning(
+                        "[QuantizedRL] Scale shape mismatch for %s: expected %s, got %s",
+                        weight_scale_name,
+                        scale_param.data.shape,
+                        new_scale.shape,
+                    )
         else:
+            # Stacked parameter (qkv_proj, gate_up_proj)
             stacked_key = next(
                 (
                     target
@@ -971,6 +1117,13 @@ class QuantizedRLModelLoader(DefaultModelLoader):
                 ),
                 None,
             )
+            if stacked_key is None:
+                logger.warning(
+                    "[QuantizedRL] Stacked key not found for stacked scale_info: %s",
+                    param_name,
+                )
+                return
+
             shard_names = next(
                 (
                     names
@@ -979,11 +1132,31 @@ class QuantizedRLModelLoader(DefaultModelLoader):
                 ),
                 [],
             )
-            rows_per_shard = scale_param.data.shape[-1] // max(len(shard_names), 1)
-            if rows_per_shard * len(shard_names) != scale_param.data.shape[-1]:
-                logger.warning(
-                    f"Scale param shape {scale_param.data.shape[-1]} not divisible by {len(shard_names)}"
+
+            if is_blockwise:
+                # Blockwise stacked: scale shape is (blk_m, blk_n) for each shard
+                # Stacked scale shape should be (blk_m_total, blk_n)
+                scale_param_to_update = scale_param_inv
+                rows_per_shard = scale_param_to_update.data.shape[0] // max(
+                    len(shard_names), 1
                 )
+            else:
+                # Perchannel stacked: scale shape is (M, k) for each shard
+                # Stacked scale shape should be (k, M_total)
+                scale_param_to_update = scale_param
+                rows_per_shard = scale_param_to_update.data.shape[-1] // max(
+                    len(shard_names), 1
+                )
+
+            if rows_per_shard * len(shard_names) != (
+                scale_param_to_update.data.shape[0]
+                if is_blockwise
+                else scale_param_to_update.data.shape[-1]
+            ):
+                logger.warning(
+                    f"Scale param shape {scale_param_to_update.data.shape} not divisible by {len(shard_names)}"
+                )
+
             offset = 0
             for idx, shard in enumerate(shard_names):
                 shard_id = (
@@ -992,15 +1165,30 @@ class QuantizedRLModelLoader(DefaultModelLoader):
                     else idx
                 )
                 shard_scale = scale_info.get(shard_id)
-                shard_scale = _get_tp_sharded_scale(shard_scale)
                 if shard_scale is None:
                     offset += rows_per_shard
                     continue
-                shard_rows = shard_scale.shape[0]
-                start = offset
-                end = start + shard_rows
-                scale_param.data[..., start:end] = shard_scale.t().contiguous()
-                offset = end
+
+                shard_scale = _get_tp_sharded_scale(
+                    shard_scale, is_blockwise=is_blockwise
+                )
+
+                if is_blockwise:
+                    # Blockwise: no transpose, stack along first dimension
+                    shard_rows = shard_scale.shape[0]
+                    start = offset
+                    end = start + shard_rows
+                    scale_param_to_update.data[start:end, :] = shard_scale.contiguous()
+                    offset = end
+                else:
+                    # Perchannel: transpose then stack along last dimension
+                    shard_rows = shard_scale.shape[0]
+                    start = offset
+                    end = start + shard_rows
+                    scale_param_to_update.data[..., start:end] = (
+                        shard_scale.t().contiguous()
+                    )
+                    offset = end
 
     @staticmethod
     def rebinding_and_load_weights(model, first_time_load_weights, weights):
@@ -1062,9 +1250,9 @@ class QuantizedRLModelLoader(DefaultModelLoader):
 
         def quantize_weights_iterator(weights_iter):
             """Quantize individual shards before weight_loader stacks them."""
-            from sglang.srt.layers.quantization.fp8_kernel import (
-                per_token_group_quant_fp8,
-            )
+
+            # Default block size for blockwise quantization
+            default_block_size = [128, 128]
 
             for name, weight in weights_iter:
                 if any(
@@ -1074,8 +1262,32 @@ class QuantizedRLModelLoader(DefaultModelLoader):
                     logger.info(f"[QuantizedRL] Skip: {name} ({weight.dtype})")
                     yield (name, weight)
                 elif weight.dtype in [torch.bfloat16, torch.float32, torch.float16]:
-                    qweight, scale = per_token_group_quant_fp8(weight, weight.shape[-1])
-                    logger.info(f"[QuantizedRL] Quantize: {name} {weight.dtype}→FP8")
+                    # Try blockwise quantization first
+                    if len(weight.shape) == 2:
+                        # Check if shape is compatible with blockwise quantization
+
+                        try:
+                            qweight, scale = scaled_fp8_blockwise(
+                                weight, default_block_size
+                            )
+                            # scale shape is (blk_m, blk_n, 1), need to squeeze
+                            scale = scale.squeeze(-1)
+                            logger.info(
+                                f"[QuantizedRL] Quantize (blockwise): {name} {weight.dtype}→FP8 "
+                                f"(shape={weight.shape}, block_size={default_block_size})"
+                            )
+                        except Exception as e:
+                            logger.warning(
+                                f"[QuantizedRL] Blockwise quantization failed for {name}: {e}, "
+                                "falling back to per_token_group_quant_fp8"
+                            )
+                            qweight, scale = per_token_group_quant_fp8(
+                                weight, weight.shape[-1]
+                            )
+                            logger.info(
+                                f"[QuantizedRL] Fallback to per-channel quantization for module: {name}; "
+                            )
+
                     QuantizedRLModelLoader._store_quantized_scale(
                         quantized_scales, name, scale
                     )
@@ -2707,15 +2919,14 @@ def get_model_loader(
             "Using QuantizedRLModelLoader for RL training with native FP8 quantization."
         )
         logger.info(
-            "FP8 approach: Model loads with native SGLang FP8 quantization. "
+            "FP8 approach: Model loads and gets blockwise fp8 quantization on    . "
             "Same model path for both training and inference."
         )
-
-        # Set quantization to FP8 for native SGLang support
         if model_config and not model_config.quantization:
             logger.info(
                 "QuantizedRL: Setting quantization to fp8 (native SGLang support). "
-                "Model will be loaded with FP8 infrastructure"
+                "Model will be loaded with FP8 infrastructure. "
+                "Quantization config will be set after weights are loaded."
             )
             model_config.quantization = "fp8"
 
