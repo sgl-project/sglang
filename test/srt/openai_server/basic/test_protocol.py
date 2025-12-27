@@ -325,6 +325,56 @@ class TestValidationEdgeCases(unittest.TestCase):
         with self.assertRaises(ValidationError):
             CompletionRequest(model="test-model", prompt="Hello", max_tokens=-1)
 
+    def test_completion_n_validation(self):
+        """Test CompletionRequest n must be >= 1"""
+        with self.assertRaises(ValidationError):
+            CompletionRequest(model="test-model", prompt="Hello", n=0)
+        with self.assertRaises(ValidationError):
+            CompletionRequest(model="test-model", prompt="Hello", n=-1)
+        # Valid values
+        req = CompletionRequest(model="test-model", prompt="Hello", n=1)
+        self.assertEqual(req.n, 1)
+        req = CompletionRequest(model="test-model", prompt="Hello", n=5)
+        self.assertEqual(req.n, 5)
+
+    def test_completion_logprobs_validation(self):
+        """Test CompletionRequest logprobs must be between 0 and 5"""
+        with self.assertRaises(ValidationError):
+            CompletionRequest(model="test-model", prompt="Hello", logprobs=-1)
+        with self.assertRaises(ValidationError):
+            CompletionRequest(model="test-model", prompt="Hello", logprobs=6)
+        # Valid values
+        req = CompletionRequest(model="test-model", prompt="Hello", logprobs=0)
+        self.assertEqual(req.logprobs, 0)
+        req = CompletionRequest(model="test-model", prompt="Hello", logprobs=5)
+        self.assertEqual(req.logprobs, 5)
+
+    def test_chat_completion_n_validation(self):
+        """Test ChatCompletionRequest n must be >= 1"""
+        messages = [{"role": "user", "content": "Hello"}]
+        with self.assertRaises(ValidationError):
+            ChatCompletionRequest(model="test-model", messages=messages, n=0)
+        with self.assertRaises(ValidationError):
+            ChatCompletionRequest(model="test-model", messages=messages, n=-1)
+        # Valid values
+        req = ChatCompletionRequest(model="test-model", messages=messages, n=1)
+        self.assertEqual(req.n, 1)
+        req = ChatCompletionRequest(model="test-model", messages=messages, n=3)
+        self.assertEqual(req.n, 3)
+
+    def test_chat_completion_top_logprobs_validation(self):
+        """Test ChatCompletionRequest top_logprobs must be between 0 and 20"""
+        messages = [{"role": "user", "content": "Hello"}]
+        with self.assertRaises(ValidationError):
+            ChatCompletionRequest(model="test-model", messages=messages, top_logprobs=-1)
+        with self.assertRaises(ValidationError):
+            ChatCompletionRequest(model="test-model", messages=messages, top_logprobs=21)
+        # Valid values
+        req = ChatCompletionRequest(model="test-model", messages=messages, top_logprobs=0)
+        self.assertEqual(req.top_logprobs, 0)
+        req = ChatCompletionRequest(model="test-model", messages=messages, top_logprobs=20)
+        self.assertEqual(req.top_logprobs, 20)
+
     def test_model_serialization_roundtrip(self):
         """Test that models can be serialized and deserialized"""
         original_request = ChatCompletionRequest(
