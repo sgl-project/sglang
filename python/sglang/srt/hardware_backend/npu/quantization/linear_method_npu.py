@@ -195,9 +195,15 @@ class NPUW8A8Int8DynamicLinearMethod(_NPULinearMethodBase):
         layer: torch.nn.Module,
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
+        dynamic_scale: torch.Tensor = None,
     ) -> torch.Tensor:
         original_dtype = x.dtype
-        quant_out, dynamic_scale = torch.ops.npu.npu_dynamic_quant(x)
+        if dynamic_scale is not None:
+            """dynamic_scale is calculated in malprolog kernel"""
+            quant_out = x
+            original_dtype = torch.bfloat16
+        else:
+            quant_out, dynamic_scale = torch.ops.npu.npu_dynamic_quant(x)
         return torch.ops.npu.npu_quant_matmul(
             quant_out,
             layer.weight,
