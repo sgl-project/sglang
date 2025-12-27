@@ -99,7 +99,7 @@ class ComponentLoader(ABC):
     def should_offload(
         self, server_args: ServerArgs, model_config: ModelConfig | None = None
     ):
-        # offload by default
+        # not offload by default
         return False
 
     def target_device(self, should_offload):
