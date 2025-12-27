@@ -12,6 +12,7 @@ from sgl_kernel import (
 
 from sglang.srt.distributed import get_moe_expert_parallel_world_size
 from sglang.srt.layers.moe.ep_moe.kernels import (
+    fp8_per_token_to_per_tensor_quant_triton,
     cutlass_w4_run_moe_ep_preproess,
     deepep_ll_get_cutlass_w4a8_moe_mm_data,
     deepep_permute_triton_kernel,
@@ -406,6 +407,7 @@ def cutlass_w4a8_moe_deepep_normal(
 
 def cutlass_w4a8_moe_deepep_ll(
     a: torch.Tensor,
+    a_scale: torch.Tensor,
     w1_q: torch.Tensor,
     w2_q: torch.Tensor,
     w1_scale: torch.Tensor,
@@ -495,7 +497,13 @@ def cutlass_w4a8_moe_deepep_ll(
     )
 
     gateup_input = torch.empty(a.shape, dtype=torch.float8_e4m3fn, device=device)
-    sgl_per_tensor_quant_fp8(a, gateup_input, a1_scale.float(), True)
+    fp8_per_token_to_per_tensor_quant_triton(
+        x=a,
+        x_scale=a_scale,
+        masked_m=masked_m,
+        output_scale=a1_scale,
+        output=gateup_input,
+    )
     c1 = torch.empty((num_experts, m, n * 2), device=device, dtype=torch.bfloat16)
     c2 = torch.empty((num_experts, m, k), device=device, dtype=torch.bfloat16)
 
