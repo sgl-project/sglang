@@ -2478,20 +2478,29 @@ class Scheduler(
 
         try:
             ok, msg = self.tree_cache.attach_storage_backend(
-                storage_backend=recv_req.storage_backend,
-                storage_backend_extra_config_json=recv_req.storage_backend_extra_config_json,
+                storage_backend=recv_req.hicache_storage_backend,
+                storage_backend_extra_config_json=recv_req.hicache_storage_backend_extra_config_json,
                 served_model_name=self.server_args.served_model_name,
+                hicache_storage_prefetch_policy=getattr(
+                    recv_req, "hicache_storage_prefetch_policy", None
+                ),
             )
         except Exception as e:
             logger.exception("Attach HiCache storage backend failed with exception.")
             return AttachHiCacheStorageReqOutput(success=False, message=str(e))
         if ok:
             self.enable_hicache_storage = True
-            self.server_args.hicache_storage_backend = recv_req.storage_backend
+            self.server_args.hicache_storage_backend = recv_req.hicache_storage_backend
             self.server_args.hicache_storage_backend_extra_config = (
-                recv_req.storage_backend_extra_config_json
+                recv_req.hicache_storage_backend_extra_config_json
             )
-            logger.info(f"Attached HiCache storage backend: {recv_req.storage_backend}")
+            if getattr(recv_req, "hicache_storage_prefetch_policy", None) is not None:
+                self.server_args.hicache_storage_prefetch_policy = (
+                    recv_req.hicache_storage_prefetch_policy
+                )
+            logger.info(
+                f"Attached HiCache storage backend: {recv_req.hicache_storage_backend}"
+            )
         return AttachHiCacheStorageReqOutput(success=ok, message=msg)
 
     def detach_hicache_storage_wrapped(

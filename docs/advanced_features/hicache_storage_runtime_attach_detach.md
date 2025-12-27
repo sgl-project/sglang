@@ -25,7 +25,7 @@ The control path is:
    - Performs a **strict idle check**
    - Calls `tree_cache.attach_storage_backend(...)` / `detach_storage_backend(...)`
 4. **HiRadixCache** (`python/sglang/srt/mem_cache/hiradix_cache.py`)
-   - Parses `storage_backend_extra_config_json` (supports both backend config and prefetch knobs)
+   - Parses `hicache_storage_backend_extra_config_json` (supports both backend config and prefetch knobs)
    - Calls `cache_controller.attach_storage_backend(...)` / `detach_storage_backend(...)`
 5. **HiCacheController** (`python/sglang/srt/managers/cache_controller.py`)
    - Creates/destroys the storage backend instance (via `StorageBackendFactory`)
@@ -72,7 +72,7 @@ The examples below assume your SGLang HTTP server is at `http://127.0.0.1:30000`
 ### 3.1 Query current storage backend status
 
 ```bash
-curl -s http://127.0.0.1:30000/hicache_storage_backend | jq
+curl -s http://127.0.0.1:30000/hicache_storage_backend
 ```
 
 Example response:
@@ -85,19 +85,27 @@ Example response:
 ```
 
 ### 3.2 Attach (enable) a storage backend
+```bash
+curl -s -X POST http://127.0.0.1:30000/attach_hicache_storage_backend \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "hicache_storage_backend": "mooncake"
+  }'
+```
 
 ```bash
 curl -s -X POST http://127.0.0.1:30000/attach_hicache_storage_backend \
   -H 'Content-Type: application/json' \
   -d '{
-    "storage_backend": "mooncake",
-    "storage_backend_extra_config_json": "{\"master_server_address\":\"127.0.0.1:50051\",\"protocol\":\"tcp\",\"global_segment_size\":\"4gb\",\"prefetch_threshold\":256}"
+    "hicache_storage_backend": "mooncake",
+    "hicache_storage_backend_extra_config_json": "{\"master_server_address\":\"127.0.0.1:50051\",\"protocol\":\"tcp\",\"global_segment_size\":\"4gb\",\"prefetch_threshold\":256}",
+    "hicache_storage_prefetch_policy": "timeout"
   }'
 ```
 
 Notes:
 
-- `storage_backend_extra_config_json` can include both:
+- `hicache_storage_backend_extra_config_json` can include both:
   - **Backend configuration** (e.g., Mooncake master/metadata/protocol, etc.)
   - **Prefetch configuration** (`prefetch_threshold`, `prefetch_timeout_base`, `prefetch_timeout_per_ki_token`, `hicache_storage_pass_prefix_keys`)
 

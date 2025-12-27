@@ -134,6 +134,7 @@ class HiRadixCache(RadixCache):
         storage_backend: str,
         storage_backend_extra_config_json: Optional[str] = None,
         served_model_name: Optional[str] = None,
+        hicache_storage_prefetch_policy: Optional[str] = None,
     ) -> tuple[bool, str]:
         """Attach (enable) storage backend at runtime.
 
@@ -143,6 +144,15 @@ class HiRadixCache(RadixCache):
         """
         if self.enable_storage:
             return False, "HiCache storage backend is already enabled."
+
+        if hicache_storage_prefetch_policy is not None:
+            allowed = ["best_effort", "wait_complete", "timeout"]
+            if hicache_storage_prefetch_policy not in allowed:
+                return (
+                    False,
+                    f"Invalid hicache_storage_prefetch_policy: {hicache_storage_prefetch_policy!r}. "
+                    f"Expected one of {allowed}.",
+                )
 
         try:
             (
@@ -196,6 +206,8 @@ class HiRadixCache(RadixCache):
             self.prefetch_timeout_base = prefetch_timeout_base
             self.prefetch_timeout_per_page = prefetch_timeout_per_page
             self.hicache_storage_pass_prefix_keys = hicache_storage_pass_prefix_keys
+            if hicache_storage_prefetch_policy is not None:
+                self.prefetch_stop_policy = hicache_storage_prefetch_policy
 
             self.enable_storage_metrics = enable_storage_metrics
             if self.enable_storage_metrics:

@@ -335,14 +335,16 @@ class TokenizerCommunicatorMixin:
 
     async def attach_hicache_storage(
         self: TokenizerManager,
-        storage_backend: str,
-        storage_backend_extra_config_json: Optional[str] = None,
+        hicache_storage_backend: str,
+        hicache_storage_backend_extra_config_json: Optional[str] = None,
+        hicache_storage_prefetch_policy: Optional[str] = None,
     ) -> AttachHiCacheStorageReqOutput:
         """Attach (enable) HiCache storage backend at runtime."""
         results = await self.attach_hicache_storage_communicator(
             AttachHiCacheStorageReqInput(
-                storage_backend=storage_backend,
-                storage_backend_extra_config_json=storage_backend_extra_config_json,
+                hicache_storage_backend=hicache_storage_backend,
+                hicache_storage_backend_extra_config_json=hicache_storage_backend_extra_config_json,
+                hicache_storage_prefetch_policy=hicache_storage_prefetch_policy,
             )
         )
 
@@ -351,10 +353,14 @@ class TokenizerCommunicatorMixin:
         # TODO: partial rollback if failed
         if all_success:
             # Keep tokenizer side server_info consistent with scheduler side.
-            self.server_args.hicache_storage_backend = storage_backend
+            self.server_args.hicache_storage_backend = hicache_storage_backend
             self.server_args.hicache_storage_backend_extra_config = (
-                storage_backend_extra_config_json
+                hicache_storage_backend_extra_config_json
             )
+            if hicache_storage_prefetch_policy is not None:
+                self.server_args.hicache_storage_prefetch_policy = (
+                    hicache_storage_prefetch_policy
+                )
         return out
 
     async def detach_hicache_storage(

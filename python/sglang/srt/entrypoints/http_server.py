@@ -719,6 +719,14 @@ async def clear_hicache_storage_backend():
     )
 
 
+# example usage:
+# curl -s -X POST http://127.0.0.1:30000/attach_hicache_storage_backend \
+#  -H 'Content-Type: application/json' \
+#   -d '{
+#     "hicache_storage_backend": "file",
+#     "hicache_storage_backend_extra_config_json": "{}",
+#     "hicache_storage_prefetch_policy": "timeout"
+#   }'
 @app.api_route("/attach_hicache_storage_backend", methods=["POST"])
 async def attach_hicache_storage_backend(obj: AttachHiCacheStorageReqInput):
     """Attach (enable) HiCache storage backend at runtime.
@@ -726,8 +734,11 @@ async def attach_hicache_storage_backend(obj: AttachHiCacheStorageReqInput):
     Only allowed when there are NO running / queued requests.
     """
     ret = await _global_state.tokenizer_manager.attach_hicache_storage(
-        storage_backend=obj.storage_backend,
-        storage_backend_extra_config_json=obj.storage_backend_extra_config_json,
+        hicache_storage_backend=obj.hicache_storage_backend,
+        hicache_storage_backend_extra_config_json=obj.hicache_storage_backend_extra_config_json,
+        hicache_storage_prefetch_policy=getattr(
+            obj, "hicache_storage_prefetch_policy", None
+        ),
     )
     msg = getattr(ret, "message", "")
     return Response(
@@ -743,6 +754,8 @@ async def attach_hicache_storage_backend(obj: AttachHiCacheStorageReqInput):
     )
 
 
+# example usage:
+# curl -s -X POST http://127.0.0.1:30000/detach_hicache_storage_backend
 @app.api_route("/detach_hicache_storage_backend", methods=["POST"])
 async def detach_hicache_storage_backend():
     """Detach (disable) HiCache storage backend at runtime.
@@ -764,12 +777,15 @@ async def detach_hicache_storage_backend():
     )
 
 
+# example usage:
+# curl -s http://127.0.0.1:30000/hicache_storage_backend
 @app.get("/hicache_storage_backend")
 async def hicache_storage_backend_status():
     """Get current HiCache storage backend status (tokenizer-side view)."""
     return {
         "hicache_storage_backend": _global_state.tokenizer_manager.server_args.hicache_storage_backend,
         "hicache_storage_backend_extra_config": _global_state.tokenizer_manager.server_args.hicache_storage_backend_extra_config,
+        "hicache_storage_prefetch_policy": _global_state.tokenizer_manager.server_args.hicache_storage_prefetch_policy,
     }
 
 

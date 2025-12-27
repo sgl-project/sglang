@@ -1132,13 +1132,24 @@ class FlushCacheReqOutput(BaseReq):
 class AttachHiCacheStorageReqInput(BaseReq):
     """Dynamically attach (enable) HiCache storage backend at runtime.
 
-    Note: `storage_backend_extra_config_json` is a JSON string. It may contain both:
+    Note: `hicache_storage_backend_extra_config_json` is a JSON string. It may contain both:
     - backend-specific configs (e.g., mooncake master address)
     - prefetch-related knobs (prefetch_threshold, prefetch_timeout_*, hicache_storage_pass_prefix_keys)
     """
 
-    storage_backend: str
-    storage_backend_extra_config_json: Optional[str] = None
+    hicache_storage_backend: str
+    hicache_storage_backend_extra_config_json: Optional[str] = None
+    hicache_storage_prefetch_policy: Optional[str] = None
+
+    def __post_init__(self):
+        if self.hicache_storage_prefetch_policy is None:
+            return
+        allowed = ["best_effort", "wait_complete", "timeout"]
+        if self.hicache_storage_prefetch_policy not in allowed:
+            raise ValueError(
+                f"Invalid hicache_storage_prefetch_policy: {self.hicache_storage_prefetch_policy!r}. "
+                f"Expected one of {allowed}."
+            )
 
 
 @dataclass
