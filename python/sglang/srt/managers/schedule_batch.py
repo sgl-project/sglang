@@ -1120,6 +1120,7 @@ class Req:
         self.grammar = None
         self.origin_input_ids = [0]  # set it to one token to skip the long prefill
         self.return_logprob = False
+        self.logprob_start_len = 0
         self.to_finish = FINISH_ABORT(
             error_msg, HTTPStatus.BAD_REQUEST, "BadRequestError"
         )
@@ -1491,24 +1492,29 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             #    and prefix_indices are the cached/shared prefix tokens)
             #
             if req.logprob_start_len >= pre_len:
-                # Optimization for prefill-only requests: When we only need logprobs at
-                # positions beyond the input sequence (to score next-token likelihood), skip all
-                # input logprob computation during prefill since no generation will occur.
-                if self.is_prefill_only and req.logprob_start_len == len(
+                # Convert absolute logprob_start_len to relative extend_logprob_start_len
+                #
+                # Example: origin_input_ids=[1,2,3,4,5] (5 tokens, positions 0-4), logprob_start_len=3
+                # Regular logic: min(3-0, 5) = min(3,5) = 3
+                # This means: "compute logprobs from position 3 onwards in extend batch"
+                req.extend_logprob_start_len = min(
+                    req.logprob_start_len - pre_len,
+                    req.extend_input_len,
+                )
+                if req.is_prefill_only and req.logprob_start_len == len(
                     req.origin_input_ids
                 ):
-                    # Skip ALL input logprobs: set extend_logprob_start_len = extend_input_len
-                    req.extend_logprob_start_len = req.extend_input_len
-                else:
-                    # Convert absolute logprob_start_len to relative extend_logprob_start_len
-                    #
-                    # Example: origin_input_ids=[1,2,3,4,5] (5 tokens, positions 0-4), logprob_start_len=3
-                    # Regular logic: min(3-0, 5, 5-1) = min(3,5,4) = 3
-                    # This means: "compute logprobs from position 3 onwards in extend batch"
-                    req.extend_logprob_start_len = min(
-                        req.logprob_start_len - pre_len,
-                        req.extend_input_len,
-                        req.seqlen - 1,
+                    if req.extend_logprob_start_len != req.extend_input_len:
+                        raise ValueError(
+                            f"req.extend_logprob_start_len is not equal to req.extend_input_len, "
+                            f"{req.extend_logprob_start_len=} {req.extend_input_len=} "
+                            f"{req.logprob_start_len=} {pre_len=} {req.extend_input_len=}"
+                        )
+                elif req.extend_logprob_start_len > req.seqlen - 1:
+                    raise ValueError(
+                        f"req.extend_logprob_start_len is greater than req.seqlen - 1,"
+                        f"{req.extend_logprob_start_len=} {req.seqlen=} {req.logprob_start_len=} "
+                        f"{pre_len=} {req.extend_input_len=}"
                     )
             else:
                 # logprob_start_len is before the current extend batch, so start from beginning
