@@ -32,6 +32,7 @@ from openai.types.responses.tool import Tool
 from pydantic import (
     BaseModel,
     Field,
+    ValidationInfo,
     field_validator,
     model_serializer,
     model_validator,
@@ -207,7 +208,39 @@ class BatchResponse(BaseModel):
     metadata: Optional[dict] = None
 
 
-class CompletionRequest(BaseModel):
+class SamplingParamsValidatorMixin:
+    """Mixin class providing common sampling parameter validators for OpenAI API requests."""
+
+    @field_validator("n")
+    @classmethod
+    def validate_n_positive(cls, v):
+        if v is not None and v < 1:
+            raise ValueError("n must be at least 1")
+        return v
+
+    @field_validator("temperature")
+    @classmethod
+    def validate_temperature_range(cls, v):
+        if v is not None and v < 0:
+            raise ValueError("temperature must be non-negative")
+        return v
+
+    @field_validator("top_p")
+    @classmethod
+    def validate_top_p_range(cls, v):
+        if v is not None and not 0 <= v <= 1:
+            raise ValueError("top_p must be between 0 and 1")
+        return v
+
+    @field_validator("frequency_penalty", "presence_penalty")
+    @classmethod
+    def validate_penalty_range(cls, v, info: ValidationInfo):
+        if v is not None and not -2.0 <= v <= 2.0:
+            raise ValueError(f"{info.field_name} must be between -2.0 and 2.0")
+        return v
+
+
+class CompletionRequest(SamplingParamsValidatorMixin, BaseModel):
     # Ordered by official OpenAI API documentation
     # https://platform.openai.com/docs/api-reference/completions/create
     model: str = Field(
@@ -279,46 +312,11 @@ class CompletionRequest(BaseModel):
             raise ValueError("max_tokens must be positive")
         return v
 
-    @field_validator("n")
-    @classmethod
-    def validate_n_positive(cls, v):
-        if v is not None and v < 1:
-            raise ValueError("n must be at least 1")
-        return v
-
     @field_validator("logprobs")
     @classmethod
     def validate_logprobs_range(cls, v):
-        if v is not None and (v < 0 or v > 5):
+        if v is not None and not 0 <= v <= 5:
             raise ValueError("logprobs must be between 0 and 5")
-        return v
-
-    @field_validator("temperature")
-    @classmethod
-    def validate_temperature_range(cls, v):
-        if v is not None and v < 0:
-            raise ValueError("temperature must be non-negative")
-        return v
-
-    @field_validator("top_p")
-    @classmethod
-    def validate_top_p_range(cls, v):
-        if v is not None and (v < 0 or v > 1):
-            raise ValueError("top_p must be between 0 and 1")
-        return v
-
-    @field_validator("frequency_penalty")
-    @classmethod
-    def validate_frequency_penalty_range(cls, v):
-        if v is not None and (v < -2.0 or v > 2.0):
-            raise ValueError("frequency_penalty must be between -2.0 and 2.0")
-        return v
-
-    @field_validator("presence_penalty")
-    @classmethod
-    def validate_presence_penalty_range(cls, v):
-        if v is not None and (v < -2.0 or v > 2.0):
-            raise ValueError("presence_penalty must be between -2.0 and 2.0")
         return v
 
 
@@ -494,7 +492,7 @@ class ToolChoice(BaseModel):
     type: Literal["function"] = Field(default="function", examples=["function"])
 
 
-class ChatCompletionRequest(BaseModel):
+class ChatCompletionRequest(SamplingParamsValidatorMixin, BaseModel):
     # Ordered by official OpenAI API documentation
     # https://platform.openai.com/docs/api-reference/chat/create
     messages: List[ChatCompletionMessageParam]
@@ -588,17 +586,10 @@ class ChatCompletionRequest(BaseModel):
         "repetition_penalty": 1.0,
     }
 
-    @field_validator("n")
-    @classmethod
-    def validate_n_positive(cls, v):
-        if v is not None and v < 1:
-            raise ValueError("n must be at least 1")
-        return v
-
     @field_validator("top_logprobs")
     @classmethod
     def validate_top_logprobs_range(cls, v):
-        if v is not None and (v < 0 or v > 20):
+        if v is not None and not 0 <= v <= 20:
             raise ValueError("top_logprobs must be between 0 and 20")
         return v
 
@@ -607,34 +598,6 @@ class ChatCompletionRequest(BaseModel):
     def validate_max_completion_tokens_positive(cls, v):
         if v is not None and v <= 0:
             raise ValueError("max_completion_tokens must be positive")
-        return v
-
-    @field_validator("temperature")
-    @classmethod
-    def validate_temperature_range(cls, v):
-        if v is not None and v < 0:
-            raise ValueError("temperature must be non-negative")
-        return v
-
-    @field_validator("top_p")
-    @classmethod
-    def validate_top_p_range(cls, v):
-        if v is not None and (v < 0 or v > 1):
-            raise ValueError("top_p must be between 0 and 1")
-        return v
-
-    @field_validator("frequency_penalty")
-    @classmethod
-    def validate_frequency_penalty_range(cls, v):
-        if v is not None and (v < -2.0 or v > 2.0):
-            raise ValueError("frequency_penalty must be between -2.0 and 2.0")
-        return v
-
-    @field_validator("presence_penalty")
-    @classmethod
-    def validate_presence_penalty_range(cls, v):
-        if v is not None and (v < -2.0 or v > 2.0):
-            raise ValueError("presence_penalty must be between -2.0 and 2.0")
         return v
 
     @model_validator(mode="before")
