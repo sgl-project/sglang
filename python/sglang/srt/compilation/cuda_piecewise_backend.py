@@ -109,6 +109,10 @@ class CUDAPiecewiseBackend:
             self.first_run_finished = True
             self.check_for_ending_compilation()
             return self.compiled_graph_for_general_shape(*args)
+
+        if len(self.sym_shape_indices) == 0:
+            return self.compiled_graph_for_general_shape(*args)
+
         runtime_shape = args[self.sym_shape_indices[0]]
         if runtime_shape not in self.concrete_size_entries:
             # we don't need to do anything for this shape
@@ -136,8 +140,11 @@ class CUDAPiecewiseBackend:
             if self.is_last_graph and not self.to_be_compiled_sizes:
                 self.check_for_ending_compilation()
 
-        return entry.runnable(*args)
-
+        # Skip CUDA graphs if this entry doesn't use them OR
+        # if we're supposed to skip them globally
+        # skip_cuda_graphs = get_forward_context().skip_cuda_graphs
+        # if not entry.use_cudagraph or skip_cuda_graphs:
+        #     return entry.runnable(*args)
         if is_in_pcg_torch_compile():
             return entry.runnable(*args)
 

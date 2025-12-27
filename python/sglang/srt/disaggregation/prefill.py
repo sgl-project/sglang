@@ -331,6 +331,8 @@ class SchedulerDisaggregationPrefillMixin:
         if batch:
             trace_event_batch("schedule", batch.reqs)
 
+        self.log_prefill_stats_late(batch)
+
         return batch
 
     @torch.no_grad()
