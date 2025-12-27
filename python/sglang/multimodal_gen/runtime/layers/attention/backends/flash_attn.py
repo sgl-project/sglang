@@ -2,11 +2,13 @@
 
 # SPDX-License-Identifier: Apache-2.0
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Any
 
 import torch
 
 from sglang.multimodal_gen.runtime.managers.forward_context import get_forward_context
+from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 
 try:
     from sgl_kernel.flash_attn import flash_attn_varlen_func
@@ -16,6 +18,14 @@ try:
     flash_attn_func = flash_attn_varlen_func
 except ImportError as e:
     raise e
+
+
+try:
+    from flash_attn_interface import (
+        flash_attn_varlen_func as flash_attn_varlen_func_upstream,
+    )
+except Exception:
+    flash_attn_varlen_func_upstream = None
 
 from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
     AttentionBackend,
@@ -28,6 +38,51 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 logger = init_logger(__name__)
 
 fa_ver = 3
+
+
+@lru_cache(maxsize=128)
+def _get_cu_seqlens(device_index: int, bsz: int, seqlen: int) -> torch.Tensor:
+    return torch.arange(
+        0,
+        (bsz + 1) * seqlen,
+        step=seqlen,
+        device=torch.device("cuda", device_index),
+        dtype=torch.int32,
+    )
+
+
+@lru_cache(maxsize=256)
+def _should_use_upstream_flash_attention(
+    upstream_available: bool,
+    upstream_heads_ok: bool,
+    q_shape: tuple[int, ...],
+    k_shape: tuple[int, ...],
+    v_shape: tuple[int, ...],
+) -> bool:
+    if not upstream_available or not upstream_heads_ok:
+        return False
+
+    if len(q_shape) != 4 or len(k_shape) != 4 or len(v_shape) != 4:
+        return False
+
+    bsz, seqlen, nheads_q, d = q_shape
+    bsz_k, seqlen_k, nheads_k, d_k = k_shape
+    bsz_v, seqlen_v, nheads_v, d_v = v_shape
+
+    if (
+        bsz != bsz_k
+        or bsz != bsz_v
+        or seqlen != seqlen_k
+        or seqlen != seqlen_v
+        or d != d_k
+        or d != d_v
+    ):
+        return False
+    if nheads_k != nheads_v:
+        return False
+    if nheads_k == 0 or (nheads_q % nheads_k) != 0:
+        return False
+    return True
 
 
 def set_fa_ver(ver: int):
@@ -73,8 +128,8 @@ class FlashAttentionBackend(AttentionBackend):
         return [32, 64, 96, 128, 160, 192, 224, 256]
 
     @staticmethod
-    def get_name() -> str:
-        return "FLASH_ATTN"
+    def get_enum() -> AttentionBackendEnum:
+        return AttentionBackendEnum.FA
 
     @staticmethod
     def get_impl_cls() -> type["FlashAttentionImpl"]:
@@ -101,9 +156,19 @@ class FlashAttentionImpl(AttentionImpl):
         prefix: str = "",
         **extra_impl_args,
     ) -> None:
+        self.num_heads = num_heads
+        self.num_kv_heads = num_kv_heads
+        self.head_size = head_size
         self.causal = causal
         self.softmax_scale = softmax_scale
         self.attention_metadata = FlashAttentionMetadata()
+        if self.num_kv_heads is None:
+            self._upstream_heads_ok = True
+        else:
+            # For gqa, the num_heads must be a multiple of num_kv_heads
+            self._upstream_heads_ok = (
+                self.num_kv_heads > 0 and (self.num_heads % self.num_kv_heads) == 0
+            )
 
     def forward(
         self,
@@ -123,6 +188,38 @@ class FlashAttentionImpl(AttentionImpl):
         else:
             max_seqlen_q = query.shape[1]
             max_seqlen_k = key.shape[1]
+        q_shape = tuple(query.shape)
+        k_shape = tuple(key.shape)
+        v_shape = tuple(value.shape)
+        use_upstream = _should_use_upstream_flash_attention(
+            flash_attn_varlen_func_upstream is not None,
+            self._upstream_heads_ok,
+            q_shape,
+            k_shape,
+            v_shape,
+        )
+
+        if use_upstream:
+            bsz, seqlen, nheads_q, d = q_shape
+            bsz_k, seqlen_k, nheads_k, d_k = k_shape
+            bsz_v, seqlen_v, nheads_v, d_v = v_shape
+            q_ = query.contiguous().reshape(bsz * seqlen, nheads_q, d)
+            k_ = key.contiguous().reshape(bsz * seqlen, nheads_k, d)
+            v_ = value.contiguous().reshape(bsz * seqlen, nheads_v, d)
+            cu = _get_cu_seqlens(q_.device.index, bsz, seqlen)
+            out = flash_attn_varlen_func_upstream(
+                q_,
+                k_,
+                v_,
+                cu,
+                cu,
+                seqlen,
+                seqlen,
+                softmax_scale=self.softmax_scale,
+                causal=self.causal,
+            )
+            return out.reshape(bsz, seqlen, nheads_q, d)
+
         output = flash_attn_func(
             q=query,  # type: ignore[no-untyped-call]
             k=key,

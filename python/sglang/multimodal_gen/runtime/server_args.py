@@ -228,10 +228,11 @@ class ServerArgs:
 
     # CPU offload parameters
     dit_cpu_offload: bool = True
-    use_fsdp_inference: bool = False
+    dit_layerwise_offload: bool = False
     text_encoder_cpu_offload: bool = True
     image_encoder_cpu_offload: bool = True
     vae_cpu_offload: bool = True
+    use_fsdp_inference: bool = False
     pin_cpu_memory: bool = True
 
     # STA (Sliding Tile Attention) parameters
@@ -301,8 +302,19 @@ class ServerArgs:
         """
         return self.host is None or self.port is None
 
+    def adjust_offload(self):
+        if self.pipeline_config.task_type.is_image_gen():
+            logger.info("Turn off all offload for image generation model")
+            self.dit_cpu_offload = False
+            self.text_encoder_cpu_offload = True
+            self.image_encoder_cpu_offload = True
+            self.vae_cpu_offload = True
+
     def __post_init__(self):
         # Add randomization to avoid race condition when multiple servers start simultaneously
+
+        self.adjust_offload()
+
         if self.attention_backend in ["fa3", "fa4"]:
             self.attention_backend = "fa"
 
@@ -340,11 +352,6 @@ class ServerArgs:
             "--model-path",
             type=str,
             help="The path of the model weights. This can be a local folder or a Hugging Face repo ID.",
-        )
-        parser.add_argument(
-            "--model-dir",
-            type=str,
-            help="Directory containing StepVideo model",
         )
         parser.add_argument(
             "--vae-path",
@@ -506,6 +513,13 @@ class ServerArgs:
             "--dit-cpu-offload",
             action=StoreBoolean,
             help="Use CPU offload for DiT inference. Enable if run out of memory with FSDP.",
+        )
+        parser.add_argument(
+            "--dit-layerwise-offload",
+            action=StoreBoolean,
+            default=ServerArgs.dit_layerwise_offload,
+            help="Enable layerwise CPU offload with async H2D prefetch overlap for supported DiT models (e.g., Wan). "
+            "Cannot be used together with cache-dit (SGLANG_CACHE_DIT_ENABLED), dit_cpu_offload, or use_fsdp_inference.",
         )
         parser.add_argument(
             "--use-fsdp-inference",
@@ -844,6 +858,26 @@ class ServerArgs:
         """Validate inference arguments for consistency"""
         if current_platform.is_mps():
             self.use_fsdp_inference = False
+            self.dit_layerwise_offload = False
+
+        if self.dit_layerwise_offload:
+            if self.use_fsdp_inference:
+                logger.warning(
+                    "dit_layerwise_offload is enabled, automatically disabling use_fsdp_inference."
+                )
+                self.use_fsdp_inference = False
+            if self.dit_cpu_offload:
+                logger.warning(
+                    "dit_layerwise_offload is enabled, automatically disabling dit_cpu_offload."
+                )
+                self.dit_cpu_offload = False
+            if os.getenv("SGLANG_CACHE_DIT_ENABLED", "").lower() == "true":
+                raise ValueError(
+                    "dit_layerwise_offload cannot be enabled together with cache-dit. "
+                    "cache-dit may reuse skipped blocks whose weights have been released by layerwise offload, "
+                    "causing shape mismatch errors. "
+                    "Please disable either --dit-layerwise-offload or SGLANG_CACHE_DIT_ENABLED."
+                )
 
         # autocast
         if self.disable_autocast is None:

@@ -309,3 +309,23 @@ class TokenizerManagerMultiItemMixin:
             ]
 
         return score_list
+
+    def _extract_logprobs_for_tokens(
+        self, logprobs_data: List, label_token_ids: List[int]
+    ) -> Dict[int, float]:
+        """
+        Extract logprobs for specified token IDs from logprobs data.
+
+        Args:
+            logprobs_data: List of (logprob, token_id, text) tuples
+            label_token_ids: Token IDs to extract logprobs for
+
+        Returns:
+            Dictionary mapping token_id to logprob
+        """
+        logprobs = {}
+        if logprobs_data:
+            for logprob, token_id, _ in logprobs_data:
+                if token_id in label_token_ids:
+                    logprobs[token_id] = logprob
+        return logprobs
