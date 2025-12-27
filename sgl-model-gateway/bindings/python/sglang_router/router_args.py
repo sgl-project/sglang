@@ -15,6 +15,9 @@ class RouterArgs:
     worker_urls: List[str] = dataclasses.field(default_factory=list)
     host: str = "0.0.0.0"
     port: int = 30000
+    # Force worker connection mode (and auto-prefix URLs that don't include a scheme)
+    # Valid values: "http", "grpc"
+    connection_mode: Optional[str] = None
 
     # PD-specific configuration
     mini_lb: bool = False
@@ -173,6 +176,13 @@ class RouterArgs:
             nargs="*",
             default=[],
             help="List of worker URLs. Supports IPv4 and IPv6 addresses (use brackets for IPv6, e.g., http://[::1]:8000 http://192.168.1.1:8000)",
+        )
+        parser.add_argument(
+            "--connection-mode",
+            type=str,
+            choices=["http", "grpc"],
+            default=None,
+            help="Force worker connection mode. When set, bare `host:port` entries in --worker-urls/--prefill/--decode are accepted and auto-prefixed.",
         )
 
         # Routing policy configuration

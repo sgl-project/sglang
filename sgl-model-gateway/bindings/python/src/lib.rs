@@ -393,6 +393,32 @@ impl Router {
         core::ConnectionMode::Http
     }
 
+    fn normalize_url_for_mode(url: &str, mode: &core::ConnectionMode) -> String {
+        if url.starts_with("http://")
+            || url.starts_with("https://")
+            || url.starts_with("grpc://")
+            || url.starts_with("grpcs://")
+        {
+            url.to_string()
+        } else {
+            match mode {
+                core::ConnectionMode::Http => format!("http://{}", url),
+                core::ConnectionMode::Grpc { .. } => format!("grpc://{}", url),
+            }
+        }
+    }
+
+    fn parse_connection_mode_str(mode: &str) -> PyResult<core::ConnectionMode> {
+        match mode.to_lowercase().as_str() {
+            "http" => Ok(core::ConnectionMode::Http),
+            "grpc" => Ok(core::ConnectionMode::Grpc { port: None }),
+            _ => Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "Invalid connection_mode: {} (expected 'http' or 'grpc')",
+                mode
+            ))),
+        }
+    }
+
     pub fn to_router_config(&self) -> config::ConfigResult<config::RouterConfig> {
         use config::{
             DiscoveryConfig, MetricsConfig, PolicyConfig as ConfigPolicyConfig, RoutingMode,
@@ -635,6 +661,7 @@ impl Router {
         queue_size = 100,
         queue_timeout_secs = 60,
         rate_limit_tokens_per_second = None,
+        connection_mode = None,
         model_path = None,
         tokenizer_path = None,
         chat_template = None,
@@ -717,6 +744,7 @@ impl Router {
         queue_size: usize,
         queue_timeout_secs: u64,
         rate_limit_tokens_per_second: Option<i32>,
+        connection_mode: Option<String>,
         model_path: Option<String>,
         tokenizer_path: Option<String>,
         chat_template: Option<String>,
@@ -752,7 +780,44 @@ impl Router {
             all_urls.extend(decode_urls.clone());
         }
 
-        let connection_mode = Self::determine_connection_mode(&all_urls);
+        let requested_mode = match connection_mode.as_deref() {
+            Some(m) => Some(Self::parse_connection_mode_str(m)?),
+            None => None,
+        };
+
+        let connection_mode = match requested_mode.clone() {
+            Some(m) => m,
+            None => Self::determine_connection_mode(&all_urls),
+        };
+
+        // Only auto-prefix URLs when user explicitly requests a connection mode.
+        let normalize = requested_mode.is_some();
+        let worker_urls = if normalize {
+            worker_urls
+                .into_iter()
+                .map(|u| Self::normalize_url_for_mode(&u, &connection_mode))
+                .collect()
+        } else {
+            worker_urls
+        };
+        let prefill_urls = if normalize {
+            prefill_urls.map(|v| {
+                v.into_iter()
+                    .map(|(u, p)| (Self::normalize_url_for_mode(&u, &connection_mode), p))
+                    .collect()
+            })
+        } else {
+            prefill_urls
+        };
+        let decode_urls = if normalize {
+            decode_urls.map(|v| {
+                v.into_iter()
+                    .map(|u| Self::normalize_url_for_mode(&u, &connection_mode))
+                    .collect()
+            })
+        } else {
+            decode_urls
+        };
 
         Ok(Router {
             host,

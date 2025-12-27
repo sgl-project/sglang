@@ -166,6 +166,18 @@ python -m sglang_router.launch_router \
   --host 0.0.0.0 --port 8080
 ```
 
+If you have many gRPC workers and want to avoid repeating the `grpc://` prefix, you can force gRPC mode and provide bare `host:port` entries:
+
+```bash
+python -m sglang_router.launch_router \
+  --connection-mode grpc \
+  --worker-urls 127.0.0.1:20000 \
+  --model-path meta-llama/Llama-3.1-8B-Instruct \
+  --reasoning-parser deepseek-r1 \
+  --tool-call-parser json \
+  --host 0.0.0.0 --port 8080
+```
+
 ---
 
 ## Deployment Modes
@@ -237,6 +249,10 @@ python -m sglang_router.launch_router \
 ```
 
 The gRPC router supports both regular HTTP-equivalent serving and PD (prefill/decode) serving. Provide `--tokenizer-path` or `--model-path` (HuggingFace ID or local directory) whenever connection mode resolves to gRPC.
+
+Tip: you may also use `--connection-mode grpc` and pass bare `host:port` URLs (the router will prefix them as `grpc://...`).
+
+Similarly, `--connection-mode http` allows bare `host:port` entries and prefixes them as `http://...`.
 
 ### Prefill/Decode Disaggregation
 
@@ -1570,7 +1586,8 @@ groups:
 |-----------|------|---------|-------------|
 | `--host` | str | 127.0.0.1 | Router host |
 | `--port` | int | 30000 | Router port |
-| `--worker-urls` | list | [] | Worker URLs (HTTP or gRPC) |
+| `--worker-urls` | list | [] | Worker URLs (HTTP or gRPC). By default, each URL must include a scheme (e.g. `http://...` or `grpc://...`). If you set `--connection-mode`, bare `host:port` entries are accepted and will be auto-prefixed. |
+| `--connection-mode` | enum | None | Force worker connection mode (`http` or `grpc`). When set, bare `host:port` entries in `--worker-urls` / `--prefill` / `--decode` are auto-prefixed accordingly. |
 | `--policy` | str | cache_aware | Routing policy |
 | `--max-concurrent-requests` | int | -1 | Concurrency limit (-1 disables) |
 | `--request-timeout-secs` | int | 600 | Request timeout |

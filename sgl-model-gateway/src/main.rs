@@ -17,6 +17,66 @@ use sgl_model_gateway::{
     service_discovery::ServiceDiscoveryConfig,
     version,
 };
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+enum ConnectionModeCli {
+    #[value(name = "http")]
+    Http,
+    #[value(name = "grpc")]
+    Grpc,
+}
+
+fn normalize_cli_url(url: &str, connection_mode: &ConnectionMode) -> String {
+    if url.starts_with("http://")
+        || url.starts_with("https://")
+        || url.starts_with("grpc://")
+        || url.starts_with("grpcs://")
+    {
+        url.to_string()
+    } else {
+        match connection_mode {
+            ConnectionMode::Http => format!("http://{}", url),
+            ConnectionMode::Grpc { .. } => format!("grpc://{}", url),
+        }
+    }
+}
+
+fn normalize_cli_urls_if_requested(
+    mode: RoutingMode,
+    connection_mode: &ConnectionMode,
+    normalize: bool,
+) -> RoutingMode {
+    if !normalize {
+        return mode;
+    }
+
+    match mode {
+        RoutingMode::Regular { worker_urls } => RoutingMode::Regular {
+            worker_urls: worker_urls
+                .into_iter()
+                .map(|u| normalize_cli_url(&u, connection_mode))
+                .collect(),
+        },
+        RoutingMode::PrefillDecode {
+            prefill_urls,
+            decode_urls,
+            prefill_policy,
+            decode_policy,
+        } => RoutingMode::PrefillDecode {
+            prefill_urls: prefill_urls
+                .into_iter()
+                .map(|(u, p)| (normalize_cli_url(&u, connection_mode), p))
+                .collect(),
+            decode_urls: decode_urls
+                .into_iter()
+                .map(|u| normalize_cli_url(&u, connection_mode))
+                .collect(),
+            prefill_policy,
+            decode_policy,
+        },
+        RoutingMode::OpenAI { worker_urls } => RoutingMode::OpenAI { worker_urls },
+    }
+}
 fn parse_prefill_args() -> Vec<(String, Option<u16>)> {
     let args: Vec<String> = std::env::args().collect();
     let mut prefill_entries = Vec::new();
@@ -136,6 +196,13 @@ struct CliArgs {
 
     #[arg(long, num_args = 0..)]
     worker_urls: Vec<String>,
+
+    /// Force worker connection mode (and auto-prefix URLs that don't include a scheme).
+    ///
+    /// Example:
+    ///   smg launch --connection-mode grpc --worker-urls worker1:50051 worker2:50051
+    #[arg(long, value_enum)]
+    connection_mode: Option<ConnectionModeCli>,
 
     #[arg(long, default_value = "cache_aware", value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "prefix_hash", "manual"])]
     policy: String,
@@ -726,10 +793,22 @@ impl CliArgs {
             }
             RoutingMode::OpenAI { .. } => {}
         }
+        let requested_connection_mode = self.connection_mode.map(|m| match m {
+            ConnectionModeCli::Http => ConnectionMode::Http,
+            ConnectionModeCli::Grpc => ConnectionMode::Grpc { port: None },
+        });
+
         let connection_mode = match &mode {
+            // OpenAI backends are always HTTP
             RoutingMode::OpenAI { .. } => ConnectionMode::Http,
-            _ => Self::determine_connection_mode(&all_urls),
+            _ => requested_connection_mode
+                .clone()
+                .unwrap_or_else(|| Self::determine_connection_mode(&all_urls)),
         };
+
+        // Only auto-prefix URLs when user explicitly requests a connection mode.
+        // This preserves existing strict behavior by default.
+        let mode = normalize_cli_urls_if_requested(mode, &connection_mode, self.connection_mode.is_some());
 
         let history_backend = match self.history_backend.as_str() {
             "none" => HistoryBackend::None,
