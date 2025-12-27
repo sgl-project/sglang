@@ -247,7 +247,7 @@ async def edits(
 
     # Default to b64_json to align with gpt-image-1 behavior in OpenAI examples
     if (response_format or "b64_json").lower() == "b64_json":
-        response_kwargs = {"data": []}
+        response_kwargs = {"id": request_id, "data": []}
         for save_file_path in save_file_path_list:
             with open(save_file_path, "rb") as f:
                 b64 = base64.b64encode(f.read()).decode("utf-8")
@@ -260,6 +260,7 @@ async def edits(
     else:
         url = f"/v1/images/{request_id}/content"
         response_kwargs = {
+            "id": request_id,
             "data": [ImageResponseData(url=url, revised_prompt=prompt)],
         }
 
