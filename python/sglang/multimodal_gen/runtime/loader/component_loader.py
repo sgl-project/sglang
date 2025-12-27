@@ -7,7 +7,6 @@ import glob
 import importlib.util
 import json
 import os
-import time
 import traceback
 from abc import ABC
 from collections.abc import Generator, Iterable
@@ -91,6 +90,26 @@ def _list_safetensors_files(model_path: str) -> list[str]:
     return sorted(glob.glob(os.path.join(str(model_path), "*.safetensors")))
 
 
+def get_memory_usage_of_component(module) -> float | None:
+    """
+    returned value is in GB, rounded to 2 decimal digits
+    """
+    if not isinstance(module, nn.Module):
+        return None
+    BYTES_PER_GB = 1024**3
+    if hasattr(module, "get_memory_footprint"):
+        usage = module.get_memory_footprint() / BYTES_PER_GB
+    else:
+        # manually
+        param_size = sum(p.numel() * p.element_size() for p in module.parameters())
+        buffer_size = sum(b.numel() * b.element_size() for b in module.buffers())
+
+        total_size_bytes = param_size + buffer_size
+        usage = total_size_bytes / (1024**3)
+
+    return round(usage, 2)
+
+
 class ComponentLoader(ABC):
     """Base class for loading a specific type of model component."""
 
@@ -169,7 +188,9 @@ class ComponentLoader(ABC):
             consumed = 0.0
         else:
             current_gpu_mem = current_platform.get_available_gpu_memory()
-            consumed = (gpu_mem_before_loading - current_gpu_mem,)
+            consumed = get_memory_usage_of_component(component)
+            if consumed is None or consumed == 0.0:
+                consumed = gpu_mem_before_loading - current_gpu_mem
             logger.info(
                 f"Loaded %s: %s from {source}. avail mem: %.2f GB, %.2f GB consumed",
                 module_name,
@@ -285,9 +306,6 @@ class TextEncoderLoader(ComponentLoader):
         allow_patterns_overrides: list[str] | None = None
         """If defined, weights will load exclusively using these patterns."""
 
-    counter_before_loading_weights: float = 0.0
-    counter_after_loading_weights: float = 0.0
-
     def should_offload(self, server_args, model_config: ModelConfig | None = None):
         should_offload = server_args.text_encoder_cpu_offload
         if not should_offload:
@@ -367,8 +385,6 @@ class TextEncoderLoader(ComponentLoader):
         else:
             weights_iterator = pt_weights_iterator(hf_weights_files, to_cpu=to_cpu)
 
-        if self.counter_before_loading_weights == 0.0:
-            self.counter_before_loading_weights = time.perf_counter()
         # apply the prefix.
         return ((source.prefix + name, tensor) for (name, tensor) in weights_iterator)
 
@@ -454,12 +470,6 @@ class TextEncoderLoader(ComponentLoader):
             weights_to_load = {name for name, _ in model.named_parameters()}
             loaded_weights = model.load_weights(
                 self._get_all_weights(model, model_path, to_cpu=should_offload)
-            )
-            self.counter_after_loading_weights = time.perf_counter()
-            logger.info(
-                "Loading weights took %.2f seconds",
-                self.counter_after_loading_weights
-                - self.counter_before_loading_weights,
             )
 
             # Explicitly move model to target device after loading weights

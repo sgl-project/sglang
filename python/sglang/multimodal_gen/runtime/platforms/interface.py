@@ -216,6 +216,7 @@ class Platform:
         raise NotImplementedError
 
     @classmethod
+    @lru_cache(maxsize=1)
     def get_device_total_memory(cls, device_id: int = 0) -> int:
         """Get the total memory of a device in bytes."""
         raise NotImplementedError

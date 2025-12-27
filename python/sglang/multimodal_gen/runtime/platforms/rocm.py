@@ -6,7 +6,7 @@
 This file is a platform abstraction for ROCm GPUs,
 adjusted to match the structure and interface of `cuda.py`.
 """
-
+from functools import lru_cache
 from typing import Any
 
 import torch
@@ -41,6 +41,7 @@ class RocmPlatform(Platform):
         return str(torch.cuda.get_device_name(device_id))
 
     @classmethod
+    @lru_cache(maxsize=1)
     def get_device_total_memory(cls, device_id: int = 0) -> int:
         return torch.cuda.get_device_properties(device_id).total_memory
 

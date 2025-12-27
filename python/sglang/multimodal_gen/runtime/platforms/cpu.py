@@ -4,6 +4,7 @@
 # Adapted from vllm: https://github.com/vllm-project/vllm/blob/v0.7.3/vllm/platforms/cpu.py
 
 import platform
+from functools import lru_cache
 from typing import Any
 
 import torch
@@ -41,10 +42,11 @@ class CpuPlatform(Platform):
         return platform.machine()
 
     @classmethod
+    @lru_cache(maxsize=1)
     def get_device_total_memory(cls, device_id: int = 0) -> int:
-        # This is a rough estimate for CPU memory
-        # In practice, you might want to use psutil or similar
-        return 0
+        import psutil
+
+        return psutil.virtual_memory().total
 
     @classmethod
     def is_async_output_supported(cls, enforce_eager: bool | None) -> bool:

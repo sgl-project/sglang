@@ -82,6 +82,7 @@ class CudaPlatformBase(Platform):
         raise NotImplementedError
 
     @classmethod
+    @lru_cache(maxsize=1)
     def get_device_total_memory(cls, device_id: int = 0) -> int:
         raise NotImplementedError
 
@@ -442,6 +443,7 @@ class NonNvmlCudaPlatform(CudaPlatformBase):
         return str(torch.cuda.get_device_name(device_id))
 
     @classmethod
+    @lru_cache(maxsize=1)
     def get_device_total_memory(cls, device_id: int = 0) -> int:
         device_props = torch.cuda.get_device_properties(device_id)
         return int(device_props.total_memory)

@@ -1,13 +1,14 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
-
-# SPDX-License-Identifier: Apache-2.0
-
+from functools import lru_cache
 from typing import Any, DeviceCapability, Platform, PlatformEnum
 
 import torch
 
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+
+# SPDX-License-Identifier: Apache-2.0
+
 
 logger = init_logger(__name__)
 
@@ -32,8 +33,11 @@ class MpsPlatform(Platform):
         raise NotImplementedError
 
     @classmethod
+    @lru_cache(maxsize=1)
     def get_device_total_memory(cls, device_id: int = 0) -> int:
-        raise NotImplementedError
+        import psutil
+
+        return psutil.virtual_memory().total
 
     @classmethod
     def is_async_output_supported(cls, enforce_eager: bool | None) -> bool:
