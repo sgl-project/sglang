@@ -91,6 +91,8 @@ class ComposedPipelineBase(ABC):
         logger.info("Loading pipeline modules...")
         self.modules = self.load_modules(server_args, loaded_modules)
 
+        self.__post_init__()
+
     def build_executor(self, server_args: ServerArgs):
         # TODO
         from sglang.multimodal_gen.runtime.pipelines_core.executors.parallel_executor import (
@@ -237,8 +239,8 @@ class ComposedPipelineBase(ABC):
 
         components = {}
         for module_name, (
-            transformers_or_diffusers,
-            architecture,
+                transformers_or_diffusers,
+                architecture,
         ) in tqdm(iterable=model_index.items(), desc="Loading required modules"):
             if transformers_or_diffusers is None:
                 logger.warning(
