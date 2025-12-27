@@ -4012,7 +4012,7 @@ class ServerArgs:
             "--piecewise-cuda-graph-tokens",
             type=int,
             nargs="+",
-            help="Set the batch sizes when using piecewise cuda graph.",
+            help="Set the list of token lengths for piecewise cuda graph capture.",
         )
         parser.add_argument(
             "--piecewise-cuda-graph-compiler",
