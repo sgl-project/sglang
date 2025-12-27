@@ -29,6 +29,7 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)  # pylint: disable=invalid-name
 
+
 try:
     from flashinfer.rope import apply_rope_with_cos_sin_cache_inplace
 except Exception:
@@ -964,6 +965,7 @@ class QwenImageTransformer2DModel(CachableDiT):
         hidden_states = self.img_in(hidden_states)
 
         timestep = (timestep / 1000).to(hidden_states.dtype)
+
         if self.zero_cond_t:
             timestep = torch.cat([timestep, self.timestep_zero], dim=0)
             device = timestep.device

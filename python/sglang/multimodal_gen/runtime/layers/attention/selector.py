@@ -90,7 +90,6 @@ def get_attn_backend(
     head_size: int,
     dtype: torch.dtype,
     supported_attention_backends: set[AttentionBackendEnum] | None = None,
-    tag: str | None = None,
 ) -> type[AttentionBackend]:
     if supported_attention_backends is None:
         be_tuple = tuple()
@@ -99,7 +98,7 @@ def get_attn_backend(
         be_tuple = tuple(
             sorted(list(supported_attention_backends), key=lambda b: b.name)
         )
-    return _cached_get_attn_backend(head_size, dtype, be_tuple, tag)
+    return _cached_get_attn_backend(head_size, dtype, be_tuple)
 
 
 @cache
@@ -107,7 +106,6 @@ def _cached_get_attn_backend(
     head_size: int,
     dtype: torch.dtype,
     supported_attention_backends: tuple[AttentionBackendEnum],
-    tag: str | None = None,
 ) -> type[AttentionBackend]:
     # Check whether a particular choice of backend was
     # previously forced.
@@ -155,7 +153,7 @@ def _cached_get_attn_backend(
         selected_backend = None
 
     attention_cls = current_platform.get_attn_backend_cls_str(
-        selected_backend, head_size, dtype, tag=tag
+        selected_backend, head_size, dtype
     )
     if not attention_cls:
         raise ValueError(
