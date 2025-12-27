@@ -92,16 +92,14 @@ class RocmPlatform(Platform):
         selected_backend: AttentionBackendEnum | None,
         head_size: int,
         dtype: torch.dtype,
-        tag: str | None = None,
     ) -> str:
         logger.info(
             "Trying SGLANG_DIFFUSION_ATTENTION_BACKEND=%s",
             envs.SGLANG_DIFFUSION_ATTENTION_BACKEND,
         )
 
-        tag_info = f" for {tag}" if tag else ""
         if selected_backend == AttentionBackendEnum.TORCH_SDPA:
-            logger.info(f"Using Torch SDPA backend{tag_info}.")
+            logger.info("Using Torch SDPA backend.")
             return "sglang.multimodal_gen.runtime.layers.attention.backends.sdpa.SDPABackend"
 
         elif selected_backend in (AttentionBackendEnum.FA, None):
@@ -110,12 +108,14 @@ class RocmPlatform(Platform):
         elif selected_backend == AttentionBackendEnum.AITER:
             if dtype not in (torch.float16, torch.bfloat16):
                 logger.warning(
-                    f"AITer backend only supports fp16/bf16 inputs but got dtype={dtype}. Falling back to Torch SDPA backend.{tag_info}"
+                    "AITer backend only supports fp16/bf16 inputs but got dtype=%s. "
+                    "Falling back to Torch SDPA backend.",
+                    dtype,
                 )
                 # TODO: need to compare triton with sdpa as an alternative backend
                 return "sglang.multimodal_gen.runtime.layers.attention.backends.sdpa.SDPABackend"
 
-            logger.info(f"Using AITer backend on ROCm{tag_info}.")
+            logger.info("Using AITer backend on ROCm.")
             return "sglang.multimodal_gen.runtime.layers.attention.backends.aiter.AITerBackend"
 
         elif selected_backend in (
@@ -133,7 +133,8 @@ class RocmPlatform(Platform):
         target_backend = AttentionBackendEnum.FA
         if dtype not in (torch.float16, torch.bfloat16):
             logger.info(
-                f"Cannot use FlashAttention backend for dtype other than torch.float16 or torch.bfloat16.{tag_info}"
+                "Cannot use FlashAttention backend for dtype other than "
+                "torch.float16 or torch.bfloat16."
             )
             target_backend = AttentionBackendEnum.TORCH_SDPA
 
@@ -148,21 +149,25 @@ class RocmPlatform(Platform):
                 supported_sizes = FlashAttentionBackend.get_supported_head_sizes()
                 if head_size not in supported_sizes:
                     logger.info(
-                        f"Cannot use FlashAttention-2 backend for head size {head_size}.{tag_info}"
+                        "Cannot use FlashAttention-2 backend for head size %d.",
+                        head_size,
                     )
                     target_backend = AttentionBackendEnum.TORCH_SDPA
             except ImportError:
                 logger.info(
-                    f"Cannot use FlashAttention backend because the flash_attn package is not found. Make sure that flash_attn was built and installed (on by default).{tag_info}"
+                    "Cannot use FlashAttention backend because the "
+                    "flash_attn package is not found. "
+                    "Make sure that flash_attn was built and installed "
+                    "(on by default)."
                 )
                 target_backend = AttentionBackendEnum.TORCH_SDPA
 
         if target_backend == AttentionBackendEnum.TORCH_SDPA:
-            logger.info(f"Using Torch SDPA backend{tag_info}.")
+            logger.info("Using Torch SDPA backend.")
 
             return "sglang.multimodal_gen.runtime.layers.attention.backends.sdpa.SDPABackend"
 
-        logger.info(f"Using Flash Attention backend{tag_info}.")
+        logger.info("Using Flash Attention backend.")
 
         return "sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn.FlashAttentionBackend"
 

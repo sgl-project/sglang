@@ -150,11 +150,9 @@ class CudaPlatformBase(Platform):
         selected_backend: AttentionBackendEnum | None,
         head_size: int,
         dtype: torch.dtype,
-        tag: str | None = None,
     ) -> str:
         # TODO(will): maybe come up with a more general interface for local attention
         # if distributed is False, we always try to use Flash attn
-        tag_info = f" for {tag}" if tag else ""
         if selected_backend == AttentionBackendEnum.SLIDING_TILE_ATTN:
             try:
                 from st_attn import sliding_tile_attention  # noqa: F401
@@ -163,7 +161,7 @@ class CudaPlatformBase(Platform):
                     SlidingTileAttentionBackend,
                 )
 
-                logger.info(f"Using Sliding Tile Attention backend{tag_info}")
+                logger.info("Using Sliding Tile Attention backend")
 
                 return "sglang.multimodal_gen.runtime.layers.attention.backends.sliding_tile_attn.SlidingTileAttentionBackend"
             except ImportError as e:
@@ -181,13 +179,13 @@ class CudaPlatformBase(Platform):
                     SageAttentionBackend,
                 )
 
-                logger.info(f"Using Sage Attention backend{tag_info}")
+                logger.info("Using Sage Attention backend")
 
                 return "sglang.multimodal_gen.runtime.layers.attention.backends.sage_attn.SageAttentionBackend"
             except ImportError as e:
                 logger.info(e)
                 logger.info(
-                    f"Sage Attention backend is not installed (To install it, run `pip install sageattention==2.2.0 --no-build-isolation`). Falling back to Flash Attention.{tag_info}"
+                    "Sage Attention backend is not installed (To install it, run `pip install sageattention==2.2.0 --no-build-isolation`). Falling back to Flash Attention."
                 )
         elif selected_backend == AttentionBackendEnum.SAGE_ATTN_3:
             try:
@@ -195,12 +193,12 @@ class CudaPlatformBase(Platform):
                     SageAttention3Backend,
                 )
 
-                logger.info(f"Using Sage Attention 3 backend{tag_info}")
+                logger.info("Using Sage Attention 3 backend")
                 return "sglang.multimodal_gen.runtime.layers.attention.backends.sage_attn3.SageAttention3Backend"
             except ImportError as e:
                 logger.info(e)
                 logger.info(
-                    f"Sage Attention 3 backend is not installed (To install it, see https://github.com/thu-ml/SageAttention/tree/main/sageattention3_blackwell#installation). Falling back to Flash Attention.{tag_info}"
+                    "Sage Attention 3 backend is not installed (To install it, see https://github.com/thu-ml/SageAttention/tree/main/sageattention3_blackwell#installation). Falling back to Flash Attention."
                 )
         elif selected_backend == AttentionBackendEnum.VIDEO_SPARSE_ATTN:
             try:
@@ -210,7 +208,7 @@ class CudaPlatformBase(Platform):
                     VideoSparseAttentionBackend,
                 )
 
-                logger.info(f"Using Video Sparse Attention backend{tag_info}")
+                logger.info("Using Video Sparse Attention backend")
 
                 return "sglang.multimodal_gen.runtime.layers.attention.backends.video_sparse_attn.VideoSparseAttentionBackend"
             except ImportError as e:
@@ -228,7 +226,7 @@ class CudaPlatformBase(Platform):
                     VMOBAAttentionBackend,
                 )
 
-                logger.info(f"Using Video MOBA Attention backend{tag_info}")
+                logger.info("Using Video MOBA Attention backend")
 
                 return "sglang.multimodal_gen.runtime.layers.attention.backends.vmoba.VMOBAAttentionBackend"
             except ImportError as e:
@@ -239,10 +237,10 @@ class CudaPlatformBase(Platform):
                     "Video MoBA Attention backend is not installed. "
                 ) from e
         elif selected_backend == AttentionBackendEnum.AITER:
-            logger.info(f"Using AITer backend{tag_info}")
+            logger.info("Using AITer backend")
             return "sglang.multimodal_gen.runtime.layers.attention.backends.aiter.AITerBackend"
         elif selected_backend == AttentionBackendEnum.TORCH_SDPA:
-            logger.info(f"Using Torch SDPA backend{tag_info}")
+            logger.info("Using Torch SDPA backend")
             return "sglang.multimodal_gen.runtime.layers.attention.backends.sdpa.SDPABackend"
         elif selected_backend in [
             AttentionBackendEnum.FA,
@@ -271,23 +269,24 @@ class CudaPlatformBase(Platform):
                         SageAttention3Backend,
                     )
 
-                    logger.info(f"Using Sage Attention 3 backend{tag_info}")
+                    logger.info("Using Sage Attention 3 backend")
                     return "sglang.multimodal_gen.runtime.layers.attention.backends.sage_attn3.SageAttention3Backend"
                 except ImportError as e:
                     logger.info(e)
                     logger.info(
-                        f"Sage Attention 3 backend is not installed, Falling back to Torch SDPA (To install it, see https://github.com/thu-ml/SageAttention/tree/main/sageattention3_blackwell#installation){tag_info}"
+                        "Sage Attention 3 backend is not installed, Falling back to Torch SDPA (To install it, see https://github.com/thu-ml/SageAttention/tree/main/sageattention3_blackwell#installation)"
                     )
                     target_backend = AttentionBackendEnum.TORCH_SDPA
 
         if not cls.has_device_capability(80):
             logger.info(
-                f"Cannot use FlashAttention backend for Volta and Turing GPUs.{tag_info}"
+                "Cannot use FlashAttention backend for Volta and Turing " "GPUs."
             )
             target_backend = AttentionBackendEnum.TORCH_SDPA
         elif dtype not in (torch.float16, torch.bfloat16):
             logger.info(
-                f"Cannot use FlashAttention backend for dtype other than torch.float16 or torch.bfloat16.{tag_info}"
+                "Cannot use FlashAttention backend for dtype other than "
+                "torch.float16 or torch.bfloat16."
             )
             target_backend = AttentionBackendEnum.TORCH_SDPA
         # FlashAttn is valid for the model, checking if the package is
@@ -301,23 +300,25 @@ class CudaPlatformBase(Platform):
                 supported_sizes = FlashAttentionBackend.get_supported_head_sizes()
                 if head_size not in supported_sizes:
                     logger.info(
-                        f"Cannot use FlashAttention backend for head size {head_size}.{tag_info}"
+                        "Cannot use FlashAttention backend for head size %d.",
+                        head_size,
                     )
                     target_backend = AttentionBackendEnum.TORCH_SDPA
             except ImportError:
                 logger.info(
-                    f"Cannot use FlashAttention backend because the flash_attn package is not found. Make sure that flash_attn was built and installed (on by default).{tag_info}"
+                    "Cannot use FlashAttention backend because the "
+                    "flash_attn package is not found. "
+                    "Make sure that flash_attn was built and installed "
+                    "(on by default)."
                 )
                 target_backend = AttentionBackendEnum.TORCH_SDPA
 
         if target_backend == AttentionBackendEnum.TORCH_SDPA:
-            logger.info(f"Using Torch SDPA backend{tag_info}")
+            logger.info("Using Torch SDPA backend")
 
             return "sglang.multimodal_gen.runtime.layers.attention.backends.sdpa.SDPABackend"
 
-        logger.info(
-            f"Using FlashAttention (FA3 for hopper, FA4 for blackwell) backend{tag_info}"
-        )
+        logger.info("Using FlashAttention (FA3 for hopper, FA4 for blackwell) backend")
 
         return "sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn.FlashAttentionBackend"
 

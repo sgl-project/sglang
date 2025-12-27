@@ -942,6 +942,7 @@ class QwenImageTransformer2DModel(CachableDiT):
         hidden_states = self.img_in(hidden_states)
 
         timestep = (timestep / 1000).to(hidden_states.dtype)
+
         if self.zero_cond_t:
             timestep = torch.cat([timestep, self.timestep_zero], dim=0)
             device = timestep.device
