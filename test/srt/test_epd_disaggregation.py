@@ -3,6 +3,8 @@ import subprocess
 import threading
 import unittest
 
+import openai
+
 from sglang.srt.utils import kill_process_tree
 from sglang.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
@@ -13,6 +15,9 @@ from sglang.test.test_utils import (
     is_in_ci,
     popen_launch_server,
 )
+
+# video test URL
+VIDEO_JOBS_URL = "https://raw.githubusercontent.com/sgl-project/sgl-test-files/refs/heads/main/videos/jobs_presenting_ipod.mp4"
 
 
 @unittest.skipIf(is_in_ci(), "Skipping in CI to reduce multi-GPU runtime")
@@ -420,6 +425,98 @@ class TestEPDDisaggregationMultiEncoders(PDDisaggregationServerBase):
         print(f"MMMU accuracy (multi encoder): {mmmu_accuracy:.4f}")
         # for qwen2.5-vl-3b-instruct, the accuracy is 0.40
         self.assertGreater(mmmu_accuracy, 0.40)
+
+    def test_video(self):
+        """Test video support with EPD disaggregation (multiple encoders)"""
+        client = openai.Client(api_key=self.api_key, base_url=f"{self.lb_url}/v1")
+
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Describe the video."},
+                    {
+                        "type": "video_url",
+                        "video_url": {"url": VIDEO_JOBS_URL},
+                    },
+                ],
+            },
+        ]
+
+        response = client.chat.completions.create(
+            model="default",
+            messages=messages,
+            max_tokens=8192,
+            stream=False,
+        )
+
+        video_response = response.choices[0].message.content
+        print("-" * 30)
+        print(f"Video response (multi encoder):\n{video_response}")
+        print("-" * 30)
+
+        # Add assertions to validate the video response
+        video_response_lower = video_response.lower()
+
+        # Check for device-related keywords
+        has_device = (
+            "ipod" in video_response_lower
+            or "device" in video_response_lower
+            or "microphone" in video_response_lower
+            or "smartphone" in video_response_lower
+            or "phone" in video_response_lower
+        )
+
+        # Check for person-related keywords
+        has_person = (
+            "man" in video_response_lower
+            or "person" in video_response_lower
+            or "individual" in video_response_lower
+            or "speaker" in video_response_lower
+            or "presenter" in video_response_lower
+            or "steve" in video_response_lower
+            or "hand" in video_response_lower
+            or "hands" in video_response_lower
+        )
+
+        # Check for action-related keywords
+        has_action = (
+            "present" in video_response_lower
+            or "presenting" in video_response_lower
+            or "examine" in video_response_lower
+            or "examining" in video_response_lower
+            or "display" in video_response_lower
+            or "displaying" in video_response_lower
+            or "hold" in video_response_lower
+            or "holding" in video_response_lower
+            or "gestur" in video_response_lower
+            or "speak" in video_response_lower
+            or "speaking" in video_response_lower
+        )
+
+        assert has_device, f"""
+        ====================== video response =====================
+        {video_response}
+        ===========================================================
+        should contain device-related keywords: 'iPod', 'device', 'microphone', 'smartphone', or 'phone'
+        """
+
+        assert has_person, f"""
+        ====================== video response =====================
+        {video_response}
+        ===========================================================
+        should contain person-related keywords: 'man', 'person', 'individual', 'speaker', 'presenter', 'Steve', 'hand', or 'hands'
+        """
+
+        assert has_action, f"""
+        ====================== video response =====================
+        {video_response}
+        ===========================================================
+        should contain action-related keywords: 'present', 'presenting', 'examine', 'examining', 'display', 'displaying', 'hold', 'holding', 'gestur', 'speak', or 'speaking'
+        """
+
+        self.assertIsNotNone(video_response)
+        self.assertGreater(len(video_response), 0)
 
 
 if __name__ == "__main__":
