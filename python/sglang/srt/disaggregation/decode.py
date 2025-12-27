@@ -60,6 +60,7 @@ from sglang.srt.mem_cache.memory_pool import (
     ReqToTokenPool,
     SWAKVPool,
 )
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.tracing.trace import trace_event_batch, trace_slice_end
 from sglang.srt.utils import get_int_env_var
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
@@ -990,6 +991,7 @@ class SchedulerDisaggregationDecodeMixin:
             self.enable_overlap,
             self.spec_algorithm,
         )
+        new_batch.forward_mode = ForwardMode.PREBUILT
 
         # construct fake completed prefill
         new_batch.prepare_for_prebuilt()

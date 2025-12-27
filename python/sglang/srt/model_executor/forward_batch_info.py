@@ -792,9 +792,10 @@ class ForwardBatch:
         attn_tp_size = get_attention_tp_size()
 
         for i in range(sync_group_size):
-            # make sure that the padded length is divisible by attn_tp_size because we may need reduce-scatter across attn_tp dim.
-            # there is no reduce-scatter in LM logprob, so we do not need to adjust the padded length for logprob
+            # # make sure that the padded length is divisible by attn_tp_size because we may need reduce-scatter across attn_tp dim.
+            # # there is no reduce-scatter in LM logprob, so we do not need to adjust the padded length for logprob
             global_num_tokens[i] = ceil_align(global_num_tokens[i], attn_tp_size)
+            # assert global_num_tokens[i] % attn_tp_size == 0
 
         dp_padding_mode = DpPaddingMode.get_dp_padding_mode(
             self.is_extend_in_batch, global_num_tokens

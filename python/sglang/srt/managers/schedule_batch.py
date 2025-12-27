@@ -1133,6 +1133,13 @@ class Req:
         )
 
 
+"""
+class DummyReq(Req):
+    def __init__(self, rid: str):
+        super().__init__(rid=rid, origin_input_text="", origin_input_ids=[0], sampling_params=SamplingParams(max_new_tokens=1), return_logprob=False, eos_token_ids={0})
+"""
+
+
 @dataclasses.dataclass
 class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     """Store all information of a batch on the scheduler."""
@@ -1184,6 +1191,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     orig_seq_lens: torch.Tensor = None  # shape: [b], int32
 
     # For DP attention
+    non_padded_batch_size: Optional[int] = None
+    non_padded_token_cnt: Optional[int] = None
     inner_idle_batch: Optional[ScheduleBatch] = None
     global_num_tokens: Optional[List[int]] = None
     global_num_tokens_for_logprob: Optional[List[int]] = None
@@ -1201,7 +1210,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     temp_scaled_logprobs: bool = False
     top_p_normalized_logprobs: bool = False
 
-    # For extend and mixed chunekd prefill
+    # For extend and mixed chunked prefill
     prefix_lens: List[int] = None
     extend_lens: List[int] = None
     extend_num_tokens: Optional[int] = None
@@ -1311,6 +1320,34 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def is_dllm(self):
         return self.dllm_config is not None
 
+    def add_dummy_reqs(self, num_dummy_reqs: int):
+        eos_token_id = self.model_config.hf_config.eos_token_id
+        self.reqs.extend(
+            [
+                Req(
+                    rid=f"dummy_{i}",
+                    origin_input_text="",
+                    origin_input_ids=[eos_token_id],
+                    sampling_params=SamplingParams(max_new_tokens=1),
+                    return_logprob=False,
+                    eos_token_ids={eos_token_id},
+                )
+                for i in range(num_dummy_reqs)
+            ]
+        )
+        if self.spec_info is not None:
+            raise NotImplementedError()
+
+    def remove_dummy_reqs(self):
+        if self.forward_mode.is_idle():
+            self.reqs = []
+        else:
+            assert self.non_padded_batch_size is not None
+            assert self.non_padded_token_cnt is not None
+            self.reqs = self.reqs[: self.non_padded_batch_size]
+        if self.spec_info is not None:
+            raise NotImplementedError()
+
     def prepare_encoder_info_extend(self, input_ids: List[int], seq_lens: List[int]):
         self.encoder_lens_cpu = []
         self.encoder_cached = []
@@ -1388,7 +1425,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def prepare_for_extend(self):
 
         if self.forward_mode is not None:
-            assert self.forward_mode in [ForwardMode.EXTEND, ForwardMode.DLLM_EXTEND]
+            assert self.forward_mode.is_extend()
         else:
             if self.is_dllm():
                 # For DLLM, we use a separate forward mode
@@ -1843,7 +1880,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.encoder_cached = [True] * len(self.reqs)
 
     def prepare_for_idle(self):
-        self.forward_mode = ForwardMode.IDLE
+        if self.forward_mode is not None:
+            assert self.forward_mode.is_idle()
+        else:
+            self.forward_mode = ForwardMode.IDLE
+
         self.input_ids = torch.empty(0, dtype=torch.int64, device=self.device)
         self.seq_lens = torch.empty(0, dtype=torch.int64, device=self.device)
         self.seq_lens_cpu = torch.empty(0, dtype=torch.int64)
@@ -1868,7 +1909,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             return
 
         if self.forward_mode is not None:
-            assert self.forward_mode == ForwardMode.DECODE
+            assert self.forward_mode.is_decode()
         else:
             self.forward_mode = ForwardMode.DECODE
 
@@ -2175,6 +2216,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             return_logprob=self.return_logprob,
             decoding_reqs=self.decoding_reqs,
             spec_algorithm=self.spec_algorithm,
+            non_padded_batch_size=self.non_padded_batch_size,
+            non_padded_token_cnt=self.non_padded_token_cnt,
             global_num_tokens=self.global_num_tokens,
             global_num_tokens_for_logprob=self.global_num_tokens_for_logprob,
             can_run_dp_cuda_graph=self.can_run_dp_cuda_graph,
