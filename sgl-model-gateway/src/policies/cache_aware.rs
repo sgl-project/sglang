@@ -87,6 +87,7 @@ use crate::core::Worker;
 pub struct CacheAwarePolicy {
     config: CacheAwareConfig,
     trees: Arc<DashMap<String, Arc<Tree>>>,
+    url_to_index: DashMap<String, usize>,
     /// Handle to the background eviction thread
     eviction_handle: Option<thread::JoinHandle<()>>,
     /// Flag to signal the eviction thread to stop
@@ -100,6 +101,7 @@ impl CacheAwarePolicy {
 
     pub fn with_config(config: CacheAwareConfig) -> Self {
         let trees = Arc::new(DashMap::<String, Arc<Tree>>::new());
+        let url_to_index = DashMap::new();
         let shutdown_flag = Arc::new(AtomicBool::new(false));
 
         // Start background eviction thread if configured
@@ -152,6 +154,7 @@ impl CacheAwarePolicy {
         Self {
             config,
             trees,
+            url_to_index,
             eviction_handle,
             shutdown_flag,
         }
@@ -160,8 +163,13 @@ impl CacheAwarePolicy {
     /// Initialize the tree with worker URLs (used only during initial setup)
     pub fn init_workers(&self, workers: &[Arc<dyn Worker>]) {
         // Group workers by model
+        self.url_to_index.clear();
+        for (idx, worker) in workers.iter().enumerate() {
+            self.url_to_index.insert(worker.url().to_string(), idx);
+        }
         let mut model_workers: std::collections::HashMap<String, Vec<&Arc<dyn Worker>>> =
             std::collections::HashMap::new();
+
         for worker in workers {
             let tree_key = normalize_model_key(worker.model_id());
             model_workers
@@ -193,12 +201,13 @@ impl CacheAwarePolicy {
     }
 
     /// Add a worker by URL and model (for backward compatibility)
-    pub fn add_worker_by_url(&self, url: &str, model_id: &str) {
+    pub fn add_worker_by_url(&self, url: &str, model_id: &str, index: usize) {
         let tree = self
             .trees
             .entry(model_id.to_string())
             .or_insert_with(|| Arc::new(Tree::new()));
         tree.insert("", url);
+        self.url_to_index.insert(url.to_string(), index);
     }
 
     /// Remove a worker from the tree
@@ -207,6 +216,7 @@ impl CacheAwarePolicy {
         if let Some(tree) = self.trees.get(tree_key) {
             tree.remove_tenant(worker.url());
         }
+        self.url_to_index.remove(worker.url());
     }
 
     /// Remove a worker by URL (removes from all model trees for backward compatibility)
@@ -242,16 +252,16 @@ impl CacheAwarePolicy {
     ) -> Option<usize> {
         // Log load balancing trigger
         // TODO may use `&str`
-        let worker_loads: Vec<(String, usize)> = workers
-            .iter()
-            .map(|w| (w.url().to_string(), w.load()))
-            .collect();
-
-        // TODO may change text
-        debug!(
-            "Load balancing triggered | max: {} | min: {} | workers: {:?}",
-            max_load, min_load, worker_loads
-        );
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            let worker_loads: Vec<(String, usize)> = workers
+                .iter()
+                .map(|w| (w.url().to_string(), w.load()))
+                .collect();
+            debug!(
+                "Load balancing triggered | max: {} | min: {} | workers: {:?}",
+                max_load, min_load, worker_loads
+            )
+        }
 
         // Use shortest queue when imbalanced
         let min_load_idx = healthy_indices
@@ -331,22 +341,24 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
             let match_rate = if text.is_empty() {
                 0.0
             } else {
-                matched_text.chars().count() as f32 / text.chars().count() as f32
+                matched_text.len() as f32 / text.len() as f32
             };
 
-            let selected_url = if match_rate > self.config.cache_threshold {
-                matched_worker.to_string()
-            } else {
-                let min_load_idx = *healthy_indices
-                    .iter()
-                    .min_by_key(|&&idx| workers[idx].load())?;
-                workers[min_load_idx].url().to_string()
-            };
+            let selected_url: std::borrow::Cow<'_, str> =
+                if match_rate > self.config.cache_threshold {
+                    std::borrow::Cow::Owned(matched_worker)
+                } else {
+                    let min_idx = *healthy_indices
+                        .iter()
+                        .min_by_key(|&&idx| workers[idx].load())?;
+                    std::borrow::Cow::Borrowed(workers[min_idx].url())
+                };
 
             // Find the index of the selected worker
-            if let Some(selected_idx) = workers.iter().position(|w| w.url() == selected_url) {
+            if let Some(entry) = self.url_to_index.get(&*selected_url) {
+                let selected_idx = *entry.value();
                 // Only proceed if the worker is healthy
-                if workers[selected_idx].is_healthy() {
+                if selected_idx < workers.len() && workers[selected_idx].is_healthy() {
                     // Update the tree with this request
                     tree.insert(text, &selected_url);
 
@@ -358,7 +370,7 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
             } else {
                 // Selected worker no longer exists, remove it from tree
                 tree.remove_tenant(&selected_url);
-                debug!("Removed stale worker {} from cache tree", selected_url);
+                debug!("Removed stale worker {} from cache tree", &selected_url);
             }
 
             // Fallback to first healthy worker
