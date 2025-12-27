@@ -4,6 +4,14 @@
 
 import torch
 
+try:
+    from flash_attn_interface import flash_attn_varlen_func
+except ImportError as e:
+    raise ImportError(
+        "flash-attention library is required. Please install it with: "
+        "pip install flash-attn --no-build-isolation"
+    ) from e
+
 from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
     AttentionBackend,
     AttentionImpl,
@@ -11,7 +19,7 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend i
     AttentionMetadataBuilder,
 )
 from sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn import (
-    flash_attn_func,
+    _get_cu_seqlens,
 )
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -65,15 +73,26 @@ class FlashAttention2Impl(AttentionImpl):
         value: torch.Tensor,
         attn_metadata: AttentionMetadata,
     ):
-        output = flash_attn_func(
-            q=query,  # type: ignore[no-untyped-call]
-            k=key,
-            v=value,
-            cu_seqlens_q=None,
-            cu_seqlens_k=None,
-            max_seqlen_q=None,
-            max_seqlen_k=None,
+        bsz, seqlen, nheads_q, d = query.shape
+        bsz_k, seqlen_k, nheads_k, d_k = key.shape
+
+        q_ = query.contiguous().reshape(bsz * seqlen, nheads_q, d)
+        k_ = key.contiguous().reshape(bsz * seqlen_k, nheads_k, d_k)
+        v_ = value.contiguous().reshape(bsz * seqlen_k, nheads_k, value.shape[-1])
+
+        cu_seqlens_q = _get_cu_seqlens(q_.device.index, bsz, seqlen)
+        cu_seqlens_k = _get_cu_seqlens(k_.device.index, bsz, seqlen_k)
+
+        out = flash_attn_varlen_func(
+            q_,
+            k_,
+            v_,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            seqlen,
+            seqlen_k,
             softmax_scale=self.softmax_scale,
             causal=self.causal,
         )
-        return output
+
+        return out.reshape(bsz, seqlen, nheads_q, -1)
