@@ -228,11 +228,11 @@ class ServerArgs:
 
     # CPU offload parameters
     dit_cpu_offload: bool = True
-    use_fsdp_inference: bool = False
     dit_layerwise_offload: bool = False
     text_encoder_cpu_offload: bool = True
     image_encoder_cpu_offload: bool = True
     vae_cpu_offload: bool = True
+    use_fsdp_inference: bool = False
     pin_cpu_memory: bool = True
 
     # STA (Sliding Tile Attention) parameters
@@ -302,8 +302,19 @@ class ServerArgs:
         """
         return self.host is None or self.port is None
 
+    def adjust_offload(self):
+        if self.pipeline_config.task_type.is_image_gen():
+            logger.info("Turn off all offload for image generation model")
+            self.dit_cpu_offload = False
+            self.text_encoder_cpu_offload = True
+            self.image_encoder_cpu_offload = True
+            self.vae_cpu_offload = True
+
     def __post_init__(self):
         # Add randomization to avoid race condition when multiple servers start simultaneously
+
+        self.adjust_offload()
+
         if self.attention_backend in ["fa3", "fa4"]:
             self.attention_backend = "fa"
 
@@ -496,7 +507,7 @@ class ServerArgs:
             action=StoreBoolean,
             default=ServerArgs.enable_torch_compile,
             help="Use torch.compile to speed up DiT inference."
-            + "However, will likely cause precision drifts. See (https://github.com/pytorch/pytorch/issues/145213)",
+                 + "However, will likely cause precision drifts. See (https://github.com/pytorch/pytorch/issues/145213)",
         )
         parser.add_argument(
             "--dit-cpu-offload",
@@ -508,7 +519,7 @@ class ServerArgs:
             action=StoreBoolean,
             default=ServerArgs.dit_layerwise_offload,
             help="Enable layerwise CPU offload with async H2D prefetch overlap for supported DiT models (e.g., Wan). "
-            "Cannot be used together with cache-dit (SGLANG_CACHE_DIT_ENABLED), dit_cpu_offload, or use_fsdp_inference.",
+                 "Cannot be used together with cache-dit (SGLANG_CACHE_DIT_ENABLED), dit_cpu_offload, or use_fsdp_inference.",
         )
         parser.add_argument(
             "--use-fsdp-inference",
@@ -534,7 +545,7 @@ class ServerArgs:
             "--pin-cpu-memory",
             action=StoreBoolean,
             help='Pin memory for CPU offload. Only added as a temp workaround if it throws "CUDA error: invalid argument". '
-            "Should be enabled in almost all cases",
+                 "Should be enabled in almost all cases",
         )
         parser.add_argument(
             "--disable-autocast",

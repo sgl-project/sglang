@@ -26,7 +26,6 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import (
     globally_suppress_loggers,
     init_logger,
 )
-from sglang.multimodal_gen.runtime.utils.perf_logger import PerformanceLogger
 from sglang.multimodal_gen.runtime.utils.perf_logger import (
     PerformanceLogger,
     StageProfiler,
