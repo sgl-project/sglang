@@ -247,6 +247,9 @@ class BaseFormatDetector(ABC):
                 res = StreamingParseResult()
 
                 if cur_arguments:
+                    # Ensure streamed_args_for_tool is large enough
+                    while len(self.streamed_args_for_tool) <= self.current_tool_id:
+                        self.streamed_args_for_tool.append("")
                     # Calculate how much of the arguments we've already streamed
                     sent = len(self.streamed_args_for_tool[self.current_tool_id])
                     cur_args_json = json.dumps(cur_arguments)
