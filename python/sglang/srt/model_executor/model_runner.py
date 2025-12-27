@@ -2352,6 +2352,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 if forward_batch.forward_mode.is_decode()
                 else forward_batch.seq_lens - 1
             ),
+            forward_batch.is_beam_search,
         )
         return next_token_ids
 

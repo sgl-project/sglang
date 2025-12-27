@@ -26,6 +26,7 @@ import setproctitle
 import zmq
 
 from sglang.srt.environ import envs
+from sglang.srt.managers.beam_search_detokenizer_mixin import BeamSearchDetokenizerMixin
 from sglang.srt.managers.io_struct import (
     BatchEmbeddingOutput,
     BatchMultimodalDecodeReq,
@@ -70,7 +71,7 @@ class DecodeStatus:
     sent_offset: int = 0
 
 
-class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
+class DetokenizerManager(BeamSearchDetokenizerMixin, MultiHttpWorkerDetokenizerMixin):
     """DetokenizerManager is a process that detokenizes the token ids."""
 
     def __init__(
@@ -307,13 +308,18 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         return output_routed_experts
 
     def handle_batch_token_id_out(self, recv_obj: BatchTokenIDOutput):
-        # If handling idle batch, set output_strs to [].
-        output_strs = (
-            self._decode_batch_token_id_output(recv_obj)
-            if len(recv_obj.rids) > 0
-            else []
-        )
-        output_routed_experts = self._extract_routed_experts(recv_obj)
+        if self.is_beam_search_batch(recv_obj):
+            self.decode_beam_search_output(recv_obj)
+            output_strs = [""] * len(recv_obj.rids)
+            output_routed_experts = None
+        else:
+            # If handling idle batch, set output_strs to [].
+            output_strs = (
+                self._decode_batch_token_id_output(recv_obj)
+                if len(recv_obj.rids) > 0
+                else []
+            )
+            output_routed_experts = self._extract_routed_experts(recv_obj)
 
         return BatchStrOutput(
             rids=recv_obj.rids,
@@ -351,6 +357,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             prefill_launch_delay=recv_obj.prefill_launch_delay,
             prefill_launch_latency=recv_obj.prefill_launch_latency,
             prefill_finished_ts=recv_obj.prefill_finished_ts,
+            beam_search_output=recv_obj.beam_search_output,
         )
 
     def handle_multimodal_decode_req(self, recv_obj: BatchMultimodalDecodeReq):
