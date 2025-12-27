@@ -210,7 +210,10 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
         sampling_params.normalize(tokenizer=None)
 
         # Create health check request
-        is_generation = self.scheduler_info.get("is_generation", True)
+        is_generation = self.scheduler_info.get("is_generation")
+        if is_generation is None:
+            is_generation = not self.server_args.is_embedding
+
         if is_generation:
             health_req = TokenizedGenerateReqInput(
                 rid=rid,
@@ -229,6 +232,7 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
                 health_req.bootstrap_host = FAKE_BOOTSTRAP_HOST
                 health_req.bootstrap_room = 0
         else:
+            sampling_params.max_new_tokens = 0
             health_req = TokenizedEmbeddingReqInput(
                 rid=rid,
                 input_text="",
