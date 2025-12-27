@@ -778,7 +778,9 @@ def np_cache_weights_iterator(
 
 
 def decrypt(fn, key):
-    raise NotImplementedError()
+    raise NotImplementedError(
+        "Model decryption is not yet implemented. Please use unencrypted model weights."
+    )
 
 
 def safetensors_encrypted_weights_iterator(
@@ -786,7 +788,10 @@ def safetensors_encrypted_weights_iterator(
     is_all_weights_sharded: bool = False,
     decryption_key: Optional[str] = None,
 ):
-    raise NotImplementedError()
+    raise NotImplementedError(
+        "Loading encrypted safetensor weights is not yet implemented. "
+        "Please use unencrypted model weights."
+    )
 
 
 def safetensors_weights_iterator(

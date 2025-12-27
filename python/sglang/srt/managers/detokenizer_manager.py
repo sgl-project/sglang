@@ -301,7 +301,9 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         )
 
     def handle_multimodal_decode_req(self, recv_obj: BatchMultimodalDecodeReq):
-        raise NotImplementedError()
+        raise NotImplementedError(
+            "Multimodal decoding requests are not yet supported in the detokenizer manager"
+        )
 
     def handle_freeze_gc_req(self, recv_req: FreezeGCReq):
         freeze_gc("Detokenizer Manager")

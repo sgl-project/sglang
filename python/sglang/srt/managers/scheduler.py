@@ -2475,7 +2475,9 @@ class Scheduler(
                 req.to_finish = FINISH_ABORT()
 
     def _pause_engine(self) -> Tuple[List[Req], int]:
-        raise NotImplementedError()
+        raise NotImplementedError(
+            f"{self.__class__.__name__} must implement _pause_engine() to support pause/resume functionality"
+        )
 
     def pause_generation(self, recv_req: PauseGenerationReqInput):
         self._engine_paused = True

@@ -91,7 +91,11 @@ def get_hidden_dim(
             # if contain extra tokens will be added; otherwise is 0.
             return config.hidden_size, config.vocab_size + lora_added_vocab_size
         else:
-            raise NotImplementedError()
+            raise NotImplementedError(
+                f"LoRA module '{module_name}' is not supported. "
+                "Supported modules: q_proj, k_proj, v_proj, o_proj, qkv_proj, kv_proj, "
+                "gate_proj, up_proj, gate_up_proj, down_proj, embed_tokens, lm_head"
+            )
 
 
 def get_normalized_target_modules(
