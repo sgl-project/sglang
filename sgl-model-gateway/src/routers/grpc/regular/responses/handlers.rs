@@ -32,7 +32,7 @@
 //!       └─► pipeline.execute_chat_for_responses()
 //! ```
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Instant};
 
 use axum::{
     body::Body,
@@ -55,6 +55,7 @@ use crate::{
         self, ConversationId, ConversationItemStorage, ConversationStorage, ResponseId,
         ResponseStorage,
     },
+    observability::metrics::{metrics_labels, Metrics},
     protocols::{
         chat::{self, ChatCompletionStreamResponse},
         common::{self},
@@ -635,11 +636,30 @@ async fn load_conversation_history(
     // Handle previous_response_id by loading response chain
     if let Some(ref prev_id_str) = modified_request.previous_response_id {
         let prev_id = ResponseId::from(prev_id_str.as_str());
-        match ctx
+        let start = Instant::now();
+        let result = ctx
             .response_storage
             .get_response_chain(&prev_id, None)
-            .await
-        {
+            .await;
+        let duration = start.elapsed();
+
+        let result_label = match &result {
+            Ok(_) => metrics_labels::RESULT_SUCCESS,
+            Err(_) => metrics_labels::RESULT_ERROR,
+        };
+
+        Metrics::record_db_operation(
+            metrics_labels::STORAGE_RESPONSE,
+            metrics_labels::DB_OP_LIST,
+            result_label,
+        );
+        Metrics::record_db_operation_duration(
+            metrics_labels::STORAGE_RESPONSE,
+            metrics_labels::DB_OP_LIST,
+            duration,
+        );
+
+        match result {
             Ok(chain) => {
                 let mut items = Vec::new();
                 for stored in chain.responses.iter() {
@@ -694,22 +714,39 @@ async fn load_conversation_history(
         let conv_id = ConversationId::from(conv_id_str.as_str());
 
         // Check if conversation exists - return error if not found
-        let conversation = ctx
-            .conversation_storage
-            .get_conversation(&conv_id)
-            .await
-            .map_err(|e| {
-                error!(
-                    function = "load_conversation_history",
-                    conversation_id = %conv_id_str,
-                    error = %e,
-                    "Failed to check conversation existence in storage"
-                );
-                error::internal_error(
-                    "check_conversation_failed",
-                    format!("Failed to check conversation: {}", e),
-                )
-            })?;
+        let start = Instant::now();
+        let result = ctx.conversation_storage.get_conversation(&conv_id).await;
+        let duration = start.elapsed();
+
+        let result_label = match &result {
+            Ok(Some(_)) => metrics_labels::RESULT_SUCCESS,
+            Ok(None) => metrics_labels::RESULT_NOT_FOUND,
+            Err(_) => metrics_labels::RESULT_ERROR,
+        };
+
+        Metrics::record_db_operation(
+            metrics_labels::STORAGE_CONVERSATION,
+            metrics_labels::DB_OP_GET,
+            result_label,
+        );
+        Metrics::record_db_operation_duration(
+            metrics_labels::STORAGE_CONVERSATION,
+            metrics_labels::DB_OP_GET,
+            duration,
+        );
+
+        let conversation = result.map_err(|e| {
+            error!(
+                function = "load_conversation_history",
+                conversation_id = %conv_id_str,
+                error = %e,
+                "Failed to check conversation existence in storage"
+            );
+            error::internal_error(
+                "check_conversation_failed",
+                format!("Failed to check conversation: {}", e),
+            )
+        })?;
 
         if conversation.is_none() {
             return Err(error::not_found(
@@ -729,11 +766,30 @@ async fn load_conversation_history(
             after: None,
         };
 
-        match ctx
+        let start = Instant::now();
+        let list_result = ctx
             .conversation_item_storage
             .list_items(&conv_id, params)
-            .await
-        {
+            .await;
+        let duration = start.elapsed();
+
+        let result_label = match &list_result {
+            Ok(_) => metrics_labels::RESULT_SUCCESS,
+            Err(_) => metrics_labels::RESULT_ERROR,
+        };
+
+        Metrics::record_db_operation(
+            metrics_labels::STORAGE_CONVERSATION_ITEM,
+            metrics_labels::DB_OP_LIST,
+            result_label,
+        );
+        Metrics::record_db_operation_duration(
+            metrics_labels::STORAGE_CONVERSATION_ITEM,
+            metrics_labels::DB_OP_LIST,
+            duration,
+        );
+
+        match list_result {
             Ok(stored_items) => {
                 let mut items: Vec<ResponseInputOutputItem> = Vec::new();
                 for item in stored_items.into_iter() {

@@ -909,12 +909,32 @@ impl crate::routers::RouterTrait for OpenAIRouter {
         if let Some(conv_id_str) = body.conversation.clone() {
             let conv_id = ConversationId::from(conv_id_str.as_str());
 
-            if let Ok(None) = self
+            let start = Instant::now();
+            let result = self
                 .responses_components
                 .conversation_storage
                 .get_conversation(&conv_id)
-                .await
-            {
+                .await;
+            let duration = start.elapsed();
+
+            let result_label = match &result {
+                Ok(Some(_)) => metrics_labels::RESULT_SUCCESS,
+                Ok(None) => metrics_labels::RESULT_NOT_FOUND,
+                Err(_) => metrics_labels::RESULT_ERROR,
+            };
+
+            Metrics::record_db_operation(
+                metrics_labels::STORAGE_CONVERSATION,
+                metrics_labels::DB_OP_GET,
+                result_label,
+            );
+            Metrics::record_db_operation_duration(
+                metrics_labels::STORAGE_CONVERSATION,
+                metrics_labels::DB_OP_GET,
+                duration,
+            );
+
+            if let Ok(None) = result {
                 Metrics::record_router_error(
                     metrics_labels::ROUTER_OPENAI,
                     metrics_labels::BACKEND_EXTERNAL,
@@ -932,12 +952,31 @@ impl crate::routers::RouterTrait for OpenAIRouter {
                 after: None,
             };
 
-            match self
+            let start = Instant::now();
+            let list_result = self
                 .responses_components
                 .conversation_item_storage
                 .list_items(&conv_id, params)
-                .await
-            {
+                .await;
+            let duration = start.elapsed();
+
+            let result_label = match &list_result {
+                Ok(_) => metrics_labels::RESULT_SUCCESS,
+                Err(_) => metrics_labels::RESULT_ERROR,
+            };
+
+            Metrics::record_db_operation(
+                metrics_labels::STORAGE_CONVERSATION_ITEM,
+                metrics_labels::DB_OP_LIST,
+                result_label,
+            );
+            Metrics::record_db_operation_duration(
+                metrics_labels::STORAGE_CONVERSATION_ITEM,
+                metrics_labels::DB_OP_LIST,
+                duration,
+            );
+
+            match list_result {
                 Ok(stored_items) => {
                     let mut items: Vec<ResponseInputOutputItem> = Vec::new();
                     for item in stored_items.into_iter() {
@@ -1103,12 +1142,32 @@ impl crate::routers::RouterTrait for OpenAIRouter {
         _params: &ResponsesGetParams,
     ) -> Response {
         let id = ResponseId::from(response_id);
-        match self
+        let start = Instant::now();
+        let result = self
             .responses_components
             .response_storage
             .get_response(&id)
-            .await
-        {
+            .await;
+        let duration = start.elapsed();
+
+        let result_label = match &result {
+            Ok(Some(_)) => metrics_labels::RESULT_SUCCESS,
+            Ok(None) => metrics_labels::RESULT_NOT_FOUND,
+            Err(_) => metrics_labels::RESULT_ERROR,
+        };
+
+        Metrics::record_db_operation(
+            metrics_labels::STORAGE_RESPONSE,
+            metrics_labels::DB_OP_GET,
+            result_label,
+        );
+        Metrics::record_db_operation_duration(
+            metrics_labels::STORAGE_RESPONSE,
+            metrics_labels::DB_OP_GET,
+            duration,
+        );
+
+        match result {
             Ok(Some(stored)) => {
                 let mut response_json = stored.raw_response;
                 if let Some(obj) = response_json.as_object_mut() {
@@ -1128,12 +1187,32 @@ impl crate::routers::RouterTrait for OpenAIRouter {
     ) -> Response {
         let resp_id = ResponseId::from(response_id);
 
-        match self
+        let start = Instant::now();
+        let result = self
             .responses_components
             .response_storage
             .get_response(&resp_id)
-            .await
-        {
+            .await;
+        let duration = start.elapsed();
+
+        let result_label = match &result {
+            Ok(Some(_)) => metrics_labels::RESULT_SUCCESS,
+            Ok(None) => metrics_labels::RESULT_NOT_FOUND,
+            Err(_) => metrics_labels::RESULT_ERROR,
+        };
+
+        Metrics::record_db_operation(
+            metrics_labels::STORAGE_RESPONSE,
+            metrics_labels::DB_OP_GET,
+            result_label,
+        );
+        Metrics::record_db_operation_duration(
+            metrics_labels::STORAGE_RESPONSE,
+            metrics_labels::DB_OP_GET,
+            duration,
+        );
+
+        match result {
             Ok(Some(stored)) => {
                 let items = stored.input.as_array().cloned().unwrap_or_default();
 

@@ -1589,25 +1589,44 @@ async fn load_previous_messages(
     let prev_id = ResponseId::from(prev_id_str.as_str());
 
     // Load response chain from storage
-    let chain = ctx
+    let start = Instant::now();
+    let result = ctx
         .response_storage
         .get_response_chain(&prev_id, None)
-        .await
-        .map_err(|e| {
-            error!(
-                function = "load_previous_messages",
-                prev_id = %prev_id_str,
-                error = %e,
-                "Failed to load previous response chain from storage"
-            );
-            error::internal_error(
-                "load_previous_response_chain_failed",
-                format!(
-                    "Failed to load previous response chain for {}: {}",
-                    prev_id_str, e
-                ),
-            )
-        })?;
+        .await;
+    let duration = start.elapsed();
+
+    let result_label = match &result {
+        Ok(_) => metrics_labels::RESULT_SUCCESS,
+        Err(_) => metrics_labels::RESULT_ERROR,
+    };
+
+    Metrics::record_db_operation(
+        metrics_labels::STORAGE_RESPONSE,
+        metrics_labels::DB_OP_LIST,
+        result_label,
+    );
+    Metrics::record_db_operation_duration(
+        metrics_labels::STORAGE_RESPONSE,
+        metrics_labels::DB_OP_LIST,
+        duration,
+    );
+
+    let chain = result.map_err(|e| {
+        error!(
+            function = "load_previous_messages",
+            prev_id = %prev_id_str,
+            error = %e,
+            "Failed to load previous response chain from storage"
+        );
+        error::internal_error(
+            "load_previous_response_chain_failed",
+            format!(
+                "Failed to load previous response chain for {}: {}",
+                prev_id_str, e
+            ),
+        )
+    })?;
 
     // Build conversation history from stored responses
     let mut history_items = Vec::new();
