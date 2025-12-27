@@ -322,6 +322,7 @@ class ServerArgs:
                     "Failed to load V-MoBA config from %s: %s", self.moba_config_path, e
                 )
                 raise
+
         self.check_server_args()
 
         configure_logger(server_args=self)

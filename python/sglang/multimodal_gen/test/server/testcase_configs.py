@@ -124,6 +124,8 @@ class DiffusionServerArgs:
     ring_degree: int | None = None
     # LoRA
     lora_path: str | None = None  # LoRA adapter path (HF repo or local path)
+    # torch compile
+    enable_torch_compile: bool = False  # enable torch.compile optimization
 
 
 @dataclass(frozen=True)
@@ -268,6 +270,7 @@ ONE_GPU_CASES_A: list[DiffusionTestCase] = [
             modality="image",
             warmup_text=1,
             warmup_edit=0,
+            enable_torch_compile=True,
         ),
         T2I_sampling_params,
     ),

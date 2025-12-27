@@ -80,6 +80,10 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
     if server_args.lora_path:
         extra_args += f" --lora-path {server_args.lora_path}"
 
+    # torch compile support
+    if server_args.enable_torch_compile:
+        extra_args += " --enable-torch-compile"
+
     # start server
     manager = ServerManager(
         model=server_args.model_path,
