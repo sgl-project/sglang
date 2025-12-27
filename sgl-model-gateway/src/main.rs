@@ -137,7 +137,7 @@ struct CliArgs {
     #[arg(long, num_args = 0..)]
     worker_urls: Vec<String>,
 
-    #[arg(long, default_value = "cache_aware", value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "manual"])]
+    #[arg(long, default_value = "cache_aware", value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "prefix_hash", "manual"])]
     policy: String,
 
     #[arg(long, default_value_t = false)]
@@ -146,10 +146,10 @@ struct CliArgs {
     #[arg(long, action = ArgAction::Append)]
     decode: Vec<String>,
 
-    #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "manual"])]
+    #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "prefix_hash", "manual"])]
     prefill_policy: Option<String>,
 
-    #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "manual"])]
+    #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "prefix_hash", "manual"])]
     decode_policy: Option<String>,
 
     #[arg(long, default_value_t = 1800)]
@@ -172,6 +172,14 @@ struct CliArgs {
 
     #[arg(long, default_value_t = 67108864)]
     max_tree_size: usize,
+
+    /// Number of prefix tokens to use for prefix_hash policy (default: 256)
+    #[arg(long, default_value_t = 256)]
+    prefix_token_count: usize,
+
+    /// Load factor threshold for prefix_hash policy (default: 1.25)
+    #[arg(long, default_value_t = 1.25)]
+    prefix_hash_load_factor: f64,
 
     #[arg(long, default_value_t = 536870912)]
     max_payload_size: usize,
@@ -548,6 +556,10 @@ impl CliArgs {
             },
             "power_of_two" => PolicyConfig::PowerOfTwo {
                 load_check_interval_secs: 5,
+            },
+            "prefix_hash" => PolicyConfig::PrefixHash {
+                prefix_token_count: self.prefix_token_count,
+                load_factor: self.prefix_hash_load_factor,
             },
             "manual" => PolicyConfig::Manual,
             _ => PolicyConfig::RoundRobin,
