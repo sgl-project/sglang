@@ -465,6 +465,7 @@ class EagleDraftWorker(BaseDraftWorker):
 
         # Run forward
         forward_batch = ForwardBatch.init_new(batch, self.draft_runner)
+        forward_batch.return_logprob = False
         logits_output = self.draft_runner.forward(forward_batch).logits_output
 
         # Update spec_info for the next draft step
