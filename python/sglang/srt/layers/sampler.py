@@ -77,10 +77,9 @@ class Sampler(nn.Module):
             sampling_info: Metadata for sampling
             return_logprob: If set, store the output logprob information to
                 logits_output
-            top_logprobs_nums: Number of top lobprobs per sequence in a batch
-            batch_next_token_ids: next token IDs. If set, skip sampling and only
-                compute output logprobs It is used for speculative decoding which
-                performs sampling in draft workers.
+            top_logprobs_nums: Number of top logprobs per sequence in a batch
+            token_ids_logprobs: List of token IDs per sequence for which to compute
+                logprobs. Used to get logprobs for specific tokens of interest.
             positions: The positions of the tokens in the sequence. Used for deterministic sampling
                 to get the unique seed for each position.
         """
