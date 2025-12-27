@@ -279,6 +279,48 @@ class CompletionRequest(BaseModel):
             raise ValueError("max_tokens must be positive")
         return v
 
+    @field_validator("n")
+    @classmethod
+    def validate_n_positive(cls, v):
+        if v is not None and v < 1:
+            raise ValueError("n must be at least 1")
+        return v
+
+    @field_validator("logprobs")
+    @classmethod
+    def validate_logprobs_range(cls, v):
+        if v is not None and (v < 0 or v > 5):
+            raise ValueError("logprobs must be between 0 and 5")
+        return v
+
+    @field_validator("temperature")
+    @classmethod
+    def validate_temperature_range(cls, v):
+        if v is not None and v < 0:
+            raise ValueError("temperature must be non-negative")
+        return v
+
+    @field_validator("top_p")
+    @classmethod
+    def validate_top_p_range(cls, v):
+        if v is not None and (v < 0 or v > 1):
+            raise ValueError("top_p must be between 0 and 1")
+        return v
+
+    @field_validator("frequency_penalty")
+    @classmethod
+    def validate_frequency_penalty_range(cls, v):
+        if v is not None and (v < -2.0 or v > 2.0):
+            raise ValueError("frequency_penalty must be between -2.0 and 2.0")
+        return v
+
+    @field_validator("presence_penalty")
+    @classmethod
+    def validate_presence_penalty_range(cls, v):
+        if v is not None and (v < -2.0 or v > 2.0):
+            raise ValueError("presence_penalty must be between -2.0 and 2.0")
+        return v
+
 
 class CompletionResponseChoice(BaseModel):
     index: int
@@ -545,6 +587,55 @@ class ChatCompletionRequest(BaseModel):
         "min_p": 0.0,
         "repetition_penalty": 1.0,
     }
+
+    @field_validator("n")
+    @classmethod
+    def validate_n_positive(cls, v):
+        if v is not None and v < 1:
+            raise ValueError("n must be at least 1")
+        return v
+
+    @field_validator("top_logprobs")
+    @classmethod
+    def validate_top_logprobs_range(cls, v):
+        if v is not None and (v < 0 or v > 20):
+            raise ValueError("top_logprobs must be between 0 and 20")
+        return v
+
+    @field_validator("max_completion_tokens")
+    @classmethod
+    def validate_max_completion_tokens_positive(cls, v):
+        if v is not None and v <= 0:
+            raise ValueError("max_completion_tokens must be positive")
+        return v
+
+    @field_validator("temperature")
+    @classmethod
+    def validate_temperature_range(cls, v):
+        if v is not None and v < 0:
+            raise ValueError("temperature must be non-negative")
+        return v
+
+    @field_validator("top_p")
+    @classmethod
+    def validate_top_p_range(cls, v):
+        if v is not None and (v < 0 or v > 1):
+            raise ValueError("top_p must be between 0 and 1")
+        return v
+
+    @field_validator("frequency_penalty")
+    @classmethod
+    def validate_frequency_penalty_range(cls, v):
+        if v is not None and (v < -2.0 or v > 2.0):
+            raise ValueError("frequency_penalty must be between -2.0 and 2.0")
+        return v
+
+    @field_validator("presence_penalty")
+    @classmethod
+    def validate_presence_penalty_range(cls, v):
+        if v is not None and (v < -2.0 or v > 2.0):
+            raise ValueError("presence_penalty must be between -2.0 and 2.0")
+        return v
 
     @model_validator(mode="before")
     @classmethod
