@@ -6,6 +6,7 @@ mod test_pd_routing {
         config::{PolicyConfig, RouterConfig, RoutingMode},
         core::{BasicWorkerBuilder, Worker, WorkerType},
         routers::{http::pd_types::PDSelectionPolicy, RouterFactory},
+        tokenizer::registry::TokenizerRegistry,
     };
 
     #[derive(Debug)]
@@ -256,7 +257,7 @@ mod test_pd_routing {
                         .router_config(config)
                         .client(client)
                         .rate_limiter(rate_limiter)
-                        .tokenizer(None) // tokenizer
+                        .tokenizer_registry(Arc::new(TokenizerRegistry::new())) // tokenizer
                         .reasoning_parser_factory(None) // reasoning_parser_factory
                         .tool_parser_factory(None) // tool_parser_factory
                         .worker_registry(worker_registry)

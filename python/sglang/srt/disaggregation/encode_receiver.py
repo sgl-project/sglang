@@ -4,14 +4,16 @@ import pickle
 import random
 import threading
 import uuid
-from typing import List
+from typing import List, Optional
 
 import aiohttp
 import torch
 import zmq
 import zmq.asyncio
+from transformers import PretrainedConfig
 
 from sglang.srt.disaggregation.mooncake.transfer_engine import MooncakeTransferEngine
+from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.managers.io_struct import TokenizedGenerateReqInput
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
 from sglang.srt.server_args import ServerArgs
@@ -89,7 +91,6 @@ class WaitingImageRequest:
         encoder_urls,
         host_name,
         receive_count,
-        embedding_port=None,
     ):
         self.rid = rid
         self.recv_req = recv_req
@@ -209,10 +210,11 @@ class MMReceiver:
     def __init__(
         self,
         server_args: ServerArgs,
-        dtype=None,
-        hf_config=None,
-        pp_rank=None,
-        tp_rank=None,
+        dtype: Optional[torch.dtype] = None,
+        hf_config: Optional[PretrainedConfig] = None,
+        pp_rank: Optional[int] = None,
+        tp_rank: Optional[int] = None,
+        tp_group: Optional[GroupCoordinator] = None,
     ):
         self.context = zmq.asyncio.Context(20)
         self.encoder_transfer_backend = server_args.encoder_transfer_backend
@@ -231,9 +233,9 @@ class MMReceiver:
             self.pp_rank = pp_rank
             self.tp_rank = tp_rank
             self.tp_size = server_args.tp_size
+            self.tp_group = tp_group
             self.nnodes = server_args.nnodes
             self.hostname = get_local_ip_auto()
-            self.world_size = server_args.pp_size * server_args.tp_size
             self.waiting_list: List[WaitingImageRequest] = []
             if hf_config is not None:
                 transport_mode = _determine_tensor_transport_mode(server_args)
@@ -270,27 +272,19 @@ class MMReceiver:
     def process_waiting_requests(self, recv_reqs):
         new_recv_reqs = []
         for recv_req in recv_reqs:
-            # E Disaggregation
             if (
                 isinstance(recv_req, TokenizedGenerateReqInput)
                 and recv_req.need_wait_for_image is True
             ):
-                embedding_port = None
-                if recv_req.embedding_ports is not None:
-                    embedding_port = recv_req.embedding_ports[
-                        self.tp_size * self.pp_rank + self.tp_rank
-                    ]
                 waiting_req = WaitingImageRequest(
                     rid=recv_req.rid,
                     recv_req=recv_req,
                     mm_processor=self.mm_processor,
                     encoder_urls=self.encode_urls,
                     host_name=self.hostname,
-                    receive_count=self.world_size,
-                    embedding_port=embedding_port,
+                    receive_count=self.tp_size,
                 )
-                if recv_req.embedding_ports is None:
-                    waiting_req.send_encode_request()
+                waiting_req.send_encode_request()
                 self.waiting_list.append(waiting_req)
             else:
                 new_recv_reqs.append(recv_req)
@@ -303,9 +297,13 @@ class MMReceiver:
             waiting_req._try_recv_mm_data()
             local_status.append(waiting_req.ready)
 
-        local_status = torch.tensor(local_status, device="cuda", dtype=torch.int32)
+        local_status = torch.tensor(local_status, device="cpu", dtype=torch.int32)
 
-        torch.distributed.all_reduce(local_status, op=torch.distributed.ReduceOp.MIN)
+        torch.distributed.all_reduce(
+            local_status,
+            op=torch.distributed.ReduceOp.MIN,
+            group=self.tp_group.cpu_group,
+        )
 
         new_waiting = []
         for i, waiting_req in enumerate(self.waiting_list):
@@ -465,7 +463,6 @@ class MMReceiver:
             obj.num_items_assigned = [
                 (idx + len(image_urls)) // len(self.encode_urls) for idx in encode_idx
             ]
-            obj.embedding_ports = None
             encode_thread = threading.Thread(
                 target=self._run_encode_in_thread,
                 args=(
@@ -473,7 +470,7 @@ class MMReceiver:
                     image_urls,
                     "encode",
                     obj.num_items_assigned,
-                    obj.embedding_ports,
+                    None,
                 ),
                 daemon=True,
             )

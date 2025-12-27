@@ -180,6 +180,21 @@ impl SglangSchedulerClient {
         ))
     }
 
+    /// Submit an embedding request
+    pub async fn embed(
+        &self,
+        req: proto::EmbedRequest,
+    ) -> Result<proto::EmbedResponse, Box<dyn std::error::Error + Send + Sync>> {
+        let mut client = self.client.clone();
+        let mut request = Request::new(req);
+
+        // Inject W3C trace context into gRPC metadata
+        inject_trace_context_grpc(request.metadata_mut());
+
+        let response = client.embed(request).await?;
+        Ok(response.into_inner())
+    }
+
     /// Perform health check
     pub async fn health_check(
         &self,
@@ -244,6 +259,25 @@ impl SglangSchedulerClient {
         let response = client.get_server_info(request).await?;
         debug!("Server info response received");
         Ok(response.into_inner())
+    }
+
+    /// Build a single SGLang EmbedRequest
+    pub fn build_embed_request(
+        &self,
+        request_id: String,
+        original_text: Option<String>,
+        token_ids: Vec<u32>,
+        log_metrics: Option<bool>,
+    ) -> proto::EmbedRequest {
+        proto::EmbedRequest {
+            request_id,
+            tokenized: Some(proto::TokenizedInput {
+                original_text: original_text.unwrap_or_default(),
+                input_ids: token_ids,
+            }),
+            log_metrics: log_metrics.unwrap_or(false), // Default to false if not specified
+            ..Default::default()
+        }
     }
 
     /// Build a single SGLang GenerateRequest from OpenAI ChatCompletionRequest

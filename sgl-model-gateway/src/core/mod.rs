@@ -9,6 +9,9 @@
 //! - Workflow steps for multi-step operations
 //! - Common utilities
 
+// Re-export UNKNOWN_MODEL_ID from protocols for use throughout core
+pub use crate::protocols::UNKNOWN_MODEL_ID;
+
 pub mod circuit_breaker;
 pub mod error;
 pub mod job_queue;

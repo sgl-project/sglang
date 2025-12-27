@@ -2,7 +2,10 @@
 Mixin class providing multiplexing scheduling logic
 """
 
+from __future__ import annotations
+
 import logging
+from typing import TYPE_CHECKING
 
 import torch
 import torch.distributed as dist
@@ -19,12 +22,15 @@ from sglang.srt.multiplex.pdmux_context import (
     set_current_stream_idx,
 )
 
+if TYPE_CHECKING:
+    from sglang.srt.managers.scheduler import Scheduler
+
 logger = logging.getLogger(__name__)
 
 
 class SchedulerMultiplexMixin:
 
-    def init_pdmux(self):
+    def init_pdmux(self: Scheduler):
         # for pd_multiplexing, Init stream_groups, exclude normal stream for prefill only and decode only
         self.pdmux_config = load_pdmux_config(self.server_args.pdmux_config_path)
         initialize_stream_groups(self.gpu_id, self.pdmux_config)
@@ -36,7 +42,9 @@ class SchedulerMultiplexMixin:
         )
 
     # TODO(jason-fxz): This is a temporary demo
-    def adjust_stream_groups(self) -> tuple[int, tuple[ExternalStream, ExternalStream]]:
+    def adjust_stream_groups(
+        self: Scheduler,
+    ) -> tuple[int, tuple[ExternalStream, ExternalStream]]:
         if not self.running_batch.is_empty() and self.split_prefill_batch:
             decode_bs = self.running_batch.batch_size()
             manual_divisions = self.pdmux_config.manual_divisions
@@ -66,7 +74,7 @@ class SchedulerMultiplexMixin:
         self.tp_worker.model_runner.update_decode_attn_backend(stream_idx)
         return stream_idx, self.stream_groups[stream_idx]
 
-    def update_split_prefill_batch(self, sm_count: int) -> bool:
+    def update_split_prefill_batch(self: Scheduler, sm_count: int) -> bool:
         if self.split_prefill_batch:
             return False
 
@@ -81,7 +89,7 @@ class SchedulerMultiplexMixin:
         return False
 
     @torch.inference_mode()
-    def event_loop_pdmux(self):
+    def event_loop_pdmux(self: Scheduler):
         """A scheduler loop for pd multiplexing."""
         decode_done = False
         prefill_done = False

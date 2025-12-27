@@ -299,6 +299,9 @@ class PipelineConfig:
 
         return shape
 
+    def allow_set_num_frames(self):
+        return False
+
     def get_decode_scale_and_shift(self, device, dtype, vae):
         vae_arch_config = self.vae_config.arch_config
         scaling_factor = getattr(vae_arch_config, "scaling_factor", None)

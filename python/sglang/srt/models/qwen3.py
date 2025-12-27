@@ -167,10 +167,10 @@ class Qwen3Attention(nn.Module):
         q, k = self.rotary_emb(positions, q, k)
         return q, k, v
 
-    def forward_prepare_npu(self, positions, hidden_states):
+    def forward_prepare_npu(self, positions, hidden_states, forward_batch):
         qkv, _ = self.qkv_proj(hidden_states)
 
-        if self.attn.layer_id == 0:
+        if self.attn.layer_id == forward_batch.token_to_kv_pool.start_layer:
             self.rotary_emb.get_cos_sin_with_position(positions)
         q, k, v = split_qkv_rmsnorm_rope(
             qkv,
@@ -205,6 +205,7 @@ class Qwen3Attention(nn.Module):
             q, k, v = self.forward_prepare_npu(
                 positions=positions,
                 hidden_states=hidden_states,
+                forward_batch=forward_batch,
             )
 
         if get_global_server_args().rl_on_policy_target is not None:

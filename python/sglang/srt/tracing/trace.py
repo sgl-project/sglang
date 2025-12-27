@@ -211,6 +211,7 @@ def process_tracing_init(otlp_endpoint, server_name):
     global tracing_enabled
     global __get_cur_time_ns
     if not opentelemetry_imported:
+        logger.warning(f"Tracing is disabled because the packages cannot be imported.")
         tracing_enabled = False
         return
 
@@ -239,8 +240,9 @@ def process_tracing_init(otlp_endpoint, server_name):
         tracer_provider.add_span_processor(processor)
         trace.set_tracer_provider(tracer_provider)
     except Exception as e:
-        logger.error(f": initialize opentelemetry error:{e}")
-        logger.warning("pelease set correct otlp endpoint")
+        logger.error(
+            f"Initialize OpenTelemetry error: {e}. Please set correct otlp endpoint."
+        )
         tracing_enabled = False
         return
 
