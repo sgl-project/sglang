@@ -279,6 +279,20 @@ class CompletionRequest(BaseModel):
             raise ValueError("max_tokens must be positive")
         return v
 
+    @field_validator("n")
+    @classmethod
+    def validate_n_positive(cls, v):
+        if v is not None and v < 1:
+            raise ValueError("n must be at least 1")
+        return v
+
+    @field_validator("logprobs")
+    @classmethod
+    def validate_logprobs_range(cls, v):
+        if v is not None and (v < 0 or v > 5):
+            raise ValueError("logprobs must be between 0 and 5")
+        return v
+
 
 class CompletionResponseChoice(BaseModel):
     index: int
@@ -545,6 +559,20 @@ class ChatCompletionRequest(BaseModel):
         "min_p": 0.0,
         "repetition_penalty": 1.0,
     }
+
+    @field_validator("n")
+    @classmethod
+    def validate_n_positive(cls, v):
+        if v is not None and v < 1:
+            raise ValueError("n must be at least 1")
+        return v
+
+    @field_validator("top_logprobs")
+    @classmethod
+    def validate_top_logprobs_range(cls, v):
+        if v is not None and (v < 0 or v > 20):
+            raise ValueError("top_logprobs must be between 0 and 20")
+        return v
 
     @model_validator(mode="before")
     @classmethod
