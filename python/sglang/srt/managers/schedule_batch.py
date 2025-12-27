@@ -1492,7 +1492,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             #    and prefix_indices are the cached/shared prefix tokens)
             #
             if req.logprob_start_len == -1:
-                req.extend_logprob_start_len = len(req.fill_ids) - 1
+                req.extend_logprob_start_len = len(req.fill_ids) - 1 - pre_len
             elif req.logprob_start_len >= pre_len:
                 # Convert absolute logprob_start_len to relative extend_logprob_start_len
                 #
