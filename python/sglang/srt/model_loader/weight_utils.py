@@ -368,30 +368,6 @@ def _find_local_hf_snapshot_dir_unlocked(
         return None
 
 
-def find_local_hf_snapshot_dir(
-    model_name_or_path: str,
-    cache_dir: Optional[str],
-    allow_patterns: List[str],
-    revision: Optional[str] = None,
-) -> Optional[str]:
-    """If the weights are already local, skip downloading and returns the path.
-
-    This function acquires a lock to prevent race conditions during validation
-    and cleanup. For use within download_weights_from_hf, use
-    _find_local_hf_snapshot_dir_unlocked instead with an external lock.
-    """
-    # For local paths, no locking needed
-    if os.path.isdir(model_name_or_path):
-        return None
-
-    # Use file lock to prevent multiple processes (TP ranks) from
-    # validating and cleaning up the same model cache simultaneously.
-    with get_lock(model_name_or_path, cache_dir):
-        return _find_local_hf_snapshot_dir_unlocked(
-            model_name_or_path, cache_dir, allow_patterns, revision
-        )
-
-
 def download_weights_from_hf(
     model_name_or_path: str,
     cache_dir: Optional[str],

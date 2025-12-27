@@ -31,6 +31,7 @@ from transformers import (
 )
 
 from sglang.srt.entrypoints.engine import Engine
+from sglang.srt.model_loader.ci_weight_validation import ci_validate_and_clean_hf_cache
 from sglang.srt.utils import is_npu, load_image
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 from sglang.test.test_utils import DEFAULT_PORT_FOR_SRT_TEST_RUNNER, calculate_rouge_l
@@ -253,10 +254,6 @@ class HFRunner:
 
         # Validate and clean corrupted files in HF cache (CI only)
         # This is needed because HFRunner bypasses SGLang's weight validation
-        from sglang.srt.model_loader.ci_weight_validation import (
-            ci_validate_and_clean_hf_cache,
-        )
-
         ci_validate_and_clean_hf_cache(model_path)
 
         # Load the model and tokenizer
