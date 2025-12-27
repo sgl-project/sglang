@@ -34,8 +34,6 @@ from sglang.multimodal_gen.utils import FlexibleArgumentParser, StoreBoolean
 
 logger = init_logger(__name__)
 
-ZMQ_TCP_PORT_DELTA = 233
-
 
 def _is_torch_tensor(obj: Any) -> tuple[bool, Any]:
     """Return (is_tensor, torch_module_or_None) without importing torch at module import time."""
@@ -304,20 +302,20 @@ class ServerArgs:
 
     def adjust_offload(self):
         if self.pipeline_config.task_type.is_image_gen():
-            logger.info("Turn off all offload for image generation model")
+            logger.info("Turn off all offloading for image generation model")
             self.dit_cpu_offload = False
-            self.text_encoder_cpu_offload = True
-            self.image_encoder_cpu_offload = True
-            self.vae_cpu_offload = True
+            self.text_encoder_cpu_offload = False
+            self.image_encoder_cpu_offload = False
+            self.vae_cpu_offload = False
 
     def __post_init__(self):
-        # Add randomization to avoid race condition when multiple servers start simultaneously
 
         self.adjust_offload()
 
         if self.attention_backend in ["fa3", "fa4"]:
             self.attention_backend = "fa"
 
+        # Add randomization to avoid race condition when multiple servers start simultaneously
         initial_scheduler_port = self.scheduler_port + random.randint(0, 100)
         self.scheduler_port = self.settle_port(initial_scheduler_port)
         # TODO: remove hard code
