@@ -16,7 +16,6 @@ mod random;
 mod registry;
 mod round_robin;
 pub mod tree;
-
 pub use bucket::BucketPolicy;
 pub use cache_aware::CacheAwarePolicy;
 pub use factory::PolicyFactory;
@@ -25,6 +24,7 @@ pub use power_of_two::PowerOfTwoPolicy;
 pub use random::RandomPolicy;
 pub use registry::PolicyRegistry;
 pub use round_robin::RoundRobinPolicy;
+pub use tree::PrefixMatchResult;
 
 /// Core trait for load balancing policies
 ///

@@ -327,15 +327,16 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
 
         if let Some(tree) = tree {
             // Now we work with the tree without holding the HashMap lock
-            let (matched_text, matched_worker) = tree.prefix_match(text);
-            let match_rate = if text.is_empty() {
+            // Use prefix_match_with_counts to avoid redundant chars().count() calls
+            let result = tree.prefix_match_with_counts(text);
+            let match_rate = if result.input_char_count == 0 {
                 0.0
             } else {
-                matched_text.chars().count() as f32 / text.chars().count() as f32
+                result.matched_char_count as f32 / result.input_char_count as f32
             };
 
             let selected_url = if match_rate > self.config.cache_threshold {
-                matched_worker.to_string()
+                result.tenant
             } else {
                 let min_load_idx = *healthy_indices
                     .iter()
