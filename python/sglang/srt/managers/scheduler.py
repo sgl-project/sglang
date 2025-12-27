@@ -156,7 +156,9 @@ from sglang.srt.managers.session_controller import Session
 from sglang.srt.managers.utils import GenerationBatchResult, validate_input_length
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.common import release_kv_cache
+from sglang.srt.mem_cache.hicache_storage import HiCacheStorageConfig
 from sglang.srt.mem_cache.radix_cache import RadixCache
+from sglang.srt.mem_cache.storage import StorageBackendFactory
 from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
 from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
 from sglang.srt.parser.reasoning_parser import ReasoningParser
@@ -297,9 +299,13 @@ class Scheduler(
         self.gpu_id = gpu_id
         self.page_size = server_args.page_size
         self.enable_hierarchical_cache = server_args.enable_hierarchical_cache
+        self.enable_hierarchical_cache_direct = (
+            server_args.enable_hierarchical_cache_direct
+        )
         self.enable_hicache_storage = server_args.hicache_storage_backend is not None
         self.max_recv_per_poll = envs.SGLANG_SCHEDULER_MAX_RECV_PER_POLL.get()
 
+        self.need_prefetch_storage = self.enable_hicache_storage
         # Distributed rank info
         self.attn_tp_rank, self.attn_tp_size, self.attn_dp_rank = (
             compute_dp_attention_world_info(
@@ -633,6 +639,7 @@ class Scheduler(
             ),
             eviction_policy=server_args.radix_eviction_policy,
             enable_metrics=self.enable_metrics,
+            gpu_id=self.gpu_id,
             enable_kv_cache_events=self.enable_kv_cache_events,
             enable_mamba_extra_buffer=server_args.enable_mamba_extra_buffer(),
         )
@@ -667,6 +674,16 @@ class Scheduler(
                 self.tp_worker.register_hicache_layer_transfer_counter(
                     self.tree_cache.cache_controller.layer_done_counter
                 )
+            elif self.enable_hierarchical_cache_direct:
+                from sglang.srt.mem_cache.hiradix_cache_direct import HiRadixCacheDirect
+
+                self.tree_cache = HiRadixCacheDirect(
+                    params=params, server_args=server_args
+                )
+                self.need_prefetch_storage = False
+                self.tp_worker.register_hicache_layer_transfer_counter(
+                    self.tree_cache.cache_controller.layer_done_counter
+                )
             elif self.is_hybrid_swa:
                 from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
 
@@ -691,6 +708,32 @@ class Scheduler(
                 )
             else:
                 self.tree_cache = RadixCache(params)
+
+        # For L3 storage scenarios in disaggregation mode, decode instance can be used to expand storage capacity
+        if (
+            server_args.disaggregation_mode == "decode"
+            and not self.enable_hierarchical_cache_direct
+            and not self.enable_hierarchical_cache
+            and envs.SGLANG_ENABLE_DECODE_DISTRIBUTED_KV_POOL.get()
+            and server_args.hicache_storage_backend is not None
+        ):
+            storage_config = HiCacheStorageConfig(
+                tp_rank=self.tp_rank,
+                tp_size=self.tp_size,
+                is_mla_model=False,
+                is_page_first_layout=False,
+                model_name=None,
+                extra_config={"device_id": self.gpu_id},
+            )
+            try:
+                self.storage_backend = StorageBackendFactory.create_backend(
+                    server_args.hicache_storage_backend, storage_config, None
+                )
+            except ValueError as e:
+                logger.error(
+                    f"Failed to init distributed kv pool {server_args.hicache_storage_backend} "
+                    f"for disaggregation_mode=decode: {e}"
+                )
 
         if (
             server_args.disaggregation_mode == "decode"
@@ -1597,7 +1640,7 @@ class Scheduler(
             self.handle_generate_request(tokenized_req)
 
     def _prefetch_kvcache(self, req: Req):
-        if self.enable_hicache_storage:
+        if self.enable_hicache_storage and self.need_prefetch_storage:
             req.init_next_round_input(self.tree_cache)
             if req.last_node.backuped:
                 # only to initiate the prefetch if the last node is backuped
@@ -1894,7 +1937,7 @@ class Scheduler(
             self.running_batch.batch_is_full = True
             return None
 
-        if self.enable_hierarchical_cache:
+        if self.enable_hierarchical_cache or self.enable_hierarchical_cache_direct:
             self.tree_cache.check_hicache_events()
 
         # Get priority queue
@@ -1984,7 +2027,10 @@ class Scheduler(
 
             if res != AddReqResult.CONTINUE:
                 if res == AddReqResult.NO_TOKEN:
-                    if self.enable_hierarchical_cache:
+                    if (
+                        self.enable_hierarchical_cache
+                        or self.enable_hierarchical_cache_direct
+                    ):
                         # Set batch_is_full after making sure there are requests that can be served
                         self.running_batch.batch_is_full = len(
                             adder.can_run_list
@@ -2417,7 +2463,7 @@ class Scheduler(
         return FlushCacheReqOutput(success=success)
 
     def clear_hicache_storage_wrapped(self, recv_req: ClearHiCacheReqInput):
-        if self.enable_hierarchical_cache:
+        if self.enable_hierarchical_cache or self.enable_hierarchical_cache_direct:
             self.tree_cache.clear_storage_backend()
             logger.info("Hierarchical cache cleared successfully!")
             if_success = True
