@@ -309,6 +309,8 @@ class ServerArgs:
             self.vae_cpu_offload = False
 
     def __post_init__(self):
+        # configure logger first to enable logging
+        configure_logger(server_args=self)
 
         self.adjust_offload()
 
@@ -332,8 +334,6 @@ class ServerArgs:
                 )
                 raise
         self.check_server_args()
-
-        configure_logger(server_args=self)
 
         # log clean server_args
         try:
@@ -813,13 +813,13 @@ class ServerArgs:
 
         if self.ulysses_degree is None:
             self.ulysses_degree = 1
-            logger.info(
+            logger.debug(
                 f"Ulysses degree not set, using default value {self.ulysses_degree}"
             )
 
         if self.ring_degree is None:
             self.ring_degree = 1
-            logger.info(f"Ring degree not set, using default value {self.ring_degree}")
+            logger.debug(f"Ring degree not set, using default value {self.ring_degree}")
 
         if self.ring_degree > 1:
             if self.attention_backend is not None and self.attention_backend != "fa":
@@ -848,7 +848,7 @@ class ServerArgs:
         assert self.dp_size >= 1, "--dp-size must be natural number"
         # NOTE: disable temporarily
         # self.dp_degree = self.num_gpus // self.dp_size
-        logger.info(f"Setting dp_degree to: {self.dp_degree}")
+        logger.debug(f"Setting dp_degree to: {self.dp_degree}")
         if self.dp_size > 1:
             raise ValueError("DP is not yet supported")
 
@@ -1045,7 +1045,7 @@ def set_global_server_args(server_args: ServerArgs):
     _global_server_args = server_args
 
 
-def get_current_server_args() -> ServerArgs:
+def get_current_server_args() -> ServerArgs | None:
     if _current_server_args is None:
         # in ci, usually when we test custom ops/modules directly,
         # we don't set the sgl_diffusion config. In that case, we set a default
@@ -1055,7 +1055,7 @@ def get_current_server_args() -> ServerArgs:
     return _current_server_args
 
 
-def get_global_server_args() -> ServerArgs:
+def get_global_server_args() -> ServerArgs | None:
     if _global_server_args is None:
         # in ci, usually when we test custom ops/modules directly,
         # we don't set the sgl_diffusion config. In that case, we set a default
