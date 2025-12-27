@@ -407,14 +407,20 @@ class Conversation:
 
     def append_image(self, image: str, detail: Literal["auto", "low", "high"]):
         """Append a new image."""
+        if self.image_data is None:
+            self.image_data = []
         self.image_data.append(ImageData(url=image, detail=detail))
 
     def append_video(self, video: str):
         """Append a new video."""
+        if self.video_data is None:
+            self.video_data = []
         self.video_data.append(video)
 
     def append_audio(self, audio: str):
         """Append a new audio."""
+        if self.audio_data is None:
+            self.audio_data = []
         self.audio_data.append(audio)
 
     def update_last_message(self, message: str):
