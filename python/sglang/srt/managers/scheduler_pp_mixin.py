@@ -221,6 +221,7 @@ class SchedulerPPMixin:
                 batch = self.get_new_batch_prefill()
                 if self.require_mlp_sync:
                     batch = self.prepare_mlp_sync_batch(batch)
+                self.log_prefill_stats_late(batch)
                 self.mbs[mb_id] = batch
                 self.running_mbs[mb_id] = self.running_batch
 
