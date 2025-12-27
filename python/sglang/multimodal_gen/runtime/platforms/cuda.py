@@ -20,7 +20,6 @@ from sglang.multimodal_gen.runtime.platforms.interface import (
     Platform,
     PlatformEnum,
 )
-from sglang.multimodal_gen.runtime.utils.common import is_blackwell, is_sm120
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.utils import import_pynvml
 
@@ -213,7 +212,7 @@ class CudaPlatformBase(Platform):
         elif selected_backend in [
             AttentionBackendEnum.FA,
         ]:
-            if is_blackwell():
+            if cls.is_blackwell():
                 from sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn import (
                     set_fa_ver,
                 )
@@ -224,14 +223,14 @@ class CudaPlatformBase(Platform):
             raise ValueError(f"Invalid attention backend for {cls.device_name}")
         else:
 
-            if is_blackwell():
+            if cls.is_blackwell():
                 from sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn import (
                     set_fa_ver,
                 )
 
                 set_fa_ver(4)
             target_backend = AttentionBackendEnum.FA
-            if is_sm120():
+            if cls.is_sm120():
                 try:
                     from sglang.multimodal_gen.runtime.layers.attention.backends.sage_attn3 import (  # noqa: F401
                         SageAttention3Backend,
