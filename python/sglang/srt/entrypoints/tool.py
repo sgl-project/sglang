@@ -46,6 +46,8 @@ class HarmonyBrowserTool(Tool):
         from sglang.srt.entrypoints.context import HarmonyContext
 
         assert isinstance(context, HarmonyContext)
+        if not context.messages:
+            return []
         last_msg = context.messages[-1]
         tool_output_msgs = []
         async for msg in self.browser_tool.process(last_msg):
@@ -76,6 +78,8 @@ class HarmonyPythonTool(Tool):
         from sglang.srt.entrypoints.context import HarmonyContext
 
         assert isinstance(context, HarmonyContext)
+        if not context.messages:
+            return []
         last_msg = context.messages[-1]
         tool_output_msgs = []
         async for msg in self.python_tool.process(last_msg):
