@@ -320,6 +320,25 @@ impl ConnectionMode {
             ConnectionMode::Grpc { .. } => metrics_labels::CONNECTION_GRPC,
         }
     }
+
+    /// Normalize a potentially scheme-less endpoint URL according to this connection mode.
+    ///
+    /// - If the URL already has a supported scheme (http/https/grpc/grpcs), it is returned as-is.
+    /// - Otherwise, the URL is prefixed with `http://` for HTTP mode or `grpc://` for gRPC mode.
+    pub fn normalize_url(&self, url: &str) -> String {
+        if url.starts_with("http://")
+            || url.starts_with("https://")
+            || url.starts_with("grpc://")
+            || url.starts_with("grpcs://")
+        {
+            url.to_string()
+        } else {
+            match self {
+                ConnectionMode::Http => format!("http://{}", url),
+                ConnectionMode::Grpc { .. } => format!("grpc://{}", url),
+            }
+        }
+    }
 }
 
 impl fmt::Display for ConnectionMode {

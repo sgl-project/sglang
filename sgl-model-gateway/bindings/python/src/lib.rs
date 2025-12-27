@@ -393,21 +393,6 @@ impl Router {
         core::ConnectionMode::Http
     }
 
-    fn normalize_url_for_mode(url: &str, mode: &core::ConnectionMode) -> String {
-        if url.starts_with("http://")
-            || url.starts_with("https://")
-            || url.starts_with("grpc://")
-            || url.starts_with("grpcs://")
-        {
-            url.to_string()
-        } else {
-            match mode {
-                core::ConnectionMode::Http => format!("http://{}", url),
-                core::ConnectionMode::Grpc { .. } => format!("grpc://{}", url),
-            }
-        }
-    }
-
     fn parse_connection_mode_str(mode: &str) -> PyResult<core::ConnectionMode> {
         match mode.to_lowercase().as_str() {
             "http" => Ok(core::ConnectionMode::Http),
@@ -795,7 +780,7 @@ impl Router {
         let worker_urls = if normalize {
             worker_urls
                 .into_iter()
-                .map(|u| Self::normalize_url_for_mode(&u, &connection_mode))
+                .map(|u| connection_mode.normalize_url(&u))
                 .collect()
         } else {
             worker_urls
@@ -803,7 +788,7 @@ impl Router {
         let prefill_urls = if normalize {
             prefill_urls.map(|v| {
                 v.into_iter()
-                    .map(|(u, p)| (Self::normalize_url_for_mode(&u, &connection_mode), p))
+                    .map(|(u, p)| (connection_mode.normalize_url(&u), p))
                     .collect()
             })
         } else {
@@ -812,7 +797,7 @@ impl Router {
         let decode_urls = if normalize {
             decode_urls.map(|v| {
                 v.into_iter()
-                    .map(|u| Self::normalize_url_for_mode(&u, &connection_mode))
+                    .map(|u| connection_mode.normalize_url(&u))
                     .collect()
             })
         } else {
