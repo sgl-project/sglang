@@ -20,7 +20,7 @@ use crate::{
     config::types::RetryConfig,
     core::{
         is_retryable_status, ConnectionMode, RetryExecutor, Worker, WorkerLoadGuard,
-        WorkerRegistry, WorkerType,
+        WorkerRegistry, WorkerType, UNKNOWN_MODEL_ID,
     },
     observability::{
         events::{self, Event},
@@ -169,11 +169,17 @@ impl Router {
             None => self.policy_registry.get_default_policy(),
         };
 
+        // Get cached hash ring for consistent hashing (O(log n) lookup)
+        let hash_ring = self
+            .worker_registry
+            .get_hash_ring(effective_model_id.unwrap_or(UNKNOWN_MODEL_ID));
+
         let idx = policy.select_worker(
             &available,
             &SelectWorkerInfo {
                 request_text: text,
                 headers,
+                hash_ring,
             },
         )?;
 

@@ -810,6 +810,15 @@ impl Metrics {
         .increment(1);
     }
 
+    /// Record consistent hashing policy execution branch for routing decisions
+    pub fn record_worker_consistent_hashing_policy_branch(branch: &'static str) {
+        counter!(
+            "smg_consistent_hashing_policy_branch_total",
+            "branch" => branch
+        )
+        .increment(1);
+    }
+
     /// Set running requests per worker
     pub fn set_worker_requests_active(worker: &str, count: usize) {
         gauge!(

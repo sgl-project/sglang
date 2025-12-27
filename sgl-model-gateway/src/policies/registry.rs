@@ -10,8 +10,8 @@ use tracing::{debug, info, warn};
 /// All subsequent workers of the same model use the established policy.
 /// When the last worker of a model is removed, the policy mapping is cleaned up.
 use super::{
-    BucketConfig, BucketPolicy, CacheAwareConfig, CacheAwarePolicy, LoadBalancingPolicy,
-    ManualPolicy, PowerOfTwoPolicy, RandomPolicy, RoundRobinPolicy,
+    BucketConfig, BucketPolicy, CacheAwareConfig, CacheAwarePolicy, ConsistentHashingPolicy,
+    LoadBalancingPolicy, ManualPolicy, PowerOfTwoPolicy, RandomPolicy, RoundRobinPolicy,
 };
 use crate::{config::types::PolicyConfig, core::Worker};
 
@@ -168,6 +168,8 @@ impl PolicyRegistry {
             "cache_aware" => Arc::new(CacheAwarePolicy::new()),
             "power_of_two" => Arc::new(PowerOfTwoPolicy::new()),
             "bucket" => Arc::new(BucketPolicy::new()),
+            "manual" => Arc::new(ManualPolicy::new()),
+            "consistent_hashing" => Arc::new(ConsistentHashingPolicy::new()),
             _ => {
                 warn!("Unknown policy type '{}', using default", policy_type);
                 Arc::clone(&self.default_policy)
@@ -210,6 +212,7 @@ impl PolicyRegistry {
                 Arc::new(BucketPolicy::with_config(config))
             }
             PolicyConfig::Manual => Arc::new(ManualPolicy::new()),
+            PolicyConfig::ConsistentHashing => Arc::new(ConsistentHashingPolicy::new()),
         }
     }
 

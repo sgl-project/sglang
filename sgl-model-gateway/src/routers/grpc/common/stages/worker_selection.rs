@@ -8,7 +8,7 @@ use tracing::{error, warn};
 
 use super::PipelineStage;
 use crate::{
-    core::{ConnectionMode, Worker, WorkerRegistry, WorkerType},
+    core::{ConnectionMode, Worker, WorkerRegistry, WorkerType, UNKNOWN_MODEL_ID},
     observability::metrics::{metrics_labels, Metrics},
     policies::{PolicyRegistry, SelectWorkerInfo},
     routers::{
@@ -148,12 +148,18 @@ impl WorkerSelectionStage {
             None => self.policy_registry.get_default_policy(),
         };
 
+        // Get cached hash ring for consistent hashing (O(log n) lookup)
+        let hash_ring = self
+            .worker_registry
+            .get_hash_ring(model_id.unwrap_or(UNKNOWN_MODEL_ID));
+
         // Select worker using the policy
         let idx = policy.select_worker(
             &available,
             &SelectWorkerInfo {
                 request_text: text,
                 headers,
+                hash_ring,
             },
         )?;
         let selected = available[idx].clone();
@@ -213,9 +219,15 @@ impl WorkerSelectionStage {
             None => self.policy_registry.get_default_policy(),
         };
 
+        // Get cached hash ring for consistent hashing (O(log n) lookup)
+        let hash_ring = self
+            .worker_registry
+            .get_hash_ring(model_id.unwrap_or(UNKNOWN_MODEL_ID));
+
         let info = SelectWorkerInfo {
             request_text: text,
             headers,
+            hash_ring,
         };
         let prefill_idx = policy.select_worker(&available_prefill, &info)?;
         let decode_idx = policy.select_worker(&available_decode, &info)?;

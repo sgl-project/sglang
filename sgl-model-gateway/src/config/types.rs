@@ -337,11 +337,19 @@ pub enum PolicyConfig {
         bucket_adjust_interval_secs: usize,
     },
 
-    /// Manual routing policy supporting header-based routing:
-    /// - X-SMG-Target-Worker: Direct routing to a specific worker by URL
-    /// - X-SMG-Routing-Key: Consistent hash routing for session affinity
+    /// Manual routing policy with sticky sessions using DashMap.
+    /// - X-SMG-Routing-Key: Routes to a cached worker or assigns a new one
+    /// - Provides true sticky sessions with zero key redistribution on worker add
+    /// - Falls back to random selection if no routing key is provided
     #[serde(rename = "manual")]
     Manual,
+
+    /// Consistent hashing policy using hash ring for session affinity:
+    /// - X-SMG-Target-Worker: Direct routing to a specific worker by URL
+    /// - X-SMG-Routing-Key: Consistent hash routing for session affinity
+    /// - Provides O(log n) lookup with minimal redistribution (~1/N keys) on topology change
+    #[serde(rename = "consistent_hashing")]
+    ConsistentHashing,
 }
 
 impl PolicyConfig {
@@ -353,6 +361,7 @@ impl PolicyConfig {
             PolicyConfig::PowerOfTwo { .. } => "power_of_two",
             PolicyConfig::Bucket { .. } => "bucket",
             PolicyConfig::Manual => "manual",
+            PolicyConfig::ConsistentHashing => "consistent_hashing",
         }
     }
 }
