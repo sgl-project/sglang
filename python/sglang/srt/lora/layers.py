@@ -682,6 +682,17 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
             is_down_proj=False,
         )
 
+        # DEBUG: Check for NaNs immediately after gate_up LoRA
+        if torch.isnan(gate_up_output).any():
+            print(f"NaNs detected in gate_up_output! Shape: {gate_up_output.shape}")
+            print(
+                f"gate_up_output min/max: {gate_up_output.min()}, {gate_up_output.max()}"
+            )
+            print(f"Input hidden_states shape: {hidden_states.shape}")
+            import pdb
+
+            pdb.set_trace()
+
         # Apply down_proj LoRA: intermediate space -> hidden space, added to base_output
         if (
             self.down_lora_a_weights is not None
@@ -700,6 +711,15 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
                 base_output=base_output,
                 is_down_proj=True,
             )
+
+            # DEBUG: Check for NaNs after down_proj LoRA
+            if torch.isnan(base_output).any():
+                print(f"NaNs detected in base_output after down_proj LoRA!")
+                print(f"base_output min/max: {base_output.min()}, {base_output.max()}")
+                print(f"gate_up_output shape: {gate_up_output.shape}")
+                import pdb
+
+                pdb.set_trace()
 
     def slice_lora_a_weights(self, A: torch.Tensor, tp_rank: int):
         # For MoE layers, tensor parallelism is typically not used

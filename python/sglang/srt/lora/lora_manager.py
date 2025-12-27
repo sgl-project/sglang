@@ -326,27 +326,54 @@ class LoRAManager:
                 if isinstance(module, FusedMoEWithLoRA) and all(
                     x in self.target_modules for x in ["gate_up_proj", "down_proj"]
                 ):
+                    gate_up_a = self.memory_pool.get_tensor(
+                        target_module="gate_up_proj_moe",
+                        layer_id=layer_id,
+                        lora_type=LoRAType.LORA_A,
+                    )
+                    gate_up_b = self.memory_pool.get_tensor(
+                        target_module="gate_up_proj_moe",
+                        layer_id=layer_id,
+                        lora_type=LoRAType.LORA_B,
+                    )
+                    down_a = self.memory_pool.get_tensor(
+                        target_module="down_proj_moe",
+                        layer_id=layer_id,
+                        lora_type=LoRAType.LORA_A,
+                    )
+                    down_b = self.memory_pool.get_tensor(
+                        target_module="down_proj_moe",
+                        layer_id=layer_id,
+                        lora_type=LoRAType.LORA_B,
+                    )
+
+                    # DEBUG: Check LoRA weights for NaNs
+                    if gate_up_a is not None and torch.isnan(gate_up_a).any():
+                        print(f"NaNs in gate_up LoRA_A weights!")
+                        import pdb
+
+                        pdb.set_trace()
+                    if gate_up_b is not None and torch.isnan(gate_up_b).any():
+                        print(f"NaNs in gate_up LoRA_B weights!")
+                        import pdb
+
+                        pdb.set_trace()
+                    if down_a is not None and torch.isnan(down_a).any():
+                        print(f"NaNs in down LoRA_A weights!")
+                        import pdb
+
+                        pdb.set_trace()
+                    if down_b is not None and torch.isnan(down_b).any():
+                        print(f"NaNs in down LoRA_B weights!")
+                        import pdb
+
+                        pdb.set_trace()
+
                     module.set_lora_info(
-                        gate_up_lora_a_weights=self.memory_pool.get_tensor(
-                            target_module="gate_up_proj_moe",
-                            layer_id=layer_id,
-                            lora_type=LoRAType.LORA_A,
-                        ),
-                        gate_up_lora_b_weights=self.memory_pool.get_tensor(
-                            target_module="gate_up_proj_moe",
-                            layer_id=layer_id,
-                            lora_type=LoRAType.LORA_B,
-                        ),
-                        down_lora_a_weights=self.memory_pool.get_tensor(
-                            target_module="down_proj_moe",
-                            layer_id=layer_id,
-                            lora_type=LoRAType.LORA_A,
-                        ),
-                        down_lora_b_weights=self.memory_pool.get_tensor(
-                            target_module="down_proj_moe",
-                            layer_id=layer_id,
-                            lora_type=LoRAType.LORA_B,
-                        ),
+                        gate_up_lora_a_weights=gate_up_a,
+                        gate_up_lora_b_weights=gate_up_b,
+                        down_lora_a_weights=down_a,
+                        down_lora_b_weights=down_b,
                     )
                     continue
 
