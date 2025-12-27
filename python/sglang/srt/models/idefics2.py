@@ -28,7 +28,7 @@ from sglang.srt.layers.activation import get_act_fn
 from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.utils import add_prefix
+from sglang.srt.utils import add_prefix, is_npu
 
 
 class Idefics2VisionMLP(nn.Module):
@@ -161,6 +161,9 @@ class Idefics2Encoder(nn.Module):
                 `input_ids` indices into associated vectorsthan the model's
                 internal embedding lookup matrix.
         """
+        # cu_seqlens must be on cpu because of npu_flash_attention_unpad operator restriction
+        if is_npu():
+            cu_seqlens = cu_seqlens.to("cpu")
         hidden_states = inputs_embeds
         for encoder_layer in self.layers:
             layer_outputs = encoder_layer(
