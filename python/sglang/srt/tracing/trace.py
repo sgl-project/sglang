@@ -236,7 +236,10 @@ def process_tracing_init(otlp_endpoint, server_name):
         tracer_provider.add_span_processor(processor)
         trace.set_tracer_provider(tracer_provider)
     except Exception as e:
-        raise RuntimeError(f"initialize opentelemetry error:{e}")
+        opentelemetry_initialized = False
+        raise RuntimeError(
+            f"initialize opentelemetry error:{e}. Please set correct otlp endpoint."
+        )
 
     opentelemetry_initialized = True
 
