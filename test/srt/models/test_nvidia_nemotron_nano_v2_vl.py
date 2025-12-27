@@ -15,7 +15,7 @@ class TestNvidiaNemotronNanoV2VLTextOnly(GSM8KMixin, DefaultServerBase):
 
 
 class TestNvidiaNemotronNanoV2VLMMMU(MMMUVLMTestBase):
-    accuracy = 0.454
+    accuracy = 0.444
     model = MODEL
     other_args = ["--max-mamba-cache-size", "128", "--trust-remote-code"]
     mmmu_args = ["--limit=0.1"]

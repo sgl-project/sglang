@@ -140,7 +140,6 @@ class ModelRunnerKVCacheMixin:
         if self.mambaish_config is not None:
             rest_memory = self.handle_max_mamba_cache(rest_memory)
 
-        logger.info(f"The available memory for KV cache is {rest_memory:.2f} GB.")
         return int(rest_memory * (1 << 30)) // cell_size
 
     def handle_max_mamba_cache(self: ModelRunner, total_rest_memory):
