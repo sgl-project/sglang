@@ -592,6 +592,10 @@ class EICStorage(HiCacheStorage):
             for item in items:
                 self.kv_cache_write_mem_pool.free_to_mempool(item.data_ptr())
 
+        if not set_outcome.status_codes:
+            logger.error(f"set data key {len(eic_keys)} failed, empty status_codes")
+            return [False] * len(keys)
+
         err_code = set_outcome.status_codes[0]
         if err_code != eic.StatusCode.SUCCESS:
             logger.error(f"set data key {len(eic_keys)} failed, err_code {err_code}")
