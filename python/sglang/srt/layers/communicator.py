@@ -545,6 +545,7 @@ class LayerCommunicator:
             return True
         return False
 
+    # NOTE: This function will cause torch recompilation
     def should_fuse_mlp_allreduce_with_next_layer(
         self, forward_batch: ForwardBatch
     ) -> bool:

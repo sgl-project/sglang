@@ -1,3 +1,9 @@
+"""
+The definition of CustomOps for multi hardware dispatching.
+
+TODO: Move this to python/sglang/srt/layers/custom_op.py
+"""
+
 from torch import nn
 
 from sglang.srt.utils import (
