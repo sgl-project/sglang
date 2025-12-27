@@ -8,8 +8,8 @@ from sglang.test.few_shot_gsm8k import run_eval
 from sglang.test.kits.matched_stop_kit import MatchedStopMixin
 from sglang.test.kits.radix_cache_server_kit import run_radix_attention_test
 from sglang.test.test_utils import (
-    DEFAULT_DRAFT_MODEL_EAGLE2,
-    DEFAULT_TARGET_MODEL_EAGLE2,
+    DEFAULT_DRAFT_MODEL_EAGLE,
+    DEFAULT_TARGET_MODEL_EAGLE,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -27,8 +27,8 @@ class TestEagleServerBase(CustomTestCase, MatchedStopMixin):
     spec_draft_tokens = 6
     page_size = 1
     other_launch_args = []
-    model = DEFAULT_TARGET_MODEL_EAGLE2
-    draft_model = DEFAULT_DRAFT_MODEL_EAGLE2
+    model = DEFAULT_TARGET_MODEL_EAGLE
+    draft_model = DEFAULT_DRAFT_MODEL_EAGLE
 
     @classmethod
     def setUpClass(cls):

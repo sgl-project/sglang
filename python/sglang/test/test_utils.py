@@ -91,17 +91,17 @@ DEFAULT_MODEL_NAME_FOR_TEST_AWQ_INT4 = (
     "hugging-quants/Meta-Llama-3.1-8B-Instruct-AWQ-INT4"
 )
 
-# EAGLE2 model
-DEFAULT_TARGET_MODEL_EAGLE2 = "meta-llama/Llama-2-7b-chat-hf"
-DEFAULT_DRAFT_MODEL_EAGLE2 = "lmsys/sglang-EAGLE-llama2-chat-7B"
+# EAGLE2 algorithm models
+DEFAULT_TARGET_MODEL_EAGLE = "meta-llama/Llama-2-7b-chat-hf"
+DEFAULT_DRAFT_MODEL_EAGLE = "lmsys/sglang-EAGLE-llama2-chat-7B"
 
 # EAGLE3 model
 DEFAULT_TARGET_MODEL_EAGLE3 = "meta-llama/Llama-3.1-8B-Instruct"
 DEFAULT_DRAFT_MODEL_EAGLE3 = "lmsys/sglang-EAGLE3-LLaMA3.1-Instruct-8B"
 
-# EAGLE with DP-Attention models
-DEFAULT_TARGET_MODEL_EAGLE2_DP_ATTN = "Qwen/Qwen3-30B-A3B"
-DEFAULT_DRAFT_MODEL_EAGLE2_DP_ATTN = "Tengyunw/qwen3_30b_moe_eagle3"
+# EAGLE2 with DP-Attention models
+DEFAULT_TARGET_MODEL_EAGLE_DP_ATTN = "Qwen/Qwen3-30B-A3B"
+DEFAULT_DRAFT_MODEL_EAGLE_DP_ATTN = "Tengyunw/qwen3_30b_moe_eagle3"
 
 # Standalone speculative decoding models
 DEFAULT_TARGET_MODEL_STANDALONE = "meta-llama/Llama-3.1-8B-Instruct"
