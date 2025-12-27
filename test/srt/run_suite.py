@@ -86,11 +86,9 @@ suites = {
         TestFile("test_retract_decode.py", 259),
         TestFile("test_score_api.py", 260),
         TestFile("test_server_args.py", 9),
-        TestFile("test_speculative_registry.py", 8),
         TestFile("test_skip_tokenizer_init.py", 77),
         TestFile("test_srt_endpoint.py", 127),
         TestFile("test_srt_engine.py", 252),
-        TestFile("test_standalone_speculative_decoding.py", 150),
         TestFile("test_start_profile.py", 41),
         TestFile("test_profile_merger.py", 8),
         TestFile("test_profile_merger_http_api.py", 9),
@@ -116,13 +114,11 @@ suites = {
         TestFile("models/test_glm4_moe_models.py", 100),
         TestFile("models/test_kimi_linear_models.py", 90),
         TestFile("rl/test_update_weights_from_distributed.py", 103),
-        TestFile("test_constrained_decoding_spec_reasoning.py", 60),
         TestFile("test_data_parallelism.py", 73),
         TestFile("test_disaggregation_basic.py", 400),
         TestFile("test_dp_attention.py", 350),
         TestFile("test_load_weights_from_remote_instance.py", 72),
         TestFile("test_patch_torch.py", 19),
-        TestFile("test_eagle_dp_attention.py", 200),
     ],
     "per-commit-4-gpu": [
         TestFile("models/test_qwen3_next_models.py", 650),
@@ -151,7 +147,6 @@ suites = {
         TestFile("test_fp8_blockwise_gemm.py", 280),
         TestFile("test_gpt_oss_4gpu.py", 700),
         TestFile("test_llama31_fp4.py", 90),
-        TestFile("test_eagle_infer_beta_dp_attention.py", 300),
     ],
     # "per-commit-8-gpu-b200": [
     #     TestFile("test_mistral_large3_basic.py", 275),  # Moved to nightly - large model
