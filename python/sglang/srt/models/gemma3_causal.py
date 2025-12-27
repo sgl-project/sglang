@@ -379,9 +379,6 @@ class Gemma3RotaryEmbedding(nn.Module):
         else:
             self.rope_type = "default"
 
-        if self.rope_type is None:
-            self.rope_type = "default"
-
         self.max_seq_len_cached = config.max_position_embeddings
         self.original_max_seq_len = config.max_position_embeddings
 
