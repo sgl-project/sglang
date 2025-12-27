@@ -2,14 +2,11 @@
 
 # SPDX-License-Identifier: Apache-2.0
 
+from typing import Any, DeviceCapability, Platform, PlatformEnum
+
 import torch
 
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
-from sglang.multimodal_gen.runtime.platforms.interface import (
-    DeviceCapability,
-    Platform,
-    PlatformEnum,
-)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
@@ -54,6 +51,31 @@ class MpsPlatform(Platform):
         cls, device: torch.types.Device | None = None
     ) -> float:
         return 0.0
+
+    @classmethod
+    def get_available_memory(
+        cls,
+        device_id: int = 0,
+        distributed: bool = False,
+        empty_cache: bool = True,
+        cpu_group: Any = None,
+    ) -> float:
+        import psutil
+
+        if empty_cache:
+            torch.mps.empty_cache()
+
+        # For MPS, available memory is essentially the system available memory
+        free_memory = psutil.virtual_memory().available
+
+        if distributed:
+            import torch.distributed as dist
+
+            tensor = torch.tensor(free_memory, dtype=torch.float32)
+            dist.all_reduce(tensor, op=dist.ReduceOp.MIN, group=cpu_group)
+            free_memory = float(tensor.item())
+
+        return free_memory / (1 << 30)
 
     @classmethod
     def get_attn_backend_cls_str(

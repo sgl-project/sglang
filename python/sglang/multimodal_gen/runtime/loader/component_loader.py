@@ -127,7 +127,13 @@ class ComponentLoader(ABC):
         If all of the above methods failed, an error will be thrown
 
         """
-        logger.info("Loading %s from %s", module_name, component_model_path)
+        gpu_mem_before_loading = current_platform.get_available_gpu_memory()
+        logger.info(
+            "Loading %s from %s. avail mem: %.2f GB",
+            module_name,
+            component_model_path,
+            gpu_mem_before_loading,
+        )
         try:
             component = self.load_customized(
                 component_model_path, server_args, module_name
@@ -160,10 +166,13 @@ class ComponentLoader(ABC):
         if component is None:
             logger.warning("Loaded %s returned None", module_name)
         else:
+            current_gpu_mem = current_platform.get_available_gpu_memory()
             logger.info(
-                f"Loaded %s: %s from: {source}",
+                f"Loaded %s: %s from {source}. avail mem: %.2f GB, %.2f GB consumed",
                 module_name,
                 component.__class__.__name__,
+                current_gpu_mem,
+                gpu_mem_before_loading - current_gpu_mem,
             )
         return component
 
