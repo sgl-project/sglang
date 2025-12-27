@@ -120,8 +120,9 @@ class TestHiCacheStorageRuntimeAttachDetach(CustomTestCase):
 
     def _attach_file_backend(self, extra_cfg: dict):
         payload = {
-            "storage_backend": "file",
-            "storage_backend_extra_config_json": json.dumps(extra_cfg),
+            "hicache_storage_backend": "file",
+            "hicache_storage_backend_extra_config_json": json.dumps(extra_cfg),
+            "hicache_storage_prefetch_policy": "timeout",
         }
         return self._http_post_json(
             f"{self.base_url}/attach_hicache_storage_backend", payload, timeout=30
@@ -154,6 +155,7 @@ class TestHiCacheStorageRuntimeAttachDetach(CustomTestCase):
             status1.get("hicache_storage_backend_extra_config"),
             json.dumps(extra_cfg),
         )
+        self.assertEqual(status1.get("hicache_storage_prefetch_policy"), "timeout")
 
         # 3) Attach again should be rejected (already enabled)
         code_attach_again, body_attach_again = self._attach_file_backend(extra_cfg)
