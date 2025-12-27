@@ -55,7 +55,13 @@ from sglang.srt.mem_cache.utils import (
     set_mla_kv_buffer_triton,
     set_mla_kv_scale_buffer_triton,
 )
-from sglang.srt.utils import is_cuda, is_npu, next_power_of_2
+from sglang.srt.utils import (
+    cpu_has_amx_support,
+    is_cpu,
+    is_cuda,
+    is_npu,
+    next_power_of_2,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.managers.cache_controller import LayerDoneCounter
@@ -67,6 +73,8 @@ logger = logging.getLogger(__name__)
 GB = 1024 * 1024 * 1024
 _is_cuda = is_cuda()
 _is_npu = is_npu()
+_is_cpu = is_cpu()
+_cpu_has_amx_support = cpu_has_amx_support()
 
 
 def get_tensor_size_bytes(t: Union[torch.Tensor, List[torch.Tensor]]):
@@ -191,6 +199,22 @@ class MambaPool:
                 )
                 for conv_shape in conv_state_shape
             ]
+
+            if _is_cpu and _cpu_has_amx_support:
+                # CPU uses a different layout of conv_state for kernel optimization
+                conv_state_cpu = []
+                for conv_shape_t in conv_state:
+                    conv_shape_new = conv_shape_t.as_strided_(
+                        conv_shape_t.size(),
+                        (
+                            conv_shape_t.stride(0),
+                            conv_shape_t.stride(1),
+                            1,
+                            conv_shape_t.size(2),
+                        ),
+                    )
+                    conv_state_cpu.append(conv_shape_new)
+                conv_state = conv_state_cpu
             temporal_state = torch.zeros(
                 size=(num_mamba_layers, size + 1) + temporal_state_shape,
                 dtype=ssm_dtype,
