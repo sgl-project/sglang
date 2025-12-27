@@ -549,6 +549,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.init_attention_backend()
             self.kernel_warmup()
             self.init_device_graphs()
+
         elif self.device in ["npu", "cpu"]:
             self.init_attention_backend()
             self.init_device_graphs()
@@ -1971,10 +1972,17 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             # TODO: Currently, cuda graph only captures decode steps, which only exists for generation models
             return
 
-        if self.server_args.model_impl.lower() == ModelImpl.MINDSPORE:
+        if self.device not in ["cpu", "npu"] and self.server_args.disable_cuda_graph:
             return
 
-        if self.device != "cpu" and self.server_args.disable_cuda_graph:
+        if (
+            self.device == "npu"
+            and self.server_args.disable_cuda_graph
+            and not self.server_args.enable_torch_compile
+        ):
+            return
+
+        if self.server_args.model_impl.lower() == ModelImpl.MINDSPORE:
             return
 
         if self.device == "cpu" and not self.server_args.enable_torch_compile:
@@ -1985,6 +1993,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         logger.info(
             f"Capture {'cpu graph' if self.device == 'cpu' else 'cuda graph'} begin. This can take up to several minutes. avail mem={before_mem:.2f} GB"
         )
+
         graph_runners = defaultdict(
             lambda: CudaGraphRunner,
             {

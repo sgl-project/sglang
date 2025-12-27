@@ -270,6 +270,7 @@ class RotaryEmbedding(CustomOp):
         fused_set_kv_buffer_arg: Optional[FusedSetKVBufferArg] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """A PyTorch-npu implementation of forward()."""
+
         assert (
             fused_set_kv_buffer_arg is None
         ), "fused_set_kv_buffer_arg is not supported for npu implementation"
