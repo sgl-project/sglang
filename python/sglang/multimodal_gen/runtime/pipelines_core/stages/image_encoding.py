@@ -198,7 +198,7 @@ class ImageVAEEncodingStage(PipelineStage):
         self.vae: ParallelTiledVAE = vae
 
     def load_model(self):
-        self.vae = self.server_args.vae.to(get_local_torch_device())
+        self.vae = self.vae.to(get_local_torch_device())
 
     def offload_model(self):
         if self.server_args.vae_cpu_offload:
@@ -264,8 +264,8 @@ class ImageVAEEncodingStage(PipelineStage):
             # Setup VAE precision
             vae_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.vae_precision]
             vae_autocast_enabled = (
-                vae_dtype != torch.float32
-            ) and not server_args.disable_autocast
+                                       vae_dtype != torch.float32
+                                   ) and not server_args.disable_autocast
 
             # Encode Image
             with torch.autocast(
