@@ -113,6 +113,7 @@ class QwenImageLayeredBeforeDenoisingStage(PipelineStage):
     def __init__(
         self, vae, tokenizer, processor, transformer, scheduler, model_path
     ) -> None:
+        super().__init__()
         self.vae = vae.to(torch.bfloat16)
         from transformers import Qwen2_5_VLForConditionalGeneration
 

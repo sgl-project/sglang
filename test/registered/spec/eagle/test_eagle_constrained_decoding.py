@@ -6,8 +6,8 @@ from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.json_constrained_kit import TestJSONConstrainedMixin
 from sglang.test.kits.regex_constrained_kit import TestRegexConstrainedMixin
 from sglang.test.test_utils import (
-    DEFAULT_EAGLE_DRAFT_MODEL_FOR_TEST,
-    DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST,
+    DEFAULT_DRAFT_MODEL_EAGLE,
+    DEFAULT_TARGET_MODEL_EAGLE,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -27,8 +27,8 @@ class TestEagleConstrainedDecoding(
     spec_draft_tokens = 6
     page_size = 1
     other_launch_args = []
-    model = DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST
-    draft_model = DEFAULT_EAGLE_DRAFT_MODEL_FOR_TEST
+    model = DEFAULT_TARGET_MODEL_EAGLE
+    draft_model = DEFAULT_DRAFT_MODEL_EAGLE
     grammar_backend = "xgrammar"
     eagle_v2 = False
 
