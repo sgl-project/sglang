@@ -332,8 +332,10 @@ class LoRAMemoryPool:
             victim_uid = self.eviction_policy.select_victim(candidates)
 
             # Evict the selected victim
-            victim_buffer_id = self.uid_to_buffer_id[victim_uid]
-            self.uid_to_buffer_id.pop(victim_uid)
+            victim_buffer_id = self.uid_to_buffer_id.get(victim_uid)
+            if victim_buffer_id is None:
+                raise ValueError(f"Victim UID {victim_uid} not found in buffer mapping")
+            self.uid_to_buffer_id.pop(victim_uid, None)
             self.eviction_policy.remove(victim_uid)
             self.buffer_id_to_uid[victim_buffer_id] = EMPTY_SLOT
             logger.debug(
