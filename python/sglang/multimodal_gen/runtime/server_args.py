@@ -302,9 +302,11 @@ class ServerArgs:
 
     def adjust_offload(self):
         if self.pipeline_config.task_type.is_image_gen():
-            logger.info("Disabling all offloading for image generation model")
+            logger.info(
+                "Disabling all offloading (except dit) for image generation model"
+            )
             if self.dit_cpu_offload is None:
-                self.dit_cpu_offload = False
+                self.dit_cpu_offload = True
             if self.text_encoder_cpu_offload is None:
                 self.text_encoder_cpu_offload = False
             if self.image_encoder_cpu_offload is None:
