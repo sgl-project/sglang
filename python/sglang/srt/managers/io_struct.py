@@ -57,7 +57,10 @@ class BaseBatchReq(ABC):
 
     def regenerate_rids(self):
         """Generate new request IDs and return them."""
-        self.rids = [uuid.uuid4().hex for _ in range(len(self.rids))]
+        if self.rids is None:
+            self.rids = [uuid.uuid4().hex]
+        else:
+            self.rids = [uuid.uuid4().hex for _ in range(len(self.rids))]
         return self.rids
 
 
