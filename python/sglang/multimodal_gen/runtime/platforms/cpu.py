@@ -7,6 +7,7 @@ import platform
 from functools import lru_cache
 from typing import Any
 
+import psutil
 import torch
 
 from sglang.multimodal_gen.runtime.platforms.interface import (
@@ -44,7 +45,6 @@ class CpuPlatform(Platform):
     @classmethod
     @lru_cache(maxsize=1)
     def get_device_total_memory(cls, device_id: int = 0) -> int:
-        import psutil
 
         return psutil.virtual_memory().total
 
@@ -67,7 +67,6 @@ class CpuPlatform(Platform):
         empty_cache: bool = True,
         cpu_group: Any = None,
     ) -> float:
-        import psutil
 
         total_free_memory = psutil.virtual_memory().available
         # For simplicity, we assume 1 NUMA node for now in this platform abstraction

@@ -2,6 +2,7 @@
 from functools import lru_cache
 from typing import Any
 
+import psutil
 import torch
 
 from sglang.multimodal_gen.runtime.platforms import (
@@ -40,7 +41,6 @@ class MpsPlatform(Platform):
     @classmethod
     @lru_cache(maxsize=1)
     def get_device_total_memory(cls, device_id: int = 0) -> int:
-        import psutil
 
         return psutil.virtual_memory().total
 
@@ -69,7 +69,6 @@ class MpsPlatform(Platform):
         empty_cache: bool = True,
         cpu_group: Any = None,
     ) -> float:
-        import psutil
 
         if empty_cache:
             torch.mps.empty_cache()

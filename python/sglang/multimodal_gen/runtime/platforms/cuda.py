@@ -5,12 +5,12 @@
 """Code inside this file can safely assume cuda platform, e.g. importing
 pynvml. However, it should not initialize cuda context.
 """
-
 import os
 from collections.abc import Callable
 from functools import lru_cache, wraps
 from typing import Any, TypeVar
 
+import psutil
 import torch
 from typing_extensions import ParamSpec
 
@@ -130,7 +130,6 @@ class CudaPlatformBase(Platform):
         sm = capability.to_int() if capability else 0
 
         if sm in SHARED_SYSMEM_DEVICE_MEM_SMS:
-            import psutil
 
             free_gpu_memory = psutil.virtual_memory().available
         else:
