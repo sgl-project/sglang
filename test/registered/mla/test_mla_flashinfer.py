@@ -115,8 +115,7 @@ class TestFlashinferMLAMTP(CustomTestCase):
 
         self.assertGreater(metrics["accuracy"], 0.60)
 
-        server_info = requests.get(self.base_url + "/get_server_info")
-        print(f"{server_info=}")
+        server_info = requests.get(self.base_url + "/get_server_info").json()
         avg_spec_accept_length = server_info.json()["internal_states"][0][
             "avg_spec_accept_length"
         ]
