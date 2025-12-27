@@ -345,11 +345,11 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             placeholder_tokens_val=None,
             retraction_counts=recv_obj.retraction_counts,
             token_steps=recv_obj.token_steps,
+            load=recv_obj.load,
             queue_time=recv_obj.queue_time,
             forward_entry_time=recv_obj.forward_entry_time,
             prefill_launch_delay=recv_obj.prefill_launch_delay,
             prefill_launch_latency=recv_obj.prefill_launch_latency,
-            load=recv_obj.load,
             prefill_finished_ts=recv_obj.prefill_finished_ts,
         )
 
@@ -386,12 +386,12 @@ def run_detokenizer_process(
 
     try:
         manager = detokenizer_manager_class(server_args, port_args)
-        if server_args.tokenizer_worker_num > 1:
-            manager.multi_http_worker_event_loop()
-        else:
+        if server_args.tokenizer_worker_num == 1:
             manager.event_loop()
+        else:
+            manager.multi_http_worker_event_loop()
     except Exception:
-        manager.maybe_clear_socket_mapping()
         traceback = get_exception_traceback()
         logger.error(f"DetokenizerManager hit an exception: {traceback}")
+        manager.maybe_clear_socket_mapping()
         parent_process.send_signal(signal.SIGQUIT)

@@ -825,6 +825,122 @@ python3 -m sglang_router.launch_router \
   --api-key "secure-api-key"
 ```
 
+### Control Plane Authentication
+
+The gateway supports role-based access control (RBAC) for control plane APIs (worker management, tokenizer registration, cache operations). Two authentication methods are available:
+
+#### Authentication Methods
+
+| Method | Use Case | Configuration |
+|--------|----------|---------------|
+| **API Keys** | Service accounts, internal services | `--control-plane-api-keys` |
+| **JWT/OIDC** | User authentication via Identity Provider | `--jwt-issuer`, `--jwt-audience` |
+
+Both methods can be used together. Requests are authenticated in order: API key → JWT token.
+
+#### Roles
+
+| Role | Access |
+|------|--------|
+| `admin` | Full access to all control plane APIs (workers, tokenizers, cache, etc.) |
+| `user` | Inference/data plane APIs only (chat completions, embeddings, etc.) |
+
+#### API Key Authentication
+
+Static API keys for service accounts and automation:
+
+```bash
+python3 -m sglang_router.launch_router \
+  --worker-urls http://worker1:8000 \
+  --control-plane-api-keys 'svc1:CI Pipeline:admin:secret-key-123' \
+                           'svc2:Monitoring:user:readonly-key-456' \
+  --control-plane-audit-enabled
+```
+
+**Format:** `id:name:role:key`
+- `id` - Unique identifier for the key
+- `name` - Human-readable description
+- `role` - Either `admin` or `user`
+- `key` - The secret key (stored as SHA-256 hash internally)
+
+**Usage:**
+```bash
+curl -H "Authorization: Bearer secret-key-123" \
+  http://localhost:30000/workers
+```
+
+#### JWT/OIDC Authentication
+
+Authenticate users via an external Identity Provider (Azure AD, Okta, Auth0, Keycloak, etc.):
+
+```bash
+python3 -m sglang_router.launch_router \
+  --worker-urls http://worker1:8000 \
+  --jwt-issuer "https://login.microsoftonline.com/{tenant-id}/v2.0" \
+  --jwt-audience "api://my-gateway-client-id" \
+  --jwt-jwks-uri "https://login.microsoftonline.com/{tenant-id}/discovery/v2.0/keys" \
+  --jwt-role-mapping 'Gateway.Admins=admin' 'Gateway.Users=user' \
+  --control-plane-audit-enabled
+```
+
+| Parameter | Description |
+|-----------|-------------|
+| `--jwt-issuer` | OIDC issuer URL. Used to validate the `iss` claim and discover JWKS endpoint via `.well-known/openid-configuration`. |
+| `--jwt-audience` | Expected audience (`aud` claim). Typically your application's client ID or API identifier (e.g., `api://client-id`). |
+| `--jwt-jwks-uri` | (Optional) Explicit JWKS URI. If omitted, discovered automatically from the issuer's OIDC configuration. |
+| `--jwt-role-mapping` | Map IDP group/role names to gateway roles. Format: `idp_role=gateway_role`. |
+
+**How it works:**
+1. User authenticates with Identity Provider (OAuth2/OIDC flow)
+2. IDP issues a JWT token
+3. User sends token to gateway: `Authorization: Bearer <jwt-token>`
+4. Gateway validates the JWT:
+   - Verifies signature against JWKS
+   - Checks `iss` matches `--jwt-issuer`
+   - Checks `aud` matches `--jwt-audience`
+   - Validates expiration and other standard claims
+   - Extracts role from `roles` claim (or `groups` as fallback)
+   - Maps IDP role to gateway role via `--jwt-role-mapping`
+
+**Example Azure AD Configuration:**
+```bash
+# Azure AD issues tokens with:
+#   iss: https://login.microsoftonline.com/{tenant}/v2.0
+#   aud: api://your-client-id (or the client ID itself)
+#   roles: ["Gateway.Admins"] or groups: ["group-id"]
+
+python3 -m sglang_router.launch_router \
+  --jwt-issuer "https://login.microsoftonline.com/your-tenant-id/v2.0" \
+  --jwt-audience "api://your-client-id" \
+  --jwt-role-mapping 'Gateway.Admins=admin' 'Gateway.Users=user'
+```
+
+#### Audit Logging
+
+Enable `--control-plane-audit-enabled` to log all control plane operations with:
+- Timestamp
+- Principal (API key ID or JWT subject)
+- Role
+- Action performed
+- Success/failure status
+
+#### Combined Authentication Example
+
+Use both API keys and JWT for different use cases:
+
+```bash
+python3 -m sglang_router.launch_router \
+  --worker-urls http://worker1:8000 \
+  # API keys for service accounts
+  --control-plane-api-keys 'ci:CI/CD Pipeline:admin:ci-secret' \
+  # JWT for human users via Azure AD
+  --jwt-issuer "https://login.microsoftonline.com/{tenant}/v2.0" \
+  --jwt-audience "api://gateway" \
+  --jwt-role-mapping 'Platform.Admins=admin' 'Platform.Users=user' \
+  # Enable audit logging
+  --control-plane-audit-enabled
+```
+
 ## Development & Testing
 ```bash
 # Build Rust components (debug mode, fast)
