@@ -57,6 +57,7 @@ class DecodingStage(PipelineStage):
     """
 
     def __init__(self, vae, pipeline=None) -> None:
+        super().__init__()
         self.vae: ParallelTiledVAE = vae
         self.pipeline = weakref.ref(pipeline) if pipeline else None
 
