@@ -1,10 +1,15 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 from functools import lru_cache
-from typing import Any, DeviceCapability, Platform, PlatformEnum
+from typing import Any
 
 import torch
 
-from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
+from sglang.multimodal_gen.runtime.platforms import (
+    AttentionBackendEnum,
+    Platform,
+    PlatformEnum,
+)
+from sglang.multimodal_gen.runtime.platforms.interface import DeviceCapability
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 # SPDX-License-Identifier: Apache-2.0
@@ -57,7 +62,7 @@ class MpsPlatform(Platform):
         return 0.0
 
     @classmethod
-    def get_available_memory(
+    def get_available_gpu_memory(
         cls,
         device_id: int = 0,
         distributed: bool = False,
