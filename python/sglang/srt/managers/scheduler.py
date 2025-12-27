@@ -1524,7 +1524,6 @@ class Scheduler(
             self._add_request_to_queue(req)
             return
 
-        # Copy more attributes
         if recv_req.logprob_start_len == -1 or not recv_req.return_logprob:
             # By default, only return the logprobs for output tokens
             # For prefill-only requests with logprob_start_len == -1, set logprob_start_len beyond input sequence
@@ -1532,16 +1531,13 @@ class Scheduler(
             if req.is_prefill_only:
                 req.logprob_start_len = len(req.origin_input_ids)
             else:
-                # TODO: For text generation, evaluate setting logprob_start_len to len(req.origin_input_ids) as well
-                req.logprob_start_len = len(req.origin_input_ids) - 1
+                req.logprob_start_len = -1
         else:
             req.logprob_start_len = recv_req.logprob_start_len
 
-        if not req.is_prefill_only and req.logprob_start_len >= len(
-            req.origin_input_ids
-        ):
+        if req.logprob_start_len > len(req.origin_input_ids):
             error_msg = f"{req.logprob_start_len=} is higher than the number of input tokens {len(req.origin_input_ids)=}. Please use a smaller logprob_start_len."
-            req.logprob_start_len = len(req.origin_input_ids) - 1
+            req.logprob_start_len = -1
             req.set_finish_with_abort(error_msg)
             self._add_request_to_queue(req)
             return
@@ -1760,7 +1756,7 @@ class Scheduler(
             return
 
         # Copy more attributes
-        req.logprob_start_len = len(req.origin_input_ids) - 1
+        req.logprob_start_len = -1
         self._add_request_to_queue(req)
 
     def handle_batch_embedding_request(

@@ -591,10 +591,10 @@ class SchedulerOutputProcessorMixin:
         For regular requests, all positions from logprob_start_len onwards have logprobs.
         """
         is_multi_item_scoring = self._is_multi_item_scoring(req)
+        relevant_tokens = req.origin_input_ids[req.logprob_start_len :]
 
         if is_multi_item_scoring:
             # Multi-item scoring: count delimiter tokens from logprob_start_len onwards
-            relevant_tokens = req.origin_input_ids[req.logprob_start_len :]
             return sum(
                 1
                 for token_id in relevant_tokens
@@ -602,7 +602,7 @@ class SchedulerOutputProcessorMixin:
             )
         else:
             # Regular request: all tokens from logprob_start_len onwards
-            return len(req.origin_input_ids) - req.logprob_start_len
+            return len(relevant_tokens)
 
     def _calculate_num_input_logprobs(
         self, req: Req, extend_input_len: int, extend_logprob_start_len: int
