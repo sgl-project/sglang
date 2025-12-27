@@ -8,8 +8,11 @@ use super::PipelineStage;
 use crate::routers::{
     error,
     grpc::{
-        context::{ClientSelection, ExecutionResult, RequestContext},
-        proto_wrapper::{ProtoGenerateRequest, ProtoStream},
+        context::{ClientSelection, ExecutionResult, LoadGuards, RequestContext, WorkerSelection},
+        proto_wrapper::{
+            ProtoEmbedRequest, ProtoEmbedResponseVariant, ProtoGenerateRequest, ProtoRequest,
+            ProtoStream,
+        },
     },
 };
 
@@ -56,6 +59,21 @@ impl PipelineStage for RequestExecutionStage {
             )
         })?;
 
+        // Create load guards for worker load tracking (increment load when created)
+        // They will be automatically dropped (and decrement load) when RequestContext is dropped
+        let workers = ctx.state.workers.as_ref().ok_or_else(|| {
+            error!(
+                function = "RequestExecutionStage::execute",
+                "Worker selection not completed"
+            );
+            error::internal_error(
+                "worker_selection_not_completed",
+                "Worker selection not completed",
+            )
+        })?;
+
+        ctx.state.load_guards = Some(LoadGuards::from(workers));
+
         // Extract dispatch metadata for tracing span
         let request_id = ctx
             .state
@@ -80,11 +98,14 @@ impl PipelineStage for RequestExecutionStage {
         );
 
         let result = async {
-            match self.mode {
-                ExecutionMode::Single => self.execute_single(proto_request, clients).await,
-                ExecutionMode::DualDispatch => {
-                    self.execute_dual_dispatch(proto_request, clients).await
-                }
+            match proto_request {
+                ProtoRequest::Generate(req) => match self.mode {
+                    ExecutionMode::Single => self.execute_single(req, clients, workers).await,
+                    ExecutionMode::DualDispatch => {
+                        self.execute_dual_dispatch(req, clients, workers).await
+                    }
+                },
+                ProtoRequest::Embed(req) => self.execute_single_embed(req, clients).await,
             }
         }
         .instrument(span)
@@ -105,6 +126,7 @@ impl RequestExecutionStage {
         &self,
         proto_request: ProtoGenerateRequest,
         clients: &mut ClientSelection,
+        workers: &WorkerSelection,
     ) -> Result<ExecutionResult, Response> {
         let client = clients.single_mut().ok_or_else(|| {
             error!(
@@ -117,7 +139,12 @@ impl RequestExecutionStage {
             )
         })?;
 
-        let stream = client.generate(proto_request).await.map_err(|e| {
+        let result = client.generate(proto_request).await;
+
+        // Record circuit breaker outcome
+        workers.record_outcome(result.is_ok());
+
+        let stream = result.map_err(|e| {
             error!(
                 function = "execute_single",
                 error = %e,
@@ -132,10 +159,67 @@ impl RequestExecutionStage {
         Ok(ExecutionResult::Single { stream })
     }
 
+    async fn execute_single_embed(
+        &self,
+        proto_request: ProtoEmbedRequest,
+        clients: &mut ClientSelection,
+    ) -> Result<ExecutionResult, Response> {
+        let client = clients.single_mut().ok_or_else(|| {
+            error!(
+                function = "execute_single_embed",
+                "Expected single client but got dual"
+            );
+            error::internal_error(
+                "expected_single_client_got_dual",
+                "Expected single client but got dual",
+            )
+        })?;
+
+        let response = client.embed(proto_request).await.map_err(|e| {
+            error!(
+                function = "execute_single_embed",
+                error = %e,
+                "Failed to start embedding"
+            );
+            error::internal_error(
+                "start_embedding_failed",
+                format!("Failed to start embedding: {}", e),
+            )
+        })?;
+
+        match response.into_response() {
+            ProtoEmbedResponseVariant::Complete(complete) => {
+                Ok(ExecutionResult::Embedding { response: complete })
+            }
+            ProtoEmbedResponseVariant::Error(e) => {
+                error!(
+                    function = "execute_single_embed",
+                    error = %e.message(),
+                    "Embedding execution failed"
+                );
+                Err(error::internal_error(
+                    "embedding_execution_failed",
+                    e.message().to_string(),
+                ))
+            }
+            ProtoEmbedResponseVariant::None => {
+                error!(
+                    function = "execute_single_embed",
+                    "Embedding execution returned no response"
+                );
+                Err(error::internal_error(
+                    "embedding_no_response",
+                    "Embedding execution returned no response",
+                ))
+            }
+        }
+    }
+
     async fn execute_dual_dispatch(
         &self,
         proto_request: ProtoGenerateRequest,
         clients: &mut ClientSelection,
+        workers: &WorkerSelection,
     ) -> Result<ExecutionResult, Response> {
         let (prefill_client, decode_client) = clients.dual_mut().ok_or_else(|| {
             error!(
@@ -155,6 +239,9 @@ impl RequestExecutionStage {
             prefill_client.generate(prefill_request),
             decode_client.generate(decode_request)
         );
+
+        // Record circuit breaker outcomes for each worker individually
+        workers.record_dual_outcomes(prefill_result.is_ok(), decode_result.is_ok());
 
         // Handle prefill result
         let prefill_stream = match prefill_result {

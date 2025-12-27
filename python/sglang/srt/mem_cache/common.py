@@ -342,9 +342,7 @@ def alloc_for_extend(
     # free out-of-window swa tokens
     if isinstance(batch.tree_cache, SWAChunkCache):
         for req, pre_len in zip(batch.reqs, batch.prefix_lens):
-            batch.tree_cache.evict_swa(
-                req, pre_len, batch.model_config.attention_chunk_size
-            )
+            batch.tree_cache.evict_swa(req, pre_len)
 
     bs = len(batch.reqs)
     prefix_tensors = [r.prefix_indices for r in batch.reqs]
@@ -437,9 +435,7 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
     """
     if isinstance(batch.tree_cache, SWAChunkCache):
         for req in batch.reqs:
-            batch.tree_cache.evict_swa(
-                req, req.seqlen - 1, batch.model_config.attention_chunk_size
-            )
+            batch.tree_cache.evict_swa(req, req.seqlen - 1)
 
     bs = batch.seq_lens.shape[0]
 

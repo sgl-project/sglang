@@ -59,6 +59,8 @@ class RouterArgs:
     request_id_headers: Optional[List[str]] = None
     # Request timeout in seconds
     request_timeout_secs: int = 1800
+    # Grace period in seconds to wait for in-flight requests during shutdown
+    shutdown_grace_period_secs: int = 180
     # Max concurrent requests for rate limiting (-1 to disable)
     max_concurrent_requests: int = -1
     # Queue size for pending requests when max concurrent limit reached
@@ -124,6 +126,15 @@ class RouterArgs:
     # Trace
     enable_trace: bool = False
     otlp_traces_endpoint: str = "localhost:4317"
+    # Control plane authentication
+    # API keys for control plane auth (list of tuples: id, name, key, role)
+    control_plane_api_keys: List[tuple] = dataclasses.field(default_factory=list)
+    control_plane_audit_enabled: bool = False
+    # JWT/OIDC configuration for control plane auth
+    jwt_issuer: Optional[str] = None
+    jwt_audience: Optional[str] = None
+    jwt_jwks_uri: Optional[str] = None
+    jwt_role_mapping: Dict[str, str] = dataclasses.field(default_factory=dict)
 
     @staticmethod
     def add_cli_args(
@@ -169,21 +180,28 @@ class RouterArgs:
             f"--{prefix}policy",
             type=str,
             default=RouterArgs.policy,
-            choices=["random", "round_robin", "cache_aware", "power_of_two"],
+            choices=["random", "round_robin", "cache_aware", "power_of_two", "manual"],
             help="Load balancing policy to use. In PD mode, this is used for both prefill and decode unless overridden",
         )
         parser.add_argument(
             f"--{prefix}prefill-policy",
             type=str,
             default=None,
-            choices=["random", "round_robin", "cache_aware", "power_of_two", "bucket"],
+            choices=[
+                "random",
+                "round_robin",
+                "cache_aware",
+                "power_of_two",
+                "manual",
+                "bucket",
+            ],
             help="Specific policy for prefill nodes in PD mode. If not specified, uses the main policy",
         )
         parser.add_argument(
             f"--{prefix}decode-policy",
             type=str,
             default=None,
-            choices=["random", "round_robin", "cache_aware", "power_of_two"],
+            choices=["random", "round_robin", "cache_aware", "power_of_two", "manual"],
             help="Specific policy for decode nodes in PD mode. If not specified, uses the main policy",
         )
 
@@ -363,6 +381,12 @@ class RouterArgs:
             type=int,
             default=RouterArgs.request_timeout_secs,
             help="Request timeout in seconds",
+        )
+        parser.add_argument(
+            f"--{prefix}shutdown-grace-period-secs",
+            type=int,
+            default=RouterArgs.shutdown_grace_period_secs,
+            help="Grace period in seconds to wait for in-flight requests during shutdown",
         )
         # Retry configuration
         parser.add_argument(
@@ -671,6 +695,47 @@ class RouterArgs:
             default="localhost:4317",
             help="Config opentelemetry collector endpoint if --enable-trace is set. format: <ip>:<port>",
         )
+        # Control plane authentication
+        parser.add_argument(
+            f"--{prefix}control-plane-api-keys",
+            type=str,
+            nargs="*",
+            default=[],
+            help="API keys for control plane authentication. Format: 'id:name:role:key' where role is 'admin' or 'user'. "
+            "Example: --control-plane-api-keys 'key1:Service Account:admin:secret123' 'key2:Read Only:user:secret456'",
+        )
+        parser.add_argument(
+            f"--{prefix}control-plane-audit-enabled",
+            action="store_true",
+            default=False,
+            help="Enable audit logging for control plane operations",
+        )
+        parser.add_argument(
+            f"--{prefix}jwt-issuer",
+            type=str,
+            default=None,
+            help="OIDC issuer URL for JWT authentication (e.g., https://login.microsoftonline.com/{tenant}/v2.0)",
+        )
+        parser.add_argument(
+            f"--{prefix}jwt-audience",
+            type=str,
+            default=None,
+            help="Expected audience claim for JWT tokens (usually the client ID or API identifier)",
+        )
+        parser.add_argument(
+            f"--{prefix}jwt-jwks-uri",
+            type=str,
+            default=None,
+            help="Explicit JWKS URI. If not provided, discovered from issuer via .well-known/openid-configuration",
+        )
+        parser.add_argument(
+            f"--{prefix}jwt-role-mapping",
+            type=str,
+            nargs="*",
+            default=[],
+            help="Mapping from IDP role/group names to gateway roles. Format: 'idp_role=gateway_role'. "
+            "Example: --jwt-role-mapping 'Gateway.Admin=admin' 'Gateway.User=user'",
+        )
 
     @classmethod
     def from_cli_args(
@@ -725,6 +790,16 @@ class RouterArgs:
 
         # Mooncake-specific annotation
         args_dict["bootstrap_port_annotation"] = "sglang.ai/bootstrap-port"
+
+        # Parse control plane API keys
+        args_dict["control_plane_api_keys"] = cls._parse_control_plane_api_keys(
+            cli_args_dict.get(f"{prefix}control_plane_api_keys", [])
+        )
+
+        # Parse JWT role mapping
+        args_dict["jwt_role_mapping"] = cls._parse_jwt_role_mapping(
+            cli_args_dict.get(f"{prefix}jwt_role_mapping", [])
+        )
 
         return cls(**args_dict)
 
@@ -815,3 +890,52 @@ class RouterArgs:
 
         # decode_list is a list of single-element lists due to nargs=1
         return [url[0] for url in decode_list]
+
+    @staticmethod
+    def _parse_control_plane_api_keys(api_keys_list):
+        """Parse control plane API keys from --control-plane-api-keys arguments.
+
+        Format: id:name:role:key
+        Example: --control-plane-api-keys 'key1:Service Account:admin:secret123'
+        """
+        if not api_keys_list:
+            return []
+
+        parsed_keys = []
+        for key_str in api_keys_list:
+            parts = key_str.split(":", 3)  # Split into at most 4 parts
+            if len(parts) != 4:
+                raise ValueError(
+                    f"Invalid API key format: '{key_str}'. Expected 'id:name:role:key'"
+                )
+            key_id, name, role, key = parts
+            role_lower = role.lower()
+            if role_lower not in ("admin", "user"):
+                raise ValueError(f"Invalid role: '{role}'. Must be 'admin' or 'user'")
+            parsed_keys.append((key_id, name, key, role_lower))
+        return parsed_keys
+
+    @staticmethod
+    def _parse_jwt_role_mapping(role_mapping_list):
+        """Parse JWT role mapping from --jwt-role-mapping arguments.
+
+        Format: idp_role=gateway_role
+        Example: --jwt-role-mapping 'Gateway.Admin=admin' 'Gateway.User=user'
+        """
+        if not role_mapping_list:
+            return {}
+
+        mapping = {}
+        for mapping_str in role_mapping_list:
+            if "=" not in mapping_str:
+                raise ValueError(
+                    f"Invalid role mapping format: '{mapping_str}'. Expected 'idp_role=gateway_role'"
+                )
+            idp_role, gateway_role = mapping_str.split("=", 1)
+            gateway_role_lower = gateway_role.lower()
+            if gateway_role_lower not in ("admin", "user"):
+                raise ValueError(
+                    f"Invalid gateway role: '{gateway_role}'. Must be 'admin' or 'user'"
+                )
+            mapping[idp_role] = gateway_role_lower
+        return mapping
