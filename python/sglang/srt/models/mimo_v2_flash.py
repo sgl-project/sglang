@@ -13,7 +13,7 @@
 # ==============================================================================
 
 import logging
-from typing import Any, Dict, Iterable, Optional, Tuple, Union
+from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -45,7 +45,11 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
-from sglang.srt.layers.moe import get_moe_a2a_backend, get_moe_runner_backend
+from sglang.srt.layers.moe import (
+    get_moe_a2a_backend,
+    get_moe_runner_backend,
+    should_use_flashinfer_cutlass_moe_fp4_allgather,
+)
 from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE, get_moe_impl_class
 from sglang.srt.layers.moe.topk import TopK, TopKOutputFormat
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -110,13 +114,21 @@ class MiMoV2MLP(nn.Module):
             )
         self.act_fn = SiluAndMul()
 
-    def forward(self, x, forward_batch: ForwardBatch = None):
+    def forward(
+        self,
+        x,
+        forward_batch: ForwardBatch = None,
+        should_allreduce_fusion: bool = False,
+        use_reduce_scatter: bool = False,
+    ):
         if (self.tp_size == 1) and x.shape[0] == 0:
             return x
 
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
-        x, _ = self.down_proj(x)
+        x, _ = self.down_proj(
+            x, skip_all_reduce=should_allreduce_fusion or use_reduce_scatter
+        )
         return x
 
 
@@ -250,11 +262,13 @@ class MiMoV2MoE(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: Optional[ForwardBatch] = None,
         should_allreduce_fusion: bool = False,
+        use_reduce_scatter: bool = False,
     ) -> torch.Tensor:
         if not self._enable_a2a_moe:
             return self.forward_normal(
                 hidden_states,
                 should_allreduce_fusion,
+                use_reduce_scatter,
             )
         else:
             return self.forward_deepep(hidden_states, forward_batch)
@@ -263,6 +277,7 @@ class MiMoV2MoE(nn.Module):
         self,
         hidden_states: torch.Tensor,
         should_allreduce_fusion: bool = False,
+        use_reduce_scatter: bool = False,
     ) -> torch.Tensor:
 
         if hidden_states.shape[0] > 0:
@@ -274,7 +289,12 @@ class MiMoV2MoE(nn.Module):
 
         final_hidden_states = self.experts(hidden_states, topk_output)
 
-        if self.tp_size > 1 and not should_allreduce_fusion:
+        if (
+            self.tp_size > 1
+            and not should_allreduce_fusion
+            and not use_reduce_scatter
+            and not should_use_flashinfer_cutlass_moe_fp4_allgather()
+        ):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
 
         return final_hidden_states
@@ -527,6 +547,8 @@ class MiMoV2DecoderLayer(nn.Module):
             layer_scatter_modes=self.layer_scatter_modes,
             input_layernorm=self.input_layernorm,
             post_attention_layernorm=self.post_attention_layernorm,
+            allow_reduce_scatter=True,
+            is_last_layer=(self.layer_id == self.config.num_hidden_layers - 1),
         )
 
     def forward(
@@ -535,10 +557,16 @@ class MiMoV2DecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
+        captured_last_layer_outputs: Optional[List[torch.Tensor]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # Self Attention
-        hidden_states, residual = self.layer_communicator.prepare_attn(
-            hidden_states, residual, forward_batch
+        hidden_states, residual = (
+            self.layer_communicator.prepare_attn_and_capture_last_layer_outputs(
+                hidden_states,
+                residual,
+                forward_batch,
+                captured_last_layer_outputs=captured_last_layer_outputs,
+            )
         )
 
         if hidden_states.shape[0] != 0:
@@ -552,11 +580,27 @@ class MiMoV2DecoderLayer(nn.Module):
             hidden_states, residual, forward_batch
         )
 
-        hidden_states = self.mlp(hidden_states, forward_batch)
-
-        hidden_states, residual = self.layer_communicator.postprocess_layer(
-            hidden_states, residual, forward_batch
+        should_allreduce_fusion = (
+            self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
+                forward_batch
+            )
         )
+
+        # For DP with padding, reduce scatter can be used instead of all-reduce.
+        use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
+            forward_batch
+        )
+
+        hidden_states = self.mlp(
+            hidden_states, forward_batch, should_allreduce_fusion, use_reduce_scatter
+        )
+
+        if should_allreduce_fusion:
+            hidden_states._sglang_needs_allreduce_fusion = True
+        else:
+            hidden_states, residual = self.layer_communicator.postprocess_layer(
+                hidden_states, residual, forward_batch
+            )
 
         return hidden_states, residual
 
@@ -625,6 +669,11 @@ class MiMoV2Model(nn.Module):
     def get_input_embeddings(self) -> nn.Embedding:
         return self.embed_tokens
 
+    def set_eagle3_layers_to_capture(self, layers_to_capture: List[int]):
+        self.layers_to_capture = layers_to_capture
+        for layer_id in self.layers_to_capture:
+            setattr(self.layers[layer_id], "_is_layer_to_capture", True)
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -643,6 +692,8 @@ class MiMoV2Model(nn.Module):
             assert pp_proxy_tensors is not None
             hidden_states = pp_proxy_tensors["hidden_states"]
             residual = pp_proxy_tensors["residual"]
+
+        aux_hidden_states = []
         for i in range(self.start_layer, self.end_layer):
             layer = self.layers[i]
             hidden_states, residual = layer(
@@ -650,6 +701,11 @@ class MiMoV2Model(nn.Module):
                 hidden_states,
                 forward_batch,
                 residual,
+                captured_last_layer_outputs=(
+                    aux_hidden_states
+                    if getattr(layer, "_is_layer_to_capture", False)
+                    else None
+                ),
             )
 
         hidden_states_before_norm = None
@@ -662,12 +718,15 @@ class MiMoV2Model(nn.Module):
             )
         else:
             if hidden_states.shape[0] > 0:
+                if forward_batch.return_hidden_states_before_norm:
+                    hidden_states_before_norm = (
+                        hidden_states if residual is None else hidden_states + residual
+                    )
                 if residual is None:
-                    hidden_states_before_norm = hidden_states
                     hidden_states = self.norm(hidden_states)
                 else:
-                    hidden_states_before_norm = hidden_states + residual
                     hidden_states, _ = self.norm(hidden_states, residual)
+
         return hidden_states, hidden_states_before_norm
 
     # If this function is called, it should always initialize KV cache scale

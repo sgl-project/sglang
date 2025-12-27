@@ -46,6 +46,7 @@ sources = [
     "csrc/allreduce/quick_all_reduce.cu",
     "csrc/common_extension_rocm.cc",
     "csrc/elementwise/activation.cu",
+    "csrc/elementwise/topk.cu",
     "csrc/grammar/apply_token_bitmask_inplace_cuda.cu",
     "csrc/moe/moe_align_kernel.cu",
     "csrc/moe/moe_topk_softmax_kernels.cu",
@@ -80,6 +81,12 @@ fp8_macro = (
     "-DHIP_FP8_TYPE_FNUZ" if amdgpu_target == "gfx942" else "-DHIP_FP8_TYPE_E4M3"
 )
 
+# Dynamic shared-memory budget for the TopK kernels.
+# - gfx942 (MI300/MI325): LDS is typically 64KB per workgroup -> keep dynamic smem <= ~48KB
+#   (leaves room for static shared allocations in the kernel).
+# - gfx95x (MI350): LDS is larger (e.g. 160KB per CU) -> allow the original 128KB dynamic smem.
+topk_dynamic_smem_bytes = 48 * 1024 if amdgpu_target == "gfx942" else 32 * 1024 * 4
+
 hipcc_flags = [
     "-DNDEBUG",
     f"-DOPERATOR_NAMESPACE={operator_namespace}",
@@ -91,6 +98,7 @@ hipcc_flags = [
     "-DENABLE_BF16",
     "-DENABLE_FP8",
     fp8_macro,
+    f"-DSGL_TOPK_DYNAMIC_SMEM_BYTES={topk_dynamic_smem_bytes}",
 ]
 
 ext_modules = [

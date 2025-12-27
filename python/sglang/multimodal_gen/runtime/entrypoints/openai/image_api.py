@@ -21,13 +21,14 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
 from sglang.multimodal_gen.runtime.entrypoints.openai.stores import IMAGE_STORE
 from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     _parse_size,
+    add_common_data_to_response,
     merge_image_input_list,
     process_generation_batch,
     save_image_to_path,
 )
 from sglang.multimodal_gen.runtime.entrypoints.utils import prepare_request
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
-from sglang.multimodal_gen.runtime.scheduler_client import scheduler_client
+from sglang.multimodal_gen.runtime.scheduler_client import async_scheduler_client
 from sglang.multimodal_gen.runtime.server_args import get_global_server_args
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.utils import shallow_asdict
@@ -55,7 +56,7 @@ def _build_sampling_params_from_request(
     size: Optional[str],
     output_format: Optional[str],
     background: Optional[str],
-    image_path: Optional[str] = None,
+    image_path: Optional[list[str]] = None,
     seed: Optional[int] = None,
     generator_device: Optional[str] = None,
     negative_prompt: Optional[str] = None,
@@ -120,8 +121,11 @@ async def generations(
         server_args=get_global_server_args(),
         sampling_params=sampling,
     )
+
     # Run synchronously for images and save to disk
-    save_file_path = await process_generation_batch(scheduler_client, batch)
+    save_file_path, result = await process_generation_batch(
+        async_scheduler_client, batch
+    )
 
     await IMAGE_STORE.upsert(
         request_id,
@@ -136,14 +140,18 @@ async def generations(
     if resp_format == "b64_json":
         with open(save_file_path, "rb") as f:
             b64 = base64.b64encode(f.read()).decode("utf-8")
-        return ImageResponse(
-            data=[
+        response_kwargs = {
+            "data": [
                 ImageResponseData(
                     b64_json=b64,
                     revised_prompt=request.prompt,
                 )
-            ]
+            ],
+        }
+        response_kwargs = add_common_data_to_response(
+            response_kwargs, request_id=request_id, result=result
         )
+        return ImageResponse(**response_kwargs)
     else:
         # Return error, not supported
         raise HTTPException(
@@ -218,7 +226,9 @@ async def edits(
     )
     batch = _build_req_from_sampling(sampling)
 
-    save_file_path = await process_generation_batch(scheduler_client, batch)
+    save_file_path, result = await process_generation_batch(
+        async_scheduler_client, batch
+    )
 
     await IMAGE_STORE.upsert(
         request_id,
@@ -235,12 +245,20 @@ async def edits(
     if (response_format or "b64_json").lower() == "b64_json":
         with open(save_file_path, "rb") as f:
             b64 = base64.b64encode(f.read()).decode("utf-8")
-        return ImageResponse(
-            data=[ImageResponseData(b64_json=b64, revised_prompt=prompt)]
-        )
+        response_kwargs = {
+            "data": [ImageResponseData(b64_json=b64, revised_prompt=prompt)],
+        }
     else:
         url = f"/v1/images/{request_id}/content"
-        return ImageResponse(data=[ImageResponseData(url=url, revised_prompt=prompt)])
+        response_kwargs = {
+            "data": [ImageResponseData(url=url, revised_prompt=prompt)],
+        }
+
+    response_kwargs = add_common_data_to_response(
+        response_kwargs, request_id=request_id, result=result
+    )
+
+    return ImageResponse(**response_kwargs)
 
 
 @router.get("/{image_id}/content")
