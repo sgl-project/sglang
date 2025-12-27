@@ -2849,5 +2849,405 @@ class TestJsonArrayParser(unittest.TestCase):
         self.assertEqual(total_calls, 3, "Should have parsed exactly 3 tool calls")
 
 
+class TestGlm47MoeDetector(unittest.TestCase):
+    def setUp(self):
+        self.tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="get_weather",
+                    description="Get weather information",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "city": {"type": "string", "description": "City name"},
+                            "date": {"type": "string", "description": "Date"},
+                        },
+                        "required": ["city", "date"],
+                    },
+                ),
+            ),
+        ]
+        self.detector = Glm47MoeDetector()
+
+    def test_single_tool_call(self):
+        text = (
+            "<tool_call>get_weather"
+            "<arg_key>city</arg_key><arg_value>Beijing</arg_value>"
+            "<arg_key>date</arg_key><arg_value>2024-06-27</arg_value>"
+            "</tool_call>"
+        )
+        result = self.detector.detect_and_parse(text, self.tools)
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(result.calls[0].name, "get_weather")
+        self.assertEqual(
+            result.calls[0].parameters, '{"city": "Beijing", "date": "2024-06-27"}'
+        )
+        self.assertEqual(result.normal_text, "")
+
+    def test_multiple_tool_calls(self):
+        text = (
+            "<tool_call>get_weather"
+            "<arg_key>city</arg_key><arg_value>Beijing</arg_value>"
+            "<arg_key>date</arg_key><arg_value>2024-06-27</arg_value>"
+            "</tool_call>"
+            "<tool_call>get_weather"
+            "<arg_key>city</arg_key><arg_value>Shanghai</arg_value>"
+            "<arg_key>date</arg_key><arg_value>2024-06-28</arg_value>"
+            "</tool_call>"
+        )
+        result = self.detector.detect_and_parse(text, self.tools)
+        self.assertEqual(len(result.calls), 2)
+        self.assertEqual(result.calls[0].name, "get_weather")
+        self.assertEqual(
+            result.calls[0].parameters, '{"city": "Beijing", "date": "2024-06-27"}'
+        )
+        self.assertEqual(result.calls[1].name, "get_weather")
+        self.assertEqual(
+            result.calls[1].parameters, '{"city": "Shanghai", "date": "2024-06-28"}'
+        )
+        self.assertEqual(result.normal_text, "")
+
+    def test_streaming_tool_call(self):
+        """Test streaming incremental parsing of a tool call."""
+        chunks = [
+            "<tool_call>get_weather",
+            "<arg_key>city</arg_key><arg_value>Beijing</arg_value>",
+            "<arg_key>date</arg_key><arg_value>2024-06-27</arg_value>",
+            "</tool_call>",
+        ]
+        tool_calls = []
+        for chunk in chunks:
+            result = self.detector.parse_streaming_increment(chunk, self.tools)
+            for tool_call_chunk in result.calls:
+                if (
+                    hasattr(tool_call_chunk, "tool_index")
+                    and tool_call_chunk.tool_index is not None
+                ):
+                    while len(tool_calls) <= tool_call_chunk.tool_index:
+                        tool_calls.append({"name": "", "parameters": ""})
+                    tc = tool_calls[tool_call_chunk.tool_index]
+                    if tool_call_chunk.name:
+                        tc["name"] = tool_call_chunk.name
+                    if tool_call_chunk.parameters:
+                        tc["parameters"] += tool_call_chunk.parameters
+        self.assertEqual(len(tool_calls), 1)
+        self.assertEqual(tool_calls[0]["name"], "get_weather")
+        self.assertEqual(
+            tool_calls[0]["parameters"], '{"city": "Beijing", "date": "2024-06-27"}'
+        )
+
+    def test_streaming_multiple_tool_calls(self):
+        """Test streaming incremental parsing of multiple tool calls."""
+        chunks = [
+            "<tool_call>get_weather",
+            "<arg_key>city</arg_key><arg_value>Beijing</arg_value>",
+            "<arg_key>date</arg_key><arg_value>2024-06-27</arg_value>",
+            "</tool_call><tool_call>get_weather",
+            "<arg_key>city</arg_key><arg_value>Shanghai</arg_value>",
+            "<arg_key>date</arg_key><arg_value>2024-06-28</arg_value>",
+            "</tool_call>",
+        ]
+        tool_calls = []
+        for chunk in chunks:
+            result = self.detector.parse_streaming_increment(chunk, self.tools)
+            for tool_call_chunk in result.calls:
+                if (
+                    hasattr(tool_call_chunk, "tool_index")
+                    and tool_call_chunk.tool_index is not None
+                ):
+                    while len(tool_calls) <= tool_call_chunk.tool_index:
+                        tool_calls.append({"name": "", "parameters": ""})
+                    tc = tool_calls[tool_call_chunk.tool_index]
+                    if tool_call_chunk.name:
+                        tc["name"] = tool_call_chunk.name
+                    if tool_call_chunk.parameters:
+                        tc["parameters"] += tool_call_chunk.parameters
+        self.assertEqual(len(tool_calls), 2)
+        self.assertEqual(tool_calls[0]["name"], "get_weather")
+        self.assertEqual(
+            tool_calls[0]["parameters"], '{"city": "Beijing", "date": "2024-06-27"}'
+        )
+        self.assertEqual(tool_calls[1]["name"], "get_weather")
+        self.assertEqual(
+            tool_calls[1]["parameters"], '{"city": "Shanghai", "date": "2024-06-28"}'
+        )
+
+    def test_complex_schema_anyof_parsing(self):
+        """Test parsing with complex JSON Schema types like anyOf that should result in array/object types, not strings."""
+
+        # Create a tool with complex parameter definition similar to the reported issue
+        complex_tool = Tool(
+            type="function",
+            function=Function(
+                name="RemoteProcedureCall",
+                description="Invoke a function (by name) in the program hosting the large language model",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "functionname": {
+                            "type": "string",
+                            "description": "Name of function to invoke",
+                        },
+                        "parameter1": {"type": "string", "description": "parameter 1"},
+                        "parameter2": {"type": "string", "description": "parameter 2"},
+                        "parameter3": {"type": "string", "description": "parameter 3"},
+                        "parameter4": {"type": "string", "description": "parameter 4"},
+                        "parameter5": {"type": "string", "description": "parameter 5"},
+                        "parameter6": {"type": "string", "description": "parameter 6"},
+                        "parameter7": {"type": "string", "description": "parameter 7"},
+                        "parameter8": {"type": "string", "description": "parameter 8"},
+                        "parameter9": {
+                            "anyOf": [
+                                {
+                                    "anyOf": [
+                                        {"not": {}},
+                                        {
+                                            "type": "array",
+                                            "items": {"type": "string"},
+                                            "description": "\nList of chunk IDs to exclude from results to prevent duplication. \nAlways provided.\nUse an empty list [] for the initial search. \nFor follow-up searches, provide the IDs from previous results.\n",
+                                        },
+                                    ],
+                                    "description": "\nList of chunk IDs to exclude from results to prevent duplication. \nAlways provided.\nUse an empty list [] for the initial search. \nFor follow-up searches, provide the IDs from previous results.\n",
+                                },
+                                {"type": "null"},
+                            ],
+                            "description": "parameter 9",
+                        },
+                    },
+                    "required": ["functionname", "parameter9"],
+                },
+            ),
+        )
+
+        tools = [complex_tool]
+        detector = Glm47MoeDetector()
+
+        # Test that parameter9 with anyOf schema gets correctly parsed as array, not string
+        text = (
+            "<tool_call>RemoteProcedureCall"
+            "<arg_key>functionname</arg_key><arg_value>TestFunction</arg_value>"
+            "<arg_key>parameter1</arg_key><arg_value>1</arg_value>"
+            "<arg_key>parameter2</arg_key><arg_value>2</arg_value>"
+            "<arg_key>parameter3</arg_key><arg_value>3</arg_value>"
+            "<arg_key>parameter4</arg_key><arg_value>4</arg_value>"
+            "<arg_key>parameter5</arg_key><arg_value>5</arg_value>"
+            "<arg_key>parameter6</arg_key><arg_value>6</arg_value>"
+            "<arg_key>parameter7</arg_key><arg_value>7</arg_value>"
+            "<arg_key>parameter8</arg_key><arg_value>8</arg_value>"
+            "<arg_key>parameter9</arg_key><arg_value>[]</arg_value>"
+            "</tool_call>"
+        )
+
+        result = detector.detect_and_parse(text, tools)
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(result.calls[0].name, "RemoteProcedureCall")
+
+        # Parse the parameters to verify that parameter9 is an array, not a string
+        params = json.loads(result.calls[0].parameters)
+        self.assertEqual(params["functionname"], "TestFunction")
+        self.assertEqual(params["parameter1"], "1")
+        self.assertEqual(params["parameter2"], "2")
+        self.assertEqual(params["parameter3"], "3")
+        self.assertEqual(params["parameter4"], "4")
+        self.assertEqual(params["parameter5"], "5")
+        self.assertEqual(params["parameter6"], "6")
+        self.assertEqual(params["parameter7"], "7")
+        self.assertEqual(params["parameter8"], "8")
+
+        # The key test: parameter9 should be an array, not a string
+        self.assertIsInstance(
+            params["parameter9"],
+            list,
+            "parameter9 should be parsed as an array, not a string",
+        )
+        self.assertEqual(
+            params["parameter9"], [], "parameter9 should be an empty array"
+        )
+
+    def test_streaming_complex_schema_anyof_parsing(self):
+        """Test streaming parsing with complex JSON Schema types like anyOf."""
+
+        # Create a tool with complex parameter definition
+        complex_tool = Tool(
+            type="function",
+            function=Function(
+                name="RemoteProcedureCall",
+                description="Invoke a function (by name) in the program hosting the large language model",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "functionname": {"type": "string"},
+                        "parameter9": {
+                            "anyOf": [
+                                {"type": "array", "items": {"type": "string"}},
+                                {"type": "null"},
+                            ]
+                        },
+                    },
+                    "required": ["functionname", "parameter9"],
+                },
+            ),
+        )
+
+        tools = [complex_tool]
+        detector = Glm47MoeDetector()
+
+        # Simulate the streaming chunks from the original issue
+        chunks = [
+            "<tool_call>RemoteProcedureCall",
+            "<arg_key>functionname</arg_key><arg_value>TestFunction</arg_value>",
+            "<arg_key>parameter9</arg_key><arg_value>[]</arg_value>",
+            "</tool_call>",
+        ]
+
+        accumulated_calls = []
+        for chunk in chunks:
+            result = detector.parse_streaming_increment(chunk, tools)
+            for call in result.calls:
+                if call.tool_index is not None:
+                    # Expand list to include current tool index
+                    while len(accumulated_calls) <= call.tool_index:
+                        accumulated_calls.append({"name": "", "parameters": ""})
+
+                    tc = accumulated_calls[call.tool_index]
+                    if call.name:
+                        tc["name"] = call.name
+                    if call.parameters:
+                        tc["parameters"] += call.parameters
+
+        # Verify the parsing result
+        self.assertEqual(
+            len(accumulated_calls), 1, f"Expected 1 call, got {len(accumulated_calls)}"
+        )
+        call = accumulated_calls[0]
+        self.assertEqual(
+            call["name"],
+            "RemoteProcedureCall",
+            f"Expected 'RemoteProcedureCall', got '{call['name']}'",
+        )
+
+        # Parse parameters and verify parameter9 is an array
+        params = json.loads(call["parameters"])
+        self.assertEqual(params["functionname"], "TestFunction")
+
+        # The key test: parameter9 should be an array, not a string
+        self.assertIsInstance(
+            params["parameter9"],
+            list,
+            f"parameter9 should be parsed as an array, not a string. Got {type(params['parameter9'])}: {params['parameter9']}",
+        )
+        self.assertEqual(
+            params["parameter9"], [], "parameter9 should be an empty array"
+        )
+
+    def test_openai_style_array_type_parsing(self):
+        """Test parsing with OpenAI-style array types like ['string', 'null']."""
+
+        # Create a tool with OpenAI-style array type
+        openai_style_tool = Tool(
+            type="function",
+            function=Function(
+                name="test_function",
+                description="Test function with OpenAI-style array type",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "optional_array": {
+                            "type": ["array", "null"],
+                            "items": {"type": "string"},
+                            "description": "An optional array",
+                        },
+                        "optional_string": {
+                            "type": ["string", "null"],
+                            "description": "An optional string",
+                        },
+                    },
+                },
+            ),
+        )
+
+        tools = [openai_style_tool]
+        detector = Glm47MoeDetector()
+
+        # Test with an array value
+        text = (
+            "<tool_call>test_function"
+            "<arg_key>optional_array</arg_key><arg_value>[]</arg_value>"
+            "<arg_key>optional_string</arg_key><arg_value>test</arg_value>"
+            "</tool_call>"
+        )
+
+        result = detector.detect_and_parse(text, tools)
+        self.assertEqual(len(result.calls), 1)
+
+        params = json.loads(result.calls[0].parameters)
+
+        # Verify that optional_array is parsed as an array, not a string
+        self.assertIsInstance(
+            params["optional_array"],
+            list,
+            "optional_array should be parsed as an array",
+        )
+        self.assertEqual(
+            params["optional_array"], [], "optional_array should be an empty array"
+        )
+
+        # Verify that optional_string is parsed as a string
+        self.assertEqual(
+            params["optional_string"],
+            "test",
+            "optional_string should be parsed as a string",
+        )
+
+    def test_tool_call_id(self):
+        """Test that the buffer and state are reset after a tool call is completed."""
+        chunks = [
+            "<tool_call>get_weather",
+            "<arg_key>city</arg_key><arg_value>Beijing</arg_value>",
+            "<arg_key>date</arg_key><arg_value>2024-06-27</arg_value>",
+            "</tool_call>",
+        ]
+        for chunk in chunks:
+            result = self.detector.parse_streaming_increment(chunk, self.tools)
+        self.assertEqual(self.detector.current_tool_id, 1)
+
+    def test_invalid_tool_call(self):
+        """Test that invalid tool calls are handled correctly."""
+        text = "<tool_call>invalid_func<arg_key>city</arg_key><arg_value>Beijing</arg_value></tool_call>"
+        result = self.detector.detect_and_parse(text, self.tools)
+        self.assertEqual(len(result.calls), 0)
+
+    def test_partial_tool_call(self):
+        """Test parsing a partial tool call that spans multiple chunks."""
+        chunks = [
+            "<tool_call>get_weather",
+            "<arg_key>city</arg_key><arg_value>Beijing</arg_value>",
+            "<arg_key>date</arg_key><arg_value>2024-06-27</arg_value></tool_call>",
+        ]
+
+        tool_calls = []
+        for chunk in chunks:
+            result = self.detector.parse_streaming_increment(chunk, self.tools)
+            for tool_call_chunk in result.calls:
+                if (
+                    hasattr(tool_call_chunk, "tool_index")
+                    and tool_call_chunk.tool_index is not None
+                ):
+                    while len(tool_calls) <= tool_call_chunk.tool_index:
+                        tool_calls.append({"name": "", "parameters": ""})
+                    tc = tool_calls[tool_call_chunk.tool_index]
+                    if tool_call_chunk.name:
+                        tc["name"] = tool_call_chunk.name
+                    if tool_call_chunk.parameters:
+                        tc["parameters"] += tool_call_chunk.parameters
+
+        self.assertEqual(len(tool_calls), 1)
+        self.assertEqual(tool_calls[0]["name"], "get_weather")
+        self.assertEqual(
+            tool_calls[0]["parameters"], '{"city": "Beijing", "date": "2024-06-27"}'
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -31,13 +31,19 @@ def get_argument_type(
 ) -> Optional[str]:
     """Get the expected type of a function argument from tool definitions.
 
+    Handles complex JSON Schema structures like anyOf, oneOf, allOf and OpenAI-style arrays.
+    For example:
+    - {"type": "string"} -> "string"
+    - {"type": ["string", "null"]} -> "string"
+    - {"anyOf": [{"type": "array"}, {"type": "null"}]} -> "array"
+
     Args:
         func_name: Name of the function/tool
         arg_key: Name of the argument
         defined_tools: List of available tools
 
     Returns:
-        The type string (e.g., 'string', 'number', 'object') or None if not found
+        The type string (e.g., 'string', 'number', 'object', 'array', 'boolean', 'integer') or None if not found
     """
     name2tool = {tool.function.name: tool for tool in defined_tools}
     if func_name not in name2tool:
@@ -48,7 +54,44 @@ def get_argument_type(
         properties = {}
     if arg_key not in properties:
         return None
-    return properties[arg_key].get("type", None)
+
+    schema = properties[arg_key]
+    return _extract_type_from_complex_schema(schema)
+
+
+def _extract_type_from_complex_schema(schema: dict) -> Optional[str]:
+    """Helper function to extract type from complex schema structures.
+
+    Recursively handles nested anyOf, oneOf, allOf structures.
+
+    Args:
+        schema: JSON Schema object
+
+    Returns:
+        The type string or None if not found
+    """
+    if "type" in schema:
+        type_value = schema["type"]
+        # Handle OpenAI-style array types: ["string", "null"]
+        if isinstance(type_value, list):
+            for t in type_value:
+                if isinstance(t, str) and t != "null":
+                    return t
+        # Handle simple type string
+        elif isinstance(type_value, str):
+            return type_value
+
+    for keyword in ["anyOf", "oneOf", "allOf"]:
+        if keyword in schema:
+            variants = schema[keyword]
+            if isinstance(variants, list):
+                for variant in variants:
+                    if isinstance(variant, dict):
+                        nested = _extract_type_from_complex_schema(variant)
+                        if nested and nested != "null":
+                            return nested
+
+    return None
 
 
 def _convert_to_number(value: str) -> Any:
@@ -93,16 +136,17 @@ def parse_arguments(
     except (json.JSONDecodeError, ValueError):
         pass
 
-    # Strategy 2: Unescape and parse
+    # Strategy 2: Unescape and parse (safe version using json.dumps for proper escaping)
     try:
-        wrapped = json.loads('{"tmp": "' + json_value + '"}')
+        escaped_value = json.dumps(json_value, ensure_ascii=False)
+        wrapped = json.loads('{"tmp": ' + escaped_value + "}")
         parsed_value = json.loads(wrapped["tmp"])
 
         if arg_type == "number" and isinstance(parsed_value, str):
             parsed_value = _convert_to_number(parsed_value)
 
         return parsed_value, True
-    except (json.JSONDecodeError, ValueError, KeyError):
+    except (json.JSONDecodeError, ValueError, KeyError, TypeError):
         pass
 
     # Strategy 3: ast.literal_eval
@@ -112,7 +156,18 @@ def parse_arguments(
     except (ValueError, SyntaxError):
         pass
 
-    # Strategy 4: Treat as string
+    # Strategy 4: For non-string types (object, array), try to parse even if it's in string format
+    if arg_type in ["object", "array"]:
+        try:
+            # If the expected type is object/array but the value is a string representation,
+            # try to parse it as JSON to get the actual object/array
+            if json_value.startswith("[") or json_value.startswith("{"):
+                parsed_value = json.loads(json_value)
+                return parsed_value, True
+        except (json.JSONDecodeError, ValueError):
+            pass
+
+    # Strategy 5: Treat as string
     try:
         quoted_value = json.dumps(str(json_value))
         return json.loads(quoted_value), True
@@ -179,8 +234,10 @@ class Glm47MoeDetector(BaseFormatDetector):
             for match_result in match_result_list:
                 # Get function name
                 func_detail = self.func_detail_regex.search(match_result)
-                func_name = func_detail.group(1)
-                func_args = func_detail.group(2)
+                if func_detail is None:
+                    continue
+                func_name = func_detail.group(1) if func_detail.group(1) else ""
+                func_args = func_detail.group(2) if func_detail.group(2) else ""
                 arguments = {}
                 if func_args:
                     pairs = self.func_arg_regex.findall(func_args)
@@ -227,7 +284,7 @@ class Glm47MoeDetector(BaseFormatDetector):
 
         Args:
             value: Raw value string
-            value_type: Expected type ('string', 'number', 'object')
+            value_type: Expected type ('string', 'number', 'object', 'array')
 
         Returns:
             Properly formatted JSON value string
@@ -237,16 +294,27 @@ class Glm47MoeDetector(BaseFormatDetector):
             return json.dumps(value, ensure_ascii=False)
         elif value_type == "number":
             try:
-                num = _convert_to_number(value.strip())
+                num = _convert_to_number(value.strip() if value else "")
                 return str(num)
             except (ValueError, AttributeError):
                 # Fallback to string if not a valid number
                 logger.warning(
                     f"Failed to parse '{value}' as number, treating as string"
                 )
+                return json.dumps(str(value) if value else "", ensure_ascii=False)
+        elif value_type in ["object", "array"]:
+            # For object/array types, try to parse and return as valid JSON
+            try:
+                parsed_value = json.loads(value)
+                return json.dumps(parsed_value, ensure_ascii=False)
+            except (json.JSONDecodeError, ValueError):
+                # If it's not valid JSON but should be object/array, treat as string
+                logger.warning(
+                    f"Failed to parse '{value}' as {value_type}, treating as string"
+                )
                 return json.dumps(str(value), ensure_ascii=False)
         else:
-            # For object/array types, return as-is (should already be valid JSON)
+            # For other types, return as-is
             return value
 
     def _process_xml_to_json_streaming(
@@ -359,7 +427,7 @@ class Glm47MoeDetector(BaseFormatDetector):
                                 self._current_value += content
                                 self._xml_tag_buffer = ""
                         else:
-                            # For object/array types, output as-is
+                            # For object/array types, output as-is (no quotes)
                             if content:
                                 if not self._value_started:
                                     self._value_started = True
@@ -383,7 +451,18 @@ class Glm47MoeDetector(BaseFormatDetector):
         # Check if we have a tool call
         has_tool_call = self.bot_token in current_text
 
-        if not has_tool_call:
+        # If there is a tool call, check if there's normal text before it
+        if has_tool_call:
+            bot_token_idx = current_text.find(self.bot_token)
+            if bot_token_idx > 0:
+                # There is text before the tool call token, return it as normal text
+                normal_text_before = current_text[:bot_token_idx]
+                # Keep the tool call and everything after it in the buffer
+                remaining_text = current_text[bot_token_idx:]
+                self._buffer = remaining_text
+                return StreamingParseResult(normal_text=normal_text_before, calls=[])
+            # If bot_token is at the beginning (index 0), continue with tool call processing
+        else:
             # Check if buffer could be the start of a tool call
             # Keep buffer if it could be a partial match of bot_token
             is_potential_start = any(
@@ -408,17 +487,33 @@ class Glm47MoeDetector(BaseFormatDetector):
         if not hasattr(self, "_tool_indices"):
             self._tool_indices = self._get_tool_indices(tools)
 
+        # Extract any normal text before the first tool call token
+        bot_token_idx = current_text.find(self.bot_token)
+        normal_text_before = ""
+        remaining_text = current_text  # Keep track of what's left to process
+
+        if bot_token_idx != -1:
+            normal_text_before = current_text[:bot_token_idx]
+            # Keep only the tool call part and after for further processing
+            remaining_text = current_text[bot_token_idx:]
+            self._buffer = remaining_text  # Update the buffer
+
         calls: list[ToolCallItem] = []
         try:
-            # Try to match a partial or complete tool call
+            # Try to match a partial or complete tool call from the remaining text
             partial_match = re.search(
                 pattern=r"<tool_call>(.*?)(<arg_key>.*?)?(</tool_call>|$)",
-                string=current_text,
+                string=remaining_text,  # Use remaining_text which starts with the tool call
                 flags=re.DOTALL,
             )
-            if partial_match:
-                func_name = partial_match.group(1).strip()
-                func_args_raw = partial_match.group(2).strip()
+            # Only proceed if we have a non-empty function name
+            if partial_match and (func_name := partial_match.group(1)) is not None:
+                # Check if we have a valid function name before proceeding
+                func_name = func_name.strip()
+                func_args_raw = partial_match.group(2)
+                func_args_raw = (
+                    func_args_raw.strip() if func_args_raw is not None else ""
+                )
                 is_tool_end = partial_match.group(3)
 
                 # Initialize state if this is the first tool call
@@ -438,7 +533,12 @@ class Glm47MoeDetector(BaseFormatDetector):
 
                 # Send tool name first if not sent yet
                 if not self.current_tool_name_sent:
-                    assert func_name, "func_name should not be empty"
+                    # Additional safety check for func_name
+                    if not func_name:
+                        logger.warning(
+                            "Empty function name detected, skipping tool call"
+                        )
+                        return StreamingParseResult(normal_text="", calls=[])
                     calls.append(
                         ToolCallItem(
                             tool_index=self.current_tool_id,
@@ -509,23 +609,27 @@ class Glm47MoeDetector(BaseFormatDetector):
                             ] += closing_brace
 
                         try:
-                            pairs = self.func_arg_regex.findall(func_args_raw)
-                            if pairs:
-                                arguments = self._parse_argument_pairs(
-                                    pairs, func_name, tools
-                                )
-                                self.prev_tool_call_arr[self.current_tool_id][
-                                    "arguments"
-                                ] = arguments
+                            # Only try to parse if func_args_raw is not empty
+                            if func_args_raw:
+                                pairs = self.func_arg_regex.findall(func_args_raw)
+                                if pairs:
+                                    arguments = self._parse_argument_pairs(
+                                        pairs, func_name, tools
+                                    )
+                                    self.prev_tool_call_arr[self.current_tool_id][
+                                        "arguments"
+                                    ] = arguments
                         except Exception as e:
                             logger.debug(
                                 f"Failed to parse arguments: {e}", exc_info=True
                             )
 
                         # Remove the completed tool call from buffer
-                        self._buffer = current_text[partial_match.end(3) :]
+                        self._buffer = remaining_text[partial_match.end(3) :]
 
-                        result = StreamingParseResult(normal_text="", calls=calls)
+                        result = StreamingParseResult(
+                            normal_text=normal_text_before, calls=calls
+                        )
                         self.current_tool_id += 1
                         self._last_arguments = ""
                         self.current_tool_name_sent = False
@@ -533,7 +637,7 @@ class Glm47MoeDetector(BaseFormatDetector):
                         self._reset_streaming_state()
                         return result
 
-            return StreamingParseResult(normal_text="", calls=calls)
+            return StreamingParseResult(normal_text=normal_text_before, calls=calls)
 
         except Exception as e:
             logger.error(f"Error in parse_streaming_increment: {e}", exc_info=True)
