@@ -104,6 +104,7 @@ class DenoisingStage(PipelineStage):
         self.attn_backend = get_attn_backend(
             head_size=attn_head_size,
             dtype=torch.float16,
+            tag="denoising_stage",
         )
 
         # cfg
@@ -484,6 +485,7 @@ class DenoisingStage(PipelineStage):
         Returns:
             A dictionary containing all the prepared variables for the denoising loop.
         """
+        assert self.transformer is not None
         pipeline = self.pipeline() if self.pipeline else None
         if not server_args.model_loaded["transformer"]:
             loader = TransformerLoader()
@@ -921,7 +923,6 @@ class DenoisingStage(PipelineStage):
             The batch with denoised latents.
         """
         # Prepare variables for the denoising loop
-
         prepared_vars = self._prepare_denoising_loop(batch, server_args)
         extra_step_kwargs = prepared_vars["extra_step_kwargs"]
         target_dtype = prepared_vars["target_dtype"]

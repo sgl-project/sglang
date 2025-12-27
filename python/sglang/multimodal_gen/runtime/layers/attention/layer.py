@@ -20,7 +20,10 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
 from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
     AttentionImpl,
 )
-from sglang.multimodal_gen.runtime.layers.attention.selector import get_attn_backend
+from sglang.multimodal_gen.runtime.layers.attention.selector import (
+    backend_name_to_enum,
+    get_attn_backend,
+)
 from sglang.multimodal_gen.runtime.layers.usp import (
     _usp_input_all_to_all,
     _usp_output_all_to_all,
@@ -59,7 +62,10 @@ class UlyssesAttention(nn.Module):
 
         dtype = get_compute_dtype()
         attn_backend = get_attn_backend(
-            head_size, dtype, supported_attention_backends=supported_attention_backends
+            head_size,
+            dtype,
+            supported_attention_backends=supported_attention_backends,
+            tag=prefix,
         )
         impl_cls = attn_backend.get_impl_cls()
 
@@ -75,7 +81,7 @@ class UlyssesAttention(nn.Module):
         self.num_heads = num_heads
         self.head_size = head_size
         self.num_kv_heads = num_kv_heads
-        self.backend = attn_backend.get_enum()
+        self.backend = backend_name_to_enum(attn_backend.get_enum().name)
         self.dtype = dtype
 
     @torch.compiler.disable
@@ -230,6 +236,7 @@ class LocalAttention(nn.Module):
         softmax_scale: float | None = None,
         causal: bool = False,
         supported_attention_backends: set[AttentionBackendEnum] | None = None,
+        prefix: str = "",
         **extra_impl_args,
     ) -> None:
         super().__init__()
@@ -242,7 +249,10 @@ class LocalAttention(nn.Module):
 
         dtype = get_compute_dtype()
         attn_backend = get_attn_backend(
-            head_size, dtype, supported_attention_backends=supported_attention_backends
+            head_size,
+            dtype,
+            supported_attention_backends=supported_attention_backends,
+            tag=prefix,
         )
         impl_cls = attn_backend.get_impl_cls()
         self.attn_impl = impl_cls(
@@ -251,12 +261,13 @@ class LocalAttention(nn.Module):
             softmax_scale=self.softmax_scale,
             num_kv_heads=num_kv_heads,
             causal=causal,
+            prefix=f"{prefix}.impl",
             **extra_impl_args,
         )
         self.num_heads = num_heads
         self.head_size = head_size
         self.num_kv_heads = num_kv_heads
-        self.backend = attn_backend.get_enum()
+        self.backend = backend_name_to_enum(attn_backend.get_enum().name)
         self.dtype = dtype
 
     def forward(
@@ -318,7 +329,10 @@ class USPAttention(nn.Module):
 
         dtype = get_compute_dtype()
         attn_backend = get_attn_backend(
-            head_size, dtype, supported_attention_backends=supported_attention_backends
+            head_size,
+            dtype,
+            supported_attention_backends=supported_attention_backends,
+            tag=prefix,
         )
         impl_cls: Type["AttentionImpl"] = attn_backend.get_impl_cls()
         self.attn_impl = impl_cls(
