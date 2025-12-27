@@ -75,7 +75,8 @@ def time_func_latency(
                 try:
                     ret = await ret
                 finally:
-                    metric.labels(name=name).observe(time.monotonic() - start)
+                    if metric is not None:
+                        metric.labels(name=name).observe(time.monotonic() - start)
             return ret
 
         @wraps(func)
@@ -88,7 +89,8 @@ def time_func_latency(
             try:
                 ret = func(*args, **kwargs)
             finally:
-                metric.labels(name=name).observe(time.monotonic() - start)
+                if metric is not None:
+                    metric.labels(name=name).observe(time.monotonic() - start)
             return ret
 
         if asyncio.iscoroutinefunction(func):
