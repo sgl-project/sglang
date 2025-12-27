@@ -10,6 +10,7 @@ import requests
 
 from sglang.bench_serving import get_tokenizer
 from sglang.srt.utils import is_hip, kill_process_tree
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_DRAFT_MODEL_EAGLE3,
@@ -20,6 +21,15 @@ from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     popen_launch_server,
+)
+
+# HiCache variant tests - temporarily disabled due to intermittent CI failures
+# that cannot be reproduced locally. Use test_hicache_storage for accuracy testing.
+# Example failure: https://github.com/sgl-project/sglang/actions/runs/20527003659/job/58972707514
+register_cuda_ci(
+    est_time=368,
+    suite="stage-b-test-small-1-gpu",
+    disabled="Intermittent CI failures not reproducible locally, see PR #15952",
 )
 
 _is_hip = is_hip()
