@@ -17,7 +17,10 @@ from sglang.test.test_utils import (
     CustomTestCase,
     find_available_port,
     is_in_ci,
+    set_hicache_env_vars,
 )
+
+set_hicache_env_vars()
 
 
 class HiCacheStorageMooncakeBackendBaseMixin(HiCacheStorageBaseMixin):

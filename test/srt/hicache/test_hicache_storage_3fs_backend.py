@@ -10,7 +10,9 @@ import unittest
 
 from test_hicache_storage_file_backend import HiCacheStorageBaseMixin
 
-from sglang.test.test_utils import CustomTestCase
+from sglang.test.test_utils import CustomTestCase, set_hicache_env_vars
+
+set_hicache_env_vars()
 
 
 class HiCacheStorage3FSBackendBaseMixin(HiCacheStorageBaseMixin):

@@ -20,9 +20,12 @@ from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     popen_launch_server,
+    set_hicache_env_vars,
 )
 
 _is_hip = is_hip()
+
+set_hicache_env_vars()
 
 
 class HiCacheEvalMixin:
