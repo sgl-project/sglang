@@ -234,7 +234,9 @@ class NSAIndexerMetadata(BaseIndexerMetadata):
             assert False, f"Unsupported {self.topk_transform_method = }"
 
 
-_NSA_IMPL_T: TypeAlias = Literal["flashmla_sparse", "flashmla_kv", "fa3", "tilelang"]
+NSA_IMPL_T: TypeAlias = Literal[
+    "flashmla_sparse", "flashmla_kv", "fa3", "tilelang", "flashinfer"
+]
 
 
 class NativeSparseAttnBackend(
@@ -266,16 +268,18 @@ class NativeSparseAttnBackend(
         self.num_q_heads = (
             model_runner.model_config.num_attention_heads // get_attention_tp_size()
         )
-        self.kv_cache_dim = model_runner.token_to_kv_pool.kv_cache_dim
+        self.kv_cache_dim: int = model_runner.token_to_kv_pool.kv_cache_dim
 
         assert model_runner.req_to_token_pool is not None
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
 
         self.use_mha: bool = False
-        self.nsa_prefill_impl: _NSA_IMPL_T = (
+        self.nsa_prefill_impl: NSA_IMPL_T = (  # type: ignore
             model_runner.server_args.nsa_prefill_backend
         )
-        self.nsa_decode_impl: _NSA_IMPL_T = model_runner.server_args.nsa_decode_backend
+        self.nsa_decode_impl: NSA_IMPL_T = (  # type: ignore
+            model_runner.server_args.nsa_decode_backend
+        )
         self.enable_auto_select_prefill_impl = self.nsa_prefill_impl == "flashmla_auto"
 
         self._arange_buf = torch.arange(16384, device=self.device, dtype=torch.int32)
@@ -298,8 +302,8 @@ class NativeSparseAttnBackend(
         self.device_capability = torch.cuda.get_device_capability()
         self.device_sm_major = self.device_capability[0]
 
-        # Allocate global workspace buffer for TRTLLm ragged attention kernel (SM100/B200)
-        if self.device_sm_major >= 10:
+        # Allocate global workspace buffer for flashinfer
+        if self.device_sm_major >= 10 or self.nsa_decode_impl == "flashinfer":
             global global_workspace_buffer
             if global_workspace_buffer is None:
                 global_workspace_buffer = torch.empty(
@@ -310,6 +314,7 @@ class NativeSparseAttnBackend(
             self.workspace_buffer = global_workspace_buffer
         else:
             self.workspace_buffer = None
+        print(f"{self.nsa_prefill_impl = } {self.nsa_decode_impl = }")
 
     def get_device_int32_arange(self, l: int) -> torch.Tensor:
         if l > len(self._arange_buf):
@@ -1312,6 +1317,16 @@ class NativeSparseAttnBackend(
                 logit_cap=layer.logit_cap,
                 page_size=1,
             )
+        elif self.nsa_decode_impl == "flashinfer":
+            if q_rope is not None:
+                q_all = torch.cat([q_nope, q_rope], dim=-1)
+            return self._forward_flashinfer(
+                q_all=q_all,
+                kv_cache=kv_cache,
+                page_table_1=page_table_1,
+                sm_scale=layer.scaling,
+                metadata=metadata,
+            )
         elif self.nsa_decode_impl == "aiter":
             if q_rope is not None:
                 q_all = torch.cat([q_nope, q_rope], dim=-1)
@@ -1524,6 +1539,32 @@ class NativeSparseAttnBackend(
             softmax_scale=layer.scaling,
             causal=causal,
             ver=fa_version,
+        )
+
+    def _forward_flashinfer(
+        self,
+        q_all: torch.Tensor,
+        kv_cache: torch.Tensor,
+        page_table_1: torch.Tensor,
+        sm_scale: float,
+        metadata: NSAMetadata,
+    ) -> torch.Tensor:
+        import flashinfer
+
+        assert self.workspace_buffer is not None
+        return flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
+            query=q_all.unsqueeze(1),  # TODO(dark): support MTP
+            kv_cache=kv_cache.view(-1, 1, self.real_page_size, self.kv_cache_dim),
+            workspace_buffer=self.workspace_buffer,
+            qk_nope_head_dim=128,
+            kv_lora_rank=512,
+            qk_rope_head_dim=64,
+            block_tables=page_table_1.unsqueeze(1),  # NOTE: 1 is MTP length
+            seq_lens=metadata.nsa_seqlens_expanded,
+            max_seq_len=metadata.nsa_max_seqlen_q,
+            sparse_mla_top_k=self.nsa_index_topk,
+            bmm1_scale=sm_scale,
+            enable_pdl=True,
         )
 
     def _forward_tilelang(
