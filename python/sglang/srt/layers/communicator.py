@@ -321,6 +321,11 @@ class LayerCommunicator:
         allow_reduce_scatter: bool = False,
         is_last_layer: bool = False,
         qkv_latent_func: Optional[Callable] = None,
+        # When comm_only is True, LayerCommunicator is used only for scatter/gather
+        # and group-size transitions, and should avoid changing hidden_states or
+        # residual via layernorm. This is useful for post-LN architectures like
+        # OLMo2/3 where layer norms live strictly outside the communicator.
+        comm_only: bool = False,
     ):
         self.layer_scatter_modes = layer_scatter_modes
         self.input_layernorm = input_layernorm
@@ -328,6 +333,7 @@ class LayerCommunicator:
         self.allow_reduce_scatter = allow_reduce_scatter
         self.is_last_layer = is_last_layer
         self.qkv_latent_func = qkv_latent_func
+        self.comm_only = comm_only
 
         self._context = CommunicateContext.init_new()
         self._communicate_simple_fn = CommunicateSimpleFn.get_fn(
@@ -391,83 +397,100 @@ class LayerCommunicator:
                 hidden_states,
                 residual,
             )
-        if hidden_states.shape[0] == 0:
-            residual = hidden_states
-        else:
-            if (
-                residual is not None
-                and hasattr(hidden_states, "_sglang_needs_allreduce_fusion")
-                and hidden_states._sglang_needs_allreduce_fusion
-            ):
-                hidden_states, residual = (
-                    self.input_layernorm.forward_with_allreduce_fusion(
-                        hidden_states, residual
-                    )
-                )
+        if not self.comm_only:
+            if hidden_states.shape[0] == 0:
+                residual = hidden_states
             else:
-                if residual is None:
-                    residual = hidden_states
-
-                    if _use_aiter and _is_gfx95_supported and ("mxfp4" in quant_format):
-                        hidden_states, *_, _ = fused_rms_mxfp4_quant(
-                            hidden_states,
-                            self.input_layernorm.weight,
-                            self.input_layernorm.variance_epsilon,
-                            None,
-                            None,
-                            None,
-                            None,
-                        )
-                    elif _use_aiter and _is_gfx95_supported and ("fp8" in quant_format):
-
-                        hidden_states, _, _, _res = fused_rms_fp8_group_quant(
-                            hidden_states,
-                            self.input_layernorm.weight,
-                            self.input_layernorm.variance_epsilon,
-                            inp2=None,
-                            inp2_weight=None,
-                            inp2_epsilon=None,
-                            group_size=128,
-                            dtype_quant=torch.float8_e4m3fn,
-                            res1=None,
-                            output_unquantized_inp1=False,
-                        )
-
-                    else:
-                        hidden_states = self.input_layernorm(hidden_states)
-                else:
-
-                    if _use_aiter and _is_gfx95_supported and ("mxfp4" in quant_format):
-                        hidden_states, *_, residual = fused_rms_mxfp4_quant(
-                            hidden_states,
-                            self.input_layernorm.weight,
-                            self.input_layernorm.variance_epsilon,
-                            None,
-                            None,
-                            None,
-                            residual,
-                        )
-                    elif _use_aiter and _is_gfx95_supported and ("fp8" in quant_format):
-                        # RMSNorm + FP8 per-group quant
-                        # return hidden_states：
-                        #   out_fp8  : FP8 activation →  a8w8 GEMM
-                        #   out_bs   : block-scale →  gemm_a8w8_blockscale.x_scale
-                        hidden_states, _, _, residual = fused_rms_fp8_group_quant(
-                            hidden_states,
-                            self.input_layernorm.weight,
-                            self.input_layernorm.variance_epsilon,
-                            inp2=None,
-                            inp2_weight=None,
-                            inp2_epsilon=None,
-                            group_size=128,
-                            dtype_quant=torch.float8_e4m3fn,
-                            res1=residual,
-                            output_unquantized_inp1=False,
-                        )
-                    else:
-                        hidden_states, residual = self.input_layernorm(
+                if (
+                    residual is not None
+                    and hasattr(hidden_states, "_sglang_needs_allreduce_fusion")
+                    and hidden_states._sglang_needs_allreduce_fusion
+                ):
+                    hidden_states, residual = (
+                        self.input_layernorm.forward_with_allreduce_fusion(
                             hidden_states, residual
                         )
+                    )
+                else:
+                    if residual is None:
+                        residual = hidden_states
+
+                        if (
+                            _use_aiter
+                            and _is_gfx95_supported
+                            and ("mxfp4" in quant_format)
+                        ):
+                            hidden_states, *_, _ = fused_rms_mxfp4_quant(
+                                hidden_states,
+                                self.input_layernorm.weight,
+                                self.input_layernorm.variance_epsilon,
+                                None,
+                                None,
+                                None,
+                                None,
+                            )
+                        elif (
+                            _use_aiter
+                            and _is_gfx95_supported
+                            and ("fp8" in quant_format)
+                        ):
+
+                            hidden_states, _, _, _res = fused_rms_fp8_group_quant(
+                                hidden_states,
+                                self.input_layernorm.weight,
+                                self.input_layernorm.variance_epsilon,
+                                inp2=None,
+                                inp2_weight=None,
+                                inp2_epsilon=None,
+                                group_size=128,
+                                dtype_quant=torch.float8_e4m3fn,
+                                res1=None,
+                                output_unquantized_inp1=False,
+                            )
+
+                        else:
+                            hidden_states = self.input_layernorm(hidden_states)
+                    else:
+
+                        if (
+                            _use_aiter
+                            and _is_gfx95_supported
+                            and ("mxfp4" in quant_format)
+                        ):
+                            hidden_states, *_, residual = fused_rms_mxfp4_quant(
+                                hidden_states,
+                                self.input_layernorm.weight,
+                                self.input_layernorm.variance_epsilon,
+                                None,
+                                None,
+                                None,
+                                residual,
+                            )
+                        elif (
+                            _use_aiter
+                            and _is_gfx95_supported
+                            and ("fp8" in quant_format)
+                        ):
+                            # RMSNorm + FP8 per-group quant
+                            # return hidden_states：
+                            #   out_fp8  : FP8 activation →  a8w8 GEMM
+                            #   out_bs   : block-scale →  gemm_a8w8_blockscale.x_scale
+                            hidden_states, _, _, residual = fused_rms_fp8_group_quant(
+                                hidden_states,
+                                self.input_layernorm.weight,
+                                self.input_layernorm.variance_epsilon,
+                                inp2=None,
+                                inp2_weight=None,
+                                inp2_epsilon=None,
+                                group_size=128,
+                                dtype_quant=torch.float8_e4m3fn,
+                                res1=residual,
+                                output_unquantized_inp1=False,
+                            )
+                        else:
+                            hidden_states, residual = self.input_layernorm(
+                                hidden_states, residual
+                            )
 
         hidden_states = self._communicate_simple_fn(
             hidden_states=hidden_states,
@@ -516,6 +539,7 @@ class LayerCommunicator:
             forward_batch=forward_batch,
             layernorm=self.post_attention_layernorm,
             context=self._context,
+            apply_layernorm=not self.comm_only,
         )
 
     def postprocess_layer(
@@ -724,9 +748,10 @@ class CommunicateWithAllReduceAndLayerNormFn:
         forward_batch: ForwardBatch,
         layernorm: torch.nn.Module,
         context: CommunicateContext,
+        apply_layernorm: bool = True,
     ):
         # TODO move these `if shape != 0` into LayerNorm itself
-        if hidden_states.shape[0] != 0:
+        if hidden_states.shape[0] != 0 and apply_layernorm:
             hidden_states, residual = layernorm(hidden_states, residual)
         return hidden_states, residual
 
@@ -739,6 +764,7 @@ class CommunicateWithAllReduceAndLayerNormFn:
         context: CommunicateContext,
         *,
         residual_input_mode,
+        apply_layernorm: bool = True,
     ):
         if get_attn_tp_context().input_scattered:
             return CommunicateWithAllReduceAndLayerNormFn._tp_all_reduce_with_scattered_residual(
@@ -755,12 +781,16 @@ class CommunicateWithAllReduceAndLayerNormFn:
             )
             attn_tp_all_gather_into_tensor(residual, local_residual)
         if context.attn_dp_size != 1:
-            if context.attn_tp_rank == 0:
+            if apply_layernorm and context.attn_tp_rank == 0:
                 hidden_states += residual
 
             # Perform layernorm on smaller data before comm. Only valid when attn_tp_size is 1 (tp_size == dp_size)
             use_layer_norm_before_gather = context.attn_tp_size == 1
-            if use_layer_norm_before_gather and hidden_states.shape[0] != 0:
+            if (
+                use_layer_norm_before_gather
+                and hidden_states.shape[0] != 0
+                and apply_layernorm
+            ):
                 residual = hidden_states
                 with use_symmetric_memory(
                     get_tp_group(),
@@ -776,26 +806,32 @@ class CommunicateWithAllReduceAndLayerNormFn:
 
             if not use_layer_norm_before_gather:
                 dp_scatter(residual, hidden_states, forward_batch)
-                if hidden_states.shape[0] != 0:
+                if hidden_states.shape[0] != 0 and apply_layernorm:
                     hidden_states = layernorm(hidden_states)
         else:
             # According to the discussion in https://github.com/flashinfer-ai/flashinfer/issues/1223#issuecomment-3047256465
             # We set the max token num to 128 for allreduce fusion with min-latency case(use_oneshot=True).
-            if (
-                (_is_sm100_supported or _is_sm90_supported)
-                and _is_flashinfer_available
-                and hasattr(layernorm, "forward_with_allreduce_fusion")
-                and get_global_server_args().enable_flashinfer_allreduce_fusion
-                and hidden_states.shape[0] <= 2048
-            ):
-                hidden_states, residual = layernorm.forward_with_allreduce_fusion(
-                    hidden_states, residual
-                )
+            if apply_layernorm:
+                if (
+                    (_is_sm100_supported or _is_sm90_supported)
+                    and _is_flashinfer_available
+                    and hasattr(layernorm, "forward_with_allreduce_fusion")
+                    and get_global_server_args().enable_flashinfer_allreduce_fusion
+                    and hidden_states.shape[0] <= 2048
+                ):
+                    hidden_states, residual = layernorm.forward_with_allreduce_fusion(
+                        hidden_states, residual
+                    )
+                else:
+                    hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+                    if context.cache is not None:
+                        _ = prepare_weight_cache(hidden_states, context.cache)
+                    hidden_states, residual = layernorm(hidden_states, residual)
             else:
+                # Comm-only path: keep allreduce/cache behavior but skip layernorm.
                 hidden_states = tensor_model_parallel_all_reduce(hidden_states)
                 if _is_npu and context.cache is not None:
                     _ = prepare_weight_cache(hidden_states, context.cache)
-                hidden_states, residual = layernorm(hidden_states, residual)
         return hidden_states, residual
 
     @staticmethod
@@ -807,6 +843,7 @@ class CommunicateWithAllReduceAndLayerNormFn:
         context: CommunicateContext,
         *,
         residual_input_mode,
+        apply_layernorm: bool = True,
     ):
         input_hidden_states = hidden_states
         hidden_states = hidden_states.tensor_split(context.attn_tp_size)[
@@ -815,7 +852,7 @@ class CommunicateWithAllReduceAndLayerNormFn:
         attn_tp_reduce_scatter_tensor(hidden_states, input_hidden_states)
         if residual_input_mode == ScatterMode.TP_ATTN_FULL:
             residual = residual.tensor_split(context.attn_tp_size)[context.attn_tp_rank]
-        if hidden_states.shape[0] != 0:
+        if hidden_states.shape[0] != 0 and apply_layernorm:
             hidden_states, residual = layernorm(hidden_states, residual)
         return hidden_states, residual
 
