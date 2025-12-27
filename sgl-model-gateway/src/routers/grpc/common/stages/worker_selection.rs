@@ -67,11 +67,23 @@ impl PipelineStage for WorkerSelectionStage {
             prep.original_text.as_deref()
         };
 
+        // Get tokens for PrefixHash policy support
+        let tokens = if prep.token_ids.is_empty() {
+            None
+        } else {
+            Some(prep.token_ids.as_slice())
+        };
+
         let headers = ctx.input.headers.as_ref();
 
         let workers = match self.mode {
             WorkerSelectionMode::Regular => {
-                match self.select_single_worker(ctx.input.model_id.as_deref(), text, headers) {
+                match self.select_single_worker(
+                    ctx.input.model_id.as_deref(),
+                    text,
+                    tokens,
+                    headers,
+                ) {
                     Some(w) => WorkerSelection::Single { worker: w },
                     None => {
                         error!(
@@ -88,7 +100,7 @@ impl PipelineStage for WorkerSelectionStage {
                 }
             }
             WorkerSelectionMode::PrefillDecode => {
-                match self.select_pd_pair(ctx.input.model_id.as_deref(), text, headers) {
+                match self.select_pd_pair(ctx.input.model_id.as_deref(), text, tokens, headers) {
                     Some((prefill, decode)) => WorkerSelection::Dual { prefill, decode },
                     None => {
                         error!(
@@ -123,6 +135,7 @@ impl WorkerSelectionStage {
         &self,
         model_id: Option<&str>,
         text: Option<&str>,
+        tokens: Option<&[u32]>,
         headers: Option<&http::HeaderMap>,
     ) -> Option<Arc<dyn Worker>> {
         // Get workers for the specified model, filtered by connection mode
@@ -158,6 +171,7 @@ impl WorkerSelectionStage {
             &available,
             &SelectWorkerInfo {
                 request_text: text,
+                tokens,
                 headers,
                 hash_ring,
             },
@@ -179,6 +193,7 @@ impl WorkerSelectionStage {
         &self,
         model_id: Option<&str>,
         text: Option<&str>,
+        tokens: Option<&[u32]>,
         headers: Option<&http::HeaderMap>,
     ) -> Option<(Arc<dyn Worker>, Arc<dyn Worker>)> {
         let all_workers = self.worker_registry.get_workers_filtered(
@@ -226,6 +241,7 @@ impl WorkerSelectionStage {
 
         let info = SelectWorkerInfo {
             request_text: text,
+            tokens,
             headers,
             hash_ring,
         };
