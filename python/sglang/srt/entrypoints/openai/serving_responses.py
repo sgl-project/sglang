@@ -468,6 +468,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                 num_prompt_tokens = final_res.meta_info.get("prompt_tokens", 0)
                 num_generated_tokens = final_res.meta_info.get("completion_tokens", 0)
                 num_cached_tokens = final_res.meta_info.get("cached_tokens", 0)
+                num_reasoning_tokens = final_res.meta_info.get("reasoning_tokens", 0)
             elif hasattr(final_res, "prompt_token_ids") and hasattr(
                 final_res, "outputs"
             ):
