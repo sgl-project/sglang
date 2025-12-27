@@ -288,7 +288,9 @@ class LoRAManager:
         num_tokens = forward_batch.input_ids.shape[0]  # Tokens in current forward pass
 
         # Create tensor and fill with adapter indices from segments
-        token_lora_indices_reordered = torch.empty(num_tokens, dtype=torch.int32, device=batch_info.weight_indices.device)
+        token_lora_indices_reordered = torch.empty(
+            num_tokens, dtype=torch.int32, device=batch_info.weight_indices.device
+        )
         seg_indptr = batch_info.seg_indptr  # [num_segments + 1]
         for seg_idx in range(batch_info.num_segments):
             start_token = seg_indptr[seg_idx]
@@ -302,7 +304,11 @@ class LoRAManager:
         else:
             # Tokens are reordered (chunked backend): need to convert back to original order
             inverse_permutation = torch.empty_like(batch_info.permutation)
-            inverse_permutation[batch_info.permutation] = torch.arange(num_tokens, dtype=batch_info.permutation.dtype, device=batch_info.permutation.device)
+            inverse_permutation[batch_info.permutation] = torch.arange(
+                num_tokens,
+                dtype=batch_info.permutation.dtype,
+                device=batch_info.permutation.device,
+            )
             token_lora_indices = token_lora_indices_reordered[inverse_permutation]
 
         forward_batch.token_lora_indices = token_lora_indices
@@ -317,21 +323,33 @@ class LoRAManager:
         for layer_id, layer_modules in enumerate(self.lora_modules):
             for module_name, module in layer_modules.items():
                 # Hack for FusedMoE layer
-                if isinstance(module, FusedMoEWithLoRA) and all(x in self.target_modules for x in ['gate_up_proj', 'down_proj']):
+                if isinstance(module, FusedMoEWithLoRA) and all(
+                    x in self.target_modules for x in ["gate_up_proj", "down_proj"]
+                ):
                     module.set_lora_info(
-                        self.memory_pool.get_tensor(
-                            target_module='gate_up_proj_moe',
+                        gate_up_lora_a_weights=self.memory_pool.get_tensor(
+                            target_module="gate_up_proj_moe",
                             layer_id=layer_id,
                             lora_type=LoRAType.LORA_A,
                         ),
-                        self.memory_pool.get_tensor(
-                            target_module='down_proj_moe',
+                        gate_up_lora_b_weights=self.memory_pool.get_tensor(
+                            target_module="gate_up_proj_moe",
+                            layer_id=layer_id,
+                            lora_type=LoRAType.LORA_B,
+                        ),
+                        down_lora_a_weights=self.memory_pool.get_tensor(
+                            target_module="down_proj_moe",
+                            layer_id=layer_id,
+                            lora_type=LoRAType.LORA_A,
+                        ),
+                        down_lora_b_weights=self.memory_pool.get_tensor(
+                            target_module="down_proj_moe",
                             layer_id=layer_id,
                             lora_type=LoRAType.LORA_B,
                         ),
                     )
                     continue
-                
+
                 target_module = get_target_module_name(
                     module_name, self.memory_pool.target_modules
                 )
@@ -377,8 +395,8 @@ class LoRAManager:
         the target modules and max_lora_rank.
         """
 
-        assert lora_paths or (
-            max_lora_rank is not None and target_modules is not None
+        assert (
+            lora_paths or (max_lora_rank is not None and target_modules is not None)
         ), "When no initial --lora-paths is provided, you need to specify both --max-lora-rank and --lora-target-modules for LoRA initialization."
 
         self.init_lora_adapters(lora_paths)
@@ -557,9 +575,11 @@ class LoRAManager:
                     module_name, module
                 )
                 continue
-        
+
             # Temporarily workaround for FusedMoE layer
-            if isinstance(module, FusedMoE) and all(x in self.target_modules for x in ['gate_up_proj', 'down_proj']):
+            if isinstance(module, FusedMoE) and all(
+                x in self.target_modules for x in ["gate_up_proj", "down_proj"]
+            ):
                 self.lora_modules[layer_id][module_name] = self.set_lora_module(
                     module_name, module
                 )

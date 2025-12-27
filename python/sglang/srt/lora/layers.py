@@ -593,18 +593,24 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
     ):
         super().__init__(base_layer, lora_backend)
         # LoRA tensors will be set by LoRAManager
-        self.lora_a_weights = None
-        self.lora_b_weights = None
+        self.gate_up_lora_a_weights = None
+        self.gate_up_lora_b_weights = None
+        self.down_lora_a_weights = None
+        self.down_lora_b_weights = None
 
     def set_lora_info(
         self,
-        lora_a_weights: torch.Tensor,
-        lora_b_weights: torch.Tensor,
+        gate_up_lora_a_weights: torch.Tensor,
+        gate_up_lora_b_weights: torch.Tensor,
+        down_lora_a_weights: torch.Tensor = None,
+        down_lora_b_weights: torch.Tensor = None,
     ):
         """Set LoRA weight tensors from memory pool."""
         self.set_lora = True
-        self.lora_a_weights = lora_a_weights
-        self.lora_b_weights = lora_b_weights
+        self.gate_up_lora_a_weights = gate_up_lora_a_weights
+        self.gate_up_lora_b_weights = gate_up_lora_b_weights
+        self.down_lora_a_weights = down_lora_a_weights
+        self.down_lora_b_weights = down_lora_b_weights
 
     def forward(self, hidden_states: torch.Tensor, topk_output: TopKOutput, **kwargs):
         """
@@ -619,7 +625,7 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         base_output = self.base_layer.forward(hidden_states, topk_output, **kwargs)
 
         # If LoRA is enabled, compute delta and add in-place for memory efficiency
-        if self.set_lora and self.lora_a_weights is not None:
+        if self.set_lora and self.gate_up_lora_a_weights is not None:
             self._compute_lora_delta(hidden_states, topk_output, base_output)
 
         return base_output
@@ -653,7 +659,6 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         lora_indices = self.lora_backend.forward_batch.token_lora_indices
 
         num_experts = self.base_layer.num_experts
-        num_loras = self.lora_a_weights.shape[0]
 
         # Dispatch tokens to experts
         token_ids, expert_ids, sorted_topk_weights, lora_ids = moe_dispatch(
@@ -662,21 +667,39 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
             lora_indices=lora_indices,
         )
 
-
-
-        # Compute per-expert LoRA forward (adds to base_output in-place)
-        per_expert_lora_forward(
+        # Apply gate_up_proj LoRA: hidden_states -> intermediate space
+        gate_up_output = per_expert_lora_forward(
             hidden_states=hidden_states,
-            lora_a_weights=self.lora_a_weights,
-            lora_b_weights=self.lora_b_weights,
+            lora_a_weights=self.gate_up_lora_a_weights,
+            lora_b_weights=self.gate_up_lora_b_weights,
             token_ids=token_ids,
             expert_ids=expert_ids,
             lora_ids=lora_ids,
             lora_ranks=lora_ranks,
             lora_scalings=scalings,
             num_experts=num_experts,
-            base_output=base_output,
+            base_output=None,
+            is_down_proj=False,
         )
+
+        # Apply down_proj LoRA: intermediate space -> hidden space, added to base_output
+        if (
+            self.down_lora_a_weights is not None
+            and self.down_lora_b_weights is not None
+        ):
+            per_expert_lora_forward(
+                hidden_states=gate_up_output,
+                lora_a_weights=self.down_lora_a_weights,
+                lora_b_weights=self.down_lora_b_weights,
+                token_ids=token_ids,
+                expert_ids=expert_ids,
+                lora_ids=lora_ids,
+                lora_ranks=lora_ranks,
+                lora_scalings=scalings,
+                num_experts=num_experts,
+                base_output=base_output,
+                is_down_proj=True,
+            )
 
     def slice_lora_a_weights(self, A: torch.Tensor, tp_rank: int):
         # For MoE layers, tensor parallelism is typically not used
