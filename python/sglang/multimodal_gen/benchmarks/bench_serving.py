@@ -596,7 +596,7 @@ def calculate_metrics(outputs: List[RequestFuncOutput], total_duration: float):
     return metrics
 
 
-def wait_for_service(base_url: str, timeout: int = 120) -> None:
+def wait_for_service(base_url: str, timeout: int = 1200) -> None:
     print(f"Waiting for service at {base_url}...")
     start_time = time.time()
     while True:
@@ -750,7 +750,7 @@ async def benchmark(args):
             )
         )
 
-    print("\n" + "=" * 60)
+    print("=" * 60)
 
     if args.output_file:
         with open(args.output_file, "w") as f:

@@ -91,9 +91,11 @@ class MpsPlatform(Platform):
         selected_backend: AttentionBackendEnum | None,
         head_size: int,
         dtype: torch.dtype,
+        tag: str | None = None,
     ) -> str:
         # MPS supports SDPA (Scaled Dot-Product Attention) which is the most compatible
-        logger.info("Using Torch SDPA backend for MPS.")
+        tag_info = f" for {tag}" if tag else ""
+        logger.info(f"Using Torch SDPA backend for MPS{tag_info}.")
         return (
             "sglang.multimodal_gen.runtime.layers.attention.backends.sdpa.SDPABackend"
         )

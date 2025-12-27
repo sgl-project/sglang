@@ -13,12 +13,9 @@ import numpy as np
 import torch
 
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.multimodal_gen.utils import resolve_obj_by_qualname
 
 if TYPE_CHECKING:
-    from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
-        AttentionImpl,
-    )
+    pass
 
 logger = init_logger(__name__)
 
@@ -170,6 +167,7 @@ class Platform:
         selected_backend: AttentionBackendEnum | None,
         head_size: int,
         dtype: torch.dtype,
+        tag: str | None = None,
     ) -> str:
         """Get the attention backend class of a device."""
         return ""
@@ -332,10 +330,6 @@ class Platform:
     def get_cpu_architecture(cls) -> CpuArchEnum:
         """Get the CPU architecture of the current platform."""
         return CpuArchEnum.UNSPECIFIED
-
-    def get_attn_backend(self, *args, **kwargs) -> AttentionImpl:
-        attention_cls_str = self.get_attn_backend_cls_str(*args, **kwargs)
-        return resolve_obj_by_qualname(attention_cls_str)
 
 
 class UnspecifiedPlatform(Platform):
