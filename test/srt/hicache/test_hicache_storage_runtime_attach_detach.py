@@ -3,7 +3,7 @@ E2E smoke test for HiCache storage runtime attach/detach.
 
 This test launches an SGLang server with hierarchical cache enabled but WITHOUT
 any storage backend at startup, then attaches/detaches a storage backend via the
-HTTP admin endpoints introduced in commit 7bae64e22f8d0fb36731b64662654f5aa9c8bf07.
+HTTP endpoints.
 
 Usage:
     python3 -m pytest test/srt/hicache/test_hicache_storage_runtime_attach_detach.py -v
