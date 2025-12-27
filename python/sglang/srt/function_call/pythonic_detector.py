@@ -73,6 +73,8 @@ class PythonicDetector(BaseFormatDetector):
 
         try:
             module = ast.parse(tool_call_text)
+            if not module.body:
+                return StreamingParseResult(normal_text=normal_text, calls=[])
             parsed = getattr(module.body[0], "value", None)
             if not (
                 isinstance(parsed, ast.List)
