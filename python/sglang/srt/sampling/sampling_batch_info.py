@@ -228,7 +228,7 @@ class SamplingBatchInfo:
         else:
             self.acc_linear_penalties = None
 
-    def apply_logits_bias(self, logits: torch.Tensor):
+    def apply_logits_bias(self, logits: torch.Tensor, apply_vocab_mask: bool = True):
         if self.acc_linear_penalties is not None:
             # Used in the overlap mode
             logits.add_(self.acc_linear_penalties)
@@ -237,7 +237,7 @@ class SamplingBatchInfo:
             # Used in the non-overlap mode
             self.penalizer_orchestrator.apply(logits)
 
-        if self.vocab_mask is not None:
+        if apply_vocab_mask and self.vocab_mask is not None:
             self.apply_mask_func(logits=logits, vocab_mask=self.vocab_mask)
 
         if self.logit_bias is not None:
