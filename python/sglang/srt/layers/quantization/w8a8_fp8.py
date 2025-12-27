@@ -271,14 +271,48 @@ class W8A8FP8MoEMethod(FusedMoEMethodBase):
         layer.register_parameter("w2_input_scale", w2_input_scale)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        layer.w13_weight = Parameter(layer.w13_weight, requires_grad=False)
-        layer.w2_weight = Parameter(layer.w2_weight, requires_grad=False)
-        layer.w13_weight_scale = Parameter(
-            layer.w13_weight_scale.data, requires_grad=False
-        )
-        layer.w2_weight_scale = Parameter(
-            layer.w2_weight_scale.data, requires_grad=False
-        )
+        def _process_weights(weight_name: str, scale_name: str):
+            """Helper to process a single expert weight."""
+            if self.quant_config.is_checkpoint_fp8_serialized:
+                # Case 1: Loading from an offline-quantized FP8 checkpoint.
+                attr_weight = getattr(layer, weight_name)
+                attr_scale = getattr(layer, scale_name)
+                setattr(
+                    layer,
+                    weight_name,
+                    Parameter(attr_weight, requires_grad=False),
+                )
+                if _is_fp8_fnuz:
+                    # Normalize for FNUZ hardware (e.g., MI300).
+                    weight, scale, _ = normalize_e4m3fn_to_e4m3fnuz(
+                        weight=attr_weight,
+                        weight_scale=attr_scale,
+                    )
+                    setattr(layer, weight_name, Parameter(weight, requires_grad=False))
+                    setattr(layer, scale_name, Parameter(scale, requires_grad=False))
+                else:
+                    # Register existing scale as a Parameter.
+                    setattr(
+                        layer,
+                        scale_name,
+                        Parameter(attr_scale.data, requires_grad=False),
+                    )
+            else:
+                # Case 2: Online quantization from FP16/BF16 checkpoint.
+                # We always use Per-channel quantization for MoE.
+                weight = getattr(layer, weight_name).contiguous()
+                qweight, scale = per_token_group_quant_fp8(weight, weight.shape[-1])
+                setattr(layer, weight_name, Parameter(qweight, requires_grad=False))
+                setattr(layer, scale_name, Parameter(scale, requires_grad=False))
+
+        # Process both sets of expert weights
+        _process_weights("w13_weight", "w13_weight_scale")
+        _process_weights("w2_weight", "w2_weight_scale")
+
+        if not self.quant_config.is_checkpoint_fp8_serialized:
+            # For online quantization, set input scales to None for dynamic activation scaling.
+            layer.w13_input_scale = None
+            layer.w2_input_scale = None
 
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
