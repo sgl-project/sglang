@@ -24,6 +24,9 @@ logger = logging.getLogger(__name__)
 
 # Global constants for custom memory pool types
 SUPPORTED_MOONCAKE_CUSTOM_MEM_POOL_TYPES = ["NVLINK", "BAREX"]
+MEMORY_BACKEND_USE_CUDAMALLOC  = 0
+MEMORY_BACKEND_USE_CUMEMCREATE = 1
+MEMORY_BACKEND_UNKNOWN         = -1
 
 
 def init_mooncake_custom_mem_pool(
@@ -47,22 +50,23 @@ def init_mooncake_custom_mem_pool(
     if enable_custom_mem_pool:
         try:
             if custom_mem_pool_type == "NVLINK":
-                logger.info("Inside NVLINK allocator")
                 from mooncake.allocator import NVLinkAllocator
-
-                if NVLinkAllocator.is_fabric_supported():
-                    logger.info("✅ I support fabric mem, using NVLink memory pool")
+                mem_backend = NVLinkAllocator.detect_mem_bankend()
+                if mem_backend == MEMORY_BACKEND_USE_CUMEMCREATE:
+                    logger.info("I support fabric mem, using NVLink memory pool")
                     allocator = NVLinkAllocator.get_allocator(device)
-                    # 使用自定义内存池
                     custom_mem_pool = torch.cuda.MemPool(allocator.allocator())
                     logger.debug(
                         f"Initialized NVLink memory pool on device {device}"
                     )
                     return True, custom_mem_pool, custom_mem_pool_type
-                else:
-                    logger.info("⚠️ Fabric memory not supported, falling back to default cudaMalloc")
+                elif  mem_backend == MEMORY_BACKEND_USE_CUDAMALLOC:
+                    logger.info("Fabric memory not supported, falling back to default cudaMalloc")
                     # 不使用任何自定义分配器 → 等价于使用 cudaMalloc
                     # 直接返回 None，表示 fallback 到默认行为
+                    return False, None, None
+                else:
+                    logger.info("Memory Backend Unknown")
                     return False, None, None
 
             elif custom_mem_pool_type == "BAREX":
