@@ -346,5 +346,213 @@ class TestValidationEdgeCases(unittest.TestCase):
         self.assertEqual(len(restored_request.messages), len(original_request.messages))
 
 
+class TestSamplingParameterValidation(unittest.TestCase):
+    """Test sampling parameter validation for OpenAI API compliance"""
+
+    def test_completion_n_validation(self):
+        """Test n parameter validation for CompletionRequest"""
+        # Valid n values
+        for n_val in [1, 5]:
+            with self.subTest(valid_n=n_val):
+                request = CompletionRequest(model="test-model", prompt="Hello", n=n_val)
+                self.assertEqual(request.n, n_val)
+
+        # Invalid n values (less than 1)
+        for n_val in [0, -1]:
+            with self.subTest(invalid_n=n_val):
+                with self.assertRaises(ValidationError):
+                    CompletionRequest(model="test-model", prompt="Hello", n=n_val)
+
+    def test_completion_logprobs_validation(self):
+        """Test logprobs parameter validation for CompletionRequest"""
+        # Valid logprobs values
+        for val in [0, 3, 5]:
+            with self.subTest(valid_logprobs=val):
+                request = CompletionRequest(
+                    model="test-model", prompt="Hello", logprobs=val
+                )
+                self.assertEqual(request.logprobs, val)
+
+        # Invalid logprobs values (out of range 0-5)
+        for val in [-1, 6]:
+            with self.subTest(invalid_logprobs=val):
+                with self.assertRaises(ValidationError):
+                    CompletionRequest(model="test-model", prompt="Hello", logprobs=val)
+
+    def test_completion_temperature_validation(self):
+        """Test temperature parameter validation for CompletionRequest"""
+        # Valid temperature values
+        for val in [0, 1.0, 2.0]:
+            with self.subTest(valid_temperature=val):
+                request = CompletionRequest(
+                    model="test-model", prompt="Hello", temperature=val
+                )
+                self.assertEqual(request.temperature, val)
+
+        # Invalid temperature values (negative)
+        for val in [-0.1, -1.0]:
+            with self.subTest(invalid_temperature=val):
+                with self.assertRaises(ValidationError):
+                    CompletionRequest(
+                        model="test-model", prompt="Hello", temperature=val
+                    )
+
+    def test_completion_top_p_validation(self):
+        """Test top_p parameter validation for CompletionRequest"""
+        # Valid top_p values
+        for val in [0, 0.5, 1.0]:
+            with self.subTest(valid_top_p=val):
+                request = CompletionRequest(
+                    model="test-model", prompt="Hello", top_p=val
+                )
+                self.assertEqual(request.top_p, val)
+
+        # Invalid top_p values (out of range 0-1)
+        for val in [-0.1, 1.1]:
+            with self.subTest(invalid_top_p=val):
+                with self.assertRaises(ValidationError):
+                    CompletionRequest(model="test-model", prompt="Hello", top_p=val)
+
+    def test_completion_penalty_validation(self):
+        """Test frequency_penalty and presence_penalty validation for CompletionRequest"""
+        # Valid penalty values
+        for penalty_type in ["frequency_penalty", "presence_penalty"]:
+            for val in [-2.0, 0, 2.0]:
+                with self.subTest(penalty=penalty_type, valid_value=val):
+                    request = CompletionRequest(
+                        model="test-model", prompt="Hello", **{penalty_type: val}
+                    )
+                    self.assertEqual(getattr(request, penalty_type), val)
+
+            # Invalid penalty values (out of range -2.0 to 2.0)
+            for val in [-2.1, 2.1]:
+                with self.subTest(penalty=penalty_type, invalid_value=val):
+                    with self.assertRaises(ValidationError):
+                        CompletionRequest(
+                            model="test-model", prompt="Hello", **{penalty_type: val}
+                        )
+
+    def test_chat_completion_n_validation(self):
+        """Test n parameter validation for ChatCompletionRequest"""
+        messages = [{"role": "user", "content": "Hello"}]
+
+        # Valid n values
+        for n_val in [1, 5]:
+            with self.subTest(valid_n=n_val):
+                request = ChatCompletionRequest(
+                    model="test-model", messages=messages, n=n_val
+                )
+                self.assertEqual(request.n, n_val)
+
+        # Invalid n values
+        for n_val in [0, -1]:
+            with self.subTest(invalid_n=n_val):
+                with self.assertRaises(ValidationError):
+                    ChatCompletionRequest(
+                        model="test-model", messages=messages, n=n_val
+                    )
+
+    def test_chat_completion_top_logprobs_validation(self):
+        """Test top_logprobs parameter validation for ChatCompletionRequest"""
+        messages = [{"role": "user", "content": "Hello"}]
+
+        # Valid top_logprobs values
+        for val in [0, 10, 20]:
+            with self.subTest(valid_top_logprobs=val):
+                request = ChatCompletionRequest(
+                    model="test-model", messages=messages, top_logprobs=val
+                )
+                self.assertEqual(request.top_logprobs, val)
+
+        # Invalid top_logprobs values (out of range 0-20)
+        for val in [-1, 21]:
+            with self.subTest(invalid_top_logprobs=val):
+                with self.assertRaises(ValidationError):
+                    ChatCompletionRequest(
+                        model="test-model", messages=messages, top_logprobs=val
+                    )
+
+    def test_chat_completion_max_completion_tokens_validation(self):
+        """Test max_completion_tokens parameter validation for ChatCompletionRequest"""
+        messages = [{"role": "user", "content": "Hello"}]
+
+        # Valid max_completion_tokens values
+        for val in [1, 100, 1000]:
+            with self.subTest(valid_max_completion_tokens=val):
+                request = ChatCompletionRequest(
+                    model="test-model", messages=messages, max_completion_tokens=val
+                )
+                self.assertEqual(request.max_completion_tokens, val)
+
+        # Invalid max_completion_tokens values (not positive)
+        for val in [0, -1]:
+            with self.subTest(invalid_max_completion_tokens=val):
+                with self.assertRaises(ValidationError):
+                    ChatCompletionRequest(
+                        model="test-model", messages=messages, max_completion_tokens=val
+                    )
+
+    def test_chat_completion_temperature_validation(self):
+        """Test temperature parameter validation for ChatCompletionRequest"""
+        messages = [{"role": "user", "content": "Hello"}]
+
+        # Valid temperature values
+        for val in [0, 1.0, 2.0]:
+            with self.subTest(valid_temperature=val):
+                request = ChatCompletionRequest(
+                    model="test-model", messages=messages, temperature=val
+                )
+                self.assertEqual(request.temperature, val)
+
+        # Invalid temperature values (negative)
+        for val in [-0.1, -1.0]:
+            with self.subTest(invalid_temperature=val):
+                with self.assertRaises(ValidationError):
+                    ChatCompletionRequest(
+                        model="test-model", messages=messages, temperature=val
+                    )
+
+    def test_chat_completion_top_p_validation(self):
+        """Test top_p parameter validation for ChatCompletionRequest"""
+        messages = [{"role": "user", "content": "Hello"}]
+
+        # Valid top_p values
+        for val in [0, 0.5, 1.0]:
+            with self.subTest(valid_top_p=val):
+                request = ChatCompletionRequest(
+                    model="test-model", messages=messages, top_p=val
+                )
+                self.assertEqual(request.top_p, val)
+
+        # Invalid top_p values
+        for val in [-0.1, 1.1]:
+            with self.subTest(invalid_top_p=val):
+                with self.assertRaises(ValidationError):
+                    ChatCompletionRequest(
+                        model="test-model", messages=messages, top_p=val
+                    )
+
+    def test_chat_completion_penalty_validation(self):
+        """Test frequency_penalty and presence_penalty validation for ChatCompletionRequest"""
+        messages = [{"role": "user", "content": "Hello"}]
+
+        # Valid penalty values
+        for penalty_type in ["frequency_penalty", "presence_penalty"]:
+            for val in [-2.0, 0, 2.0]:
+                with self.subTest(penalty=penalty_type, valid_value=val):
+                    request = ChatCompletionRequest(
+                        model="test-model", messages=messages, **{penalty_type: val}
+                    )
+                    self.assertEqual(getattr(request, penalty_type), val)
+
+            # Invalid penalty values (out of range -2.0 to 2.0)
+            for val in [-2.1, 2.1]:
+                with self.subTest(penalty=penalty_type, invalid_value=val):
+                    with self.assertRaises(ValidationError):
+                        ChatCompletionRequest(
+                            model="test-model", messages=messages, **{penalty_type: val}
+                        )
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
