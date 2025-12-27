@@ -774,6 +774,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
         captured_last_layer_outputs: Optional[List[torch.Tensor]] = None,
+        **kwargs,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
 
         hidden_states, residual = (
@@ -782,6 +783,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
                 residual,
                 forward_batch,
                 captured_last_layer_outputs=captured_last_layer_outputs,
+                **kwargs,
             )
         )
 
