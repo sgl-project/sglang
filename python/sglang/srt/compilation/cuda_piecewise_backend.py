@@ -140,11 +140,6 @@ class CUDAPiecewiseBackend:
             if self.is_last_graph and not self.to_be_compiled_sizes:
                 self.check_for_ending_compilation()
 
-        # Skip CUDA graphs if this entry doesn't use them OR
-        # if we're supposed to skip them globally
-        # skip_cuda_graphs = get_forward_context().skip_cuda_graphs
-        # if not entry.use_cudagraph or skip_cuda_graphs:
-        #     return entry.runnable(*args)
         if is_in_pcg_torch_compile():
             return entry.runnable(*args)
 

@@ -895,10 +895,14 @@ class ServerArgs:
             self.cuda_graph_max_bs = max(self.cuda_graph_bs)
 
         if self.piecewise_cuda_graph_max_tokens is None:
-            # Capture piecewise cuda graph tokens up to the chunked prefill size. Two benefits:
-            # 1. cuda graph acceleration for all prefill lengths.
-            # 2. do not need more temporary memory for activations. Less fragmentation.
-            self.piecewise_cuda_graph_max_tokens = self.chunked_prefill_size
+            # Reduce the capture size to 1024 and 2048 due to:
+            # 1. Piecewise cuda graph achieve little performance improvement when the capture size is large
+            # 2. Memory overhead of piecewise cuda graph is related to the number of capture sizes, a smaller capture
+            # range can reduce the cuda graph metadata memory overhead.
+            if self.tp_size < 4:
+                self.piecewise_cuda_graph_max_tokens = 1024
+            else:
+                self.piecewise_cuda_graph_max_tokens = 2048
 
         if self.piecewise_cuda_graph_tokens is None:
             self.piecewise_cuda_graph_tokens = (
@@ -928,6 +932,16 @@ class ServerArgs:
                 if self.cuda_graph_max_bs > 300:
                     reserved_mem += self.cuda_graph_max_bs * self.dp_size * 1.5
 
+            # For piecewise cuda graphs
+            if self.enable_piecewise_cuda_graph:
+                # Piecewise cuda graph memory overhead is constructed by the max capture size and the number of capture ranges.
+                if self.piecewise_cuda_graph_max_tokens <= 1024:
+                    reserved_mem += 1024 + 8 * len(self.piecewise_cuda_graph_tokens)
+                else:
+                    reserved_mem += 1024 * 1.5 + 8 * len(
+                        self.piecewise_cuda_graph_tokens
+                    )
+
             if gpu_mem is not None and gpu_mem > 60 * 1024:
                 reserved_mem = max(reserved_mem, 10 * 1024)
 
@@ -938,10 +952,6 @@ class ServerArgs:
                 elif self.speculative_algorithm != "NGRAM":
                     # eagle draft models and cuda graphs
                     reserved_mem += 2 * 1024
-
-            # For piecewise cuda graphs
-            if self.enable_piecewise_cuda_graph:
-                reserved_mem += self.piecewise_cuda_graph_max_tokens // 8
 
             self.mem_fraction_static = (
                 round((gpu_mem - reserved_mem) / gpu_mem, 3)
@@ -994,8 +1004,8 @@ class ServerArgs:
             list(range(4, 33, 4))
             + list(range(48, 257, 16))
             + list(range(288, 513, 32))
-            + list(range(640, 4096 + 1, 128))
-            + list(range(4352, self.piecewise_cuda_graph_max_tokens + 1, 256))
+            + list(range(640, 1024 + 1, 64))
+            + list(range(1152, self.piecewise_cuda_graph_max_tokens + 1, 128))
         )
 
         capture_sizes = [
@@ -4000,9 +4010,9 @@ class ServerArgs:
         )
         parser.add_argument(
             "--piecewise-cuda-graph-tokens",
-            type=json_list_type,
-            default=ServerArgs.piecewise_cuda_graph_tokens,
-            help="Set the list of tokens when using piecewise cuda graph.",
+            type=int,
+            nargs="+",
+            help="Set the batch sizes when using piecewise cuda graph.",
         )
         parser.add_argument(
             "--piecewise-cuda-graph-compiler",
