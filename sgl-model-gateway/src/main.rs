@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 use sgl_model_gateway::{
+    auth::{ApiKeyEntry, ControlPlaneAuthConfig, JwtConfig, Role},
     config::{
         CircuitBreakerConfig, ConfigError, ConfigResult, DiscoveryConfig, HealthCheckConfig,
         HistoryBackend, MetricsConfig, OracleConfig, PolicyConfig, PostgresConfig, RetryConfig,
@@ -372,6 +373,40 @@ struct CliArgs {
 
     #[arg(long)]
     tls_key_path: Option<String>,
+
+    // ==================== Control Plane Authentication ====================
+    /// JWT issuer URL for control plane authentication (OIDC discovery will be used)
+    /// Example: https://login.microsoftonline.com/{tenant}/v2.0
+    #[arg(long, env = "JWT_ISSUER")]
+    jwt_issuer: Option<String>,
+
+    /// Expected JWT audience claim (usually the client ID or API identifier)
+    /// Example: api://sgl-gateway
+    #[arg(long, env = "JWT_AUDIENCE")]
+    jwt_audience: Option<String>,
+
+    /// Explicit JWKS URI (if not provided, discovered from issuer)
+    #[arg(long, env = "JWT_JWKS_URI")]
+    jwt_jwks_uri: Option<String>,
+
+    /// JWT claim name containing the role (default: "roles")
+    #[arg(long, default_value = "roles")]
+    jwt_role_claim: String,
+
+    /// Role mapping from IDP role to gateway role (format: "idp_role=gateway_role")
+    /// Can be specified multiple times. Example: --jwt-role-mapping "Gateway.Admin=admin"
+    #[arg(long, action = ArgAction::Append)]
+    jwt_role_mapping: Vec<String>,
+
+    /// API keys for control plane access (format: "id:name:role:key")
+    /// Can be specified multiple times.
+    /// Example: --control-plane-api-keys "svc1:CI Pipeline:admin:secret123"
+    #[arg(long = "control-plane-api-keys", action = ArgAction::Append, env = "CONTROL_PLANE_API_KEYS")]
+    control_plane_api_keys: Vec<String>,
+
+    /// Disable audit logging for control plane operations
+    #[arg(long, default_value_t = false)]
+    disable_audit_logging: bool,
 }
 
 enum OracleConnectSource {
@@ -379,7 +414,106 @@ enum OracleConnectSource {
     Wallet { path: String, alias: String },
 }
 
+/// Parse role mapping from CLI format "idp_role=gateway_role"
+fn parse_role_mapping(mapping: &str) -> Option<(String, Role)> {
+    let parts: Vec<&str> = mapping.splitn(2, '=').collect();
+    if parts.len() != 2 {
+        eprintln!(
+            "WARNING: Invalid role mapping format '{}'. Expected 'idp_role=gateway_role'",
+            mapping
+        );
+        return None;
+    }
+    let idp_role = parts[0].to_string();
+    let gateway_role = match parts[1].to_lowercase().as_str() {
+        "admin" => Role::Admin,
+        "user" => Role::User,
+        other => {
+            eprintln!(
+                "WARNING: Invalid gateway role '{}' in mapping. Valid roles: admin, user",
+                other
+            );
+            return None;
+        }
+    };
+    Some((idp_role, gateway_role))
+}
+
+/// Parse control plane API key from CLI format "id:name:role:key"
+fn parse_control_plane_api_key(key_str: &str) -> Option<ApiKeyEntry> {
+    let parts: Vec<&str> = key_str.splitn(4, ':').collect();
+    if parts.len() != 4 {
+        eprintln!(
+            "WARNING: Invalid control-plane-api-key format '{}'. Expected 'id:name:role:key'",
+            key_str
+        );
+        return None;
+    }
+    let id = parts[0];
+    let name = parts[1];
+    let role_str = parts[2];
+    let key = parts[3];
+
+    let role = match role_str.to_lowercase().as_str() {
+        "admin" => Role::Admin,
+        "user" => Role::User,
+        other => {
+            eprintln!(
+                "WARNING: Invalid role '{}' in control-plane-api-key. Valid roles: admin, user",
+                other
+            );
+            return None;
+        }
+    };
+
+    Some(ApiKeyEntry::new(id, name, key, role))
+}
+
 impl CliArgs {
+    /// Build control plane authentication configuration from CLI args.
+    fn build_control_plane_auth_config(&self) -> ControlPlaneAuthConfig {
+        // Build JWT config if issuer and audience are provided
+        let jwt = match (&self.jwt_issuer, &self.jwt_audience) {
+            (Some(issuer), Some(audience)) => {
+                let role_mapping: HashMap<String, Role> = self
+                    .jwt_role_mapping
+                    .iter()
+                    .filter_map(|m| parse_role_mapping(m))
+                    .collect();
+
+                let mut jwt_config = JwtConfig::new(issuer.clone(), audience.clone());
+                jwt_config.role_claim = self.jwt_role_claim.clone();
+                jwt_config.role_mapping = role_mapping;
+                if let Some(jwks_uri) = &self.jwt_jwks_uri {
+                    jwt_config.jwks_uri = Some(jwks_uri.clone());
+                }
+                Some(jwt_config)
+            }
+            (Some(_), None) => {
+                eprintln!("WARNING: --jwt-issuer provided but --jwt-audience is missing. JWT auth disabled.");
+                None
+            }
+            (None, Some(_)) => {
+                eprintln!("WARNING: --jwt-audience provided but --jwt-issuer is missing. JWT auth disabled.");
+                None
+            }
+            (None, None) => None,
+        };
+
+        // Build API keys from CLI args
+        let api_keys: Vec<ApiKeyEntry> = self
+            .control_plane_api_keys
+            .iter()
+            .filter_map(|k| parse_control_plane_api_key(k))
+            .collect();
+
+        ControlPlaneAuthConfig {
+            jwt,
+            api_keys,
+            audit_enabled: !self.disable_audit_logging,
+        }
+    }
+
     fn determine_connection_mode(worker_urls: &[String]) -> ConnectionMode {
         for url in worker_urls {
             if url.starts_with("grpc://") || url.starts_with("grpcs://") {
@@ -699,6 +833,16 @@ impl CliArgs {
             },
         });
 
+        // Build control plane auth config
+        let control_plane_auth = {
+            let config = self.build_control_plane_auth_config();
+            if config.is_enabled() {
+                Some(config)
+            } else {
+                None
+            }
+        };
+
         ServerConfig {
             host: self.host.clone(),
             port: self.port,
@@ -715,6 +859,7 @@ impl CliArgs {
                 Some(self.request_id_headers.clone())
             },
             shutdown_grace_period_secs: self.shutdown_grace_period_secs,
+            control_plane_auth,
         }
     }
 }
