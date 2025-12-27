@@ -19,6 +19,7 @@ CompressedTensorsConfig = DummyConfig
 from sglang.srt.layers.quantization.auto_round import AutoRoundConfig
 from sglang.srt.layers.quantization.awq import AWQConfig, AWQMarlinConfig
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.bitsandbytes import BitsAndBytesConfig
 from sglang.srt.layers.quantization.blockwise_int8 import BlockInt8Config
 from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
     CompressedTensorsConfig,
@@ -68,6 +69,7 @@ BASE_QUANTIZATION_METHODS: Dict[str, Type[QuantizationConfig]] = {
     "fbgemm_fp8": FBGEMMFp8Config,
     "quark": QuarkConfig,
     "auto-round": AutoRoundConfig,
+    "bitsandbytes": BitsAndBytesConfig,
 }
 
 
