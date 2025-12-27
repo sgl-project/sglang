@@ -13,6 +13,7 @@ mod consistent_hashing;
 mod factory;
 mod manual;
 mod power_of_two;
+mod prefix_hash;
 mod random;
 mod registry;
 mod round_robin;
@@ -23,6 +24,7 @@ pub use consistent_hashing::ConsistentHashingPolicy;
 pub use factory::PolicyFactory;
 pub use manual::ManualPolicy;
 pub use power_of_two::PowerOfTwoPolicy;
+pub use prefix_hash::{PrefixHashConfig, PrefixHashPolicy};
 pub use random::RandomPolicy;
 pub use registry::PolicyRegistry;
 pub use round_robin::RoundRobinPolicy;
@@ -144,6 +146,9 @@ pub(crate) fn normalize_model_key(model_id: &str) -> &str {
 pub struct SelectWorkerInfo<'a> {
     /// Request text for cache-aware routing
     pub request_text: Option<&'a str>,
+    /// Tokenized request for prefix-hash routing
+    /// Used by PrefixHashPolicy for token-based prefix hashing
+    pub tokens: Option<&'a [u32]>,
     /// HTTP headers for header-based routing policies
     /// Policies can extract routing information from headers like:
     /// - X-SMG-Target-Worker: Direct routing to a specific worker by index
