@@ -46,17 +46,38 @@ def set_mla_kv_buffer_kernel(
     loc = tl.load(loc_ptr + pid_loc).to(tl.int64)
     dst_ptr = kv_buffer_ptr + loc * buffer_stride + offs
 
+    # Three-way branch to handle boundary correctly while preserving fast path
     if base + BLOCK <= nope_dim:
+        # Fast path: entire block is in nope region
         src = tl.load(
             cache_k_nope_ptr + pid_loc * nope_stride + offs,
             mask=mask,
         )
-    else:
+    elif base >= nope_dim:
+        # Fast path: entire block is in rope region
         offs_rope = offs - nope_dim
         src = tl.load(
             cache_k_rope_ptr + pid_loc * rope_stride + offs_rope,
             mask=mask,
         )
+    else:
+        # Boundary case: block spans nope/rope boundary (e.g., FP8 with nope_dim=528)
+        # Handle each offset individually to avoid negative indexing
+        is_nope = offs < nope_dim
+        is_rope = (offs >= nope_dim) & (offs < (nope_dim + rope_dim))
+
+        src_nope = tl.load(
+            cache_k_nope_ptr + pid_loc * nope_stride + offs,
+            mask=mask & is_nope,
+            other=0,
+        )
+        src_rope = tl.load(
+            cache_k_rope_ptr + pid_loc * rope_stride + (offs - nope_dim),
+            mask=mask & is_rope,
+            other=0,
+        )
+
+        src = tl.where(is_nope, src_nope, src_rope)
 
     tl.store(dst_ptr, src, mask=mask)
 
