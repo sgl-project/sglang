@@ -25,6 +25,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageConfig,
     HiCacheStorageExtraInfo,
 )
+from sglang.srt.metrics.collector import StorageMetrics
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
@@ -369,6 +370,8 @@ class HiCacheController:
             self.prefetch_thread.start()
             self.backup_thread.start()
 
+        self.prefetch_occupied_ratio = 0.0
+
     def _generate_storage_config(
         self,
         model_name: Optional[str] = None,
@@ -666,8 +669,15 @@ class HiCacheController:
         """
         Rate limit the prefetching operations to avoid overwhelming the storage backend.
         """
+        # metrics collection
+        self.prefetch_occupied_ratio = (
+            self.prefetch_tokens_occupied / self.prefetch_capacity_limit
+        )
         # cancel prefetch if too much memory is occupied
         if self.prefetch_tokens_occupied >= self.prefetch_capacity_limit:
+            logger.warning(
+                f"Prefetching rate limited, Perhaps increasing the hicache ratio or size can optimize it."
+            )
             return True
         # todo: more sophisticated rate limiting based on storage backend performance
         return False
@@ -821,3 +831,13 @@ class HiCacheController:
 
             except Empty:
                 continue
+
+    def get_storage_stats(self) -> StorageMetrics:
+        """
+        Collect cache controller metrics and merge with storage backend stats.
+        """
+        # Get storage backend stats and add prefetch occupied ratio
+        storage_stats = self.storage_backend.get_stats()
+        storage_stats.prefetch_occupied_ratios = self.prefetch_occupied_ratio
+
+        return storage_stats
