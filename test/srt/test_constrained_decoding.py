@@ -16,6 +16,7 @@ from sglang.test.test_utils import (
 class ServerWithGrammar(CustomTestCase):
     backend = "xgrammar"
     disable_overlap = False
+    tp_size = 1
 
     @classmethod
     def setUpClass(cls):
@@ -27,6 +28,9 @@ class ServerWithGrammar(CustomTestCase):
             "--grammar-backend",
             cls.backend,
         ]
+
+        if cls.tp_size > 1:
+            launch_args += ["--tp-size", str(cls.tp_size)]
 
         if cls.disable_overlap:
             launch_args += ["--disable-overlap-schedule"]
@@ -63,6 +67,32 @@ class TestLLGuidanceBackend(
     TestRegexConstrainedMixin,
 ):
     backend = "llguidance"
+
+
+# Test with TP=2
+class TestXGrammarBackendTP2(
+    ServerWithGrammar,
+    TestJSONConstrainedMixin,
+    TestEBNFConstrainedMinxin,
+    TestRegexConstrainedMixin,
+):
+    backend = "xgrammar"
+    tp_size = 2
+
+
+class TestOutlinesBackendTP2(ServerWithGrammar, TestJSONConstrainedMixin):
+    backend = "outlines"
+    tp_size = 2
+
+
+class TestLLGuidanceBackendTP2(
+    ServerWithGrammar,
+    TestJSONConstrainedMixin,
+    TestEBNFConstrainedMinxin,
+    TestRegexConstrainedMixin,
+):
+    backend = "llguidance"
+    tp_size = 2
 
 
 if __name__ == "__main__":
