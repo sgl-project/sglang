@@ -228,11 +228,11 @@ class ServerArgs:
 
     # CPU offload parameters
     dit_cpu_offload: bool = True
-    use_fsdp_inference: bool = False
     dit_layerwise_offload: bool = False
     text_encoder_cpu_offload: bool = True
     image_encoder_cpu_offload: bool = True
     vae_cpu_offload: bool = True
+    use_fsdp_inference: bool = False
     pin_cpu_memory: bool = True
 
     # STA (Sliding Tile Attention) parameters
@@ -302,8 +302,19 @@ class ServerArgs:
         """
         return self.host is None or self.port is None
 
+    def adjust_offload(self):
+        if self.pipeline_config.task_type.is_image_gen():
+            logger.info("Turn off all offload for image generation model")
+            self.dit_cpu_offload = False
+            self.text_encoder_cpu_offload = True
+            self.image_encoder_cpu_offload = True
+            self.vae_cpu_offload = True
+
     def __post_init__(self):
         # Add randomization to avoid race condition when multiple servers start simultaneously
+
+        self.adjust_offload()
+
         if self.attention_backend in ["fa3", "fa4"]:
             self.attention_backend = "fa"
 
