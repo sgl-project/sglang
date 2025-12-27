@@ -647,5 +647,10 @@ def run_dp_sharded_mrope_vision_model(
                 ]
                 embed_start += img_patches
             current_idx += count
-    out_embeddings = torch.cat(original_order_embeddings, dim=0)
+
+    # Filter out any None values that weren't filled
+    valid_embeddings = [e for e in original_order_embeddings if e is not None]
+    if not valid_embeddings:
+        raise ValueError("No valid embeddings found after gathering")
+    out_embeddings = torch.cat(valid_embeddings, dim=0)
     return out_embeddings
