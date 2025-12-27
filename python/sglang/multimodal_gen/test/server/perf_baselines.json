@@ -506,7 +506,8 @@
             },
             "expected_e2e_ms": 9006.3,
             "expected_avg_denoise_ms": 167.89,
-            "expected_median_denoise_ms": 169.67
+            "expected_median_denoise_ms": 169.67,
+            "estimated_full_test_time_s": 105.7
         },
         "zimage_image_t2i": {
             "stages_ms": {
@@ -1121,7 +1122,8 @@
             },
             "expected_e2e_ms": 426697.37,
             "expected_avg_denoise_ms": 8300.19,
-            "expected_median_denoise_ms": 8267.01
+            "expected_median_denoise_ms": 8267.01,
+            "estimated_full_test_time_s": 192.7
         },
         "wan2_1_i2v_14b_720P_2gpu": {
             "stages_ms": {
@@ -1509,7 +1511,8 @@
             },
             "expected_e2e_ms": 204257.12,
             "expected_avg_denoise_ms": 3855.55,
-            "expected_median_denoise_ms": 3774.03
+            "expected_median_denoise_ms": 3774.03,
+            "estimated_full_test_time_s": 365.8
         },
         "flux_2_image_t2i_2_gpus": {
             "stages_ms": {
