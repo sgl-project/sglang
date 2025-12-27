@@ -76,11 +76,11 @@ def _normalize_module_type(module_type: str) -> str:
 def _clean_hf_config_inplace(model_config: dict) -> None:
     """Remove common extraneous HF fields if present."""
     for key in (
-            "_name_or_path",
-            "transformers_version",
-            "model_type",
-            "tokenizer_class",
-            "torch_dtype",
+        "_name_or_path",
+        "transformers_version",
+        "model_type",
+        "tokenizer_class",
+        "torch_dtype",
     ):
         model_config.pop(key, None)
 
@@ -96,7 +96,9 @@ class ComponentLoader(ABC):
     def __init__(self, device=None) -> None:
         self.device = device
 
-    def should_offload(self, server_args: ServerArgs, model_config: ModelConfig | None = None):
+    def should_offload(
+        self, server_args: ServerArgs, model_config: ModelConfig | None = None
+    ):
         # offload by default
         return False
 
@@ -469,7 +471,7 @@ class TextEncoderLoader(ComponentLoader):
                         reshard_after_forward=True,
                         mesh=mesh["offload"],
                         fsdp_shard_conditions=model_config.arch_config._fsdp_shard_conditions
-                                              or getattr(model, "_fsdp_shard_conditions", None),
+                        or getattr(model, "_fsdp_shard_conditions", None),
                         pin_cpu_memory=server_args.pin_cpu_memory,
                     )
             # We only enable strict check for non-quantized models
@@ -562,7 +564,9 @@ class TokenizerLoader(ComponentLoader):
 class VAELoader(ComponentLoader):
     """Loader for VAE."""
 
-    def should_offload(self, server_args: ServerArgs, model_config: ModelConfig | None = None):
+    def should_offload(
+        self, server_args: ServerArgs, model_config: ModelConfig | None = None
+    ):
         return server_args.vae_cpu_offload
 
     def load_customized(
