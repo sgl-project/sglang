@@ -96,13 +96,13 @@ class PipelineStage(ABC):
     def maybe_free_model_hooks(self):
         pass
 
-    def load_model(self, server_args: ServerArgs):
+    def load_model(self):
         """
         Load the model for the stage.
         """
         pass
 
-    def offload_model(self, server_args: ServerArgs):
+    def offload_model(self):
         """
         Offload the model for the stage.
         """

@@ -63,6 +63,15 @@ class ImageEncodingStage(PipelineStage):
         self.image_encoder = image_encoder
         self.text_encoder = text_encoder
 
+    def load_model(self):
+        if self.server_args.image_encoder_cpu_offload:
+            device = get_local_torch_device()
+            self.move_to_device(device)
+
+    def offload_model(self):
+        if self.server_args.image_encoder_cpu_offload:
+            self.move_to_device("cpu")
+
     def move_to_device(self, device):
         fields = [
             "image_processor",
@@ -98,8 +107,8 @@ class ImageEncodingStage(PipelineStage):
         if batch.condition_image is None:
             return batch
         cuda_device = get_local_torch_device()
-        self.move_to_device(cuda_device)
 
+        self.load_model()
         image = batch.condition_image
 
         image_processor_kwargs = (
@@ -155,7 +164,7 @@ class ImageEncodingStage(PipelineStage):
                 self.encoding_qwen_image_edit(neg_outputs, neg_image_inputs)
             )
 
-        self.move_to_device("cpu")
+        self.offload_model()
 
         return batch
 
@@ -188,6 +197,13 @@ class ImageVAEEncodingStage(PipelineStage):
         super().__init__()
         self.vae: ParallelTiledVAE = vae
 
+    def load_model(self):
+        self.vae = self.server_args.vae.to(get_local_torch_device())
+
+    def offload_model(self):
+        if self.server_args.vae_cpu_offload:
+            self.vae = self.vae.to("cpu")
+
     def forward(
         self,
         batch: Req,
@@ -207,9 +223,8 @@ class ImageVAEEncodingStage(PipelineStage):
         if batch.condition_image is None:
             return batch
 
+        self.load_model()
         num_frames = batch.num_frames
-
-        self.vae = self.vae.to(get_local_torch_device())
 
         images = (
             batch.vae_image if batch.vae_image is not None else batch.condition_image
@@ -249,8 +264,8 @@ class ImageVAEEncodingStage(PipelineStage):
             # Setup VAE precision
             vae_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.vae_precision]
             vae_autocast_enabled = (
-                vae_dtype != torch.float32
-            ) and not server_args.disable_autocast
+                                       vae_dtype != torch.float32
+                                   ) and not server_args.disable_autocast
 
             # Encode Image
             with torch.autocast(
@@ -305,10 +320,8 @@ class ImageVAEEncodingStage(PipelineStage):
             all_image_latents.append(image_latent)
 
         batch.image_latent = torch.cat(all_image_latents, dim=1)
-        self.maybe_free_model_hooks()
 
-        self.vae.to("cpu")
-
+        self.offload_model()
         return batch
 
     def retrieve_latents(
