@@ -5,6 +5,7 @@
 
 use std::{sync::Arc, time::Instant};
 
+use base64::{engine::general_purpose, Engine as _};
 use serde_json::Value;
 use tracing::error;
 
@@ -436,6 +437,16 @@ impl ResponseProcessor {
                 None
             };
 
+            let routed_experts =
+                complete.routed_experts().map(|bytes| {
+                    match serde_json::from_slice::<Value>(bytes) {
+                        Ok(value) => value,
+                        Err(_) => serde_json::json!({
+                            "raw_bytes": general_purpose::STANDARD.encode(bytes)
+                        }),
+                    }
+                });
+
             // Build GenerateResponse struct
             let meta_info = GenerateMetaInfo {
                 id: dispatch.request_id.clone(),
@@ -451,6 +462,7 @@ impl ResponseProcessor {
                 cached_tokens: complete.cached_tokens() as u32,
                 e2e_latency: start_time.elapsed().as_secs_f64(),
                 matched_stop,
+                routed_experts,
             };
 
             result_array.push(GenerateResponse {

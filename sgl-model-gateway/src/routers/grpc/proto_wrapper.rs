@@ -107,6 +107,7 @@ impl ProtoGenerateRequest {
 }
 
 /// Unified GenerateResponse from stream
+#[allow(clippy::large_enum_variant)]
 pub enum ProtoGenerateResponse {
     Sglang(sglang::GenerateResponse),
     Vllm(vllm::GenerateResponse),
@@ -240,6 +241,7 @@ impl ProtoGenerateStreamChunk {
 
 /// Unified GenerateComplete response
 #[derive(Clone)]
+#[allow(clippy::large_enum_variant)]
 pub enum ProtoGenerateComplete {
     Sglang(sglang::GenerateComplete),
     Vllm(vllm::GenerateComplete),
@@ -359,6 +361,20 @@ impl ProtoGenerateComplete {
         match self {
             Self::Sglang(c) => c.output_logprobs.as_ref(),
             Self::Vllm(_) => None, // TODO: vLLM logprobs mapping
+        }
+    }
+
+    /// Get routed_experts
+    pub fn routed_experts(&self) -> Option<&[u8]> {
+        match self {
+            Self::Sglang(c) => {
+                if c.routed_experts.is_empty() {
+                    None
+                } else {
+                    Some(&c.routed_experts)
+                }
+            }
+            Self::Vllm(_) => None, // vLLM doesn't have routed_experts field
         }
     }
 }
