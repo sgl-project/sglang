@@ -98,6 +98,11 @@ class TritonLoRABackend(BaseLoRABackend):
         # gate_up_lora_a: (num_lora, 2 * r, input_dim)
         # gate_up_lora_b: (num_lora, 2 * output_dim, r)
         assert isinstance(gate_up_lora_b, torch.Tensor)
+        if gate_up_lora_b.shape[-2] % 2 != 0:
+            raise ValueError(
+                f"gate_up_lora_b dimension must be divisible by 2, "
+                f"got {gate_up_lora_b.shape[-2]}"
+            )
         output_dim = gate_up_lora_b.shape[-2] // 2
 
         # lora_a_output: (s, 2 * r)
