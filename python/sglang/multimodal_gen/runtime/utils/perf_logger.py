@@ -247,7 +247,6 @@ class PerformanceLogger:
 
         Note that this accords to the time spent internally in server, postprocess is not included
         """
-        assert False
         formatted_stages = [
             {"name": name, "execution_time_ms": duration_ms}
             for name, duration_ms in timings.stages.items()
