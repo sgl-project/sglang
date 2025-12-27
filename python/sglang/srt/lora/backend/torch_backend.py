@@ -87,6 +87,11 @@ class TorchNativeLoRABackend(BaseLoRABackend):
     ) -> torch.Tensor:
         num_slices = 3
         assert isinstance(qkv_lora_b, torch.Tensor)
+        if len(output_offset_cpu) < num_slices + 1:
+            raise ValueError(
+                f"output_offset_cpu must have at least {num_slices + 1} elements, "
+                f"got {len(output_offset_cpu)}"
+            )
 
         total_seq_len, _ = x.shape
         _, weight_intermediate_dim, _ = qkv_lora_a.shape
