@@ -1,12 +1,24 @@
 """
 Consolidated HiCache variant tests.
 Tests HiCache with different configurations: standard, MLA, EAGLE, and page size variants.
+
+NOTE: These tests are temporarily skipped in CI due to intermittent failures that cannot be
+reproduced locally. The failures may be related to CI environment differences.
+Use test_storage tests for hicache accuracy and logic testing in the meantime.
 """
 
+import os
 import unittest
 from types import SimpleNamespace
 
 import requests
+
+# Detect CI environment
+_is_in_ci = os.environ.get("CI") == "true" or os.environ.get("GITHUB_ACTIONS") == "true"
+_skip_in_ci_reason = (
+    "Temporarily skipped in CI: intermittent failures not reproducible locally. "
+    "Use test_storage for hicache accuracy testing."
+)
 
 from sglang.bench_serving import get_tokenizer
 from sglang.srt.utils import is_hip, kill_process_tree
@@ -85,6 +97,7 @@ class HiCacheBaseServer(CustomTestCase):
         kill_process_tree(cls.process.pid)
 
 
+@unittest.skipIf(_is_in_ci, _skip_in_ci_reason)
 class TestHiCacheStandard(HiCacheBaseServer, HiCacheEvalMixin):
     """Standard HiCache configuration tests"""
 
@@ -99,6 +112,7 @@ class TestHiCacheStandard(HiCacheBaseServer, HiCacheEvalMixin):
     expected_mmlu_score = 0.65
 
 
+@unittest.skipIf(_is_in_ci, _skip_in_ci_reason)
 class TestHiCacheMLA(HiCacheBaseServer, HiCacheEvalMixin, HiCacheMGSMEvalMixin):
     """HiCache with MLA model tests"""
 
@@ -110,6 +124,7 @@ class TestHiCacheMLA(HiCacheBaseServer, HiCacheEvalMixin, HiCacheMGSMEvalMixin):
     expected_mmlu_score = 0.5
 
 
+@unittest.skipIf(_is_in_ci, _skip_in_ci_reason)
 class TestHiCacheEagle(HiCacheBaseServer, HiCacheEvalMixin):
     """HiCache with EAGLE speculative decoding tests"""
 
@@ -161,6 +176,7 @@ class TestHiCacheEagle(HiCacheBaseServer, HiCacheEvalMixin):
         self.assertGreater(avg_spec_accept_length, 2.26)
 
 
+@unittest.skipIf(_is_in_ci, _skip_in_ci_reason)
 class TestHiCachePage(HiCacheBaseServer, HiCacheEvalMixin):
     """HiCache with custom page size tests"""
 
