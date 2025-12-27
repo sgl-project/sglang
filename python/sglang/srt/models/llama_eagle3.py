@@ -27,6 +27,7 @@ from torch import nn
 from transformers import LlamaConfig
 
 from sglang.srt.distributed import get_pp_group
+from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import QKVParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
@@ -38,6 +39,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.llama import LlamaDecoderLayer, LlamaForCausalLM, LlamaMLP
+from sglang.srt.server_args import get_global_server_args
 
 
 class LlamaDecoderLayer(LlamaDecoderLayer):
@@ -58,6 +60,8 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
             self.self_attn.total_num_kv_heads,
             bias=False,
             quant_config=quant_config,
+            tp_rank=self.self_attn.attn_tp_rank,
+            tp_size=self.self_attn.attn_tp_size,
             prefix=add_prefix("qkv_proj", prefix),
         )
 
@@ -80,23 +84,29 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-
         residual = hidden_states
-        embeds = self.input_layernorm(embeds)
+        embeds, _ = self.layer_communicator.prepare_attn(embeds, None, forward_batch)
         hidden_states = self.hidden_norm(hidden_states)
+        if hidden_states.shape[0] != 0:
+            hidden_states = torch.cat([embeds, hidden_states], dim=-1)
+            # Self Attention
 
-        hidden_states = torch.cat([embeds, hidden_states], dim=-1)
-        # Self Attention
-        hidden_states = self.self_attn(
-            positions=positions,
-            hidden_states=hidden_states,
-            forward_batch=forward_batch,
+            hidden_states = self.self_attn(
+                positions=positions,
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+            )
+        hidden_states, residual = self.layer_communicator.prepare_mlp(
+            hidden_states,
+            residual,
+            forward_batch,
         )
-
-        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
 
         # Fully Connected
         hidden_states = self.mlp(hidden_states)
+        hidden_states, residual = self.layer_communicator.postprocess_layer(
+            hidden_states, residual, forward_batch
+        )
 
         return hidden_states, residual
 
@@ -124,6 +134,7 @@ class LlamaModel(nn.Module):
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
             config.hidden_size,
+            enable_tp=not is_dp_attention_enabled(),
             prefix=add_prefix("embed_tokens", prefix),
         )
 
@@ -162,10 +173,6 @@ class LlamaModel(nn.Module):
         if hidden_states.shape[-1] != embeds.shape[-1]:
             hidden_states = self.fc(hidden_states)
 
-        # idle batch
-        if hidden_states.shape[0] == 0:
-            return hidden_states, [hidden_states]
-
         residual = None
         hidden_states, residual = self.midlayer(
             positions,
@@ -174,6 +181,9 @@ class LlamaModel(nn.Module):
             forward_batch,
             residual,
         )
+        # idle batch
+        if forward_batch.forward_mode.is_idle():
+            return hidden_states, [hidden_states]
 
         hidden_states_to_logits, hidden_states_to_aux = self.norm(
             hidden_states, residual
@@ -214,6 +224,7 @@ class LlamaForCausalLMEagle3(LlamaForCausalLM):
                 config.draft_vocab_size,
                 config.hidden_size,
                 quant_config=quant_config,
+                use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
                 prefix=add_prefix("lm_head", prefix),
             )
 
