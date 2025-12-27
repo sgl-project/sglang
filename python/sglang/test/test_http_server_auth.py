@@ -201,7 +201,7 @@ class TestHttpServerAdminAuth(unittest.TestCase):
         )
         self.assertTrue(d.allowed)
 
-    def test_with_admin_key_but_no_user_api_key(self):
+    def test_with_both_api_keys(self):
         optional_paths = {"/clear_hicache_storage_backend"}
         force_paths = {"/force_auth_demo"}
 

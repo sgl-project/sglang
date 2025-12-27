@@ -59,13 +59,12 @@ def decide_request_auth(
     # - only admin_api_key: require admin_api_key
     # - both: require admin_api_key (api_key is NOT accepted)
     if path in admin_optional_auth_paths:
-        if api_key and admin_api_key:
-            return AuthDecision(allowed=_is_bearer(admin_api_key), status_code=401)
-        if api_key:
-            return AuthDecision(allowed=_is_bearer(api_key), status_code=401)
         if admin_api_key:
             return AuthDecision(allowed=_is_bearer(admin_api_key), status_code=401)
-        return AuthDecision(allowed=True)
+        elif api_key:
+            return AuthDecision(allowed=_is_bearer(api_key), status_code=401)
+        else:
+            return AuthDecision(allowed=True)
 
     # Normal endpoints:
     # - if api_key is configured, require api_key (even if admin_api_key is also configured)
