@@ -840,6 +840,38 @@ class ImageData:
     detail: Optional[Literal["auto", "low", "high"]] = "auto"
 
 
+_aiohttp_session = None
+
+
+async def prefetch_images_async(
+    image_data: List[Union[str, bytes, "ImageData"]],
+) -> List[Union[str, bytes]]:
+    """Prefetch remote images using aiohttp for parallel downloads."""
+    global _aiohttp_session
+    try:
+        import aiohttp
+    except ImportError:
+        return image_data
+
+    if _aiohttp_session is None or _aiohttp_session.closed:
+        connector = aiohttp.TCPConnector(limit=256, limit_per_host=128)
+        timeout = aiohttp.ClientTimeout(total=int(os.getenv("REQUEST_TIMEOUT", "10")))
+        _aiohttp_session = aiohttp.ClientSession(connector=connector, timeout=timeout)
+
+    async def fetch_one(item):
+        url = item.url if hasattr(item, "url") else item
+        if isinstance(url, str) and url.startswith(("http://", "https://")):
+            try:
+                async with _aiohttp_session.get(url) as resp:
+                    resp.raise_for_status()
+                    return await resp.read()
+            except Exception:
+                return item
+        return item
+
+    return await asyncio.gather(*[fetch_one(item) for item in image_data])
+
+
 def load_image(
     image_file: Union[Image.Image, str, ImageData, bytes],
 ) -> tuple[Image.Image, tuple[int, int]]:

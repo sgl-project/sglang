@@ -20,7 +20,7 @@ class MllamaImageProcessor(BaseMultimodalProcessor):
     async def process_mm_data_async(
         self, image_data: List[Union[str, bytes]], input_text, *args, **kwargs
     ):
-        base_out = self.load_mm_data(
+        base_out = await self.load_mm_data_async(
             prompt=input_text,
             image_data=image_data,
             multimodal_tokens=self.mm_tokens,

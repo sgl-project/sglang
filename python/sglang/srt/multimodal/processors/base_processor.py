@@ -17,7 +17,15 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalDataItem,
     MultimodalInputFormat,
 )
-from sglang.srt.utils import envs, is_npu, load_audio, load_image, load_video, logger
+from sglang.srt.utils import (
+    envs,
+    is_npu,
+    load_audio,
+    load_image,
+    load_video,
+    logger,
+    prefetch_images_async,
+)
 from sglang.srt.utils.cuda_ipc_transport_utils import (
     MM_FEATURE_CACHE_SIZE,
     MM_ITEM_MEMORY_POOL_RECYCLE_INTERVAL,
@@ -677,6 +685,31 @@ class BaseMultimodalProcessor(ABC):
             audios=audios,
             videos=videos,
             input_text="".join(new_text_parts),
+        )
+
+    async def load_mm_data_async(
+        self,
+        prompt: str,
+        multimodal_tokens: MultimodalSpecialTokens,
+        image_data: Optional[list] = None,
+        video_data: Optional[list] = None,
+        audio_data: Optional[list] = None,
+        return_text: Optional[bool] = True,
+        discard_alpha_channel: bool = True,
+        audio_sample_rate: Optional[int] = None,
+    ) -> "BaseMultiModalProcessorOutput":
+        """Async version with parallel image prefetching using aiohttp."""
+        if image_data:
+            image_data = await prefetch_images_async(image_data)
+        return self.load_mm_data(
+            prompt=prompt,
+            multimodal_tokens=multimodal_tokens,
+            image_data=image_data,
+            video_data=video_data,
+            audio_data=audio_data,
+            return_text=return_text,
+            discard_alpha_channel=discard_alpha_channel,
+            audio_sample_rate=audio_sample_rate,
         )
 
     @staticmethod
