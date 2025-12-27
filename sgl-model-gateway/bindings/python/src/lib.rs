@@ -13,6 +13,7 @@ pub enum PolicyType {
     PowerOfTwo,
     Bucket,
     Manual,
+    ConsistentHashing,
 }
 
 #[pyclass(eq)]
@@ -416,6 +417,7 @@ impl Router {
                     bucket_adjust_interval_secs: self.bucket_adjust_interval_secs,
                 },
                 PolicyType::Manual => ConfigPolicyConfig::Manual,
+                PolicyType::ConsistentHashing => ConfigPolicyConfig::ConsistentHashing,
             }
         };
 

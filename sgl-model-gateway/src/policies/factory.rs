@@ -3,8 +3,8 @@
 use std::sync::Arc;
 
 use super::{
-    BucketConfig, BucketPolicy, CacheAwareConfig, CacheAwarePolicy, LoadBalancingPolicy,
-    ManualPolicy, PowerOfTwoPolicy, RandomPolicy, RoundRobinPolicy,
+    BucketConfig, BucketPolicy, CacheAwareConfig, CacheAwarePolicy, ConsistentHashingPolicy,
+    LoadBalancingPolicy, ManualPolicy, PowerOfTwoPolicy, RandomPolicy, RoundRobinPolicy,
 };
 use crate::config::PolicyConfig;
 
@@ -47,6 +47,7 @@ impl PolicyFactory {
                 Arc::new(BucketPolicy::with_config(config))
             }
             PolicyConfig::Manual => Arc::new(ManualPolicy::new()),
+            PolicyConfig::ConsistentHashing => Arc::new(ConsistentHashingPolicy::new()),
         }
     }
 
@@ -59,6 +60,9 @@ impl PolicyFactory {
             "cache_aware" | "cacheaware" => Some(Arc::new(CacheAwarePolicy::new())),
             "bucket" => Some(Arc::new(BucketPolicy::new())),
             "manual" => Some(Arc::new(ManualPolicy::new())),
+            "consistent_hashing" | "consistenthashing" => {
+                Some(Arc::new(ConsistentHashingPolicy::new()))
+            }
             _ => None,
         }
     }
@@ -96,6 +100,12 @@ mod tests {
             bucket_adjust_interval_secs: 5,
         });
         assert_eq!(policy.name(), "bucket");
+
+        let policy = PolicyFactory::create_from_config(&PolicyConfig::Manual);
+        assert_eq!(policy.name(), "manual");
+
+        let policy = PolicyFactory::create_from_config(&PolicyConfig::ConsistentHashing);
+        assert_eq!(policy.name(), "consistent_hashing");
     }
 
     #[tokio::test]
@@ -110,6 +120,10 @@ mod tests {
         assert!(PolicyFactory::create_by_name("CacheAware").is_some());
         assert!(PolicyFactory::create_by_name("bucket").is_some());
         assert!(PolicyFactory::create_by_name("Bucket").is_some());
+        assert!(PolicyFactory::create_by_name("manual").is_some());
+        assert!(PolicyFactory::create_by_name("Manual").is_some());
+        assert!(PolicyFactory::create_by_name("consistent_hashing").is_some());
+        assert!(PolicyFactory::create_by_name("ConsistentHashing").is_some());
         assert!(PolicyFactory::create_by_name("unknown").is_none());
     }
 }
