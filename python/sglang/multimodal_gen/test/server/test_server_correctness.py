@@ -37,8 +37,8 @@ class CorrectnessTestMixin:
             modality=case.server_args.modality,
             sampling_params=case.sampling_params,
         )
-        
-        # functional success check 
+
+        # functional success check
         self.run_and_collect(diffusion_server, case.id, generate_fn)
         logger.info(f"Functional success verified for {case.id}")
 
@@ -53,15 +53,17 @@ class CorrectnessTestMixin:
         payload = {
             "model": case.server_args.model_path,
             "prompt": case.sampling_params.prompt or "A dog with sunglasses",
-            "size": "512x512",
+            "size": case.sampling_params.output_size,
             "response_format": "b64_json",
             "seed": 42,
         }
 
         resp1 = client.images.generate(**payload)
         resp2 = client.images.generate(**payload)
-        
-        assert resp1.data[0].b64_json == resp2.data[0].b64_json
+
+        assert (
+            resp1.data[0].b64_json == resp2.data[0].b64_json
+        ), "Seed determinism failed: outputs are not bit-identical"
         logger.info(f"Seed determinism verified for {case.id}")
 
     def test_api_error_codes(self, case: DiffusionTestCase, diffusion_server):
@@ -69,15 +71,19 @@ class CorrectnessTestMixin:
         Verify server returns correct HTTP error codes for malformed requests.
         """
         if case.server_args.modality != "image":
-            pytest.skip("Error code boundary check restricted to image generations endpoint")
+            pytest.skip(
+                "Error code boundary check restricted to image generations endpoint"
+            )
 
-        base_url = f"http://localhost:{diffusion_server.port}/v1/images/generations"
-        
+        client = self._client(diffusion_server)
+        # Use client.base_url to construct the target endpoint dynamically
+        base_url = f"{client.base_url}/images/generations"
+
         # Test 1: Invalid resolution (400 or 422)
         payload = {
             "model": case.server_args.model_path,
             "prompt": "test",
-            "size": "invalid_size"
+            "size": "invalid_size",
         }
         resp = requests.post(base_url, json=payload)
         assert resp.status_code in [400, 422]
@@ -97,7 +103,3 @@ class TestDiffusionCorrectness(CorrectnessTestMixin, DiffusionServerBase):
     @pytest.fixture(params=CORRECTNESS_1_GPU_CASES, ids=lambda c: c.id)
     def case(self, request) -> DiffusionTestCase:
         return request.param
-
-    def test_functional_correctness(self, case: DiffusionTestCase, diffusion_server):
-        """Driver method for 1-GPU functional logic."""
-        self.test_functional_success(case, diffusion_server)

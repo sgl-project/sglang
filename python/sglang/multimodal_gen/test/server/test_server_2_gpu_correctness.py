@@ -11,7 +11,9 @@ from sglang.multimodal_gen.test.server.test_server_common import (  # noqa: F401
     DiffusionServerBase,
     diffusion_server,
 )
-from sglang.multimodal_gen.test.server.test_server_correctness import CorrectnessTestMixin
+from sglang.multimodal_gen.test.server.test_server_correctness import (
+    CorrectnessTestMixin,
+)
 from sglang.multimodal_gen.test.server.testcase_configs import (
     CORRECTNESS_2_GPU_CASES,
     DiffusionTestCase,
@@ -30,7 +32,3 @@ class TestDiffusionServerTwoGpuCorrectness(CorrectnessTestMixin, DiffusionServer
     def case(self, request) -> DiffusionTestCase:
         """Provide a DiffusionTestCase for each 2-GPU correctness test."""
         return request.param
-
-    def test_functional_correctness(self, case: DiffusionTestCase, diffusion_server):
-        """Driver method for 2-GPU functional logic."""
-        self.test_functional_success(case, diffusion_server)
