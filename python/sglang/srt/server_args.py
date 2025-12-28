@@ -1837,6 +1837,31 @@ class ServerArgs:
             if self.deepep_mode == "normal":
                 logger.warning("Cuda graph is disabled because deepep_mode=`normal`")
                 self.disable_cuda_graph = True
+            if self.deepep_mode in ["low_latency", "auto"]:
+                if (
+                    self.cuda_graph_max_bs
+                    > envs.SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get()
+                ):
+                    envs.SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.set(
+                        self.cuda_graph_max_bs
+                    )
+                    logger.warning(
+                        f"NUM_MAX_DISPATCH_TOKENS_PER_RANK is adjusted to cuda_graph_max_bs={self.cuda_graph_max_bs} to satisfy the batch size limitation on DeepEP LL mode."
+                    )
+            if (
+                self.deepep_mode == "low_latency"
+                and self.chunked_prefill_size
+                > self.tp_size
+                * envs.SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get()
+            ):
+                self.chunked_prefill_size = (
+                    self.tp_size
+                    * envs.SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get()
+                )
+                logger.warning(
+                    f"chunked_prefill_size is adjusted to tp_size * NUM_MAX_DISPATCH_TOKENS_PER_RANK={self.tp_size * envs.SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get()} to satisfy the batch size limitation on DeepEP LL mode."
+                )
+
             self.ep_size = self.tp_size
             logger.warning(
                 f"DeepEP MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
