@@ -68,7 +68,6 @@ from sglang.utils import is_in_ci
 
 logger = logging.getLogger(__name__)
 
-
 # Define constants
 SAMPLING_BACKEND_CHOICES = {"flashinfer", "pytorch", "ascend"}
 LOAD_FORMAT_CHOICES = [
@@ -2421,6 +2420,7 @@ class ServerArgs:
             logger.info("Set soft_watchdog_timeout since in CI")
             self.soft_watchdog_timeout = 300
 
+    # The current code does not support the `action="store_false"` parameter type. see #14085 for more details.
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
 
@@ -4952,15 +4952,14 @@ def prepare_server_args(argv: List[str]) -> ServerArgs:
         parser = argparse.ArgumentParser()
         ServerArgs.add_cli_args(parser)
 
-        # Get boolean action destinations
-        boolean_actions = []
-        for action in parser._actions:
-            if hasattr(action, "dest") and hasattr(action, "action"):
-                if action.action in ["store_true", "store_false"]:
-                    boolean_actions.append(action.dest)
-
         # Merge config file arguments with CLI arguments
-        config_merger = ConfigArgumentMerger(boolean_actions=boolean_actions)
+        config_merger = ConfigArgumentMerger(
+            boolean_actions=[
+                action.dest
+                for action in parser._actions
+                if isinstance(action, argparse._StoreTrueAction)
+            ]
+        )
         argv = config_merger.merge_config_with_args(argv)
 
     parser = argparse.ArgumentParser()
