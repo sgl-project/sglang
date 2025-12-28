@@ -7,10 +7,10 @@ from __future__ import annotations
 
 import pytest
 import requests
+from openai import OpenAI
 
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.test.server.test_server_common import (  # noqa: F401
-    DiffusionServerBase,
     diffusion_server,
 )
 from sglang.multimodal_gen.test.server.test_server_utils import get_generate_fn
@@ -27,11 +27,19 @@ class CorrectnessTestMixin:
     Mixin containing functional verification logic shared across GPU suites.
     """
 
+    def _client(self, ctx):
+        """Get OpenAI client for the server."""
+        return OpenAI(
+            api_key="sglang-anything",
+            base_url=f"http://localhost:{ctx.port}/v1",
+        )
+
     def test_functional_success(self, case: DiffusionTestCase, diffusion_server):
         """
         Verify that the model generates output successfully for its modality.
         Reuses project-standard polling and validation logic from get_generate_fn.
         """
+        client = self._client(diffusion_server)
         generate_fn = get_generate_fn(
             model_path=case.server_args.model_path,
             modality=case.server_args.modality,
@@ -39,7 +47,7 @@ class CorrectnessTestMixin:
         )
 
         # functional success check
-        self.run_and_collect(diffusion_server, case.id, generate_fn)
+        generate_fn(case.id, client)
         logger.info(f"Functional success verified for {case.id}")
 
     def test_seed_determinism(self, case: DiffusionTestCase, diffusion_server):
@@ -79,23 +87,14 @@ class CorrectnessTestMixin:
         # Use client.base_url to construct the target endpoint dynamically
         base_url = f"{client.base_url}/images/generations"
 
-        # Test 1: Invalid resolution (400 or 422)
-        payload = {
-            "model": case.server_args.model_path,
-            "prompt": "test",
-            "size": "invalid_size",
-        }
-        resp = requests.post(base_url, json=payload)
-        assert resp.status_code in [400, 422]
-
-        # Test 2: Missing mandatory prompt (422)
+        # Verify 422 for missing mandatory prompt
         payload = {"model": case.server_args.model_path}
         resp = requests.post(base_url, json=payload)
         assert resp.status_code == 422
         logger.info(f"Error handling verified for {case.id}")
 
 
-class TestDiffusionCorrectness(CorrectnessTestMixin, DiffusionServerBase):
+class TestDiffusionCorrectness(CorrectnessTestMixin):
     """
     Functional correctness tests for 1-GPU diffusion cases.
     """

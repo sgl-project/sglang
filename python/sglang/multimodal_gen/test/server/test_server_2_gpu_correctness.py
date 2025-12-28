@@ -22,7 +22,7 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
 logger = init_logger(__name__)
 
 
-class TestDiffusionServerTwoGpuCorrectness(CorrectnessTestMixin, DiffusionServerBase):
+class TestDiffusionServerTwoGpuCorrectness(CorrectnessTestMixin):
     """
     Functional correctness tests for 2-GPU diffusion cases.
     Inherits shared functional logic from CorrectnessTestMixin.
