@@ -12,12 +12,15 @@ use std::{
 use tonic::{transport::Channel, Request, Streaming};
 use tracing::{debug, warn};
 
-use crate::protocols::{
-    chat::ChatCompletionRequest,
-    common::{ResponseFormat, StringOrArray, ToolChoice, ToolChoiceValue},
-    generate::GenerateRequest,
-    responses::ResponsesRequest,
-    sampling_params::SamplingParams as GenerateSamplingParams,
+use crate::{
+    observability::otel_trace::inject_trace_context_grpc,
+    protocols::{
+        chat::ChatCompletionRequest,
+        common::{ResponseFormat, StringOrArray, ToolChoice, ToolChoiceValue},
+        generate::GenerateRequest,
+        responses::ResponsesRequest,
+        sampling_params::SamplingParams as GenerateSamplingParams,
+    },
 };
 
 // Include the generated protobuf code
@@ -163,7 +166,11 @@ impl SglangSchedulerClient {
     ) -> Result<AbortOnDropStream, Box<dyn std::error::Error + Send + Sync>> {
         let request_id = req.request_id.clone();
         let mut client = self.client.clone();
-        let request = Request::new(req);
+        let mut request = Request::new(req);
+
+        // Inject W3C trace context into gRPC metadata for distributed tracing
+        inject_trace_context_grpc(request.metadata_mut());
+
         let response = client.generate(request).await?;
 
         Ok(AbortOnDropStream::new(
@@ -171,6 +178,21 @@ impl SglangSchedulerClient {
             request_id,
             self.clone(),
         ))
+    }
+
+    /// Submit an embedding request
+    pub async fn embed(
+        &self,
+        req: proto::EmbedRequest,
+    ) -> Result<proto::EmbedResponse, Box<dyn std::error::Error + Send + Sync>> {
+        let mut client = self.client.clone();
+        let mut request = Request::new(req);
+
+        // Inject W3C trace context into gRPC metadata
+        inject_trace_context_grpc(request.metadata_mut());
+
+        let response = client.embed(request).await?;
+        Ok(response.into_inner())
     }
 
     /// Perform health check
@@ -237,6 +259,25 @@ impl SglangSchedulerClient {
         let response = client.get_server_info(request).await?;
         debug!("Server info response received");
         Ok(response.into_inner())
+    }
+
+    /// Build a single SGLang EmbedRequest
+    pub fn build_embed_request(
+        &self,
+        request_id: String,
+        original_text: Option<String>,
+        token_ids: Vec<u32>,
+        log_metrics: Option<bool>,
+    ) -> proto::EmbedRequest {
+        proto::EmbedRequest {
+            request_id,
+            tokenized: Some(proto::TokenizedInput {
+                original_text: original_text.unwrap_or_default(),
+                input_ids: token_ids,
+            }),
+            log_metrics: log_metrics.unwrap_or(false), // Default to false if not specified
+            ..Default::default()
+        }
     }
 
     /// Build a single SGLang GenerateRequest from OpenAI ChatCompletionRequest

@@ -4,8 +4,8 @@ use std::sync::Arc;
 
 use rand::Rng;
 
-use super::{get_healthy_worker_indices, LoadBalancingPolicy};
-use crate::{core::Worker, observability::metrics::RouterMetrics};
+use super::{get_healthy_worker_indices, LoadBalancingPolicy, SelectWorkerInfo};
+use crate::core::Worker;
 
 /// Random selection policy
 ///
@@ -23,7 +23,7 @@ impl LoadBalancingPolicy for RandomPolicy {
     fn select_worker(
         &self,
         workers: &[Arc<dyn Worker>],
-        _request_text: Option<&str>,
+        _info: &SelectWorkerInfo,
     ) -> Option<usize> {
         let healthy_indices = get_healthy_worker_indices(workers);
 
@@ -33,10 +33,7 @@ impl LoadBalancingPolicy for RandomPolicy {
 
         let mut rng = rand::rng();
         let random_idx = rng.random_range(0..healthy_indices.len());
-        let worker = workers[healthy_indices[random_idx]].url();
 
-        RouterMetrics::record_processed_request(worker);
-        RouterMetrics::record_policy_decision(self.name(), worker);
         Some(healthy_indices[random_idx])
     }
 
@@ -79,7 +76,7 @@ mod tests {
 
         let mut counts = HashMap::new();
         for _ in 0..100 {
-            if let Some(idx) = policy.select_worker(&workers, None) {
+            if let Some(idx) = policy.select_worker(&workers, &SelectWorkerInfo::default()) {
                 *counts.entry(idx).or_insert(0) += 1;
             }
         }
@@ -110,7 +107,10 @@ mod tests {
 
         // Should always select the healthy worker (index 1)
         for _ in 0..10 {
-            assert_eq!(policy.select_worker(&workers, None), Some(1));
+            assert_eq!(
+                policy.select_worker(&workers, &SelectWorkerInfo::default()),
+                Some(1)
+            );
         }
     }
 
@@ -124,6 +124,9 @@ mod tests {
         )];
 
         workers[0].set_healthy(false);
-        assert_eq!(policy.select_worker(&workers, None), None);
+        assert_eq!(
+            policy.select_worker(&workers, &SelectWorkerInfo::default()),
+            None
+        );
     }
 }

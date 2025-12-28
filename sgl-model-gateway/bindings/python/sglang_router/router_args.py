@@ -4,6 +4,8 @@ import logging
 import os
 from typing import Dict, List, Optional
 
+from sglang_router.sglang_router_rs import get_available_tool_call_parsers
+
 logger = logging.getLogger(__name__)
 
 
@@ -52,10 +54,13 @@ class RouterArgs:
     # Prometheus configuration
     prometheus_port: Optional[int] = None
     prometheus_host: Optional[str] = None
+    prometheus_duration_buckets: Optional[List[float]] = None
     # Request ID headers configuration
     request_id_headers: Optional[List[str]] = None
     # Request timeout in seconds
     request_timeout_secs: int = 1800
+    # Grace period in seconds to wait for in-flight requests during shutdown
+    shutdown_grace_period_secs: int = 180
     # Max concurrent requests for rate limiting (-1 to disable)
     max_concurrent_requests: int = -1
     # Queue size for pending requests when max concurrent limit reached
@@ -115,9 +120,21 @@ class RouterArgs:
     client_cert_path: Optional[str] = None
     client_key_path: Optional[str] = None
     ca_cert_paths: List[str] = dataclasses.field(default_factory=list)
+    # Server TLS configuration
+    server_cert_path: Optional[str] = None
+    server_key_path: Optional[str] = None
     # Trace
     enable_trace: bool = False
     otlp_traces_endpoint: str = "localhost:4317"
+    # Control plane authentication
+    # API keys for control plane auth (list of tuples: id, name, key, role)
+    control_plane_api_keys: List[tuple] = dataclasses.field(default_factory=list)
+    control_plane_audit_enabled: bool = False
+    # JWT/OIDC configuration for control plane auth
+    jwt_issuer: Optional[str] = None
+    jwt_audience: Optional[str] = None
+    jwt_jwks_uri: Optional[str] = None
+    jwt_role_mapping: Dict[str, str] = dataclasses.field(default_factory=dict)
 
     @staticmethod
     def add_cli_args(
@@ -163,21 +180,28 @@ class RouterArgs:
             f"--{prefix}policy",
             type=str,
             default=RouterArgs.policy,
-            choices=["random", "round_robin", "cache_aware", "power_of_two"],
+            choices=["random", "round_robin", "cache_aware", "power_of_two", "manual"],
             help="Load balancing policy to use. In PD mode, this is used for both prefill and decode unless overridden",
         )
         parser.add_argument(
             f"--{prefix}prefill-policy",
             type=str,
             default=None,
-            choices=["random", "round_robin", "cache_aware", "power_of_two", "bucket"],
+            choices=[
+                "random",
+                "round_robin",
+                "cache_aware",
+                "power_of_two",
+                "manual",
+                "bucket",
+            ],
             help="Specific policy for prefill nodes in PD mode. If not specified, uses the main policy",
         )
         parser.add_argument(
             f"--{prefix}decode-policy",
             type=str,
             default=None,
-            choices=["random", "round_robin", "cache_aware", "power_of_two"],
+            choices=["random", "round_robin", "cache_aware", "power_of_two", "manual"],
             help="Specific policy for decode nodes in PD mode. If not specified, uses the main policy",
         )
 
@@ -341,6 +365,12 @@ class RouterArgs:
             help="Host address to bind the Prometheus metrics server. Supports IPv4, IPv6 (e.g., ::, ::1), or 0.0.0.0 for all interfaces",
         )
         parser.add_argument(
+            f"--{prefix}prometheus-duration-buckets",
+            type=float,
+            nargs="+",
+            help="Buckets for Prometheus duration metrics",
+        )
+        parser.add_argument(
             f"--{prefix}request-id-headers",
             type=str,
             nargs="*",
@@ -351,6 +381,12 @@ class RouterArgs:
             type=int,
             default=RouterArgs.request_timeout_secs,
             help="Request timeout in seconds",
+        )
+        parser.add_argument(
+            f"--{prefix}shutdown-grace-period-secs",
+            type=int,
+            default=RouterArgs.shutdown_grace_period_secs,
+            help="Grace period in seconds to wait for in-flight requests during shutdown",
         )
         # Retry configuration
         parser.add_argument(
@@ -520,11 +556,13 @@ class RouterArgs:
             default=None,
             help="Specify the parser for reasoning models (e.g., deepseek-r1, qwen3)",
         )
+        tool_call_parser_choices = get_available_tool_call_parsers()
         parser.add_argument(
             f"--{prefix}tool-call-parser",
             type=str,
             default=None,
-            help="Specify the parser for handling tool-call interactions",
+            choices=tool_call_parser_choices,
+            help=f"Specify the parser for tool-call interactions (e.g., json, qwen)",
         )
         # MCP server configuration
         parser.add_argument(
@@ -633,6 +671,19 @@ class RouterArgs:
             default=[],
             help="Path(s) to CA certificate(s) for verifying worker TLS certificates. Can specify multiple CAs.",
         )
+        # Server TLS configuration
+        parser.add_argument(
+            f"--{prefix}tls-cert-path",
+            type=str,
+            default=None,
+            help="Path to server TLS certificate (PEM format)",
+        )
+        parser.add_argument(
+            f"--{prefix}tls-key-path",
+            type=str,
+            default=None,
+            help="Path to server TLS private key (PEM format)",
+        )
         parser.add_argument(
             f"--{prefix}enable-trace",
             action="store_true",
@@ -643,6 +694,47 @@ class RouterArgs:
             type=str,
             default="localhost:4317",
             help="Config opentelemetry collector endpoint if --enable-trace is set. format: <ip>:<port>",
+        )
+        # Control plane authentication
+        parser.add_argument(
+            f"--{prefix}control-plane-api-keys",
+            type=str,
+            nargs="*",
+            default=[],
+            help="API keys for control plane authentication. Format: 'id:name:role:key' where role is 'admin' or 'user'. "
+            "Example: --control-plane-api-keys 'key1:Service Account:admin:secret123' 'key2:Read Only:user:secret456'",
+        )
+        parser.add_argument(
+            f"--{prefix}control-plane-audit-enabled",
+            action="store_true",
+            default=False,
+            help="Enable audit logging for control plane operations",
+        )
+        parser.add_argument(
+            f"--{prefix}jwt-issuer",
+            type=str,
+            default=None,
+            help="OIDC issuer URL for JWT authentication (e.g., https://login.microsoftonline.com/{tenant}/v2.0)",
+        )
+        parser.add_argument(
+            f"--{prefix}jwt-audience",
+            type=str,
+            default=None,
+            help="Expected audience claim for JWT tokens (usually the client ID or API identifier)",
+        )
+        parser.add_argument(
+            f"--{prefix}jwt-jwks-uri",
+            type=str,
+            default=None,
+            help="Explicit JWKS URI. If not provided, discovered from issuer via .well-known/openid-configuration",
+        )
+        parser.add_argument(
+            f"--{prefix}jwt-role-mapping",
+            type=str,
+            nargs="*",
+            default=[],
+            help="Mapping from IDP role/group names to gateway roles. Format: 'idp_role=gateway_role'. "
+            "Example: --jwt-role-mapping 'Gateway.Admin=admin' 'Gateway.User=user'",
         )
 
     @classmethod
@@ -667,6 +759,18 @@ class RouterArgs:
             elif attr.name in cli_args_dict:
                 args_dict[attr.name] = cli_args_dict[attr.name]
 
+            # Special handling for CLI args with dashes vs dataclass fields with underscores
+            # e.g. --tls-cert-path maps to tls_cert_path in args namespace, but we might want server_cert_path in dataclass
+            # Wait, dataclass fields are server_cert_path/server_key_path
+            # CLI args are tls_cert_path/tls_key_path
+            # We need to manually map them if names don't match
+
+        # Map tls args to server cert/key path
+        if f"{prefix}tls_cert_path" in cli_args_dict:
+            args_dict["server_cert_path"] = cli_args_dict[f"{prefix}tls_cert_path"]
+        if f"{prefix}tls_key_path" in cli_args_dict:
+            args_dict["server_key_path"] = cli_args_dict[f"{prefix}tls_key_path"]
+
         # parse special arguments and remove "--prefill" and "--decode" from cli_args_dict
         args_dict["prefill_urls"] = cls._parse_prefill_urls(
             cli_args_dict.get(f"{prefix}prefill", None)
@@ -687,15 +791,21 @@ class RouterArgs:
         # Mooncake-specific annotation
         args_dict["bootstrap_port_annotation"] = "sglang.ai/bootstrap-port"
 
+        # Parse control plane API keys
+        args_dict["control_plane_api_keys"] = cls._parse_control_plane_api_keys(
+            cli_args_dict.get(f"{prefix}control_plane_api_keys", [])
+        )
+
+        # Parse JWT role mapping
+        args_dict["jwt_role_mapping"] = cls._parse_jwt_role_mapping(
+            cli_args_dict.get(f"{prefix}jwt_role_mapping", [])
+        )
+
         return cls(**args_dict)
 
     def _validate_router_args(self):
         # Validate configuration based on mode
         if self.pd_disaggregation:
-            # Allow empty URLs even without service discovery to support dynamic worker addition
-            # URLs will be validated separately if provided
-            pass
-
             # Warn about policy usage in PD mode
             if self.prefill_policy and self.decode_policy and self.policy:
                 logger.warning(
@@ -780,3 +890,52 @@ class RouterArgs:
 
         # decode_list is a list of single-element lists due to nargs=1
         return [url[0] for url in decode_list]
+
+    @staticmethod
+    def _parse_control_plane_api_keys(api_keys_list):
+        """Parse control plane API keys from --control-plane-api-keys arguments.
+
+        Format: id:name:role:key
+        Example: --control-plane-api-keys 'key1:Service Account:admin:secret123'
+        """
+        if not api_keys_list:
+            return []
+
+        parsed_keys = []
+        for key_str in api_keys_list:
+            parts = key_str.split(":", 3)  # Split into at most 4 parts
+            if len(parts) != 4:
+                raise ValueError(
+                    f"Invalid API key format: '{key_str}'. Expected 'id:name:role:key'"
+                )
+            key_id, name, role, key = parts
+            role_lower = role.lower()
+            if role_lower not in ("admin", "user"):
+                raise ValueError(f"Invalid role: '{role}'. Must be 'admin' or 'user'")
+            parsed_keys.append((key_id, name, key, role_lower))
+        return parsed_keys
+
+    @staticmethod
+    def _parse_jwt_role_mapping(role_mapping_list):
+        """Parse JWT role mapping from --jwt-role-mapping arguments.
+
+        Format: idp_role=gateway_role
+        Example: --jwt-role-mapping 'Gateway.Admin=admin' 'Gateway.User=user'
+        """
+        if not role_mapping_list:
+            return {}
+
+        mapping = {}
+        for mapping_str in role_mapping_list:
+            if "=" not in mapping_str:
+                raise ValueError(
+                    f"Invalid role mapping format: '{mapping_str}'. Expected 'idp_role=gateway_role'"
+                )
+            idp_role, gateway_role = mapping_str.split("=", 1)
+            gateway_role_lower = gateway_role.lower()
+            if gateway_role_lower not in ("admin", "user"):
+                raise ValueError(
+                    f"Invalid gateway role: '{gateway_role}'. Must be 'admin' or 'user'"
+                )
+            mapping[idp_role] = gateway_role_lower
+        return mapping

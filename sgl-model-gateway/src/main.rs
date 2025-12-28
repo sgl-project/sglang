@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 use sgl_model_gateway::{
+    auth::{ApiKeyEntry, ControlPlaneAuthConfig, JwtConfig, Role},
     config::{
         CircuitBreakerConfig, ConfigError, ConfigResult, DiscoveryConfig, HealthCheckConfig,
         HistoryBackend, MetricsConfig, OracleConfig, PolicyConfig, PostgresConfig, RetryConfig,
@@ -136,7 +137,7 @@ struct CliArgs {
     #[arg(long, num_args = 0..)]
     worker_urls: Vec<String>,
 
-    #[arg(long, default_value = "cache_aware", value_parser = ["random", "round_robin", "cache_aware", "power_of_two"])]
+    #[arg(long, default_value = "cache_aware", value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "prefix_hash", "manual"])]
     policy: String,
 
     #[arg(long, default_value_t = false)]
@@ -145,10 +146,10 @@ struct CliArgs {
     #[arg(long, action = ArgAction::Append)]
     decode: Vec<String>,
 
-    #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "power_of_two"])]
+    #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "prefix_hash", "manual"])]
     prefill_policy: Option<String>,
 
-    #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "power_of_two"])]
+    #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "prefix_hash", "manual"])]
     decode_policy: Option<String>,
 
     #[arg(long, default_value_t = 1800)]
@@ -171,6 +172,14 @@ struct CliArgs {
 
     #[arg(long, default_value_t = 67108864)]
     max_tree_size: usize,
+
+    /// Number of prefix tokens to use for prefix_hash policy (default: 256)
+    #[arg(long, default_value_t = 256)]
+    prefix_token_count: usize,
+
+    /// Load factor threshold for prefix_hash policy (default: 1.25)
+    #[arg(long, default_value_t = 1.25)]
+    prefix_hash_load_factor: f64,
 
     #[arg(long, default_value_t = 536870912)]
     max_payload_size: usize,
@@ -215,10 +224,19 @@ struct CliArgs {
     prometheus_host: String,
 
     #[arg(long, num_args = 0..)]
+    prometheus_duration_buckets: Vec<f64>,
+
+    #[arg(long, num_args = 0..)]
     request_id_headers: Vec<String>,
 
     #[arg(long, default_value_t = 1800)]
     request_timeout_secs: u64,
+
+    /// Grace period in seconds to wait for in-flight requests during shutdown.
+    /// When the server receives SIGTERM/SIGINT, it will stop accepting new connections
+    /// and wait up to this duration for existing streaming requests to complete.
+    #[arg(long, default_value_t = 180)]
+    shutdown_grace_period_secs: u64,
 
     #[arg(long, default_value_t = -1)]
     max_concurrent_requests: i32,
@@ -357,6 +375,46 @@ struct CliArgs {
 
     #[arg(long, default_value = "localhost:4317")]
     otlp_traces_endpoint: String,
+
+    #[arg(long)]
+    tls_cert_path: Option<String>,
+
+    #[arg(long)]
+    tls_key_path: Option<String>,
+
+    // ==================== Control Plane Authentication ====================
+    /// JWT issuer URL for control plane authentication (OIDC discovery will be used)
+    /// Example: https://login.microsoftonline.com/{tenant}/v2.0
+    #[arg(long, env = "JWT_ISSUER")]
+    jwt_issuer: Option<String>,
+
+    /// Expected JWT audience claim (usually the client ID or API identifier)
+    /// Example: api://sgl-gateway
+    #[arg(long, env = "JWT_AUDIENCE")]
+    jwt_audience: Option<String>,
+
+    /// Explicit JWKS URI (if not provided, discovered from issuer)
+    #[arg(long, env = "JWT_JWKS_URI")]
+    jwt_jwks_uri: Option<String>,
+
+    /// JWT claim name containing the role (default: "roles")
+    #[arg(long, default_value = "roles")]
+    jwt_role_claim: String,
+
+    /// Role mapping from IDP role to gateway role (format: "idp_role=gateway_role")
+    /// Can be specified multiple times. Example: --jwt-role-mapping "Gateway.Admin=admin"
+    #[arg(long, action = ArgAction::Append)]
+    jwt_role_mapping: Vec<String>,
+
+    /// API keys for control plane access (format: "id:name:role:key")
+    /// Can be specified multiple times.
+    /// Example: --control-plane-api-keys "svc1:CI Pipeline:admin:secret123"
+    #[arg(long = "control-plane-api-keys", action = ArgAction::Append, env = "CONTROL_PLANE_API_KEYS")]
+    control_plane_api_keys: Vec<String>,
+
+    /// Disable audit logging for control plane operations
+    #[arg(long, default_value_t = false)]
+    disable_audit_logging: bool,
 }
 
 enum OracleConnectSource {
@@ -364,7 +422,106 @@ enum OracleConnectSource {
     Wallet { path: String, alias: String },
 }
 
+/// Parse role mapping from CLI format "idp_role=gateway_role"
+fn parse_role_mapping(mapping: &str) -> Option<(String, Role)> {
+    let parts: Vec<&str> = mapping.splitn(2, '=').collect();
+    if parts.len() != 2 {
+        eprintln!(
+            "WARNING: Invalid role mapping format '{}'. Expected 'idp_role=gateway_role'",
+            mapping
+        );
+        return None;
+    }
+    let idp_role = parts[0].to_string();
+    let gateway_role = match parts[1].to_lowercase().as_str() {
+        "admin" => Role::Admin,
+        "user" => Role::User,
+        other => {
+            eprintln!(
+                "WARNING: Invalid gateway role '{}' in mapping. Valid roles: admin, user",
+                other
+            );
+            return None;
+        }
+    };
+    Some((idp_role, gateway_role))
+}
+
+/// Parse control plane API key from CLI format "id:name:role:key"
+fn parse_control_plane_api_key(key_str: &str) -> Option<ApiKeyEntry> {
+    let parts: Vec<&str> = key_str.splitn(4, ':').collect();
+    if parts.len() != 4 {
+        eprintln!(
+            "WARNING: Invalid control-plane-api-key format '{}'. Expected 'id:name:role:key'",
+            key_str
+        );
+        return None;
+    }
+    let id = parts[0];
+    let name = parts[1];
+    let role_str = parts[2];
+    let key = parts[3];
+
+    let role = match role_str.to_lowercase().as_str() {
+        "admin" => Role::Admin,
+        "user" => Role::User,
+        other => {
+            eprintln!(
+                "WARNING: Invalid role '{}' in control-plane-api-key. Valid roles: admin, user",
+                other
+            );
+            return None;
+        }
+    };
+
+    Some(ApiKeyEntry::new(id, name, key, role))
+}
+
 impl CliArgs {
+    /// Build control plane authentication configuration from CLI args.
+    fn build_control_plane_auth_config(&self) -> ControlPlaneAuthConfig {
+        // Build JWT config if issuer and audience are provided
+        let jwt = match (&self.jwt_issuer, &self.jwt_audience) {
+            (Some(issuer), Some(audience)) => {
+                let role_mapping: HashMap<String, Role> = self
+                    .jwt_role_mapping
+                    .iter()
+                    .filter_map(|m| parse_role_mapping(m))
+                    .collect();
+
+                let mut jwt_config = JwtConfig::new(issuer.clone(), audience.clone());
+                jwt_config.role_claim = self.jwt_role_claim.clone();
+                jwt_config.role_mapping = role_mapping;
+                if let Some(jwks_uri) = &self.jwt_jwks_uri {
+                    jwt_config.jwks_uri = Some(jwks_uri.clone());
+                }
+                Some(jwt_config)
+            }
+            (Some(_), None) => {
+                eprintln!("WARNING: --jwt-issuer provided but --jwt-audience is missing. JWT auth disabled.");
+                None
+            }
+            (None, Some(_)) => {
+                eprintln!("WARNING: --jwt-audience provided but --jwt-issuer is missing. JWT auth disabled.");
+                None
+            }
+            (None, None) => None,
+        };
+
+        // Build API keys from CLI args
+        let api_keys: Vec<ApiKeyEntry> = self
+            .control_plane_api_keys
+            .iter()
+            .filter_map(|k| parse_control_plane_api_key(k))
+            .collect();
+
+        ControlPlaneAuthConfig {
+            jwt,
+            api_keys,
+            audit_enabled: !self.disable_audit_logging,
+        }
+    }
+
     fn determine_connection_mode(worker_urls: &[String]) -> ConnectionMode {
         for url in worker_urls {
             if url.starts_with("grpc://") || url.starts_with("grpcs://") {
@@ -400,6 +557,11 @@ impl CliArgs {
             "power_of_two" => PolicyConfig::PowerOfTwo {
                 load_check_interval_secs: 5,
             },
+            "prefix_hash" => PolicyConfig::PrefixHash {
+                prefix_token_count: self.prefix_token_count,
+                load_factor: self.prefix_hash_load_factor,
+            },
+            "manual" => PolicyConfig::Manual,
             _ => PolicyConfig::RoundRobin,
         }
     }
@@ -501,26 +663,20 @@ impl CliArgs {
         &self,
         prefill_urls: Vec<(String, Option<u16>)>,
     ) -> ConfigResult<RouterConfig> {
-        let mode = if self.enable_igw {
-            RoutingMode::Regular {
-                worker_urls: vec![],
-            }
-        } else if matches!(self.backend, Backend::Openai) {
+        // Determine routing mode based on backend type and PD disaggregation flag
+        // IGW mode doesn't change routing mode, only affects router initialization
+        let mode = if matches!(self.backend, Backend::Openai) {
             RoutingMode::OpenAI {
                 worker_urls: self.worker_urls.clone(),
             }
         } else if self.pd_disaggregation {
-            let decode_urls = self.decode.clone();
-
-            // Allow empty URLs to support dynamic worker addition
             RoutingMode::PrefillDecode {
                 prefill_urls,
-                decode_urls,
+                decode_urls: self.decode.clone(),
                 prefill_policy: self.prefill_policy.as_ref().map(|p| self.parse_policy(p)),
                 decode_policy: self.decode_policy.as_ref().map(|p| self.parse_policy(p)),
             }
         } else {
-            // Allow empty URLs to support dynamic worker addition
             RoutingMode::Regular {
                 worker_urls: self.worker_urls.clone(),
             }
@@ -656,7 +812,8 @@ impl CliArgs {
             .retries(!self.disable_retries)
             .circuit_breaker(!self.disable_circuit_breaker)
             .enable_wasm(self.enable_wasm)
-            .igw(self.enable_igw);
+            .igw(self.enable_igw)
+            .maybe_server_cert_and_key(self.tls_cert_path.as_ref(), self.tls_key_path.as_ref());
 
         builder.build()
     }
@@ -681,7 +838,22 @@ impl CliArgs {
         let prometheus_config = Some(PrometheusConfig {
             port: self.prometheus_port,
             host: self.prometheus_host.clone(),
+            duration_buckets: if self.prometheus_duration_buckets.is_empty() {
+                None
+            } else {
+                Some(self.prometheus_duration_buckets.clone())
+            },
         });
+
+        // Build control plane auth config
+        let control_plane_auth = {
+            let config = self.build_control_plane_auth_config();
+            if config.is_enabled() {
+                Some(config)
+            } else {
+                None
+            }
+        };
 
         ServerConfig {
             host: self.host.clone(),
@@ -698,6 +870,8 @@ impl CliArgs {
             } else {
                 Some(self.request_id_headers.clone())
             },
+            shutdown_grace_period_secs: self.shutdown_grace_period_secs,
+            control_plane_auth,
         }
     }
 }
@@ -740,10 +914,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse_from(filtered_args);
 
     // Handle subcommands or use direct args
-    let cli_args = match cli.command {
+    let mut cli_args = match cli.command {
         Some(Commands::Launch { args }) => args,
         None => cli.router_args,
     };
+
+    // Automatically enable IGW mode when service discovery is turned on
+    if cli_args.service_discovery && !cli_args.enable_igw {
+        println!("INFO: IGW mode automatically enabled because service discovery is turned on");
+        cli_args.enable_igw = true;
+    }
 
     println!("SGLang Router starting...");
     println!("Host: {}:{}", cli_args.host, cli_args.port);

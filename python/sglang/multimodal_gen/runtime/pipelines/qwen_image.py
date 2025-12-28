@@ -1,7 +1,11 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
 # SPDX-License-Identifier: Apache-2.0
+from diffusers.image_processor import VaeImageProcessor
 
+from sglang.multimodal_gen.runtime.models.model_stages.qwen_image_layered import (
+    QwenImageLayeredBeforeDenoisingStage,
+)
 from sglang.multimodal_gen.runtime.pipelines_core import LoRAPipeline
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
@@ -45,15 +49,16 @@ def prepare_mu(batch: Req, server_args: ServerArgs):
     height = batch.height
     width = batch.width
     vae_scale_factor = server_args.pipeline_config.vae_config.vae_scale_factor
-    image_seq_len = (int(height) // vae_scale_factor) * (int(width) // vae_scale_factor)
-
+    image_seq_len = (int(height) // vae_scale_factor // 2) * (
+        int(width) // vae_scale_factor // 2
+    )
     mu = calculate_shift(
         image_seq_len,
         # hard code, since scheduler_config is not in PipelineConfig now
         256,
-        4096,
+        8192,
         0.5,
-        1.15,
+        0.9,
     )
     return "mu", mu
 
@@ -135,7 +140,13 @@ class QwenImageEditPipeline(LoRAPipeline, ComposedPipelineBase):
         """Set up pipeline stages with proper dependency injection."""
 
         self.add_stage(
-            stage_name="input_validation_stage", stage=InputValidationStage()
+            stage_name="input_validation_stage",
+            stage=InputValidationStage(
+                vae_image_processor=VaeImageProcessor(
+                    vae_scale_factor=server_args.pipeline_config.vae_config.arch_config.vae_scale_factor
+                    * 2
+                )
+            ),
         )
 
         self.add_stage(
@@ -184,4 +195,66 @@ class QwenImageEditPipeline(LoRAPipeline, ComposedPipelineBase):
         )
 
 
-EntryClass = [QwenImagePipeline, QwenImageEditPipeline]
+class QwenImageEditPlusPipeline(QwenImageEditPipeline):
+    pipeline_name = "QwenImageEditPlusPipeline"
+
+
+def prepare_mu_layered(batch: Req, server_args: ServerArgs):
+    base_seqlen = 256 * 256 / 16 / 16
+    mu = (batch.image_latent.shape[1] / base_seqlen) ** 0.5
+    return "mu", mu
+
+
+class QwenImageLayeredPipeline(QwenImageEditPipeline):
+    pipeline_name = "QwenImageLayeredPipeline"
+
+    _required_config_modules = [
+        "vae",
+        "tokenizer",
+        "processor",
+        "transformer",
+        "scheduler",
+    ]
+
+    def create_pipeline_stages(self, server_args: ServerArgs):
+        """Set up pipeline stages with proper dependency injection."""
+
+        self.add_stage(
+            stage_name="QwenImageLayeredBeforeDenoisingStage",
+            stage=QwenImageLayeredBeforeDenoisingStage(
+                vae=self.get_module("vae"),
+                tokenizer=self.get_module("tokenizer"),
+                processor=self.get_module("processor"),
+                transformer=self.get_module("transformer"),
+                scheduler=self.get_module("scheduler"),
+                model_path=self.model_path,
+            ),
+        )
+
+        self.add_stage(
+            stage_name="timestep_preparation_stage",
+            stage=TimestepPreparationStage(
+                scheduler=self.get_module("scheduler"),
+                prepare_extra_set_timesteps_kwargs=[prepare_mu_layered],
+            ),
+        )
+
+        self.add_stage(
+            stage_name="denoising_stage",
+            stage=DenoisingStage(
+                transformer=self.get_module("transformer"),
+                scheduler=self.get_module("scheduler"),
+            ),
+        )
+
+        self.add_stage(
+            stage_name="decoding_stage", stage=DecodingStage(vae=self.get_module("vae"))
+        )
+
+
+EntryClass = [
+    QwenImagePipeline,
+    QwenImageEditPipeline,
+    QwenImageEditPlusPipeline,
+    QwenImageLayeredPipeline,
+]
