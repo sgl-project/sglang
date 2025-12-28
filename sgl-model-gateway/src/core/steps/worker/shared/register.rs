@@ -51,27 +51,51 @@ impl StepExecutor for RegisterWorkersStep {
             .collect();
 
         // Update Layer 3 worker pool size metrics per unique type/connection/model
+        // Emit both healthy=true and healthy=false counts
         for (worker_type, connection_mode, model_id) in unique_configs {
             // Get labels before moving values into get_workers_filtered
             let worker_type_label = worker_type.as_metric_label();
             let connection_mode_label = connection_mode.as_metric_label();
 
-            let pool_size = app_context
+            // Get healthy workers count
+            let healthy_count = app_context
+                .worker_registry
+                .get_workers_filtered(
+                    Some(&model_id),
+                    Some(worker_type.clone()),
+                    Some(connection_mode.clone()),
+                    None,
+                    true, // healthy_only = true
+                )
+                .len();
+
+            // Get total workers count
+            let total_count = app_context
                 .worker_registry
                 .get_workers_filtered(
                     Some(&model_id),
                     Some(worker_type),
                     Some(connection_mode),
                     None,
-                    false,
+                    false, // healthy_only = false (all workers)
                 )
                 .len();
+
+            let unhealthy_count = total_count.saturating_sub(healthy_count);
 
             Metrics::set_worker_pool_size(
                 worker_type_label,
                 connection_mode_label,
                 &model_id,
-                pool_size,
+                true, // healthy
+                healthy_count,
+            );
+            Metrics::set_worker_pool_size(
+                worker_type_label,
+                connection_mode_label,
+                &model_id,
+                false, // unhealthy
+                unhealthy_count,
             );
         }
 

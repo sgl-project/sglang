@@ -164,7 +164,7 @@ pub fn init_metrics() {
     // Layer 3: Worker metrics
     describe_gauge!(
         "smg_worker_pool_size",
-        "Current worker pool size by worker_type, connection_mode, model"
+        "Current worker pool size by worker_type, connection_mode, model, healthy"
     );
     describe_gauge!(
         "smg_worker_connections_active",
@@ -729,18 +729,20 @@ impl Metrics {
     // Layer 3: Worker metrics
     // ========================================================================
 
-    /// Set worker pool size
+    /// Set worker pool size with health status
     pub fn set_worker_pool_size(
         worker_type: &'static str,
         connection_mode: &'static str,
         model_id: &str,
+        healthy: bool,
         size: usize,
     ) {
         gauge!(
             "smg_worker_pool_size",
             "worker_type" => worker_type,
             "connection_mode" => connection_mode,
-            "model" => model_id.to_string()
+            "model" => model_id.to_string(),
+            "healthy" => bool_to_static_str(healthy)
         )
         .set(size as f64);
     }
