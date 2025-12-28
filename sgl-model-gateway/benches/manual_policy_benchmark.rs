@@ -217,12 +217,15 @@ fn bench_cache_size_impact(c: &mut Criterion) {
 }
 
 fn bench_comparison_baseline(c: &mut Criterion) {
+    use rand::Rng;
+
     let mut group = c.benchmark_group("manual_policy/vs_baseline");
     let workers = create_workers(16);
 
     // Baseline: raw random selection without any policy overhead
     group.bench_function("raw_random", |b| {
-        b.iter(|| black_box(rand::random::<usize>() % workers.len()));
+        let mut rng = rand::rng();
+        b.iter(|| black_box(rng.random_range(0..workers.len())));
     });
 
     group.finish();
