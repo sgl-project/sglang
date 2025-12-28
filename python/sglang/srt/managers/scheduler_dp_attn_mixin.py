@@ -129,16 +129,10 @@ def prepare_mlp_sync_batch_raw(
                 local_batch.extend_lens,
             )
         )
-        if not local_batch.return_logprob:
-            # sanity check
-            if num_tokens_for_logprob != local_batch.batch_size():
-                print(
-                    f"extend_logprob_start_lens={local_batch.extend_logprob_start_lens}"
-                )
-                print(f"extend_lens={local_batch.extend_lens}")
-            assert (
-                num_tokens_for_logprob == local_batch.batch_size()
-            ), f"num_tokens_for_logprob={num_tokens_for_logprob}, local_batch.batch_size()={local_batch.batch_size()}"
+        assert (
+            local_batch.return_logprob
+            or num_tokens_for_logprob == local_batch.batch_size()
+        )
 
     skip_all_gather = envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.get()
     can_cuda_graph = (
