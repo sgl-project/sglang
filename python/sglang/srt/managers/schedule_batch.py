@@ -1497,16 +1497,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     req.extend_input_len,
                 )
             elif req.logprob_start_len >= pre_len:
-                # Convert absolute logprob_start_len to relative extend_logprob_start_len
-                #
-                # Example: origin_input_ids=[1,2,3,4,5] (5 tokens, positions 0-4), logprob_start_len=3
-                # Regular logic: min(3-0, 5) = min(3,5) = 3
-                # This means: "compute logprobs from position 3 onwards in extend batch"
-                if not req.return_logprob:
-                    if req.logprob_start_len - pre_len < req.extend_input_len - 1:
-                        print(
-                            f"req.logprob_start_len={req.logprob_start_len}, pre_len={pre_len}, req.extend_input_len={req.extend_input_len}"
-                        )
                 req.extend_logprob_start_len = min(
                     req.logprob_start_len - pre_len,
                     req.extend_input_len,
@@ -1515,7 +1505,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 # logprob_start_len is before the current extend batch, so start from beginning
                 req.extend_logprob_start_len = 0
 
-            if req.return_logprob:
+            if self.return_logprob:
                 # Find input logprob token ids.
                 # First, find a global index within origin_input_ids and slide it by 1
                 # to compute input logprobs. It is because you need the next token
