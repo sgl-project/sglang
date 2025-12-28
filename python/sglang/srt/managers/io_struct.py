@@ -974,7 +974,9 @@ class BatchTokenIDOutput(
     # Number of times each request was retracted.
     retraction_counts: List[int]
 
+    # Reasoning info
     reasoning_tokens: Optional[List[int]] = None
+
     # The trainer step id. Used to know which step's weights are used for sampling.
     token_steps: List[List[int]] = None
 
@@ -1060,7 +1062,9 @@ class BatchStrOutput(
     # Number of times each request was retracted.
     retraction_counts: List[int]
 
+    # Reasoning Info
     reasoning_tokens: Optional[List[int]] = None
+
     # The trainer step id. Used to know which step's weights are used for sampling.
     token_steps: List[List[int]] = None
 
