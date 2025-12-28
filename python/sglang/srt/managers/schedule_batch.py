@@ -528,12 +528,14 @@ class Req:
         self.origin_input_ids = origin_input_ids
         # Each decode stage's output ids
         self.output_ids = []
-        self.num_reasoning_tokens = 0
-        self.in_reasoning_phase = False
         # fill_ids = origin_input_ids + output_ids. Updated if chunked.
         self.fill_ids = []
         self.session_id = session_id
         self.input_embeds = input_embeds
+
+        # Reasoning phase info
+        self.num_reasoning_tokens = 0
+        self.in_reasoning_phase = False
 
         # For req-level memory management
         self.kv_committed_len = 0
