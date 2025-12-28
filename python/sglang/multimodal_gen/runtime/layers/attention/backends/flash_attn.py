@@ -141,7 +141,7 @@ class FlashAttentionImpl(AttentionImpl):
             seqlen_k,
             softmax_scale=self.softmax_scale,
             causal=self.causal,
-            return_softmax_lse=return_softmax_lse,
+            return_attn_probs=return_softmax_lse,
         )
 
         if return_softmax_lse:

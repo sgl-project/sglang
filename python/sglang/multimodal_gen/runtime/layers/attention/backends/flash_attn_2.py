@@ -72,6 +72,8 @@ class FlashAttention2Impl(AttentionImpl):
         key: torch.Tensor,
         value: torch.Tensor,
         attn_metadata: AttentionMetadata,
+        *,
+        return_softmax_lse: bool = False,
     ):
         bsz, seqlen, nheads_q, d = query.shape
         bsz_k, seqlen_k, nheads_k, d_k = key.shape
@@ -93,6 +95,10 @@ class FlashAttention2Impl(AttentionImpl):
             seqlen_k,
             softmax_scale=self.softmax_scale,
             causal=self.causal,
+            return_attn_probs=return_softmax_lse,
         )
 
+        if return_softmax_lse:
+            out, softmax_lse = out
+            return out.reshape(bsz, seqlen, nheads_q, -1), softmax_lse
         return out.reshape(bsz, seqlen, nheads_q, -1)
