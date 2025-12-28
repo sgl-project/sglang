@@ -165,8 +165,6 @@ async def create_video(
     server_args = get_global_server_args()
     is_t2v = server_args.pipeline_config.task_type == ModelTaskType.T2V
 
-    input_path = None
-
     if "multipart/form-data" in content_type:
         if not prompt:
             raise HTTPException(status_code=400, detail="prompt is required")
