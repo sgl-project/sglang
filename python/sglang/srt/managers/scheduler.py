@@ -1555,76 +1555,21 @@ class Scheduler(
             or req.sampling_params.ebnf is not None
             or req.sampling_params.structural_tag is not None
         ):
-            # Normal decode: entry rank compiles then broadcasts a small decision.
             if self.spec_algorithm.is_none():
-                decision = None
-                if self.is_entry_rank:
-                    if self.grammar_backend is None:
-                        error_msg = "Grammar constraints require a grammar backend; please launch without --grammar-backend none."
-                        decision = ("abort", error_msg, None, False)
-                    else:
-                        key = self.choose_grammar_key(req.sampling_params)
-                        value, cache_hit = (
-                            self.grammar_backend.get_cached_or_future_value(
-                                key, req.require_reasoning
-                            )
-                        )
-                        req.grammar = value
-                        if not cache_hit:
-                            req.grammar_key = key
-                            add_to_grammar_queue = True
-                            decision = ("ok_queue", None, key, False)
-                        elif value is INVALID_GRAMMAR_OBJ:
-                            error_msg = (
-                                f"Invalid grammar request with cache hit: {key=}"
-                            )
-                            req.set_finish_with_abort(error_msg)
-                            decision = ("abort", error_msg, key, True)
-                        else:
-                            decision = ("ok_cache", None, key, True)
-
-                # Broadcast entry rank decision
+                decision = (
+                    self._grammar_decision_entry_rank(req)
+                    if self.is_entry_rank
+                    else None
+                )
                 decision = broadcast_pyobj(
                     decision,
                     self.cpu_group.rank,
                     self.cpu_group,
                     src=self.entry_rank,
                 )
-
-                # Non-entry ranks apply the decision without compiling.
-                if not self.is_entry_rank:
-                    state, error_msg, grammar_key, _ = decision
-                    if state == "abort":
-                        req.set_finish_with_abort(error_msg)
-                    elif state == "ok_queue":
-                        req.grammar_key = grammar_key
-                        add_to_grammar_queue = True
-                        req.grammar = None  # rank 0 owns compilation
-                    elif state == "ok_cache":
-                        req.grammar_key = grammar_key
-                        req.grammar = INVALID_GRAMMAR_OBJ
-
+                add_to_grammar_queue = self._apply_grammar_decision(req, decision)
             else:
-                # Speculative decode or fallback: symmetric behavior.
-                if self.grammar_backend is None:
-                    error_msg = "Grammar constraints require a grammar backend; please launch without --grammar-backend none."
-                    req.set_finish_with_abort(error_msg)
-                else:
-                    key = self.choose_grammar_key(req.sampling_params)
-
-                    value, cache_hit = self.grammar_backend.get_cached_or_future_value(
-                        key, req.require_reasoning
-                    )
-                    req.grammar = value
-
-                    if not cache_hit:
-                        req.grammar_key = key
-                        add_to_grammar_queue = True
-                    elif (
-                        value is INVALID_GRAMMAR_OBJ
-                    ):  # We hit a cached invalid grammar.
-                        error_msg = f"Invalid grammar request with cache hit: {key=}"
-                        req.set_finish_with_abort(error_msg)
+                add_to_grammar_queue = self._prepare_spec_grammar(req)
 
         if add_to_grammar_queue:
             self.grammar_queue.append(req)
@@ -2382,28 +2327,7 @@ class Scheduler(
     def move_ready_grammar_requests(self):
         """Move requests whose grammar objects are ready from grammar_queue to waiting_queue."""
 
-        num_ready_reqs = 0
-        num_timeout_reqs = 0
-        for req in self.grammar_queue:
-            try:
-                if req.finished():  # It is aborted by AbortReq
-                    num_ready_reqs += 1
-                    continue
-
-                req.grammar = req.grammar.result(timeout=0.03)
-                self.grammar_backend.set_cache(req.grammar_key, req.grammar.copy())
-                if req.grammar is INVALID_GRAMMAR_OBJ:
-                    error_msg = f"Invalid grammar request: {req.grammar_key=}"
-                    req.set_finish_with_abort(error_msg)
-
-                num_ready_reqs += 1
-            except futures._base.TimeoutError:
-                req.grammar_wait_ct += 1
-                # NOTE(lianmin): this timeout is the waiting time of the above line. It is
-                # not the waiting time from it enters the grammar queue.
-                if req.grammar_wait_ct > GRAMMAR_TIMEOUT / 0.03:
-                    num_timeout_reqs = 1
-                break
+        num_ready_reqs, num_timeout_reqs = self._count_ready_grammar_requests()
 
         if self.server_args.enable_dp_attention:
             tp_size = self.attn_tp_size
@@ -2416,33 +2340,35 @@ class Scheduler(
             # Sync across TP ranks to make sure they have the same number of ready requests
             tensor = torch.tensor([num_ready_reqs, num_timeout_reqs], dtype=torch.int32)
             torch.distributed.broadcast(tensor, src=self.entry_rank, group=tp_group)
-            num_ready_reqs_max, num_timeout_reqs_max = tensor.tolist()
+            num_ready_reqs, num_timeout_reqs = tensor.tolist()
 
-            for i in range(num_ready_reqs, num_ready_reqs_max):
-                req = self.grammar_queue[i]
-                if req.finished():  # It is aborted by AbortReq
-                    continue
-                req.grammar = req.grammar.result()
-                self.grammar_backend.set_cache(req.grammar_key, req.grammar.copy())
-                if req.grammar is INVALID_GRAMMAR_OBJ:
-                    error_msg = f"Invalid grammar request: {req.grammar_key=}"
-                    req.set_finish_with_abort(error_msg)
-        else:
-            num_ready_reqs_max = num_ready_reqs
-            num_timeout_reqs_max = num_timeout_reqs
+        ready_end = num_ready_reqs
+        timeout_end = num_ready_reqs + num_timeout_reqs
 
-        for i in range(num_ready_reqs, num_ready_reqs + num_timeout_reqs_max):
-            req = self.grammar_queue[i]
-            req.grammar.cancel()
-            self.grammar_backend.set_cache(req.grammar_key, INVALID_GRAMMAR_OBJ)
+        for req in self.grammar_queue[:ready_end]:
+            if (
+                req.grammar is None
+                and self.grammar_backend is not None
+                and req.grammar_key is not None
+            ):
+                req.grammar, _ = self.grammar_backend.get_cached_or_future_value(
+                    req.grammar_key, req.require_reasoning
+                )
+            if req.grammar is INVALID_GRAMMAR_OBJ:
+                error_msg = f"Invalid grammar request with cache hit: {req.grammar_key=}"
+                req.set_finish_with_abort(error_msg)
+            self._add_request_to_queue(req)
+
+        for req in self.grammar_queue[ready_end:timeout_end]:
+            if hasattr(req.grammar, "cancel"):
+                req.grammar.cancel()
+            if self.grammar_backend and req.grammar_key is not None:
+                self.grammar_backend.set_cache(req.grammar_key, INVALID_GRAMMAR_OBJ)
             error_msg = f"Grammar preprocessing timed out for {req.grammar_key=}"
             req.set_finish_with_abort(error_msg)
-
-        num_ready_reqs = num_ready_reqs_max + num_timeout_reqs_max
-
-        for req in self.grammar_queue[:num_ready_reqs]:
             self._add_request_to_queue(req)
-        self.grammar_queue = self.grammar_queue[num_ready_reqs:]
+
+        self.grammar_queue = self.grammar_queue[timeout_end:]
 
     def flush_cache_wrapped(self, recv_req: FlushCacheReqInput):
         success = self.flush_cache()
@@ -2456,6 +2382,126 @@ class Scheduler(
         if sampling_params.ebnf is not None:
             return ("ebnf", sampling_params.ebnf)
         return ("structural_tag", sampling_params.structural_tag)
+
+    def _grammar_decision_entry_rank(self, req) -> Dict[str, Any]:
+        if self.grammar_backend is None:
+            return {
+                "state": "abort",
+                "message": "Grammar constraints require a grammar backend; please launch without --grammar-backend none.",
+                "grammar_key": None,
+                "from_cache": False,
+            }
+
+        grammar_key = self.choose_grammar_key(req.sampling_params)
+        grammar_obj, cache_hit = self.grammar_backend.get_cached_or_future_value(
+            grammar_key, req.require_reasoning
+        )
+        req.grammar = grammar_obj
+        req.grammar_key = grammar_key
+
+        if not cache_hit:
+            return {
+                "state": "queue",
+                "message": None,
+                "grammar_key": grammar_key,
+                "from_cache": False,
+            }
+
+        if grammar_obj is INVALID_GRAMMAR_OBJ:
+            return {
+                "state": "abort",
+                "message": f"Invalid grammar request with cache hit: {grammar_key=}",
+                "grammar_key": grammar_key,
+                "from_cache": True,
+            }
+
+        return {
+            "state": "cache",
+            "message": None,
+            "grammar_key": grammar_key,
+            "from_cache": True,
+        }
+
+    def _attach_cached_grammar(self, req, grammar_key: Optional[Tuple[str, Any]]):
+        req.grammar_key = grammar_key
+        if self.grammar_backend is None or grammar_key is None:
+            req.grammar = None
+            return
+        req.grammar, _ = self.grammar_backend.get_cached_or_future_value(
+            grammar_key, req.require_reasoning
+        )
+
+    def _apply_grammar_decision(self, req, decision: Dict[str, Any]) -> bool:
+        state = decision.get("state")
+        grammar_key = decision.get("grammar_key")
+        if state == "abort":
+            req.set_finish_with_abort(decision.get("message"))
+            return False
+        if state == "cache":
+            self._attach_cached_grammar(req, grammar_key)
+            return False
+        if state == "queue":
+            self._attach_cached_grammar(req, grammar_key)
+            return True
+        return False
+
+    def _prepare_spec_grammar(self, req) -> bool:
+        if self.grammar_backend is None:
+            error_msg = "Grammar constraints require a grammar backend; please launch without --grammar-backend none."
+            req.set_finish_with_abort(error_msg)
+            return False
+
+        grammar_key = self.choose_grammar_key(req.sampling_params)
+        grammar_obj, cache_hit = self.grammar_backend.get_cached_or_future_value(
+            grammar_key, req.require_reasoning
+        )
+        req.grammar = grammar_obj
+
+        if not cache_hit:
+            req.grammar_key = grammar_key
+            return True
+
+        if grammar_obj is INVALID_GRAMMAR_OBJ:
+            error_msg = f"Invalid grammar request with cache hit: {grammar_key=}"
+            req.set_finish_with_abort(error_msg)
+        return False
+
+    def _count_ready_grammar_requests(self) -> Tuple[int, int]:
+        """Return (#ready, #timeout) without mutating queue order."""
+        num_ready_reqs = 0
+        num_timeout_reqs = 0
+
+        for req in self.grammar_queue:
+            try:
+                if req.finished():  # It is aborted by AbortReq
+                    num_ready_reqs += 1
+                    continue
+
+                if req.grammar is None and req.grammar_key is not None:
+                    self._attach_cached_grammar(req, req.grammar_key)
+
+                req.grammar = req.grammar.result(timeout=0.03)
+                if (
+                    req.grammar_key is not None
+                    and self.grammar_backend is not None
+                    and req.grammar is not INVALID_GRAMMAR_OBJ
+                ):
+                    self.grammar_backend.set_cache(req.grammar_key, req.grammar.copy())
+
+                if req.grammar is INVALID_GRAMMAR_OBJ:
+                    error_msg = f"Invalid grammar request with cache hit: {req.grammar_key=}"
+                    req.set_finish_with_abort(error_msg)
+
+                num_ready_reqs += 1
+            except futures._base.TimeoutError:
+                req.grammar_wait_ct += 1
+                # NOTE(lianmin): this timeout is the waiting time of the above line. It is
+                # not the waiting time from it enters the grammar queue.
+                if req.grammar_wait_ct > GRAMMAR_TIMEOUT / 0.03:
+                    num_timeout_reqs = 1
+                break
+
+        return num_ready_reqs, num_timeout_reqs
 
     def clear_hicache_storage_wrapped(self, recv_req: ClearHiCacheReqInput):
         if self.enable_hierarchical_cache:

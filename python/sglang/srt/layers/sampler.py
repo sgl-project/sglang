@@ -209,28 +209,43 @@ class Sampler(nn.Module):
                 batch_next_token_ids,
             ]
 
-        if broadcast_from_rank0 and sampling_info.grammars and self.tp_size > 1:
+        self._sync_batch_token_ids(
+            batch_next_token_ids, sampling_info, broadcast_from_rank0
+        )
+        return batch_next_token_ids
+
+    def _sync_batch_token_ids(
+        self,
+        batch_next_token_ids: torch.Tensor,
+        sampling_info: SamplingBatchInfo,
+        broadcast_from_rank0: bool,
+    ) -> None:
+        """Keep TP ranks aligned on the chosen token IDs."""
+        if self.tp_size <= 1:
+            return
+
+        has_grammar = bool(sampling_info.grammars)
+        if broadcast_from_rank0 and has_grammar:
             # Grammar-aware sampling only runs on rank 0; broadcast its choice to keep ranks in sync.
             dist.broadcast(
                 batch_next_token_ids,
                 src=self.tp_root_rank,
                 group=self.tp_sync_group,
             )
-        elif SYNC_TOKEN_IDS_ACROSS_TP or sampling_info.grammars:
+            return
+
+        if SYNC_TOKEN_IDS_ACROSS_TP or has_grammar:
             # For performance reasons, SGLang does not sync the final token IDs across TP ranks by default.
             # This saves one all-reduce, but the correctness of this approach depends on the determinism of several operators:
             # the last all-reduce, the last lm_head matmul, and all sampling kernels.
             # These kernels are deterministic in most cases, but there are some rare instances where they are not deterministic.
             # In such cases, enable this env variable to prevent hanging due to TP ranks becoming desynchronized.
             # When using xgrammar, this becomes more likely so we also do the sync when grammar is used.
-
             torch.distributed.all_reduce(
                 batch_next_token_ids,
                 op=dist.ReduceOp.MIN,
                 group=self.tp_sync_group,
             )
-
-        return batch_next_token_ids
 
     def compute_logprobs_only(
         self,

@@ -191,31 +191,32 @@ class SamplingBatchInfo:
         return len(self.temperatures)
 
     def update_regex_vocab_mask(self):
-        if not self.grammars:
+        grammars = self.grammars or []
+        active_grammars = [
+            (idx, grammar)
+            for idx, grammar in enumerate(grammars)
+            if grammar and not grammar.finished and not grammar.is_terminated()
+        ]
+
+        if not active_grammars:
+            # Nothing to mask; drop any previous state.
             self.vocab_mask = None
             self.apply_mask_func = None
             return
 
-        # Find a grammar from the list
-        first_grammar = next(grammar for grammar in self.grammars if grammar)
-
-        # TODO(lianmin): Maybe we can reuse the existing mask?
-        self.vocab_mask = first_grammar.allocate_vocab_mask(
+        _, anchor = active_grammars[0]
+        self.vocab_mask = anchor.allocate_vocab_mask(
             vocab_size=self.vocab_size,
             batch_size=len(self.temperatures),
             device=self.device,
         )
-        self.apply_mask_func = (
-            first_grammar.apply_vocab_mask
-        )  # force to use static method
+        # force to use static method
+        self.apply_mask_func = anchor.apply_vocab_mask
 
-        # Apply the mask
-        for i, grammar in enumerate(self.grammars):
-            if grammar and not grammar.finished and not grammar.is_terminated():
-                grammar.fill_vocab_mask(self.vocab_mask, i)
+        for idx, grammar in active_grammars:
+            grammar.fill_vocab_mask(self.vocab_mask, idx)
 
-        # Move the mask to the device if needed
-        self.vocab_mask = first_grammar.move_vocab_mask(self.vocab_mask, self.device)
+        self.vocab_mask = anchor.move_vocab_mask(self.vocab_mask, self.device)
 
     def update_penalties(self):
         if self.penalizer_orchestrator.is_required:

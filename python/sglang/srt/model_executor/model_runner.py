@@ -2344,10 +2344,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 axis=-1,
             )
 
-        normal_decode = forward_batch.spec_algorithm is None
-        apply_vocab_mask = normal_decode and (
-            self.sampler.tp_size == 1 or self.sampler.tp_rank == 0
-        )
+        apply_vocab_mask = self._should_apply_vocab_mask(forward_batch)
         self._preprocess_logits(
             logits_output,
             forward_batch.sampling_info,
@@ -2366,9 +2363,22 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 if forward_batch.forward_mode.is_decode()
                 else forward_batch.seq_lens - 1
             ),
-            broadcast_from_rank0=normal_decode,
+            broadcast_from_rank0=self._should_broadcast_next_tokens(forward_batch),
         )
         return next_token_ids
+
+    def _should_apply_vocab_mask(self, forward_batch) -> bool:
+        """Apply grammar masks only on rank 0 for normal decoding."""
+        if forward_batch.spec_algorithm is not None:
+            return False
+        if self.sampler.tp_size == 1:
+            return True
+        return self.sampler.tp_rank == 0
+
+    @staticmethod
+    def _should_broadcast_next_tokens(forward_batch) -> bool:
+        # Only normal decode synchronizes tokens; speculative paths keep their own flow.
+        return forward_batch.spec_algorithm is None
 
     def compute_logprobs_only(
         self,
