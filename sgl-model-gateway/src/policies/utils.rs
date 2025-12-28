@@ -4,6 +4,17 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use tracing::debug;
+use crate::policies::CacheAwarePolicy;
+
+pub struct PeriodicTask {}
+
+impl PeriodicTask {
+    pub fn new() -> Self {}
+}
+
+impl Drop for PeriodicTask {
+    // use that `impl Drop for CacheAwarePolicy` to cancel thread
+}
 
 /// Spawn a background thread that periodically executes a task.
 ///
