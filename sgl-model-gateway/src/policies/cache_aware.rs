@@ -65,7 +65,6 @@ use std::{
         Arc,
     },
     thread,
-    time::Duration,
 };
 
 use dashmap::DashMap;
@@ -73,8 +72,8 @@ use rand::Rng;
 use tracing::debug;
 
 use super::{
-    get_healthy_worker_indices, normalize_model_key, tree::Tree, CacheAwareConfig,
-    LoadBalancingPolicy, SelectWorkerInfo,
+    get_healthy_worker_indices, normalize_model_key, tree::Tree,
+    utils::spawn_periodic_task, CacheAwareConfig, LoadBalancingPolicy, SelectWorkerInfo,
 };
 use crate::core::Worker;
 
@@ -105,34 +104,13 @@ impl CacheAwarePolicy {
         // Start background eviction thread if configured
         let eviction_handle = if config.eviction_interval_secs > 0 {
             let trees_clone = Arc::clone(&trees);
-            let shutdown_clone = Arc::clone(&shutdown_flag);
             let max_tree_size = config.max_tree_size;
-            let interval = config.eviction_interval_secs;
 
-            Some(thread::spawn(move || {
-                // Use smaller sleep intervals to check shutdown flag more frequently
-                let check_interval_ms = 100; // Check every 100ms
-                let total_sleep_ms = interval * 1000;
-
-                loop {
-                    // Sleep in small increments, checking shutdown flag periodically
-                    let mut slept_ms = 0u64;
-                    while slept_ms < total_sleep_ms {
-                        if shutdown_clone.load(Ordering::Relaxed) {
-                            debug!("Eviction thread received shutdown signal");
-                            return;
-                        }
-                        thread::sleep(Duration::from_millis(check_interval_ms));
-                        slept_ms += check_interval_ms;
-                    }
-
-                    // Check shutdown before starting eviction
-                    if shutdown_clone.load(Ordering::Relaxed) {
-                        debug!("Eviction thread received shutdown signal");
-                        return;
-                    }
-
-                    // Evict for all model trees
+            Some(spawn_periodic_task(
+                config.eviction_interval_secs,
+                Arc::clone(&shutdown_flag),
+                "Eviction",
+                move || {
                     for tree_ref in trees_clone.iter() {
                         let model_id = tree_ref.key();
                         let tree = tree_ref.value();
@@ -143,8 +121,8 @@ impl CacheAwarePolicy {
                             model_id, max_tree_size
                         );
                     }
-                }
-            }))
+                },
+            ))
         } else {
             None
         };

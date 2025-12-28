@@ -18,6 +18,7 @@ mod random;
 mod registry;
 mod round_robin;
 pub mod tree;
+pub(crate) mod utils;
 pub use bucket::BucketPolicy;
 pub use cache_aware::CacheAwarePolicy;
 pub use consistent_hashing::ConsistentHashingPolicy;
