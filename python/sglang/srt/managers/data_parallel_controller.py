@@ -16,6 +16,7 @@
 import faulthandler
 import logging
 import multiprocessing as mp
+import os
 import signal
 import threading
 import time
@@ -536,6 +537,9 @@ class DataParallelController:
         self.round_robin_scheduler(req)
 
     def event_loop(self):
+        last_child_check_time = time.time()
+        child_check_interval = 5.0  # Check every 5 seconds
+
         while True:
             while True:
                 self.watchdog.feed()
@@ -544,6 +548,17 @@ class DataParallelController:
                 except zmq.ZMQError:
                     break
                 self._request_dispatcher(recv_req)
+
+            # Periodically check if scheduler child processes are still alive
+            current_time = time.time()
+            if current_time - last_child_check_time >= child_check_interval:
+                last_child_check_time = current_time
+                for proc in self.scheduler_procs:
+                    if not proc.is_alive():
+                        raise RuntimeError(
+                            f"Scheduler process {proc.pid} died unexpectedly "
+                            f"with exit code {proc.exitcode}"
+                        )
 
 
 def run_data_parallel_controller_process(
@@ -556,6 +571,19 @@ def run_data_parallel_controller_process(
     faulthandler.enable()
     kill_itself_when_parent_died()
     parent_process = psutil.Process().parent()
+
+    # Set up SIGQUIT handler to propagate to parent
+    # This ensures that if a scheduler sends SIGQUIT to DPC, we propagate it to Engine
+    def sigquit_handler(signum, frame):
+        logger.error(
+            "DataParallelController received SIGQUIT from child. "
+            "Propagating to parent Engine process."
+        )
+        parent_process.send_signal(signal.SIGQUIT)
+        # Use os._exit to avoid running any cleanup that might hang
+        os._exit(1)
+
+    signal.signal(signal.SIGQUIT, sigquit_handler)
 
     configure_logger(server_args)
     if server_args.enable_trace:
