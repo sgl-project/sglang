@@ -569,5 +569,49 @@ TWO_GPU_CASES_B = [
     ),
 ]
 
+# Correctness Cases
+CORRECTNESS_1_GPU_CASES = [
+    # 1. Standard Image Correctness (Seed & Functional Check)
+    DiffusionTestCase(
+        "qwen_image_correctness_seed",
+        DiffusionServerArgs(
+            model_path="Qwen/Qwen-Image", modality="image", warmup_text=1
+        ),
+        T2I_sampling_params,
+    ),
+    # Multimodal Image Edit Correctness (Exercises /edits and Vision encoders)
+    DiffusionTestCase(
+        "qwen_image_edit_correctness",
+        DiffusionServerArgs(
+            model_path="Qwen/Qwen-Image-Edit", modality="image", warmup_edit=1
+        ),
+        TI2I_sampling_params,
+    ),
+    # Video generation correctness
+    DiffusionTestCase(
+        "wan_video_correctness",
+        DiffusionServerArgs(
+            model_path="Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
+            modality="video",
+            warmup_text=0,
+        ),
+        DiffusionSamplingParams(prompt="A dog with sunglasses", num_frames=8),
+    ),
+]
+
+CORRECTNESS_2_GPU_CASES = [
+    # Multimodal Image to Video
+    DiffusionTestCase(
+        "wan_video_i2v_correctness_2gpu",
+        DiffusionServerArgs(
+            model_path="Wan-AI/Wan2.1-I2V-14B-480P-Diffusers",
+            modality="video",
+            num_gpus=2,
+            warmup_edit=0,
+        ),
+        TI2V_sampling_params,
+    ),
+]
+
 # Load global configuration
 BASELINE_CONFIG = BaselineConfig.load(Path(__file__).with_name("perf_baselines.json"))
