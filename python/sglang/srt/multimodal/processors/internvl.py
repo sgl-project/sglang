@@ -2,6 +2,7 @@
 
 import logging
 from functools import lru_cache
+from typing import List
 
 import numpy as np
 import torch
@@ -99,6 +100,15 @@ class InternVLProcessor(BaseMultimodalProcessor):
             image_token_id=tokenizer.convert_tokens_to_ids(self.IMG_CONTEXT),
             video_token=self.VIDEO_PLACEHOLDER_TOKEN,
             video_token_id=self.video_token_id,
+        ).build(_image_processor)
+
+        # Cache token id for IMG_CONTEXT (used by both branches)
+        self.img_context_token_id = tokenizer.convert_tokens_to_ids(self.IMG_CONTEXT)
+
+        # InternLM2 legacy multimodal tokens: use <IMG_CONTEXT> as placeholder
+        self.mm_tokens_internlm2 = MultimodalSpecialTokens(
+            image_token=self.IMG_CONTEXT,
+            image_token_id=self.img_context_token_id,
         ).build(_image_processor)
 
         self.max_context_len = (
@@ -212,6 +222,8 @@ class InternVLProcessor(BaseMultimodalProcessor):
     def _resolve_video_num_frames(
         self, *, requested: int, num_videos: int, text_len: int, image_tile_cnt: int
     ) -> int:
+        if num_videos <= 0:
+            return 0
         if not self.VIDEO_CONTEXT_TOKEN or not self.video_token_id:
             return 0
         image_tokens = image_tile_cnt * self.num_image_token
@@ -230,6 +242,29 @@ class InternVLProcessor(BaseMultimodalProcessor):
     async def process_mm_data_async(
         self, image_data, input_text, request_obj, **kwargs
     ):
+
+        is_internlm2 = self.llm_arch == "InternLM2ForCausalLM"
+
+        if is_internlm2:
+            return await self.process_internlm2_mm_data_async(
+                image_data=image_data,
+                input_text=input_text,
+                request_obj=request_obj,
+                **kwargs,
+            )
+        else:
+            # Default branch uses OpenAI-style placeholders
+            return await self.process_qwen_mm_data_async(
+                image_data=image_data,
+                input_text=input_text,
+                request_obj=request_obj,
+                **kwargs,
+            )
+
+    async def process_qwen_mm_data_async(
+        self, image_data, input_text, request_obj, **kwargs
+    ):
+        # Qwen/Qwen3 branch: OpenAI-style placeholders <image>/<video>
         prompt = input_text or ""
         video_data = getattr(request_obj, "video_data", None) or []
 
@@ -243,7 +278,7 @@ class InternVLProcessor(BaseMultimodalProcessor):
             )
 
         logger.info(
-            "[internvl] placeholders image=%d video=%d",
+            "[internvl][qwen] placeholders image=%d video=%d",
             prompt.count(self.IMAGE_PLACEHOLDER_TOKEN),
             prompt.count(self.VIDEO_PLACEHOLDER_TOKEN),
         )
@@ -252,22 +287,22 @@ class InternVLProcessor(BaseMultimodalProcessor):
             prompt=prompt,
             image_data=image_data,
             video_data=video_data,
-            multimodal_tokens=self.mm_tokens,
+            multimodal_tokens=self.mm_tokens,  # expects <image>/<video>
             discard_alpha_channel=True,
         )
 
         logger.info(
-            "[internvl] loaded images=%d videos=%d types=%s",
+            "[internvl][qwen] loaded images=%d videos=%d",
             len(base_output.images),
             len(base_output.videos),
-            [type(v).__name__ for v in base_output.videos],
         )
 
         mean, std = self._get_normalize_tensors(device="cuda")
 
-        # Images
-        num_patches_list = []
-        pixel_values = []
+        # ----- Images -> tiles -----
+        num_patches_list: List[int] = []
+        pixel_values_list: List[torch.Tensor] = []
+
         for image in base_output.images:
             if isinstance(image, Image.Image):
                 img_np = np.array(image.convert("RGB"))
@@ -276,98 +311,100 @@ class InternVLProcessor(BaseMultimodalProcessor):
                 )
             else:
                 tensor = image.cuda()
+
             tensor = (tensor - mean) / std
             tiles = self.dynamic_preprocess(
                 tensor, image_size=448, max_num=12, use_thumbnail=True
             )
-            pixel_values.append(tiles)
+            pixel_values_list.append(tiles)
             num_patches_list.append(int(tiles.shape[0]))
 
-        image_tile_cnt = int(sum(num_patches_list))
-        text_len = self._token_len(base_output.input_text or prompt)
+        if image_data and not pixel_values_list:
+            raise ValueError(
+                "[internvl][qwen] image_data provided but no images parsed from prompt placeholders"
+            )
 
-        # Videos：each frame=1 patch
-        requested_frames = int(
-            kwargs.get("video_num_frames", self.DEFAULT_VIDEO_NUM_FRAMES)
-        )
-        num_videos = len(base_output.videos)
-        num_frames = self._resolve_video_num_frames(
-            requested=requested_frames,
-            num_videos=num_videos,
-            text_len=text_len,
-            image_tile_cnt=image_tile_cnt,
+        image_tensor = (
+            torch.cat(pixel_values_list, dim=0) if pixel_values_list else None
         )
 
-        logger.info(
-            "[internvl] cfg num_image_token=%d requested_frames=%d resolved_frames=%d",
-            self.num_image_token,
-            requested_frames,
-            num_frames,
-        )
-
+        # ----- Videos -> frame tiles (optional) -----
+        video_tensor = None
         video_patch_lists = []
         video_pixel_values = []
 
-        for video in base_output.videos:
-            vr = (
-                video
-                if isinstance(video, VideoReader)
-                else self._open_video_reader(str(video))
-            )
-            max_frame = len(vr) - 1
-            frame_indices = (
-                [0]
-                if num_frames == 1
-                else np.linspace(0, max_frame, num=num_frames, dtype=int).tolist()
-            )
-
-            per_video_tiles = []
-            per_video_patch_cnt = []
-            for fi in frame_indices:
-                frame = vr[int(fi)]
-                img_np = (
-                    frame.asnumpy() if hasattr(frame, "asnumpy") else np.array(frame)
-                )
-                frame_t = (
-                    torch.from_numpy(img_np).permute(2, 0, 1).cuda().float() / 255.0
-                )
-                frame_t = (frame_t - mean) / std
-
-                tiles = self.dynamic_preprocess(
-                    frame_t,
-                    image_size=448,
-                    max_num=self.VIDEO_MAX_NUM,
-                    use_thumbnail=self.VIDEO_USE_THUMBNAIL,
-                )
-                per_video_tiles.append(tiles)
-                per_video_patch_cnt.append(1)
-
-            pv = torch.cat(per_video_tiles, dim=0)
-            video_pixel_values.append(pv)
-            video_patch_lists.append(per_video_patch_cnt)
-
-        image_tensor = torch.cat(pixel_values, dim=0) if pixel_values else None
-        video_tensor = (
-            torch.cat(video_pixel_values, dim=0) if video_pixel_values else None
+        requested_frames = int(
+            kwargs.get("video_num_frames", self.DEFAULT_VIDEO_NUM_FRAMES)
+        )
+        num_frames = self._resolve_video_num_frames(
+            requested=requested_frames,
+            num_videos=len(base_output.videos),
+            text_len=self._token_len(base_output.input_text or prompt),
+            image_tile_cnt=int(sum(num_patches_list)) if num_patches_list else 0,
         )
 
-        # Placeholder <image>/<video> -> context token
+        if base_output.videos and num_frames > 0 and self.video_token_id is not None:
+            for video in base_output.videos:
+                vr = (
+                    video
+                    if isinstance(video, VideoReader)
+                    else self._open_video_reader(str(video))
+                )
+                max_frame = len(vr) - 1
+                frame_indices = (
+                    [0]
+                    if num_frames == 1
+                    else np.linspace(0, max_frame, num=num_frames, dtype=int).tolist()
+                )
+
+                per_video_tiles = []
+                per_video_patch_cnt = []
+                for fi in frame_indices:
+                    frame = vr[int(fi)]
+                    img_np = (
+                        frame.asnumpy()
+                        if hasattr(frame, "asnumpy")
+                        else np.array(frame)
+                    )
+                    frame_t = (
+                        torch.from_numpy(img_np).permute(2, 0, 1).cuda().float() / 255.0
+                    )
+                    frame_t = (frame_t - mean) / std
+
+                    tiles = self.dynamic_preprocess(
+                        frame_t,
+                        image_size=448,
+                        max_num=self.VIDEO_MAX_NUM,
+                        use_thumbnail=self.VIDEO_USE_THUMBNAIL,
+                    )
+                    per_video_tiles.append(tiles)
+                    per_video_patch_cnt.append(int(tiles.shape[0]))
+
+                pv = torch.cat(per_video_tiles, dim=0)
+                video_pixel_values.append(pv)
+                video_patch_lists.append(per_video_patch_cnt)
+
+            video_tensor = (
+                torch.cat(video_pixel_values, dim=0) if video_pixel_values else None
+            )
+
+        # ----- Build prompt text with <img> + CONTEXT*n + </img> -----
         img_ph = "<<<__IMG_PLACEHOLDER__>>>"
         vid_ph = "<<<__VID_PLACEHOLDER__>>>"
 
         input_text_mid = base_output.input_text or prompt
         input_text_mid = input_text_mid.replace(self.IMAGE_PLACEHOLDER_TOKEN, img_ph)
 
-        if self.VIDEO_CONTEXT_TOKEN:
+        if self.VIDEO_CONTEXT_TOKEN and self.video_token_id is not None:
             input_text_mid = input_text_mid.replace(
                 self.VIDEO_PLACEHOLDER_TOKEN, vid_ph
             )
         else:
-            logger.warning("[internvl] VIDEO_CONTEXT_TOKEN is None; video ignored")
+            input_text_mid = input_text_mid.replace(self.VIDEO_PLACEHOLDER_TOKEN, "")
 
         input_text_updated = input_text_mid
 
-        # Images: <img> + <IMG_CONTEXT>*(num_image_token*num_tiles) + </img>
+        # Expand images
         for num_patches in num_patches_list:
             image_tokens = (
                 self.IMG_START
@@ -376,32 +413,20 @@ class InternVLProcessor(BaseMultimodalProcessor):
             )
             input_text_updated = input_text_updated.replace(img_ph, image_tokens, 1)
 
-        # Videos: each frame has num_image_token <|video_pad|>
-        for frame_patch_list in video_patch_lists:
-            frames = len(frame_patch_list)
-            frame_tokens = (
-                self.IMG_START
-                + (self.VIDEO_CONTEXT_TOKEN * self.num_image_token)
-                + self.IMG_END
-            )
-            video_tokens = (
-                "\n".join([f"Frame{i+1}: {frame_tokens}" for i in range(frames)]) + "\n"
-            )
-
-            input_text_updated = input_text_updated.replace(vid_ph, video_tokens, 1)
-
-        logger.debug(
-            "[internvl][dbg] base_tail=%r",
-            (base_output.input_text or "")[-200:],
-        )
-        logger.debug(
-            "[internvl][dbg] final_token_len=%d",
-            int(
-                self.tokenizer(input_text_updated, return_tensors="pt")[
-                    "input_ids"
-                ].numel()
-            ),
-        )
+        # Expand videos (each frame is one <img>...</img>)
+        if video_patch_lists and self.VIDEO_CONTEXT_TOKEN:
+            for frame_patch_list in video_patch_lists:
+                frame_lines = []
+                for i, patch_cnt in enumerate(frame_patch_list):
+                    ctx_cnt = int(self.num_image_token) * int(patch_cnt)
+                    frame_tokens = (
+                        self.IMG_START
+                        + (self.VIDEO_CONTEXT_TOKEN * ctx_cnt)
+                        + self.IMG_END
+                    )
+                    frame_lines.append(f"Frame {i+1}: {frame_tokens}")
+                video_tokens = "\n".join(frame_lines) + "\n"
+                input_text_updated = input_text_updated.replace(vid_ph, video_tokens, 1)
 
         # Tokenize
         input_ids_tensor = self.tokenizer(input_text_updated, return_tensors="pt")[
@@ -414,7 +439,7 @@ class InternVLProcessor(BaseMultimodalProcessor):
         if image_tensor is not None:
             image_offsets = self.get_mm_items_offset(
                 input_ids=input_ids_tensor.to("cuda"),
-                mm_token_id=self.mm_tokens.image_token_id,
+                mm_token_id=self.img_context_token_id,
             )
 
         video_offsets = []
@@ -443,6 +468,113 @@ class InternVLProcessor(BaseMultimodalProcessor):
             "mm_items": items,
             "im_start_id": self.img_start_token_id,
             "im_end_id": self.img_end_token_id,
-            "im_token_id": self.mm_tokens.image_token_id,
+            "im_token_id": self.img_context_token_id,
+            "video_token_id": self.video_token_id,
+        }
+
+    async def process_internlm2_mm_data_async(
+        self, image_data, input_text, request_obj, **kwargs
+    ):
+        # InternLM2 branch: legacy placeholder <IMG_CONTEXT> (stable for InternLM2 prompt behavior)
+        prompt = input_text or ""
+        video_data = getattr(request_obj, "video_data", None) or []
+        if video_data:
+            logger.warning(
+                "[internvl][internlm2] video input ignored for InternLM2 branch"
+            )
+
+        # Convert any OpenAI-style <image> into <IMG_CONTEXT>
+        prompt = prompt.replace(self.IMAGE_PLACEHOLDER_TOKEN, self.IMG_CONTEXT)
+
+        if image_data:
+            prompt = self._ensure_placeholders_before_assistant(
+                prompt, self.IMG_CONTEXT, len(image_data)
+            )
+
+        logger.info(
+            "[internvl][internlm2] placeholders img_context=%d",
+            prompt.count(self.IMG_CONTEXT),
+        )
+
+        base_output = self.load_mm_data(
+            prompt=prompt,
+            image_data=image_data,
+            multimodal_tokens=self.mm_tokens_internlm2,  # expects <IMG_CONTEXT>
+            discard_alpha_channel=True,
+        )
+
+        mean, std = self._get_normalize_tensors(device="cuda")
+
+        num_patches_list: List[int] = []
+        pixel_values_list: List[torch.Tensor] = []
+
+        for image in base_output.images:
+            if isinstance(image, Image.Image):
+                img_np = np.array(image.convert("RGB"))
+                tensor = (
+                    torch.from_numpy(img_np).permute(2, 0, 1).cuda().float() / 255.0
+                )
+            else:
+                tensor = image.cuda()
+
+            tensor = (tensor - mean) / std
+            tiles = self.dynamic_preprocess(
+                tensor, image_size=448, max_num=12, use_thumbnail=True
+            )
+            pixel_values_list.append(tiles)
+            num_patches_list.append(int(tiles.shape[0]))
+
+        if image_data and not pixel_values_list:
+            raise ValueError(
+                "[internvl][internlm2] image_data provided but no images parsed from prompt placeholders"
+            )
+
+        pixel_values = (
+            torch.cat(pixel_values_list, dim=0) if pixel_values_list else None
+        )
+
+        # Expand each <IMG_CONTEXT> into <img> + <IMG_CONTEXT>*N + </img>
+        ph = "<<<__IMG_CONTEXT_PLACEHOLDER__>>>"
+        input_text_base = (base_output.input_text or prompt).replace(
+            self.IMG_CONTEXT, ph
+        )
+
+        input_text_updated = input_text_base
+        for num_patches in num_patches_list:
+            image_tokens = (
+                self.IMG_START
+                + (self.IMG_CONTEXT * (self.num_image_token * int(num_patches)))
+                + self.IMG_END
+            )
+            input_text_updated = input_text_updated.replace(ph, image_tokens, 1)
+
+        # Tokenize
+        input_ids_tensor = self.tokenizer(input_text_updated, return_tensors="pt")[
+            "input_ids"
+        ].flatten()
+        input_ids = input_ids_tensor.tolist()
+
+        # Offsets
+        image_offsets = []
+        if pixel_values is not None:
+            image_offsets = self.get_mm_items_offset(
+                input_ids=input_ids_tensor.to("cuda"),
+                mm_token_id=self.img_context_token_id,
+            )
+
+        items = []
+        if pixel_values is not None:
+            items.append(
+                MultimodalDataItem(
+                    feature=pixel_values, modality=Modality.IMAGE, offsets=image_offsets
+                )
+            )
+
+        return {
+            "input_ids": input_ids,
+            "mm_items": items,
+            "im_start_id": self.img_start_token_id,
+            "im_end_id": self.img_end_token_id,
+            "im_token_id": self.img_context_token_id,
             "video_token_id": self.video_token_id,
         }
