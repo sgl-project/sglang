@@ -603,11 +603,12 @@ impl ConfigValidator {
             if !url.starts_with("http://")
                 && !url.starts_with("https://")
                 && !url.starts_with("grpc://")
+                && !url.starts_with("grpcs://")
             {
                 return Err(ConfigError::InvalidValue {
                     field: "worker_url".to_string(),
                     value: url.clone(),
-                    reason: "URL must start with http://, https://, or grpc://".to_string(),
+                    reason: "URL must start with http://, https://, grpc://, or grpcs://".to_string(),
                 });
             }
 

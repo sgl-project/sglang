@@ -282,6 +282,47 @@ impl RoutingMode {
         }
     }
 
+    /// Normalize worker URLs for this routing mode when the caller explicitly requests it.
+    ///
+    /// This is primarily used by CLI frontends to allow bare `host:port` entries when a
+    /// connection mode is explicitly provided (e.g., `--connection-mode grpc`).
+    pub fn normalize_urls_if_requested(
+        self,
+        connection_mode: &ConnectionMode,
+        normalize: bool,
+    ) -> Self {
+        if !normalize {
+            return self;
+        }
+
+        match self {
+            RoutingMode::Regular { worker_urls } => RoutingMode::Regular {
+                worker_urls: worker_urls
+                    .into_iter()
+                    .map(|u| connection_mode.normalize_url(&u))
+                    .collect(),
+            },
+            RoutingMode::PrefillDecode {
+                prefill_urls,
+                decode_urls,
+                prefill_policy,
+                decode_policy,
+            } => RoutingMode::PrefillDecode {
+                prefill_urls: prefill_urls
+                    .into_iter()
+                    .map(|(u, p)| (connection_mode.normalize_url(&u), p))
+                    .collect(),
+                decode_urls: decode_urls
+                    .into_iter()
+                    .map(|u| connection_mode.normalize_url(&u))
+                    .collect(),
+                prefill_policy,
+                decode_policy,
+            },
+            RoutingMode::OpenAI { worker_urls } => RoutingMode::OpenAI { worker_urls },
+        }
+    }
+
     /// Get the effective prefill policy for PD mode
     /// Falls back to the main policy if no specific prefill policy is set
     pub fn get_prefill_policy<'a>(&'a self, main_policy: &'a PolicyConfig) -> &'a PolicyConfig {

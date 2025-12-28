@@ -217,6 +217,18 @@ Add more workers with the same API; include optional `labels` (for per-model pol
     --reasoning-parser deepseek-r1 \
     --tool-call-parser json
   ```
+
+  If you want to avoid repeating `grpc://` across many workers, you can force gRPC mode and provide bare `host:port` entries:
+
+  ```bash
+  ./target/release/sgl-model-gateway \
+    --connection-mode grpc \
+    --worker-urls worker-grpc-0:31001 worker-grpc-1:31002 \
+    --tokenizer-path /path/to/tokenizer.json \
+    --reasoning-parser deepseek-r1 \
+    --tool-call-parser json
+  ```
+  Likewise, `--connection-mode http` allows bare `host:port` entries and prefixes them as `http://...`.
 - **Python router**
   ```bash
   python3 -m sglang_router.launch_router \
