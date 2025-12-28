@@ -86,6 +86,7 @@ diffusion = [
   "PyYAML==6.0.1",
   "cloudpickle",
   "diffusers==0.36.0",
+  "flash-attn",
   "imageio==2.36.0",
   "imageio-ffmpeg==0.5.1",
   "moviepy>=2.0.0",
