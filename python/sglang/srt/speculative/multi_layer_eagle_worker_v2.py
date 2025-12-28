@@ -125,7 +125,6 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
             )
 
         # Alias for better readability
-        # self.draft_runner = self.draft_worker.model_runner
         self.draft_runner_list = self.draft_worker.model_runner_list
 
         self.init_lm_head()
