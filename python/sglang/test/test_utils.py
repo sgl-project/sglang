@@ -683,6 +683,7 @@ def popen_launch_server(
                 response = session.get(
                     f"{base_url}/health_generate",
                     headers=headers,
+                    timeout=5,
                 )
                 if response.status_code == 200:
                     return process
