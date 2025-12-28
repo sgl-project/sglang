@@ -11,9 +11,20 @@ use super::metrics::Metrics;
 
 static INFLIGHT_TRACKER: OnceLock<Arc<InFlightRequestTracker>> = OnceLock::new();
 
+/// Age bucket definitions for in-flight request metrics.
+/// Each bucket is (upper_bound_secs, label).
+/// The last bucket has no upper bound (infinity).
+const AGE_BUCKETS: &[(u64, &str)] = &[
+    (30, "0-30s"),
+    (60, "30s-1m"),
+    (180, "1m-3m"),
+    (300, "3m-5m"),
+    (600, "5m-10m"),
+    (u64::MAX, "10m+"),
+];
+
 /// Tracks in-flight HTTP requests and their start times.
 pub struct InFlightRequestTracker {
-    /// Maps request_id -> request start time
     requests: DashMap<String, Instant>,
 }
 
@@ -47,12 +58,29 @@ impl InFlightRequestTracker {
         self.requests.is_empty()
     }
 
-    /// Samples all in-flight requests and records their ages to the histogram.
+    /// Samples all in-flight requests and records counts per age bucket.
     fn sample_and_record(&self) {
         let now = Instant::now();
+
+        // Initialize bucket counts
+        let mut counts = [0usize; AGE_BUCKETS.len()];
+
+        // Count requests in each bucket
         for entry in self.requests.iter() {
-            let age = now.duration_since(*entry.value());
-            Metrics::record_inflight_request_age(age);
+            let age_secs = now.duration_since(*entry.value()).as_secs();
+            let mut prev_bound = 0u64;
+            for (i, &(upper_bound, _)) in AGE_BUCKETS.iter().enumerate() {
+                if age_secs >= prev_bound && (upper_bound == u64::MAX || age_secs < upper_bound) {
+                    counts[i] += 1;
+                    break;
+                }
+                prev_bound = upper_bound;
+            }
+        }
+
+        // Set gauge for each bucket
+        for (i, &(_, label)) in AGE_BUCKETS.iter().enumerate() {
+            Metrics::set_inflight_request_count(label, counts[i]);
         }
     }
 

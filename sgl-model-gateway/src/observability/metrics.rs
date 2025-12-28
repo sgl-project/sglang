@@ -108,9 +108,9 @@ pub fn init_metrics() {
         "smg_http_request_duration_seconds",
         "HTTP request duration by method and path"
     );
-    describe_histogram!(
-        "smg_http_inflight_request_age_seconds",
-        "Age of currently in-flight HTTP requests (sampled periodically)"
+    describe_gauge!(
+        "smg_http_inflight_request_count",
+        "Count of currently in-flight HTTP requests by age bucket"
     );
     describe_counter!(
         "smg_http_responses_total",
@@ -442,10 +442,14 @@ impl Metrics {
         .record(duration.as_secs_f64());
     }
 
-    /// Record the age of an in-flight request.
+    /// Set the count of in-flight requests for a given age bucket.
     /// Called periodically by the InFlightRequestTracker sampler.
-    pub fn record_inflight_request_age(age: Duration) {
-        histogram!("smg_http_inflight_request_age_seconds").record(age.as_secs_f64());
+    pub fn set_inflight_request_count(age_bucket: &'static str, count: usize) {
+        gauge!(
+            "smg_http_inflight_request_count",
+            "age_bucket" => age_bucket
+        )
+        .set(count as f64);
     }
 
     /// Set active HTTP connections count
