@@ -108,6 +108,10 @@ pub fn init_metrics() {
         "smg_http_request_duration_seconds",
         "HTTP request duration by method and path"
     );
+    describe_histogram!(
+        "smg_http_inflight_request_age_seconds",
+        "Age of currently in-flight HTTP requests (sampled periodically)"
+    );
     describe_counter!(
         "smg_http_responses_total",
         "Total HTTP responses by status_code and error_code"
@@ -279,6 +283,9 @@ pub fn init_metrics() {
 pub fn start_prometheus(config: PrometheusConfig) {
     init_metrics();
 
+    // Initialize in-flight request tracker with 1 second sampling interval
+    super::inflight_tracker::init_inflight_tracker(Duration::from_secs(1));
+
     let duration_matcher = Matcher::Suffix(String::from("duration_seconds"));
     let duration_bucket: Vec<f64> = config.duration_buckets.unwrap_or_else(|| {
         vec![
@@ -433,6 +440,12 @@ impl Metrics {
             "path" => path.to_string()
         )
         .record(duration.as_secs_f64());
+    }
+
+    /// Record the age of an in-flight request.
+    /// Called periodically by the InFlightRequestTracker sampler.
+    pub fn record_inflight_request_age(age: Duration) {
+        histogram!("smg_http_inflight_request_age_seconds").record(age.as_secs_f64());
     }
 
     /// Set active HTTP connections count

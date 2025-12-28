@@ -26,7 +26,10 @@ use tracing::{debug, error, field::Empty, info, info_span, warn, Span};
 
 pub use crate::core::token_bucket::TokenBucket;
 use crate::{
-    observability::metrics::{method_to_static_str, metrics_labels, Metrics},
+    observability::{
+        inflight_tracker::get_tracker,
+        metrics::{method_to_static_str, metrics_labels, Metrics},
+    },
     routers::error::extract_error_code_from_response,
     server::AppState,
     wasm::{
@@ -650,6 +653,12 @@ where
         let path = normalize_path_for_metrics(req.uri().path());
         let start = Instant::now();
 
+        // Extract request ID for in-flight tracking (set by RequestIdMiddleware)
+        let request_id = req
+            .extensions()
+            .get::<RequestId>()
+            .map(|r| r.0.clone());
+
         let mut inner = self.inner.clone();
 
         Box::pin(async move {
@@ -657,8 +666,18 @@ where
             let active = ACTIVE_HTTP_CONNECTIONS.fetch_add(1, Ordering::Relaxed) + 1;
             Metrics::set_http_connections_active(active as usize);
 
+            // Register request in in-flight tracker
+            if let (Some(ref req_id), Some(tracker)) = (&request_id, get_tracker()) {
+                tracker.register(req_id);
+            }
+
             // Capture result before decrementing to ensure decrement happens on error too
             let result = inner.call(req).await;
+
+            // Always deregister from in-flight tracker, regardless of success or failure
+            if let (Some(ref req_id), Some(tracker)) = (&request_id, get_tracker()) {
+                tracker.deregister(req_id);
+            }
 
             // Always decrement, regardless of success or failure
             let active = ACTIVE_HTTP_CONNECTIONS.fetch_sub(1, Ordering::Relaxed) - 1;
