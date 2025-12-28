@@ -45,6 +45,7 @@ suites = {
         TestFile("quant/test_block_int8.py", 44),
         TestFile("quant/test_fp8_kernel.py", 10),
         TestFile("quant/test_int8_kernel.py", 8),
+        TestFile("quant/test_modelopt_fp8_fp4.py", 150),
         TestFile("quant/test_triton_scaled_mm.py", 8),
         TestFile("quant/test_w8a8_quantization.py", 160),
         TestFile("quant/test_autoround.py", 77),
