@@ -154,6 +154,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         self.use_triton_kernels = use_triton_kernels
         self.with_bias = False
         self.use_flashinfer_trtllm_moe = use_flashinfer_trtllm_moe
+        self.use_sonic_moe = get_moe_runner_backend().is_sonic_moe()
         self._cache_permute_indices = dict({})
 
     def create_weights(
@@ -302,11 +303,13 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
         self.moe_runner_config = moe_runner_config
-        backend = (
-            MoeRunnerBackend.TRITON_KERNELS
-            if self.use_triton_kernels
-            else MoeRunnerBackend.TRITON
-        )
+        if self.use_sonic_moe:
+            backend = MoeRunnerBackend.SONIC_MOE
+        elif self.use_triton_kernels:
+            backend = MoeRunnerBackend.TRITON_KERNELS
+        else:
+            backend = MoeRunnerBackend.TRITON
+
         self.runner = MoeRunner(backend, moe_runner_config)
 
     @property
