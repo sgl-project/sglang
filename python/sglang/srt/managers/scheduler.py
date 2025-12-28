@@ -1968,7 +1968,8 @@ class Scheduler(
                 truncation_align_size=self.truncation_align_size,
             )
 
-            running_loras.add(req.lora_id)
+            if self.enable_lora:
+                running_loras.add(req.lora_id)
 
             if res != AddReqResult.CONTINUE:
                 if res == AddReqResult.NO_TOKEN:
