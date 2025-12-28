@@ -12,7 +12,6 @@ import os
 import random
 import sys
 import tempfile
-from contextlib import contextmanager
 from dataclasses import field
 from enum import Enum
 from typing import Any, Optional
@@ -861,8 +860,6 @@ class PortArgs:
         )
 
 
-# TODO: not sure what _current_server_args is for, using a _global_server_args instead
-_current_server_args = None
 _global_server_args = None
 
 
@@ -886,40 +883,12 @@ def prepare_server_args(argv: list[str]) -> ServerArgs:
     return server_args
 
 
-@contextmanager
-def set_current_server_args(server_args: ServerArgs):
-    """
-    Temporarily set the current sgl_diffusion config.
-    Used during model initialization.
-    We save the current sgl_diffusion config in a global variable,
-    so that all modules can access it, e.g. custom ops
-    can access the sgl_diffusion config to determine how to dispatch.
-    """
-    global _current_server_args
-    old_server_args = _current_server_args
-    try:
-        _current_server_args = server_args
-        yield
-    finally:
-        _current_server_args = old_server_args
-
-
 def set_global_server_args(server_args: ServerArgs):
     """
     Set the global sgl_diffusion config for each process
     """
     global _global_server_args
     _global_server_args = server_args
-
-
-def get_current_server_args() -> ServerArgs | None:
-    if _current_server_args is None:
-        # in ci, usually when we test custom ops/modules directly,
-        # we don't set the sgl_diffusion config. In that case, we set a default
-        # config.
-        # TODO(will): may need to handle this for CI.
-        raise ValueError("Current sgl_diffusion args is not set.")
-    return _current_server_args
 
 
 def get_global_server_args() -> ServerArgs | None:

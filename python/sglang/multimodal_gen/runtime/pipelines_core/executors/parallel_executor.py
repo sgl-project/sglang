@@ -4,7 +4,6 @@ from typing import List
 
 import torch
 
-from sglang.multimodal_gen.runtime.distributed import get_sp_group
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_cfg_group,
     get_classifier_free_guidance_rank,
@@ -31,26 +30,6 @@ class ParallelExecutor(PipelineExecutor):
     The correctness of the execution relies on the parallelism_type declared by stages
 
     """
-
-    def collect_from_main(self, batches: list[Req]):
-
-        # TODO: fix this condition
-        if self.server_args.sp_degree != 1:
-            sp_group = get_sp_group()
-            batches = broadcast_pyobj(
-                batches,
-                sp_group.rank,
-                sp_group.cpu_group,
-                src=sp_group.ranks[0],
-            )
-
-        if self.server_args.enable_cfg_parallel:
-            batches = broadcast_pyobj(
-                batches,
-                self.worker.cfg_group.rank,
-                self.worker.cfg_cpu_group,
-                src=self.worker.cfg_group.ranks[0],
-            )
 
     def _execute(
         self,

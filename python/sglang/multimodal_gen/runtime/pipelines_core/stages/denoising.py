@@ -63,7 +63,7 @@ from sglang.multimodal_gen.runtime.utils.layerwise_offload import (
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.perf_logger import StageProfiler
 from sglang.multimodal_gen.runtime.utils.profiler import SGLDiffusionProfiler
-from sglang.multimodal_gen.utils import dict_to_3d_list, masks_like
+from sglang.multimodal_gen.utils import masks_like
 
 logger = init_logger(__name__)
 
@@ -587,7 +587,6 @@ class DenoisingStage(PipelineStage):
             {
                 # TODO: make sure on-device
                 "encoder_hidden_states_image": image_embeds,
-                "mask_strategy": dict_to_3d_list(None, t_max=50, l_max=60, h_max=24),
             },
         )
 

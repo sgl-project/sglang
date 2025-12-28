@@ -6,12 +6,11 @@
 import ast
 import importlib
 import os
-import sys
 from abc import ABC, abstractmethod
 from collections.abc import Set
 from dataclasses import dataclass, field
 from functools import lru_cache
-from typing import NoReturn, TypeVar, cast
+from typing import NoReturn, cast
 
 from torch import nn
 
@@ -99,14 +98,6 @@ def _discover_and_register_models() -> dict[str, tuple[str, str, str]]:
 
 
 _SGLANG_DIFFUSION_MODELS = _discover_and_register_models()
-
-_SUBPROCESS_COMMAND = [
-    sys.executable,
-    "-m",
-    "sglang.multimodal_gen.runtime.models.dits.registry",
-]
-
-_T = TypeVar("_T")
 
 
 @dataclass(frozen=True)

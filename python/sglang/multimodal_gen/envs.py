@@ -23,9 +23,6 @@ if TYPE_CHECKING:
     SGLANG_DIFFUSION_LOGGING_LEVEL: str = "INFO"
     SGLANG_DIFFUSION_LOGGING_PREFIX: str = ""
     SGLANG_DIFFUSION_LOGGING_CONFIG_PATH: str | None = None
-    SGLANG_DIFFUSION_TRACE_FUNCTION: int = 0
-    SGLANG_DIFFUSION_WORKER_MULTIPROC_METHOD: str = "fork"
-    SGLANG_DIFFUSION_TARGET_DEVICE: str = "cuda"
     MAX_JOBS: str | None = None
     NVCC_THREADS: str | None = None
     CMAKE_BUILD_TYPE: str | None = None
@@ -133,11 +130,6 @@ def _lazy_path(
 
 environment_variables: dict[str, Callable[[], Any]] = {
     # ================== Installation Time Env Vars ==================
-    # Target device of sglang-diffusion, supporting [cuda (by default),
-    # rocm, neuron, cpu, openvino]
-    "SGLANG_DIFFUSION_TARGET_DEVICE": _lazy_str(
-        "SGLANG_DIFFUSION_TARGET_DEVICE", "cuda"
-    ),
     # Maximum number of compilation jobs to run in parallel.
     # By default this is the number of CPUs
     "MAX_JOBS": _lazy_str("MAX_JOBS"),
@@ -213,10 +205,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # if set, SGLANG_DIFFUSION_LOGGING_PREFIX will be prepended to all log messages
     "SGLANG_DIFFUSION_LOGGING_PREFIX": _lazy_str("SGLANG_DIFFUSION_LOGGING_PREFIX", ""),
-    # Trace function calls
-    # If set to 1, sgl_diffusion will trace function calls
-    # Useful for debugging
-    "SGLANG_DIFFUSION_TRACE_FUNCTION": _lazy_int("SGLANG_DIFFUSION_TRACE_FUNCTION", 0),
     # Path to the attention configuration file. Only used for sliding tile
     # attention for now.
     "SGLANG_DIFFUSION_ATTENTION_CONFIG": _lazy_path(
@@ -225,11 +213,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Optional override to force a specific attention backend (e.g. "aiter")
     "SGLANG_DIFFUSION_ATTENTION_BACKEND": _lazy_str(
         "SGLANG_DIFFUSION_ATTENTION_BACKEND"
-    ),
-    # Use dedicated multiprocess context for workers.
-    # Both spawn and fork work
-    "SGLANG_DIFFUSION_WORKER_MULTIPROC_METHOD": _lazy_str(
-        "SGLANG_DIFFUSION_WORKER_MULTIPROC_METHOD", "fork"
     ),
     # Enables torch profiler if set. Path to the directory where torch profiler
     # traces are saved. Note that it must be an absolute path.

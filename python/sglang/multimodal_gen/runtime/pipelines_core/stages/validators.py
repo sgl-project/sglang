@@ -495,10 +495,6 @@ class VerificationResult:
         """Get list of fields that failed validation."""
         return [field for field, passed in self._checks.items() if not passed]
 
-    def get_detailed_failures(self) -> dict[str, list[ValidationFailure]]:
-        """Get detailed failure information for each failed field."""
-        return self._failures.copy()
-
     def get_failure_summary(self) -> str:
         """Get a comprehensive summary of all validation failures."""
         if self.is_valid():
