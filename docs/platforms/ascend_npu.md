@@ -101,7 +101,7 @@ pip install -e python[srt_npu]
 #### Obtain Image
 You can download the Sglang image or build an image based on Dockerfile to obtain the Ascend NPU image.
 1. Download Sglang image
-```shell
+```angular2html
 # You can choose between dockerhub and quay.io
 dockerhub: docker.io/lmsysorg/sglang:$tag
 quay.io: quay.io/ascend/sglang:$tag
@@ -222,7 +222,7 @@ python3 -m sglang.launch_server \
 
 Launch Router
 ```shell
-python -m sglang_router.launch_router \
+python3 -m sglang_router.launch_router \
     --pd-disaggregation \
     --policy cache_aware \
     --prefill http://127.0.0.1:8000 8995 \
@@ -234,7 +234,7 @@ python -m sglang_router.launch_router \
 ### Running Service For Multimodal Language Models
 #### PD Mixed Scene
 ```shell
-python -m sglang.launch_server \
+python3 -m sglang.launch_server \
     --model-path Qwen3-VL-30B-A3B-Instruct \
     --host 127.0.0.1 \
     --port 8000 \
