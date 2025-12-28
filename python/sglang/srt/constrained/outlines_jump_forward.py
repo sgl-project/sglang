@@ -185,7 +185,8 @@ def test_main(regex_string):
             jump_forward_str, next_state = jump_forward_map.jump_forward_symbol(state)
             print(f"{state} -> {next_state}", jump_forward_str)
         bytes_ = jump_forward_map.jump_forward_byte(state)
-        print(f"{state} -> {bytes_[-1][1]}", [hex(b) for b, _ in bytes_])
+        if bytes_:
+            print(f"{state} -> {bytes_[-1][1]}", [hex(b) for b, _ in bytes_])
 
 
 if __name__ == "__main__":
