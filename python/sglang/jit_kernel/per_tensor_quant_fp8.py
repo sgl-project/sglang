@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import functools
 import os
 from typing import TYPE_CHECKING
 
@@ -8,13 +7,13 @@ import flashinfer
 import torch
 from torch.utils.cpp_extension import CUDA_HOME
 
-from sglang.jit_kernel.utils import load_jit, make_cpp_args
+from sglang.jit_kernel.utils import cache_once, load_jit, make_cpp_args, register_jit_op
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
 
 
-@functools.cache
+@cache_once
 def _jit_per_tensor_quant_fp8_module(is_static: bool) -> Module:
     args = make_cpp_args(is_static)
 
@@ -54,3 +53,12 @@ def per_tensor_quant_fp8(
 
     module = _jit_per_tensor_quant_fp8_module(is_static)
     module.per_tensor_quant_fp8(input, output_q, output_s)
+
+
+# Register as a torch custom op for torch.compile compatibility.
+# NOTE: This op mutates `output_q` and `output_s` in-place.
+per_tensor_quant_fp8 = register_jit_op(
+    per_tensor_quant_fp8,
+    op_name="per_tensor_quant_fp8",
+    out_args=["output_q", "output_s"],
+)
