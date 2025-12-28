@@ -5,7 +5,6 @@ use std::time::Duration;
 
 use tracing::debug;
 
-/// A handle to a background periodic task that automatically stops on drop.
 pub struct PeriodicTask {
     name: &'static str,
     shutdown_flag: Arc<AtomicBool>,
@@ -14,14 +13,6 @@ pub struct PeriodicTask {
 
 impl PeriodicTask {
     /// Spawn a background thread that periodically executes a task.
-    ///
-    /// The thread sleeps in small increments (100ms) to check the shutdown flag frequently,
-    /// ensuring responsive shutdown behavior.
-    ///
-    /// # Arguments
-    /// * `interval_secs` - How often to run the task (in seconds)
-    /// * `name` - Name for logging purposes
-    /// * `task` - The closure to execute periodically
     pub fn spawn<F>(interval_secs: u64, name: &'static str, task: F) -> Self
     where
         F: Fn() + Send + 'static,

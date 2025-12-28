@@ -59,13 +59,7 @@
     during the next eviction cycle.
 */
 
-use std::{
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc,
-    },
-    thread,
-};
+use std::sync::Arc;
 
 use dashmap::DashMap;
 use rand::Rng;
@@ -73,7 +67,7 @@ use tracing::debug;
 
 use super::{
     get_healthy_worker_indices, normalize_model_key, tree::Tree,
-    utils::spawn_periodic_task, CacheAwareConfig, LoadBalancingPolicy, SelectWorkerInfo,
+    utils::PeriodicTask, CacheAwareConfig, LoadBalancingPolicy, SelectWorkerInfo,
 };
 use crate::core::Worker;
 
@@ -82,14 +76,10 @@ use crate::core::Worker;
 /// Routes requests based on cache affinity when load is balanced,
 /// switches to shortest-queue routing when load is imbalanced.
 /// Maintains separate trees per model for multi-model support.
-#[derive(Debug)]
 pub struct CacheAwarePolicy {
     config: CacheAwareConfig,
     trees: Arc<DashMap<String, Arc<Tree>>>,
-    /// Handle to the background eviction thread
-    eviction_handle: Option<thread::JoinHandle<()>>,
-    /// Flag to signal the eviction thread to stop
-    shutdown_flag: Arc<AtomicBool>,
+    _eviction_task: Option<PeriodicTask>,
 }
 
 impl CacheAwarePolicy {
@@ -99,16 +89,14 @@ impl CacheAwarePolicy {
 
     pub fn with_config(config: CacheAwareConfig) -> Self {
         let trees = Arc::new(DashMap::<String, Arc<Tree>>::new());
-        let shutdown_flag = Arc::new(AtomicBool::new(false));
 
         // Start background eviction thread if configured
-        let eviction_handle = if config.eviction_interval_secs > 0 {
+        let eviction_task = if config.eviction_interval_secs > 0 {
             let trees_clone = Arc::clone(&trees);
             let max_tree_size = config.max_tree_size;
 
-            Some(spawn_periodic_task(
+            Some(PeriodicTask::spawn(
                 config.eviction_interval_secs,
-                Arc::clone(&shutdown_flag),
                 "Eviction",
                 move || {
                     for tree_ref in trees_clone.iter() {
@@ -130,8 +118,7 @@ impl CacheAwarePolicy {
         Self {
             config,
             trees,
-            eviction_handle,
-            shutdown_flag,
+            _eviction_task: eviction_task,
         }
     }
 
@@ -383,22 +370,6 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
 impl Default for CacheAwarePolicy {
     fn default() -> Self {
         Self::new()
-    }
-}
-
-impl Drop for CacheAwarePolicy {
-    fn drop(&mut self) {
-        // Signal the eviction thread to stop
-        self.shutdown_flag.store(true, Ordering::Relaxed);
-
-        // Wait for the thread to finish (with timeout)
-        if let Some(handle) = self.eviction_handle.take() {
-            // The thread checks the shutdown flag every 100ms, so it should exit quickly
-            match handle.join() {
-                Ok(()) => debug!("Eviction thread shut down cleanly"),
-                Err(_) => debug!("Eviction thread panicked during shutdown"),
-            }
-        }
     }
 }
 
