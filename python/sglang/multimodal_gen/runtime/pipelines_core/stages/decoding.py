@@ -200,7 +200,6 @@ class DecodingStage(PipelineStage):
                 - trajectory_latents (optional): Latents at different timesteps
                 - trajectory_timesteps (optional): Corresponding timesteps
             server_args: Configuration containing:
-                - output_type: "latent" to skip decoding, otherwise decode to pixels
                 - vae_cpu_offload: Whether to offload VAE to CPU after decoding
                 - model_loaded: Track VAE loading state
                 - model_paths: Path to VAE model if loading needed
@@ -213,10 +212,7 @@ class DecodingStage(PipelineStage):
         # load vae if not already loaded (used for memory constrained devices)
         self.load_model()
 
-        if server_args.output_type == "latent":
-            frames = batch.latents
-        else:
-            frames = self.decode(batch.latents, server_args)
+        frames = self.decode(batch.latents, server_args)
 
         # decode trajectory latents if needed
         if batch.return_trajectory_decoded:
