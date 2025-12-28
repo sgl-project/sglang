@@ -89,6 +89,11 @@ class SamplingParams:
     # Image inputs
     image_path: str | list[str] | None = None
 
+    # Video inputs
+    pose_video_path: str | None = None
+    face_video_path: str | None = None
+    video_path: str | None = None
+
     # Text inputs
     prompt: str | list[str] | None = None
     negative_prompt: str = (
@@ -342,12 +347,12 @@ class SamplingParams:
 
     @staticmethod
     def from_user_sampling_params_args(model_path: str, server_args, *args, **kwargs):
-        sampling_params = SamplingParams.from_pretrained(model_path, **kwargs)
+        sampling_params = SamplingParams.from_pretrained(model_path)
 
-        # user_sampling_params = SamplingParams(*args, **kwargs)
+        user_sampling_params = SamplingParams(*args, **kwargs)
         # TODO: refactor
-        # sampling_params._merge_with_user_params(user_sampling_params)
-        # sampling_params._adjust(server_args)
+        sampling_params._merge_with_user_params(user_sampling_params)
+        sampling_params._adjust(server_args)
 
         sampling_params._validate_with_pipeline_config(server_args.pipeline_config)
 
@@ -561,6 +566,24 @@ class SamplingParams:
                 "values, e.g.: "
                 '--image-path "img1.png" "img2.png"'
             ),
+        )
+        parser.add_argument(
+            "--video-path",
+            type=str,
+            default=SamplingParams.video_path,
+            help="Path to input video for wan animate generation",
+        )
+        parser.add_argument(
+            "--pose-video-path",
+            type=str,
+            default=SamplingParams.pose_video_path,
+            help="Path to input pose video for wan animate generation",
+        )
+        parser.add_argument(
+            "--face-video-path",
+            type=str,
+            default=SamplingParams.face_video_path,
+            help="Path to input face video for wan animate generation",
         )
         parser.add_argument(
             "--moba-config-path",

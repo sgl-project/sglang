@@ -1,5 +1,3 @@
-from os import sched_yield
-
 from sglang.multimodal_gen.runtime.models.schedulers.scheduling_flow_unipc_multistep import (
     FlowUniPCMultistepScheduler,
 )
@@ -9,24 +7,17 @@ from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import 
 from sglang.multimodal_gen.runtime.pipelines_core.stages import (
     ImageEncodingStage,
     InputValidationStage,
+    SegmentLoopStage,
     TextEncodingStage,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.conditioning import (
     ConditioningStage,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding import DecodingStage
-from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import DenoisingStage
+from sglang.multimodal_gen.runtime.pipelines_core.stages.data_preprocessing import (
+    WanDataPreprocessingStage,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.image_encoding import (
     ImageVAEEncodingStage,
-)
-from sglang.multimodal_gen.runtime.pipelines_core.stages.latent_preparation import (
-    LatentPreparationStage,
-)
-from sglang.multimodal_gen.runtime.pipelines_core.stages.timestep_preparation import (
-    TimestepPreparationStage,
-)
-from sglang.multimodal_gen.runtime.pipelines_core.stages.wan_animate_conditioning import (
-    WanAnimateConditioningStage,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.wan_video_processing import (
     VideoProcessingStage,
@@ -55,6 +46,16 @@ class WanAnimatePipeline(ComposedPipelineBase):
         )
 
     def create_pipeline_stages(self, server_args: ServerArgs) -> None:
+        self.add_stage(
+            stage_name="data_preprocess_stage",
+            stage=WanDataPreprocessingStage(
+                preprocess_model_path=(
+                    server_args.preprocess_model_path
+                    if hasattr(server_args, "preprocess_model_path")
+                    else None
+                )
+            ),
+        )
         self.add_stage(
             stage_name="input_validation_stage", stage=InputValidationStage()
         )
@@ -87,39 +88,15 @@ class WanAnimatePipeline(ComposedPipelineBase):
 
         self.add_stage(stage_name="conditioning_stage", stage=ConditioningStage())
 
-        for _ in range(2):
-            self.add_stage(
-                stage_name="wan_animate_conditioning_stage",
-                stage=WanAnimateConditioningStage(vae=self.get_module("vae")),
-            )
-
-            self.add_stage(
-                stage_name="timestep_preparation_stage",
-                stage=TimestepPreparationStage(scheduler=self.get_module("scheduler")),
-            )
-
-            self.add_stage(
-                stage_name="latent_preparation_stage",
-                stage=LatentPreparationStage(
-                    scheduler=self.get_module("scheduler"),
-                    transformer=self.get_module("transformer"),
-                ),
-            )
-
-            self.add_stage(
-                stage_name="denoising_stage",
-                stage=DenoisingStage(
-                    transformer=self.get_module("transformer"),
-                    transformer_2=self.get_module("transformer_2"),
-                    scheduler=self.get_module("scheduler"),
-                    vae=self.get_module("vae"),
-                ),
-            )
-
-            self.add_stage(
-                stage_name="deconding_stage",
-                stage=DecodingStage(vae=self.get_module("vae")),
-            )
+        self.add_stage(
+            stage_name="segment_loop_stage",
+            stage=SegmentLoopStage(
+                vae=self.get_module("vae"),
+                scheduler=self.get_module("scheduler"),
+                transformer=self.get_module("transformer"),
+                transformer_2=self.get_module("transformer_2"),
+            ),
+        )
 
 
 EntryClass = WanAnimatePipeline

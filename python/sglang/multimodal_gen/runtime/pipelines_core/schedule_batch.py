@@ -53,6 +53,14 @@ class Req:
 
     # Image inputs
     image_path: str | list[str] | None = None
+    # Video input paths (pose / face) used by animate pipelines
+    pose_video_path: str | None = None
+    face_video_path: str | None = None
+    video_path: str | None = None
+    # For preprocessed video inputs (e.g., WanAnimate)
+    retarget_flag: bool = False
+    use_flux: bool = False
+
     # Image encoder hidden states
     image_embeds: list[torch.Tensor] = field(default_factory=list)
 

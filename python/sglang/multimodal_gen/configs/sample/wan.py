@@ -3,7 +3,6 @@
 # SPDX-License-Identifier: Apache-2.0
 from dataclasses import dataclass, field
 
-from typing import Any
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.configs.sample.teacache import WanTeaCacheParams
 
@@ -276,11 +275,11 @@ class Wan2_2_I2V_A14B_SamplingParam(Wan2_2_Base_SamplingParams):
 
 @dataclass
 class Wan2_2_Animate_14B_SamplingParam(Wan2_2_Base_SamplingParams):
-    guidance_scale: float = 1
+    guidance_scale: float = 1.0
     num_inference_steps: int = 20
-    fps: int = 16
-
-    extra: dict[str, Any] = field(default_factory=dict)
+    fps: int = 24
+    retarget_flag: bool = False
+    use_flux: bool = False
 
 
 # =============================================

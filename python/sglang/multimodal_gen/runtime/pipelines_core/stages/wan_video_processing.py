@@ -12,12 +12,14 @@ from typing import List
 import numpy as np
 import PIL
 import torch
+
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
-from sglang.multimodal_gen.runtime.models.vaes.common import ParallelTiledVAE
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     StageValidators as V,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     VerificationResult,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
@@ -30,9 +32,40 @@ class WanVideoProcessor:
     def __init__(self, vae_scale_factor=8):
         self.vae_scale_factor = vae_scale_factor
 
-    def preprocess_video(self, video: List[PIL.Image.Image]) -> torch.Tensor:
+    def _resize_frames(
+        self,
+        video: List[PIL.Image.Image],
+        target_height: int | None,
+        target_width: int | None,
+    ) -> List[PIL.Image.Image]:
+        if target_height is None or target_width is None:
+            return video
+
+        resized = []
+        for img in video:
+            if isinstance(img, PIL.Image.Image):
+                pil_img = img
+            else:
+                pil_img = PIL.Image.fromarray(np.array(img))
+
+            if pil_img.size != (target_width, target_height):
+                pil_img = pil_img.resize(
+                    (target_width, target_height), PIL.Image.Resampling.LANCZOS
+                )
+            resized.append(pil_img)
+
+        return resized
+
+    def preprocess_video(
+        self,
+        video: List[PIL.Image.Image],
+        target_height: int | None = None,
+        target_width: int | None = None,
+    ) -> torch.Tensor:
         if not isinstance(video, list):
             video = [video]
+
+        video = self._resize_frames(video, target_height, target_width)
 
         frames = []
         for img in video:
@@ -61,15 +94,19 @@ class VideoProcessingStage(PipelineStage):
         server_args: ServerArgs,
     ) -> Req:
         pose_video = batch.extra.get("pose_video")
-        pose_video_tensor = self.video_processor.preprocess_video(pose_video).to(
-            get_local_torch_device(), dtype=torch.float32
-        )
+        pose_video_tensor = self.video_processor.preprocess_video(
+            pose_video,
+            target_height=batch.height,
+            target_width=batch.width,
+        ).to(get_local_torch_device(), dtype=torch.float32)
         batch.extra["pose_video"] = pose_video_tensor
 
         face_video = batch.extra.get("face_video")
-        face_video_tensor = self.video_processor.preprocess_video(face_video).to(
-            get_local_torch_device(), dtype=torch.float32
-        )
+        face_video_tensor = self.video_processor.preprocess_video(
+            face_video,
+            target_height=512,
+            target_width=512,
+        ).to(get_local_torch_device(), dtype=torch.float32)
         batch.extra["face_video"] = face_video_tensor
 
         return batch

@@ -1,10 +1,9 @@
-from typing import Any, List, Union
+from typing import Any, Union
 
-import numpy as np
-
-import PIL
 import torch
+import torch.nn.functional as F
 from diffusers.models.autoencoders.vae import DiagonalGaussianDistribution
+
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
@@ -217,8 +216,8 @@ class WanAnimateConditioningStage(PipelineStage):
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         self.vae = self.vae.to(get_local_torch_device())
 
-        clip_len = batch.extra.get("clip_len")
-        refert_num = batch.extra.get("refert_num")
+        clip_len = server_args.pipeline_config.clip_len
+        refert_num = server_args.pipeline_config.refert_num
         cur_segment = batch.extra.get("cur_segment")
         start_frame = cur_segment * (clip_len - refert_num)
         end_frame = start_frame + clip_len
@@ -244,10 +243,17 @@ class WanAnimateConditioningStage(PipelineStage):
 
         batch.extra["prev_segment_cond_latents"] = (
             self.prepare_prev_segment_cond_latents(
-                batch, server_args, prev_segment_cond_video
+                batch,
+                server_args,
+                prev_segment_cond_video,
+                segment_frame_length=clip_len,
+                height=batch.height,
+                width=batch.width,
+                prev_segment_cond_frames=refert_num,
+                device=get_local_torch_device(),
+                dtype=pose_latents_no_ref.dtype,
             )
         )
 
         self.maybe_free_model_hooks()
-
         return batch

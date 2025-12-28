@@ -172,9 +172,78 @@ class InputValidationStage(PipelineStage):
             height = round(np.sqrt(max_area * aspect_ratio)) // mod_value * mod_value
             width = round(np.sqrt(max_area / aspect_ratio)) // mod_value * mod_value
 
-            # batch.condition_image = batch.condition_image.resize((width, height))
-            batch.height = condition_image_height
-            batch.width = condition_image_width
+            batch.condition_image = batch.condition_image.resize((width, height))
+            batch.height = height
+            batch.width = width
+
+    @staticmethod
+    def _get_valid_len(real_len: int, clip_len: int, overlap: int) -> int:
+        real_clip_len = clip_len - overlap
+        last_clip_num = (real_len - overlap) % real_clip_len
+        extra = 0 if last_clip_num == 0 else real_clip_len - last_clip_num
+        return real_len + extra
+
+    @staticmethod
+    def _inputs_padding(array, target_len):
+        from copy import deepcopy
+
+        if len(array) == 0:
+            raise ValueError("video inputs must not be empty")
+        if len(array) == 1:
+            return [deepcopy(array[0]) for _ in range(target_len)]
+
+        idx = 0
+        flip = False
+        target_array = []
+        while len(target_array) < target_len:
+            target_array.append(deepcopy(array[idx]))
+            if flip:
+                idx -= 1
+            else:
+                idx += 1
+            if idx == 0 or idx == len(array) - 1:
+                flip = not flip
+        return target_array[:target_len]
+
+    @staticmethod
+    def _load_wan_animate_videos(batch: Req):
+        if batch.pose_video_path is not None or batch.face_video_path is not None:
+            if batch.pose_video_path is None or batch.face_video_path is None:
+                raise ValueError(
+                    "pose_video_path and face_video_path must both be provided"
+                )
+            return load_video(batch.pose_video_path), load_video(batch.face_video_path)
+
+        pose_video = batch.extra.get("pose_video")
+        face_video = batch.extra.get("face_video")
+        if pose_video is None or face_video is None:
+            raise ValueError("pose_video and face_video must be provided")
+
+        return pose_video, face_video
+
+    def verify_wan_animate(self, batch: Req, server_args: ServerArgs) -> None:
+        config = server_args.pipeline_config
+        refert_num = config.refert_num
+        if refert_num not in (1, 5):
+            raise ValueError("refert_num must be 1 or 5")
+
+        pose_video, face_video = self._load_wan_animate_videos(batch)
+        real_frame_len = len(pose_video)
+        if real_frame_len == 0 or len(face_video) == 0:
+            raise ValueError("pose_video and face_video must not be empty")
+
+        clip_len = config.clip_len
+        segment_len = clip_len - refert_num
+        if segment_len <= 0:
+            raise ValueError("clip_len must be greater than refert_num")
+        target_len = self._get_valid_len(real_frame_len, clip_len, overlap=refert_num)
+
+        batch.num_frames = target_len
+        batch.extra["real_frame_len"] = real_frame_len
+        batch.extra["pose_video"] = self._inputs_padding(pose_video, target_len)
+        batch.extra["face_video"] = self._inputs_padding(face_video, target_len)
+        batch.extra["num_segments"] = target_len // segment_len
+        batch.extra["cur_segment"] = 0
 
     def forward(
         self,
@@ -268,71 +337,7 @@ class InputValidationStage(PipelineStage):
             batch.width = batch.height * default_width // default_height
 
         if isinstance(server_args.pipeline_config, Wan2_2_Animate_14B_Config):
-            pose_video = batch.extra.get("pose_video")
-            face_video = batch.extra.get("face_video")
-            if pose_video is None:
-                raise ValueError("Pose video must be provided")
-            if face_video is None:
-                raise ValueError("Face video must be provided")
-
-            if not isinstance(pose_video, list) or not isinstance(face_video, list):
-                raise ValueError("Pose and face videos must be lists of PIL images")
-
-            if len(pose_video) == 0 or len(face_video) == 0:
-                raise ValueError("Pose and face videos must be non-empty")
-
-            refert_num = batch.extra.get("refert_num")
-            if refert_num is None:
-                refert_num = 1
-                batch.extra["refert_num"] = refert_num
-            else:
-                assert refert_num == 1 or refert_num == 5, "refert_num must be 1 or 5"
-
-            clip_len = batch.extra.get("clip_len")
-            if clip_len is None:
-                clip_len = 77
-                batch.extra["clip_len"] = clip_len
-            else:
-                assert clip_len % 4 == 1, "clip_len must be 4N+1"
-
-            def get_valid_len(real_len, clip_len, overlap):
-                real_clip_len = clip_len - overlap
-                last_clip_num = (real_len - overlap) % real_clip_len
-                if last_clip_num == 0:
-                    extra = 0
-                else:
-                    extra = real_clip_len - last_clip_num
-                target_len = real_len + extra
-                return target_len
-
-            real_frame_len = len(pose_video)
-            batch.extra["real_frame_len"] = real_frame_len
-            target_len = get_valid_len(real_frame_len, clip_len, overlap=refert_num)
-            batch.num_frames = target_len
-
-            def inputs_padding(array, target_len):
-                from copy import deepcopy
-
-                idx = 0
-                flip = False
-                target_array = []
-                while len(target_array) < target_len:
-                    target_array.append(deepcopy(array[idx]))
-                    if flip:
-                        idx -= 1
-                    else:
-                        idx += 1
-                    if idx == 0 or idx == len(array) - 1:
-                        flip = not flip
-                return target_array[:target_len]
-
-            pose_video = inputs_padding(pose_video, target_len)
-            face_video = inputs_padding(face_video, target_len)
-            batch.extra["pose_video"] = pose_video
-            batch.extra["face_video"] = face_video
-
-            batch.extra["num_segments"] = batch.num_frames // (clip_len - refert_num)
-            batch.extra["cur_segment"] = 0
+            self.verify_wan_animate(batch, server_args)
 
         return batch
 

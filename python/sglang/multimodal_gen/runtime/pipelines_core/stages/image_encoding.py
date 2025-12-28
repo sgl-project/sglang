@@ -27,6 +27,8 @@ from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     StageValidators as V,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     VerificationResult,
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
@@ -223,18 +225,26 @@ class ImageVAEEncodingStage(PipelineStage):
             return batch
 
         self.load_model()
-        num_frames_bak = batch.num_frames
-
-        if isinstance(server_args.pipeline_config, Wan2_2_Animate_14B_Config):
+        num_frames = batch.num_frames
+        num_frames_bak = num_frames
+        animate_flag = isinstance(
+            server_args.pipeline_config, Wan2_2_Animate_14B_Config
+        )
+        if animate_flag:
+            num_frames = 1
             batch.num_frames = 1
 
-        num_frames = batch.num_frames
-        self.vae = self.vae.to(get_local_torch_device())
+        images = (
+            batch.vae_image if batch.vae_image is not None else batch.condition_image
+        )
+        if not isinstance(images, list):
+            images = [images]
 
-        image = batch.condition_image
-        image = self.preprocess(
-            image,
-        ).to(get_local_torch_device(), dtype=torch.float32)
+        all_image_latents = []
+        for image in images:
+            image = self.preprocess(
+                image,
+            ).to(get_local_torch_device(), dtype=torch.float32)
 
             # (B, C, H, W) -> (B, C, 1, H, W)
             image = image.unsqueeze(2)
@@ -311,13 +321,12 @@ class ImageVAEEncodingStage(PipelineStage):
 
             latent_condition -= shift_factor
             latent_condition = latent_condition * scaling_factor
-
             image_latent = server_args.pipeline_config.postprocess_image_latent(
                 latent_condition, batch
             )
             all_image_latents.append(image_latent)
 
-        if isinstance(server_args.pipeline_config, Wan2_2_Animate_14B_Config):
+        if animate_flag:
             batch.num_frames = num_frames_bak
 
         batch.image_latent = torch.cat(all_image_latents, dim=1)

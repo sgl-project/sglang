@@ -135,9 +135,7 @@ class GPUWorker:
                 f"Error executing request {req.request_id}: {e}", exc_info=True
             )
             if output_batch is None:
-                from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import (
-                    OutputBatch,
-                )
+                pass
 
         return output_batch
 

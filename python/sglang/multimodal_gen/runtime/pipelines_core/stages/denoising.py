@@ -16,12 +16,14 @@ from typing import Any
 
 import torch
 from einops import rearrange
+from tqdm.auto import tqdm
 
 from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType, STA_Mode
 from sglang.multimodal_gen.configs.pipeline_configs.wan import (
     Wan2_2_Animate_14B_Config,
     Wan2_2_TI2V_5B_Config,
+    WanI2V480PConfig,
 )
 from sglang.multimodal_gen.runtime.distributed import (
     cfg_model_parallel_all_reduce,
@@ -51,6 +53,8 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     StageValidators as V,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     VerificationResult,
 )
 from sglang.multimodal_gen.runtime.platforms import (

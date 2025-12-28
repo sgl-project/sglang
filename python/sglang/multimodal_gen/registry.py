@@ -59,8 +59,8 @@ from sglang.multimodal_gen.configs.sample.wan import (
     Wan2_2_TI2V_5B_SamplingParam,
     WanI2V_14B_480P_SamplingParam,
     WanI2V_14B_720P_SamplingParam,
-    WanT2V_14B_SamplingParams,
     WanT2V_1_3B_SamplingParams,
+    WanT2V_14B_SamplingParams,
 )
 from sglang.multimodal_gen.configs.sample.zimage import ZImageSamplingParams
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
