@@ -485,7 +485,8 @@ class SWARadixCache(BasePrefixCache):
             )
 
         # free the unaligned tail
-        self.token_to_kv_pool_allocator.free(kv_indices[page_aligned_len:])
+        if not self.is_eagle:
+            self.token_to_kv_pool_allocator.free(kv_indices[page_aligned_len:])
 
         # Remove req slot release the cache lock
         self.req_to_token_pool.free(req.req_pool_idx)
@@ -998,10 +999,9 @@ class SWARadixCache(BasePrefixCache):
             not node.swa_tombstone
         ), f"Invariant violated: leaf node is a tombstone, {node.id=}"
         assert len(node.children) == 0, f"leaf node has children, {node.id=}"
-        for k, v in node.parent.children.items():
-            if v == node:
-                break
-        del node.parent.children[k]
+        key = self.get_child_key_fn(node.key)
+        v = node.parent.children.pop(key, None)
+        assert v == node, f"parent does not have child key, {key}"
         self.full_evictable_size_ -= len(node.key)
         self.swa_evictable_size_ -= len(node.key)
 
@@ -1015,10 +1015,10 @@ class SWARadixCache(BasePrefixCache):
             node.swa_tombstone
         ), f"Deleting a unexpected non-tombstone leaf node, {node.id=}"
         assert len(node.children) == 0, f"leaf node has children, {node.id=}"
-        for k, v in node.parent.children.items():
-            if v == node:
-                break
-        del node.parent.children[k]
+        key = self.get_child_key_fn(node.key)
+        v = node.parent.children.pop(key, None)
+        assert v == node, f"parent does not have child key, {key}"
+
         self.full_evictable_size_ -= len(node.key)
 
     def _collect_leaves(self) -> List[TreeNode]:

@@ -20,7 +20,7 @@ limitations under the License.
 
 TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
   /*
-   * From csrc/activation
+   * From csrc/elementwise
    */
   m.def("silu_and_mul(Tensor! out, Tensor input) -> ()");
   m.impl("silu_and_mul", torch::kCUDA, &silu_and_mul);
@@ -33,6 +33,19 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
 
   m.def("gelu_quick(Tensor! out, Tensor input) -> ()");
   m.impl("gelu_quick", torch::kCUDA, &gelu_quick);
+
+  m.def("fast_topk(Tensor score, Tensor indices, Tensor lengths, Tensor? row_starts) -> ()");
+  m.impl("fast_topk", torch::kCUDA, &fast_topk_interface);
+
+  m.def(
+      "fast_topk_transform_fused(Tensor score, Tensor lengths, Tensor dst_page_table, Tensor src_page_table, Tensor "
+      "cu_seqlens_q, Tensor? row_starts) -> ()");
+  m.impl("fast_topk_transform_fused", torch::kCUDA, &fast_topk_transform_interface);
+
+  m.def(
+      "fast_topk_transform_ragged_fused(Tensor score, Tensor lengths, Tensor topk_indices_ragged, Tensor "
+      "topk_indices_offset, Tensor ? row_starts) -> ()");
+  m.impl("fast_topk_transform_ragged_fused", torch::kCUDA, &fast_topk_transform_ragged_interface);
 
   /*
    * From csrc/allreduce
@@ -50,6 +63,17 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
       "all_reduce_unreg(int fa, Tensor inp, Tensor reg_buffer, Tensor! out) -> "
       "()");
   m.impl("all_reduce_unreg", torch::kCUDA, &all_reduce_unreg);
+
+  // Deterministic all-reduce for ROCm
+  extern void deterministic_all_reduce_reg(int64_t _fa, torch::Tensor & inp, torch::Tensor & out);
+  extern void deterministic_all_reduce_unreg(
+      int64_t _fa, torch::Tensor & inp, torch::Tensor & reg_buffer, torch::Tensor & out);
+
+  m.def("deterministic_all_reduce_reg(int fa, Tensor inp, Tensor! out) -> ()");
+  m.impl("deterministic_all_reduce_reg", torch::kCUDA, &deterministic_all_reduce_reg);
+
+  m.def("deterministic_all_reduce_unreg(int fa, Tensor inp, Tensor reg_buffer, Tensor! out) -> ()");
+  m.impl("deterministic_all_reduce_unreg", torch::kCUDA, &deterministic_all_reduce_unreg);
 
   m.def("dispose", &dispose);
 
@@ -186,6 +210,15 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
    */
   m.def("apply_token_bitmask_inplace_cuda(Tensor logits, Tensor bitmask, Tensor? indices=None) -> ()");
   m.impl("apply_token_bitmask_inplace_cuda", &ApplyTokenBitmaskInplace);
+
+  /*
+   * From csrc/elementwise
+   */
+  m.def(
+      "rotary_embedding(Tensor positions, Tensor! query,"
+      "                 Tensor!? key, int head_size,"
+      "                 Tensor cos_sin_cache, bool is_neox) -> ()");
+  m.impl("rotary_embedding", torch::kCUDA, &rotary_embedding);
 }
 
 REGISTER_EXTENSION(common_ops)

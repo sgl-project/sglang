@@ -116,7 +116,7 @@ def maybe_load_fsdp_model(
             hsdp_shard_dim = 1
 
         device_mesh = init_device_mesh(
-            "cuda",
+            current_platform.device_type,
             # (Replicate(), Shard(dim=0))
             mesh_shape=(hsdp_replicate_dim, hsdp_shard_dim),
             mesh_dim_names=("replicate", "shard"),
@@ -247,6 +247,7 @@ def load_model_from_full_model_state_dict(
         NotImplementedError: If got FSDP with more than 1D.
     """
     meta_sd = model.state_dict()
+    param_dict = dict(model.named_parameters())
     sharded_sd = {}
     custom_param_sd, reverse_param_names_mapping = hf_to_custom_state_dict(
         full_sd_iterator, param_names_mapping
@@ -259,8 +260,24 @@ def load_model_from_full_model_state_dict(
             )
         if not hasattr(meta_sharded_param, "device_mesh"):
             full_tensor = full_tensor.to(device=device, dtype=param_dtype)
-            # In cases where parts of the model aren't sharded, some parameters will be plain tensors
-            sharded_tensor = full_tensor
+            actual_param = param_dict.get(target_param_name)
+            weight_loader = (
+                getattr(actual_param, "weight_loader", None)
+                if actual_param is not None
+                else None
+            )
+            if weight_loader is not None:
+                sharded_tensor = torch.empty_like(
+                    meta_sharded_param, device=device, dtype=param_dtype
+                )
+                temp_param = nn.Parameter(sharded_tensor)
+                for attr in ["output_dim", "input_dim", "is_sharded_weight"]:
+                    if hasattr(actual_param, attr):
+                        setattr(temp_param, attr, getattr(actual_param, attr))
+                weight_loader(temp_param, full_tensor)
+                sharded_tensor = temp_param.data
+            else:
+                sharded_tensor = full_tensor
         else:
             full_tensor = full_tensor.to(device=device, dtype=param_dtype)
             sharded_tensor = distribute_tensor(
@@ -269,7 +286,7 @@ def load_model_from_full_model_state_dict(
                 meta_sharded_param.placements,
             )
             if cpu_offload:
-                sharded_tensor = sharded_tensor.cpu()
+                sharded_tensor = sharded_tensor.to("cpu")
         sharded_sd[target_param_name] = nn.Parameter(sharded_tensor)
 
     model.reverse_param_names_mapping = reverse_param_names_mapping

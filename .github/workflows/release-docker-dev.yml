@@ -57,6 +57,7 @@ jobs:
             --platform ${{ matrix.platform }} \
             --push \
             -f docker/Dockerfile \
+            --target framework \
             --build-arg CUDA_VERSION=${{ matrix.version }} \
             --build-arg BUILD_TYPE=${{ matrix.build_type }} \
             --build-arg CMAKE_BUILD_PARALLEL_LEVEL=$(nproc) \
