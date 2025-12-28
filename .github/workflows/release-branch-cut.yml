@@ -1,0 +1,133 @@
+name: Release Branch Cut
+
+on:
+  workflow_dispatch:
+    inputs:
+      commit_sha:
+        description: 'Commit SHA from main to cut the release branch from (defaults to latest main)'
+        required: false
+        type: string
+        default: ''
+      branch_suffix:
+        description: 'Optional suffix for branch name (e.g., "rc1" creates release/vX.Y.Z-rc1)'
+        required: false
+        type: string
+        default: ''
+
+permissions:
+  contents: write
+
+jobs:
+  cut-release-branch:
+    if: github.repository == 'sgl-project/sglang'
+    runs-on: ubuntu-latest
+    environment: 'prod'
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Validate commit SHA
+        id: validate
+        run: |
+          COMMIT_SHA="${{ github.event.inputs.commit_sha }}"
+
+          # If no commit SHA provided, use latest main
+          if [ -z "$COMMIT_SHA" ]; then
+            COMMIT_SHA=$(git rev-parse HEAD)
+            echo "No commit SHA provided, using latest main: $COMMIT_SHA"
+          fi
+
+          # Verify the commit exists and is on main
+          if ! git cat-file -t "$COMMIT_SHA" > /dev/null 2>&1; then
+            echo "::error::Commit SHA '$COMMIT_SHA' does not exist"
+            exit 1
+          fi
+
+          # Check if commit is an ancestor of main (i.e., is on main branch)
+          if ! git merge-base --is-ancestor "$COMMIT_SHA" main; then
+            echo "::error::Commit SHA '$COMMIT_SHA' is not on the main branch"
+            exit 1
+          fi
+
+          echo "COMMIT_SHA=$COMMIT_SHA" >> $GITHUB_OUTPUT
+          echo "Validated commit SHA: $COMMIT_SHA"
+
+      - name: Get version from commit
+        id: get_version
+        run: |
+          COMMIT_SHA="${{ steps.validate.outputs.COMMIT_SHA }}"
+
+          # Checkout the specific commit to read its version
+          git checkout "$COMMIT_SHA"
+
+          # Extract version from version.py
+          VERSION=$(cat python/sglang/version.py | grep -oP '(?<=__version__ = ")[^"]+')
+          if [ -z "$VERSION" ]; then
+            echo "::error::Could not extract version from python/sglang/version.py"
+            exit 1
+          fi
+
+          echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
+          echo "Extracted version: $VERSION"
+
+      - name: Determine branch name
+        id: branch_name
+        run: |
+          VERSION="${{ steps.get_version.outputs.VERSION }}"
+          SUFFIX="${{ github.event.inputs.branch_suffix }}"
+
+          if [ -n "$SUFFIX" ]; then
+            BRANCH_NAME="release/v${VERSION}-${SUFFIX}"
+          else
+            BRANCH_NAME="release/v${VERSION}"
+          fi
+
+          echo "BRANCH_NAME=$BRANCH_NAME" >> $GITHUB_OUTPUT
+          echo "Release branch name: $BRANCH_NAME"
+
+      - name: Check if branch already exists
+        id: check_branch
+        run: |
+          BRANCH_NAME="${{ steps.branch_name.outputs.BRANCH_NAME }}"
+
+          if git ls-remote --heads origin "$BRANCH_NAME" | grep -q "$BRANCH_NAME"; then
+            echo "::error::Branch '$BRANCH_NAME' already exists"
+            exit 1
+          fi
+
+          echo "Branch '$BRANCH_NAME' does not exist, proceeding with creation"
+
+      - name: Create and push release branch
+        run: |
+          COMMIT_SHA="${{ steps.validate.outputs.COMMIT_SHA }}"
+          BRANCH_NAME="${{ steps.branch_name.outputs.BRANCH_NAME }}"
+
+          git config user.name "sglang-bot"
+          git config user.email "sglang-bot@users.noreply.github.com"
+
+          # Create branch from the specified commit
+          git checkout -b "$BRANCH_NAME" "$COMMIT_SHA"
+
+          # Push the new branch
+          git push origin "$BRANCH_NAME"
+
+          echo "Successfully created and pushed branch '$BRANCH_NAME' from commit '$COMMIT_SHA'"
+
+      - name: Summary
+        run: |
+          COMMIT_SHA="${{ steps.validate.outputs.COMMIT_SHA }}"
+          BRANCH_NAME="${{ steps.branch_name.outputs.BRANCH_NAME }}"
+          VERSION="${{ steps.get_version.outputs.VERSION }}"
+
+          echo "## Release Branch Cut Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Version | \`$VERSION\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Branch | \`$BRANCH_NAME\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Commit | \`$COMMIT_SHA\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Triggered by | @${{ github.actor }} |" >> $GITHUB_STEP_SUMMARY

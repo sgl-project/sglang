@@ -258,3 +258,6 @@ outputs/
 *.nsys-rep
 *.ncu-rep
 *.nvcudmp
+
+# setuptools-scm generated version file
+python/sglang/_version.py
