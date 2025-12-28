@@ -6,17 +6,13 @@
 import ast
 import importlib
 import os
-import pickle
-import subprocess
 import sys
-import tempfile
 from abc import ABC, abstractmethod
-from collections.abc import Callable, Set
+from collections.abc import Set
 from dataclasses import dataclass, field
 from functools import lru_cache
 from typing import NoReturn, TypeVar, cast
 
-import cloudpickle
 from torch import nn
 
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -125,11 +121,6 @@ class _ModelInfo:
 
 
 class _BaseRegisteredModel(ABC):
-
-    @abstractmethod
-    def inspect_model_cls(self) -> _ModelInfo:
-        raise NotImplementedError
-
     @abstractmethod
     def load_model_cls(self) -> type[nn.Module]:
         raise NotImplementedError
@@ -151,39 +142,8 @@ class _RegisteredModel(_BaseRegisteredModel):
             model_cls=model_cls,
         )
 
-    def inspect_model_cls(self) -> _ModelInfo:
-        return self.interfaces
-
     def load_model_cls(self) -> type[nn.Module]:
         return self.model_cls
-
-
-def _run_in_subprocess(fn: Callable[[], _T]) -> _T:
-    # NOTE: We use a temporary directory instead of a temporary file to avoid
-    # issues like https://stackoverflow.com/questions/23212435/permission-denied-to-write-to-my-temporary-file
-    with tempfile.TemporaryDirectory() as tempdir:
-        output_filepath = os.path.join(tempdir, "registry_output.tmp")
-
-        # `cloudpickle` allows pickling lambda functions directly
-        input_bytes = cloudpickle.dumps((fn, output_filepath))
-
-        # cannot use `sys.executable __file__` here because the script
-        # contains relative imports
-        returned = subprocess.run(
-            _SUBPROCESS_COMMAND, input=input_bytes, capture_output=True
-        )
-
-        # check if the subprocess is successful
-        try:
-            returned.check_returncode()
-        except Exception as e:
-            # wrap raised exception to provide more information
-            raise RuntimeError(
-                f"Error raised in subprocess:\n" f"{returned.stderr.decode()}"
-            ) from e
-
-        with open(output_filepath, "rb") as f:
-            return cast(_T, pickle.load(f))
 
 
 @dataclass(frozen=True)
@@ -195,12 +155,6 @@ class _LazyRegisteredModel(_BaseRegisteredModel):
     module_name: str
     component_name: str
     class_name: str
-
-    # Performed in another process to avoid initializing CUDA
-    def inspect_model_cls(self) -> _ModelInfo:
-        return _run_in_subprocess(
-            lambda: _ModelInfo.from_model_cls(self.load_model_cls())
-        )
 
     def load_model_cls(self) -> type[nn.Module]:
         mod = importlib.import_module(self.module_name)
@@ -222,18 +176,6 @@ def _try_load_model_cls(
         return None
 
 
-@lru_cache(maxsize=128)
-def _try_inspect_model_cls(
-    model_arch: str,
-    model: _BaseRegisteredModel,
-) -> _ModelInfo | None:
-    try:
-        return model.inspect_model_cls()
-    except Exception:
-        logger.exception("Error in inspecting model architecture '%s'", model_arch)
-        return None
-
-
 @dataclass
 class _ModelRegistry:
     # Keyed by model_arch
@@ -241,42 +183,6 @@ class _ModelRegistry:
 
     def get_supported_archs(self) -> Set[str]:
         return self.registered_models.keys()
-
-    def register_model(
-        self,
-        model_arch: str,
-        model_cls: type[nn.Module] | str,
-    ) -> None:
-        """
-        Register an external model to be used in vLLM.
-
-        :code:`model_cls` can be either:
-
-        - A :class:`torch.nn.Module` class directly referencing the model.
-        - A string in the format :code:`<module>:<class>` which can be used to
-          lazily import the model. This is useful to avoid initializing CUDA
-          when importing the model and thus the related error
-          :code:`RuntimeError: Cannot re-initialize CUDA in forked subprocess`.
-        """
-        if model_arch in self.registered_models:
-            logger.warning(
-                "Model architecture %s is already registered, and will be "
-                "overwritten by the new model class %s.",
-                model_arch,
-                model_cls,
-            )
-
-        if isinstance(model_cls, str):
-            split_str = model_cls.split(":")
-            if len(split_str) != 2:
-                msg = "Expected a string in the format `<module>:<class>`"
-                raise ValueError(msg)
-
-            model = _LazyRegisteredModel(*split_str)
-        else:
-            model = _RegisteredModel.from_model_cls(model_cls)
-
-        self.registered_models[model_arch] = model
 
     def _raise_for_unsupported(self, architectures: list[str]) -> NoReturn:
         all_supported_archs = self.get_supported_archs()
@@ -298,12 +204,6 @@ class _ModelRegistry:
 
         return _try_load_model_cls(model_arch, self.registered_models[model_arch])
 
-    def _try_inspect_model_cls(self, model_arch: str) -> _ModelInfo | None:
-        if model_arch not in self.registered_models:
-            return None
-
-        return _try_inspect_model_cls(model_arch, self.registered_models[model_arch])
-
     def _normalize_archs(
         self,
         architectures: str | list[str],
@@ -322,19 +222,6 @@ class _ModelRegistry:
                 )
             normalized_arch.append(arch)
         return normalized_arch
-
-    def inspect_model_cls(
-        self,
-        architectures: str | list[str],
-    ) -> tuple[_ModelInfo, str]:
-        architectures = self._normalize_archs(architectures)
-
-        for arch in architectures:
-            model_info = self._try_inspect_model_cls(arch)
-            if model_info is not None:
-                return (model_info, arch)
-
-        return self._raise_for_unsupported(architectures)
 
     def resolve_model_cls(
         self,
