@@ -13,11 +13,11 @@
             "denoise_agg": 0.1
         },
         "pr_test": {
-            "e2e": 0.2,
+            "e2e": 0.15,
             "denoise_stage": 0.1,
             "non_denoise_stage": 0.6,
-            "denoise_step": 0.3,
-            "denoise_agg": 0.2
+            "denoise_step": 0.25,
+            "denoise_agg": 0.15
         }
     },
     "improvement_reporting": {
