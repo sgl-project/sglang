@@ -270,5 +270,40 @@ class TestPortArgs(unittest.TestCase):
         self.assertIn("expected ':' after ']'", str(context.exception))
 
 
+class TestElasticEpBackendNone(unittest.TestCase):
+    """Test that --elastic-ep-backend none is properly converted to Python None.
+
+    The argparse choices=["none", "mooncake"] returns the string "none" when a user
+    specifies --elastic-ep-backend none, but the code expects Python None.
+    This ensures the string "none" is properly converted.
+    """
+
+    def test_elastic_ep_backend_string_none_converted_to_python_none(self):
+        """Test that string 'none' is converted to Python None."""
+        # Directly set the string "none" as argparse would
+        server_args = ServerArgs(model_path="dummy", elastic_ep_backend="none")
+        # After __post_init__, it should be converted to Python None
+        self.assertIsNone(server_args.elastic_ep_backend)
+
+    def test_elastic_ep_backend_string_none_case_insensitive(self):
+        """Test that conversion is case-insensitive."""
+        for variant in ["none", "None", "NONE", "NoNe"]:
+            server_args = ServerArgs(model_path="dummy", elastic_ep_backend=variant)
+            self.assertIsNone(
+                server_args.elastic_ep_backend,
+                f"elastic_ep_backend should be None for input '{variant}'",
+            )
+
+    def test_elastic_ep_backend_mooncake_preserved(self):
+        """Test that valid backend 'mooncake' is preserved."""
+        server_args = ServerArgs(model_path="dummy", elastic_ep_backend="mooncake")
+        self.assertEqual(server_args.elastic_ep_backend, "mooncake")
+
+    def test_elastic_ep_backend_default_is_none(self):
+        """Test that the default value is Python None."""
+        server_args = ServerArgs(model_path="dummy")
+        self.assertIsNone(server_args.elastic_ep_backend)
+
+
 if __name__ == "__main__":
     unittest.main()
