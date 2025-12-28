@@ -19,8 +19,7 @@ permissions:
 
 jobs:
   create-tag:
-    # TODO: Change back to 'sgl-project/sglang' before merging to main
-    if: github.repository == 'Kangyan-Zhou/sglang'
+    if: github.repository == 'sgl-project/sglang'
     runs-on: ubuntu-latest
     environment: 'prod'
     steps:

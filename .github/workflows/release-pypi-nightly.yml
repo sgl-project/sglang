@@ -21,8 +21,7 @@ concurrency:
 
 jobs:
   build-nightly-wheel:
-    # TODO: Change back to 'sgl-project/sglang' before merging to main
-    if: github.repository == 'Kangyan-Zhou/sglang'
+    if: github.repository == 'sgl-project/sglang'
     runs-on: ubuntu-latest
     outputs:
       nightly_version: ${{ steps.build.outputs.nightly_version }}

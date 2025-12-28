@@ -3,13 +3,12 @@ name: Release Branch Cut
 on:
   workflow_dispatch:
     inputs:
+      branch_name:
+        description: 'Branch name to create (e.g., release/v0.5.7)'
+        required: true
+        type: string
       commit_sha:
         description: 'Commit SHA from main to cut the release branch from (defaults to latest main)'
-        required: false
-        type: string
-        default: ''
-      branch_suffix:
-        description: 'Optional suffix for branch name (e.g., "rc1" creates release/vX.Y.Z-rc1)'
         required: false
         type: string
         default: ''
@@ -29,6 +28,22 @@ jobs:
           ref: main
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Validate branch name
+        run: |
+          BRANCH_NAME="${{ github.event.inputs.branch_name }}"
+
+          if [ -z "$BRANCH_NAME" ]; then
+            echo "::error::Branch name is required"
+            exit 1
+          fi
+
+          # Validate branch name format (should start with release/)
+          if [[ ! "$BRANCH_NAME" =~ ^release/ ]]; then
+            echo "::warning::Branch name '$BRANCH_NAME' does not follow convention 'release/vX.Y.Z'"
+          fi
+
+          echo "Branch name: $BRANCH_NAME"
 
       - name: Validate commit SHA
         id: validate
@@ -56,43 +71,9 @@ jobs:
           echo "COMMIT_SHA=$COMMIT_SHA" >> $GITHUB_OUTPUT
           echo "Validated commit SHA: $COMMIT_SHA"
 
-      - name: Get version from commit
-        id: get_version
-        run: |
-          COMMIT_SHA="${{ steps.validate.outputs.COMMIT_SHA }}"
-
-          # Checkout the specific commit to read its version
-          git checkout "$COMMIT_SHA"
-
-          # Extract version from version.py
-          VERSION=$(cat python/sglang/version.py | grep -oP '(?<=__version__ = ")[^"]+')
-          if [ -z "$VERSION" ]; then
-            echo "::error::Could not extract version from python/sglang/version.py"
-            exit 1
-          fi
-
-          echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
-          echo "Extracted version: $VERSION"
-
-      - name: Determine branch name
-        id: branch_name
-        run: |
-          VERSION="${{ steps.get_version.outputs.VERSION }}"
-          SUFFIX="${{ github.event.inputs.branch_suffix }}"
-
-          if [ -n "$SUFFIX" ]; then
-            BRANCH_NAME="release/v${VERSION}-${SUFFIX}"
-          else
-            BRANCH_NAME="release/v${VERSION}"
-          fi
-
-          echo "BRANCH_NAME=$BRANCH_NAME" >> $GITHUB_OUTPUT
-          echo "Release branch name: $BRANCH_NAME"
-
       - name: Check if branch already exists
-        id: check_branch
         run: |
-          BRANCH_NAME="${{ steps.branch_name.outputs.BRANCH_NAME }}"
+          BRANCH_NAME="${{ github.event.inputs.branch_name }}"
 
           if git ls-remote --heads origin "$BRANCH_NAME" | grep -q "$BRANCH_NAME"; then
             echo "::error::Branch '$BRANCH_NAME' already exists"
@@ -104,7 +85,7 @@ jobs:
       - name: Create and push release branch
         run: |
           COMMIT_SHA="${{ steps.validate.outputs.COMMIT_SHA }}"
-          BRANCH_NAME="${{ steps.branch_name.outputs.BRANCH_NAME }}"
+          BRANCH_NAME="${{ github.event.inputs.branch_name }}"
 
           git config user.name "sglang-bot"
           git config user.email "sglang-bot@users.noreply.github.com"
@@ -120,14 +101,17 @@ jobs:
       - name: Summary
         run: |
           COMMIT_SHA="${{ steps.validate.outputs.COMMIT_SHA }}"
-          BRANCH_NAME="${{ steps.branch_name.outputs.BRANCH_NAME }}"
-          VERSION="${{ steps.get_version.outputs.VERSION }}"
+          BRANCH_NAME="${{ github.event.inputs.branch_name }}"
 
           echo "## Release Branch Cut Summary" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
           echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
-          echo "| Version | \`$VERSION\` |" >> $GITHUB_STEP_SUMMARY
           echo "| Branch | \`$BRANCH_NAME\` |" >> $GITHUB_STEP_SUMMARY
           echo "| Commit | \`$COMMIT_SHA\` |" >> $GITHUB_STEP_SUMMARY
           echo "| Triggered by | @${{ github.actor }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Next Steps" >> $GITHUB_STEP_SUMMARY
+          echo "1. Test on the release branch" >> $GITHUB_STEP_SUMMARY
+          echo "2. Apply any hotfixes if needed" >> $GITHUB_STEP_SUMMARY
+          echo "3. Create a tag to trigger release: \`gh workflow run release-tag.yml -f version=X.Y.Z -f ref=$BRANCH_NAME\`" >> $GITHUB_STEP_SUMMARY
