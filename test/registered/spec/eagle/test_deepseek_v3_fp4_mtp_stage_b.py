@@ -1,9 +1,9 @@
-import os
 import unittest
 from types import SimpleNamespace
 
 import requests
 
+from sglang.srt.environ import envs
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
@@ -26,7 +26,6 @@ SERVER_LAUNCH_TIMEOUT = 1200
 class TestDeepseekV3FP4MTP(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        os.environ["SGLANG_ENABLE_SPEC_V2"] = "1"
         cls.model = FULL_DEEPSEEK_V3_FP4_MODEL_PATH
         cls.base_url = DEFAULT_URL_FOR_TEST
         other_args = [
@@ -51,18 +50,17 @@ class TestDeepseekV3FP4MTP(CustomTestCase):
             "--model-loader-extra-config",
             '{"enable_multithread_load": true,"num_threads": 64}',
         ]
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=SERVER_LAUNCH_TIMEOUT,
-            other_args=other_args,
-        )
+        with envs.SGLANG_ENABLE_SPEC_V2.override(True):
+            cls.process = popen_launch_server(
+                cls.model,
+                cls.base_url,
+                timeout=SERVER_LAUNCH_TIMEOUT,
+                other_args=other_args,
+            )
 
     @classmethod
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
-        if "SGLANG_ENABLE_SPEC_V2" in os.environ:
-            del os.environ["SGLANG_ENABLE_SPEC_V2"]
 
     def test_a_gsm8k(
         self,
