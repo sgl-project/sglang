@@ -3,12 +3,15 @@ from types import SimpleNamespace
 
 import requests
 
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.run_eval import run_eval
 from sglang.test.server_fixtures.eagle_fixture import EagleServerBase
 from sglang.test.test_utils import (
     DEFAULT_DRAFT_MODEL_EAGLE3,
     DEFAULT_TARGET_MODEL_EAGLE3,
 )
+
+register_cuda_ci(est_time=50, suite="stage-b-test-small-1-gpu")
 
 
 class TestEagle3Basic(EagleServerBase):
