@@ -58,7 +58,7 @@ class ToleranceConfig:
                 f"No tolerance profile found for '{profile_name}' and no default 'pr_test' profile exists."
             )
 
-        print(f"--- Performance Tolerance Profile: {actual_profile} ---")
+        logger.info(f"--- Performance Tolerance Profile: {actual_profile} ---")
 
         return cls(
             e2e=float(os.getenv("SGLANG_E2E_TOLERANCE", tol_data["e2e"])),
