@@ -171,7 +171,6 @@ class StageProfiler:
             )
 
         if self.enabled and self.timings:
-            print(f"{self.stage_name=}")
             if "denoising_step_" in self.stage_name:
                 index = int(self.stage_name[len("denoising_step_") :])
                 self.timings.record_steps(index, execution_time_s)
