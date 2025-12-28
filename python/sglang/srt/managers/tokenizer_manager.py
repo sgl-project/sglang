@@ -237,6 +237,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             if speculative_algorithm.is_none()
             else server_args.speculative_num_draft_tokens
         )
+        self.check_total_tokens = True
 
     def init_tokenizer_and_processor(self):
         server_args = self.server_args
@@ -723,9 +724,10 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         """Validates that the input token count and the requested token count doesn't exceed the model's context length."""
         # FIXME: unify the length validation logic with the one in the scheduler.
         _max_req_len = self.context_len
-
         input_token_num = len(input_ids) if input_ids is not None else 0
         input_token_num += self.reserve_input_token_num
+
+        # Validate input length
         if input_token_num >= self.context_len:
             if self.server_args.allow_auto_truncate:
                 logger.warning(
@@ -741,16 +743,11 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                     f"model's context length ({self.context_len} tokens)."
                 )
 
-        if isinstance(obj, EmbeddingReqInput) and self.is_generation:
-            raise ValueError(
-                "This model does not appear to be an embedding model by default. "
-                "Please add `--is-embedding` when launching the server or try another model."
-            )
-
-        # Check total tokens (input + max_new_tokens)
+        # Validate total tokens (input + max_new_tokens)
         max_new_tokens = obj.sampling_params.get("max_new_tokens")
         if (
-            max_new_tokens is not None
+            self.check_total_tokens
+            and max_new_tokens is not None
             and (max_new_tokens + input_token_num) >= _max_req_len
         ):
             if self.server_args.allow_auto_truncate:
@@ -773,10 +770,18 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 )
                 raise ValueError(error_msg)
 
-        # Matryoshka embeddings validations
+        # Validate embedding requests
+        if isinstance(obj, EmbeddingReqInput) and self.is_generation:
+            raise ValueError(
+                "This model does not appear to be an embedding model by default. "
+                "Please add `--is-embedding` when launching the server or try another model."
+            )
+
+        # Validate Matryoshka embeddings
         if isinstance(obj, EmbeddingReqInput):
             self._validate_for_matryoshka_dim(obj)
 
+        # Validate custom logit processor
         if isinstance(obj, GenerateReqInput):
             if (
                 obj.return_hidden_states
@@ -839,12 +844,22 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             )
 
     def _validate_input_ids_in_vocab(
-        self, input_ids: List[int], vocab_size: int
+        self, input_ids: Union[List[int], List[List[int]]], vocab_size: int
     ) -> None:
-        if any(id >= vocab_size for id in input_ids):
-            raise ValueError(
-                f"The input_ids {input_ids} contains values greater than the vocab size ({vocab_size})."
-            )
+        # Handle both single sequence and batch of sequences
+        if isinstance(input_ids[0], list):
+            # Batch of sequences
+            for seq in input_ids:
+                if any(id >= vocab_size for id in seq):
+                    raise ValueError(
+                        f"The input_ids {seq} contains values greater than the vocab size ({vocab_size})."
+                    )
+        else:
+            # Single sequence
+            if any(id >= vocab_size for id in input_ids):
+                raise ValueError(
+                    f"The input_ids {input_ids} contains values greater than the vocab size ({vocab_size})."
+                )
 
     def _get_sampling_params(self, sampling_kwargs: Dict) -> SamplingParams:
         return SamplingParams(**sampling_kwargs)
