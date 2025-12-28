@@ -234,6 +234,9 @@ class SchedulerOutputProcessorMixin:
                     )
 
         else:  # embedding or reward model
+            if result.copy_done is not None:
+                result.copy_done.synchronize()
+
             is_sparse = envs.SGLANG_EMBEDDINGS_SPARSE_HEAD.is_set()
 
             embeddings = result.embeddings
@@ -306,6 +309,18 @@ class SchedulerOutputProcessorMixin:
 
         return predict_tokens
 
+    def process_batch_result_idle(
+        self: Scheduler,
+        batch: ScheduleBatch,
+        result: GenerationBatchResult,
+    ):
+        if result.copy_done is not None:
+            result.copy_done.synchronize()
+
+        self.stream_output_generation(
+            batch.reqs, batch.return_logprob, is_idle_batch=True
+        )
+
     def process_batch_result_dllm(
         self: Scheduler,
         batch: ScheduleBatch,
@@ -354,7 +369,7 @@ class SchedulerOutputProcessorMixin:
             next_token_ids = next_token_ids.tolist()
             if batch.return_logprob:
                 next_token_logprobs = logits_output.next_token_logprobs.tolist()
-        elif batch.is_eagle_v2:
+        elif batch.is_spec_v2:
             next_token_ids = self._resolve_spec_overlap_token_ids(result, batch)
 
         self.num_generated_tokens += len(batch.reqs)
@@ -381,8 +396,8 @@ class SchedulerOutputProcessorMixin:
             new_accepted_len = 1
             if batch.spec_algorithm.is_none():
                 req.output_ids.append(next_token_id)
-            elif batch.is_eagle_v2:
-                # Only v2 eagle's output_ids are updated here.
+            elif batch.is_spec_v2:
+                # Only spec v2's output_ids are updated here.
                 req.output_ids.extend(next_token_id)
                 new_accepted_len = len(next_token_id)
 
@@ -433,7 +448,7 @@ class SchedulerOutputProcessorMixin:
                     if batch.spec_algorithm.is_none():
                         # Normal decode: single token
                         req.grammar.accept_token(next_token_id)
-                    elif batch.is_eagle_v2:
+                    elif batch.is_spec_v2:
                         # Speculative decode: next_token_id is a list of accepted tokens
                         for token_id in next_token_id:
                             req.grammar.accept_token(token_id)
@@ -463,6 +478,10 @@ class SchedulerOutputProcessorMixin:
             and self.forward_ct_decode % self.server_args.decode_log_interval == 0
         ):
             self.log_decode_stats(can_run_cuda_graph, running_batch=batch)
+        if self.enable_metrics:
+            self.log_decode_stats_every_iteration(
+                batch, num_accepted_tokens=result.num_accepted_tokens
+            )
 
     def _mamba_prefix_cache_update(
         self, req: Req, batch: ScheduleBatch, result: GenerationBatchResult, i: int
@@ -796,11 +815,28 @@ class SchedulerOutputProcessorMixin:
         else:  # embedding or reward model
             self.stream_output_embedding(reqs)
 
+        if envs.SGLANG_TEST_CRASH_AFTER_STREAM_OUTPUTS.get() > 0:
+            self._trigger_crash_for_tests(
+                envs.SGLANG_TEST_CRASH_AFTER_STREAM_OUTPUTS.get()
+            )
+
+    def _trigger_crash_for_tests(self, crash_threshold: int):
+        # Crash trigger: crash after stream_output is called N times
+        # This is used for testing purposes.
+        if not hasattr(self, "_test_stream_output_count"):
+            self._test_stream_output_count = 0
+        self._test_stream_output_count += 1
+        if self._test_stream_output_count >= crash_threshold:
+            raise RuntimeError(
+                f"Test crash after stream_output called {self._test_stream_output_count} times"
+            )
+
     def stream_output_generation(
         self: Scheduler,
         reqs: List[Req],
         return_logprob: bool,
         skip_req: Optional[Req] = None,
+        is_idle_batch: bool = False,
     ):
         rids = []
         http_worker_ipcs = []
@@ -822,6 +858,7 @@ class SchedulerOutputProcessorMixin:
         spec_accepted_tokens = []
         retraction_counts = []
         output_hidden_states = None
+        load = self.get_load()
         output_routed_experts = None
 
         queue_times = []
@@ -1031,7 +1068,7 @@ class SchedulerOutputProcessorMixin:
                 req.log_time_stats()
 
         # Send to detokenizer
-        if rids:
+        if reqs or is_idle_batch:
             if self.model_config.is_multimodal_gen:
                 return
 
@@ -1076,6 +1113,7 @@ class SchedulerOutputProcessorMixin:
                     placeholder_tokens_idx=None,
                     placeholder_tokens_val=None,
                     retraction_counts=retraction_counts,
+                    load=load,
                 )
             )
 

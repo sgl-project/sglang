@@ -40,14 +40,23 @@ from sglang.srt.layers.quantization.modelopt_quant import (
     ModelOptFp4Config,
     ModelOptFp8Config,
 )
-from sglang.srt.model_loader.weight_validation import (
-    _cleanup_corrupted_files_selective,
-    _cleanup_corrupted_model_cache,
-    _validate_safetensors_file,
-    _validate_sharded_model,
-)
 from sglang.srt.utils import find_local_repo_dir, log_info_on_rank0, print_warning_once
 from sglang.utils import is_in_ci
+
+try:
+    from fastsafetensors import SafeTensorsFileLoader, SingleGroup
+except ImportError:
+
+    class PlaceholderModule:
+        def __init__(self, name):
+            self.name = name
+
+        def __getattr__(self, name):
+            raise ImportError(f"Please install {self.name}")
+
+    fastsafetensors = PlaceholderModule("fastsafetensors")
+    SafeTensorsFileLoader = None
+    SingleGroup = None
 
 logger = logging.getLogger(__name__)
 
@@ -327,33 +336,6 @@ def _find_local_hf_snapshot_dir_unlocked(
     if not os.path.isdir(found_local_snapshot_dir):
         return None
 
-    # Only perform cache validation and cleanup in CI to avoid
-    # unnecessary overhead for regular users
-    if is_in_ci():
-        # Check for incomplete files and clean up if found
-        repo_folder = os.path.abspath(
-            os.path.join(found_local_snapshot_dir, "..", "..")
-        )
-        blobs_dir = os.path.join(repo_folder, "blobs")
-
-        # Check for incomplete download markers
-        incomplete_files = []
-        if os.path.isdir(blobs_dir):
-            incomplete_files = glob.glob(os.path.join(blobs_dir, "*.incomplete"))
-
-        if incomplete_files:
-            log_info_on_rank0(
-                logger,
-                f"Found {len(incomplete_files)} .incomplete files in {blobs_dir} for "
-                f"{model_name_or_path}. Will clean up and re-download.",
-            )
-            _cleanup_corrupted_model_cache(
-                model_name_or_path,
-                found_local_snapshot_dir,
-                f"Incomplete download detected ({len(incomplete_files)} incomplete files)",
-            )
-            return None
-
     local_weight_files: List[str] = []
     try:
         for pattern in allow_patterns:
@@ -372,60 +354,18 @@ def _find_local_hf_snapshot_dir_unlocked(
         )
         local_weight_files = []
 
-    # Only perform cache validation and cleanup in CI
-    if is_in_ci():
-        # Validate sharded models and check for corruption
-        if local_weight_files:
-            is_valid, error_msg, corrupted_files = _validate_sharded_model(
-                found_local_snapshot_dir, local_weight_files
-            )
-            if not is_valid:
-                if corrupted_files:
-                    # Selective cleanup: only remove corrupted files
-                    log_info_on_rank0(
-                        logger,
-                        f"Found {len(corrupted_files)} corrupted file(s) for "
-                        f"{model_name_or_path}: {error_msg}. "
-                        "Will selectively clean and re-download only these files.",
-                    )
-                    _cleanup_corrupted_files_selective(
-                        model_name_or_path, corrupted_files
-                    )
-                    return None
-                else:
-                    # Missing shards (not corruption) - let snapshot_download handle it.
-                    # IMPORTANT: Do NOT delete the entire cache here, as other processes
-                    # (TP/EP ranks) may already be loading weights from these files.
-                    # Deleting the cache while other processes are using it causes
-                    # FileNotFoundError race conditions. Instead, just return None
-                    # to trigger a download - snapshot_download will only fetch
-                    # missing files without disturbing existing ones.
-                    log_info_on_rank0(
-                        logger,
-                        f"Validation failed for {model_name_or_path}: {error_msg}. "
-                        "Will attempt to download missing files.",
-                    )
-                    return None
+    # Only perform cache validation and cleanup in CI to avoid
+    # unnecessary overhead for regular users
+    if is_in_ci() and local_weight_files:
+        from sglang.srt.model_loader.ci_weight_validation import (
+            ci_validate_and_cleanup_local_snapshot,
+        )
 
-            # Also validate single (non-sharded) safetensors files
-            for f in local_weight_files:
-                base_name = os.path.basename(f)
-                # Check if this is a single model file (not sharded)
-                # Include adapter_model.safetensors for LoRA adapters
-                if base_name in [
-                    "model.safetensors",
-                    "pytorch_model.safetensors",
-                    "adapter_model.safetensors",
-                ]:
-                    if not _validate_safetensors_file(f):
-                        log_info_on_rank0(
-                            logger,
-                            f"Corrupted model file {base_name} for {model_name_or_path}. "
-                            "Will selectively clean and re-download this file.",
-                        )
-                        # Selective cleanup for single file
-                        _cleanup_corrupted_files_selective(model_name_or_path, [f])
-                        return None
+        is_valid = ci_validate_and_cleanup_local_snapshot(
+            model_name_or_path, found_local_snapshot_dir, local_weight_files
+        )
+        if not is_valid:
+            return None
 
     if len(local_weight_files) > 0:
         log_info_on_rank0(
@@ -441,83 +381,6 @@ def _find_local_hf_snapshot_dir_unlocked(
             f"{allow_patterns}; will attempt download.",
         )
         return None
-
-
-def find_local_hf_snapshot_dir(
-    model_name_or_path: str,
-    cache_dir: Optional[str],
-    allow_patterns: List[str],
-    revision: Optional[str] = None,
-) -> Optional[str]:
-    """If the weights are already local, skip downloading and returns the path.
-
-    This function acquires a lock to prevent race conditions during validation
-    and cleanup. For use within download_weights_from_hf, use
-    _find_local_hf_snapshot_dir_unlocked instead with an external lock.
-    """
-    # For local paths, no locking needed
-    if os.path.isdir(model_name_or_path):
-        return None
-
-    # Use file lock to prevent multiple processes (TP ranks) from
-    # validating and cleaning up the same model cache simultaneously.
-    with get_lock(model_name_or_path, cache_dir):
-        return _find_local_hf_snapshot_dir_unlocked(
-            model_name_or_path, cache_dir, allow_patterns, revision
-        )
-
-
-def _validate_weights_after_download(
-    hf_folder: str,
-    allow_patterns: List[str],
-    model_name_or_path: str,
-) -> bool:
-    """Validate downloaded weight files to catch corruption early.
-
-    This function validates safetensors files after download to catch
-    corruption issues (truncated downloads, network errors, etc.) before
-    model loading fails with cryptic errors.
-
-    Args:
-        hf_folder: Path to the downloaded model folder
-        allow_patterns: Patterns used to match weight files
-        model_name_or_path: Model identifier for error messages
-
-    Returns:
-        True if all files are valid, False if corrupted files were found and cleaned up
-    """
-    import glob as glob_module
-
-    # Find all weight files that were downloaded
-    weight_files: List[str] = []
-    for pattern in allow_patterns:
-        weight_files.extend(glob_module.glob(os.path.join(hf_folder, pattern)))
-
-    if not weight_files:
-        return True  # No weight files to validate
-
-    # Validate safetensors files
-    corrupted_files = []
-    for f in weight_files:
-        if f.endswith(".safetensors") and os.path.exists(f):
-            if not _validate_safetensors_file(f):
-                corrupted_files.append(os.path.basename(f))
-
-    if corrupted_files:
-        # Clean up corrupted files so next attempt re-downloads them
-        _cleanup_corrupted_files_selective(
-            model_name_or_path,
-            [os.path.join(hf_folder, f) for f in corrupted_files],
-        )
-        log_info_on_rank0(
-            logger,
-            f"Downloaded model files are corrupted for {model_name_or_path}: "
-            f"{corrupted_files}. The corrupted files have been removed. "
-            "Will retry download.",
-        )
-        return False
-
-    return True
 
 
 def download_weights_from_hf(
@@ -580,49 +443,23 @@ def download_weights_from_hf(
                     allow_patterns = [pattern]
                     break
 
-        log_info_on_rank0(logger, f"Using model weights format {allow_patterns}")
-
         # Only perform validation and retry in CI to avoid overhead for regular users
         if is_in_ci():
-            # Retry loop for handling corrupted downloads
-            for attempt in range(max_retries):
-                hf_folder = snapshot_download(
-                    model_name_or_path,
-                    allow_patterns=allow_patterns,
-                    ignore_patterns=ignore_patterns,
-                    cache_dir=cache_dir,
-                    tqdm_class=DisabledTqdm,
-                    revision=revision,
-                    local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
-                )
+            from sglang.srt.model_loader.ci_weight_validation import (
+                ci_download_with_validation_and_retry,
+            )
 
-                # Validate downloaded files to catch corruption early
-                is_valid = _validate_weights_after_download(
-                    hf_folder, allow_patterns, model_name_or_path
-                )
-
-                if is_valid:
-                    return hf_folder
-
-                # Validation failed, corrupted files were cleaned up
-                if attempt < max_retries - 1:
-                    log_info_on_rank0(
-                        logger,
-                        f"Retrying download for {model_name_or_path} "
-                        f"(attempt {attempt + 2}/{max_retries})...",
-                    )
-                else:
-                    raise RuntimeError(
-                        f"Downloaded model files are still corrupted for "
-                        f"{model_name_or_path} after {max_retries} attempts. "
-                        "This may indicate a persistent issue with the model files "
-                        "on Hugging Face Hub or network problems."
-                    )
-
-            # This should never be reached, but just in case
-            return hf_folder
+            return ci_download_with_validation_and_retry(
+                model_name_or_path=model_name_or_path,
+                allow_patterns=allow_patterns,
+                ignore_patterns=ignore_patterns,
+                cache_dir=cache_dir,
+                revision=revision,
+                max_retries=max_retries,
+            )
         else:
             # Simple download without validation for non-CI environments
+            log_info_on_rank0(logger, f"Using model weights format {allow_patterns}")
             hf_folder = snapshot_download(
                 model_name_or_path,
                 allow_patterns=allow_patterns,
@@ -824,6 +661,61 @@ def safetensors_weights_iterator(
             with safetensors.safe_open(st_file, framework="pt", device="cpu") as f:
                 for name in f.keys():
                     yield name, f.get_tensor(name)
+
+
+def fastsafetensors_weights_iterator(
+    hf_weights_files: List[str],
+) -> Generator[Tuple[str, torch.Tensor], None, None]:
+    """
+    Iterate over the weights in the model safetensor files
+    using fastsafetensor library to accelerate loading via GPU Direct Storage (if available).
+    """
+    if SafeTensorsFileLoader is None:
+        raise ImportError(
+            "Please install fastsafetensors via `pip install fastsafetensors`"
+        )
+
+    if torch.distributed.is_initialized():
+        pg = torch.distributed.group.WORLD
+    else:
+        pg = SingleGroup()
+
+    try:
+        rank = pg.rank()
+    except Exception:
+        rank = 0
+
+    device = torch.device(f"cuda:{rank}")
+
+    weight_files_sub_lists = [
+        hf_weights_files[i : i + pg.size()]
+        for i in range(0, len(hf_weights_files), pg.size())
+    ]
+
+    _BAR_FORMAT = (
+        "{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]"
+    )
+
+    for f_list in tqdm(
+        weight_files_sub_lists,
+        desc="Loading safetensors using Fastsafetensor loader",
+        disable=False,
+        bar_format=_BAR_FORMAT,
+    ):
+        loader = SafeTensorsFileLoader(pg, device)
+        rank_file_map = {i: [f] for i, f in enumerate(f_list)}
+        loader.add_filenames(rank_file_map)
+        try:
+            fb = loader.copy_files_to_device()
+            try:
+                keys = list(fb.key_to_rank_lidx.keys())
+                for k in keys:
+                    t = fb.get_tensor(k)
+                    yield k, t
+            finally:
+                pass
+        finally:
+            loader.close()
 
 
 def multi_thread_safetensors_weights_iterator(
