@@ -22,30 +22,23 @@ fn create_workers(count: usize) -> Vec<Arc<dyn Worker>> {
         .collect()
 }
 
-fn headers_with_routing_key(key: &str) -> http::HeaderMap {
-    let mut headers = http::HeaderMap::new();
-    headers.insert("x-smg-routing-key", key.parse().unwrap());
-    headers
-}
-
-fn select_with_key<'a>(
+fn select_with_key(
     policy: &ManualPolicy,
     workers: &[Arc<dyn Worker>],
     key: &str,
-    headers_buf: &'a mut http::HeaderMap,
 ) -> Option<usize> {
-    *headers_buf = headers_with_routing_key(key);
+    let mut headers = http::HeaderMap::new();
+    headers.insert("x-smg-routing-key", key.parse().unwrap());
     let info = SelectWorkerInfo {
-        headers: Some(headers_buf),
+        headers: Some(&headers),
         ..Default::default()
     };
     policy.select_worker(workers, &info)
 }
 
 fn warmup_keys(policy: &ManualPolicy, workers: &[Arc<dyn Worker>], keys: &[String]) {
-    let mut headers = http::HeaderMap::new();
     for key in keys {
-        select_with_key(policy, workers, key, &mut headers);
+        select_with_key(policy, workers, key);
     }
 }
 
@@ -72,10 +65,8 @@ fn bench_fast_path_hit(c: &mut Criterion) {
             &worker_count,
             |b, _| {
                 let mut idx = 0;
-                let mut headers = http::HeaderMap::new();
                 b.iter(|| {
-                    let result =
-                        select_with_key(&policy, &workers, &keys[idx % keys.len()], &mut headers);
+                    let result = select_with_key(&policy, &workers, &keys[idx % keys.len()]);
                     idx += 1;
                     black_box(result)
                 });
@@ -98,10 +89,9 @@ fn bench_slow_path_vacant(c: &mut Criterion) {
             |b, _| {
                 let policy = ManualPolicy::new();
                 let mut idx = 0;
-                let mut headers = http::HeaderMap::new();
                 b.iter(|| {
                     let key = format!("new-user-{}", idx);
-                    let result = select_with_key(&policy, &workers, &key, &mut headers);
+                    let result = select_with_key(&policy, &workers, &key);
                     idx += 1;
                     black_box(result)
                 });
@@ -144,21 +134,12 @@ fn bench_failover(c: &mut Criterion) {
                     || {
                         let policy = ManualPolicy::new();
                         let workers = create_workers(count);
-                        let mut headers = http::HeaderMap::new();
-                        let idx =
-                            select_with_key(&policy, &workers, "failover-test", &mut headers)
-                                .unwrap();
+                        let idx = select_with_key(&policy, &workers, "failover-test").unwrap();
                         workers[idx].set_healthy(false);
                         (policy, workers)
                     },
                     |(policy, workers)| {
-                        let mut headers = http::HeaderMap::new();
-                        black_box(select_with_key(
-                            &policy,
-                            &workers,
-                            "failover-test",
-                            &mut headers,
-                        ))
+                        black_box(select_with_key(&policy, &workers, "failover-test"))
                     },
                 );
             },
@@ -185,14 +166,14 @@ fn bench_concurrent(c: &mut Criterion) {
                             let policy = Arc::clone(&policy);
                             let workers = Arc::clone(&workers);
                             thread::spawn(move || {
-                                let mut headers = http::HeaderMap::new();
                                 for i in 0..500 {
                                     let key = if i % 5 == 0 {
                                         format!("thread{}_user{}", t, i)
                                     } else {
                                         format!("shared_user{}", i % 50)
                                     };
-                                    headers = headers_with_routing_key(&key);
+                                    let mut headers = http::HeaderMap::new();
+                                    headers.insert("x-smg-routing-key", key.parse().unwrap());
                                     let info = SelectWorkerInfo {
                                         headers: Some(&headers),
                                         ..Default::default()
@@ -225,10 +206,8 @@ fn bench_cache_size_impact(c: &mut Criterion) {
         group.throughput(Throughput::Elements(1));
         group.bench_with_input(BenchmarkId::new("keys", cache_size), &cache_size, |b, _| {
             let mut idx = 0;
-            let mut headers = http::HeaderMap::new();
             b.iter(|| {
-                let result =
-                    select_with_key(&policy, &workers, &keys[idx % keys.len()], &mut headers);
+                let result = select_with_key(&policy, &workers, &keys[idx % keys.len()]);
                 idx += 1;
                 black_box(result)
             });
@@ -251,12 +230,10 @@ fn bench_comparison_baseline(c: &mut Criterion) {
         b.iter(|| black_box(policy.select_worker(&workers, &info)));
     });
 
-    let mut headers = http::HeaderMap::new();
-    select_with_key(&policy, &workers, "cached-user", &mut headers);
+    select_with_key(&policy, &workers, "cached-user"); // warmup
 
     group.bench_function("manual_fast_path", |b| {
-        let mut headers = http::HeaderMap::new();
-        b.iter(|| black_box(select_with_key(&policy, &workers, "cached-user", &mut headers)));
+        b.iter(|| black_box(select_with_key(&policy, &workers, "cached-user")));
     });
 
     group.finish();
