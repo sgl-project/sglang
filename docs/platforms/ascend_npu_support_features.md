@@ -397,10 +397,3 @@ questions, please [open an issue](https://github.com/sgl-project/sglang/issues).
 | Argument                           | Description                                                   | Defaults | Options                   | A2 Supported                           | A3 Supported                           |
 |------------------------------------|---------------------------------------------------------------|----------|---------------------------|----------------------------------------|----------------------------------------|
 | `--enable-deterministic-inference` | Enable deterministic inference mode with batch invariant ops. | `False`  | bool flag (set to enable) | **<span style="color: red;">×</span>** | **<span style="color: red;">×</span>** |
-
-## Configuration file support
-
-| Argument   | Description                                                                          | Defaults | Options   | A2 Supported                           | A3 Supported                           |
-|------------|--------------------------------------------------------------------------------------|----------|-----------|----------------------------------------|----------------------------------------|
-| `--config` | Read CLI options from a config file. Must be a YAML file with configuration options. | `None`   | Type: str | **<span style="color: red;">×</span>** | **<span style="color: red;">×</span>** |
-
