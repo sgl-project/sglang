@@ -18,6 +18,7 @@ from fastapi import (
 )
 from fastapi.responses import FileResponse
 
+from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
 from sglang.multimodal_gen.configs.sample.sampling_params import (
     SamplingParams,
     generate_request_id,
@@ -37,10 +38,7 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
 )
 from sglang.multimodal_gen.runtime.entrypoints.utils import prepare_request
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
-from sglang.multimodal_gen.runtime.server_args import (
-    WorkloadType,
-    get_global_server_args,
-)
+from sglang.multimodal_gen.runtime.server_args import get_global_server_args
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
@@ -165,7 +163,7 @@ async def create_video(
     request_id = generate_request_id()
 
     server_args = get_global_server_args()
-    is_t2v = server_args.workload_type == WorkloadType.T2V
+    is_t2v = server_args.pipeline_config.task_type == ModelTaskType.T2V
 
     input_path = None
 
