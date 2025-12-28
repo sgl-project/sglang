@@ -88,7 +88,7 @@ class SchedulerUpdateWeightsMixin:
         self: Scheduler, recv_req: UpdateWeightsFromTensorReqInput
     ):
         """Update the online model parameter from tensors."""
-        if self.server_args.speculative_draft_model_frozen:
+        if recv_req.disable_draft_model:
             worker = self.tp_worker
         else:
             worker = self.draft_worker or self.tp_worker
