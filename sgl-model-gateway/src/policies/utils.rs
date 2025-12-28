@@ -5,18 +5,12 @@ use std::time::Duration;
 
 use tracing::debug;
 
+#[derive(Debug)]
 pub struct PeriodicTask {
-    name: &'static str,
+    debug_name: &'static str,
+    #[allow(dead_code)]
     shutdown_flag: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
-}
-
-impl std::fmt::Debug for PeriodicTask {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PeriodicTask")
-            .field("name", &self.name)
-            .finish_non_exhaustive()
-    }
 }
 
 impl PeriodicTask {
@@ -55,7 +49,7 @@ impl PeriodicTask {
         });
 
         Self {
-            name,
+            debug_name: name,
             shutdown_flag,
             handle: Some(handle),
         }
@@ -68,8 +62,8 @@ impl Drop for PeriodicTask {
 
         if let Some(handle) = self.handle.take() {
             match handle.join() {
-                Ok(()) => debug!("{} thread shut down cleanly", self.name),
-                Err(_) => debug!("{} thread panicked during shutdown", self.name),
+                Ok(()) => debug!("{} thread shut down cleanly", self.debug_name),
+                Err(_) => debug!("{} thread panicked during shutdown", self.debug_name),
             }
         }
     }
