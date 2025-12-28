@@ -1079,6 +1079,13 @@ def general_mm_embed_routine(
                 kwargs["input_deepstack_embeds"] = other_info["input_deepstack_embeds"]
             # once used, mm_inputs is useless, considering chunked-prefill is disabled for multimodal models
             # just being defensive here
+            if mm_inputs_list:
+                for mm_input_obj in mm_inputs_list:
+                    if mm_input_obj and hasattr(mm_input_obj, "mm_items"):
+                        for mm_item in mm_input_obj.mm_items:
+                            feature = getattr(mm_item, "feature", None)
+                            if isinstance(feature, torch.Tensor) and feature.is_cuda:
+                                mm_item.feature = feature.to("cpu", non_blocking=True)
             forward_batch.mm_inputs = None
         else:
             input_embeds = embed_tokens(input_ids)
