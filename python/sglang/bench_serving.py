@@ -1112,15 +1112,32 @@ def sample_mmmu_requests(
     """
     print("Loading MMMU dataset from HuggingFace...")
 
-    try:
-        print("Attempting to load MMMU Math dataset...")
-        mmmu_dataset = load_dataset("MMMU/MMMU", "Math", split="test")
-        print(
-            f"Successfully loaded MMMU Math dataset from HuggingFace with {len(mmmu_dataset)} examples"
-        )
-    except Exception as e:
-        print(f"Failed to load MMMU Math dataset: {e}")
-        raise ValueError(f"Failed to load MMMU dataset: {e}")
+    max_retries = 3
+    retry_delay = 5
+    for attempt in range(max_retries):
+        try:
+            print(
+                f"Attempting to load MMMU Math dataset (attempt {attempt + 1}/{max_retries})..."
+            )
+            # Use force_redownload if the first attempt fails, which often fixes split mismatch issues
+            download_mode = "force_redownload" if attempt > 0 else None
+            mmmu_dataset = load_dataset(
+                "MMMU/MMMU", "Math", split="test", download_mode=download_mode
+            )
+            print(
+                f"Successfully loaded MMMU Math dataset from HuggingFace with {len(mmmu_dataset)} examples"
+            )
+            break
+        except Exception as e:
+            print(f"Failed to load MMMU Math dataset on attempt {attempt + 1}: {e}")
+            if attempt < max_retries - 1:
+                print(f"Retrying in {retry_delay} seconds...")
+                time.sleep(retry_delay)
+                retry_delay *= 2
+            else:
+                raise ValueError(
+                    f"Failed to load MMMU dataset after {max_retries} attempts: {e}"
+                )
 
     # Sample from the dataset
     if len(mmmu_dataset) > num_requests:
