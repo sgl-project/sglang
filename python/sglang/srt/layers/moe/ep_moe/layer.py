@@ -16,7 +16,11 @@ from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
     get_moe_runner_backend,
 )
-from sglang.srt.layers.moe.fused_moe_triton.layer import FlashInferFusedMoE, FusedMoE
+from sglang.srt.layers.moe.fused_moe_triton.layer import (
+    FlashInferFusedMoE,
+    FusedMoE,
+    moe_forward_piecewise_cuda_graph_impl,
+)
 from sglang.srt.layers.moe.token_dispatcher.deepep import (
     DeepEPLLCombineInput,
     DeepEPNormalCombineInput,
@@ -156,7 +160,7 @@ class DeepEPMoE(FusedMoE):
             assert TopKOutputChecker.format_is_standard(
                 topk_output
             ), "Only standard topk output is supported for piecewise cuda graph"
-            return torch.ops.sglang.moe_forward_piecewise_cuda_graph_impl(
+            return moe_forward_piecewise_cuda_graph_impl(
                 hidden_states,
                 topk_output.topk_weights,
                 topk_output.topk_ids,
