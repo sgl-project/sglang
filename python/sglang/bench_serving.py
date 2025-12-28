@@ -1135,8 +1135,8 @@ def sample_mmmu_requests(
                 retry_delay *= 2
             else:
                 raise ValueError(
-                    f"Failed to load MMMU dataset after {max_retries} attempts: {e}"
-                )
+                    f"Failed to load MMMU dataset after {max_retries} attempts"
+                ) from e
 
     # Sample from the dataset
     if len(mmmu_dataset) > num_requests:
