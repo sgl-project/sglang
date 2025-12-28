@@ -610,6 +610,13 @@ impl Worker for BasicWorker {
             if !self.is_healthy()
                 && successes >= self.metadata.health_config.success_threshold as usize
             {
+                tracing::info!(
+                    worker_url = %self.metadata.url,
+                    worker_type = %self.metadata.worker_type,
+                    connection_mode = %self.metadata.connection_mode,
+                    "Worker became healthy after {} consecutive successful health checks",
+                    successes
+                );
                 self.set_healthy(true);
                 self.consecutive_successes.store(0, Ordering::Release);
             }
@@ -624,6 +631,13 @@ impl Worker for BasicWorker {
             if self.is_healthy()
                 && failures >= self.metadata.health_config.failure_threshold as usize
             {
+                tracing::warn!(
+                    worker_url = %self.metadata.url,
+                    worker_type = %self.metadata.worker_type,
+                    connection_mode = %self.metadata.connection_mode,
+                    "Worker became unhealthy after {} consecutive failed health checks",
+                    failures
+                );
                 self.set_healthy(false);
                 self.consecutive_failures.store(0, Ordering::Release);
             }
