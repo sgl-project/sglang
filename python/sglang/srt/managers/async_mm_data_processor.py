@@ -12,8 +12,10 @@ class AsyncMMDataProcessor:
     Async wrapper for a multimodal processor.
 
     Behavior:
-      - If the underlying processor exposes `process_mm_data_async`, call/await it directly.
-      - Otherwise, fall back to running a synchronous `process_mm_data` in a thread pool.
+      - Always run processing in a thread pool via run_in_executor to avoid blocking
+        the event loop. This is necessary because even `process_mm_data_async` methods
+        typically contain synchronous compute-bound code (e.g., load_mm_data with .result()
+        calls, process_and_combine_mm_data) without real await points.
       - Optionally guard per-call concurrency via an asyncio.Semaphore.
       - Optionally enforce per-call timeout via asyncio.wait_for.
     """
@@ -42,13 +44,14 @@ class AsyncMMDataProcessor:
             asyncio.Semaphore(max_concurrent_calls) if max_concurrent_calls else None
         )
 
-        # Detect async path; if missing, prepare a fallback executor for sync path
+        # Detect async path for choosing the right method to call
         self._proc_async = getattr(mm_processor, "process_mm_data_async", None)
         self.is_async = asyncio.iscoroutinefunction(self._proc_async)
-        self.fallback_exec: Optional[ThreadPoolExecutor] = (
-            ThreadPoolExecutor(max_workers=max_concurrent_calls)
-            if not self.is_async
-            else None
+
+        # Always create thread pool to ensure we don't block the event loop.
+        # Even "async" methods often contain sync blocking code internally.
+        self.executor: ThreadPoolExecutor = ThreadPoolExecutor(
+            max_workers=max_concurrent_calls or 4
         )
 
     async def process(
@@ -65,15 +68,25 @@ class AsyncMMDataProcessor:
         """
 
         async def _invoke() -> Dict[str, Any]:
+            loop = asyncio.get_running_loop()
+
             if self.is_async:
-                # Native async implementation
-                return await self._proc_async(
-                    image_data=image_data,
-                    audio_data=audio_data,
-                    input_text=input_text_or_ids,
-                    request_obj=request_obj,
-                    **kwargs,
+                # Even though process_mm_data_async is an async method, it typically
+                # contains synchronous blocking code (e.g., load_mm_data calls .result()
+                # on futures, process_and_combine_mm_data is CPU-bound). Running it
+                # directly would block the event loop. So we run it in a thread pool
+                # using asyncio.run() to execute the coroutine in that thread.
+                fn = partial(
+                    asyncio.run,
+                    self._proc_async(
+                        image_data=image_data,
+                        audio_data=audio_data,
+                        input_text=input_text_or_ids,
+                        request_obj=request_obj,
+                        **kwargs,
+                    ),
                 )
+                return await loop.run_in_executor(self.executor, fn)
 
             # Synchronous fallback
             sync_fn = getattr(self.mm_processor, "process_mm_data", None)
@@ -81,7 +94,6 @@ class AsyncMMDataProcessor:
                 raise RuntimeError(
                     "mm_processor has neither 'process_mm_data_async' nor 'process_mm_data'."
                 )
-            loop = asyncio.get_running_loop()
             fn = partial(
                 sync_fn,
                 image_data=image_data,
@@ -90,7 +102,7 @@ class AsyncMMDataProcessor:
                 request_obj=request_obj,
                 **kwargs,
             )
-            return await loop.run_in_executor(self.fallback_exec, fn)
+            return await loop.run_in_executor(self.executor, fn)
 
         # Apply optional concurrency guard
         if self.semaphore is not None:
@@ -107,8 +119,8 @@ class AsyncMMDataProcessor:
     def shutdown(self) -> None:
         """Gracefully shutdown resources owned by this wrapper."""
         try:
-            if self.fallback_exec:
-                self.fallback_exec.shutdown(wait=False)
+            if self.executor:
+                self.executor.shutdown(wait=False)
         except Exception:
             logger.exception(
                 "Error while shutting down fallback executor in AsyncMMDataProcessor"
