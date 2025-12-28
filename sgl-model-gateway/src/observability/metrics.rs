@@ -442,12 +442,13 @@ impl Metrics {
         .record(duration.as_secs_f64());
     }
 
-    /// Set the count of in-flight requests for a given age bucket.
+    /// Set the cumulative count of in-flight requests for a given age bucket.
+    /// Uses `le` label to match Prometheus histogram convention.
     /// Called periodically by the InFlightRequestTracker sampler.
-    pub fn set_inflight_request_count(age_bucket: &'static str, count: usize) {
+    pub fn set_inflight_request_count(le: &'static str, count: usize) {
         gauge!(
             "smg_http_inflight_request_count",
-            "age_bucket" => age_bucket
+            "le" => le
         )
         .set(count as f64);
     }
