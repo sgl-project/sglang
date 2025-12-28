@@ -9,10 +9,16 @@ from typing import Any
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from sgl_kernel import silu_and_mul
 
 # TODO (will): remove this dependency
 from sglang.multimodal_gen.runtime.layers.custom_op import CustomOp
+from sglang.multimodal_gen.runtime.platforms import current_platform
+
+if not current_platform.is_npu():
+    from sgl_kernel import silu_and_mul
+
+if current_platform.is_npu():
+    import torch_npu
 
 
 @CustomOp.register("silu_and_mul")
@@ -40,6 +46,10 @@ class SiluAndMul(CustomOp):
         """PyTorch-native implementation equivalent to forward()."""
         d = x.shape[-1] // 2
         return F.silu(x[..., :d]) * x[..., d:]
+
+    def forward_npu(self, x: torch.Tensor) -> torch.Tensor:
+        out = torch_npu.npu_swiglu(x)
+        return out
 
 
 @CustomOp.register("gelu_and_mul")

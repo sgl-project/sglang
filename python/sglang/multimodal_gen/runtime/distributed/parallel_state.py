@@ -244,7 +244,11 @@ def init_distributed_environment(
         )
 
         # For MPS, don't pass device_id as it doesn't support device indices
-        extra_args = {} if current_platform.is_mps() else dict(device_id=device_id)
+        extra_args = (
+            {}
+            if current_platform.is_mps() or current_platform.is_npu()
+            else dict(device_id=device_id)
+        )
         torch.distributed.init_process_group(
             backend=backend,
             init_method=distributed_init_method,
@@ -600,6 +604,7 @@ def maybe_init_distributed_environment_and_model_parallel(
         local_rank=local_rank,
         distributed_init_method=distributed_init_method,
         device_id=device,
+        backend=current_platform.get_torch_distributed_backend_str(),
     )
     initialize_model_parallel(
         data_parallel_size=dp_size,
