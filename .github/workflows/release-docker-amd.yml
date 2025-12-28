@@ -13,7 +13,8 @@ jobs:
   publish:
     # TODO: Change back to 'sgl-project/sglang' before merging to main
     if: github.repository == 'Kangyan-Zhou/sglang'
-    runs-on: amd-docker-scale
+    # TODO: Change back to 'amd-docker-scale' before merging to main
+    runs-on: ubuntu-latest
     environment: 'prod'
     strategy:
       matrix:

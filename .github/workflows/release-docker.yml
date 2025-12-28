@@ -31,7 +31,8 @@ jobs:
           - cuda_version: "12.9.1"
             build_type: "all"
             grace_blackwell: 0
-    runs-on: x64-docker-build-node
+    # TODO: Change back to 'x64-docker-build-node' before merging to main
+    runs-on: ubuntu-latest
     steps:
       - name: Delete huge unnecessary tools folder
         run: rm -rf /opt/hostedtoolcache
@@ -148,7 +149,8 @@ jobs:
           - cuda_version: "12.9.1"
             build_type: "all"
             grace_blackwell: 1
-    runs-on: arm-docker-build-node
+    # TODO: Change back to 'arm-docker-build-node' before merging to main
+    runs-on: ubuntu-latest
     steps:
       - name: Delete huge unnecessary tools folder
         run: rm -rf /opt/hostedtoolcache
