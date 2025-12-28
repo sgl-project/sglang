@@ -1757,9 +1757,7 @@ class MRotaryEmbedding(RotaryEmbedding):
         else:
             s = input_ids.shape[1]
             position_ids = torch.arange(s)
-            position_ids = (
-                position_ids.unsqueeze(0).expand(3, -1).to(input_ids.device)
-            )
+            position_ids = position_ids.unsqueeze(0).expand(3, -1).to(input_ids.device)
             max_position_ids = position_ids.max(0, keepdim=False)[0].max(
                 -1, keepdim=True
             )[0]
@@ -2054,9 +2052,7 @@ class MRotaryEmbedding(RotaryEmbedding):
         else:
             s = input_ids.shape[1]
             position_ids = torch.arange(s)
-            position_ids = (
-                position_ids.unsqueeze(0).expand(3, -1).to(input_ids.device)
-            )
+            position_ids = position_ids.unsqueeze(0).expand(3, -1).to(input_ids.device)
             max_position_ids = position_ids.max(0, keepdim=False)[0].max(
                 -1, keepdim=True
             )[0]
