@@ -53,29 +53,32 @@ impl InFlightRequestTracker {
         self.requests.is_empty()
     }
 
-    /// Samples all in-flight requests and records counts per age bucket.
+    /// Samples all in-flight requests and records cumulative counts per age bucket.
+    /// Uses histogram-style cumulative semantics: le="60" = count of requests with age <= 60s.
     fn sample_and_record(&self) {
         let now = Instant::now();
 
-        // Initialize bucket counts
-        let mut counts = [0usize; AGE_BUCKETS.len()];
+        // Initialize cumulative bucket counts (one extra for +Inf)
+        let mut cumulative_counts = [0usize; AGE_BUCKET_LABELS.len()];
+        let total_buckets = AGE_BUCKET_LABELS.len();
 
-        // Count requests in each bucket
+        // Count requests into cumulative buckets
         for entry in self.requests.iter() {
             let age_secs = now.duration_since(*entry.value()).as_secs();
-            let mut prev_bound = 0u64;
-            for (i, &(upper_bound, _)) in AGE_BUCKETS.iter().enumerate() {
-                if age_secs >= prev_bound && (upper_bound == u64::MAX || age_secs < upper_bound) {
-                    counts[i] += 1;
-                    break;
+
+            // Increment all buckets where age <= bound (cumulative)
+            for (i, &bound) in AGE_BUCKET_BOUNDS.iter().enumerate() {
+                if age_secs <= bound {
+                    cumulative_counts[i] += 1;
                 }
-                prev_bound = upper_bound;
             }
+            // Always increment +Inf bucket
+            cumulative_counts[total_buckets - 1] += 1;
         }
 
-        // Set gauge for each bucket
-        for (i, &(_, label)) in AGE_BUCKETS.iter().enumerate() {
-            Metrics::set_inflight_request_count(label, counts[i]);
+        // Set gauge for each bucket with le label
+        for (i, &label) in AGE_BUCKET_LABELS.iter().enumerate() {
+            Metrics::set_inflight_request_count(label, cumulative_counts[i]);
         }
     }
 
