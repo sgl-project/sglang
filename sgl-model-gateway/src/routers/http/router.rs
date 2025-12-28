@@ -178,6 +178,7 @@ impl Router {
             &available,
             &SelectWorkerInfo {
                 request_text: text,
+                tokens: None, // HTTP doesn't have tokens, use gRPC for PrefixHash
                 headers,
                 hash_ring,
             },

@@ -7,7 +7,7 @@ from __future__ import annotations
 import enum
 import random
 from functools import lru_cache
-from typing import TYPE_CHECKING, NamedTuple
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 import numpy as np
 import torch
@@ -216,6 +216,7 @@ class Platform:
         raise NotImplementedError
 
     @classmethod
+    @lru_cache(maxsize=1)
     def get_device_total_memory(cls, device_id: int = 0) -> int:
         """Get the total memory of a device in bytes."""
         raise NotImplementedError
@@ -304,6 +305,19 @@ class Platform:
     ) -> float:
         """
         Return the memory usage in bytes.
+        """
+        raise NotImplementedError
+
+    @classmethod
+    def get_available_gpu_memory(
+        cls,
+        device_id: int = 0,
+        distributed: bool = False,
+        empty_cache: bool = True,
+        cpu_group: Any = None,
+    ) -> float:
+        """
+        Return the available memory in GiB.
         """
         raise NotImplementedError
 

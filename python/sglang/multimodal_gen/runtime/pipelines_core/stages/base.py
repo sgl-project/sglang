@@ -191,31 +191,26 @@ class PipelineStage(ABC):
         """
         stage_name = self.__class__.__name__
         # Check if verification is enabled (simple approach for prototype)
-        enable_verification = getattr(server_args, "enable_stage_verification", False)
 
-        if enable_verification:
-            # Pre-execution input verification
-            try:
-                input_result = self.verify_input(batch, server_args)
-                self._run_verification(input_result, stage_name, "input")
-            except Exception as e:
-                logger.error("Input verification failed for %s: %s", stage_name, str(e))
-                raise
+        # Pre-execution input verification
+        try:
+            input_result = self.verify_input(batch, server_args)
+            self._run_verification(input_result, stage_name, "input")
+        except Exception as e:
+            logger.error("Input verification failed for %s: %s", stage_name, str(e))
+            raise
 
         # Execute the actual stage logic with unified profiling
         with StageProfiler(stage_name, logger=logger, timings=batch.timings):
             result = self.forward(batch, server_args)
 
-        if enable_verification:
-            # Post-execution output verification
-            try:
-                output_result = self.verify_output(result, server_args)
-                self._run_verification(output_result, stage_name, "output")
-            except Exception as e:
-                logger.error(
-                    "Output verification failed for %s: %s", stage_name, str(e)
-                )
-                raise
+        # Post-execution output verification
+        try:
+            output_result = self.verify_output(result, server_args)
+            self._run_verification(output_result, stage_name, "output")
+        except Exception as e:
+            logger.error("Output verification failed for %s: %s", stage_name, str(e))
+            raise
 
         return result
 
