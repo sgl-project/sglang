@@ -43,7 +43,7 @@ def torch_scaled_fp8_quant(tensor, inv_scale):
     "num_tokens,hidden_dim",
     list(itertools.product([128, 256, 512], [512, 2048, 4096])),
 )
-def test_per_tensor_quant_compare_implementations(
+def test_jit_per_tensor_quant_compare_implementations(
     num_tokens: int,
     hidden_dim: int,
 ):
