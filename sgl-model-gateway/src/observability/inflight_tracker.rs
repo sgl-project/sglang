@@ -1,8 +1,3 @@
-//! In-flight request tracking for age histogram metrics.
-//!
-//! Tracks all currently running HTTP requests and periodically samples their age
-//! (how long they've been running) to record in a Prometheus histogram.
-
 use std::{
     sync::{Arc, OnceLock},
     time::{Duration, Instant},
@@ -14,23 +9,15 @@ use tracing::debug;
 
 use super::metrics::Metrics;
 
-/// Global tracker instance, initialized once during metrics setup.
 static INFLIGHT_TRACKER: OnceLock<Arc<InFlightRequestTracker>> = OnceLock::new();
 
 /// Tracks in-flight HTTP requests and their start times.
-///
-/// Periodically samples all active requests to record their age in a histogram,
-/// providing visibility into request duration distribution while requests are still running.
 pub struct InFlightRequestTracker {
     /// Maps request_id -> request start time
     requests: DashMap<String, Instant>,
 }
 
 impl InFlightRequestTracker {
-    /// Creates a new tracker and starts the background sampling task.
-    ///
-    /// The sampler runs at the specified interval, recording the age of all
-    /// in-flight requests to the histogram metric.
     pub fn new(sample_interval: Duration) -> Arc<Self> {
         let tracker = Arc::new(Self {
             requests: DashMap::new(),
@@ -41,23 +28,23 @@ impl InFlightRequestTracker {
     }
 
     /// Registers a request as in-flight.
-    ///
-    /// Should be called when a request starts processing.
     pub fn register(&self, request_id: &str) {
         self.requests.insert(request_id.to_string(), Instant::now());
     }
 
     /// Deregisters a request when it completes.
-    ///
-    /// Should be called when a request finishes (success or error).
     pub fn deregister(&self, request_id: &str) {
         self.requests.remove(request_id);
     }
 
-    /// Returns the current number of in-flight requests.
     #[cfg(test)]
     pub fn len(&self) -> usize {
         self.requests.len()
+    }
+
+    #[cfg(test)]
+    pub fn is_empty(&self) -> bool {
+        self.requests.is_empty()
     }
 
     /// Samples all in-flight requests and records their ages to the histogram.
