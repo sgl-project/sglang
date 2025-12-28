@@ -343,6 +343,19 @@ class Scheduler(
 
         # Init the grammar backend for constrained generation
         self.init_grammar_backend()
+        
+        # prefill batch interval, only for null disaggregation mode
+        self.prefill_interval = -1
+        self.consecutive_decode_steps = 0
+        if self.server_args.disaggregation_mode == "null":
+            self.prefill_interval = envs.SGLANG_PREFILL_INTERVAL.get()
+            if self.prefill_interval > 10000:
+                logger.warning(f"{self.prefill_interval=} is too large, setting to -1")
+                self.prefill_interval = -1
+            elif self.prefill_interval <= 0:
+                logger.info("Prefill interval control is disabled")
+            else:
+                logger.info(f"Prefill interval: {self.prefill_interval}")
 
         # Init schedule policy and new token estimation
         self.init_schedule_policy()
@@ -1820,6 +1833,15 @@ class Scheduler(
                     # Merge running_batch with prefill batch
                     self.running_batch.merge_batch(self.last_batch)
 
+        if (
+            self.prefill_interval > 0
+            and not self.running_batch.is_empty()
+            and self.consecutive_decode_steps < self.prefill_interval
+        ):
+            self.running_batch.batch_is_full = True
+        else:
+            self.running_batch.batch_is_full = False
+
         new_batch = self.get_new_batch_prefill()
 
         need_mlp_sync = self.require_mlp_sync
@@ -1832,11 +1854,17 @@ class Scheduler(
             need_mlp_sync = new_batch is None
 
         if new_batch is not None:
+            # Prefill batch scheduled: reset the decode iteration counter
+            self.consecutive_decode_steps = 0
             # Run prefill first if possible
             ret = new_batch
         else:
             # Run decode
             if not self.running_batch.is_empty():
+                # Increment decode iteration counter for prefill interval tracking
+                if self.prefill_interval > 0:
+                    self.consecutive_decode_steps += 1
+
                 self.running_batch = self.update_running_batch(self.running_batch)
                 ret = self.running_batch if not self.running_batch.is_empty() else None
             else:
