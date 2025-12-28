@@ -87,6 +87,7 @@ SGLang supports various environment variables that can be used to configure its 
 | `SGLANG_FLASHINFER_FP4_GEMM_BACKEND` | Select backend for `mm_fp4` on Blackwell GPUS | `` |
 | `SGLANG_NVFP4_CKPT_FP8_GEMM_IN_ATTN` | Quantize q_b_proj from BF16 to FP8 when launching DeepSeek NVFP4 checkpoint | `false` |
 | `SGLANG_MOE_NVFP4_DISPATCH` | Use nvfp4 for moe dispatch (on flashinfer_cutlass or flashinfer_cutedsl moe runner backend) | `"false"` |
+| `SGLANG_NVFP4_CKPT_FP8_NEXTN_MOE` | Quantize moe of nextn layer from BF16 to FP8 when launching DeepSeek NVFP4 checkpoint | `false` |
 | `SGLANG_ENABLE_FLASHINFER_FP8_GEMM` (deprecated) | Use flashinfer kernels when running blockwise fp8 GEMM on Blackwell GPUs. **DEPRECATED**: Please use `--fp8-gemm-backend=flashinfer_trtllm` instead. | `false` |
 | `SGLANG_SUPPORT_CUTLASS_BLOCK_FP8` (deprecated) | Use Cutlass kernels when running blockwise fp8 GEMM on Hopper or Blackwell GPUs. **DEPRECATED**: Please use `--fp8-gemm-backend=cutlass` instead. | `false` |
 
