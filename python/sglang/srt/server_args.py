@@ -1540,7 +1540,7 @@ class ServerArgs:
                 else:
                     self.attention_backend = "triton"
 
-            logger.warning(
+            logger.info(
                 f"Attention backend not specified. Use {self.attention_backend} backend by default."
             )
 
@@ -1981,19 +1981,20 @@ class ServerArgs:
             ):
                 self.disable_overlap_schedule = False
                 logger.warning(
-                    "Beta spec is enabled for eagle/eagle3 speculative decoding and overlap schedule is turned on."
+                    "Spec v2 is enabled for eagle/eagle3 speculative decoding and overlap schedule is turned on."
                 )
                 if (
                     self.speculative_eagle_topk is not None
                     and self.speculative_eagle_topk > 1
                 ):
                     raise ValueError(
-                        "Beta spec currently only supports topk = 1 for speculative decoding."
+                        "Spec v2 currently only supports topk = 1 for speculative decoding."
                     )
             else:
                 self.disable_overlap_schedule = True
                 logger.warning(
-                    "Overlap scheduler is disabled when beta spec is off or using unsupported speculative algorithm."
+                    "Overlap scheduler is disabled when spec v2 is off or using unsupported speculative algorithm. "
+                    "You can set env SGLANG_ENABLE_SPEC_V2=True to enable the experimental overlap scheduler. "
                 )
 
             if self.enable_mixed_chunk:

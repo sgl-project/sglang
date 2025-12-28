@@ -185,26 +185,10 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         self.preferred_sampling_params = server_args.preferred_sampling_params
         self.crash_dump_folder = server_args.crash_dump_folder
         self.enable_trace = server_args.enable_trace
-
-        # Read model args
-        self.model_path = server_args.model_path
-        self.served_model_name = server_args.served_model_name
-        self.model_config = ModelConfig.from_server_args(server_args)
-        self.is_generation = self.model_config.is_generation
-        self.is_image_gen = self.model_config.is_image_gen
-        self.context_len = self.model_config.context_len
-        self.image_token_id = self.model_config.image_token_id
-        self.max_req_input_len = None  # Will be set later in engine.py
-        speculative_algorithm = SpeculativeAlgorithm.from_string(
-            server_args.speculative_algorithm
-        )
-        self.reserve_input_token_num = (
-            0
-            if speculative_algorithm.is_none()
-            else server_args.speculative_num_draft_tokens
-        )
-
         set_global_server_args_for_tokenizer(server_args)
+
+        # Init model config
+        self.init_model_config()
 
         # Initialize tokenizer and multimodalprocessor
         self.init_tokenizer_and_processor()
@@ -232,6 +216,27 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
 
         # Init request dispatcher
         self.init_request_dispatcher()
+
+    def init_model_config(self):
+        server_args = self.server_args
+
+        # Read model args
+        self.model_path = server_args.model_path
+        self.served_model_name = server_args.served_model_name
+        self.model_config = ModelConfig.from_server_args(server_args)
+        self.is_generation = self.model_config.is_generation
+        self.is_image_gen = self.model_config.is_image_gen
+        self.context_len = self.model_config.context_len
+        self.image_token_id = self.model_config.image_token_id
+        self.max_req_input_len = None  # Will be set later in engine.py
+        speculative_algorithm = SpeculativeAlgorithm.from_string(
+            server_args.speculative_algorithm
+        )
+        self.reserve_input_token_num = (
+            0
+            if speculative_algorithm.is_none()
+            else server_args.speculative_num_draft_tokens
+        )
 
     def init_tokenizer_and_processor(self):
         server_args = self.server_args
