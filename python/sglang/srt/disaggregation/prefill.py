@@ -325,13 +325,10 @@ class SchedulerDisaggregationPrefillMixin:
         self.process_prefill_chunk()
 
         batch = self.get_new_batch_prefill()
-        if self.require_mlp_sync:
-            batch = self.prepare_mlp_sync_batch(batch)
+        batch = self.maybe_prepare_mlp_sync_batch_and_log_stats(batch)
 
         if batch:
             trace_event_batch("schedule", batch.reqs)
-
-        self.log_prefill_stats_late(batch)
 
         return batch
 
@@ -523,7 +520,6 @@ class SchedulerDisaggregationPrefillMixin:
                 )
 
         self.maybe_send_health_check_signal()
-        self.log_prefill_stats_late(batch)
 
     def process_disagg_prefill_inflight_queue(
         self: Scheduler, rids_to_check: Optional[List[str]] = None
