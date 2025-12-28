@@ -186,6 +186,7 @@ python3 -m sglang.launch_server --model-path meta-llama/Llama-3.1-8B-Instruct --
 #### PD Separation Scene
 Launch prefill server
 ```shell
+# PIP: recommended to config first Prefill Server IP, all server need to be config the same ip, PORT: one free port
 export ASCEND_MF_STORE_URL="tcp://PIP:PORT"
 # if you use rdma, add this parameter
 export ASCEND_MF_TRANSFER_PROTOCOL="device_rdma"
@@ -203,6 +204,7 @@ python3 -m sglang.launch_server \
 ```
 Launch Decode server
 ```shell
+# PIP: recommended to config first Prefill Server IP, all server need to be config the same ip, PORT: one free port
 export ASCEND_MF_STORE_URL="tcp://PIP:PORT"
 # if you use rdma, add this parameter
 export ASCEND_MF_TRANSFER_PROTOCOL="device_rdma"
