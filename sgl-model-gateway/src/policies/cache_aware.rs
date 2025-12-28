@@ -82,6 +82,15 @@ pub struct CacheAwarePolicy {
     _eviction_task: Option<PeriodicTask>,
 }
 
+impl std::fmt::Debug for CacheAwarePolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CacheAwarePolicy")
+            .field("config", &self.config)
+            .field("trees", &self.trees)
+            .finish_non_exhaustive()
+    }
+}
+
 impl CacheAwarePolicy {
     pub fn new() -> Self {
         Self::with_config(CacheAwareConfig::default())
