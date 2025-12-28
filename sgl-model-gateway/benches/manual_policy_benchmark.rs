@@ -22,11 +22,7 @@ fn create_workers(count: usize) -> Vec<Arc<dyn Worker>> {
         .collect()
 }
 
-fn select_with_key(
-    policy: &ManualPolicy,
-    workers: &[Arc<dyn Worker>],
-    key: &str,
-) -> Option<usize> {
+fn select_with_key(policy: &ManualPolicy, workers: &[Arc<dyn Worker>], key: &str) -> Option<usize> {
     let mut headers = http::HeaderMap::new();
     headers.insert("x-smg-routing-key", key.parse().unwrap());
     let info = SelectWorkerInfo {
