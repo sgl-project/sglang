@@ -1113,7 +1113,7 @@ def sample_mmmu_requests(
     print("Loading MMMU dataset from HuggingFace...")
 
     max_retries = 3
-    retry_delay = 5
+    retry_delay = 3
     for attempt in range(max_retries):
         try:
             print(
