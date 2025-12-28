@@ -99,8 +99,8 @@ pip install -e python[srt_npu]
 
 ### Method 2: Using docker
 #### Obtain Image
-You can download the Sglang image or build an image based on Dockerfile to obtain the Ascend NPU image.
-1. Download Sglang image
+You can download the SGLang image or build an image based on Dockerfile to obtain the Ascend NPU image.
+1. Download SGLang image
 ```angular2html
 # You can choose between dockerhub and quay.io
 dockerhub: docker.io/lmsysorg/sglang:$tag
@@ -138,8 +138,7 @@ alias drun='docker run -it --rm --privileged --network=host --ipc=host --shm-siz
     --volume /etc/ascend_install.info:/etc/ascend_install.info \
     --volume /var/queue_schedule:/var/queue_schedule --volume ~/.cache/:/root/.cache/'
 
-# Add HF_TOKEN env for download model by sglang
-drun --env "HF_TOKEN=<secret>" \
+# Add HF_TOKEN env for# Add HF_TOKEN env for download model by SGLang<secret>" \
     <image_name> \
     python3 -m sglang.launch_server --model-path meta-llama/Llama-3.1-8B-Instruct --attention-backend ascend --host 0.0.0.0 --port 30000
 ```
