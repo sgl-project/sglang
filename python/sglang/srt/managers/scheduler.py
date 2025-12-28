@@ -160,6 +160,7 @@ from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
 from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
 from sglang.srt.parser.reasoning_parser import ReasoningParser
+from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import PortArgs, ServerArgs, get_global_server_args
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.tracing.trace import (
@@ -1562,24 +1563,25 @@ class Scheduler(
                         error_msg = "Grammar constraints require a grammar backend; please launch without --grammar-backend none."
                         decision = ("abort", error_msg, None, False)
                     else:
-                        key = self._choose_grammar_key(req.sampling_params)
-
-                        value, cache_hit = self.grammar_backend.get_cached_or_future_value(
-                            key, req.require_reasoning
+                        key = self.choose_grammar_key(req.sampling_params)
+                        value, cache_hit = (
+                            self.grammar_backend.get_cached_or_future_value(
+                                key, req.require_reasoning
+                            )
                         )
                         req.grammar = value
-
                         if not cache_hit:
                             req.grammar_key = key
                             add_to_grammar_queue = True
-                            decision = ("ok_queue", None, key)
+                            decision = ("ok_queue", None, key, False)
+                        elif value is INVALID_GRAMMAR_OBJ:
+                            error_msg = (
+                                f"Invalid grammar request with cache hit: {key=}"
+                            )
+                            req.set_finish_with_abort(error_msg)
+                            decision = ("abort", error_msg, key, True)
                         else:
-                            if value is INVALID_GRAMMAR_OBJ:
-                                error_msg = f"Invalid grammar request with cache hit: {key=}"
-                                req.set_finish_with_abort(error_msg)
-                                decision = ("abort", error_msg, key, False)
-                            else:
-                                decision = ("ok_cache", None, key)
+                            decision = ("ok_cache", None, key, True)
 
                 # Broadcast entry rank decision
                 decision = broadcast_pyobj(
@@ -1591,19 +1593,15 @@ class Scheduler(
 
                 # Non-entry ranks apply the decision without compiling.
                 if not self.is_entry_rank:
-                    state = decision[0]
+                    state, error_msg, grammar_key, _ = decision
                     if state == "abort":
-                        _, error_msg, _, _ = decision
                         req.set_finish_with_abort(error_msg)
                     elif state == "ok_queue":
-                        _, _, grammar_key = decision
                         req.grammar_key = grammar_key
                         add_to_grammar_queue = True
                         req.grammar = None  # rank 0 owns compilation
                     elif state == "ok_cache":
-                        _, _, grammar_key = decision
                         req.grammar_key = grammar_key
-                        # Use sentinel to keep control flow; no local compilation.
                         req.grammar = INVALID_GRAMMAR_OBJ
 
             else:
@@ -1612,7 +1610,7 @@ class Scheduler(
                     error_msg = "Grammar constraints require a grammar backend; please launch without --grammar-backend none."
                     req.set_finish_with_abort(error_msg)
                 else:
-                    key = self._choose_grammar_key(req.sampling_params)
+                    key = self.choose_grammar_key(req.sampling_params)
 
                     value, cache_hit = self.grammar_backend.get_cached_or_future_value(
                         key, req.require_reasoning
@@ -1622,33 +1620,9 @@ class Scheduler(
                     if not cache_hit:
                         req.grammar_key = key
                         add_to_grammar_queue = True
-                    elif value is INVALID_GRAMMAR_OBJ:  # We hit a cached invalid grammar.
-                        error_msg = f"Invalid grammar request with cache hit: {key=}"
-                        req.set_finish_with_abort(error_msg)
-
-        if add_to_grammar_queue:
-            self.grammar_queue.append(req)
-        else:
-            self._add_request_to_queue(req)
-                if req.sampling_params.json_schema is not None:
-                    key = ("json", req.sampling_params.json_schema)
-                elif req.sampling_params.regex is not None:
-                    key = ("regex", req.sampling_params.regex)
-                elif req.sampling_params.ebnf is not None:
-                    key = ("ebnf", req.sampling_params.ebnf)
-                elif req.sampling_params.structural_tag:
-                    key = ("structural_tag", req.sampling_params.structural_tag)
-
-                value, cache_hit = self.grammar_backend.get_cached_or_future_value(
-                    key, req.require_reasoning
-                )
-                req.grammar = value
-
-                if not cache_hit:
-                    req.grammar_key = key
-                    add_to_grammar_queue = True
-                else:
-                    if value is INVALID_GRAMMAR_OBJ:  # We hit a cached invalid grammar.
+                    elif (
+                        value is INVALID_GRAMMAR_OBJ
+                    ):  # We hit a cached invalid grammar.
                         error_msg = f"Invalid grammar request with cache hit: {key=}"
                         req.set_finish_with_abort(error_msg)
 
@@ -2474,7 +2448,7 @@ class Scheduler(
         success = self.flush_cache()
         return FlushCacheReqOutput(success=success)
 
-    def _choose_grammar_key(self, sampling_params: SamplingParams):
+    def choose_grammar_key(self, sampling_params: SamplingParams):
         if sampling_params.json_schema is not None:
             return ("json", sampling_params.json_schema)
         if sampling_params.regex is not None:
