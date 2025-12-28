@@ -190,6 +190,10 @@ pub fn init_metrics() {
         "smg_worker_errors_total",
         "Worker-level errors by worker_type, connection_mode, error_type"
     );
+    describe_gauge!(
+        "smg_manual_policy_cache_entries",
+        "Number of routing entries in manual policy cache"
+    );
 
     // Layer 3: Worker resilience metrics (circuit breaker)
     describe_gauge!(
@@ -808,6 +812,11 @@ impl Metrics {
             "branch" => branch
         )
         .increment(1);
+    }
+
+    /// Set manual policy cache entries count
+    pub fn set_manual_policy_cache_entries(count: usize) {
+        gauge!("smg_manual_policy_cache_entries").set(count as f64);
     }
 
     /// Record consistent hashing policy execution branch for routing decisions
