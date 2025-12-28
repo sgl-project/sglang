@@ -405,7 +405,7 @@ class SGLangTraceReqContext:
 
         tracer = threads_info[self.pid].tracer
         external_trace_context = _trace_context_propagator.extract(
-            external_trace_header
+            external_trace_header or {}
         )
 
         # Drop the worker_id added by MultiTokenizer
