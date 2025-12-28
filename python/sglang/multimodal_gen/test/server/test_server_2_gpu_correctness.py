@@ -8,7 +8,6 @@ import pytest
 
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.test.server.test_server_common import (  # noqa: F401
-    DiffusionServerBase,
     diffusion_server,
 )
 from sglang.multimodal_gen.test.server.test_server_correctness import (
