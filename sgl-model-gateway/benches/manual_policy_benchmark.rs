@@ -219,21 +219,10 @@ fn bench_cache_size_impact(c: &mut Criterion) {
 fn bench_comparison_baseline(c: &mut Criterion) {
     let mut group = c.benchmark_group("manual_policy/vs_baseline");
     let workers = create_workers(16);
-    let policy = ManualPolicy::new();
 
-    group.bench_function("baseline_random", |b| {
+    // Baseline: raw random selection without any policy overhead
+    group.bench_function("raw_random", |b| {
         b.iter(|| black_box(rand::random::<usize>() % workers.len()));
-    });
-
-    group.bench_function("manual_no_key", |b| {
-        let info = SelectWorkerInfo::default();
-        b.iter(|| black_box(policy.select_worker(&workers, &info)));
-    });
-
-    select_with_key(&policy, &workers, "cached-user"); // warmup
-
-    group.bench_function("manual_fast_path", |b| {
-        b.iter(|| black_box(select_with_key(&policy, &workers, "cached-user")));
     });
 
     group.finish();
