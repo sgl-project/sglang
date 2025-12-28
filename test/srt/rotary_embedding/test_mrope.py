@@ -68,7 +68,7 @@ MODELS_TO_TEST = [
 num_tokens_list = [11, 8192]
 
 
-@pytest.mark.skipif(not _is_cuda, reason="Skipping CUDA/ROCm only tests.")
+@pytest.mark.skipif(not (_is_cuda or _is_hip), reason="Skipping CUDA/ROCm only tests.")
 @pytest.mark.parametrize(
     "model_info, model_name",
     [
