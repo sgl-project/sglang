@@ -18,7 +18,7 @@ from concurrent.futures import ThreadPoolExecutor
 from functools import wraps
 from io import BytesIO
 from json import dumps
-from typing import Any, Callable, List, Optional, Tuple, Type, Union
+from typing import Any, Callable, Generator, List, Optional, Tuple, Type, Union
 
 import numpy as np
 import pybase64
@@ -32,7 +32,7 @@ from sglang.srt.environ import envs
 logger = logging.getLogger(__name__)
 
 
-def execute_once(func):
+def execute_once(func: Callable) -> Callable:
     has_run = None
 
     @wraps(func)
@@ -80,13 +80,13 @@ def convert_json_schema_to_str(json_schema: Union[dict, str, Type[BaseModel]]) -
     return schema_str
 
 
-def get_exception_traceback():
+def get_exception_traceback() -> str:
     etype, value, tb = sys.exc_info()
     err_str = "".join(traceback.format_exception(etype, value, tb))
     return err_str
 
 
-def is_same_type(values: list):
+def is_same_type(values: list) -> bool:
     """Return whether the elements in values are of the same type."""
     if len(values) <= 1:
         return True
@@ -95,7 +95,7 @@ def is_same_type(values: list):
         return all(isinstance(v, t) for v in values[1:])
 
 
-def read_jsonl(filename: str):
+def read_jsonl(filename: str) -> Generator[Any, None, None]:
     """Read a JSONL file."""
     with open(filename) as fin:
         for line in fin:
@@ -104,7 +104,7 @@ def read_jsonl(filename: str):
             yield json.loads(line)
 
 
-def dump_state_text(filename: str, states: list, mode: str = "w"):
+def dump_state_text(filename: str, states: list, mode: str = "w") -> None:
     """Dump program state in a text file."""
     from sglang.lang.interpreter import ProgramState
 
@@ -189,7 +189,7 @@ def encode_image_base64(image_path: Union[str, bytes]):
         return pybase64.b64encode(buffered.getvalue()).decode("utf-8")
 
 
-def encode_frame(frame):
+def encode_frame(frame: np.ndarray) -> bytes:
     import cv2  # pip install opencv-python-headless
     from PIL import Image
 
@@ -212,7 +212,7 @@ def encode_frame(frame):
     return frame_bytes
 
 
-def encode_video_base64(video_path: str, num_frames: int = 16):
+def encode_video_base64(video_path: str, num_frames: int = 16) -> str:
     import cv2  # pip install opencv-python-headless
 
     cap = cv2.VideoCapture(video_path)
@@ -374,7 +374,9 @@ def print_highlight(html_content: str):
 process_socket_map = weakref.WeakKeyDictionary()
 
 
-def reserve_port(host, start=30000, end=40000):
+def reserve_port(
+    host: str, start: int = 30000, end: int = 40000
+) -> Tuple[int, socket.socket]:
     """
     Reserve an available port by trying to bind a socket.
     Returns a tuple (port, lock_socket) where `lock_socket` is kept open to hold the lock.
@@ -395,7 +397,7 @@ def reserve_port(host, start=30000, end=40000):
     raise RuntimeError("No free port available.")
 
 
-def release_port(lock_socket):
+def release_port(lock_socket: socket.socket) -> None:
     """
     Release the reserved port by closing the lock socket.
     """
