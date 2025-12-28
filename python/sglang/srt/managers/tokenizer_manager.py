@@ -1452,19 +1452,17 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 "total_retractions": recv_obj.retraction_counts[i],
             }
 
-            self._add_metric_if_present(recv_obj, "reasoning_tokens", meta_info, i)
+            self._add_meta_item_if_present(recv_obj, "reasoning_tokens", meta_info, i)
 
             if self.enable_metrics:
-                self._add_metric_if_present(recv_obj, "queue_time", meta_info, i)
-                self._add_metric_if_present(
-                    recv_obj, "prefill_launch_delay", meta_info, i
-                )
-                self._add_metric_if_present(
-                    recv_obj, "prefill_launch_latency", meta_info, i
-                )
-                self._add_metric_if_present(
-                    recv_obj, "prefill_finished_ts", meta_info, i
-                )
+                metric_names = [
+                    "queue_time",
+                    "prefill_launch_delay",
+                    "prefill_launch_latency",
+                    "prefill_finished_ts",
+                ]
+                for metric_name in metric_names:
+                    self._add_meta_item_if_present(recv_obj, metric_name, meta_info, i)
 
             if getattr(state.obj, "return_logprob", False):
                 self.convert_logprob_style(
@@ -1799,7 +1797,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             completion_tokens = recv_obj.completion_tokens[i]
             meta_info["decode_throughput"] = completion_tokens / decode_time
 
-    def _add_metric_if_present(
+    def _add_meta_item_if_present(
         self,
         recv_obj: Any,
         attr_name: str,
