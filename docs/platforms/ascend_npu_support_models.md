@@ -81,4 +81,3 @@ various models based on your business requirements.
 | Model Family  | Example Models          |              A2 Supported              |              A3 Supported              |
 |---------------|-------------------------|:--------------------------------------:|:--------------------------------------:|
 | BGE-Reranker	 | BAAI/bge-reranker-v2-m3 | **<span style="color: red;">×</span>** | **<span style="color: red;">×</span>** |
-
