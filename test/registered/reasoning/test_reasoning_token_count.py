@@ -7,6 +7,11 @@ from types import SimpleNamespace
 
 import torch
 
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=1, suite="default")
+
+
 # Torch on macOS may expose torch.mps without a Stream type; make a stub to satisfy type hints.
 if hasattr(torch, "mps") and not hasattr(torch.mps, "Stream"):
 
