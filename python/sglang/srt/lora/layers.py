@@ -640,6 +640,7 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         Compute LoRA delta using per-expert LoRA weights and add to base_output in-place.
 
         Dispatch tokens to experts and compute per-expert deltas.
+        Uses intermediate caches similar to base MoE implementation for memory efficiency.
         """
         from sglang.srt.lora.moe_dispatch import moe_dispatch
         from sglang.srt.lora.triton_ops.per_expert_lora_moe import (
@@ -659,6 +660,7 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         lora_indices = self.lora_backend.forward_batch.token_lora_indices
 
         num_experts = self.base_layer.num_experts
+        num_tokens, hidden_size = hidden_states.shape
 
         # Dispatch tokens to experts
         token_ids, expert_ids, sorted_topk_weights, lora_ids = moe_dispatch(
@@ -667,8 +669,22 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
             lora_indices=lora_indices,
         )
 
+        # Get intermediate dimension from LoRA B weights (gate_up output dim)
+        # gate_up_lora_b_weights shape: [num_loras, num_experts, intermediate_dim, max_rank]
+        _, _, intermediate_size, _ = self.gate_up_lora_b_weights.shape
+
+        # Allocate intermediate cache for gate_up output (similar to intermediate_cache1 in base MoE)
+        # This stores the LoRA delta in intermediate space before down projection
+        num_dispatched = token_ids.shape[0]
+        lora_intermediate_cache = torch.empty(
+            (num_tokens, intermediate_size),
+            dtype=torch.float32,  # Use float32 for LoRA accumulation like base implementation
+            device=hidden_states.device,
+        )
+
         # Apply gate_up_proj LoRA: hidden_states -> intermediate space
-        gate_up_output = per_expert_lora_forward(
+        # Store result in intermediate cache (no base_output means allocate new tensor)
+        per_expert_lora_forward(
             hidden_states=hidden_states,
             lora_a_weights=self.gate_up_lora_a_weights,
             lora_b_weights=self.gate_up_lora_b_weights,
@@ -678,20 +694,9 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
             lora_ranks=lora_ranks,
             lora_scalings=scalings,
             num_experts=num_experts,
-            base_output=None,
+            base_output=lora_intermediate_cache,  # Store in our intermediate cache
             is_down_proj=False,
         )
-
-        # DEBUG: Check for NaNs immediately after gate_up LoRA
-        if torch.isnan(gate_up_output).any():
-            print(f"NaNs detected in gate_up_output! Shape: {gate_up_output.shape}")
-            print(
-                f"gate_up_output min/max: {gate_up_output.min()}, {gate_up_output.max()}"
-            )
-            print(f"Input hidden_states shape: {hidden_states.shape}")
-            import pdb
-
-            pdb.set_trace()
 
         # Apply down_proj LoRA: intermediate space -> hidden space, added to base_output
         if (
@@ -699,7 +704,7 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
             and self.down_lora_b_weights is not None
         ):
             per_expert_lora_forward(
-                hidden_states=gate_up_output,
+                hidden_states=lora_intermediate_cache,  # Use intermediate cache as input
                 lora_a_weights=self.down_lora_a_weights,
                 lora_b_weights=self.down_lora_b_weights,
                 token_ids=token_ids,
@@ -708,18 +713,9 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
                 lora_ranks=lora_ranks,
                 lora_scalings=scalings,
                 num_experts=num_experts,
-                base_output=base_output,
+                base_output=base_output,  # Add directly to base_output in-place
                 is_down_proj=True,
             )
-
-            # DEBUG: Check for NaNs after down_proj LoRA
-            if torch.isnan(base_output).any():
-                print(f"NaNs detected in base_output after down_proj LoRA!")
-                print(f"base_output min/max: {base_output.min()}, {base_output.max()}")
-                print(f"gate_up_output shape: {gate_up_output.shape}")
-                import pdb
-
-                pdb.set_trace()
 
     def slice_lora_a_weights(self, A: torch.Tensor, tp_rank: int):
         # For MoE layers, tensor parallelism is typically not used

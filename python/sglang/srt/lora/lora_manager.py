@@ -347,27 +347,6 @@ class LoRAManager:
                         lora_type=LoRAType.LORA_B,
                     )
 
-                    # DEBUG: Check LoRA weights for NaNs
-                    if gate_up_a is not None and torch.isnan(gate_up_a).any():
-                        print(f"NaNs in gate_up LoRA_A weights!")
-                        import pdb
-
-                        pdb.set_trace()
-                    if gate_up_b is not None and torch.isnan(gate_up_b).any():
-                        print(f"NaNs in gate_up LoRA_B weights!")
-                        import pdb
-
-                        pdb.set_trace()
-                    if down_a is not None and torch.isnan(down_a).any():
-                        print(f"NaNs in down LoRA_A weights!")
-                        import pdb
-
-                        pdb.set_trace()
-                    if down_b is not None and torch.isnan(down_b).any():
-                        print(f"NaNs in down LoRA_B weights!")
-                        import pdb
-
-                        pdb.set_trace()
 
                     module.set_lora_info(
                         gate_up_lora_a_weights=gate_up_a,

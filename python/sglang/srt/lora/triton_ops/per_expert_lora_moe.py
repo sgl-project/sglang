@@ -237,22 +237,6 @@ def per_expert_lora_forward(
     Returns:
         output: [num_tokens, output_dim] - Base output + LoRA delta (in-place)
     """
-    # DEBUG: Check inputs for NaNs
-    if torch.isnan(hidden_states).any():
-        print(f"NaNs detected in hidden_states input! Shape: {hidden_states.shape}")
-        import pdb
-
-        pdb.set_trace()
-    if lora_a_weights is not None and torch.isnan(lora_a_weights).any():
-        print(f"NaNs detected in lora_a_weights!")
-        import pdb
-
-        pdb.set_trace()
-    if lora_b_weights is not None and torch.isnan(lora_b_weights).any():
-        print(f"NaNs detected in lora_b_weights!")
-        import pdb
-
-        pdb.set_trace()
 
     # Shapes
     num_tokens, input_dim = hidden_states.shape
@@ -328,14 +312,5 @@ def per_expert_lora_forward(
         # Block size (constexpr)
         BLOCK_SIZE=BLOCK_SIZE,
     )
-
-    # DEBUG: Check output for NaNs
-    if torch.isnan(output).any():
-        print(f"NaNs detected in per_expert_lora_forward output!")
-        print(f"Output shape: {output.shape}, is_down_proj: {is_down_proj}")
-        print(f"Input shape: {hidden_states.shape}, Output dim: {output_dim}")
-        import pdb
-
-        pdb.set_trace()
 
     return output
