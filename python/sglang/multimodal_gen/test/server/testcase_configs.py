@@ -47,15 +47,15 @@ class ToleranceConfig:
             actual_profile = "legacy/flat"
         else:
             tol_data = all_tolerances.get(
-                profile_name, all_tolerances.get("long_term", {})
+                profile_name, all_tolerances.get("pr_test", {})
             )
             actual_profile = (
-                profile_name if profile_name in all_tolerances else "long_term"
+                profile_name if profile_name in all_tolerances else "pr_test"
             )
 
         if not tol_data:
             raise ValueError(
-                f"No tolerance profile found for '{profile_name}' and no default 'long_term' profile exists."
+                f"No tolerance profile found for '{profile_name}' and no default 'pr_test' profile exists."
             )
 
         print(f"--- Performance Tolerance Profile: {actual_profile} ---")
@@ -107,8 +107,8 @@ class BaselineConfig:
         with path.open("r", encoding="utf-8") as fh:
             data = json.load(fh)
 
-        # Get tolerance profile, defaulting to 'long_term'
-        profile_name = "long_term"
+        # Get tolerance profile, defaulting to 'pr_test'
+        profile_name = "pr_test"
         tolerances = ToleranceConfig.load_profile(
             data.get("tolerances", {}), profile_name
         )
