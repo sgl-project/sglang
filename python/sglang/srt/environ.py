@@ -244,6 +244,7 @@ class Envs:
     # NPU
     SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT = EnvBool(False)
     SGLANG_NPU_USE_MULTI_STREAM = EnvBool(False)
+    SGLANG_NPU_USE_MLAPO = EnvBool(False)
 
     # Quantization
     SGLANG_INT4_WEIGHT = EnvBool(False)
