@@ -1119,7 +1119,6 @@ def sample_mmmu_requests(
             print(
                 f"Attempting to load MMMU Math dataset (attempt {attempt + 1}/{max_retries})..."
             )
-            # Use force_redownload if the first attempt fails, which often fixes split mismatch issues
             download_mode = "force_redownload" if attempt > 0 else None
             mmmu_dataset = load_dataset(
                 "MMMU/MMMU", "Math", split="test", download_mode=download_mode
