@@ -538,7 +538,7 @@ class DataParallelController:
 
     def event_loop(self):
         last_child_check_time = time.time()
-        child_check_interval = 5.0  # Check every 5 seconds
+        child_check_interval = 60.0  
 
         while True:
             while True:
