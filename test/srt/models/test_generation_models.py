@@ -45,6 +45,7 @@ class ModelCase:
     rouge_l_tolerance: float = 1
     skip_long_prompt: bool = False
     trust_remote_code: bool = False
+    attention_backend: str = None
 
 
 # Popular models that run on the CI
@@ -101,6 +102,13 @@ ALL_MODELS = [
         trust_remote_code=True,
         skip_long_prompt=True,
     ),
+    ModelCase(
+        "LiquidAI/LFM2-700M",
+        trust_remote_code=True,
+        skip_long_prompt=True,
+        attention_backend="triton",
+        prefill_tolerance=0.1
+    ),
 ]
 
 TORCH_DTYPES = [torch.float16]
@@ -140,6 +148,7 @@ class TestGenerationModels(CustomTestCase):
             torch_dtype=torch_dtype,
             model_type="generation",
             trust_remote_code=model_case.trust_remote_code,
+            attention_backend=model_case.attention_backend,
         ) as srt_runner:
             srt_outputs = srt_runner.forward(prompts, max_new_tokens=max_new_tokens)
 

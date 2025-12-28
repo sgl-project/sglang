@@ -64,6 +64,7 @@ class Lfm2Config(PretrainedConfig):
         conv_dim_out: int = 1536,
         conv_use_xavier_init: bool = True,
         full_attn_idxs: Optional[list[int]] = None,
+        layer_types: Optional[list[str]] = None,
         use_pos_enc: bool = True,
         rope_theta: float = 1000000.0,
         rope_scaling: Optional[dict] = None,
@@ -100,6 +101,7 @@ class Lfm2Config(PretrainedConfig):
         self.conv_use_xavier_init = conv_use_xavier_init
         
         self.full_attn_idxs = full_attn_idxs 
+        self._layer_types = layer_types
         self.use_pos_enc = use_pos_enc
         self.rope_theta = rope_theta
         self.rope_scaling = rope_scaling
@@ -118,11 +120,18 @@ class Lfm2Config(PretrainedConfig):
     @property
     def layer_types(self) -> list[str]:
         types = []
-        for i in range(self.num_hidden_layers):
-            if i in self.full_attn_idxs:
-                types.append("full_attention")
-            else:
-                types.append("short_conv")
+        if self._layer_types is not None:
+            for item in self._layer_types:
+                if item == "full_attention":
+                    types.append("full_attention")
+                else:
+                    types.append("short_conv")
+        else:
+            for i in range(self.num_hidden_layers):
+                if self.full_attn_idxs and i in self.full_attn_idxs:
+                    types.append("full_attention")
+                else:
+                    types.append("short_conv")
         return types
     
     @property
