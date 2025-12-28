@@ -1,13 +1,3 @@
-//! Benchmarks for ManualPolicy - sticky session routing based on routing key header
-//!
-//! Run with: cargo bench --bench manual_policy_benchmark
-//!
-//! Key performance aspects tested:
-//! - Fast path vs Slow path hit rates
-//! - DashMap concurrent read/write performance
-//! - Scalability across different worker counts
-//! - Concurrent access patterns
-
 use std::{sync::Arc, thread};
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
