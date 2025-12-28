@@ -34,10 +34,8 @@ def test_gsm8k(base_url: str):
         port=int(base_url.split(":")[-1]),
     )
     metrics = run_eval_few_shot_gsm8k(args)
-    server_info = requests.get(base_url + "/get_server_info")
-    avg_spec_accept_length = server_info.json()["internal_states"][0][
-        "avg_spec_accept_length"
-    ]
+    server_info = requests.get(base_url + "/server_info").json()
+    avg_spec_accept_length = server_info["internal_states"][0]["avg_spec_accept_length"]
 
     print(f"{metrics=}")
     print(f"{avg_spec_accept_length=}")
