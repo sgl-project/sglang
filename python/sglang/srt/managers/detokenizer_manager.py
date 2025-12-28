@@ -116,7 +116,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         self.is_tool_call_parser_gpt_oss = server_args.tool_call_parser == "gpt-oss"
         self.disable_tokenizer_batch_decode = server_args.disable_tokenizer_batch_decode
 
-        self.watchdog = Watchdog.create(
+        self.soft_watchdog = Watchdog.create(
             debug_name="DetokenizerManager",
             watchdog_timeout=server_args.soft_watchdog_timeout,
             soft=True,
@@ -136,12 +136,12 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
     def event_loop(self):
         """The event loop that handles requests"""
         while True:
-            with self.watchdog.disable():
+            with self.soft_watchdog.disable():
                 recv_obj = self.recv_from_scheduler.recv_pyobj()
             output = self._request_dispatcher(recv_obj)
             if output is not None:
                 self.send_to_tokenizer.send_pyobj(output)
-            self.watchdog.feed()
+            self.soft_watchdog.feed()
 
     def trim_matched_stop(
         self, output: Union[str, List[int]], finished_reason: Dict, no_stop_trim: bool
