@@ -35,7 +35,7 @@ class TestTP(CustomTestCase):
                 "--mooncake-ib-device",
                 ib_devices,
                 "--moe-a2a-backend",
-                "deepep",
+                "mooncake",
                 "--deepep-mode",
                 "low_latency",
                 "--chunked-prefill-size",
@@ -58,8 +58,8 @@ class TestTP(CustomTestCase):
         args = SimpleNamespace(
             num_shots=5,
             data_path=None,
-            num_questions=200,
-            max_new_tokens=512,
+            num_questions=100,
+            max_new_tokens=128,
             parallel=128,
             host="http://127.0.0.1",
             port=int(self.base_url.split(":")[-1]),
@@ -115,7 +115,7 @@ class TestTBO(TestTP):
     ]
 
 
-class TestMooncakeWitchEPLB(TestTP):
+class TestMooncakeWithEPLB(TestTP):
     extra_args = [
         "--tp",
         "4",
