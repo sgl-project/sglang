@@ -2,7 +2,6 @@ import logging
 import os
 import time
 
-from sglang.srt.environ import temp_set_env
 from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -31,9 +30,6 @@ class MMMUServerBase(CustomTestCase):
     other_args: list[str] = []
     mem_fraction_static: float = DEFAULT_MEM_FRACTION_STATIC
 
-    # For OpenAI API settings
-    api_key = "sk-123456"
-
     @classmethod
     def setUpClass(cls):
         assert cls.model is not None, "Please set cls.model in subclass"
@@ -53,19 +49,14 @@ class MMMUServerBase(CustomTestCase):
             *cls.other_args,
         ]
 
-        # Set OpenAI API key and base URL environment variables.
-        # Needed for lmms-eval to work.
-        with temp_set_env(
-            OPENAI_API_KEY=cls.api_key, OPENAI_API_BASE=f"{cls.base_url}/v1"
-        ):
-            cls.process = popen_launch_server(
-                cls.model,
-                cls.base_url,
-                timeout=cls.timeout,
-                api_key=cls.api_key,
-                other_args=server_args,
-                env=process_env,
-            )
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=cls.timeout,
+            api_key=cls.api_key,
+            other_args=server_args,
+            env=process_env,
+        )
 
     @classmethod
     def tearDownClass(cls):

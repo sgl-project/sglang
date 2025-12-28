@@ -5,6 +5,7 @@ import subprocess
 import tempfile
 from types import SimpleNamespace
 
+from sglang.srt.environ import temp_set_env
 from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -28,6 +29,9 @@ class MMMUMixin:
 
     accuracy: float
     mmmu_args: list[str] = []
+
+    # For OpenAI API settings
+    api_key = "sk-123456"
 
     def run_mmmu_eval(
         self: CustomTestCase,
@@ -71,11 +75,17 @@ class MMMUMixin:
             *self.mmmu_args,
         ]
 
-        subprocess.run(
-            cmd,
-            check=True,
-            timeout=3600,
-        )
+        # Set OpenAI API key and base URL environment variables.
+        # Needed for lmms-eval to work.
+        with temp_set_env(
+            OPENAI_API_KEY=self.api_key,
+            OPENAI_API_BASE=f"{self.base_url}/v1",
+        ):
+            subprocess.run(
+                cmd,
+                check=True,
+                timeout=3600,
+            )
 
     def test_mmmu(self: CustomTestCase):
         """Run MMMU evaluation test."""
