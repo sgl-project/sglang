@@ -2027,7 +2027,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             )
 
     def merge_batch(self, other: "ScheduleBatch"):
-        # NOTE: in v2 eagle mode, we do not need wait verify here because
+        # NOTE: in spec v2 mode, we do not need wait verify here because
         # 1) current batch is always prefill, whose seq_lens is not a future
         # 2) other batch is always decode, which is finished in previous step
 

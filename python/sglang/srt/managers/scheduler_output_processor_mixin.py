@@ -387,7 +387,7 @@ class SchedulerOutputProcessorMixin:
             if batch.spec_algorithm.is_none():
                 req.output_ids.append(next_token_id)
             elif batch.is_spec_v2:
-                # Only v2 eagle's output_ids are updated here.
+                # Only spec v2's output_ids are updated here.
                 req.output_ids.extend(next_token_id)
                 new_accepted_len = len(next_token_id)
 
