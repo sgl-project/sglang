@@ -21,7 +21,7 @@ from __future__ import annotations
 import json
 import os
 import statistics
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Sequence
 
@@ -132,6 +132,12 @@ class DiffusionSamplingParams:
 
     output_size: str = ""
 
+    # optional overrides for sampling behavior
+    num_inference_steps: int | None = None
+    height: int | None = None
+    width: int | None = None
+    guidance_scale: float | None = None
+
     # inputs and conditioning
     prompt: str | None = None  # text prompt for generation
     image_path: Path | str | None = None  # input image/video for editing (Path or URL)
@@ -222,12 +228,15 @@ class PerformanceSummary:
 
 T2I_sampling_params = DiffusionSamplingParams(
     prompt="Doraemon is eating dorayaki",
-    output_size="1024x1024",
+    output_size="768x768",
+    num_inference_steps=12,
 )
 
 TI2I_sampling_params = DiffusionSamplingParams(
     prompt="Convert 2D style to 3D style",
     image_path="https://github.com/lm-sys/lm-sys.github.io/releases/download/test/TI2I_Qwen_Image_Edit_Input.jpg",
+    output_size="768x768",
+    num_inference_steps=12,
 )
 
 MULTI_IMAGE_TI2I_sampling_params = DiffusionSamplingParams(
@@ -236,6 +245,8 @@ MULTI_IMAGE_TI2I_sampling_params = DiffusionSamplingParams(
         "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-Image/edit2509/edit2509_1.jpg",
         "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-Image/edit2509/edit2509_2.jpg",
     ],
+    output_size="768x768",
+    num_inference_steps=12,
     direct_url_test=True,
 )
 
@@ -245,6 +256,11 @@ TI2V_sampling_params = DiffusionSamplingParams(
     prompt="The man in the picture slowly turns his head, his expression enigmatic and otherworldly. The camera performs a slow, cinematic dolly out, focusing on his face. Moody lighting, neon signs glowing in the background, shallow depth of field.",
     image_path="https://is1-ssl.mzstatic.com/image/thumb/Music114/v4/5f/fa/56/5ffa56c2-ea1f-7a17-6bad-192ff9b6476d/825646124206.jpg/600x600bb.jpg",
     direct_url_test=True,
+    width=832,
+    height=480,
+    num_inference_steps=12,
+    fps=8,
+    num_frames=8,
 )
 
 # All test cases with clean default values
@@ -327,6 +343,11 @@ ONE_GPU_CASES_B: list[DiffusionTestCase] = [
         ),
         DiffusionSamplingParams(
             prompt=T2V_PROMPT,
+            width=832,
+            height=480,
+            num_inference_steps=12,
+            fps=8,
+            num_frames=8,
         ),
     ),
     # LoRA test case for single transformer + merge/unmerge API test
@@ -344,6 +365,9 @@ ONE_GPU_CASES_B: list[DiffusionTestCase] = [
         DiffusionSamplingParams(
             prompt="csetiarcane Nfj1nx with blue hair, a woman walking in a cyberpunk city at night",
             num_frames=8,
+            width=832,
+            height=480,
+            num_inference_steps=12,
         ),
     ),
     # NOTE(mick): flaky
@@ -378,6 +402,11 @@ ONE_GPU_CASES_B: list[DiffusionTestCase] = [
         ),
         DiffusionSamplingParams(
             prompt=T2V_PROMPT,
+            width=544,
+            height=960,
+            num_inference_steps=4,
+            fps=8,
+            num_frames=8,
         ),
     ),
     # === Text and Image to Video (TI2V) ===
@@ -390,7 +419,12 @@ ONE_GPU_CASES_B: list[DiffusionTestCase] = [
             warmup_edit=0,
             custom_validator="video",
         ),
-        TI2V_sampling_params,
+        replace(
+            TI2V_sampling_params,
+            width=832,
+            height=480,
+            num_inference_steps=12,
+        ),
     ),
     DiffusionTestCase(
         "fastwan2_2_ti2v_5b",
@@ -401,7 +435,12 @@ ONE_GPU_CASES_B: list[DiffusionTestCase] = [
             warmup_edit=0,
             custom_validator="video",
         ),
-        TI2V_sampling_params,
+        replace(
+            TI2V_sampling_params,
+            width=832,
+            height=480,
+            num_inference_steps=12,
+        ),
     ),
 ]
 
@@ -415,7 +454,14 @@ TWO_GPU_CASES_A = [
             warmup_edit=0,
             custom_validator="video",
         ),
-        TI2V_sampling_params,
+        replace(
+            TI2V_sampling_params,
+            width=832,
+            height=480,
+            num_inference_steps=12,
+            fps=8,
+            num_frames=8,
+        ),
     ),
     DiffusionTestCase(
         "wan2_2_t2v_a14b_2gpu",
@@ -429,6 +475,11 @@ TWO_GPU_CASES_A = [
         ),
         DiffusionSamplingParams(
             prompt=T2V_PROMPT,
+            width=832,
+            height=480,
+            num_inference_steps=12,
+            fps=8,
+            num_frames=8,
         ),
     ),
     # LoRA test case for transformer_2 support
@@ -445,6 +496,11 @@ TWO_GPU_CASES_A = [
         ),
         DiffusionSamplingParams(
             prompt="Nfj1nx with blue hair, a woman walking in a cyberpunk city at night",
+            width=832,
+            height=480,
+            num_inference_steps=12,
+            fps=8,
+            num_frames=8,
         ),
     ),
     DiffusionTestCase(
@@ -459,7 +515,11 @@ TWO_GPU_CASES_A = [
         ),
         DiffusionSamplingParams(
             prompt=T2V_PROMPT,
-            output_size="832x480",
+            width=832,
+            height=480,
+            num_inference_steps=12,
+            fps=8,
+            num_frames=8,
         ),
     ),
 ]
@@ -475,7 +535,14 @@ TWO_GPU_CASES_B = [
             custom_validator="video",
             num_gpus=2,
         ),
-        TI2V_sampling_params,
+        replace(
+            TI2V_sampling_params,
+            width=832,
+            height=480,
+            num_inference_steps=12,
+            fps=8,
+            num_frames=8,
+        ),
     ),
     # I2V LoRA test case
     DiffusionTestCase(
@@ -489,7 +556,14 @@ TWO_GPU_CASES_B = [
             num_gpus=2,
             lora_path="starsfriday/Wan2.1-Divine-Power-LoRA",
         ),
-        TI2V_sampling_params,
+        replace(
+            TI2V_sampling_params,
+            width=832,
+            height=480,
+            num_inference_steps=12,
+            fps=8,
+            num_frames=8,
+        ),
     ),
     DiffusionTestCase(
         "wan2_1_i2v_14b_720P_2gpu",
@@ -501,7 +575,14 @@ TWO_GPU_CASES_B = [
             custom_validator="video",
             num_gpus=2,
         ),
-        TI2V_sampling_params,
+        replace(
+            TI2V_sampling_params,
+            width=832,
+            height=480,
+            num_inference_steps=12,
+            fps=8,
+            num_frames=8,
+        ),
     ),
     DiffusionTestCase(
         "qwen_image_t2i_2_gpus",
