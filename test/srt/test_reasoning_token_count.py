@@ -5,19 +5,6 @@ import types
 import unittest
 from types import SimpleNamespace
 
-# Provide lightweight stubs for optional native deps so we can import the mixin in a CPU-only env.
-triton_stub = types.ModuleType("triton")
-triton_language_stub = types.ModuleType("triton.language")
-triton_stub.language = triton_language_stub
-triton_stub.__spec__ = importlib.machinery.ModuleSpec("triton", None)
-triton_language_stub.__spec__ = importlib.machinery.ModuleSpec("triton.language", None)
-sys.modules.setdefault("triton", triton_stub)
-sys.modules.setdefault("triton.language", triton_language_stub)
-triton_testing_stub = types.ModuleType("triton.testing")
-triton_testing_stub.__spec__ = importlib.machinery.ModuleSpec("triton.testing", None)
-sys.modules.setdefault("triton.testing", triton_testing_stub)
-sys.modules.setdefault("zmq", types.ModuleType("zmq"))
-
 import torch
 
 # Torch on macOS may expose torch.mps without a Stream type; make a stub to satisfy type hints.
