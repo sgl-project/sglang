@@ -11,17 +11,12 @@ use super::metrics::Metrics;
 
 static INFLIGHT_TRACKER: OnceLock<Arc<InFlightRequestTracker>> = OnceLock::new();
 
-/// Age bucket definitions for in-flight request metrics.
-/// Each bucket is (upper_bound_secs, label).
-/// The last bucket has no upper bound (infinity).
-const AGE_BUCKETS: &[(u64, &str)] = &[
-    (30, "0-30s"),
-    (60, "30s-1m"),
-    (180, "1m-3m"),
-    (300, "3m-5m"),
-    (600, "5m-10m"),
-    (u64::MAX, "10m+"),
-];
+/// Age bucket upper bounds in seconds, matching Prometheus histogram `le` label convention.
+/// Uses cumulative semantics: le="60" means age <= 60s.
+const AGE_BUCKET_BOUNDS: &[u64] = &[30, 60, 180, 300, 600];
+
+/// Label values for each bucket bound, plus "+Inf" for the total.
+const AGE_BUCKET_LABELS: &[&str] = &["30", "60", "180", "300", "600", "+Inf"];
 
 /// Tracks in-flight HTTP requests and their start times.
 pub struct InFlightRequestTracker {
