@@ -37,7 +37,10 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
 )
 from sglang.multimodal_gen.runtime.entrypoints.utils import prepare_request
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
-from sglang.multimodal_gen.runtime.server_args import get_global_server_args
+from sglang.multimodal_gen.runtime.server_args import (
+    WorkloadType,
+    get_global_server_args,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
@@ -161,6 +164,11 @@ async def create_video(
     content_type = request.headers.get("content-type", "").lower()
     request_id = generate_request_id()
 
+    server_args = get_global_server_args()
+    is_t2v = server_args.workload_type == WorkloadType.T2V
+
+    input_path = None
+
     if "multipart/form-data" in content_type:
         if not prompt:
             raise HTTPException(status_code=400, detail="prompt is required")
@@ -173,7 +181,6 @@ async def create_video(
         # Save first input image
         image = image_list[0]
         uploads_dir = os.path.join("outputs", "uploads")
-        os.makedirs(uploads_dir, exist_ok=True)
         filename = image.filename if hasattr(image, "filename") else f"url_image"
         input_path = os.path.join(uploads_dir, f"{request_id}_{filename}")
         try:
@@ -247,8 +254,23 @@ async def create_video(
                     )
                 payload["input_reference"] = input_path
             req = VideoGenerationsRequest(**payload)
+            input_path = req.input_reference
         except Exception as e:
             raise HTTPException(status_code=400, detail=f"Invalid request body: {e}")
+
+    # Unified validation for input_reference
+    if is_t2v:
+        if input_path is not None:
+            raise HTTPException(
+                status_code=400,
+                detail="input_reference is not supported for Text-to-Video (T2V) models.",
+            )
+    else:
+        if input_path is None:
+            raise HTTPException(
+                status_code=400,
+                detail="input_reference file is required for I2V/TI2V models.",
+            )
 
     logger.debug(f"Server received from create_video endpoint: req={req}")
 
