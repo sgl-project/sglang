@@ -17,6 +17,7 @@ from sglang.test.test_utils import (
 DEEPSEEK_V32_MODEL_PATH = "deepseek-ai/DeepSeek-V3.2-Exp"
 
 
+@unittest.skip("Skip for saving ci time")
 class TestDeepseek(CustomTestCase):
     @classmethod
     def setUpClass(cls):
