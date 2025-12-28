@@ -736,7 +736,7 @@ class SchedulerMetricsCollector:
         self.gpu_execution_seconds_total = Counter(
             name="sglang:gpu_execution_seconds_total",
             documentation="Total time that GPU is busy executing a workload. "
-            "Refer to ForwardMode for categories.",
+            "Refer to ForwardMode for category labels.",
             labelnames=list(labels.keys()) + ["category"],
         )
 
@@ -749,7 +749,7 @@ class SchedulerMetricsCollector:
         self.dp_cooperation_gpu_execution_seconds_total = Counter(
             name="sglang:dp_cooperation_gpu_execution_seconds_total",
             documentation="Total time that GPU is busy executing a workload with labels about DP cooperation. "
-            "Refer to ForwardMode for categories.",
+            "Refer to ForwardMode for category labels.",
             labelnames=list(labels.keys()) + ["category", "num_prefill_ranks"],
         )
 
