@@ -13,10 +13,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     VerificationResult,
 )
-from sglang.multimodal_gen.runtime.platforms import (
-    AttentionBackendEnum,
-    current_platform,
-)
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
@@ -92,10 +89,6 @@ class CausalDMDDenoisingStage(DenoisingStage):
                 "encoder_attention_mask": batch.prompt_attention_mask,
             },
         )
-
-        # STA
-        if self.attn_backend.get_enum() == AttentionBackendEnum.SLIDING_TILE_ATTN:
-            self.prepare_sta_param(batch, server_args)
 
         # Latents and prompts
         assert batch.latents is not None, "latents must be provided"
@@ -249,37 +242,7 @@ class CausalDMDDenoisingStage(DenoisingStage):
                     # Prepare inputs
                     t_expand = t_cur.repeat(latent_model_input.shape[0])
 
-                    # Attention metadata if needed
-                    if (
-                        self.attn_backend.get_enum()
-                        == AttentionBackendEnum.VIDEO_SPARSE_ATTN
-                    ):
-                        self.attn_metadata_builder_cls = (
-                            self.attn_backend.get_builder_cls()
-                        )
-                        if self.attn_metadata_builder_cls is not None:
-                            self.attn_metadata_builder = (
-                                self.attn_metadata_builder_cls()
-                            )
-                            attn_metadata = self.attn_metadata_builder.build(  # type: ignore
-                                current_timestep=i,  # type: ignore
-                                raw_latent_shape=(
-                                    current_num_frames,
-                                    h,
-                                    w,
-                                ),  # type: ignore
-                                patch_size=server_args.pipeline_config.dit_config.patch_size,  # type: ignore
-                                STA_param=batch.STA_param,  # type: ignore
-                                VSA_sparsity=server_args.VSA_sparsity,  # type: ignore
-                                device=get_local_torch_device(),  # type: ignore
-                            )  # type: ignore
-                            assert (
-                                attn_metadata is not None
-                            ), "attn_metadata cannot be None"
-                        else:
-                            attn_metadata = None
-                    else:
-                        attn_metadata = None
+                    attn_metadata = None
 
                     with (
                         torch.autocast(

@@ -75,16 +75,6 @@ class ModelTaskType(Enum):
             return DataType.VIDEO
 
 
-class STA_Mode(str, Enum):
-    """STA (Sliding Tile Attention) modes."""
-
-    STA_INFERENCE = "STA_inference"
-    STA_SEARCHING = "STA_searching"
-    STA_TUNING = "STA_tuning"
-    STA_TUNING_CFG = "STA_tuning_cfg"
-    NONE = None
-
-
 def preprocess_text(prompt: str) -> str:
     return prompt
 
@@ -194,11 +184,6 @@ class PipelineConfig:
     postprocess_text_funcs: tuple[Callable[[BaseEncoderOutput], torch.tensor], ...] = (
         field(default_factory=lambda: (postprocess_text,))
     )
-
-    # STA (Sliding Tile Attention) parameters
-    mask_strategy_file_path: str | None = None
-    STA_mode: STA_Mode = STA_Mode.STA_INFERENCE
-    skip_time_steps: int = 15
 
     # DMD parameters
     dmd_denoising_steps: list[int] | None = field(default=None)

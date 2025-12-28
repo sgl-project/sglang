@@ -17,7 +17,7 @@ import threading
 import traceback
 from collections.abc import Callable
 from dataclasses import dataclass, fields, is_dataclass
-from functools import lru_cache, partial, wraps
+from functools import partial, wraps
 from typing import Any, TypeVar, cast
 
 import cloudpickle
@@ -673,23 +673,6 @@ def set_random_seed(seed: int) -> None:
     from sglang.multimodal_gen.runtime.platforms import current_platform
 
     current_platform.seed_everything(seed)
-
-
-@lru_cache(maxsize=1)
-def is_vsa_available() -> bool:
-    return importlib.util.find_spec("vsa") is not None
-
-
-@lru_cache(maxsize=1)
-def is_vmoba_available() -> bool:
-    if importlib.util.find_spec("kernel.csrc.attn.vmoba_attn.vmoba") is None:
-        return False
-    try:
-        import flash_attn
-
-        return flash_attn.__version__ >= "2.7.4"
-    except Exception:
-        return False
 
 
 # adapted from: https://github.com/Wan-Video/Wan2.2/blob/main/wan/utils/utils.py

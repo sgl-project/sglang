@@ -9,22 +9,6 @@ from sglang.multimodal_gen.test.test_utils import TestGenerateBase
 logger = init_logger(__name__)
 
 
-class TestFastWan2_1_T2V(TestGenerateBase):
-    model_path = "FastVideo/FastWan2.1-T2V-1.3B-Diffusers"
-    extra_args = ["--attention-backend=video_sparse_attn"]
-    data_type: DataType = DataType.VIDEO
-    thresholds = {
-        "test_single_gpu": 13.0,
-        "test_cfg_parallel": 15.0,
-        "test_usp": 15.0,
-        "test_mixed": 15.0 * 1.05,
-    }
-
-    # disabled for vsa
-    def test_usp(self):
-        pass
-
-
 class TestFastWan2_2_T2V(TestGenerateBase):
     model_path = "FastVideo/FastWan2.2-TI2V-5B-FullAttn-Diffusers"
     extra_args = []

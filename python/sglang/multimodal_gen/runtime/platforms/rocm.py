@@ -118,10 +118,7 @@ class RocmPlatform(Platform):
             logger.info("Using AITer backend on ROCm.")
             return "sglang.multimodal_gen.runtime.layers.attention.backends.aiter.AITerBackend"
 
-        elif selected_backend in (
-            AttentionBackendEnum.SLIDING_TILE_ATTN,
-            AttentionBackendEnum.SAGE_ATTN,
-        ):
+        elif selected_backend == AttentionBackendEnum.SAGE_ATTN:
             raise ValueError(
                 f"{selected_backend.name} is not supported on {cls.device_name}."
             )
