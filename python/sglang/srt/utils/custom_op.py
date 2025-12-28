@@ -15,6 +15,7 @@ def register_custom_op(
     op_name: Optional[str] = None,
     mutates_args: Optional[List[str]] = None,
     out_shape: Optional[Union[int, str]] = None,
+    eager: bool = False,
 ) -> F: ...
 
 
@@ -25,6 +26,7 @@ def register_custom_op(
     op_name: Optional[str] = None,
     mutates_args: Optional[List[str]] = None,
     fake_impl: Optional[Callable],
+    eager: bool = False,
 ) -> F: ...
 
 
@@ -34,6 +36,7 @@ def register_custom_op(
     op_name: Optional[str] = None,
     mutates_args: Optional[List[str]] = None,
     out_shape: Optional[Union[int, str]] = None,
+    eager: bool = False,
 ) -> Callable[[F], F]: ...
 
 
@@ -43,6 +46,7 @@ def register_custom_op(
     op_name: Optional[str] = None,
     mutates_args: Optional[List[str]] = None,
     fake_impl: Optional[Callable],
+    eager: bool = False,
 ) -> Callable[[F], F]: ...
 
 
@@ -52,6 +56,7 @@ def register_custom_op(
     *,
     op_name: Optional[str] = None,
     mutates_args: Optional[List[str]] = None,
+    eager: bool = False,
     **extra_kwargs,
 ) -> Any:
     """
@@ -84,26 +89,37 @@ def register_custom_op(
     :param fake_impl: A fake implementation for the operator.
                       Only one of `out_shape` or `fake_impl` should be provided.
     :type fake_impl: Optional[Callable]
+    :param eager: Whether to register the operator eagerly.
+                  If False, the registration will be deferred until the first call.
+                  If you met any issue with torch.compile, try to set eager=True.
+    :type eager: bool
     :return: The registered JIT custom operator, or a decorator.
              NOTE: the real register will occur at the first call of the function.
     :rtype: Callable
     """
+    extra_kwarg_keys = set(extra_kwargs.keys())
+    expected_kwarg_keys = set({"out_shape", "fake_impl"})
+    assert (
+        expected_kwarg_keys >= extra_kwarg_keys
+    ), f"Unexpected extra kwargs: {extra_kwarg_keys - expected_kwarg_keys}"
+
     has_out_shape = "out_shape" in extra_kwargs
     has_fake_impl = "fake_impl" in extra_kwargs
     assert not (
         has_out_shape and has_fake_impl
-    ), "At least one of `out_shape` or `fake_impl` should be provided."
+    ), "Only one of `out_shape` or `fake_impl` should be provided."
     # Assume inplace if neither out_shape nor fake_impl is provided
     if not (has_out_shape or has_fake_impl):
         extra_kwargs["out_shape"] = None
 
     def decorator(op_func: Callable) -> Callable:
-        return CustomOpWrapper(
+        wrapper = CustomOpWrapper(
             op_name=op_name or op_func.__name__,
             op_func=op_func,
             mutates_args=mutates_args or [],
             **extra_kwargs,
         )
+        return wrapper.real_impl if eager else wrapper
 
     if fn is not None:
         return decorator(fn)
@@ -133,6 +149,8 @@ class CustomOpWrapper:
             if not hasattr(torch.ops.sglang, self.op_name):
                 from sglang.srt.utils.common import direct_register_custom_op
 
+                # NOTE(dark): if torch compile fail here, mark the decorator as eager
+                # lazy registration does not work with torch compile
                 direct_register_custom_op(
                     op_name=self.op_name,
                     op_func=self.op_func,

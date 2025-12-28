@@ -1315,7 +1315,7 @@ class FlashInferFP4MoE(FusedMoE):
         return result
 
 
-@register_custom_op(out_shape="hidden_states")
+@register_custom_op(out_shape="hidden_states", eager=True)
 def moe_forward_piecewise_cuda_graph_impl(
     hidden_states: torch.Tensor,
     topk_weights: torch.Tensor,
@@ -1332,7 +1332,7 @@ def moe_forward_piecewise_cuda_graph_impl(
     return moe_layer.forward_impl(hidden_states, topk_output)
 
 
-@register_custom_op(out_shape="hidden_states")
+@register_custom_op(out_shape="hidden_states", eager=True)
 def flashinfer_fp4_moe_forward_piecewise_cuda_graph_impl(
     hidden_states: torch.Tensor,
     router_logits: torch.Tensor,

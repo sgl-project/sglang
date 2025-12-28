@@ -1046,7 +1046,7 @@ class Qwen3NextForCausalLM(nn.Module):
 EntryClass = Qwen3NextForCausalLM
 
 
-@register_custom_op(mutates_args=["output"])
+@register_custom_op(mutates_args=["output"], eager=True)
 def gdn_with_output(
     hidden_states: torch.Tensor,
     output: torch.Tensor,
