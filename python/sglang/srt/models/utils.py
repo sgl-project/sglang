@@ -11,24 +11,27 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
+from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from functools import lru_cache
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional, Tuple
 
 import numpy as np
 import torch
 
+from sglang.jit_kernel.norm import can_use_fused_inplace_qknorm, fused_inplace_qknorm
+from sglang.jit_kernel.utils import register_jit_op
+from sglang.srt.environ import envs
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.utils import is_cuda
 
+if TYPE_CHECKING:
+    from sglang.srt.layers.layernorm import RMSNorm
+
 _is_cuda = is_cuda()
-
-
-if _is_cuda:
-    from sgl_kernel import FusedSetKVBufferArg
 
 WeightsMapping = Mapping[str, Optional[str]]
 """If a key maps to a value of `None`, the corresponding weight is ignored."""
@@ -113,6 +116,8 @@ def create_fused_set_kv_buffer_arg(
     layer: RadixAttention,
     forward_batch: ForwardBatch,
 ):
+    from sgl_kernel import FusedSetKVBufferArg
+
     layer_id = layer.layer_id
     token_to_kv_pool = forward_batch.token_to_kv_pool
 
@@ -191,3 +196,73 @@ class RotaryPosMixin:
         wpos_ids = wpos_ids.flatten()
 
         return torch.from_numpy(np.stack([hpos_ids, wpos_ids], axis=-1))
+
+
+def apply_qk_norm(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    q_norm: RMSNorm,
+    k_norm: RMSNorm,
+    head_dim: int,
+    alt_stream: Optional[torch.cuda.Stream] = None,
+    allow_inplace: bool = True,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Apply QK normalization for query and key tensors.
+    If eligible, we will use JIT fused inplace QK normalization for better performance.
+
+    Args:
+        q: Query tensor of shape [batch_size, ...]
+        k: Key tensor of shape [batch_size, ...]
+        q_norm: RMSNorm layer for query normalization
+        k_norm: RMSNorm layer for key normalization
+        head_dim: Dimension of each attention head
+        alt_stream: Optional alternative CUDA stream for overlapping computation
+        allow_inplace: Whether to allow inplace normalization. (True for better performance)
+
+    Returns:
+        Tuple of normalized query and key tensors
+    """
+    from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
+
+    batch_size = q.size(0)
+    q_eps = q_norm.variance_epsilon
+    k_eps = k_norm.variance_epsilon
+    if (
+        _is_cuda  # TODO(dark): have not tested on ROCm or other backends
+        and allow_inplace  # TODO(dark): this can be relaxed if needed
+        and (q_eps == k_eps)  # TODO(dark): this can also be relaxed
+        and not envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get()
+        and can_use_fused_inplace_qknorm(head_dim)
+    ):
+        fused_inplace_qknorm(
+            q=q.view(batch_size, -1, head_dim),
+            k=k.view(batch_size, -1, head_dim),
+            q_weight=q_norm.weight,
+            k_weight=k_norm.weight,
+            head_dim=head_dim,
+            eps=q_eps,
+        )
+        return q, k
+
+    if alt_stream is not None and get_is_capture_mode():
+        current_stream = torch.cuda.current_stream()
+        alt_stream.wait_stream(current_stream)
+        q_by_head = q.reshape(-1, head_dim)
+        q_by_head = q_norm(q_by_head)
+        with torch.cuda.stream(alt_stream):
+            k_by_head = k.reshape(-1, head_dim)
+            k_by_head = k_norm(k_by_head)
+        current_stream.wait_stream(alt_stream)
+    else:
+        q_by_head = q.reshape(-1, head_dim)
+        q_by_head = q_norm(q_by_head)
+        k_by_head = k.reshape(-1, head_dim)
+        k_by_head = k_norm(k_by_head)
+    q = q_by_head.view(q.shape)
+    k = k_by_head.view(k.shape)
+    return q, k
+
+
+# Register the inplace op
+fused_inplace_qknorm = register_jit_op(fused_inplace_qknorm, out_args=["q", "k"])
