@@ -22,7 +22,8 @@ on:
 
 jobs:
   publish-x86:
-    if: github.repository == 'sgl-project/sglang'
+    # TODO: Change back to 'sgl-project/sglang' before merging to main
+    if: github.repository == 'Kangyan-Zhou/sglang'
     environment: "prod"
     strategy:
       matrix:
@@ -138,7 +139,8 @@ jobs:
             .
 
   publish-arm64:
-    if: github.repository == 'sgl-project/sglang'
+    # TODO: Change back to 'sgl-project/sglang' before merging to main
+    if: github.repository == 'Kangyan-Zhou/sglang'
     environment: "prod"
     strategy:
       matrix:
@@ -244,7 +246,8 @@ jobs:
   create-manifests:
     runs-on: ubuntu-22.04
     needs: [publish-x86, publish-arm64]
-    if: github.repository == 'sgl-project/sglang'
+    # TODO: Change back to 'sgl-project/sglang' before merging to main
+    if: github.repository == 'Kangyan-Zhou/sglang'
     environment: "prod"
     steps:
       - name: Checkout repository
