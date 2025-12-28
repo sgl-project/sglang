@@ -3,14 +3,14 @@ Configuration and data structures for diffusion performance tests.
 
 Usage:
 
-pytest python/sglang/multimodal_gen/test/server/test_server_a.py
-# for a single testcase, look for the name of the testcases in DIFFUSION_CASES
-pytest python/sglang/multimodal_gen/test/server/test_server_a.py -k qwen_image_t2i
+pytest python/sglang/multimodal_gen/test/server/test_server_1_gpu.py
+# for a single testcase, look for the name of the testcases in ONE_GPU_CASES or TWO_GPU_CASES
+pytest python/sglang/multimodal_gen/test/server/test_server_1_gpu.py -k qwen_image_t2i
 
 
 To add a new testcase:
-1. add your testcase with case-id: `my_new_test_case_id` to DIFFUSION_CASES
-2. run `SGLANG_GEN_BASELINE=1 pytest -s python/sglang/multimodal_gen/test/server/test_server_a.py -k my_new_test_case_id`
+1. add your testcase with case-id: `my_new_test_case_id` to ONE_GPU_CASES or TWO_GPU_CASES
+2. run `SGLANG_GEN_BASELINE=1 pytest -s python/sglang/multimodal_gen/test/server/test_server_1_gpu.py -k my_new_test_case_id`
 3. insert or override the corresponding scenario in `scenarios` section of perf_baselines.json with the output baseline of step-2
 
 
@@ -48,6 +48,7 @@ class ScenarioConfig:
     expected_e2e_ms: float
     expected_avg_denoise_ms: float
     expected_median_denoise_ms: float
+    estimated_full_test_time_s: float | None = None
 
 
 @dataclass
@@ -94,6 +95,7 @@ class BaselineConfig:
                 expected_e2e_ms=float(cfg["expected_e2e_ms"]),
                 expected_avg_denoise_ms=float(cfg["expected_avg_denoise_ms"]),
                 expected_median_denoise_ms=float(cfg["expected_median_denoise_ms"]),
+                estimated_full_test_time_s=cfg.get("estimated_full_test_time_s"),
             )
 
         return cls(
@@ -249,7 +251,7 @@ TI2V_sampling_params = DiffusionSamplingParams(
 
 # All test cases with clean default values
 # To test different models, simply add more DiffusionCase entries
-ONE_GPU_CASES_A: list[DiffusionTestCase] = [
+ONE_GPU_CASES: list[DiffusionTestCase] = [
     # === Text to Image (T2I) ===
     DiffusionTestCase(
         "qwen_image_t2i",
@@ -312,9 +314,6 @@ ONE_GPU_CASES_A: list[DiffusionTestCase] = [
         ),
         MULTI_IMAGE_TI2I_sampling_params,
     ),
-]
-
-ONE_GPU_CASES_B: list[DiffusionTestCase] = [
     # === Text to Video (T2V) ===
     DiffusionTestCase(
         "wan2_1_t2v_1.3b",
@@ -405,7 +404,7 @@ ONE_GPU_CASES_B: list[DiffusionTestCase] = [
     ),
 ]
 
-TWO_GPU_CASES_A = [
+TWO_GPU_CASES: list[DiffusionTestCase] = [
     DiffusionTestCase(
         "wan2_2_i2v_a14b_2gpu",
         DiffusionServerArgs(
@@ -462,9 +461,6 @@ TWO_GPU_CASES_A = [
             output_size="832x480",
         ),
     ),
-]
-
-TWO_GPU_CASES_B = [
     DiffusionTestCase(
         "wan2_1_i2v_14b_480P_2gpu",
         DiffusionServerArgs(
