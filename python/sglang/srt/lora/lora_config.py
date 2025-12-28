@@ -37,7 +37,9 @@ class LoRAConfig:
 
     def get_lora_config(self, dummy=False):
         if dummy:
-            raise NotImplementedError()
+            raise NotImplementedError(
+                "Dummy LoRA config loading is not yet implemented"
+            )
         else:
             if not os.path.isdir(self.path):
                 weights_dir = snapshot_download(self.path, allow_patterns=["*.json"])
