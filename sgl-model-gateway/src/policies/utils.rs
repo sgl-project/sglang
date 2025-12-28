@@ -18,7 +18,7 @@ pub struct PeriodicTask {
 
 impl PeriodicTask {
     /// Spawn a background thread that periodically executes a task.
-    pub fn spawn<F>(interval_secs: u64, name: &'static str, task: F) -> Self
+    pub fn spawn<F>(interval_secs: u64, debug_name: &'static str, task: F) -> Self
     where
         F: Fn() + Send + 'static,
     {
@@ -34,7 +34,7 @@ impl PeriodicTask {
                 let mut slept_ms = 0u64;
                 while slept_ms < total_sleep_ms {
                     if shutdown_clone.load(Ordering::Relaxed) {
-                        debug!("{} thread received shutdown signal", name);
+                        debug!("{} thread received shutdown signal", debug_name);
                         return;
                     }
                     thread::sleep(Duration::from_millis(check_interval_ms));
@@ -43,7 +43,7 @@ impl PeriodicTask {
 
                 // Check shutdown before starting task
                 if shutdown_clone.load(Ordering::Relaxed) {
-                    debug!("{} thread received shutdown signal", name);
+                    debug!("{} thread received shutdown signal", debug_name);
                     return;
                 }
 
@@ -52,7 +52,7 @@ impl PeriodicTask {
         });
 
         Self {
-            debug_name: name,
+            debug_name,
             shutdown_flag,
             handle: Some(handle),
         }
