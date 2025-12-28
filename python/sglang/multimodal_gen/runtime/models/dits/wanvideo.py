@@ -27,7 +27,7 @@ from sglang.multimodal_gen.runtime.layers.linear import ReplicatedLinear
 from sglang.multimodal_gen.runtime.layers.mlp import MLP
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
     NDRotaryEmbedding,
-    _apply_rotary_emb,
+    _apply_qk_rotary_emb,
 )
 from sglang.multimodal_gen.runtime.layers.visual_embedding import (
     ModulateProjection,
@@ -387,9 +387,7 @@ class WanTransformerBlock(nn.Module):
 
         # Apply rotary embeddings
         cos, sin = freqs_cis
-        query, key = _apply_rotary_emb(
-            query, cos, sin, is_neox_style=False
-        ), _apply_rotary_emb(key, cos, sin, is_neox_style=False)
+        query, key = _apply_qk_rotary_emb(query, key, cos, sin, is_neox_style=False)
         attn_output = self.attn1(query, key, value)
         attn_output = attn_output.flatten(2)
         attn_output, _ = self.to_out(attn_output)
@@ -555,9 +553,7 @@ class WanTransformerBlock_VSA(nn.Module):
 
         # Apply rotary embeddings
         cos, sin = freqs_cis
-        query, key = _apply_rotary_emb(
-            query, cos, sin, is_neox_style=False
-        ), _apply_rotary_emb(key, cos, sin, is_neox_style=False)
+        query, key = _apply_qk_rotary_emb(query, key, cos, sin, is_neox_style=False)
 
         attn_output = self.attn1(query, key, value, gate_compress=gate_compress)
         attn_output = attn_output.flatten(2)
