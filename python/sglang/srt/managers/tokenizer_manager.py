@@ -237,7 +237,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             if speculative_algorithm.is_none()
             else server_args.speculative_num_draft_tokens
         )
-        self.check_total_tokens = True
+        self.validate_total_tokens = True
 
     def init_tokenizer_and_processor(self):
         server_args = self.server_args
@@ -746,7 +746,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         # Validate total tokens (input + max_new_tokens)
         max_new_tokens = obj.sampling_params.get("max_new_tokens")
         if (
-            self.check_total_tokens
+            self.validate_total_tokens
             and max_new_tokens is not None
             and (max_new_tokens + input_token_num) >= _max_req_len
         ):
@@ -1834,6 +1834,14 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         ):
             meta_info[attr_name] = getattr(recv_obj, attr_name)[index]
 
+    def _request_has_grammar(self, obj: GenerateReqInput) -> bool:
+        return (
+            obj.sampling_params.get("json_schema", None)
+            or obj.sampling_params.get("regex", None)
+            or obj.sampling_params.get("ebnf", None)
+            or obj.sampling_params.get("structural_tag", None)
+        )
+
     def collect_metrics(self, state: ReqState, recv_obj: BatchStrOutput, i: int):
         completion_tokens = (
             recv_obj.completion_tokens[i]
@@ -1871,13 +1879,6 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 state.last_completion_tokens = completion_tokens
 
         if state.finished:
-            has_grammar = (
-                state.obj.sampling_params.get("json_schema", None)
-                or state.obj.sampling_params.get("regex", None)
-                or state.obj.sampling_params.get("ebnf", None)
-                or state.obj.sampling_params.get("structural_tag", None)
-            )
-
             retraction_count = (
                 recv_obj.retraction_counts[i]
                 if getattr(recv_obj, "retraction_counts", None)
@@ -1891,7 +1892,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 completion_tokens,
                 recv_obj.cached_tokens[i],
                 state.finished_time - state.created_time,
-                has_grammar,
+                self._request_has_grammar(state.obj),
                 retraction_count,
             )
 
