@@ -55,7 +55,7 @@ dependencies = [
   "python-multipart",
   "pyzmq>=25.1.2",
   "requests",
-  "scipy",
+  "soxr",
   "sentencepiece",
   "setproctitle",
   "soundfile==0.13.1",

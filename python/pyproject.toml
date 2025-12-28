@@ -55,7 +55,7 @@ dependencies = [
   "python-multipart",
   "pyzmq>=25.1.2",
   "requests",
-  "scipy",
+  "soxr",
   "sentencepiece",
   "setproctitle",
   "sgl-kernel==0.3.20",
@@ -95,7 +95,8 @@ diffusion = [
   "vsa==0.0.4",
   "yunchang==0.6.3.post1",
   "runai_model_streamer",
-  "cache-dit==1.1.8"
+  "cache-dit==1.1.8",
+  "scipy",
 ]
 
 tracing = [
