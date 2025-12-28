@@ -8,6 +8,7 @@ import logging
 import os
 import random
 import re
+import shlex
 import subprocess
 import sys
 import threading
@@ -632,7 +633,7 @@ def popen_launch_server(
     if api_key:
         command += ["--api-key", api_key]
 
-    print(f"command={' '.join(command)}")
+    print(f"command={shlex.join(command)}")
 
     if return_stdout_stderr:
         process = subprocess.Popen(
