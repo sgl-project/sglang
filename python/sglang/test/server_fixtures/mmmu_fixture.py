@@ -2,6 +2,7 @@ import logging
 import os
 import time
 
+from sglang.srt.environ import temp_set_env
 from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -37,15 +38,6 @@ class MMMUServerBase(CustomTestCase):
     def setUpClass(cls):
         assert cls.model is not None, "Please set cls.model in subclass"
 
-        # Save original environment variables for restoration in tearDownClass
-        cls._original_openai_api_key = os.environ.get("OPENAI_API_KEY")
-        cls._original_openai_api_base = os.environ.get("OPENAI_API_BASE")
-
-        # Set OpenAI API key and base URL environment variables.
-        # Needed for lmms-eval to work.
-        os.environ["OPENAI_API_KEY"] = cls.api_key
-        os.environ["OPENAI_API_BASE"] = f"{cls.base_url}/v1"
-
         # Prepare environment variables
         process_env = os.environ.copy()
         process_env["SGLANG_USE_CUDA_IPC_TRANSPORT"] = "1"
@@ -61,14 +53,19 @@ class MMMUServerBase(CustomTestCase):
             *cls.other_args,
         ]
 
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=cls.timeout,
-            api_key=cls.api_key,
-            other_args=server_args,
-            env=process_env,
-        )
+        # Set OpenAI API key and base URL environment variables.
+        # Needed for lmms-eval to work.
+        with temp_set_env(
+            OPENAI_API_KEY=cls.api_key, OPENAI_API_BASE=f"{cls.base_url}/v1"
+        ):
+            cls.process = popen_launch_server(
+                cls.model,
+                cls.base_url,
+                timeout=cls.timeout,
+                api_key=cls.api_key,
+                other_args=server_args,
+                env=process_env,
+            )
 
     @classmethod
     def tearDownClass(cls):
@@ -78,14 +75,3 @@ class MMMUServerBase(CustomTestCase):
             except Exception as e:
                 logger.error(f"Error killing process: {e}")
         time.sleep(2)
-
-        # Restore original environment variables
-        if cls._original_openai_api_key is not None:
-            os.environ["OPENAI_API_KEY"] = cls._original_openai_api_key
-        elif "OPENAI_API_KEY" in os.environ:
-            del os.environ["OPENAI_API_KEY"]
-
-        if cls._original_openai_api_base is not None:
-            os.environ["OPENAI_API_BASE"] = cls._original_openai_api_base
-        elif "OPENAI_API_BASE" in os.environ:
-            del os.environ["OPENAI_API_BASE"]
