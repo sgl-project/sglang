@@ -538,7 +538,7 @@ class DataParallelController:
 
     def event_loop(self):
         last_child_check_time = time.time()
-        child_check_interval = 60.0  
+        child_check_interval = 60.0
 
         while True:
             while True:
@@ -549,7 +549,6 @@ class DataParallelController:
                     break
                 self._request_dispatcher(recv_req)
 
-            # Periodically check if scheduler child processes are still alive
             current_time = time.time()
             if current_time - last_child_check_time >= child_check_interval:
                 last_child_check_time = current_time
