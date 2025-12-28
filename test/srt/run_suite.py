@@ -35,6 +35,7 @@ suites = {
         TestFile("openai_server/features/test_openai_server_ebnf.py", 7),
         TestFile("openai_server/features/test_openai_server_hidden_states.py", 186),
         TestFile("openai_server/features/test_reasoning_content.py", 89),
+        TestFile("openai_server/features/test_usage_tokens.py", 30),
         TestFile("openai_server/function_call/test_openai_function_calling.py", 60),
         TestFile("openai_server/function_call/test_tool_choice.py", 120),
         TestFile("openai_server/validation/test_large_max_new_tokens.py", 41),
@@ -139,7 +140,6 @@ suites = {
         TestFile("models/test_kimi_k2_models.py", 200),
         TestFile("test_deepseek_v32_basic.py", 275),
         TestFile("test_deepseek_v32_mtp.py", 275),
-        TestFile("models/test_mimo_models.py", 200),
     ],
     "per-commit-8-gpu-h20": [
         TestFile("quant/test_w4a8_deepseek_v3.py", 520),
@@ -221,6 +221,7 @@ suite_amd = {
         TestFile("openai_server/features/test_json_mode.py", 120),
         TestFile("openai_server/features/test_openai_server_ebnf.py", 20),
         TestFile("openai_server/features/test_reasoning_content.py", 89),
+        TestFile("openai_server/features/test_usage_tokens.py", 30),
         TestFile("openai_server/function_call/test_openai_function_calling.py", 73),
         TestFile("openai_server/function_call/test_tool_choice.py", 120),
         TestFile("openai_server/validation/test_large_max_new_tokens.py", 41),
