@@ -8,7 +8,6 @@ use tracing::debug;
 #[derive(Debug)]
 pub struct PeriodicTask {
     debug_name: &'static str,
-    #[allow(dead_code)]
     shutdown_flag: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
 }
