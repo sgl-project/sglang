@@ -1,7 +1,11 @@
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::{
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    thread::{self, JoinHandle},
+    time::Duration,
+};
 
 use tracing::debug;
 
@@ -70,9 +74,9 @@ impl Drop for PeriodicTask {
 
 #[cfg(test)]
 mod tests {
+    use std::{sync::atomic::AtomicUsize, time::Instant};
+
     use super::*;
-    use std::sync::atomic::AtomicUsize;
-    use std::time::Instant;
 
     #[test]
     fn test_periodic_task_executes() {
@@ -104,4 +108,3 @@ mod tests {
         assert!(elapsed < Duration::from_millis(500));
     }
 }
-
