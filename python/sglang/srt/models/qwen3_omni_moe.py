@@ -529,6 +529,7 @@ class Qwen3OmniMoeForConditionalGeneration(PreTrainedModel):
             for raw_name, loaded_weight in weights:
                 name = raw_name.replace(r"model.language_model.", r"model.")
                 fused_for_name = False  # avoid leaking fused state across weights
+                mapping_for_name = expert_params_mapping
 
                 if ("talker" in name or "code2wav" in name) and not self.enable_talker:
                     continue
@@ -539,7 +540,7 @@ class Qwen3OmniMoeForConditionalGeneration(PreTrainedModel):
                 for param_name, weight_name, shard_id in stacked_params_mapping:
                     if "experts.gate_up_proj" in name or "experts.down_proj" in name:
                         fused_for_name = True
-                        expert_params_mapping = fused_expert_params_mapping
+                        mapping_for_name = fused_expert_params_mapping
 
                     # Skip non-stacked layers and experts (experts handled below).
                     if weight_name not in name:
@@ -581,7 +582,7 @@ class Qwen3OmniMoeForConditionalGeneration(PreTrainedModel):
                 # Track if this is an expert weight to enable early skipping
                 is_expert_weight = False
 
-                for mapping in expert_params_mapping:
+                for mapping in mapping_for_name:
                     param_name, weight_name, expert_id, shard_id = mapping
                     if weight_name not in name:
                         continue
