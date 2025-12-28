@@ -1524,13 +1524,16 @@ class Scheduler(
             self._add_request_to_queue(req)
             return
 
-        if recv_req.logprob_start_len == -1 or not recv_req.return_logprob:
-            # By default, only return the logprobs for output tokens
-            # For prefill-only requests with logprob_start_len == -1, set logprob_start_len beyond input sequence
-            # to skip input logprob computation entirely
+        if recv_req.logprob_start_len == -1:
             if req.is_prefill_only:
+                # For prefill-only requests with logprob_start_len == -1, set logprob_start_len
+                # beyond input sequence to skip input logprob computation entirely
                 req.logprob_start_len = len(req.origin_input_ids)
+            elif recv_req.return_logprob:
+                # If return_logprob is True, return the logprobs for output tokens by default
+                req.logprob_start_len = len(req.origin_input_ids) - 1
             else:
+                # If return_logprob is False, only the last token requires logprob computation
                 req.logprob_start_len = -1
         else:
             req.logprob_start_len = recv_req.logprob_start_len
