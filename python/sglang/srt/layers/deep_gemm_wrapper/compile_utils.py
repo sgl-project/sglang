@@ -14,7 +14,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 from sglang.srt.environ import envs
 from sglang.srt.layers.deep_gemm_wrapper.configurer import ENABLE_JIT_DEEPGEMM
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import ceil_div, get_available_gpu_memory, get_bool_env_var
+from sglang.srt.utils import ceil_div, get_available_gpu_memory
 
 logger = logging.getLogger(__name__)
 
@@ -25,8 +25,8 @@ if ENABLE_JIT_DEEPGEMM:
 _BUILTIN_M_LIST = list(range(1, 1024 * 16 + 1))
 _ENABLE_JIT_DEEPGEMM_PRECOMPILE = envs.SGLANG_JIT_DEEPGEMM_PRECOMPILE.get()
 _DO_COMPILE_ALL = True
-_IS_FIRST_RANK_ON_NODE = get_bool_env_var("SGLANG_IS_FIRST_RANK_ON_NODE", "true")
-_IN_PRECOMPILE_STAGE = get_bool_env_var("SGLANG_IN_DEEPGEMM_PRECOMPILE_STAGE", "false")
+_IS_FIRST_RANK_ON_NODE = envs.SGLANG_IS_FIRST_RANK_ON_NODE.get()
+_IN_PRECOMPILE_STAGE = envs.SGLANG_IN_DEEPGEMM_PRECOMPILE_STAGE.get()
 
 # Force redirect deep_gemm cache_dir
 os.environ["DG_JIT_CACHE_DIR"] = os.getenv(
@@ -291,5 +291,6 @@ class _GroupedMaskedWarmupExecutor(_BaseWarmupExecutor):
 def deep_gemm_execution_hook(
     m: int, n: int, k: int, num_groups: int, kernel_type: DeepGemmKernelType
 ):
-    _maybe_compile_deep_gemm_one_type_all(kernel_type, n, k, num_groups)
+    if m > 0:
+        _maybe_compile_deep_gemm_one_type_all(kernel_type, n, k, num_groups)
     yield

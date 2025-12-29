@@ -162,6 +162,10 @@ class TestQwen2AudioServer(AudioOpenAITestMixin):
 class TestDeepseekOCRServer(TestOpenAIMLLMServerBase):
     model = "deepseek-ai/DeepSeek-OCR"
     trust_remote_code = False
+    extra_args = [
+        "--mem-fraction-static=0.70",
+        "--cuda-graph-max-bs=4",
+    ]
 
     def verify_single_image_response_for_ocr(self, response):
         """Verify DeepSeek-OCR grounding output with coordinates"""
@@ -215,12 +219,15 @@ class TestDeepseekOCRServer(TestOpenAIMLLMServerBase):
         self.verify_single_image_response_for_ocr(response)
 
 
+# Delete the mixin classes so that they are not collected by pytest
+del (
+    TestOpenAIMLLMServerBase,
+    ImageOpenAITestMixin,
+    VideoOpenAITestMixin,
+    AudioOpenAITestMixin,
+    OmniOpenAITestMixin,
+)
+
+
 if __name__ == "__main__":
-    del (
-        TestOpenAIMLLMServerBase,
-        ImageOpenAITestMixin,
-        VideoOpenAITestMixin,
-        AudioOpenAITestMixin,
-        OmniOpenAITestMixin,
-    )
     unittest.main()

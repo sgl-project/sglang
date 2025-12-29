@@ -69,6 +69,7 @@ from sglang.srt.utils import (
     is_sm90_supported,
     is_sm100_supported,
     log_info_on_rank0,
+    next_power_of_2,
     print_warning_once,
     set_weight_attrs,
     use_intel_amx_backend,
@@ -233,6 +234,7 @@ class Fp8LinearMethod(LinearMethodBase):
         input_size: int,
         output_size: int,
         params_dtype: torch.dtype,
+        skip_block_quant_check: bool = False,
         **extra_weight_attrs,
     ):
         output_size_per_partition = sum(output_partition_sizes)
@@ -244,25 +246,31 @@ class Fp8LinearMethod(LinearMethodBase):
                 self.quant_config.weight_block_size[0],
                 self.quant_config.weight_block_size[1],
             )
-            # Required by row parallel
-            if tp_size > 1 and input_size // input_size_per_partition == tp_size:
-                if input_size_per_partition % block_k != 0:
-                    raise ValueError(
-                        f"Weight input_size_per_partition = "
-                        f"{input_size_per_partition} is not divisible by "
-                        f"weight quantization block_k = {block_k}."
-                    )
-            # Required by column parallel or enabling merged weights
-            if (
-                tp_size > 1 and output_size // output_size_per_partition == tp_size
-            ) or len(output_partition_sizes) > 1:
-                for output_partition_size in output_partition_sizes:
-                    if output_partition_size % block_n != 0:
+
+            if skip_block_quant_check:
+                logger.warning_once(
+                    f"Skipping block quantization checks for weight partition."
+                )
+            else:
+                # Required by row parallel
+                if tp_size > 1 and input_size // input_size_per_partition == tp_size:
+                    if input_size_per_partition % block_k != 0:
                         raise ValueError(
-                            f"Weight output_partition_size = "
-                            f"{output_partition_size} is not divisible by "
-                            f"weight quantization block_n = {block_n}."
+                            f"Weight input_size_per_partition = "
+                            f"{input_size_per_partition} is not divisible by "
+                            f"weight quantization block_k = {block_k}."
                         )
+                # Required by column parallel or enabling merged weights
+                if (
+                    tp_size > 1 and output_size // output_size_per_partition == tp_size
+                ) or len(output_partition_sizes) > 1:
+                    for output_partition_size in output_partition_sizes:
+                        if output_partition_size % block_n != 0:
+                            raise ValueError(
+                                f"Weight output_partition_size = "
+                                f"{output_partition_size} is not divisible by "
+                                f"weight quantization block_n = {block_n}."
+                            )
 
         layer.logical_widths = output_partition_sizes
         layer.input_size_per_partition = input_size_per_partition
@@ -659,6 +667,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 ),
                 requires_grad=False,
             )
+            # w13_weight and w2_weight are always requanted together
+            w13_weight_scale.format_ue8m0 = False
+            w2_weight_scale.format_ue8m0 = False
             layer.register_parameter("w13_weight_scale_inv", w13_weight_scale)
             layer.register_parameter("w2_weight_scale_inv", w2_weight_scale)
             assert self.quant_config.activation_scheme == "dynamic"
@@ -806,6 +817,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                         ),
                     )
                     and get_moe_runner_backend().is_deep_gemm()
+                    and not layer.w13_weight_scale_inv.format_ue8m0
                 ):
                     assert isinstance(
                         layer, DeepEPMoE
@@ -817,6 +829,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     requant_weight_ue8m0_inplace(
                         layer.w2_weight, layer.w2_weight_scale_inv, weight_block_size
                     )
+                    layer.w13_weight_scale_inv.format_ue8m0 = True
+                    layer.w2_weight_scale_inv.format_ue8m0 = True
             return
 
         # If checkpoint is fp16 or bfloat16, quantize in place.
@@ -1384,6 +1398,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     tile_tokens_dim=None,
                     routing_method_type=routing_method_type,
                     use_shuffled_weight=False,
+                    tune_max_num_tokens=next_power_of_2(a_q.shape[0]),
                 )
             else:
                 routing_bias_cast = (
@@ -1415,6 +1430,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     ),
                     use_routing_scales_on_input=False,
                     routing_method_type=routing_method_type,
+                    tune_max_num_tokens=next_power_of_2(a_q.shape[0]),
                 )
 
     def maybe_apply_hip_fused_experts(

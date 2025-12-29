@@ -1,14 +1,14 @@
-import os
 import unittest
 
 import sglang as sgl
+from sglang.srt.environ import envs
 from sglang.test.test_utils import CustomTestCase
 
 
 class TestExternalModels(CustomTestCase):
     def test_external_model(self):
-        os.environ["SGLANG_EXTERNAL_MODEL_PACKAGE"] = "external_models"
-        os.environ["SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE"] = "external_models"
+        envs.SGLANG_EXTERNAL_MODEL_PACKAGE.set("external_models")
+        envs.SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE.set("external_models")
         prompt = "Today is a sunny day and I like"
         model_path = "Qwen/Qwen2-VL-2B-Instruct"
 

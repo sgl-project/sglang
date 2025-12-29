@@ -391,9 +391,9 @@ class EagleDraftWorker(BaseDraftWorker):
             spec_info.hidden_states = hidden_states
 
             # Run forward
-            logits_output, _ = self.draft_runner.forward(
+            logits_output = self.draft_runner.forward(
                 forward_batch, skip_attn_backend_init=True
-            )
+            ).logits_output
             if self.server_args.enable_nan_detection:
                 detect_nan(logits_output)
             probs = torch.softmax(logits_output.next_token_logits, dim=-1)
@@ -465,7 +465,7 @@ class EagleDraftWorker(BaseDraftWorker):
 
         # Run forward
         forward_batch = ForwardBatch.init_new(batch, self.draft_runner)
-        logits_output, _ = self.draft_runner.forward(forward_batch)
+        logits_output = self.draft_runner.forward(forward_batch).logits_output
 
         # Update spec_info for the next draft step
         probs = torch.softmax(logits_output.next_token_logits, dim=-1)
@@ -516,9 +516,9 @@ class EagleDraftWorker(BaseDraftWorker):
                 forward_batch
             )
         else:
-            draft_logits_output, _ = self.draft_runner.forward(
+            draft_logits_output = self.draft_runner.forward(
                 forward_batch, skip_attn_backend_init=True
-            )
+            ).logits_output
 
         # Reorganize the spec info for the next batch
         draft_logits_output.next_token_logits = draft_logits_output.next_token_logits[
