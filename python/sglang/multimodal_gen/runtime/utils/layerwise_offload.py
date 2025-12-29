@@ -50,7 +50,7 @@ class LayerwiseOffloadManager:
         self._consolidated_cpu_weights: Dict[int, Dict[torch.dtype, torch.Tensor]] = {}
         # layer_idx -> {name: {dtype, offset, numel, shape}}
         # stores the offset and numel of each weight from a same layer, of same dtype
-        self._tensor_metadata: Dict[int, Dict[str, Dict[str, Any]]] = {}
+        self._weight_metadata: Dict[int, Dict[str, Dict[str, Any]]] = {}
         # layer indices that are already in gpu
         self._gpu_layers: Set[int] = set()
 
@@ -96,34 +96,33 @@ class LayerwiseOffloadManager:
             )
 
         # 2. concat and offload (in pinned memory)
-        for layer_idx, dtypes_map in layer_groups.items():
+        for layer_idx, dtype_to_params in layer_groups.items():
             self._consolidated_cpu_weights[layer_idx] = {}
-            self._tensor_metadata[layer_idx] = {}
+            self._weight_metadata[layer_idx] = {}
 
-            for dtype, tensors in dtypes_map.items():
-                total_numel = sum(t.numel() for _, t in tensors)
+            for dtype, weights in dtype_to_params.items():
+                total_numel = sum(t.numel() for _, t in weights)
 
-                # concatenated CPU buffer (in pinned memory)
+                # create concatenated CPU buffer (in pinned memory)
                 cpu_buffer = torch.empty(
                     total_numel, dtype=dtype, pin_memory=self.pin_cpu_memory
                 )
 
                 # offload weights to the buffer
                 current_offset = 0
-                for name, tensor in tensors:
-                    numel = tensor.numel()
-                    cpu_buffer[current_offset: current_offset + numel].copy_(
-                        tensor.flatten()
+                for name, weight in weights:
+                    numel = weight.numel()
+                    cpu_buffer[current_offset : current_offset + numel].copy_(
+                        weight.flatten()
                     )
-                    self._tensor_metadata[layer_idx][name] = {
+                    self._weight_metadata[layer_idx][name] = {
                         "dtype": dtype,
                         "offset": current_offset,
                         "numel": numel,
-                        "shape": tensor.shape,
+                        "shape": weight.shape,
                     }
 
-                    if self.device is not None:
-                        tensor.data = torch.empty((1,), device=self.device, dtype=dtype)
+                    weight.data = torch.empty((1,), device=self.device, dtype=dtype)
 
                     current_offset += numel
 
@@ -136,6 +135,14 @@ class LayerwiseOffloadManager:
         self.prefetch_layer(0, non_blocking=non_blocking)
         if not non_blocking and self.copy_stream is not None:
             torch.cuda.current_stream().wait_stream(self.copy_stream)
+
+    def get_target_with_name(self, name: str) -> torch.Tensor:
+        """get the target model weight/buffer to be replaced"""
+        if name in self._named_parameters:
+            target = self._named_parameters[name]
+        else:
+            target = self._named_buffers[name]
+        return target
 
     @torch.compiler.disable
     def prefetch_layer(self, layer_idx: int, non_blocking: bool = True) -> None:
@@ -160,19 +167,16 @@ class LayerwiseOffloadManager:
                 gpu_buffer.copy_(cpu_buffer, non_blocking=non_blocking)
                 gpu_buffers[dtype] = gpu_buffer
 
-        # restore model's parameters by their metadata using gpu buffer
-        for name, meta in self._tensor_metadata[layer_idx].items():
+        # restore model's weights by their metadata using gpu buffer
+        for name, meta in self._weight_metadata[layer_idx].items():
             dtype = meta["dtype"]
             gpu_buffer = gpu_buffers[dtype]
 
             # map the parameter's data to the correct slice of the GPU buffer
-            if name in self._named_parameters:
-                target = self._named_parameters[name]
-            else:
-                target = self._named_buffers[name]
+            target = self.get_target_with_name(name)
             if target is not None:
                 target.data = gpu_buffer[
-                    meta["offset"]: meta["offset"] + meta["numel"]
+                    meta["offset"] : meta["offset"] + meta["numel"]
                 ].view(meta["shape"])
 
         self._gpu_layers.add(layer_idx)
@@ -211,12 +215,8 @@ class LayerwiseOffloadManager:
         if layer_idx not in self._gpu_layers:
             return
 
-        for name, meta in self._tensor_metadata.get(layer_idx, {}).items():
-            target = (
-                self._named_parameters.get(name)
-                if name in self._named_parameters
-                else self._named_buffers.get(name)
-            )
+        for name, meta in self._weight_metadata.get(layer_idx, {}).items():
+            target = self.get_target_with_name(name)
             if target is not None:
                 target.data = torch.empty((1,), device=self.device, dtype=meta["dtype"])
 
