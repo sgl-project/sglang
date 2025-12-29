@@ -68,6 +68,8 @@ def flash_attn_with_kvcache(
     sm_margin=0,  # Can be tuned if some SMs are used for communication
     return_softmax_lse=False,
     sinks=None,
+    score_mod=None,
+    aux_tensors=None,
     ver=3,
 ):
     """
@@ -149,6 +151,8 @@ def flash_attn_with_kvcache(
            to automatically determine the number of splits.
            Don't change this unless you know what you are doing.
         return_softmax_lse: bool. Whether to return the logsumexp of the attention scores.
+        score_mod [optional]: A callable that takes the attention scores and applies a modification.
+        aux_tensors [optional]: Some score_mods will want to read from global aux_tensors. This is how we thread them through to the inner kernel.
 
     Return:
         out: (batch_size, seqlen, nheads, headdim).
@@ -195,6 +199,8 @@ def flash_attn_with_kvcache(
             return_softmax_lse=return_softmax_lse,
             learnable_sink=sinks,
             page_table=page_table,
+            score_mod=score_mod,
+            aux_tensors=aux_tensors,
         )
 
     assert k_cache.stride(-1) == 1, "k_cache must have contiguous last dimension"
@@ -291,6 +297,8 @@ def flash_attn_varlen_func(
     sm_margin=0,
     return_softmax_lse=False,
     sinks=None,
+    score_mod=None,
+    aux_tensors=None,
     ver=3,
 ):
     if ver == 4:
@@ -316,6 +324,8 @@ def flash_attn_varlen_func(
             pack_gqa=pack_gqa,
             learnable_sink=sinks,
             return_softmax_lse=return_softmax_lse,
+            score_mod=score_mod,
+            aux_tensors=aux_tensors,
         )
 
     if not is_fa3_supported():
