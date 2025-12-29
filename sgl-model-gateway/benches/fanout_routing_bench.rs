@@ -21,7 +21,6 @@ use sysinfo::{CpuRefreshKind, RefreshKind, System};
 use tokio::runtime::Runtime;
 use wiremock::{matchers::method, Mock, MockServer, ResponseTemplate};
 
-// --- SCENARIO SETUP ---
 async fn setup_cluster(size: usize) -> (Arc<Router>, Vec<MockServer>) {
     // 1. Setup Registry
     let registry = Arc::new(WorkerRegistry::new());
@@ -40,7 +39,6 @@ async fn setup_cluster(size: usize) -> (Arc<Router>, Vec<MockServer>) {
     registry.register(Arc::new(w1));
     servers.push(slow_server);
 
-    // Worker 1: The "Target" Worker (Instant 200 OK)
     let target_server = MockServer::start().await;
     Mock::given(method("GET"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"status":"ok"})))
@@ -52,7 +50,6 @@ async fn setup_cluster(size: usize) -> (Arc<Router>, Vec<MockServer>) {
     registry.register(Arc::new(w2));
     servers.push(target_server);
 
-    // Workers 2..N: Fillers (Instant 404)
     if size > 2 {
         let filler_server = MockServer::start().await;
         Mock::given(method("GET"))
@@ -82,7 +79,6 @@ async fn setup_cluster(size: usize) -> (Arc<Router>, Vec<MockServer>) {
         .worker_registry(registry)
         .policy_registry(policy_registry)
         .tokenizer_registry(tokenizer_registry)
-        // Fill required fields with empty/memory implementations
         .worker_job_queue(Arc::new(OnceLock::new()))
         .workflow_engine(Arc::new(OnceLock::new()))
         .mcp_manager(Arc::new(OnceLock::new()))
@@ -100,7 +96,6 @@ async fn setup_cluster(size: usize) -> (Arc<Router>, Vec<MockServer>) {
     (Arc::new(router), servers)
 }
 
-// --- CUSTOM RESOURCE MONITOR (CPU & RPS) ---
 fn run_resource_monitor(_c: &mut Criterion) {
     println!("\n\n=== RESOURCE USAGE MONITOR ===");
     println!(
@@ -176,7 +171,6 @@ fn run_resource_monitor(_c: &mut Criterion) {
     println!("================================\n");
 }
 
-// --- STANDARD CRITERION LATENCY BENCHMARK ---
 fn bench_latency(c: &mut Criterion) {
     // Run our custom monitor first to output the table
     run_resource_monitor(c);

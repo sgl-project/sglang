@@ -384,7 +384,7 @@ impl Router {
             let client = self.client.clone();
             let method = method.clone();
             let headers = filtered_headers.clone();
-            let api_key = worker.api_key().cloned();
+            let api_key = worker.api_key().clone();
 
             async move {
                 let mut request_builder = match method {
