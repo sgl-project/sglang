@@ -311,7 +311,9 @@ class NPUW4A8Int8DynamicMoEMethod(_NPUFusedMoEMethodBase):
         ), "the last dim of weight needs to be divided by 4"
         return weight.view(torch.int32).contiguous()
 
-    def process_weights_after_loading(self, layer: torch.nn.Module, is_per_channel_weight, activation_use_clip) -> None:
+    def process_weights_after_loading(
+        self, layer: torch.nn.Module, is_per_channel_weight, activation_use_clip
+    ) -> None:
         if not activation_use_clip:
             self._process_weights_without_clip(layer, is_per_channel_weight)
         else:
@@ -342,10 +344,16 @@ class NPUW4A8Int8DynamicMoEMethod(_NPUFusedMoEMethodBase):
             else None
         )
         layer.w13_weight_scale.data, w13_bias = self.process_scale(
-            layer.w13_weight, layer.w13_weight_scale.data, w13_weight_scale_second, is_per_channel_weight,
+            layer.w13_weight, 
+            layer.w13_weight_scale.data, 
+            w13_weight_scale_second, 
+            is_per_channel_weight,
         )
         layer.w2_weight_scale.data, w2_bias = self.process_scale(
-            layer.w2_weight, layer.w2_weight_scale.data, w2_weight_scale_second, is_per_channel_weight,
+            layer.w2_weight, 
+            layer.w2_weight_scale.data, 
+            w2_weight_scale_second, 
+            is_per_channel_weight,
         )
         if hasattr(layer, "w13_weight_scale_second"):
             # scale_second is no longer used, release this part of the memory
