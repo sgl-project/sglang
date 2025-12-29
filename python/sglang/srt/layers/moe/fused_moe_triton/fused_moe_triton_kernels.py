@@ -810,9 +810,11 @@ def _apply_activation(x, ACTIVATION_TYPE: tl.constexpr):
     x = x.to(tl.float32)
     if ACTIVATION_TYPE == "silu":
         return x * tl.sigmoid(x)
-    else:
+    elif ACTIVATION_TYPE == "gelu":
         kAlpha = 0.7978845608028654
         return 0.5 * x * (1 + tanh(kAlpha * (x + 0.044715 * x * x * x)))
+    else:
+        raise ValueError(f"Unsupported activation: {ACTIVATION_TYPE}")
 
 
 @triton.jit

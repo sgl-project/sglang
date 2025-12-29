@@ -121,18 +121,18 @@ def prepare_mlp_sync_batch_raw(
         num_tokens_for_logprob = num_tokens
     else:
         num_tokens = local_batch.extend_num_tokens
-        if local_batch.return_logprob:
-            num_tokens_for_logprob = sum(
-                # We should have at least 1 token for sample in every case.
-                max(extend_len - logprob_start_len, 1)
-                for logprob_start_len, extend_len in zip(
-                    local_batch.extend_logprob_start_lens,
-                    local_batch.extend_lens,
-                )
+        num_tokens_for_logprob = sum(
+            # We should have at least 1 token for sample in every case.
+            max(extend_len - logprob_start_len, 1)
+            for logprob_start_len, extend_len in zip(
+                local_batch.extend_logprob_start_lens,
+                local_batch.extend_lens,
             )
-        else:
-            # When return_logprob = False, only need last token per request
-            num_tokens_for_logprob = local_batch.batch_size()
+        )
+        assert (
+            local_batch.return_logprob
+            or num_tokens_for_logprob == local_batch.batch_size()
+        )
 
     skip_all_gather = envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.get()
     can_cuda_graph = (

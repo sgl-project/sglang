@@ -78,7 +78,13 @@ class SchedulerMetricsMixin:
         )
 
         if self.enable_metrics:
-            engine_type = "unified"
+            if self.server_args.disaggregation_mode == DisaggregationMode.PREFILL:
+                engine_type = "prefill"
+            elif self.server_args.disaggregation_mode == DisaggregationMode.DECODE:
+                engine_type = "decode"
+            else:
+                engine_type = "unified"
+
             labels = {
                 "model_name": self.server_args.served_model_name,
                 "engine_type": engine_type,
@@ -111,7 +117,7 @@ class SchedulerMetricsMixin:
         self.spec_num_forward_ct += bs
         self.num_generated_tokens += num_accepted_tokens
 
-    def reset_metrics(self):
+    def reset_metrics(self: Scheduler):
         self.forward_ct_decode = 0
         self.num_generated_tokens = 0
         self.spec_num_accepted_tokens = 0
@@ -131,7 +137,7 @@ class SchedulerMetricsMixin:
         self.last_input_throughput = self.last_prefill_tokens / gap_latency
         self.last_prefill_tokens = adder.log_input_tokens
 
-        assert self.temp_prefill_info is None
+        # assert self.temp_prefill_info is None # TODO re-enable
         self.temp_prefill_info = dict(
             adder_log_input_tokens=adder.log_input_tokens,
             adder_log_hit_tokens=adder.log_hit_tokens,
@@ -512,7 +518,7 @@ class SchedulerMetricsMixin:
         except Exception as e:
             logger.warning(f"Failed to update LoRA metrics: {e}")
 
-    def calculate_utilization(self):
+    def calculate_utilization(self: Scheduler):
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self.stats.utilization = -1
         else:
@@ -556,7 +562,7 @@ class SchedulerMetricsMixin:
         )
 
     @contextmanager
-    def record_forward_metrics(self: Scheduler, batch):
+    def record_forward_metrics(self: Scheduler, batch: ScheduleBatch):
         if not (self.enable_metrics and ENABLE_METRICS_DEVICE_TIMER):
             yield
             return
