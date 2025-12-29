@@ -1006,14 +1006,18 @@ class AiterAttnBackend(AttentionBackend):
 
             bs0 = forward_batch.batch_size + 1
 
-            q_fp8 = q.to(dtypes.fp8)
-            k_fp8 = k.to(dtypes.fp8)
-            v_fp8 = v.to(dtypes.fp8)
+            quant_dtype = dtypes.fp8
+            q_quant, q_descale = per_tensor_quant(q, quant_dtype=quant_dtype)
+            k_quant, k_descale = per_tensor_quant(k, quant_dtype=quant_dtype)
+            v_quant, v_descale = per_tensor_quant(v, quant_dtype=quant_dtype)
 
             o = flash_attn_varlen_fp8_pertensor_func(
-                q=q_fp8,
-                k=k_fp8,
-                v=v_fp8,
+                q_quant,
+                k_quant,
+                v_quant,
+                q_descale,
+                k_descale,
+                v_descale,
                 cu_seqlens_q=self.qo_indptr[:bs0],
                 cu_seqlens_k=self.forward_metadata.kv_indptr[:bs0],
                 max_seqlen_q=self.forward_metadata.max_q_len,
