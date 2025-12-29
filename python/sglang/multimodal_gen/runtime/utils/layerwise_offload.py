@@ -168,10 +168,9 @@ class LayerwiseOffloadManager:
 
             # map the parameter's data to the correct slice of the GPU buffer
             target = self.get_target_with_name(name)
-            if target is not None:
-                target.data = gpu_buffer[
-                    meta["offset"] : meta["offset"] + meta["numel"]
-                ].view(meta["shape"])
+            target.data = gpu_buffer[
+                meta["offset"] : meta["offset"] + meta["numel"]
+            ].view(meta["shape"])
 
         self._gpu_layers.add(layer_idx)
 
@@ -211,8 +210,7 @@ class LayerwiseOffloadManager:
 
         for name, meta in self._weight_metadata.get(layer_idx, {}).items():
             target = self.get_target_with_name(name)
-            if target is not None:
-                target.data = torch.empty((1,), device=self.device, dtype=meta["dtype"])
+            target.data = torch.empty((1,), device=self.device, dtype=meta["dtype"])
 
         self._gpu_layers.discard(layer_idx)
 
