@@ -1,5 +1,5 @@
 use std::{
-    sync::Arc,
+    sync::{Arc, OnceLock},
     time::{Duration, Instant},
 };
 
@@ -7,46 +7,51 @@ use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Through
 // Adjust paths based on your actual library structure
 use sgl_model_gateway::{
     app_context::AppContext,
+    config::types::{PolicyConfig, RouterConfig},
     core::{BasicWorkerBuilder, WorkerRegistry, WorkerType},
+    data_connector::memory::{
+        MemoryConversationItemStorage, MemoryConversationStorage, MemoryResponseStorage,
+    },
     policies::PolicyRegistry,
     routers::{http::router::Router, RouterTrait},
+    tokenizer::TokenizerRegistry,
 };
 use sysinfo::{CpuRefreshKind, RefreshKind, System};
 use tokio::runtime::Runtime;
 use wiremock::{matchers::method, Mock, MockServer, ResponseTemplate};
 
 // --- SCENARIO SETUP ---
-// Creates a cluster where:
-// - Worker 0 is SLOW (200ms delay) -> Simulates a "Bad Apple"
-// - Worker 1 is TARGET (Instant 200 OK) -> Has the data
-// - Workers 2..N are FILLERS (404 Not Found)
 async fn setup_cluster(size: usize) -> (Arc<Router>, Vec<MockServer>) {
+    // 1. Setup Registry
     let registry = Arc::new(WorkerRegistry::new());
     let mut servers = Vec::new();
 
-    // 1. Bad Apple (Timeouts/Hangs)
+    // 2. Setup Mock Servers
+    // Worker 0: The "Slow" Worker (200ms delay)
     let slow_server = MockServer::start().await;
     Mock::given(method("GET"))
         .respond_with(ResponseTemplate::new(404).set_delay(Duration::from_millis(200)))
         .mount(&slow_server)
         .await;
-    registry.register(Arc::new(
-        BasicWorkerBuilder::new(&slow_server.uri()).build(),
-    ));
+    let w1 = BasicWorkerBuilder::new(&slow_server.uri())
+        .worker_type(WorkerType::Regular)
+        .build();
+    registry.register(Arc::new(w1));
     servers.push(slow_server);
 
-    // 2. Target (Success)
+    // Worker 1: The "Target" Worker (Instant 200 OK)
     let target_server = MockServer::start().await;
     Mock::given(method("GET"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"status":"ok"})))
         .mount(&target_server)
         .await;
-    registry.register(Arc::new(
-        BasicWorkerBuilder::new(&target_server.uri()).build(),
-    ));
+    let w2 = BasicWorkerBuilder::new(&target_server.uri())
+        .worker_type(WorkerType::Regular)
+        .build();
+    registry.register(Arc::new(w2));
     servers.push(target_server);
 
-    // 3. Fillers (Efficiently mocked using one server)
+    // Workers 2..N: Fillers (Instant 404)
     if size > 2 {
         let filler_server = MockServer::start().await;
         Mock::given(method("GET"))
@@ -54,9 +59,9 @@ async fn setup_cluster(size: usize) -> (Arc<Router>, Vec<MockServer>) {
             .mount(&filler_server)
             .await;
 
-        // Register multiple workers pointing to the same mock server to save OS resources
+        let filler_uri = filler_server.uri();
         for _ in 2..size {
-            let w = BasicWorkerBuilder::new(&filler_server.uri())
+            let w = BasicWorkerBuilder::new(&filler_uri)
                 .worker_type(WorkerType::Regular)
                 .build();
             registry.register(Arc::new(w));
@@ -64,14 +69,38 @@ async fn setup_cluster(size: usize) -> (Arc<Router>, Vec<MockServer>) {
         servers.push(filler_server);
     }
 
-    let ctx = Arc::new(AppContext::mock(registry, PolicyRegistry::new_default()));
-    let router = Router::new(&ctx).await.unwrap();
+    // 3. Construct AppContext Manually
+    // We cannot use mock() because it doesn't exist, so we build it.
+    let router_config = RouterConfig::default();
+    let client = reqwest::Client::new();
+    let policy_registry = Arc::new(PolicyRegistry::new(PolicyConfig::Random));
+    let tokenizer_registry = Arc::new(TokenizerRegistry::new());
+
+    let ctx = AppContext::builder()
+        .router_config(router_config)
+        .client(client)
+        .worker_registry(registry)
+        .policy_registry(policy_registry)
+        .tokenizer_registry(tokenizer_registry)
+        // Fill required fields with empty/memory implementations
+        .worker_job_queue(Arc::new(OnceLock::new()))
+        .workflow_engine(Arc::new(OnceLock::new()))
+        .mcp_manager(Arc::new(OnceLock::new()))
+        .response_storage(Arc::new(MemoryResponseStorage::new()))
+        .conversation_storage(Arc::new(MemoryConversationStorage::new()))
+        .conversation_item_storage(Arc::new(MemoryConversationItemStorage::new()))
+        .build()
+        .expect("Failed to build AppContext");
+
+    // 4. Create Router
+    let router = Router::new(&Arc::new(ctx))
+        .await
+        .expect("Failed to create Router");
 
     (Arc::new(router), servers)
 }
 
 // --- CUSTOM RESOURCE MONITOR (CPU & RPS) ---
-// Runs a quick load test to print CPU usage to stdout
 fn run_resource_monitor(_c: &mut Criterion) {
     println!("\n\n=== RESOURCE USAGE MONITOR ===");
     println!(
@@ -115,7 +144,9 @@ fn run_resource_monitor(_c: &mut Criterion) {
             // Collect results
             let mut latencies = Vec::new();
             for h in handles {
-                latencies.push(h.await.unwrap());
+                if let Ok(l) = h.await {
+                    latencies.push(l);
+                }
             }
             let duration = start.elapsed();
 
@@ -127,7 +158,11 @@ fn run_resource_monitor(_c: &mut Criterion) {
             // Stats
             let rps = 50.0 / duration.as_secs_f64();
             latencies.sort();
-            let p99 = latencies[(latencies.len() as f64 * 0.99) as usize];
+            let p99 = if !latencies.is_empty() {
+                latencies[(latencies.len() as f64 * 0.99) as usize]
+            } else {
+                0
+            };
 
             println!(
                 "{0: <15} | {1: <10.0} | {2: <10} | {3: <10.2}",
@@ -155,12 +190,13 @@ fn bench_latency(c: &mut Criterion) {
     for &size in sizes.iter() {
         group.throughput(Throughput::Elements(1));
         group.bench_with_input(BenchmarkId::from_parameter(size), &size, |b, &s| {
+            // FIX: Explicit types for the closure arguments to help type inference
             b.to_async(&rt).iter_with_setup(
                 || {
                     // Setup happens OUTSIDE the timing loop
                     rt.block_on(async { setup_cluster(s).await })
                 },
-                |(router, _guards)| async move {
+                |(router, _guards): (Arc<Router>, Vec<MockServer>)| async move {
                     // MEASURED HOT PATH
                     let _ = router
                         .get_response(None, "test-id", &Default::default())
