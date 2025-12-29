@@ -2,7 +2,11 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, NamedTuple, Optional
+from enum import Enum, auto
+from typing import NamedTuple, Optional
+
+import torch
+import torch.distributed as dist
 
 from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
@@ -17,11 +21,6 @@ from sglang.srt.layers.moe.token_dispatcher.base import (
 from sglang.srt.layers.moe.topk import TopKOutput
 from sglang.srt.layers.moe.utils import DeepEPMode
 from sglang.srt.utils import get_int_env_var
-
-from enum import Enum, auto
-
-import torch
-import torch.distributed as dist
 
 logger = logging.getLogger(__name__)
 
