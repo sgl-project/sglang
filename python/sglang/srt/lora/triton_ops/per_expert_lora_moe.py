@@ -197,19 +197,14 @@ def _per_expert_lora_kernel(
     out_ptrs = output_ptr + out_row_base + out_offs
     lora_out_ptrs = lora_output_ptr + out_row_base + out_offs
 
+    # Compute combined mask
+    store_mask = out_mask & has_rank
+
     # Add to base_output in-place
-    tl.atomic_add(
-        out_ptrs,
-        out_vals.to(tl.float16),
-        mask=out_mask & has_rank,
-    )
+    tl.atomic_add(out_ptrs, out_vals.to(tl.float16), store_mask)
 
     # Also store to separate lora_output tensor
-    tl.atomic_add(
-        lora_out_ptrs,
-        out_vals,
-        mask=out_mask & has_rank,
-    )
+    tl.atomic_add(lora_out_ptrs, out_vals, store_mask)
 
 
 def per_expert_lora_forward(
