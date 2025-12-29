@@ -3,6 +3,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # Adapted from vllm: https://github.com/vllm-project/vllm/blob/v0.7.3/vllm/model_executor/layers/layernorm.py
 """Custom normalization layers."""
+from sglang.jit_kernel.diffusion.fused_scale_residual_norm_scale_shift import (
+    fused_scale_residual_norm_scale_shift,
+)
+from sglang.jit_kernel.diffusion.fused_norm_scale_shift import fused_norm_scale_shift
+from sgl_kernel import (
+    fused_add_rmsnorm,
+    rmsnorm,
+)
 from typing import Optional, Tuple, Union
 
 import torch
@@ -15,19 +23,14 @@ from sglang.multimodal_gen.runtime.layers.triton_ops import (
     norm_infer,
     rms_norm_fn,
 )
-from sglang.multimodal_gen.runtime.utils.common import get_bool_env_var, is_cuda
+from sglang.multimodal_gen.runtime.utils.common import get_bool_env_var
+from sglang.multimodal_gen.runtime.platforms import current_platform
 
-_is_cuda = is_cuda()
-
-from sgl_kernel import (
-    fused_add_rmsnorm,
-    fused_norm_scale_shift,
-    fused_scale_residual_norm_scale_shift,
-    rmsnorm,
-)
+_is_cuda = current_platform.is_cuda()
 
 
 # Copied and adapted from sglang
+
 @CustomOp.register("rms_norm")
 class RMSNorm(CustomOp):
     """Root mean square normalization.
@@ -75,7 +78,8 @@ class RMSNorm(CustomOp):
         elif self.variance_size_override is not None:
             return self.forward_native(x, residual)
         elif residual is not None:
-            fused_add_rmsnorm(x, residual, self.weight.data, self.variance_epsilon)
+            fused_add_rmsnorm(x, residual, self.weight.data,
+                              self.variance_epsilon)
             return x.view(shape), residual.view(residual_shape)
         else:
             out = rmsnorm(x, self.weight.data, self.variance_epsilon)
@@ -159,7 +163,8 @@ class LayerNorm(CustomOp):
         factory_kwargs = {"device": device, "dtype": dtype}
         self.hidden_size = hidden_size
         if elementwise_affine:
-            self.weight = torch.nn.Parameter(torch.empty(hidden_size, **factory_kwargs))
+            self.weight = torch.nn.Parameter(
+                torch.empty(hidden_size, **factory_kwargs))
             self.bias = (
                 torch.nn.Parameter(torch.empty(hidden_size, **factory_kwargs))
                 if bias
@@ -380,7 +385,8 @@ class ScaleResidualLayerNormScaleShift(nn.Module):
                 assert gate == 1
             elif isinstance(gate, torch.Tensor):
                 if (gate.dim() == 2 and gate.shape[0] == 1) or (
-                    gate.dim() == 3 and gate.shape[0] == 1 and gate.shape[1] == 1
+                    gate.dim(
+                    ) == 3 and gate.shape[0] == 1 and gate.shape[1] == 1
                 ):
                     gate_opt = gate.contiguous().to(dtype=x.dtype, device=x.device)
                 elif gate.dim() == 4:
@@ -426,7 +432,8 @@ class ScaleResidualLayerNormScaleShift(nn.Module):
                     num_frames = gate.shape[1]
                     frame_seqlen = x.shape[1] // num_frames
                     residual_output = residual + (
-                        x.unflatten(dim=1, sizes=(num_frames, frame_seqlen)) * gate
+                        x.unflatten(dim=1, sizes=(
+                            num_frames, frame_seqlen)) * gate
                     ).flatten(1, 2)
                 else:
                     # gate.shape: [batch_size, 1, inner_dim]
@@ -459,7 +466,8 @@ class LayerNormScaleShift(nn.Module):
         self.norm_type = norm_type
         self.eps = eps
         if norm_type == "rms":
-            self.norm = RMSNorm(hidden_size, has_weight=elementwise_affine, eps=eps)
+            self.norm = RMSNorm(
+                hidden_size, has_weight=elementwise_affine, eps=eps)
         elif norm_type == "layer":
             if self.compute_dtype == torch.float32:
                 self.norm = FP32LayerNorm(
@@ -500,13 +508,15 @@ class LayerNormScaleShift(nn.Module):
         elif t.dim() == 4:
             return t.contiguous().to(dtype=x.dtype, device=x.device)
         else:
-            raise ValueError(f"Scale/shift tensor dimension {t.dim()} not supported")
+            raise ValueError(
+                f"Scale/shift tensor dimension {t.dim()} not supported")
 
     def forward(
         self, x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor
     ) -> torch.Tensor:
         """Apply ln followed by scale and shift in a single fused operation."""
-        can_use_cuda = _is_cuda and (x.shape[-1] % 4 == 0)  # x.shape[-1]: hidden_size
+        can_use_cuda = _is_cuda and (
+            x.shape[-1] % 4 == 0)  # x.shape[-1]: hidden_size
         if can_use_cuda:
             B, L, C = x.shape
             M = B * L
@@ -561,7 +571,8 @@ class LayerNormScaleShift(nn.Module):
                 num_frames = scale.shape[1]
                 frame_seqlen = normalized.shape[1] // num_frames
                 output = (
-                    normalized.unflatten(dim=1, sizes=(num_frames, frame_seqlen))
+                    normalized.unflatten(
+                        dim=1, sizes=(num_frames, frame_seqlen))
                     * (1.0 + scale)
                     + shift
                 ).flatten(1, 2)
