@@ -136,7 +136,7 @@ class SchedulerPPMixin:
 
             # When the server is idle, self-check and re-init some states
             if server_is_idle:
-                self.check_during_pp_idle()
+                self.self_check_during_idle()
 
     @DynamicGradMode()
     def event_loop_pp_disagg_prefill(self: Scheduler):
@@ -312,7 +312,7 @@ class SchedulerPPMixin:
 
             # When the server is idle, self-check and re-init some states
             if server_is_idle and len(self.disagg_prefill_inflight_queue) == 0:
-                self.check_during_pp_idle()
+                self.self_check_during_idle()
 
     @DynamicGradMode()
     def event_loop_pp_disagg_decode(self: Scheduler):
@@ -501,7 +501,7 @@ class SchedulerPPMixin:
                 queue_size += len(self.decode_offload_manager.ongoing_offload)
 
             if server_is_idle and queue_size == 0:
-                self.check_during_pp_idle()
+                self.self_check_during_idle()
 
     def init_pp_loop_state(self: Scheduler):
         self.pp_loop_size: int = self.pp_size + self.server_args.pp_async_batch_depth
@@ -565,7 +565,7 @@ class SchedulerPPMixin:
                 )
                 req.fill_ids = req.origin_input_ids
                 req.extend_input_len = len(req.fill_ids) - len(req.prefix_indices)
-                req.logprob_start_len = len(req.origin_input_ids) - 1
+                req.logprob_start_len = -1
 
                 # Prepare batch
                 batch = ScheduleBatch.init_new(
@@ -666,7 +666,7 @@ class SchedulerPPMixin:
             f"Target latency: {self.length_predictor.target_latency:.2f}ms"
         )
 
-    def predict_next_chunk_size(self: "Scheduler", history_len: int) -> Optional[int]:
+    def predict_next_chunk_size(self: Scheduler, history_len: int) -> Optional[int]:
         """
         Predict next chunk size dynamically based on current history length.
 
@@ -699,12 +699,6 @@ class SchedulerPPMixin:
             )
 
         return predicted_size
-
-    def check_during_pp_idle(self: Scheduler):
-        self.check_memory()
-        self.check_tree_cache()
-        self.new_token_ratio = self.init_new_token_ratio
-        self.maybe_sleep_on_idle()
 
     def process_bootstrapped_queue(
         self: Scheduler, bootstrapped_rids: Optional[List[str]]
