@@ -1303,6 +1303,8 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
 class NPUCompressedTensorsW4A8Int8DynamicMoEMethod(CompressedTensorsMoEMethod):
 
     def __init__(self, quantization_config) -> None:
+        self.group_size = 0
+        self.tp_size = 1
         self.activation_use_clip = activation_use_clip
         self.kernel = NPUW4A8Int8DynamicMoEMethod()
 
