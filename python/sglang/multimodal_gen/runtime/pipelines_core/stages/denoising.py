@@ -698,6 +698,8 @@ class DenoisingStage(PipelineStage):
             if offload_mgr_2 is not None and getattr(offload_mgr_2, "enabled", False):
                 offload_mgr_2.release_all()
 
+        self._offload_transformers_after_denoising(server_args)
+
         # Save STA mask search results if needed
         if (
             self.attn_backend.get_enum() == AttentionBackendEnum.SLIDING_TILE_ATTN
@@ -720,6 +722,26 @@ class DenoisingStage(PipelineStage):
                 "Memory after deallocating transformer: %s",
                 torch.mps.current_allocated_memory(),
             )
+
+    def _offload_transformers_after_denoising(self, server_args: ServerArgs) -> None:
+        if not (server_args.dit_cpu_offload or server_args.dit_layerwise_offload):
+            return
+        if current_platform.device_type != "cuda":
+            return
+
+        did_offload = False
+        for model in (self.transformer, self.transformer_2):
+            if model is None:
+                continue
+            model_param = next(model.parameters(), None)
+            if model_param is None:
+                continue
+            if model_param.device.type == "cuda":
+                model.to("cpu")
+                did_offload = True
+
+        if did_offload:
+            torch.cuda.empty_cache()
 
     def _preprocess_sp_latents(self, batch: Req, server_args: ServerArgs):
         """Shard latents for Sequence Parallelism if applicable."""
