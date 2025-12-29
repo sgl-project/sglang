@@ -398,12 +398,17 @@ impl Tree {
 
                         // Attach tenant to the new split node (intermediate - no timestamp update)
                         // The cloned DashMap already has the tenant; just ensure char count is correct
-                        if !new_node.tenant_last_access_time.contains_key(tenant_id.as_ref()) {
+                        if !new_node
+                            .tenant_last_access_time
+                            .contains_key(tenant_id.as_ref())
+                        {
                             self.tenant_char_count
                                 .entry(Arc::clone(&tenant_id))
                                 .and_modify(|count| *count += matched_text_count)
                                 .or_insert(matched_text_count);
-                            new_node.tenant_last_access_time.insert(Arc::clone(&tenant_id), 0);
+                            new_node
+                                .tenant_last_access_time
+                                .insert(Arc::clone(&tenant_id), 0);
                         }
 
                         InsertStep::Continue {
@@ -415,12 +420,17 @@ impl Tree {
                         drop(matched_node_text);
 
                         // Ensure tenant exists at this intermediate node
-                        if !matched_node.tenant_last_access_time.contains_key(tenant_id.as_ref()) {
+                        if !matched_node
+                            .tenant_last_access_time
+                            .contains_key(tenant_id.as_ref())
+                        {
                             self.tenant_char_count
                                 .entry(Arc::clone(&tenant_id))
                                 .and_modify(|count| *count += matched_node_text_count)
                                 .or_insert(matched_node_text_count);
-                            matched_node.tenant_last_access_time.insert(Arc::clone(&tenant_id), 0);
+                            matched_node
+                                .tenant_last_access_time
+                                .insert(Arc::clone(&tenant_id), 0);
                         }
 
                         InsertStep::Continue {
@@ -447,7 +457,8 @@ impl Tree {
         // Loop exited normally (remaining empty) - prev is the leaf node
         // Update its timestamp for LRU ordering
         let epoch = get_epoch();
-        prev.tenant_last_access_time.insert(Arc::clone(&tenant_id), epoch);
+        prev.tenant_last_access_time
+            .insert(Arc::clone(&tenant_id), epoch);
     }
 
     /// Performs prefix matching and returns detailed result with char counts.
