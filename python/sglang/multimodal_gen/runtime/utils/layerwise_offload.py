@@ -1,5 +1,6 @@
 import re
 from contextlib import contextmanager
+from itertools import chain
 from typing import Any, Dict, List, Set, Tuple
 
 import torch
@@ -79,20 +80,13 @@ class LayerwiseOffloadManager:
 
         # 1. collect and group tensors by layer and dtype
         layer_groups: Dict[int, Dict[torch.dtype, List[Tuple[str, torch.Tensor]]]] = {}
-        for name, param in self._named_parameters.items():
+        all_tensors = chain(self._named_parameters.items(), self._named_buffers.items())
+        for name, tensor in all_tensors:
             layer_idx = self._match_layer_idx(name)
             if layer_idx is None or layer_idx >= self.num_layers:
                 continue
-            layer_groups.setdefault(layer_idx, {}).setdefault(param.dtype, []).append(
-                (name, param)
-            )
-
-        for name, buf in self._named_buffers.items():
-            layer_idx = self._match_layer_idx(name)
-            if layer_idx is None or layer_idx >= self.num_layers:
-                continue
-            layer_groups.setdefault(layer_idx, {}).setdefault(buf.dtype, []).append(
-                (name, buf)
+            layer_groups.setdefault(layer_idx, {}).setdefault(tensor.dtype, []).append(
+                (name, tensor)
             )
 
         # 2. concat and offload (in pinned memory)
