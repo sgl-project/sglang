@@ -268,72 +268,18 @@ class HiCacheController:
         self.page_size = page_size
         self.io_backend = io_backend
         self.enable_storage = False
+        self.storage_backend = None
+        self.storage_backend_type = None
+
+        # Default storage page IO functions (may be overridden by attach).
+        self.page_get_func = self._generic_page_get
+        self.page_set_func = self._generic_page_set
+
         # Dedicated stop event for storage background threads (prefetch/backup).
         # NOTE: Do NOT reuse `self.stop_event` here since it also guards core HiCache
         # transfer buffers (CPU<->GPU). We want to allow runtime attach/detach of
         # storage without stopping the whole controller.
         self.storage_stop_event = threading.Event()
-
-        if storage_backend is not None:
-            self.storage_backend_type = storage_backend
-            from sglang.srt.mem_cache.hicache_storage import get_hash_str
-
-            self.get_hash_str = get_hash_str
-            self.storage_config = self._generate_storage_config(
-                model_name, storage_backend_extra_config
-            )
-            # for MLA models, only one rank needs to backup the KV cache
-            self.backup_skip = (
-                self.storage_config.is_mla_model
-                # todo: load balancing
-                and self.storage_config.tp_rank != 0
-            )
-
-            # Use storage backend factory for dynamic backend creation
-            from sglang.srt.mem_cache.storage import StorageBackendFactory
-
-            try:
-                self.storage_backend = StorageBackendFactory.create_backend(
-                    storage_backend, self.storage_config, self.mem_pool_host
-                )
-            except ValueError as e:
-                raise ValueError(f"Failed to create storage backend: {e}") from e
-
-            self.storage_backend.register_mem_pool_host(self.mem_pool_host)
-
-            self.enable_storage = True
-            # todo: threshold policy for prefetching
-            self.prefetch_threshold = max(prefetch_threshold, self.page_size)
-            self.prefetch_capacity_limit = int(
-                0.8 * (self.mem_pool_host.size - self.mem_pool_device.size)
-            )
-            # granularity of batch storage IO operations, in number of pages
-            self.storage_batch_size = 128
-            # tracking the number of tokens locked in prefetching, updated by the main scheduler thread
-            self.prefetch_tokens_occupied = 0
-
-            # create a new communication group for synchronizing storage operations across TP workers
-            self.tp_world_size = torch.distributed.get_world_size(group=self.tp_group)
-            if self.tp_world_size > 1:
-                from sglang.srt.distributed.parallel_state import (
-                    create_custom_parallel_group,
-                )
-
-                group_ranks = torch.distributed.get_process_group_ranks(tp_group)
-                self.prefetch_tp_group = create_custom_parallel_group(
-                    group_ranks=group_ranks, backend="gloo"
-                )
-
-            # Select the get and set functions
-            self.page_get_func = self._generic_page_get
-            self.page_set_func = self._generic_page_set
-
-            if (self.storage_backend_type in ["hf3fs", "mooncake", "eic"]) or (
-                self.storage_backend_type == "dynamic"
-                and bool(self.storage_config.extra_config.get("interface_v1", 0))
-            ):
-                self.page_get_func = self._page_get_zero_copy
-                self.page_set_func = self._page_set_zero_copy
 
         self.device = self.mem_pool_device.device
         self.layer_num = self.mem_pool_device.layer_num
@@ -362,22 +308,19 @@ class HiCacheController:
         self.write_stream = device_module.Stream()
         self.load_stream = device_module.Stream()
 
-        if self.enable_storage:
-            self.prefetch_thread = threading.Thread(
-                target=self.prefetch_thread_func, daemon=True
-            )
-            self.backup_thread = threading.Thread(
-                target=self.backup_thread_func, daemon=True
-            )
-            self.prefetch_queue = Queue()
-            self.backup_queue = Queue()
-
-            self.prefetch_revoke_queue = Queue()
-            self.ack_backup_queue = Queue()
-            self.host_mem_release_queue = Queue()
-
-            self.prefetch_thread.start()
-            self.backup_thread.start()
+        # If a storage backend is provided at startup, treat it as an implicit attach,
+        # so init/runtime share the same lifecycle semantics and code paths.
+        if storage_backend is not None:
+            try:
+                self.attach_storage_backend(
+                    storage_backend=storage_backend,
+                    prefetch_threshold=prefetch_threshold,
+                    model_name=model_name,
+                    storage_backend_extra_config=storage_backend_extra_config,
+                )
+            except ValueError as e:
+                # Preserve the historical error shape on init for unknown backends.
+                raise ValueError(f"Failed to create storage backend: {e}") from e
 
     def _start_storage_threads(self):
         """Start storage prefetch/backup threads and their queues.
@@ -482,10 +425,14 @@ class HiCacheController:
         self.storage_config = self._generate_storage_config(
             model_name, storage_backend_extra_config
         )
+        # for MLA models, only one rank needs to backup the KV cache
         self.backup_skip = (
-            self.storage_config.is_mla_model and self.storage_config.tp_rank != 0
+            self.storage_config.is_mla_model
+            # todo: load balancing
+            and self.storage_config.tp_rank != 0
         )
 
+        # Use storage backend factory for dynamic backend creation
         from sglang.srt.mem_cache.storage import StorageBackendFactory
 
         try:
@@ -495,13 +442,17 @@ class HiCacheController:
             self.storage_backend.register_mem_pool_host(self.mem_pool_host)
 
             self.enable_storage = True
+            # todo: threshold policy for prefetching
             self.prefetch_threshold = max(prefetch_threshold, self.page_size)
             self.prefetch_capacity_limit = max(
                 0, int(0.8 * (self.mem_pool_host.size - self.mem_pool_device.size))
             )
+            # granularity of batch storage IO operations, in number of pages
             self.storage_batch_size = 128
+            # tracking the number of tokens locked in prefetching, updated by the main scheduler thread
             self.prefetch_tokens_occupied = 0
 
+            # create a new communication group for synchronizing storage operations across TP workers
             self.tp_world_size = torch.distributed.get_world_size(group=self.tp_group)
             if self.tp_world_size > 1:
                 from sglang.srt.distributed.parallel_state import (
@@ -513,8 +464,10 @@ class HiCacheController:
                     group_ranks=group_ranks, backend="gloo"
                 )
 
+            # Select the get and set functions
             self.page_get_func = self._generic_page_get
             self.page_set_func = self._generic_page_set
+
             if (self.storage_backend_type in ["hf3fs", "mooncake", "eic"]) or (
                 self.storage_backend_type == "dynamic"
                 and bool(self.storage_config.extra_config.get("interface_v1", 0))

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import atexit
 import heapq
 import json
 import logging
@@ -127,7 +128,22 @@ class HiRadixCache(RadixCache):
         )
         self.load_back_threshold = 10
 
+        # Detach storage backend automatically on process shutdown
+        atexit.register(self.shutdown)
+
         super().__init__(params=params)
+
+    def shutdown(self):
+        """Best-effort auto-detach of storage backend on process shutdown.
+
+        This keeps startup and runtime behavior consistent: if a backend was attached
+        (either via CLI args or via admin API), we attempt to detach it on exit.
+        """
+        try:
+            if self.enable_storage:
+                self.detach_storage_backend()
+        except Exception:
+            logger.exception("Failed to detach storage backend on process shutdown.")
 
     def attach_storage_backend(
         self,
