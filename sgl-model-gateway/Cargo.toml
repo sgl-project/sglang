@@ -148,13 +148,7 @@ opentelemetry-proto = { version = "0.27", features = ["gen-tonic"] }
 tonic-v12 = { version = "0.12.3", package = "tonic" }
 serial_test = "3.0"
 rsa = { version = "0.9", features = ["sha2"] }
-sysinfo = "0.30"
-hdrhistogram = "7.5"
-wiremock = "0.6"
-[[bench]]
-name = "fanout_routing_bench"
-harness = false
-path = "benches/fanout_routing_bench.rs"
+
 [[bench]]
 name = "request_processing"
 harness = false
