@@ -1,4 +1,3 @@
-/// test
 use std::{
     sync::{
         atomic::{AtomicBool, Ordering},

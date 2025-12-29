@@ -523,6 +523,7 @@ class SchedulerDisaggregationPrefillMixin:
                 )
 
         self.maybe_send_health_check_signal()
+        self.log_prefill_stats_late(batch)
 
     def process_disagg_prefill_inflight_queue(
         self: Scheduler, rids_to_check: Optional[List[str]] = None
