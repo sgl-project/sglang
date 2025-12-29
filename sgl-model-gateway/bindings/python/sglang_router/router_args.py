@@ -126,6 +126,15 @@ class RouterArgs:
     # Trace
     enable_trace: bool = False
     otlp_traces_endpoint: str = "localhost:4317"
+    # Control plane authentication
+    # API keys for control plane auth (list of tuples: id, name, key, role)
+    control_plane_api_keys: List[tuple] = dataclasses.field(default_factory=list)
+    control_plane_audit_enabled: bool = False
+    # JWT/OIDC configuration for control plane auth
+    jwt_issuer: Optional[str] = None
+    jwt_audience: Optional[str] = None
+    jwt_jwks_uri: Optional[str] = None
+    jwt_role_mapping: Dict[str, str] = dataclasses.field(default_factory=dict)
 
     @staticmethod
     def add_cli_args(
@@ -143,22 +152,79 @@ class RouterArgs:
         """
         prefix = "router-" if use_router_prefix else ""
 
+        # Create argument groups for organized --help output
+        worker_group = parser.add_argument_group(
+            "Worker Configuration", "Settings for worker connections and URLs"
+        )
+        routing_group = parser.add_argument_group(
+            "Routing Policy", "Load balancing and routing configuration"
+        )
+        pd_group = parser.add_argument_group(
+            "PD Disaggregation", "Prefill-Decode disaggregated mode settings"
+        )
+        k8s_group = parser.add_argument_group(
+            "Service Discovery (Kubernetes)", "Kubernetes-based worker discovery"
+        )
+        logging_group = parser.add_argument_group("Logging", "Log output configuration")
+        prometheus_group = parser.add_argument_group(
+            "Prometheus Metrics", "Metrics export configuration"
+        )
+        request_group = parser.add_argument_group(
+            "Request Handling", "Request timeout and ID configuration"
+        )
+        rate_limit_group = parser.add_argument_group(
+            "Rate Limiting", "Concurrent request and queue limits"
+        )
+        retry_group = parser.add_argument_group(
+            "Retry Configuration", "Automatic retry behavior for failed requests"
+        )
+        cb_group = parser.add_argument_group(
+            "Circuit Breaker", "Circuit breaker pattern configuration"
+        )
+        health_group = parser.add_argument_group(
+            "Health Checks", "Worker health monitoring settings"
+        )
+        tokenizer_group = parser.add_argument_group(
+            "Tokenizer", "Tokenizer and chat template configuration"
+        )
+        parser_group = parser.add_argument_group(
+            "Parsers", "Reasoning and tool-call parser settings"
+        )
+        backend_group = parser.add_argument_group(
+            "Backend", "Backend runtime and history storage selection"
+        )
+        oracle_group = parser.add_argument_group(
+            "Oracle Database", "Oracle database backend configuration"
+        )
+        postgres_group = parser.add_argument_group(
+            "PostgreSQL Database", "PostgreSQL database backend configuration"
+        )
+        tls_group = parser.add_argument_group(
+            "TLS/mTLS Security", "TLS certificates for server and worker communication"
+        )
+        trace_group = parser.add_argument_group(
+            "Tracing (OpenTelemetry)", "Distributed tracing configuration"
+        )
+        auth_group = parser.add_argument_group(
+            "Control Plane Authentication", "API key and JWT/OIDC authentication"
+        )
+
         # Worker configuration
         if not exclude_host_port:
-            parser.add_argument(
+            worker_group.add_argument(
                 "--host",
                 type=str,
                 default=RouterArgs.host,
                 help="Host address to bind the router server. Supports IPv4, IPv6 (e.g., ::, ::1), or 0.0.0.0 for all interfaces",
             )
-            parser.add_argument(
+            worker_group.add_argument(
                 "--port",
                 type=int,
                 default=RouterArgs.port,
                 help="Port number to bind the router server",
             )
 
-        parser.add_argument(
+        worker_group.add_argument(
             "--worker-urls",
             type=str,
             nargs="*",
@@ -167,40 +233,99 @@ class RouterArgs:
         )
 
         # Routing policy configuration
-        parser.add_argument(
+        routing_group.add_argument(
             f"--{prefix}policy",
             type=str,
             default=RouterArgs.policy,
-            choices=["random", "round_robin", "cache_aware", "power_of_two"],
+            choices=["random", "round_robin", "cache_aware", "power_of_two", "manual"],
             help="Load balancing policy to use. In PD mode, this is used for both prefill and decode unless overridden",
         )
-        parser.add_argument(
+        routing_group.add_argument(
             f"--{prefix}prefill-policy",
             type=str,
             default=None,
-            choices=["random", "round_robin", "cache_aware", "power_of_two", "bucket"],
+            choices=[
+                "random",
+                "round_robin",
+                "cache_aware",
+                "power_of_two",
+                "manual",
+                "bucket",
+            ],
             help="Specific policy for prefill nodes in PD mode. If not specified, uses the main policy",
         )
-        parser.add_argument(
+        routing_group.add_argument(
             f"--{prefix}decode-policy",
             type=str,
             default=None,
-            choices=["random", "round_robin", "cache_aware", "power_of_two"],
+            choices=["random", "round_robin", "cache_aware", "power_of_two", "manual"],
             help="Specific policy for decode nodes in PD mode. If not specified, uses the main policy",
+        )
+        routing_group.add_argument(
+            f"--{prefix}cache-threshold",
+            type=float,
+            default=RouterArgs.cache_threshold,
+            help="Cache threshold (0.0-1.0) for cache-aware routing",
+        )
+        routing_group.add_argument(
+            f"--{prefix}balance-abs-threshold",
+            type=int,
+            default=RouterArgs.balance_abs_threshold,
+            help="Absolute threshold for load difference. Balancing is triggered if `(max_load - min_load) > abs_threshold` and the relative threshold is also met.",
+        )
+        routing_group.add_argument(
+            f"--{prefix}balance-rel-threshold",
+            type=float,
+            default=RouterArgs.balance_rel_threshold,
+            help="Relative threshold for load difference. Balancing is triggered if `max_load > min_load * rel_threshold` and the absolute threshold is also met.",
+        )
+        routing_group.add_argument(
+            f"--{prefix}bucket-adjust-interval-secs",
+            type=int,
+            default=RouterArgs.bucket_adjust_interval_secs,
+            help="Interval in seconds between bucket boundary adjustment operations",
+        )
+        routing_group.add_argument(
+            f"--{prefix}eviction-interval-secs",
+            type=int,
+            default=RouterArgs.eviction_interval_secs,
+            help="Interval in seconds between cache eviction operations",
+        )
+        routing_group.add_argument(
+            f"--{prefix}max-tree-size",
+            type=int,
+            default=RouterArgs.max_tree_size,
+            help="Maximum size of the approximation tree for cache-aware routing",
+        )
+        routing_group.add_argument(
+            f"--{prefix}max-payload-size",
+            type=int,
+            default=RouterArgs.max_payload_size,
+            help="Maximum payload size in bytes",
+        )
+        routing_group.add_argument(
+            f"--{prefix}dp-aware",
+            action="store_true",
+            help="Enable data parallelism aware schedule",
+        )
+        routing_group.add_argument(
+            f"--{prefix}enable-igw",
+            action="store_true",
+            help="Enable IGW (Inference-Gateway) mode for multi-model support",
         )
 
         # PD-specific arguments
-        parser.add_argument(
+        pd_group.add_argument(
             f"--{prefix}mini-lb",
             action="store_true",
             help="Enable MiniLB",
         )
-        parser.add_argument(
+        pd_group.add_argument(
             f"--{prefix}pd-disaggregation",
             action="store_true",
             help="Enable PD (Prefill-Decode) disaggregated mode",
         )
-        parser.add_argument(
+        pd_group.add_argument(
             f"--{prefix}prefill",
             nargs="+",
             action="append",
@@ -208,127 +333,73 @@ class RouterArgs:
             "Format: --prefill URL [BOOTSTRAP_PORT]. "
             "BOOTSTRAP_PORT can be a port number, 'none', or omitted (defaults to none).",
         )
-        parser.add_argument(
+        pd_group.add_argument(
             f"--{prefix}decode",
             nargs=1,
             action="append",
             metavar=("URL",),
             help="Decode server URL. Can be specified multiple times.",
         )
-        parser.add_argument(
+        pd_group.add_argument(
             f"--{prefix}worker-startup-timeout-secs",
             type=int,
             default=RouterArgs.worker_startup_timeout_secs,
             help="Timeout in seconds for worker startup and registration (default: 1800 / 30 minutes). Large models can take significant time to load into GPU memory.",
         )
-        parser.add_argument(
+        pd_group.add_argument(
             f"--{prefix}worker-startup-check-interval",
             type=int,
             default=RouterArgs.worker_startup_check_interval,
             help="Interval in seconds between checks for worker startup",
         )
-        parser.add_argument(
-            f"--{prefix}cache-threshold",
-            type=float,
-            default=RouterArgs.cache_threshold,
-            help="Cache threshold (0.0-1.0) for cache-aware routing",
-        )
-        parser.add_argument(
-            f"--{prefix}balance-abs-threshold",
-            type=int,
-            default=RouterArgs.balance_abs_threshold,
-            help="Load balancing is triggered when (max_load - min_load) > abs_threshold AND max_load > min_load * rel_threshold. Otherwise, use cache aware",
-        )
-        parser.add_argument(
-            f"--{prefix}balance-rel-threshold",
-            type=float,
-            default=RouterArgs.balance_rel_threshold,
-            help="Load balancing is triggered when (max_load - min_load) > abs_threshold AND max_load > min_load * rel_threshold. Otherwise, use cache aware",
-        )
-        parser.add_argument(
-            f"--{prefix}bucket-adjust-interval-secs",
-            type=int,
-            default=RouterArgs.bucket_adjust_interval_secs,
-            help="Interval in seconds between bucket boundary adjustment operations",
-        )
-        parser.add_argument(
-            f"--{prefix}eviction-interval-secs",
-            type=int,
-            default=RouterArgs.eviction_interval_secs,
-            help="Interval in seconds between cache eviction operations",
-        )
-        parser.add_argument(
-            f"--{prefix}max-tree-size",
-            type=int,
-            default=RouterArgs.max_tree_size,
-            help="Maximum size of the approximation tree for cache-aware routing",
-        )
-        parser.add_argument(
-            f"--{prefix}max-payload-size",
-            type=int,
-            default=RouterArgs.max_payload_size,
-            help="Maximum payload size in bytes",
-        )
-        parser.add_argument(
-            f"--{prefix}dp-aware",
-            action="store_true",
-            help="Enable data parallelism aware schedule",
-        )
-        parser.add_argument(
-            f"--{prefix}enable-igw",
-            action="store_true",
-            help="Enable IGW (Inference-Gateway) mode for multi-model support",
-        )
-        parser.add_argument(
-            f"--{prefix}api-key",
-            type=str,
-            default=None,
-            help="The api key used for the authorization with the worker.  Useful when the dp aware scheduling strategy is enaled.",
-        )
-        parser.add_argument(
+
+        # Logging configuration
+        logging_group.add_argument(
             f"--{prefix}log-dir",
             type=str,
             default=None,
             help="Directory to store log files. If not specified, logs are only output to console.",
         )
-        parser.add_argument(
+        logging_group.add_argument(
             f"--{prefix}log-level",
             type=str,
             default="info",
             choices=["debug", "info", "warn", "error"],
             help="Set the logging level. If not specified, defaults to INFO.",
         )
-        parser.add_argument(
+
+        # Service discovery configuration
+        k8s_group.add_argument(
             f"--{prefix}service-discovery",
             action="store_true",
             help="Enable Kubernetes service discovery",
         )
-        parser.add_argument(
+        k8s_group.add_argument(
             f"--{prefix}selector",
             type=str,
             nargs="+",
             default={},
             help="Label selector for Kubernetes service discovery (format: key1=value1 key2=value2)",
         )
-        parser.add_argument(
+        k8s_group.add_argument(
             f"--{prefix}service-discovery-port",
             type=int,
             default=RouterArgs.service_discovery_port,
             help="Port to use for discovered worker pods",
         )
-        parser.add_argument(
+        k8s_group.add_argument(
             f"--{prefix}service-discovery-namespace",
             type=str,
             help="Kubernetes namespace to watch for pods. If not provided, watches all namespaces (requires cluster-wide permissions)",
         )
-        parser.add_argument(
+        k8s_group.add_argument(
             f"--{prefix}prefill-selector",
             type=str,
             nargs="+",
             default={},
             help="Label selector for prefill server pods in PD mode (format: key1=value1 key2=value2)",
         )
-        parser.add_argument(
+        k8s_group.add_argument(
             f"--{prefix}decode-selector",
             type=str,
             nargs="+",
@@ -336,285 +407,303 @@ class RouterArgs:
             help="Label selector for decode server pods in PD mode (format: key1=value1 key2=value2)",
         )
         # Prometheus configuration
-        parser.add_argument(
+        prometheus_group.add_argument(
             f"--{prefix}prometheus-port",
             type=int,
             default=29000,
-            help="Port to expose Prometheus metrics. If not specified, Prometheus metrics are disabled",
+            help="Port to expose Prometheus metrics (default: 29000).",
         )
-        parser.add_argument(
+        prometheus_group.add_argument(
             f"--{prefix}prometheus-host",
             type=str,
             default="0.0.0.0",
             help="Host address to bind the Prometheus metrics server. Supports IPv4, IPv6 (e.g., ::, ::1), or 0.0.0.0 for all interfaces",
         )
-        parser.add_argument(
+        prometheus_group.add_argument(
             f"--{prefix}prometheus-duration-buckets",
             type=float,
             nargs="+",
             help="Buckets for Prometheus duration metrics",
         )
-        parser.add_argument(
+
+        # Request handling configuration
+        request_group.add_argument(
             f"--{prefix}request-id-headers",
             type=str,
             nargs="*",
             help="Custom HTTP headers to check for request IDs (e.g., x-request-id x-trace-id). If not specified, uses common defaults.",
         )
-        parser.add_argument(
+        request_group.add_argument(
             f"--{prefix}request-timeout-secs",
             type=int,
             default=RouterArgs.request_timeout_secs,
             help="Request timeout in seconds",
         )
-        parser.add_argument(
+        request_group.add_argument(
             f"--{prefix}shutdown-grace-period-secs",
             type=int,
             default=RouterArgs.shutdown_grace_period_secs,
             help="Grace period in seconds to wait for in-flight requests during shutdown",
         )
-        # Retry configuration
-        parser.add_argument(
-            f"--{prefix}retry-max-retries",
-            type=int,
-            default=RouterArgs.retry_max_retries,
-        )
-        parser.add_argument(
-            f"--{prefix}retry-initial-backoff-ms",
-            type=int,
-            default=RouterArgs.retry_initial_backoff_ms,
-        )
-        parser.add_argument(
-            f"--{prefix}retry-max-backoff-ms",
-            type=int,
-            default=RouterArgs.retry_max_backoff_ms,
-        )
-        parser.add_argument(
-            f"--{prefix}retry-backoff-multiplier",
-            type=float,
-            default=RouterArgs.retry_backoff_multiplier,
-        )
-        parser.add_argument(
-            f"--{prefix}retry-jitter-factor",
-            type=float,
-            default=RouterArgs.retry_jitter_factor,
-        )
-        parser.add_argument(
-            f"--{prefix}disable-retries",
-            action="store_true",
-            help="Disable retries (equivalent to setting retry_max_retries=1)",
-        )
-        # Circuit breaker configuration
-        parser.add_argument(
-            f"--{prefix}cb-failure-threshold",
-            type=int,
-            default=RouterArgs.cb_failure_threshold,
-        )
-        parser.add_argument(
-            f"--{prefix}cb-success-threshold",
-            type=int,
-            default=RouterArgs.cb_success_threshold,
-        )
-        parser.add_argument(
-            f"--{prefix}cb-timeout-duration-secs",
-            type=int,
-            default=RouterArgs.cb_timeout_duration_secs,
-        )
-        parser.add_argument(
-            f"--{prefix}cb-window-duration-secs",
-            type=int,
-            default=RouterArgs.cb_window_duration_secs,
-        )
-        parser.add_argument(
-            f"--{prefix}disable-circuit-breaker",
-            action="store_true",
-            help="Disable circuit breaker (equivalent to setting cb_failure_threshold to u32::MAX)",
-        )
-        # Health check configuration
-        parser.add_argument(
-            f"--{prefix}health-failure-threshold",
-            type=int,
-            default=RouterArgs.health_failure_threshold,
-            help="Number of consecutive health check failures before marking worker unhealthy",
-        )
-        parser.add_argument(
-            f"--{prefix}health-success-threshold",
-            type=int,
-            default=RouterArgs.health_success_threshold,
-            help="Number of consecutive health check successes before marking worker healthy",
-        )
-        parser.add_argument(
-            f"--{prefix}health-check-timeout-secs",
-            type=int,
-            default=RouterArgs.health_check_timeout_secs,
-            help="Timeout in seconds for health check requests",
-        )
-        parser.add_argument(
-            f"--{prefix}health-check-interval-secs",
-            type=int,
-            default=RouterArgs.health_check_interval_secs,
-            help="Interval in seconds between runtime health checks",
-        )
-        parser.add_argument(
-            f"--{prefix}health-check-endpoint",
-            type=str,
-            default=RouterArgs.health_check_endpoint,
-            help="Health check endpoint path",
-        )
-        parser.add_argument(
-            f"--{prefix}max-concurrent-requests",
-            type=int,
-            default=RouterArgs.max_concurrent_requests,
-            help="Maximum number of concurrent requests allowed (for rate limiting). Set to -1 to disable rate limiting.",
-        )
-        parser.add_argument(
-            f"--{prefix}queue-size",
-            type=int,
-            default=RouterArgs.queue_size,
-            help="Queue size for pending requests when max concurrent limit reached (0 = no queue, return 429 immediately)",
-        )
-        parser.add_argument(
-            f"--{prefix}queue-timeout-secs",
-            type=int,
-            default=RouterArgs.queue_timeout_secs,
-            help="Maximum time (in seconds) a request can wait in queue before timing out",
-        )
-        parser.add_argument(
-            f"--{prefix}rate-limit-tokens-per-second",
-            type=int,
-            default=RouterArgs.rate_limit_tokens_per_second,
-            help="Token bucket refill rate (tokens per second). If not set, defaults to max_concurrent_requests",
-        )
-        parser.add_argument(
+        request_group.add_argument(
             f"--{prefix}cors-allowed-origins",
             type=str,
             nargs="*",
             default=[],
             help="CORS allowed origins (e.g., http://localhost:3000 https://example.com)",
         )
+
+        # Rate limiting configuration
+        rate_limit_group.add_argument(
+            f"--{prefix}max-concurrent-requests",
+            type=int,
+            default=RouterArgs.max_concurrent_requests,
+            help="Maximum number of concurrent requests allowed (for rate limiting). Set to -1 to disable rate limiting.",
+        )
+        rate_limit_group.add_argument(
+            f"--{prefix}queue-size",
+            type=int,
+            default=RouterArgs.queue_size,
+            help="Queue size for pending requests when max concurrent limit reached (0 = no queue, return 429 immediately)",
+        )
+        rate_limit_group.add_argument(
+            f"--{prefix}queue-timeout-secs",
+            type=int,
+            default=RouterArgs.queue_timeout_secs,
+            help="Maximum time (in seconds) a request can wait in queue before timing out",
+        )
+        rate_limit_group.add_argument(
+            f"--{prefix}rate-limit-tokens-per-second",
+            type=int,
+            default=RouterArgs.rate_limit_tokens_per_second,
+            help="Token bucket refill rate (tokens per second). If not set, defaults to max_concurrent_requests",
+        )
+
+        # Retry configuration
+        retry_group.add_argument(
+            f"--{prefix}retry-max-retries",
+            type=int,
+            default=RouterArgs.retry_max_retries,
+            help="Maximum number of retry attempts for failed requests",
+        )
+        retry_group.add_argument(
+            f"--{prefix}retry-initial-backoff-ms",
+            type=int,
+            default=RouterArgs.retry_initial_backoff_ms,
+            help="Initial backoff delay in milliseconds before first retry",
+        )
+        retry_group.add_argument(
+            f"--{prefix}retry-max-backoff-ms",
+            type=int,
+            default=RouterArgs.retry_max_backoff_ms,
+            help="Maximum backoff delay in milliseconds between retries",
+        )
+        retry_group.add_argument(
+            f"--{prefix}retry-backoff-multiplier",
+            type=float,
+            default=RouterArgs.retry_backoff_multiplier,
+            help="Multiplier for exponential backoff between retries",
+        )
+        retry_group.add_argument(
+            f"--{prefix}retry-jitter-factor",
+            type=float,
+            default=RouterArgs.retry_jitter_factor,
+            help="Jitter factor (0.0-1.0) to add randomness to retry delays",
+        )
+        retry_group.add_argument(
+            f"--{prefix}disable-retries",
+            action="store_true",
+            help="Disable retries (equivalent to setting retry_max_retries=1)",
+        )
+
+        # Circuit breaker configuration
+        cb_group.add_argument(
+            f"--{prefix}cb-failure-threshold",
+            type=int,
+            default=RouterArgs.cb_failure_threshold,
+            help="Number of failures before circuit breaker opens",
+        )
+        cb_group.add_argument(
+            f"--{prefix}cb-success-threshold",
+            type=int,
+            default=RouterArgs.cb_success_threshold,
+            help="Number of successes in half-open state before closing circuit",
+        )
+        cb_group.add_argument(
+            f"--{prefix}cb-timeout-duration-secs",
+            type=int,
+            default=RouterArgs.cb_timeout_duration_secs,
+            help="Time in seconds before attempting to close an open circuit",
+        )
+        cb_group.add_argument(
+            f"--{prefix}cb-window-duration-secs",
+            type=int,
+            default=RouterArgs.cb_window_duration_secs,
+            help="Sliding window duration in seconds for tracking failures",
+        )
+        cb_group.add_argument(
+            f"--{prefix}disable-circuit-breaker",
+            action="store_true",
+            help="Disable circuit breaker (equivalent to setting cb_failure_threshold to u32::MAX)",
+        )
+
+        # Health check configuration
+        health_group.add_argument(
+            f"--{prefix}health-failure-threshold",
+            type=int,
+            default=RouterArgs.health_failure_threshold,
+            help="Number of consecutive health check failures before marking worker unhealthy",
+        )
+        health_group.add_argument(
+            f"--{prefix}health-success-threshold",
+            type=int,
+            default=RouterArgs.health_success_threshold,
+            help="Number of consecutive health check successes before marking worker healthy",
+        )
+        health_group.add_argument(
+            f"--{prefix}health-check-timeout-secs",
+            type=int,
+            default=RouterArgs.health_check_timeout_secs,
+            help="Timeout in seconds for health check requests",
+        )
+        health_group.add_argument(
+            f"--{prefix}health-check-interval-secs",
+            type=int,
+            default=RouterArgs.health_check_interval_secs,
+            help="Interval in seconds between runtime health checks",
+        )
+        health_group.add_argument(
+            f"--{prefix}health-check-endpoint",
+            type=str,
+            default=RouterArgs.health_check_endpoint,
+            help="Health check endpoint path",
+        )
         # Tokenizer configuration
-        parser.add_argument(
+        tokenizer_group.add_argument(
             f"--{prefix}model-path",
             type=str,
             default=None,
             help="Model path for loading tokenizer (HuggingFace model ID or local path)",
         )
-        parser.add_argument(
+        tokenizer_group.add_argument(
             f"--{prefix}tokenizer-path",
             type=str,
             default=None,
             help="Explicit tokenizer path (overrides model_path tokenizer if provided)",
         )
-        parser.add_argument(
+        tokenizer_group.add_argument(
             f"--{prefix}chat-template",
             type=str,
             default=None,
             help="Chat template path (optional)",
         )
-        parser.add_argument(
+        tokenizer_group.add_argument(
             f"--{prefix}tokenizer-cache-enable-l0",
             action="store_true",
             default=RouterArgs.tokenizer_cache_enable_l0,
             help="Enable L0 (whole-string exact match) tokenizer cache (default: False)",
         )
-        parser.add_argument(
+        tokenizer_group.add_argument(
             f"--{prefix}tokenizer-cache-l0-max-entries",
             type=int,
             default=RouterArgs.tokenizer_cache_l0_max_entries,
             help="Maximum number of entries in L0 tokenizer cache (default: 10000)",
         )
-        parser.add_argument(
+        tokenizer_group.add_argument(
             f"--{prefix}tokenizer-cache-enable-l1",
             action="store_true",
             default=RouterArgs.tokenizer_cache_enable_l1,
             help="Enable L1 (prefix matching) tokenizer cache (default: False)",
         )
-        parser.add_argument(
+        tokenizer_group.add_argument(
             f"--{prefix}tokenizer-cache-l1-max-memory",
             type=int,
             default=RouterArgs.tokenizer_cache_l1_max_memory,
             help="Maximum memory for L1 tokenizer cache in bytes (default: 50MB)",
         )
-        parser.add_argument(
+
+        # Parser configuration
+        parser_group.add_argument(
             f"--{prefix}reasoning-parser",
             type=str,
             default=None,
             help="Specify the parser for reasoning models (e.g., deepseek-r1, qwen3)",
         )
         tool_call_parser_choices = get_available_tool_call_parsers()
-        parser.add_argument(
+        parser_group.add_argument(
             f"--{prefix}tool-call-parser",
             type=str,
             default=None,
             choices=tool_call_parser_choices,
             help=f"Specify the parser for tool-call interactions (e.g., json, qwen)",
         )
-        # MCP server configuration
-        parser.add_argument(
+        parser_group.add_argument(
             f"--{prefix}mcp-config-path",
             type=str,
             default=None,
             help="Path to MCP (Model Context Protocol) server configuration file",
         )
+
         # Backend selection
-        parser.add_argument(
+        backend_group.add_argument(
             f"--{prefix}backend",
             type=str,
             default=RouterArgs.backend,
             choices=["sglang", "openai"],
             help="Backend runtime to use (default: sglang)",
         )
-        # History backend configuration
-        parser.add_argument(
+        backend_group.add_argument(
             f"--{prefix}history-backend",
             type=str,
             default=RouterArgs.history_backend,
             choices=["memory", "none", "oracle", "postgres"],
             help="History storage backend for conversations and responses (default: memory)",
         )
+
         # Oracle configuration
-        parser.add_argument(
+        oracle_group.add_argument(
             f"--{prefix}oracle-wallet-path",
             type=str,
             default=os.getenv("ATP_WALLET_PATH"),
             help="Path to Oracle ATP wallet directory (env: ATP_WALLET_PATH)",
         )
-        parser.add_argument(
+        oracle_group.add_argument(
             f"--{prefix}oracle-tns-alias",
             type=str,
             default=os.getenv("ATP_TNS_ALIAS"),
             help="Oracle TNS alias from tnsnames.ora (env: ATP_TNS_ALIAS).",
         )
-        parser.add_argument(
+        oracle_group.add_argument(
             f"--{prefix}oracle-connect-descriptor",
             type=str,
             default=os.getenv("ATP_DSN"),
             help="Oracle connection descriptor/DSN (full connection string) (env: ATP_DSN)",
         )
-        parser.add_argument(
+        oracle_group.add_argument(
             f"--{prefix}oracle-username",
             type=str,
             default=os.getenv("ATP_USER"),
             help="Oracle database username (env: ATP_USER)",
         )
-        parser.add_argument(
+        oracle_group.add_argument(
             f"--{prefix}oracle-password",
             type=str,
             default=os.getenv("ATP_PASSWORD"),
             help="Oracle database password (env: ATP_PASSWORD)",
         )
-        parser.add_argument(
+        oracle_group.add_argument(
             f"--{prefix}oracle-pool-min",
             type=int,
             default=int(os.getenv("ATP_POOL_MIN", RouterArgs.oracle_pool_min)),
             help="Minimum Oracle connection pool size (default: 1, env: ATP_POOL_MIN)",
         )
-        parser.add_argument(
+        oracle_group.add_argument(
             f"--{prefix}oracle-pool-max",
             type=int,
             default=int(os.getenv("ATP_POOL_MAX", RouterArgs.oracle_pool_max)),
             help="Maximum Oracle connection pool size (default: 16, env: ATP_POOL_MAX)",
         )
-        parser.add_argument(
+        oracle_group.add_argument(
             f"--{prefix}oracle-pool-timeout-secs",
             type=int,
             default=int(
@@ -622,62 +711,113 @@ class RouterArgs:
             ),
             help="Oracle connection pool timeout in seconds (default: 30, env: ATP_POOL_TIMEOUT_SECS)",
         )
+
         # Postgres configuration
-        parser.add_argument(
+        postgres_group.add_argument(
             f"--{prefix}postgres-db-url",
             type=str,
             default=os.getenv("POSTGRES_DB_URL"),
             help="PostgreSQL database connection URL (env: POSTGRES_DB_URL)",
         )
-        parser.add_argument(
+        postgres_group.add_argument(
             f"--{prefix}postgres-pool-max",
             type=int,
             default=int(os.getenv("POSTGRES_POOL_MAX", RouterArgs.postgres_pool_max)),
             help="Maximum PostgreSQL connection pool size (default: 16, env: POSTGRES_POOL_MAX)",
         )
-        # mTLS configuration
-        parser.add_argument(
+
+        # TLS/mTLS configuration
+        tls_group.add_argument(
             f"--{prefix}client-cert-path",
             type=str,
             default=None,
             help="Path to client certificate for mTLS authentication with workers",
         )
-        parser.add_argument(
+        tls_group.add_argument(
             f"--{prefix}client-key-path",
             type=str,
             default=None,
             help="Path to client private key for mTLS authentication with workers",
         )
-        parser.add_argument(
+        tls_group.add_argument(
             f"--{prefix}ca-cert-paths",
             type=str,
             nargs="*",
             default=[],
             help="Path(s) to CA certificate(s) for verifying worker TLS certificates. Can specify multiple CAs.",
         )
-        # Server TLS configuration
-        parser.add_argument(
+        tls_group.add_argument(
             f"--{prefix}tls-cert-path",
             type=str,
             default=None,
             help="Path to server TLS certificate (PEM format)",
         )
-        parser.add_argument(
+        tls_group.add_argument(
             f"--{prefix}tls-key-path",
             type=str,
             default=None,
             help="Path to server TLS private key (PEM format)",
         )
-        parser.add_argument(
+
+        # Tracing configuration
+        trace_group.add_argument(
             f"--{prefix}enable-trace",
             action="store_true",
             help="Enable opentelemetry trace",
         )
-        parser.add_argument(
+        trace_group.add_argument(
             f"--{prefix}otlp-traces-endpoint",
             type=str,
             default="localhost:4317",
             help="Config opentelemetry collector endpoint if --enable-trace is set. format: <ip>:<port>",
+        )
+
+        # Control plane authentication
+        auth_group.add_argument(
+            f"--{prefix}api-key",
+            type=str,
+            default=None,
+            help="The api key used for the authorization with the worker. Useful when the dp aware scheduling strategy is enabled.",
+        )
+        auth_group.add_argument(
+            f"--{prefix}control-plane-api-keys",
+            type=str,
+            nargs="*",
+            default=[],
+            help="API keys for control plane authentication. Format: 'id:name:role:key' where role is 'admin' or 'user'. "
+            "Example: --control-plane-api-keys 'key1:Service Account:admin:secret123' 'key2:Read Only:user:secret456'",
+        )
+        auth_group.add_argument(
+            f"--{prefix}control-plane-audit-enabled",
+            action="store_true",
+            default=False,
+            help="Enable audit logging for control plane operations",
+        )
+        auth_group.add_argument(
+            f"--{prefix}jwt-issuer",
+            type=str,
+            default=None,
+            help="OIDC issuer URL for JWT authentication (e.g., https://login.microsoftonline.com/{tenant}/v2.0)",
+        )
+        auth_group.add_argument(
+            f"--{prefix}jwt-audience",
+            type=str,
+            default=None,
+            help="Expected audience claim for JWT tokens (usually the client ID or API identifier)",
+        )
+        auth_group.add_argument(
+            f"--{prefix}jwt-jwks-uri",
+            type=str,
+            default=None,
+            help="Explicit JWKS URI. If not provided, discovered from issuer via .well-known/openid-configuration",
+        )
+        auth_group.add_argument(
+            f"--{prefix}jwt-role-mapping",
+            type=str,
+            nargs="*",
+            default=[],
+            help="Mapping from IDP role/group names to gateway roles. Format: 'idp_role=gateway_role'. "
+            "Example: --jwt-role-mapping 'Gateway.Admin=admin' 'Gateway.User=user'",
         )
 
     @classmethod
@@ -733,6 +873,16 @@ class RouterArgs:
 
         # Mooncake-specific annotation
         args_dict["bootstrap_port_annotation"] = "sglang.ai/bootstrap-port"
+
+        # Parse control plane API keys
+        args_dict["control_plane_api_keys"] = cls._parse_control_plane_api_keys(
+            cli_args_dict.get(f"{prefix}control_plane_api_keys", [])
+        )
+
+        # Parse JWT role mapping
+        args_dict["jwt_role_mapping"] = cls._parse_jwt_role_mapping(
+            cli_args_dict.get(f"{prefix}jwt_role_mapping", [])
+        )
 
         return cls(**args_dict)
 
@@ -823,3 +973,52 @@ class RouterArgs:
 
         # decode_list is a list of single-element lists due to nargs=1
         return [url[0] for url in decode_list]
+
+    @staticmethod
+    def _parse_control_plane_api_keys(api_keys_list):
+        """Parse control plane API keys from --control-plane-api-keys arguments.
+
+        Format: id:name:role:key
+        Example: --control-plane-api-keys 'key1:Service Account:admin:secret123'
+        """
+        if not api_keys_list:
+            return []
+
+        parsed_keys = []
+        for key_str in api_keys_list:
+            parts = key_str.split(":", 3)  # Split into at most 4 parts
+            if len(parts) != 4:
+                raise ValueError(
+                    f"Invalid API key format: '{key_str}'. Expected 'id:name:role:key'"
+                )
+            key_id, name, role, key = parts
+            role_lower = role.lower()
+            if role_lower not in ("admin", "user"):
+                raise ValueError(f"Invalid role: '{role}'. Must be 'admin' or 'user'")
+            parsed_keys.append((key_id, name, key, role_lower))
+        return parsed_keys
+
+    @staticmethod
+    def _parse_jwt_role_mapping(role_mapping_list):
+        """Parse JWT role mapping from --jwt-role-mapping arguments.
+
+        Format: idp_role=gateway_role
+        Example: --jwt-role-mapping 'Gateway.Admin=admin' 'Gateway.User=user'
+        """
+        if not role_mapping_list:
+            return {}
+
+        mapping = {}
+        for mapping_str in role_mapping_list:
+            if "=" not in mapping_str:
+                raise ValueError(
+                    f"Invalid role mapping format: '{mapping_str}'. Expected 'idp_role=gateway_role'"
+                )
+            idp_role, gateway_role = mapping_str.split("=", 1)
+            gateway_role_lower = gateway_role.lower()
+            if gateway_role_lower not in ("admin", "user"):
+                raise ValueError(
+                    f"Invalid gateway role: '{gateway_role}'. Must be 'admin' or 'user'"
+                )
+            mapping[idp_role] = gateway_role_lower
+        return mapping

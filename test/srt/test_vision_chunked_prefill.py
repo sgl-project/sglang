@@ -199,6 +199,7 @@ class TestVisionChunkedPrefill(CustomTestCase):
             logger.info(f"Killing chunked server pid={chunked_server_pid}")
             kill_process_tree(chunked_server_pid)
             logger.info("Chunked server killed")
+            time.sleep(4)
 
         # None-chunked
         logger.info("Phase 2: Testing with chunked_prefill_size=-1 (no chunking)")
@@ -218,6 +219,7 @@ class TestVisionChunkedPrefill(CustomTestCase):
             logger.info(f"Killing non-chunked server pid={no_chunked_server_pid}")
             kill_process_tree(no_chunked_server_pid)
             logger.info("Non-chunked server killed")
+            time.sleep(4)
 
         for output_chunked, output_no_chunked in zip(
             outputs_chunked, outputs_no_chunked
