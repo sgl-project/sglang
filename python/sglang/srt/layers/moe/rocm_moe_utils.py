@@ -20,7 +20,9 @@ class ActivationMethod(IntEnum):
     GELU = 1
 
 
-@register_custom_op(out_shape="hidden_states")
+# NOTE: for non _use_aiter case, use lazy registration to avoid overhead
+# (registration may not be trigger actually, since it will not be called)
+@register_custom_op(out_shape="hidden_states", eager=_use_aiter)
 def rocm_aiter_asm_moe_tkw1(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,

@@ -15,7 +15,7 @@ def register_custom_op(
     op_name: Optional[str] = None,
     mutates_args: Optional[List[str]] = None,
     out_shape: Optional[Union[int, str]] = None,
-    eager: bool = False,
+    eager: bool = True,
 ) -> F: ...
 
 
@@ -26,7 +26,7 @@ def register_custom_op(
     op_name: Optional[str] = None,
     mutates_args: Optional[List[str]] = None,
     fake_impl: Optional[Callable],
-    eager: bool = False,
+    eager: bool = True,
 ) -> F: ...
 
 
@@ -36,7 +36,7 @@ def register_custom_op(
     op_name: Optional[str] = None,
     mutates_args: Optional[List[str]] = None,
     out_shape: Optional[Union[int, str]] = None,
-    eager: bool = False,
+    eager: bool = True,
 ) -> Callable[[F], F]: ...
 
 
@@ -46,7 +46,7 @@ def register_custom_op(
     op_name: Optional[str] = None,
     mutates_args: Optional[List[str]] = None,
     fake_impl: Optional[Callable],
-    eager: bool = False,
+    eager: bool = True,
 ) -> Callable[[F], F]: ...
 
 
@@ -56,7 +56,7 @@ def register_custom_op(
     *,
     op_name: Optional[str] = None,
     mutates_args: Optional[List[str]] = None,
-    eager: bool = False,
+    eager: bool = True,
     **extra_kwargs,
 ) -> Any:
     """
@@ -92,6 +92,7 @@ def register_custom_op(
     :param eager: Whether to register the operator eagerly.
                   If False, the registration will be deferred until the first call.
                   If you met any issue with torch.compile, try to set eager=True.
+                  Currently, to avoid misuse, we set eager=True by default.
     :type eager: bool
     :return: The registered JIT custom operator, or a decorator.
              NOTE: the real register will occur at the first call of the function.

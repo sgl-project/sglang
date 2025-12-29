@@ -124,7 +124,7 @@ def _register_group(group: "GroupCoordinator") -> None:
     _groups[group.unique_name] = weakref.ref(group)
 
 
-@register_custom_op(mutates_args=["tensor"], eager=True)
+@register_custom_op(mutates_args=["tensor"])
 def inplace_all_reduce(tensor: torch.Tensor, group_name: str) -> None:
     assert group_name in _groups, f"Group {group_name} is not found."
     group = _groups[group_name]()
@@ -133,7 +133,7 @@ def inplace_all_reduce(tensor: torch.Tensor, group_name: str) -> None:
     group._all_reduce_in_place(tensor)
 
 
-@register_custom_op(out_shape="tensor", eager=True)
+@register_custom_op(out_shape="tensor")
 def outplace_all_reduce(
     tensor: torch.Tensor, group_name: str, outplace_all_reduce_method: str
 ) -> torch.Tensor:
@@ -144,7 +144,7 @@ def outplace_all_reduce(
     return group._all_reduce_out_place(tensor, outplace_all_reduce_method)
 
 
-@register_custom_op(mutates_args=["output"], eager=True)
+@register_custom_op(mutates_args=["output"])
 def reg_all_gather_into_tensor(
     output: torch.Tensor, input: torch.Tensor, group_name: str
 ) -> None:
@@ -155,7 +155,7 @@ def reg_all_gather_into_tensor(
     group._all_gather_into_tensor(output, input)
 
 
-@register_custom_op(mutates_args=["output"], eager=True)
+@register_custom_op(mutates_args=["output"])
 def reg_reduce_scatter_tensor(
     output: torch.Tensor, input: torch.Tensor, group_name: str
 ) -> None:

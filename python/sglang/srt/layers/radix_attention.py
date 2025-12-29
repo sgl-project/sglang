@@ -131,7 +131,7 @@ class RadixAttention(nn.Module):
             )
 
 
-@register_custom_op(mutates_args=["output"], eager=True)
+@register_custom_op(mutates_args=["output"])
 def unified_attention_with_output(
     query: torch.Tensor,
     key: torch.Tensor,
