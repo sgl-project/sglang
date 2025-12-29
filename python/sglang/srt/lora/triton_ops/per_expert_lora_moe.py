@@ -200,11 +200,14 @@ def _per_expert_lora_kernel(
     # Compute combined mask
     store_mask = out_mask & has_rank
 
-    # Add to base_output in-place
-    tl.atomic_add(out_ptrs, out_vals.to(tl.float16), store_mask)
+    # Convert to output dtype (matches hidden_states dtype, could be float16/bfloat16/float32)
+    out_vals_typed = out_vals.to(output_ptr.dtype.element_ty)
 
-    # Also store to separate lora_output tensor
-    tl.atomic_add(lora_out_ptrs, out_vals, store_mask)
+    # Add to base_output in-place
+    tl.atomic_add(out_ptrs, out_vals_typed, store_mask)
+
+    # Also store to separate lora_output tensor (same dtype)
+    tl.atomic_add(lora_out_ptrs, out_vals_typed, store_mask)
 
 
 def per_expert_lora_forward(
