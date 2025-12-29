@@ -271,7 +271,7 @@ class RouterArgs:
             f"--{prefix}balance-abs-threshold",
             type=int,
             default=RouterArgs.balance_abs_threshold,
-            help="Load balancing is triggered when (max_load - min_load) > abs_threshold AND max_load > min_load * rel_threshold. Otherwise, use cache aware",
+            help="Absolute threshold for load difference. Balancing is triggered if `(max_load - min_load) > abs_threshold` and the relative threshold is also met.",
         )
         routing_group.add_argument(
             f"--{prefix}balance-rel-threshold",
