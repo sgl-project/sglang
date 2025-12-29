@@ -162,9 +162,11 @@ class BaseSparseAlgorithmImpl(BaseSparseAlgorithm):
 
     def __init__(self, config, device: torch.device, **kwargs):
         super().__init__(config, device, **kwargs)
-        self.compression_ratio = getattr(config, "compression_ratio", 0.3)
-        self.page_size = getattr(config, "page_size", 64)
-        self.num_recent_pages = getattr(config, "num_recent_pages", 4)
+        self.compression_ratio = config.sparse_extra_config.get(
+            "compression_ratio", 0.3
+        )
+        self.num_recent_pages = config.sparse_extra_config.get("num_recent_pages", 4)
+        self.page_size = config.page_size
 
     def initialize_representation_pool(
         self,
