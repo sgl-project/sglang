@@ -84,16 +84,6 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def("gelu_and_mul(Tensor! out, Tensor input) -> ()");
   m.impl("gelu_and_mul", torch::kCUDA, &gelu_and_mul);
 
-  // Device LayerNorm/RMSNorm and fused LayerNorm/RMSNorm+ScaleShift
-  m.def(
-      "fused_norm_scale_shift(Tensor x, Tensor? gamma_opt, Tensor? beta_opt, "
-      "Tensor scale, Tensor shift, int norm_type, float eps) -> (Tensor)");
-  m.impl("fused_norm_scale_shift", torch::kCUDA, &fused_norm_scale_shift);
-  m.def(
-      "fused_scale_residual_norm_scale_shift(Tensor residual, Tensor x, Tensor? gate_opt, "
-      "Tensor? gamma_opt, Tensor? beta_opt, Tensor scale, Tensor shift, int norm_type, float eps) -> (Tensor, Tensor)");
-  m.impl("fused_scale_residual_norm_scale_shift", torch::kCUDA, &fused_scale_residual_norm_scale_shift);
-
   m.def(
       "apply_rope_pos_ids_cos_sin_cache(Tensor q, Tensor k, Tensor! q_rope, Tensor! k_rope, Tensor cos_sin_cache, "
       "Tensor pos_ids, bool interleave, bool enable_pdl, "
