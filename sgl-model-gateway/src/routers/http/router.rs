@@ -303,10 +303,8 @@ impl Router {
         let load_guard =
             (policy.name() == "cache_aware").then(|| WorkerLoadGuard::new(worker.clone()));
 
-        events::RequestSentEvent {
-            url: worker.url().to_string(),
-        }
-        .emit();
+        // Note: Using borrowed reference avoids heap allocation
+        events::RequestSentEvent { url: worker.url() }.emit();
         let mut headers_with_trace = headers.cloned().unwrap_or_default();
         inject_trace_context_http(&mut headers_with_trace);
         let headers = Some(&headers_with_trace);
