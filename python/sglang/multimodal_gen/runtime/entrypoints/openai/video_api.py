@@ -30,6 +30,7 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
 from sglang.multimodal_gen.runtime.entrypoints.openai.stores import VIDEO_STORE
 from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     _parse_size,
+    add_common_data_to_response,
     merge_image_input_list,
     process_generation_batch,
     save_image_to_path,
@@ -118,11 +119,16 @@ async def _dispatch_job_async(job_id: str, batch: Req) -> None:
     from sglang.multimodal_gen.runtime.scheduler_client import async_scheduler_client
 
     try:
-        await process_generation_batch(async_scheduler_client, batch)
-        await VIDEO_STORE.update_fields(
-            job_id,
-            {"status": "completed", "progress": 100, "completed_at": int(time.time())},
+        _, result = await process_generation_batch(async_scheduler_client, batch)
+        update_fields = {
+            "status": "completed",
+            "progress": 100,
+            "completed_at": int(time.time()),
+        }
+        update_fields = add_common_data_to_response(
+            update_fields, request_id=job_id, result=result
         )
+        await VIDEO_STORE.update_fields(job_id, update_fields)
     except Exception as e:
         logger.error(f"{e}")
         await VIDEO_STORE.update_fields(
@@ -131,6 +137,7 @@ async def _dispatch_job_async(job_id: str, batch: Req) -> None:
 
 
 # TODO: support image to video generation
+# TODO: this is currently not used
 @router.post("", response_model=VideoResponse)
 async def create_video(
     request: Request,

@@ -6,6 +6,7 @@ pub mod cache;
 pub mod factory;
 pub mod hub;
 pub mod mock;
+pub mod registry;
 pub mod sequence;
 pub mod stop;
 pub mod stream;
@@ -30,6 +31,7 @@ pub use factory::{
     create_tokenizer_with_chat_template_blocking, TokenizerType,
 };
 pub use huggingface::HuggingFaceTokenizer;
+pub use registry::TokenizerRegistry;
 pub use sequence::Sequence;
 pub use stop::{SequenceDecoderOutput, StopSequenceConfig, StopSequenceDecoder};
 pub use stream::DecodeStream;

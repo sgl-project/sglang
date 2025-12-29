@@ -20,6 +20,11 @@ on:
         required: false
         type: string
         default: ""
+      force_continue_on_error:
+        description: "Force continue-on-error (test scheduled CI behavior)"
+        required: false
+        type: boolean
+        default: false
 
 concurrency:
   group: pr-test-${{ github.ref }}
@@ -35,9 +40,12 @@ jobs:
     outputs:
       main_package: ${{ steps.filter.outputs.main_package || steps.scheduled.outputs.main_package }}
       sgl_kernel: ${{ steps.filter.outputs.sgl_kernel || steps.scheduled.outputs.sgl_kernel }}
+      jit_kernel: ${{ steps.filter.outputs.jit_kernel || steps.scheduled.outputs.jit_kernel }}
       multimodal_gen: ${{ steps.filter.outputs.multimodal_gen || steps.scheduled.outputs.multimodal_gen }}
       max_parallel: ${{ steps.set-parallel.outputs.max_parallel }}
       b200_runner: ${{ steps.set-runner.outputs.b200_runner }}
+      enable_retry: ${{ steps.set-retry.outputs.enable_retry }}
+      continue_on_error: ${{ steps.set-continue-on-error.outputs.continue_on_error }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -56,6 +64,10 @@ jobs:
               - ".github/workflows/pr-test.yml"
             sgl_kernel:
               - "sgl-kernel/**"
+            jit_kernel:
+              - "python/sglang/jit_kernel/**"
+              - "python/*.toml"
+              - ".github/workflows/pr-test.yml"
             multimodal_gen:
               - "python/sglang/multimodal_gen/**"
               - "python/sglang/cli/**"
@@ -68,6 +80,7 @@ jobs:
         run: |
           echo "main_package=true" >> $GITHUB_OUTPUT
           echo "sgl_kernel=false" >> $GITHUB_OUTPUT
+          echo "jit_kernel=true" >> $GITHUB_OUTPUT
           echo "multimodal_gen=true" >> $GITHUB_OUTPUT
 
       - name: Set max-parallel based on high-priority label
@@ -91,18 +104,38 @@ jobs:
             echo "b200_runner=4-gpu-b200" >> $GITHUB_OUTPUT
           fi
 
+      - name: Enable retry for CI
+        id: set-retry
+        run: |
+          echo "enable_retry=true" >> $GITHUB_OUTPUT
+          echo "Retry logic enabled for CI"
+
+      - name: Set continue-on-error for scheduled runs
+        id: set-continue-on-error
+        run: |
+          if [[ "${{ github.event_name }}" == "schedule" || "${{ inputs.force_continue_on_error }}" == "true" ]]; then
+            echo "continue_on_error=true" >> $GITHUB_OUTPUT
+            echo "Scheduled run or force flag detected, enabling continue-on-error to run all tests"
+          else
+            echo "continue_on_error=false" >> $GITHUB_OUTPUT
+            echo "Non-scheduled run, continue-on-error disabled"
+          fi
+
       - name: Show filter results in summary (table)
         run: |
           {
             echo "## Change Detection"
             echo ""
-            echo "| Component       | Changed |"
-            echo "|----------------|---------|"
-            echo "| main_package   | ${{ steps.filter.outputs.main_package || steps.scheduled.outputs.main_package }} |"
-            echo "| sgl_kernel     | ${{ steps.filter.outputs.sgl_kernel || steps.scheduled.outputs.sgl_kernel }} |"
-            echo "| multimodal_gen | ${{ steps.filter.outputs.multimodal_gen || steps.scheduled.outputs.multimodal_gen }} |"
-            echo "| max_parallel   | ${{ steps.set-parallel.outputs.max_parallel }} |"
-            echo "| b200_runner    | ${{ steps.set-runner.outputs.b200_runner }} |"
+            echo "| Component         | Changed |"
+            echo "|-------------------|---------|"
+            echo "| main_package      | ${{ steps.filter.outputs.main_package || steps.scheduled.outputs.main_package }} |"
+            echo "| sgl_kernel        | ${{ steps.filter.outputs.sgl_kernel || steps.scheduled.outputs.sgl_kernel }} |"
+            echo "| jit_kernel        | ${{ steps.filter.outputs.jit_kernel || steps.scheduled.outputs.jit_kernel }} |"
+            echo "| multimodal_gen    | ${{ steps.filter.outputs.multimodal_gen || steps.scheduled.outputs.multimodal_gen }} |"
+            echo "| max_parallel      | ${{ steps.set-parallel.outputs.max_parallel }} |"
+            echo "| b200_runner       | ${{ steps.set-runner.outputs.b200_runner }} |"
+            echo "| enable_retry      | ${{ steps.set-retry.outputs.enable_retry }} |"
+            echo "| continue_on_error | ${{ steps.set-continue-on-error.outputs.continue_on_error }} |"
           } >> $GITHUB_STEP_SUMMARY
 
   # =============================================== PR Gate ====================================================
@@ -111,6 +144,7 @@ jobs:
     if: |
       needs.check-changes.outputs.main_package == 'true' ||
       needs.check-changes.outputs.sgl_kernel == 'true' ||
+      needs.check-changes.outputs.jit_kernel == 'true' ||
       needs.check-changes.outputs.multimodal_gen == 'true'
     uses: ./.github/workflows/pr-gate.yml
     secrets: inherit
@@ -366,6 +400,27 @@ jobs:
   #         cd sgl-kernel
   #         pytest tests/
 
+  # =============================================== jit-kernel ====================================================
+
+  jit-kernel-unit-test:
+    needs: [check-changes, call-gate]
+    if: needs.check-changes.outputs.jit_kernel == 'true'
+    runs-on: 1-gpu-runner
+    env:
+      RUNNER_LABELS: 1-gpu-runner
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          bash scripts/ci/ci_install_dependency.sh
+
+      - name: Run test
+        timeout-minutes: 30
+        run: |
+          cd python/sglang/jit_kernel
+          pytest tests/
+
   # =============================================== primary ====================================================
 
   stage-a-test-1:
@@ -403,9 +458,13 @@ jobs:
         timeout-minutes: 10
         run: |
           cd test/
-          python3 run_suite.py --hw cuda --suite stage-a-test-1
+          CONTINUE_ON_ERROR_FLAG=""
+          if [[ "${{ needs.check-changes.outputs.continue_on_error }}" == "true" ]]; then
+            CONTINUE_ON_ERROR_FLAG="--continue-on-error"
+          fi
+          python3 run_suite.py --hw cuda --suite stage-a-test-1 $CONTINUE_ON_ERROR_FLAG
           # temporarily put backend-independent cpu tests here
-          python3 run_suite.py --hw cpu --suite default
+          python3 run_suite.py --hw cpu --suite default $CONTINUE_ON_ERROR_FLAG
 
   stage-b-test-small-1-gpu:
     needs: [check-changes, call-gate, stage-a-test-1, sgl-kernel-build-wheels]
@@ -425,7 +484,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        partition: [0, 1, 2]
+        partition: [0, 1, 2, 3]
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -446,7 +505,11 @@ jobs:
         timeout-minutes: 30
         run: |
           cd test/
-          python3 run_suite.py --hw cuda --suite stage-b-test-small-1-gpu --auto-partition-id ${{ matrix.partition }} --auto-partition-size 3
+          CONTINUE_ON_ERROR_FLAG=""
+          if [[ "${{ needs.check-changes.outputs.continue_on_error }}" == "true" ]]; then
+            CONTINUE_ON_ERROR_FLAG="--continue-on-error"
+          fi
+          python3 run_suite.py --hw cuda --suite stage-b-test-small-1-gpu --auto-partition-id ${{ matrix.partition }} --auto-partition-size 4 $CONTINUE_ON_ERROR_FLAG
 
   stage-b-test-large-1-gpu:
     needs: [check-changes, call-gate, stage-a-test-1, sgl-kernel-build-wheels]
@@ -483,7 +546,11 @@ jobs:
         timeout-minutes: 30
         run: |
           cd test/
-          python3 run_suite.py --hw cuda --suite stage-b-test-large-1-gpu
+          CONTINUE_ON_ERROR_FLAG=""
+          if [[ "${{ needs.check-changes.outputs.continue_on_error }}" == "true" ]]; then
+            CONTINUE_ON_ERROR_FLAG="--continue-on-error"
+          fi
+          python3 run_suite.py --hw cuda --suite stage-b-test-large-1-gpu $CONTINUE_ON_ERROR_FLAG
 
   stage-b-test-large-2-gpu:
     needs: [check-changes, call-gate, stage-a-test-1, sgl-kernel-build-wheels]
@@ -520,7 +587,52 @@ jobs:
         timeout-minutes: 30
         run: |
           cd test/
-          python3 run_suite.py --hw cuda --suite stage-b-test-large-2-gpu
+          CONTINUE_ON_ERROR_FLAG=""
+          if [[ "${{ needs.check-changes.outputs.continue_on_error }}" == "true" ]]; then
+            CONTINUE_ON_ERROR_FLAG="--continue-on-error"
+          fi
+          python3 run_suite.py --hw cuda --suite stage-b-test-large-2-gpu $CONTINUE_ON_ERROR_FLAG
+
+  stage-c-test-large-4-gpu:
+    needs: [check-changes, call-gate, stage-b-test-small-1-gpu, stage-b-test-large-1-gpu, stage-b-test-large-2-gpu, sgl-kernel-build-wheels]
+    if: |
+      always() &&
+      (
+        (inputs.target_stage == 'stage-c-test-large-4-gpu') ||
+        (
+          !inputs.target_stage &&
+          (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
+          ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+        )
+      )
+    runs-on: 4-gpu-h100
+    env:
+      RUNNER_LABELS: 4-gpu-h100
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download artifacts
+        if: needs.check-changes.outputs.sgl_kernel == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          path: sgl-kernel/dist/
+          merge-multiple: true
+          pattern: wheel-python3.10-cuda12.9
+
+      - name: Install dependencies
+        run: |
+          CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/ci_install_dependency.sh
+
+      - name: Run test
+        timeout-minutes: 30
+        run: |
+          cd test/
+          CONTINUE_ON_ERROR_FLAG=""
+          if [[ "${{ needs.check-changes.outputs.continue_on_error }}" == "true" ]]; then
+            CONTINUE_ON_ERROR_FLAG="--continue-on-error"
+          fi
+          python3 run_suite.py --hw cuda --suite stage-c-test-large-4-gpu $CONTINUE_ON_ERROR_FLAG
 
   multimodal-gen-test-1-gpu:
     needs: [check-changes, call-gate, sgl-kernel-build-wheels]
@@ -558,10 +670,15 @@ jobs:
         timeout-minutes: 60
         run: |
           cd python
+          CONTINUE_ON_ERROR_FLAG=""
+          if [[ "${{ needs.check-changes.outputs.continue_on_error }}" == "true" ]]; then
+            CONTINUE_ON_ERROR_FLAG="--continue-on-error"
+          fi
           python3 sglang/multimodal_gen/test/run_suite.py \
             --suite 1-gpu \
             --partition-id ${{ matrix.part }} \
-            --total-partitions 2
+            --total-partitions 2 \
+            $CONTINUE_ON_ERROR_FLAG
 
 
   multimodal-gen-test-2-gpu:
@@ -601,10 +718,15 @@ jobs:
         timeout-minutes: 60
         run: |
           cd python
+          CONTINUE_ON_ERROR_FLAG=""
+          if [[ "${{ needs.check-changes.outputs.continue_on_error }}" == "true" ]]; then
+            CONTINUE_ON_ERROR_FLAG="--continue-on-error"
+          fi
           python3 sglang/multimodal_gen/test/run_suite.py \
             --suite 2-gpu \
             --partition-id ${{ matrix.part }} \
-            --total-partitions 2
+            --total-partitions 2 \
+            $CONTINUE_ON_ERROR_FLAG
 
   quantization-test:
       needs: [check-changes, call-gate, stage-a-test-1]
@@ -639,7 +761,15 @@ jobs:
           timeout-minutes: 30
           run: |
             cd test/srt
-            python3 run_suite.py --suite quantization_test
+            RETRY_FLAG=""
+            if [[ "${{ needs.check-changes.outputs.enable_retry }}" == "true" ]]; then
+              RETRY_FLAG="--enable-retry"
+            fi
+            CONTINUE_ON_ERROR_FLAG=""
+            if [[ "${{ needs.check-changes.outputs.continue_on_error }}" == "true" ]]; then
+              CONTINUE_ON_ERROR_FLAG="--continue-on-error"
+            fi
+            python3 run_suite.py --suite quantization_test $RETRY_FLAG $CONTINUE_ON_ERROR_FLAG
 
   unit-test-backend-1-gpu:
     needs: [check-changes, call-gate, stage-a-test-1]
@@ -660,7 +790,7 @@ jobs:
       fail-fast: false
       max-parallel: ${{ fromJson(needs.check-changes.outputs.max_parallel) }}
       matrix:
-        part: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
+        part: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -681,7 +811,15 @@ jobs:
         timeout-minutes: 30
         run: |
           cd test/srt
-          python3 run_suite.py --suite per-commit-1-gpu --auto-partition-id ${{ matrix.part }} --auto-partition-size 15
+          RETRY_FLAG=""
+          if [[ "${{ needs.check-changes.outputs.enable_retry }}" == "true" ]]; then
+            RETRY_FLAG="--enable-retry"
+          fi
+          CONTINUE_ON_ERROR_FLAG=""
+          if [[ "${{ needs.check-changes.outputs.continue_on_error }}" == "true" ]]; then
+            CONTINUE_ON_ERROR_FLAG="--continue-on-error"
+          fi
+          python3 run_suite.py --suite per-commit-1-gpu --auto-partition-id ${{ matrix.part }} --auto-partition-size 13 $RETRY_FLAG $CONTINUE_ON_ERROR_FLAG
 
 
   stage-b-test-4-gpu-b200:
@@ -722,7 +860,11 @@ jobs:
         timeout-minutes: 30
         run: |
           cd test
-          IS_BLACKWELL=1 python3 run_suite.py --hw cuda --suite stage-b-test-4-gpu-b200
+          CONTINUE_ON_ERROR_FLAG=""
+          if [[ "${{ needs.check-changes.outputs.continue_on_error }}" == "true" ]]; then
+            CONTINUE_ON_ERROR_FLAG="--continue-on-error"
+          fi
+          IS_BLACKWELL=1 python3 run_suite.py --hw cuda --suite stage-b-test-4-gpu-b200 $CONTINUE_ON_ERROR_FLAG
 
 
   unit-test-backend-2-gpu:
@@ -764,7 +906,15 @@ jobs:
         timeout-minutes: 30
         run: |
           cd test/srt
-          python3 run_suite.py --suite per-commit-2-gpu --auto-partition-id ${{ matrix.part }} --auto-partition-size 2
+          RETRY_FLAG=""
+          if [[ "${{ needs.check-changes.outputs.enable_retry }}" == "true" ]]; then
+            RETRY_FLAG="--enable-retry"
+          fi
+          CONTINUE_ON_ERROR_FLAG=""
+          if [[ "${{ needs.check-changes.outputs.continue_on_error }}" == "true" ]]; then
+            CONTINUE_ON_ERROR_FLAG="--continue-on-error"
+          fi
+          python3 run_suite.py --suite per-commit-2-gpu --auto-partition-id ${{ matrix.part }} --auto-partition-size 2 $RETRY_FLAG $CONTINUE_ON_ERROR_FLAG
 
   unit-test-backend-4-gpu:
     needs: [check-changes, call-gate, unit-test-backend-2-gpu, stage-b-test-4-gpu-b200]
@@ -805,7 +955,15 @@ jobs:
         timeout-minutes: 20
         run: |
           cd test/srt
-          python3 run_suite.py --suite per-commit-4-gpu --auto-partition-id ${{ matrix.part }} --auto-partition-size 3
+          RETRY_FLAG=""
+          if [[ "${{ needs.check-changes.outputs.enable_retry }}" == "true" ]]; then
+            RETRY_FLAG="--enable-retry"
+          fi
+          CONTINUE_ON_ERROR_FLAG=""
+          if [[ "${{ needs.check-changes.outputs.continue_on_error }}" == "true" ]]; then
+            CONTINUE_ON_ERROR_FLAG="--continue-on-error"
+          fi
+          python3 run_suite.py --suite per-commit-4-gpu --auto-partition-id ${{ matrix.part }} --auto-partition-size 3 $RETRY_FLAG $CONTINUE_ON_ERROR_FLAG
 
   unit-test-backend-8-gpu-h200:
     needs: [check-changes, call-gate, unit-test-backend-2-gpu, stage-b-test-4-gpu-b200]
@@ -852,7 +1010,15 @@ jobs:
         timeout-minutes: 20
         run: |
           cd test/srt
-          python3 run_suite.py --suite per-commit-8-gpu-h200 --auto-partition-id ${{ matrix.part }} --auto-partition-size 3
+          RETRY_FLAG=""
+          if [[ "${{ needs.check-changes.outputs.enable_retry }}" == "true" ]]; then
+            RETRY_FLAG="--enable-retry"
+          fi
+          CONTINUE_ON_ERROR_FLAG=""
+          if [[ "${{ needs.check-changes.outputs.continue_on_error }}" == "true" ]]; then
+            CONTINUE_ON_ERROR_FLAG="--continue-on-error"
+          fi
+          python3 run_suite.py --suite per-commit-8-gpu-h200 --auto-partition-id ${{ matrix.part }} --auto-partition-size 3 $RETRY_FLAG $CONTINUE_ON_ERROR_FLAG
 
   unit-test-backend-8-gpu-h20:
     needs: [check-changes, call-gate, unit-test-backend-2-gpu, stage-b-test-4-gpu-b200]
@@ -894,7 +1060,15 @@ jobs:
         timeout-minutes: 20
         run: |
           cd test/srt
-          python3 run_suite.py --suite per-commit-8-gpu-h20 --auto-partition-id ${{ matrix.part }} --auto-partition-size 2
+          RETRY_FLAG=""
+          if [[ "${{ needs.check-changes.outputs.enable_retry }}" == "true" ]]; then
+            RETRY_FLAG="--enable-retry"
+          fi
+          CONTINUE_ON_ERROR_FLAG=""
+          if [[ "${{ needs.check-changes.outputs.continue_on_error }}" == "true" ]]; then
+            CONTINUE_ON_ERROR_FLAG="--continue-on-error"
+          fi
+          python3 run_suite.py --suite per-commit-8-gpu-h20 --auto-partition-id ${{ matrix.part }} --auto-partition-size 2 $RETRY_FLAG $CONTINUE_ON_ERROR_FLAG
 
   performance-test-1-gpu-part-1:
     needs: [check-changes, call-gate, stage-a-test-1]
@@ -1183,10 +1357,10 @@ jobs:
           pip install -e .
 
       - name: Evaluate accuracy
-        timeout-minutes: 20
+        timeout-minutes: 25
         run: |
           cd test/srt
-          python3 test_eval_accuracy_large.py
+          python3 -m sglang.test.ci.run_with_retry test_eval_accuracy_large.py
 
   accuracy-test-2-gpu:
     needs: [check-changes, call-gate, accuracy-test-1-gpu]
@@ -1223,10 +1397,10 @@ jobs:
           pip install -e .
 
       - name: Evaluate accuracy (TP=2)
-        timeout-minutes: 20
+        timeout-minutes: 25
         run: |
           cd test/srt
-          python3 test_moe_eval_accuracy_large.py
+          python3 -m sglang.test.ci.run_with_retry test_moe_eval_accuracy_large.py
 
   unit-test-deepep-4-gpu:
     needs: [check-changes, call-gate, unit-test-backend-2-gpu, stage-b-test-4-gpu-b200]
@@ -1263,7 +1437,15 @@ jobs:
         timeout-minutes: 20
         run: |
           cd test/srt
-          python3 run_suite.py --suite per-commit-4-gpu-deepep
+          RETRY_FLAG=""
+          if [[ "${{ needs.check-changes.outputs.enable_retry }}" == "true" ]]; then
+            RETRY_FLAG="--enable-retry"
+          fi
+          CONTINUE_ON_ERROR_FLAG=""
+          if [[ "${{ needs.check-changes.outputs.continue_on_error }}" == "true" ]]; then
+            CONTINUE_ON_ERROR_FLAG="--continue-on-error"
+          fi
+          python3 run_suite.py --suite per-commit-4-gpu-deepep $RETRY_FLAG $CONTINUE_ON_ERROR_FLAG
 
   unit-test-deepep-8-gpu:
     needs: [check-changes, call-gate, unit-test-backend-2-gpu, stage-b-test-4-gpu-b200]
@@ -1300,7 +1482,15 @@ jobs:
         timeout-minutes: 20
         run: |
           cd test/srt
-          python3 run_suite.py --suite per-commit-8-gpu-h200-deepep
+          RETRY_FLAG=""
+          if [[ "${{ needs.check-changes.outputs.enable_retry }}" == "true" ]]; then
+            RETRY_FLAG="--enable-retry"
+          fi
+          CONTINUE_ON_ERROR_FLAG=""
+          if [[ "${{ needs.check-changes.outputs.continue_on_error }}" == "true" ]]; then
+            CONTINUE_ON_ERROR_FLAG="--continue-on-error"
+          fi
+          python3 run_suite.py --suite per-commit-8-gpu-h200-deepep $RETRY_FLAG $CONTINUE_ON_ERROR_FLAG
 
   unit-test-backend-4-gpu-b200:
     needs: [check-changes, call-gate, unit-test-backend-2-gpu, stage-b-test-4-gpu-b200]
@@ -1342,7 +1532,15 @@ jobs:
         timeout-minutes: 30
         run: |
           cd test/srt
-          IS_BLACKWELL=1 python3 run_suite.py --suite per-commit-4-gpu-b200 --auto-partition-id ${{ matrix.part }}  --auto-partition-size 3 --timeout-per-file 1800
+          RETRY_FLAG=""
+          if [[ "${{ needs.check-changes.outputs.enable_retry }}" == "true" ]]; then
+            RETRY_FLAG="--enable-retry"
+          fi
+          CONTINUE_ON_ERROR_FLAG=""
+          if [[ "${{ needs.check-changes.outputs.continue_on_error }}" == "true" ]]; then
+            CONTINUE_ON_ERROR_FLAG="--continue-on-error"
+          fi
+          IS_BLACKWELL=1 python3 run_suite.py --suite per-commit-4-gpu-b200 --auto-partition-id ${{ matrix.part }} --auto-partition-size 3 --timeout-per-file 1800 $RETRY_FLAG $CONTINUE_ON_ERROR_FLAG
 
   unit-test-backend-4-gpu-gb200:
     needs: [check-changes, call-gate, unit-test-backend-2-gpu, stage-b-test-4-gpu-b200, sgl-kernel-build-wheels-arm]
@@ -1381,7 +1579,15 @@ jobs:
         timeout-minutes: 45
         run: |
           cd test/srt
-          python3 run_suite.py --suite per-commit-4-gpu-gb200 --auto-partition-id 0 --auto-partition-size 1 --timeout-per-file 3600
+          RETRY_FLAG=""
+          if [[ "${{ needs.check-changes.outputs.enable_retry }}" == "true" ]]; then
+            RETRY_FLAG="--enable-retry"
+          fi
+          CONTINUE_ON_ERROR_FLAG=""
+          if [[ "${{ needs.check-changes.outputs.continue_on_error }}" == "true" ]]; then
+            CONTINUE_ON_ERROR_FLAG="--continue-on-error"
+          fi
+          python3 run_suite.py --suite per-commit-4-gpu-gb200 --auto-partition-id 0 --auto-partition-size 1 --timeout-per-file 3600 $RETRY_FLAG $CONTINUE_ON_ERROR_FLAG
 
   pr-test-finish:
     needs:
@@ -1395,6 +1601,8 @@ jobs:
         sgl-kernel-benchmark-test,
         sgl-kernel-b200-test,
 
+        jit-kernel-unit-test,
+
         multimodal-gen-test-1-gpu,
         multimodal-gen-test-2-gpu,
 
@@ -1402,6 +1610,7 @@ jobs:
         stage-b-test-small-1-gpu,
         stage-b-test-large-1-gpu,
         stage-b-test-large-2-gpu,
+        stage-c-test-large-4-gpu,
         quantization-test,
         unit-test-backend-1-gpu,
         unit-test-backend-2-gpu,

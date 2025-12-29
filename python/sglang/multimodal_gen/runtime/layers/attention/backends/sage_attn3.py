@@ -10,6 +10,7 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend i
     AttentionImpl,
     AttentionMetadata,
 )
+from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
@@ -24,8 +25,8 @@ class SageAttention3Backend(AttentionBackend):
         return [64, 128, 256]
 
     @staticmethod
-    def get_name() -> str:
-        return "SAGE_ATTN_3"
+    def get_enum() -> AttentionBackendEnum:
+        return AttentionBackendEnum.SAGE_ATTN_3
 
     @staticmethod
     def get_impl_cls() -> type["SageAttention3Impl"]:

@@ -92,6 +92,113 @@ docker cp ./dummy-grok ci_sglang:/
 docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache huggingface_hub[hf_xet]
 docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache pytest
 
+# Detect AITER version
+#############################################
+# Detect correct AITER_COMMIT for this runner
+# + Check mismatch
+# + Rebuild AITER if needed
+#############################################
+
+echo "[CI-AITER-CHECK] === AITER VERSION CHECK START ==="
+
+DOCKERFILE="docker/rocm.Dockerfile"
+
+# GPU_ARCH
+GPU_ARCH="${GPU_ARCH:-mi30x}"
+echo "[CI-AITER-CHECK] Runner GPU_ARCH=${GPU_ARCH}"
+
+#############################################
+# 1. Extract AITER_COMMIT from correct Dockerfile block
+#############################################
+if [[ "${GPU_ARCH}" == "mi35x" ]]; then
+    echo "[CI-AITER-CHECK] Using gfx950 block from Dockerfile..."
+    REPO_AITER_COMMIT=$(grep -F -A20 'FROM $BASE_IMAGE_950 AS gfx950' docker/rocm.Dockerfile \
+                        | grep 'AITER_COMMIT=' \
+                        | head -n1 \
+                        | sed 's/.*AITER_COMMIT="\([^"]*\)".*/\1/')
+else
+    echo "[CI-AITER-CHECK] Using gfx942-rocm700 block from Dockerfile..."
+    REPO_AITER_COMMIT=$(grep -F -A20 'FROM $BASE_IMAGE_942_ROCM700 AS gfx942-rocm700' docker/rocm.Dockerfile \
+                        | grep 'AITER_COMMIT=' \
+                        | head -n1 \
+                        | sed 's/.*AITER_COMMIT="\([^"]*\)".*/\1/')
+fi
+
+
+if [[ -z "${REPO_AITER_COMMIT}" ]]; then
+    echo "[CI-AITER-CHECK] ERROR: Failed to extract AITER_COMMIT from Dockerfile."
+    exit 1
+fi
+
+echo "[CI-AITER-CHECK] Dockerfile expects AITER_COMMIT=${REPO_AITER_COMMIT}"
+
+#############################################
+# 2. Check container pre-installed AITER version
+#############################################
+IMAGE_AITER_VERSION=$(docker exec ci_sglang bash -c "pip show aiter 2>/dev/null | grep '^Version:' | awk '{print \$2}'" || echo "none")
+IMAGE_AITER_VERSION="v${IMAGE_AITER_VERSION}"
+echo "[CI-AITER-CHECK] AITER version inside CI image: ${IMAGE_AITER_VERSION}"
+
+#############################################
+# 3. Decide rebuild
+#############################################
+NEED_REBUILD="false"
+
+if [[ "${IMAGE_AITER_VERSION}" == "none" ]]; then
+    echo "[CI-AITER-CHECK] No AITER found in image"
+    NEED_REBUILD="true"
+elif [[ "${IMAGE_AITER_VERSION}" != "${REPO_AITER_COMMIT}" ]]; then
+    echo "[CI-AITER-CHECK] Version mismatch:"
+    echo "     Image: ${IMAGE_AITER_VERSION}"
+    echo "     Repo : ${REPO_AITER_COMMIT}"
+    NEED_REBUILD="true"
+else
+    echo "[CI-AITER-CHECK] AITER version matches → using image's version."
+fi
+
+
+#############################################
+# 4. Rebuild AITER if needed
+#############################################
+if [[ "${NEED_REBUILD}" == "true" ]]; then
+    echo "[CI-AITER-CHECK] === AITER REBUILD START ==="
+
+    # uninstall existing aiter
+    docker exec ci_sglang pip uninstall -y aiter || true
+
+    # delete old aiter directory
+    docker exec ci_sglang rm -rf /sgl-workspace/aiter
+
+    # clone a fresh copy to /sgl-workspace/aiter
+    docker exec ci_sglang git clone https://github.com/ROCm/aiter.git /sgl-workspace/aiter
+
+    # checkout correct version
+    docker exec ci_sglang bash -c "
+        cd /sgl-workspace/aiter && \
+        git fetch --all && \
+        git checkout ${REPO_AITER_COMMIT} && \
+        git submodule update --init --recursive
+    "
+
+    if [[ "${GPU_ARCH}" == "mi35x" ]]; then
+        GPU_ARCH_LIST="gfx950"
+    else
+        GPU_ARCH_LIST="gfx942"
+    fi
+    echo "[CI-AITER-CHECK] GPU_ARCH_LIST=${GPU_ARCH_LIST}"
+
+    # build AITER
+    docker exec ci_sglang bash -c "
+        cd /sgl-workspace/aiter && \
+        GPU_ARCHS=${GPU_ARCH_LIST} python3 setup.py develop
+    "
+
+    echo "[CI-AITER-CHECK] === AITER REBUILD COMPLETE ==="
+fi
+
+echo "[CI-AITER-CHECK] === AITER VERSION CHECK END ==="
+
+
 # Clear pre-built AITER kernels from Docker image to avoid segfaults
 # The Docker image may contain pre-compiled kernels incompatible with the current environment
 echo "Clearing pre-built AITER kernels from Docker image..."

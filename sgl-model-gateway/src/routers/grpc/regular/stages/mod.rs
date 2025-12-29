@@ -3,6 +3,7 @@
 //! This module defines stages specific to regular tokenizer-based models.
 
 pub mod chat;
+pub mod embedding;
 pub mod generate;
 mod preparation;
 mod request_building;

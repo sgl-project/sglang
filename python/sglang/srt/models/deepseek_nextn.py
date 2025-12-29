@@ -71,12 +71,12 @@ class DeepseekModelNextN(nn.Module):
         super().__init__()
         if enable_nextn_moe_bf16_cast_to_fp8(quant_config):
             # refer to real DeepSeek V3 quant config
-            moe_quant_config = Fp8Config(
+            moe_quant_config_override = Fp8Config(
                 is_checkpoint_fp8_serialized=True,
                 weight_block_size=[128, 128],
             )
         else:
-            moe_quant_config = None
+            moe_quant_config_override = None
 
         if quant_config is not None and quant_config.get_name() == "modelopt_fp4":
             logger.warning(
@@ -115,7 +115,7 @@ class DeepseekModelNextN(nn.Module):
             config,
             0,
             quant_config=quant_config,
-            moe_quant_config=moe_quant_config,
+            moe_quant_config_override=moe_quant_config_override,
             is_nextn=True,
             prefix=add_prefix(layer_name, prefix),
             alt_stream=self.alt_stream,
