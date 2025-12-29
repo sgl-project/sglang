@@ -9,10 +9,7 @@ use tracing::{debug, info, warn};
 /// When the first worker of a new model is added, it determines the policy for that model.
 /// All subsequent workers of the same model use the established policy.
 /// When the last worker of a model is removed, the policy mapping is cleaned up.
-use super::{
-    BucketConfig, BucketPolicy, CacheAwareConfig, CacheAwarePolicy, LoadBalancingPolicy,
-    PowerOfTwoPolicy, RandomPolicy, RoundRobinPolicy,
-};
+use super::{BucketPolicy, CacheAwarePolicy, LoadBalancingPolicy, PolicyFactory};
 use crate::{config::types::PolicyConfig, core::Worker};
 
 /// Registry for managing model-to-policy mappings
@@ -160,56 +157,17 @@ impl PolicyRegistry {
         Arc::clone(&self.default_policy)
     }
 
-    /// Create a policy from a type string
+    /// Create a policy from a type string (delegates to PolicyFactory)
     fn create_policy_from_type(&self, policy_type: &str) -> Arc<dyn LoadBalancingPolicy> {
-        match policy_type {
-            "round_robin" => Arc::new(RoundRobinPolicy::new()),
-            "random" => Arc::new(RandomPolicy::new()),
-            "cache_aware" => Arc::new(CacheAwarePolicy::new()),
-            "power_of_two" => Arc::new(PowerOfTwoPolicy::new()),
-            "bucket" => Arc::new(BucketPolicy::new()),
-            _ => {
-                warn!("Unknown policy type '{}', using default", policy_type);
-                Arc::clone(&self.default_policy)
-            }
-        }
+        PolicyFactory::create_by_name(policy_type).unwrap_or_else(|| {
+            warn!("Unknown policy type '{}', using default", policy_type);
+            Arc::clone(&self.default_policy)
+        })
     }
 
-    /// Create a policy from a PolicyConfig
+    /// Create a policy from a PolicyConfig (delegates to PolicyFactory)
     fn create_policy_from_config(config: &PolicyConfig) -> Arc<dyn LoadBalancingPolicy> {
-        match config {
-            PolicyConfig::RoundRobin => Arc::new(RoundRobinPolicy::new()),
-            PolicyConfig::Random => Arc::new(RandomPolicy::new()),
-            PolicyConfig::CacheAware {
-                cache_threshold,
-                balance_abs_threshold,
-                balance_rel_threshold,
-                eviction_interval_secs,
-                max_tree_size,
-            } => {
-                let cache_config = CacheAwareConfig {
-                    cache_threshold: *cache_threshold,
-                    balance_abs_threshold: *balance_abs_threshold,
-                    balance_rel_threshold: *balance_rel_threshold,
-                    eviction_interval_secs: *eviction_interval_secs,
-                    max_tree_size: *max_tree_size,
-                };
-                Arc::new(CacheAwarePolicy::with_config(cache_config))
-            }
-            PolicyConfig::PowerOfTwo { .. } => Arc::new(PowerOfTwoPolicy::new()),
-            PolicyConfig::Bucket {
-                balance_abs_threshold,
-                balance_rel_threshold,
-                bucket_adjust_interval_secs,
-            } => {
-                let config = BucketConfig {
-                    balance_abs_threshold: *balance_abs_threshold,
-                    balance_rel_threshold: *balance_rel_threshold,
-                    bucket_adjust_interval_secs: *bucket_adjust_interval_secs,
-                };
-                Arc::new(BucketPolicy::with_config(config))
-            }
-        }
+        PolicyFactory::create_from_config(config)
     }
 
     /// Get current model->policy mappings (for debugging/monitoring)

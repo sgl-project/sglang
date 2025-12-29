@@ -19,6 +19,7 @@ from sglang.multimodal_gen.configs.models import (
     VAEConfig,
 )
 from sglang.multimodal_gen.configs.models.encoders import BaseEncoderOutput
+from sglang.multimodal_gen.configs.sample.sampling_params import DataType
 from sglang.multimodal_gen.configs.utils import update_config_from_args
 from sglang.multimodal_gen.runtime.distributed import (
     get_sp_parallel_rank,
@@ -36,17 +37,42 @@ from sglang.multimodal_gen.utils import (
 logger = init_logger(__name__)
 
 
-# NOTE: possible duplication with DataType, WorkloadType
+# NOTE: possible duplication with DataType
 # this may focus on the model's original ability
 class ModelTaskType(Enum):
+    # TODO: check if I2V/TI2V models can work w/wo text
+
     I2V = auto()  # Image to Video
     T2V = auto()  # Text to Video
     TI2V = auto()  # Text and Image to Video
+
     T2I = auto()  # Text to Image
     I2I = auto()  # Image to Image
+    TI2I = auto()  # Image to Image or Text-Image to Image
 
-    def is_image_gen(self):
-        return self == ModelTaskType.T2I or self == ModelTaskType.I2I
+    def is_image_gen(self) -> bool:
+        return (
+            self == ModelTaskType.T2I
+            or self == ModelTaskType.I2I
+            or self == ModelTaskType.TI2I
+        )
+
+    def requires_image_input(self) -> bool:
+        return self == ModelTaskType.I2V or self == ModelTaskType.I2I
+
+    def accepts_image_input(self) -> bool:
+        return (
+            self == ModelTaskType.I2V
+            or self == ModelTaskType.I2I
+            or self == ModelTaskType.TI2I
+            or self == ModelTaskType.TI2V
+        )
+
+    def data_type(self) -> DataType:
+        if self.is_image_gen():
+            return DataType.IMAGE
+        else:
+            return DataType.VIDEO
 
 
 class STA_Mode(str, Enum):
@@ -121,6 +147,9 @@ class PipelineConfig:
     model_path: str = ""
     pipeline_config_path: str | None = None
 
+    # precision and autocast
+    enable_autocast: bool = True
+
     # generation parameters
     # controls the timestep embedding generation
     should_use_guidance: bool = True
@@ -165,11 +194,6 @@ class PipelineConfig:
     postprocess_text_funcs: tuple[Callable[[BaseEncoderOutput], torch.tensor], ...] = (
         field(default_factory=lambda: (postprocess_text,))
     )
-
-    # StepVideo specific parameters
-    pos_magic: str | None = None
-    neg_magic: str | None = None
-    timesteps_scale: bool | None = None
 
     # STA (Sliding Tile Attention) parameters
     mask_strategy_file_path: str | None = None
@@ -269,6 +293,9 @@ class PipelineConfig:
         )
 
         return shape
+
+    def allow_set_num_frames(self):
+        return False
 
     def get_decode_scale_and_shift(self, device, dtype, vae):
         vae_arch_config = self.vae_config.arch_config
@@ -435,27 +462,6 @@ class PipelineConfig:
             default=PipelineConfig.image_encoder_precision,
             choices=["fp32", "fp16", "bf16"],
             help="Precision for image encoder",
-        )
-        parser.add_argument(
-            f"--{prefix_with_dot}pos_magic",
-            type=str,
-            dest=f"{prefix_with_dot.replace('-', '_')}pos_magic",
-            default=PipelineConfig.pos_magic,
-            help="Positive magic prompt for sampling, used in stepvideo",
-        )
-        parser.add_argument(
-            f"--{prefix_with_dot}neg_magic",
-            type=str,
-            dest=f"{prefix_with_dot.replace('-', '_')}neg_magic",
-            default=PipelineConfig.neg_magic,
-            help="Negative magic prompt for sampling, used in stepvideo",
-        )
-        parser.add_argument(
-            f"--{prefix_with_dot}timesteps_scale",
-            type=bool,
-            dest=f"{prefix_with_dot.replace('-', '_')}timesteps_scale",
-            default=PipelineConfig.timesteps_scale,
-            help="Bool for applying scheduler scale in set_timesteps, used in stepvideo",
         )
 
         # DMD parameters
@@ -651,11 +657,12 @@ class ImagePipelineConfig(PipelineConfig):
         sp_world_size, rank_in_sp_group = get_sp_world_size(), get_sp_parallel_rank()
         seq_len = latents.shape[1]
 
+        # TODO: reuse code in PipelineConfig::shard_latents_for_sp
         # Pad to next multiple of SP degree if needed
         if seq_len % sp_world_size != 0:
             pad_len = sp_world_size - (seq_len % sp_world_size)
             pad = torch.zeros(
-                (latents.shape[0], pad_len, latents.shape[2]),
+                (*latents.shape[:1], pad_len, *latents.shape[2:]),
                 dtype=latents.dtype,
                 device=latents.device,
             )
