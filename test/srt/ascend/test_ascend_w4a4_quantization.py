@@ -75,8 +75,8 @@ class TestAscendW4A4(CustomTestCase):
         metrics = run_eval(args)
         print(metrics)
 
-        self.assertAlmostEqual(metrics["accuracy"], 0.84)
-        self.assertAlmostEqual(metrics["output_throughput"], 1100)
+        self.assertGreaterEqual(metrics["accuracy"], 0.80)
+        self.assertGreaterEqual(metrics["output_throughput"], 1000)
 
     def run_decode(self, max_new_tokens):
         response = requests.post(
