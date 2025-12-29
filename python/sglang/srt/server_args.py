@@ -2184,11 +2184,12 @@ class ServerArgs:
             logger.warning("KV cache is forced as chunk cache for decode server")
 
             if self.dp_size > 1 and not is_in_ci():
-                assert self.prefill_round_robin_balance, (
-                    "Prefill round robin balance is required when dp size > 1. "
-                    "Please make sure that the prefill instance is launched with `--load-balance-method round_robin`"
-                    " and `--prefill-round-robin-balance` is set for decode server."
-                )
+                if not self.prefill_round_robin_balance:
+                    logger.warning(
+                        "Prefill round robin balance is recommended when dp size > 1. "
+                        "Please make sure that the prefill instance is launched with `--load-balance-method round_robin`"
+                        " and `--prefill-round-robin-balance` is set for decode server."
+                    )
         elif self.disaggregation_mode == "prefill":
             if self.disaggregation_decode_tp is None:
                 self.disaggregation_decode_tp = self.tp_size
