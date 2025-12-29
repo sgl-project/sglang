@@ -78,6 +78,7 @@ class TestTP(CustomTestCase):
         self.assertGreater(metrics["accuracy"], 0.50)
 
 
+@unittest.skip("covered in TestMooncakeWithEPLB")
 class TestPureDP(TestTP):
     extra_args = [
         "--tp",
@@ -98,7 +99,7 @@ class TestHybridDPTP(TestTP):
     ]
 
 
-@unittest.skip("covered in TestTBO")
+@unittest.skip("covered in TestMooncakeWithEPLB")
 class TestNoGatherdBuffer(TestTP):
     extra_args = [
         "--tp",
@@ -111,6 +112,7 @@ class TestNoGatherdBuffer(TestTP):
     ]
 
 
+@unittest.skip("covered in TestMooncakeWithEPLB")
 class TestTBO(TestTP):
     extra_args = [
         "--tp",
