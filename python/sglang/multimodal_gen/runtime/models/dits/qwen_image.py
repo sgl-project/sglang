@@ -19,6 +19,9 @@ from sglang.multimodal_gen.configs.models.dits.qwenimage import QwenImageDitConf
 from sglang.multimodal_gen.runtime.layers.attention import USPAttention
 from sglang.multimodal_gen.runtime.layers.layernorm import LayerNorm, RMSNorm
 from sglang.multimodal_gen.runtime.layers.linear import ReplicatedLinear
+from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
+    apply_flashinfer_rope_qk_inplace,
+)
 from sglang.multimodal_gen.runtime.layers.triton_ops import (
     fuse_scale_shift_gate_select01_kernel,
     fuse_scale_shift_kernel,
@@ -28,12 +31,6 @@ from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)  # pylint: disable=invalid-name
-
-
-try:
-    from flashinfer.rope import apply_rope_with_cos_sin_cache_inplace
-except Exception:
-    apply_rope_with_cos_sin_cache_inplace = None
 
 
 def _get_qkv_projections(
@@ -561,9 +558,6 @@ class QwenImageCrossAttention(nn.Module):
 
         # Apply RoPE
         if image_rotary_emb is not None:
-            if apply_rope_with_cos_sin_cache_inplace is None:
-                raise RuntimeError("flashinfer is required")
-
             if not (
                 isinstance(image_rotary_emb[0], torch.Tensor)
                 and image_rotary_emb[0].dim() == 2
@@ -572,41 +566,12 @@ class QwenImageCrossAttention(nn.Module):
 
             img_cache, txt_cache = image_rotary_emb
 
-            def _apply_flashinfer_rope(
-                q_4d: torch.Tensor, k_4d: torch.Tensor, cache: torch.Tensor
-            ):
-                bsz, seqlen, nheads, d = q_4d.shape
-
-                pos_1d = torch.arange(seqlen, device="cpu", dtype=torch.long)
-                if bsz == 1:
-                    positions = pos_1d.to(q_4d.device, non_blocking=True)
-                    q2 = q_4d.squeeze(0).reshape(seqlen, nheads * d).contiguous()
-                    k2 = k_4d.squeeze(0).reshape(seqlen, nheads * d).contiguous()
-                    apply_rope_with_cos_sin_cache_inplace(
-                        positions=positions,
-                        query=q2,
-                        key=k2,
-                        head_size=d,
-                        cos_sin_cache=cache,
-                        is_neox=False,
-                    )
-                    return q2.view(1, seqlen, nheads, d), k2.view(1, seqlen, nheads, d)
-
-                positions = pos_1d.repeat(bsz).to(q_4d.device, non_blocking=True)
-                q2 = q_4d.reshape(bsz * seqlen, nheads * d).contiguous()
-                k2 = k_4d.reshape(bsz * seqlen, nheads * d).contiguous()
-                apply_rope_with_cos_sin_cache_inplace(
-                    positions=positions,
-                    query=q2,
-                    key=k2,
-                    head_size=d,
-                    cos_sin_cache=cache,
-                    is_neox=False,
-                )
-                return q2.view(bsz, seqlen, nheads, d), k2.view(bsz, seqlen, nheads, d)
-
-            img_query, img_key = _apply_flashinfer_rope(img_query, img_key, img_cache)
-            txt_query, txt_key = _apply_flashinfer_rope(txt_query, txt_key, txt_cache)
+            img_query, img_key = apply_flashinfer_rope_qk_inplace(
+                img_query, img_key, img_cache, is_neox=False
+            )
+            txt_query, txt_key = apply_flashinfer_rope_qk_inplace(
+                txt_query, txt_key, txt_cache, is_neox=False
+            )
 
         # Concatenate for joint attention
         # Order: [text, image]
