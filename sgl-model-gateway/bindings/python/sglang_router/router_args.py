@@ -411,7 +411,7 @@ class RouterArgs:
             f"--{prefix}prometheus-port",
             type=int,
             default=29000,
-            help="Port to expose Prometheus metrics. If not specified, Prometheus metrics are disabled",
+            help="Port to expose Prometheus metrics (default: 29000).",
         )
         prometheus_group.add_argument(
             f"--{prefix}prometheus-host",
