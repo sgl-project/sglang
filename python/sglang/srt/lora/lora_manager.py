@@ -208,7 +208,7 @@ class LoRAManager:
 
         return self.create_lora_update_result(success=True)
 
-    def validate_lora_batch(self, lora_ids: set[str]) -> bool:
+    def validate_lora_batch(self, lora_ids: set[Optional[str]]) -> bool:
         """
         Validate if the LoRA IDs in the batch can be loaded into the current LoRA memory pool.
         """
@@ -244,6 +244,7 @@ class LoRAManager:
     ):
         # Load active loras into lora memory pool
         cur_uids = {new_lora_id} | running_loras
+
         assert len(cur_uids) <= self.max_loras_per_batch
         self.memory_pool.prepare_lora_batch(
             cur_uids=cur_uids,

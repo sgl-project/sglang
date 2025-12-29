@@ -367,10 +367,7 @@ class Scheduler(
         self.init_request_dispatcher()
 
         if self.enable_lora:
-            self.lora_prefetcher = LoRAPrefetcher(
-                self.tp_worker.model_runner.lora_manager,
-                self.device,
-            )
+            self.lora_prefetcher = LoRAPrefetcher(self.tp_worker.model_runner.lora_manager)
 
     def init_model_config(self):
         self.model_config = ModelConfig.from_server_args(self.server_args)
@@ -1945,8 +1942,6 @@ class Scheduler(
         for req in self.waiting_queue:
             if (
                 self.enable_lora
-                # Non-LoRA requests should always be scheduled
-                and req.lora_id is not None
                 and req.lora_id not in running_loras
             ):
                 lora_prefetch_status = self.lora_prefetcher.check_prefetch_status(
