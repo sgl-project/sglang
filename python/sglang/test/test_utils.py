@@ -2035,7 +2035,7 @@ def dump_metric(metric_name: str, value: Any, labels: Optional[dict] = None):
             if isinstance(labels_for_output, str):
                 labels_str = f" labels='{labels_for_output}'"
             else:
-                labels_str = f" labels={labels_for_output}"
+                labels_str = f" labels={json.dumps(labels_for_output, ensure_ascii=False)}"
         else:
             labels_str = ""
         print(f"[METRIC] {metric_name}={converted_value}{labels_str}")
