@@ -1317,7 +1317,7 @@ class NPUCompressedTensorsW4A8Int8DynamicMoEMethod(CompressedTensorsMoEMethod):
     def __init__(self, quantization_config) -> None:
         self.group_size = 0
         self.tp_size = 1
-        self.activation_use_clip = = (
+        self.activation_use_clip = (
             self.quantization_config.get("config_groups", {})
             .get("group_1", {})
             .get("activation_use_clip", False)
