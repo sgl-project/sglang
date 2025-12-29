@@ -681,13 +681,17 @@ class BaseMultimodalProcessor(ABC):
                     mm_tokens = (
                         text_part if is_precomputed else multimodal_tokens.video_token
                     )
-                    new_text_parts += mm_tokens
+                    new_text_parts.extend(
+                        mm_tokens if isinstance(mm_tokens, list) else [mm_tokens]
+                    )
                 elif modality == Modality.AUDIO:
                     # audio
                     mm_tokens = (
                         text_part if is_precomputed else multimodal_tokens.audio_token
                     )
-                    new_text_parts += mm_tokens
+                    new_text_parts.extend(
+                        mm_tokens if isinstance(mm_tokens, list) else [mm_tokens]
+                    )
                 else:
                     # Shouldn't happen, but keep the original token for forward compatibility.
                     new_text_parts += [text_part]
