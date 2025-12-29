@@ -21,6 +21,7 @@ from sglang.srt.entrypoints.harmony_utils import (
     render_for_completion,
 )
 from sglang.srt.entrypoints.tool import Tool
+from sglang.srt.parser.reasoning_parser import ReasoningParser
 
 
 class ConversationContext(ABC):
@@ -44,11 +45,50 @@ class ConversationContext(ABC):
 
 class SimpleContext(ConversationContext):
 
-    def __init__(self):
+    def __init__(self, reasoning_parser: str | None = None):
         self.last_output = None
+        self.reasoning_text = None
+        self.normal_text = None
+        self.num_reasoning_tokens = 0
+        self.num_output_tokens = 0
+        self.num_prompt_tokens = 0
+        self.num_cached_tokens = 0
+        self._reasoning_parser = (
+            ReasoningParser(model_type=reasoning_parser, stream_reasoning=False)
+            if reasoning_parser
+            else None
+        )
 
     def append_output(self, output) -> None:
         self.last_output = output
+        if output is None or not isinstance(output, dict):
+            return
+
+        text = output.get("text")
+        meta_info = output.get("meta_info", {})
+
+        if meta_info and meta_info.get("reasoning_tokens") is not None:
+            self.num_reasoning_tokens = meta_info["reasoning_tokens"]
+        if meta_info and meta_info.get("completion_tokens") is not None:
+            self.num_output_tokens = meta_info["completion_tokens"]
+        if meta_info and meta_info.get("prompt_tokens") is not None:
+            self.num_prompt_tokens = meta_info["prompt_tokens"]
+        if meta_info and meta_info.get("cached_tokens") is not None:
+            self.num_cached_tokens = meta_info["cached_tokens"]
+
+        if self._reasoning_parser and text is not None:
+            reasoning_content, content = self._reasoning_parser.parse_non_stream(text)
+        else:
+            reasoning_content, content = None, text
+
+        if reasoning_content is not None:
+            self.reasoning_text = reasoning_content
+        if content is not None:
+            self.normal_text = content
+        if self.num_output_tokens == 0:
+            output_ids = output.get("output_ids")
+            if output_ids:
+                self.num_output_tokens = len(output_ids)
 
     def need_builtin_tool_call(self) -> bool:
         return False
@@ -97,6 +137,11 @@ class HarmonyContext(ConversationContext):
                     self.num_cached_tokens = meta_info["cached_tokens"]
                 if "completion_tokens" in meta_info:
                     self.num_output_tokens += meta_info["completion_tokens"]
+                if (
+                    "reasoning_tokens" in meta_info
+                    and meta_info["reasoning_tokens"] is not None
+                ):
+                    self.num_reasoning_tokens = meta_info["reasoning_tokens"]
 
         else:
             output_msgs = output
@@ -194,6 +239,8 @@ class StreamingHarmonyContext(HarmonyContext):
 
             # Check if we need to handle cumulative tokens
             meta_info = output.get("meta_info", {})
+            if meta_info.get("reasoning_tokens") is not None:
+                self.num_reasoning_tokens = meta_info["reasoning_tokens"]
             completion_tokens = meta_info.get("completion_tokens")
             if (
                 completion_tokens is not None
