@@ -750,7 +750,7 @@ async def benchmark(args):
             )
         )
 
-    print("\n" + "=" * 60)
+    print("=" * 60)
 
     if args.output_file:
         with open(args.output_file, "w") as f:
