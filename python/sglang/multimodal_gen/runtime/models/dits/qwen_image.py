@@ -17,7 +17,11 @@ from diffusers.models.normalization import AdaLayerNormContinuous
 
 from sglang.multimodal_gen.configs.models.dits.qwenimage import QwenImageDitConfig
 from sglang.multimodal_gen.runtime.layers.attention import USPAttention
-from sglang.multimodal_gen.runtime.layers.layernorm import LayerNorm, RMSNorm
+from sglang.multimodal_gen.runtime.layers.layernorm import (
+    LayerNorm,
+    RMSNorm,
+    apply_qk_norm,
+)
 from sglang.multimodal_gen.runtime.layers.linear import ReplicatedLinear
 from sglang.multimodal_gen.runtime.layers.triton_ops import (
     fuse_scale_shift_gate_select01_kernel,
@@ -34,8 +38,6 @@ try:
     from flashinfer.rope import apply_rope_with_cos_sin_cache_inplace
 except Exception:
     apply_rope_with_cos_sin_cache_inplace = None
-
-from sglang.srt.models.utils import apply_qk_norm
 
 
 def _get_qkv_projections(
