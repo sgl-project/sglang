@@ -808,8 +808,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             f"Load weight begin. avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
         )
 
+        default_threads_num = 0
         # This can reduce thread conflicts and speed up weight loading.
         if self.device != "cpu":
+            default_threads_num = torch.get_num_threads()
             torch.set_num_threads(1)
         if self.device == "cuda":
             if torch.cuda.get_device_capability()[0] < 8:
@@ -988,6 +990,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 raise ValueError(
                     f"TP rank {self.tp_rank} could finish the model loading, but there are other ranks that didn't finish loading. It is likely due to unexpected failures (e.g., OOM) or a slow node."
                 ) from None
+
+        if default_threads_num > 0:
+            # speed up host tensor allocating
+            torch.set_num_threads(default_threads_num)
 
     def update_expert_location(
         self,
