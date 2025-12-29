@@ -20,6 +20,7 @@ from sglang.multimodal_gen.runtime.managers.forward_context import (
     ForwardContext,
     get_forward_context,
 )
+from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.utils import dict_to_3d_list
 
@@ -55,8 +56,8 @@ class SlidingTileAttentionBackend(AttentionBackend):
         return [32, 64, 96, 128, 160, 192, 224, 256]
 
     @staticmethod
-    def get_name() -> str:
-        return "SLIDING_TILE_ATTN"
+    def get_enum() -> AttentionBackendEnum:
+        return AttentionBackendEnum.SLIDING_TILE_ATTN
 
     @staticmethod
     def get_impl_cls() -> type["SlidingTileAttentionImpl"]:

@@ -565,7 +565,7 @@ class SchedulerPPMixin:
                 )
                 req.fill_ids = req.origin_input_ids
                 req.extend_input_len = len(req.fill_ids) - len(req.prefix_indices)
-                req.logprob_start_len = len(req.origin_input_ids) - 1
+                req.logprob_start_len = -1
 
                 # Prepare batch
                 batch = ScheduleBatch.init_new(
@@ -666,7 +666,7 @@ class SchedulerPPMixin:
             f"Target latency: {self.length_predictor.target_latency:.2f}ms"
         )
 
-    def predict_next_chunk_size(self: "Scheduler", history_len: int) -> Optional[int]:
+    def predict_next_chunk_size(self: Scheduler, history_len: int) -> Optional[int]:
         """
         Predict next chunk size dynamically based on current history length.
 

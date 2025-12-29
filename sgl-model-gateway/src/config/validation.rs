@@ -147,7 +147,10 @@ impl ConfigValidator {
 
     fn validate_policy(policy: &PolicyConfig) -> ConfigResult<()> {
         match policy {
-            PolicyConfig::Random | PolicyConfig::RoundRobin => {}
+            PolicyConfig::Random
+            | PolicyConfig::RoundRobin
+            | PolicyConfig::Manual
+            | PolicyConfig::ConsistentHashing => {}
             PolicyConfig::CacheAware {
                 cache_threshold,
                 balance_abs_threshold: _,
@@ -223,6 +226,26 @@ impl ConfigValidator {
                         field: "bucket_adjust_interval_secs".to_string(),
                         value: bucket_adjust_interval_secs.to_string(),
                         reason: "Must be < 4294967296s".to_string(),
+                    });
+                }
+            }
+            PolicyConfig::PrefixHash {
+                prefix_token_count,
+                load_factor,
+            } => {
+                if *prefix_token_count == 0 {
+                    return Err(ConfigError::InvalidValue {
+                        field: "prefix_token_count".to_string(),
+                        value: prefix_token_count.to_string(),
+                        reason: "Must be > 0".to_string(),
+                    });
+                }
+
+                if *load_factor < 1.0 {
+                    return Err(ConfigError::InvalidValue {
+                        field: "load_factor".to_string(),
+                        value: load_factor.to_string(),
+                        reason: "Must be >= 1.0".to_string(),
                     });
                 }
             }

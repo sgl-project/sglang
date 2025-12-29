@@ -18,6 +18,19 @@ type NodeRef = Arc<Node>;
 /// Using Arc<str> allows cheap cloning and comparison.
 pub type TenantId = Arc<str>;
 
+/// Result of a prefix match operation, including char counts to avoid recomputation.
+#[derive(Debug, Clone)]
+pub struct PrefixMatchResult {
+    /// The matched prefix text
+    pub matched_text: String,
+    /// The tenant that owns the matched prefix
+    pub tenant: String,
+    /// Number of characters matched (avoids chars().count())
+    pub matched_char_count: usize,
+    /// Total number of characters in the input text
+    pub input_char_count: usize,
+}
+
 /// A fast identity hasher for single-character keys (used in children DashMap).
 /// Since chars have good distribution already, we use identity hashing with mixing.
 #[derive(Default)]
@@ -53,34 +66,30 @@ impl Hasher for CharHasher {
 
 type CharHasherBuilder = BuildHasherDefault<CharHasher>;
 
-/// Pre-indexed text for efficient character access.
-/// Converts UTF-8 string to Vec<char> once to enable O(1) indexing.
-struct CharIndexedText {
-    chars: Vec<char>,
+/// Advance a string slice by N characters, returning the remaining slice.
+/// Returns empty string if n >= char count.
+#[inline]
+fn advance_by_chars(s: &str, n: usize) -> &str {
+    if n == 0 {
+        return s;
+    }
+    s.char_indices()
+        .nth(n)
+        .map(|(idx, _)| &s[idx..])
+        .unwrap_or("")
 }
 
-impl CharIndexedText {
-    #[inline]
-    fn new(text: &str) -> Self {
-        Self {
-            chars: text.chars().collect(),
-        }
+/// Get the first N characters of a string as a new String.
+/// More efficient than chars().take(n).collect() for known bounds.
+#[inline]
+fn take_chars(s: &str, n: usize) -> String {
+    if n == 0 {
+        return String::new();
     }
-
-    #[inline]
-    fn len(&self) -> usize {
-        self.chars.len()
-    }
-
-    #[inline]
-    fn get(&self, idx: usize) -> Option<char> {
-        self.chars.get(idx).copied()
-    }
-
-    #[inline]
-    fn slice_to_string(&self, start: usize, end: usize) -> String {
-        self.chars[start..end].iter().collect()
-    }
+    s.char_indices()
+        .nth(n)
+        .map(|(idx, _)| s[..idx].to_string())
+        .unwrap_or_else(|| s.to_string())
 }
 
 /// Node text with cached character count to avoid repeated O(n) chars().count() calls.
@@ -251,23 +260,15 @@ impl PartialEq for EvictionEntry {
 // Note that in rust, `.len()` or slice is operated on the "byte" level. It causes issues for UTF-8 characters because one character might use multiple bytes.
 // https://en.wikipedia.org/wiki/UTF-8
 
-/// Efficient shared prefix count using pre-indexed chars for O(1) access.
-/// Returns the number of characters that match between `a` (starting at `a_start`) and `b`.
+/// Count matching prefix characters between two strings.
+/// Returns the number of characters that match from the start.
+/// Uses iterator-based comparison - no allocation required.
 #[inline]
-fn shared_prefix_count_indexed(a: &CharIndexedText, a_start: usize, b: &str) -> usize {
-    let mut i = 0;
-    let mut b_iter = b.chars();
-
-    while a_start + i < a.len() {
-        match (a.get(a_start + i), b_iter.next()) {
-            (Some(a_char), Some(b_char)) if a_char == b_char => {
-                i += 1;
-            }
-            _ => break,
-        }
-    }
-
-    i
+fn shared_prefix_count(a: &str, b: &str) -> usize {
+    a.chars()
+        .zip(b.chars())
+        .take_while(|(a_char, b_char)| a_char == b_char)
+        .count()
 }
 
 /// Intern a tenant string into an Arc<str> for efficient storage and comparison.
@@ -311,12 +312,7 @@ impl Tree {
 
     pub fn insert(&self, text: &str, tenant: &str) {
         // Insert text into tree with given tenant
-        // Pre-index text once for O(1) character access (avoids O(n²) chars().nth() calls)
-        let indexed_text = CharIndexedText::new(text);
-        let text_count = indexed_text.len();
-
-        let mut curr = Arc::clone(&self.root);
-        let mut curr_idx = 0;
+        // Use slice-based traversal to avoid Vec<char> allocation
 
         // Use cached timestamp to reduce syscalls
         let timestamp_ms = get_timestamp_ms();
@@ -324,84 +320,72 @@ impl Tree {
         // Intern the tenant ID once for reuse
         let tenant_id = intern_tenant(tenant);
 
-        curr.tenant_last_access_time
+        // Pre-compute total char count once (needed for size tracking)
+        let total_char_count = text.chars().count();
+
+        self.root
+            .tenant_last_access_time
             .insert(Arc::clone(&tenant_id), timestamp_ms);
 
         self.tenant_char_count
             .entry(Arc::clone(&tenant_id))
             .or_insert(0);
 
+        // Track remaining text as a slice - no allocation needed
+        let mut remaining = text;
+        let mut matched_chars = 0;
         let mut prev = Arc::clone(&self.root);
 
-        while curr_idx < text_count {
-            // O(1) character access instead of O(n) chars().nth()
-            let first_char = indexed_text.get(curr_idx).unwrap();
+        // Result type to carry state out of the match block
+        // This allows the entry guard to be dropped before we update prev
+        enum InsertStep {
+            Done,
+            Continue {
+                next_prev: NodeRef,
+                advance_chars: usize,
+            },
+        }
 
-            curr = prev;
+        while !remaining.is_empty() {
+            let first_char = remaining.chars().next().unwrap();
 
-            // dashmap.entry locks the entry until the op is done
-            // if using contains_key + insert, there will be an issue that
-            // 1. "apple" and "app" entered at the same time
-            // 2. and get inserted to the dashmap concurrently, so only one is inserted
-
-            match curr.children.entry(first_char) {
+            // Use entry API for atomic check-and-insert semantics (required for thread safety)
+            let step = match prev.children.entry(first_char) {
                 Entry::Vacant(entry) => {
-                    /*
-                       no matched
-                       [curr]
-                       becomes
-                       [curr] => [new node]
-                    */
-
-                    // Use indexed slice for efficient string extraction
-                    let curr_text = indexed_text.slice_to_string(curr_idx, text_count);
-                    let curr_text_count = text_count - curr_idx;
+                    // No match - create new node with remaining text
+                    let remaining_char_count = total_char_count - matched_chars;
                     let new_node = Arc::new(Node {
                         children: DashMap::with_hasher(CharHasherBuilder::default()),
-                        text: RwLock::new(NodeText::new(curr_text)),
+                        text: RwLock::new(NodeText::new(remaining.to_string())),
                         tenant_last_access_time: DashMap::new(),
-                        parent: RwLock::new(Some(Arc::clone(&curr))),
+                        parent: RwLock::new(Some(Arc::clone(&prev))),
                     });
 
-                    // Attach tenant to the new node (map is empty here) and increment count once
+                    // Attach tenant to the new node and increment count
                     self.tenant_char_count
                         .entry(Arc::clone(&tenant_id))
-                        .and_modify(|count| *count += curr_text_count)
-                        .or_insert(curr_text_count);
+                        .and_modify(|count| *count += remaining_char_count)
+                        .or_insert(remaining_char_count);
                     new_node
                         .tenant_last_access_time
                         .insert(Arc::clone(&tenant_id), timestamp_ms);
 
-                    entry.insert(Arc::clone(&new_node));
-
-                    prev = Arc::clone(&new_node);
-                    curr_idx = text_count;
+                    entry.insert(new_node);
+                    InsertStep::Done
                 }
 
                 Entry::Occupied(mut entry) => {
-                    // matched
                     let matched_node = entry.get().clone();
 
                     let matched_node_text = matched_node.text.read().unwrap();
-                    // Use cached char count instead of chars().count()
                     let matched_node_text_count = matched_node_text.char_count();
+                    let matched_node_text_str = matched_node_text.as_str();
 
-                    // Use indexed comparison to avoid creating intermediate string
-                    let shared_count = shared_prefix_count_indexed(
-                        &indexed_text,
-                        curr_idx,
-                        matched_node_text.as_str(),
-                    );
+                    // Use slice-based comparison - no allocation
+                    let shared_count = shared_prefix_count(remaining, matched_node_text_str);
 
                     if shared_count < matched_node_text_count {
-                        /*
-                           split the matched node
-                           [curr] -> [matched_node] =>
-                           becomes
-                           [curr] -> [new_node] -> [contracted_matched_node]
-                        */
-
-                        // Use split_at_char for efficient splitting with cached counts
+                        // Split the matched node
                         let (matched_text, contracted_text) =
                             matched_node_text.split_at_char(shared_count);
                         let matched_text_count = shared_count;
@@ -412,7 +396,7 @@ impl Tree {
                         let new_node = Arc::new(Node {
                             text: RwLock::new(matched_text),
                             children: DashMap::with_hasher(CharHasherBuilder::default()),
-                            parent: RwLock::new(Some(Arc::clone(&curr))),
+                            parent: RwLock::new(Some(Arc::clone(&prev))),
                             tenant_last_access_time: matched_node.tenant_last_access_time.clone(),
                         });
 
@@ -426,10 +410,11 @@ impl Tree {
                         *matched_node.text.write().unwrap() = contracted_text;
                         *matched_node.parent.write().unwrap() = Some(Arc::clone(&new_node));
 
-                        prev = Arc::clone(&new_node);
-
-                        // Atomically attach tenant to the new split node and increment count once
-                        match prev.tenant_last_access_time.entry(Arc::clone(&tenant_id)) {
+                        // Atomically attach tenant to the new split node
+                        match new_node
+                            .tenant_last_access_time
+                            .entry(Arc::clone(&tenant_id))
+                        {
                             Entry::Vacant(v) => {
                                 self.tenant_char_count
                                     .entry(Arc::clone(&tenant_id))
@@ -442,16 +427,19 @@ impl Tree {
                             }
                         }
 
-                        curr_idx += shared_count;
+                        InsertStep::Continue {
+                            next_prev: new_node,
+                            advance_chars: shared_count,
+                        }
                     } else {
-                        // move to next node
-                        // Drop read lock before continuing
+                        // Full match - move to next node
                         drop(matched_node_text);
 
-                        prev = Arc::clone(&matched_node);
-
-                        // Atomically attach tenant to existing node and increment count once
-                        match prev.tenant_last_access_time.entry(Arc::clone(&tenant_id)) {
+                        // Atomically attach tenant to existing node
+                        match matched_node
+                            .tenant_last_access_time
+                            .entry(Arc::clone(&tenant_id))
+                        {
                             Entry::Vacant(v) => {
                                 self.tenant_char_count
                                     .entry(Arc::clone(&tenant_id))
@@ -463,51 +451,62 @@ impl Tree {
                                 o.insert(timestamp_ms);
                             }
                         }
-                        curr_idx += shared_count;
+
+                        InsertStep::Continue {
+                            next_prev: matched_node,
+                            advance_chars: shared_count,
+                        }
                     }
+                }
+            };
+
+            // Entry guard is now dropped - safe to update prev
+            match step {
+                InsertStep::Done => break,
+                InsertStep::Continue {
+                    next_prev,
+                    advance_chars,
+                } => {
+                    prev = next_prev;
+                    remaining = advance_by_chars(remaining, advance_chars);
+                    matched_chars += advance_chars;
                 }
             }
         }
     }
 
-    #[allow(unused_assignments)]
-    pub fn prefix_match(&self, text: &str) -> (String, String) {
-        // Pre-index text once for O(1) character access
-        let indexed_text = CharIndexedText::new(text);
-        let text_count = indexed_text.len();
+    /// Performs prefix matching and returns detailed result with char counts.
+    /// This is the optimized version that avoids redundant chars().count() calls.
+    pub fn prefix_match_with_counts(&self, text: &str) -> PrefixMatchResult {
+        // Use slice-based traversal - no Vec<char> allocation
+        let input_char_count = text.chars().count();
 
-        let mut curr = Arc::clone(&self.root);
-        let mut curr_idx = 0;
-
+        let mut remaining = text;
+        let mut matched_chars = 0;
         let mut prev = Arc::clone(&self.root);
 
-        while curr_idx < text_count {
-            // O(1) character access instead of O(n) chars().nth()
-            let first_char = indexed_text.get(curr_idx).unwrap();
+        while !remaining.is_empty() {
+            let first_char = remaining.chars().next().unwrap();
 
-            curr = prev.clone();
+            let child_node = prev.children.get(&first_char).map(|e| e.value().clone());
 
-            if let Some(entry) = curr.children.get(&first_char) {
-                let matched_node = entry.value().clone();
+            if let Some(matched_node) = child_node {
                 let matched_text_guard = matched_node.text.read().unwrap();
-                // Use indexed comparison to avoid creating intermediate string
-                let shared_count = shared_prefix_count_indexed(
-                    &indexed_text,
-                    curr_idx,
-                    matched_text_guard.as_str(),
-                );
-                // Use cached char count instead of chars().count()
                 let matched_node_text_count = matched_text_guard.char_count();
+
+                // Use slice-based comparison - no allocation
+                let shared_count = shared_prefix_count(remaining, matched_text_guard.as_str());
                 drop(matched_text_guard);
 
                 if shared_count == matched_node_text_count {
                     // Full match with current node's text, continue to next node
-                    curr_idx += shared_count;
-                    prev = Arc::clone(&matched_node);
+                    matched_chars += shared_count;
+                    remaining = advance_by_chars(remaining, shared_count);
+                    prev = matched_node;
                 } else {
-                    // Partial match, stop here
-                    curr_idx += shared_count;
-                    prev = Arc::clone(&matched_node);
+                    // Partial match - still use this node for tenant selection
+                    matched_chars += shared_count;
+                    prev = matched_node;
                     break;
                 }
             } else {
@@ -516,9 +515,9 @@ impl Tree {
             }
         }
 
-        curr = prev.clone();
+        let curr = prev;
 
-        // Select the first tenant (key in the map) - use Arc<str> directly
+        // Select the first tenant (key in the map)
         let tenant: Option<TenantId> = curr
             .tenant_last_access_time
             .iter()
@@ -530,7 +529,7 @@ impl Tree {
 
         // Traverse from the curr node to the root and update the timestamp
         if let Some(ref tenant_id) = tenant {
-            let mut current_node = Some(curr);
+            let mut current_node = Some(Arc::clone(&curr));
             while let Some(node) = current_node {
                 node.tenant_last_access_time
                     .insert(Arc::clone(tenant_id), timestamp_ms);
@@ -538,39 +537,45 @@ impl Tree {
             }
         }
 
-        // Use indexed slice for result
-        let ret_text = indexed_text.slice_to_string(0, curr_idx);
+        // Build matched text from original input using char count
+        let matched_text = take_chars(text, matched_chars);
         let tenant_str = tenant
             .map(|t| t.to_string())
             .unwrap_or_else(|| "empty".to_string());
-        (ret_text, tenant_str)
+
+        PrefixMatchResult {
+            matched_text,
+            tenant: tenant_str,
+            matched_char_count: matched_chars,
+            input_char_count,
+        }
     }
 
-    #[allow(unused_assignments, dead_code)]
+    /// Legacy prefix_match API for backward compatibility.
+    /// Prefer prefix_match_with_counts() for better performance.
+    pub fn prefix_match(&self, text: &str) -> (String, String) {
+        let result = self.prefix_match_with_counts(text);
+        (result.matched_text, result.tenant)
+    }
+
+    #[allow(dead_code)]
     pub fn prefix_match_tenant(&self, text: &str, tenant: &str) -> String {
-        // Pre-index text once for O(1) character access
-        let indexed_text = CharIndexedText::new(text);
-        let text_count = indexed_text.len();
+        // Use slice-based traversal - no Vec<char> allocation
 
         // Intern tenant ID once for efficient lookups
         let tenant_id = intern_tenant(tenant);
 
-        let mut curr = Arc::clone(&self.root);
-        let mut curr_idx = 0;
-
+        let mut remaining = text;
+        let mut matched_chars = 0;
         let mut prev = Arc::clone(&self.root);
 
-        while curr_idx < text_count {
-            // O(1) character access instead of O(n) chars().nth()
-            let first_char = indexed_text.get(curr_idx).unwrap();
+        while !remaining.is_empty() {
+            let first_char = remaining.chars().next().unwrap();
 
-            curr = prev.clone();
+            let child_node = prev.children.get(&first_char).map(|e| e.value().clone());
 
-            if let Some(entry) = curr.children.get(&first_char) {
-                let matched_node = entry.value().clone();
-
+            if let Some(matched_node) = child_node {
                 // Only continue matching if this node belongs to the specified tenant
-                // Note: contains_key with &str works because Arc<str> implements Borrow<str>
                 if !matched_node
                     .tenant_last_access_time
                     .contains_key(tenant_id.as_ref())
@@ -579,24 +584,21 @@ impl Tree {
                 }
 
                 let matched_text_guard = matched_node.text.read().unwrap();
-                // Use indexed comparison to avoid creating intermediate string
-                let shared_count = shared_prefix_count_indexed(
-                    &indexed_text,
-                    curr_idx,
-                    matched_text_guard.as_str(),
-                );
-                // Use cached char count instead of chars().count()
                 let matched_node_text_count = matched_text_guard.char_count();
+
+                // Use slice-based comparison - no allocation
+                let shared_count = shared_prefix_count(remaining, matched_text_guard.as_str());
                 drop(matched_text_guard);
 
                 if shared_count == matched_node_text_count {
                     // Full match with current node's text, continue to next node
-                    curr_idx += shared_count;
-                    prev = Arc::clone(&matched_node);
+                    matched_chars += shared_count;
+                    remaining = advance_by_chars(remaining, shared_count);
+                    prev = matched_node;
                 } else {
-                    // Partial match, stop here
-                    curr_idx += shared_count;
-                    prev = Arc::clone(&matched_node);
+                    // Partial match - still use this node for timestamp update
+                    matched_chars += shared_count;
+                    prev = matched_node;
                     break;
                 }
             } else {
@@ -605,7 +607,7 @@ impl Tree {
             }
         }
 
-        curr = prev.clone();
+        let curr = prev;
 
         // Only update timestamp if we found a match for the specified tenant
         if curr
@@ -623,15 +625,13 @@ impl Tree {
             }
         }
 
-        // Use indexed slice for result
-        indexed_text.slice_to_string(0, curr_idx)
+        // Build result from original input using char count
+        take_chars(text, matched_chars)
     }
 
+    /// Return the list of tenants for which this node is a leaf.
+    /// A tenant is a leaf at this node if no children have that tenant.
     fn leaf_of(node: &NodeRef) -> Vec<TenantId> {
-        /*
-        Return the list of tenants if it's a leaf for the tenant.
-        A tenant is a "leaf" at this node if this node has the tenant but none of its children do.
-         */
         let mut candidates: HashMap<TenantId, bool> = node
             .tenant_last_access_time
             .iter()
@@ -689,43 +689,66 @@ impl Tree {
                 }
             }
 
-            // Decrement when removing tenant from node
-            if node.tenant_last_access_time.contains_key(tenant.as_ref()) {
-                // Use cached char count instead of chars().count()
-                let node_len = node.text.read().unwrap().char_count();
-                self.tenant_char_count
-                    .entry(Arc::clone(&tenant))
-                    .and_modify(|count| {
-                        *count = count.saturating_sub(node_len);
-                    });
+            // Verify this node is still a leaf for this tenant (may have changed)
+            // A node is a leaf for a tenant if no children have that tenant
+            let is_still_leaf = node.tenant_last_access_time.contains_key(tenant.as_ref())
+                && !node.children.iter().any(|child| {
+                    child
+                        .value()
+                        .tenant_last_access_time
+                        .contains_key(tenant.as_ref())
+                });
+            if !is_still_leaf {
+                continue;
             }
+
+            // Decrement when removing tenant from node
+            let node_len = node.text.read().unwrap().char_count();
+            self.tenant_char_count
+                .entry(Arc::clone(&tenant))
+                .and_modify(|count| {
+                    *count = count.saturating_sub(node_len);
+                });
 
             // Remove tenant from node
             node.tenant_last_access_time.remove(tenant.as_ref());
 
+            // Get parent reference outside of the borrow scope
+            let parent_opt = node.parent.read().unwrap().clone();
+
             // Remove empty nodes
             if node.children.is_empty() && node.tenant_last_access_time.is_empty() {
-                if let Some(parent) = node.parent.read().unwrap().as_ref() {
-                    let text_guard = node.text.read().unwrap();
-                    if let Some(first_char) = text_guard.first_char() {
-                        parent.children.remove(&first_char);
+                if let Some(ref parent) = parent_opt {
+                    if let Some(fc) = node.text.read().unwrap().first_char() {
+                        parent.children.remove(&fc);
                     }
                 }
             }
 
-            // Add parent to queue if it becomes a leaf
-            if let Some(parent) = node.parent.read().unwrap().as_ref() {
-                let parent_leaves = Tree::leaf_of(parent);
-                if parent_leaves.iter().any(|t| t.as_ref() == tenant.as_ref()) {
-                    if let Some(timestamp) = parent.tenant_last_access_time.get(tenant.as_ref()) {
-                        pq.push(Reverse(EvictionEntry {
-                            timestamp: *timestamp,
-                            tenant: Arc::clone(&tenant),
-                            node: Arc::clone(parent),
-                        }));
+            // If parent has this tenant and no other children have it,
+            // parent becomes a new leaf - add to priority queue
+            if let Some(ref parent) = parent_opt {
+                if parent.tenant_last_access_time.contains_key(tenant.as_ref()) {
+                    let has_child_with_tenant = parent.children.iter().any(|child| {
+                        child
+                            .value()
+                            .tenant_last_access_time
+                            .contains_key(tenant.as_ref())
+                    });
+
+                    if !has_child_with_tenant {
+                        // Add parent to priority queue as new leaf
+                        if let Some(timestamp) = parent.tenant_last_access_time.get(tenant.as_ref())
+                        {
+                            pq.push(Reverse(EvictionEntry {
+                                timestamp: *timestamp,
+                                tenant: Arc::clone(&tenant),
+                                node: Arc::clone(parent),
+                            }));
+                        }
                     }
                 }
-            };
+            }
         }
 
         debug!("After eviction - Used size per tenant:");
@@ -739,6 +762,7 @@ impl Tree {
         let tenant_id = intern_tenant(tenant);
 
         // 1. Find all the leaves for the tenant
+        // A leaf is a node that has this tenant but no children have it
         let mut stack = vec![Arc::clone(&self.root)];
         let mut queue = VecDeque::new();
 
@@ -747,35 +771,57 @@ impl Tree {
                 stack.push(Arc::clone(child.value()));
             }
 
-            let leaves = Tree::leaf_of(&curr);
-            if leaves.iter().any(|t| t.as_ref() == tenant_id.as_ref()) {
-                queue.push_back(Arc::clone(&curr));
+            // Check if this node is a leaf for the tenant
+            if curr
+                .tenant_last_access_time
+                .contains_key(tenant_id.as_ref())
+            {
+                let has_child_with_tenant = curr.children.iter().any(|child| {
+                    child
+                        .value()
+                        .tenant_last_access_time
+                        .contains_key(tenant_id.as_ref())
+                });
+                if !has_child_with_tenant {
+                    queue.push_back(Arc::clone(&curr));
+                }
             }
         }
 
         // 2. Start from the leaves and traverse up to the root, removing the tenant from each node
         while let Some(curr) = queue.pop_front() {
-            // remove tenant from node
+            // Remove tenant from node
             curr.tenant_last_access_time.remove(tenant_id.as_ref());
 
-            // remove empty nodes
+            // Get parent reference outside of the borrow scope
+            let parent_opt = curr.parent.read().unwrap().clone();
+
+            // Remove empty nodes
             if curr.children.is_empty() && curr.tenant_last_access_time.is_empty() {
-                if let Some(parent) = curr.parent.read().unwrap().as_ref() {
-                    let text_guard = curr.text.read().unwrap();
-                    if let Some(first_char) = text_guard.first_char() {
-                        parent.children.remove(&first_char);
+                if let Some(ref parent) = parent_opt {
+                    if let Some(fc) = curr.text.read().unwrap().first_char() {
+                        parent.children.remove(&fc);
                     }
                 }
             }
 
-            // add parent to queue if it becomes a leaf
-            if let Some(parent) = curr.parent.read().unwrap().as_ref() {
-                let parent_leaves = Tree::leaf_of(parent);
-                if parent_leaves
-                    .iter()
-                    .any(|t| t.as_ref() == tenant_id.as_ref())
+            // If parent has this tenant and no other children have it,
+            // parent becomes a new leaf - add to queue
+            if let Some(ref parent) = parent_opt {
+                if parent
+                    .tenant_last_access_time
+                    .contains_key(tenant_id.as_ref())
                 {
-                    queue.push_back(Arc::clone(parent));
+                    let has_child_with_tenant = parent.children.iter().any(|child| {
+                        child
+                            .value()
+                            .tenant_last_access_time
+                            .contains_key(tenant_id.as_ref())
+                    });
+
+                    if !has_child_with_tenant {
+                        queue.push_back(Arc::clone(parent));
+                    }
                 }
             }
         }

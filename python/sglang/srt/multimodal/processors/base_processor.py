@@ -299,7 +299,7 @@ class BaseMultimodalProcessor(ABC):
         if audios:
             if self._processor.__class__.__name__ in {
                 "Gemma3nProcessor",
-                "GlmasrProcessor",
+                "GlmAsrProcessor",
                 "Qwen2AudioProcessor",
                 "Qwen3OmniMoeProcessor",
             }:

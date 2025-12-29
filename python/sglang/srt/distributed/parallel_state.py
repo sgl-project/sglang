@@ -376,28 +376,12 @@ class GroupCoordinator:
                     group=self.cpu_group,
                     device=self.device,
                 )
-                # Log which all-reduce mode will be used
-                if is_hip():
-                    if envs.SGLANG_USE_1STAGE_ALLREDUCE.is_set():
-                        if envs.SGLANG_USE_1STAGE_ALLREDUCE.get():
-                            logger.info(
-                                "[AR] All-reduce: 1-stage kernel (SGLANG_USE_1STAGE_ALLREDUCE=1)"
-                            )
-                        else:
-                            logger.info(
-                                "[AR] All-reduce: default (SGLANG_USE_1STAGE_ALLREDUCE=0)"
-                            )
-                    elif envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get():
-                        logger.info(
-                            "[AR] All-reduce: 1-stage kernel (deterministic inference enabled)"
-                        )
-                    else:
-                        logger.info("[AR] All-reduce: default")
             except Exception as e:
                 logger.warning(
                     f"Setup Custom allreduce failed with {e}. To silence this "
                     "warning, specify --disable-custom-all-reduce explicitly."
                 )
+
             if is_hip():
                 try:
                     # Initialize a custom quick all-reduce implementation for AMD

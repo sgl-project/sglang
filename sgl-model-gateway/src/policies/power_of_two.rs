@@ -8,7 +8,7 @@ use std::{
 use rand::Rng;
 use tracing::debug;
 
-use super::{get_healthy_worker_indices, LoadBalancingPolicy};
+use super::{get_healthy_worker_indices, LoadBalancingPolicy, SelectWorkerInfo};
 use crate::core::Worker;
 
 /// Power-of-two choices policy
@@ -33,7 +33,7 @@ impl LoadBalancingPolicy for PowerOfTwoPolicy {
     fn select_worker(
         &self,
         workers: &[Arc<dyn Worker>],
-        _request_text: Option<&str>,
+        _info: &SelectWorkerInfo,
     ) -> Option<usize> {
         let healthy_indices = get_healthy_worker_indices(workers);
 
@@ -157,8 +157,9 @@ mod tests {
 
         // Run multiple selections
         let mut selected_counts = [0; 3];
+        let info = SelectWorkerInfo::default();
         for _ in 0..100 {
-            if let Some(idx) = policy.select_worker(&workers, None) {
+            if let Some(idx) = policy.select_worker(&workers, &info) {
                 selected_counts[idx] += 1;
             }
         }
@@ -192,8 +193,9 @@ mod tests {
 
         // Should prefer worker2 with lower cached load
         let mut w2_selected = 0;
+        let info = SelectWorkerInfo::default();
         for _ in 0..50 {
-            if let Some(idx) = policy.select_worker(&workers, None) {
+            if let Some(idx) = policy.select_worker(&workers, &info) {
                 if idx == 1 {
                     w2_selected += 1;
                 }
@@ -214,7 +216,10 @@ mod tests {
         )];
 
         // With single worker, should always select it
-        assert_eq!(policy.select_worker(&workers, None), Some(0));
+        assert_eq!(
+            policy.select_worker(&workers, &SelectWorkerInfo::default()),
+            Some(0)
+        );
     }
 
     #[test]
@@ -251,7 +256,7 @@ mod tests {
 
         // 5. Run selection
         let selected_idx = policy
-            .select_worker(&workers, None)
+            .select_worker(&workers, &SelectWorkerInfo::default())
             .expect("Should select a worker");
 
         // 6. Verify the Fix
@@ -307,7 +312,9 @@ mod tests {
         loads_1.insert("http://b:8000".to_string(), 100_000);
         policy.update_loads(&loads_1);
 
-        let idx_1 = policy.select_worker(&workers_1, None).unwrap();
+        let idx_1 = policy
+            .select_worker(&workers_1, &SelectWorkerInfo::default())
+            .unwrap();
         assert_eq!(
             idx_1, 0,
             "Happy Path Failed: Should select Worker A (fewer tokens) despite higher request count"
@@ -326,7 +333,9 @@ mod tests {
         // http://d:8000 is MISSING
         policy.update_loads(&loads_2);
 
-        let idx_2 = policy.select_worker(&workers_2, None).unwrap();
+        let idx_2 = policy
+            .select_worker(&workers_2, &SelectWorkerInfo::default())
+            .unwrap();
         assert_eq!(idx_2, 1, "Partial Fail 1 Failed: Should fallback to requests and select Worker B (fewer requests)");
 
         // Scenario 3: Partial Failure (Worker A is missing, Worker B has tokens)
@@ -342,7 +351,9 @@ mod tests {
         loads_3.insert("http://f:8000".to_string(), 1_000);
         policy.update_loads(&loads_3);
 
-        let idx_3 = policy.select_worker(&workers_3, None).unwrap();
+        let idx_3 = policy
+            .select_worker(&workers_3, &SelectWorkerInfo::default())
+            .unwrap();
         assert_eq!(idx_3, 0, "Partial Fail 2 Failed: Should fallback to requests and select Worker A (fewer requests)");
 
         // Scenario 4: Total Failure (Both missing)
@@ -356,7 +367,9 @@ mod tests {
         let loads_4 = HashMap::new();
         policy.update_loads(&loads_4);
 
-        let idx_4 = policy.select_worker(&workers_4, None).unwrap();
+        let idx_4 = policy
+            .select_worker(&workers_4, &SelectWorkerInfo::default())
+            .unwrap();
         assert_eq!(
             idx_4, 1,
             "Total Fail Failed: Should select Worker B based on request count"

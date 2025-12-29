@@ -1,8 +1,8 @@
-import os
 import unittest
 from types import SimpleNamespace
 from urllib.parse import urlparse
 
+from sglang.srt.environ import envs
 from sglang.srt.utils import kill_process_tree
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
 from sglang.test.test_utils import (
@@ -54,12 +54,9 @@ class TestAscendDeepSeekMTP(CustomTestCase):
             2,
         ]
 
-        cls.extra_envs = {
-            "SGLANG_NPU_USE_MLAPO": "1",
-            "SGLANG_ENABLE_SPEC_V2": "1",
-            "SGLANG_ENABLE_OVERLAP_PLAN_STREAM": "1",
-        }
-        os.environ.update(cls.extra_envs)
+        envs.SGLANG_NPU_USE_MLAPO.set(True)
+        envs.SGLANG_ENABLE_SPEC_V2.set(True)
+        envs.SGLANG_ENABLE_OVERLAP_PLAN_STREAM.set(True)
 
     def test_a_gsm8k(self):
         for model in self.models:
