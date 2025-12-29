@@ -98,9 +98,9 @@ class LayerwiseOffloadManager:
                 continue
             self._offload_tensor(name, buf, layer_idx)
 
-        self.prepare_for_denoise()
+        self.prepare_for_next_denoise()
 
-    def prepare_for_denoise(self, non_blocking=False):
+    def prepare_for_next_denoise(self, non_blocking=True):
         self.prefetch_layer(0, non_blocking=non_blocking)
         if not non_blocking and self.copy_stream is not None:
             torch.cuda.current_stream().wait_stream(self.copy_stream)
