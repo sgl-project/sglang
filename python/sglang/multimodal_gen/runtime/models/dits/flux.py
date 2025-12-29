@@ -40,7 +40,7 @@ from sglang.multimodal_gen.runtime.layers.linear import ColumnParallelLinear
 from sglang.multimodal_gen.runtime.layers.mlp import MLP
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
     NDRotaryEmbedding,
-    _apply_rotary_emb,
+    apply_flashinfer_rope_qk_inplace,
 )
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 from sglang.multimodal_gen.runtime.platforms import current_platform
@@ -52,13 +52,15 @@ logger = init_logger(__name__)  # pylint: disable=invalid-name
 def _get_qkv_projections(
     attn: "FluxAttention", hidden_states, encoder_hidden_states=None
 ):
-    qkv, _ = attn.to_qkv(hidden_states)
-    query, key, value = qkv.chunk(3, dim=-1)
+    query, _ = attn.to_q(hidden_states)
+    key, _ = attn.to_k(hidden_states)
+    value, _ = attn.to_v(hidden_states)
 
     encoder_query = encoder_key = encoder_value = None
     if encoder_hidden_states is not None and attn.added_kv_proj_dim is not None:
-        added_qkv, _ = attn.to_added_qkv(encoder_hidden_states)
-        encoder_query, encoder_key, encoder_value = added_qkv.chunk(3, dim=-1)
+        encoder_query, _ = attn.add_q_proj(encoder_hidden_states)
+        encoder_key, _ = attn.add_k_proj(encoder_hidden_states)
+        encoder_value, _ = attn.add_v_proj(encoder_hidden_states)
 
     return query, key, value, encoder_query, encoder_key, encoder_value
 
@@ -96,8 +98,14 @@ class FluxAttention(torch.nn.Module, AttentionModuleMixin):
         self.norm_q = RMSNorm(dim_head, eps=eps)
         self.norm_k = RMSNorm(dim_head, eps=eps)
 
-        self.to_qkv = ColumnParallelLinear(
-            query_dim, self.inner_dim * 3, bias=bias, gather_output=True
+        self.to_q = ColumnParallelLinear(
+            query_dim, self.inner_dim, bias=bias, gather_output=True
+        )
+        self.to_k = ColumnParallelLinear(
+            query_dim, self.inner_dim, bias=bias, gather_output=True
+        )
+        self.to_v = ColumnParallelLinear(
+            query_dim, self.inner_dim, bias=bias, gather_output=True
         )
 
         if not self.pre_only:
@@ -113,9 +121,21 @@ class FluxAttention(torch.nn.Module, AttentionModuleMixin):
         if added_kv_proj_dim is not None:
             self.norm_added_q = RMSNorm(dim_head, eps=eps)
             self.norm_added_k = RMSNorm(dim_head, eps=eps)
-            self.to_added_qkv = ColumnParallelLinear(
+            self.add_q_proj = ColumnParallelLinear(
                 added_kv_proj_dim,
-                self.inner_dim * 3,
+                self.inner_dim,
+                bias=added_proj_bias,
+                gather_output=True,
+            )
+            self.add_k_proj = ColumnParallelLinear(
+                added_kv_proj_dim,
+                self.inner_dim,
+                bias=added_proj_bias,
+                gather_output=True,
+            )
+            self.add_v_proj = ColumnParallelLinear(
+                added_kv_proj_dim,
+                self.inner_dim,
                 bias=added_proj_bias,
                 gather_output=True,
             )
@@ -162,11 +182,15 @@ class FluxAttention(torch.nn.Module, AttentionModuleMixin):
 
         if freqs_cis is not None:
             cos, sin = freqs_cis
-            query = _apply_rotary_emb(
-                query, cos, sin, is_neox_style=False, interleaved=False
+            cos_sin_cache = torch.cat(
+                [
+                    cos.to(dtype=torch.float32).contiguous(),
+                    sin.to(dtype=torch.float32).contiguous(),
+                ],
+                dim=-1,
             )
-            key = _apply_rotary_emb(
-                key, cos, sin, is_neox_style=False, interleaved=False
+            query, key = apply_flashinfer_rope_qk_inplace(
+                query, key, cos_sin_cache, is_neox=False
             )
 
         x = self.attn(query, key, value)
