@@ -22,6 +22,8 @@ if TYPE_CHECKING:
         StandardDispatchOutput,
     )
 
+from sglang.srt.layers.moe.sonic_moe.enums import ActivationType
+
 
 @dataclass
 class SonicMoeRunnerInput(RunnerInput):
@@ -83,6 +85,7 @@ def fused_experts_none_to_sonic_moe(
     Fused expert computation for SonicMoE backend.
     Follows similar pattern to Triton implementation but uses SonicMoE kernels.
     """
+    from sglang.srt.layers.moe.sonic_moe.functional import sonic_moe_forward_placeholder
     from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
 
     hidden_states = dispatch_output.hidden_states
@@ -92,21 +95,44 @@ def fused_experts_none_to_sonic_moe(
     b13 = quant_info.b13
     b2 = quant_info.b2
 
-    output = _sonic_moe_forward_placeholder(
-        hidden_states=hidden_states,
-        w13=w13_weight,
-        b13=b13,
-        w2=w2_weight,
-        b2=b2,
-        router_weights=topk_output.topk_weights,
-        selected_experts=topk_output.topk_ids,
-        config=runner_config,
-    )
+    if runner_config.is_gated and runner_config.activation == "silu":
+        activation_type = ActivationType("swiglu")
+    else:
+        raise NotImplementedError(
+            "Only SiLU gated activation is supported in SonicMoE fused path."
+        )
+
+    use_torch = False
+
+    if use_torch:
+        output = _sonic_moe_forward_placeholder_torch(
+            hidden_states=hidden_states,
+            w13=w13_weight,
+            b13=b13,
+            w2=w2_weight,
+            b2=b2,
+            router_weights=topk_output.topk_weights,
+            selected_experts=topk_output.topk_ids,
+            config=runner_config,
+        )
+    else:
+
+        output = sonic_moe_forward_placeholder(
+            hidden_states=hidden_states,
+            w13=w13_weight.permute(1, 2, 0),
+            b13=b13,
+            w2=w2_weight.permute(1, 2, 0),
+            b2=b2,
+            router_weights=topk_output.topk_weights,
+            selected_experts=topk_output.topk_ids,
+            activation_type=activation_type,
+            config=runner_config,
+        )
 
     return StandardCombineInput(hidden_states=output)
 
 
-def _sonic_moe_forward_placeholder(
+def _sonic_moe_forward_placeholder_torch(
     hidden_states: torch.Tensor,
     w13: torch.Tensor,
     w2: torch.Tensor,
@@ -208,5 +234,6 @@ def _torch_forward(
 
 
 def _swiglu(x: torch.Tensor) -> torch.Tensor:
-    g, u = x.chunk(2, dim=-1)
-    return F.silu(g) * u
+    u = x[..., 1::2]
+    g = x[..., ::2]
+    return u * F.silu(g)
