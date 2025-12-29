@@ -371,8 +371,6 @@ class Indexer(CustomOp):
         assert page_size == 64, "only support page size 64"
         assert len(weights.shape) == 3
         weights = weights.squeeze(-1)
-        k_fp8_list = []
-        k_scale_list = []
         ks_list = []
         ke_list = []
         # Token-to-batch mapping for PAGED chunk alignment
@@ -388,23 +386,33 @@ class Indexer(CustomOp):
             forward_batch.seq_lens_cpu is not None
             and forward_batch.extend_seq_lens_cpu is not None
         )
+        
+        sum_seq_len = 0
+        for i in range(forward_batch.batch_size):
+            sum_seq_len += forward_batch.seq_lens_cpu[i].item()
+        k_fp8 = torch.zeros((sum_seq_len, 128), dtype=torch.uint8, device="cuda")
+        k_scale = torch.zeros((sum_seq_len, 4), dtype=torch.uint8, device="cuda")
 
         for i in range(forward_batch.batch_size):
             seq_len = forward_batch.seq_lens_cpu[i].item()
             assert isinstance(seq_len, int)
+            extend_seq_len = forward_batch.extend_seq_lens_cpu[i]
             # Use fused Triton kernel to get both K and scale in a single call
-            k_fp8, k_scale = forward_batch.token_to_kv_pool.get_index_k_scale_buffer(
+            k_offset_ = k_offset*128
+            k_scale_offset_ = k_offset*4
+            forward_batch.token_to_kv_pool.get_index_k_scale_buffer(
                 layer_id,
                 seq_len,
                 block_tables[i],
+                k_fp8,
+                k_scale,
+                k_offset_,
+                k_scale_offset_,
             )
-            extend_seq_len = forward_batch.extend_seq_lens_cpu[i]
             ks = torch.full(
                 (extend_seq_len,), k_offset, dtype=torch.int32, device="cuda"
             )
             ke = ks + seq_lens_expanded[q_offset : q_offset + extend_seq_len]
-            k_fp8_list.append(k_fp8)
-            k_scale_list.append(k_scale)
             ks_list.append(ks)
             ke_list.append(ke)
 
@@ -412,8 +420,8 @@ class Indexer(CustomOp):
             q_offset += extend_seq_len
             k_offset += seq_len
 
-        k_fp8 = torch.cat(k_fp8_list, dim=0).view(torch.float8_e4m3fn)
-        k_scale = torch.cat(k_scale_list, dim=0).view(torch.float32).squeeze(-1)
+        k_fp8 = k_fp8.view(torch.float8_e4m3fn)
+        k_scale = k_scale.view(torch.float32).squeeze(-1)
         kv_fp8 = (k_fp8, k_scale)
         ks = torch.cat(ks_list, dim=0)
         ke = torch.cat(ke_list, dim=0)
