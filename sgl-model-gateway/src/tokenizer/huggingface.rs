@@ -1,8 +1,7 @@
 use std::collections::HashMap;
 
 use anyhow::{Error, Result};
-use tokenizers::processors::template::TemplateProcessing;
-use tokenizers::tokenizer::Tokenizer as HfTokenizer;
+use tokenizers::{processors::template::TemplateProcessing, tokenizer::Tokenizer as HfTokenizer};
 use tracing::debug;
 
 use super::{
@@ -209,40 +208,28 @@ impl HuggingFaceTokenizer {
     fn load_chat_template_and_config(
         tokenizer_path: &str,
     ) -> (Option<String>, Option<bool>, Option<bool>) {
-        let path = std::path::Path::new(tokenizer_path);
-        let dir = match path.parent() {
-            Some(d) => d,
-            None => return (None, None, None),
-        };
-        let config_path = dir.join("tokenizer_config.json");
+        (|| {
+            let path = std::path::Path::new(tokenizer_path);
+            let config_path = path.parent()?.join("tokenizer_config.json");
 
-        if !config_path.exists() {
-            return (None, None, None);
-        }
+            if !config_path.exists() {
+                return None;
+            }
 
-        let config_str = match config_path.to_str() {
-            Some(s) => s,
-            None => return (None, None, None),
-        };
+            let config_str = config_path.to_str()?;
+            let content = std::fs::read_to_string(&config_path).ok()?;
+            let config: serde_json::Value = serde_json::from_str(&content).ok()?;
 
-        let content = match std::fs::read_to_string(&config_path) {
-            Ok(c) => c,
-            Err(_) => return (None, None, None),
-        };
+            let chat_template = super::chat_template::load_chat_template_from_config(config_str)
+                .ok()
+                .flatten();
 
-        let config: serde_json::Value = match serde_json::from_str(&content) {
-            Ok(c) => c,
-            Err(_) => return (None, None, None),
-        };
+            let add_bos_token = config.get("add_bos_token").and_then(|v| v.as_bool());
+            let add_eos_token = config.get("add_eos_token").and_then(|v| v.as_bool());
 
-        let chat_template =
-            super::chat_template::load_chat_template_from_config(config_str).ok().flatten();
-
-        // Use Option<bool> to distinguish: Some(true), Some(false), None (not set)
-        let add_bos_token = config.get("add_bos_token").and_then(|v| v.as_bool());
-        let add_eos_token = config.get("add_eos_token").and_then(|v| v.as_bool());
-
-        (chat_template, add_bos_token, add_eos_token)
+            Some((chat_template, add_bos_token, add_eos_token))
+        })()
+        .unwrap_or((None, None, None))
     }
 
     /// Load chat template from a file (.jinja or .json containing Jinja)
@@ -315,23 +302,23 @@ impl HuggingFaceTokenizer {
 }
 
 impl Encoder for HuggingFaceTokenizer {
-    fn encode(&self, input: &str) -> Result<Encoding> {
+    fn encode(&self, input: &str, add_special_tokens: bool) -> Result<Encoding> {
         self.tokenizer
-            .encode(input, true)
+            .encode(input, add_special_tokens)
             .map_err(|e| Error::msg(format!("Encoding failed: {}", e)))
             .map(|encoding| Encoding::Hf(Box::new(encoding)))
     }
 
-    fn encode_batch(&self, inputs: &[&str]) -> Result<Vec<Encoding>> {
-        let encodings = self
-            .tokenizer
-            .encode_batch(inputs.to_vec(), true)
-            .map_err(|e| Error::msg(format!("Batch encoding failed: {}", e)))?;
-
-        Ok(encodings
-            .into_iter()
-            .map(|e| Encoding::Hf(Box::new(e)))
-            .collect())
+    fn encode_batch(&self, inputs: &[&str], add_special_tokens: bool) -> Result<Vec<Encoding>> {
+        self.tokenizer
+            .encode_batch(inputs.to_vec(), add_special_tokens)
+            .map_err(|e| Error::msg(format!("Batch encoding failed: {}", e)))
+            .map(|encodings| {
+                encodings
+                    .into_iter()
+                    .map(|e| Encoding::Hf(Box::new(e)))
+                    .collect()
+            })
     }
 }
 
