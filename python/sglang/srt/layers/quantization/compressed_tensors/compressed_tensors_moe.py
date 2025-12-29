@@ -1323,7 +1323,7 @@ class NPUCompressedTensorsW4A8Int8DynamicMoEMethod(CompressedTensorsMoEMethod):
             .get("activation_use_clip", False)
         )
         self.kernel = NPUW4A8Int8DynamicMoEMethod()
-    
+
     def create_weights(
         self,
         layer: torch.nn.Module,
