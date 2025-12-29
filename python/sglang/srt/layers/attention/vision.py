@@ -192,9 +192,27 @@ class VisionSdpaAttention(nn.Module):
         if cu_seqlens is None:
             return None
 
-        cu_seqlens_tuple = tuple(cu_seqlens.cpu().tolist())
+        # Fast path: check pointer-based cache (no GPU→CPU sync)
+        ptr = cu_seqlens.data_ptr()
+        numel = cu_seqlens.numel()
+        fast_key = (s, flatten_batch, ptr, numel)
 
-        return self._generate_mask_cache(s, flatten_batch, cu_seqlens_tuple)
+        if not hasattr(self, "_ptr_mask_cache"):
+            self._ptr_mask_cache = {}
+
+        if fast_key in self._ptr_mask_cache:
+            return self._ptr_mask_cache[fast_key]
+
+        # Slow path: cache miss - need CPU sync
+        cu_seqlens_tuple = tuple(cu_seqlens.cpu().tolist())
+        mask = self._generate_mask_cache(s, flatten_batch, cu_seqlens_tuple)
+
+        # Store in fast cache (bounded size)
+        if len(self._ptr_mask_cache) >= 256:
+            self._ptr_mask_cache.clear()
+        self._ptr_mask_cache[fast_key] = mask
+
+        return mask
 
     def forward(
         self,
