@@ -82,7 +82,7 @@ class ModelSlimW4A8Int8MoE(ModelSlimMoEMethod):
         self.group_size = 0
         self.tp_size = 1
         self.activation_use_clip = (
-            self.quant_description.get("config_groups", {})
+            self.quant_config.get("config_groups", {})
             .get("group_1", {})
             .get("activation_use_clip", False)
         )
