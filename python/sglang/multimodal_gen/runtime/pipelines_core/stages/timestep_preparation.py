@@ -43,6 +43,7 @@ class TimestepPreparationStage(PipelineStage):
             Callable[[Req, ServerArgs], Tuple[str, Any]]
         ] = [],
     ) -> None:
+        super().__init__()
         self.scheduler = scheduler
         self.prepare_extra_set_timesteps_kwargs = prepare_extra_set_timesteps_kwargs
 
@@ -127,7 +128,7 @@ class TimestepPreparationStage(PipelineStage):
 
         # Update batch with prepared timesteps
         batch.timesteps = timesteps
-        self.log_debug(f"timesteps: {timesteps}")
+        self.log_debug("timesteps: %s", timesteps)
         return batch
 
     def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
