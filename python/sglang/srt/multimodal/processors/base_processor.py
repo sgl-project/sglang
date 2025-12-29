@@ -154,12 +154,14 @@ class MultimodalSpecialTokens:
             if t is not None:
                 patterns.append(t.pattern)
                 flags |= t.flags
+
         # If no multimodal tokens are configured, return a regex that never matches.
         # This avoids creating an empty "()" pattern which would match empty strings
         # and break downstream logic (e.g. re.split producing many empty parts).
         if not patterns:
             self.combined_regex = re.compile(r"$^")
             return self.combined_regex
+
         combined = "(" + "|".join(f"(?:{p})" for p in patterns) + ")"
         self.combined_regex = re.compile(combined, flags)
         return self.combined_regex
@@ -629,8 +631,9 @@ class BaseMultimodalProcessor(ABC):
             if multimodal_tokens.get_modality_of_token(p) is not None
         )
         for text_part in text_parts:
-            modality_in_prompt = multimodal_tokens.get_modality_of_token(text_part)
-            if modality_in_prompt is None:
+            # Keep it consistent with submit_data_loading_tasks
+            modality = multimodal_tokens.get_modality_of_token(text_part)
+            if modality is None:
                 # normal text
                 new_text_parts += [text_part]
                 continue
@@ -648,7 +651,7 @@ class BaseMultimodalProcessor(ABC):
                     continue
                 logger.warning(
                     "Mismatch: More multimodal tokens found in the prompt than corresponding data provided. "
-                    f"Keeping token as-is. token={text_part!r}, modality={getattr(modality_in_prompt, 'name', modality_in_prompt)}, "
+                    f"Keeping token as-is. token={text_part!r}, modality={getattr(modality, 'name', modality)}, "
                     f"mm_tokens_in_prompt={mm_token_count_in_prompt}, loaded_items={len(task_info)}"
                 )
                 new_text_parts += [text_part]
@@ -678,17 +681,13 @@ class BaseMultimodalProcessor(ABC):
                     mm_tokens = (
                         text_part if is_precomputed else multimodal_tokens.video_token
                     )
-                    new_text_parts += (
-                        [mm_tokens] if mm_tokens is not None else [text_part]
-                    )
+                    new_text_parts += mm_tokens
                 elif modality == Modality.AUDIO:
                     # audio
                     mm_tokens = (
                         text_part if is_precomputed else multimodal_tokens.audio_token
                     )
-                    new_text_parts += (
-                        [mm_tokens] if mm_tokens is not None else [text_part]
-                    )
+                    new_text_parts += mm_tokens
                 else:
                     # Shouldn't happen, but keep the original token for forward compatibility.
                     new_text_parts += [text_part]
