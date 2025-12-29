@@ -1320,9 +1320,6 @@ class NPUCompressedTensorsW4A8Int8DynamicMoEMethod(CompressedTensorsMoEMethod):
         )
         self.kernel = NPUW4A8Int8DynamicMoEMethod()
 
-    # TODO: See if we can merge this method's logic
-    # with CompressedTensorsWNA8MoEMethod. Need more models and tests.
-    # @OrangeRedeng @TamirBaydasov
     def create_weights(
         self,
         layer: torch.nn.Module,
