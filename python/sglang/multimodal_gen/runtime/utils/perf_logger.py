@@ -1,7 +1,6 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 import dataclasses
 import json
-import logging
 import os
 import subprocess
 import sys
@@ -18,7 +17,10 @@ import sglang.multimodal_gen.envs as envs
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
     _SGLDiffusionLogger,
     get_is_main_process,
+    init_logger,
 )
+
+logger = init_logger(__name__)
 
 
 @dataclasses.dataclass
@@ -129,27 +131,26 @@ class StageProfiler:
         logger: _SGLDiffusionLogger,
         timings: Optional["RequestTimings"],
         simple_log: bool = False,
+        perf_dump_path_provided: bool = False,
     ):
         self.stage_name = stage_name
         self.timings = timings
         self.logger = logger
         self.simple_log = simple_log
         self.start_time = 0.0
-
-        # Check env var at runtime to ensure we pick up changes (e.g. from CLI args)
-        self.metrics_enabled = envs.SGLANG_DIFFUSION_STAGE_LOGGING
+        self.enabled = perf_dump_path_provided or envs.SGLANG_DIFFUSION_STAGE_LOGGING
 
     def __enter__(self):
         if self.simple_log:
             self.logger.info(f"[{self.stage_name}] started...")
 
-        if (self.metrics_enabled and self.timings) or self.simple_log:
+        if (self.enabled and self.timings) or self.simple_log:
             self.start_time = time.perf_counter()
 
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        if not ((self.metrics_enabled and self.timings) or self.simple_log):
+        if not ((self.enabled and self.timings) or self.simple_log):
             return False
 
         execution_time_s = time.perf_counter() - self.start_time
@@ -166,10 +167,10 @@ class StageProfiler:
 
         if self.simple_log:
             self.logger.info(
-                f"[{self.stage_name}] finished in {execution_time_s:.4f} seconds"
+                f"[{self.stage_name}] finished in {execution_time_s:.4f} seconds",
             )
 
-        if self.metrics_enabled and self.timings:
+        if self.enabled and self.timings:
             if "denoising_step_" in self.stage_name:
                 index = int(self.stage_name[len("denoising_step_") :])
                 self.timings.record_steps(index, execution_time_s)
@@ -205,6 +206,11 @@ class PerformanceLogger:
             for name, duration_ms in timings.stages.items()
         ]
 
+        denoise_steps_ms = [
+            {"step": idx, "duration_ms": duration_ms}
+            for idx, duration_ms in enumerate(timings.steps)
+        ]
+
         report = {
             "timestamp": datetime.now(UTC).isoformat(),
             "request_id": timings.request_id,
@@ -212,6 +218,7 @@ class PerformanceLogger:
             "tag": tag,
             "total_duration_ms": timings.total_duration_ms,
             "steps": formatted_steps,
+            "denoise_steps_ms": denoise_steps_ms,
             "meta": meta or {},
         }
 
@@ -220,10 +227,9 @@ class PerformanceLogger:
             os.makedirs(os.path.dirname(abs_path), exist_ok=True)
             with open(abs_path, "w", encoding="utf-8") as f:
                 json.dump(report, f, indent=2)
-            print(f"[Performance] Metrics dumped to: {abs_path}")
+            logger.info(f"[Performance] Metrics dumped to: {abs_path}")
         except IOError as e:
-            print(f"[Performance] Failed to dump metrics to {abs_path}: {e}")
-            logging.getLogger(__name__).error(f"Dump failed: {e}")
+            logger.error(f"[Performance] Failed to dump metrics to {abs_path}: {e}")
 
     @classmethod
     def log_request_summary(
@@ -233,6 +239,8 @@ class PerformanceLogger:
     ):
         """logs the stage metrics and total duration for a completed request
         to the performance_log file.
+
+        Note that this accords to the time spent internally in server, postprocess is not included
         """
         formatted_stages = [
             {"name": name, "execution_time_ms": duration_ms}

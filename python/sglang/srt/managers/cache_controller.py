@@ -309,9 +309,13 @@ class HiCacheController:
             # create a new communication group for synchronizing storage operations across TP workers
             self.tp_world_size = torch.distributed.get_world_size(group=tp_group)
             if self.tp_world_size > 1:
+                from sglang.srt.distributed.parallel_state import (
+                    create_custom_parallel_group,
+                )
+
                 group_ranks = torch.distributed.get_process_group_ranks(tp_group)
-                self.prefetch_tp_group = torch.distributed.new_group(
-                    group_ranks, backend="gloo"
+                self.prefetch_tp_group = create_custom_parallel_group(
+                    group_ranks=group_ranks, backend="gloo"
                 )
 
             # Select the get and set functions
@@ -503,7 +507,7 @@ class HiCacheController:
             elif self.mem_pool_host.layout == "page_first_direct":
                 return host_indices, device_indices.cpu()
         elif self.io_backend == "kernel_ascend":
-            return host_indices, device_indices
+            return host_indices, device_indices.cpu()
         else:
             raise ValueError(f"Unsupported io backend")
 

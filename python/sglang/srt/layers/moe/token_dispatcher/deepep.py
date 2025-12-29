@@ -5,6 +5,7 @@ from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, NamedTuple, Optional, Tuple, Union
 
+from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.dp_attention import get_is_extend_in_batch
@@ -26,7 +27,6 @@ from sglang.srt.layers.moe.utils import (
 )
 from sglang.srt.utils import (
     get_bool_env_var,
-    get_int_env_var,
     is_blackwell,
     is_hip,
     is_npu,
@@ -317,8 +317,8 @@ class _DeepEPDispatcherImplBase:
 
         self.params_bytes = 2
         # A large value will lead to large memory occupation, thus users should change it accordingly
-        self.num_max_dispatch_tokens_per_rank = get_int_env_var(
-            "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK", 128
+        self.num_max_dispatch_tokens_per_rank = (
+            envs.SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get()
         )
         # DeepEP internode_ll dispatch uses FINISHED_SUM_TAG=1024
         # and the logic requires num-tokens-sent-from-one-rank-to-another-rank less than it
@@ -387,7 +387,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         if (
             deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
             and not get_moe_runner_backend().is_cutlass()
-            and not get_bool_env_var("SGLANG_DEEPEP_BF16_DISPATCH")
+            and not envs.SGLANG_DEEPEP_BF16_DISPATCH.get()
         ):
             # TODO hard code 128 block quant,use fp8 communication
             hidden_states = sglang_per_token_group_quant_fp8(
@@ -609,7 +609,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         input_global_scale = self.quant_config.get("input_global_scale", None)
         if input_global_scale is not None:
             use_nvfp4 = True
-        elif not get_bool_env_var("SGLANG_DEEPEP_BF16_DISPATCH"):
+        elif not envs.SGLANG_DEEPEP_BF16_DISPATCH.get():
             use_fp8 = True
 
         buffer = self._get_buffer()

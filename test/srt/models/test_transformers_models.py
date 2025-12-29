@@ -6,7 +6,7 @@ from typing import List
 
 import torch
 
-from sglang.srt.utils import kill_process_tree
+from sglang.srt.utils import is_hip, kill_process_tree
 from sglang.test.runners import DEFAULT_PROMPTS, SRTRunner, check_close_model_outputs
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
@@ -66,6 +66,7 @@ class TestTransformersFallbackEndpoint(CustomTestCase):
         self.assertGreater(metrics["accuracy"], self.gsm8k_lower_bound)
 
 
+@unittest.skipIf(is_hip(), "TorchAO int4wo quantization is not supported on AMD GPUs")
 class TestTransformersFallbackTorchAO(TestTransformersFallbackEndpoint):
     @classmethod
     def setUpClass(cls):
