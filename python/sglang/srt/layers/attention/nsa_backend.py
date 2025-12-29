@@ -26,7 +26,7 @@ from sglang.srt.layers.attention.trtllm_mla_backend import _concat_mla_absorb_q_
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.utils import is_hip
-
+from sglang.srt.utils.common import get_int_env_var
 # from sgl_kernel.flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
 
 if TYPE_CHECKING:
@@ -257,6 +257,8 @@ class NativeSparseAttnBackend(AttentionBackend):
             model_runner.token_to_kv_pool.nsa_kv_cache_store_fp8
         )
         self.nsa_index_topk = get_nsa_index_topk(model_runner.model_config.hf_config)
+        mha_nsa_index_topk_value = self.nsa_index_topk*6 if self.nsa_kv_cache_store_fp8 else self.nsa_index_topk*3
+        self.mha_nsa_index_topk = get_int_env_var("SGLANG_MHA_NSA_INDEX_TOPK", mha_nsa_index_topk_value)
         self.max_context_len = model_runner.model_config.context_len
         self.num_q_heads = (
             model_runner.model_config.num_attention_heads // get_attention_tp_size()
@@ -1445,7 +1447,7 @@ class NativeSparseAttnBackend(AttentionBackend):
                 (
                     device_sm == 90 or (device_sm >= 100 and device_sm < 110)
                 )  # SM90/SM100 only
-                and max_kv_len <= self.nsa_index_topk  # Short enough for MHA
+                and max_kv_len <= self.mha_nsa_index_topk  # Short enough for MHA
                 and forward_batch.token_to_kv_pool.dtype
                 in [torch.bfloat16, torch.float8_e4m3fn]
                 and sum_seq_lens
