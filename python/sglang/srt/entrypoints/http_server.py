@@ -547,6 +547,24 @@ async def model_info():
         "model_type": getattr(model_config.hf_config, "model_type", None),
         "architectures": getattr(model_config.hf_config, "architectures", None),
     }
+
+    # Add KV cache information from scheduler_info if available
+    if _global_state.scheduler_info:
+        max_tokens = _global_state.scheduler_info.get("max_total_num_tokens")
+        size_bytes = _global_state.scheduler_info.get("kv_cache_size_bytes")
+
+        kv_cache_info = {
+            "max_total_num_tokens": int(max_tokens) if max_tokens is not None else None,
+            "kv_cache_size_bytes": int(size_bytes) if size_bytes is not None else None,
+        }
+
+        if "kv_cache_size_bytes" in kv_cache_info:
+            kv_cache_info["kv_cache_size_gb"] = kv_cache_info["kv_cache_size_bytes"] / (
+                1024 * 1024 * 1024
+            )
+
+        result["kv_cache_info"] = kv_cache_info
+
     return result
 
 

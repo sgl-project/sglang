@@ -2846,6 +2846,19 @@ class SenderWrapper:
         self.socket.send_pyobj(output)
 
 
+def _get_kv_size_bytes_from_scheduler(scheduler: Scheduler):
+    kv_cache = scheduler.token_to_kv_pool_allocator.get_kvcache()
+    kv_size_bytes = kv_cache.get_kv_size_bytes()
+
+    # Handle both tuple (K, V) and single value returns
+    if isinstance(kv_size_bytes, tuple):
+        total_kv_size_bytes = sum(kv_size_bytes)
+    else:
+        total_kv_size_bytes = kv_size_bytes
+
+    return total_kv_size_bytes
+
+
 def run_scheduler_process(
     server_args: ServerArgs,
     port_args: PortArgs,
@@ -2915,6 +2928,7 @@ def run_scheduler_process(
             "status": "ready",
             "max_total_num_tokens": scheduler.max_total_num_tokens,
             "max_req_input_len": scheduler.max_req_input_len,
+            "kv_cache_size_bytes": _get_kv_size_bytes_from_scheduler(scheduler),
         }
         if server_args.remote_instance_weight_loader_use_transfer_engine():
             (
