@@ -19,14 +19,14 @@ from sglang.multimodal_gen.configs.models.dits.qwenimage import QwenImageDitConf
 from sglang.multimodal_gen.runtime.layers.attention import USPAttention
 from sglang.multimodal_gen.runtime.layers.layernorm import LayerNorm, RMSNorm
 from sglang.multimodal_gen.runtime.layers.linear import ReplicatedLinear
+from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
+    apply_flashinfer_rope_qk_inplace,
+)
 from sglang.multimodal_gen.runtime.layers.triton_ops import (
     fuse_scale_shift_gate_select01_kernel,
     fuse_scale_shift_kernel,
 )
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
-from sglang.multimodal_gen.runtime.models.dits.utils import (
-    apply_flashinfer_rope_qk_inplace,
-)
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
