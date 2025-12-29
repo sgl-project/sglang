@@ -71,14 +71,14 @@ impl UpdatePoliciesStep {
                 );
             }
 
-            // Specific check for the deprecated prefill_round_robin_balance flag
+            // Check for Data-Parallel consistency using fundamental properties
             if let Some(dp_size_str) = pdp {
                 if let Ok(dp_size) = dp_size_str.parse::<usize>() {
                     if dp_size > 1 {
-                        let prrb = pl.get("prefill_round_robin_balance");
-                        if prrb.map(|s| s.as_str()) != Some("true") {
+                        // When dp_size > 1, round_robin is required for correct rank alignment in disaggregated mode
+                        if plb.map(|s| s.as_str()) != Some("round_robin") {
                             warn!(
-                                "Model {} has dp_size > 1 but prefill_round_robin_balance is not enabled on prefill workers. This may cause rank mismatch.",
+                                "Model {} has dp_size > 1 but load_balance_method is not 'round_robin' on prefill workers. This may cause rank mismatch in disaggregated mode.",
                                 model_id
                             );
                         }
