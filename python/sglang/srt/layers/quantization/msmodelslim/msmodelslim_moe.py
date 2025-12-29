@@ -88,7 +88,7 @@ class ModelSlimW4A8Int8MoE(ModelSlimMoEMethod):
         )
         self.kernel = NPUW4A8Int8DynamicMoEMethod()
 
-def create_weights(
+    def create_weights(
         self,
         layer: torch.nn.Module,
         num_experts: int,
