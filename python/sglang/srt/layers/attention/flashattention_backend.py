@@ -1036,7 +1036,6 @@ class FlashAttentionBackend(AttentionBackend):
         k_rope: Optional[torch.Tensor] = None,
         sinks: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        assert self.fa_impl_ver in [3], "Only FA3 support decoding"
         if k is not None:
             assert v is not None
             if save_kv_cache:
