@@ -95,15 +95,6 @@ print(response.text)
 
 ## Usage Notes
 
-### Performance Optimization
-
-For multimodal models, you can use the `--keep-mm-feature-on-device` flag to optimize for latency at the cost of increased GPU memory usage:
-
-- **Default behavior**: Multimodal feature tensors are moved to CPU after processing to save GPU memory
-- **With `--keep-mm-feature-on-device`**: Feature tensors remain on GPU, reducing device-to-host copy overhead and improving latency, but consuming more GPU memory
-
-Use this flag when you have sufficient GPU memory and want to minimize latency for multimodal inference.
-
 ### Multimodal Inputs Limitation
 
 - **Use `--mm-process-config '{"image":{"max_pixels":1048576},"video":{"fps":3,"max_pixels":602112,"max_frames":60}}'`**: To set `image`, `video`, and `audio` input limits.

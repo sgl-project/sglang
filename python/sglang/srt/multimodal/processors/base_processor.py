@@ -330,7 +330,7 @@ class BaseMultimodalProcessor(ABC):
             return_tensors="pt",
             **kwargs,
         )
-        if not self.server_args.keep_mm_feature_on_device and not SGL_USE_CUDA_IPC:
+        if not SGL_USE_CUDA_IPC:
             # move feature tensors to cpu
             for feature_name in self.FEATURE_NAMES:
                 if feature_name in result and isinstance(

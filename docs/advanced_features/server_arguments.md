@@ -398,7 +398,6 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--disable-shared-experts-fusion` | Disable shared experts fusion optimization for deepseek v3/r1. | `False` | bool flag (set to enable) |
 | `--disable-chunked-prefix-cache` | Disable chunked prefix cache feature for deepseek, which should save overhead for short sequences. | `False` | bool flag (set to enable) |
 | `--disable-fast-image-processor` | Adopt base image processor instead of fast image processor. | `False` | bool flag (set to enable) |
-| `--keep-mm-feature-on-device` | Keep multimodal feature tensors on device after processing to save D2H copy. | `False` | bool flag (set to enable) |
 | `--enable-return-hidden-states` | Enable returning hidden states with responses. | `False` | bool flag (set to enable) |
 | `--scheduler-recv-interval` | The interval to poll requests in scheduler. Can be set to >1 to reduce the overhead of this. | `1` | Type: int |
 | `--numa-node` | Sets the numa node for the subprocesses. i-th element corresponds to i-th subprocess. | `None` | List[int] |

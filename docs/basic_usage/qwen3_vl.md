@@ -17,7 +17,6 @@ python3 -m sglang.launch_server \
   --ep 8 \
   --host 0.0.0.0 \
   --port 30000 \
-  --keep-mm-feature-on-device
 ```
 
 ### Non-FP8 (BF16 / full precision) mode
@@ -106,7 +105,6 @@ When launching the model server for **multimodal support**, you can use the foll
 - `--mm-attention-backend`: Specify multimodal attention backend. Eg. `fa3`(Flash Attention 3)
 - `--mm-max-concurrent-calls <value>`: Specifies the **maximum number of concurrent asynchronous multimodal data processing calls** allowed on the server. Use this to control parallel throughput and GPU memory usage during image/video inference.
 - `--mm-per-request-timeout <seconds>`: Defines the **timeout duration (in seconds)** for each multimodal request. If a request exceeds this time limit (e.g., for very large video inputs), it will be automatically terminated.
-- `--keep-mm-feature-on-device`: Instructs the server to **retain multimodal feature tensors on the GPU** after processing. This avoids device-to-host (D2H) memory copies and improves performance for repeated or high-frequency inference workloads.
 - `SGLANG_USE_CUDA_IPC_TRANSPORT=1`: Shared memory pool based CUDA IPC for multi-modal data transport. For significantly improving e2e latency.
 
 ### Example usage with the above optimizations:
