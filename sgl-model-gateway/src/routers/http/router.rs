@@ -406,7 +406,7 @@ impl Router {
                 }
 
                 for (name, value) in headers {
-                    request_builder = request_builder.header(*name, *value);
+                    request_builder = request_builder.header(name.clone(), value.clone());
                 }
 
                 request_builder.send().await.map_err(convert_reqwest_error)
