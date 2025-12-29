@@ -100,6 +100,7 @@ def forward_mha_prepare_npu(
         k_pe = latent_cache[:, :, m.kv_lora_rank:]
         if m.rotary_emb is not None:
             q_pe, k_pe = m.rotary_emb(positions, q_pe, k_pe)
+        m._set_mla_kv_buffer(latent_cache, kv_a, k_pe, forward_batch)
 
     q[..., m.qk_nope_head_dim :] = q_pe
 
