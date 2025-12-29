@@ -92,7 +92,7 @@ FetchContent_Populate(repo-flashinfer)
 FetchContent_Declare(
     repo-flash-attention
     GIT_REPOSITORY https://github.com/sgl-project/sgl-attn
-    GIT_TAG        4961ba138b563bce620edf1ecdc112618c35bc06
+    GIT_TAG        b7134ded1fb66cac04a016daaf5e8e46567649e7
     GIT_SHALLOW    OFF
 )
 FetchContent_Populate(repo-flash-attention)
