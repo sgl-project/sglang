@@ -2,16 +2,17 @@
 Multi-modality utils
 """
 
+import copy
 import hashlib
 import pickle
 from abc import abstractmethod
+from collections import defaultdict
 from typing import Any, Callable, Dict, List, Literal, Optional, Tuple
 
 import numpy as np
 import torch
 from torch import nn
 
-from sglang.srt.distributed.parallel_state import get_tp_group
 from sglang.srt.environ import envs
 from sglang.srt.layers.multimodal import gpu_tensor_hash
 from sglang.srt.managers.schedule_batch import (
@@ -322,22 +323,46 @@ class MultiModalityDataPaddingPatternMultimodalTokens(MultiModalityDataPaddingPa
 
         input_ids_tensor = torch.as_tensor(input_ids)
 
-        # Create mapping of token_ids to pad_values for each modality
-        token_to_pad_mapping = {}
+        # Check if MM splitting is enabled
+        if envs.SGLANG_ENABLE_MM_SPLITTING.get():
+            items_by_modality = defaultdict(list)
+            for item in mm_inputs.mm_items:
+                items_by_modality[item.modality].append(item)
 
-        for item in mm_inputs.mm_items:
-            if item.is_image() and mm_inputs.im_token_id is not None:
-                token_to_pad_mapping[mm_inputs.im_token_id] = item.pad_value
-            elif item.is_audio() and mm_inputs.audio_token_id is not None:
-                token_to_pad_mapping[mm_inputs.audio_token_id] = item.pad_value
-            elif item.is_video() and mm_inputs.video_token_id is not None:
-                token_to_pad_mapping[mm_inputs.video_token_id] = item.pad_value
-            else:
-                raise ValueError(f"No multimodal token id provided for {item.modality}")
+            token_id_map = {
+                Modality.IMAGE: mm_inputs.im_token_id,
+                Modality.MULTI_IMAGES: mm_inputs.im_token_id,
+                Modality.AUDIO: mm_inputs.audio_token_id,
+                Modality.VIDEO: mm_inputs.video_token_id,
+            }
 
-        # Apply replacements for all tokens at once
-        for token_id, pad_value in token_to_pad_mapping.items():
-            input_ids_tensor[input_ids_tensor == token_id] = pad_value
+            for modality, items in items_by_modality.items():
+                token_id = token_id_map.get(modality)
+
+                if not items or token_id is None:
+                    continue
+
+                for i, item in enumerate(items):
+                    for offset in items[i].offsets:
+                        input_ids_tensor[offset[0] : offset[1] + 1] = item.pad_value
+        else:
+            # Create mapping of token_ids to pad_values for each modality
+            token_to_pad_mapping = {}
+            for item in mm_inputs.mm_items:
+                if item.is_image() and mm_inputs.im_token_id is not None:
+                    token_to_pad_mapping[mm_inputs.im_token_id] = item.pad_value
+                elif item.is_audio() and mm_inputs.audio_token_id is not None:
+                    token_to_pad_mapping[mm_inputs.audio_token_id] = item.pad_value
+                elif item.is_video() and mm_inputs.video_token_id is not None:
+                    token_to_pad_mapping[mm_inputs.video_token_id] = item.pad_value
+                else:
+                    raise ValueError(
+                        f"No multimodal token id provided for {item.modality}"
+                    )
+
+            # Apply replacements for all tokens at once
+            for token_id, pad_value in token_to_pad_mapping.items():
+                input_ids_tensor[input_ids_tensor == token_id] = pad_value
 
         ret_input_ids = input_ids_tensor.tolist()
         return ret_input_ids
@@ -1017,69 +1042,52 @@ def general_mm_embed_routine(
     Returns:
         Hidden states from language model forward pass
     """
-    # Lazy import to allow some monkey patch of piecewise_cuda_graph_runner
-    from sglang.srt.model_executor.piecewise_cuda_graph_runner import (
-        use_original_ca_comm,
-    )
-
-    tp_group = get_tp_group()
-
-    with use_original_ca_comm(tp_group):
-        # We disable custom allreduce in piecewise cuda graph.
-        # However, because we only capture the language model part, the multimodal can still use custom allreduce.
-        assert hasattr(language_model, "get_input_embeddings")
-        embed_tokens = language_model.get_input_embeddings()
+    assert hasattr(language_model, "get_input_embeddings")
+    embed_tokens = language_model.get_input_embeddings()
+    if not hasattr(language_model, "pp_group") or language_model.pp_group.is_first_rank:
         if (
-            not hasattr(language_model, "pp_group")
-            or language_model.pp_group.is_first_rank
+            not forward_batch.forward_mode.is_decode()
+            and not forward_batch.forward_mode.is_target_verify()
+            and forward_batch.contains_mm_inputs()
         ):
-            if (
-                not forward_batch.forward_mode.is_decode()
-                and not forward_batch.forward_mode.is_target_verify()
-                and forward_batch.contains_mm_inputs()
-            ):
-                mm_inputs_list = [
-                    mm_input
-                    for mm_input in forward_batch.mm_inputs
-                    if mm_input is not None
-                ]
-                extend_prefix_lens = [
-                    prefix_len
-                    for i, prefix_len in enumerate(forward_batch.extend_prefix_lens_cpu)
-                    if forward_batch.mm_inputs[i] is not None
-                ]
-                extend_seq_lens = [
-                    seq_len
-                    for i, seq_len in enumerate(forward_batch.extend_seq_lens_cpu)
-                    if forward_batch.mm_inputs[i] is not None
-                ]
-                input_embeds, other_info = embed_mm_inputs(
-                    mm_inputs_list=mm_inputs_list,
-                    extend_prefix_lens=extend_prefix_lens,
-                    extend_seq_lens=extend_seq_lens,
-                    input_ids=input_ids,
-                    multimodal_model=multimodal_model,
-                    input_embedding=embed_tokens,
-                    data_embedding_func_mapping=data_embedding_funcs,
-                    placeholder_tokens=placeholder_tokens,
-                    use_deepstack=use_deepstack,
-                )
-                # add for qwen3_vl deepstack
-                if use_deepstack:
-                    kwargs["input_deepstack_embeds"] = other_info[
-                        "input_deepstack_embeds"
-                    ]
-                # once used, mm_inputs is useless, considering chunked-prefill is disabled for multimodal models
-                # just being defensive here
-                forward_batch.mm_inputs = None
-            else:
-                input_embeds = embed_tokens(input_ids)
-            # Copy to pre-allocated buffer if available (for CUDA graph address stability)
-            if forward_batch.input_embeds is not None:
-                forward_batch.input_embeds.copy_(input_embeds)
-                input_embeds = forward_batch.input_embeds
+            mm_inputs_list = [
+                mm_input for mm_input in forward_batch.mm_inputs if mm_input is not None
+            ]
+            extend_prefix_lens = [
+                prefix_len
+                for i, prefix_len in enumerate(forward_batch.extend_prefix_lens_cpu)
+                if forward_batch.mm_inputs[i] is not None
+            ]
+            extend_seq_lens = [
+                seq_len
+                for i, seq_len in enumerate(forward_batch.extend_seq_lens_cpu)
+                if forward_batch.mm_inputs[i] is not None
+            ]
+            input_embeds, other_info = embed_mm_inputs(
+                mm_inputs_list=mm_inputs_list,
+                extend_prefix_lens=extend_prefix_lens,
+                extend_seq_lens=extend_seq_lens,
+                input_ids=input_ids,
+                multimodal_model=multimodal_model,
+                input_embedding=embed_tokens,
+                data_embedding_func_mapping=data_embedding_funcs,
+                placeholder_tokens=placeholder_tokens,
+                use_deepstack=use_deepstack,
+            )
+            # add for qwen3_vl deepstack
+            if use_deepstack:
+                kwargs["input_deepstack_embeds"] = other_info["input_deepstack_embeds"]
+            # once used, mm_inputs is useless, considering chunked-prefill is disabled for multimodal models
+            # just being defensive here
+            forward_batch.mm_inputs = None
         else:
-            input_embeds = None
+            input_embeds = embed_tokens(input_ids)
+        # Copy to pre-allocated buffer if available (for CUDA graph address stability)
+        if forward_batch.input_embeds is not None:
+            forward_batch.input_embeds.copy_(input_embeds)
+            input_embeds = forward_batch.input_embeds
+    else:
+        input_embeds = None
 
     hidden_states = language_model(
         input_ids=None,
@@ -1238,3 +1246,204 @@ def extend_mrope_positions_for_retracted_request(
 
     # Concatenate to the original mrope_positions
     return torch.cat([mrope_positions, output_positions], dim=1)
+
+
+def _get_length(value):
+    if value is None:
+        return None
+    if isinstance(value, torch.Tensor):
+        return value.shape[0] if value.ndim > 0 else None
+    if isinstance(value, np.ndarray):
+        return value.shape[0] if value.ndim > 0 else None
+    if isinstance(value, (list, tuple)):
+        return len(value)
+    return None
+
+
+def _slice_value(value, start, end):
+    if isinstance(value, torch.Tensor):
+        return value[start:end]
+    if isinstance(value, np.ndarray):
+        return value[start:end]
+    if isinstance(value, list):
+        return value[start:end]
+    if isinstance(value, tuple):
+        return value[start:end]
+    try:
+        return value[start:end]
+    except Exception:
+        return value
+
+
+def _slice_model_data(
+    data: dict,
+    index: int,
+    start: int,
+    end: int,
+    num_items: int,
+    total_feature_len: Optional[int],
+):
+    sliced = {}
+    for key, value in data.items():
+        length = _get_length(value)
+        if length == num_items:
+            sliced[key] = _slice_value(value, index, index + 1)
+        elif total_feature_len is not None and length == total_feature_len:
+            sliced[key] = _slice_value(value, start, end)
+        else:
+            sliced[key] = value
+    return sliced
+
+
+def get_new_expanded_mm_items(original_mm_items):
+    expanded_mm_items = []
+    for item in original_mm_items:
+        is_bundled = item.offsets is not None and len(item.offsets) > 1
+
+        if is_bundled:
+            num_items = len(item.offsets)
+
+            if item.is_image():
+                image_grid_thw = item.model_specific_data.get("image_grid_thw")
+                grid_len = _get_length(image_grid_thw)
+                if image_grid_thw is None or grid_len != num_items:
+                    expanded_mm_items.append(item)
+                    continue
+
+                patches_per_item = []
+                for grid in image_grid_thw:
+                    grid_tensor = torch.as_tensor(grid, dtype=torch.long)
+                    patches_per_item.append(int(torch.prod(grid_tensor).item()))
+
+                cumulative = torch.cumsum(
+                    torch.tensor(patches_per_item, dtype=torch.long), dim=0
+                )
+                slice_indices = [0] + cumulative.tolist()
+
+                feature_len = _get_length(item.feature)
+                if feature_len is None:
+                    feature_len = _get_length(item.precomputed_embeddings)
+                if feature_len is None or slice_indices[-1] != feature_len:
+                    expanded_mm_items.append(item)
+                    continue
+
+                total_feature_len = feature_len
+                for i in range(num_items):
+                    start, end = slice_indices[i], slice_indices[i + 1]
+                    new_item = copy.deepcopy(item)
+                    if item.feature is not None:
+                        new_item.feature = _slice_value(item.feature, start, end)
+                    if item.precomputed_embeddings is not None:
+                        new_item.precomputed_embeddings = _slice_value(
+                            item.precomputed_embeddings, start, end
+                        )
+                    new_item.offsets = [item.offsets[i]]
+                    new_item.model_specific_data = _slice_model_data(
+                        item.model_specific_data,
+                        index=i,
+                        start=start,
+                        end=end,
+                        num_items=num_items,
+                        total_feature_len=total_feature_len,
+                    )
+                    new_item.hash = None
+                    expanded_mm_items.append(new_item)
+
+            elif item.is_video():
+                video_grid_thw = item.model_specific_data.get("video_grid_thw")
+                if video_grid_thw is None:
+                    expanded_mm_items.append(item)
+                    continue
+
+                # video_grid_thw shape: [num_videos, 3] where each row is [T, H, W]
+                # When T > 1, item.offsets contains frames (num_items = total frames)
+                # grid_len = num_videos, num_items = sum(T for each video) = total frames
+                grid_len = _get_length(video_grid_thw)
+                num_videos = grid_len
+
+                # Calculate total frames and frames per video
+                frames_per_video = []
+                total_frames = 0
+                for i in range(num_videos):
+                    grid = video_grid_thw[i]
+                    if isinstance(grid, torch.Tensor):
+                        T = int(grid[0].item())  # T is the first element [T, H, W]
+                    else:
+                        grid_tensor = torch.as_tensor(grid, dtype=torch.long)
+                        T = int(grid_tensor[0].item())
+                    frames_per_video.append(T)
+                    total_frames += T
+
+                # num_items should equal total_frames when T > 1
+                if num_items != total_frames:
+                    expanded_mm_items.append(item)
+                    continue
+
+                # Calculate patches per video: T * H * W for each video
+                patches_per_video = []
+                for i in range(num_videos):
+                    grid = video_grid_thw[i]
+                    if isinstance(grid, torch.Tensor):
+                        patches_per_video.append(int(torch.prod(grid).item()))
+                    else:
+                        grid_tensor = torch.as_tensor(grid, dtype=torch.long)
+                        patches_per_video.append(int(torch.prod(grid_tensor).item()))
+
+                # Calculate cumulative patches to get slice indices for each video
+                cumulative = torch.cumsum(
+                    torch.tensor(patches_per_video, dtype=torch.long), dim=0
+                )
+                slice_indices = [0] + cumulative.tolist()
+
+                feature_len = _get_length(item.feature)
+                if feature_len is None:
+                    feature_len = _get_length(item.precomputed_embeddings)
+                if feature_len is None or slice_indices[-1] != feature_len:
+                    expanded_mm_items.append(item)
+                    continue
+
+                total_feature_len = feature_len
+                # Group frames by video: calculate frame indices for each video
+                frame_start_indices = [0]
+                for i in range(num_videos):
+                    frame_start_indices.append(
+                        frame_start_indices[-1] + frames_per_video[i]
+                    )
+
+                # Expand each video into a separate item
+                for video_idx in range(num_videos):
+                    start, end = (
+                        slice_indices[video_idx],
+                        slice_indices[video_idx + 1],
+                    )
+                    frame_start, frame_end = (
+                        frame_start_indices[video_idx],
+                        frame_start_indices[video_idx + 1],
+                    )
+
+                    new_item = copy.deepcopy(item)
+                    if item.feature is not None:
+                        new_item.feature = _slice_value(item.feature, start, end)
+                    if item.precomputed_embeddings is not None:
+                        new_item.precomputed_embeddings = _slice_value(
+                            item.precomputed_embeddings, start, end
+                        )
+                    # Group offsets for this video (all frames of this video)
+                    new_item.offsets = item.offsets[frame_start:frame_end]
+                    # For video_grid_thw, slice the corresponding row [T, H, W] for this video
+                    new_item.model_specific_data = _slice_model_data(
+                        item.model_specific_data,
+                        index=video_idx,
+                        start=start,
+                        end=end,
+                        num_items=num_videos,
+                        total_feature_len=total_feature_len,
+                    )
+                    new_item.hash = None
+                    expanded_mm_items.append(new_item)
+            else:
+                expanded_mm_items.append(item)
+
+        else:
+            expanded_mm_items.append(item)
+    return expanded_mm_items

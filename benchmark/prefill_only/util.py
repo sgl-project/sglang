@@ -553,6 +553,7 @@ async def process_results(
     print(f"  Server type:           {config.server_type}")
     print(f"  HTTP mode:             {http_mode}")
     print(f"  Target RPS:            {rps}")
+    print(f"  Achieved RPS:          {len(all_results) / total_duration:.2f}")
     print(f"  Item count:            {item_count}")
     print(f"  Distribution:          {config.distribution}")
     print(f"  Unique requests generated: {config.num_unique_requests}")

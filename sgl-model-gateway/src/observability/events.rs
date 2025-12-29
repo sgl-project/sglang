@@ -1,31 +1,30 @@
 //! Request events for observability and monitoring.
 //!
-//! Events use conditional log levels:
-//! - DEBUG when OTEL is disabled (keeps logs quiet)
-//! - INFO when OTEL is enabled (passes through EnvFilter to OTEL layer)
+//! Events use DEBUG level when OTEL is disabled, INFO when enabled.
 
 use tracing::{debug, event, Level};
 
 use super::otel_trace::is_otel_enabled;
 
 /// Module path used by CustomOtelFilter to identify events for OTEL export.
-pub fn get_module_path() -> &'static str {
-    module_path!()
+#[inline]
+pub const fn get_module_path() -> &'static str {
+    "sgl_model_gateway::observability::events"
 }
 
-/// Trait for emitting observability events.
 pub trait Event {
     fn emit(&self);
 }
 
 /// Event emitted when a prefill-decode request pair is sent.
-#[derive(Debug)]
-pub struct RequestPDSentEvent {
-    pub prefill_url: String,
-    pub decode_url: String,
+#[derive(Debug, Clone, Copy)]
+pub struct RequestPDSentEvent<'a> {
+    pub prefill_url: &'a str,
+    pub decode_url: &'a str,
 }
 
-impl Event for RequestPDSentEvent {
+impl Event for RequestPDSentEvent<'_> {
+    #[inline]
     fn emit(&self) {
         if is_otel_enabled() {
             event!(
@@ -45,12 +44,13 @@ impl Event for RequestPDSentEvent {
 }
 
 /// Event emitted when a request is sent to a worker.
-#[derive(Debug)]
-pub struct RequestSentEvent {
-    pub url: String,
+#[derive(Debug, Clone, Copy)]
+pub struct RequestSentEvent<'a> {
+    pub url: &'a str,
 }
 
-impl Event for RequestSentEvent {
+impl Event for RequestSentEvent<'_> {
+    #[inline]
     fn emit(&self) {
         if is_otel_enabled() {
             event!(Level::INFO, url = %self.url, "Sending request");
@@ -61,15 +61,30 @@ impl Event for RequestSentEvent {
 }
 
 /// Event emitted when concurrent requests are received.
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub struct RequestReceivedEvent;
 
 impl Event for RequestReceivedEvent {
+    #[inline]
     fn emit(&self) {
         if is_otel_enabled() {
             event!(Level::INFO, "Received concurrent requests");
         } else {
             debug!("Received concurrent requests");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::mem::size_of;
+
+    use super::*;
+
+    #[test]
+    fn test_event_sizes() {
+        assert_eq!(size_of::<RequestReceivedEvent>(), 0);
+        assert_eq!(size_of::<RequestSentEvent>(), 16);
+        assert_eq!(size_of::<RequestPDSentEvent>(), 32);
     }
 }

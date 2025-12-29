@@ -10,6 +10,7 @@ fn test_embedding_request_serialization_string_input() {
         user: Some("user-1".to_string()),
         dimensions: Some(128),
         rid: Some("rid-123".to_string()),
+        log_metrics: None,
     };
 
     let serialized = to_string(&req).unwrap();
@@ -32,6 +33,7 @@ fn test_embedding_request_serialization_array_input() {
         user: None,
         dimensions: None,
         rid: None,
+        log_metrics: None,
     };
 
     let serialized = to_string(&req).unwrap();
@@ -49,6 +51,7 @@ fn test_embedding_generation_request_trait_string() {
         user: None,
         dimensions: None,
         rid: None,
+        log_metrics: None,
     };
     assert!(!req.is_stream());
     assert_eq!(req.get_model(), Some("emb-model"));
@@ -64,6 +67,7 @@ fn test_embedding_generation_request_trait_array() {
         user: None,
         dimensions: None,
         rid: None,
+        log_metrics: None,
     };
     assert_eq!(req.extract_text_for_routing(), "hello world");
 }
@@ -77,6 +81,7 @@ fn test_embedding_generation_request_trait_non_text() {
         user: None,
         dimensions: None,
         rid: None,
+        log_metrics: None,
     };
     assert_eq!(req.extract_text_for_routing(), "");
 }
@@ -90,6 +95,7 @@ fn test_embedding_generation_request_trait_mixed_array_ignores_nested() {
         user: None,
         dimensions: None,
         rid: None,
+        log_metrics: None,
     };
     // Only top-level string elements are extracted
     assert_eq!(req.extract_text_for_routing(), "a");

@@ -10,6 +10,7 @@ use uuid::Uuid;
 
 use super::{
     client::GrpcClient,
+    context::RequestContext,
     proto_wrapper::{ProtoGenerateComplete, ProtoStream},
     ProcessedMessages,
 };
@@ -41,6 +42,49 @@ use crate::{
         ParserFactory as ToolParserFactory, PooledParser as ToolPooledParser, ToolParser,
     },
 };
+
+/// Resolve tokenizer from registry and cache it in request context.
+///
+/// This is a helper to avoid duplicating tokenizer resolution logic across
+/// preparation stages (chat, generate, embedding).
+///
+/// Returns the tokenizer Arc, which is also cached in `ctx.state.tokenizer`.
+pub fn resolve_tokenizer(
+    ctx: &mut RequestContext,
+    stage_name: &str,
+) -> Result<Arc<dyn Tokenizer>, Box<Response>> {
+    let model_id = ctx.input.model_id.as_deref().ok_or_else(|| {
+        error!(
+            function = %stage_name,
+            "model_id not set in request context"
+        );
+        Box::new(error::internal_error(
+            "model_id_not_set",
+            "model_id not set in request context - this is a bug in request routing",
+        ))
+    })?;
+
+    let tokenizer = ctx
+        .components
+        .tokenizer_registry
+        .get(model_id)
+        .ok_or_else(|| {
+            error!(
+                function = %stage_name,
+                model = %model_id,
+                "Tokenizer not found for model"
+            );
+            Box::new(error::internal_error(
+                "tokenizer_not_found",
+                format!("Tokenizer not found for model: {}", model_id),
+            ))
+        })?;
+
+    // Cache tokenizer in context for reuse in response processing stage
+    ctx.state.tokenizer = Some(tokenizer.clone());
+
+    Ok(tokenizer)
+}
 
 /// Get gRPC client from worker, returning appropriate error response on failure
 pub async fn get_grpc_client_from_worker(worker: &Arc<dyn Worker>) -> Result<GrpcClient, Response> {

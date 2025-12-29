@@ -12,8 +12,10 @@ class ImageResponseData(BaseModel):
 
 
 class ImageResponse(BaseModel):
+    id: str
     created: int = Field(default_factory=lambda: int(time.time()))
     data: List[ImageResponseData]
+    peak_memory_mb: Optional[float] = None
 
 
 class ImageGenerationsRequest(BaseModel):
@@ -50,6 +52,7 @@ class VideoResponse(BaseModel):
     completed_at: Optional[int] = None
     expires_at: Optional[int] = None
     error: Optional[Dict[str, Any]] = None
+    peak_memory_mb: Optional[float] = None
 
 
 class VideoGenerationsRequest(BaseModel):

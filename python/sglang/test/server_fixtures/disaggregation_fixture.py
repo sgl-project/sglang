@@ -1,5 +1,6 @@
 import logging
 import os
+import shlex
 import time
 import warnings
 from urllib.parse import urlparse
@@ -69,7 +70,7 @@ class PDDisaggregationServerBase(CustomTestCase):
             "--port",
             cls.lb_port,
         ]
-        print("Starting load balancer:", " ".join(lb_command))
+        print("Starting load balancer:", shlex.join(lb_command))
         cls.process_lb = popen_with_error_check(lb_command)
         cls.wait_server_ready(cls.lb_url + "/health")
 

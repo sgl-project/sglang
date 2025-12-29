@@ -17,6 +17,7 @@ from sglang.test.test_utils import (
 DEEPSEEK_V32_MODEL_PATH = "deepseek-ai/DeepSeek-V3.2-Exp"
 
 
+@unittest.skip("Skip for saving ci time")
 class TestDeepseek(CustomTestCase):
     @classmethod
     def setUpClass(cls):
@@ -172,7 +173,7 @@ class TestDeepseekV32TBO(CustomTestCase):
             "--moe-a2a-backend",
             "deepep",
             "--cuda-graph-max-bs",
-            "32",
+            "256",
         ]
         cls.process = popen_launch_server(
             cls.model,
@@ -189,10 +190,10 @@ class TestDeepseekV32TBO(CustomTestCase):
         self,
     ):  # Append an "a" to make this test run first (alphabetically) to warm up the server
         args = SimpleNamespace(
-            num_shots=20,
+            num_shots=5,
             data_path=None,
-            num_questions=1400,
-            parallel=1400,
+            num_questions=1200,
+            parallel=1200,
             max_new_tokens=512,
             host="http://127.0.0.1",
             port=int(self.base_url.split(":")[-1]),

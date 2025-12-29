@@ -93,6 +93,7 @@ class SchedulePolicy:
         self.enable_hierarchical_cache = enable_hierarchical_cache
         self.enable_priority_scheduling = enable_priority_scheduling
         self.schedule_low_priority_values_first = schedule_low_priority_values_first
+        self.priority_sign = 1 if schedule_low_priority_values_first else -1
 
         # It is used to find the matching prefix for in-batch prefix caching.
         self.waiting_queue_radix_tree = RadixCache.create_simulated()
@@ -101,7 +102,7 @@ class SchedulePolicy:
         if self.policy == CacheAgnosticPolicy.FCFS:
             if self.enable_priority_scheduling:
                 SchedulePolicy._sort_by_priority_and_fcfs(
-                    waiting_queue, self.schedule_low_priority_values_first
+                    waiting_queue, self.priority_sign
                 )
             return False
 
@@ -128,7 +129,7 @@ class SchedulePolicy:
                 SchedulePolicy._sort_by_longest_output(
                     waiting_queue,
                     self.enable_priority_scheduling,
-                    self.schedule_low_priority_values_first,
+                    self.priority_sign,
                 )
             elif policy == CacheAgnosticPolicy.RANDOM:
                 SchedulePolicy._sort_randomly(waiting_queue)
@@ -173,7 +174,6 @@ class SchedulePolicy:
         for r in waiting_queue:
             prefix_ids = r.origin_input_ids + r.output_ids
             extra_key = r.extra_key
-
             # NOTE: the prefix_indices must always be aligned with last_node
             match_result = self.tree_cache.match_prefix(
                 rid=r.rid, key=RadixKey(token_ids=prefix_ids, extra_key=extra_key)
@@ -255,18 +255,16 @@ class SchedulePolicy:
     def _sort_by_longest_output(
         waiting_queue: List[Req],
         enable_priority_scheduling: bool,
-        schedule_low_priority_values_first: bool,
+        priority_sign: int,
     ) -> None:
         """Sorts the waiting queue based on the longest output (max_new_tokens). If using priority scheduling, sort by priority first."""
         if enable_priority_scheduling:
-            if schedule_low_priority_values_first:
-                waiting_queue.sort(
-                    key=lambda x: (x.priority, -x.sampling_params.max_new_tokens)
+            waiting_queue.sort(
+                key=lambda x: (
+                    x.priority * priority_sign,
+                    -x.sampling_params.max_new_tokens,
                 )
-            else:
-                waiting_queue.sort(
-                    key=lambda x: (-x.priority, -x.sampling_params.max_new_tokens)
-                )
+            )
         else:
             waiting_queue.sort(key=lambda x: -x.sampling_params.max_new_tokens)
 
@@ -277,17 +275,15 @@ class SchedulePolicy:
 
     @staticmethod
     def _sort_by_priority_and_fcfs(
-        waiting_queue: List[Req], schedule_low_priority_values_first: bool
+        waiting_queue: List[Req], priority_sign: int
     ) -> None:
         """Sorts the waiting queue based on the request priority then received titmestamp."""
-        if schedule_low_priority_values_first:
-            waiting_queue.sort(
-                key=lambda x: (x.priority, x.time_stats.wait_queue_entry_time)
+        waiting_queue.sort(
+            key=lambda x: (
+                x.priority * priority_sign,
+                x.time_stats.wait_queue_entry_time,
             )
-        else:
-            waiting_queue.sort(
-                key=lambda x: (-x.priority, x.time_stats.wait_queue_entry_time)
-            )
+        )
 
     @staticmethod
     def _calc_weight(cur_node: TreeNode, node_to_weight: Dict[TreeNode, int]) -> None:
@@ -340,7 +336,6 @@ class PrefillAdder:
         self.rem_chunk_tokens = rem_chunk_tokens
         if self.rem_chunk_tokens is not None:
             self.rem_chunk_tokens -= mixed_with_decode_tokens
-
         self.rem_total_token_offset = mixed_with_decode_tokens
         self.cur_rem_token_offset = mixed_with_decode_tokens
 
@@ -399,7 +394,6 @@ class PrefillAdder:
                 self.token_to_kv_pool_allocator.available_size()
                 + self.tree_cache.evictable_size()
             )
-
         return available_and_evictable - self.rem_total_token_offset
 
     @property
@@ -677,19 +671,20 @@ class PrefillAdder:
         Returns True if preemption was committed, and the new request can be scheduled.
         """
         # Iterate running requests to find preemptible requests
+        priority_sign = 1 if server_args.schedule_low_priority_values_first else -1
+
         valid_running_reqs = (
             r for r in self.running_batch.reqs if r not in self.preempt_list
         )
-        if server_args.schedule_low_priority_values_first:
-            sorted_valid_running_reqs = sorted(
-                valid_running_reqs,
-                key=lambda x: (-x.priority, -x.time_stats.wait_queue_entry_time),
-            )
-        else:
-            sorted_valid_running_reqs = sorted(
-                valid_running_reqs,
-                key=lambda x: (x.priority, -x.time_stats.wait_queue_entry_time),
-            )
+
+        sorted_valid_running_reqs = sorted(
+            valid_running_reqs,
+            key=lambda x: (
+                x.priority * (-priority_sign),
+                -x.time_stats.wait_queue_entry_time,
+            ),
+        )
+
         preemptible_reqs = []
         min_tokens_to_remove = (
             req.extend_input_len
@@ -698,9 +693,8 @@ class PrefillAdder:
         )
         for running_req in sorted_valid_running_reqs:
             # Priority difference needs to meet the threshold to be preemptible.
-            priority_diff = req.priority - running_req.priority
-            if server_args.schedule_low_priority_values_first:
-                priority_diff *= -1
+            priority_diff = (req.priority - running_req.priority) * (-priority_sign)
+
             if priority_diff > self.priority_scheduling_preemption_threshold:
                 preemptible_reqs.append(running_req)
                 min_tokens_to_remove -= self._get_running_request_total_token_offset(

@@ -174,21 +174,25 @@ async fn test_cache_produces_identical_tokens() {
 
         // Tokenize with base (no cache)
         let base_encoding = base_tokenizer
-            .encode(turn)
+            .encode(turn, false)
             .expect("Base tokenization failed");
         let base_tokens = base_encoding.token_ids();
 
         // Tokenize with L0-only
-        let l0_encoding = l0_tokenizer.encode(turn).expect("L0 tokenization failed");
+        let l0_encoding = l0_tokenizer
+            .encode(turn, false)
+            .expect("L0 tokenization failed");
         let l0_tokens = l0_encoding.token_ids();
 
         // Tokenize with L1-only
-        let l1_encoding = l1_tokenizer.encode(turn).expect("L1 tokenization failed");
+        let l1_encoding = l1_tokenizer
+            .encode(turn, false)
+            .expect("L1 tokenization failed");
         let l1_tokens = l1_encoding.token_ids();
 
         // Tokenize with L0+L1
         let l0_l1_encoding = l0_l1_tokenizer
-            .encode(turn)
+            .encode(turn, false)
             .expect("L0+L1 tokenization failed");
         let l0_l1_tokens = l0_l1_encoding.token_ids();
 
@@ -397,13 +401,13 @@ async fn test_cache_correctness_with_edge_cases() {
         test_count += 1;
 
         let base_tokens = base_tokenizer
-            .encode(query)
+            .encode(query, false)
             .expect("Base encoding failed")
             .token_ids()
             .to_vec();
 
         let cached_tokens = cached_tokenizer
-            .encode(query)
+            .encode(query, false)
             .expect("Cached encoding failed")
             .token_ids()
             .to_vec();

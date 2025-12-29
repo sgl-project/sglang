@@ -2,6 +2,7 @@
 /docker @Fridge003 @ispobock @HaiShaw @ishandhanani
 /docker/npu.Dockerfile @ping1jing2 @iforgetmyname
 /python/pyproject.toml @merrymercy @Fridge003 @ispobock
+/python/sglang/jit_kernel @DarkSharpness @BBuf
 /python/sglang/multimodal_gen @mickqian @yhyang201
 /python/sglang/srt/batch_invariant_ops @Fridge003 @hebiao064
 /python/sglang/srt/constrained @hnyls2002 @DarkSharpness

@@ -5,11 +5,20 @@
         "description": "Reference numbers captured from the CI diffusion server baseline run"
     },
     "tolerances": {
-        "e2e": 0.1,
-        "denoise_stage": 0.05,
-        "non_denoise_stage": 0.4,
-        "denoise_step": 0.2,
-        "denoise_agg": 0.1
+        "long_term": {
+            "e2e": 0.1,
+            "denoise_stage": 0.05,
+            "non_denoise_stage": 0.4,
+            "denoise_step": 0.2,
+            "denoise_agg": 0.1
+        },
+        "pr_test": {
+            "e2e": 0.15,
+            "denoise_stage": 0.1,
+            "non_denoise_stage": 0.6,
+            "denoise_step": 0.25,
+            "denoise_agg": 0.15
+        }
     },
     "improvement_reporting": {
         "threshold": 0.2
@@ -294,6 +303,74 @@
             "expected_e2e_ms": 27648.69,
             "expected_avg_denoise_ms": 520.09,
             "expected_median_denoise_ms": 528.0
+        },
+
+        "flux_2_image_t2i_layerwise_offload": {
+            "stages_ms": {
+                "InputValidationStage": 0.06,
+                "TextEncodingStage": 513.58,
+                "ImageVAEEncodingStage": 0.0,
+                "ConditioningStage": 0.03,
+                "LatentPreparationStage": 0.46,
+                "TimestepPreparationStage": 2.38,
+                "DenoisingStage": 52187.62,
+                "DecodingStage": 190.31
+            },
+            "denoise_step_ms": {
+                "0": 1033.45,
+                "1": 137.03,
+                "2": 1046.96,
+                "3": 1039.28,
+                "4": 1039.05,
+                "5": 1043.91,
+                "6": 1041.75,
+                "7": 1037.6,
+                "8": 1043.54,
+                "9": 1048.63,
+                "10": 1039.8,
+                "11": 1042.25,
+                "12": 1041.54,
+                "13": 1045.89,
+                "14": 1038.99,
+                "15": 1041.82,
+                "16": 1038.32,
+                "17": 1045.53,
+                "18": 1046.54,
+                "19": 1041.22,
+                "20": 1044.55,
+                "21": 1041.31,
+                "22": 1051.28,
+                "23": 1043.12,
+                "24": 1044.65,
+                "25": 1042.25,
+                "26": 1046.47,
+                "27": 1052.9,
+                "28": 1039.04,
+                "29": 1042.39,
+                "30": 1045.33,
+                "31": 1038.05,
+                "32": 1037.76,
+                "33": 1037.93,
+                "34": 1052.85,
+                "35": 1045.59,
+                "36": 1054.32,
+                "37": 1044.59,
+                "38": 1043.57,
+                "39": 1041.93,
+                "40": 1043.59,
+                "41": 1046.17,
+                "42": 1046.92,
+                "43": 1047.04,
+                "44": 1046.8,
+                "45": 1041.86,
+                "46": 1041.05,
+                "47": 1044.04,
+                "48": 1039.77,
+                "49": 1047.12
+            },
+            "expected_e2e_ms": 53290.15,
+            "expected_avg_denoise_ms": 1025.35,
+            "expected_median_denoise_ms": 1043.33
         },
         "flux_2_ti2i": {
             "stages_ms": {

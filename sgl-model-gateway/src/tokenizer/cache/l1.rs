@@ -176,6 +176,7 @@ impl L1Cache {
         input: &str,
         tokenizer: &E,
         special_tokens: &[&str],
+        add_special_tokens: bool,
     ) -> anyhow::Result<()> {
         let boundaries = find_special_token_boundaries(input, special_tokens);
 
@@ -194,7 +195,7 @@ impl L1Cache {
 
             // Re-tokenize the prefix for guaranteed correctness
             // This is the only way to know the exact token boundaries
-            let prefix_encoding = tokenizer.encode(prefix)?;
+            let prefix_encoding = tokenizer.encode(prefix, add_special_tokens)?;
             // Convert to Arc<[TokenIdType]> for zero-copy sharing
             let prefix_tokens: Arc<[TokenIdType]> = prefix_encoding.token_ids().into();
 
@@ -357,7 +358,7 @@ mod tests {
 
         // Insert at special token boundaries (re-tokenizes prefixes)
         cache
-            .insert_at_boundaries(input1, &tokenizer, special_tokens)
+            .insert_at_boundaries(input1, &tokenizer, special_tokens, false)
             .unwrap();
 
         // Should have cached at special token boundaries
@@ -384,7 +385,7 @@ mod tests {
         let input = "<|im_start|>user\nHi<|im_end|>";
 
         cache
-            .insert_at_boundaries(input, &tokenizer, special_tokens)
+            .insert_at_boundaries(input, &tokenizer, special_tokens, false)
             .unwrap();
 
         // Should cache at <|im_start|> boundary (has suffix left)
@@ -405,7 +406,7 @@ mod tests {
         let input = "<|im_start|>system\nYou are a helpful AI assistant that provides detailed and accurate responses.<|im_end|><|im_start|>user\nHello there! How are you today? Can you help me understand how tokenization works in language models?<|im_end|><|im_start|>assistant\nI'm doing well, thank you! I'd be happy to explain tokenization. Tokenization is the process of breaking text into smaller units called tokens.<|im_end|>";
 
         cache
-            .insert_at_boundaries(input, &tokenizer, special_tokens)
+            .insert_at_boundaries(input, &tokenizer, special_tokens, false)
             .unwrap();
 
         // Should have multiple entries at special token boundaries
@@ -432,7 +433,7 @@ mod tests {
         let input = "<|im_start|>system\nYou are a helpful assistant that provides detailed answers.<|im_end|><|im_start|>user\nHello there! How are you today?<|im_end|>";
 
         cache
-            .insert_at_boundaries(input, &tokenizer, special_tokens)
+            .insert_at_boundaries(input, &tokenizer, special_tokens, false)
             .unwrap();
 
         // Try to find match
@@ -454,7 +455,7 @@ mod tests {
         let input = "<|im_start|>system\nYou are a helpful assistant that provides clear and detailed responses.<|im_end|><|im_start|>user\nHello there!<|im_end|>";
 
         cache
-            .insert_at_boundaries(input, &tokenizer, special_tokens)
+            .insert_at_boundaries(input, &tokenizer, special_tokens, false)
             .unwrap();
         assert!(!cache.is_empty());
 
@@ -476,7 +477,7 @@ mod tests {
         // Insert first conversation
         let input1 = "<|im_start|>system\nYou are a helpful assistant specialized in mathematics.<|im_end|><|im_start|>user\nCan you explain calculus to me?<|im_end|><|im_start|>assistant\nCertainly! Calculus is a branch of mathematics that studies continuous change.<|im_end|><|eot_id|>";
         cache
-            .insert_at_boundaries(input1, &tokenizer, special_tokens)
+            .insert_at_boundaries(input1, &tokenizer, special_tokens, false)
             .unwrap();
 
         // Access the first entry to update its timestamp
@@ -486,7 +487,7 @@ mod tests {
         // Insert second conversation
         let input2 = "<|im_start|>system\nYou are a helpful assistant specialized in physics.<|im_end|><|im_start|>user\nWhat is quantum mechanics?<|im_end|><|im_start|>assistant\nQuantum mechanics is the fundamental theory describing nature at atomic and subatomic scales.<|im_end|><|eot_id|>";
         cache
-            .insert_at_boundaries(input2, &tokenizer, special_tokens)
+            .insert_at_boundaries(input2, &tokenizer, special_tokens, false)
             .unwrap();
 
         // Access the second entry to make it more recent
@@ -496,7 +497,7 @@ mod tests {
         // Insert third conversation (should trigger eviction of oldest)
         let input3 = "<|im_start|>system\nYou are a helpful assistant specialized in chemistry.<|im_end|><|im_start|>user\nExplain the periodic table to me please.<|im_end|><|im_start|>assistant\nThe periodic table is a tabular arrangement of chemical elements organized by atomic number and electron configuration.<|im_end|><|eot_id|>";
         cache
-            .insert_at_boundaries(input3, &tokenizer, special_tokens)
+            .insert_at_boundaries(input3, &tokenizer, special_tokens, false)
             .unwrap();
 
         // Verify cache didn't exceed max memory

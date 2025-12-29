@@ -10,6 +10,7 @@ import httpx
 from fastapi import UploadFile
 
 from sglang.multimodal_gen.runtime.entrypoints.utils import post_process_sample
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 from sglang.multimodal_gen.runtime.scheduler_client import AsyncSchedulerClient
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
     init_logger,
@@ -25,11 +26,13 @@ class SetLoraReq:
     lora_nickname: str
     lora_path: Optional[str] = None
     target: str = "all"  # "all", "transformer", "transformer_2", "critic"
+    strength: float = 1.0  # LoRA strength for merge, default 1.0
 
 
 @dataclasses.dataclass
 class MergeLoraWeightsReq:
     target: str = "all"  # "all", "transformer", "transformer_2", "critic"
+    strength: float = 1.0  # LoRA strength for merge, default 1.0
 
 
 @dataclasses.dataclass
@@ -64,7 +67,7 @@ async def _save_upload_to_path(upload: UploadFile, target_path: str) -> str:
     return target_path
 
 
-async def _maybe_url_image(img_url: str, target_path: str) -> str:
+async def _maybe_url_image(img_url: str, target_path: str) -> str | None:
     if not isinstance(img_url, str):
         return None
 
@@ -86,25 +89,36 @@ async def _save_url_image_to_path(image_url: str, target_path: str) -> str:
     os.makedirs(os.path.dirname(target_path), exist_ok=True)
 
     try:
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(follow_redirects=True) as client:
             response = await client.get(image_url, timeout=10.0)
             response.raise_for_status()
 
             # Determine file extension from content type or URL after downloading
             if not os.path.splitext(target_path)[1]:
-                content_type = response.headers.get("content-type", "")
-                if not content_type.startswith("image/"):
+                content_type = response.headers.get("content-type", "").lower()
+
+                url_path = image_url.split("?")[0]
+                _, url_ext = os.path.splitext(url_path)
+                url_ext = url_ext.lower()
+
+                if url_ext in {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp"}:
+                    ext = ".jpg" if url_ext == ".jpeg" else url_ext
+                elif content_type.startswith("image/"):
+                    if "jpeg" in content_type or "jpg" in content_type:
+                        ext = ".jpg"
+                    elif "png" in content_type:
+                        ext = ".png"
+                    elif "webp" in content_type:
+                        ext = ".webp"
+                    else:
+                        ext = ".jpg"  # Default to jpg
+                elif content_type == "application/octet-stream":
+                    # for octet-stream, if we couldn't get it from URL, default to jpg
+                    ext = ".jpg"
+                else:
                     raise ValueError(
                         f"URL does not point to an image. Content-Type: {content_type}"
                     )
-                if "jpeg" in content_type or "jpg" in content_type:
-                    ext = ".jpg"
-                elif "png" in content_type:
-                    ext = ".png"
-                elif "webp" in content_type:
-                    ext = ".webp"
-                else:
-                    ext = ".jpg"  # Default to jpg
                 target_path = f"{target_path}{ext}"
 
             with open(target_path, "wb") as f:
@@ -159,7 +173,7 @@ async def _save_base64_image_to_path(base64_data: str, target_path: str) -> str:
 async def process_generation_batch(
     scheduler_client: AsyncSchedulerClient,
     batch,
-):
+) -> tuple[str, OutputBatch]:
     total_start_time = time.perf_counter()
     with log_generation_timer(logger, batch.prompt):
         result = await scheduler_client.forward([batch])
@@ -182,7 +196,10 @@ async def process_generation_batch(
     total_time = time.perf_counter() - total_start_time
     log_batch_completion(logger, 1, total_time)
 
-    return save_file_path
+    if result.peak_memory_mb and result.peak_memory_mb > 0:
+        logger.info(f"Peak memory usage: {result.peak_memory_mb:.2f} MB")
+
+    return save_file_path, result
 
 
 def merge_image_input_list(*inputs: Union[List, Any, None]) -> List:
@@ -211,3 +228,14 @@ def merge_image_input_list(*inputs: Union[List, Any, None]) -> List:
             else:
                 result.append(input_item)
     return result
+
+
+def add_common_data_to_response(
+    response: dict, request_id: str, result: OutputBatch
+) -> dict:
+    if result.peak_memory_mb and result.peak_memory_mb > 0:
+        response["peak_memory_mb"] = result.peak_memory_mb
+
+    response["id"] = request_id
+
+    return response
