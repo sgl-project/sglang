@@ -122,7 +122,8 @@ jobs:
             echo "sccache not available, using regular cargo"
           fi
           # Run only the summary benchmark for quick validation in PRs
-          cargo bench --bench request_processing -- benchmark_summary --exact
+          # Capture output to file for CI summary
+          cargo bench --bench request_processing -- benchmark_summary --exact 2>&1 | tee benchmark_output.txt
 
       - name: Upload benchmark results
         if: always()
@@ -131,6 +132,7 @@ jobs:
           name: request-processing-results-${{ github.sha }}
           path: |
             sgl-model-gateway/target/criterion/benchmark_summary/
+            sgl-model-gateway/benchmark_output.txt
           retention-days: 30
 
       - name: Show sccache stats
@@ -193,7 +195,8 @@ jobs:
           else
             echo "sccache not available, using regular cargo"
           fi
-          cargo bench --bench tokenizer_benchmark
+          # Capture output to file for CI summary
+          cargo bench --bench tokenizer_benchmark 2>&1 | tee benchmark_output.txt
 
       - name: Upload benchmark results
         if: always()
@@ -202,6 +205,7 @@ jobs:
           name: tokenizer-results-${{ github.sha }}
           path: |
             sgl-model-gateway/target/criterion/tokenizer*/
+            sgl-model-gateway/benchmark_output.txt
           retention-days: 30
 
   benchmark-tool-parser:
@@ -260,7 +264,8 @@ jobs:
           else
             echo "sccache not available, using regular cargo"
           fi
-          cargo bench --bench tool_parser_benchmark
+          # Capture output to file for CI summary
+          cargo bench --bench tool_parser_benchmark 2>&1 | tee benchmark_output.txt
 
       - name: Upload benchmark results
         if: always()
@@ -269,6 +274,7 @@ jobs:
           name: tool-parser-results-${{ github.sha }}
           path: |
             sgl-model-gateway/target/criterion/tool_parser*/
+            sgl-model-gateway/benchmark_output.txt
           retention-days: 30
 
       - name: Show sccache stats
@@ -289,29 +295,80 @@ jobs:
 
       - name: Generate summary
         run: |
-          echo "## Benchmark Results Summary" > summary.md
+          echo "## 🚀 Benchmark Results Summary" > summary.md
           echo "" >> summary.md
+
+          # Request Processing Benchmark
           echo "### Request Processing" >> summary.md
-          if [ -d "benchmark-results/request-processing-results-${{ github.sha }}" ]; then
-            echo "✅ Completed" >> summary.md
+          REQ_DIR="benchmark-results/request-processing-results-${{ github.sha }}"
+          if [ -d "$REQ_DIR" ]; then
+            echo "✅ **Completed**" >> summary.md
+            if [ -f "$REQ_DIR/benchmark_output.txt" ]; then
+              echo "" >> summary.md
+              echo "<details>" >> summary.md
+              echo "<summary>View Results</summary>" >> summary.md
+              echo "" >> summary.md
+              echo '```' >> summary.md
+              # Extract the summary section (starts with "SGLang Model Gateway" or performance data)
+              grep -A 100 "SGLang Model Gateway\|Quick Performance\|Performance Insights" "$REQ_DIR/benchmark_output.txt" | head -50 >> summary.md || cat "$REQ_DIR/benchmark_output.txt" | tail -60 >> summary.md
+              echo '```' >> summary.md
+              echo "</details>" >> summary.md
+            fi
           else
             echo "❌ Failed or skipped" >> summary.md
           fi
           echo "" >> summary.md
+
+          # Tokenizer Benchmark
           echo "### Tokenizer" >> summary.md
-          if [ -d "benchmark-results/tokenizer-results-${{ github.sha }}" ]; then
-            echo "✅ Completed" >> summary.md
+          TOK_DIR="benchmark-results/tokenizer-results-${{ github.sha }}"
+          if [ -d "$TOK_DIR" ]; then
+            echo "✅ **Completed**" >> summary.md
+            if [ -f "$TOK_DIR/benchmark_output.txt" ]; then
+              echo "" >> summary.md
+              echo "<details>" >> summary.md
+              echo "<summary>View Results</summary>" >> summary.md
+              echo "" >> summary.md
+              echo '```' >> summary.md
+              # Extract the summary table section
+              grep -A 200 "TOKENIZER BENCHMARK SUMMARY\|ENCODING THROUGHPUT" "$TOK_DIR/benchmark_output.txt" | head -100 >> summary.md || cat "$TOK_DIR/benchmark_output.txt" | tail -100 >> summary.md
+              echo '```' >> summary.md
+              echo "</details>" >> summary.md
+            fi
           else
             echo "❌ Failed or skipped" >> summary.md
           fi
           echo "" >> summary.md
+
+          # Tool Parser Benchmark
           echo "### Tool Parser" >> summary.md
-          if [ -d "benchmark-results/tool-parser-results-${{ github.sha }}" ]; then
-            echo "✅ Completed" >> summary.md
+          TOOL_DIR="benchmark-results/tool-parser-results-${{ github.sha }}"
+          if [ -d "$TOOL_DIR" ]; then
+            echo "✅ **Completed**" >> summary.md
+            if [ -f "$TOOL_DIR/benchmark_output.txt" ]; then
+              echo "" >> summary.md
+              echo "<details>" >> summary.md
+              echo "<summary>View Results</summary>" >> summary.md
+              echo "" >> summary.md
+              echo '```' >> summary.md
+              # Extract the summary table section
+              grep -A 200 "TOOL PARSER BENCHMARK SUMMARY\|REGISTRY OPERATIONS\|COMPLETE PARSING" "$TOOL_DIR/benchmark_output.txt" | head -100 >> summary.md || cat "$TOOL_DIR/benchmark_output.txt" | tail -100 >> summary.md
+              echo '```' >> summary.md
+              echo "</details>" >> summary.md
+            fi
           else
             echo "❌ Failed or skipped" >> summary.md
           fi
+
+          echo "" >> summary.md
+          echo "---" >> summary.md
+          echo "_Generated at $(date -u '+%Y-%m-%d %H:%M:%S UTC')_" >> summary.md
+
+          # Display summary in logs
           cat summary.md
+
+          # Write to GitHub Step Summary for visibility in the Actions UI
+          cat summary.md >> $GITHUB_STEP_SUMMARY
 
       - name: Upload summary
         uses: actions/upload-artifact@v4
