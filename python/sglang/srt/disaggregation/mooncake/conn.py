@@ -130,8 +130,16 @@ class KVArgsRegisterInfo:
             dst_tp_rank=int(msg[7].decode("ascii")),
             dst_attn_tp_size=int(msg[8].decode("ascii")),
             dst_kv_item_len=int(msg[9].decode("ascii")),
-            dst_state_item_lens=list(struct.unpack(f"{len(msg[10])//4}I", msg[10])) if len(msg) > 10 and len(msg[10]) > 0 else [],
-            dst_state_dim_per_tensor=list(struct.unpack(f"{len(msg[11])//4}I", msg[11])) if len(msg) > 11 and len(msg[11]) > 0 else [],
+            dst_state_item_lens=(
+                list(struct.unpack(f"{len(msg[10])//4}I", msg[10]))
+                if len(msg) > 10 and len(msg[10]) > 0
+                else []
+            ),
+            dst_state_dim_per_tensor=(
+                list(struct.unpack(f"{len(msg[11])//4}I", msg[11]))
+                if len(msg) > 11 and len(msg[11]) > 0
+                else []
+            ),
         )
 
 
@@ -653,8 +661,10 @@ class MooncakeKVManager(CommonKVManager):
 
         if state_type == "mamba":
             # Check if we need slice transfer for different TP sizes
-            if (target_rank_registration_info is not None and
-                self.attn_tp_size != target_rank_registration_info.dst_attn_tp_size):
+            if (
+                target_rank_registration_info is not None
+                and self.attn_tp_size != target_rank_registration_info.dst_attn_tp_size
+            ):
                 return self._send_mamba_state_slice(
                     req,
                     prefill_state_indices,
@@ -672,9 +682,11 @@ class MooncakeKVManager(CommonKVManager):
                 )
         elif state_type in ["swa", "nsa"]:
             # SWA and NSA hybrid models do not support different TP sizes yet
-            if (target_rank_registration_info is not None and
-                not self.is_mla_backend and
-                self.attn_tp_size != target_rank_registration_info.dst_attn_tp_size):
+            if (
+                target_rank_registration_info is not None
+                and not self.is_mla_backend
+                and self.attn_tp_size != target_rank_registration_info.dst_attn_tp_size
+            ):
                 raise RuntimeError(
                     f"PD Disaggregation does NOT support PD different TP sizes for non-MLA {state_type.upper()} hybrid models yet."
                 )
@@ -743,7 +755,7 @@ class MooncakeKVManager(CommonKVManager):
         transfer_blocks = []
         prefill_state_data_ptrs = self.kv_args.state_data_ptrs
         prefill_state_item_lens = self.kv_args.state_item_lens
-        src_state_dim_per_tensor = getattr(self.kv_args, 'state_dim_per_tensor', [])
+        src_state_dim_per_tensor = getattr(self.kv_args, "state_dim_per_tensor", [])
 
         # If no dimension info available, fall back to regular transfer
         if not src_state_dim_per_tensor or not dst_state_dim_per_tensor:
@@ -783,12 +795,16 @@ class MooncakeKVManager(CommonKVManager):
             bytes_to_send = num_dims_to_send * src_bytes_per_dim
 
             # Calculate addresses for this state tensor
-            src_addr = (prefill_state_data_ptrs[i] +
-                       src_item_len * int(prefill_mamba_index[0]) +
-                       src_dim_offset)
-            dst_addr = (dst_state_ptr +
-                       dst_item_len * int(req.dst_state_indices[0]) +
-                       dst_dim_offset)
+            src_addr = (
+                prefill_state_data_ptrs[i]
+                + src_item_len * int(prefill_mamba_index[0])
+                + src_dim_offset
+            )
+            dst_addr = (
+                dst_state_ptr
+                + dst_item_len * int(req.dst_state_indices[0])
+                + dst_dim_offset
+            )
 
             transfer_blocks.append((src_addr, dst_addr, bytes_to_send))
 
@@ -1305,9 +1321,12 @@ class MooncakeKVReceiver(CommonKVReceiver):
             )
             # Pack state_item_lens and state_dim_per_tensor for mamba state slice transfer
             packed_state_item_lens = b"".join(
-                struct.pack("I", item_len) for item_len in self.kv_mgr.kv_args.state_item_lens
+                struct.pack("I", item_len)
+                for item_len in self.kv_mgr.kv_args.state_item_lens
             )
-            state_dim_per_tensor = getattr(self.kv_mgr.kv_args, 'state_dim_per_tensor', [])
+            state_dim_per_tensor = getattr(
+                self.kv_mgr.kv_args, "state_dim_per_tensor", []
+            )
             packed_state_dim_per_tensor = b"".join(
                 struct.pack("I", dim) for dim in state_dim_per_tensor
             )
