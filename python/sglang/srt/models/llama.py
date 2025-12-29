@@ -92,6 +92,7 @@ class LlamaMLP(nn.Module):
             bias=False,
             quant_config=quant_config,
             prefix=add_prefix("down_proj", prefix),
+            reduce_results=reduce_results,
         )
         if hidden_act != "silu":
             raise ValueError(

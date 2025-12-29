@@ -19,7 +19,7 @@ struct Node {
   std::unordered_map<int32_t, int32_t> next;
 };
 
-Ngram::Result fillResult(int last_token, int draft_token_num, std::vector<Node>& tree, int root) {
+Ngram::Result fillResult(int last_token, int draft_token_num, const std::vector<Node>& tree, int root) {
   Ngram::Result info;
   std::vector<int32_t> prevs;
   info.token.reserve(draft_token_num);
@@ -255,42 +255,55 @@ void Ngram::asyncInsert(std::vector<std::vector<int32_t>>&& tokens) {
 }
 
 Ngram::Result Ngram::matchBFS(const std::vector<int32_t>& tokens, size_t batch_size) const {
-  std::vector<std::pair<TrieNode*, int32_t>> nodes = match(tokens, batch_size);
+  auto nodes = match(tokens, batch_size);
+
+  if (nodes.empty()) {
+    return fillResult(tokens.back(), 1, {{}}, 0);
+  }
 
   double bfs_breadth_scale = double(param_.max_bfs_breadth - param_.min_bfs_breadth) /
                              (param_.max_match_window_size - param_.min_match_window_size + 1);
 
-  auto draft_token_num = param_.get_draft_token_num(batch_size);
-  std::vector<Node> tree(draft_token_num + 1);
+  std::vector<Node> tree;
+  tree.reserve(64);
+  tree.push_back(Node{});
+
   int root = 0;
   int cursor = 1;
 
+  const int max_actual_draft = param_.get_draft_token_num(batch_size) + 1;
+
   for (auto [node, depth] : nodes) {
-    std::queue<std::tuple<int32_t, double, const TrieNode*>> queue;  // parent, bfs_breadth, node
-    queue.push({root, (param_.max_match_window_size - depth) * bfs_breadth_scale + param_.min_bfs_breadth, node});
-    while (queue.size() && cursor <= draft_token_num) {
-      auto front = queue.front();
+    std::queue<std::tuple<int32_t, double, const TrieNode*>> queue;
+    double init_breadth = (param_.max_match_window_size - depth) * bfs_breadth_scale + param_.min_bfs_breadth;
+    queue.push({root, init_breadth, node});
+
+    while (!queue.empty() && cursor < max_actual_draft) {
+      auto [parent, cur_breadth, trie_node] = queue.front();
       queue.pop();
 
-      auto parent = std::get<0>(front);
-      auto cur_breadth = std::get<1>(front);
-      auto iter = std::get<2>(front)->lru.begin();
+      int breadth = std::max(1, static_cast<int>(cur_breadth));
+      auto iter = trie_node->lru.begin();
 
-      auto breadth = std::max(1, int32_t(cur_breadth));
-      for (int i = 0; i < breadth && iter != std::get<2>(front)->lru.end() && cursor <= draft_token_num; ++i, ++iter) {
-        auto token = (*iter)->token;
-        auto pos = -1;
-        if (auto tit = tree[parent].next.find(token); tit != tree[parent].next.end()) {
-          pos = tit->second;
+      for (int i = 0; i < breadth && iter != trie_node->lru.end() && cursor < max_actual_draft; ++i, ++iter) {
+        int32_t token = (*iter)->token;
+
+        auto& next_map = tree[parent].next;
+        int pos;
+        if (auto it = next_map.find(token); it != next_map.end()) {
+          pos = it->second;
         } else {
-          pos = tree[parent].next.insert(std::make_pair(token, cursor++)).first->second;
+          pos = cursor++;
+          next_map[token] = pos;
+          tree.push_back(Node{});
         }
+
         queue.emplace(pos, cur_breadth - bfs_breadth_scale, *iter);
       }
     }
   }
 
-  return fillResult(tokens.back(), draft_token_num + 1, tree, root);
+  return fillResult(tokens.back(), cursor, tree, root);
 }
 
 Ngram::Result Ngram::matchProb(const std::vector<int32_t>& tokens, size_t batch_size) const {

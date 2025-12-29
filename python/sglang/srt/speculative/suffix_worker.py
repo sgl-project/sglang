@@ -82,11 +82,11 @@ class SuffixWorker(NGRAMWorker):
         req_drafts, mask = self.ngram_cache.batch_get(
             batch_req_ids, batch_prompts, batch_tokens
         )
-        total_draft_token_num = len(req_drafts)
+        # total_draft_token_num = len(req_drafts)
 
-        assert (
-            total_draft_token_num == bs * self.draft_token_num
-        ), f"{total_draft_token_num=}, {bs=}, {self.draft_token_num=}"
+        # assert (
+        #     total_draft_token_num == bs * self.draft_token_num
+        # ), f"{total_draft_token_num=}, {bs=}, {self.draft_token_num=}"
 
         return req_drafts, mask
 
