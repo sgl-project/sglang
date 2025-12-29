@@ -10,11 +10,11 @@ from sglang.srt.utils import kill_process_tree
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import (
-    DEFAULT_EAGLE_DRAFT_MODEL_FOR_TEST,
-    DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST,
-    DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST_EAGLE3,
-    DEFAULT_MODEL_NAME_FOR_TEST_EAGLE3,
+    DEFAULT_DRAFT_MODEL_EAGLE,
+    DEFAULT_DRAFT_MODEL_EAGLE3,
     DEFAULT_MODEL_NAME_FOR_TEST_MLA,
+    DEFAULT_TARGET_MODEL_EAGLE,
+    DEFAULT_TARGET_MODEL_EAGLE3,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -31,8 +31,8 @@ decode_tolerance: float = 5e-2
 
 class TestEAGLEEngine(CustomTestCase):
     BASE_CONFIG = {
-        "model_path": DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST,
-        "speculative_draft_model_path": DEFAULT_EAGLE_DRAFT_MODEL_FOR_TEST,
+        "model_path": DEFAULT_TARGET_MODEL_EAGLE,
+        "speculative_draft_model_path": DEFAULT_DRAFT_MODEL_EAGLE,
         "speculative_algorithm": "EAGLE",
         "speculative_num_steps": 5,
         "speculative_eagle_topk": 4,
@@ -133,7 +133,7 @@ class TestEAGLEEngine(CustomTestCase):
             "skip_special_tokens": False,
         }
 
-        tokenizer = get_tokenizer(DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST)
+        tokenizer = get_tokenizer(DEFAULT_TARGET_MODEL_EAGLE)
         output = engine.generate(prompt, params)["text"]
         print(f"{output=}")
 
@@ -187,8 +187,8 @@ class TestEAGLEEngineTokenMap(TestEAGLEEngine):
 
 class TestEAGLE3Engine(TestEAGLEEngine):
     BASE_CONFIG = {
-        "model_path": DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST_EAGLE3,
-        "speculative_draft_model_path": DEFAULT_MODEL_NAME_FOR_TEST_EAGLE3,
+        "model_path": DEFAULT_TARGET_MODEL_EAGLE3,
+        "speculative_draft_model_path": DEFAULT_DRAFT_MODEL_EAGLE3,
         "speculative_algorithm": "EAGLE3",
         "speculative_num_steps": 5,
         "speculative_eagle_topk": 16,
@@ -206,8 +206,8 @@ class TestEAGLE3Engine(TestEAGLEEngine):
 
 class TestEAGLERadixCache(CustomTestCase):
     BASE_CONFIG = {
-        "model_path": DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST_EAGLE3,
-        "speculative_draft_model_path": DEFAULT_MODEL_NAME_FOR_TEST_EAGLE3,
+        "model_path": DEFAULT_TARGET_MODEL_EAGLE3,
+        "speculative_draft_model_path": DEFAULT_DRAFT_MODEL_EAGLE3,
         "speculative_algorithm": "EAGLE3",
         "speculative_num_steps": 2,
         "speculative_eagle_topk": 2,
@@ -309,14 +309,14 @@ class TestEAGLEDraftExtend(CustomTestCase):
     def setUpClass(cls):
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
-            DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST,
+            DEFAULT_TARGET_MODEL_EAGLE,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=[
                 "--speculative-algorithm",
                 "EAGLE",
                 "--speculative-draft-model-path",
-                DEFAULT_EAGLE_DRAFT_MODEL_FOR_TEST,
+                DEFAULT_DRAFT_MODEL_EAGLE,
                 "--speculative-num-steps",
                 1,
                 "--speculative-eagle-topk",
@@ -375,14 +375,14 @@ class TestEAGLEDraftExtendFlashinfer(TestEAGLEDraftExtend):
     def setUpClass(cls):
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
-            DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST,
+            DEFAULT_TARGET_MODEL_EAGLE,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=[
                 "--speculative-algorithm",
                 "EAGLE",
                 "--speculative-draft-model-path",
-                DEFAULT_EAGLE_DRAFT_MODEL_FOR_TEST,
+                DEFAULT_DRAFT_MODEL_EAGLE,
                 "--speculative-num-steps",
                 1,
                 "--speculative-eagle-topk",
@@ -404,14 +404,14 @@ class TestEAGLEDraftExtendTriton(TestEAGLEDraftExtend):
     def setUpClass(cls):
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
-            DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST,
+            DEFAULT_TARGET_MODEL_EAGLE,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=[
                 "--speculative-algorithm",
                 "EAGLE",
                 "--speculative-draft-model-path",
-                DEFAULT_EAGLE_DRAFT_MODEL_FOR_TEST,
+                DEFAULT_DRAFT_MODEL_EAGLE,
                 "--speculative-num-steps",
                 1,
                 "--speculative-eagle-topk",
