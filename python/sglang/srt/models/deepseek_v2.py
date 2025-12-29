@@ -3642,24 +3642,6 @@ class DeepseekV2ForCausalLM(nn.Module):
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False):
 
-        # For QAT int4 RL: Restore Marlin-transformed weights before update weight .
-        model_obj = getattr(self, "model", self)
-        layers = getattr(model_obj, "layers", [])
-
-        for layer in layers:
-            target = (
-                layer.mlp.experts
-                if hasattr(layer, "mlp") and hasattr(layer.mlp, "experts")
-                else getattr(layer, "experts", None)
-            )
-
-            if (
-                target is not None
-                and hasattr(target, "quant_method")
-                and hasattr(target.quant_method, "restore_weights_before_loading")
-            ):
-                target.quant_method.restore_weights_before_loading(target)
-
         if is_nextn:
             if hasattr(self.config, "num_nextn_predict_layers"):
                 num_nextn_layers = self.config.num_nextn_predict_layers
