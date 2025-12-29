@@ -24,7 +24,7 @@ from sglang.test.test_utils import (
 os.environ["SGLANG_USE_MODELSCOPE"] = "true"
 
 if "ASCEND_RT_VISIBLE_DEVICES" not in os.environ:
-    os.environ["ASCEND_RT_VISIBLE_DEVICES"] = "0,1"
+    os.environ["ASCEND_RT_VISIBLE_DEVICES"] = "0,1,2,3"
 DEFAULT_PORT_FOR_SRT_TEST_RUNNER = (
     7000 + int(os.environ.get("ASCEND_RT_VISIBLE_DEVICES", "0")[0]) * 100
 )
@@ -34,7 +34,7 @@ DEFAULT_URL_FOR_TEST = f"http://127.0.0.1:{DEFAULT_PORT_FOR_SRT_TEST_RUNNER + 10
 class TestAscendW4A4(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = "/root/.cache/modelscope/hub/models/Eco-Tech/Qwen3-8B-w4a4-QuaRot"
+        cls.model = "/root/.cache/modelscope/hub/models/Eco-Tech/Qwen3-32B-w4a4-LAOS"
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,
@@ -47,7 +47,7 @@ class TestAscendW4A4(CustomTestCase):
                 "--attention-backend",
                 "ascend",
                 "--tp-size",
-                "2",
+                "4",
                 "--mem-fraction-static",
                 "0.8",
                 "--cuda-graph-bs",
@@ -66,7 +66,7 @@ class TestAscendW4A4(CustomTestCase):
         args = SimpleNamespace(
             num_shots=5,
             data_path=None,
-            num_questions=128,
+            num_questions=1319,
             max_new_tokens=512,
             parallel=64,
             host=f"http://{url.hostname}",
@@ -75,8 +75,8 @@ class TestAscendW4A4(CustomTestCase):
         metrics = run_eval(args)
         print(metrics)
 
-        self.assertGreaterEqual(metrics["accuracy"], 0.50)
-        self.assertGreaterEqual(metrics["output_throughput"], 700)
+        self.assertAlmostEqual(metrics["accuracy"], 0.84)
+        self.assertAlmostEqual(metrics["output_throughput"], 1100)
 
     def run_decode(self, max_new_tokens):
         response = requests.post(
@@ -103,7 +103,7 @@ class TestAscendW4A4(CustomTestCase):
         print(f"Throughput: {throughput} tokens/s")
 
         if is_in_ci():
-            self.assertGreaterEqual(throughput, 25)
+            self.assertAlmostEqual(throughput, 38)
 
 
 if __name__ == "__main__":
