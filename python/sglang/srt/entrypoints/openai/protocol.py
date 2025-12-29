@@ -259,6 +259,7 @@ class CompletionRequest(BaseModel):
 
     # For data parallel rank routing
     data_parallel_rank: Optional[int] = None
+    prefill_data_parallel_rank: Optional[int] = None
 
     # For request id
     rid: Optional[Union[List[str], str]] = None
@@ -536,6 +537,7 @@ class ChatCompletionRequest(BaseModel):
 
     # For data parallel rank routing
     data_parallel_rank: Optional[int] = None
+    prefill_data_parallel_rank: Optional[int] = None
 
     # OpenAI/SGLang default sampling parameters
     _DEFAULT_SAMPLING_PARAMS = {

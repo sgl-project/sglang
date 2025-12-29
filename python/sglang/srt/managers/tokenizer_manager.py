@@ -799,6 +799,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 reasoning=obj.reasoning,
                 return_hidden_states=obj.return_hidden_states,
                 data_parallel_rank=obj.data_parallel_rank,
+                prefill_data_parallel_rank=obj.prefill_data_parallel_rank,
                 priority=obj.priority,
                 extra_key=obj.extra_key,
             )
