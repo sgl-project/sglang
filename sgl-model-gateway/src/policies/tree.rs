@@ -20,11 +20,9 @@ pub type TenantId = Arc<str>;
 /// Result of a prefix match operation, including char counts to avoid recomputation.
 #[derive(Debug, Clone)]
 pub struct PrefixMatchResult {
-    /// The matched prefix text
-    pub matched_text: String,
-    /// The tenant that owns the matched prefix
-    pub tenant: String,
-    /// Number of characters matched (avoids chars().count())
+    /// The tenant that owns the matched prefix (zero-copy)
+    pub tenant: TenantId,
+    /// Number of characters matched
     pub matched_char_count: usize,
     /// Total number of characters in the input text
     pub input_char_count: usize,
@@ -451,11 +449,8 @@ impl Tree {
     }
 
     /// Performs prefix matching and returns detailed result with char counts.
-    /// This is the optimized version that avoids redundant chars().count() calls.
+    /// Optimized: no string allocations, deferred char counting.
     pub fn prefix_match_with_counts(&self, text: &str) -> PrefixMatchResult {
-        // Use slice-based traversal - no Vec<char> allocation
-        let input_char_count = text.chars().count();
-
         let mut remaining = text;
         let mut matched_chars = 0;
         let mut prev = Arc::clone(&self.root);
@@ -499,33 +494,29 @@ impl Tree {
             .next()
             .map(|kv| Arc::clone(kv.key()));
 
-        // Update timestamp on the matched node only (O(1)).
-        // Ancestor propagation is unnecessary - eviction only uses leaf timestamps.
-        if let Some(ref tenant_id) = tenant {
-            let epoch = get_epoch();
-            curr.tenant_last_access_time
-                .insert(Arc::clone(tenant_id), epoch);
-        }
+        // Get tenant directly as Arc<str> - no String allocation
+        let tenant: TenantId = tenant.unwrap_or_else(|| Arc::from("empty"));
 
-        // Build matched text from original input using char count
-        let matched_text = take_chars(text, matched_chars);
-        let tenant_str = tenant
-            .map(|t| t.to_string())
-            .unwrap_or_else(|| "empty".to_string());
+        // Update timestamp on the matched node only (O(1)).
+        let epoch = get_epoch();
+        curr.tenant_last_access_time.insert(Arc::clone(&tenant), epoch);
+
+        // Compute input char count from matched + remaining (deferred from start)
+        let input_char_count = matched_chars + remaining.chars().count();
 
         PrefixMatchResult {
-            matched_text,
-            tenant: tenant_str,
+            tenant,
             matched_char_count: matched_chars,
             input_char_count,
         }
     }
 
     /// Legacy prefix_match API for backward compatibility.
-    /// Prefer prefix_match_with_counts() for better performance.
+    /// Note: This computes matched_text which has allocation overhead.
     pub fn prefix_match(&self, text: &str) -> (String, String) {
         let result = self.prefix_match_with_counts(text);
-        (result.matched_text, result.tenant)
+        let matched_text = take_chars(text, result.matched_char_count);
+        (matched_text, result.tenant.to_string())
     }
 
     #[allow(dead_code)]
