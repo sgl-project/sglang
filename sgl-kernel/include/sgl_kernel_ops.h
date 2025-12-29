@@ -135,28 +135,6 @@ void silu_and_mul(at::Tensor& out, at::Tensor& input);
 void gelu_tanh_and_mul(at::Tensor& out, at::Tensor& input);
 void gelu_and_mul(at::Tensor& out, at::Tensor& input);
 
-// Device LayerNorm and fused LayerNorm/RMSNorm+ScaleShift (CUTLASS-based)
-torch::Tensor fused_norm_scale_shift(
-    torch::Tensor x,
-    c10::optional<torch::Tensor> gamma_opt,
-    c10::optional<torch::Tensor> beta_opt,
-    torch::Tensor scale,
-    torch::Tensor shift,
-    int norm_type,
-    double eps);
-
-// LayerNorm/RMSNorm fused with residual + gate (gate shapes: [M,N], [B,1,N], or [B,F,1,N]) and then scale/shift ([M,N]
-// or [B,F,1,N])
-std::tuple<torch::Tensor, torch::Tensor> fused_scale_residual_norm_scale_shift(
-    const torch::Tensor& residual,
-    const torch::Tensor& x,
-    const c10::optional<torch::Tensor>& gate_opt,
-    const c10::optional<torch::Tensor>& gamma_opt,
-    const c10::optional<torch::Tensor>& beta_opt,
-    const torch::Tensor& scale,
-    const torch::Tensor& shift,
-    int norm_type,
-    double eps);
 void apply_rope_pos_ids_cos_sin_cache(
     at::Tensor q,
     at::Tensor k,

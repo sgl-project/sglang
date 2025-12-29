@@ -2,7 +2,11 @@ from typing import Optional
 
 import pytest
 import torch
-from sgl_kernel import fused_norm_scale_shift, fused_scale_residual_norm_scale_shift
+
+from sglang.jit_kernel.diffusion.fused_norm_scale_shift import fused_norm_scale_shift
+from sglang.jit_kernel.diffusion.fused_scale_residual_norm_scale_shift import (
+    fused_scale_residual_norm_scale_shift,
+)
 
 
 # Reference fused output: compute LN in fp32, then apply scale/shift in fp32, cast back

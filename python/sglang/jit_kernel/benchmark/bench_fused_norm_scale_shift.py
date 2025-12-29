@@ -8,8 +8,12 @@ import os
 from dataclasses import dataclass
 from typing import List, Tuple
 
-import sgl_kernel
 import torch
+
+from sglang.jit_kernel.diffusion.fused_norm_scale_shift import fused_norm_scale_shift
+from sglang.jit_kernel.diffusion.fused_scale_residual_norm_scale_shift import (
+    fused_scale_residual_norm_scale_shift,
+)
 
 # CI environment detection
 IS_CI = (
@@ -59,9 +63,7 @@ def fused_norm_scale_shift_sglang(
     norm_type: str,
     eps: float = 1e-5,
 ):
-    return sgl_kernel.fused_norm_scale_shift(
-        x, weight, bias, scale, shift, norm_type, eps
-    )
+    return fused_norm_scale_shift(x, weight, bias, scale, shift, norm_type, eps)
 
 
 # ========== fused_norm_scale_shift_no_affine ==========
@@ -97,9 +99,7 @@ def fused_norm_scale_shift_no_affine_sglang(
     norm_type: str,
     eps: float = 1e-5,
 ):
-    return sgl_kernel.fused_norm_scale_shift(
-        x, None, None, scale, shift, norm_type, eps
-    )
+    return fused_norm_scale_shift(x, None, None, scale, shift, norm_type, eps)
 
 
 # ========== fused_scale_residual_norm_scale_shift ==========
@@ -151,7 +151,7 @@ def fused_scale_residual_norm_scale_shift_sglang(
     norm_type: str,
     eps: float = 1e-5,
 ):
-    return sgl_kernel.fused_scale_residual_norm_scale_shift(
+    return fused_scale_residual_norm_scale_shift(
         residual, x, gate, weight, bias, scale, shift, norm_type, eps
     )
 

@@ -1,18 +1,18 @@
 /* Copyright 2025 SGLang Team. */
+#include <sgl_kernel/tensor.h>   // For TensorMatcher, SymbolicSize, SymbolicDevice
+#include <sgl_kernel/utils.cuh>  // For LaunchKernel
+#include <sgl_kernel/utils.h>    // For div_ceil, RuntimeCheck
 
-#include <ATen/cuda/CUDAContext.h>
-#include <c10/cuda/CUDAStream.h>
 #include <cuda_fp16.h>
+#include <dlpack/dlpack.h>
+#include <tvm/ffi/container/tensor.h>
+#include <tvm/ffi/optional.h>
 
-#include <cassert>
-#include <type_traits>
-
-#include "cutlass/cutlass.h"
-#include "cutlass/layout/tensor.h"
 #include "cutlass/numeric_types.h"
-#include "cutlass/tensor_coord.h"
-#include "cutlass/tensor_ref.h"
-#include "utils.h"
+
+namespace {
+
+namespace ffi = tvm::ffi;
 
 enum NormType : int {
   LayerNorm = 0,
@@ -92,9 +92,19 @@ struct alignas(8) half4 {
   __half x, y, z, w;
 };
 
+// both scale and shift are scalar
 template <typename T4, typename T, int ITEM_PER_THREAD, NormType norm_type>
 __global__ void norm_twoPassAlgo_stored_locally_e4(
-    T4* output, const T4* input, const T4* gamma, const T4* beta, const int m, const int n, bool affine, float eps) {
+    T4* output,
+    const T4* input,
+    const T4* gamma,
+    const T4* beta,
+    const T* scale,
+    const T* shift,
+    const int m,
+    const int n,
+    bool affine,
+    float eps) {
   const int m_idx = blockIdx.x;
   const int tid = threadIdx.x;
   const int bdimx = blockDim.x;
@@ -165,27 +175,53 @@ __global__ void norm_twoPassAlgo_stored_locally_e4(
       if constexpr (norm_type == NormType::LayerNorm) {
         const T4 gamma_val = affine ? gamma[index] : T4{T(1.0f), T(1.0f), T(1.0f), T(1.0f)};
         const T4 beta_val = affine ? beta[index] : T4{T(0.0f), T(0.0f), T(0.0f), T(0.0f)};
+        const T scale_v = scale[0], shift_v = shift[0];
+        const T4 scale_val = {scale_v, scale_v, scale_v, scale_v};
+        const T4 shift_val = {shift_v, shift_v, shift_v, shift_v};
         T4 tmp;
         tmp.x =
-            T((static_cast<float>(local_val[i].x) - s_mean) * s_variance * static_cast<float>(gamma_val.x) +
-              static_cast<float>(beta_val.x));
+            T(((static_cast<float>(local_val[i].x) - s_mean) * s_variance * static_cast<float>(gamma_val.x) +
+               static_cast<float>(beta_val.x)) *
+                  (1.0f + static_cast<float>(scale_val.x)) +
+              static_cast<float>(shift_val.x));
         tmp.y =
-            T((static_cast<float>(local_val[i].y) - s_mean) * s_variance * static_cast<float>(gamma_val.y) +
-              static_cast<float>(beta_val.y));
+            T(((static_cast<float>(local_val[i].y) - s_mean) * s_variance * static_cast<float>(gamma_val.y) +
+               static_cast<float>(beta_val.y)) *
+                  (1.0f + static_cast<float>(scale_val.y)) +
+              static_cast<float>(shift_val.y));
         tmp.z =
-            T((static_cast<float>(local_val[i].z) - s_mean) * s_variance * static_cast<float>(gamma_val.z) +
-              static_cast<float>(beta_val.z));
+            T(((static_cast<float>(local_val[i].z) - s_mean) * s_variance * static_cast<float>(gamma_val.z) +
+               static_cast<float>(beta_val.z)) *
+                  (1.0f + static_cast<float>(scale_val.z)) +
+              static_cast<float>(shift_val.z));
         tmp.w =
-            T((static_cast<float>(local_val[i].w) - s_mean) * s_variance * static_cast<float>(gamma_val.w) +
-              static_cast<float>(beta_val.w));
+            T(((static_cast<float>(local_val[i].w) - s_mean) * s_variance * static_cast<float>(gamma_val.w) +
+               static_cast<float>(beta_val.w)) *
+                  (1.0f + static_cast<float>(scale_val.w)) +
+              static_cast<float>(shift_val.w));
         output[index] = tmp;
       } else {
         const T4 gamma_val = affine ? gamma[index] : T4{T(1.0f), T(1.0f), T(1.0f), T(1.0f)};
+        const T scale_v = scale[0], shift_v = shift[0];
+        const T4 scale_val = {scale_v, scale_v, scale_v, scale_v};
+        const T4 shift_val = {shift_v, shift_v, shift_v, shift_v};
         T4 tmp;
-        tmp.x = T(static_cast<float>(local_val[i].x) * s_variance * static_cast<float>(gamma_val.x));
-        tmp.y = T(static_cast<float>(local_val[i].y) * s_variance * static_cast<float>(gamma_val.y));
-        tmp.z = T(static_cast<float>(local_val[i].z) * s_variance * static_cast<float>(gamma_val.z));
-        tmp.w = T(static_cast<float>(local_val[i].w) * s_variance * static_cast<float>(gamma_val.w));
+        tmp.x =
+            T((static_cast<float>(local_val[i].x) * s_variance * static_cast<float>(gamma_val.x)) *
+                  (1.0f + static_cast<float>(scale_val.x)) +
+              static_cast<float>(shift_val.x));
+        tmp.y =
+            T((static_cast<float>(local_val[i].y) * s_variance * static_cast<float>(gamma_val.y)) *
+                  (1.0f + static_cast<float>(scale_val.y)) +
+              static_cast<float>(shift_val.y));
+        tmp.z =
+            T((static_cast<float>(local_val[i].z) * s_variance * static_cast<float>(gamma_val.z)) *
+                  (1.0f + static_cast<float>(scale_val.z)) +
+              static_cast<float>(shift_val.z));
+        tmp.w =
+            T((static_cast<float>(local_val[i].w) * s_variance * static_cast<float>(gamma_val.w)) *
+                  (1.0f + static_cast<float>(scale_val.w)) +
+              static_cast<float>(shift_val.w));
         output[index] = tmp;
       }
     }
@@ -474,16 +510,18 @@ __global__ void norm_twoPassAlgo_stored_locally_e4_fused_scale_shift_4d(
 }
 
 static void norm_fused_scale_shift_launch(
-    const torch::Tensor& x,
-    const c10::optional<torch::Tensor>& gamma_opt,
-    const c10::optional<torch::Tensor>& beta_opt,
-    const torch::Tensor& scale,
-    const torch::Tensor& shift,
-    torch::Tensor& y,
+    ffi::TensorView& out,
+    const ffi::TensorView& x,
+    const ffi::Optional<ffi::TensorView>& gamma_opt,
+    const ffi::Optional<ffi::TensorView>& beta_opt,
+    const ffi::TensorView& scale,
+    const ffi::TensorView& shift,
     NormType norm_type,
     float eps) {
-  bool has_gamma = gamma_opt.has_value() && gamma_opt->defined();
-  bool has_beta = beta_opt.has_value() && beta_opt->defined();
+  using namespace host;
+
+  bool has_gamma = gamma_opt.has_value();
+  bool has_beta = beta_opt.has_value();
   // layermorm requires gamma and beta to be either both defined or both undefined.
   bool affine = has_gamma;
   auto gamma_ptr = has_gamma ? gamma_opt.value().data_ptr() : nullptr;
@@ -492,12 +530,12 @@ static void norm_fused_scale_shift_launch(
   const int64_t M = x.size(0);
   const int64_t N = x.size(1);
   dim3 grid((unsigned)M);
-  TORCH_CHECK((N % 4) == 0, "N must be divisible by 4");
+  RuntimeCheck((N % 4) == 0, "N must be divisible by 4");
   dim3 block(0);
 
-  auto is_broadcast_2d = [&](const torch::Tensor& t) {
-    if (t.dim() == 2) return (t.size(0) == M || t.size(0) == 1) && t.size(1) == N;
-    if (t.dim() == 3) return t.size(0) == 1 && t.size(1) == 1 && t.size(2) == N;
+  auto is_broadcast_2d = [&](const ffi::TensorView& t) {
+    if (t.ndim() == 2) return (t.size(0) == M || t.size(0) == 1) && t.size(1) == N;
+    if (t.ndim() == 3) return t.size(0) == 1 && t.size(1) == 1 && t.size(2) == N;
     return false;
   };
 
@@ -505,19 +543,13 @@ static void norm_fused_scale_shift_launch(
   bool is_scale_c_1 = false;
   bool is_shift_c_1 = false;
   if (use_2d) {
-    is_scale_c_1 = (scale.dim() == 3) || (scale.size(0) == 1);
-    is_shift_c_1 = (shift.dim() == 3) || (shift.size(0) == 1);
+    is_scale_c_1 = (scale.ndim() == 3) || (scale.size(0) == 1);
+    is_shift_c_1 = (shift.ndim() == 3) || (shift.size(0) == 1);
   }
 
-  const bool use_4d = (scale.dim() == 4 && shift.dim() == 4);
-  const bool scalar_both = (scale.dim() == 1 && scale.numel() == 1 && shift.dim() == 1 && shift.numel() == 1);
-  bool skip = false;
-  if (scalar_both) {
-    const float s0 = scale.item<float>();
-    const float sh0 = shift.item<float>();
-    skip = (s0 == 0.0f && sh0 == 0.0f);
-  }
-  TORCH_CHECK(use_2d || use_4d || skip, "scale/shift must be 2D [M, N], 4D [B, F, 1, N], or scalar zeros to skip");
+  const bool use_4d = (scale.ndim() == 4 && shift.ndim() == 4);
+  const bool scalar_both = (scale.ndim() == 1 && scale.numel() == 1 && shift.ndim() == 1 && shift.numel() == 1);
+  RuntimeCheck(use_2d || use_4d || scalar_both, "scale/shift must be 2D [M, N], 4D [B, F, 1, N], or 1D [1]");
 
   auto dispatch = [&](auto launch_kernel) {
     auto dispatch_dtype = [&](auto dtype) {
@@ -543,34 +575,37 @@ static void norm_fused_scale_shift_launch(
       }
     };
 
-    if (x.dtype() == torch::kFloat32) {
+    const auto& dtype = x.dtype();
+    if (dtype.code == kDLFloat && dtype.bits == 32) {
       dispatch_dtype(DTypeTag<float4, float>{});
-    } else if (x.dtype() == torch::kFloat16) {
+    } else if (dtype.code == kDLFloat && dtype.bits == 16) {
       dispatch_dtype(DTypeTag<half4, half>{});
-    } else if (x.dtype() == torch::kBFloat16) {
+    } else if (dtype.code == kDLBfloat && dtype.bits == 16) {
       dispatch_dtype(DTypeTag<bf16_4, cutlass::bfloat16_t>{});
     } else {
-      TORCH_CHECK(false, "Unsupported dtype. Use float32, float16, or bfloat16.");
+      RuntimeCheck(false, "Unsupported dtype. Use float32, float16, or bfloat16.");
     }
   };
 
-  // If skipping scale/shift, launch the non-fused LN kernel (no temporary tensors).
-  if (skip) {
+  // If both scale and shift are scalar, launch the below kernel.
+  if (scalar_both) {
     auto launch_kernel = [&](auto dtype_tag, auto ipt_tag, auto norm_tag) {
       using T4 = typename decltype(dtype_tag)::T4;
       using T = typename decltype(dtype_tag)::T;
       using IPT = decltype(ipt_tag);
       using NT = decltype(norm_tag);
-      norm_twoPassAlgo_stored_locally_e4<T4, T, IPT::value, NT::value>
-          <<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
-              (T4*)y.data_ptr(),
-              (const T4*)x.data_ptr(),
-              (const T4*)gamma_ptr,
-              (const T4*)beta_ptr,
-              (int)M,
-              (int)N,
-              affine,
-              eps);
+      LaunchKernel(grid, block, x.device())(
+          norm_twoPassAlgo_stored_locally_e4<T4, T, IPT::value, NT::value>,
+          (T4*)out.data_ptr(),
+          (const T4*)x.data_ptr(),
+          (const T4*)gamma_ptr,
+          (const T4*)beta_ptr,
+          (const T*)scale.data_ptr(),
+          (const T*)shift.data_ptr(),
+          (int)M,
+          (int)N,
+          affine,
+          eps);
     };
 
     dispatch(launch_kernel);
@@ -583,20 +618,20 @@ static void norm_fused_scale_shift_launch(
       using T = typename decltype(dtype_tag)::T;
       using IPT = decltype(ipt_tag);
       using NT = decltype(norm_tag);
-      norm_twoPassAlgo_stored_locally_e4_fused_scale_shift<T4, T, IPT::value, NT::value>
-          <<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
-              (T4*)y.data_ptr(),
-              (const T4*)x.data_ptr(),
-              (const T4*)gamma_ptr,
-              (const T4*)beta_ptr,
-              (const T4*)scale.data_ptr(),
-              (const T4*)shift.data_ptr(),
-              (int)M,
-              (int)N,
-              affine,
-              is_scale_c_1,
-              is_shift_c_1,
-              eps);
+      LaunchKernel(grid, block, x.device())(
+          norm_twoPassAlgo_stored_locally_e4_fused_scale_shift<T4, T, IPT::value, NT::value>,
+          (T4*)out.data_ptr(),
+          (const T4*)x.data_ptr(),
+          (const T4*)gamma_ptr,
+          (const T4*)beta_ptr,
+          (const T4*)scale.data_ptr(),
+          (const T4*)shift.data_ptr(),
+          (int)M,
+          (int)N,
+          affine,
+          is_scale_c_1,
+          is_shift_c_1,
+          eps);
     };
 
     dispatch(launch_kernel);
@@ -604,11 +639,10 @@ static void norm_fused_scale_shift_launch(
   }
 
   // 4D launcher path
-  TORCH_CHECK(scale.size(2) == 1 && shift.size(2) == 1, "scale/shift 4D must have size 1 at dim=2");
-  TORCH_CHECK(scale.size(3) == N && shift.size(3) == N, "scale/shift last dim must be N");
+  RuntimeCheck(scale.size(2) == 1 && shift.size(2) == 1, "scale/shift 4D must have size 1 at dim=2");
+  RuntimeCheck(scale.size(3) == N && shift.size(3) == N, "scale/shift last dim must be N");
   const int64_t B = scale.size(0);
   const int64_t F = scale.size(1);
-  TORCH_CHECK((M % (B * F)) == 0, "M must be divisible by B*F for 4D scale/shift");
   const int frame_seqlen = (int)(M / (B * F));
 
   auto launch_kernel = [&](auto dtype_tag, auto ipt_tag, auto norm_tag) {
@@ -616,82 +650,110 @@ static void norm_fused_scale_shift_launch(
     using T = typename decltype(dtype_tag)::T;
     using IPT = decltype(ipt_tag);
     using NT = decltype(norm_tag);
-    norm_twoPassAlgo_stored_locally_e4_fused_scale_shift_4d<T4, T, IPT::value, NT::value>
-        <<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
-            (T4*)y.data_ptr(),
-            (const T4*)x.data_ptr(),
-            (const T4*)gamma_ptr,
-            (const T4*)beta_ptr,
-            (const T4*)scale.data_ptr(),
-            (const T4*)shift.data_ptr(),
-            (int)M,
-            (int)N,
-            (int)B,
-            (int)F,
-            (int)frame_seqlen,
-            affine,
-            eps);
+    LaunchKernel(grid, block, x.device())(
+        norm_twoPassAlgo_stored_locally_e4_fused_scale_shift_4d<T4, T, IPT::value, NT::value>,
+        (T4*)out.data_ptr(),
+        (const T4*)x.data_ptr(),
+        (const T4*)gamma_ptr,
+        (const T4*)beta_ptr,
+        (const T4*)scale.data_ptr(),
+        (const T4*)shift.data_ptr(),
+        (int)M,
+        (int)N,
+        (int)B,
+        (int)F,
+        (int)frame_seqlen,
+        affine,
+        eps);
   };
 
   dispatch(launch_kernel);
 }
 
-torch::Tensor fused_norm_scale_shift(
-    const torch::Tensor& x,
-    const c10::optional<torch::Tensor>& gamma_opt,
-    const c10::optional<torch::Tensor>& beta_opt,
-    const torch::Tensor& scale,
-    const torch::Tensor& shift,
-    int64_t norm_type,
+template <int norm_type>
+void fused_norm_scale_shift(
+    ffi::TensorView& out,
+    const ffi::TensorView& x,
+    const ffi::Optional<ffi::TensorView>& gamma_opt,
+    const ffi::Optional<ffi::TensorView>& beta_opt,
+    const ffi::TensorView& scale,
+    const ffi::TensorView& shift,
     double eps) {
-  bool has_gamma = gamma_opt.has_value() && gamma_opt->defined();
-  bool has_beta = beta_opt.has_value() && beta_opt->defined();
+  using namespace host;
 
-  CHECK_CUDA(x);
-  CHECK_CUDA(scale);
-  CHECK_CUDA(shift);
-  TORCH_CHECK(x.dim() == 2, "x must be 2D [M, N]");
-  TORCH_CHECK(x.stride(-1) == 1, "last dim of x must be contiguous (stride 1)");
-  TORCH_CHECK(x.dtype() == scale.dtype() && x.dtype() == shift.dtype(), "x, scale, shift must have same dtype");
-  const int64_t M = x.size(0);
-  const int64_t N = x.size(1);
-  if ((scale.dim() == 2 || scale.dim() == 3) && (shift.dim() == 2 || shift.dim() == 3)) {
-    TORCH_CHECK(scale.size(-1) == N && shift.size(-1) == N, "scale/shift last dim must be N");
-    TORCH_CHECK(
+  SymbolicSize M_ = {"M"};
+  SymbolicSize N_ = {"N"};
+  SymbolicDevice device_;
+  TensorMatcher({M_, N_})  // 2D tensor, must be contiguous
+      .with_dtype<float, half, nv_bfloat16>()
+      .with_strides({N_, 1})
+      .with_device<kDLCUDA>(device_)
+      .verify(x)
+      .verify(out);
+
+  RuntimeCheck(x.dtype() == scale.dtype() && x.dtype() == shift.dtype(), "x, scale, shift must have same dtype");
+  const auto M = M_.unwrap();
+  const auto N = N_.unwrap();
+  RuntimeCheck((N % 4) == 0, "N must be divisible by 4");
+
+  if ((scale.ndim() == 2 || scale.ndim() == 3) && (shift.ndim() == 2 || shift.ndim() == 3)) {
+    RuntimeCheck(scale.size(-1) == N && shift.size(-1) == N, "scale/shift last dim must be N");
+    RuntimeCheck(
         scale.stride(-1) == 1 && shift.stride(-1) == 1, "last dim of scale/shift must be contiguous (stride 1)");
-  } else if (scale.dim() == 4 && shift.dim() == 4) {
-    TORCH_CHECK(scale.size(3) == N && shift.size(3) == N, "scale/shift last dim must be N");
-    TORCH_CHECK(scale.size(2) == 1 && shift.size(2) == 1, "scale/shift 4D must have size 1 at dim=2");
-    TORCH_CHECK(scale.stride(3) == 1 && shift.stride(3) == 1, "last dim of scale/shift must be contiguous (stride 1)");
+  } else if (scale.ndim() == 4 && shift.ndim() == 4) {
+    RuntimeCheck(scale.size(3) == N && shift.size(3) == N, "scale/shift last dim must be N");
+    RuntimeCheck(scale.size(2) == 1 && shift.size(2) == 1, "scale/shift 4D must have size 1 at dim=2");
+    RuntimeCheck(scale.stride(3) == 1 && shift.stride(3) == 1, "last dim of scale/shift must be contiguous (stride 1)");
     const int64_t B = scale.size(0);
     const int64_t F = scale.size(1);
-    TORCH_CHECK((M % (B * F)) == 0, "M must be divisible by B*F for 4D scale/shift");
-  } else if (scale.dim() == 1 && scale.numel() == 1 && shift.dim() == 1 && shift.numel() == 1) {
-    const float s0 = scale.item<float>();
-    const float sh0 = shift.item<float>();
-    TORCH_CHECK(s0 == 0.0f && sh0 == 0.0f, "When scale/shift are scalar, both must be 0 to skip");
+    RuntimeCheck((M % (B * F)) == 0, "M must be divisible by B*F for 4D scale/shift");
+  } else if (scale.ndim() == 1 && scale.numel() == 1 && shift.ndim() == 1 && shift.numel() == 1) {
+    // Do nothing
   } else {
-    TORCH_CHECK(false, "scale/shift must be 2D [M, N] or 4D [B, F, 1, N]");
+    RuntimeCheck(false, "scale/shift must be 2D [M, N] or 4D [B, F, 1, N]");
   }
-  if (has_gamma) {
+  if (gamma_opt.has_value()) {
     const auto& gamma = gamma_opt.value();
-    CHECK_CUDA(gamma);
-    TORCH_CHECK(gamma.dim() == 1, "gamma must be 1D [N]");
-    TORCH_CHECK(gamma.numel() == N, "gamma must be length N");
-    if (has_beta) {
+    TensorMatcher({N_})  // 1D tensor, must be contiguous
+        .with_dtype<float, half, nv_bfloat16>()
+        .with_device<kDLCUDA>(device_)
+        .verify(gamma);
+    RuntimeCheck(x.dtype() == gamma.dtype(), "x, gamma must have same dtype");
+    if (beta_opt.has_value()) {
       const auto& beta = beta_opt.value();
-      CHECK_CUDA(beta);
-      TORCH_CHECK(beta.dim() == 1, "beta must be 1D [N]");
-      TORCH_CHECK(beta.numel() == N, "beta must be length N");
-      TORCH_CHECK(x.dtype() == gamma.dtype() && x.dtype() == beta.dtype(), "x, gamma, beta must have same dtype");
+      TensorMatcher({N_})  // 1D tensor, must be contiguous
+          .with_dtype<float, half, nv_bfloat16>()
+          .with_device<kDLCUDA>(device_)
+          .verify(beta);
+      RuntimeCheck(x.dtype() == beta.dtype(), "x, beta must have same dtype");
     }
   }
-  TORCH_CHECK(norm_type == 0 || norm_type == 1, "norm_type must be 0 (layer) or 1 (rms).");
+  RuntimeCheck(norm_type == 0 || norm_type == 1, "norm_type must be 0 (layer) or 1 (rms).");
 
-  auto y = torch::empty_like(x);
   norm_fused_scale_shift_launch(
-      x, gamma_opt, beta_opt, scale, shift, y, NormType((int)norm_type), static_cast<float>(eps));
-  return y;
+      out, x, gamma_opt, beta_opt, scale, shift, NormType((int)norm_type), static_cast<float>(eps));
+}
+
+void fused_layernorm_scale_shift(
+    ffi::TensorView out,
+    const ffi::TensorView& x,
+    const ffi::Optional<ffi::TensorView>& gamma_opt,
+    const ffi::Optional<ffi::TensorView>& beta_opt,
+    const ffi::TensorView& scale,
+    const ffi::TensorView& shift,
+    double eps) {
+  fused_norm_scale_shift<0>(out, x, gamma_opt, beta_opt, scale, shift, eps);
+}
+
+void fused_rmsnorm_scale_shift(
+    ffi::TensorView out,
+    const ffi::TensorView x,
+    const ffi::Optional<ffi::TensorView> gamma_opt,
+    const ffi::Optional<ffi::TensorView> beta_opt,
+    const ffi::TensorView scale,
+    const ffi::TensorView shift,
+    double eps) {
+  fused_norm_scale_shift<1>(out, x, gamma_opt, beta_opt, scale, shift, eps);
 }
 
 // =========================
@@ -703,7 +765,7 @@ torch::Tensor fused_norm_scale_shift(
 // 1: 2D gate [M, N]
 // 2: Bx1xN gate [B, 1, N]
 // 3: BxFx1xN gate [B, F, 1, N]
-template <typename T4, typename T, int ITEM_PER_THREAD, NormType norm_type>
+template <typename T4, typename T, int ITEM_PER_THREAD, NormType norm_type, bool scalar_both>
 __global__ void norm_e4_fused_res_gate_scale_shift_2d(
     T4* __restrict__ output,
     T4* __restrict__ residual_out,
@@ -818,8 +880,16 @@ __global__ void norm_e4_fused_res_gate_scale_shift_2d(
       if constexpr (norm_type == NormType::LayerNorm) {
         const T4 gamma_val = affine ? gamma[index] : T4{T(1.0f), T(1.0f), T(1.0f), T(1.0f)};
         const T4 beta_val = affine ? beta[index] : T4{T(0.0f), T(0.0f), T(0.0f), T(0.0f)};
-        const T4 scale_val = scale[is_scale_c_1 ? index : (offset + index)];
-        const T4 shift_val = shift[is_shift_c_1 ? index : (offset + index)];
+        T4 scale_val, shift_val;
+        if constexpr (scalar_both) {
+          T scale_v = ((const T*)scale)[0];
+          T shift_v = ((const T*)shift)[0];
+          scale_val = {scale_v, scale_v, scale_v, scale_v};
+          shift_val = {shift_v, shift_v, shift_v, shift_v};
+        } else {
+          scale_val = scale[is_scale_c_1 ? index : (offset + index)];
+          shift_val = shift[is_shift_c_1 ? index : (offset + index)];
+        }
         T4 tmp;
         tmp.x =
             T(((static_cast<float>(local_val[i].x) - s_mean) * s_variance * static_cast<float>(gamma_val.x) +
@@ -844,8 +914,16 @@ __global__ void norm_e4_fused_res_gate_scale_shift_2d(
         output[offset + index] = tmp;
       } else {
         const T4 gamma_val = affine ? gamma[index] : T4{T(1.0f), T(1.0f), T(1.0f), T(1.0f)};
-        const T4 scale_val = scale[is_scale_c_1 ? index : (offset + index)];
-        const T4 shift_val = shift[is_shift_c_1 ? index : (offset + index)];
+        T4 scale_val, shift_val;
+        if constexpr (scalar_both) {
+          T scale_v = ((const T*)scale)[0];
+          T shift_v = ((const T*)shift)[0];
+          scale_val = {scale_v, scale_v, scale_v, scale_v};
+          shift_val = {shift_v, shift_v, shift_v, shift_v};
+        } else {
+          scale_val = scale[is_scale_c_1 ? index : (offset + index)];
+          shift_val = shift[is_shift_c_1 ? index : (offset + index)];
+        }
         T4 tmp;
         tmp.x =
             T((static_cast<float>(local_val[i].x) * s_variance * static_cast<float>(gamma_val.x)) *
@@ -1038,27 +1116,26 @@ __global__ void norm_e4_fused_res_gate_scale_shift_4d(
 }
 
 static void norm_fused_res_gate_scale_shift_launch_with_residual(
-    const torch::Tensor& x,
-    const torch::Tensor& residual,
-    const c10::optional<torch::Tensor>& gate_opt,
-    const c10::optional<torch::Tensor>& gamma_opt,
-    const c10::optional<torch::Tensor>& beta_opt,
-    const torch::Tensor& scale,
-    const torch::Tensor& shift,
-    torch::Tensor& y,
-    torch::Tensor& residual_out,
+    ffi::TensorView& y,
+    ffi::TensorView& residual_out,
+    const ffi::TensorView& x,
+    const ffi::TensorView& residual,
+    const ffi::Optional<ffi::TensorView>& gate_opt,
+    const ffi::Optional<ffi::TensorView>& gamma_opt,
+    const ffi::Optional<ffi::TensorView>& beta_opt,
+    const ffi::TensorView& scale,
+    const ffi::TensorView& shift,
     NormType norm_type,
     float eps) {
-  bool has_gamma = gamma_opt.has_value() && gamma_opt->defined();
-  bool has_beta = beta_opt.has_value() && beta_opt->defined();
-  auto gamma_ptr = has_gamma ? gamma_opt.value().data_ptr() : nullptr;
-  auto beta_ptr = has_beta ? beta_opt.value().data_ptr() : nullptr;
-  bool affine = has_gamma;
+  using namespace host;
+
+  auto gamma_ptr = gamma_opt.has_value() ? gamma_opt.value().data_ptr() : nullptr;
+  auto beta_ptr = beta_opt.has_value() ? beta_opt.value().data_ptr() : nullptr;
+  bool affine = gamma_opt.has_value();
 
   const int64_t M = x.size(0);
   const int64_t N = x.size(1);
   dim3 grid((unsigned)M);
-  TORCH_CHECK((N % 4) == 0, "N must be divisible by 4");
   dim3 block(0);
 
   // Configure thread block
@@ -1070,9 +1147,9 @@ static void norm_fused_res_gate_scale_shift_launch_with_residual(
   }
   if (block.x > 1024) block.x = 1024;
 
-  auto is_broadcast_2d = [&](const torch::Tensor& t) {
-    if (t.dim() == 2) return (t.size(0) == M || t.size(0) == 1) && t.size(1) == N;
-    if (t.dim() == 3) return t.size(0) == 1 && t.size(1) == 1 && t.size(2) == N;
+  auto is_broadcast_2d = [&](const ffi::TensorView& t) {
+    if (t.ndim() == 2) return (t.size(0) == M || t.size(0) == 1) && t.size(1) == N;
+    if (t.ndim() == 3) return t.size(0) == 1 && t.size(1) == 1 && t.size(2) == N;
     return false;
   };
 
@@ -1080,53 +1157,46 @@ static void norm_fused_res_gate_scale_shift_launch_with_residual(
   bool is_scale_c_1 = false;
   bool is_shift_c_1 = false;
   if (use_2d) {
-    is_scale_c_1 = (scale.dim() == 3) || (scale.size(0) == 1);
-    is_shift_c_1 = (shift.dim() == 3) || (shift.size(0) == 1);
+    is_scale_c_1 = (scale.ndim() == 3) || (scale.size(0) == 1);
+    is_shift_c_1 = (shift.ndim() == 3) || (shift.size(0) == 1);
   }
 
-  const bool use_4d = (scale.dim() == 4 && shift.dim() == 4);
-  const bool scalar_both = (scale.dim() == 1 && scale.numel() == 1 && shift.dim() == 1 && shift.numel() == 1);
-  bool skip = false;
-  if (scalar_both) {
-    const float s0 = scale.item<float>();
-    const float sh0 = shift.item<float>();
-    skip = (s0 == 0.0f && sh0 == 0.0f);
-  }
-  TORCH_CHECK(
-      use_2d || use_4d || skip,
-      "scale/shift must be 2D [M, N] , 2D [1, N], 3D [1, 1, N], 4D [B, F, 1, N], or scalar zeros to skip");
+  const bool use_4d = (scale.ndim() == 4 && shift.ndim() == 4);
+  const bool scalar_both = (scale.ndim() == 1 && scale.numel() == 1 && shift.ndim() == 1 && shift.numel() == 1);
+  RuntimeCheck(
+      use_2d || use_4d || scalar_both,
+      "scale/shift must be 2D [M, N] , 2D [1, N], 3D [1, 1, N], 4D [B, F, 1, N], or scalar");
 
   // Determine gate mode
   int gate_mode = 0;
   bool is_gate_c_1 = false;
-  torch::Tensor gate;
-  if (gate_opt.has_value() && gate_opt->defined()) {
-    gate = *gate_opt;
-    TORCH_CHECK(gate.dtype() == x.dtype(), "gate must have same dtype as x");
-    if (gate.dim() == 2) {
+  if (gate_opt.has_value()) {
+    const auto& gate = gate_opt.value();
+    RuntimeCheck(gate.dtype() == x.dtype(), "gate must have same dtype as x");
+    if (gate.ndim() == 2) {
       if (gate.size(0) == M && gate.size(1) == N) {
         gate_mode = 1;
       } else if (gate.size(0) == 1 && gate.size(1) == N) {
         gate_mode = 1;
         is_gate_c_1 = true;
       } else {
-        TORCH_CHECK(false, "2D gate must be [M, N] or [1, N]");
+        RuntimeCheck(false, "2D gate must be [M, N] or [1, N]");
       }
-    } else if (gate.dim() == 3) {
+    } else if (gate.ndim() == 3) {
       if (gate.size(0) == 1 && gate.size(1) == 1 && gate.size(2) == N) {
         gate_mode = 1;
         is_gate_c_1 = true;
       } else {
-        TORCH_CHECK(gate.size(1) == 1 && gate.size(2) == N, "3D gate must be [B, 1, N]");
+        RuntimeCheck(gate.size(1) == 1 && gate.size(2) == N, "3D gate must be [B, 1, N]");
         const int64_t B = gate.size(0);
-        TORCH_CHECK((M % B) == 0, "M must be divisible by B for 3D gate [B,1,N]");
+        RuntimeCheck((M % B) == 0, "M must be divisible by B for 3D gate [B,1,N]");
         gate_mode = 2;
       }
-    } else if (gate.dim() == 4) {
-      TORCH_CHECK(gate.size(2) == 1 && gate.size(3) == N, "4D gate must be [B, F, 1, N]");
+    } else if (gate.ndim() == 4) {
+      RuntimeCheck(gate.size(2) == 1 && gate.size(3) == N, "4D gate must be [B, F, 1, N]");
       gate_mode = 3;
     } else {
-      TORCH_CHECK(false, "Unsupported gate shape. Use [M,N], [B,1,N], [B,F,1,N] , 2D [1, N], 3D [1, 1, N]");
+      RuntimeCheck(false, "Unsupported gate shape. Use [M,N], [B,1,N], [B,F,1,N] , 2D [1, N], 3D [1, 1, N]");
     }
   }
 
@@ -1149,27 +1219,26 @@ static void norm_fused_res_gate_scale_shift_launch_with_residual(
       }
     };
 
-    if (x.dtype() == torch::kFloat32) {
+    const auto& dtype = x.dtype();
+    if (dtype.code == kDLFloat && dtype.bits == 32) {
       dispatch_dtype(DTypeTag<float4, float>{});
-    } else if (x.dtype() == torch::kFloat16) {
+    } else if (dtype.code == kDLFloat && dtype.bits == 16) {
       dispatch_dtype(DTypeTag<half4, half>{});
-    } else if (x.dtype() == torch::kBFloat16) {
+    } else if (dtype.code == kDLBfloat && dtype.bits == 16) {
       dispatch_dtype(DTypeTag<bf16_4, cutlass::bfloat16_t>{});
     } else {
-      TORCH_CHECK(false, "Unsupported dtype. Use float32, float16, or bfloat16.");
+      RuntimeCheck(false, "Unsupported dtype. Use float32, float16, or bfloat16.");
     }
   };
 
-  if (use_2d || skip) {
-    const int rows_per_b = (gate_mode == 2) ? (int)(M / gate.size(0)) : 0;
-    torch::Tensor scale2d = scale;
-    torch::Tensor shift2d = shift;
-    if (skip) {
-      TORCH_CHECK(
+  if (use_2d || scalar_both) {
+    const int rows_per_b = (gate_mode == 2) ? (int)(M / gate_opt.value().size(0)) : 0;
+    const auto& scale2d = scale;
+    const auto& shift2d = shift;
+    if (scalar_both) {
+      RuntimeCheck(
           gate_mode != 3,
           "When skipping with scalar scale/shift, 4D gate is not supported. Provide 2D/3D gate or 4D scale/shift.");
-      scale2d = torch::zeros({M, N}, x.options());
-      shift2d = torch::zeros({M, N}, x.options());
     }
 
     auto launch_kernel = [&](auto dtype_tag, auto ipt_tag, auto norm_tag) {
@@ -1177,27 +1246,51 @@ static void norm_fused_res_gate_scale_shift_launch_with_residual(
       using T = typename decltype(dtype_tag)::T;
       using IPT = decltype(ipt_tag);
       using NT = decltype(norm_tag);
-      norm_e4_fused_res_gate_scale_shift_2d<T4, T, IPT::value, NT::value>
-          <<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
-              (T4*)y.data_ptr(),
-              (T4*)residual_out.data_ptr(),
-              (const T4*)x.data_ptr(),
-              (const T4*)residual.data_ptr(),
-              (const T4*)gamma_ptr,
-              (const T4*)beta_ptr,
-              (const T4*)scale2d.data_ptr(),
-              (const T4*)shift2d.data_ptr(),
-              (gate_mode == 1) ? (const T4*)gate.data_ptr() : nullptr,
-              (gate_mode == 2) ? (const T4*)gate.data_ptr() : nullptr,
-              (int)M,
-              (int)N,
-              gate_mode,
-              rows_per_b,
-              affine,
-              is_scale_c_1,
-              is_shift_c_1,
-              is_gate_c_1,
-              eps);
+      if (scalar_both) {
+        LaunchKernel(grid, block, x.device())(
+            norm_e4_fused_res_gate_scale_shift_2d<T4, T, IPT::value, NT::value, true>,
+            (T4*)y.data_ptr(),
+            (T4*)residual_out.data_ptr(),
+            (const T4*)x.data_ptr(),
+            (const T4*)residual.data_ptr(),
+            (const T4*)gamma_ptr,
+            (const T4*)beta_ptr,
+            (const T4*)scale2d.data_ptr(),
+            (const T4*)shift2d.data_ptr(),
+            (gate_mode == 1) ? (const T4*)gate_opt.value().data_ptr() : nullptr,
+            (gate_mode == 2) ? (const T4*)gate_opt.value().data_ptr() : nullptr,
+            (int)M,
+            (int)N,
+            gate_mode,
+            rows_per_b,
+            affine,
+            is_scale_c_1,
+            is_shift_c_1,
+            is_gate_c_1,
+            eps);
+      } else {
+        LaunchKernel(grid, block, x.device())(
+            norm_e4_fused_res_gate_scale_shift_2d<T4, T, IPT::value, NT::value, false>,
+            (T4*)y.data_ptr(),
+            (T4*)residual_out.data_ptr(),
+            (const T4*)x.data_ptr(),
+            (const T4*)residual.data_ptr(),
+            (const T4*)gamma_ptr,
+            (const T4*)beta_ptr,
+            (const T4*)scale2d.data_ptr(),
+            (const T4*)shift2d.data_ptr(),
+            (gate_mode == 1) ? (const T4*)gate_opt.value().data_ptr() : nullptr,
+            (gate_mode == 2) ? (const T4*)gate_opt.value().data_ptr() : nullptr,
+            (int)M,
+            (int)N,
+            gate_mode,
+            rows_per_b,
+            affine,
+            is_scale_c_1,
+            is_shift_c_1,
+            is_gate_c_1,
+            eps);
+      }
     };
 
     dispatch(launch_kernel);
@@ -1208,125 +1301,131 @@ static void norm_fused_res_gate_scale_shift_launch_with_residual(
   const int64_t B = scale.size(0);
   const int64_t F = scale.size(1);
   const int frame_seqlen = (int)(M / (B * F));
-  TORCH_CHECK(gate_mode == 0 || gate_mode == 3, "When scale/shift are 4D, gate must be none or 4D [B,F,1,N]");
+  RuntimeCheck(gate_mode == 0 || gate_mode == 3, "When scale/shift are 4D, gate must be none or 4D [B,F,1,N]");
 
   auto launch_kernel = [&](auto dtype_tag, auto ipt_tag, auto norm_tag) {
     using T4 = typename decltype(dtype_tag)::T4;
     using T = typename decltype(dtype_tag)::T;
     using IPT = decltype(ipt_tag);
     using NT = decltype(norm_tag);
-    norm_e4_fused_res_gate_scale_shift_4d<T4, T, IPT::value, NT::value>
-        <<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
-            (T4*)y.data_ptr(),
-            (T4*)residual_out.data_ptr(),
-            (const T4*)x.data_ptr(),
-            (const T4*)residual.data_ptr(),
-            (const T4*)gamma_ptr,
-            (const T4*)beta_ptr,
-            (const T4*)scale.data_ptr(),
-            (const T4*)shift.data_ptr(),
-            nullptr,
-            nullptr,
-            (gate_mode == 3) ? (const T4*)gate.data_ptr() : nullptr,
-            (int)M,
-            (int)N,
-            gate_mode,
-            (int)B,
-            (int)F,
-            frame_seqlen,
-            affine,
-            eps);
+    LaunchKernel(grid, block, x.device())(
+        norm_e4_fused_res_gate_scale_shift_4d<T4, T, IPT::value, NT::value>,
+        (T4*)y.data_ptr(),
+        (T4*)residual_out.data_ptr(),
+        (const T4*)x.data_ptr(),
+        (const T4*)residual.data_ptr(),
+        (const T4*)gamma_ptr,
+        (const T4*)beta_ptr,
+        (const T4*)scale.data_ptr(),
+        (const T4*)shift.data_ptr(),
+        nullptr,
+        nullptr,
+        (gate_mode == 3) ? (const T4*)gate_opt.value().data_ptr() : nullptr,
+        (int)M,
+        (int)N,
+        gate_mode,
+        (int)B,
+        (int)F,
+        frame_seqlen,
+        affine,
+        eps);
   };
 
   dispatch(launch_kernel);
 }
 
-std::tuple<torch::Tensor, torch::Tensor> fused_scale_residual_norm_scale_shift(
-    const torch::Tensor& residual,
-    const torch::Tensor& x,
-    const c10::optional<torch::Tensor>& gate_opt,
-    const c10::optional<torch::Tensor>& gamma_opt,
-    const c10::optional<torch::Tensor>& beta_opt,
-    const torch::Tensor& scale,
-    const torch::Tensor& shift,
-    int64_t norm_type,
+template <int norm_type>
+void fused_scale_residual_norm_scale_shift(
+    ffi::TensorView& y,
+    ffi::TensorView& residual_output,
+    const ffi::TensorView& residual,
+    const ffi::TensorView& x,
+    const ffi::Optional<ffi::TensorView>& gate_opt,
+    const ffi::Optional<ffi::TensorView>& gamma_opt,
+    const ffi::Optional<ffi::TensorView>& beta_opt,
+    const ffi::TensorView& scale,
+    const ffi::TensorView& shift,
     double eps) {
-  CHECK_CUDA(x);
-  CHECK_CUDA(residual);
-  CHECK_CUDA(scale);
-  CHECK_CUDA(shift);
-  TORCH_CHECK(x.dim() == 2 && residual.dim() == 2, "x and residual must be 2D [M, N]");
-  TORCH_CHECK(x.stride(-1) == 1 && residual.stride(-1) == 1, "last dim of x/residual must be contiguous (stride 1)");
-  TORCH_CHECK(x.dtype() == residual.dtype(), "x and residual must have same dtype");
-  TORCH_CHECK(x.size(0) == residual.size(0) && x.size(1) == residual.size(1), "x and residual shapes must match");
-  TORCH_CHECK(x.dtype() == scale.dtype() && x.dtype() == shift.dtype(), "x, scale, shift must have same dtype");
+  using namespace host;
+
+  SymbolicSize M_ = {"M"};
+  SymbolicSize N_ = {"N"};
+  SymbolicDevice device_;
+  TensorMatcher({M_, N_})  // 2D tensor, must be contiguous
+      .with_dtype<float, half, nv_bfloat16>()
+      .with_strides({N_, 1})
+      .with_device<kDLCUDA>(device_)
+      .verify(residual)
+      .verify(x)
+      .verify(y)
+      .verify(residual_output);
+
+  RuntimeCheck(x.dtype() == residual.dtype(), "x and residual must have same dtype");
+  RuntimeCheck(x.dtype() == scale.dtype() && x.dtype() == shift.dtype(), "x, scale, shift must have same dtype");
   const int64_t M = x.size(0);
   const int64_t N = x.size(1);
-  if ((scale.dim() == 2 || scale.dim() == 3) && (shift.dim() == 2 || shift.dim() == 3)) {
-    TORCH_CHECK(scale.size(-1) == N && shift.size(-1) == N, "scale/shift last dim must be N");
-    TORCH_CHECK(
+  if ((scale.ndim() == 2 || scale.ndim() == 3) && (shift.ndim() == 2 || shift.ndim() == 3)) {
+    RuntimeCheck(scale.size(-1) == N && shift.size(-1) == N, "scale/shift last dim must be N");
+    RuntimeCheck(
         scale.stride(-1) == 1 && shift.stride(-1) == 1, "last dim of scale/shift must be contiguous (stride 1)");
-  } else if (scale.dim() == 4 && shift.dim() == 4) {
-    TORCH_CHECK(scale.size(3) == N && shift.size(3) == N, "scale/shift last dim must be N");
-    TORCH_CHECK(scale.size(2) == 1 && shift.size(2) == 1, "scale/shift 4D must have size 1 at dim=2");
-    TORCH_CHECK(scale.stride(3) == 1 && shift.stride(3) == 1, "last dim of scale/shift must be contiguous (stride 1)");
+  } else if (scale.ndim() == 4 && shift.ndim() == 4) {
+    RuntimeCheck(scale.size(3) == N && shift.size(3) == N, "scale/shift last dim must be N");
+    RuntimeCheck(scale.size(2) == 1 && shift.size(2) == 1, "scale/shift 4D must have size 1 at dim=2");
+    RuntimeCheck(scale.stride(3) == 1 && shift.stride(3) == 1, "last dim of scale/shift must be contiguous (stride 1)");
     const int64_t B = scale.size(0);
     const int64_t F = scale.size(1);
-    TORCH_CHECK((M % (B * F)) == 0, "M must be divisible by B*F for 4D scale/shift");
-  } else if (scale.dim() == 1 && scale.numel() == 1 && shift.dim() == 1 && shift.numel() == 1) {
-    const float s0 = scale.item<float>();
-    const float sh0 = shift.item<float>();
-    TORCH_CHECK(s0 == 0.0f && sh0 == 0.0f, "When scale/shift are scalar, both must be 0 to skip");
+    RuntimeCheck((M % (B * F)) == 0, "M must be divisible by B*F for 4D scale/shift");
+  } else if (scale.ndim() == 1 && scale.numel() == 1 && shift.ndim() == 1 && shift.numel() == 1) {
+    // Do nothing
   } else {
-    TORCH_CHECK(false, "scale/shift must be 2D [M, N] or 4D [B, F, 1, N]");
+    RuntimeCheck(false, "scale/shift must be 2D [M, N] or 4D [B, F, 1, N]");
   }
-  if (gate_opt.has_value() && gate_opt->defined()) {
-    const auto& gate = *gate_opt;
-    CHECK_CUDA(gate);
-    TORCH_CHECK(gate.dtype() == x.dtype(), "gate must have same dtype as x");
-    if (gate.dim() == 2) {
-      TORCH_CHECK((gate.size(0) == M || gate.size(0) == 1) && gate.size(1) == N, "2D gate must be [M, N] or [1, N]");
-      TORCH_CHECK(gate.stride(-1) == 1, "last dim of gate must be contiguous (stride 1)");
-    } else if (gate.dim() == 3) {
-      TORCH_CHECK(gate.size(1) == 1 && gate.size(2) == N, "3D gate must be [B, 1, N]");
+  if (gate_opt.has_value()) {
+    const auto& gate = gate_opt.value();
+    RuntimeCheck(gate.dtype() == x.dtype(), "gate must have same dtype as x");
+    if (gate.ndim() == 2) {
+      RuntimeCheck((gate.size(0) == M || gate.size(0) == 1) && gate.size(1) == N, "2D gate must be [M, N] or [1, N]");
+      RuntimeCheck(gate.stride(-1) == 1, "last dim of gate must be contiguous (stride 1)");
+    } else if (gate.ndim() == 3) {
+      RuntimeCheck(gate.size(1) == 1 && gate.size(2) == N, "3D gate must be [B, 1, N]");
       if (gate.size(0) != 1) {
-        TORCH_CHECK((M % gate.size(0)) == 0, "M must be divisible by B for 3D gate [B,1,N]");
+        RuntimeCheck((M % gate.size(0)) == 0, "M must be divisible by B for 3D gate [B,1,N]");
       }
-      TORCH_CHECK(gate.stride(2) == 1, "last dim of 3D gate must be contiguous (stride 1)");
-    } else if (gate.dim() == 4) {
-      TORCH_CHECK(gate.size(2) == 1 && gate.size(3) == N, "4D gate must be [B, F, 1, N]");
-      TORCH_CHECK(gate.stride(3) == 1, "last dim of 4D gate must be contiguous (stride 1)");
+      RuntimeCheck(gate.stride(2) == 1, "last dim of 3D gate must be contiguous (stride 1)");
+    } else if (gate.ndim() == 4) {
+      RuntimeCheck(gate.size(2) == 1 && gate.size(3) == N, "4D gate must be [B, F, 1, N]");
+      RuntimeCheck(gate.stride(3) == 1, "last dim of 4D gate must be contiguous (stride 1)");
       const int64_t B = gate.size(0);
       const int64_t F = gate.size(1);
-      TORCH_CHECK((M % (B * F)) == 0, "M must be divisible by B*F for 4D gate");
-      if (scale.dim() == 4) {
-        TORCH_CHECK(scale.size(0) == B && scale.size(1) == F, "gate [B,F,1,N] must match scale/shift [B,F,1,N]");
+      RuntimeCheck((M % (B * F)) == 0, "M must be divisible by B*F for 4D gate");
+      if (scale.ndim() == 4) {
+        RuntimeCheck(scale.size(0) == B && scale.size(1) == F, "gate [B,F,1,N] must match scale/shift [B,F,1,N]");
       }
     } else {
-      TORCH_CHECK(false, "Unsupported gate shape. Use [M,N], [B,1,N], or [B,F,1,N]");
+      RuntimeCheck(false, "Unsupported gate shape. Use [M,N], [B,1,N], or [B,F,1,N]");
     }
   }
-
-  if (gamma_opt.has_value() && gamma_opt->defined()) {
+  if (gamma_opt.has_value()) {
     const auto& gamma = gamma_opt.value();
-    CHECK_CUDA(gamma);
-    TORCH_CHECK(gamma.dim() == 1, "gamma must be 1D [N]");
-    TORCH_CHECK(x.dtype() == gamma.dtype(), "x, gamma must have same dtype");
-    TORCH_CHECK(gamma.numel() == N, "gamma must be length N");
-    if (beta_opt.has_value() && beta_opt->defined()) {
+    TensorMatcher({N_})  // 1D tensor, must be contiguous
+        .with_dtype<float, half, nv_bfloat16>()
+        .with_device<kDLCUDA>(device_)
+        .verify(gamma);
+    RuntimeCheck(x.dtype() == gamma.dtype(), "x, gamma must have same dtype");
+    if (beta_opt.has_value()) {
       const auto& beta = beta_opt.value();
-      CHECK_CUDA(beta);
-      TORCH_CHECK(beta.dim() == 1, "beta must be 1D [N]");
-      TORCH_CHECK(x.dtype() == beta.dtype(), "x, beta must have same dtype");
-      TORCH_CHECK(beta.numel() == N, "beta must be length N");
+      TensorMatcher({N_})  // 1D tensor, must be contiguous
+          .with_dtype<float, half, nv_bfloat16>()
+          .with_device<kDLCUDA>(device_)
+          .verify(beta);
+      RuntimeCheck(x.dtype() == beta.dtype(), "x, beta must have same dtype");
     }
   }
-  TORCH_CHECK(norm_type == 0 || norm_type == 1, "norm_type must be 0 (layer) or 1 (rms).");
-
-  auto y = torch::empty_like(x);
-  auto residual_output = torch::empty_like(x);
+  RuntimeCheck(norm_type == 0 || norm_type == 1, "norm_type must be 0 (layer) or 1 (rms).");
 
   norm_fused_res_gate_scale_shift_launch_with_residual(
+      y,
+      residual_output,
       x,
       residual,
       gate_opt,
@@ -1334,9 +1433,37 @@ std::tuple<torch::Tensor, torch::Tensor> fused_scale_residual_norm_scale_shift(
       beta_opt,
       scale,
       shift,
-      y,
-      residual_output,
       NormType((int)norm_type),
       static_cast<float>(eps));
-  return std::make_tuple(y, residual_output);
 }
+
+void fused_scale_residual_layernorm_scale_shift(
+    ffi::TensorView y,
+    ffi::TensorView residual_output,
+    const ffi::TensorView residual,
+    const ffi::TensorView x,
+    const ffi::Optional<ffi::TensorView> gate_opt,
+    const ffi::Optional<ffi::TensorView> gamma_opt,
+    const ffi::Optional<ffi::TensorView> beta_opt,
+    const ffi::TensorView scale,
+    const ffi::TensorView shift,
+    double eps) {
+  fused_scale_residual_norm_scale_shift<0>(
+      y, residual_output, residual, x, gate_opt, gamma_opt, beta_opt, scale, shift, eps);
+}
+
+void fused_scale_residual_rmsnorm_scale_shift(
+    ffi::TensorView y,
+    ffi::TensorView residual_output,
+    const ffi::TensorView residual,
+    const ffi::TensorView x,
+    const ffi::Optional<ffi::TensorView> gate_opt,
+    const ffi::Optional<ffi::TensorView> gamma_opt,
+    const ffi::Optional<ffi::TensorView> beta_opt,
+    const ffi::TensorView scale,
+    const ffi::TensorView shift,
+    double eps) {
+  fused_scale_residual_norm_scale_shift<1>(
+      y, residual_output, residual, x, gate_opt, gamma_opt, beta_opt, scale, shift, eps);
+}
+}  // namespace

@@ -406,67 +406,6 @@ def concat_mla_absorb_q(
     return out
 
 
-def fused_norm_scale_shift(
-    x: torch.Tensor,
-    gamma: Optional[torch.Tensor],
-    beta: Optional[torch.Tensor],
-    scale: torch.Tensor,
-    shift: torch.Tensor,
-    norm_type: str,
-    eps: Optional[float] = 1e-5,
-) -> torch.Tensor:
-    """
-    LayerNorm(x; gamma, beta) followed by fused scale/shift.
-    or RMSNorm(x; gamma, beta) followed by fused scale/shift.
-    Expects:
-      - x: [M, N], contiguous on last dim
-      - gamma/beta: None, [N]
-      - scale/shift: [M, N] or [B, F, 1, N]
-      - norm_type: str, "layer" or "rms"
-      - eps: Optional[float], default: 1e-5
-    """
-    norm_type_val = -1
-    if norm_type == "layer":
-        norm_type_val = 0
-    elif norm_type == "rms":
-        norm_type_val = 1
-    return torch.ops.sgl_kernel.fused_norm_scale_shift.default(
-        x, gamma, beta, scale, shift, norm_type_val, eps
-    )
-
-
-def fused_scale_residual_norm_scale_shift(
-    residual: torch.Tensor,
-    x: torch.Tensor,
-    gate: Optional[torch.Tensor],
-    gamma: Optional[torch.Tensor],
-    beta: Optional[torch.Tensor],
-    scale: torch.Tensor,
-    shift: torch.Tensor,
-    norm_type: str,
-    eps: Optional[float] = 1e-5,
-) -> torch.Tensor:
-    """
-    Fused: (residual + gate * x) -> LayerNorm(gamma, beta) -> scale/shift.
-    or Fused: (residual + gate * x) -> RMSNorm(gamma, beta) -> scale/shift.
-    Expects:
-      - residual/x: [M, N], contiguous on last dim
-      - gate: None, [1, N], [M, N], [1, 1, N], [B, 1, N], or [B, F, 1, N]
-      - gamma/beta: None, [N]
-      - scale/shift: [M, N] or [B, F, 1, N]
-      - norm_type: str, "layer" or "rms"
-      - eps: Optional[float], default: 1e-5
-    """
-    norm_type_val = -1
-    if norm_type == "layer":
-        norm_type_val = 0
-    elif norm_type == "rms":
-        norm_type_val = 1
-    return torch.ops.sgl_kernel.fused_scale_residual_norm_scale_shift.default(
-        residual, x, gate, gamma, beta, scale, shift, norm_type_val, eps
-    )
-
-
 def timestep_embedding(
     t: torch.Tensor,
     dim: int,
