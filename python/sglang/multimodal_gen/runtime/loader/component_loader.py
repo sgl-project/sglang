@@ -76,11 +76,11 @@ def _normalize_module_type(module_type: str) -> str:
 def _clean_hf_config_inplace(model_config: dict) -> None:
     """Remove common extraneous HF fields if present."""
     for key in (
-            "_name_or_path",
-            "transformers_version",
-            "model_type",
-            "tokenizer_class",
-            "torch_dtype",
+        "_name_or_path",
+        "transformers_version",
+        "model_type",
+        "tokenizer_class",
+        "torch_dtype",
     ):
         model_config.pop(key, None)
 
@@ -96,7 +96,7 @@ def get_memory_usage_of_component(module) -> float | None:
     """
     if not isinstance(module, nn.Module):
         return None
-    BYTES_PER_GB = 1024 ** 3
+    BYTES_PER_GB = 1024**3
     if hasattr(module, "get_memory_footprint"):
         usage = module.get_memory_footprint() / BYTES_PER_GB
     else:
@@ -105,7 +105,7 @@ def get_memory_usage_of_component(module) -> float | None:
         buffer_size = sum(b.numel() * b.element_size() for b in module.buffers())
 
         total_size_bytes = param_size + buffer_size
-        usage = total_size_bytes / (1024 ** 3)
+        usage = total_size_bytes / (1024**3)
 
     return round(usage, 2)
 
@@ -493,7 +493,7 @@ class TextEncoderLoader(ComponentLoader):
                         reshard_after_forward=True,
                         mesh=mesh["offload"],
                         fsdp_shard_conditions=model_config.arch_config._fsdp_shard_conditions
-                                              or getattr(model, "_fsdp_shard_conditions", None),
+                        or getattr(model, "_fsdp_shard_conditions", None),
                         pin_cpu_memory=server_args.pin_cpu_memory,
                     )
             # We only enable strict check for non-quantized models

@@ -98,7 +98,7 @@ class QwenImageRMS_norm(nn.Module):
         shape = (dim, *broadcastable_dims) if channel_first else (dim,)
 
         self.channel_first = channel_first
-        self.scale = dim ** 0.5
+        self.scale = dim**0.5
         self.gamma = nn.Parameter(torch.ones(shape))
         self.bias = nn.Parameter(torch.zeros(shape)) if bias else 0.0
 

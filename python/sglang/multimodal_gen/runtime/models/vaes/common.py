@@ -188,8 +188,8 @@ class ParallelTiledVAE(ABC, nn.Module):
                     :,
                     :,
                     :,
-                    i: i + self.tile_sample_min_height,
-                    j: j + self.tile_sample_min_width,
+                    i : i + self.tile_sample_min_height,
+                    j : j + self.tile_sample_min_width,
                 ]
                 tile = self._encode(tile)
                 row.append(tile)
@@ -213,7 +213,7 @@ class ParallelTiledVAE(ABC, nn.Module):
                 mul_shape = prod(shape)
                 yield (
                     gathered_results[
-                        i, _start_shape: _start_shape + mul_shape
+                        i, _start_shape : _start_shape + mul_shape
                     ].reshape(shape),
                     global_idx,
                 )
@@ -252,8 +252,8 @@ class ParallelTiledVAE(ABC, nn.Module):
 
         # Calculate tile dimensions
         num_t_tiles = (
-                          T + tile_latent_stride_num_frames - 1
-                      ) // tile_latent_stride_num_frames
+            T + tile_latent_stride_num_frames - 1
+        ) // tile_latent_stride_num_frames
         num_h_tiles = (H + tile_latent_stride_height - 1) // tile_latent_stride_height
         num_w_tiles = (W + tile_latent_stride_width - 1) // tile_latent_stride_width
         total_spatial_tiles = num_h_tiles * num_w_tiles
@@ -282,9 +282,9 @@ class ParallelTiledVAE(ABC, nn.Module):
             tile = z[
                 :,
                 :,
-                t_start: t_start + tile_latent_min_num_frames + 1,
-                h_start: h_start + tile_latent_min_height,
-                w_start: w_start + tile_latent_min_width,
+                t_start : t_start + tile_latent_min_num_frames + 1,
+                h_start : h_start + tile_latent_min_height,
+                w_start : w_start + tile_latent_min_width,
             ]
 
             # Process tile
@@ -424,8 +424,8 @@ class ParallelTiledVAE(ABC, nn.Module):
                     :,
                     :,
                     :,
-                    i: i + tile_latent_min_height,
-                    j: j + tile_latent_min_width,
+                    i : i + tile_latent_min_height,
+                    j : j + tile_latent_min_width,
                 ]
                 decoded = self._decode(tile)
                 row.append(decoded)
@@ -448,7 +448,7 @@ class ParallelTiledVAE(ABC, nn.Module):
 
         row = []
         for i in range(0, num_frames, self.tile_sample_stride_num_frames):
-            tile = x[:, :, i: i + self.tile_sample_min_num_frames + 1, :, :]
+            tile = x[:, :, i : i + self.tile_sample_min_num_frames + 1, :, :]
             if self.use_tiling and (
                 height > self.tile_sample_min_height
                 or width > self.tile_sample_min_width
@@ -487,7 +487,7 @@ class ParallelTiledVAE(ABC, nn.Module):
 
         row = []
         for i in range(0, num_frames, tile_latent_stride_num_frames):
-            tile = z[:, :, i: i + tile_latent_min_num_frames + 1, :, :]
+            tile = z[:, :, i : i + tile_latent_min_num_frames + 1, :, :]
             if self.use_tiling and (
                 tile.shape[-1] > tile_latent_min_width
                 or tile.shape[-2] > tile_latent_min_height
