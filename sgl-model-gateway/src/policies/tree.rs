@@ -6,7 +6,6 @@ use std::{
         atomic::{AtomicU64, Ordering},
         Arc, RwLock,
     },
-    time::{SystemTime, UNIX_EPOCH},
 };
 
 use dashmap::{mapref::entry::Entry, DashMap};
@@ -176,35 +175,24 @@ impl Clone for NodeText {
     }
 }
 
-/// Global timestamp that gets updated periodically to reduce syscalls.
-/// Uses milliseconds since epoch.
-static CURRENT_TIMESTAMP_MS: AtomicU64 = AtomicU64::new(0);
+/// Global epoch counter for LRU ordering.
+/// Uses a simple incrementing counter instead of wall clock time.
+///
+/// Benefits:
+/// - No syscall overhead (vs SystemTime::now())
+/// - Smaller memory footprint (u64 vs u128)
+/// - Perfectly monotonic (no clock skew issues)
+///
+/// For LRU eviction, relative ordering is all that matters.
+static EPOCH_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// Staleness threshold in milliseconds for forced refresh.
-/// If cached timestamp is older than this, always get fresh time.
-const TIMESTAMP_STALENESS_MS: u64 = 5;
-
-/// Get current timestamp in milliseconds, using cached value when possible.
-/// Refreshes if the cached value is stale (>TIMESTAMP_STALENESS_MS).
-/// This provides ~99% syscall reduction under high load while maintaining accuracy.
+/// Get the next epoch value for LRU timestamp ordering.
+/// Uses fetch_add for lock-free, monotonically increasing values.
+/// Relaxed ordering is sufficient since we only need eventual consistency
+/// for approximate LRU behavior.
 #[inline]
-fn get_timestamp_ms() -> u128 {
-    let cached = CURRENT_TIMESTAMP_MS.load(Ordering::Relaxed);
-
-    // Always need syscall to check staleness, but it's cheap and necessary for correctness
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as u64;
-
-    // Fast path: return cached if still fresh (within TIMESTAMP_STALENESS_MS)
-    if cached != 0 && now.saturating_sub(cached) < TIMESTAMP_STALENESS_MS {
-        return cached as u128;
-    }
-
-    // Update cached value
-    CURRENT_TIMESTAMP_MS.store(now, Ordering::Relaxed);
-    now as u128
+fn get_epoch() -> u64 {
+    EPOCH_COUNTER.fetch_add(1, Ordering::Relaxed)
 }
 
 #[derive(Debug)]
@@ -214,8 +202,8 @@ struct Node {
     children: DashMap<char, NodeRef, CharHasherBuilder>,
     /// Node text with cached character count
     text: RwLock<NodeText>,
-    /// Per-tenant last access timestamps. Using TenantId (Arc<str>) for cheap cloning.
-    tenant_last_access_time: DashMap<TenantId, u128>,
+    /// Per-tenant last access epoch for LRU ordering. Using TenantId (Arc<str>) for cheap cloning.
+    tenant_last_access_time: DashMap<TenantId, u64>,
     /// Parent pointer for upward traversal during timestamp updates
     parent: RwLock<Option<NodeRef>>,
 }
@@ -230,7 +218,7 @@ pub struct Tree {
 // For the heap
 
 struct EvictionEntry {
-    timestamp: u128,
+    timestamp: u64,
     tenant: TenantId,
     node: NodeRef,
 }
@@ -314,8 +302,8 @@ impl Tree {
         // Insert text into tree with given tenant
         // Use slice-based traversal to avoid Vec<char> allocation
 
-        // Use cached timestamp to reduce syscalls
-        let timestamp_ms = get_timestamp_ms();
+        // Get epoch for LRU ordering
+        let epoch = get_epoch();
 
         // Intern the tenant ID once for reuse
         let tenant_id = intern_tenant(tenant);
@@ -325,7 +313,7 @@ impl Tree {
 
         self.root
             .tenant_last_access_time
-            .insert(Arc::clone(&tenant_id), timestamp_ms);
+            .insert(Arc::clone(&tenant_id), epoch);
 
         self.tenant_char_count
             .entry(Arc::clone(&tenant_id))
@@ -368,7 +356,7 @@ impl Tree {
                         .or_insert(remaining_char_count);
                     new_node
                         .tenant_last_access_time
-                        .insert(Arc::clone(&tenant_id), timestamp_ms);
+                        .insert(Arc::clone(&tenant_id), epoch);
 
                     entry.insert(new_node);
                     InsertStep::Done
@@ -420,10 +408,10 @@ impl Tree {
                                     .entry(Arc::clone(&tenant_id))
                                     .and_modify(|count| *count += matched_text_count)
                                     .or_insert(matched_text_count);
-                                v.insert(timestamp_ms);
+                                v.insert(epoch);
                             }
                             Entry::Occupied(mut o) => {
-                                o.insert(timestamp_ms);
+                                o.insert(epoch);
                             }
                         }
 
@@ -445,10 +433,10 @@ impl Tree {
                                     .entry(Arc::clone(&tenant_id))
                                     .and_modify(|count| *count += matched_node_text_count)
                                     .or_insert(matched_node_text_count);
-                                v.insert(timestamp_ms);
+                                v.insert(epoch);
                             }
                             Entry::Occupied(mut o) => {
-                                o.insert(timestamp_ms);
+                                o.insert(epoch);
                             }
                         }
 
@@ -524,17 +512,12 @@ impl Tree {
             .next()
             .map(|kv| Arc::clone(kv.key()));
 
-        // Use cached timestamp to reduce syscalls
-        let timestamp_ms = get_timestamp_ms();
-
-        // Traverse from the curr node to the root and update the timestamp
+        // Update timestamp on the matched node only (O(1)).
+        // Ancestor propagation is unnecessary - eviction only uses leaf timestamps.
         if let Some(ref tenant_id) = tenant {
-            let mut current_node = Some(Arc::clone(&curr));
-            while let Some(node) = current_node {
-                node.tenant_last_access_time
-                    .insert(Arc::clone(tenant_id), timestamp_ms);
-                current_node = node.parent.read().unwrap().clone();
-            }
+            let epoch = get_epoch();
+            curr.tenant_last_access_time
+                .insert(Arc::clone(tenant_id), epoch);
         }
 
         // Build matched text from original input using char count
@@ -609,20 +592,15 @@ impl Tree {
 
         let curr = prev;
 
-        // Only update timestamp if we found a match for the specified tenant
+        // Only update timestamp if we found a match for the specified tenant.
+        // Update matched node only - ancestor propagation is unnecessary.
         if curr
             .tenant_last_access_time
             .contains_key(tenant_id.as_ref())
         {
-            // Use cached timestamp to reduce syscalls
-            let timestamp_ms = get_timestamp_ms();
-
-            let mut current_node = Some(curr);
-            while let Some(node) = current_node {
-                node.tenant_last_access_time
-                    .insert(Arc::clone(&tenant_id), timestamp_ms);
-                current_node = node.parent.read().unwrap().clone();
-            }
+            let epoch = get_epoch();
+            curr.tenant_last_access_time
+                .insert(Arc::clone(&tenant_id), epoch);
         }
 
         // Build result from original input using char count
@@ -866,8 +844,6 @@ impl Tree {
 
     #[allow(dead_code)]
     fn node_to_string(node: &NodeRef, prefix: &str, is_last: bool) -> String {
-        use std::time::Duration;
-
         let mut result = String::new();
 
         // Add prefix and branch character
@@ -878,29 +854,12 @@ impl Tree {
         let node_text = node.text.read().unwrap();
         result.push_str(&format!("'{}' [", node_text.as_str()));
 
-        // Add tenant information with timestamps
+        // Add tenant information with epoch values
         let mut tenant_info = Vec::new();
         for entry in node.tenant_last_access_time.iter() {
             let tenant_id = entry.key();
-            let timestamp_ms = entry.value();
-
-            // Convert milliseconds to seconds and remaining milliseconds
-            let seconds = (timestamp_ms / 1000) as u64;
-            let millis = (timestamp_ms % 1000) as u32;
-
-            // Create SystemTime from Unix timestamp
-            let system_time = UNIX_EPOCH + Duration::from_secs(seconds);
-
-            // Format time as HH:MM:SS.mmm
-            let datetime = system_time.duration_since(UNIX_EPOCH).unwrap();
-            let hours = (datetime.as_secs() % 86400) / 3600;
-            let minutes = (datetime.as_secs() % 3600) / 60;
-            let seconds = datetime.as_secs() % 60;
-
-            tenant_info.push(format!(
-                "{} | {:02}:{:02}:{:02}.{:03}",
-                tenant_id, hours, minutes, seconds, millis
-            ));
+            let epoch = entry.value();
+            tenant_info.push(format!("{} | epoch:{}", tenant_id, epoch));
         }
 
         result.push_str(&tenant_info.join(", "));
