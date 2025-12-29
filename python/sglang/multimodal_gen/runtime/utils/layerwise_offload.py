@@ -108,7 +108,7 @@ class LayerwiseOffloadManager:
                     total_numel, dtype=dtype, pin_memory=self.pin_cpu_memory
                 )
 
-                # offload weights into the buffer
+                # offload weights to the buffer
                 current_offset = 0
                 for name, tensor in tensors:
                     numel = tensor.numel()
@@ -211,7 +211,6 @@ class LayerwiseOffloadManager:
         if layer_idx not in self._gpu_layers:
             return
 
-        # Release GPU memory by pointing to dummy tensors
         for name, meta in self._tensor_metadata.get(layer_idx, {}).items():
             target = (
                 self._named_parameters.get(name)
