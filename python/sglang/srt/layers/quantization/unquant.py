@@ -302,10 +302,11 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             )
 
         if _is_npu:
+            from sglang.srt.hardware_backend.npu.utils import NPUACLFormat
             for weight_name in ["w13_weight", "w2_weight"]:
                 weight = getattr(layer, weight_name)
                 weight.data = torch_npu.npu_format_cast(
-                    weight.data, NPU_FORMAT_FRACTAL_NZ
+                    weight.data, NPUACLFormat.ACL_FORMAT_FRACTAL_NZ
                 )
 
         return
