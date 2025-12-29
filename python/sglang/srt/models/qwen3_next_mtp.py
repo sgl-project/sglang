@@ -21,6 +21,7 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from sglang.srt.distributed import get_pp_group, get_tensor_model_parallel_world_size
+from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.layernorm import GemmaRMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -61,7 +62,10 @@ class Qwen3NextForCausalLMMTP(Qwen3NextForCausalLM):
         config.num_hidden_layers = 1
         config.full_attention_interval = 1
         self.model = Qwen3NextModel(
-            config, quant_config, prefix=add_prefix("model", prefix)
+            config,
+            quant_config,
+            prefix=add_prefix("model", prefix),
+            is_nextn=True,
         )
         self.lm_head = ParallelLMHead(
             config.vocab_size,
@@ -91,12 +95,13 @@ class Qwen3NextForCausalLMMTP(Qwen3NextForCausalLM):
             hidden_states = self.pre_fc_norm_hidden(hidden_states)
         hidden_states = self.fc(torch.cat((input_embeds, hidden_states), dim=-1))
 
-        hidden_states = self.model(
-            input_ids,
-            positions,
-            forward_batch,
-            hidden_states,
-        )
+        with get_global_expert_distribution_recorder().disable_this_region():
+            hidden_states = self.model(
+                input_ids,
+                positions,
+                forward_batch,
+                hidden_states,
+            )
 
         return self.logits_processor(
             input_ids, hidden_states, self.lm_head, forward_batch
