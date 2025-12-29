@@ -154,6 +154,12 @@ class MultimodalSpecialTokens:
             if t is not None:
                 patterns.append(t.pattern)
                 flags |= t.flags
+        # If no multimodal tokens are configured, return a regex that never matches.
+        # This avoids creating an empty "()" pattern which would match empty strings
+        # and break downstream logic (e.g. re.split producing many empty parts).
+        if not patterns:
+            self.combined_regex = re.compile(r"$^")
+            return self.combined_regex
         combined = "(" + "|".join(f"(?:{p})" for p in patterns) + ")"
         self.combined_regex = re.compile(combined, flags)
         return self.combined_regex
@@ -616,62 +622,80 @@ class BaseMultimodalProcessor(ABC):
         images, videos, audios = [], [], []
         new_text_parts = []
         has_precomputed_input = False
+        # Precompute how many multimodal tokens are present in the prompt for better diagnostics.
+        mm_token_count_in_prompt = sum(
+            1
+            for p in text_parts
+            if multimodal_tokens.get_modality_of_token(p) is not None
+        )
         for text_part in text_parts:
+            modality_in_prompt = multimodal_tokens.get_modality_of_token(text_part)
+            if modality_in_prompt is None:
+                # normal text
+                new_text_parts += [text_part]
+                continue
+
             try:
-                if multimodal_tokens_pattern.match(text_part):
-                    modality, raw_data, frame_limit = next(task_info_iter)
-                    result = next(futures_iter).result()
-
-                    is_precomputed, new_imgs, new_vids, new_auds = (
-                        self._process_loaded_mm_data(modality, raw_data, result)
-                    )
-
-                    has_precomputed_input |= is_precomputed
-                    images.extend(new_imgs)
-                    videos.extend(new_vids)
-                    audios.extend(new_auds)
-
-                    if modality == Modality.IMAGE:
-                        if is_precomputed:
-                            new_text_parts += [text_part]
-                        else:
-                            count = len(new_imgs)
-                            if count > 0:
-                                new_text_parts += [
-                                    multimodal_tokens.image_token
-                                ] * count
-                    elif modality == Modality.VIDEO:
-                        # load as video
-                        mm_tokens = (
-                            text_part
-                            if is_precomputed
-                            else multimodal_tokens.video_token
-                        )
-                        new_text_parts += mm_tokens
-                    elif modality == Modality.AUDIO:
-                        # audio
-                        mm_tokens = (
-                            text_part
-                            if is_precomputed
-                            else multimodal_tokens.audio_token
-                        )
-                        new_text_parts += mm_tokens
-                else:
-                    # normal text
-                    new_text_parts += [text_part]
-
-            except StopIteration as e:
-                # when precomputed_input is presented with multi-images, StopIteration is expected
+                modality, raw_data, frame_limit = next(task_info_iter)
+                future = next(futures_iter)
+            except StopIteration:
+                # Mismatch: prompt contains more multimodal tokens than provided data.
+                #
+                # This can happen in some model templates or when users provide too few inputs.
+                # For robustness, keep the token as-is in the text and continue.
                 if has_precomputed_input:
                     new_text_parts += [text_part]
                     continue
-                raise RuntimeError(
-                    f"An exception occurred while loading multimodal data: {e}"
+                logger.warning(
+                    "Mismatch: More multimodal tokens found in the prompt than corresponding data provided. "
+                    f"Keeping token as-is. token={text_part!r}, modality={getattr(modality_in_prompt, 'name', modality_in_prompt)}, "
+                    f"mm_tokens_in_prompt={mm_token_count_in_prompt}, loaded_items={len(task_info)}"
                 )
+                new_text_parts += [text_part]
+                continue
+
+            try:
+                result = future.result()
+
+                is_precomputed, new_imgs, new_vids, new_auds = (
+                    self._process_loaded_mm_data(modality, raw_data, result)
+                )
+
+                has_precomputed_input |= is_precomputed
+                images.extend(new_imgs)
+                videos.extend(new_vids)
+                audios.extend(new_auds)
+
+                if modality == Modality.IMAGE:
+                    if is_precomputed:
+                        new_text_parts += [text_part]
+                    else:
+                        count = len(new_imgs)
+                        if count > 0:
+                            new_text_parts += [multimodal_tokens.image_token] * count
+                elif modality == Modality.VIDEO:
+                    # load as video
+                    mm_tokens = (
+                        text_part if is_precomputed else multimodal_tokens.video_token
+                    )
+                    new_text_parts += (
+                        [mm_tokens] if mm_tokens is not None else [text_part]
+                    )
+                elif modality == Modality.AUDIO:
+                    # audio
+                    mm_tokens = (
+                        text_part if is_precomputed else multimodal_tokens.audio_token
+                    )
+                    new_text_parts += (
+                        [mm_tokens] if mm_tokens is not None else [text_part]
+                    )
+                else:
+                    # Shouldn't happen, but keep the original token for forward compatibility.
+                    new_text_parts += [text_part]
             except Exception as e:
                 raise RuntimeError(
                     f"An exception occurred while loading multimodal data: {e}"
-                )
+                ) from e
         return BaseMultiModalProcessorOutput(
             images=images,
             audios=audios,
