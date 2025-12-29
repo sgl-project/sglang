@@ -12,14 +12,16 @@ from sglang.test.test_utils import dump_metric
 class TestDumpMetric(unittest.TestCase):
     """Test suite for dump_metric() function."""
 
+    _ENV_KEYS_TO_CLEAN = ["SGLANG_TEST_METRICS_OUTPUT", "PYTEST_CURRENT_TEST"]
+
     def setUp(self):
         """Clean up env vars before each test."""
-        for key in ["SGLANG_TEST_METRICS_OUTPUT", "PYTEST_CURRENT_TEST"]:
+        for key in self._ENV_KEYS_TO_CLEAN:
             os.environ.pop(key, None)
 
     def tearDown(self):
         """Clean up env vars after each test."""
-        for key in ["SGLANG_TEST_METRICS_OUTPUT", "PYTEST_CURRENT_TEST"]:
+        for key in self._ENV_KEYS_TO_CLEAN:
             os.environ.pop(key, None)
 
     def test_writes_valid_jsonl(self):
