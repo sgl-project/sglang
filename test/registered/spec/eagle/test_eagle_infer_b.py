@@ -15,10 +15,7 @@ from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.few_shot_gsm8k import run_eval as run_gsm8k_eval
 from sglang.test.kits.radix_cache_server_kit import run_radix_attention_test
 from sglang.test.server_fixtures.eagle_fixture import EagleServerBase
-from sglang.test.test_utils import (
-    DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST,
-    run_logprob_check,
-)
+from sglang.test.test_utils import DEFAULT_TARGET_MODEL_EAGLE, run_logprob_check
 
 register_cuda_ci(est_time=1100, suite="stage-b-test-small-1-gpu")
 
@@ -78,7 +75,7 @@ class TestEAGLEServerBasic(EagleServerBase):
         print(f"{metrics=}")
         self.assertGreater(metrics["accuracy"], 0.20)
 
-        server_info = requests.get(self.base_url + "/get_server_info").json()
+        server_info = requests.get(self.base_url + "/server_info").json()
         avg_spec_accept_length = server_info["internal_states"][0][
             "avg_spec_accept_length"
         ]
@@ -262,7 +259,7 @@ class TestEAGLEServerBasic(EagleServerBase):
         response = requests.post(
             self.base_url + "/v1/chat/completions",
             json={
-                "model": DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST,
+                "model": DEFAULT_TARGET_MODEL_EAGLE,
                 "messages": messages,
                 "temperature": 0,
                 "response_format": {"type": "json_object"},
@@ -290,14 +287,16 @@ class TestEAGLEServerBasic(EagleServerBase):
 
 
 class TestEAGLERetract(TestEAGLEServerBasic):
-    extra_args = ["--chunked-prefill-size", 128, "--max-running-requests", 64]
+    extra_args = [
+        "--chunked-prefill-size=128",
+        "--max-running-requests=64",
+        "--max-total-tokens=4500",  # Set a smaller KV cache to trigger retract more easily
+    ]
 
     @classmethod
     def setUpClass(cls):
         # These config helps find a leak.
-        with envs.SGLANG_TEST_RETRACT.override(
-            True
-        ), envs.SGLANG_CI_SMALL_KV_SIZE.override(4500):
+        with envs.SGLANG_TEST_RETRACT.override(True):
             super().setUpClass()
 
 
