@@ -10,7 +10,7 @@ use crate::{
     app_context::AppContext,
     core::{
         BasicWorkerBuilder, CircuitBreakerConfig, ConnectionMode, DPAwareWorkerBuilder,
-        HealthConfig, ModelCard, RuntimeType, Worker, WorkerType,
+        HealthConfig, ModelCard, RuntimeType, Worker, WorkerType, UNKNOWN_MODEL_ID,
     },
     protocols::worker_spec::WorkerConfigRequest,
     workflow::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, WorkflowResult},
@@ -62,15 +62,15 @@ impl StepExecutor for CreateLocalWorkerStep {
             final_labels.insert(key.clone(), value.clone());
         }
 
-        // Determine model_id: config > served_model_name > model_path > "unknown"
+        // Determine model_id: config > served_model_name > model_path > UNKNOWN_MODEL_ID
         let model_id = config
             .model_id
             .clone()
             .or_else(|| final_labels.get("served_model_name").cloned())
             .or_else(|| final_labels.get("model_path").cloned())
-            .unwrap_or_else(|| "unknown".to_string());
+            .unwrap_or_else(|| UNKNOWN_MODEL_ID.to_string());
 
-        if model_id != "unknown" {
+        if model_id != UNKNOWN_MODEL_ID {
             debug!("Using model_id: {}", model_id);
         }
 

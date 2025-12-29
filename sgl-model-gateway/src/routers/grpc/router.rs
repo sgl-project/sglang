@@ -22,9 +22,12 @@ use super::{
 };
 use crate::{
     app_context::AppContext,
-    core::WorkerRegistry,
+    config::types::RetryConfig,
+    core::{is_retryable_status, RetryExecutor, WorkerRegistry},
+    observability::metrics::{metrics_labels, Metrics},
     protocols::{
         chat::ChatCompletionRequest,
+        embedding::EmbeddingRequest,
         generate::GenerateRequest,
         responses::{ResponsesGetParams, ResponsesRequest},
     },
@@ -38,20 +41,19 @@ pub struct GrpcRouter {
     worker_registry: Arc<WorkerRegistry>,
     pipeline: RequestPipeline,
     harmony_pipeline: RequestPipeline,
+    embedding_pipeline: RequestPipeline, // New field for embedding pipeline
     shared_components: Arc<SharedComponents>,
     responses_context: responses::ResponsesContext,
     harmony_responses_context: responses::ResponsesContext,
+    retry_config: RetryConfig,
 }
 
 impl GrpcRouter {
     /// Create a new gRPC router
     pub async fn new(ctx: &Arc<AppContext>) -> Result<Self, String> {
-        // Extract necessary components from context
-        let tokenizer = ctx
-            .tokenizer
-            .as_ref()
-            .ok_or_else(|| "gRPC router requires tokenizer".to_string())?
-            .clone();
+        // Get tokenizer registry (no longer requires pre-loaded tokenizer)
+        let tokenizer_registry = ctx.tokenizer_registry.clone();
+
         let reasoning_parser_factory = ctx
             .reasoning_parser_factory
             .as_ref()
@@ -68,7 +70,7 @@ impl GrpcRouter {
 
         // Create shared components for pipeline
         let shared_components = Arc::new(SharedComponents {
-            tokenizer: tokenizer.clone(),
+            tokenizer_registry: tokenizer_registry.clone(),
             tool_parser_factory: tool_parser_factory.clone(),
             reasoning_parser_factory: reasoning_parser_factory.clone(),
         });
@@ -77,7 +79,6 @@ impl GrpcRouter {
         let pipeline = RequestPipeline::new_regular(
             worker_registry.clone(),
             _policy_registry.clone(),
-            tokenizer.clone(),
             tool_parser_factory.clone(),
             reasoning_parser_factory.clone(),
             ctx.configured_tool_parser.clone(),
@@ -88,12 +89,15 @@ impl GrpcRouter {
         let harmony_pipeline = RequestPipeline::new_harmony(
             worker_registry.clone(),
             _policy_registry.clone(),
-            tokenizer.clone(),
             tool_parser_factory.clone(),
             reasoning_parser_factory.clone(),
             ctx.configured_tool_parser.clone(),
             ctx.configured_reasoning_parser.clone(),
         );
+
+        // Create Embedding pipeline
+        let embedding_pipeline =
+            RequestPipeline::new_embeddings(worker_registry.clone(), _policy_registry.clone());
 
         // Extract shared dependencies for responses contexts
         let mcp_manager = ctx
@@ -123,9 +127,11 @@ impl GrpcRouter {
             worker_registry,
             pipeline,
             harmony_pipeline,
+            embedding_pipeline,
             shared_components,
             responses_context,
             harmony_responses_context,
+            retry_config: ctx.router_config.effective_retry_config(),
         })
     }
 
@@ -151,14 +157,45 @@ impl GrpcRouter {
             &self.pipeline
         };
 
-        pipeline
-            .execute_chat(
-                Arc::new(body.clone()),
-                headers.cloned(),
-                model_id.map(|s| s.to_string()),
-                self.shared_components.clone(),
-            )
-            .await
+        // Clone values needed for retry closure
+        let request = Arc::new(body.clone());
+        let headers_cloned = headers.cloned();
+        let model_id_cloned = model_id.map(|s| s.to_string());
+        let components = self.shared_components.clone();
+
+        RetryExecutor::execute_response_with_retry(
+            &self.retry_config,
+            // Operation: execute pipeline (creates fresh context each attempt)
+            |_attempt| {
+                let request = Arc::clone(&request);
+                let headers = headers_cloned.clone();
+                let model_id = model_id_cloned.clone();
+                let components = Arc::clone(&components);
+                async move {
+                    pipeline
+                        .execute_chat(request, headers, model_id, components)
+                        .await
+                }
+            },
+            // Should retry: check if status is retryable
+            |res, _attempt| is_retryable_status(res.status()),
+            // On backoff: record retry metrics
+            |delay, attempt| {
+                Metrics::record_worker_retry(
+                    metrics_labels::WORKER_REGULAR,
+                    metrics_labels::ENDPOINT_CHAT,
+                );
+                Metrics::record_worker_retry_backoff(attempt, delay);
+            },
+            // On exhausted: record exhaustion
+            || {
+                Metrics::record_worker_retries_exhausted(
+                    metrics_labels::WORKER_REGULAR,
+                    metrics_labels::ENDPOINT_CHAT,
+                );
+            },
+        )
+        .await
     }
 
     /// Main route_generate implementation
@@ -170,14 +207,46 @@ impl GrpcRouter {
     ) -> Response {
         debug!("Processing generate request for model: {:?}", model_id);
 
-        self.pipeline
-            .execute_generate(
-                Arc::new(body.clone()),
-                headers.cloned(),
-                model_id.map(|s| s.to_string()),
-                self.shared_components.clone(),
-            )
-            .await
+        // Clone values needed for retry closure
+        let request = Arc::new(body.clone());
+        let headers_cloned = headers.cloned();
+        let model_id_cloned = model_id.map(|s| s.to_string());
+        let components = self.shared_components.clone();
+        let pipeline = &self.pipeline;
+
+        RetryExecutor::execute_response_with_retry(
+            &self.retry_config,
+            // Operation: execute pipeline (creates fresh context each attempt)
+            |_attempt| {
+                let request = Arc::clone(&request);
+                let headers = headers_cloned.clone();
+                let model_id = model_id_cloned.clone();
+                let components = Arc::clone(&components);
+                async move {
+                    pipeline
+                        .execute_generate(request, headers, model_id, components)
+                        .await
+                }
+            },
+            // Should retry: check if status is retryable
+            |res, _attempt| is_retryable_status(res.status()),
+            // On backoff: record retry metrics
+            |delay, attempt| {
+                Metrics::record_worker_retry(
+                    metrics_labels::WORKER_REGULAR,
+                    metrics_labels::ENDPOINT_GENERATE,
+                );
+                Metrics::record_worker_retry_backoff(attempt, delay);
+            },
+            // On exhausted: record exhaustion
+            || {
+                Metrics::record_worker_retries_exhausted(
+                    metrics_labels::WORKER_REGULAR,
+                    metrics_labels::ENDPOINT_GENERATE,
+                );
+            },
+        )
+        .await
     }
 
     /// Main route_responses implementation
@@ -236,6 +305,25 @@ impl GrpcRouter {
             .await
         }
     }
+
+    /// Main route_embeddings implementation
+    async fn route_embeddings_impl(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &EmbeddingRequest,
+        model_id: Option<&str>,
+    ) -> Response {
+        debug!("Processing embedding request for model: {:?}", model_id);
+
+        self.embedding_pipeline
+            .execute_embeddings(
+                Arc::new(body.clone()),
+                headers.cloned(),
+                model_id.map(|s| s.to_string()),
+                self.shared_components.clone(),
+            )
+            .await
+    }
 }
 
 impl std::fmt::Debug for GrpcRouter {
@@ -291,6 +379,15 @@ impl RouterTrait for GrpcRouter {
 
     async fn cancel_response(&self, _headers: Option<&HeaderMap>, response_id: &str) -> Response {
         cancel_response_impl(&self.responses_context, response_id).await
+    }
+
+    async fn route_embeddings(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &EmbeddingRequest,
+        model_id: Option<&str>,
+    ) -> Response {
+        self.route_embeddings_impl(headers, body, model_id).await
     }
 
     fn router_type(&self) -> &'static str {

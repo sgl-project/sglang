@@ -7,7 +7,10 @@ use async_trait::async_trait;
 use axum::response::Response;
 use tracing::error;
 
-use super::{chat::ChatPreparationStage, generate::GeneratePreparationStage};
+use super::{
+    chat::ChatPreparationStage, embedding::preparation::EmbeddingPreparationStage,
+    generate::GeneratePreparationStage,
+};
 use crate::routers::{
     error as grpc_error,
     grpc::{
@@ -20,6 +23,7 @@ use crate::routers::{
 pub struct PreparationStage {
     chat_stage: ChatPreparationStage,
     generate_stage: GeneratePreparationStage,
+    embedding_stage: EmbeddingPreparationStage,
 }
 
 impl PreparationStage {
@@ -27,6 +31,7 @@ impl PreparationStage {
         Self {
             chat_stage: ChatPreparationStage,
             generate_stage: GeneratePreparationStage,
+            embedding_stage: EmbeddingPreparationStage::new(),
         }
     }
 }
@@ -43,6 +48,7 @@ impl PipelineStage for PreparationStage {
         match &ctx.input.request_type {
             RequestType::Chat(_) => self.chat_stage.execute(ctx).await,
             RequestType::Generate(_) => self.generate_stage.execute(ctx).await,
+            RequestType::Embedding(_) => self.embedding_stage.execute(ctx).await,
             RequestType::Responses(_) => {
                 error!(
                     function = "PreparationStage::execute",

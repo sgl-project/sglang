@@ -2,7 +2,9 @@
 
 use crate::{
     grpc_client::{SglangSchedulerClient, VllmEngineClient},
-    routers::grpc::proto_wrapper::{ProtoGenerateRequest, ProtoStream},
+    routers::grpc::proto_wrapper::{
+        ProtoEmbedRequest, ProtoEmbedResponse, ProtoGenerateRequest, ProtoStream,
+    },
 };
 
 /// Health check response (common across backends)
@@ -129,6 +131,20 @@ impl GrpcClient {
                 Ok(ProtoStream::Vllm(stream))
             }
             _ => panic!("Mismatched client and request types"),
+        }
+    }
+
+    /// Submit an embedding request
+    pub async fn embed(
+        &mut self,
+        req: ProtoEmbedRequest,
+    ) -> Result<ProtoEmbedResponse, Box<dyn std::error::Error + Send + Sync>> {
+        match (self, req) {
+            (Self::Sglang(client), ProtoEmbedRequest::Sglang(boxed_req)) => {
+                let resp = client.embed(*boxed_req).await?;
+                Ok(ProtoEmbedResponse::Sglang(resp))
+            }
+            _ => panic!("Mismatched client and request types or unsupported embedding backend"),
         }
     }
 }

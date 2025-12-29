@@ -33,10 +33,7 @@ from transformers import AutoConfig, PretrainedConfig
 from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_NAMES
 
 from sglang.multimodal_gen.runtime.loader.weight_utils import get_lock
-from sglang.multimodal_gen.runtime.utils.logging_utils import (
-    init_logger,
-    suppress_other_loggers,
-)
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 _CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = {
@@ -366,26 +363,55 @@ def maybe_download_model(
         Local path to the model
     """
 
-    # If the path exists locally, return it
+    def _verify_model_complete(path: str) -> bool:
+        """Check if model directory has required subdirectories."""
+        transformer_dir = os.path.join(path, "transformer")
+        vae_dir = os.path.join(path, "vae")
+        config_path = os.path.join(path, "model_index.json")
+        return (
+            os.path.exists(config_path)
+            and os.path.exists(transformer_dir)
+            and os.path.exists(vae_dir)
+        )
+
+    # If the path exists locally, verify it's complete
     if os.path.exists(model_name_or_path):
-        logger.info("Model already exists locally")
-        return model_name_or_path
+        if _verify_model_complete(model_name_or_path):
+            logger.info("Model already exists locally and is complete")
+            return model_name_or_path
+        else:
+            logger.warning(
+                "Local model at %s appears incomplete (missing transformer/ or vae/), "
+                "will attempt re-download",
+                model_name_or_path,
+            )
 
     # Otherwise, assume it's a HF Hub model ID and try to download it
     try:
         logger.info(
             "Downloading model snapshot from HF Hub for %s...", model_name_or_path
         )
-        with (
-            suppress_other_loggers(not_suppress_on_main_rank=False),
-            get_lock(model_name_or_path).acquire(poll_interval=2),
-        ):
+        with get_lock(model_name_or_path).acquire(poll_interval=2):
             local_path = snapshot_download(
                 repo_id=model_name_or_path,
                 ignore_patterns=["*.onnx", "*.msgpack"],
                 local_dir=local_dir,
             )
-            logger.info("Downloaded model to %s", local_path)
+        # Verify downloaded model is complete
+        if not _verify_model_complete(local_path):
+            logger.warning(
+                "Downloaded model at %s is incomplete, retrying with force_download=True",
+                local_path,
+            )
+            with get_lock(model_name_or_path).acquire(poll_interval=2):
+                local_path = snapshot_download(
+                    repo_id=model_name_or_path,
+                    ignore_patterns=["*.onnx", "*.msgpack"],
+                    local_dir=local_dir,
+                    force_download=True,
+                )
+
+        logger.info("Downloaded model to %s", local_path)
         return str(local_path)
     except Exception as e:
         raise ValueError(
