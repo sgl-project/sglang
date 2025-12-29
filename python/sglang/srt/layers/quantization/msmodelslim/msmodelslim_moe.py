@@ -81,11 +81,7 @@ class ModelSlimW4A8Int8MoE(ModelSlimMoEMethod):
         self.quant_config = quant_config
         self.group_size = 0
         self.tp_size = 1
-        self.activation_use_clip = (
-            self.quant_config.get("config_groups", {})
-            .get("group_1", {})
-            .get("activation_use_clip", False)
-        )
+        self.activation_use_clip = False
         self.kernel = NPUW4A8Int8DynamicMoEMethod()
 
     def create_weights(
@@ -181,61 +177,6 @@ class ModelSlimW4A8Int8MoE(ModelSlimMoEMethod):
                 intermediate_size_per_partition,
                 extra_weight_attrs,
             )
-
-    def _init_activation_clip_params(
-        self,
-        layer: torch.nn.Module,
-        num_experts: int,
-        hidden_size: int,
-        intermediate_size_per_partition: int,
-        extra_weight_attrs: dict,
-    ) -> None:
-        """
-        Initializes bias and alpha parameters for quantization schemes that use activation clipping.
-
-        This helper registers `w13_bias`, `w2_bias`, and `w2_alpha`, which are required to
-        shift and scale the activations or outputs to compensate for the precision loss
-        introduced by clamping activations.
-        """
-        w13_bias = torch.nn.Parameter(
-            torch.ones(
-                num_experts, 2 * intermediate_size_per_partition, dtype=torch.float
-            ),
-            requires_grad=False,
-        )
-        layer.register_parameter("w13_bias", w13_bias)
-        set_weight_attrs(w13_bias, extra_weight_attrs)
-
-        w2_bias = torch.nn.Parameter(
-            torch.ones(num_experts, hidden_size, dtype=torch.float),
-            requires_grad=False,
-        )
-        layer.register_parameter("w2_bias", w2_bias)
-        set_weight_attrs(w2_bias, extra_weight_attrs)
-
-        w2_alpha = torch.nn.Parameter(
-            torch.ones(num_experts, dtype=torch.float), requires_grad=False
-        )
-        layer.register_parameter("w2_alpha", w2_alpha)
-        set_weight_attrs(w2_alpha, extra_weight_attrs)
-
-    def _init_extra_scale_params(
-        self,
-        layer: torch.nn.Module,
-        num_experts: int,
-        hidden_size: int,
-        intermediate_size_per_partition: int,
-        extra_weight_attrs: dict,
-    ) -> None:
-        """
-        Initializes additional scaling, offset, and bias parameters for quantization schemes without activation clipping.
-
-        This method registers the following parameters:
-        1. Scale Biases: `w13_scale_bias` and `w2_scale_bias`.
-        2. Secondary Quantization Params (initialized only for grouped quantization):
-            `w13_weight_scale_second`, `w13_weight_offset_second`,
-            `w2_weight_scale_second`, and `w2_weight_offset_second`.
-        """
         if not self.is_per_channel_weight:
             w13_weight_scale_second = torch.nn.Parameter(
                 torch.empty(
@@ -306,7 +247,7 @@ class ModelSlimW4A8Int8MoE(ModelSlimMoEMethod):
         set_weight_attrs(w2_scale_bias, extra_weight_attrs)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        self.kernel.process_weights_after_loading(layer, self.is_per_channel_weight)
+        self.kernel.process_weights_after_loading(layer, self.is_per_channel_weight, self.activation_use_clip)
 
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: "MoeRunnerConfig"
