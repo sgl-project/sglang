@@ -60,9 +60,10 @@ impl PipelineStage for EmbeddingPreparationStage {
         let tokenizer =
             utils::resolve_tokenizer(ctx, "EmbeddingPreparationStage::execute").map_err(|e| *e)?;
 
-        // Tokenize
+        // Tokenize with special tokens (BOS/EOS) for embeddings
+        // This matches Python's transformers behavior which reads add_bos_token/add_eos_token from tokenizer_config.json
         let token_ids = tokenizer
-            .encode(&text)
+            .encode(&text, true)
             .map_err(|e| {
                 error!(
                     function = "EmbeddingPreparationStage::execute",
