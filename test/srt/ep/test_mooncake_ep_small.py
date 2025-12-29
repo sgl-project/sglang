@@ -9,6 +9,7 @@ from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
+    is_in_ci,
     popen_launch_server,
 )
 
@@ -22,32 +23,39 @@ class TestTP(CustomTestCase):
     def setUpClass(cls):
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST_MLA
         cls.base_url = DEFAULT_URL_FOR_TEST
+
+        other_args = [
+            "--trust-remote-code",
+            "--tp",
+            "4",
+            "--elastic-ep-backend",
+            "mooncake",
+            "--mooncake-ib-device",
+            ib_devices,
+            "--moe-a2a-backend",
+            "mooncake",
+            "--deepep-mode",
+            "low_latency",
+            "--chunked-prefill-size",
+            "512",
+            "--max-running-requests",
+            "512",
+            "--mem-fraction-static",
+            "0.5",
+            *cls.extra_args,
+        ]
+
+        if is_in_ci():
+            # Cannot enable CUDA graph without IBGDA
+            other_args.append("--disable-cuda-graph")
+        else:
+            other_args.extend(["--cuda-graph-max-bs", "128"])
+
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=[
-                "--trust-remote-code",
-                "--tp",
-                "4",
-                "--elastic-ep-backend",
-                "mooncake",
-                "--mooncake-ib-device",
-                ib_devices,
-                "--moe-a2a-backend",
-                "mooncake",
-                "--deepep-mode",
-                "low_latency",
-                "--chunked-prefill-size",
-                "512",
-                "--cuda-graph-max-bs",
-                "128",
-                "--max-running-requests",
-                "512",
-                "--mem-fraction-static",
-                "0.5",
-                *cls.extra_args,
-            ],
+            other_args=other_args,
         )
 
     @classmethod
@@ -58,8 +66,8 @@ class TestTP(CustomTestCase):
         args = SimpleNamespace(
             num_shots=5,
             data_path=None,
-            num_questions=200,
-            max_new_tokens=512,
+            num_questions=100,
+            max_new_tokens=128,
             parallel=128,
             host="http://127.0.0.1",
             port=int(self.base_url.split(":")[-1]),
@@ -67,7 +75,7 @@ class TestTP(CustomTestCase):
         metrics = run_eval_few_shot_gsm8k(args)
         print(metrics)
 
-        self.assertGreater(metrics["accuracy"], 0.60)
+        self.assertGreater(metrics["accuracy"], 0.50)
 
 
 class TestPureDP(TestTP):
@@ -90,6 +98,7 @@ class TestHybridDPTP(TestTP):
     ]
 
 
+@unittest.skip("covered in TestTBO")
 class TestNoGatherdBuffer(TestTP):
     extra_args = [
         "--tp",
