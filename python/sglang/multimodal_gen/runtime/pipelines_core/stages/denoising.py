@@ -726,20 +726,11 @@ class DenoisingStage(PipelineStage):
 
         # reset offload manager with prefetching first layer for next forward
         offload_mgr: Optional[LayerwiseOffloadManager] = None
-        if (
-            offload_mgr := getattr(self.transformer, "_layerwise_offload_manager", None)
-        ) is not None:
-            offload_mgr.prepare_for_denoise()
-        if (
-            self.transformer_2 is not None
-            and (
-                offload_mgr := getattr(
-                    self.transformer_2, "_layerwise_offload_manager", None
-                )
-            )
-            is not None
-        ):
-            offload_mgr.prepare_for_denoise()
+        for transformer in filter(None, [self.transformer, self.transformer_2]):
+            if (
+                offload_mgr := getattr(transformer, "_layerwise_offload_manager", None)
+            ) is not None:
+                offload_mgr.prepare_for_denoise()
 
     def _preprocess_sp_latents(self, batch: Req, server_args: ServerArgs):
         """Shard latents for Sequence Parallelism if applicable."""
