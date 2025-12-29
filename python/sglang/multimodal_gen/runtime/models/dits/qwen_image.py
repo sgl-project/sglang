@@ -554,16 +554,16 @@ class QwenImageCrossAttention(nn.Module):
         # Apply QK normalization
         if self.qk_norm:
             img_query, img_key = apply_qk_norm(
-                q=img_query.contiguous(),
-                k=img_key.contiguous(),
+                q=img_query,
+                k=img_key,
                 q_norm=self.norm_q,
                 k_norm=self.norm_k,
                 head_dim=img_query.shape[-1],
                 allow_inplace=True,
             )
             txt_query, txt_key = apply_qk_norm(
-                q=txt_query.contiguous(),
-                k=txt_key.contiguous(),
+                q=txt_query,
+                k=txt_key,
                 q_norm=self.norm_added_q,
                 k_norm=self.norm_added_k,
                 head_dim=txt_query.shape[-1],
