@@ -54,9 +54,11 @@ pub mod router_ids {
 
     pub const HTTP_REGULAR: RouterId = RouterId::new("http-regular");
     pub const HTTP_PD: RouterId = RouterId::new("http-pd");
+    pub const HTTP_EPD: RouterId = RouterId::new("http-epd");
     pub const HTTP_OPENAI: RouterId = RouterId::new("http-openai");
     pub const GRPC_REGULAR: RouterId = RouterId::new("grpc-regular");
     pub const GRPC_PD: RouterId = RouterId::new("grpc-pd");
+    pub const GRPC_EPD: RouterId = RouterId::new("grpc-epd");
 }
 
 pub struct RouterManager {
@@ -193,9 +195,13 @@ impl RouterManager {
         match (connection_mode, routing_mode) {
             (ConnectionMode::Http, RoutingMode::Regular { .. }) => router_ids::HTTP_REGULAR,
             (ConnectionMode::Http, RoutingMode::PrefillDecode { .. }) => router_ids::HTTP_PD,
+            (ConnectionMode::Http, RoutingMode::EncodePrefillDecode { .. }) => router_ids::HTTP_EPD,
             (ConnectionMode::Http, RoutingMode::OpenAI { .. }) => router_ids::HTTP_OPENAI,
             (ConnectionMode::Grpc { .. }, RoutingMode::Regular { .. }) => router_ids::GRPC_REGULAR,
             (ConnectionMode::Grpc { .. }, RoutingMode::PrefillDecode { .. }) => router_ids::GRPC_PD,
+            (ConnectionMode::Grpc { .. }, RoutingMode::EncodePrefillDecode { .. }) => {
+                router_ids::GRPC_EPD
+            }
             (ConnectionMode::Grpc { .. }, RoutingMode::OpenAI { .. }) => router_ids::GRPC_REGULAR,
         }
     }
