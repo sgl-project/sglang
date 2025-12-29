@@ -22,7 +22,7 @@ from sglang.multimodal_gen.configs.models.vaes.flux import Flux2VAEConfig
 from sglang.multimodal_gen.runtime.models.vaes.common import ParallelTiledVAE
 
 
-class AutoencoderKLFlux2(nn.Module, ParallelTiledVAE):
+class AutoencoderKLFlux2(ParallelTiledVAE):
     r"""
     A VAE model with KL loss for encoding images into latents and decoding latent representations into images.
 
