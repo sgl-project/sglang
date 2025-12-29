@@ -2041,8 +2041,9 @@ def dump_metric(metric_name: str, value: Any, labels: Optional[dict] = None):
             labels_str = ""
         print(f"[METRIC] {metric_name}={converted_value}{labels_str}")
 
-    except Exception:
+    except Exception as e:
         # Silent failure - never break tests
+        logging.warning(f"sglang.test.dump_metric: failed to dump metric '{metric_name}': {e}", exc_info=True)
         pass
 
 
