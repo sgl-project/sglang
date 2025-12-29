@@ -125,14 +125,6 @@ class CompressedTensorsMoEMethod(FusedMoEMethodBase):
                         "Using NPUCompressedTensorsW4A16Int4DynamicMoEMethod"
                     )
                     return NPUCompressedTensorsW4A16Int4DynamicMoEMethod(quant_config)
-                elif (
-                    quant_config._is_dynamic_token_w4(weight_quant, input_quant)
-                    and input_quant is not None
-                ):
-                    logger.info_once(
-                        "Using NPUCompressedTensorsW4A8Int8DynamicMoEMethod"
-                    )
-                    return NPUCompressedTensorsW4A8Int8DynamicMoEMethod(quant_config)
         elif quant_config._is_fp4a4_nvfp4(weight_quant, input_quant):
             logger.info_once("Using CompressedTensorsW4A4Nvfp4MoEMethod")
             return CompressedTensorsW4A4Nvfp4MoEMethod(quant_config)
@@ -146,6 +138,17 @@ class CompressedTensorsMoEMethod(FusedMoEMethodBase):
             else:
                 raise NotImplementedError(
                     f"The W8A8Int8 Fused MoE scheme is implemented only for NPU for now."
+                )
+        elif:
+            # TODO add w4a8 verification method
+            if _is_npu:
+                logger.info_once(
+                    "Using NPUCompressedTensorsW4A8Int8DynamicMoEMethod"
+                )
+                return NPUCompressedTensorsW4A8Int8DynamicMoEMethod(quant_config)
+            else:
+                raise NotImplementedError(
+                    f"The W4A8Int8 Fused MoE scheme is implemented only for NPU for now."
                 )
         else:
             raise RuntimeError(
