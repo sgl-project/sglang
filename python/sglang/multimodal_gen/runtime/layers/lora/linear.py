@@ -245,17 +245,22 @@ class BaseLayerWithLoRA(nn.Module):
         A: torch.Tensor,
         B: torch.Tensor,
         lora_path: str | None = None,
+        strength: float = 1.0,
     ) -> None:
         self.lora_A = torch.nn.Parameter(
             A
         )  # share storage with weights in the pipeline
         self.lora_B = torch.nn.Parameter(B)
         self.disable_lora = False
+        self.strength = strength
         self.merge_lora_weights()
         self.lora_path = lora_path
 
     @torch.no_grad()
-    def merge_lora_weights(self) -> None:
+    def merge_lora_weights(self, strength: float | None = None) -> None:
+        if strength is not None:
+            self.strength = strength
+
         if self.disable_lora:
             return
 
@@ -280,9 +285,14 @@ class BaseLayerWithLoRA(nn.Module):
             data = self.base_layer.weight.data.to(
                 get_local_torch_device()
             ).full_tensor()
-            data += self.slice_lora_b_weights(self.lora_B).to(
+            lora_delta = self.slice_lora_b_weights(self.lora_B).to(
                 data
             ) @ self.slice_lora_a_weights(self.lora_A).to(data)
+            # Apply lora_alpha / lora_rank scaling for consistency with forward()
+            if self.lora_alpha is not None and self.lora_rank is not None:
+                if self.lora_alpha != self.lora_rank:
+                    lora_delta = lora_delta * (self.lora_alpha / self.lora_rank)
+            data += self.strength * lora_delta
             unsharded_base_layer.weight = nn.Parameter(data.to(current_device))
             if isinstance(getattr(self.base_layer, "bias", None), DTensor):
                 unsharded_base_layer.bias = nn.Parameter(
@@ -305,9 +315,14 @@ class BaseLayerWithLoRA(nn.Module):
         else:
             current_device = self.base_layer.weight.data.device
             data = self.base_layer.weight.data.to(get_local_torch_device())
-            data += self.slice_lora_b_weights(
+            lora_delta = self.slice_lora_b_weights(
                 self.lora_B.to(data)
             ) @ self.slice_lora_a_weights(self.lora_A.to(data))
+            # Apply lora_alpha / lora_rank scaling for consistency with forward()
+            if self.lora_alpha is not None and self.lora_rank is not None:
+                if self.lora_alpha != self.lora_rank:
+                    lora_delta = lora_delta * (self.lora_alpha / self.lora_rank)
+            data += self.strength * lora_delta
             self.base_layer.weight.data = data.to(current_device, non_blocking=True)
 
         self.merged = True
@@ -472,9 +487,6 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
             self.base_layer, input_parallel
         )
 
-        if self.set_lora:
-            output_parallel = self.apply_lora(output_parallel, input_parallel)
-
         if self.base_layer.reduce_results and self.base_layer.tp_size > 1:
             output_ = tensor_model_parallel_all_reduce(output_parallel)
         else:
@@ -535,6 +547,7 @@ class LinearWithLoRA(BaseLayerWithLoRA):
                 delta = delta * (
                     self.lora_alpha / self.lora_rank  # type: ignore
                 )  # type: ignore
+            delta = delta * self.strength
             # nn.Linear.forward() returns a single tensor, not a tuple
             out = self.base_layer(x)
             return out + delta

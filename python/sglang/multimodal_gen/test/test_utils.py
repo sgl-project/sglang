@@ -12,6 +12,7 @@ import unittest
 from pathlib import Path
 from typing import Optional
 
+import cv2
 from PIL import Image
 
 from sglang.multimodal_gen.configs.sample.sampling_params import DataType
@@ -90,9 +91,11 @@ def get_dynamic_server_port() -> int:
     return base_port + 1000
 
 
-def is_mp4(data):
-    idx = data.find(b"ftyp")
-    return 0 <= idx <= 32
+def is_mp4(data: bytes) -> bool:
+    """Check if data represents a valid MP4 file by magic bytes."""
+    if len(data) < 8:
+        return False
+    return data[4:8] == b"ftyp"
 
 
 def is_jpeg(data: bytes) -> bool:
@@ -103,6 +106,30 @@ def is_jpeg(data: bytes) -> bool:
 def is_png(data):
     # PNG files start with: 89 50 4E 47 0D 0A 1A 0A
     return data.startswith(b"\x89PNG\r\n\x1a\n")
+
+
+def is_webp(data: bytes) -> bool:
+    # WebP files start with: RIFF....WEBP
+    return data[:4] == b"RIFF" and data[8:12] == b"WEBP"
+
+
+def get_expected_image_format(
+    output_format: str | None = None,
+    background: str | None = None,
+) -> str:
+    """Infer expected image format based on request parameters.
+    Args:
+        output_format: The output_format parameter from the request (png/jpeg/webp/jpg)
+        background: The background parameter from the request (transparent/opaque/auto)
+    Returns:
+        Expected file extension: "jpg", "png", or "webp"
+    """
+    fmt = (output_format or "").lower()
+    if fmt in {"png", "webp", "jpeg", "jpg"}:
+        return "jpg" if fmt == "jpeg" else fmt
+    if (background or "auto").lower() == "transparent":
+        return "png"
+    return "jpg"  # Default
 
 
 def wait_for_port(host="127.0.0.1", port=30010, deadline=300.0, interval=0.5):
@@ -171,10 +198,9 @@ def read_perf_logs(log_path: Path) -> list[RequestPerfRecord]:
 
 def wait_for_req_perf_record(
     request_id: str,
-    prev_len: int,
     log_path: Path,
     timeout: float = 30.0,
-) -> tuple[RequestPerfRecord | None, int]:
+) -> RequestPerfRecord | None:
     """
     the stage metrics of this request should be in the performance_log file with {request-id}
     """
@@ -182,16 +208,14 @@ def wait_for_req_perf_record(
     deadline = time.time() + timeout
     while time.time() < deadline:
         records = read_perf_logs(log_path)
-        if len(records) >= prev_len + 1:
-            # FIXME: unable to get rid from openai apis, this is a hack. we should compare rid
-            # potential error when there are multiple servers
-            return records[-1], len(records)
+        for record in records:
+            if record.request_id == request_id:
+                return record
 
         time.sleep(0.5)
 
     if os.environ.get("SGLANG_GEN_BASELINE", "0") == "1":
-        records = read_perf_logs(log_path)
-        return None, len(records)
+        return None
 
     logger.error(f"record: {records}")
     raise AssertionError(f"Timeout waiting for stage metrics for request {request_id} ")
@@ -206,22 +230,173 @@ def validate_image(b64_json: str) -> None:
 def validate_video(b64_json: str) -> None:
     """Decode and validate that video is a valid format."""
     video_bytes = base64.b64decode(b64_json)
-    is_mp4 = (
-        video_bytes[:4] == b"\x00\x00\x00\x18" or video_bytes[:4] == b"\x00\x00\x00\x1c"
-    )
     is_webm = video_bytes[:4] == b"\x1a\x45\xdf\xa3"
-    assert is_mp4 or is_webm, "Video must be MP4 or WebM"
+    assert is_mp4(video_bytes) or is_webm, "Video must be MP4 or WebM"
 
 
 def validate_openai_video(video_bytes: bytes) -> None:
     """Validate that video is MP4 or WebM by magic bytes."""
-    is_mp4 = (
-        video_bytes.startswith(b"\x00\x00\x00\x18")
-        or video_bytes.startswith(b"\x00\x00\x00\x1c")
-        or video_bytes[4:8] == b"ftyp"
-    )
     is_webm = video_bytes.startswith(b"\x1a\x45\xdf\xa3")
-    assert is_mp4 or is_webm, "Video must be MP4 or WebM"
+    assert is_mp4(video_bytes) or is_webm, "Video must be MP4 or WebM"
+
+
+def validate_image_file(
+    file_path: str,
+    expected_filename: str,
+    expected_width: int | None = None,
+    expected_height: int | None = None,
+    output_format: str | None = None,
+    background: str | None = None,
+) -> None:
+    """Validate image output file: existence, extension, size, filename, format, dimensions."""
+    # Infer expected format from request parameters
+    expected_ext = get_expected_image_format(output_format, background)
+
+    # 1. File existence
+    assert os.path.exists(file_path), f"Image file does not exist: {file_path}"
+
+    # 2. Extension check
+    assert file_path.endswith(
+        f".{expected_ext}"
+    ), f"Expected .{expected_ext} extension, got: {file_path}"
+
+    # 3. File size > 0
+    file_size = os.path.getsize(file_path)
+    assert file_size > 0, f"Image file is empty: {file_path}"
+
+    # 4. Filename validation
+    actual_filename = os.path.basename(file_path)
+    assert (
+        actual_filename == expected_filename
+    ), f"Filename mismatch: expected '{expected_filename}', got '{actual_filename}'"
+
+    # 5. Image format validation (magic bytes check based on expected format)
+    with open(file_path, "rb") as f:
+        header = f.read(12)  # Read enough bytes for webp detection
+        if expected_ext == "png":
+            assert is_png(header), f"File is not a valid PNG: {file_path}"
+        elif expected_ext == "jpg":
+            assert is_jpeg(header), f"File is not a valid JPEG: {file_path}"
+        elif expected_ext == "webp":
+            assert is_webp(header), f"File is not a valid WebP: {file_path}"
+
+    # 6. Image dimension validation (reuse PIL)
+    if expected_width is not None and expected_height is not None:
+        with Image.open(file_path) as img:
+            width, height = img.size
+            assert (
+                width == expected_width
+            ), f"Width mismatch: expected {expected_width}, got {width}"
+            assert (
+                height == expected_height
+            ), f"Height mismatch: expected {expected_height}, got {height}"
+
+
+def _get_video_dimensions_from_metadata(
+    cap: cv2.VideoCapture,
+) -> tuple[int, int] | None:
+    """Get video dimensions from metadata properties.
+
+    Args:
+        cap: OpenCV VideoCapture object
+
+    Returns:
+        Tuple of (width, height) if successful, None if metadata is invalid
+    """
+    width = cap.get(cv2.CAP_PROP_FRAME_WIDTH)
+    height = cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
+
+    if width == 0 or height == 0:
+        return None
+
+    return (int(width), int(height))
+
+
+def _get_video_dimensions_from_frame(cap: cv2.VideoCapture) -> tuple[int, int]:
+    """Get video dimensions by reading the first frame.
+
+    Args:
+        cap: OpenCV VideoCapture object
+
+    Returns:
+        Tuple of (width, height)
+
+    Raises:
+        ValueError: If unable to read a frame from the video
+    """
+    ret, frame = cap.read()
+    if not ret or frame is None:
+        raise ValueError("Unable to read video frame to get dimensions")
+
+    # frame.shape is (height, width, channels)
+    height, width = frame.shape[:2]
+    return (int(width), int(height))
+
+
+def get_video_dimensions(file_path: str) -> tuple[int, int]:
+    """Get video dimensions (width, height) from a video file.
+
+    Tries to get dimensions from metadata first, falls back to reading first frame.
+
+    Args:
+        file_path: Path to the video file
+
+    Returns:
+        Tuple of (width, height)
+
+    Raises:
+        ValueError: If unable to get video dimensions
+    """
+    cap = cv2.VideoCapture(file_path)
+    try:
+        # Try to get dimensions from metadata first
+        dimensions = _get_video_dimensions_from_metadata(cap)
+        if dimensions is not None:
+            return dimensions
+
+        # Fall back to reading first frame
+        return _get_video_dimensions_from_frame(cap)
+    finally:
+        cap.release()
+
+
+def validate_video_file(
+    file_path: str,
+    expected_filename: str,
+    expected_width: int | None = None,
+    expected_height: int | None = None,
+) -> None:
+    """Validate video output file: existence, extension, size, filename, format, dimensions."""
+    # 1. File existence
+    assert os.path.exists(file_path), f"Video file does not exist: {file_path}"
+
+    # 2. Extension check
+    assert file_path.endswith(".mp4"), f"Expected .mp4 extension, got: {file_path}"
+
+    # 3. File size > 0
+    file_size = os.path.getsize(file_path)
+    assert file_size > 0, f"Video file is empty: {file_path}"
+
+    # 4. Filename validation
+    actual_filename = os.path.basename(file_path)
+    assert (
+        actual_filename == expected_filename
+    ), f"Filename mismatch: expected '{expected_filename}', got '{actual_filename}'"
+
+    # 5. Video format validation (reuse is_mp4)
+    with open(file_path, "rb") as f:
+        header = f.read(32)
+        assert is_mp4(header), f"File is not a valid MP4: {file_path}"
+
+    # 6. Video dimension validation (using OpenCV)
+    if expected_width is not None and expected_height is not None:
+        actual_width, actual_height = get_video_dimensions(file_path)
+        assert (
+            actual_width == expected_width
+        ), f"Video width mismatch: expected {expected_width}, got {actual_width}"
+        assert (
+            actual_height == expected_height
+        ), f"Video height mismatch: expected {expected_height}, got {actual_height}"
 
 
 @dataclasses.dataclass

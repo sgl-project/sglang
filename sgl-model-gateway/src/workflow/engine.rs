@@ -5,7 +5,7 @@
 //! wait for all dependencies to complete successfully.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     sync::Arc,
     time::Duration,
 };
@@ -53,7 +53,18 @@ impl StepTracker {
     }
 }
 
-/// Linear backoff implementation that increases delay by a fixed amount each retry
+/// Fixed backoff that returns the same delay every time
+struct FixedBackoff(Duration);
+
+impl Backoff for FixedBackoff {
+    fn reset(&mut self) {}
+
+    fn next_backoff(&mut self) -> Option<Duration> {
+        Some(self.0)
+    }
+}
+
+/// Linear backoff that increases delay by a fixed amount each retry
 struct LinearBackoff {
     current: Duration,
     increment: Duration,
@@ -132,8 +143,8 @@ impl WorkflowEngine {
     }
 
     /// Register a workflow definition
-    pub fn register_workflow(&self, definition: WorkflowDefinition) -> Result<(), String> {
-        // Validate DAG once at registration, not on every execution
+    pub fn register_workflow(&self, mut definition: WorkflowDefinition) -> Result<(), String> {
+        // Validate DAG and build dependency graph once at registration
         definition.validate()?;
 
         let id = definition.id.clone();
@@ -203,6 +214,9 @@ impl WorkflowEngine {
     }
 
     /// Execute a workflow with DAG-based parallel execution
+    ///
+    /// Uses event-driven readiness: instead of scanning all steps each iteration,
+    /// we only check steps whose dependencies just completed.
     async fn execute_workflow(
         &self,
         instance_id: WorkflowInstanceId,
@@ -214,6 +228,13 @@ impl WorkflowEngine {
         let tracker: Arc<RwLock<StepTracker>> = Arc::new(RwLock::new(StepTracker::default()));
         let (tx, mut rx) = mpsc::channel::<(StepId, StepResult)>(step_count.max(1));
 
+        // Initialize with steps that have no dependencies (O(1) lookup)
+        let mut pending_check: VecDeque<usize> = definition
+            .get_initial_step_indices()
+            .iter()
+            .copied()
+            .collect();
+
         loop {
             if self.state_store.is_cancelled(instance_id)? {
                 self.event_bus
@@ -222,32 +243,22 @@ impl WorkflowEngine {
                 return Ok(());
             }
 
-            let (ready_step_indices, total_processed, running_count, blocked_by_failure) = {
+            // Find ready steps from pending_check (not all steps)
+            let (ready_step_indices, total_processed, running_count) = {
                 let t = tracker.read();
 
-                let ready: Vec<usize> = definition
-                    .steps
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, step)| {
+                // Only check steps in pending_check, not all steps
+                let ready: Vec<usize> = pending_check
+                    .drain(..)
+                    .filter(|&idx| {
+                        let step = &definition.steps[idx];
                         t.is_step_processable(&step.id)
                             && t.are_dependencies_satisfied(&step.depends_on)
                             && !t.has_failed_dependency(&step.depends_on)
                     })
-                    .map(|(i, _)| i)
                     .collect();
 
-                let processed = t.total_processed();
-                let running = t.running.len();
-
-                // Check for blocked steps only if needed
-                let blocked = ready.is_empty()
-                    && running == 0
-                    && definition.steps.iter().any(|step| {
-                        t.is_step_processable(&step.id) && t.has_failed_dependency(&step.depends_on)
-                    });
-
-                (ready, processed, running, blocked)
+                (ready, t.total_processed(), t.running.len())
             };
 
             // Check if we're done
@@ -255,9 +266,10 @@ impl WorkflowEngine {
                 break;
             }
 
-            // Handle blocked workflow
-            if ready_step_indices.is_empty() && running_count == 0 {
-                let error_message = if blocked_by_failure {
+            // Handle blocked workflow (no ready steps, none running, but work remains)
+            if ready_step_indices.is_empty() && running_count == 0 && pending_check.is_empty() {
+                let failed_step = tracker.read().failed.iter().next().cloned();
+                let error_message = if failed_step.is_some() {
                     "Workflow failed due to step dependency failure".to_string()
                 } else {
                     "Workflow deadlocked: no steps ready and none running. This may indicate a scheduler bug.".to_string()
@@ -266,8 +278,6 @@ impl WorkflowEngine {
                 self.state_store.update(instance_id, |s| {
                     s.status = WorkflowStatus::Failed;
                 })?;
-
-                let failed_step = tracker.read().failed.iter().next().cloned();
                 self.event_bus
                     .publish(WorkflowEvent::WorkflowFailed {
                         instance_id,
@@ -345,6 +355,14 @@ impl WorkflowEngine {
                         result = ?result,
                         "Step completed"
                     );
+
+                    // Add dependents of completed step to pending_check (O(1) lookup)
+                    // Only if the step succeeded or was skipped (not failed)
+                    if matches!(result, StepResult::Success | StepResult::Skip) {
+                        for &dep_idx in definition.get_dependent_indices(&completed_step_id) {
+                            pending_check.push_back(dep_idx);
+                        }
+                    }
                 }
             }
         }
@@ -546,19 +564,9 @@ impl WorkflowEngine {
         }
     }
 
-    /// Create a backoff instance from strategy
     fn create_backoff(strategy: &BackoffStrategy) -> Box<dyn Backoff + Send> {
         match strategy {
-            BackoffStrategy::Fixed(duration) => {
-                // For fixed backoff, use exponential with multiplier 1.0
-                let backoff = ExponentialBackoffBuilder::new()
-                    .with_initial_interval(*duration)
-                    .with_multiplier(1.0)
-                    .with_max_interval(*duration)
-                    .with_max_elapsed_time(None)
-                    .build();
-                Box::new(backoff)
-            }
+            BackoffStrategy::Fixed(duration) => Box::new(FixedBackoff(*duration)),
             BackoffStrategy::Exponential { base, max } => {
                 let backoff = ExponentialBackoffBuilder::new()
                     .with_initial_interval(*base)
@@ -568,7 +576,6 @@ impl WorkflowEngine {
                 Box::new(backoff)
             }
             BackoffStrategy::Linear { increment, max } => {
-                // Use proper linear backoff: increment, 2*increment, 3*increment, ...
                 Box::new(LinearBackoff::new(*increment, *max))
             }
         }

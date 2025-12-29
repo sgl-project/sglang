@@ -3,7 +3,7 @@
 
 You can install SGLang using any of the methods below. Please go through `System Settings` section to ensure the clusters are roaring at max performance. Feel free to leave an issue [here at sglang](https://github.com/sgl-project/sglang/issues) if you encounter any issues or have any problems.
 
-## Installing SGLang
+## Preparing the Running Environment
 
 ### Method 1: Installing from source with prerequisites
 
@@ -98,11 +98,17 @@ pip install -e python[srt_npu]
 ```
 
 ### Method 2: Using docker
-
-__Notice:__ `--privileged` and `--network=host` are required by RDMA, which is typically needed by Ascend NPU clusters.
-
-__Notice:__ The following docker command is based on Atlas 800I A3 machines. If you are using Atlas 800I A2, make sure only `davinci[0-7]` are mapped into container.
-
+#### Obtain Image
+You can download the SGLang image or build an image based on Dockerfile to obtain the Ascend NPU image.
+1. Download SGLang image
+```angular2html
+dockerhub: docker.io/lmsysorg/sglang:$tag
+# Main-based tag, change main to specific version like v0.5.6,
+# you can get image for specific version
+Atlas 800I A3 : {main}-cann8.3.rc2-a3
+Atlas 800I A2: {main}-cann8.3.rc2-910b
+```
+2. Build an image based on Dockerfile
 ```shell
 # Clone the SGLang repository
 git clone https://github.com/sgl-project/sglang.git
@@ -110,6 +116,14 @@ cd sglang/docker
 
 # Build the docker image
 docker build -t <image_name> -f npu.Dockerfile .
+```
+
+#### Create Docker
+__Notice:__ `--privileged` and `--network=host` are required by RDMA, which is typically needed by Ascend NPU clusters.
+
+__Notice:__ The following docker command is based on Atlas 800I A3 machines. If you are using Atlas 800I A2, make sure only `davinci[0-7]` are mapped into container.
+
+```shell
 
 alias drun='docker run -it --rm --privileged --network=host --ipc=host --shm-size=16g \
     --device=/dev/davinci0 --device=/dev/davinci1 --device=/dev/davinci2 --device=/dev/davinci3 \
@@ -122,6 +136,7 @@ alias drun='docker run -it --rm --privileged --network=host --ipc=host --shm-siz
     --volume /etc/ascend_install.info:/etc/ascend_install.info \
     --volume /var/queue_schedule:/var/queue_schedule --volume ~/.cache/:/root/.cache/'
 
+# Add HF_TOKEN env for download model by SGLang
 drun --env "HF_TOKEN=<secret>" \
     <image_name> \
     python3 -m sglang.launch_server --model-path meta-llama/Llama-3.1-8B-Instruct --attention-backend ascend --host 0.0.0.0 --port 30000
@@ -156,4 +171,77 @@ sudo sysctl -w vm.swappiness=10
 
 # Check
 cat /proc/sys/vm/swappiness # shows 10
+```
+
+## Running SGLang Service
+### Running Service For Large Language Models
+#### PD Mixed Scene
+```shell
+python3 -m sglang.launch_server --model-path meta-llama/Llama-3.1-8B-Instruct --attention-backend ascend --host 0.0.0.0 --port 30000
+```
+#### PD Separation Scene
+Launch prefill server
+```shell
+export SGLANG_SET_CPU_AFFINITY=1
+# PIP: recommended to config first Prefill Server IP, all server need to be config the same ip, PORT: one free port
+export ASCEND_MF_STORE_URL="tcp://PIP:PORT"
+# if you are Atlas 800I A2 hardware and use rdma for kv cache transfer, add this parameter
+export ASCEND_MF_TRANSFER_PROTOCOL="device_rdma"
+python3 -m sglang.launch_server \
+    --model-path meta-llama/Llama-3.1-8B-Instruct \
+    --disaggregation-mode prefill \
+    --disaggregation-transfer-backend ascend \
+    --disaggregation-bootstrap-port 8995 \
+    --attention-backend ascend \
+    --device npu \
+    --base-gpu-id 0 \
+    --tp-size 1 \
+    --host 127.0.0.1  \
+    --port 8000
+```
+Launch Decode server
+```shell
+export SGLANG_SET_CPU_AFFINITY=1
+# PIP: recommended to config first Prefill Server IP, all server need to be config the same ip, PORT: one free port
+export ASCEND_MF_STORE_URL="tcp://PIP:PORT"
+# if you are Atlas 800I A2 hardware and use rdma for kv cache transfer, add this parameter
+export ASCEND_MF_TRANSFER_PROTOCOL="device_rdma"
+python3 -m sglang.launch_server \
+    --model-path meta-llama/Llama-3.1-8B-Instruct \
+    --disaggregation-mode decode \
+    --disaggregation-transfer-backend ascend \
+    --attention-backend ascend \
+    --device npu \
+    --base-gpu-id 1 \
+    --tp-size 1 \
+    --host 127.0.0.1 \
+    --port 8001
+```
+
+Launch Router
+```shell
+python3 -m sglang_router.launch_router \
+    --pd-disaggregation \
+    --policy cache_aware \
+    --prefill http://127.0.0.1:8000 8995 \
+    --decode http://127.0.0.1:8001 \
+    --host 127.0.0.1 \
+    --port 6688
+```
+
+### Running Service For Multimodal Language Models
+#### PD Mixed Scene
+```shell
+python3 -m sglang.launch_server \
+    --model-path Qwen3-VL-30B-A3B-Instruct \
+    --host 127.0.0.1 \
+    --port 8000 \
+    --tp 4 \
+    --device npu \
+    --attention-backend ascend \
+    --mm-attention-backend ascend_attn \
+    --disable-radix-cache \
+    --trust-remote-code \
+    --enable-multimodal \
+    --sampling-backend ascend
 ```
