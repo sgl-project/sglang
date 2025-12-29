@@ -367,7 +367,9 @@ class Scheduler(
         self.init_request_dispatcher()
 
         if self.enable_lora:
-            self.lora_prefetcher = LoRAPrefetcher(self.tp_worker.model_runner.lora_manager)
+            self.lora_prefetcher = LoRAPrefetcher(
+                self.tp_worker.model_runner.lora_manager
+            )
 
     def init_model_config(self):
         self.model_config = ModelConfig.from_server_args(self.server_args)
@@ -1940,10 +1942,7 @@ class Scheduler(
 
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
-            if (
-                self.enable_lora
-                and req.lora_id not in running_loras
-            ):
+            if self.enable_lora and req.lora_id not in running_loras:
                 lora_prefetch_status = self.lora_prefetcher.check_prefetch_status(
                     req.lora_id
                 )

@@ -462,6 +462,7 @@ class LoRAManager:
             lora_added_tokens_size=self.lora_added_tokens_size,
         )
 
+        # Initializing memory pool with base model
         self.fetch_new_lora(None, set())
 
     def set_lora_module(self, module_name, module):
