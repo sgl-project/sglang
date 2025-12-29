@@ -3,7 +3,6 @@ from typing import List, Optional
 
 import numpy as np
 import torch
-from sgl_kernel.speculative import reconstruct_indices_from_tree_mask
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
@@ -16,11 +15,17 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.cpp_ngram.ngram_cache import NgramCache
 from sglang.srt.speculative.ngram_info import NgramVerifyInput
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.utils import is_npu
+
+if not is_npu:
+    from sgl_kernel.speculative import reconstruct_indices_from_tree_mask
+
+    USE_FULL_MASK = True
+else:
+    USE_FULL_MASK = False
+
 
 logger = logging.getLogger(__name__)
-
-
-USE_FULL_MASK = True
 
 
 class NGRAMWorker:
@@ -158,16 +163,26 @@ class NGRAMWorker:
         tree_mask.copy_(torch.from_numpy(mask), non_blocking=True)
         draft_tokens.copy_(torch.from_numpy(req_drafts), non_blocking=True)
 
-        reconstruct_indices_from_tree_mask(
-            tree_mask,
-            batch.seq_lens,
-            positions,  # mutable
-            retrive_index,  # mutable
-            retrive_next_token,  # mutable
-            retrive_next_sibling,  # mutable
-            bs,
-            self.draft_token_num,
-        )
+        if is_npu:
+            # npu just support linear speculative decoding now
+            self._prepare_linear_speculative_indices(
+                batch,
+                positions,
+                retrive_index,
+                retrive_next_token,
+                retrive_next_sibling,
+            )
+        else:
+            reconstruct_indices_from_tree_mask(
+                tree_mask,
+                batch.seq_lens,
+                positions,  # mutable
+                retrive_index,  # mutable
+                retrive_next_token,  # mutable
+                retrive_next_sibling,  # mutable
+                bs,
+                self.draft_token_num,
+            )
 
         # NOTE: QLEN_MASK is faster than FULL_MASK, but requires corresponding changes in flashinfer.
         # Testing shows about 8% performance improvement (the effect is roughly proportional to batch size).
@@ -197,6 +212,30 @@ class NGRAMWorker:
             self.draft_token_num,
         )
         batch.spec_info.prepare_for_verify(batch, self.page_size)
+
+    def _prepare_linear_speculative_indices(
+        self, batch, positions, retrive_index, retrive_next_token, retrive_next_sibling
+    ):
+        B = batch.batch_size()
+        K = self.draft_token_num
+        device = positions.device
+
+        retrive_index.fill_(-1)
+        retrive_next_token.fill_(-1)
+        retrive_next_sibling.fill_(-1)
+
+        bases = batch.seq_lens_cpu.to(device, non_blocking=True).unsqueeze(1)  # [B, 1]
+        offsets = torch.arange(K, device=device, dtype=positions.dtype)  # [K]
+        positions[:] = (bases + offsets).view(-1)
+
+        global_idx = torch.arange(B * K, device=device, dtype=retrive_index.dtype).view(
+            B, K
+        )
+        retrive_index[:, :K] = global_idx
+
+        if K > 1:
+            next_vals = global_idx[:, 1:]  # [B, K-1]
+            retrive_next_token[:, : K - 1] = next_vals
 
     def add_logprob_values(
         self,

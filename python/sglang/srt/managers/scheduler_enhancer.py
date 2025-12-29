@@ -15,7 +15,7 @@ class SchedulerEnhancer:
         self.cpu_group = tp_worker.get_tp_group().cpu_group
         self.max_running_requests = max_running_requests
         self.stable_count = 0
-        # If scheduling is performed 30 times and some dp units are still at full load, the prefill-prioritized scheduling strategy will still be used.
+        # If scheduling is performed 200 times and some dp units are still at full load, the prefill-prioritized scheduling strategy will still be used.
         self.max_stable_count = 200
         self.server_args = server_args
         assert (

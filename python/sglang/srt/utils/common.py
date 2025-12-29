@@ -1933,7 +1933,7 @@ def get_compiler_backend(mode=None) -> str:
                 "Please install torchair for torch.compile support on NPU."
             )
         compiler_config = CompilerConfig()
-        compiler_config.mode = "max-autotune"
+        compiler_config.mode = "max-autotune" if mode is None else mode
         if mode == "npugraph_ex":
             compiler_config.mode = "reduce-overhead"
             compiler_config.debug.run_eagerly = True
@@ -3432,6 +3432,9 @@ class ConcurrentCounter:
 def is_triton_kernels_available() -> bool:
     return importlib.util.find_spec("triton_kernels") is not None
 
+@lru_cache(maxsize=1)
+def is_arctic_inference_available() -> bool:
+    return importlib.util.find_spec("arctic_inference") is not None
 
 def check_cuda_result(raw_output):
     import cuda.bindings.runtime as cuda_rt
