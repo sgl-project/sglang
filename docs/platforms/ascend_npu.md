@@ -102,13 +102,11 @@ pip install -e python[srt_npu]
 You can download the SGLang image or build an image based on Dockerfile to obtain the Ascend NPU image.
 1. Download SGLang image
 ```angular2html
-# You can choose between dockerhub and quay.io
 dockerhub: docker.io/lmsysorg/sglang:$tag
-quay.io: quay.io/ascend/sglang:$tag
 # Main-based tag, change main to specific version like v0.5.6,
 # you can get image for specific version
-Atlas A3 server : {main}-cann8.3.rc2-a3
-Atlas A2 server: {main}-cann8.3.rc2-910b
+Atlas 800I A3 : {main}-cann8.3.rc2-a3
+Atlas 800I A2: {main}-cann8.3.rc2-910b
 ```
 2. Build an image based on Dockerfile
 ```shell
@@ -161,8 +159,6 @@ cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor # shows performance
 
 ```shell
 sudo sysctl -w kernel.numa_balancing=0
-# Enabling CPU Affinity
-export SGLANG_SET_CPU_AFFINITY=1
 
 # Check
 cat /proc/sys/kernel/numa_balancing # shows 0
@@ -177,7 +173,7 @@ sudo sysctl -w vm.swappiness=10
 cat /proc/sys/vm/swappiness # shows 10
 ```
 
-## Running Sglang Service
+## Running SGLang Service
 ### Running Service For Large Language Models
 #### PD Mixed Scene
 ```shell
@@ -186,9 +182,10 @@ python3 -m sglang.launch_server --model-path meta-llama/Llama-3.1-8B-Instruct --
 #### PD Separation Scene
 Launch prefill server
 ```shell
+export SGLANG_SET_CPU_AFFINITY=1
 # PIP: recommended to config first Prefill Server IP, all server need to be config the same ip, PORT: one free port
 export ASCEND_MF_STORE_URL="tcp://PIP:PORT"
-# if you use rdma, add this parameter
+# if you are Atlas 800I A2 hardware and use rdma for kv cache transfer, add this parameter
 export ASCEND_MF_TRANSFER_PROTOCOL="device_rdma"
 python3 -m sglang.launch_server \
     --model-path meta-llama/Llama-3.1-8B-Instruct \
@@ -204,9 +201,10 @@ python3 -m sglang.launch_server \
 ```
 Launch Decode server
 ```shell
+export SGLANG_SET_CPU_AFFINITY=1
 # PIP: recommended to config first Prefill Server IP, all server need to be config the same ip, PORT: one free port
 export ASCEND_MF_STORE_URL="tcp://PIP:PORT"
-# if you use rdma, add this parameter
+# if you are Atlas 800I A2 hardware and use rdma for kv cache transfer, add this parameter
 export ASCEND_MF_TRANSFER_PROTOCOL="device_rdma"
 python3 -m sglang.launch_server \
     --model-path meta-llama/Llama-3.1-8B-Instruct \
