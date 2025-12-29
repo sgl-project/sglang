@@ -3,6 +3,7 @@
 use async_trait::async_trait;
 use axum::response::Response;
 use tracing::error;
+use uuid::Uuid;
 
 use crate::routers::{
     error,
@@ -70,13 +71,12 @@ impl PipelineStage for EmbeddingRequestBuildingStage {
                 error::internal_error("client_missing", "Client not selected")
             })?;
 
-        // Extract request ID
-        let request_id = ctx
-            .state
-            .dispatch
-            .as_ref()
-            .map(|d| d.request_id.clone())
-            .unwrap_or_else(|| "unknown".to_string());
+        // Generate request ID with appropriate prefix based on request type
+        let request_id = match &ctx.input.request_type {
+            RequestType::Embedding(_) => format!("embed-{}", Uuid::new_v4()),
+            RequestType::Classify(_) => format!("classify-{}", Uuid::new_v4()),
+            _ => format!("embed-{}", Uuid::new_v4()), // fallback
+        };
 
         // Extract original text
         let original_text = prep_output.original_text.clone();
