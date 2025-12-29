@@ -25,7 +25,8 @@ def _per_expert_lora_kernel(
     hidden_states_ptr,  # [num_total_tokens, input_dim]
     lora_a_weights_ptr,  # [num_loras, num_experts, max_rank, input_dim]
     lora_b_weights_ptr,  # [num_loras, num_experts, output_dim, max_rank]
-    output_ptr,  # [num_total_tokens, output_dim]
+    output_ptr,  # [num_total_tokens, output_dim] - base output (modified in-place)
+    lora_output_ptr,  # [num_total_tokens, output_dim] - separate LoRA-only output
     # Dispatch info (length = num_dispatched)
     token_ids_ptr,  # [num_dispatched] -> index into hidden/output
     expert_ids_ptr,  # [num_dispatched]
@@ -190,13 +191,22 @@ def _per_expert_lora_kernel(
     out_vals *= scaling
 
     # ----------------------------
-    # Accumulate into global output
+    # Accumulate into global output (base_output) and store to lora_output
     # ----------------------------
     out_row_base = actual_token_id * output_dim
     out_ptrs = output_ptr + out_row_base + out_offs
+    lora_out_ptrs = lora_output_ptr + out_row_base + out_offs
 
+    # Add to base_output in-place
     tl.atomic_add(
         out_ptrs,
+        out_vals.to(tl.float16),
+        mask=out_mask & has_rank,
+    )
+
+    # Also store to separate lora_output tensor
+    tl.atomic_add(
+        lora_out_ptrs,
         out_vals,
         mask=out_mask & has_rank,
     )
@@ -214,7 +224,7 @@ def per_expert_lora_forward(
     num_experts: int,
     base_output: torch.Tensor = None,
     is_down_proj: bool = False,
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Forward pass for per-expert LoRA computation using a 3D Triton grid:
         grid = (spatial, slices, loras)
@@ -235,7 +245,9 @@ def per_expert_lora_forward(
                      or gate_up_proj (hidden_dim -> intermediate_dim)
 
     Returns:
-        output: [num_tokens, output_dim] - Base output + LoRA delta (in-place)
+        tuple of:
+            output: [num_tokens, output_dim] - Base output + LoRA delta (in-place)
+            lora_output: [num_tokens, output_dim] - Just the LoRA delta contribution
     """
 
     # Shapes
@@ -271,6 +283,14 @@ def per_expert_lora_forward(
         ), f"Expected shape ({num_tokens}, {output_dim}), got {output.shape}"
         assert output.device == device
 
+    # Allocate separate tensor for just the LoRA contribution
+    lora_output = torch.zeros(
+        num_tokens,
+        output_dim,
+        dtype=torch.float32,
+        device=device,
+    )
+
     # Tile size for hidden and output dimensions
     BLOCK_SIZE = 64  # tune as needed
 
@@ -285,7 +305,8 @@ def per_expert_lora_forward(
         hidden_states,  # hidden_states_ptr
         lora_a_weights,  # lora_a_weights_ptr
         lora_b_weights,  # lora_b_weights_ptr
-        output,  # output_ptr
+        output,  # output_ptr (base output, modified in-place)
+        lora_output,  # lora_output_ptr (separate LoRA-only output)
         # Dispatch info
         token_ids,  # token_ids_ptr
         expert_ids,  # expert_ids_ptr
@@ -313,4 +334,4 @@ def per_expert_lora_forward(
         BLOCK_SIZE=BLOCK_SIZE,
     )
 
-    return output
+    return output, lora_output

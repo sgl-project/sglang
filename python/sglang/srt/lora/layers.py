@@ -621,12 +621,15 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         2. Parallel LoRA delta computation (if enabled, added in-place)
         3. Return modified base_output
         """
+        # Copy hidden_states for LoRA computation to ensure we use unmodified input
+        hidden_states_for_lora = hidden_states.clone()
+
         # Run base MoE
         base_output = self.base_layer.forward(hidden_states, topk_output, **kwargs)
 
         # If LoRA is enabled, compute delta and add in-place for memory efficiency
         if self.set_lora and self.gate_up_lora_a_weights is not None:
-            self._compute_lora_delta(hidden_states, topk_output, base_output)
+            self._compute_lora_delta(hidden_states_for_lora, topk_output, base_output)
 
         return base_output
 
@@ -675,7 +678,6 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
 
         # Allocate intermediate cache for gate_up output (similar to intermediate_cache1 in base MoE)
         # This stores the LoRA delta in intermediate space before down projection
-        num_dispatched = token_ids.shape[0]
         lora_intermediate_cache = torch.empty(
             (num_tokens, intermediate_size),
             dtype=torch.float32,  # Use float32 for LoRA accumulation like base implementation
@@ -684,7 +686,7 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
 
         # Apply gate_up_proj LoRA: hidden_states -> intermediate space
         # Store result in intermediate cache (no base_output means allocate new tensor)
-        per_expert_lora_forward(
+        _, _ = per_expert_lora_forward(
             hidden_states=hidden_states,
             lora_a_weights=self.gate_up_lora_a_weights,
             lora_b_weights=self.gate_up_lora_b_weights,
@@ -703,7 +705,7 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
             self.down_lora_a_weights is not None
             and self.down_lora_b_weights is not None
         ):
-            per_expert_lora_forward(
+            _, _ = per_expert_lora_forward(
                 hidden_states=lora_intermediate_cache,  # Use intermediate cache as input
                 lora_a_weights=self.down_lora_a_weights,
                 lora_b_weights=self.down_lora_b_weights,
