@@ -329,8 +329,8 @@ class NPUW4A8Int8DynamicMoEMethod(_NPUFusedMoEMethodBase):
         layer.w13_weight.data = npu_format_cast(layer.w13_weight.data)
         layer.w2_weight.data = npu_format_cast(layer.w2_weight.data)
 
-        layer.w13_weight.data = self.pack_to_int32(layer.w13_weight.data)
-        layer.w2_weight.data = self.pack_to_int32(layer.w2_weight.data)
+        layer.w13_weight.data = self._pack_to_int32(layer.w13_weight.data)
+        layer.w2_weight.data = self._pack_to_int32(layer.w2_weight.data)
 
     def _process_weights_without_clip(
         self, layer: torch.nn.Module, is_per_channel_weight
@@ -345,13 +345,13 @@ class NPUW4A8Int8DynamicMoEMethod(_NPUFusedMoEMethodBase):
             if hasattr(layer, "w2_weight_scale_second")
             else None
         )
-        layer.w13_weight_scale.data, w13_bias = self.process_scale(
+        layer.w13_weight_scale.data, w13_bias = self._process_scale(
             layer.w13_weight,
             layer.w13_weight_scale.data,
             w13_weight_scale_second,
             is_per_channel_weight,
         )
-        layer.w2_weight_scale.data, w2_bias = self.process_scale(
+        layer.w2_weight_scale.data, w2_bias = self._process_scale(
             layer.w2_weight,
             layer.w2_weight_scale.data,
             w2_weight_scale_second,
@@ -364,7 +364,7 @@ class NPUW4A8Int8DynamicMoEMethod(_NPUFusedMoEMethodBase):
             del layer.w13_weight_offset_second
             del layer.w2_weight_offset_second
 
-        self.update_bias(layer, w13_bias, w2_bias)
+        self._update_bias(layer, w13_bias, w2_bias)
 
     def _process_weights_with_clip(self, layer: torch.nn.Module) -> None:
         w13_weight_scale = (
