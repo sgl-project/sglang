@@ -12,6 +12,7 @@ from sglang.multimodal_gen.runtime.models.schedulers.scheduling_flow_match_euler
 from sglang.multimodal_gen.runtime.models.utils import pred_noise_to_pred_video
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages import DenoisingStage
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.perf_logger import StageProfiler
@@ -88,7 +89,6 @@ class DmdDenoisingStage(DenoisingStage):
         )
 
         pos_cond_kwargs = prepared_vars["pos_cond_kwargs"]
-        prompt_embeds = prepared_vars["prompt_embeds"]
 
         denoising_loop_start_time = time.time()
         with self.progress_bar(total=len(timesteps)) as progress_bar:
@@ -98,7 +98,10 @@ class DmdDenoisingStage(DenoisingStage):
                     continue
 
                 with StageProfiler(
-                    f"denoising_step_{i}", logger=logger, timings=batch.timings
+                    f"denoising_step_{i}",
+                    logger=logger,
+                    timings=batch.timings,
+                    perf_dump_path_provided=batch.perf_dump_path is not None,
                 ):
                     # Expand latents for I2V
                     noise_latents = latents.clone()
@@ -127,7 +130,7 @@ class DmdDenoisingStage(DenoisingStage):
 
                     # Predict noise residual
                     with torch.autocast(
-                        device_type="cuda",
+                        device_type=current_platform.device_type,
                         dtype=target_dtype,
                         enabled=autocast_enabled,
                     ):
@@ -141,9 +144,8 @@ class DmdDenoisingStage(DenoisingStage):
                         ):
                             # Run transformer
                             pred_noise = self.transformer(
-                                latent_model_input.permute(0, 2, 1, 3, 4),
-                                prompt_embeds,
-                                t_expand,
+                                hidden_states=latent_model_input.permute(0, 2, 1, 3, 4),
+                                timestep=t_expand,
                                 guidance=guidance_expand,
                                 **image_kwargs,
                                 **pos_cond_kwargs,

@@ -26,7 +26,7 @@ use tracing::{debug, error, field::Empty, info, info_span, warn, Span};
 
 pub use crate::core::token_bucket::TokenBucket;
 use crate::{
-    observability::metrics::{smg_labels, RouterMetrics, SmgMetrics},
+    observability::metrics::{method_to_static_str, metrics_labels, Metrics},
     routers::error::extract_error_code_from_response,
     server::AppState,
     wasm::{
@@ -289,7 +289,7 @@ impl<B> MakeSpan<B> for RequestSpan {
             status_code = Empty,
             latency = Empty,
             error = Empty,
-            module = "sglang::router_rs"
+            module = "sgl_model_gateway"
         )
     }
 }
@@ -308,7 +308,9 @@ impl<B> OnRequest<B> for RequestLogger {
             span.record("request_id", request_id.0.as_str());
         }
 
-        RouterMetrics::record_http_request();
+        let method = method_to_static_str(request.method().as_str());
+        let path = normalize_path_for_metrics(request.uri().path());
+        Metrics::record_http_request(method, &path);
 
         // Log the request start
         info!(
@@ -339,12 +341,8 @@ impl<B> OnResponse<B> for ResponseLogger {
 
         let error_code = extract_error_code_from_response(response);
 
-        // TODO support `route` information
-        RouterMetrics::record_http_status_code(status_code, error_code);
-        RouterMetrics::record_request_duration(latency);
-
-        // New SMG metrics (Layer 1: HTTP)
-        SmgMetrics::record_http_response(status_code, error_code);
+        // Layer 1: HTTP metrics
+        Metrics::record_http_response(status_code, error_code);
 
         // Record these in the span for structured logging/observability tools
         span.record("status_code", status_code);
@@ -424,7 +422,7 @@ impl QueueProcessor {
     }
 
     pub async fn run(mut self) {
-        info!("Starting concurrency queue processor");
+        debug!("Starting concurrency queue processor");
 
         // Process requests in a single task to reduce overhead
         while let Some(queued) = self.queue_rx.recv().await {
@@ -520,7 +518,7 @@ pub async fn concurrency_limit_middleware(
     // Try to acquire token immediately
     if token_bucket.try_acquire(1.0).await.is_ok() {
         debug!("Acquired token immediately");
-        SmgMetrics::record_http_rate_limit(smg_labels::RATE_LIMIT_ALLOWED);
+        Metrics::record_http_rate_limit(metrics_labels::RATE_LIMIT_ALLOWED);
         let response = next.run(request).await;
 
         // Wrap the response body with TokenGuardBody to return token when stream ends
@@ -545,22 +543,19 @@ pub async fn concurrency_limit_middleware(
             // Try to send to queue
             match queue_tx.try_send(queued) {
                 Ok(_) => {
-                    // On successful enqueue, update embeddings queue gauge if applicable
+                    // On successful enqueue, update embeddings queue counter if applicable
                     if is_embeddings {
-                        let new_val = EMBEDDINGS_QUEUE_SIZE.fetch_add(1, Ordering::Relaxed) + 1;
-                        RouterMetrics::set_embeddings_queue_size(new_val as usize);
+                        EMBEDDINGS_QUEUE_SIZE.fetch_add(1, Ordering::Relaxed);
                     }
 
                     // Wait for token from queue processor
                     match permit_rx.await {
                         Ok(Ok(())) => {
                             debug!("Acquired token from queue");
-                            SmgMetrics::record_http_rate_limit(smg_labels::RATE_LIMIT_ALLOWED);
+                            Metrics::record_http_rate_limit(metrics_labels::RATE_LIMIT_ALLOWED);
                             // Dequeue for embeddings
                             if is_embeddings {
-                                let new_val =
-                                    EMBEDDINGS_QUEUE_SIZE.fetch_sub(1, Ordering::Relaxed) - 1;
-                                RouterMetrics::set_embeddings_queue_size(new_val as usize);
+                                EMBEDDINGS_QUEUE_SIZE.fetch_sub(1, Ordering::Relaxed);
                             }
 
                             let response = next.run(request).await;
@@ -572,23 +567,19 @@ pub async fn concurrency_limit_middleware(
                         }
                         Ok(Err(status)) => {
                             warn!("Queue returned error status: {}", status);
-                            SmgMetrics::record_http_rate_limit(smg_labels::RATE_LIMIT_REJECTED);
+                            Metrics::record_http_rate_limit(metrics_labels::RATE_LIMIT_REJECTED);
                             // Dequeue for embeddings on error
                             if is_embeddings {
-                                let new_val =
-                                    EMBEDDINGS_QUEUE_SIZE.fetch_sub(1, Ordering::Relaxed) - 1;
-                                RouterMetrics::set_embeddings_queue_size(new_val as usize);
+                                EMBEDDINGS_QUEUE_SIZE.fetch_sub(1, Ordering::Relaxed);
                             }
                             status.into_response()
                         }
                         Err(_) => {
                             error!("Queue response channel closed");
-                            SmgMetrics::record_http_rate_limit(smg_labels::RATE_LIMIT_REJECTED);
+                            Metrics::record_http_rate_limit(metrics_labels::RATE_LIMIT_REJECTED);
                             // Dequeue for embeddings on channel error
                             if is_embeddings {
-                                let new_val =
-                                    EMBEDDINGS_QUEUE_SIZE.fetch_sub(1, Ordering::Relaxed) - 1;
-                                RouterMetrics::set_embeddings_queue_size(new_val as usize);
+                                EMBEDDINGS_QUEUE_SIZE.fetch_sub(1, Ordering::Relaxed);
                             }
                             StatusCode::INTERNAL_SERVER_ERROR.into_response()
                         }
@@ -596,13 +587,13 @@ pub async fn concurrency_limit_middleware(
                 }
                 Err(_) => {
                     warn!("Request queue is full, returning 429");
-                    SmgMetrics::record_http_rate_limit(smg_labels::RATE_LIMIT_REJECTED);
+                    Metrics::record_http_rate_limit(metrics_labels::RATE_LIMIT_REJECTED);
                     StatusCode::TOO_MANY_REQUESTS.into_response()
                 }
             }
         } else {
             warn!("No tokens available and queuing is disabled, returning 429");
-            SmgMetrics::record_http_rate_limit(smg_labels::RATE_LIMIT_REJECTED);
+            Metrics::record_http_rate_limit(metrics_labels::RATE_LIMIT_REJECTED);
             StatusCode::TOO_MANY_REQUESTS.into_response()
         }
     }
@@ -612,7 +603,7 @@ pub async fn concurrency_limit_middleware(
 // HTTP Metrics Layer (Layer 1: SMG metrics)
 // ============================================================================
 
-/// Global counter for active HTTP connections
+/// Global counter for active HTTP connections (handlers currently executing)
 static ACTIVE_HTTP_CONNECTIONS: AtomicU64 = AtomicU64::new(0);
 
 /// Tower Layer for HTTP metrics collection (SMG Layer 1 metrics)
@@ -654,7 +645,8 @@ where
     }
 
     fn call(&mut self, req: Request) -> Self::Future {
-        let method = req.method().as_str().to_owned();
+        // Convert method to static string to avoid allocation
+        let method = method_to_static_str(req.method().as_str());
         let path = normalize_path_for_metrics(req.uri().path());
         let start = Instant::now();
 
@@ -663,37 +655,22 @@ where
         Box::pin(async move {
             // Increment inside async block - ensures no leak if future is dropped before polling
             let active = ACTIVE_HTTP_CONNECTIONS.fetch_add(1, Ordering::Relaxed) + 1;
-            SmgMetrics::set_http_connections_active(active as usize);
+            Metrics::set_http_connections_active(active as usize);
 
             // Capture result before decrementing to ensure decrement happens on error too
             let result = inner.call(req).await;
 
             // Always decrement, regardless of success or failure
             let active = ACTIVE_HTTP_CONNECTIONS.fetch_sub(1, Ordering::Relaxed) - 1;
-            SmgMetrics::set_http_connections_active(active as usize);
+            Metrics::set_http_connections_active(active as usize);
 
             let response = result?;
 
             let duration = start.elapsed();
-            let status_class = status_to_class(response.status().as_u16());
-
-            SmgMetrics::record_http_request(&method, &path, status_class);
-            SmgMetrics::record_http_duration(&method, &path, duration);
+            Metrics::record_http_duration(method, &path, duration);
 
             Ok(response)
         })
-    }
-}
-
-#[inline]
-fn status_to_class(status: u16) -> &'static str {
-    match status {
-        100..=199 => "1xx",
-        200..=299 => "2xx",
-        300..=399 => "3xx",
-        400..=499 => "4xx",
-        500..=599 => "5xx",
-        _ => "unknown",
     }
 }
 
