@@ -322,6 +322,8 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         self.event_loop = None
         self.asyncio_tasks = set()
 
+        self.mm_input_processing_sem = asyncio.Semaphore(1)
+
         # Health check
         self.server_status = ServerStatus.Starting
         self.gracefully_exit = False
@@ -691,13 +693,16 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                         prompt=(input_text or input_ids),
                     )
                 if mm_inputs is None:
-                    mm_inputs: Dict = await self.mm_data_processor.process(
-                        image_data=obj.image_data,
-                        audio_data=obj.audio_data,
-                        input_text_or_ids=(input_text or input_ids),
-                        request_obj=obj,
-                        max_req_input_len=self.max_req_input_len,
-                    )
+                    async with self.mm_input_processing_sem:
+                        await asyncio.sleep(0)
+
+                        mm_inputs: Dict = await self.mm_data_processor.process(
+                            image_data=obj.image_data,
+                            audio_data=obj.audio_data,
+                            input_text_or_ids=(input_text or input_ids),
+                            request_obj=obj,
+                            max_req_input_len=self.max_req_input_len,
+                        )
 
             if mm_inputs and "input_ids" in mm_inputs:
                 input_ids = mm_inputs["input_ids"]
@@ -1435,11 +1440,16 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
     async def handle_loop(self):
         """The event loop that handles requests"""
         while True:
-            with self.soft_watchdog.disable():
-                recv_obj = await self.recv_from_detokenizer.recv_pyobj()
-            self._result_dispatcher(recv_obj)
-            self.last_receive_tstamp = time.time()
-            self.soft_watchdog.feed()
+            if await self.recv_from_detokenizer.poll(timeout=100):
+                with self.soft_watchdog.disable():
+                    recv_obj = await self.recv_from_detokenizer.recv_pyobj()
+                self._result_dispatcher(recv_obj)
+                self.last_receive_tstamp = time.time()
+                self.soft_watchdog.feed()
+            else:
+                self.soft_watchdog.feed()
+                await asyncio.sleep(0)
+                # not good for cpu ?
 
     def _handle_batch_output(
         self,
