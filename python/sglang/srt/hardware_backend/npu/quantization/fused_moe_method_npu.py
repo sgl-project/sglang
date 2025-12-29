@@ -333,9 +333,7 @@ class NPUW4A8Int8DynamicMoEMethod(_NPUFusedMoEMethodBase):
         layer.w2_weight.data = self.pack_to_int32(layer.w2_weight.data)
 
     def _process_weights_without_clip(
-        self, 
-        layer: torch.nn.Module, 
-        is_per_channel_weight
+        self, layer: torch.nn.Module, is_per_channel_weight
     ) -> None:
         w13_weight_scale_second = (
             layer.w13_weight_scale_second.data
