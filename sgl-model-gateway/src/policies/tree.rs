@@ -204,6 +204,9 @@ struct Node {
     tenant_last_access_time: DashMap<TenantId, u64>,
     /// Parent pointer for upward traversal during timestamp updates
     parent: RwLock<Option<NodeRef>>,
+    /// Cached last-accessed tenant for O(1) lookup during prefix match.
+    /// Avoids O(shards) DashMap iteration in the common case.
+    last_tenant: parking_lot::RwLock<Option<TenantId>>,
 }
 
 #[derive(Debug)]
@@ -291,6 +294,7 @@ impl Tree {
                 text: RwLock::new(NodeText::empty()),
                 tenant_last_access_time: DashMap::new(),
                 parent: RwLock::new(None),
+                last_tenant: parking_lot::RwLock::new(None),
             }),
             tenant_char_count: DashMap::new(),
         }
@@ -343,6 +347,7 @@ impl Tree {
                         text: RwLock::new(NodeText::new(remaining.to_string())),
                         tenant_last_access_time: DashMap::new(),
                         parent: RwLock::new(Some(Arc::clone(&prev))),
+                        last_tenant: parking_lot::RwLock::new(Some(Arc::clone(&tenant_id))),
                     });
 
                     // Attach tenant to the new leaf node with timestamp
@@ -382,6 +387,9 @@ impl Tree {
                             children: DashMap::with_hasher(CharHasherBuilder::default()),
                             parent: RwLock::new(Some(Arc::clone(&prev))),
                             tenant_last_access_time: matched_node.tenant_last_access_time.clone(),
+                            last_tenant: parking_lot::RwLock::new(
+                                matched_node.last_tenant.read().clone(),
+                            ),
                         });
 
                         let first_new_char = contracted_text.first_char().unwrap();
@@ -396,12 +404,17 @@ impl Tree {
 
                         // Attach tenant to the new split node (intermediate - no timestamp update)
                         // The cloned DashMap already has the tenant; just ensure char count is correct
-                        if !new_node.tenant_last_access_time.contains_key(tenant_id.as_ref()) {
+                        if !new_node
+                            .tenant_last_access_time
+                            .contains_key(tenant_id.as_ref())
+                        {
                             self.tenant_char_count
                                 .entry(Arc::clone(&tenant_id))
                                 .and_modify(|count| *count += matched_text_count)
                                 .or_insert(matched_text_count);
-                            new_node.tenant_last_access_time.insert(Arc::clone(&tenant_id), 0);
+                            new_node
+                                .tenant_last_access_time
+                                .insert(Arc::clone(&tenant_id), 0);
                         }
 
                         InsertStep::Continue {
@@ -413,12 +426,17 @@ impl Tree {
                         drop(matched_node_text);
 
                         // Ensure tenant exists at this intermediate node
-                        if !matched_node.tenant_last_access_time.contains_key(tenant_id.as_ref()) {
+                        if !matched_node
+                            .tenant_last_access_time
+                            .contains_key(tenant_id.as_ref())
+                        {
                             self.tenant_char_count
                                 .entry(Arc::clone(&tenant_id))
                                 .and_modify(|count| *count += matched_node_text_count)
                                 .or_insert(matched_node_text_count);
-                            matched_node.tenant_last_access_time.insert(Arc::clone(&tenant_id), 0);
+                            matched_node
+                                .tenant_last_access_time
+                                .insert(Arc::clone(&tenant_id), 0);
                         }
 
                         InsertStep::Continue {
@@ -445,7 +463,8 @@ impl Tree {
         // Loop exited normally (remaining empty) - prev is the leaf node
         // Update its timestamp for LRU ordering
         let epoch = get_epoch();
-        prev.tenant_last_access_time.insert(Arc::clone(&tenant_id), epoch);
+        prev.tenant_last_access_time
+            .insert(Arc::clone(&tenant_id), epoch);
     }
 
     /// Performs prefix matching and returns detailed result with char counts.
@@ -487,19 +506,43 @@ impl Tree {
 
         let curr = prev;
 
-        // Select the first tenant (key in the map)
-        let tenant: Option<TenantId> = curr
-            .tenant_last_access_time
-            .iter()
-            .next()
-            .map(|kv| Arc::clone(kv.key()));
-
-        // Get tenant directly as Arc<str> - no String allocation
-        let tenant: TenantId = tenant.unwrap_or_else(|| Arc::from("empty"));
+        // Try cached tenant first (O(1)) before falling back to O(shards) DashMap iteration.
+        // The cache is valid if the tenant still exists in tenant_last_access_time.
+        let tenant: TenantId = {
+            let cached = curr.last_tenant.read();
+            if let Some(ref t) = *cached {
+                if curr.tenant_last_access_time.contains_key(t.as_ref()) {
+                    Arc::clone(t)
+                } else {
+                    drop(cached);
+                    // Cache stale, fall back to iteration and update cache
+                    let t = curr
+                        .tenant_last_access_time
+                        .iter()
+                        .next()
+                        .map(|kv| Arc::clone(kv.key()))
+                        .unwrap_or_else(|| Arc::from("empty"));
+                    *curr.last_tenant.write() = Some(Arc::clone(&t));
+                    t
+                }
+            } else {
+                drop(cached);
+                // No cache, iterate and populate cache
+                let t = curr
+                    .tenant_last_access_time
+                    .iter()
+                    .next()
+                    .map(|kv| Arc::clone(kv.key()))
+                    .unwrap_or_else(|| Arc::from("empty"));
+                *curr.last_tenant.write() = Some(Arc::clone(&t));
+                t
+            }
+        };
 
         // Update timestamp on the matched node only (O(1)).
         let epoch = get_epoch();
-        curr.tenant_last_access_time.insert(Arc::clone(&tenant), epoch);
+        curr.tenant_last_access_time
+            .insert(Arc::clone(&tenant), epoch);
 
         // Compute input char count from matched + remaining (deferred from start)
         let input_char_count = matched_chars + remaining.chars().count();
