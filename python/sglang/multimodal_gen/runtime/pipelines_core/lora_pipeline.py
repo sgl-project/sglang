@@ -1,5 +1,9 @@
-# Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
+# =========================
+# File 1: LoRAPipeline (e.g. sglang/multimodal_gen/runtime/pipelines_core/lora_pipeline.py)
+# =========================
 
+# Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
+#
 # SPDX-License-Identifier: Apache-2.0
 import os
 from collections import defaultdict
@@ -21,6 +25,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import 
     ComposedPipelineBase,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.lora_format_adapter import (
+    maybe_fuse_qwen_image_qkv_lora_state_dict,
     normalize_lora_state_dict,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
@@ -230,6 +235,85 @@ class LoRAPipeline(ComposedPipelineBase):
                 converted_count_critic,
             )
 
+    def _set_lora_weights_dynamic_rank(
+        self,
+        layer: BaseLayerWithLoRA,
+        lora_A: torch.Tensor,
+        lora_B: torch.Tensor,
+        lora_path: str | None,
+        strength: float,
+        rank: int,
+        layer_name: str,
+    ) -> None:
+        """
+        Set LoRA weights on a layer.
+
+        Prefer calling layer.set_lora_weights() (the canonical path). If the underlying
+        implementation enforces a fixed rank and raises shape/rank mismatch errors,
+        fall back to replacing the registered parameters with the new shapes.
+        """
+        try:
+            layer.set_lora_weights(
+                lora_A,
+                lora_B,
+                lora_path=lora_path,
+                strength=strength,
+            )
+            return
+        except Exception as exc:
+            msg = str(exc).lower()
+            looks_like_shape_issue = (
+                isinstance(exc, AssertionError)
+                or ("shape" in msg)
+                or ("size" in msg)
+                or ("rank" in msg)
+                or ("mismatch" in msg)
+                or ("dim" in msg)
+            )
+            if not looks_like_shape_issue:
+                raise
+
+            if rank == 0:
+                logger.warning(
+                    "Layer '%s': set_lora_weights failed (%s). "
+                    "Falling back to dynamic parameter replacement (inference-safe).",
+                    layer_name,
+                    exc,
+                )
+
+            # Dynamic replacement: update / replace registered parameters to match new shapes.
+            try:
+                if (
+                    not hasattr(layer, "lora_A")
+                    or layer.lora_A is None
+                    or layer.lora_A.shape != lora_A.shape
+                ):
+                    layer.lora_A = torch.nn.Parameter(lora_A, requires_grad=False)
+                else:
+                    layer.lora_A.data.copy_(lora_A)
+
+                if (
+                    not hasattr(layer, "lora_B")
+                    or layer.lora_B is None
+                    or layer.lora_B.shape != lora_B.shape
+                ):
+                    layer.lora_B = torch.nn.Parameter(lora_B, requires_grad=False)
+                else:
+                    layer.lora_B.data.copy_(lora_B)
+
+                if hasattr(layer, "disable_lora"):
+                    layer.disable_lora = False
+                if hasattr(layer, "merged"):
+                    layer.merged = False
+                if hasattr(layer, "lora_strength"):
+                    layer.lora_strength = strength
+                if hasattr(layer, "lora_path"):
+                    layer.lora_path = lora_path
+            except Exception as exc2:
+                raise RuntimeError(
+                    f"Layer '{layer_name}': dynamic-rank fallback failed ({exc2})"
+                ) from exc2
+
     def _apply_lora_to_layers(
         self,
         lora_layers: dict[str, BaseLayerWithLoRA],
@@ -259,12 +343,38 @@ class LoRAPipeline(ComposedPipelineBase):
                 lora_A_name in self.lora_adapters[lora_nickname]
                 and lora_B_name in self.lora_adapters[lora_nickname]
             ):
-                layer.set_lora_weights(
-                    self.lora_adapters[lora_nickname][lora_A_name],
-                    self.lora_adapters[lora_nickname][lora_B_name],
+                lora_A = self.lora_adapters[lora_nickname][lora_A_name]
+                lora_B = self.lora_adapters[lora_nickname][lora_B_name]
+
+                self._set_lora_weights_dynamic_rank(
+                    layer,
+                    lora_A,
+                    lora_B,
                     lora_path=lora_path,
                     strength=strength,
+                    rank=rank,
+                    layer_name=name,
                 )
+
+                # ---- DEBUG: confirm fused QKV is hit and weights look non-trivial (rank 0 only) ----
+                if rank == 0 and name in (
+                    "transformer_blocks.0.attn.to_qkv",
+                    "transformer_blocks.0.attn.to_added_qkv",
+                ):
+                    try:
+                        logger.info(
+                            "[LoRA DEBUG] %s A=%s (mean|A|=%g) B=%s (mean|B|=%g)",
+                            name,
+                            tuple(lora_A.shape),
+                            float(lora_A.abs().mean().item()),
+                            tuple(lora_B.shape),
+                            float(lora_B.abs().mean().item()),
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "[LoRA DEBUG] %s: failed to compute stats (%s)", name, exc
+                        )
+
                 adapted_count += 1
             else:
                 if rank == 0:
@@ -309,6 +419,65 @@ class LoRAPipeline(ComposedPipelineBase):
 
         raw_state_dict = load_file(lora_local_path)
         lora_state_dict = normalize_lora_state_dict(raw_state_dict, logger=logger)
+
+        # ------------------------------------------------------------------
+        # Qwen-Image fix: fuse split q/k/v (and add_q/k/v) LoRA into fused
+        # to_qkv / to_added_qkv, when the *target model* uses fused layers.
+        # ------------------------------------------------------------------
+        target_has_to_qkv = any(
+            name.endswith("attn.to_qkv") for name in self.lora_layers.keys()
+        )
+        target_has_to_added_qkv = any(
+            name.endswith("attn.to_added_qkv") for name in self.lora_layers.keys()
+        )
+        sd_has_split_qkv = any(
+            ".attn.to_q.lora_A.weight" in k for k in lora_state_dict.keys()
+        )
+        sd_has_split_added = any(
+            ".attn.add_q_proj.lora_A.weight" in k for k in lora_state_dict.keys()
+        )
+
+        if (target_has_to_qkv and sd_has_split_qkv) or (
+            target_has_to_added_qkv and sd_has_split_added
+        ):
+            lora_state_dict = maybe_fuse_qwen_image_qkv_lora_state_dict(
+                lora_state_dict, logger=logger
+            )
+
+        # ---- DEBUG: inspect qkv-related LoRA keys (rank 0 only) ----
+        if rank == 0:
+            keys = list(lora_state_dict.keys())
+
+            def _pick(substrs: list[str], max_n: int = 50) -> list[str]:
+                out = []
+                for k in keys:
+                    if any(s in k for s in substrs):
+                        out.append(k)
+                        if len(out) >= max_n:
+                            break
+                return out
+
+            qkv_like = _pick(
+                [
+                    "to_qkv",
+                    "to_added_qkv",
+                    "qkv",
+                    ".to_q.",
+                    ".to_k.",
+                    ".to_v.",
+                    "add_q_proj",
+                    "add_k_proj",
+                    "add_v_proj",
+                    "q_proj",
+                    "k_proj",
+                    "v_proj",
+                ]
+            )
+            logger.info(
+                "[LoRA DEBUG] qkv-like keys (<=%d):\n%s",
+                len(qkv_like),
+                "\n".join(qkv_like) if qkv_like else "(none)",
+            )
 
         if lora_nickname in self.lora_adapters:
             self.lora_adapters[lora_nickname].clear()
