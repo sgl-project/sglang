@@ -51,12 +51,14 @@ if _use_aiter:
 
 if _is_npu:
     import torch_npu
+
     from sglang.srt.hardware_backend.npu.utils import NPUACLFormat
 
 try:
     from flashinfer.fused_moe import cutlass_fused_moe as flashinfer_cutlass_fused_moe
 except ImportError:
     flashinfer_cutlass_fused_moe = None
+
 
 class UnquantizedEmbeddingMethod(QuantizeMethodBase):
     """Unquantized method for embeddings."""
