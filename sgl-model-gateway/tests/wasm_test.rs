@@ -28,6 +28,7 @@ use sgl_model_gateway::{
     policies::PolicyRegistry,
     routers::RouterFactory,
     server::{build_app, AppState},
+    tokenizer::TokenizerRegistry,
     wasm::{
         module::{
             WasmModuleAddRequest, WasmModuleAddResponse, WasmModuleAttachPoint,
@@ -53,6 +54,7 @@ async fn create_test_context_with_wasm() -> Arc<AppContext> {
     // Create AppContext with wasm_manager from the start
     let client = reqwest::Client::new();
 
+    let tokenizer_registry = Arc::new(TokenizerRegistry::new());
     let worker_registry = Arc::new(WorkerRegistry::new());
     let policy_registry = Arc::new(PolicyRegistry::new(config.policy.clone()));
 
@@ -80,7 +82,7 @@ async fn create_test_context_with_wasm() -> Arc<AppContext> {
             .router_config(config.clone())
             .client(client)
             .rate_limiter(None)
-            .tokenizer(None)
+            .tokenizer_registry(tokenizer_registry)
             .reasoning_parser_factory(None)
             .tool_parser_factory(None)
             .worker_registry(worker_registry)
@@ -205,6 +207,7 @@ async fn create_test_app_with_wasm() -> (axum::Router, Arc<AppContext>, TempDir)
     let app = build_app(
         app_state,
         sgl_model_gateway::middleware::AuthConfig { api_key: None },
+        None, // No control plane auth for tests
         256 * 1024 * 1024,
         request_id_headers,
         vec![], // cors_allowed_origins
