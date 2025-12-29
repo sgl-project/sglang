@@ -79,6 +79,7 @@ from sglang.srt.utils import (
     configure_logger,
     get_bool_env_var,
     is_cuda_alike,
+    is_npu,
     is_xpu,
     kill_process_tree,
     maybe_reindex_device_id,
@@ -88,6 +89,10 @@ from sglang.srt.utils import (
     suppress_other_loggers,
 )
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
+
+_is_npu = is_npu()
+if _is_npu:
+    import torch_npu
 
 profile_activities = [torch.profiler.ProfilerActivity.CPU] + [
     profiler_activity
@@ -99,10 +104,15 @@ profile_activities = [torch.profiler.ProfilerActivity.CPU] + [
 ]
 
 
-def start_profile(profile_activities, profile_record_shapes=False, rank_print=print):
+def start_profile(
+    profile_activities,
+    profile_record_shapes=False,
+    rank_print=print,
+    trace_dir=None,
+):
     """
     Abstracted function to start profiling based on profile_activities.
-    Returns profiler object (or None).
+    Returns profiler object (or None). For NPU, saves trace results by default.
     """
     if "CUDA_PROFILER" in profile_activities:
         try:
@@ -111,6 +121,31 @@ def start_profile(profile_activities, profile_record_shapes=False, rank_print=pr
         except Exception as e:
             rank_print(f"Failed to start CUDA profiler: {e}")
         return None
+    elif _is_npu and trace_dir is not None:
+        activities = []
+        if "CPU" in profile_activities:
+            activities.append(torch_npu.profiler.ProfilerActivity.CPU)
+        if "GPU" in profile_activities:
+            activities.append(torch_npu.profiler.ProfilerActivity.NPU)
+        if activities:
+            experiment_config = torch_npu.profiler._ExperimentalConfig(
+                export_type=[torch_npu.profiler.ExportType.Text],
+                profiler_level=torch_npu.profiler.ProfilerLevel.Level1,
+                aic_metrics=torch_npu.profiler.AiCMetrics.AiCoreNone,
+            )
+            os.makedirs(trace_dir, exist_ok=True)
+            profiler = torch_npu.profiler.profile(
+                activities=activities,
+                on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(
+                    trace_dir
+                ),
+                record_shapes=profile_record_shapes,
+                with_stack=True,
+                profile_memory=True,
+                experimental_config=experiment_config,
+            )
+            profiler.start()
+            return profiler
     else:
         activities = []
         if "CPU" in profile_activities:
@@ -138,7 +173,7 @@ def stop_profile(
 ):
     """
     Abstracted function to stop profiling based on profile_activities.
-    Optionally saves trace results and prints completion messages.
+    Optionally saves trace results and prints completion messages. For NPU, saves trace results by default.
     """
     if "CUDA_PROFILER" in profile_activities:
         try:
@@ -148,6 +183,10 @@ def stop_profile(
             rank_print(f"Failed to stop CUDA profiler: {e}")
     elif profiler is not None:
         profiler.stop()
+
+    if _is_npu:
+        rank_print(f"Ascend PyTorch Profiler for {stage} completed")
+        return
 
     if save_trace:
         if profiler is not None:
@@ -422,11 +461,11 @@ def _get_torch_profiler_output_dir():
     return os.environ.get("SGLANG_TORCH_PROFILER_DIR", "/tmp")
 
 
-def _create_torch_profiler_filename(
-    profile_filename_prefix, batch_size, input_len, output_len, stage
+def _create_torch_profiler_path(
+    profile_filename_prefix, batch_size, input_len, output_len, stage, suffix=""
 ):
     output_dir = _get_torch_profiler_output_dir()
-    filename = f"{profile_filename_prefix}_batch{batch_size}_input{input_len}_output{output_len}_{stage}.trace.json.gz"
+    filename = f"{profile_filename_prefix}_batch{batch_size}_input{input_len}_output{output_len}_{stage}{suffix}"
     return os.path.join(output_dir, filename)
 
 
@@ -533,10 +572,14 @@ def latency_test_run_once(
     profiler = None
     enable_profile_prefill = profile and profile_stage in ["all", "prefill"]
     if enable_profile_prefill:
+        trace_filepath = _create_torch_profiler_path(
+            profile_filename_prefix, batch_size, input_len, output_len, "prefill", ""
+        )
         profiler = start_profile(
             profile_activities,
             profile_record_shapes=profile_record_shapes,
             rank_print=rank_print,
+            trace_dir=trace_filepath,
         )
 
     synchronize(device)
@@ -546,8 +589,13 @@ def latency_test_run_once(
     prefill_latency = time.perf_counter() - tic
 
     if enable_profile_prefill:
-        trace_filename = _create_torch_profiler_filename(
-            profile_filename_prefix, batch_size, input_len, output_len, "prefill"
+        trace_filename = _create_torch_profiler_path(
+            profile_filename_prefix,
+            batch_size,
+            input_len,
+            output_len,
+            "prefill",
+            ".trace.json.gz",
         )
         stop_profile(
             profiler,
@@ -573,10 +621,14 @@ def latency_test_run_once(
         synchronize(device)
         profiler = None
         if enable_profile_decode and i == profile_step_of_interest:
+            trace_filepath = _create_torch_profiler_path(
+                profile_filename_prefix, batch_size, input_len, output_len, "decode", ""
+            )
             profiler = start_profile(
                 profile_activities,
                 profile_record_shapes=profile_record_shapes,
                 rank_print=rank_print,
+                trace_dir=trace_filepath,
             )
 
         tic = time.perf_counter()
@@ -585,8 +637,13 @@ def latency_test_run_once(
         latency = time.perf_counter() - tic
 
         if enable_profile_decode and i == profile_step_of_interest:
-            trace_filename = _create_torch_profiler_filename(
-                profile_filename_prefix, batch_size, input_len, output_len, "decode"
+            trace_filename = _create_torch_profiler_path(
+                profile_filename_prefix,
+                batch_size,
+                input_len,
+                output_len,
+                "decode",
+                ".trace.json.gz",
             )
             stop_profile(
                 profiler,
