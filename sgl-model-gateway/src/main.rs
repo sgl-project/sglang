@@ -10,11 +10,11 @@ use sgl_model_gateway::{
         RouterConfig, RoutingMode, TokenizerCacheConfig, TraceConfig,
     },
     core::ConnectionMode,
+    ha::service::HAServerConfig,
     observability::{
         metrics::PrometheusConfig,
         otel_trace::{is_otel_enabled, shutdown_otel},
     },
-    ha::service::HAServerConfig,
     server::{self, ServerConfig},
     service_discovery::ServiceDiscoveryConfig,
     version,

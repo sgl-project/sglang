@@ -31,8 +31,8 @@ use crate::{
         },
         Job, JobQueue, JobQueueConfig, WorkerManager, WorkerType,
     },
-    ha_run,
     ha::service::HAServerConfig,
+    ha_run,
     middleware::{self, AuthConfig, QueuedRequest},
     observability::{
         logging::{self, LoggingConfig},
@@ -704,11 +704,13 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         metrics::start_prometheus(prometheus_config.clone());
     }
 
-    let ha_handler = config.ha_server_config.as_ref().map(|ha_server_config| ha_run!(
+    let ha_handler = config.ha_server_config.as_ref().map(|ha_server_config| {
+        ha_run!(
             ha_server_config.self_name,
             ha_server_config.self_addr,
             ha_server_config.init_peer
-        ));
+        )
+    });
 
     info!(
         "Starting router on {}:{} | mode: {:?} | policy: {:?} | max_payload: {}MB",

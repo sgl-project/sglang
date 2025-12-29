@@ -35,10 +35,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Generate both client and server code
         .build_server(true)
         .build_client(true)
-        .compile_protos(
-            &["src/ha/proto/gossip.proto"],
-            &["src/ha/proto"],
-        )?;
+        .compile_protos(&["src/ha/proto/gossip.proto"], &["src/ha/proto"])?;
 
     // Set version info environment variables
     let version = read_cargo_version().unwrap_or_else(|_| DEFAULT_VERSION.to_string());
