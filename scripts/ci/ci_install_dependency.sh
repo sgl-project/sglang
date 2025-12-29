@@ -215,7 +215,6 @@ fi
 # Show current packages
 $PIP_CMD list
 python3 -c "import torch; print(torch.version.cuda)"
-python3 -c "import cv2; print(f'OpenCV version: {cv2.__version__}')"
 
 # Prepare the CI runner (cleanup HuggingFace cache, etc.)
 bash "${SCRIPT_DIR}/prepare_runner.sh"
