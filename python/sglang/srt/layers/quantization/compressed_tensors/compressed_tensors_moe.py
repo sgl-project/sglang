@@ -125,6 +125,14 @@ class CompressedTensorsMoEMethod(FusedMoEMethodBase):
                         "Using NPUCompressedTensorsW4A16Int4DynamicMoEMethod"
                     )
                     return NPUCompressedTensorsW4A16Int4DynamicMoEMethod(quant_config)
+                elif (
+                    quant_config._is_dynamic_token_w4(weight_quant, input_quant)
+                    and input_quant is not None
+                ):
+                    logger.info_once(
+                        "Using NPUCompressedTensorsW4A8Int8DynamicMoEMethod"
+                    )
+                    return NPUCompressedTensorsW4A8Int8DynamicMoEMethod(quant_config)
         elif quant_config._is_fp4a4_nvfp4(weight_quant, input_quant):
             logger.info_once("Using CompressedTensorsW4A4Nvfp4MoEMethod")
             return CompressedTensorsW4A4Nvfp4MoEMethod(quant_config)
