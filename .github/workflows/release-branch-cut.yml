@@ -21,6 +21,8 @@ jobs:
     if: github.repository == 'sgl-project/sglang'
     runs-on: ubuntu-latest
     environment: 'prod'
+    outputs:
+      branch_name: ${{ steps.set_output.outputs.branch_name }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -83,6 +85,7 @@ jobs:
           echo "Branch '$BRANCH_NAME' does not exist, proceeding with creation"
 
       - name: Create and push release branch
+        id: set_output
         run: |
           COMMIT_SHA="${{ steps.validate.outputs.COMMIT_SHA }}"
           BRANCH_NAME="${{ github.event.inputs.branch_name }}"
@@ -96,6 +99,7 @@ jobs:
           # Push the new branch
           git push origin "$BRANCH_NAME"
 
+          echo "branch_name=$BRANCH_NAME" >> $GITHUB_OUTPUT
           echo "Successfully created and pushed branch '$BRANCH_NAME' from commit '$COMMIT_SHA'"
 
       - name: Summary
@@ -112,6 +116,41 @@ jobs:
           echo "| Triggered by | @${{ github.actor }} |" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "### Next Steps" >> $GITHUB_STEP_SUMMARY
-          echo "1. Test on the release branch" >> $GITHUB_STEP_SUMMARY
+          echo "1. Tests are automatically triggered on the release branch" >> $GITHUB_STEP_SUMMARY
           echo "2. Apply any hotfixes if needed" >> $GITHUB_STEP_SUMMARY
           echo "3. Create a tag to trigger release: \`gh workflow run release-tag.yml -f version=X.Y.Z -f ref=$BRANCH_NAME\`" >> $GITHUB_STEP_SUMMARY
+
+  run-nightly-tests-nvidia:
+    needs: cut-release-branch
+    uses: ./.github/workflows/nightly-test-nvidia.yml
+    with:
+      ref: ${{ needs.cut-release-branch.outputs.branch_name }}
+    secrets: inherit
+
+  run-nightly-tests-amd:
+    needs: cut-release-branch
+    uses: ./.github/workflows/nightly-test-amd.yml
+    with:
+      ref: ${{ needs.cut-release-branch.outputs.branch_name }}
+    secrets: inherit
+
+  run-nightly-tests-npu:
+    needs: cut-release-branch
+    uses: ./.github/workflows/nightly-test-npu.yml
+    with:
+      ref: ${{ needs.cut-release-branch.outputs.branch_name }}
+    secrets: inherit
+
+  run-pr-tests-xeon:
+    needs: cut-release-branch
+    uses: ./.github/workflows/pr-test-xeon.yml
+    with:
+      ref: ${{ needs.cut-release-branch.outputs.branch_name }}
+    secrets: inherit
+
+  run-pr-tests-xpu:
+    needs: cut-release-branch
+    uses: ./.github/workflows/pr-test-xpu.yml
+    with:
+      ref: ${{ needs.cut-release-branch.outputs.branch_name }}
+    secrets: inherit
