@@ -1,7 +1,7 @@
 """
 Test for parallel sampling log requests bug.
 
-This test verifies that the RequestLogger correctly handles
+This test verifies that RequestLogger correctly handles
 parallel sampling (n > 1) when log_requests_level >= 2.
 """
 import unittest
@@ -58,7 +58,7 @@ class TestRequestLoggerParallelSampling(unittest.TestCase):
             # Simulate batch_decode returning list of strings
             return [f"Hello_{i}" for i in range(len(input_ids_list))]
         
-        mock_tokenizer.batch_decode.side_effect = mock_batch_decode
+        mock_tokenizer.batch_decode.return_value = ["Hello_0", "Hello_1", "Hello_2"]
         
         # Create request with n=3 (parallel sampling)
         req = GenerateReqInput(
@@ -71,50 +71,47 @@ class TestRequestLoggerParallelSampling(unittest.TestCase):
         # and is_single becomes False
         self.assertFalse(req.is_single)
         
-        # This should fail with TypeError before fix because
-        # it tries tokenizer.decode() with List[List[int]]
         # After fix, it should use tokenizer.batch_decode()
-        try:
-            self.request_logger.log_received_request(req, mock_tokenizer)
-            # If we got here without error, the fix is working
-        except TypeError as e:
-            # This is the bug we're testing for
-            self.assertIn("cannot be interpreted as an integer", str(e))
-            # Bug is present
-            return
+        self.request_logger.log_received_request(req, mock_tokenizer)
         
-        # If we get here, the code should have used batch_decode
-        # For parallel sampling, batch_decode should be called
+        # If we get here, code should have used batch_decode
         self.assertEqual(mock_tokenizer.batch_decode.call_count, 1)
         call_args = mock_tokenizer.batch_decode.call_args
         input_ids_arg = call_args[0][0]
-        # For batch/parallel request, input_ids should be List[List[int]]
-        self.assertIsInstance(input_ids_arg, list)
-        if input_ids_arg and isinstance(input_ids_arg[0], list):
-            pass  # Correct: List[List[int]]
+        
+        # The type check for input_ids_arg can be made more explicit and robust
+        # by using an assertion to ensure it fails correctly if type is incorrect.
+        self.assertIsInstance(input_ids_arg, list, "input_ids_arg should be a list")
+        self.assertTrue(
+            input_ids_arg and isinstance(input_ids_arg[0], list),
+            "Elements of input_ids should be lists for a batch/parallel request."
+        )
+        # Also verify batch_decode was called instead of decode
+        self.assertEqual(mock_tokenizer.decode.call_count, 0, "decode() should not be called for parallel sampling")
 
     def test_log_received_request_with_batch_input_ids(self):
         """Test logging with batch input_ids directly."""
         # Create a mock tokenizer
         mock_tokenizer = Mock()
-        mock_tokenizer.batch_decode.side_effect = lambda x, skip_special_tokens: ["Text1", "Text2"]
+        mock_tokenizer.batch_decode.return_value = ["Text1", "Text2", "Text3"]
         
         # Create request with batch input_ids
         req = GenerateReqInput(
-            input_ids=[[1, 2, 3], [4, 5, 6]],
+            input_ids=[[1, 2, 3], [4, 5, 6], [7, 8, 9]],
             text=None,
             sampling_params={"n": 1},
         )
         req.normalize_batch_and_arguments()
         
         # Should not raise error
-        try:
-            self.request_logger.log_received_request(req, mock_tokenizer)
-        except Exception as e:
-            self.fail(f"log_received_request raised unexpected exception: {e}")
+        self.request_logger.log_received_request(req, mock_tokenizer)
         
         # Verify tokenizer.batch_decode was called with List[List[int]]
         self.assertEqual(mock_tokenizer.batch_decode.call_count, 1)
+        
+        # Validate that text field contains a decoded list
+        self.assertIsInstance(req.text, list, "text should be a list for batch request")
+        self.assertEqual(len(req.text), 3, "Should have 3 decoded texts")
 
     def test_log_received_request_level_below_2(self):
         """Test that log_requests_level < 2 doesn't decode input_ids."""
