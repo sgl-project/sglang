@@ -1317,6 +1317,7 @@ class NPUCompressedTensorsW4A8Int8DynamicMoEMethod(CompressedTensorsMoEMethod):
     ### TODO: Get rid of code duplication with python/sglang/srt/msmodelslim/msmodelslim_moe.py @OrangeRedeng @TamirBaydasov
     def __init__(self, quantization_config) -> None:
         self.group_size = 0
+        self.is_per_channel_weight = self.group_size == 0
         self.tp_size = 1
         self.activation_use_clip = (
             self.quantization_config.get("config_groups", {})
@@ -1336,7 +1337,6 @@ class NPUCompressedTensorsW4A8Int8DynamicMoEMethod(CompressedTensorsMoEMethod):
     ) -> None:
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
 
-        self.is_per_channel_weight = self.group_size == 0
         self.num_experts = num_experts
         extra_weight_attrs.update(
             {"quant_method": FusedMoeWeightScaleSupported.CHANNEL.value}
@@ -1543,7 +1543,7 @@ class NPUCompressedTensorsW4A8Int8DynamicMoEMethod(CompressedTensorsMoEMethod):
         set_weight_attrs(w2_scale_bias, extra_weight_attrs)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        self.kernel.process_weights_after_loading(layer)
+        self.kernel.process_weights_after_loading(layer, self.is_per_channel_weight, self.activation_use_clip)
 
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
