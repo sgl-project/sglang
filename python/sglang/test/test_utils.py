@@ -2028,23 +2028,28 @@ def dump_metric(metric_name: str, value: Any, labels: Optional[dict] = None):
                 with open(jsonl_path, "a", encoding="utf-8") as f:
                     f.write(json.dumps(record, ensure_ascii=False) + "\n")
             except Exception as e:
-                logging.warning(f"sglang.test.dump_metric: failed to write to {jsonl_path}: {e}")
-                pass  # Silently ignore write failures
+                logging.warning(
+                    f"sglang.test.dump_metric: failed to write to {jsonl_path}: {e}"
+                )
 
         # 6. Output to stdout (use same labels as record)
         if labels_for_output:
             if isinstance(labels_for_output, str):
                 labels_str = f" labels='{labels_for_output}'"
             else:
-                labels_str = f" labels={json.dumps(labels_for_output, ensure_ascii=False)}"
+                labels_str = (
+                    f" labels={json.dumps(labels_for_output, ensure_ascii=False)}"
+                )
         else:
             labels_str = ""
         print(f"[METRIC] {metric_name}={converted_value}{labels_str}")
 
     except Exception as e:
         # Silent failure - never break tests
-        logging.warning(f"sglang.test.dump_metric: failed to dump metric '{metric_name}': {e}", exc_info=True)
-        pass
+        logging.warning(
+            f"sglang.test.dump_metric: failed to dump metric '{metric_name}': {e}",
+            exc_info=True,
+        )
 
 
 def _get_test_context() -> tuple[str, str]:
