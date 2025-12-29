@@ -227,7 +227,11 @@ class ModelSlimW4A8Int8MoE(ModelSlimMoEMethod):
         set_weight_attrs(w2_scale_bias, extra_weight_attrs)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        self.kernel.process_weights_after_loading(layer, self.is_per_channel_weight, self.activation_use_clip)
+        self.kernel.process_weights_after_loading(
+            layer, 
+            self.is_per_channel_weight, 
+            self.activation_use_clip
+        )
 
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: "MoeRunnerConfig"
