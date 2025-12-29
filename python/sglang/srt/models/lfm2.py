@@ -345,28 +345,26 @@ class Lfm2ShortConv(nn.Module):
                 self.conv.weight.size(0), self.conv.weight.size(2)
             )
             Bx_for_conv = Bx.squeeze(1)
-            if forward_batch.extend_seq_lens is not None:
-                seq_lens = forward_batch.extend_seq_lens
-                split_Bx = torch.split(Bx_for_conv, seq_lens.tolist())
+            seq_lens = forward_batch.extend_seq_lens
+            split_Bx = torch.split(Bx_for_conv, seq_lens.tolist())
 
-                for i, seq_bx in enumerate(split_Bx):
-                    cache_idx = forward_metadata.mamba_cache_indices[i]
-                    seq_len = seq_bx.shape[0]
-                    if seq_len >= self.kernel_size - 1:
-                        new_conv_state = seq_bx[-(self.kernel_size - 1) :, :]
-                    else:
-                        padding = torch.zeros(
-                            self.kernel_size - 1 - seq_len,
-                            self.hidden_size,
-                            dtype=seq_bx.dtype,
-                            device=seq_bx.device,
-                        )
-                        new_conv_state = torch.cat([padding, seq_bx], dim=0)
+            for i, seq_bx in enumerate(split_Bx):
+                cache_idx = forward_metadata.mamba_cache_indices[i]
+                seq_len = seq_bx.shape[0]
+                if seq_len >= self.kernel_size - 1:
+                    new_conv_state = seq_bx[-(self.kernel_size - 1) :, :]
+                else:
+                    padding = torch.zeros(
+                        self.kernel_size - 1 - seq_len,
+                        self.hidden_size,
+                        dtype=seq_bx.dtype,
+                        device=seq_bx.device,
+                    )
+                    new_conv_state = torch.cat([padding, seq_bx], dim=0)
 
-                    conv_cache[cache_idx, : self.hidden_size, :] = new_conv_state.t()
+                conv_cache[cache_idx, : self.hidden_size, :] = new_conv_state.t()
 
             conv_outs = []
-            split_Bx = torch.split(Bx_for_conv, seq_lens.tolist())
             for seq_bx in split_Bx:
                 seq_bx_conv = seq_bx.unsqueeze(0).transpose(1, 2)
                 conv_out_seq = causal_conv1d_fn(
@@ -599,7 +597,10 @@ class Lfm2Model(nn.Module):
         aux_hidden_states = []
         for i in range(self.start_layer, self.end_layer):
             if i in self.layers_to_capture:
-                aux_hidden_states.append(hidden_states + residual)
+                if residual is not None:
+                    aux_hidden_states.append(hidden_states + residual)
+                else:
+                    aux_hidden_states.append(hidden_states)
 
             layer = self.layers[i]
             hidden_states, residual = layer(
