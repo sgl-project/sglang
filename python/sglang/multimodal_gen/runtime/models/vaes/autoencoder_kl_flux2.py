@@ -39,7 +39,7 @@ class AutoencoderKLFlux2(ParallelTiledVAE):
         self,
         config: Flux2VAEConfig,
     ):
-        super().__init__()
+        super().__init__(config=config)
 
         self.config = config
         arch_config = config.arch_config
