@@ -1,5 +1,7 @@
 import unittest
 
+import torch
+
 from sglang.srt.utils import kill_process_tree
 from sglang.test.kits.ebnf_constrained_kit import TestEBNFConstrainedMinxin
 from sglang.test.kits.json_constrained_kit import TestJSONConstrainedMixin
@@ -70,6 +72,7 @@ class TestLLGuidanceBackend(
 
 
 # Test with TP=2
+@unittest.skipIf(torch.cuda.device_count() < 2, "Requires at least 2 GPUs")
 class TestXGrammarBackendTP2(
     ServerWithGrammar,
     TestJSONConstrainedMixin,
@@ -80,11 +83,13 @@ class TestXGrammarBackendTP2(
     tp_size = 2
 
 
+@unittest.skipIf(torch.cuda.device_count() < 2, "Requires at least 2 GPUs")
 class TestOutlinesBackendTP2(ServerWithGrammar, TestJSONConstrainedMixin):
     backend = "outlines"
     tp_size = 2
 
 
+@unittest.skipIf(torch.cuda.device_count() < 2, "Requires at least 2 GPUs")
 class TestLLGuidanceBackendTP2(
     ServerWithGrammar,
     TestJSONConstrainedMixin,
