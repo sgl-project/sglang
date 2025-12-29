@@ -375,44 +375,48 @@ impl Router {
             })
             .unwrap_or_default();
 
-        let futures = workers.into_iter().map(|worker| {
-            let worker_url = worker.url();
-            let base = self.worker_base_url(worker_url);
+        let futures: Vec<_> = workers
+            .into_iter()
+            .map(|worker| {
+                let worker_url = worker.url();
+                let base = self.worker_base_url(worker_url);
+                let url = format!("{}/{}", base, endpoint);
+                let client = self.client.clone();
+                let method = method.clone();
 
-            let url = format!("{}/{}", base, endpoint);
-            let client = self.client.clone();
-            let method = method.clone();
-            let headers = filtered_headers.clone();
-            let api_key = worker.api_key().clone();
+                let headers = filtered_headers.clone();
 
-            async move {
-                let mut request_builder = match method {
-                    Method::GET => client.get(url),
-                    Method::POST => client.post(url),
-                    _ => {
-                        return Err(error::method_not_allowed(
-                            "unsupported_method",
-                            "Unsupported method for simple routing",
-                        ))
+                let api_key = worker.api_key().clone();
+
+                async move {
+                    let mut request_builder = match method {
+                        Method::GET => client.get(url),
+                        Method::POST => client.post(url),
+                        _ => {
+                            return Err(error::method_not_allowed(
+                                "unsupported_method",
+                                "Unsupported method for simple routing",
+                            ))
+                        }
+                    };
+
+                    if let Some(key) = api_key {
+                        let mut auth_header = String::with_capacity(7 + key.len());
+                        auth_header.push_str("Bearer ");
+                        auth_header.push_str(&key);
+                        request_builder = request_builder.header("Authorization", auth_header);
                     }
-                };
 
-                if let Some(key) = api_key {
-                    let mut auth_header = String::with_capacity(7 + key.len());
-                    auth_header.push_str("Bearer ");
-                    auth_header.push_str(&key);
-                    request_builder = request_builder.header("Authorization", auth_header);
+                    for (name, value) in headers {
+                        request_builder = request_builder.header(name.clone(), value.clone());
+                    }
+
+                    request_builder.send().await.map_err(convert_reqwest_error)
                 }
+            })
+            .collect();
 
-                for (name, value) in headers {
-                    request_builder = request_builder.header(name.clone(), value.clone());
-                }
-
-                request_builder.send().await.map_err(convert_reqwest_error)
-            }
-        });
-
-        // execute up to 32 requests concurrently
+        // Now execute the collected futures concurrently
         let mut stream = stream::iter(futures).buffer_unordered(32);
         let mut last_response: Option<Response> = None;
 
@@ -421,12 +425,15 @@ impl Router {
                 Ok(res) => {
                     let status = StatusCode::from_u16(res.status().as_u16())
                         .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+
                     let response_headers = header_utils::preserve_response_headers(res.headers());
+
                     match res.bytes().await {
                         Ok(body) => {
                             let mut response = Response::new(Body::from(body));
                             *response.status_mut() = status;
                             *response.headers_mut() = response_headers;
+
                             if status.is_success() {
                                 return response;
                             }
