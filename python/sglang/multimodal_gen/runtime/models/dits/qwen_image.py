@@ -17,7 +17,11 @@ from diffusers.models.normalization import AdaLayerNormContinuous
 
 from sglang.multimodal_gen.configs.models.dits.qwenimage import QwenImageDitConfig
 from sglang.multimodal_gen.runtime.layers.attention import USPAttention
-from sglang.multimodal_gen.runtime.layers.layernorm import LayerNorm, RMSNorm
+from sglang.multimodal_gen.runtime.layers.layernorm import (
+    LayerNorm,
+    RMSNorm,
+    apply_qk_norm,
+)
 from sglang.multimodal_gen.runtime.layers.linear import ReplicatedLinear
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
     apply_flashinfer_rope_qk_inplace,
@@ -547,14 +551,23 @@ class QwenImageCrossAttention(nn.Module):
         txt_value = txt_value.unflatten(-1, (self.num_heads, -1))
 
         # Apply QK normalization
-        if self.norm_q is not None:
-            img_query = self.norm_q(img_query)
-        if self.norm_k is not None:
-            img_key = self.norm_k(img_key)
-        if self.norm_added_q is not None:
-            txt_query = self.norm_added_q(txt_query)
-        if self.norm_added_k is not None:
-            txt_key = self.norm_added_k(txt_key)
+        if self.qk_norm:
+            img_query, img_key = apply_qk_norm(
+                q=img_query,
+                k=img_key,
+                q_norm=self.norm_q,
+                k_norm=self.norm_k,
+                head_dim=img_query.shape[-1],
+                allow_inplace=True,
+            )
+            txt_query, txt_key = apply_qk_norm(
+                q=txt_query,
+                k=txt_key,
+                q_norm=self.norm_added_q,
+                k_norm=self.norm_added_k,
+                head_dim=txt_query.shape[-1],
+                allow_inplace=True,
+            )
 
         # Apply RoPE
         if image_rotary_emb is not None:
