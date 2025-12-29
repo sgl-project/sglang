@@ -686,6 +686,7 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
 
         # Apply gate_up_proj LoRA: hidden_states -> intermediate space
         # Store result in intermediate cache (no base_output means allocate new tensor)
+        # Note: topk_weights are NOT applied here - they are applied on the final down_proj output
         _, _ = per_expert_lora_forward(
             hidden_states=hidden_states,
             lora_a_weights=self.gate_up_lora_a_weights,
@@ -698,9 +699,11 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
             num_experts=num_experts,
             base_output=lora_intermediate_cache,  # Store in our intermediate cache
             is_down_proj=False,
+            topk_weights=None,  # No router weight multiplication for gate_up
         )
 
         # Apply down_proj LoRA: intermediate space -> hidden space, added to base_output
+        # Router weights (topk_weights) are applied here to scale each expert's contribution
         if (
             self.down_lora_a_weights is not None
             and self.down_lora_b_weights is not None
@@ -717,6 +720,7 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
                 num_experts=num_experts,
                 base_output=base_output,  # Add directly to base_output in-place
                 is_down_proj=True,
+                topk_weights=sorted_topk_weights,  # Apply router weights to final output
             )
 
     def slice_lora_a_weights(self, A: torch.Tensor, tp_rank: int):

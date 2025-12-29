@@ -31,6 +31,7 @@ def _per_expert_lora_kernel(
     token_ids_ptr,  # [num_dispatched] -> index into hidden/output
     expert_ids_ptr,  # [num_dispatched]
     lora_ids_ptr,  # [num_dispatched]
+    topk_weights_ptr,  # [num_dispatched] - Router weights for each dispatched token
     # Dimensions
     input_dim: tl.constexpr,
     output_dim: tl.constexpr,
@@ -53,6 +54,8 @@ def _per_expert_lora_kernel(
     lora_scalings_ptr,
     # Block size (used for input and output tiling; rank is not tiled)
     BLOCK_SIZE: tl.constexpr,
+    # Whether to multiply by router weights
+    MUL_ROUTED_WEIGHT: tl.constexpr,
 ):
     """
     Compute per-expert LoRA delta:
@@ -190,6 +193,11 @@ def _per_expert_lora_kernel(
     # Apply scaling
     out_vals *= scaling
 
+    # Apply router weight if enabled (matches base MoE behavior)
+    if MUL_ROUTED_WEIGHT:
+        topk_weight = tl.load(topk_weights_ptr + spatial_id)
+        out_vals *= topk_weight
+
     # ----------------------------
     # Accumulate into global output (base_output) and store to lora_output
     # ----------------------------
@@ -222,6 +230,7 @@ def per_expert_lora_forward(
     num_experts: int,
     base_output: torch.Tensor = None,
     is_down_proj: bool = False,
+    topk_weights: torch.Tensor = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Forward pass for per-expert LoRA computation using a 3D Triton grid:
@@ -241,6 +250,8 @@ def per_expert_lora_forward(
         base_output: [num_tokens, output_dim] - Base MoE output (modified in-place)
         is_down_proj: Whether this is for down_proj (intermediate_dim -> hidden_dim)
                      or gate_up_proj (hidden_dim -> intermediate_dim)
+        topk_weights: [num_dispatched] - Router weights for each dispatched token.
+                     Always multiplied by output (router weights are applied to final output).
 
     Returns:
         tuple of:
@@ -266,6 +277,14 @@ def per_expert_lora_forward(
     lora_ids = lora_ids.contiguous()
     lora_ranks = lora_ranks.contiguous()
     lora_scalings = lora_scalings.contiguous()
+
+    # Handle topk_weights (always provided, but only applied for down_proj)
+    mul_routed_weight = is_down_proj  # Apply router weights only to down_proj output
+    if topk_weights is not None:
+        topk_weights = topk_weights.contiguous()
+    else:
+        # Create dummy tensor if not provided
+        topk_weights = torch.empty(0, device=device, dtype=dtype)
 
     # Initialize or reuse output tensor for in-place addition
     if base_output is None:
@@ -312,6 +331,7 @@ def per_expert_lora_forward(
         token_ids,  # token_ids_ptr
         expert_ids,  # expert_ids_ptr
         lora_ids,  # lora_ids_ptr
+        topk_weights,  # topk_weights_ptr
         # Dimensions
         input_dim,  # input_dim (hidden_dim for gate_up_proj, intermediate_dim for down_proj)
         output_dim,  # output_dim (intermediate_dim for gate_up_proj, hidden_dim for down_proj)
@@ -333,6 +353,8 @@ def per_expert_lora_forward(
         lora_scalings,  # lora_scalings_ptr
         # Block size (constexpr)
         BLOCK_SIZE=BLOCK_SIZE,
+        # Router weight multiplication flag
+        MUL_ROUTED_WEIGHT=mul_routed_weight,
     )
 
     return output, lora_output
