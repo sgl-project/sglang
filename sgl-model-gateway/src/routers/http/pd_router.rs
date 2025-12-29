@@ -806,6 +806,7 @@ impl PDRouter {
                 &available_workers,
                 &SelectWorkerInfo {
                     request_text,
+                    tokens: None, // HTTP doesn't have tokens, use gRPC for PrefixHash
                     headers,
                     hash_ring,
                 },
