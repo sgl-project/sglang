@@ -370,6 +370,7 @@ class MambaRadixCache(BasePrefixCache):
         self.page_size = params.page_size
         self.disable = params.disable
         self.enable_mamba_extra_buffer = params.enable_mamba_extra_buffer
+        self.store_decode_only = params.store_decode_only
 
         if not self.enable_mamba_extra_buffer:
             assert (
@@ -591,7 +592,7 @@ class MambaRadixCache(BasePrefixCache):
             if self.enable_mamba_extra_buffer
             else len(token_ids)
         )
-        if self.disable or cache_len is None:
+        if self.disable or cache_len is None or self.store_decode_only:
             return _skip_cache_unfinished_req(req)
 
         kv_indices_orig = self.req_to_token_pool.req_to_token[

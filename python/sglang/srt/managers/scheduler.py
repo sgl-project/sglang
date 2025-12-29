@@ -635,6 +635,7 @@ class Scheduler(
             enable_metrics=self.enable_metrics,
             enable_kv_cache_events=self.enable_kv_cache_events,
             enable_mamba_extra_buffer=server_args.enable_mamba_extra_buffer(),
+            store_decode_only=server_args.mamba_store_decode_only,
         )
 
         if (
