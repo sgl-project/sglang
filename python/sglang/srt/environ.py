@@ -6,6 +6,29 @@ from enum import IntEnum
 from typing import Any
 
 
+@contextmanager
+def temp_set_env(**env_vars: dict[str, Any]):
+    """Temporarily set non-sglang environment variables, e.g. OPENAI_API_KEY"""
+    for key in env_vars:
+        if key.startswith("SGLANG_") or key.startswith("SGL_"):
+            raise ValueError("temp_set_env should not be used for sglang env vars")
+
+    backup = {key: os.environ.get(key) for key in env_vars}
+    try:
+        for key, value in env_vars.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = str(value)
+        yield
+    finally:
+        for key, value in backup.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
 class EnvField:
     _allow_set_name = True
 
@@ -139,6 +162,7 @@ class Envs:
     SGLANG_LOG_FORWARD_ITERS = EnvBool(False)
     SGLANG_LOG_MS = EnvBool(False)
     SGLANG_DISABLE_REQUEST_LOGGING = EnvBool(False)
+    SGLANG_LOG_REQUEST_EXCEEDED_MS = EnvInt(-1)
 
     # SGLang CI
     SGLANG_IS_IN_CI = EnvBool(False)
@@ -146,9 +170,11 @@ class Envs:
     SGLANG_TEST_MAX_RETRY = EnvInt(None)
 
     # Test & Debug
+    SGLANG_DETECT_SLOW_RANK = EnvBool(False)
     SGLANG_TEST_STUCK_DETOKENIZER = EnvFloat(0)
     SGLANG_TEST_STUCK_DP_CONTROLLER = EnvFloat(0)
     SGLANG_TEST_STUCK_TOKENIZER = EnvFloat(0)
+    SGLANG_TEST_CRASH_AFTER_STREAM_OUTPUTS = EnvInt(0)
     IS_BLACKWELL = EnvBool(False)
     IS_H200 = EnvBool(False)
     SGLANG_SET_CPU_AFFINITY = EnvBool(False)
@@ -166,6 +192,7 @@ class Envs:
     SGLANG_OTLP_EXPORTER_SCHEDULE_DELAY_MILLIS = EnvInt(500)
     SGLANG_OTLP_EXPORTER_MAX_EXPORT_BATCH_SIZE = EnvInt(64)
     SGLANG_NATIVE_MOVE_KV_CACHE = EnvBool(False)
+    SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK = EnvBool(True)
 
     # Scheduler: memory leak test
     SGLANG_TEST_RETRACT = EnvBool(False)
@@ -173,7 +200,6 @@ class Envs:
     SGLANG_TEST_RETRACT_NO_PREFILL_BS = EnvInt(2 ** 31)
     SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY = EnvInt(0)
     SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE = EnvBool(True)
-    SGLANG_CI_SMALL_KV_SIZE = EnvInt(-1)
 
     # Scheduler: new token ratio hyperparameters
     SGLANG_INIT_NEW_TOKEN_RATIO = EnvFloat(0.7)
@@ -225,6 +251,7 @@ class Envs:
     # Mooncake Store
     SGLANG_HICACHE_MOONCAKE_CONFIG_PATH = EnvStr(None)
     MOONCAKE_MASTER = EnvStr(None)
+    MOONCAKE_CLIENT = EnvStr(None)
     MOONCAKE_LOCAL_HOSTNAME = EnvStr("localhost")
     MOONCAKE_TE_META_DATA_SERVER = EnvStr("P2PHANDSHAKE")
     MOONCAKE_GLOBAL_SEGMENT_SIZE = EnvStr("4gb")
@@ -232,6 +259,7 @@ class Envs:
     MOONCAKE_DEVICE = EnvStr("")
     MOONCAKE_MASTER_METRICS_PORT = EnvInt(9003)
     MOONCAKE_CHECK_SERVER = EnvBool(False)
+    MOONCAKE_STANDALONE_STORAGE = EnvBool(False)
 
     # AMD & ROCm
     SGLANG_USE_AITER = EnvBool(False)
@@ -241,6 +269,7 @@ class Envs:
     # NPU
     SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT = EnvBool(False)
     SGLANG_NPU_USE_MULTI_STREAM = EnvBool(False)
+    SGLANG_NPU_USE_MLAPO = EnvBool(False)
 
     # Quantization
     SGLANG_INT4_WEIGHT = EnvBool(False)
@@ -250,6 +279,7 @@ class Envs:
     SGLANG_MOE_NVFP4_DISPATCH = EnvBool(False)
     SGLANG_NVFP4_CKPT_FP8_GEMM_IN_ATTN = EnvBool(False)
     SGLANG_PER_TOKEN_GROUP_QUANT_8BIT_V2 = EnvBool(False)
+    SGLANG_NVFP4_CKPT_FP8_NEXTN_MOE = EnvBool(False)
 
     # Flashinfer
     SGLANG_IS_FLASHINFER_AVAILABLE = EnvBool(True)
@@ -416,6 +446,10 @@ def _convert_SGL_to_SGLANG():
     )
     _print_deprecated_env(
         "SGLANG_MOE_NVFP4_DISPATCH", "SGLANG_CUTEDSL_MOE_NVFP4_DISPATCH"
+    )
+    _print_deprecated_env(
+        "SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK",
+        "SGL_DISABLE_TP_MEMORY_INBALANCE_CHECK",
     )
 
     for key, value in os.environ.items():

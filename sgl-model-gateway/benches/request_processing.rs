@@ -67,7 +67,6 @@ fn default_generate_request() -> GenerateRequest {
         return_bytes: false,
         return_entropy: false,
         rid: None,
-        routing_id: None,
     }
 }
 
@@ -123,7 +122,6 @@ fn default_completion_request() -> CompletionRequest {
         return_hidden_states: false,
         sampling_seed: None,
         other: serde_json::Map::new(),
-        routing_id: None,
     }
 }
 
@@ -579,8 +577,8 @@ fn bench_full_round_trip(c: &mut Criterion) {
 fn benchmark_summary(c: &mut Criterion) {
     let group = c.benchmark_group("benchmark_summary");
 
-    println!("\nSGLang Router Performance Benchmark Suite");
-    println!("=============================================");
+    println!("\nSGLang Model Gateway Performance Benchmark Suite");
+    println!("=================================================");
 
     // Quick performance overview
     let generate_req = create_sample_generate_request();
