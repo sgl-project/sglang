@@ -30,11 +30,13 @@ class RequestTrackers:
         device: torch.device,
         num_layers: int,
         min_sparse_prompt_len: int,
+        lru_len: int,
         max_context_len: int,
     ):
         self.device = device
         self.num_layers = num_layers
         self.top_k = min_sparse_prompt_len
+        self.lru_len = lru_len
 
         self.repr_constructed = torch.zeros(
             max_pool_size, dtype=torch.bool, device=device
@@ -53,32 +55,32 @@ class RequestTrackers:
             device=device,
         )
         self.curr_device_indices = torch.full(
-            (max_pool_size, self.top_k),
+            (max_pool_size, self.lru_len),
             -1,
             dtype=torch.int32,
             device=device,
         )
         self.should_load_device_indices = torch.full(
-            (max_pool_size, self.top_k),
+            (max_pool_size, self.lru_len),
             -1,
             dtype=torch.int64,
             device=device,
         )
         self.should_load_host_indices = torch.full(
-            (max_pool_size, self.top_k),
+            (max_pool_size, self.lru_len),
             -1,
             dtype=torch.int64,
             device=device,
         )
 
         self.prev_top_k_result = torch.full(
-            (max_pool_size, num_layers, self.top_k),
+            (max_pool_size, num_layers, self.lru_len),
             -1,
             dtype=torch.int64,
             device=device,
         )
         self.prev_device_indices = torch.full(
-            (max_pool_size, num_layers, self.top_k),
+            (max_pool_size, num_layers, self.lru_len),
             -1,
             dtype=torch.int64,
             device=device,
@@ -119,6 +121,7 @@ class SparseConfig:
     page_size: int = 64
     sparse_ratio: float = 0.5
     min_sparse_prompt_len: int = 2048
+    lru_len: int = 4096
 
 
 class SparseCoordinator:
@@ -153,6 +156,7 @@ class SparseCoordinator:
             device,
             end_layer - start_layer + 1,
             self.config.min_sparse_prompt_len,
+            self.config.lru_len,
             self.req_to_token_pool.max_context_len,
         )
         if self.sparse_kv_cache_manager is not None:
@@ -182,7 +186,7 @@ class SparseCoordinator:
         if (
             req.req_pool_idx is None
             or self.sparse_kv_cache_manager is None
-            or len(req.origin_input_ids) < self.config.min_sparse_prompt_len
+            or len(req.origin_input_ids) < self.config.lru_len
         ):
             return
 
@@ -191,7 +195,7 @@ class SparseCoordinator:
         self.sparse_kv_cache_manager.check_prefill_offload_progress()
 
         # Store previous device indices
-        indices_len = self.config.min_sparse_prompt_len
+        indices_len = self.config.lru_len
         self.states.prev_device_indices[req.req_pool_idx] = (
             self.req_to_token_pool.req_to_token[req.req_pool_idx, :indices_len]
         )
@@ -232,7 +236,7 @@ class SparseCoordinator:
 
         offload_mask = (
             self.states.prompt_lens[forward_batch.req_pool_indices]
-            >= self.config.min_sparse_prompt_len
+            >= self.config.lru_len
         )
         if offload_mask.any():
             self.sparse_kv_cache_manager.offload_sparse_decode_req_tokens(
@@ -329,7 +333,7 @@ class SparseCoordinator:
     def _compute_sparse_mask(self, req_pool_indices):
         mask = (
             self.states.prompt_lens[req_pool_indices]
-            >= self.config.min_sparse_prompt_len
+            >= self.config.lru_len
         )
 
         if not isinstance(self.algorithm, DeepSeekNSAAlgorithm):

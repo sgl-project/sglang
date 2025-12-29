@@ -118,10 +118,11 @@ class SparseKVCacheManager:
             page_table,
             layer_id,
             page_size,
+            self.req_states.lru_len
         )
 
-        should_load_device_indices = self.req_states.should_load_device_indices[:bs]
-        should_load_host_indices = self.req_states.should_load_host_indices[:bs]
+        should_load_device_indices = self.req_states.should_load_device_indices[:bs, :self.req_states.top_k]
+        should_load_host_indices = self.req_states.should_load_host_indices[:bs, :self.req_states.top_k]
 
         # load cache from cpu
         self.host_mem_pool.load_to_device_per_layer(
@@ -133,7 +134,7 @@ class SparseKVCacheManager:
             io_block_num=bs,
         )
 
-        return self.req_states.curr_device_indices[:bs]
+        return self.req_states.curr_device_indices[:bs, :self.req_states.top_k]
 
     def offload_sparse_decode_req_tokens(
         self, req_pool_indices, out_alloc_len, seq_lens

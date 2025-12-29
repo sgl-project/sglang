@@ -31,10 +31,12 @@ def nsa_sparse_diff_triton_kernel(
     page_table_s: tl.constexpr,
     layer_id,
     TOPK: tl.constexpr,
+    LRU_LEN: tl.constexpr,
 ):
     """Optimized version with vectorized operations instead of serial loops."""
     bid = tl.program_id(0)
     offset = tl.arange(0, TOPK)
+    offset_lru = tl.arange(0, LRU_LEN)
     req_idx = tl.load(req_idx_ptr + bid)
     seq_len = tl.load(seq_len_ptr + bid) - 1
     out_cache_loc = tl.load(out_cache_loc_ptr + bid)
@@ -48,9 +50,9 @@ def nsa_sparse_diff_triton_kernel(
     load_host_base = load_host_idx_ptr + load_host_s * bid
 
     # ----  Refill -1 ----
-    tl.store(curr_dev_base + offset, -1)
-    tl.store(load_dev_base + offset, -1)
-    tl.store(load_host_base + offset, -1)
+    tl.store(curr_dev_base + offset_lru, -1)
+    tl.store(load_dev_base + offset_lru, -1)
+    tl.store(load_host_base + offset_lru, -1)
 
     # Handling reqs where seq_len < min_sparse_len
     sparse_mask_val = tl.load(sparse_mask_ptr + bid)
@@ -64,9 +66,9 @@ def nsa_sparse_diff_triton_kernel(
         return
 
     # ----- Calculate intersection of prev_topk and curr_topk -----
-    prev_topk = tl.load(prev_topk_base + offset)
-    curr_topk = tl.load(curr_topk_base + offset)
-    tl.store(diff_map_ptr + diff_map_s * bid + prev_topk, offset)
+    prev_topk = tl.load(prev_topk_base + offset_lru)
+    curr_topk_origin = tl.load(curr_topk_base + offset)
+    tl.store(diff_map_ptr + diff_map_s * bid + prev_topk, offset_lru)
     tl.debug_barrier()
 
     # 1. remove previous step's out_cache_loc
@@ -76,7 +78,7 @@ def nsa_sparse_diff_triton_kernel(
         tl.store(prev_dev_base + prev_cache_idx, -1)
 
     # 2. get intersection and store
-    exist_topk_idx = tl.load(diff_map_ptr + diff_map_s * bid + curr_topk)
+    exist_topk_idx = tl.load(diff_map_ptr + diff_map_s * bid + curr_topk_origin)
     mask = exist_topk_idx >= 0
     existing_dev_idx = tl.load(prev_dev_base + exist_topk_idx, mask=mask)
     tl.store(curr_dev_base + offset, existing_dev_idx, mask=mask)
@@ -97,40 +99,53 @@ def nsa_sparse_diff_triton_kernel(
     tl.store(load_host_base + offset, no_exist_host_indices, mask=host_mask)
 
     # 5. set out_cache_loc
-    out_cache_loc_mask = curr_topk == seq_len
+    out_cache_loc_mask = curr_topk_origin == seq_len
     tl.store(curr_dev_base + offset, out_cache_loc, mask=out_cache_loc_mask)
 
     # 6. get empty slots in curr_dev
-    curr_dev = tl.load(curr_dev_base + offset)
+    curr_dev = tl.load(curr_dev_base + offset_lru)
+    curr_topk = tl.load(curr_topk_base + offset_lru)
     empty_slots = curr_dev == -1
     empty_slots_int = empty_slots.to(tl.int32)
-    fill_count = tl.sum(empty_slots_int)
     fill_cumsum = tl.cumsum(empty_slots_int, axis=0)
     fill_pos = fill_cumsum - empty_slots_int
 
+    empty_slots_topk = tl.where(offset_lru<TOPK, empty_slots_int, 0)
+    fill_count = tl.sum(empty_slots_topk)
+
     # 7. get non-empty slots in prev_dev
-    dev_vals = tl.load(prev_dev_base + offset)
+    dev_vals = tl.load(prev_dev_base + offset_lru)
+    dev_topk = tl.load(prev_topk_base + offset_lru)
     dev_valid = dev_vals != -1
     dev_valid_int = dev_valid.to(tl.int32)
+    dev_valid_count = tl.sum(dev_valid_int)
     dev_cumsum = tl.cumsum(dev_valid_int, axis=0)
     dev_pos = dev_cumsum - dev_valid_int
+    move_count = dev_valid_count - fill_count
+    fill_slots = dev_pos >= move_count
+    dev_pos = tl.where(fill_slots, dev_pos - move_count, dev_pos + fill_count)
 
     # 8. Store the slots that need to be loaded and left-aligned.
     tl.store(load_dev_base + dev_pos, dev_vals, mask=dev_valid)
-    tl.store(load_dev_base + offset, -1, mask=offset >= fill_count)
-    host_vals_all = tl.load(load_host_base + offset)
-    tl.store(load_host_base + fill_pos, host_vals_all, mask=empty_slots)
-    tl.store(load_host_base + offset, -1, mask=offset >= fill_count)
+    tl.store(prev_topk_base + dev_pos, dev_topk, mask=dev_valid)
+
 
     # 9. merge slots
     fill_vals = tl.load(load_dev_base + fill_pos, mask=empty_slots, other=-1)
+    fill_topk = tl.load(prev_topk_base + fill_pos, mask=empty_slots, other=-1)
     final_dev = tl.where(empty_slots, fill_vals, curr_dev)
-    tl.store(curr_dev_base + offset, final_dev)
+    final_topk = tl.where(empty_slots, fill_topk, curr_topk)
+    tl.store(curr_dev_base + offset_lru, final_dev)
+    tl.store(prev_dev_base + offset_lru, final_dev)
+    tl.store(prev_topk_base + offset_lru, final_topk)
+    tl.store(prev_topk_base + offset, curr_topk_origin)
 
-    # 10. Update state
-    tl.store(prev_topk_base + offset, curr_topk)
-    tl.store(prev_dev_base + offset, final_dev)
-    # tl.store(curr_topk_base + offset, curr_topk)
+
+    tl.store(load_dev_base + offset_lru, -1, mask=offset_lru >= fill_count)
+    host_vals_all = tl.load(load_host_base + offset_lru)
+    tl.store(load_host_base + fill_pos, host_vals_all, mask=empty_slots)
+    tl.store(load_host_base + offset_lru, -1, mask=offset_lru >= fill_count)
+
 
 
 def invoke_nsa_sparse_diff_kernel(
@@ -149,6 +164,7 @@ def invoke_nsa_sparse_diff_kernel(
     page_table: torch.Tensor,
     layer_id: int,
     page_size: int,
+    lru_len: int,
 ):
     bs = curr_top_k_result.shape[0]
     top_k = curr_top_k_result.shape[1]
@@ -181,6 +197,7 @@ def invoke_nsa_sparse_diff_kernel(
         page_table.stride(0),
         layer_id,
         top_k,
+        lru_len,
     )
 
 

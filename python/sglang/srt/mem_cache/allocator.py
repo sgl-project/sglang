@@ -172,7 +172,7 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         return self._kvcache.load_cpu_copy(kv_cache_cpu, indices)
 
 
-HIERARCHICAL_NSA_DECODE_MAX_TOKENS = 2048 + 1
+HIERARCHICAL_NSA_DECODE_MAX_TOKENS = 4096 + 1
 
 
 def is_enable_hierarchical_nsa(allocator):
