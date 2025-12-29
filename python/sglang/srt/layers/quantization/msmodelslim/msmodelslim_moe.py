@@ -305,7 +305,6 @@ class ModelSlimW4A8Int8MoE(ModelSlimMoEMethod):
         layer.register_parameter("w2_scale_bias", w2_scale_bias)
         set_weight_attrs(w2_scale_bias, extra_weight_attrs)
 
-
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         self.kernel.process_weights_after_loading(layer, self.is_per_channel_weight)
 
