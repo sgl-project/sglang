@@ -26,7 +26,7 @@ from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm
 from sglang.multimodal_gen.runtime.layers.linear import ReplicatedLinear
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
     NDRotaryEmbedding,
-    _apply_rotary_emb,
+    apply_flashinfer_rope_qk_inplace,
 )
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 from sglang.multimodal_gen.runtime.platforms import current_platform
@@ -38,13 +38,15 @@ logger = init_logger(__name__)  # pylint: disable=invalid-name
 def _get_qkv_projections(
     attn: "Flux2Attention", hidden_states, encoder_hidden_states=None
 ):
-    qkv, _ = attn.to_qkv(hidden_states)
-    query, key, value = qkv.chunk(3, dim=-1)
+    query, _ = attn.to_q(hidden_states)
+    key, _ = attn.to_k(hidden_states)
+    value, _ = attn.to_v(hidden_states)
 
     encoder_query = encoder_key = encoder_value = None
     if encoder_hidden_states is not None and attn.added_kv_proj_dim is not None:
-        added_qkv, _ = attn.to_added_qkv(encoder_hidden_states)
-        encoder_query, encoder_key, encoder_value = added_qkv.chunk(3, dim=-1)
+        encoder_query, _ = attn.add_q_proj(encoder_hidden_states)
+        encoder_key, _ = attn.add_k_proj(encoder_hidden_states)
+        encoder_value, _ = attn.add_v_proj(encoder_hidden_states)
 
     return query, key, value, encoder_query, encoder_key, encoder_value
 
@@ -120,8 +122,9 @@ class Flux2Attention(torch.nn.Module, AttentionModuleMixin):
         self.added_kv_proj_dim = added_kv_proj_dim
         self.added_proj_bias = added_proj_bias
 
-        # Use ReplicatedLinear for fused QKV projections
-        self.to_qkv = ReplicatedLinear(query_dim, self.inner_dim * 3, bias=bias)
+        self.to_q = ReplicatedLinear(query_dim, self.inner_dim, bias=bias)
+        self.to_k = ReplicatedLinear(query_dim, self.inner_dim, bias=bias)
+        self.to_v = ReplicatedLinear(query_dim, self.inner_dim, bias=bias)
 
         # QK Norm
         self.norm_q = RMSNorm(dim_head, eps=eps)
@@ -134,9 +137,14 @@ class Flux2Attention(torch.nn.Module, AttentionModuleMixin):
         if added_kv_proj_dim is not None:
             self.norm_added_q = RMSNorm(dim_head, eps=eps)
             self.norm_added_k = RMSNorm(dim_head, eps=eps)
-            # Use ReplicatedLinear for added (encoder) QKV projections
-            self.to_added_qkv = ReplicatedLinear(
-                added_kv_proj_dim, self.inner_dim * 3, bias=added_proj_bias
+            self.add_q_proj = ReplicatedLinear(
+                added_kv_proj_dim, self.inner_dim, bias=added_proj_bias
+            )
+            self.add_k_proj = ReplicatedLinear(
+                added_kv_proj_dim, self.inner_dim, bias=added_proj_bias
+            )
+            self.add_v_proj = ReplicatedLinear(
+                added_kv_proj_dim, self.inner_dim, bias=added_proj_bias
             )
             self.to_add_out = torch.nn.Linear(self.inner_dim, query_dim, bias=out_bias)
 
@@ -179,11 +187,15 @@ class Flux2Attention(torch.nn.Module, AttentionModuleMixin):
 
         if freqs_cis is not None:
             cos, sin = freqs_cis
-            query = _apply_rotary_emb(
-                query, cos, sin, is_neox_style=False, interleaved=True
+            cos_sin_cache = torch.cat(
+                [
+                    cos.to(dtype=torch.float32).contiguous(),
+                    sin.to(dtype=torch.float32).contiguous(),
+                ],
+                dim=-1,
             )
-            key = _apply_rotary_emb(
-                key, cos, sin, is_neox_style=False, interleaved=True
+            query, key = apply_flashinfer_rope_qk_inplace(
+                query, key, cos_sin_cache, is_neox=False
             )
 
         hidden_states = self.attn(query, key, value)
@@ -303,11 +315,15 @@ class Flux2ParallelSelfAttention(torch.nn.Module, AttentionModuleMixin):
 
         if freqs_cis is not None:
             cos, sin = freqs_cis
-            query = _apply_rotary_emb(
-                query, cos, sin, is_neox_style=False, interleaved=True
+            cos_sin_cache = torch.cat(
+                [
+                    cos.to(dtype=torch.float32).contiguous(),
+                    sin.to(dtype=torch.float32).contiguous(),
+                ],
+                dim=-1,
             )
-            key = _apply_rotary_emb(
-                key, cos, sin, is_neox_style=False, interleaved=True
+            query, key = apply_flashinfer_rope_qk_inplace(
+                query, key, cos_sin_cache, is_neox=False
             )
         hidden_states = self.attn(query, key, value)
         hidden_states = hidden_states.flatten(2, 3)
