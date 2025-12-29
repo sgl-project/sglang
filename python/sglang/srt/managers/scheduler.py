@@ -635,7 +635,7 @@ class Scheduler(
             enable_metrics=self.enable_metrics,
             enable_kv_cache_events=self.enable_kv_cache_events,
             enable_mamba_extra_buffer=server_args.enable_mamba_extra_buffer(),
-            store_decode_only=server_args.mamba_store_decode_only,
+            mamba_session_mode=server_args.mamba_radix_cache_session_mode,
         )
 
         if (
@@ -1455,6 +1455,7 @@ class Scheduler(
                 ),
                 http_worker_ipc=recv_req.http_worker_ipc,
                 dllm_config=self.dllm_config,
+                session_id=recv_req.session_id,
             )
             req.tokenizer = self.tokenizer
 

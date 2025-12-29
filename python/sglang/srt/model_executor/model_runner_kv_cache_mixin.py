@@ -288,14 +288,15 @@ class ModelRunnerKVCacheMixin:
 
         if self.mambaish_config is not None:
             additional_ratio = 0
+            if self.server_args.enable_mamba_extra_buffer():
+                if not self.spec_algorithm.is_none():
+                    additional_ratio = MAMBA_CACHE_V2_ADDITIONAL_RATIO_NO_OVERLAP
+                else:
+                    additional_ratio = MAMBA_CACHE_V2_ADDITIONAL_RATIO_OVERLAP
             if (
-                self.server_args.enable_mamba_extra_buffer()
-                and not self.spec_algorithm.is_none()
+                self.server_args.disable_radix_cache
+                or self.server_args.mamba_radix_cache_session_mode
             ):
-                additional_ratio = MAMBA_CACHE_V2_ADDITIONAL_RATIO_NO_OVERLAP
-            else:
-                additional_ratio = MAMBA_CACHE_V2_ADDITIONAL_RATIO_OVERLAP
-            if self.server_args.disable_radix_cache:
                 ratio = 1
             else:
                 ratio = MAMBA_CACHE_SIZE_MAX_RUNNING_REQUESTS_RATIO + additional_ratio

@@ -26,7 +26,7 @@ class CacheInitParams:
     enable_kv_cache_events: bool = False
 
     enable_mamba_extra_buffer: bool = False
-    store_decode_only: bool = False
+    mamba_session_mode: bool = False
 
     # For SWAChunkCache
     sliding_window_size: Optional[int] = None

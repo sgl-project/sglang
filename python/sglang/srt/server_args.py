@@ -472,7 +472,7 @@ class ServerArgs:
     mamba_full_memory_ratio: float = 0.9
     mamba_scheduler_strategy: str = "auto"
     mamba_track_interval: int = 256
-    mamba_store_decode_only: bool = False
+    mamba_radix_cache_session_mode: bool = False
 
     # Hierarchical cache
     enable_hierarchical_cache: bool = False
@@ -3681,9 +3681,9 @@ class ServerArgs:
             help="The interval to track the mamba state during decode.",
         )
         parser.add_argument(
-            "--mamba-store-decode-only",
+            "--mamba-radix-cache-session-mode",
             action="store_true",
-            help="Mamba radix cache only stores decode states.",
+            help="Mamba radix cache store by session id.",
         )
         # Hierarchical cache
         parser.add_argument(

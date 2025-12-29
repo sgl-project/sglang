@@ -259,6 +259,9 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
     need_wait_for_image: Optional[bool] = None
     num_items_assigned: Optional[List] = None
 
+    # for session_id for mamba_radix_cache
+    session_id: Optional[str] = None
+
     def contains_mm_input(self) -> bool:
         return (
             has_valid_data(self.image_data)
@@ -744,6 +747,9 @@ class TokenizedGenerateReqInput(BaseReq):
 
     need_wait_for_image: bool = False
     num_items_assigned: Optional[List] = None
+
+    # for session_id for mamba_radix_cache
+    session_id: Optional[str] = None
 
 
 @dataclass

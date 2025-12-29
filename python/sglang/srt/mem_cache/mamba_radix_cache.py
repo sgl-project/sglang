@@ -86,6 +86,7 @@ class TreeNode:
 
         self.id = TreeNode.counter if id is None else id
         TreeNode.counter += 1
+        self.mamba_session_id_set: set[str] = set()
 
     @property
     def evicted(self):
@@ -370,7 +371,7 @@ class MambaRadixCache(BasePrefixCache):
         self.page_size = params.page_size
         self.disable = params.disable
         self.enable_mamba_extra_buffer = params.enable_mamba_extra_buffer
-        self.store_decode_only = params.store_decode_only
+        self.session_mode = params.mamba_session_mode
 
         if not self.enable_mamba_extra_buffer:
             assert (
@@ -470,13 +471,19 @@ class MambaRadixCache(BasePrefixCache):
             mamba_branching_seqlen=mamba_branching_seqlen,
         )
 
-    def insert(self, key: RadixKey, value=None, mamba_value=None) -> Tuple[int, bool]:
+    def insert(
+        self,
+        key: RadixKey,
+        value=None,
+        mamba_value=None,
+        session_id: Optional[str] = None,
+    ) -> Tuple[int, bool]:
         if self.disable:
             return 0, False
 
         if value is None:
             value = torch.tensor([x for x in key.token_ids], dtype=torch.int64)
-        return self._insert_helper(self.root_node, key, value, mamba_value)
+        return self._insert_helper(self.root_node, key, value, mamba_value, session_id)
 
     def cache_finished_req(self, req: Req, is_insert: bool = True) -> None:
         """Cache request when it finishes."""
@@ -552,6 +559,7 @@ class MambaRadixCache(BasePrefixCache):
                 RadixKey(token_ids[:page_aligned_len], req.extra_key),
                 page_aligned_kv_indices,
                 mamba_value,
+                req.session_id,
             )
 
             self.token_to_kv_pool_allocator.free(
@@ -592,7 +600,7 @@ class MambaRadixCache(BasePrefixCache):
             if self.enable_mamba_extra_buffer
             else len(token_ids)
         )
-        if self.disable or cache_len is None or self.store_decode_only:
+        if self.disable or cache_len is None or self.session_mode:
             return _skip_cache_unfinished_req(req)
 
         kv_indices_orig = self.req_to_token_pool.req_to_token[
@@ -826,6 +834,16 @@ class MambaRadixCache(BasePrefixCache):
                 self.mamba_evictable_size_ += len(node.mamba_value)
                 self.mamba_protected_size_ -= len(node.mamba_value)
             node.mamba_lock_ref -= 1
+            if (
+                node.mamba_lock_ref == 0
+                and len(node.mamba_session_id_set) == 0
+                and self.session_mode
+            ):
+                # free mamba value if no session is using it
+                self.req_to_token_pool.mamba_pool.free(node.mamba_value)
+                self.mamba_lru_list.remove_node(node)
+                self.mamba_evictable_size_ -= len(node.mamba_value)
+                node.mamba_value = None
 
         while node != self.root_node:
             assert (
@@ -1003,6 +1021,7 @@ class MambaRadixCache(BasePrefixCache):
         key: RadixKey,
         value,
         mamba_value,
+        session_id: Optional[str] = None,
     ) -> Tuple[int, bool]:
         # Update the last access time from root to leaf, so that
         # mamba will tombstone the node closer to root first
@@ -1018,6 +1037,8 @@ class MambaRadixCache(BasePrefixCache):
         child_key = self.get_child_key_fn(key)
 
         total_prefix_length = 0
+
+        use_session = session_id is not None and self.session_mode
         while len(key) > 0 and child_key in node.children.keys():
             node = node.children[child_key]
             node.last_access_time = get_last_access_time()
@@ -1033,6 +1054,18 @@ class MambaRadixCache(BasePrefixCache):
                 new_node = self._split_node(node.key, node, prefix_len)
                 node = new_node
 
+            if (
+                use_session
+                and session_id in node.mamba_session_id_set
+                and node.mamba_value is not None
+            ):
+                node.mamba_session_id_set.remove(session_id)
+                if len(node.mamba_session_id_set) == 0 and node.mamba_lock_ref == 0:
+                    self.req_to_token_pool.mamba_pool.free(node.mamba_value)
+                    self.mamba_lru_list.remove_node(node)
+                    self.mamba_evictable_size_ -= len(node.mamba_value)
+                    node.mamba_value = None
+
             if len(key):
                 child_key = self.get_child_key_fn(key)
 
@@ -1043,6 +1076,8 @@ class MambaRadixCache(BasePrefixCache):
             new_node.key = key
             new_node.value = value
             new_node.mamba_value = mamba_value
+            if use_session:
+                new_node.mamba_session_id_set.add(session_id)
             self.full_lru_list.insert_mru(new_node)
             self.mamba_lru_list.insert_mru(new_node)
             node.children[child_key] = new_node
@@ -1050,6 +1085,8 @@ class MambaRadixCache(BasePrefixCache):
             self.mamba_evictable_size_ += len(mamba_value)
         elif node.mamba_value is None:  # add for mamba tombstone
             node.mamba_value = mamba_value
+            if use_session:
+                node.mamba_session_id_set.add(session_id)
             self.full_lru_list.reset_node_mru(node)
             self.mamba_lru_list.insert_mru(node)
             self.mamba_evictable_size_ += len(mamba_value)
@@ -1059,6 +1096,8 @@ class MambaRadixCache(BasePrefixCache):
             self.full_lru_list.reset_node_mru(node)
             self.mamba_lru_list.reset_node_mru(node)
             node.last_access_time = get_last_access_time()
+            if use_session:
+                node.mamba_session_id_set.add(session_id)
 
         return total_prefix_length, mamba_value_exist
 
