@@ -9,6 +9,7 @@ use sgl_model_gateway::{
     app_context::AppContext,
     config::types::{PolicyConfig, RouterConfig},
     core::{BasicWorkerBuilder, WorkerRegistry, WorkerType},
+    // FIX: Import directly from data_connector, not data_connector::memory
     data_connector::{
         MemoryConversationItemStorage, MemoryConversationStorage, MemoryResponseStorage,
     },
@@ -187,16 +188,19 @@ fn bench_latency(c: &mut Criterion) {
     let sizes = [10, 100, 500, 1000];
 
     for &size in sizes.iter() {
+        // SETUP: Run setup once per cluster size, OUTSIDE the measurement loop
+        let (router, _guards) = rt.block_on(async { setup_cluster(size).await });
+
         group.throughput(Throughput::Elements(1));
-        group.bench_with_input(BenchmarkId::from_parameter(size), &size, |b, &s| {
-            b.to_async(&rt).iter_with_setup(
-                || rt.block_on(async { setup_cluster(s).await }),
-                |(router, _guards): (Arc<Router>, Vec<MockServer>)| async move {
-                    let _ = router
-                        .get_response(None, "test-id", &Default::default())
-                        .await;
-                },
-            );
+
+        group.bench_with_input(BenchmarkId::from_parameter(size), &size, |b, &_s| {
+            // Clone router for the async block
+            let r = router.clone();
+
+            // MEASURE: Use to_async to measure just the hot path
+            b.to_async(&rt).iter(|| async {
+                let _ = r.get_response(None, "test-id", &Default::default()).await;
+            });
         });
     }
     group.finish();
