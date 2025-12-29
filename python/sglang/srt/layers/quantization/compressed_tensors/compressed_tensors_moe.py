@@ -1313,6 +1313,7 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
 
 class NPUCompressedTensorsW4A8Int8DynamicMoEMethod(CompressedTensorsMoEMethod):
 
+    ### TODO: Get rid of code duplication with python/sglang/srt/msmodelslim/msmodelslim_moe.py @OrangeRedeng @TamirBaydasov
     def __init__(self, quantization_config) -> None:
         self.group_size = 0
         self.tp_size = 1
@@ -1322,7 +1323,7 @@ class NPUCompressedTensorsW4A8Int8DynamicMoEMethod(CompressedTensorsMoEMethod):
             .get("activation_use_clip", False)
         )
         self.kernel = NPUW4A8Int8DynamicMoEMethod()
-
+    
     def create_weights(
         self,
         layer: torch.nn.Module,
