@@ -17,12 +17,10 @@ class SchedulerEnhancer:
         self.stable_count = 0
         # If scheduling is performed 200 times and some dp units are still at full load, the prefill-prioritized scheduling strategy will still be used.
         self.max_stable_count = 200
+        self.server_args = server_args
         assert (
             server_args.schedule_policy == "fcfs"
         ), f"To use SCHEDULER_DECREASE_PREFILL_IDLE, schedule_policy must be 'fcfs'. '{self.schedule_policy}' is not supported."
-        assert (
-            server_args.enable_dp_attention == True
-        ), f"To use SCHEDULER_DECREASE_PREFILL_IDLE, enable_dp_attention must be enable."
         assert (
             server_args.disaggregation_mode == "null"
         ), f"To use SCHEDULER_DECREASE_PREFILL_IDLE, disaggregation_mode must be null."
@@ -46,14 +44,22 @@ class SchedulerEnhancer:
         tp0_info = self.global_batch_size[:, 0, :]
         return tp0_info
 
-    def get_schedule_decision(self, running_batch):
-        tp0_info = self.get_schedule_info(running_batch)
-        if (
-            int(tp0_info[:, 0].min().item()) < self.max_running_requests
-            and int(tp0_info[:, 0].max().item()) == self.max_running_requests
+    def get_schedule_decision(self, running_batch, max_prefill_bs):
+        if self.server_args.enable_dp_attention:
+            tp0_info = self.get_schedule_info(running_batch)
+            if (
+                int(tp0_info[:, 0].min().item()) < self.max_running_requests
+                and int(tp0_info[:, 0].max().item()) == self.max_running_requests
+            ):
+                self.stable_count += 1
+                if self.stable_count < self.max_stable_count:
+                    return False
+        elif (
+            self.max_running_requests - running_batch.batch_size() < max_prefill_bs
         ):
             self.stable_count += 1
             if self.stable_count < self.max_stable_count:
                 return False
+
         self.stable_count = 0
         return True
