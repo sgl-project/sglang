@@ -198,7 +198,7 @@ impl PipelineStage for ClassifyResponseProcessingStage {
 
         // Build response
         let response = ClassifyResponse::new(
-            format!("classify-{}", dispatch.request_id),
+            dispatch.request_id.clone(),
             dispatch.model.clone(),
             dispatch.created,
             vec![classify_data],
