@@ -26,13 +26,13 @@ impl Default for WasmRuntimeConfig {
         let default_thread_pool_size = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(4)
-            .max(1);
+            .clamp(1, 4);
 
         Self {
             max_memory_pages: 1024,                     // 64MB
             max_execution_time_ms: 1000,                // 1 seconds
             max_stack_size: 1024 * 1024,                // 1MB
-            thread_pool_size: default_thread_pool_size, // based on cpu count
+            thread_pool_size: default_thread_pool_size, // based on cpu count and capped
             module_cache_size: 10,                      // Cache up to 10 modules per worker
             max_body_size: 10 * 1024 * 1024,            // 10MB
         }

@@ -202,7 +202,7 @@ class DataParallelController:
 
         self.init_dispatcher()
 
-        self.watchdog = Watchdog.create(
+        self.soft_watchdog = Watchdog.create(
             debug_name="DataParallelController",
             watchdog_timeout=server_args.soft_watchdog_timeout,
             soft=True,
@@ -605,7 +605,7 @@ class DataParallelController:
     def event_loop(self):
         while True:
             while True:
-                self.watchdog.feed()
+                self.soft_watchdog.feed()
                 try:
                     parts = self.recv_from_tokenizer.recv_multipart(
                         flags=zmq.NOBLOCK, copy=False
