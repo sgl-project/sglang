@@ -730,7 +730,7 @@ class DenoisingStage(PipelineStage):
             if (
                 offload_mgr := getattr(transformer, "_layerwise_offload_manager", None)
             ) is not None:
-                offload_mgr.prepare_for_next_denoise()
+                offload_mgr.prepare_for_next_denoise(non_blocking=True)
 
     def _preprocess_sp_latents(self, batch: Req, server_args: ServerArgs):
         """Shard latents for Sequence Parallelism if applicable."""
