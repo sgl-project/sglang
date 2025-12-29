@@ -20,10 +20,12 @@ from sglang.srt.utils import is_npu
 if not is_npu:
     from sgl_kernel.speculative import reconstruct_indices_from_tree_mask
 
+    USE_FULL_MASK = True
+else:
+    USE_FULL_MASK = False
+
+
 logger = logging.getLogger(__name__)
-
-
-USE_FULL_MASK = True
 
 
 class NGRAMWorker:
@@ -214,7 +216,7 @@ class NGRAMWorker:
     def _prepare_linear_speculative_indices(
         self, batch, positions, retrive_index, retrive_next_token, retrive_next_sibling
     ):
-        bs = batch.batch_size()
+        B = batch.batch_size()
         K = self.draft_token_num
         device = positions.device
 
@@ -222,25 +224,18 @@ class NGRAMWorker:
         retrive_next_token.fill_(-1)
         retrive_next_sibling.fill_(-1)
 
-        for i, req in enumerate(batch.reqs):
-            base = int(batch.seq_lens_cpu[i].item())
+        bases = batch.seq_lens_cpu.to(device, non_blocking=True).unsqueeze(1)  # [B, 1]
+        offsets = torch.arange(K, device=device, dtype=positions.dtype)  # [K]
+        positions[:] = (bases + offsets).view(-1)
 
-            off = i * K
-            positions[off:off + K] = torch.arange(
-                base, base + K, device=device,
-                dtype=positions.dtype
-            )
+        global_idx = torch.arange(B * K, device=device, dtype=retrive_index.dtype).view(
+            B, K
+        )
+        retrive_index[:, :K] = global_idx
 
-            base_global = i * K
-            retrive_index[i, :K] = torch.arange(
-                base_global, base_global + K, device=device, dtype=retrive_index.dtype
-            )
-
-            # chain: j -> j+1, last -> -1
-            if K > 1:
-                retrive_next_token[i, :K - 1] = torch.arange(
-                    base_global + 1, base_global + K, device=device, dtype=retrive_next_token.dtype
-                )
+        if K > 1:
+            next_vals = global_idx[:, 1:]  # [B, K-1]
+            retrive_next_token[:, : K - 1] = next_vals
 
     def add_logprob_values(
         self,
