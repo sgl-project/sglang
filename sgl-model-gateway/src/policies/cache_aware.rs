@@ -302,7 +302,7 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
             };
 
             let selected_url = if match_rate > self.config.cache_threshold {
-                result.tenant
+                result.tenant.to_string()
             } else {
                 let min_load_idx = *healthy_indices
                     .iter()
