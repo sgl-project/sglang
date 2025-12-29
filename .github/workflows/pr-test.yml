@@ -40,6 +40,7 @@ jobs:
     outputs:
       main_package: ${{ steps.filter.outputs.main_package || steps.scheduled.outputs.main_package }}
       sgl_kernel: ${{ steps.filter.outputs.sgl_kernel || steps.scheduled.outputs.sgl_kernel }}
+      jit_kernel: ${{ steps.filter.outputs.jit_kernel || steps.scheduled.outputs.jit_kernel }}
       multimodal_gen: ${{ steps.filter.outputs.multimodal_gen || steps.scheduled.outputs.multimodal_gen }}
       max_parallel: ${{ steps.set-parallel.outputs.max_parallel }}
       b200_runner: ${{ steps.set-runner.outputs.b200_runner }}
@@ -63,6 +64,10 @@ jobs:
               - ".github/workflows/pr-test.yml"
             sgl_kernel:
               - "sgl-kernel/**"
+            jit_kernel:
+              - "python/sglang/jit_kernel/**"
+              - "python/*.toml"
+              - ".github/workflows/pr-test.yml"
             multimodal_gen:
               - "python/sglang/multimodal_gen/**"
               - "python/sglang/cli/**"
@@ -75,6 +80,7 @@ jobs:
         run: |
           echo "main_package=true" >> $GITHUB_OUTPUT
           echo "sgl_kernel=false" >> $GITHUB_OUTPUT
+          echo "jit_kernel=true" >> $GITHUB_OUTPUT
           echo "multimodal_gen=true" >> $GITHUB_OUTPUT
 
       - name: Set max-parallel based on high-priority label
@@ -124,6 +130,7 @@ jobs:
             echo "|-------------------|---------|"
             echo "| main_package      | ${{ steps.filter.outputs.main_package || steps.scheduled.outputs.main_package }} |"
             echo "| sgl_kernel        | ${{ steps.filter.outputs.sgl_kernel || steps.scheduled.outputs.sgl_kernel }} |"
+            echo "| jit_kernel        | ${{ steps.filter.outputs.jit_kernel || steps.scheduled.outputs.jit_kernel }} |"
             echo "| multimodal_gen    | ${{ steps.filter.outputs.multimodal_gen || steps.scheduled.outputs.multimodal_gen }} |"
             echo "| max_parallel      | ${{ steps.set-parallel.outputs.max_parallel }} |"
             echo "| b200_runner       | ${{ steps.set-runner.outputs.b200_runner }} |"
@@ -137,6 +144,7 @@ jobs:
     if: |
       needs.check-changes.outputs.main_package == 'true' ||
       needs.check-changes.outputs.sgl_kernel == 'true' ||
+      needs.check-changes.outputs.jit_kernel == 'true' ||
       needs.check-changes.outputs.multimodal_gen == 'true'
     uses: ./.github/workflows/pr-gate.yml
     secrets: inherit
@@ -391,6 +399,27 @@ jobs:
   #       run: |
   #         cd sgl-kernel
   #         pytest tests/
+
+  # =============================================== jit-kernel ====================================================
+
+  jit-kernel-unit-test:
+    needs: [check-changes, call-gate]
+    if: needs.check-changes.outputs.jit_kernel == 'true'
+    runs-on: 1-gpu-runner
+    env:
+      RUNNER_LABELS: 1-gpu-runner
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          bash scripts/ci/ci_install_dependency.sh
+
+      - name: Run test
+        timeout-minutes: 30
+        run: |
+          cd python/sglang/jit_kernel
+          pytest tests/
 
   # =============================================== primary ====================================================
 
@@ -1571,6 +1600,8 @@ jobs:
         sgl-kernel-mla-test,
         sgl-kernel-benchmark-test,
         sgl-kernel-b200-test,
+
+        jit-kernel-unit-test,
 
         multimodal-gen-test-1-gpu,
         multimodal-gen-test-2-gpu,
