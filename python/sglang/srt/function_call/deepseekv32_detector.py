@@ -106,7 +106,7 @@ class DeepSeekV32Detector(BaseFormatDetector):
         invoke_content_stripped = invoke_content.strip()
         if invoke_content_stripped.startswith("{"):
             if allow_partial:
-                # Remove incomplete parameter_end_call prefix in case they are captured by param
+                # Remove incomplete invoke end call prefix in case they are captured by param
                 for token in reversed(self.prefix_invoke_end_call):
                     invoke_content_stripped = invoke_content_stripped.rstrip(token)
                 return invoke_content_stripped
