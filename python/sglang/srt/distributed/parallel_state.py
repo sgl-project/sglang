@@ -376,28 +376,12 @@ class GroupCoordinator:
                     group=self.cpu_group,
                     device=self.device,
                 )
-                # Log which all-reduce mode will be used
-                if is_hip():
-                    if envs.SGLANG_USE_1STAGE_ALLREDUCE.is_set():
-                        if envs.SGLANG_USE_1STAGE_ALLREDUCE.get():
-                            logger.info(
-                                "[AR] All-reduce: 1-stage kernel (SGLANG_USE_1STAGE_ALLREDUCE=1)"
-                            )
-                        else:
-                            logger.info(
-                                "[AR] All-reduce: default (SGLANG_USE_1STAGE_ALLREDUCE=0)"
-                            )
-                    elif envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get():
-                        logger.info(
-                            "[AR] All-reduce: 1-stage kernel (deterministic inference enabled)"
-                        )
-                    else:
-                        logger.info("[AR] All-reduce: default")
             except Exception as e:
                 logger.warning(
                     f"Setup Custom allreduce failed with {e}. To silence this "
                     "warning, specify --disable-custom-all-reduce explicitly."
                 )
+
             if is_hip():
                 try:
                     # Initialize a custom quick all-reduce implementation for AMD
@@ -1731,6 +1715,55 @@ def initialize_model_parallel(
         use_custom_allreduce=False,
         group_name="pp",
     )
+
+
+def create_custom_parallel_group(
+    group_ranks: List[int], backend: str = "gloo"
+) -> Optional[torch.distributed.ProcessGroup]:
+    """
+    Create a custom parallel group based on the provided ranks.
+
+    Args:
+        group_ranks: The list of ranks that the CURRENT process wants to join.
+                     (e.g., Rank 0 passes [0...7], Rank 8 passes [8...15])
+        backend: The communication backend (default: "gloo").
+
+    Returns:
+        The ProcessGroup if the current rank is in group_ranks, else None.
+    """
+    assert torch.distributed.is_initialized()
+
+    world_size = torch.distributed.get_world_size()
+    rank = torch.distributed.get_rank()
+
+    local_config = sorted(list(set(group_ranks)))
+    gathered_configs = [None for _ in range(world_size)]
+
+    torch.distributed.all_gather_object(gathered_configs, local_config)
+
+    unique_groups = []
+    seen_signatures = set()
+
+    for config in gathered_configs:
+        config_tuple = tuple(config)
+        if config_tuple not in seen_signatures:
+            seen_signatures.add(config_tuple)
+            unique_groups.append(list(config_tuple))
+
+    unique_groups.sort(key=lambda x: x[0])
+
+    my_new_group = None
+
+    for g_ranks in unique_groups:
+        group = torch.distributed.new_group(ranks=g_ranks, backend=backend)
+
+        if set(g_ranks) == set(local_config):
+            my_new_group = group
+            logger.debug(
+                f"Rank {rank} successfully created/joined custom group: {g_ranks}"
+            )
+
+    return my_new_group
 
 
 def ensure_model_parallel_initialized(

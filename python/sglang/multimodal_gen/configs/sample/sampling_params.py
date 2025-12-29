@@ -69,7 +69,7 @@ class DataType(Enum):
 
     def get_default_extension(self) -> str:
         if self == DataType.IMAGE:
-            return "jpg"
+            return "png"
         else:
             return "mp4"
 
@@ -279,8 +279,10 @@ class SamplingParams:
 
         if pipeline_config.task_type.is_image_gen():
             # settle num_frames
-            logger.debug(f"num_frames set to 1 for image generation model")
-            self.num_frames = 1
+            if not server_args.pipeline_config.allow_set_num_frames():
+                logger.debug(f"Setting `num_frames` to 1 for image generation model")
+                self.num_frames = 1
+
         elif self.adjust_frames:
             # NOTE: We must apply adjust_num_frames BEFORE the SP alignment logic below.
             # If we apply it after, adjust_num_frames might modify the frame count
@@ -301,8 +303,6 @@ class SamplingParams:
 
             if use_temporal_scaling_frames:
                 orig_latent_num_frames = (num_frames - 1) // temporal_scale_factor + 1
-            else:  # stepvideo only
-                orig_latent_num_frames = self.num_frames // 17 * 3
 
             if orig_latent_num_frames % server_args.num_gpus != 0:
                 # Adjust latent frames to be divisible by number of GPUs
@@ -321,15 +321,6 @@ class SamplingParams:
                     new_num_frames = (
                         new_latent_num_frames - 1
                     ) * temporal_scale_factor + 1
-                else:  # stepvideo only
-                    # Find the least common multiple of 3 and num_gpus
-                    divisor = math.lcm(3, num_gpus)
-                    # Round up to the nearest multiple of this LCM
-                    new_latent_num_frames = (
-                        (new_latent_num_frames + divisor - 1) // divisor
-                    ) * divisor
-                    # Convert back to actual frames using the StepVideo formula
-                    new_num_frames = new_latent_num_frames // 3 * 17
 
                 logger.info(
                     "Adjusting number of frames from %s to %s based on number of GPUs (%s)",
