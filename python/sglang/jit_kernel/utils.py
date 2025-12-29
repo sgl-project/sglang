@@ -1,8 +1,25 @@
 from __future__ import annotations
 
+import functools
+import inspect
 import pathlib
 from functools import lru_cache
-from typing import TYPE_CHECKING, List, Tuple, TypeAlias, Union
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    List,
+    Optional,
+    Tuple,
+    TypeAlias,
+    TypeVar,
+    Union,
+    overload,
+)
+
+import torch
+
+from sglang.srt.utils.common import direct_register_custom_op
 
 if TYPE_CHECKING:
     from tvm_ffi import Module
@@ -70,6 +87,36 @@ def load_jit(
     extra_include_paths: List[str] | None = None,
     build_directory: str | None = None,
 ) -> Module:
+    """
+    Loading a JIT module from C++/CUDA source files.
+    We define a wrapper as a tuple of (export_name, kernel_name),
+    where `export_name` is the name used to called from Python,
+    and `kernel_name` is the name of the kernel class in C++/CUDA source.
+
+    :param args: Unique marker of the JIT module. Must be distinct for different kernels.
+    :type args: str
+    :param cpp_files: A list of C++ source files.
+    :type cpp_files: List[str] | None
+    :param cuda_files: A list of CUDA source files.
+    :type cuda_files: List[str] | None
+    :param cpp_wrappers: A list of C++ wrappers, defining the export name and kernel name.
+    :type cpp_wrappers: List[Tuple[str, str]] | None
+    :param cuda_wrappers: A list of CUDA wrappers, defining the export name and kernel name.
+    :type cuda_wrappers: List[Tuple[str, str]] | None
+    :param extra_cflags: Extra C++ compiler flags.
+    :type extra_cflags: List[str] | None
+    :param extra_cuda_cflags: Extra CUDA compiler flags.
+    :type extra_cuda_cflags: List[str] | None
+    :param extra_ldflags: Extra linker flags.
+    :type extra_ldflags: List[str] | None
+    :param extra_include_paths: Extra include paths.
+    :type extra_include_paths: List[str] | None
+    :param build_directory: The build directory for JIT compilation.
+    :type build_directory: str | None
+    :return: A just-in-time(JIT) compiled module.
+    :rtype: Module
+    """
+
     from tvm_ffi.cpp import load_inline
 
     cpp_files = cpp_files or []
@@ -101,3 +148,134 @@ def load_jit(
         extra_include_paths=DEFAULT_INCLUDE + extra_include_paths,
         build_directory=build_directory,
     )
+
+
+F = TypeVar("F", bound=Callable[..., Any])
+
+
+def cache_once(fn: F) -> F:
+    """
+    NOTE: `functools.lru_cache` is not compatible with `torch.compile`
+    So we manually implement a simple cache_once decorator to replace it.
+    """
+    result_map = {}
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        key = (args, tuple(sorted(kwargs.items(), key=lambda x: x[0])))
+        if key not in result_map:
+            result_map[key] = fn(*args, **kwargs)
+        return result_map[key]
+
+    return wrapper  # type: ignore
+
+
+@cache_once
+def is_arch_support_pdl() -> bool:
+    import torch
+
+    device = torch.cuda.current_device()
+    return torch.cuda.get_device_capability(device)[0] >= 9
+
+
+def fake_inplace_impl(*args, **kwargs) -> None:
+    pass
+
+
+@overload
+def register_jit_op(
+    fn: F,
+    *,
+    op_name: Optional[str] = None,
+    out_list: Optional[List[int]] = None,
+    out_args: Optional[List[str]] = None,
+    fake_impl: Optional[Callable] = fake_inplace_impl,
+) -> F: ...
+
+
+@overload
+def register_jit_op(
+    *,
+    op_name: Optional[str] = None,
+    out_list: Optional[List[int]] = None,
+    out_args: Optional[List[str]] = None,
+    fake_impl: Optional[Callable] = fake_inplace_impl,
+) -> Callable[[F], F]: ...
+
+
+# Real implementation
+def register_jit_op(
+    fn=None,
+    *,
+    op_name: Optional[str] = None,
+    out_list: Optional[List[int]] = None,
+    out_args: Optional[List[str]] = None,
+    fake_impl: Optional[Callable] = fake_inplace_impl,
+) -> Any:
+    """
+    A decorator to register a JIT custom operator.
+
+    Example usage:
+    ```python
+    @register_jit_op(op_name="my_op", out_list=[0])
+    def my_inplace_op(x: torch.Tensor) -> None:
+        x.add_(1)
+
+    def fake_impl(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        return x + y
+
+    @register_jit_op(op_name="my_op2", out_args=["x"], fake_impl=fake_impl)
+    def my_op(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        return x.add_(y)
+    ```
+
+    :param fn: The function to be registered as a JIT custom operator.
+               If None, return a decorator.
+    :type fn: Callable
+    :param op_name: The name of the operator. If None, use the function name
+    :type op_name: Optional[str]
+    :param out_list: A list of argument indices that are mutated in-place.
+    :type out_list: Optional[List[int]]
+    :param out_args: A list of argument names that are mutated in-place.
+    :type out_args: Optional[List[str]]
+    :param fake_impl: A fake implementation for the operator, used for
+                      torch.compile compatibility.
+                      By default, a no-op function is used, which suits
+                      for most in-place operations.
+    :type fake_impl: Optional[Callable]
+    :return: The registered JIT custom operator, or a decorator.
+             NOTE: the real register will occur at the first call of the function.
+    :rtype: Callable
+    """
+
+    def decorator(fn):
+        real_impl = None
+        resolved_name = op_name or fn.__name__
+
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            nonlocal real_impl
+            if real_impl is None:
+                if not hasattr(torch.ops.sglang, resolved_name):
+                    signature = inspect.signature(fn)
+                    mutates_args = []
+                    param_names = list(signature.parameters.keys())
+                    for id in out_list or []:
+                        mutates_args.append(param_names[id])
+                    for name in out_args or []:
+                        mutates_args.append(name)
+                    mutates_args = list(set(mutates_args))
+                    direct_register_custom_op(
+                        op_name=resolved_name,
+                        op_func=fn,
+                        mutates_args=mutates_args,
+                        fake_impl=fake_impl,
+                    )
+                real_impl = getattr(torch.ops.sglang, resolved_name)
+            return real_impl(*args, **kwargs)
+
+        return wrapper
+
+    if fn is not None:
+        return decorator(fn)
+    return decorator

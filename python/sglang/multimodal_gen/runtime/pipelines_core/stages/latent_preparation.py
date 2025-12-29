@@ -128,8 +128,6 @@ class LatentPreparationStage(PipelineStage):
                 server_args.pipeline_config.vae_config.arch_config.temporal_compression_ratio
             )
             latent_num_frames = (video_length - 1) // temporal_scale_factor + 1
-        else:  # stepvideo only
-            latent_num_frames = video_length // 17 * 3
         return int(latent_num_frames)
 
     def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
