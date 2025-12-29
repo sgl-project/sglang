@@ -17,7 +17,7 @@ use dashmap::DashMap;
 use uuid::Uuid;
 
 use crate::{
-    core::{ConnectionMode, RuntimeType, Worker, WorkerType},
+    core::{CircuitState, ConnectionMode, RuntimeType, Worker, WorkerType},
     observability::metrics::Metrics,
 };
 
@@ -526,6 +526,10 @@ impl WorkerRegistry {
         let mut regular_count = 0;
         let mut prefill_count = 0;
         let mut decode_count = 0;
+        let mut http_count = 0;
+        let mut grpc_count = 0;
+        let mut cb_open_count = 0;
+        let mut cb_half_open_count = 0;
 
         // Iterate DashMap directly to avoid cloning all workers via get_all()
         for entry in self.workers.iter() {
@@ -540,16 +544,32 @@ impl WorkerRegistry {
                 WorkerType::Prefill { .. } => prefill_count += 1,
                 WorkerType::Decode => decode_count += 1,
             }
+
+            match worker.connection_mode() {
+                ConnectionMode::Http => http_count += 1,
+                ConnectionMode::Grpc { .. } => grpc_count += 1,
+            }
+
+            match worker.circuit_breaker().state() {
+                CircuitState::Open => cb_open_count += 1,
+                CircuitState::HalfOpen => cb_half_open_count += 1,
+                CircuitState::Closed => {}
+            }
         }
 
         WorkerRegistryStats {
             total_workers,
             total_models,
             healthy_workers: healthy_count,
+            unhealthy_workers: total_workers.saturating_sub(healthy_count),
             total_load,
             regular_workers: regular_count,
             prefill_workers: prefill_count,
             decode_workers: decode_count,
+            http_workers: http_count,
+            grpc_workers: grpc_count,
+            circuit_breaker_open: cb_open_count,
+            circuit_breaker_half_open: cb_half_open_count,
         }
     }
 
@@ -631,13 +651,30 @@ impl Default for WorkerRegistry {
 /// Statistics for the worker registry
 #[derive(Debug, Clone)]
 pub struct WorkerRegistryStats {
+    /// Total number of registered workers
     pub total_workers: usize,
+    /// Number of unique models served
     pub total_models: usize,
+    /// Number of workers passing health checks
     pub healthy_workers: usize,
+    /// Number of workers failing health checks
+    pub unhealthy_workers: usize,
+    /// Sum of current load across all workers
     pub total_load: usize,
+    /// Number of regular (non-PD) workers
     pub regular_workers: usize,
+    /// Number of prefill workers (PD mode)
     pub prefill_workers: usize,
+    /// Number of decode workers (PD mode)
     pub decode_workers: usize,
+    /// Number of HTTP-connected workers
+    pub http_workers: usize,
+    /// Number of gRPC-connected workers
+    pub grpc_workers: usize,
+    /// Number of workers with circuit breaker in Open state (not accepting requests)
+    pub circuit_breaker_open: usize,
+    /// Number of workers with circuit breaker in HalfOpen state (testing recovery)
+    pub circuit_breaker_half_open: usize,
 }
 
 #[cfg(test)]
