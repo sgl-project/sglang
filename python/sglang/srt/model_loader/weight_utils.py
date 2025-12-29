@@ -40,31 +40,19 @@ from sglang.srt.layers.quantization.modelopt_quant import (
     ModelOptFp4Config,
     ModelOptFp8Config,
 )
+from sglang.srt.model_loader.ci_weight_validation import (
+    ci_download_with_validation_and_retry,
+    ci_validate_and_cleanup_local_snapshot,
+)
 from sglang.srt.utils import find_local_repo_dir, log_info_on_rank0, print_warning_once
 from sglang.utils import is_in_ci
 
 try:
     from fastsafetensors import SafeTensorsFileLoader, SingleGroup
-except ImportError:
-
-    class PlaceholderModule:
-        def __init__(self, name):
-            self.name = name
-
-        def __getattr__(self, name):
-            raise ImportError(f"Please install {self.name}")
-
-    fastsafetensors = PlaceholderModule("fastsafetensors")
-    SafeTensorsFileLoader = None
-    SingleGroup = None
+except ImportError as e:
+    SafeTensorsFileLoader = SingleGroup = None
 
 logger = logging.getLogger(__name__)
-
-# use system-level temp directory for file locks, so that multiple users
-# can share the same lock without error.
-# lock files in the temp directory will be automatically deleted when the
-# system reboots, so users will not complain about annoying lock files
-temp_dir = tempfile.gettempdir()
 
 
 def enable_hf_transfer():
@@ -82,10 +70,11 @@ def enable_hf_transfer():
 enable_hf_transfer()
 
 
-class DisabledTqdm(tqdm):
-    def __init__(self, *args, **kwargs):
-        kwargs["disable"] = True
-        super().__init__(*args, **kwargs)
+# use system-level temp directory for file locks, so that multiple users
+# can share the same lock without error.
+# lock files in the temp directory will be automatically deleted when the
+# system reboots, so users will not complain about annoying lock files
+temp_dir = tempfile.gettempdir()
 
 
 def get_lock(
@@ -169,6 +158,12 @@ def replace_substrings(key: str, substring_mapping: dict[str, str]) -> str:
     return key
 
 
+class DisabledTqdm(tqdm):
+    def __init__(self, *args, **kwargs):
+        kwargs["disable"] = True
+        super().__init__(*args, **kwargs)
+
+
 # TODO(woosuk): Move this to other place.
 def get_quant_config(
     model_config: ModelConfig,
@@ -194,6 +189,7 @@ def get_quant_config(
     if hf_quant_config is not None:
         hf_quant_config["packed_modules_mapping"] = packed_modules_mapping
         return quant_cls.from_config(hf_quant_config)
+
     # In case of bitsandbytes/QLoRA, get quant config from the adapter model.
     if model_config.quantization == "bitsandbytes":
         if (
@@ -204,9 +200,9 @@ def get_quant_config(
         model_name_or_path = load_config.model_loader_extra_config[
             "qlora_adapter_name_or_path"
         ]
-
     else:
         model_name_or_path = model_config.model_path
+
     is_local = os.path.isdir(model_name_or_path)
     if not is_local:
         # Download the config files.
@@ -357,10 +353,6 @@ def _find_local_hf_snapshot_dir_unlocked(
     # Only perform cache validation and cleanup in CI to avoid
     # unnecessary overhead for regular users
     if is_in_ci() and local_weight_files:
-        from sglang.srt.model_loader.ci_weight_validation import (
-            ci_validate_and_cleanup_local_snapshot,
-        )
-
         is_valid = ci_validate_and_cleanup_local_snapshot(
             model_name_or_path, found_local_snapshot_dir, local_weight_files
         )
@@ -443,23 +435,10 @@ def download_weights_from_hf(
                     allow_patterns = [pattern]
                     break
 
-        # Only perform validation and retry in CI to avoid overhead for regular users
-        if is_in_ci():
-            from sglang.srt.model_loader.ci_weight_validation import (
-                ci_download_with_validation_and_retry,
-            )
+        log_info_on_rank0(logger, f"Using model weights format {allow_patterns}")
 
-            return ci_download_with_validation_and_retry(
-                model_name_or_path=model_name_or_path,
-                allow_patterns=allow_patterns,
-                ignore_patterns=ignore_patterns,
-                cache_dir=cache_dir,
-                revision=revision,
-                max_retries=max_retries,
-            )
-        else:
+        if not is_in_ci():
             # Simple download without validation for non-CI environments
-            log_info_on_rank0(logger, f"Using model weights format {allow_patterns}")
             hf_folder = snapshot_download(
                 model_name_or_path,
                 allow_patterns=allow_patterns,
@@ -470,6 +449,16 @@ def download_weights_from_hf(
                 local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
             )
             return hf_folder
+        else:
+            # Only perform validation and retry in CI to avoid overhead for regular users
+            return ci_download_with_validation_and_retry(
+                model_name_or_path=model_name_or_path,
+                allow_patterns=allow_patterns,
+                ignore_patterns=ignore_patterns,
+                cache_dir=cache_dir,
+                revision=revision,
+                max_retries=max_retries,
+            )
 
 
 def download_safetensors_index_file_from_hf(
