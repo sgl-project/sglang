@@ -251,6 +251,7 @@ class Envs:
     # Mooncake Store
     SGLANG_HICACHE_MOONCAKE_CONFIG_PATH = EnvStr(None)
     MOONCAKE_MASTER = EnvStr(None)
+    MOONCAKE_CLIENT = EnvStr(None)
     MOONCAKE_LOCAL_HOSTNAME = EnvStr("localhost")
     MOONCAKE_TE_META_DATA_SERVER = EnvStr("P2PHANDSHAKE")
     MOONCAKE_GLOBAL_SEGMENT_SIZE = EnvStr("4gb")
@@ -258,6 +259,7 @@ class Envs:
     MOONCAKE_DEVICE = EnvStr("")
     MOONCAKE_MASTER_METRICS_PORT = EnvInt(9003)
     MOONCAKE_CHECK_SERVER = EnvBool(False)
+    MOONCAKE_STANDALONE_STORAGE = EnvBool(False)
 
     # AMD & ROCm
     SGLANG_USE_AITER = EnvBool(False)
