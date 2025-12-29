@@ -260,7 +260,7 @@ jobs:
       - name: Nightly Perf Test (8-GPU Grok-1 + Grok-2)
         timeout-minutes: 60
         run: |
-          bash scripts/ci/amd_ci_exec.sh -w /sglang-checkout/test -e RCCL_MSCCL_ENABLE=0 -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" python3 registered/test_grok_perf.py || TEST_EXIT_CODE=$?
+          bash scripts/ci/amd_ci_exec.sh -w /sglang-checkout/test -e RCCL_MSCCL_ENABLE=0 -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" python3 registered/amd/test_grok_perf.py || TEST_EXIT_CODE=$?
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
 
@@ -285,7 +285,7 @@ jobs:
       - name: Nightly Perf Test (8-GPU DeepSeek-V3)
         timeout-minutes: 300
         run: |
-          bash scripts/ci/amd_ci_exec.sh -w /sglang-checkout/test -e SGLANG_USE_ROCM700A=1 -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" python3 registered/test_deepseek_v3_perf.py || TEST_EXIT_CODE=$?
+          bash scripts/ci/amd_ci_exec.sh -w /sglang-checkout/test -e SGLANG_USE_ROCM700A=1 -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" python3 registered/amd/test_deepseek_v3_perf.py || TEST_EXIT_CODE=$?
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
 
@@ -310,7 +310,7 @@ jobs:
       - name: Nightly Perf Test (8-GPU DeepSeek-V3.1)
         timeout-minutes: 300
         run: |
-          bash scripts/ci/amd_ci_exec.sh -w /sglang-checkout/test -e SGLANG_USE_ROCM700A=1 -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" python3 registered/test_deepseek_v31_perf.py || TEST_EXIT_CODE=$?
+          bash scripts/ci/amd_ci_exec.sh -w /sglang-checkout/test -e SGLANG_USE_ROCM700A=1 -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" python3 registered/amd/test_deepseek_v31_perf.py || TEST_EXIT_CODE=$?
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
 
