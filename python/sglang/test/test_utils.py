@@ -8,6 +8,7 @@ import logging
 import os
 import random
 import re
+import shlex
 import subprocess
 import sys
 import threading
@@ -59,6 +60,7 @@ DEFAULT_MODEL_NAME_FOR_TEST_MLA = "lmsys/sglang-ci-dsv3-test"
 DEFAULT_MODEL_NAME_FOR_TEST_MLA_NEXTN = "lmsys/sglang-ci-dsv3-test-NextN"
 
 # VL test models
+DEFAULT_MODEL_NAME_FOR_TEST_VL_PP = "Qwen/Qwen3-VL-2B-Thinking"
 DEFAULT_MODEL_NAME_FOR_TEST_GLM_41V_PP = "zai-org/GLM-4.1V-9B-Thinking"
 
 # NVFP4 models
@@ -90,18 +92,24 @@ DEFAULT_MODEL_NAME_FOR_TEST_AWQ_INT4 = (
     "hugging-quants/Meta-Llama-3.1-8B-Instruct-AWQ-INT4"
 )
 
-# EAGLE
-DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST = "meta-llama/Llama-2-7b-chat-hf"
-DEFAULT_EAGLE_DRAFT_MODEL_FOR_TEST = "lmsys/sglang-EAGLE-llama2-chat-7B"
-DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST_EAGLE3 = "meta-llama/Llama-3.1-8B-Instruct"
-DEFAULT_EAGLE_DP_ATTENTION_TARGET_MODEL_FOR_TEST = "Qwen/Qwen3-30B-A3B"
-DEFAULT_EAGLE_DP_ATTENTION_DRAFT_MODEL_FOR_TEST = "Tengyunw/qwen3_30b_moe_eagle3"
-DEFAULT_MODEL_NAME_FOR_TEST_EAGLE3 = "lmsys/sglang-EAGLE3-LLaMA3.1-Instruct-8B"
-DEFAULT_STANDALONE_SPECULATIVE_TARGET_MODEL_FOR_TEST = (
-    "meta-llama/Llama-3.1-8B-Instruct"
-)
-DEFAULT_STANDALONE_SPECULATIVE_DRAFT_MODEL_FOR_TEST = "meta-llama/Llama-3.2-1B-Instruct"
-DEFAULT_NGRAM_SPECULATIVE_TARGET_MODEL_FOR_TEST = "Qwen/Qwen2.5-Coder-7B-Instruct"
+# EAGLE2 algorithm models
+DEFAULT_TARGET_MODEL_EAGLE = "meta-llama/Llama-2-7b-chat-hf"
+DEFAULT_DRAFT_MODEL_EAGLE = "lmsys/sglang-EAGLE-llama2-chat-7B"
+
+# EAGLE3 model
+DEFAULT_TARGET_MODEL_EAGLE3 = "meta-llama/Llama-3.1-8B-Instruct"
+DEFAULT_DRAFT_MODEL_EAGLE3 = "lmsys/sglang-EAGLE3-LLaMA3.1-Instruct-8B"
+
+# EAGLE2 with DP-Attention models
+DEFAULT_TARGET_MODEL_EAGLE_DP_ATTN = "Qwen/Qwen3-30B-A3B"
+DEFAULT_DRAFT_MODEL_EAGLE_DP_ATTN = "Tengyunw/qwen3_30b_moe_eagle3"
+
+# Standalone speculative decoding models
+DEFAULT_TARGET_MODEL_STANDALONE = "meta-llama/Llama-3.1-8B-Instruct"
+DEFAULT_DRAFT_MODEL_STANDALONE = "meta-llama/Llama-3.2-1B-Instruct"
+
+# N-gram speculative decoding models
+DEFAULT_TARGET_MODEL_NGRAM = "Qwen/Qwen2.5-Coder-7B-Instruct"
 
 # Other use cases
 DEFAULT_AUTOROUND_MODEL_NAME_FOR_TEST = (
@@ -119,6 +127,7 @@ DEFAULT_AWQ_MOE_MODEL_NAME_FOR_TEST = (
 )
 DEFAULT_ENABLE_THINKING_MODEL_NAME_FOR_TEST = "Qwen/Qwen3-30B-A3B"
 DEFAULT_DEEPSEEK_W4AFP8_MODEL_FOR_TEST = "Barrrrry/DeepSeek-R1-W4AFP8"
+DEFAULT_ENABLE_ROUTED_EXPERTS_MODEL_NAME_FOR_TEST = "Qwen/Qwen3-30B-A3B"
 
 # Nightly tests
 DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP1 = "meta-llama/Llama-3.1-8B-Instruct,mistralai/Mistral-7B-Instruct-v0.3,deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct,google/gemma-2-27b-it"
@@ -166,6 +175,11 @@ def is_blackwell_system():
     return envs.IS_BLACKWELL.get()
 
 
+def is_h200_system():
+    """Return whether it is running on an H200 system."""
+    return envs.IS_H200.get()
+
+
 def _use_cached_default_models(model_repo: str):
     cache_dir = os.getenv("DEFAULT_MODEL_CACHE_DIR")
     if cache_dir and model_repo:
@@ -190,6 +204,9 @@ if is_in_amd_ci():
 
 if is_blackwell_system():
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH = 3000
+
+if is_h200_system():
+    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH = 3600
 
 
 def call_generate_lightllm(prompt, temperature, max_tokens, stop=None, url=None):
@@ -616,7 +633,7 @@ def popen_launch_server(
     if api_key:
         command += ["--api-key", api_key]
 
-    print(f"command={' '.join(command)}")
+    print(f"command={shlex.join(command)}")
 
     if return_stdout_stderr:
         process = subprocess.Popen(
@@ -667,6 +684,7 @@ def popen_launch_server(
                 response = session.get(
                     f"{base_url}/health_generate",
                     headers=headers,
+                    timeout=5,
                 )
                 if response.status_code == 200:
                     return process
@@ -771,6 +789,7 @@ def get_benchmark_args(
         disable_tqdm=False,
         disable_stream=disable_stream,
         return_logprob=False,
+        return_routed_experts=False,
         seed=seed,
         disable_ignore_eos=disable_ignore_eos,
         extra_request_body=None,
@@ -1694,16 +1713,19 @@ async def send_concurrent_generate_requests_with_custom_params(
 
 class CustomTestCase(unittest.TestCase):
     def _callTestMethod(self, method):
-        max_retry = int(
-            os.environ.get("SGLANG_TEST_MAX_RETRY", "1" if is_in_ci() else "0")
-        )
+        max_retry = envs.SGLANG_TEST_MAX_RETRY.get()
+        if max_retry is None:
+            max_retry = 1 if is_in_ci() else 0
         retry(
             lambda: super(CustomTestCase, self)._callTestMethod(method),
             max_retry=max_retry,
         )
 
     def setUp(self):
-        print(f"[CI Test Method] {self.__class__.__name__}.{self._testMethodName}")
+        print(
+            f"[CI Test Method] {self.__class__.__name__}.{self._testMethodName}",
+            flush=True,
+        )
 
 
 def dump_bench_raw_result(
@@ -1786,17 +1808,19 @@ def check_evaluation_test_results(
     model_count=None,
 ):
     """
-    results: list of tuple of (model_path, accuracy, latency)
+    results: list of tuple of (model_path, accuracy, latency) or (model_path, accuracy, latency, error)
     """
     failed_models = []
     if model_latency_thresholds is not None:
-        summary = " | model | status | score | score_threshold | latency | latency_threshold | \n"
-        summary += "| ----- | ------ | ----- | --------------- | ------- | ----------------- | \n"
+        summary = " | model | status | score | score_threshold | latency | latency_threshold | error | \n"
+        summary += "| ----- | ------ | ----- | --------------- | ------- | ----------------- | ----- | \n"
     else:
-        summary = " | model | status | score | score_threshold | \n"
-        summary += "| ----- | ------ | ----- | --------------- | \n"
+        summary = " | model | status | score | score_threshold | error | \n"
+        summary += "| ----- | ------ | ----- | --------------- | ----- | \n"
 
-    results_dict = {res[0]: (res[1], res[2]) for res in results}
+    results_dict = {
+        res[0]: (res[1], res[2], res[3] if len(res) == 4 else None) for res in results
+    }
 
     for model, accuracy_threshold in sorted(model_accuracy_thresholds.items()):
         latency_threshold = (
@@ -1805,8 +1829,15 @@ def check_evaluation_test_results(
             else 1e9
         )
 
-        if model in results_dict:
-            accuracy, latency = results_dict[model]
+        # check for error here
+        error = (
+            results_dict.get(model, (None, None, None))[2]
+            if model in results_dict
+            else None
+        )
+
+        if model in results_dict and error is None:
+            accuracy, latency, _ = results_dict[model]
             is_success = accuracy >= accuracy_threshold and latency <= latency_threshold
             status_emoji = "✅" if is_success else "❌"
 
@@ -1823,18 +1854,17 @@ def check_evaluation_test_results(
                     )
 
             if model_latency_thresholds is not None:
-                line = f"| {model} | {status_emoji} | {accuracy} | {accuracy_threshold} | {latency} | {latency_threshold}\n"
+                line = f"| {model} | {status_emoji} | {accuracy} | {accuracy_threshold} | {latency} | {latency_threshold} | - |\n"
             else:
-                line = (
-                    f"| {model} | {status_emoji} | {accuracy} | {accuracy_threshold}\n"
-                )
+                line = f"| {model} | {status_emoji} | {accuracy} | {accuracy_threshold} | - |\n"
         else:
             status_emoji = "❌"
+            error_display = error if error else "Model not evaluated"
             failed_models.append(f"Model failed to launch or be evaluated: {model}")
             if model_latency_thresholds is not None:
-                line = f"| {model} | {status_emoji} | N/A | {accuracy_threshold} | N/A | {latency_threshold}\n"
+                line = f"| {model} | {status_emoji} | N/A | {accuracy_threshold} | N/A | {latency_threshold} | {error_display} |\n"
             else:
-                line = f"| {model} | {status_emoji} | N/A | {accuracy_threshold}\n"
+                line = f"| {model} | {status_emoji} | N/A | {accuracy_threshold} | {error_display} |\n"
 
         summary += line
 

@@ -1,12 +1,13 @@
 //! Workflow step implementations
 //!
 //! This module contains concrete step implementations for various workflows:
-//! - Worker management (registration, removal, future: updates)
+//! - Worker management (registration, removal, updates)
 //! - MCP server registration
 //! - WASM module registration and removal
-//! - Future: Tokenizer fetching, LoRA updates, etc.
+//! - Tokenizer registration
 
 pub mod mcp_registration;
+pub mod tokenizer_registration;
 pub mod wasm_module_registration;
 pub mod wasm_module_removal;
 pub mod worker;
@@ -22,6 +23,7 @@ pub use worker::{
     create_external_worker_workflow,
     create_local_worker_workflow,
     create_worker_removal_workflow,
+    create_worker_update_workflow,
     // Utility functions
     group_models_into_cards,
     infer_model_type_from_id,
@@ -36,6 +38,8 @@ pub use worker::{
     DiscoverMetadataStep,
     DiscoverModelsStep,
     DpInfo,
+    // Update steps
+    FindWorkerToUpdateStep,
     // Removal steps
     FindWorkersToRemoveStep,
     ModelInfo,
@@ -43,8 +47,10 @@ pub use worker::{
     RegisterWorkersStep,
     RemoveFromPolicyRegistryStep,
     RemoveFromWorkerRegistryStep,
+    UpdatePoliciesForWorkerStep,
     UpdatePoliciesStep,
     UpdateRemainingPoliciesStep,
+    UpdateWorkerPropertiesStep,
     WorkerList,
     WorkerRemovalRequest,
 };
@@ -60,6 +66,10 @@ pub type UpdateExternalPoliciesStep = UpdatePoliciesStep;
 pub use mcp_registration::{
     create_mcp_registration_workflow, ConnectMcpServerStep, DiscoverMcpInventoryStep,
     McpServerConfigRequest, RegisterMcpServerStep, ValidateRegistrationStep,
+};
+pub use tokenizer_registration::{
+    create_tokenizer_registration_workflow, LoadTokenizerStep, TokenizerConfigRequest,
+    TokenizerRemovalRequest, ValidateTokenizerConfigStep,
 };
 pub use wasm_module_registration::{
     create_wasm_module_registration_workflow, CalculateHashStep, CheckDuplicateStep,

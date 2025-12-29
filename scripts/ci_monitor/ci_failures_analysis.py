@@ -12,7 +12,7 @@ Features:
 - Generates detailed reports with actionable recommendations
 
 Usage:
-    python ci_failures_analysis.py --token <GITHUB_TOKEN> --limit 500 --threshold 3
+    python ci_failures_analysis.py --token <GITHUB_TOKEN> --limit 100
 """
 
 import argparse
@@ -30,9 +30,8 @@ import requests
 class SGLangFailuresAnalyzer:
     """Analyzes consecutive failures in GitHub Actions workflows."""
 
-    def __init__(self, token: str, alert_threshold: int = 3):
+    def __init__(self, token: str):
         self.token = token
-        self.alert_threshold = alert_threshold
         self.base_url = "https://api.github.com"
         self.repo = "sgl-project/sglang"
         self.headers = {
@@ -103,14 +102,32 @@ class SGLangFailuresAnalyzer:
         return all_runs
 
     def get_jobs_for_run(self, run_id: int) -> List[Dict]:
-        """Get all jobs for a specific workflow run."""
+        """Get all jobs for a specific workflow run, handling pagination."""
         try:
+            all_jobs = []
             url = f"{self.base_url}/repos/{self.repo}/actions/runs/{run_id}/jobs"
-            response = self.session.get(url, timeout=30)
-            response.raise_for_status()
-            data = response.json()
-            jobs = data.get("jobs", [])
-            return jobs
+            params = {"per_page": 100}  # Max per page
+
+            while url:
+                response = self.session.get(url, params=params, timeout=30)
+                response.raise_for_status()
+                data = response.json()
+                jobs = data.get("jobs", [])
+                all_jobs.extend(jobs)
+
+                # Check for next page in Link header
+                link_header = response.headers.get("Link", "")
+                next_url = None
+                if link_header:
+                    links = link_header.split(", ")
+                    for link in links:
+                        if 'rel="next"' in link:
+                            next_url = link.split(";")[0].strip("<>")
+                            break
+                url = next_url
+                params = {}  # Clear params for subsequent requests (URL has them)
+
+            return all_jobs
         except requests.exceptions.RequestException as e:
             print(f"Error fetching jobs for run {run_id}: {e}")
             return []
@@ -682,10 +699,8 @@ class SGLangFailuresAnalyzer:
         # Build final results
         job_streak_data = {}
         for job_name in job_current_streak.keys():
-            # Get last 5 runs (most recent first)
-            recent_runs = job_recent_runs.get(job_name, [])[-5:][
-                ::-1
-            ]  # Last 5, reversed
+            # Get last 5 runs (oldest to latest, chronological order)
+            recent_runs = job_recent_runs.get(job_name, [])[-5:]
 
             job_streak_data[job_name] = {
                 "current_streak": job_current_streak[job_name],
@@ -815,8 +830,10 @@ class SGLangFailuresAnalyzer:
             if broken:
                 print(f"## {title} ({len(broken)} jobs with active streaks)")
                 print("=" * 130)
+                # Add sub-header to clarify this shows ongoing failure streaks
+                print("\n🔥 Consecutive failures (>=2) & currently failing")
                 print(
-                    f"\n{'Job Name':<40} {'Current':<8} {'Max':<6} {'Runs':<6} {'First':<13} {'Last':<13} {'Recent History':<30}"
+                    f"\n{'Job Name':<40} {'Current':<8} {'Max':<6} {'Runs':<6} {'First':<13} {'Last':<13} {'Recent Runs (oldest → latest)':<30}"
                 )
                 print("-" * 130)
                 for job_name, d in broken[:15]:
@@ -839,7 +856,7 @@ class SGLangFailuresAnalyzer:
                     # Recent history (last 5 runs as emoji)
                     recent_runs = d.get("recent_runs", [])
                     history_str = (
-                        " ".join([r["status"] for r in recent_runs])
+                        "… " + " ".join([r["status"] for r in recent_runs])
                         if recent_runs
                         else "N/A"
                     )
@@ -847,11 +864,11 @@ class SGLangFailuresAnalyzer:
                     # Color red if color_failures is True (for critical sections)
                     if color_failures:
                         print(
-                            f"\033[91m{display_name:<40}\033[0m {d['current_streak']:<8} {d['max_streak']:<6} {d['total_runs']:<6} {first_str:<13} {last_str:<13} {history_str:<30}"
+                            f"\033[91m{display_name:<40}\033[0m {d['current_streak']:<8} {d['max_streak']:<6} {d['total_runs']:<6} {first_str:<13} {last_str:<13} {history_str:<32}"
                         )
                     else:
                         print(
-                            f"{display_name:<40} {d['current_streak']:<8} {d['max_streak']:<6} {d['total_runs']:<6} {first_str:<13} {last_str:<13} {history_str:<30}"
+                            f"{display_name:<40} {d['current_streak']:<8} {d['max_streak']:<6} {d['total_runs']:<6} {first_str:<13} {last_str:<13} {history_str:<32}"
                         )
             else:
                 print(f"## {title}")
@@ -860,11 +877,17 @@ class SGLangFailuresAnalyzer:
 
             # Show recently failed jobs in a collapsed section (terminal doesn't support collapse, so just show as separate section)
             if recently_failed:
+                # Extract just the workflow name without the run count for cleaner display
+                short_title = title.split("(")[0].strip()
+                if short_title and short_title[0].isdigit():
+                    short_title = short_title.split(".", 1)[-1].strip()
+                # Get the max total_runs from recently_failed jobs to show the analysis window
+                max_total_runs = max(d["total_runs"] for _, d in recently_failed)
                 print(
-                    f"\n   Recently failed jobs (no active streak): {len(recently_failed)} jobs"
+                    f"\n   📋 [{short_title}] No current failure streak, but had failures in the past {max_total_runs} runs - {len(recently_failed)} jobs"
                 )
                 print(
-                    f"   {'Job Name':<38} {'Failures':<12} {'Fail Rate':<12} {'Total Runs':<12} {'Recent History (last 5)':<30}"
+                    f"   {'Job Name':<38} {'Failures':<12} {'Fail Rate':<12} {'Total Runs':<12} {'Recent Runs (oldest → latest)':<30}"
                 )
                 print("   " + "-" * 120)
                 for job_name, d in recently_failed[:10]:
@@ -873,12 +896,12 @@ class SGLangFailuresAnalyzer:
                     )
                     recent_runs = d.get("recent_runs", [])
                     history_str = (
-                        " ".join([r["status"] for r in recent_runs])
+                        "… " + " ".join([r["status"] for r in recent_runs])
                         if recent_runs
                         else "N/A"
                     )
                     print(
-                        f"   {display_name:<38} {d['total_failures']:<12} {d['failure_rate']:.1f}%{'':<7} {d['total_runs']:<12} {history_str:<30}"
+                        f"   {display_name:<38} {d['total_failures']:<12} {d['failure_rate']:.1f}%{'':<7} {d['total_runs']:<12} {history_str:<32}"
                     )
 
         # ========== SCHEDULED/MAIN BRANCH RUNS (9 sections) ==========
@@ -1105,7 +1128,6 @@ class SGLangFailuresAnalyzer:
                     1 for j in sorted_jobs if j[1]["current_streak"] > 0
                 ),
                 "total_runners": len(runner_stats) if runner_stats else 0,
-                "alert_threshold": self.alert_threshold,
                 "analysis_timestamp": datetime.now().isoformat(),
                 "avg_queue_time_seconds": overall_avg_queue,
                 "p90_queue_time_seconds": overall_p90_queue,
@@ -1170,7 +1192,7 @@ class SGLangFailuresAnalyzer:
                 f"**Analysis Timestamp:** {report_data['summary']['analysis_timestamp']}"
             )
             summary_lines.append(
-                f"**Alert Threshold:** {report_data['summary']['alert_threshold']} consecutive failures"
+                "_Note: Recent runs are shown oldest → latest (left to right)_"
             )
             summary_lines.append("")
 
@@ -1253,11 +1275,16 @@ class SGLangFailuresAnalyzer:
                 summary_lines.append("")
 
                 if broken:
+                    # Add sub-header to clarify this shows ongoing failure streaks
                     summary_lines.append(
-                        "| Job Name | Current | Max | Runs | First | Last | Recent History |"
+                        "🔥 **Consecutive failures (≥2) & currently failing**"
+                    )
+                    summary_lines.append("")
+                    summary_lines.append(
+                        "| Job Name | Current | Max | Runs | First | Last | Recent Runs (oldest → latest) |"
                     )
                     summary_lines.append(
-                        "|----------|---------|-----|------|-------|------|----------------|"
+                        "|----------|---------|-----|------|-------|------|-------------------------------|"
                     )
                     for job_name, d in broken[:15]:
                         display_name = (
@@ -1281,7 +1308,7 @@ class SGLangFailuresAnalyzer:
                         # Recent history (last 5 runs as clickable emoji)
                         recent_runs = d.get("recent_runs", [])
                         if recent_runs:
-                            history_links = " ".join(
+                            history_links = "… " + " ".join(
                                 [
                                     f"[{r['status']}]({r['job_url']})"
                                     for r in recent_runs
@@ -1310,16 +1337,24 @@ class SGLangFailuresAnalyzer:
 
                 # Show recently failed jobs in a collapsible section
                 if recently_failed:
+                    # Extract just the workflow name without the run count for cleaner display
+                    # e.g., "1. PR Test NVIDIA - Scheduled (latest 12 runs)" -> "PR Test NVIDIA - Scheduled"
+                    short_title = title.split("(")[0].strip()
+                    # Remove the leading number and period if present
+                    if short_title and short_title[0].isdigit():
+                        short_title = short_title.split(".", 1)[-1].strip()
+                    # Get the max total_runs from recently_failed jobs to show the analysis window
+                    max_total_runs = max(d["total_runs"] for _, d in recently_failed)
                     summary_lines.append("<details>")
                     summary_lines.append(
-                        f"<summary>Recently failed jobs (no active streak) - {len(recently_failed)} jobs</summary>"
+                        f"<summary>📋 [{short_title}] No current failure streak, but had failures in the past {max_total_runs} runs - {len(recently_failed)} jobs</summary>"
                     )
                     summary_lines.append("")
                     summary_lines.append(
-                        "| Job Name | Failures | Fail Rate | Total Runs | Recent History (last 5) |"
+                        "| Job Name | Failures | Fail Rate | Total Runs | Recent Runs (oldest → latest) |"
                     )
                     summary_lines.append(
-                        "|----------|----------|-----------|------------|-------------------------|"
+                        "|----------|----------|-----------|------------|-------------------------------|"
                     )
                     for job_name, d in recently_failed[:15]:
                         display_name = (
@@ -1327,7 +1362,7 @@ class SGLangFailuresAnalyzer:
                         )
                         recent_runs = d.get("recent_runs", [])
                         if recent_runs:
-                            history_links = " ".join(
+                            history_links = "… " + " ".join(
                                 [
                                     f"[{r['status']}]({r['job_url']})"
                                     for r in recent_runs
@@ -1563,12 +1598,6 @@ def main():
         help="Number of workflow runs to analyze per workflow for general analysis (default: 100)",
     )
     parser.add_argument(
-        "--threshold",
-        type=int,
-        default=3,
-        help="Alert threshold for consecutive failures (default: 3)",
-    )
-    parser.add_argument(
         "--output",
         default=None,
         help="Output JSON file (optional, only writes if specified)",
@@ -1576,7 +1605,7 @@ def main():
 
     args = parser.parse_args()
 
-    analyzer = SGLangFailuresAnalyzer(args.token, alert_threshold=args.threshold)
+    analyzer = SGLangFailuresAnalyzer(args.token)
 
     try:
         # Fetch runs for each category separately
