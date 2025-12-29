@@ -38,6 +38,47 @@ class ToleranceConfig:
     denoise_step: float
     denoise_agg: float
 
+    @classmethod
+    def load_profile(cls, all_tolerances: dict, profile_name: str) -> ToleranceConfig:
+        """Load a specific tolerance profile from a dictionary of profiles."""
+        # Support both flat structure (backward compatibility) and profiled structure
+        if "e2e" in all_tolerances and not isinstance(all_tolerances["e2e"], dict):
+            tol_data = all_tolerances
+            actual_profile = "legacy/flat"
+        else:
+            tol_data = all_tolerances.get(
+                profile_name, all_tolerances.get("pr_test", {})
+            )
+            actual_profile = (
+                profile_name if profile_name in all_tolerances else "pr_test"
+            )
+
+        if not tol_data:
+            raise ValueError(
+                f"No tolerance profile found for '{profile_name}' and no default 'pr_test' profile exists."
+            )
+
+        print(f"--- Performance Tolerance Profile: {actual_profile} ---")
+
+        return cls(
+            e2e=float(os.getenv("SGLANG_E2E_TOLERANCE", tol_data["e2e"])),
+            denoise_stage=float(
+                os.getenv("SGLANG_STAGE_TIME_TOLERANCE", tol_data["denoise_stage"])
+            ),
+            non_denoise_stage=float(
+                os.getenv(
+                    "SGLANG_NON_DENOISE_STAGE_TIME_TOLERANCE",
+                    tol_data["non_denoise_stage"],
+                )
+            ),
+            denoise_step=float(
+                os.getenv("SGLANG_DENOISE_STEP_TOLERANCE", tol_data["denoise_step"])
+            ),
+            denoise_agg=float(
+                os.getenv("SGLANG_DENOISE_AGG_TOLERANCE", tol_data["denoise_agg"])
+            ),
+        )
+
 
 @dataclass
 class ScenarioConfig:
@@ -66,24 +107,10 @@ class BaselineConfig:
         with path.open("r", encoding="utf-8") as fh:
             data = json.load(fh)
 
-        tol_data = data["tolerances"]
-        tolerances = ToleranceConfig(
-            e2e=float(os.getenv("SGLANG_E2E_TOLERANCE", tol_data["e2e"])),
-            denoise_stage=float(
-                os.getenv("SGLANG_STAGE_TIME_TOLERANCE", tol_data["denoise_stage"])
-            ),
-            non_denoise_stage=float(
-                os.getenv(
-                    "SGLANG_NON_DENOISE_STAGE_TIME_TOLERANCE",
-                    tol_data["non_denoise_stage"],
-                )
-            ),
-            denoise_step=float(
-                os.getenv("SGLANG_DENOISE_STEP_TOLERANCE", tol_data["denoise_step"])
-            ),
-            denoise_agg=float(
-                os.getenv("SGLANG_DENOISE_AGG_TOLERANCE", tol_data["denoise_agg"])
-            ),
+        # Get tolerance profile, defaulting to 'pr_test'
+        profile_name = "pr_test"
+        tolerances = ToleranceConfig.load_profile(
+            data.get("tolerances", {}), profile_name
         )
 
         scenarios = {}
