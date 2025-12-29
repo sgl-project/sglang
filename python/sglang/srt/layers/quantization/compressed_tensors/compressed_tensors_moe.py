@@ -140,8 +140,8 @@ class CompressedTensorsMoEMethod(FusedMoEMethodBase):
                     f"The W8A8Int8 Fused MoE scheme is implemented only for NPU for now."
                 )
         elif (
-            quant_config._is_dynamic_token_w4(weight_quant, input_quant) 
-            and input_quant is not None\
+            quant_config._is_dynamic_token_w4(weight_quant, input_quant)
+            and input_quant is not None
         ):
             # TODO add w4a8 verification method
             if _is_npu:
@@ -1543,7 +1543,11 @@ class NPUCompressedTensorsW4A8Int8DynamicMoEMethod(CompressedTensorsMoEMethod):
         set_weight_attrs(w2_scale_bias, extra_weight_attrs)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        self.kernel.process_weights_after_loading(layer, self.is_per_channel_weight, self.activation_use_clip)
+        self.kernel.process_weights_after_loading(
+            layer, 
+            self.is_per_channel_weight, 
+            self.activation_use_clip
+        )
 
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
