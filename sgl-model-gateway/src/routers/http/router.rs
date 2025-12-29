@@ -375,8 +375,7 @@ impl Router {
             })
             .unwrap_or_default();
 
-        // Create a stream of futures for concurrent execution
-        let futures = workers.iter().map(|worker| {
+        let futures = workers.into_iter().map(|worker| {
             let worker_url = worker.url();
             let base = self.worker_base_url(worker_url);
 
