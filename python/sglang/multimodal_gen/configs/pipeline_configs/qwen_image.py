@@ -156,6 +156,7 @@ class QwenImagePipelineConfig(ImagePipelineConfig):
         # img_shapes: for global entire image
         img_freqs, txt_freqs = rotary_emb(img_shapes, txt_seq_lens, device=device)
 
+        # flashinfer RoPE expects a float32 cos/sin cache concatenated on the last dim
         img_cos_half = img_freqs.real.to(dtype=torch.float32).contiguous()
         img_sin_half = img_freqs.imag.to(dtype=torch.float32).contiguous()
         txt_cos_half = txt_freqs.real.to(dtype=torch.float32).contiguous()
