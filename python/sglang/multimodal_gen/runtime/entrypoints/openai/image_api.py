@@ -121,8 +121,6 @@ async def generations(
         server_args=get_global_server_args(),
         sampling_params=sampling,
     )
-
-    # Run synchronously for images and save to disk
     save_file_path, result = await process_generation_batch(
         async_scheduler_client, batch
     )
