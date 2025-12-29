@@ -8,8 +8,8 @@ from sglang.test.few_shot_gsm8k import run_eval
 from sglang.test.kits.matched_stop_kit import MatchedStopMixin
 from sglang.test.kits.radix_cache_server_kit import run_radix_attention_test
 from sglang.test.test_utils import (
-    DEFAULT_EAGLE_DRAFT_MODEL_FOR_TEST,
-    DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST,
+    DEFAULT_DRAFT_MODEL_EAGLE,
+    DEFAULT_TARGET_MODEL_EAGLE,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -27,8 +27,8 @@ class TestEagleServerBase(CustomTestCase, MatchedStopMixin):
     spec_draft_tokens = 6
     page_size = 1
     other_launch_args = []
-    model = DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST
-    draft_model = DEFAULT_EAGLE_DRAFT_MODEL_FOR_TEST
+    model = DEFAULT_TARGET_MODEL_EAGLE
+    draft_model = DEFAULT_DRAFT_MODEL_EAGLE
 
     @classmethod
     def setUpClass(cls):
@@ -57,7 +57,9 @@ class TestEagleServerBase(CustomTestCase, MatchedStopMixin):
             *[str(i) for i in range(1, cls.max_running_requests + 1)],
         ]
         launch_args.extend(cls.other_launch_args)
-        with envs.SGLANG_ENABLE_SPEC_V2.override(True):
+        with envs.SGLANG_ENABLE_SPEC_V2.override(
+            True
+        ), envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.override(1):
             cls.process = popen_launch_server(
                 cls.model,
                 cls.base_url,

@@ -91,7 +91,7 @@ class OpenAIServingChat(OpenAIServingBase):
             self.tokenizer_manager.tokenizer is not None
             and self.tokenizer_manager.tokenizer.chat_template is not None
         )
-        architectures = self.tokenizer_manager.server_args.get_hf_config().architectures
+        architectures = self.tokenizer_manager.model_config.hf_config.architectures
         is_dpsk_v32 = "DeepseekV3" in architectures[0] if architectures else False
         return not has_chat_template and is_dpsk_v32
 
@@ -133,7 +133,7 @@ class OpenAIServingChat(OpenAIServingBase):
             max_output_tokens
             and server_context_length
             and max_output_tokens > server_context_length
-        ):
+        ) and not self.tokenizer_manager.server_args.allow_auto_truncate:
             return (
                 f"max_completion_tokens is too large: {max_output_tokens}."
                 f"This model supports at most {server_context_length} completion tokens."
@@ -1069,8 +1069,8 @@ class OpenAIServingChat(OpenAIServingBase):
                 request.chat_template_kwargs is not None
                 and request.chat_template_kwargs.get("thinking") is True
             )
-        if self.reasoning_parser in ["qwen3", "glm45", "nano_v3"]:
-            # qwen3, glm45, and nano_v3 are reasoning by default
+        if self.reasoning_parser in ["qwen3", "glm45", "nano_v3", "interns1"]:
+            # qwen3, glm45, nano_v3, and interns1 are reasoning by default
             return (
                 not request.chat_template_kwargs
                 or request.chat_template_kwargs.get("enable_thinking", True) is True
