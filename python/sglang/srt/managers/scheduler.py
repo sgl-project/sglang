@@ -2338,7 +2338,7 @@ class Scheduler(
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
     ):
         if batch.forward_mode.is_decode():
-            if batch.reqs[0].is_beam_search:
+            if batch.reqs and batch.reqs[0].is_beam_search:
                 self.process_beam_search_decode_result(batch, result)
             else:
                 self.process_batch_result_decode(batch, result)

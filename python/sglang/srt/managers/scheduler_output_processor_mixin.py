@@ -97,7 +97,7 @@ class SchedulerOutputProcessorMixin:
                 result.extend_logprob_start_len_per_req,
             )
 
-            if batch.reqs[0].is_beam_search:
+            if batch.reqs and batch.reqs[0].is_beam_search:
                 self.process_beam_search_prefill_result(batch, logits_output)
                 return
 
