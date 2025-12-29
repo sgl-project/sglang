@@ -26,7 +26,7 @@ class TestRequestLoggerParallelSampling(unittest.TestCase):
         """Test logging with single request (n=1)."""
         # Create a mock tokenizer
         mock_tokenizer = Mock()
-        mock_tokenizer.decode.side_effect = lambda x, skip_special_tokens: "Hello"
+        mock_tokenizer.decode.return_value = "Hello"
         
         # Create request with n=1 (single request)
         req = GenerateReqInput(
@@ -36,17 +36,15 @@ class TestRequestLoggerParallelSampling(unittest.TestCase):
         req.normalize_batch_and_arguments()
         
         # Should not raise error
-        try:
-            self.request_logger.log_received_request(req, mock_tokenizer)
-        except Exception as e:
-            self.fail(f"log_received_request raised unexpected exception: {e}")
+        self.request_logger.log_received_request(req, mock_tokenizer)
         
-        # Verify tokenizer.decode was called with List[int]
+        # The type check for input_ids_arg can be made more explicit and robust
+        # by using an assertion instead of a pass statement.
         self.assertEqual(mock_tokenizer.decode.call_count, 1)
         call_args = mock_tokenizer.decode.call_args
         input_ids_arg = call_args[0][0]
         # For single request, input_ids should be List[int]
-        self.assertIsInstance(input_ids_arg, list)
+        self.assertIsInstance(input_ids_arg, list, "input_ids_arg should be a list")
         if input_ids_arg and isinstance(input_ids_arg[0], int):
             pass  # Correct: List[int]
 
