@@ -26,6 +26,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import 
 )
 from sglang.multimodal_gen.runtime.pipelines_core.lora_format_adapter import (
     maybe_fuse_qwen_image_qkv_lora_state_dict,
+    maybe_fuse_w13_lora_state_dict,
     normalize_lora_state_dict,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
@@ -358,8 +359,9 @@ class LoRAPipeline(ComposedPipelineBase):
 
                 # ---- DEBUG: confirm fused QKV is hit and weights look non-trivial (rank 0 only) ----
                 if rank == 0 and name in (
-                    "transformer_blocks.0.attn.to_qkv",
-                    "transformer_blocks.0.attn.to_added_qkv",
+                    "layers.0.attention.to_qkv",
+                    "layers.0.attention.to_out.0",
+                    "layers.0.feed_forward.w13",
                 ):
                     try:
                         logger.info(
@@ -421,21 +423,38 @@ class LoRAPipeline(ComposedPipelineBase):
         lora_state_dict = normalize_lora_state_dict(raw_state_dict, logger=logger)
 
         # ------------------------------------------------------------------
-        # Qwen-Image fix: fuse split q/k/v (and add_q/k/v) LoRA into fused
+        # Qwen-Image & Z-image fix: fuse split q/k/v (and add_q/k/v) LoRA into fused
         # to_qkv / to_added_qkv, when the *target model* uses fused layers.
         # ------------------------------------------------------------------
         target_has_to_qkv = any(
-            name.endswith("attn.to_qkv") for name in self.lora_layers.keys()
+            name.endswith(("attn.to_qkv", "attention.to_qkv"))
+            for name in self.lora_layers.keys()
         )
         target_has_to_added_qkv = any(
-            name.endswith("attn.to_added_qkv") for name in self.lora_layers.keys()
+            name.endswith(("attn.to_added_qkv", "attention.to_added_qkv"))
+            for name in self.lora_layers.keys()
         )
+
+        # NOTE: lora_state_dict 这时可能仍带 "diffusion_model." 前缀，所以用 substring 最稳
         sd_has_split_qkv = any(
-            ".attn.to_q.lora_A.weight" in k for k in lora_state_dict.keys()
+            (".attn.to_q.lora_A.weight" in k) or (".attention.to_q.lora_A.weight" in k)
+            for k in lora_state_dict.keys()
         )
         sd_has_split_added = any(
-            ".attn.add_q_proj.lora_A.weight" in k for k in lora_state_dict.keys()
+            (".attn.add_q_proj.lora_A.weight" in k)
+            or (".attention.add_q_proj.lora_A.weight" in k)
+            for k in lora_state_dict.keys()
         )
+
+        if rank == 0:
+            logger.info(
+                "[LoRA DEBUG] fuse check: target_has_to_qkv=%s sd_has_split_qkv=%s "
+                "target_has_to_added_qkv=%s sd_has_split_added=%s",
+                target_has_to_qkv,
+                sd_has_split_qkv,
+                target_has_to_added_qkv,
+                sd_has_split_added,
+            )
 
         if (target_has_to_qkv and sd_has_split_qkv) or (
             target_has_to_added_qkv and sd_has_split_added
@@ -443,6 +462,57 @@ class LoRAPipeline(ComposedPipelineBase):
             lora_state_dict = maybe_fuse_qwen_image_qkv_lora_state_dict(
                 lora_state_dict, logger=logger
             )
+
+            if rank == 0:
+                keys2 = list(lora_state_dict.keys())
+                logger.info(
+                    "[LoRA DEBUG] after fuse: has_to_qkv=%s has_split_to_q=%s",
+                    any(".to_qkv.lora_A.weight" in k for k in keys2),
+                    any(".to_q.lora_A.weight" in k for k in keys2),
+                )
+
+        # ------------------------------------------------------------------
+        # Z-image fix: fuse split FFN w1/w3 into fused w13 (when target has w13)
+        # ------------------------------------------------------------------
+        target_has_w13 = any(
+            name.endswith(("feed_forward.w13", "ffn.w13", "mlp.w13"))
+            for name in self.lora_layers.keys()
+        )
+
+        sd_has_split_w1 = any(
+            (".feed_forward.w1.lora_A.weight" in k)
+            or (".ffn.w1.lora_A.weight" in k)
+            or (".mlp.w1.lora_A.weight" in k)
+            for k in lora_state_dict.keys()
+        )
+        sd_has_split_w3 = any(
+            (".feed_forward.w3.lora_A.weight" in k)
+            or (".ffn.w3.lora_A.weight" in k)
+            or (".mlp.w3.lora_A.weight" in k)
+            for k in lora_state_dict.keys()
+        )
+
+        if rank == 0:
+            logger.info(
+                "[LoRA DEBUG] w13 fuse check: target_has_w13=%s sd_has_w1=%s sd_has_w3=%s",
+                target_has_w13,
+                sd_has_split_w1,
+                sd_has_split_w3,
+            )
+
+        if target_has_w13 and sd_has_split_w1 and sd_has_split_w3:
+            lora_state_dict = maybe_fuse_w13_lora_state_dict(
+                lora_state_dict, logger=logger
+            )
+
+            if rank == 0:
+                keys3 = list(lora_state_dict.keys())
+                logger.info(
+                    "[LoRA DEBUG] after w13 fuse: has_w13=%s has_w1=%s has_w3=%s",
+                    any(".w13.lora_A.weight" in k for k in keys3),
+                    any(".w1.lora_A.weight" in k for k in keys3),
+                    any(".w3.lora_A.weight" in k for k in keys3),
+                )
 
         # ---- DEBUG: inspect qkv-related LoRA keys (rank 0 only) ----
         if rank == 0:

@@ -364,7 +364,11 @@ def fuse_qkv_like_keys_inplace(
     skipped = 0
     a_mismatch = 0
     for q, k, v, fused_name in patterns:
-        pat = re.compile(rf"^(?P<prefix>.+\.attn)\.{re.escape(q)}\.lora_A\.weight$")
+        # Support both "...attn.*" and "...attention.*"
+        pat = re.compile(
+            rf"^(?P<prefix>.+\.(?:attn|attention))\.{re.escape(q)}\.lora_A\.weight$"
+        )
+
         prefixes = sorted(
             {
                 m.group("prefix")
@@ -439,6 +443,246 @@ def maybe_fuse_qwen_image_qkv_lora_state_dict(
         ]
         log.info(
             "[LoRAFormatAdapter] fused qkv/add_qkv LoRA: fused=%d skipped=%d A_mismatch=%d, sample fused keys (<=20): %s",
+            stats["fused"],
+            stats["skipped"],
+            stats["A_mismatch"],
+            ", ".join(sample) if sample else "(none)",
+        )
+
+    return sd
+
+
+# ---------------------------------------------------------------------------
+# Fuse split FFN w1/w3 LoRA into fused w13 (SwiGLU gate+up projection)
+# ---------------------------------------------------------------------------
+
+
+def _fuse_one_w13_pair(
+    sd: Dict[str, torch.Tensor],
+    prefix: str,
+    w1: str,
+    w3: str,
+    fused: str,
+    log: logging.Logger,
+    *,
+    atol: float = 1e-5,
+    rtol: float = 1e-3,
+) -> tuple[bool, bool]:
+    """
+    Fuse one (w1, w3) pair under a shared FFN prefix into fused projection (w13).
+
+    Returns:
+      (fused_ok, used_blockdiag)
+
+    Exact fusion:
+      - If A1 == A3: keep A, concat B along output dim.
+      - Else: block-diagonal exact fusion (rank expands).
+    """
+    A1_k = f"{prefix}.{w1}.lora_A.weight"
+    A3_k = f"{prefix}.{w3}.lora_A.weight"
+    B1_k = f"{prefix}.{w1}.lora_B.weight"
+    B3_k = f"{prefix}.{w3}.lora_B.weight"
+
+    need = (A1_k, A3_k, B1_k, B3_k)
+    if not all(k in sd for k in need):
+        return False, False
+
+    A1, A3 = sd[A1_k], sd[A3_k]
+    B1, B3 = sd[B1_k], sd[B3_k]
+
+    if any(t.ndim != 2 for t in (A1, A3, B1, B3)):
+        return False, False
+
+    # Align device/dtype (avoid block_diag mismatch / fp32 surprises)
+    dev = A1.device
+    dtype = A1.dtype
+    if A3.device != dev:
+        A3 = A3.to(dev)
+    if B1.device != dev:
+        B1 = B1.to(dev)
+    if B3.device != dev:
+        B3 = B3.to(dev)
+
+    if A3.dtype != dtype:
+        A3 = A3.to(dtype)
+    if B1.dtype != dtype:
+        B1 = B1.to(dtype)
+    if B3.dtype != dtype:
+        B3 = B3.to(dtype)
+
+    layout = _infer_lora_layout(A1, B1)
+    if layout is None:
+        return False, False
+    if _infer_lora_layout(A3, B3) != layout:
+        return False, False
+
+    # Validate in_dim matches
+    if layout == "BA":
+        # A: (r, in), B: (out, r)
+        in_dim = int(A1.shape[1])
+        if int(A3.shape[1]) != in_dim:
+            return False, False
+        # out dims can differ; w13 out = out1 + out3, so no strict equality required.
+
+        shared_a = A1.shape == A3.shape and torch.allclose(A1, A3, atol=atol, rtol=rtol)
+
+        if shared_a:
+            A_fused = A1
+            B_fused = torch.cat([B1, B3], dim=0)  # (out1+out3, r)
+            used_blockdiag = False
+            log.info(
+                "[LoRAFormatAdapter] FFN w1/w3 A shared at %s.%s, using shared-A fusion (layout=%s).",
+                prefix,
+                fused,
+                layout,
+            )
+        else:
+            # Exact block-diag fusion: (B1@A1 ; B3@A3)
+            A_fused = torch.cat([A1, A3], dim=0)  # (r1+r3, in)
+            B_fused = _block_diag([B1, B3])  # (out1+out3, r1+r3)
+            used_blockdiag = True
+            diff = _max_abs_diff(A1, A3)
+            log.warning(
+                "[LoRAFormatAdapter] FFN w1/w3 LoRA A mismatch at %s.%s: max|A1-A3|=%s. "
+                "Using block-diagonal exact fusion (layout=%s, rank expands).",
+                prefix,
+                fused,
+                diff,
+                layout,
+            )
+
+    else:
+        # layout == "AB"
+        # A: (in, r), B: (r, out)
+        in_dim = int(A1.shape[0])
+        if int(A3.shape[0]) != in_dim:
+            return False, False
+
+        shared_a = A1.shape == A3.shape and torch.allclose(A1, A3, atol=atol, rtol=rtol)
+
+        if shared_a:
+            A_fused = A1
+            B_fused = torch.cat([B1, B3], dim=1)  # (r, out1+out3)
+            used_blockdiag = False
+            log.info(
+                "[LoRAFormatAdapter] FFN w1/w3 A shared at %s.%s, using shared-A fusion (layout=%s).",
+                prefix,
+                fused,
+                layout,
+            )
+        else:
+            A_fused = torch.cat([A1, A3], dim=1)  # (in, r1+r3)
+            B_fused = _block_diag([B1, B3])  # (r1+r3, out1+out3)
+            used_blockdiag = True
+            diff = _max_abs_diff(A1, A3)
+            log.warning(
+                "[LoRAFormatAdapter] FFN w1/w3 LoRA A mismatch at %s.%s: max|A1-A3|=%s. "
+                "Using block-diagonal exact fusion (layout=%s, rank expands).",
+                prefix,
+                fused,
+                diff,
+                layout,
+            )
+
+    fused_A_k = f"{prefix}.{fused}.lora_A.weight"
+    fused_B_k = f"{prefix}.{fused}.lora_B.weight"
+    sd[fused_A_k] = A_fused
+    sd[fused_B_k] = B_fused
+
+    # Copy alpha if still present (often already baked & removed)
+    alpha_1 = f"{prefix}.{w1}.alpha"
+    if alpha_1 in sd:
+        sd[f"{prefix}.{fused}.alpha"] = sd[alpha_1]
+
+    # Remove old split keys
+    for p in (w1, w3):
+        sd.pop(f"{prefix}.{p}.lora_A.weight", None)
+        sd.pop(f"{prefix}.{p}.lora_B.weight", None)
+        sd.pop(f"{prefix}.{p}.alpha", None)
+
+    return True, used_blockdiag
+
+
+def fuse_w13_like_keys_inplace(
+    sd: Dict[str, torch.Tensor], log: logging.Logger
+) -> dict[str, int]:
+    """
+    In-place fuse split FFN w1/w3 LoRA into fused w13.
+
+    Supports prefixes like:
+      ...feed_forward.w1 / ...feed_forward.w3
+      ...ffn.w1 / ...ffn.w3
+      ...mlp.w1 / ...mlp.w3
+
+    Returns stats for logging/diagnostics.
+    """
+    fused = 0
+    skipped = 0
+    a_mismatch = 0
+
+    # Match both Z-Image naming ("feed_forward") and possible variants ("ffn"/"mlp")
+    pat = re.compile(r"^(?P<prefix>.+\.(?:feed_forward|ffn|mlp))\.w1\.lora_A\.weight$")
+
+    prefixes = sorted(
+        {
+            m.group("prefix")
+            for key in sd.keys()
+            for m in [pat.match(key)]
+            if m is not None
+        }
+    )
+
+    for prefix in prefixes:
+        # If already fused exists, skip
+        if f"{prefix}.w13.lora_A.weight" in sd or f"{prefix}.w13.lora_B.weight" in sd:
+            continue
+
+        ok, used_blockdiag = _fuse_one_w13_pair(sd, prefix, "w1", "w3", "w13", log)
+        if ok:
+            fused += 1
+            if used_blockdiag:
+                a_mismatch += 1
+        else:
+            skipped += 1
+
+    return {"fused": fused, "skipped": skipped, "A_mismatch": a_mismatch}
+
+
+def maybe_fuse_w13_lora_state_dict(
+    state_dict: Mapping[str, torch.Tensor],
+    logger: Optional[logging.Logger] = None,
+) -> Dict[str, torch.Tensor]:
+    """
+    Fuse split FFN w1/w3 LoRA into fused w13 when target model uses fused w13.
+
+    Input keys (after normalize_lora_state_dict):
+      ...feed_forward.w1.lora_A.weight / ...w1.lora_B.weight
+      ...feed_forward.w3.lora_A.weight / ...w3.lora_B.weight
+
+    Output:
+      ...feed_forward.w13.lora_A.weight / ...w13.lora_B.weight
+
+    Notes:
+      - Strips optional "diffusion_model." prefix.
+      - Removes original split keys after fusing.
+    """
+    log = logger or globals()["logger"]
+    if not state_dict:
+        return dict(state_dict)
+
+    # Canonicalize keys: strip optional "diffusion_model." prefix
+    sd: Dict[str, torch.Tensor] = {}
+    for k, v in state_dict.items():
+        if k.startswith("diffusion_model."):
+            k = k[len("diffusion_model.") :]
+        sd[k] = v
+
+    stats = fuse_w13_like_keys_inplace(sd, log)
+
+    if stats["fused"] > 0:
+        sample = [k for k in sd.keys() if ".w13." in k][:20]
+        log.info(
+            "[LoRAFormatAdapter] fused w1/w3->w13 LoRA: fused=%d skipped=%d A_mismatch=%d, sample fused keys (<=20): %s",
             stats["fused"],
             stats["skipped"],
             stats["A_mismatch"],
