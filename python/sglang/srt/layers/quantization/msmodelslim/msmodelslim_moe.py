@@ -96,6 +96,7 @@ class ModelSlimW4A8Int8MoE(ModelSlimMoEMethod):
     ) -> None:
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
 
+        self.is_per_channel_weight = self.group_size == 0
         self.num_experts = num_experts
         extra_weight_attrs.update(
             {"quant_method": FusedMoeWeightScaleSupported.CHANNEL.value}
@@ -123,13 +124,9 @@ class ModelSlimW4A8Int8MoE(ModelSlimMoEMethod):
         set_weight_attrs(w2_weight, extra_weight_attrs)
 
         # >> scale
-        weight_scale_dtype = torch.int64 if self.activation_use_clip else torch.float32
         w13_weight_scale = torch.nn.Parameter(
             torch.empty(
-                num_experts,
-                2 * intermediate_size_per_partition,
-                1,
-                dtype=weight_scale_dtype,
+                num_experts, 2 * intermediate_size_per_partition, 1, dtype=torch.float32
             ),
             requires_grad=False,
         )
@@ -137,7 +134,7 @@ class ModelSlimW4A8Int8MoE(ModelSlimMoEMethod):
         set_weight_attrs(w13_weight_scale, extra_weight_attrs)
 
         w2_weight_scale = torch.nn.Parameter(
-            torch.empty(num_experts, hidden_size, 1, dtype=weight_scale_dtype),
+            torch.empty(num_experts, hidden_size, 1, dtype=torch.float32),
             requires_grad=False,
         )
         layer.register_parameter("w2_weight_scale", w2_weight_scale)
@@ -161,22 +158,6 @@ class ModelSlimW4A8Int8MoE(ModelSlimMoEMethod):
         set_weight_attrs(w2_weight_offset, extra_weight_attrs)
 
         # >>> special param for w4a8
-        if self.activation_use_clip:
-            self._init_activation_clip_params(
-                layer,
-                num_experts,
-                hidden_size,
-                intermediate_size_per_partition,
-                extra_weight_attrs,
-            )
-        else:
-            self._init_extra_scale_params(
-                layer,
-                num_experts,
-                hidden_size,
-                intermediate_size_per_partition,
-                extra_weight_attrs,
-            )
         if not self.is_per_channel_weight:
             w13_weight_scale_second = torch.nn.Parameter(
                 torch.empty(
@@ -189,7 +170,6 @@ class ModelSlimW4A8Int8MoE(ModelSlimMoEMethod):
             )
             layer.register_parameter("w13_weight_scale_second", w13_weight_scale_second)
             set_weight_attrs(w13_weight_scale_second, extra_weight_attrs)
-
             w13_weight_offset_second = torch.nn.Parameter(
                 torch.empty(
                     num_experts,
