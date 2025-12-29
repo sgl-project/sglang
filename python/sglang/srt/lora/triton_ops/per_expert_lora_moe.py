@@ -252,6 +252,9 @@ def per_expert_lora_forward(
 
     # Make sure everything is on the same device and contiguous
     device = hidden_states.device
+
+    # Use hidden_states dtype for consistency with model
+    dtype = hidden_states.dtype
     hidden_states = hidden_states.contiguous()
     lora_a_weights = lora_a_weights.contiguous()
     lora_b_weights = lora_b_weights.contiguous()
@@ -263,11 +266,11 @@ def per_expert_lora_forward(
 
     # Initialize or reuse output tensor for in-place addition
     if base_output is None:
-        # Use float32 for accumulation; you can cast back if needed
+        # Use specified dtype for consistency with model
         output = torch.zeros(
             num_tokens,
             output_dim,
-            dtype=torch.float32,
+            dtype=dtype,
             device=device,
         )
     else:
@@ -282,7 +285,7 @@ def per_expert_lora_forward(
     lora_output = torch.zeros(
         num_tokens,
         output_dim,
-        dtype=torch.float32,
+        dtype=dtype,
         device=device,
     )
 

@@ -680,7 +680,7 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         # This stores the LoRA delta in intermediate space before down projection
         lora_intermediate_cache = torch.empty(
             (num_tokens, intermediate_size),
-            dtype=torch.float32,  # Use float32 for LoRA accumulation like base implementation
+            dtype=hidden_states.dtype,  # Use consistent dtype with model
             device=hidden_states.device,
         )
 
