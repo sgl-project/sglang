@@ -2027,7 +2027,8 @@ def dump_metric(metric_name: str, value: Any, labels: Optional[dict] = None):
                 jsonl_path = f"{base_path}.{os.getpid()}.jsonl"
                 with open(jsonl_path, "a", encoding="utf-8") as f:
                     f.write(json.dumps(record, ensure_ascii=False) + "\n")
-            except Exception:
+            except Exception as e:
+                logging.warning(f"sglang.test.dump_metric: failed to write to {jsonl_path}: {e}")
                 pass  # Silently ignore write failures
 
         # 6. Output to stdout (use same labels as record)
