@@ -323,6 +323,33 @@ class MambaPool:
             ]
         return data_ptrs, data_lens, item_lens
 
+    def get_state_dim_per_tensor(self):
+        """Get the sliceable dimension size for each state tensor.
+
+        For mamba state, the layout is:
+        - conv_state: [num_layers, size+1, conv_dim/tp, conv_kernel-1]
+        - temporal_state: [num_layers, size+1, num_heads/tp, head_dim, state_size]
+
+        The 3rd dimension (index 2) is the one that gets sliced by TP.
+        Returns the size of this dimension for each tensor (repeated for each layer).
+        """
+        state_tensors = []
+        for field in vars(self.mamba_cache):
+            value = getattr(self.mamba_cache, field)
+            if isinstance(value, list):
+                state_tensors.extend(value)
+            else:
+                state_tensors.append(value)
+
+        dim_per_tensor = []
+        for state_tensor in state_tensors:
+            # state_tensor shape: [num_layers, size+1, sliceable_dim, ...]
+            # The sliceable dimension is at index 2 (after num_layers and size)
+            sliceable_dim = state_tensor.shape[2]
+            # Repeat for each layer since we have per-layer data_ptrs
+            dim_per_tensor += [sliceable_dim] * self.num_mamba_layers
+        return dim_per_tensor
+
 
 class HybridReqToTokenPool(ReqToTokenPool):
     """A memory pool that maps a request to its token locations."""
@@ -1177,6 +1204,10 @@ class HybridLinearKVPool(KVCache):
             self.mamba_pool.get_contiguous_buf_infos()
         )
         return mamba_data_ptrs, mamba_data_lens, mamba_item_lens
+
+    def get_state_dim_per_tensor(self):
+        """Get the sliceable dimension size for each mamba state tensor."""
+        return self.mamba_pool.get_state_dim_per_tensor()
 
     def maybe_get_custom_mem_pool(self):
         return self.full_kv_pool.maybe_get_custom_mem_pool()
