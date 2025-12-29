@@ -40,7 +40,7 @@ jobs:
       - name: Configure sccache
         uses: mozilla-actions/sccache-action@v0.0.9
         with:
-          version: "v0.10.0"
+          version: "v0.12.0"
 
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
@@ -87,7 +87,7 @@ jobs:
       - name: Configure sccache
         uses: mozilla-actions/sccache-action@v0.0.9
         with:
-          version: "v0.10.0"
+          version: "v0.12.0"
 
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
@@ -159,7 +159,7 @@ jobs:
       - name: Configure sccache
         uses: mozilla-actions/sccache-action@v0.0.9
         with:
-          version: "v0.10.0"
+          version: "v0.12.0"
 
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
@@ -226,7 +226,7 @@ jobs:
       - name: Configure sccache
         uses: mozilla-actions/sccache-action@v0.0.9
         with:
-          version: "v0.10.0"
+          version: "v0.12.0"
 
       - name: Rust cache
         uses: Swatinem/rust-cache@v2

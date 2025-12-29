@@ -1,16 +1,13 @@
 import argparse
-import copy
 import csv
-import itertools
 import os
 
-import pytest
 import torch
 import triton
 from flashinfer import mm_fp4
 from sgl_kernel import cutlass_scaled_fp4_mm, scaled_fp4_quant
 
-from sglang.srt.utils import get_device_capability
+from sglang.srt.utils import get_device_capability, is_sm100_supported
 
 # CI environment detection
 IS_CI = (
@@ -73,9 +70,21 @@ else:
         # x_vals = [64],
         x_log=False,
         line_arg="provider",
-        line_vals=["cutlass", "cudnn", "trtllm"],
-        line_names=["baseline cutlass fp4", "cudnn fp4", "trtllm fp4"],
-        styles=[("red", "solid"), ("blue", "solid"), ("green", "solid")],
+        line_vals=["sglang_cutlass", "cutlass", "cudnn", "trtllm", "auto"],
+        line_names=[
+            "sglang cutlass fp4",
+            "flashinfer cutlass fp4",
+            "cudnn fp4",
+            "trtllm fp4",
+            "auto fp4 (cudnn/cutlass)",
+        ],
+        styles=[
+            ("red", "solid"),
+            ("orange", "solid"),
+            ("blue", "solid"),
+            ("green", "solid"),
+            ("purple", "solid"),
+        ],
         ylabel="latency (ms)",
         plot_name="fp4_gemm_benchmark",
         args={},
@@ -101,10 +110,24 @@ def benchmark(batch_size, provider, N, K, dtype, correctness, csv_file):
     res_fi = torch.empty((M, N), dtype=dtype, device="cuda")
 
     quantiles = [0.5, 0.2, 0.8]
-    if provider == "cutlass":
+    if provider == "sglang_cutlass":
         ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(
             lambda: cutlass_scaled_fp4_mm(
                 a_fp4, b_fp4, a_scale_interleaved, b_scale_interleaved, alpha, dtype
+            ),
+            quantiles=quantiles,
+        )
+    if provider == "cutlass":
+        ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(
+            lambda: mm_fp4(
+                a_fp4,
+                b_fp4.T,
+                a_scale_interleaved,
+                b_scale_interleaved.T,
+                alpha,
+                dtype,
+                res_fi,
+                backend="cutlass",
             ),
             quantiles=quantiles,
         )
@@ -118,6 +141,7 @@ def benchmark(batch_size, provider, N, K, dtype, correctness, csv_file):
                 alpha,
                 dtype,
                 res_fi,
+                backend="cudnn",
             ),
             quantiles=quantiles,
         )
@@ -134,6 +158,19 @@ def benchmark(batch_size, provider, N, K, dtype, correctness, csv_file):
                 dtype,
                 res_fi,
                 backend="trtllm",
+            ),
+            quantiles=quantiles,
+        )
+    if provider == "auto":
+        ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(
+            lambda: mm_fp4(
+                a_fp4,
+                b_fp4.T,
+                a_scale_interleaved,
+                b_scale_interleaved.T,
+                alpha,
+                dtype,
+                res_fi,
             ),
             quantiles=quantiles,
         )
@@ -213,12 +250,14 @@ if __name__ == "__main__":
             writer = csv.writer(f)
             writer.writerow(["provider", "m", "n", "k", "time_ms"])
 
-    # Check architecture compatibility - FP4 operations require sm100a/sm103a
+    # FP4 operations require Blackwell SM100 support
     major, minor = get_device_capability()
-    if major is None or major < 10:  # Requires compute capability 10.0+ (sm100a/sm103a)
+    if not is_sm100_supported():
         print("Skipping FP4 GEMM benchmark")
         if major is not None:
-            print(f"FP4 operations require sm100a/sm103a, but found sm{major}{minor}")
+            print(
+                f"FP4 operations require SM100 (Blackwell), but found sm{major}{minor}"
+            )
         else:
             print("Could not determine device capability")
     else:

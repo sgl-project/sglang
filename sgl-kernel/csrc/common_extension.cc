@@ -278,7 +278,8 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "fused_qk_norm_rope(Tensor! qkv, int num_heads_q, "
       "int num_heads_k, int num_heads_v, int head_dim, float eps, "
       "Tensor q_weight, Tensor k_weight, float base, "
-      "bool is_neox, Tensor position_ids, float factor, float low, float high, float attention_factor) -> ()");
+      "bool is_neox, Tensor position_ids, float factor, float low, float high, float attention_factor, int rotary_dim) "
+      "-> ()");
   m.impl("fused_qk_norm_rope", torch::kCUDA, &fused_qk_norm_rope);
 
   /*
@@ -608,6 +609,19 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
 
   m.def("fast_hadamard_transform_40N(Tensor x, float scale) -> Tensor");
   m.impl("fast_hadamard_transform_40N", torch::kCUDA, &fast_hadamard_transform_40N);
+
+  /*
+   * From csrc/sgl_diffusion/elementwise
+   */
+  m.def(
+      "timestep_embedding(Tensor input,"
+      "Tensor output,"
+      "int dim,"
+      "bool flip_sin_to_cos,"
+      "float downscale_freq_shift,"
+      "float scale,"
+      "int max_period) -> Tensor");
+  m.impl("timestep_embedding", torch::kCUDA, &timestep_embedding);
 }
 
 REGISTER_EXTENSION(common_ops)

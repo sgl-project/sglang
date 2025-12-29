@@ -1,8 +1,6 @@
 // factory.rs
 //
 // Factory function to create storage backends based on configuration.
-// This centralizes storage initialization logic and fixes the bug where
-// conversation_item_storage was missing/incorrect in server.rs.
 
 use std::sync::Arc;
 

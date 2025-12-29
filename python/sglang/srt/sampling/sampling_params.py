@@ -58,7 +58,7 @@ class SamplingParams:
         custom_params: Optional[Dict[str, Any]] = None,
         stream_interval: Optional[int] = None,
         logit_bias: Optional[Dict[str, float]] = None,
-        sampling_seed: int = 42,
+        sampling_seed: Optional[int] = None,
     ) -> None:
         self.max_new_tokens = max_new_tokens
         self.stop_strs = stop
@@ -146,8 +146,6 @@ class SamplingParams:
                         f"logit_bias must has keys in [0, {vocab_size - 1}], got "
                         f"{token_id}."
                     )
-        if self.sampling_seed is None:
-            raise ValueError("sampling_seed should not be None")
 
         grammars = [
             self.json_schema,

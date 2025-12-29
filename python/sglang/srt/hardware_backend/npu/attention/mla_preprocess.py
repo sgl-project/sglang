@@ -16,6 +16,16 @@ def is_mla_preprocess_enabled() -> bool:
     return get_bool_env_var("SGLANG_NPU_USE_MLAPO")
 
 
+@lru_cache(maxsize=1)
+def is_fia_nz() -> bool:
+    is_fia_nz_ = get_bool_env_var("SGLANG_USE_FIA_NZ")
+    if is_fia_nz_:
+        assert (
+            is_mla_preprocess_enabled()
+        ), "SGLANG_USE_FIA_NZ must be enable with SGLANG_NPU_USE_MLAPO"
+    return is_fia_nz_
+
+
 def round_up(val: int, align: int) -> int:
     if align == 0:
         return 0
@@ -84,7 +94,7 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
         self.qk_head_dim = qk_nope_head_dim + qk_rope_head_dim
 
     def preprocess_weights(self, hidden_states):
-        self.dummy = torch.empty(
+        self.dummy = torch.zeros(
             (hidden_states.shape[-1]),
             dtype=hidden_states.dtype,
             device=hidden_states.device,
@@ -281,7 +291,7 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
             -1, 1, 1, self.kv_lora_rank + self.qk_rope_head_dim
         )  # (B*S,N,1,D)
 
-        cache_mode = "PA_BNSD"
+        cache_mode = "PA_NZ" if is_fia_nz() else "PA_BNSD"
         self.kvCache = self.kvCache.view(
             -1,
             forward_batch.attn_backend.page_size,
@@ -328,9 +338,22 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
             dtype=input_dtype,
             device=hidden_states.device,
         )
-
+        if is_fia_nz():
+            kv_shape, kv_rope_shape = k_cache.shape, v_cache.shape
+            num_blocks, block_size, num_heads, _ = kv_shape
+            k_cache = k_cache.view(
+                num_blocks, num_heads * self.kv_lora_rank // 16, block_size, 16
+            )
+            v_cache = v_cache.view(
+                num_blocks, num_heads * self.qk_rope_head_dim // 16, block_size, 16
+            )
         # TODO: dummy inputs to be removed
         # https://github.com/sgl-project/sgl-kernel-npu/issues/78
+        if hasattr(self.q_a_layernorm, "bias"):
+            q_a_layernorm_bias = self.q_a_layernorm.bias
+        else:
+            q_a_layernorm_bias = self.dummy
+
         torch.ops.npu.mla_preprocess(
             hidden_states,
             self.dummy,
@@ -338,7 +361,7 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
             self.qkv_a_proj_weight_nz,
             self.qkv_a_proj_deq_scale_kvq,
             self.q_a_layernorm.weight,
-            self.q_a_layernorm.bias,
+            q_a_layernorm_bias,
             self.q_b_proj_weight_nz,
             self.q_b_proj_deq_scale,
             self.kv_a_layernorm.weight,
@@ -354,13 +377,18 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
             quant_scale1=self.q_b_proj.input_scale,
             quant_offset1=self.q_b_proj_input_offset,
             bias1=self.q_b_proj_quant_bias,
-            cache_mode="krope_ctkv",
+            cache_mode="nzcache" if is_fia_nz() else "krope_ctkv",
             quant_mode="per_tensor_quant_asymm",
             q_out0=q_nope_out,
             kv_cache_out0=k_cache,
             q_out1=q_rope_out,
             kv_cache_out1=v_cache,
         )
+
+        if is_fia_nz():
+            k_cache = k_cache.view(kv_shape)
+            v_cache = v_cache.view(kv_rope_shape)
+
         return (
             q_rope_out,
             v_cache,

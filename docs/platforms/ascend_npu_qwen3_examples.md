@@ -23,6 +23,35 @@ ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 python -m sglang.launch_server \
    --mem-fraction-static 0.8
 ```
 
+#### Running Qwen3-32B on 1 x Atlas 800I A3 with Qwen3-32B-Eagle3.
+
+Model weights could be found [here](https://huggingface.co/Qwen/Qwen3-32B)
+
+Speculative model weights could be found [here](https://huggingface.co/Zhihu-ai/Zhi-Create-Qwen3-32B-Eagle3)
+
+```shell
+export SGLANG_SET_CPU_AFFINITY=1
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export STREAMS_PER_DEVICE=32
+export HCCL_OP_EXPANSION_MODE=AIV
+export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+export SGLANG_ENABLE_SPEC_V2=1
+
+python -m sglang.launch_server \
+   --device npu \
+   --attention-backend ascend \
+   --trust-remote-code \
+   --tp-size 4 \
+   --model-path Qwen/Qwen3-32B \
+   --port 30111 \
+   --mem-fraction-static 0.8 \
+   --speculative-algorithm EAGLE3 \
+   --speculative-draft-model-path Qwen/Qwen3-32B-Eagle3 \
+   --speculative-num-steps 1 \
+   --speculative-eagle-topk 1 \
+   --speculative-num-draft-tokens 2
+```
+
 #### Running Qwen3-30B-A3B MOE on 1 x Atlas 800I A3.
 
 Model weights could be found [here](https://huggingface.co/Qwen/Qwen3-30B-A3B)

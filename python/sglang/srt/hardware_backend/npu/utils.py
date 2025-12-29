@@ -6,13 +6,14 @@ from typing import TYPE_CHECKING, Callable
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.utils import is_npu
+from sglang.srt.utils import get_npu_memory_capacity, is_npu
 
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
 _is_npu = is_npu()
+indexer_weight_stream = None
 
 
 class NPUACLFormat(IntEnum):
@@ -47,6 +48,29 @@ def set_default_server_args(args: "ServerArgs"):
     if args.page_size is None:
         args.page_size = 128
 
+    # NPU memory settings
+    npu_mem = get_npu_memory_capacity()
+    if npu_mem <= 32 * 1024:
+        # Ascend 910B4,910B4_1
+        # (chunked_prefill_size 4k, cuda_graph_max_bs 16 if tp < 4 else 64)
+        if args.chunked_prefill_size is None:
+            args.chunked_prefill_size = 4 * 1024
+        if args.cuda_graph_max_bs is None:
+            if args.tp_size < 4:
+                args.cuda_graph_max_bs = 16
+            else:
+                args.cuda_graph_max_bs = 64
+    elif npu_mem <= 64 * 1024:
+        # Ascend 910B1,910B2,910B2C,910B3,910_9391,910_9392,910_9381,910_9382,910_9372,910_9362
+        # (chunked_prefill_size 8k, cuda_graph_max_bs 64 if tp < 4 else 256)
+        if args.chunked_prefill_size is None:
+            args.chunked_prefill_size = 8 * 1024
+        if args.cuda_graph_max_bs is None:
+            if args.tp_size < 4:
+                args.cuda_graph_max_bs = 64
+            else:
+                args.cuda_graph_max_bs = 256
+
     # NPU does not support CustomAllReduce
     args.disable_custom_all_reduce = True
 
@@ -68,6 +92,14 @@ def init_npu_backend():
     assert _is_npu, "NPU backend initialization called on non-NPU device."
 
     import sgl_kernel_npu  # noqa: F401
+
+    try:
+        import custom_ops  # noqa: F401
+    except ImportError:
+        logger.warning(
+            f"custom_ops not found, dsv3.2 requires this package, which includes the npu_lightning_indexer and npu_sparse_flash_attention operators."
+        )
+
     import torch_npu
     from torch_npu.contrib import transfer_to_npu  # noqa: F401
 
@@ -102,3 +134,10 @@ def npu_format_cast(
     import torch_npu
 
     return torch_npu.npu_format_cast(tensor, acl_format.value)
+
+
+def get_indexer_weight_stream():
+    global indexer_weight_stream
+    if indexer_weight_stream is None:
+        indexer_weight_stream = torch.npu.Stream()
+    return indexer_weight_stream

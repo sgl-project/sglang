@@ -24,6 +24,18 @@ if torch.version.hip is not None:
     ) -> None:
         torch.ops.sgl_kernel.all_reduce_unreg.default(fa, inp, reg_buffer, out)
 
+    def deterministic_all_reduce_reg(
+        fa: int, inp: torch.Tensor, out: torch.Tensor
+    ) -> None:
+        torch.ops.sgl_kernel.deterministic_all_reduce_reg.default(fa, inp, out)
+
+    def deterministic_all_reduce_unreg(
+        fa: int, inp: torch.Tensor, reg_buffer: torch.Tensor, out: torch.Tensor
+    ) -> None:
+        torch.ops.sgl_kernel.deterministic_all_reduce_unreg.default(
+            fa, inp, reg_buffer, out
+        )
+
     def dispose(fa: int) -> None:
         torch.ops.sgl_kernel.dispose.default(fa)
 

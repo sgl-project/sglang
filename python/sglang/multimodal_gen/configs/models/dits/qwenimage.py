@@ -20,9 +20,13 @@ class QwenImageArchConfig(DiTArchConfig):
     pooled_projection_dim: int = 768
     guidance_embeds: bool = False
     axes_dims_rope: Tuple[int, int, int] = (16, 56, 56)
+    zero_cond_t: bool = False
+
+    stacked_params_mapping: list[tuple[str, str, str]] = field(default_factory=list)
 
     param_names_mapping: dict = field(
         default_factory=lambda: {
+            # LoRA mappings
             r"^(transformer_blocks\.\d+\.attn\..*\.lora_[AB])\.default$": r"\1",
         }
     )

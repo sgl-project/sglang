@@ -6,6 +6,7 @@ mod test_pd_routing {
         config::{PolicyConfig, RouterConfig, RoutingMode},
         core::{BasicWorkerBuilder, Worker, WorkerType},
         routers::{http::pd_types::PDSelectionPolicy, RouterFactory},
+        tokenizer::registry::TokenizerRegistry,
     };
 
     #[derive(Debug)]
@@ -51,7 +52,7 @@ mod test_pd_routing {
         assert_eq!(prefill_worker.url(), "http://prefill:8080");
         match prefill_worker.worker_type() {
             WorkerType::Prefill { bootstrap_port } => {
-                assert_eq!(bootstrap_port, Some(9000));
+                assert_eq!(*bootstrap_port, Some(9000));
             }
             _ => panic!("Expected Prefill worker type"),
         }
@@ -256,7 +257,7 @@ mod test_pd_routing {
                         .router_config(config)
                         .client(client)
                         .rate_limiter(rate_limiter)
-                        .tokenizer(None) // tokenizer
+                        .tokenizer_registry(Arc::new(TokenizerRegistry::new())) // tokenizer
                         .reasoning_parser_factory(None) // reasoning_parser_factory
                         .tool_parser_factory(None) // tool_parser_factory
                         .worker_registry(worker_registry)
@@ -353,7 +354,7 @@ mod test_pd_routing {
 
         let bootstrap_port = match prefill_worker.worker_type() {
             WorkerType::Prefill { bootstrap_port } => bootstrap_port,
-            _ => None,
+            _ => &None,
         };
 
         single_json["bootstrap_host"] = json!(prefill_worker.bootstrap_host());
@@ -697,7 +698,7 @@ mod test_pd_routing {
 
         let bootstrap_port = match prefill_worker.worker_type() {
             WorkerType::Prefill { bootstrap_port } => bootstrap_port,
-            _ => None,
+            _ => &None,
         };
         let batch_size = 16;
         let hostname = prefill_worker.bootstrap_host();
@@ -823,7 +824,7 @@ mod test_pd_routing {
 
             let bootstrap_port = match prefill_worker.worker_type() {
                 WorkerType::Prefill { bootstrap_port } => bootstrap_port,
-                _ => None,
+                _ => &None,
             };
             let hostname = prefill_worker.bootstrap_host();
 

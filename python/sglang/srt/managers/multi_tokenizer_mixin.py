@@ -128,6 +128,9 @@ def _handle_output_by_index(output, i):
             prefill_launch_latency=_extract_field_by_index(
                 output, "prefill_launch_latency", i
             ),
+            prefill_finished_ts=_extract_field_by_index(
+                output, "prefill_finished_ts", i
+            ),
             finished_reasons=_extract_field_by_index(output, "finished_reasons", i),
             decoded_texts=_extract_field_by_index(output, "decoded_texts", i),
             decode_ids=_extract_field_by_index(output, "decode_ids", i),
@@ -216,6 +219,9 @@ def _handle_output_by_index(output, i):
             prefill_launch_latency=_extract_field_by_index(
                 output, "prefill_launch_latency", i
             ),
+            prefill_finished_ts=_extract_field_by_index(
+                output, "prefill_finished_ts", i
+            ),
             finished_reasons=_extract_field_by_index(output, "finished_reasons", i),
             output_strs=_extract_field_by_index(output, "output_strs", i),
             output_ids=_extract_field_by_index(output, "output_ids", i),
@@ -263,6 +269,9 @@ def _handle_output_by_index(output, i):
             ),
             output_hidden_states=_extract_field_by_index(
                 output, "output_hidden_states", i, check_length=False
+            ),
+            output_routed_experts=_extract_field_by_index(
+                output, "output_routed_experts", i, check_length=False
             ),
             placeholder_tokens_idx=None,
             placeholder_tokens_val=None,

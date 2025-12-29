@@ -1,7 +1,7 @@
 # Usage (to build SGLang ROCm docker image):
-#   docker build --build-arg SGL_BRANCH=v0.5.6.post1 --build-arg GPU_ARCH=gfx942 -t v0.5.6.post1-rocm630-mi30x -f rocm.Dockerfile .
-#   docker build --build-arg SGL_BRANCH=v0.5.6.post1 --build-arg GPU_ARCH=gfx942-rocm700 -t v0.5.6.post1-rocm700-mi30x -f rocm.Dockerfile .
-#   docker build --build-arg SGL_BRANCH=v0.5.6.post1 --build-arg GPU_ARCH=gfx950 -t v0.5.6.post1-rocm700-mi35x -f rocm.Dockerfile .
+#   docker build --build-arg SGL_BRANCH=v0.5.6.post2 --build-arg GPU_ARCH=gfx942 -t v0.5.6.post2-rocm630-mi30x -f rocm.Dockerfile .
+#   docker build --build-arg SGL_BRANCH=v0.5.6.post2 --build-arg GPU_ARCH=gfx942-rocm700 -t v0.5.6.post2-rocm700-mi30x -f rocm.Dockerfile .
+#   docker build --build-arg SGL_BRANCH=v0.5.6.post2 --build-arg GPU_ARCH=gfx950 -t v0.5.6.post2-rocm700-mi35x -f rocm.Dockerfile .
 
 
 # Default base images
@@ -187,9 +187,9 @@ RUN git clone ${SGL_REPO} \
     && cd .. \
     && rm -rf python/pyproject.toml && mv python/pyproject_other.toml python/pyproject.toml \
     && if [ "$BUILD_TYPE" = "srt" ]; then \
-         python -m pip --no-cache-dir install -e "python[srt_hip]" ${NO_DEPS_FLAG}; \
+         python -m pip --no-cache-dir install -e "python[srt_hip,diffusion]" ${NO_DEPS_FLAG}; \
        else \
-         python -m pip --no-cache-dir install -e "python[all_hip]" ${NO_DEPS_FLAG}; \
+         python -m pip --no-cache-dir install -e "python[all_hip,diffusion]" ${NO_DEPS_FLAG}; \
        fi
 
 RUN python -m pip cache purge
