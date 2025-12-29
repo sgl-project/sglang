@@ -19,7 +19,7 @@ use super::pd_types::api_path;
 use crate::{
     config::types::RetryConfig,
     core::{
-        is_retryable_status, HashRing, RetryExecutor, Worker, WorkerLoadGuard, WorkerRegistry,
+        is_retryable_status, HashRing, RetryExecutor, Worker, WorkerLoadGuard, WorkerLoadManager, WorkerRegistry,
         WorkerType, UNKNOWN_MODEL_ID,
     },
     observability::{
@@ -46,6 +46,7 @@ use crate::{
 pub struct PDRouter {
     pub worker_registry: Arc<WorkerRegistry>,
     pub policy_registry: Arc<PolicyRegistry>,
+    pub worker_load_manager: Option<Arc<WorkerLoadManager>>,
     pub client: Client,
     pub retry_config: RetryConfig,
     pub api_key: Option<String>,
@@ -159,6 +160,9 @@ impl PDRouter {
         Ok(PDRouter {
             worker_registry: Arc::clone(&ctx.worker_registry),
             policy_registry: Arc::clone(&ctx.policy_registry),
+            worker_load_manager: ctx.load_monitor.as_ref().map(|load_monitor_arc| {
+                load_monitor_arc.worker_load_manager.clone()
+            }),
             client: ctx.client.clone(),
             retry_config: ctx.router_config.effective_retry_config(),
             api_key: ctx.router_config.api_key.clone(),
@@ -339,6 +343,24 @@ impl PDRouter {
                             Err(e) => return Self::handle_serialization_error(e),
                         };
 
+                        if self
+                            .policy_registry
+                            .is_dp_minimum_tokens_scheduler_enabled()
+                        {
+                            // data_parallel_rank
+                            json_request = match self
+                                .select_data_parallel_rank(
+                                    json_request,
+                                    prefill.as_ref(),
+                                    decode.as_ref(),
+                                    context.request_text.as_deref(),
+                                )
+                                .await
+                            {
+                                Ok(v) => v,
+                                Err(e) => return Self::handle_serialization_error(e),
+                            };
+                        }
                         let response = self
                             .execute_dual_dispatch_internal(
                                 headers,
@@ -693,6 +715,58 @@ impl PDRouter {
         let prefill_policy = self.policy_registry.get_prefill_policy();
         let decode_policy = self.policy_registry.get_decode_policy();
         prefill_policy.needs_request_text() || decode_policy.needs_request_text()
+    }
+
+    async fn select_data_parallel_rank(
+        &self,
+        mut original: Value,
+        prefill_worker: &dyn Worker,
+        decode_worker: &dyn Worker,
+        request_text: Option<&str>,
+    ) -> Result<Value, String> {
+        let obj = original
+            .as_object_mut()
+            .ok_or_else(|| "Request must be a JSON object".to_string())?;
+
+        if let Some(worker_load) = self.worker_load_manager.as_ref() {
+            let length = match request_text {
+                Some(s) => s.len(),
+                None => 0,
+            };
+            let lowest_prefill_dp_rank = worker_load.get_lowest_dp_load(prefill_worker);
+            let lowest_decode_dp_rank = worker_load.get_lowest_dp_load(decode_worker);
+            obj.insert(
+                "data_parallel_rank".to_string(),
+                match lowest_prefill_dp_rank {
+                    Some(v) => Value::from(v),
+                    None => Value::Null,
+                },
+            );
+            // During the prefill and decode stages, requests may be scheduled to different dp_rank
+            // data_parallel_rank_decode specifies which dp_rank the request should be scheduled to for decode
+            // data_parallel_rank specifies which dp_rank the request is in for prefill
+            obj.insert(
+                "data_parallel_rank_decode".to_string(),
+                match lowest_decode_dp_rank {
+                    Some(v) => Value::from(v),
+                    None => Value::Null,
+                },
+            );
+            let prompt_len = length
+                .try_into()
+                .map_err(|e| format!("Failed to convert length to size:{}", e))?;
+            debug!(
+                "select_data_parallel_rank obj:{:?}, prompt_len:{}",
+                obj, prompt_len
+            );
+            if let Some(dp_rank) = lowest_prefill_dp_rank {
+                worker_load.load_increment(prefill_worker, dp_rank, prompt_len);
+            }
+            if let Some(dp_rank) = lowest_decode_dp_rank {
+                worker_load.load_increment(decode_worker, dp_rank, prompt_len);
+            }
+        }
+        Ok(original)
     }
 
     async fn select_pd_pair(

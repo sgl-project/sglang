@@ -182,6 +182,9 @@ struct CliArgs {
     #[arg(long, default_value_t = false, help_heading = "Routing Policy")]
     enable_igw: bool,
 
+    #[arg(long, default_value_t = false)]
+    dp_minimum_tokens_scheduler: bool,
+
     // ==================== PD Disaggregation ====================
     /// Enable PD (Prefill-Decode) disaggregated mode
     #[arg(long, default_value_t = false, help_heading = "PD Disaggregation")]
@@ -206,6 +209,9 @@ struct CliArgs {
     /// Interval in seconds between worker startup checks
     #[arg(long, default_value_t = 30, help_heading = "PD Disaggregation")]
     worker_startup_check_interval: u64,
+
+    #[arg(long, default_value_t = 10)]
+    worker_load_check_interval: u64,
 
     // ==================== Service Discovery (Kubernetes) ====================
     /// Enable Kubernetes service discovery
@@ -886,6 +892,7 @@ impl CliArgs {
             .request_timeout_secs(self.request_timeout_secs)
             .worker_startup_timeout_secs(self.worker_startup_timeout_secs)
             .worker_startup_check_interval_secs(self.worker_startup_check_interval)
+            .worker_load_check_interval_secs(self.worker_load_check_interval)
             .max_concurrent_requests(self.max_concurrent_requests)
             .queue_size(self.queue_size)
             .queue_timeout_secs(self.queue_timeout_secs)
@@ -936,6 +943,7 @@ impl CliArgs {
             .maybe_tool_call_parser(self.tool_call_parser.as_ref())
             .maybe_mcp_config_path(self.mcp_config_path.as_ref())
             .dp_aware(self.dp_aware)
+            .dp_minimum_tokens_scheduler(self.dp_minimum_tokens_scheduler)
             .retries(!self.disable_retries)
             .circuit_breaker(!self.disable_circuit_breaker)
             .enable_wasm(self.enable_wasm)
