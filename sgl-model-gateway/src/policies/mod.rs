@@ -5,24 +5,31 @@
 
 use std::{fmt::Debug, sync::Arc};
 
-use crate::core::Worker;
+use crate::core::{HashRing, Worker};
 
 mod bucket;
 mod cache_aware;
+mod consistent_hashing;
 mod factory;
+mod manual;
 mod power_of_two;
+mod prefix_hash;
 mod random;
 mod registry;
 mod round_robin;
 pub mod tree;
-
+pub(crate) mod utils;
 pub use bucket::BucketPolicy;
 pub use cache_aware::CacheAwarePolicy;
+pub use consistent_hashing::ConsistentHashingPolicy;
 pub use factory::PolicyFactory;
+pub use manual::ManualPolicy;
 pub use power_of_two::PowerOfTwoPolicy;
+pub use prefix_hash::{PrefixHashConfig, PrefixHashPolicy};
 pub use random::RandomPolicy;
 pub use registry::PolicyRegistry;
 pub use round_robin::RoundRobinPolicy;
+pub use tree::PrefixMatchResult;
 
 /// Core trait for load balancing policies
 ///
@@ -33,11 +40,11 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
     ///
     /// This is used for regular routing mode where requests go to a single worker.
     /// Now uses Arc<dyn Worker> for better performance and to avoid unnecessary cloning.
-    fn select_worker(
-        &self,
-        workers: &[Arc<dyn Worker>],
-        request_text: Option<&str>,
-    ) -> Option<usize>;
+    ///
+    /// # Arguments
+    /// * `workers` - Available workers to select from
+    /// * `info` - Additional information for routing decisions
+    fn select_worker(&self, workers: &[Arc<dyn Worker>], info: &SelectWorkerInfo) -> Option<usize>;
 
     /// Update policy state after request completion
     ///
@@ -133,6 +140,24 @@ pub(crate) fn normalize_model_key(model_id: &str) -> &str {
     } else {
         model_id
     }
+}
+
+/// Information passed to policy for worker selection
+#[derive(Debug, Clone, Default)]
+pub struct SelectWorkerInfo<'a> {
+    /// Request text for cache-aware routing
+    pub request_text: Option<&'a str>,
+    /// Tokenized request for prefix-hash routing
+    /// Used by PrefixHashPolicy for token-based prefix hashing
+    pub tokens: Option<&'a [u32]>,
+    /// HTTP headers for header-based routing policies
+    /// Policies can extract routing information from headers like:
+    /// - X-SMG-Target-Worker: Direct routing to a specific worker by index
+    /// - X-SMG-Routing-Key: Consistent hash routing for session affinity
+    pub headers: Option<&'a http::HeaderMap>,
+    /// Pre-computed hash ring for O(log n) consistent hashing
+    /// Built and cached by WorkerRegistry, passed through to avoid per-request rebuilds
+    pub hash_ring: Option<Arc<HashRing>>,
 }
 
 #[cfg(test)]

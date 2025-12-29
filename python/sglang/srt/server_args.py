@@ -377,7 +377,6 @@ class ServerArgs:
     # Data parallelism
     dp_size: int = 1
     load_balance_method: str = "round_robin"
-    load_watch_interval: float = 0.1
     # FIXME: remove this after dp rank scheduling is fully supported with PD-Disaggregation
     prefill_round_robin_balance: bool = False
 
@@ -1139,6 +1138,27 @@ class ServerArgs:
                         "Use flashinfer_trtllm as MoE runner backend on sm100 for DeepseekV3ForCausalLM"
                     )
 
+                if (
+                    self.quantization == "modelopt_fp4"
+                    and self.speculative_algorithm == "EAGLE"
+                    and (
+                        self.speculative_moe_runner_backend is None
+                        or self.speculative_moe_a2a_backend is None
+                    )
+                ):
+                    if envs.SGLANG_NVFP4_CKPT_FP8_NEXTN_MOE.get():
+                        self.speculative_moe_runner_backend = "deep_gemm"
+                        self.speculative_moe_a2a_backend = "deepep"
+                        logger.info(
+                            "Use deep_gemm moe runner and deepep a2a backend for bf16 nextn layer in deepseek fp4 checkpoint."
+                        )
+                    else:
+                        self.speculative_moe_runner_backend = "triton"
+                        self.speculative_moe_a2a_backend = "none"
+                        logger.info(
+                            "Use triton fused moe by default for bf16 nextn layer in deepseek fp4 checkpoint."
+                        )
+
         elif model_arch in ["GptOssForCausalLM"]:
             # Set attention backend for GPT-OSS
             if self.is_attention_backend_not_set():
@@ -1193,13 +1213,22 @@ class ServerArgs:
             self.disable_hybrid_swa_memory = True
 
         elif "MiMoV2FlashForCausalLM" in model_arch:
-            self.enable_multi_layer_eagle = True
-            logger.info("Enable multi-layer eagle for MiMoV2FlashForCausalLM model")
-            self.swa_full_tokens_ratio = 1.0
-            logger.warning(
-                "Reset swa_full_tokens_ratio to 1.0 for MiMoV2FlashForCausalLM model"
-            )
+            if self.speculative_algorithm == "EAGLE":
+                self.enable_multi_layer_eagle = True
+                logger.info(
+                    "Enable multi-layer EAGLE speculative decoding for MiMoV2FlashForCausalLM model."
+                )
+                if not envs.SGLANG_ENABLE_SPEC_V2.get():
+                    envs.SGLANG_ENABLE_SPEC_V2.set(True)
+                    logger.warning(
+                        "Spec v2 is enabled for multi-layer EAGLE speculative decoding."
+                    )
+
             if self.enable_hierarchical_cache:
+                self.swa_full_tokens_ratio = 1.0
+                logger.warning(
+                    "Reset swa_full_tokens_ratio to 1.0 for MiMoV2FlashForCausalLM model with hierarchical cache"
+                )
                 self.disable_hybrid_swa_memory = True
                 logger.warning(
                     "Disable hybrid SWA memory for MiMoV2FlashForCausalLM model with hierarchical cache"
@@ -1431,9 +1460,11 @@ class ServerArgs:
                         self.disable_radix_cache = True
                         self.disable_overlap_schedule = False
 
-        if not self.get_model_config().is_generation:
+        if envs.SGLANG_EMBEDDINGS_SPARSE_HEAD.is_set():
             self.disable_overlap_schedule = True
-            logger.warning("Overlap scheduler is disabled for embedding models.")
+            logger.warning(
+                f"Overlap scheduler is disabled when using sparse head for embedding model."
+            )
 
         # TRTLLM AllReduce Fusion supports SM90/100/120, enable it by default
         # for models with explicit support (DeepseekV3, GptOss, Glm4Moe, Qwen3Moe)
@@ -1530,7 +1561,7 @@ class ServerArgs:
                 else:
                     self.attention_backend = "triton"
 
-            logger.warning(
+            logger.info(
                 f"Attention backend not specified. Use {self.attention_backend} backend by default."
             )
 
@@ -1584,9 +1615,9 @@ class ServerArgs:
                 )
                 self.page_size = 64
 
-            if self.kv_cache_dtype not in ["fp8_e4m3", "fp4_e2m1", "auto"]:
+            if self.kv_cache_dtype not in ["fp8_e4m3", "fp4_e2m1", "bf16", "auto"]:
                 raise ValueError(
-                    "TensorRT-LLM MLA backend only supports kv-cache-dtype of fp8_e4m3, fp4_e2m1, or auto."
+                    "TensorRT-LLM MLA backend only supports kv-cache-dtype of fp8_e4m3, fp4_e2m1, bf16, or auto."
                 )
 
         if (
@@ -1966,19 +1997,25 @@ class ServerArgs:
                 )
 
             if (
-                self.speculative_algorithm == "EAGLE"
+                self.speculative_algorithm in ["EAGLE", "EAGLE3"]
                 and envs.SGLANG_ENABLE_SPEC_V2.get()
             ):
                 self.disable_overlap_schedule = False
                 logger.warning(
-                    "Beta spec is enabled for eagle speculative decoding and overlap schedule is turned on."
+                    "Spec v2 is enabled for eagle/eagle3 speculative decoding and overlap schedule is turned on."
                 )
-
-            if not envs.SGLANG_ENABLE_SPEC_V2.get():
+                if (
+                    self.speculative_eagle_topk is not None
+                    and self.speculative_eagle_topk > 1
+                ):
+                    raise ValueError(
+                        "Spec v2 currently only supports topk = 1 for speculative decoding."
+                    )
+            else:
                 self.disable_overlap_schedule = True
                 logger.warning(
-                    "Overlap scheduler is disabled because of using eagle3 or standalone speculative decoding."
-                    "You can set env SGLANG_ENABLE_SPEC_V2=True to enable the experimental overlap scheduler."
+                    "Overlap scheduler is disabled when spec v2 is off or using unsupported speculative algorithm. "
+                    "You can set env SGLANG_ENABLE_SPEC_V2=True to enable the experimental overlap scheduler. "
                 )
 
             if self.enable_mixed_chunk:
@@ -2248,6 +2285,8 @@ class ServerArgs:
                 raise ValueError(
                     "Spec v2 and decode offload kv cache are incompatible and cannot be enabled together."
                 )
+        if not (0 < self.swa_full_tokens_ratio <= 1.0):
+            raise ValueError("--swa-full-tokens-ratio should be in range (0, 1.0].")
 
     def _handle_deterministic_inference(self):
         if self.rl_on_policy_target is not None:
@@ -3142,12 +3181,6 @@ class ServerArgs:
                 "shortest_queue",
                 "minimum_tokens",
             ],
-        )
-        parser.add_argument(
-            "--load-watch-interval",
-            type=float,
-            default=ServerArgs.load_watch_interval,
-            help="The interval of load watching in seconds.",
         )
         parser.add_argument(
             "--prefill-round-robin-balance",
@@ -5001,12 +5034,12 @@ class PortArgs:
         else:
             nccl_port = server_args.nccl_port
 
-        if server_args.tokenizer_worker_num > 1:
+        if server_args.tokenizer_worker_num == 1:
+            tokenizer_worker_ipc_name = None
+        else:
             tokenizer_worker_ipc_name = (
                 f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}"
             )
-        else:
-            tokenizer_worker_ipc_name = None
 
         if not server_args.enable_dp_attention:
             # Normal case, use IPC within a single node
@@ -5133,8 +5166,8 @@ def auto_choose_speculative_params(self: ServerArgs):
         "BailingMoeV2ForCausalLM",
         "MistralLarge3ForCausalLM",
         "PixtralForConditionalGeneration",
+        "MiMoV2FlashForCausalLM",
     ]:
-        # The default value for deepseek and gpt-oss
         return (3, 1, 4)
     elif arch in ["Grok1ForCausalLM", "Grok1VForCausalLM"]:
         return (5, 4, 8)

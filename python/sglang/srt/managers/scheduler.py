@@ -210,6 +210,25 @@ GRAMMAR_TIMEOUT = float(os.environ.get("SGLANG_GRAMMAR_TIMEOUT", 300))
 @dataclass
 class EmbeddingBatchResult:
     embeddings: torch.Tensor
+    copy_done: Optional[torch.cuda.Event] = None
+
+    def copy_to_cpu(self):
+        """Copy embeddings tensor to CPU in overlap scheduling."""
+
+        if isinstance(self.embeddings, torch.Tensor):
+            self.copy_done = torch.get_device_module(self.embeddings.device).Event()
+            self.embeddings = self.embeddings.to("cpu", non_blocking=True)
+        else:
+            assert isinstance(self.embeddings, list)
+            if len(self.embeddings) == 0:
+                return
+
+            self.copy_done = torch.get_device_module(self.embeddings[0].device).Event()
+            self.embeddings = [
+                emb.to("cpu", non_blocking=True) for emb in self.embeddings
+            ]
+
+        self.copy_done.record()
 
 
 class Scheduler(
@@ -298,7 +317,7 @@ class Scheduler(
         self.init_metrics(tp_rank, pp_rank, dp_rank)
 
         # Init inter-process communication
-        self.init_sockets(server_args, port_args)
+        self.init_ipc_channels(port_args)
 
         # Init PD-multiplexing context
         if self.enable_pdmux:
@@ -354,7 +373,7 @@ class Scheduler(
             else None
         )
 
-    def init_sockets(self, server_args: ServerArgs, port_args: PortArgs):
+    def init_ipc_channels(self, port_args: PortArgs):
         context = zmq.Context(2)
         self.idle_sleeper = None
 
@@ -369,7 +388,7 @@ class Scheduler(
             send_to_tokenizer = get_zmq_socket(
                 context, zmq.PUSH, port_args.tokenizer_ipc_name, False
             )
-            if server_args.skip_tokenizer_init:
+            if self.server_args.skip_tokenizer_init:
                 # Directly send to the TokenizerManager
                 send_to_detokenizer = get_zmq_socket(
                     context, zmq.PUSH, port_args.tokenizer_ipc_name, False
@@ -629,10 +648,8 @@ class Scheduler(
             else:
                 from sglang.srt.mem_cache.chunk_cache import SWAChunkCache
 
-                params.is_local_attention = (
-                    "Llama4ForConditionalGeneration"
-                    in self.model_config.hf_config.architectures
-                )
+                params.sliding_window_size = self.model_config.sliding_window_size
+                params.attention_chunk_size = self.model_config.attention_chunk_size
 
                 self.tree_cache = SWAChunkCache(params)
         else:
@@ -715,8 +732,6 @@ class Scheduler(
         # The last forward batch
         self.last_batch: Optional[ScheduleBatch] = None
         self.forward_ct = 0
-        self.last_prefill_tokens = 0
-        self.last_prefill_cache_tokens = 0
         self.return_health_check_ct = 0
         self.num_retracted_reqs: int = 0
         self.num_paused_reqs: int = 0
@@ -1083,7 +1098,9 @@ class Scheduler(
     @DynamicGradMode()
     def event_loop_overlap(self):
         """A scheduler loop that overlaps the CPU processing and GPU computation."""
-        self.result_queue: Deque[Tuple[ScheduleBatch, GenerationBatchResult]] = deque()
+        self.result_queue: Deque[
+            Tuple[ScheduleBatch, Union[GenerationBatchResult, EmbeddingBatchResult]]
+        ] = deque()
 
         def pop_and_process():
             # Process the results of the last batch
@@ -1124,7 +1141,8 @@ class Scheduler(
 
             # Run sample of the current batch
             # It depends on the result of the last batch (e.g., grammar), so we run it after the last batch is processed.
-            self.launch_batch_sample_if_needed(batch_result)
+            if self.is_generation:
+                self.launch_batch_sample_if_needed(batch_result)
 
             # Update last_batch
             self.last_batch = batch
@@ -1147,7 +1165,7 @@ class Scheduler(
         # TODO(lsyin): support overlap + spec + grammar
         need_grammar_sync = (
             batch
-            and batch.is_eagle_v2
+            and batch.is_spec_v2
             and batch.has_grammar
             and batch.forward_mode.is_decode()
             and len(self.result_queue) > 0
@@ -1506,24 +1524,23 @@ class Scheduler(
             self._add_request_to_queue(req)
             return
 
-        # Copy more attributes
-        if recv_req.logprob_start_len == -1 or not recv_req.return_logprob:
-            # By default, only return the logprobs for output tokens
-            # For prefill-only requests with logprob_start_len == -1, set logprob_start_len beyond input sequence
-            # to skip input logprob computation entirely
+        if recv_req.logprob_start_len == -1:
             if req.is_prefill_only:
+                # For prefill-only requests with logprob_start_len == -1, set logprob_start_len
+                # beyond input sequence to skip input logprob computation entirely
                 req.logprob_start_len = len(req.origin_input_ids)
-            else:
-                # TODO: For text generation, evaluate setting logprob_start_len to len(req.origin_input_ids) as well
+            elif recv_req.return_logprob:
+                # If return_logprob is True, return the logprobs for output tokens by default
                 req.logprob_start_len = len(req.origin_input_ids) - 1
+            else:
+                # If return_logprob is False, only the last token requires logprob computation
+                req.logprob_start_len = -1
         else:
             req.logprob_start_len = recv_req.logprob_start_len
 
-        if not req.is_prefill_only and req.logprob_start_len >= len(
-            req.origin_input_ids
-        ):
+        if req.logprob_start_len > len(req.origin_input_ids):
             error_msg = f"{req.logprob_start_len=} is higher than the number of input tokens {len(req.origin_input_ids)=}. Please use a smaller logprob_start_len."
-            req.logprob_start_len = len(req.origin_input_ids) - 1
+            req.logprob_start_len = -1
             req.set_finish_with_abort(error_msg)
             self._add_request_to_queue(req)
             return
@@ -1742,7 +1759,7 @@ class Scheduler(
             return
 
         # Copy more attributes
-        req.logprob_start_len = len(req.origin_input_ids) - 1
+        req.logprob_start_len = -1
         self._add_request_to_queue(req)
 
     def handle_batch_embedding_request(
@@ -2068,12 +2085,24 @@ class Scheduler(
                 self.decode_mem_cache_buf_multiplier
             )
         ) or (TEST_RETRACT and self.forward_ct % TEST_RETRACT_INTERVAL == 0):
-            old_available_tokens = self.token_to_kv_pool_allocator.available_size()
+            if self.is_hybrid_swa:
+                old_available_tokens = min(
+                    self.token_to_kv_pool_allocator.full_available_size(),
+                    self.token_to_kv_pool_allocator.swa_available_size(),
+                )
+            else:
+                old_available_tokens = self.token_to_kv_pool_allocator.available_size()
             old_ratio = self.new_token_ratio
             retracted_reqs, new_token_ratio, reqs_to_abort = batch.retract_decode(
                 self.server_args, self.decode_mem_cache_buf_multiplier
             )
-            new_available_tokens = self.token_to_kv_pool_allocator.available_size()
+            if self.is_hybrid_swa:
+                new_available_tokens = min(
+                    self.token_to_kv_pool_allocator.full_available_size(),
+                    self.token_to_kv_pool_allocator.swa_available_size(),
+                )
+            else:
+                new_available_tokens = self.token_to_kv_pool_allocator.available_size()
             new_token_gained = new_available_tokens - old_available_tokens
 
             self.num_retracted_reqs = len(retracted_reqs)
@@ -2195,8 +2224,8 @@ class Scheduler(
                 # FIXME(lsyin): move this assignment elsewhere
                 future_indices_or_next_token_ids = -future_indices.indices
 
-                if batch.is_eagle_v2:
-                    # FIXME(lsyin): tmp code for eagle v2
+                if batch.is_spec_v2:
+                    # FIXME(lsyin): tmp code for spec v2
                     # We only keep future indices for next draft input
 
                     batch.spec_info = batch_result.next_draft_input
@@ -2249,8 +2278,19 @@ class Scheduler(
             ret = batch_result
         else:  # embedding or reward model
             model_worker_batch = batch.get_model_worker_batch()
-            embeddings = self.tp_worker.forward_batch_embedding(model_worker_batch)
-            ret = EmbeddingBatchResult(embeddings=embeddings)
+
+            if self.enable_overlap:
+                self.record_batch_in_overlap(model_worker_batch)
+                with self.forward_stream_ctx:
+                    self.forward_stream.wait_stream(self.default_stream)
+                    embeddings = self.tp_worker.forward_batch_embedding(
+                        model_worker_batch
+                    )
+                    ret = EmbeddingBatchResult(embeddings=embeddings)
+                    ret.copy_to_cpu()
+            else:
+                embeddings = self.tp_worker.forward_batch_embedding(model_worker_batch)
+                ret = EmbeddingBatchResult(embeddings=embeddings)
 
         # Capture prefill end time for EXTEND mode
         if batch.forward_mode == ForwardMode.EXTEND:
@@ -2262,7 +2302,7 @@ class Scheduler(
 
     def launch_batch_sample_if_needed(
         self, batch_result: GenerationBatchResult
-    ) -> Union[GenerationBatchResult, EmbeddingBatchResult]:
+    ) -> Union[GenerationBatchResult]:
         # TODO(lsyin): make the delayed sample a default behavior after
         # unifying the forward_batch_generation interface (related to spec V2).
         if batch_result is None or batch_result.delay_sample_func is None:
@@ -2291,9 +2331,7 @@ class Scheduler(
         elif batch.forward_mode.is_prebuilt():
             self.process_batch_result_prebuilt(batch)
         elif batch.forward_mode.is_idle():
-            if self.enable_overlap:
-                if result.copy_done is not None:
-                    result.copy_done.synchronize()
+            self.process_batch_result_idle(batch, result)
 
         self.log_batch_result_stats(batch, result)
         self.maybe_send_health_check_signal()
@@ -2544,7 +2582,10 @@ class Scheduler(
                 release_kv_cache(req, self.tree_cache)
 
             # For mamba radix cache
-            if req.mamba_pool_idx is not None:
+            if (
+                req.mamba_pool_idx is not None
+                and self.disaggregation_mode != DisaggregationMode.DECODE
+            ):
                 release_kv_cache(req, self.tree_cache, is_insert=False)
             logger.debug(f"Abort queued request. {req.rid=}")
 
