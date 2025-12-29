@@ -51,7 +51,6 @@ if _use_aiter:
 
 if _is_npu:
     import torch_npu
-    NPU_FORMAT_FRACTAL_NZ = 29
 
 try:
     from flashinfer.fused_moe import cutlass_fused_moe as flashinfer_cutlass_fused_moe
