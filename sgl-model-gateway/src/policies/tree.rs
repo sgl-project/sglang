@@ -65,11 +65,22 @@ type CharHasherBuilder = BuildHasherDefault<CharHasher>;
 
 /// Advance a string slice by N characters, returning the remaining slice.
 /// Returns empty string if n >= char count.
+/// Optimized: uses direct byte slicing for ASCII, falls back to char_indices for UTF-8.
 #[inline]
 fn advance_by_chars(s: &str, n: usize) -> &str {
     if n == 0 {
         return s;
     }
+    if n >= s.len() {
+        return "";
+    }
+    // Fast path: if first N bytes are all ASCII, we can slice directly
+    let bytes = s.as_bytes();
+    if bytes[..n].is_ascii() {
+        // Safe: we verified all bytes in [0..n] are ASCII (valid UTF-8 boundary)
+        return &s[n..];
+    }
+    // Slow path: UTF-8 requires char-by-char traversal
     s.char_indices()
         .nth(n)
         .map(|(idx, _)| &s[idx..])
@@ -251,9 +262,31 @@ impl PartialEq for EvictionEntry {
 
 /// Count matching prefix characters between two strings.
 /// Returns the number of characters that match from the start.
-/// Uses iterator-based comparison - no allocation required.
+/// Optimized: uses fast byte comparison for ASCII, falls back to char iteration for UTF-8.
 #[inline]
 fn shared_prefix_count(a: &str, b: &str) -> usize {
+    let a_bytes = a.as_bytes();
+    let b_bytes = b.as_bytes();
+
+    // Find common byte prefix length using iterator (potentially SIMD-optimized)
+    let common_byte_len = a_bytes
+        .iter()
+        .zip(b_bytes)
+        .position(|(&a_byte, &b_byte)| a_byte != b_byte)
+        .unwrap_or_else(|| a_bytes.len().min(b_bytes.len()));
+
+    // If the common byte prefix is all ASCII, byte count == char count
+    // Otherwise, fall back to char-by-char comparison for UTF-8 safety
+    if a_bytes[..common_byte_len].is_ascii() {
+        common_byte_len
+    } else {
+        shared_prefix_count_chars(a, b)
+    }
+}
+
+/// Fallback char-by-char comparison for strings with non-ASCII characters.
+#[inline]
+fn shared_prefix_count_chars(a: &str, b: &str) -> usize {
     a.chars()
         .zip(b.chars())
         .take_while(|(a_char, b_char)| a_char == b_char)
@@ -539,10 +572,13 @@ impl Tree {
             }
         };
 
-        // Update timestamp on the matched node only (O(1)).
+        // Update timestamp probabilistically (1 in 8 matches) to reduce DashMap contention.
+        // LRU eviction doesn't need perfect accuracy - approximate timestamps suffice.
         let epoch = get_epoch();
-        curr.tenant_last_access_time
-            .insert(Arc::clone(&tenant), epoch);
+        if epoch & 0x7 == 0 {
+            curr.tenant_last_access_time
+                .insert(Arc::clone(&tenant), epoch);
+        }
 
         // Compute input char count from matched + remaining (deferred from start)
         let input_char_count = matched_chars + remaining.chars().count();
