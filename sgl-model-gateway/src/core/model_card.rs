@@ -7,6 +7,8 @@
 //!
 //! Inspired by Dynamo's ModelDeploymentCard but simplified for router needs.
 
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 
 use super::{
@@ -168,6 +170,21 @@ pub struct ModelCard {
     /// User-defined metadata (for fields not covered above)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata: Option<serde_json::Value>,
+
+    // === Classification Support ===
+    /// Classification label mapping (class index -> label name).
+    /// Empty if not a classification model.
+    /// Example: {0: "negative", 1: "positive"}
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub id2label: HashMap<u32, String>,
+
+    /// Number of classification labels (0 if not a classifier).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub num_labels: u32,
+}
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
 }
 
 fn default_model_type() -> ModelType {
@@ -193,6 +210,8 @@ impl ModelCard {
             reasoning_parser: None,
             tool_parser: None,
             metadata: None,
+            id2label: HashMap::new(),
+            num_labels: 0,
         }
     }
 
@@ -276,6 +295,19 @@ impl ModelCard {
         self
     }
 
+    /// Set the id2label mapping for classification models
+    pub fn with_id2label(mut self, id2label: HashMap<u32, String>) -> Self {
+        self.num_labels = id2label.len() as u32;
+        self.id2label = id2label;
+        self
+    }
+
+    /// Set num_labels directly (alternative to with_id2label)
+    pub fn with_num_labels(mut self, num_labels: u32) -> Self {
+        self.num_labels = num_labels;
+        self
+    }
+
     // === Query methods ===
 
     /// Check if this model matches the given ID (including aliases)
@@ -333,6 +365,20 @@ impl ModelCard {
     #[inline]
     pub fn supports_reasoning(&self) -> bool {
         self.model_type.supports_reasoning()
+    }
+
+    /// Check if this is a classification model
+    #[inline]
+    pub fn is_classifier(&self) -> bool {
+        self.num_labels > 0
+    }
+
+    /// Get label for a class index, with fallback to generic label (LABEL_N)
+    pub fn get_label(&self, class_idx: u32) -> String {
+        self.id2label
+            .get(&class_idx)
+            .cloned()
+            .unwrap_or_else(|| format!("LABEL_{}", class_idx))
     }
 }
 
