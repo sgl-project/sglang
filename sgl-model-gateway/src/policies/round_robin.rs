@@ -5,7 +5,7 @@ use std::sync::{
     Arc,
 };
 
-use super::{get_healthy_worker_indices, LoadBalancingPolicy};
+use super::{get_healthy_worker_indices, LoadBalancingPolicy, SelectWorkerInfo};
 use crate::core::Worker;
 
 /// Round-robin selection policy
@@ -28,7 +28,7 @@ impl LoadBalancingPolicy for RoundRobinPolicy {
     fn select_worker(
         &self,
         workers: &[Arc<dyn Worker>],
-        _request_text: Option<&str>,
+        _info: &SelectWorkerInfo,
     ) -> Option<usize> {
         let healthy_indices = get_healthy_worker_indices(workers);
 
@@ -83,11 +83,12 @@ mod tests {
         ];
 
         // Should select workers in order: 0, 1, 2, 0, 1, 2, ...
-        assert_eq!(policy.select_worker(&workers, None), Some(0));
-        assert_eq!(policy.select_worker(&workers, None), Some(1));
-        assert_eq!(policy.select_worker(&workers, None), Some(2));
-        assert_eq!(policy.select_worker(&workers, None), Some(0));
-        assert_eq!(policy.select_worker(&workers, None), Some(1));
+        let info = SelectWorkerInfo::default();
+        assert_eq!(policy.select_worker(&workers, &info), Some(0));
+        assert_eq!(policy.select_worker(&workers, &info), Some(1));
+        assert_eq!(policy.select_worker(&workers, &info), Some(2));
+        assert_eq!(policy.select_worker(&workers, &info), Some(0));
+        assert_eq!(policy.select_worker(&workers, &info), Some(1));
     }
 
     #[test]
@@ -115,10 +116,11 @@ mod tests {
         workers[1].set_healthy(false);
 
         // Should skip unhealthy worker: 0, 2, 0, 2, ...
-        assert_eq!(policy.select_worker(&workers, None), Some(0));
-        assert_eq!(policy.select_worker(&workers, None), Some(2));
-        assert_eq!(policy.select_worker(&workers, None), Some(0));
-        assert_eq!(policy.select_worker(&workers, None), Some(2));
+        let info = SelectWorkerInfo::default();
+        assert_eq!(policy.select_worker(&workers, &info), Some(0));
+        assert_eq!(policy.select_worker(&workers, &info), Some(2));
+        assert_eq!(policy.select_worker(&workers, &info), Some(0));
+        assert_eq!(policy.select_worker(&workers, &info), Some(2));
     }
 
     #[test]
@@ -138,11 +140,12 @@ mod tests {
         ];
 
         // Advance the counter
-        assert_eq!(policy.select_worker(&workers, None), Some(0));
-        assert_eq!(policy.select_worker(&workers, None), Some(1));
+        let info = SelectWorkerInfo::default();
+        assert_eq!(policy.select_worker(&workers, &info), Some(0));
+        assert_eq!(policy.select_worker(&workers, &info), Some(1));
 
         // Reset should start from beginning
         policy.reset();
-        assert_eq!(policy.select_worker(&workers, None), Some(0));
+        assert_eq!(policy.select_worker(&workers, &info), Some(0));
     }
 }
