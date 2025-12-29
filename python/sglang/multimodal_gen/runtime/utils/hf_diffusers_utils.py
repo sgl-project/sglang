@@ -216,9 +216,14 @@ def maybe_download_lora(
     Returns:
         Local path to the model
     """
+    allow_patterns = ["*.json", "*.safetensors", "*.bin"]
 
     local_path = maybe_download_model(
-        model_name_or_path, local_dir, download, is_lora=True
+        model_name_or_path,
+        local_dir,
+        download,
+        is_lora=True,
+        allow_patterns=allow_patterns,
     )
     # return directly if local_path is a file
     if os.path.isfile(local_path):
@@ -363,6 +368,7 @@ def maybe_download_model(
     local_dir: str | None = None,
     download: bool = True,
     is_lora: bool = False,
+    allow_patterns: list[str] | None = None,
 ) -> str:
     """
     Check if the model path is a Hugging Face Hub model ID and download it if needed.
@@ -411,6 +417,9 @@ def maybe_download_model(
             ignore_patterns=["*.onnx", "*.msgpack"],
             local_dir=local_dir,
             local_files_only=True,
+            resume_download=True,
+            max_workers=8,
+            etag_timeout=60,
         )
         if is_lora or _verify_model_complete(local_path):
             logger.info("Found complete model in cache at %s", local_path)
@@ -442,7 +451,7 @@ def maybe_download_model(
             ) from e
 
     # 3. Download strategy (with retry mechanism)
-    MAX_RETRIES = 3
+    MAX_RETRIES = 5
     for attempt in range(MAX_RETRIES):
         try:
             logger.info(
@@ -455,7 +464,11 @@ def maybe_download_model(
                 local_path = snapshot_download(
                     repo_id=model_name_or_path,
                     ignore_patterns=["*.onnx", "*.msgpack"],
+                    allow_patterns=allow_patterns,
                     local_dir=local_dir,
+                    resume_download=True,
+                    max_workers=8,
+                    etag_timeout=120,
                 )
 
             # Verify downloaded model is complete (skip for LoRA)
@@ -469,6 +482,9 @@ def maybe_download_model(
                         repo_id=model_name_or_path,
                         ignore_patterns=["*.onnx", "*.msgpack"],
                         local_dir=local_dir,
+                        resume_download=True,
+                        max_workers=8,
+                        etag_timeout=60,
                         force_download=True,
                     )
                 if not _verify_model_complete(local_path):
