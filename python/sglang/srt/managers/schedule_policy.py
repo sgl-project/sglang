@@ -456,6 +456,8 @@ class PrefillAdder:
         truncated = req.extend_input_len > _rem_tokens
         req.extend_input_len = min(req.extend_input_len, _rem_tokens)
         req.fill_ids = req.fill_ids[: len(req.prefix_indices) + req.extend_input_len]
+        # anchor
+
         self.can_run_list.append(req)
         self._update_prefill_budget(
             0,
@@ -561,6 +563,8 @@ class PrefillAdder:
 
             req.extend_input_len = trunc_len
             req.fill_ids = req.fill_ids[:trunc_len]
+            # anchor
+
             self.can_run_list.append(req)
             self.new_chunked_req = req
             self._update_prefill_budget(0, trunc_len, 0)
@@ -609,6 +613,7 @@ class PrefillAdder:
                 )
                 req.prefix_indices = torch.cat([req.prefix_indices, new_indices])
                 req.extend_input_len = len(req.fill_ids) - len(req.prefix_indices)
+                # anchor
                 prefix_len = len(req.prefix_indices)
                 req.cache_protected_len = prefix_len
 
@@ -653,6 +658,7 @@ class PrefillAdder:
                 # Chunked prefill
                 req.extend_input_len = trunc_len
                 req.fill_ids = req.fill_ids[: len(req.prefix_indices) + trunc_len]
+                # anchor
 
                 self.can_run_list.append(req)
                 self.new_chunked_req = req

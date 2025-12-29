@@ -896,6 +896,7 @@ class Req:
             )
 
         self.extend_input_len = len(self.fill_ids) - len(self.prefix_indices)
+        # anchor
 
     # Based on https://github.com/vllm-project/vllm/blob/7a64d24aad69e4d2548aa0bf528d9fe63428ab01/vllm/transformers_utils/detokenizer.py#L194-L313
     def init_incremental_detokenize(self):
@@ -1068,6 +1069,7 @@ class Req:
         self.last_node = None
         self.swa_uuid_for_lock = None
         self.extend_input_len = 0
+        # anchor
         self.is_retracted = True
         self.retracted_stain = True
         self.input_token_logprobs = None
@@ -1680,6 +1682,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         for req in running_batch.reqs:
             req.fill_ids = req.origin_input_ids + req.output_ids
             req.extend_input_len = 1
+            # anchor
 
         input_ids = torch.cat([self.input_ids, running_batch.input_ids])
         out_cache_loc = torch.cat([self.out_cache_loc, running_batch.out_cache_loc])

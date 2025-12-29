@@ -94,6 +94,8 @@ class TestForwardSplitPrefill(CustomTestCase):
             req.fill_ids = req.origin_input_ids
             req.extend_input_len = len(req.fill_ids) - len(req.prefix_indices)
             req.logprob_start_len = -1
+            # anchor
+
             reqs.append(req)
 
         # Create dummy tree_cache for tests (no prefix caching, just allocation)

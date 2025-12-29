@@ -304,6 +304,7 @@ def prepare_inputs_for_correctness_test(bench_args, tokenizer, custom_prompts):
         req.extend_input_len = len(req.fill_ids) - len(req.prefix_indices)
         req.logprob_start_len = -1
         reqs.append(req)
+        # anchor
 
     return input_ids, reqs
 
@@ -319,6 +320,8 @@ def prepare_extend_inputs_for_correctness_test(
         ]
         req.extend_input_len = len(req.fill_ids) - len(req.prefix_indices)
         req.logprob_start_len = -1
+        # anchor
+
     return reqs
 
 
@@ -346,6 +349,8 @@ def prepare_synthetic_inputs_for_latency_test(
         req.fill_ids = req.origin_input_ids
         req.extend_input_len = len(req.fill_ids) - len(req.prefix_indices)
         req.logprob_start_len = -1
+        # anchor
+
         reqs.append(req)
 
     return reqs
