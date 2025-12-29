@@ -39,49 +39,33 @@ impl UpdatePoliciesStep {
         }
 
         // Compare configurations of prefill vs decode workers
-        // We take the first of each as representative for the check
         if let (Some(pw), Some(dw)) = (prefill_workers.first(), decode_workers.first()) {
             let pl = &pw.metadata().labels;
             let dl = &dw.metadata().labels;
 
-            let ptp = pl.get("tp_size");
-            let dtp = dl.get("tp_size");
-            if ptp != dtp {
-                warn!(
-                    "Model {} has conflicting tp_size: prefill={:?}, decode={:?}",
-                    model_id, ptp, dtp
-                );
+            // Define keys to check for equality
+            let keys_to_check = ["tp_size", "dp_size", "load_balance_method"];
+
+            for key in keys_to_check {
+                let p_val = pl.get(key);
+                let d_val = dl.get(key);
+                if p_val != d_val {
+                    warn!(
+                        "Model {} has conflicting {}: prefill={:?}, decode={:?}",
+                        model_id, key, p_val, d_val
+                    );
+                }
             }
 
-            let pdp = pl.get("dp_size");
-            let ddp = dl.get("dp_size");
-            if pdp != ddp {
-                warn!(
-                    "Model {} has conflicting dp_size: prefill={:?}, decode={:?}",
-                    model_id, pdp, ddp
-                );
-            }
-
-            let plb = pl.get("load_balance_method");
-            let dlb = dl.get("load_balance_method");
-            if plb != dlb {
-                warn!(
-                    "Model {} has conflicting load_balance_method: prefill={:?}, decode={:?}",
-                    model_id, plb, dlb
-                );
-            }
-
-            // Check for Data-Parallel consistency using fundamental properties
-            if let Some(dp_size_str) = pdp {
-                if let Ok(dp_size) = dp_size_str.parse::<usize>() {
-                    if dp_size > 1 {
-                        // When dp_size > 1, round_robin is required for correct rank alignment in disaggregated mode
-                        if plb.map(|s| s.as_str()) != Some("round_robin") {
-                            warn!(
-                                "Model {} has dp_size > 1 but load_balance_method is not 'round_robin' on prefill workers. This may cause rank mismatch in disaggregated mode.",
-                                model_id
-                            );
-                        }
+            // Specific check for Data-Parallel consistency
+            if let Some(dp_size) = pl.get("dp_size").and_then(|s| s.parse::<usize>().ok()) {
+                if dp_size > 1 {
+                    let plb = pl.get("load_balance_method").map(|s| s.as_str());
+                    if plb != Some("round_robin") {
+                        warn!(
+                            "Model {} has dp_size > 1 but load_balance_method is not 'round_robin' on prefill workers. This may cause rank mismatch in disaggregated mode.",
+                            model_id
+                        );
                     }
                 }
             }
