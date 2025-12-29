@@ -511,8 +511,6 @@ def ci_download_with_validation_and_retry(
             kwargs["disable"] = True
             super().__init__(*args, **kwargs)
 
-    log_info_on_rank0(logger, f"Using model weights format {allow_patterns}")
-
     # Retry loop for handling corrupted downloads
     for attempt in range(max_retries):
         hf_folder = snapshot_download(
