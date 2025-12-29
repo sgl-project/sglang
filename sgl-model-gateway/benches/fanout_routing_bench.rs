@@ -9,7 +9,7 @@ use sgl_model_gateway::{
     app_context::AppContext,
     config::types::{PolicyConfig, RouterConfig},
     core::{BasicWorkerBuilder, WorkerRegistry, WorkerType},
-    data_connector::memory::{
+    data_connector::{
         MemoryConversationItemStorage, MemoryConversationStorage, MemoryResponseStorage,
     },
     policies::PolicyRegistry,
@@ -70,7 +70,6 @@ async fn setup_cluster(size: usize) -> (Arc<Router>, Vec<MockServer>) {
     }
 
     // 3. Construct AppContext Manually
-    // We cannot use mock() because it doesn't exist, so we build it.
     let router_config = RouterConfig::default();
     let client = reqwest::Client::new();
     let policy_registry = Arc::new(PolicyRegistry::new(PolicyConfig::Random));
@@ -190,14 +189,9 @@ fn bench_latency(c: &mut Criterion) {
     for &size in sizes.iter() {
         group.throughput(Throughput::Elements(1));
         group.bench_with_input(BenchmarkId::from_parameter(size), &size, |b, &s| {
-            // FIX: Explicit types for the closure arguments to help type inference
             b.to_async(&rt).iter_with_setup(
-                || {
-                    // Setup happens OUTSIDE the timing loop
-                    rt.block_on(async { setup_cluster(s).await })
-                },
+                || rt.block_on(async { setup_cluster(s).await }),
                 |(router, _guards): (Arc<Router>, Vec<MockServer>)| async move {
-                    // MEASURED HOT PATH
                     let _ = router
                         .get_response(None, "test-id", &Default::default())
                         .await;
