@@ -277,7 +277,7 @@ class RouterArgs:
             f"--{prefix}balance-rel-threshold",
             type=float,
             default=RouterArgs.balance_rel_threshold,
-            help="Load balancing is triggered when (max_load - min_load) > abs_threshold AND max_load > min_load * rel_threshold. Otherwise, use cache aware",
+            help="Relative threshold for load difference. Balancing is triggered if `max_load > min_load * rel_threshold` and the absolute threshold is also met.",
         )
         routing_group.add_argument(
             f"--{prefix}bucket-adjust-interval-secs",
