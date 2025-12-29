@@ -608,23 +608,26 @@ class RadixCache(BasePrefixCache):
         return self.protected_size_
 
     def get_cache_stats(self) -> dict:
-        """Return cache statistics for monitoring."""
-        return {
-            "entry_count": self._count_entries(),
-            "total_tokens": self.total_size(),
-            "evictable_tokens": self.evictable_size(),
-        }
+        """Return cache statistics for monitoring.
 
-    def _count_entries(self) -> int:
-        """Count total number of cache entries (tree nodes with values)."""
-        count = 0
+        Computes entry_count and total_tokens in a single pass for efficiency.
+        """
+        entry_count = 0
+        total_tokens = 0
         stack = [self.root_node]
         while stack:
             node = stack.pop()
             if node.value is not None and len(node.value) > 0:
-                count += 1
-            stack.extend(node.children.values())
-        return count
+                entry_count += 1
+                total_tokens += len(node.value)
+            for child in node.children.values():
+                if not child.evicted:
+                    stack.append(child)
+        return {
+            "entry_count": entry_count,
+            "total_tokens": total_tokens,
+            "evictable_tokens": self.evictable_size(),
+        }
 
     def all_values_flatten(self):
         values = []
