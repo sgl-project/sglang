@@ -80,6 +80,7 @@ class ModelSlimW4A8Int8MoE(ModelSlimMoEMethod):
     ):
         self.quant_config = quant_config
         self.group_size = 0
+        self.is_per_channel_weight = self.group_size == 0
         self.tp_size = 1
         self.activation_use_clip = False
         self.kernel = NPUW4A8Int8DynamicMoEMethod()
@@ -95,7 +96,6 @@ class ModelSlimW4A8Int8MoE(ModelSlimMoEMethod):
     ) -> None:
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
 
-        self.is_per_channel_weight = self.group_size == 0
         self.num_experts = num_experts
         extra_weight_attrs.update(
             {"quant_method": FusedMoeWeightScaleSupported.CHANNEL.value}
