@@ -20,6 +20,11 @@ import cutlass.cute as cute
 import torch
 from cutlass.cute.runtime import from_dlpack
 from flash_attn_origin.cute import utils
+from flash_attn_origin.cute.block_sparsity import (
+    BlockSparseTensorsTorch,
+    normalize_block_sparse_tensors,
+    to_cute_block_sparse_tensors,
+)
 from flash_attn_origin.cute.flash_fwd import FlashAttentionForwardSm90
 from flash_attn_origin.cute.flash_fwd_combine import FlashAttentionForwardCombine
 from flash_attn_origin.cute.flash_fwd_sm100 import FlashAttentionForwardSm100
@@ -27,6 +32,19 @@ from flash_attn_origin.cute.flash_fwd_sm100 import FlashAttentionForwardSm100
 
 def maybe_contiguous(x):
     return x.contiguous() if x is not None and x.stride(-1) != 1 else x
+
+
+def _validate_tensor(t, name, expected_shape, expected_dtype, expected_device):
+    assert (
+        t.shape == expected_shape
+    ), f"{name} shape {t.shape} != expected {expected_shape}"
+    assert (
+        t.dtype == expected_dtype
+    ), f"{name} dtype {t.dtype} != expected {expected_dtype}"
+    assert (
+        t.device == expected_device
+    ), f"{name} device {t.device} != expected {expected_device}"
+    assert t.is_cuda, f"{name} must be on CUDA"
 
 
 torch2cute_dtype_map = {
@@ -70,13 +88,26 @@ def _flash_attn_fwd(
     num_splits: int = 1,
     pack_gqa: Optional[bool] = None,
     _compute_capability: Optional[int] = None,
-    score_mod: Callable | None = None,
+    score_mod: Optional[Callable] = None,
     mask_mod: Optional[Callable] = None,
+    block_sparse_tensors: Optional[BlockSparseTensorsTorch] = None,
     return_lse: bool = False,
     out: Optional[torch.Tensor] = None,
     lse: Optional[torch.Tensor] = None,
-    buffers: Optional[list[torch.Tensor]] = None,
+    aux_tensors: Optional[list[torch.Tensor]] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Forward pass for FlashAttention.
+
+    Args:
+        ...
+        score_mod: A callable that takes the attention scores and applies a modification.
+        mask_mod: A callable that takes token position information and selectively masks
+        block_sparse_tensors: A tuple of tensors used for block sparsity.
+        return_lse: Whether to return the log softmax of the attention scores. If set to True will always calculate
+        out: Optional pre-allocated output tensor. If None, will be allocated internally.
+        lse: Optional pre-allocated log-sum-exp tensor. If None, will be allocated when needed.
+        aux_tensors: Some score_mods will want to read from global aux_tensors. This is how we thread them through to the inner kernel.
+    """
     q, k, v = [maybe_contiguous(t) for t in (q, k, v)]
     num_head, head_dim = q.shape[-2:]
     if cu_seqlens_q is None:
@@ -114,6 +145,7 @@ def _flash_attn_fwd(
         assert cu_seqlens_k.shape == (
             batch_size + 1,
         ), "cu_seqlens_k must have shape (batch_size + 1,)"
+
     if cu_seqlens_q is not None:
         assert cu_seqlens_q.shape == (
             batch_size + 1,
@@ -140,6 +172,7 @@ def _flash_attn_fwd(
     if learnable_sink is not None:
         assert learnable_sink.shape == (num_head,)
         assert learnable_sink.dtype == torch.bfloat16, "learnable_sink must be bfloat16"
+
     assert all(
         t is None or t.is_cuda
         for t in (
@@ -188,17 +221,13 @@ def _flash_attn_fwd(
             device=device,
         )
     else:
-        expected_out_shape = (*q_batch_seqlen_shape, num_head, head_dim_v)
-        assert (
-            out.shape == expected_out_shape
-        ), f"out tensor shape {out.shape} does not match expected shape {expected_out_shape}"
-        assert (
-            out.dtype == out_torch_dtype
-        ), f"out tensor dtype {out.dtype} does not match expected dtype {out_torch_dtype}"
-        assert (
-            out.device == device
-        ), f"out tensor device {out.device} does not match input device {device}"
-        assert out.is_cuda, "out tensor must be on CUDA device"
+        _validate_tensor(
+            out,
+            "out",
+            (*q_batch_seqlen_shape, num_head, head_dim_v),
+            out_torch_dtype,
+            device,
+        )
 
     if lse is None:
         lse = (
@@ -207,26 +236,67 @@ def _flash_attn_fwd(
             else None
         )
     elif lse is not None:
-        assert (
-            lse.shape == lse_shape
-        ), f"lse tensor shape {lse.shape} does not match expected shape {lse_shape}"
-        assert (
-            lse.dtype == torch.float32
-        ), f"lse tensor dtype {lse.dtype} does not match expected dtype torch.float32"
-        assert (
-            lse.device == device
-        ), f"lse tensor device {lse.device} does not match input device {device}"
-        assert lse.is_cuda, "lse tensor must be on CUDA device"
+        _validate_tensor(lse, "lse", lse_shape, torch.float32, device)
 
+    dtype = torch2cute_dtype_map[q.dtype]
+    (
+        cu_seqlens_q_tensor,
+        cu_seqlens_k_tensor,
+        seqused_q_tensor,
+        seqused_k_tensor,
+        learnable_sink_tensor,
+    ) = [
+        (
+            from_dlpack(t.detach(), assumed_align=4).mark_layout_dynamic(leading_dim=0)
+            if t is not None
+            else None
+        )
+        for t in (cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k, learnable_sink)
+    ]
+    page_table_tensor = (
+        from_dlpack(page_table.detach(), assumed_align=4).mark_layout_dynamic(
+            leading_dim=1
+        )
+        if page_table is not None
+        else None
+    )
     compute_capability = (
         torch.cuda.get_device_capability()[0]
         if _compute_capability is None
         else _compute_capability
     )
+
     assert compute_capability in [
         9,
         10,
     ], "Unsupported compute capability. Supported: 9.x, 10.x"
+
+    sparse_tensors = None
+    if block_sparse_tensors is not None:
+        if seqlen_q is None:
+            raise ValueError(
+                "Block sparsity requires fixed-length sequences (seqlen_q must be known)."
+            )
+        m_block_size_block = m_block_size
+        if compute_capability == 10:
+            # TODO: This multiplier should really be q_stage, wire up in later PR
+            # 1 cta handles 2*tile_m row
+            m_block_size_block = 2 * m_block_size
+        expected_m_blocks = (seqlen_q + m_block_size_block - 1) // m_block_size_block
+        expected_n_blocks = (seqlen_k + n_block_size - 1) // n_block_size
+        block_sparse_tensors = normalize_block_sparse_tensors(
+            block_sparse_tensors,
+            expected_count_shape=(batch_size, num_head, expected_m_blocks),
+            expected_index_shape=(
+                batch_size,
+                num_head,
+                expected_m_blocks,
+                expected_n_blocks,
+            ),
+        )
+        sparse_tensors = to_cute_block_sparse_tensors(block_sparse_tensors)
+
+    use_block_sparsity = sparse_tensors is not None
 
     if mask_mod is None:
         if causal:
@@ -241,8 +311,15 @@ def _flash_attn_fwd(
     else:
         causal, local = False, False
 
+    current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+
     if compute_capability == 9:  # TODO: tune block size according to hdim.
-        if head_dim == head_dim_v == 128 and not causal and not local:
+        if (
+            head_dim == head_dim_v == 128
+            and not causal
+            and not local
+            and not use_block_sparsity
+        ):
             n_block_size = 192
     if compute_capability == 10:
         # TODO: fix the varlen case
@@ -303,7 +380,6 @@ def _flash_attn_fwd(
             num_splits, *lse_shape, dtype=torch.float32, device=device
         )
 
-    dtype = torch2cute_dtype_map[q.dtype]
     q_tensor, k_tensor, v_tensor, o_tensor = [
         from_dlpack(t.detach(), assumed_align=16).mark_layout_dynamic(
             leading_dim=t.ndim - 1
@@ -320,29 +396,6 @@ def _flash_attn_fwd(
         )
     else:
         lse_tensor = None
-    (
-        cu_seqlens_q_tensor,
-        cu_seqlens_k_tensor,
-        seqused_q_tensor,
-        seqused_k_tensor,
-        learnable_sink_tensor,
-    ) = [
-        (
-            from_dlpack(t.detach(), assumed_align=4).mark_layout_dynamic(leading_dim=0)
-            if t is not None
-            else None
-        )
-        for t in (cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k, learnable_sink)
-    ]
-    page_table_tensor = (
-        from_dlpack(page_table.detach(), assumed_align=4).mark_layout_dynamic(
-            leading_dim=1
-        )
-        if page_table is not None
-        else None
-    )
-
-    current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
     # hash score and mask mods for compile cache
     score_mod_hash = utils.hash_callable(score_mod) if score_mod is not None else False
@@ -361,22 +414,38 @@ def _flash_attn_fwd(
     if score_mod is not None:
         if is_varlen:
             raise NotImplementedError(
-                "score_mod with buffers is not yet supported for varlen sequences. This will be fixed in a future PR."
+                "score_mod with aux_tensors is not yet supported for varlen sequences. This will be fixed in a future PR."
             )
 
     if mask_mod is not None:
         if is_varlen:
             raise NotImplementedError(
-                "mask_mod with buffers is not yet supported for varlen sequences. This will be fixed in a future PR."
+                "mask_mod with aux_tensors is not yet supported for varlen sequences. This will be fixed in a future PR."
             )
         if pack_gqa:
             raise NotImplementedError(
-                "mask_mod with buffers is not yet supported with pack_gqa=True. This will be fixed in a future PR."
+                "mask_mod with aux_tensors is not yet supported with pack_gqa=True. This will be fixed in a future PR."
             )
 
-    cute_buffers = None
-    if buffers is not None:
-        cute_buffers = [from_dlpack(buf).mark_layout_dynamic() for buf in buffers]
+    if use_block_sparsity:
+        if is_varlen:
+            raise NotImplementedError(
+                "Block sparsity is not yet supported for varlen sequences. This will be fixed in a future PR."
+            )
+        if pack_gqa:
+            raise NotImplementedError(
+                "Block sparsity is not yet supported with pack_gqa=True. This will be fixed in a future PR."
+            )
+        if is_split_kv:
+            raise NotImplementedError(
+                "Block sparsity is not yet supported with SplitKV. TODO: partition sparse block lists per split."
+            )
+
+    cute_aux_tensors = None
+    if aux_tensors is not None:
+        cute_aux_tensors = [
+            from_dlpack(buf).mark_layout_dynamic() for buf in aux_tensors
+        ]
 
     compile_key = (
         dtype,
@@ -386,8 +455,8 @@ def _flash_attn_fwd(
         causal,
         score_mod_hash,
         mask_mod_hash,
-        False,  # use_block_sparsity (not supported in sglang)
-        len(buffers) if buffers is not None else 0,
+        use_block_sparsity,
+        len(aux_tensors) if aux_tensors is not None else 0,
         lse is None,
         cu_seqlens_q is None,
         cu_seqlens_k is None,
@@ -428,13 +497,9 @@ def _flash_attn_fwd(
                 mma_pv_is_rs=True,
                 mask_mod=mask_mod,
                 score_mod=score_mod,
-                has_buffers=buffers is not None,
+                has_aux_tensors=aux_tensors is not None,
             )
         elif compute_capability == 10:
-            assert page_size in [
-                None,
-                128,
-            ], "Only page_size=128 is supported for paged KV on SM 10.0"
             fa_fwd = FlashAttentionForwardSm100(
                 head_dim,
                 head_dim_v,
@@ -452,7 +517,7 @@ def _flash_attn_fwd(
                 and not is_split_kv,
                 score_mod=score_mod,
                 mask_mod=mask_mod,
-                has_buffers=buffers is not None,
+                has_aux_tensors=aux_tensors is not None,
                 paged_kv_non_tma=page_size not in [None, 128],
                 is_varlen_q=cu_seqlens_q is not None or seqused_q is not None,
             )
@@ -478,8 +543,8 @@ def _flash_attn_fwd(
             window_size_left,
             window_size_right,
             learnable_sink_tensor,
-            None,  # sparse_tensors (not supported in sglang)
-            cute_buffers,
+            sparse_tensors,
+            cute_aux_tensors,
         )
     _flash_attn_fwd.compile_cache[compile_key](
         q_tensor,
@@ -497,8 +562,8 @@ def _flash_attn_fwd(
         window_size_left,
         window_size_right,
         learnable_sink_tensor,
-        None,  # sparse_tensors (not supported in sglang)
-        cute_buffers,
+        sparse_tensors,
+        cute_aux_tensors,
     )
     if is_split_kv:
         _flash_attn_fwd_combine(
@@ -541,6 +606,7 @@ def _flash_attn_fwd_combine(
         seqused: Used sequence lengths for each batch
         num_splits_dynamic_ptr: Dynamic number of splits per batch
         semaphore_to_reset: Semaphore for synchronization
+        k_block_size: Block size for head dimension
 
     Returns:
         None
@@ -834,6 +900,7 @@ def flash_attn_varlen_func(
     window_size: Tuple[Optional[int], Optional[int]] = (None, None),
     learnable_sink: Optional[torch.Tensor] = None,
     softcap: float = 0.0,
+    num_splits: int = 1,
     pack_gqa: Optional[bool] = None,
     return_softmax_lse: Optional[bool] = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -852,6 +919,7 @@ def flash_attn_varlen_func(
         window_size_right=window_size[1],
         learnable_sink=learnable_sink,
         softcap=softcap,
+        num_splits=num_splits,
         pack_gqa=pack_gqa,
         return_lse=return_softmax_lse,
     )

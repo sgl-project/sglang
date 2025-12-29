@@ -176,6 +176,10 @@ def flash_attn_with_kvcache(
 
         if window_size == (-1, -1):
             window_size = (None, None)
+
+        if num_splits == 0:
+            # TODO: Remove this once num_splits=0 is compatible with CUDA Graph.
+            num_splits = 1
         return flash_attn_varlen_func_v4(
             q=q,
             k=k_cache,
@@ -186,6 +190,7 @@ def flash_attn_with_kvcache(
             causal=causal,
             window_size=window_size,
             softcap=softcap,
+            num_splits=num_splits,
             pack_gqa=pack_gqa,
             return_softmax_lse=return_softmax_lse,
             learnable_sink=sinks,
