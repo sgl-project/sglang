@@ -8,7 +8,7 @@
 2. Install aiter:
    ```
    pip uninstall aiter
-   git clone -b qwen3vl-project https://github.com/ZLkanyo009/aiter.git
+   git clone -b dev/perf https://github.com/ROCm/aiter.git
    cd aiter
    git checkout <target_commit>
    git submodule sync && git submodule update --init --recursive
@@ -33,25 +33,35 @@
 
 
 # Launch server
-1. download model Qwen3-Omni-30B-A3B-Instruct
 
+    download model Qwen3-Omni-30B-A3B-Instruct
+
+    You can either:
+    - Download the original bf16 model from Hugging Face:
     ```bash
     huggingface-cli download Qwen/Qwen3-Omni-30B-A3B-Instruct --local-dir /models/Qwen3-Omni-30B-A3B-Instruct
     ```
+    - Download our pre-quantized **fp8 ptpc** model directly from Hugging Face:(We have uploaded the fp8 version so you can skip the quantization step.)
+    ```bash
+    huggingface-cli download sammysun0711/Qwen3-Omni-30B-A3B-Instruct-FP8-Dynamic --local-dir /models/Qwen3-Omni-30B-A3B-Instruct-FP8-Dynamic
+    ```
+    - Or generate a **fp8 ptpc** quantized version using the quantization script [Qwen3-Omni-30B-A3B-Instruct PTPC FP8 Quantization with llm-compressor](https://github.com/sammysun0711/llm-benchmark-tools/tree/main/quantization)
 
 - launch server:
 
     The example command:
     ```bash
-    model=/models/Qwen3-Omni-30B-A3B-Instruct/
-    TP=4
-    DP=2
+    model=/models/Qwen3-Omni-30B-A3B-Instruct # or Use /models/Qwen3-Omni-30B-A3B-Instruct-FP8-Dynamic
+    TP=8
 
     echo "launching ${model}"
     echo "TP=${TP}"
-    echo "DP=${DP}"
-
-     SGLANG_VLM_CACHE_SIZE_MB=0 \
+     # AITER_MOE_PADDING_SIZE=128 \ only for fp8 tp8
+     AITER_MOE_SMALL_BATCH=1 \
+     SGLANG_ROCM_USE_AITER_LINEAR_FP8HIPB=0 \
+     ROCM_QUICK_REDUCE_QUANTIZATION=INT4 \
+     SGLANG_USE_CUDA_IPC_TRANSPORT=1 \
+     SGLANG_VLM_CACHE_SIZE_MB=8192 \
      SGLANG_USE_AITER=1 \
      USE_PA=1 \
      SGLANG_ROCM_USE_AITER_PA_ASM_PRESHUFFLE_LAYOUT=0 \
@@ -61,23 +71,25 @@
         --host localhost    \
         --port 9000 \
         --tensor-parallel-size ${TP} \
-        --data-parallel-size ${DP} \
         --trust-remote-code \
         --chunked-prefill-size 32768 \
         --mem-fraction-static 0.85 \
         --mm-attention-backend "aiter_attn" \
         --max-prefill-tokens 32768 \
         --disable-radix-cache \
-        --page-size 64 \
+        --page-size 32 \
         --mm-enable-dp-encoder \
+        --enable-aiter-allreduce-fusion \
+        --max-running-requests 128 \
         --cuda-graph-max-bs 8
         2>&1 | tee log.server.log &
 
     ```
-    You can add `--mm-enable-dp-encoder` when launch server, this command can reduces TTFT for multi-modal workloads under some testing conditions.
+    Please add **AITER_MOE_PADDING_SIZE=128** when launch server for fp8 model with tp8.
 
 # Curl request
-1. curl a single request to quickly check the functionality
+
+   curl a single request to quickly check the functionality
 
  
    Then curl a single quickly request
@@ -125,11 +137,11 @@ The benchmarks for Qwen3-Omni are conducted in three distinct scenarios.
 
 ## Image+Text
     ```bash
-    model=/models/Qwen3-Omni-30B-A3B-Instruct/
+    model=/models/Qwen3-Omni-30B-A3B-Instruct/ # or Use /models/Qwen3-Omni-30B-A3B-Instruct-FP8-Dynamic
 
     input_tokens=8000
     output_tokens=500
-    num_prompts=64
+    num_prompts=32
     max_concurrency=1
     image_count=10
     image_resolution=960x1280
@@ -163,11 +175,11 @@ The benchmarks for Qwen3-Omni are conducted in three distinct scenarios.
     ```
 ## Pure Text
     ```bash
-    model=/models/Qwen3-Omni-30B-A3B-Instruct/
+    model=/models/Qwen3-Omni-30B-A3B-Instruct/ # or Use /models/Qwen3-Omni-30B-A3B-Instruct-FP8-Dynamic
 
     input_tokens=8000
     output_tokens=500
-    num_prompts=64
+    num_prompts=32
     max_concurrency=1
     dataset_name="random-ids"
 
@@ -195,11 +207,11 @@ The benchmarks for Qwen3-Omni are conducted in three distinct scenarios.
 
 ## Audio+Text
     ```bash
-    model=/models/Qwen3-Omni-30B-A3B-Instruct/
+    model=/models/Qwen3-Omni-30B-A3B-Instruct/ # or Use /models/Qwen3-Omni-30B-A3B-Instruct-FP8-Dynamic
 
     input_tokens=2000
     output_tokens=20
-    num_prompts=64
+    num_prompts=32
     max_concurrency=1
     dataset_name="random-omni"
     audio_length=10
