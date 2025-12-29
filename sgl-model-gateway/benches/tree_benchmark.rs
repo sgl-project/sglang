@@ -788,13 +788,12 @@ fn bench_summary(c: &mut Criterion) {
     // Configuration constants
     const TREE_SIZE: usize = 10_000; // Realistic cache size
     const INSERT_POOL_SIZE: usize = 10_000; // Unique requests for insert tests
-    const NUM_THREADS: usize = 8;
-    const OPS_PER_THREAD: usize = 100;
+    const NUM_THREADS: usize = 64; // Match GPU runner's 64 CPU cores
+    const OPS_PER_THREAD: usize = 200;
 
     // Worker scaling configurations to test
-    // Using 2 representative counts (low/high) to keep CI runtime reasonable
-    // while still demonstrating scaling behavior
-    const WORKER_COUNTS: [usize; 2] = [10, 100];
+    // Full range to demonstrate scaling behavior on GPU runner
+    const WORKER_COUNTS: [usize; 4] = [10, 50, 100, 500];
 
     // Pre-generate requests for tree population and queries
     let requests = generate_realistic_requests(TREE_SIZE);
