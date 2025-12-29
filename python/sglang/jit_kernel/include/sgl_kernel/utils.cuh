@@ -12,6 +12,49 @@
 namespace device {
 
 inline constexpr auto kWarpThreads = 32u;
+inline constexpr auto kFullMask = 0xffffffffu;
+
+__device__ __forceinline__ float atomicMaxFloat(float* addr, float value) {
+#ifndef USE_ROCM
+  float old;
+  old = (value >= 0) ? __int_as_float(atomicMax((int*)addr, __float_as_int(value)))
+                     : __uint_as_float(atomicMin((unsigned int*)addr, __float_as_uint(value)));
+  return old;
+#else
+  int* addr_as_i = (int*)addr;
+  int old = *addr_as_i, assumed;
+  do {
+    assumed = old;
+    old = atomicCAS(addr_as_i, assumed, __float_as_int(fmaxf(value, __int_as_float(assumed))));
+  } while (assumed != old);
+  return __int_as_float(old);
+#endif
+}
+
+__device__ __forceinline__ float warpReduceMax(float value) {
+  value = fmaxf(value, __shfl_xor_sync(kFullMask, value, 16));
+  value = fmaxf(value, __shfl_xor_sync(kFullMask, value, 8));
+  value = fmaxf(value, __shfl_xor_sync(kFullMask, value, 4));
+  value = fmaxf(value, __shfl_xor_sync(kFullMask, value, 2));
+  value = fmaxf(value, __shfl_xor_sync(kFullMask, value, 1));
+  return value;
+}
+
+__device__ __forceinline__ float blockReduceMax(float value) {
+  static __shared__ float warpLevelMaxs[kWarpThreads];
+  const int laneId = threadIdx.x % kWarpThreads;
+  const int warpId = threadIdx.x / kWarpThreads;
+
+  value = warpReduceMax(value);
+
+  if (laneId == 0) warpLevelMaxs[warpId] = value;
+  __syncthreads();
+
+  value = (threadIdx.x < blockDim.x / kWarpThreads) ? warpLevelMaxs[laneId] : 0;
+  if (warpId == 0) value = warpReduceMax(value);
+
+  return value;
+}
 
 namespace pointer {
 
@@ -35,6 +78,24 @@ template <typename T, std::size_t N>
 struct device_vec {
   T data[N];
 };
+
+template <bool kUsePDL>
+__forceinline__ __device__ void PDLWaitPrimary() {
+#ifndef USE_ROCM
+  if constexpr (kUsePDL) {
+    asm volatile("griddepcontrol.wait;");
+  }
+#endif
+}
+
+template <bool kUsePDL>
+__forceinline__ __device__ void PDLTriggerSecondary() {
+#ifndef USE_ROCM
+  if constexpr (kUsePDL) {
+    asm volatile("griddepcontrol.launch_dependents;");
+  }
+#endif
+}
 
 }  // namespace device
 
@@ -77,6 +138,18 @@ struct LaunchKernel {
     return static_cast<cudaStream_t>(::TVMFFIEnvGetStream(device.device_type, device.device_id));
   }
 
+  auto enable_pdl(bool enabled = true) -> LaunchKernel& {
+    if (enabled) {
+      m_attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+      m_attrs[0].val.programmaticStreamSerializationAllowed = true;
+      m_config.numAttrs = 1;
+      m_config.attrs = m_attrs;
+    } else {
+      m_config.numAttrs = 0;
+    }
+    return *this;
+  }
+
   template <typename T, typename... Args>
   auto operator()(T&& kernel, Args&&... args) const -> void {
     RuntimeDeviceCheck(::cudaLaunchKernelEx(&m_config, kernel, std::forward<Args>(args)...), m_location);
@@ -99,7 +172,7 @@ struct LaunchKernel {
 
   cudaLaunchConfig_t m_config;
   const DebugInfo m_location;
-  /// TODO: We can add a queue to store the attributes (e.g. for PDL) if needed in the future.
+  cudaLaunchAttribute m_attrs[1];
 };
 
 }  // namespace host

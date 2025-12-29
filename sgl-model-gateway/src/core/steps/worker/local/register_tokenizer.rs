@@ -8,7 +8,7 @@ use tracing::{debug, warn};
 use crate::{
     app_context::AppContext,
     core::Worker,
-    tokenizer::factory,
+    tokenizer::{factory, TokenizerRegistry},
     workflow::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowResult},
 };
 
@@ -47,10 +47,14 @@ impl StepExecutor for RegisterTokenizerStep {
                 model_id, tokenizer_path
             );
 
+            // Generate ID for this tokenizer
+            let tokenizer_id = TokenizerRegistry::generate_id();
+            let source = tokenizer_path.clone();
+
             // Load tokenizer with thread safe lock
             if let Err(e) = app_context
                 .tokenizer_registry
-                .load(&model_id, || async move {
+                .load(&tokenizer_id, &model_id, &source, || async move {
                     factory::create_tokenizer_async(&tokenizer_path.to_string())
                         .await
                         .map_err(|e| e.to_string())
@@ -59,12 +63,12 @@ impl StepExecutor for RegisterTokenizerStep {
             {
                 warn!(
                     "Failed to load tokenizer for model {} from {}: {}",
-                    model_id, tokenizer_path, e
+                    model_id, source, e
                 );
             } else {
                 debug!(
                     "Successfully registered tokenizer for model {} from {}",
-                    model_id, tokenizer_path
+                    model_id, source
                 );
             }
         }

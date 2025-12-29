@@ -74,7 +74,11 @@ from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
-from sglang.srt.metrics.collector import SchedulerMetricsCollector, TimeStats
+from sglang.srt.metrics.collector import (
+    DPCooperationInfo,
+    SchedulerMetricsCollector,
+    TimeStats,
+)
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -334,8 +338,18 @@ class MultimodalInputs:
 
     @staticmethod
     def from_dict(obj: dict):
+        # Check if MM splitting is enabled
+        if not envs.SGLANG_ENABLE_MM_SPLITTING.get():
+            mm_items = obj["mm_items"]
+        else:
+            from sglang.srt.managers.mm_utils import get_new_expanded_mm_items
+
+            original_mm_items = obj["mm_items"]
+            # Now, `mm_items` contains one item per image.
+            mm_items = get_new_expanded_mm_items(original_mm_items)
+
         ret = MultimodalInputs(
-            mm_items=obj["mm_items"],
+            mm_items=mm_items,
         )
 
         assert isinstance(ret.mm_items, list)
@@ -837,7 +851,7 @@ class Req:
         input_len = len(self.fill_ids)
         # NOTE: the matched length is at most 1 less than the input length to enable logprob computation
         max_prefix_len = input_len - 1
-        if self.return_logprob:
+        if self.return_logprob and self.logprob_start_len >= 0:
             max_prefix_len = min(max_prefix_len, self.logprob_start_len)
         max_prefix_len = max(max_prefix_len, 0)
         token_ids = self.fill_ids[:max_prefix_len]
@@ -1087,13 +1101,15 @@ class Req:
 
     def log_time_stats(self):
         # If overlap schedule, we schedule one decode batch ahead so this gets called twice.
-        if self.has_log_time_stats is True:
+        if self.has_log_time_stats:
             return
 
-        if self.bootstrap_room is not None:
-            prefix = f"Req Time Stats(rid={self.rid}, bootstrap_room={self.bootstrap_room}, input len={len(self.origin_input_ids)}, output len={len(self.output_ids)}, type={self.time_stats.disagg_mode_str()})"
-        else:
-            prefix = f"Req Time Stats(rid={self.rid}, input len={len(self.origin_input_ids)}, output len={len(self.output_ids)}, type={self.time_stats.disagg_mode_str()})"
+        bootstrap_info = (
+            f", bootstrap_room={self.bootstrap_room}"
+            if self.bootstrap_room is not None
+            else ""
+        )
+        prefix = f"Req Time Stats(rid={self.rid}{bootstrap_info}, input len={len(self.origin_input_ids)}, output len={len(self.output_ids)}, type={self.time_stats.disagg_mode_str()})"
         logger.info(f"{prefix}: {self.time_stats.convert_to_duration()}")
         self.has_log_time_stats = True
 
@@ -1104,6 +1120,7 @@ class Req:
         self.grammar = None
         self.origin_input_ids = [0]  # set it to one token to skip the long prefill
         self.return_logprob = False
+        self.logprob_start_len = -1
         self.to_finish = FINISH_ABORT(
             error_msg, HTTPStatus.BAD_REQUEST, "BadRequestError"
         )
@@ -1238,6 +1255,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     # Diffusion LLM
     dllm_config: Optional[DllmConfig] = None
+
+    # Metrics
+    dp_cooperation_info: Optional[DPCooperationInfo] = None
 
     @classmethod
     def init_new(
@@ -1471,26 +1491,16 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             #   (= len(fill_ids) - len(prefix_indices), where fill_ids = origin_input_ids + output_ids
             #    and prefix_indices are the cached/shared prefix tokens)
             #
-            if req.logprob_start_len >= pre_len:
-                # Optimization for prefill-only requests: When we only need logprobs at
-                # positions beyond the input sequence (to score next-token likelihood), skip all
-                # input logprob computation during prefill since no generation will occur.
-                if self.is_prefill_only and req.logprob_start_len == len(
-                    req.origin_input_ids
-                ):
-                    # Skip ALL input logprobs: set extend_logprob_start_len = extend_input_len
-                    req.extend_logprob_start_len = req.extend_input_len
-                else:
-                    # Convert absolute logprob_start_len to relative extend_logprob_start_len
-                    #
-                    # Example: origin_input_ids=[1,2,3,4,5] (5 tokens, positions 0-4), logprob_start_len=3
-                    # Regular logic: min(3-0, 5, 5-1) = min(3,5,4) = 3
-                    # This means: "compute logprobs from position 3 onwards in extend batch"
-                    req.extend_logprob_start_len = min(
-                        req.logprob_start_len - pre_len,
-                        req.extend_input_len,
-                        req.seqlen - 1,
-                    )
+            if req.logprob_start_len == -1:
+                req.extend_logprob_start_len = min(
+                    len(req.fill_ids) - 1 - pre_len,
+                    req.extend_input_len,
+                )
+            elif req.logprob_start_len >= pre_len:
+                req.extend_logprob_start_len = min(
+                    req.logprob_start_len - pre_len,
+                    req.extend_input_len,
+                )
             else:
                 # logprob_start_len is before the current extend batch, so start from beginning
                 req.extend_logprob_start_len = 0
@@ -1513,9 +1523,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     len(req.prefix_indices),
                     len(req.fill_ids),
                 )
+                if req.logprob_start_len == -1:
+                    logprob_start_len = len(req.origin_input_ids) - 1
+                else:
+                    logprob_start_len = req.logprob_start_len
                 # Apply logprob_start_len
-                if global_start_idx < req.logprob_start_len:
-                    global_start_idx = req.logprob_start_len
+                if global_start_idx < logprob_start_len:
+                    global_start_idx = logprob_start_len
 
                 logprob_token_ids = req.origin_input_ids[
                     global_start_idx + 1 : global_end_idx + 1
@@ -1835,16 +1849,16 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         )
 
     @property
-    def is_eagle_v2(self):
-        # FIXME: finally deprecate is_eagle_v2
+    def is_spec_v2(self):
+        # FIXME: finally deprecate is_spec_v2
         return self.enable_overlap and self.spec_algorithm.is_eagle()
 
     def prepare_for_decode(self):
         self.forward_mode = ForwardMode.DECODE
         bs = len(self.reqs)
 
-        if self.is_eagle_v2:
-            # TODO(spec-v2): all v2 spec should go through this path
+        if self.is_spec_v2:
+            # TODO(spec-v2): all spec v2 should go through this path
             draft_input: EagleDraftInput = self.spec_info
             draft_input.prepare_for_decode(self)
 
@@ -1923,7 +1937,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             )
 
     def maybe_wait_verify_done(self):
-        if self.is_eagle_v2:
+        if self.is_spec_v2:
             draft_input: EagleDraftInput = self.spec_info
             if draft_input.verify_done is not None:
                 draft_input.verify_done.synchronize()
@@ -1977,7 +1991,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.orig_seq_lens = self.orig_seq_lens[keep_indices_device]
         self.out_cache_loc = None
         self.seq_lens_sum = self.seq_lens.sum().item()
-        self.output_ids = self.output_ids[keep_indices_device]
+
+        if self.output_ids is not None:
+            self.output_ids = self.output_ids[keep_indices_device]
+
         self.mamba_track_indices = None
         self.mamba_track_mask = None
         self.mamba_track_seqlens = None
@@ -1996,7 +2013,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # NOTE: spec_info filtered before batch filtering only happens in:
         # - Spec v1's verify phase
         # - Only for decode batch (running_batch)
-        has_been_filtered = v1_spec_info_filtered and not self.is_eagle_v2
+        has_been_filtered = v1_spec_info_filtered and not self.is_spec_v2
 
         if self.spec_info:
             self.spec_info.filter_batch(
@@ -2005,7 +2022,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             )
 
     def merge_batch(self, other: "ScheduleBatch"):
-        # NOTE: in v2 eagle mode, we do not need wait verify here because
+        # NOTE: in spec v2 mode, we do not need wait verify here because
         # 1) current batch is always prefill, whose seq_lens is not a future
         # 2) other batch is always decode, which is finished in previous step
 
@@ -2151,6 +2168,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             mamba_track_indices=self.mamba_track_indices,
             mamba_track_mask=self.mamba_track_mask,
             mamba_track_seqlens=self.mamba_track_seqlens,
+            dp_cooperation_info=self.dp_cooperation_info,
         )
 
     def _is_available_size_sufficient(self, num_tokens: int) -> bool:

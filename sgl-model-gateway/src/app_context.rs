@@ -8,7 +8,7 @@ use tracing::{debug, info};
 
 use crate::{
     config::RouterConfig,
-    core::{ConnectionMode, JobQueue, LoadMonitor, WorkerRegistry, WorkerService},
+    core::{JobQueue, LoadMonitor, WorkerRegistry, WorkerService, UNKNOWN_MODEL_ID},
     data_connector::{
         create_storage, ConversationItemStorage, ConversationStorage, ResponseStorage,
     },
@@ -288,8 +288,8 @@ impl AppContextBuilder {
             .with_client(&router_config, request_timeout_secs)?
             .maybe_rate_limiter(&router_config)
             .with_tokenizer_registry(&router_config)?
-            .maybe_reasoning_parser_factory(&router_config)
-            .maybe_tool_parser_factory(&router_config)
+            .with_reasoning_parser_factory()
+            .with_tool_parser_factory()
             .with_worker_registry()
             .with_policy_registry(&router_config)
             .with_storage(&router_config)?
@@ -433,43 +433,43 @@ impl AppContextBuilder {
         Ok(Some(tokenizer))
     }
 
-    /// Create reasoning parser factory for gRPC mode
-    fn maybe_reasoning_parser_factory(mut self, config: &RouterConfig) -> Self {
-        if matches!(config.connection_mode, ConnectionMode::Grpc { .. }) {
-            self.reasoning_parser_factory = Some(ReasoningParserFactory::new());
-        }
+    /// Create reasoning parser factory for gRPC mode or IGW mode
+    fn with_reasoning_parser_factory(mut self) -> Self {
+        // Initialize reasoning parser factory
+        self.reasoning_parser_factory = Some(ReasoningParserFactory::new());
         self
     }
 
-    /// Create tool parser factory for gRPC mode
-    fn maybe_tool_parser_factory(mut self, config: &RouterConfig) -> Self {
-        if matches!(config.connection_mode, ConnectionMode::Grpc { .. }) {
-            self.tool_parser_factory = Some(ToolParserFactory::new());
-        }
+    /// Create tool parser factory for gRPC mode or IGW mode
+    fn with_tool_parser_factory(mut self) -> Self {
+        // Initialize tool parser factory
+        self.tool_parser_factory = Some(ToolParserFactory::new());
         self
     }
 
     /// Create tokenizer registry and optionally load tokenizer
     /// If a tokenizer is successfully loaded, it is registered with a key derived from
-    /// tokenizer_path or model_path (falling back to "unknown" if neither exists).
+    /// tokenizer_path or model_path (falling back to UNKNOWN_MODEL_ID if neither exists).
     fn with_tokenizer_registry(mut self, config: &RouterConfig) -> Result<Self, String> {
         // Create empty tokenizer registry
         let registry = Arc::new(TokenizerRegistry::new());
 
         // Try to load router-level tokenizer if path is provided
         if let Some(tokenizer) = Self::maybe_tokenizer(config)? {
-            // Determine registration key: prefer tokenizer_path, then model_path, finally "unknown"
-            let tokenizer_key = config
+            // Determine registration key: prefer tokenizer_path, then model_path, finally UNKNOWN_MODEL_ID
+            let source = config
                 .tokenizer_path
                 .as_ref()
                 .or(config.model_path.as_ref())
                 .map(|s| s.as_str())
-                .unwrap_or("unknown");
+                .unwrap_or(UNKNOWN_MODEL_ID);
 
-            registry.register(tokenizer_key, tokenizer.clone());
+            let tokenizer_id = TokenizerRegistry::generate_id();
+            registry.register(&tokenizer_id, source, source, tokenizer.clone());
             info!(
-                "Tokenizer loaded and registered with key '{}' (vocab_size: {})",
-                tokenizer_key,
+                "Tokenizer loaded and registered with name '{}' id={} (vocab_size: {})",
+                source,
+                tokenizer_id,
                 tokenizer.vocab_size()
             );
         }
