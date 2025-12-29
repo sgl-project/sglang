@@ -9,7 +9,7 @@ from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
     NPU_W4A4DynamicLinearMethod,
 )
 from sglang.srt.layers.parameter import PerTensorScaleParameter
-from sglang.srt.layers.quantization.msmodelslim.schemes import ModelSlimScheme
+from sglang.srt.layers.quantization.modelslim.schemes import ModelSlimScheme
 from sglang.srt.utils import set_weight_attrs
 
 

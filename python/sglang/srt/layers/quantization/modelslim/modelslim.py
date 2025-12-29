@@ -14,10 +14,8 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizeMethodBase,
 )
 from sglang.srt.layers.quantization.compressed_tensors.utils import should_ignore_layer
-from sglang.srt.layers.quantization.msmodelslim.msmodelslim_moe import (
-    ModelSlimMoEMethod,
-)
-from sglang.srt.layers.quantization.msmodelslim.schemes import (
+from sglang.srt.layers.quantization.modelslim.modelslim_moe import ModelSlimMoEMethod
+from sglang.srt.layers.quantization.modelslim.schemes import (
     ModelSlimScheme,
     ModelSlimW4A4Int4,
     ModelSlimW8A8Int8,

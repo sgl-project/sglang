@@ -20,7 +20,7 @@ if TYPE_CHECKING:
         CombineInput,
         StandardDispatchOutput,
     )
-    from sglang.srt.layers.quantization.msmodelslim.msmodelslim import ModelSlimConfig
+    from sglang.srt.layers.quantization.modelslim.modelslim import ModelSlimConfig
 
 logger = logging.getLogger(__name__)
 

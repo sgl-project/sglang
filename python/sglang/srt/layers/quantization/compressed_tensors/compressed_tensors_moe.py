@@ -1314,7 +1314,7 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
 
 class NPUCompressedTensorsW4A8Int8DynamicMoEMethod(CompressedTensorsMoEMethod):
 
-    ### TODO: Get rid of code duplication with python/sglang/srt/msmodelslim/msmodelslim_moe.py @OrangeRedeng @TamirBaydasov
+    ### TODO: Get rid of code duplication with python/sglang/srt/modelslim/modelslim_moe.py @OrangeRedeng @TamirBaydasov
     def __init__(self, quantization_config) -> None:
         self.group_size = 0
         self.is_per_channel_weight = self.group_size == 0
