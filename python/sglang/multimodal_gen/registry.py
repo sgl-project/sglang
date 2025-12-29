@@ -324,7 +324,7 @@ def _register_configs():
         sampling_param_cls=WanT2V_1_3B_SamplingParams,
         pipeline_config_cls=TurboWanT2V480PConfig,
         hf_model_paths=[
-            "Wan-AI/TurboWan2.1-T2V-1.3B-Diffusers",
+            "IPostYellow/TurboWan2.1-T2V-1.3B-Diffusers",
         ],
     )
     register_configs(
@@ -332,6 +332,13 @@ def _register_configs():
         pipeline_config_cls=WanT2V720PConfig,
         hf_model_paths=[
             "Wan-AI/Wan2.1-T2V-14B-Diffusers",
+        ],
+    )
+    register_configs(
+        sampling_param_cls=WanT2V_14B_SamplingParams,
+        pipeline_config_cls=TurboWanT2V480PConfig,
+        hf_model_paths=[
+            "IPostYellow/TurboWan2.1-T2V-14B-Diffusers",
         ],
     )
     register_configs(
