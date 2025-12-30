@@ -31,6 +31,7 @@ pip install mf-adapter==1.0.0
 #### Pytorch and Pytorch Framework Adaptor on Ascend
 
 At the moment NPUGraph optimizations are supported only in `torch_npu==2.6.0.post3` that requires 'torch==2.6.0'.
+
 _TODO: NPUGraph optimizations will be supported in future releases of 'torch_npu' 2.7.1, 2.8.0 and 2.9.0_
 
 ```shell
@@ -41,7 +42,7 @@ pip install torch==$PYTORCH_VERSION torchvision==$TORCHVISION_VERSION --index-ur
 pip install torch_npu==$TORCH_NPU_VERSION
 ```
 
-While there is no resleased versions of 'torch_npu' for 'torch==2.7.1' and 'torch==2.8.0' we provide custom builds of 'torch_npu'. PLATFORM can be 'aarch64' or 'x86_64'
+While there is no released versions of 'torch_npu' for 'torch==2.7.1' and 'torch==2.8.0' we provide custom builds of 'torch_npu'. PLATFORM can be 'aarch64' or 'x86_64'
 
 ```shell
 PLATFORM="aarch64"
@@ -52,7 +53,7 @@ wget https://sglang-ascend.obs.cn-east-3.myhuaweicloud.com/sglang/torch_npu/torc
 pip install torch_npu-${PYTORCH_VERSION}.post2.dev20251120-cp311-cp311-manylinux_2_28_${PLATFORM}.whl
 ```
 
-If you are using other versions of 'torch' install 'torch_npu' from sources, check [installation guide](https://github.com/Ascend/pytorch/blob/master/README.md)
+If you are using other versions of `torch` and install `torch_npu`, check [installation guide](https://github.com/Ascend/pytorch/blob/master/README.md)
 
 #### Triton on Ascend
 
@@ -69,7 +70,7 @@ pip install triton-ascend==3.2.0rc4
 For installation of Triton on Ascend nightly builds or from sources, follow [installation guide](https://gitcode.com/Ascend/triton-ascend/blob/master/docs/sources/getting-started/installation.md)
 
 #### SGLang Kernels NPU
-We provide our own set of SGL kernels, check [installation guide](https://github.com/sgl-project/sgl-kernel-npu/blob/main/python/sgl_kernel_npu/README.md).
+We provide SGL kernels for Ascend NPU, check [installation guide](https://github.com/sgl-project/sgl-kernel-npu/blob/main/python/sgl_kernel_npu/README.md).
 
 #### DeepEP-compatible Library
 We provide a DeepEP-compatible Library as a drop-in replacement of deepseek-ai's DeepEP library, check the [installation guide](https://github.com/sgl-project/sgl-kernel-npu/blob/main/python/deep_ep/README.md).
@@ -97,7 +98,7 @@ mv python/pyproject_other.toml python/pyproject.toml
 pip install -e python[srt_npu]
 ```
 
-### Method 2: Using docker
+### Method 2: Using Docker Image
 #### Obtain Image
 You can download the SGLang image or build an image based on Dockerfile to obtain the Ascend NPU image.
 1. Download SGLang image
@@ -136,10 +137,10 @@ alias drun='docker run -it --rm --privileged --network=host --ipc=host --shm-siz
     --volume /etc/ascend_install.info:/etc/ascend_install.info \
     --volume /var/queue_schedule:/var/queue_schedule --volume ~/.cache/:/root/.cache/'
 
-# Add HF_TOKEN env for download model by SGLang
+# Add HF_TOKEN env for download model by SGLang.
 drun --env "HF_TOKEN=<secret>" \
     <image_name> \
-    python3 -m sglang.launch_server --model-path meta-llama/Llama-3.1-8B-Instruct --attention-backend ascend --host 0.0.0.0 --port 30000
+    python3 -m sglang.launch_server --model-path meta-llama/Llama-3.1-8B-Instruct --attention-backend ascend
 ```
 
 ## System Settings
@@ -159,7 +160,6 @@ cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor # shows performance
 
 ```shell
 sudo sysctl -w kernel.numa_balancing=0
-
 # Check
 cat /proc/sys/kernel/numa_balancing # shows 0
 ```
@@ -177,13 +177,20 @@ cat /proc/sys/vm/swappiness # shows 10
 ### Running Service For Large Language Models
 #### PD Mixed Scene
 ```shell
-python3 -m sglang.launch_server --model-path meta-llama/Llama-3.1-8B-Instruct --attention-backend ascend --host 0.0.0.0 --port 30000
-```
-#### PD Separation Scene
-Launch prefill server
-```shell
+# Enabling CPU Affinity
 export SGLANG_SET_CPU_AFFINITY=1
-# PIP: recommended to config first Prefill Server IP, all server need to be config the same ip, PORT: one free port
+python3 -m sglang.launch_server --model-path meta-llama/Llama-3.1-8B-Instruct --attention-backend ascend
+```
+
+#### PD Separation Scene
+1. Launch Prefill Server
+```shell
+# Enabling CPU Affinity
+export SGLANG_SET_CPU_AFFINITY=1
+
+# PIP: recommended to config first Prefill Server IP
+# PORT: one free port
+# all sglang servers need to be config the same PIP and PORT,
 export ASCEND_MF_STORE_URL="tcp://PIP:PORT"
 # if you are Atlas 800I A2 hardware and use rdma for kv cache transfer, add this parameter
 export ASCEND_MF_TRANSFER_PROTOCOL="device_rdma"
@@ -196,13 +203,13 @@ python3 -m sglang.launch_server \
     --device npu \
     --base-gpu-id 0 \
     --tp-size 1 \
-    --host 127.0.0.1  \
-    --port 8000
 ```
-Launch Decode server
+
+2. Launch Decode Server
 ```shell
-export SGLANG_SET_CPU_AFFINITY=1
-# PIP: recommended to config first Prefill Server IP, all server need to be config the same ip, PORT: one free port
+# PIP: recommended to config first Prefill Server IP
+# PORT: one free port
+# all sglang servers need to be config the same PIP and PORT,
 export ASCEND_MF_STORE_URL="tcp://PIP:PORT"
 # if you are Atlas 800I A2 hardware and use rdma for kv cache transfer, add this parameter
 export ASCEND_MF_TRANSFER_PROTOCOL="device_rdma"
@@ -218,7 +225,7 @@ python3 -m sglang.launch_server \
     --port 8001
 ```
 
-Launch Router
+3. Launch Router
 ```shell
 python3 -m sglang_router.launch_router \
     --pd-disaggregation \
