@@ -129,6 +129,7 @@ class NightlyBenchmarkRunner:
             profile_path_prefix,
             f"--pydantic-result-filename={json_output_file}",
             "--no-append-to-github-summary",
+            "--trust-remote-code",
         ]
 
         if extra_args:

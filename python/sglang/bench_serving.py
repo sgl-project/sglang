@@ -50,6 +50,7 @@ from transformers import (
 )
 
 ASSISTANT_SUFFIX = "Assistant:"
+_ROUTING_KEY_HEADER = "X-SMG-Routing-Key"
 
 TERM_PLOTLIB_AVAILABLE = (importlib.util.find_spec("termplotlib") is not None) and (
     shutil.which("gnuplot") is not None
@@ -88,7 +89,7 @@ class RequestFuncInput:
     image_data: Optional[List[str]]
     extra_request_body: Dict[str, Any]
     timestamp: Optional[float] = None
-    routing_id: Optional[str] = None
+    routing_key: Optional[str] = None
 
 
 @dataclass
@@ -234,10 +235,9 @@ async def async_request_openai_completions(
         if request_func_input.image_data:
             payload.update({"image_data": request_func_input.image_data})
 
-        if request_func_input.routing_id:
-            payload["routing_id"] = request_func_input.routing_id
-
         headers = get_auth_headers()
+        if request_func_input.routing_key:
+            headers[_ROUTING_KEY_HEADER] = request_func_input.routing_key
 
         output = RequestFuncOutput.init_new(request_func_input)
 
@@ -374,10 +374,9 @@ async def async_request_openai_chat_completions(
             payload["model"] = request_func_input.lora_name
             payload["lora_path"] = request_func_input.lora_name
 
-        if request_func_input.routing_id:
-            payload["routing_id"] = request_func_input.routing_id
-
         headers = get_auth_headers()
+        if request_func_input.routing_key:
+            headers[_ROUTING_KEY_HEADER] = request_func_input.routing_key
 
         output = RequestFuncOutput.init_new(request_func_input)
 
@@ -581,10 +580,9 @@ async def async_request_sglang_generate(
         if request_func_input.image_data:
             payload["image_data"] = request_func_input.image_data
 
-        if request_func_input.routing_id:
-            payload["routing_id"] = request_func_input.routing_id
-
         headers = get_auth_headers()
+        if request_func_input.routing_key:
+            headers[_ROUTING_KEY_HEADER] = request_func_input.routing_key
 
         output = RequestFuncOutput.init_new(request_func_input)
 
@@ -872,6 +870,17 @@ def get_dataset(args, tokenizer, model_id=None):
 
         # Limit the number of requests based on --num-prompts
         input_requests = all_requests_data[: args.num_prompts]
+    elif args.dataset_name == "custom":
+        assert not tokenize_prompt
+        input_requests = sample_custom_requests(
+            dataset_path=args.dataset_path,
+            num_requests=args.num_prompts,
+            tokenizer=tokenizer,
+            fixed_output_len=args.sharegpt_output_len,
+            context_len=args.sharegpt_context_len,
+            prompt_suffix=args.prompt_suffix,
+            apply_chat_template=args.apply_chat_template,
+        )
     else:
         raise ValueError(f"Unknown dataset: {args.dataset_name}")
     return input_requests
@@ -1009,7 +1018,7 @@ class DatasetRow:
     vision_prompt_len: Optional[int] = None
     image_data: Optional[List[str]] = None
     timestamp: Optional[float] = None
-    routing_id: Optional[str] = None
+    routing_key: Optional[str] = None
 
     def __post_init__(self):
         if self.text_prompt_len is None:
@@ -1230,6 +1239,102 @@ def sample_sharegpt_requests(
 
         # Tokenize the prompts and completions.
         prompt = dataset[i][0]
+        if prompt_suffix:
+            prompt = (
+                remove_suffix(prompt, ASSISTANT_SUFFIX)
+                + prompt_suffix
+                + ASSISTANT_SUFFIX
+            )
+
+        if apply_chat_template:
+            prompt = tokenizer.apply_chat_template(
+                [{"role": "user", "content": prompt}],
+                add_generation_prompt=True,
+                tokenize=False,
+                return_dict=False,
+            )
+            if tokenizer.bos_token:
+                prompt = prompt.replace(tokenizer.bos_token, "")
+
+        prompt_token_ids = tokenizer.encode(prompt)
+        completion = dataset[i][1]
+        completion_token_ids = tokenizer.encode(completion)
+        prompt_len = len(prompt_token_ids)
+        output_len = (
+            len(completion_token_ids) if fixed_output_len is None else fixed_output_len
+        )
+
+        if prompt_len < 2 or output_len < 2:
+            # Prune too short sequences.
+            continue
+
+        if context_len and prompt_len + output_len > context_len:
+            # Prune too long sequences.
+            continue
+
+        filtered_dataset.append(
+            DatasetRow(
+                prompt=prompt,
+                prompt_len=prompt_len,
+                output_len=output_len,
+            )
+        )
+
+    print(f"#Input tokens: {np.sum([x.prompt_len for x in filtered_dataset])}")
+    print(f"#Output tokens: {np.sum([x.output_len for x in filtered_dataset])}")
+    return filtered_dataset
+
+
+def sample_custom_requests(
+    dataset_path: str,
+    num_requests: int,
+    tokenizer: PreTrainedTokenizerBase,
+    fixed_output_len: Optional[int] = None,
+    context_len: Optional[int] = None,
+    prompt_suffix: Optional[str] = "",
+    apply_chat_template=False,
+) -> List[DatasetRow]:
+    """
+    Sample requests from a custom JSONL dataset: supports 'content'/'value' as conversation keys.
+    """
+    if fixed_output_len is not None and fixed_output_len < 4:
+        raise ValueError("output_len too small")
+
+    # Load the dataset
+    dataset = []
+    if not os.path.isfile(dataset_path):
+        raise FileNotFoundError(f"Dataset not found at {dataset_path}")
+
+    with open(dataset_path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:  # skip empty lines
+                try:
+                    dataset.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue  # skip lines with JSON errors
+
+    # Filter out the conversations with less than 2 turns.
+    processed_dataset = []
+    for data in dataset:
+        convs = data.get("conversations", data.get("conversation", []))
+        if len(convs) >= 2:
+            user_turn = convs[0].get("content", convs[0].get("value", ""))
+            assist_turn = convs[1].get("content", convs[1].get("value", ""))
+            processed_dataset.append((user_turn, assist_turn))
+    dataset = processed_dataset
+    random.shuffle(dataset)
+
+    # Filter out sequences that are too long or too short
+    filtered_dataset: List[DatasetRow] = []
+
+    for i in range(len(dataset)):
+        if len(filtered_dataset) == num_requests:
+            break
+
+        # Tokenize the prompts and completions.
+        prompt = dataset[i][0]
+
         if prompt_suffix:
             prompt = (
                 remove_suffix(prompt, ASSISTANT_SUFFIX)
@@ -1661,10 +1766,10 @@ def sample_generated_shared_prefix_requests(
     args: argparse.Namespace,
 ) -> List[DatasetRow]:
     """Generate benchmark requests with shared system prompts using random tokens and caching."""
-    send_routing_id = getattr(args, "gsp_send_routing_id", False)
+    send_routing_key = getattr(args, "gsp_send_routing_key", False)
 
     cache_path = get_gen_prefix_cache_path(args, tokenizer)
-    should_cache = (range_ratio == 1) and not send_routing_id
+    should_cache = (range_ratio == 1) and not send_routing_key
 
     # Try to load from cache first
     if cache_path.exists() and should_cache:
@@ -1716,9 +1821,9 @@ def sample_generated_shared_prefix_requests(
 
     for group_idx in tqdm(range(num_groups), desc="Generating system prompt"):
         system_prompt = system_prompts[group_idx]
-        routing_id = (
+        routing_key = (
             f"{run_random_str}_{run_start_timestamp}_{group_idx}"
-            if send_routing_id
+            if send_routing_key
             else None
         )
         for prompt_idx in tqdm(
@@ -1738,7 +1843,7 @@ def sample_generated_shared_prefix_requests(
                     prompt=full_prompt,
                     prompt_len=prompt_len,
                     output_len=output_lens[flat_index].item(),
-                    routing_id=routing_id,
+                    routing_key=routing_key,
                 )
             )
             total_input_tokens += prompt_len
@@ -2175,7 +2280,7 @@ async def benchmark(
             image_data=request.image_data,
             extra_request_body=extra_request_body,
             timestamp=request.timestamp,
-            routing_id=request.routing_id,
+            routing_key=request.routing_key,
         )
 
         tasks.append(
@@ -2689,6 +2794,7 @@ if __name__ == "__main__":
         default="sharegpt",
         choices=[
             "sharegpt",
+            "custom",
             "random",
             "random-ids",
             "generated-shared-prefix",
@@ -3005,9 +3111,9 @@ if __name__ == "__main__":
         help="Speedup preparing by removing statistics computation, which will make some output statistics inaccurate but suitable for pressure tests.",
     )
     group.add_argument(
-        "--gsp-send-routing-id",
+        "--gsp-send-routing-key",
         action="store_true",
-        help="Send routing_id in requests. Requests with the same prefix share the same routing_id.",
+        help="Send routing key in requests via X-SMG-Routing-Key header. Requests with the same prefix share the same routing key.",
     )
     mooncake_group = parser.add_argument_group("mooncake dataset arguments")
     mooncake_group.add_argument(
