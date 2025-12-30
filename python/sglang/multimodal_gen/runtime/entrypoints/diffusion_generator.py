@@ -145,12 +145,12 @@ class DiffGenerator:
         if not sync_scheduler_client.ping():
             raise ConnectionError(
                 f"Could not connect to remote scheduler at "
-                f"{self.server_args.scheduler_endpoint()} with `local mode` as False. "
+                f"{self.server_args.scheduler_endpoint} with `local mode` as False. "
                 "Please ensure the server is running."
             )
         logger.info(
             f"Successfully connected to remote scheduler at "
-            f"{self.server_args.scheduler_endpoint()}."
+            f"{self.server_args.scheduler_endpoint}."
         )
 
     def generate(
