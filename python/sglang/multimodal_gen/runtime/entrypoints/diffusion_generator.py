@@ -145,12 +145,12 @@ class DiffGenerator:
         if not sync_scheduler_client.ping():
             raise ConnectionError(
                 f"Could not connect to remote scheduler at "
-                f"{self.server_args.scheduler_endpoint()} with `local mode` as False. "
+                f"{self.server_args.scheduler_endpoint} with `local mode` as False. "
                 "Please ensure the server is running."
             )
         logger.info(
             f"Successfully connected to remote scheduler at "
-            f"{self.server_args.scheduler_endpoint()}."
+            f"{self.server_args.scheduler_endpoint}."
         )
 
     def generate(
@@ -183,14 +183,13 @@ class DiffGenerator:
                 raise ValueError(f"No prompts found in file: {prompt_txt_path}")
 
             logger.info("Found %d prompts in %s", len(prompts), prompt_txt_path)
-        elif prompt is not None:
+        else:
+            if prompt is None:
+                prompt = " "
             if isinstance(prompt, str):
                 prompts.append(prompt)
             elif isinstance(prompt, list):
                 prompts.extend(prompt)
-        else:
-            raise ValueError("Either prompt or prompt_txt must be provided")
-
         sampling_params = SamplingParams.from_user_sampling_params_args(
             self.server_args.model_path,
             server_args=self.server_args,
