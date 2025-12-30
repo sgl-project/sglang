@@ -422,7 +422,9 @@ jobs:
 
   jit-kernel-unit-test:
     needs: [check-changes, call-gate]
-    if: needs.check-changes.outputs.jit_kernel == 'true'
+    if: |
+      !inputs.target_stage &&
+      needs.check-changes.outputs.jit_kernel == 'true'
     runs-on: 1-gpu-runner
     env:
       RUNNER_LABELS: 1-gpu-runner
