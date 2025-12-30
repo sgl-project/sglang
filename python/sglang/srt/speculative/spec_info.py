@@ -50,8 +50,9 @@ class SpeculativeAlgorithm(Enum):
 
     def create_worker(
         self, enable_overlap: bool = False
-    ) -> Union[Type[BaseSpecWorker], Type[TpModelWorker], Type[NGRAMWorker]]:
-        assert not self.is_none()
+    ) -> Optional[Union[Type[BaseSpecWorker], Type[TpModelWorker], Type[NGRAMWorker]]]:
+        if self.is_none():
+            return None
 
         if self.is_eagle():
             if enable_overlap:
