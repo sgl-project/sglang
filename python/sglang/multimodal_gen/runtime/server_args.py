@@ -12,12 +12,11 @@ import os
 import random
 import sys
 import tempfile
-from contextlib import contextmanager
 from dataclasses import field
 from enum import Enum
 from typing import Any, Optional
 
-from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig, STA_Mode
+from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
 from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
     current_platform,
@@ -199,22 +198,10 @@ class ServerArgs:
     use_fsdp_inference: bool = False
     pin_cpu_memory: bool = True
 
-    # STA (Sliding Tile Attention) parameters
-    mask_strategy_file_path: str | None = None
-    STA_mode: STA_Mode = STA_Mode.STA_INFERENCE
-    skip_time_steps: int = 15
-
     # Compilation
     enable_torch_compile: bool = False
 
     disable_autocast: bool | None = None
-
-    # VSA parameters
-    VSA_sparsity: float = 0.0  # inference/validation sparsity
-
-    # V-MoBA parameters
-    moba_config_path: str | None = None
-    moba_config: dict[str, Any] = field(default_factory=dict)
 
     # Master port for distributed inference
     # TODO: do not hard code
@@ -298,17 +285,6 @@ class ServerArgs:
         # TODO: remove hard code
         initial_master_port = (self.master_port or 30005) + random.randint(0, 100)
         self.master_port = self.settle_port(initial_master_port, 37)
-        if self.moba_config_path:
-            try:
-                with open(self.moba_config_path) as f:
-                    self.moba_config = json.load(f)
-                logger.info("Loaded V-MoBA config from %s", self.moba_config_path)
-            except (FileNotFoundError, json.JSONDecodeError) as e:
-                logger.error(
-                    "Failed to load V-MoBA config from %s: %s", self.moba_config_path, e
-                )
-                raise
-
         self.check_server_args()
 
         # log clean server_args
@@ -430,25 +406,6 @@ class ServerArgs:
             help="Path to a text file containing prompts (one per line) for batch processing",
         )
 
-        # STA (Sliding Tile Attention) parameters
-        parser.add_argument(
-            "--STA-mode",
-            type=str,
-            default=ServerArgs.STA_mode.value,
-            choices=[mode.value for mode in STA_Mode],
-            help="STA mode contains STA_inference, STA_searching, STA_tuning, STA_tuning_cfg, None",
-        )
-        parser.add_argument(
-            "--skip-time-steps",
-            type=int,
-            default=ServerArgs.skip_time_steps,
-            help="Number of time steps to warmup (full attention) for STA",
-        )
-        parser.add_argument(
-            "--mask-strategy-file-path",
-            type=str,
-            help="Path to mask strategy JSON file for STA",
-        )
         parser.add_argument(
             "--enable-torch-compile",
             action=StoreBoolean,
@@ -498,14 +455,6 @@ class ServerArgs:
             "--disable-autocast",
             action=StoreBoolean,
             help="Disable autocast for denoising loop and vae decoding in pipeline sampling",
-        )
-
-        # VSA parameters
-        parser.add_argument(
-            "--VSA-sparsity",
-            type=float,
-            default=ServerArgs.VSA_sparsity,
-            help="Validation sparsity for VSA",
         )
 
         # Master port for distributed inference
@@ -911,8 +860,6 @@ class PortArgs:
         )
 
 
-# TODO: not sure what _current_server_args is for, using a _global_server_args instead
-_current_server_args = None
 _global_server_args = None
 
 
@@ -936,40 +883,12 @@ def prepare_server_args(argv: list[str]) -> ServerArgs:
     return server_args
 
 
-@contextmanager
-def set_current_server_args(server_args: ServerArgs):
-    """
-    Temporarily set the current sgl_diffusion config.
-    Used during model initialization.
-    We save the current sgl_diffusion config in a global variable,
-    so that all modules can access it, e.g. custom ops
-    can access the sgl_diffusion config to determine how to dispatch.
-    """
-    global _current_server_args
-    old_server_args = _current_server_args
-    try:
-        _current_server_args = server_args
-        yield
-    finally:
-        _current_server_args = old_server_args
-
-
 def set_global_server_args(server_args: ServerArgs):
     """
     Set the global sgl_diffusion config for each process
     """
     global _global_server_args
     _global_server_args = server_args
-
-
-def get_current_server_args() -> ServerArgs | None:
-    if _current_server_args is None:
-        # in ci, usually when we test custom ops/modules directly,
-        # we don't set the sgl_diffusion config. In that case, we set a default
-        # config.
-        # TODO(will): may need to handle this for CI.
-        raise ValueError("Current sgl_diffusion args is not set.")
-    return _current_server_args
 
 
 def get_global_server_args() -> ServerArgs | None:

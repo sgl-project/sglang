@@ -153,25 +153,7 @@ class CudaPlatformBase(Platform):
     ) -> str:
         # TODO(will): maybe come up with a more general interface for local attention
         # if distributed is False, we always try to use Flash attn
-        if selected_backend == AttentionBackendEnum.SLIDING_TILE_ATTN:
-            try:
-                from st_attn import sliding_tile_attention  # noqa: F401
-
-                from sglang.multimodal_gen.runtime.layers.attention.backends.sliding_tile_attn import (  # noqa: F401
-                    SlidingTileAttentionBackend,
-                )
-
-                logger.info("Using Sliding Tile Attention backend")
-
-                return "sglang.multimodal_gen.runtime.layers.attention.backends.sliding_tile_attn.SlidingTileAttentionBackend"
-            except ImportError as e:
-                logger.error(
-                    "Failed to import Sliding Tile Attention backend: %s", str(e)
-                )
-                raise ImportError(
-                    "Sliding Tile Attention backend is not installed. "
-                ) from e
-        elif selected_backend == AttentionBackendEnum.SAGE_ATTN:
+        if selected_backend == AttentionBackendEnum.SAGE_ATTN:
             try:
                 from sageattention import sageattn  # noqa: F401
 
@@ -200,42 +182,6 @@ class CudaPlatformBase(Platform):
                 logger.info(
                     "Sage Attention 3 backend is not installed (To install it, see https://github.com/thu-ml/SageAttention/tree/main/sageattention3_blackwell#installation). Falling back to Flash Attention."
                 )
-        elif selected_backend == AttentionBackendEnum.VIDEO_SPARSE_ATTN:
-            try:
-                from vsa import block_sparse_attn  # noqa: F401
-
-                from sglang.multimodal_gen.runtime.layers.attention.backends.video_sparse_attn import (  # noqa: F401
-                    VideoSparseAttentionBackend,
-                )
-
-                logger.info("Using Video Sparse Attention backend")
-
-                return "sglang.multimodal_gen.runtime.layers.attention.backends.video_sparse_attn.VideoSparseAttentionBackend"
-            except ImportError as e:
-                logger.error(
-                    "Failed to import Video Sparse Attention backend: %s", str(e)
-                )
-                raise ImportError(
-                    "Video Sparse Attention backend is not installed."
-                ) from e
-        elif selected_backend == AttentionBackendEnum.VMOBA_ATTN:
-            try:
-                from kernel.attn.vmoba_attn.vmoba import moba_attn_varlen  # noqa: F401
-
-                from sglang.multimodal_gen.runtime.layers.attention.backends.vmoba import (  # noqa: F401
-                    VMOBAAttentionBackend,
-                )
-
-                logger.info("Using Video MOBA Attention backend")
-
-                return "sglang.multimodal_gen.runtime.layers.attention.backends.vmoba.VMOBAAttentionBackend"
-            except ImportError as e:
-                logger.error(
-                    "Failed to import Video MoBA Attention backend: %s", str(e)
-                )
-                raise ImportError(
-                    "Video MoBA Attention backend is not installed. "
-                ) from e
         elif selected_backend == AttentionBackendEnum.AITER:
             logger.info("Using AITer backend")
             return "sglang.multimodal_gen.runtime.layers.attention.backends.aiter.AITerBackend"

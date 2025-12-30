@@ -56,13 +56,6 @@ for name, cls in _CONFIG_REGISTRY.items():
         AutoConfig.register(name, cls)
 
 
-def download_from_hf(model_path: str):
-    if os.path.exists(model_path):
-        return model_path
-
-    return snapshot_download(model_path, allow_patterns=["*.json", "*.bin", "*.model"])
-
-
 def get_hf_config(
     component_model_path: str,
     trust_remote_code: bool,
@@ -165,19 +158,6 @@ def get_diffusers_component_config(
     )
 
     return combined_config
-
-
-# Models don't use the same configuration key for determining the maximum
-# context length.  Store them here so we can sanely check them.
-# NOTE: The ordering here is important. Some models have two of these and we
-# have a preference for which value gets used.
-CONTEXT_LENGTH_KEYS = [
-    "max_sequence_length",
-    "seq_length",
-    "max_seq_len",
-    "model_max_length",
-    "max_position_embeddings",
-]
 
 
 def attach_additional_stop_token_ids(tokenizer):

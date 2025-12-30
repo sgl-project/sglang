@@ -50,8 +50,6 @@ class TestWan2_1_I2V_14B_720P(TestGenerateTI2VBase):
 
 class TestWan2_2_TI2V_5B(TestGenerateTI2VBase):
     model_path = "Wan-AI/Wan2.2-TI2V-5B-Diffusers"
-    # FIXME: doesn't work with vsa at the moment
-    # extra_args = ["--attention-backend=video_sparse_attn"]
     thresholds = {
         "test_usp": 82.3 * 1.05,
     }

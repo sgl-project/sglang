@@ -20,11 +20,8 @@ The CLI accepts the lowercase names of `AttentionBackendEnum`. The table below l
 |---|---|---|
 | `fa` / `fa3` / `fa4` | `FA` | FlashAttention. `fa3/fa4` are normalized to `fa` during argument parsing (`ServerArgs.__post_init__`). |
 | `torch_sdpa` | `TORCH_SDPA` | PyTorch `scaled_dot_product_attention`. |
-| `sliding_tile_attn` | `SLIDING_TILE_ATTN` | Sliding Tile Attention (STA). Requires `st_attn` and a mask-strategy config file set via the `SGLANG_DIFFUSION_ATTENTION_CONFIG` environment variable. |
 | `sage_attn` | `SAGE_ATTN` | Requires `sageattention`. Upstream SageAttention CUDA extensions target SM80/SM86/SM89/SM90/SM120 (compute capability 8.0/8.6/8.9/9.0/12.0); see upstream `setup.py`: https://github.com/thu-ml/SageAttention/blob/main/setup.py. |
 | `sage_attn_3` | `SAGE_ATTN_3` | Requires SageAttention3 installed per upstream instructions. |
-| `video_sparse_attn` | `VIDEO_SPARSE_ATTN` | Requires `vsa`. |
-| `vmoba_attn` | `VMOBA_ATTN` | Requires `kernel.attn.vmoba_attn.vmoba`. |
 | `aiter` | `AITER` | Requires `aiter`. |
 
 ## Selection priority
@@ -41,11 +38,8 @@ The selection order in `runtime/layers/attention/selector.py` is:
 |---|---:|---:|---:|---|
 | `fa` | ✅ | ✅ | ❌ | CUDA requires SM80+ and fp16/bf16. FlashAttention is only used when the required runtime is installed; otherwise it falls back to `torch_sdpa`. |
 | `torch_sdpa` | ✅ | ✅ | ✅ | Most compatible option across platforms. |
-| `sliding_tile_attn` | ✅ | ❌ | ❌ | CUDA-only. Requires `st_attn` and `SGLANG_DIFFUSION_ATTENTION_CONFIG`. |
 | `sage_attn` | ✅ | ❌ | ❌ | CUDA-only (optional dependency). |
 | `sage_attn_3` | ✅ | ❌ | ❌ | CUDA-only (optional dependency). |
-| `video_sparse_attn` | ✅ | ❌ | ❌ | CUDA-only. Requires `vsa`. |
-| `vmoba_attn` | ✅ | ❌ | ❌ | CUDA-only. Requires `kernel.attn.vmoba_attn.vmoba`. |
 | `aiter` | ✅ | ❌ | ❌ | Requires `aiter`. |
 
 ## Usage
@@ -64,17 +58,6 @@ sglang generate \
   --model-path <MODEL_PATH_OR_ID> \
   --prompt "..." \
   --attention-backend torch_sdpa
-```
-
-### Using Sliding Tile Attention (STA)
-
-```bash
-export SGLANG_DIFFUSION_ATTENTION_CONFIG=/abs/path/to/mask_strategy.json
-
-sglang generate \
-  --model-path <MODEL_PATH_OR_ID> \
-  --prompt "..." \
-  --attention-backend sliding_tile_attn
 ```
 
 ### Notes for ROCm / MPS

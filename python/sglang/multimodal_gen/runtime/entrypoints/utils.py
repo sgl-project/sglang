@@ -39,7 +39,7 @@ def prepare_request(
     params_dict = shallow_asdict(sampling_params)
     req_field_names = {f.name for f in dataclasses.fields(Req)}
     filtered_params = {k: v for k, v in params_dict.items() if k in req_field_names}
-    req = Req(**filtered_params, VSA_sparsity=server_args.VSA_sparsity)
+    req = Req(**filtered_params)
     req.adjust_size(server_args)
 
     if (req.width is not None and req.width <= 0) or (

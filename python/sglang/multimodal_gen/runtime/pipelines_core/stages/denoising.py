@@ -19,7 +19,7 @@ from einops import rearrange
 from tqdm.auto import tqdm
 
 from sglang.multimodal_gen import envs
-from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType, STA_Mode
+from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
 from sglang.multimodal_gen.configs.pipeline_configs.wan import (
     Wan2_2_TI2V_5B_Config,
     WanI2V480PConfig,
@@ -39,10 +39,6 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_classifier_free_guidance_rank,
 )
 from sglang.multimodal_gen.runtime.layers.attention.selector import get_attn_backend
-from sglang.multimodal_gen.runtime.layers.attention.STA_configuration import (
-    configure_sta,
-    save_mask_search_results,
-)
 from sglang.multimodal_gen.runtime.loader.component_loader import TransformerLoader
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
@@ -67,7 +63,7 @@ from sglang.multimodal_gen.runtime.utils.layerwise_offload import (
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.perf_logger import StageProfiler
 from sglang.multimodal_gen.runtime.utils.profiler import SGLDiffusionProfiler
-from sglang.multimodal_gen.utils import dict_to_3d_list, masks_like
+from sglang.multimodal_gen.utils import masks_like
 
 logger = init_logger(__name__)
 
@@ -534,10 +530,6 @@ class DenoisingStage(PipelineStage):
                 image_embed.to(target_dtype) for image_embed in image_embeds
             ]
 
-        # Prepare STA parameters
-        if self.attn_backend.get_enum() == AttentionBackendEnum.SLIDING_TILE_ATTN:
-            self.prepare_sta_param(batch, server_args)
-
         # Get latents and embeddings
         latents = batch.latents
         prompt_embeds = batch.prompt_embeds
@@ -595,7 +587,6 @@ class DenoisingStage(PipelineStage):
             {
                 # TODO: make sure on-device
                 "encoder_hidden_states_image": image_embeds,
-                "mask_strategy": dict_to_3d_list(None, t_max=50, l_max=60, h_max=24),
             },
         )
 
@@ -701,13 +692,6 @@ class DenoisingStage(PipelineStage):
             )
             if offload_mgr_2 is not None and getattr(offload_mgr_2, "enabled", False):
                 offload_mgr_2.release_all()
-
-        # Save STA mask search results if needed
-        if (
-            self.attn_backend.get_enum() == AttentionBackendEnum.SLIDING_TILE_ATTN
-            and server_args.STA_mode == STA_Mode.STA_SEARCHING
-        ):
-            self.save_sta_search_results(batch)
 
         # deallocate transformer if on mps
         pipeline = self.pipeline() if self.pipeline else None
@@ -1168,29 +1152,7 @@ class DenoisingStage(PipelineStage):
             self.attn_metadata_builder_cls = None
         if self.attn_metadata_builder_cls:
             self.attn_metadata_builder = self.attn_metadata_builder_cls()
-        if (
-            self.attn_backend.get_enum() == AttentionBackendEnum.SLIDING_TILE_ATTN
-            or self.attn_backend.get_enum() == AttentionBackendEnum.VIDEO_SPARSE_ATTN
-        ):
-            attn_metadata = self.attn_metadata_builder.build(
-                current_timestep=i,
-                raw_latent_shape=batch.raw_latent_shape[2:5],
-                patch_size=server_args.pipeline_config.dit_config.patch_size,
-                STA_param=batch.STA_param,
-                VSA_sparsity=server_args.VSA_sparsity,
-                device=get_local_torch_device(),
-            )
-        elif self.attn_backend.get_enum() == AttentionBackendEnum.VMOBA_ATTN:
-            moba_params = server_args.moba_config.copy()
-            moba_params.update(
-                {
-                    "current_timestep": i,
-                    "raw_latent_shape": batch.raw_latent_shape[2:5],
-                    "patch_size": server_args.pipeline_config.dit_config.patch_size,
-                    "device": get_local_torch_device(),
-                }
-            )
-        elif self.attn_backend.get_enum() == AttentionBackendEnum.FA:
+        if self.attn_backend.get_enum() == AttentionBackendEnum.FA:
             attn_metadata = self.attn_metadata_builder.build(
                 raw_latent_shape=batch.raw_latent_shape
             )
@@ -1349,158 +1311,6 @@ class DenoisingStage(PipelineStage):
                     guidance_rescale=batch.guidance_rescale,
                 )
             return noise_pred
-
-    def prepare_sta_param(self, batch: Req, server_args: ServerArgs):
-        """
-        Prepare Sliding Tile Attention (STA) parameters and settings.
-
-        Args:
-            batch: The current batch information.
-            server_args: The inference arguments.
-        """
-        # TODO(kevin): STA mask search, currently only support Wan2.1 with 69x768x1280
-        STA_mode = server_args.STA_mode
-        skip_time_steps = server_args.skip_time_steps
-        if batch.timesteps is None:
-            raise ValueError("Timesteps must be provided")
-        timesteps_num = batch.timesteps.shape[0]
-
-        logger.info("STA_mode: %s", STA_mode)
-        if (batch.num_frames, batch.height, batch.width) != (
-            69,
-            768,
-            1280,
-        ) and STA_mode != "STA_inference":
-            raise NotImplementedError(
-                "STA mask search/tuning is not supported for this resolution"
-            )
-
-        if (
-            STA_mode == STA_Mode.STA_SEARCHING
-            or STA_mode == STA_Mode.STA_TUNING
-            or STA_mode == STA_Mode.STA_TUNING_CFG
-        ):
-            size = (batch.width, batch.height)
-            if size == (1280, 768):
-                # TODO: make it configurable
-                sparse_mask_candidates_searching = [
-                    "3, 1, 10",
-                    "1, 5, 7",
-                    "3, 3, 3",
-                    "1, 6, 5",
-                    "1, 3, 10",
-                    "3, 6, 1",
-                ]
-                sparse_mask_candidates_tuning = [
-                    "3, 1, 10",
-                    "1, 5, 7",
-                    "3, 3, 3",
-                    "1, 6, 5",
-                    "1, 3, 10",
-                    "3, 6, 1",
-                ]
-                full_mask = ["3,6,10"]
-            else:
-                raise NotImplementedError(
-                    "STA mask search is not supported for this resolution"
-                )
-        layer_num = self.transformer.config.num_layers
-        # specific for HunyuanVideo
-        if hasattr(self.transformer.config, "num_single_layers"):
-            layer_num += self.transformer.config.num_single_layers
-        head_num = self.transformer.config.num_attention_heads
-
-        if STA_mode == STA_Mode.STA_SEARCHING:
-            STA_param = configure_sta(
-                mode=STA_Mode.STA_SEARCHING,
-                layer_num=layer_num,
-                head_num=head_num,
-                time_step_num=timesteps_num,
-                mask_candidates=sparse_mask_candidates_searching + full_mask,
-                # last is full mask; Can add more sparse masks while keep last one as full mask
-            )
-        elif STA_mode == STA_Mode.STA_TUNING:
-            STA_param = configure_sta(
-                mode=STA_Mode.STA_TUNING,
-                layer_num=layer_num,
-                head_num=head_num,
-                time_step_num=timesteps_num,
-                mask_search_files_path=f"output/mask_search_result_pos_{size[0]}x{size[1]}/",
-                mask_candidates=sparse_mask_candidates_tuning,
-                full_attention_mask=[int(x) for x in full_mask[0].split(",")],
-                skip_time_steps=skip_time_steps,  # Use full attention for first 12 steps
-                save_dir=f"output/mask_search_strategy_{size[0]}x{size[1]}/",  # Custom save directory
-                timesteps=timesteps_num,
-            )
-        elif STA_mode == STA_Mode.STA_TUNING_CFG:
-            STA_param = configure_sta(
-                mode=STA_Mode.STA_TUNING_CFG,
-                layer_num=layer_num,
-                head_num=head_num,
-                time_step_num=timesteps_num,
-                mask_search_files_path_pos=f"output/mask_search_result_pos_{size[0]}x{size[1]}/",
-                mask_search_files_path_neg=f"output/mask_search_result_neg_{size[0]}x{size[1]}/",
-                mask_candidates=sparse_mask_candidates_tuning,
-                full_attention_mask=[int(x) for x in full_mask[0].split(",")],
-                skip_time_steps=skip_time_steps,
-                save_dir=f"output/mask_search_strategy_{size[0]}x{size[1]}/",
-                timesteps=timesteps_num,
-            )
-        elif STA_mode == STA_Mode.STA_INFERENCE:
-            import sglang.multimodal_gen.envs as envs
-
-            config_file = envs.SGLANG_DIFFUSION_ATTENTION_CONFIG
-            if config_file is None:
-                raise ValueError("SGLANG_DIFFUSION_ATTENTION_CONFIG is not set")
-            STA_param = configure_sta(
-                mode=STA_Mode.STA_INFERENCE,
-                layer_num=layer_num,
-                head_num=head_num,
-                time_step_num=timesteps_num,
-                load_path=config_file,
-            )
-
-        batch.STA_param = STA_param
-        batch.mask_search_final_result_pos = [[] for _ in range(timesteps_num)]
-        batch.mask_search_final_result_neg = [[] for _ in range(timesteps_num)]
-
-    def save_sta_search_results(self, batch: Req):
-        """
-        Save the STA mask search results.
-
-        Args:
-            batch: The current batch information.
-        """
-        size = (batch.width, batch.height)
-        if size == (1280, 768):
-            # TODO: make it configurable
-            sparse_mask_candidates_searching = [
-                "3, 1, 10",
-                "1, 5, 7",
-                "3, 3, 3",
-                "1, 6, 5",
-                "1, 3, 10",
-                "3, 6, 1",
-            ]
-        else:
-            raise NotImplementedError(
-                "STA mask search is not supported for this resolution"
-            )
-
-        if batch.mask_search_final_result_pos is not None and batch.prompt is not None:
-            save_mask_search_results(
-                [dict(layer_data) for layer_data in batch.mask_search_final_result_pos],
-                prompt=str(batch.prompt),
-                mask_strategies=sparse_mask_candidates_searching,
-                output_dir=f"output/mask_search_result_pos_{size[0]}x{size[1]}/",
-            )
-        if batch.mask_search_final_result_neg is not None and batch.prompt is not None:
-            save_mask_search_results(
-                [dict(layer_data) for layer_data in batch.mask_search_final_result_neg],
-                prompt=str(batch.prompt),
-                mask_strategies=sparse_mask_candidates_searching,
-                output_dir=f"output/mask_search_result_neg_{size[0]}x{size[1]}/",
-            )
 
     def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
         """Verify denoising stage inputs."""
