@@ -2,10 +2,12 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from enum import Enum, IntEnum, auto
-from typing import TYPE_CHECKING, Any, List, Optional, Tuple
+from typing import TYPE_CHECKING, List, Optional, Tuple, Type, Union
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ModelWorkerBatch
+    from sglang.srt.managers.tp_worker import TpModelWorker
+    from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 
 
 class SpeculativeAlgorithm(Enum):
@@ -45,35 +47,43 @@ class SpeculativeAlgorithm(Enum):
     def supports_spec_v2(self) -> bool:
         return self.is_eagle() or self.is_standalone()
 
+    def create_worker(
+        self, enable_overlap: bool = False
+    ) -> Union[Type[BaseSpecWorker], Type[TpModelWorker]]:
+        assert not self.is_none()
 
-def _create_eagle_worker(**kwargs: Any) -> Any:
-    enable_overlap = kwargs.pop("enable_overlap", False)
-    if enable_overlap:
-        from sglang.srt.speculative.eagle_worker_v2 import EAGLEWorkerV2
+        if enable_overlap:
+            if self.is_eagle():
+                from sglang.srt.speculative.eagle_worker_v2 import EAGLEWorkerV2
 
-        return EAGLEWorkerV2(**kwargs)
+                return EAGLEWorkerV2
+            elif self.is_standalone():
+                from sglang.srt.speculative.standalone_worker_v2 import (
+                    StandaloneWorkerV2,
+                )
 
-    from sglang.srt.speculative.eagle_worker import EAGLEWorker
+                return StandaloneWorkerV2
+            else:
+                raise ValueError(
+                    f"Speculative algorithm {self.name} does not support overlap worker creation."
+                )
 
-    return EAGLEWorker(**kwargs)
+        if self.is_eagle():
+            from sglang.srt.speculative.eagle_worker import EAGLEWorker
 
+            return EAGLEWorker
+        elif self.is_standalone():
+            from sglang.srt.speculative.standalone_worker import StandaloneWorker
 
-def _create_standalone_worker(**kwargs: Any) -> Any:
-    enable_overlap = kwargs.pop("enable_overlap", False)
-    if enable_overlap:
-        from sglang.srt.speculative.standalone_worker_v2 import StandaloneWorkerV2
+            return StandaloneWorker
+        elif self.is_ngram():
+            from sglang.srt.speculative.ngram_worker import NGRAMWorker
 
-        return StandaloneWorkerV2(**kwargs)
+            return NGRAMWorker
 
-    from sglang.srt.speculative.standalone_worker import StandaloneWorker
-
-    return StandaloneWorker(**kwargs)
-
-
-def _create_ngram_worker(**kwargs: Any) -> Any:
-    from sglang.srt.speculative.ngram_worker import NGRAMWorker
-
-    return NGRAMWorker(**kwargs)
+        raise ValueError(
+            f"Speculative algorithm {self.name} does not support non-overlap worker creation."
+        )
 
 
 class SpecInputType(IntEnum):
