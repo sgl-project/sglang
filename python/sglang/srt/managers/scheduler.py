@@ -2058,7 +2058,8 @@ class Scheduler(
             if res != AddReqResult.CONTINUE:
                 # Release mamba slot allocated via COW if scheduling fails
                 if (
-                    isinstance(self.tree_cache, MambaRadixCache)
+                    self.is_hybrid_ssm
+                    and isinstance(self.tree_cache, MambaRadixCache)
                     and req.mamba_pool_idx is not None
                 ):
                     self.req_to_token_pool.mamba_pool.free(
