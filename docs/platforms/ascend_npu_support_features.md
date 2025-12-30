@@ -1,4 +1,4 @@
-# Support Features on Ascend Npu
+# Support Features on Ascend NPU
 
 This section describes the basic functions and features supported by the Ascend NPU.If you encounter issues or have any
 questions, please [open an issue](https://github.com/sgl-project/sglang/issues).
