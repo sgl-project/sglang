@@ -29,7 +29,7 @@ from diffusion_case_parser import (
 def load_execution_reports(reports_dir: Path) -> list[dict]:
     """Load all execution report JSON files from the given directory."""
     reports = []
-    for json_file in reports_dir.glob("execution_report_*.json"):
+    for json_file in reports_dir.glob("**/execution_report_*.json"):
         with open(json_file, "r", encoding="utf-8") as f:
             reports.append(json.load(f))
     return reports
