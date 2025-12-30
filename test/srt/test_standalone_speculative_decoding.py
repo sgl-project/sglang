@@ -7,8 +7,8 @@ from sglang.srt.environ import envs
 from sglang.srt.utils import kill_process_tree
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
 from sglang.test.test_utils import (
-    DEFAULT_STANDALONE_SPECULATIVE_DRAFT_MODEL_FOR_TEST,
-    DEFAULT_STANDALONE_SPECULATIVE_TARGET_MODEL_FOR_TEST,
+    DEFAULT_DRAFT_MODEL_STANDALONE,
+    DEFAULT_TARGET_MODEL_STANDALONE,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -26,7 +26,7 @@ DEFAULT_SERVER_ARGS = [
     "--speculative-algorithm",
     "STANDALONE",
     "--speculative-draft-model-path",
-    DEFAULT_STANDALONE_SPECULATIVE_DRAFT_MODEL_FOR_TEST,
+    DEFAULT_DRAFT_MODEL_STANDALONE,
     "--speculative-num-steps",
     "4",
     "--speculative-eagle-topk",
@@ -40,8 +40,8 @@ DEFAULT_SERVER_ARGS = [
 
 class TestStandaloneSpeculativeDecodingBase(CustomTestCase):
 
-    model = DEFAULT_STANDALONE_SPECULATIVE_TARGET_MODEL_FOR_TEST
-    draft_model = DEFAULT_STANDALONE_SPECULATIVE_DRAFT_MODEL_FOR_TEST
+    model = DEFAULT_TARGET_MODEL_STANDALONE
+    draft_model = DEFAULT_DRAFT_MODEL_STANDALONE
     base_url = DEFAULT_URL_FOR_TEST
     accuracy_threshold = 0.7  # derived tests need to override this
     spec_decode_threshold = 3.6  # derived spec decoding tests need to override this

@@ -814,6 +814,18 @@ class FusedMoE(torch.nn.Module):
             )
             return
 
+        if (
+            "bias" in weight_name
+            and self.quant_config.quant_description["quant_method"] == "modelslim"
+        ):
+            self._load_per_channel_weight_scale(
+                shard_id=shard_id,
+                shard_dim=shard_dim,
+                loaded_weight=loaded_weight,
+                expert_data=expert_data,
+                tp_rank=tp_rank,
+            )
+
     def weight_loader_fused(
         self,
         param: torch.nn.Parameter,
