@@ -125,6 +125,7 @@ jobs:
     uses: ./.github/workflows/pr-test.yml
     with:
       ref: ${{ needs.cut-release-branch.outputs.branch_name }}
+      run_all_tests: true
     secrets: inherit
 
   run-pr-tests-amd:
@@ -132,6 +133,7 @@ jobs:
     uses: ./.github/workflows/pr-test-amd.yml
     with:
       ref: ${{ needs.cut-release-branch.outputs.branch_name }}
+      run_all_tests: true
     secrets: inherit
 
   run-pr-test-npu:
@@ -139,6 +141,7 @@ jobs:
     uses: ./.github/workflows/pr-test-npu.yml
     with:
       ref: ${{ needs.cut-release-branch.outputs.branch_name }}
+      run_all_tests: true
     secrets: inherit
 
   run-pr-tests-xeon:
@@ -146,6 +149,7 @@ jobs:
     uses: ./.github/workflows/pr-test-xeon.yml
     with:
       ref: ${{ needs.cut-release-branch.outputs.branch_name }}
+      run_all_tests: true
     secrets: inherit
 
   run-pr-tests-xpu:
@@ -153,6 +157,7 @@ jobs:
     uses: ./.github/workflows/pr-test-xpu.yml
     with:
       ref: ${{ needs.cut-release-branch.outputs.branch_name }}
+      run_all_tests: true
     secrets: inherit
 
   run-nightly-tests-nvidia:

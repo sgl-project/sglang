@@ -13,6 +13,11 @@ on:
         required: false
         type: string
         default: ''
+      run_all_tests:
+        description: "Run all tests (for releasing or testing purpose)"
+        required: false
+        type: boolean
+        default: false
 
 concurrency:
   group: pr-test-npu-${{ github.ref }}
@@ -23,7 +28,7 @@ jobs:
   check-changes:
     runs-on: ubuntu-latest
     outputs:
-      main_package: ${{ steps.filter.outputs.main_package || steps.full-run.outputs.main_package }}
+      main_package: ${{ steps.filter.outputs.main_package || steps.run-mode.outputs.run_all_tests }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -35,9 +40,9 @@ jobs:
         run: |
           # Run all tests for workflow_call (when ref input is provided)
           # Note: github.event_name is inherited from caller, so we detect workflow_call by checking inputs.ref
-          if [[ -n "${{ inputs.ref }}" ]]; then
+          if [[ "${{ inputs.run_all_tests }}" == "true" ]]; then
             echo "run_all_tests=true" >> $GITHUB_OUTPUT
-            echo "Run mode: ALL TESTS (ref=${{ inputs.ref }})"
+            echo "Run mode: ALL TESTS (run_all_tests=${{ inputs.run_all_tests }})"
           else
             echo "run_all_tests=false" >> $GITHUB_OUTPUT
             echo "Run mode: FILTERED (triggered by ${{ github.event_name }})"
@@ -55,12 +60,6 @@ jobs:
               - "scripts/ci/npu_ci_install_dependency.sh"
               - "test/srt/ascend/**"
               - ".github/workflows/pr-test-npu.yml"
-
-      - name: Set all changes to true for full test runs
-        id: full-run
-        if: steps.run-mode.outputs.run_all_tests == 'true'
-        run: |
-          echo "main_package=true" >> $GITHUB_OUTPUT
 
   # ==================== PR Gate ==================== #
   pr-gate:
