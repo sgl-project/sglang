@@ -43,6 +43,7 @@ from sglang.multimodal_gen.runtime.platforms import (
     current_platform,
 )
 from sglang.multimodal_gen.runtime.server_args import get_global_server_args
+from sglang.multimodal_gen.runtime.utils.layerwise_offload import OffloadableDiTMixin
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
@@ -602,7 +603,7 @@ class WanTransformerBlock_VSA(nn.Module):
         return hidden_states
 
 
-class WanTransformer3DModel(CachableDiT):
+class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
     _fsdp_shard_conditions = WanVideoConfig()._fsdp_shard_conditions
     _compile_conditions = WanVideoConfig()._compile_conditions
     _supported_attention_backends = WanVideoConfig()._supported_attention_backends
@@ -621,7 +622,6 @@ class WanTransformer3DModel(CachableDiT):
         self.num_channels_latents = config.num_channels_latents
         self.patch_size = config.patch_size
         self.text_len = config.text_len
-        self.dit_module_names = ["blocks"]
 
         # 1. Patch & position embedding
         self.patch_embedding = PatchEmbed(
@@ -707,6 +707,8 @@ class WanTransformer3DModel(CachableDiT):
             rope_theta=10000,
             dtype=torch.float32 if current_platform.is_mps() else torch.float64,
         )
+
+        self.layer_names = ["blocks"]
 
     def forward(
         self,
@@ -806,25 +808,10 @@ class WanTransformer3DModel(CachableDiT):
             if enable_teacache:
                 original_hidden_states = hidden_states.clone()
 
-            offload_mgr = getattr(self, "_layerwise_offload_manager", None)
-            if offload_mgr is not None and getattr(offload_mgr, "enabled", False):
-                for i, block in enumerate(self.blocks):
-                    with offload_mgr.layer_scope(
-                        prefetch_layer_idx=i + 1,
-                        release_layer_idx=i,
-                        non_blocking=True,
-                    ):
-                        hidden_states = block(
-                            hidden_states,
-                            encoder_hidden_states,
-                            timestep_proj,
-                            freqs_cis,
-                        )
-            else:
-                for block in self.blocks:
-                    hidden_states = block(
-                        hidden_states, encoder_hidden_states, timestep_proj, freqs_cis
-                    )
+            for block in self.blocks:
+                hidden_states = block(
+                    hidden_states, encoder_hidden_states, timestep_proj, freqs_cis
+                )
             # if teacache is enabled, we need to cache the original hidden states
             if enable_teacache:
                 self.maybe_cache_states(hidden_states, original_hidden_states)
