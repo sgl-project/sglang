@@ -23,6 +23,9 @@ ${PIP_INSTALL} --upgrade pip
 # Pin wheel to 0.45.1, REF: https://github.com/pypa/wheel/issues/662
 ${PIP_INSTALL} wheel==0.45.1 pybind11
 
+# Download Datasets
+wget -O /tmp/test.jsonl https://gh-proxy.test.osinfra.cn/https://raw.githubusercontent.com/openai/grade-school-math/master/grade_school_math/data/test.jsonl
+
 
 ### Install MemFabric
 ${PIP_INSTALL} mf-adapter==1.0.0
