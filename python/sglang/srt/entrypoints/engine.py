@@ -788,18 +788,32 @@ def _set_envs_and_config(server_args: ServerArgs):
             )
 
     if server_args.custom_sigquit_handler is None:
-        # Register the signal handler.
-        # The child processes will send SIGQUIT to this process when any error happens
-        # This process then clean up the whole process tree
-        # Note: This sigquit handler is used in the launch phase, and may be replaced by
-        # the running_phase_sigquit_handler in the tokenizer manager after the grpc server is launched.
+        # Register signal handlers for both SIGQUIT and SIGTERM.
+        #
+        # SIGQUIT handler:
+        # - The child processes will send SIGQUIT to this process when any error happens
+        # - This process will then clean up the whole process tree
+        # - This handler is used in the launch phase, and may be replaced by
+        #   the running_phase_sigquit_handler in the tokenizer manager after the grpc server is launched
+        #
+        # SIGTERM handler:
+        # - Sent when the server is being terminated by the user or system
+        # - This process will clean up the whole process tree to ensure graceful shutdown
+        # - This handler is active during the launch phase
         def launch_phase_sigquit_handler(signum, frame):
             logger.error(
                 "Received sigquit from a child process. It usually means the child failed."
             )
             kill_process_tree(os.getpid())
 
+        def launch_phase_sigterm_handler(signum, frame):
+            logger.error(
+                "Received sigterm signal when server launching. It usually means the server was terminated by user or system."
+            )
+            kill_process_tree(os.getpid())
+
         signal.signal(signal.SIGQUIT, launch_phase_sigquit_handler)
+        signal.signal(signal.SIGTERM, launch_phase_sigterm_handler)
     else:
         # Allow users to register a custom SIGQUIT handler for things like crash dump
         logger.error(
