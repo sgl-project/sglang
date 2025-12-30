@@ -1093,6 +1093,10 @@ class ServerArgs:
                     )
 
                     print_nsa_bool_env_vars()
+                if self.enable_nsa_prefill_context_parallel:
+                    assert (
+                        self.disaggregation_mode != "decode"
+                    ), "CP is only supported for prefill when PD disaggregation, please remove --enable-nsa-prefill-context-parallel."
 
             else:
                 # DeepSeek V3/R1/V3.1
