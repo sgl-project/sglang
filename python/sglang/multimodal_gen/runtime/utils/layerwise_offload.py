@@ -29,13 +29,13 @@ class LayerwiseOffloadManager:
         self,
         model: torch.nn.Module,
         *,
-        module_list_attr: str,
+        layers_attr_str: str,
         num_layers: int,
         enabled: bool,
         pin_cpu_memory: bool = True,
     ) -> None:
         self.model = model
-        self.layers_attr_str = module_list_attr
+        self.layers_attr_str = layers_attr_str
         self.num_layers = num_layers
         self.pin_cpu_memory = pin_cpu_memory
 
@@ -46,7 +46,7 @@ class LayerwiseOffloadManager:
         self.copy_stream = torch.cuda.Stream()
 
         self._layer_name_re = re.compile(
-            rf"(^|\.){re.escape(module_list_attr)}\.(\d+)(\.|$)"
+            rf"(^|\.){re.escape(layers_attr_str)}\.(\d+)(\.|$)"
         )
 
         # layer_idx -> {dtype: consolidated_pinned_cpu_tensor}
@@ -241,15 +241,16 @@ class OffloadableDiTMixin:
 
     def configure_layerwise_offload(self, server_args: ServerArgs):
         self.layerwise_offload_managers = []
-        for module_name in self.layer_names:
-            module_list = getattr(self, module_name, None)
+        for layer_name in self.layer_names:
+            # a manager per layer-list
+            module_list = getattr(self, layer_name, None)
             if module_list is None or not isinstance(module_list, torch.nn.ModuleList):
                 continue
 
             num_layers = len(module_list)
             manager = LayerwiseOffloadManager(
                 model=self,
-                module_list_attr=module_name,
+                layers_attr_str=layer_name,
                 num_layers=num_layers,
                 enabled=True,
                 pin_cpu_memory=server_args.pin_cpu_memory,
