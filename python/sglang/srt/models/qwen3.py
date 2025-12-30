@@ -308,7 +308,6 @@ class Qwen3DecoderLayer(nn.Module):
             return None
 
         def _get_weights(layer):
-        def _get_weights(layer):
             weight_attrs = ["weight", "qweight"]
             for attr_name in weight_attrs:
                 weight = getattr(layer, attr_name, None)
