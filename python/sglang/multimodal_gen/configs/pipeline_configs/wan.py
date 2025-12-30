@@ -148,6 +148,7 @@ class WanI2V720PConfig(WanI2V480PConfig):
     flow_shift: float | None = 5.0
 
 
+@dataclass
 class TurboWanI2V720Config(WanI2V720PConfig):
     flow_shift: float | None = 8.0
     dmd_denoising_steps: list[int] | None = field(
