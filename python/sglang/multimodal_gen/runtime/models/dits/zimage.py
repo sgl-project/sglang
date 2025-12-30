@@ -154,7 +154,7 @@ class ZImageAttention(nn.Module):
         k = k.view(*k.shape[:-1], self.num_kv_heads, self.head_dim)
         v = v.view(*v.shape[:-1], self.num_kv_heads, self.head_dim)
 
-        if self.qk_norm and (self.norm_q is not None) and (self.norm_k is not None):
+        if self.qk_norm:
             if (
                 q.is_cuda
                 and (self.norm_q.variance_epsilon == self.norm_k.variance_epsilon)
