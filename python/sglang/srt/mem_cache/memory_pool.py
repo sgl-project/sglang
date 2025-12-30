@@ -1174,6 +1174,11 @@ class HybridLinearKVPool(KVCache):
             self.mem_usage = (k_size + v_size) / GB
 
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
+        if self.use_mla:
+            raise NotImplementedError(
+                "move_kv_cache is not supported for MLA attention"
+                "Speculative decoding with topk > 1 and page_size > 1 is not supported for MLA models."
+            )
         self.full_kv_pool.move_kv_cache(tgt_loc, src_loc)
 
     def get_kv_size_bytes(self):
