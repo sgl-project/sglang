@@ -237,7 +237,7 @@ class OffloadableDiTMixin:
 
     # the list of names of a DiT's layers/blocks
     layer_names: List[str]
-    layerwise_offload_manager: LayerwiseOffloadManager | None = None
+    layerwise_offload_managers: list[LayerwiseOffloadManager] | None = None
 
     def configure_layerwise_offload(self, server_args: ServerArgs):
         self.layerwise_offload_managers = []
@@ -260,3 +260,9 @@ class OffloadableDiTMixin:
         logger.info(
             f"Enabled layerwise offload for {self.__class__.__name__} on modules: {self.layer_names}"
         )
+
+    def prepare_for_next_denoise(self):
+        if self.layerwise_offload_managers is None:
+            return
+        for manager in self.layerwise_offload_managers:
+            manager.prepare_for_next_denoise(non_blocking=True)

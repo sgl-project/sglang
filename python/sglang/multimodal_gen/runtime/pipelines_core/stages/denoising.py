@@ -723,11 +723,10 @@ class DenoisingStage(PipelineStage):
                 torch.mps.current_allocated_memory(),
             )
 
-        # reset offload manager with prefetching first layer for next forward
-        for transformer in filter(None, [self.transformer, self.transformer_2]):
-            if isinstance(transformer, OffloadableDiTMixin):
-                if (offload_mgr := transformer.layerwise_offload_manager) is not None:
-                    offload_mgr.prepare_for_next_denoise(non_blocking=True)
+        # reset offload managers with prefetching first layer for next forward
+        for dit in filter(None, [self.transformer, self.transformer_2]):
+            if isinstance(dit, OffloadableDiTMixin):
+                dit.prepare_for_next_denoise()
 
     def _preprocess_sp_latents(self, batch: Req, server_args: ServerArgs):
         """Shard latents for Sequence Parallelism if applicable."""
