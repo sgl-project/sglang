@@ -91,6 +91,8 @@ from sglang.srt.utils import flatten_nested_list
 from sglang.srt.utils.cuda_ipc_transport_utils import CudaIpcTensorTransportProxy
 
 if TYPE_CHECKING:
+    from typing import Any, Dict
+
     from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.speculative.eagle_info import EagleDraftInput
     from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
@@ -699,6 +701,8 @@ class Req:
         self.routed_experts: Optional[torch.Tensor] = (
             None  # cpu tensor: shape (seqlen, topk)
         )
+        # Customized info
+        self.customized_info: Optional[Dict[str, List[Any]]] = None
 
         # Embedding (return values)
         self.embedding = None
@@ -1068,6 +1072,7 @@ class Req:
         self.last_node = None
         self.swa_uuid_for_lock = None
         self.extend_input_len = 0
+        self.customized_info = None
         self.is_retracted = True
         self.retracted_stain = True
         self.input_token_logprobs = None
