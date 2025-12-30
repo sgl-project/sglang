@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import sglang as sgl
 from sglang.srt.environ import envs
 from sglang.srt.utils import kill_process_tree
-from sglang.test.run_eval import run_eval
+from sglang.test.few_shot_gsm8k import run_eval
 from sglang.test.test_utils import (
     DEFAULT_MLA_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -41,7 +41,9 @@ class _BaseTestDynamicEPLB(CustomTestCase):
                     "--moe-a2a-backend",
                     "deepep",
                     "--deepep-mode",
-                    "normal",
+                    "low_latency",
+                    "--chunked-prefill-size",
+                    "256",
                     "--disable-cuda-graph",
                     "--enable-eplb",
                     "--ep-num-redundant-experts",
@@ -65,17 +67,19 @@ class _BaseTestDynamicEPLB(CustomTestCase):
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
 
-    def test_mmlu(self):
+    def test_gsm8k(self):
         args = SimpleNamespace(
-            base_url=self.base_url,
-            model=self.model,
-            eval_name="mmlu",
-            num_examples=64,
-            num_threads=32,
+            num_shots=2,
+            data_path=None,
+            num_questions=50,
+            max_new_tokens=512,
+            parallel=1,
+            host=f"http://127.0.0.1",
+            port=int(self.base_url.split(":")[-1]),
         )
 
         metrics = run_eval(args)
-        self.assertGreater(metrics["score"], 0.5)
+        self.assertGreater(metrics["accuracy"], 0.7)
 
 
 class TestDynamicEPLBSimple(_BaseTestDynamicEPLB):
@@ -97,6 +101,8 @@ class TestStaticEPLB(CustomTestCase):
                 ep_num_redundant_experts=4,
                 enable_dp_attention=True,
                 moe_a2a_backend="deepep",
+                deepep_mode="low_latency",
+                chunked_prefill_size=256,
                 disable_cuda_graph=True,
                 expert_distribution_recorder_mode="stat",
                 tp_size=2,
