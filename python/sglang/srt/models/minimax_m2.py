@@ -137,8 +137,8 @@ def rmsnorm_apply_kernel_serial(
 
     sum_sq1 = tl.load(sum_sq_ptr + row_id)
     sum_sq2 = tl.load(sum_sq_ptr + row_id + B)
-    inv_rms1 = tl.rsqrt(sum_sq1 / tp_world / D1 + eps)
-    inv_rms2 = tl.rsqrt(sum_sq2 / tp_world / D2 + eps)
+    inv_rms1 = tl.rsqrt(sum_sq1 / D1 / tp_world + eps)
+    inv_rms2 = tl.rsqrt(sum_sq2 / D2 / tp_world + eps)
 
     offsets1 = tl.arange(0, BLOCK_SIZE1)
     offsets2 = tl.arange(0, BLOCK_SIZE2)
