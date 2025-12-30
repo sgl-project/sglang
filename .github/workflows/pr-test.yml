@@ -90,8 +90,8 @@ jobs:
             echo "max_parallel=15" >> $GITHUB_OUTPUT
             echo "High priority PR detected, setting max_parallel to 15"
           else
-            echo "max_parallel=8" >> $GITHUB_OUTPUT
-            echo "Using default max_parallel of 8"
+            echo "max_parallel=4" >> $GITHUB_OUTPUT
+            echo "Using default max_parallel of 4"
           fi
 
       - name: Set B200 runner tag
