@@ -17,6 +17,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from sglang.jit_kernel.norm import can_use_fused_inplace_qknorm, fused_inplace_qknorm
 from sglang.multimodal_gen.runtime.layers.custom_op import CustomOp
 from sglang.multimodal_gen.runtime.layers.triton_ops import (
     fuse_scale_shift_kernel,
@@ -561,7 +562,6 @@ class LayerNormScaleShift(nn.Module):
                 self.eps,
             )
             return y_2d.view(B, L, C)
-
         else:
             # Fallback path for triton kernel (not fused)
             normalized = self.norm(x)
@@ -581,3 +581,44 @@ class LayerNormScaleShift(nn.Module):
             if self.compute_dtype == torch.float32:
                 output = output.to(x.dtype)
             return output
+        return output
+
+
+def apply_qk_norm(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    q_norm: "RMSNorm",
+    k_norm: "RMSNorm",
+    head_dim: int,
+    allow_inplace: bool = True,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Apply QK normalization for query and key tensors.
+
+    Minimal multimodal_gen-only implementation: only the JIT fused inplace
+    QK-norm kernel path is supported (no fallback).
+    """
+
+    batch_size = q.size(0)
+    q_eps = q_norm.variance_epsilon
+    k_eps = k_norm.variance_epsilon
+    # Only try fused path on CUDA and when it won't introduce implicit copies.
+    if (
+        q.is_cuda
+        and allow_inplace
+        and (q_eps == k_eps)
+        and can_use_fused_inplace_qknorm(head_dim)
+    ):
+        fused_inplace_qknorm(
+            q=q.view(batch_size, -1, head_dim),
+            k=k.view(batch_size, -1, head_dim),
+            q_weight=q_norm.weight,
+            k_weight=k_norm.weight,
+            head_dim=head_dim,
+            eps=q_eps,
+        )
+        return q, k
+
+    raise RuntimeError(
+        "apply_qk_norm: fused inplace QK-norm is not applicable "
+        "(expected CUDA, contiguous q/k, matching eps, and supported head_dim)"
+    )
