@@ -8,10 +8,15 @@ on:
         required: true
         type: string
       commit_sha:
-        description: 'Commit SHA from main to cut the release branch from (defaults to latest main)'
+        description: 'Commit SHA to cut the release branch from (defaults to latest main)'
         required: false
         type: string
         default: ''
+      ref_branch:
+        description: 'Branch to cut the release branch from (for testing purpose, defaults to main)'
+        required: false
+        type: string
+        default: 'main'
 
 permissions:
   contents: write
@@ -27,7 +32,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          ref: main
+          ref: ${{ github.event.inputs.ref_branch || 'main' }}
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
 
