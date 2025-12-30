@@ -13,6 +13,28 @@ use tracing::debug;
 
 type NodeRef = Arc<Node>;
 
+/// Shard counts for DashMaps to balance concurrency vs allocation overhead.
+/// Default DashMap uses num_cpus * 4 shards (e.g., 256 on 64-core machines).
+///
+/// Root node uses higher shard count since ALL requests pass through it.
+/// Other nodes use lower count as traffic diverges through the tree.
+///
+/// This reduces memory by ~90% vs default while maintaining good concurrency.
+const ROOT_SHARD_COUNT: usize = 32;
+const NODE_SHARD_COUNT: usize = 8;
+
+/// Create a children DashMap for non-root nodes
+#[inline]
+fn new_children_map() -> DashMap<char, NodeRef, CharHasherBuilder> {
+    DashMap::with_hasher_and_shard_amount(CharHasherBuilder::default(), NODE_SHARD_COUNT)
+}
+
+/// Create a tenant access time DashMap for non-root nodes
+#[inline]
+fn new_tenant_map() -> DashMap<TenantId, u64> {
+    DashMap::with_shard_amount(NODE_SHARD_COUNT)
+}
+
 /// Interned tenant ID to avoid repeated string allocations.
 /// Using Arc<str> allows cheap cloning and comparison.
 pub type TenantId = Arc<str>;
@@ -322,14 +344,18 @@ impl Tree {
 
     pub fn new() -> Self {
         Tree {
+            // Root uses higher shard count since ALL requests pass through it
             root: Arc::new(Node {
-                children: DashMap::with_hasher(CharHasherBuilder::default()),
+                children: DashMap::with_hasher_and_shard_amount(
+                    CharHasherBuilder::default(),
+                    ROOT_SHARD_COUNT,
+                ),
                 text: RwLock::new(NodeText::empty()),
-                tenant_last_access_time: DashMap::new(),
+                tenant_last_access_time: DashMap::with_shard_amount(ROOT_SHARD_COUNT),
                 parent: RwLock::new(None),
                 last_tenant: parking_lot::RwLock::new(None),
             }),
-            tenant_char_count: DashMap::new(),
+            tenant_char_count: DashMap::with_shard_amount(ROOT_SHARD_COUNT),
         }
     }
 
@@ -376,9 +402,9 @@ impl Tree {
                     let epoch = get_epoch();
 
                     let new_node = Arc::new(Node {
-                        children: DashMap::with_hasher(CharHasherBuilder::default()),
+                        children: new_children_map(),
                         text: RwLock::new(NodeText::new(remaining.to_string())),
-                        tenant_last_access_time: DashMap::new(),
+                        tenant_last_access_time: new_tenant_map(),
                         parent: RwLock::new(Some(Arc::clone(&prev))),
                         last_tenant: parking_lot::RwLock::new(Some(Arc::clone(&tenant_id))),
                     });
@@ -417,7 +443,7 @@ impl Tree {
 
                         let new_node = Arc::new(Node {
                             text: RwLock::new(matched_text),
-                            children: DashMap::with_hasher(CharHasherBuilder::default()),
+                            children: new_children_map(),
                             parent: RwLock::new(Some(Arc::clone(&prev))),
                             tenant_last_access_time: matched_node.tenant_last_access_time.clone(),
                             last_tenant: parking_lot::RwLock::new(
