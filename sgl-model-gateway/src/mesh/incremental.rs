@@ -13,7 +13,8 @@ use tracing::{debug, trace};
 
 use super::{
     gossip::StateUpdate,
-    stores::{StateStores, StoreType},
+    stores::{MembershipState, PolicyState, StateStores, StoreType, WorkerState},
+    SKey,
 };
 
 /// Tracks the last sent version for each key in each store
@@ -42,6 +43,57 @@ impl IncrementalUpdateCollector {
         }
     }
 
+    /// Get current timestamp in nanoseconds
+    fn current_timestamp() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as u64
+    }
+
+    /// Helper function to collect updates for stores with serializable state
+    fn collect_serializable_updates<S>(
+        &self,
+        all_items: std::collections::BTreeMap<SKey, S>,
+        get_version: impl Fn(&SKey) -> u64,
+        last_sent_map: &mut HashMap<String, u64>,
+        store_name: &str,
+        get_id: impl Fn(&S) -> String,
+    ) -> Vec<StateUpdate>
+    where
+        S: serde::Serialize,
+    {
+        let mut updates = Vec::new();
+        let timestamp = Self::current_timestamp();
+
+        for (key, state) in all_items {
+            let key_str = key.as_str().to_string();
+            let current_version = get_version(&key);
+            let last_sent_version = last_sent_map.get(&key_str).copied().unwrap_or(0);
+
+            if current_version > last_sent_version {
+                if let Ok(serialized) = serde_json::to_vec(&state) {
+                    updates.push(StateUpdate {
+                        key: key_str.clone(),
+                        value: serialized,
+                        version: current_version,
+                        actor: self.self_name.clone(),
+                        timestamp,
+                    });
+
+                    last_sent_map.insert(key_str, current_version);
+                    trace!(
+                        "Collected {} update: {} (version: {})",
+                        store_name,
+                        get_id(&state),
+                        current_version
+                    );
+                }
+            }
+        }
+        updates
+    }
+
     /// Collect incremental updates for a specific store type
     pub fn collect_updates_for_store(&self, store_type: StoreType) -> Vec<StateUpdate> {
         let mut updates = Vec::new();
@@ -50,82 +102,41 @@ impl IncrementalUpdateCollector {
         match store_type {
             StoreType::Worker => {
                 let all_workers = self.stores.worker.all();
-                for (key, state) in all_workers {
-                    let key_str = key.as_str().to_string();
-                    let current_version = self
-                        .stores
+                let get_version = |key: &SKey| {
+                    self.stores
                         .worker
-                        .get_metadata(&key)
+                        .get_metadata(key)
                         .map(|(v, _)| v)
-                        .unwrap_or(0);
-
-                    let last_sent_version = last_sent.worker.get(&key_str).copied().unwrap_or(0);
-
-                    // Only include if version has changed
-                    if current_version > last_sent_version {
-                        if let Ok(serialized) = serde_json::to_vec(&state) {
-                            updates.push(StateUpdate {
-                                key: key_str.clone(),
-                                value: serialized,
-                                version: current_version,
-                                actor: self.self_name.clone(),
-                                timestamp: SystemTime::now()
-                                    .duration_since(UNIX_EPOCH)
-                                    .unwrap()
-                                    .as_nanos() as u64,
-                            });
-
-                            // Update last sent version
-                            last_sent.worker.insert(key_str, current_version);
-                            trace!(
-                                "Collected worker update: {} (version: {})",
-                                state.worker_id,
-                                current_version
-                            );
-                        }
-                    }
-                }
+                        .unwrap_or(0)
+                };
+                updates = self.collect_serializable_updates(
+                    all_workers,
+                    get_version,
+                    &mut last_sent.worker,
+                    "worker",
+                    |state: &WorkerState| state.worker_id.clone(),
+                );
             }
             StoreType::Policy => {
                 let all_policies = self.stores.policy.all();
-                for (key, state) in all_policies {
-                    let key_str = key.as_str().to_string();
-                    let current_version = self
-                        .stores
+                let get_version = |key: &SKey| {
+                    self.stores
                         .policy
-                        .get_metadata(&key)
+                        .get_metadata(key)
                         .map(|(v, _)| v)
-                        .unwrap_or(0);
-
-                    let last_sent_version = last_sent.policy.get(&key_str).copied().unwrap_or(0);
-
-                    // Only include if version has changed
-                    if current_version > last_sent_version {
-                        if let Ok(serialized) = serde_json::to_vec(&state) {
-                            updates.push(StateUpdate {
-                                key: key_str.clone(),
-                                value: serialized,
-                                version: current_version,
-                                actor: self.self_name.clone(),
-                                timestamp: SystemTime::now()
-                                    .duration_since(UNIX_EPOCH)
-                                    .unwrap()
-                                    .as_nanos() as u64,
-                            });
-
-                            // Update last sent version
-                            last_sent.policy.insert(key_str, current_version);
-                            trace!(
-                                "Collected policy update: {} (version: {})",
-                                state.model_id,
-                                current_version
-                            );
-                        }
-                    }
-                }
+                        .unwrap_or(0)
+                };
+                updates = self.collect_serializable_updates(
+                    all_policies,
+                    get_version,
+                    &mut last_sent.policy,
+                    "policy",
+                    |state: &PolicyState| state.model_id.clone(),
+                );
             }
             StoreType::App => {
                 let all_apps = self.stores.app.all();
+                let timestamp = Self::current_timestamp();
                 for (key, state) in all_apps {
                     let key_str = key.as_str().to_string();
                     let current_version = self
@@ -134,23 +145,16 @@ impl IncrementalUpdateCollector {
                         .get_metadata(&key)
                         .map(|(v, _)| v)
                         .unwrap_or(0);
-
                     let last_sent_version = last_sent.app.get(&key_str).copied().unwrap_or(0);
 
-                    // Only include if version has changed
                     if current_version > last_sent_version {
                         updates.push(StateUpdate {
                             key: key_str.clone(),
                             value: state.value.clone(),
                             version: current_version,
                             actor: self.self_name.clone(),
-                            timestamp: SystemTime::now()
-                                .duration_since(UNIX_EPOCH)
-                                .unwrap()
-                                .as_nanos() as u64,
+                            timestamp,
                         });
-
-                        // Update last sent version
                         last_sent.app.insert(key_str, current_version);
                         trace!(
                             "Collected app update: {} (version: {})",
@@ -162,67 +166,33 @@ impl IncrementalUpdateCollector {
             }
             StoreType::Membership => {
                 let all_members = self.stores.membership.all();
-                for (key, state) in all_members {
-                    let key_str = key.as_str().to_string();
-                    let current_version = self
-                        .stores
+                let get_version = |key: &SKey| {
+                    self.stores
                         .membership
-                        .get_metadata(&key)
+                        .get_metadata(key)
                         .map(|(v, _)| v)
-                        .unwrap_or(0);
-
-                    let last_sent_version =
-                        last_sent.membership.get(&key_str).copied().unwrap_or(0);
-
-                    // Only include if version has changed
-                    if current_version > last_sent_version {
-                        if let Ok(serialized) = serde_json::to_vec(&state) {
-                            updates.push(StateUpdate {
-                                key: key_str.clone(),
-                                value: serialized,
-                                version: current_version,
-                                actor: self.self_name.clone(),
-                                timestamp: SystemTime::now()
-                                    .duration_since(UNIX_EPOCH)
-                                    .unwrap()
-                                    .as_nanos() as u64,
-                            });
-
-                            // Update last sent version
-                            last_sent.membership.insert(key_str, current_version);
-                            trace!(
-                                "Collected membership update: {} (version: {})",
-                                state.name,
-                                current_version
-                            );
-                        }
-                    }
-                }
+                        .unwrap_or(0)
+                };
+                updates = self.collect_serializable_updates(
+                    all_members,
+                    get_version,
+                    &mut last_sent.membership,
+                    "membership",
+                    |state: &MembershipState| state.name.clone(),
+                );
             }
             StoreType::RateLimit => {
-                // Collect rate limit counters from owners
                 let rate_limit_keys = self.stores.rate_limit.keys();
-                let mut last_sent = self.last_sent.write();
+                let current_timestamp = Self::current_timestamp();
 
                 for key in rate_limit_keys {
-                    // Only collect if this node is an owner
                     if self.stores.rate_limit.is_owner(&key) {
                         if let Some(counter) = self.stores.rate_limit.get_counter(&key) {
-                            // Use timestamp as version for rate limit counters
-                            let current_timestamp = SystemTime::now()
-                                .duration_since(UNIX_EPOCH)
-                                .unwrap()
-                                .as_nanos()
-                                as u64;
-
                             let last_sent_timestamp =
                                 last_sent.rate_limit.get(&key).copied().unwrap_or(0);
 
-                            // Only send if enough time has passed (to avoid too frequent updates)
-                            // Or if this is the first time
-                            // Check if at least 1 second has passed since last send
+                            // Only send if at least 1 second has passed since last send
                             if current_timestamp > last_sent_timestamp + 1_000_000_000 {
-                                // Serialize the counter snapshot
                                 if let Ok(serialized) = serde_json::to_vec(&counter.snapshot()) {
                                     let key_str = key.clone();
                                     updates.push(StateUpdate {
@@ -232,8 +202,6 @@ impl IncrementalUpdateCollector {
                                         actor: self.self_name.clone(),
                                         timestamp: current_timestamp,
                                     });
-
-                                    // Update last sent timestamp
                                     last_sent.rate_limit.insert(key_str, current_timestamp);
                                     trace!("Collected rate limit counter update: {}", key);
                                 }
@@ -275,36 +243,16 @@ impl IncrementalUpdateCollector {
     /// Mark updates as sent (called after successful transmission)
     pub fn mark_sent(&self, store_type: StoreType, updates: &[StateUpdate]) {
         let mut last_sent = self.last_sent.write();
-        match store_type {
-            StoreType::Worker => {
-                for update in updates {
-                    last_sent.worker.insert(update.key.clone(), update.version);
-                }
-            }
-            StoreType::Policy => {
-                for update in updates {
-                    last_sent.policy.insert(update.key.clone(), update.version);
-                }
-            }
-            StoreType::App => {
-                for update in updates {
-                    last_sent.app.insert(update.key.clone(), update.version);
-                }
-            }
-            StoreType::Membership => {
-                for update in updates {
-                    last_sent
-                        .membership
-                        .insert(update.key.clone(), update.version);
-                }
-            }
-            StoreType::RateLimit => {
-                for update in updates {
-                    last_sent
-                        .rate_limit
-                        .insert(update.key.clone(), update.version);
-                }
-            }
+        let target_map = match store_type {
+            StoreType::Worker => &mut last_sent.worker,
+            StoreType::Policy => &mut last_sent.policy,
+            StoreType::App => &mut last_sent.app,
+            StoreType::Membership => &mut last_sent.membership,
+            StoreType::RateLimit => &mut last_sent.rate_limit,
+        };
+
+        for update in updates {
+            target_map.insert(update.key.clone(), update.version);
         }
     }
 }
