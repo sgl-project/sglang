@@ -220,9 +220,9 @@ class ServerArgs:
     # TODO: do not hard code
     master_port: int | None = None
 
-    # http server endpoint config, would be ignored in local mode
-    host: str | None = None
-    port: int | None = None
+    # http server endpoint config
+    host: str | None = "127.0.0.1"
+    port: int | None = 30000
 
     # TODO: webui and their endpoint, check if webui_port is available.
     webui: bool = False
@@ -290,6 +290,8 @@ class ServerArgs:
         if self.attention_backend in ["fa3", "fa4"]:
             self.attention_backend = "fa"
 
+        # network initialization: port and host
+        self.port = self.settle_port(self.port)
         # Add randomization to avoid race condition when multiple servers start simultaneously
         initial_scheduler_port = self.scheduler_port + random.randint(0, 100)
         self.scheduler_port = self.settle_port(initial_scheduler_port)
@@ -306,6 +308,7 @@ class ServerArgs:
                     "Failed to load V-MoBA config from %s: %s", self.moba_config_path, e
                 )
                 raise
+
         self.check_server_args()
 
         # log clean server_args
@@ -575,12 +578,15 @@ class ServerArgs:
         else:
             return f"http://{self.host}:{self.port}"
 
+    @property
     def scheduler_endpoint(self):
         """
-        Internal endpoint for scheduler
-
+        Internal endpoint for scheduler.
+        Prefers the configured host but normalizes localhost -> 127.0.0.1 to avoid ZMQ issues.
         """
-        scheduler_host = self.host or "localhost"
+        scheduler_host = self.host
+        if scheduler_host is None or scheduler_host == "localhost":
+            scheduler_host = "127.0.0.1"
         return f"tcp://{scheduler_host}:{self.scheduler_port}"
 
     def settle_port(
@@ -622,16 +628,6 @@ class ServerArgs:
             f"Failed to find available port after {max_attempts} attempts "
             f"(started from port {original_port})"
         )
-
-    def post_init_serve(self):
-        """
-        Post init when in serve mode
-        """
-        if self.host is None:
-            self.host = "localhost"
-        if self.port is None:
-            self.port = 3000
-        self.port = self.settle_port(self.port)
 
     @classmethod
     def from_cli_args(
