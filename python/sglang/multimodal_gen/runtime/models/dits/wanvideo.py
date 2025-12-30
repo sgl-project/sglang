@@ -13,6 +13,8 @@ from sglang.multimodal_gen.configs.models.dits import WanVideoConfig
 from sglang.multimodal_gen.configs.sample.wan import WanTeaCacheParams
 from sglang.multimodal_gen.runtime.distributed.parallel_state import get_sp_world_size
 from sglang.multimodal_gen.runtime.layers.attention import (
+    MinimalA2AAttnOp,
+    SparseLinearAttention,
     UlyssesAttention_VSA,
     USPAttention,
 )
@@ -262,6 +264,8 @@ class WanTransformerBlock(nn.Module):
         added_kv_proj_dim: int | None = None,
         supported_attention_backends: set[AttentionBackendEnum] | None = None,
         prefix: str = "",
+        attention_type: str = "original",
+        sla_topk: float = 0.1,
     ):
         super().__init__()
 
@@ -272,13 +276,20 @@ class WanTransformerBlock(nn.Module):
         self.to_v = ReplicatedLinear(dim, dim, bias=True)
 
         self.to_out = ReplicatedLinear(dim, dim, bias=True)
-        self.attn1 = USPAttention(
-            num_heads=num_heads,
-            head_size=dim // num_heads,
-            causal=False,
-            supported_attention_backends=supported_attention_backends,
-            prefix=f"{prefix}.attn1",
-        )
+        if attention_type == "sla":
+            self.attn1 = MinimalA2AAttnOp(
+                SparseLinearAttention(
+                    dim // num_heads, topk=sla_topk, BLKQ=128, BLKK=64
+                )
+            )
+        else:
+            self.attn1 = USPAttention(
+                num_heads=num_heads,
+                head_size=dim // num_heads,
+                causal=False,
+                supported_attention_backends=supported_attention_backends,
+                prefix=f"{prefix}.attn1",
+            )
 
         self.hidden_dim = dim
         self.num_attention_heads = num_heads
@@ -610,6 +621,7 @@ class WanTransformer3DModel(CachableDiT):
         self.num_channels_latents = config.num_channels_latents
         self.patch_size = config.patch_size
         self.text_len = config.text_len
+        self.dit_module_names = ["blocks"]
 
         # 1. Patch & position embedding
         self.patch_embedding = PatchEmbed(
@@ -647,6 +659,8 @@ class WanTransformer3DModel(CachableDiT):
                     self._supported_attention_backends
                     | {AttentionBackendEnum.VIDEO_SPARSE_ATTN},
                     prefix=f"{config.prefix}.blocks.{i}",
+                    attention_type=config.attention_type,
+                    sla_topk=config.sla_topk,
                 )
                 for i in range(config.num_layers)
             ]
@@ -792,10 +806,25 @@ class WanTransformer3DModel(CachableDiT):
             if enable_teacache:
                 original_hidden_states = hidden_states.clone()
 
-            for block in self.blocks:
-                hidden_states = block(
-                    hidden_states, encoder_hidden_states, timestep_proj, freqs_cis
-                )
+            offload_mgr = getattr(self, "_layerwise_offload_manager", None)
+            if offload_mgr is not None and getattr(offload_mgr, "enabled", False):
+                for i, block in enumerate(self.blocks):
+                    with offload_mgr.layer_scope(
+                        prefetch_layer_idx=i + 1,
+                        release_layer_idx=i,
+                        non_blocking=True,
+                    ):
+                        hidden_states = block(
+                            hidden_states,
+                            encoder_hidden_states,
+                            timestep_proj,
+                            freqs_cis,
+                        )
+            else:
+                for block in self.blocks:
+                    hidden_states = block(
+                        hidden_states, encoder_hidden_states, timestep_proj, freqs_cis
+                    )
             # if teacache is enabled, we need to cache the original hidden states
             if enable_teacache:
                 self.maybe_cache_states(hidden_states, original_hidden_states)

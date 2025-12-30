@@ -300,10 +300,13 @@ class Indexer(CustomOp):
             seqlens_32 = metadata.get_seqlens_expanded()
         else:
             seqlens_32 = metadata.get_seqlens_int32()
-        # NOTE(dark): 132 is SM count on H200/B200, not magic number
-        schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
-            seqlens_32, blocksize, self.sm_count
-        )
+        # Reuse pre-computed schedule metadata if available (from init_forward_metadata),
+        # otherwise fall back to computing it here.
+        schedule_metadata = getattr(metadata, "paged_mqa_schedule_metadata", None)
+        if schedule_metadata is None:
+            schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
+                seqlens_32, blocksize, self.sm_count
+            )
 
         assert len(q_fp8.shape) == 3
         q_fp8 = q_fp8.unsqueeze(1)  # the next_n dim is 1 now

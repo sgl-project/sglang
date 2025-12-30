@@ -7,10 +7,10 @@ from sglang.srt.function_call.core_types import StreamingParseResult
 from sglang.srt.function_call.deepseekv3_detector import DeepSeekV3Detector
 from sglang.srt.function_call.deepseekv32_detector import DeepSeekV32Detector
 from sglang.srt.function_call.glm4_moe_detector import Glm4MoeDetector
+from sglang.srt.function_call.glm47_moe_detector import Glm47MoeDetector
 from sglang.srt.function_call.json_array_parser import JsonArrayParser
 from sglang.srt.function_call.kimik2_detector import KimiK2Detector
 from sglang.srt.function_call.llama32_detector import Llama32Detector
-from sglang.srt.function_call.mimo_detector import MiMoDetector
 from sglang.srt.function_call.mistral_detector import MistralDetector
 from sglang.srt.function_call.pythonic_detector import PythonicDetector
 from sglang.srt.function_call.qwen3_coder_detector import Qwen3CoderDetector
@@ -1162,6 +1162,7 @@ class TestDeepSeekV32Detector(unittest.TestCase):
         from transformers import AutoTokenizer
 
         self.tokenizer = AutoTokenizer.from_pretrained("deepseek-ai/DeepSeek-V3.2")
+        self.interval = 1
 
     def test_detect_and_parse_xml_format(self):
         """Test parsing standard XML format (DSML)"""
@@ -1239,14 +1240,17 @@ class TestDeepSeekV32Detector(unittest.TestCase):
         text = """<｜DSML｜function_calls>
             <｜DSML｜invoke name="get_favorite_tourist_spot">
                 <｜DSML｜parameter name="city" string="true">San Francisco</｜DSML｜parameter>
-                <｜DSML｜parameter name="second" string="true">London</｜DSML｜parameter>
+                <｜DSML｜parameter name="another_city" string="true">London</｜DSML｜parameter>
                 <｜DSML｜parameter name="topn" string="false">10</｜DSML｜parameter>
                 <｜DSML｜parameter name="obj" string="false">{"name": "John", "age": 30}</｜DSML｜parameter>
             </｜DSML｜invoke>
         </｜DSML｜function_calls>"""
 
         input_ids = self.tokenizer.encode(text, add_special_tokens=False)
-        chunk_ids = [input_ids[i : i + 5] for i in range(0, len(input_ids), 5)]
+        chunk_ids = [
+            input_ids[i : i + self.interval]
+            for i in range(0, len(input_ids), self.interval)
+        ]
         chunks = [self.tokenizer.decode(chunk_id) for chunk_id in chunk_ids]
 
         tool_calls_by_index = {}
@@ -1270,15 +1274,12 @@ class TestDeepSeekV32Detector(unittest.TestCase):
 
         self.assertEqual(len(tool_calls_by_index), 1)
         self.assertEqual(tool_calls_by_index[0]["name"], "get_favorite_tourist_spot")
-        # Note: The detector might accumulate partial JSON string which is valid,
-        # but for XML format it constructs JSON at the end.
-        # Let's check if the final parameters parse correctly.
-        try:
-            params = json.loads(tool_calls_by_index[0]["parameters"])
-            self.assertEqual(params["city"], "San Francisco")
-        except json.JSONDecodeError:
-            # In streaming XML, parameters might be constructed differently or incrementally
-            pass
+        params = json.loads(tool_calls_by_index[0]["parameters"])
+        self.assertEqual(params["city"], "San Francisco")
+        self.assertEqual(params["another_city"], "London")
+        self.assertEqual(params["topn"], 10)
+        self.assertEqual(params["obj"]["name"], "John")
+        self.assertEqual(params["obj"]["age"], 30)
 
     def test_streaming_json_format(self):
         """Test streaming parsing of JSON format"""
@@ -1291,7 +1292,10 @@ class TestDeepSeekV32Detector(unittest.TestCase):
         </｜DSML｜function_calls>"""
 
         input_ids = self.tokenizer.encode(text, add_special_tokens=False)
-        chunk_ids = [input_ids[i : i + 5] for i in range(0, len(input_ids), 5)]
+        chunk_ids = [
+            input_ids[i : i + self.interval]
+            for i in range(0, len(input_ids), self.interval)
+        ]
         chunks = [self.tokenizer.decode(chunk_id) for chunk_id in chunk_ids]
 
         tool_calls_by_index = {}
@@ -1379,9 +1383,11 @@ class TestDeepSeekV32Detector(unittest.TestCase):
         self.detector = DeepSeekV32Detector()
 
         # Simulate streaming by splitting into small chunks
-        # chunks = [text[i : i + 5] for i in range(0, len(text), 5)]
         input_ids = self.tokenizer.encode(text, add_special_tokens=False)
-        chunk_ids = [input_ids[i : i + 5] for i in range(0, len(input_ids), 5)]
+        chunk_ids = [
+            input_ids[i : i + self.interval]
+            for i in range(0, len(input_ids), self.interval)
+        ]
         chunks = [self.tokenizer.decode(chunk_id) for chunk_id in chunk_ids]
 
         tool_calls_by_index = {}
@@ -1437,7 +1443,12 @@ class TestDeepSeekV32Detector(unittest.TestCase):
         # Reset detector state
         self.detector = DeepSeekV32Detector()
 
-        chunks = [text[i : i + 5] for i in range(0, len(text), 5)]
+        input_ids = self.tokenizer.encode(text, add_special_tokens=False)
+        chunk_ids = [
+            input_ids[i : i + self.interval]
+            for i in range(0, len(input_ids), self.interval)
+        ]
+        chunks = [self.tokenizer.decode(chunk_id) for chunk_id in chunk_ids]
 
         tool_calls_by_index = {}
 
@@ -2247,444 +2258,280 @@ class TestGlm4MoeDetector(unittest.TestCase):
         check_single_todos(result, expected_output)
 
 
-class TestMiMoDetector(unittest.TestCase):
+class TestGlm47MoeDetector(unittest.TestCase):
     def setUp(self):
-        # Create sample tools for testing
         self.tools = [
             Tool(
                 type="function",
                 function=Function(
-                    name="get_current_weather",
-                    description="Get the current weather",
+                    name="get_weather",
+                    description="Get weather information",
                     parameters={
+                        "type": "object",
                         "properties": {
-                            "city": {"type": "string", "description": "The city name"},
-                            "state": {
-                                "type": "string",
-                                "description": "The state code",
-                            },
-                            "unit": {
-                                "type": "string",
-                                "enum": ["fahrenheit", "celsius"],
-                            },
+                            "city": {"type": "string", "description": "City name"},
+                            "date": {"type": "string", "description": "Date"},
                         },
-                        "required": ["city", "state"],
+                        "required": ["city", "date"],
                     },
                 ),
             ),
+        ]
+        self.detector = Glm47MoeDetector()
+
+    def test_single_tool_call(self):
+        text = (
+            "<tool_call>get_weather"
+            "<arg_key>city</arg_key><arg_value>Beijing</arg_value>"
+            "<arg_key>date</arg_key><arg_value>2024-06-27</arg_value>"
+            "</tool_call>"
+        )
+        result = self.detector.detect_and_parse(text, self.tools)
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(result.calls[0].name, "get_weather")
+        self.assertEqual(
+            result.calls[0].parameters, '{"city": "Beijing", "date": "2024-06-27"}'
+        )
+        self.assertEqual(result.normal_text, "")
+
+    def test_multiple_tool_calls(self):
+        text = (
+            "<tool_call>get_weather"
+            "<arg_key>city</arg_key><arg_value>Beijing</arg_value>"
+            "<arg_key>date</arg_key><arg_value>2024-06-27</arg_value>"
+            "</tool_call>"
+            "<tool_call>get_weather"
+            "<arg_key>city</arg_key><arg_value>Shanghai</arg_value>"
+            "<arg_key>date</arg_key><arg_value>2024-06-28</arg_value>"
+            "</tool_call>"
+        )
+        result = self.detector.detect_and_parse(text, self.tools)
+        self.assertEqual(len(result.calls), 2)
+        self.assertEqual(result.calls[0].name, "get_weather")
+        self.assertEqual(
+            result.calls[0].parameters, '{"city": "Beijing", "date": "2024-06-27"}'
+        )
+        self.assertEqual(result.calls[1].name, "get_weather")
+        self.assertEqual(
+            result.calls[1].parameters, '{"city": "Shanghai", "date": "2024-06-28"}'
+        )
+        self.assertEqual(result.normal_text, "")
+
+    def test_streaming_tool_call(self):
+        """Test streaming incremental parsing of a tool call."""
+        chunks = [
+            "<tool_call>get_weather",
+            "<arg_key>city</arg_key><arg_value>Beijing</arg_value>",
+            "<arg_key>date</arg_key><arg_value>2024-06-27</arg_value>",
+            "</tool_call>",
+        ]
+        tool_calls = []
+        for chunk in chunks:
+            result = self.detector.parse_streaming_increment(chunk, self.tools)
+            for tool_call_chunk in result.calls:
+                if (
+                    hasattr(tool_call_chunk, "tool_index")
+                    and tool_call_chunk.tool_index is not None
+                ):
+                    while len(tool_calls) <= tool_call_chunk.tool_index:
+                        tool_calls.append({"name": "", "parameters": ""})
+                    tc = tool_calls[tool_call_chunk.tool_index]
+                    if tool_call_chunk.name:
+                        tc["name"] = tool_call_chunk.name
+                    if tool_call_chunk.parameters:
+                        tc["parameters"] += tool_call_chunk.parameters
+        self.assertEqual(len(tool_calls), 1)
+        self.assertEqual(tool_calls[0]["name"], "get_weather")
+        self.assertEqual(
+            tool_calls[0]["parameters"], '{"city": "Beijing", "date": "2024-06-27"}'
+        )
+
+    def test_streaming_multiple_tool_calls(self):
+        """Test streaming incremental parsing of multiple tool calls."""
+        chunks = [
+            "<tool_call>get_weather",
+            "<arg_key>city</arg_key><arg_value>Beijing</arg_value>",
+            "<arg_key>date</arg_key><arg_value>2024-06-27</arg_value>",
+            "</tool_call><tool_call>get_weather",
+            "<arg_key>city</arg_key><arg_value>Shanghai</arg_value>",
+            "<arg_key>date</arg_key><arg_value>2024-06-28</arg_value>",
+            "</tool_call>",
+        ]
+        tool_calls = []
+        for chunk in chunks:
+            result = self.detector.parse_streaming_increment(chunk, self.tools)
+            for tool_call_chunk in result.calls:
+                if (
+                    hasattr(tool_call_chunk, "tool_index")
+                    and tool_call_chunk.tool_index is not None
+                ):
+                    while len(tool_calls) <= tool_call_chunk.tool_index:
+                        tool_calls.append({"name": "", "parameters": ""})
+                    tc = tool_calls[tool_call_chunk.tool_index]
+                    if tool_call_chunk.name:
+                        tc["name"] = tool_call_chunk.name
+                    if tool_call_chunk.parameters:
+                        tc["parameters"] += tool_call_chunk.parameters
+        self.assertEqual(len(tool_calls), 2)
+        self.assertEqual(tool_calls[0]["name"], "get_weather")
+        self.assertEqual(
+            tool_calls[0]["parameters"], '{"city": "Beijing", "date": "2024-06-27"}'
+        )
+        self.assertEqual(tool_calls[1]["name"], "get_weather")
+        self.assertEqual(
+            tool_calls[1]["parameters"], '{"city": "Shanghai", "date": "2024-06-28"}'
+        )
+
+    def test_tool_call_id(self):
+        """Test that the buffer and state are reset after a tool call is completed."""
+        chunks = [
+            "<tool_call>get_weather",
+            "<arg_key>city</arg_key><arg_value>Beijing</arg_value>",
+            "<arg_key>date</arg_key><arg_value>2024-06-27</arg_value>",
+            "</tool_call>",
+        ]
+        for chunk in chunks:
+            result = self.detector.parse_streaming_increment(chunk, self.tools)
+        self.assertEqual(self.detector.current_tool_id, 1)
+
+    def test_invalid_tool_call(self):
+        """Test that invalid tool calls are handled correctly."""
+        text = "<tool_call>invalid_func<arg_key>city</arg_key><arg_value>Beijing</arg_value></tool_call>"
+        result = self.detector.detect_and_parse(text, self.tools)
+        self.assertEqual(len(result.calls), 0)
+
+    def test_partial_tool_call(self):
+        """Test parsing a partial tool call that spans multiple chunks."""
+        chunks = [
+            "<tool_call>get_weather",
+            "<arg_key>city</arg_key><arg_value>Beijing</arg_value>",
+            "<arg_key>date</arg_key><arg_value>2024-06-27</arg_value></tool_call>",
+        ]
+
+        tool_calls = []
+        for chunk in chunks:
+            result = self.detector.parse_streaming_increment(chunk, self.tools)
+            for tool_call_chunk in result.calls:
+                if (
+                    hasattr(tool_call_chunk, "tool_index")
+                    and tool_call_chunk.tool_index is not None
+                ):
+                    while len(tool_calls) <= tool_call_chunk.tool_index:
+                        tool_calls.append({"name": "", "parameters": ""})
+                    tc = tool_calls[tool_call_chunk.tool_index]
+                    if tool_call_chunk.name:
+                        tc["name"] = tool_call_chunk.name
+                    if tool_call_chunk.parameters:
+                        tc["parameters"] += tool_call_chunk.parameters
+
+        self.assertEqual(len(tool_calls), 1)
+        self.assertEqual(tool_calls[0]["name"], "get_weather")
+        self.assertEqual(
+            tool_calls[0]["parameters"], '{"city": "Beijing", "date": "2024-06-27"}'
+        )
+
+    def test_array_argument_with_escaped_json(self):
+        """Test that array arguments with escaped JSON are properly handled without double-escaping."""
+        # Add a tool with array parameter
+        tools_with_array = [
             Tool(
                 type="function",
                 function=Function(
-                    name="calculate_area",
-                    description="Calculate area of a shape",
+                    name="todo_write",
+                    description="Write todos",
                     parameters={
+                        "type": "object",
                         "properties": {
-                            "shape": {"type": "string"},
-                            "dimensions": {"type": "object"},
-                            "precision": {"type": "integer"},
-                        }
+                            "todos": {
+                                "type": "array",
+                                "description": "The updated todo list",
+                            }
+                        },
+                        "required": ["todos"],
                     },
                 ),
             ),
         ]
-        self.detector = MiMoDetector()
 
-    def test_has_tool_call(self):
-        """Test detection of tool call markers."""
-        self.assertTrue(self.detector.has_tool_call("<tool_call>test</tool_call>"))
-        self.assertFalse(self.detector.has_tool_call("No tool call here"))
+        def check_params(result):
+            self.assertEqual(1, len(result.calls))
+            self.assertEqual("todo_write", result.calls[0].name)
+            params = json.loads(result.calls[0].parameters)
+            self.assertIsInstance(params["todos"], list)
+            self.assertEqual(4, len(params["todos"]))
+            self.assertEqual("1", params["todos"][0]["id"])
+            self.assertEqual(
+                "Check for hard-coded issues in the backend code",
+                params["todos"][0]["task"],
+            )
+            self.assertEqual("in_progress", params["todos"][0]["status"])
+            self.assertEqual("2", params["todos"][1]["id"])
+            self.assertEqual(
+                "Check for hard-coded issues in the frontend code",
+                params["todos"][1]["task"],
+            )
+            self.assertEqual("pending", params["todos"][1]["status"])
+            self.assertEqual("3", params["todos"][2]["id"])
+            self.assertEqual(
+                "Check for code violating the Single Responsibility Principle",
+                params["todos"][2]["task"],
+            )
+            self.assertEqual("pending", params["todos"][2]["status"])
+            self.assertEqual("4", params["todos"][3]["id"])
+            self.assertEqual(
+                "Generate a rectification proposal report", params["todos"][3]["task"]
+            )
+            self.assertEqual("pending", params["todos"][3]["status"])
 
-    def test_detect_and_parse_no_tools(self):
-        """Test parsing text without tool calls."""
-        model_output = "This is a test response without any tool calls"
-        result = self.detector.detect_and_parse(model_output, tools=[])
-        self.assertEqual(result.normal_text, model_output)
-        self.assertEqual(result.calls, [])
-
-    def test_detect_and_parse_single_tool(self):
-        """Test parsing a single tool call."""
-        model_output = """<tool_call>
-<function=get_current_weather>
-<parameter=city>Dallas</parameter>
-<parameter=state>TX</parameter>
-<parameter=unit>fahrenheit</parameter>
-</function>
-</tool_call>"""
-
-        result = self.detector.detect_and_parse(model_output, tools=self.tools)
-
-        self.assertEqual(result.normal_text, "")
-        self.assertEqual(len(result.calls), 1)
-        self.assertEqual(result.calls[0].name, "get_current_weather")
-
-        params = json.loads(result.calls[0].parameters)
-        self.assertEqual(params["city"], "Dallas")
-        self.assertEqual(params["state"], "TX")
-        self.assertEqual(params["unit"], "fahrenheit")
-
-    def test_detect_and_parse_with_content(self):
-        """Test parsing tool call with surrounding text."""
-        model_output = """Sure! Let me check the weather for you.<tool_call>
-<function=get_current_weather>
-<parameter=city>Dallas</parameter>
-<parameter=state>TX</parameter>
-<parameter=unit>fahrenheit</parameter>
-</function>
-</tool_call>"""
-
-        result = self.detector.detect_and_parse(model_output, tools=self.tools)
-
-        self.assertEqual(result.normal_text, "Sure! Let me check the weather for you.")
-        self.assertEqual(len(result.calls), 1)
-        self.assertEqual(result.calls[0].name, "get_current_weather")
-
-    def test_detect_and_parse_multiline_param(self):
-        """Test parsing tool call with multiline parameter values."""
-        model_output = """<tool_call>
-<function=calculate_area>
-<parameter=shape>rectangle</parameter>
-<parameter=dimensions>{"width": 10, "height": 20}</parameter>
-<parameter=precision>2</parameter>
-</function>
-</tool_call>"""
-
-        result = self.detector.detect_and_parse(model_output, tools=self.tools)
-
-        self.assertEqual(len(result.calls), 1)
-        self.assertEqual(result.calls[0].name, "calculate_area")
-
-        params = json.loads(result.calls[0].parameters)
-        self.assertEqual(params["shape"], "rectangle")
-        self.assertEqual(params["dimensions"], {"width": 10, "height": 20})
-        self.assertEqual(params["precision"], 2)
-
-    def test_detect_and_parse_parallel_tools(self):
-        """Test parsing multiple tool calls."""
-        model_output = """<tool_call>
-<function=get_current_weather>
-<parameter=city>Dallas</parameter>
-<parameter=state>TX</parameter>
-<parameter=unit>fahrenheit</parameter>
-</function>
-</tool_call>
-<tool_call>
-<function=get_current_weather>
-<parameter=city>Orlando</parameter>
-<parameter=state>FL</parameter>
-<parameter=unit>fahrenheit</parameter>
-</function>
-</tool_call>"""
-
-        result = self.detector.detect_and_parse(model_output, tools=self.tools)
-
-        self.assertEqual(result.normal_text, "")
-        self.assertEqual(len(result.calls), 2)
-
-        # First call
-        self.assertEqual(result.calls[0].name, "get_current_weather")
-        params1 = json.loads(result.calls[0].parameters)
-        self.assertEqual(params1["city"], "Dallas")
-        self.assertEqual(params1["state"], "TX")
-
-        # Second call
-        self.assertEqual(result.calls[1].name, "get_current_weather")
-        params2 = json.loads(result.calls[1].parameters)
-        self.assertEqual(params2["city"], "Orlando")
-        self.assertEqual(params2["state"], "FL")
-
-    def test_parse_streaming_simple(self):
-        """Test basic streaming parsing."""
-        chunks = [
-            "Sure! ",
-            "Let me check ",
-            "the weather.",
-            "<tool_call>",
-            "\n<function=get_current_weather>",
-            "\n<parameter=city>Dallas</parameter>",
-            "\n<parameter=state>TX</parameter>",
-            "\n</function>",
-            "\n</tool_call>",
-        ]
-
-        accumulated_text = ""
-        accumulated_calls = []
-        tool_calls_by_index = {}
-
-        for chunk in chunks:
-            result = self.detector.parse_streaming_increment(chunk, tools=self.tools)
-            accumulated_text += result.normal_text
-
-            # Track calls by tool_index to handle streaming properly
-            for call in result.calls:
-                if call.tool_index is not None:
-                    if call.tool_index not in tool_calls_by_index:
-                        tool_calls_by_index[call.tool_index] = {
-                            "name": "",
-                            "parameters": "",
-                        }
-
-                    if call.name:
-                        tool_calls_by_index[call.tool_index]["name"] = call.name
-                    if call.parameters:
-                        tool_calls_by_index[call.tool_index][
-                            "parameters"
-                        ] += call.parameters
-
-        self.assertEqual(accumulated_text, "Sure! Let me check the weather.")
-        self.assertEqual(len(tool_calls_by_index), 1)
-
-        # Get the complete tool call
-        tool_call = tool_calls_by_index[0]
-        self.assertEqual(tool_call["name"], "get_current_weather")
-
-        # Parse the accumulated parameters
-        params = json.loads(tool_call["parameters"])
-        self.assertEqual(params["city"], "Dallas")
-        self.assertEqual(params["state"], "TX")
-
-    def test_parse_streaming_incomplete(self):
-        """Test streaming with incomplete tool call."""
-        # Send incomplete tool call
-        chunks = [
-            "<tool_call>",
-            "\n<function=get_current_weather>",
-            "\n<parameter=city>Dallas</parameter>",
-            "\n<parameter=state>",
-            # Missing </parameter>, </function>, </tool_call>
-        ]
-
-        tool_calls_by_index = {}
-        for chunk in chunks:
-            result = self.detector.parse_streaming_increment(chunk, tools=self.tools)
-
-            # Track calls by tool_index to handle streaming properly
-            for call in result.calls:
-                if call.tool_index is not None:
-                    if call.tool_index not in tool_calls_by_index:
-                        tool_calls_by_index[call.tool_index] = {
-                            "name": "",
-                            "parameters": "",
-                        }
-
-                    if call.name:
-                        tool_calls_by_index[call.tool_index]["name"] = call.name
-                    if call.parameters:
-                        tool_calls_by_index[call.tool_index][
-                            "parameters"
-                        ] += call.parameters
-
-        # Should have no complete tool calls yet (buffered)
-        self.assertEqual(len(tool_calls_by_index), 0)
-
-        # Now complete it
-        result = self.detector.parse_streaming_increment(
-            "TX</parameter>\n</function>\n</tool_call>", tools=self.tools
+        # Simulate the raw response from GLM-4.6 model with normal and escaped JSON in XML
+        result = self.detector.detect_and_parse(
+            """<tool_call>todo_write<arg_key>todos</arg_key><arg_value>[{\"id\": \"1\", \"task\": \"Check for hard-coded issues in the backend code\", \"status\": \"in_progress\"}, {\"id\": \"2\", \"task\": \"Check for hard-coded issues in the frontend code\", \"status\": \"pending\"}, {\"id\": \"3\", \"task\": \"Check for code violating the Single Responsibility Principle\", \"status\": \"pending\"}, {\"id\": \"4\", \"task\": \"Generate a rectification proposal report\", \"status\": \"pending\"}]</arg_value>
+</tool_call>""",
+            tools_with_array,
         )
-
-        # Update the accumulated parameters
-        for call in result.calls:
-            if call.tool_index is not None:
-                if call.tool_index not in tool_calls_by_index:
-                    tool_calls_by_index[call.tool_index] = {
-                        "name": "",
-                        "parameters": "",
-                    }
-                if call.name:
-                    tool_calls_by_index[call.tool_index]["name"] = call.name
-                if call.parameters:
-                    tool_calls_by_index[call.tool_index][
-                        "parameters"
-                    ] += call.parameters
-
-        # Now should have complete tool call
-        self.assertEqual(len(tool_calls_by_index), 1)
-        final_params = json.loads(tool_calls_by_index[0]["parameters"])
-        self.assertEqual(final_params["city"], "Dallas")
-        self.assertEqual(final_params["state"], "TX")
-
-    def test_edge_case_no_parameters(self):
-        """Test tool call without parameters."""
-        model_output = """<tool_call>
-<function=get_current_weather>
-</function>
-</tool_call>"""
-
-        result = self.detector.detect_and_parse(model_output, tools=self.tools)
-        self.assertEqual(len(result.calls), 1)
-        self.assertEqual(result.calls[0].name, "get_current_weather")
-        self.assertEqual(json.loads(result.calls[0].parameters), {})
-
-    def test_edge_case_special_chars_in_value(self):
-        """Test parameter with special characters in value."""
-        model_output = """<tool_call>
-<function=get_current_weather>
-<parameter=city>Dallas->TX</parameter>
-</function>
-</tool_call>"""
-
-        result = self.detector.detect_and_parse(model_output, tools=self.tools)
-        self.assertEqual(len(result.calls), 1)
-
-        params = json.loads(result.calls[0].parameters)
-        self.assertEqual(params["city"], "Dallas->TX")
-
-    def test_extract_tool_calls_type_conversion(self):
-        """Test parameter type conversion based on tool schema."""
-        test_tool = Tool(
-            type="function",
-            function=Function(
-                name="test_types",
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "int_param": {"type": "integer"},
-                        "float_param": {"type": "float"},
-                        "bool_param": {"type": "boolean"},
-                        "str_param": {"type": "string"},
-                        "obj_param": {"type": "object"},
-                    },
-                },
-            ),
+        check_params(result)
+        result = self.detector.detect_and_parse(
+            r"""<tool_call>todo_write<arg_key>todos</arg_key><arg_value>[{\"id\": \"1\", \"task\": \"Check for hard-coded issues in the backend code\", \"status\": \"in_progress\"}, {\"id\": \"2\", \"task\": \"Check for hard-coded issues in the frontend code\", \"status\": \"pending\"}, {\"id\": \"3\", \"task\": \"Check for code violating the Single Responsibility Principle\", \"status\": \"pending\"}, {\"id\": \"4\", \"task\": \"Generate a rectification proposal report\", \"status\": \"pending\"}]</arg_value>
+</tool_call>""",
+            tools_with_array,
         )
+        check_params(result)
 
-        model_output = """<tool_call>
-<function=test_types>
-<parameter=int_param>42</parameter>
-<parameter=float_param>3.14</parameter>
-<parameter=bool_param>true</parameter>
-<parameter=str_param>hello world</parameter>
-<parameter=obj_param>{"key": "value"}</parameter>
-</function>
-</tool_call>"""
+        def check_single_todos(tool_result, expected):
+            self.assertEqual(1, len(tool_result.calls))
+            self.assertEqual("todo_write", tool_result.calls[0].name)
+            params = json.loads(tool_result.calls[0].parameters)
+            self.assertIsInstance(params["todos"], list)
+            self.assertEqual(1, len(params["todos"]))
+            self.assertEqual("1", params["todos"][0]["id"])
+            self.assertEqual(expected, params["todos"][0]["task"])
+            self.assertEqual("pending", params["todos"][0]["status"])
 
-        result = self.detector.detect_and_parse(model_output, tools=[test_tool])
+        # Test with escaped JSON containing backslashes in content (e.g., Windows paths)
+        expected_path = r"Check file at C:\Users\test.txt"
+        result = self.detector.detect_and_parse(
+            """<tool_call>todo_write<arg_key>todos</arg_key><arg_value>[{\"id\": \"1\", \"task\": \"Check file at C:\\\\Users\\\\test.txt\", \"status\": \"pending\"}]</arg_value></tool_call>""",
+            tools_with_array,
+        )
+        check_single_todos(result, expected_path)
+        result = self.detector.detect_and_parse(
+            r"""<tool_call>todo_write<arg_key>todos</arg_key><arg_value>[{\"id\": \"1\", \"task\": \"Check file at C:\\\\Users\\\\test.txt\", \"status\": \"pending\"}]</arg_value></tool_call>""",
+            tools_with_array,
+        )
+        check_single_todos(result, expected_path)
 
-        self.assertEqual(len(result.calls), 1)
-        params = json.loads(result.calls[0].parameters)
-        self.assertEqual(params["int_param"], 42)
-        self.assertEqual(params["float_param"], 3.14)
-        self.assertEqual(params["bool_param"], True)
-        self.assertEqual(params["str_param"], "hello world")
-        self.assertEqual(params["obj_param"], {"key": "value"})
-
-    def test_parse_streaming_incremental(self):
-        """Test that streaming is truly incremental with very small chunks."""
-        # Simulate more realistic token-based chunks where <tool_call> is a single token
-        chunks = [
-            "I'll check the weather.",
-            "<tool_call>",
-            "\n<function=get_current_weather>\n",
-            "<parameter=city>",
-            "Dallas",
-            "</parameter>\n",
-            "<parameter=state>",
-            "TX",
-            "</parameter>\n",
-            "</function>\n",
-            "</tool_call>",
-        ]
-
-        accumulated_text = ""
-        tool_calls = []
-        chunks_count = 0
-
-        for chunk in chunks:
-            result = self.detector.parse_streaming_increment(chunk, self.tools)
-            accumulated_text += result.normal_text
-            chunks_count += 1
-            for tool_call_chunk in result.calls:
-                if (
-                    hasattr(tool_call_chunk, "tool_index")
-                    and tool_call_chunk.tool_index is not None
-                ):
-                    while len(tool_calls) <= tool_call_chunk.tool_index:
-                        tool_calls.append({"name": "", "parameters": ""})
-                    tc = tool_calls[tool_call_chunk.tool_index]
-                    if tool_call_chunk.name:
-                        tc["name"] = tool_call_chunk.name
-                    if tool_call_chunk.parameters:
-                        tc["parameters"] += tool_call_chunk.parameters
-
-        self.assertGreater(chunks_count, 3)
-
-        # Verify the accumulated results
-        self.assertIn("I'll check the weather.", accumulated_text)
-        self.assertEqual(len(tool_calls), 1)
-        self.assertEqual(tool_calls[0]["name"], "get_current_weather")
-
-        params = json.loads(tool_calls[0]["parameters"])
-        self.assertEqual(params, {"city": "Dallas", "state": "TX"})
-
-    def test_parse_streaming_multiple_tools(self):
-        """Test streaming with multiple tool calls."""
-        model_output = """<tool_call>
-<function=get_current_weather>
-<parameter=city>Dallas</parameter>
-<parameter=state>TX</parameter>
-</function>
-</tool_call>
-Some text in between.
-<tool_call>
-<function=calculate_area>
-<parameter=shape>circle</parameter>
-<parameter=dimensions>{"radius": 5}</parameter>
-</function>
-</tool_call>"""
-
-        # Simulate streaming by chunks
-        chunk_size = 20
-        chunks = [
-            model_output[i : i + chunk_size]
-            for i in range(0, len(model_output), chunk_size)
-        ]
-
-        accumulated_text = ""
-        tool_calls = []
-        chunks_count = 0
-
-        for chunk in chunks:
-            result = self.detector.parse_streaming_increment(chunk, self.tools)
-            accumulated_text += result.normal_text
-            chunks_count += 1
-            for tool_call_chunk in result.calls:
-                if (
-                    hasattr(tool_call_chunk, "tool_index")
-                    and tool_call_chunk.tool_index is not None
-                ):
-                    while len(tool_calls) <= tool_call_chunk.tool_index:
-                        tool_calls.append({"name": "", "parameters": ""})
-                    tc = tool_calls[tool_call_chunk.tool_index]
-                    if tool_call_chunk.name:
-                        tc["name"] = tool_call_chunk.name
-                    if tool_call_chunk.parameters:
-                        tc["parameters"] += tool_call_chunk.parameters
-
-        self.assertIn("Some text in between.", accumulated_text)
-        self.assertEqual(len(tool_calls), 2)
-        self.assertEqual(tool_calls[0]["name"], "get_current_weather")
-        self.assertEqual(tool_calls[1]["name"], "calculate_area")
-
-        # Verify parameters
-        params1 = json.loads(tool_calls[0]["parameters"])
-        self.assertEqual(params1, {"city": "Dallas", "state": "TX"})
-
-        params2 = json.loads(tool_calls[1]["parameters"])
-        self.assertEqual(params2, {"shape": "circle", "dimensions": {"radius": 5}})
-
-    def test_html_entity_decoding(self):
-        """Test that HTML entities in parameter values are decoded."""
-        model_output = """<tool_call>
-<function=get_current_weather>
-<parameter=city>Dallas &amp; Fort Worth</parameter>
-<parameter=state>TX</parameter>
-</function>
-</tool_call>"""
-
-        result = self.detector.detect_and_parse(model_output, tools=self.tools)
-
-        self.assertEqual(len(result.calls), 1)
-        params = json.loads(result.calls[0].parameters)
-        self.assertEqual(params["city"], "Dallas & Fort Worth")
+        # Should contain literal \n, not actual newline
+        expected_output = r"Print \n to see newline"
+        result = self.detector.detect_and_parse(
+            """<tool_call>todo_write<arg_key>todos</arg_key><arg_value>[{\"id\": \"1\", \"task\": \"Print \\\\n to see newline\",\"status\": \"pending\"}]</arg_value></tool_call>""",
+            tools_with_array,
+        )
+        check_single_todos(result, expected_output)
+        result = self.detector.detect_and_parse(
+            r"""<tool_call>todo_write<arg_key>todos</arg_key><arg_value>[{\"id\": \"1\", \"task\": \"Print \\\\n to see newline\",\"status\": \"pending\"}]</arg_value></tool_call>""",
+            tools_with_array,
+        )
+        check_single_todos(result, expected_output)
 
 
 class TestJsonArrayParser(unittest.TestCase):

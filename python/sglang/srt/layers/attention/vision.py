@@ -11,6 +11,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size
 from sglang.srt.utils import (
     get_bool_env_var,
@@ -20,6 +21,10 @@ from sglang.srt.utils import (
     is_hip,
     is_npu,
     print_info_once,
+)
+from sglang.srt.utils.multi_stream_utils import (
+    maybe_execute_in_parallel,
+    with_multi_stream,
 )
 
 _is_cuda = is_cuda()
@@ -294,7 +299,7 @@ class VisionTritonAttention(nn.Module):
         Returns:
              [b * s, h, head_size]
         """
-        if get_bool_env_var("SGLANG_VIT_ENABLE_CUDA_GRAPH") and self.tp_size == 1:
+        if envs.SGLANG_VIT_ENABLE_CUDA_GRAPH.get():
             if "output_ws" not in kwargs:
                 raise RuntimeError("output_ws should be prepared for cuda-graph mode")
 
@@ -363,7 +368,7 @@ class VisionFlash3Attention(nn.Module):
         Returns:
              [b * s, h, head_size]
         """
-        if get_bool_env_var("SGLANG_VIT_ENABLE_CUDA_GRAPH") and self.tp_size == 1:
+        if envs.SGLANG_VIT_ENABLE_CUDA_GRAPH.get():
             max_seqlen = cu_seqlens[1]
             output = flash_attn_varlen_func(
                 q,
@@ -531,6 +536,7 @@ class VisionAttention(nn.Module):
             [torch.Tensor, torch.Tensor, Any, Any], Tuple[torch.Tensor, torch.Tensor]
         ] = None,
         use_data_parallel: bool = False,
+        aux_stream: Optional[torch.cuda.Stream] = None,
         **kwargs,
     ):
         super().__init__()
@@ -619,6 +625,8 @@ class VisionAttention(nn.Module):
             tp_size=self.tp_size,
             prefix=add_prefix("proj", prefix),
         )
+        self.aux_stream = aux_stream
+        self.ln_events = [torch.cuda.Event(), torch.cuda.Event()] if aux_stream else []
 
     def _determine_attention_backend(self, passed_backend: Optional[str]) -> str:
         """Decide the multimodal attention backend string.
@@ -654,20 +662,40 @@ class VisionAttention(nn.Module):
 
     def _apply_qk_norm(self, q: torch.Tensor, k: torch.Tensor):
         """apply qk norm for internvl vit attn"""
-        q = q.flatten(1, 2)
-        k = k.flatten(1, 2)
 
-        if self.tp_size > 1:
-            q = tensor_model_parallel_all_gather(q.contiguous())
-            k = tensor_model_parallel_all_gather(k.contiguous())
-        q = self.q_norm(q)
-        k = self.k_norm(k)
-        if self.tp_size > 1:
-            splitter = partial(split_tensor_along_last_dim, num_partitions=self.tp_size)
-            q = splitter(q)[self.tp_rank]
-            k = splitter(k)[self.tp_rank]
-        q = q.unflatten(-1, (-1, self.head_size))
-        k = k.unflatten(-1, (-1, self.head_size))
+        def q_l2norm():
+            q_ = q.flatten(1, 2)
+            if self.tp_size > 1:
+                q_ = tensor_model_parallel_all_gather(q_.contiguous())
+            q_ = self.q_norm(q_)
+            if self.tp_size > 1:
+                splitter = partial(
+                    split_tensor_along_last_dim, num_partitions=self.tp_size
+                )
+                q_ = splitter(q_)[self.tp_rank]
+            q_ = q_.unflatten(-1, (-1, self.head_size))
+            return q_
+
+        def k_l2norm():
+            k_ = k.flatten(1, 2)
+            if self.tp_size > 1:
+                k_ = tensor_model_parallel_all_gather(k_.contiguous())
+            k_ = self.k_norm(k_)
+            if self.tp_size > 1:
+                splitter = partial(
+                    split_tensor_along_last_dim, num_partitions=self.tp_size
+                )
+                k_ = splitter(k_)[self.tp_rank]
+            k_ = k_.unflatten(-1, (-1, self.head_size))
+            return k_
+
+        with with_multi_stream(True):
+            q, k = maybe_execute_in_parallel(
+                q_l2norm,
+                k_l2norm,
+                self.ln_events,
+                self.aux_stream,
+            )
         return q, k
 
     def forward(

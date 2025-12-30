@@ -323,7 +323,11 @@ class DecodePreallocQueue:
             req.retraction_mb_id = None
             self.retracted_queue.append(req)
         else:
-            if req.bootstrap_host == FAKE_BOOTSTRAP_HOST:
+            # Auto enable FAKE mode if configured
+            if req.bootstrap_host == FAKE_BOOTSTRAP_HOST or (
+                req.bootstrap_host is None
+                and self.scheduler.server_args.disaggregation_decode_enable_fake_auto
+            ):
                 kv_receiver_class = get_kv_class(
                     TransferBackend.FAKE, KVClassType.RECEIVER
                 )
@@ -686,7 +690,7 @@ class DecodePreallocQueue:
 
         # populate metadata
         req.fill_ids = req.origin_input_ids + req.output_ids
-        req.extend_input_len = len(req.origin_input_ids)
+        req.set_extend_input_len(len(req.fill_ids))
 
         return kv_loc
 

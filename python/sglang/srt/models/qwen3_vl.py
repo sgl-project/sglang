@@ -19,7 +19,6 @@ import re
 from functools import lru_cache, partial
 from typing import Callable, Iterable, List, Optional, Tuple, Union
 
-import numpy as np
 import torch
 import torch.nn as nn
 from einops import rearrange
@@ -31,6 +30,7 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
 )
 from sglang.srt.distributed.parallel_state import get_pp_group
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
@@ -57,6 +57,7 @@ from sglang.srt.models.utils import (
     compute_cu_seqlens_from_grid_numpy,
 )
 from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
+from sglang.srt.multimodal.vit_cuda_graph_runner import ViTCudaGraphRunner
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix, get_int_env_var
 from sglang.srt.utils.hf_transformers_utils import get_processor
@@ -188,6 +189,7 @@ class Qwen3_VisionBlock(nn.Module):
         cu_seqlens: torch.Tensor,
         rotary_pos_emb_cos: torch.Tensor,
         rotary_pos_emb_sin: torch.Tensor,
+        output_ws: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         hidden_states = self.norm1(x)
         hidden_states = rearrange(hidden_states, "s b ... -> b s ...")
@@ -196,6 +198,7 @@ class Qwen3_VisionBlock(nn.Module):
             cu_seqlens=cu_seqlens,
             rotary_pos_emb_cos=rotary_pos_emb_cos,
             rotary_pos_emb_sin=rotary_pos_emb_sin,
+            output_ws=output_ws,
         )
         attn = rearrange(attn, "b s ... -> s b ...")
         x += attn
@@ -278,6 +281,11 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
         self.hidden_size = vision_config.hidden_size
         self.num_heads = vision_config.num_heads
         self.num_position_embeddings = vision_config.num_position_embeddings
+        self.num_grid_per_side = int(self.num_position_embeddings**0.5)
+        self.num_grid = self.num_grid_per_side * self.num_grid_per_side
+        self.align_corners = (
+            get_global_server_args().enable_precise_embedding_interpolation
+        )
         self.patch_size = vision_config.patch_size
         self.spatial_merge_size = vision_config.spatial_merge_size
         self.spatial_merge_unit = self.spatial_merge_size**2
@@ -341,6 +349,11 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
             ]
         )
 
+        self.tp_size = (
+            1 if use_data_parallel else get_tensor_model_parallel_world_size()
+        )
+        self.cuda_graph_runner: Optional[ViTCudaGraphRunner] = ViTCudaGraphRunner(self)
+
     @property
     def dtype(self) -> torch.dtype:
         return self.patch_embed.proj.weight.dtype
@@ -369,95 +382,39 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
         return cos_combined, sin_combined
 
     def fast_pos_embed_interpolate(self, grid_thw):
-        num_grid_per_side = int(self.num_position_embeddings**0.5)
-
-        idx_list = [[] for _ in range(4)]
-        weight_list = [[] for _ in range(4)]
-
-        # TODO: use torch instand of np
-        for t, h, w in grid_thw:
-            h_idxs = np.linspace(0, num_grid_per_side - 1, h)
-            w_idxs = np.linspace(0, num_grid_per_side - 1, w)
-
-            h_idxs_floor = h_idxs.astype(int)
-            w_idxs_floor = w_idxs.astype(int)
-            h_idxs_ceil = (h_idxs.astype(int) + 1).clip(max=num_grid_per_side - 1)
-            w_idxs_ceil = (w_idxs.astype(int) + 1).clip(max=num_grid_per_side - 1)
-
-            dh = h_idxs - h_idxs_floor
-            dw = w_idxs - w_idxs_floor
-
-            idx_list[0].extend(
-                ((h_idxs_floor * num_grid_per_side)[None].T + w_idxs_floor[None])
-                .flatten()
-                .tolist()
-                * t
-            )
-            idx_list[1].extend(
-                ((h_idxs_floor * num_grid_per_side)[None].T + w_idxs_ceil[None])
-                .flatten()
-                .tolist()
-                * t
-            )
-            idx_list[2].extend(
-                ((h_idxs_ceil * num_grid_per_side)[None].T + w_idxs_floor[None])
-                .flatten()
-                .tolist()
-                * t
-            )
-            idx_list[3].extend(
-                ((h_idxs_ceil * num_grid_per_side)[None].T + w_idxs_ceil[None])
-                .flatten()
-                .tolist()
-                * t
-            )
-
-            weight_list[0].extend(
-                ((1 - dh)[None].T * (1 - dw)[None]).flatten().tolist() * t
-            )
-            weight_list[1].extend(((1 - dh)[None].T * dw[None]).flatten().tolist() * t)
-            weight_list[2].extend((dh[None].T * (1 - dw)[None]).flatten().tolist() * t)
-            weight_list[3].extend((dh[None].T * dw[None]).flatten().tolist() * t)
-
-        device = self.pos_embed.weight.device
-        dtype = self.pos_embed.weight.dtype
-
-        p0 = (
-            self.pos_embed(torch.tensor(idx_list[0], dtype=torch.long, device=device))
-            * torch.tensor(weight_list[0], dtype=dtype, device=device)[:, None]
-        )
-        p1 = (
-            self.pos_embed(torch.tensor(idx_list[1], dtype=torch.long, device=device))
-            * torch.tensor(weight_list[1], dtype=dtype, device=device)[:, None]
-        )
-        p2 = (
-            self.pos_embed(torch.tensor(idx_list[2], dtype=torch.long, device=device))
-            * torch.tensor(weight_list[2], dtype=dtype, device=device)[:, None]
-        )
-        p3 = (
-            self.pos_embed(torch.tensor(idx_list[3], dtype=torch.long, device=device))
-            * torch.tensor(weight_list[3], dtype=dtype, device=device)[:, None]
-        )
-
-        patch_pos_embeds = p0 + p1 + p2 + p3
-        patch_pos_embeds = patch_pos_embeds.split([t * h * w for t, h, w in grid_thw])
         patch_pos_embeds_permute = []
         m_size = self.spatial_merge_size
-        for pos_embed, (t, h, w) in zip(patch_pos_embeds, grid_thw):
-            pos_embed = (
-                pos_embed.view(t, h // m_size, m_size, w // m_size, m_size, -1)
-                .permute(0, 1, 3, 2, 4, 5)
-                .flatten(0, 4)
+
+        embeds = torch.arange(self.num_grid, device=self.pos_embed.weight.device)
+        embeds = (
+            self.pos_embed(embeds)
+            .permute(1, 0)
+            .reshape(1, -1, self.num_grid_per_side, self.num_grid_per_side)
+        )
+        for t, h, w in grid_thw:
+            pos_embed = torch.nn.functional.interpolate(
+                embeds, size=(h, w), mode="bilinear", align_corners=self.align_corners
             )
+            pos_embed = pos_embed.reshape(
+                -1,
+                h // self.spatial_merge_size,
+                self.spatial_merge_size,
+                w // self.spatial_merge_size,
+                self.spatial_merge_size,
+            )
+            pos_embed = pos_embed.permute(1, 3, 2, 4, 0)
+            pos_embed = pos_embed.flatten(0, 3).repeat(t, 1)
             patch_pos_embeds_permute.append(pos_embed)
-        patch_pos_embeds = torch.cat(patch_pos_embeds_permute)
-        return patch_pos_embeds
+        return torch.cat(patch_pos_embeds_permute)
 
     def forward(
         self,
         x: torch.Tensor,
         grid_thw: torch.Tensor,
     ) -> torch.Tensor:
+        if envs.SGLANG_VIT_ENABLE_CUDA_GRAPH.get():
+            return self.forward_with_cuda_graph(x, grid_thw)
+
         x = x.to(device=self.device, dtype=self.dtype)
         x = self.patch_embed(x)
 
@@ -500,6 +457,46 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
             [x] + deepstack_feature_lists, dim=1
         )  # [seq_len, hidden_size * (1 + depth_of_deepstack)]
         return hidden_states
+
+    def forward_with_cuda_graph(
+        self,
+        x: torch.Tensor,
+        grid_thw: torch.Tensor,
+    ) -> torch.Tensor:
+        # patchify
+        x = x.to(device=self.device, dtype=self.dtype)
+        x = self.patch_embed(x)
+
+        if isinstance(grid_thw, list):
+            grid_thw_list = grid_thw
+            grid_thw = torch.tensor(grid_thw, dtype=torch.int32)
+        else:
+            grid_thw_list = grid_thw.tolist()
+
+        pos_embeds = self.fast_pos_embed_interpolate(grid_thw)
+        x += pos_embeds
+
+        # rotary embedding -> (cos, sin)
+        rotary_pos_emb_cos, rotary_pos_emb_sin = self.rot_pos_emb(grid_thw_list)
+
+        # compute cu_seqlens
+        cu_seqlens = compute_cu_seqlens_from_grid_numpy(grid_thw)
+        if not isinstance(cu_seqlens, torch.Tensor):
+            cu_seqlens = torch.tensor(cu_seqlens, device=x.device, dtype=torch.int32)
+        else:
+            cu_seqlens = cu_seqlens.to(device=x.device, dtype=torch.int32)
+        cu_seqlens = cu_seqlens.contiguous()
+
+        # blocks + merger + deepstack(optional) via CUDA Graph Runner
+        return self.cuda_graph_runner.run(
+            x=x,
+            position_embeddings=None,
+            rotary_pos_emb_cos=rotary_pos_emb_cos,
+            rotary_pos_emb_sin=rotary_pos_emb_sin,
+            cu_seqlens=cu_seqlens,
+            cu_window_seqlens=None,
+            output_indices=None,
+        )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         stacked_params_mapping = [
