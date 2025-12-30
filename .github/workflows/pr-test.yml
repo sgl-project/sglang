@@ -62,10 +62,11 @@ jobs:
       - name: Determine run mode
         id: run-mode
         run: |
-          # Run all tests for scheduled runs and workflow_call (e.g., release branch testing)
-          if [[ "${{ github.event_name }}" == "schedule" || "${{ github.event_name }}" == "workflow_call" ]]; then
+          # Run all tests for scheduled runs and workflow_call (when ref input is provided)
+          # Note: github.event_name is inherited from caller, so we detect workflow_call by checking inputs.ref
+          if [[ "${{ github.event_name }}" == "schedule" || -n "${{ inputs.ref }}" ]]; then
             echo "run_all_tests=true" >> $GITHUB_OUTPUT
-            echo "Run mode: ALL TESTS (triggered by ${{ github.event_name }})"
+            echo "Run mode: ALL TESTS (schedule=${{ github.event_name == 'schedule' }}, ref=${{ inputs.ref }})"
           else
             echo "run_all_tests=false" >> $GITHUB_OUTPUT
             echo "Run mode: FILTERED (triggered by ${{ github.event_name }})"
