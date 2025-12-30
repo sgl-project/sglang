@@ -45,6 +45,7 @@ from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
 )
 from sglang.multimodal_gen.runtime.utils.layerwise_offload import (
     LayerwiseOffloadManager,
+    OffloadableDiTMixin,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
@@ -739,9 +740,9 @@ class TransformerLoader(ComponentLoader):
 
         model = model.eval()
 
-        if server_args.dit_layerwise_offload and hasattr(model, "dit_module_names"):
+        if server_args.dit_layerwise_offload and isinstance(model, OffloadableDiTMixin):
             # TODO(will): support multiple module names
-            module_name = getattr(model, "dit_module_names", ["transformer_blocks"])[0]
+            module_name = model.layer_names[0]
             try:
                 num_layers = len(getattr(model, module_name))
             except Exception:
@@ -756,6 +757,7 @@ class TransformerLoader(ComponentLoader):
                     auto_initialize=True,
                 )
                 setattr(model, "_layerwise_offload_manager", mgr)
+                mgr.enable_forward_hooks()
 
         return model
 

@@ -6,6 +6,10 @@ from typing import Any, Dict, List, Set, Tuple
 import torch
 
 
+class OffloadableDiTMixin:
+    layer_names: List[str]
+
+
 # Adapted from skywork AI Infra diffusion optimize
 class LayerwiseOffloadManager:
     """A lightweight layerwise CPU offload manager.
