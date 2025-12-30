@@ -53,31 +53,32 @@ class SpeculativeAlgorithm(Enum):
     ) -> Union[Type[BaseSpecWorker], Type[TpModelWorker], Type[NGRAMWorker]]:
         assert not self.is_none()
 
-        if enable_overlap:
-            if self.is_eagle():
+        if self.is_eagle():
+            if enable_overlap:
                 from sglang.srt.speculative.eagle_worker_v2 import EAGLEWorkerV2
 
                 return EAGLEWorkerV2
-            elif self.is_standalone():
+
+            from sglang.srt.speculative.eagle_worker import EAGLEWorker
+
+            return EAGLEWorker
+        elif self.is_standalone():
+            if enable_overlap:
                 from sglang.srt.speculative.standalone_worker_v2 import (
                     StandaloneWorkerV2,
                 )
 
                 return StandaloneWorkerV2
-            else:
-                raise ValueError(
-                    f"Speculative algorithm {self.name} does not support overlap worker creation."
-                )
 
-        if self.is_eagle():
-            from sglang.srt.speculative.eagle_worker import EAGLEWorker
-
-            return EAGLEWorker
-        elif self.is_standalone():
             from sglang.srt.speculative.standalone_worker import StandaloneWorker
 
             return StandaloneWorker
         elif self.is_ngram():
+            if enable_overlap:
+                raise ValueError(
+                    f"Speculative algorithm {self.name} does not support overlap worker creation."
+                )
+
             from sglang.srt.speculative.ngram_worker import NGRAMWorker
 
             return NGRAMWorker
