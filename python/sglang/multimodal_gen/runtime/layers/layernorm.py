@@ -8,7 +8,6 @@ from typing import Optional, Tuple, Union
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from sgl_kernel import fused_add_rmsnorm, rmsnorm
 
 from sglang.jit_kernel.norm import can_use_fused_inplace_qknorm, fused_inplace_qknorm
 from sglang.multimodal_gen.runtime.layers.custom_op import CustomOp
@@ -17,7 +16,14 @@ from sglang.multimodal_gen.runtime.layers.triton_ops import (
     norm_infer,
     rms_norm_fn,
 )
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.common import get_bool_env_var
+
+if not current_platform.is_npu():
+    from sgl_kernel import fused_add_rmsnorm, rmsnorm
+
+if current_platform.is_npu():
+    import torch_npu
 
 
 # Copied and adapted from sglang
@@ -121,6 +127,18 @@ class RMSNorm(CustomOp):
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         return self.forward_native(x, residual)
 
+    def forward_npu(
+        self,
+        x: torch.Tensor,
+        residual: Optional[torch.Tensor] = None,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        if residual is not None:
+            out, _, residual_out = torch_npu.npu_add_rms_norm(
+                residual, x, self.weight.data, self.variance_epsilon
+            )
+            return out, residual_out
+        return torch_npu.npu_rms_norm(x, self.weight.data, self.variance_epsilon)[0]
+
     def forward_hip(
         self,
         x: torch.Tensor,
@@ -194,7 +212,7 @@ class LayerNorm(CustomOp):
         x = x.view(-1, self.hidden_size)
         return self.forward_triton(x).view(shape)
 
-    @torch.compile(backend="inductor")
+    @torch.compile(backend="inductor", disable=current_platform.is_npu())
     def forward_native(
         self,
         x: torch.Tensor,

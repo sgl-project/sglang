@@ -57,6 +57,11 @@ class CustomOp(nn.Module):
         # PyTorch-native implementation.
         return self.forward_native(*args, **kwargs)
 
+    def forward_npu(self, *args, **kwargs) -> Any:
+        # By default, we assume that NPU ops are compatible with the
+        # PyTorch-native implementation.
+        return self.forward_native(*args, **kwargs)
+
     def dispatch_forward(self) -> Callable:
         if current_platform.is_cuda():
             return self.forward_cuda

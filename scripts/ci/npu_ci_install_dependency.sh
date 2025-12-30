@@ -17,7 +17,9 @@ apt update -y && apt install -y \
     clang \
     locales \
     ccache \
-    ca-certificates
+    ca-certificates \
+    libgl1 \
+    libglib2.0-0
 update-ca-certificates
 ${PIP_INSTALL} --upgrade pip
 # Pin wheel to 0.45.1, REF: https://github.com/pypa/wheel/issues/662
@@ -61,6 +63,9 @@ chmod a+x ./CANN-custom_ops-8.2.0.0-$DEVICE_TYPE-linux.aarch64.run
 wget https://sglang-ascend.obs.cn-east-3.myhuaweicloud.com/ops/custom_ops-1.0.$DEVICE_TYPE-cp311-cp311-linux_aarch64.whl
 pip install ./custom_ops-1.0.$DEVICE_TYPE-cp311-cp311-linux_aarch64.whl
 
+git clone https://github.com/feifeibear/long-context-attention.git long-context-attention
+(cd long-context-attention && git checkout 7a52abd669efb35e550680a239e1745b620b2bae && ${PIP_INSTALL} .)
+
 ### Install SGLang
-rm -rf python/pyproject.toml && mv python/pyproject_other.toml python/pyproject.toml
-${PIP_INSTALL} -v -e "python[srt_npu]"
+rm -rf python/pyproject.toml && mv python/pyproject_npu.toml python/pyproject.toml
+${PIP_INSTALL} -v -e "python[dev_npu]"
