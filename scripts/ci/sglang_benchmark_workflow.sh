@@ -7,16 +7,20 @@ model_name=${2:-Qwen3-VL-235B}
 model_path=${3:-/models/Qwen3-VL-235B-A22B-Instruct-FP8-dynamic/}
 TP=${4:-8}
 EP=${5:-8}
+TIMEOUT=${6:-60}
 
 export SGLANG_TORCH_PROFILER_DIR=./
 export SGLANG_PROFILE_WITH_STACK=1
 export SGLANG_PROFILE_RECORD_SHAPES=1
+echo "GPU_ARCHS: ${GPU_ARCHS}"
+echo "PYTORCH_ROCM_ARCH: ${PYTORCH_ROCM_ARCH}"
 
 echo "Dectect TYPE ${TYPE}"
 echo "Detect model_name: ${model_name}"
 echo "Detect model_path ${model_path}"
 echo "Detect TP ${TP}"
 echo "Detect EP ${EP}"
+echo "Detect TIMEOUT ${TIMEOUT}"
 
 
 if [[ "${TYPE}" == "launch" ]]; then
@@ -24,6 +28,14 @@ if [[ "${TYPE}" == "launch" ]]; then
     echo "========== LAUNCHING SERVER ========"
     if [[ "${model_name}" == "Qwen3-VL-235B" ]]; then
         export SGLANG_USE_AITER=1
+        echo "********** AOT Prebuild aiter kernel start ... **********"
+        cd /aiter
+        python3 op_tests/test_rope.py
+        python3 op_tests/test_layernorm2d.py
+        python3 op_tests/test_rmsnorm2d.py
+        python3 op_tests/test_rmsnorm2dFusedAddQuant.py
+        python3 op_tests/test_trtllm_all_reduce_fusion.py
+        echo "********** AOT Prebuild aiter kernel finished ... **********"
         python3 -m sglang.launch_server \
             --model-path "${model_path}" \
             --host localhost \
@@ -65,11 +77,21 @@ if [[ "${TYPE}" == "launch" ]]; then
     elif [[ "${model_name}" == "Qwen3-Omni" ]]; then
         echo "Qwen3-Omni-Server Launch"
         export SGLANG_USE_CUDA_IPC_TRANSPORT=1
-        export SGLANG_VLM_CACHE_SIZE_MB=0
+        export SGLANG_VLM_CACHE_SIZE_MB=8192
         export SGLANG_USE_AITER=1
         export USE_PA=1
         export SGLANG_ROCM_USE_AITER_PA_ASM_PRESHUFFLE_LAYOUT=0
         export SGLANG_ROCM_USE_AITER_LINEAR_SHUFFLE=1
+        export SGLANG_ROCM_USE_AITER_LINEAR_FP8HIPB=0
+        export ROCM_QUICK_REDUCE_QUANTIZATION=INT4
+        echo "********** AOT Prebuild aiter kernel start ... **********"
+        cd /aiter
+        python3 op_tests/test_rope.py
+        python3 op_tests/test_layernorm2d.py
+        python3 op_tests/test_rmsnorm2d.py
+        python3 op_tests/test_rmsnorm2dFusedAddQuant.py
+        python3 op_tests/test_trtllm_all_reduce_fusion.py
+        echo "********** AOT Prebuild aiter kernel finished ... **********"
         python3 -m sglang.launch_server \
             --model-path "${model_path}" \
             --host localhost \
@@ -82,8 +104,10 @@ if [[ "${TYPE}" == "launch" ]]; then
             --disable-radix-cache \
             --max-prefill-tokens 32768 \
             --cuda-graph-max-bs 8 \
-            --page-size 64  \
+            --page-size 32  \
             --mm-enable-dp-encoder \
+            --enable-aiter-allreduce-fusion \
+            --max-running-requests 128 \
             --watchdog-timeout 1200 &
         sglang_pid=$!
     else
@@ -93,7 +117,7 @@ if [[ "${TYPE}" == "launch" ]]; then
 
     echo
     echo "========== WAITING FOR SERVER TO BE READY ========"
-    max_retries=60
+    max_retries=${TIMEOUT}
     retry_interval=60
     for ((i=1; i<=max_retries; i++)); do
         if curl -s http://localhost:9000/v1/completions -o /dev/null; then
