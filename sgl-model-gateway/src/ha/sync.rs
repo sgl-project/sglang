@@ -10,8 +10,8 @@ use super::{
     crdt::SKey,
     gossip::NodeStatus,
     stores::{
-        PolicyState, RateLimitConfig, StateStores, WorkerState, GLOBAL_RATE_LIMIT_COUNTER_KEY,
-        GLOBAL_RATE_LIMIT_KEY, tree_state_key,
+        tree_state_key, PolicyState, RateLimitConfig, StateStores, WorkerState,
+        GLOBAL_RATE_LIMIT_COUNTER_KEY, GLOBAL_RATE_LIMIT_KEY,
     },
     tree_ops::{TreeOperation, TreeState},
 };
@@ -380,9 +380,7 @@ impl HASyncManager {
         self.stores
             .policy
             .get(&key)
-            .and_then(|policy_state| {
-                serde_json::from_slice::<TreeState>(&policy_state.config).ok()
-            })
+            .and_then(|policy_state| serde_json::from_slice::<TreeState>(&policy_state.config).ok())
     }
 
     /// Apply remote tree operation to local policy
@@ -420,7 +418,10 @@ impl HASyncManager {
                     model_id, current_version, tree_state.version
                 );
             } else {
-                debug!("Failed to serialize remote tree state for model={}", model_id);
+                debug!(
+                    "Failed to serialize remote tree state for model={}",
+                    model_id
+                );
             }
         } else {
             debug!(

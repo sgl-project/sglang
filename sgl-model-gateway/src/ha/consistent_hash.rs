@@ -74,7 +74,7 @@ impl ConsistentHashRing {
         // Find the first node >= key_hash (clockwise)
         let mut iter = self.ring.range(key_hash..);
         let mut wrapped = false;
-        
+
         while owners.len() < max_owners {
             if let Some((_, node)) = iter.next() {
                 if !seen_nodes.contains(node) {

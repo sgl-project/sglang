@@ -23,8 +23,8 @@ pub use endpoints::{
 };
 pub use service::{broadcast_node_states, gossip, try_ping, ClusterState};
 pub use stores::{
-    AppState, AppStore, MembershipState, MembershipStore, PolicyState, PolicyStore, RateLimitStore,
-    StateStores, StoreType, WorkerState, WorkerStore, tree_state_key,
+    tree_state_key, AppState, AppStore, MembershipState, MembershipStore, PolicyState, PolicyStore,
+    RateLimitStore, StateStores, StoreType, WorkerState, WorkerStore,
 };
-pub use tree_ops::{TreeInsertOp, TreeOperation, TreeRemoveOp, TreeState};
 pub use sync::{HASyncManager, OptionalHASyncManager};
+pub use tree_ops::{TreeInsertOp, TreeOperation, TreeRemoveOp, TreeState};

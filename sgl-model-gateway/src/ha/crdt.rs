@@ -356,7 +356,7 @@ mod tests {
     fn test_crdt_pncounter_inc_and_value() {
         let mut counter = CRDTPNCounter::new();
         assert_eq!(counter.value(), 0);
-        
+
         // Test direct PNCounter usage
         use crdts::{CmRDT, PNCounter};
         let mut pn = PNCounter::new();
@@ -364,13 +364,13 @@ mod tests {
         pn.apply(op);
         let pn_val: BigInt = pn.read();
         println!("Direct PNCounter value after inc(1): {:?}", pn_val);
-        
+
         counter.inc("actor1".to_string(), 5);
         let val = counter.value();
         println!("Counter value after inc(5): {}", val);
         println!("Counter inner read(): {:?}", counter.inner.read());
         assert!(val > 0, "Counter should be incremented, got: {}", val);
-        
+
         counter.inc("actor2".to_string(), 3);
         let val2 = counter.value();
         println!("Counter value after inc(3): {}", val2);

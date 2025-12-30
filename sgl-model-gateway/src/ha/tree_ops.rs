@@ -77,7 +77,7 @@ mod tests {
             tenant: "http://worker1:8000".to_string(),
         };
         let operation = TreeOperation::Insert(insert_op.clone());
-        
+
         match &operation {
             TreeOperation::Insert(op) => {
                 assert_eq!(op.text, "test_text");
@@ -93,7 +93,7 @@ mod tests {
             tenant: "http://worker1:8000".to_string(),
         };
         let operation = TreeOperation::Remove(remove_op.clone());
-        
+
         match &operation {
             TreeOperation::Insert(_) => panic!("Expected Remove operation"),
             TreeOperation::Remove(op) => {
@@ -159,21 +159,21 @@ mod tests {
     #[test]
     fn test_tree_state_add_operation() {
         let mut state = TreeState::new("model1".to_string());
-        
+
         let insert_op = TreeInsertOp {
             text: "text1".to_string(),
             tenant: "http://worker1:8000".to_string(),
         };
         state.add_operation(TreeOperation::Insert(insert_op));
-        
+
         assert_eq!(state.operations.len(), 1);
         assert_eq!(state.version, 1);
-        
+
         let remove_op = TreeRemoveOp {
             tenant: "http://worker1:8000".to_string(),
         };
         state.add_operation(TreeOperation::Remove(remove_op));
-        
+
         assert_eq!(state.operations.len(), 2);
         assert_eq!(state.version, 2);
     }
@@ -181,7 +181,7 @@ mod tests {
     #[test]
     fn test_tree_state_add_multiple_operations() {
         let mut state = TreeState::new("model1".to_string());
-        
+
         for i in 0..5 {
             let insert_op = TreeInsertOp {
                 text: format!("text_{}", i),
@@ -189,7 +189,7 @@ mod tests {
             };
             state.add_operation(TreeOperation::Insert(insert_op));
         }
-        
+
         assert_eq!(state.operations.len(), 5);
         assert_eq!(state.version, 5);
     }
@@ -197,21 +197,21 @@ mod tests {
     #[test]
     fn test_tree_state_serialization() {
         let mut state = TreeState::new("model1".to_string());
-        
+
         let insert_op = TreeInsertOp {
             text: "test_text".to_string(),
             tenant: "http://worker1:8000".to_string(),
         };
         state.add_operation(TreeOperation::Insert(insert_op));
-        
+
         let remove_op = TreeRemoveOp {
             tenant: "http://worker1:8000".to_string(),
         };
         state.add_operation(TreeOperation::Remove(remove_op));
-        
+
         let serialized = serde_json::to_string(&state).unwrap();
         let deserialized: TreeState = serde_json::from_str(&serialized).unwrap();
-        
+
         assert_eq!(state.model_id, deserialized.model_id);
         assert_eq!(state.operations.len(), deserialized.operations.len());
         assert_eq!(state.version, deserialized.version);
@@ -220,13 +220,13 @@ mod tests {
     #[test]
     fn test_tree_state_clone() {
         let mut state = TreeState::new("model1".to_string());
-        
+
         let insert_op = TreeInsertOp {
             text: "test_text".to_string(),
             tenant: "http://worker1:8000".to_string(),
         };
         state.add_operation(TreeOperation::Insert(insert_op));
-        
+
         let cloned = state.clone();
         assert_eq!(state.model_id, cloned.model_id);
         assert_eq!(state.operations.len(), cloned.operations.len());
@@ -237,21 +237,21 @@ mod tests {
     fn test_tree_state_equality() {
         let mut state1 = TreeState::new("model1".to_string());
         let mut state2 = TreeState::new("model1".to_string());
-        
+
         let insert_op = TreeInsertOp {
             text: "test_text".to_string(),
             tenant: "http://worker1:8000".to_string(),
         };
         state1.add_operation(TreeOperation::Insert(insert_op.clone()));
         state2.add_operation(TreeOperation::Insert(insert_op));
-        
+
         assert_eq!(state1, state2);
     }
 
     #[test]
     fn test_tree_operation_hash() {
         use std::collections::HashSet;
-        
+
         let insert_op1 = TreeInsertOp {
             text: "text1".to_string(),
             tenant: "http://worker1:8000".to_string(),
@@ -260,16 +260,15 @@ mod tests {
             text: "text1".to_string(),
             tenant: "http://worker1:8000".to_string(),
         };
-        
+
         let op1 = TreeOperation::Insert(insert_op1);
         let op2 = TreeOperation::Insert(insert_op2);
-        
+
         let mut set = HashSet::new();
         set.insert(op1.clone());
         set.insert(op2.clone());
-        
+
         // Same operations should be considered equal
         assert_eq!(set.len(), 1);
     }
 }
-

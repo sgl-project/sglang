@@ -70,17 +70,9 @@ pub struct AppState {
 }
 
 /// Global rate limit configuration
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct RateLimitConfig {
     pub limit_per_second: u64,
-}
-
-impl Default for RateLimitConfig {
-    fn default() -> Self {
-        Self {
-            limit_per_second: 0, // 0 means disabled
-        }
-    }
 }
 
 /// Key for global rate limit configuration in AppStore
@@ -397,12 +389,7 @@ impl RateLimitStore {
         }
 
         let mut counters = self.counters.write();
-        Some(
-            counters
-                .entry(key.clone())
-                .or_default()
-                .clone(),
-        )
+        Some(counters.entry(key.clone()).or_default().clone())
     }
 
     pub fn get_counter(&self, key: &str) -> Option<SyncPNCounter> {
@@ -421,9 +408,7 @@ impl RateLimitStore {
         }
 
         let mut counters = self.counters.write();
-        let counter = counters
-            .entry(key.clone())
-            .or_default();
+        let counter = counters.entry(key.clone()).or_default();
         counter.inc(actor, delta);
     }
 
