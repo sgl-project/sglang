@@ -397,7 +397,7 @@ mod tests {
 
     #[test]
     fn test_lww_register_merge_older_loses() {
-        let mut reg1 = LWWRegister::new(42, "actor1".to_string());
+        let reg1 = LWWRegister::new(42, "actor1".to_string());
         thread::sleep(Duration::from_millis(1));
         let reg2 = LWWRegister::new(100, "actor2".to_string());
 

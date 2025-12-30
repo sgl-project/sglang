@@ -13,13 +13,8 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
-use super::{
-    service::HAServerHandler,
-    stores::{MembershipState, PolicyState, StoreType, WorkerState},
-    sync::HASyncManager,
-};
 
 /// HA cluster status response
 #[derive(Debug, Serialize, Deserialize)]

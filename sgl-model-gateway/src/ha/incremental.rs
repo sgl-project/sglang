@@ -3,19 +3,17 @@
 //! Collects local state changes and batches them for efficient transmission
 
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::HashMap,
     sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use parking_lot::RwLock;
-use serde::{Deserialize, Serialize};
 use tracing::{debug, trace};
 
 use super::{
-    crdt::SKey,
     gossip::StateUpdate,
-    stores::{AppState, PolicyState, StateStores, StoreType, WorkerState},
+    stores::{StateStores, StoreType},
 };
 
 /// Tracks the last sent version for each key in each store

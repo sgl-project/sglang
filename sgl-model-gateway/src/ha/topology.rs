@@ -6,12 +6,11 @@
 
 use std::{
     collections::{BTreeMap, HashSet},
-    net::SocketAddr,
     sync::Arc,
 };
 
 use parking_lot::RwLock;
-use tracing::{debug, info, warn};
+use tracing::debug;
 
 use super::{service::ClusterState, stores::MembershipState};
 

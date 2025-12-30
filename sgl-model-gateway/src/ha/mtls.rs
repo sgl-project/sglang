@@ -16,7 +16,7 @@ use rustls::{
 };
 use rustls_pemfile::{certs, pkcs8_private_keys};
 use tokio::{fs, sync::RwLock};
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
 /// mTLS configuration
 #[derive(Debug, Clone)]
@@ -104,7 +104,7 @@ impl MTLSManager {
     /// Load certificates from file
     async fn load_certs(&self, path: &Path) -> Result<Vec<CertificateDer<'static>>> {
         let cert_data = fs::read(path).await?;
-        let mut certs = certs(&mut cert_data.as_slice()).collect::<Result<Vec<_>, _>>()?;
+        let certs = certs(&mut cert_data.as_slice()).collect::<Result<Vec<_>, _>>()?;
         Ok(certs)
     }
 
@@ -145,8 +145,8 @@ impl MTLSManager {
     /// Check and reload certificates if they have changed
     async fn check_and_reload_certs(
         config: &MTLSConfig,
-        server_config: &Arc<RwLock<Option<Arc<ServerConfig>>>>,
-        client_config: &Arc<RwLock<Option<Arc<ClientConfig>>>>,
+        _server_config: &Arc<RwLock<Option<Arc<ServerConfig>>>>,
+        _client_config: &Arc<RwLock<Option<Arc<ClientConfig>>>>,
     ) -> Result<()> {
         // Get file modification times
         let server_cert_mtime = fs::metadata(&config.server_cert_path).await?.modified()?;

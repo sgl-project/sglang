@@ -2,7 +2,6 @@ use std::{net::SocketAddr, pin::Pin, sync::Arc, time::{Duration, Instant}};
 
 use anyhow::Result;
 use futures::Stream;
-use serde::{Deserialize, Serialize};
 use tokio_stream::StreamExt;
 use tonic::{transport::Server, Response, Status};
 use tracing as log;
@@ -18,13 +17,12 @@ use super::{
     },
     incremental::IncrementalUpdateCollector,
     metrics::{
-        record_ack, record_batch_received, record_batch_sent, record_nack, record_peer_reconnect,
+        record_ack, record_batch_sent, record_nack, record_peer_reconnect,
         record_snapshot_bytes, record_snapshot_duration, record_snapshot_trigger,
         update_peer_connections, ConvergenceTracker,
     },
     stores::{
-        AppStore, MembershipStore, PolicyStore, StateStores, StoreType as LocalStoreType,
-        WorkerStore,
+        StateStores, StoreType as LocalStoreType,
     },
     sync::HASyncManager,
     try_ping, ClusterState,
@@ -55,10 +53,10 @@ impl GossipService {
         };
 
         let proto_store_type = match store_type {
-            LocalStoreType::Membership => super::gossip::StoreType::Membership as i32,
-            LocalStoreType::App => super::gossip::StoreType::App as i32,
-            LocalStoreType::Worker => super::gossip::StoreType::Worker as i32,
-            LocalStoreType::Policy => super::gossip::StoreType::Policy as i32,
+            LocalStoreType::Membership => gossip::StoreType::Membership as i32,
+            LocalStoreType::App => gossip::StoreType::App as i32,
+            LocalStoreType::Worker => gossip::StoreType::Worker as i32,
+            LocalStoreType::Policy => gossip::StoreType::Policy as i32,
         };
 
         // Get all entries from the store
@@ -313,10 +311,10 @@ impl Gossip for GossipService {
                     if !all_updates.is_empty() {
                         for (store_type, updates) in all_updates {
                             let proto_store_type = match store_type {
-                                LocalStoreType::Membership => super::gossip::StoreType::Membership as i32,
-                                LocalStoreType::App => super::gossip::StoreType::App as i32,
-                                LocalStoreType::Worker => super::gossip::StoreType::Worker as i32,
-                                LocalStoreType::Policy => super::gossip::StoreType::Policy as i32,
+                                LocalStoreType::Membership => gossip::StoreType::Membership as i32,
+                                LocalStoreType::App => gossip::StoreType::App as i32,
+                                LocalStoreType::Worker => gossip::StoreType::Worker as i32,
+                                LocalStoreType::Policy => gossip::StoreType::Policy as i32,
                             };
                             
                             sequence_counter += 1;
@@ -324,7 +322,7 @@ impl Gossip for GossipService {
                             
                             let incremental_update = StreamMessage {
                                 message_type: StreamMessageType::IncrementalUpdate as i32,
-                                payload: Some(super::gossip::stream_message::Payload::Incremental(
+                                payload: Some(gossip::stream_message::Payload::Incremental(
                                     IncrementalUpdate {
                                         store: proto_store_type,
                                         updates: updates.clone(),
@@ -355,7 +353,7 @@ impl Gossip for GossipService {
 
         // Spawn task to handle incoming messages
         let mut sequence: u64 = 0;
-        let mut convergence_tracker = ConvergenceTracker::new();
+        let _convergence_tracker = ConvergenceTracker::new();
         
         // Track snapshot reception state: (store_type, total_chunks) -> received_chunks
         use std::collections::HashMap;
@@ -382,15 +380,15 @@ impl Gossip for GossipService {
                     if store_len == 0 {
                         log::info!("Store {:?} is empty, requesting snapshot from {}", store_type, peer_id);
                         let proto_store_type = match store_type {
-                            LocalStoreType::Membership => super::gossip::StoreType::Membership as i32,
-                            LocalStoreType::App => super::gossip::StoreType::App as i32,
-                            LocalStoreType::Worker => super::gossip::StoreType::Worker as i32,
-                            LocalStoreType::Policy => super::gossip::StoreType::Policy as i32,
+                            LocalStoreType::Membership => gossip::StoreType::Membership as i32,
+                            LocalStoreType::App => gossip::StoreType::App as i32,
+                            LocalStoreType::Worker => gossip::StoreType::Worker as i32,
+                            LocalStoreType::Policy => gossip::StoreType::Policy as i32,
                         };
                         
                         let snapshot_request = StreamMessage {
                             message_type: StreamMessageType::SnapshotRequest as i32,
-                            payload: Some(super::gossip::stream_message::Payload::SnapshotRequest(
+                            payload: Some(gossip::stream_message::Payload::SnapshotRequest(
                                 SnapshotRequest {
                                     store: proto_store_type,
                                     from_version: 0, // Request from beginning
@@ -466,7 +464,7 @@ impl Gossip for GossipService {
                                     }
                                     let ack = StreamMessage {
                                         message_type: StreamMessageType::Ack as i32,
-                                        payload: Some(super::gossip::stream_message::Payload::Ack(
+                                        payload: Some(gossip::stream_message::Payload::Ack(
                                             StreamAck {
                                                 sequence: msg.sequence,
                                                 success: true,
@@ -556,7 +554,7 @@ impl Gossip for GossipService {
                                     // Send ACK
                                     let ack = StreamMessage {
                                         message_type: StreamMessageType::Ack as i32,
-                                        payload: Some(super::gossip::stream_message::Payload::Ack(
+                                        payload: Some(gossip::stream_message::Payload::Ack(
                                             StreamAck {
                                                 sequence: msg.sequence,
                                                 success: true,
@@ -656,7 +654,7 @@ impl Gossip for GossipService {
                                     
                                     let ack = StreamMessage {
                                         message_type: StreamMessageType::Ack as i32,
-                                        payload: Some(super::gossip::stream_message::Payload::Ack(
+                                        payload: Some(gossip::stream_message::Payload::Ack(
                                             StreamAck {
                                                 sequence: msg.sequence,
                                                 success: true,

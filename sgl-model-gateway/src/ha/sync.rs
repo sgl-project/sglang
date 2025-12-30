@@ -4,12 +4,11 @@
 
 use std::sync::Arc;
 
-use serde::{Deserialize, Serialize};
-use tracing::{debug, info, warn};
+use tracing::debug;
 
 use super::{
     crdt::SKey,
-    stores::{PolicyState, StateStores, StoreType, WorkerState},
+    stores::{PolicyState, StateStores, WorkerState},
 };
 
 /// HA sync manager for coordinating state synchronization
@@ -176,7 +175,7 @@ mod tests {
 
     fn create_test_sync_manager() -> HASyncManager {
         let stores = Arc::new(StateStores::new());
-        HASyncManager::new(stores)
+        HASyncManager::new(stores, "test_node".to_string())
     }
 
     #[test]
@@ -375,7 +374,7 @@ mod tests {
             version: 1,
         };
 
-        manager.apply_remote_worker_state(remote_state.clone());
+        manager.apply_remote_worker_state(remote_state.clone(), None);
 
         let state = manager.get_worker_state("remote_worker1");
         assert!(state.is_some());
@@ -398,7 +397,7 @@ mod tests {
             version: 1,
         };
 
-        manager.apply_remote_policy_state(remote_state.clone());
+        manager.apply_remote_policy_state(remote_state.clone(), None);
 
         let state = manager.get_policy_state("model1");
         assert!(state.is_some());
@@ -430,7 +429,7 @@ mod tests {
             load: 0.7,
             version: 1,
         };
-        manager.apply_remote_worker_state(remote_state);
+        manager.apply_remote_worker_state(remote_state, None);
 
         let all_states = manager.get_all_worker_states();
         assert_eq!(all_states.len(), 2);
