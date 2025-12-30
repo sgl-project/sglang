@@ -66,6 +66,7 @@ from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_r
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.layers.moe import initialize_moe_config
 from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
+from sglang.srt.managers.embedding_cache_controller import EmbeddingCacheController
 from sglang.srt.managers.io_struct import (
     AbortReq,
     BaseBatchReq,
@@ -618,6 +619,12 @@ class Scheduler(
         self.req_to_token_pool, self.token_to_kv_pool_allocator = (
             self.tp_worker.get_memory_pool()
         )
+        if self.server_args.enable_mm_global_cache:
+            self.mm_global_cache = EmbeddingCacheController(
+                tp_rank=self.tp_rank,
+                tp_size=self.tp_size,
+                hidden_dim=self.model_config.hidden_size,
+            )
 
         # Create cache
         params = CacheInitParams(

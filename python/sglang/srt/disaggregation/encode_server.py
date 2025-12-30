@@ -6,7 +6,7 @@ import os
 import pickle
 import time
 import traceback
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Set, Tuple, Union
 
 import aiohttp
 import numpy as np
@@ -176,55 +176,177 @@ class MMEncoder:
                     ib_device=server_args.disaggregation_ib_device,
                 )
 
+            if getattr(self.server_args, "enable_mm_global_cache", False):
+                from sglang.srt.managers.embedding_cache_controller import (
+                    EmbeddingCacheController,
+                )
+
+                self.mm_global_cache = EmbeddingCacheController(
+                    rank, server_args.tp_size, hidden_dim=self.model_config.hidden_size
+                )
+                self.background_tasks = set()
+            else:
+                self.mm_global_cache = None
+
             self.embedding_to_send = dict()
 
         logger.info(f"rank {rank} init finish ")
 
-    async def _encode(self, mm_items) -> torch.Tensor:
-        images = load_images(mm_items)
+    def get_num_patches(self, grid: Union[torch.Tensor, List[int]]) -> int:
+        """Calculate number of raw patches (before 2x2 merge). Used for pixel_values slicing."""
+        return int(grid[0] * grid[1] * grid[2])
 
-        images_input = self.image_processor(images=images)
-        feature = images_input["pixel_values"]
+    def get_num_tokens(self, grid: Union[torch.Tensor, List[int]]) -> int:
+        """Calculate number of tokens (after 2x2 merge). Used for mm_embedding slicing."""
+        merge_size = getattr(self.image_processor, "merge_size", 2)
+        return self.get_num_patches(grid) // (merge_size**2)
+
+    def slice_embedding(
+        self, mm_embedding: torch.Tensor, grid_thw: List
+    ) -> List[torch.Tensor]:
+        """Slice a concatenated embedding tensor into individual image embeddings."""
+        slices, offset = [], 0
+        for grid in grid_thw:
+            count = self.get_num_tokens(grid)
+            slices.append(mm_embedding[offset : offset + count])
+            offset += count
+        return slices
+
+    def _calculate_hashes_from_features(
+        self, pixel_values: torch.Tensor, grid_thw: List
+    ) -> List[str]:
+        """CPU Task: Compute hashes based on processed feature patches (pixel_values)."""
+        hashes, offset = [], 0
+        for grid in grid_thw:
+            num_patches = self.get_num_patches(grid)
+            feature_slice = pixel_values[offset : offset + num_patches]
+            tmp_item = MultimodalDataItem(
+                modality=Modality.IMAGE, feature=feature_slice
+            )
+            tmp_item.set_pad_value()
+            hashes.append(tmp_item.hash)
+            offset += num_patches
+        return hashes
+
+    async def _encode(
+        self, pixel_values: torch.Tensor, images_input: dict, indices: List[int]
+    ) -> List[torch.Tensor]:
+        """
+        GPU Task: Run ViT inference ONLY on the subset of images missing from the cache.
+        """
+        grid_thw = images_input["image_grid_thw"]
+
+        # 1. Slice pixel_values to get only the patches for missing images
+        sub_pixel_list = []
+        offsets = [0]
+        curr = 0
+        for g in grid_thw:
+            curr += self.get_num_patches(g)
+            offsets.append(curr)
+
+        for idx in indices:
+            sub_pixel_list.append(pixel_values[offsets[idx] : offsets[idx + 1]])
+
+        sub_feature = torch.cat(sub_pixel_list, dim=0)
+
         mm_item = MultimodalDataItem.from_dict(
             {
                 "modality": Modality.IMAGE,
-                "feature": _convert(feature),
+                "feature": _convert(sub_feature),
             }
         )
+
         for k, v in images_input.items():
             if k == "pixel_values":
                 continue
-            mm_item.set(k, _convert(v))
+            val = _convert(v)
+            if k in _image_grid_attrs:
+                mm_item.set(k, val[indices])
+            else:
+                mm_item.set(k, val)
 
-        # support mm_cache
-        mm_embedding = None
-        mm_hash = None
+        with torch.inference_mode():
+            new_embeddings = self.model.get_image_feature([mm_item]).cpu()
+            if new_embeddings.ndim != 2:
+                new_embeddings = new_embeddings.reshape(-1, new_embeddings.shape[-1])
 
-        start_time = time.perf_counter()
-        if self.server_args.enable_prefix_mm_cache:
-            mm_item.set_pad_value()
-            mm_hash = MultiModalStaticCache.combine_hashes([mm_item.hash])
-            async with self.mm_cache_lock:
-                mm_cache = self.mm_cache.get([mm_item.hash])
-                if mm_cache is not None:
-                    mm_embedding = mm_cache
+        sub_grids = [grid_thw[i] for i in indices]
+        return self.slice_embedding(new_embeddings, sub_grids)
 
-        if mm_embedding is None:
-            with torch.inference_mode():
-                mm_embedding: torch.Tensor = self.model.get_image_feature([mm_item])
-                mm_embedding = mm_embedding.cpu()
-            if len(mm_embedding.shape) != 2:
-                mm_embedding = mm_embedding.reshape(-1, mm_embedding.shape[-1])
+    async def encode(
+        self,
+        mm_items: List[str],
+        req_id: str,
+        num_parts: int,
+        part_idx: int,
+        hashes: Optional[List[str]] = None,
+    ):
+        images = await asyncio.to_thread(load_images, mm_items)
+        images_input = self.image_processor(images=images)
+        pixel_values = _convert(images_input["pixel_values"])
+        grid_thw = images_input["image_grid_thw"]
 
-        if self.server_args.enable_prefix_mm_cache:
-            async with self.mm_cache_lock:
-                self.mm_cache.set(mm_hash, mm_embedding)
-        end_time = time.perf_counter()
-        logger.info(
-            f"Vit time : {(end_time - start_time)*1000:.2f} ms {mm_embedding.shape = }"
+        if hashes is None:
+            image_hashes = self._calculate_hashes_from_features(pixel_values, grid_thw)
+        else:
+            image_hashes = hashes
+
+        if self.mm_global_cache:
+            exist_mask = await self.mm_global_cache.batch_is_exist(image_hashes)
+        else:
+            exist_mask = [False] * len(image_hashes)
+
+        missing_indices = [i for i, exist in enumerate(exist_mask) if not exist]
+        hit_indices = [i for i, exist in enumerate(exist_mask) if exist]
+
+        gpu_task = None
+        if missing_indices:
+            gpu_task = asyncio.create_task(
+                self._encode(pixel_values, images_input, missing_indices)
+            )
+
+        if hit_indices and self.mm_global_cache:
+            hit_hashes = [image_hashes[i] for i in hit_indices]
+            hit_tokens = [self.get_num_tokens(grid_thw[i]) for i in hit_indices]
+            self.mm_global_cache.prefetch(req_id, hit_hashes, hit_tokens)
+
+        new_slices = await gpu_task if gpu_task else []
+
+        if hit_indices and self.mm_global_cache:
+            while not self.mm_global_cache.check_prefetch_progress(req_id):
+                await asyncio.sleep(0.001)
+
+        cached_slices = (
+            self.mm_global_cache.get_embeddings([image_hashes[i] for i in hit_indices])
+            if hit_indices
+            else []
         )
 
-        return _get_image_grid_dim(images_input), mm_embedding
+        final_slices = [None] * len(image_hashes)
+        for i, idx in enumerate(missing_indices):
+            final_slices[idx] = new_slices[i]
+        for i, idx in enumerate(hit_indices):
+            final_slices[idx] = cached_slices[i]
+
+        mm_embedding = torch.cat(final_slices, dim=0)
+        if self.mm_global_cache and missing_indices:
+            new_hashes = [image_hashes[i] for i in missing_indices]
+
+            async def _background_insert():
+                await asyncio.to_thread(
+                    self.mm_global_cache.insert_batch, new_hashes, new_slices
+                )
+
+            task = asyncio.create_task(_background_insert())
+            self.background_tasks.add(task)
+            task.add_done_callback(self.background_tasks.discard)
+
+        if self.rank == 0:
+            self.embedding_to_send[req_id] = EmbeddingData(
+                req_id, num_parts, part_idx, grid_thw, mm_embedding
+            )
+
+        return mm_embedding.nbytes, mm_embedding.shape[0], mm_embedding.shape[1]
 
     async def _send(
         self,
@@ -268,22 +390,6 @@ class MMEncoder:
             socket.send_multipart(
                 [pickle.dumps(new_mm_data), embedding_tensor.__buffer__()]
             )
-
-    async def encode(self, mm_items, req_id, num_parts, part_idx):
-        start_time = time.time()
-        image_grid_dim, mm_embedding = await self._encode(mm_items)
-        end_time = time.time()
-        logger.info(f"🕛 encode cost = {(end_time - start_time) * 1000:.2f}ms")
-        if self.rank == 0:
-            mm_data = EmbeddingData(
-                req_id,
-                num_parts,
-                part_idx,
-                image_grid_dim,
-                mm_embedding,
-            )
-            self.embedding_to_send[mm_data.req_id] = mm_data
-        return mm_embedding.nbytes, mm_embedding.shape[0], mm_embedding.shape[1]
 
     # For zmq_to_tokenizer zmq_to_scheduler and mooncake
     async def send(
