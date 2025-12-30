@@ -580,6 +580,7 @@ class ServerArgs:
     mm_max_concurrent_calls: int = 32
     mm_per_request_timeout: float = 10.0
     enable_broadcast_mm_inputs_process: bool = False
+    enable_batch_compute_mm_embeddings: bool = False
 
     # For checkpoint decryption
     decrypted_config_file: Optional[str] = None
@@ -3883,6 +3884,12 @@ class ServerArgs:
             action="store_true",
             default=ServerArgs.enable_broadcast_mm_inputs_process,
             help="Enable broadcast mm-inputs process in scheduler.",
+        )
+        parser.add_argument(
+            "--enable-batch-compute-mm-embeddings",
+            action="store_true",
+            default=ServerArgs.enable_batch_compute_mm_embeddings,
+            help="Enable batch computing of mm item embeddings across multiple requests.",
         )
 
         # For checkpoint decryption
