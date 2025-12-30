@@ -214,26 +214,35 @@ def handle_rerun_stage(
             print(f"Error: {workflow_name} workflow not found")
             return False
 
-        # Always dispatch on main branch and pass PR head SHA as input.
-        # This works for both fork and non-fork PRs because:
-        # - workflow_dispatch requires ref to be a branch/tag in the target repo
-        # - fork branch names don't exist in the main repo (causing 422 errors)
-        # - the workflow will checkout the specific SHA from pr_head_sha input
-        ref = "main"
-        pr_head_sha = pr.head.sha
-        print(
-            f"Triggering {workflow_name} workflow on ref: {ref}, PR head SHA: {pr_head_sha}"
-        )
+        # Check if PR is from a fork by comparing repo owners
+        is_fork = pr.head.repo.owner.login != gh_repo.owner.login
+        print(f"PR is from fork: {is_fork}")
 
-        # AMD workflow doesn't have version input, only target_stage
-        if is_amd_stage:
-            inputs = {"target_stage": stage_name, "pr_head_sha": pr_head_sha}
+        if is_fork:
+            # For fork PRs: dispatch on main and pass SHA as input
+            # This is needed because fork branch names don't exist in the main repo
+            ref = "main"
+            pr_head_sha = pr.head.sha
+            print(
+                f"Triggering {workflow_name} workflow on ref: {ref}, PR head SHA: {pr_head_sha}"
+            )
+            if is_amd_stage:
+                inputs = {"target_stage": stage_name, "pr_head_sha": pr_head_sha}
+            else:
+                inputs = {
+                    "version": "release",
+                    "target_stage": stage_name,
+                    "pr_head_sha": pr_head_sha,
+                }
         else:
-            inputs = {
-                "version": "release",
-                "target_stage": stage_name,
-                "pr_head_sha": pr_head_sha,
-            }
+            # For non-fork PRs: dispatch on the PR branch directly
+            # This allows testing workflow changes before merge
+            ref = pr.head.ref
+            print(f"Triggering {workflow_name} workflow on branch: {ref}")
+            if is_amd_stage:
+                inputs = {"target_stage": stage_name}
+            else:
+                inputs = {"version": "release", "target_stage": stage_name}
 
         # Use requests directly as PyGithub's create_dispatch only accepts HTTP 204
         dispatch_url = f"https://api.github.com/repos/{gh_repo.full_name}/actions/workflows/{target_workflow.id}/dispatches"
