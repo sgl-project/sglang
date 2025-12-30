@@ -20,7 +20,7 @@ from sglang.multimodal_gen.runtime.layers.attention import USPAttention
 from sglang.multimodal_gen.runtime.layers.layernorm import LayerNorm, RMSNorm
 from sglang.multimodal_gen.runtime.layers.linear import ReplicatedLinear
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
-    apply_flashinfer_rope_qk_inplace,
+    apply_sglang_jit_rope_qk_inplace,
 )
 from sglang.multimodal_gen.runtime.layers.triton_ops import (
     fuse_scale_shift_gate_select01_kernel,
@@ -565,11 +565,10 @@ class QwenImageCrossAttention(nn.Module):
                 raise RuntimeError("image_rotary_emb must be cos_sin_cache tensors")
 
             img_cache, txt_cache = image_rotary_emb
-
-            img_query, img_key = apply_flashinfer_rope_qk_inplace(
+            img_query, img_key = apply_sglang_jit_rope_qk_inplace(
                 img_query, img_key, img_cache, is_neox=False
             )
-            txt_query, txt_key = apply_flashinfer_rope_qk_inplace(
+            txt_query, txt_key = apply_sglang_jit_rope_qk_inplace(
                 txt_query, txt_key, txt_cache, is_neox=False
             )
 

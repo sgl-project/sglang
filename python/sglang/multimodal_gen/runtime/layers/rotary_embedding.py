@@ -105,6 +105,108 @@ def apply_flashinfer_rope_qk_inplace(
     return q_flat.view(bsz, seqlen, nheads, d), k_flat.view(bsz, seqlen, nheads, d)
 
 
+def _split_cos_sin_from_cache(
+    cache: torch.Tensor, *, dtype: torch.dtype
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Convert a 2D RoPE cache into (cos, sin) tensors."""
+    if cache.is_complex():
+        cos = cache.real.to(dtype)
+        sin = cache.imag.to(dtype)
+        return cos, sin
+    if cache.shape[1] % 2 != 0:
+        raise ValueError(
+            f"Expected complex freqs_cis or cat([cos,sin]) cache; got real cache with odd last dim={cache.shape[1]}"
+        )
+    half = cache.shape[1] // 2
+    cos = cache[:, :half].to(dtype)
+    sin = cache[:, half:].to(dtype)
+    return cos, sin
+
+
+def apply_sglang_jit_rope_qk_inplace(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    *,
+    head_size: Optional[int] = None,
+    is_neox: bool = False,
+    positions: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Apply SGLang JIT RoPE on GPU using `sglang.jit_kernel.rotary_embedding_cos_sin`."""
+    if q.dim() != 4 or k.dim() != 4:
+        raise ValueError(
+            f"Expected q/k to be 4D [bsz, seqlen, nheads, head_size], "
+            f"got q:{tuple(q.shape)} k:{tuple(k.shape)}"
+        )
+    if q.shape != k.shape:
+        raise ValueError(f"q and k must have the same shape, got {q.shape} vs {k.shape}")
+
+    if not (isinstance(cos_sin_cache, torch.Tensor) and cos_sin_cache.dim() == 2):
+        raise ValueError("cos_sin_cache must be a 2D torch.Tensor")
+
+    bsz, seqlen, nheads, d = q.shape
+    if head_size is None:
+        head_size = d
+    if head_size != d:
+        raise ValueError(f"head_size mismatch: inferred {d}, but head_size={head_size}")
+
+    try:
+        from sglang.jit_kernel.rotary_embedding import (
+            rotary_embedding_cos_sin as sglang_jit_rotary_embedding_cos_sin,
+        )
+    except Exception as e:
+        raise RuntimeError(
+            "SGLang JIT RoPE is required for apply_sglang_jit_rope_qk_inplace."
+        ) from e
+
+    num_tokens = bsz * seqlen
+
+    if positions is None:
+        pos_1d = torch.arange(seqlen, device="cpu", dtype=torch.long)
+        positions = pos_1d if bsz == 1 else pos_1d.repeat(bsz)
+    else:
+        if not (
+            isinstance(positions, torch.Tensor)
+            and positions.dtype == torch.long
+            and positions.dim() == 1
+        ):
+            raise ValueError("positions must be a 1D torch.long Tensor")
+        if positions.numel() != num_tokens:
+            raise ValueError(
+                f"positions length must be bsz*seqlen={num_tokens}, got {positions.numel()}"
+            )
+    positions = positions.to(q.device, non_blocking=True)
+
+    if cos_sin_cache.shape[0] == seqlen:
+        cache_tok = cos_sin_cache[None, :, :].expand(bsz, seqlen, cos_sin_cache.shape[1]).reshape(
+            num_tokens, cos_sin_cache.shape[1]
+        )
+    elif cos_sin_cache.shape[0] == num_tokens:
+        cache_tok = cos_sin_cache
+    else:
+        cache_tok = cos_sin_cache.index_select(0, positions)
+
+    q3 = q.reshape(num_tokens, nheads, d).contiguous()
+    k3 = k.reshape(num_tokens, nheads, d).contiguous()
+
+    cos_half, sin_half = _split_cos_sin_from_cache(cache_tok.contiguous(), dtype=q.dtype)
+
+    interleaved = not is_neox
+    if interleaved:
+        cos = cos_half.contiguous()
+        sin = sin_half.contiguous()
+    else:
+        if cos_half.shape[1] * 2 == head_size:
+            cos = torch.cat([cos_half, cos_half], dim=-1).contiguous()
+            sin = torch.cat([sin_half, sin_half], dim=-1).contiguous()
+        else:
+            cos = cos_half.contiguous()
+            sin = sin_half.contiguous()
+
+    sglang_jit_rotary_embedding_cos_sin(cos, sin, q3, k3, head_size, interleaved)
+    return q3.view(bsz, seqlen, nheads, d), k3.view(bsz, seqlen, nheads, d)
+
+
 def _rotate_neox(x: torch.Tensor) -> torch.Tensor:
     x1 = x[..., : x.shape[-1] // 2]
     x2 = x[..., x.shape[-1] // 2 :]
