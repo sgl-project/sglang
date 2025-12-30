@@ -25,6 +25,7 @@ from sglang.jit_kernel.norm import can_use_fused_inplace_qknorm, fused_inplace_q
 from sglang.jit_kernel.utils import register_jit_op
 from sglang.srt.environ import envs
 from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.utils import is_cuda
 
@@ -223,7 +224,6 @@ def apply_qk_norm(
     Returns:
         Tuple of normalized query and key tensors
     """
-    from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 
     batch_size = q.size(0)
     q_eps = q_norm.variance_epsilon

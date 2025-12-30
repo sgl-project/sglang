@@ -11,8 +11,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 
+from sglang.jit_kernel.norm import can_use_fused_inplace_qknorm as can_use_jit_qk_norm
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size
+from sglang.srt.models.utils import apply_qk_norm
 from sglang.srt.utils import (
     get_bool_env_var,
     get_device_capability,
@@ -799,7 +801,23 @@ class VisionAttention(nn.Module):
 
         # internvl
         if self.qk_normalization:
-            q, k = self._apply_qk_norm(q, k)
+            # jit kernel
+            if can_use_jit_qk_norm(self.head_size):
+
+                # q: [tokens, head, head_size]  ->  [tokens, embed_dim]
+                head_dim_for_norm = head * self.head_size
+
+                q, k = apply_qk_norm(
+                    q=q,
+                    k=k,
+                    q_norm=self.q_norm,
+                    k_norm=self.k_norm,
+                    head_dim=head_dim_for_norm,
+                    alt_stream=self.aux_stream,
+                )
+
+            else:
+                q, k = self._apply_qk_norm(q, k)
 
         output = self.qkv_backend.forward(
             q=q,
