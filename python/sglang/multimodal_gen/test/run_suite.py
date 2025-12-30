@@ -376,10 +376,20 @@ def write_execution_report(
     return str(report_path)
 
 
-def run_pytest(files, filter_expr=None, junit_xml_path=None):
+def run_pytest(files, filter_expr=None, junit_xml_path=None) -> tuple[int, list[str]]:
+    """
+    Run pytest with retry logic for flaky tests.
+
+    Returns:
+        Tuple of (exit_code, executed_cases) where executed_cases is a list of
+        case IDs that were executed across all retry attempts.
+    """
     if not files:
         print("No files to run.")
-        return 0
+        return (0, [])
+
+    # Accumulate executed cases across all retry attempts
+    all_executed_cases: set[str] = set()
 
     base_cmd = [sys.executable, "-m", "pytest", "-s", "-v"]
 
@@ -426,8 +436,13 @@ def run_pytest(files, filter_expr=None, junit_xml_path=None):
         process.wait()
         returncode = process.returncode
 
+        # Accumulate executed cases from this run before checking return code
+        if junit_xml_path:
+            cases_this_run = parse_junit_xml_for_executed_cases(junit_xml_path)
+            all_executed_cases.update(cases_this_run)
+
         if returncode == 0:
-            return 0
+            return (0, list(all_executed_cases))
 
         # Exit code 5 means no tests were collected/selected - treat as success
         # when using filters, since some partitions may have all tests filtered out
@@ -436,7 +451,7 @@ def run_pytest(files, filter_expr=None, junit_xml_path=None):
                 "No tests collected (exit code 5). This is expected when filters "
                 "deselect all tests in a partition. Treating as success."
             )
-            return 0
+            return (0, list(all_executed_cases))
 
         # check if the failure is due to an assertion in test_server_utils.py
         full_output = output_bytes.decode("utf-8", errors="replace")
@@ -455,10 +470,10 @@ def run_pytest(files, filter_expr=None, junit_xml_path=None):
         )
 
         if not (is_perf_assertion or is_flaky_ci_assertion or is_oom_error):
-            return returncode
+            return (returncode, list(all_executed_cases))
 
-    print(f"Max retry exceeded")
-    return returncode
+    logger.info("Max retry exceeded")
+    return (returncode, list(all_executed_cases))
 
 
 def main():
@@ -545,12 +560,11 @@ def main():
         print()
 
         junit_xml_path = str(target_dir / "junit_results.xml")
-        exit_code = run_pytest(
+        exit_code, executed_cases = run_pytest(
             suite_files, filter_expr=filter_expr, junit_xml_path=junit_xml_path
         )
 
-        # Generate execution report
-        executed_cases = parse_junit_xml_for_executed_cases(junit_xml_path)
+        # Generate execution report (executed_cases already collected from run_pytest)
         write_execution_report(
             suite=args.suite,
             partition_id=args.partition_id,
@@ -582,7 +596,7 @@ def main():
 
         # Run without case ID filter (standalone tests are not parametrized)
         junit_xml_path = str(target_dir / "junit_results.xml")
-        exit_code = run_pytest(
+        exit_code, _ = run_pytest(
             [standalone_file], filter_expr=args.filter, junit_xml_path=junit_xml_path
         )
 
