@@ -1355,17 +1355,6 @@ class ServerArgs:
             logger.warning(
                 f"Disabling Radix Cache for {model_arch} as it is not yet supported."
             )
-            if self.attention_backend is None:
-                if is_blackwell_supported():
-                    self.attention_backend = "trtllm_mla"
-                    logger.info(
-                        "Use trtllm_mla as attention backend for KimiLinearForCausalLM model on Blackwell"
-                    )
-                else:
-                    self.attention_backend = "flashinfer"
-                    logger.info(
-                        "Use flashinfer as attention backend for KimiLinearForCausalLM model"
-                    )
             self.disable_radix_cache = True
         elif model_arch in ["NemotronHForCausalLM"]:
             assert (
