@@ -1148,7 +1148,6 @@ class Req:
         )
 
     def update_reasoning_tokens(self, token_id, think_end_id):
-        print(f"\033[42m {token_id=} \033[0m")
         if not isinstance(token_id, list):
             token_id = [token_id]
 
