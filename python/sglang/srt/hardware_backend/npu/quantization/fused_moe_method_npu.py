@@ -735,13 +735,7 @@ class NPUW4A16Int4DynamicMoEMethod(FusedMoEMethodBase):
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
 
         self.num_experts = num_experts
-        if (
-            extra_weight_attrs.get(
-                "intermediate_size_full", intermediate_size_per_partition
-            )
-            // intermediate_size_per_partition
-            > 1
-        ):
+        if layer.moe_tp_size > 1:
             quant_method = FusedMoeWeightScaleSupported.GROUP.value
         else:
             quant_method = FusedMoeWeightScaleSupported.CHANNEL.value
