@@ -377,8 +377,6 @@ class ServerArgs:
     # Data parallelism
     dp_size: int = 1
     load_balance_method: str = "auto"
-    # FIXME: remove this after dp rank scheduling is fully supported with PD-Disaggregation
-    prefill_round_robin_balance: bool = False
 
     # Multi-node distributed serving
     dist_init_addr: Optional[str] = None
@@ -2221,13 +2219,6 @@ class ServerArgs:
             self.disable_radix_cache = True
             logger.warning("KV cache is forced as chunk cache for decode server")
 
-            if self.dp_size > 1 and not is_in_ci():
-                assert self.prefill_round_robin_balance, (
-                    "Prefill round robin balance is required when dp size > 1. "
-                    "Please make sure that the prefill instance is launched with `--load-balance-method auto` "
-                    "or `--load-balance-method follow_bootstrap_room` "
-                    "and `--prefill-round-robin-balance` is set for decode server."
-                )
         elif self.disaggregation_mode == "prefill":
             if self.disaggregation_decode_tp is None:
                 self.disaggregation_decode_tp = self.tp_size
@@ -3224,9 +3215,8 @@ class ServerArgs:
         )
         parser.add_argument(
             "--prefill-round-robin-balance",
-            default=ServerArgs.prefill_round_robin_balance,
-            action="store_true",
-            help="Prefill is round robin balanced. This is used to promise decode server can get the correct dp rank.",
+            action=DeprecatedAction,
+            help="Note: --prefill-round-robin-balance is deprecated now.",
         )
 
         # Multi-node distributed serving
