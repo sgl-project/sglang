@@ -17,6 +17,7 @@ from sglang.multimodal_gen.runtime.layers.linear import (
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import _apply_rotary_emb
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 from sglang.multimodal_gen.runtime.platforms import current_platform
+from sglang.multimodal_gen.runtime.utils.layerwise_offload import OffloadableDiTMixin
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
@@ -350,7 +351,7 @@ class RopeEmbedder:
         return torch.cat(cos_out, dim=-1), torch.cat(sin_out, dim=-1)
 
 
-class ZImageTransformer2DModel(CachableDiT):
+class ZImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
     _supports_gradient_checkpointing = True
     _no_split_modules = ["ZImageTransformerBlock"]
     param_names_mapping = ZImageDitConfig().arch_config.param_names_mapping
@@ -465,6 +466,7 @@ class ZImageTransformer2DModel(CachableDiT):
         self.rotary_emb = RopeEmbedder(
             theta=self.rope_theta, axes_dims=self.axes_dims, axes_lens=self.axes_lens
         )
+        self.layer_names = ["layers"]
 
     def unpatchify(
         self, x: List[torch.Tensor], size: List[Tuple], patch_size, f_patch_size
