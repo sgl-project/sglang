@@ -15,6 +15,7 @@ try:
         LoadMetadata,
         StoreMetadata,
     )
+
     HAS_LMCACHE_INPROC = True
 except ImportError:
     HAS_LMCACHE_INPROC = False
@@ -27,6 +28,7 @@ try:
     from sglang.srt.mem_cache.storage.lmcache.multi_process_adapter import (
         LMCacheMPConnector,
     )
+
     HAS_LMCACHE_MP = True
 except ImportError:
     HAS_LMCACHE_MP = False
@@ -81,7 +83,7 @@ class LayerTransferCounter:
         self.load_stream.synchronize()
         with self.load_stream:
             # Both connectors support load_kv_layerwise (MP connector has a stub)
-            if hasattr(self.lmc_connector, 'load_kv_layerwise'):
+            if hasattr(self.lmc_connector, "load_kv_layerwise"):
                 self.lmc_connector.load_kv_layerwise(layer_id)
 
 
@@ -95,7 +97,7 @@ class LMCRadixCache(RadixCache):
       - Overridden `match_prefix` to fetch missing prefix chunks from LMCache
       - Extended cache_finalization paths to store back into LMCache
       - Eviction barrier that respects any in-flight host->device stores
-    
+
     Supports two modes:
       - In-process mode (default): Uses LMCacheLayerwiseConnector
       - Multi-process mode: Uses LMCacheMPConnector to connect to external server
@@ -113,19 +115,19 @@ class LMCRadixCache(RadixCache):
 
         # Get server args to check MP mode
         from sglang.srt.server_args import get_global_server_args
+
         server_args = get_global_server_args()
-        
+
         # Determine if we should use MP mode
-        self._use_mp_mode = (
-            server_args is not None and 
-            getattr(server_args, 'lmcache_mp_enable', False)
+        self._use_mp_mode = server_args is not None and getattr(
+            server_args, "lmcache_mp_enable", False
         )
-        
+
         # Check if required connector is available
         _check_lmcache_available(self._use_mp_mode)
 
         kvcache = self.token_to_kv_pool_allocator.get_kvcache()
-        
+
         # Get KV cache buffers
         k_pool = getattr(
             kvcache,
@@ -137,7 +139,7 @@ class LMCRadixCache(RadixCache):
             "v_buffer",
             getattr(self.token_to_kv_pool_allocator._kvcache, "v_buffer"),
         )
-        
+
         if self._use_mp_mode:
             # Use Multi-Process mode connector
             logger.info(
@@ -313,7 +315,7 @@ class LMCRadixCache(RadixCache):
         assert new_last_node is not None
 
         self.inc_lock_ref(new_last_node)
-        
+
         with torch.cuda.stream(self.store_stream):
             if self._use_mp_mode:
                 # MP mode uses direct arguments
@@ -331,7 +333,7 @@ class LMCRadixCache(RadixCache):
                     offset=0,
                 )
                 self.lmcache_connector.store_kv(store_md)
-        
+
         with self._node_lock:
             self._in_flight_nodes.append(new_last_node)
 
