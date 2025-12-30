@@ -252,6 +252,8 @@ class NemotronHMoE(nn.Module):
             # router_scores: [num_tokens, num_experts]
             router_logits, _ = self.gate(hidden_states.to(dtype=torch.float32))
             topk_output = self.topk(hidden_states, router_logits)
+            if self.use_latent_moe:
+                hidden_states, _ = self.fc1_latent_proj(hidden_states)
             final_hidden_states = self.experts(hidden_states, topk_output)
         get_current_device_stream_fast().wait_stream(alt_stream)
 
