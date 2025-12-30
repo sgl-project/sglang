@@ -67,19 +67,20 @@ class CLIBase(unittest.TestCase):
     height: int = 720
     output_path: str = "test_outputs"
 
-    base_command = [
-        "sglang",
-        "generate",
-        "--text-encoder-cpu-offload",
-        "--pin-cpu-memory",
-        "--prompt",
-        "A curious raccoon",
-        "--save-output",
-        "--log-level=debug",
-        f"--width={width}",
-        f"--height={height}",
-        f"--output-path={output_path}",
-    ]
+    def get_base_command(self):
+        return [
+            "sglang",
+            "generate",
+            "--text-encoder-cpu-offload",
+            "--pin-cpu-memory",
+            "--prompt",
+            "A curious raccoon",
+            "--save-output",
+            "--log-level=debug",
+            f"--width={self.width}",
+            f"--height={self.height}",
+            f"--output-path={self.output_path}",
+        ]
 
     results = []
 
