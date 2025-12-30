@@ -25,7 +25,7 @@ class SpeculativeAlgorithm(Enum):
         if name is None:
             return cls.NONE
         try:
-            return cls[name]
+            return cls[name.upper()]
         except KeyError:
             raise ValueError(f"Unknown speculative algorithm name: {name}")
 
