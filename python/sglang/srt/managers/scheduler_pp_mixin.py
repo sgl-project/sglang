@@ -1343,8 +1343,7 @@ class ChunkSizePredictor:
         smoothed_chunk_size = base_chunk_size + smooth_coeff * (
             calculated_chunk_size_float - base_chunk_size
         )
-        # Make sure the dynamic chunk size is at least 1/4 of the base chunk size
-        calculated_chunk_size = max(int(smoothed_chunk_size), base_chunk_size // 4)
+        calculated_chunk_size = int(smoothed_chunk_size)
 
         # Align to page_size (minimum alignment size is 64)
         alignment_size = max(page_size, 64)

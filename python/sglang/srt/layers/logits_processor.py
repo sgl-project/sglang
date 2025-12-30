@@ -515,11 +515,16 @@ class LogitsProcessor(nn.Module):
             if hidden_states_before_norm is not None:
                 pruned_states_before_norm = torch.cat(pruned_states_before_norm_list)
             sample_indices = torch.tensor(
-                sample_indices, device=pruned_states.device, dtype=torch.int64
-            )
-            input_logprob_indices = torch.tensor(
-                input_logprob_indices, device=pruned_states.device, dtype=torch.int64
-            )
+                sample_indices, 
+                dtype=torch.int64, 
+                device="cpu", 
+                pin_memory=True
+            ).to(pruned_states.device, non_blocking=True)
+            input_logprob_indices = torch.tensor(input_logprob_indices,
+                dtype=torch.int64,
+                device="cpu",
+                pin_memory=True
+            ).to(pruned_states.device, non_blocking=True)
 
         full_logits = (
             self._get_logits(hidden_states, lm_head, logits_metadata)

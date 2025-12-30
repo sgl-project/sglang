@@ -530,23 +530,20 @@ class SchedulerOutputProcessorMixin:
 
         is_multi_item_scoring = self._is_multi_item_scoring(req)
 
-        # Initialize arrays - multi-item scoring starts empty, others start with None
-        req.input_top_logprobs_val = [] if is_multi_item_scoring else [None]
-        req.input_top_logprobs_idx = [] if is_multi_item_scoring else [None]
+        # Initialize arrays the first item
+        req.input_top_logprobs_val = torch.ones(1, req.top_logprobs_num)
+        req.input_top_logprobs_idx = torch.ones(1, req.top_logprobs_num)
 
         # Extend arrays with temp values
-        for val, idx in zip(
-            req.temp_input_top_logprobs_val,
-            req.temp_input_top_logprobs_idx,
-            strict=True,
-        ):
-            req.input_top_logprobs_val.extend(val)
-            req.input_top_logprobs_idx.extend(idx)
+        req.input_top_logprobs_val = torch.cat([req.input_top_logprobs_val] + \
+            req.temp_input_top_logprobs_val, dim=0)
+        req.input_top_logprobs_idx = torch.cat([req.input_top_logprobs_idx] +  \
+            req.temp_input_top_logprobs_idx, dim=0)
 
         # Remove last token (sampling token) for non multi-item scoring requests
         if not is_multi_item_scoring:
-            req.input_top_logprobs_val.pop()
-            req.input_top_logprobs_idx.pop()
+            req.input_top_logprobs_val = req.input_top_logprobs_val[:-1]
+            req.input_top_logprobs_idx = req.input_top_logprobs_idx[:-1]
 
         # Clean up temp storage
         req.temp_input_top_logprobs_idx = None
@@ -686,8 +683,8 @@ class SchedulerOutputProcessorMixin:
         req.input_token_logprobs.extend(input_token_logprobs)
 
         if req.top_logprobs_num > 0:
-            req.temp_input_top_logprobs_val.append(output.input_top_logprobs_val[i])
-            req.temp_input_top_logprobs_idx.append(output.input_top_logprobs_idx[i])
+            req.temp_input_top_logprobs_val.append(output.input_top_logprobs_val[i].cpu())
+            req.temp_input_top_logprobs_idx.append(output.input_top_logprobs_idx[i].cpu())
 
         if req.token_ids_logprob is not None:
             req.temp_input_token_ids_logprobs_val.append(
@@ -747,8 +744,8 @@ class SchedulerOutputProcessorMixin:
             self._initialize_empty_logprob_containers(req)
 
         if req.top_logprobs_num > 0:
-            req.output_top_logprobs_val.append(output.next_token_top_logprobs_val[i])
-            req.output_top_logprobs_idx.append(output.next_token_top_logprobs_idx[i])
+            req.output_top_logprobs_val.append(output.next_token_top_logprobs_val[i].cpu().clone().tolist())
+            req.output_top_logprobs_idx.append(output.next_token_top_logprobs_idx[i].cpu().clone().tolist())
 
         if (
             req.token_ids_logprob is not None
