@@ -579,6 +579,7 @@ class ServerArgs:
     # Context parallelism used in the long sequence prefill phase of DeepSeek v3.2
     enable_nsa_prefill_context_parallel: bool = False
     enable_fused_qk_norm_rope: bool = False
+    enable_precise_embedding_interpolation: bool = False
 
     # Dynamic batch tokenizer
     enable_dynamic_batch_tokenizer: bool = False
@@ -1997,7 +1998,7 @@ class ServerArgs:
                 )
 
             if (
-                self.speculative_algorithm in ["EAGLE", "EAGLE3"]
+                self.speculative_algorithm in ["EAGLE", "EAGLE3", "STANDALONE"]
                 and envs.SGLANG_ENABLE_SPEC_V2.get()
             ):
                 self.disable_overlap_schedule = False
@@ -4190,6 +4191,11 @@ class ServerArgs:
             "--enable-fused-qk-norm-rope",
             action="store_true",
             help="Enable fused qk normalization and rope rotary embedding.",
+        )
+        parser.add_argument(
+            "--enable-precise-embedding-interpolation",
+            action="store_true",
+            help="Enable corner alignment for resize of embeddings grid to ensure more accurate(but slower) evaluation of interpolated embedding values.",
         )
 
         # Dynamic batch tokenizer
