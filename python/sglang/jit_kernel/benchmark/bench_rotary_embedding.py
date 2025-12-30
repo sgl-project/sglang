@@ -7,6 +7,13 @@ import torch
 import triton
 import triton.testing
 
+try:
+    import sgl_kernel  # noqa: F401
+except Exception:
+    sgl_kernel = None  # type: ignore
+
+HAS_SGL_POS = hasattr(torch.ops.sgl_kernel, "rotary_embedding")
+
 IS_CI = (
     os.getenv("CI", "false").lower() == "true"
     or os.getenv("GITHUB_ACTIONS", "false").lower() == "true"
@@ -134,15 +141,15 @@ def sglang_aot_rotary_positions(
     interleaved: bool,
     cos_sin_cache: torch.Tensor,
 ) -> None:
-    from sgl_kernel.rotary_embedding import rotary_embedding
-
-    rotary_embedding(
-        positions=positions,
-        query=q,
-        key=k,
-        head_size=head_size,
-        is_neox=not interleaved,
-        cos_sin_cache=cos_sin_cache,
+    if not HAS_SGL_POS:
+        raise RuntimeError("torch.ops.sgl_kernel.rotary_embedding is not available")
+    torch.ops.sgl_kernel.rotary_embedding(
+        positions,
+        q,
+        k,
+        head_size,
+        cos_sin_cache,
+        not interleaved,  # sgl-kernel positions op uses is_neox (split-halves) flag
     )
 
 
@@ -159,13 +166,18 @@ def sglang_jit_rotary_cos_sin(
     rotary_embedding_cos_sin(cos, sin, q, k, head_size, interleaved)
 
 
-BASE_LINE_VALS = ["jit_cos_sin", "aot_pos"]
-BASE_LINE_NAMES = ["SGL JIT (cos/sin)", "SGL AOT (positions)"]
-BASE_STYLES = [("blue", "-"), ("orange", "--")]
+BASE_LINE_VALS = ["jit_cos_sin"]
+BASE_LINE_NAMES = ["SGL JIT (cos/sin)"]
+BASE_STYLES = [("blue", "-")]
 
 LINE_VALS = list(BASE_LINE_VALS)
 LINE_NAMES = list(BASE_LINE_NAMES)
 STYLES = list(BASE_STYLES)
+
+if HAS_SGL_POS:
+    LINE_VALS.append("aot_pos")
+    LINE_NAMES.append("SGL AOT (positions)")
+    STYLES.append(("orange", "--"))
 
 if HAS_VLLM:
     LINE_VALS.append("vllm_pos")

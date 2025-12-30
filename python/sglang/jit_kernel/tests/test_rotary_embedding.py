@@ -3,6 +3,13 @@
 import torch
 import triton
 
+try:
+    import sgl_kernel  # noqa: F401
+except Exception:
+    sgl_kernel = None  # type: ignore
+
+HAS_SGL_POS = hasattr(torch.ops.sgl_kernel, "rotary_embedding")
+
 
 def _compute_cos_sin_cache_half(
     max_seq_len: int,
@@ -28,18 +35,15 @@ def sglang_aot_rotary_positions(
     interleaved: bool,
     cos_sin_cache: torch.Tensor,
 ) -> None:
-    # NOTE: `sgl_kernel` positions-kernel uses `is_neox` flag internally:
-    # - is_neox=True  => x_index=i, y_index=embed_dim+i   (split halves)
-    # - is_neox=False => x_index=2*i, y_index=2*i+1       (interleaved pairs)
-    from sgl_kernel.rotary_embedding import rotary_embedding
-
-    rotary_embedding(
-        positions=positions,
-        query=q,
-        key=k,
-        head_size=head_size,
-        is_neox=not interleaved,
-        cos_sin_cache=cos_sin_cache,
+    if not HAS_SGL_POS:
+        raise RuntimeError("torch.ops.sgl_kernel.rotary_embedding is not available")
+    torch.ops.sgl_kernel.rotary_embedding(
+        positions,
+        q,
+        k,
+        head_size,
+        cos_sin_cache,
+        not interleaved,  # sgl-kernel positions op uses is_neox (split-halves) flag
     )
 
 
@@ -167,14 +171,15 @@ def main():
 
                     q_k_aot = (q.clone(), k.clone())
                     q_k_jit = (q.clone(), k.clone())
-                    sglang_aot_rotary_positions(
-                        positions,
-                        q_k_aot[0],
-                        q_k_aot[1],
-                        HEAD_SIZE,
-                        INTERLEAVED,
-                        aot_cos_sin_cache,
-                    )
+                    if HAS_SGL_POS:
+                        sglang_aot_rotary_positions(
+                            positions,
+                            q_k_aot[0],
+                            q_k_aot[1],
+                            HEAD_SIZE,
+                            INTERLEAVED,
+                            aot_cos_sin_cache,
+                        )
                     sglang_jit_rotary_cos_sin(
                         cos, sin, q_k_jit[0], q_k_jit[1], HEAD_SIZE, INTERLEAVED
                     )
@@ -182,12 +187,13 @@ def main():
                     ref_atol = 2e-2 if DTYPE == torch.bfloat16 else 2e-3
                     ref_rtol = 2e-2 if DTYPE == torch.bfloat16 else 2e-3
 
-                    triton.testing.assert_close(
-                        q_ref_fp32, q_k_aot[0], atol=ref_atol, rtol=ref_rtol
-                    )
-                    triton.testing.assert_close(
-                        k_ref_fp32, q_k_aot[1], atol=ref_atol, rtol=ref_rtol
-                    )
+                    if HAS_SGL_POS:
+                        triton.testing.assert_close(
+                            q_ref_fp32, q_k_aot[0], atol=ref_atol, rtol=ref_rtol
+                        )
+                        triton.testing.assert_close(
+                            k_ref_fp32, q_k_aot[1], atol=ref_atol, rtol=ref_rtol
+                        )
                     triton.testing.assert_close(
                         q_ref_fp32, q_k_jit[0], atol=ref_atol, rtol=ref_rtol
                     )
