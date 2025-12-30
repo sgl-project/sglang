@@ -154,7 +154,9 @@ class NPUW8A8Int8LinearMethod(_NPULinearMethodBase):
         layer.weight_data = layer.weight.data
 
         layer.weight_scale.data = torch.flatten(layer.weight_scale.data)
+        layer.weight_scale_data = layer.weight_scale.data
         layer.weight_offset.data = torch.flatten(layer.weight_offset.data)
+        layer.weight_offset_data = layer.weight_offset.data
 
         expanding_factor = layer.weight.data.shape[0]
         layer.aclnn_input_scale = torch.nn.Parameter(
@@ -220,8 +222,13 @@ class NPUW8A8Int8DynamicLinearMethod(_NPULinearMethodBase):
         )
         layer.register_parameter("weight_scale", weight_scale)
 
+        weight_offset_data = torch.empty(
+            (output_size_per_partition, 1), dtype=params_dtype
+        )
+        layer.__dict__["weight_offset_data"] = weight_offset_data
+
         weight_offset = ChannelQuantScaleParameter(
-            data=torch.empty((output_size_per_partition, 1), dtype=params_dtype),
+            data=weight_offset_data,
             output_dim=0,
             weight_loader=weight_loader,
         )
@@ -250,4 +257,6 @@ class NPUW8A8Int8DynamicLinearMethod(_NPULinearMethodBase):
         layer.weight_data = layer.weight.data
 
         layer.weight_scale.data = layer.weight_scale.data.flatten()
+        layer.weight_scale_data = layer.weight_scale.data
         layer.weight_offset.data = layer.weight_offset.data.flatten()
+        layer.weight_offset_data = layer.weight_offset.data
