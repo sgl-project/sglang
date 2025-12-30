@@ -485,6 +485,10 @@ class ServerArgs:
     hicache_storage_backend_extra_config: Optional[str] = None
     # LMCache
     enable_lmcache: bool = False
+    # LMCache Multi-Process Mode
+    lmcache_mp_enable: bool = False
+    lmcache_mp_host: str = "localhost"
+    lmcache_mp_port: int = 5555
 
     # Ktransformers/AMX expert parallelism
     kt_weight_path: Optional[str] = None
@@ -3753,6 +3757,24 @@ class ServerArgs:
             "--enable-lmcache",
             action="store_true",
             help="Using LMCache as an alternative hierarchical cache solution",
+        )
+        # LMCache Multi-Process Mode
+        parser.add_argument(
+            "--lmcache-mp-enable",
+            action="store_true",
+            help="Enable LMCache multi-process mode (connect to external LMCache server)",
+        )
+        parser.add_argument(
+            "--lmcache-mp-host",
+            type=str,
+            default=ServerArgs.lmcache_mp_host,
+            help="LMCache MP server host (default: localhost)",
+        )
+        parser.add_argument(
+            "--lmcache-mp-port",
+            type=int,
+            default=ServerArgs.lmcache_mp_port,
+            help="LMCache MP server port (default: 5555)",
         )
 
         # Ktransformer server args
