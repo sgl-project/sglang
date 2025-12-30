@@ -115,7 +115,6 @@ class LayerwiseOffloadManager:
                     self._max_buffer_size_per_dtype.get(dtype, 0), total_numel
                 )
 
-                # concatenated CPU buffer (in pinned memory)
                 cpu_buffer = torch.empty(
                     total_numel, dtype=dtype, pin_memory=self.pin_cpu_memory
                 )
@@ -124,7 +123,7 @@ class LayerwiseOffloadManager:
                 current_offset = 0
                 for name, weight in weights:
                     numel = weight.numel()
-                    cpu_buffer[current_offset : current_offset + numel].copy_(
+                    cpu_buffer[current_offset: current_offset + numel].copy_(
                         weight.flatten()
                     )
                     self._weight_metadata[layer_idx][name] = {
@@ -148,15 +147,13 @@ class LayerwiseOffloadManager:
                     torch.empty(max_size, dtype=dtype, device=self.device)
                 )
 
-        # Calculate and log the total size of the GPU buffer pool
         total_bytes = sum(
             buf.numel() * buf.element_size()
             for buffers in self._gpu_buffer_pool.values()
             for buf in buffers
         )
         logger.info(
-            f"LayerwiseOffloadManager: GPU buffer pool allocated. "
-            f"Total size: {total_bytes / 1024**2:.2f} MB"
+            f"LayerwiseOffloadManager: GPU buffer pool allocated with total size: {total_bytes / 1024 ** 2:.2f} MB"
         )
 
         # prefetch the first layer as warm-up
@@ -212,7 +209,7 @@ class LayerwiseOffloadManager:
             # map the parameter's data to the correct slice of the static GPU buffer
             target = self.get_target_with_name(name)
             target.data = gpu_buffer[
-                meta["offset"] : meta["offset"] + meta["numel"]
+                meta["offset"]: meta["offset"] + meta["numel"]
             ].view(meta["shape"])
 
         self._gpu_layers.add(layer_idx)
@@ -251,7 +248,6 @@ class LayerwiseOffloadManager:
         if layer_idx not in self._gpu_layers:
             return
 
-        # Release GPU memory by pointing to dummy tensors
         for name, meta in self._weight_metadata.get(layer_idx, {}).items():
             target = self.get_target_with_name(name)
             target.data = torch.empty((1,), device=self.device, dtype=meta["dtype"])
