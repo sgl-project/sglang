@@ -1,18 +1,22 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING, Callable, Optional
 
 import torch
 
 from sglang.srt.batch_overlap.two_batch_overlap import TboDPAttentionPreparer
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
+from sglang.srt.metrics.collector import DPCooperationInfo
 from sglang.srt.utils.common import require_mlp_tp_gather
 
 if TYPE_CHECKING:
     from sglang.srt.distributed.parallel_state import GroupCoordinator
     from sglang.srt.managers.scheduler import Scheduler
+
+
+_ENABLE_METRICS_DP_ATTENTION = envs.SGLANG_ENABLE_METRICS_DP_ATTENTION.get()
 
 
 @dataclass
@@ -33,6 +37,7 @@ class MLPSyncBatchInfo:
     global_num_tokens_for_logprob: list[int] = None
     tbo_split_seq_index: torch.Tensor = None
     global_forward_mode: int = None
+    dp_cooperation_info: Optional[DPCooperationInfo] = None
 
     def _get_local_tensor(self, device, dtype=torch.int64) -> torch.Tensor:
         return torch.tensor(
@@ -68,6 +73,8 @@ class MLPSyncBatchInfo:
         self.global_num_tokens_for_logprob = tp0_info[:, 1].tolist()
         self.can_cuda_graph = bool(tp0_info[:, 2].min().item())
         self.is_extend_in_batch = bool(tp0_info[:, 3].max().item())
+        if _ENABLE_METRICS_DP_ATTENTION:
+            self.dp_cooperation_info = DPCooperationInfo.create(tp0_info[:, 5].tolist())
 
 
 def _update_gather_batch(
@@ -114,18 +121,18 @@ def prepare_mlp_sync_batch_raw(
         num_tokens_for_logprob = num_tokens
     else:
         num_tokens = local_batch.extend_num_tokens
-        if local_batch.return_logprob:
-            num_tokens_for_logprob = sum(
-                # We should have at least 1 token for sample in every case.
-                max(extend_len - logprob_start_len, 1)
-                for logprob_start_len, extend_len in zip(
-                    local_batch.extend_logprob_start_lens,
-                    local_batch.extend_lens,
-                )
+        num_tokens_for_logprob = sum(
+            # We should have at least 1 token for sample in every case.
+            max(extend_len - logprob_start_len, 1)
+            for logprob_start_len, extend_len in zip(
+                local_batch.extend_logprob_start_lens,
+                local_batch.extend_lens,
             )
-        else:
-            # When return_logprob = False, only need last token per request
-            num_tokens_for_logprob = local_batch.batch_size()
+        )
+        assert (
+            local_batch.return_logprob
+            or num_tokens_for_logprob == local_batch.batch_size()
+        )
 
     skip_all_gather = envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.get()
     can_cuda_graph = (
@@ -179,6 +186,9 @@ def prepare_mlp_sync_batch_raw(
         _update_gather_batch(
             batch_to_gather, mlp_sync_info, require_mlp_tp_gather, skip_all_gather
         )
+
+    if _ENABLE_METRICS_DP_ATTENTION and local_batch is not None:
+        local_batch.dp_cooperation_info = mlp_sync_info.dp_cooperation_info
 
     return local_batch
 
