@@ -102,6 +102,7 @@ subtle = "2.6"
 jsonwebtoken = { version = "9.3", default-features = false, features = ["use_pem"] }
 rustpython-parser = "0.4.0"
 num-traits = "0.2"
+num-bigint = "0.4"
 image = { version = "0.25.4", default-features = false, features = ["png", "jpeg", "gif", "bmp", "ico", "tiff", "webp"] }
 ndarray = "0.16"
 base64 = "0.22"

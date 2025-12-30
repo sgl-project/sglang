@@ -66,17 +66,28 @@ impl ConsistentHashRing {
         let key_hash = Self::hash(key);
         let mut owners = Vec::new();
         let mut seen_nodes = HashSet::new();
+        let total_nodes = self.node_hashes.len();
+
+        // If we have fewer nodes than NUM_OWNERS, we can only return what we have
+        let max_owners = NUM_OWNERS.min(total_nodes);
 
         // Find the first node >= key_hash (clockwise)
         let mut iter = self.ring.range(key_hash..);
-        while owners.len() < NUM_OWNERS {
+        let mut wrapped = false;
+        
+        while owners.len() < max_owners {
             if let Some((_, node)) = iter.next() {
                 if !seen_nodes.contains(node) {
                     owners.push(node.clone());
                     seen_nodes.insert(node.clone());
                 }
             } else {
-                // Wrap around to the beginning
+                // Wrap around to the beginning, but only once
+                if wrapped {
+                    // Already wrapped, no more nodes to check
+                    break;
+                }
+                wrapped = true;
                 iter = self.ring.range(..);
             }
         }

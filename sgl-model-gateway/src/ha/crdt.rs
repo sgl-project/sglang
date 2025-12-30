@@ -10,7 +10,9 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use crdts::{CvRDT, PNCounter};
+use crdts::{CmRDT, CvRDT, PNCounter};
+use num_bigint::BigInt;
+use num_traits::ToPrimitive;
 use parking_lot::RwLock;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
@@ -207,30 +209,39 @@ impl CRDTPNCounter {
     }
 
     pub fn inc(&mut self, actor: String, delta: i64) {
-        // PNCounter API: inc(actor) increments by 1, dec(actor) decrements by 1
-        // Each call to inc/dec needs a unique actor or the same actor can be reused
+        // PNCounter API: inc(actor) and dec(actor) return operations that need to be applied
+        // In crdts 7.3, we need to call apply() to actually modify the counter
         if delta > 0 {
             for i in 0..delta as u64 {
                 // Use a unique actor for each increment to ensure they're all counted
                 let unique_actor = format!("{}:{}", actor, i);
-                self.inner.inc(unique_actor);
+                let op = self.inner.inc(unique_actor);
+                self.inner.apply(op);
             }
         } else if delta < 0 {
             for i in 0..(-delta) as u64 {
                 // Use a unique actor for each decrement
                 let unique_actor = format!("{}:{}", actor, i);
-                self.inner.dec(unique_actor);
+                let op = self.inner.dec(unique_actor);
+                self.inner.apply(op);
             }
         }
     }
 
     pub fn value(&self) -> i64 {
-        // PNCounter read() returns the counter value
-        // In crdts 7.3, read() returns the actual counter value directly
-        let val = self.inner.read();
-        // The read() method returns the counter value which should be convertible
-        use num_traits::ToPrimitive;
-        val.to_i64().unwrap_or(0)
+        // PNCounter read() returns BigInt in crdts 7.3
+        let val: BigInt = self.inner.read();
+        // Convert BigInt to i64, clamping to i64::MAX/i64::MIN if value is out of range
+        val.to_i64().unwrap_or_else(|| {
+            // If value is too large, clamp to i64::MAX
+            if val > BigInt::from(i64::MAX) {
+                i64::MAX
+            } else if val < BigInt::from(i64::MIN) {
+                i64::MIN
+            } else {
+                0
+            }
+        })
     }
 
     pub fn merge(&mut self, other: &Self) {
@@ -340,6 +351,31 @@ mod tests {
     use std::{thread, time::Duration};
 
     use super::*;
+
+    #[test]
+    fn test_crdt_pncounter_inc_and_value() {
+        let mut counter = CRDTPNCounter::new();
+        assert_eq!(counter.value(), 0);
+        
+        // Test direct PNCounter usage
+        use crdts::{CmRDT, PNCounter};
+        let mut pn = PNCounter::new();
+        let op = pn.inc("actor1".to_string());
+        pn.apply(op);
+        let pn_val: BigInt = pn.read();
+        println!("Direct PNCounter value after inc(1): {:?}", pn_val);
+        
+        counter.inc("actor1".to_string(), 5);
+        let val = counter.value();
+        println!("Counter value after inc(5): {}", val);
+        println!("Counter inner read(): {:?}", counter.inner.read());
+        assert!(val > 0, "Counter should be incremented, got: {}", val);
+        
+        counter.inc("actor2".to_string(), 3);
+        let val2 = counter.value();
+        println!("Counter value after inc(3): {}", val2);
+        assert!(val2 > val, "Counter should be incremented further");
+    }
 
     // SKey tests
     #[test]
