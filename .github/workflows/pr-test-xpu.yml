@@ -13,11 +13,11 @@ on:
         required: false
         type: string
         default: ''
-      job_filter:
-        description: 'Select which job to run (leave empty or "all" to run all jobs)'
+      run_all_tests:
+        description: "Run all tests (for releasing or testing purpose)"
         required: false
-        type: string
-        default: 'all'
+        type: boolean
+        default: false
 
 concurrency:
   group: pr-test-xpu-${{ github.ref }}
@@ -28,14 +28,29 @@ jobs:
   check-changes:
     runs-on: ubuntu-latest
     outputs:
-      main_package: ${{ steps.filter.outputs.main_package }}
+      main_package: ${{ steps.filter.outputs.main_package || steps.run-mode.outputs.run_all_tests }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
 
+      - name: Determine run mode
+        id: run-mode
+        run: |
+          # Run all tests for workflow_call (when ref input is provided)
+          # Note: github.event_name is inherited from caller, so we detect workflow_call by checking inputs.ref
+          if [[ "${{ inputs.run_all_tests }}" == "true" ]]; then
+            echo "run_all_tests=true" >> $GITHUB_OUTPUT
+            echo "Run mode: ALL TESTS (run_all_tests=${{ inputs.run_all_tests }})"
+          else
+            echo "run_all_tests=false" >> $GITHUB_OUTPUT
+            echo "Run mode: FILTERED (triggered by ${{ github.event_name }})"
+          fi
       - name: Detect file changes
         id: filter
         uses: dorny/paths-filter@v3
+        if: steps.run-mode.outputs.run_all_tests != 'true'
         with:
           filters: |
             main_package:
@@ -65,6 +80,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          ref: ${{ inputs.ref || github.ref }}
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
