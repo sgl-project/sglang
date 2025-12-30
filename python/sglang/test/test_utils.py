@@ -558,6 +558,129 @@ def popen_with_error_check(command: list[str], allow_exit: bool = False):
     return process
 
 
+def _try_enable_offline_mode_if_cache_complete(model_name_or_path: str, env: dict):
+    """
+    CI helper: Validate local cache and enable offline mode if complete.
+
+    This function checks if the model is already cached locally with all
+    required files (config, tokenizer, weights). If so, it sets HF_HUB_OFFLINE=1
+    in the provided env dict to avoid HF Hub network requests during server init.
+
+    Args:
+        model_name_or_path: Model identifier or path
+        env: Environment dict to modify (will add HF_HUB_OFFLINE=1 if cache is complete)
+    """
+    import glob
+    import json
+
+    from sglang.srt.model_loader.ci_weight_validation import (
+        ci_validate_cache_and_enable_offline_if_complete,
+    )
+    from sglang.srt.utils import find_local_repo_dir
+
+    # Skip if already a local path
+    if os.path.isdir(model_name_or_path):
+        return
+
+    # Try to find local snapshot
+    try:
+        snapshot_dir = find_local_repo_dir(model_name_or_path, revision=None)
+        if not snapshot_dir or not os.path.isdir(snapshot_dir):
+            logger.debug(f"CI: No local cache found for {model_name_or_path}")
+            return
+    except Exception as e:
+        logger.debug(f"CI: Failed to find local snapshot for {model_name_or_path}: {e}")
+        return
+
+    # Sanity check: ensure this is a HF snapshot path
+    if "snapshots" not in snapshot_dir:
+        logger.debug(
+            f"CI: snapshot_dir not a HF snapshot path: ...{snapshot_dir[-50:]}"
+        )
+        return
+
+    # Scan for weight files - prioritize index files for sharded models
+    weight_files = []
+
+    # First, look for index files
+    index_patterns = ["*.safetensors.index.json", "pytorch_model.bin.index.json"]
+    index_files = []
+    for pattern in index_patterns:
+        index_files.extend(glob.glob(os.path.join(snapshot_dir, pattern)))
+
+    # If we have safetensors index, collect shards from it
+    for index_file in index_files:
+        if index_file.endswith(".safetensors.index.json"):
+            try:
+                with open(index_file, "r", encoding="utf-8") as f:
+                    index_data = json.load(f)
+                weight_map = index_data.get("weight_map", {})
+                for weight_file in set(weight_map.values()):
+                    weight_path = os.path.join(snapshot_dir, weight_file)
+                    if os.path.exists(weight_path):
+                        weight_files.append(weight_path)
+            except Exception as e:
+                logger.debug(
+                    f"CI: Failed to parse index {os.path.basename(index_file)}: {e}"
+                )
+
+    # If no index found or no shards from index, do recursive glob for safetensors
+    if not weight_files:
+        matched = glob.glob(
+            os.path.join(snapshot_dir, "**/*.safetensors"), recursive=True
+        )
+        # Limit to avoid scanning too many files
+        MAX_WEIGHT_FILES = 1000
+        if len(matched) > MAX_WEIGHT_FILES:
+            logger.warning(
+                f"CI: Too many safetensors files ({len(matched)} > {MAX_WEIGHT_FILES}), "
+                "will use online mode to be safe"
+            )
+            return
+
+        for f in matched:
+            if os.path.exists(f):  # Filter out broken symlinks
+                weight_files.append(f)
+
+    # Guard: require at least one weight file to enable offline mode
+    if not weight_files:
+        logger.info(
+            f"CI_OFFLINE: No weight files found, skip offline, keep online allowed - {model_name_or_path}"
+        )
+        return
+
+    # Print cache info for verification
+    snapshot_basename = os.path.basename(snapshot_dir)
+    logger.info(
+        f"CI_OFFLINE: Validating cache for {model_name_or_path} - "
+        f"snapshot={snapshot_basename}, weight_files={len(weight_files)}"
+    )
+
+    # Validate cache completeness
+    try:
+        cache_complete = ci_validate_cache_and_enable_offline_if_complete(
+            snapshot_dir=snapshot_dir,
+            weight_files=weight_files,
+            model_name_or_path=model_name_or_path,
+        )
+
+        if cache_complete:
+            env["HF_HUB_OFFLINE"] = "1"
+            logger.info(
+                f"CI: Enabled HF_HUB_OFFLINE for subprocess - "
+                f"cache validation passed for {model_name_or_path}"
+            )
+        else:
+            logger.info(
+                f"CI: Cache validation failed for {model_name_or_path}, "
+                "will use online mode"
+            )
+    except Exception as e:
+        logger.warning(
+            f"CI: Cache validation raised exception for {model_name_or_path}: {e}"
+        )
+
+
 def popen_launch_server(
     model: str,
     base_url: str,
@@ -583,6 +706,22 @@ def popen_launch_server(
         device = auto_config_device()
         other_args = list(other_args)
         other_args += ["--device", str(device)]
+
+    # CI-specific: Validate cache and enable offline mode if complete
+    # This avoids HF Hub network requests during server initialization
+    if env is None:
+        env = os.environ.copy()
+    else:
+        env = env.copy()
+
+    try:
+        from sglang.utils import is_in_ci
+
+        if is_in_ci():
+            _try_enable_offline_mode_if_cache_complete(model, env)
+    except Exception as e:
+        # Don't fail the test if cache validation fails
+        logger.debug(f"CI cache validation failed (non-fatal): {e}")
 
     _, host, port = base_url.split(":")
     host = host[2:]
@@ -634,6 +773,12 @@ def popen_launch_server(
         command += ["--api-key", api_key]
 
     print(f"command={shlex.join(command)}")
+
+    # Log critical env info for debugging offline mode in CI
+    hf_hub_offline = env.get("HF_HUB_OFFLINE", "0")
+    logger.info(
+        f"CI_OFFLINE: Launching server HF_HUB_OFFLINE={hf_hub_offline} model={model}"
+    )
 
     if return_stdout_stderr:
         process = subprocess.Popen(

@@ -7,6 +7,7 @@ These functions handle:
 - Checking for missing shards in sharded models
 - Cleaning up corrupted files (selective or full cache deletion)
 - Automatic retry logic for corrupted downloads
+- Validating config/tokenizer files completeness to enable offline mode
 
 For regular users, weight_utils.py provides simple download functionality without
 the overhead of validation and automatic cleanup. The CI-specific behavior is
@@ -26,6 +27,198 @@ import safetensors
 from sglang.srt.utils import log_info_on_rank0
 
 logger = logging.getLogger(__name__)
+
+
+def _validate_json_file(file_path: str, file_name: str) -> bool:
+    """
+    Validate that a JSON file exists, is non-empty, and can be parsed.
+
+    Args:
+        file_path: Path to the JSON file
+        file_name: Name of the file (for logging)
+
+    Returns:
+        True if the file is valid, False otherwise
+    """
+    if not os.path.exists(file_path):
+        logger.debug("CI cache validation: %s not found at %s", file_name, file_path)
+        return False
+
+    if not os.path.isfile(file_path):
+        logger.warning(
+            "CI cache validation: %s is not a file: %s", file_name, file_path
+        )
+        return False
+
+    # Check if file is non-empty
+    try:
+        file_size = os.path.getsize(file_path)
+        if file_size == 0:
+            logger.warning("CI cache validation: %s is empty: %s", file_name, file_path)
+            return False
+    except OSError as e:
+        logger.warning("CI cache validation: Cannot get size of %s: %s", file_name, e)
+        return False
+
+    # Try to parse JSON
+    try:
+        with open(file_path, "r", encoding="utf-8") as f:
+            json.load(f)
+        return True
+    except json.JSONDecodeError as e:
+        logger.warning(
+            "CI cache validation: %s is not valid JSON: %s - %s",
+            file_name,
+            file_path,
+            e,
+        )
+        return False
+    except Exception as e:
+        logger.warning(
+            "CI cache validation: Failed to read %s: %s - %s",
+            file_name,
+            file_path,
+            e,
+        )
+        return False
+
+
+def _validate_config_and_tokenizer_files(snapshot_dir: str) -> Tuple[bool, List[str]]:
+    """
+    Validate that critical config and tokenizer files exist and are valid.
+
+    This checks for:
+    - config.json (required)
+    - tokenizer_config.json (required)
+    - generation_config.json (optional but validated if present)
+    - At least one tokenizer file: tokenizer.json, tokenizer.model, or tiktoken.model
+
+    Args:
+        snapshot_dir: Path to the model snapshot directory
+
+    Returns:
+        Tuple of (is_valid, missing_files)
+        - is_valid: True if all required files are present and valid
+        - missing_files: List of missing or invalid file names
+    """
+    missing_files = []
+
+    # Check required config files
+    required_files = [
+        "config.json",
+        "tokenizer_config.json",
+    ]
+
+    for file_name in required_files:
+        file_path = os.path.join(snapshot_dir, file_name)
+        if not _validate_json_file(file_path, file_name):
+            missing_files.append(file_name)
+
+    # Check optional generation_config.json (validate if exists)
+    generation_config_path = os.path.join(snapshot_dir, "generation_config.json")
+    if os.path.exists(generation_config_path):
+        if not _validate_json_file(generation_config_path, "generation_config.json"):
+            missing_files.append("generation_config.json (exists but invalid)")
+
+    # Check for at least one tokenizer file
+    tokenizer_files = [
+        "tokenizer.json",
+        "tokenizer.model",
+        "tiktoken.model",
+    ]
+
+    tokenizer_found = False
+    for tokenizer_file in tokenizer_files:
+        tokenizer_path = os.path.join(snapshot_dir, tokenizer_file)
+        if os.path.exists(tokenizer_path) and os.path.isfile(tokenizer_path):
+            # For tokenizer.json, validate it's proper JSON
+            if tokenizer_file == "tokenizer.json":
+                if _validate_json_file(tokenizer_path, tokenizer_file):
+                    tokenizer_found = True
+                    break
+            else:
+                # For .model files, just check they're non-empty
+                try:
+                    if os.path.getsize(tokenizer_path) > 0:
+                        tokenizer_found = True
+                        break
+                except OSError:
+                    pass
+
+    if not tokenizer_found:
+        missing_files.append(
+            "tokenizer file (none of: tokenizer.json, tokenizer.model, tiktoken.model)"
+        )
+
+    is_valid = len(missing_files) == 0
+    return is_valid, missing_files
+
+
+def ci_validate_cache_and_enable_offline_if_complete(
+    snapshot_dir: str,
+    weight_files: List[str],
+    model_name_or_path: str,
+) -> bool:
+    """
+    Validate local cache completeness (config/tokenizer/weights) and determine
+    if offline mode can be safely enabled.
+
+    This function checks:
+    1. Config and tokenizer files (config.json, tokenizer_config.json, etc.)
+    2. Weight files (safetensors shards, index files, corruption check)
+
+    If all are present and valid, it returns True to signal that offline
+    mode can be safely enabled.
+
+    IMPORTANT: This should be called BEFORE any HF operations, and if it
+    returns True, the caller should set HF_HUB_OFFLINE=1 for the entire
+    operation scope (e.g., server initialization subprocess env).
+
+    Args:
+        snapshot_dir: Path to the model snapshot directory
+        weight_files: List of weight file paths to validate (must be non-empty)
+        model_name_or_path: Model identifier for logging
+
+    Returns:
+        True if cache is complete and offline mode can be enabled, False otherwise
+    """
+    # Guard: weight_files is required
+    if not weight_files:
+        log_info_on_rank0(
+            logger,
+            f"CI_OFFLINE: No weight files provided, skip offline, keep online allowed - {model_name_or_path}",
+        )
+        return False
+
+    # Validate config and tokenizer files
+    config_valid, missing_config_files = _validate_config_and_tokenizer_files(
+        snapshot_dir
+    )
+
+    if not config_valid:
+        log_info_on_rank0(
+            logger,
+            f"CI_OFFLINE: Missing config/tokenizer files {missing_config_files}, "
+            f"skip offline, keep online allowed - {model_name_or_path}",
+        )
+        return False
+
+    # Validate weight files using existing validation from PR #15216
+    # This checks for missing shards, corrupted safetensors, etc.
+    weights_valid, error_msg, _ = _validate_sharded_model(snapshot_dir, weight_files)
+    if not weights_valid:
+        log_info_on_rank0(
+            logger,
+            f"CI_OFFLINE: Weight validation failed ({error_msg}), "
+            f"skip offline, keep online allowed - {model_name_or_path}",
+        )
+        return False
+
+    log_info_on_rank0(
+        logger,
+        f"CI_OFFLINE: Cache validation PASSED, offline mode will be enabled - {model_name_or_path}",
+    )
+    return True
 
 
 def _validate_safetensors_file(file_path: str) -> bool:
