@@ -12,7 +12,7 @@ import time
 import weakref
 from collections.abc import Iterable
 from functools import lru_cache
-from typing import Any
+from typing import Any, Optional
 
 import torch
 from einops import rearrange
@@ -61,6 +61,9 @@ from sglang.multimodal_gen.runtime.platforms import (
     current_platform,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.utils.layerwise_offload import (
+    LayerwiseOffloadManager,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.perf_logger import StageProfiler
 from sglang.multimodal_gen.runtime.utils.profiler import SGLDiffusionProfiler
@@ -720,6 +723,14 @@ class DenoisingStage(PipelineStage):
                 "Memory after deallocating transformer: %s",
                 torch.mps.current_allocated_memory(),
             )
+
+        # reset offload manager with prefetching first layer for next forward
+        offload_mgr: Optional[LayerwiseOffloadManager] = None
+        for transformer in filter(None, [self.transformer, self.transformer_2]):
+            if (
+                offload_mgr := getattr(transformer, "_layerwise_offload_manager", None)
+            ) is not None:
+                offload_mgr.prepare_for_next_denoise(non_blocking=True)
 
     def _preprocess_sp_latents(self, batch: Req, server_args: ServerArgs):
         """Shard latents for Sequence Parallelism if applicable."""
