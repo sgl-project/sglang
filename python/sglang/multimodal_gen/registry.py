@@ -18,7 +18,6 @@ from sglang.multimodal_gen.configs.pipeline_configs import (
     FastHunyuanConfig,
     FluxPipelineConfig,
     HunyuanConfig,
-    StepVideoT2VConfig,
     WanI2V480PConfig,
     WanI2V720PConfig,
     WanT2V480PConfig,
@@ -29,6 +28,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.flux import Flux2PipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
     QwenImageEditPipelineConfig,
+    QwenImageEditPlus_2511_PipelineConfig,
+    QwenImageEditPlusPipelineConfig,
+    QwenImageLayeredPipelineConfig,
     QwenImagePipelineConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.wan import (
@@ -43,8 +45,11 @@ from sglang.multimodal_gen.configs.sample.hunyuan import (
     FastHunyuanSamplingParam,
     HunyuanSamplingParams,
 )
-from sglang.multimodal_gen.configs.sample.qwenimage import QwenImageSamplingParams
-from sglang.multimodal_gen.configs.sample.stepvideo import StepVideoT2VSamplingParams
+from sglang.multimodal_gen.configs.sample.qwenimage import (
+    QwenImageEditPlusSamplingParams,
+    QwenImageLayeredSamplingParams,
+    QwenImageSamplingParams,
+)
 from sglang.multimodal_gen.configs.sample.wan import (
     FastWanT2V480PConfig,
     Wan2_1_Fun_1_3B_InP_SamplingParams,
@@ -306,16 +311,6 @@ def _register_configs():
         ],
     )
 
-    # StepVideo
-    register_configs(
-        sampling_param_cls=StepVideoT2VSamplingParams,
-        pipeline_config_cls=StepVideoT2VConfig,
-        hf_model_paths=[
-            "FastVideo/stepvideo-t2v-diffusers",
-        ],
-        model_detectors=[lambda hf_id: "stepvideo" in hf_id.lower()],
-    )
-
     # Wan
     register_configs(
         sampling_param_cls=WanT2V_1_3B_SamplingParams,
@@ -425,6 +420,24 @@ def _register_configs():
         sampling_param_cls=QwenImageSamplingParams,
         pipeline_config_cls=QwenImageEditPipelineConfig,
         hf_model_paths=["Qwen/Qwen-Image-Edit"],
+    )
+
+    register_configs(
+        sampling_param_cls=QwenImageEditPlusSamplingParams,
+        pipeline_config_cls=QwenImageEditPlusPipelineConfig,
+        hf_model_paths=["Qwen/Qwen-Image-Edit-2509"],
+    )
+
+    register_configs(
+        sampling_param_cls=QwenImageEditPlusSamplingParams,
+        pipeline_config_cls=QwenImageEditPlus_2511_PipelineConfig,
+        hf_model_paths=["Qwen/Qwen-Image-Edit-2511"],
+    )
+
+    register_configs(
+        sampling_param_cls=QwenImageLayeredSamplingParams,
+        pipeline_config_cls=QwenImageLayeredPipelineConfig,
+        hf_model_paths=["Qwen/Qwen-Image-Layered"],
     )
 
 

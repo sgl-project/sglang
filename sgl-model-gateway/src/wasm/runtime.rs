@@ -4,6 +4,7 @@
 //! Provides a thread pool for concurrent WASM execution and metrics tracking.
 
 use std::{
+    num::NonZeroUsize,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
@@ -11,11 +12,13 @@ use std::{
     time::Duration,
 };
 
+use lru::LruCache;
 use tokio::sync::oneshot;
-use tracing::{debug, error, info};
+use tracing::{debug, error};
 use wasmtime::{
     component::{Component, Linker, ResourceTable},
-    Config, Engine, Store, StoreLimitsBuilder, UpdateDeadline,
+    Config, Engine, InstanceAllocationStrategy, PoolingAllocationConfig, Store, StoreLimitsBuilder,
+    UpdateDeadline,
 };
 use wasmtime_wasi::WasiCtx;
 
@@ -181,7 +184,7 @@ impl WasmThreadPool {
             .max(1);
         let num_workers = config.thread_pool_size.clamp(1, max_workers);
 
-        info!(
+        debug!(
             target: "sgl_model_gateway::wasm::runtime",
             "Initializing WASM runtime with {} workers",
             num_workers
@@ -245,7 +248,19 @@ impl WasmThreadPool {
             "Worker started"
         );
 
+        let mut pool_config = PoolingAllocationConfig::default();
+        let max_memory_bytes = (config.max_memory_pages as usize) * 65536;
+
+        // Since this thread handles tasks sequentially, we don't need a large pool per thread.
+        // A pool size of 20 allows for efficient reuse without hogging memory.
+        pool_config.total_core_instances(20);
+        pool_config.max_memory_size(max_memory_bytes);
+        pool_config.max_component_instance_size(max_memory_bytes);
+        pool_config.max_tables_per_component(5);
+
         let mut wasmtime_config = Config::new();
+        wasmtime_config.allocation_strategy(InstanceAllocationStrategy::Pooling(pool_config));
+
         wasmtime_config.async_stack_size(config.max_stack_size);
         wasmtime_config.async_support(true);
         wasmtime_config.wasm_component_model(true); // Enable component model
@@ -263,6 +278,10 @@ impl WasmThreadPool {
                 return;
             }
         };
+
+        let cache_capacity =
+            NonZeroUsize::new(config.module_cache_size).unwrap_or(NonZeroUsize::new(10).unwrap());
+        let mut component_cache: LruCache<Vec<u8>, Component> = LruCache::new(cache_capacity);
 
         // Start epoch incrementer for timeout enforcement.
         // The engine's epoch counter is incremented periodically, and each Store
@@ -307,6 +326,7 @@ impl WasmThreadPool {
                 } => {
                     let result = Self::execute_component_in_worker(
                         &engine,
+                        &mut component_cache, // Pass the cache
                         wasm_bytes,
                         attach_point,
                         input,
@@ -322,22 +342,30 @@ impl WasmThreadPool {
 
     async fn execute_component_in_worker(
         engine: &Engine,
+        cache: &mut LruCache<Vec<u8>, Component>, //  cache argument
         wasm_bytes: Vec<u8>,
         attach_point: WasmModuleAttachPoint,
         input: WasmComponentInput,
         config: &WasmRuntimeConfig,
     ) -> Result<WasmComponentOutput> {
-        // Compile component from bytes
+        // Compile component from bytes OR retrieve from cache
         // Note: The WASM file must be in component format (not plain WASM module)
-        // Use `wasm-tools component new` to wrap a WASM module into a component if needed
-        let component = Component::new(engine, &wasm_bytes).map_err(|e| {
-            WasmRuntimeError::CompileFailed(format!(
-                "failed to parse WebAssembly component: {}. \
-                 Hint: The WASM file must be in component format. \
-                 If you're using wit-bindgen, use 'wasm-tools component new' to wrap the WASM module into a component.",
-                e
-            ))
-        })?;
+        let component = if let Some(comp) = cache.get(&wasm_bytes) {
+            comp.clone() // Component is just a handle (cheap clone)
+        } else {
+            // Compile new component
+            let comp = Component::new(engine, &wasm_bytes).map_err(|e| {
+                WasmRuntimeError::CompileFailed(format!(
+                    "failed to parse WebAssembly component: {}. \
+                     Hint: The WASM file must be in component format. \
+                     If you're using wit-bindgen, use 'wasm-tools component new' to wrap the WASM module into a component.",
+                    e
+                ))
+            })?;
+
+            cache.push(wasm_bytes, comp.clone());
+            comp
+        };
 
         let mut linker = Linker::<WasiState>::new(engine);
         wasmtime_wasi::p2::add_to_linker_async(&mut linker)?;
@@ -461,6 +489,10 @@ impl Drop for WasmThreadPool {
 
 #[cfg(test)]
 mod tests {
+    use std::{num::NonZeroUsize, time::Instant};
+
+    use lru::LruCache;
+
     use super::*;
     use crate::wasm::config::WasmRuntimeConfig;
 
@@ -496,5 +528,82 @@ mod tests {
         assert_eq!(config.max_stack_size, cloned_config.max_stack_size);
         assert_eq!(config.thread_pool_size, cloned_config.thread_pool_size);
         assert_eq!(config.module_cache_size, cloned_config.module_cache_size);
+    }
+    #[test]
+    fn test_wasm_instantiation_performance_threshold() -> Result<()> {
+        // A simple WASM module forcing memory allocation
+        const WASM_WAT: &str = r#"
+            (module
+                (memory (export "memory") 1)
+                (func (export "run") (param i32 i32) (result i32)
+                    local.get 0
+                    local.get 1
+                    i32.add)
+            )
+        "#;
+
+        let iterations = 1000;
+
+        //  Scenario A: Baseline (No Pool, No Cache)
+        let engine_standard = Engine::default();
+        let start_standard = Instant::now();
+        for _ in 0..iterations {
+            // Simulate compilation + instantiation overhead
+            let module = wasmtime::Module::new(&engine_standard, WASM_WAT).unwrap();
+            let mut store = Store::new(&engine_standard, ());
+            let instance = wasmtime::Instance::new(&mut store, &module, &[]).unwrap();
+            let run_func = instance
+                .get_typed_func::<(i32, i32), i32>(&mut store, "run")
+                .unwrap();
+            let _ = run_func.call(&mut store, (10, 20)).unwrap();
+        }
+        let duration_standard = start_standard.elapsed();
+
+        // --- Scenario B: Optimized (Pool + Cache)
+        let mut pool_config = PoolingAllocationConfig::default();
+
+        pool_config.total_core_instances(100);
+
+        let mut config = Config::new();
+        config.allocation_strategy(InstanceAllocationStrategy::Pooling(pool_config));
+
+        let engine_pooled = Engine::new(&config).unwrap();
+
+        // Setup LRU Cache
+        let cache_capacity = NonZeroUsize::new(100).unwrap();
+        let mut cache: LruCache<Vec<u8>, wasmtime::Module> = LruCache::new(cache_capacity);
+
+        // Pre-warm cache (simulating the "cached" state)
+        let key = WASM_WAT.as_bytes().to_vec();
+        let module_compiled = wasmtime::Module::new(&engine_pooled, WASM_WAT).unwrap();
+        cache.push(key.clone(), module_compiled);
+
+        let start_pooled = Instant::now();
+        for _ in 0..iterations {
+            let module = cache.get(&key).unwrap().clone();
+            let mut store = Store::new(&engine_pooled, ());
+            let instance = wasmtime::Instance::new(&mut store, &module, &[]).unwrap();
+            let run_func = instance
+                .get_typed_func::<(i32, i32), i32>(&mut store, "run")
+                .unwrap();
+            let _ = run_func.call(&mut store, (10, 20)).unwrap();
+        }
+        let duration_pooled = start_pooled.elapsed();
+
+        // Verify Speedup
+        let standard_secs = duration_standard.as_secs_f64();
+        let pooled_secs = duration_pooled.as_secs_f64();
+
+        if pooled_secs > 0.0 {
+            let speedup = standard_secs / pooled_secs;
+
+            assert!(
+                speedup > 5.0,
+                "Optimization regression: Pooling+Caching was only {:.2}x faster",
+                speedup
+            );
+        }
+
+        Ok(())
     }
 }

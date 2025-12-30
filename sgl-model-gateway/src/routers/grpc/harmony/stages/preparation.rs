@@ -65,6 +65,7 @@ impl PipelineStage for HarmonyPreparationStage {
                 "Unsupported request type for Harmony pipeline"
             );
             return Err(error::bad_request(
+                "harmony_request_type_invalid",
                 "Only Chat and Responses requests supported in Harmony pipeline".to_string(),
             ));
         }
@@ -91,6 +92,7 @@ impl HarmonyPreparationStage {
                 "logprobs requested but not supported for Harmony models"
             );
             return Err(error::bad_request(
+                "harmony_logprobs_not_supported",
                 "logprobs are not supported for Harmony models".to_string(),
             ));
         }
@@ -112,7 +114,10 @@ impl HarmonyPreparationStage {
                 error = %e,
                 "Harmony build failed for chat request"
             );
-            error::bad_request(format!("Harmony build failed: {}", e))
+            error::bad_request(
+                "harmony_build_failed",
+                format!("Harmony build failed: {}", e),
+            )
         })?;
 
         // Step 4: Store results
@@ -175,6 +180,7 @@ impl HarmonyPreparationStage {
                 "Conflicting constraints: both tool_choice and text format specified"
             );
             return Err(error::bad_request(
+                "conflicting_constraints",
                 "Cannot use both tool_choice (required/function) and text format (json_object/json_schema) simultaneously".to_string(),
             ));
         }
@@ -188,7 +194,10 @@ impl HarmonyPreparationStage {
                 error = %e,
                 "Harmony build failed for responses request"
             );
-            error::bad_request(format!("Harmony build failed: {}", e))
+            error::bad_request(
+                "harmony_build_failed",
+                format!("Harmony build failed: {}", e),
+            )
         })?;
 
         // Step 4: Store results with constraint
@@ -230,7 +239,7 @@ impl HarmonyPreparationStage {
                             error = %e,
                             "Failed to build text format structural tag for JsonObject"
                         );
-                        Box::new(error::internal_error(e))
+                        Box::new(error::internal_error("build_text_format_tag_failed", e))
                     })?;
                 Ok(Some(("structural_tag".to_string(), tag)))
             }
@@ -241,7 +250,7 @@ impl HarmonyPreparationStage {
                         error = %e,
                         "Failed to build text format structural tag for JsonSchema"
                     );
-                    Box::new(error::internal_error(e))
+                    Box::new(error::internal_error("build_text_format_tag_failed", e))
                 })?;
                 Ok(Some(("structural_tag".to_string(), tag)))
             }
@@ -310,10 +319,10 @@ impl HarmonyPreparationStage {
                     tool_name = %tool_name,
                     "Specified tool not found in tools list"
                 );
-                return Err(Box::new(error::bad_request(format!(
-                    "Tool '{}' not found in tools list",
-                    tool_name
-                ))));
+                return Err(Box::new(error::bad_request(
+                    "tool_not_found",
+                    format!("Tool '{}' not found in tools list", tool_name),
+                )));
             }
             _ => {}
         }
@@ -362,10 +371,10 @@ impl HarmonyPreparationStage {
                 error = %e,
                 "Failed to serialize structural tag"
             );
-            Box::new(error::internal_error(format!(
-                "Failed to serialize structural tag: {}",
-                e
-            )))
+            Box::new(error::internal_error(
+                "serialize_structural_tag_failed",
+                format!("Failed to serialize structural tag: {}", e),
+            ))
         })
     }
 }

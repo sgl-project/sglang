@@ -36,7 +36,7 @@ use std::sync::Arc;
 
 use axum::{
     body::Body,
-    http::{self, StatusCode},
+    http,
     response::{IntoResponse, Response},
 };
 use bytes::Bytes;
@@ -85,18 +85,10 @@ pub async fn route_responses(
     // 1. Reject background mode (no longer supported)
     let is_background = request.background.unwrap_or(false);
     if is_background {
-        return (
-            StatusCode::BAD_REQUEST,
-            axum::Json(json!({
-                "error": {
-                    "message": "Background mode is not supported. Please set 'background' to false or omit it.",
-                    "type": "invalid_request_error",
-                    "param": "background",
-                    "code": "unsupported_parameter"
-                }
-            })),
-        )
-            .into_response();
+        return error::bad_request(
+            "unsupported_parameter",
+            "Background mode is not supported. Please set 'background' to false or omit it.",
+        );
     }
 
     // 2. Route based on execution mode
@@ -219,16 +211,10 @@ async fn route_responses_streaming(
     let chat_request = match conversions::responses_to_chat(&modified_request) {
         Ok(req) => Arc::new(req),
         Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                axum::Json(json!({
-                    "error": {
-                        "message": format!("Failed to convert request: {}", e),
-                        "type": "invalid_request_error"
-                    }
-                })),
-            )
-                .into_response();
+            return error::bad_request(
+                "convert_request_failed",
+                format!("Failed to convert request: {}", e),
+            );
         }
     };
 
@@ -607,7 +593,10 @@ async fn execute_without_mcp(
             error = %e,
             "Failed to convert ResponsesRequest to ChatCompletionRequest"
         );
-        error::bad_request(format!("Failed to convert request: {}", e))
+        error::bad_request(
+            "convert_request_failed",
+            format!("Failed to convert request: {}", e),
+        )
     })?;
 
     // Execute chat pipeline (errors already have proper HTTP status codes)
@@ -628,7 +617,10 @@ async fn execute_without_mcp(
             error = %e,
             "Failed to convert ChatCompletionResponse to ResponsesResponse"
         );
-        error::internal_error(format!("Failed to convert to responses format: {}", e))
+        error::internal_error(
+            "convert_to_responses_format_failed",
+            format!("Failed to convert to responses format: {}", e),
+        )
     })
 }
 
@@ -713,14 +705,20 @@ async fn load_conversation_history(
                     error = %e,
                     "Failed to check conversation existence in storage"
                 );
-                error::internal_error(format!("Failed to check conversation: {}", e))
+                error::internal_error(
+                    "check_conversation_failed",
+                    format!("Failed to check conversation: {}", e),
+                )
             })?;
 
         if conversation.is_none() {
-            return Err(error::not_found(format!(
-                "Conversation '{}' not found. Please create the conversation first using the conversations API.",
-                conv_id_str
-            )));
+            return Err(error::not_found(
+                "conversation_not_found",
+                format!(
+                    "Conversation '{}' not found. Please create the conversation first using the conversations API.",
+                    conv_id_str
+                )
+            ));
         }
 
         // Load conversation history

@@ -2,7 +2,7 @@ from typing import Optional
 
 import torch
 
-from sglang.srt.utils import is_cuda
+from sglang.srt.utils import direct_register_custom_op, is_cuda
 
 _is_cuda = is_cuda()
 
@@ -41,7 +41,7 @@ def fused_marlin_moe(
     num_bits: int = 8,
     is_k_full: bool = True,
     inplace: bool = False,
-    routed_scaling_factor: float = None,
+    routed_scaling_factor: Optional[float] = None,
 ) -> torch.Tensor:
     """
     This function computes a Mixture of Experts (MoE) layer using two sets of
@@ -225,15 +225,26 @@ def fused_marlin_moe_fake(
     gating_output: torch.Tensor,
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
+    global_num_experts: int = -1,
+    expert_map: Optional[torch.Tensor] = None,
     g_idx1: Optional[torch.Tensor] = None,
     g_idx2: Optional[torch.Tensor] = None,
     sort_indices1: Optional[torch.Tensor] = None,
     sort_indices2: Optional[torch.Tensor] = None,
     w1_zeros: Optional[torch.Tensor] = None,
     w2_zeros: Optional[torch.Tensor] = None,
+    workspace: Optional[torch.Tensor] = None,
     num_bits: int = 8,
     is_k_full: bool = True,
     inplace: bool = False,
-    routed_scaling_factor: float = None,
+    routed_scaling_factor: Optional[float] = None,
 ) -> torch.Tensor:
     return torch.empty_like(hidden_states)
+
+
+direct_register_custom_op(
+    op_name="fused_marlin_moe",
+    op_func=fused_marlin_moe,
+    mutates_args=[],
+    fake_impl=fused_marlin_moe_fake,
+)

@@ -1,12 +1,11 @@
 use std::{
-    sync::{
-        atomic::{AtomicU32, AtomicU64, Ordering},
-        Arc, RwLock,
-    },
+    sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering},
     time::{Duration, Instant},
 };
 
 use tracing::info;
+
+use crate::observability::metrics::Metrics;
 
 /// Circuit breaker configuration
 #[derive(Debug, Clone)]
@@ -32,6 +31,11 @@ impl Default for CircuitBreakerConfig {
     }
 }
 
+/// Circuit breaker state constants for atomic storage
+const STATE_CLOSED: u8 = 0;
+const STATE_OPEN: u8 = 1;
+const STATE_HALF_OPEN: u8 = 2;
+
 /// Circuit breaker state
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CircuitState {
@@ -53,40 +57,94 @@ impl std::fmt::Display for CircuitState {
     }
 }
 
-/// Circuit breaker implementation
+impl CircuitState {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            CircuitState::Closed => "closed",
+            CircuitState::Open => "open",
+            CircuitState::HalfOpen => "half_open",
+        }
+    }
+
+    pub fn to_int(&self) -> u8 {
+        match self {
+            CircuitState::Closed => STATE_CLOSED,
+            CircuitState::Open => STATE_OPEN,
+            CircuitState::HalfOpen => STATE_HALF_OPEN,
+        }
+    }
+
+    fn from_int(v: u8) -> Self {
+        match v {
+            STATE_CLOSED => CircuitState::Closed,
+            STATE_OPEN => CircuitState::Open,
+            STATE_HALF_OPEN => CircuitState::HalfOpen,
+            _ => CircuitState::Closed, // Default to closed for safety
+        }
+    }
+}
+
+/// Get current time as milliseconds since an arbitrary epoch.
+/// Uses Instant for monotonic time, converting to ms for atomic storage.
+#[inline]
+fn now_ms() -> u64 {
+    // Use a static reference point for consistent timing
+    static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    let start = START.get_or_init(Instant::now);
+    start.elapsed().as_millis() as u64
+}
+
+/// Circuit breaker implementation using lock-free atomics for hot paths.
+///
+/// This implementation avoids RwLock contention by using atomic operations
+/// for state checks (the most common operation). Only state transitions
+/// use compare-and-swap which is still lock-free.
 #[derive(Debug)]
 pub struct CircuitBreaker {
-    state: Arc<RwLock<CircuitState>>,
-    consecutive_failures: Arc<AtomicU32>,
-    consecutive_successes: Arc<AtomicU32>,
-    total_failures: Arc<AtomicU64>,
-    total_successes: Arc<AtomicU64>,
-    last_failure_time: Arc<RwLock<Option<Instant>>>,
-    last_state_change: Arc<RwLock<Instant>>,
+    /// Circuit state stored as atomic u8 (0=Closed, 1=Open, 2=HalfOpen)
+    state: AtomicU8,
+    consecutive_failures: AtomicU32,
+    consecutive_successes: AtomicU32,
+    total_failures: AtomicU64,
+    total_successes: AtomicU64,
+    /// Last failure time in milliseconds (from now_ms())
+    last_failure_time_ms: AtomicU64,
+    /// Last state change time in milliseconds (from now_ms())
+    last_state_change_ms: AtomicU64,
     config: CircuitBreakerConfig,
+    metric_label: String,
 }
 
 impl CircuitBreaker {
     /// Create a new circuit breaker with default configuration
     pub fn new() -> Self {
-        Self::with_config(CircuitBreakerConfig::default())
+        Self::with_config_and_label(CircuitBreakerConfig::default(), String::new())
     }
 
-    /// Create a new circuit breaker with custom configuration
-    pub fn with_config(config: CircuitBreakerConfig) -> Self {
+    /// Create a new circuit breaker with custom configuration and metric label
+    pub fn with_config_and_label(config: CircuitBreakerConfig, metric_label: String) -> Self {
+        let init_state = CircuitState::Closed;
+        Metrics::set_worker_cb_state(&metric_label, init_state.to_int());
         Self {
-            state: Arc::new(RwLock::new(CircuitState::Closed)),
-            consecutive_failures: Arc::new(AtomicU32::new(0)),
-            consecutive_successes: Arc::new(AtomicU32::new(0)),
-            total_failures: Arc::new(AtomicU64::new(0)),
-            total_successes: Arc::new(AtomicU64::new(0)),
-            last_failure_time: Arc::new(RwLock::new(None)),
-            last_state_change: Arc::new(RwLock::new(Instant::now())),
+            state: AtomicU8::new(STATE_CLOSED),
+            consecutive_failures: AtomicU32::new(0),
+            consecutive_successes: AtomicU32::new(0),
+            total_failures: AtomicU64::new(0),
+            total_successes: AtomicU64::new(0),
+            last_failure_time_ms: AtomicU64::new(0),
+            last_state_change_ms: AtomicU64::new(now_ms()),
             config,
+            metric_label,
         }
     }
 
-    /// Check if a request can be executed
+    /// Get the metric label
+    pub fn metric_label(&self) -> &str {
+        &self.metric_label
+    }
+
+    /// Check if a request can be executed (lock-free hot path)
+    #[inline]
     pub fn can_execute(&self) -> bool {
         let state = self.state();
         match state {
@@ -96,20 +154,47 @@ impl CircuitBreaker {
         }
     }
 
-    /// Get the current state
+    /// Get the current state (lock-free)
+    #[inline]
     pub fn state(&self) -> CircuitState {
         self.check_and_update_state_returning()
     }
 
-    /// Check and update state, returning the current state to avoid double lock
+    /// Check and update state, returning the current state (lock-free)
+    #[inline]
     fn check_and_update_state_returning(&self) -> CircuitState {
-        let current_state = *self.state.read().unwrap();
+        let current_state_int = self.state.load(Ordering::Acquire);
+        let current_state = CircuitState::from_int(current_state_int);
 
         if current_state == CircuitState::Open {
-            let last_change = *self.last_state_change.read().unwrap();
-            if last_change.elapsed() >= self.config.timeout_duration {
-                self.transition_to(CircuitState::HalfOpen);
-                return CircuitState::HalfOpen;
+            let last_change_ms = self.last_state_change_ms.load(Ordering::Acquire);
+            let elapsed_ms = now_ms().saturating_sub(last_change_ms);
+            let timeout_ms = self.config.timeout_duration.as_millis() as u64;
+
+            if elapsed_ms >= timeout_ms {
+                // Try to transition to HalfOpen using CAS
+                if self
+                    .state
+                    .compare_exchange(
+                        STATE_OPEN,
+                        STATE_HALF_OPEN,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_ok()
+                {
+                    self.last_state_change_ms.store(now_ms(), Ordering::Release);
+                    self.consecutive_failures.store(0, Ordering::Release);
+                    self.consecutive_successes.store(0, Ordering::Release);
+
+                    info!("Circuit breaker state transition: open -> half_open");
+                    Metrics::record_worker_cb_transition(&self.metric_label, "open", "half_open");
+                    Metrics::set_worker_cb_state(&self.metric_label, STATE_HALF_OPEN);
+                    self.publish_gauge_metrics();
+                    return CircuitState::HalfOpen;
+                }
+                // Another thread already transitioned, re-read the state
+                return CircuitState::from_int(self.state.load(Ordering::Acquire));
             }
         }
         current_state
@@ -122,6 +207,10 @@ impl CircuitBreaker {
         } else {
             self.record_failure();
         }
+
+        let outcome_str = if success { "success" } else { "failure" };
+        Metrics::record_worker_cb_outcome(&self.metric_label, outcome_str);
+        self.publish_gauge_metrics();
     }
 
     /// Record a successful request
@@ -130,7 +219,7 @@ impl CircuitBreaker {
         self.consecutive_failures.store(0, Ordering::Release);
         let successes = self.consecutive_successes.fetch_add(1, Ordering::AcqRel) + 1;
 
-        let current_state = *self.state.read().unwrap();
+        let current_state = CircuitState::from_int(self.state.load(Ordering::Acquire));
 
         match current_state {
             CircuitState::HalfOpen => {
@@ -151,12 +240,10 @@ impl CircuitBreaker {
         self.consecutive_successes.store(0, Ordering::Release);
         let failures = self.consecutive_failures.fetch_add(1, Ordering::AcqRel) + 1;
 
-        {
-            let mut last_failure = self.last_failure_time.write().unwrap();
-            *last_failure = Some(Instant::now());
-        }
+        // Update last failure time atomically
+        self.last_failure_time_ms.store(now_ms(), Ordering::Release);
 
-        let current_state = *self.state.read().unwrap();
+        let current_state = CircuitState::from_int(self.state.load(Ordering::Acquire));
 
         match current_state {
             CircuitState::Closed => {
@@ -171,16 +258,14 @@ impl CircuitBreaker {
         }
     }
 
-    /// Transition to a new state
+    /// Transition to a new state (uses CAS for lock-free operation)
     fn transition_to(&self, new_state: CircuitState) {
-        let mut state = self.state.write().unwrap();
-        let old_state = *state;
+        let new_state_int = new_state.to_int();
+        let old_state_int = self.state.swap(new_state_int, Ordering::AcqRel);
+        let old_state = CircuitState::from_int(old_state_int);
 
         if old_state != new_state {
-            *state = new_state;
-
-            let mut last_change = self.last_state_change.write().unwrap();
-            *last_change = Instant::now();
+            self.last_state_change_ms.store(now_ms(), Ordering::Release);
 
             match new_state {
                 CircuitState::Closed => {
@@ -196,27 +281,22 @@ impl CircuitBreaker {
                 }
             }
 
-            let from = match old_state {
-                CircuitState::Closed => "closed",
-                CircuitState::Open => "open",
-                CircuitState::HalfOpen => "half_open",
-            };
-            let to = match new_state {
-                CircuitState::Closed => "closed",
-                CircuitState::Open => "open",
-                CircuitState::HalfOpen => "half_open",
-            };
+            let from = old_state.as_str();
+            let to = new_state.as_str();
             info!("Circuit breaker state transition: {} -> {}", from, to);
+            Metrics::record_worker_cb_transition(&self.metric_label, from, to);
+            Metrics::set_worker_cb_state(&self.metric_label, new_state.to_int());
+            self.publish_gauge_metrics();
         }
     }
 
     /// Get the number of consecutive failures
-    pub fn failure_count(&self) -> u32 {
+    pub fn consecutive_failures(&self) -> u32 {
         self.consecutive_failures.load(Ordering::Acquire)
     }
 
     /// Get the number of consecutive successes
-    pub fn success_count(&self) -> u32 {
+    pub fn consecutive_successes(&self) -> u32 {
         self.consecutive_successes.load(Ordering::Acquire)
     }
 
@@ -232,12 +312,20 @@ impl CircuitBreaker {
 
     /// Get time since last failure
     pub fn time_since_last_failure(&self) -> Option<Duration> {
-        self.last_failure_time.read().unwrap().map(|t| t.elapsed())
+        let last_ms = self.last_failure_time_ms.load(Ordering::Acquire);
+        if last_ms == 0 {
+            None
+        } else {
+            let elapsed_ms = now_ms().saturating_sub(last_ms);
+            Some(Duration::from_millis(elapsed_ms))
+        }
     }
 
     /// Get time since last state change
     pub fn time_since_last_state_change(&self) -> Duration {
-        self.last_state_change.read().unwrap().elapsed()
+        let last_ms = self.last_state_change_ms.load(Ordering::Acquire);
+        let elapsed_ms = now_ms().saturating_sub(last_ms);
+        Duration::from_millis(elapsed_ms)
     }
 
     /// Check if the circuit is in a half-open state
@@ -264,6 +352,7 @@ impl CircuitBreaker {
         self.transition_to(CircuitState::Closed);
         self.consecutive_failures.store(0, Ordering::Release);
         self.consecutive_successes.store(0, Ordering::Release);
+        self.publish_gauge_metrics();
     }
 
     /// Force the circuit to open (for manual intervention)
@@ -275,27 +364,41 @@ impl CircuitBreaker {
     pub fn stats(&self) -> CircuitBreakerStats {
         CircuitBreakerStats {
             state: self.state(),
-            consecutive_failures: self.failure_count(),
-            consecutive_successes: self.success_count(),
+            consecutive_failures: self.consecutive_failures(),
+            consecutive_successes: self.consecutive_successes(),
             total_failures: self.total_failures(),
             total_successes: self.total_successes(),
             time_since_last_failure: self.time_since_last_failure(),
             time_since_last_state_change: self.time_since_last_state_change(),
         }
     }
+
+    fn publish_gauge_metrics(&self) {
+        Metrics::set_worker_cb_consecutive_failures(
+            &self.metric_label,
+            self.consecutive_failures(),
+        );
+        Metrics::set_worker_cb_consecutive_successes(
+            &self.metric_label,
+            self.consecutive_successes(),
+        );
+    }
 }
 
 impl Clone for CircuitBreaker {
     fn clone(&self) -> Self {
         Self {
-            state: Arc::clone(&self.state),
-            consecutive_failures: Arc::clone(&self.consecutive_failures),
-            consecutive_successes: Arc::clone(&self.consecutive_successes),
-            total_failures: Arc::clone(&self.total_failures),
-            total_successes: Arc::clone(&self.total_successes),
-            last_failure_time: Arc::clone(&self.last_failure_time),
-            last_state_change: Arc::clone(&self.last_state_change),
+            state: AtomicU8::new(self.state.load(Ordering::Acquire)),
+            consecutive_failures: AtomicU32::new(self.consecutive_failures.load(Ordering::Acquire)),
+            consecutive_successes: AtomicU32::new(
+                self.consecutive_successes.load(Ordering::Acquire),
+            ),
+            total_failures: AtomicU64::new(self.total_failures.load(Ordering::Relaxed)),
+            total_successes: AtomicU64::new(self.total_successes.load(Ordering::Relaxed)),
+            last_failure_time_ms: AtomicU64::new(self.last_failure_time_ms.load(Ordering::Acquire)),
+            last_state_change_ms: AtomicU64::new(self.last_state_change_ms.load(Ordering::Acquire)),
             config: self.config.clone(),
+            metric_label: self.metric_label.clone(),
         }
     }
 }
@@ -329,8 +432,8 @@ mod tests {
         let cb = CircuitBreaker::new();
         assert_eq!(cb.state(), CircuitState::Closed);
         assert!(cb.can_execute());
-        assert_eq!(cb.failure_count(), 0);
-        assert_eq!(cb.success_count(), 0);
+        assert_eq!(cb.consecutive_failures(), 0);
+        assert_eq!(cb.consecutive_successes(), 0);
     }
 
     #[test]
@@ -339,7 +442,7 @@ mod tests {
             failure_threshold: 3,
             ..Default::default()
         };
-        let cb = CircuitBreaker::with_config(config);
+        let cb = CircuitBreaker::with_config_and_label(config, String::new());
 
         assert_eq!(cb.state(), CircuitState::Closed);
         cb.record_failure();
@@ -350,7 +453,7 @@ mod tests {
 
         assert_eq!(cb.state(), CircuitState::Open);
         assert!(!cb.can_execute());
-        assert_eq!(cb.failure_count(), 3);
+        assert_eq!(cb.consecutive_failures(), 3);
     }
 
     #[test]
@@ -360,7 +463,7 @@ mod tests {
             timeout_duration: Duration::from_millis(100),
             ..Default::default()
         };
-        let cb = CircuitBreaker::with_config(config);
+        let cb = CircuitBreaker::with_config_and_label(config, String::new());
 
         cb.record_failure();
         assert_eq!(cb.state(), CircuitState::Open);
@@ -379,7 +482,7 @@ mod tests {
             timeout_duration: Duration::from_millis(50),
             ..Default::default()
         };
-        let cb = CircuitBreaker::with_config(config);
+        let cb = CircuitBreaker::with_config_and_label(config, String::new());
 
         cb.record_failure();
         assert_eq!(cb.state(), CircuitState::Open);
@@ -402,7 +505,7 @@ mod tests {
             timeout_duration: Duration::from_millis(50),
             ..Default::default()
         };
-        let cb = CircuitBreaker::with_config(config);
+        let cb = CircuitBreaker::with_config_and_label(config, String::new());
 
         cb.record_failure();
         assert_eq!(cb.state(), CircuitState::Open);
@@ -422,15 +525,15 @@ mod tests {
             failure_threshold: 3,
             ..Default::default()
         };
-        let cb = CircuitBreaker::with_config(config);
+        let cb = CircuitBreaker::with_config_and_label(config, String::new());
 
         cb.record_failure();
         cb.record_failure();
-        assert_eq!(cb.failure_count(), 2);
+        assert_eq!(cb.consecutive_failures(), 2);
 
         cb.record_success();
-        assert_eq!(cb.failure_count(), 0);
-        assert_eq!(cb.success_count(), 1);
+        assert_eq!(cb.consecutive_failures(), 0);
+        assert_eq!(cb.consecutive_successes(), 1);
 
         cb.record_failure();
         cb.record_failure();
@@ -443,15 +546,15 @@ mod tests {
             failure_threshold: 1,
             ..Default::default()
         };
-        let cb = CircuitBreaker::with_config(config);
+        let cb = CircuitBreaker::with_config_and_label(config, String::new());
 
         cb.record_failure();
         assert_eq!(cb.state(), CircuitState::Open);
 
         cb.reset();
         assert_eq!(cb.state(), CircuitState::Closed);
-        assert_eq!(cb.failure_count(), 0);
-        assert_eq!(cb.success_count(), 0);
+        assert_eq!(cb.consecutive_failures(), 0);
+        assert_eq!(cb.consecutive_successes(), 0);
     }
 
     #[test]
@@ -470,7 +573,7 @@ mod tests {
             failure_threshold: 2,
             ..Default::default()
         };
-        let cb = CircuitBreaker::with_config(config);
+        let cb = CircuitBreaker::with_config_and_label(config, String::new());
 
         cb.record_success();
         cb.record_failure();
@@ -490,10 +593,11 @@ mod tests {
         cb1.record_failure();
 
         let cb2 = cb1.clone();
-        assert_eq!(cb2.failure_count(), 1);
+        assert_eq!(cb2.consecutive_failures(), 1);
 
         cb1.record_failure();
-        assert_eq!(cb2.failure_count(), 2);
+        assert_eq!(cb1.consecutive_failures(), 2);
+        assert_eq!(cb2.consecutive_failures(), 1); // cb2 is unchanged
     }
 
     #[test]
