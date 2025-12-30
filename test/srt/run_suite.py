@@ -110,6 +110,7 @@ suites = {
         TestFile("hicache/test_hicache_storage_3fs_backend.py", 200),
         TestFile("hicache/test_hicache_storage_file_backend.py", 200),
         TestFile("hicache/test_hicache_storage_mooncake_backend.py", 300),
+        TestFile("hicache/test_hicache_storage_runtime_attach_detach.py", 300),
         TestFile("layers/attention/mamba/test_mamba2_mixer.py", 50),
         TestFile("models/test_glm4_moe_models.py", 100),
         TestFile("models/test_kimi_linear_models.py", 90),
