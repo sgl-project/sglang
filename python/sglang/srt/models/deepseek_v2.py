@@ -167,7 +167,6 @@ from sglang.srt.utils import (
     log_info_on_rank0,
     make_layers,
     use_intel_amx_backend,
-    disable_duck_shaping,
 )
 
 if _use_aiter_gfx95:
@@ -1883,23 +1882,22 @@ class DeepseekV2AttentionMLA(nn.Module):
                     fp8_dtype if self.kv_cache_dtype == "fp8_e4m3" else q_nope_out.dtype
                 )
 
-                with disable_duck_shaping():
-                    q, _, _, k, _ = fused_qk_rope_cat_and_cache_mla(
-                        q_nope_out,
-                        q_pe,
-                        k_nope,
-                        k_pe,
-                        forward_batch.token_to_kv_pool.get_key_buffer(
-                            self.attn_mqa.layer_id
-                        ),
-                        forward_batch.out_cache_loc,
-                        positions,
-                        cos,
-                        sin,
-                        self.attn_mqa.k_scale,
-                        self.rotary_emb.is_neox_style,
-                        q_out_dtype=kv_cache_dtype,
-                    )
+                q, _, _, k, _ = fused_qk_rope_cat_and_cache_mla(
+                    q_nope_out,
+                    q_pe,
+                    k_nope,
+                    k_pe,
+                    forward_batch.token_to_kv_pool.get_key_buffer(
+                        self.attn_mqa.layer_id
+                    ),
+                    forward_batch.out_cache_loc,
+                    positions,
+                    cos,
+                    sin,
+                    self.attn_mqa.k_scale,
+                    self.rotary_emb.is_neox_style,
+                    q_out_dtype=kv_cache_dtype,
+                )
 
                 save_kv_cache = False
             else:

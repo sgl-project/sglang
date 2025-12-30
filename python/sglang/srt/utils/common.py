@@ -3795,13 +3795,3 @@ def get_torch_compile_disable_decorator(is_disable) -> Callable:
         return torch._dynamo.disable
     else:
         return lambda func: func
-
-
-@contextmanager
-def disable_duck_shaping():
-    prev = fx_config.use_duck_shape
-    fx_config.use_duck_shape = False
-    try:
-        yield
-    finally:
-        fx_config.use_duck_shape = prev
