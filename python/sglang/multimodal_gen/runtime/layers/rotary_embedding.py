@@ -76,7 +76,7 @@ def apply_flashinfer_rope_qk_inplace(
         ) from e
 
     if positions is None:
-        pos_1d = torch.arange(seqlen, device="cpu", dtype=torch.long)
+        pos_1d = torch.arange(seqlen, device=q.device, dtype=torch.long)
         positions = pos_1d if bsz == 1 else pos_1d.repeat(bsz)
     else:
         if not (
