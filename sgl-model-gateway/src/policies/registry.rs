@@ -181,10 +181,16 @@ impl PolicyRegistry {
 
     /// Create a policy from a type string (delegates to PolicyFactory)
     fn create_policy_from_type(&self, policy_type: &str) -> Arc<dyn LoadBalancingPolicy> {
-        PolicyFactory::create_by_name(policy_type).unwrap_or_else(|| {
-            warn!("Unknown policy type '{}', using default", policy_type);
-            Arc::clone(&self.default_policy)
-        })
+        if policy_type == "cache_aware" && self.mesh_sync.is_some() {
+            let mut cache_aware = CacheAwarePolicy::new();
+            cache_aware.set_mesh_sync(self.mesh_sync.clone());
+            Arc::new(cache_aware)
+        } else {
+            PolicyFactory::create_by_name(policy_type).unwrap_or_else(|| {
+                warn!("Unknown policy type '{}', using default", policy_type);
+                Arc::clone(&self.default_policy)
+            })
+        }
     }
 
     /// Create a policy from a PolicyConfig (delegates to PolicyFactory)
@@ -372,6 +378,54 @@ impl PolicyRegistry {
                         );
                         bucket.init_prefill_worker_urls(prefill_workers);
                     }
+                }
+            }
+        }
+    }
+
+    /// Apply remote tree operation to cache-aware policy for a model
+    /// This is called when receiving tree state updates from mesh
+    pub fn apply_remote_tree_operation(
+        &self,
+        model_id: &str,
+        operation: &crate::mesh::tree_ops::TreeOperation,
+    ) {
+        // Try to find the policy for this model
+        if let Some(policy) = self.get_policy(model_id) {
+            if policy.name() == "cache_aware" {
+                if let Some(cache_aware) = policy.as_any().downcast_ref::<CacheAwarePolicy>() {
+                    cache_aware.apply_remote_tree_operation(model_id, operation);
+                }
+            }
+        }
+
+        // Also check default policy if it's cache-aware
+        if self.default_policy.name() == "cache_aware" {
+            if let Some(cache_aware) = self
+                .default_policy
+                .as_any()
+                .downcast_ref::<CacheAwarePolicy>()
+            {
+                cache_aware.apply_remote_tree_operation(model_id, operation);
+            }
+        }
+
+        // Check prefill and decode policies for PD mode
+        if let Some(prefill_policy) = self.prefill_policy.get() {
+            if prefill_policy.name() == "cache_aware" {
+                if let Some(cache_aware) =
+                    prefill_policy.as_any().downcast_ref::<CacheAwarePolicy>()
+                {
+                    cache_aware.apply_remote_tree_operation(model_id, operation);
+                }
+            }
+        }
+
+        if let Some(decode_policy) = self.decode_policy.get() {
+            if decode_policy.name() == "cache_aware" {
+                if let Some(cache_aware) = decode_policy.as_any().downcast_ref::<CacheAwarePolicy>()
+                {
+                    cache_aware.apply_remote_tree_operation(model_id, operation);
                 }
             }
         }
