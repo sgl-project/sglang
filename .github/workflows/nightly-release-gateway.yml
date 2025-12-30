@@ -1,12 +1,12 @@
-name: Release SGLang Model Gateway to PyPI
+# Nightly release workflow for SGLang Model Gateway
+
+name: Nightly Release SGLang Model Gateway to PyPI
 
 on:
-  push:
-    branches:
-      - main
-    paths:
-      - sgl-router/pyproject.toml
-  workflow_dispatch:
+  schedule:
+    # Run at 2 AM UTC every day
+    - cron: '0 2 * * *'
+  workflow_dispatch:  # Allow manual trigger
 
 jobs:
   build:
@@ -50,9 +50,9 @@ jobs:
         with:
           path: sglang-repo
 
-      - name: Move sgl-router folder to root and delete sglang-repo
+      - name: Move sgl-model-gateway folder to root and delete sglang-repo
         run: |
-          mv sglang-repo/sgl-router/* .
+          mv sglang-repo/sgl-model-gateway/* .
           rm -rf sglang-repo
           ls -alt
         shell: bash
@@ -63,8 +63,23 @@ jobs:
           python-version: "3.13"
           architecture: ${{ matrix.python-architecture || 'x64' }}
 
-      - name: Install twine
-        run: pip install -U twine
+      - name: Modify version for nightly release
+        run: |
+          # Get current version from pyproject.toml
+          CURRENT_VERSION=$(python -c "import tomllib; print(tomllib.load(open('bindings/python/pyproject.toml', 'rb'))['project']['version'])" 2>/dev/null || python -c "import tomli; print(tomli.load(open('bindings/python/pyproject.toml', 'rb'))['project']['version'])")
+          # Create nightly version with date: e.g., 0.2.1.dev20250128
+          NIGHTLY_VERSION="${CURRENT_VERSION}.dev$(date +%Y%m%d)"
+          echo "Nightly version: $NIGHTLY_VERSION"
+
+          # Update pyproject.toml with nightly version (temporary, not committed)
+          sed -i.bak "s/version = \"${CURRENT_VERSION}\"/version = \"${NIGHTLY_VERSION}\"/" bindings/python/pyproject.toml
+
+          # Verify the change
+          cat bindings/python/pyproject.toml | grep "^version"
+        shell: bash
+
+      - name: Install twine and tomli
+        run: pip install -U twine tomli
 
       - name: Install protoc (macOS)
         if: matrix.os == 'macos'
@@ -77,6 +92,7 @@ jobs:
       - name: Build wheels
         uses: PyO3/maturin-action@v1
         with:
+          working-directory: bindings/python
           target: ${{ matrix.target }}
           manylinux: ${{ matrix.manylinux || 'auto' }}
           args: --release --out dist --features vendored-openssl --interpreter ${{ matrix.interpreter || '3.9 3.10 3.11 3.12 3.13 3.14' }}
@@ -104,15 +120,15 @@ jobs:
             protoc --version
 
       - name: List built packages
-        run: ${{ matrix.ls || 'ls -lh' }} dist/
+        run: ${{ matrix.ls || 'ls -lh' }} bindings/python/dist/
 
       - name: Check packages
-        run: twine check --strict dist/*
+        run: twine check --strict bindings/python/dist/*
 
       - uses: actions/upload-artifact@v4
         with:
           name: packages-${{ matrix.os }}-${{ matrix.target }}-${{ matrix.manylinux || 'auto' }}
-          path: dist/
+          path: bindings/python/dist/
 
   build-sdist:
     name: Build SDist
@@ -122,9 +138,9 @@ jobs:
         with:
           path: sglang-repo
 
-      - name: Move sgl-router folder to root and delete sglang-repo
+      - name: Move sgl-model-gateway folder to root and delete sglang-repo
         run: |
-          mv sglang-repo/sgl-router/* .
+          mv sglang-repo/sgl-model-gateway/* .
           rm -rf sglang-repo
           ls -alt
 
@@ -133,9 +149,24 @@ jobs:
         with:
           python-version: "3.13"
 
+      - name: Modify version for nightly release
+        run: |
+          # Get current version from pyproject.toml
+          CURRENT_VERSION=$(python -c "import tomllib; print(tomllib.load(open('bindings/python/pyproject.toml', 'rb'))['project']['version'])" 2>/dev/null || python -c "import tomli; print(tomli.load(open('bindings/python/pyproject.toml', 'rb'))['project']['version'])")
+          # Create nightly version with date: e.g., 0.2.1.dev20250128
+          NIGHTLY_VERSION="${CURRENT_VERSION}.dev$(date +%Y%m%d)"
+          echo "Nightly version: $NIGHTLY_VERSION"
+
+          # Update pyproject.toml with nightly version (temporary, not committed)
+          sed -i "s/version = \"${CURRENT_VERSION}\"/version = \"${NIGHTLY_VERSION}\"/" bindings/python/pyproject.toml
+
+          # Verify the change
+          cat bindings/python/pyproject.toml | grep "^version"
+
       - name: Build SDist
         uses: PyO3/maturin-action@v1
         with:
+          working-directory: bindings/python
           command: sdist
           args: --out dist
           rust-toolchain: stable
@@ -143,10 +174,10 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: sdist
-          path: dist/*.tar.gz
+          path: bindings/python/dist/*.tar.gz
 
   upload:
-    name: Upload to PyPI
+    name: Upload to TestPyPI
     if: github.repository == 'sgl-project/sglang'  # Ensure this job only runs for the sgl-project/sglang repository
     needs: [build, build-sdist]
     runs-on: ubuntu-latest
@@ -156,10 +187,10 @@ jobs:
           path: dist
           merge-multiple: true
 
-      - name: Upload to PyPI
+      - name: Upload to TestPyPI
         env:
           TWINE_USERNAME: __token__
-          TWINE_PASSWORD: ${{ secrets.PYPI_TOKEN_ROUTER }}
+          TWINE_PASSWORD: ${{ secrets.TEST_PYPI_TOKEN_ROUTER }}
         run: |
           pip install twine
-          twine upload dist/* --verbose
+          twine upload --repository testpypi dist/* --verbose

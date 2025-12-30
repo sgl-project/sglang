@@ -4,6 +4,7 @@
 # Code adapted from SGLang https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/lora/layers.py
 
 import math
+from collections import defaultdict
 
 import torch
 from torch import nn
@@ -32,7 +33,10 @@ from sglang.multimodal_gen.runtime.layers.linear import (
 from sglang.multimodal_gen.runtime.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.utils import get_mixed_precision_state
+
+logger = init_logger(__name__)
 
 torch._dynamo.config.recompile_limit = 16
 
@@ -332,6 +336,13 @@ class QKVParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
 
 
 class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
+    """
+    Row parallel linear layer with LoRA support.
+
+    In tensor parallelism, RowParallel splits the input dimension.
+    For LoRA: A is sliced along input dim, B is full.
+    The LoRA delta must be all-reduced across TP ranks.
+    """
 
     def __init__(
         self,
@@ -341,6 +352,78 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
         training_mode: bool = False,
     ) -> None:
         super().__init__(base_layer, lora_rank, lora_alpha, training_mode)
+
+    def _apply_multi_lora(
+        self, x: torch.Tensor, base_out: torch.Tensor, output_bias
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Apply LoRA adaptively per sample in batch for RowParallel.
+
+        For RowParallel:
+        - LoRA_A is sliced along input dim (same as input sharding)
+        - LoRA_B is NOT sliced
+        - delta = x_sharded @ A_sliced.T @ B.T produces a PARTIAL delta
+        - The partial delta is added to the sharded base output
+        - The combined output will be all-reduced in forward() along with
+          all other partial results, effectively summing the LoRA deltas.
+
+        Note: We do NOT all-reduce the delta here. The final all-reduce in
+        forward() handles summing partial deltas from all ranks.
+        """
+        if self.active_lora_indices is None or len(self.lora_weights_pool) == 0:
+            return base_out, output_bias
+
+        device = x.device
+
+        # Group requests by LoRA to minimize computation
+        lora_groups: dict[int, list[int]] = defaultdict(list)
+        for i, lora_idx in enumerate(self.active_lora_indices.cpu().tolist()):
+            lora_groups[lora_idx].append(i)
+
+        delta = torch.zeros_like(base_out)
+
+        for lora_idx, sample_indices in lora_groups.items():
+            if lora_idx < 0:
+                continue
+
+            lora_nickname = self._index_to_nickname(lora_idx)
+            if lora_nickname is None:
+                logger.warning(
+                    "LoRA index %d not found in nickname mapping for layer %s",
+                    lora_idx,
+                    self.layer_name or self.__class__.__name__,
+                )
+                continue
+            if lora_nickname not in self.lora_weights_pool:
+                logger.warning(
+                    "LoRA adapter '%s' not found in weights pool for layer %s",
+                    lora_nickname,
+                    self.layer_name or self.__class__.__name__,
+                )
+                continue
+
+            lora_A, lora_B = self.lora_weights_pool[lora_nickname]
+            lora_A = lora_A.to(device, non_blocking=True)
+            lora_B = lora_B.to(device, non_blocking=True)
+
+            # Slice for tensor parallelism - A is sliced, B is full
+            lora_A_sliced = self.slice_lora_a_weights(lora_A)
+            lora_B_sliced = self.slice_lora_b_weights(lora_B)
+
+            x_group = x[sample_indices]
+            delta_group = x_group @ lora_A_sliced.T @ lora_B_sliced.T
+
+            adapter_config = self.lora_adapter_configs.get(lora_nickname, {})
+            alpha = adapter_config.get("alpha", self.lora_alpha or 16.0)
+            rank = adapter_config.get("rank", self.lora_rank or 16)
+            if alpha != rank:
+                delta_group = delta_group * (alpha / rank)
+
+            delta[sample_indices] = delta_group
+
+        # Do NOT all-reduce here - the final all-reduce in forward() will
+        # sum the partial deltas from all ranks together with base output.
+        return base_out + delta, output_bias
 
     def forward(self, input_: torch.Tensor):
         # duplicate the logic in RowParallelLinear
@@ -352,11 +435,35 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
                 input_, num_partitions=self.base_layer.tp_size
             )
             input_parallel = splitted_input[tp_rank].contiguous()
+
         output_parallel = self.base_layer.quant_method.apply(
             self.base_layer, input_parallel
         )
 
-        if self.set_lora:
+        # Handle multi-LoRA mode
+        if (
+            self.use_multi_lora
+            and self.active_lora_indices is not None
+            and not self.disable_lora
+        ):
+            # For multi-LoRA in RowParallel, we need to:
+            # 1. Compute the LoRA delta on sharded input
+            # 2. All-reduce the delta across TP ranks
+            # 3. Add to base output (which will also be all-reduced)
+            #
+            # Note: We handle all-reduce in _apply_multi_lora for the delta
+            # The base output will be all-reduced below as normal
+            output_bias = (
+                self.base_layer.bias if self.base_layer.skip_bias_add else None
+            )
+
+            # Apply multi-LoRA with all-reduce for RowParallel
+            output_parallel, output_bias = self._apply_multi_lora(
+                input_parallel, output_parallel, output_bias
+            )
+
+        # Legacy single-LoRA handling
+        elif hasattr(self, "set_lora") and self.set_lora:
             output_parallel = self.apply_lora(output_parallel, input_parallel)
 
         if self.base_layer.reduce_results and self.base_layer.tp_size > 1:
