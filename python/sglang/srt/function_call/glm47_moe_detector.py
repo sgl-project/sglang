@@ -494,13 +494,16 @@ class Glm47MoeDetector(BaseFormatDetector):
             raw_increment, func_name, tools
         )
 
+        # CRITICAL: Update streamed length BEFORE early return
+        # Even if json_increment is empty, the input has been consumed by the state machine
+        self._streamed_raw_length = current_raw_length
+
         if not json_increment:
             return None
 
         # Update state
         self._last_arguments += json_increment
         self.streamed_args_for_tool[self.current_tool_id] += json_increment
-        self._streamed_raw_length = current_raw_length
 
         return ToolCallItem(
             tool_index=self.current_tool_id,

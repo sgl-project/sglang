@@ -486,6 +486,10 @@ class Glm4MoeDetector(BaseFormatDetector):
                             raw_increment, func_name, tools
                         )
 
+                        # CRITICAL: Update streamed length BEFORE checking json_increment
+                        # Even if json_increment is empty, the input has been consumed by the state machine
+                        self._streamed_raw_length = current_raw_length
+
                         if json_increment:
                             calls.append(
                                 ToolCallItem(
@@ -498,9 +502,6 @@ class Glm4MoeDetector(BaseFormatDetector):
                             self.streamed_args_for_tool[
                                 self.current_tool_id
                             ] += json_increment
-
-                        # Update the streamed length
-                        self._streamed_raw_length = current_raw_length
 
                     if is_tool_end == self.eot_token:
                         if self._is_first_param:

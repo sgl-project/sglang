@@ -915,6 +915,262 @@ class TestGlm47MoeDetector(unittest.TestCase):
         # Incomplete call should not be in results
         # (or may be partially present - main thing is no exception)
 
+    # ==================== Streamed Raw Length Bug Tests (3) ====================
+
+    def test_streamed_raw_length_incomplete_xml_tag(self):
+        """
+        Test that _streamed_raw_length is updated even when json_increment is empty.
+
+        Scenario: Stream XML content that is split at an incomplete tag boundary,
+                 causing the state machine to buffer without producing JSON output.
+        Purpose: Verify that _streamed_raw_length is updated regardless of whether
+                json_increment is empty, preventing reprocessing of the same input.
+
+        This tests the bug where:
+        1. raw_increment is extracted from func_args_raw[self._streamed_raw_length:]
+        2. _process_xml_to_json_streaming() returns empty string (buffering state)
+        3. If _streamed_raw_length is NOT updated before the early return,
+           the next call will reprocess the same raw_increment
+        """
+        tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="get_weather",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "city": {"type": "string"},
+                            "temperature": {"type": "number"},
+                        },
+                    },
+                ),
+            ),
+        ]
+
+        # Simulate streaming chunks where XML tags are split
+        chunks = [
+            "<tool_call>get_weather",
+            "<arg_key>city</arg_key><arg_value>Bei",  # Split in middle of value
+            "jing</arg_value>",  # Complete the value
+            "<arg_key>temperature</arg_key><arg_value>2",  # Split numeric value
+            "5</arg_value></tool_call>",
+        ]
+
+        detector = Glm47MoeDetector()
+        all_calls = []
+        collected_params = ""
+
+        for i, chunk in enumerate(chunks):
+            result = detector.parse_streaming_increment(chunk, tools)
+            all_calls.extend(result.calls)
+
+            # Collect parameters
+            for call in result.calls:
+                if call.parameters:
+                    collected_params += call.parameters
+
+        # Verify complete parameters were collected without duplication
+        if collected_params:
+            params = json.loads(collected_params)
+            self.assertEqual(params["city"], "Beijing")
+            self.assertEqual(params["temperature"], 25)
+
+            # Critical: Verify no duplicate JSON output due to reprocessing
+            # Count occurrences of "city" key - should appear exactly once
+            city_count = collected_params.count('"city"')
+            self.assertEqual(
+                city_count,
+                1,
+                f"'city' key appears {city_count} times, expected 1. "
+                f"This indicates input reprocessing bug.",
+            )
+
+    def test_streamed_raw_length_tag_split_across_chunks(self):
+        """
+        Test _streamed_raw_length update when tag is split across chunk boundaries.
+
+        Scenario: XML tags themselves are split across chunks (e.g., "<arg_k" + "ey>").
+        Purpose: Verify that even when the state machine is buffering partial tags,
+                _streamed_raw_length is correctly updated to prevent reprocessing.
+        """
+        tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="search",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "query": {"type": "string"},
+                            "limit": {"type": "integer"},
+                        },
+                    },
+                ),
+            ),
+        ]
+
+        # Split tags in extreme positions
+        chunks = [
+            "<tool_call>search<arg_",  # Split tag name
+            "key>query</arg_key><arg_value>Python progra",  # Complete tag, split value
+            "mming</arg_value><arg_",  # Complete value, split next tag
+            "key>limit</arg_key><arg_value>10</arg_value></tool_call>",
+        ]
+
+        detector = Glm47MoeDetector()
+        all_params = ""
+
+        for chunk in chunks:
+            result = detector.parse_streaming_increment(chunk, tools)
+            for call in result.calls:
+                if call.parameters:
+                    all_params += call.parameters
+
+        # Verify correct reassembly
+        params = json.loads(all_params)
+        self.assertEqual(params["query"], "Python programming")
+        self.assertEqual(params["limit"], 10)
+
+        # Verify no duplication in output
+        query_count = all_params.count('"query"')
+        limit_count = all_params.count('"limit"')
+        self.assertEqual(query_count, 1, "query key duplicated - reprocessing bug")
+        self.assertEqual(limit_count, 1, "limit key duplicated - reprocessing bug")
+
+    def test_streamed_raw_length_buffer_only_partial_tag(self):
+        """
+        Test that _streamed_raw_length updates even when state machine returns empty.
+
+        Scenario: Send increment that is ONLY a partial opening tag that state machine
+                 must buffer completely without producing any JSON output.
+        Purpose: Force json_increment to be empty string to expose the bug where
+                _streamed_raw_length is not updated before early return.
+        """
+        tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="test_func",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "key1": {"type": "string"},
+                        },
+                    },
+                ),
+            ),
+        ]
+
+        # Manually call _process_arguments_streaming to have precise control
+        detector = Glm47MoeDetector()
+        detector.current_tool_id = 0
+        detector.current_tool_name_sent = True
+        detector._reset_streaming_state()
+        detector.streamed_args_for_tool = [""]
+        detector._streamed_raw_length = 0
+
+        # First call: Complete tag that produces JSON output
+        func_args_1 = "<arg_key>key1</arg_key><arg_value>va"
+        result_1 = detector._process_arguments_streaming(
+            "test_func", func_args_1, tools
+        )
+
+        # Should produce JSON output: {"key1": "va (partial)
+        self.assertIsNotNone(result_1)
+        self.assertGreater(len(result_1.parameters), 0)
+        initial_length = detector._streamed_raw_length
+        self.assertEqual(initial_length, len(func_args_1))
+
+        # Second call: Add just partial closing tag - state machine will buffer this
+        # without producing JSON (it's waiting to see if </arg_value> is complete)
+        func_args_2 = func_args_1 + "<"  # Add partial tag
+        result_2 = detector._process_arguments_streaming(
+            "test_func", func_args_2, tools
+        )
+
+        # This is the critical test: if _streamed_raw_length is NOT updated when
+        # json_increment is empty, then detector._streamed_raw_length will still be
+        # at initial_length, and the next call will reprocess the "<" character
+
+        # Check if length was updated (bug test)
+        updated_length = detector._streamed_raw_length
+
+        # BUG: If code has bug, updated_length will equal initial_length
+        # FIXED: If code is correct, updated_length should equal len(func_args_2)
+        self.assertEqual(
+            updated_length,
+            len(func_args_2),
+            "Bug detected: _streamed_raw_length not updated when json_increment is empty. "
+            f"Expected {len(func_args_2)}, got {updated_length}",
+        )
+
+    def test_streamed_raw_length_multiple_empty_returns(self):
+        """
+        Test consecutive chunks that produce empty json_increment.
+
+        Scenario: Multiple consecutive chunks that all result in empty json_increment
+                 as the state machine buffers complex nested structures.
+        Purpose: Verify _streamed_raw_length advances correctly through multiple
+                empty-return cycles without getting stuck or reprocessing.
+        """
+        tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="update_settings",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "name": {"type": "string"},
+                            "value": {"type": "string"},
+                        },
+                    },
+                ),
+            ),
+        ]
+
+        # Split XML at positions that may cause state machine buffering
+        chunks = [
+            "<tool_call>update_settings<arg_key>na",  # Split in tag name
+            "me</arg_key><arg_val",  # Complete tag, split next tag
+            "ue>co",  # Complete tag start, split value  # codespell:ignore ue
+            "nf",  # Continue value
+            "ig_v1</arg_value><arg_key>val",  # Complete value, split next key
+            "ue</arg_key><arg_value>ena",  # Complete key name, split value  # codespell:ignore ue
+            "bled</arg_value></tool_call>",  # Complete everything
+        ]
+
+        detector = Glm47MoeDetector()
+        all_params = ""
+
+        for i, chunk in enumerate(chunks):
+            result = detector.parse_streaming_increment(chunk, tools)
+
+            for call in result.calls:
+                if call.parameters:
+                    all_params += call.parameters
+
+        # Verify final output is correct
+        self.assertGreater(len(all_params), 0, "Should have generated some parameters")
+        params = json.loads(all_params)
+        self.assertEqual(params["name"], "config_v1")
+        self.assertEqual(params["value"], "enabled")
+
+        # Verify no duplicate keys due to reprocessing
+        name_count = all_params.count('"name"')
+        value_count = all_params.count('"value"')
+        self.assertEqual(
+            name_count,
+            1,
+            f"'name' appears {name_count} times - indicates reprocessing bug",
+        )
+        self.assertEqual(
+            value_count,
+            1,
+            f"'value' appears {value_count} times - indicates reprocessing bug",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
