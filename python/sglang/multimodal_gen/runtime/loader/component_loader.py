@@ -749,7 +749,7 @@ class TransformerLoader(ComponentLoader):
                 except Exception:
                     num_layers = None
                 assert isinstance(num_layers, int) and num_layers > 0
-                _mgr = LayerwiseOffloadManager(
+                model.layerwise_offload_manager = LayerwiseOffloadManager(
                     model,
                     module_list_attr=module_name,
                     num_layers=num_layers,
