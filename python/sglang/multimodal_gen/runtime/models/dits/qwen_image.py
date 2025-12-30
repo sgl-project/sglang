@@ -32,6 +32,7 @@ from sglang.multimodal_gen.runtime.layers.triton_ops import (
 )
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
+from sglang.multimodal_gen.runtime.utils.layerwise_offload import OffloadableDiTMixin
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)  # pylint: disable=invalid-name
@@ -814,7 +815,7 @@ def to_hashable(obj):
     return obj
 
 
-class QwenImageTransformer2DModel(CachableDiT):
+class QwenImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
     """
     The Transformer model introduced in Qwen.
 
@@ -893,6 +894,8 @@ class QwenImageTransformer2DModel(CachableDiT):
         self.timestep_zero = torch.zeros(
             (1,), dtype=torch.int, device=get_local_torch_device()
         )
+
+        self.layer_names = ["transformer_blocks"]
 
     @functools.lru_cache(maxsize=50)
     def build_modulate_index(self, img_shapes: tuple[int, int, int], device):

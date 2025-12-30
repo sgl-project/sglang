@@ -40,6 +40,7 @@ from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
     current_platform,
 )
+from sglang.multimodal_gen.runtime.utils.layerwise_offload import OffloadableDiTMixin
 
 
 class MMDoubleStreamBlock(nn.Module):
@@ -386,7 +387,7 @@ class MMSingleStreamBlock(nn.Module):
         return self.output_residual(x, output, mod_gate)
 
 
-class HunyuanVideoTransformer3DModel(CachableDiT):
+class HunyuanVideoTransformer3DModel(CachableDiT, OffloadableDiTMixin):
     """
     HunyuanVideo Transformer backbone adapted for distributed training.
 
@@ -508,7 +509,7 @@ class HunyuanVideoTransformer3DModel(CachableDiT):
                     mlp_ratio=config.mlp_ratio,
                     dtype=config.dtype,
                     supported_attention_backends=self._supported_attention_backends,
-                    prefix=f"{config.prefix}.single_blocks.{i+config.num_layers}",
+                    prefix=f"{config.prefix}.single_blocks.{i + config.num_layers}",
                 )
                 for i in range(config.num_single_layers)
             ]
@@ -523,6 +524,8 @@ class HunyuanVideoTransformer3DModel(CachableDiT):
         )
 
         self.__post_init__()
+
+        self.layer_names = ["double_blocks", "single_blocks"]
 
     # TODO: change the input the FORWARD_BATCH Dict
     # TODO: change output to a dict
