@@ -815,6 +815,13 @@ jobs:
             --total-partitions ${{ matrix.total }} \
             $CONTINUE_ON_ERROR_FLAG
 
+      - name: Upload execution report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diffusion-report-1gpu-${{ matrix.part }}
+          path: python/sglang/multimodal_gen/test/execution_report_*.json
+          retention-days: 1
 
   multimodal-gen-test-2-gpu:
     needs: [check-changes, call-gate, compute-diffusion-partitions, sgl-kernel-build-wheels]
@@ -865,6 +872,42 @@ jobs:
             --partition-id ${{ matrix.part }} \
             --total-partitions ${{ matrix.total }} \
             $CONTINUE_ON_ERROR_FLAG
+
+      - name: Upload execution report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diffusion-report-2gpu-${{ matrix.part }}
+          path: python/sglang/multimodal_gen/test/execution_report_*.json
+          retention-days: 1
+
+  diffusion-coverage-check:
+    needs: [check-changes, multimodal-gen-test-1-gpu, multimodal-gen-test-2-gpu]
+    if: |
+      always() &&
+      (needs.multimodal-gen-test-1-gpu.result == 'success' || needs.multimodal-gen-test-1-gpu.result == 'failure') &&
+      (needs.multimodal-gen-test-2-gpu.result == 'success' || needs.multimodal-gen-test-2-gpu.result == 'failure') &&
+      needs.check-changes.outputs.multimodal_gen == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Download all execution reports
+        uses: actions/download-artifact@v4
+        with:
+          path: reports/
+          pattern: diffusion-report-*
+          merge-multiple: true
+
+      - name: Verify coverage
+        run: |
+          python scripts/ci/verify_diffusion_coverage.py --reports-dir reports/
 
   quantization-test:
       needs: [check-changes, call-gate, stage-a-test-1]
@@ -1778,6 +1821,7 @@ jobs:
 
         multimodal-gen-test-1-gpu,
         multimodal-gen-test-2-gpu,
+        diffusion-coverage-check,
 
         stage-a-test-1,
         stage-b-test-small-1-gpu,

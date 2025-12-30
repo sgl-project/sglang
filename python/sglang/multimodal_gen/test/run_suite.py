@@ -12,9 +12,11 @@ Example:
 """
 
 import argparse
+import json
 import os
 import subprocess
 import sys
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 import tabulate
@@ -257,12 +259,133 @@ def collect_test_items(files, filter_expr=None):
     return test_items
 
 
-def run_pytest(files, filter_expr=None):
+def collect_test_items(files, filter_expr=None):
+    """Collect test item node IDs from the given files using pytest --collect-only.
+
+    Raises:
+        RuntimeError: If pytest collection fails due to errors (e.g., syntax errors,
+            import errors, or other collection failures).
+    """
+    cmd = [sys.executable, "-m", "pytest", "--collect-only", "-q"]
+    if filter_expr:
+        cmd.extend(["-k", filter_expr])
+    cmd.extend(files)
+
+    print(f"Collecting tests with command: {' '.join(cmd)}")
+    result = subprocess.run(cmd, capture_output=True, text=True)
+
+    # Check for collection errors
+    # pytest exit codes:
+    #   0: success
+    #   1: tests collected but some had errors during collection
+    #   2: test execution interrupted
+    #   3: internal error
+    #   4: command line usage error
+    #   5: no tests collected (may be expected with filters)
+    if result.returncode not in (0, 5):
+        error_msg = (
+            f"pytest --collect-only failed with exit code {result.returncode}\n"
+            f"Command: {' '.join(cmd)}\n"
+        )
+        if result.stderr:
+            error_msg += f"stderr:\n{result.stderr}\n"
+        if result.stdout:
+            error_msg += f"stdout:\n{result.stdout}\n"
+        logger.error(error_msg)
+        raise RuntimeError(error_msg)
+
+    if result.returncode == 5:
+        print(
+            "No tests were collected (exit code 5). This may be expected with filters."
+        )
+
+    # Parse the output to extract test node IDs
+    # pytest -q outputs lines like: test_file.py::TestClass::test_method[param]
+    test_items = []
+    for line in result.stdout.strip().split("\n"):
+        line = line.strip()
+        # Skip empty lines and summary lines
+        if line and "::" in line and not line.startswith(("=", "-", " ")):
+            # Handle lines that might have extra info after the test ID
+            test_id = line.split()[0] if " " in line else line
+            if "::" in test_id:
+                test_items.append(test_id)
+
+    print(f"Collected {len(test_items)} test items")
+    return test_items
+
+
+def parse_junit_xml_for_executed_cases(xml_path: str) -> list[str]:
+    """
+    Parse JUnit XML to extract case IDs that were actually executed (not skipped).
+
+    Returns:
+        List of case IDs that were executed (passed or failed, not skipped).
+    """
+    if not Path(xml_path).exists():
+        return []
+
+    executed_cases = []
+    tree = ET.parse(xml_path)
+    root = tree.getroot()
+
+    for testcase in root.iter("testcase"):
+        # Check if test was skipped
+        if testcase.find("skipped") is not None:
+            continue
+
+        name = testcase.get("name", "")
+        # Extract case ID from test name like "test_diffusion_server[qwen_image_t2i]"
+        if "[" in name and "]" in name:
+            case_id = name[name.index("[") + 1 : name.index("]")]
+            executed_cases.append(case_id)
+
+    return executed_cases
+
+
+def write_execution_report(
+    suite: str,
+    partition_id: int,
+    total_partitions: int,
+    executed_cases: list[str],
+    is_standalone: bool = False,
+    standalone_file: str | None = None,
+) -> str:
+    """
+    Write execution report to JSON file.
+
+    Returns:
+        Path to the generated report file.
+    """
+    report = {
+        "suite": suite,
+        "partition_id": partition_id,
+        "total_partitions": total_partitions,
+        "is_standalone": is_standalone,
+        "standalone_file": standalone_file,
+        "executed_cases": executed_cases,
+    }
+
+    report_filename = f"execution_report_{suite}_{partition_id}.json"
+    report_path = Path(__file__).parent / report_filename
+
+    with open(report_path, "w", encoding="utf-8") as f:
+        json.dump(report, f, indent=2)
+
+    logger.info(f"Execution report written to: {report_path}")
+    return str(report_path)
+
+
+def run_pytest(files, filter_expr=None, junit_xml_path=None):
     if not files:
         print("No files to run.")
         return 0
 
     base_cmd = [sys.executable, "-m", "pytest", "-s", "-v"]
+
+    # Add JUnit XML output for coverage tracking
+    if junit_xml_path:
+        base_cmd.extend(["--junit-xml", junit_xml_path])
 
     # Add pytest -k filter if provided
     if filter_expr:
@@ -421,7 +544,20 @@ def main():
         print(f"Filter expression: {filter_expr}")
         print()
 
-        exit_code = run_pytest(suite_files, filter_expr=filter_expr)
+        junit_xml_path = str(target_dir / "junit_results.xml")
+        exit_code = run_pytest(
+            suite_files, filter_expr=filter_expr, junit_xml_path=junit_xml_path
+        )
+
+        # Generate execution report
+        executed_cases = parse_junit_xml_for_executed_cases(junit_xml_path)
+        write_execution_report(
+            suite=args.suite,
+            partition_id=args.partition_id,
+            total_partitions=args.total_partitions,
+            executed_cases=executed_cases,
+            is_standalone=False,
+        )
 
     else:
         # === Standalone test partition ===
@@ -445,7 +581,21 @@ def main():
         print()
 
         # Run without case ID filter (standalone tests are not parametrized)
-        exit_code = run_pytest([standalone_file], filter_expr=args.filter)
+        junit_xml_path = str(target_dir / "junit_results.xml")
+        exit_code = run_pytest(
+            [standalone_file], filter_expr=args.filter, junit_xml_path=junit_xml_path
+        )
+
+        # Generate execution report for standalone
+        standalone_filename = os.path.basename(standalone_file)
+        write_execution_report(
+            suite=args.suite,
+            partition_id=args.partition_id,
+            total_partitions=args.total_partitions,
+            executed_cases=[],  # Standalone doesn't have parametrized cases
+            is_standalone=True,
+            standalone_file=standalone_filename,
+        )
 
     sys.exit(exit_code)
 
