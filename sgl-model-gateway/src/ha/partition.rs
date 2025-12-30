@@ -9,7 +9,7 @@ use std::{
 };
 
 use parking_lot::RwLock;
-use tracing::{debug, warn};
+use tracing::warn;
 
 use super::gossip::{NodeState, NodeStatus};
 

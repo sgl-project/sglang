@@ -39,7 +39,6 @@ use crate::{
         service::{HAServerConfig, HAServerHandler},
         sync::HASyncManager,
     },
-    ha_run,
     middleware::{self, AuthConfig, QueuedRequest},
     observability::{
         logging::{self, LoggingConfig},
@@ -760,7 +759,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         let stores_for_server = stores.clone();
         let sync_manager_for_server = sync_manager.clone();
         let partition_detector_for_server = partition_detector.clone();
-        tokio::spawn(async move {
+        spawn(async move {
             if let Err(e) = ha_server
                 .start_serve_with_stores(
                     Some(stores_for_server),

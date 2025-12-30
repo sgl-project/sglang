@@ -3,13 +3,12 @@
 //! Manages node lifecycle: NotReady -> Joining -> SnapshotPull -> Converging -> Ready
 
 use std::{
-    collections::HashSet,
     sync::Arc,
     time::{Duration, Instant},
 };
 
 use parking_lot::RwLock;
-use tracing::{debug, info, warn};
+use tracing::info;
 
 use super::stores::StateStores;
 
@@ -217,9 +216,9 @@ impl NodeStateMachine {
 
     /// Check if stores are empty (need snapshot)
     pub fn needs_snapshot(&self) -> bool {
-        self.stores.membership.is_empty()
-            || self.stores.worker.is_empty()
-            || self.stores.policy.is_empty()
+        self.stores.membership.len() == 0
+            || self.stores.worker.len() == 0
+            || self.stores.policy.len() == 0
     }
 
     /// Calculate a simple hash of current state (for convergence detection)

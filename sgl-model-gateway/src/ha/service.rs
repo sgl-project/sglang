@@ -23,7 +23,7 @@ use gossip::{
 use crate::ha::{
     controller::HAController,
     node_state_machine::{ConvergenceConfig, NodeStateMachine},
-    partition::{PartitionConfig, PartitionDetector},
+    partition::PartitionDetector,
     ping_server::GossipService,
 };
 
@@ -319,6 +319,49 @@ impl HAServer {
             self_address
         );
 
+        Ok(())
+    }
+
+    pub async fn start_serve_with_stores(
+        self,
+        stores: Option<Arc<super::stores::StateStores>>,
+        sync_manager: Option<Arc<super::sync::HASyncManager>>,
+        partition_detector: Option<Arc<PartitionDetector>>,
+    ) -> Result<()> {
+        log::info!("HA server listening on {}", self.self_addr);
+        let self_name = self.self_name.clone();
+        let self_address = self.self_addr;
+
+        let mut service = self.build_ping_server();
+        if let Some(stores) = stores {
+            service = service.with_stores(stores);
+        }
+        if let Some(sync_manager) = sync_manager {
+            service = service.with_sync_manager(sync_manager);
+        }
+        if let Some(partition_detector) = partition_detector {
+            service = service.with_partition_detector(partition_detector);
+        }
+        let controller = self.build_controller();
+
+        let mut service_shutdown = self.signal_rx.clone();
+
+        let listener = tokio::spawn(service.serve_ping_with_shutdown(async move {
+            _ = service_shutdown.changed().await;
+        }));
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let app_handle = tokio::spawn(controller.event_loop(self.signal_rx.clone()));
+
+        tokio::select! {
+            res = listener => res??,
+            res = app_handle => res??,
+        }
+
+        log::info!(
+            "HA server {} at {} is shutting down",
+            self_name,
+            self_address
+        );
         Ok(())
     }
 }

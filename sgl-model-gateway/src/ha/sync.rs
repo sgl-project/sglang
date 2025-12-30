@@ -9,7 +9,7 @@ use tracing::debug;
 use super::{
     crdt::SKey,
     gossip::NodeStatus,
-    stores::{MembershipState, PolicyState, StateStores, WorkerState},
+    stores::{PolicyState, StateStores, WorkerState},
 };
 
 /// HA sync manager for coordinating state synchronization

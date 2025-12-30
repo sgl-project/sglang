@@ -11,7 +11,6 @@ use std::{
 };
 
 use parking_lot::RwLock;
-use tracing::{debug, warn};
 
 /// Maximum message size in bytes (default: 10MB)
 pub const MAX_MESSAGE_SIZE: usize = 10 * 1024 * 1024;

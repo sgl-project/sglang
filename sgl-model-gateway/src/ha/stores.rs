@@ -10,7 +10,7 @@ use std::{collections::BTreeMap, sync::Arc};
 
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
-use tracing::{debug, warn};
+use tracing::debug;
 
 use super::{
     consistent_hash::ConsistentHashRing,
@@ -347,6 +347,7 @@ impl RateLimitStore {
     }
 
     /// Get or create counter (only if this node is an owner)
+    #[allow(dead_code)]
     fn get_or_create_counter_internal(&self, key: String) -> Option<SyncPNCounter> {
         if !self.is_owner(&key) {
             return None;
