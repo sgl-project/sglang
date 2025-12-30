@@ -43,10 +43,7 @@ from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
     get_diffusers_component_config,
     get_hf_config,
 )
-from sglang.multimodal_gen.runtime.utils.layerwise_offload import (
-    LayerwiseOffloadManager,
-    OffloadableDiTMixin,
-)
+from sglang.multimodal_gen.runtime.utils.layerwise_offload import OffloadableDiTMixin
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
 
@@ -741,21 +738,9 @@ class TransformerLoader(ComponentLoader):
         model = model.eval()
 
         if server_args.dit_layerwise_offload:
+            # enable layerwise offload if possible
             if isinstance(model, OffloadableDiTMixin):
-                # TODO(will): support multiple module names
-                module_name = model.layer_names[0]
-                try:
-                    num_layers = len(getattr(model, module_name))
-                except Exception:
-                    num_layers = None
-                assert isinstance(num_layers, int) and num_layers > 0
-                model.layerwise_offload_manager = LayerwiseOffloadManager(
-                    model,
-                    module_list_attr=module_name,
-                    num_layers=num_layers,
-                    enabled=True,
-                    pin_cpu_memory=server_args.pin_cpu_memory,
-                )
+                model.configure_layerwise_offload(server_args)
             else:
                 logger.info(
                     "Disabling layerwise offload since current model does not support this feature"

@@ -4,6 +4,7 @@ from typing import Any, Dict, List, Set, Tuple
 
 import torch
 
+from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
@@ -34,7 +35,7 @@ class LayerwiseOffloadManager:
         pin_cpu_memory: bool = True,
     ) -> None:
         self.model = model
-        self.module_list_attr = module_list_attr
+        self.layers_attr_str = module_list_attr
         self.num_layers = num_layers
         self.pin_cpu_memory = pin_cpu_memory
 
@@ -61,8 +62,6 @@ class LayerwiseOffloadManager:
         self._named_buffers: Dict[str, torch.Tensor] = {}
 
         self._initialize()
-
-        logger.info("LayerwiseOffloadManager initialized")
 
     def _match_layer_idx(self, name: str) -> int | None:
         m = self._layer_name_re.search(name)
@@ -128,7 +127,8 @@ class LayerwiseOffloadManager:
         # prefetch the first layer for warm-up
         self.prepare_for_next_denoise(non_blocking=False)
 
-        self.enable_forward_hooks()
+        self.register_forward_hooks()
+        logger.info("LayerwiseOffloadManager initialized")
 
     def prepare_for_next_denoise(self, non_blocking=True):
         self.prefetch_layer(0, non_blocking=non_blocking)
@@ -204,11 +204,11 @@ class LayerwiseOffloadManager:
         for layer_idx in list(self._gpu_layers):
             self.release_layer(layer_idx)
 
-    def enable_forward_hooks(self) -> None:
+    def register_forward_hooks(self) -> None:
         if not self.enabled:
             return
 
-        modules = getattr(self.model, self.module_list_attr)
+        layers = getattr(self.model, self.layers_attr_str)
 
         def make_pre_hook(i):
             def hook(module, input):
@@ -224,16 +224,38 @@ class LayerwiseOffloadManager:
 
             return hook
 
-        for i, module in enumerate(modules):
-            module.register_forward_pre_hook(make_pre_hook(i))
-            module.register_forward_hook(make_post_hook(i))
+        # register prefetch & release hooks for each layer
+        for i, layer in enumerate(layers):
+            layer.register_forward_pre_hook(make_pre_hook(i))
+            layer.register_forward_hook(make_post_hook(i))
 
 
 class OffloadableDiTMixin:
     """
-    A mixin that registers forward hooks to utilize LayerwiseOffloadManager for a DiT
+    A mixin that registers forward hooks for a DiT to enable layerwise offload
     """
 
     # the list of names of a DiT's layers/blocks
     layer_names: List[str]
     layerwise_offload_manager: LayerwiseOffloadManager | None = None
+
+    def configure_layerwise_offload(self, server_args: ServerArgs):
+        self.layerwise_offload_managers = []
+        for module_name in self.layer_names:
+            module_list = getattr(self, module_name, None)
+            if module_list is None or not isinstance(module_list, torch.nn.ModuleList):
+                continue
+
+            num_layers = len(module_list)
+            manager = LayerwiseOffloadManager(
+                model=self,
+                module_list_attr=module_name,
+                num_layers=num_layers,
+                enabled=True,
+                pin_cpu_memory=server_args.pin_cpu_memory,
+            )
+            self.layerwise_offload_managers.append(manager)
+
+        logger.info(
+            f"Enabled layerwise offload for {self.__class__.__name__} on modules: {self.layer_names}"
+        )
