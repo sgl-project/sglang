@@ -26,7 +26,7 @@ use tracing::{debug, error, field::Empty, info, info_span, warn, Span};
 
 pub use crate::core::token_bucket::TokenBucket;
 use crate::{
-    observability::metrics::{metrics_labels, Metrics},
+    observability::metrics::{method_to_static_str, metrics_labels, Metrics},
     routers::error::extract_error_code_from_response,
     server::AppState,
     wasm::{
@@ -289,7 +289,7 @@ impl<B> MakeSpan<B> for RequestSpan {
             status_code = Empty,
             latency = Empty,
             error = Empty,
-            module = "sglang::router_rs"
+            module = "sgl_model_gateway"
         )
     }
 }
@@ -307,6 +307,10 @@ impl<B> OnRequest<B> for RequestLogger {
         if let Some(request_id) = request.extensions().get::<RequestId>() {
             span.record("request_id", request_id.0.as_str());
         }
+
+        let method = method_to_static_str(request.method().as_str());
+        let path = normalize_path_for_metrics(request.uri().path());
+        Metrics::record_http_request(method, &path);
 
         // Log the request start
         info!(
@@ -418,7 +422,7 @@ impl QueueProcessor {
     }
 
     pub async fn run(mut self) {
-        info!("Starting concurrency queue processor");
+        debug!("Starting concurrency queue processor");
 
         // Process requests in a single task to reduce overhead
         while let Some(queued) = self.queue_rx.recv().await {
@@ -599,7 +603,7 @@ pub async fn concurrency_limit_middleware(
 // HTTP Metrics Layer (Layer 1: SMG metrics)
 // ============================================================================
 
-/// Global counter for active HTTP connections
+/// Global counter for active HTTP connections (handlers currently executing)
 static ACTIVE_HTTP_CONNECTIONS: AtomicU64 = AtomicU64::new(0);
 
 /// Tower Layer for HTTP metrics collection (SMG Layer 1 metrics)
@@ -641,7 +645,8 @@ where
     }
 
     fn call(&mut self, req: Request) -> Self::Future {
-        let method = req.method().as_str().to_owned();
+        // Convert method to static string to avoid allocation
+        let method = method_to_static_str(req.method().as_str());
         let path = normalize_path_for_metrics(req.uri().path());
         let start = Instant::now();
 
@@ -662,25 +667,10 @@ where
             let response = result?;
 
             let duration = start.elapsed();
-            let status_class = status_to_class(response.status().as_u16());
-
-            Metrics::record_http_request(&method, &path, status_class);
-            Metrics::record_http_duration(&method, &path, duration);
+            Metrics::record_http_duration(method, &path, duration);
 
             Ok(response)
         })
-    }
-}
-
-#[inline]
-fn status_to_class(status: u16) -> &'static str {
-    match status {
-        100..=199 => "1xx",
-        200..=299 => "2xx",
-        300..=399 => "3xx",
-        400..=499 => "4xx",
-        500..=599 => "5xx",
-        _ => "unknown",
     }
 }
 

@@ -485,7 +485,8 @@ class SWARadixCache(BasePrefixCache):
             )
 
         # free the unaligned tail
-        self.token_to_kv_pool_allocator.free(kv_indices[page_aligned_len:])
+        if not self.is_eagle:
+            self.token_to_kv_pool_allocator.free(kv_indices[page_aligned_len:])
 
         # Remove req slot release the cache lock
         self.req_to_token_pool.free(req.req_pool_idx)

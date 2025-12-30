@@ -39,7 +39,7 @@ def run_eval_once(args, base_url: str, eval_obj: Eval) -> dict:
         base_url=base_url,
         temperature=getattr(args, "temperature", 0.0),
         reasoning_effort=getattr(args, "reasoning_effort", None),
-        extra_body=thinking_kwargs,
+        extra_body=thinking_kwargs if thinking_kwargs else None,
     )
 
     # Run eval
@@ -120,6 +120,10 @@ def run_eval(args):
             args.num_threads,
             response_answer_regex=getattr(args, "response_answer_regex", None),
         )
+    elif args.eval_name == "aime25":
+        from sglang.test.simple_eval_aime25 import AIME25Eval
+
+        eval_obj = AIME25Eval(args.num_examples, args.num_threads)
     else:
         raise ValueError(f"Invalid eval name: {args.eval_name}")
 
