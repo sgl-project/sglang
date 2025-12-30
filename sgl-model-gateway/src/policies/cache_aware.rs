@@ -701,7 +701,7 @@ mod tests {
         let tree_state = mesh_sync.get_tree_state("default");
         assert!(tree_state.is_some());
         let tree = tree_state.unwrap();
-        assert!(tree.operations.len() > 0);
+        assert!(!tree.operations.is_empty());
     }
 
     #[test]
