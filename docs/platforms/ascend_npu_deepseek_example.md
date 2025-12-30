@@ -25,14 +25,13 @@ export SGLANG_USE_FIA_NZ=1
 export ENABLE_MOE_NZ=1
 
 python3 -m sglang.launch_server \
-    --host 127.0.0.1 \
-    --port 6688 \
     --model-path ${MODEL_PATH} \
+    --tp 16 \
     --trust-remote-code \
     --attention-backend ascend \
     --device npu \
-    --tp 16 \
     --quantization modelslim \
+    --watchdog-timeout 9000 \
     --cuda-graph-bs 8 16 24 28 32 \
     --mem-fraction-static 0.68 \
     --max-running-requests 128 \
@@ -49,8 +48,6 @@ python3 -m sglang.launch_server \
     --speculative-num-steps 3 \
     --speculative-eagle-topk 1 \
     --speculative-num-draft-tokens 4 \
-    --watchdog-timeout 9000 \
-    --log-level info \
     --dtype bfloat16
 ```
 
