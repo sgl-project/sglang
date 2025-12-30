@@ -109,7 +109,7 @@ class LayerwiseOffloadManager:
                 current_offset = 0
                 for name, weight in weights:
                     numel = weight.numel()
-                    cpu_buffer[current_offset: current_offset + numel].copy_(
+                    cpu_buffer[current_offset : current_offset + numel].copy_(
                         weight.flatten()
                     )
                     self._weight_metadata[layer_idx][name] = {
@@ -173,7 +173,7 @@ class LayerwiseOffloadManager:
             # map the parameter's data to the correct slice of the GPU buffer
             target = self.get_target_with_name(name)
             target.data = gpu_buffer[
-                meta["offset"]: meta["offset"] + meta["numel"]
+                meta["offset"] : meta["offset"] + meta["numel"]
             ].view(meta["shape"])
 
         self._gpu_layers.add(layer_idx)
@@ -231,8 +231,9 @@ class LayerwiseOffloadManager:
 
 class OffloadableDiTMixin:
     """
-        A mixin that registers forward hooks to utilize LayerwiseOffloadManager for a DiT
+    A mixin that registers forward hooks to utilize LayerwiseOffloadManager for a DiT
     """
+
     # the list of names of a DiT's layers/blocks
     layer_names: List[str]
     layerwise_offload_manager: LayerwiseOffloadManager | None = None
