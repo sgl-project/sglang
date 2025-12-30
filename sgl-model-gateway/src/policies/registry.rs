@@ -185,7 +185,7 @@ impl PolicyRegistry {
     fn create_policy_from_type(&self, policy_type: &str) -> Arc<dyn LoadBalancingPolicy> {
         if policy_type == "cache_aware" {
             let mut cache_aware = CacheAwarePolicy::new();
-            let ref mesh_sync = *self.mesh_sync.read().unwrap();
+            let mesh_sync = &*self.mesh_sync.read().unwrap();
             cache_aware.set_mesh_sync(mesh_sync.clone());
             Arc::new(cache_aware)
         } else {
