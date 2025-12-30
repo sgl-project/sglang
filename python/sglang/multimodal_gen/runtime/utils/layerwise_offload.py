@@ -1,5 +1,4 @@
 import re
-import time
 from contextlib import contextmanager
 from itertools import chain
 from typing import Any, Dict, List, Set, Tuple
@@ -63,15 +62,13 @@ class LayerwiseOffloadManager:
         self._named_parameters: Dict[str, torch.nn.Parameter] = {}
         self._named_buffers: Dict[str, torch.Tensor] = {}
 
-        # --- Static Buffer Pool ---
         # A pool of pre-allocated GPU buffers to avoid torch.empty overhead.
-        # {dtype: [buffer_1, buffer_2, ...]}
+        # dtype -> [buffer] * buffer_pool_size
         self._gpu_buffer_pool: Dict[torch.dtype, List[torch.Tensor]] = {}
-        # Track which buffer is assigned to which layer: layer_idx -> {dtype: buffer_index}
-        self._layer_buffer_indices: Dict[int, Dict[torch.dtype, int]] = {}
-        # Max number of buffers to keep in pool (e.g., 2 or 3 for double/triple buffering)
+        # max number of buffers to keep in pool (2 for double buffer)
         self._buffer_pool_size = 2
-        # Max buffer size needed per dtype (calculated during init)
+        # max buffer size needed per dtype across all layers
+        # dtype -> buffer_size
         self._max_buffer_size_per_dtype: Dict[torch.dtype, int] = {}
 
         if auto_initialize:
@@ -113,7 +110,7 @@ class LayerwiseOffloadManager:
             for dtype, weights in dtype_to_params.items():
                 total_numel = sum(t.numel() for _, t in weights)
 
-                # Track max size needed for static buffer
+                # track max size needed for static buffer
                 self._max_buffer_size_per_dtype[dtype] = max(
                     self._max_buffer_size_per_dtype.get(dtype, 0), total_numel
                 )
@@ -143,17 +140,15 @@ class LayerwiseOffloadManager:
 
                 self._consolidated_cpu_weights[layer_idx][dtype] = cpu_buffer
 
-        # 3. Pre-allocate GPU static buffers
-        if self.device is not None:
-            for dtype, max_size in self._max_buffer_size_per_dtype.items():
-                self._gpu_buffer_pool[dtype] = []
-                for _ in range(self._buffer_pool_size):
-                    # Allocate max needed size
-                    self._gpu_buffer_pool[dtype].append(
-                        torch.empty(max_size, dtype=dtype, device=self.device)
-                    )
+        # 3. pre-allocate GPU static buffer for prefetch
+        for dtype, max_size in self._max_buffer_size_per_dtype.items():
+            self._gpu_buffer_pool[dtype] = []
+            for _ in range(self._buffer_pool_size):
+                self._gpu_buffer_pool[dtype].append(
+                    torch.empty(max_size, dtype=dtype, device=self.device)
+                )
 
-        # prefetch the first layer for warm-up
+        # prefetch the first layer as warm-up
         self.prepare_for_next_denoise(non_blocking=False)
 
     def prepare_for_next_denoise(self, non_blocking=True):
@@ -182,44 +177,30 @@ class LayerwiseOffloadManager:
 
         self.copy_stream.wait_stream(torch.cuda.current_stream())
 
-        # Determine which buffer index to use from the pool.
-        # We use a simple round-robin or based on layer_idx to assign a slot.
-        # Since we usually prefetch i+1 while i is active, layer_idx % pool_size works well
-        # to avoid overwriting the currently active layer.
+        # determine which buffer index to use from the pool for the layer being prefetched
+        # simple round-robin is sufficient for current behavior: prefetch layer i+1 while using layer i
         pool_idx = layer_idx % self._buffer_pool_size
-        self._layer_buffer_indices[layer_idx] = {}
 
-        # load from CPU buffer to Static GPU buffer
+        # load from cpu buffer to static gpu buffer
         gpu_buffers: Dict[torch.dtype, torch.Tensor] = {}
         with torch.cuda.stream(self.copy_stream):
             for dtype, cpu_buffer in self._consolidated_cpu_weights[layer_idx].items():
-                if dtype not in self._gpu_buffer_pool:
-                    # Fallback if dtype wasn't pre-allocated (shouldn't happen if init is correct)
-                    gpu_buffer = torch.empty(
-                        cpu_buffer.shape, dtype=dtype, device=self.device
-                    )
-                    gpu_buffer.copy_(cpu_buffer, non_blocking=non_blocking)
-                    gpu_buffers[dtype] = gpu_buffer
-                else:
-                    # Use static buffer
-                    static_buffer = self._gpu_buffer_pool[dtype][pool_idx]
-                    # Slice the static buffer to match the needed size
-                    # NOTE: We must use a slice to ensure copy_ size matches cpu_buffer
-                    target_slice = static_buffer[: cpu_buffer.numel()].view(
-                        cpu_buffer.shape
-                    )
-                    target_slice.copy_(cpu_buffer, non_blocking=non_blocking)
-                    gpu_buffers[dtype] = target_slice
-                    self._layer_buffer_indices[layer_idx][dtype] = pool_idx
+                static_buffer = self._gpu_buffer_pool[dtype][pool_idx]
+                # slice the gpu buffer for required size
+                target_slice = static_buffer[: cpu_buffer.numel()].view(
+                    cpu_buffer.shape
+                )
+                target_slice.copy_(cpu_buffer, non_blocking=non_blocking)
+                gpu_buffers[dtype] = target_slice
 
         # restore model's weights by their metadata using gpu buffer
         for name, meta in self._weight_metadata[layer_idx].items():
             dtype = meta["dtype"]
             gpu_buffer = gpu_buffers[dtype]
 
-            # map the parameter's data to the correct slice of the GPU buffer
+            # map the parameter's data to the correct slice of the static GPU buffer
             target = self.get_target_with_name(name)
-            # Direct pointer assignment into the static buffer slicetarget.data = gpu_buffer[
+            target.data = gpu_buffer[
                 meta["offset"] : meta["offset"] + meta["numel"]
             ].view(meta["shape"])
 
@@ -240,42 +221,10 @@ class LayerwiseOffloadManager:
         ``release_layer_idx`` on exit.
         """
         if self.enabled and prefetch_layer_idx is not None:
-            # 记录预取开始时间
-            prefetch_start_time = time.perf_counter()
             self.prefetch_layer(prefetch_layer_idx, non_blocking=non_blocking)
-
-        # 记录计算开始时间
-        comp_start_time = time.perf_counter()
         try:
             yield
         finally:
-            # print(f"finally")
-            # # 计算结束时间
-            # comp_end_time = time.perf_counter()
-            # comp_duration = (comp_end_time - comp_start_time) * 1000 # ms
-            # if self.enabled and self.copy_stream is not None and prefetch_layer_idx is not None:
-            #     print(f"entering")
-            #     # 核心分析逻辑：
-            #     # 我们通过同步 copy_stream 来检测搬运是否已经完成。
-            #     # 如果搬运已经完成，synchronize 会立即返回。
-            #     wait_start = time.perf_counter()
-            #     self.copy_stream.synchronize()
-            #     wait_duration = (time.perf_counter() - wait_start) * 1000 # ms
-            #
-            #     if wait_duration > 0.1: # 超过 0.1ms 的等待被视为搬运未完全隐藏
-            #         print(
-            #             f"[Offload Log] Layer {prefetch_layer_idx} prefetch NOT fully hidden! "
-            #             f"Comp: {comp_duration:.2f}ms, EXTRA Wait: {wait_duration:.2f}ms"
-            #         )
-            #     else:
-            #         print(
-            #             f"[Offload Log] Layer {prefetch_layer_idx} prefetch fully hidden. "
-            #             f"Comp: {comp_duration:.2f}ms"
-            #         )
-            #
-            #     # 维持原有的流水线同步逻辑
-            #     torch.cuda.current_stream().wait_stream(self.copy_stream)
-
             if self.enabled and self.copy_stream is not None:
                 torch.cuda.current_stream().wait_stream(self.copy_stream)
             if self.enabled and release_layer_idx is not None:
@@ -292,16 +241,9 @@ class LayerwiseOffloadManager:
             return
 
         # Release GPU memory by pointing to dummy tensors
-        # Note: We don't "free" the static buffer, we just let it be overwritten by the next layer
-        # that claims this pool_idx.
-        for name, meta in self._tensor_metadata.get(layer_idx, {}).items():
+        for name, meta in self._weight_metadata.get(layer_idx, {}).items():
             target = self.get_target_with_name(name)
-            if target is not None:
-                target.data = torch.empty((1,), device=self.device, dtype=meta["dtype"])
-
-        # Clean up tracking info
-        if layer_idx in self._layer_buffer_indices:
-            del self._layer_buffer_indices[layer_idx]
+            target.data = torch.empty((1,), device=self.device, dtype=meta["dtype"])
 
         self._gpu_layers.discard(layer_idx)
 
