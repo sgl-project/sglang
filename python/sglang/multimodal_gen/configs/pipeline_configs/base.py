@@ -195,11 +195,6 @@ class PipelineConfig:
         field(default_factory=lambda: (postprocess_text,))
     )
 
-    # StepVideo specific parameters
-    pos_magic: str | None = None
-    neg_magic: str | None = None
-    timesteps_scale: bool | None = None
-
     # STA (Sliding Tile Attention) parameters
     mask_strategy_file_path: str | None = None
     STA_mode: STA_Mode = STA_Mode.STA_INFERENCE
@@ -298,6 +293,9 @@ class PipelineConfig:
         )
 
         return shape
+
+    def allow_set_num_frames(self):
+        return False
 
     def get_decode_scale_and_shift(self, device, dtype, vae):
         vae_arch_config = self.vae_config.arch_config
@@ -464,27 +462,6 @@ class PipelineConfig:
             default=PipelineConfig.image_encoder_precision,
             choices=["fp32", "fp16", "bf16"],
             help="Precision for image encoder",
-        )
-        parser.add_argument(
-            f"--{prefix_with_dot}pos_magic",
-            type=str,
-            dest=f"{prefix_with_dot.replace('-', '_')}pos_magic",
-            default=PipelineConfig.pos_magic,
-            help="Positive magic prompt for sampling, used in stepvideo",
-        )
-        parser.add_argument(
-            f"--{prefix_with_dot}neg_magic",
-            type=str,
-            dest=f"{prefix_with_dot.replace('-', '_')}neg_magic",
-            default=PipelineConfig.neg_magic,
-            help="Negative magic prompt for sampling, used in stepvideo",
-        )
-        parser.add_argument(
-            f"--{prefix_with_dot}timesteps_scale",
-            type=bool,
-            dest=f"{prefix_with_dot.replace('-', '_')}timesteps_scale",
-            default=PipelineConfig.timesteps_scale,
-            help="Bool for applying scheduler scale in set_timesteps, used in stepvideo",
         )
 
         # DMD parameters
