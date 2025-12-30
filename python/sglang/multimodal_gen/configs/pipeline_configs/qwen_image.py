@@ -6,7 +6,10 @@ from typing import Callable
 import torch
 
 from sglang.multimodal_gen.configs.models import DiTConfig, EncoderConfig, VAEConfig
-from sglang.multimodal_gen.configs.models.dits.qwenimage import QwenImageDitConfig
+from sglang.multimodal_gen.configs.models.dits.qwenimage import (
+    QwenImageDitConfig,
+    QwenImageEditPlus_2511_DitConfig,
+)
 from sglang.multimodal_gen.configs.models.encoders.qwen_image import Qwen2_5VLConfig
 from sglang.multimodal_gen.configs.models.vaes.qwenimage import QwenImageVAEConfig
 from sglang.multimodal_gen.configs.pipeline_configs.base import (
@@ -415,7 +418,6 @@ class QwenImageEditPlusPipelineConfig(QwenImageEditPipelineConfig):
         assert batch_size == 1
         height = batch.height
         width = batch.width
-        image_size = batch.original_condition_image_size
 
         vae_scale_factor = self.get_vae_scale_factor()
 
@@ -472,6 +474,11 @@ class QwenImageEditPlusPipelineConfig(QwenImageEditPipelineConfig):
             "freqs_cis": ((img_cos, img_sin), (txt_cos, txt_sin)),
             "img_shapes": img_shapes,
         }
+
+
+@dataclass
+class QwenImageEditPlus_2511_PipelineConfig(QwenImageEditPlusPipelineConfig):
+    dit_config: DiTConfig = field(default_factory=QwenImageEditPlus_2511_DitConfig)
 
 
 @dataclass

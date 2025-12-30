@@ -205,7 +205,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | Argument | Description | Defaults | Options |
 | --- | --- | --- | --- |
 | `--data-parallel-size`<br>`--dp-size` | The data parallelism size. | `1` | Type: int |
-| `--load-balance-method` | The load balancing strategy for data parallelism. The Minimum Token algorithm can only be used when DP attention is applied. This algorithm performs load balancing based on the real-time token load of the DP workers. | `round_robin` | `round_robin`, `shortest_queue`, `minimum_tokens` |
+| `--load-balance-method` | The load balancing strategy for data parallelism. The Minimum Token algorithm can only be used when DP attention is applied. This algorithm performs load balancing based on the real-time token load of the DP workers. | `auto` | `auto`, `round_robin`, `follow_bootstrap_room`, `shortest_queue`, `minimum_tokens` |
 | `--load-watch-interval` | The interval of load watching in seconds. | `0.1` | Type: float |
 | `--prefill-round-robin-balance` | Prefill is round robin balanced. This is used to promise decode server can get the correct dp rank. | `False` | bool flag (set to enable) |
 
