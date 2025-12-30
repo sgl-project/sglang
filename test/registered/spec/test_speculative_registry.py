@@ -17,27 +17,20 @@ class DummyWorker:
 
 
 class SpeculativeRegistryTests(unittest.TestCase):
-    def test_nextn_alias_maps_to_eagle(self):
-        eagle = SpeculativeAlgorithm.from_string("EAGLE")
-        alias = SpeculativeAlgorithm.from_string("NEXTN")
-        self.assertIs(alias, eagle)
-
     def test_register_speculative_algorithm_registers_worker_and_flags(self):
         original_next_value = SpeculativeAlgorithm._next_value
         algo = register_speculative_algorithm(
             "TEST_SPEC_ALGO",
             DummyWorker,
-            aliases=("TEST_SPEC_ALIAS",),
             flags=("EAGLE",),
             override_worker=True,
         )
-        self.addCleanup(self._cleanup_registered_algorithm, algo, ("TEST_SPEC_ALIAS",))
+        self.addCleanup(self._cleanup_registered_algorithm, algo)
         self.addCleanup(
             setattr, SpeculativeAlgorithm, "_next_value", original_next_value
         )
 
         self.assertIs(SpeculativeAlgorithm.from_string("TEST_SPEC_ALGO"), algo)
-        self.assertIs(SpeculativeAlgorithm.from_string("TEST_SPEC_ALIAS"), algo)
         self.assertTrue(algo.is_eagle())
         self.assertIs(SpeculativeAlgorithm.from_value(int(algo)), algo)
         self.assertIn(algo, list(spec_info_module._REGISTERED_WORKERS))
@@ -128,15 +121,12 @@ class SpeculativeRegistryTests(unittest.TestCase):
 
         self.assertEqual(algo.create_draft_worker(), "dummy")
 
-    def _cleanup_registered_algorithm(self, algorithm: SpeculativeAlgorithm, aliases):
+    def _cleanup_registered_algorithm(self, algorithm: SpeculativeAlgorithm):
         name = algorithm.name
         SpeculativeAlgorithm._registry_by_value.pop(algorithm.value, None)
         SpeculativeAlgorithm._registry_by_name.pop(name, None)
         if hasattr(SpeculativeAlgorithm, name):
             delattr(SpeculativeAlgorithm, name)
-
-        for alias in aliases:
-            SpeculativeAlgorithm._registry_by_name.pop(alias, None)
 
         try:
             SpeculativeAlgorithm._registration_order.remove(algorithm)

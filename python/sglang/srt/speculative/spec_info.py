@@ -73,7 +73,6 @@ class SpeculativeAlgorithm(metaclass=_SpeculativeAlgorithmMeta):
         cls,
         name: str,
         *,
-        aliases: Optional[Sequence[str]] = None,
         value: Optional[int] = None,
         draft_worker_factory: Optional[DraftWorkerFactory] = None,
     ) -> SpeculativeAlgorithm:
@@ -98,15 +97,7 @@ class SpeculativeAlgorithm(metaclass=_SpeculativeAlgorithmMeta):
         cls._registration_order.append(algorithm)
         setattr(cls, normalized_name, algorithm)
 
-        if aliases:
-            cls.register_aliases(algorithm, *aliases)
-
         return algorithm
-
-    @classmethod
-    def register_aliases(cls, algorithm: SpeculativeAlgorithm, *aliases: str) -> None:
-        for alias in aliases:
-            cls._registry_by_name[alias.upper()] = algorithm
 
     @classmethod
     def register_draft_worker(
@@ -206,7 +197,6 @@ def register_speculative_algorithm(
     name: str,
     worker_cls: DraftWorkerClass,
     *,
-    aliases: Optional[Sequence[str]] = None,
     flags: Optional[Iterable[str]] = None,
     value: Optional[int] = None,
     override_worker: bool = False,
@@ -226,7 +216,6 @@ def register_speculative_algorithm(
         except ValueError:
             algorithm = SpeculativeAlgorithm.register(
                 name_upper,
-                aliases=aliases,
                 value=value,
             )
             SpeculativeAlgorithm.register_draft_worker(
@@ -235,8 +224,6 @@ def register_speculative_algorithm(
             exists = False
 
         if exists:
-            if aliases:
-                SpeculativeAlgorithm.register_aliases(algorithm, *aliases)
             if not override_worker and algorithm in _REGISTERED_WORKERS:
                 raise ValueError(
                     f"Worker already registered for {algorithm!r}. "
@@ -302,7 +289,6 @@ SpeculativeAlgorithm.register("NONE")
 
 register_speculative_algorithm(
     "EAGLE",
-    aliases=("NEXTN",),
     worker_cls=_create_eagle_worker,
     flags=("EAGLE",),
 )
