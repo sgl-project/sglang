@@ -17,7 +17,7 @@ use tracing::{debug, info, warn};
 
 use super::{
     service::HAServerHandler,
-    stores::{StoreType, WorkerState, PolicyState, MembershipState},
+    stores::{MembershipState, PolicyState, StoreType, WorkerState},
     sync::HASyncManager,
 };
 
@@ -56,9 +56,7 @@ pub struct HAHealthResponse {
 }
 
 /// Get HA cluster status
-pub async fn get_cluster_status(
-    State(app_state): State<Arc<AppState>>,
-) -> Response {
+pub async fn get_cluster_status(State(app_state): State<Arc<AppState>>) -> Response {
     let handler = match &app_state.ha_handler {
         Some(h) => h,
         None => {
@@ -99,9 +97,7 @@ pub async fn get_cluster_status(
 }
 
 /// Get HA health status
-pub async fn get_ha_health(
-    State(app_state): State<Arc<AppState>>,
-) -> Response {
+pub async fn get_ha_health(State(app_state): State<Arc<AppState>>) -> Response {
     let handler = match &app_state.ha_handler {
         Some(h) => h,
         None => {
@@ -114,7 +110,7 @@ pub async fn get_ha_health(
     };
     let state = handler.state.read();
     let cluster_size = state.len();
-    
+
     let response = HAHealthResponse {
         status: "healthy".to_string(),
         node_name: handler.self_name.clone(),
@@ -126,40 +122,32 @@ pub async fn get_ha_health(
 }
 
 /// Get worker states from HA store
-pub async fn get_worker_states(
-    State(app_state): State<Arc<AppState>>,
-) -> Response {
+pub async fn get_worker_states(State(app_state): State<Arc<AppState>>) -> Response {
     match &app_state.ha_sync_manager {
         Some(manager) => {
             let workers = manager.get_all_worker_states();
             (StatusCode::OK, Json(workers)).into_response()
         }
-        None => {
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(json!({"error": "HA sync manager not available"})),
-            )
-                .into_response()
-        }
+        None => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "HA sync manager not available"})),
+        )
+            .into_response(),
     }
 }
 
 /// Get policy states from HA store
-pub async fn get_policy_states(
-    State(app_state): State<Arc<AppState>>,
-) -> Response {
+pub async fn get_policy_states(State(app_state): State<Arc<AppState>>) -> Response {
     match &app_state.ha_sync_manager {
         Some(manager) => {
             let policies = manager.get_all_policy_states();
             (StatusCode::OK, Json(policies)).into_response()
         }
-        None => {
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(json!({"error": "HA sync manager not available"})),
-            )
-                .into_response()
-        }
+        None => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "HA sync manager not available"})),
+        )
+            .into_response(),
     }
 }
 
@@ -169,23 +157,19 @@ pub async fn get_worker_state(
     State(app_state): State<Arc<AppState>>,
 ) -> Response {
     match &app_state.ha_sync_manager {
-        Some(manager) => {
-            match manager.get_worker_state(&worker_id) {
-                Some(state) => (StatusCode::OK, Json(state)).into_response(),
-                None => (
-                    StatusCode::NOT_FOUND,
-                    Json(json!({"error": "Worker not found"})),
-                )
-                    .into_response(),
-            }
-        }
-        None => {
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(json!({"error": "HA sync manager not available"})),
+        Some(manager) => match manager.get_worker_state(&worker_id) {
+            Some(state) => (StatusCode::OK, Json(state)).into_response(),
+            None => (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": "Worker not found"})),
             )
-                .into_response()
-        }
+                .into_response(),
+        },
+        None => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "HA sync manager not available"})),
+        )
+            .into_response(),
     }
 }
 
@@ -195,23 +179,19 @@ pub async fn get_policy_state(
     State(app_state): State<Arc<AppState>>,
 ) -> Response {
     match &app_state.ha_sync_manager {
-        Some(manager) => {
-            match manager.get_policy_state(&model_id) {
-                Some(state) => (StatusCode::OK, Json(state)).into_response(),
-                None => (
-                    StatusCode::NOT_FOUND,
-                    Json(json!({"error": "Policy not found"})),
-                )
-                    .into_response(),
-            }
-        }
-        None => {
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(json!({"error": "HA sync manager not available"})),
+        Some(manager) => match manager.get_policy_state(&model_id) {
+            Some(state) => (StatusCode::OK, Json(state)).into_response(),
+            None => (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": "Policy not found"})),
             )
-                .into_response()
-        }
+                .into_response(),
+        },
+        None => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "HA sync manager not available"})),
+        )
+            .into_response(),
     }
 }
 
@@ -236,7 +216,7 @@ pub async fn update_app_config(
                 .into_response();
         }
     };
-    
+
     // Decode hex string to bytes
     // Simple hex decoding without external dependency
     let value = if request.value.len() % 2 == 0 {
@@ -304,9 +284,7 @@ pub async fn get_app_config(
 }
 
 /// Trigger graceful shutdown
-pub async fn trigger_graceful_shutdown(
-    State(app_state): State<Arc<AppState>>,
-) -> Response {
+pub async fn trigger_graceful_shutdown(State(app_state): State<Arc<AppState>>) -> Response {
     let handler = match &app_state.ha_handler {
         Some(h) => h.clone(),
         None => {
@@ -333,4 +311,3 @@ pub async fn trigger_graceful_shutdown(
 use std::sync::Arc;
 
 use crate::server::AppState;
-

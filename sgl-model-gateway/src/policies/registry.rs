@@ -4,8 +4,6 @@ use dashmap::DashMap;
 use serde_json;
 use tracing::{debug, info, warn};
 
-use crate::ha::OptionalHASyncManager;
-
 /// Policy Registry for managing model-to-policy mappings
 ///
 /// This registry manages the dynamic assignment of load balancing policies to models.
@@ -13,7 +11,7 @@ use crate::ha::OptionalHASyncManager;
 /// All subsequent workers of the same model use the established policy.
 /// When the last worker of a model is removed, the policy mapping is cleaned up.
 use super::{BucketPolicy, CacheAwarePolicy, LoadBalancingPolicy, PolicyFactory};
-use crate::{config::types::PolicyConfig, core::Worker};
+use crate::{config::types::PolicyConfig, core::Worker, ha::OptionalHASyncManager};
 
 /// Registry for managing model-to-policy mappings
 #[derive(Clone)]
@@ -100,11 +98,7 @@ impl PolicyRegistry {
         if let Some(ref ha_sync) = self.ha_sync {
             // Serialize policy config (simplified - just store policy name for now)
             let config = serde_json::to_vec(&policy.name()).unwrap_or_default();
-            ha_sync.sync_policy_state(
-                model_id.to_string(),
-                policy.name().to_string(),
-                config,
-            );
+            ha_sync.sync_policy_state(model_id.to_string(), policy.name().to_string(), config);
         }
 
         policy

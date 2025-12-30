@@ -10,9 +10,8 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use parking_lot::RwLock;
-
 use crdts::{CvRDT, PNCounter};
+use parking_lot::RwLock;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 /// State key for CRDT maps
@@ -43,8 +42,7 @@ impl From<&str> for SKey {
 
 /// Last-Write-Wins Register wrapper
 /// Simplified implementation using timestamp and version
-#[derive(Debug, Clone)]
-#[derive(serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize)]
 #[serde(bound(serialize = "T: Serialize"))]
 #[derive(serde::Deserialize)]
 #[serde(bound(deserialize = "T: DeserializeOwned"))]
@@ -99,8 +97,7 @@ impl<T: Clone + Serialize + DeserializeOwned> LWWRegister<T> {
 
 /// CRDT Map wrapper using LWWRegister for values
 /// Simplified implementation using BTreeMap with LWWRegister values
-#[derive(Debug, Clone)]
-#[derive(serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize)]
 #[serde(bound(serialize = "T: Serialize + DeserializeOwned"))]
 #[derive(serde::Deserialize)]
 #[serde(bound(deserialize = "T: DeserializeOwned"))]
@@ -321,9 +318,9 @@ impl SyncPNCounter {
 
 #[cfg(test)]
 mod tests {
+    use std::{thread, time::Duration};
+
     use super::*;
-    use std::thread;
-    use std::time::Duration;
 
     // SKey tests
     #[test]
@@ -375,7 +372,7 @@ mod tests {
         let mut reg1 = LWWRegister::new(42, "actor1".to_string());
         thread::sleep(Duration::from_millis(1));
         let reg2 = LWWRegister::new(100, "actor2".to_string());
-        
+
         reg1.merge(&reg2);
         assert_eq!(*reg1.read(), 100);
         assert_eq!(reg1.actor, "actor2");
@@ -386,7 +383,7 @@ mod tests {
         let mut reg1 = LWWRegister::new(42, "actor1".to_string());
         thread::sleep(Duration::from_millis(1));
         let reg2 = LWWRegister::new(100, "actor2".to_string());
-        
+
         let mut reg2_clone = reg2.clone();
         reg2_clone.merge(&reg1);
         assert_eq!(*reg2_clone.read(), 100);
@@ -406,7 +403,7 @@ mod tests {
         let mut map = CRDTMap::new();
         let key = SKey::new("key1".to_string());
         map.insert(key.clone(), 42, "actor1".to_string());
-        
+
         assert_eq!(map.get(&key), Some(&42));
         assert_eq!(map.len(), 1);
         assert!(!map.is_empty());
@@ -418,7 +415,7 @@ mod tests {
         let key = SKey::new("key1".to_string());
         map.insert(key.clone(), 42, "actor1".to_string());
         assert_eq!(map.len(), 1);
-        
+
         map.remove(&key);
         assert_eq!(map.get(&key), None);
         assert_eq!(map.len(), 0);
@@ -430,7 +427,7 @@ mod tests {
         let mut map = CRDTMap::new();
         let key = SKey::new("key1".to_string());
         assert!(!map.contains_key(&key));
-        
+
         map.insert(key.clone(), 42, "actor1".to_string());
         assert!(map.contains_key(&key));
     }
@@ -441,7 +438,7 @@ mod tests {
         map.insert(SKey::new("key1".to_string()), 1, "actor1".to_string());
         map.insert(SKey::new("key2".to_string()), 2, "actor1".to_string());
         map.insert(SKey::new("key3".to_string()), 3, "actor1".to_string());
-        
+
         let mut values: Vec<i32> = map.values().cloned().collect();
         values.sort();
         assert_eq!(values, vec![1, 2, 3]);
@@ -452,15 +449,15 @@ mod tests {
         let mut map1 = CRDTMap::new();
         map1.insert(SKey::new("key1".to_string()), 1, "actor1".to_string());
         map1.insert(SKey::new("key2".to_string()), 2, "actor1".to_string());
-        
+
         let mut map2 = CRDTMap::new();
         map2.insert(SKey::new("key2".to_string()), 20, "actor2".to_string());
         map2.insert(SKey::new("key3".to_string()), 3, "actor2".to_string());
-        
+
         // Wait a bit to ensure map2 has newer timestamps
         thread::sleep(Duration::from_millis(1));
         map1.merge(&map2);
-        
+
         assert_eq!(map1.get(&SKey::new("key1".to_string())), Some(&1));
         assert_eq!(map1.get(&SKey::new("key2".to_string())), Some(&20)); // Newer value wins
         assert_eq!(map1.get(&SKey::new("key3".to_string())), Some(&3));
@@ -472,7 +469,7 @@ mod tests {
         let mut map = CRDTMap::new();
         map.insert(SKey::new("key1".to_string()), 1, "actor1".to_string());
         map.insert(SKey::new("key2".to_string()), 2, "actor1".to_string());
-        
+
         let btree_map = map.to_map();
         assert_eq!(btree_map.len(), 2);
         assert_eq!(btree_map.get(&SKey::new("key1".to_string())), Some(&1));
@@ -515,10 +512,10 @@ mod tests {
     fn test_pn_counter_merge() {
         let mut counter1 = CRDTPNCounter::new();
         counter1.inc("actor1".to_string(), 5);
-        
+
         let mut counter2 = CRDTPNCounter::new();
         counter2.inc("actor2".to_string(), 3);
-        
+
         counter1.merge(&counter2);
         // Note: PNCounter read() may require ReadCtx or have different behavior
         // This test verifies the merge() method works
@@ -555,7 +552,7 @@ mod tests {
         let map = SyncCRDTMap::new();
         let key = SKey::new("key1".to_string());
         map.insert(key.clone(), 42, "actor1".to_string());
-        
+
         assert_eq!(map.get(&key), Some(42));
         assert_eq!(map.len(), 1);
     }
@@ -564,7 +561,7 @@ mod tests {
     fn test_sync_crdt_map_concurrent_access() {
         let map = Arc::new(SyncCRDTMap::new());
         let mut handles = vec![];
-        
+
         for i in 0..10 {
             let map_clone = map.clone();
             let handle = thread::spawn(move || {
@@ -574,11 +571,11 @@ mod tests {
             });
             handles.push(handle);
         }
-        
+
         for handle in handles {
             handle.join().unwrap();
         }
-        
+
         assert_eq!(map.len(), 10);
     }
 
@@ -587,7 +584,7 @@ mod tests {
         let map = SyncCRDTMap::new();
         map.insert(SKey::new("key1".to_string()), 1, "actor1".to_string());
         map.insert(SKey::new("key2".to_string()), 2, "actor1".to_string());
-        
+
         let snapshot = map.snapshot();
         assert_eq!(snapshot.len(), 2);
         assert_eq!(snapshot.get(&SKey::new("key1".to_string())), Some(&1));
@@ -597,11 +594,11 @@ mod tests {
     fn test_sync_crdt_map_merge() {
         let map = SyncCRDTMap::new();
         map.insert(SKey::new("key1".to_string()), 1, "actor1".to_string());
-        
+
         let mut other = CRDTMap::new();
         thread::sleep(Duration::from_millis(1));
         other.insert(SKey::new("key2".to_string()), 2, "actor2".to_string());
-        
+
         map.merge(&other);
         assert_eq!(map.len(), 2);
         assert_eq!(map.get(&SKey::new("key1".to_string())), Some(1));
@@ -630,7 +627,7 @@ mod tests {
     fn test_sync_pn_counter_concurrent_access() {
         let counter = Arc::new(SyncPNCounter::new());
         let mut handles = vec![];
-        
+
         for i in 0..10 {
             let counter_clone = counter.clone();
             let handle = thread::spawn(move || {
@@ -638,11 +635,11 @@ mod tests {
             });
             handles.push(handle);
         }
-        
+
         for handle in handles {
             handle.join().unwrap();
         }
-        
+
         // Note: PNCounter read() may require ReadCtx or have different behavior
         let val = counter.value();
         // For now, just verify concurrent access doesn't panic
@@ -654,10 +651,10 @@ mod tests {
     fn test_sync_pn_counter_merge() {
         let counter = SyncPNCounter::new();
         counter.inc("actor1".to_string(), 5);
-        
+
         let mut other = CRDTPNCounter::new();
         other.inc("actor2".to_string(), 3);
-        
+
         counter.merge(&other);
         // Note: PNCounter read() may require ReadCtx or have different behavior
         let val = counter.value();
@@ -670,7 +667,7 @@ mod tests {
     fn test_sync_pn_counter_snapshot() {
         let counter = SyncPNCounter::new();
         counter.inc("actor1".to_string(), 5);
-        
+
         let snapshot = counter.snapshot();
         // Note: PNCounter read() may require ReadCtx or have different behavior
         let val = snapshot.value();
@@ -679,5 +676,3 @@ mod tests {
         assert!(val >= 0); // At minimum, should not panic
     }
 }
-
-

@@ -32,13 +32,12 @@ use crate::{
         Job, JobQueue, JobQueueConfig, WorkerManager, WorkerType,
     },
     ha::{
+        endpoints::{
+            get_app_config, get_cluster_status, get_ha_health, get_policy_state, get_policy_states,
+            get_worker_state, get_worker_states, trigger_graceful_shutdown, update_app_config,
+        },
         service::{HAServerConfig, HAServerHandler},
         sync::HASyncManager,
-        endpoints::{
-            get_cluster_status, get_ha_health, get_worker_states, get_policy_states,
-            get_worker_state, get_policy_state, update_app_config, get_app_config,
-            trigger_graceful_shutdown,
-        },
     },
     ha_run,
     middleware::{self, AuthConfig, QueuedRequest},
@@ -737,11 +736,11 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
             ha_server_config.self_addr,
             ha_server_config.init_peer
         );
-        
+
         // Create HA sync manager if stores are available
         // TODO: Get stores from HA server if available
         let sync_manager = None; // Will be set up when stores are integrated
-        
+
         (Some(Arc::new(handler)), sync_manager)
     } else {
         (None, None)

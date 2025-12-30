@@ -15,8 +15,7 @@ use rustls::{
     ClientConfig, RootCertStore, ServerConfig,
 };
 use rustls_pemfile::{certs, pkcs8_private_keys};
-use tokio::fs;
-use tokio::sync::RwLock;
+use tokio::{fs, sync::RwLock};
 use tracing::{error, info, warn};
 
 /// mTLS configuration
@@ -83,7 +82,7 @@ impl MTLSManager {
     /// Load client TLS configuration
     pub async fn load_client_config(&self) -> Result<Arc<ClientConfig>> {
         let mut root_store = RootCertStore::empty();
-        
+
         // Load CA certificate
         let ca_certs = self.load_certs(&self.config.ca_cert_path).await?;
         for cert in ca_certs {
@@ -105,21 +104,20 @@ impl MTLSManager {
     /// Load certificates from file
     async fn load_certs(&self, path: &Path) -> Result<Vec<CertificateDer<'static>>> {
         let cert_data = fs::read(path).await?;
-        let mut certs = certs(&mut cert_data.as_slice())
-            .collect::<Result<Vec<_>, _>>()?;
+        let mut certs = certs(&mut cert_data.as_slice()).collect::<Result<Vec<_>, _>>()?;
         Ok(certs)
     }
 
     /// Load private key from file
     async fn load_private_key(&self, path: &Path) -> Result<PrivateKeyDer<'static>> {
         let key_data = fs::read(path).await?;
-        let mut keys = pkcs8_private_keys(&mut key_data.as_slice())
-            .collect::<Result<Vec<_>, _>>()?;
-        
+        let mut keys =
+            pkcs8_private_keys(&mut key_data.as_slice()).collect::<Result<Vec<_>, _>>()?;
+
         if keys.is_empty() {
             return Err(anyhow::anyhow!("No private key found in file"));
         }
-        
+
         Ok(PrivateKeyDer::Pkcs8(keys.remove(0)))
     }
 
@@ -128,18 +126,16 @@ impl MTLSManager {
         let config = self.config.clone();
         let server_config = self.server_config.clone();
         let client_config = self.client_config.clone();
-        
+
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(config.rotation_check_interval);
             loop {
                 interval.tick().await;
-                
+
                 // Check if certificates have changed
-                if let Err(e) = Self::check_and_reload_certs(
-                    &config,
-                    &server_config,
-                    &client_config,
-                ).await {
+                if let Err(e) =
+                    Self::check_and_reload_certs(&config, &server_config, &client_config).await
+                {
                     warn!("Error checking certificate rotation: {}", e);
                 }
             }
@@ -159,8 +155,10 @@ impl MTLSManager {
 
         // TODO: Compare with cached modification times
         // For now, we'll just log that rotation monitoring is active
-        info!("Certificate rotation check: server_cert={:?}, server_key={:?}, ca_cert={:?}",
-            server_cert_mtime, server_key_mtime, ca_cert_mtime);
+        info!(
+            "Certificate rotation check: server_cert={:?}, server_key={:?}, ca_cert={:?}",
+            server_cert_mtime, server_key_mtime, ca_cert_mtime
+        );
 
         // Reload if certificates have changed
         // This is a simplified version - in production, you'd compare mtimes
@@ -180,4 +178,3 @@ impl MTLSManager {
 
 /// Optional mTLS manager
 pub type OptionalMTLSManager = Option<Arc<MTLSManager>>;
-

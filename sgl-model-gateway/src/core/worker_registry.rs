@@ -400,7 +400,7 @@ impl WorkerRegistry {
         if let Some(worker) = self.workers.get(worker_id) {
             // Update worker health (if Worker trait has a method for this)
             // For now, we'll just sync to HA
-            
+
             // Sync to HA if enabled
             if let Some(ref ha_sync) = self.ha_sync {
                 ha_sync.sync_worker_state(

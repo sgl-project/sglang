@@ -8,8 +8,9 @@
 //! - State integrity metrics
 //! - Rate-limit/LB drift metrics
 
-use metrics::{counter, describe_counter, describe_gauge, describe_histogram, gauge, histogram};
 use std::time::{Duration, Instant};
+
+use metrics::{counter, describe_counter, describe_gauge, describe_histogram, gauge, histogram};
 
 /// Initialize HA metrics descriptions
 pub fn init_ha_metrics() {
@@ -24,10 +25,7 @@ pub fn init_ha_metrics() {
         "router_mesh_batches_total",
         "Total number of state update batches sent/received"
     );
-    describe_counter!(
-        "router_mesh_bytes_total",
-        "Total bytes transmitted in mesh"
-    );
+    describe_counter!("router_mesh_bytes_total", "Total bytes transmitted in mesh");
 
     // Snapshot metrics
     describe_counter!(
@@ -52,10 +50,7 @@ pub fn init_ha_metrics() {
         "router_mesh_peer_reconnects_total",
         "Total number of peer reconnections"
     );
-    describe_counter!(
-        "router_mesh_peer_ack_total",
-        "Total number of ACK messages"
-    );
+    describe_counter!("router_mesh_peer_ack_total", "Total number of ACK messages");
     describe_counter!(
         "router_mesh_peer_nack_total",
         "Total number of NACK messages"
@@ -86,7 +81,8 @@ pub fn init_ha_metrics() {
 pub fn record_convergence_latency(duration: Duration) {
     histogram!("router_mesh_convergence_ms",
         "quantile" => "p50"
-    ).record(duration.as_millis() as f64);
+    )
+    .record(duration.as_millis() as f64);
 }
 
 /// Record batch transmission
@@ -94,11 +90,13 @@ pub fn record_batch_sent(peer: &str, batch_size: usize) {
     counter!("router_mesh_batches_total",
         "direction" => "sent",
         "peer" => peer.to_string()
-    ).increment(1);
+    )
+    .increment(1);
     counter!("router_mesh_bytes_total",
         "direction" => "sent",
         "peer" => peer.to_string()
-    ).increment(batch_size as u64);
+    )
+    .increment(batch_size as u64);
 }
 
 /// Record batch reception
@@ -106,11 +104,13 @@ pub fn record_batch_received(peer: &str, batch_size: usize) {
     counter!("router_mesh_batches_total",
         "direction" => "received",
         "peer" => peer.to_string()
-    ).increment(1);
+    )
+    .increment(1);
     counter!("router_mesh_bytes_total",
         "direction" => "received",
         "peer" => peer.to_string()
-    ).increment(batch_size as u64);
+    )
+    .increment(batch_size as u64);
 }
 
 /// Record snapshot trigger
@@ -118,14 +118,16 @@ pub fn record_snapshot_trigger(store: &str, reason: &str) {
     counter!("router_mesh_snapshot_trigger_total",
         "store" => store.to_string(),
         "reason" => reason.to_string()
-    ).increment(1);
+    )
+    .increment(1);
 }
 
 /// Record snapshot generation duration
 pub fn record_snapshot_duration(store: &str, duration: Duration) {
     histogram!("router_mesh_snapshot_duration_seconds",
         "store" => store.to_string()
-    ).record(duration.as_secs_f64());
+    )
+    .record(duration.as_secs_f64());
 }
 
 /// Record snapshot bytes
@@ -133,21 +135,24 @@ pub fn record_snapshot_bytes(store: &str, direction: &str, bytes: usize) {
     counter!("router_mesh_snapshot_bytes_total",
         "store" => store.to_string(),
         "direction" => direction.to_string()
-    ).increment(bytes as u64);
+    )
+    .increment(bytes as u64);
 }
 
 /// Update peer connection status
 pub fn update_peer_connections(peer: &str, connected: bool) {
     gauge!("router_mesh_peer_connections",
         "peer" => peer.to_string()
-    ).set(if connected { 1.0 } else { 0.0 });
+    )
+    .set(if connected { 1.0 } else { 0.0 });
 }
 
 /// Record peer reconnection
 pub fn record_peer_reconnect(peer: &str) {
     counter!("router_mesh_peer_reconnects_total",
         "peer" => peer.to_string()
-    ).increment(1);
+    )
+    .increment(1);
 }
 
 /// Record ACK
@@ -156,42 +161,48 @@ pub fn record_ack(peer: &str, success: bool) {
     counter!("router_mesh_peer_ack_total",
         "peer" => peer.to_string(),
         "status" => status.to_string()
-    ).increment(1);
+    )
+    .increment(1);
 }
 
 /// Record NACK
 pub fn record_nack(peer: &str) {
     counter!("router_mesh_peer_nack_total",
         "peer" => peer.to_string()
-    ).increment(1);
+    )
+    .increment(1);
 }
 
 /// Update store cardinality
 pub fn update_store_cardinality(store: &str, count: usize) {
     gauge!("router_mesh_store_cardinality",
         "store" => store.to_string()
-    ).set(count as f64);
+    )
+    .set(count as f64);
 }
 
 /// Update store hash (for integrity checking)
 pub fn update_store_hash(store: &str, hash: u64) {
     gauge!("router_mesh_store_hash",
         "store" => store.to_string()
-    ).set(hash as f64);
+    )
+    .set(hash as f64);
 }
 
 /// Update rate-limit drift ratio
 pub fn update_rl_drift_ratio(key: &str, ratio: f64) {
     gauge!("router_rl_drift_ratio",
         "key" => key.to_string()
-    ).set(ratio);
+    )
+    .set(ratio);
 }
 
 /// Update load balance drift ratio
 pub fn update_lb_drift_ratio(model: &str, ratio: f64) {
     gauge!("router_lb_drift_ratio",
         "model" => model.to_string()
-    ).set(ratio);
+    )
+    .set(ratio);
 }
 
 /// Helper struct for tracking convergence time
@@ -217,4 +228,3 @@ impl Default for ConvergenceTracker {
         Self::new()
     }
 }
-

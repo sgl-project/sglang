@@ -13,10 +13,7 @@ use std::{
 use parking_lot::RwLock;
 use tracing::{debug, info, warn};
 
-use super::{
-    service::ClusterState,
-    stores::MembershipState,
-};
+use super::{service::ClusterState, stores::MembershipState};
 
 /// Topology configuration
 #[derive(Debug, Clone)]
@@ -49,11 +46,7 @@ pub struct TopologyManager {
 }
 
 impl TopologyManager {
-    pub fn new(
-        config: TopologyConfig,
-        state: ClusterState,
-        self_name: String,
-    ) -> Self {
+    pub fn new(config: TopologyConfig, state: ClusterState, self_name: String) -> Self {
         Self {
             config,
             state,
@@ -90,7 +83,9 @@ impl TopologyManager {
                 && node.status == super::gossip::NodeStatus::Alive as i32
                 && !active.contains(name)
             {
-                let metadata: BTreeMap<String, Vec<u8>> = node.metadata.iter()
+                let metadata: BTreeMap<String, Vec<u8>> = node
+                    .metadata
+                    .iter()
                     .map(|(k, v)| (k.clone(), v.clone()))
                     .collect();
                 peers.push(MembershipState {
@@ -119,20 +114,28 @@ impl TopologyManager {
         let active = self.active_peers.read();
 
         // First, try to connect to nodes in same region/AZ
-        if let (Some(ref region), Some(ref az)) = (&self.config.region, &self.config.availability_zone) {
+        if let (Some(ref region), Some(ref az)) =
+            (&self.config.region, &self.config.availability_zone)
+        {
             for (name, node) in state.iter() {
                 if name != &self.self_name
                     && node.status == super::gossip::NodeStatus::Alive as i32
                     && !active.contains(name)
                 {
                     // Check if node is in same region/AZ (from metadata)
-                    let node_region = node.metadata.get("region")
+                    let node_region = node
+                        .metadata
+                        .get("region")
                         .and_then(|v| String::from_utf8(v.clone()).ok());
-                    let node_az = node.metadata.get("availability_zone")
+                    let node_az = node
+                        .metadata
+                        .get("availability_zone")
                         .and_then(|v| String::from_utf8(v.clone()).ok());
 
                     if node_region.as_ref() == Some(region) && node_az.as_ref() == Some(az) {
-                        let metadata: BTreeMap<String, Vec<u8>> = node.metadata.iter()
+                        let metadata: BTreeMap<String, Vec<u8>> = node
+                            .metadata
+                            .iter()
                             .map(|(k, v)| (k.clone(), v.clone()))
                             .collect();
                         peers.push(MembershipState {
@@ -158,7 +161,9 @@ impl TopologyManager {
                     && !active.contains(name)
                     && !peers.iter().any(|p| p.name == node.name)
                 {
-                    let metadata: BTreeMap<String, Vec<u8>> = node.metadata.iter()
+                    let metadata: BTreeMap<String, Vec<u8>> = node
+                        .metadata
+                        .iter()
                         .map(|(k, v)| (k.clone(), v.clone()))
                         .collect();
                     peers.push(MembershipState {
@@ -201,4 +206,3 @@ impl TopologyManager {
         state.len() <= self.config.full_mesh_threshold
     }
 }
-

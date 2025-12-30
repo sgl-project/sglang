@@ -9,7 +9,7 @@ use tracing::{debug, info, warn};
 
 use super::{
     crdt::SKey,
-    stores::{StateStores, WorkerState, PolicyState, StoreType},
+    stores::{PolicyState, StateStores, StoreType, WorkerState},
 };
 
 /// HA sync manager for coordinating state synchronization
@@ -56,12 +56,7 @@ impl HASyncManager {
     }
 
     /// Sync policy state to HA stores
-    pub fn sync_policy_state(
-        &self,
-        model_id: String,
-        policy_type: String,
-        config: Vec<u8>,
-    ) {
+    pub fn sync_policy_state(&self, model_id: String, policy_type: String, config: Vec<u8>) {
         let key = SKey::new(format!("policy:{}", model_id));
         let state = PolicyState {
             model_id: model_id.clone(),
@@ -145,7 +140,7 @@ mod tests {
     #[test]
     fn test_sync_worker_state() {
         let manager = create_test_sync_manager();
-        
+
         manager.sync_worker_state(
             "worker1".to_string(),
             "model1".to_string(),
@@ -153,7 +148,7 @@ mod tests {
             true,
             0.5,
         );
-        
+
         let state = manager.get_worker_state("worker1");
         assert!(state.is_some());
         let state = state.unwrap();
@@ -167,7 +162,7 @@ mod tests {
     #[test]
     fn test_sync_multiple_worker_states() {
         let manager = create_test_sync_manager();
-        
+
         manager.sync_worker_state(
             "worker1".to_string(),
             "model1".to_string(),
@@ -175,7 +170,7 @@ mod tests {
             true,
             0.5,
         );
-        
+
         manager.sync_worker_state(
             "worker2".to_string(),
             "model1".to_string(),
@@ -183,7 +178,7 @@ mod tests {
             false,
             0.8,
         );
-        
+
         manager.sync_worker_state(
             "worker3".to_string(),
             "model2".to_string(),
@@ -191,18 +186,18 @@ mod tests {
             true,
             0.3,
         );
-        
+
         let all_states = manager.get_all_worker_states();
         assert_eq!(all_states.len(), 3);
-        
+
         let worker1 = manager.get_worker_state("worker1").unwrap();
         assert_eq!(worker1.worker_id, "worker1");
         assert!(worker1.health);
-        
+
         let worker2 = manager.get_worker_state("worker2").unwrap();
         assert_eq!(worker2.worker_id, "worker2");
         assert!(!worker2.health);
-        
+
         let worker3 = manager.get_worker_state("worker3").unwrap();
         assert_eq!(worker3.worker_id, "worker3");
         assert_eq!(worker3.model_id, "model2");
@@ -211,7 +206,7 @@ mod tests {
     #[test]
     fn test_remove_worker_state() {
         let manager = create_test_sync_manager();
-        
+
         manager.sync_worker_state(
             "worker1".to_string(),
             "model1".to_string(),
@@ -219,11 +214,11 @@ mod tests {
             true,
             0.5,
         );
-        
+
         assert!(manager.get_worker_state("worker1").is_some());
-        
+
         manager.remove_worker_state("worker1");
-        
+
         assert!(manager.get_worker_state("worker1").is_none());
         assert_eq!(manager.get_all_worker_states().len(), 0);
     }
@@ -231,7 +226,7 @@ mod tests {
     #[test]
     fn test_remove_nonexistent_worker_state() {
         let manager = create_test_sync_manager();
-        
+
         // Should not panic
         manager.remove_worker_state("nonexistent");
         assert!(manager.get_worker_state("nonexistent").is_none());
@@ -240,14 +235,14 @@ mod tests {
     #[test]
     fn test_sync_policy_state() {
         let manager = create_test_sync_manager();
-        
+
         let config = b"policy_config_data".to_vec();
         manager.sync_policy_state(
             "model1".to_string(),
             "round_robin".to_string(),
             config.clone(),
         );
-        
+
         let state = manager.get_policy_state("model1");
         assert!(state.is_some());
         let state = state.unwrap();
@@ -259,32 +254,32 @@ mod tests {
     #[test]
     fn test_sync_multiple_policy_states() {
         let manager = create_test_sync_manager();
-        
+
         manager.sync_policy_state(
             "model1".to_string(),
             "round_robin".to_string(),
             b"config1".to_vec(),
         );
-        
+
         manager.sync_policy_state(
             "model2".to_string(),
             "random".to_string(),
             b"config2".to_vec(),
         );
-        
+
         manager.sync_policy_state(
             "model3".to_string(),
             "consistent_hash".to_string(),
             b"config3".to_vec(),
         );
-        
+
         let all_states = manager.get_all_policy_states();
         assert_eq!(all_states.len(), 3);
-        
+
         let policy1 = manager.get_policy_state("model1").unwrap();
         assert_eq!(policy1.model_id, "model1");
         assert_eq!(policy1.policy_type, "round_robin");
-        
+
         let policy2 = manager.get_policy_state("model2").unwrap();
         assert_eq!(policy2.model_id, "model2");
         assert_eq!(policy2.policy_type, "random");
@@ -293,17 +288,17 @@ mod tests {
     #[test]
     fn test_remove_policy_state() {
         let manager = create_test_sync_manager();
-        
+
         manager.sync_policy_state(
             "model1".to_string(),
             "round_robin".to_string(),
             b"config".to_vec(),
         );
-        
+
         assert!(manager.get_policy_state("model1").is_some());
-        
+
         manager.remove_policy_state("model1");
-        
+
         assert!(manager.get_policy_state("model1").is_none());
         assert_eq!(manager.get_all_policy_states().len(), 0);
     }
@@ -311,7 +306,7 @@ mod tests {
     #[test]
     fn test_remove_nonexistent_policy_state() {
         let manager = create_test_sync_manager();
-        
+
         // Should not panic
         manager.remove_policy_state("nonexistent");
         assert!(manager.get_policy_state("nonexistent").is_none());
@@ -320,7 +315,7 @@ mod tests {
     #[test]
     fn test_apply_remote_worker_state() {
         let manager = create_test_sync_manager();
-        
+
         let remote_state = WorkerState {
             worker_id: "remote_worker1".to_string(),
             model_id: "model1".to_string(),
@@ -329,9 +324,9 @@ mod tests {
             load: 0.6,
             version: 1,
         };
-        
+
         manager.apply_remote_worker_state(remote_state.clone());
-        
+
         let state = manager.get_worker_state("remote_worker1");
         assert!(state.is_some());
         let state = state.unwrap();
@@ -345,16 +340,16 @@ mod tests {
     #[test]
     fn test_apply_remote_policy_state() {
         let manager = create_test_sync_manager();
-        
+
         let remote_state = PolicyState {
             model_id: "model1".to_string(),
             policy_type: "remote_policy".to_string(),
             config: b"remote_config".to_vec(),
             version: 1,
         };
-        
+
         manager.apply_remote_policy_state(remote_state.clone());
-        
+
         let state = manager.get_policy_state("model1");
         assert!(state.is_some());
         let state = state.unwrap();
@@ -366,7 +361,7 @@ mod tests {
     #[test]
     fn test_mixed_local_and_remote_states() {
         let manager = create_test_sync_manager();
-        
+
         // Add local worker
         manager.sync_worker_state(
             "local_worker".to_string(),
@@ -375,7 +370,7 @@ mod tests {
             true,
             0.5,
         );
-        
+
         // Add remote worker
         let remote_state = WorkerState {
             worker_id: "remote_worker".to_string(),
@@ -386,10 +381,10 @@ mod tests {
             version: 1,
         };
         manager.apply_remote_worker_state(remote_state);
-        
+
         let all_states = manager.get_all_worker_states();
         assert_eq!(all_states.len(), 2);
-        
+
         assert!(manager.get_worker_state("local_worker").is_some());
         assert!(manager.get_worker_state("remote_worker").is_some());
     }
@@ -397,7 +392,7 @@ mod tests {
     #[test]
     fn test_update_worker_state() {
         let manager = create_test_sync_manager();
-        
+
         // Initial state
         manager.sync_worker_state(
             "worker1".to_string(),
@@ -406,7 +401,7 @@ mod tests {
             true,
             0.5,
         );
-        
+
         // Update state
         manager.sync_worker_state(
             "worker1".to_string(),
@@ -415,7 +410,7 @@ mod tests {
             false,
             0.9,
         );
-        
+
         let state = manager.get_worker_state("worker1").unwrap();
         assert!(!state.health);
         assert_eq!(state.load, 0.9);
@@ -425,21 +420,21 @@ mod tests {
     #[test]
     fn test_update_policy_state() {
         let manager = create_test_sync_manager();
-        
+
         // Initial state
         manager.sync_policy_state(
             "model1".to_string(),
             "round_robin".to_string(),
             b"config1".to_vec(),
         );
-        
+
         // Update state
         manager.sync_policy_state(
             "model1".to_string(),
             "random".to_string(),
             b"config2".to_vec(),
         );
-        
+
         let state = manager.get_policy_state("model1").unwrap();
         assert_eq!(state.policy_type, "random");
         assert_eq!(state.config, b"config2");
@@ -460,4 +455,3 @@ mod tests {
         assert!(states.is_empty());
     }
 }
-
