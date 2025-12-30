@@ -899,7 +899,7 @@ class Req:
                 )
             )
 
-        self.extend_input_len = len(self.fill_ids) - len(self.prefix_indices)
+        self.set_extend_input_len(len(self.fill_ids) - len(self.prefix_indices))
 
     # Based on https://github.com/vllm-project/vllm/blob/7a64d24aad69e4d2548aa0bf528d9fe63428ab01/vllm/transformers_utils/detokenizer.py#L194-L313
     def init_incremental_detokenize(self):
@@ -1116,6 +1116,24 @@ class Req:
         prefix = f"Req Time Stats(rid={self.rid}{bootstrap_info}, input len={len(self.origin_input_ids)}, output len={len(self.output_ids)}, type={self.time_stats.disagg_mode_str()})"
         logger.info(f"{prefix}: {self.time_stats.convert_to_duration()}")
         self.has_log_time_stats = True
+
+    def set_extend_input_len(self, extend_input_len: int):
+        # Setting extend_input_len and computing the relative logprob_start_len in an extend batch
+        #
+        # Key variables:
+        # - logprob_start_len: Absolute position in full sequence where logprob computation begins
+        # - extend_logprob_start_len: Relative position within current extend batch where logprob computation begins
+        # - extend_input_len: Number of tokens that need to be processed in this extend batch
+        self.extend_input_len = extend_input_len
+        if self.logprob_start_len == -1:
+            logprob_start_len = len(self.fill_ids) - 1
+        else:
+            # logprob_start_len should be at least the length of the prefix indices
+            logprob_start_len = max(self.logprob_start_len, len(self.prefix_indices))
+        self.extend_logprob_start_len = min(
+            logprob_start_len - len(self.prefix_indices),
+            self.extend_input_len,
+        )
 
     def set_finish_with_abort(self, error_msg: str):
         if get_tensor_model_parallel_rank() == 0:
@@ -1492,29 +1510,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     mamba_track_seqlens_cpu,
                 )
 
-            # Compute the relative logprob_start_len in an extend batch
-            #
-            # Key variables:
-            # - logprob_start_len: Absolute position in full sequence where logprob computation begins
-            # - extend_logprob_start_len: Relative position within current extend batch where logprob computation begins
-            # - extend_input_len: Number of tokens that need to be processed in this extend batch
-            #   (= len(fill_ids) - len(prefix_indices), where fill_ids = origin_input_ids + output_ids
-            #    and prefix_indices are the cached/shared prefix tokens)
-            #
-            if req.logprob_start_len == -1:
-                req.extend_logprob_start_len = min(
-                    len(req.fill_ids) - 1 - pre_len,
-                    req.extend_input_len,
-                )
-            elif req.logprob_start_len >= pre_len:
-                req.extend_logprob_start_len = min(
-                    req.logprob_start_len - pre_len,
-                    req.extend_input_len,
-                )
-            else:
-                # logprob_start_len is before the current extend batch, so start from beginning
-                req.extend_logprob_start_len = 0
-
             if self.return_logprob:
                 # Find input logprob token ids.
                 # First, find a global index within origin_input_ids and slide it by 1
@@ -1689,7 +1684,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         for req in running_batch.reqs:
             req.fill_ids = req.origin_input_ids + req.output_ids
-            req.extend_input_len = 1
+            req.set_extend_input_len(1)
 
         input_ids = torch.cat([self.input_ids, running_batch.input_ids])
         out_cache_loc = torch.cat([self.out_cache_loc, running_batch.out_cache_loc])

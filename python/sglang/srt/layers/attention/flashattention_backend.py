@@ -11,6 +11,7 @@ import triton.language as tl
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.radix_attention import AttentionType
+from sglang.srt.mem_cache.memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.spec_info import SpecInput
@@ -335,12 +336,13 @@ class FlashAttentionBackend(AttentionBackend):
         self.page_size = model_runner.page_size
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
         self.skip_prefill = skip_prefill
-        self.is_hybrid_swa = model_runner.is_hybrid_swa
-        if self.is_hybrid_swa:
-            self.full_to_swa_index_mapping = (
-                model_runner.token_to_kv_pool.full_to_swa_index_mapping
-            )
+
+        self.use_sliding_window_kv_pool = isinstance(
+            model_runner.token_to_kv_pool, SWAKVPool
+        )
+        if self.use_sliding_window_kv_pool:
             self.token_to_kv_pool = model_runner.token_to_kv_pool
+
         self.topk = model_runner.server_args.speculative_eagle_topk or 0
         self.speculative_num_steps = speculative_num_steps
         self.speculative_num_draft_tokens = (
@@ -732,10 +734,10 @@ class FlashAttentionBackend(AttentionBackend):
         # Calculate window size (can be moved to metadata if layer properties don't change)
         # we don't do layer.sliding_window_size - 1 since in model.get_attention_sliding_window_size() we already - 1
         # here is two side inclusive
-        is_hybrid_swa = (
+        is_swa_layer = (
             layer.sliding_window_size is not None and layer.sliding_window_size > -1
         )
-        window_size = (layer.sliding_window_size, 0) if is_hybrid_swa else (-1, -1)
+        window_size = (layer.sliding_window_size, 0) if is_swa_layer else (-1, -1)
         k_descale, v_descale = None, None
         # only use kv scaling if: 1) fp8 kv is explicitly enabled, 2) RadixAttention
         # has corresponding quantization method so that layer.k_scale is not None,
@@ -771,7 +773,7 @@ class FlashAttentionBackend(AttentionBackend):
         use_cascade_attn = (
             forward_batch.forward_mode.is_target_verify()
             and self.topk > 1
-            and not is_hybrid_swa
+            and not is_swa_layer
         )
 
         # For fa3 interface version compatibility, we put new fields into conditional keyword args
@@ -788,7 +790,7 @@ class FlashAttentionBackend(AttentionBackend):
             cu_seqlens_q = local_metadata.local_query_start_loc
             cache_seqlens = local_metadata.local_seqused_k
             max_seqlen_q = local_metadata.local_max_query_len
-        elif is_hybrid_swa and metadata.swa_spec_metadata is not None:
+        elif is_swa_layer and metadata.swa_spec_metadata is not None:
             swa_spec_metadata = metadata.swa_spec_metadata
             page_table = swa_spec_metadata.page_table
             cu_seqlens_q = swa_spec_metadata.cu_seqlens_q
@@ -797,15 +799,10 @@ class FlashAttentionBackend(AttentionBackend):
             cu_seqlens_k = swa_spec_metadata.cu_seqlens_k
         else:
             page_table = metadata.page_table
-            if self.is_hybrid_swa:
-                _, is_swa = forward_batch.token_to_kv_pool.layers_mapping[
-                    layer.layer_id
-                ]
-                if is_swa:
-                    page_table = self.token_to_kv_pool.translate_loc_from_full_to_swa(
-                        page_table
-                    )
-                    window_size = (self.attention_chunk_size, 0)
+            if is_swa_layer and self.use_sliding_window_kv_pool:
+                page_table = self.token_to_kv_pool.translate_loc_from_full_to_swa(
+                    page_table
+                )
             cu_seqlens_q = metadata.cu_seqlens_q
             cache_seqlens = metadata.cache_seqlens_int32
             max_seqlen_q = metadata.max_seq_len_q
@@ -1074,11 +1071,11 @@ class FlashAttentionBackend(AttentionBackend):
         # Calculate window size (can be moved to metadata if layer properties don't change)
         # we don't do layer.sliding_window_size - 1 since in model.get_attention_sliding_window_size() we already - 1
         # here is two side inclusive
-        window_size = (
-            (layer.sliding_window_size, 0)
-            if layer.sliding_window_size is not None and layer.sliding_window_size > -1
-            else (-1, -1)
+        is_swa_layer = (
+            layer.sliding_window_size is not None and layer.sliding_window_size > -1
         )
+        window_size = (layer.sliding_window_size, 0) if is_swa_layer else (-1, -1)
+
         causal = True
         if layer.is_cross_attention or layer.attn_type == AttentionType.ENCODER_ONLY:
             causal = False
@@ -1157,17 +1154,10 @@ class FlashAttentionBackend(AttentionBackend):
                 )
             else:
                 page_table = metadata.page_table
-                if self.is_hybrid_swa:
-                    _, is_swa = forward_batch.token_to_kv_pool.layers_mapping[
-                        layer.layer_id
-                    ]
-                    if is_swa:
-                        page_table = (
-                            self.token_to_kv_pool.translate_loc_from_full_to_swa(
-                                page_table
-                            )
-                        )
-                        window_size = (self.attention_chunk_size, 0)
+                if is_swa_layer and self.use_sliding_window_kv_pool:
+                    page_table = self.token_to_kv_pool.translate_loc_from_full_to_swa(
+                        page_table
+                    )
                 cache_seqlens = metadata.cache_seqlens_int32
                 cu_seqlens_k = metadata.cu_seqlens_k
                 max_seqlen_q = metadata.max_seq_len_q
@@ -2139,9 +2129,9 @@ class FlashAttentionBackend(AttentionBackend):
 
         cu_seqlens_q = metadata.cu_seqlens_q
         cache_seqlens_int32 = metadata.cache_seqlens_int32
-        if self.is_hybrid_swa:
-            page_table = self.full_to_swa_index_mapping[metadata.page_table].to(
-                torch.int32
+        if self.use_sliding_window_kv_pool:
+            page_table = self.token_to_kv_pool.translate_loc_from_full_to_swa(
+                metadata.page_table
             )
         else:
             page_table = metadata.page_table
@@ -2263,10 +2253,10 @@ class FlashAttentionBackend(AttentionBackend):
         # Without this slicing, the pre-allocated page_table may contain zeros or invalid indices
         # beyond the actual sequence length, leading to incorrect attention calculations
         max_seq_len = int(seqlens.max().item())
-        if self.is_hybrid_swa:
-            sliced_page_table = self.full_to_swa_index_mapping[
+        if self.use_sliding_window_kv_pool:
+            sliced_page_table = self.token_to_kv_pool.translate_loc_from_full_to_swa(
                 metadata.page_table[:bs, :max_seq_len]
-            ].to(torch.int32)
+            )
         else:
             sliced_page_table = metadata.page_table[:bs, :max_seq_len]
 
