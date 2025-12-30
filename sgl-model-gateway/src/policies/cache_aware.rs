@@ -233,14 +233,20 @@ impl CacheAwarePolicy {
         }
     }
 
-    /// Apply remote tree operation from mesh
-    /// This is called when receiving tree state updates from other nodes
-    pub fn apply_remote_tree_operation(&self, model_id: &str, operation: &TreeOperation) {
-        let tree_key = if model_id.is_empty() || model_id == "unknown" {
+    /// Normalize model_id for mesh synchronization
+    /// Converts "unknown" or empty to "default" for consistency
+    fn normalize_mesh_model_id(model_id: &str) -> &str {
+        if model_id.is_empty() || model_id == "unknown" {
             "default"
         } else {
             model_id
-        };
+        }
+    }
+
+    /// Apply remote tree operation from mesh
+    /// This is called when receiving tree state updates from other nodes
+    pub fn apply_remote_tree_operation(&self, model_id: &str, operation: &TreeOperation) {
+        let tree_key = Self::normalize_mesh_model_id(model_id);
 
         let tree = self
             .trees
@@ -325,7 +331,8 @@ impl CacheAwarePolicy {
                         text: text.to_string(),
                         tenant: worker_url.to_string(),
                     });
-                    if let Err(e) = mesh_sync.sync_tree_operation(model_id.to_string(), op) {
+                    let mesh_model_id = Self::normalize_mesh_model_id(model_id);
+                    if let Err(e) = mesh_sync.sync_tree_operation(mesh_model_id.to_string(), op) {
                         warn!("Failed to sync tree insert operation to mesh: {}", e);
                     }
                 }
@@ -419,7 +426,8 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
                             text: text.to_string(),
                             tenant: selected_url.clone(),
                         });
-                        if let Err(e) = mesh_sync.sync_tree_operation(model_id.to_string(), op) {
+                        let mesh_model_id = Self::normalize_mesh_model_id(model_id);
+                        if let Err(e) = mesh_sync.sync_tree_operation(mesh_model_id.to_string(), op) {
                             warn!("Failed to sync tree insert operation to mesh: {}", e);
                         }
                     }
@@ -440,7 +448,8 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
                     let op = TreeOperation::Remove(TreeRemoveOp {
                         tenant: selected_url.clone(),
                     });
-                    if let Err(e) = mesh_sync.sync_tree_operation(model_id.to_string(), op) {
+                    let mesh_model_id = Self::normalize_mesh_model_id(model_id);
+                    if let Err(e) = mesh_sync.sync_tree_operation(mesh_model_id.to_string(), op) {
                         warn!("Failed to sync tree remove operation to mesh: {}", e);
                     }
                 }
