@@ -8,6 +8,7 @@ if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ModelWorkerBatch
     from sglang.srt.managers.tp_worker import TpModelWorker
     from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
+    from sglang.srt.speculative.ngram_worker import NGRAMWorker
 
 
 class SpeculativeAlgorithm(Enum):
@@ -49,7 +50,7 @@ class SpeculativeAlgorithm(Enum):
 
     def create_worker(
         self, enable_overlap: bool = False
-    ) -> Union[Type[BaseSpecWorker], Type[TpModelWorker]]:
+    ) -> Union[Type[BaseSpecWorker], Type[TpModelWorker], Type[NGRAMWorker]]:
         assert not self.is_none()
 
         if enable_overlap:
