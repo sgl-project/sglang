@@ -20,18 +20,27 @@ from pathlib import Path
 import tabulate
 from typing import List
 
-# Add scripts/ci to path for importing diffusion_case_parser
-_REPO_ROOT = Path(__file__).resolve().parents[5]
-sys.path.insert(0, str(_REPO_ROOT / "scripts" / "ci"))
-
-from diffusion_case_parser import (  # noqa: E402
-    DiffusionCaseInfo,
-    collect_diffusion_suites,
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.test.server.testcase_configs import (
+    BASELINE_CONFIG,
+    ONE_GPU_CASES,
+    TWO_GPU_CASES,
+    DiffusionTestCase,
 )
 
-from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger  # noqa: E402
-
 logger = init_logger(__name__)
+
+# Suite definitions
+SUITES = {
+    "1-gpu": ONE_GPU_CASES,
+    "2-gpu": TWO_GPU_CASES,
+}
+
+# Default estimated time for cases without baseline (5 minutes)
+DEFAULT_EST_TIME_SECONDS = 300.0
+
+# Fixed overhead for server startup when estimated_full_test_time_s is not set
+STARTUP_OVERHEAD_SECONDS = 120.0
 
 # Parametrized test files (use case ID filter)
 PARAMETRIZED_FILES = {
@@ -49,11 +58,24 @@ STANDALONE_FILES = {
 }
 
 
+def get_case_est_time(case_id: str) -> float:
+    """
+    Get estimated time in seconds from perf_baselines.json.
+    Returns default value if case has no baseline.
+    """
+    scenario = BASELINE_CONFIG.scenarios.get(case_id)
+    if scenario is None:
+        return DEFAULT_EST_TIME_SECONDS
+    if scenario.estimated_full_test_time_s is not None:
+        return scenario.estimated_full_test_time_s
+    return scenario.expected_e2e_ms / 1000.0 + STARTUP_OVERHEAD_SECONDS
+
+
 def auto_partition(
-    cases: List[DiffusionCaseInfo],
+    cases: List[DiffusionTestCase],
     rank: int,
     size: int,
-) -> List[DiffusionCaseInfo]:
+) -> List[DiffusionTestCase]:
     """
     Partition cases using LPT (Longest Processing Time First) greedy algorithm.
 
@@ -61,28 +83,28 @@ def auto_partition(
     estimated time in each partition.
 
     Args:
-        cases: List of DiffusionCaseInfo objects
+        cases: List of DiffusionTestCase objects
         rank: Index of the partition to return (0 to size-1)
         size: Total number of partitions
 
     Returns:
-        List of DiffusionCaseInfo objects assigned to the specified partition
+        List of DiffusionTestCase objects assigned to the specified partition
     """
     if not cases or size <= 0:
         return []
 
     # Sort by time descending (LPT heuristic)
-    sorted_cases = sorted(cases, key=lambda c: c.est_time, reverse=True)
+    sorted_cases = sorted(cases, key=lambda c: get_case_est_time(c.id), reverse=True)
 
     # Initialize partitions
-    partitions: List[List[DiffusionCaseInfo]] = [[] for _ in range(size)]
+    partitions: List[List[DiffusionTestCase]] = [[] for _ in range(size)]
     partition_sums = [0.0] * size
 
     # Greedy assignment: assign each case to partition with smallest current sum
     for case in sorted_cases:
         min_idx = partition_sums.index(min(partition_sums))
         partitions[min_idx].append(case)
-        partition_sums[min_idx] += case.est_time
+        partition_sums[min_idx] += get_case_est_time(case.id)
 
     if rank < size:
         return partitions[rank]
@@ -328,24 +350,13 @@ def main():
         print(f"Error: Target directory {target_dir} does not exist.")
         sys.exit(1)
 
-    # 2. Parse test configuration using AST
-    testcase_config_path = test_root_dir / "server" / "testcase_configs.py"
-    baseline_path = test_root_dir / "server" / "perf_baselines.json"
-    run_suite_path = current_file_path
-
-    suites = collect_diffusion_suites(
-        testcase_config_path,
-        run_suite_path,
-        baseline_path,
-    )
-
-    suite_info = suites.get(args.suite)
-    if suite_info is None:
+    # 2. Get test cases from imported configuration
+    all_cases = SUITES.get(args.suite)
+    if all_cases is None:
         print(f"Unknown suite: {args.suite}")
         sys.exit(1)
 
-    all_cases = suite_info.cases
-    standalone_files = suite_info.standalone_files
+    standalone_files = STANDALONE_FILES.get(args.suite, [])
 
     # 3. Calculate partition allocation
     num_standalone = len(standalone_files)
@@ -381,15 +392,16 @@ def main():
         print(f"Running {len(my_cases)} cases in this partition:")
         total_est_time = 0.0
         for case in my_cases:
-            total_est_time += case.est_time
-            print(f"  - {case.case_id} (est: {case.est_time:.1f}s)")
+            est_time = get_case_est_time(case.id)
+            total_est_time += est_time
+            print(f"  - {case.id} (est: {est_time:.1f}s)")
         print(
             f"Total estimated time: {total_est_time:.1f}s ({total_est_time/60:.1f} min)"
         )
         print()
 
         # Build pytest filter expression from case IDs
-        case_ids = [case.case_id for case in my_cases]
+        case_ids = [case.id for case in my_cases]
         partition_filter = " or ".join([f"[{cid}]" for cid in case_ids])
 
         # Combine with additional filter if provided
