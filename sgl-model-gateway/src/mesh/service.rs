@@ -13,15 +13,15 @@ use tracing as log;
 
 pub mod gossip {
     #![allow(unused_qualifications)]
-    tonic::include_proto!("sglang.ha.gossip");
+    tonic::include_proto!("sglang.mesh.gossip");
 }
 use gossip::{
     gossip_client, gossip_message, GossipMessage, NodeState, NodeStatus, NodeUpdate, Ping,
     StateSync,
 };
 
-use crate::ha::{
-    controller::HAController,
+use crate::mesh::{
+    controller::MeshController,
     node_state_machine::{ConvergenceConfig, NodeStateMachine},
     partition::PartitionDetector,
     ping_server::GossipService,
@@ -29,17 +29,17 @@ use crate::ha::{
 
 pub type ClusterState = Arc<RwLock<BTreeMap<String, NodeState>>>;
 
-pub struct HAServerConfig {
+pub struct MeshServerConfig {
     pub self_name: String,
     pub self_addr: SocketAddr,
     pub init_peer: Option<SocketAddr>,
 }
 
-/// HAServerHandler
-/// It is the handler for the HA server, which is responsible for the node management.
+/// MeshServerHandler
+/// It is the handler for the mesh server, which is responsible for the node management.
 /// Includes some basic node management logic, like shutdown,
 /// node discovery(TODO), node status update(TODO), etc.
-pub struct HAServerHandler {
+pub struct MeshServerHandler {
     pub state: ClusterState,
     pub self_name: String,
     _self_addr: SocketAddr,
@@ -48,7 +48,7 @@ pub struct HAServerHandler {
     state_machine: Option<Arc<NodeStateMachine>>,
 }
 
-impl HAServerHandler {
+impl MeshServerHandler {
     pub fn new(
         state: ClusterState,
         self_name: &str,
@@ -199,14 +199,14 @@ impl HAServerHandler {
     }
 }
 
-pub struct HAServerBuilder {
+pub struct MeshServerBuilder {
     state: ClusterState,
     self_name: String,
     self_addr: SocketAddr,
     init_peer: Option<SocketAddr>,
 }
 
-impl HAServerBuilder {
+impl MeshServerBuilder {
     pub fn new(self_name: String, self_addr: SocketAddr, init_peer: Option<SocketAddr>) -> Self {
         let state = Arc::new(RwLock::new(BTreeMap::from([(
             self_name.clone(),
@@ -226,24 +226,24 @@ impl HAServerBuilder {
         }
     }
 
-    pub fn build(&self) -> (HAServer, HAServerHandler) {
+    pub fn build(&self) -> (MeshServer, MeshServerHandler) {
         self.build_with_stores(None)
     }
 
     pub fn build_with_stores(
         &self,
         stores: Option<Arc<super::stores::StateStores>>,
-    ) -> (HAServer, HAServerHandler) {
+    ) -> (MeshServer, MeshServerHandler) {
         let (signal_tx, signal_rx) = tokio::sync::watch::channel(());
         (
-            HAServer::new(
+            MeshServer::new(
                 self.state.clone(),
                 &self.self_name,
                 self.self_addr,
                 self.init_peer,
                 signal_rx,
             ),
-            HAServerHandler::with_partition_and_state_machine(
+            MeshServerHandler::with_partition_and_state_machine(
                 self.state.clone(),
                 &self.self_name,
                 self.self_addr,
@@ -254,7 +254,7 @@ impl HAServerBuilder {
     }
 }
 
-pub struct HAServer {
+pub struct MeshServer {
     state: ClusterState,
     self_name: String,
     self_addr: SocketAddr,
@@ -262,7 +262,7 @@ pub struct HAServer {
     signal_rx: tokio::sync::watch::Receiver<()>,
 }
 
-impl HAServer {
+impl MeshServer {
     pub fn new(
         state: ClusterState,
         self_name: &str,
@@ -270,7 +270,7 @@ impl HAServer {
         init_peer: Option<SocketAddr>,
         signal_rx: tokio::sync::watch::Receiver<()>,
     ) -> Self {
-        HAServer {
+        MeshServer {
             state,
             self_name: self_name.to_string(),
             self_addr,
@@ -283,8 +283,8 @@ impl HAServer {
         GossipService::new(self.state.clone(), self.self_addr, &self.self_name)
     }
 
-    pub fn build_controller(&self) -> HAController {
-        HAController::new(
+    pub fn build_controller(&self) -> MeshController {
+        MeshController::new(
             self.state.clone(),
             self.self_addr,
             &self.self_name,
@@ -293,7 +293,7 @@ impl HAServer {
     }
 
     pub async fn start_serve(self) -> Result<()> {
-        log::info!("HA server listening on {}", self.self_addr);
+        log::info!("Mesh server listening on {}", self.self_addr);
         let self_name = self.self_name.clone();
         let self_address = self.self_addr;
 
@@ -314,7 +314,7 @@ impl HAServer {
         }
 
         log::info!(
-            "HA server {} at {} is shutting down",
+            "Mesh server {} at {} is shutting down",
             self_name,
             self_address
         );
@@ -325,10 +325,10 @@ impl HAServer {
     pub async fn start_serve_with_stores(
         self,
         stores: Option<Arc<super::stores::StateStores>>,
-        sync_manager: Option<Arc<super::sync::HASyncManager>>,
+        sync_manager: Option<Arc<super::sync::MeshSyncManager>>,
         partition_detector: Option<Arc<PartitionDetector>>,
     ) -> Result<()> {
-        log::info!("HA server listening on {}", self.self_addr);
+        log::info!("Mesh server listening on {}", self.self_addr);
         let self_name = self.self_name.clone();
         let self_address = self.self_addr;
 
@@ -358,7 +358,7 @@ impl HAServer {
         }
 
         log::info!(
-            "HA server {} at {} is shutting down",
+            "Mesh server {} at {} is shutting down",
             self_name,
             self_address
         );
@@ -465,18 +465,19 @@ pub async fn try_ping(
 }
 
 #[macro_export]
-macro_rules! ha_run {
+macro_rules! mesh_run {
     ($addr:expr, $init_peer:expr) => {{
-        ha_run!($addr.to_string(), $addr, $init_peer)
+        mesh_run!($addr.to_string(), $addr, $init_peer)
     }};
 
     ($name:expr, $addr:expr, $init_peer:expr) => {{
-        tracing::info!("Starting HA server : {}", $addr);
+        tracing::info!("Starting mesh server : {}", $addr);
         let (server, handler) =
-            $crate::ha::service::HAServerBuilder::new($name.to_string(), $addr, $init_peer).build();
+            $crate::mesh::service::MeshServerBuilder::new($name.to_string(), $addr, $init_peer)
+                .build();
         tokio::spawn(async move {
             if let Err(e) = server.start_serve().await {
-                tracing::error!("HA server failed: {}", e);
+                tracing::error!("Mesh server failed: {}", e);
             }
         });
         handler
@@ -519,7 +520,7 @@ mod tests {
         format!("127.0.0.1:{}", port).parse().unwrap()
     }
 
-    fn print_state(handler: &HAServerHandler) -> String {
+    fn print_state(handler: &MeshServerHandler) -> String {
         let state = handler.state.read();
         let mut res = vec![];
         for (k, v) in state.iter() {
@@ -540,9 +541,9 @@ mod tests {
 
         // 1. setup node A and B for initial cluster
         let addr_a = get_node().await;
-        let handler_a = ha_run!("A", addr_a, None);
+        let handler_a = mesh_run!("A", addr_a, None);
         let addr_b = get_node().await;
-        let handler_b = ha_run!("B", addr_b, Some(addr_a));
+        let handler_b = mesh_run!("B", addr_b, Some(addr_a));
 
         // 2. wait for node A and B to sync and write some data
         tokio::time::sleep(Duration::from_secs(2)).await;
@@ -551,16 +552,16 @@ mod tests {
 
         // 3. add node C and D and wait for them to sync
         let addr_c = get_node().await;
-        let handler_c = ha_run!("C", addr_c, Some(addr_a));
+        let handler_c = mesh_run!("C", addr_c, Some(addr_a));
         let addr_d = get_node().await;
-        let handler_d = ha_run!("D", addr_d, Some(addr_c));
+        let handler_d = mesh_run!("D", addr_d, Some(addr_c));
         tokio::time::sleep(Duration::from_secs(2)).await;
         log::info!("================================================");
 
         // 4. add node E and wait for it to sync and kill it
         {
             let addr_e = get_node().await;
-            let handler_e = ha_run!("E", addr_e, Some(addr_d));
+            let handler_e = mesh_run!("E", addr_e, Some(addr_d));
             tokio::time::sleep(Duration::from_secs(3)).await;
             log::info!("State E: {:?}", print_state(&handler_e));
             // killing_button.send(()).unwrap();

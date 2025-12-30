@@ -16,14 +16,14 @@ use super::{
     ClusterState,
 };
 
-pub struct HAController {
+pub struct MeshController {
     state: ClusterState,
     self_name: String,
     self_addr: SocketAddr,
     init_peer: Option<SocketAddr>,
 }
 
-impl HAController {
+impl MeshController {
     pub fn new(
         state: ClusterState,
         self_addr: SocketAddr,

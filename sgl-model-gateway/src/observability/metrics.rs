@@ -324,8 +324,8 @@ pub fn init_metrics() {
     );
     describe_counter!("smg_db_items_stored", "Total items stored by storage_type");
 
-    // Initialize HA metrics
-    crate::ha::metrics::init_ha_metrics();
+    // Initialize mesh metrics
+    crate::mesh::metrics::init_mesh_metrics();
 }
 
 pub fn start_prometheus(config: PrometheusConfig) {

@@ -1,4 +1,4 @@
-//! Topology management for HA cluster
+//! Topology management for mesh cluster
 //!
 //! Supports:
 //! - Full mesh for small/medium clusters

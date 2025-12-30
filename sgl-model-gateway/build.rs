@@ -12,7 +12,7 @@ macro_rules! set_env {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Rebuild triggers
-    println!("cargo:rerun-if-changed=src/ha/proto/gossip.proto");
+    println!("cargo:rerun-if-changed=src/mesh/proto/gossip.proto");
     println!("cargo:rerun-if-changed=src/proto/sglang_scheduler.proto");
     println!("cargo:rerun-if-changed=src/proto/vllm_engine.proto");
     println!("cargo:rerun-if-changed=Cargo.toml");
@@ -36,7 +36,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Generate both client and server code
         .build_server(true)
         .build_client(true)
-        .compile_protos(&["src/ha/proto/gossip.proto"], &["src/ha/proto"])?;
+        .compile_protos(&["src/mesh/proto/gossip.proto"], &["src/mesh/proto"])?;
 
     // Set version info environment variables
     let version = read_cargo_version().unwrap_or_else(|_| DEFAULT_VERSION.to_string());

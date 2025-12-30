@@ -7,17 +7,17 @@ use std::{sync::Arc, time::Duration};
 use tokio::time::interval;
 use tracing::{debug, info};
 
-use super::sync::HASyncManager;
+use super::sync::MeshSyncManager;
 
 /// Rate limit window manager
 /// Handles periodic reset of rate limit counters for time window management
 pub struct RateLimitWindow {
-    sync_manager: Arc<HASyncManager>,
+    sync_manager: Arc<MeshSyncManager>,
     window_seconds: u64,
 }
 
 impl RateLimitWindow {
-    pub fn new(sync_manager: Arc<HASyncManager>, window_seconds: u64) -> Self {
+    pub fn new(sync_manager: Arc<MeshSyncManager>, window_seconds: u64) -> Self {
         Self {
             sync_manager,
             window_seconds,
@@ -47,12 +47,12 @@ mod tests {
     use tokio::time::{sleep, Duration as TokioDuration};
 
     use super::*;
-    use crate::ha::stores::StateStores;
+    use crate::mesh::stores::StateStores;
 
     #[test]
     fn test_rate_limit_window_new() {
         let stores = Arc::new(StateStores::new());
-        let sync_manager = Arc::new(HASyncManager::new(stores, "test_node".to_string()));
+        let sync_manager = Arc::new(MeshSyncManager::new(stores, "test_node".to_string()));
         let window = RateLimitWindow::new(sync_manager, 60);
 
         // Should create without panicking
@@ -62,7 +62,7 @@ mod tests {
     #[test]
     fn test_rate_limit_window_different_intervals() {
         let stores = Arc::new(StateStores::new());
-        let sync_manager = Arc::new(HASyncManager::new(stores, "test_node".to_string()));
+        let sync_manager = Arc::new(MeshSyncManager::new(stores, "test_node".to_string()));
 
         let window1 = RateLimitWindow::new(sync_manager.clone(), 30);
         assert_eq!(window1.window_seconds, 30);
@@ -74,7 +74,7 @@ mod tests {
     #[tokio::test]
     async fn test_rate_limit_window_reset_task_interval() {
         let stores = Arc::new(StateStores::new());
-        let sync_manager = Arc::new(HASyncManager::new(stores, "test_node".to_string()));
+        let sync_manager = Arc::new(MeshSyncManager::new(stores, "test_node".to_string()));
 
         // Set a very short window for testing (1 second)
         let window = RateLimitWindow::new(sync_manager, 1);
@@ -97,11 +97,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_rate_limit_window_reset_with_counter() {
-        use crate::ha::{crdt::SKey, stores::MembershipState};
+        use crate::mesh::{crdt::SKey, stores::MembershipState};
 
         // Use with_self_name to ensure RateLimitStore uses the same self_name
         let stores = Arc::new(StateStores::with_self_name("test_node".to_string()));
-        let sync_manager = Arc::new(HASyncManager::new(stores.clone(), "test_node".to_string()));
+        let sync_manager = Arc::new(MeshSyncManager::new(
+            stores.clone(),
+            "test_node".to_string(),
+        ));
 
         // First, add this node to membership so it can be an owner
         let membership_key = SKey::new("test_node".to_string());
@@ -120,7 +123,7 @@ mod tests {
         sync_manager.update_rate_limit_membership();
 
         // Check if node is owner before incrementing
-        let key = crate::ha::stores::GLOBAL_RATE_LIMIT_COUNTER_KEY.to_string();
+        let key = crate::mesh::stores::GLOBAL_RATE_LIMIT_COUNTER_KEY.to_string();
         let is_owner = stores.rate_limit.is_owner(&key);
         assert!(is_owner, "Node should be owner of the rate limit key");
 
@@ -156,7 +159,7 @@ mod tests {
     #[test]
     fn test_rate_limit_window_zero_seconds() {
         let stores = Arc::new(StateStores::new());
-        let sync_manager = Arc::new(HASyncManager::new(stores, "test_node".to_string()));
+        let sync_manager = Arc::new(MeshSyncManager::new(stores, "test_node".to_string()));
 
         // Should handle zero seconds (though not recommended in practice)
         let window = RateLimitWindow::new(sync_manager, 0);
@@ -166,7 +169,7 @@ mod tests {
     #[test]
     fn test_rate_limit_window_large_interval() {
         let stores = Arc::new(StateStores::new());
-        let sync_manager = Arc::new(HASyncManager::new(stores, "test_node".to_string()));
+        let sync_manager = Arc::new(MeshSyncManager::new(stores, "test_node".to_string()));
 
         // Test with a large interval
         let window = RateLimitWindow::new(sync_manager, 86400); // 24 hours

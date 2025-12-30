@@ -1,6 +1,6 @@
-//! HA management endpoints
+//! Mesh management endpoints
 //!
-//! Provides REST API for HA cluster management:
+//! Provides REST API for mesh cluster management:
 //! - Configuration CRUD operations
 //! - Health checks
 //! - Cluster status
@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tracing::{info, warn};
 
-/// HA cluster status response
+/// Mesh cluster status response
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ClusterStatusResponse {
     pub node_name: String,
@@ -42,21 +42,21 @@ pub struct StoreStatus {
 
 /// Health check response
 #[derive(Debug, Serialize, Deserialize)]
-pub struct HAHealthResponse {
+pub struct MeshHealthResponse {
     pub status: String,
     pub node_name: String,
     pub cluster_size: usize,
     pub stores_healthy: bool,
 }
 
-/// Get HA cluster status
+/// Get mesh cluster status
 pub async fn get_cluster_status(State(app_state): State<Arc<AppState>>) -> Response {
-    let handler = match &app_state.ha_handler {
+    let handler = match &app_state.mesh_handler {
         Some(h) => h,
         None => {
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
-                Json(json!({"error": "HA not enabled"})),
+                Json(json!({"error": "mesh not enabled"})),
             )
                 .into_response();
         }
@@ -90,14 +90,14 @@ pub async fn get_cluster_status(State(app_state): State<Arc<AppState>>) -> Respo
     (StatusCode::OK, Json(response)).into_response()
 }
 
-/// Get HA health status
-pub async fn get_ha_health(State(app_state): State<Arc<AppState>>) -> Response {
-    let handler = match &app_state.ha_handler {
+/// Get mesh health status
+pub async fn get_mesh_health(State(app_state): State<Arc<AppState>>) -> Response {
+    let handler = match &app_state.mesh_handler {
         Some(h) => h,
         None => {
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
-                Json(json!({"error": "HA not enabled"})),
+                Json(json!({"error": "mesh not enabled"})),
             )
                 .into_response();
         }
@@ -105,7 +105,7 @@ pub async fn get_ha_health(State(app_state): State<Arc<AppState>>) -> Response {
     let state = handler.state.read();
     let cluster_size = state.len();
 
-    let response = HAHealthResponse {
+    let response = MeshHealthResponse {
         status: "healthy".to_string(),
         node_name: handler.self_name.clone(),
         cluster_size,
@@ -115,31 +115,31 @@ pub async fn get_ha_health(State(app_state): State<Arc<AppState>>) -> Response {
     (StatusCode::OK, Json(response)).into_response()
 }
 
-/// Get worker states from HA store
+/// Get worker states from mesh store
 pub async fn get_worker_states(State(app_state): State<Arc<AppState>>) -> Response {
-    match &app_state.ha_sync_manager {
+    match &app_state.mesh_sync_manager {
         Some(manager) => {
             let workers = manager.get_all_worker_states();
             (StatusCode::OK, Json(workers)).into_response()
         }
         None => (
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({"error": "HA sync manager not available"})),
+            Json(json!({"error": "mesh sync manager not available"})),
         )
             .into_response(),
     }
 }
 
-/// Get policy states from HA store
+/// Get policy states from mesh store
 pub async fn get_policy_states(State(app_state): State<Arc<AppState>>) -> Response {
-    match &app_state.ha_sync_manager {
+    match &app_state.mesh_sync_manager {
         Some(manager) => {
             let policies = manager.get_all_policy_states();
             (StatusCode::OK, Json(policies)).into_response()
         }
         None => (
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({"error": "HA sync manager not available"})),
+            Json(json!({"error": "mesh sync manager not available"})),
         )
             .into_response(),
     }
@@ -150,7 +150,7 @@ pub async fn get_worker_state(
     Path(worker_id): Path<String>,
     State(app_state): State<Arc<AppState>>,
 ) -> Response {
-    match &app_state.ha_sync_manager {
+    match &app_state.mesh_sync_manager {
         Some(manager) => match manager.get_worker_state(&worker_id) {
             Some(state) => (StatusCode::OK, Json(state)).into_response(),
             None => (
@@ -161,7 +161,7 @@ pub async fn get_worker_state(
         },
         None => (
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({"error": "HA sync manager not available"})),
+            Json(json!({"error": "mesh sync manager not available"})),
         )
             .into_response(),
     }
@@ -172,7 +172,7 @@ pub async fn get_policy_state(
     Path(model_id): Path<String>,
     State(app_state): State<Arc<AppState>>,
 ) -> Response {
-    match &app_state.ha_sync_manager {
+    match &app_state.mesh_sync_manager {
         Some(manager) => match manager.get_policy_state(&model_id) {
             Some(state) => (StatusCode::OK, Json(state)).into_response(),
             None => (
@@ -183,7 +183,7 @@ pub async fn get_policy_state(
         },
         None => (
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({"error": "HA sync manager not available"})),
+            Json(json!({"error": "mesh sync manager not available"})),
         )
             .into_response(),
     }
@@ -200,12 +200,12 @@ pub async fn update_app_config(
     State(app_state): State<Arc<AppState>>,
     Json(request): Json<UpdateAppConfigRequest>,
 ) -> Response {
-    let handler = match &app_state.ha_handler {
+    let handler = match &app_state.mesh_handler {
         Some(h) => h,
         None => {
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
-                Json(json!({"error": "HA not enabled"})),
+                Json(json!({"error": "mesh not enabled"})),
             )
                 .into_response();
         }
@@ -249,12 +249,12 @@ pub async fn get_app_config(
     Path(key): Path<String>,
     State(app_state): State<Arc<AppState>>,
 ) -> Response {
-    let handler = match &app_state.ha_handler {
+    let handler = match &app_state.mesh_handler {
         Some(h) => h,
         None => {
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
-                Json(json!({"error": "HA not enabled"})),
+                Json(json!({"error": "mesh not enabled"})),
             )
                 .into_response();
         }
@@ -293,12 +293,12 @@ pub async fn set_global_rate_limit(
     };
 
     if let Ok(config_bytes) = serde_json::to_vec(&config) {
-        let handler = match &app_state.ha_handler {
+        let handler = match &app_state.mesh_handler {
             Some(h) => h,
             None => {
                 return (
                     StatusCode::SERVICE_UNAVAILABLE,
-                    Json(json!({"error": "HA not enabled"})),
+                    Json(json!({"error": "mesh not enabled"})),
                 )
                     .into_response();
             }
@@ -326,12 +326,12 @@ pub async fn set_global_rate_limit(
 
 /// Get global rate limit configuration
 pub async fn get_global_rate_limit(State(app_state): State<Arc<AppState>>) -> Response {
-    let handler = match &app_state.ha_handler {
+    let handler = match &app_state.mesh_handler {
         Some(h) => h,
         None => {
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
-                Json(json!({"error": "HA not enabled"})),
+                Json(json!({"error": "mesh not enabled"})),
             )
                 .into_response();
         }
@@ -362,24 +362,24 @@ pub async fn get_global_rate_limit(State(app_state): State<Arc<AppState>>) -> Re
 
 /// Get global rate limit statistics
 pub async fn get_global_rate_limit_stats(State(app_state): State<Arc<AppState>>) -> Response {
-    let sync_manager = match &app_state.ha_sync_manager {
+    let sync_manager = match &app_state.mesh_sync_manager {
         Some(m) => m,
         None => {
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
-                Json(json!({"error": "HA sync manager not available"})),
+                Json(json!({"error": "mesh sync manager not available"})),
             )
                 .into_response();
         }
     };
 
     // Get configuration
-    let handler = match &app_state.ha_handler {
+    let handler = match &app_state.mesh_handler {
         Some(h) => h,
         None => {
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
-                Json(json!({"error": "HA not enabled"})),
+                Json(json!({"error": "mesh not enabled"})),
             )
                 .into_response();
         }
@@ -392,7 +392,7 @@ pub async fn get_global_rate_limit_stats(State(app_state): State<Arc<AppState>>)
 
     // Get current counter value
     let current_count = sync_manager
-        .get_rate_limit_value(crate::ha::stores::GLOBAL_RATE_LIMIT_COUNTER_KEY)
+        .get_rate_limit_value(crate::mesh::stores::GLOBAL_RATE_LIMIT_COUNTER_KEY)
         .unwrap_or(0);
 
     (
@@ -412,12 +412,12 @@ pub async fn get_global_rate_limit_stats(State(app_state): State<Arc<AppState>>)
 
 /// Trigger graceful shutdown
 pub async fn trigger_graceful_shutdown(State(app_state): State<Arc<AppState>>) -> Response {
-    let handler = match &app_state.ha_handler {
+    let handler = match &app_state.mesh_handler {
         Some(h) => h.clone(),
         None => {
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
-                Json(json!({"error": "HA not enabled"})),
+                Json(json!({"error": "mesh not enabled"})),
             )
                 .into_response();
         }
@@ -438,6 +438,6 @@ pub async fn trigger_graceful_shutdown(State(app_state): State<Arc<AppState>>) -
 use std::sync::Arc;
 
 use crate::{
-    ha::stores::{RateLimitConfig, GLOBAL_RATE_LIMIT_KEY},
+    mesh::stores::{RateLimitConfig, GLOBAL_RATE_LIMIT_KEY},
     server::AppState,
 };

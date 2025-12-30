@@ -30,7 +30,7 @@ use super::{
     node_state_machine::NodeStateMachine,
     partition::PartitionDetector,
     stores::{StateStores, StoreType as LocalStoreType},
-    sync::HASyncManager,
+    sync::MeshSyncManager,
     try_ping, ClusterState,
 };
 
@@ -40,7 +40,7 @@ pub struct GossipService {
     self_addr: SocketAddr,
     self_name: String,
     stores: Option<Arc<StateStores>>, // Optional state stores for CRDT-based sync
-    sync_manager: Option<Arc<HASyncManager>>, // Optional sync manager for applying remote updates
+    sync_manager: Option<Arc<MeshSyncManager>>, // Optional sync manager for applying remote updates
     state_machine: Option<Arc<NodeStateMachine>>,
     partition_detector: Option<Arc<PartitionDetector>>,
 }
@@ -248,7 +248,7 @@ impl GossipService {
         self
     }
 
-    pub fn with_sync_manager(mut self, sync_manager: Arc<HASyncManager>) -> Self {
+    pub fn with_sync_manager(mut self, sync_manager: Arc<MeshSyncManager>) -> Self {
         self.sync_manager = Some(sync_manager);
         self
     }

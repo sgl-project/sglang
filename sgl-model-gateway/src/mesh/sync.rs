@@ -1,6 +1,6 @@
-//! HA state synchronization module
+//! Mesh state synchronization module
 //!
-//! Handles synchronization of worker and policy states across HA cluster nodes
+//! Handles synchronization of worker and policy states across mesh cluster nodes
 
 use std::sync::Arc;
 
@@ -16,14 +16,14 @@ use super::{
     tree_ops::{TreeOperation, TreeState},
 };
 
-/// HA sync manager for coordinating state synchronization
+/// Mesh sync manager for coordinating state synchronization
 #[derive(Clone, Debug)]
-pub struct HASyncManager {
+pub struct MeshSyncManager {
     stores: Arc<StateStores>,
     self_name: String,
 }
 
-impl HASyncManager {
+impl MeshSyncManager {
     pub fn new(stores: Arc<StateStores>, self_name: String) -> Self {
         Self { stores, self_name }
     }
@@ -33,7 +33,7 @@ impl HASyncManager {
         &self.self_name
     }
 
-    /// Sync worker state to HA stores
+    /// Sync worker state to mesh stores
     pub fn sync_worker_state(
         &self,
         worker_id: String,
@@ -66,19 +66,19 @@ impl HASyncManager {
         let actor = self.self_name.clone();
         self.stores.worker.insert(key, state, actor);
         debug!(
-            "Synced worker state to HA: {} (version: {})",
+            "Synced worker state to mesh {} (version: {})",
             worker_id, new_version
         );
     }
 
-    /// Remove worker state from HA stores
+    /// Remove worker state from mesh stores
     pub fn remove_worker_state(&self, worker_id: &str) {
         let key = SKey::new(worker_id.to_string());
         self.stores.worker.remove(&key);
-        debug!("Removed worker state from HA: {}", worker_id);
+        debug!("Removed worker state from mesh {}", worker_id);
     }
 
-    /// Sync policy state to HA stores
+    /// Sync policy state to mesh stores
     pub fn sync_policy_state(&self, model_id: String, policy_type: String, config: Vec<u8>) {
         let key = SKey::new(format!("policy:{}", model_id));
 
@@ -102,36 +102,36 @@ impl HASyncManager {
         let actor = self.self_name.clone();
         self.stores.policy.insert(key, state, actor);
         debug!(
-            "Synced policy state to HA: model={} (version: {})",
+            "Synced policy state to mesh model={} (version: {})",
             model_id, new_version
         );
     }
 
-    /// Remove policy state from HA stores
+    /// Remove policy state from mesh stores
     pub fn remove_policy_state(&self, model_id: &str) {
         let key = SKey::new(format!("policy:{}", model_id));
         self.stores.policy.remove(&key);
-        debug!("Removed policy state from HA: model={}", model_id);
+        debug!("Removed policy state from mesh model={}", model_id);
     }
 
-    /// Get worker state from HA stores
+    /// Get worker state from mesh stores
     pub fn get_worker_state(&self, worker_id: &str) -> Option<WorkerState> {
         let key = SKey::new(worker_id.to_string());
         self.stores.worker.get(&key)
     }
 
-    /// Get all worker states from HA stores
+    /// Get all worker states from mesh stores
     pub fn get_all_worker_states(&self) -> Vec<WorkerState> {
         self.stores.worker.all().into_values().collect()
     }
 
-    /// Get policy state from HA stores
+    /// Get policy state from mesh stores
     pub fn get_policy_state(&self, model_id: &str) -> Option<PolicyState> {
         let key = SKey::new(format!("policy:{}", model_id));
         self.stores.policy.get(&key)
     }
 
-    /// Get all policy states from HA stores
+    /// Get all policy states from mesh stores
     pub fn get_all_policy_states(&self) -> Vec<PolicyState> {
         self.stores.policy.all().into_values().collect()
     }
@@ -323,7 +323,7 @@ impl HASyncManager {
         }
     }
 
-    /// Sync tree operation to HA stores
+    /// Sync tree operation to mesh stores
     /// This adds a tree operation (insert or remove) to the tree state for a specific model
     pub fn sync_tree_operation(
         &self,
@@ -367,14 +367,14 @@ impl HASyncManager {
         let actor = self.self_name.clone();
         self.stores.policy.insert(key, state, actor);
         debug!(
-            "Synced tree operation to HA: model={} (version: {})",
+            "Synced tree operation to mesh: model={} (version: {})",
             model_id, new_version
         );
 
         Ok(())
     }
 
-    /// Get tree state for a model from HA stores
+    /// Get tree state for a model from mesh stores
     pub fn get_tree_state(&self, model_id: &str) -> Option<TreeState> {
         let key = SKey::new(tree_state_key(model_id));
         self.stores
@@ -432,17 +432,17 @@ impl HASyncManager {
     }
 }
 
-/// Optional HA sync manager (can be None if HA is not enabled)
-pub type OptionalHASyncManager = Option<Arc<HASyncManager>>;
+/// Optional mesh sync manager (can be None if mesh is not enabled)
+pub type OptionalMeshSyncManager = Option<Arc<MeshSyncManager>>;
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ha::stores::StateStores;
+    use crate::mesh::stores::StateStores;
 
-    fn create_test_sync_manager() -> HASyncManager {
+    fn create_test_sync_manager() -> MeshSyncManager {
         let stores = Arc::new(StateStores::new());
-        HASyncManager::new(stores, "test_node".to_string())
+        MeshSyncManager::new(stores, "test_node".to_string())
     }
 
     #[test]

@@ -1,4 +1,4 @@
-//! Flow control for HA cluster communication
+//! Flow control for mesh cluster communication
 //!
 //! Provides:
 //! - Backpressure control (channel capacity monitoring)

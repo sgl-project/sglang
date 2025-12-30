@@ -179,7 +179,7 @@ mod tests {
 
     use super::*;
     // Import NodeState and NodeStatus from gossip module
-    use crate::ha::service::gossip::{NodeState, NodeStatus};
+    use crate::mesh::service::gossip::{NodeState, NodeStatus};
 
     fn create_test_config() -> PartitionConfig {
         PartitionConfig {

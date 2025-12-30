@@ -1,4 +1,4 @@
-//! HA cluster metrics for Prometheus
+//! Mesh cluster metrics for Prometheus
 //!
 //! Implements all metrics required by issue #10839:
 //! - Convergence latency
@@ -12,8 +12,8 @@ use std::time::{Duration, Instant};
 
 use metrics::{counter, describe_counter, describe_gauge, describe_histogram, gauge, histogram};
 
-/// Initialize HA metrics descriptions
-pub fn init_ha_metrics() {
+/// Initialize mesh metrics descriptions
+pub fn init_mesh_metrics() {
     // Convergence latency
     describe_histogram!(
         "router_mesh_convergence_ms",

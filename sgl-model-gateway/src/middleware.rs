@@ -503,8 +503,8 @@ pub async fn concurrency_limit_middleware(
     request: Request<Body>,
     next: Next,
 ) -> Response {
-    // Check HA global rate limit first if enabled
-    if let Some(sync_manager) = &app_state.ha_sync_manager {
+    // Check mesh global rate limit first if enabled
+    if let Some(sync_manager) = &app_state.mesh_sync_manager {
         let (is_exceeded, current_count, limit) = sync_manager.check_global_rate_limit();
         if is_exceeded {
             debug!(

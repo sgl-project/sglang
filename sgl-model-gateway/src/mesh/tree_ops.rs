@@ -1,6 +1,6 @@
-//! Tree operation definitions for HA synchronization
+//! Tree operation definitions for mesh synchronization
 //!
-//! Defines serializable tree operations that can be synchronized across HA cluster nodes
+//! Defines serializable tree operations that can be synchronized across mesh cluster nodes
 
 use serde::{Deserialize, Serialize};
 

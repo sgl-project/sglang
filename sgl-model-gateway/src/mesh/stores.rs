@@ -1,4 +1,4 @@
-//! State stores for HA cluster synchronization
+//! State stores for mesh cluster synchronization
 //!
 //! Four types of state stores:
 //! - MembershipStore: Router node membership
@@ -146,11 +146,11 @@ impl MembershipStore {
         self.inner.remove(key);
     }
 
-    pub fn merge(&self, other: &crate::ha::crdt::CRDTMap<MembershipState>) {
+    pub fn merge(&self, other: &crate::mesh::crdt::CRDTMap<MembershipState>) {
         self.inner.merge(other);
     }
 
-    pub fn snapshot(&self) -> crate::ha::crdt::CRDTMap<MembershipState> {
+    pub fn snapshot(&self) -> crate::mesh::crdt::CRDTMap<MembershipState> {
         self.inner.snapshot()
     }
 
@@ -202,11 +202,11 @@ impl AppStore {
         self.inner.remove(key);
     }
 
-    pub fn merge(&self, other: &crate::ha::crdt::CRDTMap<AppState>) {
+    pub fn merge(&self, other: &crate::mesh::crdt::CRDTMap<AppState>) {
         self.inner.merge(other);
     }
 
-    pub fn snapshot(&self) -> crate::ha::crdt::CRDTMap<AppState> {
+    pub fn snapshot(&self) -> crate::mesh::crdt::CRDTMap<AppState> {
         self.inner.snapshot()
     }
 
@@ -258,11 +258,11 @@ impl WorkerStore {
         self.inner.remove(key);
     }
 
-    pub fn merge(&self, other: &crate::ha::crdt::CRDTMap<WorkerState>) {
+    pub fn merge(&self, other: &crate::mesh::crdt::CRDTMap<WorkerState>) {
         self.inner.merge(other);
     }
 
-    pub fn snapshot(&self) -> crate::ha::crdt::CRDTMap<WorkerState> {
+    pub fn snapshot(&self) -> crate::mesh::crdt::CRDTMap<WorkerState> {
         self.inner.snapshot()
     }
 
@@ -314,11 +314,11 @@ impl PolicyStore {
         self.inner.remove(key);
     }
 
-    pub fn merge(&self, other: &crate::ha::crdt::CRDTMap<PolicyState>) {
+    pub fn merge(&self, other: &crate::mesh::crdt::CRDTMap<PolicyState>) {
         self.inner.merge(other);
     }
 
-    pub fn snapshot(&self) -> crate::ha::crdt::CRDTMap<PolicyState> {
+    pub fn snapshot(&self) -> crate::mesh::crdt::CRDTMap<PolicyState> {
         self.inner.snapshot()
     }
 

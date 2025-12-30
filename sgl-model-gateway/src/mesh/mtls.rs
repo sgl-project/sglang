@@ -1,4 +1,4 @@
-//! mTLS (mutual TLS) support for HA cluster communication
+//! mTLS (mutual TLS) support for mesh cluster communication
 //!
 //! Provides optional mTLS encryption for gRPC mesh connections using rustls.
 //! Supports certificate rotation without restart.
