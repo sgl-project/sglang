@@ -133,10 +133,12 @@ impl<T: Clone + Serialize + DeserializeOwned> CRDTMap<T> {
             self.inner.insert(key, reg);
         }
     }
-    
+
     /// Get the version and actor for a key
     pub fn get_metadata(&self, key: &SKey) -> Option<(u64, String)> {
-        self.inner.get(key).map(|reg| (reg.version, reg.actor.clone()))
+        self.inner
+            .get(key)
+            .map(|reg| (reg.version, reg.actor.clone()))
     }
 
     pub fn remove(&mut self, key: &SKey) {
@@ -265,7 +267,7 @@ impl<T: Clone + Serialize + DeserializeOwned> SyncCRDTMap<T> {
     pub fn insert(&self, key: SKey, value: T, actor: String) {
         self.inner.write().insert(key, value, actor);
     }
-    
+
     /// Get the version and actor for a key
     pub fn get_metadata(&self, key: &SKey) -> Option<(u64, String)> {
         self.inner.read().get_metadata(key)

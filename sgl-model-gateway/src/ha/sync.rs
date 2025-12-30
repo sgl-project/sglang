@@ -22,7 +22,7 @@ impl HASyncManager {
     pub fn new(stores: Arc<StateStores>, self_name: String) -> Self {
         Self { stores, self_name }
     }
-    
+
     /// Get the node name (actor) for this sync manager
     pub fn self_name(&self) -> &str {
         &self.self_name
@@ -38,13 +38,16 @@ impl HASyncManager {
         load: f64,
     ) {
         let key = SKey::new(worker_id.clone());
-        
+
         // Get current version if exists, otherwise start at 1
-        let current_version = self.stores.worker.get_metadata(&key)
+        let current_version = self
+            .stores
+            .worker
+            .get_metadata(&key)
             .map(|(v, _)| v)
             .unwrap_or(0);
         let new_version = current_version + 1;
-        
+
         let state = WorkerState {
             worker_id: worker_id.clone(),
             model_id,
@@ -57,7 +60,10 @@ impl HASyncManager {
         // Use self node name as actor
         let actor = self.self_name.clone();
         self.stores.worker.insert(key, state, actor);
-        debug!("Synced worker state to HA: {} (version: {})", worker_id, new_version);
+        debug!(
+            "Synced worker state to HA: {} (version: {})",
+            worker_id, new_version
+        );
     }
 
     /// Remove worker state from HA stores
@@ -70,13 +76,16 @@ impl HASyncManager {
     /// Sync policy state to HA stores
     pub fn sync_policy_state(&self, model_id: String, policy_type: String, config: Vec<u8>) {
         let key = SKey::new(format!("policy:{}", model_id));
-        
+
         // Get current version if exists, otherwise start at 1
-        let current_version = self.stores.policy.get_metadata(&key)
+        let current_version = self
+            .stores
+            .policy
+            .get_metadata(&key)
             .map(|(v, _)| v)
             .unwrap_or(0);
         let new_version = current_version + 1;
-        
+
         let state = PolicyState {
             model_id: model_id.clone(),
             policy_type,
@@ -87,7 +96,10 @@ impl HASyncManager {
         // Use self node name as actor
         let actor = self.self_name.clone();
         self.stores.policy.insert(key, state, actor);
-        debug!("Synced policy state to HA: model={} (version: {})", model_id, new_version);
+        debug!(
+            "Synced policy state to HA: model={} (version: {})",
+            model_id, new_version
+        );
     }
 
     /// Remove policy state from HA stores
@@ -126,19 +138,26 @@ impl HASyncManager {
         // Use provided actor, or fallback to a default if not available
         // In practice, actor should come from the StateUpdate message
         let actor = actor.unwrap_or_else(|| "remote".to_string());
-        
+
         // Check if we should update based on version
-        let current_version = self.stores.worker.get_metadata(&key)
+        let current_version = self
+            .stores
+            .worker
+            .get_metadata(&key)
             .map(|(v, _)| v)
             .unwrap_or(0);
-        
+
         if state.version > current_version {
             self.stores.worker.insert(key, state.clone(), actor.clone());
-            debug!("Applied remote worker state update: {} (version: {} -> {})", 
-                state.worker_id, current_version, state.version);
+            debug!(
+                "Applied remote worker state update: {} (version: {} -> {})",
+                state.worker_id, current_version, state.version
+            );
         } else {
-            debug!("Skipped remote worker state update: {} (version {} <= current {})", 
-                state.worker_id, state.version, current_version);
+            debug!(
+                "Skipped remote worker state update: {} (version {} <= current {})",
+                state.worker_id, state.version, current_version
+            );
         }
     }
 
@@ -148,19 +167,26 @@ impl HASyncManager {
         let key = SKey::new(format!("policy:{}", state.model_id));
         // Use provided actor, or fallback to a default if not available
         let actor = actor.unwrap_or_else(|| "remote".to_string());
-        
+
         // Check if we should update based on version
-        let current_version = self.stores.policy.get_metadata(&key)
+        let current_version = self
+            .stores
+            .policy
+            .get_metadata(&key)
             .map(|(v, _)| v)
             .unwrap_or(0);
-        
+
         if state.version > current_version {
             self.stores.policy.insert(key, state.clone(), actor.clone());
-            debug!("Applied remote policy state update: {} (version: {} -> {})", 
-                state.model_id, current_version, state.version);
+            debug!(
+                "Applied remote policy state update: {} (version: {} -> {})",
+                state.model_id, current_version, state.version
+            );
         } else {
-            debug!("Skipped remote policy state update: {} (version {} <= current {})", 
-                state.model_id, state.version, current_version);
+            debug!(
+                "Skipped remote policy state update: {} (version {} <= current {})",
+                state.model_id, state.version, current_version
+            );
         }
     }
 }

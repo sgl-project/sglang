@@ -42,10 +42,7 @@ impl IncrementalUpdateCollector {
     }
 
     /// Collect incremental updates for a specific store type
-    pub fn collect_updates_for_store(
-        &self,
-        store_type: StoreType,
-    ) -> Vec<StateUpdate> {
+    pub fn collect_updates_for_store(&self, store_type: StoreType) -> Vec<StateUpdate> {
         let mut updates = Vec::new();
         let mut last_sent = self.last_sent.write();
 
@@ -54,12 +51,15 @@ impl IncrementalUpdateCollector {
                 let all_workers = self.stores.worker.all();
                 for (key, state) in all_workers {
                     let key_str = key.as_str().to_string();
-                    let current_version = self.stores.worker.get_metadata(&key)
+                    let current_version = self
+                        .stores
+                        .worker
+                        .get_metadata(&key)
                         .map(|(v, _)| v)
                         .unwrap_or(0);
-                    
+
                     let last_sent_version = last_sent.worker.get(&key_str).copied().unwrap_or(0);
-                    
+
                     // Only include if version has changed
                     if current_version > last_sent_version {
                         if let Ok(serialized) = serde_json::to_vec(&state) {
@@ -73,10 +73,14 @@ impl IncrementalUpdateCollector {
                                     .unwrap()
                                     .as_nanos() as u64,
                             });
-                            
+
                             // Update last sent version
                             last_sent.worker.insert(key_str, current_version);
-                            trace!("Collected worker update: {} (version: {})", state.worker_id, current_version);
+                            trace!(
+                                "Collected worker update: {} (version: {})",
+                                state.worker_id,
+                                current_version
+                            );
                         }
                     }
                 }
@@ -85,12 +89,15 @@ impl IncrementalUpdateCollector {
                 let all_policies = self.stores.policy.all();
                 for (key, state) in all_policies {
                     let key_str = key.as_str().to_string();
-                    let current_version = self.stores.policy.get_metadata(&key)
+                    let current_version = self
+                        .stores
+                        .policy
+                        .get_metadata(&key)
                         .map(|(v, _)| v)
                         .unwrap_or(0);
-                    
+
                     let last_sent_version = last_sent.policy.get(&key_str).copied().unwrap_or(0);
-                    
+
                     // Only include if version has changed
                     if current_version > last_sent_version {
                         if let Ok(serialized) = serde_json::to_vec(&state) {
@@ -104,10 +111,14 @@ impl IncrementalUpdateCollector {
                                     .unwrap()
                                     .as_nanos() as u64,
                             });
-                            
+
                             // Update last sent version
                             last_sent.policy.insert(key_str, current_version);
-                            trace!("Collected policy update: {} (version: {})", state.model_id, current_version);
+                            trace!(
+                                "Collected policy update: {} (version: {})",
+                                state.model_id,
+                                current_version
+                            );
                         }
                     }
                 }
@@ -116,12 +127,15 @@ impl IncrementalUpdateCollector {
                 let all_apps = self.stores.app.all();
                 for (key, state) in all_apps {
                     let key_str = key.as_str().to_string();
-                    let current_version = self.stores.app.get_metadata(&key)
+                    let current_version = self
+                        .stores
+                        .app
+                        .get_metadata(&key)
                         .map(|(v, _)| v)
                         .unwrap_or(0);
-                    
+
                     let last_sent_version = last_sent.app.get(&key_str).copied().unwrap_or(0);
-                    
+
                     // Only include if version has changed
                     if current_version > last_sent_version {
                         updates.push(StateUpdate {
@@ -134,10 +148,14 @@ impl IncrementalUpdateCollector {
                                 .unwrap()
                                 .as_nanos() as u64,
                         });
-                        
+
                         // Update last sent version
                         last_sent.app.insert(key_str, current_version);
-                        trace!("Collected app update: {} (version: {})", state.key, current_version);
+                        trace!(
+                            "Collected app update: {} (version: {})",
+                            state.key,
+                            current_version
+                        );
                     }
                 }
             }
@@ -145,12 +163,16 @@ impl IncrementalUpdateCollector {
                 let all_members = self.stores.membership.all();
                 for (key, state) in all_members {
                     let key_str = key.as_str().to_string();
-                    let current_version = self.stores.membership.get_metadata(&key)
+                    let current_version = self
+                        .stores
+                        .membership
+                        .get_metadata(&key)
                         .map(|(v, _)| v)
                         .unwrap_or(0);
-                    
-                    let last_sent_version = last_sent.membership.get(&key_str).copied().unwrap_or(0);
-                    
+
+                    let last_sent_version =
+                        last_sent.membership.get(&key_str).copied().unwrap_or(0);
+
                     // Only include if version has changed
                     if current_version > last_sent_version {
                         if let Ok(serialized) = serde_json::to_vec(&state) {
@@ -164,31 +186,44 @@ impl IncrementalUpdateCollector {
                                     .unwrap()
                                     .as_nanos() as u64,
                             });
-                            
+
                             // Update last sent version
                             last_sent.membership.insert(key_str, current_version);
-                            trace!("Collected membership update: {} (version: {})", state.name, current_version);
+                            trace!(
+                                "Collected membership update: {} (version: {})",
+                                state.name,
+                                current_version
+                            );
                         }
                     }
                 }
             }
         }
 
-        debug!("Collected {} incremental updates for store {:?}", updates.len(), store_type);
+        debug!(
+            "Collected {} incremental updates for store {:?}",
+            updates.len(),
+            store_type
+        );
         updates
     }
 
     /// Collect all incremental updates across all stores
     pub fn collect_all_updates(&self) -> Vec<(StoreType, Vec<StateUpdate>)> {
         let mut all_updates = Vec::new();
-        
-        for store_type in [StoreType::Worker, StoreType::Policy, StoreType::App, StoreType::Membership] {
+
+        for store_type in [
+            StoreType::Worker,
+            StoreType::Policy,
+            StoreType::App,
+            StoreType::Membership,
+        ] {
             let updates = self.collect_updates_for_store(store_type);
             if !updates.is_empty() {
                 all_updates.push((store_type, updates));
             }
         }
-        
+
         all_updates
     }
 
@@ -213,10 +248,11 @@ impl IncrementalUpdateCollector {
             }
             StoreType::Membership => {
                 for update in updates {
-                    last_sent.membership.insert(update.key.clone(), update.version);
+                    last_sent
+                        .membership
+                        .insert(update.key.clone(), update.version);
                 }
             }
         }
     }
 }
-

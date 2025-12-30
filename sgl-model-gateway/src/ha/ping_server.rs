@@ -1,4 +1,9 @@
-use std::{net::SocketAddr, pin::Pin, sync::Arc, time::{Duration, Instant}};
+use std::{
+    net::SocketAddr,
+    pin::Pin,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use anyhow::Result;
 use futures::Stream;
@@ -17,13 +22,11 @@ use super::{
     },
     incremental::IncrementalUpdateCollector,
     metrics::{
-        record_ack, record_batch_sent, record_nack, record_peer_reconnect,
-        record_snapshot_bytes, record_snapshot_duration, record_snapshot_trigger,
-        update_peer_connections, ConvergenceTracker,
+        record_ack, record_batch_sent, record_nack, record_peer_reconnect, record_snapshot_bytes,
+        record_snapshot_duration, record_snapshot_trigger, update_peer_connections,
+        ConvergenceTracker,
     },
-    stores::{
-        StateStores, StoreType as LocalStoreType,
-    },
+    stores::{StateStores, StoreType as LocalStoreType},
     sync::HASyncManager,
     try_ping, ClusterState,
 };
@@ -61,58 +64,54 @@ impl GossipService {
 
         // Get all entries from the store
         let entries: Vec<(SKey, Vec<u8>)> = match store_type {
-            LocalStoreType::Membership => {
-                stores.membership.all()
-                    .into_iter()
-                    .map(|(k, v)| {
-                        let serialized = serde_json::to_vec(&v)
-                            .unwrap_or_else(|e| {
-                                log::error!("Failed to serialize membership state: {}", e);
-                                vec![]
-                            });
-                        (k, serialized)
-                    })
-                    .collect()
-            }
-            LocalStoreType::App => {
-                stores.app.all()
-                    .into_iter()
-                    .map(|(k, v)| {
-                        let serialized = serde_json::to_vec(&v)
-                            .unwrap_or_else(|e| {
-                                log::error!("Failed to serialize app state: {}", e);
-                                vec![]
-                            });
-                        (k, serialized)
-                    })
-                    .collect()
-            }
-            LocalStoreType::Worker => {
-                stores.worker.all()
-                    .into_iter()
-                    .map(|(k, v)| {
-                        let serialized = serde_json::to_vec(&v)
-                            .unwrap_or_else(|e| {
-                                log::error!("Failed to serialize worker state: {}", e);
-                                vec![]
-                            });
-                        (k, serialized)
-                    })
-                    .collect()
-            }
-            LocalStoreType::Policy => {
-                stores.policy.all()
-                    .into_iter()
-                    .map(|(k, v)| {
-                        let serialized = serde_json::to_vec(&v)
-                            .unwrap_or_else(|e| {
-                                log::error!("Failed to serialize policy state: {}", e);
-                                vec![]
-                            });
-                        (k, serialized)
-                    })
-                    .collect()
-            }
+            LocalStoreType::Membership => stores
+                .membership
+                .all()
+                .into_iter()
+                .map(|(k, v)| {
+                    let serialized = serde_json::to_vec(&v).unwrap_or_else(|e| {
+                        log::error!("Failed to serialize membership state: {}", e);
+                        vec![]
+                    });
+                    (k, serialized)
+                })
+                .collect(),
+            LocalStoreType::App => stores
+                .app
+                .all()
+                .into_iter()
+                .map(|(k, v)| {
+                    let serialized = serde_json::to_vec(&v).unwrap_or_else(|e| {
+                        log::error!("Failed to serialize app state: {}", e);
+                        vec![]
+                    });
+                    (k, serialized)
+                })
+                .collect(),
+            LocalStoreType::Worker => stores
+                .worker
+                .all()
+                .into_iter()
+                .map(|(k, v)| {
+                    let serialized = serde_json::to_vec(&v).unwrap_or_else(|e| {
+                        log::error!("Failed to serialize worker state: {}", e);
+                        vec![]
+                    });
+                    (k, serialized)
+                })
+                .collect(),
+            LocalStoreType::Policy => stores
+                .policy
+                .all()
+                .into_iter()
+                .map(|(k, v)| {
+                    let serialized = serde_json::to_vec(&v).unwrap_or_else(|e| {
+                        log::error!("Failed to serialize policy state: {}", e);
+                        vec![]
+                    });
+                    (k, serialized)
+                })
+                .collect(),
         };
 
         if entries.is_empty() {
@@ -129,12 +128,22 @@ impl GossipService {
                 .map(|(key, value)| {
                     // Get actual version from CRDT metadata
                     let version = match store_type {
-                        LocalStoreType::Membership => stores.membership.get_metadata(key).map(|(v, _)| v).unwrap_or(1),
-                        LocalStoreType::App => stores.app.get_metadata(key).map(|(v, _)| v).unwrap_or(1),
-                        LocalStoreType::Worker => stores.worker.get_metadata(key).map(|(v, _)| v).unwrap_or(1),
-                        LocalStoreType::Policy => stores.policy.get_metadata(key).map(|(v, _)| v).unwrap_or(1),
+                        LocalStoreType::Membership => stores
+                            .membership
+                            .get_metadata(key)
+                            .map(|(v, _)| v)
+                            .unwrap_or(1),
+                        LocalStoreType::App => {
+                            stores.app.get_metadata(key).map(|(v, _)| v).unwrap_or(1)
+                        }
+                        LocalStoreType::Worker => {
+                            stores.worker.get_metadata(key).map(|(v, _)| v).unwrap_or(1)
+                        }
+                        LocalStoreType::Policy => {
+                            stores.policy.get_metadata(key).map(|(v, _)| v).unwrap_or(1)
+                        }
                     };
-                    
+
                     StateUpdate {
                         key: key.as_str().to_string(),
                         value: value.clone(),
@@ -166,7 +175,11 @@ impl GossipService {
             });
         }
 
-        log::info!("Generated {} snapshot chunks for store {:?}", chunks.len(), store_type);
+        log::info!(
+            "Generated {} snapshot chunks for store {:?}",
+            chunks.len(),
+            store_type
+        );
         chunks
     }
 }
@@ -301,13 +314,13 @@ impl Gossip for GossipService {
             tokio::spawn(async move {
                 let mut interval = tokio::time::interval(Duration::from_secs(5)); // Send every 5 seconds
                 let mut sequence_counter: u64 = 0;
-                
+
                 loop {
                     interval.tick().await;
-                    
+
                     // Collect all incremental updates
                     let all_updates = collector.collect_all_updates();
-                    
+
                     if !all_updates.is_empty() {
                         for (store_type, updates) in all_updates {
                             let proto_store_type = match store_type {
@@ -316,10 +329,10 @@ impl Gossip for GossipService {
                                 LocalStoreType::Worker => gossip::StoreType::Worker as i32,
                                 LocalStoreType::Policy => gossip::StoreType::Policy as i32,
                             };
-                            
+
                             sequence_counter += 1;
                             let batch_size: usize = updates.iter().map(|u| u.value.len()).sum();
-                            
+
                             let incremental_update = StreamMessage {
                                 message_type: StreamMessageType::IncrementalUpdate as i32,
                                 payload: Some(gossip::stream_message::Payload::Incremental(
@@ -332,19 +345,23 @@ impl Gossip for GossipService {
                                 sequence: sequence_counter,
                                 peer_id: self_name_incremental.clone(),
                             };
-                            
+
                             // Record metrics
                             record_batch_sent(&self_name_incremental, batch_size);
-                            
+
                             // Mark as sent after successful transmission
                             collector.mark_sent(store_type, &updates);
-                            
+
                             if tx_incremental.send(Ok(incremental_update)).await.is_err() {
                                 log::warn!("Failed to send incremental update, stream closed");
                                 break;
                             }
-                            
-                            log::debug!("Sent incremental update: store={:?}, {} updates", store_type, updates.len());
+
+                            log::debug!(
+                                "Sent incremental update: store={:?}, {} updates",
+                                store_type,
+                                updates.len()
+                            );
                         }
                     }
                 }
@@ -354,38 +371,47 @@ impl Gossip for GossipService {
         // Spawn task to handle incoming messages
         let mut sequence: u64 = 0;
         let _convergence_tracker = ConvergenceTracker::new();
-        
+
         // Track snapshot reception state: (store_type, total_chunks) -> received_chunks
         use std::collections::HashMap;
         let mut snapshot_state: HashMap<(LocalStoreType, u64), Vec<SnapshotChunk>> = HashMap::new();
-        
+
         tokio::spawn(async move {
             let mut peer_id = String::new();
             update_peer_connections(&peer_id, true);
-            
+
             // Check if we need to request snapshots on connection
             // This happens when:
             // 1. We're a new node joining (stores are empty or very small)
             // 2. We detect a version gap
             if let Some(ref stores) = stores {
-                for store_type in [LocalStoreType::Membership, LocalStoreType::App, LocalStoreType::Worker, LocalStoreType::Policy] {
+                for store_type in [
+                    LocalStoreType::Membership,
+                    LocalStoreType::App,
+                    LocalStoreType::Worker,
+                    LocalStoreType::Policy,
+                ] {
                     let store_len = match store_type {
                         LocalStoreType::Membership => stores.membership.len(),
                         LocalStoreType::App => stores.app.len(),
                         LocalStoreType::Worker => stores.worker.len(),
                         LocalStoreType::Policy => stores.policy.len(),
                     };
-                    
+
                     // If store is empty or very small, request snapshot
                     if store_len == 0 {
-                        log::info!("Store {:?} is empty, requesting snapshot from {}", store_type, peer_id);
+                        log::info!(
+                            "Store {:?} is empty, requesting snapshot from {}",
+                            store_type,
+                            peer_id
+                        );
                         let proto_store_type = match store_type {
                             LocalStoreType::Membership => gossip::StoreType::Membership as i32,
                             LocalStoreType::App => gossip::StoreType::App as i32,
                             LocalStoreType::Worker => gossip::StoreType::Worker as i32,
                             LocalStoreType::Policy => gossip::StoreType::Policy as i32,
                         };
-                        
+
                         let snapshot_request = StreamMessage {
                             message_type: StreamMessageType::SnapshotRequest as i32,
                             payload: Some(gossip::stream_message::Payload::SnapshotRequest(
@@ -397,14 +423,14 @@ impl Gossip for GossipService {
                             sequence: 0,
                             peer_id: self_name.clone(),
                         };
-                        
+
                         if tx.send(Ok(snapshot_request)).await.is_err() {
                             log::warn!("Failed to send snapshot request");
                         }
                     }
                 }
             }
-            
+
             while let Some(msg_result) = incoming.next().await {
                 match msg_result {
                     Ok(msg) => {
@@ -434,7 +460,8 @@ impl Gossip for GossipService {
                                                         &state_update.value
                                                     ) {
                                                         // Extract actor from StateUpdate
-                                                        let actor = Some(state_update.actor.clone());
+                                                        let actor =
+                                                            Some(state_update.actor.clone());
                                                         sync_manager.apply_remote_worker_state(
                                                             worker_state,
                                                             actor,
@@ -449,7 +476,8 @@ impl Gossip for GossipService {
                                                         &state_update.value
                                                     ) {
                                                         // Extract actor from StateUpdate
-                                                        let actor = Some(state_update.actor.clone());
+                                                        let actor =
+                                                            Some(state_update.actor.clone());
                                                         sync_manager.apply_remote_policy_state(
                                                             policy_state,
                                                             actor,
@@ -499,7 +527,8 @@ impl Gossip for GossipService {
                                         stores: stores.clone(),
                                         sync_manager: sync_manager.clone(),
                                     };
-                                    let chunks = service.create_snapshot_chunks(store_type, 100).await; // chunk_size = 100 entries
+                                    let chunks =
+                                        service.create_snapshot_chunks(store_type, 100).await; // chunk_size = 100 entries
                                     let total_chunks = chunks.len() as u64;
                                     let mut total_bytes = 0;
 
@@ -591,7 +620,8 @@ impl Gossip for GossipService {
 
                                     // Store chunk for later application
                                     let chunk_key = (store_type, chunk.total_chunks);
-                                    snapshot_state.entry(chunk_key)
+                                    snapshot_state
+                                        .entry(chunk_key)
                                         .or_insert_with(Vec::new)
                                         .push(chunk.clone());
 
@@ -601,17 +631,17 @@ impl Gossip for GossipService {
                                             // All chunks received, apply snapshot
                                             log::info!("All {} chunks received for store {:?}, applying snapshot", 
                                                 chunk.total_chunks, store_type);
-                                            
+
                                             if let Some(ref stores) = stores {
                                                 // Sort chunks by index
                                                 let mut sorted_chunks = received_chunks.clone();
                                                 sorted_chunks.sort_by_key(|c| c.chunk_index);
-                                                
+
                                                 // Apply all entries from chunks
                                                 for chunk in &sorted_chunks {
                                                     for entry in &chunk.entries {
                                                         let key = SKey::new(entry.key.clone());
-                                                        
+
                                                         match store_type {
                                                             LocalStoreType::Membership => {
                                                                 if let Ok(membership_state) = serde_json::from_slice::<super::stores::MembershipState>(&entry.value) {
@@ -644,14 +674,17 @@ impl Gossip for GossipService {
                                                         }
                                                     }
                                                 }
-                                                
+
                                                 // Clear snapshot state
                                                 snapshot_state.remove(&chunk_key);
-                                                log::info!("Snapshot applied successfully for store {:?}", store_type);
+                                                log::info!(
+                                                    "Snapshot applied successfully for store {:?}",
+                                                    store_type
+                                                );
                                             }
                                         }
                                     }
-                                    
+
                                     let ack = StreamMessage {
                                         message_type: StreamMessageType::Ack as i32,
                                         payload: Some(gossip::stream_message::Payload::Ack(
