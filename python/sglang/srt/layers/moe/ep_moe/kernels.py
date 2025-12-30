@@ -1243,6 +1243,28 @@ def compute_problem_sizes_w4a8(
     )
     return problem_sizes1, problem_sizes2
 
+def get_cutlass_w4a8_moe_mm_data_triton_kernel(
+    topk_ids,
+    expert_offsets,
+    problem_sizes1,
+    problem_sizes2,
+    num_experts,
+    n,
+    k,
+):
+    ids = topk_ids.view(-1).to(torch.int64)
+    valid = (ids >= 0) & (ids < num_experts)
+    counts = torch.bincount(ids[valid], minlength=num_experts).to(torch.int32)
+    problem_sizes1, problem_sizes2 = compute_problem_sizes_w4a8(
+        counts, problem_sizes1, problem_sizes2, n, k, num_experts
+    )
+    expert_offsets.zero_()
+    expert_offsets[1:].copy_(torch.cumsum(counts, dim=0))
+    return (
+        problem_sizes1.to(torch.int32),
+        problem_sizes2.to(torch.int32),
+        expert_offsets.to(torch.int32),
+    )
 
 def deepep_ll_get_cutlass_w4a8_moe_mm_data(
     masked_m,

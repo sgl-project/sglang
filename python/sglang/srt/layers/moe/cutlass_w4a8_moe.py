@@ -10,9 +10,12 @@ from sgl_kernel import (
     silu_and_mul,
 )
 
+from sglang.srt.utils import get_bool_env_var
+
 from sglang.srt.distributed import get_moe_expert_parallel_world_size
 from sglang.srt.layers.moe.ep_moe.kernels import (
     cutlass_w4_run_moe_ep_preproess,
+    get_cutlass_w4a8_moe_mm_data_triton_kernel,
     deepep_ll_get_cutlass_w4a8_moe_mm_data,
     deepep_permute_triton_kernel,
     deepep_post_reorder_triton_kernel,
@@ -139,19 +142,32 @@ def cutlass_w4a8_moe(
     # NOTE: a_map and c_map are not used in the get_cutlass_w4a8_moe_mm_data kernel,
     # they are kept to allow for a quick switch of the permutation logic
     # from the current triton kernel implementation to the cutlass-based one if needed.
-    a_map = torch.empty((topk_ids.numel()), dtype=torch.int32, device=device)
-    c_map = torch.empty((topk_ids.numel()), dtype=torch.int32, device=device)
-    get_cutlass_w4a8_moe_mm_data(
-        topk_ids,
-        expert_offsets,
-        problem_sizes1,
-        problem_sizes2,
-        a_map,
-        c_map,
-        num_local_experts,
-        n,
-        k,
-    )
+    if not get_bool_env_var("SGLANG_USE_TRITON_PREP_NORMAL"):
+        a_map = torch.empty((topk_ids.numel()), dtype=torch.int32, device=device)
+        c_map = torch.empty((topk_ids.numel()), dtype=torch.int32, device=device)
+        get_cutlass_w4a8_moe_mm_data(
+            topk_ids,
+            expert_offsets,
+            problem_sizes1,
+            problem_sizes2,
+            a_map,
+            c_map,
+            num_local_experts,
+            n,
+            k,
+        )
+    else:
+        # use triton kernel to get problem sizes and expert offsets
+        assert get_bool_env_var("SGLANG_USE_TRITON_PREP_NORMAL"), "SGLANG_USE_TRITON_PREP_NORMAL is not set"
+        problem_sizes1, problem_sizes2, expert_offsets = get_cutlass_w4a8_moe_mm_data_triton_kernel(
+            topk_ids,
+            expert_offsets,
+            problem_sizes1,
+            problem_sizes2,
+            num_local_experts,
+            n,
+            k,
+        )
 
     c1 = torch.empty((m * topk, n * 2), device=device, dtype=torch.bfloat16)
     c2 = torch.empty((m * topk, k), device=device, dtype=torch.bfloat16)
