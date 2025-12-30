@@ -89,6 +89,11 @@ class SamplingParams:
     # Image inputs
     image_path: str | list[str] | None = None
 
+    # Video inputs
+    pose_video_path: str | None = None
+    face_video_path: str | None = None
+    video_path: str | None = None
+
     # Text inputs
     prompt: str | list[str] | None = None
     negative_prompt: str = (
@@ -561,6 +566,24 @@ class SamplingParams:
                 "values, e.g.: "
                 '--image-path "img1.png" "img2.png"'
             ),
+        )
+        parser.add_argument(
+            "--video-path",
+            type=str,
+            default=SamplingParams.video_path,
+            help="Path to input video for wan animate generation",
+        )
+        parser.add_argument(
+            "--pose-video-path",
+            type=str,
+            default=SamplingParams.pose_video_path,
+            help="Path to input pose video for wan animate generation",
+        )
+        parser.add_argument(
+            "--face-video-path",
+            type=str,
+            default=SamplingParams.face_video_path,
+            help="Path to input face video for wan animate generation",
         )
         parser.add_argument(
             "--moba-config-path",

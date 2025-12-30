@@ -37,6 +37,15 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.text_encoding import (
 from sglang.multimodal_gen.runtime.pipelines_core.stages.timestep_preparation import (
     TimestepPreparationStage,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stages.wan_animate_conditioning import (
+    WanAnimateConditioningStage,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.wan_animate_segment_loop import (
+    SegmentLoopStage,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.wan_video_processing import (
+    VideoProcessingStage,
+)
 
 __all__ = [
     "PipelineStage",
@@ -52,4 +61,7 @@ __all__ = [
     "ImageEncodingStage",
     "ImageVAEEncodingStage",
     "TextEncodingStage",
+    "VideoProcessingStage",
+    "SegmentLoopStage",
+    "WanAnimateConditioningStage",
 ]

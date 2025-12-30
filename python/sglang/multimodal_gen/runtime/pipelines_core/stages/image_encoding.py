@@ -15,6 +15,7 @@ from diffusers.models.modeling_outputs import AutoencoderKLOutput
 from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
     qwen_image_postprocess_text,
 )
+from sglang.multimodal_gen.configs.pipeline_configs.wan import Wan2_2_Animate_14B_Config
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.models.vaes.common import ParallelTiledVAE
@@ -226,6 +227,13 @@ class ImageVAEEncodingStage(PipelineStage):
 
         self.load_model()
         num_frames = batch.num_frames
+        num_frames_bak = num_frames
+        animate_flag = isinstance(
+            server_args.pipeline_config, Wan2_2_Animate_14B_Config
+        )
+        if animate_flag:
+            num_frames = 1
+            batch.num_frames = 1
 
         images = (
             batch.vae_image if batch.vae_image is not None else batch.condition_image
@@ -317,11 +325,13 @@ class ImageVAEEncodingStage(PipelineStage):
 
             latent_condition -= shift_factor
             latent_condition = latent_condition * scaling_factor
-
             image_latent = server_args.pipeline_config.postprocess_image_latent(
                 latent_condition, batch
             )
             all_image_latents.append(image_latent)
+
+        if animate_flag:
+            batch.num_frames = num_frames_bak
 
         batch.image_latent = torch.cat(all_image_latents, dim=1)
 

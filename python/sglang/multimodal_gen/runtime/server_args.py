@@ -186,6 +186,9 @@ class ServerArgs:
 
     # VAE parameters
     vae_path: str | None = None  # Custom VAE path (e.g., for distilled autoencoder)
+    # Wan Animate preprocessing paths
+    preprocess_model_path: str | None = None
+
     # can restrict layers to adapt, e.g. ["q_proj"]
     # Will adapt only q, k, v, o by default.
     lora_target_modules: list[str] | None = None
@@ -330,6 +333,27 @@ class ServerArgs:
             default=ServerArgs.vae_path,
             help="Custom path to VAE model (e.g., for distilled autoencoder). If not specified, VAE will be loaded from the main model path.",
         )
+        parser.add_argument(
+            "--preprocess-model-path",
+            type=str,
+            default=ServerArgs.preprocess_model_path,
+            help=(
+                "Base directory for Wan animate preprocess models. Used to auto-resolve "
+                "det/pose2d model paths at server startup."
+            ),
+        )
+        # parser.add_argument(
+        #     "--det-model-path",
+        #     type=str,
+        #     default=ServerArgs.det_model_path,
+        #     help="Path to Wan animate detection model.",
+        # )
+        # parser.add_argument(
+        #     "--pose2d-model-path",
+        #     type=str,
+        #     default=ServerArgs.pose2d_model_path,
+        #     help="Path to Wan animate 2D pose model.",
+        # )
 
         # attention
         parser.add_argument(

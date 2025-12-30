@@ -16,6 +16,7 @@ class WanVideoArchConfig(DiTArchConfig):
 
     param_names_mapping: dict = field(
         default_factory=lambda: {
+            r"^pose_patch_embedding\.(.*)$": r"pose_patch_embedding.proj.\1",
             r"^patch_embedding\.(.*)$": r"patch_embedding.proj.\1",
             r"^condition_embedder\.text_embedder\.linear_1\.(.*)$": r"condition_embedder.text_embedder.fc_in.\1",
             r"^condition_embedder\.text_embedder\.linear_2\.(.*)$": r"condition_embedder.text_embedder.fc_out.\1",

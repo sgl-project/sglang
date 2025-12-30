@@ -273,6 +273,15 @@ class Wan2_2_I2V_A14B_SamplingParam(Wan2_2_Base_SamplingParams):
     )
 
 
+@dataclass
+class Wan2_2_Animate_14B_SamplingParam(Wan2_2_Base_SamplingParams):
+    guidance_scale: float = 1.0
+    num_inference_steps: int = 20
+    fps: int = 24
+    retarget_flag: bool = False
+    use_flux: bool = False
+
+
 # =============================================
 # ============= Causal Self-Forcing =============
 # =============================================

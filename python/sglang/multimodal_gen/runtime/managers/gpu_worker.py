@@ -135,14 +135,9 @@ class GPUWorker:
                 f"Error executing request {req.request_id}: {e}", exc_info=True
             )
             if output_batch is None:
-                from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import (
-                    OutputBatch,
-                )
+                pass
 
-                output_batch = OutputBatch()
-            output_batch.error = f"Error executing request {req.request_id}: {e}"
-        finally:
-            return output_batch
+        return output_batch
 
     def get_can_stay_resident_components(
         self, remaining_gpu_mem_gb: float

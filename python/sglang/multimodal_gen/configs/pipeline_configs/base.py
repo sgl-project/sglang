@@ -269,11 +269,21 @@ class PipelineConfig:
         image_latents = torch.concat([mask_lat_size, latent_condition], dim=1)
         return image_latents
 
+    def postprocess_decoded_frames(self, batch, frames):
+        return frames, None
+
     def slice_noise_pred(self, noise, latents):
         return noise
 
     def adjust_num_frames(self, num_frames):
         return num_frames
+
+    def get_latent_video_length(self, num_frames: int) -> int:
+        return num_frames
+
+    # for wan animate ref image latent(1 frame)
+    def get_latent_extra_frames(self) -> int:
+        return 0
 
     # tokenize the prompt
     def tokenize_prompt(self, prompt: list[str], tokenizer, tok_kwargs) -> dict:

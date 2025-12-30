@@ -201,6 +201,48 @@ class Wan2_2_I2V_A14B_Config(WanI2V480PConfig):
         self.dit_config.boundary_ratio = self.boundary_ratio
 
 
+class Wan2_2_Animate_14B_Config(WanI2V480PConfig):
+    flow_shift: float | None = 5.0
+    boundary_ratio: float | None = 0.900
+    refert_num: int = 1
+    clip_len: int = 77
+
+    def get_latent_video_length(self, num_frames: int) -> int:
+        return self.clip_len
+
+    def get_latent_extra_frames(self) -> int:
+        return 1
+
+    def post_denoising_loop(self, latents, batch):
+        return latents[:, :, self.refert_num :]
+
+    def postprocess_decoded_frames(self, batch, frames):
+        print("Decoding stage: handling WanAnimate segment stitching.")
+        if batch.extra.get("all_frames") is None:
+            batch.extra["all_frames"] = frames
+        else:
+            batch.extra["all_frames"] = torch.cat(
+                (
+                    batch.extra.get("all_frames"),
+                    frames[:, :, self.refert_num :],
+                ),
+                dim=2,
+            )
+
+        if batch.extra.get("cur_segment") != batch.extra.get("num_segments") - 1:
+            batch.extra["cur_segment"] = batch.extra.get("cur_segment") + 1
+            batch.timesteps = None
+            batch.latents = None
+            return frames, batch
+
+        frames = batch.extra.get("all_frames")
+        frames = frames[:, :, : batch.extra["real_frame_len"]]
+        return frames, None
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+
+
 # =============================================
 # ============= Causal Self-Forcing =============
 # =============================================

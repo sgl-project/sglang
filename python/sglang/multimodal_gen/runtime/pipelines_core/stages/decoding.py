@@ -239,6 +239,15 @@ class DecodingStage(PipelineStage):
         else:
             trajectory_decoded = None
 
+        frames, early_batch = server_args.pipeline_config.postprocess_decoded_frames(
+            batch, frames
+        )
+        if early_batch is not None:
+            return early_batch
+
+        # Convert to CPU float32 for compatibility
+        frames = frames.cpu().float()
+
         # Update batch with decoded image
         output_batch = OutputBatch(
             output=frames,

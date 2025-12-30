@@ -21,6 +21,7 @@ from tqdm.auto import tqdm
 from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType, STA_Mode
 from sglang.multimodal_gen.configs.pipeline_configs.wan import (
+    Wan2_2_Animate_14B_Config,
     Wan2_2_TI2V_5B_Config,
     WanI2V480PConfig,
 )
@@ -604,6 +605,8 @@ class DenoisingStage(PipelineStage):
             {
                 "encoder_hidden_states_2": batch.clip_embedding_pos,
                 "encoder_attention_mask": batch.prompt_attention_mask,
+                "pose_hidden_states": batch.extra["pose_hidden_states"],
+                "face_pixel_values": batch.extra["face_pixel_values"],
             }
             | server_args.pipeline_config.prepare_pos_cond_kwargs(
                 batch,
@@ -994,8 +997,20 @@ class DenoisingStage(PipelineStage):
                                 not server_args.pipeline_config.task_type
                                 == ModelTaskType.TI2V
                             ), "image latents should not be provided for TI2V task"
+
+                            if isinstance(
+                                server_args.pipeline_config, Wan2_2_Animate_14B_Config
+                            ):
+                                prev_segment_latent = batch.extra.get(
+                                    "prev_segment_cond_latents"
+                                )
+                                cond_latent = torch.cat(
+                                    [batch.image_latent, prev_segment_latent], dim=2
+                                ).to(target_dtype)
+                            else:
+                                cond_latent = batch.image_latent
                             latent_model_input = torch.cat(
-                                [latent_model_input, batch.image_latent], dim=1
+                                [latent_model_input, cond_latent], dim=1
                             ).to(target_dtype)
 
                         timestep = self.expand_timestep_before_forward(

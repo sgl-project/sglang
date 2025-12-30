@@ -105,6 +105,7 @@ class LatentPreparationStage(PipelineStage):
         # Update batch with prepared latents
         batch.latents = latents
         batch.raw_latent_shape = latents.shape
+
         return batch
 
     def adjust_video_length(self, batch: Req, server_args: ServerArgs) -> int:
@@ -119,16 +120,20 @@ class LatentPreparationStage(PipelineStage):
             The batch with adjusted video length.
         """
 
-        video_length = batch.num_frames
+        pipeline_cfg = server_args.pipeline_config
+        video_length = pipeline_cfg.get_latent_video_length(batch.num_frames)
         use_temporal_scaling_frames = (
-            server_args.pipeline_config.vae_config.use_temporal_scaling_frames
+            pipeline_cfg.vae_config.use_temporal_scaling_frames
         )
         if use_temporal_scaling_frames:
             temporal_scale_factor = (
-                server_args.pipeline_config.vae_config.arch_config.temporal_compression_ratio
+                pipeline_cfg.vae_config.arch_config.temporal_compression_ratio
             )
             latent_num_frames = (video_length - 1) // temporal_scale_factor + 1
-        return int(latent_num_frames)
+        else:
+            latent_num_frames = video_length
+
+        return int(latent_num_frames) + pipeline_cfg.get_latent_extra_frames()
 
     def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
         """Verify latent preparation stage inputs."""

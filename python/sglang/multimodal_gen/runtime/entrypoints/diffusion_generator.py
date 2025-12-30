@@ -211,6 +211,16 @@ class DiffGenerator:
 
         # 2. send requests to scheduler, one at a time
         # TODO: send batch when supported
+        # import debugpy
+        # print("正在启动 Debugger 监听，端口 5678...")
+        # debugpy.listen(("0.0.0.0", 5678))
+
+        # # 2. (可选) 暂停程序，直到 VS Code 连接上来
+        # # 如果你想调试程序启动阶段的逻辑，这行是必须的
+        # print("等待 VS Code 调试器连接...")
+        # debugpy.wait_for_client()
+
+        # print("调试器已连接，程序继续运行！")
         for request_idx, req in enumerate(requests):
             try:
                 with log_generation_timer(

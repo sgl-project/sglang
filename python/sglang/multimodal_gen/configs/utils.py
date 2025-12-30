@@ -1,6 +1,7 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
 import argparse
+import os
 from typing import Any
 
 
@@ -59,3 +60,78 @@ def clean_cli_args(args: argparse.Namespace) -> dict[str, Any]:
             provided_args[k] = v
 
     return provided_args
+
+
+def _list_onnx_files(dir_path: str) -> list[str]:
+    try:
+        entries = os.listdir(dir_path)
+    except OSError:
+        return []
+    return [
+        os.path.join(dir_path, name)
+        for name in entries
+        if name.endswith(".onnx") and os.path.isfile(os.path.join(dir_path, name))
+    ]
+
+
+def _list_end2end_onnx_files(dir_path: str) -> list[str]:
+    try:
+        entries = os.listdir(dir_path)
+    except OSError:
+        return []
+    return [
+        os.path.join(dir_path, name)
+        for name in entries
+        if name == "end2end.onnx" and os.path.isfile(os.path.join(dir_path, name))
+    ]
+
+
+def _list_onnx_files_recursive(base_dir: str) -> list[str]:
+    matches = []
+    for root, _, files in os.walk(base_dir):
+        for name in files:
+            if name.endswith(".onnx"):
+                matches.append(os.path.join(root, name))
+    return matches
+
+
+def _list_end2end_onnx_files_recursive(base_dir: str) -> list[str]:
+    matches = []
+    for root, _, files in os.walk(base_dir):
+        for name in files:
+            if name == "end2end.onnx":
+                matches.append(os.path.join(root, name))
+    return matches
+
+
+def resolve_wan_preprocess_model_paths(
+    preprocess_model_path: str,
+) -> tuple[str | None, str | None]:
+    if not preprocess_model_path:
+        return None, None
+
+    base_dir = preprocess_model_path
+    if os.path.isdir(os.path.join(base_dir, "process_checkpoint")):
+        base_dir = os.path.join(base_dir, "process_checkpoint")
+
+    det_candidates = []
+    for subdir in ("det", "detector", "detection"):
+        det_candidates.extend(_list_onnx_files(os.path.join(base_dir, subdir)))
+    pose_candidates = []
+    for subdir in ("pose2d", "pose", "pose_2d"):
+        pose_dir = os.path.join(base_dir, subdir)
+        pose_candidates.extend(_list_end2end_onnx_files(pose_dir))
+        if not pose_candidates and os.path.isdir(pose_dir):
+            pose_candidates.extend(_list_end2end_onnx_files_recursive(pose_dir))
+
+    if not det_candidates or not pose_candidates:
+        all_candidates = _list_onnx_files_recursive(base_dir)
+        all_pose_candidates = _list_end2end_onnx_files_recursive(base_dir)
+        if not det_candidates:
+            det_candidates = all_candidates
+        if not pose_candidates:
+            pose_candidates = all_pose_candidates
+
+    det_path = det_candidates[0] if det_candidates else None
+    pose_path = pose_candidates[0] if pose_candidates else None
+    return det_path, pose_path
