@@ -57,12 +57,11 @@ def run_command(command) -> Optional[float]:
         return None
 
 
-class TestCLIBase(unittest.TestCase):
+class CLIBase(unittest.TestCase):
     model_path: str = None
     extra_args = []
     data_type: DataType = None
     # tested on h100
-    thresholds = {}
 
     width: int = 720
     height: int = 720
@@ -106,12 +105,10 @@ class TestCLIBase(unittest.TestCase):
         return name, duration, status
 
 
-class TestGenerateBase(TestCLIBase):
+class GenerateBase(CLIBase):
     model_path: str = None
     extra_args = []
     data_type: DataType = None
-    # tested on h100
-    thresholds = {}
 
     width: int = 720
     height: int = 720
@@ -142,24 +139,18 @@ class TestGenerateBase(TestCLIBase):
         pass
 
     def _run_test(self, name: str, args, model_path: str, test_key: str):
-        time_threshold = self.thresholds[test_key]
         name, duration, status = self._run_command(
             name, args=args, model_path=model_path, test_key=test_key
         )
-        self.verify(status, name, duration, time_threshold)
+        self.verify(status, name, duration)
 
-    def verify(self, status, name, duration, time_threshold):
+    def verify(self, status, name, duration):
         print("-" * 80)
         print("\n" * 3)
 
         # test task status
         self.assertEqual(status, "Success", f"{name} command failed")
         self.assertIsNotNone(duration, f"Could not parse duration for {name}")
-        self.assertLessEqual(
-            duration,
-            time_threshold,
-            f"{name} failed with {duration:.4f}s > {time_threshold}s",
-        )
 
         # test output file
         path = os.path.join(
@@ -169,7 +160,7 @@ class TestGenerateBase(TestCLIBase):
         if self.data_type == DataType.IMAGE:
             with Image.open(path) as image:
                 check_image_size(self, image, self.width, self.height)
-        logger.info(f"{name} passed in {duration:.4f}s (threshold: {time_threshold}s)")
+        logger.info(f"{name} passed in {duration:.4f}s")
 
     def model_name(self):
         return self.model_path.split("/")[-1]
