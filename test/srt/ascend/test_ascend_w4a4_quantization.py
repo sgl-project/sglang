@@ -9,6 +9,8 @@ import unittest
 from types import SimpleNamespace
 from urllib.parse import urlparse
 
+import requests
+
 from sglang.srt.utils import kill_process_tree
 from sglang.test.few_shot_gsm8k import run_eval
 from sglang.test.test_utils import (
@@ -75,6 +77,20 @@ class TestAscendW4A4(CustomTestCase):
 
         self.assertGreaterEqual(metrics["accuracy"], 0.80)
         self.assertGreaterEqual(metrics["output_throughput"], 1000)
+
+    def run_decode(self, max_new_tokens):
+        response = requests.post(
+            self.base_url + "/generate",
+            json={
+                "text": "The capital of France is",
+                "sampling_params": {
+                    "temperature": 0,
+                    "max_new_tokens": max_new_tokens,
+                },
+                "ignore_eos": True,
+            },
+        )
+        return response.json()
 
     def test_throughput(self):
         max_tokens = 256
