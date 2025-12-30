@@ -148,6 +148,17 @@ class LayerwiseOffloadManager:
                     torch.empty(max_size, dtype=dtype, device=self.device)
                 )
 
+        # Calculate and log the total size of the GPU buffer pool
+        total_bytes = sum(
+            buf.numel() * buf.element_size()
+            for buffers in self._gpu_buffer_pool.values()
+            for buf in buffers
+        )
+        logger.info(
+            f"LayerwiseOffloadManager: GPU buffer pool allocated. "
+            f"Total size: {total_bytes / 1024**2:.2f} MB"
+        )
+
         # prefetch the first layer as warm-up
         self.prepare_for_next_denoise(non_blocking=False)
 
