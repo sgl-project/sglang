@@ -158,7 +158,6 @@ def cutlass_w4a8_moe(
         )
     else:
         # use triton kernel to get problem sizes and expert offsets
-        assert get_bool_env_var("SGLANG_USE_TRITON_PREP_NORMAL"), "SGLANG_USE_TRITON_PREP_NORMAL is not set"
         problem_sizes1, problem_sizes2, expert_offsets = get_cutlass_w4a8_moe_mm_data_triton_kernel(
             topk_ids,
             expert_offsets,
