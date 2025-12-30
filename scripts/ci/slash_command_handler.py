@@ -214,15 +214,26 @@ def handle_rerun_stage(
             print(f"Error: {workflow_name} workflow not found")
             return False
 
-        # Trigger workflow_dispatch on the PR's head branch
-        ref = pr.head.ref
-        print(f"Triggering {workflow_name} workflow on branch: {ref}")
+        # Always dispatch on main branch and pass PR head SHA as input.
+        # This works for both fork and non-fork PRs because:
+        # - workflow_dispatch requires ref to be a branch/tag in the target repo
+        # - fork branch names don't exist in the main repo (causing 422 errors)
+        # - the workflow will checkout the specific SHA from pr_head_sha input
+        ref = "main"
+        pr_head_sha = pr.head.sha
+        print(
+            f"Triggering {workflow_name} workflow on ref: {ref}, PR head SHA: {pr_head_sha}"
+        )
 
         # AMD workflow doesn't have version input, only target_stage
         if is_amd_stage:
-            inputs = {"target_stage": stage_name}
+            inputs = {"target_stage": stage_name, "pr_head_sha": pr_head_sha}
         else:
-            inputs = {"version": "release", "target_stage": stage_name}
+            inputs = {
+                "version": "release",
+                "target_stage": stage_name,
+                "pr_head_sha": pr_head_sha,
+            }
 
         # Use requests directly as PyGithub's create_dispatch only accepts HTTP 204
         dispatch_url = f"https://api.github.com/repos/{gh_repo.full_name}/actions/workflows/{target_workflow.id}/dispatches"
