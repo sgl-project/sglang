@@ -56,11 +56,25 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Determine run mode
+        id: run-mode
+        run: |
+          # Run all tests for scheduled runs and workflow_call (e.g., release branch testing)
+          if [[ "${{ github.event_name }}" == "schedule" || "${{ github.event_name }}" == "workflow_call" ]]; then
+            echo "run_all_tests=true" >> $GITHUB_OUTPUT
+            echo "Run mode: ALL TESTS (triggered by ${{ github.event_name }})"
+          else
+            echo "run_all_tests=false" >> $GITHUB_OUTPUT
+            echo "Run mode: FILTERED (triggered by ${{ github.event_name }})"
+          fi
 
       - name: Detect file changes
         id: filter
         uses: dorny/paths-filter@v3
-        if: github.event_name != 'schedule'
+        if: steps.run-mode.outputs.run_all_tests != 'true'
         with:
           filters: |
             main_package:
@@ -81,9 +95,9 @@ jobs:
               - "python/*.toml"
               - ".github/workflows/pr-test.yml"
 
-      - name: Set all changes to true for scheduled runs
+      - name: Set all changes to true for full test runs
         id: scheduled
-        if: github.event_name == 'schedule'
+        if: steps.run-mode.outputs.run_all_tests == 'true'
         run: |
           echo "main_package=true" >> $GITHUB_OUTPUT
           echo "sgl_kernel=false" >> $GITHUB_OUTPUT
@@ -117,15 +131,15 @@ jobs:
           echo "enable_retry=true" >> $GITHUB_OUTPUT
           echo "Retry logic enabled for CI"
 
-      - name: Set continue-on-error for scheduled runs
+      - name: Set continue-on-error for full test runs
         id: set-continue-on-error
         run: |
-          if [[ "${{ github.event_name }}" == "schedule" || "${{ inputs.force_continue_on_error }}" == "true" ]]; then
+          if [[ "${{ steps.run-mode.outputs.run_all_tests }}" == "true" || "${{ inputs.force_continue_on_error }}" == "true" ]]; then
             echo "continue_on_error=true" >> $GITHUB_OUTPUT
-            echo "Scheduled run or force flag detected, enabling continue-on-error to run all tests"
+            echo "Full test run or force flag detected, enabling continue-on-error to run all tests"
           else
             echo "continue_on_error=false" >> $GITHUB_OUTPUT
-            echo "Non-scheduled run, continue-on-error disabled"
+            echo "Filtered run, continue-on-error disabled"
           fi
 
       - name: Show filter results in summary (table)
@@ -816,6 +830,8 @@ jobs:
       steps:
         - name: Checkout code
           uses: actions/checkout@v4
+          with:
+            ref: ${{ inputs.ref || github.ref }}
 
         - name: Download artifacts
           if: needs.check-changes.outputs.sgl_kernel == 'true'

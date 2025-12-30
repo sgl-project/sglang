@@ -23,14 +23,29 @@ jobs:
   check-changes:
     runs-on: ubuntu-latest
     outputs:
-      main_package: ${{ steps.filter.outputs.main_package }}
+      main_package: ${{ steps.filter.outputs.main_package || steps.full-run.outputs.main_package }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Determine run mode
+        id: run-mode
+        run: |
+          # Run all tests for workflow_call (e.g., release branch testing)
+          if [[ "${{ github.event_name }}" == "workflow_call" ]]; then
+            echo "run_all_tests=true" >> $GITHUB_OUTPUT
+            echo "Run mode: ALL TESTS (triggered by ${{ github.event_name }})"
+          else
+            echo "run_all_tests=false" >> $GITHUB_OUTPUT
+            echo "Run mode: FILTERED (triggered by ${{ github.event_name }})"
+          fi
 
       - name: Detect file changes
         id: filter
         uses: dorny/paths-filter@v3
+        if: steps.run-mode.outputs.run_all_tests != 'true'
         with:
           filters: |
             main_package:
@@ -39,6 +54,12 @@ jobs:
               - "scripts/ci/npu_ci_install_dependency.sh"
               - "test/srt/ascend/**"
               - ".github/workflows/pr-test-npu.yml"
+
+      - name: Set all changes to true for full test runs
+        id: full-run
+        if: steps.run-mode.outputs.run_all_tests == 'true'
+        run: |
+          echo "main_package=true" >> $GITHUB_OUTPUT
 
   # ==================== PR Gate ==================== #
   pr-gate:
