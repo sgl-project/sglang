@@ -134,4 +134,3 @@ nsys profile \
 ## FAQ
 
 - If you are profiling `sglang generate` with Nsight Systems and find that the generated profiler file did not capture any CUDA kernels, you can resolve this issue by increasing the model's inference steps to extend the execution time.
-
