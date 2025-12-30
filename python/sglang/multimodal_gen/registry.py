@@ -414,7 +414,7 @@ def _register_configs():
     register_configs(
         sampling_param_cls=QwenImageSamplingParams,
         pipeline_config_cls=QwenImagePipelineConfig,
-        hf_model_paths=["Qwen/Qwen-Image"],
+        hf_model_paths=["Qwen/Qwen-Image, Qwen/Qwen-Image-2512"],
     )
     register_configs(
         sampling_param_cls=QwenImageSamplingParams,
