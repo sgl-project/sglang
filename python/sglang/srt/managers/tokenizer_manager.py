@@ -1690,7 +1690,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             and recv_obj.load is not None
         ):
             load_update_req = WatchLoadUpdateReq(loads=[recv_obj.load])
-            self.send_to_scheduler.send_pyobj(load_update_req)
+            self._send_multi_parts(self.send_to_scheduler, load_update_req)
 
     def add_logprob_to_meta_info(
         self,
