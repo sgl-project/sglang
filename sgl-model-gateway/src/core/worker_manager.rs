@@ -13,6 +13,7 @@ use futures::{
     stream::{self, StreamExt},
 };
 use http::StatusCode;
+use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::{
     sync::{watch, Mutex},
@@ -28,6 +29,11 @@ use crate::{
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_CONCURRENT: usize = 32;
+
+#[derive(Deserialize)]
+struct LoadResponseItem {
+    num_tokens: i64,
+}
 
 /// Result of a fan-out request to a single worker
 struct WorkerResponse {
@@ -259,14 +265,12 @@ impl WorkerManager {
         }
 
         match req.send().await {
-            Ok(r) if r.status().is_success() => match r.json::<Value>().await {
-                Ok(json) if json.is_array() => json
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .filter_map(|e| e.get("num_tokens").and_then(|v| v.as_i64()))
-                    .sum::<i64>() as isize,
-                _ => -1,
+            Ok(r) if r.status().is_success() => match r.json::<Vec<LoadResponseItem>>().await {
+                Ok(items) => items.iter().map(|item| item.num_tokens).sum::<i64>() as isize,
+                Err(e) => {
+                    warn!("Failed to parse load response from {}: {}", url, e);
+                    -1
+                }
             },
             _ => -1,
         }
