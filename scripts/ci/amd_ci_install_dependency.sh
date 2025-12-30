@@ -91,7 +91,10 @@ docker cp ./dummy-grok ci_sglang:/
 
 docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache huggingface_hub[hf_xet]
 docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache pytest
-
+if [[ "$OPTIONAL_DEPS" == *"diffusion"* ]]; then
+    echo "Installing ROCm flashinfer for diffusion tests..."
+    docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache flashinfer --extra-index-url=https://pypi.amd.com/simple
+fi
 # Detect AITER version
 #############################################
 # Detect correct AITER_COMMIT for this runner
