@@ -335,7 +335,7 @@ def forward_dsa_prepare_npu(
         k_nope, k_pe = latent_cache.unsqueeze(1).split(
             [m.kv_lora_rank, m.qk_rope_head_dim], dim=-1
         )
-        k_nope = m.kv_a_layernorm(k_nope).unsqueeze(1)
+        k_nope = m.kv_a_layernorm(k_nope)
         torch.npu.current_stream().wait_event(q_event)
 
         q_nope, q_pe = q.split([m.qk_nope_head_dim, m.qk_rope_head_dim], dim=-1)
