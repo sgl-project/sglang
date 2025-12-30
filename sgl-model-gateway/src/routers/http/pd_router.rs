@@ -305,10 +305,18 @@ impl PDRouter {
         };
 
         let prefill_policy = self.policy_registry.get_prefill_policy();
+
+        // Get cached hash ring for consistent hashing
+        let hash_ring = self
+            .worker_registry
+            .get_hash_ring(effective_model_id.unwrap_or(UNKNOWN_MODEL_ID));
+
         let prefill = match Self::pick_worker_by_policy_arc(
             &prefill_workers,
             &*prefill_policy,
             request_text.as_deref(),
+            headers,
+            hash_ring.clone(),
             "prefill",
         ) {
             Ok(w) => w,
