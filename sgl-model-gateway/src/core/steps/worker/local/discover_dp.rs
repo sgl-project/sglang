@@ -7,6 +7,7 @@ use tracing::debug;
 
 use super::discover_metadata::get_server_info;
 use crate::{
+    core::UNKNOWN_MODEL_ID,
     protocols::worker_spec::WorkerConfigRequest,
     workflow::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, WorkflowResult},
 };
@@ -34,7 +35,7 @@ pub async fn get_dp_info(url: &str, api_key: Option<&str>) -> Result<DpInfo, Str
             info.model_path
                 .and_then(|path| path.split('/').next_back().map(|s| s.to_string()))
         })
-        .unwrap_or_else(|| "unknown".to_string());
+        .unwrap_or_else(|| UNKNOWN_MODEL_ID.to_string());
 
     Ok(DpInfo { dp_size, model_id })
 }

@@ -133,7 +133,7 @@ class OpenAIServingChat(OpenAIServingBase):
             max_output_tokens
             and server_context_length
             and max_output_tokens > server_context_length
-        ):
+        ) and not self.tokenizer_manager.server_args.allow_auto_truncate:
             return (
                 f"max_completion_tokens is too large: {max_output_tokens}."
                 f"This model supports at most {server_context_length} completion tokens."
