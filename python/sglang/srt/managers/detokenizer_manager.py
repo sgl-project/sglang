@@ -206,9 +206,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         # TODO(lmzheng): handle skip_special_tokens/spaces_between_special_tokens per request
         skip_uniform = len(set(recv_obj.skip_special_tokens)) == 1
         space_uniform = len(set(recv_obj.spaces_between_special_tokens)) == 1
-        if not self.disable_tokenizer_batch_decode or not (
-            skip_uniform and space_uniform
-        ):
+        if not self.disable_tokenizer_batch_decode and skip_uniform and space_uniform:
             if not self.is_dummy:
                 # Run normal batch decode
                 surr_texts = self.tokenizer.batch_decode(
