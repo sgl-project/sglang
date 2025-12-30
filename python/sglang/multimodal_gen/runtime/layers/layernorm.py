@@ -434,17 +434,19 @@ def apply_qk_norm(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Apply QK normalization for query and key tensors.
 
-    Minimal multimodal_gen-only implementation: only the JIT fused inplace
-    QK-norm kernel path is supported (no fallback).
+    Prefer the fused inplace QK-norm kernel when applicable;
+    otherwise fall back to PyTorch norms.
     """
 
     batch_size = q.size(0)
     q_eps = q_norm.variance_epsilon
     k_eps = k_norm.variance_epsilon
-    # Only try fused path on CUDA and when it won't introduce implicit copies.
     if (
         q.is_cuda
+        and (torch.version.cuda is not None)
         and allow_inplace
+        and q.is_contiguous()
+        and k.is_contiguous()
         and (q_eps == k_eps)
         and can_use_fused_inplace_qknorm(head_dim)
     ):
@@ -458,7 +460,15 @@ def apply_qk_norm(
         )
         return q, k
 
-    raise RuntimeError(
-        "apply_qk_norm: fused inplace QK-norm is not applicable "
-        "(expected CUDA, contiguous q/k, matching eps, and supported head_dim)"
-    )
+    # Fallback: apply the PyTorch norms.
+    q_out = q_norm(q)
+    k_out = k_norm(k)
+
+    if allow_inplace and q.is_contiguous() and q_out.shape == q.shape:
+        q.copy_(q_out)
+        q_out = q
+    if allow_inplace and k.is_contiguous() and k_out.shape == k.shape:
+        k.copy_(k_out)
+        k_out = k
+
+    return q_out, k_out
