@@ -677,7 +677,7 @@ class Scheduler(
                 from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
 
                 self.tree_cache = MambaRadixCache(params)
-            elif server_args.enable_lmcache:
+            elif server_args.enable_lmcache or server_args.lmcache_mp_enable:
                 from sglang.srt.mem_cache.storage.lmcache.lmc_radix_cache import (
                     LMCRadixCache,
                 )
