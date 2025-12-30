@@ -1,13 +1,9 @@
-# =========================
-# File 2: LoRAFormatAdapter (e.g. sglang/multimodal_gen/runtime/pipelines_core/lora_format_adapter.py)
-# =========================
-
 from __future__ import annotations
 
 import logging
 import re
 from enum import Enum
-from typing import Dict, Iterable, Mapping, Optional
+from typing import Any, Dict, Iterable, Mapping, Optional
 
 import torch
 from diffusers.loaders import lora_conversion_utils as lcu
@@ -26,9 +22,215 @@ class LoRAFormat(str, Enum):
     WAN = "wan"
 
 
-# ---------------------------------------------------------------------------
-# Qwen-Image specific: fuse split Q/K/V LoRA into fused to_qkv/to_added_qkv
-# ---------------------------------------------------------------------------
+def set_lora_weights_dynamic_rank(
+    layer: Any,
+    lora_A: torch.Tensor,
+    lora_B: torch.Tensor,
+    *,
+    lora_path: str | None,
+    strength: float,
+    rank: int = 0,
+    layer_name: str = "",
+    logger: Optional[logging.Logger] = None,
+) -> None:
+    """
+    Set LoRA weights on a layer.
+
+    Prefer layer.set_lora_weights(). If it fails due to rank/shape mismatch,
+    fall back to replacing layer.lora_A/lora_B parameters (inference-oriented).
+    """
+    log = logger or globals()["logger"]
+
+    try:
+        layer.set_lora_weights(
+            lora_A,
+            lora_B,
+            lora_path=lora_path,
+            strength=strength,
+        )
+        return
+    except Exception as exc:
+        msg = str(exc).lower()
+        looks_like_shape_issue = (
+            isinstance(exc, AssertionError)
+            or ("shape" in msg)
+            or ("size" in msg)
+            or ("rank" in msg)
+            or ("mismatch" in msg)
+            or ("dim" in msg)
+        )
+        if not looks_like_shape_issue:
+            raise
+
+        if rank == 0:
+            log.warning(
+                "Layer '%s': set_lora_weights failed (%s). "
+                "Falling back to dynamic parameter replacement (inference-safe).",
+                layer_name,
+                exc,
+            )
+
+        try:
+            if (
+                not hasattr(layer, "lora_A")
+                or getattr(layer, "lora_A") is None
+                or layer.lora_A.shape != lora_A.shape
+            ):
+                layer.lora_A = torch.nn.Parameter(lora_A, requires_grad=False)
+            else:
+                layer.lora_A.data.copy_(lora_A)
+
+            if (
+                not hasattr(layer, "lora_B")
+                or getattr(layer, "lora_B") is None
+                or layer.lora_B.shape != lora_B.shape
+            ):
+                layer.lora_B = torch.nn.Parameter(lora_B, requires_grad=False)
+            else:
+                layer.lora_B.data.copy_(lora_B)
+
+            if hasattr(layer, "disable_lora"):
+                layer.disable_lora = False
+            if hasattr(layer, "merged"):
+                layer.merged = False
+            if hasattr(layer, "lora_strength"):
+                layer.lora_strength = strength
+            if hasattr(layer, "lora_path"):
+                layer.lora_path = lora_path
+        except Exception as exc2:
+            raise RuntimeError(
+                f"Layer '{layer_name}': dynamic-rank fallback failed ({exc2})"
+            ) from exc2
+
+
+def _target_has_fused_qkv(target_layer_names: Iterable[str]) -> tuple[bool, bool]:
+    """Return (has_to_qkv, has_to_added_qkv) based on target module names."""
+    names = list(target_layer_names)
+    has_to_qkv = any(n.endswith(("attn.to_qkv", "attention.to_qkv")) for n in names)
+    has_to_added_qkv = any(
+        n.endswith(("attn.to_added_qkv", "attention.to_added_qkv")) for n in names
+    )
+    return has_to_qkv, has_to_added_qkv
+
+
+def _target_has_fused_w13(target_layer_names: Iterable[str]) -> bool:
+    """Return True if target uses fused FFN projection w13 (SwiGLU gate+up)."""
+    names = list(target_layer_names)
+    return any(n.endswith(("feed_forward.w13", "ffn.w13", "mlp.w13")) for n in names)
+
+
+def _sd_has_split_qkv(sd: Mapping[str, torch.Tensor]) -> bool:
+    keys = sd.keys()
+    return any(
+        (".attn.to_q.lora_A.weight" in k) or (".attention.to_q.lora_A.weight" in k)
+        for k in keys
+    )
+
+
+def _sd_has_split_added_qkv(sd: Mapping[str, torch.Tensor]) -> bool:
+    keys = sd.keys()
+    return any(
+        (".attn.add_q_proj.lora_A.weight" in k)
+        or (".attention.add_q_proj.lora_A.weight" in k)
+        for k in keys
+    )
+
+
+def _sd_has_split_w1(sd: Mapping[str, torch.Tensor]) -> bool:
+    keys = sd.keys()
+    return any(
+        (".feed_forward.w1.lora_A.weight" in k)
+        or (".ffn.w1.lora_A.weight" in k)
+        or (".mlp.w1.lora_A.weight" in k)
+        for k in keys
+    )
+
+
+def _sd_has_split_w3(sd: Mapping[str, torch.Tensor]) -> bool:
+    keys = sd.keys()
+    return any(
+        (".feed_forward.w3.lora_A.weight" in k)
+        or (".ffn.w3.lora_A.weight" in k)
+        or (".mlp.w3.lora_A.weight" in k)
+        for k in keys
+    )
+
+
+def prepare_lora_state_dict_for_target(
+    raw_state_dict: Mapping[str, torch.Tensor],
+    target_lora_layer_names: Optional[Iterable[str]] = None,
+    logger: Optional[logging.Logger] = None,
+    *,
+    rank: int | None = None,
+    fuse_qkv: bool = True,
+    fuse_w13: bool = True,
+) -> Dict[str, torch.Tensor]:
+    """
+    Normalize an external LoRA state_dict and (optionally) fuse keys to match
+    target fused projections (to_qkv/to_added_qkv, w13).
+    """
+    log = logger or globals()["logger"]
+    is_rank0 = (rank is None) or (rank == 0)
+
+    sd = normalize_lora_state_dict(raw_state_dict, logger=log)
+
+    if not target_lora_layer_names:
+        return sd
+
+    target_names = list(target_lora_layer_names)
+    if not target_names:
+        return sd
+
+    target_has_to_qkv, target_has_to_added_qkv = _target_has_fused_qkv(target_names)
+    target_has_w13 = _target_has_fused_w13(target_names)
+
+    sd_has_split_qkv = _sd_has_split_qkv(sd)
+    sd_has_split_added = _sd_has_split_added_qkv(sd)
+    sd_has_w1 = _sd_has_split_w1(sd)
+    sd_has_w3 = _sd_has_split_w3(sd)
+
+    if is_rank0:
+        log.info(
+            "[LoRAFormatAdapter] target-aware fuse check: "
+            "target_has_to_qkv=%s sd_has_split_qkv=%s "
+            "target_has_to_added_qkv=%s sd_has_split_added=%s "
+            "target_has_w13=%s sd_has_w1=%s sd_has_w3=%s",
+            target_has_to_qkv,
+            sd_has_split_qkv,
+            target_has_to_added_qkv,
+            sd_has_split_added,
+            target_has_w13,
+            sd_has_w1,
+            sd_has_w3,
+        )
+
+    if fuse_qkv and (
+        (target_has_to_qkv and sd_has_split_qkv)
+        or (target_has_to_added_qkv and sd_has_split_added)
+    ):
+        sd = maybe_fuse_qwen_image_qkv_lora_state_dict(sd, logger=log)
+
+        if is_rank0:
+            keys2 = list(sd.keys())
+            log.info(
+                "[LoRAFormatAdapter] after qkv fuse: has_to_qkv=%s has_split_to_q=%s",
+                any(".to_qkv.lora_A.weight" in k for k in keys2),
+                any(".to_q.lora_A.weight" in k for k in keys2),
+            )
+
+    if fuse_w13 and target_has_w13 and sd_has_w1 and sd_has_w3:
+        sd = maybe_fuse_w13_lora_state_dict(sd, logger=log)
+
+        if is_rank0:
+            keys3 = list(sd.keys())
+            log.info(
+                "[LoRAFormatAdapter] after w13 fuse: has_w13=%s has_w1=%s has_w3=%s",
+                any(".w13.lora_A.weight" in k for k in keys3),
+                any(".w1.lora_A.weight" in k for k in keys3),
+                any(".w3.lora_A.weight" in k for k in keys3),
+            )
+
+    return sd
 
 
 def apply_lora_alpha_scaling_inplace(
@@ -38,12 +240,7 @@ def apply_lora_alpha_scaling_inplace(
     remove_alpha: bool = True,
     atol: float = 1e-8,
 ) -> int:
-    """
-    Bake LoRA scaling (alpha / rank) into lora_B.weight in-place.
-
-    This makes the pipeline correct even if runtime ignores `.alpha`.
-    Returns: number of modules scaled.
-    """
+    """Bake (alpha / rank) scaling into lora_B.weight. Returns #modules scaled."""
     scaled = 0
     keys = list(sd.keys())
 
@@ -60,7 +257,6 @@ def apply_lora_alpha_scaling_inplace(
         B = sd[kB]
         alpha_t = sd[kAlpha]
 
-        # alpha may be scalar tensor or something similar
         try:
             alpha_val = float(alpha_t.reshape(-1)[0].item())
         except Exception:
@@ -73,22 +269,17 @@ def apply_lora_alpha_scaling_inplace(
             continue
 
         if layout == "BA":
-            # A: (r, in), B: (out, r)
             r = int(A.shape[0])
         else:
-            # "AB": A: (in, r), B: (r, out)
             r = int(B.shape[0])
 
         if r <= 0:
             continue
-        scale = alpha_val / float(r)
 
-        # If alpha is 0 or extremely small, skip (or keep)
+        scale = alpha_val / float(r)
         if abs(scale) <= atol:
-            # still can zero out if desired; keep conservative
             continue
 
-        # keep dtype/device consistent (avoid fp32 upcast surprises)
         scale_t = torch.tensor(scale, device=B.device, dtype=B.dtype)
         sd[kB] = B * scale_t
 
@@ -108,24 +299,21 @@ def _infer_lora_layout(A: torch.Tensor, B: torch.Tensor) -> str | None:
     """
     Infer LoRA matmul layout from A/B shapes.
 
-    Return:
-      - "BA" if ΔW = B @ A is valid with (B: out×r, A: r×in)
-      - "AB" if ΔW = A @ B is valid with (A: in×r, B: r×out)
-      - None if neither works / unknown
+    Returns:
+      - "BA" if ΔW = B @ A (B: out×r, A: r×in)
+      - "AB" if ΔW = A @ B (A: in×r, B: r×out)
     """
     if A.ndim != 2 or B.ndim != 2:
         return None
 
-    ba_ok = B.shape[1] == A.shape[0]  # B(out,r) @ A(r,in)
-    ab_ok = A.shape[1] == B.shape[0]  # A(in,r) @ B(r,out)
+    ba_ok = B.shape[1] == A.shape[0]
+    ab_ok = A.shape[1] == B.shape[0]
 
     if ba_ok and not ab_ok:
         return "BA"
     if ab_ok and not ba_ok:
         return "AB"
     if ba_ok and ab_ok:
-        # Ambiguous (rare but possible if square-ish). Prefer the one that treats
-        # the smaller dimension as rank.
         r_ba = int(A.shape[0])
         r_ab = int(A.shape[1])
         return "BA" if r_ba <= r_ab else "AB"
@@ -176,12 +364,7 @@ def _fuse_one_qkv_triplet(
     atol: float = 1e-5,
     rtol: float = 1e-3,
 ) -> tuple[bool, bool]:
-    """
-    Fuse one (q,k,v) triplet under a shared prefix into a fused projection.
-
-    Returns:
-      (fused_ok, used_blockdiag)
-    """
+    """Fuse (q,k,v) into a single fused projection. Returns (ok, used_blockdiag)."""
     Aq_k = f"{prefix}.{q}.lora_A.weight"
     Ak_k = f"{prefix}.{k}.lora_A.weight"
     Av_k = f"{prefix}.{v}.lora_A.weight"
@@ -199,10 +382,9 @@ def _fuse_one_qkv_triplet(
     if any(t.ndim != 2 for t in (Aq, Ak, Av, Bq, Bk, Bv)):
         return False, False
 
-    # Ensure all tensors are on the same device (avoid block_diag device mismatch).
-    # Prefer Q's device/dtype.
     dev = Aq.device
     dtype = Aq.dtype
+
     if Ak.device != dev:
         Ak = Ak.to(dev)
     if Av.device != dev:
@@ -214,7 +396,6 @@ def _fuse_one_qkv_triplet(
     if Bv.device != dev:
         Bv = Bv.to(dev)
 
-    # Keep consistent dtype where reasonable (avoid accidental fp32 expansion).
     if Ak.dtype != dtype:
         Ak = Ak.to(dtype)
     if Av.dtype != dtype:
@@ -232,9 +413,7 @@ def _fuse_one_qkv_triplet(
     if _infer_lora_layout(Ak, Bk) != layout or _infer_lora_layout(Av, Bv) != layout:
         return False, False
 
-    # Validate in/out feature dims are compatible
     if layout == "BA":
-        # A: (r, in), B: (out, r)
         in_dim = int(Aq.shape[1])
         out_dim = int(Bq.shape[0])
 
@@ -251,9 +430,8 @@ def _fuse_one_qkv_triplet(
         )
 
         if shared_a:
-            # Exact fusion with shared A: concat B on out-dim (rows)
             A_fused = Aq
-            B_fused = torch.cat([Bq, Bk, Bv], dim=0)  # (3*out, r)
+            B_fused = torch.cat([Bq, Bk, Bv], dim=0)
             used_blockdiag = False
             log.info(
                 "[LoRAFormatAdapter] QKV A shared at %s.%s, using shared-A fusion (layout=%s).",
@@ -262,9 +440,8 @@ def _fuse_one_qkv_triplet(
                 layout,
             )
         else:
-            # Exact fusion with mismatched A: block-diagonal B and stacked A (rank expands)
-            A_fused = torch.cat([Aq, Ak, Av], dim=0)  # (r_sum, in)
-            B_fused = _block_diag([Bq, Bk, Bv])  # (3*out, r_sum)
+            A_fused = torch.cat([Aq, Ak, Av], dim=0)
+            B_fused = _block_diag([Bq, Bk, Bv])
             used_blockdiag = True
             diff1 = _max_abs_diff(Aq, Ak)
             diff2 = _max_abs_diff(Aq, Av)
@@ -279,8 +456,6 @@ def _fuse_one_qkv_triplet(
             )
 
     else:
-        # layout == "AB"
-        # A: (in, r), B: (r, out)
         in_dim = int(Aq.shape[0])
         out_dim = int(Bq.shape[1])
 
@@ -297,9 +472,8 @@ def _fuse_one_qkv_triplet(
         )
 
         if shared_a:
-            # Exact fusion with shared A: concat B on out-dim (cols)
             A_fused = Aq
-            B_fused = torch.cat([Bq, Bk, Bv], dim=1)  # (r, 3*out)
+            B_fused = torch.cat([Bq, Bk, Bv], dim=1)
             used_blockdiag = False
             log.info(
                 "[LoRAFormatAdapter] QKV A shared at %s.%s, using shared-A fusion (layout=%s).",
@@ -308,9 +482,8 @@ def _fuse_one_qkv_triplet(
                 layout,
             )
         else:
-            # Exact fusion with mismatched A: block-diagonal B and concatenated A on rank-dim
-            A_fused = torch.cat([Aq, Ak, Av], dim=1)  # (in, r_sum)
-            B_fused = _block_diag([Bq, Bk, Bv])  # (r_sum, 3*out)
+            A_fused = torch.cat([Aq, Ak, Av], dim=1)
+            B_fused = _block_diag([Bq, Bk, Bv])
             used_blockdiag = True
             diff1 = _max_abs_diff(Aq, Ak)
             diff2 = _max_abs_diff(Aq, Av)
@@ -329,12 +502,10 @@ def _fuse_one_qkv_triplet(
     sd[fused_A_k] = A_fused
     sd[fused_B_k] = B_fused
 
-    # Copy alpha from Q-proj if present (pipeline currently ignores alpha, but keep for completeness)
     alpha_q = f"{prefix}.{q}.alpha"
     if alpha_q in sd:
         sd[f"{prefix}.{fused}.alpha"] = sd[alpha_q]
 
-    # Remove old split keys (avoid downstream collisions / confusion)
     for p in (q, k, v):
         sd.pop(f"{prefix}.{p}.lora_A.weight", None)
         sd.pop(f"{prefix}.{p}.lora_B.weight", None)
@@ -346,15 +517,7 @@ def _fuse_one_qkv_triplet(
 def fuse_qkv_like_keys_inplace(
     sd: Dict[str, torch.Tensor], log: logging.Logger
 ) -> dict[str, int]:
-    """
-    In-place fuse split q/k/v (and add_q/k/v) LoRA weights into fused projections.
-
-    This is *exact*:
-      - If Aq==Ak==Av (shared A), we keep A and concat B (standard fused-QKV constraint).
-      - If A differs, we perform block-diagonal exact fusion (rank expands, typically 3r).
-
-    Returns a small stats dict for logging/diagnostics.
-    """
+    """Fuse split q/k/v (and add_q/k/v) LoRA keys into fused projections, in-place."""
     patterns = [
         ("to_q", "to_k", "to_v", "to_qkv"),
         ("add_q_proj", "add_k_proj", "add_v_proj", "to_added_qkv"),
@@ -364,7 +527,6 @@ def fuse_qkv_like_keys_inplace(
     skipped = 0
     a_mismatch = 0
     for q, k, v, fused_name in patterns:
-        # Support both "...attn.*" and "...attention.*"
         pat = re.compile(
             rf"^(?P<prefix>.+\.(?:attn|attention))\.{re.escape(q)}\.lora_A\.weight$"
         )
@@ -379,7 +541,6 @@ def fuse_qkv_like_keys_inplace(
         )
 
         for prefix in prefixes:
-            # If already fused keys exist, skip
             if (
                 f"{prefix}.{fused_name}.lora_A.weight" in sd
                 or f"{prefix}.{fused_name}.lora_B.weight" in sd
@@ -403,32 +564,11 @@ def maybe_fuse_qwen_image_qkv_lora_state_dict(
     state_dict: Mapping[str, torch.Tensor],
     logger: Optional[logging.Logger] = None,
 ) -> Dict[str, torch.Tensor]:
-    """
-    Fuse split Q/K/V LoRA weights into fused to_qkv / to_added_qkv for Qwen-Image style models.
-
-    Expected split keys (after normalize_lora_state_dict):
-      ...attn.to_q.lora_A.weight / ...attn.to_k... / ...attn.to_v...
-      ...attn.add_q_proj.lora_A.weight / ...add_k_proj... / ...add_v_proj...
-
-    Output fused keys:
-      ...attn.to_qkv.lora_A.weight / ...attn.to_qkv.lora_B.weight
-      ...attn.to_added_qkv.lora_A.weight / ...attn.to_added_qkv.lora_B.weight
-
-    Fusion rule (EXACT, preserves Lightning LoRA semantics):
-      - If Aq/Ak/Av are equal (shared-A), keep A and concatenate B on output dim.
-      - If Aq/Ak/Av differ, perform block-diagonal exact fusion, expanding effective rank
-        (typically from r to 3r).
-
-    Notes:
-      - We strip an optional "diffusion_model." prefix for robustness.
-      - We remove the original split keys after fusing to avoid collisions downstream.
-      - We copy alpha from Q-proj to fused proj if present (pipeline currently ignores alpha).
-    """
+    """Fuse split Q/K/V LoRA weights into to_qkv/to_added_qkv when applicable."""
     log = logger or globals()["logger"]
     if not state_dict:
         return dict(state_dict)
 
-    # Canonicalize keys: strip optional "diffusion_model." prefix
     sd: Dict[str, torch.Tensor] = {}
     for k, v in state_dict.items():
         if k.startswith("diffusion_model."):
@@ -452,11 +592,6 @@ def maybe_fuse_qwen_image_qkv_lora_state_dict(
     return sd
 
 
-# ---------------------------------------------------------------------------
-# Fuse split FFN w1/w3 LoRA into fused w13 (SwiGLU gate+up projection)
-# ---------------------------------------------------------------------------
-
-
 def _fuse_one_w13_pair(
     sd: Dict[str, torch.Tensor],
     prefix: str,
@@ -468,16 +603,7 @@ def _fuse_one_w13_pair(
     atol: float = 1e-5,
     rtol: float = 1e-3,
 ) -> tuple[bool, bool]:
-    """
-    Fuse one (w1, w3) pair under a shared FFN prefix into fused projection (w13).
-
-    Returns:
-      (fused_ok, used_blockdiag)
-
-    Exact fusion:
-      - If A1 == A3: keep A, concat B along output dim.
-      - Else: block-diagonal exact fusion (rank expands).
-    """
+    """Fuse (w1,w3) into w13. Returns (ok, used_blockdiag)."""
     A1_k = f"{prefix}.{w1}.lora_A.weight"
     A3_k = f"{prefix}.{w3}.lora_A.weight"
     B1_k = f"{prefix}.{w1}.lora_B.weight"
@@ -493,9 +619,9 @@ def _fuse_one_w13_pair(
     if any(t.ndim != 2 for t in (A1, A3, B1, B3)):
         return False, False
 
-    # Align device/dtype (avoid block_diag mismatch / fp32 surprises)
     dev = A1.device
     dtype = A1.dtype
+
     if A3.device != dev:
         A3 = A3.to(dev)
     if B1.device != dev:
@@ -516,19 +642,16 @@ def _fuse_one_w13_pair(
     if _infer_lora_layout(A3, B3) != layout:
         return False, False
 
-    # Validate in_dim matches
     if layout == "BA":
-        # A: (r, in), B: (out, r)
         in_dim = int(A1.shape[1])
         if int(A3.shape[1]) != in_dim:
             return False, False
-        # out dims can differ; w13 out = out1 + out3, so no strict equality required.
 
         shared_a = A1.shape == A3.shape and torch.allclose(A1, A3, atol=atol, rtol=rtol)
 
         if shared_a:
             A_fused = A1
-            B_fused = torch.cat([B1, B3], dim=0)  # (out1+out3, r)
+            B_fused = torch.cat([B1, B3], dim=0)
             used_blockdiag = False
             log.info(
                 "[LoRAFormatAdapter] FFN w1/w3 A shared at %s.%s, using shared-A fusion (layout=%s).",
@@ -537,9 +660,8 @@ def _fuse_one_w13_pair(
                 layout,
             )
         else:
-            # Exact block-diag fusion: (B1@A1 ; B3@A3)
-            A_fused = torch.cat([A1, A3], dim=0)  # (r1+r3, in)
-            B_fused = _block_diag([B1, B3])  # (out1+out3, r1+r3)
+            A_fused = torch.cat([A1, A3], dim=0)
+            B_fused = _block_diag([B1, B3])
             used_blockdiag = True
             diff = _max_abs_diff(A1, A3)
             log.warning(
@@ -552,8 +674,6 @@ def _fuse_one_w13_pair(
             )
 
     else:
-        # layout == "AB"
-        # A: (in, r), B: (r, out)
         in_dim = int(A1.shape[0])
         if int(A3.shape[0]) != in_dim:
             return False, False
@@ -562,7 +682,7 @@ def _fuse_one_w13_pair(
 
         if shared_a:
             A_fused = A1
-            B_fused = torch.cat([B1, B3], dim=1)  # (r, out1+out3)
+            B_fused = torch.cat([B1, B3], dim=1)
             used_blockdiag = False
             log.info(
                 "[LoRAFormatAdapter] FFN w1/w3 A shared at %s.%s, using shared-A fusion (layout=%s).",
@@ -571,8 +691,8 @@ def _fuse_one_w13_pair(
                 layout,
             )
         else:
-            A_fused = torch.cat([A1, A3], dim=1)  # (in, r1+r3)
-            B_fused = _block_diag([B1, B3])  # (r1+r3, out1+out3)
+            A_fused = torch.cat([A1, A3], dim=1)
+            B_fused = _block_diag([B1, B3])
             used_blockdiag = True
             diff = _max_abs_diff(A1, A3)
             log.warning(
@@ -589,12 +709,10 @@ def _fuse_one_w13_pair(
     sd[fused_A_k] = A_fused
     sd[fused_B_k] = B_fused
 
-    # Copy alpha if still present (often already baked & removed)
     alpha_1 = f"{prefix}.{w1}.alpha"
     if alpha_1 in sd:
         sd[f"{prefix}.{fused}.alpha"] = sd[alpha_1]
 
-    # Remove old split keys
     for p in (w1, w3):
         sd.pop(f"{prefix}.{p}.lora_A.weight", None)
         sd.pop(f"{prefix}.{p}.lora_B.weight", None)
@@ -606,21 +724,11 @@ def _fuse_one_w13_pair(
 def fuse_w13_like_keys_inplace(
     sd: Dict[str, torch.Tensor], log: logging.Logger
 ) -> dict[str, int]:
-    """
-    In-place fuse split FFN w1/w3 LoRA into fused w13.
-
-    Supports prefixes like:
-      ...feed_forward.w1 / ...feed_forward.w3
-      ...ffn.w1 / ...ffn.w3
-      ...mlp.w1 / ...mlp.w3
-
-    Returns stats for logging/diagnostics.
-    """
+    """Fuse split FFN w1/w3 LoRA into fused w13, in-place."""
     fused = 0
     skipped = 0
     a_mismatch = 0
 
-    # Match both Z-Image naming ("feed_forward") and possible variants ("ffn"/"mlp")
     pat = re.compile(r"^(?P<prefix>.+\.(?:feed_forward|ffn|mlp))\.w1\.lora_A\.weight$")
 
     prefixes = sorted(
@@ -633,7 +741,6 @@ def fuse_w13_like_keys_inplace(
     )
 
     for prefix in prefixes:
-        # If already fused exists, skip
         if f"{prefix}.w13.lora_A.weight" in sd or f"{prefix}.w13.lora_B.weight" in sd:
             continue
 
@@ -652,25 +759,11 @@ def maybe_fuse_w13_lora_state_dict(
     state_dict: Mapping[str, torch.Tensor],
     logger: Optional[logging.Logger] = None,
 ) -> Dict[str, torch.Tensor]:
-    """
-    Fuse split FFN w1/w3 LoRA into fused w13 when target model uses fused w13.
-
-    Input keys (after normalize_lora_state_dict):
-      ...feed_forward.w1.lora_A.weight / ...w1.lora_B.weight
-      ...feed_forward.w3.lora_A.weight / ...w3.lora_B.weight
-
-    Output:
-      ...feed_forward.w13.lora_A.weight / ...w13.lora_B.weight
-
-    Notes:
-      - Strips optional "diffusion_model." prefix.
-      - Removes original split keys after fusing.
-    """
+    """Fuse split FFN w1/w3 LoRA into fused w13 when needed."""
     log = logger or globals()["logger"]
     if not state_dict:
         return dict(state_dict)
 
-    # Canonicalize keys: strip optional "diffusion_model." prefix
     sd: Dict[str, torch.Tensor] = {}
     for k, v in state_dict.items():
         if k.startswith("diffusion_model."):
@@ -692,11 +785,6 @@ def maybe_fuse_w13_lora_state_dict(
     return sd
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-
 def _sample_keys(keys: Iterable[str], k: int = 20) -> list[str]:
     out = []
     for i, key in enumerate(keys):
@@ -712,11 +800,6 @@ def _has_substring_key(keys: Iterable[str], substr: str) -> bool:
 
 def _has_prefix_key(keys: Iterable[str], prefix: str) -> bool:
     return any(k.startswith(prefix) for k in keys)
-
-
-# ---------------------------------------------------------------------------
-# Format-specific heuristics
-# ---------------------------------------------------------------------------
 
 
 def _looks_like_xlabs_flux_key(k: str) -> bool:
@@ -738,7 +821,7 @@ def _looks_like_xlabs_flux_key(k: str) -> bool:
 
 
 def _looks_like_kohya_flux(state_dict: Mapping[str, torch.Tensor]) -> bool:
-    """Kohya FLUX LoRA (flux_lora.py) under lora_unet_double/single_blocks_ prefixes."""
+    """Kohya FLUX LoRA (flux_lora.py) prefixes."""
     if not state_dict:
         return False
     keys = state_dict.keys()
@@ -757,6 +840,95 @@ def _looks_like_non_diffusers_sd(state_dict: Mapping[str, torch.Tensor]) -> bool
     return all(
         k.startswith(("lora_unet_", "lora_te_", "lora_te1_", "lora_te2_")) for k in keys
     )
+
+
+def _looks_like_non_diffusers_qwen_unet(state_dict: Mapping[str, torch.Tensor]) -> bool:
+    """A1111/kohya SD-LoRA keys that target Qwen-Image transformer blocks."""
+    if not state_dict:
+        return False
+    return any(k.startswith("lora_unet_transformer_blocks_") for k in state_dict.keys())
+
+
+_QWEN_UNET_REWRITES: list[tuple[str, str]] = [
+    (
+        r"^lora_unet_transformer_blocks_(\d+)_attn_to_q\.",
+        r"transformer_blocks.\1.attn.to_q.",
+    ),
+    (
+        r"^lora_unet_transformer_blocks_(\d+)_attn_to_k\.",
+        r"transformer_blocks.\1.attn.to_k.",
+    ),
+    (
+        r"^lora_unet_transformer_blocks_(\d+)_attn_to_v\.",
+        r"transformer_blocks.\1.attn.to_v.",
+    ),
+    (
+        r"^lora_unet_transformer_blocks_(\d+)_attn_to_out_0\.",
+        r"transformer_blocks.\1.attn.to_out.0.",
+    ),
+    (
+        r"^lora_unet_transformer_blocks_(\d+)_attn_add_q_proj\.",
+        r"transformer_blocks.\1.attn.add_q_proj.",
+    ),
+    (
+        r"^lora_unet_transformer_blocks_(\d+)_attn_add_k_proj\.",
+        r"transformer_blocks.\1.attn.add_k_proj.",
+    ),
+    (
+        r"^lora_unet_transformer_blocks_(\d+)_attn_add_v_proj\.",
+        r"transformer_blocks.\1.attn.add_v_proj.",
+    ),
+    (
+        r"^lora_unet_transformer_blocks_(\d+)_attn_to_add_out\.",
+        r"transformer_blocks.\1.attn.to_add_out.",
+    ),
+    (
+        r"^lora_unet_transformer_blocks_(\d+)_img_mlp_net_0_proj\.",
+        r"transformer_blocks.\1.img_mlp.net.0.proj.",
+    ),
+    (
+        r"^lora_unet_transformer_blocks_(\d+)_img_mlp_net_2\.",
+        r"transformer_blocks.\1.img_mlp.net.2.",
+    ),
+    (
+        r"^lora_unet_transformer_blocks_(\d+)_txt_mlp_net_0_proj\.",
+        r"transformer_blocks.\1.txt_mlp.net.0.proj.",
+    ),
+    (
+        r"^lora_unet_transformer_blocks_(\d+)_txt_mlp_net_2\.",
+        r"transformer_blocks.\1.txt_mlp.net.2.",
+    ),
+    (
+        r"^lora_unet_transformer_blocks_(\d+)_img_mod_1\.",
+        r"transformer_blocks.\1.img_mod.1.",
+    ),
+    (
+        r"^lora_unet_transformer_blocks_(\d+)_txt_mod_1\.",
+        r"transformer_blocks.\1.txt_mod.1.",
+    ),
+]
+
+
+def _convert_non_diffusers_qwen_lora_to_diffusers(
+    state_dict: Mapping[str, torch.Tensor], log: logging.Logger
+) -> Dict[str, torch.Tensor]:
+    """Rewrite NON_DIFFUSERS_SD keys (Qwen-Image transformer blocks) into dot-notation."""
+    out: Dict[str, torch.Tensor] = {}
+    for k, v in state_dict.items():
+        nk = k
+        for pat, rep in _QWEN_UNET_REWRITES:
+            nk2 = re.sub(pat, rep, nk)
+            if nk2 != nk:
+                nk = nk2
+                break
+        out[nk] = v
+
+    sample = _sample_keys(out.keys(), 20)
+    log.info(
+        "[LoRAFormatAdapter] after NON_DIFFUSERS_QWEN rewrite, sample keys (<=20): %s",
+        ", ".join(sample),
+    )
+    return out
 
 
 def _looks_like_wan_lora(state_dict: Mapping[str, torch.Tensor]) -> bool:
@@ -785,13 +957,8 @@ def _looks_like_qwen_image(state_dict: Mapping[str, torch.Tensor]) -> bool:
     )
 
 
-# ---------------------------------------------------------------------------
-# Format detection
-# ---------------------------------------------------------------------------
-
-
 def detect_lora_format_from_state_dict(
-    state_dict: Mapping[str, torch.Tensor],
+    state_dict: Mapping[str, torch.Tensor]
 ) -> LoRAFormat:
     """Classify LoRA format by key patterns only."""
     keys = list(state_dict.keys())
@@ -821,14 +988,8 @@ def detect_lora_format_from_state_dict(
     return LoRAFormat.STANDARD
 
 
-# ---------------------------------------------------------------------------
-# Converters
-# ---------------------------------------------------------------------------
-
-
 def _convert_qwen_image_standard(
-    state_dict: Mapping[str, torch.Tensor],
-    log: logging.Logger,
+    state_dict: Mapping[str, torch.Tensor], log: logging.Logger
 ) -> Dict[str, torch.Tensor]:
     """Qwen-Image: transformer.*.lora.down/up -> transformer_blocks.*.lora_A/B."""
     out: Dict[str, torch.Tensor] = {}
@@ -851,8 +1012,7 @@ def _convert_qwen_image_standard(
 
 
 def _convert_non_diffusers_sd_simple(
-    state_dict: Mapping[str, torch.Tensor],
-    log: logging.Logger,
+    state_dict: Mapping[str, torch.Tensor], log: logging.Logger
 ) -> Dict[str, torch.Tensor]:
     """Generic down/up -> A/B conversion for non-diffusers SD-like formats."""
     out: Dict[str, torch.Tensor] = {}
@@ -873,8 +1033,7 @@ def _convert_non_diffusers_sd_simple(
 
     sample = _sample_keys(out.keys(), 20)
     log.info(
-        "[LoRAFormatAdapter] after NON_DIFFUSERS_SD simple conversion, "
-        "sample keys (<=20): %s",
+        "[LoRAFormatAdapter] after NON_DIFFUSERS_SD simple conversion, sample keys (<=20): %s",
         ", ".join(sample),
     )
     return out
@@ -887,9 +1046,7 @@ def _convert_with_diffusers_utils_if_available(
     """Use diffusers.lora_conversion_utils if available."""
     try:
         if hasattr(lcu, "maybe_convert_state_dict"):
-            converted = lcu.maybe_convert_state_dict(  # type: ignore[attr-defined]
-                state_dict
-            )
+            converted = lcu.maybe_convert_state_dict(state_dict)  # type: ignore[attr-defined]
         else:
             converted = dict(state_dict)
 
@@ -898,15 +1055,13 @@ def _convert_with_diffusers_utils_if_available(
 
         sample = _sample_keys(converted.keys(), 20)
         log.info(
-            "[LoRAFormatAdapter] diffusers.lora_conversion_utils converted keys, "
-            "sample keys (<=20): %s",
+            "[LoRAFormatAdapter] diffusers.lora_conversion_utils converted keys, sample keys (<=20): %s",
             ", ".join(sample),
         )
         return converted
     except Exception as exc:  # pragma: no cover
         log.warning(
-            "[LoRAFormatAdapter] diffusers lora_conversion_utils failed, "
-            "falling back to internal converters. Error: %s",
+            "[LoRAFormatAdapter] diffusers lora_conversion_utils failed, falling back. Error: %s",
             exc,
         )
         return None
@@ -949,8 +1104,7 @@ def _convert_via_diffusers_candidates(
 
 
 def _convert_xlabs_ai_via_diffusers(
-    state_dict: Mapping[str, torch.Tensor],
-    log: logging.Logger,
+    state_dict: Mapping[str, torch.Tensor], log: logging.Logger
 ) -> Dict[str, torch.Tensor]:
     """Convert XLabs FLUX LoRA via diffusers helpers."""
     return _convert_via_diffusers_candidates(
@@ -962,23 +1116,15 @@ def _convert_xlabs_ai_via_diffusers(
             "convert_xlabs_flux_lora_to_diffusers",
         ),
         log=log,
-        unavailable_warning=(
-            "[LoRAFormatAdapter] XLabs FLUX detected but diffusers is unavailable."
-        ),
-        no_converter_warning=(
-            "[LoRAFormatAdapter] No XLabs FLUX converter found in diffusers."
-        ),
+        unavailable_warning="[LoRAFormatAdapter] XLabs FLUX detected but diffusers is unavailable.",
+        no_converter_warning="[LoRAFormatAdapter] No XLabs FLUX converter found in diffusers.",
         success_info="[LoRAFormatAdapter] Converted XLabs FLUX LoRA using {name}",
-        all_failed_warning=(
-            "[LoRAFormatAdapter] All XLabs FLUX converters failed; "
-            "last error: {last_err}"
-        ),
+        all_failed_warning="[LoRAFormatAdapter] All XLabs FLUX converters failed; last error: {last_err}",
     )
 
 
 def _convert_kohya_flux_via_diffusers(
-    state_dict: Mapping[str, torch.Tensor],
-    log: logging.Logger,
+    state_dict: Mapping[str, torch.Tensor], log: logging.Logger
 ) -> Dict[str, torch.Tensor]:
     """Convert Kohya FLUX LoRA via diffusers helpers."""
     return _convert_via_diffusers_candidates(
@@ -988,21 +1134,11 @@ def _convert_kohya_flux_via_diffusers(
             "convert_kohya_flux_lora_to_diffusers",
         ),
         log=log,
-        unavailable_warning=(
-            "[LoRAFormatAdapter] Kohya FLUX detected but diffusers is unavailable."
-        ),
+        unavailable_warning="[LoRAFormatAdapter] Kohya FLUX detected but diffusers is unavailable.",
         no_converter_warning="[LoRAFormatAdapter] No Kohya FLUX converter found.",
         success_info="[LoRAFormatAdapter] Converted Kohya FLUX LoRA using {name}",
-        all_failed_warning=(
-            "[LoRAFormatAdapter] Kohya FLUX conversion failed; "
-            "last error: {last_err}"
-        ),
+        all_failed_warning="[LoRAFormatAdapter] Kohya FLUX conversion failed; last error: {last_err}",
     )
-
-
-# ---------------------------------------------------------------------------
-# Conversion dispatcher
-# ---------------------------------------------------------------------------
 
 
 def convert_lora_state_dict_by_format(
@@ -1042,31 +1178,28 @@ def convert_lora_state_dict_by_format(
         maybe = _convert_with_diffusers_utils_if_available(state_dict, log)
         if maybe is None:
             maybe = dict(state_dict)
+
+        if _looks_like_non_diffusers_qwen_unet(maybe):
+            maybe = _convert_non_diffusers_qwen_lora_to_diffusers(maybe, log)
+
         return _convert_non_diffusers_sd_simple(maybe, log)
 
     log.info(
-        "[LoRAFormatAdapter] format %s not handled specially, returning as-is",
-        fmt,
+        "[LoRAFormatAdapter] format %s not handled specially, returning as-is", fmt
     )
     return dict(state_dict)
-
-
-# ---------------------------------------------------------------------------
-# Public entry point
-# ---------------------------------------------------------------------------
 
 
 def normalize_lora_state_dict(
     state_dict: Mapping[str, torch.Tensor],
     logger: Optional[logging.Logger] = None,
 ) -> Dict[str, torch.Tensor]:
-    """Normalize any supported LoRA format into a single canonical layout."""
+    """Normalize any supported LoRA format into a canonical layout."""
     log = logger or globals()["logger"]
 
     keys = list(state_dict.keys())
     log.info(
-        "[LoRAFormatAdapter] normalize_lora_state_dict called, #keys=%d",
-        len(keys),
+        "[LoRAFormatAdapter] normalize_lora_state_dict called, #keys=%d", len(keys)
     )
     if keys:
         log.info(
