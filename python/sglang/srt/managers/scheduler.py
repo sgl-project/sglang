@@ -499,7 +499,7 @@ class Scheduler(
 
         # Draft workers are looked up via `SpeculativeAlgorithm` registry; new
         # algorithms should register their factory instead of patching this code.
-        if self.spec_algorithm.is_eagle() or self.spec_algorithm.is_standalone():
+        if self.spec_algorithm.supports_spec_v2():
             draft_worker_kwargs["enable_overlap"] = self.enable_overlap
 
         # FIXME: refactor the draft worker registration logic
@@ -852,9 +852,7 @@ class Scheduler(
 
         if self.draft_worker is None or self.spec_algorithm.is_ngram():
             draft_token_to_kv_pool = None
-        elif (
-            self.spec_algorithm.is_eagle() or self.spec_algorithm.is_standalone()
-        ) and self.enable_overlap:
+        elif self.spec_algorithm.supports_spec_v2() and self.enable_overlap:
             if self.server_args.enable_multi_layer_eagle:
                 draft_runner = self.draft_worker.draft_worker.draft_runner_list[0]
             else:

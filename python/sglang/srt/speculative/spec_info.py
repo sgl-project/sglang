@@ -161,6 +161,9 @@ class SpeculativeAlgorithm(metaclass=_SpeculativeAlgorithmMeta):
     def is_none(self) -> bool:
         return self is SpeculativeAlgorithm.NONE
 
+    def supports_spec_v2(self) -> bool:
+        return self.is_eagle() or self.is_eagle3() or self.is_standalone()
+
     def is_eagle(self) -> bool:
         return self._has_flag("EAGLE")
 
