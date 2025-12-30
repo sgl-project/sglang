@@ -156,12 +156,15 @@ echo performance | sudo tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governo
 cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor # shows performance
 ```
 
-### Disable NUMA balancing
+### Disable NUMA balancing and enable cpu affinity
 
 ```shell
 sudo sysctl -w kernel.numa_balancing=0
 # Check
 cat /proc/sys/kernel/numa_balancing # shows 0
+
+# Enabling CPU Affinity
+export SGLANG_SET_CPU_AFFINITY=1
 ```
 
 ### Prevent swapping out system memory
