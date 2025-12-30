@@ -241,11 +241,8 @@ class ModelSlimW4A8Int8MoE(ModelSlimMoEMethod):
         layer,
         dispatch_output: "StandardDispatchOutput",
     ) -> "CombineInput":
-        # FIXME W4A8 without EP gives 0 accuracy
-        raise NotImplementedError(
-            f"W4A8 only support with deepep for now, please enable --moe-a2a-backend deepep"
-        )
-        # return self.kernel.apply(layer, dispatch_output)
+        # FIXME W4A8 without EP can give 0 accuracy
+        return self.kernel.apply(layer, dispatch_output)
 
     def apply_without_routing_weights(
         self,
