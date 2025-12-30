@@ -39,9 +39,7 @@ from sglang.test.runners import HFRunner, SRTRunner
 
 register_cuda_ci(
     est_time=300,
-    suite="nightly-1-gpu",
-    nightly=True,
-    disabled="Temporarily disabled, will be fixed later",
+    suite="stage-b-test-small-1-gpu",
 )
 
 from sglang.test.test_utils import DEFAULT_PORT_FOR_SRT_TEST_RUNNER, CustomTestCase
