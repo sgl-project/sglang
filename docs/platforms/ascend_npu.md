@@ -97,7 +97,7 @@ mv python/pyproject_other.toml python/pyproject.toml
 pip install -e python[srt_npu]
 ```
 
-### Method 2: Using docker Image
+### Method 2: Using Docker Image
 #### Obtain Image
 You can download the Sglang image or build an image based on Dockerfile to obtain the Ascend NPU image.
 1. Download Sglang image
@@ -123,7 +123,7 @@ docker build -t <image_name> -f npu.Dockerfile .
 #### Create Docker
 __Notice:__ `--privileged` and `--network=host` are required by RDMA, which is typically needed by Ascend NPU clusters.
 
-__Notice:__ The following docs 800I A3 machines. If you are using Atlas 800I A2, make sure oker command is based on Atlanly `davinci[0-7]` are mapped into container.
+__Notice:__ The following docker command is based on Atlas 800I A3 machines. If you are using Atlas 800I A2, make sure only `davinci[0-7]` are mapped into container.
 
 ```shell
 
@@ -138,7 +138,7 @@ alias drun='docker run -it --rm --privileged --network=host --ipc=host --shm-siz
     --volume /etc/ascend_install.info:/etc/ascend_install.info \
     --volume /var/queue_schedule:/var/queue_schedule --volume ~/.cache/:/root/.cache/'
 
-# Add HF_TOKEN env for download model by sglang. If your model weights has already in local disk, please remote the parameter `--env HF_TOKEN`
+# Add HF_TOKEN env for download model by sglang. If your model weights has already in local disk, please remove the parameter `--env HF_TOKEN`
 drun --env "HF_TOKEN=<secret>" \
     <image_name> \
     python3 -m sglang.launch_server --model-path meta-llama/Llama-3.1-8B-Instruct --attention-backend ascend --host 127.0.0.1 --port 30000

@@ -57,14 +57,14 @@ You are welcome to enable various models based on your business requirements.
 
 ## Embedding Models
 
-| Model Family             | Example Models                            | A2 Supported                           |               A3 Supported               |
-|--------------------------|-------------------------------------------|----------------------------------------|:----------------------------------------:|
-| E5 (Llama/Mistral based) | 	intfloat/e5-mistral-7b-instruct          | **<span style="color: red;">×</span>** |  **<span style="color: red;">×</span>**  |
-| GTE-Qwen2                | 	iic/gte_Qwen2-1.5B-instruct              | **<span style="color: red;">×</span>** |  **<span style="color: red;">×</span>**  |
-| Qwen3-Embedding          | 	Qwen/Qwen3-Embedding-8B                  | **<span style="color: red;">×</span>** |  **<span style="color: red;">×</span>**  |
-| GME (Multimodal)         | 	Alibaba-NLP/gme-Qwen2-VL-2B-Instruct     | **<span style="color: red;">×</span>** |  **<span style="color: red;">×</span>**  |
-| CLIP                     | 	AI-ModelScope/clip-vit-large-patch14-336 | **<span style="color: red;">×</span>** | **<span style="color: green;">√</span>** |
-| BGE                      | 	BAAI/bge-large-en-v1.5                   | **<span style="color: red;">×</span>** |  **<span style="color: red;">×</span>**  |
+| Model Family             | Example Models                            | A2 Supported                             |               A3 Supported               |
+|--------------------------|-------------------------------------------|------------------------------------------|:----------------------------------------:|
+| E5 (Llama/Mistral based) | 	intfloat/e5-mistral-7b-instruct          | **<span style="color: red;">×</span>**   | **<span style="color: green;">√</span>** |
+| GTE-Qwen2                | 	iic/gte_Qwen2-1.5B-instruct              | **<span style="color: red;">×</span>**   | **<span style="color: green;">√</span>** |
+| Qwen3-Embedding          | 	Qwen/Qwen3-Embedding-8B                  | **<span style="color: red;">×</span>**   |  **<span style="color: red;">×</span>**  |
+| GME (Multimodal)         | 	Alibaba-NLP/gme-Qwen2-VL-2B-Instruct     | **<span style="color: red;">×</span>**   | **<span style="color: green;">√</span>** |
+| CLIP                     | 	AI-ModelScope/clip-vit-large-patch14-336 | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
+| BGE                      | 	BAAI/bge-large-en-v1.5                   | **<span style="color: red;">×</span>**   |  **<span style="color: red;">×</span>**  |
 
 ## Reward Models
 
