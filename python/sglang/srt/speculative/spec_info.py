@@ -2,12 +2,10 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from enum import Enum, IntEnum, auto
-from typing import Any, Callable, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, List, Optional, Tuple
 
-from sglang.srt.managers.schedule_batch import ModelWorkerBatch
-
-DraftWorkerClass = Callable[..., Any]
-DraftWorkerFactory = Callable[..., Any]
+if TYPE_CHECKING:
+    from sglang.srt.managers.schedule_batch import ModelWorkerBatch
 
 
 class SpeculativeAlgorithm(Enum):
