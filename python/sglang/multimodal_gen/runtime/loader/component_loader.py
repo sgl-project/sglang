@@ -192,11 +192,11 @@ class ComponentLoader(ABC):
             if consumed is None or consumed == 0.0:
                 consumed = gpu_mem_before_loading - current_gpu_mem
             logger.info(
-                f"Loaded %s: %s from {source}. avail mem: %.2f GB, %.2f GB consumed",
+                f"Loaded %s: %s from {source}. model size: %.2f GB, avail mem: %.2f GB",
                 module_name,
                 component.__class__.__name__,
-                current_gpu_mem,
                 consumed,
+                current_gpu_mem,
             )
         return component, consumed
 

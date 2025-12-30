@@ -718,6 +718,7 @@ def get_generate_fn(
     """Return appropriate generation function for the case."""
     # Allow override via environment variable (useful for AMD where large resolutions cause slow VAE)
     output_size = os.environ.get("SGLANG_TEST_OUTPUT_SIZE", sampling_params.output_size)
+    n = sampling_params.num_outputs_per_prompt
 
     def _create_and_download_video(
         client,
@@ -837,7 +838,7 @@ def get_generate_fn(
         response = client.images.with_raw_response.generate(
             model=model_path,
             prompt=sampling_params.prompt,
-            n=1,
+            n=n,
             size=output_size,
             response_format="b64_json",
         )
@@ -906,7 +907,7 @@ def get_generate_fn(
                 model=model_path,
                 image=images,
                 prompt=sampling_params.prompt,
-                n=1,
+                n=n,
                 size=output_size,
                 response_format="b64_json",
             )
@@ -974,7 +975,7 @@ def get_generate_fn(
             model=model_path,
             prompt=sampling_params.prompt,
             image=[],  # Only for OpenAI verification
-            n=1,
+            n=n,
             size=sampling_params.output_size,
             response_format="b64_json",
             extra_body={"url": image_urls},

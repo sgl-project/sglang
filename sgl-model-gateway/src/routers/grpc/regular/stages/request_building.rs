@@ -40,6 +40,7 @@ impl PipelineStage for RequestBuildingStage {
             RequestType::Chat(_) => self.chat_stage.execute(ctx).await,
             RequestType::Generate(_) => self.generate_stage.execute(ctx).await,
             RequestType::Embedding(_) => self.embedding_stage.execute(ctx).await,
+            RequestType::Classify(_) => self.embedding_stage.execute(ctx).await,
             RequestType::Responses(_request) => {
                 error!(
                     function = "RequestBuildingStage::execute",

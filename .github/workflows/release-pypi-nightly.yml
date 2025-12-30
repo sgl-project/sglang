@@ -24,77 +24,50 @@ jobs:
     if: github.repository == 'sgl-project/sglang'
     runs-on: ubuntu-latest
     outputs:
-      nightly_version: ${{ steps.gen_version.outputs.nightly_version }}
-      commit_hash: ${{ steps.gen_version.outputs.commit_hash }}
-      build_date: ${{ steps.gen_version.outputs.build_date }}
+      nightly_version: ${{ steps.build.outputs.nightly_version }}
+      commit_hash: ${{ steps.build.outputs.commit_hash }}
+      build_date: ${{ steps.build.outputs.build_date }}
     steps:
       - uses: actions/checkout@v4
         with:
           # Use commit from: 1) Docker workflow, 2) manual input, 3) latest main
           ref: ${{ github.event.client_payload.commit_sha || inputs.commit_sha || github.sha }}
-          fetch-depth: 0  # Need full history for version generation
+          fetch-depth: 0  # Need full history for setuptools-scm
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.10"
 
-      - name: Generate nightly version
-        id: gen_version
+      - name: Install build dependencies
         run: |
-          # Get base version from version.py
-          BASE_VERSION=$(cat python/sglang/version.py | cut -d'"' -f2)
+          pip install build wheel setuptools setuptools-scm
+
+      - name: Build wheel
+        id: build
+        run: |
+          cd python
+          cp ../README.md ../LICENSE .
+
+          # Build wheel - setuptools-scm automatically generates version from git tags
+          python3 -m build --wheel
+
+          # Extract version from built wheel filename
+          WHEEL_FILE=$(ls dist/*.whl)
+          NIGHTLY_VERSION=$(echo "$WHEEL_FILE" | sed 's/.*sglang-\(.*\)-py3.*/\1/')
 
           # Get commit info
           COMMIT_HASH=$(git rev-parse --short HEAD)
-          COMMIT_COUNT=$(git rev-list --count HEAD)
-
-          # Get current date in YYYY-MM-DD format for release tag
           BUILD_DATE=$(date -u +%Y-%m-%d)
-          # Get compact date format for wheel filename (YYYYMMDD)
-          BUILD_DATE_COMPACT=$(date -u +%Y%m%d)
 
-          # Generate nightly version following PEP 440
-          # Format: {base_version}.dev{commit_count}+{date}.g{commit_hash}
-          NIGHTLY_VERSION="${BASE_VERSION}.dev${COMMIT_COUNT}+${BUILD_DATE_COMPACT}.g${COMMIT_HASH}"
-
-          echo "Base version: ${BASE_VERSION}"
+          echo "Built wheel: $WHEEL_FILE"
           echo "Nightly version: ${NIGHTLY_VERSION}"
           echo "Commit: ${COMMIT_HASH}"
           echo "Build date: ${BUILD_DATE}"
 
           echo "nightly_version=${NIGHTLY_VERSION}" >> $GITHUB_OUTPUT
           echo "commit_hash=${COMMIT_HASH}" >> $GITHUB_OUTPUT
-          echo "base_version=${BASE_VERSION}" >> $GITHUB_OUTPUT
           echo "build_date=${BUILD_DATE}" >> $GITHUB_OUTPUT
-
-      - name: Update pyproject.toml with nightly version
-        run: |
-          cd python
-          BASE_VERSION=$(cat sglang/version.py | cut -d'"' -f2)
-          NIGHTLY_VERSION="${{ steps.gen_version.outputs.nightly_version }}"
-
-          # Update version (temporary, not committed)
-          sed -i "s/version = \"${BASE_VERSION}\"/version = \"${NIGHTLY_VERSION}\"/" pyproject.toml
-
-          # Verify update
-          echo "Updated version in pyproject.toml:"
-          grep "^version" pyproject.toml
-
-      - name: Install build dependencies
-        run: |
-          cd python
-          pip install build wheel setuptools
-
-      - name: Build wheel
-        run: |
-          cd python
-          cp ../README.md ../LICENSE .
-          python3 -m build --wheel
-
-          # List built wheels
-          echo "Built wheel:"
-          ls -lh dist/
 
       - name: Upload wheel artifact
         uses: actions/upload-artifact@v4

@@ -122,7 +122,8 @@ jobs:
             echo "sccache not available, using regular cargo"
           fi
           # Run only the summary benchmark for quick validation in PRs
-          cargo bench --bench request_processing -- benchmark_summary --exact
+          # Capture output to file for CI summary
+          cargo bench --bench request_processing -- benchmark_summary --exact 2>&1 | tee benchmark_output.txt
 
       - name: Upload benchmark results
         if: always()
@@ -131,6 +132,7 @@ jobs:
           name: request-processing-results-${{ github.sha }}
           path: |
             sgl-model-gateway/target/criterion/benchmark_summary/
+            sgl-model-gateway/benchmark_output.txt
           retention-days: 30
 
       - name: Show sccache stats
@@ -193,7 +195,8 @@ jobs:
           else
             echo "sccache not available, using regular cargo"
           fi
-          cargo bench --bench tokenizer_benchmark
+          # Capture output to file for CI summary
+          cargo bench --bench tokenizer_benchmark 2>&1 | tee benchmark_output.txt
 
       - name: Upload benchmark results
         if: always()
@@ -202,6 +205,7 @@ jobs:
           name: tokenizer-results-${{ github.sha }}
           path: |
             sgl-model-gateway/target/criterion/tokenizer*/
+            sgl-model-gateway/benchmark_output.txt
           retention-days: 30
 
   benchmark-tool-parser:
@@ -260,7 +264,8 @@ jobs:
           else
             echo "sccache not available, using regular cargo"
           fi
-          cargo bench --bench tool_parser_benchmark
+          # Capture output to file for CI summary
+          cargo bench --bench tool_parser_benchmark 2>&1 | tee benchmark_output.txt
 
       - name: Upload benchmark results
         if: always()
@@ -269,6 +274,83 @@ jobs:
           name: tool-parser-results-${{ github.sha }}
           path: |
             sgl-model-gateway/target/criterion/tool_parser*/
+            sgl-model-gateway/benchmark_output.txt
+          retention-days: 30
+
+      - name: Show sccache stats
+        if: always()
+        run: sccache --show-stats
+
+  benchmark-tree:
+    name: Tree Benchmark
+    if: |
+      github.repository == 'sgl-project/sglang' &&
+      (github.event_name == 'push' ||
+       github.event_name == 'workflow_dispatch' ||
+       (contains(github.event.pull_request.labels.*.name, 'router-benchmark') &&
+        contains(github.event.pull_request.labels.*.name, 'run-ci')))
+    # Use 4-core runner for concurrent benchmarks that spawn multiple threads
+    runs-on: 4-gpu-a10
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 100
+
+      - name: Install dependencies
+        run: |
+          bash scripts/ci/ci_install_rust.sh
+
+      - name: Configure sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+        with:
+          version: "v0.10.0"
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: sgl-model-gateway
+          # Share cache across all benchmark jobs
+          shared-key: "rust-cache"
+          cache-all-crates: true
+          cache-on-failure: true
+          # Save cache even on failure
+          save-if: true
+
+      - name: Run tree benchmark
+        timeout-minutes: 30
+        run: |
+          source "$HOME/.cargo/env"
+          cd sgl-model-gateway/
+          # Try to use sccache, but disable if it fails
+          if command -v sccache &> /dev/null; then
+            echo "Testing sccache availability..."
+            # Try to start sccache and check if it works
+            export RUSTC_WRAPPER=sccache
+            export SCCACHE_GHA_ENABLED="true"
+            if sccache --start-server 2>/dev/null && sccache --show-stats 2>/dev/null; then
+              echo "sccache is working, using it for compilation"
+            else
+              echo "sccache failed to start, falling back to regular cargo"
+              unset RUSTC_WRAPPER
+              unset SCCACHE_GHA_ENABLED
+            fi
+          else
+            echo "sccache not available, using regular cargo"
+          fi
+          # Run summary benchmark for quick validation in CI
+          # Note: Don't use --exact because benchmark names are prefixed (benchmark_summary/insert_realistic)
+          # Capture output to file for CI summary
+          cargo bench --bench tree_benchmark -- benchmark_summary 2>&1 | tee benchmark_output.txt
+
+      - name: Upload benchmark results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tree-results-${{ github.sha }}
+          path: |
+            sgl-model-gateway/target/criterion/benchmark_summary*/
+            sgl-model-gateway/benchmark_output.txt
           retention-days: 30
 
       - name: Show sccache stats
@@ -277,7 +359,7 @@ jobs:
 
   benchmark-summary:
     name: Benchmark Summary
-    needs: [benchmark-request-processing, benchmark-tokenizer, benchmark-tool-parser]
+    needs: [benchmark-request-processing, benchmark-tokenizer, benchmark-tool-parser, benchmark-tree]
     if: always() && (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request')
     runs-on: ubuntu-latest
     steps:
@@ -289,29 +371,105 @@ jobs:
 
       - name: Generate summary
         run: |
-          echo "## Benchmark Results Summary" > summary.md
+          echo "## 🚀 Benchmark Results Summary" > summary.md
           echo "" >> summary.md
+
+          # Request Processing Benchmark
           echo "### Request Processing" >> summary.md
-          if [ -d "benchmark-results/request-processing-results-${{ github.sha }}" ]; then
-            echo "✅ Completed" >> summary.md
+          REQ_DIR="benchmark-results/request-processing-results-${{ github.sha }}"
+          if [ -d "$REQ_DIR" ]; then
+            echo "✅ **Completed**" >> summary.md
+            if [ -f "$REQ_DIR/benchmark_output.txt" ]; then
+              echo "" >> summary.md
+              echo "<details>" >> summary.md
+              echo "<summary>View Results</summary>" >> summary.md
+              echo "" >> summary.md
+              echo '```' >> summary.md
+              # Extract the summary section (starts with "SGLang Model Gateway" or performance data)
+              grep -A 100 "SGLang Model Gateway\|Quick Performance\|Performance Insights" "$REQ_DIR/benchmark_output.txt" | head -50 >> summary.md || cat "$REQ_DIR/benchmark_output.txt" | tail -60 >> summary.md
+              echo '```' >> summary.md
+              echo "</details>" >> summary.md
+            fi
           else
             echo "❌ Failed or skipped" >> summary.md
           fi
           echo "" >> summary.md
+
+          # Tokenizer Benchmark
           echo "### Tokenizer" >> summary.md
-          if [ -d "benchmark-results/tokenizer-results-${{ github.sha }}" ]; then
-            echo "✅ Completed" >> summary.md
+          TOK_DIR="benchmark-results/tokenizer-results-${{ github.sha }}"
+          if [ -d "$TOK_DIR" ]; then
+            echo "✅ **Completed**" >> summary.md
+            if [ -f "$TOK_DIR/benchmark_output.txt" ]; then
+              echo "" >> summary.md
+              echo "<details>" >> summary.md
+              echo "<summary>View Results</summary>" >> summary.md
+              echo "" >> summary.md
+              echo '```' >> summary.md
+              # Extract the summary table section
+              grep -A 200 "TOKENIZER BENCHMARK SUMMARY\|ENCODING THROUGHPUT" "$TOK_DIR/benchmark_output.txt" | head -100 >> summary.md || cat "$TOK_DIR/benchmark_output.txt" | tail -100 >> summary.md
+              echo '```' >> summary.md
+              echo "</details>" >> summary.md
+            fi
           else
             echo "❌ Failed or skipped" >> summary.md
           fi
           echo "" >> summary.md
+
+          # Tool Parser Benchmark
           echo "### Tool Parser" >> summary.md
-          if [ -d "benchmark-results/tool-parser-results-${{ github.sha }}" ]; then
-            echo "✅ Completed" >> summary.md
+          TOOL_DIR="benchmark-results/tool-parser-results-${{ github.sha }}"
+          if [ -d "$TOOL_DIR" ]; then
+            echo "✅ **Completed**" >> summary.md
+            if [ -f "$TOOL_DIR/benchmark_output.txt" ]; then
+              echo "" >> summary.md
+              echo "<details>" >> summary.md
+              echo "<summary>View Results</summary>" >> summary.md
+              echo "" >> summary.md
+              echo '```' >> summary.md
+              # Extract the summary table section
+              grep -A 200 "TOOL PARSER BENCHMARK SUMMARY\|REGISTRY OPERATIONS\|COMPLETE PARSING" "$TOOL_DIR/benchmark_output.txt" | head -100 >> summary.md || cat "$TOOL_DIR/benchmark_output.txt" | tail -100 >> summary.md
+              echo '```' >> summary.md
+              echo "</details>" >> summary.md
+            fi
           else
             echo "❌ Failed or skipped" >> summary.md
           fi
+          echo "" >> summary.md
+
+          # Tree Benchmark
+          echo "### Radix Tree (Cache-Aware Routing)" >> summary.md
+          TREE_DIR="benchmark-results/tree-results-${{ github.sha }}"
+          if [ -d "$TREE_DIR" ]; then
+            echo "✅ **Completed**" >> summary.md
+            if [ -f "$TREE_DIR/benchmark_output.txt" ]; then
+              echo "" >> summary.md
+              echo "<details>" >> summary.md
+              echo "<summary>View Results</summary>" >> summary.md
+              echo "" >> summary.md
+              echo '```' >> summary.md
+              # Extract benchmark results (printed incrementally during run)
+              echo "=== Summary Results ===" >> summary.md
+              grep "\[BENCH_RESULT\] summary" "$TREE_DIR/benchmark_output.txt" | sed 's/\[BENCH_RESULT\] //' >> summary.md || true
+              echo "" >> summary.md
+              # Also show the full summary table if available
+              grep -A 100 "RADIX TREE BENCHMARK SUMMARY\|CI SUMMARY" "$TREE_DIR/benchmark_output.txt" | head -60 >> summary.md || cat "$TREE_DIR/benchmark_output.txt" | tail -60 >> summary.md
+              echo '```' >> summary.md
+              echo "</details>" >> summary.md
+            fi
+          else
+            echo "❌ Failed or skipped" >> summary.md
+          fi
+
+          echo "" >> summary.md
+          echo "---" >> summary.md
+          echo "_Generated at $(date -u '+%Y-%m-%d %H:%M:%S UTC')_" >> summary.md
+
+          # Display summary in logs
           cat summary.md
+
+          # Write to GitHub Step Summary for visibility in the Actions UI
+          cat summary.md >> $GITHUB_STEP_SUMMARY
 
       - name: Upload summary
         uses: actions/upload-artifact@v4

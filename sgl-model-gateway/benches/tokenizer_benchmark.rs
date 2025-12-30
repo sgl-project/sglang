@@ -120,7 +120,7 @@ fn bench_encode_throughput(c: &mut Criterion) {
         let tokenizer_clone = tokenizer.clone();
 
         // Get token count once
-        let encoding = tokenizer.encode(prompt).unwrap();
+        let encoding = tokenizer.encode(prompt, false).unwrap();
         let token_count = encoding.token_ids().len();
 
         // Track if metrics have been printed for this test case
@@ -134,7 +134,7 @@ fn bench_encode_throughput(c: &mut Criterion) {
             b.iter_custom(|iters| {
                 let start = Instant::now();
                 for _ in 0..iters {
-                    black_box(tokenizer.encode(prompt).unwrap());
+                    black_box(tokenizer.encode(prompt, false).unwrap());
                 }
                 let duration = start.elapsed();
 
@@ -178,7 +178,7 @@ fn bench_batch_encode(c: &mut Criterion) {
     let batch_sizes = vec![1, 8, 16, 32, 64, 128];
     let prompt = MEDIUM_PROMPT;
     let prompt_len = prompt.len();
-    let encoding = tokenizer.encode(prompt).unwrap();
+    let encoding = tokenizer.encode(prompt, false).unwrap();
     let token_count = encoding.token_ids().len();
 
     let mut group = c.benchmark_group("batch_encode");
@@ -199,7 +199,7 @@ fn bench_batch_encode(c: &mut Criterion) {
                 b.iter_custom(|iters| {
                     let start = Instant::now();
                     for _ in 0..iters {
-                        black_box(tokenizer.encode_batch(&prompts).unwrap());
+                        black_box(tokenizer.encode_batch(&prompts, false).unwrap());
                     }
                     let duration = start.elapsed();
 
@@ -272,7 +272,7 @@ fn bench_concurrent_encode(c: &mut Criterion) {
                                 let mut local_chars = 0u64;
 
                                 while start.elapsed() < Duration::from_millis(500) {
-                                    let _ = tokenizer.encode(prompt).unwrap();
+                                    let _ = tokenizer.encode(prompt, false).unwrap();
                                     local_ops += 1;
                                     local_chars += prompt.len() as u64;
                                 }
@@ -325,7 +325,7 @@ fn bench_decode_performance(c: &mut Criterion) {
     );
 
     let test_text = "The quick brown fox jumps over the lazy dog. ".repeat(10);
-    let encoding = tokenizer.encode(&test_text).unwrap();
+    let encoding = tokenizer.encode(&test_text, false).unwrap();
     let tokens = encoding.token_ids();
     let num_tokens = tokens.len();
 
@@ -444,7 +444,7 @@ fn bench_streaming_decode_100k(c: &mut Criterion) {
     );
 
     let sample_text = "The quick brown fox jumps over the lazy dog. ".repeat(1000);
-    let encoding = tokenizer.encode(&sample_text).unwrap();
+    let encoding = tokenizer.encode(&sample_text, false).unwrap();
     let all_tokens = encoding.token_ids();
 
     let mut group = c.benchmark_group("streaming_100k");
@@ -587,13 +587,13 @@ fn bench_latency_distribution(c: &mut Criterion) {
 
                     // Warm up
                     for _ in 0..100 {
-                        let _ = tokenizer.encode(prompt).unwrap();
+                        let _ = tokenizer.encode(prompt, false).unwrap();
                     }
 
                     // Measure for statistics
                     for _ in 0..1000 {
                         let start = Instant::now();
-                        let _ = tokenizer.encode(prompt).unwrap();
+                        let _ = tokenizer.encode(prompt, false).unwrap();
                         let latency = start.elapsed();
                         latencies.push(latency);
                     }
@@ -623,7 +623,7 @@ fn bench_latency_distribution(c: &mut Criterion) {
                     // Regular benchmark iterations
                     let start = Instant::now();
                     for _ in 0..iters {
-                        black_box(tokenizer.encode(prompt).unwrap());
+                        black_box(tokenizer.encode(prompt, false).unwrap());
                     }
                     start.elapsed()
                 };
@@ -712,7 +712,7 @@ fn bench_concurrent_streaming(c: &mut Criterion) {
     let tokens_per_sequence = 10_000;
 
     let sample_text = "The quick brown fox jumps over the lazy dog. ".repeat(100);
-    let encoding = tokenizer.encode(&sample_text).unwrap();
+    let encoding = tokenizer.encode(&sample_text, false).unwrap();
     let token_batch: Vec<u32> = encoding.token_ids().to_vec();
 
     let mut group = c.benchmark_group("concurrent_streaming");
@@ -795,7 +795,7 @@ fn bench_stop_sequences(c: &mut Criterion) {
         .with_stop_token(2);
 
     let sample_text = "Hello world! This is a test. ### Stop here. Continue after.".repeat(100);
-    let encoding = tokenizer.encode(&sample_text).unwrap();
+    let encoding = tokenizer.encode(&sample_text, false).unwrap();
     let tokens = encoding.token_ids();
 
     let mut group = c.benchmark_group("stop_sequences");
@@ -937,7 +937,7 @@ fn bench_multithreaded_encode(c: &mut Criterion) {
 
                             thread::spawn(move || {
                                 for _ in 0..operations_per_thread {
-                                    let encoding = tokenizer.encode(test_prompt).unwrap();
+                                    let encoding = tokenizer.encode(test_prompt, false).unwrap();
                                     total_tok.fetch_add(
                                         encoding.token_ids().len() as u64,
                                         Ordering::Relaxed,
@@ -1005,7 +1005,7 @@ fn bench_multithreaded_decode(c: &mut Criterion) {
 
     // Generate tokens for decoding
     let test_text = "The quick brown fox jumps over the lazy dog. ".repeat(100);
-    let encoding = tokenizer.encode(&test_text).unwrap();
+    let encoding = tokenizer.encode(&test_text, false).unwrap();
     let test_tokens: Vec<u32> = encoding.token_ids().to_vec();
 
     let mut group = c.benchmark_group("multithreaded_decode");
@@ -1102,7 +1102,7 @@ fn bench_memory_efficiency(c: &mut Criterion) {
     );
 
     let large_text = "The quick brown fox jumps over the lazy dog. ".repeat(1000);
-    let encoding = tokenizer.encode(&large_text).unwrap();
+    let encoding = tokenizer.encode(&large_text, false).unwrap();
 
     let mut group = c.benchmark_group("memory");
 
@@ -1324,7 +1324,7 @@ fn bench_l1_cache_chat_template(c: &mut Criterion) {
             for _ in 0..iters {
                 // Simulate 100 requests with different queries (realistic workload)
                 for prompt in &test_prompts {
-                    black_box(tokenizer.encode(prompt).unwrap());
+                    black_box(tokenizer.encode(prompt, false).unwrap());
                 }
             }
             let duration = start.elapsed();
@@ -1372,7 +1372,7 @@ fn bench_l1_cache_chat_template(c: &mut Criterion) {
 
             for _ in 0..iters {
                 for prompt in &test_prompts {
-                    black_box(cached.encode(prompt).unwrap());
+                    black_box(cached.encode(prompt, false).unwrap());
                 }
             }
             let duration = start.elapsed();
@@ -1423,13 +1423,13 @@ fn bench_l1_cache_chat_template(c: &mut Criterion) {
             cached.clear_cache(); // Start fresh
 
             // Prime with first request to populate L1 with system prefix
-            cached.encode(&test_prompts[0]).unwrap();
+            cached.encode(&test_prompts[0], false).unwrap();
 
             let start = Instant::now();
             for _ in 0..iters {
                 // All subsequent requests benefit from L1 prefix cache
                 for prompt in &test_prompts {
-                    black_box(cached.encode(prompt).unwrap());
+                    black_box(cached.encode(prompt, false).unwrap());
                 }
             }
             let duration = start.elapsed();
@@ -1507,12 +1507,12 @@ fn bench_l1_cache_chat_template(c: &mut Criterion) {
 
         b.iter_custom(|iters| {
             cached.clear_cache();
-            cached.encode(&test_prompts[0]).unwrap(); // Prime cache
+            cached.encode(&test_prompts[0], false).unwrap(); // Prime cache
 
             let start = Instant::now();
             for _ in 0..iters {
                 for prompt in &test_prompts {
-                    black_box(cached.encode(prompt).unwrap());
+                    black_box(cached.encode(prompt, false).unwrap());
                 }
             }
             let duration = start.elapsed();
@@ -1555,12 +1555,12 @@ fn bench_l1_cache_chat_template(c: &mut Criterion) {
 
         b.iter_custom(|iters| {
             cached.clear_cache();
-            cached.encode(&test_prompts[0]).unwrap(); // Prime cache
+            cached.encode(&test_prompts[0], false).unwrap(); // Prime cache
 
             let start = Instant::now();
             for _ in 0..iters {
                 for prompt in &test_prompts {
-                    black_box(cached.encode(prompt).unwrap());
+                    black_box(cached.encode(prompt, false).unwrap());
                 }
             }
             let duration = start.elapsed();
@@ -1623,7 +1623,7 @@ fn bench_l1_cache_chat_template(c: &mut Criterion) {
             for _ in 0..iters {
                 // Simulate progressive conversation (each turn shares prefix with previous)
                 for turn in &test_turns {
-                    black_box(cached.encode(turn).unwrap());
+                    black_box(cached.encode(turn, false).unwrap());
                 }
             }
             let duration = start.elapsed();
@@ -1692,12 +1692,12 @@ fn bench_l1_cache_chat_template(c: &mut Criterion) {
 
         b.iter_custom(|iters| {
             cached.clear_cache();
-            cached.encode(&test_prompts[0]).unwrap(); // Prime cache
+            cached.encode(&test_prompts[0], false).unwrap(); // Prime cache
 
             let start = Instant::now();
             for _ in 0..iters {
                 for prompt in &test_prompts {
-                    black_box(cached.encode(prompt).unwrap());
+                    black_box(cached.encode(prompt, false).unwrap());
                 }
             }
             let duration = start.elapsed();

@@ -3,6 +3,7 @@
 use async_trait::async_trait;
 use axum::response::Response;
 use tracing::error;
+use uuid::Uuid;
 
 use crate::routers::{
     error,
@@ -31,19 +32,21 @@ impl Default for EmbeddingRequestBuildingStage {
 #[async_trait]
 impl PipelineStage for EmbeddingRequestBuildingStage {
     async fn execute(&self, ctx: &mut RequestContext) -> Result<Option<Response>, Response> {
-        // Check if the request is of type Embedding
-        if let RequestType::Embedding(_) = &ctx.input.request_type {
-            // Proceed as expected
-        } else {
-            error!(
-                function = "EmbeddingRequestBuildingStage::execute",
-                "Invalid request type: expected Embedding"
-            );
-            return Err(error::internal_error(
-                "invalid_request_type",
-                "Expected Embedding request",
-            ));
-        }
+        // Extract log_metrics from embedding or classify request (both use same backend)
+        let log_metrics = match &ctx.input.request_type {
+            RequestType::Embedding(req) => req.log_metrics,
+            RequestType::Classify(req) => req.log_metrics,
+            _ => {
+                error!(
+                    function = "EmbeddingRequestBuildingStage::execute",
+                    "Invalid request type: expected Embedding or Classify"
+                );
+                return Err(error::internal_error(
+                    "invalid_request_type",
+                    "Expected Embedding or Classify request",
+                ));
+            }
+        };
 
         // Preparation output should have tokenized input
         let prep_output = ctx.state.preparation.as_ref().ok_or_else(|| {
@@ -68,13 +71,12 @@ impl PipelineStage for EmbeddingRequestBuildingStage {
                 error::internal_error("client_missing", "Client not selected")
             })?;
 
-        // Extract request ID
-        let request_id = ctx
-            .state
-            .dispatch
-            .as_ref()
-            .map(|d| d.request_id.clone())
-            .unwrap_or_else(|| "unknown".to_string());
+        // Generate request ID with appropriate prefix based on request type
+        let request_id = match &ctx.input.request_type {
+            RequestType::Embedding(_) => format!("embed-{}", Uuid::new_v4()),
+            RequestType::Classify(_) => format!("classify-{}", Uuid::new_v4()),
+            _ => format!("embed-{}", Uuid::new_v4()), // fallback
+        };
 
         // Extract original text
         let original_text = prep_output.original_text.clone();
@@ -82,13 +84,12 @@ impl PipelineStage for EmbeddingRequestBuildingStage {
         // Use backend-specific builder to create ProtoEmbedRequest
         // Currently only SGLang supports embedding via gRPC
         let sglang_client = client.as_sglang();
-        let embedding_request = ctx.embedding_request();
 
         let sglang_req = sglang_client.build_embed_request(
             request_id.clone(),
             original_text,
             prep_output.token_ids.clone(),
-            embedding_request.log_metrics,
+            log_metrics,
         );
 
         let proto_req = ProtoEmbedRequest::Sglang(Box::new(sglang_req));

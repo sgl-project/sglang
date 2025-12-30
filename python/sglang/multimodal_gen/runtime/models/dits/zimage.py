@@ -11,7 +11,6 @@ from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm
 from sglang.multimodal_gen.runtime.layers.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
-    QKVParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
 )
@@ -110,16 +109,13 @@ class ZImageAttention(nn.Module):
         super().__init__()
         self.dim = dim
         self.head_dim = dim // num_heads
+        self.num_heads = num_heads
+        self.num_kv_heads = num_kv_heads
         self.qk_norm = qk_norm
 
-        # Use QKVParallelLinear for QKV projection (fused)
-        self.to_qkv = QKVParallelLinear(
-            hidden_size=dim,
-            head_size=self.head_dim,
-            total_num_heads=num_heads,
-            total_num_kv_heads=num_kv_heads,
-            bias=False,
-        )
+        self.to_q = ReplicatedLinear(dim, dim, bias=False)
+        self.to_k = ReplicatedLinear(dim, self.head_dim * num_kv_heads, bias=False)
+        self.to_v = ReplicatedLinear(dim, self.head_dim * num_kv_heads, bias=False)
 
         if self.qk_norm:
             self.norm_q = RMSNorm(self.head_dim, eps=eps)
@@ -146,14 +142,13 @@ class ZImageAttention(nn.Module):
         hidden_states: torch.Tensor,
         freqs_cis: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ):
-        qkv, _ = self.to_qkv(hidden_states)
-        q_dim = self.to_qkv.num_heads * self.head_dim
-        kv_dim = self.to_qkv.num_kv_heads * self.head_dim
-        q, k, v = torch.split(qkv, [q_dim, kv_dim, kv_dim], dim=-1)
+        q, _ = self.to_q(hidden_states)
+        k, _ = self.to_k(hidden_states)
+        v, _ = self.to_v(hidden_states)
 
-        q = q.view(*q.shape[:-1], self.to_qkv.num_heads, self.head_dim)
-        k = k.view(*k.shape[:-1], self.to_qkv.num_kv_heads, self.head_dim)
-        v = v.view(*v.shape[:-1], self.to_qkv.num_kv_heads, self.head_dim)
+        q = q.view(*q.shape[:-1], self.num_heads, self.head_dim)
+        k = k.view(*k.shape[:-1], self.num_kv_heads, self.head_dim)
+        v = v.view(*v.shape[:-1], self.num_kv_heads, self.head_dim)
 
         if self.norm_q is not None:
             q = self.norm_q(q)

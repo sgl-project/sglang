@@ -242,6 +242,40 @@ pub trait Worker: Send + Sync + fmt::Debug {
         self.metadata().provider_for_model(model_id)
     }
 
+    /// Check if a model is a classifier (has id2label mapping).
+    fn is_classifier(&self, model_id: &str) -> bool {
+        self.metadata()
+            .find_model(model_id)
+            .map(|m| m.is_classifier())
+            .unwrap_or(false)
+    }
+
+    /// Get the id2label mapping for a classification model.
+    /// Returns None if model is not a classifier or not found.
+    fn id2label(&self, model_id: &str) -> Option<&std::collections::HashMap<u32, String>> {
+        self.metadata()
+            .find_model(model_id)
+            .filter(|m| m.is_classifier())
+            .map(|m| &m.id2label)
+    }
+
+    /// Get the number of classification labels for a model.
+    fn num_labels(&self, model_id: &str) -> u32 {
+        self.metadata()
+            .find_model(model_id)
+            .map(|m| m.num_labels)
+            .unwrap_or(0)
+    }
+
+    /// Get label for a class index from a classification model.
+    /// Returns generic label (LABEL_N) if model not found or index not in mapping.
+    fn get_label(&self, model_id: &str, class_idx: u32) -> String {
+        self.metadata()
+            .find_model(model_id)
+            .map(|m| m.get_label(class_idx))
+            .unwrap_or_else(|| format!("LABEL_{}", class_idx))
+    }
+
     /// Check if this worker supports a specific model.
     /// If models list is empty, worker accepts any model.
     fn supports_model(&self, model_id: &str) -> bool {

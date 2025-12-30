@@ -128,292 +128,419 @@ enum Commands {
 
 #[derive(Parser, Debug)]
 struct CliArgs {
-    #[arg(long, default_value = "0.0.0.0")]
+    // ==================== Worker Configuration ====================
+    /// Host address to bind the router server
+    #[arg(long, default_value = "0.0.0.0", help_heading = "Worker Configuration")]
     host: String,
 
-    #[arg(long, default_value_t = 30000)]
+    /// Port number to bind the router server
+    #[arg(long, default_value_t = 30000, help_heading = "Worker Configuration")]
     port: u16,
 
-    #[arg(long, num_args = 0..)]
+    /// List of worker URLs (supports IPv4 and IPv6)
+    #[arg(long, num_args = 0.., help_heading = "Worker Configuration")]
     worker_urls: Vec<String>,
 
-    #[arg(long, default_value = "cache_aware", value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "prefix_hash", "manual"])]
+    // ==================== Routing Policy ====================
+    /// Load balancing policy to use
+    #[arg(long, default_value = "cache_aware", value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "prefix_hash", "manual"], help_heading = "Routing Policy")]
     policy: String,
 
-    #[arg(long, default_value_t = false)]
-    pd_disaggregation: bool,
-
-    #[arg(long, action = ArgAction::Append)]
-    decode: Vec<String>,
-
-    #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "prefix_hash", "manual"])]
-    prefill_policy: Option<String>,
-
-    #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "prefix_hash", "manual"])]
-    decode_policy: Option<String>,
-
-    #[arg(long, default_value_t = 1800)]
-    worker_startup_timeout_secs: u64,
-
-    #[arg(long, default_value_t = 30)]
-    worker_startup_check_interval: u64,
-
-    #[arg(long, default_value_t = 0.3)]
+    /// Cache threshold (0.0-1.0) for cache-aware routing
+    #[arg(long, default_value_t = 0.3, help_heading = "Routing Policy")]
     cache_threshold: f32,
 
-    #[arg(long, default_value_t = 64)]
+    /// Absolute threshold for load balancing trigger
+    #[arg(long, default_value_t = 64, help_heading = "Routing Policy")]
     balance_abs_threshold: usize,
 
-    #[arg(long, default_value_t = 1.5)]
+    /// Relative threshold for load balancing trigger
+    #[arg(long, default_value_t = 1.5, help_heading = "Routing Policy")]
     balance_rel_threshold: f32,
 
-    #[arg(long, default_value_t = 120)]
+    /// Interval in seconds between cache eviction operations
+    #[arg(long, default_value_t = 120, help_heading = "Routing Policy")]
     eviction_interval: u64,
 
-    #[arg(long, default_value_t = 67108864)]
+    /// Maximum size of the approximation tree for cache-aware routing
+    #[arg(long, default_value_t = 67108864, help_heading = "Routing Policy")]
     max_tree_size: usize,
 
-    /// Number of prefix tokens to use for prefix_hash policy (default: 256)
-    #[arg(long, default_value_t = 256)]
+    /// Number of prefix tokens to use for prefix_hash policy
+    #[arg(long, default_value_t = 256, help_heading = "Routing Policy")]
     prefix_token_count: usize,
 
-    /// Load factor threshold for prefix_hash policy (default: 1.25)
-    #[arg(long, default_value_t = 1.25)]
+    /// Load factor threshold for prefix_hash policy
+    #[arg(long, default_value_t = 1.25, help_heading = "Routing Policy")]
     prefix_hash_load_factor: f64,
 
-    #[arg(long, default_value_t = 536870912)]
-    max_payload_size: usize,
-
-    #[arg(long, default_value_t = false)]
+    /// Enable data parallelism aware scheduling
+    #[arg(long, default_value_t = false, help_heading = "Routing Policy")]
     dp_aware: bool,
 
-    #[arg(long)]
-    api_key: Option<String>,
-
-    #[arg(long, value_enum, default_value_t = Backend::Sglang, alias = "runtime")]
-    backend: Backend,
-
-    #[arg(long)]
-    log_dir: Option<String>,
-
-    #[arg(long, default_value = "info", value_parser = ["debug", "info", "warn", "error"])]
-    log_level: String,
-
-    #[arg(long, default_value_t = false)]
-    service_discovery: bool,
-
-    #[arg(long, num_args = 0..)]
-    selector: Vec<String>,
-
-    #[arg(long, default_value_t = 80)]
-    service_discovery_port: u16,
-
-    #[arg(long)]
-    service_discovery_namespace: Option<String>,
-
-    #[arg(long, num_args = 0..)]
-    prefill_selector: Vec<String>,
-
-    #[arg(long, num_args = 0..)]
-    decode_selector: Vec<String>,
-
-    #[arg(long, default_value_t = 29000)]
-    prometheus_port: u16,
-
-    #[arg(long, default_value = "0.0.0.0")]
-    prometheus_host: String,
-
-    #[arg(long, num_args = 0..)]
-    prometheus_duration_buckets: Vec<f64>,
-
-    #[arg(long, num_args = 0..)]
-    request_id_headers: Vec<String>,
-
-    #[arg(long, default_value_t = 1800)]
-    request_timeout_secs: u64,
-
-    /// Grace period in seconds to wait for in-flight requests during shutdown.
-    /// When the server receives SIGTERM/SIGINT, it will stop accepting new connections
-    /// and wait up to this duration for existing streaming requests to complete.
-    #[arg(long, default_value_t = 180)]
-    shutdown_grace_period_secs: u64,
-
-    #[arg(long, default_value_t = -1)]
-    max_concurrent_requests: i32,
-
-    #[arg(long, default_value_t = 100)]
-    queue_size: usize,
-
-    #[arg(long, default_value_t = 60)]
-    queue_timeout_secs: u64,
-
-    #[arg(long)]
-    rate_limit_tokens_per_second: Option<i32>,
-
-    #[arg(long, num_args = 0..)]
-    cors_allowed_origins: Vec<String>,
-
-    #[arg(long, default_value_t = 5)]
-    retry_max_retries: u32,
-
-    #[arg(long, default_value_t = 50)]
-    retry_initial_backoff_ms: u64,
-
-    #[arg(long, default_value_t = 30000)]
-    retry_max_backoff_ms: u64,
-
-    #[arg(long, default_value_t = 1.5)]
-    retry_backoff_multiplier: f32,
-
-    #[arg(long, default_value_t = 0.2)]
-    retry_jitter_factor: f32,
-
-    #[arg(long, default_value_t = false)]
-    disable_retries: bool,
-
-    #[arg(long, default_value_t = 10)]
-    cb_failure_threshold: u32,
-
-    #[arg(long, default_value_t = 3)]
-    cb_success_threshold: u32,
-
-    #[arg(long, default_value_t = 60)]
-    cb_timeout_duration_secs: u64,
-
-    #[arg(long, default_value_t = 120)]
-    cb_window_duration_secs: u64,
-
-    #[arg(long, default_value_t = false)]
-    disable_circuit_breaker: bool,
-
-    #[arg(long, default_value_t = 3)]
-    health_failure_threshold: u32,
-
-    #[arg(long, default_value_t = 2)]
-    health_success_threshold: u32,
-
-    #[arg(long, default_value_t = 5)]
-    health_check_timeout_secs: u64,
-
-    #[arg(long, default_value_t = 60)]
-    health_check_interval_secs: u64,
-
-    #[arg(long, default_value = "/health")]
-    health_check_endpoint: String,
-
-    #[arg(long, default_value_t = false)]
+    /// Enable IGW (Inference Gateway) mode for multi-model support
+    #[arg(long, default_value_t = false, help_heading = "Routing Policy")]
     enable_igw: bool,
 
-    #[arg(long)]
+    // ==================== PD Disaggregation ====================
+    /// Enable PD (Prefill-Decode) disaggregated mode
+    #[arg(long, default_value_t = false, help_heading = "PD Disaggregation")]
+    pd_disaggregation: bool,
+
+    /// Decode server URLs (can be specified multiple times)
+    #[arg(long, action = ArgAction::Append, help_heading = "PD Disaggregation")]
+    decode: Vec<String>,
+
+    /// Specific policy for prefill nodes in PD mode
+    #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "prefix_hash", "manual"], help_heading = "PD Disaggregation")]
+    prefill_policy: Option<String>,
+
+    /// Specific policy for decode nodes in PD mode
+    #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "prefix_hash", "manual"], help_heading = "PD Disaggregation")]
+    decode_policy: Option<String>,
+
+    /// Timeout in seconds for worker startup and registration
+    #[arg(long, default_value_t = 1800, help_heading = "PD Disaggregation")]
+    worker_startup_timeout_secs: u64,
+
+    /// Interval in seconds between worker startup checks
+    #[arg(long, default_value_t = 30, help_heading = "PD Disaggregation")]
+    worker_startup_check_interval: u64,
+
+    // ==================== Service Discovery (Kubernetes) ====================
+    /// Enable Kubernetes service discovery
+    #[arg(
+        long,
+        default_value_t = false,
+        help_heading = "Service Discovery (Kubernetes)"
+    )]
+    service_discovery: bool,
+
+    /// Label selector for Kubernetes service discovery (format: key=value)
+    #[arg(long, num_args = 0.., help_heading = "Service Discovery (Kubernetes)")]
+    selector: Vec<String>,
+
+    /// Port to use for discovered worker pods
+    #[arg(
+        long,
+        default_value_t = 80,
+        help_heading = "Service Discovery (Kubernetes)"
+    )]
+    service_discovery_port: u16,
+
+    /// Kubernetes namespace to watch for pods
+    #[arg(long, help_heading = "Service Discovery (Kubernetes)")]
+    service_discovery_namespace: Option<String>,
+
+    /// Label selector for prefill server pods in PD mode
+    #[arg(long, num_args = 0.., help_heading = "Service Discovery (Kubernetes)")]
+    prefill_selector: Vec<String>,
+
+    /// Label selector for decode server pods in PD mode
+    #[arg(long, num_args = 0.., help_heading = "Service Discovery (Kubernetes)")]
+    decode_selector: Vec<String>,
+
+    // ==================== Logging ====================
+    /// Directory to store log files
+    #[arg(long, help_heading = "Logging")]
+    log_dir: Option<String>,
+
+    /// Set the logging level
+    #[arg(long, default_value = "info", value_parser = ["debug", "info", "warn", "error"], help_heading = "Logging")]
+    log_level: String,
+
+    // ==================== Prometheus Metrics ====================
+    /// Port to expose Prometheus metrics
+    #[arg(long, default_value_t = 29000, help_heading = "Prometheus Metrics")]
+    prometheus_port: u16,
+
+    /// Host address to bind the Prometheus metrics server
+    #[arg(long, default_value = "0.0.0.0", help_heading = "Prometheus Metrics")]
+    prometheus_host: String,
+
+    /// Custom buckets for Prometheus duration metrics
+    #[arg(long, num_args = 0.., help_heading = "Prometheus Metrics")]
+    prometheus_duration_buckets: Vec<f64>,
+
+    // ==================== Request Handling ====================
+    /// Custom HTTP headers to check for request IDs
+    #[arg(long, num_args = 0.., help_heading = "Request Handling")]
+    request_id_headers: Vec<String>,
+
+    /// Request timeout in seconds
+    #[arg(long, default_value_t = 1800, help_heading = "Request Handling")]
+    request_timeout_secs: u64,
+
+    /// Grace period in seconds to wait for in-flight requests during shutdown
+    #[arg(long, default_value_t = 180, help_heading = "Request Handling")]
+    shutdown_grace_period_secs: u64,
+
+    /// Maximum payload size in bytes
+    #[arg(long, default_value_t = 536870912, help_heading = "Request Handling")]
+    max_payload_size: usize,
+
+    /// CORS allowed origins
+    #[arg(long, num_args = 0.., help_heading = "Request Handling")]
+    cors_allowed_origins: Vec<String>,
+
+    // ==================== Rate Limiting ====================
+    /// Maximum concurrent requests (-1 to disable)
+    #[arg(long, default_value_t = -1, help_heading = "Rate Limiting")]
+    max_concurrent_requests: i32,
+
+    /// Queue size for pending requests when limit reached
+    #[arg(long, default_value_t = 100, help_heading = "Rate Limiting")]
+    queue_size: usize,
+
+    /// Maximum time in seconds a request can wait in queue
+    #[arg(long, default_value_t = 60, help_heading = "Rate Limiting")]
+    queue_timeout_secs: u64,
+
+    /// Token bucket refill rate (tokens per second)
+    #[arg(long, help_heading = "Rate Limiting")]
+    rate_limit_tokens_per_second: Option<i32>,
+
+    // ==================== Retry Configuration ====================
+    /// Maximum number of retry attempts
+    #[arg(long, default_value_t = 5, help_heading = "Retry Configuration")]
+    retry_max_retries: u32,
+
+    /// Initial backoff delay in milliseconds
+    #[arg(long, default_value_t = 50, help_heading = "Retry Configuration")]
+    retry_initial_backoff_ms: u64,
+
+    /// Maximum backoff delay in milliseconds
+    #[arg(long, default_value_t = 30000, help_heading = "Retry Configuration")]
+    retry_max_backoff_ms: u64,
+
+    /// Multiplier for exponential backoff
+    #[arg(long, default_value_t = 1.5, help_heading = "Retry Configuration")]
+    retry_backoff_multiplier: f32,
+
+    /// Jitter factor (0.0-1.0) for retry delays
+    #[arg(long, default_value_t = 0.2, help_heading = "Retry Configuration")]
+    retry_jitter_factor: f32,
+
+    /// Disable automatic retries
+    #[arg(long, default_value_t = false, help_heading = "Retry Configuration")]
+    disable_retries: bool,
+
+    // ==================== Circuit Breaker ====================
+    /// Number of failures before circuit opens
+    #[arg(long, default_value_t = 10, help_heading = "Circuit Breaker")]
+    cb_failure_threshold: u32,
+
+    /// Successes needed in half-open state to close
+    #[arg(long, default_value_t = 3, help_heading = "Circuit Breaker")]
+    cb_success_threshold: u32,
+
+    /// Seconds before attempting to close open circuit
+    #[arg(long, default_value_t = 60, help_heading = "Circuit Breaker")]
+    cb_timeout_duration_secs: u64,
+
+    /// Sliding window duration for tracking failures
+    #[arg(long, default_value_t = 120, help_heading = "Circuit Breaker")]
+    cb_window_duration_secs: u64,
+
+    /// Disable circuit breaker
+    #[arg(long, default_value_t = false, help_heading = "Circuit Breaker")]
+    disable_circuit_breaker: bool,
+
+    // ==================== Health Checks ====================
+    /// Failures before marking worker unhealthy
+    #[arg(long, default_value_t = 3, help_heading = "Health Checks")]
+    health_failure_threshold: u32,
+
+    /// Successes before marking worker healthy
+    #[arg(long, default_value_t = 2, help_heading = "Health Checks")]
+    health_success_threshold: u32,
+
+    /// Timeout in seconds for health check requests
+    #[arg(long, default_value_t = 5, help_heading = "Health Checks")]
+    health_check_timeout_secs: u64,
+
+    /// Interval in seconds between health checks
+    #[arg(long, default_value_t = 60, help_heading = "Health Checks")]
+    health_check_interval_secs: u64,
+
+    /// Health check endpoint path
+    #[arg(long, default_value = "/health", help_heading = "Health Checks")]
+    health_check_endpoint: String,
+
+    // ==================== Tokenizer ====================
+    /// Model path for loading tokenizer (HuggingFace ID or local path)
+    #[arg(long, help_heading = "Tokenizer")]
     model_path: Option<String>,
 
-    #[arg(long)]
+    /// Explicit tokenizer path (overrides model_path)
+    #[arg(long, help_heading = "Tokenizer")]
     tokenizer_path: Option<String>,
 
-    #[arg(long)]
+    /// Chat template path
+    #[arg(long, help_heading = "Tokenizer")]
     chat_template: Option<String>,
 
-    #[arg(long, default_value_t = false)]
+    /// Enable L0 (exact match) tokenizer cache
+    #[arg(long, default_value_t = false, help_heading = "Tokenizer")]
     tokenizer_cache_enable_l0: bool,
 
-    #[arg(long, default_value_t = 10000)]
+    /// Maximum entries in L0 tokenizer cache
+    #[arg(long, default_value_t = 10000, help_heading = "Tokenizer")]
     tokenizer_cache_l0_max_entries: usize,
 
-    #[arg(long, default_value_t = false)]
+    /// Enable L1 (prefix matching) tokenizer cache
+    #[arg(long, default_value_t = false, help_heading = "Tokenizer")]
     tokenizer_cache_enable_l1: bool,
 
-    #[arg(long, default_value_t = 52428800)]
+    /// Maximum memory for L1 tokenizer cache in bytes
+    #[arg(long, default_value_t = 52428800, help_heading = "Tokenizer")]
     tokenizer_cache_l1_max_memory: usize,
 
-    #[arg(long, default_value = "memory", value_parser = ["memory", "none", "oracle","postgres"])]
-    history_backend: String,
-
-    #[arg(long, env = "ATP_WALLET_PATH")]
-    oracle_wallet_path: Option<String>,
-
-    #[arg(long, env = "ATP_TNS_ALIAS")]
-    oracle_tns_alias: Option<String>,
-
-    #[arg(long, env = "ATP_DSN")]
-    oracle_dsn: Option<String>,
-
-    #[arg(long, env = "ATP_USER")]
-    oracle_user: Option<String>,
-
-    #[arg(long, env = "ATP_PASSWORD")]
-    oracle_password: Option<String>,
-
-    #[arg(long, env = "ATP_POOL_MIN")]
-    oracle_pool_min: Option<usize>,
-
-    #[arg(long, env = "ATP_POOL_MAX")]
-    oracle_pool_max: Option<usize>,
-
-    #[arg(long, env = "ATP_POOL_TIMEOUT_SECS")]
-    oracle_pool_timeout_secs: Option<u64>,
-
-    #[arg(long)]
-    postgres_db_url: Option<String>,
-
-    #[arg(long)]
-    postgres_pool_max_size: Option<usize>,
-
-    #[arg(long)]
+    // ==================== Parsers ====================
+    /// Parser for reasoning models (e.g., deepseek-r1, qwen3)
+    #[arg(long, help_heading = "Parsers")]
     reasoning_parser: Option<String>,
 
-    #[arg(long)]
+    /// Parser for tool-call interactions
+    #[arg(long, help_heading = "Parsers")]
     tool_call_parser: Option<String>,
 
-    #[arg(long)]
+    /// Path to MCP server configuration file
+    #[arg(long, help_heading = "Parsers")]
     mcp_config_path: Option<String>,
 
-    #[arg(long, default_value_t = false)]
+    // ==================== Backend ====================
+    /// Backend runtime to use
+    #[arg(long, value_enum, default_value_t = Backend::Sglang, alias = "runtime", help_heading = "Backend")]
+    backend: Backend,
+
+    /// History storage backend
+    #[arg(long, default_value = "memory", value_parser = ["memory", "none", "oracle","postgres"], help_heading = "Backend")]
+    history_backend: String,
+
+    /// Enable WebAssembly support
+    #[arg(long, default_value_t = false, help_heading = "Backend")]
     enable_wasm: bool,
 
-    #[arg(long, default_value_t = false)]
-    enable_trace: bool,
+    // ==================== Oracle Database ====================
+    /// Path to Oracle ATP wallet directory
+    #[arg(long, env = "ATP_WALLET_PATH", help_heading = "Oracle Database")]
+    oracle_wallet_path: Option<String>,
 
-    #[arg(long, default_value = "localhost:4317")]
-    otlp_traces_endpoint: String,
+    /// Oracle TNS alias from tnsnames.ora
+    #[arg(long, env = "ATP_TNS_ALIAS", help_heading = "Oracle Database")]
+    oracle_tns_alias: Option<String>,
 
-    #[arg(long)]
+    /// Oracle connection descriptor/DSN
+    #[arg(long, env = "ATP_DSN", help_heading = "Oracle Database")]
+    oracle_dsn: Option<String>,
+
+    /// Oracle database username
+    #[arg(long, env = "ATP_USER", help_heading = "Oracle Database")]
+    oracle_user: Option<String>,
+
+    /// Oracle database password
+    #[arg(long, env = "ATP_PASSWORD", help_heading = "Oracle Database")]
+    oracle_password: Option<String>,
+
+    /// Minimum Oracle connection pool size
+    #[arg(long, env = "ATP_POOL_MIN", help_heading = "Oracle Database")]
+    oracle_pool_min: Option<usize>,
+
+    /// Maximum Oracle connection pool size
+    #[arg(long, env = "ATP_POOL_MAX", help_heading = "Oracle Database")]
+    oracle_pool_max: Option<usize>,
+
+    /// Oracle connection pool timeout in seconds
+    #[arg(long, env = "ATP_POOL_TIMEOUT_SECS", help_heading = "Oracle Database")]
+    oracle_pool_timeout_secs: Option<u64>,
+
+    // ==================== PostgreSQL Database ====================
+    /// PostgreSQL database connection URL
+    #[arg(long, help_heading = "PostgreSQL Database")]
+    postgres_db_url: Option<String>,
+
+    /// Maximum PostgreSQL connection pool size
+    #[arg(long, help_heading = "PostgreSQL Database")]
+    postgres_pool_max_size: Option<usize>,
+
+    // ==================== TLS/mTLS Security ====================
+    /// Path to server TLS certificate (PEM format)
+    #[arg(long, help_heading = "TLS/mTLS Security")]
     tls_cert_path: Option<String>,
 
-    #[arg(long)]
+    /// Path to server TLS private key (PEM format)
+    #[arg(long, help_heading = "TLS/mTLS Security")]
     tls_key_path: Option<String>,
 
+    // ==================== Tracing (OpenTelemetry) ====================
+    /// Enable OpenTelemetry tracing
+    #[arg(
+        long,
+        default_value_t = false,
+        help_heading = "Tracing (OpenTelemetry)"
+    )]
+    enable_trace: bool,
+
+    /// OTLP collector endpoint (format: host:port)
+    #[arg(
+        long,
+        default_value = "localhost:4317",
+        help_heading = "Tracing (OpenTelemetry)"
+    )]
+    otlp_traces_endpoint: String,
+
     // ==================== Control Plane Authentication ====================
-    /// JWT issuer URL for control plane authentication (OIDC discovery will be used)
-    /// Example: https://login.microsoftonline.com/{tenant}/v2.0
-    #[arg(long, env = "JWT_ISSUER")]
+    /// API key for worker authorization
+    #[arg(long, help_heading = "Control Plane Authentication")]
+    api_key: Option<String>,
+
+    /// JWT issuer URL for OIDC authentication
+    #[arg(
+        long,
+        env = "JWT_ISSUER",
+        help_heading = "Control Plane Authentication"
+    )]
     jwt_issuer: Option<String>,
 
-    /// Expected JWT audience claim (usually the client ID or API identifier)
-    /// Example: api://sgl-gateway
-    #[arg(long, env = "JWT_AUDIENCE")]
+    /// Expected JWT audience claim
+    #[arg(
+        long,
+        env = "JWT_AUDIENCE",
+        help_heading = "Control Plane Authentication"
+    )]
     jwt_audience: Option<String>,
 
-    /// Explicit JWKS URI (if not provided, discovered from issuer)
-    #[arg(long, env = "JWT_JWKS_URI")]
+    /// Explicit JWKS URI (discovered from issuer if not set)
+    #[arg(
+        long,
+        env = "JWT_JWKS_URI",
+        help_heading = "Control Plane Authentication"
+    )]
     jwt_jwks_uri: Option<String>,
 
-    /// JWT claim name containing the role (default: "roles")
-    #[arg(long, default_value = "roles")]
+    /// JWT claim name containing the role
+    #[arg(
+        long,
+        default_value = "roles",
+        help_heading = "Control Plane Authentication"
+    )]
     jwt_role_claim: String,
 
-    /// Role mapping from IDP role to gateway role (format: "idp_role=gateway_role")
-    /// Can be specified multiple times. Example: --jwt-role-mapping "Gateway.Admin=admin"
-    #[arg(long, action = ArgAction::Append)]
+    /// Role mapping from IDP to gateway role (format: idp_role=gateway_role)
+    #[arg(long, action = ArgAction::Append, help_heading = "Control Plane Authentication")]
     jwt_role_mapping: Vec<String>,
 
-    /// API keys for control plane access (format: "id:name:role:key")
-    /// Can be specified multiple times.
-    /// Example: --control-plane-api-keys "svc1:CI Pipeline:admin:secret123"
-    #[arg(long = "control-plane-api-keys", action = ArgAction::Append, env = "CONTROL_PLANE_API_KEYS")]
+    /// API keys for control plane access (format: id:name:role:key)
+    #[arg(long = "control-plane-api-keys", action = ArgAction::Append, env = "CONTROL_PLANE_API_KEYS", help_heading = "Control Plane Authentication")]
     control_plane_api_keys: Vec<String>,
 
     /// Disable audit logging for control plane operations
-    #[arg(long, default_value_t = false)]
+    #[arg(
+        long,
+        default_value_t = false,
+        help_heading = "Control Plane Authentication"
+    )]
     disable_audit_logging: bool,
 }
 

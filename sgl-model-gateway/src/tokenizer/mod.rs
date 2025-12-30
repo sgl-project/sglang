@@ -74,13 +74,19 @@ impl Tokenizer {
     }
 
     /// Direct encode method
-    pub fn encode(&self, input: &str) -> Result<Encoding> {
-        self.0.encode(input)
+    ///
+    /// Set `add_special_tokens` to `true` for embeddings (to add BOS/EOS tokens configured in tokenizer_config.json),
+    /// or `false` for chat completion (where the chat template handles special tokens).
+    pub fn encode(&self, input: &str, add_special_tokens: bool) -> Result<Encoding> {
+        self.0.encode(input, add_special_tokens)
     }
 
     /// Direct batch encode method
-    pub fn encode_batch(&self, inputs: &[&str]) -> Result<Vec<Encoding>> {
-        self.0.encode_batch(inputs)
+    ///
+    /// Set `add_special_tokens` to `true` for embeddings (to add BOS/EOS tokens configured in tokenizer_config.json),
+    /// or `false` for chat completion (where the chat template handles special tokens).
+    pub fn encode_batch(&self, inputs: &[&str], add_special_tokens: bool) -> Result<Vec<Encoding>> {
+        self.0.encode_batch(inputs, add_special_tokens)
     }
 
     /// Direct decode method
