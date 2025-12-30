@@ -564,8 +564,8 @@ class SchedulerPPMixin:
                     sampling_params=sampling_params,
                 )
                 req.fill_ids = req.origin_input_ids
-                req.extend_input_len = len(req.fill_ids) - len(req.prefix_indices)
-                req.logprob_start_len = len(req.origin_input_ids) - 1
+                req.logprob_start_len = -1
+                req.set_extend_input_len(len(req.fill_ids) - len(req.prefix_indices))
 
                 # Prepare batch
                 batch = ScheduleBatch.init_new(

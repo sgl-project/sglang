@@ -555,7 +555,7 @@ def fused_experts_impl(
                     gemm1_alpha,
                     gemm1_limit,
                 )
-            elif _is_hip or _is_cuda:
+            elif _is_cuda or _is_hip:
                 if not filter_expert:
                     silu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
                 else:
@@ -575,7 +575,7 @@ def fused_experts_impl(
         elif activation == "gelu" and is_gated:
             assert gemm1_alpha is None, "gemm1_alpha is not supported for gelu"
             assert gemm1_limit is None, "gemm1_limit is not supported for gelu"
-            if _is_hip or _is_cuda:
+            if _is_cuda or _is_hip:
                 if not filter_expert:
                     gelu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
                 else:

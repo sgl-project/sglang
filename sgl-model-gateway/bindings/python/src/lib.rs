@@ -14,6 +14,7 @@ pub enum PolicyType {
     Bucket,
     Manual,
     ConsistentHashing,
+    PrefixHash,
 }
 
 #[pyclass(eq)]
@@ -418,6 +419,10 @@ impl Router {
                 },
                 PolicyType::Manual => ConfigPolicyConfig::Manual,
                 PolicyType::ConsistentHashing => ConfigPolicyConfig::ConsistentHashing,
+                PolicyType::PrefixHash => ConfigPolicyConfig::PrefixHash {
+                    prefix_token_count: 256,
+                    load_factor: 1.25,
+                },
             }
         };
 

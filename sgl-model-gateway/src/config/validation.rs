@@ -229,6 +229,26 @@ impl ConfigValidator {
                     });
                 }
             }
+            PolicyConfig::PrefixHash {
+                prefix_token_count,
+                load_factor,
+            } => {
+                if *prefix_token_count == 0 {
+                    return Err(ConfigError::InvalidValue {
+                        field: "prefix_token_count".to_string(),
+                        value: prefix_token_count.to_string(),
+                        reason: "Must be > 0".to_string(),
+                    });
+                }
+
+                if *load_factor < 1.0 {
+                    return Err(ConfigError::InvalidValue {
+                        field: "load_factor".to_string(),
+                        value: load_factor.to_string(),
+                        reason: "Must be >= 1.0".to_string(),
+                    });
+                }
+            }
         }
         Ok(())
     }

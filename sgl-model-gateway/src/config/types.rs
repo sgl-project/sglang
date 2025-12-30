@@ -350,6 +350,30 @@ pub enum PolicyConfig {
     /// - Provides O(log n) lookup with minimal redistribution (~1/N keys) on topology change
     #[serde(rename = "consistent_hashing")]
     ConsistentHashing,
+
+    /// Prefix hash policy for KV cache-aware load balancing.
+    /// A lightweight alternative to cache_aware radix tree.
+    /// Routes requests based on prefix token hash for cache locality.
+    /// - Uses consistent hash ring with bounded load balancing
+    /// - Walks ring if worker is overloaded (load > avg * load_factor)
+    /// - O(log n) lookup instead of O(prefix_len) radix tree traversal
+    #[serde(rename = "prefix_hash")]
+    PrefixHash {
+        /// Number of prefix tokens to hash (default: 256)
+        #[serde(default = "default_prefix_token_count")]
+        prefix_token_count: usize,
+        /// Load factor threshold - walk ring if load > avg * factor (default: 1.25)
+        #[serde(default = "default_load_factor")]
+        load_factor: f64,
+    },
+}
+
+fn default_prefix_token_count() -> usize {
+    256
+}
+
+fn default_load_factor() -> f64 {
+    1.25
 }
 
 impl PolicyConfig {
@@ -362,6 +386,7 @@ impl PolicyConfig {
             PolicyConfig::Bucket { .. } => "bucket",
             PolicyConfig::Manual => "manual",
             PolicyConfig::ConsistentHashing => "consistent_hashing",
+            PolicyConfig::PrefixHash { .. } => "prefix_hash",
         }
     }
 }
