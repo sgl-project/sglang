@@ -9,6 +9,7 @@ on:
     paths:
       - "python/sglang/version.py"
   workflow_dispatch:
+  workflow_call:
     inputs:
       ref:
         description: "Branch, tag or SHA to checkout"
