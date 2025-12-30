@@ -2223,7 +2223,7 @@ class ServerArgs:
                         "Prefill round robin balance is recommended when dp size > 1. "
                         "Please make sure that the prefill instance is launched with `--load-balance-method auto`"
                         "or `--load-balance-method follow_bootstrap_room` "
-                        " and `--prefill-round-robin-balance` is set for decode server."
+                        "and `--prefill-round-robin-balance` is set for decode server."
                     )
 
         elif self.disaggregation_mode == "prefill":
