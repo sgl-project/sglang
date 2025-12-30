@@ -509,7 +509,7 @@ class MambaAttnBackendBase(AttentionBackend):
                 self.query_start_loc_list[bs - 1][: bs - num_padding].copy_(
                     self.cached_cuda_graph_decode_query_start_loc[: bs - num_padding]
                 )
-                self.query_start_loc_list[bs - 1][bs - num_padding :].copy_(
+                self.query_start_loc_list[bs - 1][bs - num_padding :].fill_(
                     bs - num_padding
                 )
         elif forward_mode.is_target_verify():
@@ -521,7 +521,7 @@ class MambaAttnBackendBase(AttentionBackend):
                 self.query_start_loc_list[bs - 1][: bs - num_padding].copy_(
                     self.cached_cuda_graph_verify_query_start_loc[: bs - num_padding]
                 )
-                self.query_start_loc_list[bs - 1][bs - num_padding :].copy_(
+                self.query_start_loc_list[bs - 1][bs - num_padding :].fill_(
                     (bs - num_padding) * spec_info.draft_token_num
                 )
         else:
