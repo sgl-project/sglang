@@ -11,6 +11,10 @@ These functions handle:
 For regular users, weight_utils.py provides simple download functionality without
 the overhead of validation and automatic cleanup. The CI-specific behavior is
 gated by is_in_ci() checks in weight_utils.py.
+
+Main entry points:
+- validate_hf_weights(snapshot_dir, allow_patterns) - consolidated validation
+- remove_hf_weights(snapshot_dir, corrupted_files) - consolidated cleanup
 """
 
 import glob as glob_module
@@ -26,6 +30,11 @@ import safetensors
 from sglang.srt.utils import log_info_on_rank0
 
 logger = logging.getLogger(__name__)
+
+
+# =============================================================================
+# Low-level validation helpers (internal)
+# =============================================================================
 
 
 def _validate_safetensors_file(file_path: str) -> bool:
@@ -69,9 +78,12 @@ def _check_index_files_exist(snapshot_dir: str) -> Tuple[bool, Optional[str]]:
         Tuple of (all_exist, error_message)
     """
     # Find all safetensors index files
-    index_files = [
-        f for f in os.listdir(snapshot_dir) if f.endswith(".safetensors.index.json")
-    ]
+    try:
+        index_files = [
+            f for f in os.listdir(snapshot_dir) if f.endswith(".safetensors.index.json")
+        ]
+    except Exception:
+        return True, None
 
     if not index_files:
         # No index files means it's not a sharded model, skip this check
@@ -230,9 +242,136 @@ def _validate_sharded_model(
     return True, None, []
 
 
-def _cleanup_corrupted_files_selective(
-    model_name_or_path: str, corrupted_files: List[str]
-) -> int:
+def _check_incomplete_downloads(snapshot_dir: str) -> Tuple[bool, List[str]]:
+    """
+    Check for incomplete download markers in the blob directory.
+
+    Args:
+        snapshot_dir: Path to the model snapshot directory
+
+    Returns:
+        Tuple of (has_incomplete, incomplete_files)
+    """
+    repo_folder = os.path.abspath(os.path.join(snapshot_dir, "..", ".."))
+    blobs_dir = os.path.join(repo_folder, "blobs")
+
+    if not os.path.isdir(blobs_dir):
+        return False, []
+
+    try:
+        incomplete_files = glob_module.glob(os.path.join(blobs_dir, "*.incomplete"))
+        return len(incomplete_files) > 0, incomplete_files
+    except Exception:
+        return False, []
+
+
+# =============================================================================
+# Main API: validate_hf_weights and remove_hf_weights
+# =============================================================================
+
+
+def validate_hf_weights(
+    snapshot_dir: str,
+    allow_patterns: Optional[List[str]] = None,
+) -> Tuple[bool, Optional[str], List[str]]:
+    """
+    Validate HuggingFace model weights in a snapshot directory.
+
+    This is the main validation entry point that consolidates all validation logic:
+    - Checks for incomplete downloads (.incomplete markers)
+    - Validates all files from index exist
+    - Validates sharded models (all shards present)
+    - Validates safetensors files for corruption
+
+    Args:
+        snapshot_dir: Path to the model snapshot directory
+        allow_patterns: Optional patterns to filter weight files (e.g., ["*.safetensors"])
+
+    Returns:
+        Tuple of (is_valid, error_message, corrupted_files)
+        - is_valid: True if all validations pass
+        - error_message: Description of the issue if invalid, None otherwise
+        - corrupted_files: List of corrupted file paths for selective cleanup
+    """
+    if not snapshot_dir or not os.path.isdir(snapshot_dir):
+        return False, f"Snapshot directory does not exist: {snapshot_dir}", []
+
+    # Check for incomplete downloads
+    has_incomplete, incomplete_files = _check_incomplete_downloads(snapshot_dir)
+    if has_incomplete:
+        return (
+            False,
+            f"Incomplete download detected ({len(incomplete_files)} incomplete files)",
+            [],
+        )
+
+    # Find weight files
+    if allow_patterns is None:
+        allow_patterns = ["*.safetensors", "*.bin"]
+
+    weight_files: List[str] = []
+    for pattern in allow_patterns:
+        matched = glob_module.glob(os.path.join(snapshot_dir, pattern))
+        for f in matched:
+            # os.path.exists returns False for broken symlinks
+            if os.path.exists(f):
+                weight_files.append(f)
+
+    if not weight_files:
+        return False, f"No weight files matching {allow_patterns}", []
+
+    # Validate sharded models
+    is_valid, error_msg, corrupted_files = _validate_sharded_model(
+        snapshot_dir, weight_files
+    )
+    if not is_valid:
+        return is_valid, error_msg, corrupted_files
+
+    # Also validate single (non-sharded) safetensors files
+    single_model_files = [
+        "model.safetensors",
+        "pytorch_model.safetensors",
+        "adapter_model.safetensors",
+    ]
+    for f in weight_files:
+        base_name = os.path.basename(f)
+        if base_name in single_model_files:
+            if not _validate_safetensors_file(f):
+                return (
+                    False,
+                    f"Corrupted model file: {base_name}",
+                    [f],
+                )
+
+    return True, None, []
+
+
+def remove_hf_weights(
+    snapshot_dir: str,
+    corrupted_files: Optional[List[str]] = None,
+) -> bool:
+    """
+    Remove HuggingFace model weights (selective or full cache removal).
+
+    This is the main cleanup entry point that consolidates all cleanup logic.
+
+    Args:
+        snapshot_dir: Path to the model snapshot directory
+        corrupted_files: If provided, only remove these specific files (selective cleanup).
+                        If None, remove the entire model cache directory.
+
+    Returns:
+        True if cleanup was successful, False otherwise
+    """
+    if corrupted_files:
+        # Selective cleanup: only remove corrupted files and their blobs
+        return _remove_corrupted_files(corrupted_files)
+    else:
+        # Full cleanup: remove entire model cache
+        return _remove_model_cache(snapshot_dir)
+
+
+def _remove_corrupted_files(corrupted_files: List[str]) -> bool:
     """
     Selectively remove corrupted files and their blobs to force re-download.
 
@@ -240,13 +379,12 @@ def _cleanup_corrupted_files_selective(
     re-downloads corrupted files rather than the entire model.
 
     Args:
-        model_name_or_path: Model identifier
         corrupted_files: List of corrupted file paths (symlinks in snapshot)
 
     Returns:
-        Number of files successfully cleaned up
+        True if all files were cleaned up successfully
     """
-    cleaned_count = 0
+    success = True
 
     for file_path in corrupted_files:
         try:
@@ -266,13 +404,10 @@ def _cleanup_corrupted_files_selective(
                     logger.info(
                         "Removed corrupted blob: %s", os.path.basename(blob_path)
                     )
-
-                cleaned_count += 1
             elif os.path.exists(file_path):
                 # Not a symlink, just delete the file
                 os.remove(file_path)
                 logger.info("Removed corrupted file: %s", os.path.basename(file_path))
-                cleaned_count += 1
 
         except Exception as e:
             logger.error(
@@ -280,200 +415,48 @@ def _cleanup_corrupted_files_selective(
                 os.path.basename(file_path),
                 e,
             )
+            success = False
 
-    if cleaned_count > 0:
-        logger.warning(
-            "Removed %d corrupted file(s) for %s. "
-            "These will be re-downloaded on next load.",
-            cleaned_count,
-            model_name_or_path,
-        )
-
-    return cleaned_count
+    return success
 
 
-def _cleanup_corrupted_model_cache(
-    model_name_or_path: str, snapshot_dir: str, reason: str
-) -> None:
+def _remove_model_cache(snapshot_dir: str) -> bool:
     """
-    Remove entire corrupted model cache directory to force a clean re-download.
-
-    This is used when we cannot selectively clean (e.g., missing shards, incomplete
-    downloads with unknown affected files).
+    Remove entire model cache directory to force a clean re-download.
 
     Args:
-        model_name_or_path: Model identifier
         snapshot_dir: Path to the snapshot directory
-        reason: Reason for cleanup
+
+    Returns:
+        True if cleanup was successful
     """
     # Navigate up to the model root directory: snapshots/hash -> snapshots -> model_root
     repo_folder = os.path.abspath(os.path.join(snapshot_dir, "..", ".."))
 
     try:
         logger.warning(
-            "Removing entire cache for %s at %s. Reason: %s",
-            model_name_or_path,
+            "Removing entire cache at %s",
             repo_folder,
-            reason,
         )
         shutil.rmtree(repo_folder)
-        logger.info("Successfully removed corrupted cache directory")
+        logger.info("Successfully removed cache directory")
+        return True
     except Exception as e:
         logger.error(
-            "Failed to remove corrupted cache directory %s: %s. "
+            "Failed to remove cache directory %s: %s. "
             "Manual cleanup may be required.",
             repo_folder,
             e,
         )
-
-
-def ci_validate_and_cleanup_local_snapshot(
-    model_name_or_path: str,
-    found_local_snapshot_dir: str,
-    local_weight_files: List[str],
-) -> bool:
-    """
-    CI-specific validation and cleanup for local model snapshots.
-
-    This function validates the local snapshot and performs automatic cleanup
-    if corruption or missing files are detected. This behavior is only appropriate
-    for CI environments where we want automatic recovery.
-
-    Args:
-        model_name_or_path: Model identifier for logging
-        found_local_snapshot_dir: Path to the local snapshot directory
-        local_weight_files: List of weight file paths found in the snapshot
-
-    Returns:
-        True if the snapshot is valid and can be used, False if it was invalid
-        and cleanup was performed (caller should re-download)
-    """
-    # Check for incomplete files and clean up if found
-    repo_folder = os.path.abspath(os.path.join(found_local_snapshot_dir, "..", ".."))
-    blobs_dir = os.path.join(repo_folder, "blobs")
-
-    # Check for incomplete download markers
-    incomplete_files = []
-    if os.path.isdir(blobs_dir):
-        incomplete_files = glob_module.glob(os.path.join(blobs_dir, "*.incomplete"))
-
-    if incomplete_files:
-        log_info_on_rank0(
-            logger,
-            f"Found {len(incomplete_files)} .incomplete files in {blobs_dir} for "
-            f"{model_name_or_path}. Will clean up and re-download.",
-        )
-        _cleanup_corrupted_model_cache(
-            model_name_or_path,
-            found_local_snapshot_dir,
-            f"Incomplete download detected ({len(incomplete_files)} incomplete files)",
-        )
         return False
 
-    # Validate sharded models and check for corruption
-    if local_weight_files:
-        is_valid, error_msg, corrupted_files = _validate_sharded_model(
-            found_local_snapshot_dir, local_weight_files
-        )
-        if not is_valid:
-            if corrupted_files:
-                # Selective cleanup: only remove corrupted files
-                log_info_on_rank0(
-                    logger,
-                    f"Found {len(corrupted_files)} corrupted file(s) for "
-                    f"{model_name_or_path}: {error_msg}. "
-                    "Will selectively clean and re-download only these files.",
-                )
-                _cleanup_corrupted_files_selective(model_name_or_path, corrupted_files)
-                return False
-            else:
-                # Missing shards (not corruption) - let snapshot_download handle it.
-                # IMPORTANT: Do NOT delete the entire cache here, as other processes
-                # (TP/EP ranks) may already be loading weights from these files.
-                log_info_on_rank0(
-                    logger,
-                    f"Validation failed for {model_name_or_path}: {error_msg}. "
-                    "Will attempt to download missing files.",
-                )
-                return False
 
-        # Also validate single (non-sharded) safetensors files
-        for f in local_weight_files:
-            base_name = os.path.basename(f)
-            # Check if this is a single model file (not sharded)
-            # Include adapter_model.safetensors for LoRA adapters
-            if base_name in [
-                "model.safetensors",
-                "pytorch_model.safetensors",
-                "adapter_model.safetensors",
-            ]:
-                if not _validate_safetensors_file(f):
-                    log_info_on_rank0(
-                        logger,
-                        f"Corrupted model file {base_name} for {model_name_or_path}. "
-                        "Will selectively clean and re-download this file.",
-                    )
-                    # Selective cleanup for single file
-                    _cleanup_corrupted_files_selective(model_name_or_path, [f])
-                    return False
-
-    return True
+# =============================================================================
+# CI download with retry (uses validate_hf_weights and remove_hf_weights)
+# =============================================================================
 
 
-def _validate_weights_after_download(
-    hf_folder: str,
-    allow_patterns: List[str],
-    model_name_or_path: str,
-) -> bool:
-    """
-    Validate downloaded weight files to catch corruption early.
-
-    This function validates safetensors files after download to catch
-    corruption issues (truncated downloads, network errors, etc.) before
-    model loading fails with cryptic errors. If corruption is found,
-    the corrupted files are automatically cleaned up.
-
-    Args:
-        hf_folder: Path to the downloaded model folder
-        allow_patterns: Patterns used to match weight files
-        model_name_or_path: Model identifier for error messages
-
-    Returns:
-        True if all files are valid, False if corrupted files were found and cleaned up
-    """
-    # Find all weight files that were downloaded
-    weight_files: List[str] = []
-    for pattern in allow_patterns:
-        weight_files.extend(glob_module.glob(os.path.join(hf_folder, pattern)))
-
-    if not weight_files:
-        return True  # No weight files to validate
-
-    # Validate safetensors files
-    corrupted_files = []
-    for f in weight_files:
-        if f.endswith(".safetensors") and os.path.exists(f):
-            if not _validate_safetensors_file(f):
-                corrupted_files.append(os.path.basename(f))
-
-    if corrupted_files:
-        # Clean up corrupted files so next attempt re-downloads them
-        _cleanup_corrupted_files_selective(
-            model_name_or_path,
-            [os.path.join(hf_folder, f) for f in corrupted_files],
-        )
-        log_info_on_rank0(
-            logger,
-            f"Downloaded model files are corrupted for {model_name_or_path}: "
-            f"{corrupted_files}. The corrupted files have been removed. "
-            "Will retry download.",
-        )
-        return False
-
-    return True
-
-
-def ci_download_with_validation_and_retry(
+def ci_download_with_retry(
     model_name_or_path: str,
     allow_patterns: List[str],
     ignore_patterns,
@@ -524,14 +507,27 @@ def ci_download_with_validation_and_retry(
         )
 
         # Validate downloaded files to catch corruption early
-        is_valid = _validate_weights_after_download(
-            hf_folder, allow_patterns, model_name_or_path
+        is_valid, error_msg, corrupted_files = validate_hf_weights(
+            hf_folder, allow_patterns
         )
 
         if is_valid:
             return hf_folder
 
-        # Validation failed, corrupted files were cleaned up
+        # Validation failed - clean up and retry
+        log_info_on_rank0(
+            logger,
+            f"Validation failed for {model_name_or_path}: {error_msg}",
+        )
+
+        if corrupted_files:
+            # Selective cleanup for corrupted files
+            remove_hf_weights(hf_folder, corrupted_files)
+        elif "Incomplete download" in (error_msg or ""):
+            # Full cleanup for incomplete downloads
+            remove_hf_weights(hf_folder)
+        # For missing shards, let snapshot_download handle it on retry
+
         if attempt < max_retries - 1:
             log_info_on_rank0(
                 logger,
@@ -548,6 +544,11 @@ def ci_download_with_validation_and_retry(
 
     # This should never be reached, but just in case
     return hf_folder
+
+
+# =============================================================================
+# Utility for HFRunner (validates HF cache before transformers loads)
+# =============================================================================
 
 
 def ci_validate_and_clean_hf_cache(model_path: str) -> None:
@@ -594,33 +595,22 @@ def ci_validate_and_clean_hf_cache(model_path: str) -> None:
             return
 
         # Check each snapshot for corrupted files
-        corrupted_files = []
         for snapshot_hash in os.listdir(snapshots_dir):
             snapshot_dir = os.path.join(snapshots_dir, snapshot_hash)
             if not os.path.isdir(snapshot_dir):
                 continue
 
-            # Find all safetensors files
-            safetensors_files = glob_module.glob(
-                os.path.join(snapshot_dir, "*.safetensors")
-            )
+            # Use consolidated validation
+            is_valid, error_msg, corrupted_files = validate_hf_weights(snapshot_dir)
 
-            for sf_file in safetensors_files:
-                # Skip broken symlinks (os.path.exists returns False for them)
-                if not os.path.exists(sf_file):
-                    continue
-
-                if not _validate_safetensors_file(sf_file):
-                    corrupted_files.append(sf_file)
-
-        if corrupted_files:
-            logger.warning(
-                "HFRunner: Found %d corrupted safetensors file(s) for %s. "
-                "Removing to force re-download.",
-                len(corrupted_files),
-                model_path,
-            )
-            _cleanup_corrupted_files_selective(model_path, corrupted_files)
+            if not is_valid and corrupted_files:
+                logger.warning(
+                    "HFRunner: Found corrupted files for %s: %s. "
+                    "Removing to force re-download.",
+                    model_path,
+                    error_msg,
+                )
+                remove_hf_weights(snapshot_dir, corrupted_files)
 
     except Exception as e:
         # Don't fail if validation itself fails - let HF handle it
