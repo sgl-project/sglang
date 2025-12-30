@@ -4003,16 +4003,17 @@ class DeepseekV2ForCausalLM(nn.Module):
                         f"model.layers.{nextn_layer_id}.mlp.{expert_sub_name}.{stem}"
                     )
 
-        for partial_name in tqdm.tqdm(
-            partial_names,
-            desc="quant weights to fp8 ue8m0",
-        ):
-            original_weight = weights_dict[f"{partial_name}.weight"]
-            out_w, out_s = quant_weight_ue8m0(
-                original_weight, weight_block_size=weight_block_size
-            )
-            weights_dict[f"{partial_name}.weight"] = out_w
-            weights_dict[f"{partial_name}.weight_scale_inv"] = out_s
+        if len(partial_names) > 0:
+            for partial_name in tqdm.tqdm(
+                partial_names,
+                desc="quant weights to fp8 ue8m0",
+            ):
+                original_weight = weights_dict[f"{partial_name}.weight"]
+                out_w, out_s = quant_weight_ue8m0(
+                    original_weight, weight_block_size=weight_block_size
+                )
+                weights_dict[f"{partial_name}.weight"] = out_w
+                weights_dict[f"{partial_name}.weight_scale_inv"] = out_s
 
         if is_nextn and enable_nextn_moe_bf16_cast_to_fp8(self.quant_config):
             self._mark_nextn_moe_weights_as_ue8m0()
