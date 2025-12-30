@@ -103,7 +103,7 @@ class TestAscendW4A4(CustomTestCase):
         print(f"Throughput: {throughput} tokens/s")
 
         if is_in_ci():
-            self.assertAlmostEqual(throughput, 35)
+            self.assertGreaterEqual(throughput, 35)
 
 
 if __name__ == "__main__":
