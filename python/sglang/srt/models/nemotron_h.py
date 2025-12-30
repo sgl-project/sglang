@@ -48,7 +48,7 @@ from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.quantization import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.layers.utils import PPMissingLayer
+from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import (
     DEFAULT_VOCAB_PADDING_SIZE,
     ParallelLMHead,
@@ -647,13 +647,13 @@ class NemotronHForCausalLM(nn.Module):
         if self.pp_group.world_size > 1 and self.config.tie_word_embeddings:
             if self.pp_group.is_first_rank:
                 self.pp_group.send(
-                    self.model.embed_tokens.weight, dst=self.pp_group.world_size - 1
+                    self.model.embed_tokens.weight, dst=self.pp_group.last_rank
                 )
             elif self.pp_group.is_last_rank:
                 emb_token_weight = self.pp_group.recv(
                     size=self.lm_head.weight.shape,
                     dtype=next(self.model.parameters()).dtype,
-                    src=0,
+                    src=self.pp_group.first_rank,
                 )
                 self.lm_head.weight.copy_(emb_token_weight)
 
@@ -722,6 +722,25 @@ class NemotronHForCausalLM(nn.Module):
                 name = maybe_remap_kv_scale_name(name, params_dict)
                 if name is None:
                     continue
+
+            layer_id = get_layer_id(name)
+            if (
+                layer_id is not None
+                and hasattr(self.model, "start_layer")
+                and (
+                    layer_id < self.model.start_layer
+                    or layer_id >= self.model.end_layer
+                )
+            ):
+                continue
+
+            if "embed_tokens" in name and not self.pp_group.is_first_rank:
+                continue
+
+            if (
+                "norm_f" in name or "lm_head" in name
+            ) and not self.pp_group.is_last_rank:
+                continue
 
             for param_name, weight_name, shard_id in self.stacked_params_mapping:
                 if weight_name not in name:
