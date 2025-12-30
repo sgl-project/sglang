@@ -9,6 +9,12 @@ on:
     paths:
       - "python/sglang/version.py"
   workflow_dispatch:
+    inputs:
+      ref:
+        description: "Branch, tag or SHA to checkout"
+        required: false
+        type: string
+        default: ""
 
 concurrency:
   group: nightly-test-intel-${{ github.ref }}
