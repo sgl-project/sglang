@@ -18,21 +18,18 @@ import sys
 from pathlib import Path
 from typing import List
 
-from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.multimodal_gen.test.server.testcase_configs import (
-    BASELINE_CONFIG,
-    ONE_GPU_CASES,
-    TWO_GPU_CASES,
-    DiffusionTestCase,
+# Add scripts/ci to path for importing diffusion_case_parser
+_REPO_ROOT = Path(__file__).resolve().parents[5]
+sys.path.insert(0, str(_REPO_ROOT / "scripts" / "ci"))
+
+from diffusion_case_parser import (  # noqa: E402
+    DiffusionCaseInfo,
+    collect_diffusion_suites,
 )
 
-logger = init_logger(__name__)
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger  # noqa: E402
 
-# Suite definitions using DiffusionTestCase lists
-SUITES = {
-    "1-gpu": ONE_GPU_CASES,
-    "2-gpu": TWO_GPU_CASES,
-}
+logger = init_logger(__name__)
 
 # Parametrized test files (use case ID filter)
 PARAMETRIZED_FILES = {
@@ -41,41 +38,18 @@ PARAMETRIZED_FILES = {
 }
 
 # Standalone test files (each gets its own partition, no filter, run last)
+# NOTE: This is parsed by diffusion_case_parser.py using AST
 STANDALONE_FILES = {
     "1-gpu": ["test_lora_format_adapter.py"],
     "2-gpu": [],
 }
 
-# Default estimated time for cases without baseline (5 minutes)
-DEFAULT_EST_TIME_SECONDS = 300.0
-# Fixed overhead for server startup when estimated_full_test_time_s is not set
-STARTUP_OVERHEAD_SECONDS = 120.0
-
-
-def get_case_est_time(case_id: str) -> float:
-    """
-    Get estimated time in seconds from perf_baselines.json.
-
-    Priority:
-    1. estimated_full_test_time_s (if set)
-    2. expected_e2e_ms / 1000 + STARTUP_OVERHEAD_SECONDS (fallback)
-    3. DEFAULT_EST_TIME_SECONDS (if no baseline)
-    """
-    scenario = BASELINE_CONFIG.scenarios.get(case_id)
-    if scenario is None:
-        return DEFAULT_EST_TIME_SECONDS
-
-    if scenario.estimated_full_test_time_s is not None:
-        return scenario.estimated_full_test_time_s
-
-    return scenario.expected_e2e_ms / 1000.0 + STARTUP_OVERHEAD_SECONDS
-
 
 def auto_partition(
-    cases: List[DiffusionTestCase],
+    cases: List[DiffusionCaseInfo],
     rank: int,
     size: int,
-) -> List[DiffusionTestCase]:
+) -> List[DiffusionCaseInfo]:
     """
     Partition cases using LPT (Longest Processing Time First) greedy algorithm.
 
@@ -83,31 +57,28 @@ def auto_partition(
     estimated time in each partition.
 
     Args:
-        cases: List of DiffusionTestCase objects
+        cases: List of DiffusionCaseInfo objects
         rank: Index of the partition to return (0 to size-1)
         size: Total number of partitions
 
     Returns:
-        List of DiffusionTestCase objects assigned to the specified partition
+        List of DiffusionCaseInfo objects assigned to the specified partition
     """
     if not cases or size <= 0:
         return []
 
-    # Get estimated time for each case
-    cases_with_time = [(case, get_case_est_time(case.id)) for case in cases]
-
     # Sort by time descending (LPT heuristic)
-    sorted_cases = sorted(cases_with_time, key=lambda x: x[1], reverse=True)
+    sorted_cases = sorted(cases, key=lambda c: c.est_time, reverse=True)
 
     # Initialize partitions
-    partitions: List[List[DiffusionTestCase]] = [[] for _ in range(size)]
+    partitions: List[List[DiffusionCaseInfo]] = [[] for _ in range(size)]
     partition_sums = [0.0] * size
 
     # Greedy assignment: assign each case to partition with smallest current sum
-    for case, est_time in sorted_cases:
+    for case in sorted_cases:
         min_idx = partition_sums.index(min(partition_sums))
         partitions[min_idx].append(case)
-        partition_sums[min_idx] += est_time
+        partition_sums[min_idx] += case.est_time
 
     if rank < size:
         return partitions[rank]
@@ -136,25 +107,28 @@ def get_parametrized_files(suite: str, target_dir: Path) -> List[str]:
     return result
 
 
-def get_standalone_file(suite: str, target_dir: Path, index: int) -> str | None:
+def get_standalone_file(
+    standalone_files: List[str], target_dir: Path, index: int
+) -> str | None:
     """
     Get a standalone test file path by index.
 
     Args:
-        suite: Suite name (e.g., "1-gpu", "2-gpu")
+        standalone_files: List of standalone file names
         target_dir: Base directory for test files
         index: Index of the standalone file (0-based)
 
     Returns:
         Absolute file path, or None if not found
     """
-    files = STANDALONE_FILES.get(suite, [])
-    if index < 0 or index >= len(files):
+    if index < 0 or index >= len(standalone_files):
         return None
-    f_path = target_dir / files[index]
+    f_path = target_dir / standalone_files[index]
     if f_path.exists():
         return str(f_path)
-    logger.warning(f"Standalone test file {files[index]} not found in {target_dir}")
+    logger.warning(
+        f"Standalone test file {standalone_files[index]} not found in {target_dir}"
+    )
     return None
 
 
@@ -164,7 +138,7 @@ def parse_args():
         "--suite",
         type=str,
         required=True,
-        choices=list(SUITES.keys()),
+        choices=["1-gpu", "2-gpu"],
         help="The test suite to run (e.g., 1-gpu, 2-gpu)",
     )
     parser.add_argument(
@@ -199,62 +173,6 @@ def parse_args():
         help="Continue running remaining tests even if one fails (for CI consistency; pytest already continues by default)",
     )
     return parser.parse_args()
-
-
-def collect_test_items(files, filter_expr=None):
-    """Collect test item node IDs from the given files using pytest --collect-only.
-
-    Raises:
-        RuntimeError: If pytest collection fails due to errors (e.g., syntax errors,
-            import errors, or other collection failures).
-    """
-    cmd = [sys.executable, "-m", "pytest", "--collect-only", "-q"]
-    if filter_expr:
-        cmd.extend(["-k", filter_expr])
-    cmd.extend(files)
-
-    logger.info(f"Collecting tests with command: {' '.join(cmd)}")
-    result = subprocess.run(cmd, capture_output=True, text=True)
-
-    # Check for collection errors
-    # pytest exit codes:
-    #   0: success
-    #   1: tests collected but some had errors during collection
-    #   2: test execution interrupted
-    #   3: internal error
-    #   4: command line usage error
-    #   5: no tests collected (may be expected with filters)
-    if result.returncode not in (0, 5):
-        error_msg = (
-            f"pytest --collect-only failed with exit code {result.returncode}\n"
-            f"Command: {' '.join(cmd)}\n"
-        )
-        if result.stderr:
-            error_msg += f"stderr:\n{result.stderr}\n"
-        if result.stdout:
-            error_msg += f"stdout:\n{result.stdout}\n"
-        logger.error(error_msg)
-        raise RuntimeError(error_msg)
-
-    if result.returncode == 5:
-        logger.info(
-            "No tests were collected (exit code 5). This may be expected with filters."
-        )
-
-    # Parse the output to extract test node IDs
-    # pytest -q outputs lines like: test_file.py::TestClass::test_method[param]
-    test_items = []
-    for line in result.stdout.strip().split("\n"):
-        line = line.strip()
-        # Skip empty lines and summary lines
-        if line and "::" in line and not line.startswith(("=", "-", " ")):
-            # Handle lines that might have extra info after the test ID
-            test_id = line.split()[0] if " " in line else line
-            if "::" in test_id:
-                test_items.append(test_id)
-
-    logger.info(f"Collected {len(test_items)} test items")
-    return test_items
 
 
 def run_pytest(files, filter_expr=None):
@@ -347,8 +265,26 @@ def main():
         print(f"Error: Target directory {target_dir} does not exist.")
         sys.exit(1)
 
-    # 2. Calculate partition allocation
-    standalone_files = STANDALONE_FILES.get(args.suite, [])
+    # 2. Parse test configuration using AST
+    testcase_config_path = test_root_dir / "server" / "testcase_configs.py"
+    baseline_path = test_root_dir / "server" / "perf_baselines.json"
+    run_suite_path = current_file_path
+
+    suites = collect_diffusion_suites(
+        testcase_config_path,
+        run_suite_path,
+        baseline_path,
+    )
+
+    suite_info = suites.get(args.suite)
+    if suite_info is None:
+        print(f"Unknown suite: {args.suite}")
+        sys.exit(1)
+
+    all_cases = suite_info.cases
+    standalone_files = suite_info.standalone_files
+
+    # 3. Calculate partition allocation
     num_standalone = len(standalone_files)
     parametrized_partitions = args.total_partitions - num_standalone
 
@@ -359,11 +295,9 @@ def main():
         )
         sys.exit(1)
 
-    # 3. Determine partition type and execute
+    # 4. Determine partition type and execute
     if args.partition_id < parametrized_partitions:
         # === Parametrized test partition ===
-        all_cases = SUITES.get(args.suite, [])
-
         if not all_cases:
             print(f"No cases found for suite '{args.suite}'.")
             sys.exit(0)
@@ -384,16 +318,15 @@ def main():
         print(f"Running {len(my_cases)} cases in this partition:")
         total_est_time = 0.0
         for case in my_cases:
-            est = get_case_est_time(case.id)
-            total_est_time += est
-            print(f"  - {case.id} (est: {est:.1f}s)")
+            total_est_time += case.est_time
+            print(f"  - {case.case_id} (est: {case.est_time:.1f}s)")
         print(
             f"Total estimated time: {total_est_time:.1f}s ({total_est_time/60:.1f} min)"
         )
         print()
 
         # Build pytest filter expression from case IDs
-        case_ids = [case.id for case in my_cases]
+        case_ids = [case.case_id for case in my_cases]
         partition_filter = " or ".join([f"[{cid}]" for cid in case_ids])
 
         # Combine with additional filter if provided
@@ -423,7 +356,9 @@ def main():
             f"Suite: {args.suite} | Partition: {args.partition_id + 1}/{args.total_partitions} (standalone)"
         )
 
-        standalone_file = get_standalone_file(args.suite, target_dir, standalone_idx)
+        standalone_file = get_standalone_file(
+            standalone_files, target_dir, standalone_idx
+        )
 
         if not standalone_file:
             print(
