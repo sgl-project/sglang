@@ -56,6 +56,8 @@ def _per_expert_lora_kernel(
     BLOCK_SIZE: tl.constexpr,
     # Whether to multiply by router weights
     MUL_ROUTED_WEIGHT: tl.constexpr,
+    # Whether this is down_proj (affects stacking factor for rank calculation)
+    IS_DOWN_PROJ: tl.constexpr,
 ):
     """
     Compute per-expert LoRA delta:
@@ -89,7 +91,13 @@ def _per_expert_lora_kernel(
     # Load LoRA rank and scaling (scalar tensors) for this LoRA adapter
     rank = tl.load(lora_ranks_ptr + lora_id_grid)
     scaling = tl.load(lora_scalings_ptr + lora_id_grid)
-    has_rank = rank > 0
+
+    # Adjust rank for stacked modules (gate_up_proj has stacking factor 2)
+    effective_rank = rank
+    if not IS_DOWN_PROJ:  # gate_up_proj case
+        effective_rank = rank * 2
+
+    has_rank = effective_rank > 0
     if not has_rank:
         return
 
@@ -119,7 +127,7 @@ def _per_expert_lora_kernel(
 
     # We assume max_rank is small enough to keep as a single 1D vector
     r_offs = tl.arange(0, max_rank)  # [max_rank]
-    rank_mask = r_offs < rank  # [max_rank]
+    rank_mask = r_offs < effective_rank  # [max_rank]
 
     # Accumulator for intermediate: [max_rank]
     intermediate = tl.zeros((max_rank,), dtype=tl.float32)
@@ -145,7 +153,8 @@ def _per_expert_lora_kernel(
         a_ptrs = (
             lora_a_base
             + r_offs[:, None] * lora_a_stride_rank
-            + input_offs[None, :] * lora_a_stride_input
+            + input_offs[None, :]
+            * lora_a_stride_input  # check if it is necessary to multiply by stride value as it should be contigious in this dimension
         )
         a_vals = tl.load(
             a_ptrs,
@@ -195,7 +204,9 @@ def _per_expert_lora_kernel(
 
     # Apply router weight if enabled (matches base MoE behavior)
     if MUL_ROUTED_WEIGHT:
-        topk_weight = tl.load(topk_weights_ptr + spatial_id)
+        topk_weight = tl.load(
+            topk_weights_ptr + spatial_id
+        )  # I don't think this correctly understands how top_k weights is organized (now moe dispatch reorganizes topk weights to work w this)
         out_vals *= topk_weight
 
     # ----------------------------
@@ -205,17 +216,14 @@ def _per_expert_lora_kernel(
     out_ptrs = output_ptr + out_row_base + out_offs
     lora_out_ptrs = lora_output_ptr + out_row_base + out_offs
 
-    # Compute combined mask
-    store_mask = out_mask & has_rank
-
     # Convert to output dtype (matches hidden_states dtype, could be float16/bfloat16/float32)
     out_vals_typed = out_vals.to(output_ptr.dtype.element_ty)
 
     # Add to base_output in-place
-    tl.atomic_add(out_ptrs, out_vals_typed, store_mask)
+    tl.atomic_add(out_ptrs, out_vals_typed, out_mask)
 
     # Also store to separate lora_output tensor (same dtype)
-    tl.atomic_add(lora_out_ptrs, out_vals_typed, store_mask)
+    tl.atomic_add(lora_out_ptrs, out_vals_typed, out_mask)
 
 
 def per_expert_lora_forward(
@@ -261,8 +269,13 @@ def per_expert_lora_forward(
 
     # Shapes
     num_tokens, input_dim = hidden_states.shape
-    num_loras, _, output_dim, max_rank = lora_b_weights.shape
+    num_loras, _, output_dim, _ = lora_b_weights.shape
     num_dispatched = token_ids.shape[0]
+
+    # Use fixed max_rank for consistent kernel compilation
+    # Maximum stacking factor is 2 (for gate_up_proj), so max_rank = max_lora_rank * 2
+    # We assume max_lora_rank is reasonably small (e.g., 64-128) so max_rank = 256 is safe
+    max_rank = 256  # Conservative upper bound for max_lora_rank * 2
 
     # Make sure everything is on the same device and contiguous
     device = hidden_states.device
@@ -355,6 +368,8 @@ def per_expert_lora_forward(
         BLOCK_SIZE=BLOCK_SIZE,
         # Router weight multiplication flag
         MUL_ROUTED_WEIGHT=mul_routed_weight,
+        # Whether this is down_proj
+        IS_DOWN_PROJ=is_down_proj,
     )
 
     return output, lora_output
