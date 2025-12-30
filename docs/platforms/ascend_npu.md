@@ -31,7 +31,8 @@ pip install mf-adapter==1.0.0
 #### Pytorch and Pytorch Framework Adaptor on Ascend
 
 At the moment NPUGraph optimizations are supported only in `torch_npu==2.6.0.post3` that requires 'torch==2.6.0'.
-<br>_TODO: NPUGraph optimizations will be supported in future releases of 'torch_npu' 2.7.1, 2.8.0 and 2.9.0_
+
+_TODO: NPUGraph optimizations will be supported in future releases of 'torch_npu' 2.7.1, 2.8.0 and 2.9.0_
 
 ```shell
 PYTORCH_VERSION=2.6.0
@@ -52,7 +53,7 @@ wget https://sglang-ascend.obs.cn-east-3.myhuaweicloud.com/sglang/torch_npu/torc
 pip install torch_npu-${PYTORCH_VERSION}.post2.dev20251120-cp311-cp311-manylinux_2_28_${PLATFORM}.whl
 ```
 
-If you are using other versions of `torch` and `torch_npu`, check [installation guide](https://github.com/Ascend/pytorch/blob/master/README.md)
+If you are using other versions of `torch` and install `torch_npu`, check [installation guide](https://github.com/Ascend/pytorch/blob/master/README.md)
 
 #### Triton on Ascend
 
@@ -99,16 +100,14 @@ pip install -e python[srt_npu]
 
 ### Method 2: Using Docker Image
 #### Obtain Image
-You can download the Sglang image or build an image based on Dockerfile to obtain the Ascend NPU image.
-1. Download Sglang image
-```shell
-# You can choose between dockerhub and quay.io
+You can download the SGLang image or build an image based on Dockerfile to obtain the Ascend NPU image.
+1. Download SGLang image
+```angular2html
 dockerhub: docker.io/lmsysorg/sglang:$tag
-quay.io: quay.io/ascend/sglang:$tag
 # Main-based tag, change main to specific version like v0.5.6,
 # you can get image for specific version
-Atlas A3 server : {main}-cann8.3.rc2-a3
-Atlas A2 server: {main}-cann8.3.rc2-910b
+Atlas 800I A3 : {main}-cann8.3.rc2-a3
+Atlas 800I A2: {main}-cann8.3.rc2-910b
 ```
 2. Build an image based on Dockerfile
 ```shell
@@ -138,10 +137,10 @@ alias drun='docker run -it --rm --privileged --network=host --ipc=host --shm-siz
     --volume /etc/ascend_install.info:/etc/ascend_install.info \
     --volume /var/queue_schedule:/var/queue_schedule --volume ~/.cache/:/root/.cache/'
 
-# Add HF_TOKEN env for download model by sglang. If your model weights has already in local disk, please remove the parameter `--env HF_TOKEN`
+# Add HF_TOKEN env for download model by SGLang.
 drun --env "HF_TOKEN=<secret>" \
     <image_name> \
-    python3 -m sglang.launch_server --model-path meta-llama/Llama-3.1-8B-Instruct --attention-backend ascend --host 127.0.0.1 --port 30000
+    python3 -m sglang.launch_server --model-path meta-llama/Llama-3.1-8B-Instruct --attention-backend ascend
 ```
 
 ## System Settings
@@ -157,15 +156,12 @@ echo performance | sudo tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governo
 cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor # shows performance
 ```
 
-### Disable NUMA balancing and enable cpu affinity
+### Disable NUMA balancing
 
 ```shell
 sudo sysctl -w kernel.numa_balancing=0
 # Check
 cat /proc/sys/kernel/numa_balancing # shows 0
-
-# Enabling CPU Affinity
-export SGLANG_SET_CPU_AFFINITY=1
 ```
 
 ### Prevent swapping out system memory
@@ -177,21 +173,26 @@ sudo sysctl -w vm.swappiness=10
 cat /proc/sys/vm/swappiness # shows 10
 ```
 
-## Running Sglang Service
+## Running SGLang Service
 ### Running Service For Large Language Models
 #### PD Mixed Scene
 ```shell
-python3 -m sglang.launch_server --model-path meta-llama/Llama-3.1-8B-Instruct --attention-backend ascend --host 127.0.0.1 --port 30000
+# Enabling CPU Affinity
+export SGLANG_SET_CPU_AFFINITY=1
+python3 -m sglang.launch_server --model-path meta-llama/Llama-3.1-8B-Instruct --attention-backend ascend
 ```
 
 #### PD Separation Scene
 1. Launch Prefill Server
 ```shell
+# Enabling CPU Affinity
+export SGLANG_SET_CPU_AFFINITY=1
+
 # PIP: recommended to config first Prefill Server IP
 # PORT: one free port
 # all sglang servers need to be config the same PIP and PORT,
 export ASCEND_MF_STORE_URL="tcp://PIP:PORT"
-# if you use rdma, add this parameter
+# if you are Atlas 800I A2 hardware and use rdma for kv cache transfer, add this parameter
 export ASCEND_MF_TRANSFER_PROTOCOL="device_rdma"
 python3 -m sglang.launch_server \
     --model-path meta-llama/Llama-3.1-8B-Instruct \
@@ -202,8 +203,6 @@ python3 -m sglang.launch_server \
     --device npu \
     --base-gpu-id 0 \
     --tp-size 1 \
-    --host 127.0.0.1  \
-    --port 8000
 ```
 
 2. Launch Decode Server
@@ -212,7 +211,7 @@ python3 -m sglang.launch_server \
 # PORT: one free port
 # all sglang servers need to be config the same PIP and PORT,
 export ASCEND_MF_STORE_URL="tcp://PIP:PORT"
-# if you use rdma, add this parameter
+# if you are Atlas 800I A2 hardware and use rdma for kv cache transfer, add this parameter
 export ASCEND_MF_TRANSFER_PROTOCOL="device_rdma"
 python3 -m sglang.launch_server \
     --model-path meta-llama/Llama-3.1-8B-Instruct \
@@ -228,7 +227,7 @@ python3 -m sglang.launch_server \
 
 3. Launch Router
 ```shell
-python -m sglang_router.launch_router \
+python3 -m sglang_router.launch_router \
     --pd-disaggregation \
     --policy cache_aware \
     --prefill http://127.0.0.1:8000 8995 \
@@ -240,7 +239,7 @@ python -m sglang_router.launch_router \
 ### Running Service For Multimodal Language Models
 #### PD Mixed Scene
 ```shell
-python -m sglang.launch_server \
+python3 -m sglang.launch_server \
     --model-path Qwen3-VL-30B-A3B-Instruct \
     --host 127.0.0.1 \
     --port 8000 \

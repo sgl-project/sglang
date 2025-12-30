@@ -14,8 +14,6 @@ export HCCL_BUFFSIZE=1536
 export HCCL_OP_EXPANSION_MODE=AIV
 
 python -m sglang.launch_server \
-   --host 127.0.0.1 \
-   --port 30111 \
    --device npu \
    --attention-backend ascend \
    --trust-remote-code \
@@ -39,8 +37,6 @@ export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
 export SGLANG_ENABLE_SPEC_V2=1
 
 python -m sglang.launch_server \
-   --host 127.0.0.1 \
-   --port 30111 \
    --device npu \
    --attention-backend ascend \
    --trust-remote-code \
@@ -69,8 +65,6 @@ export SGLANG_DEEPEP_BF16_DISPATCH=1
 export ENABLE_ASCEND_MOE_NZ=1
 
 python -m sglang.launch_server \
-   --host 127.0.0.1 \
-   --port 30111 \
    --device npu \
    --attention-backend ascend \
    --trust-remote-code \
@@ -94,8 +88,6 @@ export ENABLE_ASCEND_MOE_NZ=1
 
 python -m sglang.launch_server \
    --model-path Qwen/Qwen3-235B-A22B-Instruct-2507 \
-   --host 127.0.0.1 \
-   --port 30111 \
    --tp-size 16 \
    --trust-remote-code \
    --attention-backend ascend \
@@ -116,14 +108,11 @@ export HCCL_BUFFSIZE=1536
 export HCCL_OP_EXPANSION_MODE=AIV
 
 python -m sglang.launch_server \
-   --host 127.0.0.1 \
-   --port 30111 \
-   --model-path Qwen/Qwen3-VL-8B-Instruct \
    --enable-multimodal \
-   --device npu \
    --attention-backend ascend \
    --mm-attention-backend ascend_attn \
    --trust-remote-code \
    --tp-size 4 \
+   --model-path Qwen/Qwen3-VL-8B-Instruct \
    --mem-fraction-static 0.8
 ```
