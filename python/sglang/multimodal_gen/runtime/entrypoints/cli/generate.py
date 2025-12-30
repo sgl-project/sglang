@@ -10,7 +10,6 @@ from typing import cast
 
 from tqdm import tqdm
 
-import sglang.multimodal_gen.envs as envs
 from sglang.multimodal_gen import DiffGenerator
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.runtime.entrypoints.cli.cli_types import CLISubcommand
@@ -43,6 +42,11 @@ def add_multimodal_gen_generate_args(parser: argparse.ArgumentParser):
         default=None,
         required=False,
         help="Path to dump the performance metrics (JSON) for the run.",
+    )
+    parser.add_argument(
+        "--warmup",
+        action="store_true",
+        help="Run a warm-up phase to exclude compilation overhead from performance measurements, if needed. Requires --perf-dump-path to be set."
     )
 
     parser = ServerArgs.add_cli_args(parser)
@@ -89,6 +93,9 @@ def maybe_dump_performance(args: argparse.Namespace, server_args, prompt: str, r
 
 def generate_cmd(args: argparse.Namespace):
     """The entry point for the generate command."""
+    if args.warmup and args.perf_dump_path is None:
+        raise ValueError("--warmup requires --perf-dump-path to be specified")
+
     args.request_id = "mocked_fake_id_for_offline_generate"
 
     server_args = ServerArgs.from_cli_args(args)
@@ -97,7 +104,7 @@ def generate_cmd(args: argparse.Namespace):
         model_path=server_args.model_path, server_args=server_args
     )
 
-    if args.perf_dump_path:
+    if args.warmup:
         for _ in tqdm(range(10)):
             generator.generate(
                 sampling_params_kwargs={**sampling_params_kwargs, "save_output": False}
