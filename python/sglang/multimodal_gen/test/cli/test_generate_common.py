@@ -15,13 +15,9 @@ from PIL import Image
 
 from sglang.multimodal_gen.configs.sample.sampling_params import DataType
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.multimodal_gen.test.test_utils import (
-    check_image_size,
-)
+from sglang.multimodal_gen.test.test_utils import check_image_size
 
 logger = init_logger(__name__)
-
-
 
 
 @dataclasses.dataclass
@@ -34,7 +30,6 @@ class TestResult:
     @property
     def duration_str(self):
         return f"{self.duration:.4f}" if self.duration else "NA"
-
 
 
 def run_command(command) -> Optional[float]:

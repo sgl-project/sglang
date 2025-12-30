@@ -42,6 +42,23 @@ def is_in_ci() -> bool:
     return get_bool_env_var("SGLANG_IS_IN_CI")
 
 
+def get_dynamic_server_port() -> int:
+    cuda_devices = os.environ.get("CUDA_VISIBLE_DEVICES", "0")
+    if not cuda_devices:
+        cuda_devices = "0"
+    try:
+        first_device_id = int(cuda_devices.split(",")[0].strip()[0])
+    except (ValueError, IndexError):
+        first_device_id = 0
+
+    if is_in_ci():
+        base_port = 10000 + first_device_id * 2000
+    else:
+        base_port = 20000 + first_device_id * 1000
+
+    return base_port + 1000
+
+
 def is_mp4(data: bytes) -> bool:
     """Check if data represents a valid MP4 file by magic bytes."""
     if len(data) < 8:

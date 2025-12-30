@@ -104,7 +104,9 @@ class DiffGenerator:
         return cls.from_server_args(server_args, local_mode=local_mode)
 
     @classmethod
-    def from_server_args(cls, server_args: ServerArgs, local_mode: bool = True) -> "DiffGenerator":
+    def from_server_args(
+        cls, server_args: ServerArgs, local_mode: bool = True
+    ) -> "DiffGenerator":
         """
         Create a DiffGenerator with the specified arguments.
 
