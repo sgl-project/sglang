@@ -38,7 +38,7 @@ from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.runners import HFRunner, SRTRunner
 
 register_cuda_ci(
-    est_time=300,
+    est_time=120,
     suite="stage-b-test-small-1-gpu",
 )
 
