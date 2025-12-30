@@ -824,7 +824,6 @@ def load_audio(
 
     # Resample audio if the original sample rate is different from the desired sample rate
     if original_sr != sr:
-        num_samples = int(len(audio) * float(sr) / original_sr)
         audio = soxr.resample(audio, original_sr, sr)
 
     # Convert to mono if requested and audio is stereo
