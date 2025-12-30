@@ -11,7 +11,7 @@ import torch.nn as nn
 import triton
 import triton.language as tl
 
-from sglang.srt.custom_op import CustomOp
+from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     cpu_has_amx_support,
@@ -89,7 +89,7 @@ def _apply_rotary_emb(
         return torch.stack((o1, o2), dim=-1).flatten(-2)
 
 
-class RotaryEmbedding(CustomOp):
+class RotaryEmbedding(MultiPlatformOp):
     """Original rotary positional embedding."""
 
     def __init__(
@@ -2298,7 +2298,7 @@ class MRotaryEmbedding(RotaryEmbedding):
         return llm_pos_ids
 
 
-class DualChunkRotaryEmbedding(CustomOp):
+class DualChunkRotaryEmbedding(MultiPlatformOp):
     """Rotary positional embedding for Dual Chunk Attention."""
 
     def __init__(

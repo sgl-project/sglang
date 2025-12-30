@@ -690,7 +690,7 @@ class DecodePreallocQueue:
 
         # populate metadata
         req.fill_ids = req.origin_input_ids + req.output_ids
-        req.extend_input_len = len(req.origin_input_ids)
+        req.set_extend_input_len(len(req.fill_ids))
 
         return kv_loc
 
