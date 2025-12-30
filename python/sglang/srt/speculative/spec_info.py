@@ -82,9 +82,7 @@ class SpeculativeAlgorithm(Enum):
 
             return NGRAMWorker
 
-        raise ValueError(
-            f"Speculative algorithm {self.name} does not support non-overlap worker creation."
-        )
+        raise ValueError("Unreachable code path in create_worker.")
 
 
 class SpecInputType(IntEnum):
