@@ -28,6 +28,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.flux import Flux2PipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
     QwenImageEditPipelineConfig,
+    QwenImageEditPlus_2511_PipelineConfig,
     QwenImageEditPlusPipelineConfig,
     QwenImageLayeredPipelineConfig,
     QwenImagePipelineConfig,
@@ -429,7 +430,7 @@ def _register_configs():
 
     register_configs(
         sampling_param_cls=QwenImageEditPlusSamplingParams,
-        pipeline_config_cls=QwenImageEditPlusPipelineConfig,
+        pipeline_config_cls=QwenImageEditPlus_2511_PipelineConfig,
         hf_model_paths=["Qwen/Qwen-Image-Edit-2511"],
     )
 
