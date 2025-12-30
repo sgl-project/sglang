@@ -17,7 +17,6 @@ fn test_rerank_request_serialization() {
         return_documents: true,
         rid: Some(StringOrArray::String("req-123".to_string())),
         user: Some("user-456".to_string()),
-        routing_id: None,
     };
 
     let serialized = to_string(&request).unwrap();
@@ -60,7 +59,6 @@ fn test_rerank_request_validation_success() {
         return_documents: true,
         rid: None,
         user: None,
-        routing_id: None,
     };
 
     assert!(request.validate().is_ok());
@@ -76,7 +74,6 @@ fn test_rerank_request_validation_empty_query() {
         return_documents: true,
         rid: None,
         user: None,
-        routing_id: None,
     };
 
     let result = request.validate();
@@ -93,7 +90,6 @@ fn test_rerank_request_validation_whitespace_query() {
         return_documents: true,
         rid: None,
         user: None,
-        routing_id: None,
     };
 
     let result = request.validate();
@@ -110,7 +106,6 @@ fn test_rerank_request_validation_empty_documents() {
         return_documents: true,
         rid: None,
         user: None,
-        routing_id: None,
     };
 
     let result = request.validate();
@@ -127,7 +122,6 @@ fn test_rerank_request_validation_top_k_zero() {
         return_documents: true,
         rid: None,
         user: None,
-        routing_id: None,
     };
 
     let result = request.validate();
@@ -144,7 +138,6 @@ fn test_rerank_request_validation_top_k_greater_than_docs() {
         return_documents: true,
         rid: None,
         user: None,
-        routing_id: None,
     };
 
     // This should pass but log a warning
@@ -161,7 +154,6 @@ fn test_rerank_request_effective_top_k() {
         return_documents: true,
         rid: None,
         user: None,
-        routing_id: None,
     };
 
     assert_eq!(request.effective_top_k(), 2);
@@ -177,7 +169,6 @@ fn test_rerank_request_effective_top_k_none() {
         return_documents: true,
         rid: None,
         user: None,
-        routing_id: None,
     };
 
     assert_eq!(request.effective_top_k(), 3);
@@ -399,7 +390,6 @@ fn test_rerank_request_generation_request_trait() {
         return_documents: true,
         rid: None,
         user: None,
-        routing_id: None,
     };
 
     assert_eq!(request.get_model(), Some("test-model"));
@@ -418,7 +408,6 @@ fn test_rerank_request_very_long_query() {
         return_documents: true,
         rid: None,
         user: None,
-        routing_id: None,
     };
 
     assert!(request.validate().is_ok());
@@ -435,7 +424,6 @@ fn test_rerank_request_many_documents() {
         return_documents: true,
         rid: None,
         user: None,
-        routing_id: None,
     };
 
     assert!(request.validate().is_ok());
@@ -455,7 +443,6 @@ fn test_rerank_request_special_characters() {
         return_documents: true,
         rid: Some(StringOrArray::String("req-🚀-123".to_string())),
         user: Some("user-🎉-456".to_string()),
-        routing_id: None,
     };
 
     assert!(request.validate().is_ok());
@@ -474,7 +461,6 @@ fn test_rerank_request_rid_array() {
             "req2".to_string(),
         ])),
         user: None,
-        routing_id: None,
     };
 
     assert!(request.validate().is_ok());
@@ -529,7 +515,6 @@ fn test_full_rerank_workflow() {
         return_documents: true,
         rid: Some(StringOrArray::String("req-123".to_string())),
         user: Some("user-456".to_string()),
-        routing_id: None,
     };
 
     // Validate request

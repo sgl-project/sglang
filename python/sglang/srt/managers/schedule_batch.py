@@ -851,7 +851,7 @@ class Req:
         input_len = len(self.fill_ids)
         # NOTE: the matched length is at most 1 less than the input length to enable logprob computation
         max_prefix_len = input_len - 1
-        if self.return_logprob:
+        if self.return_logprob and self.logprob_start_len >= 0:
             max_prefix_len = min(max_prefix_len, self.logprob_start_len)
         max_prefix_len = max(max_prefix_len, 0)
         token_ids = self.fill_ids[:max_prefix_len]
@@ -1120,6 +1120,7 @@ class Req:
         self.grammar = None
         self.origin_input_ids = [0]  # set it to one token to skip the long prefill
         self.return_logprob = False
+        self.logprob_start_len = -1
         self.to_finish = FINISH_ABORT(
             error_msg, HTTPStatus.BAD_REQUEST, "BadRequestError"
         )
@@ -1490,26 +1491,16 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             #   (= len(fill_ids) - len(prefix_indices), where fill_ids = origin_input_ids + output_ids
             #    and prefix_indices are the cached/shared prefix tokens)
             #
-            if req.logprob_start_len >= pre_len:
-                # Optimization for prefill-only requests: When we only need logprobs at
-                # positions beyond the input sequence (to score next-token likelihood), skip all
-                # input logprob computation during prefill since no generation will occur.
-                if self.is_prefill_only and req.logprob_start_len == len(
-                    req.origin_input_ids
-                ):
-                    # Skip ALL input logprobs: set extend_logprob_start_len = extend_input_len
-                    req.extend_logprob_start_len = req.extend_input_len
-                else:
-                    # Convert absolute logprob_start_len to relative extend_logprob_start_len
-                    #
-                    # Example: origin_input_ids=[1,2,3,4,5] (5 tokens, positions 0-4), logprob_start_len=3
-                    # Regular logic: min(3-0, 5, 5-1) = min(3,5,4) = 3
-                    # This means: "compute logprobs from position 3 onwards in extend batch"
-                    req.extend_logprob_start_len = min(
-                        req.logprob_start_len - pre_len,
-                        req.extend_input_len,
-                        req.seqlen - 1,
-                    )
+            if req.logprob_start_len == -1:
+                req.extend_logprob_start_len = min(
+                    len(req.fill_ids) - 1 - pre_len,
+                    req.extend_input_len,
+                )
+            elif req.logprob_start_len >= pre_len:
+                req.extend_logprob_start_len = min(
+                    req.logprob_start_len - pre_len,
+                    req.extend_input_len,
+                )
             else:
                 # logprob_start_len is before the current extend batch, so start from beginning
                 req.extend_logprob_start_len = 0
@@ -1532,9 +1523,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     len(req.prefix_indices),
                     len(req.fill_ids),
                 )
+                if req.logprob_start_len == -1:
+                    logprob_start_len = len(req.origin_input_ids) - 1
+                else:
+                    logprob_start_len = req.logprob_start_len
                 # Apply logprob_start_len
-                if global_start_idx < req.logprob_start_len:
-                    global_start_idx = req.logprob_start_len
+                if global_start_idx < logprob_start_len:
+                    global_start_idx = logprob_start_len
 
                 logprob_token_ids = req.origin_input_ids[
                     global_start_idx + 1 : global_end_idx + 1
@@ -1556,6 +1551,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             extend_input_logprob_token_ids = torch.tensor(
                 extend_input_logprob_token_ids
             )
+            # Clamp placeholder or out-of-range token IDs (e.g., multimodal hashes)
+            # so they stay within the vocab boundary before being sent to GPU.
+            extend_input_logprob_token_ids.clamp_(0, self.model_config.vocab_size - 1)
         else:
             extend_input_logprob_token_ids = None
 
@@ -1854,16 +1852,16 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         )
 
     @property
-    def is_eagle_v2(self):
-        # FIXME: finally deprecate is_eagle_v2
+    def is_spec_v2(self):
+        # FIXME: finally deprecate is_spec_v2
         return self.enable_overlap and self.spec_algorithm.is_eagle()
 
     def prepare_for_decode(self):
         self.forward_mode = ForwardMode.DECODE
         bs = len(self.reqs)
 
-        if self.is_eagle_v2:
-            # TODO(spec-v2): all v2 spec should go through this path
+        if self.is_spec_v2:
+            # TODO(spec-v2): all spec v2 should go through this path
             draft_input: EagleDraftInput = self.spec_info
             draft_input.prepare_for_decode(self)
 
@@ -1942,7 +1940,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             )
 
     def maybe_wait_verify_done(self):
-        if self.is_eagle_v2:
+        if self.is_spec_v2:
             draft_input: EagleDraftInput = self.spec_info
             if draft_input.verify_done is not None:
                 draft_input.verify_done.synchronize()
@@ -2018,7 +2016,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # NOTE: spec_info filtered before batch filtering only happens in:
         # - Spec v1's verify phase
         # - Only for decode batch (running_batch)
-        has_been_filtered = v1_spec_info_filtered and not self.is_eagle_v2
+        has_been_filtered = v1_spec_info_filtered and not self.is_spec_v2
 
         if self.spec_info:
             self.spec_info.filter_batch(
@@ -2027,7 +2025,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             )
 
     def merge_batch(self, other: "ScheduleBatch"):
-        # NOTE: in v2 eagle mode, we do not need wait verify here because
+        # NOTE: in spec v2 mode, we do not need wait verify here because
         # 1) current batch is always prefill, whose seq_lens is not a future
         # 2) other batch is always decode, which is finished in previous step
 

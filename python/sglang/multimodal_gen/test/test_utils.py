@@ -198,10 +198,9 @@ def read_perf_logs(log_path: Path) -> list[RequestPerfRecord]:
 
 def wait_for_req_perf_record(
     request_id: str,
-    prev_len: int,
     log_path: Path,
     timeout: float = 30.0,
-) -> tuple[RequestPerfRecord | None, int]:
+) -> RequestPerfRecord | None:
     """
     the stage metrics of this request should be in the performance_log file with {request-id}
     """
@@ -209,16 +208,14 @@ def wait_for_req_perf_record(
     deadline = time.time() + timeout
     while time.time() < deadline:
         records = read_perf_logs(log_path)
-        if len(records) >= prev_len + 1:
-            # FIXME: unable to get rid from openai apis, this is a hack. we should compare rid
-            # potential error when there are multiple servers
-            return records[-1], len(records)
+        for record in records:
+            if record.request_id == request_id:
+                return record
 
         time.sleep(0.5)
 
     if os.environ.get("SGLANG_GEN_BASELINE", "0") == "1":
-        records = read_perf_logs(log_path)
-        return None, len(records)
+        return None
 
     logger.error(f"record: {records}")
     raise AssertionError(f"Timeout waiting for stage metrics for request {request_id} ")

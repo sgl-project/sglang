@@ -21,6 +21,7 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
 from sglang.multimodal_gen.runtime.entrypoints.openai.stores import IMAGE_STORE
 from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     _parse_size,
+    add_common_data_to_response,
     merge_image_input_list,
     process_generation_batch,
     save_image_to_path,
@@ -120,8 +121,6 @@ async def generations(
         server_args=get_global_server_args(),
         sampling_params=sampling,
     )
-
-    # Run synchronously for images and save to disk
     save_file_path, result = await process_generation_batch(
         async_scheduler_client, batch
     )
@@ -145,10 +144,11 @@ async def generations(
                     b64_json=b64,
                     revised_prompt=request.prompt,
                 )
-            ]
+            ],
         }
-        if result.peak_memory_mb and result.peak_memory_mb > 0:
-            response_kwargs["peak_memory_mb"] = result.peak_memory_mb
+        response_kwargs = add_common_data_to_response(
+            response_kwargs, request_id=request_id, result=result
+        )
         return ImageResponse(**response_kwargs)
     else:
         # Return error, not supported
@@ -244,17 +244,19 @@ async def edits(
         with open(save_file_path, "rb") as f:
             b64 = base64.b64encode(f.read()).decode("utf-8")
         response_kwargs = {
-            "data": [ImageResponseData(b64_json=b64, revised_prompt=prompt)]
+            "data": [ImageResponseData(b64_json=b64, revised_prompt=prompt)],
         }
-        if result.peak_memory_mb and result.peak_memory_mb > 0:
-            response_kwargs["peak_memory_mb"] = result.peak_memory_mb
-        return ImageResponse(**response_kwargs)
     else:
         url = f"/v1/images/{request_id}/content"
-        response_kwargs = {"data": [ImageResponseData(url=url, revised_prompt=prompt)]}
-        if result.peak_memory_mb and result.peak_memory_mb > 0:
-            response_kwargs["peak_memory_mb"] = result.peak_memory_mb
-        return ImageResponse(**response_kwargs)
+        response_kwargs = {
+            "data": [ImageResponseData(url=url, revised_prompt=prompt)],
+        }
+
+    response_kwargs = add_common_data_to_response(
+        response_kwargs, request_id=request_id, result=result
+    )
+
+    return ImageResponse(**response_kwargs)
 
 
 @router.get("/{image_id}/content")

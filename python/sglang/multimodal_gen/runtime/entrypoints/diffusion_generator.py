@@ -183,14 +183,13 @@ class DiffGenerator:
                 raise ValueError(f"No prompts found in file: {prompt_txt_path}")
 
             logger.info("Found %d prompts in %s", len(prompts), prompt_txt_path)
-        elif prompt is not None:
+        else:
+            if prompt is None:
+                prompt = " "
             if isinstance(prompt, str):
                 prompts.append(prompt)
             elif isinstance(prompt, list):
                 prompts.extend(prompt)
-        else:
-            raise ValueError("Either prompt or prompt_txt must be provided")
-
         sampling_params = SamplingParams.from_user_sampling_params_args(
             self.server_args.model_path,
             server_args=self.server_args,

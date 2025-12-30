@@ -103,24 +103,16 @@ fn test_mixed_model_ids() {
 
     let default_workers: Vec<Arc<dyn Worker>> =
         vec![Arc::new(worker1.clone()), Arc::new(worker3.clone())];
-    let selected = policy.select_worker(
-        &default_workers,
-        &SelectWorkerInfo {
-            request_text: Some("test request"),
-            ..Default::default()
-        },
-    );
+    let info = SelectWorkerInfo {
+        request_text: Some("test request"),
+        ..Default::default()
+    };
+    let selected = policy.select_worker(&default_workers, &info);
     assert!(selected.is_some(), "Should select from default workers");
 
     let llama_workers: Vec<Arc<dyn Worker>> =
         vec![Arc::new(worker2.clone()), Arc::new(worker4.clone())];
-    let selected = policy.select_worker(
-        &llama_workers,
-        &SelectWorkerInfo {
-            request_text: Some("test request"),
-            ..Default::default()
-        },
-    );
+    let selected = policy.select_worker(&llama_workers, &info);
     assert!(selected.is_some(), "Should select from llama-3 workers");
 
     let all_workers: Vec<Arc<dyn Worker>> = vec![
@@ -129,13 +121,7 @@ fn test_mixed_model_ids() {
         Arc::new(worker3.clone()),
         Arc::new(worker4.clone()),
     ];
-    let selected = policy.select_worker(
-        &all_workers,
-        &SelectWorkerInfo {
-            request_text: Some("test request"),
-            ..Default::default()
-        },
-    );
+    let selected = policy.select_worker(&all_workers, &info);
     assert!(selected.is_some(), "Should select from all workers");
 }
 

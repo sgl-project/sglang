@@ -59,22 +59,15 @@
     during the next eviction cycle.
 */
 
-use std::{
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc,
-    },
-    thread,
-    time::Duration,
-};
+use std::sync::Arc;
 
 use dashmap::DashMap;
 use rand::Rng;
 use tracing::debug;
 
 use super::{
-    get_healthy_worker_indices, normalize_model_key, tree::Tree, CacheAwareConfig,
-    LoadBalancingPolicy, SelectWorkerInfo,
+    get_healthy_worker_indices, normalize_model_key, tree::Tree, utils::PeriodicTask,
+    CacheAwareConfig, LoadBalancingPolicy, SelectWorkerInfo,
 };
 use crate::core::Worker;
 
@@ -87,10 +80,7 @@ use crate::core::Worker;
 pub struct CacheAwarePolicy {
     config: CacheAwareConfig,
     trees: Arc<DashMap<String, Arc<Tree>>>,
-    /// Handle to the background eviction thread
-    eviction_handle: Option<thread::JoinHandle<()>>,
-    /// Flag to signal the eviction thread to stop
-    shutdown_flag: Arc<AtomicBool>,
+    _eviction_task: Option<PeriodicTask>,
 }
 
 impl CacheAwarePolicy {
@@ -100,39 +90,16 @@ impl CacheAwarePolicy {
 
     pub fn with_config(config: CacheAwareConfig) -> Self {
         let trees = Arc::new(DashMap::<String, Arc<Tree>>::new());
-        let shutdown_flag = Arc::new(AtomicBool::new(false));
 
         // Start background eviction thread if configured
-        let eviction_handle = if config.eviction_interval_secs > 0 {
+        let eviction_task = if config.eviction_interval_secs > 0 {
             let trees_clone = Arc::clone(&trees);
-            let shutdown_clone = Arc::clone(&shutdown_flag);
             let max_tree_size = config.max_tree_size;
-            let interval = config.eviction_interval_secs;
 
-            Some(thread::spawn(move || {
-                // Use smaller sleep intervals to check shutdown flag more frequently
-                let check_interval_ms = 100; // Check every 100ms
-                let total_sleep_ms = interval * 1000;
-
-                loop {
-                    // Sleep in small increments, checking shutdown flag periodically
-                    let mut slept_ms = 0u64;
-                    while slept_ms < total_sleep_ms {
-                        if shutdown_clone.load(Ordering::Relaxed) {
-                            debug!("Eviction thread received shutdown signal");
-                            return;
-                        }
-                        thread::sleep(Duration::from_millis(check_interval_ms));
-                        slept_ms += check_interval_ms;
-                    }
-
-                    // Check shutdown before starting eviction
-                    if shutdown_clone.load(Ordering::Relaxed) {
-                        debug!("Eviction thread received shutdown signal");
-                        return;
-                    }
-
-                    // Evict for all model trees
+            Some(PeriodicTask::spawn(
+                config.eviction_interval_secs,
+                "Eviction",
+                move || {
                     for tree_ref in trees_clone.iter() {
                         let model_id = tree_ref.key();
                         let tree = tree_ref.value();
@@ -143,8 +110,8 @@ impl CacheAwarePolicy {
                             model_id, max_tree_size
                         );
                     }
-                }
-            }))
+                },
+            ))
         } else {
             None
         };
@@ -152,8 +119,7 @@ impl CacheAwarePolicy {
         Self {
             config,
             trees,
-            eviction_handle,
-            shutdown_flag,
+            _eviction_task: eviction_task,
         }
     }
 
@@ -327,15 +293,16 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
 
         if let Some(tree) = tree {
             // Now we work with the tree without holding the HashMap lock
-            let (matched_text, matched_worker) = tree.prefix_match(text);
-            let match_rate = if text.is_empty() {
+            // Use prefix_match_with_counts to avoid redundant chars().count() calls
+            let result = tree.prefix_match_with_counts(text);
+            let match_rate = if result.input_char_count == 0 {
                 0.0
             } else {
-                matched_text.chars().count() as f32 / text.chars().count() as f32
+                result.matched_char_count as f32 / result.input_char_count as f32
             };
 
             let selected_url = if match_rate > self.config.cache_threshold {
-                matched_worker.to_string()
+                result.tenant.to_string()
             } else {
                 let min_load_idx = *healthy_indices
                     .iter()
@@ -404,22 +371,6 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
 impl Default for CacheAwarePolicy {
     fn default() -> Self {
         Self::new()
-    }
-}
-
-impl Drop for CacheAwarePolicy {
-    fn drop(&mut self) {
-        // Signal the eviction thread to stop
-        self.shutdown_flag.store(true, Ordering::Relaxed);
-
-        // Wait for the thread to finish (with timeout)
-        if let Some(handle) = self.eviction_handle.take() {
-            // The thread checks the shutdown flag every 100ms, so it should exit quickly
-            match handle.join() {
-                Ok(()) => debug!("Eviction thread shut down cleanly"),
-                Err(_) => debug!("Eviction thread panicked during shutdown"),
-            }
-        }
     }
 }
 
@@ -517,16 +468,12 @@ mod tests {
         policy.init_workers(&workers);
 
         // Should select worker2 (lower load) despite cache affinity
+        let info = SelectWorkerInfo {
+            request_text: Some("test"),
+            ..Default::default()
+        };
         for _ in 0..5 {
-            let idx = policy
-                .select_worker(
-                    &workers,
-                    &SelectWorkerInfo {
-                        request_text: Some("test"),
-                        ..Default::default()
-                    },
-                )
-                .unwrap();
+            let idx = policy.select_worker(&workers, &info).unwrap();
             assert_eq!(idx, 1); // Should always pick worker2
         }
     }
