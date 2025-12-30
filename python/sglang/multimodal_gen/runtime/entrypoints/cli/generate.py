@@ -46,7 +46,7 @@ def add_multimodal_gen_generate_args(parser: argparse.ArgumentParser):
     parser.add_argument(
         "--warmup",
         action="store_true",
-        help="Run a warm-up phase to exclude compilation overhead from performance measurements, if needed. Requires --perf-dump-path to be set."
+        help="Run a warm-up phase to exclude compilation overhead from performance measurements, if needed. Requires --perf-dump-path to be set.",
     )
 
     parser = ServerArgs.add_cli_args(parser)
