@@ -316,7 +316,7 @@ class Qwen3DecoderLayer(nn.Module):
             return []
 
         combined_cache = _get_weights(self.mlp.gate_up_proj) + _get_weights(self.mlp.down_proj)
-        return combined_cache if combined_cache else None
+        return combined_cache or None
 
 
 class Qwen3Model(Qwen2Model):
