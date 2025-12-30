@@ -498,11 +498,6 @@ class Scheduler(
                 f"Using draft model load_format: '{self.server_args.speculative_draft_load_format}'"
             )
 
-        # Draft workers are looked up via `SpeculativeAlgorithm` registry; new
-        # algorithms should register their factory instead of patching this code.
-        if self.spec_algorithm.supports_spec_v2():
-            draft_worker_kwargs["enable_overlap"] = self.enable_overlap
-
         # FIXME: refactor the draft worker registration logic
         if self.server_args.enable_multi_layer_eagle:
             if self.enable_overlap:
@@ -534,9 +529,15 @@ class Scheduler(
                     dp_rank=self.dp_rank,
                 )
         else:
-            self.draft_worker = self.spec_algorithm.create_draft_worker(
-                **draft_worker_kwargs
+            WorkerClass = self.spec_algorithm.create_worker(
+                enable_overlap=self.enable_overlap
             )
+
+            # FIXME: optimize the init draft worker code path
+            if WorkerClass is not None:
+                self.draft_worker = WorkerClass(**draft_worker_kwargs)
+            else:
+                self.draft_worker = None
 
     def init_model_worker(self):
         self.init_tp_model_worker()
