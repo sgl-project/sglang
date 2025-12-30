@@ -292,6 +292,8 @@ class Scheduler(
             )
         )
 
+        self.max_prefill_bs = 0
+
         # Init model configs
         self.init_model_config()
 
@@ -1088,13 +1090,17 @@ class Scheduler(
             self.process_batch_result(tmp_batch, tmp_result)
 
         import os
-        enable_profiling: bool = os.getenv("ENABLE_PROFILING", "0") == "1" and self.tp_rank == 0
+
+        enable_profiling: bool = (
+            os.getenv("ENABLE_PROFILING", "0") == "1" and self.tp_rank == 0
+        )
         prof_bs: int = os.getenv("PROFILING_BS", 8)
         profiling_stage: str = os.getenv("PROFILING_STAGE", "decode")
         prof_step: int = os.getenv("PROFILING_step", 10)
         if enable_profiling:
             prof_cnt = 0
             import torch_npu
+
             experimental_config = torch_npu.profiler._ExperimentalConfig(
                 aic_metrics=torch_npu.profiler.AiCMetrics.PipeUtilization,
                 profiler_level=torch_npu.profiler.ProfilerLevel.Level2,
@@ -1110,13 +1116,16 @@ class Scheduler(
                 on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(
                     profiling_path
                 ),
-                schedule=torch_npu.profiler.schedule(wait=1, warmup=1, active=10, repeat=1, skip_first=1),
+                schedule=torch_npu.profiler.schedule(
+                    wait=1, warmup=1, active=10, repeat=1, skip_first=1
+                ),
                 record_shapes=True,
                 profile_memory=True,
                 with_stack=False,
                 with_flops=False,
                 with_modules=False,
-                experimental_config=experimental_config)
+                experimental_config=experimental_config,
+            )
 
         while True:
             # Receive requests
@@ -1139,9 +1148,13 @@ class Scheduler(
             if batch:
                 if enable_profiling:
                     is_prof_stage = False
-                    if (profiling_stage == "decode" and batch.forward_mode.is_decode()) or (profiling_stage == "prefill" and batch.forward_mode.is_extend()):
+                    if (
+                        profiling_stage == "decode" and batch.forward_mode.is_decode()
+                    ) or (
+                        profiling_stage == "prefill" and batch.forward_mode.is_extend()
+                    ):
                         is_prof_stage = True
-                    
+
                     if len(batch.reqs) >= prof_bs and prof_cnt == 0 and is_prof_stage:
                         prof.start()
                         prof_cnt += 1
@@ -1154,7 +1167,12 @@ class Scheduler(
                 batch_result = self.run_batch(batch)
                 self.result_queue.append((batch.copy(), batch_result))
 
-                if enable_profiling and prof_cnt > 0 and prof_cnt < prof_step and is_prof_stage:
+                if (
+                    enable_profiling
+                    and prof_cnt > 0
+                    and prof_cnt < prof_step
+                    and is_prof_stage
+                ):
                     prof.step()
             else:
                 batch_result = None
@@ -1802,6 +1820,15 @@ class Scheduler(
             if self.chunked_req is not None and self.chunked_req.finished():
                 self.chunked_req = None
 
+        skip_prefill_scheduler = False
+        if self.schedule_enhancer and not self.schedule_enhancer.get_schedule_decision(
+            self.running_batch, self.max_prefill_bs
+        ):
+            # Decrease prefill idle as much as possible during high dp load.
+            skip_prefill_scheduler = True
+            chunked_back = self.chunked_req
+            self.chunked_req = None
+
         # Merge the prefill batch into the running batch
         chunked_req_to_exclude = set()
         if self.chunked_req:
@@ -1841,7 +1868,10 @@ class Scheduler(
                     # Merge running_batch with prefill batch
                     self.running_batch.merge_batch(self.last_batch)
 
-        new_batch = self.get_new_batch_prefill()
+        if skip_prefill_scheduler:
+            new_batch = None
+        else:
+            new_batch = self.get_new_batch_prefill()
 
         need_mlp_sync = self.require_mlp_sync
         if need_mlp_sync and not self.spec_algorithm.is_none():
@@ -1869,7 +1899,8 @@ class Scheduler(
 
         if ret:
             trace_event_batch("schedule", ret.reqs)
-
+        if skip_prefill_scheduler:
+            self.chunked_req = chunked_back
         return ret
 
     def get_num_allocatable_reqs(self, running_bs):
@@ -1879,12 +1910,6 @@ class Scheduler(
         return res
 
     def get_new_batch_prefill(self) -> Optional[ScheduleBatch]:
-        if self.schedule_enhancer and not self.schedule_enhancer.get_schedule_decision(
-            self.running_batch
-        ):
-            # Decrease prefill idle as much as possible during high dp load.
-            return None
-
         # Check if the grammar is ready in the grammar queue
         if self.grammar_queue:
             self.move_ready_grammar_requests()
@@ -2012,6 +2037,7 @@ class Scheduler(
                         self.running_batch.batch_is_full = True
                 break
 
+        self.max_prefill_bs = max(self.max_prefill_bs, len(adder.can_run_list))
         # Update waiting queue
         can_run_list: List[Req] = adder.can_run_list
         if len(can_run_list) == 0:
