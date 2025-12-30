@@ -4,11 +4,12 @@ use std::{
     hash::{BuildHasherDefault, Hasher},
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc, RwLock,
+        Arc,
     },
 };
 
 use dashmap::{mapref::entry::Entry, DashMap};
+use parking_lot::RwLock;
 use tracing::debug;
 
 type NodeRef = Arc<Node>;
@@ -85,6 +86,31 @@ impl Hasher for CharHasher {
 
 type CharHasherBuilder = BuildHasherDefault<CharHasher>;
 
+/// Get the first character of a string with ASCII fast path.
+/// Panics if string is empty.
+#[inline(always)]
+fn first_char_fast(s: &str) -> char {
+    // SAFETY: Caller must ensure s is non-empty
+    let b = s.as_bytes()[0];
+    if b.is_ascii() {
+        b as char
+    } else {
+        // UTF-8 multi-byte character - use standard method
+        s.chars().next().unwrap()
+    }
+}
+
+/// Count characters in a string with ASCII fast path.
+/// For ASCII text (most LLM prompts), byte length equals char count.
+#[inline(always)]
+fn char_count_fast(s: &str) -> usize {
+    if s.is_ascii() {
+        s.len()
+    } else {
+        s.chars().count()
+    }
+}
+
 /// Advance a string slice by N characters, returning the remaining slice.
 /// Returns empty string if n >= char count.
 /// Optimized: uses direct byte slicing for ASCII, falls back to char_indices for UTF-8.
@@ -110,12 +136,22 @@ fn advance_by_chars(s: &str, n: usize) -> &str {
 }
 
 /// Get the first N characters of a string as a new String.
-/// More efficient than chars().take(n).collect() for known bounds.
+/// Optimized: uses direct byte slicing for ASCII, falls back to char_indices for UTF-8.
 #[inline]
 fn take_chars(s: &str, n: usize) -> String {
     if n == 0 {
         return String::new();
     }
+    if n >= s.len() {
+        return s.to_string();
+    }
+    // Fast path: if first N bytes are all ASCII, we can slice directly
+    let bytes = s.as_bytes();
+    if bytes[..n].is_ascii() {
+        // Safe: we verified all bytes in [0..n] are ASCII (valid UTF-8 boundary)
+        return s[..n].to_string();
+    }
+    // Slow path: UTF-8 requires char-by-char traversal
     s.char_indices()
         .nth(n)
         .map(|(idx, _)| s[..idx].to_string())
@@ -134,7 +170,7 @@ struct NodeText {
 impl NodeText {
     #[inline]
     fn new(text: String) -> Self {
-        let char_count = text.chars().count();
+        let char_count = char_count_fast(&text);
         Self { text, char_count }
     }
 
@@ -158,11 +194,15 @@ impl NodeText {
 
     #[inline]
     fn first_char(&self) -> Option<char> {
-        self.text.chars().next()
+        if self.text.is_empty() {
+            None
+        } else {
+            Some(first_char_fast(&self.text))
+        }
     }
 
     /// Split the text at a character boundary, returning the prefix and suffix.
-    /// This is more efficient than slice_by_chars as it computes both at once.
+    /// Optimized: uses direct byte slicing for ASCII, falls back to char_indices for UTF-8.
     #[inline]
     fn split_at_char(&self, char_idx: usize) -> (NodeText, NodeText) {
         if char_idx == 0 {
@@ -172,13 +212,19 @@ impl NodeText {
             return (self.clone_text(), NodeText::empty());
         }
 
-        // Find byte index for the character boundary
-        let byte_idx = self
-            .text
-            .char_indices()
-            .nth(char_idx)
-            .map(|(i, _)| i)
-            .unwrap_or(self.text.len());
+        let bytes = self.text.as_bytes();
+
+        // Fast path: if first char_idx bytes are all ASCII, byte_idx == char_idx
+        let byte_idx = if char_idx <= bytes.len() && bytes[..char_idx].is_ascii() {
+            char_idx
+        } else {
+            // Slow path: UTF-8 requires char-by-char traversal
+            self.text
+                .char_indices()
+                .nth(char_idx)
+                .map(|(i, _)| i)
+                .unwrap_or(self.text.len())
+        };
 
         let prefix = NodeText {
             text: self.text[..byte_idx].to_string(),
@@ -239,7 +285,7 @@ struct Node {
     parent: RwLock<Option<NodeRef>>,
     /// Cached last-accessed tenant for O(1) lookup during prefix match.
     /// Avoids O(shards) DashMap iteration in the common case.
-    last_tenant: parking_lot::RwLock<Option<TenantId>>,
+    last_tenant: RwLock<Option<TenantId>>,
 }
 
 #[derive(Debug)]
@@ -353,7 +399,7 @@ impl Tree {
                 text: RwLock::new(NodeText::empty()),
                 tenant_last_access_time: DashMap::with_shard_amount(ROOT_SHARD_COUNT),
                 parent: RwLock::new(None),
-                last_tenant: parking_lot::RwLock::new(None),
+                last_tenant: RwLock::new(None),
             }),
             tenant_char_count: DashMap::with_shard_amount(ROOT_SHARD_COUNT),
         }
@@ -391,14 +437,14 @@ impl Tree {
         }
 
         while !remaining.is_empty() {
-            let first_char = remaining.chars().next().unwrap();
+            let first_char = first_char_fast(remaining);
 
             // Use entry API for atomic check-and-insert semantics (required for thread safety)
             let step = match prev.children.entry(first_char) {
                 Entry::Vacant(entry) => {
                     // No match - create new node with remaining text (this is the leaf)
-                    // Compute remaining char count lazily - only here when creating leaf
-                    let remaining_char_count = remaining.chars().count();
+                    // Compute remaining char count with ASCII fast path
+                    let remaining_char_count = char_count_fast(remaining);
                     let epoch = get_epoch();
 
                     let new_node = Arc::new(Node {
@@ -406,7 +452,7 @@ impl Tree {
                         text: RwLock::new(NodeText::new(remaining.to_string())),
                         tenant_last_access_time: new_tenant_map(),
                         parent: RwLock::new(Some(Arc::clone(&prev))),
-                        last_tenant: parking_lot::RwLock::new(Some(Arc::clone(&tenant_id))),
+                        last_tenant: RwLock::new(Some(Arc::clone(&tenant_id))),
                     });
 
                     // Attach tenant to the new leaf node with timestamp
@@ -425,7 +471,7 @@ impl Tree {
                 Entry::Occupied(mut entry) => {
                     let matched_node = entry.get().clone();
 
-                    let matched_node_text = matched_node.text.read().unwrap();
+                    let matched_node_text = matched_node.text.read();
                     let matched_node_text_count = matched_node_text.char_count();
                     let matched_node_text_str = matched_node_text.as_str();
 
@@ -446,9 +492,7 @@ impl Tree {
                             children: new_children_map(),
                             parent: RwLock::new(Some(Arc::clone(&prev))),
                             tenant_last_access_time: matched_node.tenant_last_access_time.clone(),
-                            last_tenant: parking_lot::RwLock::new(
-                                matched_node.last_tenant.read().clone(),
-                            ),
+                            last_tenant: RwLock::new(matched_node.last_tenant.read().clone()),
                         });
 
                         let first_new_char = contracted_text.first_char().unwrap();
@@ -458,8 +502,8 @@ impl Tree {
 
                         entry.insert(Arc::clone(&new_node));
 
-                        *matched_node.text.write().unwrap() = contracted_text;
-                        *matched_node.parent.write().unwrap() = Some(Arc::clone(&new_node));
+                        *matched_node.text.write() = contracted_text;
+                        *matched_node.parent.write() = Some(Arc::clone(&new_node));
 
                         // Attach tenant to the new split node (intermediate - no timestamp update)
                         // The cloned DashMap already has the tenant; just ensure char count is correct
@@ -534,12 +578,12 @@ impl Tree {
         let mut prev = Arc::clone(&self.root);
 
         while !remaining.is_empty() {
-            let first_char = remaining.chars().next().unwrap();
+            let first_char = first_char_fast(remaining);
 
             let child_node = prev.children.get(&first_char).map(|e| e.value().clone());
 
             if let Some(matched_node) = child_node {
-                let matched_text_guard = matched_node.text.read().unwrap();
+                let matched_text_guard = matched_node.text.read();
                 let matched_node_text_count = matched_text_guard.char_count();
 
                 // Use slice-based comparison - no allocation
@@ -568,13 +612,13 @@ impl Tree {
         // Try cached tenant first (O(1)) before falling back to O(shards) DashMap iteration.
         // The cache is valid if the tenant still exists in tenant_last_access_time.
         let tenant: TenantId = {
-            let cached = curr.last_tenant.read();
-            if let Some(ref t) = *cached {
+            // Fast path: check cache
+            let cached = curr.last_tenant.read().clone();
+            if let Some(ref t) = cached {
                 if curr.tenant_last_access_time.contains_key(t.as_ref()) {
                     Arc::clone(t)
                 } else {
-                    drop(cached);
-                    // Cache stale, fall back to iteration and update cache
+                    // Cache stale, fall back to DashMap and update cache
                     let t = curr
                         .tenant_last_access_time
                         .iter()
@@ -585,8 +629,7 @@ impl Tree {
                     t
                 }
             } else {
-                drop(cached);
-                // No cache, iterate and populate cache
+                // No cache, get from DashMap and populate cache
                 let t = curr
                     .tenant_last_access_time
                     .iter()
@@ -606,8 +649,8 @@ impl Tree {
                 .insert(Arc::clone(&tenant), epoch);
         }
 
-        // Compute input char count from matched + remaining (deferred from start)
-        let input_char_count = matched_chars + remaining.chars().count();
+        // Compute input char count from matched + remaining (with ASCII fast path)
+        let input_char_count = matched_chars + char_count_fast(remaining);
 
         PrefixMatchResult {
             tenant,
@@ -636,7 +679,7 @@ impl Tree {
         let mut prev = Arc::clone(&self.root);
 
         while !remaining.is_empty() {
-            let first_char = remaining.chars().next().unwrap();
+            let first_char = first_char_fast(remaining);
 
             let child_node = prev.children.get(&first_char).map(|e| e.value().clone());
 
@@ -649,7 +692,7 @@ impl Tree {
                     break;
                 }
 
-                let matched_text_guard = matched_node.text.read().unwrap();
+                let matched_text_guard = matched_node.text.read();
                 let matched_node_text_count = matched_text_guard.char_count();
 
                 // Use slice-based comparison - no allocation
@@ -764,7 +807,7 @@ impl Tree {
             }
 
             // Decrement when removing tenant from node
-            let node_len = node.text.read().unwrap().char_count();
+            let node_len = node.text.read().char_count();
             self.tenant_char_count
                 .entry(Arc::clone(&tenant))
                 .and_modify(|count| {
@@ -775,12 +818,12 @@ impl Tree {
             node.tenant_last_access_time.remove(tenant.as_ref());
 
             // Get parent reference outside of the borrow scope
-            let parent_opt = node.parent.read().unwrap().clone();
+            let parent_opt = node.parent.read().clone();
 
             // Remove empty nodes
             if node.children.is_empty() && node.tenant_last_access_time.is_empty() {
                 if let Some(ref parent) = parent_opt {
-                    if let Some(fc) = node.text.read().unwrap().first_char() {
+                    if let Some(fc) = node.text.read().first_char() {
                         parent.children.remove(&fc);
                     }
                 }
@@ -855,12 +898,12 @@ impl Tree {
             curr.tenant_last_access_time.remove(tenant_id.as_ref());
 
             // Get parent reference outside of the borrow scope
-            let parent_opt = curr.parent.read().unwrap().clone();
+            let parent_opt = curr.parent.read().clone();
 
             // Remove empty nodes
             if curr.children.is_empty() && curr.tenant_last_access_time.is_empty() {
                 if let Some(ref parent) = parent_opt {
-                    if let Some(fc) = curr.text.read().unwrap().first_char() {
+                    if let Some(fc) = curr.text.read().first_char() {
                         parent.children.remove(&fc);
                     }
                 }
@@ -908,7 +951,7 @@ impl Tree {
 
         while let Some(curr) = stack.pop() {
             // Use cached char count instead of chars().count()
-            let text_count = curr.text.read().unwrap().char_count();
+            let text_count = curr.text.read().char_count();
 
             for tenant in curr.tenant_last_access_time.iter() {
                 let size = used_size_per_tenant
@@ -934,7 +977,7 @@ impl Tree {
         result.push_str(if is_last { "└── " } else { "├── " });
 
         // Add node text
-        let node_text = node.text.read().unwrap();
+        let node_text = node.text.read();
         result.push_str(&format!("'{}' [", node_text.as_str()));
 
         // Add tenant information with epoch values
