@@ -107,7 +107,7 @@ ALL_MODELS = [
         trust_remote_code=True,
         skip_long_prompt=True,
         attention_backend="triton",
-        prefill_tolerance=0.1
+        prefill_tolerance=0.1,
     ),
 ]
 
