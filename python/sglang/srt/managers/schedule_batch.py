@@ -1148,10 +1148,15 @@ class Req:
         )
 
     def update_reasoning_tokens(self, token_id, think_end_id):
+        print(f"\033[42m {token_id=} \033[0m")
+        if not isinstance(token_id, list):
+            token_id = [token_id]
+
         if not self._reasoning_over:
-            self.reasoning_tokens += 1
-            if token_id == think_end_id:
-                self._reasoning_over = True
+            for tok_id in token_id:
+                self.reasoning_tokens += 1
+                if tok_id == think_end_id:
+                    self._reasoning_over = True
 
     def __repr__(self):
         return (
