@@ -552,7 +552,7 @@ class ForwardBatch:
             num_tokens_per_dp = self.global_num_tokens_gpu[0]
 
         self.num_token_non_padded = compute_local_num_token_non_padded(
-            global_num_token_non_padded=self.num_token_non_padded,
+            global_num_token_non_padded=self.num_token_non_padded_cpu,
             num_tokens_per_dp=num_tokens_per_dp,
         )
 
