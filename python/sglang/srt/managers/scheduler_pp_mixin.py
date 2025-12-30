@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 import numpy as np
 import torch
 import torch.distributed
+from tqdm import tqdm
 
 from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.srt.disaggregation.utils import DisaggregationMode, poll_and_all_reduce
@@ -135,7 +136,7 @@ class SchedulerPPMixin:
 
             # When the server is idle, self-check and re-init some states
             if server_is_idle:
-                self.check_during_pp_idle()
+                self.self_check_during_idle()
 
     @DynamicGradMode()
     def event_loop_pp_disagg_prefill(self: Scheduler):
@@ -311,7 +312,7 @@ class SchedulerPPMixin:
 
             # When the server is idle, self-check and re-init some states
             if server_is_idle and len(self.disagg_prefill_inflight_queue) == 0:
-                self.check_during_pp_idle()
+                self.self_check_during_idle()
 
     @DynamicGradMode()
     def event_loop_pp_disagg_decode(self: Scheduler):
@@ -500,7 +501,7 @@ class SchedulerPPMixin:
                 queue_size += len(self.decode_offload_manager.ongoing_offload)
 
             if server_is_idle and queue_size == 0:
-                self.check_during_pp_idle()
+                self.self_check_during_idle()
 
     def init_pp_loop_state(self: Scheduler):
         self.pp_loop_size: int = self.pp_size + self.server_args.pp_async_batch_depth
@@ -532,13 +533,11 @@ class SchedulerPPMixin:
         latencies: List[float] = []
 
         if self.pp_group.is_first_rank:
-            logger.info("Profiling prefill latency for dynamic chunk sizing...")
-
-            # Create requests with different lengths: base_chunk_size // (2**i) for i in range(10)
             input_ids_list = []
-            for i in range(32):
-                chunk_size = self.chunked_prefill_size - i * (
-                    self.chunked_prefill_size // 32
+            for i in range(128):
+                chunk_size = int(
+                    self.chunked_prefill_size * 1.25
+                    - i * (self.chunked_prefill_size * 1.25 // 128)
                 )
                 if chunk_size <= 0:
                     break
@@ -551,9 +550,13 @@ class SchedulerPPMixin:
                 temperature=0,
                 max_new_tokens=1,
             )
-
             # Create and profile requests
-            for i, input_ids in enumerate(input_ids_list):
+            for i, input_ids in enumerate(
+                tqdm(
+                    input_ids_list,
+                    desc="Profiling prefill latency for dynamic chunking",
+                )
+            ):
                 req = Req(
                     rid=str(i),
                     origin_input_text="",
@@ -562,7 +565,7 @@ class SchedulerPPMixin:
                 )
                 req.fill_ids = req.origin_input_ids
                 req.extend_input_len = len(req.fill_ids) - len(req.prefix_indices)
-                req.logprob_start_len = len(req.origin_input_ids) - 1
+                req.logprob_start_len = -1
 
                 # Prepare batch
                 batch = ScheduleBatch.init_new(
@@ -611,7 +614,7 @@ class SchedulerPPMixin:
                 forward_batch = ForwardBatch.init_new(
                     model_worker_batch, self.tp_worker.model_runner
                 )
-                _, _ = self.tp_worker.model_runner.forward(
+                _ = self.tp_worker.model_runner.forward(
                     forward_batch=forward_batch, pp_proxy_tensors=pp_proxy
                 )
 
@@ -637,6 +640,16 @@ class SchedulerPPMixin:
                 f"seq_lens={seq_lens}, latencies_ms={latencies}"
             )
 
+            if self.attn_tp_size > 1:
+                data_to_sync_tp = [seq_lens, latencies]
+                data_to_sync_tp = broadcast_pyobj(
+                    data_to_sync_tp,
+                    self.attn_tp_group.rank,
+                    self.attn_tp_cpu_group,
+                    src=self.attn_tp_group.ranks[0],
+                )
+                seq_lens, latencies = data_to_sync_tp
+
         # Broadcast data to all ranks
         if torch.distributed.is_available() and torch.distributed.is_initialized():
             data_to_sync = [seq_lens, latencies]
@@ -653,7 +666,7 @@ class SchedulerPPMixin:
             f"Target latency: {self.length_predictor.target_latency:.2f}ms"
         )
 
-    def predict_next_chunk_size(self: "Scheduler", history_len: int) -> Optional[int]:
+    def predict_next_chunk_size(self: Scheduler, history_len: int) -> Optional[int]:
         """
         Predict next chunk size dynamically based on current history length.
 
@@ -686,12 +699,6 @@ class SchedulerPPMixin:
             )
 
         return predicted_size
-
-    def check_during_pp_idle(self: Scheduler):
-        self.check_memory()
-        self.check_tree_cache()
-        self.new_token_ratio = self.init_new_token_ratio
-        self.maybe_sleep_on_idle()
 
     def process_bootstrapped_queue(
         self: Scheduler, bootstrapped_rids: Optional[List[str]]
@@ -866,7 +873,7 @@ class SchedulerPPMixin:
         else:
             data = None
 
-        if self.attn_tp_size != 1:
+        if self.attn_tp_size > 1:
             data = broadcast_pyobj(
                 data,
                 self.attn_tp_group.rank,
@@ -1338,8 +1345,8 @@ class ChunkSizePredictor:
         )
         calculated_chunk_size = int(smoothed_chunk_size)
 
-        # Align to page_size (round down to nearest multiple)
-        alignment_size = max(page_size, 1)
+        # Align to page_size (minimum alignment size is 64)
+        alignment_size = max(page_size, 64)
         dynamic_chunk_size = (calculated_chunk_size // alignment_size) * alignment_size
 
         # Ensure aligned size is at least alignment_size

@@ -16,6 +16,7 @@ import pytest
 import requests
 from openai import OpenAI
 
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.perf_logger import RequestPerfRecord
 from sglang.multimodal_gen.test.server.conftest import _GLOBAL_PERF_RESULTS
@@ -37,7 +38,6 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
 from sglang.multimodal_gen.test.test_utils import (
     get_dynamic_server_port,
     is_image_url,
-    read_perf_logs,
     wait_for_req_perf_record,
 )
 
@@ -47,9 +47,22 @@ logger = init_logger(__name__)
 @pytest.fixture
 def diffusion_server(case: DiffusionTestCase) -> ServerContext:
     """Start a diffusion server for a single case and tear it down afterwards."""
+    server_args = case.server_args
+
+    # Skip ring attention tests on AMD/ROCm - Ring Attention requires Flash Attention
+    # which is not available on AMD. Use Ulysses parallelism instead.
+    if (
+        current_platform.is_hip()
+        and server_args.ring_degree is not None
+        and server_args.ring_degree > 1
+    ):
+        pytest.skip(
+            f"Skipping {case.id}: Ring Attention (ring_degree={server_args.ring_degree}) "
+            "requires Flash Attention which is not available on AMD/ROCm"
+        )
+
     default_port = get_dynamic_server_port()
     port = int(os.environ.get("SGLANG_TEST_SERVER_PORT", default_port))
-    server_args = case.server_args
     sampling_params = case.sampling_params
     extra_args = os.environ.get("SGLANG_TEST_SERVE_ARGS", "")
     extra_args += f" --num-gpus {server_args.num_gpus}"
@@ -59,6 +72,9 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
 
     if server_args.ulysses_degree is not None:
         extra_args += f" --ulysses-degree {server_args.ulysses_degree}"
+
+    if server_args.dit_layerwise_offload:
+        extra_args += f" --dit-layerwise-offload true"
 
     if server_args.ring_degree is not None:
         extra_args += f" --ring-degree {server_args.ring_degree}"
@@ -78,7 +94,10 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
 
     try:
         # Reconstruct output size for OpenAI API
-        output_size = sampling_params.output_size
+        # Allow override via environment variable (useful for AMD where large resolutions can cause GPU hang)
+        output_size = os.environ.get(
+            "SGLANG_TEST_OUTPUT_SIZE", sampling_params.output_size
+        )
         warmup = WarmupRunner(
             port=ctx.port,
             model=server_args.model_path,
@@ -174,15 +193,13 @@ Consider updating perf_baselines.json with the snippets below:
     ) -> RequestPerfRecord:
         """Run generation and collect performance records."""
         log_path = ctx.perf_log_path
-        prev_len = len(read_perf_logs(log_path))
         log_wait_timeout = 30
 
         client = self._client(ctx)
         rid = generate_fn(case_id, client)
 
-        req_perf_record, _ = wait_for_req_perf_record(
+        req_perf_record = wait_for_req_perf_record(
             rid,
-            prev_len,
             log_path,
             timeout=log_wait_timeout,
         )
