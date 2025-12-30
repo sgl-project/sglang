@@ -175,10 +175,3 @@ jobs:
     with:
       ref: ${{ needs.cut-release-branch.outputs.branch_name }}
     secrets: inherit
-
-  run-nightly-tests-intel:
-    needs: cut-release-branch
-    uses: ./.github/workflows/nightly-test-intel.yml
-    with:
-      ref: ${{ needs.cut-release-branch.outputs.branch_name }}
-    secrets: inherit
