@@ -15,7 +15,6 @@ import tempfile
 from contextlib import contextmanager
 from dataclasses import field
 from enum import Enum
-from functools import lru_cache
 from typing import Any, Optional
 
 from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig, STA_Mode
@@ -579,7 +578,7 @@ class ServerArgs:
         else:
             return f"http://{self.host}:{self.port}"
 
-    @lru_cache(maxsize=1)
+    @property
     def scheduler_endpoint(self):
         """
         Internal endpoint for scheduler.
