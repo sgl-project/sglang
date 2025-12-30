@@ -683,7 +683,6 @@ class ForwardBatch:
                         (3, 1),
                         self.seq_lens_cpu[batch_idx] - 1,
                         dtype=torch.int64,
-                        device=model_runner.device,
                     )
                 else:
                     mrope_positions = self._expand_mrope_from_input(
