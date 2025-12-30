@@ -1,4 +1,4 @@
-Quantization [ModelSlim](https://gitcode.com/Ascend/msit/tree/master/msmodelslim) module.
+Quantization [ModelSlim](https://gitcode.com/Ascend/msit) module.
 
 `--quantization modelslim` flag introduced. To load already quantized models, simply load the model weights. For models quantized with ModelSlim, there's no need to add `--quantization modelslim` argument when starting the engine. The quantization method will be automatically parsed from the downloaded `quant_model_description.json` config.
 
