@@ -176,7 +176,7 @@ class TestDisaggregationHybridAttentionMambaDPDecode(PDDisaggregationServerBase)
             "--disaggregation-mode",
             "prefill",
             "--tp",
-            "4",
+            "2",
             "--load-balance-method",
             "round_robin",
         ]
@@ -195,13 +195,13 @@ class TestDisaggregationHybridAttentionMambaDPDecode(PDDisaggregationServerBase)
             "--disaggregation-mode",
             "decode",
             "--tp",
-            "4",
+            "2",
             "--dp",
-            "4",
+            "2",
             "--enable-dp-attention",
             "--enable-dp-lm-head",
             "--base-gpu-id",
-            "4",
+            "2",
             "--prefill-round-robin-balance",
         ]
         decode_args += cls.transfer_backend + cls.rdma_devices
