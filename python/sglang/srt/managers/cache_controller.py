@@ -459,7 +459,7 @@ class HiCacheController:
                     create_custom_parallel_group,
                 )
 
-                group_ranks = torch.distributed.get_process_group_ranks(tp_group)
+                group_ranks = torch.distributed.get_process_group_ranks(self.tp_group)
                 self.prefetch_tp_group = create_custom_parallel_group(
                     group_ranks=group_ranks, backend="gloo"
                 )
