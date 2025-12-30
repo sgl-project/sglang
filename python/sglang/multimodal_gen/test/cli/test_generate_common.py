@@ -71,8 +71,6 @@ class CLIBase(unittest.TestCase):
         return [
             "sglang",
             "generate",
-            "--text-encoder-cpu-offload",
-            "--pin-cpu-memory",
             "--prompt",
             "A curious raccoon",
             "--save-output",
@@ -90,7 +88,7 @@ class CLIBase(unittest.TestCase):
 
     def _run_command(self, name: str, model_path: str, test_key: str = "", args=[]):
         command = (
-            self.base_command
+            self.get_base_command()
             + [f"--model-path={model_path}"]
             + shlex.split(args or "")
             + ["--output-file-name", f"{name}"]
@@ -104,40 +102,6 @@ class CLIBase(unittest.TestCase):
         self.results.append(TestResult(name, test_key, duration, succeed))
 
         return name, duration, status
-
-
-class GenerateBase(CLIBase):
-    model_path: str = None
-    extra_args = []
-    data_type: DataType = None
-
-    width: int = 720
-    height: int = 720
-    output_path: str = "test_outputs"
-    image_path: str | None = None
-    prompt: str | None = "A curious raccoon"
-
-    base_command = [
-        "sglang",
-        "generate",
-        f"--prompt",
-        f"{prompt}",
-        "--save-output",
-        "--log-level=debug",
-        f"--width={width}",
-        f"--height={height}",
-        f"--output-path={output_path}",
-    ]
-
-    results: list[TestResult] = []
-
-    @classmethod
-    def setUpClass(cls):
-        cls.results = []
-
-    @classmethod
-    def tearDownClass(cls):
-        pass
 
     def _run_test(self, name: str, args, model_path: str, test_key: str):
         name, duration, status = self._run_command(
