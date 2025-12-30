@@ -9,8 +9,6 @@ import unittest
 from types import SimpleNamespace
 from urllib.parse import urlparse
 
-import requests
-
 from sglang.srt.utils import kill_process_tree
 from sglang.test.few_shot_gsm8k import run_eval
 from sglang.test.test_utils import (
