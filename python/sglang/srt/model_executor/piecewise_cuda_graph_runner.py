@@ -33,6 +33,8 @@ from sglang.srt.compilation.piecewise_context_manager import (
     set_forward_context,
     set_pcg_capture_stream,
 )
+from sglang.srt.compilation.sglang_config import SGLangConfig
+from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.custom_op import CustomOp
 from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
@@ -158,15 +160,23 @@ class PiecewiseCudaGraphRunner:
             "inductor",
         ], "By now, only eager and inductor are supported for piecewise cuda graph compiler."
         self.compile_config = CompilationConfig(
-            self.model_runner.server_args.piecewise_cuda_graph_tokens,
-            self.model_runner.server_args.piecewise_cuda_graph_compiler,
-            self.model_runner.server_args.enable_torch_compile_debug_mode,
+            capture_sizes=self.model_runner.server_args.piecewise_cuda_graph_tokens,
+            compiler=self.model_runner.server_args.piecewise_cuda_graph_compiler,
+            enable_debug_mode=self.model_runner.server_args.enable_torch_compile_debug_mode,
         )
         if get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake():
             self.compile_config.add_split_op(
                 "sglang.moe_forward_piecewise_cuda_graph_impl"
             )
 
+        self.model_config = self.model_runner.model_config
+        self.sglang_config = SGLangConfig(
+            model_config=self.model_config,
+            device_config=DeviceConfig(
+                self.model_runner.device, self.model_runner.gpu_id
+            ),
+            compilation_config=self.compile_config,
+        )
         self.quant_config = getattr(self.model_runner.model, "quant_config", None)
 
         # Batch sizes to capture
@@ -247,7 +257,7 @@ class PiecewiseCudaGraphRunner:
                     patched_model,
                     fullgraph=True,
                     dynamic_arg_dims=None,
-                    compile_config=self.compile_config,
+                    sglang_config=self.sglang_config,
                     graph_pool=get_global_graph_memory_pool(),
                 )
 
