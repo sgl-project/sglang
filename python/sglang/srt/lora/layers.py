@@ -621,15 +621,12 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         2. Parallel LoRA delta computation (if enabled, added in-place)
         3. Return modified base_output
         """
-        # Copy hidden_states for LoRA computation to ensure we use unmodified input
-        hidden_states_for_lora = hidden_states.clone()
-
         # Run base MoE
         base_output = self.base_layer.forward(hidden_states, topk_output, **kwargs)
 
         # If LoRA is enabled, compute delta and add in-place for memory efficiency
         if self.set_lora and self.gate_up_lora_a_weights is not None:
-            self._compute_lora_delta(hidden_states_for_lora, topk_output, base_output)
+            self._compute_lora_delta(hidden_states, topk_output, base_output)
 
         return base_output
 

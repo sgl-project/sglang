@@ -129,6 +129,7 @@ def _per_expert_lora_kernel(
     r_offs = tl.arange(0, max_rank)  # [max_rank]
     rank_mask = r_offs < effective_rank  # [max_rank]
 
+    # TODO (Jonahcb): check if it is better to allocate outside the kernel
     # Accumulator for intermediate: [max_rank]
     intermediate = tl.zeros((max_rank,), dtype=tl.float32)
 
@@ -174,12 +175,6 @@ def _per_expert_lora_kernel(
     out_offs = out_start + tl.arange(0, BLOCK_SIZE)  # [BLOCK_SIZE]
     out_mask = out_offs < output_dim  # [BLOCK_SIZE]
 
-    # If this slice is entirely out of bounds, we can early-exit
-    # (not strictly necessary but cheap)
-    # NOTE: Triton doesn't have a direct "if not any(mask)" primitive,
-    # but the mask will naturally guard loads/stores below, so this is safe to omit.
-    # We'll just rely on masks.
-
     # Build [max_rank, BLOCK_SIZE] tile of B:
     #   rows: r_offs (rank dimension)
     #   cols: out_offs (output dimension)
@@ -195,7 +190,6 @@ def _per_expert_lora_kernel(
         other=0.0,
     ).to(tl.float32)
 
-    # Contribution:
     #   out_vals[j] = sum_r B[j, r] * intermediate[r]
     out_vals = tl.sum(b_vals * intermediate[:, None], axis=0)  # [BLOCK_SIZE]
 
