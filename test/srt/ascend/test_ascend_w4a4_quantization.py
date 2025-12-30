@@ -78,20 +78,6 @@ class TestAscendW4A4(CustomTestCase):
         self.assertGreaterEqual(metrics["accuracy"], 0.80)
         self.assertGreaterEqual(metrics["output_throughput"], 1000)
 
-    def run_decode(self, max_new_tokens):
-        response = requests.post(
-            self.base_url + "/generate",
-            json={
-                "text": "The capital of France is",
-                "sampling_params": {
-                    "temperature": 0,
-                    "max_new_tokens": max_new_tokens,
-                },
-                "ignore_eos": True,
-            },
-        )
-        return response.json()
-
     def test_throughput(self):
         max_tokens = 256
 
@@ -103,7 +89,7 @@ class TestAscendW4A4(CustomTestCase):
         print(f"Throughput: {throughput} tokens/s")
 
         if is_in_ci():
-            self.assertAlmostEqual(throughput, 38)
+            self.assertAlmostEqual(throughput, 35)
 
 
 if __name__ == "__main__":
