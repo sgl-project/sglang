@@ -70,6 +70,7 @@ logger = logging.getLogger(__name__)
 
 
 # Define constants
+SAMPLING_BACKEND_CHOICES = {"flashinfer", "pytorch", "ascend"}
 LOAD_FORMAT_CHOICES = [
     "auto",
     "pt",
@@ -83,6 +84,7 @@ LOAD_FORMAT_CHOICES = [
     "flash_rl",
     "remote",
     "remote_instance",
+    "fastsafetensors",
     "private",
 ]
 
@@ -335,6 +337,7 @@ class ServerArgs:
     log_level_http: Optional[str] = None
     log_requests: bool = False
     log_requests_level: int = 2
+    log_requests_format: str = "text"
     crash_dump_folder: Optional[str] = None
     show_time_cost: bool = False
     enable_metrics: bool = False
@@ -374,7 +377,6 @@ class ServerArgs:
     # Data parallelism
     dp_size: int = 1
     load_balance_method: str = "round_robin"
-    load_watch_interval: float = 0.1
     # FIXME: remove this after dp rank scheduling is fully supported with PD-Disaggregation
     prefill_round_robin_balance: bool = False
 
@@ -437,6 +439,7 @@ class ServerArgs:
     speculative_ngram_match_type: Literal["BFS", "PROB"] = "BFS"
     speculative_ngram_branch_length: int = 18
     speculative_ngram_capacity: int = 10 * 1000 * 1000
+    enable_multi_layer_eagle: bool = False
 
     # Expert parallelism
     ep_size: int = 1
@@ -549,7 +552,7 @@ class ServerArgs:
     enable_piecewise_cuda_graph: bool = False
     enable_torch_compile_debug_mode: bool = False
     torch_compile_max_bs: int = 32
-    piecewise_cuda_graph_max_tokens: int = 4096
+    piecewise_cuda_graph_max_tokens: Optional[int] = None
     piecewise_cuda_graph_tokens: Optional[List[int]] = None
     piecewise_cuda_graph_compiler: str = "eager"
     torchao_config: str = ""
@@ -571,6 +574,7 @@ class ServerArgs:
     disable_fast_image_processor: bool = False
     keep_mm_feature_on_device: bool = False
     enable_return_hidden_states: bool = False
+    enable_return_routed_experts: bool = False
     scheduler_recv_interval: int = 1
     numa_node: Optional[List[int]] = None
     enable_deterministic_inference: bool = False
@@ -579,6 +583,7 @@ class ServerArgs:
     # Context parallelism used in the long sequence prefill phase of DeepSeek v3.2
     enable_nsa_prefill_context_parallel: bool = False
     enable_fused_qk_norm_rope: bool = False
+    enable_precise_embedding_interpolation: bool = False
 
     # Dynamic batch tokenizer
     enable_dynamic_batch_tokenizer: bool = False
@@ -602,6 +607,8 @@ class ServerArgs:
     disaggregation_prefill_pp: Optional[int] = 1
     disaggregation_ib_device: Optional[str] = None
     disaggregation_decode_enable_offload_kvcache: bool = False
+    # Enable auto FAKE mode for decode node testing, no need to pass bootstrap_host in request
+    disaggregation_decode_enable_fake_auto: bool = False
     num_reserved_decode_tokens: int = 512  # used for decode kv cache offload in PD
     # FIXME: hack to reduce ITL when decode bs is small
     disaggregation_decode_polling_interval: int = 1
@@ -633,6 +640,7 @@ class ServerArgs:
     enable_prefix_mm_cache: bool = False
     mm_enable_dp_encoder: bool = False
     mm_process_config: Optional[Dict[str, Any]] = None
+    limit_mm_data_per_request: Optional[Union[str, Dict[str, int]]] = None
 
     # For checkpoint decryption
     decrypted_config_file: Optional[str] = None
@@ -720,6 +728,9 @@ class ServerArgs:
 
         # Handle diffusion LLM inference.
         self._handle_dllm_inference()
+
+        # Handle debug utilities.
+        self._handle_debug_utils()
 
         # Handle any other necessary validations.
         self._handle_other_validations()
@@ -888,6 +899,12 @@ class ServerArgs:
         else:
             self.cuda_graph_max_bs = max(self.cuda_graph_bs)
 
+        if self.piecewise_cuda_graph_max_tokens is None:
+            # Capture piecewise cuda graph tokens up to the chunked prefill size. Two benefits:
+            # 1. cuda graph acceleration for all prefill lengths.
+            # 2. do not need more temporary memory for activations. Less fragmentation.
+            self.piecewise_cuda_graph_max_tokens = self.chunked_prefill_size
+
         if self.piecewise_cuda_graph_tokens is None:
             self.piecewise_cuda_graph_tokens = (
                 self._generate_piecewise_cuda_graph_tokens()
@@ -929,7 +946,7 @@ class ServerArgs:
 
             # For piecewise cuda graphs
             if self.enable_piecewise_cuda_graph:
-                reserved_mem += self.piecewise_cuda_graph_max_tokens // 4
+                reserved_mem += self.piecewise_cuda_graph_max_tokens // 8
 
             self.mem_fraction_static = (
                 round((gpu_mem - reserved_mem) / gpu_mem, 3)
@@ -1126,6 +1143,27 @@ class ServerArgs:
                         "Use flashinfer_trtllm as MoE runner backend on sm100 for DeepseekV3ForCausalLM"
                     )
 
+                if (
+                    self.quantization == "modelopt_fp4"
+                    and self.speculative_algorithm == "EAGLE"
+                    and (
+                        self.speculative_moe_runner_backend is None
+                        or self.speculative_moe_a2a_backend is None
+                    )
+                ):
+                    if envs.SGLANG_NVFP4_CKPT_FP8_NEXTN_MOE.get():
+                        self.speculative_moe_runner_backend = "deep_gemm"
+                        self.speculative_moe_a2a_backend = "deepep"
+                        logger.info(
+                            "Use deep_gemm moe runner and deepep a2a backend for bf16 nextn layer in deepseek fp4 checkpoint."
+                        )
+                    else:
+                        self.speculative_moe_runner_backend = "triton"
+                        self.speculative_moe_a2a_backend = "none"
+                        logger.info(
+                            "Use triton fused moe by default for bf16 nextn layer in deepseek fp4 checkpoint."
+                        )
+
         elif model_arch in ["GptOssForCausalLM"]:
             # Set attention backend for GPT-OSS
             if self.is_attention_backend_not_set():
@@ -1179,6 +1217,27 @@ class ServerArgs:
                 ), "Triton kernel MoE is only supported when ep_size == 1"
             self.disable_hybrid_swa_memory = True
 
+        elif "MiMoV2FlashForCausalLM" in model_arch:
+            if self.speculative_algorithm == "EAGLE":
+                self.enable_multi_layer_eagle = True
+                logger.info(
+                    "Enable multi-layer EAGLE speculative decoding for MiMoV2FlashForCausalLM model."
+                )
+                if not envs.SGLANG_ENABLE_SPEC_V2.get():
+                    envs.SGLANG_ENABLE_SPEC_V2.set(True)
+                    logger.warning(
+                        "Spec v2 is enabled for multi-layer EAGLE speculative decoding."
+                    )
+
+            if self.enable_hierarchical_cache:
+                self.swa_full_tokens_ratio = 1.0
+                logger.warning(
+                    "Reset swa_full_tokens_ratio to 1.0 for MiMoV2FlashForCausalLM model with hierarchical cache"
+                )
+                self.disable_hybrid_swa_memory = True
+                logger.warning(
+                    "Disable hybrid SWA memory for MiMoV2FlashForCausalLM model with hierarchical cache"
+                )
         elif "Llama4" in model_arch and self.device != "cpu":
             # Auto-select attention backend for Llama4 if not specified
             if self.attention_backend is None:
@@ -1406,9 +1465,11 @@ class ServerArgs:
                         self.disable_radix_cache = True
                         self.disable_overlap_schedule = False
 
-        if not self.get_model_config().is_generation:
+        if envs.SGLANG_EMBEDDINGS_SPARSE_HEAD.is_set():
             self.disable_overlap_schedule = True
-            logger.warning("Overlap scheduler is disabled for embedding models.")
+            logger.warning(
+                f"Overlap scheduler is disabled when using sparse head for embedding model."
+            )
 
         # TRTLLM AllReduce Fusion supports SM90/100/120, enable it by default
         # for models with explicit support (DeepseekV3, GptOss, Glm4Moe, Qwen3Moe)
@@ -1505,7 +1566,7 @@ class ServerArgs:
                 else:
                     self.attention_backend = "triton"
 
-            logger.warning(
+            logger.info(
                 f"Attention backend not specified. Use {self.attention_backend} backend by default."
             )
 
@@ -1559,9 +1620,9 @@ class ServerArgs:
                 )
                 self.page_size = 64
 
-            if self.kv_cache_dtype not in ["fp8_e4m3", "fp4_e2m1", "auto"]:
+            if self.kv_cache_dtype not in ["fp8_e4m3", "fp4_e2m1", "bf16", "auto"]:
                 raise ValueError(
-                    "TensorRT-LLM MLA backend only supports kv-cache-dtype of fp8_e4m3, fp4_e2m1, or auto."
+                    "TensorRT-LLM MLA backend only supports kv-cache-dtype of fp8_e4m3, fp4_e2m1, bf16, or auto."
                 )
 
         if (
@@ -1941,19 +2002,25 @@ class ServerArgs:
                 )
 
             if (
-                self.speculative_algorithm == "EAGLE"
+                self.speculative_algorithm in ["EAGLE", "EAGLE3"]
                 and envs.SGLANG_ENABLE_SPEC_V2.get()
             ):
                 self.disable_overlap_schedule = False
                 logger.warning(
-                    "Beta spec is enabled for eagle speculative decoding and overlap schedule is turned on."
+                    "Spec v2 is enabled for eagle/eagle3 speculative decoding and overlap schedule is turned on."
                 )
-
-            if not envs.SGLANG_ENABLE_SPEC_V2.get():
+                if (
+                    self.speculative_eagle_topk is not None
+                    and self.speculative_eagle_topk > 1
+                ):
+                    raise ValueError(
+                        "Spec v2 currently only supports topk = 1 for speculative decoding."
+                    )
+            else:
                 self.disable_overlap_schedule = True
                 logger.warning(
-                    "Overlap scheduler is disabled because of using eagle3 or standalone speculative decoding."
-                    "You can set env SGLANG_ENABLE_SPEC_V2=True to enable the experimental overlap scheduler."
+                    "Overlap scheduler is disabled when spec v2 is off or using unsupported speculative algorithm. "
+                    "You can set env SGLANG_ENABLE_SPEC_V2=True to enable the experimental overlap scheduler. "
                 )
 
             if self.enable_mixed_chunk:
@@ -2153,12 +2220,6 @@ class ServerArgs:
             raise ValueError(
                 "Cannot set --encoder-only and --disaggregation-mode prefill/decode together"
             )
-        if (
-            self.language_only
-            and self.encoder_transfer_backend == "zmq_to_scheduler"
-            and self.pp_size > 1
-        ):
-            raise ValueError("zmq_to_scheduler not support pp_size > 1")
 
         if self.language_only and len(self.encoder_urls) == 0:
             raise ValueError(
@@ -2229,6 +2290,8 @@ class ServerArgs:
                 raise ValueError(
                     "Spec v2 and decode offload kv cache are incompatible and cannot be enabled together."
                 )
+        if not (0 < self.swa_full_tokens_ratio <= 1.0):
+            raise ValueError("--swa-full-tokens-ratio should be in range (0, 1.0].")
 
     def _handle_deterministic_inference(self):
         if self.rl_on_policy_target is not None:
@@ -2303,11 +2366,19 @@ class ServerArgs:
 
             # Check TP size
             if self.tp_size > 1:
-                os.environ["NCCL_ALGO"] = "allreduce:tree"
-                self.disable_custom_all_reduce = True
-                logger.warning(
-                    "NCCL_ALGO is set to 'allreduce:tree' and custom all reduce is disabled for deterministic inference when TP size > 1."
-                )
+                if is_hip():
+                    # AMD: use 1-stage all-reduce kernel which is inherently deterministic
+                    # (each GPU reads all data from all GPUs, reduces locally in fixed order)
+                    logger.info(
+                        "AMD/ROCm: Using 1-stage all-reduce kernel (deterministic)"
+                    )
+                else:
+                    # CUDA: use NCCL tree algorithm
+                    os.environ["NCCL_ALGO"] = "allreduce:tree"
+                    self.disable_custom_all_reduce = True
+                    logger.warning(
+                        "NCCL_ALGO is set to 'allreduce:tree' and custom all reduce is disabled for deterministic inference when TP size > 1."
+                    )
 
     def _handle_dllm_inference(self):
         if self.dllm_algorithm is None:
@@ -2347,6 +2418,34 @@ class ServerArgs:
             )
             self.disable_cuda_graph = True
             self.skip_server_warmup = True
+
+        # Validate limit_mm_per_prompt modalities
+        if self.limit_mm_data_per_request:
+            if isinstance(self.limit_mm_data_per_request, str):
+                self.limit_mm_data_per_request = json.loads(
+                    self.limit_mm_data_per_request
+                )
+
+            if isinstance(self.limit_mm_data_per_request, dict):
+                allowed_modalities = {"image", "video", "audio"}
+                for modality in self.limit_mm_data_per_request.keys():
+                    if modality not in allowed_modalities:
+                        raise ValueError(
+                            f"Invalid modality '{modality}' in --limit-mm-data-per-request."
+                            f"Allowed modalities are: {list(allowed_modalities)}"
+                        )
+
+        # Validate preferred_sampling_params
+        if self.preferred_sampling_params:
+            if isinstance(self.preferred_sampling_params, str):
+                self.preferred_sampling_params = json.loads(
+                    self.preferred_sampling_params
+                )
+
+    def _handle_debug_utils(self):
+        if is_in_ci() and self.soft_watchdog_timeout is None:
+            logger.info("Set soft_watchdog_timeout since in CI")
+            self.soft_watchdog_timeout = 300
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
@@ -2854,6 +2953,13 @@ class ServerArgs:
             choices=[0, 1, 2, 3],
         )
         parser.add_argument(
+            "--log-requests-format",
+            type=str,
+            default=ServerArgs.log_requests_format,
+            choices=["text", "json"],
+            help="Format for request logging: 'text' (human-readable) or 'json' (structured)",
+        )
+        parser.add_argument(
             "--crash-dump-folder",
             type=str,
             default=ServerArgs.crash_dump_folder,
@@ -3076,15 +3182,10 @@ class ServerArgs:
             help="The load balancing strategy for data parallelism.",
             choices=[
                 "round_robin",
+                "decode_round_robin",
                 "shortest_queue",
                 "minimum_tokens",
             ],
-        )
-        parser.add_argument(
-            "--load-watch-interval",
-            type=float,
-            default=ServerArgs.load_watch_interval,
-            help="The interval of load watching in seconds.",
         )
         parser.add_argument(
             "--prefill-round-robin-balance",
@@ -3116,7 +3217,7 @@ class ServerArgs:
         )
         parser.add_argument(
             "--preferred-sampling-params",
-            type=str,
+            type=json.loads,
             help="json-formatted sampling settings that will be returned in /get_model_info",
         )
 
@@ -3210,7 +3311,7 @@ class ServerArgs:
         parser.add_argument(
             "--sampling-backend",
             type=str,
-            choices=["flashinfer", "pytorch", "ascend"],
+            choices=SAMPLING_BACKEND_CHOICES,
             default=ServerArgs.sampling_backend,
             help="Choose the kernels for sampling layers.",
         )
@@ -3407,6 +3508,13 @@ class ServerArgs:
             type=int,
             default=ServerArgs.speculative_ngram_capacity,
             help="The cache capacity for ngram speculative decoding.",
+        )
+
+        # Multi-layer Eagle speculative decoding
+        parser.add_argument(
+            "--enable-multi-layer-eagle",
+            action="store_true",
+            help="Enable multi-layer Eagle speculative decoding.",
         )
 
         # Expert parallelism
@@ -4065,6 +4173,11 @@ class ServerArgs:
             help="Enable returning hidden states with responses.",
         )
         parser.add_argument(
+            "--enable-return-routed-experts",
+            action="store_true",
+            help="Enable returning routed experts of each layer with responses.",
+        )
+        parser.add_argument(
             "--scheduler-recv-interval",
             type=int,
             default=ServerArgs.scheduler_recv_interval,
@@ -4104,6 +4217,11 @@ class ServerArgs:
             "--enable-fused-qk-norm-rope",
             action="store_true",
             help="Enable fused qk normalization and rope rotary embedding.",
+        )
+        parser.add_argument(
+            "--enable-precise-embedding-interpolation",
+            action="store_true",
+            help="Enable corner alignment for resize of embeddings grid to ensure more accurate(but slower) evaluation of interpolated embedding values.",
         )
 
         # Dynamic batch tokenizer
@@ -4202,6 +4320,12 @@ class ServerArgs:
             "--disaggregation-decode-enable-offload-kvcache",
             action="store_true",
             help="Enable async KV cache offloading on decode server (PD mode).",
+        )
+        parser.add_argument(
+            "--disaggregation-decode-enable-fake-auto",
+            action="store_true",
+            help="Auto enable FAKE mode for decode node testing, "
+            "no need to pass bootstrap_host and bootstrap_room in request.",
         )
         parser.add_argument(
             "--num-reserved-decode-tokens",
@@ -4342,6 +4466,13 @@ class ServerArgs:
             action="store_true",
             default=ServerArgs.mm_enable_dp_encoder,
             help="Enabling data parallelism for mm encoder. The dp size will be set to the tp size automatically.",
+        )
+        parser.add_argument(
+            "--limit-mm-data-per-request",
+            type=json.loads,
+            default=ServerArgs.limit_mm_data_per_request,
+            help="Limit the number of multimodal inputs per request. "
+            'e.g. \'{"image": 1, "video": 1, "audio": 1}\'',
         )
 
         # For checkpoint decryption
@@ -4554,6 +4685,12 @@ class ServerArgs:
         if self.export_metrics_to_file and self.export_metrics_to_file_dir is None:
             raise ValueError(
                 "--export-metrics-to-file-dir is required when --export-metrics-to-file is enabled"
+            )
+
+        # Check two batch overlap
+        if self.enable_two_batch_overlap and self.moe_a2a_backend == "none":
+            raise ValueError(
+                "When enabling two batch overlap, moe_a2a_backend cannot be 'none'."
             )
 
     def check_torch_2_9_1_cudnn_compatibility(self):
@@ -4929,12 +5066,12 @@ class PortArgs:
         else:
             nccl_port = server_args.nccl_port
 
-        if server_args.tokenizer_worker_num > 1:
+        if server_args.tokenizer_worker_num == 1:
+            tokenizer_worker_ipc_name = None
+        else:
             tokenizer_worker_ipc_name = (
                 f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}"
             )
-        else:
-            tokenizer_worker_ipc_name = None
 
         if not server_args.enable_dp_attention:
             # Normal case, use IPC within a single node
@@ -5061,8 +5198,8 @@ def auto_choose_speculative_params(self: ServerArgs):
         "BailingMoeV2ForCausalLM",
         "MistralLarge3ForCausalLM",
         "PixtralForConditionalGeneration",
+        "MiMoV2FlashForCausalLM",
     ]:
-        # The default value for deepseek and gpt-oss
         return (3, 1, 4)
     elif arch in ["Grok1ForCausalLM", "Grok1VForCausalLM"]:
         return (5, 4, 8)

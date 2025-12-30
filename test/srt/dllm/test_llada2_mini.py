@@ -57,7 +57,7 @@ class TestLLaDA2Mini(CustomTestCase):
         metrics = run_eval_few_shot_gsm8k(args)
         print(f"{metrics=}")
 
-        self.assertGreater(metrics["accuracy"], 0.6)
+        self.assertGreater(metrics["accuracy"], 0.88)
         self.assertGreater(metrics["output_throughput"], 150)
 
     def test_bs_1_speed(self):
