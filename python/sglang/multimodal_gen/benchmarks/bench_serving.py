@@ -646,7 +646,7 @@ async def benchmark(args):
         request_func = async_request_image_sglang
     elif args.backend == "sglang-video":
         if args.task not in ["t2v", "i2v", "ti2v"]:
-            raise Exception("sglang-image backend only support ti2i and t2i tasks.")
+            raise Exception("sglang-video backend only support t2v, i2v and ti2v tasks.")
         api_url = f"{args.base_url}/v1/videos"
         request_func = async_request_video_sglang
     else:
