@@ -91,9 +91,9 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("apply_rope_pos_ids_cos_sin_cache", torch::kCUDA, &apply_rope_pos_ids_cos_sin_cache);
 
   m.def(
-    "rotary_embedding(Tensor positions, Tensor! query,"
-    "                 Tensor!? key, int head_size,"
-    "                 Tensor cos_sin_cache, bool is_neox) -> ()");
+      "rotary_embedding(Tensor positions, Tensor! query,"
+      "                 Tensor!? key, int head_size,"
+      "                 Tensor cos_sin_cache, bool is_neox) -> ()");
   m.impl("rotary_embedding", torch::kCUDA, &rotary_embedding);
 
   m.def(

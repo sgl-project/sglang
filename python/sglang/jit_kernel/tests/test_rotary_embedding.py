@@ -87,6 +87,7 @@ def torch_impl_rotary_fp32(
             x1 = xr2[..., 1].clone()
             xr2[..., 0].copy_(x0 * cos_b - x1 * sin_b)
             xr2[..., 1].copy_(x1 * cos_b + x0 * sin_b)
+
     else:
         if cos_f.shape[1] == head_size // 2:
             embed_dim = int(cos_f.shape[1])

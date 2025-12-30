@@ -1,6 +1,9 @@
 from __future__ import annotations
+
 from typing import Optional
+
 import torch
+
 from sglang.jit_kernel.utils import cache_once, load_jit
 
 
@@ -136,7 +139,10 @@ def rotary_embedding_cos_sin(
 
     module = _jit_rotary_embedding_cos_sin_module()
     if k3 is None:
-        module.rotary_embedding_cos_sin_q(cos_to_use, sin_to_use, q3, head_size, effective_interleaved)
+        module.rotary_embedding_cos_sin_q(
+            cos_to_use, sin_to_use, q3, head_size, effective_interleaved
+        )
     else:
-        module.rotary_embedding_cos_sin_qk(cos_to_use, sin_to_use, q3, k3, head_size, effective_interleaved)
-
+        module.rotary_embedding_cos_sin_qk(
+            cos_to_use, sin_to_use, q3, k3, head_size, effective_interleaved
+        )

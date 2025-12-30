@@ -139,7 +139,9 @@ def apply_sglang_jit_rope_qk_inplace(
             f"got q:{tuple(q.shape)} k:{tuple(k.shape)}"
         )
     if q.shape != k.shape:
-        raise ValueError(f"q and k must have the same shape, got {q.shape} vs {k.shape}")
+        raise ValueError(
+            f"q and k must have the same shape, got {q.shape} vs {k.shape}"
+        )
 
     if not (isinstance(cos_sin_cache, torch.Tensor) and cos_sin_cache.dim() == 2):
         raise ValueError("cos_sin_cache must be a 2D torch.Tensor")
@@ -178,8 +180,10 @@ def apply_sglang_jit_rope_qk_inplace(
     positions = positions.to(q.device, non_blocking=True)
 
     if cos_sin_cache.shape[0] == seqlen:
-        cache_tok = cos_sin_cache[None, :, :].expand(bsz, seqlen, cos_sin_cache.shape[1]).reshape(
-            num_tokens, cos_sin_cache.shape[1]
+        cache_tok = (
+            cos_sin_cache[None, :, :]
+            .expand(bsz, seqlen, cos_sin_cache.shape[1])
+            .reshape(num_tokens, cos_sin_cache.shape[1])
         )
     elif cos_sin_cache.shape[0] == num_tokens:
         cache_tok = cos_sin_cache
@@ -189,7 +193,9 @@ def apply_sglang_jit_rope_qk_inplace(
     q3 = q.reshape(num_tokens, nheads, d).contiguous()
     k3 = k.reshape(num_tokens, nheads, d).contiguous()
 
-    cos_half, sin_half = _split_cos_sin_from_cache(cache_tok.contiguous(), dtype=q.dtype)
+    cos_half, sin_half = _split_cos_sin_from_cache(
+        cache_tok.contiguous(), dtype=q.dtype
+    )
 
     interleaved = not is_neox
     if interleaved:
