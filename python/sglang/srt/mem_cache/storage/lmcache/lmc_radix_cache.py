@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 import threading
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Optional, Union
 
 import torch
 
@@ -15,10 +15,22 @@ try:
         LoadMetadata,
         StoreMetadata,
     )
-except ImportError as e:
-    raise RuntimeError(
-        "LMCache is not installed. Please install it by running `pip install lmcache`"
-    ) from e
+    HAS_LMCACHE_INPROC = True
+except ImportError:
+    HAS_LMCACHE_INPROC = False
+    LMCacheLayerwiseConnector = None
+    LoadMetadata = None
+    StoreMetadata = None
+
+# Try importing MP connector
+try:
+    from sglang.srt.mem_cache.storage.lmcache.multi_process_adapter import (
+        LMCacheMPConnector,
+    )
+    HAS_LMCACHE_MP = True
+except ImportError:
+    HAS_LMCACHE_MP = False
+    LMCacheMPConnector = None
 
 
 if TYPE_CHECKING:
@@ -27,6 +39,22 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 
 logger = logging.getLogger(__name__)
+
+
+def _check_lmcache_available(mp_mode: bool) -> None:
+    """Check if the required LMCache connector is available."""
+    if mp_mode:
+        if not HAS_LMCACHE_MP:
+            raise RuntimeError(
+                "LMCache MP mode requires the multi_process_adapter module. "
+                "Please ensure LMCache is properly installed."
+            )
+    else:
+        if not HAS_LMCACHE_INPROC:
+            raise RuntimeError(
+                "LMCache is not installed. Please install it by running "
+                "`pip install lmcache`"
+            )
 
 
 class LayerTransferCounter:
@@ -41,7 +69,7 @@ class LayerTransferCounter:
         self,
         num_layers: int,
         load_stream: torch.cuda.Stream,
-        lmc_connector: LMCacheLayerwiseConnector,
+        lmc_connector: Union["LMCacheLayerwiseConnector", "LMCacheMPConnector"],
         printable: bool = False,
     ):
         self.num_layers = num_layers
@@ -52,7 +80,9 @@ class LayerTransferCounter:
         # Ensure ordering of the async loads wrt compute stream(s).
         self.load_stream.synchronize()
         with self.load_stream:
-            self.lmc_connector.load_kv_layerwise(layer_id)
+            # Both connectors support load_kv_layerwise (MP connector has a stub)
+            if hasattr(self.lmc_connector, 'load_kv_layerwise'):
+                self.lmc_connector.load_kv_layerwise(layer_id)
 
 
 class LMCRadixCache(RadixCache):
@@ -65,6 +95,10 @@ class LMCRadixCache(RadixCache):
       - Overridden `match_prefix` to fetch missing prefix chunks from LMCache
       - Extended cache_finalization paths to store back into LMCache
       - Eviction barrier that respects any in-flight host->device stores
+    
+    Supports two modes:
+      - In-process mode (default): Uses LMCacheLayerwiseConnector
+      - Multi-process mode: Uses LMCacheMPConnector to connect to external server
     """
 
     def __init__(
@@ -77,26 +111,61 @@ class LMCRadixCache(RadixCache):
     ):
         super().__init__(params)
 
-        kvcache = self.token_to_kv_pool_allocator.get_kvcache()
-        self.lmcache_connector = LMCacheLayerwiseConnector(
-            sgl_config=model_config,
-            tp_size=tp_size,
-            rank=rank,
-            # NOTE: The original implementation accessed private buffers via
-            # `_kvcache.k_buffer` / `.v_buffer`. We prefer public accessors when
-            # available; fall back to private fields if needed.
-            k_pool=getattr(
-                kvcache,
-                "k_buffer",
-                getattr(self.token_to_kv_pool_allocator._kvcache, "k_buffer"),
-            ),
-            v_pool=getattr(
-                kvcache,
-                "v_buffer",
-                getattr(self.token_to_kv_pool_allocator._kvcache, "v_buffer"),
-            ),
-            tp_group=tp_group.device_group if tp_group is not None else None,
+        # Get server args to check MP mode
+        from sglang.srt.server_args import get_global_server_args
+        server_args = get_global_server_args()
+        
+        # Determine if we should use MP mode
+        self._use_mp_mode = (
+            server_args is not None and 
+            getattr(server_args, 'lmcache_mp_enable', False)
         )
+        
+        # Check if required connector is available
+        _check_lmcache_available(self._use_mp_mode)
+
+        kvcache = self.token_to_kv_pool_allocator.get_kvcache()
+        
+        # Get KV cache buffers
+        k_pool = getattr(
+            kvcache,
+            "k_buffer",
+            getattr(self.token_to_kv_pool_allocator._kvcache, "k_buffer"),
+        )
+        v_pool = getattr(
+            kvcache,
+            "v_buffer",
+            getattr(self.token_to_kv_pool_allocator._kvcache, "v_buffer"),
+        )
+        
+        if self._use_mp_mode:
+            # Use Multi-Process mode connector
+            logger.info(
+                f"Initializing LMCache in MP mode: "
+                f"host={server_args.lmcache_mp_host}, "
+                f"port={server_args.lmcache_mp_port}"
+            )
+            self.lmcache_connector = LMCacheMPConnector(
+                model_config=model_config,
+                tp_size=tp_size,
+                rank=rank,
+                k_pool=k_pool,
+                v_pool=v_pool,
+                mp_host=server_args.lmcache_mp_host,
+                mp_port=server_args.lmcache_mp_port,
+                tp_group=tp_group.device_group if tp_group is not None else None,
+            )
+        else:
+            # Use in-process connector
+            logger.info("Initializing LMCache in in-process mode")
+            self.lmcache_connector = LMCacheLayerwiseConnector(
+                sgl_config=model_config,
+                tp_size=tp_size,
+                rank=rank,
+                k_pool=k_pool,
+                v_pool=v_pool,
+                tp_group=tp_group.device_group if tp_group is not None else None,
+            )
 
         self.load_stream = torch.cuda.Stream()
         self.store_stream = torch.cuda.Stream()
@@ -164,13 +233,23 @@ class LMCRadixCache(RadixCache):
         )
 
         with torch.cuda.stream(self.load_stream):
-            num_retrieved = self.lmcache_connector.start_load_kv(
-                LoadMetadata(
-                    token_ids=key.token_ids,  # full page-aligned key
+            offset = value.numel() - prefix_pad
+            if self._use_mp_mode:
+                # MP mode uses direct arguments
+                num_retrieved = self.lmcache_connector.start_load_kv(
+                    token_ids=key.token_ids,
                     slot_mapping=slot_mapping,
-                    offset=value.numel() - prefix_pad,  # LMCache offset convention
+                    offset=offset,
                 )
-            )
+            else:
+                # In-process mode uses LoadMetadata
+                num_retrieved = self.lmcache_connector.start_load_kv(
+                    LoadMetadata(
+                        token_ids=key.token_ids,  # full page-aligned key
+                        slot_mapping=slot_mapping,
+                        offset=offset,  # LMCache offset convention
+                    )
+                )
         logger.debug("num_retrieved_tokens: %s", num_retrieved)
 
         if num_retrieved > 0:
@@ -234,14 +313,25 @@ class LMCRadixCache(RadixCache):
         assert new_last_node is not None
 
         self.inc_lock_ref(new_last_node)
-        store_md = StoreMetadata(
-            last_node=new_last_node,
-            token_ids=token_ids,
-            kv_indices=kv_indices,
-            offset=0,
-        )
+        
         with torch.cuda.stream(self.store_stream):
-            self.lmcache_connector.store_kv(store_md)
+            if self._use_mp_mode:
+                # MP mode uses direct arguments
+                self.lmcache_connector.store_kv(
+                    token_ids=token_ids,
+                    kv_indices=kv_indices,
+                    offset=0,
+                )
+            else:
+                # In-process mode uses StoreMetadata
+                store_md = StoreMetadata(
+                    last_node=new_last_node,
+                    token_ids=token_ids,
+                    kv_indices=kv_indices,
+                    offset=0,
+                )
+                self.lmcache_connector.store_kv(store_md)
+        
         with self._node_lock:
             self._in_flight_nodes.append(new_last_node)
 
