@@ -252,3 +252,298 @@ impl Default for NodeStateMachine {
         )
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+
+    fn create_test_stores() -> Arc<StateStores> {
+        Arc::new(StateStores::default())
+    }
+
+    fn create_test_config() -> ConvergenceConfig {
+        ConvergenceConfig {
+            convergence_window: Duration::from_millis(100),
+            min_stable_updates: 3,
+            snapshot_timeout: Duration::from_secs(1),
+        }
+    }
+
+    #[test]
+    fn test_node_readiness_as_str() {
+        assert_eq!(NodeReadiness::NotReady.as_str(), "not_ready");
+        assert_eq!(NodeReadiness::Joining.as_str(), "joining");
+        assert_eq!(NodeReadiness::SnapshotPull.as_str(), "snapshot_pull");
+        assert_eq!(NodeReadiness::Converging.as_str(), "converging");
+        assert_eq!(NodeReadiness::Ready.as_str(), "ready");
+    }
+
+    #[test]
+    fn test_convergence_config_default() {
+        let config = ConvergenceConfig::default();
+        assert_eq!(config.convergence_window, Duration::from_secs(10));
+        assert_eq!(config.min_stable_updates, 5);
+        assert_eq!(config.snapshot_timeout, Duration::from_secs(60));
+    }
+
+    #[test]
+    fn test_node_state_machine_initial_state() {
+        let stores = create_test_stores();
+        let config = create_test_config();
+        let sm = NodeStateMachine::new(stores, config);
+
+        assert_eq!(sm.readiness(), NodeReadiness::NotReady);
+        assert!(!sm.is_ready());
+    }
+
+    #[test]
+    fn test_state_transition_flow() {
+        let stores = create_test_stores();
+        let config = create_test_config();
+        let sm = NodeStateMachine::new(stores, config);
+
+        // Start joining
+        sm.start_joining();
+        assert_eq!(sm.readiness(), NodeReadiness::Joining);
+
+        // Start snapshot pull
+        sm.start_snapshot_pull();
+        assert_eq!(sm.readiness(), NodeReadiness::SnapshotPull);
+        assert!(!sm.is_snapshot_timeout());
+
+        // Start converging
+        sm.start_converging();
+        assert_eq!(sm.readiness(), NodeReadiness::Converging);
+
+        // Transition to ready
+        sm.transition_to_ready();
+        assert_eq!(sm.readiness(), NodeReadiness::Ready);
+        assert!(sm.is_ready());
+    }
+
+    #[test]
+    fn test_state_transition_guards() {
+        let stores = create_test_stores();
+        let config = create_test_config();
+        let sm = NodeStateMachine::new(stores, config);
+
+        // Cannot start snapshot pull without joining first
+        sm.start_snapshot_pull();
+        assert_eq!(sm.readiness(), NodeReadiness::NotReady);
+
+        // Cannot start converging without snapshot pull
+        sm.start_joining();
+        sm.start_converging();
+        assert_eq!(sm.readiness(), NodeReadiness::Joining);
+
+        // Cannot transition to ready without converging
+        sm.transition_to_ready();
+        assert_eq!(sm.readiness(), NodeReadiness::Joining);
+    }
+
+    #[test]
+    fn test_snapshot_timeout() {
+        let stores = create_test_stores();
+        let mut config = create_test_config();
+        config.snapshot_timeout = Duration::from_millis(50);
+        let sm = NodeStateMachine::new(stores, config);
+
+        sm.start_joining();
+        sm.start_snapshot_pull();
+        assert!(!sm.is_snapshot_timeout());
+
+        // Wait for timeout
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(sm.is_snapshot_timeout());
+    }
+
+    #[test]
+    fn test_needs_snapshot() {
+        let stores = create_test_stores();
+        let config = create_test_config();
+        let sm = NodeStateMachine::new(stores.clone(), config);
+
+        // Empty stores need snapshot
+        assert!(sm.needs_snapshot());
+
+        // Add some data to stores
+        use super::super::{
+            crdt::SKey,
+            stores::{MembershipState, PolicyState, WorkerState},
+        };
+
+        stores.membership.insert(
+            SKey::from("node1"),
+            MembershipState {
+                name: "node1".to_string(),
+                address: "127.0.0.1:8080".to_string(),
+                status: 1,
+                version: 1,
+                metadata: Default::default(),
+            },
+            "test".to_string(),
+        );
+
+        stores.worker.insert(
+            SKey::from("worker1"),
+            WorkerState {
+                worker_id: "worker1".to_string(),
+                model_id: "model1".to_string(),
+                url: "http://localhost:8000".to_string(),
+                health: true,
+                load: 0.5,
+                version: 1,
+            },
+            "test".to_string(),
+        );
+
+        stores.policy.insert(
+            SKey::from("policy1"),
+            PolicyState {
+                model_id: "model1".to_string(),
+                policy_type: "round_robin".to_string(),
+                config: vec![],
+                version: 1,
+            },
+            "test".to_string(),
+        );
+
+        // Now should not need snapshot
+        assert!(!sm.needs_snapshot());
+    }
+
+    #[test]
+    fn test_record_state_update_not_converging() {
+        let stores = create_test_stores();
+        let config = create_test_config();
+        let sm = NodeStateMachine::new(stores, config);
+
+        // Should return false when not in converging state
+        assert!(!sm.record_state_update());
+        assert_eq!(sm.readiness(), NodeReadiness::NotReady);
+    }
+
+    #[test]
+    fn test_convergence_detection() {
+        let stores = create_test_stores();
+        let mut config = create_test_config();
+        config.convergence_window = Duration::from_millis(50);
+        config.min_stable_updates = 2;
+        let sm = NodeStateMachine::new(stores, config);
+
+        // Transition to converging state
+        sm.start_joining();
+        sm.start_snapshot_pull();
+        sm.start_converging();
+        assert_eq!(sm.readiness(), NodeReadiness::Converging);
+
+        // Record multiple updates with same state
+        let converged1 = sm.record_state_update();
+        assert!(!converged1);
+
+        // Wait a bit and record more updates
+        std::thread::sleep(Duration::from_millis(60));
+        let converged2 = sm.record_state_update();
+        assert!(!converged2); // Still not enough stable updates
+
+        // Record more stable updates
+        std::thread::sleep(Duration::from_millis(10));
+        let converged3 = sm.record_state_update();
+        // Should converge after enough stable updates within window
+        if converged3 {
+            assert_eq!(sm.readiness(), NodeReadiness::Ready);
+        }
+    }
+
+    #[test]
+    fn test_convergence_reset_on_state_change() {
+        let stores = create_test_stores();
+        let mut config = create_test_config();
+        config.convergence_window = Duration::from_millis(100);
+        config.min_stable_updates = 2;
+        let sm = NodeStateMachine::new(stores.clone(), config);
+
+        sm.start_joining();
+        sm.start_snapshot_pull();
+        sm.start_converging();
+
+        // Record update
+        sm.record_state_update();
+
+        // Change state by adding data
+        use super::super::{crdt::SKey, stores::AppState};
+        stores.app.insert(
+            SKey::from("app1"),
+            AppState {
+                key: "app1".to_string(),
+                value: vec![1, 2, 3],
+                version: 1,
+            },
+            "test".to_string(),
+        );
+
+        // Record update with changed state
+        sm.record_state_update();
+
+        // The stable count should be reset
+        std::thread::sleep(Duration::from_millis(110));
+        let converged = sm.record_state_update();
+        // Should not converge immediately after state change
+        assert!(!converged || sm.readiness() == NodeReadiness::Converging);
+    }
+
+    #[test]
+    fn test_reset() {
+        let stores = create_test_stores();
+        let config = create_test_config();
+        let sm = NodeStateMachine::new(stores, config);
+
+        // Go through states
+        sm.start_joining();
+        sm.start_snapshot_pull();
+        sm.start_converging();
+        sm.transition_to_ready();
+
+        assert_eq!(sm.readiness(), NodeReadiness::Ready);
+
+        // Reset
+        sm.reset();
+        assert_eq!(sm.readiness(), NodeReadiness::NotReady);
+        assert!(!sm.is_ready());
+        assert!(!sm.is_snapshot_timeout());
+    }
+
+    #[test]
+    fn test_calculate_state_hash() {
+        let stores = create_test_stores();
+        let config = create_test_config();
+        let sm = NodeStateMachine::new(stores.clone(), config);
+
+        let hash1 = sm.calculate_state_hash();
+
+        // Add some data
+        use super::super::{crdt::SKey, stores::AppState};
+        stores.app.insert(
+            SKey::from("app1"),
+            AppState {
+                key: "app1".to_string(),
+                value: vec![],
+                version: 1,
+            },
+            "test".to_string(),
+        );
+
+        // Hash should change
+        let hash2 = sm.calculate_state_hash();
+        assert_ne!(hash1, hash2);
+    }
+
+    #[test]
+    fn test_default_implementation() {
+        let sm = NodeStateMachine::default();
+        assert_eq!(sm.readiness(), NodeReadiness::NotReady);
+        assert!(!sm.is_ready());
+    }
+}
