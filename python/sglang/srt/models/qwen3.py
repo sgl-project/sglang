@@ -308,11 +308,12 @@ class Qwen3DecoderLayer(nn.Module):
             return None
 
         def _get_weights(layer):
-            weight_attrs = ["weight","qweight"]
+        def _get_weights(layer):
+            weight_attrs = ["weight", "qweight"]
             for attr_name in weight_attrs:
-                value = getattr(layer, attr_name, None)
-                if value is not None:
-                    return [value]
+                weight = getattr(layer, attr_name, None)
+                if weight is not None:
+                    return [weight]
             return []
 
         combined_cache = _get_weights(self.mlp.gate_up_proj) + _get_weights(self.mlp.down_proj)
