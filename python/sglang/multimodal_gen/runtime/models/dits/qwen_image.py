@@ -3,7 +3,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import functools
-from math import prod
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
@@ -16,6 +15,7 @@ from diffusers.models.modeling_outputs import Transformer2DModelOutput
 from diffusers.models.normalization import AdaLayerNormContinuous
 
 from sglang.multimodal_gen.configs.models.dits.qwenimage import QwenImageDitConfig
+from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.layers.attention import USPAttention
 from sglang.multimodal_gen.runtime.layers.layernorm import (
     LayerNorm,
@@ -792,6 +792,12 @@ class QwenImageTransformerBlock(nn.Module):
         return encoder_hidden_states, hidden_states
 
 
+def to_hashable(obj):
+    if isinstance(obj, list):
+        return tuple(to_hashable(x) for x in obj)
+    return obj
+
+
 class QwenImageTransformer2DModel(CachableDiT):
     """
     The Transformer model introduced in Qwen.
@@ -868,6 +874,22 @@ class QwenImageTransformer2DModel(CachableDiT):
             self.inner_dim, patch_size * patch_size * self.out_channels, bias=True
         )
 
+        self.timestep_zero = torch.zeros(
+            (1,), dtype=torch.int, device=get_local_torch_device()
+        )
+
+    @functools.lru_cache(maxsize=50)
+    def build_modulate_index(self, img_shapes: tuple[int, int, int], device):
+        modulate_index_list = []
+        for sample in img_shapes:
+            first_size = sample[0][0] * sample[0][1] * sample[0][2]
+            total_size = sum(s[0] * s[1] * s[2] for s in sample)
+            idx = (torch.arange(total_size, device=device) >= first_size).int()
+            modulate_index_list.append(idx)
+
+        modulate_index = torch.stack(modulate_index_list)
+        return modulate_index
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -923,16 +945,9 @@ class QwenImageTransformer2DModel(CachableDiT):
         timestep = (timestep / 1000).to(hidden_states.dtype)
 
         if self.zero_cond_t:
-            timestep = torch.cat([timestep, timestep * 0], dim=0)
-            # Use torch operations for GPU efficiency
-            modulate_index = torch.tensor(
-                [
-                    [0] * prod(sample[0]) + [1] * sum([prod(s) for s in sample[1:]])
-                    for sample in img_shapes
-                ],
-                device=timestep.device,
-                dtype=torch.int,
-            )
+            timestep = torch.cat([timestep, self.timestep_zero], dim=0)
+            device = timestep.device
+            modulate_index = self.build_modulate_index(to_hashable(img_shapes), device)
         else:
             modulate_index = None
 
