@@ -153,10 +153,8 @@ class ModelRunnerKVCacheMixin:
                 assert server_args.speculative_num_draft_tokens is not None
                 assert server_args.max_running_requests is not None
 
-                max_running_requests = (
-                    server_args.max_running_requests // self.dp_size
-                    if server_args.enable_dp_attention
-                    else 1
+                max_running_requests = server_args.max_running_requests // (
+                    self.dp_size if server_args.enable_dp_attention else 1
                 )
                 mamba_state_intermediate_size = (
                     config.mamba2_cache_params.mamba_cache_per_req
