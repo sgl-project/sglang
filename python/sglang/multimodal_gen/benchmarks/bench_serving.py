@@ -3,26 +3,13 @@ Benchmark online serving for diffusion models (Image/Video Generation).
 
 
 Usage:
-    # Video
-    t2v:
-    python3 -m sglang.multimodal_gen.benchmarks.bench_serving \
-         --backend sglang-video --dataset vbench --task t2v --num-prompts 20
+    # launch a server and benchmark on it
 
-    i2v:
-    python3 -m sglang.multimodal_gen.benchmarks.bench_serving \
-         --backend sglang-video --dataset vbench --task i2v --num-prompts 20
+    # T2V or T2I or any other multimodal generation model
+    sglang serve Wan-AI/Wan2.2-T2V-A14B-Diffusers --num-gpus 1 --port 1231
 
-
-    # Image
-    t2i:
-    python3 -m sglang.multimodal_gen.benchmarks.bench_serving \
-         --backend sglang-image --dataset vbench --task t2i --num-prompts 20
-
-    ti2i(edit):
-    python3 -m sglang.multimodal_gen.benchmarks.bench_serving \
-         --backend sglang-image --dataset vbench --task ti2i --num-prompts 20
-
-
+    # benchmark it and make sure the port is the same as the server's port
+    python3 -m sglang.multimodal_gen.benchmarks.bench_serving --dataset vbench --num-prompts 20 --port 1231
 """
 
 import argparse
@@ -105,9 +92,9 @@ class VBenchDataset(BaseDataset):
         self.items = self._load_data()
 
     def _load_data(self) -> List[Dict[str, Any]]:
-        if self.args.task == "t2v" or self.args.task == "t2i":
+        if self.args.task_name in ["text-to-video", "text-to-image"]:
             return self._load_t2v_prompts()
-        elif self.args.task in ["i2v", "ti2v", "ti2i"]:
+        elif self.args.task_name in ["image-to-video", "image-to-image"]:
             return self._load_i2v_data()
         else:
             return self._load_t2v_prompts()
@@ -633,9 +620,20 @@ def wait_for_service(base_url: str, timeout: int = 1200) -> None:
 
 
 async def benchmark(args):
+    from huggingface_hub import model_info
+
     # Construct base_url if not provided
     if args.base_url is None:
         args.base_url = f"http://{args.host}:{args.port}"
+
+    if args.task is not None:
+        print(
+            f"DEPRECATED: --task is deprecated, we will get task from --model instead. Using --task {args.task}."
+        )
+    if args.backend is not None:
+        print(
+            f"DEPRECATED: --backend is deprecated, we will get backend from --model instead. Using --backend {args.backend}."
+        )
 
     # Wait for service
     wait_for_service(args.base_url)
@@ -651,24 +649,23 @@ async def benchmark(args):
     except Exception as e:
         print(f"Failed to fetch model info: {e}. Using default: {args.model}")
 
-    # Setup dataset
-    if args.backend == "sglang-image":
-        if args.task not in ["ti2i", "t2i"]:
-            raise Exception("sglang-image backend only support ti2i and t2i tasks.")
-        if args.task == "ti2i":
+    task_name = model_info(args.model).pipeline_tag
+
+    if task_name in ("text-to-video", "image-to-video", "video-to-video"):
+        api_url = f"{args.base_url}/v1/videos"
+        request_func = async_request_video_sglang
+    elif task_name in ["text-to-image", "image-to-image"]:
+        if task_name == "image-to-image":
             api_url = f"{args.base_url}/v1/images/edits"
         else:
             api_url = f"{args.base_url}/v1/images/generations"
         request_func = async_request_image_sglang
-    elif args.backend == "sglang-video":
-        if args.task not in ["t2v", "i2v", "ti2v"]:
-            raise Exception(
-                "sglang-video backend only support t2v, i2v and ti2v tasks."
-            )
-        api_url = f"{args.base_url}/v1/videos"
-        request_func = async_request_video_sglang
     else:
-        raise ValueError(f"Unknown backend: {args.backend}")
+        raise ValueError(
+            f"The task name {task_name} of model {args.model} is not a valid task name for multimodal generation. Please check the model path."
+        )
+
+    setattr(args, "task_name", task_name)
 
     if args.dataset == "vbench":
         dataset = VBenchDataset(args, api_url, args.model)
@@ -720,10 +717,9 @@ async def benchmark(args):
     print("\n{s:{c}^{n}}".format(s=" Serving Benchmark Result ", n=60, c="="))
 
     # Section 1: Configuration
-    print("{:<40} {:<15}".format("Backend:", args.backend))
+    print("{:<40} {:<15}".format("Task:", task_name))
     print("{:<40} {:<15}".format("Model:", args.model))
     print("{:<40} {:<15}".format("Dataset:", args.dataset))
-    print("{:<40} {:<15}".format("Task:", args.task))
 
     # Section 2: Execution & Traffic
     print(f"{'-' * 50}")
@@ -786,9 +782,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--backend",
         type=str,
-        required=True,
-        choices=["sglang-image", "sglang-video"],
-        help="Backend type.",
+        default=None,
+        help="DEPRECATED, we don't use backend anymore, and we will get backend from --model instead.",
     )
     parser.add_argument(
         "--base-url",
@@ -809,9 +804,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--task",
         type=str,
-        default="t2v",
-        choices=["t2v", "i2v", "ti2v", "ti2i", "t2i"],
-        help="Task type. t2v, i2v, ti2v are used for video generation. ti2i, t2i are used for image generation. ti2i is image edit task and t2i is image generation task.",
+        default=None,
+        help="DEPRECATED, we don't use task anymore, and we will get task from --model instead.",
     )
     parser.add_argument(
         "--dataset-path",
