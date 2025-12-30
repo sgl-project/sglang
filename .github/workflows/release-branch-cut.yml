@@ -13,7 +13,7 @@ on:
         type: string
         default: ''
       ref_branch:
-        description: 'Branch to cut the release branch from (for testing purpose, defaults to main)'
+        description: 'Branch to cut the release branch from (for testing or hotfix purpose, defaults to main)'
         required: false
         type: string
         default: 'main'
