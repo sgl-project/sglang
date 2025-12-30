@@ -272,7 +272,6 @@ class WanTransformerBlock(nn.Module):
         # 1. Self-attention
         self.norm1 = LayerNormScaleShift(
             dim,
-            norm_type="layer",
             eps=eps,
             elementwise_affine=False,
             dtype=torch.float32,
@@ -314,7 +313,6 @@ class WanTransformerBlock(nn.Module):
         assert cross_attn_norm is True
         self.self_attn_residual_norm = ScaleResidualLayerNormScaleShift(
             dim,
-            norm_type="layer",
             eps=eps,
             elementwise_affine=True,
             dtype=torch.float32,
@@ -342,7 +340,6 @@ class WanTransformerBlock(nn.Module):
             )
         self.cross_attn_residual_norm = ScaleResidualLayerNormScaleShift(
             dim,
-            norm_type="layer",
             eps=eps,
             elementwise_affine=False,
             dtype=torch.float32,
@@ -460,7 +457,6 @@ class WanTransformerBlock_VSA(nn.Module):
         # 1. Self-attention
         self.norm1 = LayerNormScaleShift(
             dim,
-            norm_type="layer",
             eps=eps,
             elementwise_affine=False,
             dtype=torch.float32,
@@ -495,7 +491,6 @@ class WanTransformerBlock_VSA(nn.Module):
         assert cross_attn_norm is True
         self.self_attn_residual_norm = ScaleResidualLayerNormScaleShift(
             dim,
-            norm_type="layer",
             eps=eps,
             elementwise_affine=True,
             dtype=torch.float32,
@@ -525,7 +520,6 @@ class WanTransformerBlock_VSA(nn.Module):
             )
         self.cross_attn_residual_norm = ScaleResidualLayerNormScaleShift(
             dim,
-            norm_type="layer",
             eps=eps,
             elementwise_affine=False,
             dtype=torch.float32,
@@ -680,7 +674,6 @@ class WanTransformer3DModel(CachableDiT):
         # 4. Output norm & projection
         self.norm_out = LayerNormScaleShift(
             inner_dim,
-            norm_type="layer",
             eps=config.eps,
             elementwise_affine=False,
             dtype=torch.float32,

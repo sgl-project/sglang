@@ -75,10 +75,10 @@ class MMDoubleStreamBlock(nn.Module):
 
         # Fused operations for image stream
         self.img_attn_norm = LayerNormScaleShift(
-            hidden_size, norm_type="layer", elementwise_affine=False, dtype=dtype
+            hidden_size, elementwise_affine=False, dtype=dtype
         )
         self.img_attn_residual_mlp_norm = ScaleResidualLayerNormScaleShift(
-            hidden_size, norm_type="layer", elementwise_affine=False, dtype=dtype
+            hidden_size, elementwise_affine=False, dtype=dtype
         )
         self.img_mlp_residual = ScaleResidual()
 
@@ -121,10 +121,10 @@ class MMDoubleStreamBlock(nn.Module):
 
         # Fused operations for text stream
         self.txt_attn_norm = LayerNormScaleShift(
-            hidden_size, norm_type="layer", elementwise_affine=False, dtype=dtype
+            hidden_size, elementwise_affine=False, dtype=dtype
         )
         self.txt_attn_residual_mlp_norm = ScaleResidualLayerNormScaleShift(
-            hidden_size, norm_type="layer", elementwise_affine=False, dtype=dtype
+            hidden_size, elementwise_affine=False, dtype=dtype
         )
         self.txt_mlp_residual = ScaleResidual()
 
