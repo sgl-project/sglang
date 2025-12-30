@@ -15,6 +15,8 @@ class TestFlux_T2V(CLIBase):
     data_type: DataType = DataType.IMAGE
 
 
+del CLIBase
+
+
 if __name__ == "__main__":
-    del CLIBase
     unittest.main()
