@@ -37,6 +37,8 @@ class MoeRunner:
             self.runner_core = TritonKernelsRunnerCore(config)
         elif runner_backend.is_deep_gemm():
             self.runner_core = DeepGemmRunnerCore(config)
+        elif runner_backend.is_marlin():
+            self.runner_core = None  # Marlin only supports fused path
         else:
             raise NotImplementedError(f"Unsupported runner backend: {runner_backend}")
 

@@ -19,6 +19,11 @@ NSA_FLASHMLA_BACKEND_DECODE_COMPUTE_FP8 = get_bool_env_var(
 NSA_QUANT_K_CACHE_FAST = get_bool_env_var("SGLANG_NSA_QUANT_K_CACHE_FAST", "true")
 NSA_DEQUANT_K_CACHE_FAST = get_bool_env_var("SGLANG_NSA_DEQUANT_K_CACHE_FAST", "true")
 
+# Environment variable to control mtp precomputing of metadata for multi-step speculative decoding
+NSA_ENABLE_MTP_PRECOMPUTE_METADATA = get_bool_env_var(
+    "SGLANG_NSA_ENABLE_MTP_PRECOMPUTE_METADATA", "true"
+)
+
 
 def print_nsa_bool_env_vars():
     msg = ""
@@ -49,6 +54,10 @@ class NSAContextParallelMetadata:
     kv_len_next: int = -1
     actual_seq_q_prev: int = -1
     actual_seq_q_next: int = -1
+    kv_len_prev_tensor: torch.Tensor = None
+    kv_len_next_tensor: torch.Tensor = None
+    actual_seq_q_prev_tensor: torch.Tensor = None
+    actual_seq_q_next_tensor: torch.Tensor = None
     total_seq_lens: torch.Tensor = None
 
 
@@ -312,6 +321,19 @@ def prepare_input_dp_with_cp_dsa(
 
     # TODO Support multi-batch-cp-split, multi-batch-cp support has accuracy issues
     # cp_seq_index = calculate_cp_seq_idx(split_list[:], seqs_len[:])
+    kv_len_prev = prefix_sum_list[cp_rank]
+    kv_len_next = prefix_sum_list[cp_size * 2 - cp_rank - 1]
+    actual_seq_q_prev = split_list[cp_rank]
+    actual_seq_q_next = split_list[cp_size * 2 - cp_rank - 1]
+    kv_len_prev_tensor = torch.tensor(kv_len_prev).to(device="cuda", dtype=torch.int32)
+    kv_len_next_tensor = torch.tensor(kv_len_next).to(device="cuda", dtype=torch.int32)
+    actual_seq_q_prev_tensor = torch.tensor(actual_seq_q_prev).to(
+        device="cuda", dtype=torch.int32
+    )
+    actual_seq_q_next_tensor = torch.tensor(actual_seq_q_next).to(
+        device="cuda", dtype=torch.int32
+    )
+
     nsa_cp_metadata = NSAContextParallelMetadata(
         split_list=split_list,
         max_rank_len=max_rank_len,
@@ -319,10 +341,14 @@ def prepare_input_dp_with_cp_dsa(
         per_rank_actual_token=per_rank_actual_token,
         reverse_split_len=reverse_split_len,
         cp_reverse_index=cp_reverse_index,
-        kv_len_prev=prefix_sum_list[cp_rank],
-        kv_len_next=prefix_sum_list[cp_size * 2 - cp_rank - 1],
-        actual_seq_q_prev=split_list[cp_rank],
-        actual_seq_q_next=split_list[cp_size * 2 - cp_rank - 1],
+        kv_len_prev=kv_len_prev,
+        kv_len_next=kv_len_next,
+        actual_seq_q_prev=actual_seq_q_prev,
+        actual_seq_q_next=actual_seq_q_next,
+        kv_len_prev_tensor=kv_len_prev_tensor,
+        kv_len_next_tensor=kv_len_next_tensor,
+        actual_seq_q_prev_tensor=actual_seq_q_prev_tensor,
+        actual_seq_q_next_tensor=actual_seq_q_next_tensor,
         total_seq_lens=kv_len_origin,
     )
     return nsa_cp_metadata

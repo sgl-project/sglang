@@ -38,7 +38,10 @@ from sglang.srt.models.qwen3 import Qwen3ForCausalLM
 from sglang.srt.models.qwen3_moe import Qwen3MoeForCausalLM
 from sglang.srt.multimodal.mm_utils import run_dp_sharded_vision_model
 from sglang.srt.server_args import get_global_server_args
+from sglang.srt.utils import is_cuda
 from sglang.utils import logger
+
+_is_cuda = is_cuda()
 
 
 class InternAttention(nn.Module):
@@ -47,6 +50,7 @@ class InternAttention(nn.Module):
         config,
         quant_config: QuantizationConfig = None,
         use_data_parallel: bool = False,
+        aux_stream: Optional[torch.cuda.Stream] = None,
     ):
         super().__init__()
         self.config = config
@@ -69,6 +73,7 @@ class InternAttention(nn.Module):
             or getattr(config, "use_qk_norm", False),
             flatten_batch=False,
             use_data_parallel=use_data_parallel,
+            aux_stream=aux_stream,
         )
 
         self.proj_drop = nn.Dropout(config.dropout)
@@ -222,6 +227,7 @@ class InternVisionEncoderLayer(nn.Module):
         drop_path_rate: float,
         quant_config: QuantizationConfig = None,
         use_data_parallel: bool = False,
+        aux_stream: Optional[torch.cuda.Stream] = None,
     ):
         super().__init__()
         self.embed_dim = config.hidden_size
@@ -231,6 +237,7 @@ class InternVisionEncoderLayer(nn.Module):
             config=config,
             quant_config=quant_config,
             use_data_parallel=use_data_parallel,
+            aux_stream=aux_stream,
         )
         self.mlp = InternMLP(config, use_data_parallel)
         self.norm1 = NORM2FN[self.norm_type](self.embed_dim, eps=config.layer_norm_eps)
@@ -296,10 +303,11 @@ class InternVisionEncoder(nn.Module):
             x.item()
             for x in torch.linspace(0, config.drop_path_rate, config.num_hidden_layers)
         ]
+        aux_stream = torch.cuda.Stream() if _is_cuda else None
         self.layers = nn.ModuleList(
             [
                 InternVisionEncoderLayer(
-                    config, dpr[idx], quant_config, use_data_parallel
+                    config, dpr[idx], quant_config, use_data_parallel, aux_stream
                 )
                 for idx in range(config.num_hidden_layers)
             ]

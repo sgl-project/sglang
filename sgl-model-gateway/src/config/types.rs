@@ -64,6 +64,12 @@ pub struct RouterConfig {
     pub tool_call_parser: Option<String>,
     #[serde(default)]
     pub tokenizer_cache: TokenizerCacheConfig,
+    /// Server TLS certificate (PEM)
+    #[serde(skip)]
+    pub server_cert: Option<Vec<u8>>,
+    /// Server TLS private key (PEM)
+    #[serde(skip)]
+    pub server_key: Option<Vec<u8>>,
     /// Combined certificate + key in PEM format, loaded from client_cert_path and client_key_path during config creation
     #[serde(skip)]
     pub client_identity: Option<Vec<u8>>,
@@ -330,6 +336,44 @@ pub enum PolicyConfig {
         /// Interval between bucket boundary adjustment cycles (seconds)
         bucket_adjust_interval_secs: usize,
     },
+
+    /// Manual routing policy with sticky sessions using DashMap.
+    /// - X-SMG-Routing-Key: Routes to a cached worker or assigns a new one
+    /// - Provides true sticky sessions with zero key redistribution on worker add
+    /// - Falls back to random selection if no routing key is provided
+    #[serde(rename = "manual")]
+    Manual,
+
+    /// Consistent hashing policy using hash ring for session affinity:
+    /// - X-SMG-Target-Worker: Direct routing to a specific worker by URL
+    /// - X-SMG-Routing-Key: Consistent hash routing for session affinity
+    /// - Provides O(log n) lookup with minimal redistribution (~1/N keys) on topology change
+    #[serde(rename = "consistent_hashing")]
+    ConsistentHashing,
+
+    /// Prefix hash policy for KV cache-aware load balancing.
+    /// A lightweight alternative to cache_aware radix tree.
+    /// Routes requests based on prefix token hash for cache locality.
+    /// - Uses consistent hash ring with bounded load balancing
+    /// - Walks ring if worker is overloaded (load > avg * load_factor)
+    /// - O(log n) lookup instead of O(prefix_len) radix tree traversal
+    #[serde(rename = "prefix_hash")]
+    PrefixHash {
+        /// Number of prefix tokens to hash (default: 256)
+        #[serde(default = "default_prefix_token_count")]
+        prefix_token_count: usize,
+        /// Load factor threshold - walk ring if load > avg * factor (default: 1.25)
+        #[serde(default = "default_load_factor")]
+        load_factor: f64,
+    },
+}
+
+fn default_prefix_token_count() -> usize {
+    256
+}
+
+fn default_load_factor() -> f64 {
+    1.25
 }
 
 impl PolicyConfig {
@@ -340,6 +384,9 @@ impl PolicyConfig {
             PolicyConfig::CacheAware { .. } => "cache_aware",
             PolicyConfig::PowerOfTwo { .. } => "power_of_two",
             PolicyConfig::Bucket { .. } => "bucket",
+            PolicyConfig::Manual => "manual",
+            PolicyConfig::ConsistentHashing => "consistent_hashing",
+            PolicyConfig::PrefixHash { .. } => "prefix_hash",
         }
     }
 }
@@ -523,6 +570,8 @@ impl Default for RouterConfig {
             ca_certificates: vec![],
             mcp_config: None,
             enable_wasm: false,
+            server_cert: None,
+            server_key: None,
         }
     }
 }
