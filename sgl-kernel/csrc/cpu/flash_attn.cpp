@@ -257,7 +257,7 @@ void flash_attn_varlen_kernel_impl(
 
           // s_delta <- exp(s_i - m_i)
           at::vec::map<float>(
-              [m_i](Vec x) { return (x - Vec(m_i)).exp_u20(); }, s_delta + row * BLOCK_N, s_i + row * BLOCK_N, n_size);
+              [m_i](Vec x) { return (x - Vec(m_i)).fexp_u20(); }, s_delta + row * BLOCK_N, s_i + row * BLOCK_N, n_size);
 
           // s' <- s' * m_delta + sum(s_delta)
           s_prime[row] *= m_delta;
