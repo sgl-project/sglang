@@ -125,7 +125,7 @@ impl GossipService {
 
         // Split entries into chunks
         let mut chunks = Vec::new();
-        let total_chunks = (entries.len() + chunk_size - 1) / chunk_size; // Ceiling division
+        let total_chunks = entries.len().div_ceil(chunk_size);
 
         for (chunk_idx, chunk_entries) in entries.chunks(chunk_size).enumerate() {
             let state_updates: Vec<StateUpdate> = chunk_entries
@@ -321,14 +321,12 @@ impl Gossip for GossipService {
         let size_validator = MessageSizeValidator::default();
 
         // Create incremental update collector if stores are available
-        let collector = if let Some(stores) = &stores {
-            Some(Arc::new(IncrementalUpdateCollector::new(
+        let collector = stores.as_ref().map(|stores| {
+            Arc::new(IncrementalUpdateCollector::new(
                 stores.clone(),
                 self_name.clone(),
-            )))
-        } else {
-            None
-        };
+            ))
+        });
 
         // Spawn task to periodically send incremental updates
         if let Some(collector) = collector {
@@ -724,7 +722,7 @@ impl Gossip for GossipService {
                                     let chunk_key = (store_type, chunk.total_chunks);
                                     snapshot_state
                                         .entry(chunk_key)
-                                        .or_insert_with(Vec::new)
+                                        .or_default()
                                         .push(chunk.clone());
 
                                     // Check if we've received all chunks

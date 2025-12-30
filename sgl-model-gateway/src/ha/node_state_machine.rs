@@ -216,9 +216,9 @@ impl NodeStateMachine {
 
     /// Check if stores are empty (need snapshot)
     pub fn needs_snapshot(&self) -> bool {
-        self.stores.membership.len() == 0
-            || self.stores.worker.len() == 0
-            || self.stores.policy.len() == 0
+        self.stores.membership.is_empty()
+            || self.stores.worker.is_empty()
+            || self.stores.policy.is_empty()
     }
 
     /// Calculate a simple hash of current state (for convergence detection)

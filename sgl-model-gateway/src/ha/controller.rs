@@ -84,7 +84,7 @@ impl HAController {
                         // Get or create retry manager for this peer
                         let retry_manager = retry_managers
                             .entry(peer_name.clone())
-                            .or_insert_with(RetryManager::default);
+                            .or_default();
 
                         // Check if we should retry based on backoff
                         if retry_manager.should_retry() {

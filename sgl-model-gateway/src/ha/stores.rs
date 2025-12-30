@@ -139,6 +139,10 @@ impl MembershipStore {
         self.inner.len()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.inner.len() == 0
+    }
+
     pub fn all(&self) -> BTreeMap<SKey, MembershipState> {
         self.inner.snapshot().to_map()
     }
@@ -189,6 +193,10 @@ impl AppStore {
 
     pub fn len(&self) -> usize {
         self.inner.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.inner.len() == 0
     }
 
     pub fn all(&self) -> BTreeMap<SKey, AppState> {
@@ -243,6 +251,10 @@ impl WorkerStore {
         self.inner.len()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.inner.len() == 0
+    }
+
     pub fn all(&self) -> BTreeMap<SKey, WorkerState> {
         self.inner.snapshot().to_map()
     }
@@ -293,6 +305,10 @@ impl PolicyStore {
 
     pub fn len(&self) -> usize {
         self.inner.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.inner.len() == 0
     }
 
     pub fn all(&self) -> BTreeMap<SKey, PolicyState> {
@@ -357,7 +373,7 @@ impl RateLimitStore {
         Some(
             counters
                 .entry(key.clone())
-                .or_insert_with(SyncPNCounter::new)
+                .or_default()
                 .clone(),
         )
     }
@@ -380,7 +396,7 @@ impl RateLimitStore {
         let mut counters = self.counters.write();
         let counter = counters
             .entry(key.clone())
-            .or_insert_with(SyncPNCounter::new);
+            .or_default();
         counter.inc(actor, delta);
     }
 
@@ -393,7 +409,7 @@ impl RateLimitStore {
     /// Merge counter from another node (for CRDT synchronization)
     pub fn merge_counter(&self, key: String, other: &SyncPNCounter) {
         let mut counters = self.counters.write();
-        let counter = counters.entry(key).or_insert_with(SyncPNCounter::new);
+        let counter = counters.entry(key).or_default();
         // Get the inner CRDTPNCounter from other SyncPNCounter
         let other_inner = other.snapshot();
         counter.merge(&other_inner);
