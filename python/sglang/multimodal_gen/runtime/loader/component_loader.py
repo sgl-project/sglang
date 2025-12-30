@@ -740,24 +740,26 @@ class TransformerLoader(ComponentLoader):
 
         model = model.eval()
 
-        if server_args.dit_layerwise_offload and isinstance(model, OffloadableDiTMixin):
-            # TODO(will): support multiple module names
-            module_name = model.layer_names[0]
-            try:
-                num_layers = len(getattr(model, module_name))
-            except Exception:
-                num_layers = None
-            if isinstance(num_layers, int) and num_layers > 0:
-                mgr = LayerwiseOffloadManager(
+        if server_args.dit_layerwise_offload:
+            if isinstance(model, OffloadableDiTMixin):
+                # TODO(will): support multiple module names
+                module_name = model.layer_names[0]
+                try:
+                    num_layers = len(getattr(model, module_name))
+                except Exception:
+                    num_layers = None
+                assert isinstance(num_layers, int) and num_layers > 0
+                _mgr = LayerwiseOffloadManager(
                     model,
                     module_list_attr=module_name,
                     num_layers=num_layers,
                     enabled=True,
                     pin_cpu_memory=server_args.pin_cpu_memory,
-                    auto_initialize=True,
                 )
-                setattr(model, "_layerwise_offload_manager", mgr)
-                mgr.enable_forward_hooks()
+            else:
+                logger.info(
+                    "Disabling layerwise offload since current model does not support this feature"
+                )
 
         return model
 

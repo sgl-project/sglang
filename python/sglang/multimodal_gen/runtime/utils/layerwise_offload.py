@@ -1,13 +1,12 @@
 import re
-from contextlib import contextmanager
 from itertools import chain
 from typing import Any, Dict, List, Set, Tuple
 
 import torch
 
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
-class OffloadableDiTMixin:
-    layer_names: List[str]
+logger = init_logger(__name__)
 
 
 # Adapted from skywork AI Infra diffusion optimize
@@ -33,7 +32,6 @@ class LayerwiseOffloadManager:
         num_layers: int,
         enabled: bool,
         pin_cpu_memory: bool = True,
-        auto_initialize: bool = False,
     ) -> None:
         self.model = model
         self.module_list_attr = module_list_attr
@@ -41,10 +39,10 @@ class LayerwiseOffloadManager:
         self.pin_cpu_memory = pin_cpu_memory
 
         self.enabled = bool(enabled and torch.cuda.is_available())
-        self.device = (
-            torch.device("cuda", torch.cuda.current_device()) if self.enabled else None
-        )
-        self.copy_stream = torch.cuda.Stream() if self.enabled else None
+        if not self.enabled:
+            return
+        self.device = torch.device("cuda", torch.cuda.current_device())
+        self.copy_stream = torch.cuda.Stream()
 
         self._layer_name_re = re.compile(
             rf"(^|\.){re.escape(module_list_attr)}\.(\d+)(\.|$)"
@@ -62,8 +60,9 @@ class LayerwiseOffloadManager:
         self._named_parameters: Dict[str, torch.nn.Parameter] = {}
         self._named_buffers: Dict[str, torch.Tensor] = {}
 
-        if auto_initialize:
-            self._initialize()
+        self._initialize()
+
+        logger.info("LayerwiseOffloadManager initialized")
 
     def _match_layer_idx(self, name: str) -> int | None:
         m = self._layer_name_re.search(name)
@@ -129,6 +128,8 @@ class LayerwiseOffloadManager:
         # prefetch the first layer for warm-up
         self.prepare_for_next_denoise(non_blocking=False)
 
+        self.enable_forward_hooks()
+
     def prepare_for_next_denoise(self, non_blocking=True):
         self.prefetch_layer(0, non_blocking=non_blocking)
         if not non_blocking and self.copy_stream is not None:
@@ -152,7 +153,6 @@ class LayerwiseOffloadManager:
             return
         if layer_idx not in self._consolidated_cpu_weights:
             return
-
         self.copy_stream.wait_stream(torch.cuda.current_stream())
 
         # create gpu buffer and load from CPU buffer
@@ -177,30 +177,6 @@ class LayerwiseOffloadManager:
             ].view(meta["shape"])
 
         self._gpu_layers.add(layer_idx)
-
-    @contextmanager
-    def layer_scope(
-        self,
-        *,
-        prefetch_layer_idx: int | None,
-        release_layer_idx: int | None,
-        non_blocking: bool = True,
-    ):
-        """A helper context manager to improve readability at call sites.
-
-        It optionally prefetches ``prefetch_layer_idx`` before entering the
-        context, and waits for the copy stream then releases
-        ``release_layer_idx`` on exit.
-        """
-        if self.enabled and prefetch_layer_idx is not None:
-            self.prefetch_layer(prefetch_layer_idx, non_blocking=non_blocking)
-        try:
-            yield
-        finally:
-            if self.enabled and self.copy_stream is not None:
-                torch.cuda.current_stream().wait_stream(self.copy_stream)
-            if self.enabled and release_layer_idx is not None:
-                self.release_layer(release_layer_idx)
 
     @torch.compiler.disable
     def release_layer(self, layer_idx: int) -> None:
@@ -227,3 +203,32 @@ class LayerwiseOffloadManager:
 
         for layer_idx in list(self._gpu_layers):
             self.release_layer(layer_idx)
+
+    def enable_forward_hooks(self) -> None:
+        if not self.enabled:
+            return
+
+        modules = getattr(self.model, self.module_list_attr)
+
+        def make_pre_hook(i):
+            def hook(module, input):
+                self.prefetch_layer(i + 1, non_blocking=True)
+
+            return hook
+
+        def make_post_hook(i):
+            def hook(module, input, output):
+                if self.copy_stream is not None:
+                    torch.cuda.current_stream().wait_stream(self.copy_stream)
+                self.release_layer(i)
+
+            return hook
+
+        for i, module in enumerate(modules):
+            module.register_forward_pre_hook(make_pre_hook(i))
+            module.register_forward_hook(make_post_hook(i))
+
+
+class OffloadableDiTMixin:
+    layer_names: List[str]
+    layerwise_offload_manager: LayerwiseOffloadManager | None = None

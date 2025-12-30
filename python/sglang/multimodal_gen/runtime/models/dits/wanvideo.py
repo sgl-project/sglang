@@ -611,7 +611,6 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
         self.num_channels_latents = config.num_channels_latents
         self.patch_size = config.patch_size
         self.text_len = config.text_len
-        self.layer_names = ["blocks"]
 
         # 1. Patch & position embedding
         self.patch_embedding = PatchEmbed(
@@ -695,6 +694,8 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
             rope_theta=10000,
             dtype=torch.float32 if current_platform.is_mps() else torch.float64,
         )
+
+        self.layer_names = ["blocks"]
 
     def forward(
         self,

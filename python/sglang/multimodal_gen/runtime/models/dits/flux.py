@@ -427,10 +427,6 @@ class FluxTransformer2DModel(CachableDiT, OffloadableDiTMixin):
         self.inner_dim = (
             self.config.num_attention_heads * self.config.attention_head_dim
         )
-        self.layer_names = [
-            "transformer_blocks",
-            "single_transformer_blocks",
-        ]
 
         self.rotary_emb = FluxPosEmbed(theta=10000, axes_dim=self.config.axes_dims_rope)
 
@@ -484,6 +480,11 @@ class FluxTransformer2DModel(CachableDiT, OffloadableDiTMixin):
             bias=True,
             gather_output=True,
         )
+
+        self.layer_names = [
+            "transformer_blocks",
+            "single_transformer_blocks",
+        ]
 
     def forward(
         self,
