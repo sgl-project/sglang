@@ -24,7 +24,7 @@ from sglang.test.test_utils import (
 @dataclass
 class Req:
     rid: int
-    req_context: Optional[Union[SGLangTraceReqContext, Dict]] = None
+    req_context: Optional[Union[TraceReqContext, Dict]] = None
 
 
 class TestTrace(CustomTestCase):
@@ -200,7 +200,7 @@ class TestTrace(CustomTestCase):
         try:
             process_tracing_init("0.0.0.0:4317", "test")
             trace_set_thread_info("Test")
-            req_context = SGLangTraceReqContext(0, tracing_enable=True)
+            req_context = TraceReqContext(0, tracing_enable=True)
             req_context.trace_req_start()
             req_context.trace_slice_start("test slice")
             time.sleep(1)
@@ -222,7 +222,7 @@ class TestTrace(CustomTestCase):
         try:
             process_tracing_init("0.0.0.0:4317", "test")
             trace_set_thread_info("Test")
-            req_context = SGLangTraceReqContext(0, tracing_enable=True)
+            req_context = TraceReqContext(0, tracing_enable=True)
             req_context.trace_req_start()
             req_context.trace_slice_start("", anonymous=True)
             time.sleep(1)
@@ -253,7 +253,7 @@ class TestTrace(CustomTestCase):
 
             try:
                 req = recv_from_main.recv_pyobj()
-                req_context = SGLangTraceReqContext(0, tracing_enable=True)
+                req_context = TraceReqContext(0, tracing_enable=True)
                 req_context.trace_set_proc_propagate_context(req.req_context)
                 req.req_context = req_context
                 req.req_context.trace_slice_start("work")
@@ -282,7 +282,7 @@ class TestTrace(CustomTestCase):
             time.sleep(1)
 
             req = Req(rid=0)
-            req.req_context = SGLangTraceReqContext(0, tracing_enable=True)
+            req.req_context = TraceReqContext(0, tracing_enable=True)
             req.req_context.trace_req_start()
             req.req_context.trace_slice_start("dispatch")
             time.sleep(1)

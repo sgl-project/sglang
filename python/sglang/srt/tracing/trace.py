@@ -86,7 +86,7 @@ class TraceEvent:
 
 
 @dataclass
-class SGLangTraceSliceContext:
+class TraceSliceContext:
     slice_name: str
     start_time_ns: int
     end_time_ns: Optional[int] = None
@@ -99,15 +99,15 @@ class SGLangTraceSliceContext:
     level: int = 1
     attrs: Optional[Dict[str, Any]] = None
     events: Optional[List[TraceEvent]] = None
-    parent_slice: Optional[SGLangTraceSliceContext] = None
-    child_slices: Optional[List[SGLangTraceSliceContext]] = None
+    parent_slice: Optional[TraceSliceContext] = None
+    child_slices: Optional[List[TraceSliceContext]] = None
     prev_span_context: Optional[trace.span.SpanContext] = None
 
 
 @dataclass
 class TraceThreadContext:
     thread_info: TraceThreadInfo
-    cur_slice: Optional[SGLangTraceSliceContext] = None
+    cur_slice: Optional[TraceSliceContext] = None
     thread_span: Optional[trace.span.Span] = None
     # Record the most recently completed span as the previous span for the next span to be created.
     last_span_context: Optional[trace.span.SpanContext] = None
@@ -155,7 +155,7 @@ class TracePropagateContext:
         return cls(root_span_context, prev_span_context)
 
 
-class SGLangTraceCustomIdGenerator(id_generator.IdGenerator):
+class TraceCustomIdGenerator(id_generator.IdGenerator):
     """
     The default IdGenerator may produce duplicate trace IDs across multiple TP scheduler processes,
     hence a custom IdGenerator is implemented.
@@ -218,7 +218,7 @@ def process_tracing_init(otlp_endpoint, server_name):
             }
         )
         tracer_provider = TracerProvider(
-            resource=resource, id_generator=SGLangTraceCustomIdGenerator()
+            resource=resource, id_generator=TraceCustomIdGenerator()
         )
 
         schedule_delay_millis = get_int_env_var(
@@ -285,7 +285,7 @@ def trace_set_thread_info(
     )
 
 
-class SGLangTraceReqContext:
+class TraceReqContext:
     def __init__(
         self,
         rid,
@@ -443,7 +443,7 @@ class SGLangTraceReqContext:
 
         self.root_span.end(end_time=ts)
 
-    def __create_slice_span(self, _slice: SGLangTraceSliceContext):
+    def __create_slice_span(self, _slice: TraceSliceContext):
         if _slice.span:
             return
 
@@ -477,7 +477,7 @@ class SGLangTraceReqContext:
         _slice.attrs = {}
         _slice.events = []
 
-    def __end_slice_span(self, _slice: SGLangTraceSliceContext):
+    def __end_slice_span(self, _slice: TraceSliceContext):
         # child_slices is not empty but they have not created span
         # if cur_slice.lazy_flag is True before.
         if _slice.child_slices:
@@ -504,7 +504,7 @@ class SGLangTraceReqContext:
 
         ts = ts or get_cur_time_ns()
 
-        cur_slice = SGLangTraceSliceContext(
+        cur_slice = TraceSliceContext(
             slice_name=name,
             start_time_ns=ts,
             anonymous=anonymous,
@@ -534,7 +534,7 @@ class SGLangTraceReqContext:
 
         self.__create_slice_span(cur_slice)
 
-    def __release_slice_reference_tree(self, _slice: SGLangTraceSliceContext):
+    def __release_slice_reference_tree(self, _slice: TraceSliceContext):
         for child_slice in _slice.child_slices:
             self.__release_slice_reference_tree(child_slice)
         _slice.child_slices = []

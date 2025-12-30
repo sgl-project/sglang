@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Union
 
 from sglang.srt.tracing.trace import (
-    SGLangTraceReqContext,
+    TraceReqContext,
     get_cur_time_ns,
     get_opentelemetry_initialized,
 )
@@ -139,7 +139,7 @@ class RequestStage:
     ANONYMOUS = RequestStageConfig("")
 
 
-class TraceMetricContext(SGLangTraceReqContext):
+class TraceMetricContext(TraceReqContext):
     def __init__(
         self,
         rid,
