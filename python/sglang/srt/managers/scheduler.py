@@ -1823,7 +1823,35 @@ class Scheduler(
 
         new_batch = self.get_new_batch_prefill()
 
+        if new_batch and self.is_mixed_chunk:
+            # Mixed-style chunked prefill
+            new_batch.prepare_for_extend()
+            if not self.running_batch.is_empty() and not (
+                new_batch.return_logprob or self.running_batch.return_logprob
+            ):
+                # TODO (lianmin): support return_logprob + mixed chunked prefill
+                self.running_batch.filter_batch(v1_spec_info_filtered=True)
+                if not self.running_batch.is_empty():
+                    self.running_batch.forward_mode = ForwardMode.DECODE
+                    self.running_batch.prepare_for_decode()
+                    new_batch.mix_with_running(self.running_batch)
+                    new_batch.decoding_reqs = self.running_batch.reqs
+                self.running_batch = ScheduleBatch(
+                    reqs=[], batch_is_full=self.running_batch.batch_is_full
+                )
+            trace_event_batch("schedule", new_batch.reqs)
+            self.log_prefill_stats_late(new_batch)
+            return new_batch
+
+        if new_batch:
+            new_batch.prepare_for_extend()
+
         need_mlp_sync = self.require_mlp_sync
+
+        if need_mlp_sync:
+            if self.is_mixed_chunk:
+                raise NotImplementedError()
+
         if need_mlp_sync and not self.spec_algorithm.is_none():
             # NOTE: This branch makes sure prefill and decode batches will not be mixed when spec and dp-attn is enabled.
             # Before merging the new batch into running batch:
@@ -1839,6 +1867,7 @@ class Scheduler(
             # Run decode
             if not self.running_batch.is_empty():
                 self.running_batch = self.update_running_batch(self.running_batch)
+                self.running_batch.prepare_for_decode()
                 ret = self.running_batch if not self.running_batch.is_empty() else None
             else:
                 ret = None
@@ -2050,25 +2079,10 @@ class Scheduler(
                 self.tree_cache.ready_to_load_host_cache()
             )
 
-        new_batch.prepare_for_extend()
-
-        # Mixed-style chunked prefill
-        if (
-            self.is_mixed_chunk
-            and not self.running_batch.is_empty()
-            and not (new_batch.return_logprob or self.running_batch.return_logprob)
-        ):
-            # TODO (lianmin): support return_logprob + mixed chunked prefill
-            self.running_batch.filter_batch(v1_spec_info_filtered=True)
-            if not self.running_batch.is_empty():
-                self.running_batch.prepare_for_decode()
-                new_batch.mix_with_running(self.running_batch)
-                new_batch.decoding_reqs = self.running_batch.reqs
-            self.running_batch = ScheduleBatch(
-                reqs=[], batch_is_full=self.running_batch.batch_is_full
-            )
+        if new_batch.is_dllm():
+            new_batch.forward_mode = ForwardMode.DLLM_EXTEND
         else:
-            new_batch.decoding_reqs = None
+            new_batch.forward_mode = ForwardMode.EXTEND
 
         return new_batch
 
@@ -2148,8 +2162,7 @@ class Scheduler(
         if batch.batch_size() < initial_bs:
             batch.batch_is_full = False
 
-        # Update batch tensors
-        batch.prepare_for_decode()
+        batch.forward_mode = ForwardMode.DECODE
         return batch
 
     def record_batch_in_overlap(self, model_worker_batch: ModelWorkerBatch):

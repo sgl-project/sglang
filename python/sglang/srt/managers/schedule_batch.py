@@ -1405,11 +1405,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         ), f"Expected {len(self.out_cache_loc)}, got {self.extend_num_tokens}"
 
     def prepare_for_extend(self):
-        self.forward_mode = ForwardMode.EXTEND
 
-        if self.is_dllm():
-            # For DLLM, we use a separate forward mode
-            self.forward_mode = ForwardMode.DLLM_EXTEND
+        if self.forward_mode is not None:
+            assert self.forward_mode in [ForwardMode.EXTEND, ForwardMode.DLLM_EXTEND]
+        else:
+            if self.is_dllm():
+                # For DLLM, we use a separate forward mode
+                self.forward_mode = ForwardMode.DLLM_EXTEND
+            else:
+                self.forward_mode = ForwardMode.EXTEND
 
         # Init tensors
         reqs = self.reqs
@@ -1854,7 +1858,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         return ret
 
     def prepare_for_decode(self):
-        self.forward_mode = ForwardMode.DECODE
+
+        if self.is_empty():
+            return
+
+        if self.forward_mode is not None:
+            assert self.forward_mode == ForwardMode.DECODE
+        else:
+            self.forward_mode = ForwardMode.DECODE
+
         bs = len(self.reqs)
 
         if self.is_spec_v2:

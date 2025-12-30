@@ -80,6 +80,8 @@ class SchedulerMultiplexMixin:
 
         # add new request
         batch = self.get_new_batch_prefill()
+        if batch:
+            batch.prepare_for_extend()
         if batch and not batch.is_empty():
             batch.forward_mode = (
                 ForwardMode.SPLIT_PREFILL
@@ -120,6 +122,7 @@ class SchedulerMultiplexMixin:
             with torch.cuda.stream(decode_stream):
                 set_pdmux_status(False)
                 self.running_batch = self.update_running_batch(self.running_batch)
+                self.running_batch.prepare_for_decode()
                 adjust_stream_group = adjust_stream_group or (
                     stream_idx > 0 and self.running_batch.is_empty()
                 )

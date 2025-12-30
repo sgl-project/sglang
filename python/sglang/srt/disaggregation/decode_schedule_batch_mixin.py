@@ -27,7 +27,11 @@ class ScheduleBatchDisaggregationDecodeMixin:
         Adapted from .prepare_for_extend().
         """
 
-        self.forward_mode = ForwardMode.PREBUILT
+        if self.forward_mode is not None:
+            assert self.forward_mode.is_prebuilt()
+        else:
+            self.forward_mode = ForwardMode.PREBUILT
+
         reqs = self.reqs
         input_ids = [r.fill_ids[len(r.prefix_indices) :] for r in reqs]
         extend_num_tokens = sum(len(ids) for ids in input_ids)
