@@ -161,6 +161,9 @@ class SpeculativeAlgorithm(metaclass=_SpeculativeAlgorithmMeta):
     def is_none(self) -> bool:
         return self is SpeculativeAlgorithm.NONE
 
+    def supports_spec_v2(self) -> bool:
+        return self.is_eagle() or self.is_eagle3() or self.is_standalone()
+
     def is_eagle(self) -> bool:
         return self._has_flag("EAGLE")
 
@@ -274,6 +277,12 @@ def _create_eagle_worker(**kwargs: Any) -> Any:
 
 
 def _create_standalone_worker(**kwargs: Any) -> Any:
+    enable_overlap = kwargs.pop("enable_overlap", False)
+    if enable_overlap:
+        from sglang.srt.speculative.standalone_worker_v2 import StandaloneWorkerV2
+
+        return StandaloneWorkerV2(**kwargs)
+
     from sglang.srt.speculative.standalone_worker import StandaloneWorker
 
     return StandaloneWorker(**kwargs)
