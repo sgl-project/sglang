@@ -216,6 +216,10 @@ def compute_local_num_token_non_padded(
     attn_tp_size = get_attention_tp_size()
     tokens_per_rank = num_tokens_per_dp // attn_tp_size
 
+    # Make sure global_num_token_non_padded is tensor so torch.clamp doesn't break
+    if isinstance(global_num_token_non_padded, int):
+        global_num_token_non_padded = torch.tensor(global_num_token_non_padded)
+
     return torch.clamp(
         global_num_token_non_padded - tokens_per_rank * attn_tp_rank,
         0,
@@ -545,11 +549,12 @@ class ForwardBatch:
         from sglang.srt.utils.common import require_mlp_tp_gather
 
         dp_rank = get_attention_dp_rank()
+        assert self.global_num_tokens_cpu is not None
 
         if require_mlp_tp_gather(server_args):
-            num_tokens_per_dp = self.global_num_tokens_gpu[dp_rank]
+            num_tokens_per_dp = self.global_num_tokens_cpu[dp_rank]
         else:
-            num_tokens_per_dp = self.global_num_tokens_gpu[0]
+            num_tokens_per_dp = self.global_num_tokens_cpu[0]
 
         self.num_token_non_padded = compute_local_num_token_non_padded(
             global_num_token_non_padded=self.num_token_non_padded_cpu,
