@@ -13,6 +13,8 @@ from sglang.multimodal_gen.configs.models.dits import WanVideoConfig
 from sglang.multimodal_gen.configs.sample.wan import WanTeaCacheParams
 from sglang.multimodal_gen.runtime.distributed.parallel_state import get_sp_world_size
 from sglang.multimodal_gen.runtime.layers.attention import (
+    MinimalA2AAttnOp,
+    SparseLinearAttention,
     UlyssesAttention_VSA,
     USPAttention,
 )
@@ -262,6 +264,8 @@ class WanTransformerBlock(nn.Module):
         added_kv_proj_dim: int | None = None,
         supported_attention_backends: set[AttentionBackendEnum] | None = None,
         prefix: str = "",
+        attention_type: str = "original",
+        sla_topk: float = 0.1,
     ):
         super().__init__()
 
@@ -272,13 +276,20 @@ class WanTransformerBlock(nn.Module):
         self.to_v = ReplicatedLinear(dim, dim, bias=True)
 
         self.to_out = ReplicatedLinear(dim, dim, bias=True)
-        self.attn1 = USPAttention(
-            num_heads=num_heads,
-            head_size=dim // num_heads,
-            causal=False,
-            supported_attention_backends=supported_attention_backends,
-            prefix=f"{prefix}.attn1",
-        )
+        if attention_type == "sla":
+            self.attn1 = MinimalA2AAttnOp(
+                SparseLinearAttention(
+                    dim // num_heads, topk=sla_topk, BLKQ=128, BLKK=64
+                )
+            )
+        else:
+            self.attn1 = USPAttention(
+                num_heads=num_heads,
+                head_size=dim // num_heads,
+                causal=False,
+                supported_attention_backends=supported_attention_backends,
+                prefix=f"{prefix}.attn1",
+            )
 
         self.hidden_dim = dim
         self.num_attention_heads = num_heads
@@ -648,6 +659,8 @@ class WanTransformer3DModel(CachableDiT):
                     self._supported_attention_backends
                     | {AttentionBackendEnum.VIDEO_SPARSE_ATTN},
                     prefix=f"{config.prefix}.blocks.{i}",
+                    attention_type=config.attention_type,
+                    sla_topk=config.sla_topk,
                 )
                 for i in range(config.num_layers)
             ]

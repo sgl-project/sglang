@@ -131,31 +131,26 @@ class StageProfiler:
         logger: _SGLDiffusionLogger,
         timings: Optional["RequestTimings"],
         simple_log: bool = False,
+        perf_dump_path_provided: bool = False,
     ):
         self.stage_name = stage_name
         self.timings = timings
         self.logger = logger
         self.simple_log = simple_log
         self.start_time = 0.0
-
-        self._metrics_enabled = StageProfiler.metrics_enabled()
-
-    @staticmethod
-    def metrics_enabled():
-        # Check env var at runtime to ensure we pick up changes (e.g. from CLI args)
-        return envs.SGLANG_DIFFUSION_STAGE_LOGGING
+        self.enabled = perf_dump_path_provided or envs.SGLANG_DIFFUSION_STAGE_LOGGING
 
     def __enter__(self):
         if self.simple_log:
             self.logger.info(f"[{self.stage_name}] started...")
 
-        if (self._metrics_enabled and self.timings) or self.simple_log:
+        if (self.enabled and self.timings) or self.simple_log:
             self.start_time = time.perf_counter()
 
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        if not ((self._metrics_enabled and self.timings) or self.simple_log):
+        if not ((self.enabled and self.timings) or self.simple_log):
             return False
 
         execution_time_s = time.perf_counter() - self.start_time
@@ -175,7 +170,7 @@ class StageProfiler:
                 f"[{self.stage_name}] finished in {execution_time_s:.4f} seconds",
             )
 
-        if self._metrics_enabled and self.timings:
+        if self.enabled and self.timings:
             if "denoising_step_" in self.stage_name:
                 index = int(self.stage_name[len("denoising_step_") :])
                 self.timings.record_steps(index, execution_time_s)
