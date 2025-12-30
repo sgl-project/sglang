@@ -609,7 +609,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         input_global_scale = self.quant_config.get("input_global_scale", None)
         if input_global_scale is not None:
             use_nvfp4 = True
-        elif not envs.SGLANG_DEEPEP_BF16_DISPATCH.get() or self.quant_config.get("dispatch_input_scale") is None:
+        elif not envs.SGLANG_DEEPEP_BF16_DISPATCH.get() or self.quant_config.get("dispatch_weight_scale") is None:
             use_fp8 = True
 
         buffer = self._get_buffer()
