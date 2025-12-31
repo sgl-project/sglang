@@ -130,7 +130,7 @@ class ConfigArgumentMerger:
         args = []
 
         for key, value in config.items():
-            key_norm = key.replace("_", "-")
+            key_norm = key.replace("-", "_")
             if key_norm in self.unsupported_actions:
                 action = self.unsupported_actions[key_norm]
                 msg = f"Unsupported config option '{key_norm}' with action '{action.__class__.__name__}'"
