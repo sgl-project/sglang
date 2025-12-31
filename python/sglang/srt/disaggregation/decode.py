@@ -340,7 +340,7 @@ class DecodePreallocQueue:
                 mgr=self.kv_manager,
                 bootstrap_addr=f"{req.bootstrap_host}:{req.bootstrap_port}",
                 bootstrap_room=req.bootstrap_room,
-                prefill_dp_rank=req.data_parallel_rank,
+                prefill_dp_rank=req.prefill_data_parallel_rank,
             )
 
             req.add_latency(RequestStage.DECODE_PREPARE)

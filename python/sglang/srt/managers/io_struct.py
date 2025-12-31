@@ -230,6 +230,7 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
 
     # For data parallel rank routing
     data_parallel_rank: Optional[int] = None
+    prefill_data_parallel_rank: Optional[int] = None
 
     # For background responses (OpenAI responses API)
     background: bool = False
@@ -655,6 +656,11 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
             data_parallel_rank=(
                 self.data_parallel_rank if self.data_parallel_rank is not None else None
             ),
+            prefill_data_parallel_rank=(
+                self.prefill_data_parallel_rank
+                if self.prefill_data_parallel_rank is not None
+                else None
+            ),
             conversation_id=self.conversation_id,
             priority=self.priority,
             extra_key=self.extra_key,
@@ -723,6 +729,7 @@ class TokenizedGenerateReqInput(BaseReq):
 
     # For data parallel rank routing
     data_parallel_rank: Optional[int] = None
+    prefill_data_parallel_rank: Optional[int] = None
 
     # Priority for the request
     priority: Optional[int] = None
