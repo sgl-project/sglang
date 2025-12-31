@@ -47,6 +47,8 @@ class FlashAttentionMetadata:
     window_size: tuple = (-1, -1)
     # Page table, the index of KV Cache Tables/Blocks
     page_table: torch.Tensor = None
+    # Page table for Sliding Window Attention
+    swa_page_table: torch.Tensor = None
 
     # Encoder metadata
     # Cumulative sequence lengths for encoder key
@@ -646,11 +648,24 @@ class FlashAttentionBackend(AttentionBackend):
                 ),
             ]
 
+        if self.has_swa and self.use_sliding_window_kv_pool:
+            metadata.swa_page_table = (
+                self.token_to_kv_pool.translate_loc_from_full_to_swa(
+                    metadata.page_table
+                )
+            )
+
         # Convert the page table to a strided format which is needed by FA3 API
         if self.page_size > 1:
             self.strided_indices = torch.arange(
                 0, metadata.page_table.shape[1], self.page_size, device=self.device
             )
+
+            if self.has_swa and self.use_sliding_window_kv_pool:
+                metadata.swa_page_table = (
+                    metadata.swa_page_table[:, self.strided_indices] // self.page_size
+                )
+
             metadata.page_table = (
                 metadata.page_table[:, self.strided_indices] // self.page_size
             )
@@ -800,9 +815,7 @@ class FlashAttentionBackend(AttentionBackend):
         else:
             page_table = metadata.page_table
             if is_swa_layer and self.use_sliding_window_kv_pool:
-                page_table = self.token_to_kv_pool.translate_loc_from_full_to_swa(
-                    page_table
-                )
+                page_table = metadata.swa_page_table
             cu_seqlens_q = metadata.cu_seqlens_q
             cache_seqlens = metadata.cache_seqlens_int32
             max_seqlen_q = metadata.max_seq_len_q
@@ -1155,9 +1168,7 @@ class FlashAttentionBackend(AttentionBackend):
             else:
                 page_table = metadata.page_table
                 if is_swa_layer and self.use_sliding_window_kv_pool:
-                    page_table = self.token_to_kv_pool.translate_loc_from_full_to_swa(
-                        page_table
-                    )
+                    page_table = metadata.swa_page_table
                 cache_seqlens = metadata.cache_seqlens_int32
                 cu_seqlens_k = metadata.cu_seqlens_k
                 max_seqlen_q = metadata.max_seq_len_q
