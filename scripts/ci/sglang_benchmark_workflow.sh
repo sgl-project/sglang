@@ -47,10 +47,11 @@ if [[ "${TYPE}" == "launch" ]]; then
             --disable-radix-cache \
             --max-prefill-tokens 32768 \
             --cuda-graph-max-bs 128 \
-            --page-size 16 \
+            --page-size 1024 \
             --mm-attention-backend aiter_attn \
             --mm-enable-dp-encoder \
             --enable-aiter-allreduce-fusion \
+            --kv-cache-dtype fp8_e4m3 \
             --mm-processor-kwargs '{"max_pixels": 1638400, "min_pixels": 740}' \
             --watchdog-timeout 1200 &
         sglang_pid=$!
@@ -69,9 +70,10 @@ if [[ "${TYPE}" == "launch" ]]; then
             --disable-radix-cache \
             --max-prefill-tokens 32768 \
             --cuda-graph-max-bs 256 \
-            --page-size 64 \
+            --page-size 1024 \
             --attention-backend triton \
             --max-running-requests 128 \
+            --kv-cache-dtype fp8_e4m3 \
             --watchdog-timeout 1200 &
         sglang_pid=$!
     elif [[ "${model_name}" == "Qwen3-Omni" ]]; then
@@ -104,8 +106,9 @@ if [[ "${TYPE}" == "launch" ]]; then
             --disable-radix-cache \
             --max-prefill-tokens 32768 \
             --cuda-graph-max-bs 8 \
-            --page-size 32  \
+            --page-size 1024  \
             --mm-enable-dp-encoder \
+            --kv-cache-dtype fp8_e4m3 \
             --enable-aiter-allreduce-fusion \
             --max-running-requests 128 \
             --watchdog-timeout 1200 &
