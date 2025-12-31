@@ -625,6 +625,7 @@ mod tests {
                 &prefill_workers,
                 &SelectWorkerInfo {
                     request_text: Some(&*"a".repeat(33)),
+                    ..Default::default()
                 },
             )
             .unwrap();
@@ -634,6 +635,7 @@ mod tests {
                 &prefill_workers,
                 &SelectWorkerInfo {
                     request_text: Some(&*"a".repeat(34)),
+                    ..Default::default()
                 },
             )
             .unwrap();
@@ -642,6 +644,7 @@ mod tests {
                 &prefill_workers,
                 &SelectWorkerInfo {
                     request_text: Some(&*"a".repeat(34)),
+                    ..Default::default()
                 },
             )
             .unwrap();
@@ -675,6 +678,7 @@ mod tests {
                 &prefill_workers,
                 &SelectWorkerInfo {
                     request_text: Some(&*"a".repeat(33)),
+                    ..Default::default()
                 },
             )
             .unwrap();
@@ -683,6 +687,7 @@ mod tests {
                 &prefill_workers,
                 &SelectWorkerInfo {
                     request_text: Some(&*"a".repeat(33)),
+                    ..Default::default()
                 },
             )
             .unwrap();
@@ -691,6 +696,7 @@ mod tests {
                 &prefill_workers,
                 &SelectWorkerInfo {
                     request_text: Some(&*"a".repeat(33)),
+                    ..Default::default()
                 },
             )
             .unwrap();
@@ -714,6 +720,7 @@ mod tests {
                 &prefill_workers,
                 &SelectWorkerInfo {
                     request_text: Some(&*"a".repeat(20)),
+                    ..Default::default()
                 },
             )
             .unwrap(); // worker1: 20
@@ -722,6 +729,7 @@ mod tests {
                 &prefill_workers,
                 &SelectWorkerInfo {
                     request_text: Some(&*"a".repeat(8)),
+                    ..Default::default()
                 },
             )
             .unwrap(); // worker1: 8
@@ -732,6 +740,7 @@ mod tests {
                 &prefill_workers,
                 &SelectWorkerInfo {
                     request_text: Some("request"),
+                    ..Default::default()
                 },
             )
             .unwrap();
@@ -756,6 +765,7 @@ mod tests {
                 &prefill_workers,
                 &SelectWorkerInfo {
                     request_text: Some(&*"a".repeat(15)),
+                    ..Default::default()
                 },
             )
             .unwrap(); // worker1: 15
@@ -764,6 +774,7 @@ mod tests {
                 &prefill_workers,
                 &SelectWorkerInfo {
                     request_text: Some("short"),
+                    ..Default::default()
                 },
             )
             .unwrap(); // worker2: 5
@@ -772,6 +783,7 @@ mod tests {
                 &prefill_workers,
                 &SelectWorkerInfo {
                     request_text: Some(&*"a".repeat(10)),
+                    ..Default::default()
                 },
             )
             .unwrap(); // worker3: 10
@@ -782,6 +794,7 @@ mod tests {
                 &prefill_workers,
                 &SelectWorkerInfo {
                     request_text: Some("request"),
+                    ..Default::default()
                 },
             )
             .unwrap();
@@ -854,6 +867,7 @@ mod tests {
                 &prefill_workers,
                 &SelectWorkerInfo {
                     request_text: Some(&*"a".repeat(5)),
+                    ..Default::default()
                 },
             )
             .unwrap();
@@ -862,6 +876,7 @@ mod tests {
                 &prefill_workers,
                 &SelectWorkerInfo {
                     request_text: Some(&*"a".repeat(10)),
+                    ..Default::default()
                 },
             )
             .unwrap();
@@ -870,6 +885,7 @@ mod tests {
                 &prefill_workers,
                 &SelectWorkerInfo {
                     request_text: Some(&*"a".repeat(15)),
+                    ..Default::default()
                 },
             )
             .unwrap();
@@ -878,6 +894,7 @@ mod tests {
                 &prefill_workers,
                 &SelectWorkerInfo {
                     request_text: Some(&*"a".repeat(20)),
+                    ..Default::default()
                 },
             )
             .unwrap();
@@ -886,6 +903,7 @@ mod tests {
                 &prefill_workers,
                 &SelectWorkerInfo {
                     request_text: Some(&*"a".repeat(24)),
+                    ..Default::default()
                 },
             )
             .unwrap();
@@ -894,6 +912,7 @@ mod tests {
                 &prefill_workers,
                 &SelectWorkerInfo {
                     request_text: Some(&*"a".repeat(26)),
+                    ..Default::default()
                 },
             )
             .unwrap();
@@ -929,6 +948,7 @@ mod tests {
                 &prefill_workers,
                 &SelectWorkerInfo {
                     request_text: Some(&*"a".repeat(10)),
+                    ..Default::default()
                 },
             )
             .unwrap();
@@ -937,6 +957,7 @@ mod tests {
                 &prefill_workers,
                 &SelectWorkerInfo {
                     request_text: Some(&*"a".repeat(20)),
+                    ..Default::default()
                 },
             )
             .unwrap();
@@ -945,6 +966,7 @@ mod tests {
                 &prefill_workers,
                 &SelectWorkerInfo {
                     request_text: Some(&*"a".repeat(30)),
+                    ..Default::default()
                 },
             )
             .unwrap();
@@ -953,6 +975,7 @@ mod tests {
                 &prefill_workers,
                 &SelectWorkerInfo {
                     request_text: Some(&*"a".repeat(40)),
+                    ..Default::default()
                 },
             )
             .unwrap();
@@ -961,6 +984,7 @@ mod tests {
                 &prefill_workers,
                 &SelectWorkerInfo {
                     request_text: Some(&*"a".repeat(45)),
+                    ..Default::default()
                 },
             )
             .unwrap();
@@ -969,6 +993,7 @@ mod tests {
                 &prefill_workers,
                 &SelectWorkerInfo {
                     request_text: Some(&*"a".repeat(57)),
+                    ..Default::default()
                 },
             )
             .unwrap();
@@ -1059,6 +1084,7 @@ mod tests {
                 &prefill_workers,
                 &SelectWorkerInfo {
                     request_text: Some(&*"a".repeat(20)),
+                    ..Default::default()
                 },
             )
             .unwrap();
@@ -1091,6 +1117,7 @@ mod tests {
                 &prefill_workers,
                 &SelectWorkerInfo {
                     request_text: Some(&*"a".repeat(7)),
+                    ..Default::default()
                 },
             )
             .unwrap();
@@ -1179,6 +1206,7 @@ mod tests {
                 &prefill_workers,
                 &SelectWorkerInfo {
                     request_text: Some(&*"a".repeat(5)),
+                    ..Default::default()
                 },
             )
             .unwrap();
@@ -1187,6 +1215,7 @@ mod tests {
                 &prefill_workers,
                 &SelectWorkerInfo {
                     request_text: Some(&*"a".repeat(10)),
+                    ..Default::default()
                 },
             )
             .unwrap();
@@ -1195,6 +1224,7 @@ mod tests {
                 &prefill_workers,
                 &SelectWorkerInfo {
                     request_text: Some(&*"a".repeat(15)),
+                    ..Default::default()
                 },
             )
             .unwrap();
@@ -1203,6 +1233,7 @@ mod tests {
                 &prefill_workers,
                 &SelectWorkerInfo {
                     request_text: Some(&*"a".repeat(20)),
+                    ..Default::default()
                 },
             )
             .unwrap();
@@ -1211,6 +1242,7 @@ mod tests {
                 &prefill_workers,
                 &SelectWorkerInfo {
                     request_text: Some(&*"a".repeat(24)),
+                    ..Default::default()
                 },
             )
             .unwrap();
@@ -1219,6 +1251,7 @@ mod tests {
                 &prefill_workers,
                 &SelectWorkerInfo {
                     request_text: Some(&*"a".repeat(26)),
+                    ..Default::default()
                 },
             )
             .unwrap();
@@ -1251,6 +1284,7 @@ mod tests {
                 &prefill_workers,
                 &SelectWorkerInfo {
                     request_text: Some(&*"a".repeat(10)),
+                    ..Default::default()
                 },
             )
             .unwrap();
@@ -1259,6 +1293,7 @@ mod tests {
                 &prefill_workers,
                 &SelectWorkerInfo {
                     request_text: Some(&*"a".repeat(20)),
+                    ..Default::default()
                 },
             )
             .unwrap();
@@ -1267,6 +1302,7 @@ mod tests {
                 &prefill_workers,
                 &SelectWorkerInfo {
                     request_text: Some(&*"a".repeat(30)),
+                    ..Default::default()
                 },
             )
             .unwrap();
@@ -1275,6 +1311,7 @@ mod tests {
                 &prefill_workers,
                 &SelectWorkerInfo {
                     request_text: Some(&*"a".repeat(32)),
+                    ..Default::default()
                 },
             )
             .unwrap();
@@ -1283,6 +1320,7 @@ mod tests {
                 &prefill_workers,
                 &SelectWorkerInfo {
                     request_text: Some(&*"a".repeat(45)),
+                    ..Default::default()
                 },
             )
             .unwrap();
@@ -1291,6 +1329,7 @@ mod tests {
                 &prefill_workers,
                 &SelectWorkerInfo {
                     request_text: Some(&*"a".repeat(55)),
+                    ..Default::default()
                 },
             )
             .unwrap();

@@ -58,7 +58,6 @@ suites = {
         TestFile("test_constrained_decoding.py", 111),
         TestFile("test_eval_fp8_accuracy.py", 250),
         TestFile("test_external_models.py", 30),
-        TestFile("test_flashmla.py", 230),
         TestFile("test_fp8_utils.py", 9),
         TestFile("rotary_embedding/test_mrope.py", 10),
         TestFile("test_fused_moe.py", 80),
@@ -71,11 +70,6 @@ suites = {
         TestFile("test_mamba_unittest.py", 9),
         TestFile("test_metrics.py", 32),
         TestFile("test_metrics_utils.py", 1),
-        TestFile("test_mla.py", 194),
-        TestFile("test_mla_deepseek_v3.py", 442),
-        TestFile("test_mla_flashinfer.py", 302),
-        TestFile("test_mla_fp8.py", 77),
-        TestFile("test_mla_int8_deepseek_v3.py", 300),
         TestFile("test_model_hooks.py", 6),
         TestFile("test_modelopt_loader.py", 11),
         TestFile("test_multi_tokenizer.py", 230),
@@ -92,11 +86,9 @@ suites = {
         TestFile("test_retract_decode.py", 259),
         TestFile("test_score_api.py", 260),
         TestFile("test_server_args.py", 9),
-        TestFile("test_speculative_registry.py", 8),
         TestFile("test_skip_tokenizer_init.py", 77),
         TestFile("test_srt_endpoint.py", 127),
         TestFile("test_srt_engine.py", 252),
-        TestFile("test_standalone_speculative_decoding.py", 150),
         TestFile("test_start_profile.py", 41),
         TestFile("test_profile_merger.py", 8),
         TestFile("test_profile_merger_http_api.py", 9),
@@ -122,13 +114,11 @@ suites = {
         TestFile("models/test_glm4_moe_models.py", 100),
         TestFile("models/test_kimi_linear_models.py", 90),
         TestFile("rl/test_update_weights_from_distributed.py", 103),
-        TestFile("test_constrained_decoding_spec_reasoning.py", 60),
         TestFile("test_data_parallelism.py", 73),
         TestFile("test_disaggregation_basic.py", 400),
         TestFile("test_dp_attention.py", 350),
         TestFile("test_load_weights_from_remote_instance.py", 72),
         TestFile("test_patch_torch.py", 19),
-        TestFile("test_eagle_dp_attention.py", 200),
     ],
     "per-commit-4-gpu": [
         TestFile("models/test_qwen3_next_models.py", 650),
@@ -145,6 +135,7 @@ suites = {
         TestFile("models/test_kimi_k2_models.py", 200),
         TestFile("test_deepseek_v32_basic.py", 275),
         TestFile("test_deepseek_v32_mtp.py", 275),
+        TestFile("models/test_mimo_models.py", 200),
     ],
     "per-commit-8-gpu-h20": [
         TestFile("quant/test_w4a8_deepseek_v3.py", 520),
@@ -157,7 +148,6 @@ suites = {
         TestFile("test_fp8_blockwise_gemm.py", 280),
         TestFile("test_gpt_oss_4gpu.py", 700),
         TestFile("test_llama31_fp4.py", 90),
-        TestFile("test_eagle_infer_beta_dp_attention.py", 300),
     ],
     # "per-commit-8-gpu-b200": [
     #     TestFile("test_mistral_large3_basic.py", 275),  # Moved to nightly - large model
@@ -247,8 +237,6 @@ suite_amd = {
         TestFile("test_jinja_template_utils.py", 1),
         TestFile("test_metrics.py", 32),
         TestFile("test_metrics_utils.py", 1),
-        # TestFile("test_mla.py", 242), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/13107
-        # TestFile("test_mla_deepseek_v3.py", 221), # Temporarily disabled, see https://github.com/sgl-project/sglang/issues/12574
         TestFile("test_no_chunked_prefill.py", 108),
         TestFile("test_page_size.py", 60),
         TestFile("test_penalty.py", 180),
@@ -275,7 +263,6 @@ suite_amd = {
     ],
     "per-commit-amd-mi35x": [
         TestFile("test_gpt_oss_1gpu.py", 750),
-        TestFile("test_mla.py", 242),
     ],
     "per-commit-2-gpu-amd": [
         # TestFile("lora/test_lora_tp.py", 116), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/13107. Moved to test/registered/lora/
@@ -347,6 +334,7 @@ suite_ascend = {
         TestFile("ascend/test_ascend_sampling_backend.py", 400),
         TestFile("ascend/test_ascend_tp1_bf16.py", 400),
         TestFile("ascend/test_ascend_compile_graph_tp1_bf16.py", 400),
+        TestFile("test_embed_interpolate_unittest.py", 400),
     ],
     "per-commit-2-npu-a2": [
         TestFile("ascend/test_ascend_graph_tp2_bf16.py", 400),

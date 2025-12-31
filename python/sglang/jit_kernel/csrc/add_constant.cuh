@@ -53,8 +53,6 @@ void add_constant(tvm::ffi::TensorView dst, tvm::ffi::TensorView src) {
       static_cast<int32_t*>(dst.data_ptr()),
       static_cast<int32_t*>(src.data_ptr()),
       num_elements);
-  // You can also manually check the last CUDA error code via:
-  // RuntimeDeviceCheck();
 }
 
 }  // namespace

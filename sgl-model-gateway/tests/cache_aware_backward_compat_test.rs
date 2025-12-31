@@ -44,6 +44,7 @@ fn test_backward_compatibility_with_empty_model_id() {
         &workers,
         &SelectWorkerInfo {
             request_text: Some("test request"),
+            ..Default::default()
         },
     );
     assert!(selected.is_some(), "Should select a worker");
@@ -104,6 +105,7 @@ fn test_mixed_model_ids() {
         vec![Arc::new(worker1.clone()), Arc::new(worker3.clone())];
     let info = SelectWorkerInfo {
         request_text: Some("test request"),
+        ..Default::default()
     };
     let selected = policy.select_worker(&default_workers, &info);
     assert!(selected.is_some(), "Should select from default workers");
@@ -156,6 +158,7 @@ fn test_remove_worker_by_url_backward_compat() {
         &workers,
         &SelectWorkerInfo {
             request_text: Some("test"),
+            ..Default::default()
         },
     );
     assert_eq!(selected, Some(0), "Should only have worker2 left");
