@@ -377,8 +377,6 @@ class ServerArgs:
     # Data parallelism
     dp_size: int = 1
     load_balance_method: str = "auto"
-    # FIXME: remove this after dp rank scheduling is fully supported with PD-Disaggregation
-    prefill_round_robin_balance: bool = False
 
     # Multi-node distributed serving
     dist_init_addr: Optional[str] = None
@@ -1126,6 +1124,10 @@ class ServerArgs:
                     )
 
                     print_nsa_bool_env_vars()
+                if self.enable_nsa_prefill_context_parallel:
+                    assert (
+                        self.disaggregation_mode != "decode"
+                    ), "CP is only supported for prefill when PD disaggregation, please remove --enable-nsa-prefill-context-parallel."
 
             else:
                 # DeepSeek V3/R1/V3.1
@@ -2217,13 +2219,6 @@ class ServerArgs:
             self.disable_radix_cache = True
             logger.warning("KV cache is forced as chunk cache for decode server")
 
-            if self.dp_size > 1 and not is_in_ci():
-                assert self.prefill_round_robin_balance, (
-                    "Prefill round robin balance is required when dp size > 1. "
-                    "Please make sure that the prefill instance is launched with `--load-balance-method auto` "
-                    "or `--load-balance-method follow_bootstrap_room` "
-                    "and `--prefill-round-robin-balance` is set for decode server."
-                )
         elif self.disaggregation_mode == "prefill":
             if self.disaggregation_decode_tp is None:
                 self.disaggregation_decode_tp = self.tp_size
@@ -3220,9 +3215,8 @@ class ServerArgs:
         )
         parser.add_argument(
             "--prefill-round-robin-balance",
-            default=ServerArgs.prefill_round_robin_balance,
-            action="store_true",
-            help="Prefill is round robin balanced. This is used to promise decode server can get the correct dp rank.",
+            action=DeprecatedAction,
+            help="Note: --prefill-round-robin-balance is deprecated now.",
         )
 
         # Multi-node distributed serving
@@ -5169,6 +5163,10 @@ class LoRAPathAction(argparse.Action):
         setattr(namespace, self.dest, lora_paths)
 
 
+def print_deprecated_warning(message: str):
+    logger.warning(f"\033[1;33m{message}\033[0m")
+
+
 class DeprecatedAction(argparse.Action):
     def __init__(self, option_strings, dest, nargs=0, **kwargs):
         super(DeprecatedAction, self).__init__(
@@ -5176,11 +5174,9 @@ class DeprecatedAction(argparse.Action):
         )
 
     def __call__(self, parser, namespace, values, option_string=None):
-        raise ValueError(self.help)
-
-
-def print_deprecated_warning(message: str):
-    logger.warning(f"\033[33m{message}\033[0m")
+        print_deprecated_warning(
+            f"The command line argument '{option_string}' is deprecated and will be removed in future versions."
+        )
 
 
 def auto_choose_speculative_params(self: ServerArgs):
