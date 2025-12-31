@@ -455,6 +455,7 @@ class WarmupRunner:
         model: str,
         prompt: str,
         output_size: str,
+        output_format: str = None,
     ):
         self.client = OpenAI(
             api_key="sglang-anything",
@@ -463,6 +464,7 @@ class WarmupRunner:
         self.model = model
         self.prompt = prompt
         self.output_size = output_size
+        self.output_format = output_format
 
     def run_text_warmups(self, count: int) -> None:
         """Run text-to-image warmup requests."""
@@ -511,6 +513,7 @@ class WarmupRunner:
                     n=1,
                     size=self.output_size,
                     response_format="b64_json",
+                    output_format=self.output_format,
                 )
             finally:
                 for img in images:
@@ -718,6 +721,7 @@ def get_generate_fn(
     """Return appropriate generation function for the case."""
     # Allow override via environment variable (useful for AMD where large resolutions cause slow VAE)
     output_size = os.environ.get("SGLANG_TEST_OUTPUT_SIZE", sampling_params.output_size)
+    n = sampling_params.num_outputs_per_prompt
 
     def _create_and_download_video(
         client,
@@ -837,7 +841,7 @@ def get_generate_fn(
         response = client.images.with_raw_response.generate(
             model=model_path,
             prompt=sampling_params.prompt,
-            n=1,
+            n=n,
             size=output_size,
             response_format="b64_json",
         )
@@ -897,7 +901,9 @@ def get_generate_fn(
         image_paths = new_image_paths
 
         # Request parameters that affect output format
-        req_output_format = None  # Not specified in current request
+        req_output_format = (
+            sampling_params.output_format
+        )  # Not specified in current request
         req_background = None  # Not specified in current request
 
         images = [open(image_path, "rb") for image_path in image_paths]
@@ -906,9 +912,11 @@ def get_generate_fn(
                 model=model_path,
                 image=images,
                 prompt=sampling_params.prompt,
-                n=1,
+                n=n,
                 size=output_size,
                 response_format="b64_json",
+                output_format=req_output_format,
+                extra_body={"num_frames": sampling_params.num_frames},
             )
         finally:
             for img in images:
@@ -953,7 +961,6 @@ def get_generate_fn(
         """TI2I: Text + Image ? Image edit using direct URL transfer (no pre-download)."""
         if not sampling_params.prompt or not sampling_params.image_path:
             pytest.skip(f"{id}: no edit config")
-
         # Handle both single URL and list of URLs
         image_urls = sampling_params.image_path
         if not isinstance(image_urls, list):
@@ -967,17 +974,20 @@ def get_generate_fn(
                 )
 
         # Request parameters that affect output format
-        req_output_format = None  # Not specified in current request
+        req_output_format = (
+            sampling_params.output_format
+        )  # Not specified in current request
         req_background = None  # Not specified in current request
 
         response = client.images.with_raw_response.edit(
             model=model_path,
             prompt=sampling_params.prompt,
             image=[],  # Only for OpenAI verification
-            n=1,
+            n=n,
             size=sampling_params.output_size,
             response_format="b64_json",
-            extra_body={"url": image_urls},
+            output_format=req_output_format,
+            extra_body={"url": image_urls, "num_frames": sampling_params.num_frames},
         )
 
         result = response.parse()

@@ -77,6 +77,7 @@ class DiffGenerator:
     @classmethod
     def from_pretrained(
         cls,
+        local_mode: bool = True,
         **kwargs,
     ) -> "DiffGenerator":
         """
@@ -100,10 +101,12 @@ class DiffGenerator:
         else:
             server_args = ServerArgs.from_kwargs(**kwargs)
 
-        return cls.from_server_args(server_args)
+        return cls.from_server_args(server_args, local_mode=local_mode)
 
     @classmethod
-    def from_server_args(cls, server_args: ServerArgs) -> "DiffGenerator":
+    def from_server_args(
+        cls, server_args: ServerArgs, local_mode: bool = True
+    ) -> "DiffGenerator":
         """
         Create a DiffGenerator with the specified arguments.
 
@@ -116,9 +119,8 @@ class DiffGenerator:
         instance = cls(
             server_args=server_args,
         )
-        is_local_mode = server_args.is_local_mode
-        logger.info(f"Local mode: {is_local_mode}")
-        if is_local_mode:
+        logger.info(f"Local mode: {local_mode}")
+        if local_mode:
             instance.local_scheduler_process = instance._start_local_server_if_needed()
         else:
             # In remote mode, we just need to connect and check.
@@ -145,12 +147,12 @@ class DiffGenerator:
         if not sync_scheduler_client.ping():
             raise ConnectionError(
                 f"Could not connect to remote scheduler at "
-                f"{self.server_args.scheduler_endpoint()} with `local mode` as False. "
+                f"{self.server_args.scheduler_endpoint} with `local mode` as False. "
                 "Please ensure the server is running."
             )
         logger.info(
             f"Successfully connected to remote scheduler at "
-            f"{self.server_args.scheduler_endpoint()}."
+            f"{self.server_args.scheduler_endpoint}."
         )
 
     def generate(

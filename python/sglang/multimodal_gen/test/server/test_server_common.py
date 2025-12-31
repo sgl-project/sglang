@@ -73,6 +73,9 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
     if server_args.ulysses_degree is not None:
         extra_args += f" --ulysses-degree {server_args.ulysses_degree}"
 
+    if server_args.dit_layerwise_offload:
+        extra_args += f" --dit-layerwise-offload true"
+
     if server_args.ring_degree is not None:
         extra_args += f" --ring-degree {server_args.ring_degree}"
 
@@ -100,6 +103,7 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
             model=server_args.model_path,
             prompt=sampling_params.prompt or "A colorful raccoon icon",
             output_size=output_size,
+            output_format=sampling_params.output_format,
         )
         warmup.run_text_warmups(server_args.warmup_text)
 

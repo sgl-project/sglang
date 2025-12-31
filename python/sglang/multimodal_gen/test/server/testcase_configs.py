@@ -152,6 +152,8 @@ class DiffusionServerArgs:
     # LoRA
     lora_path: str | None = None  # LoRA adapter path (HF repo or local path)
 
+    dit_layerwise_offload: bool = False
+
 
 @dataclass(frozen=True)
 class DiffusionSamplingParams:
@@ -170,6 +172,11 @@ class DiffusionSamplingParams:
 
     # URL direct test flag - if True, don't pre-download URL images
     direct_url_test: bool = False
+
+    # output format
+    output_format: str | None = None  # "png", "jpeg", "mp4", etc.
+
+    num_outputs_per_prompt: int = 1
 
 
 @dataclass(frozen=True)
@@ -265,6 +272,15 @@ MULTI_IMAGE_TI2I_sampling_params = DiffusionSamplingParams(
     ],
     direct_url_test=True,
 )
+MULTI_FRAME_I2I_sampling_params = DiffusionSamplingParams(
+    prompt="a high quality, cute halloween themed illustration, consistent style and lighting",
+    image_path=[
+        "https://raw.githubusercontent.com/QwenLM/Qwen-Image-Layered/main/assets/test_images/4.png"
+    ],
+    num_frames=4,
+    direct_url_test=True,
+    output_format="png",
+)
 
 T2V_PROMPT = "A curious raccoon"
 
@@ -308,6 +324,19 @@ ONE_GPU_CASES_A: list[DiffusionTestCase] = [
         ),
         T2I_sampling_params,
     ),
+    # TODO: replace with a faster model to test the --dit-layerwise-offload
+    # TODO: currently, we don't support sending more than one request in test, and setting `num_outputs_per_prompt` to 2 doesn't guarantee the denoising be executed twice,
+    # so we do one warmup and send one request instead
+    DiffusionTestCase(
+        "flux_2_image_t2i_layerwise_offload",
+        DiffusionServerArgs(
+            model_path="black-forest-labs/FLUX.2-dev",
+            modality="image",
+            dit_layerwise_offload=True,
+            warmup_text=1,
+        ),
+        T2I_sampling_params,
+    ),
     DiffusionTestCase(
         "zimage_image_t2i",
         DiffusionServerArgs(
@@ -338,6 +367,16 @@ ONE_GPU_CASES_A: list[DiffusionTestCase] = [
             warmup_edit=1,
         ),
         MULTI_IMAGE_TI2I_sampling_params,
+    ),
+    DiffusionTestCase(
+        "qwen_image_layered_i2i",
+        DiffusionServerArgs(
+            model_path="Qwen/Qwen-Image-Layered",
+            modality="image",
+            warmup_text=0,
+            warmup_edit=1,
+        ),
+        MULTI_FRAME_I2I_sampling_params,
     ),
 ]
 

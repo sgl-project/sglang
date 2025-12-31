@@ -16,11 +16,11 @@ Usage:
     # Image
     t2i:
     python3 -m sglang.multimodal_gen.benchmarks.bench_serving \
-         --backend sglang-image --dataset vbench --task t2v --num-prompts 20
+         --backend sglang-image --dataset vbench --task t2i --num-prompts 20
 
-    i2v:
+    ti2i(edit):
     python3 -m sglang.multimodal_gen.benchmarks.bench_serving \
-         --backend sglang-image --dataset vbench --task i2v --num-prompts 20
+         --backend sglang-image --dataset vbench --task ti2i --num-prompts 20
 
 
 """
@@ -100,7 +100,7 @@ class VBenchDataset(BaseDataset):
         self.items = self._load_data()
 
     def _load_data(self) -> List[Dict[str, Any]]:
-        if self.args.task == "t2v":
+        if self.args.task == "t2v" or self.args.task == "t2i":
             return self._load_t2v_prompts()
         elif self.args.task in ["i2v", "ti2v", "ti2i"]:
             return self._load_i2v_data()
@@ -427,7 +427,6 @@ async def async_request_video_sglang(
 
     # 1. Submit Job
     job_id = None
-
     # Check if we need to upload images (Multipart) or just send JSON
     if input.image_paths and len(input.image_paths) > 0:
         # Use multipart/form-data
@@ -596,7 +595,7 @@ def calculate_metrics(outputs: List[RequestFuncOutput], total_duration: float):
     return metrics
 
 
-def wait_for_service(base_url: str, timeout: int = 120) -> None:
+def wait_for_service(base_url: str, timeout: int = 1200) -> None:
     print(f"Waiting for service at {base_url}...")
     start_time = time.time()
     while True:
@@ -638,12 +637,18 @@ async def benchmark(args):
 
     # Setup dataset
     if args.backend == "sglang-image":
-        if args.task == "i2v":
+        if args.task not in ["ti2i", "t2i"]:
+            raise Exception("sglang-image backend only support ti2i and t2i tasks.")
+        if args.task == "ti2i":
             api_url = f"{args.base_url}/v1/images/edits"
         else:
             api_url = f"{args.base_url}/v1/images/generations"
         request_func = async_request_image_sglang
     elif args.backend == "sglang-video":
+        if args.task not in ["t2v", "i2v", "ti2v"]:
+            raise Exception(
+                "sglang-video backend only support t2v, i2v and ti2v tasks."
+            )
         api_url = f"{args.base_url}/v1/videos"
         request_func = async_request_video_sglang
     else:
@@ -750,7 +755,7 @@ async def benchmark(args):
             )
         )
 
-    print("\n" + "=" * 60)
+    print("=" * 60)
 
     if args.output_file:
         with open(args.output_file, "w") as f:
@@ -789,8 +794,8 @@ if __name__ == "__main__":
         "--task",
         type=str,
         default="t2v",
-        choices=["t2v", "i2v", "ti2v", "ti2i"],
-        help="Task type.",
+        choices=["t2v", "i2v", "ti2v", "ti2i", "t2i"],
+        help="Task type. t2v, i2v, ti2v are used for video generation. ti2i, t2i are used for image generation. ti2i is image edit task and t2i is image generation task.",
     )
     parser.add_argument(
         "--dataset-path",
