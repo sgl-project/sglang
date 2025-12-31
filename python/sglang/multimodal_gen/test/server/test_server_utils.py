@@ -455,6 +455,7 @@ class WarmupRunner:
         model: str,
         prompt: str,
         output_size: str,
+        output_format: str = None,
     ):
         self.client = OpenAI(
             api_key="sglang-anything",
@@ -463,6 +464,7 @@ class WarmupRunner:
         self.model = model
         self.prompt = prompt
         self.output_size = output_size
+        self.output_format = output_format
 
     def run_text_warmups(self, count: int) -> None:
         """Run text-to-image warmup requests."""
@@ -511,6 +513,7 @@ class WarmupRunner:
                     n=1,
                     size=self.output_size,
                     response_format="b64_json",
+                    output_format=self.output_format,
                 )
             finally:
                 for img in images:
@@ -898,7 +901,9 @@ def get_generate_fn(
         image_paths = new_image_paths
 
         # Request parameters that affect output format
-        req_output_format = None  # Not specified in current request
+        req_output_format = (
+            sampling_params.output_format
+        )  # Not specified in current request
         req_background = None  # Not specified in current request
 
         images = [open(image_path, "rb") for image_path in image_paths]
@@ -910,6 +915,8 @@ def get_generate_fn(
                 n=n,
                 size=output_size,
                 response_format="b64_json",
+                output_format=req_output_format,
+                extra_body={"num_frames": sampling_params.num_frames},
             )
         finally:
             for img in images:
@@ -954,7 +961,6 @@ def get_generate_fn(
         """TI2I: Text + Image ? Image edit using direct URL transfer (no pre-download)."""
         if not sampling_params.prompt or not sampling_params.image_path:
             pytest.skip(f"{id}: no edit config")
-
         # Handle both single URL and list of URLs
         image_urls = sampling_params.image_path
         if not isinstance(image_urls, list):
@@ -968,7 +974,9 @@ def get_generate_fn(
                 )
 
         # Request parameters that affect output format
-        req_output_format = None  # Not specified in current request
+        req_output_format = (
+            sampling_params.output_format
+        )  # Not specified in current request
         req_background = None  # Not specified in current request
 
         response = client.images.with_raw_response.edit(
@@ -978,7 +986,8 @@ def get_generate_fn(
             n=n,
             size=sampling_params.output_size,
             response_format="b64_json",
-            extra_body={"url": image_urls},
+            output_format=req_output_format,
+            extra_body={"url": image_urls, "num_frames": sampling_params.num_frames},
         )
 
         result = response.parse()
