@@ -106,12 +106,17 @@ def collect_test_items(files, filter_expr=None):
             f"pytest --collect-only failed with exit code {result.returncode}\n"
             f"Command: {' '.join(cmd)}\n"
         )
+
+        should_rerun = "FileNotFoundError" in result.stderr
+
         if result.stderr:
             error_msg += f"stderr:\n{result.stderr}\n"
         if result.stdout:
             error_msg += f"stdout:\n{result.stdout}\n"
         logger.error(error_msg)
-        raise RuntimeError(error_msg)
+
+        if not should_rerun:
+            raise RuntimeError(error_msg)
 
     if result.returncode == 5:
         logger.info(
