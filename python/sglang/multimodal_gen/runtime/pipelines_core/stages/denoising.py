@@ -920,6 +920,16 @@ class DenoisingStage(PipelineStage):
         batch: Req,
         server_args: ServerArgs,
     ) -> Req:
+        """
+        Run the denoising loop.
+
+        Args:
+            batch: The current batch information.
+            server_args: The inference arguments.
+
+        Returns:
+            The batch with denoised latents.
+        """
         # Prepare variables for the denoising loop
 
         prepared_vars = self._prepare_denoising_loop(batch, server_args)
@@ -956,16 +966,11 @@ class DenoisingStage(PipelineStage):
             dtype=target_dtype,
             enabled=autocast_enabled,
         ):
-            disable_tqdm = is_warmup
             with self.progress_bar(total=num_inference_steps) as progress_bar:
-                if disable_tqdm:
-                    progress_bar.disable = True
-
                 for i, t_host in enumerate(timesteps_cpu):
-                    step_name = (
-                        f"denoising_step_{i}" if not is_warmup else f"warmup_step_{i}"
-                    )
-                    with StageProfiler(step_name, logger=logger, timings=batch.timings,
+                    with StageProfiler(
+                        f"denoising_step_{i}", logger=logger, timings=batch.timings
+                    ,
                         perf_dump_path_provided=batch.perf_dump_path is not None,
                     ):
                         t_int = int(t_host.item())
