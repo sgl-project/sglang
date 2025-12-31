@@ -1324,3 +1324,94 @@ def narrow_padded_param_and_loaded_weight(
     param_data = param_data.narrow(dim, param_data_start, actual_shard_size)
 
     return param_data, loaded_weight
+
+
+def validate_loaded_weights(
+    model: torch.nn.Module,
+    loaded_param_names: set,
+    logger: logging.Logger,
+    strict: bool = False,
+) -> None:
+    """Validate that all model parameters were loaded from the checkpoint.
+
+    This function checks for parameters that exist in the model but were not
+    loaded from the checkpoint, which would leave them with random initialization
+    values and cause incorrect model behavior.
+
+    Args:
+        model: The model whose weights were loaded
+        loaded_param_names: Set of parameter names that were successfully loaded
+        logger: Logger instance for warnings/errors
+        strict: If True, raise an error on missing weights. If False, only warn.
+
+    Raises:
+        ValueError: If strict=True and missing weights are detected
+    """
+    from sglang.srt.layers.utils import PPMissingLayer
+
+    # Get all model parameters
+    all_params = dict(model.named_parameters())
+    all_buffers = dict(model.named_buffers())
+
+    # Parameters that are expected to be missing (not loaded from checkpoint)
+    expected_missing = set()
+
+    # 1. Computed/derived parameters (rotary embeddings, etc.)
+    computed_param_patterns = [
+        "rotary_emb.inv_freq",
+        "rotary_emb.cos_cached",
+        "rotary_emb.sin_cached",
+        "rotary_emb.cos_sin_cache",
+        "projector",  # Vision projectors are sometimes computed
+    ]
+
+    for param_name in all_params:
+        if any(pattern in param_name for pattern in computed_param_patterns):
+            expected_missing.add(param_name)
+
+    # 2. Non-persistent buffers (registered with persistent=False)
+    # These appear in named_buffers() but not in state_dict()
+    for buffer_name in all_buffers:
+        if buffer_name in all_params:  # It's tracked as a param but shouldn't be loaded
+            expected_missing.add(buffer_name)
+
+    # 3. Tied weights (lm_head.weight tied to embed_tokens.weight)
+    config = getattr(model, "config", None)
+    if config and getattr(config, "tie_word_embeddings", False):
+        for param_name in all_params:
+            if "lm_head.weight" in param_name:
+                expected_missing.add(param_name)
+
+    # 4. Pipeline parallelism missing layers
+    for module_name, module in model.named_modules():
+        if isinstance(module, PPMissingLayer):
+            # All params under this module are expected to be missing
+            for param_name in all_params:
+                if param_name.startswith(module_name):
+                    expected_missing.add(param_name)
+
+    # Calculate truly missing parameters
+    missing_params = set(all_params.keys()) - loaded_param_names - expected_missing
+
+    if missing_params:
+        missing_list = sorted(missing_params)
+        message = (
+            f"Weight loading validation failed! {len(missing_params)} parameters "
+            f"exist in the model but were not loaded from checkpoint.\n"
+            f"These parameters will have random values and cause incorrect outputs:\n"
+            f"{missing_list[:10]}"  # Show first 10
+        )
+        if len(missing_list) > 10:
+            message += f"\n... and {len(missing_list) - 10} more"
+
+        message += (
+            f"\n\nThis usually indicates:\n"
+            f"1. Model architecture doesn't match checkpoint (config.json mismatch)\n"
+            f"2. Checkpoint is incomplete or from different model version\n"
+            f"3. Custom model class has parameters not in HuggingFace format"
+        )
+
+        if strict:
+            raise ValueError(message)
+        else:
+            logger.warning(message)

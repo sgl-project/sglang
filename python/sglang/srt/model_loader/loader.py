@@ -643,7 +643,39 @@ class DefaultModelLoader(BaseModelLoader):
 
     @staticmethod
     def load_weights_and_postprocess(model, weights, target_device):
-        model.load_weights(weights)
+        from sglang.srt.model_loader.weight_utils import validate_loaded_weights
+
+        # Track which parameters get loaded by wrapping the iterator
+        loaded_param_names = set()
+
+        def tracking_iterator(weights_iter):
+            """Wrapper that tracks weight names from the checkpoint."""
+            params_dict = dict(model.named_parameters())
+
+            for name, tensor in weights_iter:
+                # Map checkpoint weight names to actual model parameter names
+                # This handles renaming (e.g., q_proj->qkv_proj)
+                if name in params_dict:
+                    loaded_param_names.add(name)
+                # Also check for fused param mappings
+                # (checkpoint has q_proj, model has qkv_proj)
+                for param_name in params_dict:
+                    if any(part in name for part in ["q_proj", "k_proj", "v_proj"]):
+                        if "qkv_proj" in param_name and param_name.replace("qkv_proj", "").strip(".") in name:
+                            loaded_param_names.add(param_name)
+                    if any(part in name for part in ["gate_proj", "up_proj"]):
+                        if "gate_up_proj" in param_name and param_name.replace("gate_up_proj", "").strip(".") in name:
+                            loaded_param_names.add(param_name)
+
+                yield name, tensor
+
+        # Load weights with tracking
+        model.load_weights(tracking_iterator(weights))
+
+        # Validate that all required parameters were loaded
+        # Check environment variable for strict mode
+        strict_mode = os.getenv("SGLANG_STRICT_WEIGHT_LOADING", "0") == "1"
+        validate_loaded_weights(model, loaded_param_names, logger, strict=strict_mode)
 
         for _, module in model.named_modules():
             quant_method = getattr(module, "quant_method", None)
