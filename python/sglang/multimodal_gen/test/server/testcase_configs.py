@@ -173,6 +173,9 @@ class DiffusionSamplingParams:
     # URL direct test flag - if True, don't pre-download URL images
     direct_url_test: bool = False
 
+    # output format
+    output_format: str | None = None  # "png", "jpeg", "mp4", etc.
+
     num_outputs_per_prompt: int = 1
 
 
@@ -269,6 +272,15 @@ MULTI_IMAGE_TI2I_sampling_params = DiffusionSamplingParams(
     ],
     direct_url_test=True,
 )
+MULTI_FRAME_I2I_sampling_params = DiffusionSamplingParams(
+    prompt="a high quality, cute halloween themed illustration, consistent style and lighting",
+    image_path=[
+        "https://raw.githubusercontent.com/QwenLM/Qwen-Image-Layered/main/assets/test_images/4.png"
+    ],
+    num_frames=4,
+    direct_url_test=True,
+    output_format="png",
+)
 
 T2V_PROMPT = "A curious raccoon"
 
@@ -355,6 +367,16 @@ ONE_GPU_CASES_A: list[DiffusionTestCase] = [
             warmup_edit=1,
         ),
         MULTI_IMAGE_TI2I_sampling_params,
+    ),
+    DiffusionTestCase(
+        "qwen_image_layered_i2i",
+        DiffusionServerArgs(
+            model_path="Qwen/Qwen-Image-Layered",
+            modality="image",
+            warmup_text=0,
+            warmup_edit=1,
+        ),
+        MULTI_FRAME_I2I_sampling_params,
     ),
 ]
 
