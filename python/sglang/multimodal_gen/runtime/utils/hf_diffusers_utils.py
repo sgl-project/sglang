@@ -19,25 +19,29 @@
 """Utilities for Huggingface Transformers."""
 
 import contextlib
-import hashlib
 import json
 import os
-import tempfile
+import time
+from functools import reduce
 from pathlib import Path
 from typing import Any, Optional, cast
 
-import filelock
 from diffusers.loaders.lora_base import (
     _best_guess_weight_name,  # watch out for potetential removal from diffusers
 )
 from huggingface_hub import snapshot_download
+from huggingface_hub.errors import (
+    LocalEntryNotFoundError,
+    RepositoryNotFoundError,
+    RevisionNotFoundError,
+)
+from requests.exceptions import ConnectionError as RequestsConnectionError
+from requests.exceptions import RequestException
 from transformers import AutoConfig, PretrainedConfig
 from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_NAMES
 
-from sglang.multimodal_gen.runtime.utils.logging_utils import (
-    init_logger,
-    suppress_other_loggers,
-)
+from sglang.multimodal_gen.runtime.loader.weight_utils import get_lock
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 _CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = {
@@ -60,24 +64,27 @@ def download_from_hf(model_path: str):
 
 
 def get_hf_config(
-    model: str,
+    component_model_path: str,
     trust_remote_code: bool,
     revision: str | None = None,
     model_override_args: dict | None = None,
     **kwargs,
-):
-    is_gguf = check_gguf_file(model)
+) -> PretrainedConfig:
+    is_gguf = check_gguf_file(component_model_path)
     if is_gguf:
         raise NotImplementedError("GGUF models are not supported.")
 
     config = AutoConfig.from_pretrained(
-        model, trust_remote_code=trust_remote_code, revision=revision, **kwargs
+        component_model_path,
+        trust_remote_code=trust_remote_code,
+        revision=revision,
+        **kwargs,
     )
     if config.model_type in _CONFIG_REGISTRY:
         config_class = _CONFIG_REGISTRY[config.model_type]
-        config = config_class.from_pretrained(model, revision=revision)
+        config = config_class.from_pretrained(component_model_path, revision=revision)
         # NOTE(HandH1998): Qwen2VL requires `_name_or_path` attribute in `config`.
-        config._name_or_path = model
+        config._name_or_path = component_model_path
     if model_override_args:
         config.update(model_override_args)
 
@@ -125,30 +132,39 @@ def load_dict(file_path):
         ) from e
 
 
-def get_diffusers_config(
-    model: str,
+def get_diffusers_component_config(
+    model_path: str,
 ) -> dict[str, Any]:
-    """Gets a configuration for the given diffusers model.
+    """Gets a configuration of a submodule for the given diffusers model.
 
     Args:
-        model: The model name or path.
+        model_path: the path of the submodule (can be local path or HuggingFace model ID)
 
     Returns:
         The loaded configuration.
     """
 
-    config_name = "config.json"
-    if "scheduler" in model:
-        config_name = "scheduler_config.json"
-    # Check if the model path exists
-    if os.path.exists(model):
-        config_file = os.path.join(model, config_name)
-        config_dict = load_dict(config_file)
-        generation_config_file = os.path.join(model, "generation_config.json")
-        generation_config_dict = load_dict(generation_config_file)
-        return config_dict | generation_config_dict
+    # Download from HuggingFace Hub if path doesn't exist locally
+    if not os.path.exists(model_path):
+        model_path = maybe_download_model(model_path)
+
+    # tokenizer
+    config_names = ["generation_config.json"]
+    # By default, we load config.json, but scheduler_config.json for scheduler
+    if "scheduler" in model_path:
+        config_names.append("scheduler_config.json")
     else:
-        raise RuntimeError(f"Diffusers config file not found at {model}")
+        config_names.append("config.json")
+
+    config_file_paths = [
+        os.path.join(model_path, config_name) for config_name in config_names
+    ]
+
+    combined_config = reduce(
+        lambda acc, path: acc | load_dict(path), config_file_paths, {}
+    )
+
+    return combined_config
 
 
 # Models don't use the same configuration key for determining the maximum
@@ -187,18 +203,6 @@ def check_gguf_file(model: str | os.PathLike) -> bool:
     return header == b"GGUF"
 
 
-def get_lock(model_name_or_path: str):
-    lock_dir = tempfile.gettempdir()
-    os.makedirs(os.path.dirname(lock_dir), exist_ok=True)
-    model_name = model_name_or_path.replace("/", "-")
-    hash_name = hashlib.sha256(model_name.encode()).hexdigest()
-    # add hash to avoid conflict with old users' lock files
-    lock_file_name = hash_name + model_name + ".lock"
-    # mode 0o666 is required for the filelock to be shared across users
-    lock = filelock.FileLock(os.path.join(lock_dir, lock_file_name), mode=0o666)
-    return lock
-
-
 def maybe_download_lora(
     model_name_or_path: str, local_dir: str | None = None, download: bool = True
 ) -> str:
@@ -212,11 +216,20 @@ def maybe_download_lora(
     Returns:
         Local path to the model
     """
+    allow_patterns = ["*.json", "*.safetensors", "*.bin"]
 
-    local_path = maybe_download_model(model_name_or_path, local_dir, download)
-    weight_name = _best_guess_weight_name(
-        model_name_or_path, file_extension=".safetensors"
+    local_path = maybe_download_model(
+        model_name_or_path,
+        local_dir,
+        download,
+        is_lora=True,
+        allow_patterns=allow_patterns,
     )
+    # return directly if local_path is a file
+    if os.path.isfile(local_path):
+        return local_path
+
+    weight_name = _best_guess_weight_name(local_path, file_extension=".safetensors")
     return os.path.join(local_path, weight_name)
 
 
@@ -349,7 +362,11 @@ def maybe_download_model_index(model_name_or_path: str) -> dict[str, Any]:
 
 
 def maybe_download_model(
-    model_name_or_path: str, local_dir: str | None = None, download: bool = True
+    model_name_or_path: str,
+    local_dir: str | None = None,
+    download: bool = True,
+    is_lora: bool = False,
+    allow_patterns: list[str] | None = None,
 ) -> str:
     """
     Check if the model path is a Hugging Face Hub model ID and download it if needed.
@@ -358,32 +375,147 @@ def maybe_download_model(
         model_name_or_path: Local path or Hugging Face Hub model ID
         local_dir: Local directory to save the model
         download: Whether to download the model from Hugging Face Hub
+        is_lora: If True, skip model completeness verification (LoRA models don't have transformer/vae directories)
 
     Returns:
         Local path to the model
     """
 
-    # If the path exists locally, return it
-    if os.path.exists(model_name_or_path):
-        logger.info("Model already exists locally")
-        return model_name_or_path
+    def _verify_model_complete(path: str) -> bool:
+        """Check if model directory has required subdirectories."""
+        transformer_dir = os.path.join(path, "transformer")
+        vae_dir = os.path.join(path, "vae")
+        config_path = os.path.join(path, "model_index.json")
+        return (
+            os.path.exists(config_path)
+            and os.path.exists(transformer_dir)
+            and os.path.exists(vae_dir)
+        )
 
-    # Otherwise, assume it's a HF Hub model ID and try to download it
+    # 1. Local path check: if path exists locally, verify it's complete (skip for LoRA)
+    if os.path.exists(model_name_or_path):
+        if is_lora or _verify_model_complete(model_name_or_path):
+            logger.info("Model already exists locally and is complete")
+            return model_name_or_path
+        else:
+            logger.warning(
+                "Local model at %s appears incomplete (missing transformer/ or vae/), "
+                "will attempt re-download",
+                model_name_or_path,
+            )
+
+    # 2. Cache-first strategy (Fast Path)
+    # Try to read from HF cache without network access
     try:
         logger.info(
-            "Downloading model snapshot from HF Hub for %s...", model_name_or_path
+            "Checking for cached model in HF Hub cache for %s...", model_name_or_path
         )
-        with get_lock(model_name_or_path).acquire(
-            poll_interval=2
-        ), suppress_other_loggers(not_suppress_on_main_rank=True):
-            local_path = snapshot_download(
-                repo_id=model_name_or_path,
-                ignore_patterns=["*.onnx", "*.msgpack"],
-                local_dir=local_dir,
+        local_path = snapshot_download(
+            repo_id=model_name_or_path,
+            ignore_patterns=["*.onnx", "*.msgpack"],
+            local_dir=local_dir,
+            local_files_only=True,
+            resume_download=True,
+            max_workers=8,
+            etag_timeout=60,
+        )
+        if is_lora or _verify_model_complete(local_path):
+            logger.info("Found complete model in cache at %s", local_path)
+            return str(local_path)
+        else:
+            # Model found in cache but incomplete
+            if not download:
+                raise ValueError(
+                    f"Model {model_name_or_path} found in cache but is incomplete and download=False."
+                )
+            logger.info(
+                "Model found in cache but incomplete, will download from HF Hub"
             )
-        logger.info("Downloaded model to %s", local_path)
-        return str(local_path)
+    except LocalEntryNotFoundError:
+        if not download:
+            raise ValueError(
+                f"Model {model_name_or_path} not found in local cache and download=False."
+            )
+        logger.info("Model not found in cache, will download from HF Hub")
     except Exception as e:
-        raise ValueError(
-            f"Could not find model at {model_name_or_path} and failed to download from HF Hub: {e}"
-        ) from e
+        logger.warning(
+            "Unexpected error while checking cache for %s: %s, will attempt download",
+            model_name_or_path,
+            e,
+        )
+        if not download:
+            raise ValueError(
+                f"Error checking cache for {model_name_or_path} and download=False: {e}"
+            ) from e
+
+    # 3. Download strategy (with retry mechanism)
+    MAX_RETRIES = 5
+    for attempt in range(MAX_RETRIES):
+        try:
+            logger.info(
+                "Downloading model snapshot from HF Hub for %s (attempt %d/%d)...",
+                model_name_or_path,
+                attempt + 1,
+                MAX_RETRIES,
+            )
+            with get_lock(model_name_or_path).acquire(poll_interval=2):
+                local_path = snapshot_download(
+                    repo_id=model_name_or_path,
+                    ignore_patterns=["*.onnx", "*.msgpack"],
+                    allow_patterns=allow_patterns,
+                    local_dir=local_dir,
+                    resume_download=True,
+                    max_workers=8,
+                    etag_timeout=120,
+                )
+
+            # Verify downloaded model is complete (skip for LoRA)
+            if not is_lora and not _verify_model_complete(local_path):
+                logger.warning(
+                    "Downloaded model at %s is incomplete, retrying with force_download=True",
+                    local_path,
+                )
+                with get_lock(model_name_or_path).acquire(poll_interval=2):
+                    local_path = snapshot_download(
+                        repo_id=model_name_or_path,
+                        ignore_patterns=["*.onnx", "*.msgpack"],
+                        local_dir=local_dir,
+                        resume_download=True,
+                        max_workers=8,
+                        etag_timeout=60,
+                        force_download=True,
+                    )
+                if not _verify_model_complete(local_path):
+                    raise ValueError(
+                        f"Downloaded model at {local_path} is still incomplete after forced re-download. "
+                        "The model repository may be missing required components (model_index.json, transformer/, or vae/)."
+                    )
+
+            logger.info("Downloaded model to %s", local_path)
+            return str(local_path)
+
+        except (RepositoryNotFoundError, RevisionNotFoundError) as e:
+            raise ValueError(
+                f"Model or revision not found at {model_name_or_path}. "
+                f"Please check the model ID or ensure you have access to the repository. Error: {e}"
+            ) from e
+        except (RequestException, RequestsConnectionError) as e:
+            if attempt == MAX_RETRIES - 1:
+                raise ValueError(
+                    f"Could not find model at {model_name_or_path} and failed to download from HF Hub "
+                    f"after {MAX_RETRIES} attempts due to network error: {e}"
+                ) from e
+            wait_time = 2**attempt
+            logger.warning(
+                "Download failed (attempt %d/%d) due to network error: %s. "
+                "Retrying in %d seconds...",
+                attempt + 1,
+                MAX_RETRIES,
+                e,
+                wait_time,
+            )
+            time.sleep(wait_time)
+        except Exception as e:
+            raise ValueError(
+                f"Could not find model at {model_name_or_path} and failed to download from HF Hub: {e}"
+            ) from e

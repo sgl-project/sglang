@@ -61,8 +61,9 @@ class ScheduleBatchDisaggregationDecodeMixin:
                     seq_len - pre_len == req.extend_input_len
                 ), f"seq_len={seq_len}, pre_len={pre_len}, req.extend_input_len={req.extend_input_len}"
 
-            req.cached_tokens += pre_len - req.already_computed
-            req.already_computed = seq_len
+            if not req.retracted_stain:
+                req.cached_tokens += pre_len - req.already_computed
+                req.already_computed = seq_len
             req.is_retracted = False
             pre_lens.append(pre_len)
             req.extend_logprob_start_len = 0
@@ -131,13 +132,13 @@ class ScheduleBatchDisaggregationDecodeMixin:
 
         # Simulate the eagle run.
         if self.spec_algorithm.is_eagle():
-
-            b = len(self.reqs)
-            topk = server_args.speculative_eagle_topk
+            num_states = server_args.speculative_eagle_topk
+            if server_args.enable_multi_layer_eagle:
+                num_states *= server_args.speculative_num_steps
             topk_p = torch.stack(
                 [
                     torch.as_tensor(
-                        req.output_topk_p[:topk],
+                        req.output_topk_p[:num_states],
                         device=self.device,
                         dtype=torch.float32,
                     )
@@ -148,7 +149,7 @@ class ScheduleBatchDisaggregationDecodeMixin:
             topk_index = torch.stack(
                 [
                     torch.as_tensor(
-                        req.output_topk_index[:topk],
+                        req.output_topk_index[:num_states],
                         device=self.device,
                         dtype=torch.int64,
                     )
@@ -169,7 +170,6 @@ class ScheduleBatchDisaggregationDecodeMixin:
                 hidden_states=hidden_states,
                 verified_id=self.output_ids,
                 new_seq_lens=self.seq_lens,
-                allocate_lens=self.seq_lens,
             )
             spec_info.prepare_for_extend(self)
             spec_info.capture_hidden_mode = CaptureHiddenMode.LAST

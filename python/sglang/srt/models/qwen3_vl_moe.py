@@ -22,6 +22,7 @@ import torch
 import torch.nn as nn
 
 from sglang.srt.configs.qwen3_vl import Qwen3VLMoeConfig, Qwen3VLMoeTextConfig
+from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
@@ -242,7 +243,7 @@ class Qwen3VLMoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                     param_name, weight_name, expert_id, shard_id = mapping
                     if weight_name not in name:
                         continue
-                    if "visual" in name:
+                    if "visual" in name or self.config.encoder_only:
                         continue
                     # Anyway, this is an expert weight and should not be
                     # attempted to load as other weights later
@@ -308,6 +309,12 @@ class Qwen3VLMoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                     if name.endswith(ignore_suffixes) and name not in params_dict:
                         continue
 
+                    # Skip loading mm/language parameters
+                    if (
+                        self.config.encoder_only or self.config.language_only
+                    ) and name not in params_dict:
+                        continue
+
                     if name in params_dict.keys():
                         param = params_dict[name]
                         weight_loader = getattr(
@@ -325,6 +332,14 @@ class Qwen3VLMoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
         #         for layer_id in range(self.start_layer, self.end_layer)
         #         if isinstance(self.model.layers[layer_id].mlp, Qwen3MoeSparseMoeBlock)
         #     }
+
+    @classmethod
+    def get_model_config_for_expert_location(cls, config):
+        return ModelConfigForExpertLocation(
+            num_layers=config.text_config.num_hidden_layers,
+            num_logical_experts=config.text_config.num_experts,
+            num_groups=None,
+        )
 
 
 EntryClass = Qwen3VLMoeForConditionalGeneration

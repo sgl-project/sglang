@@ -31,9 +31,15 @@ from transformers import (
 )
 
 from sglang.srt.entrypoints.engine import Engine
-from sglang.srt.utils import load_image
+from sglang.srt.model_loader.ci_weight_validation import ci_validate_and_clean_hf_cache
+from sglang.srt.utils import is_npu, load_image
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 from sglang.test.test_utils import DEFAULT_PORT_FOR_SRT_TEST_RUNNER, calculate_rouge_l
+
+if is_npu():
+    from sglang.srt.hardware_backend.npu.utils import init_npu_backend
+
+    init_npu_backend()
 
 DEFAULT_PROMPTS = [
     "Apple is red. Banana is Yellow. " * 800 + "Apple is",
@@ -72,6 +78,8 @@ def get_dtype_str(torch_dtype):
         return "float16"
     if torch_dtype is torch.float32:
         return "float32"
+    if torch_dtype is torch.bfloat16:
+        return "bfloat16"
     else:
         raise NotImplementedError()
 
@@ -244,6 +252,10 @@ class HFRunner:
         # Apply model-specific patches
         monkey_patch_gemma2_sdpa()
 
+        # Validate and clean corrupted files in HF cache (CI only)
+        # This is needed because HFRunner bypasses SGLang's weight validation
+        ci_validate_and_clean_hf_cache(model_path)
+
         # Load the model and tokenizer
         if self.model_type == "generation":
             config = AutoConfig.from_pretrained(
@@ -353,7 +365,7 @@ class HFRunner:
                     scores = []
                     for conv in prompts:
                         conv_formatted = self.tokenizer.apply_chat_template(
-                            conv, tokenize=False
+                            conv, tokenize=False, return_dict=False
                         )
                         conv_tokenized = self.tokenizer(
                             conv_formatted, return_tensors="pt"
@@ -429,6 +441,7 @@ class HFRunner:
                 )
             else:
                 model = base_model
+
             if patch_model_do_sample_false:
                 model.generation_config.do_sample = False
             outputs = model.generate(
@@ -448,6 +461,7 @@ class HFRunner:
             text = tokenizer.decode(
                 outputs[0][0][len(input_ids[0]) :], skip_special_tokens=True
             )
+
             # Check if the text is empty or only whitespace.
             if not text.strip():
                 raise ValueError(
