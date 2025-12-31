@@ -153,7 +153,7 @@ class DiffusionServerArgs:
     lora_path: str | None = None  # LoRA adapter path (HF repo or local path)
 
     dit_layerwise_offload: bool = False
-    enable_cache_dit: bool = False  # Enable SGLANG_CACHE_DIT_ENABLED env var
+    enable_cache_dit: bool = False
 
 
 @dataclass(frozen=True)
