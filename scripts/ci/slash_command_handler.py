@@ -216,7 +216,10 @@ def handle_rerun_stage(
             return False
 
         # Check if PR is from a fork by comparing repo owners
-        is_fork = pr.head.repo.owner.login != gh_repo.owner.login
+        # Handle case where fork repo may have been deleted (pr.head.repo is None)
+        is_fork = (
+            pr.head.repo is None or pr.head.repo.owner.login != gh_repo.owner.login
+        )
         print(f"PR is from fork: {is_fork}")
 
         if is_fork:
