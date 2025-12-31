@@ -1,6 +1,7 @@
 import json
 import os
 import sys
+import time
 
 import requests
 from github import Auth, Github
@@ -148,6 +149,7 @@ def handle_rerun_stage(
         "stage-b-test-large-1-gpu",
         "stage-b-test-large-2-gpu",
         "stage-c-test-large-4-gpu",
+        "stage-c-test-large-4-gpu-b200",
         "multimodal-gen-test-1-gpu",
         "multimodal-gen-test-2-gpu",
         "quantization-test",
@@ -300,6 +302,12 @@ def main():
         tagged = handle_tag_run_ci(
             repo, pr, comment, user_perms, react_on_success=False
         )
+
+        # Wait for the label to propagate before triggering rerun
+        if tagged:
+            print("Waiting 5 seconds for label to propagate...")
+            time.sleep(5)
+
         rerun = handle_rerun_failed_ci(
             repo, pr, comment, user_perms, react_on_success=False
         )

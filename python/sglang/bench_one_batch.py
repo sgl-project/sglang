@@ -301,8 +301,8 @@ def prepare_inputs_for_correctness_test(bench_args, tokenizer, custom_prompts):
             sampling_params=sampling_params,
         )
         req.fill_ids = req.origin_input_ids
-        req.extend_input_len = len(req.fill_ids) - len(req.prefix_indices)
-        req.logprob_start_len = len(req.origin_input_ids) - 1
+        req.logprob_start_len = -1
+        req.set_extend_input_len(len(req.fill_ids) - len(req.prefix_indices))
         reqs.append(req)
 
     return input_ids, reqs
@@ -312,13 +312,13 @@ def prepare_extend_inputs_for_correctness_test(
     bench_args, input_ids, reqs, model_runner
 ):
     for i in range(len(reqs)):
-        req = reqs[i]
+        req: Req = reqs[i]
         req.fill_ids += input_ids[i][bench_args.cut_len :]
         req.prefix_indices = model_runner.req_to_token_pool.req_to_token[
             i, : bench_args.cut_len
         ]
-        req.extend_input_len = len(req.fill_ids) - len(req.prefix_indices)
-        req.logprob_start_len = len(req.origin_input_ids) - 1
+        req.logprob_start_len = -1
+        req.set_extend_input_len(len(req.fill_ids) - len(req.prefix_indices))
     return reqs
 
 
@@ -344,8 +344,8 @@ def prepare_synthetic_inputs_for_latency_test(
             sampling_params=sampling_params,
         )
         req.fill_ids = req.origin_input_ids
-        req.extend_input_len = len(req.fill_ids) - len(req.prefix_indices)
-        req.logprob_start_len = len(req.origin_input_ids) - 1
+        req.logprob_start_len = -1
+        req.set_extend_input_len(len(req.fill_ids) - len(req.prefix_indices))
         reqs.append(req)
 
     return reqs

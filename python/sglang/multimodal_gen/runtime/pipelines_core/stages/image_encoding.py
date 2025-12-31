@@ -10,6 +10,7 @@ This module contains implementations of image encoding stages for diffusion pipe
 import PIL
 import torch
 from diffusers.models.autoencoders.vae import DiagonalGaussianDistribution
+from diffusers.models.modeling_outputs import AutoencoderKLOutput
 
 from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
     qwen_image_postprocess_text,
@@ -63,6 +64,15 @@ class ImageEncodingStage(PipelineStage):
         self.image_encoder = image_encoder
         self.text_encoder = text_encoder
 
+    def load_model(self):
+        if self.server_args.image_encoder_cpu_offload:
+            device = get_local_torch_device()
+            self.move_to_device(device)
+
+    def offload_model(self):
+        if self.server_args.image_encoder_cpu_offload:
+            self.move_to_device("cpu")
+
     def move_to_device(self, device):
         fields = [
             "image_processor",
@@ -98,8 +108,8 @@ class ImageEncodingStage(PipelineStage):
         if batch.condition_image is None:
             return batch
         cuda_device = get_local_torch_device()
-        self.move_to_device(cuda_device)
 
+        self.load_model()
         image = batch.condition_image
 
         image_processor_kwargs = (
@@ -130,7 +140,7 @@ class ImageEncodingStage(PipelineStage):
 
             neg_image_inputs = self.image_processor(
                 images=image, return_tensors="pt", **neg_image_processor_kwargs
-            ).to(get_local_torch_device())
+            ).to(cuda_device)
 
             with set_forward_context(current_timestep=0, attn_metadata=None):
                 outputs = self.text_encoder(
@@ -155,7 +165,7 @@ class ImageEncodingStage(PipelineStage):
                 self.encoding_qwen_image_edit(neg_outputs, neg_image_inputs)
             )
 
-        self.move_to_device("cpu")
+        self.offload_model()
 
         return batch
 
@@ -188,6 +198,13 @@ class ImageVAEEncodingStage(PipelineStage):
         super().__init__()
         self.vae: ParallelTiledVAE = vae
 
+    def load_model(self):
+        self.vae = self.vae.to(get_local_torch_device())
+
+    def offload_model(self):
+        if self.server_args.vae_cpu_offload:
+            self.vae = self.vae.to("cpu")
+
     def forward(
         self,
         batch: Req,
@@ -207,9 +224,8 @@ class ImageVAEEncodingStage(PipelineStage):
         if batch.condition_image is None:
             return batch
 
+        self.load_model()
         num_frames = batch.num_frames
-
-        self.vae = self.vae.to(get_local_torch_device())
 
         images = (
             batch.vae_image if batch.vae_image is not None else batch.condition_image
@@ -264,9 +280,12 @@ class ImageVAEEncodingStage(PipelineStage):
                 #     self.vae.enable_parallel()
                 if not vae_autocast_enabled:
                     video_condition = video_condition.to(vae_dtype)
-                encoder_output: DiagonalGaussianDistribution = self.vae.encode(
+                latent_dist: DiagonalGaussianDistribution = self.vae.encode(
                     video_condition
                 )
+                # for auto_encoder from diffusers
+                if isinstance(latent_dist, AutoencoderKLOutput):
+                    latent_dist = latent_dist.latent_dist
 
             generator = batch.generator
             if generator is None:
@@ -275,7 +294,7 @@ class ImageVAEEncodingStage(PipelineStage):
             sample_mode = server_args.pipeline_config.vae_config.encode_sample_mode()
 
             latent_condition = self.retrieve_latents(
-                encoder_output, generator, sample_mode=sample_mode
+                latent_dist, generator, sample_mode=sample_mode
             )
             latent_condition = server_args.pipeline_config.postprocess_vae_encode(
                 latent_condition, self.vae
@@ -305,10 +324,8 @@ class ImageVAEEncodingStage(PipelineStage):
             all_image_latents.append(image_latent)
 
         batch.image_latent = torch.cat(all_image_latents, dim=1)
-        self.maybe_free_model_hooks()
 
-        self.vae.to("cpu")
-
+        self.offload_model()
         return batch
 
     def retrieve_latents(

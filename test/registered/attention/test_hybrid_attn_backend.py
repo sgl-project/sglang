@@ -8,10 +8,10 @@ from sglang.srt.utils import get_device_sm, kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
 from sglang.test.test_utils import (
-    DEFAULT_EAGLE_DRAFT_MODEL_FOR_TEST,
-    DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST,
+    DEFAULT_DRAFT_MODEL_EAGLE,
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_MODEL_NAME_FOR_TEST_MLA,
+    DEFAULT_TARGET_MODEL_EAGLE,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -59,7 +59,7 @@ class TestHybridAttnBackendBase(CustomTestCase):
             envs.SGLANG_ENABLE_JIT_DEEPGEMM.override(False),
         ):
             if cls.speculative_decode:
-                model = DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST
+                model = DEFAULT_TARGET_MODEL_EAGLE
             else:
                 model = cls.model
             cls.process = popen_launch_server(
@@ -129,7 +129,7 @@ class TestHybridAttnBackendSpeculativeDecodingPrefillBackend(TestHybridAttnBacke
             "--speculative-algorithm",
             "EAGLE",
             "--speculative-draft-model-path",
-            DEFAULT_EAGLE_DRAFT_MODEL_FOR_TEST,
+            DEFAULT_DRAFT_MODEL_EAGLE,
             "--speculative-num-steps",
             "3",
             "--speculative-eagle-topk",
@@ -152,7 +152,7 @@ class TestHybridAttnBackendSpeculativeDecodingDecodeBackend(TestHybridAttnBacken
             "--speculative-algorithm",
             "EAGLE",
             "--speculative-draft-model-path",
-            DEFAULT_EAGLE_DRAFT_MODEL_FOR_TEST,
+            DEFAULT_DRAFT_MODEL_EAGLE,
             "--speculative-num-steps",
             "3",
             "--speculative-eagle-topk",
