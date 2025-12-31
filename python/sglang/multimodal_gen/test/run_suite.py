@@ -106,17 +106,12 @@ def collect_test_items(files, filter_expr=None):
             f"pytest --collect-only failed with exit code {result.returncode}\n"
             f"Command: {' '.join(cmd)}\n"
         )
-
         if result.stderr:
             error_msg += f"stderr:\n{result.stderr}\n"
         if result.stdout:
             error_msg += f"stdout:\n{result.stdout}\n"
         logger.error(error_msg)
-
-        should_rerun = "FileNotFoundError" in result.stderr
-
-        if not should_rerun:
-            raise RuntimeError(error_msg)
+        raise RuntimeError(error_msg)
 
     if result.returncode == 5:
         logger.info(
@@ -203,7 +198,9 @@ def run_pytest(files, filter_expr=None):
             and "AssertionError" in full_output
         )
 
-        is_flaky_ci_assertion = "SafetensorError" in full_output
+        is_flaky_ci_assertion = (
+            "SafetensorError" in full_output or "FileNotFoundError" in full_output
+        )
 
         is_oom_error = (
             "out of memory" in full_output.lower()
