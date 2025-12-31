@@ -3,6 +3,7 @@ Configuration argument parser for command-line applications.
 Handles merging of YAML configuration files with command-line arguments.
 """
 
+import argparse
 import logging
 from pathlib import Path
 from typing import Any, Dict, List
@@ -15,14 +16,24 @@ logger = logging.getLogger(__name__)
 class ConfigArgumentMerger:
     """Handles merging of configuration file arguments with command-line arguments."""
 
-    def __init__(
-        self,
-        store_true_actions: List[str] = None,
-        unsupported_actions: List[str] = None,
-    ):
+    def __init__(self, parser: argparse.ArgumentParser):
         """Initialize with list of store_true action names."""
-        self.store_true_actions = store_true_actions or []
-        self.unsupported_actions = unsupported_actions or []
+        # NOTE: The current code does not support actions other than "store_true" and "store".
+        self.store_true_actions = [
+            action.dest
+            for action in parser._actions
+            if isinstance(action, argparse._StoreTrueAction)
+        ]
+        self.unsupported_actions = [
+            a.dest
+            for a in parser._actions
+            if a.option_strings
+            and not isinstance(a, argparse._StoreTrueAction)
+            and not isinstance(a, argparse._StoreAction)
+            and "--config" not in a.option_strings
+            and "--help" not in a.option_strings
+            and "-h" not in a.option_strings
+        ]
 
     def merge_config_with_args(self, cli_args: List[str]) -> List[str]:
         """

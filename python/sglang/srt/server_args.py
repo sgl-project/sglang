@@ -4968,43 +4968,19 @@ def prepare_server_args(argv: List[str]) -> ServerArgs:
     Returns:
         The server arguments.
     """
-    # Import here to avoid circular imports
-    from sglang.srt.server_args_config_parser import ConfigArgumentMerger
+    parser = argparse.ArgumentParser()
+    ServerArgs.add_cli_args(parser)
 
     # Check for config file and merge arguments if present
     if "--config" in argv:
+        # Import here to avoid circular imports
+        from sglang.srt.server_args_config_parser import ConfigArgumentMerger
+
         # Extract boolean actions from the parser to handle them correctly
-        parser = argparse.ArgumentParser()
-        ServerArgs.add_cli_args(parser)
-        # NOTE: The current code does not support actions other than "store_true" and "store".
-
-        # Merge config file arguments with CLI arguments
-        store_ture_actions = [
-            action.dest
-            for action in parser._actions
-            if isinstance(action, argparse._StoreTrueAction)
-        ]
-        unsupported_actions = [
-            a.dest
-            for a in parser._actions
-            if a.option_strings
-            and not isinstance(a, argparse._StoreTrueAction)
-            and not isinstance(a, argparse._StoreAction)
-            and "--config" not in a.option_strings
-            and "--help" not in a.option_strings
-            and "-h" not in a.option_strings
-        ]
-
-        config_merger = ConfigArgumentMerger(
-            store_true_actions=store_ture_actions,
-            unsupported_actions=unsupported_actions,
-        )
+        config_merger = ConfigArgumentMerger(parser)
         argv = config_merger.merge_config_with_args(argv)
 
-    parser = argparse.ArgumentParser()
-    ServerArgs.add_cli_args(parser)
     raw_args = parser.parse_args(argv)
-
     return ServerArgs.from_cli_args(raw_args)
 
 
