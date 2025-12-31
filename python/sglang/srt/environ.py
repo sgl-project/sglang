@@ -375,6 +375,9 @@ class Envs:
     # Metrics
     SGLANG_ENABLE_METRICS_DEVICE_TIMER = EnvBool(False)
 
+    # Attention
+    SGLANG_USE_PAGED_ATTENTION = EnvBool(False)
+
     # fmt: on
 
 

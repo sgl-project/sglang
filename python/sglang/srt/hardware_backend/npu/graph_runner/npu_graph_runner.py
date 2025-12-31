@@ -29,6 +29,7 @@ import sglang
 from sglang.srt.configs.model_config import AttentionArch, is_deepseek_nsa
 from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.layers.dp_attention import get_attention_tp_size
+from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
 from sglang.srt.utils import (
     empty_context,
@@ -111,23 +112,15 @@ class NPUGraphRunner(CudaGraphRunner):
             out = run_once_fn()
         return out
 
-    def _get_update_attr_name(self, model_runner, forward_batch):
-        if (
-            self.bs < get_attention_tp_size()
-            or forward_batch.forward_mode.is_target_verify()
-            or self.use_fia
-        ):
-            return self.attr_name[AttentionArch.MLA]
-        return self.attr_name[model_runner.model_config.attention_arch]
+    def _get_update_attr_name(self):
+        if envs.SGLANG_USE_PAGED_ATTENTION.get():
+            return self.attr_name[AttentionArch.MHA]
+        return self.attr_name[AttentionArch.MLA]
 
-    def _get_update_attr_type(self, model_runner, forward_batch):
-        if (
-            self.bs < get_attention_tp_size()
-            or forward_batch.forward_mode.is_target_verify()
-            or self.use_fia
-        ):
-            return self.attr_type[AttentionArch.MLA]
-        return self.attr_type[model_runner.model_config.attention_arch]
+    def _get_update_attr_type(self):
+        if envs.SGLANG_USE_PAGED_ATTENTION.get():
+            return self.attr_type[AttentionArch.MHA]
+        return self.attr_type[AttentionArch.MLA]
 
     def _update_inputs(self, seq_lens):
         if isinstance(self.update_attr_type, torch.Tensor):
@@ -185,12 +178,8 @@ class NPUGraphRunner(CudaGraphRunner):
             self.buffers.input_ids[: self.raw_num_token].copy_(forward_batch.input_ids)
             self.buffers.positions[: self.raw_num_token].copy_(forward_batch.positions)
 
-        self.update_attr_name = self._get_update_attr_name(
-            self.model_runner, forward_batch
-        )
-        self.update_attr_type = self._get_update_attr_type(
-            self.model_runner, forward_batch
-        )
+        self.update_attr_name = self._get_update_attr_name()
+        self.update_attr_type = self._get_update_attr_type()
         # Replay
         if not is_deepseek_nsa(self.model_runner.model_config.hf_config):
             if forward_batch.forward_mode.is_target_verify():
