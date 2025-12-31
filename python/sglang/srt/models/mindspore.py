@@ -34,7 +34,7 @@ def _get_arch_from_config(config):
     if isinstance(architectures, str):
         architectures = [architectures]
     if not architectures:
-        logger.warning("No model architectures are specified")
+        raise ValueError("No model architectures are specified")
     for arch in architectures:
         if arch in mindspore_models:
             return mindspore_models[arch]
