@@ -1,6 +1,7 @@
 import json
 import os
 import sys
+import time
 
 import requests
 from github import Auth, Github
@@ -321,6 +322,12 @@ def main():
         tagged = handle_tag_run_ci(
             repo, pr, comment, user_perms, react_on_success=False
         )
+
+        # Wait for the label to propagate before triggering rerun
+        if tagged:
+            print("Waiting 5 seconds for label to propagate...")
+            time.sleep(5)
+
         rerun = handle_rerun_failed_ci(
             repo, pr, comment, user_perms, react_on_success=False
         )

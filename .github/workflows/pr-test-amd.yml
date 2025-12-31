@@ -29,6 +29,18 @@ on:
         required: false
         type: string
         default: ""
+  workflow_call:
+    inputs:
+      ref:
+        description: 'Git ref (branch, tag, or SHA) to test. If not provided, uses the default branch.'
+        required: false
+        type: string
+        default: ''
+      run_all_tests:
+        description: "Run all tests (for releasing or testing purpose)"
+        required: false
+        type: boolean
+        default: false
 
 concurrency:
   # Include pr_head_sha in group for /rerun-stage dispatches to avoid collisions with main branch runs
@@ -43,17 +55,32 @@ jobs:
     needs: [call-gate]
     runs-on: ubuntu-latest
     outputs:
-      main_package: ${{ steps.filter.outputs.main_package }}
-      sgl_kernel: ${{ steps.filter.outputs.sgl_kernel }}
-      multimodal_gen: ${{ steps.filter.outputs.multimodal_gen }}
+      main_package: ${{ steps.filter.outputs.main_package || steps.run-mode.outputs.run_all_tests }}
+      sgl_kernel: ${{ steps.filter.outputs.sgl_kernel || steps.run-mode.outputs.run_all_tests }}
+      multimodal_gen: ${{ steps.filter.outputs.multimodal_gen || steps.run-mode.outputs.run_all_tests }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.pr_head_sha || github.sha }}
+          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
+
+      - name: Determine run mode
+        id: run-mode
+        run: |
+          # Run all tests for workflow_call (when ref input is provided)
+          # Note: github.event_name is inherited from caller, so we detect workflow_call by checking inputs.ref
+          if [[ "${{ inputs.run_all_tests }}" == "true" ]]; then
+            echo "run_all_tests=true" >> $GITHUB_OUTPUT
+            echo "Run mode: ALL TESTS (run_all_tests=${{ inputs.run_all_tests }})"
+          else
+            echo "run_all_tests=false" >> $GITHUB_OUTPUT
+            echo "Run mode: FILTERED (triggered by ${{ github.event_name }})"
+          fi
+
       - name: Detect file changes
         id: filter
         uses: dorny/paths-filter@v3
+        if: steps.run-mode.outputs.run_all_tests != 'true'
         with:
           filters: |
             main_package:
@@ -90,7 +117,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.pr_head_sha || github.sha }}
+          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
 
       - name: Ensure VRAM is clear
         run: bash scripts/ensure_vram_clear.sh rocm
@@ -138,7 +165,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.pr_head_sha || github.sha }}
+          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
 
       - name: Ensure VRAM is clear
         run: bash scripts/ensure_vram_clear.sh rocm
@@ -171,7 +198,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.pr_head_sha || github.sha }}
+          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
 
       - name: Ensure VRAM is clear
         run: bash scripts/ensure_vram_clear.sh rocm
@@ -292,7 +319,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.pr_head_sha || github.sha }}
+          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
 
       - name: Ensure VRAM is clear
         run: bash scripts/ensure_vram_clear.sh rocm
@@ -419,7 +446,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.pr_head_sha || github.sha }}
+          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
 
       - name: Ensure VRAM is clear
         run: bash scripts/ensure_vram_clear.sh rocm
@@ -459,7 +486,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.pr_head_sha || github.sha }}
+          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
 
       - name: Ensure VRAM is clear
         run: bash scripts/ensure_vram_clear.sh rocm
@@ -501,7 +528,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.pr_head_sha || github.sha }}
+          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
 
       - name: Ensure VRAM is clear
         run: bash scripts/ensure_vram_clear.sh rocm
@@ -546,7 +573,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.pr_head_sha || github.sha }}
+          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
 
       - name: Ensure VRAM is clear
         run: bash scripts/ensure_vram_clear.sh rocm
@@ -601,7 +628,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.pr_head_sha || github.sha }}
+          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
 
       - name: Ensure VRAM is clear
         run: bash scripts/ensure_vram_clear.sh rocm
@@ -650,7 +677,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.pr_head_sha || github.sha }}
+          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
 
       - name: Ensure VRAM is clear
         run: bash scripts/ensure_vram_clear.sh rocm
@@ -709,7 +736,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.pr_head_sha || github.sha }}
+          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
 
       - name: Ensure VRAM is clear
         run: bash scripts/ensure_vram_clear.sh rocm
@@ -751,7 +778,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.pr_head_sha || github.sha }}
+          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
 
       - name: Ensure VRAM is clear
         run: bash scripts/ensure_vram_clear.sh rocm
