@@ -1641,14 +1641,43 @@ def sample_image_requests(
         and processor.tokenizer.all_special_ids is not None
     ):
         special_tokens = set(processor.tokenizer.all_special_ids)
-
+ 
+    # Extract special token strings and convert to token_id
+    special_token_strings = []
+    special_token_ids = set()
+    
+    if hasattr(processor.tokenizer, "special_tokens"):
+        # Extract all special tokens from tokenizer.special_tokens dictionary
+        for key, value in processor.tokenizer.special_tokens.items():
+            if isinstance(value, str):
+                special_token_strings.append(value)
+            elif isinstance(value, list):
+                special_token_strings.extend(value)
+    
+    # Also extract from additional_special_tokens
+    if hasattr(processor.tokenizer, "additional_special_tokens"):
+        special_token_strings.extend(processor.tokenizer.additional_special_tokens)
+    
+    # Convert to token_id
+    if special_token_strings and hasattr(processor.tokenizer, "convert_tokens_to_ids"):
+        special_token_ids = set(processor.tokenizer.convert_tokens_to_ids(special_token_strings))
+    
+    # Merge all_special_ids and special_token_ids converted from strings
+    if special_tokens is not None and special_token_ids:
+        merged_special_tokens = special_tokens | special_token_ids
+    elif special_tokens is not None:
+        merged_special_tokens = special_tokens
+    elif special_token_ids:
+        merged_special_tokens = special_token_ids
+    else:
+        merged_special_tokens = None
     for i in range(num_requests):
         # Generate text prompt
         text_prompt = gen_mm_prompt(
             processor.tokenizer,
             processor.image_token_id if hasattr(processor, "image_token_id") else None,
             int(input_lens[i]),
-            special_tokens,
+            merged_special_tokens,
         )
 
         # Generate image list
