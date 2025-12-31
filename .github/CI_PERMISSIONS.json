@@ -20,6 +20,13 @@
         "reason": "custom override",
         "can_rerun_stage": true
     },
+    "attack204": {
+        "can_tag_run_ci_label": true,
+        "can_rerun_failed_ci": true,
+        "cooldown_interval_minutes": 0,
+        "reason": "custom override",
+        "can_rerun_stage": true
+    },
     "BBuf": {
         "can_tag_run_ci_label": true,
         "can_rerun_failed_ci": true,
@@ -242,7 +249,7 @@
         "can_rerun_failed_ci": true,
         "cooldown_interval_minutes": 0,
         "reason": "custom override",
-		"can_rerun_stage": true
+        "can_rerun_stage": true
     },
     "XiaotongJiang": {
         "can_tag_run_ci_label": true,
