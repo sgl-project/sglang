@@ -25,6 +25,18 @@ on:
         required: false
         type: boolean
         default: false
+  workflow_call:
+    inputs:
+      ref:
+        description: 'Git ref (branch, tag, or SHA) to test. If not provided, uses the default branch.'
+        required: false
+        type: string
+        default: ''
+      run_all_tests:
+        description: "Run all tests (for releasing or testing purpose)"
+        required: false
+        type: boolean
+        default: false
 
 concurrency:
   group: pr-test-${{ github.ref }}
@@ -38,10 +50,10 @@ jobs:
   check-changes:
     runs-on: ubuntu-latest
     outputs:
-      main_package: ${{ steps.filter.outputs.main_package || steps.scheduled.outputs.main_package }}
-      sgl_kernel: ${{ steps.filter.outputs.sgl_kernel || steps.scheduled.outputs.sgl_kernel }}
-      jit_kernel: ${{ steps.filter.outputs.jit_kernel || steps.scheduled.outputs.jit_kernel }}
-      multimodal_gen: ${{ steps.filter.outputs.multimodal_gen || steps.scheduled.outputs.multimodal_gen }}
+      main_package: ${{ steps.filter.outputs.main_package || steps.run-mode.outputs.run_all_tests }}
+      sgl_kernel: ${{ steps.filter.outputs.sgl_kernel }} # sgl-kernel tests only run when kernels are rebuilt
+      jit_kernel: ${{ steps.filter.outputs.jit_kernel || steps.run-mode.outputs.run_all_tests }}
+      multimodal_gen: ${{ steps.filter.outputs.multimodal_gen || steps.run-mode.outputs.run_all_tests }}
       max_parallel: ${{ steps.set-parallel.outputs.max_parallel }}
       b200_runner: ${{ steps.set-runner.outputs.b200_runner }}
       enable_retry: ${{ steps.set-retry.outputs.enable_retry }}
@@ -49,11 +61,26 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Determine run mode
+        id: run-mode
+        run: |
+          # Run all tests for scheduled runs and workflow_call (when ref input is provided)
+          # Note: github.event_name is inherited from caller, so we detect workflow_call by checking inputs.ref
+          if [[ "${{ github.event_name }}" == "schedule" || "${{ inputs.run_all_tests }}" == "true" ]]; then
+            echo "run_all_tests=true" >> $GITHUB_OUTPUT
+            echo "Run mode: ALL TESTS (schedule=${{ github.event_name == 'schedule' }}, run_all_tests=${{ inputs.run_all_tests }})"
+          else
+            echo "run_all_tests=false" >> $GITHUB_OUTPUT
+            echo "Run mode: FILTERED (triggered by ${{ github.event_name }})"
+          fi
 
       - name: Detect file changes
         id: filter
         uses: dorny/paths-filter@v3
-        if: github.event_name != 'schedule'
+        if: steps.run-mode.outputs.run_all_tests != 'true'
         with:
           filters: |
             main_package:
@@ -74,15 +101,6 @@ jobs:
               - "python/*.toml"
               - ".github/workflows/pr-test.yml"
 
-      - name: Set all changes to true for scheduled runs
-        id: scheduled
-        if: github.event_name == 'schedule'
-        run: |
-          echo "main_package=true" >> $GITHUB_OUTPUT
-          echo "sgl_kernel=false" >> $GITHUB_OUTPUT
-          echo "jit_kernel=true" >> $GITHUB_OUTPUT
-          echo "multimodal_gen=true" >> $GITHUB_OUTPUT
-
       - name: Set max-parallel based on high-priority label
         id: set-parallel
         run: |
@@ -90,14 +108,14 @@ jobs:
             echo "max_parallel=15" >> $GITHUB_OUTPUT
             echo "High priority PR detected, setting max_parallel to 15"
           else
-            echo "max_parallel=8" >> $GITHUB_OUTPUT
-            echo "Using default max_parallel of 8"
+            echo "max_parallel=4" >> $GITHUB_OUTPUT
+            echo "Using default max_parallel of 4"
           fi
 
       - name: Set B200 runner tag
         id: set-runner
         run: |
-          sgl_kernel="${{ steps.filter.outputs.sgl_kernel || steps.scheduled.outputs.sgl_kernel }}"
+          sgl_kernel="${{ steps.filter.outputs.sgl_kernel || steps.run-mode.outputs.run_all_tests }}"
           if [[ "$sgl_kernel" == "true" ]]; then
             echo "b200_runner=4-gpu-b200-kernel" >> $GITHUB_OUTPUT
           else
@@ -110,15 +128,15 @@ jobs:
           echo "enable_retry=true" >> $GITHUB_OUTPUT
           echo "Retry logic enabled for CI"
 
-      - name: Set continue-on-error for scheduled runs
+      - name: Set continue-on-error for full test runs
         id: set-continue-on-error
         run: |
-          if [[ "${{ github.event_name }}" == "schedule" || "${{ inputs.force_continue_on_error }}" == "true" ]]; then
+          if [[ "${{ steps.run-mode.outputs.run_all_tests }}" == "true" || "${{ inputs.force_continue_on_error }}" == "true" ]]; then
             echo "continue_on_error=true" >> $GITHUB_OUTPUT
-            echo "Scheduled run or force flag detected, enabling continue-on-error to run all tests"
+            echo "Full test run or force flag detected, enabling continue-on-error to run all tests"
           else
             echo "continue_on_error=false" >> $GITHUB_OUTPUT
-            echo "Non-scheduled run, continue-on-error disabled"
+            echo "Filtered run, continue-on-error disabled"
           fi
 
       - name: Show filter results in summary (table)
@@ -128,10 +146,10 @@ jobs:
             echo ""
             echo "| Component         | Changed |"
             echo "|-------------------|---------|"
-            echo "| main_package      | ${{ steps.filter.outputs.main_package || steps.scheduled.outputs.main_package }} |"
-            echo "| sgl_kernel        | ${{ steps.filter.outputs.sgl_kernel || steps.scheduled.outputs.sgl_kernel }} |"
-            echo "| jit_kernel        | ${{ steps.filter.outputs.jit_kernel || steps.scheduled.outputs.jit_kernel }} |"
-            echo "| multimodal_gen    | ${{ steps.filter.outputs.multimodal_gen || steps.scheduled.outputs.multimodal_gen }} |"
+            echo "| main_package      | ${{ steps.filter.outputs.main_package || steps.run-mode.outputs.run_all_tests }} |"
+            echo "| sgl_kernel        | ${{ steps.filter.outputs.sgl_kernel || steps.run-mode.outputs.run_all_tests }} |"
+            echo "| jit_kernel        | ${{ steps.filter.outputs.jit_kernel || steps.run-mode.outputs.run_all_tests }} |"
+            echo "| multimodal_gen    | ${{ steps.filter.outputs.multimodal_gen || steps.run-mode.outputs.run_all_tests }} |"
             echo "| max_parallel      | ${{ steps.set-parallel.outputs.max_parallel }} |"
             echo "| b200_runner       | ${{ steps.set-runner.outputs.b200_runner }} |"
             echo "| enable_retry      | ${{ steps.set-retry.outputs.enable_retry }} |"
@@ -172,6 +190,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: "recursive"
+          ref: ${{ inputs.ref || github.ref }}
 
       - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v5
@@ -213,6 +232,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: "recursive"
+          ref: ${{ inputs.ref || github.ref }}
 
       - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v5
@@ -240,6 +260,8 @@ jobs:
       RUNNER_LABELS: 1-gpu-runner
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
 
       - name: Cleanup
         run: |
@@ -271,6 +293,8 @@ jobs:
       RUNNER_LABELS: 1-gpu-runner
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
 
       - name: Cleanup
         run: |
@@ -291,7 +315,7 @@ jobs:
       - name: Run test
         timeout-minutes: 30
         run: |
-          cd test/srt
+          cd test/registered/mla
           python3 test_mla_deepseek_v3.py
 
   sgl-kernel-benchmark-test:
@@ -303,6 +327,8 @@ jobs:
       RUNNER_LABELS: 1-gpu-runner
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
 
       - name: Cleanup
         run: |
@@ -346,6 +372,8 @@ jobs:
       RUNNER_LABELS: ${{ needs.check-changes.outputs.b200_runner }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
 
       - name: Cleanup
         run: |
@@ -410,6 +438,8 @@ jobs:
       RUNNER_LABELS: 1-gpu-runner
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
 
       - name: Install dependencies
         run: |
@@ -441,6 +471,8 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
@@ -488,6 +520,8 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
@@ -529,6 +563,8 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
@@ -570,6 +606,8 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
@@ -611,6 +649,8 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
@@ -634,6 +674,45 @@ jobs:
           fi
           python3 run_suite.py --hw cuda --suite stage-c-test-large-4-gpu $CONTINUE_ON_ERROR_FLAG
 
+  stage-c-test-large-4-gpu-b200:
+    needs: [check-changes, call-gate, stage-b-test-small-1-gpu, stage-b-test-large-1-gpu, stage-b-test-large-2-gpu, stage-b-test-4-gpu-b200, sgl-kernel-build-wheels]
+    if: |
+      always() &&
+      (
+        (inputs.target_stage == 'stage-c-test-large-4-gpu-b200') ||
+        (
+          !inputs.target_stage &&
+          (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
+          ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+        )
+      )
+    runs-on: ${{ needs.check-changes.outputs.b200_runner }}
+    env:
+      RUNNER_LABELS: ${{ needs.check-changes.outputs.b200_runner }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Download artifacts
+        if: needs.check-changes.outputs.sgl_kernel == 'true'
+        uses: actions/download-artifact@v6
+        with:
+          path: sgl-kernel/dist/
+          merge-multiple: true
+          pattern: wheel-python3.10-cuda12.9
+
+      - name: Install dependencies
+        run: |
+          CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} IS_BLACKWELL=1 bash scripts/ci/ci_install_dependency.sh
+
+      - name: Run test
+        timeout-minutes: 30
+        run: |
+          cd test/
+          IS_BLACKWELL=1 python3 run_suite.py --hw cuda --suite stage-c-test-large-4-gpu-b200
+
   multimodal-gen-test-1-gpu:
     needs: [check-changes, call-gate, sgl-kernel-build-wheels]
     if: |
@@ -654,6 +733,8 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
@@ -701,6 +782,8 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
@@ -744,6 +827,8 @@ jobs:
       steps:
         - name: Checkout code
           uses: actions/checkout@v4
+          with:
+            ref: ${{ inputs.ref || github.ref }}
 
         - name: Download artifacts
           if: needs.check-changes.outputs.sgl_kernel == 'true'
@@ -794,6 +879,8 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
@@ -843,6 +930,8 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
@@ -889,6 +978,8 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
@@ -917,7 +1008,7 @@ jobs:
           python3 run_suite.py --suite per-commit-2-gpu --auto-partition-id ${{ matrix.part }} --auto-partition-size 2 $RETRY_FLAG $CONTINUE_ON_ERROR_FLAG
 
   unit-test-backend-4-gpu:
-    needs: [check-changes, call-gate, unit-test-backend-2-gpu, stage-b-test-4-gpu-b200]
+    needs: [check-changes, call-gate, unit-test-backend-1-gpu, stage-b-test-4-gpu-b200]
     if: |
       always() &&
       (
@@ -938,6 +1029,8 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
@@ -966,7 +1059,7 @@ jobs:
           python3 run_suite.py --suite per-commit-4-gpu --auto-partition-id ${{ matrix.part }} --auto-partition-size 3 $RETRY_FLAG $CONTINUE_ON_ERROR_FLAG
 
   unit-test-backend-8-gpu-h200:
-    needs: [check-changes, call-gate, unit-test-backend-2-gpu, stage-b-test-4-gpu-b200]
+    needs: [check-changes, call-gate, unit-test-backend-1-gpu, stage-b-test-4-gpu-b200]
     if: |
       always() &&
       (
@@ -987,6 +1080,8 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
@@ -1021,7 +1116,7 @@ jobs:
           python3 run_suite.py --suite per-commit-8-gpu-h200 --auto-partition-id ${{ matrix.part }} --auto-partition-size 3 $RETRY_FLAG $CONTINUE_ON_ERROR_FLAG
 
   unit-test-backend-8-gpu-h20:
-    needs: [check-changes, call-gate, unit-test-backend-2-gpu, stage-b-test-4-gpu-b200]
+    needs: [check-changes, call-gate, unit-test-backend-1-gpu, stage-b-test-4-gpu-b200]
     if: |
       always() &&
       (
@@ -1043,6 +1138,8 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
@@ -1088,6 +1185,8 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
@@ -1157,6 +1256,8 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
@@ -1218,6 +1319,8 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
@@ -1256,7 +1359,7 @@ jobs:
           python3 -m unittest test_bench_serving.TestBenchServing.test_embeddings_api_batch_scaling
 
   performance-test-2-gpu:
-    needs: [check-changes, call-gate, unit-test-backend-2-gpu, stage-b-test-4-gpu-b200]
+    needs: [check-changes, call-gate, unit-test-backend-1-gpu, stage-b-test-4-gpu-b200]
     if: |
       always() &&
       (
@@ -1273,6 +1376,8 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
@@ -1340,6 +1445,8 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
@@ -1380,6 +1487,8 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
@@ -1403,7 +1512,7 @@ jobs:
           python3 -m sglang.test.ci.run_with_retry test_moe_eval_accuracy_large.py
 
   unit-test-deepep-4-gpu:
-    needs: [check-changes, call-gate, unit-test-backend-2-gpu, stage-b-test-4-gpu-b200]
+    needs: [check-changes, call-gate, unit-test-backend-1-gpu, stage-b-test-4-gpu-b200]
     if: |
       always() &&
       (
@@ -1420,6 +1529,8 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
@@ -1448,7 +1559,7 @@ jobs:
           python3 run_suite.py --suite per-commit-4-gpu-deepep $RETRY_FLAG $CONTINUE_ON_ERROR_FLAG
 
   unit-test-deepep-8-gpu:
-    needs: [check-changes, call-gate, unit-test-backend-2-gpu, stage-b-test-4-gpu-b200]
+    needs: [check-changes, call-gate, unit-test-backend-1-gpu, stage-b-test-4-gpu-b200]
     if: |
       always() &&
       (
@@ -1465,6 +1576,8 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
@@ -1493,7 +1606,7 @@ jobs:
           python3 run_suite.py --suite per-commit-8-gpu-h200-deepep $RETRY_FLAG $CONTINUE_ON_ERROR_FLAG
 
   unit-test-backend-4-gpu-b200:
-    needs: [check-changes, call-gate, unit-test-backend-2-gpu, stage-b-test-4-gpu-b200]
+    needs: [check-changes, call-gate, unit-test-backend-1-gpu, stage-b-test-4-gpu-b200]
     if: |
       always() &&
       (
@@ -1515,6 +1628,8 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
@@ -1543,7 +1658,7 @@ jobs:
           IS_BLACKWELL=1 python3 run_suite.py --suite per-commit-4-gpu-b200 --auto-partition-id ${{ matrix.part }} --auto-partition-size 3 --timeout-per-file 1800 $RETRY_FLAG $CONTINUE_ON_ERROR_FLAG
 
   unit-test-backend-4-gpu-gb200:
-    needs: [check-changes, call-gate, unit-test-backend-2-gpu, stage-b-test-4-gpu-b200, sgl-kernel-build-wheels-arm]
+    needs: [check-changes, call-gate, unit-test-backend-1-gpu, stage-b-test-4-gpu-b200, sgl-kernel-build-wheels-arm]
     if: |
       always() &&
       (
@@ -1562,6 +1677,8 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'

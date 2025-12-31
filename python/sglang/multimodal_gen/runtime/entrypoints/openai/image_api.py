@@ -63,6 +63,7 @@ def _build_sampling_params_from_request(
     guidance_scale: Optional[float] = None,
     num_inference_steps: Optional[int] = None,
     enable_teacache: Optional[bool] = None,
+    num_frames: int = 1,
 ) -> SamplingParams:
     if size is None:
         width, height = None, None
@@ -76,7 +77,7 @@ def _build_sampling_params_from_request(
         request_id=request_id,
         prompt=prompt,
         image_path=image_path,
-        num_frames=1,  # image
+        num_frames=num_frames,  # image
         width=width,
         height=height,
         num_outputs_per_prompt=max(1, min(int(n or 1), 10)),
@@ -123,9 +124,10 @@ async def generations(
     )
 
     # Run synchronously for images and save to disk
-    save_file_path, result = await process_generation_batch(
+    save_file_path_list, result = await process_generation_batch(
         async_scheduler_client, batch
     )
+    save_file_path = save_file_path_list[0]
 
     await IMAGE_STORE.upsert(
         request_id,
@@ -180,6 +182,7 @@ async def edits(
     guidance_scale: Optional[float] = Form(None),
     num_inference_steps: Optional[int] = Form(None),
     enable_teacache: Optional[bool] = Form(False),
+    num_frames: int = Form(1),
 ):
     request_id = generate_request_id()
     # Resolve images from either `image` or `image[]` (OpenAI SDK sends `image[]` when list is provided)
@@ -223,13 +226,14 @@ async def edits(
         guidance_scale=guidance_scale,
         num_inference_steps=num_inference_steps,
         enable_teacache=enable_teacache,
+        num_frames=num_frames,  # image
     )
     batch = _build_req_from_sampling(sampling)
 
-    save_file_path, result = await process_generation_batch(
+    save_file_path_list, result = await process_generation_batch(
         async_scheduler_client, batch
     )
-
+    save_file_path = save_file_path_list[0]
     await IMAGE_STORE.upsert(
         request_id,
         {
@@ -243,11 +247,15 @@ async def edits(
 
     # Default to b64_json to align with gpt-image-1 behavior in OpenAI examples
     if (response_format or "b64_json").lower() == "b64_json":
-        with open(save_file_path, "rb") as f:
-            b64 = base64.b64encode(f.read()).decode("utf-8")
-        response_kwargs = {
-            "data": [ImageResponseData(b64_json=b64, revised_prompt=prompt)],
-        }
+        response_kwargs = {"data": []}
+        for save_file_path in save_file_path_list:
+            with open(save_file_path, "rb") as f:
+                b64 = base64.b64encode(f.read()).decode("utf-8")
+                response_kwargs["data"].append(
+                    ImageResponseData(b64_json=b64, revised_prompt=prompt)
+                )
+        if result.peak_memory_mb and result.peak_memory_mb > 0:
+            response_kwargs["peak_memory_mb"] = result.peak_memory_mb
     else:
         url = f"/v1/images/{request_id}/content"
         response_kwargs = {
