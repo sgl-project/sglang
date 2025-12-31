@@ -21,7 +21,7 @@ from sglang.srt.layers.attention.triton_ops.trtllm_fp8_kv_kernel import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.utils import is_flashinfer_available
-from sglang.srt.utils.common import is_sm100_supported
+from sglang.srt.utils.common import is_sm90_supported, is_sm100_supported, is_sm120_supported
 
 logger = logging.getLogger(__name__)
 
@@ -134,6 +134,17 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         self.k_scales_gpu, self.v_scales_gpu = self.preload_kv_scales(
             config, model_runner
         )
+
+
+        # Init backend (XQA or TRTLLM-GEN)
+        # We need to specify q_type and out_type for different backend
+        # XQA: (q_type must be bf16)
+        #   KV bf16: q_type = bf16, out_type=model_runner.dtype
+        #   KV fp8: q_type = bf16, out_type=model_runner.dtype
+        # TRTLLM-GEN:
+        #   KV bf16: q_type = bf16, out_type=model_runner.dtype
+        #   KV fp8: q_type = fp8, out_type=model_runner.dtype
+        self.is_xqa_impl = is_sm90_supported() or is_sm120_supported()
 
     def preload_kv_scales(self, config, model_runner: ModelRunner):
         if not self.is_nvfp4_kvcache:
@@ -761,7 +772,8 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 )
 
         # prepare query
-        if self.data_type == torch.float8_e4m3fn or self.is_nvfp4_kvcache:
+        # For XQA, q_dtype should be bf16
+        if (self.data_type == torch.float8_e4m3fn or self.is_nvfp4_kvcache) and (not self.is_xqa_impl):
             q = q.to(torch.float8_e4m3fn)
         q = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
 
