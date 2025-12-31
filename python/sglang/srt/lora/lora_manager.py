@@ -473,6 +473,9 @@ class LoRAManager:
         self.embed_tokens_module: Optional[BaseLayerWithLoRA] = None
         self.lm_head_module: Optional[BaseLayerWithLoRA] = None
 
+        # Check if embeddings are tied (lm_head shares weights with embed_tokens)
+        tie_word_embeddings = getattr(self.base_hf_config, "tie_word_embeddings", False)
+
         for module_name, module in self.base_model.named_modules():
             # TODO (lifuhuang): in the future, we should consider generalizing the
             # should_apply_lora function to support mapping by full module name instead
@@ -500,6 +503,7 @@ class LoRAManager:
                 ):
                     lora_module = self.set_lora_module(module_name, module)
                     self.lm_head_module = lora_module
+                    logger.info(f"Created LoRA wrapper for lm_head: {module_name}")
                     continue
 
             # The module should be converted if it is included in target_names
@@ -507,4 +511,59 @@ class LoRAManager:
                 layer_id = get_layer_id(module_name)
                 self.lora_modules[layer_id][module_name] = self.set_lora_module(
                     module_name, module
+                )
+
+        # Handle tied embeddings case: when tie_word_embeddings=True, lm_head is an alias
+        # to embed_tokens and won't appear as a separate module in named_modules().
+        # We create a separate ParallelLMHead that shares weights with embed_tokens,
+        # allowing LoRA to be applied independently to both embedding and lm_head.
+        if (
+            tie_word_embeddings
+            and "lm_head" in self.target_modules
+            and self.lm_head_module is None
+        ):
+            # Get the embed_tokens module (may be wrapped with LoRA already)
+            embed_tokens = None
+            for name, module in self.base_model.named_modules():
+                if "embed_tokens" in name:
+                    embed_tokens = module
+                    break
+
+            if embed_tokens is not None:
+                # Get the base embed_tokens (unwrap if it's a LoRA wrapper)
+                base_embed_tokens = (
+                    embed_tokens.base_layer
+                    if isinstance(embed_tokens, BaseLayerWithLoRA)
+                    else embed_tokens
+                )
+
+                # Create a new ParallelLMHead that shares the weight tensor
+                # This allows lm_head to have its own LoRA wrapper while sharing base weights
+                lm_head = ParallelLMHead(
+                    num_embeddings=base_embed_tokens.num_embeddings,
+                    embedding_dim=base_embed_tokens.embedding_dim,
+                    params_dtype=base_embed_tokens.weight.dtype,
+                    org_num_embeddings=base_embed_tokens.org_vocab_size,
+                )
+                # Share the weight tensor (no additional memory)
+                lm_head.weight = base_embed_tokens.weight
+                # Copy shard indices for proper TP handling
+                lm_head.shard_indices = base_embed_tokens.shard_indices
+                lm_head.num_org_embeddings_per_partition = (
+                    base_embed_tokens.num_org_embeddings_per_partition
+                )
+
+                # Replace lm_head in the model and wrap with LoRA
+                replace_submodule(self.base_model, "lm_head", lm_head)
+                lora_module = get_lora_layer(lm_head, self.lora_backend)
+                replace_submodule(self.base_model, "lm_head", lora_module)
+                self.lm_head_module = lora_module
+                logger.info(
+                    "Created separate ParallelLMHead with shared weights for LoRA "
+                    "(tie_word_embeddings=True)"
+                )
+            else:
+                logger.warning(
+                    "Model has tie_word_embeddings=True, but 'lm_head' is in target_modules "
+                    "and embed_tokens module was not found. Skipping lm_head LoRA wrapper."
                 )

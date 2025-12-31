@@ -192,7 +192,19 @@ class LoRAMemoryPool:
         _, output_dim = get_hidden_dim(
             module_name, self.base_hf_config, base_model, 0, self.lora_added_tokens_size
         )
-        # Have not imp self.tp_size > 1 yet.
+        # For lm_head with TP>1, vocab dimension is sharded across TP ranks
+        # We need to use the padded vocab size for proper division
+        if module_name == "lm_head" and self.tp_size > 1:
+            from sglang.srt.layers.vocab_parallel_embedding import (
+                DEFAULT_VOCAB_PADDING_SIZE,
+                pad_vocab_size,
+            )
+            # Pad vocab size to ensure divisibility by tp_size (same logic as VocabParallelEmbedding)
+            padding_size = DEFAULT_VOCAB_PADDING_SIZE
+            if pad_vocab_size(output_dim, padding_size) % self.tp_size != 0:
+                padding_size *= self.tp_size
+            output_dim_padded = pad_vocab_size(output_dim, padding_size)
+            output_dim = divide(output_dim_padded, self.tp_size)
         return (
             self.max_loras_per_batch,
             output_dim,
@@ -503,31 +515,52 @@ class LoRAMemoryPool:
                     and "lm_head" in name
                     and ("lora_embedding_A" in name or "lora_A" in name)
                 ):
+                    lora_a_weights = weights
+                    # For lm_head, LoRA A weights are NOT sharded (hidden_dim is replicated across TP ranks)
+                    # So no slicing is needed regardless of TP size
                     buffer_view = self.lm_head_A_buffer[target_module][
-                        # buffer_id, :, :lora_rank
                         buffer_id,
                         :lora_rank,
                         :,
                     ]
-                    load_lora_weight_tensor(buffer_view, weights)
+                    load_lora_weight_tensor(buffer_view, lora_a_weights)
                 elif (
                     target_module == "lm_head"
                     and "lm_head" in name
                     and ("lora_embedding_B" in name or "lora_B" in name)
                 ):
                     lora_b_weights = weights
-                    # [to-do] support TP
-                    # if self.tp_size > 1:
-                    #     cur_module = lora_embeddings_modules[target_module]
-                    #     for module_name, module in cur_module:
-                    #         lora_b_weights = module.slice_lora_b_weights(
-                    #             lora_b_weights, self.tp_rank
-                    #         )
-
+                    # For TP>1, slice the LoRA B weights along vocab dimension
+                    if self.tp_size > 1:
+                        if lora_lm_head_module is not None:
+                            lora_b_weights = lora_lm_head_module.slice_lora_b_weights(
+                                lora_b_weights, self.tp_rank
+                            )
+                        else:
+                            # Fallback: compute slice indices directly using same logic as buffer allocation
+                            from sglang.srt.layers.vocab_parallel_embedding import (
+                                DEFAULT_VOCAB_PADDING_SIZE,
+                                pad_vocab_size,
+                                vocab_range_from_global_vocab_size,
+                            )
+                            vocab_size = lora_b_weights.shape[0]
+                            padding_size = DEFAULT_VOCAB_PADDING_SIZE
+                            if pad_vocab_size(vocab_size, padding_size) % self.tp_size != 0:
+                                padding_size *= self.tp_size
+                            org_vocab_size_padded = pad_vocab_size(vocab_size, padding_size)
+                            # Get shard range for this rank
+                            start_idx, end_idx = vocab_range_from_global_vocab_size(
+                                org_vocab_size_padded, self.tp_rank, self.tp_size
+                            )
+                            # Clamp to actual vocab size
+                            start_idx = min(start_idx, vocab_size)
+                            end_idx = min(end_idx, vocab_size)
+                            lora_b_weights = lora_b_weights[start_idx:end_idx, :]
+                    # Get the sharded vocab size for buffer view
+                    sharded_vocab_size = lora_b_weights.shape[0]
                     buffer_view = self.lm_head_B_buffer[target_module][
-                        # buffer_id, :lora_rank, : org_vocab_size + extra_vocab_size
                         buffer_id,
-                        : (org_vocab_size + self.lora_added_tokens_size),
+                        :sharded_vocab_size,
                         :lora_rank,
                     ]
                     load_lora_weight_tensor(buffer_view, lora_b_weights)

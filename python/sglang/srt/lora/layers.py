@@ -210,7 +210,7 @@ class VocabParallelEmbeddingWithLoRA(BaseLayerWithLoRA):
 
 class ParallelLMHeadWithLoRA(BaseLayerWithLoRA):
     """
-    Parallel LM Head layer with LoRA support (simplified for TP=1).
+    Parallel LM Head layer with LoRA support.
 
     The LM head computes logits = hidden_states @ (W + B @ A)^T
     """
@@ -224,8 +224,10 @@ class ParallelLMHeadWithLoRA(BaseLayerWithLoRA):
         self.weight = base_layer.weight
         self.embed_dim = base_layer.embedding_dim
         self.vocab_size = base_layer.org_vocab_size
+        # Use the per-partition vocab size for output_offset (handles TP>1)
+        self.vocab_size_per_partition = base_layer.num_org_embeddings_per_partition
         self.output_offset = torch.tensor(
-            [0, self.vocab_size],
+            [0, self.vocab_size_per_partition],
             dtype=torch.int32,
             device=next(base_layer.parameters()).device,
         )
@@ -238,7 +240,7 @@ class ParallelLMHeadWithLoRA(BaseLayerWithLoRA):
         """Set LoRA buffers for LM head layer."""
         self.set_lora = True
         self.lm_head_A_buffer = lm_head_A_buffer  # (num_loras, rank, hidden_dim)
-        self.lm_head_B_buffer = lm_head_B_buffer  # (num_loras, vocab_size, rank)
+        self.lm_head_B_buffer = lm_head_B_buffer  # (num_loras, vocab_size_per_partition, rank)
 
     def apply_lora(
         self, base_output: torch.Tensor, hidden_states: torch.Tensor
@@ -266,10 +268,11 @@ class ParallelLMHeadWithLoRA(BaseLayerWithLoRA):
         return lora_output
 
     def forward(self, hidden_states: torch.Tensor):
-        # Apply base linear transformation
-        base_output = F.linear(
-            hidden_states, self.weight, bias=getattr(self.base_layer, "bias", None)
-        )
+        # Cast hidden_states to weight dtype (matches logits_processor behavior)
+        hidden_states = hidden_states.to(self.weight.dtype)
+
+        # Apply base linear transformation: hidden_states @ weight.T
+        base_output = torch.matmul(hidden_states, self.weight.T)
 
         # Apply LoRA if set
         if self.set_lora:
@@ -278,24 +281,20 @@ class ParallelLMHeadWithLoRA(BaseLayerWithLoRA):
         return base_output
 
     def slice_lora_a_weights(self, A: torch.Tensor, tp_rank: int):
-        # For TP=1, no slicing needed
-        # For TP>1, need to modify code in: sglang/python/sglang/srt/lora/mem_pool.py
-        # return A
-        if tp_rank > 1:
-            raise NotImplementedError(
-                f"ParallelLMHeadWithLoRA does not support tensor parallelism > 1. "
-                f"Got tp_size={tp_rank}"
-            )
+        # LoRA A shape: (lora_rank, hidden_size)
+        # hidden_size is replicated across TP ranks, so no slicing needed
+        return A
 
     def slice_lora_b_weights(self, B: torch.Tensor, tp_rank: int):
-        # For TP=1, no slicing needed
-        # For TP>1, would slice along vocab dimension, need to modify code in: sglang/python/sglang/srt/lora/mem_pool.py
-        # return B
-        if tp_rank > 1:
-            raise NotImplementedError(
-                f"ParallelLMHeadWithLoRA does not support tensor parallelism > 1. "
-                f"Got tp_size={tp_rank}"
-            )
+        # LoRA B shape: (vocab_size, lora_rank)
+        # vocab_size is sharded across TP ranks, so slice along dim 0
+        # Use the same sharding indices as the base ParallelLMHead weight
+        # Note: shard_indices are computed per-rank, so we use the indices directly
+        # rather than computing tp_rank * shard_size (which would be incorrect
+        # because shard sizes may vary across ranks due to padding)
+        start_idx = self.base_layer.shard_indices.org_vocab_start_index
+        end_idx = self.base_layer.shard_indices.org_vocab_end_index
+        return B[start_idx:end_idx, :]
 
 
 class ColumnParallelLinearWithLoRA(BaseLayerWithLoRA):
