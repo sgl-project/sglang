@@ -40,6 +40,7 @@ def run_command(command) -> Optional[float]:
     ) as process:
         for line in process.stdout:
             sys.stdout.write(line)
+        process.wait()
         if process.returncode == 0:
             return True
         print(f"Command failed with exit code {process.returncode}")
