@@ -937,8 +937,7 @@ class SchedulerDisaggregationDecodeMixin:
         # 2. decode + prebuilt -> decode + idle (idle forward, prebuilt returns)
         # 3. prebuilt + None -> None (None forward, prebuilt returns) + None
         # 4. prebuilt + decode + None -> idle (idle forward, prebuilt returns) + decode + idle
-        if self.require_mlp_sync:
-            ret = self.prepare_mlp_sync_batch(ret)
+        ret = self.maybe_prepare_mlp_sync_batch_and_log_stats(ret)
 
         if ret:
             trace_event_batch("schedule", ret.reqs)
