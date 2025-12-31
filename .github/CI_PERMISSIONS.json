@@ -13,14 +13,14 @@
         "reason": "custom override",
         "can_rerun_stage": true
     },
-    "AniZpZ": {
+    "alphabetc1": {
         "can_tag_run_ci_label": true,
         "can_rerun_failed_ci": true,
         "cooldown_interval_minutes": 0,
         "reason": "custom override",
         "can_rerun_stage": true
     },
-    "alphabetc1": {
+    "AniZpZ": {
         "can_tag_run_ci_label": true,
         "can_rerun_failed_ci": true,
         "cooldown_interval_minutes": 0,
