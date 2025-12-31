@@ -2414,34 +2414,19 @@ class Scheduler(
             tp_group = self.tp_cpu_group
 
         if tp_size > 1:
-            # Rank 0 broadcasts the ready/timeout counts to all ranks
+            # Rank 0 is broadcasts its ready/timeout counts to all ranks
             tensor = torch.tensor([num_ready_reqs, num_timeout_reqs], dtype=torch.int32)
 
             # Broadcast from local rank 0 within the TP group, using group_src (local rank)
             # rather than src (global rank) to be consistent with other self.tp_rank == 0 checks
             torch.distributed.broadcast(tensor, group_src=0, group=tp_group)
-            num_ready_reqs_max, num_timeout_reqs_max = tensor.tolist()
-
-            # Rank 0 may need to wait for additional grammars that other ranks counted as ready
-            if self.tp_rank == 0:
-                for i in range(num_ready_reqs, num_ready_reqs_max):
-                    req = self.grammar_queue[i]
-                    if req.finished():
-                        continue
-                    # On cache hit, req.grammar is already compiled.
-                    if not isinstance(req.grammar, futures.Future):
-                        continue
-                    req.grammar = req.grammar.result()
-                    self.grammar_backend.set_cache(req.grammar_key, req.grammar.copy())
-                    if req.grammar is INVALID_GRAMMAR_OBJ:
-                        error_msg = f"Invalid grammar request: {req.grammar_key=}"
-                        req.set_finish_with_abort(error_msg)
+            num_ready_reqs_rank_0, num_timeout_reqs_rank_0 = tensor.tolist()
         else:
-            num_ready_reqs_max = num_ready_reqs
-            num_timeout_reqs_max = num_timeout_reqs
+            num_ready_reqs_rank_0 = num_ready_reqs
+            num_timeout_reqs_rank_0 = num_timeout_reqs
 
         # Handle timed-out requests: all ranks must abort to maintain consistency.
-        for i in range(num_ready_reqs, num_ready_reqs + num_timeout_reqs_max):
+        for i in range(num_ready_reqs_rank_0, num_ready_reqs_rank_0 + num_timeout_reqs_rank_0):
             req = self.grammar_queue[i]
             # Only rank 0 has futures to cancel and cache to update
             if self.tp_rank == 0 and isinstance(req.grammar, futures.Future):
@@ -2450,7 +2435,7 @@ class Scheduler(
             error_msg = f"Grammar preprocessing timed out for {req.grammar_key=}"
             req.set_finish_with_abort(error_msg)
 
-        num_ready_reqs = num_ready_reqs_max + num_timeout_reqs_max
+        num_ready_reqs = num_ready_reqs_rank_0 + num_timeout_reqs_rank_0
 
         # Move synchronized requests from grammar_queue to waiting_queue.
         for req in self.grammar_queue[:num_ready_reqs]:
