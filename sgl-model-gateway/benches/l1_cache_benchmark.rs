@@ -1,10 +1,8 @@
-use std::sync::Arc;
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
-use sgl_model_gateway::tokenizer::cache::L1Cache; // Corrected path
+use sgl_model_gateway::tokenizer::cache::L1Cache;
 use sgl_model_gateway::tokenizer::mock::MockTokenizer;
 
-/// Generates a realistic ChatML prompt with N turns to test boundary scaling
 fn generate_prompt(turns: usize) -> String {
     let mut prompt = String::new();
     prompt.push_str("<|im_start|>system\nYou are a helpful AI assistant.<|im_end|>");
@@ -30,7 +28,7 @@ fn bench_l1_cache(c: &mut Criterion) {
         // Measure throughput in terms of characters processed per second
         group.throughput(Throughput::Elements(input.len() as u64));
 
-        // --- 1. Insertion Benchmark ---
+        // Insertion Benchmark
         // Current code re-hashes and re-tokenizes the prefix at every boundary.
         // Optimization targets this method specifically.
         group.bench_function("insert_at_boundaries", |b| {
@@ -47,7 +45,7 @@ fn bench_l1_cache(c: &mut Criterion) {
             })
         });
 
-        // --- 2. Lookup Benchmark ---
+        // Lookup Benchmark
         // This measures the efficiency of the backward search.
         group.bench_function("longest_prefix_match", |b| {
             let cache = L1Cache::new(100 * 1024 * 1024);
