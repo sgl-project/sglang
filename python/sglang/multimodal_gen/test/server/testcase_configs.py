@@ -153,6 +153,7 @@ class DiffusionServerArgs:
     lora_path: str | None = None  # LoRA adapter path (HF repo or local path)
 
     dit_layerwise_offload: bool = False
+    enable_cache_dit: bool = False  # Enable SGLANG_CACHE_DIT_ENABLED env var
 
 
 @dataclass(frozen=True)
@@ -293,6 +294,17 @@ ONE_GPU_CASES_A: list[DiffusionTestCase] = [
         T2I_sampling_params,
     ),
     DiffusionTestCase(
+        "qwen_image_t2i_cache_dit_enabled",
+        DiffusionServerArgs(
+            model_path="Qwen/Qwen-Image",
+            modality="image",
+            warmup_text=1,
+            warmup_edit=0,
+            enable_cache_dit=True,
+        ),
+        T2I_sampling_params,
+    ),
+    DiffusionTestCase(
         "flux_image_t2i",
         DiffusionServerArgs(
             model_path="black-forest-labs/FLUX.1-dev",
@@ -368,6 +380,20 @@ ONE_GPU_CASES_B: list[DiffusionTestCase] = [
             warmup_text=0,
             warmup_edit=0,
             custom_validator="video",
+        ),
+        DiffusionSamplingParams(
+            prompt=T2V_PROMPT,
+        ),
+    ),
+    DiffusionTestCase(
+        "wan2_1_t2v_1.3b_cache_dit_enabled",
+        DiffusionServerArgs(
+            model_path="Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
+            modality="video",
+            warmup_text=0,
+            warmup_edit=0,
+            custom_validator="video",
+            enable_cache_dit=True,
         ),
         DiffusionSamplingParams(
             prompt=T2V_PROMPT,
