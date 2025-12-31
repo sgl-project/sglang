@@ -1,4 +1,4 @@
-## Bench Serving Guide
+# Bench Serving Guide
 
 This guide explains how to benchmark online serving throughput and latency using `python -m sglang.bench_serving`. It supports multiple inference backends via OpenAI-compatible and native endpoints, and produces both console metrics and optional JSONL outputs.
 

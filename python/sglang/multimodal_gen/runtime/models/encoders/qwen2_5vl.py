@@ -54,7 +54,13 @@ from sglang.multimodal_gen.runtime.utils.common import add_prefix
 # limitations under the License.
 """Inference-only Qwen2-VL model compatible with HuggingFace weights."""
 import logging
-from typing import Callable, Iterable, Optional, Tuple, Union, Unpack
+from typing import Callable, Iterable, Optional, Tuple, Union
+
+try:
+    from typing import Unpack  # type: ignore[attr-defined]
+except ImportError:
+    # Python 3.10 and below
+    from typing_extensions import Unpack
 
 import torch
 import torch.nn as nn
@@ -131,7 +137,7 @@ class Qwen2_5_VLAttention(nn.Module):
             softmax_scale=self.scaling,
             causal=True,
             supported_attention_backends=(
-                AttentionBackendEnum.FA3,
+                AttentionBackendEnum.FA,
                 AttentionBackendEnum.TORCH_SDPA,
             ),
         )
@@ -382,13 +388,6 @@ class Qwen2_5_VLTextModel(nn.Module):
             raise ValueError(
                 "You must specify exactly one of input_ids or inputs_embeds"
             )
-
-        if self.gradient_checkpointing and self.training:
-            if use_cache:
-                logger.warn(
-                    "`use_cache=True` is incompatible with gradient checkpointing. Setting `use_cache=False`..."
-                )
-                use_cache = False
 
         # torch.jit.trace() doesn't support cache objects in the output
         if use_cache and past_key_values is None and not torch.jit.is_tracing():

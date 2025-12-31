@@ -5,8 +5,6 @@ This test module verifies the functionality of ModelOptModelLoader, which
 applies NVIDIA Model Optimizer quantization to models during loading.
 """
 
-import os
-import sys
 import unittest
 from unittest.mock import MagicMock, patch
 

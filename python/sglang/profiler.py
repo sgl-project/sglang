@@ -18,26 +18,19 @@ import requests
 PROFILER_DIR = os.getenv("SGLANG_TORCH_PROFILER_DIR", "/tmp")
 
 
-def _run_profile(
+def run_profile(
     url: Optional[str],
     num_steps: int,
     activities: List[str],
     output_dir: Optional[str] = None,
-    profile_name: Optional[str] = None,
     profile_by_stage: bool = False,
     merge_profiles: bool = False,
+    profile_prefix: Optional[str] = None,
 ) -> str:
     if output_dir is None:
         output_dir = PROFILER_DIR
 
-    output_dir = os.path.normpath(output_dir)
-    output_dir = os.path.abspath(output_dir)
-    output_dir = Path(output_dir)
-
-    # Add "profile_name/timestamp" to the path.
-    if profile_name:
-        output_dir = output_dir / profile_name
-    output_dir = output_dir / str(time.time())
+    output_dir = Path(os.path.abspath(os.path.normpath(output_dir))) / str(time.time())
     output_dir.mkdir(exist_ok=True, parents=True)
 
     print(f"Dump profiling traces to {output_dir}")
@@ -62,6 +55,7 @@ def _run_profile(
         "activities": activities,
         "profile_by_stage": profile_by_stage,
         "merge_profiles": merge_profiles,
+        "profile_prefix": profile_prefix,
     }
 
     response = requests.post(url=url + "/start_profile", json=json_data)
@@ -69,28 +63,6 @@ def _run_profile(
 
     trace_link = str(output_dir)
     return trace_link
-
-
-def run_profile(
-    url: Optional[str],
-    num_steps: int,
-    activities: List[str],
-    output_dir: Optional[str] = None,
-    profile_name: Optional[str] = None,
-    profile_by_stage: bool = False,
-    merge_profiles: bool = False,
-):
-    # step based profile will self terminate on num_steps constraints
-    link = _run_profile(
-        url,
-        num_steps,
-        activities,
-        output_dir,
-        profile_name,
-        profile_by_stage,
-        merge_profiles,
-    )
-    return link
 
 
 if __name__ == "__main__":
@@ -108,12 +80,6 @@ if __name__ == "__main__":
         help="Profile directory to dump profile traces.",
     )
     parser.add_argument(
-        "--profile-name",
-        type=str,
-        default=None,
-        help="The name of this profile run.",
-    )
-    parser.add_argument(
         "--num-steps",
         type=int,
         default=5,
@@ -125,6 +91,11 @@ if __name__ == "__main__":
         type=bool,
         default=False,
         help="Whether to profile prefill and decode separately",
+    )
+    parser.add_argument(
+        "--profile-prefix",
+        type=str,
+        help="The prefix of this profiler file.",
     )
     parser.add_argument(
         "--cpu",
@@ -145,14 +116,14 @@ if __name__ == "__main__":
         action=argparse.BooleanOptionalAction,
         type=bool,
         default=False,
-        help="Whether to memory usage (https://pytorch.org/memory_viz)",
+        help="Whether to profile memory usage (https://pytorch.org/memory_viz)",
     )
     parser.add_argument(
         "--rpd",
         action=argparse.BooleanOptionalAction,
         type=bool,
         default=False,
-        help="Whether to use rpd profiler (https://github.com/ROCm/rocmProfileData)",
+        help="Whether to use ROCM rpd profiler (https://github.com/ROCm/rocmProfileData)",
     )
     parser.add_argument(
         "--merge-profiles",
@@ -172,12 +143,13 @@ if __name__ == "__main__":
         activities.append("MEM")
     if args.rpd:
         activities.append("RPD")
+
     run_profile(
-        args.url,
-        args.num_steps,
-        activities,
-        args.output_dir,
-        args.profile_name,
-        args.profile_by_stage,
-        args.merge_profiles,
+        url=args.url,
+        num_steps=args.num_steps,
+        activities=activities,
+        output_dir=args.output_dir,
+        profile_by_stage=args.profile_by_stage,
+        profile_prefix=args.profile_prefix,
+        merge_profiles=args.merge_profiles,
     )

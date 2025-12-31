@@ -40,7 +40,7 @@ from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
-from sglang.srt.layers.sampler import Sampler
+from sglang.srt.layers.sampler import create_sampler
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -150,6 +150,7 @@ class HunYuanSparseMoeBlock(nn.Module):
 
         self.topk = TopK(
             top_k=top_k,
+            layer_id=layer_id,
             renormalize=True if top_k > 1 else False,
         )
 
@@ -603,7 +604,7 @@ class HunYuanMoEV1ForCausalLM(nn.Module):
 
         logit_scale = getattr(config, "logit_scale", 1.0)
         self.logits_processor = LogitsProcessor(config, logit_scale=logit_scale)
-        self.sampler = Sampler()
+        self.sampler = create_sampler()
 
     def forward(
         self,

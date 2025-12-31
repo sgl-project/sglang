@@ -276,17 +276,17 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
         layer.w2_weight_scale_inv = Parameter(w2_weight_scale, requires_grad=False)
 
         # Process input scales
-        w13_input_scale_max = layer.w13_input_scale.max().to(dtype).item()
+        w13_input_scale_max = layer.w13_input_scale.max().to(torch.float32).item()
         new_w13_input_scale = torch.tensor(
             [w13_input_scale_max],
-            dtype=dtype,
+            dtype=torch.float32,
             device=device,
         )
         layer.w13_input_scale = Parameter(new_w13_input_scale, requires_grad=False)
 
-        w2_input_scale_max = layer.w2_input_scale.max().to(dtype).item()
+        w2_input_scale_max = layer.w2_input_scale.max().to(torch.float32).item()
         new_w2_input_scale = torch.tensor(
-            [w2_input_scale_max], dtype=dtype, device=device
+            [w2_input_scale_max], dtype=torch.float32, device=device
         )
         layer.w2_input_scale = Parameter(new_w2_input_scale, requires_grad=False)
 

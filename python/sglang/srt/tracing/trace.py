@@ -30,17 +30,34 @@ from sglang.srt.utils import get_int_env_var
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Req
+from typing import Any, Dict, List, Mapping, Optional
 
 logger = logging.getLogger(__name__)
 opentelemetry_imported = False
 tracing_enabled = False
+_trace_context_propagator = None
+
+TRACE_HEADERS = ["traceparent", "tracestate"]
 
 try:
     from opentelemetry import context, propagate, trace
-    from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
+    from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import (
+        OTLPSpanExporter as GRPCSpanExporter,
+    )
+    from opentelemetry.exporter.otlp.proto.http.trace_exporter import (
+        OTLPSpanExporter as HTTPSpanExporter,
+    )
+    from opentelemetry.sdk.environment_variables import (
+        OTEL_EXPORTER_OTLP_TRACES_PROTOCOL,
+    )
     from opentelemetry.sdk.resources import SERVICE_NAME, Resource
     from opentelemetry.sdk.trace import TracerProvider, id_generator
     from opentelemetry.sdk.trace.export import BatchSpanProcessor
+    from opentelemetry.trace.propagation.tracecontext import (
+        TraceContextTextMapPropagator,
+    )
+
+    _trace_context_propagator = TraceContextTextMapPropagator()
 
     opentelemetry_imported = True
 except ImportError:
@@ -49,7 +66,15 @@ except ImportError:
         class IdGenerator:
             pass
 
-    logger.info("opentelemetry package is not installed, tracing disabled")
+    logger.debug("opentelemetry package is not installed, tracing disabled")
+
+
+def is_tracing_enabled() -> bool:
+    return tracing_enabled
+
+
+def extract_trace_headers(headers: Mapping[str, str]) -> Optional[Dict]:
+    return {h: headers[h] for h in TRACE_HEADERS if h in headers}
 
 
 @dataclass
@@ -186,6 +211,7 @@ def process_tracing_init(otlp_endpoint, server_name):
     global tracing_enabled
     global __get_cur_time_ns
     if not opentelemetry_imported:
+        logger.warning(f"Tracing is disabled because the packages cannot be imported.")
         tracing_enabled = False
         return
 
@@ -207,15 +233,16 @@ def process_tracing_init(otlp_endpoint, server_name):
         )
 
         processor = BatchSpanProcessor(
-            OTLPSpanExporter(endpoint=otlp_endpoint, insecure=True),
+            span_exporter=get_otlp_span_exporter(otlp_endpoint),
             schedule_delay_millis=schedule_delay_millis,
             max_export_batch_size=max_export_batch_size,
         )
         tracer_provider.add_span_processor(processor)
         trace.set_tracer_provider(tracer_provider)
     except Exception as e:
-        logger.error(f": initialize opentelemetry error:{e}")
-        logger.warning("pelease set correct otlp endpoint")
+        logger.error(
+            f"Initialize OpenTelemetry error: {e}. Please set correct otlp endpoint."
+        )
         tracing_enabled = False
         return
 
@@ -223,6 +250,22 @@ def process_tracing_init(otlp_endpoint, server_name):
         __get_cur_time_ns = lambda: int(time.time_ns())
 
     tracing_enabled = True
+
+
+def get_otlp_span_exporter(endpoint):
+    protocol = os.environ.get(OTEL_EXPORTER_OTLP_TRACES_PROTOCOL, "grpc")
+    supported_protocols = {"grpc", "http/protobuf"}
+
+    if protocol not in supported_protocols:
+        raise ValueError(
+            f"Unsupported OTLP protocol '{protocol}' configured. "
+            f"Supported protocols are: {', '.join(sorted(supported_protocols))}"
+        )
+
+    if protocol == "grpc":
+        return GRPCSpanExporter(endpoint=endpoint, insecure=True)
+    elif protocol == "http/protobuf":
+        return HTTPSpanExporter(endpoint=endpoint)
 
 
 # Should be called by each tracked thread.
@@ -394,6 +437,7 @@ def trace_req_start(
     bootstrap_room: Optional[int] = None,
     ts: Optional[int] = None,
     role: Optional[str] = "null",
+    external_trace_header: Optional[Dict[str, str]] = None,
 ):
     if not tracing_enabled:
         return
@@ -420,10 +464,14 @@ def trace_req_start(
     tracer = threads_info[pid].tracer
     if str(bootstrap_room) not in remote_trace_contexts:
         attrs = {"bootstrap_room": str(hex(bootstrap_room))}
+        external_trace_context = _trace_context_propagator.extract(
+            external_trace_header or {}
+        )
         bootstrap_room_span = tracer.start_span(
             name=f"Bootstrap Room {hex(bootstrap_room)}",
             start_time=ts,
             attributes=attrs,
+            context=external_trace_context,
         )
         reqs_context[rid].bootstrap_room_span = bootstrap_room_span
         bootstrap_room_span_context = trace.set_span_in_context(bootstrap_room_span)
@@ -488,7 +536,7 @@ def trace_req_finish(
     req_context.root_span.end(end_time=ts)
     if str(req_context.bootstrap_room) in remote_trace_contexts:
         del remote_trace_contexts[str(req_context.bootstrap_room)]
-    else:
+    elif req_context.bootstrap_room_span:
         req_context.bootstrap_room_span.end(end_time=ts)
 
     del reqs_context[rid]
@@ -678,10 +726,14 @@ def trace_event_batch(
     name: str,
     reqs: List[Req],
     ts: Optional[int] = None,
-    attrs: Dict[str, Any] = None,
+    attrs: Dict[str, Any] = {},
 ):
     if not tracing_enabled:
         return
 
+    bid = uuid.uuid4().hex[:8]
+    _attrs = {"bid": bid, "batch_size": len(reqs)}
+    _attrs.update(attrs)
+
     for req in reqs:
-        trace_event(name, req.rid, ts=ts, attrs=attrs)
+        trace_event(name, req.rid, ts=ts, attrs=_attrs)

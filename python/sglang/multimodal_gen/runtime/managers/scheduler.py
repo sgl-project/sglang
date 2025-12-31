@@ -1,12 +1,20 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
 # SPDX-License-Identifier: Apache-2.0
-from typing import Any
+import pickle
+from collections import deque
+from typing import Any, List
 
 import zmq
 
+from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
+    MergeLoraWeightsReq,
+    SetLoraReq,
+    UnmergeLoraWeightsReq,
+)
 from sglang.multimodal_gen.runtime.managers.gpu_worker import GPUWorker
-from sglang.multimodal_gen.runtime.pipelines.pipeline_batch_info import OutputBatch
+from sglang.multimodal_gen.runtime.pipelines_core import Req
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 from sglang.multimodal_gen.runtime.server_args import (
     PortArgs,
     ServerArgs,
@@ -41,10 +49,13 @@ class Scheduler:
 
         # Inter-process Communication
         self.context = zmq.Context(io_threads=2)
-        endpoint = server_args.scheduler_endpoint()
-        logger.info(f"Scheduler listening at endpoint: {endpoint}")
+        endpoint = server_args.scheduler_endpoint
         if gpu_id == 0:
-            self.receiver = get_zmq_socket(self.context, zmq.REP, endpoint, True)
+            # router allocates identify (envelope) for each connection
+            self.receiver, actual_endpoint = get_zmq_socket(
+                self.context, zmq.ROUTER, endpoint, True
+            )
+            logger.info(f"Scheduler bind at endpoint: {actual_endpoint}")
         else:
             self.receiver = None
 
@@ -60,20 +71,71 @@ class Scheduler:
         self.gpu_id = gpu_id
         self._running = True
 
-    def return_result(self, output_batch: OutputBatch):
+        self.request_handlers = {
+            SetLoraReq: self._handle_set_lora,
+            MergeLoraWeightsReq: self._handle_merge_lora,
+            UnmergeLoraWeightsReq: self._handle_unmerge_lora,
+            Req: self._handle_generation,
+            List[Req]: self._handle_generation,
+        }
+
+        # FIFO, new reqs are appended
+        self.waiting_queue: deque[tuple[bytes, Req]] = deque()
+
+    def _handle_set_lora(self, reqs: List[Any]):
+        # TODO: return set status
+        req = reqs[0]
+        self.worker.set_lora(req.lora_nickname, req.lora_path, req.target, req.strength)
+        return {"status": "ok"}
+
+    def _handle_merge_lora(self, reqs: List[Any]):
+        req = reqs[0]
+        self.worker.merge_lora_weights(req.target, req.strength)
+        return {"status": "ok"}
+
+    def _handle_unmerge_lora(self, reqs: List[Any]):
+        req = reqs[0]
+        self.worker.unmerge_lora_weights(req.target)
+        return {"status": "ok"}
+
+    def _handle_generation(self, reqs: List[Req]):
+        return self.worker.execute_forward(reqs)
+
+    def return_result(self, output_batch: OutputBatch, identity: bytes | None = None):
         """
         replies to client, only on rank 0
         """
-        if self.receiver is not None:
-            self.receiver.send_pyobj(output_batch)
+        if self.receiver is not None and identity is not None:
+            self.receiver.send_multipart([identity, b"", pickle.dumps(output_batch)])
 
-    def recv_reqs(self):
+    def get_next_batch_to_run(self) -> list[tuple[bytes, Req]] | None:
+        """pull a req from waiting_queue"""
+        if not self.waiting_queue:
+            return None
+
+        # pop the first (earliest)
+        item = self.waiting_queue.popleft()
+
+        return [item]
+
+    def recv_reqs(self) -> List[tuple[bytes, Any]]:
         """
         For non-main schedulers, reqs are broadcasted from main using broadcast_pyobj
         """
         if self.receiver is not None:
-            recv_reqs = self.receiver.recv_pyobj()
-            assert isinstance(recv_reqs, list)
+            try:
+                identity, _, payload = self.receiver.recv_multipart()
+                recv_reqs = pickle.loads(payload)
+            except zmq.ZMQError:
+                # re-raise or handle appropriately to let the outer loop continue
+                raise
+
+            # Ensure recv_reqs is a list
+            if not isinstance(recv_reqs, list):
+                recv_reqs = [recv_reqs]
+
+            # Pack with identity for rank 0
+            recv_reqs = [(identity, req) for req in recv_reqs]
         else:
             recv_reqs = None
 
@@ -106,22 +168,22 @@ class Scheduler:
 
         return recv_reqs
 
-    # TODO: queueing, cancellation
     def event_loop(self) -> None:
         """
         The main event loop that listens for ZMQ requests.
         Handles abortion
         """
 
-        logger.info(
+        logger.debug(
             f"Rank 0 scheduler listening on tcp://*:{self.server_args.scheduler_port}"
         )
 
         while self._running:
-            reqs = None
             # 1: receive requests
             try:
-                reqs = self.recv_reqs()
+                new_reqs = self.recv_reqs()
+                # after processing input reqs
+                self.waiting_queue.extend(new_reqs)
             except Exception as e:
                 logger.error(
                     f"Error receiving requests in scheduler event loop: {e}",
@@ -130,21 +192,43 @@ class Scheduler:
                 continue
 
             # 2: execute, make sure a reply is always sent
-            try:
-                output_batch = self.worker.execute_forward(reqs, self.server_args)
-            except Exception as e:
-                logger.error(
-                    f"Error executing forward in scheduler event loop: {e}",
-                    exc_info=True,
-                )
-                output_batch = OutputBatch(error=str(e))
+            while self.waiting_queue:
+                items = self.get_next_batch_to_run()
+                if not items:
+                    break
 
-            try:
-                self.return_result(output_batch)
-            except zmq.ZMQError as e:
-                # Reply failed; log and keep loop alive to accept future requests
-                logger.error(f"ZMQ error sending reply: {e}")
-                continue
+                identities = [item[0] for item in items]
+                reqs = [item[1] for item in items]
+
+                try:
+                    first_req = reqs[0]
+                    handler = self.request_handlers.get(type(first_req))
+                    if handler:
+                        output_batch = handler(reqs)
+                    else:
+                        output_batch = {
+                            "status": "error",
+                            "message": f"Unknown request type: {type(first_req)}",
+                        }
+                except Exception as e:
+                    logger.error(
+                        f"Error executing request in scheduler event loop: {e}",
+                        exc_info=True,
+                    )
+                    # Determine appropriate error response format
+                    output_batch = (
+                        OutputBatch(error=str(e))
+                        if reqs and isinstance(reqs[0], Req)
+                        else {"status": "error", "message": str(e)}
+                    )
+
+                try:
+                    # TODO: Support sending back to multiple identities if batched
+                    self.return_result(output_batch, identities[0])
+                except zmq.ZMQError as e:
+                    # Reply failed; log and keep loop alive to accept future requests
+                    logger.error(f"ZMQ error sending reply: {e}")
+                    continue
 
         logger.info("Scheduler event loop terminated.")
         if self.receiver is not None:
@@ -169,7 +253,7 @@ class Scheduler:
             return {"status": "ok", "result": result}
         return {"status": "error", "error": f"Unknown method: {method}"}
 
-    def _collect_slave_results(self) -> list[dict[str, Any]]:
+    def _collect_slave_results(self) -> List[dict[str, Any]]:
         """Collect results from all slave worker processes."""
         results = []
         for pipe in self.result_pipes_from_slaves:

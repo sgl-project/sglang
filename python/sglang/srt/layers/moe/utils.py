@@ -2,8 +2,7 @@ from __future__ import annotations
 
 import logging
 from contextlib import contextmanager
-from enum import Enum
-from functools import lru_cache
+from enum import Enum, IntEnum
 from typing import TYPE_CHECKING, Optional
 
 from sglang.srt.distributed.parallel_state import get_moe_expert_parallel_world_size
@@ -24,6 +23,7 @@ class MoeA2ABackend(Enum):
     NONE = "none"
     DEEPEP = "deepep"
     MOONCAKE = "mooncake"
+    ASCEND_FUSEEP = "ascend_fuseep"
 
     @classmethod
     def _missing_(cls, value):
@@ -43,6 +43,9 @@ class MoeA2ABackend(Enum):
     def is_mooncake(self):
         return self == MoeA2ABackend.MOONCAKE
 
+    def is_ascend_fuseep(self):
+        return self == MoeA2ABackend.ASCEND_FUSEEP
+
 
 class MoeRunnerBackend(Enum):
 
@@ -55,6 +58,7 @@ class MoeRunnerBackend(Enum):
     FLASHINFER_MXFP4 = "flashinfer_mxfp4"
     FLASHINFER_CUTEDSL = "flashinfer_cutedsl"
     CUTLASS = "cutlass"
+    MARLIN = "marlin"
 
     def is_auto(self):
         return self == MoeRunnerBackend.AUTO
@@ -82,6 +86,9 @@ class MoeRunnerBackend(Enum):
 
     def is_cutlass(self):
         return self == MoeRunnerBackend.CUTLASS
+
+    def is_marlin(self):
+        return self == MoeRunnerBackend.MARLIN
 
 
 class DeepEPMode(Enum):
@@ -118,24 +125,28 @@ class DeepEPMode(Enum):
 MOE_A2A_BACKEND: Optional[MoeA2ABackend] = None
 MOE_RUNNER_BACKEND: Optional[MoeRunnerBackend] = None
 SPECULATIVE_MOE_RUNNER_BACKEND: Optional[MoeRunnerBackend] = None
+SPECULATIVE_MOE_A2A_BACKEND: Optional[MoeA2ABackend] = None
 DEEPEP_MODE: Optional[DeepEPMode] = None
 IS_TBO_ENABLED: Optional[bool] = None
 IS_SBO_ENABLED: Optional[bool] = None
 TBO_TOKEN_DISTRIBUTION_THRESHOLD: Optional[float] = None
 DEEPEP_CONFIG: Optional[str] = None
 DISABLE_FLASHINFER_CUTLASS_MOE_FP4_ALLGATHER: Optional[bool] = None
+MOE_QUANTIZATION: Optional[str] = None
 
 
 def initialize_moe_config(server_args: ServerArgs):
     global MOE_A2A_BACKEND
     global MOE_RUNNER_BACKEND
     global SPECULATIVE_MOE_RUNNER_BACKEND
+    global SPECULATIVE_MOE_A2A_BACKEND
     global DEEPEP_MODE
     global DEEPEP_CONFIG
     global IS_TBO_ENABLED
     global IS_SBO_ENABLED
     global TBO_TOKEN_DISTRIBUTION_THRESHOLD
     global DISABLE_FLASHINFER_CUTLASS_MOE_FP4_ALLGATHER
+    global MOE_QUANTIZATION
 
     MOE_A2A_BACKEND = MoeA2ABackend(server_args.moe_a2a_backend)
     MOE_RUNNER_BACKEND = MoeRunnerBackend(server_args.moe_runner_backend)
@@ -143,6 +154,11 @@ def initialize_moe_config(server_args: ServerArgs):
         MoeRunnerBackend(server_args.speculative_moe_runner_backend)
         if server_args.speculative_moe_runner_backend is not None
         else MOE_RUNNER_BACKEND
+    )
+    SPECULATIVE_MOE_A2A_BACKEND = (
+        MoeA2ABackend(server_args.speculative_moe_a2a_backend)
+        if server_args.speculative_moe_a2a_backend is not None
+        else MOE_A2A_BACKEND
     )
     DEEPEP_MODE = DeepEPMode(server_args.deepep_mode)
     DEEPEP_CONFIG = server_args.deepep_config or ""
@@ -152,6 +168,7 @@ def initialize_moe_config(server_args: ServerArgs):
     DISABLE_FLASHINFER_CUTLASS_MOE_FP4_ALLGATHER = (
         server_args.disable_flashinfer_cutlass_moe_fp4_allgather
     )
+    MOE_QUANTIZATION = server_args.quantization
 
 
 def get_moe_a2a_backend() -> MoeA2ABackend:
@@ -180,6 +197,16 @@ def get_speculative_moe_runner_backend() -> MoeRunnerBackend:
         )
         SPECULATIVE_MOE_RUNNER_BACKEND = MoeRunnerBackend.AUTO
     return SPECULATIVE_MOE_RUNNER_BACKEND
+
+
+def get_speculative_moe_a2a_backend() -> MoeA2ABackend:
+    global SPECULATIVE_MOE_A2A_BACKEND
+    if SPECULATIVE_MOE_A2A_BACKEND is None:
+        logger.warning(
+            "SPECULATIVE_MOE_A2A_BACKEND is not initialized, using none backend"
+        )
+        SPECULATIVE_MOE_A2A_BACKEND = MoeA2ABackend.NONE
+    return SPECULATIVE_MOE_A2A_BACKEND
 
 
 def get_deepep_mode() -> DeepEPMode:
@@ -222,7 +249,6 @@ def get_tbo_token_distribution_threshold() -> float:
     return TBO_TOKEN_DISTRIBUTION_THRESHOLD
 
 
-@lru_cache(maxsize=1)
 def should_use_flashinfer_cutlass_moe_fp4_allgather():
     """
     Perform FP4 quantize before all-gather for flashinfer cutlass moe to reduce communication cost for high-throughput serving.
@@ -231,6 +257,7 @@ def should_use_flashinfer_cutlass_moe_fp4_allgather():
         not DISABLE_FLASHINFER_CUTLASS_MOE_FP4_ALLGATHER
         and get_moe_runner_backend().is_flashinfer_cutlass()
         and is_dp_attention_enabled()
+        and MOE_QUANTIZATION == "modelopt_fp4"
         and get_moe_expert_parallel_world_size() == get_attention_dp_size()
     )
 
@@ -248,3 +275,46 @@ def speculative_moe_backend_context():
         yield
     finally:
         MOE_RUNNER_BACKEND = original_backend
+
+
+@contextmanager
+def speculative_moe_a2a_backend_context():
+    """
+    Context manager to temporarily use the speculative MoE A2A backend for draft model operations.
+    This ensures that draft models in speculative decoding use the configured speculative A2A backend.
+    """
+    global MOE_A2A_BACKEND
+    global DISABLE_FLASHINFER_CUTLASS_MOE_FP4_ALLGATHER
+    original_backend = MOE_A2A_BACKEND
+    original_disable_flashinfer_cutlass_moe_fp4_allgather = (
+        DISABLE_FLASHINFER_CUTLASS_MOE_FP4_ALLGATHER
+    )
+    try:
+        MOE_A2A_BACKEND = get_speculative_moe_a2a_backend()
+        # Disable FP4 allgather for spec decode since MTP layers are unquantized
+        DISABLE_FLASHINFER_CUTLASS_MOE_FP4_ALLGATHER = True
+        yield
+    finally:
+        MOE_A2A_BACKEND = original_backend
+        DISABLE_FLASHINFER_CUTLASS_MOE_FP4_ALLGATHER = (
+            original_disable_flashinfer_cutlass_moe_fp4_allgather
+        )
+
+
+# The type of method in top-K routing, for use in torch custom op
+# Please keep this in sync with the counterpart defined in https://github.com/flashinfer-ai/flashinfer/blob/main/include/flashinfer/trtllm/fused_moe/runner.h
+class RoutingMethodType(IntEnum):
+    # Default: Softmax -> TopK
+    Default = (0,)
+    # Renormalize: TopK -> Softmax
+    Renormalize = (1,)
+    # DeepSeekV3: Sigmoid -> RoutingBiasAdd -> Top2 in group -> Top4 groups -> Top8 experts from the Top4 groups
+    DeepSeekV3 = (2,)
+    # Llama4: Top1 -> Sigmoid
+    Llama4 = (3,)
+    # Qwen3: Softmax -> TopK -> Renormalize
+    RenormalizeNaive = (4,)
+    # TopK only (no softmax)
+    TopK = (5,)
+    # Unspecified
+    Unspecified = 6

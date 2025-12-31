@@ -21,12 +21,8 @@ from functools import lru_cache, partial, wraps
 from typing import Any, TypeVar, cast
 
 import cloudpickle
-import imageio
-import numpy as np
 import torch
-import torchvision
 import yaml
-from einops import rearrange
 from remote_pdb import RemotePdb
 from torch.distributed.fsdp import MixedPrecisionPolicy
 
@@ -48,8 +44,8 @@ PRECISION_TO_TYPE = {
     "bf16": torch.bfloat16,
 }
 
-STR_BACKEND_ENV_VAR: str = "SGL_DIFFUSION_ATTENTION_BACKEND"
-STR_ATTN_CONFIG_ENV_VAR: str = "SGL_DIFFUSION_ATTENTION_CONFIG"
+STR_BACKEND_ENV_VAR: str = "SGLANG_DIFFUSION_ATTENTION_BACKEND"
+STR_ATTN_CONFIG_ENV_VAR: str = "SGLANG_DIFFUSION_ATTENTION_CONFIG"
 
 
 def find_nccl_library() -> str:
@@ -59,12 +55,12 @@ def find_nccl_library() -> str:
     After importing `torch`, `libnccl.so.2` or `librccl.so.1` can be
     found by `ctypes` automatically.
     """
-    so_file = envs.SGL_DIFFUSION_NCCL_SO_PATH
+    so_file = envs.SGLANG_DIFFUSION_NCCL_SO_PATH
 
     # manually load the nccl library
     if so_file:
         logger.info(
-            "Found nccl from environment variable SGL_DIFFUSION_NCCL_SO_PATH=%s",
+            "Found nccl from environment variable SGLANG_DIFFUSION_NCCL_SO_PATH=%s",
             so_file,
         )
     else:
@@ -450,8 +446,8 @@ def import_pynvml():
     status without initializing CUDA context in the current process.
     Historically, there are two packages that provide pynvml:
     - `nvidia-ml-py` (https://pypi.org/project/nvidia-ml-py/): The official
-        wrapper. It is a dependency of sgl-diffusion, and is installed when users
-        install sgl-diffusion. It provides a Python module named `pynvml`.
+        wrapper. It is a dependency of sglang-diffusion, and is installed when users
+        install sglang-diffusion. It provides a Python module named `pynvml`.
     - `pynvml` (https://pypi.org/project/pynvml/): An unofficial wrapper.
         Prior to version 12.0, it also provides a Python module `pynvml`,
         and therefore conflicts with the official one which is a standalone Python file.
@@ -698,12 +694,38 @@ def is_vmoba_available() -> bool:
 
 # adapted from: https://github.com/Wan-Video/Wan2.2/blob/main/wan/utils/utils.py
 def masks_like(
-    tensor, zero=False, generator=None, p=0.2
+    tensors, zero=False, generator=None, p=0.2
 ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
-    assert isinstance(tensor, list)
-    out1 = [torch.ones(u.shape, dtype=u.dtype, device=u.device) for u in tensor]
+    """
+    Generate binary masks for Text-to-Image-to-Video (TI2V) tasks.
 
-    out2 = [torch.ones(u.shape, dtype=u.dtype, device=u.device) for u in tensor]
+    Creates masks to control which frames should be preserved vs replaced.
+    Primarily used to fix the first frame to the input image while generating other frames.
+
+    Args:
+        tensors: List of tensors with shape [C, T, H, W]
+        zero: If True, set first frame (dim 1, index 0) to zero. Default: False
+        generator: Optional random generator for stochastic masking
+        p: Probability of applying special noise when generator is provided. Default: 0.2
+
+    Returns:
+        Tuple of two lists of tensors:
+        - When zero=False: Both lists contain all-ones tensors
+        - When zero=True (no generator): First frame set to 0, others to 1
+        - When zero=True (with generator): First frame set to small random values with probability p
+
+    Example:
+        >>> latent = torch.randn(48, 69, 96, 160)  # [C, T, H, W]
+        >>> _, mask = masks_like([latent], zero=True)
+        >>> # mask[0][:, 0] == 0 (first frame)
+        >>> # mask[0][:, 1:] == 1 (other frames)
+        >>> blended = (1.0 - mask[0]) * image + mask[0] * latent
+        >>> # Result: first frame = image, other frames = latent
+    """
+    assert isinstance(tensors, list)
+    out1 = [torch.ones(u.shape, dtype=u.dtype, device=u.device) for u in tensors]
+
+    out2 = [torch.ones(u.shape, dtype=u.dtype, device=u.device) for u in tensors]
 
     if zero:
         if generator is not None:
@@ -762,16 +784,11 @@ def best_output_size(w, h, dw, dh, expected_area):
         return ow2, oh2
 
 
-def save_decoded_latents_as_video(
-    decoded_latents: list[torch.Tensor], output_path: str, fps: int
-):
-    # Process outputs
-    videos = rearrange(decoded_latents, "b c t h w -> t b c h w")
-    frames = []
-    for x in videos:
-        x = torchvision.utils.make_grid(x, nrow=6)
-        x = x.transpose(0, 1).transpose(1, 2).squeeze(-1)
-        frames.append((x * 255).numpy().astype(np.uint8))
+def calculate_dimensions(target_area, ratio):
+    width = math.sqrt(target_area * ratio)
+    height = width / ratio
 
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    imageio.mimsave(output_path, frames, fps=fps, format="mp4")
+    width = round(width / 32) * 32
+    height = round(height / 32) * 32
+
+    return width, height, None

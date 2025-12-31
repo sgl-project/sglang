@@ -1,10 +1,10 @@
-from typing import Tuple
+from typing import Optional, Tuple
 
 import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.utils import is_hip
+from sglang.srt.utils import direct_register_custom_op, is_hip
 
 _is_hip = is_hip()
 
@@ -358,7 +358,11 @@ def experts_combine_kernel(
     tl.store(out_hidden_states + start_index_mlp + offsets, combined_x, mask=mask)
 
 
-def experts_combine_triton(moe_hidden_states, mlp_hidden_states, output_buffer=None):
+def experts_combine_triton(
+    moe_hidden_states: torch.Tensor,
+    mlp_hidden_states: torch.Tensor,
+    output_buffer: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
     assert moe_hidden_states.is_contiguous()
     assert mlp_hidden_states.is_contiguous()
 
@@ -393,7 +397,24 @@ def experts_combine_triton(moe_hidden_states, mlp_hidden_states, output_buffer=N
         hidden_dim,
         **config,
     )
+
     return out_hidden_states
+
+
+def experts_combine_triton_fake(
+    moe_hidden_states: torch.Tensor,
+    mlp_hidden_states: torch.Tensor,
+    output_buffer: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    return torch.empty_like(mlp_hidden_states)
+
+
+direct_register_custom_op(
+    op_name="experts_combine_triton",
+    op_func=experts_combine_triton,
+    mutates_args=[],
+    fake_impl=experts_combine_triton_fake,
+)
 
 
 # gelu on first half of vector

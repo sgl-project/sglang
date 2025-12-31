@@ -1,8 +1,6 @@
 import json
-import os
 import unittest
 
-import numpy as np
 import openai
 
 from sglang.srt.utils import kill_process_tree

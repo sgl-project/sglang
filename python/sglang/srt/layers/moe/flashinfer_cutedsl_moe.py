@@ -1,11 +1,11 @@
 from typing import Optional
 
 import torch
-from flashinfer.cute_dsl.blockscaled_gemm import grouped_gemm_nt_masked
-from sgl_kernel.gemm import (
-    scaled_fp4_grouped_quant,
-    silu_and_mul_scaled_fp4_grouped_quant,
+from flashinfer import (
+    scaled_fp4_grouped_quantize,
+    silu_and_mul_scaled_nvfp4_experts_quantize,
 )
+from flashinfer.cute_dsl.blockscaled_gemm import grouped_gemm_nt_masked
 
 
 def get_cute_dtype(input: torch.Tensor) -> str:
@@ -97,10 +97,10 @@ def flashinfer_cutedsl_moe_masked(
             num_experts,
         ), f"input_global_scale must be (l,), got {input_global_scale.shape}"
 
-        a_q, a_q_sf = scaled_fp4_grouped_quant(
+        a_q, a_q_sf = scaled_fp4_grouped_quantize(
             hidden_states[0],
-            input_global_scale,
             masked_m,
+            input_global_scale,
         )
 
     assert w1.shape[-2] == 2 * n, f"w1 last-2 dim must be 2*n, got {w1.shape}"
@@ -148,10 +148,10 @@ def flashinfer_cutedsl_moe_masked(
     )  # in logical [m, n, l]
 
     # SILU and quantization
-    diq, diq_sf = silu_and_mul_scaled_fp4_grouped_quant(
+    diq, diq_sf = silu_and_mul_scaled_nvfp4_experts_quantize(
         gateup_output.permute(2, 0, 1),
-        a2_global_scale,
         masked_m,
+        a2_global_scale,
     )
 
     if down_start_event is not None:
