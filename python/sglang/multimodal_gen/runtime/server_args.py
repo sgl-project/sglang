@@ -458,7 +458,9 @@ class ServerArgs:
             "--enable-warmup",
             action=StoreBoolean,
             default=ServerArgs.enable_warmup,
-            help="Enable denoising stage warmup for the model.",
+            help="Perform a 1-step end-to-end warmup request before the actual request. "
+            "Recommended to enable when benchmarking to ensure fair comparison and best performance."
+            "When enabled, look for the line ending with `with warmup excluded` for actual processing time.",
         )
         parser.add_argument(
             "--dit-cpu-offload",
