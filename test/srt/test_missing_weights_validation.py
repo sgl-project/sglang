@@ -7,11 +7,12 @@ from checkpoints, which would leave them with random initialization values.
 
 import logging
 import unittest
-from unittest.mock import MagicMock, Mock
+from unittest.mock import Mock
 
 import torch
 import torch.nn as nn
 
+from sglang.srt.layers.utils import PPMissingLayer
 from sglang.srt.model_loader.weight_utils import validate_loaded_weights
 
 
@@ -151,6 +152,52 @@ class TestMissingWeightsValidation(unittest.TestCase):
         self.assertIn("layer2.bias", error_msg)
         # Should explain the issue
         self.assertIn("not loaded from checkpoint", error_msg.lower())
+
+    def test_pp_missing_layer_prefix_correctness(self):
+        """Test that PPMissingLayer exclusions use exact prefix matching.
+
+        When using pipeline parallelism, layers.1 might be a PPMissingLayer.
+        This test ensures that only parameters under layers.1 are excluded,
+        not layers.10, layers.11, etc. (which share the prefix "layers.1").
+        """
+        model = DummyModel()
+
+        # Create a model with layers 0-11
+        model.layers = nn.ModuleList([
+            nn.Linear(10, 10) for _ in range(12)
+        ])
+
+        # Mark layer 1 as missing (on different pipeline stage)
+        model.layers[1] = PPMissingLayer()
+
+        # Load weights for all layers except the PPMissingLayer
+        loaded_params = {
+            "layer1.weight",
+            "layer1.bias",
+            "layer2.weight",
+            "layer2.bias",
+        }
+
+        for i in range(12):
+            if i != 1:  # Skip layer 1 (PPMissingLayer)
+                loaded_params.add(f"layers.{i}.weight")
+                loaded_params.add(f"layers.{i}.bias")
+
+        # Should pass - layers.10 and layers.11 are properly validated
+        # despite sharing "layers.1" as a prefix with the PPMissingLayer
+        validate_loaded_weights(model, loaded_params, self.logger, strict=True)
+
+        # Verify that missing weights in layers.10 are still detected
+        loaded_params_missing_10 = loaded_params.copy()
+        loaded_params_missing_10.remove("layers.10.weight")
+        loaded_params_missing_10.remove("layers.10.bias")
+
+        with self.assertRaises(ValueError) as cm:
+            validate_loaded_weights(model, loaded_params_missing_10, self.logger, strict=True)
+
+        error_msg = str(cm.exception)
+        self.assertIn("layers.10.weight", error_msg)
+        self.assertIn("layers.10.bias", error_msg)
 
 
 if __name__ == "__main__":

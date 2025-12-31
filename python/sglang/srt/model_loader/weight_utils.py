@@ -1383,12 +1383,18 @@ def validate_loaded_weights(
                 expected_missing.add(param_name)
 
     # 4. Pipeline parallelism missing layers
-    for module_name, module in model.named_modules():
-        if isinstance(module, PPMissingLayer):
-            # All params under this module are expected to be missing
-            for param_name in all_params:
-                if param_name.startswith(module_name):
-                    expected_missing.add(param_name)
+    # Collect module prefixes for layers on other pipeline stages.
+    # Append "." to ensure exact prefix matching (e.g., "layers.1." won't match "layers.10").
+    pp_missing_prefixes = [
+        name + "." for name, mod in model.named_modules() if isinstance(mod, PPMissingLayer)
+    ]
+    # Handle edge case: if root module is PPMissingLayer (name=""), all params are missing
+    if "." in pp_missing_prefixes:
+        expected_missing.update(all_params.keys())
+    else:
+        for param_name in all_params:
+            if any(param_name.startswith(prefix) for prefix in pp_missing_prefixes):
+                expected_missing.add(param_name)
 
     # Calculate truly missing parameters
     missing_params = set(all_params.keys()) - loaded_param_names - expected_missing

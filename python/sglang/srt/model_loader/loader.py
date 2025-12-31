@@ -305,6 +305,14 @@ class DefaultModelLoader(BaseModelLoader):
     # default number of thread when enable multithread weight loading
     DEFAULT_NUM_THREADS = 8
 
+    # Mapping of fused parameter names to their constituent parts
+    # Used for tracking weight loading when checkpoints have separate parameters
+    # (e.g., q_proj, k_proj, v_proj) but the model fuses them (e.g., qkv_proj)
+    FUSED_PARAMS_MAPPING = {
+        "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+        "gate_up_proj": ["gate_proj", "up_proj"],
+    }
+
     @dataclasses.dataclass
     class Source:
         """A source for weights."""
@@ -652,20 +660,26 @@ class DefaultModelLoader(BaseModelLoader):
             """Wrapper that tracks weight names from the checkpoint."""
             params_dict = dict(model.named_parameters())
 
+            # Build mapping from checkpoint names to model parameter names
+            # using the shared FUSED_PARAMS_MAPPING constant.
+            fused_mapping = {}
+            for param_name in params_dict:
+                for fused_part, shard_parts in DefaultModelLoader.FUSED_PARAMS_MAPPING.items():
+                    # Check if fused_part appears as a complete component in the dotted path
+                    # This avoids false matches like "my_qkv_proj_extra" matching "qkv_proj"
+                    if f".{fused_part}." in f".{param_name}.":
+                        for shard_part in shard_parts:
+                            # Replace only first occurrence to avoid edge cases
+                            sharded_name = param_name.replace(fused_part, shard_part, 1)
+                            fused_mapping[sharded_name] = param_name
+                        break
+
             for name, tensor in weights_iter:
-                # Map checkpoint weight names to actual model parameter names
-                # This handles renaming (e.g., q_proj->qkv_proj)
+                # Track which model parameters get loaded
                 if name in params_dict:
                     loaded_param_names.add(name)
-                # Also check for fused param mappings
-                # (checkpoint has q_proj, model has qkv_proj)
-                for param_name in params_dict:
-                    if any(part in name for part in ["q_proj", "k_proj", "v_proj"]):
-                        if "qkv_proj" in param_name and param_name.replace("qkv_proj", "").strip(".") in name:
-                            loaded_param_names.add(param_name)
-                    if any(part in name for part in ["gate_proj", "up_proj"]):
-                        if "gate_up_proj" in param_name and param_name.replace("gate_up_proj", "").strip(".") in name:
-                            loaded_param_names.add(param_name)
+                elif name in fused_mapping:
+                    loaded_param_names.add(fused_mapping[name])
 
                 yield name, tensor
 
