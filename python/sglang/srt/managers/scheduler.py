@@ -2063,7 +2063,9 @@ class Scheduler(
                 #
                 # See: https://github.com/sgl-project/sglang/issues/15840
                 if req.mamba_pool_idx is not None:
-                    self.req_to_token_pool.mamba_pool.free(req.mamba_pool_idx.unsqueeze(-1))
+                    self.req_to_token_pool.mamba_pool.free(
+                        req.mamba_pool_idx.unsqueeze(-1)
+                    )
                     req.mamba_pool_idx = None
 
                 if res == AddReqResult.NO_TOKEN:
