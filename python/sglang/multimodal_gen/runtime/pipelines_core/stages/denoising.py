@@ -94,7 +94,7 @@ class DenoisingStage(PipelineStage):
         # torch compile
         if self.server_args.enable_torch_compile:
             for transformer in filter(None, [self.transformer, self.transformer_2]):
-                self.torch_compile_module(transformer)
+                self.compile_module_with_torch_compile(transformer)
 
         self.scheduler = scheduler
         self.vae = vae
@@ -116,7 +116,7 @@ class DenoisingStage(PipelineStage):
         self._cached_num_steps = None
         self._is_warmed_up = False
 
-    def torch_compile_module(self, module):
+    def compile_module_with_torch_compile(self, module):
         """
         Compile a module's forward with torch.compile, and enable inductor overlap tweak if available.
         No-op if torch compile is disabled or the object has no forward.
@@ -488,19 +488,14 @@ class DenoisingStage(PipelineStage):
         assert self.transformer is not None
         pipeline = self.pipeline() if self.pipeline else None
         if not server_args.model_loaded["transformer"]:
+            # FIXME: reuse more code
             loader = TransformerLoader()
-            # FIXME
             self.transformer = loader.load(
                 server_args.model_paths["transformer"], server_args, "transformer"
             )
-
             # enable cache-dit before torch.compile (delayed mounting)
             self._maybe_enable_cache_dit(batch.num_inference_steps)
-
-            if self.server_args.enable_torch_compile:
-                self.transformer = torch.compile(
-                    self.transformer, mode="max-autotune", fullgraph=True
-                )
+            self.compile_module_with_torch_compile(self.transformer)
             if pipeline:
                 pipeline.add_module("transformer", self.transformer)
             server_args.model_loaded["transformer"] = True

@@ -457,6 +457,14 @@ class ServerArgs:
             + "However, will likely cause precision drifts. See (https://github.com/pytorch/pytorch/issues/145213)",
         )
         parser.add_argument(
+            "--enable-warmup",
+            action=StoreBoolean,
+            default=ServerArgs.enable_warmup,
+            help="Perform a 1-step end-to-end warmup request before the actual request. "
+            "Recommended to enable when benchmarking to ensure fair comparison and best performance."
+            "When enabled, look for the line ending with `with warmup excluded` for actual processing time.",
+        )
+        parser.add_argument(
             "--dit-cpu-offload",
             action=StoreBoolean,
             help="Use CPU offload for DiT inference. Enable if run out of memory with FSDP.",
