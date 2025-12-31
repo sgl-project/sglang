@@ -2445,6 +2445,7 @@ class ServerArgs:
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
 
+        # Model and tokenizer
         parser.add_argument(
             "--model-path",
             "--model",
