@@ -6,13 +6,34 @@ use std::{
         atomic::{AtomicU64, Ordering},
         Arc, RwLock,
     },
-    time::{SystemTime, UNIX_EPOCH},
 };
 
 use dashmap::{mapref::entry::Entry, DashMap};
 use tracing::debug;
 
 type NodeRef = Arc<Node>;
+
+/// Shard counts for DashMaps to balance concurrency vs allocation overhead.
+/// Default DashMap uses num_cpus * 4 shards (e.g., 256 on 64-core machines).
+///
+/// Root node uses higher shard count since ALL requests pass through it.
+/// Other nodes use lower count as traffic diverges through the tree.
+///
+/// This reduces memory by ~90% vs default while maintaining good concurrency.
+const ROOT_SHARD_COUNT: usize = 32;
+const NODE_SHARD_COUNT: usize = 8;
+
+/// Create a children DashMap for non-root nodes
+#[inline]
+fn new_children_map() -> DashMap<char, NodeRef, CharHasherBuilder> {
+    DashMap::with_hasher_and_shard_amount(CharHasherBuilder::default(), NODE_SHARD_COUNT)
+}
+
+/// Create a tenant access time DashMap for non-root nodes
+#[inline]
+fn new_tenant_map() -> DashMap<TenantId, u64> {
+    DashMap::with_shard_amount(NODE_SHARD_COUNT)
+}
 
 /// Interned tenant ID to avoid repeated string allocations.
 /// Using Arc<str> allows cheap cloning and comparison.
@@ -21,11 +42,9 @@ pub type TenantId = Arc<str>;
 /// Result of a prefix match operation, including char counts to avoid recomputation.
 #[derive(Debug, Clone)]
 pub struct PrefixMatchResult {
-    /// The matched prefix text
-    pub matched_text: String,
-    /// The tenant that owns the matched prefix
-    pub tenant: String,
-    /// Number of characters matched (avoids chars().count())
+    /// The tenant that owns the matched prefix (zero-copy)
+    pub tenant: TenantId,
+    /// Number of characters matched
     pub matched_char_count: usize,
     /// Total number of characters in the input text
     pub input_char_count: usize,
@@ -68,11 +87,22 @@ type CharHasherBuilder = BuildHasherDefault<CharHasher>;
 
 /// Advance a string slice by N characters, returning the remaining slice.
 /// Returns empty string if n >= char count.
+/// Optimized: uses direct byte slicing for ASCII, falls back to char_indices for UTF-8.
 #[inline]
 fn advance_by_chars(s: &str, n: usize) -> &str {
     if n == 0 {
         return s;
     }
+    if n >= s.len() {
+        return "";
+    }
+    // Fast path: if first N bytes are all ASCII, we can slice directly
+    let bytes = s.as_bytes();
+    if bytes[..n].is_ascii() {
+        // Safe: we verified all bytes in [0..n] are ASCII (valid UTF-8 boundary)
+        return &s[n..];
+    }
+    // Slow path: UTF-8 requires char-by-char traversal
     s.char_indices()
         .nth(n)
         .map(|(idx, _)| &s[idx..])
@@ -176,35 +206,24 @@ impl Clone for NodeText {
     }
 }
 
-/// Global timestamp that gets updated periodically to reduce syscalls.
-/// Uses milliseconds since epoch.
-static CURRENT_TIMESTAMP_MS: AtomicU64 = AtomicU64::new(0);
+/// Global epoch counter for LRU ordering.
+/// Uses a simple incrementing counter instead of wall clock time.
+///
+/// Benefits:
+/// - No syscall overhead (vs SystemTime::now())
+/// - Smaller memory footprint (u64 vs u128)
+/// - Perfectly monotonic (no clock skew issues)
+///
+/// For LRU eviction, relative ordering is all that matters.
+static EPOCH_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// Staleness threshold in milliseconds for forced refresh.
-/// If cached timestamp is older than this, always get fresh time.
-const TIMESTAMP_STALENESS_MS: u64 = 5;
-
-/// Get current timestamp in milliseconds, using cached value when possible.
-/// Refreshes if the cached value is stale (>TIMESTAMP_STALENESS_MS).
-/// This provides ~99% syscall reduction under high load while maintaining accuracy.
+/// Get the next epoch value for LRU timestamp ordering.
+/// Uses fetch_add for lock-free, monotonically increasing values.
+/// Relaxed ordering is sufficient since we only need eventual consistency
+/// for approximate LRU behavior.
 #[inline]
-fn get_timestamp_ms() -> u128 {
-    let cached = CURRENT_TIMESTAMP_MS.load(Ordering::Relaxed);
-
-    // Always need syscall to check staleness, but it's cheap and necessary for correctness
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as u64;
-
-    // Fast path: return cached if still fresh (within TIMESTAMP_STALENESS_MS)
-    if cached != 0 && now.saturating_sub(cached) < TIMESTAMP_STALENESS_MS {
-        return cached as u128;
-    }
-
-    // Update cached value
-    CURRENT_TIMESTAMP_MS.store(now, Ordering::Relaxed);
-    now as u128
+fn get_epoch() -> u64 {
+    EPOCH_COUNTER.fetch_add(1, Ordering::Relaxed)
 }
 
 #[derive(Debug)]
@@ -214,10 +233,13 @@ struct Node {
     children: DashMap<char, NodeRef, CharHasherBuilder>,
     /// Node text with cached character count
     text: RwLock<NodeText>,
-    /// Per-tenant last access timestamps. Using TenantId (Arc<str>) for cheap cloning.
-    tenant_last_access_time: DashMap<TenantId, u128>,
+    /// Per-tenant last access epoch for LRU ordering. Using TenantId (Arc<str>) for cheap cloning.
+    tenant_last_access_time: DashMap<TenantId, u64>,
     /// Parent pointer for upward traversal during timestamp updates
     parent: RwLock<Option<NodeRef>>,
+    /// Cached last-accessed tenant for O(1) lookup during prefix match.
+    /// Avoids O(shards) DashMap iteration in the common case.
+    last_tenant: parking_lot::RwLock<Option<TenantId>>,
 }
 
 #[derive(Debug)]
@@ -230,7 +252,7 @@ pub struct Tree {
 // For the heap
 
 struct EvictionEntry {
-    timestamp: u128,
+    timestamp: u64,
     tenant: TenantId,
     node: NodeRef,
 }
@@ -262,9 +284,31 @@ impl PartialEq for EvictionEntry {
 
 /// Count matching prefix characters between two strings.
 /// Returns the number of characters that match from the start.
-/// Uses iterator-based comparison - no allocation required.
+/// Optimized: uses fast byte comparison for ASCII, falls back to char iteration for UTF-8.
 #[inline]
 fn shared_prefix_count(a: &str, b: &str) -> usize {
+    let a_bytes = a.as_bytes();
+    let b_bytes = b.as_bytes();
+
+    // Find common byte prefix length using iterator (potentially SIMD-optimized)
+    let common_byte_len = a_bytes
+        .iter()
+        .zip(b_bytes)
+        .position(|(&a_byte, &b_byte)| a_byte != b_byte)
+        .unwrap_or_else(|| a_bytes.len().min(b_bytes.len()));
+
+    // If the common byte prefix is all ASCII, byte count == char count
+    // Otherwise, fall back to char-by-char comparison for UTF-8 safety
+    if a_bytes[..common_byte_len].is_ascii() {
+        common_byte_len
+    } else {
+        shared_prefix_count_chars(a, b)
+    }
+}
+
+/// Fallback char-by-char comparison for strings with non-ASCII characters.
+#[inline]
+fn shared_prefix_count_chars(a: &str, b: &str) -> usize {
     a.chars()
         .zip(b.chars())
         .take_while(|(a_char, b_char)| a_char == b_char)
@@ -300,13 +344,18 @@ impl Tree {
 
     pub fn new() -> Self {
         Tree {
+            // Root uses higher shard count since ALL requests pass through it
             root: Arc::new(Node {
-                children: DashMap::with_hasher(CharHasherBuilder::default()),
+                children: DashMap::with_hasher_and_shard_amount(
+                    CharHasherBuilder::default(),
+                    ROOT_SHARD_COUNT,
+                ),
                 text: RwLock::new(NodeText::empty()),
-                tenant_last_access_time: DashMap::new(),
+                tenant_last_access_time: DashMap::with_shard_amount(ROOT_SHARD_COUNT),
                 parent: RwLock::new(None),
+                last_tenant: parking_lot::RwLock::new(None),
             }),
-            tenant_char_count: DashMap::new(),
+            tenant_char_count: DashMap::with_shard_amount(ROOT_SHARD_COUNT),
         }
     }
 
@@ -314,18 +363,14 @@ impl Tree {
         // Insert text into tree with given tenant
         // Use slice-based traversal to avoid Vec<char> allocation
 
-        // Use cached timestamp to reduce syscalls
-        let timestamp_ms = get_timestamp_ms();
-
         // Intern the tenant ID once for reuse
         let tenant_id = intern_tenant(tenant);
 
-        // Pre-compute total char count once (needed for size tracking)
-        let total_char_count = text.chars().count();
-
+        // Ensure tenant exists at root (don't update timestamp - root is never evicted)
         self.root
             .tenant_last_access_time
-            .insert(Arc::clone(&tenant_id), timestamp_ms);
+            .entry(Arc::clone(&tenant_id))
+            .or_insert(0);
 
         self.tenant_char_count
             .entry(Arc::clone(&tenant_id))
@@ -333,7 +378,6 @@ impl Tree {
 
         // Track remaining text as a slice - no allocation needed
         let mut remaining = text;
-        let mut matched_chars = 0;
         let mut prev = Arc::clone(&self.root);
 
         // Result type to carry state out of the match block
@@ -352,23 +396,27 @@ impl Tree {
             // Use entry API for atomic check-and-insert semantics (required for thread safety)
             let step = match prev.children.entry(first_char) {
                 Entry::Vacant(entry) => {
-                    // No match - create new node with remaining text
-                    let remaining_char_count = total_char_count - matched_chars;
+                    // No match - create new node with remaining text (this is the leaf)
+                    // Compute remaining char count lazily - only here when creating leaf
+                    let remaining_char_count = remaining.chars().count();
+                    let epoch = get_epoch();
+
                     let new_node = Arc::new(Node {
-                        children: DashMap::with_hasher(CharHasherBuilder::default()),
+                        children: new_children_map(),
                         text: RwLock::new(NodeText::new(remaining.to_string())),
-                        tenant_last_access_time: DashMap::new(),
+                        tenant_last_access_time: new_tenant_map(),
                         parent: RwLock::new(Some(Arc::clone(&prev))),
+                        last_tenant: parking_lot::RwLock::new(Some(Arc::clone(&tenant_id))),
                     });
 
-                    // Attach tenant to the new node and increment count
+                    // Attach tenant to the new leaf node with timestamp
                     self.tenant_char_count
                         .entry(Arc::clone(&tenant_id))
                         .and_modify(|count| *count += remaining_char_count)
                         .or_insert(remaining_char_count);
                     new_node
                         .tenant_last_access_time
-                        .insert(Arc::clone(&tenant_id), timestamp_ms);
+                        .insert(Arc::clone(&tenant_id), epoch);
 
                     entry.insert(new_node);
                     InsertStep::Done
@@ -395,9 +443,12 @@ impl Tree {
 
                         let new_node = Arc::new(Node {
                             text: RwLock::new(matched_text),
-                            children: DashMap::with_hasher(CharHasherBuilder::default()),
+                            children: new_children_map(),
                             parent: RwLock::new(Some(Arc::clone(&prev))),
                             tenant_last_access_time: matched_node.tenant_last_access_time.clone(),
+                            last_tenant: parking_lot::RwLock::new(
+                                matched_node.last_tenant.read().clone(),
+                            ),
                         });
 
                         let first_new_char = contracted_text.first_char().unwrap();
@@ -410,21 +461,19 @@ impl Tree {
                         *matched_node.text.write().unwrap() = contracted_text;
                         *matched_node.parent.write().unwrap() = Some(Arc::clone(&new_node));
 
-                        // Atomically attach tenant to the new split node
-                        match new_node
+                        // Attach tenant to the new split node (intermediate - no timestamp update)
+                        // The cloned DashMap already has the tenant; just ensure char count is correct
+                        if !new_node
                             .tenant_last_access_time
-                            .entry(Arc::clone(&tenant_id))
+                            .contains_key(tenant_id.as_ref())
                         {
-                            Entry::Vacant(v) => {
-                                self.tenant_char_count
-                                    .entry(Arc::clone(&tenant_id))
-                                    .and_modify(|count| *count += matched_text_count)
-                                    .or_insert(matched_text_count);
-                                v.insert(timestamp_ms);
-                            }
-                            Entry::Occupied(mut o) => {
-                                o.insert(timestamp_ms);
-                            }
+                            self.tenant_char_count
+                                .entry(Arc::clone(&tenant_id))
+                                .and_modify(|count| *count += matched_text_count)
+                                .or_insert(matched_text_count);
+                            new_node
+                                .tenant_last_access_time
+                                .insert(Arc::clone(&tenant_id), 0);
                         }
 
                         InsertStep::Continue {
@@ -432,24 +481,21 @@ impl Tree {
                             advance_chars: shared_count,
                         }
                     } else {
-                        // Full match - move to next node
+                        // Full match - move to next node (intermediate - no timestamp update)
                         drop(matched_node_text);
 
-                        // Atomically attach tenant to existing node
-                        match matched_node
+                        // Ensure tenant exists at this intermediate node
+                        if !matched_node
                             .tenant_last_access_time
-                            .entry(Arc::clone(&tenant_id))
+                            .contains_key(tenant_id.as_ref())
                         {
-                            Entry::Vacant(v) => {
-                                self.tenant_char_count
-                                    .entry(Arc::clone(&tenant_id))
-                                    .and_modify(|count| *count += matched_node_text_count)
-                                    .or_insert(matched_node_text_count);
-                                v.insert(timestamp_ms);
-                            }
-                            Entry::Occupied(mut o) => {
-                                o.insert(timestamp_ms);
-                            }
+                            self.tenant_char_count
+                                .entry(Arc::clone(&tenant_id))
+                                .and_modify(|count| *count += matched_node_text_count)
+                                .or_insert(matched_node_text_count);
+                            matched_node
+                                .tenant_last_access_time
+                                .insert(Arc::clone(&tenant_id), 0);
                         }
 
                         InsertStep::Continue {
@@ -462,25 +508,27 @@ impl Tree {
 
             // Entry guard is now dropped - safe to update prev
             match step {
-                InsertStep::Done => break,
+                InsertStep::Done => return, // New leaf created with timestamp, we're done
                 InsertStep::Continue {
                     next_prev,
                     advance_chars,
                 } => {
                     prev = next_prev;
                     remaining = advance_by_chars(remaining, advance_chars);
-                    matched_chars += advance_chars;
                 }
             }
         }
+
+        // Loop exited normally (remaining empty) - prev is the leaf node
+        // Update its timestamp for LRU ordering
+        let epoch = get_epoch();
+        prev.tenant_last_access_time
+            .insert(Arc::clone(&tenant_id), epoch);
     }
 
     /// Performs prefix matching and returns detailed result with char counts.
-    /// This is the optimized version that avoids redundant chars().count() calls.
+    /// Optimized: no string allocations, deferred char counting.
     pub fn prefix_match_with_counts(&self, text: &str) -> PrefixMatchResult {
-        // Use slice-based traversal - no Vec<char> allocation
-        let input_char_count = text.chars().count();
-
         let mut remaining = text;
         let mut matched_chars = 0;
         let mut prev = Arc::clone(&self.root);
@@ -506,6 +554,7 @@ impl Tree {
                 } else {
                     // Partial match - still use this node for tenant selection
                     matched_chars += shared_count;
+                    remaining = advance_by_chars(remaining, shared_count);
                     prev = matched_node;
                     break;
                 }
@@ -517,45 +566,63 @@ impl Tree {
 
         let curr = prev;
 
-        // Select the first tenant (key in the map)
-        let tenant: Option<TenantId> = curr
-            .tenant_last_access_time
-            .iter()
-            .next()
-            .map(|kv| Arc::clone(kv.key()));
-
-        // Use cached timestamp to reduce syscalls
-        let timestamp_ms = get_timestamp_ms();
-
-        // Traverse from the curr node to the root and update the timestamp
-        if let Some(ref tenant_id) = tenant {
-            let mut current_node = Some(Arc::clone(&curr));
-            while let Some(node) = current_node {
-                node.tenant_last_access_time
-                    .insert(Arc::clone(tenant_id), timestamp_ms);
-                current_node = node.parent.read().unwrap().clone();
+        // Try cached tenant first (O(1)) before falling back to O(shards) DashMap iteration.
+        // The cache is valid if the tenant still exists in tenant_last_access_time.
+        let tenant: TenantId = {
+            let cached = curr.last_tenant.read();
+            if let Some(ref t) = *cached {
+                if curr.tenant_last_access_time.contains_key(t.as_ref()) {
+                    Arc::clone(t)
+                } else {
+                    drop(cached);
+                    // Cache stale, fall back to iteration and update cache
+                    let t = curr
+                        .tenant_last_access_time
+                        .iter()
+                        .next()
+                        .map(|kv| Arc::clone(kv.key()))
+                        .unwrap_or_else(|| Arc::from("empty"));
+                    *curr.last_tenant.write() = Some(Arc::clone(&t));
+                    t
+                }
+            } else {
+                drop(cached);
+                // No cache, iterate and populate cache
+                let t = curr
+                    .tenant_last_access_time
+                    .iter()
+                    .next()
+                    .map(|kv| Arc::clone(kv.key()))
+                    .unwrap_or_else(|| Arc::from("empty"));
+                *curr.last_tenant.write() = Some(Arc::clone(&t));
+                t
             }
+        };
+
+        // Update timestamp probabilistically (1 in 8 matches) to reduce DashMap contention.
+        // LRU eviction doesn't need perfect accuracy - approximate timestamps suffice.
+        let epoch = get_epoch();
+        if epoch & 0x7 == 0 {
+            curr.tenant_last_access_time
+                .insert(Arc::clone(&tenant), epoch);
         }
 
-        // Build matched text from original input using char count
-        let matched_text = take_chars(text, matched_chars);
-        let tenant_str = tenant
-            .map(|t| t.to_string())
-            .unwrap_or_else(|| "empty".to_string());
+        // Compute input char count from matched + remaining (deferred from start)
+        let input_char_count = matched_chars + remaining.chars().count();
 
         PrefixMatchResult {
-            matched_text,
-            tenant: tenant_str,
+            tenant,
             matched_char_count: matched_chars,
             input_char_count,
         }
     }
 
     /// Legacy prefix_match API for backward compatibility.
-    /// Prefer prefix_match_with_counts() for better performance.
+    /// Note: This computes matched_text which has allocation overhead.
     pub fn prefix_match(&self, text: &str) -> (String, String) {
         let result = self.prefix_match_with_counts(text);
-        (result.matched_text, result.tenant)
+        let matched_text = take_chars(text, result.matched_char_count);
+        (matched_text, result.tenant.to_string())
     }
 
     #[allow(dead_code)]
@@ -609,20 +676,15 @@ impl Tree {
 
         let curr = prev;
 
-        // Only update timestamp if we found a match for the specified tenant
+        // Only update timestamp if we found a match for the specified tenant.
+        // Update matched node only - ancestor propagation is unnecessary.
         if curr
             .tenant_last_access_time
             .contains_key(tenant_id.as_ref())
         {
-            // Use cached timestamp to reduce syscalls
-            let timestamp_ms = get_timestamp_ms();
-
-            let mut current_node = Some(curr);
-            while let Some(node) = current_node {
-                node.tenant_last_access_time
-                    .insert(Arc::clone(&tenant_id), timestamp_ms);
-                current_node = node.parent.read().unwrap().clone();
-            }
+            let epoch = get_epoch();
+            curr.tenant_last_access_time
+                .insert(Arc::clone(&tenant_id), epoch);
         }
 
         // Build result from original input using char count
@@ -866,8 +928,6 @@ impl Tree {
 
     #[allow(dead_code)]
     fn node_to_string(node: &NodeRef, prefix: &str, is_last: bool) -> String {
-        use std::time::Duration;
-
         let mut result = String::new();
 
         // Add prefix and branch character
@@ -878,29 +938,12 @@ impl Tree {
         let node_text = node.text.read().unwrap();
         result.push_str(&format!("'{}' [", node_text.as_str()));
 
-        // Add tenant information with timestamps
+        // Add tenant information with epoch values
         let mut tenant_info = Vec::new();
         for entry in node.tenant_last_access_time.iter() {
             let tenant_id = entry.key();
-            let timestamp_ms = entry.value();
-
-            // Convert milliseconds to seconds and remaining milliseconds
-            let seconds = (timestamp_ms / 1000) as u64;
-            let millis = (timestamp_ms % 1000) as u32;
-
-            // Create SystemTime from Unix timestamp
-            let system_time = UNIX_EPOCH + Duration::from_secs(seconds);
-
-            // Format time as HH:MM:SS.mmm
-            let datetime = system_time.duration_since(UNIX_EPOCH).unwrap();
-            let hours = (datetime.as_secs() % 86400) / 3600;
-            let minutes = (datetime.as_secs() % 3600) / 60;
-            let seconds = datetime.as_secs() % 60;
-
-            tenant_info.push(format!(
-                "{} | {:02}:{:02}:{:02}.{:03}",
-                tenant_id, hours, minutes, seconds, millis
-            ));
+            let epoch = entry.value();
+            tenant_info.push(format!("{} | epoch:{}", tenant_id, epoch));
         }
 
         result.push_str(&tenant_info.join(", "));
@@ -1678,5 +1721,589 @@ mod tests {
 
         let tenant2_size = final_sizes.get("tenant2").unwrap();
         assert_eq!(tenant2_size, &(5 + 5 + 6 + 2)); // "apple" + "etite" + "banana" + "ll"
+    }
+
+    // ==================== Edge Case Tests ====================
+
+    #[test]
+    fn test_empty_string_input() {
+        let tree = Tree::new();
+
+        // Insert empty string
+        tree.insert("", "tenant1");
+
+        // Match empty string
+        let (matched, tenant) = tree.prefix_match("");
+        assert_eq!(matched, "");
+        assert_eq!(tenant, "tenant1");
+
+        // Insert non-empty, then match empty
+        tree.insert("hello", "tenant2");
+        let (matched, tenant) = tree.prefix_match("");
+        assert_eq!(matched, "");
+        assert_eq!(tenant, "tenant1");
+    }
+
+    #[test]
+    fn test_single_character_operations() {
+        let tree = Tree::new();
+
+        // Insert single characters
+        tree.insert("a", "tenant1");
+        tree.insert("b", "tenant2");
+        tree.insert("c", "tenant1");
+
+        let (matched, tenant) = tree.prefix_match("a");
+        assert_eq!(matched, "a");
+        assert_eq!(tenant, "tenant1");
+
+        let (matched, tenant) = tree.prefix_match("b");
+        assert_eq!(matched, "b");
+        assert_eq!(tenant, "tenant2");
+
+        // Match with longer string starting with single char
+        let (matched, tenant) = tree.prefix_match("abc");
+        assert_eq!(matched, "a");
+        assert_eq!(tenant, "tenant1");
+    }
+
+    #[test]
+    fn test_prefix_is_subset_of_existing() {
+        let tree = Tree::new();
+
+        // Insert longer string first
+        tree.insert("application", "tenant1");
+
+        // Now insert prefix of existing
+        tree.insert("app", "tenant2");
+
+        // Match the prefix - both tenants own "app" node
+        let (matched, tenant) = tree.prefix_match("app");
+        assert_eq!(matched, "app");
+        assert!(tenant == "tenant1" || tenant == "tenant2");
+
+        // Match longer string
+        let (matched, tenant) = tree.prefix_match("application");
+        assert_eq!(matched, "application");
+        assert_eq!(tenant, "tenant1");
+
+        // Match "apple" - matches "app" + "l" from the child node = "appl"
+        // Then 'e' doesn't match 'i' in the remaining suffix, so stops at 4 chars
+        let (matched, _tenant) = tree.prefix_match("apple");
+        assert_eq!(matched, "appl");
+    }
+
+    #[test]
+    fn test_existing_is_prefix_of_new() {
+        let tree = Tree::new();
+
+        // Insert shorter string first
+        tree.insert("app", "tenant1");
+
+        // Now insert longer string with same prefix
+        tree.insert("application", "tenant2");
+
+        let (matched, tenant) = tree.prefix_match("app");
+        assert_eq!(matched, "app");
+        assert!(tenant == "tenant1" || tenant == "tenant2");
+
+        let (matched, tenant) = tree.prefix_match("application");
+        assert_eq!(matched, "application");
+        assert_eq!(tenant, "tenant2");
+
+        // "applesauce" matches "app" + "l" from the child node = "appl"
+        // Then 'e' in "esauce" doesn't match 'i' in the suffix, so matching stops
+        let (matched, _tenant) = tree.prefix_match("applesauce");
+        assert_eq!(matched, "appl");
+    }
+
+    // ==================== prefix_match_with_counts Tests ====================
+
+    #[test]
+    fn test_prefix_match_with_counts_accuracy() {
+        let tree = Tree::new();
+
+        tree.insert("hello world", "tenant1");
+
+        // Exact match
+        let result = tree.prefix_match_with_counts("hello world");
+        assert_eq!(result.matched_char_count, 11);
+        assert_eq!(result.input_char_count, 11);
+        assert_eq!(&*result.tenant, "tenant1");
+
+        // Partial match
+        let result = tree.prefix_match_with_counts("hello");
+        assert_eq!(result.matched_char_count, 5);
+        assert_eq!(result.input_char_count, 5);
+
+        // Extended match
+        let result = tree.prefix_match_with_counts("hello world and more");
+        assert_eq!(result.matched_char_count, 11);
+        assert_eq!(result.input_char_count, 20);
+
+        // No match
+        let result = tree.prefix_match_with_counts("goodbye");
+        assert_eq!(result.matched_char_count, 0);
+        assert_eq!(result.input_char_count, 7);
+    }
+
+    #[test]
+    fn test_prefix_match_with_counts_utf8() {
+        let tree = Tree::new();
+
+        // UTF-8 string: 5 characters, more bytes
+        tree.insert("你好世界呀", "tenant1");
+
+        let result = tree.prefix_match_with_counts("你好世界呀");
+        assert_eq!(result.matched_char_count, 5);
+        assert_eq!(result.input_char_count, 5);
+
+        let result = tree.prefix_match_with_counts("你好");
+        assert_eq!(result.matched_char_count, 2);
+        assert_eq!(result.input_char_count, 2);
+
+        // Mixed ASCII and UTF-8
+        tree.insert("hello你好", "tenant2");
+        let result = tree.prefix_match_with_counts("hello你好世界");
+        assert_eq!(result.matched_char_count, 7); // "hello你好" = 7 chars
+        assert_eq!(result.input_char_count, 9); // "hello你好世界" = 9 chars
+    }
+
+    // ==================== Node Splitting Edge Cases ====================
+
+    #[test]
+    fn test_split_at_first_character() {
+        let tree = Tree::new();
+
+        // Insert "abc"
+        tree.insert("abc", "tenant1");
+
+        // Insert "aXX" - should split at first char
+        tree.insert("aXX", "tenant2");
+
+        let (matched, tenant) = tree.prefix_match("abc");
+        assert_eq!(matched, "abc");
+        assert_eq!(tenant, "tenant1");
+
+        let (matched, tenant) = tree.prefix_match("aXX");
+        assert_eq!(matched, "aXX");
+        assert_eq!(tenant, "tenant2");
+
+        let (matched, _) = tree.prefix_match("a");
+        assert_eq!(matched, "a");
+    }
+
+    #[test]
+    fn test_split_at_last_character() {
+        let tree = Tree::new();
+
+        // Insert "abcd"
+        tree.insert("abcd", "tenant1");
+
+        // Insert "abcX" - should split at last char of shared prefix
+        tree.insert("abcX", "tenant2");
+
+        let (matched, tenant) = tree.prefix_match("abcd");
+        assert_eq!(matched, "abcd");
+        assert_eq!(tenant, "tenant1");
+
+        let (matched, tenant) = tree.prefix_match("abcX");
+        assert_eq!(matched, "abcX");
+        assert_eq!(tenant, "tenant2");
+
+        let (matched, _) = tree.prefix_match("abc");
+        assert_eq!(matched, "abc");
+    }
+
+    #[test]
+    fn test_multiple_splits_same_path() {
+        let tree = Tree::new();
+
+        // Create a chain of splits
+        tree.insert("abcdefgh", "tenant1");
+        tree.insert("abcdef", "tenant2");
+        tree.insert("abcd", "tenant3");
+        tree.insert("ab", "tenant4");
+
+        // Verify all paths work
+        assert_eq!(tree.prefix_match("abcdefgh").0, "abcdefgh");
+        assert_eq!(tree.prefix_match("abcdef").0, "abcdef");
+        assert_eq!(tree.prefix_match("abcd").0, "abcd");
+        assert_eq!(tree.prefix_match("ab").0, "ab");
+        assert_eq!(tree.prefix_match("a").0, "a");
+    }
+
+    // ==================== High Contention Stress Tests ====================
+
+    #[test]
+    fn test_high_contention_same_prefix() {
+        let tree = Arc::new(Tree::new());
+        let num_threads = 16;
+        let ops_per_thread = 100;
+        let mut handles = vec![];
+
+        // All threads operate on strings with same prefix
+        for thread_id in 0..num_threads {
+            let tree = Arc::clone(&tree);
+            let handle = thread::spawn(move || {
+                let tenant = format!("tenant{}", thread_id);
+                for i in 0..ops_per_thread {
+                    let text = format!("shared_prefix_{}", i);
+                    tree.insert(&text, &tenant);
+
+                    // Immediately try to match
+                    let (matched, _) = tree.prefix_match(&text);
+                    assert!(
+                        matched.starts_with("shared_prefix_"),
+                        "Match should start with shared_prefix_"
+                    );
+                }
+            });
+            handles.push(handle);
+        }
+
+        for handle in handles {
+            handle.join().expect("Thread panicked");
+        }
+
+        // Verify tree is still consistent
+        let sizes = tree.get_used_size_per_tenant();
+        assert!(!sizes.is_empty(), "Tree should have entries");
+    }
+
+    #[test]
+    fn test_rapid_insert_remove_cycles() {
+        let tree = Arc::new(Tree::new());
+        let num_cycles = 50;
+
+        for cycle in 0..num_cycles {
+            let tenant = format!("tenant{}", cycle % 5);
+
+            // Insert several entries
+            for i in 0..10 {
+                let text = format!("cycle{}entry{}", cycle, i);
+                tree.insert(&text, &tenant);
+            }
+
+            // Remove the tenant
+            tree.remove_tenant(&tenant);
+
+            // Verify tenant is gone
+            let sizes = tree.get_used_size_per_tenant();
+            assert!(
+                !sizes.contains_key(&tenant),
+                "Tenant {} should be removed after cycle {}",
+                tenant,
+                cycle
+            );
+        }
+    }
+
+    // ==================== ASCII/UTF-8 Consistency Tests ====================
+
+    #[test]
+    fn test_ascii_utf8_consistency() {
+        let tree = Tree::new();
+
+        // Insert ASCII
+        tree.insert("hello", "tenant1");
+
+        // Insert UTF-8 with same logical prefix (none)
+        tree.insert("你好", "tenant2");
+
+        // Insert mixed
+        tree.insert("hello你好", "tenant3");
+
+        // All should be retrievable
+        assert_eq!(tree.prefix_match("hello").0, "hello");
+        assert_eq!(tree.prefix_match("你好").0, "你好");
+        assert_eq!(tree.prefix_match("hello你好").0, "hello你好");
+
+        // Counts should be correct
+        let result = tree.prefix_match_with_counts("hello");
+        assert_eq!(result.matched_char_count, 5);
+        assert_eq!(result.input_char_count, 5);
+
+        let result = tree.prefix_match_with_counts("你好");
+        assert_eq!(result.matched_char_count, 2);
+        assert_eq!(result.input_char_count, 2);
+
+        let result = tree.prefix_match_with_counts("hello你好");
+        assert_eq!(result.matched_char_count, 7);
+        assert_eq!(result.input_char_count, 7);
+    }
+
+    #[test]
+    fn test_emoji_handling() {
+        let tree = Tree::new();
+
+        // Emoji are multi-byte UTF-8
+        tree.insert("hello 👋", "tenant1");
+        tree.insert("hello 👋🌍", "tenant2");
+
+        let (matched, tenant) = tree.prefix_match("hello 👋");
+        assert_eq!(matched, "hello 👋");
+        assert_eq!(tenant, "tenant1");
+
+        let (matched, tenant) = tree.prefix_match("hello 👋🌍");
+        assert_eq!(matched, "hello 👋🌍");
+        assert_eq!(tenant, "tenant2");
+
+        // Verify char count (not byte count)
+        let result = tree.prefix_match_with_counts("hello 👋");
+        assert_eq!(result.matched_char_count, 7);
+        assert_eq!(result.input_char_count, 7); // h-e-l-l-o-space-emoji
+    }
+
+    // ==================== Eviction Edge Cases ====================
+
+    #[test]
+    fn test_eviction_empty_tree() {
+        let tree = Tree::new();
+
+        // Should not panic on empty tree
+        tree.evict_tenant_by_size(100);
+
+        let sizes = tree.get_used_size_per_tenant();
+        assert!(sizes.is_empty());
+    }
+
+    #[test]
+    fn test_eviction_zero_max_size() {
+        let tree = Tree::new();
+
+        tree.insert("hello", "tenant1");
+        tree.insert("world", "tenant1");
+
+        // Evict with max_size = 0 should remove everything
+        tree.evict_tenant_by_size(0);
+
+        let sizes = tree.get_used_size_per_tenant();
+        assert!(
+            sizes.is_empty() || sizes.values().all(|&v| v == 0),
+            "All tenants should be evicted or have zero size"
+        );
+    }
+
+    #[test]
+    fn test_eviction_single_tenant_all_entries() {
+        let tree = Tree::new();
+
+        // Insert many entries for single tenant
+        for i in 0..100 {
+            let text = format!("entry{:03}", i);
+            tree.insert(&text, "tenant1");
+        }
+
+        let initial_size = *tree.get_used_size_per_tenant().get("tenant1").unwrap();
+        assert!(initial_size > 50, "Should have significant size");
+
+        // Evict to small size
+        tree.evict_tenant_by_size(50);
+
+        let final_size = *tree.get_used_size_per_tenant().get("tenant1").unwrap_or(&0);
+        assert!(
+            final_size <= 50,
+            "Size {} should be <= 50 after eviction",
+            final_size
+        );
+    }
+
+    // ==================== Last Tenant Cache Tests ====================
+
+    #[test]
+    fn test_last_tenant_cache_update() {
+        let tree = Tree::new();
+
+        // Insert for tenant1
+        tree.insert("hello", "tenant1");
+
+        // First match should return tenant1
+        let (_, tenant) = tree.prefix_match("hello");
+        assert_eq!(tenant, "tenant1");
+
+        // Insert for tenant2 on same path
+        tree.insert("hello", "tenant2");
+
+        // Match again - should still work (cache or iteration)
+        let (matched, _) = tree.prefix_match("hello");
+        assert_eq!(matched, "hello");
+    }
+
+    #[test]
+    fn test_stale_cache_after_tenant_removal() {
+        let tree = Tree::new();
+
+        tree.insert("hello", "tenant1");
+        tree.insert("hello", "tenant2");
+
+        // Access to populate cache
+        let _ = tree.prefix_match("hello");
+
+        // Remove tenant1
+        tree.remove_tenant("tenant1");
+
+        // Should still work with tenant2
+        let (matched, tenant) = tree.prefix_match("hello");
+        assert_eq!(matched, "hello");
+        assert_eq!(tenant, "tenant2");
+    }
+
+    // ==================== Consistency Verification Tests ====================
+
+    #[test]
+    fn test_char_count_consistency_after_operations() {
+        let tree = Tree::new();
+
+        // Helper to verify consistency
+        let verify_consistency = |tree: &Tree| {
+            let maintained = get_maintained_counts(tree);
+            let computed = tree.get_used_size_per_tenant();
+            assert_eq!(
+                maintained, computed,
+                "Maintained counts should match computed counts"
+            );
+        };
+
+        // Insert phase
+        for i in 0..50 {
+            tree.insert(&format!("prefix{}", i), "tenant1");
+            tree.insert(&format!("other{}", i), "tenant2");
+        }
+        verify_consistency(&tree);
+
+        // Overlapping inserts
+        for i in 0..25 {
+            tree.insert(&format!("prefix{}", i), "tenant2");
+        }
+        verify_consistency(&tree);
+
+        // Eviction
+        tree.evict_tenant_by_size(100);
+        verify_consistency(&tree);
+
+        // Tenant removal
+        tree.remove_tenant("tenant1");
+        verify_consistency(&tree);
+    }
+
+    #[test]
+    fn test_tree_structure_integrity_after_stress() {
+        let tree = Arc::new(Tree::new());
+        let num_threads = 8;
+        let mut handles = vec![];
+
+        for thread_id in 0..num_threads {
+            let tree = Arc::clone(&tree);
+            let handle = thread::spawn(move || {
+                let mut rng = rand::rng();
+                let tenant = format!("tenant{}", thread_id);
+
+                for _ in 0..200 {
+                    let op: u8 = rng.random_range(0..10);
+                    let key = format!("key{}", rng.random_range(0..50));
+
+                    match op {
+                        0..=6 => {
+                            // Insert (70%)
+                            tree.insert(&key, &tenant);
+                        }
+                        7..=8 => {
+                            // Match (20%)
+                            let _ = tree.prefix_match(&key);
+                        }
+                        _ => {
+                            // Match with counts (10%)
+                            let _ = tree.prefix_match_with_counts(&key);
+                        }
+                    }
+                }
+            });
+            handles.push(handle);
+        }
+
+        for handle in handles {
+            handle.join().expect("Thread panicked during stress test");
+        }
+
+        // Verify tree is still functional
+        let sizes = tree.get_used_size_per_tenant();
+        for (tenant, size) in sizes.iter() {
+            assert!(*size > 0, "Tenant {} should have positive size", tenant);
+        }
+
+        // Verify char count consistency
+        let maintained = get_maintained_counts(&tree);
+        let computed = tree.get_used_size_per_tenant();
+        assert_eq!(
+            maintained, computed,
+            "Counts should be consistent after stress test"
+        );
+    }
+
+    // ==================== Boundary Condition Tests ====================
+
+    #[test]
+    fn test_very_long_strings() {
+        let tree = Tree::new();
+
+        // Create a very long string (10KB)
+        let long_string: String = (0..10000)
+            .map(|i| ((i % 26) as u8 + b'a') as char)
+            .collect();
+
+        tree.insert(&long_string, "tenant1");
+
+        let (matched, tenant) = tree.prefix_match(&long_string);
+        assert_eq!(matched.len(), long_string.len());
+        assert_eq!(tenant, "tenant1");
+
+        // Partial match of long string
+        let partial = &long_string[..5000];
+        let (matched, _) = tree.prefix_match(partial);
+        assert_eq!(matched, partial);
+    }
+
+    #[test]
+    fn test_many_tenants_same_path() {
+        let tree = Tree::new();
+
+        // 100 tenants all insert same string
+        for i in 0..100 {
+            tree.insert("shared_path", &format!("tenant{}", i));
+        }
+
+        // Match should return one of them
+        let (matched, _) = tree.prefix_match("shared_path");
+        assert_eq!(matched, "shared_path");
+
+        // Verify all tenants are tracked
+        let sizes = tree.get_used_size_per_tenant();
+        assert_eq!(sizes.len(), 100, "Should have 100 tenants");
+    }
+
+    #[test]
+    fn test_special_characters() {
+        let tree = Tree::new();
+
+        // Various special characters
+        let test_cases = vec![
+            ("hello\nworld", "tenant1"),      // newline
+            ("hello\tworld", "tenant2"),      // tab
+            ("hello\0world", "tenant3"),      // null byte
+            ("hello\u{A0}world", "tenant4"),  // non-breaking space
+            ("path/to/file", "tenant5"),      // slashes
+            ("query?param=value", "tenant6"), // URL-like
+        ];
+
+        for (text, tenant) in &test_cases {
+            tree.insert(text, tenant);
+        }
+
+        for (text, tenant) in &test_cases {
+            let (matched, matched_tenant) = tree.prefix_match(text);
+            assert_eq!(matched, *text, "Failed for: {:?}", text);
+            assert_eq!(matched_tenant, *tenant);
+        }
     }
 }
