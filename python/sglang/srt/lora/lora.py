@@ -94,19 +94,19 @@ class LoRAAdapter(nn.Module):
         ):
             layer_id = get_layer_id(name)
             if layer_id is not None:
-                self.layers[layer_id].weights[name] = loaded_weight.cpu().pin_memory()
+                self.layers[layer_id].weights[name] = loaded_weight.cpu()
             elif "embed_tokens" in name or "lm_head" in name:
                 # Check if this module is declared in target_modules before loading
                 module_name = "embed_tokens" if "embed_tokens" in name else "lm_head"
                 if module_name in normalized_target_modules:
-                    self.embedding_layers[name] = loaded_weight.cpu().pin_memory()
+                    self.embedding_layers[name] = loaded_weight.cpu()
                 else:
                     logger.debug(
                         f"Skipping {name} as '{module_name}' is not in adapter's target_modules: {self.config.target_modules}"
                     )
             elif "input_embeddings" in name or "output_embeddings" in name:
                 # added/extra token emb
-                self.added_tokens_embeddings[name] = loaded_weight.cpu().pin_memory()
+                self.added_tokens_embeddings[name] = loaded_weight.cpu()
                 assert loaded_weight.shape[0] == self.config.lora_added_tokens_size, (
                     f"LoRA adapter {self.uid} has extra_vocab_size {self.config.extra_vocab_size} specified in the config, "
                     f"but the loaded weight has {loaded_weight.shape[0]} extra vocab size"
@@ -156,7 +156,7 @@ class LoRAAdapter(nn.Module):
                         weights[v_name],
                     ),
                     0,
-                ).pin_memory()
+                )
                 weights.pop(q_name)
                 if "k_proj" in target_module:
                     weights.pop(k_name)
@@ -168,7 +168,7 @@ class LoRAAdapter(nn.Module):
                 k_name = weight_name.replace("qkv_proj", "k_proj")
                 v_name = weight_name.replace("qkv_proj", "v_proj")
                 if "lora_A" in weight_name:
-                    weights[qkv_name] = weights[qkv_name].repeat(3, 1).pin_memory()
+                    weights[qkv_name] = weights[qkv_name].repeat(3, 1)
                 # else: no-op as LoRA B weight is already stacked.
 
     def normalize_gate_up_proj(
@@ -187,7 +187,7 @@ class LoRAAdapter(nn.Module):
                     )
                 weights[gate_up_name] = torch.cat(
                     (weights[weight_name], weights[up_name]), 0
-                ).pin_memory()
+                )
                 weights.pop(weight_name)
                 if up_name in weights:
                     weights.pop(up_name)
@@ -195,7 +195,16 @@ class LoRAAdapter(nn.Module):
                 # If gate_up_proj is already stacked, we normalize it following the SGL convention
                 gate_up_name = weight_name
                 if "lora_A" in weight_name:
-                    weights[gate_up_name] = (
-                        weights[gate_up_name].repeat(2, 1).pin_memory()
-                    )
+                    weights[gate_up_name] = weights[gate_up_name].repeat(2, 1)
                 # else: no-op as LoRA B weight is already stacked.
+
+    def pin_weights(self):
+        for layer in self.layers:
+            for name, weight in layer.weights.items():
+                layer.weights[name] = weight.pin_memory()
+
+        for name, weight in self.embedding_layers.items():
+            self.embedding_layers[name] = weight.pin_memory()
+
+        for name, weight in self.added_tokens_embeddings.items():
+            self.added_tokens_embeddings[name] = weight.pin_memory()

@@ -279,6 +279,7 @@ class Scheduler(
             server_args.priority_scheduling_preemption_threshold
         )
         self.enable_lora = server_args.enable_lora
+        self.enable_lora_prefetch = server_args.enable_lora_prefetch
         self.max_loras_per_batch = server_args.max_loras_per_batch
         self.enable_overlap = not server_args.disable_overlap_schedule
         self.enable_pdmux = server_args.enable_pdmux
@@ -366,7 +367,7 @@ class Scheduler(
         # Init request dispatcher
         self.init_request_dispatcher()
 
-        if self.enable_lora:
+        if self.enable_lora_prefetch:
             self.lora_prefetcher = LoRAPrefetcher(
                 self.tp_worker.model_runner.lora_manager
             )
@@ -1943,15 +1944,8 @@ class Scheduler(
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
             if self.enable_lora and req.lora_id not in running_loras:
-                lora_prefetch_status = self.lora_prefetcher.check_prefetch_status(
-                    req.lora_id
-                )
-                if lora_prefetch_status == LoRAPrefetchStatus.PREFETCHING:
-                    continue
-                elif lora_prefetch_status == LoRAPrefetchStatus.NOT_PREFETCHED:
-                    res = self.lora_prefetcher.try_start_prefetch(
-                        req.lora_id, running_loras
-                    )
+                res = self.try_load_lora(req.lora_id, running_loras)
+                if not res:
                     continue
 
             running_bs = len(self.running_batch.reqs)
@@ -2339,6 +2333,30 @@ class Scheduler(
 
         self.log_batch_result_stats(batch, result)
         self.maybe_send_health_check_signal()
+
+    def try_load_lora(self, lora_id: Optional[str], running_loras: set[Optional[str]]):
+        if self.enable_lora_prefetch:
+            lora_prefetch_status = self.lora_prefetcher.check_prefetch_status(lora_id)
+            if lora_prefetch_status == LoRAPrefetchStatus.PREFETCHING:
+                return False
+            elif lora_prefetch_status == LoRAPrefetchStatus.NOT_PREFETCHED:
+                res = self.lora_prefetcher.try_start_prefetch(lora_id, running_loras)
+                if res:
+                    logger.debug(f"Prefetching LoRA: {lora_id}")
+
+                return False
+            else:
+                assert lora_prefetch_status == LoRAPrefetchStatus.LOADED
+                return True
+        else:
+            lora_manager = self.tp_worker.model_runner.lora_manager
+
+            new_lora_set = running_loras | {lora_id}
+            if not lora_manager.validate_lora_batch(new_lora_set):
+                return False
+
+            lora_manager.fetch_new_lora(lora_id, running_loras)
+            return True
 
     def maybe_send_health_check_signal(self):
         if self.return_health_check_ct:

@@ -44,11 +44,9 @@ class LoRAPrefetcher:
     ) -> bool:
         loras_to_be_loaded = running_loras | self.lora_to_prefetch_event.keys()
 
-        # Non-LoRA requests are prioritized and thus the base model should always be loaded
-        if lora_id is not None:
-            new_lora_set = loras_to_be_loaded | {lora_id}
-            if not self.lora_manager.validate_lora_batch(new_lora_set):
-                return False
+        new_lora_set = loras_to_be_loaded | {lora_id}
+        if not self.lora_manager.validate_lora_batch(new_lora_set):
+            return False
 
         with self.load_stream_context:
             self.lora_manager.fetch_new_lora(lora_id, loras_to_be_loaded)

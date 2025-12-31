@@ -72,6 +72,7 @@ class LoRAManager:
         self.tp_size: int = tp_size
         self.tp_rank: int = tp_rank
         self.lora_added_tokens_size: Optional[int] = None
+        self.enable_lora_prefetch: Optional[bool] = server_args.enable_lora_prefetch
 
         # Store eviction policy from server args
         self.eviction_policy = server_args.lora_eviction_policy
@@ -445,6 +446,11 @@ class LoRAManager:
             self.lora_backend,
         )
         lora_adapter.initialize_weights()
+
+        # If we want to prefetch LoRA adapters, they must be pinned in CPU memory
+        if self.enable_lora_prefetch:
+            lora_adapter.pin_weights()
+
         self.loras[lora_ref.lora_id] = lora_adapter
 
     def init_memory_pool(self):
