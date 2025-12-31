@@ -163,6 +163,10 @@ class MooncakeKVManager(CommonKVManager):
         super().__init__(args, disaggregation_mode, server_args, is_mla_backend)
         self.init_engine()
         self.register_buffer_to_engine()
+        # Bootstrap overlap is only enabled for Mooncake backend
+        self.bootstrap_overlap_enabled = (
+            get_int_env_var("SGLANG_DISAGGREGATION_BOOTSTRAP_OVERLAP_DISABLE", 1) == 0
+        )
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self.start_prefill_thread()
             self.session_failures = defaultdict(int)
@@ -707,6 +711,19 @@ class MooncakeKVManager(CommonKVManager):
         while True:
             try:
                 kv_chunk: TransferKVChunk = queue.get()
+
+                # Check request status before processing (skip when bootstrap_overlap is disabled)
+                if (
+                    not self.bootstrap_overlap_enabled
+                    and kv_chunk.room in self.request_status
+                ):
+                    status = self.check_status(kv_chunk.room)
+                    if status == KVPoll.Bootstrapping:
+                        queue.put(kv_chunk)
+                        continue
+                    elif status == KVPoll.Failed:
+                        continue
+
                 reqs_to_be_processed = (
                     self.transfer_infos[kv_chunk.room].values()
                     if kv_chunk.room in self.transfer_infos
@@ -838,10 +855,9 @@ class MooncakeKVManager(CommonKVManager):
                         if kv_chunk.is_last and req.room in self.request_status:
                             self.update_status(req.room, KVPoll.Success)
 
-                if (
-                    kv_chunk.room not in self.request_status
-                    or self.check_status(kv_chunk.room) == KVPoll.Success
-                ):
+                if kv_chunk.room not in self.request_status or self.check_status(
+                    kv_chunk.room
+                ) in (KVPoll.Success, KVPoll.Failed):
                     if kv_chunk.room in self.transfer_infos:
                         self.transfer_infos.pop(kv_chunk.room)
 
@@ -1135,6 +1151,7 @@ class MooncakeKVSender(CommonKVSender):
                             "which means prefill instances fail to receive the KV indices from the decode instance of this request. "
                             "If a greater mean TTFT is acceptable, you can 'export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=600' (10 minutes) to relax the timeout condition. "
                         )
+                        self.is_bootstrapping_failed = True
                         self.kv_mgr.record_failure(
                             self.bootstrap_room,
                             f"Request {self.bootstrap_room} timed out after {elapsed:.1f}s in KVPoll.Bootstrapping",

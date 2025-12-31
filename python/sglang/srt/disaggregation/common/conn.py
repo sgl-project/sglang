@@ -200,6 +200,7 @@ class CommonKVSender(BaseKVSender):
         self.bootstrap_server_url = bootstrap_addr
         # inner state
         self.curr_idx = 0
+        self.is_bootstrapping_failed = False
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Bootstrapping)
 
     def init(self, num_kv_indices: int, aux_index: Optional[int] = None):

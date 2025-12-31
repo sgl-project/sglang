@@ -109,6 +109,13 @@ class PrefillBootstrapQueue:
         self.transfer_backend = transfer_backend
         self.kv_manager = self._init_kv_manager()
 
+        # Bootstrap overlap is only enabled for Mooncake backend
+        self.bootstrap_overlap_enabled = (
+            self.transfer_backend == TransferBackend.MOONCAKE
+            and hasattr(self.kv_manager, "bootstrap_overlap_enabled")
+            and self.kv_manager.bootstrap_overlap_enabled
+        )
+
         if self.scheduler.tp_worker.is_hybrid_swa:
             # FIXME: current SWA allocation allocate full kv cache size in prefill
             self.max_total_num_tokens = min(
@@ -227,6 +234,65 @@ class PrefillBootstrapQueue:
         """
         req.sampling_params.max_new_tokens = 1
 
+    def pop_bootstrapped_without_checking_status(
+        self,
+        return_failed_reqs: bool = False,
+        rids_to_check: Optional[List[str]] = None,
+    ) -> List[Req]:
+        """
+        pop the reqs which has finished bootstrapping
+
+        return_failed_reqs: For PP, on rank 0, also return the failed reqs to notify the next rank
+        rids_to_check: For PP, on rank > 0, check the rids from the previous rank has consensus with the current rank.
+        """
+
+        bootstrapped_reqs = []
+        failed_reqs = []
+        indices_to_remove = set()
+
+        if len(self.queue) == 0:
+            if return_failed_reqs is False:
+                return []
+            else:
+                return [], []
+
+        for i, req in enumerate(self.queue):
+            if rids_to_check is not None:
+                # if req not in reqs_info_to_check, skip
+                if req.rid not in rids_to_check:
+                    continue
+
+            # KV.WaitingForInput - init here
+            num_kv_indices = len(req.origin_input_ids)
+            if self.req_to_metadata_buffer_idx_allocator.available_size() == 0:
+                break
+
+            req.metadata_buffer_index = (
+                self.req_to_metadata_buffer_idx_allocator.alloc()
+            )
+            assert req.metadata_buffer_index is not None
+
+            num_pages = kv_to_page_num(num_kv_indices, self.token_to_kv_pool.page_size)
+            req.disagg_kv_sender.init(num_pages, req.metadata_buffer_index)
+
+            bootstrapped_reqs.append(req)
+            indices_to_remove.add(i)
+            req.time_stats.wait_queue_entry_time = time.perf_counter()
+            req.add_latency(RequestStage.PREFILL_BOOTSTRAP)
+
+            trace_slice_end(
+                RequestStage.PREFILL_BOOTSTRAP, req.rid, auto_next_anon=True
+            )
+
+        self.queue = [
+            entry for i, entry in enumerate(self.queue) if i not in indices_to_remove
+        ]
+
+        if return_failed_reqs is False:
+            return bootstrapped_reqs
+        else:
+            return bootstrapped_reqs, failed_reqs
+
     def pop_bootstrapped(
         self,
         return_failed_reqs: bool = False,
@@ -238,6 +304,13 @@ class PrefillBootstrapQueue:
         return_failed_reqs: For PP, on rank 0, also return the failed reqs to notify the next rank
         rids_to_check: For PP, on rank > 0, check the rids from the previous rank has consensus with the current rank.
         """
+
+        # Use pop_bootstrapped_without_checking_status when bootstrap overlap is enabled
+        if self.bootstrap_overlap_enabled:
+            return self.pop_bootstrapped_without_checking_status(
+                return_failed_reqs=return_failed_reqs,
+                rids_to_check=rids_to_check,
+            )
 
         bootstrapped_reqs = []
         failed_reqs = []
@@ -549,7 +622,11 @@ class SchedulerDisaggregationPrefillMixin:
 
                 assert poll == KVPoll.Success or poll == KVPoll.Failed
 
-            if poll in [KVPoll.WaitingForInput, KVPoll.Transferring]:
+            if poll in [
+                KVPoll.Bootstrapping,
+                KVPoll.WaitingForInput,
+                KVPoll.Transferring,
+            ]:
                 undone_reqs.append(req)
             elif poll == KVPoll.Success:  # transfer done
                 release_kv_cache(req, self.tree_cache)  # unlock the tree
@@ -559,7 +636,11 @@ class SchedulerDisaggregationPrefillMixin:
                     req.disagg_kv_sender.clear()
                 done_reqs.append(req)
             elif poll == KVPoll.Failed:
-                error_message = f"Prefill transfer failed for request rank={self.tp_rank} {req.rid=} {req.bootstrap_room=}"
+                error_message = ""
+                if req.disagg_kv_sender.is_bootstrapping_failed:
+                    error_message = f"Prefill bootstrap failed for request rank={self.tp_rank} {req.rid=} {req.bootstrap_room=}"
+                else:
+                    error_message = f"Prefill transfer failed for request rank={self.tp_rank} {req.rid=} {req.bootstrap_room=}"
                 try:
                     req.disagg_kv_sender.failure_exception()
                 except Exception as e:
