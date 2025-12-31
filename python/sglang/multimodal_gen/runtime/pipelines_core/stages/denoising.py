@@ -38,11 +38,11 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_cfg_group,
     get_classifier_free_guidance_rank,
 )
-from sglang.multimodal_gen.runtime.layers.attention.selector import get_attn_backend
 from sglang.multimodal_gen.runtime.layers.attention.STA_configuration import (
     configure_sta,
     save_mask_search_results,
 )
+from sglang.multimodal_gen.runtime.layers.attention.selector import get_attn_backend
 from sglang.multimodal_gen.runtime.loader.component_loader import TransformerLoader
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
@@ -93,9 +93,8 @@ class DenoisingStage(PipelineStage):
 
         # torch compile
         if self.server_args.enable_torch_compile:
-            self.torch_compile_module(self.transformer)
-            if transformer_2 is not None:
-                self.torch_compile_module(self.transformer_2)
+            for transformer in filter(None, [self.transformer, self.transformer_2]):
+                self.torch_compile_module(transformer)
 
         self.scheduler = scheduler
         self.vae = vae
@@ -115,6 +114,7 @@ class DenoisingStage(PipelineStage):
         # cache-dit state (for delayed mounting and idempotent control)
         self._cache_dit_enabled = False
         self._cached_num_steps = None
+        self._is_warmed_up = False
 
     def torch_compile_module(self, module):
         """
@@ -374,8 +374,8 @@ class DenoisingStage(PipelineStage):
         # z: [B, C, 1, H, W], reserved_frames_mask: [1, C, T, H, W]
         # Both will broadcast correctly
         latents = (
-            1.0 - reserved_frames_mask
-        ) * z + reserved_frames_mask * latent_model_input
+                      1.0 - reserved_frames_mask
+                  ) * z + reserved_frames_mask * latent_model_input
         assert latents.ndim == 5
         latents = latents.to(get_local_torch_device())
         batch.latents = latents
@@ -489,8 +489,9 @@ class DenoisingStage(PipelineStage):
         pipeline = self.pipeline() if self.pipeline else None
         if not server_args.model_loaded["transformer"]:
             loader = TransformerLoader()
+            # FIXME
             self.transformer = loader.load(
-                server_args.model_paths["transformer"], server_args
+                server_args.model_paths["transformer"], server_args, "transformer"
             )
 
             # enable cache-dit before torch.compile (delayed mounting)
@@ -515,8 +516,8 @@ class DenoisingStage(PipelineStage):
         # Setup precision and autocast settings
         target_dtype = torch.bfloat16
         autocast_enabled = (
-            target_dtype != torch.float32
-        ) and not server_args.disable_autocast
+                               target_dtype != torch.float32
+                           ) and not server_args.disable_autocast
 
         # Get timesteps and calculate warmup steps
         timesteps = batch.timesteps
@@ -666,6 +667,7 @@ class DenoisingStage(PipelineStage):
         trajectory_latents: list,
         trajectory_timesteps: list,
         server_args: ServerArgs,
+        is_warmup: bool = False,
     ):
         # Gather results if using sequence parallelism
         if trajectory_latents:
@@ -702,14 +704,15 @@ class DenoisingStage(PipelineStage):
 
         # Save STA mask search results if needed
         if (
-            self.attn_backend.get_enum() == AttentionBackendEnum.SLIDING_TILE_ATTN
+            not is_warmup
+            and self.attn_backend.get_enum() == AttentionBackendEnum.SLIDING_TILE_ATTN
             and server_args.STA_mode == STA_Mode.STA_SEARCHING
         ):
             self.save_sta_search_results(batch)
 
         # deallocate transformer if on mps
         pipeline = self.pipeline() if self.pipeline else None
-        if torch.backends.mps.is_available():
+        if torch.backends.mps.is_available() and not is_warmup:
             logger.info(
                 "Memory before deallocating transformer: %s",
                 torch.mps.current_allocated_memory(),
@@ -906,8 +909,8 @@ class DenoisingStage(PipelineStage):
                 # Unsqueeze mask to [1, C, T_local, H, W] for broadcasting.
                 # z will broadcast along the time dimension.
                 latents = (
-                    1.0 - reserved_frames_mask.unsqueeze(0)
-                ) * z + reserved_frames_mask.unsqueeze(0) * latents
+                              1.0 - reserved_frames_mask.unsqueeze(0)
+                          ) * z + reserved_frames_mask.unsqueeze(0) * latents
 
         return latents
 
@@ -917,16 +920,6 @@ class DenoisingStage(PipelineStage):
         batch: Req,
         server_args: ServerArgs,
     ) -> Req:
-        """
-        Run the denoising loop.
-
-        Args:
-            batch: The current batch information.
-            server_args: The inference arguments.
-
-        Returns:
-            The batch with denoised latents.
-        """
         # Prepare variables for the denoising loop
 
         prepared_vars = self._prepare_denoising_loop(batch, server_args)
@@ -954,7 +947,7 @@ class DenoisingStage(PipelineStage):
         denoising_start_time = time.time()
 
         # to avoid device-sync caused by timestep comparison
-
+        is_warmup = batch.is_warmup
         self.scheduler.set_begin_index(0)
         timesteps_cpu = timesteps.cpu()
         num_timesteps = timesteps_cpu.shape[0]
@@ -963,10 +956,19 @@ class DenoisingStage(PipelineStage):
             dtype=target_dtype,
             enabled=autocast_enabled,
         ):
-            with self.progress_bar(total=num_inference_steps) as progress_bar:
+            disable_tqdm = is_warmup
+            with self.progress_bar(
+                total=num_inference_steps
+            ) as progress_bar:
+                if disable_tqdm:
+                    progress_bar.disable = True
+
                 for i, t_host in enumerate(timesteps_cpu):
+                    step_name = (
+                        f"denoising_step_{i}" if not is_warmup else f"warmup_step_{i}"
+                    )
                     with StageProfiler(
-                        f"denoising_step_{i}",
+                        step_name,
                         logger=logger,
                         timings=batch.timings,
                         perf_dump_path_provided=batch.perf_dump_path is not None,
@@ -987,7 +989,7 @@ class DenoisingStage(PipelineStage):
                         if batch.image_latent is not None:
                             assert (
                                 not server_args.pipeline_config.task_type
-                                == ModelTaskType.TI2V
+                                    == ModelTaskType.TI2V
                             ), "image latents should not be provided for TI2V task"
                             latent_model_input = torch.cat(
                                 [latent_model_input, batch.image_latent], dim=1
@@ -1051,11 +1053,12 @@ class DenoisingStage(PipelineStage):
                         ):
                             progress_bar.update()
 
-                        self.step_profile()
+                        if not is_warmup:
+                            self.step_profile()
 
         denoising_end_time = time.time()
 
-        if num_timesteps > 0:
+        if num_timesteps > 0 and not is_warmup:
             self.log_info(
                 "average time per step: %.4f seconds",
                 (denoising_end_time - denoising_start_time) / len(timesteps),
@@ -1067,6 +1070,7 @@ class DenoisingStage(PipelineStage):
             trajectory_latents=trajectory_latents,
             trajectory_timesteps=trajectory_timesteps,
             server_args=server_args,
+            is_warmup=is_warmup,
         )
         return batch
 
@@ -1362,9 +1366,9 @@ class DenoisingStage(PipelineStage):
 
         logger.info("STA_mode: %s", STA_mode)
         if (batch.num_frames, batch.height, batch.width) != (
-            69,
-            768,
-            1280,
+                69,
+                768,
+                1280,
         ) and STA_mode != "STA_inference":
             raise NotImplementedError(
                 "STA mask search/tuning is not supported for this resolution"

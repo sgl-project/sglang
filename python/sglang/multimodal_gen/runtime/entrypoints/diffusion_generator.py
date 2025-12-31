@@ -266,6 +266,11 @@ class DiffGenerator:
         log_batch_completion(logger, len(results), total_gen_time)
 
         if results:
+            if self.server_args.enable_warmup:
+                total_duration_ms = results[0]["timings"]["total_duration_ms"]
+                logger.info(
+                    f"Batch processed in %.2f seconds (with wa rmup excluded)", total_duration_ms / 1000.0)
+
             peak_memories = [r.get("peak_memory_mb", 0) for r in results]
             if peak_memories:
                 max_peak_memory = max(peak_memories)
