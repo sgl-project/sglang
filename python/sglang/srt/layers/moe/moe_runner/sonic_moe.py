@@ -4,7 +4,6 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
 import torch
-import torch.nn.functional as F
 
 from sglang.srt.layers.moe.moe_runner.base import (
     MoeQuantInfo,
@@ -22,7 +21,12 @@ if TYPE_CHECKING:
         StandardDispatchOutput,
     )
 
+from sonicmoe.count_cumsum import count_cumsum
+from sonicmoe.enums import ActivationType
+from sonicmoe.functional import TC_topk_router_metadata, _DownProjection, _UpProjection
 
+
+# import sonic_moe
 @dataclass
 class SonicMoeRunnerInput(RunnerInput):
     hidden_states: torch.Tensor
@@ -85,6 +89,12 @@ def fused_experts_none_to_sonic_moe(
     """
     from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
 
+    if runner_config.is_gated and runner_config.activation == "silu":
+        activation_type = ActivationType("swiglu")
+    else:
+        raise NotImplementedError(
+            "Only SiLU gated activation is supported in SonicMoE fused path."
+        )
     hidden_states = dispatch_output.hidden_states
     topk_output = dispatch_output.topk_output
     w13_weight = quant_info.w13_weight
@@ -94,12 +104,13 @@ def fused_experts_none_to_sonic_moe(
 
     output = _sonic_moe_forward_placeholder(
         hidden_states=hidden_states,
-        w13=w13_weight,
+        w13=w13_weight.permute(1, 2, 0),
         b13=b13,
-        w2=w2_weight,
+        w2=w2_weight.permute(1, 2, 0),
         b2=b2,
         router_weights=topk_output.topk_weights,
         selected_experts=topk_output.topk_ids,
+        activation_type=activation_type,
         config=runner_config,
     )
 
@@ -114,6 +125,7 @@ def _sonic_moe_forward_placeholder(
     b2: Optional[torch.Tensor],
     router_weights: torch.Tensor,
     selected_experts: torch.Tensor,
+    activation_type: ActivationType,
     config: MoeRunnerConfig,
 ) -> torch.Tensor:
     """
@@ -122,91 +134,67 @@ def _sonic_moe_forward_placeholder(
     """
     assert hidden_states.size(0) == selected_experts.size(0), "Batch size mismatch"
     assert hidden_states.size(1) == config.hidden_size, "Hidden size mismatch"
-    assert w13.size(0) == config.num_experts, "W13 expert count mismatch"
-    assert w13.size(1) == (
+    assert w13.size(2) == config.num_experts, "W13 expert count mismatch"
+    assert w13.size(0) == (
         config.intermediate_size_per_partition * 2
         if config.is_gated
         else config.intermediate_size_per_partition
     ), "W13 intermediate size mismatch"
-    assert w13.size(2) == config.hidden_size, "W13 hidden size mismatch"
-    assert w2.size(0) == config.num_experts, "W2 expert count mismatch"
-    assert w2.size(1) == config.hidden_size, "W2 hidden size mismatch"
+    assert w13.size(1) == config.hidden_size, "W13 hidden size mismatch"
+    assert w2.size(2) == config.num_experts, "W2 expert count mismatch"
+    assert w2.size(0) == config.hidden_size, "W2 hidden size mismatch"
     assert (
-        w2.size(2) == config.intermediate_size_per_partition
+        w2.size(1) == config.intermediate_size_per_partition
     ), "W2 intermediate size mismatch"
     assert selected_experts.size(1) == config.top_k, "Input feature size mismatch"
 
     T = hidden_states.size(0)
+    K = config.top_k
+    stream_id = torch.cuda.current_stream().cuda_stream
 
-    selected_experts = selected_experts.flatten()
+    expert_frequency, expert_frequency_offset = count_cumsum(
+        selected_experts.view(-1), config.num_experts, do_cumsum=True
+    )
+    (
+        expert_frequency_offset,
+        x_gather_idx,
+        s_scatter_idx,
+        s_reverse_scatter_idx,
+        num_activated_expert_per_token_offset,
+    ) = TC_topk_router_metadata(selected_experts, expert_frequency_offset, K)
 
-    sorted_expert_idxs, sorted_scattered_idxs = selected_experts.sort()
-
-    expert_frequency = selected_experts.bincount(minlength=config.num_experts).to(
-        torch.int32
+    y1, z = _UpProjection.apply(
+        hidden_states,
+        w13,
+        b13,
+        expert_frequency_offset,
+        T * K,
+        K,
+        stream_id,
+        x_gather_idx,
+        s_scatter_idx,
+        s_reverse_scatter_idx,
+        num_activated_expert_per_token_offset,
+        False,  # is_varlen_K
+        activation_type,
+        True,  # inference_mode_enabled
     )
 
-    # sort and group input tokens according to expert assignment
-    fan_in_index = sorted_scattered_idxs // config.top_k
-
-    # gather the gate values for grouped input tokens
-    router_weights = router_weights.flatten().to(hidden_states.dtype)
-    batch_gates = router_weights[sorted_scattered_idxs]
-
-    hidden_states = hidden_states[fan_in_index]
-
-    hidden_states = _torch_forward(
-        hidden_states=hidden_states,
-        expert_frequency=expert_frequency,
-        weight=w13,
-        bias=b13,
-        return_list=True,
+    hidden_states = _DownProjection.apply(
+        y1,
+        z,
+        w2,
+        b2,
+        router_weights,
+        expert_frequency_offset,
+        T,
+        K,
+        stream_id,
+        x_gather_idx,
+        s_scatter_idx,
+        s_reverse_scatter_idx,
+        num_activated_expert_per_token_offset,
+        False,  # is_varlen_K
+        activation_type,
     )
-
-    hidden_states = [_swiglu(i) for i in hidden_states]
-
-    hidden_states = _torch_forward(
-        hidden_states=hidden_states,
-        expert_frequency=None,
-        weight=w2,
-        bias=b2,
-        return_list=False,
-    )
-
-    hidden_states = hidden_states * batch_gates.unsqueeze(-1)
-
-    zeros = torch.zeros(
-        (T, config.hidden_size), dtype=hidden_states.dtype, device=hidden_states.device
-    )
-
-    hidden_states = zeros.index_add(0, fan_in_index, hidden_states)
-
     return hidden_states
-
-
-def _torch_forward(
-    hidden_states: torch.Tensor,
-    expert_frequency: torch.Tensor | None,
-    weight: torch.Tensor,
-    bias: Optional[torch.Tensor] = None,
-    return_list: bool = False,
-) -> list[torch.Tensor] | torch.Tensor:
-    if isinstance(hidden_states, torch.Tensor):
-        hidden_states = hidden_states.split(expert_frequency.tolist(), dim=0)
-    else:
-        assert expert_frequency is None
-
-    hidden_states = [
-        F.linear(hidden_states[i], weight[i], None if bias is None else bias[i])
-        for i in range(weight.size(0))
-    ]
-
-    if not return_list:
-        hidden_states = torch.cat(hidden_states, dim=0)
-
-    return hidden_states
-
-
-def _swiglu(x: torch.Tensor) -> torch.Tensor:
-    g, u = x.chunk(2, dim=-1)
-    return F.silu(g) * u

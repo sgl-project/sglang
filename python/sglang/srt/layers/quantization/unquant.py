@@ -296,6 +296,27 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             layer.w2_weight.data = layer.w2_weight.data.reshape(
                 layer.num_local_experts, *new_shape_w2
             )
+        if self.use_sonic_moe:
+            # Expect w13_weight shape like [num_local_experts, 2N, hidden] or [*, 2N, *]
+            w = layer.w13_weight.data
+            assert w.size(1) % 2 == 0, f"w13_weight dim1 must be even, got {w.size(1)}"
+            N = w.size(1) // 2
+            print(f"Reordering w13_weight for SonicMoE fused gated activation...{N}")
+            device = w.device
+
+            # Cache the permutation indices to avoid rebuilding every layer call
+            perm = getattr(self, "_sonic_w13_perm", None)
+            if perm is None or perm.numel() != 2 * N or perm.device != device:
+                idx = torch.arange(N, device=device)
+                perm = torch.stack((idx, idx + N), dim=1).reshape(
+                    -1
+                )  # [0, N, 1, N+1, ...]
+                self._sonic_w13_perm = perm
+
+            # Reorder rows: w[:, perm, :] -> w (write back)
+            # Can't do true in-place reorder safely, so use a temp buffer then copy_ back.
+            tmp = w.index_select(1, perm)
+            w.copy_(tmp)
 
         return
 
@@ -398,6 +419,16 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                     expert_mask=layer.expert_mask_gpu,
                 )
                 return StandardCombineInput(hidden_states=output)
+            elif backend.is_sonic_moe():
+                from sglang.srt.layers.moe.moe_runner.sonic_moe import SonicMoeQuantInfo
+
+                quant_info = SonicMoeQuantInfo(
+                    w13_weight=layer.w13_weight,
+                    w2_weight=layer.w2_weight,
+                    b13=getattr(layer, "w13_weight_bias", None),
+                    b2=getattr(layer, "w2_weight_bias", None),
+                )
+                return self.runner.run(dispatch_output, quant_info)
             else:
                 quant_info = TritonMoeQuantInfo(
                     w13_weight=layer.w13_weight,
