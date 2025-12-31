@@ -5163,6 +5163,10 @@ class LoRAPathAction(argparse.Action):
         setattr(namespace, self.dest, lora_paths)
 
 
+def print_deprecated_warning(message: str):
+    logger.warning(f"\033[1;33m{message}\033[0m")
+
+
 class DeprecatedAction(argparse.Action):
     def __init__(self, option_strings, dest, nargs=0, **kwargs):
         super(DeprecatedAction, self).__init__(
@@ -5170,11 +5174,9 @@ class DeprecatedAction(argparse.Action):
         )
 
     def __call__(self, parser, namespace, values, option_string=None):
-        raise ValueError(self.help)
-
-
-def print_deprecated_warning(message: str):
-    logger.warning(f"\033[33m{message}\033[0m")
+        print_deprecated_warning(
+            f"The command line argument '{option_string}' is deprecated and will be removed in future versions."
+        )
 
 
 def auto_choose_speculative_params(self: ServerArgs):
