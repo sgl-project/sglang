@@ -22,6 +22,7 @@ from contextlib import contextmanager
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.distributed as dist
 from einops import rearrange
 
 from sglang.multimodal_gen.configs.models.vaes import WanVAEConfig
@@ -31,6 +32,10 @@ from sglang.multimodal_gen.runtime.models.vaes.common import (
     ParallelTiledVAE,
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
+from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+    get_sp_parallel_rank,
+    get_sp_world_size,
+)
 
 CACHE_T = 2
 
@@ -212,6 +217,164 @@ class WanCausalConv3d(nn.Conv3d):
         )  # casting needed for mps since amp isn't supported
         return super().forward(x)
 
+def halo_exchange(x: torch.Tensor, height_halo_size: int = 1) -> torch.Tensor:
+    if height_halo_size == 0:
+        return x
+    
+    rank = get_sp_parallel_rank()
+    world_size = get_sp_world_size()
+
+    top_row = x[..., :height_halo_size, :].contiguous()
+    bottom_row = x[..., -height_halo_size:, :].contiguous()
+
+    recv_top_buf = torch.empty_like(top_row)
+    recv_bottom_buf = torch.empty_like(bottom_row)
+
+    reqs = []
+
+    if rank > 0:
+        # has previous neighbor, recv previous rank's data to recv_top_buf and send top_row to it.
+        reqs.append(dist.irecv(recv_top_buf, src=rank-1))
+        reqs.append(dist.isend(top_row, dst=rank-1))
+    if rank < world_size - 1:
+        # has next neighbor, send bottom_row to next rank and recv next rank's data to recv_bottom_buf.
+        reqs.append(dist.isend(bottom_row, dst=rank+1))
+        reqs.append(dist.irecv(recv_bottom_buf, src=rank+1))
+
+    if rank == 0:
+        recv_top_buf.zero_()
+    if rank == world_size - 1:
+        recv_bottom_buf.zero_()
+
+    for req in reqs:
+        req.wait()
+
+    return torch.concat([recv_top_buf, x, recv_bottom_buf], dim=-2)
+
+
+class WanDistConv2d(nn.Conv2d):
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size: int | tuple[int, int, int],
+        stride: int | tuple[int, int, int] = 1,
+        padding: int | tuple[int, int, int] = 0,
+    ):
+        super().__init__(
+            in_channels=in_channels,
+            out_channels=out_channels,
+            kernel_size=kernel_size,
+            stride=stride,
+            padding=padding,
+        )
+
+        self.height_halo_size = (self.kernel_size[-2] - 1) // 2
+        self.height_trim_size = abs(self.padding[-2] - self.height_halo_size)
+
+        self.padding: tuple[int, int]
+        if self.height_halo_size > 0:
+            self._padding = (self.padding[1], self.padding[1], 0, 0)
+        else:
+            self._padding = (self.padding[1], self.padding[1], self.padding[0],
+                             self.padding[0])
+
+        self.padding = (0, 0)
+
+    def forward(self, x):
+        rank = get_sp_parallel_rank()
+        world_size = get_sp_world_size()
+
+        x = F.pad(x, self._padding)
+
+        x_padded = halo_exchange(x, height_halo_size=self.height_halo_size)
+
+        out = super().forward(x_padded)
+
+        if self.height_trim_size == 0:
+            return out
+
+        if rank == 0:
+            out = out[..., self.height_trim_size:, :]
+        elif rank == world_size - 1:
+            out = out[..., :-self.height_trim_size, :]
+
+        return out
+
+
+class WanDistCausalConv3d(nn.Conv3d):
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size: int | tuple[int, int, int],
+        stride: int | tuple[int, int, int] = 1,
+        padding: int | tuple[int, int, int] = 0,
+    ):
+        super().__init__(
+            in_channels=in_channels,
+            out_channels=out_channels,
+            kernel_size=kernel_size,
+            stride=stride,
+            padding=padding
+        )
+
+        self.height_halo_size = (self.kernel_size[-2] - 1) // 2
+        self.height_trim_size = abs(self.padding[-2] - self.height_halo_size)
+
+        self.padding: tuple[int, int, int]
+        # Set up causal padding, let the halo to control height padding
+        if self.height_halo_size > 0:
+            self._padding: tuple[int, ...] = (
+                self.padding[2],
+                self.padding[2],
+                0,
+                0,
+                2 * self.padding[0],
+                0,
+            )
+        else:
+            self._padding: tuple[int, ...] = (
+                self.padding[2],
+                self.padding[2],
+                self.padding[1],
+                self.padding[1],
+                2 * self.padding[0],
+                0,
+            )
+        self.padding = (0, 0, 0)
+
+    def forward(self, x, cache_x=None):
+        rank = get_sp_parallel_rank()
+        world_size = get_sp_world_size()
+
+
+        padding = list(self._padding)
+        if cache_x is not None and self._padding[4] > 0:
+            cache_x = cache_x.to(x.device)
+            x = torch.cat([cache_x, x], dim=2)
+            padding[4] -= cache_x.shape[2]
+
+        x = F.pad(x, padding)
+
+        x = (
+            x.to(self.weight.dtype) if current_platform.is_mps() else x
+        )  # casting needed for mps since amp isn't supported
+
+        x_padded = halo_exchange(x, height_halo_size=self.height_halo_size)
+
+        out = super().forward(x_padded)
+
+        if self.height_trim_size == 0:
+            return out
+
+        if rank == 0:
+            out = out[..., self.height_trim_size:, :]
+        elif rank == world_size - 1:
+            out = out[..., :-self.height_trim_size, :]
+
+        return out
+
 
 class WanRMS_norm(nn.Module):
     r"""
@@ -287,34 +450,64 @@ class WanResample(nn.Module):
         # default to dim //2
         if upsample_out_dim is None:
             upsample_out_dim = dim // 2
+        
+        world_size = get_sp_world_size()
 
         # layers
-        if mode == "upsample2d":
-            self.resample = nn.Sequential(
-                WanUpsample(scale_factor=(2.0, 2.0), mode="nearest-exact"),
-                nn.Conv2d(dim, upsample_out_dim, 3, padding=1),
-            )
-        elif mode == "upsample3d":
-            self.resample = nn.Sequential(
-                WanUpsample(scale_factor=(2.0, 2.0), mode="nearest-exact"),
-                nn.Conv2d(dim, upsample_out_dim, 3, padding=1),
-            )
-            self.time_conv = WanCausalConv3d(dim, dim * 2, (3, 1, 1), padding=(1, 0, 0))
+        if world_size > 1:
+            if mode == "upsample2d":
+                self.resample = nn.Sequential(
+                    WanUpsample(scale_factor=(2.0, 2.0), mode="nearest-exact"),
+                    WanDistConv2d(dim, upsample_out_dim, 3, padding=1),
+                )
+            elif mode == "upsample3d":
+                self.resample = nn.Sequential(
+                    WanUpsample(scale_factor=(2.0, 2.0), mode="nearest-exact"),
+                    WanDistConv2d(dim, upsample_out_dim, 3, padding=1),
+                )
+                self.time_conv = WanCausalConv3d(dim, dim * 2, (3, 1, 1), padding=(1, 0, 0))
 
-        elif mode == "downsample2d":
-            self.resample = nn.Sequential(
-                nn.ZeroPad2d((0, 1, 0, 1)), nn.Conv2d(dim, dim, 3, stride=(2, 2))
-            )
-        elif mode == "downsample3d":
-            self.resample = nn.Sequential(
-                nn.ZeroPad2d((0, 1, 0, 1)), nn.Conv2d(dim, dim, 3, stride=(2, 2))
-            )
-            self.time_conv = WanCausalConv3d(
-                dim, dim, (3, 1, 1), stride=(2, 1, 1), padding=(0, 0, 0)
-            )
+            elif mode == "downsample2d":
+                self.resample = nn.Sequential(
+                    nn.ZeroPad2d((0, 1, 0, 1)), nn.Conv2d(dim, dim, 3, stride=(2, 2))
+                )
+            elif mode == "downsample3d":
+                self.resample = nn.Sequential(
+                    nn.ZeroPad2d((0, 1, 0, 1)), nn.Conv2d(dim, dim, 3, stride=(2, 2))
+                )
+                self.time_conv = WanCausalConv3d(
+                    dim, dim, (3, 1, 1), stride=(2, 1, 1), padding=(0, 0, 0)
+                )
 
+            else:
+                self.resample = nn.Identity()
         else:
-            self.resample = nn.Identity()
+            if mode == "upsample2d":
+                self.resample = nn.Sequential(
+                    WanUpsample(scale_factor=(2.0, 2.0), mode="nearest-exact"),
+                    nn.Conv2d(dim, upsample_out_dim, 3, padding=1),
+                )
+            elif mode == "upsample3d":
+                self.resample = nn.Sequential(
+                    WanUpsample(scale_factor=(2.0, 2.0), mode="nearest-exact"),
+                    nn.Conv2d(dim, upsample_out_dim, 3, padding=1),
+                )
+                self.time_conv = WanCausalConv3d(dim, dim * 2, (3, 1, 1), padding=(1, 0, 0))
+
+            elif mode == "downsample2d":
+                self.resample = nn.Sequential(
+                    nn.ZeroPad2d((0, 1, 0, 1)), nn.Conv2d(dim, dim, 3, stride=(2, 2))
+                )
+            elif mode == "downsample3d":
+                self.resample = nn.Sequential(
+                    nn.ZeroPad2d((0, 1, 0, 1)), nn.Conv2d(dim, dim, 3, stride=(2, 2))
+                )
+                self.time_conv = WanCausalConv3d(
+                    dim, dim, (3, 1, 1), stride=(2, 1, 1), padding=(0, 0, 0)
+                )
+
+            else:
+                self.resample = nn.Identity()
 
     def forward(self, x):
         b, c, t, h, w = x.size()
@@ -498,6 +691,105 @@ class WanResidualBlock(nn.Module):
         # Add residual connection
         return x + h
 
+class WanDistResidualBlock(nn.Module):
+    r"""
+    A custom residual block module.
+
+    Args:
+        in_dim (int): Number of input channels.
+        out_dim (int): Number of output channels.
+        dropout (float, optional): Dropout rate for the dropout layer. Default is 0.0.
+        non_linearity (str, optional): Type of non-linearity to use. Default is "silu".
+    """
+
+    def __init__(
+        self,
+        in_dim: int,
+        out_dim: int,
+        dropout: float = 0.0,
+        non_linearity: str = "silu",
+    ) -> None:
+        super().__init__()
+        self.in_dim = in_dim
+        self.out_dim = out_dim
+        self.nonlinearity = get_act_fn(non_linearity)
+
+        # layers
+        self.norm1 = WanRMS_norm(in_dim, images=False)
+        self.conv1 = WanDistCausalConv3d(in_dim, out_dim, 3, padding=1)
+        self.norm2 = WanRMS_norm(out_dim, images=False)
+        self.dropout = nn.Dropout(dropout)
+        self.conv2 = WanDistCausalConv3d(out_dim, out_dim, 3, padding=1)
+        self.conv_shortcut = (
+            WanDistCausalConv3d(in_dim, out_dim, 1) if in_dim != out_dim else nn.Identity()
+        )
+
+    def forward(self, x):
+        # Apply shortcut connection
+        h = self.conv_shortcut(x)
+
+        # First normalization and activation
+        x = self.norm1(x)
+        x = self.nonlinearity(x)
+
+        _feat_cache = feat_cache.get()
+        _feat_idx = feat_idx.get()
+        if _feat_cache is not None:
+            idx = _feat_idx
+            cache_x = x[:, :, -CACHE_T:, :, :].clone()
+            if cache_x.shape[2] < 2 and _feat_cache[idx] is not None:
+                cache_x = torch.cat(
+                    [
+                        _feat_cache[idx][:, :, -1, :, :]
+                        .unsqueeze(2)
+                        .to(cache_x.device),
+                        cache_x,
+                    ],
+                    dim=2,
+                )
+
+            x = self.conv1(x, _feat_cache[idx])
+            _feat_cache[idx] = cache_x
+            _feat_idx += 1
+            feat_cache.set(_feat_cache)
+            feat_idx.set(_feat_idx)
+        else:
+            x = self.conv1(x)
+
+        # Second normalization and activation
+        x = self.norm2(x)
+        x = self.nonlinearity(x)
+
+        # Dropout
+        x = self.dropout(x)
+
+        _feat_cache = feat_cache.get()
+        _feat_idx = feat_idx.get()
+        if _feat_cache is not None:
+            idx = _feat_idx
+            cache_x = x[:, :, -CACHE_T:, :, :].clone()
+            if cache_x.shape[2] < 2 and _feat_cache[idx] is not None:
+                cache_x = torch.cat(
+                    [
+                        _feat_cache[idx][:, :, -1, :, :]
+                        .unsqueeze(2)
+                        .to(cache_x.device),
+                        cache_x,
+                    ],
+                    dim=2,
+                )
+
+            x = self.conv2(x, _feat_cache[idx])
+            _feat_cache[idx] = cache_x
+            _feat_idx += 1
+            feat_cache.set(_feat_cache)
+            feat_idx.set(_feat_idx)
+        else:
+            x = self.conv2(x)
+
+        # Add residual connection
+        return x + h
+
 
 class WanAttentionBlock(nn.Module):
     r"""
@@ -515,6 +807,55 @@ class WanAttentionBlock(nn.Module):
         self.norm = WanRMS_norm(dim)
         self.to_qkv = nn.Conv2d(dim, dim * 3, 1)
         self.proj = nn.Conv2d(dim, dim, 1)
+
+    def forward(self, x):
+        identity = x
+        batch_size, channels, time, height, width = x.size()
+
+        x = x.permute(0, 2, 1, 3, 4).reshape(batch_size * time, channels, height, width)
+        x = self.norm(x)
+
+        # compute query, key, value
+        qkv = self.to_qkv(x)
+        qkv = qkv.reshape(batch_size * time, 1, channels * 3, -1)
+        qkv = qkv.permute(0, 1, 3, 2).contiguous()
+        q, k, v = qkv.chunk(3, dim=-1)
+
+        # apply attention
+        x = F.scaled_dot_product_attention(q, k, v)
+
+        x = (
+            x.squeeze(1)
+            .permute(0, 2, 1)
+            .reshape(batch_size * time, channels, height, width)
+        )
+
+        # output projection
+        x = self.proj(x)
+
+        # Reshape back: [(b*t), c, h, w] -> [b, c, t, h, w]
+        x = x.view(batch_size, time, channels, height, width)
+        x = x.permute(0, 2, 1, 3, 4)
+
+        return x + identity
+
+
+class WanDistAttentionBlock(nn.Module):
+    r"""
+    Causal self-attention with a single head.
+
+    Args:
+        dim (int): The number of channels in the input tensor.
+    """
+
+    def __init__(self, dim) -> None:
+        super().__init__()
+        self.dim = dim
+
+        # layers
+        self.norm = WanRMS_norm(dim)
+        self.to_qkv = WanDistConv2d(dim, dim * 3, 1)
+        self.proj = WanDistConv2d(dim, dim, 1)
 
     def forward(self, x):
         identity = x
@@ -593,6 +934,51 @@ class WanMidBlock(nn.Module):
         return x
 
 
+class WanDistMidBlock(nn.Module):
+    """
+    Middle block for WanVAE encoder and decoder.
+
+    Args:
+        dim (int): Number of input/output channels.
+        dropout (float): Dropout rate.
+        non_linearity (str): Type of non-linearity to use.
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        dropout: float = 0.0,
+        non_linearity: str = "silu",
+        num_layers: int = 1,
+    ):
+        super().__init__()
+        self.dim = dim
+
+        # Create the components
+        resnets = [WanDistResidualBlock(dim, dim, dropout, non_linearity)]
+        attentions = []
+        for _ in range(num_layers):
+            attentions.append(WanDistAttentionBlock(dim))
+            resnets.append(WanDistResidualBlock(dim, dim, dropout, non_linearity))
+        self.attentions = nn.ModuleList(attentions)
+        self.resnets = nn.ModuleList(resnets)
+
+        self.gradient_checkpointing = False
+
+    def forward(self, x):
+        # First residual block
+        x = self.resnets[0](x)
+
+        # Process through attention and residual blocks
+        for attn, resnet in zip(self.attentions, self.resnets[1:], strict=True):
+            if attn is not None:
+                x = attn(x)
+
+            x = resnet(x)
+
+        return x
+
+
 class WanResidualDownBlock(nn.Module):
 
     def __init__(
@@ -618,6 +1004,50 @@ class WanResidualDownBlock(nn.Module):
         resnets = []
         for _ in range(num_res_blocks):
             resnets.append(WanResidualBlock(in_dim, out_dim, dropout))
+            in_dim = out_dim
+        self.resnets = nn.ModuleList(resnets)
+
+        # Add the final downsample block
+        if down_flag:
+            mode = "downsample3d" if temperal_downsample else "downsample2d"
+            self.downsampler = WanResample(out_dim, mode=mode)
+        else:
+            self.downsampler = None
+
+    def forward(self, x):
+        x_copy = x.clone()
+        for resnet in self.resnets:
+            x = resnet(x)
+        if self.downsampler is not None:
+            x = self.downsampler(x)
+
+        return x + self.avg_shortcut(x_copy)
+
+class WanDistResidualDownBlock(nn.Module):
+
+    def __init__(
+        self,
+        in_dim,
+        out_dim,
+        dropout,
+        num_res_blocks,
+        temperal_downsample=False,
+        down_flag=False,
+    ):
+        super().__init__()
+
+        # Shortcut path with downsample
+        self.avg_shortcut = AvgDown3D(
+            in_dim,
+            out_dim,
+            factor_t=2 if temperal_downsample else 1,
+            factor_s=2 if down_flag else 1,
+        )
+
+        # Main path with residual blocks and downsample
+        resnets = []
+        for _ in range(num_res_blocks):
+            resnets.append(WanDistResidualBlock(in_dim, out_dim, dropout))
             in_dim = out_dim
         self.resnets = nn.ModuleList(resnets)
 
@@ -868,6 +1298,88 @@ class WanResidualUpBlock(nn.Module):
 
         return x
 
+class WanDistResidualUpBlock(nn.Module):
+    """
+    A block that handles upsampling for the WanVAE decoder.
+    Args:
+        in_dim (int): Input dimension
+        out_dim (int): Output dimension
+        num_res_blocks (int): Number of residual blocks
+        dropout (float): Dropout rate
+        temperal_upsample (bool): Whether to upsample on temporal dimension
+        up_flag (bool): Whether to upsample or not
+        non_linearity (str): Type of non-linearity to use
+    """
+
+    def __init__(
+        self,
+        in_dim: int,
+        out_dim: int,
+        num_res_blocks: int,
+        dropout: float = 0.0,
+        temperal_upsample: bool = False,
+        up_flag: bool = False,
+        non_linearity: str = "silu",
+    ):
+        super().__init__()
+        self.in_dim = in_dim
+        self.out_dim = out_dim
+
+        if up_flag:
+            self.avg_shortcut = DupUp3D(
+                in_dim,
+                out_dim,
+                factor_t=2 if temperal_upsample else 1,
+                factor_s=2,
+            )
+        else:
+            self.avg_shortcut = None
+
+        # create residual blocks
+        resnets = []
+        current_dim = in_dim
+        for _ in range(num_res_blocks + 1):
+            resnets.append(
+                WanDistResidualBlock(current_dim, out_dim, dropout, non_linearity)
+            )
+            current_dim = out_dim
+
+        self.resnets = nn.ModuleList(resnets)
+
+        # Add upsampling layer if needed
+        if up_flag:
+            upsample_mode = "upsample3d" if temperal_upsample else "upsample2d"
+            self.upsampler = WanResample(
+                out_dim, mode=upsample_mode, upsample_out_dim=out_dim
+            )
+        else:
+            self.upsampler = None
+
+        self.gradient_checkpointing = False
+
+    def forward(self, x):
+        """
+        Forward pass through the upsampling block.
+        Args:
+            x (torch.Tensor): Input tensor
+            feat_cache (list, optional): Feature cache for causal convolutions
+            feat_idx (list, optional): Feature index for cache management
+        Returns:
+            torch.Tensor: Output tensor
+        """
+        if self.avg_shortcut is not None:
+            x_copy = x.clone()
+
+        for resnet in self.resnets:
+            x = resnet(x)
+
+        if self.upsampler is not None:
+            x = self.upsampler(x)
+
+        if self.avg_shortcut is not None:
+            x = x + self.avg_shortcut(x_copy)
+
+        return x
 
 class WanUpBlock(nn.Module):
     """
@@ -902,6 +1414,71 @@ class WanUpBlock(nn.Module):
         for _ in range(num_res_blocks + 1):
             resnets.append(
                 WanResidualBlock(current_dim, out_dim, dropout, non_linearity)
+            )
+            current_dim = out_dim
+
+        self.resnets = nn.ModuleList(resnets)
+
+        # Add upsampling layer if needed
+        self.upsamplers = None
+        if upsample_mode is not None:
+            self.upsamplers = nn.ModuleList([WanResample(out_dim, mode=upsample_mode)])
+
+        self.gradient_checkpointing = False
+
+    def forward(self, x):
+        """
+        Forward pass through the upsampling block.
+
+        Args:
+            x (torch.Tensor): Input tensor
+            feat_cache (list, optional): Feature cache for causal convolutions
+            feat_idx (list, optional): Feature index for cache management
+
+        Returns:
+            torch.Tensor: Output tensor
+        """
+        for resnet in self.resnets:
+            x = resnet(x)
+
+        if self.upsamplers is not None:
+            x = self.upsamplers[0](x)
+        return x
+
+
+class WanDistUpBlock(nn.Module):
+    """
+    A block that handles upsampling for the WanVAE decoder.
+
+    Args:
+        in_dim (int): Input dimension
+        out_dim (int): Output dimension
+        num_res_blocks (int): Number of residual blocks
+        dropout (float): Dropout rate
+        upsample_mode (str, optional): Mode for upsampling ('upsample2d' or 'upsample3d')
+        non_linearity (str): Type of non-linearity to use
+    """
+
+    def __init__(
+        self,
+        in_dim: int,
+        out_dim: int,
+        num_res_blocks: int,
+        dropout: float = 0.0,
+        upsample_mode: str | None = None,
+        non_linearity: str = "silu",
+    ):
+        super().__init__()
+        self.in_dim = in_dim
+        self.out_dim = out_dim
+
+        # Create layers list
+        resnets = []
+        # Add residual blocks and attention if needed
+        current_dim = in_dim
+        for _ in range(num_res_blocks + 1):
+            resnets.append(
+                WanDistResidualBlock(current_dim, out_dim, dropout, non_linearity)
             )
             current_dim = out_dim
 
@@ -976,58 +1553,115 @@ class WanDecoder3d(nn.Module):
         # dimensions
         dims = [dim * u for u in [dim_mult[-1]] + dim_mult[::-1]]
 
-        # init block
-        self.conv_in = WanCausalConv3d(z_dim, dims[0], 3, padding=1)
+        world_size = get_sp_world_size()
 
-        # middle blocks
-        self.mid_block = WanMidBlock(dims[0], dropout, non_linearity, num_layers=1)
+        if world_size > 1:
+            # init block
+            self.conv_in = WanDistCausalConv3d(z_dim, dims[0], 3, padding=1)
 
-        # upsample blocks
-        self.up_blocks = nn.ModuleList([])
-        for i, (in_dim, out_dim) in enumerate(zip(dims[:-1], dims[1:], strict=True)):
-            # residual (+attention) blocks
-            if i > 0 and not is_residual:
-                # wan vae 2.1
-                in_dim = in_dim // 2
+            # middle blocks
+            self.mid_block = WanDistMidBlock(dims[0], dropout, non_linearity, num_layers=1)
 
-            # determine if we need upsampling
-            up_flag = i != len(dim_mult) - 1
-            # determine upsampling mode, if not upsampling, set to None
-            upsample_mode = None
-            if up_flag and temperal_upsample[i]:
-                upsample_mode = "upsample3d"
-            elif up_flag:
-                upsample_mode = "upsample2d"
+            # upsample blocks
+            self.up_blocks = nn.ModuleList([])
+            for i, (in_dim, out_dim) in enumerate(zip(dims[:-1], dims[1:], strict=True)):
+                # residual (+attention) blocks
+                if i > 0 and not is_residual:
+                    # wan vae 2.1
+                    in_dim = in_dim // 2
 
-            # Create and add the upsampling block
-            if is_residual:
-                up_block = WanResidualUpBlock(
-                    in_dim=in_dim,
-                    out_dim=out_dim,
-                    num_res_blocks=num_res_blocks,
-                    dropout=dropout,
-                    temperal_upsample=temperal_upsample[i] if up_flag else False,
-                    up_flag=up_flag,
-                    non_linearity=non_linearity,
-                )
-            else:
-                up_block = WanUpBlock(
-                    in_dim=in_dim,
-                    out_dim=out_dim,
-                    num_res_blocks=num_res_blocks,
-                    dropout=dropout,
-                    upsample_mode=upsample_mode,
-                    non_linearity=non_linearity,
-                )
-            self.up_blocks.append(up_block)
+                # determine if we need upsampling
+                up_flag = i != len(dim_mult) - 1
+                # determine upsampling mode, if not upsampling, set to None
+                upsample_mode = None
+                if up_flag and temperal_upsample[i]:
+                    upsample_mode = "upsample3d"
+                elif up_flag:
+                    upsample_mode = "upsample2d"
 
-        # output blocks
-        self.norm_out = WanRMS_norm(out_dim, images=False)
-        self.conv_out = WanCausalConv3d(out_dim, out_channels, 3, padding=1)
+                # Create and add the upsampling block
+                if is_residual:
+                    up_block = WanDistResidualUpBlock(
+                        in_dim=in_dim,
+                        out_dim=out_dim,
+                        num_res_blocks=num_res_blocks,
+                        dropout=dropout,
+                        temperal_upsample=temperal_upsample[i] if up_flag else False,
+                        up_flag=up_flag,
+                        non_linearity=non_linearity,
+                    )
+                else:
+                    up_block = WanDistUpBlock(
+                        in_dim=in_dim,
+                        out_dim=out_dim,
+                        num_res_blocks=num_res_blocks,
+                        dropout=dropout,
+                        upsample_mode=upsample_mode,
+                        non_linearity=non_linearity,
+                    )
+                self.up_blocks.append(up_block)
+
+            # output blocks
+            self.norm_out = WanRMS_norm(out_dim, images=False)
+            self.conv_out = WanDistCausalConv3d(out_dim, out_channels, 3, padding=1)
+        else:
+            # init block
+            self.conv_in = WanCausalConv3d(z_dim, dims[0], 3, padding=1)
+
+            # middle blocks
+            self.mid_block = WanMidBlock(dims[0], dropout, non_linearity, num_layers=1)
+
+            # upsample blocks
+            self.up_blocks = nn.ModuleList([])
+            for i, (in_dim, out_dim) in enumerate(zip(dims[:-1], dims[1:], strict=True)):
+                # residual (+attention) blocks
+                if i > 0 and not is_residual:
+                    # wan vae 2.1
+                    in_dim = in_dim // 2
+
+                # determine if we need upsampling
+                up_flag = i != len(dim_mult) - 1
+                # determine upsampling mode, if not upsampling, set to None
+                upsample_mode = None
+                if up_flag and temperal_upsample[i]:
+                    upsample_mode = "upsample3d"
+                elif up_flag:
+                    upsample_mode = "upsample2d"
+
+                # Create and add the upsampling block
+                if is_residual:
+                    up_block = WanDistResidualUpBlock(
+                        in_dim=in_dim,
+                        out_dim=out_dim,
+                        num_res_blocks=num_res_blocks,
+                        dropout=dropout,
+                        temperal_upsample=temperal_upsample[i] if up_flag else False,
+                        up_flag=up_flag,
+                        non_linearity=non_linearity,
+                    )
+                else:
+                    up_block = WanUpBlock(
+                        in_dim=in_dim,
+                        out_dim=out_dim,
+                        num_res_blocks=num_res_blocks,
+                        dropout=dropout,
+                        upsample_mode=upsample_mode,
+                        non_linearity=non_linearity,
+                    )
+                self.up_blocks.append(up_block)
+
+            # output blocks
+            self.norm_out = WanRMS_norm(out_dim, images=False)
+            self.conv_out = WanCausalConv3d(out_dim, out_channels, 3, padding=1)
 
         self.gradient_checkpointing = False
 
     def forward(self, x):
+        rank = get_sp_parallel_rank()
+        world_size = get_sp_world_size()
+
+        x = torch.chunk(x, world_size, dim=-2)[rank]
+
         ## conv1
         _feat_cache = feat_cache.get()
         _feat_idx = feat_idx.get()
@@ -1086,6 +1720,12 @@ class WanDecoder3d(nn.Module):
             feat_idx.set(_feat_idx)
         else:
             x = self.conv_out(x)
+
+        if world_size > 1:
+            tensor_list = [torch.empty_like(x) for _ in range(world_size)]
+            dist.all_gather(tensor_list, x)
+            torch.concat(tensor_list, dim=-2)
+
         return x
 
 
@@ -1188,7 +1828,7 @@ class AutoencoderKLWan(ParallelTiledVAE):
         def _count_conv3d(model) -> int:
             count = 0
             for m in model.modules():
-                if isinstance(m, WanCausalConv3d):
+                if isinstance(m, WanCausalConv3d) or isinstance(m, WanDistCausalConv3d):
                     count += 1
             return count
 
