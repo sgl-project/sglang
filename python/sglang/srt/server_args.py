@@ -3228,7 +3228,7 @@ class ServerArgs:
             "--enable-lora-prefetch",
             default=ServerArgs.enable_lora_prefetch,
             action="store_true",
-            help="Enable asynchronous LoRA weight loading to overlap H2D transfers with GPU compute."
+            help="Enable asynchronous LoRA weight loading to overlap H2D transfers with GPU compute.",
         )
         parser.add_argument(
             "--max-lora-rank",

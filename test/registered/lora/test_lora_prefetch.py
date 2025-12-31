@@ -18,6 +18,7 @@ End-to-end tests for the --enable-lora-prefetch server argument.
 import multiprocessing as mp
 import unittest
 
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.lora_utils import (
     CI_MULTI_LORA_MODELS,
     DEFAULT_PROMPTS,
@@ -28,6 +29,8 @@ from sglang.test.lora_utils import (
 )
 from sglang.test.runners import SRTRunner
 from sglang.test.test_utils import CustomTestCase, calculate_rouge_l
+
+register_cuda_ci(est_time=200, suite="stage-b-test-small-1-gpu")
 
 
 def run_mixed_batch_test(model_case: LoRAModelCase, torch_dtype, max_new_tokens=32):
