@@ -39,8 +39,18 @@ class ConfigArgumentMerger:
         if not config_file_path:
             return cli_args
 
-        config_args = self._parse_yaml_config(config_file_path)
-        return self._insert_config_args(cli_args, config_args, config_file_path)
+        config_data = self._parse_yaml_config(config_file_path)
+        config_args = self._convert_config_to_args(config_data)
+
+        # Merge config args into CLI args
+        config_index = cli_args.index("--config")
+
+        # Split arguments around config file
+        before_config = cli_args[:config_index]
+        after_config = cli_args[config_index + 2 :]  # Skip --config and file path
+
+        # Simple merge: config args + CLI args
+        return config_args + before_config + after_config
 
     def _extract_config_file_path(self, args: List[str]) -> str:
         """Extract the config file path from arguments."""
@@ -58,20 +68,7 @@ class ConfigArgumentMerger:
 
         return args[config_index + 1]
 
-    def _insert_config_args(
-        self, cli_args: List[str], config_args: List[str], config_file_path: str
-    ) -> List[str]:
-        """Insert configuration arguments into the CLI argument list."""
-        config_index = cli_args.index("--config")
-
-        # Split arguments around config file
-        before_config = cli_args[:config_index]
-        after_config = cli_args[config_index + 2 :]  # Skip --config and file path
-
-        # Simple merge: config args + CLI args
-        return config_args + before_config + after_config
-
-    def _parse_yaml_config(self, file_path: str) -> List[str]:
+    def _parse_yaml_config(self, file_path: str) -> Dict[str, Any]:
         """
         Parse YAML configuration file and convert to argument list.
 
@@ -100,7 +97,7 @@ class ConfigArgumentMerger:
         if not isinstance(config_data, dict):
             raise ValueError("Config file must contain a dictionary at root level")
 
-        return self._convert_config_to_args(config_data)
+        return config_data
 
     def _validate_yaml_file(self, file_path: str) -> None:
         """Validate that the file is a YAML file."""
@@ -130,8 +127,8 @@ class ConfigArgumentMerger:
         Add boolean argument to the list.
 
         Only store_true flags:
-            - value True → add flag
-            - value False → skip
+            - value True -> add flag
+            - value False -> skip
         Regular booleans:
             - always add --key true/false
         """
