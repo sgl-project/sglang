@@ -8,6 +8,7 @@ import logging
 import os
 import random
 import re
+import shlex
 import subprocess
 import sys
 import threading
@@ -632,7 +633,7 @@ def popen_launch_server(
     if api_key:
         command += ["--api-key", api_key]
 
-    print(f"command={' '.join(command)}")
+    print(f"command={shlex.join(command)}")
 
     if return_stdout_stderr:
         process = subprocess.Popen(
@@ -1766,11 +1767,13 @@ class ModelLaunchSettings:
         tp_size: int = 1,
         extra_args: Optional[List[str]] = None,
         env: Optional[dict] = None,
+        variant: Optional[str] = None,
     ):
         self.model_path = model_path
         self.tp_size = tp_size
         self.extra_args = list(extra_args) if extra_args else []
         self.env = env
+        self.variant = variant
 
         if self.tp_size > 1 and "--tp" not in self.extra_args:
             self.extra_args.extend(["--tp", str(self.tp_size)])
