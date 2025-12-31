@@ -18,7 +18,6 @@ suites = {
         TestFile("models/test_embedding_models.py", 73),
         TestFile("models/test_encoder_embedding_models.py", 221),
         TestFile("models/test_generation_models.py", 103),
-        TestFile("models/test_nvidia_nemotron_nano_v2.py", 132),
         TestFile("models/test_nvidia_nemotron_nano_v2_vl.py", 214),  # GSM8k + MMMU
         TestFile("models/test_qwen_models.py", 90),
         TestFile("models/test_reward_models.py", 103),
@@ -113,6 +112,7 @@ suites = {
         TestFile("layers/attention/mamba/test_mamba2_mixer.py", 50),
         TestFile("models/test_glm4_moe_models.py", 100),
         TestFile("models/test_kimi_linear_models.py", 90),
+        TestFile("models/test_nvidia_nemotron_nano_v2.py", 132),
         TestFile("rl/test_update_weights_from_distributed.py", 103),
         TestFile("test_data_parallelism.py", 73),
         TestFile("test_disaggregation_basic.py", 400),
