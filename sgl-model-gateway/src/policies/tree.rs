@@ -554,6 +554,7 @@ impl Tree {
                 } else {
                     // Partial match - still use this node for tenant selection
                     matched_chars += shared_count;
+                    remaining = advance_by_chars(remaining, shared_count);
                     prev = matched_node;
                     break;
                 }
@@ -1720,5 +1721,589 @@ mod tests {
 
         let tenant2_size = final_sizes.get("tenant2").unwrap();
         assert_eq!(tenant2_size, &(5 + 5 + 6 + 2)); // "apple" + "etite" + "banana" + "ll"
+    }
+
+    // ==================== Edge Case Tests ====================
+
+    #[test]
+    fn test_empty_string_input() {
+        let tree = Tree::new();
+
+        // Insert empty string
+        tree.insert("", "tenant1");
+
+        // Match empty string
+        let (matched, tenant) = tree.prefix_match("");
+        assert_eq!(matched, "");
+        assert_eq!(tenant, "tenant1");
+
+        // Insert non-empty, then match empty
+        tree.insert("hello", "tenant2");
+        let (matched, tenant) = tree.prefix_match("");
+        assert_eq!(matched, "");
+        assert_eq!(tenant, "tenant1");
+    }
+
+    #[test]
+    fn test_single_character_operations() {
+        let tree = Tree::new();
+
+        // Insert single characters
+        tree.insert("a", "tenant1");
+        tree.insert("b", "tenant2");
+        tree.insert("c", "tenant1");
+
+        let (matched, tenant) = tree.prefix_match("a");
+        assert_eq!(matched, "a");
+        assert_eq!(tenant, "tenant1");
+
+        let (matched, tenant) = tree.prefix_match("b");
+        assert_eq!(matched, "b");
+        assert_eq!(tenant, "tenant2");
+
+        // Match with longer string starting with single char
+        let (matched, tenant) = tree.prefix_match("abc");
+        assert_eq!(matched, "a");
+        assert_eq!(tenant, "tenant1");
+    }
+
+    #[test]
+    fn test_prefix_is_subset_of_existing() {
+        let tree = Tree::new();
+
+        // Insert longer string first
+        tree.insert("application", "tenant1");
+
+        // Now insert prefix of existing
+        tree.insert("app", "tenant2");
+
+        // Match the prefix - both tenants own "app" node
+        let (matched, tenant) = tree.prefix_match("app");
+        assert_eq!(matched, "app");
+        assert!(tenant == "tenant1" || tenant == "tenant2");
+
+        // Match longer string
+        let (matched, tenant) = tree.prefix_match("application");
+        assert_eq!(matched, "application");
+        assert_eq!(tenant, "tenant1");
+
+        // Match "apple" - matches "app" + "l" from the child node = "appl"
+        // Then 'e' doesn't match 'i' in the remaining suffix, so stops at 4 chars
+        let (matched, _tenant) = tree.prefix_match("apple");
+        assert_eq!(matched, "appl");
+    }
+
+    #[test]
+    fn test_existing_is_prefix_of_new() {
+        let tree = Tree::new();
+
+        // Insert shorter string first
+        tree.insert("app", "tenant1");
+
+        // Now insert longer string with same prefix
+        tree.insert("application", "tenant2");
+
+        let (matched, tenant) = tree.prefix_match("app");
+        assert_eq!(matched, "app");
+        assert!(tenant == "tenant1" || tenant == "tenant2");
+
+        let (matched, tenant) = tree.prefix_match("application");
+        assert_eq!(matched, "application");
+        assert_eq!(tenant, "tenant2");
+
+        // "applesauce" matches "app" + "l" from the child node = "appl"
+        // Then 'e' in "esauce" doesn't match 'i' in the suffix, so matching stops
+        let (matched, _tenant) = tree.prefix_match("applesauce");
+        assert_eq!(matched, "appl");
+    }
+
+    // ==================== prefix_match_with_counts Tests ====================
+
+    #[test]
+    fn test_prefix_match_with_counts_accuracy() {
+        let tree = Tree::new();
+
+        tree.insert("hello world", "tenant1");
+
+        // Exact match
+        let result = tree.prefix_match_with_counts("hello world");
+        assert_eq!(result.matched_char_count, 11);
+        assert_eq!(result.input_char_count, 11);
+        assert_eq!(&*result.tenant, "tenant1");
+
+        // Partial match
+        let result = tree.prefix_match_with_counts("hello");
+        assert_eq!(result.matched_char_count, 5);
+        assert_eq!(result.input_char_count, 5);
+
+        // Extended match
+        let result = tree.prefix_match_with_counts("hello world and more");
+        assert_eq!(result.matched_char_count, 11);
+        assert_eq!(result.input_char_count, 20);
+
+        // No match
+        let result = tree.prefix_match_with_counts("goodbye");
+        assert_eq!(result.matched_char_count, 0);
+        assert_eq!(result.input_char_count, 7);
+    }
+
+    #[test]
+    fn test_prefix_match_with_counts_utf8() {
+        let tree = Tree::new();
+
+        // UTF-8 string: 5 characters, more bytes
+        tree.insert("你好世界呀", "tenant1");
+
+        let result = tree.prefix_match_with_counts("你好世界呀");
+        assert_eq!(result.matched_char_count, 5);
+        assert_eq!(result.input_char_count, 5);
+
+        let result = tree.prefix_match_with_counts("你好");
+        assert_eq!(result.matched_char_count, 2);
+        assert_eq!(result.input_char_count, 2);
+
+        // Mixed ASCII and UTF-8
+        tree.insert("hello你好", "tenant2");
+        let result = tree.prefix_match_with_counts("hello你好世界");
+        assert_eq!(result.matched_char_count, 7); // "hello你好" = 7 chars
+        assert_eq!(result.input_char_count, 9); // "hello你好世界" = 9 chars
+    }
+
+    // ==================== Node Splitting Edge Cases ====================
+
+    #[test]
+    fn test_split_at_first_character() {
+        let tree = Tree::new();
+
+        // Insert "abc"
+        tree.insert("abc", "tenant1");
+
+        // Insert "aXX" - should split at first char
+        tree.insert("aXX", "tenant2");
+
+        let (matched, tenant) = tree.prefix_match("abc");
+        assert_eq!(matched, "abc");
+        assert_eq!(tenant, "tenant1");
+
+        let (matched, tenant) = tree.prefix_match("aXX");
+        assert_eq!(matched, "aXX");
+        assert_eq!(tenant, "tenant2");
+
+        let (matched, _) = tree.prefix_match("a");
+        assert_eq!(matched, "a");
+    }
+
+    #[test]
+    fn test_split_at_last_character() {
+        let tree = Tree::new();
+
+        // Insert "abcd"
+        tree.insert("abcd", "tenant1");
+
+        // Insert "abcX" - should split at last char of shared prefix
+        tree.insert("abcX", "tenant2");
+
+        let (matched, tenant) = tree.prefix_match("abcd");
+        assert_eq!(matched, "abcd");
+        assert_eq!(tenant, "tenant1");
+
+        let (matched, tenant) = tree.prefix_match("abcX");
+        assert_eq!(matched, "abcX");
+        assert_eq!(tenant, "tenant2");
+
+        let (matched, _) = tree.prefix_match("abc");
+        assert_eq!(matched, "abc");
+    }
+
+    #[test]
+    fn test_multiple_splits_same_path() {
+        let tree = Tree::new();
+
+        // Create a chain of splits
+        tree.insert("abcdefgh", "tenant1");
+        tree.insert("abcdef", "tenant2");
+        tree.insert("abcd", "tenant3");
+        tree.insert("ab", "tenant4");
+
+        // Verify all paths work
+        assert_eq!(tree.prefix_match("abcdefgh").0, "abcdefgh");
+        assert_eq!(tree.prefix_match("abcdef").0, "abcdef");
+        assert_eq!(tree.prefix_match("abcd").0, "abcd");
+        assert_eq!(tree.prefix_match("ab").0, "ab");
+        assert_eq!(tree.prefix_match("a").0, "a");
+    }
+
+    // ==================== High Contention Stress Tests ====================
+
+    #[test]
+    fn test_high_contention_same_prefix() {
+        let tree = Arc::new(Tree::new());
+        let num_threads = 16;
+        let ops_per_thread = 100;
+        let mut handles = vec![];
+
+        // All threads operate on strings with same prefix
+        for thread_id in 0..num_threads {
+            let tree = Arc::clone(&tree);
+            let handle = thread::spawn(move || {
+                let tenant = format!("tenant{}", thread_id);
+                for i in 0..ops_per_thread {
+                    let text = format!("shared_prefix_{}", i);
+                    tree.insert(&text, &tenant);
+
+                    // Immediately try to match
+                    let (matched, _) = tree.prefix_match(&text);
+                    assert!(
+                        matched.starts_with("shared_prefix_"),
+                        "Match should start with shared_prefix_"
+                    );
+                }
+            });
+            handles.push(handle);
+        }
+
+        for handle in handles {
+            handle.join().expect("Thread panicked");
+        }
+
+        // Verify tree is still consistent
+        let sizes = tree.get_used_size_per_tenant();
+        assert!(!sizes.is_empty(), "Tree should have entries");
+    }
+
+    #[test]
+    fn test_rapid_insert_remove_cycles() {
+        let tree = Arc::new(Tree::new());
+        let num_cycles = 50;
+
+        for cycle in 0..num_cycles {
+            let tenant = format!("tenant{}", cycle % 5);
+
+            // Insert several entries
+            for i in 0..10 {
+                let text = format!("cycle{}entry{}", cycle, i);
+                tree.insert(&text, &tenant);
+            }
+
+            // Remove the tenant
+            tree.remove_tenant(&tenant);
+
+            // Verify tenant is gone
+            let sizes = tree.get_used_size_per_tenant();
+            assert!(
+                !sizes.contains_key(&tenant),
+                "Tenant {} should be removed after cycle {}",
+                tenant,
+                cycle
+            );
+        }
+    }
+
+    // ==================== ASCII/UTF-8 Consistency Tests ====================
+
+    #[test]
+    fn test_ascii_utf8_consistency() {
+        let tree = Tree::new();
+
+        // Insert ASCII
+        tree.insert("hello", "tenant1");
+
+        // Insert UTF-8 with same logical prefix (none)
+        tree.insert("你好", "tenant2");
+
+        // Insert mixed
+        tree.insert("hello你好", "tenant3");
+
+        // All should be retrievable
+        assert_eq!(tree.prefix_match("hello").0, "hello");
+        assert_eq!(tree.prefix_match("你好").0, "你好");
+        assert_eq!(tree.prefix_match("hello你好").0, "hello你好");
+
+        // Counts should be correct
+        let result = tree.prefix_match_with_counts("hello");
+        assert_eq!(result.matched_char_count, 5);
+        assert_eq!(result.input_char_count, 5);
+
+        let result = tree.prefix_match_with_counts("你好");
+        assert_eq!(result.matched_char_count, 2);
+        assert_eq!(result.input_char_count, 2);
+
+        let result = tree.prefix_match_with_counts("hello你好");
+        assert_eq!(result.matched_char_count, 7);
+        assert_eq!(result.input_char_count, 7);
+    }
+
+    #[test]
+    fn test_emoji_handling() {
+        let tree = Tree::new();
+
+        // Emoji are multi-byte UTF-8
+        tree.insert("hello 👋", "tenant1");
+        tree.insert("hello 👋🌍", "tenant2");
+
+        let (matched, tenant) = tree.prefix_match("hello 👋");
+        assert_eq!(matched, "hello 👋");
+        assert_eq!(tenant, "tenant1");
+
+        let (matched, tenant) = tree.prefix_match("hello 👋🌍");
+        assert_eq!(matched, "hello 👋🌍");
+        assert_eq!(tenant, "tenant2");
+
+        // Verify char count (not byte count)
+        let result = tree.prefix_match_with_counts("hello 👋");
+        assert_eq!(result.matched_char_count, 7);
+        assert_eq!(result.input_char_count, 7); // h-e-l-l-o-space-emoji
+    }
+
+    // ==================== Eviction Edge Cases ====================
+
+    #[test]
+    fn test_eviction_empty_tree() {
+        let tree = Tree::new();
+
+        // Should not panic on empty tree
+        tree.evict_tenant_by_size(100);
+
+        let sizes = tree.get_used_size_per_tenant();
+        assert!(sizes.is_empty());
+    }
+
+    #[test]
+    fn test_eviction_zero_max_size() {
+        let tree = Tree::new();
+
+        tree.insert("hello", "tenant1");
+        tree.insert("world", "tenant1");
+
+        // Evict with max_size = 0 should remove everything
+        tree.evict_tenant_by_size(0);
+
+        let sizes = tree.get_used_size_per_tenant();
+        assert!(
+            sizes.is_empty() || sizes.values().all(|&v| v == 0),
+            "All tenants should be evicted or have zero size"
+        );
+    }
+
+    #[test]
+    fn test_eviction_single_tenant_all_entries() {
+        let tree = Tree::new();
+
+        // Insert many entries for single tenant
+        for i in 0..100 {
+            let text = format!("entry{:03}", i);
+            tree.insert(&text, "tenant1");
+        }
+
+        let initial_size = *tree.get_used_size_per_tenant().get("tenant1").unwrap();
+        assert!(initial_size > 50, "Should have significant size");
+
+        // Evict to small size
+        tree.evict_tenant_by_size(50);
+
+        let final_size = *tree.get_used_size_per_tenant().get("tenant1").unwrap_or(&0);
+        assert!(
+            final_size <= 50,
+            "Size {} should be <= 50 after eviction",
+            final_size
+        );
+    }
+
+    // ==================== Last Tenant Cache Tests ====================
+
+    #[test]
+    fn test_last_tenant_cache_update() {
+        let tree = Tree::new();
+
+        // Insert for tenant1
+        tree.insert("hello", "tenant1");
+
+        // First match should return tenant1
+        let (_, tenant) = tree.prefix_match("hello");
+        assert_eq!(tenant, "tenant1");
+
+        // Insert for tenant2 on same path
+        tree.insert("hello", "tenant2");
+
+        // Match again - should still work (cache or iteration)
+        let (matched, _) = tree.prefix_match("hello");
+        assert_eq!(matched, "hello");
+    }
+
+    #[test]
+    fn test_stale_cache_after_tenant_removal() {
+        let tree = Tree::new();
+
+        tree.insert("hello", "tenant1");
+        tree.insert("hello", "tenant2");
+
+        // Access to populate cache
+        let _ = tree.prefix_match("hello");
+
+        // Remove tenant1
+        tree.remove_tenant("tenant1");
+
+        // Should still work with tenant2
+        let (matched, tenant) = tree.prefix_match("hello");
+        assert_eq!(matched, "hello");
+        assert_eq!(tenant, "tenant2");
+    }
+
+    // ==================== Consistency Verification Tests ====================
+
+    #[test]
+    fn test_char_count_consistency_after_operations() {
+        let tree = Tree::new();
+
+        // Helper to verify consistency
+        let verify_consistency = |tree: &Tree| {
+            let maintained = get_maintained_counts(tree);
+            let computed = tree.get_used_size_per_tenant();
+            assert_eq!(
+                maintained, computed,
+                "Maintained counts should match computed counts"
+            );
+        };
+
+        // Insert phase
+        for i in 0..50 {
+            tree.insert(&format!("prefix{}", i), "tenant1");
+            tree.insert(&format!("other{}", i), "tenant2");
+        }
+        verify_consistency(&tree);
+
+        // Overlapping inserts
+        for i in 0..25 {
+            tree.insert(&format!("prefix{}", i), "tenant2");
+        }
+        verify_consistency(&tree);
+
+        // Eviction
+        tree.evict_tenant_by_size(100);
+        verify_consistency(&tree);
+
+        // Tenant removal
+        tree.remove_tenant("tenant1");
+        verify_consistency(&tree);
+    }
+
+    #[test]
+    fn test_tree_structure_integrity_after_stress() {
+        let tree = Arc::new(Tree::new());
+        let num_threads = 8;
+        let mut handles = vec![];
+
+        for thread_id in 0..num_threads {
+            let tree = Arc::clone(&tree);
+            let handle = thread::spawn(move || {
+                let mut rng = rand::rng();
+                let tenant = format!("tenant{}", thread_id);
+
+                for _ in 0..200 {
+                    let op: u8 = rng.random_range(0..10);
+                    let key = format!("key{}", rng.random_range(0..50));
+
+                    match op {
+                        0..=6 => {
+                            // Insert (70%)
+                            tree.insert(&key, &tenant);
+                        }
+                        7..=8 => {
+                            // Match (20%)
+                            let _ = tree.prefix_match(&key);
+                        }
+                        _ => {
+                            // Match with counts (10%)
+                            let _ = tree.prefix_match_with_counts(&key);
+                        }
+                    }
+                }
+            });
+            handles.push(handle);
+        }
+
+        for handle in handles {
+            handle.join().expect("Thread panicked during stress test");
+        }
+
+        // Verify tree is still functional
+        let sizes = tree.get_used_size_per_tenant();
+        for (tenant, size) in sizes.iter() {
+            assert!(*size > 0, "Tenant {} should have positive size", tenant);
+        }
+
+        // Verify char count consistency
+        let maintained = get_maintained_counts(&tree);
+        let computed = tree.get_used_size_per_tenant();
+        assert_eq!(
+            maintained, computed,
+            "Counts should be consistent after stress test"
+        );
+    }
+
+    // ==================== Boundary Condition Tests ====================
+
+    #[test]
+    fn test_very_long_strings() {
+        let tree = Tree::new();
+
+        // Create a very long string (10KB)
+        let long_string: String = (0..10000)
+            .map(|i| ((i % 26) as u8 + b'a') as char)
+            .collect();
+
+        tree.insert(&long_string, "tenant1");
+
+        let (matched, tenant) = tree.prefix_match(&long_string);
+        assert_eq!(matched.len(), long_string.len());
+        assert_eq!(tenant, "tenant1");
+
+        // Partial match of long string
+        let partial = &long_string[..5000];
+        let (matched, _) = tree.prefix_match(partial);
+        assert_eq!(matched, partial);
+    }
+
+    #[test]
+    fn test_many_tenants_same_path() {
+        let tree = Tree::new();
+
+        // 100 tenants all insert same string
+        for i in 0..100 {
+            tree.insert("shared_path", &format!("tenant{}", i));
+        }
+
+        // Match should return one of them
+        let (matched, _) = tree.prefix_match("shared_path");
+        assert_eq!(matched, "shared_path");
+
+        // Verify all tenants are tracked
+        let sizes = tree.get_used_size_per_tenant();
+        assert_eq!(sizes.len(), 100, "Should have 100 tenants");
+    }
+
+    #[test]
+    fn test_special_characters() {
+        let tree = Tree::new();
+
+        // Various special characters
+        let test_cases = vec![
+            ("hello\nworld", "tenant1"),      // newline
+            ("hello\tworld", "tenant2"),      // tab
+            ("hello\0world", "tenant3"),      // null byte
+            ("hello\u{A0}world", "tenant4"),  // non-breaking space
+            ("path/to/file", "tenant5"),      // slashes
+            ("query?param=value", "tenant6"), // URL-like
+        ];
+
+        for (text, tenant) in &test_cases {
+            tree.insert(text, tenant);
+        }
+
+        for (text, tenant) in &test_cases {
+            let (matched, matched_tenant) = tree.prefix_match(text);
+            assert_eq!(matched, *text, "Failed for: {:?}", text);
+            assert_eq!(matched_tenant, *tenant);
+        }
     }
 }
