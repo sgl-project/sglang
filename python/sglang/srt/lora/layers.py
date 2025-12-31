@@ -685,6 +685,7 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         # Apply gate_up_proj LoRA: hidden_states -> intermediate space
         # Store result in intermediate cache (no base_output means allocate new tensor)
         # Note: topk_weights are NOT applied here - they are applied on the final down_proj output
+        # TODO (Jonahcb): remove return values after done debugging
         _, _ = per_expert_lora_forward(
             hidden_states=hidden_states,
             lora_a_weights=self.gate_up_lora_a_weights,

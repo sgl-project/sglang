@@ -216,6 +216,7 @@ def _per_expert_lora_kernel(
     # Add to base_output in-place
     tl.atomic_add(out_ptrs, out_vals_typed, out_mask)
 
+     # TODO (Jonahcb): remove unnecessary store to lora_output tensor after done debugging
     # Also store to separate lora_output tensor (same dtype)
     tl.atomic_add(lora_out_ptrs, out_vals_typed, out_mask)
 
