@@ -54,7 +54,7 @@ import requests
 # Configuration
 REPO_OWNER = "sgl-project"
 REPO_NAME = "sglang"
-FILE_NAME = "CI_PERMISSIONS.json"
+FILE_NAME = os.path.join(os.path.dirname(__file__), "CI_PERMISSIONS.json")
 HEADERS = {}
 
 
