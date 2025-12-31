@@ -69,13 +69,17 @@ from sglang.srt.models.utils import (
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     add_prefix,
+    get_bool_env_var,
     is_cuda,
     is_flashinfer_available,
+    is_hip,
     is_non_idle_and_non_empty,
     is_npu,
 )
 
 _is_cuda = is_cuda()
+_is_hip = is_hip()
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 if _is_cuda:
     from sgl_kernel import fused_qk_norm_rope
@@ -611,7 +615,9 @@ class Qwen3MoeAttention(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ):
-        if hidden_states.shape[0] == 0:
+        if (isinstance(hidden_states, tuple) and hidden_states[0].shape[0] == 0) or (
+            isinstance(hidden_states, torch.Tensor) and hidden_states.shape[0] == 0
+        ):
             return hidden_states, forward_batch, None
         if not _is_npu:
             return self.forward_prepare_native(
@@ -758,18 +764,26 @@ class Qwen3MoeDecoderLayer(nn.Module):
         captured_last_layer_outputs: Optional[List[torch.Tensor]] = None,
         **kwargs,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-
+        if _use_aiter and self.self_attn.qkv_proj.weight.dtype == getattr(
+            torch, "float8_e4m3fnuz", None
+        ):
+            quant_format = "fp8_e4m3fnuz"
+        else:
+            quant_format = ""
         hidden_states, residual = (
             self.layer_communicator.prepare_attn_and_capture_last_layer_outputs(
                 hidden_states,
                 residual,
                 forward_batch,
                 captured_last_layer_outputs=captured_last_layer_outputs,
+                quant_format=quant_format,
                 **kwargs,
             )
         )
 
-        if hidden_states.shape[0] != 0:
+        if (isinstance(hidden_states, tuple) and hidden_states[0].shape[0] != 0) or (
+            isinstance(hidden_states, torch.Tensor) and hidden_states.shape[0] != 0
+        ):
             hidden_states = self.self_attn(
                 positions=positions,
                 hidden_states=hidden_states,
