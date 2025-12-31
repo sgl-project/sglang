@@ -790,7 +790,7 @@
         },
         "fastwan2_2_ti2v_5b": {
             "stages_ms": {
-                "InputValidationStage": 88.86,
+                "InputValidationStage": 300.00,
                 "TextEncodingStage": 2327.87,
                 "ConditioningStage": 0.01,
                 "TimestepPreparationStage": 58.66,
