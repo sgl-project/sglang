@@ -150,7 +150,7 @@ serial_test = "3.0"
 rsa = { version = "0.9", features = ["sha2"] }
 
 [[bench]]
-name = "l1_cache_benchmark.rs"
+name = "l1_cache_benchmark"
 harness = false
 [[bench]]
 name = "request_processing"
