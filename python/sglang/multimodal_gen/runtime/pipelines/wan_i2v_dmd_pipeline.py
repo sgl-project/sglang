@@ -105,6 +105,7 @@ class WanImageToVideoDmdPipeline(LoRAPipeline, ComposedPipelineBase):
             stage=DmdDenoisingStage(
                 transformer=self.get_module("transformer"),
                 scheduler=self.get_module("scheduler"),
+                transformer_2=self.get_module("transformer_2"),
             ),
         )
 

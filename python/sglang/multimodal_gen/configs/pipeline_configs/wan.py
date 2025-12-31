@@ -154,6 +154,10 @@ class TurboWanI2V720Config(WanI2V720PConfig):
     dmd_denoising_steps: list[int] | None = field(
         default_factory=lambda: [996, 932, 852, 608]
     )
+    boundary_ratio: float | None = 0.9
+
+    def __post_init__(self) -> None:
+        self.dit_config.boundary_ratio = self.boundary_ratio
 
 
 @dataclass
