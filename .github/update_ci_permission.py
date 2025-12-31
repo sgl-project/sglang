@@ -49,7 +49,10 @@ import os
 from collections import Counter
 from datetime import datetime, timedelta, timezone
 
-import requests
+try:
+    import requests
+except ImportError:
+    requests = None  # Only needed for non-sort-only runs
 
 # Configuration
 REPO_OWNER = "sgl-project"
@@ -60,6 +63,10 @@ HEADERS = {}
 
 def github_api_get(endpoint, params=None):
     """Helper to make paginated GitHub API requests."""
+    if requests is None:
+        raise RuntimeError(
+            "The requests package is required. Install it or use --sort-only."
+        )
     if not HEADERS:
         raise RuntimeError(
             "GitHub headers not initialized. Set GH_TOKEN or use --sort-only."
