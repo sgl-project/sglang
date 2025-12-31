@@ -20,6 +20,7 @@ import unittest
 
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.lora_utils import (
+    BACKENDS,
     CI_MULTI_LORA_MODELS,
     DEFAULT_PROMPTS,
     TEST_MULTIPLE_BATCH_PROMPTS,
@@ -30,15 +31,17 @@ from sglang.test.lora_utils import (
 from sglang.test.runners import SRTRunner
 from sglang.test.test_utils import CustomTestCase, calculate_rouge_l
 
-register_cuda_ci(est_time=200, suite="stage-b-test-small-1-gpu")
+register_cuda_ci(est_time=400, suite="stage-b-test-small-1-gpu")
 
 
-def run_mixed_batch_test(model_case: LoRAModelCase, torch_dtype, max_new_tokens=32):
+def run_mixed_batch_test(
+    model_case: LoRAModelCase, torch_dtype, backend, max_new_tokens=32
+):
     base_path = model_case.base
     adaptor_paths = [a.name for a in model_case.adaptors]
     print(
         f"\n========== Testing mixed batch prefetch on base '{base_path}' "
-        f"with dtype={torch_dtype} ==========\n"
+        f"with dtype={torch_dtype}, backend={backend} ==========\n"
     )
     ensure_reproducibility()
 
@@ -60,6 +63,7 @@ def run_mixed_batch_test(model_case: LoRAModelCase, torch_dtype, max_new_tokens=
         disable_radix_cache=True,
         mem_fraction_static=0.65,
         sleep_on_idle=True,
+        lora_backend=backend,
     )
 
     results_no_prefetch = []
@@ -95,13 +99,13 @@ def run_mixed_batch_test(model_case: LoRAModelCase, torch_dtype, max_new_tokens=
 
 
 def run_prefetch_vs_no_prefetch(
-    model_case: LoRAModelCase, torch_dtype, max_new_tokens=32
+    model_case: LoRAModelCase, torch_dtype, backend, max_new_tokens=32
 ):
     base_path = model_case.base
     adaptor_paths = [a.name for a in model_case.adaptors]
     print(
         f"\n========== Testing prefetch vs no-prefetch on base '{base_path}' "
-        f"with dtype={torch_dtype} ==========\n"
+        f"with dtype={torch_dtype}, backend={backend} ==========\n"
     )
     ensure_reproducibility()
     prompts = DEFAULT_PROMPTS[:2]
@@ -116,6 +120,7 @@ def run_prefetch_vs_no_prefetch(
         disable_cuda_graph=True,
         disable_radix_cache=True,
         mem_fraction_static=0.65,
+        lora_backend=backend,
     )
 
     with SRTRunner(base_path, enable_lora_prefetch=False, **common_args) as runner:
@@ -165,12 +170,14 @@ class TestLoRAPrefetch(CustomTestCase):
     def test_mixed_batch(self):
         for case in CI_MULTI_LORA_MODELS:
             for dtype in TORCH_DTYPES:
-                run_mixed_batch_test(case, dtype)
+                for backend in BACKENDS:
+                    run_mixed_batch_test(case, dtype, backend)
 
     def test_prefetch_vs_no_prefetch(self):
         for case in CI_MULTI_LORA_MODELS:
             for dtype in TORCH_DTYPES:
-                run_prefetch_vs_no_prefetch(case, dtype)
+                for backend in BACKENDS:
+                    run_prefetch_vs_no_prefetch(case, dtype, backend)
 
 
 if __name__ == "__main__":
