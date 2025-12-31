@@ -290,22 +290,18 @@ impl CacheAwarePolicy {
         request_text: &Option<&str>,
         healthy_indices: &[usize],
         model_id: &str,
-        // TODO may skip passing this arg (and compute inside function) if this is not bottleneck
         max_load: usize,
         min_load: usize,
     ) -> Option<usize> {
-        // Log load balancing trigger
-        // TODO may use `&str`
-        let worker_loads: Vec<(String, usize)> = workers
-            .iter()
-            .map(|w| (w.url().to_string(), w.load()))
-            .collect();
-
-        // TODO may change text
-        debug!(
-            "Load balancing triggered | max: {} | min: {} | workers: {:?}",
-            max_load, min_load, worker_loads
-        );
+        // Log load balancing trigger (only compute worker loads if debug enabled)
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            let worker_loads: Vec<(&str, usize)> =
+                workers.iter().map(|w| (w.url(), w.load())).collect();
+            debug!(
+                "Load balancing triggered | max: {} | min: {} | workers: {:?}",
+                max_load, min_load, worker_loads
+            );
+        }
 
         // Use shortest queue when imbalanced
         let min_load_idx = healthy_indices
@@ -403,51 +399,43 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
                 result.matched_char_count as f32 / result.input_char_count as f32
             };
 
-            let selected_url = if match_rate > self.config.cache_threshold {
-                result.tenant.to_string()
-            } else {
-                let min_load_idx = *healthy_indices
+            // Select worker without String allocation
+            let selected_idx = if match_rate > self.config.cache_threshold {
+                // Cache hit path: find worker by URL (compare &str directly, no allocation)
+                let tenant_url: &str = &result.tenant;
+                workers
                     .iter()
-                    .min_by_key(|&&idx| workers[idx].load())?;
-                workers[min_load_idx].url().to_string()
+                    .position(|w| w.url() == tenant_url)
+                    .filter(|&idx| workers[idx].is_healthy())
+            } else {
+                // Low cache match: use worker with minimum load
+                healthy_indices
+                    .iter()
+                    .min_by_key(|&&idx| workers[idx].load())
+                    .copied()
             };
 
-            // Find the index of the selected worker
-            if let Some(selected_idx) = workers.iter().position(|w| w.url() == selected_url) {
-                // Only proceed if the worker is healthy
-                if workers[selected_idx].is_healthy() {
-                    // Update the tree with this request
-                    tree.insert(text, &selected_url);
+            if let Some(idx) = selected_idx {
+                // Update the tree with this request (use worker URL directly, no allocation)
+                tree.insert(text, workers[idx].url());
 
-                    // Sync insert operation to mesh if enabled (no-op if mesh is not enabled)
-                    if let Some(ref mesh_sync) = self.mesh_sync {
-                        use crate::mesh::tree_ops::TreeInsertOp;
-                        let op = TreeOperation::Insert(TreeInsertOp {
-                            text: text.to_string(),
-                            tenant: selected_url.clone(),
-                        });
-                        let mesh_model_id = Self::normalize_mesh_model_id(model_id);
-                        if let Err(e) = mesh_sync.sync_tree_operation(mesh_model_id.to_string(), op)
-                        {
-                            warn!("Failed to sync tree insert operation to mesh: {}", e);
-                        }
-                    }
+                // Increment processed counter
+                workers[idx].increment_processed();
 
-                    // Increment processed counter
-                    workers[selected_idx].increment_processed();
+                return Some(idx);
+            }
 
-                    return Some(selected_idx);
-                }
-            } else {
-                // Selected worker no longer exists, remove it from tree
-                tree.remove_tenant(&selected_url);
-                debug!("Removed stale worker {} from cache tree", selected_url);
+            // Selected worker no longer exists or unhealthy, remove stale tenant from tree
+            if match_rate > self.config.cache_threshold {
+                let tenant_url: &str = &result.tenant;
+                tree.remove_tenant(tenant_url);
+                debug!("Removed stale worker {} from cache tree", tenant_url);
 
                 // Sync removal to mesh if enabled (no-op if mesh is not enabled)
                 if let Some(ref mesh_sync) = self.mesh_sync {
                     use crate::mesh::tree_ops::TreeRemoveOp;
                     let op = TreeOperation::Remove(TreeRemoveOp {
-                        tenant: selected_url.clone(),
+                        tenant: tenant_url.to_string(),
                     });
                     let mesh_model_id = Self::normalize_mesh_model_id(model_id);
                     if let Err(e) = mesh_sync.sync_tree_operation(mesh_model_id.to_string(), op) {

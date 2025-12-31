@@ -208,16 +208,37 @@ class RotaryEmbedding(MultiPlatformOp):
         )
 
     def get_cos_sin_with_position(self, positions):
-        cos_sin = self.cos_sin_cache.index_select(0, positions.flatten())
-        last_dim = cos_sin.size()[-1]
-        cos, sin = (
-            cos_sin.reshape(-1, 2, last_dim // 2).repeat(1, 1, 2).chunk(2, dim=-2)
-        )
-        # BSNH
-        self.position_cos, self.position_sin = (
-            cos.view(-1, 1, 1, last_dim).contiguous(),
-            sin.view(-1, 1, 1, last_dim).contiguous(),
-        )
+        assert positions.ndim == 1 or positions.ndim == 2
+        if positions.ndim == 1:
+            cos_sin = self.cos_sin_cache.index_select(0, positions.flatten())
+            last_dim = cos_sin.size()[-1]
+            cos, sin = (
+                cos_sin.reshape(-1, 2, last_dim // 2).repeat(1, 1, 2).chunk(2, dim=-2)
+            )
+            # BSNH
+            self.position_cos, self.position_sin = (
+                cos.view(-1, 1, 1, last_dim).contiguous(),
+                sin.view(-1, 1, 1, last_dim).contiguous(),
+            )
+        else:
+            assert self.mrope_section
+            cos_sin = self.cos_sin_cache[positions]
+            last_dim = cos_sin.size()[-1]
+            cos, sin = cos_sin.chunk(2, dim=-1)
+            if self.mrope_interleaved:
+                cos = apply_interleaved_rope(cos, self.mrope_section)
+                sin = apply_interleaved_rope(sin, self.mrope_section)
+            else:
+                cos = torch.cat(
+                    [m[i] for i, m in enumerate(cos.split(self.mrope_section, dim=-1))],
+                    dim=-1,
+                )
+                sin = torch.cat(
+                    [m[i] for i, m in enumerate(sin.split(self.mrope_section, dim=-1))],
+                    dim=-1,
+                )
+            self.position_cos = cos.repeat(1, 2).view(-1, 1, 1, last_dim).contiguous()
+            self.position_sin = sin.repeat(1, 2).view(-1, 1, 1, last_dim).contiguous()
 
     def get_cos_sin(self, seqlen: int) -> tuple[torch.Tensor, torch.Tensor]:
         cos_sin = self.cos_sin_cache[:seqlen]
