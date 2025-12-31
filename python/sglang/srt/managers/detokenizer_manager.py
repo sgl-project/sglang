@@ -116,7 +116,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         self.is_tool_call_parser_gpt_oss = server_args.tool_call_parser == "gpt-oss"
         self.disable_tokenizer_batch_decode = server_args.disable_tokenizer_batch_decode
 
-        self.watchdog = Watchdog.create(
+        self.soft_watchdog = Watchdog.create(
             debug_name="DetokenizerManager",
             watchdog_timeout=server_args.soft_watchdog_timeout,
             soft=True,
@@ -136,12 +136,12 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
     def event_loop(self):
         """The event loop that handles requests"""
         while True:
-            with self.watchdog.disable():
+            with self.soft_watchdog.disable():
                 recv_obj = self.recv_from_scheduler.recv_pyobj()
             output = self._request_dispatcher(recv_obj)
             if output is not None:
                 self.send_to_tokenizer.send_pyobj(output)
-            self.watchdog.feed()
+            self.soft_watchdog.feed()
 
     def trim_matched_stop(
         self, output: Union[str, List[int]], finished_reason: Dict, no_stop_trim: bool
@@ -345,11 +345,11 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             placeholder_tokens_val=None,
             retraction_counts=recv_obj.retraction_counts,
             token_steps=recv_obj.token_steps,
+            load=recv_obj.load,
             queue_time=recv_obj.queue_time,
             forward_entry_time=recv_obj.forward_entry_time,
             prefill_launch_delay=recv_obj.prefill_launch_delay,
             prefill_launch_latency=recv_obj.prefill_launch_latency,
-            load=recv_obj.load,
             prefill_finished_ts=recv_obj.prefill_finished_ts,
         )
 
@@ -386,12 +386,12 @@ def run_detokenizer_process(
 
     try:
         manager = detokenizer_manager_class(server_args, port_args)
-        if server_args.tokenizer_worker_num > 1:
-            manager.multi_http_worker_event_loop()
-        else:
+        if server_args.tokenizer_worker_num == 1:
             manager.event_loop()
+        else:
+            manager.multi_http_worker_event_loop()
     except Exception:
-        manager.maybe_clear_socket_mapping()
         traceback = get_exception_traceback()
         logger.error(f"DetokenizerManager hit an exception: {traceback}")
+        manager.maybe_clear_socket_mapping()
         parent_process.send_signal(signal.SIGQUIT)

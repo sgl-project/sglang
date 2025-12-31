@@ -16,7 +16,7 @@ import json
 import multiprocessing as mp
 import os
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, List, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -31,6 +31,7 @@ from transformers import (
 )
 
 from sglang.srt.entrypoints.engine import Engine
+from sglang.srt.model_loader.ci_weight_validation import ci_validate_and_clean_hf_cache
 from sglang.srt.utils import is_npu, load_image
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 from sglang.test.test_utils import DEFAULT_PORT_FOR_SRT_TEST_RUNNER, calculate_rouge_l
@@ -149,31 +150,11 @@ class HFRunner:
         trust_remote_code: bool = False,
         patch_model_do_sample_false: bool = False,
         matryoshka_dim: Optional[int] = None,
-        # Memory and device management (matching SRTRunner capabilities)
-        max_memory: Optional[Dict[str, str]] = None,
-        device_map: Optional[str] = None,
-        load_in_8bit: bool = False,
-        load_in_4bit: bool = False,
-        offload_folder: Optional[str] = None,
-        # Additional parameters for consistency with SRTRunner
-        mem_fraction_static: Optional[float] = None,
-        max_total_tokens: Optional[int] = None,
-        max_running_requests: Optional[int] = None,
-        quantization: Optional[str] = None,
     ):
         self.model_type = model_type
         self.output_str_only = output_str_only
         self.trust_remote_code = trust_remote_code
         self.patch_model_do_sample_false = patch_model_do_sample_false
-        self.max_memory = max_memory
-        self.device_map = device_map
-        self.load_in_8bit = load_in_8bit
-        self.load_in_4bit = load_in_4bit
-        self.offload_folder = offload_folder
-        self.mem_fraction_static = mem_fraction_static
-        self.max_total_tokens = max_total_tokens
-        self.max_running_requests = max_running_requests
-        self.quantization = quantization
 
         self.in_queue = mp.Queue()
         self.out_queue = mp.Queue()
@@ -186,12 +167,6 @@ class HFRunner:
                 model_path,
                 torch_dtype,
                 matryoshka_dim,
-                self.max_memory,
-                self.device_map,
-                self.load_in_8bit,
-                self.load_in_4bit,
-                self.offload_folder,
-                self.quantization,
             ),
         )
         self.model_proc.start()
@@ -273,40 +248,13 @@ class HFRunner:
         model_path,
         torch_dtype,
         matryoshka_dim: Optional[int] = None,
-        max_memory=None,
-        device_map=None,
-        load_in_8bit=False,
-        load_in_4bit=False,
-        offload_folder=None,
-        quantization=None,
     ):
         # Apply model-specific patches
         monkey_patch_gemma2_sdpa()
 
-        # Build common kwargs for from_pretrained calls
-        common_kwargs = {
-            "torch_dtype": torch_dtype,
-            "trust_remote_code": self.trust_remote_code,
-            "low_cpu_mem_usage": True,
-        }
-
-        # Add optional memory/device parameters
-        if max_memory is not None:
-            common_kwargs["max_memory"] = max_memory
-        if device_map is not None:
-            common_kwargs["device_map"] = device_map
-        if load_in_8bit:
-            common_kwargs["load_in_8bit"] = load_in_8bit
-        if load_in_4bit:
-            common_kwargs["load_in_4bit"] = load_in_4bit
-        if offload_folder is not None:
-            common_kwargs["offload_folder"] = offload_folder
-
-        # Handle quantization parameter (map to appropriate HF parameter)
-        if quantization == "8bit":
-            common_kwargs["load_in_8bit"] = True
-        elif quantization == "4bit":
-            common_kwargs["load_in_4bit"] = True
+        # Validate and clean corrupted files in HF cache (CI only)
+        # This is needed because HFRunner bypasses SGLang's weight validation
+        ci_validate_and_clean_hf_cache(model_path)
 
         # Load the model and tokenizer
         if self.model_type == "generation":
@@ -320,15 +268,17 @@ class HFRunner:
                 model_cls = getattr(transformers, model_arch)
             self.base_model = model_cls.from_pretrained(
                 model_path,
-                **common_kwargs
+                torch_dtype=torch_dtype,
+                trust_remote_code=self.trust_remote_code,
+                low_cpu_mem_usage=True,
             ).cuda()
         elif self.model_type == "embedding":
             if "gme-qwen2-vl" in model_path.lower():
-                embedding_kwargs = common_kwargs.copy()
-                embedding_kwargs["trust_remote_code"] = False  # Override for this specific model
                 self.model = AutoModelForVision2Seq.from_pretrained(
                     model_path,
-                    **embedding_kwargs
+                    torch_dtype=torch_dtype,
+                    trust_remote_code=False,
+                    low_cpu_mem_usage=True,
                 ).cuda()
                 self.processor = AutoProcessor.from_pretrained(model_path)
             elif "clip" in model_path.lower():
@@ -341,11 +291,10 @@ class HFRunner:
         elif self.model_type == "reward" or self.model_type == "cross_encoder":
             from transformers import AutoModelForSequenceClassification
 
-            reward_kwargs = common_kwargs.copy()
-            reward_kwargs["trust_remote_code"] = self.needs_trust_remote_code(model_path)
             self.model = AutoModelForSequenceClassification.from_pretrained(
                 model_path,
-                **reward_kwargs
+                torch_dtype=torch_dtype,
+                trust_remote_code=self.needs_trust_remote_code(model_path),
             ).cuda()
         else:
             raise Exception(f"Unrecognized model type {self.model_type}")
@@ -573,9 +522,6 @@ class SRTRunner:
         port: int = DEFAULT_PORT_FOR_SRT_TEST_RUNNER,
         lora_paths: Optional[Union[List[str], List[dict[str, str]]]] = None,
         max_loras_per_batch: int = 4,
-        quantization: Optional[str] = None,
-        max_lora_chunk_size: Optional[int] = None,
-        max_running_requests: Optional[int] = None,
         attention_backend: Optional[str] = None,
         prefill_attention_backend: Optional[str] = None,
         decode_attention_backend: Optional[str] = None,
@@ -646,9 +592,6 @@ class SRTRunner:
             is_embedding=not self.is_generation,
             lora_paths=lora_paths,
             max_loras_per_batch=max_loras_per_batch,
-            quantization=quantization,
-            max_lora_chunk_size=max_lora_chunk_size,
-            max_running_requests=max_running_requests,
             lora_backend=lora_backend,
             attention_backend=attention_backend,
             prefill_attention_backend=prefill_attention_backend,

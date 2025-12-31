@@ -18,7 +18,6 @@ from sglang.multimodal_gen.configs.pipeline_configs import (
     FastHunyuanConfig,
     FluxPipelineConfig,
     HunyuanConfig,
-    StepVideoT2VConfig,
     WanI2V480PConfig,
     WanI2V720PConfig,
     WanT2V480PConfig,
@@ -29,6 +28,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.flux import Flux2PipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
     QwenImageEditPipelineConfig,
+    QwenImageEditPlus_2511_PipelineConfig,
     QwenImageEditPlusPipelineConfig,
     QwenImageLayeredPipelineConfig,
     QwenImagePipelineConfig,
@@ -36,6 +36,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
 from sglang.multimodal_gen.configs.pipeline_configs.wan import (
     FastWan2_1_T2V_480P_Config,
     FastWan2_2_TI2V_5B_Config,
+    TurboWanT2V480PConfig,
     Wan2_2_I2V_A14B_Config,
     Wan2_2_T2V_A14B_Config,
     Wan2_2_TI2V_5B_Config,
@@ -50,7 +51,6 @@ from sglang.multimodal_gen.configs.sample.qwenimage import (
     QwenImageLayeredSamplingParams,
     QwenImageSamplingParams,
 )
-from sglang.multimodal_gen.configs.sample.stepvideo import StepVideoT2VSamplingParams
 from sglang.multimodal_gen.configs.sample.wan import (
     FastWanT2V480PConfig,
     Wan2_1_Fun_1_3B_InP_SamplingParams,
@@ -312,16 +312,6 @@ def _register_configs():
         ],
     )
 
-    # StepVideo
-    register_configs(
-        sampling_param_cls=StepVideoT2VSamplingParams,
-        pipeline_config_cls=StepVideoT2VConfig,
-        hf_model_paths=[
-            "FastVideo/stepvideo-t2v-diffusers",
-        ],
-        model_detectors=[lambda hf_id: "stepvideo" in hf_id.lower()],
-    )
-
     # Wan
     register_configs(
         sampling_param_cls=WanT2V_1_3B_SamplingParams,
@@ -332,10 +322,24 @@ def _register_configs():
         model_detectors=[lambda hf_id: "wanpipeline" in hf_id.lower()],
     )
     register_configs(
+        sampling_param_cls=WanT2V_1_3B_SamplingParams,
+        pipeline_config_cls=TurboWanT2V480PConfig,
+        hf_model_paths=[
+            "IPostYellow/TurboWan2.1-T2V-1.3B-Diffusers",
+        ],
+    )
+    register_configs(
         sampling_param_cls=WanT2V_14B_SamplingParams,
         pipeline_config_cls=WanT2V720PConfig,
         hf_model_paths=[
             "Wan-AI/Wan2.1-T2V-14B-Diffusers",
+        ],
+    )
+    register_configs(
+        sampling_param_cls=WanT2V_14B_SamplingParams,
+        pipeline_config_cls=TurboWanT2V480PConfig,
+        hf_model_paths=[
+            "IPostYellow/TurboWan2.1-T2V-14B-Diffusers",
         ],
     )
     register_configs(
@@ -425,7 +429,7 @@ def _register_configs():
     register_configs(
         sampling_param_cls=QwenImageSamplingParams,
         pipeline_config_cls=QwenImagePipelineConfig,
-        hf_model_paths=["Qwen/Qwen-Image"],
+        hf_model_paths=["Qwen/Qwen-Image", "Qwen/Qwen-Image-2512"],
     )
     register_configs(
         sampling_param_cls=QwenImageSamplingParams,
@@ -441,7 +445,7 @@ def _register_configs():
 
     register_configs(
         sampling_param_cls=QwenImageEditPlusSamplingParams,
-        pipeline_config_cls=QwenImageEditPlusPipelineConfig,
+        pipeline_config_cls=QwenImageEditPlus_2511_PipelineConfig,
         hf_model_paths=["Qwen/Qwen-Image-Edit-2511"],
     )
 

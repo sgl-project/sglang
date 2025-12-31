@@ -141,7 +141,7 @@ class ForwardMode(IntEnum):
         )
 
     def is_draft_extend_v2(self):
-        # For fixed shape logits output in v2 eagle worker
+        # For fixed shape logits output in eagle v2 worker
         return self == ForwardMode.DRAFT_EXTEND_V2
 
     def is_extend_or_draft_extend_or_mixed(self, include_draft_extend_v2: bool = False):
