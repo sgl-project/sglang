@@ -487,10 +487,10 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
         # compute cu_seqlens
         cu_seqlens = compute_cu_seqlens_from_grid_numpy(grid_thw)
         # cu_seqlens must be on cpu because of npu_flash_attention_unpad operator restriction
-        if is_npu():
-            cu_seqlens = cu_seqlens.to("cpu")
-        else:
+        if not is_npu():
             cu_seqlens = cu_seqlens.to(self.device, non_blocking=True)
+        else:
+            cu_seqlens = cu_seqlens.to("cpu")
         x = x.unsqueeze(1)
 
         deepstack_feature_lists = []
