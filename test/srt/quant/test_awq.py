@@ -74,5 +74,38 @@ class TestAWQMarlinBfloat16(CustomTestCase):
         self.assertGreater(metrics["score"], 0.85)
 
 
+class TestAWQMarlinFloat16(CustomTestCase):
+    """
+    Verify that the model can be loaded with float16 dtype and awq_marlin quantization
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.model = "QuantTrio/Qwen3-VL-30B-A3B-Instruct-AWQ"
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=["--dtype", "float16", "--quantization", "awq_marlin"],
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        kill_process_tree(cls.process.pid)
+
+    def test_mmlu(self):
+        args = SimpleNamespace(
+            base_url=self.base_url,
+            model=self.model,
+            eval_name="mmlu",
+            num_examples=64,
+            num_threads=32,
+        )
+
+        metrics = run_eval(args)
+        self.assertGreater(metrics["score"], 0.85)
+
+
 if __name__ == "__main__":
     unittest.main()

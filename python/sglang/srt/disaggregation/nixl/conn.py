@@ -322,12 +322,11 @@ class NixlKVManager(CommonKVManager):
             src_kv_ptrs, dst_kv_ptrs, layers_current_pp_stage = (
                 self.get_mla_kv_ptrs_with_pp(self.kv_args.kv_data_ptrs, dst_kv_ptrs)
             )
-            kv_item_len = self.kv_args.kv_item_lens[0]
             layers_params = [
                 (
                     src_kv_ptrs[layer_id],
                     dst_kv_ptrs[layer_id],
-                    kv_item_len,
+                    self.kv_args.kv_item_lens[layer_id],
                 )
                 for layer_id in range(layers_current_pp_stage)
             ]
@@ -336,19 +335,18 @@ class NixlKVManager(CommonKVManager):
                 self.get_mha_kv_ptrs_with_pp(self.kv_args.kv_data_ptrs, dst_kv_ptrs)
             )
 
-            kv_item_len = self.kv_args.kv_item_lens[0]
             layers_params = [
                 (
                     src_k_ptrs[layer_id],
                     dst_k_ptrs[layer_id],
-                    kv_item_len,
+                    self.kv_args.kv_item_lens[layer_id],
                 )
                 for layer_id in range(layers_current_pp_stage)
             ] + [
                 (
                     src_v_ptrs[layer_id],
                     dst_v_ptrs[layer_id],
-                    kv_item_len,
+                    self.kv_args.kv_item_lens[layer_id],
                 )
                 for layer_id in range(layers_current_pp_stage)
             ]
@@ -607,7 +605,7 @@ class NixlKVManager(CommonKVManager):
 
             handles.append(kv_xfer_handle)
             # Only the last chunk we need to send the aux data.
-            if is_last and self.pp_group.is_last_rank:
+            if is_last:
                 assert aux_index is not None
                 aux_xfer_handle = self.send_aux(
                     req.agent_name,

@@ -22,10 +22,52 @@ from sglang.multimodal_gen.runtime.layers.triton_ops import (
     fuse_scale_shift_kernel,
 )
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
+from sglang.multimodal_gen.runtime.models.dits.utils import (
+    delete_projection_layers,
+    fuse_linear_projections,
+)
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)  # pylint: disable=invalid-name
+
+
+def _get_projections(
+    attn: "QwenImageCrossAttention", hidden_states, encoder_hidden_states=None
+):
+    img_query, _ = attn.to_q(hidden_states)
+    img_key, _ = attn.to_k(hidden_states)
+    img_value, _ = attn.to_v(hidden_states)
+
+    txt_query = txt_key = txt_value = None
+    if encoder_hidden_states is not None and hasattr(attn, "add_q_proj"):
+        txt_query, _ = attn.add_q_proj(encoder_hidden_states)
+        txt_key, _ = attn.add_k_proj(encoder_hidden_states)
+        txt_value, _ = attn.add_v_proj(encoder_hidden_states)
+
+    return img_query, img_key, img_value, txt_query, txt_key, txt_value
+
+
+def _get_fused_projections(
+    attn: "QwenImageCrossAttention", hidden_states, encoder_hidden_states=None
+):
+    img_qkv, _ = attn.to_qkv(hidden_states)
+    img_query, img_key, img_value = img_qkv.chunk(3, dim=-1)
+
+    txt_query = txt_key = txt_value = None
+    if encoder_hidden_states is not None and hasattr(attn, "to_added_qkv"):
+        txt_qkv, _ = attn.to_added_qkv(encoder_hidden_states)
+        txt_query, txt_key, txt_value = txt_qkv.chunk(3, dim=-1)
+
+    return img_query, img_key, img_value, txt_query, txt_key, txt_value
+
+
+def _get_qkv_projections(
+    attn: "QwenImageCrossAttention", hidden_states, encoder_hidden_states=None
+):
+    if attn.fused_projections:
+        return _get_fused_projections(attn, hidden_states, encoder_hidden_states)
+    return _get_projections(attn, hidden_states, encoder_hidden_states)
 
 
 class QwenTimestepProjEmbeddings(nn.Module):
@@ -218,6 +260,7 @@ class QwenEmbedRope(nn.Module):
 
 
 class QwenImageCrossAttention(nn.Module):
+    _supports_qkv_fusion = True
 
     def __init__(
         self,
@@ -291,8 +334,34 @@ class QwenImageCrossAttention(nn.Module):
             supported_attention_backends={
                 AttentionBackendEnum.FA,
                 AttentionBackendEnum.TORCH_SDPA,
+                AttentionBackendEnum.SAGE_ATTN,
             },
         )
+
+        self.fused_projections = False
+        self.added_kv_proj_dim_val = added_kv_proj_dim
+
+    @torch.no_grad()
+    def fuse_projections(self):
+        if self.fused_projections:
+            return
+
+        self.to_qkv = fuse_linear_projections(
+            self.to_q, self.to_k, self.to_v, use_bias=False, linear_cls=ReplicatedLinear
+        )
+        delete_projection_layers(self, ["to_q", "to_k", "to_v"])
+
+        if self.added_kv_proj_dim_val is not None and hasattr(self, "add_q_proj"):
+            self.to_added_qkv = fuse_linear_projections(
+                self.add_q_proj,
+                self.add_k_proj,
+                self.add_v_proj,
+                use_bias=True,
+                linear_cls=ReplicatedLinear,
+            )
+            delete_projection_layers(self, ["add_q_proj", "add_k_proj", "add_v_proj"])
+
+        self.fused_projections = True
 
     def forward(
         self,
@@ -303,15 +372,9 @@ class QwenImageCrossAttention(nn.Module):
     ):
         seq_len_txt = encoder_hidden_states.shape[1]
 
-        # Compute QKV for image stream (sample projections)
-        img_query, _ = self.to_q(hidden_states)
-        img_key, _ = self.to_k(hidden_states)
-        img_value, _ = self.to_v(hidden_states)
-
-        # Compute QKV for text stream (context projections)
-        txt_query, _ = self.add_q_proj(encoder_hidden_states)
-        txt_key, _ = self.add_k_proj(encoder_hidden_states)
-        txt_value, _ = self.add_v_proj(encoder_hidden_states)
+        img_query, img_key, img_value, txt_query, txt_key, txt_value = (
+            _get_qkv_projections(self, hidden_states, encoder_hidden_states)
+        )
 
         # Reshape for multi-head attention
         img_query = img_query.unflatten(-1, (self.num_heads, -1))
@@ -561,6 +624,13 @@ class QwenImageTransformer2DModel(CachableDiT):
         self.proj_out = nn.Linear(
             self.inner_dim, patch_size * patch_size * self.out_channels, bias=True
         )
+
+    def fuse_qkv_projections(self):
+        for block in self.transformer_blocks:
+            if hasattr(block.attn, "fuse_projections") and getattr(
+                block.attn, "_supports_qkv_fusion", True
+            ):
+                block.attn.fuse_projections()
 
     def forward(
         self,

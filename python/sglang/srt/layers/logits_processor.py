@@ -392,6 +392,14 @@ class LogitsProcessor(nn.Module):
                 input_ids, hidden_states, lm_head, logits_metadata, multi_item_delimiter
             )
 
+        if logits_metadata.forward_mode.is_dllm_extend():
+            assert self.return_full_logits
+            full_logits = self._get_logits(hidden_states, lm_head, logits_metadata)
+            return LogitsProcessorOutput(
+                full_logits=full_logits,
+                next_token_logits=None,
+            )
+
         # Get the last hidden states and last logits for the next token prediction
         if (
             logits_metadata.forward_mode.is_decode_or_idle()
@@ -829,7 +837,10 @@ class LogitsProcessor(nn.Module):
             )
             dp_gather_replicate(hidden_states, local_hidden_states, logits_metadata)
 
-        if hasattr(lm_head, "weight"):
+        if hasattr(lm_head, "set_lora") and hasattr(lm_head, "apply_lora"):
+            # This is a LoRA-wrapped module, use its forward method
+            logits = lm_head(hidden_states)
+        elif hasattr(lm_head, "weight"):
             if self.use_fp32_lm_head:
                 logits = torch.matmul(
                     hidden_states.to(torch.float32), lm_head.weight.to(torch.float32).T
