@@ -513,7 +513,8 @@ class DataParallelController:
         if self.maybe_external_dp_rank_routing(req):
             return
 
-        self.workers[self.round_robin_counter].send_pyobj(req)
+        msg = [b"NORM", pickle.dumps(req)]
+        self.workers[self.round_robin_counter].send_multipart(msg, copy=False)
         self.round_robin_counter = (self.round_robin_counter + 1) % len(self.workers)
 
     def follow_bootstrap_room_scheduler(self, req: Req):
@@ -535,7 +536,8 @@ class DataParallelController:
             "prefill or decode instances; send to the router instead."
         )
         target_rank = req.bootstrap_room % len(self.workers)
-        self.workers[target_rank].send_pyobj(req)
+        msg = [b"NORM", pickle.dumps(req)]
+        self.workers[target_rank].send_multipart(msg, copy=False)
 
     def shortest_queue_scheduler(self, req):
         if self.maybe_external_dp_rank_routing(req):
