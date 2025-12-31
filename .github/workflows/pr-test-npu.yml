@@ -20,8 +20,8 @@ on:
         default: false
 
 concurrency:
-  group: pr-test-npu-${{ github.ref }}
-  cancel-in-progress: true
+  group: pr-test-npu-${{ inputs.ref || github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'workflow_call' }}
 
 jobs:
   # ==================== Check Changes ==================== #
