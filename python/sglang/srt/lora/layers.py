@@ -1,7 +1,6 @@
 from typing import Optional
 
 import torch
-import torch.nn.functional as F
 from torch import nn
 
 from sglang.srt.distributed import (
@@ -240,7 +239,9 @@ class ParallelLMHeadWithLoRA(BaseLayerWithLoRA):
         """Set LoRA buffers for LM head layer."""
         self.set_lora = True
         self.lm_head_A_buffer = lm_head_A_buffer  # (num_loras, rank, hidden_dim)
-        self.lm_head_B_buffer = lm_head_B_buffer  # (num_loras, vocab_size_per_partition, rank)
+        self.lm_head_B_buffer = (
+            lm_head_B_buffer  # (num_loras, vocab_size_per_partition, rank)
+        )
 
     def apply_lora(
         self, base_output: torch.Tensor, hidden_states: torch.Tensor

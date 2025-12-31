@@ -199,6 +199,7 @@ class LoRAMemoryPool:
                 DEFAULT_VOCAB_PADDING_SIZE,
                 pad_vocab_size,
             )
+
             # Pad vocab size to ensure divisibility by tp_size (same logic as VocabParallelEmbedding)
             padding_size = DEFAULT_VOCAB_PADDING_SIZE
             if pad_vocab_size(output_dim, padding_size) % self.tp_size != 0:
@@ -543,11 +544,17 @@ class LoRAMemoryPool:
                                 pad_vocab_size,
                                 vocab_range_from_global_vocab_size,
                             )
+
                             vocab_size = lora_b_weights.shape[0]
                             padding_size = DEFAULT_VOCAB_PADDING_SIZE
-                            if pad_vocab_size(vocab_size, padding_size) % self.tp_size != 0:
+                            if (
+                                pad_vocab_size(vocab_size, padding_size) % self.tp_size
+                                != 0
+                            ):
                                 padding_size *= self.tp_size
-                            org_vocab_size_padded = pad_vocab_size(vocab_size, padding_size)
+                            org_vocab_size_padded = pad_vocab_size(
+                                vocab_size, padding_size
+                            )
                             # Get shard range for this rank
                             start_idx, end_idx = vocab_range_from_global_vocab_size(
                                 org_vocab_size_padded, self.tp_rank, self.tp_size
