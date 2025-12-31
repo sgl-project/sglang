@@ -20,7 +20,11 @@ from sglang.srt.managers.io_struct import UpdateWeightsFromTensorReqInput
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
-from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardBatch
+from sglang.srt.model_executor.forward_batch_info import (
+    CaptureHiddenMode,
+    ForwardBatch,
+    ForwardMode,
+)
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseDraftWorker, BaseSpecWorker
 from sglang.srt.speculative.draft_utils import DraftBackendFactory
@@ -226,7 +230,8 @@ class EagleDraftWorker(BaseDraftWorker):
 
         if self.server_args.disable_cuda_graph:
             return
-
+        # todo
+        return
         Device2DraftCudaGraphRunner = {
             "npu": EAGLEDraftNpuGraphRunner,
             "cuda": EAGLEDraftCudaGraphRunner,
@@ -283,13 +288,13 @@ class EagleDraftWorker(BaseDraftWorker):
                 forward_batch,
             )
         else:
-            if (
-                not forward_batch.forward_mode.is_idle()
-                and self.speculative_num_steps > 1
-            ):
-                # Skip attention backend init for 1-step draft,
-                # `draft_forward` only does sample in this case.
-                self.draft_attn_backend.init_forward_metadata(forward_batch)
+            # if (
+            #     not forward_batch.forward_mode.is_idle()
+            #     and self.speculative_num_steps > 1
+            # ):
+            #     # Skip attention backend init for 1-step draft,
+            #     # `draft_forward` only does sample in this case.
+            #     self.draft_attn_backend.init_forward_metadata(forward_batch)
             parent_list, top_scores_index, draft_tokens = self.draft_forward(
                 forward_batch
             )
@@ -348,7 +353,7 @@ class EagleDraftWorker(BaseDraftWorker):
     def draft_forward(self, forward_batch: ForwardBatch):
         # Parse args
         spec_info: EagleDraftInput = forward_batch.spec_info
-        out_cache_loc = forward_batch.out_cache_loc
+        # out_cache_loc = forward_batch.out_cache_loc
         topk_p, topk_index, hidden_states = (
             spec_info.topk_p,
             spec_info.topk_index,
@@ -357,12 +362,12 @@ class EagleDraftWorker(BaseDraftWorker):
         if self.hot_token_id is not None:
             topk_index = self.hot_token_id[topk_index]
 
-        out_cache_loc = out_cache_loc.reshape(
-            forward_batch.batch_size, self.topk, self.speculative_num_steps
-        )
-        out_cache_loc = out_cache_loc.permute((2, 0, 1)).reshape(
-            self.speculative_num_steps, -1
-        )
+        # out_cache_loc = out_cache_loc.reshape(
+        #     forward_batch.batch_size, self.topk, self.speculative_num_steps
+        # )
+        # out_cache_loc = out_cache_loc.permute((2, 0, 1)).reshape(
+        #     self.speculative_num_steps, -1
+        # )
 
         # Return values
         score_list: List[torch.Tensor] = []
@@ -371,36 +376,29 @@ class EagleDraftWorker(BaseDraftWorker):
 
         # Forward multiple steps
         scores = None
-        for i in range(self.speculative_num_steps):
-            input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
-                i, topk_p, topk_index, hidden_states, scores, self.topk
-            )
+        input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
+            0, topk_p, topk_index, hidden_states, scores, self.topk
+        )
+        if self.speculative_num_steps == 1:
             score_list.append(tree_info[0])
             token_list.append(tree_info[1])
             parents_list.append(tree_info[2])
-
-            # We don't need to run the last forward. we get 1 token from draft prefill and (#spec steps - 1) tokens here
-            if i == self.speculative_num_steps - 1:
-                break
-
-            # Set inputs
-            forward_batch.input_ids = input_ids
-            forward_batch.out_cache_loc = out_cache_loc[i]
-            forward_batch.positions.add_(1)
-            forward_batch.attn_backend = self.draft_attn_backend.attn_backends[i]
-            spec_info.hidden_states = hidden_states
-
-            # Run forward
-            logits_output = self.draft_runner.forward(
-                forward_batch, skip_attn_backend_init=True
-            ).logits_output
-            if self.server_args.enable_nan_detection:
-                detect_nan(logits_output)
-            probs = torch.softmax(logits_output.next_token_logits, dim=-1)
-            topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
-            if self.hot_token_id is not None:
-                topk_index = self.hot_token_id[topk_index]
-            hidden_states = logits_output.hidden_states
+        else:
+            for i in range(self.speculative_num_steps):
+                score_list.append(tree_info[0][:, :, i].unsqueeze(-1))
+                token_index = tree_info[1][:, i].unsqueeze(-1)
+                token_list.append(token_index)
+                if i == 0:
+                    parents_list.append(tree_info[2])
+                else:
+                    parents_list.append(
+                        torch.full(
+                            (tree_info[2].size(0), 1),
+                            i,
+                            dtype=torch.long,
+                            device="cuda",
+                        )
+                    )
 
         # Organize the results
         score_list = torch.cat(score_list, dim=1).flatten(
@@ -469,10 +467,30 @@ class EagleDraftWorker(BaseDraftWorker):
 
         # Update spec_info for the next draft step
         probs = torch.softmax(logits_output.next_token_logits, dim=-1)
-        next_draft_input.topk_p, next_draft_input.topk_index = fast_topk(
-            probs, self.topk, dim=-1
-        )
-        next_draft_input.hidden_states = logits_output.hidden_states
+        topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
+        # next_draft_input.hidden_states = logits_output.hidden_states
+        if self.speculative_num_steps > 1:
+            topk_p = torch.cat(
+                [
+                    topk_p,
+                    topk_p.new_zeros(
+                        *topk_p.shape[:1],
+                        self.speculative_num_steps * self.topk - topk_p.shape[1],
+                    ),
+                ],
+                dim=1,
+            )
+            topk_index = torch.cat(
+                [
+                    topk_index,
+                    topk_index.new_zeros(
+                        *topk_index.shape[:1],
+                        self.speculative_num_steps * self.topk - topk_index.shape[1],
+                    ),
+                ],
+                dim=1,
+            )
+        next_draft_input.topk_p, next_draft_input.topk_index = topk_p, topk_index
         return next_draft_input
 
     def _draft_extend_for_decode(
@@ -505,32 +523,105 @@ class EagleDraftWorker(BaseDraftWorker):
             torch.get_device_module(self.device).current_stream().wait_stream(
                 self.plan_stream
             )
+        ret_topk_p_list = []
+        ret_topk_index_list = []
 
-        # Run draft extend batch in the main compute stream
-        can_cuda_graph = (
-            self.cuda_graph_runner_for_draft_extend
-            and self.cuda_graph_runner_for_draft_extend.can_run(forward_batch)
+        draft_logits_output, _ = self.draft_runner.forward(
+            forward_batch, skip_attn_backend_init=True
         )
-        if can_cuda_graph:
-            draft_logits_output = self.cuda_graph_runner_for_draft_extend.replay(
-                forward_batch
-            )
-        else:
-            draft_logits_output = self.draft_runner.forward(
-                forward_batch, skip_attn_backend_init=True
-            ).logits_output
-
         # Reorganize the spec info for the next batch
-        draft_logits_output.next_token_logits = draft_logits_output.next_token_logits[
-            select_index
-        ]
         draft_logits_output.hidden_states = draft_logits_output.hidden_states[
             select_index
         ]
-        probs = torch.softmax(draft_logits_output.next_token_logits, dim=-1)
+        probs = torch.softmax(
+            draft_logits_output.next_token_logits[select_index], dim=-1
+        )
         ret_topk_p, ret_topk_index = fast_topk(probs, self.topk, dim=-1)
-        ret_hidden_states = draft_logits_output.hidden_states
+        ret_topk_p_list.append(ret_topk_p)
+        ret_topk_index_list.append(ret_topk_index)
+        seq_lens_bk = batch.seq_lens
+        for step in range(self.speculative_num_steps):
+            # log_info_on_rank0(logger, f"step: {step}, forward_batch.input_ids: {forward_batch.input_ids}")
+            # if can_cuda_graph:
+            #     draft_logits_output = (
+            #         self.cuda_graph_runner_for_draft_extend.get_runner(step).replay(
+            #             forward_batch, init_state=(step == 0)
+            #         )
+            #     )
+            #     ret_topk_p, ret_topk_index = (
+            #         draft_logits_output.topk_p,
+            #         draft_logits_output.topk_index,
+            #     )
+            # else:
+            # todo draft_extend + decode
+            if step == self.speculative_num_steps - 1:
+                break
+            if step == 0:
+                scores = None
+                batch.forward_mode = (
+                    ForwardMode.IDLE
+                    if batch.forward_mode.is_idle()
+                    else ForwardMode.DECODE
+                )
+                batch.input_ids = ret_topk_index
+                # batch.seq_lens = batch_result.next_draft_input.new_seq_lens
+                # batch.seq_lens_cpu = batch.seq_lens.cpu()
+                with self.plan_stream_ctx:
+                    forward_batch, can_cuda_graph = draft_input.prepare_for_v2_draft(
+                        self.req_to_token_pool,
+                        batch,
+                        None,
+                        self.draft_runner,
+                        self.topk,
+                        self.speculative_num_steps,
+                    )
+                    if not batch.forward_mode.is_idle():
+                        self.draft_attn_backend.init_forward_metadata(forward_batch)
+                if self.plan_stream:
+                    torch.get_device_module(self.device).current_stream().wait_stream(
+                        self.plan_stream
+                    )
+                spec_info = forward_batch.spec_info
+                out_cache_loc = forward_batch.out_cache_loc
+                out_cache_loc = out_cache_loc.reshape(
+                    forward_batch.batch_size, self.topk, self.speculative_num_steps
+                )
+                out_cache_loc = out_cache_loc.permute((2, 0, 1)).reshape(
+                    self.speculative_num_steps, -1
+                )
+                # if not forward_batch.forward_mode.is_idle():
+                #     print(f"xxxxxx draft xxx {out_cache_loc=}")
 
+            input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
+                step,
+                ret_topk_p,
+                ret_topk_index,
+                draft_logits_output.hidden_states,
+                scores,
+                self.topk,
+            )
+            forward_batch.input_ids = input_ids
+            forward_batch.out_cache_loc = out_cache_loc[step]
+            forward_batch.positions.add_(1)
+            forward_batch.attn_backend = self.draft_attn_backend.attn_backends[step]
+            spec_info.hidden_states = hidden_states
+            # print(f"{input_ids.shape=} {forward_batch.out_cache_loc.shape=} {forward_batch.seq_lens_cpu=} {forward_batch.seq_lens=}")
+
+            # if not forward_batch.forward_mode.is_idle():
+            #     print(
+            #         f"xxxxxxxxx {step=} {forward_batch.input_ids=} {hidden_states.float().sum()=} {forward_batch.out_cache_loc=}"
+            #     )
+            # print(f"======xxx {forward_batch.forward_mode=}")
+            draft_logits_output, _ = self.draft_runner.forward(
+                forward_batch, skip_attn_backend_init=True
+            )
+            probs = torch.softmax(draft_logits_output.next_token_logits, dim=-1)
+            ret_topk_p, ret_topk_index = fast_topk(probs, self.topk, dim=-1)
+            # if not forward_batch.forward_mode.is_idle():
+            #     print(f"xxxxxxxxx {step=} {ret_topk_index=}")
+            ret_topk_p_list.append(ret_topk_p)
+            ret_topk_index_list.append(ret_topk_index)
+        batch.seq_lens = seq_lens_bk
         # Construct the return values
         next_draft_input = batch_result.next_draft_input
         (
@@ -538,9 +629,9 @@ class EagleDraftWorker(BaseDraftWorker):
             next_draft_input.topk_index,
             next_draft_input.hidden_states,
         ) = (
-            ret_topk_p,
-            ret_topk_index,
-            ret_hidden_states,
+            torch.cat(ret_topk_p_list, dim=1).clone(),
+            torch.cat(ret_topk_index_list, dim=1).clone(),
+            None,
         )
 
 
@@ -629,7 +720,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     device=self.device,
                     hidden_size=self.target_worker.model_config.hidden_size,
                     dtype=self.target_worker.model_config.dtype,
-                    topk=self.topk,
+                    topk=self.topk * self.speculative_num_steps,
                     capture_hidden_mode=CaptureHiddenMode.LAST,
                 )
             with speculative_moe_backend_context(), speculative_moe_a2a_backend_context():

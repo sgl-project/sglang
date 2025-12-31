@@ -469,14 +469,18 @@ class ForwardBatch:
 
             ret.original_global_num_tokens_cpu = batch.global_num_tokens
             ret.global_num_tokens_cpu = global_num_tokens
-            ret.global_num_tokens_gpu = torch.tensor(
-                global_num_tokens, dtype=torch.int64
-            ).to(device, non_blocking=True)
+            ret.global_num_tokens_gpu = (
+                torch.tensor(global_num_tokens, dtype=torch.int64)
+                .pin_memory()
+                .to(device, non_blocking=True)
+            )
 
             ret.global_num_tokens_for_logprob_cpu = global_num_tokens_for_logprob
-            ret.global_num_tokens_for_logprob_gpu = torch.tensor(
-                global_num_tokens_for_logprob, dtype=torch.int64
-            ).to(device, non_blocking=True)
+            ret.global_num_tokens_for_logprob_gpu = (
+                torch.tensor(global_num_tokens_for_logprob, dtype=torch.int64)
+                .pin_memory()
+                .to(device, non_blocking=True)
+            )
 
         if ret.forward_mode.is_idle():
             ret.positions = torch.empty((0,), dtype=torch.int64, device=device)
@@ -485,14 +489,18 @@ class ForwardBatch:
         # Override the positions with diffusion LLM or spec_info
         if batch.dllm_config is not None:
             block_size = batch.dllm_config.block_size
-            ret.positions = torch.tensor(
-                [
-                    i
-                    for block_offset in batch.dllm_block_offsets
-                    for i in range(block_offset, block_offset + block_size)
-                ],
-                dtype=torch.int32,
-            ).to(device, non_blocking=True)
+            ret.positions = (
+                torch.tensor(
+                    [
+                        i
+                        for block_offset in batch.dllm_block_offsets
+                        for i in range(block_offset, block_offset + block_size)
+                    ],
+                    dtype=torch.int32,
+                )
+                .pin_memory()
+                .to(device, non_blocking=True)
+            )
         elif (
             ret.spec_info is not None
             and getattr(ret.spec_info, "positions", None) is not None
@@ -506,12 +514,16 @@ class ForwardBatch:
         else:
             assert isinstance(batch.extend_seq_lens, list)
             assert isinstance(batch.extend_prefix_lens, list)
-            ret.extend_seq_lens = torch.tensor(
-                batch.extend_seq_lens, dtype=torch.int32
-            ).to(device, non_blocking=True)
-            ret.extend_prefix_lens = torch.tensor(
-                batch.extend_prefix_lens, dtype=torch.int32
-            ).to(device, non_blocking=True)
+            ret.extend_seq_lens = (
+                torch.tensor(batch.extend_seq_lens, dtype=torch.int32)
+                .pin_memory()
+                .to(device, non_blocking=True)
+            )
+            ret.extend_prefix_lens = (
+                torch.tensor(batch.extend_prefix_lens, dtype=torch.int32)
+                .pin_memory()
+                .to(device, non_blocking=True)
+            )
             ret.extend_num_tokens = batch.extend_num_tokens
             positions, ret.extend_start_loc = compute_position(
                 model_runner.server_args.attention_backend,
