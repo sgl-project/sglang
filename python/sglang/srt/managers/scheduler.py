@@ -2414,7 +2414,7 @@ class Scheduler(
             tp_group = self.tp_cpu_group
 
         if tp_size > 1:
-            # Rank 0 is broadcasts its ready/timeout counts to all ranks
+            # Rank 0 broadcasts its ready/timeout counts to all ranks
             tensor = torch.tensor([num_ready_reqs, num_timeout_reqs], dtype=torch.int32)
 
             # Broadcast from local rank 0 within the TP group, using group_src (local rank)
