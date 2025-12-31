@@ -100,6 +100,17 @@ fn first_char_fast(s: &str) -> char {
     }
 }
 
+/// Count characters in a string with ASCII fast path.
+/// For ASCII text (most LLM prompts), byte length equals char count.
+#[inline(always)]
+fn char_count_fast(s: &str) -> usize {
+    if s.is_ascii() {
+        s.len()
+    } else {
+        s.chars().count()
+    }
+}
+
 /// Advance a string slice by N characters, returning the remaining slice.
 /// Returns empty string if n >= char count.
 /// Optimized: uses direct byte slicing for ASCII, falls back to char_indices for UTF-8.
@@ -159,7 +170,7 @@ struct NodeText {
 impl NodeText {
     #[inline]
     fn new(text: String) -> Self {
-        let char_count = text.chars().count();
+        let char_count = char_count_fast(&text);
         Self { text, char_count }
     }
 
@@ -432,7 +443,8 @@ impl Tree {
             let step = match prev.children.entry(first_char) {
                 Entry::Vacant(entry) => {
                     // No match - create new node with remaining text (this is the leaf)
-                    let remaining_char_count = remaining.chars().count();
+                    // Compute remaining char count with ASCII fast path
+                    let remaining_char_count = char_count_fast(remaining);
                     let epoch = get_epoch();
 
                     let new_node = Arc::new(Node {
@@ -637,8 +649,8 @@ impl Tree {
                 .insert(Arc::clone(&tenant), epoch);
         }
 
-        // Compute input char count from matched + remaining
-        let input_char_count = matched_chars + remaining.chars().count();
+        // Compute input char count from matched + remaining (with ASCII fast path)
+        let input_char_count = matched_chars + char_count_fast(remaining);
 
         PrefixMatchResult {
             tenant,
