@@ -1,15 +1,19 @@
 use std::sync::Arc;
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
-use sgl_model_gateway::tokenizer::{cache::l1::L1Cache, mock::MockTokenizer};
+use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
+use sgl_model_gateway::tokenizer::cache::L1Cache; // Corrected path
+use sgl_model_gateway::tokenizer::mock::MockTokenizer;
 
 /// Generates a realistic ChatML prompt with N turns to test boundary scaling
 fn generate_prompt(turns: usize) -> String {
     let mut prompt = String::new();
-    prompt.push_str("<|im_start|>system\nYou are a helpful AI thought partner.<|im_end|>");
+    prompt.push_str("<|im_start|>system\nYou are a helpful AI assistant.<|im_end|>");
     for i in 0..turns {
-        prompt.push_str(&format!("<|im_start|>user\nIteration {} prompt text that is somewhat long to test hashing performance.<|im_end|>", i));
-        prompt.push_str("<|im_start|>assistant\nCertainly! Here is a detailed response to your query.<|im_end|>");
+        prompt.push_str(&format!(
+            "<|im_start|>user\nIteration {} prompt text to test hashing and tokenization performance.<|im_end|>",
+            i
+        ));
+        prompt.push_str("<|im_start|>assistant\nI am processing your request and generating a valid response.<|im_end|>");
     }
     prompt
 }
@@ -18,17 +22,22 @@ fn bench_l1_cache(c: &mut Criterion) {
     let special_tokens = vec!["<|im_start|>", "<|im_end|>"];
     let tokenizer = MockTokenizer::new();
 
-    // Test with varying turn counts (number of boundaries)
-    // Current code is O(B*L), optimization makes it O(L)
-    for turns in [1, 5, 20, 50].iter() {
+    // We test with exponentially increasing turns to see the O(N^2) impact vs O(N)
+    for turns in [2, 10, 50].iter() {
         let input = generate_prompt(*turns);
-        let mut group = c.benchmark_group(format!("L1Cache-Turns-{}", turns));
+        let mut group = c.benchmark_group(format!("L1-Cache-Turns-{}", turns));
+
+        // Measure throughput in terms of characters processed per second
+        group.throughput(Throughput::Elements(input.len() as u64));
 
         // --- 1. Insertion Benchmark ---
-        // This is where "Incremental Hashing & Tokenization" helps most
+        // Current code re-hashes and re-tokenizes the prefix at every boundary.
+        // Optimization targets this method specifically.
         group.bench_function("insert_at_boundaries", |b| {
             b.iter(|| {
-                let cache = L1Cache::new(100 * 1024 * 1024); // 100MB
+                // We create a new cache per iteration to ensure we are benchmarking
+                // the full insertion logic and not a "no-op" on existing entries.
+                let cache = L1Cache::new(100 * 1024 * 1024);
                 let _ = cache.insert_at_boundaries(
                     black_box(&input),
                     black_box(&tokenizer),
@@ -39,7 +48,7 @@ fn bench_l1_cache(c: &mut Criterion) {
         });
 
         // --- 2. Lookup Benchmark ---
-        // Measures search efficiency across many boundaries
+        // This measures the efficiency of the backward search.
         group.bench_function("longest_prefix_match", |b| {
             let cache = L1Cache::new(100 * 1024 * 1024);
             let _ = cache.insert_at_boundaries(&input, &tokenizer, &special_tokens, false);
