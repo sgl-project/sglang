@@ -1,6 +1,6 @@
 from json import JSONDecodeError, JSONDecoder
 from json.decoder import WHITESPACE
-from typing import Any, List, Literal, Optional, Tuple, Union
+from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 
 import orjson
 import partial_json_parser
@@ -99,6 +99,109 @@ def _get_tool_schema(tool: Tool) -> dict:
         },
         "required": ["name", "parameters"],
     }
+
+
+def infer_type_from_json_schema(schema: Dict[str, Any]) -> Optional[str]:
+    """
+    从 JSON Schema 推断参数的主要类型。
+
+    支持复杂的 JSON Schema 结构，包括：
+    - 直接的 type 字段（包括类型数组）
+    - anyOf/oneOf：参数可以是多种类型中的任意一种
+    - enum：参数必须是枚举值之一
+    - allOf：参数必须满足所有类型定义
+    - properties：推断为 object 类型
+    - items：推断为 array 类型
+
+    Args:
+        schema: JSON Schema 定义
+
+    Returns:
+        推断出的类型（'string', 'number', 'object', 'array' 等）或 None
+    """
+    if not isinstance(schema, dict):
+        return None
+
+    # 优先级 1: 直接 type 字段（包括类型数组）
+    if "type" in schema:
+        type_value = schema["type"]
+        if isinstance(type_value, str):
+            return type_value
+        elif isinstance(type_value, list) and type_value:
+            # 处理类型数组：优先返回非 null 类型
+            non_null_types = [t for t in type_value if t != "null"]
+            if non_null_types:
+                return non_null_types[0]
+            return "string"  # 如果只有 null，默认为 string
+
+    # 优先级 2: 处理 anyOf/oneOf
+    if "anyOf" in schema or "oneOf" in schema:
+        schemas = schema.get("anyOf") or schema.get("oneOf")
+        types = []
+
+        if isinstance(schemas, list):
+            for sub_schema in schemas:
+                inferred_type = infer_type_from_json_schema(sub_schema)
+                if inferred_type:
+                    types.append(inferred_type)
+
+            if types:
+                # 如果所有类型都相同，返回统一类型
+                if len(set(types)) == 1:
+                    return types[0]
+                # 类型不一致时，优先选择 string（最安全）
+                if "string" in types:
+                    return "string"
+                # 其他情况返回第一个类型
+                return types[0]
+
+    # 优先级 3: 处理 enum（推断枚举值的类型）
+    if "enum" in schema and isinstance(schema["enum"], list):
+        if not schema["enum"]:
+            return "string"
+
+        # 推断枚举值的类型
+        enum_types = set()
+        for value in schema["enum"]:
+            if value is None:
+                enum_types.add("null")
+            elif isinstance(value, bool):
+                enum_types.add("boolean")
+            elif isinstance(value, int):
+                enum_types.add("integer")
+            elif isinstance(value, float):
+                enum_types.add("number")
+            elif isinstance(value, str):
+                enum_types.add("string")
+            elif isinstance(value, list):
+                enum_types.add("array")
+            elif isinstance(value, dict):
+                enum_types.add("object")
+
+        # 如果类型统一，返回该类型
+        if len(enum_types) == 1:
+            return enum_types.pop()
+        # 混合类型，优先返回 string
+        return "string"
+
+    # 优先级 4: 处理 allOf（需要满足所有类型）
+    if "allOf" in schema and isinstance(schema["allOf"], list):
+        schemas = schema["allOf"]
+        for sub_schema in schemas:
+            inferred_type = infer_type_from_json_schema(sub_schema)
+            if inferred_type and inferred_type != "string":
+                return inferred_type
+        return "string"
+
+    # 优先级 5: 推断对象类型
+    if "properties" in schema:
+        return "object"
+
+    # 优先级 6: 推断数组类型
+    if "items" in schema:
+        return "array"
+
+    return None
 
 
 def get_json_schema_constraint(
