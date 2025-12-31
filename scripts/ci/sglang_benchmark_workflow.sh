@@ -110,6 +110,29 @@ if [[ "${TYPE}" == "launch" ]]; then
             --max-running-requests 128 \
             --watchdog-timeout 1200 &
         sglang_pid=$!
+    elif [[ "${model_name}" == "Qwen3-235B-A22B-Instruct-2507-FP8-Dynamic" ]]; then
+        export SGLANG_USE_AITER=1
+        export AITER_ROPE_FUSED_QKNORM=1
+        export SGLANG_ROCM_USE_AITER_PA_ASM_PRESHUFFLE_LAYOUT=0
+        export SGLANG_ROCM_USE_AITER_LINEAR_SHUFFLE=1
+        export SGLANG_ROCM_USE_AITER_LINEAR_FP8HIPB=1
+        python3 -m sglang.launch_server \
+            --model-path "${model_path}" \
+            --host localhost \
+            --port 9000 \
+            --tp-size ${TP} \
+            --disable-radix-cache \
+            --trust-remote-code \
+            --max-prefill-tokens 65536 \
+            --context-length 65536 \
+            --page-size 16 \
+            --max-running-requests 512 \
+            --chunked-prefill-size 65536 \
+            --mem-fraction-static 0.9 \
+            --mm-attention-backend aiter_attn \
+            --enable-aiter-allreduce-fusion \
+            --watchdog-timeout 1200 &
+        sglang_pid=$!
     else
         echo "Unknown model_name: ${model_name}"
         exit 1

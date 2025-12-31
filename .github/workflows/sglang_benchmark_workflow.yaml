@@ -7,20 +7,20 @@ on:
   workflow_dispatch:
     inputs:
       model_list:
-        description: 'Model list to benchmark on MI355 (JSON array format, default: ["Qwen3-VL-235B","Qwen3-next","Qwen3-Omni"])'
+        description: 'Model list to benchmark on MI355 (JSON array format, default: ["Qwen3-VL-235B","Qwen3-next","Qwen3-Omni","Qwen3-235B-A22B-Instruct-2507-FP8-Dynamic"])'
         required: false
-        default: '["Qwen3-VL-235B","Qwen3-next","Qwen3-Omni"]'
+        default: '["Qwen3-VL-235B","Qwen3-next","Qwen3-Omni","Qwen3-235B-A22B-Instruct-2507-FP8-Dynamic"]'
       image:
-        description: 'Image to use for the benchmark (default: "rocm/ali-private:ubuntu22.04_rocm6.4.3.127_sglang_f25820a_aiter_5fad56f_20251212")'
+        description: 'Image to use for the benchmark (default: "rocm/ali-private:ubuntu22.04_rocm6.4.3.127_sglang_7a2543_aiter_ad2ea1")'
         required: true
-        default: "rocm/ali-private:ubuntu22.04_rocm6.4.3.127_sglang_f25820a_aiter_5fad56f_20251212"
+        default: "rocm/ali-private:ubuntu22.04_rocm6.4.3.127_sglang_7a2543_aiter_ad2ea1"
   
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 env:
-  IMAGE: ${{ github.event.inputs.image || 'rocm/ali-private:ubuntu22.04_rocm6.4.3.127_sglang_f25820a_aiter_5fad56f_20251212' }}
+  IMAGE: ${{ github.event.inputs.image || 'rocm/ali-private:ubuntu22.04_rocm6.4.3.127_sglang_7a2543_aiter_ad2ea1' }}
   SGLANG_GITHUB_REPO_URL: ${{ github.event.pull_request.head.repo.clone_url || 'https://github.com/zejunchen-zejun/sglang.git' }}
   SGLANG_GITHUB_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.event.head_commit.id }}
 
@@ -30,7 +30,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        model: ${{ fromJson(github.event.inputs.model_list || '["Qwen3-VL-235B","Qwen3-next","Qwen3-Omni"]') }} 
+        model: ${{ fromJson(github.event.inputs.model_list || '["Qwen3-VL-235B","Qwen3-next","Qwen3-Omni","Qwen3-235B-A22B-Instruct-2507-FP8-Dynamic"]') }} 
 
     steps:
       - name: Checkout code
@@ -52,7 +52,6 @@ jobs:
           FROM ${{ env.IMAGE }}
           ENV GPU_ARCHS="gfx942"
           ENV PYTORCH_ROCM_ARCH="gfx942"
-          RUN echo "=== Aiter version BEFORE uninstall ===" && pip show aiter || true
           RUN echo "=== Aiter version BEFORE uninstall ===" && pip show amd-aiter || true
           RUN pip uninstall -y aiter amd-aiter
           RUN rm -rf /opt/aiter/aiter/jit/build
@@ -138,7 +137,9 @@ jobs:
           elif [ "$model_name" == "Qwen3-next" ]; then
             docker exec sglang_test bash -c "scripts/ci/sglang_benchmark_workflow.sh launch $model_name /models/Qwen/Qwen3-Next-80B-A3B-Instruct/ 4 1 60"
           elif [ "$model_name" == "Qwen3-Omni" ]; then
-            docker exec sglang_test bash -c "scripts/ci/sglang_benchmark_workflow.sh launch $model_name /models/Qwen/Qwen3-Omni-30B-A3B-Instruct/ 4 1 90"
+            docker exec sglang_test bash -c "scripts/ci/sglang_benchmark_workflow.sh launch $model_name /models/Qwen/Qwen3-Omni-30B-A3B-Instruct/ 4 1 60"
+          elif [ "$model_name" == "Qwen3-235B-A22B-Instruct-2507-FP8-Dynamic" ]; then
+            docker exec sglang_test bash -c "scripts/ci/sglang_benchmark_workflow.sh launch $model_name /models/RedHatAI/Qwen3-235B-A22B-Instruct-2507-FP8-Dynamic/ 8 8 90"
           else
             echo "Unknown model_name: ${model_name}"
             exit 1
@@ -155,6 +156,8 @@ jobs:
             docker exec sglang_test bash -c "scripts/ci/sglang_benchmark_workflow.sh evaluation $model_name /models/Qwen/Qwen3-Next-80B-A3B-Instruct/ 4 1"
           elif [ "$model_name" == "Qwen3-Omni" ]; then
             docker exec sglang_test bash -c "scripts/ci/sglang_benchmark_workflow.sh evaluation $model_name /models/Qwen/Qwen3-Omni-30B-A3B-Instruct/ 4 1"
+          elif [ "$model_name" == "Qwen3-235B-A22B-Instruct-2507-FP8-Dynamic" ]; then
+            docker exec sglang_test bash -c "scripts/ci/sglang_benchmark_workflow.sh evaluation $model_name /models/RedHatAI/Qwen3-235B-A22B-Instruct-2507-FP8-Dynamic/ 8 8"
           else
             echo "Unknown model_name: ${model_name}"
             exit 1
