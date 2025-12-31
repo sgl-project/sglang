@@ -130,11 +130,11 @@ class ConfigArgumentMerger:
         args = []
 
         for key, value in config.items():
-            if key in self.unsupported_actions:
-                action = self.unsupported_actions[key]
-                raise ValueError(
-                    f"Unsupported config option '{key}' with action '{action.__class__.__name__}'"
-                )
+            key_norm = key.replace("_", "-")
+            if key_norm in self.unsupported_actions:
+                action = self.unsupported_actions[key_norm]
+                msg = f"Unsupported config option '{key_norm}' with action '{action.__class__.__name__}'"
+                raise ValueError(msg)
             if isinstance(value, bool):
                 self._add_boolean_arg(args, key, value)
             elif isinstance(value, list):
@@ -154,7 +154,8 @@ class ConfigArgumentMerger:
         Regular booleans:
             - always add --key true/false
         """
-        if key in self.store_true_actions:
+        key_norm = key.replace("-", "_")
+        if key_norm in self.store_true_actions:
             if value:
                 args.append(f"--{key}")
         else:
