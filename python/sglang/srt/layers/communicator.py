@@ -77,6 +77,11 @@ _is_gfx95_supported = is_gfx95_supported()
 _is_npu = is_npu()
 _use_ag_after_qlora = envs.SGLANG_USE_AG_AFTER_QLORA.get()
 
+if _use_aiter:
+    from aiter import (
+        rmsnorm2d_fwd_with_add_dynamicquant,
+        rmsnorm2d_fwd_with_dynamicquant,
+    )
 if _use_aiter and _is_gfx95_supported:
     from aiter.ops.triton.fused_fp8_quant import fused_rms_fp8_group_quant
 
@@ -405,13 +410,17 @@ class LayerCommunicator:
         residual: torch.Tensor,
         forward_batch: ForwardBatch,
         captured_last_layer_outputs: Optional[List[torch.Tensor]] = None,
+        quant_format: str = "",
         post_residual_addition: Optional[torch.Tensor] = None,
+        **kwargs,
     ):
         hidden_states, residual = self.prepare_attn(
             hidden_states,
             residual,
             forward_batch,
             post_residual_addition=post_residual_addition,
+            quant_format=quant_format,
+            **kwargs,
         )
         if captured_last_layer_outputs is not None:
             gathered_last_layer_output = self._communicate_simple_fn(
@@ -488,7 +497,27 @@ class LayerCommunicator:
                             res1=None,
                             output_unquantized_inp1=False,
                         )
-
+                    elif _use_aiter and ("fp8_e4m3fnuz" in quant_format):
+                        y_scale = torch.empty(
+                            hidden_states.shape[0],
+                            1,
+                            dtype=torch.float32,
+                            device=hidden_states.device,
+                        )
+                        output = torch.empty_like(
+                            hidden_states,
+                            dtype=torch.float8_e4m3fnuz,
+                            device=hidden_states.device,
+                        )
+                        rmsnorm2d_fwd_with_dynamicquant(
+                            output,
+                            hidden_states,
+                            y_scale,
+                            self.input_layernorm.weight,
+                            self.input_layernorm.variance_epsilon,
+                            use_model_sensitive_rmsnorm=0,
+                        )
+                        hidden_states = (output, y_scale)
                     else:
                         hidden_states = self.input_layernorm(hidden_states)
                 else:
@@ -520,6 +549,30 @@ class LayerCommunicator:
                             res1=residual,
                             output_unquantized_inp1=False,
                         )
+                    elif _use_aiter and ("fp8_e4m3fnuz" in quant_format):
+                        y_scale = torch.empty(
+                            hidden_states.shape[0],
+                            1,
+                            dtype=torch.float32,
+                            device=hidden_states.device,
+                        )
+                        output = torch.empty_like(
+                            hidden_states,
+                            dtype=torch.float8_e4m3fnuz,
+                            device=hidden_states.device,
+                        )
+                        residual_out = torch.empty_like(residual)
+                        rmsnorm2d_fwd_with_add_dynamicquant(
+                            output,
+                            hidden_states,
+                            residual,
+                            residual_out,
+                            y_scale,
+                            self.input_layernorm.weight,
+                            self.input_layernorm.variance_epsilon,
+                            use_model_sensitive_rmsnorm=0,
+                        )
+                        hidden_states, residual = (output, y_scale), residual_out
                     else:
                         hidden_states, residual = self.input_layernorm(
                             hidden_states,
