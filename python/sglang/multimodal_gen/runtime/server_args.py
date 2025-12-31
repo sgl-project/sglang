@@ -206,6 +206,7 @@ class ServerArgs:
 
     # Compilation
     enable_torch_compile: bool = False
+    enable_warmup: bool = False
 
     disable_autocast: bool | None = None
 
