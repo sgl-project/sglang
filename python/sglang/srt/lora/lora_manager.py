@@ -347,7 +347,6 @@ class LoRAManager:
                         lora_type=LoRAType.LORA_B,
                     )
 
-
                     module.set_lora_info(
                         gate_up_lora_a_weights=gate_up_a,
                         gate_up_lora_b_weights=gate_up_b,

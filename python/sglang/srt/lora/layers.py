@@ -675,7 +675,7 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
 
         # Allocate intermediate cache for gate_up output (similar to intermediate_cache1 in base MoE)
         # This stores the LoRA delta in intermediate space before down projection
-        lora_intermediate_cache = torch.empty(
+        lora_intermediate_cache = torch.zeros(
             (num_tokens, intermediate_size),
             dtype=hidden_states.dtype,  # Use consistent dtype with model
             device=hidden_states.device,
