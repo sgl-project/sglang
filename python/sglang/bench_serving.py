@@ -739,8 +739,15 @@ def get_processor(
         pretrained_model_name_or_path
     ):
         pretrained_model_name_or_path = get_model(pretrained_model_name_or_path)
+
+    # Disable truncation when loading the processor for a quantized model.
+    # Truncation affects the `create_mm_data_row` function’s ability to correctly 
+    # count input tokens (text/vision) for bench serving, which may lead to 
+    # inaccurate token statistics.
     return AutoProcessor.from_pretrained(
-        pretrained_model_name_or_path, trust_remote_code=True
+        pretrained_model_name_or_path,
+        trust_remote_code=True,
+        truncation=False,
     )
 
 
