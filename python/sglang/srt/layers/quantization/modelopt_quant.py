@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 from enum import IntEnum
+from functools import lru_cache
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import torch
@@ -49,6 +50,7 @@ from sglang.srt.layers.quantization.utils import (
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.utils.common import (
     get_bool_env_var,
+    get_cuda_version,
     is_cuda,
     is_sm120_supported,
     next_power_of_2,
@@ -113,7 +115,7 @@ def _sglang_fp4_gemm(
     out_dtype: torch.dtype,
     out_features: int,
 ) -> torch.Tensor:
-    backend = FLASHINFER_FP4_GEMM_BACKEND if FLASHINFER_FP4_GEMM_BACKEND else "cutlass"
+    backend = resolve_mm_fp4_gemm_backend()
     if enable_flashinfer_fp4_gemm:
         return fp4_gemm(
             input, weight, input_sf, weight_sf, alpha, out_dtype, backend=backend
@@ -160,6 +162,21 @@ ACT_STR_TO_TYPE_MAP = {
     "silu": ActivationType.Swiglu,  # This is the default
     "relu2": ActivationType.Relu2,
 }
+
+_IS_CUDA_13 = is_cuda() and get_cuda_version() >= (13, 0)
+
+
+@lru_cache(maxsize=1)
+def resolve_mm_fp4_gemm_backend():
+    if _IS_CUDA_13:
+        # auto resolution: if cudnn < 9.15, use cutlass else use cudnn
+        # https://github.com/flashinfer-ai/flashinfer/pull/1979
+        backend = FLASHINFER_FP4_GEMM_BACKEND if FLASHINFER_FP4_GEMM_BACKEND else "auto"
+    else:
+        backend = (
+            FLASHINFER_FP4_GEMM_BACKEND if FLASHINFER_FP4_GEMM_BACKEND else "cutlass"
+        )
+    return backend
 
 
 class ModelOptQuantConfig(QuantizationConfig):
@@ -1226,9 +1243,6 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
             w_scale_interleaved = layer.weight_scale_interleaved.T
         # TODO(shuw@nvidia.com)
         # Remove the default after flashinfer bumped to 0.5.1
-        backend = (
-            FLASHINFER_FP4_GEMM_BACKEND if FLASHINFER_FP4_GEMM_BACKEND else "cutlass"
-        )
         out = torch.ops.sglang.fp4_gemm(
             x_fp4,
             w,
