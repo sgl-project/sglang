@@ -61,6 +61,7 @@ from sglang.multimodal_gen.runtime.platforms import (
     current_platform,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.utils.layerwise_offload import OffloadableDiTMixin
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.perf_logger import StageProfiler
 from sglang.multimodal_gen.runtime.utils.profiler import SGLDiffusionProfiler
@@ -484,6 +485,7 @@ class DenoisingStage(PipelineStage):
         Returns:
             A dictionary containing all the prepared variables for the denoising loop.
         """
+        assert self.transformer is not None
         pipeline = self.pipeline() if self.pipeline else None
         if not server_args.model_loaded["transformer"]:
             loader = TransformerLoader()
@@ -720,6 +722,11 @@ class DenoisingStage(PipelineStage):
                 "Memory after deallocating transformer: %s",
                 torch.mps.current_allocated_memory(),
             )
+
+        # reset offload managers with prefetching first layer for next forward
+        for dit in filter(None, [self.transformer, self.transformer_2]):
+            if isinstance(dit, OffloadableDiTMixin):
+                dit.prepare_for_next_denoise()
 
     def _preprocess_sp_latents(self, batch: Req, server_args: ServerArgs):
         """Shard latents for Sequence Parallelism if applicable."""
