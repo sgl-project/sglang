@@ -376,7 +376,7 @@ class ServerArgs:
 
     # Data parallelism
     dp_size: int = 1
-    load_balance_method: str = "round_robin"
+    load_balance_method: str = "auto"
     # FIXME: remove this after dp rank scheduling is fully supported with PD-Disaggregation
     prefill_round_robin_balance: bool = False
 
@@ -579,6 +579,7 @@ class ServerArgs:
     # Context parallelism used in the long sequence prefill phase of DeepSeek v3.2
     enable_nsa_prefill_context_parallel: bool = False
     enable_fused_qk_norm_rope: bool = False
+    enable_precise_embedding_interpolation: bool = False
 
     # Dynamic batch tokenizer
     enable_dynamic_batch_tokenizer: bool = False
@@ -648,6 +649,9 @@ class ServerArgs:
         """
         Orchestrates the handling of various server arguments, ensuring proper configuration and validation.
         """
+
+        # Normalize load balancing defaults early (before dummy-model short-circuit).
+        self._handle_load_balance_method()
 
         if self.model_path.lower() in ["none", "dummy"]:
             # Skip for dummy models
@@ -729,6 +733,36 @@ class ServerArgs:
 
         # Handle any other necessary validations.
         self._handle_other_validations()
+
+    def _handle_load_balance_method(self):
+        if self.disaggregation_mode not in ("null", "prefill", "decode"):
+            raise ValueError(
+                f"Invalid disaggregation_mode={self.disaggregation_mode!r}"
+            )
+
+        if self.load_balance_method == "auto":
+            # Default behavior:
+            # - non-PD: round_robin
+            # - PD prefill: follow_bootstrap_room
+            # - PD decode: round_robin
+            self.load_balance_method = (
+                "follow_bootstrap_room"
+                if self.disaggregation_mode == "prefill"
+                else "round_robin"
+            )
+            return
+
+        # Backward compat: in PD prefill, legacy "round_robin" means `bootstrap_room` routing.
+        if (
+            self.disaggregation_mode == "prefill"
+            and self.load_balance_method == "round_robin"
+        ):
+            logger.warning(
+                "In PD-disaggregation prefill mode, the 'round_robin' load balancing method "
+                "means `bootstrap_room` routing (use 'follow_bootstrap_room' instead). "
+                "Falling back to 'follow_bootstrap_room' for backward compatibility."
+            )
+            self.load_balance_method = "follow_bootstrap_room"
 
     def _handle_deprecated_args(self):
         # Handle deprecated tool call parsers
@@ -1092,6 +1126,10 @@ class ServerArgs:
                     )
 
                     print_nsa_bool_env_vars()
+                if self.enable_nsa_prefill_context_parallel:
+                    assert (
+                        self.disaggregation_mode != "decode"
+                    ), "CP is only supported for prefill when PD disaggregation, please remove --enable-nsa-prefill-context-parallel."
 
             else:
                 # DeepSeek V3/R1/V3.1
@@ -1997,7 +2035,7 @@ class ServerArgs:
                 )
 
             if (
-                self.speculative_algorithm in ["EAGLE", "EAGLE3"]
+                self.speculative_algorithm in ["EAGLE", "EAGLE3", "STANDALONE"]
                 and envs.SGLANG_ENABLE_SPEC_V2.get()
             ):
                 self.disable_overlap_schedule = False
@@ -2186,8 +2224,9 @@ class ServerArgs:
             if self.dp_size > 1 and not is_in_ci():
                 assert self.prefill_round_robin_balance, (
                     "Prefill round robin balance is required when dp size > 1. "
-                    "Please make sure that the prefill instance is launched with `--load-balance-method round_robin`"
-                    " and `--prefill-round-robin-balance` is set for decode server."
+                    "Please make sure that the prefill instance is launched with `--load-balance-method auto` "
+                    "or `--load-balance-method follow_bootstrap_room` "
+                    "and `--prefill-round-robin-balance` is set for decode server."
                 )
         elif self.disaggregation_mode == "prefill":
             if self.disaggregation_decode_tp is None:
@@ -3176,8 +3215,9 @@ class ServerArgs:
             default=ServerArgs.load_balance_method,
             help="The load balancing strategy for data parallelism.",
             choices=[
+                "auto",
                 "round_robin",
-                "decode_round_robin",
+                "follow_bootstrap_room",
                 "shortest_queue",
                 "minimum_tokens",
             ],
@@ -4190,6 +4230,11 @@ class ServerArgs:
             "--enable-fused-qk-norm-rope",
             action="store_true",
             help="Enable fused qk normalization and rope rotary embedding.",
+        )
+        parser.add_argument(
+            "--enable-precise-embedding-interpolation",
+            action="store_true",
+            help="Enable corner alignment for resize of embeddings grid to ensure more accurate(but slower) evaluation of interpolated embedding values.",
         )
 
         # Dynamic batch tokenizer

@@ -194,6 +194,7 @@ suites = {
 # NOTE: please sort the test cases alphabetically by the test file name
 suite_amd = {
     "per-commit-amd": [
+        TestFile("debug_utils/test_tensor_dump_forward_hook.py", 15),
         # TestFile("hicache/test_hicache.py", 116), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/12575
         # TestFile("hicache/test_hicache_mla.py", 127), # Disabled temporarily,  # Temporarily disabled, see https://github.com/sgl-project/sglang/issues/12574
         # TestFile("hicache/test_hicache_storage.py", 127), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/12575
@@ -202,6 +203,7 @@ suite_amd = {
         # TestFile("lora/test_lora_cuda_graph.py", 250), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/13107
         # TestFile("lora/test_lora_qwen3.py", 97), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/13107
         TestFile("models/test_compressed_tensors_models.py", 42),
+        TestFile("models/test_cross_encoder_models.py", 150),
         TestFile("models/test_qwen_models.py", 82),
         TestFile("models/test_reward_models.py", 132),
         TestFile("models/test_transformers_models.py", 320),
@@ -222,14 +224,20 @@ suite_amd = {
         TestFile("openai_server/validation/test_matched_stop.py", 60),
         TestFile("openai_server/validation/test_openai_server_ignore_eos.py", 85),
         TestFile("openai_server/validation/test_request_length_validation.py", 31),
+        TestFile("ops/test_repeat_interleave.py", 75),
         TestFile("quant/test_awq_dequant.py", 2),
         TestFile("quant/test_block_int8.py", 22),
         TestFile("quant/test_fused_rms_fp8_group_quant.py", 10),
+        TestFile("quant/test_triton_scaled_mm.py", 12),
+        TestFile("rl/test_fp32_lm_head.py", 15),
         # TestFile("rl/test_update_weights_from_disk.py", 210),  # Temporarily disabled, see https://github.com/sgl-project/sglang/pull/13998
+        TestFile("rotary_embedding/test_mrope.py", 15),
         TestFile("test_abort.py", 51),
         TestFile("test_bench_typebaseddispatcher.py", 10),
         TestFile("test_chunked_prefill.py", 312),
+        TestFile("test_constrained_decoding.py", 120),
         TestFile("test_eval_fp8_accuracy.py", 303),
+        TestFile("test_external_models.py", 45),
         TestFile("test_fused_moe.py", 30),
         TestFile("test_harmony_parser.py", 20),
         TestFile("test_input_embeddings.py", 38),
@@ -237,21 +245,31 @@ suite_amd = {
         TestFile("test_jinja_template_utils.py", 1),
         TestFile("test_metrics.py", 32),
         TestFile("test_metrics_utils.py", 1),
+        TestFile("test_model_hooks.py", 10),
+        TestFile("test_multi_tokenizer.py", 345),
         TestFile("test_no_chunked_prefill.py", 108),
+        TestFile("test_original_logprobs.py", 60),
         TestFile("test_page_size.py", 60),
         TestFile("test_penalty.py", 180),
+        TestFile("test_prefill_adder.py", 2),
+        TestFile("test_priority_scheduling.py", 195),
+        TestFile("test_profile_merger.py", 12),
+        TestFile("test_profile_merger_http_api.py", 15),
         TestFile("test_pytorch_sampling_backend.py", 66),
         TestFile("test_reasoning_parser.py", 5),
-        TestFile("test_constrained_decoding.py", 120),
+        TestFile("test_request_queue_validation.py", 70),
         TestFile("test_retract_decode.py", 450),
         TestFile("test_rope_rocm.py", 3),
         TestFile("test_server_args.py", 1),
         TestFile("test_skip_tokenizer_init.py", 117),
         TestFile("test_srt_endpoint.py", 130),
         TestFile("test_srt_engine.py", 261),
+        TestFile("test_start_profile.py", 60),
+        TestFile("test_swa_unittest.py", 10),
         TestFile("test_torch_compile.py", 169),
         # TestFile("test_torch_compile_moe.py", 210), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/13107
         TestFile("test_type_based_dispatcher.py", 10),
+        TestFile("test_video_utils.py", 8),
         # Disabled temporarily
         # TestFile("test_vlm_input_format.py", 300),
         # TestFile("models/test_embedding_models.py", 73), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/11127
@@ -334,6 +352,7 @@ suite_ascend = {
         TestFile("ascend/test_ascend_sampling_backend.py", 400),
         TestFile("ascend/test_ascend_tp1_bf16.py", 400),
         TestFile("ascend/test_ascend_compile_graph_tp1_bf16.py", 400),
+        TestFile("test_embed_interpolate_unittest.py", 400),
     ],
     "per-commit-2-npu-a2": [
         TestFile("ascend/test_ascend_graph_tp2_bf16.py", 400),
