@@ -68,6 +68,7 @@ class FakeKVReceiver(BaseKVReceiver):
         prefill_dp_rank: Optional[int] = None,
     ):
         self.has_init = False
+        self.should_notify_dp_rank = False
 
     def poll(self) -> KVPoll:
         if self.has_init is False:
@@ -83,6 +84,7 @@ class FakeKVReceiver(BaseKVReceiver):
         kv_indices: list[int],
         aux_index: Optional[int] = None,
         state_indices: Optional[List[int]] = None,
+        prefill_dp_rank: Optional[int] = None,
     ):
         self.has_init = True
         logger.debug(
