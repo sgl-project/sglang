@@ -269,7 +269,7 @@ class DiffGenerator:
             if self.server_args.enable_warmup:
                 total_duration_ms = results[0]["timings"]["total_duration_ms"]
                 logger.info(
-                    f"Batch processed in %.2f seconds (with wa rmup excluded)",
+                    f"Batch processed in %.2f seconds (with warmup excluded)",
                     total_duration_ms / 1000.0,
                 )
 

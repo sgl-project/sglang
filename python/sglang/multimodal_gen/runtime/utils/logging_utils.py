@@ -487,7 +487,7 @@ def log_batch_completion(
     logger: logging.Logger, num_outputs: int, total_time: float
 ) -> None:
     logger.info(
-        "Completed batch processing. Generated %d outputs in %.2f seconds.",
+        "Completed batch processing. Generated %d outputs in %.2f seconds",
         num_outputs,
         total_time,
     )
