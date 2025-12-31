@@ -15,9 +15,14 @@ logger = logging.getLogger(__name__)
 class ConfigArgumentMerger:
     """Handles merging of configuration file arguments with command-line arguments."""
 
-    def __init__(self, store_true_actions: List[str] = None):
+    def __init__(
+        self,
+        store_true_actions: List[str] = None,
+        unsupported_actions: List[str] = None,
+    ):
         """Initialize with list of store_true action names."""
         self.store_true_actions = store_true_actions or []
+        self.unsupported_actions = unsupported_actions or []
 
     def merge_config_with_args(self, cli_args: List[str]) -> List[str]:
         """

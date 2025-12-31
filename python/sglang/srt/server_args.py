@@ -2442,11 +2442,9 @@ class ServerArgs:
             logger.info("Set soft_watchdog_timeout since in CI")
             self.soft_watchdog_timeout = 300
 
-    # The current code does not support the `action="store_false"` parameter type. see #14085 for more details.
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
 
-        # Model and tokenizer
         parser.add_argument(
             "--model-path",
             "--model",
@@ -4978,6 +4976,7 @@ def prepare_server_args(argv: List[str]) -> ServerArgs:
         # Extract boolean actions from the parser to handle them correctly
         parser = argparse.ArgumentParser()
         ServerArgs.add_cli_args(parser)
+        # NOTE: The current code does not support actions other than "store_true" and "store".
 
         # Merge config file arguments with CLI arguments
         store_ture_actions = [
@@ -4985,7 +4984,21 @@ def prepare_server_args(argv: List[str]) -> ServerArgs:
             for action in parser._actions
             if isinstance(action, argparse._StoreTrueAction)
         ]
-        config_merger = ConfigArgumentMerger(store_true_actions=store_ture_actions)
+        unsupported_actions = [
+            a.dest
+            for a in parser._actions
+            if a.option_strings
+            and not isinstance(a, argparse._StoreTrueAction)
+            and not isinstance(a, argparse._StoreAction)
+            and "--config" not in a.option_strings
+            and "--help" not in a.option_strings
+            and "-h" not in a.option_strings
+        ]
+
+        config_merger = ConfigArgumentMerger(
+            store_true_actions=store_ture_actions,
+            unsupported_actions=unsupported_actions,
+        )
         argv = config_merger.merge_config_with_args(argv)
 
     parser = argparse.ArgumentParser()
