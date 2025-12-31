@@ -103,6 +103,7 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
             model=server_args.model_path,
             prompt=sampling_params.prompt or "A colorful raccoon icon",
             output_size=output_size,
+            output_format=sampling_params.output_format,
         )
         warmup.run_text_warmups(server_args.warmup_text)
 
