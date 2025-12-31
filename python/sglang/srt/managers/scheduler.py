@@ -2426,7 +2426,9 @@ class Scheduler(
             num_timeout_reqs_rank_0 = num_timeout_reqs
 
         # Handle timed-out requests: all ranks must abort to maintain consistency.
-        for i in range(num_ready_reqs_rank_0, num_ready_reqs_rank_0 + num_timeout_reqs_rank_0):
+        for i in range(
+            num_ready_reqs_rank_0, num_ready_reqs_rank_0 + num_timeout_reqs_rank_0
+        ):
             req = self.grammar_queue[i]
             # Only rank 0 has futures to cancel and cache to update
             if self.tp_rank == 0 and isinstance(req.grammar, futures.Future):
