@@ -404,14 +404,14 @@ ONE_GPU_CASES_B: list[DiffusionTestCase] = [
     ),
     # NOTE(mick): flaky
     # DiffusionTestCase(
-    #     id="hunyuan_video",
-    #     model_path="hunyuanvideo-community/HunyuanVideo",
-    #     modality="video",
-    #     prompt="A curious raccoon",
-    #     output_size="720x480",
-    #     warmup_text=0,
-    #     warmup_edit=0,
-    #     custom_validator="video",
+    #     "hunyuan_video",
+    #     DiffusionServerArgs(
+    #         model_path="hunyuanvideo-community/HunyuanVideo",
+    #         modality="video",
+    #     ),
+    #     DiffusionSamplingParams(
+    #         prompt=T2V_PROMPT,
+    #     ),
     # ),
     DiffusionTestCase(
         "flux_2_ti2i",
