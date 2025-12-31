@@ -54,7 +54,7 @@ LOGPROB_THRESHOLD = 1e-01
 DEFAULT_TEST_PROMPTS = [
     "SGL is a",
     "AI is a field of computer science focused on",
-    "The president in the U.S is",
+    "Write a long story.",
     "Write a short story.",
     "What are the main components of a computer?",
 ]
