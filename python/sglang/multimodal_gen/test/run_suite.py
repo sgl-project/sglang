@@ -107,13 +107,13 @@ def collect_test_items(files, filter_expr=None):
             f"Command: {' '.join(cmd)}\n"
         )
 
-        should_rerun = "FileNotFoundError" in result.stderr
-
         if result.stderr:
             error_msg += f"stderr:\n{result.stderr}\n"
         if result.stdout:
             error_msg += f"stdout:\n{result.stdout}\n"
         logger.error(error_msg)
+
+        should_rerun = "FileNotFoundError" in result.stderr
 
         if not should_rerun:
             raise RuntimeError(error_msg)
