@@ -560,7 +560,7 @@ class DataParallelController:
             "The 'minimum_tokens' load balancing method is deprecated for now and will introduced later."
             "Fall back to 'round_robin_scheduler'"
         )
-        if self.server_args.disaggregation_mode ==  "null":
+        if self.server_args.disaggregation_mode == "null":
             self.round_robin_scheduler(req)
         else:
             self.follow_bootstrap_room_scheduler(req)
