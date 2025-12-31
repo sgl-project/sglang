@@ -30,6 +30,7 @@ from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
 )
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 from sglang.multimodal_gen.runtime.platforms import current_platform
+from sglang.multimodal_gen.runtime.utils.layerwise_offload import OffloadableDiTMixin
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)  # pylint: disable=invalid-name
@@ -593,7 +594,7 @@ class Flux2PosEmbed(nn.Module):
         return freqs_cos.contiguous().float(), freqs_sin.contiguous().float()
 
 
-class Flux2Transformer2DModel(CachableDiT):
+class Flux2Transformer2DModel(CachableDiT, OffloadableDiTMixin):
     """
     The Transformer model introduced in Flux 2.
 
@@ -692,7 +693,7 @@ class Flux2Transformer2DModel(CachableDiT):
             self.inner_dim, patch_size * patch_size * self.out_channels, bias=False
         )
 
-        self.gradient_checkpointing = False
+        self.layer_names = ["transformer_blocks", "single_transformer_blocks"]
 
     def forward(
         self,
