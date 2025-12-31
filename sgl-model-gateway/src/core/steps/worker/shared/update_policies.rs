@@ -20,19 +20,27 @@ pub struct UpdatePoliciesStep;
 impl UpdatePoliciesStep {
     /// Check for conflicts between prefill and decode worker configurations for a model.
     fn check_worker_conflicts(&self, model_id: &str, workers: &[Arc<dyn Worker>]) {
-        let mut prefill_workers = Vec::new();
-        let mut decode_workers = Vec::new();
+        let prefill_workers: Vec<_> = workers
+            .iter()
+            .filter(|w| {
+                w.metadata()
+                    .labels
+                    .get("disaggregation_mode")
+                    .map(|s| s.as_str())
+                    == Some("prefill")
+            })
+            .collect();
 
-        for worker in workers {
-            let labels = &worker.metadata().labels;
-            let disagg_mode = labels.get("disaggregation_mode").map(|s| s.as_str());
-
-            match disagg_mode {
-                Some("prefill") => prefill_workers.push(worker),
-                Some("decode") => decode_workers.push(worker),
-                _ => {}
-            }
-        }
+        let decode_workers: Vec<_> = workers
+            .iter()
+            .filter(|w| {
+                w.metadata()
+                    .labels
+                    .get("disaggregation_mode")
+                    .map(|s| s.as_str())
+                    == Some("decode")
+            })
+            .collect();
 
         if prefill_workers.is_empty() || decode_workers.is_empty() {
             return;
