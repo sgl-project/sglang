@@ -135,43 +135,6 @@ class CausalDMDDenoisingStage(DenoisingStage):
                     )
                 )
 
-        # Determine block sizes
-        if not independent_first_frame or (
-            independent_first_frame and batch.image_latent is not None
-        ):
-            if t % self.num_frames_per_block != 0:
-                raise ValueError(
-                    "num_frames must be divisible by num_frames_per_block for causal DMD denoising"
-                )
-            num_blocks = t // self.num_frames_per_block
-            block_sizes = [self.num_frames_per_block] * num_blocks
-            start_index = 0
-        else:
-            if (t - 1) % self.num_frames_per_block != 0:
-                raise ValueError(
-                    "(num_frames - 1) must be divisible by num_frame_per_block when independent_first_frame=True"
-                )
-            num_blocks = (t - 1) // self.num_frames_per_block
-            block_sizes = [1] + [self.num_frames_per_block] * num_blocks
-            start_index = 0
-
-        # Warmup
-        if server_args.enable_warmup:
-            # Reset cache after warmup
-            for block_index in range(self.num_transformer_blocks):
-                self.crossattn_cache[block_index]["is_init"] = False  # type: ignore
-            for block_index in range(len(self.kv_cache1)):
-                self.kv_cache1[block_index]["global_end_index"] = (
-                    torch.tensor(  # type: ignore
-                        [0], dtype=torch.long, device=latents.device
-                    )
-                )
-                self.kv_cache1[block_index]["local_end_index"] = (
-                    torch.tensor(  # type: ignore
-                        [0], dtype=torch.long, device=latents.device
-                    )
-                )
-
         # Optional: cache context features from provided image latents prior to generation
         current_start_frame = 0
         if getattr(batch, "image_latent", None) is not None:
@@ -237,6 +200,26 @@ class CausalDMDDenoisingStage(DenoisingStage):
 
         # Base position offset from any cache warm-up
         pos_start_base = current_start_frame
+
+        # Determine block sizes
+        if not independent_first_frame or (
+            independent_first_frame and batch.image_latent is not None
+        ):
+            if t % self.num_frames_per_block != 0:
+                raise ValueError(
+                    "num_frames must be divisible by num_frames_per_block for causal DMD denoising"
+                )
+            num_blocks = t // self.num_frames_per_block
+            block_sizes = [self.num_frames_per_block] * num_blocks
+            start_index = 0
+        else:
+            if (t - 1) % self.num_frames_per_block != 0:
+                raise ValueError(
+                    "(num_frames - 1) must be divisible by num_frame_per_block when independent_first_frame=True"
+                )
+            num_blocks = (t - 1) // self.num_frames_per_block
+            block_sizes = [1] + [self.num_frames_per_block] * num_blocks
+            start_index = 0
 
         # DMD loop in causal blocks
         with self.progress_bar(total=len(block_sizes) * len(timesteps)) as progress_bar:

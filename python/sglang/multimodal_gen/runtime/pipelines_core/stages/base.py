@@ -51,7 +51,6 @@ class PipelineStage(ABC):
 
     def __init__(self):
         self.server_args = get_global_server_args()
-        self._warmed_up = False
 
     def log_info(self, msg, *args):
         """Logs an informational message with the stage name as a prefix."""
