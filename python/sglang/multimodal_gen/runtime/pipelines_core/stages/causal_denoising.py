@@ -56,8 +56,8 @@ class CausalDMDDenoisingStage(DenoisingStage):
     ) -> Req:
         target_dtype = torch.bfloat16
         autocast_enabled = (
-                               target_dtype != torch.float32
-                           ) and not server_args.disable_autocast
+            target_dtype != torch.float32
+        ) and not server_args.disable_autocast
 
         latent_seq_length = batch.latents.shape[-1] * batch.latents.shape[-2]
         patch_ratio = (
@@ -212,7 +212,7 @@ class CausalDMDDenoisingStage(DenoisingStage):
                 block = min(self.num_frames_per_block, remaining_frames)
                 ref_btchw = (
                     image_latent[
-                        :, :, current_start_frame: current_start_frame + block, :, :
+                        :, :, current_start_frame : current_start_frame + block, :, :
                     ]
                     .to(target_dtype)
                     .permute(0, 2, 1, 3, 4)
@@ -242,7 +242,7 @@ class CausalDMDDenoisingStage(DenoisingStage):
         with self.progress_bar(total=len(block_sizes) * len(timesteps)) as progress_bar:
             for current_num_frames in block_sizes:
                 current_latents = latents[
-                    :, :, start_index: start_index + current_num_frames, :, :
+                    :, :, start_index : start_index + current_num_frames, :, :
                 ]
                 # use BTCHW for DMD conversion routines
                 noise_latents_btchw = current_latents.permute(0, 2, 1, 3, 4)
@@ -323,7 +323,7 @@ class CausalDMDDenoisingStage(DenoisingStage):
                             kv_cache=self.kv_cache1,
                             crossattn_cache=self.crossattn_cache,
                             current_start=(pos_start_base + start_index)
-                                          * self.frame_seq_length,
+                            * self.frame_seq_length,
                             start_frame=start_index,
                             **image_kwargs,
                             **pos_cond_kwargs,
@@ -365,7 +365,7 @@ class CausalDMDDenoisingStage(DenoisingStage):
                         progress_bar.update()
 
                 # Write back and advance
-                latents[:, :, start_index: start_index + current_num_frames, :, :] = (
+                latents[:, :, start_index : start_index + current_num_frames, :, :] = (
                     current_latents
                 )
 
@@ -395,7 +395,7 @@ class CausalDMDDenoisingStage(DenoisingStage):
                         kv_cache=self.kv_cache1,
                         crossattn_cache=self.crossattn_cache,
                         current_start=(pos_start_base + start_index)
-                                      * self.frame_seq_length,
+                        * self.frame_seq_length,
                         start_frame=start_index,
                         **image_kwargs,
                         **pos_cond_kwargs,
