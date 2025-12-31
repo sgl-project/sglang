@@ -2366,6 +2366,7 @@ class Scheduler(
         """
         num_ready_reqs = 0
         num_timeout_reqs = 0
+        invalid_indices = []
 
         if self.server_args.enable_dp_attention:
             tp_size = self.attn_tp_size
@@ -2396,8 +2397,7 @@ class Scheduler(
                 req.grammar = req.grammar.result(timeout=0.03)
                 self.grammar_backend.set_cache(req.grammar_key, req.grammar.copy())
                 if req.grammar is INVALID_GRAMMAR_OBJ:
-                    error_msg = f"Invalid grammar request: {req.grammar_key=}"
-                    req.set_finish_with_abort(error_msg)
+                    invalid_indices.append(num_ready_reqs)
 
                 num_ready_reqs += 1
             except futures._base.TimeoutError:
@@ -2409,16 +2409,46 @@ class Scheduler(
                 break
 
         if tp_size > 1:
-            # Rank 0 broadcasts its ready/timeout counts to all ranks
-            tensor = torch.tensor([num_ready_reqs, num_timeout_reqs], dtype=torch.int32)
+            # Rank 0 broadcasts its ready/timeout/invalid counts
+            num_invalid = len(invalid_indices)
+            tensor = torch.tensor(
+                [num_ready_reqs, num_timeout_reqs, num_invalid], dtype=torch.int32
+            )
 
             # Broadcast from local rank 0 within the TP group, using group_src (local rank)
             # rather than src (global rank) to be consistent with other self.tp_rank == 0 checks
             torch.distributed.broadcast(tensor, group_src=0, group=tp_group)
-            num_ready_reqs_rank_0, num_timeout_reqs_rank_0 = tensor.tolist()
+            num_ready_reqs_rank_0, num_timeout_reqs_rank_0, num_invalid = (
+                tensor.tolist()
+            )
+
+            # In order to have the consistent abort request state, we must broadcast the invalid indices
+            if num_invalid > 0:
+                if self.tp_rank == 0:
+                    # On rank 0, we create our tensor with our invalid indices data (to send)
+                    invalid_tensor = torch.tensor(invalid_indices, dtype=torch.int32)
+                else:
+                    # On non-entry ranks, we create our empty tensors (to receive)
+                    invalid_tensor = torch.zeros(num_invalid, dtype=torch.int32)
+                torch.distributed.broadcast(invalid_tensor, group_src=0, group=tp_group)
+
+                # All ranks abort invalid requests
+                for idx in invalid_tensor.tolist():
+                    req = self.grammar_queue[idx]
+                    if not req.finished():
+                        req.set_finish_with_abort(
+                            f"Invalid grammar request: {req.grammar_key=}"
+                        )
         else:
             num_ready_reqs_rank_0 = num_ready_reqs
             num_timeout_reqs_rank_0 = num_timeout_reqs
+
+            # Non TP>1: Handle invalid grammars directly
+            for idx in invalid_indices:
+                req = self.grammar_queue[idx]
+                req.set_finish_with_abort(
+                    f"Invalid grammar request: {req.grammar_key=}"
+                )
 
         # Handle timed-out requests: all ranks must abort to maintain consistency.
         for i in range(
@@ -2436,19 +2466,21 @@ class Scheduler(
 
         # Move synchronized requests from grammar_queue to waiting_queue.
         for req in self.grammar_queue[:num_ready_reqs]:
+            # Skip cache lookup for already-finished requests (invalid/timed-out/aborted)
             if (
-                req.grammar is None
+                not req.finished()
+                and req.grammar is None
                 and self.grammar_backend is not None
                 and req.grammar_key is not None
             ):
-                # TP>1: Non-entry ranks fetch grammar from local cache, each rank has its own backend.
+                # TP>1: Non-rank-0 workers fetch grammar from rank 0's cache.
                 grammar_obj, cache_hit = (
                     self.grammar_backend.get_cached_or_future_value(
                         req.grammar_key, req.require_reasoning
                     )
                 )
 
-                # If we got a Future, ensure all ranks have the grammar.
+                # If we got a Future, wait for compilation to complete.
                 if isinstance(grammar_obj, futures.Future):
                     grammar_obj = grammar_obj.result()
                     self.grammar_backend.set_cache(req.grammar_key, grammar_obj.copy())
