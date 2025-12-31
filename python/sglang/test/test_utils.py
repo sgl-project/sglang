@@ -647,6 +647,7 @@ def popen_launch_server(
             env=env,
             text=True,
             bufsize=1,
+            errors="ignore",
         )
 
         def _dump(src, sinks):
