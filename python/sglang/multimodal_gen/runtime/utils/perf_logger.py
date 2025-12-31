@@ -33,6 +33,10 @@ class RequestTimings:
         self.steps: list[float] = []
         self.total_duration_ms: float = 0.0
 
+    @property
+    def total_duration_s(self) -> float:
+        return self.total_duration_ms / 1000.0
+
     def record_stage(self, stage_name: str, duration_s: float):
         """Records the duration of a pipeline stage"""
         self.stages[stage_name] = duration_s * 1000  # Store as milliseconds

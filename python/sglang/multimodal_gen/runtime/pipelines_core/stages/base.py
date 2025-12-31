@@ -53,19 +53,6 @@ class PipelineStage(ABC):
         self.server_args = get_global_server_args()
         self._warmed_up = False
 
-    def warmup(self, batch: Req, server_args: ServerArgs, **kwargs):
-        """
-        Perform warmup for the stage if enabled and not yet performed.
-        """
-        if server_args.enable_warmup and not self._warmed_up:
-            self._warmup(batch, server_args, **kwargs)
-            self._warmed_up = True
-
-    def _warmup(self, batch: Req, server_args: ServerArgs, **kwargs):
-        """
-        Actual warmup implementation. Should be overridden by subclasses.
-        """
-        pass
 
     def log_info(self, msg, *args):
         """Logs an informational message with the stage name as a prefix."""

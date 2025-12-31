@@ -49,50 +49,6 @@ class CausalDMDDenoisingStage(DenoisingStage):
         except Exception:
             self.local_attn_size = -1
 
-    def _warmup(
-        self,
-        batch,
-        server_args,
-        current_latents,
-        first_timestep,
-        target_dtype,
-        autocast_enabled,
-        image_kwargs,
-        pos_cond_kwargs,
-        prompt_embeds,
-    ):
-        logger.info("Performing 1-step warmup for Causal DMD denoising")
-        latent_model_input = current_latents.to(target_dtype)
-
-        t_expanded_noise = first_timestep[0] * torch.ones(
-            (latent_model_input.shape[0], 1),
-            device=latent_model_input.device,
-            dtype=torch.long,
-        )
-
-        with torch.autocast(
-            device_type="cuda",
-            dtype=target_dtype,
-            enabled=autocast_enabled,
-        ):
-            with set_forward_context(
-                current_timestep=0,
-                attn_metadata=None,
-                forward_batch=batch,
-            ):
-                _ = self.transformer(
-                    latent_model_input,
-                    prompt_embeds,
-                    t_expanded_noise,
-                    kv_cache=self.kv_cache1,
-                    crossattn_cache=self.crossattn_cache,
-                    current_start=0,
-                    start_frame=0,
-                    **image_kwargs,
-                    **pos_cond_kwargs,
-                )
-        logger.info("Warmup done.")
-
     def forward(
         self,
         batch: Req,
@@ -100,8 +56,8 @@ class CausalDMDDenoisingStage(DenoisingStage):
     ) -> Req:
         target_dtype = torch.bfloat16
         autocast_enabled = (
-            target_dtype != torch.float32
-        ) and not server_args.disable_autocast
+                               target_dtype != torch.float32
+                           ) and not server_args.disable_autocast
 
         latent_seq_length = batch.latents.shape[-1] * batch.latents.shape[-2]
         patch_ratio = (
@@ -200,17 +156,6 @@ class CausalDMDDenoisingStage(DenoisingStage):
             start_index = 0
 
         # Warmup
-        self.warmup(
-            batch,
-            server_args,
-            current_latents=latents[:, :, : block_sizes[0], :, :],
-            first_timestep=timesteps[0:1],
-            target_dtype=target_dtype,
-            autocast_enabled=autocast_enabled,
-            image_kwargs=image_kwargs,
-            pos_cond_kwargs=pos_cond_kwargs,
-            prompt_embeds=prompt_embeds,
-        )
         if server_args.enable_warmup:
             # Reset cache after warmup
             for block_index in range(self.num_transformer_blocks):
@@ -267,7 +212,7 @@ class CausalDMDDenoisingStage(DenoisingStage):
                 block = min(self.num_frames_per_block, remaining_frames)
                 ref_btchw = (
                     image_latent[
-                        :, :, current_start_frame : current_start_frame + block, :, :
+                        :, :, current_start_frame: current_start_frame + block, :, :
                     ]
                     .to(target_dtype)
                     .permute(0, 2, 1, 3, 4)
@@ -297,7 +242,7 @@ class CausalDMDDenoisingStage(DenoisingStage):
         with self.progress_bar(total=len(block_sizes) * len(timesteps)) as progress_bar:
             for current_num_frames in block_sizes:
                 current_latents = latents[
-                    :, :, start_index : start_index + current_num_frames, :, :
+                    :, :, start_index: start_index + current_num_frames, :, :
                 ]
                 # use BTCHW for DMD conversion routines
                 noise_latents_btchw = current_latents.permute(0, 2, 1, 3, 4)
@@ -378,7 +323,7 @@ class CausalDMDDenoisingStage(DenoisingStage):
                             kv_cache=self.kv_cache1,
                             crossattn_cache=self.crossattn_cache,
                             current_start=(pos_start_base + start_index)
-                            * self.frame_seq_length,
+                                          * self.frame_seq_length,
                             start_frame=start_index,
                             **image_kwargs,
                             **pos_cond_kwargs,
@@ -420,7 +365,7 @@ class CausalDMDDenoisingStage(DenoisingStage):
                         progress_bar.update()
 
                 # Write back and advance
-                latents[:, :, start_index : start_index + current_num_frames, :, :] = (
+                latents[:, :, start_index: start_index + current_num_frames, :, :] = (
                     current_latents
                 )
 
@@ -450,7 +395,7 @@ class CausalDMDDenoisingStage(DenoisingStage):
                         kv_cache=self.kv_cache1,
                         crossattn_cache=self.crossattn_cache,
                         current_start=(pos_start_base + start_index)
-                        * self.frame_seq_length,
+                                      * self.frame_seq_length,
                         start_frame=start_index,
                         **image_kwargs,
                         **pos_cond_kwargs,

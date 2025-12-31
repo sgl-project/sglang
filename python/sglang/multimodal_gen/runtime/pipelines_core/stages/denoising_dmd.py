@@ -28,53 +28,6 @@ class DmdDenoisingStage(DenoisingStage):
         super().__init__(transformer, scheduler)
         self.scheduler = FlowMatchEulerDiscreteScheduler(shift=8.0)
 
-    def _warmup(
-        self,
-        batch,
-        server_args,
-        latents,
-        first_timestep,
-        target_dtype,
-        autocast_enabled,
-        image_kwargs,
-        pos_cond_kwargs,
-    ):
-        logger.info("Performing 1-step warmup for DMD denoising")
-        latent_model_input = latents.to(target_dtype)
-        if batch.image_latent is not None:
-            latent_model_input = torch.cat(
-                [
-                    latent_model_input,
-                    batch.image_latent.permute(0, 2, 1, 3, 4),
-                ],
-                dim=2,
-            ).to(target_dtype)
-        assert not torch.isnan(
-            latent_model_input
-        ).any(), "latent_model_input contains nan"
-
-        t_expand = first_timestep.repeat(latent_model_input.shape[0])
-        with torch.autocast(
-            device_type="cuda",
-            dtype=target_dtype,
-            enabled=autocast_enabled,
-        ):
-            attn_metadata = self._build_attn_metadata(0, batch, server_args)
-            with set_forward_context(
-                current_timestep=0,
-                attn_metadata=attn_metadata,
-                forward_batch=batch,
-            ):
-                # Run transformer
-                _ = self.transformer(
-                    hidden_states=latent_model_input.permute(0, 2, 1, 3, 4),
-                    timestep=t_expand,
-                    guidance=None,
-                    **image_kwargs,
-                    **pos_cond_kwargs,
-                )
-        logger.info("Warmup done.")
-
     def _preprocess_sp_latents(self, batch: Req, server_args: ServerArgs):
         # 1. to shard latents (B, C, T, H, W) along dim 2
         super()._preprocess_sp_latents(batch, server_args)
@@ -134,18 +87,6 @@ class DmdDenoisingStage(DenoisingStage):
         )
 
         pos_cond_kwargs = prepared_vars["pos_cond_kwargs"]
-
-        # Warmup
-        self.warmup(
-            batch,
-            server_args,
-            latents=latents,
-            first_timestep=timesteps[0:1],
-            target_dtype=target_dtype,
-            autocast_enabled=autocast_enabled,
-            image_kwargs=image_kwargs,
-            pos_cond_kwargs=pos_cond_kwargs,
-        )
 
         denoising_loop_start_time = time.time()
         with self.progress_bar(total=len(timesteps)) as progress_bar:
