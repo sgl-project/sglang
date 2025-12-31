@@ -152,7 +152,6 @@ rsa = { version = "0.9", features = ["sha2"] }
 [[bench]]
 name = "l1_cache_benchmark.rs"
 harness = false
-path = "benches/l1_cache_benchmark.rs"
 [[bench]]
 name = "request_processing"
 harness = false
