@@ -566,6 +566,9 @@ def _try_enable_offline_mode_if_cache_complete(model_name_or_path: str, env: dic
     required files (config, tokenizer, weights). If so, it sets HF_HUB_OFFLINE=1
     in the provided env dict to avoid HF Hub network requests during server init.
 
+    Uses snapshot-level markers to cache validation results, so heavy validation
+    is done at most once per snapshot per runner.
+
     Args:
         model_name_or_path: Model identifier or path
         env: Environment dict to modify (will add HF_HUB_OFFLINE=1 if cache is complete)
@@ -577,6 +580,14 @@ def _try_enable_offline_mode_if_cache_complete(model_name_or_path: str, env: dic
         ci_validate_cache_and_enable_offline_if_complete,
     )
     from sglang.srt.utils import find_local_repo_dir
+
+    # Fast-path: If subprocess env already has HF_HUB_OFFLINE=1, skip validation
+    if env.get("HF_HUB_OFFLINE") == "1":
+        print(
+            f"CI_OFFLINE: Subprocess env already has HF_HUB_OFFLINE=1, "
+            f"skip validation - {model_name_or_path}"
+        )
+        return
 
     # Skip if already a local path
     if os.path.isdir(model_name_or_path):
@@ -652,7 +663,7 @@ def _try_enable_offline_mode_if_cache_complete(model_name_or_path: str, env: dic
         f"snapshot={snapshot_basename}, weight_files={len(weight_files)}"
     )
 
-    # Validate cache completeness
+    # Validate cache completeness (uses marker for result caching)
     try:
         cache_complete = ci_validate_cache_and_enable_offline_if_complete(
             snapshot_dir=snapshot_dir,
@@ -661,15 +672,16 @@ def _try_enable_offline_mode_if_cache_complete(model_name_or_path: str, env: dic
         )
 
         if cache_complete:
+            # IMPORTANT: Set HF_HUB_OFFLINE=1 ONLY for this subprocess, not globally
             env["HF_HUB_OFFLINE"] = "1"
             print(
-                f"CI: Enabled HF_HUB_OFFLINE for subprocess - "
+                f"CI_OFFLINE: Enabled HF_HUB_OFFLINE=1 for subprocess only - "
                 f"cache validation passed for {model_name_or_path}"
             )
         else:
             print(
-                f"CI: Cache validation failed for {model_name_or_path}, "
-                "will use online mode"
+                f"CI_OFFLINE: Cache validation failed for {model_name_or_path}, "
+                "will use online mode (allows HF to download missing files)"
             )
     except Exception as e:
         print(f"CI: Cache validation raised exception for {model_name_or_path}: {e}")

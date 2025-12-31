@@ -15,11 +15,13 @@ gated by is_in_ci() checks in weight_utils.py.
 """
 
 import glob as glob_module
+import hashlib
 import json
 import logging
 import os
 import re
 import shutil
+import tempfile
 from typing import List, Optional, Tuple
 
 import safetensors
@@ -27,6 +29,149 @@ import safetensors
 from sglang.srt.utils import log_info_on_rank0
 
 logger = logging.getLogger(__name__)
+
+# Validation marker version - increment when validation logic changes
+VALIDATION_MARKER_VERSION = "1"
+
+
+def _get_validation_marker_path(snapshot_dir: str) -> Optional[str]:
+    """
+    Get the path to validation marker file for a snapshot.
+
+    Marker is stored in /tmp to avoid permission issues with HF cache directory.
+    Marker key is sha256(snapshot_dir) to avoid any collisions regardless of
+    model_name_or_path format.
+
+    Args:
+        snapshot_dir: Path to snapshot directory
+
+    Returns:
+        Path to marker file or None if snapshot_dir is invalid
+    """
+    if not snapshot_dir or not os.path.isdir(snapshot_dir):
+        return None
+
+    # Normalize path to avoid marker misses due to trailing slashes or symlinks
+    # realpath resolves symlinks, rstrip removes trailing slashes
+    normalized_dir = os.path.realpath(snapshot_dir).rstrip("/")
+
+    # Use sha256 of normalized snapshot_dir path as unique key
+    # This avoids any collision issues with repo naming or snapshot hash reuse
+    dir_hash = hashlib.sha256(normalized_dir.encode("utf-8")).hexdigest()[:12]
+
+    # Store in /tmp with directory hash
+    return f"/tmp/sglang_hf_validation_{dir_hash}.json"
+
+
+def _read_validation_marker(snapshot_dir: str) -> Optional[dict]:
+    """
+    Read validation marker for a snapshot.
+
+    Args:
+        snapshot_dir: Path to snapshot directory
+
+    Returns:
+        Marker dict with keys: version, validated_at, validation_passed
+        None if marker doesn't exist or is invalid or validation_passed is not True
+    """
+    marker_path = _get_validation_marker_path(snapshot_dir)
+    if not marker_path:
+        return None
+
+    if not os.path.exists(marker_path):
+        return None
+
+    try:
+        with open(marker_path, "r", encoding="utf-8") as f:
+            marker = json.load(f)
+
+        # Validate marker structure
+        if not isinstance(marker, dict):
+            return None
+
+        required_keys = ["version", "validated_at", "validation_passed"]
+        if not all(key in marker for key in required_keys):
+            return None
+
+        # Check version match
+        if marker["version"] != VALIDATION_MARKER_VERSION:
+            logger.debug(
+                "Validation marker version mismatch: %s != %s, will re-validate",
+                marker["version"],
+                VALIDATION_MARKER_VERSION,
+            )
+            return None
+
+        # Explicitly check validation_passed is True (defensive check)
+        # Even though we only write markers on success, this guards against
+        # manual edits or future code changes
+        if marker.get("validation_passed") is not True:
+            logger.debug(
+                "Validation marker has validation_passed=%s, treating as invalid",
+                marker.get("validation_passed"),
+            )
+            return None
+
+        return marker
+    except (json.JSONDecodeError, OSError) as e:
+        logger.debug("Failed to read validation marker at %s: %s", marker_path, e)
+        return None
+
+
+def _write_validation_marker(snapshot_dir: str, passed: bool) -> None:
+    """
+    Write validation marker for a snapshot (atomic write).
+
+    IMPORTANT: We only cache successful validations. Failed validations are NOT
+    cached to allow retry after files are downloaded.
+
+    Args:
+        snapshot_dir: Path to snapshot directory
+        passed: Whether validation passed
+    """
+    if not passed:
+        # Don't cache failures - allow retry on next launch
+        return
+
+    marker_path = _get_validation_marker_path(snapshot_dir)
+    if not marker_path:
+        logger.debug("Cannot write marker: invalid snapshot_dir")
+        return
+
+    from datetime import datetime
+
+    marker = {
+        "version": VALIDATION_MARKER_VERSION,
+        "validated_at": datetime.utcnow().isoformat() + "Z",
+        "validation_passed": passed,
+    }
+
+    try:
+        # Atomic write: write to temp file then os.replace
+        marker_dir = os.path.dirname(marker_path)
+        os.makedirs(marker_dir, exist_ok=True)
+
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=marker_dir,
+            delete=False,
+            suffix=".tmp",
+        ) as f:
+            temp_path = f.name
+            json.dump(marker, f, indent=2)
+
+        # Atomic replace (overwrites existing file if any)
+        os.replace(temp_path, marker_path)
+        logger.debug("Wrote validation marker to %s (passed=%s)", marker_path, passed)
+    except Exception as e:
+        logger.warning("Failed to write validation marker to %s: %s", marker_path, e)
+        # Clean up temp file if it exists
+        try:
+            if "temp_path" in locals() and os.path.exists(temp_path):
+                os.remove(temp_path)
+        except Exception:
+            pass
 
 
 def _validate_json_file(file_path: str, file_name: str) -> bool:
@@ -163,16 +308,20 @@ def ci_validate_cache_and_enable_offline_if_complete(
     Validate local cache completeness (config/tokenizer/weights) and determine
     if offline mode can be safely enabled.
 
+    This function uses a snapshot-level marker to cache validation results,
+    so the heavy validation is done at most once per snapshot per runner.
+
     This function checks:
-    1. Config and tokenizer files (config.json, tokenizer_config.json, etc.)
-    2. Weight files (safetensors shards, index files, corruption check)
+    1. Validation marker (if exists and version matches, skip re-validation)
+    2. Config and tokenizer files (config.json, tokenizer_config.json, etc.)
+    3. Weight files (safetensors shards, index files, corruption check)
 
     If all are present and valid, it returns True to signal that offline
     mode can be safely enabled.
 
     IMPORTANT: This should be called BEFORE any HF operations, and if it
-    returns True, the caller should set HF_HUB_OFFLINE=1 for the entire
-    operation scope (e.g., server initialization subprocess env).
+    returns True, the caller should set HF_HUB_OFFLINE=1 for the server
+    subprocess env ONLY (not global environment).
 
     Args:
         snapshot_dir: Path to the model snapshot directory
@@ -190,6 +339,25 @@ def ci_validate_cache_and_enable_offline_if_complete(
         )
         return False
 
+    # Fast-path: Check if validation marker exists and is valid
+    # We only cache successful validations, so if marker exists, it means cache is complete
+    marker = _read_validation_marker(snapshot_dir)
+    if marker is not None:
+        marker_path = _get_validation_marker_path(snapshot_dir)
+        marker_name = os.path.basename(marker_path) if marker_path else "unknown"
+        log_info_on_rank0(
+            logger,
+            f"CI_OFFLINE: Marker hit (marker={marker_name}), skip re-validation, offline mode will be enabled - {model_name_or_path}",
+        )
+        return True
+
+    # No marker - perform full validation
+    # (Failures are not cached, so we'll retry validation each time until success)
+    log_info_on_rank0(
+        logger,
+        f"CI_OFFLINE: No marker found, performing full validation - {model_name_or_path}",
+    )
+
     # Validate config and tokenizer files
     config_valid, missing_config_files = _validate_config_and_tokenizer_files(
         snapshot_dir
@@ -198,9 +366,9 @@ def ci_validate_cache_and_enable_offline_if_complete(
     if not config_valid:
         log_info_on_rank0(
             logger,
-            f"CI_OFFLINE: Missing config/tokenizer files {missing_config_files}, "
-            f"skip offline, keep online allowed - {model_name_or_path}",
+            f"CI_OFFLINE: Missing config/tokenizer files {missing_config_files}, skip offline, keep online allowed - {model_name_or_path}",
         )
+        # Don't write marker for failures - allow retry after download
         return False
 
     # Validate weight files using existing validation from PR #15216
@@ -209,15 +377,19 @@ def ci_validate_cache_and_enable_offline_if_complete(
     if not weights_valid:
         log_info_on_rank0(
             logger,
-            f"CI_OFFLINE: Weight validation failed ({error_msg}), "
-            f"skip offline, keep online allowed - {model_name_or_path}",
+            f"CI_OFFLINE: Weight validation failed ({error_msg}), skip offline, keep online allowed - {model_name_or_path}",
         )
+        # Don't write marker for failures - allow retry after download
         return False
 
     log_info_on_rank0(
         logger,
         f"CI_OFFLINE: Cache validation PASSED, offline mode will be enabled - {model_name_or_path}",
     )
+
+    # Write marker with passed=True for future reuse
+    # (Failures are not cached, so this only happens on success)
+    _write_validation_marker(snapshot_dir, passed=True)
     return True
 
 
