@@ -1008,7 +1008,7 @@ jobs:
           python3 run_suite.py --suite per-commit-2-gpu --auto-partition-id ${{ matrix.part }} --auto-partition-size 2 $RETRY_FLAG $CONTINUE_ON_ERROR_FLAG
 
   unit-test-backend-4-gpu:
-    needs: [check-changes, call-gate, unit-test-backend-2-gpu, stage-b-test-4-gpu-b200]
+    needs: [check-changes, call-gate, unit-test-backend-1-gpu, stage-b-test-4-gpu-b200]
     if: |
       always() &&
       (
@@ -1059,7 +1059,7 @@ jobs:
           python3 run_suite.py --suite per-commit-4-gpu --auto-partition-id ${{ matrix.part }} --auto-partition-size 3 $RETRY_FLAG $CONTINUE_ON_ERROR_FLAG
 
   unit-test-backend-8-gpu-h200:
-    needs: [check-changes, call-gate, unit-test-backend-2-gpu, stage-b-test-4-gpu-b200]
+    needs: [check-changes, call-gate, unit-test-backend-1-gpu, stage-b-test-4-gpu-b200]
     if: |
       always() &&
       (
@@ -1116,7 +1116,7 @@ jobs:
           python3 run_suite.py --suite per-commit-8-gpu-h200 --auto-partition-id ${{ matrix.part }} --auto-partition-size 3 $RETRY_FLAG $CONTINUE_ON_ERROR_FLAG
 
   unit-test-backend-8-gpu-h20:
-    needs: [check-changes, call-gate, unit-test-backend-2-gpu, stage-b-test-4-gpu-b200]
+    needs: [check-changes, call-gate, unit-test-backend-1-gpu, stage-b-test-4-gpu-b200]
     if: |
       always() &&
       (
@@ -1359,7 +1359,7 @@ jobs:
           python3 -m unittest test_bench_serving.TestBenchServing.test_embeddings_api_batch_scaling
 
   performance-test-2-gpu:
-    needs: [check-changes, call-gate, unit-test-backend-2-gpu, stage-b-test-4-gpu-b200]
+    needs: [check-changes, call-gate, unit-test-backend-1-gpu, stage-b-test-4-gpu-b200]
     if: |
       always() &&
       (
@@ -1512,7 +1512,7 @@ jobs:
           python3 -m sglang.test.ci.run_with_retry test_moe_eval_accuracy_large.py
 
   unit-test-deepep-4-gpu:
-    needs: [check-changes, call-gate, unit-test-backend-2-gpu, stage-b-test-4-gpu-b200]
+    needs: [check-changes, call-gate, unit-test-backend-1-gpu, stage-b-test-4-gpu-b200]
     if: |
       always() &&
       (
@@ -1559,7 +1559,7 @@ jobs:
           python3 run_suite.py --suite per-commit-4-gpu-deepep $RETRY_FLAG $CONTINUE_ON_ERROR_FLAG
 
   unit-test-deepep-8-gpu:
-    needs: [check-changes, call-gate, unit-test-backend-2-gpu, stage-b-test-4-gpu-b200]
+    needs: [check-changes, call-gate, unit-test-backend-1-gpu, stage-b-test-4-gpu-b200]
     if: |
       always() &&
       (
@@ -1606,7 +1606,7 @@ jobs:
           python3 run_suite.py --suite per-commit-8-gpu-h200-deepep $RETRY_FLAG $CONTINUE_ON_ERROR_FLAG
 
   unit-test-backend-4-gpu-b200:
-    needs: [check-changes, call-gate, unit-test-backend-2-gpu, stage-b-test-4-gpu-b200]
+    needs: [check-changes, call-gate, unit-test-backend-1-gpu, stage-b-test-4-gpu-b200]
     if: |
       always() &&
       (
@@ -1658,7 +1658,7 @@ jobs:
           IS_BLACKWELL=1 python3 run_suite.py --suite per-commit-4-gpu-b200 --auto-partition-id ${{ matrix.part }} --auto-partition-size 3 --timeout-per-file 1800 $RETRY_FLAG $CONTINUE_ON_ERROR_FLAG
 
   unit-test-backend-4-gpu-gb200:
-    needs: [check-changes, call-gate, unit-test-backend-2-gpu, stage-b-test-4-gpu-b200, sgl-kernel-build-wheels-arm]
+    needs: [check-changes, call-gate, unit-test-backend-1-gpu, stage-b-test-4-gpu-b200, sgl-kernel-build-wheels-arm]
     if: |
       always() &&
       (
