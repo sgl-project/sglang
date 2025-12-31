@@ -4980,13 +4980,12 @@ def prepare_server_args(argv: List[str]) -> ServerArgs:
         ServerArgs.add_cli_args(parser)
 
         # Merge config file arguments with CLI arguments
-        config_merger = ConfigArgumentMerger(
-            boolean_actions=[
-                action.dest
-                for action in parser._actions
-                if isinstance(action, argparse._StoreTrueAction)
-            ]
-        )
+        store_ture_actions = [
+            action.dest
+            for action in parser._actions
+            if isinstance(action, argparse._StoreTrueAction)
+        ]
+        config_merger = ConfigArgumentMerger(store_true_actions=store_ture_actions)
         argv = config_merger.merge_config_with_args(argv)
 
     parser = argparse.ArgumentParser()

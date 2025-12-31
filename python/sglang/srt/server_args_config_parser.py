@@ -15,9 +15,9 @@ logger = logging.getLogger(__name__)
 class ConfigArgumentMerger:
     """Handles merging of configuration file arguments with command-line arguments."""
 
-    def __init__(self, boolean_actions: List[str] = None):
-        """Initialize with list of boolean action destinations."""
-        self.boolean_actions = boolean_actions or []
+    def __init__(self, store_true_actions: List[str] = None):
+        """Initialize with list of store_true action names."""
+        self.store_true_actions = store_true_actions or []
 
     def merge_config_with_args(self, cli_args: List[str]) -> List[str]:
         """
@@ -135,7 +135,7 @@ class ConfigArgumentMerger:
         Regular booleans:
             - always add --key true/false
         """
-        if key in self.boolean_actions:
+        if key in self.store_true_actions:
             if value:
                 args.append(f"--{key}")
         else:
