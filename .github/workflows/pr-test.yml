@@ -836,7 +836,7 @@ jobs:
         - name: Checkout code
           uses: actions/checkout@v4
           with:
-          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
+            ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
 
         - name: Download artifacts
           if: needs.check-changes.outputs.sgl_kernel == 'true'
