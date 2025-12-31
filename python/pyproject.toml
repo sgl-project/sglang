@@ -95,7 +95,8 @@ diffusion = [
   "vsa==0.0.4",
   "yunchang==0.6.3.post1",
   "runai_model_streamer",
-  "cache-dit==1.1.8"
+  "cache-dit==1.1.8",
+  "gdown",
 ]
 
 tracing = [
