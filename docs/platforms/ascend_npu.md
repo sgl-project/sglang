@@ -20,12 +20,8 @@ You can obtain the dependency of a specified version of CANN through an image.
 ```shell
 # for Atlas 800I A3 and Ubuntu OS
 docker pull quay.io/ascend/cann:8.3.rc2-a3-ubuntu22.04-py3.11
-# for Atlas 800I A3 and OpenEuler OS
-docker pull quay.io/ascend/cann:8.3.rc2-a3-openeuler24.03-py3.11
 # for Atlas 800I A2 and Ubuntu OS
 docker pull quay.io/ascend/cann:8.3.rc2-910b-ubuntu22.04-py3.11
-# for Atlas 800I A2 and OpenEuler OS
-docker pull quay.io/ascend/cann:8.3.rc2-910b-openeuler24.03-py3.11
 ```
 
 ## Preparing the Running Environment
