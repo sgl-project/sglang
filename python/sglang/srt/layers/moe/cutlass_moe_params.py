@@ -11,9 +11,14 @@ class CutlassMoEType(Enum):
     that are currently supported in SGLang.
     """
 
+    # Standard quantization-based modes
     BlockscaledFP8 = auto()
     BlockscaledFP4 = auto()
     W4A8 = auto()
+
+    # DeepEP distributed execution modes
+    DeepEP_LL = auto()
+    DeepEP_Normal = auto()
 
 
 @dataclass
