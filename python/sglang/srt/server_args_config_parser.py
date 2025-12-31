@@ -19,13 +19,14 @@ class ConfigArgumentMerger:
     def __init__(self, parser: argparse.ArgumentParser):
         """Initialize with list of store_true action names."""
         # NOTE: The current code does not support actions other than "store_true" and "store".
+        self.parser = parser
         self.store_true_actions = [
             action.dest
             for action in parser._actions
             if isinstance(action, argparse._StoreTrueAction)
         ]
-        self.unsupported_actions = [
-            a.dest
+        self.unsupported_actions = {
+            a.dest: a
             for a in parser._actions
             if a.option_strings
             and not isinstance(a, argparse._StoreTrueAction)
@@ -33,7 +34,7 @@ class ConfigArgumentMerger:
             and "--config" not in a.option_strings
             and "--help" not in a.option_strings
             and "-h" not in a.option_strings
-        ]
+        }
 
     def merge_config_with_args(self, cli_args: List[str]) -> List[str]:
         """
@@ -129,6 +130,11 @@ class ConfigArgumentMerger:
         args = []
 
         for key, value in config.items():
+            if key in self.unsupported_actions:
+                action = self.unsupported_actions[key]
+                raise ValueError(
+                    f"Unsupported config option '{key}' with action '{action.__class__.__name__}'"
+                )
             if isinstance(value, bool):
                 self._add_boolean_arg(args, key, value)
             elif isinstance(value, list):
