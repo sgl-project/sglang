@@ -678,7 +678,14 @@ class AscendAttnBackend(AttentionBackend):
                 )
 
             else:
-                if layer.qk_head_dim <= 128 and layer.logit_cap == 0:
+                causal = True
+                if (
+                    layer.is_cross_attention
+                    or layer.attn_type == AttentionType.ENCODER_ONLY
+                ):
+                    causal = False
+
+                if layer.qk_head_dim <= 128 and layer.logit_cap == 0 and causal:
                     """When logit_cap > 0, use torch native attention backend instead
                     cause Ascend attn ops do not support soft-capping attention currently.
                     """
@@ -714,13 +721,6 @@ class AscendAttnBackend(AttentionBackend):
 
                     q_ = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
                     o_ = attn_output.view(-1, layer.tp_q_head_num, layer.v_head_dim)
-
-                    causal = True
-                    if (
-                        layer.is_cross_attention
-                        or layer.attn_type == AttentionType.ENCODER_ONLY
-                    ):
-                        causal = False
 
                     self.native_attn._run_sdpa_forward_extend(
                         q_,
