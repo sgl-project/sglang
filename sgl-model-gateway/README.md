@@ -482,6 +482,53 @@ The HTTP router exposes the full OpenAI-compatible surface area (`/generate`, `/
 | `POST /v1/rerank`, `POST /rerank`                                                | Ranking APIs.                                              |
 | `POST /v1/classify`                                                              | Text classification endpoint.                              |
 
+### Classification API
+
+The `/v1/classify` endpoint provides text classification using sequence classification models (e.g., `Qwen2ForSequenceClassification`, `BertForSequenceClassification`).
+
+**Request:**
+```bash
+curl http://localhost:30000/v1/classify \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "jason9693/Qwen2.5-1.5B-apeach",
+    "input": "I love this product!"
+  }'
+```
+
+**Response:**
+```json
+{
+  "id": "classify-a1b2c3d4-5678-90ab-cdef-1234567890ab",
+  "object": "list",
+  "created": 1767034308,
+  "model": "jason9693/Qwen2.5-1.5B-apeach",
+  "data": [
+    {
+      "index": 0,
+      "label": "positive",
+      "probs": [0.12, 0.88],
+      "num_classes": 2
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 6,
+    "completion_tokens": 0,
+    "total_tokens": 6
+  }
+}
+```
+
+**Fields:**
+- `label`: Predicted class label (from model's `id2label` config, or `LABEL_N` fallback)
+- `probs`: Probability distribution over all classes (softmax of logits)
+- `num_classes`: Number of classification classes
+
+**Notes:**
+- Classification reuses the embedding backend—the scheduler returns logits which are converted to probabilities via softmax
+- Labels come from the model's HuggingFace config (`id2label` field); models without this mapping use generic labels (`LABEL_0`, `LABEL_1`, etc.)
+- Both HTTP and gRPC routers support classification
+
 Public health endpoints (`/liveness`, `/readiness`, `/health`, `/health_generate`) reflect registry state; readiness ensures PD workers are paired and IGW has at least one healthy route.
 
 ### Tokenization Endpoints
