@@ -1,4 +1,4 @@
-# Best Practice on Ascend Npu
+# Best Practice on Ascend NPU
 
 This section describes the best practice data of mainstream LLM models such as DeepSeek and Qwen on the Ascend Npu.If
 you encounter issues or have any questions, please [open an issue](https://github.com/sgl-project/sglang/issues).
@@ -7,55 +7,55 @@ you encounter issues or have any questions, please [open an issue](https://githu
 
 ### Low Latency
 
-| Model         | Hardware | CardNum | Deploy Mode   | Dataset   | Limit TPOT(ms) | Quantization | TTFT(s) | TPOT(ms) | Output TPS(per card) | Configuration                                             |
-|---------------|----------|---------|---------------|-----------|----------------|--------------|---------|----------|----------------------|-----------------------------------------------------------|
-| Deepseek-R1   | A3-560T  | 32      | PD Separation | 6K-1.6K   | 20             | W8A8         | 5.15    | 19.81    | 36.906               | [Optimal Configuration](#ds-r1-a3-560t-p32-6k1.6k-20ms)   |
-| Deepseek-R1   | A3-560T  | 32      | PD Separation | 3.9K-1K   | 20             | W8A8         | 2.90    | 19.77    | 35.625               | [Optimal Configuration](#ds-r1-a3-560t-p32-3.9k1k-20ms)   |
-| Deepseek-R1   | A3-560T  | 32      | PD Separation | 3.5K-1.5K | 20             | W8A8         | 2.67    | 19.92    | 36.980               | [Optimal Configuration](#ds-r1-a3-560t-p32-3.5k1.5k-20ms) |
-| Deepseek-R1   | A3-560T  | 32      | PD Separation | 3.5K-1K   | 20             | W8A8         | 2.65    | 19.52    | 36.344               | [Optimal Configuration](#ds-r1-a3-560t-p32-3.5k1k-20ms)   |
-| Deepseek-V3.2 | A3-560T  | 32      | PD Separation | 64K-1K    | 30             | W8A8         | 39.313  | 25.36    | 14.74                | [Optimal Configuration](#ds-v32-a3-560t-p32-64k1k-30ms)   |
+| Model         | Hardware | CardNum | Deploy Mode   | Dataset   | Quantization | TPOT(ms) | Output TPS(per card) | Configuration                                             |
+|---------------|----------|---------|---------------|-----------|--------------|----------|----------------------|-----------------------------------------------------------|
+| Deepseek-R1   | A3-560T  | 32      | PD Separation | 6K-1.6K   | W8A8         | 19.81    | 36.906               | [Optimal Configuration](#ds-r1-a3-560t-p32-6k1.6k-20ms)   |
+| Deepseek-R1   | A3-560T  | 32      | PD Separation | 3.9K-1K   | W8A8         | 19.77    | 35.625               | [Optimal Configuration](#ds-r1-a3-560t-p32-3.9k1k-20ms)   |
+| Deepseek-R1   | A3-560T  | 32      | PD Separation | 3.5K-1.5K | W8A8         | 19.92    | 36.980               | [Optimal Configuration](#ds-r1-a3-560t-p32-3.5k1.5k-20ms) |
+| Deepseek-R1   | A3-560T  | 32      | PD Separation | 3.5K-1K   | W8A8         | 19.52    | 36.344               | [Optimal Configuration](#ds-r1-a3-560t-p32-3.5k1k-20ms)   |
+| Deepseek-V3.2 | A3-560T  | 32      | PD Separation | 64K-1K    | W8A8         | 25.36    | 14.74                | [Optimal Configuration](#ds-v32-a3-560t-p32-64k1k-30ms)   |
 
 ### High Throughput
 
-| Model       | Hardware | CardNum | Deploy Mode   | Dataset   | Limit TPOT(ms) | Quantization | TTFT(s) | TPOT(ms) | Output TPS(per card) | Configuration                                             |
-|-------------|----------|---------|---------------|-----------|----------------|--------------|---------|----------|----------------------|-----------------------------------------------------------|
-| Deepseek-R1 | A3-560T  | 32      | PD Separation | 3.5K-1.5K | 50             | W8A8         | 10.17   | 48.10    | 396.796              | [Optimal Configuration](#ds-r1-a3-560t-p32-3.5k1.5k-50ms) |
-| Deepseek-R1 | A3-560T  | 8       | PD Mixed      | 2K-2K     | 50             | W4A8         | 10.27   | 49.67    | 528.375              | [Optimal Configuration](#ds-r1-a3-560t-p8-2k2k-50ms)      |
-| Deepseek-R1 | A3-560T  | 16      | PD Separation | 2K-2K     | 50             | W4A8         | 5.14    | 47.76    | 452.227              | [Optimal Configuration](#ds-r1-a3-560t-p16-2k2k-50ms)     |
-| Deepseek-R1 | A3-560T  | 8       | PD Mixed      | 3.5K-1K   | 50             | W4A8         | 6.79    | 49.77    | 312.077              | [Optimal Configuration](#ds-r1-a3-560t-p8-3.5k1.5k-50ms)  |
-| Deepseek-R1 | A3-560T  | 16      | PD Separation | 3.5K-1K   | 50             | W4A8         | 9.78    | 49.43    | 361.500              | [Optimal Configuration](#ds-r1-a3-560t-p16-3.5k1.5k-50ms) |
+| Model       | Hardware | CardNum | Deploy Mode   | Dataset   | Quantization | TPOT(ms) | Output TPS(per card) | Configuration                                             |
+|-------------|----------|---------|---------------|-----------|--------------|----------|----------------------|-----------------------------------------------------------|
+| Deepseek-R1 | A3-560T  | 32      | PD Separation | 3.5K-1.5K | W8A8         | 48.10    | 396.796              | [Optimal Configuration](#ds-r1-a3-560t-p32-3.5k1.5k-50ms) |
+| Deepseek-R1 | A3-560T  | 8       | PD Mixed      | 2K-2K     | W4A8         | 49.67    | 528.375              | [Optimal Configuration](#ds-r1-a3-560t-p8-2k2k-50ms)      |
+| Deepseek-R1 | A3-560T  | 16      | PD Separation | 2K-2K     | W4A8         | 47.76    | 452.227              | [Optimal Configuration](#ds-r1-a3-560t-p16-2k2k-50ms)     |
+| Deepseek-R1 | A3-560T  | 8       | PD Mixed      | 3.5K-1K   | W4A8         | 49.77    | 312.077              | [Optimal Configuration](#ds-r1-a3-560t-p8-3.5k1.5k-50ms)  |
+| Deepseek-R1 | A3-560T  | 16      | PD Separation | 3.5K-1K   | W4A8         | 49.43    | 361.500              | [Optimal Configuration](#ds-r1-a3-560t-p16-3.5k1.5k-50ms) |
 
 ## Qwen Series Models
 
 ### Low Latency
 
-| Model      | Hardware | CardNum | Deploy Mode | Dataset | Limit TPOT(ms) | Quantization | TTFT(s) | TPOT(ms) | Output TPS(per card) | Configuration                                               |
-|------------|----------|---------|-------------|---------|----------------|--------------|---------|----------|----------------------|-------------------------------------------------------------|
-| Qwen3-235B | A3-560T  | 8       | PD Mixed    | 11K-1K  | 10             | BF16         | 0.97    | 9.70     | 11.690               | [Optimal Configuration](#qwen3-235b-a3-560t-p8-11k1k-10ms)  |
-| Qwen3-32B  | A3-560T  | 4       | PD Mixed    | 6K-1.5K | 18             | W8A8         | 8.90    | 16.87    | 311.750              | [Optimal Configuration](#qwen3-32b-a3-560t-p4-6k1.5k-18ms)  |
-| Qwen3-32B  | A3-560T  | 4       | PD Mixed    | 4K-1.5K | 11             | BF16         | 0.317   | 9.46     | 25.850               | [Optimal Configuration](#qwen3-32b-a3-560t-p4-4k1.5k-11ms)  |
-| Qwen3-32B  | A3-560T  | 8       | PD Mixed    | 18K-4K  | 12             | BF16         | 1.13    | 12.27    | 9.955                | [Optimal Configuration](#qwen3-32b-a3-560t-p8-18k4k-12ms)   |
-| Qwen3-32B  | A2-910B2 | 8       | PD Mixed    | 6K-1.5K | 18             | W8A8         | 11.54   | 16.46    | 296                  | [Optimal Configuration](#qwen3-32b-a2-910b2-p8-6k1.5k-18ms) |
-| Qwen3-32B  | A2-910B2 | 8       | PD Mixed    | 4K-1.5K | 11             | BF16         | 0.312   | 10.18    | 12                   | [Optimal Configuration](#qwen3-32b-a2-910b2-p8-4k1.5k-11ms) |
+| Model      | Hardware | CardNum | Deploy Mode | Dataset | Quantization | TPOT(ms) | Output TPS(per card) | Configuration                                               |
+|------------|----------|---------|-------------|---------|--------------|----------|----------------------|-------------------------------------------------------------|
+| Qwen3-235B | A3-560T  | 8       | PD Mixed    | 11K-1K  | BF16         | 9.70     | 11.690               | [Optimal Configuration](#qwen3-235b-a3-560t-p8-11k1k-10ms)  |
+| Qwen3-32B  | A3-560T  | 4       | PD Mixed    | 6K-1.5K | W8A8         | 16.87    | 311.750              | [Optimal Configuration](#qwen3-32b-a3-560t-p4-6k1.5k-18ms)  |
+| Qwen3-32B  | A3-560T  | 4       | PD Mixed    | 4K-1.5K | BF16         | 9.46     | 25.850               | [Optimal Configuration](#qwen3-32b-a3-560t-p4-4k1.5k-11ms)  |
+| Qwen3-32B  | A3-560T  | 8       | PD Mixed    | 18K-4K  | BF16         | 12.27    | 9.955                | [Optimal Configuration](#qwen3-32b-a3-560t-p8-18k4k-12ms)   |
+| Qwen3-32B  | A2-910B2 | 8       | PD Mixed    | 6K-1.5K | W8A8         | 16.46    | 296                  | [Optimal Configuration](#qwen3-32b-a2-910b2-p8-6k1.5k-18ms) |
+| Qwen3-32B  | A2-910B2 | 8       | PD Mixed    | 4K-1.5K | BF16         | 10.18    | 12                   | [Optimal Configuration](#qwen3-32b-a2-910b2-p8-4k1.5k-11ms) |
 
 ### High Throughput
 
-| Model      | Hardware | CardNum | Deploy Mode   | Dataset   | Limit TPOT(ms) | Quantization | TTFT(s) | TPOT(ms) | Output TPS(per card) | Configuration                                                  |
-|------------|----------|---------|---------------|-----------|----------------|--------------|---------|----------|----------------------|----------------------------------------------------------------|
-| Qwen3-235B | A3-560T  | 24      | PD Separation | 3.5K-1.5K | 50             | W8A8         | 26.90   | 40.75    | 467.416              | [Optimal Configuration](#qwen3-235b-a3-560t-p24-3.5k1.5k-50ms) |
-| Qwen3-235B | A3-560T  | 8       | PD Mixed      | 3.5K-1.5K | 50             | W8A8         | 16.70   | 51.51    | 477.625              | [Optimal Configuration](#qwen3-235b-a3-560t-p8-3.5k1.5k-50ms)  |
-| Qwen3-235B | A3-560T  | 8       | PD Mixed      | 2K-2K     | 100            | W8A8         | 4.04    | 54.78    | 790.071              | [Optimal Configuration](#qwen3-235b-a3-560t-p8-2k2k-100ms)     |
-| Qwen3-235B | A3-560T  | 8       | PD Mixed      | 2K-2K     | 50             | W8A8         | 4.45    | 48.19    | 737.995              | [Optimal Configuration](#qwen3-235b-a3-560t-p8-2k2k-50ms)      |
-| Qwen3-235B | A3-560T  | 16      | PD Mixed      | 2K-2K     | 50             | W8A8         | 27.8    | 50.12    | 519.625              | [Optimal Configuration](#qwen3-235b-a3-560t-p16-2k2k-50ms)     |
-| Qwen3-32B  | A3-560T  | 2       | PD Mixed      | 3.5K-1.5K | 50             | W8A8         | 5.37    | 49.20    | 707.500              | [Optimal Configuration](#qwen3-32b-a3-560t-p2-3.5k1.5k-50ms)   |
-| Qwen3-32B  | A3-560T  | 2       | PD Mixed      | 2K-2K     | 50             | W8A8         | 16.10   | 48.30    | 986.150              | [Optimal Configuration](#qwen3-32b-a3-560t-p2-2k2k-50ms)       |
-| Qwen3-30B  | A3-560T  | 1       | PD Mixed      | 3.5K-1.5K | 50             | W8A8         | 4.02    | 44.35    | 3166.030             | [Optimal Configuration](#qwen3-30b-a3-560t-p1-3.5k1.5k-50ms)   |
-| Qwen3-480B | A3-560T  | 24      | PD Separation | 3.5K-1.5K | 50             | W8A8         | 4.40    | 48.27    | 266.250              | [Optimal Configuration](#qwen3-480b-a3-560t-p24-3.5k1.5k-50ms) |
-| Qwen3-480B | A3-560T  | 16      | PD Mixed      | 3.5K-1.5K | 50             | W8A8         | 15.40   | 50.34    | 289.813              | [Optimal Configuration](#qwen3-480b-a3-560t-p16-3.5k1.5k-50ms) |
-| Qwen3-480B | A3-560T  | 8       | PD Mixed      | 3.5K-1.5K | 50             | W8A8         | 6.60    | 48.20    | 187.500              | [Optimal Configuration](#qwen3-480b-a3-560t-p8-3.5k1.5k-50ms)  |
-| Qwen3-Next | A3-560T  | 2       | PD Mixed      | 3.5K-1.5K | 50             | W8A8         | 10.68   | 49.91    | 702.83               | [Optimal Configuration](#qwen3-next-a3-560t-p2-3.5k1.5k-50ms)  |                                                         |
-| Qwen3-32B  | A2-910B  | 8       | PD Mixed      | 3.5K-1.5K | 50             | W8A8         | 5.79    | 48.97    | 348.75               | [Optimal Configuration](#qwen3-32b-a2-910b2-p8-3.5k1.5k-50ms)  |
-| Qwen3-32B  | A2-910B  | 8       | PD Mixed      | 2K-2K     | 50             | W8A8         | 17.09   | 45.88    | 512                  | [Optimal Configuration](#qwen3-32b-a2-910b2-p8-2k2k-50ms)      |
+| Model      | Hardware | CardNum | Deploy Mode   | Dataset   | Quantization | TPOT(ms) | Output TPS(per card) | Configuration                                                  |
+|------------|----------|---------|---------------|-----------|--------------|----------|----------------------|----------------------------------------------------------------|
+| Qwen3-235B | A3-560T  | 24      | PD Separation | 3.5K-1.5K | W8A8         | 40.75    | 467.416              | [Optimal Configuration](#qwen3-235b-a3-560t-p24-3.5k1.5k-50ms) |
+| Qwen3-235B | A3-560T  | 8       | PD Mixed      | 3.5K-1.5K | W8A8         | 51.51    | 477.625              | [Optimal Configuration](#qwen3-235b-a3-560t-p8-3.5k1.5k-50ms)  |
+| Qwen3-235B | A3-560T  | 8       | PD Mixed      | 2K-2K     | W8A8         | 54.78    | 790.071              | [Optimal Configuration](#qwen3-235b-a3-560t-p8-2k2k-100ms)     |
+| Qwen3-235B | A3-560T  | 8       | PD Mixed      | 2K-2K     | W8A8         | 48.19    | 737.995              | [Optimal Configuration](#qwen3-235b-a3-560t-p8-2k2k-50ms)      |
+| Qwen3-235B | A3-560T  | 16      | PD Mixed      | 2K-2K     | W8A8         | 50.12    | 519.625              | [Optimal Configuration](#qwen3-235b-a3-560t-p16-2k2k-50ms)     |
+| Qwen3-32B  | A3-560T  | 2       | PD Mixed      | 3.5K-1.5K | W8A8         | 49.20    | 707.500              | [Optimal Configuration](#qwen3-32b-a3-560t-p2-3.5k1.5k-50ms)   |
+| Qwen3-32B  | A3-560T  | 2       | PD Mixed      | 2K-2K     | W8A8         | 48.30    | 986.150              | [Optimal Configuration](#qwen3-32b-a3-560t-p2-2k2k-50ms)       |
+| Qwen3-30B  | A3-560T  | 1       | PD Mixed      | 3.5K-1.5K | W8A8         | 44.35    | 3166.030             | [Optimal Configuration](#qwen3-30b-a3-560t-p1-3.5k1.5k-50ms)   |
+| Qwen3-480B | A3-560T  | 24      | PD Separation | 3.5K-1.5K | W8A8         | 48.27    | 266.250              | [Optimal Configuration](#qwen3-480b-a3-560t-p24-3.5k1.5k-50ms) |
+| Qwen3-480B | A3-560T  | 16      | PD Mixed      | 3.5K-1.5K | W8A8         | 50.34    | 289.813              | [Optimal Configuration](#qwen3-480b-a3-560t-p16-3.5k1.5k-50ms) |
+| Qwen3-480B | A3-560T  | 8       | PD Mixed      | 3.5K-1.5K | W8A8         | 48.20    | 187.500              | [Optimal Configuration](#qwen3-480b-a3-560t-p8-3.5k1.5k-50ms)  |
+| Qwen3-Next | A3-560T  | 2       | PD Mixed      | 3.5K-1.5K | W8A8         | 49.91    | 702.83               | [Optimal Configuration](#qwen3-next-a3-560t-p2-3.5k1.5k-50ms)  |                                                         |
+| Qwen3-32B  | A2-910B  | 8       | PD Mixed      | 3.5K-1.5K | W8A8         | 48.97    | 348.75               | [Optimal Configuration](#qwen3-32b-a2-910b2-p8-3.5k1.5k-50ms)  |
+| Qwen3-32B  | A2-910B  | 8       | PD Mixed      | 2K-2K     | W8A8         | 45.88    | 512                  | [Optimal Configuration](#qwen3-32b-a2-910b2-p8-2k2k-50ms)      |
 
 ## Optimal Configuration
 
