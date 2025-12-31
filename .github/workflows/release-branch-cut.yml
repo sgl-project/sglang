@@ -120,6 +120,46 @@ jobs:
           echo "2. Apply any hotfixes if needed" >> $GITHUB_STEP_SUMMARY
           echo "3. Create a tag to trigger release: \`gh workflow run release-tag.yml -f version=X.Y.Z -f ref=$BRANCH_NAME\`" >> $GITHUB_STEP_SUMMARY
 
+  run-pr-tests-nvidia:
+    needs: cut-release-branch
+    uses: ./.github/workflows/pr-test.yml
+    with:
+      ref: ${{ needs.cut-release-branch.outputs.branch_name }}
+      run_all_tests: true
+    secrets: inherit
+
+  run-pr-tests-amd:
+    needs: cut-release-branch
+    uses: ./.github/workflows/pr-test-amd.yml
+    with:
+      ref: ${{ needs.cut-release-branch.outputs.branch_name }}
+      run_all_tests: true
+    secrets: inherit
+
+  run-pr-test-npu:
+    needs: cut-release-branch
+    uses: ./.github/workflows/pr-test-npu.yml
+    with:
+      ref: ${{ needs.cut-release-branch.outputs.branch_name }}
+      run_all_tests: true
+    secrets: inherit
+
+  run-pr-tests-xeon:
+    needs: cut-release-branch
+    uses: ./.github/workflows/pr-test-xeon.yml
+    with:
+      ref: ${{ needs.cut-release-branch.outputs.branch_name }}
+      run_all_tests: true
+    secrets: inherit
+
+  run-pr-tests-xpu:
+    needs: cut-release-branch
+    uses: ./.github/workflows/pr-test-xpu.yml
+    with:
+      ref: ${{ needs.cut-release-branch.outputs.branch_name }}
+      run_all_tests: true
+    secrets: inherit
+
   run-nightly-tests-nvidia:
     needs: cut-release-branch
     uses: ./.github/workflows/nightly-test-nvidia.yml
@@ -141,16 +181,9 @@ jobs:
       ref: ${{ needs.cut-release-branch.outputs.branch_name }}
     secrets: inherit
 
-  run-pr-tests-xeon:
+  run-nightly-tests-intel:
     needs: cut-release-branch
-    uses: ./.github/workflows/pr-test-xeon.yml
-    with:
-      ref: ${{ needs.cut-release-branch.outputs.branch_name }}
-    secrets: inherit
-
-  run-pr-tests-xpu:
-    needs: cut-release-branch
-    uses: ./.github/workflows/pr-test-xpu.yml
+    uses: ./.github/workflows/nightly-test-intel.yml
     with:
       ref: ${{ needs.cut-release-branch.outputs.branch_name }}
     secrets: inherit

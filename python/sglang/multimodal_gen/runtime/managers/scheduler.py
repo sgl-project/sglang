@@ -49,7 +49,7 @@ class Scheduler:
 
         # Inter-process Communication
         self.context = zmq.Context(io_threads=2)
-        endpoint = server_args.scheduler_endpoint()
+        endpoint = server_args.scheduler_endpoint
         if gpu_id == 0:
             # router allocates identify (envelope) for each connection
             self.receiver, actual_endpoint = get_zmq_socket(
