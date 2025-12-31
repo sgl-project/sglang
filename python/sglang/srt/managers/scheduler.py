@@ -2369,8 +2369,10 @@ class Scheduler(
 
         if self.server_args.enable_dp_attention:
             tp_size = self.attn_tp_size
+            tp_group = self.attn_tp_cpu_group
         else:
             tp_size = self.tp_size
+            tp_group = self.tp_cpu_group
 
         # Count how many requests have ready grammars (non-blocking check).
         # For TP>1, only rank 0 actually checks Future completion; others just count.
@@ -2405,13 +2407,6 @@ class Scheduler(
                 if req.grammar_wait_ct > GRAMMAR_TIMEOUT / 0.03:
                     num_timeout_reqs = 1
                 break
-
-        if self.server_args.enable_dp_attention:
-            tp_size = self.attn_tp_size
-            tp_group = self.attn_tp_cpu_group
-        else:
-            tp_size = self.tp_size
-            tp_group = self.tp_cpu_group
 
         if tp_size > 1:
             # Rank 0 broadcasts its ready/timeout counts to all ranks
