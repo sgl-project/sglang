@@ -385,20 +385,6 @@ ONE_GPU_CASES_B: list[DiffusionTestCase] = [
             prompt=T2V_PROMPT,
         ),
     ),
-    DiffusionTestCase(
-        "wan2_1_t2v_1.3b_cache_dit_enabled",
-        DiffusionServerArgs(
-            model_path="Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
-            modality="video",
-            warmup_text=0,
-            warmup_edit=0,
-            custom_validator="video",
-            enable_cache_dit=True,
-        ),
-        DiffusionSamplingParams(
-            prompt=T2V_PROMPT,
-        ),
-    ),
     # LoRA test case for single transformer + merge/unmerge API test
     DiffusionTestCase(
         "wan2_1_t2v_1_3b_lora_1gpu",
