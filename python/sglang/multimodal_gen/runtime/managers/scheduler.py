@@ -233,10 +233,9 @@ class Scheduler:
                 if handler:
                     output_batch = handler(reqs)
                 else:
-                    output_batch = {
-                        "status": "error",
-                        "message": f"Unknown request type: {type(processed_req)}",
-                    }
+                    output_batch = OutputBatch(
+                        error=f"Unknown request type: {type(processed_req)}"
+                    )
             except Exception as e:
                 logger.error(
                     f"Error executing request in scheduler event loop: {e}",
