@@ -359,6 +359,12 @@ class RouterArgs:
             default=RouterArgs.worker_startup_check_interval,
             help="Interval in seconds between checks for worker startup",
         )
+        pd_group.add_argument(
+            f"--{prefix}worker-load-check-interval",
+            type=int,
+            default=RouterArgs.worker_load_check_interval,
+            help="Interval in seconds between checks for worker load",
+        )
 
         # Logging configuration
         logging_group.add_argument(

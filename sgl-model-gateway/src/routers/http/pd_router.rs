@@ -1470,6 +1470,7 @@ mod tests {
         PDRouter {
             worker_registry,
             policy_registry,
+            worker_load_manager: None,
             client: Client::new(),
             retry_config: RetryConfig::default(),
             api_key: Some("test_api_key".to_string()),
