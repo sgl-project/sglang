@@ -419,6 +419,19 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
                 // Update the tree with this request (use worker URL directly, no allocation)
                 tree.insert(text, workers[idx].url());
 
+                // Sync insert operation to mesh if enabled (no-op if mesh is not enabled)
+                if let Some(ref mesh_sync) = self.mesh_sync {
+                    use crate::mesh::tree_ops::TreeInsertOp;
+                    let op = TreeOperation::Insert(TreeInsertOp {
+                        text: text.to_string(),
+                        tenant: workers[idx].url().to_string(),
+                    });
+                    let mesh_model_id = Self::normalize_mesh_model_id(model_id);
+                    if let Err(e) = mesh_sync.sync_tree_operation(mesh_model_id.to_string(), op) {
+                        warn!("Failed to sync tree insert operation to mesh: {}", e);
+                    }
+                }
+
                 // Increment processed counter
                 workers[idx].increment_processed();
 
