@@ -69,9 +69,9 @@ impl UpdatePoliciesStep {
             if let Some(dp_size) = pl.get("dp_size").and_then(|s| s.parse::<usize>().ok()) {
                 if dp_size > 1 {
                     let plb = pl.get("load_balance_method").map(|s| s.as_str());
-                    if plb != Some("round_robin") {
+                    if plb != Some("follow_bootstrap_room") {
                         warn!(
-                            "Model {} has dp_size > 1 but load_balance_method is not 'round_robin' on prefill workers. This may cause rank mismatch in disaggregated mode.",
+                            "Model {} has dp_size > 1 but load_balance_method is not 'follow_bootstrap_room' on prefill workers. This may cause rank mismatch in disaggregated mode.",
                             model_id
                         );
                     }
