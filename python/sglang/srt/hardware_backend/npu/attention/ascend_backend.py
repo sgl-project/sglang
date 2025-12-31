@@ -22,6 +22,7 @@ from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.speculative.spec_info import SpecInput
+from sglang.srt.environ import envs
 from sglang.srt.utils import get_bool_env_var
 
 if TYPE_CHECKING:
@@ -1098,9 +1099,42 @@ class AscendAttnBackend(AttentionBackend):
             return attn_out
 
         if not self.use_mla:
-            num_tokens = q.shape[0]
-            """PA will support bs<tp in the later version of CANN"""
-            if num_tokens < get_attention_tp_size():
+            if envs.SGLANG_USE_PAGED_ATTENTION.get():
+                k_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
+                v_cache = forward_batch.token_to_kv_pool.get_value_buffer(
+                    layer.layer_id
+                )
+                query = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
+                num_tokens = query.shape[0]
+                attn_output = torch.empty(
+                    (num_tokens, layer.tp_q_head_num, layer.v_head_dim),
+                    dtype=query.dtype,
+                    device=query.device,
+                )
+                if self.forward_metadata.seq_lens_cpu_int is None:
+                    actual_seq_len_kv = torch.from_numpy(
+                        np.array(self.forward_metadata.seq_lens_cpu_list).astype(
+                            np.int32
+                        )
+                    )
+                else:
+                    actual_seq_len_kv = self.forward_metadata.seq_lens_cpu_int
+
+                torch_npu._npu_paged_attention(
+                    query=query,
+                    key_cache=k_cache,
+                    value_cache=v_cache,
+                    num_heads=layer.tp_q_head_num,
+                    num_kv_heads=layer.tp_k_head_num,
+                    scale_value=layer.scaling,
+                    block_table=self.forward_metadata.block_tables,
+                    context_lens=actual_seq_len_kv,
+                    out=attn_output,
+                )
+                return attn_output.view(
+                    num_tokens, layer.tp_q_head_num * layer.v_head_dim
+                )
+            else:
                 k_cache = forward_batch.token_to_kv_pool.get_key_buffer(
                     layer.layer_id
                 ).view(-1, self.page_size, layer.tp_k_head_num * layer.qk_head_dim)
@@ -1150,41 +1184,6 @@ class AscendAttnBackend(AttentionBackend):
                     out=[output, softmax_lse],
                 )
                 return output.view(num_tokens, layer.tp_q_head_num * layer.v_head_dim)
-            else:
-                k_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
-                v_cache = forward_batch.token_to_kv_pool.get_value_buffer(
-                    layer.layer_id
-                )
-                query = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
-                num_tokens = query.shape[0]
-                attn_output = torch.empty(
-                    (num_tokens, layer.tp_q_head_num, layer.v_head_dim),
-                    dtype=query.dtype,
-                    device=query.device,
-                )
-                if self.forward_metadata.seq_lens_cpu_int is None:
-                    actual_seq_len_kv = torch.from_numpy(
-                        np.array(self.forward_metadata.seq_lens_cpu_list).astype(
-                            np.int32
-                        )
-                    )
-                else:
-                    actual_seq_len_kv = self.forward_metadata.seq_lens_cpu_int
-
-                torch_npu._npu_paged_attention(
-                    query=query,
-                    key_cache=k_cache,
-                    value_cache=v_cache,
-                    num_heads=layer.tp_q_head_num,
-                    num_kv_heads=layer.tp_k_head_num,
-                    scale_value=layer.scaling,
-                    block_table=self.forward_metadata.block_tables,
-                    context_lens=actual_seq_len_kv,
-                    out=attn_output,
-                )
-                return attn_output.view(
-                    num_tokens, layer.tp_q_head_num * layer.v_head_dim
-                )
         else:
             c_kv, k_rope = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
             if is_fia_nz():
