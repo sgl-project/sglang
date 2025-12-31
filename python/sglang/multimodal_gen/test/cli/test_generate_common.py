@@ -7,6 +7,7 @@ import dataclasses
 import os
 import shlex
 import subprocess
+import sys
 import unittest
 from typing import Optional
 
@@ -30,19 +31,19 @@ def run_command(command) -> Optional[float]:
     """Runs a command and returns the execution time and status."""
     print(f"Running command: {shlex.join(command)}")
 
-    process = subprocess.Popen(
+    with subprocess.Popen(
         command,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
         encoding="utf-8",
-    )
-
-    if process.returncode == 0:
-        return True
-    else:
+    ) as process:
+        for line in process.stdout:
+            sys.stdout.write(line)
+        if process.returncode == 0:
+            return True
         print(f"Command failed with exit code {process.returncode}")
-        return False
+    return False
 
 
 class CLIBase(unittest.TestCase):
