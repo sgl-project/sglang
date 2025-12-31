@@ -87,6 +87,7 @@ class Scheduler:
 
     def _handle_set_lora(self, reqs: List[Any]) -> OutputBatch:
         # TODO: return set status
+        # TODO: return with SetLoRAResponse or something more appropriate
         req = reqs[0]
         return self.worker.set_lora(
             req.lora_nickname, req.lora_path, req.target, req.strength
@@ -245,7 +246,7 @@ class Scheduler:
                 output_batch = (
                     OutputBatch(error=str(e))
                     if reqs and isinstance(reqs[0], Req)
-                    else {"status": "error", "message": str(e)}
+                    else OutputBatch(error=str(e))
                 )
 
             # 3. return results
@@ -278,16 +279,6 @@ class Scheduler:
         task = {"method": method, "kwargs": kwargs}
         for pipe in self.task_pipes_to_slaves:
             pipe.send(task)
-
-    def _execute_on_rank0(self, payload: dict[str, Any]) -> dict[str, Any]:
-        """Execute task locally on the rank 0 worker."""
-        method = payload["method"]
-        kwargs = {k: v for k, v in payload.items() if k != "method"}
-        handler = getattr(self.worker, method, None)
-        if handler:
-            result = handler(**kwargs)
-            return {"status": "ok", "result": result}
-        return {"status": "error", "error": f"Unknown method: {method}"}
 
     def _collect_slave_results(self) -> List[dict[str, Any]]:
         """Collect results from all slave worker processes."""
