@@ -31,6 +31,8 @@ from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBa
 from sglang.multimodal_gen.runtime.scheduler_client import sync_scheduler_client
 from sglang.multimodal_gen.runtime.server_args import PortArgs, ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
+    GREEN,
+    RESET,
     init_logger,
     log_batch_completion,
     log_generation_timer,
@@ -269,7 +271,7 @@ class DiffGenerator:
             if self.server_args.enable_warmup:
                 total_duration_ms = results[0]["timings"]["total_duration_ms"]
                 logger.info(
-                    f"Warmup request processed in %.2f seconds (with warmup excluded)",
+                    f"Warmed-up request processed in {GREEN}%.2f{RESET} seconds (with warmup excluded)",
                     total_duration_ms / 1000.0,
                 )
 

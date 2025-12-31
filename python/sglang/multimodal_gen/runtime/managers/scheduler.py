@@ -23,7 +23,7 @@ from sglang.multimodal_gen.runtime.server_args import (
 )
 from sglang.multimodal_gen.runtime.utils.common import get_zmq_socket
 from sglang.multimodal_gen.runtime.utils.distributed import broadcast_pyobj
-from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.logging_utils import GREEN, RESET, init_logger
 
 logger = init_logger(__name__)
 
@@ -256,7 +256,7 @@ class Scheduler:
                 )
                 if is_warmup:
                     logger.info(
-                        "Server warmup done in %.2f seconds",
+                        f"Server warmup done in {GREEN}%.2f{RESET} seconds",
                         output_batch.timings.total_duration_s,
                     )
 
