@@ -23,6 +23,7 @@ pub mod steps;
 pub mod token_bucket;
 pub mod worker;
 pub mod worker_builder;
+pub mod worker_load;
 pub mod worker_manager;
 pub mod worker_registry;
 pub mod worker_service;
@@ -40,6 +41,7 @@ pub use worker::{
     HealthChecker, HealthConfig, RuntimeType, Worker, WorkerFactory, WorkerLoadGuard, WorkerType,
 };
 pub use worker_builder::{BasicWorkerBuilder, DPAwareWorkerBuilder};
+pub use worker_load::WorkerLoadManager;
 pub use worker_manager::{LoadMonitor, WorkerManager};
 pub use worker_registry::{HashRing, WorkerId, WorkerRegistry, WorkerRegistryStats};
 pub use worker_service::{WorkerService, WorkerServiceError};
