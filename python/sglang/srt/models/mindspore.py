@@ -263,11 +263,14 @@ class MindSporeForCausalLM(torch.nn.Module):
 
         is_prefill = self.get_is_prefill(forward_batch)
         batch_valid_length = forward_batch.seq_lens.cpu().numpy()
-
+        if forward_batch.forward_mode.is_target_verify():
+            batch_valid_length += forward_batch.spec_info.num_tokens_per_batch
         if forward_batch.extend_seq_lens is not None:
             q_seq_lens = forward_batch.extend_seq_lens.cpu().numpy()
         else:
             q_seq_lens = np.ones([forward_batch.batch_size], dtype=np.int32)
+            if forward_batch.forward_mode.is_target_verify():
+                q_seq_lens = q_seq_lens * forward_batch.spec_info.num_tokens_per_batch
 
         page_size = forward_batch.token_to_kv_pool.page_size
         block_tables = tensor_torch2ms(
