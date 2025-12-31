@@ -72,7 +72,7 @@ class LoadBalanceMethod(Enum):
     """Load balance method."""
 
     ROUND_ROBIN = auto()
-    DECODE_ROUND_ROBIN = auto()
+    FOLLOW_BOOTSTRAP_ROOM = auto()
     SHORTEST_QUEUE = auto()
     MINIMUM_TOKENS = auto()
 
@@ -177,7 +177,7 @@ class DataParallelController:
         self.round_robin_counter = 0
         dispatch_lookup = {
             LoadBalanceMethod.ROUND_ROBIN: self.round_robin_scheduler,
-            LoadBalanceMethod.DECODE_ROUND_ROBIN: self.decode_round_robin_scheduler,
+            LoadBalanceMethod.FOLLOW_BOOTSTRAP_ROOM: self.follow_bootstrap_room_scheduler,
             LoadBalanceMethod.SHORTEST_QUEUE: self.shortest_queue_scheduler,
             LoadBalanceMethod.MINIMUM_TOKENS: self.minimum_tokens_scheduler,
         }
@@ -512,47 +512,40 @@ class DataParallelController:
     def round_robin_scheduler(self, req: Req):
         if self.maybe_external_dp_rank_routing(req):
             return
-        msg = [b"NORM", pickle.dumps(req)]
-        if self.server_args.disaggregation_mode == "null":
-            self.workers[self.round_robin_counter].send_multipart(msg, copy=False)
-            self.round_robin_counter = (self.round_robin_counter + 1) % len(
-                self.workers
-            )
-        else:
-            # Set default bootstrap_room if in FAKE auto mode and room is None
-            if (
-                req.bootstrap_room is None
-                and self.server_args.disaggregation_decode_enable_fake_auto
-            ):
-                req.bootstrap_room = self.round_robin_counter
-                self.round_robin_counter = (self.round_robin_counter + 1) % len(
-                    self.workers
-                )
 
-            assert (
-                req.bootstrap_room is not None
-            ), "req.bootstrap_room should not be None. Do not send requests directly to prefill or decode instances, but send to the router instead."
-            target_rank = req.bootstrap_room % len(self.workers)
-            self.workers[target_rank].send_multipart(msg, copy=False)
+        self.workers[self.round_robin_counter].send_pyobj(req)
+        self.round_robin_counter = (self.round_robin_counter + 1) % len(self.workers)
 
-    def decode_round_robin_scheduler(self, req: Req):
+    def follow_bootstrap_room_scheduler(self, req: Req):
         if self.maybe_external_dp_rank_routing(req):
             return
 
-        if self.server_args.disaggregation_mode == "decode":
-            self.workers[self.round_robin_counter].send_pyobj(req)
+        # Set default bootstrap_room if in FAKE auto mode and room is None
+        if (
+            req.bootstrap_room is None
+            and self.server_args.disaggregation_decode_enable_fake_auto
+        ):
+            req.bootstrap_room = self.round_robin_counter
             self.round_robin_counter = (self.round_robin_counter + 1) % len(
                 self.workers
             )
-            return
-        self.round_robin_scheduler(req)
+
+        assert req.bootstrap_room is not None, (
+            "req.bootstrap_room should not be None. Do not send requests directly to "
+            "prefill or decode instances; send to the router instead."
+        )
+        target_rank = req.bootstrap_room % len(self.workers)
+        self.workers[target_rank].send_pyobj(req)
 
     def shortest_queue_scheduler(self, req):
         if self.maybe_external_dp_rank_routing(req):
             return
         target_worker = self.dp_budget.dispatch()
         if target_worker is None:
-            self.round_robin_scheduler(req)
+            if self.server_args.disaggregation_mode == "null":
+                self.round_robin_scheduler(req)
+            else:
+                self.follow_bootstrap_room_scheduler(req)
         else:
             msg = [b"NORM", pickle.dumps(req)]
             self.workers[target_worker].send_multipart(msg, copy=False)
@@ -565,7 +558,45 @@ class DataParallelController:
             "The 'minimum_tokens' load balancing method is deprecated for now and will introduced later."
             "Fall back to 'round_robin_scheduler'"
         )
-        self.round_robin_scheduler(req)
+        if self.server_args.disaggregation_mode ==  "null":
+            self.round_robin_scheduler(req)
+        else:
+            self.follow_bootstrap_room_scheduler(req)
+
+    def _parse_multipart_message(self, parts):
+        # Check message type
+        msg_type = bytes(parts[0])
+
+        if msg_type == b"NORM":
+            # Normal message
+            recv_req = pickle.loads(parts[1])
+
+        elif msg_type == b"FEAT":
+            # Message with optimized feature tensors
+            recv_req = pickle.loads(parts[1])
+            feature_infos = pickle.loads(parts[2])
+
+            # Reconstruct tensors
+            for i, feature_info in enumerate(feature_infos):
+                buffer_idx = 3 + i
+                buffer = (
+                    parts[buffer_idx].buffer
+                    if hasattr(parts[buffer_idx], "buffer")
+                    else parts[buffer_idx]
+                )
+
+                dtype = feature_info["dtype"]
+                shape = feature_info["shape"]
+                tensor = torch.frombuffer(buffer, dtype=dtype).reshape(shape)
+
+                idx = feature_info["idx"]
+                if hasattr(recv_req, "mm_inputs") and recv_req.mm_inputs:
+                    mm_items = recv_req.mm_inputs.get("mm_items", [])
+                    if idx < len(mm_items):
+                        mm_items[idx].feature = tensor
+        else:
+            logger.warning(f"Unknown message type: {msg_type}")
+        return recv_req
 
     def _parse_multipart_message(self, parts):
         # Check message type

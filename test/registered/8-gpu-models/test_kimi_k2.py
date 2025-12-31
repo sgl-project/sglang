@@ -35,6 +35,7 @@ class TestKimiK2Unified(unittest.TestCase):
                 KIMI_K2_THINKING_MODEL_PATH,
                 tp_size=8,
                 extra_args=base_args,
+                variant="TP8",
             ),
         ]
 

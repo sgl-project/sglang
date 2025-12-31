@@ -466,7 +466,7 @@ class Scheduler(
         # This must be called after initialize_moe_config
         self.require_mlp_sync = require_mlp_sync(self.server_args)
 
-    def init_model_worker(self):
+    def init_tp_model_worker(self):
         from sglang.srt.managers.tp_worker import TpModelWorker
 
         self.tp_worker = TpModelWorker(
@@ -479,6 +479,7 @@ class Scheduler(
             nccl_port=self.nccl_port,
         )
 
+    def init_draft_worker(self):
         # Launch a draft worker for speculative decoding
         draft_worker_kwargs = dict(
             server_args=self.server_args,
@@ -497,11 +498,6 @@ class Scheduler(
             logger.info(
                 f"Using draft model load_format: '{self.server_args.speculative_draft_load_format}'"
             )
-
-        # Draft workers are looked up via `SpeculativeAlgorithm` registry; new
-        # algorithms should register their factory instead of patching this code.
-        if self.spec_algorithm.is_eagle():
-            draft_worker_kwargs["enable_overlap"] = self.enable_overlap
 
         # FIXME: refactor the draft worker registration logic
         if self.server_args.enable_multi_layer_eagle:
@@ -534,9 +530,19 @@ class Scheduler(
                     dp_rank=self.dp_rank,
                 )
         else:
-            self.draft_worker = self.spec_algorithm.create_draft_worker(
-                **draft_worker_kwargs
+            WorkerClass = self.spec_algorithm.create_worker(
+                enable_overlap=self.enable_overlap
             )
+
+            # FIXME: optimize the init draft worker code path
+            if WorkerClass is not None:
+                self.draft_worker = WorkerClass(**draft_worker_kwargs)
+            else:
+                self.draft_worker = None
+
+    def init_model_worker(self):
+        self.init_tp_model_worker()
+        self.init_draft_worker()
 
         # Dispatch the model worker
         if self.spec_algorithm.is_none():
@@ -853,7 +859,7 @@ class Scheduler(
 
         if self.draft_worker is None or self.spec_algorithm.is_ngram():
             draft_token_to_kv_pool = None
-        elif self.spec_algorithm.is_eagle() and self.enable_overlap:
+        elif self.spec_algorithm.supports_spec_v2() and self.enable_overlap:
             if self.server_args.enable_multi_layer_eagle:
                 draft_runner = self.draft_worker.draft_worker.draft_runner_list[0]
             else:
@@ -931,11 +937,13 @@ class Scheduler(
                 hidden_size=(
                     model_config.hidden_size
                     if self.spec_algorithm.is_eagle()
+                    or self.spec_algorithm.is_standalone()
                     else 16  # minimal padding size for RDMA
                 ),
                 hidden_states_dtype=(
                     model_config.dtype
                     if self.spec_algorithm.is_eagle()
+                    or self.spec_algorithm.is_standalone()
                     else torch.float32
                 ),
                 custom_mem_pool=self.token_to_kv_pool_allocator.get_kvcache().maybe_get_custom_mem_pool(),
@@ -2305,7 +2313,7 @@ class Scheduler(
             # These 2 values are needed for processing the output, but the values can be
             # modified by overlap schedule. So we have to copy them here so that
             # we can use the correct values in output processing.
-            if batch.return_logprob or self.spec_algorithm.is_eagle():
+            if batch.return_logprob:
                 batch_result.extend_input_len_per_req = [
                     req.extend_input_len for req in batch.reqs
                 ]
