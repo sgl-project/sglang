@@ -138,6 +138,13 @@ class MMEncoder:
 
         torch.get_device_module(self.device).set_device(self.gpu_id)
 
+        # Force CUDA context + cuBLAS init
+        device = (
+            f"{self.device}:{self.gpu_id}" if self.device == "cuda" else self.device
+        )
+        _ = torch.randn((8, 8), device=device) @ torch.randn((8, 8), device=device)
+        torch.cuda.synchronize()
+
         init_distributed_environment(
             world_size=server_args.tp_size,
             rank=rank,
