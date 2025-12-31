@@ -88,7 +88,9 @@ class Scheduler:
     def _handle_set_lora(self, reqs: List[Any]) -> OutputBatch:
         # TODO: return set status
         req = reqs[0]
-        return self.worker.set_lora(req.lora_nickname, req.lora_path, req.target, req.strength)
+        return self.worker.set_lora(
+            req.lora_nickname, req.lora_path, req.target, req.strength
+        )
 
     def _handle_merge_lora(self, reqs: List[Any]):
         req = reqs[0]
@@ -101,7 +103,12 @@ class Scheduler:
     def _handle_generation(self, reqs: List[Req]):
         return self.worker.execute_forward(reqs)
 
-    def return_result(self, output_batch: OutputBatch, identity: bytes | None = None, is_warmup: bool = False):
+    def return_result(
+        self,
+        output_batch: OutputBatch,
+        identity: bytes | None = None,
+        is_warmup: bool = False,
+    ):
         """
         replies to client, only on rank 0
         """
@@ -172,7 +179,11 @@ class Scheduler:
 
         # handle server warmup by inserting an identical req to the beginning of the waiting queue
         # only the very first req through server's lifetime will be warmup
-        if not self.warmed_up and len(recv_reqs) == 1 and self.server_args.enable_warmup:
+        if (
+            not self.warmed_up
+            and len(recv_reqs) == 1
+            and self.server_args.enable_warmup
+        ):
             identity, req = recv_reqs[0]
             if isinstance(req, Req):
                 warmup_req = deepcopy(req)
@@ -240,9 +251,14 @@ class Scheduler:
             # 3. return results
             try:
                 # TODO: Support sending back to multiple identities if batched
-                is_warmup = processed_req.is_warmup if isinstance(processed_req, Req) else False
+                is_warmup = (
+                    processed_req.is_warmup if isinstance(processed_req, Req) else False
+                )
                 if is_warmup:
-                    logger.info("Server warmup done in %.2f seconds", output_batch.timings.total_duration_s)
+                    logger.info(
+                        "Server warmup done in %.2f seconds",
+                        output_batch.timings.total_duration_s,
+                    )
 
                 self.return_result(output_batch, identities[0], is_warmup=is_warmup)
             except zmq.ZMQError as e:

@@ -20,8 +20,9 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
 )
 from sglang.multimodal_gen.runtime.pipelines_core import (
     ComposedPipelineBase,
+    LoRAPipeline,
     Req,
-    build_pipeline, LoRAPipeline,
+    build_pipeline,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 from sglang.multimodal_gen.runtime.platforms import current_platform
@@ -109,10 +110,10 @@ class GPUWorker:
 
             if self.rank == 0:
                 peak_memory_bytes = torch.cuda.max_memory_allocated()
-                output_batch.peak_memory_mb = peak_memory_bytes / (1024 ** 2)
-                peak_memory_gb = peak_memory_bytes / (1024 ** 3)
+                output_batch.peak_memory_mb = peak_memory_bytes / (1024**2)
+                peak_memory_gb = peak_memory_bytes / (1024**3)
                 remaining_gpu_mem_gb = (
-                    current_platform.get_device_total_memory() / (1024 ** 3)
+                    current_platform.get_device_total_memory() / (1024**3)
                     - peak_memory_gb
                 )
                 can_stay_resident = self.get_can_stay_resident_components(
@@ -159,7 +160,7 @@ class GPUWorker:
         # If the flag is True, it is currently offloaded, so it's a candidate to "stay resident".
         offload_flags = {
             "transformer": self.server_args.dit_cpu_offload
-                           or self.server_args.dit_layerwise_offload,
+            or self.server_args.dit_layerwise_offload,
             "vae": self.server_args.vae_cpu_offload,
             "text_encoder": self.server_args.text_encoder_cpu_offload,
             "text_encoder_2": self.server_args.text_encoder_cpu_offload,
@@ -199,7 +200,9 @@ class GPUWorker:
         self.pipeline.set_lora(lora_nickname, lora_path, target, strength)
         return OutputBatch()
 
-    def merge_lora_weights(self, target: str = "all", strength: float = 1.0) -> OutputBatch:
+    def merge_lora_weights(
+        self, target: str = "all", strength: float = 1.0
+    ) -> OutputBatch:
         """
         Merge LoRA weights.
 
