@@ -2517,7 +2517,6 @@ class DeepseekV2Model(nn.Module):
             else None
         )
 
-        print(f"{config=}")
         self.layers, self.start_layer, self.end_layer = make_layers(
             config.num_hidden_layers,
             lambda idx, prefix: DeepseekV2DecoderLayer(

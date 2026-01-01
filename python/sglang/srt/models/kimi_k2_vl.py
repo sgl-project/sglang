@@ -74,9 +74,7 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalInputs,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_loader.weight_utils import (
-    default_weight_loader,
-)
+from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_v2 import DeepseekV3ForCausalLM
 from sglang.srt.models.kimi_vl_moonvit import MLP2, VL_VISION_ATTENTION_FUNCTIONS
 
@@ -825,6 +823,7 @@ class K2VLForConditionalGeneration(nn.Module):
                 vision_name = name
                 vision_weights.append((vision_name, loaded_weight))
             else:
+                name = name.replace("language_model.", "")
                 # All other weights go to language model
                 language_weights.append((name, loaded_weight))
 
@@ -840,7 +839,7 @@ class K2VLForConditionalGeneration(nn.Module):
             weight_loader(param, loaded_weight)
 
         # Load language model weights
-        if not self.config.encoder_only and language_weights:
+        if language_weights:
             self.language_model.load_weights(language_weights)
 
 
