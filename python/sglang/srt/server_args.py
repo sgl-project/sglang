@@ -5198,4 +5198,4 @@ def auto_choose_speculative_params(self: ServerArgs):
         return (5, 4, 8)
     else:
         # The default value for all other models
-        return (5, 4, 8)
+        return (3, 1, 4)
