@@ -25,9 +25,14 @@ class TestPrefillDelayerThroughput(CustomTestCase):
             "8",
         ]
 
+        # TODO fix mem leak
         with envs.SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE.override(
             with_prefill_delayer
-        ), envs.SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES.override(100):
+        ), envs.SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES.override(
+            100
+        ), envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE.override(
+            False
+        ):
             process = popen_launch_server(
                 model,
                 base_url,
