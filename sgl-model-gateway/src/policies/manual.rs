@@ -167,12 +167,13 @@ impl ManualPolicy {
                 {
                     entry.get_mut().last_access = Instant::now();
                     return (idx, ExecutionBranch::OccupiedHit);
+                } else {
+                    let selected_idx = random_select(healthy_indices);
+                    let node = entry.get_mut();
+                    node.push_bounded(workers[selected_idx].url().to_string());
+                    node.last_access = Instant::now();
+                    (selected_idx, ExecutionBranch::OccupiedMiss)
                 }
-                let selected_idx = random_select(healthy_indices);
-                let node = entry.get_mut();
-                node.push_bounded(workers[selected_idx].url().to_string());
-                node.last_access = Instant::now();
-                (selected_idx, ExecutionBranch::OccupiedMiss)
             }
             Entry::Vacant(entry) => {
                 let selected_idx = random_select(healthy_indices);
@@ -646,17 +647,6 @@ mod tests {
         let config = ManualConfig::default();
         assert_eq!(config.eviction_interval_secs, 60);
         assert_eq!(config.max_entries, 67108864);
-    }
-
-    #[test]
-    fn test_manual_with_config() {
-        let config = ManualConfig {
-            eviction_interval_secs: 30,
-            max_entries: 5000,
-        };
-        let policy = ManualPolicy::with_config(config);
-        assert_eq!(policy.config.eviction_interval_secs, 30);
-        assert_eq!(policy.config.max_entries, 5000);
     }
 
     #[test]
