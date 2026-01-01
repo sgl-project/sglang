@@ -1,22 +1,7 @@
-"""Prefill Delayer for DP Attention scenarios.
-
-This module delays prefill requests when DP ranks have imbalanced load to reduce
-idle time during prefill/decode phases. It looks at the waiting queue across
-all DP ranks to make scheduling decisions.
-"""
-
 import torch
 
 
 class PrefillDelayer:
-    """Delays prefill requests to reduce idle time in DP attention scenarios.
-
-    In DP attention with mixed configurations, when all DP ranks are at full capacity
-    and one rank finishes a request, starting a prefill causes other ranks to idle.
-    This class delays prefill until more DP ranks have available slots, reducing the
-    prefill/idle scenario.
-    """
-
     def __init__(
         self, dp_size, attn_tp_size, tp_worker, max_running_requests, server_args
     ):
@@ -45,7 +30,6 @@ class PrefillDelayer:
         ), "To use SCHEDULER_DECREASE_PREFILL_IDLE, disable_overlap_schedule must be False."
 
     def _gather_waiting_queue_info(self, waiting_queue_len: int):
-        """Gather waiting queue length from all DP ranks."""
         local_queue_len = torch.tensor(
             [waiting_queue_len],
             device="cpu",
@@ -60,15 +44,6 @@ class PrefillDelayer:
         return tp0_info
 
     def should_allow_prefill(self, waiting_queue_len: int) -> bool:
-        """Determine if prefill should be allowed based on waiting queue state.
-
-        Returns True if prefill is allowed, False if it should be delayed.
-
-        The heuristic: delay prefill when some DP ranks have empty waiting queues
-        while others have requests waiting. This indicates an imbalance that could
-        cause idle time if we start prefill. After max_stable_count consecutive
-        delays, we allow prefill anyway to avoid excessive TTFT.
-        """
         tp0_info = self._gather_waiting_queue_info(waiting_queue_len)
         min_queue_len = int(tp0_info[:, 0].min().item())
         max_queue_len = int(tp0_info[:, 0].max().item())
@@ -79,7 +54,3 @@ class PrefillDelayer:
                 return False
         self.stable_count = 0
         return True
-
-
-# Backward compatibility alias
-SchedulerEnhancer = PrefillDelayer

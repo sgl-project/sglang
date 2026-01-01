@@ -1,10 +1,3 @@
-"""
-Test throughput for PrefillDelayer (SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE).
-
-This test compares throughput with and without the prefill delayer feature
-in DP attention scenarios.
-"""
-
 import unittest
 
 from sglang.bench_serving import run_benchmark
@@ -23,10 +16,7 @@ from sglang.test.test_utils import (
 
 
 class TestPrefillDelayerThroughput(CustomTestCase):
-    """Test throughput with PrefillDelayer enabled in DP attention scenarios."""
-
     def _run_throughput_test(self, with_prefill_delayer: bool):
-        """Run throughput test with or without prefill delayer."""
         model = DEFAULT_MLA_MODEL_NAME_FOR_TEST
         base_url = DEFAULT_URL_FOR_TEST
         other_args = [
