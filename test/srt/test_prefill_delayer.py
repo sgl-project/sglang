@@ -25,7 +25,7 @@ class TestPrefillDelayerThroughput(CustomTestCase):
             "8",
         ]
 
-        # TODO fix mem leak
+        # TODO further fix mem leak
         with envs.SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE.override(
             with_prefill_delayer
         ), envs.SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES.override(
