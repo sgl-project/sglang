@@ -1879,14 +1879,14 @@ class Scheduler(
             self.running_batch.batch_is_full = False
 
         # Handle the cases where prefill is not allowed
-        if self.chunked_req is None:
-            if self.running_batch.batch_is_full or len(self.waiting_queue) == 0:
-                return None
-            # Delay prefill to reduce idle time when DP ranks have imbalanced load.
-            if self.prefill_delayer and not self.prefill_delayer.should_allow_prefill(
-                len(self.waiting_queue)
-            ):
-                return None
+        if (
+            self.running_batch.batch_is_full or len(self.waiting_queue) == 0
+        ) and self.chunked_req is None:
+            return None
+        if self.prefill_delayer and not self.prefill_delayer.get_schedule_decision(
+            self.running_batch
+        ):
+            return None
 
         running_bs = len(self.running_batch.reqs)
         # Ignore the check if self.chunked_req is not None.
