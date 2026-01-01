@@ -18,6 +18,7 @@ class CompilationConfig:
         self.split_ops = [
             "sglang.unified_attention_with_output",
             "sglang.gdn_with_output",
+            "sglang.inplace_all_reduce",
         ]
 
     def add_split_op(self, op: str):

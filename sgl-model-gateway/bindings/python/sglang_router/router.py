@@ -5,8 +5,12 @@ from sglang_router.sglang_router_rs import (
     BackendType,
     HistoryBackendType,
     PolicyType,
+    PyApiKeyEntry,
+    PyControlPlaneAuthConfig,
+    PyJwtConfig,
     PyOracleConfig,
     PyPostgresConfig,
+    PyRole,
 )
 from sglang_router.sglang_router_rs import Router as _Router
 
@@ -21,6 +25,9 @@ def policy_from_str(policy_str: Optional[str]) -> PolicyType:
         "cache_aware": PolicyType.CacheAware,
         "power_of_two": PolicyType.PowerOfTwo,
         "bucket": PolicyType.Bucket,
+        "manual": PolicyType.Manual,
+        "consistent_hashing": PolicyType.ConsistentHashing,
+        "prefix_hash": PolicyType.PrefixHash,
     }
     return policy_map[policy_str]
 
@@ -58,6 +65,60 @@ def history_backend_from_str(backend_str: Optional[str]) -> HistoryBackendType:
         return HistoryBackendType.Postgres
     else:
         raise ValueError(f"Unknown history backend: {backend_str}")
+
+
+def role_from_str(role_str: str) -> PyRole:
+    """Convert role string to PyRole enum."""
+    if role_str.lower() == "admin":
+        return PyRole.Admin
+    return PyRole.User
+
+
+def build_control_plane_auth_config(
+    args_dict: dict,
+) -> Optional[PyControlPlaneAuthConfig]:
+    """Build control plane auth config from args dict."""
+    api_keys = args_dict.get("control_plane_api_keys", [])
+    jwt_issuer = args_dict.get("jwt_issuer")
+    jwt_audience = args_dict.get("jwt_audience")
+    audit_enabled = args_dict.get("control_plane_audit_enabled", False)
+
+    # Check if any auth is configured
+    has_api_keys = bool(api_keys)
+    has_jwt = jwt_issuer is not None and jwt_audience is not None
+
+    if not has_api_keys and not has_jwt:
+        return None
+
+    # Build API key entries
+    py_api_keys = []
+    for key_tuple in api_keys:
+        # Tuple format: (id, name, key, role)
+        key_id, name, key, role = key_tuple
+        py_api_keys.append(
+            PyApiKeyEntry(
+                id=key_id,
+                name=name,
+                key=key,
+                role=role_from_str(role),
+            )
+        )
+
+    # Build JWT config if present
+    jwt_config = None
+    if has_jwt:
+        jwt_config = PyJwtConfig(
+            issuer=jwt_issuer,
+            audience=jwt_audience,
+            jwks_uri=args_dict.get("jwt_jwks_uri"),
+            role_mapping=args_dict.get("jwt_role_mapping", {}),
+        )
+
+    return PyControlPlaneAuthConfig(
+        jwt=jwt_config,
+        api_keys=py_api_keys,
+        audit_enabled=audit_enabled,
+    )
 
 
 class Router:
@@ -201,6 +262,9 @@ class Router:
             )
         args_dict["postgres_config"] = postgres_config
 
+        # Build control plane auth config
+        args_dict["control_plane_auth"] = build_control_plane_auth_config(args_dict)
+
         # Remove fields that shouldn't be passed to Rust Router constructor
         fields_to_remove = [
             "mini_lb",
@@ -214,6 +278,13 @@ class Router:
             "oracle_pool_timeout_secs",
             "postgres_db_url",
             "postgres_pool_max",
+            # Control plane auth fields (converted to control_plane_auth)
+            "control_plane_api_keys",
+            "control_plane_audit_enabled",
+            "jwt_issuer",
+            "jwt_audience",
+            "jwt_jwks_uri",
+            "jwt_role_mapping",
         ]
         for field in fields_to_remove:
             args_dict.pop(field, None)
