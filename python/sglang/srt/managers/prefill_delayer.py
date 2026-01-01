@@ -58,8 +58,6 @@ class PrefillDelayer:
             self.delayed_count += 1
             if self.delayed_count < self.max_delay_passes:
                 return False
-            else:
-                print(f"hi delay too many times and have to allow prefill")
 
         self.delayed_count = 0
         return True
