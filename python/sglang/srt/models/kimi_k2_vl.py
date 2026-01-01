@@ -52,7 +52,6 @@ from torch import nn
 
 from sglang.srt.configs.kimi_k2_vl import K2VLConfig
 from sglang.srt.configs.kimi_vl import KimiVLConfig
-from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternMultimodalTokens,
@@ -77,10 +76,9 @@ from sglang.srt.managers.schedule_batch import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
-    maybe_remap_kv_scale_name,
 )
 from sglang.srt.models.deepseek_v2 import DeepseekV3ForCausalLM
-from sglang.srt.models.kimi_vl_moonvit import VL_VISION_ATTENTION_FUNCTIONS, MLP2
+from sglang.srt.models.kimi_vl_moonvit import MLP2, VL_VISION_ATTENTION_FUNCTIONS
 
 logger = logging.getLogger(__name__)
 
@@ -689,7 +687,6 @@ class MoonViT3dPretrainedModel(nn.Module):
         return hidden_states
 
 
-
 class MLP(nn.Module):
 
     def __init__(self, config):
@@ -697,12 +694,13 @@ class MLP(nn.Module):
         # TODO, use faster LayerNorm
         self.pre_norm = nn.LayerNorm(config.mm_hidden_size)
         self.proj = nn.Sequential(
-            nn.Linear(config.mm_hidden_size, config.hidden_size), nn.GELU(),
-            nn.Linear(config.hidden_size, config.hidden_size))
+            nn.Linear(config.mm_hidden_size, config.hidden_size),
+            nn.GELU(),
+            nn.Linear(config.hidden_size, config.hidden_size),
+        )
 
     def forward(self, x, *args, **kwargs):
-        assert isinstance(x,
-                          list | tuple), f'x is not a list or tuple: {type(x)}'
+        assert isinstance(x, list | tuple), f"x is not a list or tuple: {type(x)}"
         lengths = [item.shape[0] for item in x]
         x = torch.cat(x, dim=0)
         x = self.pre_norm(x)
@@ -718,7 +716,8 @@ class PatchMergerMLP(nn.Module):
         super().__init__()
         eps = config.projector_ln_eps
         self.hidden_size = config.mm_hidden_size * (
-            config.merge_kernel_size[0] * config.merge_kernel_size[1])
+            config.merge_kernel_size[0] * config.merge_kernel_size[1]
+        )
         self.pre_norm = nn.LayerNorm(config.mm_hidden_size, eps=eps)
         self.proj = nn.Sequential(
             nn.Linear(self.hidden_size, self.hidden_size),
@@ -728,10 +727,7 @@ class PatchMergerMLP(nn.Module):
 
     def forward(self, x, *args, **kwargs):
         if isinstance(x, list) or isinstance(x, tuple):
-            x = [
-                self.proj(self.pre_norm(item).view(item.shape[0], -1))
-                for item in x
-            ]
+            x = [self.proj(self.pre_norm(item).view(item.shape[0], -1)) for item in x]
         else:
             # 不一定有4个维度，可能会把BxN合并在一起，我们只要关心第一个shape和最后一个shape不变就行了
             # B, N, N_k, C = x.shape
@@ -749,6 +745,7 @@ class K2VLForConditionalGeneration(nn.Module):
         **kwargs,  # fix init_tts argument error
     ) -> None:
         super().__init__()
+        self.config = config
         # 创建 vision tower
         vt_config = VisionTowerConfig(config)
         self.vision_tower = MoonViT3dPretrainedModel(vt_config)
@@ -766,7 +763,9 @@ class K2VLForConditionalGeneration(nn.Module):
                 f"Unsupported mm_projector_type: {config.mm_projector_type}"
             )
 
-        self.language_model = DeepseekV3ForCausalLM(config.text_config)
+        self.language_model = DeepseekV3ForCausalLM(config.text_config, quant_config)
+
+        # print(f"{config.text_config=}")
 
         # 确保vision_tower和mm_projector的dtype与language_model一致
         # 这解决了使用device_map="auto"和torch_dtype时的dtype不匹配问题
@@ -813,116 +812,36 @@ class K2VLForConditionalGeneration(nn.Module):
         return hidden_states
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        config = self.config.text_config
-        _KEYS_TO_MODIFY_MAPPING = {
-            # "language_model.lm_head": "lm_head",
-            # "language_model.model": "language_model",
-        }
-        # only doing this for language model part for now.
-        stacked_params_mapping = [
-            # (param_name, shard_name, shard_id)
-            (".gate_up_proj", ".gate_proj", 0),
-            (".gate_up_proj", ".up_proj", 1),
-        ]
-        if not config.use_mla:
-            stacked_params_mapping += [
-                (".qkv_proj", ".q_proj", "q"),
-                (".qkv_proj", ".k_proj", "k"),
-                (".qkv_proj", ".v_proj", "v"),
-            ]
-        if getattr(config, "n_routed_experts", None):
-            # Params for weights, fp8 weight scales, fp8 activation scales
-            # (param_name, weight_name, expert_id, shard_id)
-            expert_params_mapping = FusedMoE.make_expert_params_mapping(
-                ckpt_gate_proj_name="gate_proj",
-                ckpt_down_proj_name="down_proj",
-                ckpt_up_proj_name="up_proj",
-                num_experts=config.n_routed_experts,
-            )
-        else:
-            expert_params_mapping = []
+        """Load weights for the model, separating vision and language weights"""
+        weights = list(weights)
 
-        params_dict = dict(self.named_parameters())
-        for args in weights:
-            name, loaded_weight = args[:2]
-            kwargs = args[2] if len(args) > 2 else {}
-            if "rotary_emb.inv_freq" in name:
-                continue
+        # Separate vision tower weights and language model weights
+        vision_weights = []
+        language_weights = []
 
-            if "rotary_emb.cos_cached" in name or "rotary_emb.sin_cached" in name:
-                # Models trained using ColossalAI may include these tensors in
-                # the checkpoint. Skip them.
-                continue
-            for key_to_modify, new_key in _KEYS_TO_MODIFY_MAPPING.items():
-                if key_to_modify in name:
-                    name = name.replace(key_to_modify, new_key)
-            use_default_weight_loading = False
-            if "vision" in name:
-                if self.vision_tower is not None:
-                    # We only do sharding for language model and
-                    # not vision model for now.
-                    use_default_weight_loading = True
+        for name, loaded_weight in weights:
+            if "vision_tower" in name or "mm_projector" in name:
+                # vision_name = name.replace(r"attn.qkv.", r"attn.qkv_proj.")
+                vision_name = name
+                vision_weights.append((vision_name, loaded_weight))
             else:
-                for param_name, weight_name, shard_id in stacked_params_mapping:
-                    if weight_name not in name:
-                        continue
-                    # We have mlp.experts[0].gate_proj in the checkpoint.
-                    # Since we handle the experts below in expert_params_mapping,
-                    # we need to skip here BEFORE we update the name, otherwise
-                    # name will be updated to mlp.experts[0].gate_up_proj, which
-                    # will then be updated below in expert_params_mapping
-                    # for mlp.experts[0].gate_gate_up_proj, which breaks load.
-                    if ("mlp.experts." in name) and name not in params_dict:
-                        continue
-                    name = name.replace(weight_name, param_name)
-                    # Skip loading extra bias for GPTQ models.
-                    if name.endswith(".bias") and name not in params_dict:
-                        continue
+                # All other weights go to language model
+                language_weights.append((name, loaded_weight))
 
-                    param = params_dict[name]
-                    weight_loader = param.weight_loader
-                    weight_loader(param, loaded_weight, shard_id, **kwargs)
-                    break
-                else:
-                    for idx, (
-                            param_name,
-                            weight_name,
-                            expert_id,
-                            shard_id,
-                    ) in enumerate(expert_params_mapping):
-                        if weight_name not in name:
-                            continue
-                        name = name.replace(weight_name, param_name)
+        # Load vision tower weights
+        vision_state_dict = dict(vision_weights)
+        params_dict = dict(self.named_parameters(remove_duplicate=False))
+        for name, loaded_weight in vision_state_dict.items():
+            if name not in params_dict:
+                raise ValueError(f"Weight {name} not found in params_dict")
+            param = params_dict[name]
+            weight_loader = getattr(param, "weight_loader", default_weight_loader)
+            # loaded_weight = self._pad_vit_attn_dummy_heads(name, loaded_weight)
+            weight_loader(param, loaded_weight)
 
-                        param = params_dict[name]
-                        weight_loader = param.weight_loader
-                        weight_loader(
-                            param,
-                            loaded_weight,
-                            name,
-                            expert_id=expert_id,
-                            shard_id=shard_id,
-                            **kwargs,
-                        )
-                        break
-                    else:
-                        use_default_weight_loading = True
-            if use_default_weight_loading:
-                # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-                # Remapping the name of FP8 kv-scale.
-                name = maybe_remap_kv_scale_name(name, params_dict)
-                if name is None:
-                    continue
-
-                # if is_pp_missing_parameter(name, self):
-                #     continue
-
-                param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight, **kwargs)
-        self.language_model.post_load_weights()
+        # Load language model weights
+        if not self.config.encoder_only and language_weights:
+            self.language_model.load_weights(language_weights)
 
 
 EntryClass = [K2VLForConditionalGeneration]
