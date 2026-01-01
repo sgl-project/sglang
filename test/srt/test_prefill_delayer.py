@@ -7,6 +7,7 @@ in DP attention scenarios.
 
 import unittest
 
+from sglang.bench_serving import run_benchmark
 from sglang.srt.environ import envs
 from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
@@ -14,12 +15,11 @@ from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
-    popen_launch_server,
+    get_benchmark_args,
     is_in_ci,
+    popen_launch_server,
     write_github_step_summary,
 )
-from sglang.bench_serving import run_benchmark
-from sglang.test.test_utils import get_benchmark_args
 
 
 class TestPrefillDelayerThroughput(CustomTestCase):

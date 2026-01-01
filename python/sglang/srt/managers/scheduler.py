@@ -119,6 +119,7 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.mm_utils import init_mm_embedding_cache
 from sglang.srt.managers.overlap_utils import FutureMap
+from sglang.srt.managers.prefill_delayer import PrefillDelayer
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
     ModelWorkerBatch,
@@ -133,7 +134,6 @@ from sglang.srt.managers.schedule_policy import (
     SchedulePolicy,
 )
 from sglang.srt.managers.scheduler_dp_attn_mixin import SchedulerDPAttnMixin
-from sglang.srt.managers.prefill_delayer import PrefillDelayer
 from sglang.srt.managers.scheduler_input_blocker import SchedulerInputBlocker
 from sglang.srt.managers.scheduler_metrics_mixin import (
     RECORD_STEP_TIME,
@@ -1880,11 +1880,11 @@ class Scheduler(
 
         # Handle the cases where prefill is not allowed
         if (
-            self.running_batch.batch_is_full or len(self.waiting_queue) == 0
-        ) and self.chunked_req is None:
-            return None
-        if self.prefill_delayer and not self.prefill_delayer.get_schedule_decision(
-            self.running_batch
+            (self.running_batch.batch_is_full or len(self.waiting_queue) == 0)
+            and self.chunked_req is None
+        ) or (
+            self.prefill_delayer
+            and not self.prefill_delayer.get_schedule_decision(self.running_batch)
         ):
             return None
 
