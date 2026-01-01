@@ -838,6 +838,7 @@ def load_audio(
 class ImageData:
     url: str
     detail: Optional[Literal["auto", "low", "high"]] = "auto"
+    max_dynamic_patch: Optional[int] = None
 
 
 def load_image(
