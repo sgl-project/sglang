@@ -1,11 +1,17 @@
+import json
 import os
 import re
+import socket
+import threading
 import time
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 import torch
 import torch.distributed as dist
+
+# -------------------------------------- dumper core ------------------------------------------
 
 
 class _Dumper:
@@ -21,6 +27,10 @@ class _Dumper:
     sys.path.append("/YOUR_PATH/sglang/python/sglang/srt/debug_utils")
     from dumper import dumper
     ```
+
+    Disable at startup and enable via HTTP:
+    1. `SGLANG_DUMPER_ENABLE=0 python ...`
+    2. `curl -X POST http://localhost:40000/dumper -d '{"enable": true}'`
 
     Related: `sglang.srt.debug_utils.dump_comparator` for dump comparison
     """
@@ -39,9 +49,13 @@ class _Dumper:
         self._forward_pass_id = 0
         self._global_ctx = {}
         self._override_enable = None
+        self._http_server_handled = False
 
     def on_forward_pass_start(self):
         """This should be called on all ranks."""
+
+        # Even if SGLANG_DUMPER_ENABLE=0, users may want to use HTTP endpoint to enable it
+        self._ensure_http_server()
 
         if not self._enable:
             return
@@ -53,6 +67,12 @@ class _Dumper:
         print(
             f"[Dumper] [{time.time()}] on_forward_pass_start id={self._forward_pass_id}"
         )
+
+    def _ensure_http_server(self):
+        if self._http_server_handled:
+            return
+        self._http_server_handled = True
+        _start_maybe_http_server(self)
 
     def _ensure_partial_name(self):
         if self._partial_name is None:
@@ -81,6 +101,8 @@ class _Dumper:
             self.dump(f"{name_prefix}_{name}", value, save=save, **kwargs)
 
     def dump(self, name, value, save: bool = True, **kwargs):
+        self._ensure_http_server()
+
         if not (self._enable and (self._override_enable is not False)):
             return
         if (f := self._filter) is not None and re.search(f, name) is None:
@@ -167,6 +189,173 @@ def _obj_to_dict(obj):
     return ret
 
 
+# -------------------------------------- http control server ------------------------------------------
+
+
+def _start_maybe_http_server(dumper):
+    http_port = int(os.environ.get("SGLANG_DUMPER_SERVER_PORT", "40000"))
+    zmq_base_port = int(os.environ.get("SGLANG_DUMPER_ZMQ_BASE_PORT", "16800"))
+    if http_port <= 0:
+        return
+
+    local_handler = _DumperRpcHandler(dumper)
+    rpc_handles = _create_zmq_rpc_handles(local_handler, base_port=zmq_base_port)
+
+    if _get_rank() == 0:
+        handler_class = _make_dumper_http_handler(rpc_handles=rpc_handles)
+        server = HTTPServer(("0.0.0.0", http_port), handler_class)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        print(f"[Dumper] HTTP server started on port {http_port}")
+
+
+def _make_dumper_http_handler(rpc_handles):
+    class _DumperHTTPHandler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            if self.path == "/dumper":
+                try:
+                    self._handle_endpoint_dumper()
+                    self.send_response(200)
+                    self.end_headers()
+                except Exception as e:
+                    self.send_error(400, str(e))
+            else:
+                self.send_error(404)
+
+        def _get_request_body(self):
+            content_length = int(self.headers.get("Content-Length", 0))
+            return json.loads(self.rfile.read(content_length))
+
+        def _handle_endpoint_dumper(self):
+            data = self._get_request_body()
+            print(f"[Dumper#{_get_rank()}] Handle HTTP endpoint {data=}")
+            for rpc_handle in rpc_handles:
+                rpc_handle.set_enable(data["enable"])
+
+    return _DumperHTTPHandler
+
+
+class _DumperRpcHandler:
+    def __init__(self, dumper):
+        self._dumper = dumper
+
+    def set_enable(self, enable: bool):
+        print(f"[DumperRpcHandler] set_enable {enable=}")
+        self._dumper._enable = enable
+
+
+# -------------------------------------- zmq rpc ------------------------------------------
+
+
+def _create_zmq_rpc_handles(handler, base_port: int) -> Optional[List["_ZmqRpcHandle"]]:
+    import zmq
+
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+    port = base_port + rank
+    local_addr = f"tcp://{_get_local_ip_by_remote()}:{port}"
+
+    ctx = zmq.Context()
+    sock = ctx.socket(zmq.REP)
+    sock.bind(f"tcp://*:{port}")
+
+    def serve_loop():
+        while True:
+            try:
+                req = sock.recv_pyobj()
+                result = getattr(handler, req["method"])(*req["args"], **req["kwargs"])
+                resp = {"result": result, "error": None}
+            except Exception as e:
+                print(f"[Dumper.ZmqRpc] error inside handler: {e}")
+                resp = {"result": None, "error": str(e)}
+            sock.send_pyobj(resp)
+
+    thread = threading.Thread(target=serve_loop, daemon=True)
+    thread.start()
+    print(f"[Dumper.ZmqRpc] rank={rank} server started at {local_addr}")
+
+    all_addresses = [None] * world_size
+    dist.all_gather_object(all_addresses, local_addr)
+    print(f"[Dumper.ZmqRpc] rank={rank} all_addresses={all_addresses}")
+
+    if rank == 0:
+        handles = []
+        for i, addr in enumerate(all_addresses):
+            req_socket = ctx.socket(zmq.REQ)
+            req_socket.connect(addr)
+            handles.append(_ZmqRpcHandle(req_socket, debug_name=f"rank-{i}"))
+        return handles
+    else:
+        return None
+
+
+class _ZmqRpcHandle:
+    """Proxy object to call remote handler methods via ZMQ."""
+
+    def __init__(self, socket, debug_name):
+        self._socket = socket
+        self._debug_name = debug_name
+
+    def __getattr__(self, method_name: str):
+        def call(*args, **kwargs):
+            self._socket.send_pyobj(
+                {
+                    "method": method_name,
+                    "args": args,
+                    "kwargs": kwargs,
+                }
+            )
+            response = self._socket.recv_pyobj()
+            if response["error"]:
+                raise RuntimeError(
+                    f"RPC error on {self._debug_name}: {response['error']}"
+                )
+            return response["result"]
+
+        return call
+
+
+# --------------------------------- copied code (avoid dependency) --------------------------------------
+
+
+def _get_local_ip_by_remote() -> Optional[str]:
+    # try ipv4
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))  # Doesn't need to be reachable
+        return s.getsockname()[0]
+    except Exception:
+        pass
+
+    try:
+        hostname = socket.gethostname()
+        ip = socket.gethostbyname(hostname)
+        if ip and ip != "127.0.0.1" and ip != "0.0.0.0":
+            return ip
+    except Exception:
+        pass
+
+    # try ipv6
+    try:
+        s = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+        # Google's public DNS server, see
+        # https://developers.google.com/speed/public-dns/docs/using#addresses
+        s.connect(("2001:4860:4860::8888", 80))  # Doesn't need to be reachable
+        return s.getsockname()[0]
+    except Exception:
+        print("Can not get local ip by remote")
+    return None
+
+
+# -------------------------------------- singleton ------------------------------------------
+
+
+dumper = _Dumper()
+
+
+# -------------------------------------- other utility functions ------------------------------------------
+
+
 def get_truncated_value(value):
     if value is None:
         return None
@@ -182,9 +371,6 @@ def get_truncated_value(value):
 
     slices = [slice(0, 5) if dim_size > 50 else slice(None) for dim_size in value.shape]
     return value[tuple(slices)]
-
-
-dumper = _Dumper()
 
 
 def get_tensor_info(x):
