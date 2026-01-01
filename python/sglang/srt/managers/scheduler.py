@@ -133,7 +133,7 @@ from sglang.srt.managers.schedule_policy import (
     SchedulePolicy,
 )
 from sglang.srt.managers.scheduler_dp_attn_mixin import SchedulerDPAttnMixin
-from sglang.srt.managers.scheduler_enhancer import SchedulerEnhancer
+from sglang.srt.managers.prefill_delayer import PrefillDelayer
 from sglang.srt.managers.scheduler_input_blocker import SchedulerInputBlocker
 from sglang.srt.managers.scheduler_metrics_mixin import (
     RECORD_STEP_TIME,
@@ -793,9 +793,9 @@ class Scheduler(
             self.enable_priority_scheduling,
             self.schedule_low_priority_values_first,
         )
-        self.schedule_enhancer = None
+        self.prefill_delayer = None
         if SCHEDULER_DECREASE_PREFILL_IDLE:
-            self.schedule_enhancer = SchedulerEnhancer(
+            self.prefill_delayer = PrefillDelayer(
                 self.dp_size,
                 self.attn_tp_size,
                 self.tp_worker,
@@ -1870,12 +1870,6 @@ class Scheduler(
         return res
 
     def get_new_batch_prefill(self) -> Optional[ScheduleBatch]:
-        if self.schedule_enhancer and not self.schedule_enhancer.get_schedule_decision(
-            self.running_batch
-        ):
-            # Decrease prefill idle as much as possible during high dp load.
-            return None
-
         # Check if the grammar is ready in the grammar queue
         if self.grammar_queue:
             self.move_ready_grammar_requests()
@@ -1885,10 +1879,14 @@ class Scheduler(
             self.running_batch.batch_is_full = False
 
         # Handle the cases where prefill is not allowed
-        if (
-            self.running_batch.batch_is_full or len(self.waiting_queue) == 0
-        ) and self.chunked_req is None:
-            return None
+        if self.chunked_req is None:
+            if self.running_batch.batch_is_full or len(self.waiting_queue) == 0:
+                return None
+            # Delay prefill to reduce idle time when DP ranks have imbalanced load.
+            if self.prefill_delayer and not self.prefill_delayer.should_allow_prefill(
+                len(self.waiting_queue)
+            ):
+                return None
 
         running_bs = len(self.running_batch.reqs)
         # Ignore the check if self.chunked_req is not None.
