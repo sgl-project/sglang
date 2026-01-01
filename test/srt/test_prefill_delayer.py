@@ -17,7 +17,7 @@ from sglang.test.test_utils import (
 
 class TestPrefillDelayerThroughput(CustomTestCase):
     def _run_throughput_test(self, with_prefill_delayer: bool):
-        model = DEFAULT_MLA_MODEL_NAME_FOR_TEST
+        model = "Qwen/Qwen3-0.6B"
         base_url = DEFAULT_URL_FOR_TEST
         other_args = [
             "--trust-remote-code",
