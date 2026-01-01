@@ -74,7 +74,7 @@ class SchedulerOutputProcessorMixin:
     def maybe_collect_customized_info(
         self: Scheduler, i: int, req: Req, logits_output: LogitsProcessorOutput
     ):
-        if logits_output.customized_info is not None:
+        if logits_output is not None and logits_output.customized_info is not None:
             if req.customized_info is None:
                 req.customized_info = {}
             for k, v in logits_output.customized_info.items():
