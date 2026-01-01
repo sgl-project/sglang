@@ -1488,7 +1488,9 @@ class Scheduler(
         else:
             # Create a new request from a previous session
             session = self.sessions[recv_req.session_params.id]
-            req = session.create_req(recv_req, self.tokenizer, self.model_config.vocab_size)
+            req = session.create_req(
+                recv_req, self.tokenizer, self.model_config.vocab_size
+            )
             if isinstance(req.finished_reason, FINISH_ABORT):
                 self.init_req_max_new_tokens(req)
                 self._add_request_to_queue(req)
