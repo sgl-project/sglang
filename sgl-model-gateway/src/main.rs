@@ -691,7 +691,7 @@ impl CliArgs {
             // Reuse eviction_interval and max_tree_size to avoid adding new CLI args
             "manual" => PolicyConfig::Manual {
                 eviction_interval_secs: self.eviction_interval,
-                max_entries: self.max_tree_size,
+                max_idle_secs: 4 * 3600, // 4 hours TTL
             },
             _ => PolicyConfig::RoundRobin,
         }

@@ -420,7 +420,7 @@ impl Router {
                 // Reuse eviction_interval_secs and max_tree_size to avoid adding new args
                 PolicyType::Manual => ConfigPolicyConfig::Manual {
                     eviction_interval_secs: self.eviction_interval_secs,
-                    max_entries: self.max_tree_size,
+                    max_idle_secs: 4 * 3600, // 4 hours TTL
                 },
                 PolicyType::ConsistentHashing => ConfigPolicyConfig::ConsistentHashing,
                 PolicyType::PrefixHash => ConfigPolicyConfig::PrefixHash {

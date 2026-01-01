@@ -344,12 +344,12 @@ pub enum PolicyConfig {
     /// - Supports LRU eviction when cache size exceeds max_entries
     #[serde(rename = "manual")]
     Manual {
-        /// Interval between LRU eviction cycles (seconds, default: 60)
+        /// Interval between TTL eviction cycles (seconds, default: 60)
         #[serde(default = "default_manual_eviction_interval_secs")]
         eviction_interval_secs: u64,
-        /// Maximum number of routing entries before LRU eviction (default: 67108864)
-        #[serde(default = "default_manual_max_entries")]
-        max_entries: usize,
+        /// Maximum idle time before eviction (seconds, default: 14400 = 4 hours)
+        #[serde(default = "default_manual_max_idle_secs")]
+        max_idle_secs: u64,
     },
 
     /// Consistent hashing policy using hash ring for session affinity:
@@ -388,8 +388,8 @@ fn default_manual_eviction_interval_secs() -> u64 {
     60
 }
 
-fn default_manual_max_entries() -> usize {
-    67108864
+fn default_manual_max_idle_secs() -> u64 {
+    4 * 3600 // 4 hours
 }
 
 impl PolicyConfig {

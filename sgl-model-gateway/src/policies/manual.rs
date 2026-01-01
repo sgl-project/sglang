@@ -63,14 +63,14 @@ const MAX_CANDIDATE_WORKERS: usize = 2;
 #[derive(Debug, Clone)]
 pub struct ManualConfig {
     pub eviction_interval_secs: u64,
-    pub max_entries: usize,
+    pub max_idle_secs: u64,
 }
 
 impl Default for ManualConfig {
     fn default() -> Self {
         Self {
             eviction_interval_secs: 60,
-            max_entries: 67108864,
+            max_idle_secs: 4 * 3600, // 4 hours
         }
     }
 }
@@ -109,39 +109,32 @@ impl ManualPolicy {
     }
 
     pub fn with_config(config: ManualConfig) -> Self {
+        use std::time::Duration;
+
         let routing_map = Arc::new(DashMap::<RoutingId, Node>::new());
 
-        let eviction_task = if config.eviction_interval_secs > 0 && config.max_entries > 0 {
+        let eviction_task = if config.eviction_interval_secs > 0 && config.max_idle_secs > 0 {
             let routing_map_clone = Arc::clone(&routing_map);
-            let max_entries = config.max_entries;
+            let max_idle = Duration::from_secs(config.max_idle_secs);
 
             Some(PeriodicTask::spawn(
                 config.eviction_interval_secs,
                 "ManualPolicyEviction",
                 move || {
-                    let current_size = routing_map_clone.len();
-                    if current_size <= max_entries {
-                        return;
+                    let now = Instant::now();
+                    let before_size = routing_map_clone.len();
+
+                    routing_map_clone.retain(|_, node| now.duration_since(node.last_access) < max_idle);
+
+                    let evicted_count = before_size - routing_map_clone.len();
+                    if evicted_count > 0 {
+                        debug!(
+                            "ManualPolicy TTL eviction: evicted {} entries, remaining {} (max_idle: {}s)",
+                            evicted_count,
+                            routing_map_clone.len(),
+                            max_idle.as_secs()
+                        );
                     }
-
-                    let to_evict = current_size - max_entries;
-                    let mut entries: Vec<_> = routing_map_clone
-                        .iter()
-                        .map(|entry| (entry.key().clone(), entry.value().last_access))
-                        .collect();
-                    entries.sort_by_key(|(_, last_access)| *last_access);
-                    let evicted_count = entries
-                        .iter()
-                        .take(to_evict)
-                        .filter(|(key, _)| routing_map_clone.remove(key).is_some())
-                        .count();
-
-                    debug!(
-                        "ManualPolicy LRU eviction: evicted {} entries, remaining {} (max: {})",
-                        evicted_count,
-                        routing_map_clone.len(),
-                        max_entries
-                    );
                 },
             ))
         } else {
@@ -648,14 +641,14 @@ mod tests {
     fn test_manual_config_default() {
         let config = ManualConfig::default();
         assert_eq!(config.eviction_interval_secs, 60);
-        assert_eq!(config.max_entries, 67108864);
+        assert_eq!(config.max_idle_secs, 4 * 3600);
     }
 
     #[test]
     fn test_manual_with_disabled_eviction() {
         let config = ManualConfig {
             eviction_interval_secs: 0,
-            max_entries: 10000,
+            max_idle_secs: 3600,
         };
         let policy = ManualPolicy::with_config(config);
         assert!(policy._eviction_task.is_none());
@@ -665,7 +658,7 @@ mod tests {
     fn test_manual_last_access_updates_on_slow_path() {
         let config = ManualConfig {
             eviction_interval_secs: 0,
-            max_entries: 10000,
+            max_idle_secs: 3600,
         };
         let policy = ManualPolicy::with_config(config);
         let workers = create_workers(&["http://w1:8000", "http://w2:8000"]);
@@ -699,12 +692,12 @@ mod tests {
     }
 
     #[test]
-    fn test_manual_lru_eviction_logic() {
-        use std::{thread, time::Duration};
+    fn test_manual_ttl_eviction_logic() {
+        use std::time::{Duration, Instant};
 
         let config = ManualConfig {
             eviction_interval_secs: 0,
-            max_entries: 2,
+            max_idle_secs: 1, // 1 second TTL for testing
         };
         let policy = ManualPolicy::with_config(config);
         let workers = create_workers(&["http://w1:8000", "http://w2:8000"]);
@@ -716,25 +709,24 @@ mod tests {
                 ..Default::default()
             };
             policy.select_worker_impl(&workers, &info);
-            thread::sleep(Duration::from_millis(10));
         }
 
         assert_eq!(policy.routing_map.len(), 3);
 
-        let max_entries = 2usize;
-        let current_size = policy.routing_map.len();
-        if current_size > max_entries {
-            let to_evict = current_size - max_entries;
-            let mut entries: Vec<_> = policy
-                .routing_map
-                .iter()
-                .map(|entry| (entry.key().clone(), entry.value().last_access))
-                .collect();
-            entries.sort_by_key(|(_, last_access)| *last_access);
-            for (key, _) in entries.iter().take(to_evict) {
-                policy.routing_map.remove(key);
+        // Simulate TTL eviction by manually setting old last_access
+        {
+            let routing_id = RoutingId::new("key-0");
+            if let Some(mut entry) = policy.routing_map.get_mut(&routing_id) {
+                entry.last_access = Instant::now() - Duration::from_secs(10);
             }
         }
+
+        // Manually run TTL eviction logic
+        let max_idle = Duration::from_secs(1);
+        let now = Instant::now();
+        policy
+            .routing_map
+            .retain(|_, node| now.duration_since(node.last_access) < max_idle);
 
         assert_eq!(policy.routing_map.len(), 2);
 
