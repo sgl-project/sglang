@@ -13,13 +13,14 @@
 //! ## Header
 //! - `X-SMG-Routing-Key`: The routing key for sticky session routing
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Instant};
 
 use dashmap::{mapref::entry::Entry, DashMap};
 use http::header::HeaderName;
 use rand::Rng;
+use tracing::debug;
 
-use super::{get_healthy_worker_indices, LoadBalancingPolicy, SelectWorkerInfo};
+use super::{get_healthy_worker_indices, utils::PeriodicTask, LoadBalancingPolicy, SelectWorkerInfo};
 use crate::{core::Worker, observability::metrics::Metrics};
 
 /// Header for routing key based sticky sessions
@@ -60,8 +61,24 @@ impl RoutingId {
 const MAX_CANDIDATE_WORKERS: usize = 2;
 
 #[derive(Debug, Clone)]
+pub struct ManualConfig {
+    pub eviction_interval_secs: u64,
+    pub max_idle_secs: u64,
+}
+
+impl Default for ManualConfig {
+    fn default() -> Self {
+        Self {
+            eviction_interval_secs: 60,
+            max_idle_secs: 3600,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 struct Node {
     candi_worker_urls: Vec<String>,
+    last_access: Instant,
 }
 
 impl Node {
@@ -74,16 +91,65 @@ impl Node {
 }
 
 // TODO may optimize performance
-// TODO evict old data periodically
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct ManualPolicy {
-    routing_map: DashMap<RoutingId, Node>,
+    config: ManualConfig,
+    routing_map: Arc<DashMap<RoutingId, Node>>,
+    _eviction_task: Option<PeriodicTask>,
+}
+
+impl Default for ManualPolicy {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ManualPolicy {
     pub fn new() -> Self {
+        Self::with_config(ManualConfig::default())
+    }
+
+    pub fn with_config(config: ManualConfig) -> Self {
+        let routing_map = Arc::new(DashMap::<RoutingId, Node>::new());
+
+        let eviction_task = if config.eviction_interval_secs > 0 && config.max_idle_secs > 0 {
+            let routing_map_clone = Arc::clone(&routing_map);
+            let max_idle_secs = config.max_idle_secs;
+
+            Some(PeriodicTask::spawn(
+                config.eviction_interval_secs,
+                "ManualPolicyEviction",
+                move || {
+                    let now = Instant::now();
+                    let mut evicted_count = 0usize;
+
+                    routing_map_clone.retain(|_, node| {
+                        let idle_secs = now.duration_since(node.last_access).as_secs();
+                        if idle_secs > max_idle_secs {
+                            evicted_count += 1;
+                            false
+                        } else {
+                            true
+                        }
+                    });
+
+                    if evicted_count > 0 {
+                        debug!(
+                            "ManualPolicy eviction completed: evicted {} entries, remaining {}",
+                            evicted_count,
+                            routing_map_clone.len()
+                        );
+                    }
+                },
+            ))
+        } else {
+            None
+        };
+
         Self {
-            routing_map: DashMap::new(),
+            config,
+            routing_map,
+            _eviction_task: eviction_task,
         }
     }
 
@@ -95,11 +161,12 @@ impl ManualPolicy {
     ) -> (usize, ExecutionBranch) {
         let routing_id = RoutingId::new(routing_id);
 
-        // Fast path
-        if let Some(info) = self.routing_map.get(&routing_id) {
+        // Fast path: use get_mut to update last_access
+        if let Some(mut info) = self.routing_map.get_mut(&routing_id) {
             if let Some(idx) =
                 find_healthy_worker(&info.candi_worker_urls, workers, healthy_indices)
             {
+                info.last_access = Instant::now();
                 return (idx, ExecutionBranch::FastPathHit);
             }
         }
@@ -110,18 +177,20 @@ impl ManualPolicy {
                 if let Some(idx) =
                     find_healthy_worker(&entry.get().candi_worker_urls, workers, healthy_indices)
                 {
+                    entry.get_mut().last_access = Instant::now();
                     return (idx, ExecutionBranch::SlowPathOccupiedHit);
                 }
                 let selected_idx = random_select(healthy_indices);
-                entry
-                    .get_mut()
-                    .push_bounded(workers[selected_idx].url().to_string());
+                let node = entry.get_mut();
+                node.push_bounded(workers[selected_idx].url().to_string());
+                node.last_access = Instant::now();
                 (selected_idx, ExecutionBranch::SlowPathOccupiedMiss)
             }
             Entry::Vacant(entry) => {
                 let selected_idx = random_select(healthy_indices);
                 entry.insert(Node {
                     candi_worker_urls: vec![workers[selected_idx].url().to_string()],
+                    last_access: Instant::now(),
                 });
                 (selected_idx, ExecutionBranch::SlowPathVacant)
             }
@@ -580,6 +649,96 @@ mod tests {
             find_worker_index_by_url(&workers, "http://w3:8000"),
             None,
             "Should return None for unknown URL"
+        );
+    }
+
+    #[test]
+    fn test_manual_config_default() {
+        let config = ManualConfig::default();
+        assert_eq!(config.eviction_interval_secs, 60);
+        assert_eq!(config.max_idle_secs, 3600);
+    }
+
+    #[test]
+    fn test_manual_with_config() {
+        let config = ManualConfig {
+            eviction_interval_secs: 30,
+            max_idle_secs: 1800,
+        };
+        let policy = ManualPolicy::with_config(config);
+        assert_eq!(policy.config.eviction_interval_secs, 30);
+        assert_eq!(policy.config.max_idle_secs, 1800);
+    }
+
+    #[test]
+    fn test_manual_with_disabled_eviction() {
+        let config = ManualConfig {
+            eviction_interval_secs: 0,
+            max_idle_secs: 3600,
+        };
+        let policy = ManualPolicy::with_config(config);
+        assert!(policy._eviction_task.is_none());
+    }
+
+    #[test]
+    fn test_manual_last_access_updates_on_access() {
+        let config = ManualConfig {
+            eviction_interval_secs: 0,
+            max_idle_secs: 3600,
+        };
+        let policy = ManualPolicy::with_config(config);
+        let workers = create_workers(&["http://w1:8000", "http://w2:8000"]);
+
+        let headers = headers_with_routing_key("test-key");
+        let info = SelectWorkerInfo {
+            headers: Some(&headers),
+            ..Default::default()
+        };
+
+        policy.select_worker_impl(&workers, &info);
+
+        let routing_id = RoutingId::new("test-key");
+        let node = policy.routing_map.get(&routing_id).unwrap();
+        let first_access = node.last_access;
+
+        std::thread::sleep(std::time::Duration::from_millis(10));
+
+        policy.select_worker_impl(&workers, &info);
+
+        let node = policy.routing_map.get(&routing_id).unwrap();
+        assert!(
+            node.last_access > first_access,
+            "last_access should be updated on subsequent access"
+        );
+    }
+
+    #[test]
+    fn test_manual_eviction_removes_old_entries() {
+        use std::thread;
+        use std::time::Duration;
+
+        let config = ManualConfig {
+            eviction_interval_secs: 1,
+            max_idle_secs: 1,
+        };
+        let policy = ManualPolicy::with_config(config);
+        let workers = create_workers(&["http://w1:8000", "http://w2:8000"]);
+
+        let headers = headers_with_routing_key("eviction-test");
+        let info = SelectWorkerInfo {
+            headers: Some(&headers),
+            ..Default::default()
+        };
+
+        policy.select_worker_impl(&workers, &info);
+        assert_eq!(policy.routing_map.len(), 1, "Should have one entry");
+
+        thread::sleep(Duration::from_secs(3));
+
+        assert_eq!(
+            policy.routing_map.len(),
+            0,
+            "Entry should be evicted after max_idle_secs"
         );
     }
 }
