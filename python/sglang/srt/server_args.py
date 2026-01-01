@@ -68,7 +68,6 @@ from sglang.utils import is_in_ci
 
 logger = logging.getLogger(__name__)
 
-
 # Define constants
 SAMPLING_BACKEND_CHOICES = {"flashinfer", "pytorch", "ascend"}
 LOAD_FORMAT_CHOICES = [
@@ -4999,30 +4998,19 @@ def prepare_server_args(argv: List[str]) -> ServerArgs:
     Returns:
         The server arguments.
     """
-    # Import here to avoid circular imports
-    from sglang.srt.server_args_config_parser import ConfigArgumentMerger
+    parser = argparse.ArgumentParser()
+    ServerArgs.add_cli_args(parser)
 
     # Check for config file and merge arguments if present
     if "--config" in argv:
+        # Import here to avoid circular imports
+        from sglang.srt.server_args_config_parser import ConfigArgumentMerger
+
         # Extract boolean actions from the parser to handle them correctly
-        parser = argparse.ArgumentParser()
-        ServerArgs.add_cli_args(parser)
-
-        # Get boolean action destinations
-        boolean_actions = []
-        for action in parser._actions:
-            if hasattr(action, "dest") and hasattr(action, "action"):
-                if action.action in ["store_true", "store_false"]:
-                    boolean_actions.append(action.dest)
-
-        # Merge config file arguments with CLI arguments
-        config_merger = ConfigArgumentMerger(boolean_actions=boolean_actions)
+        config_merger = ConfigArgumentMerger(parser)
         argv = config_merger.merge_config_with_args(argv)
 
-    parser = argparse.ArgumentParser()
-    ServerArgs.add_cli_args(parser)
     raw_args = parser.parse_args(argv)
-
     return ServerArgs.from_cli_args(raw_args)
 
 
@@ -5210,4 +5198,4 @@ def auto_choose_speculative_params(self: ServerArgs):
         return (5, 4, 8)
     else:
         # The default value for all other models
-        return (5, 4, 8)
+        return (3, 1, 4)
