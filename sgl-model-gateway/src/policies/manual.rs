@@ -124,7 +124,8 @@ impl ManualPolicy {
                     let now = Instant::now();
                     let before_size = routing_map_clone.len();
 
-                    routing_map_clone.retain(|_, node| now.duration_since(node.last_access) < max_idle);
+                    routing_map_clone
+                        .retain(|_, node| now.duration_since(node.last_access) < max_idle);
 
                     let evicted_count = before_size - routing_map_clone.len();
                     if evicted_count > 0 {
