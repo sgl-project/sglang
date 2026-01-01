@@ -470,7 +470,8 @@ class RadixCache(BasePrefixCache):
 
         # Remove req slot release the cache lock
         self.req_to_token_pool.free(req.req_pool_idx)
-        self.dec_lock_ref(req.last_node)
+        if not req.is_dummy():
+            self.dec_lock_ref(req.last_node)
 
     def cache_unfinished_req(self, req: Req, chunked=False):
         """Cache request when it is unfinished."""
@@ -583,6 +584,10 @@ class RadixCache(BasePrefixCache):
         return delta
 
     def dec_lock_ref(self, node: TreeNode):
+
+        if node is None:
+            raise ValueError(f"node is None. Possible reason: request is dummy.")
+
         if self.disable:
             return 0
 

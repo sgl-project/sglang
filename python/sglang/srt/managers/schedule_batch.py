@@ -173,6 +173,16 @@ class FINISH_ABORT(BaseFinishReason):
         }
 
 
+class FINISH_DUMMY(BaseFinishReason):
+    def __init__(self):
+        super().__init__()
+
+    def to_json(self):
+        return {
+            "type": "dummy",
+        }
+
+
 class Modality(Enum):
     IMAGE = auto()
     MULTI_IMAGES = auto()
@@ -649,7 +659,7 @@ class Req:
         # Logprobs (arguments)
         self.return_logprob = return_logprob
         # Start index to compute logprob from.
-        self.logprob_start_len = 0
+        self.logprob_start_len = -1
         self.top_logprobs_num = top_logprobs_num
         self.token_ids_logprob = token_ids_logprob
         self.temp_scaled_logprobs = False
@@ -1030,6 +1040,10 @@ class Req:
         if self.finished():
             return
 
+        if self.is_dummy():
+            self.finished_reason = FINISH_DUMMY()
+            return
+
         if self.to_finish:
             self.finished_reason = self.to_finish
             self.to_finish = None
@@ -1151,6 +1165,24 @@ class Req:
             f"{self.sampling_params=})"
         )
 
+    def is_dummy(self) -> bool:
+        return isinstance(self, DummyReq)
+
+
+class DummyReq(Req):
+    def __init__(self, rid: str, eos_token_id: int):
+        super().__init__(
+            rid=rid,
+            origin_input_text="",
+            origin_input_ids=[eos_token_id],
+            sampling_params=SamplingParams(max_new_tokens=0),
+            return_logprob=False,
+            eos_token_ids={eos_token_id},
+        )
+        self.logprob_start_len = 1
+        # # label it as finished
+        # self.finished_reason = FINISH_DUMMY()
+
 
 @dataclasses.dataclass
 class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
@@ -1203,6 +1235,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     orig_seq_lens: torch.Tensor = None  # shape: [b], int32
 
     # For DP attention
+    non_padded_batch_size: Optional[int] = None
+    non_padded_token_cnt: Optional[int] = None
     inner_idle_batch: Optional[ScheduleBatch] = None
     global_num_tokens: Optional[List[int]] = None
     global_num_tokens_for_logprob: Optional[List[int]] = None
@@ -1220,7 +1254,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     temp_scaled_logprobs: bool = False
     top_p_normalized_logprobs: bool = False
 
-    # For extend and mixed chunekd prefill
+    # For extend and mixed chunked prefill
     prefix_lens: List[int] = None
     extend_lens: List[int] = None
     extend_num_tokens: Optional[int] = None
@@ -1330,6 +1364,29 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def is_dllm(self):
         return self.dllm_config is not None
 
+    def add_dummy_reqs(self, num_dummy_reqs: int):
+        eos_token_id = self.model_config.hf_config.eos_token_id
+
+        for i in range(num_dummy_reqs):
+            r = DummyReq(rid=f"dummy_{i}", eos_token_id=eos_token_id)
+            r.init_next_round_input()
+            self.reqs.append(r)
+            if self.multimodal_inputs is not None:
+                self.multimodal_inputs.append(None)
+
+        if self.spec_info is not None:
+            raise NotImplementedError()
+
+    # def remove_dummy_reqs(self):
+    #     if self.forward_mode.is_idle():
+    #         self.reqs = []
+    #     else:
+    #         assert self.non_padded_batch_size is not None
+    #         assert self.non_padded_token_cnt is not None
+    #         self.reqs = self.reqs[: self.non_padded_batch_size]
+    #     if self.spec_info is not None:
+    #         raise NotImplementedError()
+
     def prepare_encoder_info_extend(self, input_ids: List[int], seq_lens: List[int]):
         self.encoder_lens_cpu = []
         self.encoder_cached = []
@@ -1407,7 +1464,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def prepare_for_extend(self):
 
         if self.forward_mode is not None:
-            assert self.forward_mode in [ForwardMode.EXTEND, ForwardMode.DLLM_EXTEND]
+            assert self.forward_mode.is_extend()
         else:
             if self.is_dllm():
                 # For DLLM, we use a separate forward mode
@@ -1459,6 +1516,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.extend_lens = extend_lens
         self.seq_lens = seq_lens_tensor
         self.seq_lens_cpu = seq_lens_cpu
+        assert self.extend_num_tokens == extend_num_tokens
         self.extend_num_tokens = extend_num_tokens
 
         # Allocate memory
@@ -1584,7 +1642,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.top_logprobs_nums = [r.top_logprobs_num for r in reqs]
             self.token_ids_logprobs = [r.token_ids_logprob for r in reqs]
 
+        for i, r in enumerate(reqs):
+            assert r.extend_logprob_start_len == self.extend_logprob_start_lens[i]
+            assert r.extend_input_len == self.extend_lens[i]
+
         self.extend_logprob_start_lens = [r.extend_logprob_start_len for r in reqs]
+        self.extend_lens = [r.extend_input_len for r in reqs]
         self.extend_input_logprob_token_ids = extend_input_logprob_token_ids
 
         if get_global_server_args().enable_mamba_extra_buffer():
@@ -1836,7 +1899,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.encoder_cached = [True] * len(self.reqs)
 
     def prepare_for_idle(self):
-        self.forward_mode = ForwardMode.IDLE
+        if self.forward_mode is not None:
+            assert self.forward_mode.is_idle()
+        else:
+            self.forward_mode = ForwardMode.IDLE
+
         self.input_ids = torch.empty(0, dtype=torch.int64, device=self.device)
         self.seq_lens = torch.empty(0, dtype=torch.int64, device=self.device)
         self.seq_lens_cpu = torch.empty(0, dtype=torch.int64)
@@ -1863,7 +1930,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             return
 
         if self.forward_mode is not None:
-            assert self.forward_mode == ForwardMode.DECODE
+            assert self.forward_mode.is_decode()
         else:
             self.forward_mode = ForwardMode.DECODE
 
@@ -1965,6 +2032,23 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # The batch has been launched but we need it verified to get correct next batch info
         self.maybe_wait_verify_done()
 
+        """
+        n_reqs = len(self.reqs)
+        if self.multimodal_inputs is not None:
+            n_multimodal_inputs = len(self.multimodal_inputs)
+        else:
+            n_multimodal_inputs = n_reqs
+        seq_lens_dim_0 = self.seq_lens_cpu.shape[0]
+        if n_reqs != n_multimodal_inputs:
+            print(self.reqs)
+            print(self.multimodal_inputs)
+            assert n_reqs == n_multimodal_inputs, f"{n_reqs=}, {n_multimodal_inputs=}"
+        if n_reqs != seq_lens_dim_0:
+            print(self.reqs)
+            print(self.seq_lens_cpu)
+            assert n_reqs == seq_lens_dim_0, f"{n_reqs=}, {self.seq_lens_cpu=}"
+        """
+
         if keep_indices is None:
             if isinstance(chunked_req_to_exclude, Req):
                 chunked_req_to_exclude = [chunked_req_to_exclude]
@@ -1975,6 +2059,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 for i in range(len(self.reqs))
                 if not self.reqs[i].finished()
                 and self.reqs[i] not in chunked_req_to_exclude
+                and not self.reqs[i].is_dummy()
             ]
 
         if keep_indices is None or len(keep_indices) == 0:
@@ -2170,6 +2255,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             return_logprob=self.return_logprob,
             decoding_reqs=self.decoding_reqs,
             spec_algorithm=self.spec_algorithm,
+            non_padded_batch_size=self.non_padded_batch_size,
+            non_padded_token_cnt=self.non_padded_token_cnt,
             global_num_tokens=self.global_num_tokens,
             global_num_tokens_for_logprob=self.global_num_tokens_for_logprob,
             can_run_dp_cuda_graph=self.can_run_dp_cuda_graph,

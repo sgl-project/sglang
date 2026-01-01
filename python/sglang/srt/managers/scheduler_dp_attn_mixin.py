@@ -7,9 +7,11 @@ import torch
 
 from sglang.srt.batch_overlap.two_batch_overlap import TboDPAttentionPreparer
 from sglang.srt.environ import envs
+from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.metrics.collector import DPCooperationInfo
-from sglang.srt.utils.common import require_mlp_tp_gather
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.utils.common import ceil_align, require_mlp_tp_gather
 
 if TYPE_CHECKING:
     from sglang.srt.distributed.parallel_state import GroupCoordinator
@@ -77,13 +79,61 @@ class MLPSyncBatchInfo:
             self.dp_cooperation_info = DPCooperationInfo.create(tp0_info[:, 5].tolist())
 
 
+def _process_local_dp_padding(local_batch: ScheduleBatch):
+    # make sure that the input length after padding is divisible by attn_tp_size because
+    # we need all-gather and reduce-scatter across attn_tp dim.
+    attn_tp_size = get_attention_tp_size()
+
+    if local_batch.forward_mode.is_decode():
+        non_padded_token_cnt = local_batch.batch_size()
+    elif local_batch.forward_mode.is_prebuilt():
+        non_padded_token_cnt = 0
+    elif local_batch.forward_mode.is_extend():
+        input_ids = [r.fill_ids[len(r.prefix_indices) :] for r in local_batch.reqs]
+        non_padded_token_cnt = sum(len(ids) for ids in input_ids)
+    else:
+        raise ValueError(f"Unsupported forward mode: {local_batch.forward_mode}")
+
+    # assert local_batch.non_padded_batch_size is None
+    # assert local_batch.non_padded_token_cnt is None
+
+    local_batch.non_padded_batch_size = local_batch.batch_size()
+    local_batch.non_padded_token_cnt = non_padded_token_cnt
+
+    for req in local_batch.reqs:
+        assert not req.is_dummy()
+
+    num_dummy_reqs = (
+        ceil_align(non_padded_token_cnt, attn_tp_size) - non_padded_token_cnt
+    )
+    local_batch.add_dummy_reqs(num_dummy_reqs)
+
+    if local_batch.forward_mode.is_extend():
+        # cache extend info for mlp sync preprocessing, these fields will be re-
+        # computed in `prepare_for_extend` and the results will remain the same.
+        local_batch.extend_num_tokens = non_padded_token_cnt + num_dummy_reqs
+        local_batch.extend_logprob_start_lens = [
+            r.extend_logprob_start_len for r in local_batch.reqs
+        ]
+        local_batch.extend_lens = [r.extend_input_len for r in local_batch.reqs]
+
+
+def _process_global_dp_padding(local_batch: ScheduleBatch):
+    if local_batch.forward_mode.is_prebuilt():
+        batch_to_pad = local_batch.inner_idle_batch
+    else:
+        batch_to_pad = local_batch
+
+
 def _update_gather_batch(
     batch: ScheduleBatch,
     mlp_sync_info: MLPSyncBatchInfo,
     require_mlp_tp_gather: bool,
     skip_all_gather=False,
 ):
-    # TODO: handle the case when moe_dense_tp_size != 1
+    # TODO: we need this branch because dp attn cannot tell if it requires mlp tp gather,
+    # thus collecting max/sum over glabal num_tokens generate incorrect results.
+    # remove this branch after refactor.
     if not require_mlp_tp_gather:
         batch.global_num_tokens = [mlp_sync_info.num_tokens]
         batch.global_num_tokens_for_logprob = [mlp_sync_info.num_tokens_for_logprob]
@@ -195,6 +245,10 @@ def prepare_mlp_sync_batch_raw(
 
 class SchedulerDPAttnMixin:
     def prepare_mlp_sync_batch(self: Scheduler, local_batch: ScheduleBatch):
+
+        if local_batch is not None:
+            _process_local_dp_padding(local_batch)
+
         return prepare_mlp_sync_batch_raw(
             local_batch,
             dp_size=self.server_args.dp_size,
@@ -207,6 +261,11 @@ class SchedulerDPAttnMixin:
             offload_tags=self.offload_tags,
         )
 
+    def post_process_mlp_sync_batch(self: Scheduler, batch: ScheduleBatch):
+        # batch.remove_dummy_reqs()
+        batch.non_padded_batch_size = None
+        batch.non_padded_token_cnt = None
+
     def get_idle_batch(self: Scheduler) -> ScheduleBatch:
         idle_batch = ScheduleBatch.init_new(
             [],
@@ -217,5 +276,6 @@ class SchedulerDPAttnMixin:
             self.enable_overlap,
             self.spec_algorithm,
         )
-        idle_batch.prepare_for_idle()
+        idle_batch.forward_mode = ForwardMode.IDLE
+        # idle_batch.prepare_for_idle()
         return idle_batch

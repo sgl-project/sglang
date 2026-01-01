@@ -1782,6 +1782,9 @@ class Scheduler(
             if self.chunked_req is not None and self.chunked_req.finished():
                 self.chunked_req = None
 
+        # if self.require_mlp_sync and self.last_batch is not None:
+        #     self.post_process_mlp_sync_batch(self.last_batch)
+
         # Merge the prefill batch into the running batch
         chunked_req_to_exclude = set()
         if self.chunked_req:
@@ -1843,9 +1846,6 @@ class Scheduler(
             self.log_prefill_stats_late(new_batch)
             return new_batch
 
-        if new_batch:
-            new_batch.prepare_for_extend()
-
         need_mlp_sync = self.require_mlp_sync
 
         if need_mlp_sync:
@@ -1867,7 +1867,6 @@ class Scheduler(
             # Run decode
             if not self.running_batch.is_empty():
                 self.running_batch = self.update_running_batch(self.running_batch)
-                self.running_batch.prepare_for_decode()
                 ret = self.running_batch if not self.running_batch.is_empty() else None
             else:
                 ret = None
@@ -1877,6 +1876,12 @@ class Scheduler(
             ret = self.prepare_mlp_sync_batch(ret)
 
         if ret:
+            if ret.forward_mode.is_extend():
+                ret.prepare_for_extend()
+            elif ret.forward_mode.is_decode():
+                ret.prepare_for_decode()
+            elif ret.forward_mode.is_idle():
+                ret.prepare_for_idle()
             trace_event_batch("schedule", ret.reqs)
 
         self.log_prefill_stats_late(ret)
@@ -2182,6 +2187,8 @@ class Scheduler(
         """Run a batch."""
         self.forward_ct += 1
 
+        # TODO: remove dummy reqs and results before returning
+
         # Whether to run the profiler
         self._profile_batch_predicate(batch)
         if self.forward_sleep_time is not None:
@@ -2335,6 +2342,9 @@ class Scheduler(
         batch: ScheduleBatch,
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
     ):
+        # if self.require_mlp_sync:
+        #     self.post_process_mlp_sync_batch(batch)
+
         if batch.forward_mode.is_decode():
             self.process_batch_result_decode(batch, result)
             trace_slice_batch(RequestStage.DECODE_LOOP, batch.reqs)
