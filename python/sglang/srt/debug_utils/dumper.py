@@ -157,7 +157,7 @@ def _obj_to_dict(obj):
         k: v
         for k in dir(obj)
         if not (k.startswith("__") and k.endswith("__"))
-           and not callable(v := getattr(obj, k))
+        and not callable(v := getattr(obj, k))
     }
 
 
