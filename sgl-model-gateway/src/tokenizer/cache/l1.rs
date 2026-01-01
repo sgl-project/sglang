@@ -199,7 +199,7 @@ impl L1Cache {
 
             // 1. Incremental Hash update
             hasher.update(delta_text.as_bytes());
-            let hash_bytes: Blake3Hash = *hasher.finalize().as_bytes();
+            let hash_bytes: Blake3Hash = *hasher.clone().finalize().as_bytes();
 
             // 2. Incremental Tokenization
             // Only add special tokens (like BOS) for the very first segment to avoid duplicates
