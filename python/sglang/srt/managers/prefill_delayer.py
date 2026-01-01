@@ -4,20 +4,17 @@ from sglang.srt.environ import envs
 
 
 class PrefillDelayer:
-    def __init__(
-        self, dp_size, attn_tp_size, tp_worker, max_running_requests, server_args
-    ):
-        self.dp_size = dp_size
-        self.attn_tp_size = attn_tp_size
+    def __init__(self, dp_size, attn_tp_size, tp_worker, server_args):
         self.global_info = torch.empty(
-            (self.dp_size, self.attn_tp_size, 2),
+            (dp_size, attn_tp_size, 2),
             dtype=torch.int64,
             device="cpu",
         )
         self.cpu_group = tp_worker.get_tp_group().cpu_group
-        self.max_running_requests = max_running_requests
+
         self.delayed_count = 0
         self.max_delay_passes = envs.SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES.get()
+
         assert (
             server_args.schedule_policy == "fcfs"
         ), f"To use SCHEDULER_DECREASE_PREFILL_IDLE, schedule_policy must be 'fcfs'. '{server_args.schedule_policy}' is not supported."

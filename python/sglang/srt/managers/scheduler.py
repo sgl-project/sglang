@@ -795,11 +795,10 @@ class Scheduler(
         self.prefill_delayer: Optional[PrefillDelayer] = None
         if envs.SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE.get():
             self.prefill_delayer = PrefillDelayer(
-                self.dp_size,
-                self.attn_tp_size,
-                self.tp_worker,
-                self.max_running_requests,
-                self.server_args,
+                dp_size=self.dp_size,
+                attn_tp_size=self.attn_tp_size,
+                tp_worker=self.tp_worker,
+                server_args=self.server_args,
             )
         # Enable preemption for priority scheduling.
         self.try_preemption = self.enable_priority_scheduling
