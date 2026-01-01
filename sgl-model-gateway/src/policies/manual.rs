@@ -733,8 +733,8 @@ mod tests {
         use std::time::Duration;
 
         let config = ManualConfig {
-            eviction_interval_secs: 1,
-            max_idle_secs: 1,
+            eviction_interval_secs: 2,
+            max_idle_secs: 2,
         };
         let policy = ManualPolicy::with_config(config);
         let workers = create_workers(&["http://w1:8000", "http://w2:8000"]);
@@ -748,7 +748,7 @@ mod tests {
 
         assert_eq!(policy.routing_map.len(), 1);
 
-        std::thread::sleep(Duration::from_secs(3));
+        std::thread::sleep(Duration::from_secs(4));
 
         assert_eq!(policy.routing_map.len(), 0);
     }
