@@ -1677,10 +1677,7 @@ def get_npu_memory_capacity():
 
 def get_cpu_memory_capacity():
     # Per-rank memory capacity cannot be determined for customized core settings
-    if (
-        envs.SGLANG_CPU_OMP_THREADS_BIND.is_set()
-        and envs.SGLANG_CPU_OMP_THREADS_BIND.get()
-    ):
+    if envs.SGLANG_CPU_OMP_THREADS_BIND.get():
         return None
     n_numa_node: int = len(get_cpu_ids_by_node())
     if n_numa_node == 0:
