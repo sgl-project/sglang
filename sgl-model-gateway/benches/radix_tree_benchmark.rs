@@ -23,7 +23,6 @@ use rand::{
     distr::{Alphanumeric, SampleString},
     rng as thread_rng, Rng,
 };
-
 // Import both old and new tree implementations
 use sgl_model_gateway::policies::tree::Tree as OldTree;
 use sgl_model_gateway::radix_tree::{StringTree, TokenTree};
@@ -130,11 +129,13 @@ fn bench_summary(c: &mut Criterion) {
 
     // Pre-generate requests
     let string_requests = generate_realistic_requests(TREE_SIZE);
-    let avg_chars: usize = string_requests.iter().map(|r| r.len()).sum::<usize>() / string_requests.len();
+    let avg_chars: usize =
+        string_requests.iter().map(|r| r.len()).sum::<usize>() / string_requests.len();
 
     // Token sequences with ~4 chars per token ratio
     let token_sequences = generate_token_sequences(TREE_SIZE, (250, 750));
-    let avg_tokens: usize = token_sequences.iter().map(|s| s.len()).sum::<usize>() / token_sequences.len();
+    let avg_tokens: usize =
+        token_sequences.iter().map(|s| s.len()).sum::<usize>() / token_sequences.len();
 
     // Report test configuration
     add_result("config", "Test Configuration:".to_string());
@@ -146,10 +147,7 @@ fn bench_summary(c: &mut Criterion) {
             avg_chars / 4
         ),
     );
-    add_result(
-        "config",
-        format!("  TokenTree:  ~{} tokens", avg_tokens),
-    );
+    add_result("config", format!("  TokenTree:  ~{} tokens", avg_tokens));
     add_result(
         "config",
         format!("  Tree size: {} entries (for MATCH tests)", TREE_SIZE),
@@ -174,7 +172,10 @@ fn bench_summary(c: &mut Criterion) {
     // OLD vs NEW StringTree Comparison
     // ========================================================================
     add_result("oldnew", "".to_string());
-    add_result("oldnew", "OLD (policies::tree) vs NEW (radix_tree::StringTree):".to_string());
+    add_result(
+        "oldnew",
+        "OLD (policies::tree) vs NEW (radix_tree::StringTree):".to_string(),
+    );
 
     // Pre-populate both trees
     let old_tree = Arc::new(OldTree::new());
@@ -227,7 +228,10 @@ fn bench_summary(c: &mut Criterion) {
         }
     });
 
-    add_result("oldnew", "  (See Criterion output above for OLD vs NEW timing)".to_string());
+    add_result(
+        "oldnew",
+        "  (See Criterion output above for OLD vs NEW timing)".to_string(),
+    );
 
     // ========================================================================
     // StringTree vs TokenTree INSERT at different worker scales

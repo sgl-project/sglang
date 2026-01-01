@@ -11,8 +11,10 @@ use std::{
 use dashmap::{mapref::entry::Entry, DashMap};
 use tracing::debug;
 
-use super::common::{MatchResult, TenantId};
-use super::RadixTree;
+use super::{
+    common::{MatchResult, TenantId},
+    RadixTree,
+};
 
 type NodeRef = Arc<Node>;
 
@@ -942,11 +944,7 @@ impl Tree {
 
     /// Evict entries for a specific tenant to reduce to max_chars.
     pub fn evict_by_tenant(&self, tenant: &TenantId, max_chars: usize) {
-        let current_count = self
-            .tenant_char_count
-            .get(tenant)
-            .map(|v| *v)
-            .unwrap_or(0);
+        let current_count = self.tenant_char_count.get(tenant).map(|v| *v).unwrap_or(0);
 
         if current_count <= max_chars {
             return;

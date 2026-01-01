@@ -19,8 +19,10 @@ use std::{
 use dashmap::DashMap;
 use tracing::debug;
 
-use super::common::{MatchResult, TenantId};
-use super::RadixTree;
+use super::{
+    common::{MatchResult, TenantId},
+    RadixTree,
+};
 
 /// Token ID type (matches SGLang's token representation)
 pub type TokenId = u32;
@@ -146,11 +148,6 @@ impl Node {
             tenant_last_access_time: DashMap::with_shard_amount(ROOT_SHARD_COUNT),
             last_tenant: RwLock::new(None),
         }
-    }
-
-    /// Check if this node is a leaf (owned by at least one tenant and has no children)
-    fn is_leaf(&self) -> bool {
-        self.children.is_empty() && !self.tenant_last_access_time.is_empty()
     }
 
     /// Get any tenant that owns this node (for match results)
@@ -288,11 +285,15 @@ impl TokenTree {
                             tokens: RwLock::new(prefix_tokens),
                             children: new_children_map(),
                             tenant_last_access_time: child.tenant_last_access_time.clone(),
-                            last_tenant: RwLock::new(child.last_tenant.read().ok().and_then(|g| g.clone())),
+                            last_tenant: RwLock::new(
+                                child.last_tenant.read().ok().and_then(|g| g.clone()),
+                            ),
                         });
 
                         // Add original child (now suffix) as child of intermediate
-                        intermediate_node.children.insert(suffix_first, Arc::clone(&child));
+                        intermediate_node
+                            .children
+                            .insert(suffix_first, Arc::clone(&child));
 
                         // Replace entry with intermediate node
                         entry.insert(intermediate_node.clone());
@@ -318,17 +319,23 @@ impl TokenTree {
                             tokens: RwLock::new(prefix_tokens),
                             children: new_children_map(),
                             tenant_last_access_time: child.tenant_last_access_time.clone(),
-                            last_tenant: RwLock::new(child.last_tenant.read().ok().and_then(|g| g.clone())),
+                            last_tenant: RwLock::new(
+                                child.last_tenant.read().ok().and_then(|g| g.clone()),
+                            ),
                         });
 
                         // Add original child (now suffix) as child of intermediate
-                        intermediate_node.children.insert(child_suffix_first, Arc::clone(&child));
+                        intermediate_node
+                            .children
+                            .insert(child_suffix_first, Arc::clone(&child));
 
                         // Create new node for the remaining input suffix
                         let new_remaining = &remaining[common_len..];
                         let new_node = Arc::new(Node::new(new_remaining.to_vec()));
                         new_node.touch_tenant(&tenant_id);
-                        intermediate_node.children.insert(new_remaining[0], new_node);
+                        intermediate_node
+                            .children
+                            .insert(new_remaining[0], new_node);
 
                         // Replace entry with intermediate node
                         entry.insert(intermediate_node.clone());
@@ -383,8 +390,15 @@ impl TokenTree {
 
         enum MatchStep {
             Done,
-            Continue { next: NodeRef, advance: usize, tenant: Option<TenantId> },
-            PartialMatch { matched: usize, tenant: Option<TenantId> },
+            Continue {
+                next: NodeRef,
+                advance: usize,
+                tenant: Option<TenantId>,
+            },
+            PartialMatch {
+                matched: usize,
+                tenant: Option<TenantId>,
+            },
         }
 
         while !remaining.is_empty() {
@@ -412,11 +426,18 @@ impl TokenTree {
 
                         if match_len < child_tokens.len() {
                             // Partial match within node
-                            MatchStep::PartialMatch { matched: match_len, tenant }
+                            MatchStep::PartialMatch {
+                                matched: match_len,
+                                tenant,
+                            }
                         } else {
                             // Full match - continue
                             drop(child_tokens);
-                            MatchStep::Continue { next: child, advance: match_len, tenant }
+                            MatchStep::Continue {
+                                next: child,
+                                advance: match_len,
+                                tenant,
+                            }
                         }
                     }
                 }
@@ -431,7 +452,11 @@ impl TokenTree {
                     }
                     break;
                 }
-                MatchStep::Continue { next, advance, tenant } => {
+                MatchStep::Continue {
+                    next,
+                    advance,
+                    tenant,
+                } => {
                     matched_tokens += advance;
                     if let Some(t) = tenant {
                         last_tenant = Some(t);
@@ -467,11 +492,7 @@ impl TokenTree {
 
     /// Evict entries for a tenant to reduce to max_tokens.
     pub fn evict_tenant(&self, tenant: &TenantId, max_tokens: usize) {
-        let current_count = self
-            .tenant_token_count
-            .get(tenant)
-            .map(|v| *v)
-            .unwrap_or(0);
+        let current_count = self.tenant_token_count.get(tenant).map(|v| *v).unwrap_or(0);
 
         if current_count <= max_tokens {
             return;
@@ -790,7 +811,7 @@ mod tests {
         tree.insert_tokens(&[1, 2, 3], "tenant1");
         tree.insert_tokens(&[4, 5, 6], "tenant2");
 
-        assert!(tree.get_tenant_token_counts().len() > 0);
+        assert!(!tree.get_tenant_token_counts().is_empty());
 
         tree.clear();
 
@@ -814,8 +835,8 @@ mod tests {
         assert!(tree.tenant_token_size(&tenant2_id) >= 3);
 
         let counts = tree.get_tenant_token_counts();
-        assert!(counts.get("tenant1").is_some());
-        assert!(counts.get("tenant2").is_some());
+        assert!(counts.contains_key("tenant1"));
+        assert!(counts.contains_key("tenant2"));
     }
 
     #[test]
@@ -855,7 +876,8 @@ mod tests {
             let tree = Arc::clone(&tree);
             handles.push(thread::spawn(move || {
                 for i in 0..entries_per_thread {
-                    let tokens: Vec<TokenId> = (0..10).map(|j| (t * 10000 + i * 100 + j) as u32).collect();
+                    let tokens: Vec<TokenId> =
+                        (0..10).map(|j| (t * 10000 + i * 100 + j) as u32).collect();
                     tree.insert_tokens(&tokens, &format!("tenant{}", t));
                 }
             }));
@@ -870,7 +892,8 @@ mod tests {
             let tree = Arc::clone(&tree);
             handles.push(thread::spawn(move || {
                 for i in 0..entries_per_thread {
-                    let tokens: Vec<TokenId> = (0..10).map(|j| (t * 10000 + i * 100 + j) as u32).collect();
+                    let tokens: Vec<TokenId> =
+                        (0..10).map(|j| (t * 10000 + i * 100 + j) as u32).collect();
                     let (matched, tenant) = tree.prefix_match_legacy(&tokens);
                     assert_eq!(matched, tokens);
                     assert_eq!(tenant, format!("tenant{}", t));
@@ -894,7 +917,8 @@ mod tests {
             let tree = Arc::clone(&tree);
             handles.push(thread::spawn(move || {
                 for i in 0..entries_per_thread {
-                    let tokens: Vec<TokenId> = (0..20).map(|j| (t * 10000 + i * 100 + j) as u32).collect();
+                    let tokens: Vec<TokenId> =
+                        (0..20).map(|j| (t * 10000 + i * 100 + j) as u32).collect();
                     tree.insert_tokens(&tokens, &format!("tenant{}", t));
                 }
             }));
@@ -909,7 +933,8 @@ mod tests {
             let tree = Arc::clone(&tree);
             handles.push(thread::spawn(move || {
                 for i in 0..entries_per_thread {
-                    let full_tokens: Vec<TokenId> = (0..20).map(|j| (t * 10000 + i * 100 + j) as u32).collect();
+                    let full_tokens: Vec<TokenId> =
+                        (0..20).map(|j| (t * 10000 + i * 100 + j) as u32).collect();
                     let partial: Vec<TokenId> = full_tokens[..10].to_vec();
                     let (matched, _) = tree.prefix_match_legacy(&partial);
                     assert_eq!(matched, partial);
@@ -968,7 +993,9 @@ mod tests {
             let tree = Arc::clone(&tree);
             handles.push(thread::spawn(move || {
                 for i in 0..100 {
-                    let tokens: Vec<TokenId> = (0..10).map(|j| (1000000 + t * 10000 + i * 100 + j) as u32).collect();
+                    let tokens: Vec<TokenId> = (0..10)
+                        .map(|j| (1000000 + t * 10000 + i * 100 + j) as u32)
+                        .collect();
                     tree.insert_tokens(&tokens, &format!("new_tenant{}", t));
                 }
             }));
@@ -1046,7 +1073,9 @@ mod tests {
             let tree = Arc::clone(&tree);
             handles.push(thread::spawn(move || {
                 for i in 0..50 {
-                    let tokens: Vec<TokenId> = (0..10).map(|j| (100000 + t * 10000 + i * 100 + j) as u32).collect();
+                    let tokens: Vec<TokenId> = (0..10)
+                        .map(|j| (100000 + t * 10000 + i * 100 + j) as u32)
+                        .collect();
                     tree.insert_tokens(&tokens, &format!("tenant{}", t));
                 }
             }));
@@ -1065,7 +1094,7 @@ mod tests {
         }
 
         // Matchers
-        for t in 0..num_threads {
+        for _ in 0..num_threads {
             let tree = Arc::clone(&tree);
             handles.push(thread::spawn(move || {
                 for i in 0..50 {
@@ -1321,7 +1350,9 @@ mod tests {
                 for cycle in 0..10 {
                     // Insert
                     for i in 0..20 {
-                        let tokens: Vec<TokenId> = (0..5).map(|j| (t * 10000 + cycle * 1000 + i * 10 + j) as u32).collect();
+                        let tokens: Vec<TokenId> = (0..5)
+                            .map(|j| (t * 10000 + cycle * 1000 + i * 10 + j) as u32)
+                            .collect();
                         tree.insert_tokens(&tokens, &format!("tenant{}", t));
                     }
                     // Evict
@@ -1421,7 +1452,10 @@ mod tests {
 
         // Insert
         tree.insert_tokens(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10], "tenant1");
-        tree.insert_tokens(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15], "tenant1");
+        tree.insert_tokens(
+            &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+            "tenant1",
+        );
 
         let tenant1_id: TenantId = Arc::from("tenant1");
         let count1 = tree.tenant_token_size(&tenant1_id);
@@ -1450,7 +1484,8 @@ mod tests {
             let tree = Arc::clone(&tree);
             handles.push(thread::spawn(move || {
                 for i in 0..200 {
-                    let tokens: Vec<TokenId> = (0..10).map(|j| (t * 100000 + i * 100 + j) as u32).collect();
+                    let tokens: Vec<TokenId> =
+                        (0..10).map(|j| (t * 100000 + i * 100 + j) as u32).collect();
                     tree.insert_tokens(&tokens, &format!("tenant{}", t));
                 }
             }));
@@ -1463,7 +1498,8 @@ mod tests {
         // Verify structure by matching
         for t in 0..num_threads {
             for i in 0..10 {
-                let tokens: Vec<TokenId> = (0..10).map(|j| (t * 100000 + i * 100 + j) as u32).collect();
+                let tokens: Vec<TokenId> =
+                    (0..10).map(|j| (t * 100000 + i * 100 + j) as u32).collect();
                 let (matched, _) = tree.prefix_match_legacy(&tokens);
                 assert_eq!(matched, tokens);
             }
@@ -1504,7 +1540,7 @@ mod tests {
 
         // All 100 tenants should have registered
         let counts = tree.get_tenant_token_counts();
-        assert!(counts.len() >= 1); // At least some tenants tracked
+        assert!(!counts.is_empty()); // At least some tenants tracked
     }
 
     #[test]
