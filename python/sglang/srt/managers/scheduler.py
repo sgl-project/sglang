@@ -1878,14 +1878,14 @@ class Scheduler(
             self.running_batch.batch_is_full = False
 
         # The `should_allow_prefill` needs to be called on all ranks since contains communication
-        prefill_delayer_allow_prefill = (
+        delayer_allow_prefill = (
             self.prefill_delayer.should_allow_prefill(
                 waiting_queue_len=len(self.waiting_queue)
             )
             if self.prefill_delayer
             else True
         )
-        if (not prefill_delayer_allow_prefill) or (
+        if (not delayer_allow_prefill) or (
             (self.running_batch.batch_is_full or len(self.waiting_queue) == 0)
             and self.chunked_req is None
         ):
