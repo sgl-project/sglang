@@ -2070,7 +2070,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         )
 
     def init_threads_binding(self):
-        omp_cpuids = os.environ.get("SGLANG_CPU_OMP_THREADS_BIND", "all")
+        if not envs.SGLANG_CPU_OMP_THREADS_BIND.is_set():
+            omp_cpuids = "all"
+        else:
+            omp_cpuids = envs.SGLANG_CPU_OMP_THREADS_BIND.get()
         cpu_ids_by_node = get_cpu_ids_by_node()
         n_numa_node = len(cpu_ids_by_node)
         if omp_cpuids == "all":

@@ -24,6 +24,7 @@ from grpc_reflection.v1alpha import reflection
 import sglang
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST, DisaggregationMode
+from sglang.srt.environ import envs
 from sglang.srt.grpc import sglang_scheduler_pb2, sglang_scheduler_pb2_grpc
 from sglang.srt.grpc.grpc_request_manager import GrpcRequestManager
 from sglang.srt.grpc.health_servicer import SGLangHealthServicer
@@ -39,7 +40,7 @@ from sglang.srt.utils import kill_process_tree
 from sglang.utils import get_exception_traceback
 
 logger = logging.getLogger(__name__)
-HEALTH_CHECK_TIMEOUT = int(os.getenv("SGLANG_HEALTH_CHECK_TIMEOUT", 20))
+HEALTH_CHECK_TIMEOUT = envs.SGLANG_HEALTH_CHECK_TIMEOUT.get()
 
 
 class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer):

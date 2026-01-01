@@ -155,8 +155,8 @@ logger = logging.getLogger(__name__)
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
 # Global constants
-HEALTH_CHECK_TIMEOUT = int(os.getenv("SGLANG_HEALTH_CHECK_TIMEOUT", 20))
-WAIT_WEIGHTS_READY_TIMEOUT = int(os.getenv("SGLANG_WAIT_WEIGHTS_READY_TIMEOUT", 120))
+HEALTH_CHECK_TIMEOUT = envs.SGLANG_HEALTH_CHECK_TIMEOUT.get()
+WAIT_WEIGHTS_READY_TIMEOUT = envs.SGLANG_WAIT_WEIGHTS_READY_TIMEOUT.get()
 
 
 # Store global states
