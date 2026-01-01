@@ -1361,7 +1361,13 @@ class ServerArgs:
                 else:
                     self.quantization = model_config.quantization
                 self.moe_runner_backend = "flashinfer_cutlass"
-            if not self.disable_radix_cache:
+
+            if not self.disable_radix_cache and self.speculative_algorithm is not None:
+                logger.warning(
+                    "Disabling radix cache since speculative decoding for NemotronHForCausalLM is not supported with radix cache yet."
+                )
+                self.disable_radix_cache = True
+            elif not self.disable_radix_cache:
                 logger.warning(
                     "Disabling overlap schedule since MambaRadixCache is not compatible with "
                     "overlap schedule currently, try to use --disable-radix-cache if overlap schedule is necessary"
