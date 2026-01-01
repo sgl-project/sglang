@@ -1838,9 +1838,9 @@ class ServerArgs:
             self.enable_dp_lm_head = False
 
         if self.enable_dp_attention:
-            self.schedule_conservativeness = self.schedule_conservativeness * 0.3
+            # self.schedule_conservativeness = self.schedule_conservativeness * 0.3
             assert self.tp_size % self.dp_size == 0
-            self.chunked_prefill_size = self.chunked_prefill_size // self.dp_size
+            # self.chunked_prefill_size = self.chunked_prefill_size // self.dp_size
             logger.warning(
                 f"DP attention is enabled. The chunked prefill size is adjusted to {self.chunked_prefill_size} to avoid MoE kernel issues. "
             )
