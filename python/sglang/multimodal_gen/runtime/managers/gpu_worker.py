@@ -9,6 +9,7 @@ from typing import List
 import torch
 from setproctitle import setproctitle
 
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.distributed import (
     get_sp_group,
     maybe_init_distributed_environment_and_model_parallel,
@@ -17,8 +18,13 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_cfg_group,
     get_tp_group,
 )
-from sglang.multimodal_gen.runtime.pipelines_core import Req, build_pipeline
+from sglang.multimodal_gen.runtime.pipelines_core import (
+    ComposedPipelineBase,
+    Req,
+    build_pipeline,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import PortArgs, ServerArgs
 from sglang.multimodal_gen.runtime.utils.common import set_cuda_arch
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
@@ -26,10 +32,7 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import (
     globally_suppress_loggers,
     init_logger,
 )
-from sglang.multimodal_gen.runtime.utils.perf_logger import (
-    PerformanceLogger,
-    RequestTimings,
-)
+from sglang.multimodal_gen.runtime.utils.perf_logger import PerformanceLogger
 
 logger = init_logger(__name__)
 
@@ -51,7 +54,7 @@ class GPUWorker:
         self.master_port = master_port
         # FIXME: should we use tcp as distribute init method?
         self.server_args = server_args
-        self.pipeline = None
+        self.pipeline: ComposedPipelineBase = None
 
         self.init_device_and_model()
         self.sp_group = get_sp_group()
@@ -101,18 +104,31 @@ class GPUWorker:
                 torch.cuda.reset_peak_memory_stats()
 
             start_time = time.monotonic()
-            timings = RequestTimings(request_id=req.request_id)
-            req.timings = timings
 
             output_batch = self.pipeline.forward(req, self.server_args)
-            duration_ms = (time.monotonic() - start_time) * 1000
 
             if self.rank == 0:
                 peak_memory_bytes = torch.cuda.max_memory_allocated()
                 output_batch.peak_memory_mb = peak_memory_bytes / (1024**2)
+                peak_memory_gb = peak_memory_bytes / (1024**3)
+                remaining_gpu_mem_gb = (
+                    current_platform.get_device_total_memory() / (1024**3)
+                    - peak_memory_gb
+                )
+                can_stay_resident = self.get_can_stay_resident_components(
+                    remaining_gpu_mem_gb
+                )
+                logger.info(
+                    f"Peak GPU memory: {peak_memory_gb:.2f} GB, "
+                    f"Remaining GPU memory at peak: {remaining_gpu_mem_gb:.2f} GB. "
+                    f"Components that can stay resident: {can_stay_resident}"
+                )
 
-            if output_batch.timings:
-                output_batch.timings.total_duration_ms = duration_ms
+            duration_ms = (time.monotonic() - start_time) * 1000
+            output_batch.timings.total_duration_ms = duration_ms
+
+            # TODO: extract to avoid duplication
+            if req.perf_dump_path is not None or envs.SGLANG_DIFFUSION_STAGE_LOGGING:
                 PerformanceLogger.log_request_summary(timings=output_batch.timings)
         except Exception as e:
             logger.error(
@@ -127,6 +143,40 @@ class GPUWorker:
             output_batch.error = f"Error executing request {req.request_id}: {e}"
         finally:
             return output_batch
+
+    def get_can_stay_resident_components(
+        self, remaining_gpu_mem_gb: float
+    ) -> List[str]:
+        """
+        Calculate which components can stay resident on GPU without being offloaded.
+        """
+        can_stay_resident = []
+        if not self.pipeline:
+            return can_stay_resident
+
+        # Map memory_usage keys to server_args offload flags
+        # If the flag is False, the component is ALREADY resident, so we don't suggest it.
+        # If the flag is True, it is currently offloaded, so it's a candidate to "stay resident".
+        offload_flags = {
+            "transformer": self.server_args.dit_cpu_offload
+            or self.server_args.dit_layerwise_offload,
+            "vae": self.server_args.vae_cpu_offload,
+            "text_encoder": self.server_args.text_encoder_cpu_offload,
+            "text_encoder_2": self.server_args.text_encoder_cpu_offload,
+            "image_encoder": self.server_args.image_encoder_cpu_offload,
+        }
+
+        for name, usage in self.pipeline.memory_usages.items():
+            # Only consider components that are currently configured to be offloaded
+            is_offload_configured = offload_flags.get(name, False)
+            if not is_offload_configured:
+                continue
+
+            if usage <= remaining_gpu_mem_gb:
+                can_stay_resident.append(name)
+                remaining_gpu_mem_gb -= usage
+
+        return can_stay_resident
 
     def set_lora(
         self,

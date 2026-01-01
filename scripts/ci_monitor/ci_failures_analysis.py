@@ -699,10 +699,8 @@ class SGLangFailuresAnalyzer:
         # Build final results
         job_streak_data = {}
         for job_name in job_current_streak.keys():
-            # Get last 5 runs (most recent first)
-            recent_runs = job_recent_runs.get(job_name, [])[-5:][
-                ::-1
-            ]  # Last 5, reversed
+            # Get last 5 runs (oldest to latest, chronological order)
+            recent_runs = job_recent_runs.get(job_name, [])[-5:]
 
             job_streak_data[job_name] = {
                 "current_streak": job_current_streak[job_name],
@@ -832,8 +830,10 @@ class SGLangFailuresAnalyzer:
             if broken:
                 print(f"## {title} ({len(broken)} jobs with active streaks)")
                 print("=" * 130)
+                # Add sub-header to clarify this shows ongoing failure streaks
+                print("\n🔥 Consecutive failures (>=2) & currently failing")
                 print(
-                    f"\n{'Job Name':<40} {'Current':<8} {'Max':<6} {'Runs':<6} {'First':<13} {'Last':<13} {'Recent History':<30}"
+                    f"\n{'Job Name':<40} {'Current':<8} {'Max':<6} {'Runs':<6} {'First':<13} {'Last':<13} {'Recent Runs (oldest → latest)':<30}"
                 )
                 print("-" * 130)
                 for job_name, d in broken[:15]:
@@ -856,7 +856,7 @@ class SGLangFailuresAnalyzer:
                     # Recent history (last 5 runs as emoji)
                     recent_runs = d.get("recent_runs", [])
                     history_str = (
-                        " ".join([r["status"] for r in recent_runs])
+                        "… " + " ".join([r["status"] for r in recent_runs])
                         if recent_runs
                         else "N/A"
                     )
@@ -864,11 +864,11 @@ class SGLangFailuresAnalyzer:
                     # Color red if color_failures is True (for critical sections)
                     if color_failures:
                         print(
-                            f"\033[91m{display_name:<40}\033[0m {d['current_streak']:<8} {d['max_streak']:<6} {d['total_runs']:<6} {first_str:<13} {last_str:<13} {history_str:<30}"
+                            f"\033[91m{display_name:<40}\033[0m {d['current_streak']:<8} {d['max_streak']:<6} {d['total_runs']:<6} {first_str:<13} {last_str:<13} {history_str:<32}"
                         )
                     else:
                         print(
-                            f"{display_name:<40} {d['current_streak']:<8} {d['max_streak']:<6} {d['total_runs']:<6} {first_str:<13} {last_str:<13} {history_str:<30}"
+                            f"{display_name:<40} {d['current_streak']:<8} {d['max_streak']:<6} {d['total_runs']:<6} {first_str:<13} {last_str:<13} {history_str:<32}"
                         )
             else:
                 print(f"## {title}")
@@ -877,11 +877,17 @@ class SGLangFailuresAnalyzer:
 
             # Show recently failed jobs in a collapsed section (terminal doesn't support collapse, so just show as separate section)
             if recently_failed:
+                # Extract just the workflow name without the run count for cleaner display
+                short_title = title.split("(")[0].strip()
+                if short_title and short_title[0].isdigit():
+                    short_title = short_title.split(".", 1)[-1].strip()
+                # Get the max total_runs from recently_failed jobs to show the analysis window
+                max_total_runs = max(d["total_runs"] for _, d in recently_failed)
                 print(
-                    f"\n   Recently failed jobs (no active streak): {len(recently_failed)} jobs"
+                    f"\n   📋 [{short_title}] No current failure streak, but had failures in the past {max_total_runs} runs - {len(recently_failed)} jobs"
                 )
                 print(
-                    f"   {'Job Name':<38} {'Failures':<12} {'Fail Rate':<12} {'Total Runs':<12} {'Recent History (last 5)':<30}"
+                    f"   {'Job Name':<38} {'Failures':<12} {'Fail Rate':<12} {'Total Runs':<12} {'Recent Runs (oldest → latest)':<30}"
                 )
                 print("   " + "-" * 120)
                 for job_name, d in recently_failed[:10]:
@@ -890,12 +896,12 @@ class SGLangFailuresAnalyzer:
                     )
                     recent_runs = d.get("recent_runs", [])
                     history_str = (
-                        " ".join([r["status"] for r in recent_runs])
+                        "… " + " ".join([r["status"] for r in recent_runs])
                         if recent_runs
                         else "N/A"
                     )
                     print(
-                        f"   {display_name:<38} {d['total_failures']:<12} {d['failure_rate']:.1f}%{'':<7} {d['total_runs']:<12} {history_str:<30}"
+                        f"   {display_name:<38} {d['total_failures']:<12} {d['failure_rate']:.1f}%{'':<7} {d['total_runs']:<12} {history_str:<32}"
                     )
 
         # ========== SCHEDULED/MAIN BRANCH RUNS (9 sections) ==========
@@ -1185,7 +1191,9 @@ class SGLangFailuresAnalyzer:
             summary_lines.append(
                 f"**Analysis Timestamp:** {report_data['summary']['analysis_timestamp']}"
             )
-            summary_lines.append("_Note: Recent runs are shown left to right_")
+            summary_lines.append(
+                "_Note: Recent runs are shown oldest → latest (left to right)_"
+            )
             summary_lines.append("")
 
             # Summary stats - COLLAPSIBLE
@@ -1267,11 +1275,16 @@ class SGLangFailuresAnalyzer:
                 summary_lines.append("")
 
                 if broken:
+                    # Add sub-header to clarify this shows ongoing failure streaks
                     summary_lines.append(
-                        "| Job Name | Current | Max | Runs | First | Last | Recent History |"
+                        "🔥 **Consecutive failures (≥2) & currently failing**"
+                    )
+                    summary_lines.append("")
+                    summary_lines.append(
+                        "| Job Name | Current | Max | Runs | First | Last | Recent Runs (oldest → latest) |"
                     )
                     summary_lines.append(
-                        "|----------|---------|-----|------|-------|------|----------------|"
+                        "|----------|---------|-----|------|-------|------|-------------------------------|"
                     )
                     for job_name, d in broken[:15]:
                         display_name = (
@@ -1295,7 +1308,7 @@ class SGLangFailuresAnalyzer:
                         # Recent history (last 5 runs as clickable emoji)
                         recent_runs = d.get("recent_runs", [])
                         if recent_runs:
-                            history_links = " ".join(
+                            history_links = "… " + " ".join(
                                 [
                                     f"[{r['status']}]({r['job_url']})"
                                     for r in recent_runs
@@ -1324,16 +1337,24 @@ class SGLangFailuresAnalyzer:
 
                 # Show recently failed jobs in a collapsible section
                 if recently_failed:
+                    # Extract just the workflow name without the run count for cleaner display
+                    # e.g., "1. PR Test NVIDIA - Scheduled (latest 12 runs)" -> "PR Test NVIDIA - Scheduled"
+                    short_title = title.split("(")[0].strip()
+                    # Remove the leading number and period if present
+                    if short_title and short_title[0].isdigit():
+                        short_title = short_title.split(".", 1)[-1].strip()
+                    # Get the max total_runs from recently_failed jobs to show the analysis window
+                    max_total_runs = max(d["total_runs"] for _, d in recently_failed)
                     summary_lines.append("<details>")
                     summary_lines.append(
-                        f"<summary>Recently failed jobs (no active streak) - {len(recently_failed)} jobs</summary>"
+                        f"<summary>📋 [{short_title}] No current failure streak, but had failures in the past {max_total_runs} runs - {len(recently_failed)} jobs</summary>"
                     )
                     summary_lines.append("")
                     summary_lines.append(
-                        "| Job Name | Failures | Fail Rate | Total Runs | Recent History (last 5) |"
+                        "| Job Name | Failures | Fail Rate | Total Runs | Recent Runs (oldest → latest) |"
                     )
                     summary_lines.append(
-                        "|----------|----------|-----------|------------|-------------------------|"
+                        "|----------|----------|-----------|------------|-------------------------------|"
                     )
                     for job_name, d in recently_failed[:15]:
                         display_name = (
@@ -1341,7 +1362,7 @@ class SGLangFailuresAnalyzer:
                         )
                         recent_runs = d.get("recent_runs", [])
                         if recent_runs:
-                            history_links = " ".join(
+                            history_links = "… " + " ".join(
                                 [
                                     f"[{r['status']}]({r['job_url']})"
                                     for r in recent_runs
