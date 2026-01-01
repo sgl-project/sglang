@@ -148,7 +148,7 @@ impl L1Cache {
 
         for &boundary_pos in &boundaries {
             hasher.update(input[last_pos..boundary_pos].as_bytes());
-            prefix_hashes.push((boundary_pos, *hasher.finalize().as_bytes()));
+            prefix_hashes.push((boundary_pos, *hasher.clone().finalize().as_bytes()));
             last_pos = boundary_pos;
         }
 
