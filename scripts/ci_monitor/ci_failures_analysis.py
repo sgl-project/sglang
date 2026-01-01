@@ -132,16 +132,11 @@ class SGLangFailuresAnalyzer:
             print(f"Error fetching jobs for run {run_id}: {e}")
             return []
 
-    def get_job_logs(self, job_id: int, debug: bool = False) -> str:
+    def get_job_logs(self, job_id: int) -> str:
         """Fetch logs for a specific job."""
         try:
             url = f"{self.base_url}/repos/{self.repo}/actions/jobs/{job_id}/logs"
-            if debug:
-                print(f"    [DEBUG] Fetching logs from: {url}")
             response = self.session.get(url, timeout=60, allow_redirects=True)
-            if debug:
-                print(f"    [DEBUG] Response status: {response.status_code}")
-                print(f"    [DEBUG] Response length: {len(response.text)} chars")
             if response.status_code == 200:
                 return response.text
             return ""
@@ -149,7 +144,7 @@ class SGLangFailuresAnalyzer:
             print(f"Error fetching logs for job {job_id}: {e}")
             return ""
 
-    def parse_test_summary(self, logs: str, debug: bool = False) -> Optional[Dict]:
+    def parse_test_summary(self, logs: str) -> Optional[Dict]:
         """
         Parse the test summary block from job logs.
 
@@ -162,58 +157,14 @@ class SGLangFailuresAnalyzer:
         ansi_escape = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
         logs = ansi_escape.sub("", logs)
 
-        if debug:
-            # Search for Test Summary in the logs and print context around it
-            print(f"    [DEBUG] Total log length: {len(logs)} chars (after ANSI strip)")
-            test_summary_idx = logs.find("Test Summary:")
-            if test_summary_idx != -1:
-                # Print 200 chars before and 1500 chars after
-                start = max(0, test_summary_idx - 200)
-                end = min(len(logs), test_summary_idx + 1500)
-                print(
-                    f"    [DEBUG] Found 'Test Summary:' at position {test_summary_idx}"
-                )
-                print("    " + "-" * 60)
-                print(logs[start:end])
-                print("    " + "-" * 60)
-            else:
-                print("    [DEBUG] 'Test Summary:' not found in logs!")
-                # Search for alternative patterns
-                failed_idx = logs.find("FAILED:")
-                if failed_idx != -1:
-                    print(f"    [DEBUG] Found 'FAILED:' at position {failed_idx}")
-                    start = max(0, failed_idx - 500)
-                    end = min(len(logs), failed_idx + 1000)
-                    print("    " + "-" * 60)
-                    print(logs[start:end])
-                    print("    " + "-" * 60)
-                else:
-                    # Print last 2000 chars as fallback
-                    print(
-                        "    [DEBUG] No 'FAILED:' found either. Last 2000 chars of logs:"
-                    )
-                    print("    " + "-" * 60)
-                    print(logs[-2000:] if len(logs) > 2000 else logs)
-                    print("    " + "-" * 60)
-
-        # Look for the test summary pattern - handle multiline
-        # Pattern matches (with optional timestamp prefix from GitHub Actions logs):
-        # 2024-01-01T12:34:56.789Z Test Summary: 7/8 passed
-        # ...
-        # ✗ FAILED:
-        #   test_file.py (exit code 1)
-        # ====...
-        # First find the summary line (allow any prefix before "Test Summary")
+        # Look for the test summary pattern
+        # Pattern matches: "Test Summary: 7/8 passed"
         summary_match = re.search(r"Test Summary:\s*(\d+)/(\d+)\s*passed", logs)
         if not summary_match:
-            if debug:
-                print("    [DEBUG] No 'Test Summary: X/Y passed' pattern found in logs")
             return None
 
         passed = int(summary_match.group(1))
         total = int(summary_match.group(2))
-        if debug:
-            print(f"    [DEBUG] Found Test Summary: {passed}/{total} passed")
 
         # Find failed tests section
         # Look for "FAILED:" (the ✗ character may be mangled due to encoding)
@@ -225,9 +176,6 @@ class SGLangFailuresAnalyzer:
 
         if failed_section_match:
             failed_section = failed_section_match.group(1)
-            if debug:
-                print(f"    [DEBUG] Found FAILED section:")
-                print(f"    {failed_section[:500]}")
             # Find all .py files - just look for non-whitespace ending in .py
             for match in re.finditer(r"(\S+\.py)", failed_section):
                 full_path = match.group(1)
@@ -239,14 +187,6 @@ class SGLangFailuresAnalyzer:
                         "full_path": full_path,
                     }
                 )
-                if debug:
-                    print(f"    [DEBUG] Found failed test: {test_file}")
-        else:
-            if debug:
-                print("    [DEBUG] No 'FAILED:' section found")
-
-        if debug:
-            print(f"    [DEBUG] Total failed tests found: {len(failed_tests)}")
 
         return {
             "passed": passed,
@@ -254,9 +194,7 @@ class SGLangFailuresAnalyzer:
             "failed_tests": failed_tests,
         }
 
-    def analyze_test_failures_for_job(
-        self, recent_runs: List[Dict], debug: bool = False
-    ) -> Dict[str, Dict]:
+    def analyze_test_failures_for_job(self, recent_runs: List[Dict]) -> Dict[str, Dict]:
         """
         Analyze test-level failures for a specific job across its recent runs.
 
@@ -283,26 +221,10 @@ class SGLangFailuresAnalyzer:
             job_id = run_info.get("job_id")
             conclusion = run_info.get("conclusion")
 
-            if debug:
-                print(
-                    f"    [DEBUG] Processing run #{run_info.get('run_number')}, job_id={job_id}, conclusion={conclusion}"
-                )
-                # DEBUG: For failed jobs, print last 15000 chars of logs
-                if conclusion == "failure" and job_id:
-                    print(f"    [DEBUG] Fetching logs for job_id={job_id}...")
-                    logs = self.get_job_logs(job_id, debug=False)
-                    print(
-                        f"    [DEBUG] === LOG TAIL (last 15000 of {len(logs)} chars) ==="
-                    )
-                    print(logs[-15000:] if len(logs) > 15000 else logs)
-                    print(f"    [DEBUG] === LOG TAIL END ===")
-
             # For failed jobs, fetch logs and parse test failures
             if conclusion == "failure" and job_id:
-                logs = self.get_job_logs(job_id, debug=debug)
-                test_summary = (
-                    self.parse_test_summary(logs, debug=debug) if logs else None
-                )
+                logs = self.get_job_logs(job_id)
+                test_summary = self.parse_test_summary(logs) if logs else None
 
                 if test_summary and test_summary["failed_tests"]:
                     parsed_any_test_summary = True
@@ -1010,11 +932,7 @@ class SGLangFailuresAnalyzer:
             recent_runs = data.get("recent_runs", [])
 
             if recent_runs:
-                # Enable debug for the first job only
-                debug_this_job = i == 4
-                test_failures = self.analyze_test_failures_for_job(
-                    recent_runs, debug=debug_this_job
-                )
+                test_failures = self.analyze_test_failures_for_job(recent_runs)
                 if test_failures:
                     job_test_failures[job_name] = test_failures
 
@@ -1774,115 +1692,93 @@ def main():
             workflow_filter=["pr-test.yml"],
             filters={"event": "schedule"},
         )
-        # DEBUG: Comment out other workflows for testing
-        pr_test_amd_scheduled_runs = []
-        pr_test_xeon_scheduled_runs = []
-        pr_test_xpu_scheduled_runs = []
-        pr_test_npu_scheduled_runs = []
-        # # These 4 don't have scheduled events, so filter by main branch instead
-        # pr_test_amd_scheduled_runs = analyzer.get_recent_runs(
-        #     limit=pr_test_scheduled_limit,
-        #     workflow_filter=["pr-test-amd.yml"],
-        #     filters={"branch": "main"},
-        # )
-        # pr_test_xeon_scheduled_runs = analyzer.get_recent_runs(
-        #     limit=pr_test_scheduled_limit,
-        #     workflow_filter=["pr-test-xeon.yml"],
-        #     filters={"branch": "main"},
-        # )
-        # pr_test_xpu_scheduled_runs = analyzer.get_recent_runs(
-        #     limit=pr_test_scheduled_limit,
-        #     workflow_filter=["pr-test-xpu.yml"],
-        #     filters={"branch": "main"},
-        # )
-        # pr_test_npu_scheduled_runs = analyzer.get_recent_runs(
-        #     limit=pr_test_scheduled_limit,
-        #     workflow_filter=["pr-test-npu.yml"],
-        #     filters={"branch": "main"},
-        # )
+        # These 4 don't have scheduled events, so filter by main branch instead
+        pr_test_amd_scheduled_runs = analyzer.get_recent_runs(
+            limit=pr_test_scheduled_limit,
+            workflow_filter=["pr-test-amd.yml"],
+            filters={"branch": "main"},
+        )
+        pr_test_xeon_scheduled_runs = analyzer.get_recent_runs(
+            limit=pr_test_scheduled_limit,
+            workflow_filter=["pr-test-xeon.yml"],
+            filters={"branch": "main"},
+        )
+        pr_test_xpu_scheduled_runs = analyzer.get_recent_runs(
+            limit=pr_test_scheduled_limit,
+            workflow_filter=["pr-test-xpu.yml"],
+            filters={"branch": "main"},
+        )
+        pr_test_npu_scheduled_runs = analyzer.get_recent_runs(
+            limit=pr_test_scheduled_limit,
+            workflow_filter=["pr-test-npu.yml"],
+            filters={"branch": "main"},
+        )
 
-        # DEBUG: Comment out nightly scheduled runs
-        nightly_nvidia_scheduled_runs = []
-        nightly_amd_scheduled_runs = []
-        nightly_intel_scheduled_runs = []
-        nightly_npu_scheduled_runs = []
-        # # Nightly Tests - Scheduled (4 workflows)
-        # nightly_nvidia_scheduled_runs = analyzer.get_recent_runs(
-        #     limit=nightly_scheduled_limit,
-        #     workflow_filter=["nightly-test-nvidia.yml"],
-        #     filters={"event": "schedule"},
-        # )
-        # nightly_amd_scheduled_runs = analyzer.get_recent_runs(
-        #     limit=nightly_scheduled_limit,
-        #     workflow_filter=["nightly-test-amd.yml"],
-        #     filters={"event": "schedule"},
-        # )
-        # nightly_intel_scheduled_runs = analyzer.get_recent_runs(
-        #     limit=nightly_scheduled_limit,
-        #     workflow_filter=["nightly-test-intel.yml"],
-        #     filters={"event": "schedule"},
-        # )
-        # nightly_npu_scheduled_runs = analyzer.get_recent_runs(
-        #     limit=nightly_scheduled_limit,
-        #     workflow_filter=["nightly-test-npu.yml"],
-        #     filters={"event": "schedule"},
-        # )
+        # Nightly Tests - Scheduled (4 workflows)
+        nightly_nvidia_scheduled_runs = analyzer.get_recent_runs(
+            limit=nightly_scheduled_limit,
+            workflow_filter=["nightly-test-nvidia.yml"],
+            filters={"event": "schedule"},
+        )
+        nightly_amd_scheduled_runs = analyzer.get_recent_runs(
+            limit=nightly_scheduled_limit,
+            workflow_filter=["nightly-test-amd.yml"],
+            filters={"event": "schedule"},
+        )
+        nightly_intel_scheduled_runs = analyzer.get_recent_runs(
+            limit=nightly_scheduled_limit,
+            workflow_filter=["nightly-test-intel.yml"],
+            filters={"event": "schedule"},
+        )
+        nightly_npu_scheduled_runs = analyzer.get_recent_runs(
+            limit=nightly_scheduled_limit,
+            workflow_filter=["nightly-test-npu.yml"],
+            filters={"event": "schedule"},
+        )
 
-        # DEBUG: Comment out general runs
-        pr_test_nvidia_general_runs = []
-        pr_test_amd_general_runs = []
-        pr_test_xeon_general_runs = []
-        pr_test_xpu_general_runs = []
-        pr_test_npu_general_runs = []
-        nightly_nvidia_general_runs = []
-        nightly_amd_general_runs = []
-        nightly_intel_general_runs = []
-        nightly_npu_general_runs = []
-        # # === GENERAL RUNS (9 workflows) ===
-        # # PR Tests - General (5 workflows)
-        # pr_test_nvidia_general_runs = analyzer.get_recent_runs(
-        #     limit=args.limit,
-        #     workflow_filter=["pr-test.yml"],
-        # )
-        # pr_test_amd_general_runs = analyzer.get_recent_runs(
-        #     limit=args.limit,
-        #     workflow_filter=["pr-test-amd.yml"],
-        # )
-        # pr_test_xeon_general_runs = analyzer.get_recent_runs(
-        #     limit=args.limit,
-        #     workflow_filter=["pr-test-xeon.yml"],
-        # )
-        # pr_test_xpu_general_runs = analyzer.get_recent_runs(
-        #     limit=args.limit,
-        #     workflow_filter=["pr-test-xpu.yml"],
-        # )
-        # pr_test_npu_general_runs = analyzer.get_recent_runs(
-        #     limit=args.limit,
-        #     workflow_filter=["pr-test-npu.yml"],
-        # )
-        #
-        # # Nightly Tests - General (4 workflows)
-        # nightly_nvidia_general_runs = analyzer.get_recent_runs(
-        #     limit=args.limit,
-        #     workflow_filter=["nightly-test-nvidia.yml"],
-        # )
-        # nightly_amd_general_runs = analyzer.get_recent_runs(
-        #     limit=args.limit,
-        #     workflow_filter=["nightly-test-amd.yml"],
-        # )
-        # nightly_intel_general_runs = analyzer.get_recent_runs(
-        #     limit=args.limit,
-        #     workflow_filter=["nightly-test-intel.yml"],
-        # )
-        # nightly_npu_general_runs = analyzer.get_recent_runs(
-        #     limit=args.limit,
-        #     workflow_filter=["nightly-test-npu.yml"],
-        # )
+        # === GENERAL RUNS (9 workflows) ===
+        # PR Tests - General (5 workflows)
+        pr_test_nvidia_general_runs = analyzer.get_recent_runs(
+            limit=args.limit,
+            workflow_filter=["pr-test.yml"],
+        )
+        pr_test_amd_general_runs = analyzer.get_recent_runs(
+            limit=args.limit,
+            workflow_filter=["pr-test-amd.yml"],
+        )
+        pr_test_xeon_general_runs = analyzer.get_recent_runs(
+            limit=args.limit,
+            workflow_filter=["pr-test-xeon.yml"],
+        )
+        pr_test_xpu_general_runs = analyzer.get_recent_runs(
+            limit=args.limit,
+            workflow_filter=["pr-test-xpu.yml"],
+        )
+        pr_test_npu_general_runs = analyzer.get_recent_runs(
+            limit=args.limit,
+            workflow_filter=["pr-test-npu.yml"],
+        )
+
+        # Nightly Tests - General (4 workflows)
+        nightly_nvidia_general_runs = analyzer.get_recent_runs(
+            limit=args.limit,
+            workflow_filter=["nightly-test-nvidia.yml"],
+        )
+        nightly_amd_general_runs = analyzer.get_recent_runs(
+            limit=args.limit,
+            workflow_filter=["nightly-test-amd.yml"],
+        )
+        nightly_intel_general_runs = analyzer.get_recent_runs(
+            limit=args.limit,
+            workflow_filter=["nightly-test-intel.yml"],
+        )
+        nightly_npu_general_runs = analyzer.get_recent_runs(
+            limit=args.limit,
+            workflow_filter=["nightly-test-npu.yml"],
+        )
 
         # Choosing nvidia pr test and nightly for runner health analysis
-        # DEBUG: Use scheduled runs for runner analysis since general runs are disabled
-        runner_runs = pr_test_nvidia_scheduled_runs
-        # runner_runs = pr_test_nvidia_general_runs + nightly_nvidia_general_runs
+        runner_runs = pr_test_nvidia_general_runs + nightly_nvidia_general_runs
 
         if not runner_runs and not pr_test_nvidia_scheduled_runs:
             print("No workflow runs found")
