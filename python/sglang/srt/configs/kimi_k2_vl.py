@@ -1,13 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # Adapted from https://huggingface.co/moonshotai/Kimi-VL-A3B-Instruct/blob/main/configuration_kimi_vl.py
-from typing import Optional, Union
 
 from transformers import DeepseekV3Config
 from transformers.configuration_utils import PretrainedConfig
-
-from sglang.srt.configs.deepseekvl2 import DeepseekV2Config
-from sglang.srt.configs.kimi_vl_moonvit import MoonViTConfig
-
 
 
 class K2VLConfig(PretrainedConfig):
@@ -52,17 +47,17 @@ class K2VLConfig(PretrainedConfig):
         init_pos_emb_height: int = 64,
         init_pos_emb_width: int = 64,
         init_pos_emb_time: int = 4,
-        pos_emb_type: str = 'divided_fixed',
+        pos_emb_type: str = "divided_fixed",
         vt_num_attention_heads: int = 16,
         vt_num_hidden_layers: int = 27,
         vt_hidden_size: int = 1152,
         vt_intermediate_size: int = 4304,
         merge_kernel_size: tuple = (2, 2),
-        video_attn_type: str = 'spatial_temporal',
-        merge_type: str = 'sd2_tpool',
-        _attn_implementation: str = 'flash_attention_2',
+        video_attn_type: str = "spatial_temporal",
+        merge_type: str = "sd2_tpool",
+        _attn_implementation: str = "flash_attention_2",
         # MM Projector parameters (from MultiModalProjectorConfig)
-        mm_projector_type: str = 'patchmerger',
+        mm_projector_type: str = "patchmerger",
         mm_hidden_size: int | None = None,
         projector_hidden_act: str = "gelu",
         projector_ln_eps: float = 1e-5,
@@ -96,7 +91,9 @@ class K2VLConfig(PretrainedConfig):
 
         # MM Projector config
         self.mm_projector_type = mm_projector_type
-        self.mm_hidden_size = mm_hidden_size if mm_hidden_size is not None else vt_hidden_size
+        self.mm_hidden_size = (
+            mm_hidden_size if mm_hidden_size is not None else vt_hidden_size
+        )
         self.projector_hidden_act = projector_hidden_act
         self.projector_ln_eps = projector_ln_eps
 
