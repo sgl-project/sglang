@@ -98,7 +98,11 @@ class DPBudget:
         if method == LoadBalanceMethod.TOTAL_REQUESTS:
             target_rank = self.total_requests.index(min(self.total_requests))
         elif method == LoadBalanceMethod.TOTAL_TOKENS:
-            target_rank = self.total_tokens.index(min(self.total_tokens))
+            # Use total_requests as a tie-breaker when total_tokens are equal
+            target_rank = min(
+                range(self.dp_size),
+                key=lambda i: (self.total_tokens[i], self.total_requests[i]),
+            )
         else:
             return None
 
