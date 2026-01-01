@@ -12,7 +12,7 @@ class PrefillDelayer:
         )
         self.cpu_group = tp_worker.get_tp_group().cpu_group
 
-        self.delayed_count = 0
+        self.curr_delayed_count = 0
         self.max_delay_passes = envs.SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES.get()
 
         assert (
@@ -52,9 +52,9 @@ class PrefillDelayer:
             return True
 
         if global_exists_cannot_prefill and global_exists_can_prefill:
-            self.delayed_count += 1
-            if self.delayed_count < self.max_delay_passes:
+            self.curr_delayed_count += 1
+            if self.curr_delayed_count < self.max_delay_passes:
                 return False
 
-        self.delayed_count = 0
+        self.curr_delayed_count = 0
         return True
