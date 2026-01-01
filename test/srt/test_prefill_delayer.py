@@ -54,14 +54,6 @@ class TestPrefillDelayerThroughput(CustomTestCase):
         print(f"Output throughput: {res['output_throughput']:.2f} token/s")
         print(f"Input throughput: {res['input_throughput']:.2f} token/s")
 
-        if is_in_ci():
-            test_name = f"test_dp_attention_throughput_{'with' if with_prefill_delayer else 'without'}_prefill_delayer"
-            write_github_step_summary(
-                f"### {test_name}\n"
-                f"Output throughput: {res['output_throughput']:.2f} token/s\n"
-                f"Input throughput: {res['input_throughput']:.2f} token/s\n"
-            )
-
         self.assertGreater(res["output_throughput"], 0)
 
     def test_dp_attention_throughput_with_prefill_delayer(self):
