@@ -91,8 +91,6 @@ impl Node {
 // TODO may optimize performance
 #[derive(Debug)]
 pub struct ManualPolicy {
-    #[allow(dead_code)]
-    config: ManualConfig,
     routing_map: Arc<DashMap<RoutingId, Node>>,
     _eviction_task: Option<PeriodicTask>,
 }
@@ -149,7 +147,6 @@ impl ManualPolicy {
         };
 
         Self {
-            config,
             routing_map,
             _eviction_task: eviction_task,
         }
