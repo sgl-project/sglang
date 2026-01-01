@@ -714,8 +714,6 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
             num_experts=num_experts,
             base_output=lora_intermediate_cache1,
             is_down_proj=False,
-            topk_weights=None,
-            keep_experts_separate=True,  # Keep each (token, expert) pair separate
         )
 
         # Stage 2: Apply activation to each (token, expert) pair separately
@@ -773,8 +771,6 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
                 num_experts=num_experts,
                 base_output=lora_intermediate_cache3,
                 is_down_proj=True,
-                topk_weights=None,  # Don't apply weights in kernel
-                keep_experts_separate=True,  # Keep each (token, expert) pair separate
             )
 
             # Stage 4: Final reduction - combine expert outputs with router weights

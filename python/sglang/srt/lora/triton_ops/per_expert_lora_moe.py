@@ -31,7 +31,6 @@ def _per_expert_lora_kernel(
     token_ids_ptr,  # [num_dispatched] -> index into hidden/output
     expert_ids_ptr,  # [num_dispatched]
     lora_ids_ptr,  # [num_dispatched]
-    topk_weights_ptr,  # [num_dispatched] - Router weights for each dispatched token
     # Dimensions
     input_dim: tl.constexpr,
     output_dim: tl.constexpr,
@@ -54,12 +53,8 @@ def _per_expert_lora_kernel(
     lora_scalings_ptr,
     # Block size (used for input and output tiling; rank is not tiled)
     BLOCK_SIZE: tl.constexpr,
-    # Whether to multiply by router weights
-    MUL_ROUTED_WEIGHT: tl.constexpr,
     # Whether this is down_proj (affects stacking factor for rank calculation)
     IS_DOWN_PROJ: tl.constexpr,
-    # Whether to keep expert outputs separate
-    KEEP_EXPERTS_SEPARATE: tl.constexpr,
 ):
     """
     Compute per-expert LoRA delta:
@@ -198,37 +193,21 @@ def _per_expert_lora_kernel(
     # Apply scaling
     out_vals *= scaling
 
-    # Apply router weight if enabled (matches base MoE behavior)
-    if MUL_ROUTED_WEIGHT:
-        topk_weight = tl.load(
-            topk_weights_ptr + spatial_id
-        )  # I don't think this correctly understands how top_k weights is organized (now moe dispatch reorganizes topk weights to work w this)
-        out_vals *= topk_weight
+    # Router weights are applied in the final reduction step, not in the kernel
 
     # ----------------------------
-    # Accumulate into global output (base_output) and store to lora_output
+    # Store results for each (token, expert) pair separately
     # ----------------------------
     # Convert to output dtype (matches hidden_states dtype, could be float16/bfloat16/float32)
     out_vals_typed = out_vals.to(output_ptr.dtype.element_ty)
 
-    if KEEP_EXPERTS_SEPARATE:
-        # Write to spatial_id position (keeps each (token, expert) pair separate)
-        out_row_base = spatial_id * output_dim
-        out_ptrs = output_ptr + out_row_base + out_offs
-        lora_out_ptrs = lora_output_ptr + out_row_base + out_offs
-        # Use regular store (not atomic) since each spatial_id is unique
-        tl.store(out_ptrs, out_vals_typed, out_mask)
-        tl.store(lora_out_ptrs, out_vals_typed, out_mask)
-    else:
-        # Write to actual_token_id position (combines experts per token via atomic_add)
-        out_row_base = actual_token_id * output_dim
-        out_ptrs = output_ptr + out_row_base + out_offs
-        lora_out_ptrs = lora_output_ptr + out_row_base + out_offs
-        # Add to base_output in-place
-        tl.atomic_add(out_ptrs, out_vals_typed, out_mask)
-        # TODO (Jonahcb): remove unnecessary store to lora_output tensor after done debugging
-        # Also store to separate lora_output tensor (same dtype)
-        tl.atomic_add(lora_out_ptrs, out_vals_typed, out_mask)
+    # Write to spatial_id position (each (token, expert) pair gets its own row)
+    out_row_base = spatial_id * output_dim
+    out_ptrs = output_ptr + out_row_base + out_offs
+    lora_out_ptrs = lora_output_ptr + out_row_base + out_offs
+    # Use regular store since each spatial_id is unique
+    tl.store(out_ptrs, out_vals_typed, out_mask)
+    tl.store(lora_out_ptrs, out_vals_typed, out_mask)
 
 
 def per_expert_lora_forward(
@@ -243,12 +222,13 @@ def per_expert_lora_forward(
     num_experts: int,
     base_output: torch.Tensor = None,
     is_down_proj: bool = False,
-    topk_weights: torch.Tensor = None,
-    keep_experts_separate: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Forward pass for per-expert LoRA computation using a 3D Triton grid:
         grid = (spatial, slices, loras)
+
+    Mathematically correct implementation that keeps expert outputs separate
+    until final reduction, matching the base Triton MoE pattern.
 
     Args:
         hidden_states: [num_tokens, input_dim] where input_dim is hidden_dim for gate_up_proj
@@ -261,20 +241,15 @@ def per_expert_lora_forward(
         lora_ranks: [num_loras] - Rank for each LoRA
         lora_scalings: [num_loras] - Scaling factor for each LoRA
         num_experts: Total number of experts
-        base_output: Output tensor - shape depends on keep_experts_separate:
-                     [num_tokens, output_dim] if False (combined)
-                     [num_dispatched, output_dim] if True (separate)
+        base_output: Output tensor with shape [num_dispatched, output_dim]
+                    Each row contains the output for one (token, expert) pair
         is_down_proj: Whether this is for down_proj (intermediate_dim -> hidden_dim)
                      or gate_up_proj (hidden_dim -> intermediate_dim)
-        topk_weights: [num_dispatched] - Router weights for each dispatched token.
-                     Only applied when is_down_proj=True and keep_experts_separate=False.
-        keep_experts_separate: If True, keeps each (token, expert) pair's output separate
-                              (like base Triton MoE). If False, combines experts per token.
 
     Returns:
         tuple of:
-            output: Base output + LoRA delta
-            lora_output: Just the LoRA delta contribution
+            output: LoRA delta for each (token, expert) pair
+            lora_output: Just the LoRA delta contribution (same as output)
     """
 
     # Shapes
@@ -301,20 +276,10 @@ def per_expert_lora_forward(
     lora_ranks = lora_ranks.contiguous()
     lora_scalings = lora_scalings.contiguous()
 
-    # Handle topk_weights (only applied for down_proj when combining experts)
-    # Don't apply router weights in kernel when keeping experts separate
-    mul_routed_weight = is_down_proj and not keep_experts_separate
-    if topk_weights is not None:
-        topk_weights = topk_weights.contiguous()
-    else:
-        # Create dummy tensor if not provided
-        topk_weights = torch.empty(0, device=device, dtype=dtype)
+    # Router weights are always applied in the final reduction step, never in the kernel
 
-    # Determine output shape based on whether we keep experts separate
-    if keep_experts_separate:
-        output_shape = (num_dispatched, output_dim)
-    else:
-        output_shape = (num_tokens, output_dim)
+    # Always keep experts separate until final reduction
+    output_shape = (num_dispatched, output_dim)
 
     # Initialize or reuse output tensor for in-place addition
     if base_output is None:
@@ -358,7 +323,6 @@ def per_expert_lora_forward(
         token_ids,  # token_ids_ptr
         expert_ids,  # expert_ids_ptr
         lora_ids,  # lora_ids_ptr
-        topk_weights,  # topk_weights_ptr
         # Dimensions
         input_dim,  # input_dim (hidden_dim for gate_up_proj, intermediate_dim for down_proj)
         output_dim,  # output_dim (intermediate_dim for gate_up_proj, hidden_dim for down_proj)
@@ -380,12 +344,8 @@ def per_expert_lora_forward(
         lora_scalings,  # lora_scalings_ptr
         # Block size (constexpr)
         BLOCK_SIZE=BLOCK_SIZE,
-        # Router weight multiplication flag
-        MUL_ROUTED_WEIGHT=mul_routed_weight,
         # Whether this is down_proj
         IS_DOWN_PROJ=is_down_proj,
-        # Whether to keep expert outputs separate
-        KEEP_EXPERTS_SEPARATE=keep_experts_separate,
     )
 
     return output, lora_output
