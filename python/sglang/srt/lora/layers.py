@@ -749,50 +749,47 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
 
         # Stage 3: down_proj LoRA - keep experts separate
         # Shape: (num_dispatched, hidden_size)
-        if (
-            self.down_lora_a_weights is not None
-            and self.down_lora_b_weights is not None
-        ):
-            lora_intermediate_cache3 = torch.zeros(
-                (num_dispatched, hidden_size),
-                dtype=hidden_states.dtype,
-                device=hidden_states.device,
-            )
 
-            _, _ = per_expert_lora_forward(
-                hidden_states=lora_intermediate_cache2,
-                lora_a_weights=self.down_lora_a_weights,
-                lora_b_weights=self.down_lora_b_weights,
-                token_ids=token_ids,
-                expert_ids=expert_ids,
-                lora_ids=lora_ids,
-                lora_ranks=lora_ranks,
-                lora_scalings=scalings,
-                num_experts=num_experts,
-                base_output=lora_intermediate_cache3,
-                is_down_proj=True,
-            )
+        lora_intermediate_cache3 = torch.zeros(
+            (num_dispatched, hidden_size),
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+        )
 
-            # Stage 4: Final reduction - combine expert outputs with router weights
-            # Similar to moe_sum_reduce in base Triton MoE
-            # For each token, sum: output[t] += Σ_k (cache3[d] * topk_weights[d])
-            # where d iterates over all dispatched pairs for token t
+        _, _ = per_expert_lora_forward(
+            hidden_states=lora_intermediate_cache2,
+            lora_a_weights=self.down_lora_a_weights,
+            lora_b_weights=self.down_lora_b_weights,
+            token_ids=token_ids,
+            expert_ids=expert_ids,
+            lora_ids=lora_ids,
+            lora_ranks=lora_ranks,
+            lora_scalings=scalings,
+            num_experts=num_experts,
+            base_output=lora_intermediate_cache3,
+            is_down_proj=True,
+        )
 
-            # Apply router weights to each (token, expert) output
-            weighted_outputs = lora_intermediate_cache3 * sorted_topk_weights.unsqueeze(
-                -1
-            )
+        # Stage 4: Final reduction - combine expert outputs with router weights
+        # Similar to moe_sum_reduce in base Triton MoE
+        # For each token, sum: output[t] += Σ_k (cache3[d] * topk_weights[d])
+        # where d iterates over all dispatched pairs for token t
 
-            # Ensure weighted_outputs has the same dtype as base_output for scatter_add_
-            weighted_outputs = weighted_outputs.to(base_output.dtype)
+        # Apply router weights to each (token, expert) output
+        weighted_outputs = lora_intermediate_cache3 * sorted_topk_weights.unsqueeze(
+            -1
+        )
 
-            # Scatter-add to combine experts per token
-            # token_ids[d] tells us which token row to add weighted_outputs[d] to
-            base_output.scatter_add_(
-                0,
-                token_ids.unsqueeze(-1).expand(-1, hidden_size),
-                weighted_outputs,
-            )
+        # Ensure weighted_outputs has the same dtype as base_output for scatter_add_
+        weighted_outputs = weighted_outputs.to(base_output.dtype)
+
+        # Scatter-add to combine experts per token
+        # token_ids[d] tells us which token row to add weighted_outputs[d] to
+        base_output.scatter_add_(
+            0,
+            token_ids.unsqueeze(-1).expand(-1, hidden_size),
+            weighted_outputs,
+        )
 
     def slice_lora_a_weights(self, A: torch.Tensor, tp_rank: int):
         # For MoE layers, tensor parallelism is typically not used
