@@ -41,6 +41,7 @@ class TestPrefillDelayerThroughput(CustomTestCase):
                 random_input_len=1024,
                 random_output_len=512,
                 request_rate=float("inf"),
+                tokenizer=model,
             )
             res = run_benchmark(args)
         finally:
