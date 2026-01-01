@@ -23,6 +23,8 @@ class TestPrefillDelayerThroughput(CustomTestCase):
             "--enable-dp-attention",
             "--dp",
             "8",
+            "--chunked-prefill-size",
+            "65536",
         ]
 
         # TODO further fix mem leak
@@ -45,7 +47,7 @@ class TestPrefillDelayerThroughput(CustomTestCase):
                 base_url=base_url,
                 dataset_name="random",
                 num_prompts=80,
-                random_input_len=4096,
+                random_input_len=16384,
                 random_output_len=128,
                 request_rate=8,
                 tokenizer=model,
