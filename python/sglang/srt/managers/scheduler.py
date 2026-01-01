@@ -203,7 +203,6 @@ logger = logging.getLogger(__name__)
 TEST_RETRACT = envs.SGLANG_TEST_RETRACT.get()
 TEST_RETRACT_INTERVAL = envs.SGLANG_TEST_RETRACT_INTERVAL.get()
 TEST_RETRACT_NO_PREFILL_BS = envs.SGLANG_TEST_RETRACT_NO_PREFILL_BS.get()
-SCHEDULER_DECREASE_PREFILL_IDLE = envs.SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE.get()
 GRAMMAR_TIMEOUT = float(os.environ.get("SGLANG_GRAMMAR_TIMEOUT", 300))
 
 
@@ -793,8 +792,8 @@ class Scheduler(
             self.enable_priority_scheduling,
             self.schedule_low_priority_values_first,
         )
-        self.prefill_delayer = None
-        if SCHEDULER_DECREASE_PREFILL_IDLE:
+        self.prefill_delayer: Optional[PrefillDelayer] = None
+        if envs.SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE.get():
             self.prefill_delayer = PrefillDelayer(
                 self.dp_size,
                 self.attn_tp_size,
@@ -1884,7 +1883,7 @@ class Scheduler(
             and self.chunked_req is None
         ) or (
             self.prefill_delayer
-            and not self.prefill_delayer.get_schedule_decision(self.running_batch)
+            and not self.prefill_delayer.should_allow_prefill(waiting_queue_len=len(self.waiting_queue))
         ):
             return None
 
