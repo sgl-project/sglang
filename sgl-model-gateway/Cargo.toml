@@ -175,6 +175,11 @@ harness = false
 path = "benches/tree_benchmark.rs"
 
 [[bench]]
+name = "radix_tree_benchmark"
+harness = false
+path = "benches/radix_tree_benchmark.rs"
+
+[[bench]]
 name = "manual_policy_benchmark"
 harness = false
 path = "benches/manual_policy_benchmark.rs"
