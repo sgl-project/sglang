@@ -1877,15 +1877,16 @@ class Scheduler(
             # Reset batch_is_full to try preemption with a prefill adder.
             self.running_batch.batch_is_full = False
 
-        # Handle the cases where prefill is not allowed
-        if (
-            (self.running_batch.batch_is_full or len(self.waiting_queue) == 0)
-            and self.chunked_req is None
-        ) or (
-            self.prefill_delayer
-            and not self.prefill_delayer.should_allow_prefill(
+        # The `should_allow_prefill` needs to be called on all ranks
+        prefill_delayer_allow_prefill = (
+            self.prefill_delayer.should_allow_prefill(
                 waiting_queue_len=len(self.waiting_queue)
             )
+            if self.prefill_delayer else True
+        )
+        if (not prefill_delayer_allow_prefill) or (
+            (self.running_batch.batch_is_full or len(self.waiting_queue) == 0)
+            and self.chunked_req is None
         ):
             return None
 
