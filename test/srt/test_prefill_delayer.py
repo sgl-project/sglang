@@ -46,12 +46,7 @@ class TestPrefillDelayerThroughput(CustomTestCase):
         finally:
             kill_process_tree(process.pid)
 
-        label = (
-            "With PrefillDelayer"
-            if with_prefill_delayer
-            else "Without PrefillDelayer (baseline)"
-        )
-        print(f"=== {label} ===")
+        print(f"=== {with_prefill_delayer=} ===")
         print(f"Output throughput: {res['output_throughput']:.2f} token/s")
         print(f"Input throughput: {res['input_throughput']:.2f} token/s")
 
