@@ -61,7 +61,7 @@ struct aligned_vector {
     static_assert(std::is_same_v<U, T> || std::is_same_v<U, void>);
     reinterpret_cast<storage_t*>(ptr)[offset] = m_storage;
   }
-  __forceinline__ __device__ void fill(T value) const {
+  __forceinline__ __device__ void fill(T value) {
     const auto store_value = *reinterpret_cast<element_t*>(&value);
 #pragma unroll
     for (std::size_t i = 0; i < N; ++i) {
