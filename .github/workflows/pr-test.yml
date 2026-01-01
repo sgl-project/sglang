@@ -45,8 +45,8 @@ on:
 
 concurrency:
   # Include pr_head_sha in group for /rerun-stage dispatches to avoid collisions with main branch runs
-  group: pr-test-${{ github.ref }}${{ inputs.pr_head_sha && format('-{0}', inputs.pr_head_sha) || '' }}
-  cancel-in-progress: true
+  group: pr-test-${{ inputs.pr_head_sha || inputs.ref || github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'workflow_call' }}
 
 env:
   SGLANG_IS_IN_CI: true
