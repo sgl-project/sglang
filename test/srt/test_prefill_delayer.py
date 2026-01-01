@@ -41,10 +41,11 @@ class TestPrefillDelayerThroughput(CustomTestCase):
                 dataset_name="random",
                 num_prompts=300,
                 random_input_len=4096,
-                random_output_len=256,
+                random_output_len=512,
                 request_rate=float("inf"),
                 tokenizer=model,
             )
+            args.random_range_ratio = 0.95
             res = run_benchmark(args)
         finally:
             kill_process_tree(process.pid)
