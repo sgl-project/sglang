@@ -49,6 +49,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import nn
+from transformers import activations
 
 from sglang.srt.configs.kimi_k2_vl import K2VLConfig
 from sglang.srt.configs.kimi_vl import KimiVLConfig
@@ -57,7 +58,6 @@ from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternMultimodalTokens,
     general_mm_embed_routine,
 )
-from transformers import activations
 
 try:
     from transformers.activations import PytorchGELUTanh
@@ -122,7 +122,7 @@ def tpool_patch_merger(
     pre_sum = 0
     for t, h, w in grid_thws.tolist():
         # Get the current sequence
-        seq = x[pre_sum: pre_sum + t * h * w]
+        seq = x[pre_sum : pre_sum + t * h * w]
         # Reshape along self.merge_kernel_size and concat to the last dimension
         kernel_height, kernel_width = merge_kernel_size
         new_height, new_width = h // kernel_height, w // kernel_width
@@ -287,7 +287,7 @@ def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
     assert embed_dim % 2 == 0
     omega = np.arange(embed_dim // 2, dtype=np.float32)
     omega /= embed_dim / 2.0
-    omega = 1.0 / 10000 ** omega  # (D/2,)
+    omega = 1.0 / 10000**omega  # (D/2,)
 
     pos = pos.reshape(-1)  # (M,)
     out = np.einsum("m,d->md", pos, omega)  # (M, D/2), outer product
