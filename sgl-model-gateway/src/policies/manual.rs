@@ -648,7 +648,7 @@ mod tests {
     fn test_manual_config_default() {
         let config = ManualConfig::default();
         assert_eq!(config.eviction_interval_secs, 60);
-        assert_eq!(config.max_entries, 10000);
+        assert_eq!(config.max_entries, 67108864);
     }
 
     #[test]
