@@ -689,8 +689,8 @@ impl CliArgs {
                 load_factor: self.prefix_hash_load_factor,
             },
             "manual" => PolicyConfig::Manual {
-                eviction_interval_secs: 60,
-                max_entries: 10000,
+                eviction_interval_secs: self.eviction_interval,
+                max_entries: self.max_tree_size,
             },
             _ => PolicyConfig::RoundRobin,
         }

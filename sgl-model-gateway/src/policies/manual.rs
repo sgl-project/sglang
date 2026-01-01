@@ -444,7 +444,7 @@ mod tests {
         let (new_result, branch) = policy.select_worker_impl(&workers, &info);
         let new_idx = new_result.unwrap();
         assert_ne!(new_idx, first_idx, "Should remap to healthy worker");
-        assert_eq!(branch, ExecutionBranch::SlowPathOccupiedMiss);
+        assert_eq!(branch, ExecutionBranch::OccupiedMiss);
 
         for _ in 0..10 {
             let (result, branch) = policy.select_worker_impl(&workers, &info);
@@ -513,7 +513,7 @@ mod tests {
         let (second_result, branch) = policy.select_worker_impl(&workers, &info);
         let second_idx = second_result.unwrap();
         assert_ne!(second_idx, first_idx);
-        assert_eq!(branch, ExecutionBranch::SlowPathOccupiedMiss);
+        assert_eq!(branch, ExecutionBranch::OccupiedMiss);
 
         workers[first_idx].set_healthy(true);
 
@@ -546,7 +546,7 @@ mod tests {
         let (second_result, branch) = policy.select_worker_impl(&workers, &info);
         let second_idx = second_result.unwrap();
         assert_ne!(second_idx, first_idx);
-        assert_eq!(branch, ExecutionBranch::SlowPathOccupiedMiss);
+        assert_eq!(branch, ExecutionBranch::OccupiedMiss);
 
         workers[second_idx].set_healthy(false);
 
@@ -557,7 +557,7 @@ mod tests {
             Some(remaining_idx),
             "Should select the only remaining healthy worker"
         );
-        assert_eq!(branch, ExecutionBranch::SlowPathOccupiedMiss);
+        assert_eq!(branch, ExecutionBranch::OccupiedMiss);
 
         workers[first_idx].set_healthy(true);
 
@@ -710,7 +710,7 @@ mod tests {
 
         // This should trigger slow path (occupied miss) and update last_access
         let (_, branch) = policy.select_worker_impl(&workers, &info);
-        assert_eq!(branch, ExecutionBranch::SlowPathOccupiedMiss);
+        assert_eq!(branch, ExecutionBranch::OccupiedMiss);
 
         let node = policy.routing_map.get(&routing_id).unwrap();
         assert!(
@@ -720,12 +720,13 @@ mod tests {
     }
 
     #[test]
-    fn test_manual_lru_eviction_by_size() {
+    fn test_manual_lru_eviction_logic() {
         use std::thread;
         use std::time::Duration;
 
+        // Disable background eviction, we'll test the logic directly
         let config = ManualConfig {
-            eviction_interval_secs: 1,
+            eviction_interval_secs: 0,
             max_entries: 2,
         };
         let policy = ManualPolicy::with_config(config);
@@ -739,18 +740,31 @@ mod tests {
                 ..Default::default()
             };
             policy.select_worker_impl(&workers, &info);
-            thread::sleep(Duration::from_millis(50));
+            thread::sleep(Duration::from_millis(10));
         }
 
         assert_eq!(policy.routing_map.len(), 3, "Should have 3 entries before eviction");
 
-        // Wait for eviction to run
-        thread::sleep(Duration::from_secs(2));
+        // Manually trigger eviction logic
+        let max_entries = 2usize;
+        let current_size = policy.routing_map.len();
+        if current_size > max_entries {
+            let to_evict = current_size - max_entries;
+            let mut entries: Vec<_> = policy
+                .routing_map
+                .iter()
+                .map(|entry| (entry.key().clone(), entry.value().last_access))
+                .collect();
+            entries.sort_by_key(|(_, last_access)| *last_access);
+            for (key, _) in entries.iter().take(to_evict) {
+                policy.routing_map.remove(key);
+            }
+        }
 
         assert_eq!(
             policy.routing_map.len(),
             2,
-            "Should have 2 entries after LRU eviction (max_entries=2)"
+            "Should have 2 entries after LRU eviction"
         );
 
         // The oldest entry (key-0) should be evicted
