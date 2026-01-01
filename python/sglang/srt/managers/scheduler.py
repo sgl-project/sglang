@@ -1877,7 +1877,7 @@ class Scheduler(
             # Reset batch_is_full to try preemption with a prefill adder.
             self.running_batch.batch_is_full = False
 
-        # The `should_allow_prefill` needs to be called on all ranks
+        # The `should_allow_prefill` needs to be called on all ranks since contains communication
         prefill_delayer_allow_prefill = (
             self.prefill_delayer.should_allow_prefill(
                 waiting_queue_len=len(self.waiting_queue)
