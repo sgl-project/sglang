@@ -8,7 +8,7 @@ class PrefillDelayer:
         self.dp_size = dp_size
         self.attn_tp_size = attn_tp_size
         self.global_waiting_queue_len = torch.empty(
-            (self.dp_size, self.attn_tp_size, 1),
+            (self.dp_size, self.attn_tp_size, 2),
             dtype=torch.int64,
             device="cpu",
         )
@@ -30,9 +30,9 @@ class PrefillDelayer:
             not server_args.disable_overlap_schedule
         ), "To use SCHEDULER_DECREASE_PREFILL_IDLE, disable_overlap_schedule must be False."
 
-    def _gather_waiting_queue_info(self, waiting_queue_len: int):
+    def _gather_info(self, waiting_queue_len: int, is_idle: bool):
         local_queue_len = torch.tensor(
-            [waiting_queue_len],
+            [waiting_queue_len, int(is_idle)],
             device="cpu",
             dtype=torch.int64,
         )
@@ -44,10 +44,14 @@ class PrefillDelayer:
         tp0_info = self.global_waiting_queue_len[:, 0, :]
         return tp0_info
 
-    def should_allow_prefill(self, waiting_queue_len: int) -> bool:
-        tp0_info = self._gather_waiting_queue_info(waiting_queue_len)
+    def should_allow_prefill(self, waiting_queue_len: int, is_idle: bool) -> bool:
+        tp0_info = self._gather_info(waiting_queue_len=waiting_queue_len, is_idle=is_idle)
         min_queue_len = int(tp0_info[:, 0].min().item())
         max_queue_len = int(tp0_info[:, 0].max().item())
+        has_idle = bool(tp0_info[:, 1].max().item())
+
+        if has_idle:
+            return True
 
         if min_queue_len == 0 and max_queue_len > 0:
             self.stable_count += 1
