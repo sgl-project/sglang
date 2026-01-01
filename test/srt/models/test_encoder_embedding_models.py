@@ -25,7 +25,11 @@ from transformers import AutoConfig, AutoTokenizer
 from sglang.test.runners import DEFAULT_PROMPTS, HFRunner, SRTRunner
 from sglang.test.test_utils import CustomTestCase, get_similarities, is_in_ci
 
-MODELS = [("BAAI/bge-small-en", 1, 1e-5), ("BAAI/bge-m3", 1, 1e-5)]
+MODELS = [
+    ("BAAI/bge-small-en", 1, 1e-5),
+    ("BAAI/bge-m3", 1, 1e-5),
+    ("answerdotai/ModernBERT-base", 1, 1e-5),
+]
 
 ATTENTION_BACKEND = ["torch_native", "triton", "flashinfer"]
 BATCH_SIZE = [1, 2]
@@ -137,6 +141,10 @@ class TestEncoderEmbeddingModels(CustomTestCase):
                                 model == "BAAI/bge-small-en"
                                 or torch_dtype == torch.float32
                             ):
+                                continue
+
+                        if model == "answerdotai/ModernBERT-base":
+                            if attention_backend == "flashinfer":
                                 continue
 
                         self.assert_close_prefill_logits(

@@ -124,3 +124,4 @@ print("Embedding:", response["data"][0]["embedding"])
 | **BGE**                                    | `BAAI/bge-large-en-v1.5`              | N/A           | BAAI's text embeddings (requires `attention-backend` triton/torch_native)  |
 | **GME (Multimodal)**                      | `Alibaba-NLP/gme-Qwen2-VL-2B-Instruct`| `gme-qwen2-vl`| Multimodal embedding for text and image cross-modal tasks                  |
 | **CLIP**                                   | `openai/clip-vit-large-patch14-336`   | N/A           | OpenAI's CLIP for image and text embeddings                                |
+| **Modern BERT** | `answerdotai/ModernBERT-base` | N/A           | Modernized BERT-style encoder-only model pre-trained on 2T tokens with 8K context length |
