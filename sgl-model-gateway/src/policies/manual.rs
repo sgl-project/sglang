@@ -18,7 +18,7 @@ use std::{sync::Arc, time::Instant};
 use dashmap::{mapref::entry::Entry, DashMap};
 use http::header::HeaderName;
 use rand::Rng;
-use tracing::debug;
+use tracing::info;
 
 use super::{
     get_healthy_worker_indices, utils::PeriodicTask, LoadBalancingPolicy, SelectWorkerInfo,
@@ -128,7 +128,7 @@ impl ManualPolicy {
 
                     let evicted_count = before_size - routing_map_clone.len();
                     if evicted_count > 0 {
-                        debug!(
+                        info!(
                             "ManualPolicy TTL eviction: evicted {} entries, remaining {} (max_idle: {}s)",
                             evicted_count,
                             routing_map_clone.len(),
@@ -655,77 +655,39 @@ mod tests {
     }
 
     #[test]
-    fn test_manual_last_access_updates_on_vacant() {
+    fn test_manual_last_access_updates() {
         let policy = ManualPolicy::new();
         let workers = create_workers(&["http://w1:8000", "http://w2:8000"]);
-
         let headers = headers_with_routing_key("test-key");
         let info = SelectWorkerInfo {
             headers: Some(&headers),
             ..Default::default()
         };
+        let routing_id = RoutingId::new("test-key");
 
+        // Vacant: first access
         let (result, branch) = policy.select_worker_impl(&workers, &info);
         assert_eq!(branch, ExecutionBranch::Vacant);
-        assert!(result.is_some());
-
-        let routing_id = RoutingId::new("test-key");
-        let node = policy.routing_map.get(&routing_id).unwrap();
-        assert!(node.last_access.elapsed().as_millis() < 100);
-    }
-
-    #[test]
-    fn test_manual_last_access_updates_on_occupied_hit() {
-        let policy = ManualPolicy::new();
-        let workers = create_workers(&["http://w1:8000", "http://w2:8000"]);
-
-        let headers = headers_with_routing_key("test-key");
-        let info = SelectWorkerInfo {
-            headers: Some(&headers),
-            ..Default::default()
-        };
-
-        let (_, branch) = policy.select_worker_impl(&workers, &info);
-        assert_eq!(branch, ExecutionBranch::Vacant);
-
-        let routing_id = RoutingId::new("test-key");
-        let first_access = policy.routing_map.get(&routing_id).unwrap().last_access;
+        let first_idx = result.unwrap();
+        let access_after_vacant = policy.routing_map.get(&routing_id).unwrap().last_access;
+        assert!(access_after_vacant.elapsed().as_millis() < 100);
 
         std::thread::sleep(std::time::Duration::from_millis(10));
 
+        // OccupiedHit: same worker still healthy
         let (_, branch) = policy.select_worker_impl(&workers, &info);
         assert_eq!(branch, ExecutionBranch::OccupiedHit);
-
-        let second_access = policy.routing_map.get(&routing_id).unwrap().last_access;
-        assert!(second_access > first_access);
-    }
-
-    #[test]
-    fn test_manual_last_access_updates_on_occupied_miss() {
-        let policy = ManualPolicy::new();
-        let workers = create_workers(&["http://w1:8000", "http://w2:8000"]);
-
-        let headers = headers_with_routing_key("test-key");
-        let info = SelectWorkerInfo {
-            headers: Some(&headers),
-            ..Default::default()
-        };
-
-        let (first_result, branch) = policy.select_worker_impl(&workers, &info);
-        assert_eq!(branch, ExecutionBranch::Vacant);
-        let first_idx = first_result.unwrap();
-
-        let routing_id = RoutingId::new("test-key");
-        let first_access = policy.routing_map.get(&routing_id).unwrap().last_access;
+        let access_after_hit = policy.routing_map.get(&routing_id).unwrap().last_access;
+        assert!(access_after_hit > access_after_vacant);
 
         std::thread::sleep(std::time::Duration::from_millis(10));
-        workers[first_idx].set_healthy(false);
 
+        // OccupiedMiss: worker becomes unhealthy
+        workers[first_idx].set_healthy(false);
         let (_, branch) = policy.select_worker_impl(&workers, &info);
         assert_eq!(branch, ExecutionBranch::OccupiedMiss);
-
-        let second_access = policy.routing_map.get(&routing_id).unwrap().last_access;
-        assert!(second_access > first_access);
+        let access_after_miss = policy.routing_map.get(&routing_id).unwrap().last_access;
+        assert!(access_after_miss > access_after_hit);
     }
 
     #[test]
