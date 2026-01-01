@@ -37,8 +37,8 @@ on:
         type: boolean
         default: false
 concurrency:
-  group: pr-test-amd-${{ github.ref }}
-  cancel-in-progress: true
+  group: pr-test-amd-${{ inputs.ref || github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'workflow_call' }}
 
 jobs:
   call-gate:
