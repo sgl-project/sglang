@@ -565,7 +565,11 @@ impl TokenTree {
     /// Evict entries for a tenant to reduce to max_tokens.
     pub fn evict_tenant(&self, tenant: &TenantId, max_tokens: usize) {
         // Use borrowed lookup to avoid Arc hash overhead
-        let current_count = self.tenant_token_count.get(tenant.as_ref()).map(|v| *v).unwrap_or(0);
+        let current_count = self
+            .tenant_token_count
+            .get(tenant.as_ref())
+            .map(|v| *v)
+            .unwrap_or(0);
 
         if current_count <= max_tokens {
             return;
@@ -626,13 +630,18 @@ impl TokenTree {
 
     fn remove_tenant_from_node(&self, node: &NodeRef, tenant_id: &TenantId) -> bool {
         // Use borrowed lookup to avoid Arc hash overhead
-        node.tenant_last_access_time.remove(tenant_id.as_ref()).is_some()
+        node.tenant_last_access_time
+            .remove(tenant_id.as_ref())
+            .is_some()
     }
 
     /// Get the token count for a specific tenant.
     pub fn tenant_token_size(&self, tenant: &TenantId) -> usize {
         // Use borrowed lookup to avoid Arc hash overhead
-        self.tenant_token_count.get(tenant.as_ref()).map(|v| *v).unwrap_or(0)
+        self.tenant_token_count
+            .get(tenant.as_ref())
+            .map(|v| *v)
+            .unwrap_or(0)
     }
 
     /// Clear the tree to empty state.

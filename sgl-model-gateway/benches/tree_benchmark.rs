@@ -567,7 +567,13 @@ fn bench_utf8_vs_ascii(c: &mut Criterion) {
     let ascii_strings: Vec<String> = (0..1000).map(|_| random_ascii_string(4000)).collect();
     // UTF-8 strings with realistic prompt-like content
     let utf8_strings: Vec<String> = (0..1000)
-        .map(|i| format!("你好世界，这是一个较长的测试字符串，用于模拟真实的LLM请求。请求编号：{}。{}", i, random_ascii_string(3500)))
+        .map(|i| {
+            format!(
+                "你好世界，这是一个较长的测试字符串，用于模拟真实的LLM请求。请求编号：{}。{}",
+                i,
+                random_ascii_string(3500)
+            )
+        })
         .collect();
 
     for (i, s) in ascii_strings.iter().enumerate() {

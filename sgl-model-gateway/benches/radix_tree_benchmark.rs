@@ -101,6 +101,14 @@ fn generate_token_sequences(count: usize, len_range: (usize, usize)) -> Vec<Vec<
         .collect()
 }
 
+/// Generate fixed-size token sequences for size-specific benchmarks
+fn generate_fixed_token_sequences(count: usize, token_len: usize) -> Vec<Vec<TokenId>> {
+    let mut rng = thread_rng();
+    (0..count)
+        .map(|_| (0..token_len).map(|_| rng.random_range(0..50000)).collect())
+        .collect()
+}
+
 /// Generate worker endpoint URLs for scaling tests
 fn generate_worker_endpoints(count: usize) -> Vec<String> {
     (0..count)
@@ -199,16 +207,32 @@ fn bench_summary(c: &mut Criterion) {
         let requests = requests_clone.clone();
         let mut idx = 0;
         let printed = printed_old.clone();
+        let avg_chars = avg_chars;
 
-        b.iter(|| {
-            let result = tree.prefix_match(black_box(&requests[idx % requests.len()]));
-            idx += 1;
-            black_box(result)
+        b.iter_custom(|iters| {
+            let start = Instant::now();
+            for _ in 0..iters {
+                let result = tree.prefix_match(black_box(&requests[idx % requests.len()]));
+                black_box(result);
+                idx += 1;
+            }
+            let duration = start.elapsed();
+
+            if !printed.swap(true, Ordering::Relaxed) {
+                let ops_per_sec = iters as f64 / duration.as_secs_f64();
+                let latency_us = duration.as_nanos() as f64 / iters as f64 / 1000.0;
+                let throughput_mb = (ops_per_sec * avg_chars as f64) / 1_000_000.0;
+                add_result(
+                    "oldnew",
+                    format!(
+                        "OLD tree MATCH: {:>8.0} ops/sec | {:>5.1} µs/op | {:>6.1} MB/s",
+                        ops_per_sec, latency_us, throughput_mb
+                    ),
+                );
+            }
+
+            duration
         });
-
-        if !printed.swap(true, Ordering::Relaxed) {
-            // Results will be printed by Criterion
-        }
     });
 
     // Benchmark NEW tree match
@@ -220,22 +244,33 @@ fn bench_summary(c: &mut Criterion) {
         let requests = requests_clone.clone();
         let mut idx = 0;
         let printed = printed_new.clone();
+        let avg_chars = avg_chars;
 
-        b.iter(|| {
-            let result = tree.prefix_match_legacy(black_box(&requests[idx % requests.len()]));
-            idx += 1;
-            black_box(result)
+        b.iter_custom(|iters| {
+            let start = Instant::now();
+            for _ in 0..iters {
+                let result = tree.prefix_match_legacy(black_box(&requests[idx % requests.len()]));
+                black_box(result);
+                idx += 1;
+            }
+            let duration = start.elapsed();
+
+            if !printed.swap(true, Ordering::Relaxed) {
+                let ops_per_sec = iters as f64 / duration.as_secs_f64();
+                let latency_us = duration.as_nanos() as f64 / iters as f64 / 1000.0;
+                let throughput_mb = (ops_per_sec * avg_chars as f64) / 1_000_000.0;
+                add_result(
+                    "oldnew",
+                    format!(
+                        "NEW tree MATCH: {:>8.0} ops/sec | {:>5.1} µs/op | {:>6.1} MB/s",
+                        ops_per_sec, latency_us, throughput_mb
+                    ),
+                );
+            }
+
+            duration
         });
-
-        if !printed.swap(true, Ordering::Relaxed) {
-            // Results will be printed by Criterion
-        }
     });
-
-    add_result(
-        "oldnew",
-        "  (See Criterion output above for OLD vs NEW timing)".to_string(),
-    );
 
     // ========================================================================
     // StringTree vs TokenTree INSERT at different worker scales
@@ -319,6 +354,100 @@ fn bench_summary(c: &mut Criterion) {
                         ),
                     );
                     printed.store(true, Ordering::Relaxed);
+                }
+
+                duration
+            });
+        });
+    }
+
+    // ========================================================================
+    // TokenTree INSERT by token size (1k, 2k, 4k, 8k, 16k tokens)
+    // ========================================================================
+    const TOKEN_SIZES: [usize; 5] = [1024, 2048, 4096, 8192, 16384];
+    const TOKEN_SIZE_WORKERS: usize = 100; // Fixed worker count for size comparison
+    let size_workers = generate_worker_endpoints(TOKEN_SIZE_WORKERS);
+
+    for &token_size in &TOKEN_SIZES {
+        let fixed_sequences = generate_fixed_token_sequences(INSERT_POOL_SIZE, token_size);
+        let printed = Arc::new(AtomicBool::new(false));
+        let bench_name = format!("token_insert_{}tok", token_size);
+        let workers_clone = size_workers.clone();
+
+        group.bench_function(&bench_name, |b| {
+            let workers = workers_clone.clone();
+            let seqs = fixed_sequences.clone();
+            let printed = printed.clone();
+
+            b.iter_custom(|iters| {
+                let tree = TokenTree::new();
+                let start = Instant::now();
+                for i in 0..iters {
+                    let tenant = &workers[i as usize % workers.len()];
+                    let tokens = &seqs[i as usize % seqs.len()];
+                    tree.insert_tokens(black_box(tokens), tenant);
+                }
+                let duration = start.elapsed();
+
+                if !printed.swap(true, Ordering::Relaxed) {
+                    let ops_per_sec = iters as f64 / duration.as_secs_f64();
+                    let latency_us = duration.as_nanos() as f64 / iters as f64 / 1000.0;
+                    let throughput_mtok = (ops_per_sec * token_size as f64) / 1_000_000.0;
+                    add_result(
+                        "token_size",
+                        format!(
+                            "INSERT {:>5} tokens: {:>8.0} ops/sec | {:>6.1} µs/op | {:>6.1} Mtok/s",
+                            token_size, ops_per_sec, latency_us, throughput_mtok
+                        ),
+                    );
+                }
+
+                duration
+            });
+        });
+    }
+
+    // TokenTree MATCH by token size
+    for &token_size in &TOKEN_SIZES {
+        let fixed_sequences = generate_fixed_token_sequences(TREE_SIZE, token_size);
+
+        // Pre-populate tree
+        let token_tree = Arc::new(TokenTree::new());
+        for (i, seq) in fixed_sequences.iter().enumerate() {
+            let tenant = &size_workers[i % size_workers.len()];
+            token_tree.insert_tokens(seq, tenant);
+        }
+
+        let printed = Arc::new(AtomicBool::new(false));
+        let bench_name = format!("token_match_{}tok", token_size);
+        let tree_clone = token_tree.clone();
+
+        group.bench_function(&bench_name, |b| {
+            let tree = tree_clone.clone();
+            let seqs = fixed_sequences.clone();
+            let mut idx = 0;
+            let printed = printed.clone();
+
+            b.iter_custom(|iters| {
+                let start = Instant::now();
+                for _ in 0..iters {
+                    let result = tree.prefix_match_legacy(black_box(&seqs[idx % seqs.len()]));
+                    black_box(result);
+                    idx += 1;
+                }
+                let duration = start.elapsed();
+
+                if !printed.swap(true, Ordering::Relaxed) {
+                    let ops_per_sec = iters as f64 / duration.as_secs_f64();
+                    let latency_us = duration.as_nanos() as f64 / iters as f64 / 1000.0;
+                    let throughput_mtok = (ops_per_sec * token_size as f64) / 1_000_000.0;
+                    add_result(
+                        "token_size",
+                        format!(
+                            "MATCH  {:>5} tokens: {:>8.0} ops/sec | {:>6.1} µs/op | {:>6.1} Mtok/s",
+                            token_size, ops_per_sec, latency_us, throughput_mtok
+                        ),
+                    );
                 }
 
                 duration
@@ -573,6 +702,7 @@ fn print_summary() {
     let mut oldnew_results = Vec::new();
     let mut string_results = Vec::new();
     let mut token_results = Vec::new();
+    let mut token_size_results = Vec::new();
 
     for (key, value) in results.iter() {
         let category = key.split('_').skip(1).collect::<Vec<_>>().join("_");
@@ -581,6 +711,7 @@ fn print_summary() {
             "oldnew" => oldnew_results.push(value.clone()),
             "string" => string_results.push(value.clone()),
             "token" => token_results.push(value.clone()),
+            "token_size" => token_size_results.push(value.clone()),
             _ => {}
         }
     }
@@ -615,6 +746,16 @@ fn print_summary() {
     eprintln!("{}", "-".repeat(100));
     for v in &token_results {
         eprintln!("{}", v);
+    }
+
+    // Print TokenTree by size results
+    if !token_size_results.is_empty() {
+        eprintln!("\n{}", "-".repeat(100));
+        eprintln!("TOKENTREE BY TOKEN SIZE (100 workers, 10k tree entries)");
+        eprintln!("{}", "-".repeat(100));
+        for v in &token_size_results {
+            eprintln!("{}", v);
+        }
     }
 
     eprintln!("\n{}", "=".repeat(100));
