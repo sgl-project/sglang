@@ -688,6 +688,7 @@ impl CliArgs {
                 prefix_token_count: self.prefix_token_count,
                 load_factor: self.prefix_hash_load_factor,
             },
+            // Reuse eviction_interval and max_tree_size to avoid adding new CLI args
             "manual" => PolicyConfig::Manual {
                 eviction_interval_secs: self.eviction_interval,
                 max_entries: self.max_tree_size,

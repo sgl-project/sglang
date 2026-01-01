@@ -68,7 +68,7 @@ impl Default for ManualConfig {
     fn default() -> Self {
         Self {
             eviction_interval_secs: 60,
-            max_entries: 10000,
+            max_entries: 67108864,
         }
     }
 }
@@ -125,17 +125,11 @@ impl ManualPolicy {
                     }
 
                     let to_evict = current_size - max_entries;
-
-                    // Collect entries with their last_access time
                     let mut entries: Vec<_> = routing_map_clone
                         .iter()
                         .map(|entry| (entry.key().clone(), entry.value().last_access))
                         .collect();
-
-                    // Sort by last_access (oldest first)
                     entries.sort_by_key(|(_, last_access)| *last_access);
-
-                    // Remove oldest entries
                     let evicted_count = entries
                         .iter()
                         .take(to_evict)
@@ -693,7 +687,6 @@ mod tests {
             ..Default::default()
         };
 
-        // First access creates entry (slow path - vacant)
         let (first_result, branch) = policy.select_worker_impl(&workers, &info);
         assert_eq!(branch, ExecutionBranch::Vacant);
         let first_idx = first_result.unwrap();
@@ -704,11 +697,8 @@ mod tests {
         drop(node);
 
         std::thread::sleep(std::time::Duration::from_millis(10));
-
-        // Make the assigned worker unhealthy to force slow path
         workers[first_idx].set_healthy(false);
 
-        // This should trigger slow path (occupied miss) and update last_access
         let (_, branch) = policy.select_worker_impl(&workers, &info);
         assert_eq!(branch, ExecutionBranch::OccupiedMiss);
 

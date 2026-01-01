@@ -347,7 +347,7 @@ pub enum PolicyConfig {
         /// Interval between LRU eviction cycles (seconds, default: 60)
         #[serde(default = "default_manual_eviction_interval_secs")]
         eviction_interval_secs: u64,
-        /// Maximum number of routing entries before LRU eviction (default: 10000)
+        /// Maximum number of routing entries before LRU eviction (default: 67108864)
         #[serde(default = "default_manual_max_entries")]
         max_entries: usize,
     },
@@ -389,7 +389,7 @@ fn default_manual_eviction_interval_secs() -> u64 {
 }
 
 fn default_manual_max_entries() -> usize {
-    10000
+    67108864
 }
 
 impl PolicyConfig {
