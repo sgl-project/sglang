@@ -72,7 +72,7 @@ from sglang.srt.models.deepseek_v2 import (
     DeepseekV2MoE,
 )
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.single_batch_overlap import SboFlags
+from sglang.srt.batch_overlap.single_batch_overlap import SboFlags
 from sglang.srt.utils import (
     BumpAllocator,
     LazyValue,
@@ -128,6 +128,43 @@ class Glm4MoeLiteMLP(nn.Module):
                 f"Unsupported activation: {hidden_act}. Only silu is supported for now."
             )
         self.act_fn = SiluAndMul()
+
+    def forward(
+        self,
+        x,
+        forward_batch=None,
+        should_allreduce_fusion: bool = False,
+        use_reduce_scatter: bool = False,
+        gemm_output_zero_allocator: BumpAllocator = None,
+    ):
+        # Keep parity with DeepseekV2MLP.forward signature since DeepseekV2DecoderLayer
+        # invokes MLP modules with these extra arguments.
+        if (self.tp_size == 1) and x.shape[0] == 0:
+            return x
+
+        # Some quantization wrappers store the underlying parameter as `weight_packed`.
+        if not hasattr(self.gate_up_proj, "weight"):
+            self.gate_up_proj.weight = getattr(self.gate_up_proj, "weight_packed")
+        if not hasattr(self.down_proj, "weight"):
+            self.down_proj.weight = getattr(self.down_proj, "weight_packed")
+
+        if (
+            gemm_output_zero_allocator is not None
+            and x.shape[0] <= 256
+            and self.gate_up_proj.weight.dtype == torch.uint8
+        ):
+            y = gemm_output_zero_allocator.allocate(
+                x.shape[0] * self.gate_up_proj.output_size_per_partition
+            ).view(x.shape[0], self.gate_up_proj.output_size_per_partition)
+            x = (x, None, y)
+
+        gate_up, _ = self.gate_up_proj(x)
+        x = self.act_fn(gate_up)
+        x, _ = self.down_proj(
+            x,
+            skip_all_reduce=should_allreduce_fusion or use_reduce_scatter,
+        )
+        return x
 
 
 class Glm4MoeLiteAttention(nn.Module):
@@ -476,8 +513,16 @@ class Glm4MoeLiteDecoderLayer(DeepseekV2DecoderLayer):
         nn.Module.__init__(self)
         self.hidden_size = config.hidden_size
         self.config = config
+
+        from sglang.srt.layers.attention.nsa.utils import is_nsa_enable_prefill_cp
+
+        self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
         rope_theta = getattr(config, "rope_theta", 10000)
         rope_scaling = getattr(config, "rope_scaling", None)
+        # Fix for GLM-4-Moe-Lite where rope_scaling is populated with default values
+        # but DeepseekV2AttentionMLA blindly treats any rope_scaling dict as deepseek_yarn
+        if rope_scaling is not None and rope_scaling.get("rope_type", "default") == "default":
+            rope_scaling = None
         max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
         self.layer_id = layer_id
         self.mla = getattr(config, "mla", False)
@@ -502,12 +547,14 @@ class Glm4MoeLiteDecoderLayer(DeepseekV2DecoderLayer):
 
         self.is_layer_sparse = self._is_layer_sparse(layer_id, is_nextn=is_nextn)
         is_previous_layer_sparse = self._is_layer_sparse(layer_id - 1, is_nextn=False)
+        is_next_layer_sparse = self._is_layer_sparse(layer_id + 1, is_nextn=False)
 
         self.layer_scatter_modes = LayerScatterModes.init_new(
             layer_id=layer_id,
             num_layers=1 if is_nextn else config.num_hidden_layers,
             is_layer_sparse=self.is_layer_sparse,
             is_previous_layer_sparse=is_previous_layer_sparse,
+            is_next_layer_sparse=is_next_layer_sparse,
         )
 
         if self.is_layer_sparse:
@@ -547,8 +594,8 @@ class Glm4MoeLiteDecoderLayer(DeepseekV2DecoderLayer):
             is_last_layer=(
                 is_nextn or (self.layer_id == self.config.num_hidden_layers - 1)
             ),
+            qkv_latent_func=self.self_attn.prepare_qkv_latent,
         )
-
 
 class Glm4MoeLiteModel(DeepseekV2Model):
     def __init__(
@@ -562,6 +609,14 @@ class Glm4MoeLiteModel(DeepseekV2Model):
         self.vocab_size = config.vocab_size
         self.first_k_dense_replace = config.first_k_dense_replace
         self.pp_group = get_pp_group()
+
+        # DeepseekV2Model.forward expects these attributes to exist.
+        from sglang.srt.layers.attention.nsa.utils import is_nsa_enable_prefill_cp
+
+        self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
+        self.cp_size = get_attention_tp_size() if self.nsa_enable_prefill_cp else None
+        self.gemm_output_zero_allocator_size = 0
+        self.llama_4_scaling_config = getattr(config, "llama_4_scaling", None)
 
         if self.pp_group.is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
@@ -627,6 +682,19 @@ class Glm4MoeLiteForCausalLM(DeepseekV2ForCausalLM):
             }
         )
         self.capture_aux_hidden_states = False
+
+
+        from sglang.srt.layers.attention.nsa.utils import is_nsa_enable_prefill_cp
+        self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
+        if self.nsa_enable_prefill_cp:
+            from sglang.srt.layers.dp_attention import (
+                get_attention_tp_rank,
+                get_attention_tp_size,
+            )
+            self.cp_rank = get_attention_tp_rank()
+            self.cp_size = get_attention_tp_size()
+        else:
+            self.cp_rank = self.cp_size = None
 
     def determine_num_fused_shared_experts(
         self, architecture: str = "Glm4MoeLiteForCausalLM"
@@ -908,8 +976,14 @@ class Glm4MoeLiteForCausalLM(DeepseekV2ForCausalLM):
                     else:
                         logger.warning(f"Parameter {name} not found in params_dict")
 
-        if getattr(self.config, "mla", False):
-            self.post_load_weights(is_nextn=is_nextn, weight_names=weight_names)
+        # DeepseekV2AttentionMLA.forward_* expects post_load_weights() to populate
+        # per-layer packed weights like `w_kc`/`w_vc` (used during CUDA graph capture).
+        # GLM-Lite configs may not set `config.mla`, but this model always uses
+        # DeepseekV2AttentionMLA, so we must run the post-load processing.
+        # Use weight_names=None to ensure we always process all layers. Some checkpoints /
+        # naming schemes may not include "kv_b_proj" in `weight_names`, but `w_kc`/`w_vc`
+        # are still required by DeepseekV2AttentionMLA at runtime.
+        self.post_load_weights(is_nextn=is_nextn, weight_names=None)
 
 
 EntryClass = [Glm4MoeLiteForCausalLM]
