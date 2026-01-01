@@ -43,7 +43,7 @@
 
 import logging
 from copy import deepcopy
-from typing import Iterable, List, Optional, Tuple, Literal, Sequence
+from typing import Iterable, List, Literal, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -58,6 +58,7 @@ from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternMultimodalTokens,
     general_mm_embed_routine,
 )
+from transformers import activations
 
 try:
     from transformers.activations import PytorchGELUTanh
@@ -66,6 +67,8 @@ except ImportError:
 
     activations.PytorchGELUTanh = GELUTanh
     PytorchGELUTanh = GELUTanh
+from transformers import PretrainedConfig
+
 from sglang.srt.managers.schedule_batch import (
     Modality,
     MultimodalDataItem,
@@ -77,8 +80,7 @@ from sglang.srt.model_loader.weight_utils import (
     maybe_remap_kv_scale_name,
 )
 from sglang.srt.models.deepseek_v2 import DeepseekV3ForCausalLM
-from sglang.srt.models.kimi_vl_moonvit import VL_VISION_ATTENTION_FUNCTIONS
-from transformers import PretrainedConfig
+from sglang.srt.models.kimi_vl_moonvit import VL_VISION_ATTENTION_FUNCTIONS, MLP2
 
 logger = logging.getLogger(__name__)
 
@@ -90,8 +92,9 @@ def _apply_rope_input_validation(x, freqs_cis):
     assert freqs_cis.dtype == torch.complex64, freqs_cis.dtype
 
 
-def apply_rope(xq: torch.Tensor, xk: torch.Tensor,
-               freqs_cis: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+def apply_rope(
+    xq: torch.Tensor, xk: torch.Tensor, freqs_cis: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Args: (The leading dimensions of all inputs should be the same)
         xq: query, tensor of shape (..., num_heads, head_dim)
@@ -107,10 +110,8 @@ def apply_rope(xq: torch.Tensor, xk: torch.Tensor,
     # ..., num_heads, head_dim/2
     xq_ = torch.view_as_complex(xq.float().view(*xq.shape[:-1], -1, 2))
     xk_ = torch.view_as_complex(xk.float().view(*xq.shape[:-1], -1, 2))
-    xq_out = torch.view_as_real(xq_ * freqs_cis).flatten(
-        -2)  # ..., num_heads, head_dim
-    xk_out = torch.view_as_real(xk_ * freqs_cis).flatten(
-        -2)  # ..., num_heads, head_dim
+    xq_out = torch.view_as_real(xq_ * freqs_cis).flatten(-2)  # ..., num_heads, head_dim
+    xk_out = torch.view_as_real(xk_ * freqs_cis).flatten(-2)  # ..., num_heads, head_dim
     return xq_out.type_as(xq), xk_out.type_as(xk)
 
 
@@ -125,17 +126,19 @@ def tpool_patch_merger(
     pre_sum = 0
     for t, h, w in grid_thws.tolist():
         # Get the current sequence
-        seq = x[pre_sum:pre_sum + t * h * w]
+        seq = x[pre_sum: pre_sum + t * h * w]
         # Reshape along self.merge_kernel_size and concat to the last dimension
         kernel_height, kernel_width = merge_kernel_size
         new_height, new_width = h // kernel_height, w // kernel_width
-        reshaped_seq = seq.view(t, new_height, kernel_height, new_width,
-                                kernel_width, d_model)
-        reshaped_seq = reshaped_seq.permute(0, 1,
-                                            3, 2, 4, 5).contiguous().mean(
-            dim=0)  # temporal pooling
-        padded_seq = reshaped_seq.view(new_height * new_width,
-                                       kernel_height * kernel_width, -1)
+        reshaped_seq = seq.view(
+            t, new_height, kernel_height, new_width, kernel_width, d_model
+        )
+        reshaped_seq = (
+            reshaped_seq.permute(0, 1, 3, 2, 4, 5).contiguous().mean(dim=0)
+        )  # temporal pooling
+        padded_seq = reshaped_seq.view(
+            new_height * new_width, kernel_height * kernel_width, -1
+        )
         outputs.append(padded_seq)
         pre_sum += t * h * w
 
@@ -182,7 +185,7 @@ class MoonViTEncoderLayer(nn.Module):
         hidden_dim: int,
         mlp_dim: int,
         *,
-        attn_implementation: str = 'flash_attention_2',
+        attn_implementation: str = "flash_attention_2",
         activation=F.gelu,
         attn_bias: bool = False,
         use_deterministic_attn: bool = False,
@@ -226,14 +229,16 @@ class MoonViTEncoderLayer(nn.Module):
         xq, xk = apply_rope(xq, xk, rope_freqs_cis)
 
         attn_func = VL_VISION_ATTENTION_FUNCTIONS[self.attn_implementation]
-        attn_out = attn_func(xq,
-                             xk,
-                             xv,
-                             q_cu_seqlens=cu_seqlens,
-                             k_cu_seqlens=cu_seqlens,
-                             max_seqlen_k=max_seqlen,
-                             max_seqlen_q=max_seqlen,
-                             deterministic=self.use_deterministic_attn)
+        attn_out = attn_func(
+            xq,
+            xk,
+            xv,
+            q_cu_seqlens=cu_seqlens,
+            k_cu_seqlens=cu_seqlens,
+            max_seqlen_k=max_seqlen,
+            max_seqlen_q=max_seqlen,
+            deterministic=self.use_deterministic_attn,
+        )
 
         attn_out = self.wo(attn_out)
         return attn_out
@@ -248,8 +253,9 @@ class MoonViTEncoderLayer(nn.Module):
         residual = hidden_states
         hidden_states = self.norm0(hidden_states)
 
-        hidden_states = self.attention_qkvpacked(hidden_states, cu_seqlens,
-                                                 max_seqlen, rope_freqs_cis)
+        hidden_states = self.attention_qkvpacked(
+            hidden_states, cu_seqlens, max_seqlen, rope_freqs_cis
+        )
         hidden_states = residual + hidden_states
 
         residual = hidden_states
@@ -288,7 +294,7 @@ def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
     omega = 1.0 / 10000 ** omega  # (D/2,)
 
     pos = pos.reshape(-1)  # (M,)
-    out = np.einsum('m,d->md', pos, omega)  # (M, D/2), outer product
+    out = np.einsum("m,d->md", pos, omega)  # (M, D/2), outer product
 
     emb_sin = np.sin(out)  # (M, D/2)
     emb_cos = np.cos(out)  # (M, D/2)
@@ -300,11 +306,16 @@ def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
 @get_rope_shape_decorate
 @torch.compile(dynamic=True)
 def get_rope_shape(org, interpolation_mode, shape):
-    return (F.interpolate(
-        org.permute((2, 0, 1)).unsqueeze(0),
-        size=shape,
-        mode=interpolation_mode,
-    ).squeeze(0).permute((1, 2, 0)).flatten(end_dim=1))
+    return (
+        F.interpolate(
+            org.permute((2, 0, 1)).unsqueeze(0),
+            size=shape,
+            mode=interpolation_mode,
+        )
+        .squeeze(0)
+        .permute((1, 2, 0))
+        .flatten(end_dim=1)
+    )
 
 
 def get_1d_sincos_pos_embed(embed_dim, t_size, cls_token=False):
@@ -316,8 +327,7 @@ def get_1d_sincos_pos_embed(embed_dim, t_size, cls_token=False):
     grid_t = np.arange(t_size, dtype=np.float32)
     pos_embed = get_1d_sincos_pos_embed_from_grid(embed_dim, grid_t)
     if cls_token:
-        pos_embed = np.concatenate([np.zeros([1, embed_dim]), pos_embed],
-                                   axis=0)
+        pos_embed = np.concatenate([np.zeros([1, embed_dim]), pos_embed], axis=0)
     return pos_embed
 
 
@@ -332,12 +342,14 @@ class IdentityMap(nn.Module):
 
 class Learnable2DInterpPosEmbDivided_fixed(nn.Module):
 
-    def __init__(self,
-                 height: int,
-                 width: int,
-                 num_frames: int,
-                 dim: int,
-                 interpolation_mode: str = 'bicubic') -> None:
+    def __init__(
+        self,
+        height: int,
+        width: int,
+        num_frames: int,
+        dim: int,
+        interpolation_mode: str = "bicubic",
+    ) -> None:
         super().__init__()
         self.height = height
         self.width = width
@@ -345,23 +357,23 @@ class Learnable2DInterpPosEmbDivided_fixed(nn.Module):
         self.dim = dim
         self.interpolation_mode = interpolation_mode
         self.weight = nn.Parameter(torch.empty(height, width, dim))
-        self.register_buffer('time_weight',
-                             torch.from_numpy(
-                                 get_1d_sincos_pos_embed(
-                                     self.dim,
-                                     self.num_frames)).float().unsqueeze(1),
-                             persistent=False)
+        self.register_buffer(
+            "time_weight",
+            torch.from_numpy(get_1d_sincos_pos_embed(self.dim, self.num_frames))
+            .float()
+            .unsqueeze(1),
+            persistent=False,
+        )
 
         self.reset_parameters()
 
     def reset_parameters(self):
         nn.init.normal_(self.weight)
 
-    def forward(self, x: torch.Tensor,
-                grid_thws: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, grid_thws: torch.Tensor) -> torch.Tensor:
         pos_embs = []
         for t, h, w in grid_thws.tolist():
-            assert t <= self.num_frames, f't:{t} > self.num_frames:{self.num_frames}'
+            assert t <= self.num_frames, f"t:{t} > self.num_frames:{self.num_frames}"
             if (h, w) == self.weight.shape[:-1]:
                 pos_emb_2d = self.weight.flatten(end_dim=1)
             else:
@@ -374,8 +386,9 @@ class Learnable2DInterpPosEmbDivided_fixed(nn.Module):
             if t == 1:
                 pos_emb_3d = pos_emb_2d
             else:
-                pos_emb_3d = pos_emb_2d.unsqueeze(0).repeat(
-                    t, 1, 1) + self.time_weight[0:t]
+                pos_emb_3d = (
+                    pos_emb_2d.unsqueeze(0).repeat(t, 1, 1) + self.time_weight[0:t]
+                )
 
             pos_embs.append(pos_emb_3d.reshape(-1, pos_emb_3d.shape[-1]))
 
@@ -401,20 +414,16 @@ class Rope2DPosEmbRepeated(nn.Module):
         theta_base (float): the base of the theta
     """
 
-    def __init__(self,
-                 dim: int,
-                 max_height: int,
-                 max_width: int,
-                 theta_base=10000):
+    def __init__(self, dim: int, max_height: int, max_width: int, theta_base=10000):
         super().__init__()
         self.dim = dim
-        assert self.dim % 4 == 0, 'dim must be divisible by 4'
+        assert self.dim % 4 == 0, "dim must be divisible by 4"
         self.max_height = max_height
         self.max_width = max_width
         self.theta_base = theta_base
 
     def extra_repr(self):
-        return f'dim={self.dim}, max_height={self.max_height}, max_width={self.max_width}, theta_base={self.theta_base}'
+        return f"dim={self.dim}, max_height={self.max_height}, max_width={self.max_width}, theta_base={self.theta_base}"
 
     def _precompute_freqs_cis(self, device: torch.device) -> torch.Tensor:
         """Calculate the cis(freqs) for each position in the 2D grid.
@@ -427,9 +436,9 @@ class Rope2DPosEmbRepeated(nn.Module):
         flat_pos = torch.arange(0, N).float().to(device)
         x_pos = flat_pos % self.max_width
         y_pos = flat_pos // self.max_width
-        dim_range = (torch.arange(0, self.dim,
-                                  4)[:(self.dim // 4)].float().to(device)
-                     )  # C/4
+        dim_range = (
+            torch.arange(0, self.dim, 4)[: (self.dim // 4)].float().to(device)
+        )  # C/4
         freqs = 1.0 / (self.theta_base ** (dim_range / self.dim))
         x_freqs = torch.outer(x_pos, freqs).float()  # N, C/4
         y_freqs = torch.outer(y_pos, freqs).float()  # N, C/4
@@ -437,28 +446,30 @@ class Rope2DPosEmbRepeated(nn.Module):
         y_cis = torch.polar(torch.ones_like(y_freqs), y_freqs)  # N, C/4
         # N, C/4, 2
         freqs_cis = torch.cat(
-            [x_cis.unsqueeze(dim=-1),
-             y_cis.unsqueeze(dim=-1)], dim=-1)
+            [x_cis.unsqueeze(dim=-1), y_cis.unsqueeze(dim=-1)], dim=-1
+        )
         # max_height, max_width, C/2
         freqs_cis = freqs_cis.reshape(self.max_height, self.max_width, -1)
         return freqs_cis
 
-    def get_freqs_cis(self, grid_thws: torch.Tensor,
-                      device: torch.device) -> torch.Tensor:
+    def get_freqs_cis(
+        self, grid_thws: torch.Tensor, device: torch.device
+    ) -> torch.Tensor:
         """
         Args:
             grid_thws (torch.Tensor): grid time, height and width
         Returns:
             freqs_cis: tensor of shape (sum(t * height * width), dim//2)
         """
-        if not hasattr(self, 'freqs_cis'):
-            self.register_buffer('freqs_cis',
-                                 self._precompute_freqs_cis(device),
-                                 persistent=False)
+        if not hasattr(self, "freqs_cis"):
+            self.register_buffer(
+                "freqs_cis", self._precompute_freqs_cis(device), persistent=False
+            )
 
         shapes = grid_thws.tolist()
-        assert all(1 <= h <= self.max_height and 1 <= w <= self.max_width
-                   for t, h, w in shapes), (
+        assert all(
+            1 <= h <= self.max_height and 1 <= w <= self.max_width for t, h, w in shapes
+        ), (
             shapes,
             self.max_height,
             self.max_width,
@@ -475,41 +486,42 @@ class Rope2DPosEmbRepeated(nn.Module):
 
 class MoonVision3dPatchEmbed(nn.Module):
 
-    def __init__(self,
-                 out_dim: int,
-                 in_dim: int = 3,
-                 patch_size: int | tuple[int, int] = (14, 14),
-                 pos_emb_height: int = 14,
-                 pos_emb_width: int = 14,
-                 pos_emb_time: int = 4,
-                 pos_emb_type: str = 'divided_fixed'):
+    def __init__(
+        self,
+        out_dim: int,
+        in_dim: int = 3,
+        patch_size: int | tuple[int, int] = (14, 14),
+        pos_emb_height: int = 14,
+        pos_emb_width: int = 14,
+        pos_emb_time: int = 4,
+        pos_emb_type: str = "divided_fixed",
+    ):
         super().__init__()
         assert isinstance(
-            patch_size,
-            int | Sequence), f'Invalid patch_size type: {type(patch_size)}'
+            patch_size, int | Sequence
+        ), f"Invalid patch_size type: {type(patch_size)}"
         if isinstance(patch_size, int):
             patch_size = (patch_size, patch_size)
-        assert (len(patch_size) == 2
-                ), f'Expected patch_size to be a tuple of 2, got {patch_size}'
+        assert (
+            len(patch_size) == 2
+        ), f"Expected patch_size to be a tuple of 2, got {patch_size}"
         self.patch_size = patch_size
 
-        self.proj = nn.Conv2d(in_dim,
-                              out_dim,
-                              kernel_size=patch_size,
-                              stride=patch_size)
+        self.proj = nn.Conv2d(
+            in_dim, out_dim, kernel_size=patch_size, stride=patch_size
+        )
 
-        if pos_emb_type == 'divided_fixed':
+        if pos_emb_type == "divided_fixed":
             self.pos_emb = Learnable2DInterpPosEmbDivided_fixed(
                 height=pos_emb_height,
                 width=pos_emb_width,
                 num_frames=pos_emb_time,
-                dim=out_dim)
+                dim=out_dim,
+            )
         else:
-            raise NotImplementedError(
-                f'Not support pos_emb_type: {pos_emb_type}')
+            raise NotImplementedError(f"Not support pos_emb_type: {pos_emb_type}")
 
-    def forward(self, x: torch.Tensor,
-                grid_thws: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, grid_thws: torch.Tensor) -> torch.Tensor:
         """
         Args:
             x (L, Channels): input tensor
@@ -530,9 +542,9 @@ class MoonViT3dEncoder(nn.Module):
         hidden_dim: int,
         num_layers: int,
         block_cfg: dict,
-        video_attn_type: str = 'spatial_temporal',
+        video_attn_type: str = "spatial_temporal",
         use_checkpoint: bool = False,
-        recompute_method: Literal['uniform', 'block', None] = 'uniform',
+        recompute_method: Literal["uniform", "block", None] = "uniform",
         recompute_num_layers: int = 1,
         activation_cpu_offload: bool = False,
         use_deterministic_attn: bool = False,
@@ -541,25 +553,31 @@ class MoonViT3dEncoder(nn.Module):
 
         self.use_checkpoint = use_checkpoint
         if recompute_method is None:
-            recompute_method = 'uniform'
+            recompute_method = "uniform"
         assert recompute_method in [
-            'uniform', 'block'
+            "uniform",
+            "block",
         ], f'recompute_method must be in ["uniform", "block"], got {recompute_method}'
         self.recompute_method = recompute_method
         self.recompute_num_layers = recompute_num_layers
         self.activation_cpu_offload = activation_cpu_offload
         self.use_deterministic_attn = use_deterministic_attn
 
-        assert video_attn_type == 'spatial_temporal', f'video_attn_type must be "spatial_temporal", got {video_attn_type}'
+        assert (
+            video_attn_type == "spatial_temporal"
+        ), f'video_attn_type must be "spatial_temporal", got {video_attn_type}'
         self.video_attn_type = video_attn_type
         self.rope_2d = Rope2DPosEmbRepeated(
-            block_cfg['hidden_dim'] // block_cfg['num_heads'], 512, 512)
-        self.blocks = nn.ModuleList([
-            MoonViTEncoderLayer(
-                **block_cfg,
-                use_deterministic_attn=self.use_deterministic_attn)
-            for _ in range(num_layers)
-        ])
+            block_cfg["hidden_dim"] // block_cfg["num_heads"], 512, 512
+        )
+        self.blocks = nn.ModuleList(
+            [
+                MoonViTEncoderLayer(
+                    **block_cfg, use_deterministic_attn=self.use_deterministic_attn
+                )
+                for _ in range(num_layers)
+            ]
+        )
         self.final_layernorm = nn.LayerNorm(hidden_dim)
 
     def forward(
@@ -568,16 +586,18 @@ class MoonViT3dEncoder(nn.Module):
         grid_thws: torch.Tensor,
     ) -> torch.Tensor:
         rope_freqs_cis = self.rope_2d.get_freqs_cis(
-            grid_thws=grid_thws, device=hidden_states.device)
+            grid_thws=grid_thws, device=hidden_states.device
+        )
 
-        lengths = torch.cat((
-            torch.zeros(1, dtype=grid_thws.dtype, device=grid_thws.device),
-            grid_thws[:, 0] * grid_thws[:, 1] * grid_thws[:, 2],
-        ))
+        lengths = torch.cat(
+            (
+                torch.zeros(1, dtype=grid_thws.dtype, device=grid_thws.device),
+                grid_thws[:, 0] * grid_thws[:, 1] * grid_thws[:, 2],
+            )
+        )
 
         max_seqlen = lengths.max()
-        cu_seqlens = lengths.to(hidden_states.device).cumsum(dim=0,
-                                                             dtype=torch.int32)
+        cu_seqlens = lengths.to(hidden_states.device).cumsum(dim=0, dtype=torch.int32)
 
         def custom(start, end):
 
@@ -591,10 +611,9 @@ class MoonViT3dEncoder(nn.Module):
             return custom_forward
 
         for block in self.blocks:
-            hidden_states = block(hidden_states,
-                                  cu_seqlens,
-                                  max_seqlen,
-                                  rope_freqs_cis=rope_freqs_cis)
+            hidden_states = block(
+                hidden_states, cu_seqlens, max_seqlen, rope_freqs_cis=rope_freqs_cis
+            )
 
         hidden_states = self.final_layernorm(hidden_states)
 
@@ -603,13 +622,13 @@ class MoonViT3dEncoder(nn.Module):
 
 class MoonViT3dPretrainedModel(nn.Module):
     config_class = None  # Will be set by K2VL dynamically
-    model_type = 'moonvit3d'
-    _no_split_modules = ['PackingTransformer']
+    model_type = "moonvit3d"
+    _no_split_modules = ["PackingTransformer"]
     _supports_flash_attn_2 = True
     _supports_sdpa = True
 
     def __init__(self, config, *inputs, **kwargs):
-        super().__init__(config, *inputs, **kwargs)
+        super().__init__()
         config = deepcopy(config)
         self.merge_kernel_size = config.merge_kernel_size
         self.patch_size = config.patch_size
@@ -628,22 +647,24 @@ class MoonViT3dPretrainedModel(nn.Module):
             hidden_dim=config.hidden_size,
             num_layers=config.num_hidden_layers,
             block_cfg={
-                'num_heads': config.num_attention_heads,
-                'hidden_dim': config.hidden_size,
-                'mlp_dim': config.intermediate_size,
-                'activation': PytorchGELUTanh(),
-                'attn_bias': True,
-                'attn_implementation': config._attn_implementation,
+                "num_heads": config.num_attention_heads,
+                "hidden_dim": config.hidden_size,
+                "mlp_dim": config.intermediate_size,
+                "activation": PytorchGELUTanh(),
+                "attn_bias": True,
+                "attn_implementation": config._attn_implementation,
             },
-            use_checkpoint=kwargs.get('use_checkpoint', False),
-            recompute_method=kwargs.get('recompute_method', None),
-            recompute_num_layers=kwargs.get('recompute_num_layers', 1),
-            activation_cpu_offload=kwargs.get('activation_cpu_offload', False),
-            use_deterministic_attn=kwargs.get('use_deterministic_attn', False),
-            video_attn_type=config.video_attn_type)
+            use_checkpoint=kwargs.get("use_checkpoint", False),
+            recompute_method=kwargs.get("recompute_method", None),
+            recompute_num_layers=kwargs.get("recompute_num_layers", 1),
+            activation_cpu_offload=kwargs.get("activation_cpu_offload", False),
+            use_deterministic_attn=kwargs.get("use_deterministic_attn", False),
+            video_attn_type=config.video_attn_type,
+        )
 
-    def forward(self, pixel_values: torch.Tensor,
-                grid_thws: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, pixel_values: torch.Tensor, grid_thws: torch.Tensor
+    ) -> torch.Tensor:
         """
         Args:
             pixel_values (torch.Tensor): The input pixel values.
@@ -652,19 +673,71 @@ class MoonViT3dPretrainedModel(nn.Module):
             torch.Tensor: The output tokens.
         """
         # grid_thws = grid_thws.to('cpu')  # 不再强制移到CPU，保持在输入设备上
-        assert grid_thws.ndim == 2, f'grid_thws should be 2D, got {grid_thws.ndim}'
-        assert grid_thws.size(1) == 3, f'No support for thw: {grid_thws}'
+        assert grid_thws.ndim == 2, f"grid_thws should be 2D, got {grid_thws.ndim}"
+        assert grid_thws.size(1) == 3, f"No support for thw: {grid_thws}"
         hidden_states = self.patch_embed(pixel_values, grid_thws)
         hidden_states = self.encoder(hidden_states, grid_thws)
-        if self.merge_type == 'sd2_tpool':  # spatial downsampling 2x with temporal pooling all
+        if (
+            self.merge_type == "sd2_tpool"
+        ):  # spatial downsampling 2x with temporal pooling all
             hidden_states = tpool_patch_merger(
-                hidden_states,
-                grid_thws,
-                merge_kernel_size=self.merge_kernel_size)
+                hidden_states, grid_thws, merge_kernel_size=self.merge_kernel_size
+            )
         else:
-            raise NotImplementedError(f'Not support {self.merge_type}')
+            raise NotImplementedError(f"Not support {self.merge_type}")
 
         return hidden_states
+
+
+
+class MLP(nn.Module):
+
+    def __init__(self, config):
+        super().__init__()
+        # TODO, use faster LayerNorm
+        self.pre_norm = nn.LayerNorm(config.mm_hidden_size)
+        self.proj = nn.Sequential(
+            nn.Linear(config.mm_hidden_size, config.hidden_size), nn.GELU(),
+            nn.Linear(config.hidden_size, config.hidden_size))
+
+    def forward(self, x, *args, **kwargs):
+        assert isinstance(x,
+                          list | tuple), f'x is not a list or tuple: {type(x)}'
+        lengths = [item.shape[0] for item in x]
+        x = torch.cat(x, dim=0)
+        x = self.pre_norm(x)
+        x = self.proj(x)
+        x = torch.split(x, lengths, dim=0)
+
+        return x
+
+
+class PatchMergerMLP(nn.Module):
+
+    def __init__(self, config):
+        super().__init__()
+        eps = config.projector_ln_eps
+        self.hidden_size = config.mm_hidden_size * (
+            config.merge_kernel_size[0] * config.merge_kernel_size[1])
+        self.pre_norm = nn.LayerNorm(config.mm_hidden_size, eps=eps)
+        self.proj = nn.Sequential(
+            nn.Linear(self.hidden_size, self.hidden_size),
+            nn.GELU(),
+            nn.Linear(self.hidden_size, config.hidden_size),
+        )
+
+    def forward(self, x, *args, **kwargs):
+        if isinstance(x, list) or isinstance(x, tuple):
+            x = [
+                self.proj(self.pre_norm(item).view(item.shape[0], -1))
+                for item in x
+            ]
+        else:
+            # 不一定有4个维度，可能会把BxN合并在一起，我们只要关心第一个shape和最后一个shape不变就行了
+            # B, N, N_k, C = x.shape
+            B = x.shape[0]
+            x = self.proj(self.pre_norm(x).view(B, -1, self.hidden_size))
+        return x
 
 
 class K2VLForConditionalGeneration(nn.Module):
