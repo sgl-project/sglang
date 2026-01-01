@@ -291,5 +291,6 @@ class _GroupedMaskedWarmupExecutor(_BaseWarmupExecutor):
 def deep_gemm_execution_hook(
     m: int, n: int, k: int, num_groups: int, kernel_type: DeepGemmKernelType
 ):
-    _maybe_compile_deep_gemm_one_type_all(kernel_type, n, k, num_groups)
+    if m > 0:
+        _maybe_compile_deep_gemm_one_type_all(kernel_type, n, k, num_groups)
     yield

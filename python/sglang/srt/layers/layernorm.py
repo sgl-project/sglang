@@ -24,7 +24,7 @@ from sglang.srt.batch_invariant_ops import (
     is_batch_invariant_mode_enabled,
     rms_norm_batch_invariant,
 )
-from sglang.srt.custom_op import CustomOp
+from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     cpu_has_amx_support,
@@ -35,7 +35,6 @@ from sglang.srt.utils import (
     is_hip,
     is_npu,
     is_xpu,
-    supports_custom_op,
 )
 
 _is_cuda = is_cuda()
@@ -77,7 +76,7 @@ if _is_npu:
     import torch_npu
 
 
-class RMSNorm(CustomOp):
+class RMSNorm(MultiPlatformOp):
     def __init__(
         self,
         hidden_size: int,
@@ -266,14 +265,8 @@ class RMSNorm(CustomOp):
                 flashinfer_allreduce_residual_rmsnorm,
             )
 
-            fused_op = (
-                torch.ops.sglang.flashinfer_allreduce_residual_rmsnorm
-                if supports_custom_op()
-                else flashinfer_allreduce_residual_rmsnorm
-            )
-
             if get_tensor_model_parallel_world_size() > 1:
-                fused_result = fused_op(
+                fused_result = flashinfer_allreduce_residual_rmsnorm(
                     input_tensor=x,
                     residual=residual,
                     weight=self.weight,
@@ -285,7 +278,7 @@ class RMSNorm(CustomOp):
         return self.forward(x, residual)
 
 
-class LayerNorm(CustomOp):
+class LayerNorm(MultiPlatformOp):
     def __init__(
         self,
         hidden_size: int,
@@ -357,7 +350,7 @@ class LayerNorm(CustomOp):
             return self.forward_native(x)
 
 
-class GemmaRMSNorm(CustomOp):
+class GemmaRMSNorm(MultiPlatformOp):
     def __init__(
         self,
         hidden_size: int,
@@ -444,7 +437,7 @@ class GemmaRMSNorm(CustomOp):
         return self._forward_impl(x, residual)
 
 
-class Gemma3RMSNorm(CustomOp):
+class Gemma3RMSNorm(MultiPlatformOp):
     def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
         self.eps = eps
