@@ -161,7 +161,7 @@ impl ManualPolicy {
                     find_healthy_worker(&entry.get().candi_worker_urls, workers, healthy_indices)
                 {
                     entry.get_mut().last_access = Instant::now();
-                    return (idx, ExecutionBranch::OccupiedHit);
+                    (idx, ExecutionBranch::OccupiedHit)
                 } else {
                     let selected_idx = random_select(healthy_indices);
                     let node = entry.get_mut();
