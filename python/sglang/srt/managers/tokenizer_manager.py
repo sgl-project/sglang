@@ -461,7 +461,6 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
         request: Optional[fastapi.Request] = None,
-        traceparent: Optional[str] = None,
     ):
         created_time = obj.received_time if obj.received_time else time.time()
         self.auto_create_handle_loop()
@@ -469,7 +468,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         # Normalize the request
         obj.normalize_batch_and_arguments()
         if self.enable_trace:
-            self._trace_request_start(obj, created_time, request, traceparent)
+            self._trace_request_start(obj, created_time, request)
         if self.server_args.language_only:
             self._handle_epd_disaggregation_encode_request(obj)
         if self.server_args.tokenizer_worker_num > 1:
@@ -2147,7 +2146,6 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         obj: Union[GenerateReqInput, EmbeddingReqInput],
         created_time: Optional[float] = None,
         request: Optional[fastapi.Request] = None,
-        traceparent: Optional[str] = None,
     ):
         external_trace_header = None
         if request:
@@ -2155,11 +2153,11 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 trace_set_remote_propagate_context(request.headers["trace_context"])
             else:
                 external_trace_header = extract_trace_headers(request.headers)
-        elif traceparent:
-            # When the request comes form the rust grpc server there isn't a
-            # real request object but we still need to propagate the traceparent from
-            # the traceparent that is explicitly passed in
-            external_trace_header = {"traceparent": traceparent}
+        elif obj.external_trace_header:
+            # When the request comes form the rust grpc server or Engine there isn't a
+            # real request object but we still need to propagate the trace context from
+            # the trace context that is explicitly passed in
+            external_trace_header = obj.external_trace_header
 
         if obj.is_single:
             bootstrap_room = (

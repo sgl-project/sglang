@@ -1,9 +1,13 @@
 import re
-from contextlib import contextmanager
 from itertools import chain
 from typing import Any, Dict, List, Set, Tuple
 
 import torch
+
+from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+
+logger = init_logger(__name__)
 
 
 # Adapted from skywork AI Infra diffusion optimize
@@ -25,25 +29,24 @@ class LayerwiseOffloadManager:
         self,
         model: torch.nn.Module,
         *,
-        module_list_attr: str,
+        layers_attr_str: str,
         num_layers: int,
         enabled: bool,
         pin_cpu_memory: bool = True,
-        auto_initialize: bool = False,
     ) -> None:
         self.model = model
-        self.module_list_attr = module_list_attr
+        self.layers_attr_str = layers_attr_str
         self.num_layers = num_layers
         self.pin_cpu_memory = pin_cpu_memory
 
         self.enabled = bool(enabled and torch.cuda.is_available())
-        self.device = (
-            torch.device("cuda", torch.cuda.current_device()) if self.enabled else None
-        )
-        self.copy_stream = torch.cuda.Stream() if self.enabled else None
+        if not self.enabled:
+            return
+        self.device = torch.device("cuda", torch.cuda.current_device())
+        self.copy_stream = torch.cuda.Stream()
 
         self._layer_name_re = re.compile(
-            rf"(^|\.){re.escape(module_list_attr)}\.(\d+)(\.|$)"
+            rf"(^|\.){re.escape(layers_attr_str)}\.(\d+)(\.|$)"
         )
 
         # layer_idx -> {dtype: consolidated_pinned_cpu_tensor}
@@ -58,8 +61,7 @@ class LayerwiseOffloadManager:
         self._named_parameters: Dict[str, torch.nn.Parameter] = {}
         self._named_buffers: Dict[str, torch.Tensor] = {}
 
-        if auto_initialize:
-            self._initialize()
+        self._initialize()
 
     def _match_layer_idx(self, name: str) -> int | None:
         m = self._layer_name_re.search(name)
@@ -125,6 +127,9 @@ class LayerwiseOffloadManager:
         # prefetch the first layer for warm-up
         self.prepare_for_next_denoise(non_blocking=False)
 
+        self.register_forward_hooks()
+        logger.info("LayerwiseOffloadManager initialized")
+
     def prepare_for_next_denoise(self, non_blocking=True):
         self.prefetch_layer(0, non_blocking=non_blocking)
         if not non_blocking and self.copy_stream is not None:
@@ -148,7 +153,6 @@ class LayerwiseOffloadManager:
             return
         if layer_idx not in self._consolidated_cpu_weights:
             return
-
         self.copy_stream.wait_stream(torch.cuda.current_stream())
 
         # create gpu buffer and load from CPU buffer
@@ -173,30 +177,6 @@ class LayerwiseOffloadManager:
             ].view(meta["shape"])
 
         self._gpu_layers.add(layer_idx)
-
-    @contextmanager
-    def layer_scope(
-        self,
-        *,
-        prefetch_layer_idx: int | None,
-        release_layer_idx: int | None,
-        non_blocking: bool = True,
-    ):
-        """A helper context manager to improve readability at call sites.
-
-        It optionally prefetches ``prefetch_layer_idx`` before entering the
-        context, and waits for the copy stream then releases
-        ``release_layer_idx`` on exit.
-        """
-        if self.enabled and prefetch_layer_idx is not None:
-            self.prefetch_layer(prefetch_layer_idx, non_blocking=non_blocking)
-        try:
-            yield
-        finally:
-            if self.enabled and self.copy_stream is not None:
-                torch.cuda.current_stream().wait_stream(self.copy_stream)
-            if self.enabled and release_layer_idx is not None:
-                self.release_layer(release_layer_idx)
 
     @torch.compiler.disable
     def release_layer(self, layer_idx: int) -> None:
@@ -223,3 +203,66 @@ class LayerwiseOffloadManager:
 
         for layer_idx in list(self._gpu_layers):
             self.release_layer(layer_idx)
+
+    def register_forward_hooks(self) -> None:
+        if not self.enabled:
+            return
+
+        layers = getattr(self.model, self.layers_attr_str)
+
+        def make_pre_hook(i):
+            def hook(module, input):
+                self.prefetch_layer(i + 1, non_blocking=True)
+
+            return hook
+
+        def make_post_hook(i):
+            def hook(module, input, output):
+                if self.copy_stream is not None:
+                    torch.cuda.current_stream().wait_stream(self.copy_stream)
+                self.release_layer(i)
+
+            return hook
+
+        # register prefetch & release hooks for each layer
+        for i, layer in enumerate(layers):
+            layer.register_forward_pre_hook(make_pre_hook(i))
+            layer.register_forward_hook(make_post_hook(i))
+
+
+class OffloadableDiTMixin:
+    """
+    A mixin that registers forward hooks for a DiT to enable layerwise offload
+    """
+
+    # the list of names of a DiT's layers/blocks
+    layer_names: List[str]
+    layerwise_offload_managers: list[LayerwiseOffloadManager] | None = None
+
+    def configure_layerwise_offload(self, server_args: ServerArgs):
+        self.layerwise_offload_managers = []
+        for layer_name in self.layer_names:
+            # a manager per layer-list
+            module_list = getattr(self, layer_name, None)
+            if module_list is None or not isinstance(module_list, torch.nn.ModuleList):
+                continue
+
+            num_layers = len(module_list)
+            manager = LayerwiseOffloadManager(
+                model=self,
+                layers_attr_str=layer_name,
+                num_layers=num_layers,
+                enabled=True,
+                pin_cpu_memory=server_args.pin_cpu_memory,
+            )
+            self.layerwise_offload_managers.append(manager)
+
+        logger.info(
+            f"Enabled layerwise offload for {self.__class__.__name__} on modules: {self.layer_names}"
+        )
+
+    def prepare_for_next_denoise(self):
+        if self.layerwise_offload_managers is None:
+            return
+        for manager in self.layerwise_offload_managers:
+            manager.prepare_for_next_denoise(non_blocking=True)
