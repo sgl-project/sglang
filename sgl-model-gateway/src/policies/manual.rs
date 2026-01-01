@@ -171,12 +171,16 @@ impl ManualPolicy {
     ) -> (usize, ExecutionBranch) {
         let routing_id = RoutingId::new(routing_id);
 
-        // Fast path: use get_mut to update last_access
-        if let Some(mut info) = self.routing_map.get_mut(&routing_id) {
+        // Fast path: read-only check first (shared lock)
+        if let Some(info) = self.routing_map.get(&routing_id) {
             if let Some(idx) =
                 find_healthy_worker(&info.candi_worker_urls, workers, healthy_indices)
             {
-                info.last_access = Instant::now();
+                drop(info); // Release read lock before acquiring write lock
+                // Update last_access with write lock
+                if let Some(mut info) = self.routing_map.get_mut(&routing_id) {
+                    info.last_access = Instant::now();
+                }
                 return (idx, ExecutionBranch::FastPathHit);
             }
         }
@@ -667,25 +671,25 @@ mod tests {
     fn test_manual_config_default() {
         let config = ManualConfig::default();
         assert_eq!(config.eviction_interval_secs, 60);
-        assert_eq!(config.max_idle_secs, 3600);
+        assert_eq!(config.max_entries, 10000);
     }
 
     #[test]
     fn test_manual_with_config() {
         let config = ManualConfig {
             eviction_interval_secs: 30,
-            max_idle_secs: 1800,
+            max_entries: 5000,
         };
         let policy = ManualPolicy::with_config(config);
         assert_eq!(policy.config.eviction_interval_secs, 30);
-        assert_eq!(policy.config.max_idle_secs, 1800);
+        assert_eq!(policy.config.max_entries, 5000);
     }
 
     #[test]
     fn test_manual_with_disabled_eviction() {
         let config = ManualConfig {
             eviction_interval_secs: 0,
-            max_idle_secs: 3600,
+            max_entries: 10000,
         };
         let policy = ManualPolicy::with_config(config);
         assert!(policy._eviction_task.is_none());
@@ -695,7 +699,7 @@ mod tests {
     fn test_manual_last_access_updates_on_access() {
         let config = ManualConfig {
             eviction_interval_secs: 0,
-            max_idle_secs: 3600,
+            max_entries: 10000,
         };
         let policy = ManualPolicy::with_config(config);
         let workers = create_workers(&["http://w1:8000", "http://w2:8000"]);
@@ -724,32 +728,44 @@ mod tests {
     }
 
     #[test]
-    fn test_manual_eviction_removes_old_entries() {
+    fn test_manual_lru_eviction_by_size() {
         use std::thread;
         use std::time::Duration;
 
         let config = ManualConfig {
             eviction_interval_secs: 1,
-            max_idle_secs: 1,
+            max_entries: 2,
         };
         let policy = ManualPolicy::with_config(config);
         let workers = create_workers(&["http://w1:8000", "http://w2:8000"]);
 
-        let headers = headers_with_routing_key("eviction-test");
-        let info = SelectWorkerInfo {
-            headers: Some(&headers),
-            ..Default::default()
-        };
+        // Add 3 entries with small delays to ensure different last_access times
+        for i in 0..3 {
+            let headers = headers_with_routing_key(&format!("key-{}", i));
+            let info = SelectWorkerInfo {
+                headers: Some(&headers),
+                ..Default::default()
+            };
+            policy.select_worker_impl(&workers, &info);
+            thread::sleep(Duration::from_millis(50));
+        }
 
-        policy.select_worker_impl(&workers, &info);
-        assert_eq!(policy.routing_map.len(), 1, "Should have one entry");
+        assert_eq!(policy.routing_map.len(), 3, "Should have 3 entries before eviction");
 
-        thread::sleep(Duration::from_secs(3));
+        // Wait for eviction to run
+        thread::sleep(Duration::from_secs(2));
 
         assert_eq!(
             policy.routing_map.len(),
-            0,
-            "Entry should be evicted after max_idle_secs"
+            2,
+            "Should have 2 entries after LRU eviction (max_entries=2)"
+        );
+
+        // The oldest entry (key-0) should be evicted
+        let routing_id = RoutingId::new("key-0");
+        assert!(
+            policy.routing_map.get(&routing_id).is_none(),
+            "Oldest entry should be evicted"
         );
     }
 }
