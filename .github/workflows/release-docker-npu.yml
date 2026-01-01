@@ -3,9 +3,6 @@ on:
   push:
     tags:
       - 'v[0-9]+.*'
-  pull_request:
-    branches:
-      - main
   workflow_dispatch:
     inputs:
       version:
