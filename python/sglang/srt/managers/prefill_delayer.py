@@ -46,8 +46,9 @@ class PrefillDelayer:
         tp0_info = self._gather_info(
             local_can_prefill=local_can_prefill, local_is_idle=local_is_idle
         )
-        global_exists_cannot_prefill = tp0_info[:, 0].min().item() == 0
-        global_exists_can_prefill = tp0_info[:, 0].max().item() > 0
+        global_can_prefill = tp0_info[:, 0]
+        global_exists_cannot_prefill = global_can_prefill.min().item() == 0
+        global_exists_can_prefill = global_can_prefill.max().item() > 0
         global_exists_idle = bool(tp0_info[:, 1].max().item())
 
         if (
