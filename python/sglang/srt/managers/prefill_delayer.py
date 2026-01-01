@@ -31,6 +31,7 @@ class PrefillDelayer:
         ), "To use SCHEDULER_DECREASE_PREFILL_IDLE, disable_overlap_schedule must be False."
 
     def _gather_waiting_queue_info(self, waiting_queue_len: int):
+        print(f"hi [{torch.distributed.get_rank()}] _gather_waiting_queue_info")
         local_queue_len = torch.tensor(
             [waiting_queue_len],
             device="cpu",
