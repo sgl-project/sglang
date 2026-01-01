@@ -73,12 +73,14 @@ fn random_ascii_string(len: usize) -> String {
 }
 
 /// Generate realistic LLM request texts
+/// Realistic sizes: 4k-32k chars (~1k-8k tokens at ~4 chars/token)
 fn generate_realistic_requests(count: usize) -> Vec<String> {
     let mut rng = thread_rng();
     (0..count)
         .map(|_| {
             let prefix_idx = rng.random_range(0..CONVERSATION_PREFIXES.len());
-            let query_len = rng.random_range(1000..3000);
+            // 4k-32k chars = ~1k-8k tokens (matching token sequence sizes)
+            let query_len = rng.random_range(4000..32000);
             format!(
                 "{}{}",
                 CONVERSATION_PREFIXES[prefix_idx],
@@ -128,12 +130,14 @@ fn bench_summary(c: &mut Criterion) {
     const WORKER_COUNTS: [usize; 4] = [10, 50, 100, 500];
 
     // Pre-generate requests
+    // Realistic LLM prompts: 4k-16k chars (~1k-4k tokens)
     let string_requests = generate_realistic_requests(TREE_SIZE);
     let avg_chars: usize =
         string_requests.iter().map(|r| r.len()).sum::<usize>() / string_requests.len();
 
-    // Token sequences with ~4 chars per token ratio
-    let token_sequences = generate_token_sequences(TREE_SIZE, (250, 750));
+    // Realistic token sequences: 1k-8k tokens (typical LLM context lengths)
+    // Real requests range from 1k (short) to 64k+ (long context)
+    let token_sequences = generate_token_sequences(TREE_SIZE, (1024, 8192));
     let avg_tokens: usize =
         token_sequences.iter().map(|s| s.len()).sum::<usize>() / token_sequences.len();
 
@@ -237,7 +241,8 @@ fn bench_summary(c: &mut Criterion) {
     // StringTree vs TokenTree INSERT at different worker scales
     // ========================================================================
     let insert_string_requests = generate_realistic_requests(INSERT_POOL_SIZE);
-    let insert_token_sequences = generate_token_sequences(INSERT_POOL_SIZE, (250, 750));
+    // Realistic token sequences: 1k-8k tokens (matching typical LLM requests)
+    let insert_token_sequences = generate_token_sequences(INSERT_POOL_SIZE, (1024, 8192));
 
     for &num_workers in &WORKER_COUNTS {
         let workers = generate_worker_endpoints(num_workers);

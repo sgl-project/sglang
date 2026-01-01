@@ -84,9 +84,9 @@ fn generate_realistic_requests(count: usize) -> Vec<String> {
     (0..count)
         .map(|_| {
             let prefix_idx = rng.random_range(0..CONVERSATION_PREFIXES.len());
-            // Realistic LLM request sizes: 1000-3000 chars (~250-750 tokens)
+            // Realistic LLM request sizes: 4k-32k chars (~1k-8k tokens)
             // This represents typical user queries with context
-            let query_len = rng.random_range(1000..3000);
+            let query_len = rng.random_range(4000..32000);
             format!(
                 "{}{}",
                 CONVERSATION_PREFIXES[prefix_idx],
@@ -100,7 +100,8 @@ fn generate_realistic_requests(count: usize) -> Vec<String> {
 fn bench_insert_throughput(c: &mut Criterion) {
     let mut group = c.benchmark_group("insert_throughput");
 
-    for text_len in [10, 50, 100, 500].iter() {
+    // Realistic text lengths: 1k, 2k, 4k, 8k chars (~250-2k tokens)
+    for text_len in [1000, 2000, 4000, 8000].iter() {
         let printed = Arc::new(AtomicBool::new(false));
         group.throughput(Throughput::Elements(1));
         group.bench_with_input(
@@ -145,9 +146,10 @@ fn bench_insert_throughput(c: &mut Criterion) {
     group.bench_function("shared_prefix_100", |b| {
         let tree = Tree::new();
         let prefixes = ["system:", "user:", "assistant:", "tool:"];
+        // Realistic suffix lengths: 4k-8k chars (~1k-2k tokens)
         let strings: Vec<String> = prefixes
             .iter()
-            .flat_map(|p| random_prefixed_strings(p, 50, 250))
+            .flat_map(|p| random_prefixed_strings(p, 4000, 250))
             .collect();
         let mut idx = 0;
         let printed = printed_prefix.clone();
@@ -216,9 +218,10 @@ fn bench_prefix_match_latency(c: &mut Criterion) {
     // Setup: pre-populate tree with data distributed across all endpoints
     let tree = Arc::new(Tree::new());
     let prefixes = ["system:", "user:", "assistant:", "tool:"];
+    // Realistic suffix lengths: 4k chars (~1k tokens)
     let strings: Vec<String> = prefixes
         .iter()
-        .flat_map(|p| random_prefixed_strings(p, 50, 1000))
+        .flat_map(|p| random_prefixed_strings(p, 4000, 1000))
         .collect();
 
     // Distribute entries across all 10 endpoint tenants
@@ -261,8 +264,8 @@ fn bench_prefix_match_latency(c: &mut Criterion) {
         });
     });
 
-    // Benchmark cache miss (no match)
-    let miss_strings: Vec<String> = (0..1000).map(|_| random_ascii_string(50)).collect();
+    // Benchmark cache miss (no match) - realistic sizes
+    let miss_strings: Vec<String> = (0..1000).map(|_| random_ascii_string(4000)).collect();
     let printed_miss = Arc::new(AtomicBool::new(false));
     let tree_clone = tree.clone();
     group.bench_function("cache_miss", |b| {
@@ -560,9 +563,12 @@ fn bench_utf8_vs_ascii(c: &mut Criterion) {
     let tree_ascii = Arc::new(Tree::new());
     let tree_utf8 = Arc::new(Tree::new());
 
-    // Pre-populate with data distributed across endpoints
-    let ascii_strings: Vec<String> = (0..1000).map(|_| random_ascii_string(50)).collect();
-    let utf8_strings: Vec<String> = (0..1000).map(|i| format!("你好世界_{}", i)).collect();
+    // Pre-populate with data distributed across endpoints - realistic sizes
+    let ascii_strings: Vec<String> = (0..1000).map(|_| random_ascii_string(4000)).collect();
+    // UTF-8 strings with realistic prompt-like content
+    let utf8_strings: Vec<String> = (0..1000)
+        .map(|i| format!("你好世界，这是一个较长的测试字符串，用于模拟真实的LLM请求。请求编号：{}。{}", i, random_ascii_string(3500)))
+        .collect();
 
     for (i, s) in ascii_strings.iter().enumerate() {
         let tenant = ENDPOINT_TENANTS[i % ENDPOINT_TENANTS.len()];
