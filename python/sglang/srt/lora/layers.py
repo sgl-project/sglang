@@ -783,6 +783,9 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
                 -1
             )
 
+            # Ensure weighted_outputs has the same dtype as base_output for scatter_add_
+            weighted_outputs = weighted_outputs.to(base_output.dtype)
+
             # Scatter-add to combine experts per token
             # token_ids[d] tells us which token row to add weighted_outputs[d] to
             base_output.scatter_add_(
