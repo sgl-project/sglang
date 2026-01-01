@@ -607,6 +607,28 @@ class RadixCache(BasePrefixCache):
         # protected size refers to the size of the cache that is locked
         return self.protected_size_
 
+    def get_cache_stats(self) -> dict:
+        """Return cache statistics for monitoring.
+
+        Computes entry_count and total_tokens in a single pass for efficiency.
+        """
+        entry_count = 0
+        total_tokens = 0
+        stack = [self.root_node]
+        while stack:
+            node = stack.pop()
+            if node.value is not None and len(node.value) > 0:
+                entry_count += 1
+                total_tokens += len(node.value)
+            for child in node.children.values():
+                if not child.evicted:
+                    stack.append(child)
+        return {
+            "entry_count": entry_count,
+            "total_tokens": total_tokens,
+            "evictable_tokens": self.evictable_size(),
+        }
+
     def all_values_flatten(self):
         values = []
 
