@@ -1544,7 +1544,10 @@ class MRotaryEmbedding(RotaryEmbedding):
         assert positions.ndim == 1 or positions.ndim == 2
 
         if positions.ndim == 2 and self.mrope_section and _is_cuda:
-            return self._forward_triton(positions, query, key)
+            # NOTE: Use native implementation for mRoPE on CUDA as a safety measure.
+            # The triton kernel is correct but we use native to avoid potential
+            # issues with position shape mismatches on different hardware.
+            return self._forward_native(positions, query, key)
         elif _is_npu:
             return self._forward_npu(positions, query, key)
         else:
@@ -1775,9 +1778,7 @@ class MRotaryEmbedding(RotaryEmbedding):
         else:
             s = input_ids.shape[1]
             position_ids = torch.arange(s)
-            position_ids = (
-                position_ids.unsqueeze(0).expand(3, -1, -1).to(input_ids.device)
-            )
+            position_ids = position_ids.unsqueeze(0).expand(3, -1).to(input_ids.device)
             max_position_ids = position_ids.max(0, keepdim=False)[0].max(
                 -1, keepdim=True
             )[0]
@@ -2072,9 +2073,7 @@ class MRotaryEmbedding(RotaryEmbedding):
         else:
             s = input_ids.shape[1]
             position_ids = torch.arange(s)
-            position_ids = (
-                position_ids.unsqueeze(0).expand(3, -1, -1).to(input_ids.device)
-            )
+            position_ids = position_ids.unsqueeze(0).expand(3, -1).to(input_ids.device)
             max_position_ids = position_ids.max(0, keepdim=False)[0].max(
                 -1, keepdim=True
             )[0]
