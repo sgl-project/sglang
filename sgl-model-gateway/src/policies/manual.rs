@@ -93,6 +93,7 @@ impl Node {
 // TODO may optimize performance
 #[derive(Debug)]
 pub struct ManualPolicy {
+    #[allow(dead_code)]
     config: ManualConfig,
     routing_map: Arc<DashMap<RoutingId, Node>>,
     _eviction_task: Option<PeriodicTask>,
@@ -583,6 +584,7 @@ mod tests {
     fn test_manual_routing_info_push_bounded() {
         let mut info = Node {
             candi_worker_urls: vec!["http://w1:8000".to_string()],
+            last_access: Instant::now(),
         };
 
         info.push_bounded("http://w2:8000".to_string());

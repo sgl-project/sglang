@@ -688,7 +688,10 @@ impl CliArgs {
                 prefix_token_count: self.prefix_token_count,
                 load_factor: self.prefix_hash_load_factor,
             },
-            "manual" => PolicyConfig::Manual,
+            "manual" => PolicyConfig::Manual {
+                eviction_interval_secs: 60,
+                max_idle_secs: 3600,
+            },
             _ => PolicyConfig::RoundRobin,
         }
     }
