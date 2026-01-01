@@ -1024,7 +1024,7 @@ cargo build --release
 # rustc-wrapper = "sccache"
 ```
 
-> **Note:** sccache and incremental compilation are mutually exclusive—sccache cannot cache incrementally compiled crates. The project defaults to incremental compilation for faster local iteration. Use sccache for clean/release builds where caching across builds matters more.
+> **Note:** sccache and incremental compilation are mutually exclusive—sccache cannot cache incrementally compiled crates. The project defaults to incremental compilation for faster local iteration. Use sccache for clean/release builds where caching across builds matters more. CI workflows use sccache with GitHub Actions cache backend for cross-job compilation caching.
 
 ---
 

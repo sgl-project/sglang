@@ -1532,6 +1532,10 @@ class Scheduler(
             self._add_request_to_queue(req)
             return
 
+        if not recv_req.return_logprob and recv_req.logprob_start_len != -1:
+            # When return_logprob is False, logprob_start_len should be ignored
+            recv_req.logprob_start_len = -1
+
         if recv_req.logprob_start_len == -1:
             if req.is_prefill_only:
                 # For prefill-only requests with logprob_start_len == -1, set logprob_start_len
