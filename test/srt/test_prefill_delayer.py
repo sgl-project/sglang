@@ -41,7 +41,7 @@ class TestPrefillDelayerThroughput(CustomTestCase):
                 dataset_name="random",
                 num_prompts=200,
                 random_input_len=1024,
-                random_output_len=1024,
+                random_output_len=512,
                 request_rate=float("inf"),
                 tokenizer=model,
             )
