@@ -44,24 +44,9 @@ impl GeneratePreparationStage {
         ctx: &mut RequestContext,
         request: &GenerateRequest,
     ) -> Result<(), Response> {
-        // Get model_id from context (normalized by router_manager)
-        let model_id = ctx.input.model_id.as_deref().unwrap();
-
-        let tokenizer = ctx
-            .components
-            .tokenizer_registry
-            .get(model_id)
-            .ok_or_else(|| {
-                error!(
-                    function = "GeneratePreparationStage::execute",
-                    model = %model_id,
-                    "Tokenizer not found for model"
-                );
-                error::internal_error(
-                    "tokenizer_not_found",
-                    format!("Tokenizer not found for model: {}", model_id),
-                )
-            })?;
+        // Resolve tokenizer from registry (cached for reuse in response processing)
+        let tokenizer = utils::resolve_tokenizer(ctx, "GeneratePreparationStage::prepare_generate")
+            .map_err(|e| *e)?;
 
         let (original_text, token_ids) = match self.resolve_generate_input(request, &tokenizer) {
             Ok(res) => res,
@@ -134,8 +119,9 @@ impl GeneratePreparationStage {
         tokenizer: &Arc<dyn Tokenizer>,
         text: &str,
     ) -> Result<(String, Vec<u32>), String> {
+        // Don't add special tokens - raw text generation uses text as-is
         let encoding = tokenizer
-            .encode(text)
+            .encode(text, false)
             .map_err(|e| format!("Tokenization failed: {}", e))?;
         Ok((text.to_string(), encoding.token_ids().to_vec()))
     }

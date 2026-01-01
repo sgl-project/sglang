@@ -77,24 +77,17 @@ impl GenerateResponseProcessingStage {
             })?
             .clone();
 
-        // Get model_id from context
-        let model_id = ctx.input.model_id.as_deref().unwrap();
-
-        let tokenizer = ctx
-            .components
-            .tokenizer_registry
-            .get(model_id)
-            .ok_or_else(|| {
-                error!(
-                    function = "GeneratePreparationStage::execute",
-                    model = %model_id,
-                    "Tokenizer not found for model"
-                );
-                error::internal_error(
-                    "tokenizer_not_found",
-                    format!("Tokenizer not found for model: {}", model_id),
-                )
-            })?;
+        // Get cached tokenizer (resolved once in preparation stage)
+        let tokenizer = ctx.tokenizer_arc().ok_or_else(|| {
+            error!(
+                function = "GenerateResponseProcessingStage::process_generate_response",
+                "Tokenizer not cached in context"
+            );
+            error::internal_error(
+                "tokenizer_not_cached",
+                "Tokenizer not cached in context - preparation stage may have been skipped",
+            )
+        })?;
 
         if is_streaming {
             // Streaming: Use StreamingProcessor and return SSE response

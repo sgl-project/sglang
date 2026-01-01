@@ -9,6 +9,9 @@
 //! - Workflow steps for multi-step operations
 //! - Common utilities
 
+// Re-export UNKNOWN_MODEL_ID from protocols for use throughout core
+pub use crate::protocols::UNKNOWN_MODEL_ID;
+
 pub mod circuit_breaker;
 pub mod error;
 pub mod job_queue;
@@ -38,5 +41,5 @@ pub use worker::{
 };
 pub use worker_builder::{BasicWorkerBuilder, DPAwareWorkerBuilder};
 pub use worker_manager::{LoadMonitor, WorkerManager};
-pub use worker_registry::{WorkerId, WorkerRegistry, WorkerRegistryStats};
+pub use worker_registry::{HashRing, WorkerId, WorkerRegistry, WorkerRegistryStats};
 pub use worker_service::{WorkerService, WorkerServiceError};

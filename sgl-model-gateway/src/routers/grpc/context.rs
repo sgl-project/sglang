@@ -17,12 +17,13 @@ use crate::{
     core::{attach_guards_to_response, Worker, WorkerLoadGuard},
     protocols::{
         chat::{ChatCompletionRequest, ChatCompletionResponse},
+        classify::{ClassifyRequest, ClassifyResponse},
         embedding::{EmbeddingRequest, EmbeddingResponse},
         generate::{GenerateRequest, GenerateResponse},
         responses::ResponsesRequest,
     },
     reasoning_parser::ParserFactory as ReasoningParserFactory,
-    tokenizer::{stop::StopSequenceDecoder, TokenizerRegistry},
+    tokenizer::{stop::StopSequenceDecoder, traits::Tokenizer, TokenizerRegistry},
     tool_parser::ParserFactory as ToolParserFactory,
 };
 
@@ -51,6 +52,7 @@ pub enum RequestType {
     Generate(Arc<GenerateRequest>),
     Responses(Arc<ResponsesRequest>),
     Embedding(Arc<EmbeddingRequest>),
+    Classify(Arc<ClassifyRequest>),
 }
 
 /// Shared components (injected once at creation)
@@ -65,6 +67,10 @@ pub struct SharedComponents {
 pub struct ProcessingState {
     // Stage 1: Preparation outputs
     pub preparation: Option<PreparationOutput>,
+
+    /// Resolved tokenizer (set once in preparation, reused in response processing)
+    /// This avoids redundant registry lookups across pipeline stages.
+    pub tokenizer: Option<Arc<dyn Tokenizer>>,
 
     // Stage 2: Worker selection outputs
     pub workers: Option<WorkerSelection>,
@@ -316,6 +322,24 @@ impl RequestContext {
         }
     }
 
+    /// Create context for classify request
+    pub fn for_classify(
+        request: Arc<ClassifyRequest>,
+        headers: Option<HeaderMap>,
+        model_id: Option<String>,
+        components: Arc<SharedComponents>,
+    ) -> Self {
+        Self {
+            input: RequestInput {
+                request_type: RequestType::Classify(request),
+                headers,
+                model_id,
+            },
+            components,
+            state: ProcessingState::default(),
+        }
+    }
+
     /// Get reference to original request (type-safe)
     pub fn request(&self) -> &RequestType {
         &self.input.request_type
@@ -385,6 +409,22 @@ impl RequestContext {
         }
     }
 
+    /// Get classify request (panics if not classify)
+    pub fn classify_request(&self) -> &ClassifyRequest {
+        match &self.input.request_type {
+            RequestType::Classify(req) => req.as_ref(),
+            _ => panic!("Expected classify request"),
+        }
+    }
+
+    /// Get Arc clone of classify request (panics if not classify)
+    pub fn classify_request_arc(&self) -> Arc<ClassifyRequest> {
+        match &self.input.request_type {
+            RequestType::Classify(req) => Arc::clone(req),
+            _ => panic!("Expected classify request"),
+        }
+    }
+
     /// Check if request is streaming
     pub fn is_streaming(&self) -> bool {
         match &self.input.request_type {
@@ -392,7 +432,16 @@ impl RequestContext {
             RequestType::Generate(req) => req.stream,
             RequestType::Responses(req) => req.stream.unwrap_or(false),
             RequestType::Embedding(_) => false, // Embeddings are never streaming
+            RequestType::Classify(_) => false,  // Classification is never streaming
         }
+    }
+
+    /// Get the cached tokenizer, cloning the Arc (cheap 8-byte clone)
+    ///
+    /// Returns None if tokenizer hasn't been resolved yet.
+    /// The tokenizer is resolved once in the preparation stage and cached for reuse.
+    pub fn tokenizer_arc(&self) -> Option<Arc<dyn Tokenizer>> {
+        self.state.tokenizer.clone()
     }
 }
 
@@ -536,4 +585,6 @@ pub enum FinalResponse {
     Generate(Vec<GenerateResponse>),
     /// Embedding response
     Embedding(EmbeddingResponse),
+    /// Classification response
+    Classify(ClassifyResponse),
 }

@@ -43,23 +43,9 @@ impl ChatPreparationStage {
         ctx: &mut RequestContext,
         request: &ChatCompletionRequest,
     ) -> Result<(), Response> {
-        // Step 0: Resolve tokenizer from registry
-        let model_id = ctx.input.model_id.as_deref().unwrap();
-        let tokenizer = ctx
-            .components
-            .tokenizer_registry
-            .get(model_id)
-            .ok_or_else(|| {
-                error!(
-                    function = "ChatPreparationStage::prepare_chat",
-                    model = %model_id,
-                    "Tokenizer not found for model"
-                );
-                error::internal_error(
-                    "tokenizer_not_found",
-                    format!("Tokenizer not found for model: {}", model_id),
-                )
-            })?;
+        // Step 0: Resolve tokenizer from registry (cached for reuse in response processing)
+        let tokenizer =
+            utils::resolve_tokenizer(ctx, "ChatPreparationStage::prepare_chat").map_err(|e| *e)?;
 
         // Step 1: Filter tools if needed
         let body_ref = utils::filter_chat_request_by_tool_choice(request);
@@ -73,8 +59,8 @@ impl ChatPreparationStage {
             }
         };
 
-        // Step 3: Tokenize the processed text
-        let encoding = match tokenizer.encode(&processed_messages.text) {
+        // Step 3: Tokenize the processed text (no special tokens - chat template already handles them)
+        let encoding = match tokenizer.encode(&processed_messages.text, false) {
             Ok(encoding) => encoding,
             Err(e) => {
                 error!(function = "ChatPreparationStage::execute", error = %e, "Tokenization failed");

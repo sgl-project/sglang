@@ -19,6 +19,7 @@ use crate::{
             ResponseReasoningContent::ReasoningText, ResponseStatus, ResponsesRequest,
             ResponsesResponse, ResponsesUsage, StringOrContentParts, TextConfig, TextFormat,
         },
+        UNKNOWN_MODEL_ID,
     },
     routers::grpc::common::responses::utils::extract_tools_from_response_tools,
 };
@@ -171,7 +172,7 @@ pub fn responses_to_chat(req: &ResponsesRequest) -> Result<ChatCompletionRequest
     Ok(ChatCompletionRequest {
         messages,
         model: if req.model.is_empty() {
-            "unknown".to_string()
+            UNKNOWN_MODEL_ID.to_string()
         } else {
             req.model.clone()
         },

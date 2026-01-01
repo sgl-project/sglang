@@ -11,6 +11,7 @@ use crate::{
         grpc::{
             common::stages::PipelineStage,
             context::{PreparationOutput, RequestContext, RequestType},
+            utils,
         },
     },
 };
@@ -32,22 +33,21 @@ impl Default for EmbeddingPreparationStage {
 #[async_trait]
 impl PipelineStage for EmbeddingPreparationStage {
     async fn execute(&self, ctx: &mut RequestContext) -> Result<Option<Response>, Response> {
-        // Extract embedding request
-        let request = if let RequestType::Embedding(req) = &ctx.input.request_type {
-            req
-        } else {
-            error!(
-                function = "EmbeddingPreparationStage::execute",
-                "Invalid request type: expected Embedding"
-            );
-            return Err(error::internal_error(
-                "invalid_request_type",
-                "Expected Embedding request",
-            ));
+        // Extract text from embedding or classify request (both use same preparation)
+        let text = match &ctx.input.request_type {
+            RequestType::Embedding(req) => req.extract_text_for_routing(),
+            RequestType::Classify(req) => req.extract_text_for_routing(),
+            _ => {
+                error!(
+                    function = "EmbeddingPreparationStage::execute",
+                    "Invalid request type: expected Embedding or Classify"
+                );
+                return Err(error::internal_error(
+                    "invalid_request_type",
+                    "Expected Embedding or Classify request",
+                ));
+            }
         };
-
-        // Extract text from request
-        let text = request.extract_text_for_routing();
         if text.is_empty() {
             return Err(error::bad_request(
                 "empty_input",
@@ -55,11 +55,14 @@ impl PipelineStage for EmbeddingPreparationStage {
             ));
         }
 
-        // Tokenize
-        let token_ids = ctx
-            .components
-            .tokenizer
-            .encode(&text)
+        // Resolve tokenizer from registry (cached for potential reuse)
+        let tokenizer =
+            utils::resolve_tokenizer(ctx, "EmbeddingPreparationStage::execute").map_err(|e| *e)?;
+
+        // Tokenize with special tokens (BOS/EOS) for embeddings
+        // This matches Python's transformers behavior which reads add_bos_token/add_eos_token from tokenizer_config.json
+        let token_ids = tokenizer
+            .encode(&text, true)
             .map_err(|e| {
                 error!(
                     function = "EmbeddingPreparationStage::execute",

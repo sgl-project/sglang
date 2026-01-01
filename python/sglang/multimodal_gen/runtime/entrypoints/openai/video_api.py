@@ -30,6 +30,7 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
 from sglang.multimodal_gen.runtime.entrypoints.openai.stores import VIDEO_STORE
 from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     _parse_size,
+    add_common_data_to_response,
     merge_image_input_list,
     process_generation_batch,
     save_image_to_path,
@@ -124,8 +125,9 @@ async def _dispatch_job_async(job_id: str, batch: Req) -> None:
             "progress": 100,
             "completed_at": int(time.time()),
         }
-        if result.peak_memory_mb and result.peak_memory_mb > 0:
-            update_fields["peak_memory_mb"] = result.peak_memory_mb
+        update_fields = add_common_data_to_response(
+            update_fields, request_id=job_id, result=result
+        )
         await VIDEO_STORE.update_fields(job_id, update_fields)
     except Exception as e:
         logger.error(f"{e}")
@@ -135,6 +137,7 @@ async def _dispatch_job_async(job_id: str, batch: Req) -> None:
 
 
 # TODO: support image to video generation
+# TODO: this is currently not used
 @router.post("", response_model=VideoResponse)
 async def create_video(
     request: Request,
