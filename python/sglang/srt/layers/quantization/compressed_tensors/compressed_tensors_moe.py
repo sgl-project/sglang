@@ -1148,56 +1148,72 @@ class CompressedTensorsMxInt4MoEMethod(CompressedTensorsMoEMethod):
         gemm2_weights_mxint4_shuffled = []
         gemm2_scales_shuffled = []
 
+        def repack(w):
+            assert w.dim() == 2 and w.dtype == torch.int32
+            shifts = torch.arange(0, 32, 4, dtype=torch.int32, device=w.device)
+            w = (w.unsqueeze(2) >> shifts) & 0x0F
+            w = (w - 8).to(torch.int8).reshape(w.shape[0], -1, 2)
+            w = w[..., 0] | (w[..., 1] << 4)
+            w = w.to(torch.uint8)
+            # w = w.reshape(w.shape[0], -1).to(torch.int8)
+            # w = torch.where(w >= 8, w - 16, w).to(torch.bfloat16)
+            return w
+
         for i in range(num_experts):
+            # NOTE(HandH1998):
+            # the huggingface weight format follows (w/s + 8) to pack, however,
+            # trtllm requires (w/s) to pack
+            # we need to convert the weight to trtllm's format first
+            cur_expert_gemm1_weight = repack(gemm1_weights[i])
+            cur_expert_gemm2_weight = repack(gemm2_weights[i])
+
             # Calculate the permute indices for the following:
             # 1. Reorder rows of W1 and scales for fused gated activation
             # 2. Shuffle weights and scaling factors for transposed mma output
             # for both w3_w1 and w2 weights and scale factors
             permute_indices = _maybe_get_cached_w3_w1_permute_indices(
                 self._cache_permute_indices,
-                gemm1_weights[i].view(torch.uint8),
+                cur_expert_gemm1_weight,
                 epilogue_tile_m,
             )
             gemm1_weights_shuffled = (
-                gemm1_weights[i]
-                .view(torch.uint8)[permute_indices.to(gemm1_weights.device)]
+                cur_expert_gemm1_weight[permute_indices.to(gemm1_weights.device)]
                 .contiguous()
             )
             permute_sf_indices = _maybe_get_cached_w3_w1_permute_indices(
                 self._cache_permute_indices,
-                gemm1_scales[i].view(torch.bfloat16),
+                gemm1_scales[i].to(torch.bfloat16),
                 epilogue_tile_m,
                 num_elts_per_sf=32,
             )
             gemm1_scales_shuffled.append(
                 block_scale_interleave(
                     gemm1_scales[i]
-                    .view(torch.bfloat16)[permute_sf_indices.to(gemm1_scales.device)]
+                    .to(torch.bfloat16)[permute_sf_indices.to(gemm1_scales.device)]
                     .contiguous()
                 )
             )
 
             permute_indices = get_w2_permute_indices_with_cache(
                 self._cache_permute_indices,
-                gemm2_weights[i].view(torch.uint8),
+                cur_expert_gemm2_weight,
                 epilogue_tile_m,
             )
             gemm2_weights_shuffled = (
-                gemm2_weights[i]
-                .view(torch.uint8)[permute_indices.to(gemm2_weights.device)]
+                cur_expert_gemm2_weight[permute_indices.to(gemm2_weights.device)]
                 .contiguous()
             )
 
             permute_sf_indices = get_w2_permute_indices_with_cache(
                 self._cache_permute_indices,
-                gemm2_scales[i].view(torch.bfloat16),
+                gemm2_scales[i].to(torch.bfloat16),
                 epilogue_tile_m,
                 num_elts_per_sf=16,
             )
             gemm2_scales_shuffled.append(
                 block_scale_interleave(
                     gemm2_scales[i]
-                    .view(torch.bfloat16)[permute_sf_indices.to(gemm2_scales.device)]
+                    .to(torch.bfloat16)[permute_sf_indices.to(gemm2_scales.device)]
                     .contiguous()
                 )
             )
@@ -1226,13 +1242,6 @@ class CompressedTensorsMxInt4MoEMethod(CompressedTensorsMoEMethod):
         )
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-
-        # def replace_tensor(name, new_t):
-        #     # It is important to use resize_() here since it ensures
-        #     # the same buffer is reused
-        #     getattr(layer, name).resize_(new_t.shape)
-        #     getattr(layer, name).copy_(new_t)
-        #     del new_t
 
         num_experts = layer.w13_weight_packed.shape[0]
         (
