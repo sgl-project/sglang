@@ -1,4 +1,5 @@
 import os
+import re
 import time
 from pathlib import Path
 from typing import Optional
@@ -27,6 +28,8 @@ class _Dumper:
     def __init__(self):
         # Do not import `sglang` to make this file standalone
         self._enable = bool(int(os.environ.get("SGLANG_DUMPER_ENABLE", "1")))
+        # TODO (1) support filtering kv instead of name only (2) allow HTTP req change it
+        self._filter = os.environ.get("SGLANG_DUMPER_FILTER")
         self._base_dir = Path(os.environ.get("SGLANG_DUMPER_DIR", "/tmp"))
         self._enable_write_file = bool(
             int(os.environ.get("SGLANG_DUMPER_WRITE_FILE", "1"))
@@ -72,8 +75,15 @@ class _Dumper:
     def override_enable(self, value: bool):
         self._override_enable = value
 
+    def dump_dict(self, name_prefix, data, save: bool = True, **kwargs):
+        data = _obj_to_dict(data)
+        for name, value in data.items():
+            self.dump(f"{name_prefix}_{name}", value, save=save, **kwargs)
+
     def dump(self, name, value, save: bool = True, **kwargs):
         if not (self._enable and (self._override_enable is not False)):
+            return
+        if (f := self._filter) is not None and re.search(f, name) is None:
             return
 
         if self._forward_pass_id < 1:
@@ -101,12 +111,28 @@ class _Dumper:
             f"shape={value.shape if isinstance(value, torch.Tensor) else None} "
             f"dtype={value.dtype if isinstance(value, torch.Tensor) else None} "
             f"device={value.device if isinstance(value, torch.Tensor) else None} "
+            f"id={id(value)} "
             f"sample_value={sample_value}"
         )
 
         if self._enable_write_file and save:
             path.parent.mkdir(parents=True, exist_ok=True)
-            torch.save(value, str(path))
+            _torch_save(value, str(path))
+
+
+def _torch_save(value, path: str):
+    try:
+        try:
+            return torch.save(value, path)
+        except RuntimeError as e:
+            if "not pickleable" in str(e):
+                # Some parameter subclasses with extra fields are not pickleable
+                if isinstance(value, torch.nn.Parameter):
+                    print(f"[Dumper] Observe error={e} and try pickling value.data")
+                    return _torch_save(value.data, path)
+            raise
+    except Exception as e:
+        print(f"[Dumper] Observe error={e} when saving data, skip the tensor")
 
 
 def _get_partial_name():
@@ -122,6 +148,23 @@ def _get_rank():
         return dist.get_rank()
     else:
         return 0
+
+
+def _obj_to_dict(obj):
+    if isinstance(obj, dict):
+        return obj
+    ret = {}
+    for k in dir(obj):
+        if k.startswith("__") and k.endswith("__"):
+            continue
+        try:
+            v = getattr(obj, k)
+            if not callable(v):
+                ret[k] = v
+        except Exception:
+            # Skip attributes that raise an exception on access
+            continue
+    return ret
 
 
 def get_truncated_value(value):
