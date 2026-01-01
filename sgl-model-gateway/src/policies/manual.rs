@@ -157,16 +157,15 @@ impl ManualPolicy {
 
         match self.routing_map.entry(routing_id) {
             Entry::Occupied(mut entry) => {
+                let node = entry.get_mut();
+                node.last_access = Instant::now();
                 if let Some(idx) =
-                    find_healthy_worker(&entry.get().candi_worker_urls, workers, healthy_indices)
+                    find_healthy_worker(&node.candi_worker_urls, workers, healthy_indices)
                 {
-                    entry.get_mut().last_access = Instant::now();
                     (idx, ExecutionBranch::OccupiedHit)
                 } else {
                     let selected_idx = random_select(healthy_indices);
-                    let node = entry.get_mut();
                     node.push_bounded(workers[selected_idx].url().to_string());
-                    node.last_access = Instant::now();
                     (selected_idx, ExecutionBranch::OccupiedMiss)
                 }
             }
