@@ -60,11 +60,11 @@ impl RoutingId {
 const MAX_CANDIDATE_WORKERS: usize = 2;
 
 #[derive(Debug, Clone)]
-struct RoutingInfo {
+struct Node {
     candi_worker_urls: Vec<String>,
 }
 
-impl RoutingInfo {
+impl Node {
     fn push_bounded(&mut self, url: String) {
         while self.candi_worker_urls.len() >= MAX_CANDIDATE_WORKERS {
             self.candi_worker_urls.remove(0);
@@ -77,7 +77,7 @@ impl RoutingInfo {
 // TODO evict old data periodically
 #[derive(Debug, Default)]
 pub struct ManualPolicy {
-    routing_map: DashMap<RoutingId, RoutingInfo>,
+    routing_map: DashMap<RoutingId, Node>,
 }
 
 impl ManualPolicy {
@@ -120,7 +120,7 @@ impl ManualPolicy {
             }
             Entry::Vacant(entry) => {
                 let selected_idx = random_select(healthy_indices);
-                entry.insert(RoutingInfo {
+                entry.insert(Node {
                     candi_worker_urls: vec![workers[selected_idx].url().to_string()],
                 });
                 (selected_idx, ExecutionBranch::SlowPathVacant)
@@ -512,7 +512,7 @@ mod tests {
 
     #[test]
     fn test_manual_routing_info_push_bounded() {
-        let mut info = RoutingInfo {
+        let mut info = Node {
             candi_worker_urls: vec!["http://w1:8000".to_string()],
         };
 
