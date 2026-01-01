@@ -199,7 +199,8 @@ impl Node {
         // Fast path: check cached tenant (parking_lot has no poisoning)
         let guard = self.last_tenant.read();
         if let Some(ref tenant) = *guard {
-            if self.tenant_last_access_time.contains_key(tenant) {
+            // Use borrowed lookup to avoid Arc clone for validation
+            if self.tenant_last_access_time.contains_key(tenant.as_ref()) {
                 return Some(Arc::clone(tenant));
             }
         }
@@ -215,10 +216,15 @@ impl Node {
     /// Update tenant access and cache (with probabilistic update to reduce contention)
     fn touch_tenant(&self, tenant: &TenantId) {
         let ts = next_timestamp();
-        self.tenant_last_access_time
-            .entry(Arc::clone(tenant))
-            .and_modify(|t| *t = ts)
-            .or_insert(ts);
+
+        // Fast path: try to update existing entry without Arc clone
+        // DashMap supports Borrow<str> lookups, avoiding allocation
+        if let Some(mut entry) = self.tenant_last_access_time.get_mut(tenant.as_ref()) {
+            *entry = ts;
+        } else {
+            // Slow path: insert new entry (requires Arc clone)
+            self.tenant_last_access_time.insert(Arc::clone(tenant), ts);
+        }
 
         // Probabilistic cache update (1/16 chance) to reduce write contention
         if ts & 0xF == 0 {
@@ -558,7 +564,8 @@ impl TokenTree {
 
     /// Evict entries for a tenant to reduce to max_tokens.
     pub fn evict_tenant(&self, tenant: &TenantId, max_tokens: usize) {
-        let current_count = self.tenant_token_count.get(tenant).map(|v| *v).unwrap_or(0);
+        // Use borrowed lookup to avoid Arc hash overhead
+        let current_count = self.tenant_token_count.get(tenant.as_ref()).map(|v| *v).unwrap_or(0);
 
         if current_count <= max_tokens {
             return;
@@ -585,10 +592,10 @@ impl TokenTree {
             }
         }
 
-        // Update tenant token count
-        self.tenant_token_count
-            .entry(tenant.clone())
-            .and_modify(|count| *count = count.saturating_sub(evicted));
+        // Update tenant token count using borrowed lookup when possible
+        if let Some(mut count) = self.tenant_token_count.get_mut(tenant.as_ref()) {
+            *count = count.saturating_sub(evicted);
+        }
 
         debug!(
             tenant = %tenant.as_ref(),
@@ -606,7 +613,8 @@ impl TokenTree {
     ) {
         // Skip root
         if !Arc::ptr_eq(node, &self.root) {
-            if let Some(ts) = node.tenant_last_access_time.get(tenant_id) {
+            // Use borrowed lookup to avoid Arc hash overhead
+            if let Some(ts) = node.tenant_last_access_time.get(tenant_id.as_ref()) {
                 result.push((Arc::clone(node), *ts));
             }
         }
@@ -617,12 +625,14 @@ impl TokenTree {
     }
 
     fn remove_tenant_from_node(&self, node: &NodeRef, tenant_id: &TenantId) -> bool {
-        node.tenant_last_access_time.remove(tenant_id).is_some()
+        // Use borrowed lookup to avoid Arc hash overhead
+        node.tenant_last_access_time.remove(tenant_id.as_ref()).is_some()
     }
 
     /// Get the token count for a specific tenant.
     pub fn tenant_token_size(&self, tenant: &TenantId) -> usize {
-        self.tenant_token_count.get(tenant).map(|v| *v).unwrap_or(0)
+        // Use borrowed lookup to avoid Arc hash overhead
+        self.tenant_token_count.get(tenant.as_ref()).map(|v| *v).unwrap_or(0)
     }
 
     /// Clear the tree to empty state.
