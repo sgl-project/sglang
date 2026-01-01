@@ -53,8 +53,8 @@ class TestPrefillDelayerThroughput(CustomTestCase):
         print(f"Input throughput: {res['input_throughput']:.2f} token/s")
         print(f"Output throughput: {res['output_throughput']:.2f} token/s")
 
-    # def test_dp_attention_throughput_with_prefill_delayer(self):
-    #     self._run_throughput_test(with_prefill_delayer=True)
+    def test_dp_attention_throughput_with_prefill_delayer(self):
+        self._run_throughput_test(with_prefill_delayer=True)
 
     def test_dp_attention_throughput_without_prefill_delayer(self):
         self._run_throughput_test(with_prefill_delayer=False)
