@@ -124,7 +124,7 @@ mod tests {
 
         let policy = PolicyFactory::create_from_config(&PolicyConfig::Manual {
             eviction_interval_secs: 60,
-            max_entries: 10000,
+            max_entries: 67108864,
         });
         assert_eq!(policy.name(), "manual");
 

@@ -714,7 +714,6 @@ mod tests {
         use std::thread;
         use std::time::Duration;
 
-        // Disable background eviction, we'll test the logic directly
         let config = ManualConfig {
             eviction_interval_secs: 0,
             max_entries: 2,
@@ -722,7 +721,6 @@ mod tests {
         let policy = ManualPolicy::with_config(config);
         let workers = create_workers(&["http://w1:8000", "http://w2:8000"]);
 
-        // Add 3 entries with small delays to ensure different last_access times
         for i in 0..3 {
             let headers = headers_with_routing_key(&format!("key-{}", i));
             let info = SelectWorkerInfo {
@@ -733,9 +731,8 @@ mod tests {
             thread::sleep(Duration::from_millis(10));
         }
 
-        assert_eq!(policy.routing_map.len(), 3, "Should have 3 entries before eviction");
+        assert_eq!(policy.routing_map.len(), 3);
 
-        // Manually trigger eviction logic
         let max_entries = 2usize;
         let current_size = policy.routing_map.len();
         if current_size > max_entries {
@@ -751,17 +748,9 @@ mod tests {
             }
         }
 
-        assert_eq!(
-            policy.routing_map.len(),
-            2,
-            "Should have 2 entries after LRU eviction"
-        );
+        assert_eq!(policy.routing_map.len(), 2);
 
-        // The oldest entry (key-0) should be evicted
         let routing_id = RoutingId::new("key-0");
-        assert!(
-            policy.routing_map.get(&routing_id).is_none(),
-            "Oldest entry should be evicted"
-        );
+        assert!(policy.routing_map.get(&routing_id).is_none());
     }
 }
