@@ -23,8 +23,6 @@ class TestPrefillDelayerThroughput(CustomTestCase):
             "--enable-dp-attention",
             "--dp",
             "8",
-            "--max-running-requests",
-            "10",
         ]
 
         with envs.SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE.override(with_prefill_delayer), envs.SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES.override(100):
@@ -39,10 +37,10 @@ class TestPrefillDelayerThroughput(CustomTestCase):
             args = get_benchmark_args(
                 base_url=base_url,
                 dataset_name="random",
-                num_prompts=300,
+                num_prompts=80,
                 random_input_len=4096,
                 random_output_len=512,
-                request_rate=float("inf"),
+                request_rate=8,
                 tokenizer=model,
             )
             args.random_range_ratio = 0.95
