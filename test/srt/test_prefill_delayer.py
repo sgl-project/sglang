@@ -19,10 +19,10 @@ class TestPrefillDelayerThroughput(CustomTestCase):
         other_args = [
             "--trust-remote-code",
             "--tp",
-            "2",
+            "8",
             "--enable-dp-attention",
             "--dp",
-            "2",
+            "8",
             "--max-running-requests",
             "10",
         ]
@@ -39,9 +39,9 @@ class TestPrefillDelayerThroughput(CustomTestCase):
             args = get_benchmark_args(
                 base_url=base_url,
                 dataset_name="random",
-                num_prompts=50,
+                num_prompts=200,
                 random_input_len=1024,
-                random_output_len=512,
+                random_output_len=1024,
                 request_rate=float("inf"),
                 tokenizer=model,
             )
