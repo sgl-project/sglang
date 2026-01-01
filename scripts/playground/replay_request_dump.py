@@ -22,6 +22,41 @@ from sglang.bench_serving import set_ulimit
 from sglang.utils import get_exception_traceback
 
 
+def normalize_mm_data_item(item):
+    """Convert {'url': '...'} dict back to plain URL string."""
+    if isinstance(item, dict) and "url" in item:
+        return item["url"]
+    return item
+
+
+def normalize_mm_data(data):
+    """Normalize multimodal data field (handles nested lists)."""
+    if data is None:
+        return None
+    if isinstance(data, list):
+        return [
+            (
+                [normalize_mm_data_item(item) for item in sublist]
+                if isinstance(sublist, list)
+                else normalize_mm_data_item(sublist)
+            )
+            for sublist in data
+        ]
+    return normalize_mm_data_item(data)
+
+
+def normalize_request_data(json_data):
+    """Normalize multimodal fields in request data for replay compatibility.
+
+    When using asdict() on request dataclasses, ImageData objects are converted
+    to {'url': '...'} dicts, but the /generate API expects plain URL strings.
+    """
+    for field in ["image_data", "video_data", "audio_data"]:
+        if field in json_data and json_data[field] is not None:
+            json_data[field] = normalize_mm_data(json_data[field])
+    return json_data
+
+
 def read_records(files):
     records = []
     for f in files:
@@ -43,7 +78,7 @@ def run_one_request_internal(record):
     else:
         recorded_completion_tokens = ""
 
-    json_data = asdict(req)
+    json_data = normalize_request_data(asdict(req))
     stream = json_data["stream"]
 
     if args.ignore_eos:
