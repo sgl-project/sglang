@@ -219,11 +219,12 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
 
     def init_model_config(self):
         server_args = self.server_args
+        model_config_class = getattr(self, "model_config_class", ModelConfig)
 
         # Read model args
         self.model_path = server_args.model_path
         self.served_model_name = server_args.served_model_name
-        self.model_config = ModelConfig.from_server_args(server_args)
+        self.model_config = model_config_class.from_server_args(server_args)
         self.is_generation = self.model_config.is_generation
         self.is_image_gen = self.model_config.is_image_gen
         self.context_len = self.model_config.context_len
@@ -232,11 +233,15 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         speculative_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
         )
-        self.reserve_input_token_num = (
-            0
-            if speculative_algorithm.is_none()
-            else server_args.speculative_num_draft_tokens
-        )
+        if speculative_algorithm.is_eagle():
+            # In the current eagle implementation, we store the draft tokens in the output token slots,
+            # so we need to reserve the space for the draft tokens.
+            self.num_reserved_tokens = max(
+                server_args.speculative_eagle_topk * server_args.speculative_num_steps,
+                server_args.speculative_num_draft_tokens,
+            )
+        else:
+            self.num_reserved_tokens = 0
         self.validate_total_tokens = True
 
     def init_tokenizer_and_processor(self):
@@ -456,6 +461,9 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             ]
         )
         self.init_communicators(self.server_args)
+
+        self.sampling_params_class = SamplingParams
+        self.signal_handler_class = SignalHandler
 
     async def generate_request(
         self,
@@ -725,7 +733,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         # FIXME: unify the length validation logic with the one in the scheduler.
         _max_req_len = self.context_len
         input_token_num = len(input_ids) if input_ids is not None else 0
-        input_token_num += self.reserve_input_token_num
+        input_token_num += self.num_reserved_tokens
 
         # Validate input length
         if input_token_num >= self.context_len:
@@ -861,9 +869,6 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                     f"The input_ids {input_ids} contains values greater than the vocab size ({vocab_size})."
                 )
 
-    def _get_sampling_params(self, sampling_kwargs: Dict) -> SamplingParams:
-        return SamplingParams(**sampling_kwargs)
-
     def _create_tokenized_object(
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
@@ -881,7 +886,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             sampling_kwargs = {**self.preferred_sampling_params, **obj.sampling_params}
         else:
             sampling_kwargs = obj.sampling_params
-        sampling_params = self._get_sampling_params(sampling_kwargs)
+        sampling_params = self.sampling_params_class(**sampling_kwargs)
         sampling_params.normalize(self.tokenizer)
         sampling_params.verify(self.model_config.vocab_size)
 
@@ -1413,21 +1418,22 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         )
         self.event_loop = loop
 
-        # We cannot add signal handler when the tokenizer manager is not in
-        # the main thread due to the CPython limitation.
         if threading.current_thread() is threading.main_thread():
-            signal_handler = SignalHandler(self)
+            signal_handler = self.signal_handler_class(self)
             loop.add_signal_handler(signal.SIGTERM, signal_handler.sigterm_handler)
             # Update the signal handler for the process. It overrides the sigquit handler in the launch phase.
             loop.add_signal_handler(
                 signal.SIGQUIT, signal_handler.running_phase_sigquit_handler
             )
         else:
+            # We cannot add signal handler when the tokenizer manager is not in
+            # the main thread due to the CPython limitation.
             logger.warning(
                 "Signal handler is not added because the tokenizer manager is "
                 "not in the main thread. This disables graceful shutdown of the "
                 "tokenizer manager when SIGTERM is received."
             )
+
         self.asyncio_tasks.add(
             loop.create_task(print_exception_wrapper(self.sigterm_watchdog))
         )
