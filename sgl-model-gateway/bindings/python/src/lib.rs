@@ -417,7 +417,11 @@ impl Router {
                     balance_rel_threshold: self.balance_rel_threshold,
                     bucket_adjust_interval_secs: self.bucket_adjust_interval_secs,
                 },
-                PolicyType::Manual => ConfigPolicyConfig::Manual,
+                // Reuse eviction_interval_secs and max_tree_size to avoid adding new args
+                PolicyType::Manual => ConfigPolicyConfig::Manual {
+                    eviction_interval_secs: self.eviction_interval_secs,
+                    max_entries: self.max_tree_size,
+                },
                 PolicyType::ConsistentHashing => ConfigPolicyConfig::ConsistentHashing,
                 PolicyType::PrefixHash => ConfigPolicyConfig::PrefixHash {
                     prefix_token_count: 256,
