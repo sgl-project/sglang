@@ -9,7 +9,7 @@ class PrefillDelayer:
     ):
         self.dp_size = dp_size
         self.attn_tp_size = attn_tp_size
-        self.global_waiting_queue_len = torch.empty(
+        self.global_info = torch.empty(
             (self.dp_size, self.attn_tp_size, 2),
             dtype=torch.int64,
             device="cpu",
@@ -31,30 +31,30 @@ class PrefillDelayer:
             not server_args.disable_overlap_schedule
         ), "To use SCHEDULER_DECREASE_PREFILL_IDLE, disable_overlap_schedule must be False."
 
-    def _gather_info(self, waiting_queue_len: int, is_local_idle: bool):
-        local_queue_len = torch.tensor(
-            [waiting_queue_len, int(is_local_idle)],
+    def _gather_info(self, local_can_prefill: int, local_is_idle: bool):
+        local_info = torch.tensor(
+            [local_can_prefill, int(local_is_idle)],
             device="cpu",
             dtype=torch.int64,
         )
         torch.distributed.all_gather_into_tensor(
-            self.global_waiting_queue_len.flatten(),
-            local_queue_len,
+            self.global_info.flatten(),
+            local_info,
             group=self.cpu_group,
         )
-        tp0_info = self.global_waiting_queue_len[:, 0, :]
+        tp0_info = self.global_info[:, 0, :]
         return tp0_info
 
-    def should_allow_prefill(self, waiting_queue_len: int, is_local_idle: bool) -> bool:
-        tp0_info = self._gather_info(waiting_queue_len=waiting_queue_len, is_local_idle=is_local_idle)
-        min_queue_len = int(tp0_info[:, 0].min().item())
-        max_queue_len = int(tp0_info[:, 0].max().item())
-        has_idle = bool(tp0_info[:, 1].max().item())
+    def should_allow_prefill(self, local_can_prefill: int, local_is_idle: bool) -> bool:
+        tp0_info = self._gather_info(local_can_prefill=local_can_prefill, local_is_idle=local_is_idle)
+        global_exists__prefillable_req = bool(tp0_info[:, 0].min().item())
+        global_exists_prefillable_req = bool(tp0_info[:, 0].max().item())
+        global_exists_idle = bool(tp0_info[:, 1].max().item())
 
-        if has_idle:
+        if global_exists_idle:
             return True
 
-        if min_queue_len == 0 and max_queue_len > 0:
+        if min_has_prefillable_req == 0 and max_has_prefillable_req > 0:
             self.delayed_count += 1
             if self.delayed_count < self.max_delay_passes:
                 return False

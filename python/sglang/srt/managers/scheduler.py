@@ -1880,8 +1880,9 @@ class Scheduler(
         # The `should_allow_prefill` needs to be called on all ranks since contains communication
         delayer_allow_prefill = (
             self.prefill_delayer.should_allow_prefill(
-                is_local_idle=len(self.running_batch.reqs) == 0,
-                waiting_queue_len=len(self.waiting_queue),
+                # TODO: consider offline generation cases when there are a lot of waiting requests
+                local_can_prefill=len(self.waiting_queue) > 0,
+                local_is_idle=len(self.running_batch.reqs) == 0,
             )
             if self.prefill_delayer
             else True
