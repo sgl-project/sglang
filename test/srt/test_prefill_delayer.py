@@ -41,7 +41,7 @@ class TestPrefillDelayerThroughput(CustomTestCase):
                 dataset_name="random",
                 num_prompts=300,
                 random_input_len=4096,
-                random_output_len=128,
+                random_output_len=256,
                 request_rate=float("inf"),
                 tokenizer=model,
             )
@@ -53,11 +53,11 @@ class TestPrefillDelayerThroughput(CustomTestCase):
         print(f"Input throughput: {res['input_throughput']:.2f} token/s")
         print(f"Output throughput: {res['output_throughput']:.2f} token/s")
 
-    def test_1_dp_attention_throughput_without_prefill_delayer(self):
-        self._run_throughput_test(with_prefill_delayer=False)
-
-    def test_2_dp_attention_throughput_with_prefill_delayer(self):
+    def test_1_dp_attention_throughput_with_prefill_delayer(self):
         self._run_throughput_test(with_prefill_delayer=True)
+
+    def test_2_dp_attention_throughput_without_prefill_delayer(self):
+        self._run_throughput_test(with_prefill_delayer=False)
 
 
 if __name__ == "__main__":
