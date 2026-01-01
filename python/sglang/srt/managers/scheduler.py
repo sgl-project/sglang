@@ -1882,7 +1882,8 @@ class Scheduler(
             self.prefill_delayer.should_allow_prefill(
                 waiting_queue_len=len(self.waiting_queue)
             )
-            if self.prefill_delayer else True
+            if self.prefill_delayer
+            else True
         )
         if (not prefill_delayer_allow_prefill) or (
             (self.running_batch.batch_is_full or len(self.waiting_queue) == 0)

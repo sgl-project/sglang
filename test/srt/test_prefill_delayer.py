@@ -24,7 +24,7 @@ class TestPrefillDelayerThroughput(CustomTestCase):
             "--dp",
             "2",
             "--max-running-requests",
-            "10"
+            "10",
         ]
 
         with envs.SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE.override(with_prefill_delayer):
