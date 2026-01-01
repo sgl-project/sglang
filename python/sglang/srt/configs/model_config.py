@@ -382,7 +382,7 @@ class ModelConfig:
         if (
             "DeepseekV2ForCausalLM" in self.hf_config.architectures
             or "DeepseekV32ForCausalLM" in self.hf_config.architectures
-            or "DeepseekV3ForCausalLM" in self.hf_config.architectures
+            or "DeepseekV3ForCausalLM" in self.hf_text_config.architectures
             or "DeepseekV3ForCausalLMNextN" in self.hf_config.architectures
             or "Glm4MoeLiteForCausalLM" in self.hf_config.architectures
             or "LongcatFlashForCausalLM" in self.hf_config.architectures
@@ -394,13 +394,13 @@ class ModelConfig:
         ):
             self.head_dim = 256
             self.attention_arch = AttentionArch.MLA
-            self.kv_lora_rank = self.hf_config.kv_lora_rank
-            self.qk_nope_head_dim = self.hf_config.qk_nope_head_dim
-            self.qk_rope_head_dim = self.hf_config.qk_rope_head_dim
-            self.v_head_dim = self.hf_config.v_head_dim
+            self.kv_lora_rank = self.hf_text_config.kv_lora_rank
+            self.qk_nope_head_dim = self.hf_text_config.qk_nope_head_dim
+            self.qk_rope_head_dim = self.hf_text_config.qk_rope_head_dim
+            self.v_head_dim = self.hf_text_config.v_head_dim
             self.index_head_dim = (
-                get_nsa_index_head_dim(self.hf_config)
-                if is_deepseek_nsa(self.hf_config)
+                get_nsa_index_head_dim(self.hf_text_config)
+                if is_deepseek_nsa(self.hf_text_config)
                 else None
             )
 
@@ -412,11 +412,11 @@ class ModelConfig:
                 self.scaling = 1 / math.sqrt(
                     self.qk_nope_head_dim + self.qk_rope_head_dim
                 )
-                if self.hf_config.rope_scaling:
+                if self.hf_text_config.rope_scaling:
                     mscale_all_dim = self.hf_config.rope_scaling.get(
                         "mscale_all_dim", False
                     )
-                    scaling_factor = self.hf_config.rope_scaling["factor"]
+                    scaling_factor = self.hf_text_config.rope_scaling["factor"]
                     mscale = yarn_get_mscale(scaling_factor, float(mscale_all_dim))
                     self.scaling = self.scaling * mscale * mscale
 
@@ -1168,7 +1168,11 @@ multimodal_model_archs = [
     "JetVLMForConditionalGeneration",
     "PaddleOCRVLForConditionalGeneration",
     "MiDashengLMModel",
+<<<<<<< HEAD
     "StepVLForConditionalGeneration",
+=======
+    "K2VLForConditionalGeneration",
+>>>>>>> f8d2590c4 (warmup succeed)
 ]
 
 if external_mm_model_arch := envs.SGLANG_EXTERNAL_MM_MODEL_ARCH.get():
