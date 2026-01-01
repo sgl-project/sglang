@@ -9,6 +9,7 @@ from typing import Any, List, Optional, Union
 import httpx
 from fastapi import UploadFile
 
+from sglang.multimodal_gen.configs.sample.sampling_params import DataType
 from sglang.multimodal_gen.runtime.entrypoints.utils import post_process_sample
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 from sglang.multimodal_gen.runtime.scheduler_client import AsyncSchedulerClient
@@ -183,15 +184,35 @@ async def process_generation_batch(
             raise RuntimeError(
                 f"Model generation returned no output. Error from scheduler: {error_msg}"
             )
-
-        save_file_path = str(os.path.join(batch.output_path, batch.output_file_name))
-        post_process_sample(
-            result.output[0],
-            batch.data_type,
-            batch.fps,
-            batch.save_output,
-            save_file_path,
-        )
+        save_file_path_list = []
+        if batch.data_type == DataType.VIDEO:
+            for idx, output in enumerate(result.output):
+                save_file_path = str(
+                    os.path.join(batch.output_path, batch.output_file_name)
+                )
+                post_process_sample(
+                    result.output[idx],
+                    batch.data_type,
+                    batch.fps,
+                    batch.save_output,
+                    save_file_path,
+                )
+                save_file_path_list.append(save_file_path)
+        else:
+            for idx, output in enumerate(result.output):
+                save_file_path = str(
+                    os.path.join(
+                        batch.output_path, f"sample_{idx}_" + batch.output_file_name
+                    )
+                )
+                post_process_sample(
+                    output,
+                    batch.data_type,
+                    batch.fps,
+                    batch.save_output,
+                    save_file_path,
+                )
+                save_file_path_list.append(save_file_path)
 
     total_time = time.perf_counter() - total_start_time
     log_batch_completion(logger, 1, total_time)
@@ -199,7 +220,7 @@ async def process_generation_batch(
     if result.peak_memory_mb and result.peak_memory_mb > 0:
         logger.info(f"Peak memory usage: {result.peak_memory_mb:.2f} MB")
 
-    return save_file_path, result
+    return save_file_path_list, result
 
 
 def merge_image_input_list(*inputs: Union[List, Any, None]) -> List:
