@@ -21,13 +21,13 @@ class PrefillDelayer:
             server_args.schedule_policy == "fcfs"
         ), f"To use SCHEDULER_DECREASE_PREFILL_IDLE, schedule_policy must be 'fcfs'. '{server_args.schedule_policy}' is not supported."
         assert (
-            server_args.enable_dp_attention == True
+            server_args.enable_dp_attention
         ), "To use SCHEDULER_DECREASE_PREFILL_IDLE, enable_dp_attention must be enabled."
         assert (
             server_args.disaggregation_mode == "null"
         ), "To use SCHEDULER_DECREASE_PREFILL_IDLE, disaggregation_mode must be null."
         assert (
-            server_args.disable_overlap_schedule == False
+            not server_args.disable_overlap_schedule
         ), "To use SCHEDULER_DECREASE_PREFILL_IDLE, disable_overlap_schedule must be False."
 
     def _gather_waiting_queue_info(self, waiting_queue_len: int):
