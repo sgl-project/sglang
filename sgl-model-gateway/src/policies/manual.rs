@@ -20,7 +20,9 @@ use http::header::HeaderName;
 use rand::Rng;
 use tracing::debug;
 
-use super::{get_healthy_worker_indices, utils::PeriodicTask, LoadBalancingPolicy, SelectWorkerInfo};
+use super::{
+    get_healthy_worker_indices, utils::PeriodicTask, LoadBalancingPolicy, SelectWorkerInfo,
+};
 use crate::{core::Worker, observability::metrics::Metrics};
 
 /// Header for routing key based sticky sessions
@@ -698,8 +700,7 @@ mod tests {
 
     #[test]
     fn test_manual_lru_eviction_logic() {
-        use std::thread;
-        use std::time::Duration;
+        use std::{thread, time::Duration};
 
         let config = ManualConfig {
             eviction_interval_secs: 0,
