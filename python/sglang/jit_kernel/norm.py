@@ -17,8 +17,8 @@ if TYPE_CHECKING:
 
 
 @cache_once
-def _jit_qknorm_module(head_dims: int) -> Module:
-    args = make_cpp_args(head_dims, is_arch_support_pdl())
+def _jit_qknorm_module(head_dim: int) -> Module:
+    args = make_cpp_args(head_dim, is_arch_support_pdl())
     return load_jit(
         "qknorm",
         *args,
