@@ -3259,8 +3259,8 @@ class ServerArgs:
                 "auto",
                 "round_robin",
                 "follow_bootstrap_room",
-                "total_tokens",
                 "total_requests",
+                "total_tokens",
             ],
         )
         parser.add_argument(
