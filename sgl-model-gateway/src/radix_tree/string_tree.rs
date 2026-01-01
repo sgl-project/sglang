@@ -4,11 +4,13 @@ use std::{
     hash::{BuildHasherDefault, Hasher},
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc, RwLock,
+        Arc, Weak,
     },
 };
 
 use dashmap::{mapref::entry::Entry, DashMap};
+use once_cell::sync::Lazy;
+use parking_lot::RwLock;
 use tracing::debug;
 
 use super::{
@@ -221,6 +223,10 @@ impl Clone for NodeText {
     }
 }
 
+/// Global tenant string intern pool to avoid repeated allocations.
+/// Uses DashMap for concurrent access with minimal contention.
+static TENANT_INTERN_POOL: Lazy<DashMap<Arc<str>, ()>> = Lazy::new(DashMap::new);
+
 /// Global epoch counter for LRU ordering.
 /// Uses a simple incrementing counter instead of wall clock time.
 ///
@@ -250,11 +256,12 @@ struct Node {
     text: RwLock<NodeText>,
     /// Per-tenant last access epoch for LRU ordering. Using TenantId (Arc<str>) for cheap cloning.
     tenant_last_access_time: DashMap<TenantId, u64>,
-    /// Parent pointer for upward traversal during timestamp updates
-    parent: RwLock<Option<NodeRef>>,
+    /// Parent pointer for upward traversal during timestamp updates.
+    /// Uses Weak to avoid Arc reference cycles (parent -> child -> parent).
+    parent: RwLock<Option<Weak<Node>>>,
     /// Cached last-accessed tenant for O(1) lookup during prefix match.
     /// Avoids O(shards) DashMap iteration in the common case.
-    last_tenant: parking_lot::RwLock<Option<TenantId>>,
+    last_tenant: RwLock<Option<TenantId>>,
 }
 
 #[derive(Debug)]
@@ -330,10 +337,19 @@ fn shared_prefix_count_chars(a: &str, b: &str) -> usize {
         .count()
 }
 
-/// Intern a tenant string into an Arc<str> for efficient storage and comparison.
+/// Intern tenant ID to avoid repeated allocations.
+/// Returns cached Arc<str> if tenant was seen before.
 #[inline]
 fn intern_tenant(tenant: &str) -> TenantId {
-    Arc::from(tenant)
+    // Fast path: check if already interned
+    if let Some(entry) = TENANT_INTERN_POOL.get(tenant) {
+        return Arc::clone(entry.key());
+    }
+
+    // Slow path: intern new tenant
+    let interned: Arc<str> = Arc::from(tenant);
+    TENANT_INTERN_POOL.insert(Arc::clone(&interned), ());
+    interned
 }
 
 impl Default for Tree {
@@ -368,7 +384,7 @@ impl Tree {
                 text: RwLock::new(NodeText::empty()),
                 tenant_last_access_time: DashMap::with_shard_amount(ROOT_SHARD_COUNT),
                 parent: RwLock::new(None),
-                last_tenant: parking_lot::RwLock::new(None),
+                last_tenant: RwLock::new(None),
             }),
             tenant_char_count: DashMap::with_shard_amount(ROOT_SHARD_COUNT),
         }
@@ -420,8 +436,8 @@ impl Tree {
                         children: new_children_map(),
                         text: RwLock::new(NodeText::new(remaining.to_string())),
                         tenant_last_access_time: new_tenant_map(),
-                        parent: RwLock::new(Some(Arc::clone(&prev))),
-                        last_tenant: parking_lot::RwLock::new(Some(Arc::clone(&tenant_id))),
+                        parent: RwLock::new(Some(Arc::downgrade(&prev))),
+                        last_tenant: RwLock::new(Some(Arc::clone(&tenant_id))),
                     });
 
                     // Attach tenant to the new leaf node with timestamp
@@ -440,7 +456,7 @@ impl Tree {
                 Entry::Occupied(mut entry) => {
                     let matched_node = entry.get().clone();
 
-                    let matched_node_text = matched_node.text.read().unwrap();
+                    let matched_node_text = matched_node.text.read();
                     let matched_node_text_count = matched_node_text.char_count();
                     let matched_node_text_str = matched_node_text.as_str();
 
@@ -459,11 +475,9 @@ impl Tree {
                         let new_node = Arc::new(Node {
                             text: RwLock::new(matched_text),
                             children: new_children_map(),
-                            parent: RwLock::new(Some(Arc::clone(&prev))),
+                            parent: RwLock::new(Some(Arc::downgrade(&prev))),
                             tenant_last_access_time: matched_node.tenant_last_access_time.clone(),
-                            last_tenant: parking_lot::RwLock::new(
-                                matched_node.last_tenant.read().clone(),
-                            ),
+                            last_tenant: RwLock::new(matched_node.last_tenant.read().clone()),
                         });
 
                         let first_new_char = contracted_text.first_char().unwrap();
@@ -473,8 +487,8 @@ impl Tree {
 
                         entry.insert(Arc::clone(&new_node));
 
-                        *matched_node.text.write().unwrap() = contracted_text;
-                        *matched_node.parent.write().unwrap() = Some(Arc::clone(&new_node));
+                        *matched_node.text.write() = contracted_text;
+                        *matched_node.parent.write() = Some(Arc::downgrade(&new_node));
 
                         // Attach tenant to the new split node (intermediate - no timestamp update)
                         // The cloned DashMap already has the tenant; just ensure char count is correct
@@ -554,7 +568,7 @@ impl Tree {
             let child_node = prev.children.get(&first_char).map(|e| e.value().clone());
 
             if let Some(matched_node) = child_node {
-                let matched_text_guard = matched_node.text.read().unwrap();
+                let matched_text_guard = matched_node.text.read();
                 let matched_node_text_count = matched_text_guard.char_count();
 
                 // Use slice-based comparison - no allocation
@@ -666,7 +680,7 @@ impl Tree {
                     break;
                 }
 
-                let matched_text_guard = matched_node.text.read().unwrap();
+                let matched_text_guard = matched_node.text.read();
                 let matched_node_text_count = matched_text_guard.char_count();
 
                 // Use slice-based comparison - no allocation
@@ -781,7 +795,7 @@ impl Tree {
             }
 
             // Decrement when removing tenant from node
-            let node_len = node.text.read().unwrap().char_count();
+            let node_len = node.text.read().char_count();
             self.tenant_char_count
                 .entry(Arc::clone(&tenant))
                 .and_modify(|count| {
@@ -792,12 +806,13 @@ impl Tree {
             node.tenant_last_access_time.remove(tenant.as_ref());
 
             // Get parent reference outside of the borrow scope
-            let parent_opt = node.parent.read().unwrap().clone();
+            // Use Weak::upgrade() to get a strong reference if the parent still exists
+            let parent_opt = node.parent.read().as_ref().and_then(Weak::upgrade);
 
             // Remove empty nodes
             if node.children.is_empty() && node.tenant_last_access_time.is_empty() {
                 if let Some(ref parent) = parent_opt {
-                    if let Some(fc) = node.text.read().unwrap().first_char() {
+                    if let Some(fc) = node.text.read().first_char() {
                         parent.children.remove(&fc);
                     }
                 }
@@ -872,12 +887,13 @@ impl Tree {
             curr.tenant_last_access_time.remove(tenant_id.as_ref());
 
             // Get parent reference outside of the borrow scope
-            let parent_opt = curr.parent.read().unwrap().clone();
+            // Use Weak::upgrade() to get a strong reference if the parent still exists
+            let parent_opt = curr.parent.read().as_ref().and_then(Weak::upgrade);
 
             // Remove empty nodes
             if curr.children.is_empty() && curr.tenant_last_access_time.is_empty() {
                 if let Some(ref parent) = parent_opt {
-                    if let Some(fc) = curr.text.read().unwrap().first_char() {
+                    if let Some(fc) = curr.text.read().first_char() {
                         parent.children.remove(&fc);
                     }
                 }
@@ -925,7 +941,7 @@ impl Tree {
 
         while let Some(curr) = stack.pop() {
             // Use cached char count instead of chars().count()
-            let text_count = curr.text.read().unwrap().char_count();
+            let text_count = curr.text.read().char_count();
 
             for tenant in curr.tenant_last_access_time.iter() {
                 let size = used_size_per_tenant
@@ -975,7 +991,7 @@ impl Tree {
                 break;
             }
 
-            let node_chars = node.text.read().unwrap().char_count();
+            let node_chars = node.text.read().char_count();
             if self.remove_tenant_from_node(&node, tenant_id) {
                 evicted += node_chars;
             }
@@ -1023,7 +1039,7 @@ impl Tree {
         // Clear tenant char counts
         self.tenant_char_count.clear();
         // Reset root text
-        *self.root.text.write().unwrap() = NodeText::new(String::new());
+        *self.root.text.write() = NodeText::new(String::new());
     }
 
     #[allow(dead_code)]
@@ -1035,7 +1051,7 @@ impl Tree {
         result.push_str(if is_last { "└── " } else { "├── " });
 
         // Add node text
-        let node_text = node.text.read().unwrap();
+        let node_text = node.text.read();
         result.push_str(&format!("'{}' [", node_text.as_str()));
 
         // Add tenant information with epoch values
