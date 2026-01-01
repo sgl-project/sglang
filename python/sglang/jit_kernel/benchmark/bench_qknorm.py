@@ -53,6 +53,7 @@ def flashinfer_qknorm(
     q_weight: torch.Tensor,
     k_weight: torch.Tensor,
 ) -> None:
+    from flashinfer import rmsnorm
 
     rmsnorm(q, q_weight, out=q)
     rmsnorm(k, k_weight, out=k)
