@@ -341,15 +341,15 @@ pub enum PolicyConfig {
     /// - X-SMG-Routing-Key: Routes to a cached worker or assigns a new one
     /// - Provides true sticky sessions with zero key redistribution on worker add
     /// - Falls back to random selection if no routing key is provided
-    /// - Supports LRU eviction of stale routing entries
+    /// - Supports LRU eviction when cache size exceeds max_entries
     #[serde(rename = "manual")]
     Manual {
         /// Interval between LRU eviction cycles (seconds, default: 60)
         #[serde(default = "default_manual_eviction_interval_secs")]
         eviction_interval_secs: u64,
-        /// Maximum idle time before entry is evicted (seconds, default: 3600)
-        #[serde(default = "default_manual_max_idle_secs")]
-        max_idle_secs: u64,
+        /// Maximum number of routing entries before LRU eviction (default: 10000)
+        #[serde(default = "default_manual_max_entries")]
+        max_entries: usize,
     },
 
     /// Consistent hashing policy using hash ring for session affinity:
@@ -388,8 +388,8 @@ fn default_manual_eviction_interval_secs() -> u64 {
     60
 }
 
-fn default_manual_max_idle_secs() -> u64 {
-    3600
+fn default_manual_max_entries() -> usize {
+    10000
 }
 
 impl PolicyConfig {

@@ -49,11 +49,11 @@ impl PolicyFactory {
             }
             PolicyConfig::Manual {
                 eviction_interval_secs,
-                max_idle_secs,
+                max_entries,
             } => {
                 let config = ManualConfig {
                     eviction_interval_secs: *eviction_interval_secs,
-                    max_idle_secs: *max_idle_secs,
+                    max_entries: *max_entries,
                 };
                 Arc::new(ManualPolicy::with_config(config))
             }
@@ -124,7 +124,7 @@ mod tests {
 
         let policy = PolicyFactory::create_from_config(&PolicyConfig::Manual {
             eviction_interval_secs: 60,
-            max_idle_secs: 3600,
+            max_entries: 10000,
         });
         assert_eq!(policy.name(), "manual");
 

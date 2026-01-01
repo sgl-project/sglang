@@ -63,14 +63,14 @@ const MAX_CANDIDATE_WORKERS: usize = 2;
 #[derive(Debug, Clone)]
 pub struct ManualConfig {
     pub eviction_interval_secs: u64,
-    pub max_idle_secs: u64,
+    pub max_entries: usize,
 }
 
 impl Default for ManualConfig {
     fn default() -> Self {
         Self {
             eviction_interval_secs: 60,
-            max_idle_secs: 3600,
+            max_entries: 10000,
         }
     }
 }
@@ -113,34 +113,43 @@ impl ManualPolicy {
     pub fn with_config(config: ManualConfig) -> Self {
         let routing_map = Arc::new(DashMap::<RoutingId, Node>::new());
 
-        let eviction_task = if config.eviction_interval_secs > 0 && config.max_idle_secs > 0 {
+        let eviction_task = if config.eviction_interval_secs > 0 && config.max_entries > 0 {
             let routing_map_clone = Arc::clone(&routing_map);
-            let max_idle_secs = config.max_idle_secs;
+            let max_entries = config.max_entries;
 
             Some(PeriodicTask::spawn(
                 config.eviction_interval_secs,
                 "ManualPolicyEviction",
                 move || {
-                    let now = Instant::now();
-                    let mut evicted_count = 0usize;
-
-                    routing_map_clone.retain(|_, node| {
-                        let idle_secs = now.duration_since(node.last_access).as_secs();
-                        if idle_secs > max_idle_secs {
-                            evicted_count += 1;
-                            false
-                        } else {
-                            true
-                        }
-                    });
-
-                    if evicted_count > 0 {
-                        debug!(
-                            "ManualPolicy eviction completed: evicted {} entries, remaining {}",
-                            evicted_count,
-                            routing_map_clone.len()
-                        );
+                    let current_size = routing_map_clone.len();
+                    if current_size <= max_entries {
+                        return;
                     }
+
+                    let to_evict = current_size - max_entries;
+
+                    // Collect entries with their last_access time
+                    let mut entries: Vec<_> = routing_map_clone
+                        .iter()
+                        .map(|entry| (entry.key().clone(), entry.value().last_access))
+                        .collect();
+
+                    // Sort by last_access (oldest first)
+                    entries.sort_by_key(|(_, last_access)| *last_access);
+
+                    // Remove oldest entries
+                    let evicted_count = entries
+                        .iter()
+                        .take(to_evict)
+                        .filter(|(key, _)| routing_map_clone.remove(key).is_some())
+                        .count();
+
+                    debug!(
+                        "ManualPolicy LRU eviction: evicted {} entries, remaining {} (max: {})",
+                        evicted_count,
+                        routing_map_clone.len(),
+                        max_entries
+                    );
                 },
             ))
         } else {

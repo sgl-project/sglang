@@ -690,7 +690,7 @@ impl CliArgs {
             },
             "manual" => PolicyConfig::Manual {
                 eviction_interval_secs: 60,
-                max_idle_secs: 3600,
+                max_entries: 10000,
             },
             _ => PolicyConfig::RoundRobin,
         }
