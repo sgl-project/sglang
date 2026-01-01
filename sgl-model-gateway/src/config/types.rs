@@ -389,7 +389,7 @@ fn default_manual_eviction_interval_secs() -> u64 {
 }
 
 fn default_manual_max_idle_secs() -> u64 {
-    4 * 3600 // 4 hours
+    4 * 3600
 }
 
 impl PolicyConfig {

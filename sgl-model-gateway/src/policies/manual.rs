@@ -70,7 +70,7 @@ impl Default for ManualConfig {
     fn default() -> Self {
         Self {
             eviction_interval_secs: 60,
-            max_idle_secs: 4 * 3600, // 4 hours
+            max_idle_secs: 4 * 3600,
         }
     }
 }
@@ -655,12 +655,54 @@ mod tests {
     }
 
     #[test]
-    fn test_manual_last_access_updates_on_slow_path() {
-        let config = ManualConfig {
-            eviction_interval_secs: 0,
-            max_idle_secs: 3600,
+    fn test_manual_last_access_updates_on_vacant() {
+        let policy = ManualPolicy::new();
+        let workers = create_workers(&["http://w1:8000", "http://w2:8000"]);
+
+        let headers = headers_with_routing_key("test-key");
+        let info = SelectWorkerInfo {
+            headers: Some(&headers),
+            ..Default::default()
         };
-        let policy = ManualPolicy::with_config(config);
+
+        let (result, branch) = policy.select_worker_impl(&workers, &info);
+        assert_eq!(branch, ExecutionBranch::Vacant);
+        assert!(result.is_some());
+
+        let routing_id = RoutingId::new("test-key");
+        let node = policy.routing_map.get(&routing_id).unwrap();
+        assert!(node.last_access.elapsed().as_millis() < 100);
+    }
+
+    #[test]
+    fn test_manual_last_access_updates_on_occupied_hit() {
+        let policy = ManualPolicy::new();
+        let workers = create_workers(&["http://w1:8000", "http://w2:8000"]);
+
+        let headers = headers_with_routing_key("test-key");
+        let info = SelectWorkerInfo {
+            headers: Some(&headers),
+            ..Default::default()
+        };
+
+        let (_, branch) = policy.select_worker_impl(&workers, &info);
+        assert_eq!(branch, ExecutionBranch::Vacant);
+
+        let routing_id = RoutingId::new("test-key");
+        let first_access = policy.routing_map.get(&routing_id).unwrap().last_access;
+
+        std::thread::sleep(std::time::Duration::from_millis(10));
+
+        let (_, branch) = policy.select_worker_impl(&workers, &info);
+        assert_eq!(branch, ExecutionBranch::OccupiedHit);
+
+        let second_access = policy.routing_map.get(&routing_id).unwrap().last_access;
+        assert!(second_access > first_access);
+    }
+
+    #[test]
+    fn test_manual_last_access_updates_on_occupied_miss() {
+        let policy = ManualPolicy::new();
         let workers = create_workers(&["http://w1:8000", "http://w2:8000"]);
 
         let headers = headers_with_routing_key("test-key");
@@ -674,9 +716,7 @@ mod tests {
         let first_idx = first_result.unwrap();
 
         let routing_id = RoutingId::new("test-key");
-        let node = policy.routing_map.get(&routing_id).unwrap();
-        let first_access = node.last_access;
-        drop(node);
+        let first_access = policy.routing_map.get(&routing_id).unwrap().last_access;
 
         std::thread::sleep(std::time::Duration::from_millis(10));
         workers[first_idx].set_healthy(false);
@@ -684,53 +724,32 @@ mod tests {
         let (_, branch) = policy.select_worker_impl(&workers, &info);
         assert_eq!(branch, ExecutionBranch::OccupiedMiss);
 
-        let node = policy.routing_map.get(&routing_id).unwrap();
-        assert!(
-            node.last_access > first_access,
-            "last_access should be updated on slow path"
-        );
+        let second_access = policy.routing_map.get(&routing_id).unwrap().last_access;
+        assert!(second_access > first_access);
     }
 
     #[test]
     fn test_manual_ttl_eviction_logic() {
-        use std::time::{Duration, Instant};
+        use std::time::Duration;
 
         let config = ManualConfig {
-            eviction_interval_secs: 0,
-            max_idle_secs: 1, // 1 second TTL for testing
+            eviction_interval_secs: 1,
+            max_idle_secs: 1,
         };
         let policy = ManualPolicy::with_config(config);
         let workers = create_workers(&["http://w1:8000", "http://w2:8000"]);
 
-        for i in 0..3 {
-            let headers = headers_with_routing_key(&format!("key-{}", i));
-            let info = SelectWorkerInfo {
-                headers: Some(&headers),
-                ..Default::default()
-            };
-            policy.select_worker_impl(&workers, &info);
-        }
+        let headers = headers_with_routing_key("key-0");
+        let info = SelectWorkerInfo {
+            headers: Some(&headers),
+            ..Default::default()
+        };
+        policy.select_worker_impl(&workers, &info);
 
-        assert_eq!(policy.routing_map.len(), 3);
+        assert_eq!(policy.routing_map.len(), 1);
 
-        // Simulate TTL eviction by manually setting old last_access
-        {
-            let routing_id = RoutingId::new("key-0");
-            if let Some(mut entry) = policy.routing_map.get_mut(&routing_id) {
-                entry.last_access = Instant::now() - Duration::from_secs(10);
-            }
-        }
+        std::thread::sleep(Duration::from_secs(3));
 
-        // Manually run TTL eviction logic
-        let max_idle = Duration::from_secs(1);
-        let now = Instant::now();
-        policy
-            .routing_map
-            .retain(|_, node| now.duration_since(node.last_access) < max_idle);
-
-        assert_eq!(policy.routing_map.len(), 2);
-
-        let routing_id = RoutingId::new("key-0");
-        assert!(policy.routing_map.get(&routing_id).is_none());
+        assert_eq!(policy.routing_map.len(), 0);
     }
 }
