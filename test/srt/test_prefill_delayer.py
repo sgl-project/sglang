@@ -27,7 +27,7 @@ class TestPrefillDelayerThroughput(CustomTestCase):
             "10",
         ]
 
-        with envs.SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE.override(with_prefill_delayer):
+        with envs.SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE.override(with_prefill_delayer), envs.SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES.override(100):
             process = popen_launch_server(
                 model,
                 base_url,
