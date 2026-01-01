@@ -33,8 +33,8 @@ type NodeRef = Arc<Node>;
 const ROOT_SHARD_COUNT: usize = 32;
 const NODE_SHARD_COUNT: usize = 8;
 
-/// A fast identity hasher for token ID keys (u32).
-/// Since token IDs have good distribution already, we use identity hashing with mixing.
+/// A fast hasher for single token IDs (u32).
+/// Uses FxHash-style multiplication mixing for excellent distribution.
 #[derive(Default)]
 struct TokenHasher(u64);
 
@@ -46,28 +46,26 @@ impl Hasher for TokenHasher {
 
     #[inline(always)]
     fn write(&mut self, bytes: &[u8]) {
-        // Fast path for 4-byte (u32) writes
+        // Fast path for u32 (single token)
         if bytes.len() == 4 {
             let val = u32::from_ne_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
-            // Mix with golden ratio for better distribution
-            self.0 = (val as u64).wrapping_mul(0x9E3779B97F4A7C15);
-            return;
+            // FxHash-style mixing: multiply by golden ratio prime and rotate
+            self.0 = (val as u64).wrapping_mul(0x517cc1b727220a95);
+        } else {
+            // Fallback for other sizes
+            for chunk in bytes.chunks(4) {
+                if chunk.len() == 4 {
+                    let val = u32::from_ne_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+                    self.0 = self.0.wrapping_add(val as u64).wrapping_mul(0x517cc1b727220a95);
+                }
+            }
         }
-        // Fallback for other sizes
-        for &byte in bytes {
-            self.0 = self.0.wrapping_mul(0x100000001b3).wrapping_add(byte as u64);
-        }
-    }
-
-    #[inline(always)]
-    fn write_u32(&mut self, i: u32) {
-        self.0 = (i as u64).wrapping_mul(0x9E3779B97F4A7C15);
     }
 }
 
 type TokenHasherBuilder = BuildHasherDefault<TokenHasher>;
 
-/// Create a children DashMap for non-root nodes with optimized hasher
+/// Create a children DashMap with single-token key lookup
 #[inline]
 fn new_children_map() -> DashMap<TokenId, NodeRef, TokenHasherBuilder> {
     DashMap::with_hasher_and_shard_amount(TokenHasherBuilder::default(), NODE_SHARD_COUNT)
@@ -120,7 +118,7 @@ fn next_timestamp() -> u64 {
 struct Node {
     /// Token sequence stored at this node
     tokens: RwLock<Vec<TokenId>>,
-    /// Children nodes keyed by first token (with optimized hasher)
+    /// Children nodes keyed by first token (for fast lookup)
     children: DashMap<TokenId, NodeRef, TokenHasherBuilder>,
     /// Tenants that own this node with last access timestamps
     tenant_last_access_time: DashMap<TenantId, u64>,
@@ -236,6 +234,7 @@ impl TokenTree {
         }
 
         while !remaining.is_empty() {
+            // Use first token as key for children lookup
             let first_token = remaining[0];
 
             let step = match current.children.entry(first_token) {
@@ -402,6 +401,7 @@ impl TokenTree {
         }
 
         while !remaining.is_empty() {
+            // Use first token as key for children lookup
             let first_token = remaining[0];
 
             let step = match current.children.get(&first_token) {
