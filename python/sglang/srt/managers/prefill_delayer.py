@@ -47,14 +47,14 @@ class PrefillDelayer:
 
     def should_allow_prefill(self, local_can_prefill: int, local_is_idle: bool) -> bool:
         tp0_info = self._gather_info(local_can_prefill=local_can_prefill, local_is_idle=local_is_idle)
-        global_exists__prefillable_req = bool(tp0_info[:, 0].min().item())
-        global_exists_prefillable_req = bool(tp0_info[:, 0].max().item())
+        global_exists_cannot_prefill = tp0_info[:, 0].min().item() == 0
+        global_exists_can_prefill = tp0_info[:, 0].max().item() > 0
         global_exists_idle = bool(tp0_info[:, 1].max().item())
 
         if global_exists_idle:
             return True
 
-        if min_has_prefillable_req == 0 and max_has_prefillable_req > 0:
+        if global_exists_cannot_prefill and global_exists_can_prefill:
             self.delayed_count += 1
             if self.delayed_count < self.max_delay_passes:
                 return False
