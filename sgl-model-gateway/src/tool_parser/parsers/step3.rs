@@ -10,7 +10,7 @@ use crate::{
         errors::{ParserError, ParserResult},
         parsers::helpers,
         traits::ToolParser,
-        types::{FunctionCall, StreamingParseResult, ToolCall, ToolCallItem},
+        types::{FormatInfo, FunctionCall, StreamingParseResult, ToolCall, ToolCallItem},
     },
 };
 
@@ -572,5 +572,11 @@ impl ToolParser for Step3Parser {
         self.current_parameters.clear();
         self.in_tool_call = false;
         self.function_name_sent = false;
+    }
+
+    fn get_format_info(&self) -> Option<FormatInfo> {
+        // This parser does not support structural tags
+        // (Python implementation: structure_info() raises NotImplementedError)
+        None
     }
 }

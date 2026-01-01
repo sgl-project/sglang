@@ -139,20 +139,38 @@ fn build_structural_tag_from_format_info(
     let mut structures = Vec::new();
     let mut trigger_set = std::collections::HashSet::new();
 
-    for tool in tools {
-        let tool_name = &tool.function.name;
-        let begin = (format_info.begin_pattern)(tool_name);
-        let end = &format_info.end_pattern;
-        trigger_set.insert(format_info.trigger.clone());
+    // Add primary trigger
+    trigger_set.insert(format_info.trigger.clone());
+    
+    // Add secondary trigger if it exists
+    if let Some(ref trigger_subsequent) = format_info.trigger_subsequent {
+        trigger_set.insert(trigger_subsequent.clone());
+    }
 
+    for (index, tool) in tools.iter().enumerate() {
+        let tool_name = &tool.function.name;
+        let end = &format_info.end_pattern;
+        
         // Use tool's parameters schema if available
         let schema = &tool.function.parameters;
 
+        // Create structure for first tool call (or all if no subsequent pattern)
+        let begin_first = (format_info.begin_pattern)(tool_name, index);
         structures.push(json!({
-            "begin": begin,
+            "begin": begin_first,
             "schema": schema,
             "end": end,
         }));
+
+        // If there's a subsequent pattern, create a second structure for subsequent calls
+        if let Some(ref begin_pattern_subsequent) = format_info.begin_pattern_subsequent {
+            let begin_subsequent = begin_pattern_subsequent(tool_name, index);
+            structures.push(json!({
+                "begin": begin_subsequent,
+                "schema": schema,
+                "end": end,
+            }));
+        }
     }
 
     let structural_tag = json!({

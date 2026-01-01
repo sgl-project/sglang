@@ -8,7 +8,7 @@ use crate::{
         errors::{ParserError, ParserResult},
         parsers::helpers,
         traits::ToolParser,
-        types::{FunctionCall, StreamingParseResult, ToolCall, ToolCallItem},
+        types::{FormatInfo, FunctionCall, StreamingParseResult, ToolCall, ToolCallItem},
     },
 };
 
@@ -336,5 +336,11 @@ impl ToolParser for Glm4MoeParser {
         self.prev_tool_call_arr.clear();
         self.current_tool_id = -1;
         self.streamed_args_for_tool.clear();
+    }
+
+    fn get_format_info(&self) -> Option<FormatInfo> {
+        // This parser does not support structural tags
+        // (Python implementation: supports_structural_tag() = False, structure_info() raises NotImplementedError)
+        None
     }
 }

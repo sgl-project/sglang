@@ -8,7 +8,7 @@ use crate::{
         parsers::helpers,
         partial_json::PartialJson,
         traits::ToolParser,
-        types::{FunctionCall, StreamingParseResult, ToolCall, ToolCallItem},
+        types::{FormatInfo, FunctionCall, StreamingParseResult, ToolCall, ToolCallItem},
     },
 };
 
@@ -301,5 +301,11 @@ impl ToolParser for JsonParser {
         );
         self.is_array_format = false;
         self.array_closed = false;
+    }
+
+    fn get_format_info(&self) -> Option<FormatInfo> {
+        // This parser does not support structural tags
+        // (Python JsonArrayParser raises NotImplementedError for structure_info)
+        None
     }
 }

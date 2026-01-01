@@ -90,10 +90,18 @@ pub struct ToolCallItem {
 /// Format information for building structural tags
 /// Contains the patterns needed to construct structural tags for constrained generation
 pub struct FormatInfo {
-    /// Function to generate begin pattern for a specific tool name
-    pub begin_pattern: Box<dyn Fn(&str) -> String + Send + Sync>,
+    /// Function to generate begin pattern for a specific tool name and index
+    /// Parameters: (tool_name, tool_index)
+    pub begin_pattern: Box<dyn Fn(&str, usize) -> String + Send + Sync>,
     /// End pattern string
     pub end_pattern: String,
     /// Trigger token that starts the tool call sequence
     pub trigger: String,
+    /// Optional function to generate begin pattern for subsequent tool calls (after the first one)
+    /// Used for parsers with dual triggers (e.g., KimiK2, DeepSeek V3.1)
+    /// If None, uses begin_pattern for all tool calls
+    pub begin_pattern_subsequent: Option<Box<dyn Fn(&str, usize) -> String + Send + Sync>>,
+    /// Optional second trigger token for subsequent tool calls
+    /// If None, uses trigger for all tool calls
+    pub trigger_subsequent: Option<String>,
 }

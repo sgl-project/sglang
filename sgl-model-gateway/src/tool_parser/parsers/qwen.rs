@@ -258,11 +258,13 @@ impl ToolParser for QwenParser {
 
     fn get_format_info(&self) -> Option<FormatInfo> {
         Some(FormatInfo {
-            begin_pattern: Box::new(|name| {
+            begin_pattern: Box::new(|name, _index| {
                 format!(r#"<tool_call>\n{{"name":"{}", "arguments":"#, name)
             }),
             end_pattern: "}\n</tool_call>".to_string(),
             trigger: "<tool_call>".to_string(),
+            begin_pattern_subsequent: None,
+            trigger_subsequent: None,
         })
     }
 }

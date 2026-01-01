@@ -328,7 +328,7 @@ impl ToolParser for DeepSeekParser {
 
     fn get_format_info(&self) -> Option<FormatInfo> {
         Some(FormatInfo {
-            begin_pattern: Box::new(|name| {
+            begin_pattern: Box::new(|name, _index| {
                 format!(
                     "<｜tool▁call▁begin｜>function<｜tool▁sep｜>{}\n```json\n",
                     name
@@ -336,6 +336,8 @@ impl ToolParser for DeepSeekParser {
             }),
             end_pattern: "\n```<｜tool▁call▁end｜>".to_string(),
             trigger: "<｜tool▁calls▁begin｜>".to_string(),
+            begin_pattern_subsequent: None,
+            trigger_subsequent: None,
         })
     }
 }
