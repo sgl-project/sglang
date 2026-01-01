@@ -153,12 +153,18 @@ def _get_rank():
 def _obj_to_dict(obj):
     if isinstance(obj, dict):
         return obj
-    return {
-        k: v
-        for k in dir(obj)
-        if not (k.startswith("__") and k.endswith("__"))
-        and not callable(v := getattr(obj, k))
-    }
+    ret = {}
+    for k in dir(obj):
+        if k.startswith("__") and k.endswith("__"):
+            continue
+        try:
+            v = getattr(obj, k)
+            if not callable(v):
+                ret[k] = v
+        except Exception:
+            # Skip attributes that raise an exception on access
+            continue
+    return ret
 
 
 def get_truncated_value(value):
