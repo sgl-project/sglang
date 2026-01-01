@@ -7,7 +7,7 @@ use axum::response::Response;
 use tracing::error;
 
 use super::{
-    chat::ChatResponseProcessingStage,
+    chat::ChatResponseProcessingStage, classify::ClassifyResponseProcessingStage,
     embedding::response_processing::EmbeddingResponseProcessingStage,
     generate::GenerateResponseProcessingStage,
 };
@@ -25,6 +25,7 @@ pub struct ResponseProcessingStage {
     chat_stage: ChatResponseProcessingStage,
     generate_stage: GenerateResponseProcessingStage,
     embedding_stage: EmbeddingResponseProcessingStage,
+    classify_stage: ClassifyResponseProcessingStage,
 }
 
 impl ResponseProcessingStage {
@@ -39,6 +40,7 @@ impl ResponseProcessingStage {
             ),
             generate_stage: GenerateResponseProcessingStage::new(processor, streaming_processor),
             embedding_stage: EmbeddingResponseProcessingStage::new(),
+            classify_stage: ClassifyResponseProcessingStage::new(),
         }
     }
 }
@@ -50,6 +52,7 @@ impl PipelineStage for ResponseProcessingStage {
             RequestType::Chat(_) => self.chat_stage.execute(ctx).await,
             RequestType::Generate(_) => self.generate_stage.execute(ctx).await,
             RequestType::Embedding(_) => self.embedding_stage.execute(ctx).await,
+            RequestType::Classify(_) => self.classify_stage.execute(ctx).await,
             RequestType::Responses(_) => {
                 error!(
                     function = "ResponseProcessingStage::execute",

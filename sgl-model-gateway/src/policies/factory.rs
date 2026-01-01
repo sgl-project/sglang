@@ -3,8 +3,9 @@
 use std::sync::Arc;
 
 use super::{
-    BucketConfig, BucketPolicy, CacheAwareConfig, CacheAwarePolicy, LoadBalancingPolicy,
-    ManualPolicy, PowerOfTwoPolicy, RandomPolicy, RoundRobinPolicy,
+    BucketConfig, BucketPolicy, CacheAwareConfig, CacheAwarePolicy, ConsistentHashingPolicy,
+    LoadBalancingPolicy, ManualPolicy, PowerOfTwoPolicy, PrefixHashConfig, PrefixHashPolicy,
+    RandomPolicy, RoundRobinPolicy,
 };
 use crate::config::PolicyConfig;
 
@@ -47,6 +48,17 @@ impl PolicyFactory {
                 Arc::new(BucketPolicy::with_config(config))
             }
             PolicyConfig::Manual => Arc::new(ManualPolicy::new()),
+            PolicyConfig::ConsistentHashing => Arc::new(ConsistentHashingPolicy::new()),
+            PolicyConfig::PrefixHash {
+                prefix_token_count,
+                load_factor,
+            } => {
+                let config = PrefixHashConfig {
+                    prefix_token_count: *prefix_token_count,
+                    load_factor: *load_factor,
+                };
+                Arc::new(PrefixHashPolicy::new(config))
+            }
         }
     }
 
@@ -59,6 +71,10 @@ impl PolicyFactory {
             "cache_aware" | "cacheaware" => Some(Arc::new(CacheAwarePolicy::new())),
             "bucket" => Some(Arc::new(BucketPolicy::new())),
             "manual" => Some(Arc::new(ManualPolicy::new())),
+            "consistent_hashing" | "consistenthashing" => {
+                Some(Arc::new(ConsistentHashingPolicy::new()))
+            }
+            "prefix_hash" | "prefixhash" => Some(Arc::new(PrefixHashPolicy::with_defaults())),
             _ => None,
         }
     }
@@ -99,6 +115,9 @@ mod tests {
 
         let policy = PolicyFactory::create_from_config(&PolicyConfig::Manual);
         assert_eq!(policy.name(), "manual");
+
+        let policy = PolicyFactory::create_from_config(&PolicyConfig::ConsistentHashing);
+        assert_eq!(policy.name(), "consistent_hashing");
     }
 
     #[tokio::test]
@@ -115,6 +134,8 @@ mod tests {
         assert!(PolicyFactory::create_by_name("Bucket").is_some());
         assert!(PolicyFactory::create_by_name("manual").is_some());
         assert!(PolicyFactory::create_by_name("Manual").is_some());
+        assert!(PolicyFactory::create_by_name("consistent_hashing").is_some());
+        assert!(PolicyFactory::create_by_name("ConsistentHashing").is_some());
         assert!(PolicyFactory::create_by_name("unknown").is_none());
     }
 }
