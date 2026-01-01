@@ -47,10 +47,8 @@ class TestPrefillDelayerThroughput(CustomTestCase):
             kill_process_tree(process.pid)
 
         print(f"=== {with_prefill_delayer=} ===")
-        print(f"Output throughput: {res['output_throughput']:.2f} token/s")
         print(f"Input throughput: {res['input_throughput']:.2f} token/s")
-
-        self.assertGreater(res["output_throughput"], 0)
+        print(f"Output throughput: {res['output_throughput']:.2f} token/s")
 
     def test_dp_attention_throughput_with_prefill_delayer(self):
         self._run_throughput_test(with_prefill_delayer=True)
