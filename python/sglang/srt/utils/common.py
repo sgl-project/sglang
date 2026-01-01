@@ -79,7 +79,6 @@ import requests
 import torch
 import torch.distributed
 import torch.distributed as dist
-import triton
 import zmq
 from fastapi.responses import ORJSONResponse
 from packaging import version as pkg_version
@@ -91,6 +90,7 @@ from torch.profiler import ProfilerActivity, profile, record_function
 from torch.utils._contextlib import _DecoratorContextManager
 from typing_extensions import Literal
 
+import triton
 from sglang.srt.environ import envs
 from sglang.srt.metrics.func_timer import enable_func_timer
 
@@ -1129,9 +1129,12 @@ def add_api_key_middleware(app, api_key: str):
             "/metrics"
         ):
             return await call_next(request)
-        if request.headers.get("Authorization") != "Bearer " + api_key:
-            return ORJSONResponse(content={"error": "Unauthorized"}, status_code=401)
-        return await call_next(request)
+        # Accept both OpenAI-style (Authorization: Bearer) and Anthropic-style (x-api-key) auth
+        auth_header = request.headers.get("Authorization")
+        x_api_key = request.headers.get("x-api-key")
+        if auth_header == "Bearer " + api_key or x_api_key == api_key:
+            return await call_next(request)
+        return ORJSONResponse(content={"error": "Unauthorized"}, status_code=401)
 
 
 def prepare_model_and_tokenizer(model_path: str, tokenizer_path: str):
