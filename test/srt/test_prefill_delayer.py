@@ -4,14 +4,11 @@ from sglang.bench_serving import run_benchmark
 from sglang.srt.environ import envs
 from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
-    DEFAULT_MLA_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     get_benchmark_args,
-    is_in_ci,
     popen_launch_server,
-    write_github_step_summary,
 )
 
 
@@ -49,7 +46,11 @@ class TestPrefillDelayerThroughput(CustomTestCase):
         finally:
             kill_process_tree(process.pid)
 
-        label = "With PrefillDelayer" if with_prefill_delayer else "Without PrefillDelayer (baseline)"
+        label = (
+            "With PrefillDelayer"
+            if with_prefill_delayer
+            else "Without PrefillDelayer (baseline)"
+        )
         print(f"=== {label} ===")
         print(f"Output throughput: {res['output_throughput']:.2f} token/s")
         print(f"Input throughput: {res['input_throughput']:.2f} token/s")

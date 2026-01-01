@@ -1883,7 +1883,9 @@ class Scheduler(
             and self.chunked_req is None
         ) or (
             self.prefill_delayer
-            and not self.prefill_delayer.should_allow_prefill(waiting_queue_len=len(self.waiting_queue))
+            and not self.prefill_delayer.should_allow_prefill(
+                waiting_queue_len=len(self.waiting_queue)
+            )
         ):
             return None
 
