@@ -339,9 +339,11 @@ class FlashAttentionBackend(AttentionBackend):
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
         self.skip_prefill = skip_prefill
 
-        self.use_sliding_window_kv_pool = isinstance(
-            model_runner.token_to_kv_pool, SWAKVPool
+        self.use_sliding_window_kv_pool = (
+            isinstance(model_runner.token_to_kv_pool, SWAKVPool)
+            and model_runner.token_to_kv_pool.swa_layer_nums > 0
         )
+
         if self.use_sliding_window_kv_pool:
             self.token_to_kv_pool = model_runner.token_to_kv_pool
 
@@ -648,7 +650,7 @@ class FlashAttentionBackend(AttentionBackend):
                 ),
             ]
 
-        if self.has_swa and self.use_sliding_window_kv_pool:
+        if self.use_sliding_window_kv_pool:
             metadata.swa_page_table = (
                 self.token_to_kv_pool.translate_loc_from_full_to_swa(
                     metadata.page_table
@@ -661,7 +663,7 @@ class FlashAttentionBackend(AttentionBackend):
                 0, metadata.page_table.shape[1], self.page_size, device=self.device
             )
 
-            if self.has_swa and self.use_sliding_window_kv_pool:
+            if self.use_sliding_window_kv_pool:
                 metadata.swa_page_table = (
                     metadata.swa_page_table[:, self.strided_indices] // self.page_size
                 )
@@ -815,7 +817,12 @@ class FlashAttentionBackend(AttentionBackend):
         else:
             page_table = metadata.page_table
             if is_swa_layer and self.use_sliding_window_kv_pool:
-                page_table = metadata.swa_page_table
+                if metadata.swa_page_table is not None:
+                    page_table = metadata.swa_page_table
+                else:
+                    page_table = self.token_to_kv_pool.translate_loc_from_full_to_swa(
+                        metadata.page_table
+                    )
             cu_seqlens_q = metadata.cu_seqlens_q
             cache_seqlens = metadata.cache_seqlens_int32
             max_seqlen_q = metadata.max_seq_len_q
@@ -1168,7 +1175,14 @@ class FlashAttentionBackend(AttentionBackend):
             else:
                 page_table = metadata.page_table
                 if is_swa_layer and self.use_sliding_window_kv_pool:
-                    page_table = metadata.swa_page_table
+                    if metadata.swa_page_table is not None:
+                        page_table = metadata.swa_page_table
+                    else:
+                        page_table = (
+                            self.token_to_kv_pool.translate_loc_from_full_to_swa(
+                                metadata.page_table
+                            )
+                        )
                 cache_seqlens = metadata.cache_seqlens_int32
                 cu_seqlens_k = metadata.cu_seqlens_k
                 max_seqlen_q = metadata.max_seq_len_q
@@ -1360,6 +1374,14 @@ class FlashAttentionBackend(AttentionBackend):
                     device=self.device,
                 ),
             }
+
+        if self.use_sliding_window_kv_pool:
+            self.decode_cuda_graph_metadata["swa_page_table"] = torch.zeros(
+                max_bs,
+                max_num_pages,
+                dtype=torch.int32,
+                device=self.device,
+            )
 
         # This is used by draft decode's first half of metadata when topk > 1
         if self.topk > 1:
@@ -1660,6 +1682,10 @@ class FlashAttentionBackend(AttentionBackend):
                 metadata.page_table = self.decode_cuda_graph_metadata["page_table"][
                     :bs, :
                 ]
+                if self.use_sliding_window_kv_pool:
+                    metadata.swa_page_table = self.decode_cuda_graph_metadata[
+                        "swa_page_table"
+                    ][:bs, :]
                 # Precompute cumulative sequence lengths
                 metadata.cu_seqlens_q = torch.arange(
                     0, batch_size + 1, dtype=torch.int32, device=device
@@ -1911,6 +1937,12 @@ class FlashAttentionBackend(AttentionBackend):
                     seq_lens,
                     0,
                     self.page_size,
+                    (
+                        self.decode_cuda_graph_metadata["swa_page_table"]
+                        if self.use_sliding_window_kv_pool
+                        else None
+                    ),
+                    self.token_to_kv_pool if self.use_sliding_window_kv_pool else None,
                 )
 
                 self._update_local_attn_metadata_for_replay(
@@ -2545,6 +2577,8 @@ def normal_decode_set_metadata(
     seq_lens: torch.Tensor,
     seq_len_delta: int,
     page_size: int,
+    swa_page_table: Optional[torch.Tensor] = None,
+    token_to_kv_pool: Optional[SWAKVPool] = None,
 ):
     cache_seqlens_int32.copy_(seq_lens + seq_len_delta)
     cu_seqlens_k[1:].copy_(torch.cumsum(cache_seqlens_int32, dim=0, dtype=torch.int32))
@@ -2553,6 +2587,10 @@ def normal_decode_set_metadata(
         strided_indices[:max_seq_pages][None, :],
     ]
     page_table[:, :max_seq_pages].copy_(page_indices // page_size)
+
+    if swa_page_table is not None and token_to_kv_pool is not None:
+        swa_page_indices = token_to_kv_pool.translate_loc_from_full_to_swa(page_indices)
+        swa_page_table[:, :max_seq_pages].copy_(swa_page_indices // page_size)
 
 
 @torch.compile(dynamic=True, backend=get_compiler_backend())
