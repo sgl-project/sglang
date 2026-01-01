@@ -17,11 +17,13 @@ use std::{
     hash::{BuildHasherDefault, Hasher},
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc, RwLock,
+        Arc,
     },
 };
 
 use dashmap::DashMap;
+use once_cell::sync::Lazy;
+use parking_lot::RwLock as ParkingLotRwLock;
 use tracing::debug;
 
 use super::{
@@ -44,8 +46,10 @@ pub type TokenPageKey = [TokenId; PAGE_SIZE];
 type NodeRef = Arc<Node>;
 
 /// Shard counts for DashMaps to balance concurrency vs allocation overhead.
+/// Root node has more shards due to higher contention.
 const ROOT_SHARD_COUNT: usize = 32;
-const NODE_SHARD_COUNT: usize = 8;
+/// Child nodes typically have few entries, minimize shard overhead.
+const NODE_SHARD_COUNT: usize = 4;
 
 /// Align token count to page boundary (truncate to nearest page).
 /// Matches SGLang's: `page_aligned_len = len(key) // page_size * page_size`
@@ -130,9 +134,22 @@ impl MatchResult for PrefixMatchResult {
     }
 }
 
-/// Intern tenant ID to avoid repeated allocations
+/// Global tenant string intern pool to avoid repeated allocations.
+/// Uses DashMap for concurrent access with minimal contention.
+static TENANT_INTERN_POOL: Lazy<DashMap<Arc<str>, ()>> = Lazy::new(DashMap::new);
+
+/// Intern tenant ID to avoid repeated allocations.
+/// Returns cached Arc<str> if tenant was seen before.
 fn intern_tenant(tenant: &str) -> TenantId {
-    Arc::from(tenant)
+    // Fast path: check if already interned
+    if let Some(entry) = TENANT_INTERN_POOL.get(tenant) {
+        return Arc::clone(entry.key());
+    }
+
+    // Slow path: intern new tenant
+    let interned: Arc<str> = Arc::from(tenant);
+    TENANT_INTERN_POOL.insert(Arc::clone(&interned), ());
+    interned
 }
 
 /// Global timestamp counter for LRU ordering
@@ -142,50 +159,51 @@ fn next_timestamp() -> u64 {
     GLOBAL_TIMESTAMP.fetch_add(1, Ordering::Relaxed)
 }
 
-/// Node in the token-based radix tree
+/// Node in the token-based radix tree.
+/// Uses parking_lot RwLock for better performance (no poisoning, smaller size).
 struct Node {
     /// Token sequence stored at this node (always page-aligned length, multiple of PAGE_SIZE)
-    tokens: RwLock<Vec<TokenId>>,
+    tokens: ParkingLotRwLock<Vec<TokenId>>,
     /// Children nodes keyed by first PAGE_SIZE tokens (page key)
     children: DashMap<TokenPageKey, NodeRef, TokenPageHasherBuilder>,
     /// Tenants that own this node with last access timestamps
     tenant_last_access_time: DashMap<TenantId, u64>,
     /// Cached last tenant for fast access (probabilistic update)
-    last_tenant: RwLock<Option<TenantId>>,
+    last_tenant: ParkingLotRwLock<Option<TenantId>>,
 }
 
 impl Node {
     fn new(tokens: Vec<TokenId>) -> Self {
         Self {
-            tokens: RwLock::new(tokens),
+            tokens: ParkingLotRwLock::new(tokens),
             children: new_children_map(),
             tenant_last_access_time: new_tenant_map(),
-            last_tenant: RwLock::new(None),
+            last_tenant: ParkingLotRwLock::new(None),
         }
     }
 
     fn new_root() -> Self {
         Self {
-            tokens: RwLock::new(Vec::new()),
+            tokens: ParkingLotRwLock::new(Vec::new()),
             children: DashMap::with_hasher_and_shard_amount(
                 TokenPageHasherBuilder::default(),
                 ROOT_SHARD_COUNT,
             ),
             tenant_last_access_time: DashMap::with_shard_amount(ROOT_SHARD_COUNT),
-            last_tenant: RwLock::new(None),
+            last_tenant: ParkingLotRwLock::new(None),
         }
     }
 
     /// Get any tenant that owns this node (for match results)
     fn get_any_tenant(&self) -> Option<TenantId> {
-        // Fast path: check cached tenant
-        if let Ok(guard) = self.last_tenant.read() {
-            if let Some(ref tenant) = *guard {
-                if self.tenant_last_access_time.contains_key(tenant) {
-                    return Some(Arc::clone(tenant));
-                }
+        // Fast path: check cached tenant (parking_lot has no poisoning)
+        let guard = self.last_tenant.read();
+        if let Some(ref tenant) = *guard {
+            if self.tenant_last_access_time.contains_key(tenant) {
+                return Some(Arc::clone(tenant));
             }
         }
+        drop(guard);
 
         // Slow path: iterate to find any tenant
         self.tenant_last_access_time
@@ -204,7 +222,7 @@ impl Node {
 
         // Probabilistic cache update (1/16 chance) to reduce write contention
         if ts & 0xF == 0 {
-            if let Ok(mut guard) = self.last_tenant.try_write() {
+            if let Some(mut guard) = self.last_tenant.try_write() {
                 *guard = Some(Arc::clone(tenant));
             }
         }
@@ -282,7 +300,7 @@ impl TokenTree {
                 }
                 dashmap::mapref::entry::Entry::Occupied(mut entry) => {
                     let child = Arc::clone(entry.get());
-                    let child_tokens = child.tokens.read().unwrap();
+                    let child_tokens = child.tokens.read();
                     let child_len = child_tokens.len();
 
                     // Find common prefix length (page-aligned)
@@ -316,19 +334,17 @@ impl TokenTree {
                         drop(child_tokens);
 
                         // Modify original child to hold only suffix tokens
-                        let mut child_tokens_write = child.tokens.write().unwrap();
+                        let mut child_tokens_write = child.tokens.write();
                         let suffix_tokens: Vec<TokenId> = child_tokens_write[common_len..].to_vec();
                         *child_tokens_write = suffix_tokens;
                         drop(child_tokens_write);
 
                         // Create intermediate node with prefix - clone tenant map (O(1))
                         let intermediate_node = Arc::new(Node {
-                            tokens: RwLock::new(prefix_tokens),
+                            tokens: ParkingLotRwLock::new(prefix_tokens),
                             children: new_children_map(),
                             tenant_last_access_time: child.tenant_last_access_time.clone(),
-                            last_tenant: RwLock::new(
-                                child.last_tenant.read().ok().and_then(|g| g.clone()),
-                            ),
+                            last_tenant: ParkingLotRwLock::new(child.last_tenant.read().clone()),
                         });
 
                         // Add original child (now suffix) as child of intermediate
@@ -350,19 +366,17 @@ impl TokenTree {
                         drop(child_tokens);
 
                         // Modify original child to hold only its suffix tokens
-                        let mut child_tokens_write = child.tokens.write().unwrap();
+                        let mut child_tokens_write = child.tokens.write();
                         let child_suffix: Vec<TokenId> = child_tokens_write[common_len..].to_vec();
                         *child_tokens_write = child_suffix;
                         drop(child_tokens_write);
 
                         // Create intermediate node with common prefix - clone tenant map (O(1))
                         let intermediate_node = Arc::new(Node {
-                            tokens: RwLock::new(prefix_tokens),
+                            tokens: ParkingLotRwLock::new(prefix_tokens),
                             children: new_children_map(),
                             tenant_last_access_time: child.tenant_last_access_time.clone(),
-                            last_tenant: RwLock::new(
-                                child.last_tenant.read().ok().and_then(|g| g.clone()),
-                            ),
+                            last_tenant: ParkingLotRwLock::new(child.last_tenant.read().clone()),
                         });
 
                         // Add original child (now suffix) as child of intermediate
@@ -460,7 +474,7 @@ impl TokenTree {
                     let child = Arc::clone(child_ref.value());
                     drop(child_ref);
 
-                    let child_tokens = child.tokens.read().unwrap();
+                    let child_tokens = child.tokens.read();
 
                     // Count matching tokens
                     let match_len = remaining
@@ -565,7 +579,7 @@ impl TokenTree {
                 break;
             }
 
-            let node_tokens = node.tokens.read().unwrap().len();
+            let node_tokens = node.tokens.read().len();
             if self.remove_tenant_from_node(&node, tenant) {
                 evicted += node_tokens;
             }
@@ -700,7 +714,7 @@ mod tests {
 
         // Should have no entries (too short)
         let counts = tree.get_tenant_token_counts();
-        assert!(counts.is_empty() || counts.get("tenant1").map(|c| *c).unwrap_or(0) == 0);
+        assert!(counts.is_empty() || counts.get("tenant1").copied().unwrap_or(0) == 0);
 
         // Lookup also returns 0 for short sequences
         let result = tree.match_prefix_with_counts(&[1, 2, 3, 4, 5]);
@@ -785,7 +799,7 @@ mod tests {
 
         // After eviction, counts should be reduced
         let new_counts = tree.get_tenant_token_counts();
-        let new_count = new_counts.get("tenant1").map(|c| *c).unwrap_or(0);
+        let new_count = new_counts.get("tenant1").copied().unwrap_or(0);
         assert!(new_count < *counts.get("tenant1").unwrap());
     }
 
