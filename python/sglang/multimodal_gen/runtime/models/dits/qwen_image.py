@@ -135,7 +135,8 @@ class QwenEmbedRope(nn.Module):
                 1.0
                 / torch.pow(
                     theta,
-                    torch.arange(0, dim, 2, device=device).to(torch.float32).div(dim),
+                    torch.arange(0, dim, 2, device=device).to(
+                        torch.float32).div(dim),
                 )
             ).to(device=device),
         )
@@ -204,7 +205,7 @@ class QwenEmbedRope(nn.Module):
                 max_vid_index = max(height, width, max_vid_index)
 
         max_len = max(txt_seq_lens)
-        txt_freqs = self.pos_freqs[max_vid_index : max_vid_index + max_len, ...]
+        txt_freqs = self.pos_freqs[max_vid_index: max_vid_index + max_len, ...]
         vid_freqs = torch.cat(vid_freqs, dim=0).to(device=device)
         return vid_freqs, txt_freqs
 
@@ -213,24 +214,28 @@ class QwenEmbedRope(nn.Module):
         self, frame: int, height: int, width: int, idx: int = 0
     ) -> torch.Tensor:
         seq_lens = frame * height * width
-        freqs_pos = self.pos_freqs.split([x // 2 for x in self.axes_dim], dim=1)
-        freqs_neg = self.neg_freqs.split([x // 2 for x in self.axes_dim], dim=1)
+        freqs_pos = self.pos_freqs.split(
+            [x // 2 for x in self.axes_dim], dim=1)
+        freqs_neg = self.neg_freqs.split(
+            [x // 2 for x in self.axes_dim], dim=1)
 
         freqs_frame = (
-            freqs_pos[0][idx : idx + frame]
+            freqs_pos[0][idx: idx + frame]
             .view(frame, 1, 1, -1)
             .expand(frame, height, width, -1)
         )
         if self.scale_rope:
             freqs_height = torch.cat(
-                [freqs_neg[1][-(height - height // 2) :], freqs_pos[1][: height // 2]],
+                [freqs_neg[1][-(height - height // 2):],
+                 freqs_pos[1][: height // 2]],
                 dim=0,
             )
             freqs_height = freqs_height.view(1, height, 1, -1).expand(
                 frame, height, width, -1
             )
             freqs_width = torch.cat(
-                [freqs_neg[2][-(width - width // 2) :], freqs_pos[2][: width // 2]],
+                [freqs_neg[2][-(width - width // 2):],
+                 freqs_pos[2][: width // 2]],
                 dim=0,
             )
             freqs_width = freqs_width.view(1, 1, width, -1).expand(
@@ -293,7 +298,8 @@ class QwenEmbedLayer3DRope(nn.Module):
                 1.0
                 / torch.pow(
                     theta,
-                    torch.arange(0, dim, 2, device=device).to(torch.float32).div(dim),
+                    torch.arange(0, dim, 2, device=device).to(
+                        torch.float32).div(dim),
                 )
             ).to(device=device),
         )
@@ -344,10 +350,12 @@ class QwenEmbedLayer3DRope(nn.Module):
         for idx, fhw in enumerate(video_fhw):
             frame, height, width = fhw
             if idx != layer_num:
-                video_freq = self._compute_video_freqs(frame, height, width, idx)
+                video_freq = self._compute_video_freqs(
+                    frame, height, width, idx)
             else:
-                ### For the condition image, we set the layer index to -1
-                video_freq = self._compute_condition_freqs(frame, height, width)
+                # For the condition image, we set the layer index to -1
+                video_freq = self._compute_condition_freqs(
+                    frame, height, width)
             video_freq = video_freq.to(device)
             vid_freqs.append(video_freq)
 
@@ -358,7 +366,7 @@ class QwenEmbedLayer3DRope(nn.Module):
 
         max_vid_index = max(max_vid_index, layer_num)
         max_len = max(txt_seq_lens)
-        txt_freqs = self.pos_freqs[max_vid_index : max_vid_index + max_len, ...]
+        txt_freqs = self.pos_freqs[max_vid_index: max_vid_index + max_len, ...]
         vid_freqs = torch.cat(vid_freqs, dim=0)
 
         return vid_freqs, txt_freqs
@@ -366,24 +374,28 @@ class QwenEmbedLayer3DRope(nn.Module):
     @functools.lru_cache(maxsize=None)
     def _compute_video_freqs(self, frame, height, width, idx=0):
         seq_lens = frame * height * width
-        freqs_pos = self.pos_freqs.split([x // 2 for x in self.axes_dim], dim=1)
-        freqs_neg = self.neg_freqs.split([x // 2 for x in self.axes_dim], dim=1)
+        freqs_pos = self.pos_freqs.split(
+            [x // 2 for x in self.axes_dim], dim=1)
+        freqs_neg = self.neg_freqs.split(
+            [x // 2 for x in self.axes_dim], dim=1)
 
         freqs_frame = (
-            freqs_pos[0][idx : idx + frame]
+            freqs_pos[0][idx: idx + frame]
             .view(frame, 1, 1, -1)
             .expand(frame, height, width, -1)
         )
         if self.scale_rope:
             freqs_height = torch.cat(
-                [freqs_neg[1][-(height - height // 2) :], freqs_pos[1][: height // 2]],
+                [freqs_neg[1][-(height - height // 2):],
+                 freqs_pos[1][: height // 2]],
                 dim=0,
             )
             freqs_height = freqs_height.view(1, height, 1, -1).expand(
                 frame, height, width, -1
             )
             freqs_width = torch.cat(
-                [freqs_neg[2][-(width - width // 2) :], freqs_pos[2][: width // 2]],
+                [freqs_neg[2][-(width - width // 2):],
+                 freqs_pos[2][: width // 2]],
                 dim=0,
             )
             freqs_width = freqs_width.view(1, 1, width, -1).expand(
@@ -409,22 +421,27 @@ class QwenEmbedLayer3DRope(nn.Module):
     @functools.lru_cache(maxsize=None)
     def _compute_condition_freqs(self, frame, height, width):
         seq_lens = frame * height * width
-        freqs_pos = self.pos_freqs.split([x // 2 for x in self.axes_dim], dim=1)
-        freqs_neg = self.neg_freqs.split([x // 2 for x in self.axes_dim], dim=1)
+        freqs_pos = self.pos_freqs.split(
+            [x // 2 for x in self.axes_dim], dim=1)
+        freqs_neg = self.neg_freqs.split(
+            [x // 2 for x in self.axes_dim], dim=1)
 
         freqs_frame = (
-            freqs_neg[0][-1:].view(frame, 1, 1, -1).expand(frame, height, width, -1)
+            freqs_neg[0][-1:].view(frame, 1, 1, -
+                                   1).expand(frame, height, width, -1)
         )
         if self.scale_rope:
             freqs_height = torch.cat(
-                [freqs_neg[1][-(height - height // 2) :], freqs_pos[1][: height // 2]],
+                [freqs_neg[1][-(height - height // 2):],
+                 freqs_pos[1][: height // 2]],
                 dim=0,
             )
             freqs_height = freqs_height.view(1, height, 1, -1).expand(
                 frame, height, width, -1
             )
             freqs_width = torch.cat(
-                [freqs_neg[2][-(width - width // 2) :], freqs_pos[2][: width // 2]],
+                [freqs_neg[2][-(width - width // 2):],
+                 freqs_pos[2][: width // 2]],
                 dim=0,
             )
             freqs_width = freqs_width.view(1, 1, width, -1).expand(
@@ -483,8 +500,10 @@ class QwenImageCrossAttention(nn.Module):
         self.to_v = ReplicatedLinear(dim, self.inner_dim, bias=True)
 
         if self.qk_norm:
-            self.norm_q = RMSNorm(head_dim, eps=eps) if qk_norm else nn.Identity()
-            self.norm_k = RMSNorm(head_dim, eps=eps) if qk_norm else nn.Identity()
+            self.norm_q = RMSNorm(
+                head_dim, eps=eps) if qk_norm else nn.Identity()
+            self.norm_k = RMSNorm(
+                head_dim, eps=eps) if qk_norm else nn.Identity()
 
         if added_kv_proj_dim is not None:
             self.add_q_proj = ReplicatedLinear(
@@ -498,7 +517,8 @@ class QwenImageCrossAttention(nn.Module):
             )
 
         if context_pre_only is not None and not context_pre_only:
-            self.to_add_out = ReplicatedLinear(self.inner_dim, self.dim, bias=out_bias)
+            self.to_add_out = ReplicatedLinear(
+                self.inner_dim, self.dim, bias=out_bias)
         else:
             self.to_add_out = None
 
@@ -576,7 +596,8 @@ class QwenImageCrossAttention(nn.Module):
                 isinstance(image_rotary_emb[0], torch.Tensor)
                 and image_rotary_emb[0].dim() == 2
             ):
-                raise RuntimeError("image_rotary_emb must be cos_sin_cache tensors")
+                raise RuntimeError(
+                    "image_rotary_emb must be cos_sin_cache tensors")
 
             img_cache, txt_cache = image_rotary_emb
 
@@ -676,13 +697,13 @@ class QwenImageTransformerBlock(nn.Module):
             actual_batch = x.shape[0]
             shift0, shift1 = (
                 shift[:actual_batch],
-                shift[actual_batch : 2 * actual_batch],
+                shift[actual_batch: 2 * actual_batch],
             )
             scale0, scale1 = (
                 scale[:actual_batch],
-                scale[actual_batch : 2 * actual_batch],
+                scale[actual_batch: 2 * actual_batch],
             )
-            gate0, gate1 = gate[:actual_batch], gate[actual_batch : 2 * actual_batch]
+            gate0, gate1 = gate[:actual_batch], gate[actual_batch: 2 * actual_batch]
 
             if x.is_cuda:
                 if not x.is_contiguous():
@@ -708,7 +729,8 @@ class QwenImageTransformerBlock(nn.Module):
                 scale_result = torch.where(
                     mask, scale0.unsqueeze(1), scale1.unsqueeze(1)
                 )
-                gate_result = torch.where(mask, gate0.unsqueeze(1), gate1.unsqueeze(1))
+                gate_result = torch.where(
+                    mask, gate0.unsqueeze(1), gate1.unsqueeze(1))
                 return (
                     fuse_scale_shift_kernel(x, scale_result, shift_result),
                     gate_result,
@@ -742,7 +764,8 @@ class QwenImageTransformerBlock(nn.Module):
 
         img_normed = self.img_norm1(hidden_states)
 
-        img_modulated, img_gate1 = self._modulate(img_normed, img_mod1, modulate_index)
+        img_modulated, img_gate1 = self._modulate(
+            img_normed, img_mod1, modulate_index)
         # Process text stream - norm1 + modulation
         txt_normed = self.txt_norm1(encoder_hidden_states)
         txt_modulated, txt_gate1 = self._modulate(txt_normed, txt_mod1)
@@ -755,8 +778,10 @@ class QwenImageTransformerBlock(nn.Module):
         # 4. Splits results back to separate streams
         joint_attention_kwargs = joint_attention_kwargs or {}
         attn_output = self.attn(
-            hidden_states=img_modulated,  # Image stream (will be processed as "sample")
-            encoder_hidden_states=txt_modulated,  # Text stream (will be processed as "context")
+            # Image stream (will be processed as "sample")
+            hidden_states=img_modulated,
+            # Text stream (will be processed as "context")
+            encoder_hidden_states=txt_modulated,
             encoder_hidden_states_mask=encoder_hidden_states_mask,
             image_rotary_emb=image_rotary_emb,
             **joint_attention_kwargs,
@@ -776,13 +801,14 @@ class QwenImageTransformerBlock(nn.Module):
             img_normed2, img_mod2, modulate_index
         )
         img_mlp_output = self.img_mlp(img_modulated2)
-        hidden_states = hidden_states + img_gate2 * img_mlp_output
+        hidden_states = fuse_scale_shift_kernel(img_gate2, img_mlp_output, hidden_states, scale_constant=0.0)
 
         # Process text stream - norm2 + MLP
         txt_normed2 = self.txt_norm2(encoder_hidden_states)
         txt_modulated2, txt_gate2 = self._modulate(txt_normed2, txt_mod2)
         txt_mlp_output = self.txt_mlp(txt_modulated2)
-        encoder_hidden_states = encoder_hidden_states + txt_gate2 * txt_mlp_output
+        encoder_hidden_states = fuse_scale_shift_kernel(
+            txt_gate2, txt_mlp_output, encoder_hidden_states, scale_constant=0.0)
 
         # Clip to prevent overflow for fp16
         if encoder_hidden_states.dtype == torch.float16:
@@ -950,7 +976,8 @@ class QwenImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
         if self.zero_cond_t:
             timestep = torch.cat([timestep, self.timestep_zero], dim=0)
             device = timestep.device
-            modulate_index = self.build_modulate_index(to_hashable(img_shapes), device)
+            modulate_index = self.build_modulate_index(
+                to_hashable(img_shapes), device)
         else:
             modulate_index = None
 
