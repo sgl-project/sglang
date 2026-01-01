@@ -11,7 +11,6 @@ from typing import List, Optional
 import torch
 import torch.distributed as dist
 
-
 # -------------------------------------- dumper core ------------------------------------------
 
 
@@ -192,6 +191,7 @@ def _obj_to_dict(obj):
 
 # -------------------------------------- http control server ------------------------------------------
 
+
 def _start_maybe_http_server(dumper):
     http_port = int(os.environ.get("SGLANG_DUMPER_SERVER_PORT", "40000"))
     zmq_base_port = int(os.environ.get("SGLANG_DUMPER_ZMQ_BASE_PORT", "16800"))
@@ -298,14 +298,18 @@ class _ZmqRpcHandle:
 
     def __getattr__(self, method_name: str):
         def call(*args, **kwargs):
-            self._socket.send_pyobj({
-                "method": method_name,
-                "args": args,
-                "kwargs": kwargs,
-            })
+            self._socket.send_pyobj(
+                {
+                    "method": method_name,
+                    "args": args,
+                    "kwargs": kwargs,
+                }
+            )
             response = self._socket.recv_pyobj()
             if response["error"]:
-                raise RuntimeError(f"RPC error on {self._debug_name}: {response['error']}")
+                raise RuntimeError(
+                    f"RPC error on {self._debug_name}: {response['error']}"
+                )
             return response["result"]
 
         return call
