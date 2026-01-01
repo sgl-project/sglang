@@ -1196,7 +1196,7 @@ class SGLangFailuresAnalyzer:
                 if test_failures.get("_no_test_summary"):
                     lines.append("<details>")
                     lines.append(
-                        f"<summary>🔬 Test failures for `{job_name}` (no test summary available)</summary>"
+                        f"<summary>🔬 Test failures for <code>{job_name}</code> (no test summary available)</summary>"
                     )
                     lines.append("")
                     lines.append(
@@ -1223,7 +1223,7 @@ class SGLangFailuresAnalyzer:
 
                 lines.append("<details>")
                 lines.append(
-                    f"<summary>🔬 Test failures for `{job_name}` ({len(sorted_tests)} tests)</summary>"
+                    f"<summary>🔬 Test failures for <code>{job_name}</code> ({len(sorted_tests)} tests)</summary>"
                 )
                 lines.append("")
                 lines.append(
