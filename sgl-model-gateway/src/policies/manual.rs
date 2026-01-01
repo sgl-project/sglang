@@ -171,16 +171,12 @@ impl ManualPolicy {
     ) -> (usize, ExecutionBranch) {
         let routing_id = RoutingId::new(routing_id);
 
-        // Fast path: read-only check first (shared lock)
+        // Fast path: read-only check (shared lock, no last_access update)
+        // Entries that hit fast path are actively used and won't be evicted anyway
         if let Some(info) = self.routing_map.get(&routing_id) {
             if let Some(idx) =
                 find_healthy_worker(&info.candi_worker_urls, workers, healthy_indices)
             {
-                drop(info); // Release read lock before acquiring write lock
-                // Update last_access with write lock
-                if let Some(mut info) = self.routing_map.get_mut(&routing_id) {
-                    info.last_access = Instant::now();
-                }
                 return (idx, ExecutionBranch::FastPathHit);
             }
         }
@@ -696,7 +692,7 @@ mod tests {
     }
 
     #[test]
-    fn test_manual_last_access_updates_on_access() {
+    fn test_manual_last_access_updates_on_slow_path() {
         let config = ManualConfig {
             eviction_interval_secs: 0,
             max_entries: 10000,
@@ -710,20 +706,29 @@ mod tests {
             ..Default::default()
         };
 
-        policy.select_worker_impl(&workers, &info);
+        // First access creates entry (slow path - vacant)
+        let (first_result, branch) = policy.select_worker_impl(&workers, &info);
+        assert_eq!(branch, ExecutionBranch::SlowPathVacant);
+        let first_idx = first_result.unwrap();
 
         let routing_id = RoutingId::new("test-key");
         let node = policy.routing_map.get(&routing_id).unwrap();
         let first_access = node.last_access;
+        drop(node);
 
         std::thread::sleep(std::time::Duration::from_millis(10));
 
-        policy.select_worker_impl(&workers, &info);
+        // Make the assigned worker unhealthy to force slow path
+        workers[first_idx].set_healthy(false);
+
+        // This should trigger slow path (occupied miss) and update last_access
+        let (_, branch) = policy.select_worker_impl(&workers, &info);
+        assert_eq!(branch, ExecutionBranch::SlowPathOccupiedMiss);
 
         let node = policy.routing_map.get(&routing_id).unwrap();
         assert!(
             node.last_access > first_access,
-            "last_access should be updated on subsequent access"
+            "last_access should be updated on slow path"
         );
     }
 
