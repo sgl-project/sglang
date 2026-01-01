@@ -1,5 +1,7 @@
 import torch
 
+from sglang.srt.environ import envs
+
 
 class PrefillDelayer:
     def __init__(
@@ -14,9 +16,8 @@ class PrefillDelayer:
         )
         self.cpu_group = tp_worker.get_tp_group().cpu_group
         self.max_running_requests = max_running_requests
-        self.stable_count = 0
-        # If scheduling is performed 30 times and some dp units are still at full load, the prefill-prioritized scheduling strategy will still be used.
-        self.max_stable_count = 30
+        self.delayed_count = 0
+        self.max_delay_passes = envs.SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES.get()
         assert (
             server_args.schedule_policy == "fcfs"
         ), f"To use SCHEDULER_DECREASE_PREFILL_IDLE, schedule_policy must be 'fcfs'. '{server_args.schedule_policy}' is not supported."
@@ -54,8 +55,9 @@ class PrefillDelayer:
             return True
 
         if min_queue_len == 0 and max_queue_len > 0:
-            self.stable_count += 1
-            if self.stable_count < self.max_stable_count:
+            self.delayed_count += 1
+            if self.delayed_count < self.max_delay_passes:
                 return False
-        self.stable_count = 0
+
+        self.delayed_count = 0
         return True
