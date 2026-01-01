@@ -25,6 +25,7 @@ from typing import Any, Dict, List, Optional, Type, Union
 import torch
 from huggingface_hub import snapshot_download
 
+from sglang.srt.configs.kimi_k2_vl import K2VLConfig
 from sglang.srt.utils import get_bool_env_var
 
 # Conditional import based on SGLANG_USE_MODELSCOPE environment variable
@@ -93,6 +94,7 @@ _CONFIG_REGISTRY: List[Type[PretrainedConfig]] = [
     DeepseekVLV2Config,
     JetNemotronConfig,
     JetVLMConfig,
+    K2VLConfig,
 ]
 
 _CONFIG_REGISTRY = {
