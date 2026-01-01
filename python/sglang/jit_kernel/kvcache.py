@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING
 
 import torch
@@ -24,6 +25,25 @@ def _jit_kvcache_module(element_bytes: int) -> Module:
         cuda_files=["elementwise/kvcache.cuh"],
         cuda_wrappers=[("store_cache", f"StoreKVCacheKernel<{args}>::run")],
     )
+
+
+@cache_once
+def can_use_store_cache(size: int) -> bool:
+    logger = logging.getLogger(__name__)
+    if size % 4 != 0:
+        logger.warning(
+            f"Unsupported element_bytes={size} for JIT KV-Cache kernel:"
+            " must be multiple of 4"
+        )
+        return False
+    try:
+        _jit_kvcache_module(size)
+        return True
+    except Exception as e:
+        logger.warning(
+            f"Failed to load JIT KV-Cache kernel " f"with element_bytes={size}: {e}"
+        )
+        return False
 
 
 def store_cache(
