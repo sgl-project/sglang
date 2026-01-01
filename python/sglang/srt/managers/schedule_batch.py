@@ -92,6 +92,7 @@ from sglang.srt.utils.cuda_ipc_transport_utils import CudaIpcTensorTransportProx
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
+    from sglang.srt.managers.utils import GenerationBatchResult
     from sglang.srt.speculative.eagle_info import EagleDraftInput
     from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
 
@@ -1260,8 +1261,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     spec_info: Optional[SpecInput] = None
 
     # Pending accept info from last batch for overlapped grammar processing
-    # list of (request, accepted_token_ids)
-    pending_accept_info: Optional[List[Tuple[Req, List[int]]]] = None
+    # Tuple of (last_batch, last_result)
+    pending_accept_info: Optional[Tuple[ScheduleBatch, GenerationBatchResult]] = None
 
     # Whether to return hidden states
     return_hidden_states: bool = False
@@ -2278,8 +2279,8 @@ class ModelWorkerBatch:
     reqs: Optional[List[Req]] = None
     has_grammar: bool = False
     # Pending accept info from last batch for overlapped grammar processing
-    # Format: List[Tuple[Req, List[int]]] - list of (request, accepted_token_ids)
-    pending_accept_info: Optional[List] = None
+    # Tuple of (last_batch, last_result)
+    pending_accept_info: Optional[Tuple[ScheduleBatch, GenerationBatchResult]] = None
 
     # For hidden states before normal
     return_hidden_states_before_norm: bool = False
