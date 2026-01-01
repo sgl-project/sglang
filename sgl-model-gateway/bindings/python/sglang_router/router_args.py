@@ -33,7 +33,7 @@ class RouterArgs:
     cache_threshold: float = 0.3
     balance_abs_threshold: int = 64
     balance_rel_threshold: float = 1.5
-    eviction_interval_secs: int = 120
+    eviction_interval_secs: int = 60
     max_tree_size: int = 2**26
     max_idle_secs: int = 4 * 3600
     max_payload_size: int = 512 * 1024 * 1024  # 512MB default for large batches
