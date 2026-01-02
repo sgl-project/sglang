@@ -23,6 +23,8 @@ SUITES = {
         "test_server_a.py",
         "test_server_b.py",
         "test_lora_format_adapter.py",
+        # cli test
+        "../cli/test_generate_t2i_perf.py",
         # add new 1-gpu test files here
     ],
     "2-gpu": [
@@ -198,7 +200,12 @@ def run_pytest(files, filter_expr=None):
 
         is_flaky_ci_assertion = "SafetensorError" in full_output
 
-        if not (is_perf_assertion or is_flaky_ci_assertion):
+        is_oom_error = (
+            "out of memory" in full_output.lower()
+            or "oom killer" in full_output.lower()
+        )
+
+        if not (is_perf_assertion or is_flaky_ci_assertion or is_oom_error):
             return returncode
 
     logger.info(f"Max retry exceeded")
