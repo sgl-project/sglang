@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import functools
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union, overload
 
 import numpy as np
 import torch
@@ -20,6 +20,7 @@ from sglang.multimodal_gen.runtime.layers.attention import USPAttention
 from sglang.multimodal_gen.runtime.layers.layernorm import (
     LayerNormScaleShift,
     RMSNorm,
+    ScaleResidualLayerNormScaleShift,
     apply_layernorm_only,
     apply_qk_norm,
 )
@@ -653,7 +654,7 @@ class QwenImageTransformerBlock(nn.Module):
             context_pre_only=False,
             head_dim=attention_head_dim,
         )
-        self.img_norm2 = LayerNormScaleShift(
+        self.img_norm2 = ScaleResidualLayerNormScaleShift(
             hidden_size=dim, eps=eps, elementwise_affine=False
         )
         self.img_mlp = FeedForward(
@@ -671,14 +672,43 @@ class QwenImageTransformerBlock(nn.Module):
             hidden_size=dim, eps=eps, elementwise_affine=False
         )
         # Text doesn't need separate attention - it's handled by img_attn joint computation
-        self.txt_norm2 = LayerNormScaleShift(
+        self.txt_norm2 = ScaleResidualLayerNormScaleShift(
             hidden_size=dim, eps=eps, elementwise_affine=False
         )
         self.txt_mlp = FeedForward(
             dim=dim, dim_out=dim, activation_fn="gelu-approximate"
         )
 
-    def _modulate(self, x, mod_params, norm_module: LayerNormScaleShift, index=None):
+    @overload
+    def _modulate(
+        self,
+        x,
+        mod_params,
+        norm_module: LayerNormScaleShift,
+        gate_x=None,
+        residual_x=None,
+        index=None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]: ...
+
+    @overload
+    def _modulate(
+        self,
+        x,
+        mod_params,
+        norm_module: ScaleResidualLayerNormScaleShift,
+        gate_x=...,
+        residual_x=...,
+        index=None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]: ...
+
+    def _modulate(
+        self, x, mod_params, norm_module, index=None, gate_x=None, residual_x=None
+    ):
+        # Apply attention gates and add residual (like in Megatron)
+        #   - residual_out = gate_x * x + residual_x
+        # - x = norm(residual_out) * (1 + scale) + shift
+        is_scale_residual = gate_x is not None
+
         shift, scale, gate = mod_params.chunk(3, dim=-1)
         if index is not None:
             actual_batch = x.shape[0]
@@ -691,6 +721,9 @@ class QwenImageTransformerBlock(nn.Module):
                 scale[actual_batch : 2 * actual_batch],
             )
             gate0, gate1 = gate[:actual_batch], gate[actual_batch : 2 * actual_batch]
+            if is_scale_residual:
+                x = gate_x * x + residual_x
+                residual_out = x
 
             if x.is_cuda:
                 if not x.is_contiguous():
@@ -709,7 +742,10 @@ class QwenImageTransformerBlock(nn.Module):
                     gate1=gate1.contiguous(),
                     index=index,
                 )
-                return x, gate_result
+                if is_scale_residual:
+                    return x, residual_out, gate_result
+                else:
+                    return x, gate_result
             else:
                 mask = (index == 0).unsqueeze(-1)
                 shift_result = torch.where(
@@ -719,15 +755,35 @@ class QwenImageTransformerBlock(nn.Module):
                     mask, scale0.unsqueeze(1), scale1.unsqueeze(1)
                 )
                 gate_result = torch.where(mask, gate0.unsqueeze(1), gate1.unsqueeze(1))
-                return (
-                    norm_module(x, shift=shift_result, scale=scale_result),
-                    gate_result,
-                )
+                if is_scale_residual:
+                    return (
+                        norm_module(x, shift=shift_result, scale=scale_result),
+                        residual_out,
+                        gate_result,
+                    )
+                else:
+                    return (
+                        norm_module(x, shift=shift_result, scale=scale_result),
+                        gate_result,
+                    )
         else:
             shift_result = shift.unsqueeze(1)
             scale_result = scale.unsqueeze(1)
             gate_result = gate.unsqueeze(1)
-            return norm_module(x, shift=shift_result, scale=scale_result), gate_result
+            if is_scale_residual:
+                modulated, residual_out = norm_module(
+                    residual=residual_x,
+                    x=x,
+                    gate=gate_x,
+                    shift=shift_result,
+                    scale=scale_result,
+                )
+                return modulated, residual_out, gate_result
+            else:
+                return (
+                    norm_module(x=x, shift=shift_result, scale=scale_result),
+                    gate_result,
+                )
 
     def forward(
         self,
@@ -778,23 +834,26 @@ class QwenImageTransformerBlock(nn.Module):
 
         # QwenAttnProcessor2_0 returns (img_output, txt_output) when encoder_hidden_states is provided
         img_attn_output, txt_attn_output = attn_output
-
-        # Apply attention gates and add residual (like in Megatron)
-        hidden_states = hidden_states + img_gate1 * img_attn_output
-
-        encoder_hidden_states = encoder_hidden_states + txt_gate1 * txt_attn_output
-
         # Process image stream - norm2 + MLP
-        img_modulated2, img_gate2 = self._modulate(
-            hidden_states, img_mod2, self.img_norm2, modulate_index
+        img_modulated2, hidden_states, img_gate2 = self._modulate(
+            img_attn_output,
+            img_mod2,
+            self.img_norm2,
+            modulate_index,
+            gate_x=img_gate1,
+            residual_x=hidden_states,
         )
         img_mlp_output = self.img_mlp(img_modulated2)
         hidden_states = hidden_states + img_gate2 * img_mlp_output
 
         # Process text stream - norm2 + MLP
         txt_shift2, txt_scale2, txt_gate2_raw = txt_mod2.chunk(3, dim=-1)
-        txt_modulated2 = self.txt_norm2(
-            encoder_hidden_states, shift=txt_shift2, scale=txt_scale2
+        txt_modulated2, encoder_hidden_states = self.txt_norm2(
+            residual=encoder_hidden_states,
+            x=txt_attn_output,
+            gate=txt_gate1,
+            shift=txt_shift2,
+            scale=txt_scale2,
         )
         txt_gate2 = txt_gate2_raw.unsqueeze(1)
         txt_mlp_output = self.txt_mlp(txt_modulated2)
