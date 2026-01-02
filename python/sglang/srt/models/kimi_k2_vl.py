@@ -68,6 +68,7 @@ except ImportError:
     PytorchGELUTanh = GELUTanh
 from transformers import PretrainedConfig
 
+from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.managers.schedule_batch import (
     Modality,
     MultimodalDataItem,
@@ -77,6 +78,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_v2 import DeepseekV3ForCausalLM
 from sglang.srt.models.kimi_vl_moonvit import MLP2, VL_VISION_ATTENTION_FUNCTIONS
+from sglang.srt.utils import add_prefix
 
 logger = logging.getLogger(__name__)
 
@@ -89,7 +91,7 @@ def _apply_rope_input_validation(x, freqs_cis):
 
 
 def apply_rope(
-    xq: torch.Tensor, xk: torch.Tensor, freqs_cis: torch.Tensor
+    xq: torch.Tensor, xk: torch.Tensor, freqs_cis: torch.Tensor, x_shape=None
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Args: (The leading dimensions of all inputs should be the same)
@@ -185,6 +187,9 @@ class MoonViTEncoderLayer(nn.Module):
         activation=F.gelu,
         attn_bias: bool = False,
         use_deterministic_attn: bool = False,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+        use_data_parallel: bool = False,
     ):
         super().__init__()
         self.num_heads = num_heads
@@ -196,8 +201,22 @@ class MoonViTEncoderLayer(nn.Module):
         self.norm0 = nn.LayerNorm(hidden_dim)
         self.norm1 = nn.LayerNorm(hidden_dim)
         self.mlp = MLP2([hidden_dim, mlp_dim, hidden_dim], activation)
-        self.wqkv = nn.Linear(hidden_dim, hidden_dim * 3, bias=attn_bias)
-        self.wo = nn.Linear(hidden_dim, hidden_dim, bias=attn_bias)
+        # self.wqkv = nn.Linear(hidden_dim, hidden_dim * 3, bias=attn_bias)
+        # self.wo = nn.Linear(hidden_dim, hidden_dim, bias=attn_bias)
+
+        self.attn = VisionAttention(
+            embed_dim=hidden_dim,
+            num_heads=num_heads,
+            projection_size=hidden_dim,
+            use_qkv_parallel=True,
+            qkv_bias=attn_bias,
+            proj_bias=attn_bias,
+            flatten_batch=True,
+            quant_config=quant_config,
+            prefix=add_prefix("attn", prefix),
+            use_data_parallel=use_data_parallel,
+            customized_position_embedding_applier=apply_rope,
+        )
 
     def attention_qkvpacked(
         self,
@@ -249,8 +268,13 @@ class MoonViTEncoderLayer(nn.Module):
         residual = hidden_states
         hidden_states = self.norm0(hidden_states)
 
-        hidden_states = self.attention_qkvpacked(
-            hidden_states, cu_seqlens, max_seqlen, rope_freqs_cis
+        # hidden_states = self.attention_qkvpacked(
+        #     hidden_states, cu_seqlens, max_seqlen, rope_freqs_cis
+        # )
+        attn = self.attn(
+            hidden_states,
+            cu_seqlens=cu_seqlens,
+            position_embeddings=rope_freqs_cis,
         )
         hidden_states = residual + hidden_states
 
@@ -658,6 +682,14 @@ class MoonViT3dPretrainedModel(nn.Module):
             video_attn_type=config.video_attn_type,
         )
 
+    @property
+    def dtype(self) -> torch.dtype:
+        return self.patch_embed.proj.weight.dtype
+
+    @property
+    def device(self) -> torch.device:
+        return self.patch_embed.proj.weight.device
+
     def forward(
         self, pixel_values: torch.Tensor, grid_thws: torch.Tensor
     ) -> torch.Tensor:
@@ -670,7 +702,7 @@ class MoonViT3dPretrainedModel(nn.Module):
         """
         # grid_thws = grid_thws.to('cpu')  # 不再强制移到CPU，保持在输入设备上
         assert grid_thws.ndim == 2, f"grid_thws should be 2D, got {grid_thws.ndim}"
-        assert grid_thws.size(1) == 3, f"No support for thw: {grid_thws}"
+        assert grid_thws.size(1) == 3, f"No support for _thw: {grid_thws}"
         hidden_states = self.patch_embed(pixel_values, grid_thws)
         hidden_states = self.encoder(hidden_states, grid_thws)
         if (
@@ -776,14 +808,17 @@ class K2VLForConditionalGeneration(nn.Module):
         pixel_values = torch.cat([item.feature for item in items], dim=0).type(
             self.vision_tower.dtype
         )
-        image_grid_thw = torch.concat(
-            [item.image_grid_thw for item in items], dim=0
-        ).to(self.vision_tower.device)
+        grid_thws = torch.concat([item.grid_thws for item in items], dim=0).to(
+            self.vision_tower.device
+        )
 
         target_dtype = self.vision_tower.patch_embed.proj.weight.dtype
         pixel_values = pixel_values.to(target_dtype)
 
-        image_features = self.vision_tower(pixel_values, image_grid_thw)
+        image_features = self.vision_tower(pixel_values, grid_thws)
+        # print(f"{len(image_features)=}")
+        image_features = torch.cat(image_features, dim=0)
+        print(f"{image_features.shape=}")
         return image_features
 
     def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
@@ -820,8 +855,9 @@ class K2VLForConditionalGeneration(nn.Module):
         for name, loaded_weight in weights:
             if "vision_tower" in name or "mm_projector" in name:
                 # vision_name = name.replace(r"attn.qkv.", r"attn.qkv_proj.")
-                vision_name = name
-                vision_weights.append((vision_name, loaded_weight))
+                name = name.replace(r"wqkv.", r"attn.qkv_proj.")
+                name = name.replace(r"wo.", r"attn.proj.")
+                vision_weights.append((name, loaded_weight))
             else:
                 name = name.replace("language_model.", "")
                 # All other weights go to language model

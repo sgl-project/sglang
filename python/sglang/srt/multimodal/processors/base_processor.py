@@ -210,6 +210,7 @@ class BaseMultimodalProcessor(ABC):
             "num_patches": Modality.IMAGE,
             "patch_pixel_values": Modality.IMAGE,
             "block_sizes": Modality.IMAGE,
+            "grid_thws": Modality.IMAGE,  # for kimi k2 vl
             # Audio-related attributes
             "audio_features": Modality.AUDIO,
             "audio_feature_lens": Modality.AUDIO,
@@ -306,6 +307,13 @@ class BaseMultimodalProcessor(ABC):
         """
         process multimodal data with transformers AutoProcessor
         """
+        if images:  # and is kimi k2 vl
+            mediums = []
+            for image in images:
+                mediums.append({"type": "image", "image": image})
+            key = "_medias"[1:]
+            kwargs[key] = mediums
+            images = None
         if images:
             kwargs["images"] = images
         if videos:
@@ -349,6 +357,7 @@ class BaseMultimodalProcessor(ABC):
             return_tensors="pt",
             **kwargs,
         )
+        print(f"334 result: {result}")
         if not self.server_args.keep_mm_feature_on_device:
             # move feature tensors to cpu
             for feature_name in self.FEATURE_NAMES:
@@ -922,6 +931,7 @@ class BaseMultimodalProcessor(ABC):
         """
 
         items: dict[Modality, MultimodalDataItem] = {}
+        print(f"724 data_dict: {data_dict}")
         for attr_name, value in data_dict.items():
             if attr_name == "input_ids":
                 continue

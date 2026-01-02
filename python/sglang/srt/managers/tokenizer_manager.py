@@ -694,7 +694,8 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             input_ids, token_type_ids = await self._tokenize_texts(
                 input_text, is_cross_encoder_request
             )
-
+        print(f"678 self.mm_processor: {self.mm_processor}")
+        print(f"679 obj.contains_mm_input(): {obj.contains_mm_input()}")
         if self.mm_processor and obj.contains_mm_input():
             if obj.image_data is not None and not isinstance(obj.image_data, list):
                 obj.image_data = [obj.image_data]
