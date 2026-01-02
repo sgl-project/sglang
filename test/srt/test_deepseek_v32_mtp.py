@@ -101,7 +101,7 @@ class TestDeepseekV32DPMTP(CustomTestCase):
             self.assertGreater(speed, 75)
 
 
-class TestDeepseekV32MTP(CustomTestCase):
+class TestDeepseekV32TPMTP(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = FULL_DEEPSEEK_V32_MODEL_PATH
