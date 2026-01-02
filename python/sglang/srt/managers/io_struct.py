@@ -984,6 +984,8 @@ class BatchTokenIDOutput(
 
     # Load for DP balance
     load: GetLoadReqOutput = None
+    # Customized info
+    customized_info: Optional[Dict[str, List[Any]]] = None
 
 
 @dataclass
@@ -1069,6 +1071,9 @@ class BatchStrOutput(
 
     # Load for DP balance
     load: GetLoadReqOutput = None
+
+    # Customized info
+    customized_info: Optional[Dict[str, List[Any]]] = None
 
 
 @dataclass
