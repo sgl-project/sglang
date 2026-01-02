@@ -1937,12 +1937,8 @@ class FlashAttentionBackend(AttentionBackend):
                     seq_lens,
                     0,
                     self.page_size,
-                    (
-                        self.decode_cuda_graph_metadata["swa_page_table"]
-                        if self.use_sliding_window_kv_pool
-                        else None
-                    ),
-                    self.token_to_kv_pool if self.use_sliding_window_kv_pool else None,
+                    metadata.swa_page_table,
+                    self.token_to_kv_pool,
                 )
 
                 self._update_local_attn_metadata_for_replay(
@@ -2589,6 +2585,7 @@ def normal_decode_set_metadata(
     page_table[:, :max_seq_pages].copy_(page_indices // page_size)
 
     if swa_page_table is not None and token_to_kv_pool is not None:
+        assert isinstance(token_to_kv_pool, SWAKVPool)
         swa_page_indices = token_to_kv_pool.translate_loc_from_full_to_swa(page_indices)
         swa_page_table[:, :max_seq_pages].copy_(swa_page_indices // page_size)
 
