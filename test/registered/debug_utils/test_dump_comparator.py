@@ -98,7 +98,9 @@ class TestEndToEnd(CustomTestCase):
 
             dump_dirs = []
             for d, tensor in [(d1, baseline_tensor), (d2, target_tensor)]:
-                with _with_env("SGLANG_DUMPER_DIR", d):
+                with _with_env("SGLANG_DUMPER_DIR", d), _with_env(
+                    "SGLANG_DUMPER_SERVER_PORT", "-1"
+                ):
                     dumper = _Dumper()
                     dumper.on_forward_pass_start()
                     dumper.dump("tensor_a", tensor)
