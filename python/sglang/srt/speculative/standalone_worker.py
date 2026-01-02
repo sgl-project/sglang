@@ -12,6 +12,7 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.eagle_worker import EAGLEWorker
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import draft_tp_context, load_token_map
+from sglang.srt.speculative.vocab_intersection import create_vocab_mapper
 from sglang.srt.utils import empty_context, get_bool_env_var, is_cuda
 
 if is_cuda():
@@ -103,3 +104,10 @@ class StandaloneWorker(EAGLEWorker):
             (), dtype=torch.int64, device=self.device
         )
         self.extend_lens = torch.empty((), dtype=torch.int64, device=self.device)
+
+        if server_args.enable_heterogeneous_vocab:
+            self.vocab_mapper = create_vocab_mapper(
+                draft_tokenizer=self.draft_model_runner.tokenizer,
+                target_tokenizer=target_worker.model_runner.tokenizer,
+                device=self.device,
+            )

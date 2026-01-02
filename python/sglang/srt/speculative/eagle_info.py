@@ -220,6 +220,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
         token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
         page_size: int,
         vocab_mask: Optional[torch.Tensor] = None,  # For grammar
+        vocab_mapper=None,  # For heterogeneous vocab speculative decoding
     ) -> torch.Tensor:
         """
         Verify and find accepted tokens based on logits output and batch
@@ -253,6 +254,9 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
 
         bs = self.retrive_index.shape[0]
         candidates = self.draft_token.reshape(bs, self.draft_token_num)
+        if vocab_mapper is not None:
+            candidates = vocab_mapper.map_draft_to_target(candidates)
+
         sampling_info = batch.sampling_info
 
         predict_shape = list(logits_output.next_token_logits.shape)[:-1]

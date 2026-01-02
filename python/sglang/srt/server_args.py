@@ -427,6 +427,7 @@ class ServerArgs:
     speculative_moe_runner_backend: Optional[str] = None
     speculative_moe_a2a_backend: Optional[str] = None
     speculative_draft_model_quantization: Optional[str] = None
+    enable_heterogeneous_vocab: bool = False
 
     # Speculative decoding (ngram)
     speculative_ngram_min_match_window_size: int = 1
@@ -3490,6 +3491,14 @@ class ServerArgs:
             choices=SPECULATIVE_DRAFT_MODEL_QUANTIZATION_CHOICES,
             default=ServerArgs.speculative_draft_model_quantization,
             help="The quantization method for speculative model.",
+        )
+        parser.add_argument(
+            "--enable-heterogeneous-vocab",
+            action="store_true",
+            default=ServerArgs.enable_heterogeneous_vocab,
+            help="Enable heterogeneous vocabulary speculative decoding using TLI algorithm. "
+            "This allows using draft models with different vocabularies from the target model. "
+            "See: 'Lossless Speculative Decoding for Heterogeneous Vocabularies' (ICML 2025).",
         )
 
         # Speculative decoding (ngram)
