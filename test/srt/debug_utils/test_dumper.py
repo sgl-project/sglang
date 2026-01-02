@@ -125,9 +125,8 @@ def _test_http_func(rank):
 def _test_filter_func(rank, tmpdir):
     os.environ["SGLANG_DUMPER_DIR"] = tmpdir
     os.environ["SGLANG_DUMPER_FILTER"] = "keep"
-    from sglang.srt.debug_utils.dumper import _Dumper
+    from sglang.srt.debug_utils.dumper import dumper
 
-    dumper = _Dumper()
     dumper.on_forward_pass_start()
     dumper.dump("keep_this", torch.randn(5, device=f"cuda:{rank}"))
     dumper.dump("skip_this", torch.randn(5, device=f"cuda:{rank}"))
@@ -141,9 +140,8 @@ def _test_filter_func(rank, tmpdir):
 def _test_write_disabled_func(rank, tmpdir):
     os.environ["SGLANG_DUMPER_DIR"] = tmpdir
     os.environ["SGLANG_DUMPER_WRITE_FILE"] = "0"
-    from sglang.srt.debug_utils.dumper import _Dumper
+    from sglang.srt.debug_utils.dumper import dumper
 
-    dumper = _Dumper()
     dumper.on_forward_pass_start()
     dumper.dump("no_write", torch.randn(5, device=f"cuda:{rank}"))
 

@@ -11,24 +11,16 @@ from sglang.test.test_utils import CustomTestCase
 
 
 @contextmanager
-def dumper_env(base_dir):
-    old_env = {k: os.environ.get(k) for k in ["SGLANG_DUMPER_DIR", "SGLANG_DUMPER_ENABLE", "SGLANG_DUMPER_WRITE_FILE"]}
-    os.environ["SGLANG_DUMPER_DIR"] = str(base_dir)
-    os.environ["SGLANG_DUMPER_ENABLE"] = "1"
-    os.environ["SGLANG_DUMPER_WRITE_FILE"] = "1"
+def with_env(name: str, value: str):
+    old = os.environ.get(name)
+    os.environ[name] = value
     try:
-        from sglang.srt.debug_utils.dumper import _Dumper
-        yield _Dumper()
+        yield
     finally:
-        for k, v in old_env.items():
-            if v is None:
-                os.environ.pop(k, None)
-            else:
-                os.environ[k] = v
-
-
-def _get_dump_dir(base_dir, dumper):
-    return Path(base_dir) / f"sglang_dump_{dumper._partial_name}"
+        if old is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = old
 
 
 class TestDumpComparator(CustomTestCase):
@@ -136,15 +128,18 @@ class TestEndToEnd(CustomTestCase):
             baseline_tensor = torch.randn(10, 10)
             noise = torch.randn(10, 10) * 0.01
 
-            with dumper_env(d1) as dumper1:
+            with with_env("SGLANG_DUMPER_DIR", d1):
+                from sglang.srt.debug_utils.dumper import _Dumper
+                dumper1 = _Dumper()
                 dumper1.on_forward_pass_start()
                 dumper1.dump("x", baseline_tensor)
-                dump_dir1 = _get_dump_dir(d1, dumper1)
+                dump_dir1 = Path(d1) / f"sglang_dump_{dumper1._partial_name}"
 
-            with dumper_env(d2) as dumper2:
+            with with_env("SGLANG_DUMPER_DIR", d2):
+                dumper2 = _Dumper()
                 dumper2.on_forward_pass_start()
                 dumper2.dump("x", baseline_tensor + noise)
-                dump_dir2 = _get_dump_dir(d2, dumper2)
+                dump_dir2 = Path(d2) / f"sglang_dump_{dumper2._partial_name}"
 
             df1, df2 = read_meta(dump_dir1), read_meta(dump_dir2)
             self.assertEqual(len(df1), 1)
@@ -160,10 +155,12 @@ class TestEndToEnd(CustomTestCase):
         from sglang.srt.debug_utils.dump_loader import read_meta
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            with dumper_env(tmpdir) as dumper:
+            with with_env("SGLANG_DUMPER_DIR", tmpdir):
+                from sglang.srt.debug_utils.dumper import _Dumper
+                dumper = _Dumper()
                 dumper.on_forward_pass_start()
                 dumper.dump_dict("layer", {"w": torch.randn(5), "b": torch.randn(3)})
-                dump_dir = _get_dump_dir(tmpdir, dumper)
+                dump_dir = Path(tmpdir) / f"sglang_dump_{dumper._partial_name}"
 
             df = read_meta(dump_dir)
             self.assertEqual(set(df["name"].to_list()), {"layer_w", "layer_b"})
