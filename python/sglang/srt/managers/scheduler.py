@@ -498,11 +498,6 @@ class Scheduler(
                 f"Using draft model load_format: '{self.server_args.speculative_draft_load_format}'"
             )
 
-        # Draft workers are looked up via `SpeculativeAlgorithm` registry; new
-        # algorithms should register their factory instead of patching this code.
-        if self.spec_algorithm.supports_spec_v2():
-            draft_worker_kwargs["enable_overlap"] = self.enable_overlap
-
         # FIXME: refactor the draft worker registration logic
         if self.server_args.enable_multi_layer_eagle:
             if self.enable_overlap:
@@ -534,9 +529,15 @@ class Scheduler(
                     dp_rank=self.dp_rank,
                 )
         else:
-            self.draft_worker = self.spec_algorithm.create_draft_worker(
-                **draft_worker_kwargs
+            WorkerClass = self.spec_algorithm.create_worker(
+                enable_overlap=self.enable_overlap
             )
+
+            # FIXME: optimize the init draft worker code path
+            if WorkerClass is not None:
+                self.draft_worker = WorkerClass(**draft_worker_kwargs)
+            else:
+                self.draft_worker = None
 
     def init_model_worker(self):
         self.init_tp_model_worker()
@@ -732,8 +733,6 @@ class Scheduler(
         self.running_batch: ScheduleBatch = ScheduleBatch(reqs=[], batch_is_full=False)
         # The current forward batch
         self.cur_batch: Optional[ScheduleBatch] = None
-        # The current split prefill batch
-        self.split_prefill_batch: Optional[ScheduleBatch] = None
         # The last forward batch
         self.last_batch: Optional[ScheduleBatch] = None
         self.forward_ct = 0
@@ -1531,6 +1530,10 @@ class Scheduler(
             self._add_request_to_queue(req)
             return
 
+        if not recv_req.return_logprob and recv_req.logprob_start_len != -1:
+            # When return_logprob is False, logprob_start_len should be ignored
+            recv_req.logprob_start_len = -1
+
         if recv_req.logprob_start_len == -1:
             if req.is_prefill_only:
                 # For prefill-only requests with logprob_start_len == -1, set logprob_start_len
@@ -1834,7 +1837,9 @@ class Scheduler(
             # Before merging the new batch into running batch:
             # 1. All new batches are none -> need_mlp_sync remains true (sync is needed for decode batch).
             # 2. All new batches are some (prefill / idle) -> we do not need prepare mlp sync one more time.
-            new_batch = self.prepare_mlp_sync_batch(new_batch)
+            new_batch = self.maybe_prepare_mlp_sync_batch_and_log_stats(
+                new_batch, log_stats=False
+            )
             need_mlp_sync = new_batch is None
 
         if new_batch is not None:
@@ -1848,14 +1853,13 @@ class Scheduler(
             else:
                 ret = None
 
-        # Handle DP attention
-        if need_mlp_sync:
-            ret = self.prepare_mlp_sync_batch(ret)
+        # Handle DP attention and log stats
+        ret = self.maybe_prepare_mlp_sync_batch_and_log_stats(
+            ret, need_sync=need_mlp_sync
+        )
 
         if ret:
             trace_event_batch("schedule", ret.reqs)
-
-        self.log_prefill_stats_late(ret)
 
         return ret
 
