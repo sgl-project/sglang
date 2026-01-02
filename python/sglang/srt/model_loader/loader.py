@@ -559,7 +559,9 @@ class DefaultModelLoader(BaseModelLoader):
             )
 
         hf_config = AutoConfig.from_pretrained(
-            model_config.model_path, trust_remote_code=True
+            model_config.model_path,
+            trust_remote_code=True,
+            local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
         )
         with init_empty_weights():
             torch_dtype = getattr(hf_config, "torch_dtype", torch.float16)
