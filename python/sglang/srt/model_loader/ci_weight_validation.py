@@ -236,6 +236,7 @@ def _validate_config_and_tokenizer_files(snapshot_dir: str) -> Tuple[bool, List[
     - config.json (required)
     - tokenizer_config.json (required)
     - generation_config.json (optional but validated if present)
+    - hf_quant_config.json (optional but validated if present)
     - At least one tokenizer file: tokenizer.json, tokenizer.model, or tiktoken.model
 
     Args:
@@ -264,6 +265,13 @@ def _validate_config_and_tokenizer_files(snapshot_dir: str) -> Tuple[bool, List[
     if os.path.exists(generation_config_path):
         if not _validate_json_file(generation_config_path, "generation_config.json"):
             missing_files.append("generation_config.json (exists but invalid)")
+
+    # Check optional hf_quant_config.json (validate if exists)
+    # This file is needed for quantized models (FP4, GPTQ, etc.)
+    hf_quant_config_path = os.path.join(snapshot_dir, "hf_quant_config.json")
+    if os.path.exists(hf_quant_config_path):
+        if not _validate_json_file(hf_quant_config_path, "hf_quant_config.json"):
+            missing_files.append("hf_quant_config.json (exists but invalid)")
 
     # Check for at least one tokenizer file
     tokenizer_files = [
