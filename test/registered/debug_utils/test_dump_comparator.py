@@ -13,19 +13,6 @@ from sglang.test.test_utils import CustomTestCase
 register_cuda_ci(est_time=60, suite="nightly-1-gpu", nightly=True)
 
 
-@contextmanager
-def with_env(name: str, value: str):
-    old = os.environ.get(name)
-    os.environ[name] = value
-    try:
-        yield
-    finally:
-        if old is None:
-            os.environ.pop(name, None)
-        else:
-            os.environ[name] = old
-
-
 class TestDumpComparator(CustomTestCase):
     def test_calc_rel_diff(self):
         from sglang.srt.debug_utils.dump_comparator import _calc_rel_diff
@@ -107,7 +94,7 @@ class TestEndToEnd(CustomTestCase):
             baseline_tensor = torch.randn(10, 10)
             noise = torch.randn(10, 10) * 0.01
 
-            with with_env("SGLANG_DUMPER_DIR", d1):
+            with _with_env("SGLANG_DUMPER_DIR", d1):
                 from sglang.srt.debug_utils.dumper import _Dumper
 
                 dumper1 = _Dumper()
@@ -115,7 +102,7 @@ class TestEndToEnd(CustomTestCase):
                 dumper1.dump("x", baseline_tensor)
                 dump_dir1 = Path(d1) / f"sglang_dump_{dumper1._partial_name}"
 
-            with with_env("SGLANG_DUMPER_DIR", d2):
+            with _with_env("SGLANG_DUMPER_DIR", d2):
                 dumper2 = _Dumper()
                 dumper2.on_forward_pass_start()
                 dumper2.dump("x", baseline_tensor + noise)
@@ -141,7 +128,7 @@ class TestEndToEnd(CustomTestCase):
         from sglang.srt.debug_utils.dump_loader import read_meta
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            with with_env("SGLANG_DUMPER_DIR", tmpdir):
+            with _with_env("SGLANG_DUMPER_DIR", tmpdir):
                 from sglang.srt.debug_utils.dumper import _Dumper
 
                 dumper = _Dumper()
@@ -151,6 +138,19 @@ class TestEndToEnd(CustomTestCase):
 
             df = read_meta(dump_dir)
             self.assertEqual(set(df["name"].to_list()), {"layer_w", "layer_b"})
+
+
+@contextmanager
+def _with_env(name: str, value: str):
+    old = os.environ.get(name)
+    os.environ[name] = value
+    try:
+        yield
+    finally:
+        if old is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = old
 
 
 if __name__ == "__main__":
