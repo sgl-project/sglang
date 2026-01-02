@@ -43,7 +43,7 @@ import torch
 import torch.utils.checkpoint
 from torch import nn
 from torch.nn.parameter import Parameter
-from transformers import PretrainedConfig
+from transformers import PretrainedConfig, CohereConfig, Cohere2Config
 
 from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
@@ -198,12 +198,18 @@ class CohereAttention(nn.Module):
             rope_scaling=self.rope_scaling,
             is_neox_style=False,
         )
+
+        # Model v2 has interleaved sliding windows, v1 does not
+        self.v1 = isinstance(config, CohereConfig)
+        self.sliding_window_size = config.sliding_window if isinstance(config, Cohere2Config) and config.layer_types[layer_id] == "sliding_attention" else -1
+
         self.attn = RadixAttention(
             self.num_heads,
             self.head_dim,
             self.scaling,
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
+            sliding_window_size=self.sliding_window_size,
             quant_config=quant_config,
             prefix=add_prefix("attn", prefix),
         )
@@ -235,7 +241,8 @@ class CohereAttention(nn.Module):
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         if self.use_qk_norm:
             q, k = self._apply_qk_norm(q, k)
-        q, k = self.rotary_emb(positions, q, k)
+        if self.v1 or self.sliding_window_size > 0:
+            q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v, forward_batch)
         output, _ = self.o_proj(attn_output)
         return output
