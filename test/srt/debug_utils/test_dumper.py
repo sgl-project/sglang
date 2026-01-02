@@ -51,8 +51,9 @@ def _test_basic_func(rank, tmpdir):
         {"forward_pass_id=2", "name=tensor_b", "my_ctx_arg=200", f"rank={rank}"},
     ]
     for segments in expected_segments:
-        assert any(all(seg in f for seg in segments) for f in filenames), \
-            f"No file matches {segments}, got {filenames}"
+        assert any(
+            all(seg in f for seg in segments) for f in filenames
+        ), f"No file matches {segments}, got {filenames}"
 
     assert not any("tensor_should_not_exist" in f for f in filenames)
 
@@ -69,7 +70,9 @@ def _test_http_func(rank):
         dist.barrier()
         if rank == 0:
             time.sleep(0.1)
-            requests.post("http://localhost:40000/dumper", json={"enable": enable}).raise_for_status()
+            requests.post(
+                "http://localhost:40000/dumper", json={"enable": enable}
+            ).raise_for_status()
         dist.barrier()
         assert dumper._enable == enable, f"Rank {rank}: expected _enable={enable}"
 
@@ -81,7 +84,9 @@ def _run_distributed_test(func, world_size=2, **kwargs):
     processes = []
 
     for rank in range(world_size):
-        p = ctx.Process(target=_run_distributed, args=(rank, world_size, func, result_queue, kwargs))
+        p = ctx.Process(
+            target=_run_distributed, args=(rank, world_size, func, result_queue, kwargs)
+        )
         p.start()
         processes.append(p)
 
@@ -112,6 +117,7 @@ def _run_distributed(rank, world_size, func, result_queue, kwargs):
         result_queue.put((rank, None))
     except Exception as e:
         import traceback
+
         result_queue.put((rank, f"{e}\n{traceback.format_exc()}"))
     finally:
         dist.destroy_process_group()
