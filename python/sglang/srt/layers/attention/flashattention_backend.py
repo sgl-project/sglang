@@ -1938,7 +1938,7 @@ class FlashAttentionBackend(AttentionBackend):
                     0,
                     self.page_size,
                     metadata.swa_page_table,
-                    self.token_to_kv_pool,
+                    self.token_to_kv_pool if self.use_sliding_window_kv_pool else None,
                 )
 
                 self._update_local_attn_metadata_for_replay(
