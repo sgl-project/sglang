@@ -202,6 +202,7 @@ class Qwen3GatedDeltaNet(nn.Module):
         layer_id: int,
         quant_config: Optional[QuantizationConfig] = None,
         alt_stream: Optional[torch.cuda.Stream] = None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
         self.config = config
@@ -241,6 +242,7 @@ class Qwen3GatedDeltaNet(nn.Module):
             quant_config=quant_config,
             tp_rank=self.attn_tp_rank,
             tp_size=self.attn_tp_size,
+            prefix=add_prefix("in_proj_qkvz", prefix),
         )
         self.in_proj_ba = ColumnParallelLinear(
             input_size=self.hidden_size,
@@ -249,6 +251,7 @@ class Qwen3GatedDeltaNet(nn.Module):
             quant_config=None,
             tp_rank=self.attn_tp_rank,
             tp_size=self.attn_tp_size,
+            prefix=add_prefix("in_proj_ba", prefix),
         )
 
         query_key_settings = (self.key_dim, 0, False)
@@ -297,6 +300,7 @@ class Qwen3GatedDeltaNet(nn.Module):
             reduce_results=False,
             tp_rank=self.attn_tp_rank,
             tp_size=self.attn_tp_size,
+            prefix=add_prefix("out_proj", prefix),
         )
 
     def fix_query_key_value_ordering(self, mixed_qkvz, mixed_ba):
@@ -478,7 +482,11 @@ class Qwen3HybridLinearDecoderLayer(nn.Module):
         super().__init__()
         self.config = config
         self.linear_attn = Qwen3GatedDeltaNet(
-            config, layer_id, quant_config, alt_stream
+            config,
+            layer_id,
+            quant_config,
+            alt_stream,
+            prefix=add_prefix("linear_attn", prefix),
         )
 
         # Qwen3Next all layers are sparse and have no nextn now
@@ -617,6 +625,7 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
             quant_config=quant_config,
             tp_rank=self.attn_tp_rank,
             tp_size=self.attn_tp_size,
+            prefix=add_prefix("self_attn.qkv_proj", prefix),
         )
 
         self.o_proj = RowParallelLinear(
@@ -627,6 +636,7 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
             reduce_results=False,
             tp_rank=self.attn_tp_rank,
             tp_size=self.attn_tp_size,
+            prefix=add_prefix("self_attn.o_proj", prefix),
         )
 
         self.attn = RadixAttention(
@@ -862,6 +872,14 @@ class HybridLayerType(enum.Enum):
 
 class Qwen3NextForCausalLM(nn.Module):
     fall_back_to_pt_during_load = False
+    packed_modules_mapping = {
+        "qkv_proj": [
+            "q_proj",
+            "k_proj",
+            "v_proj",
+        ],
+        "gate_up_proj": ["gate_proj", "up_proj"],
+    }
 
     def __init__(
         self,
