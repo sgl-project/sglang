@@ -725,6 +725,7 @@ class DeepseekV2MoE(nn.Module):
                     if get_moe_a2a_backend().is_deepep()
                     or get_moe_a2a_backend().is_mooncake()
                     or get_moe_a2a_backend().is_ascend_fuseep()
+                    or enable_nextn_moe_sparse_fully_dp(is_nextn)
                     or should_use_flashinfer_cutlass_moe_fp4_allgather()
                     else {}
                 ),
