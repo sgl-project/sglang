@@ -598,7 +598,7 @@ async fn test_dag_dependency_failure_blocks_dependents() {
 #[test]
 fn test_dag_validation_cycle_detection() {
     // Create a workflow with a cycle: A -> B -> C -> A
-    let workflow = WorkflowDefinition::new("cyclic_workflow", "Cyclic Test")
+    let mut workflow = WorkflowDefinition::new("cyclic_workflow", "Cyclic Test")
         .add_step(
             StepDefinition::new("step_a", "Step A", Arc::new(AlwaysSucceedStep))
                 .depends_on(&["step_c"]),
@@ -620,7 +620,7 @@ fn test_dag_validation_cycle_detection() {
 #[test]
 fn test_dag_validation_missing_dependency() {
     // Create a workflow with a missing dependency
-    let workflow = WorkflowDefinition::new("missing_dep_workflow", "Missing Dep Test")
+    let mut workflow = WorkflowDefinition::new("missing_dep_workflow", "Missing Dep Test")
         .add_step(StepDefinition::new(
             "step_a",
             "Step A",
@@ -639,7 +639,7 @@ fn test_dag_validation_missing_dependency() {
 #[test]
 fn test_dag_validation_valid_workflow() {
     // Create a valid DAG workflow
-    let workflow = WorkflowDefinition::new("valid_workflow", "Valid Test")
+    let mut workflow = WorkflowDefinition::new("valid_workflow", "Valid Test")
         .add_step(StepDefinition::new(
             "step_a",
             "Step A",

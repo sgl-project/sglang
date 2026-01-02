@@ -91,13 +91,13 @@ def get_attn_backend(
     dtype: torch.dtype,
     supported_attention_backends: set[AttentionBackendEnum] | None = None,
 ) -> type[AttentionBackend]:
-    if supported_attention_backends is not None:
+    if supported_attention_backends is None:
+        be_tuple = tuple()
+    else:
         # Sort the backend names to ensure consistent cache key
         be_tuple = tuple(
             sorted(list(supported_attention_backends), key=lambda b: b.name)
         )
-    else:
-        be_tuple = None
     return _cached_get_attn_backend(head_size, dtype, be_tuple)
 
 
@@ -105,7 +105,7 @@ def get_attn_backend(
 def _cached_get_attn_backend(
     head_size: int,
     dtype: torch.dtype,
-    supported_attention_backends: tuple[AttentionBackendEnum] | None = None,
+    supported_attention_backends: tuple[AttentionBackendEnum],
 ) -> type[AttentionBackend]:
     # Check whether a particular choice of backend was
     # previously forced.
@@ -115,8 +115,6 @@ def _cached_get_attn_backend(
     from sglang.multimodal_gen.runtime.platforms import current_platform
 
     supported_attention_backends = set(supported_attention_backends)
-    if not supported_attention_backends:
-        raise ValueError("supported_attention_backends is empty")
     selected_backend = None
     backend_by_global_setting: AttentionBackendEnum | None = (
         get_global_forced_attn_backend()
@@ -139,12 +137,12 @@ def _cached_get_attn_backend(
                 )
 
     # get device-specific attn_backend
-    if selected_backend is None:
+    if len(supported_attention_backends) == 0:
+        # all attention backends are allowed
+        pass
+    elif selected_backend is None:
         logger.debug(f"Attention backend not specified")
-    elif (
-        not supported_attention_backends
-        or selected_backend not in supported_attention_backends
-    ):
+    elif selected_backend not in supported_attention_backends:
         supported_attention_backends_str = [
             supported_attention_backend.__str__()
             for supported_attention_backend in supported_attention_backends

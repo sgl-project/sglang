@@ -53,6 +53,7 @@ from sglang.srt.utils.common import (
     is_sm120_supported,
     next_power_of_2,
 )
+from sglang.srt.utils.custom_op import register_custom_op
 from sglang.srt.utils.patch_torch import register_fake_if_exists
 
 if TYPE_CHECKING:
@@ -73,15 +74,13 @@ except ImportError:
     fp4_quantize = None
 
 try:
-    from flashinfer import mm_fp4 as fp4_gemm
+    from flashinfer import mm_fp4 as flashinfer_fp4_gemm
     from flashinfer import reorder_rows_for_gated_act_gemm, shuffle_matrix_sf_a
 
     enable_flashinfer_fp4_gemm = True
 except ImportError:
     if is_cuda():
-        from sgl_kernel import cutlass_scaled_fp4_mm as fp4_gemm
-    else:
-        fp4_gemm = None
+        from sgl_kernel import cutlass_scaled_fp4_mm as cutlass_fp4_gemm
     enable_flashinfer_fp4_gemm = False
     reorder_rows_for_gated_act_gemm = None
     shuffle_matrix_a = None
@@ -103,8 +102,22 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
-@torch.library.custom_op("sglang::fp4_gemm", mutates_args=())
-def _sglang_fp4_gemm(
+def _sglang_fp4_gemm_fake(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    input_sf: torch.Tensor,
+    weight_sf: torch.Tensor,
+    alpha: torch.Tensor,
+    out_dtype: torch.dtype,
+    out_features: int,
+) -> torch.Tensor:
+    M = input.shape[-2]
+    N = int(out_features)
+    return input.new_empty((M, N), dtype=out_dtype)
+
+
+@register_custom_op(fake_impl=_sglang_fp4_gemm_fake)
+def fp4_gemm(
     input: torch.Tensor,
     weight: torch.Tensor,
     input_sf: torch.Tensor,
@@ -115,26 +128,11 @@ def _sglang_fp4_gemm(
 ) -> torch.Tensor:
     backend = FLASHINFER_FP4_GEMM_BACKEND if FLASHINFER_FP4_GEMM_BACKEND else "cutlass"
     if enable_flashinfer_fp4_gemm:
-        return fp4_gemm(
+        return flashinfer_fp4_gemm(
             input, weight, input_sf, weight_sf, alpha, out_dtype, backend=backend
         )
     else:
-        return fp4_gemm(input, weight, input_sf, weight_sf, alpha, out_dtype)
-
-
-@torch.library.register_fake("sglang::fp4_gemm")
-def _sglang_fp4_gemm_fake(
-    input,
-    weight,
-    input_sf,
-    weight_sf,
-    alpha,
-    out_dtype,
-    out_features: int,
-):
-    M = input.shape[-2]
-    N = int(out_features)
-    return input.new_empty((M, N), dtype=out_dtype)
+        return cutlass_fp4_gemm(input, weight, input_sf, weight_sf, alpha, out_dtype)
 
 
 if is_cuda() and (not is_sm120_supported()) and (fp4_quantize is not None):
@@ -950,12 +948,22 @@ class ModelOptFp4Config(ModelOptQuantConfig):
             if not kv_cache_quant_algo:
                 # For config.json format, derive from kv_cache_scheme if available
                 kv_cache_scheme = config.get("kv_cache_scheme")
-                if (
-                    kv_cache_scheme
-                    and kv_cache_scheme.get("type") == "float"
-                    and kv_cache_scheme.get("num_bits") == 8
-                ):
-                    kv_cache_quant_algo = "FP8"
+                if isinstance(kv_cache_scheme, dict):
+                    if (
+                        kv_cache_scheme.get("type") == "float"
+                        and kv_cache_scheme.get("num_bits") == 8
+                    ):
+                        kv_cache_quant_algo = "FP8"
+                    else:
+                        kv_cache_quant_algo = "auto"
+                elif isinstance(kv_cache_scheme, str):
+                    scheme_name = kv_cache_scheme.strip().upper()
+                    if scheme_name in ("FP8", "FLOAT8"):
+                        kv_cache_quant_algo = "FP8"
+                    elif scheme_name in ("FP4", "FLOAT4", "NVFP4"):
+                        kv_cache_quant_algo = "NVFP4"
+                    else:
+                        kv_cache_quant_algo = "auto"
                 else:
                     kv_cache_quant_algo = "auto"
 
@@ -1219,7 +1227,7 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         backend = (
             FLASHINFER_FP4_GEMM_BACKEND if FLASHINFER_FP4_GEMM_BACKEND else "cutlass"
         )
-        out = _sglang_fp4_gemm(
+        out = fp4_gemm(
             x_fp4,
             w,
             x_scale_interleaved,
@@ -1485,15 +1493,27 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 )
             }
         )
+        block_size = 16
         # Validate weight scales
         assert_dim = 2 if layer.moe_runner_config.is_gated else 1
         for name, weight_scale in [
             ("w13", layer.w13_weight_scale),
             ("w2", layer.w2_weight_scale),
         ]:
-            assert (
-                weight_scale.shape[assert_dim] % 16 == 0
-            ), f"Expected {name}_weight_scale.dim({assert_dim}) to be divisible by 16"
+            # For NVFP4 TRTLLM we require one scale per 16 inputs (last dim == expected_blocks[name]).
+            if get_moe_runner_backend().is_flashinfer_trtllm():
+                expected_blocks = {
+                    "w13": layer.w13_weight.shape[2] * 2 // block_size,
+                    "w2": layer.w2_weight.shape[2] * 2 // block_size,
+                }
+                assert (
+                    weight_scale.shape[-1] == expected_blocks[name]
+                ), f"Expected {name}_weight_scale.dim(2) == {expected_blocks[name]}, got {weight_scale.shape[-1]}"
+            else:
+                # For other backends, ensure the per-input block dimension is aligned to 16.
+                assert (
+                    weight_scale.shape[assert_dim] % block_size == 0
+                ), f"Expected {name}_weight_scale.dim({assert_dim}) to be divisible by {block_size}"
             assert (
                 weight_scale.dtype == torch.float8_e4m3fn
             ), f"{name} Weight Blockscale must be represented as FP8-E4M3"

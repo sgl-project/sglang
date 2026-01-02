@@ -29,6 +29,18 @@ def _wait_for_workers(
     )
 
 
+def _get_worker_id_by_url(base_url: str, worker_url: str, headers: dict = None) -> str:
+    r = requests.get(f"{base_url}/workers", headers=headers, timeout=10)
+    r.raise_for_status()
+    workers = r.json().get("workers", [])
+    worker_id = next((w.get("id") for w in workers if w.get("url") == worker_url), None)
+    if not worker_id:
+        raise RuntimeError(
+            f"Could not find worker_id for url={worker_url}. workers={workers}"
+        )
+    return worker_id
+
+
 @pytest.mark.e2e
 def test_mmlu(e2e_router_only_rr, e2e_two_workers_dp2, e2e_model):
     # Attach two dp=2 workers (total 4 GPUs) to a fresh router-only instance
@@ -111,10 +123,8 @@ def test_add_and_remove_worker_live(e2e_router_only_rr, e2e_primary_worker, e2e_
             r.raise_for_status()
 
     # Remove the worker
-    from urllib.parse import quote
-
-    encoded_url = quote(worker_url, safe="")
-    r = requests.delete(f"{base}/workers/{encoded_url}", timeout=60)
+    worker_id = _get_worker_id_by_url(base, worker_url)
+    r = requests.delete(f"{base}/workers/{worker_id}", timeout=60)
     assert r.status_code == 202, f"Expected 202 ACCEPTED, got {r.status_code}: {r.text}"
 
 

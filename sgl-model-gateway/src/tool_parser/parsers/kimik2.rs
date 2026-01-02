@@ -137,7 +137,7 @@ impl ToolParser for KimiK2Parser {
                             });
                         }
                         Err(e) => {
-                            tracing::warn!(
+                            tracing::debug!(
                                 "Failed to parse JSON arguments for {}: {}",
                                 func_name,
                                 e
@@ -146,7 +146,7 @@ impl ToolParser for KimiK2Parser {
                         }
                     }
                 } else {
-                    tracing::warn!("Failed to parse function ID: {}", function_id);
+                    tracing::debug!("Failed to parse function ID: {}", function_id);
                     continue;
                 }
             }
@@ -204,7 +204,7 @@ impl ToolParser for KimiK2Parser {
                     // Validate tool name
                     if !tool_indices.contains_key(&func_name) {
                         // Invalid tool name - skip this tool, preserve indexing for next tool
-                        tracing::warn!("Invalid tool name '{}' - skipping", func_name);
+                        tracing::debug!("Invalid tool name '{}' - skipping", func_name);
                         helpers::reset_current_tool_state(
                             &mut self.buffer,
                             &mut self.current_tool_name_sent,

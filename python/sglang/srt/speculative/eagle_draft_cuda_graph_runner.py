@@ -141,6 +141,7 @@ class EAGLEDraftCudaGraphRunner:
             cuda_graph_bs = (
                 max(forward_batch.global_num_tokens_cpu) // self.num_tokens_per_bs
                 if self.model_runner.spec_algorithm.is_eagle()
+                or self.model_runner.spec_algorithm.is_standalone()
                 else max(forward_batch.global_num_tokens_cpu)
             )
         else:
@@ -328,6 +329,7 @@ class EAGLEDraftCudaGraphRunner:
             max_batch_size = (
                 max_num_tokens // self.num_tokens_per_bs
                 if self.model_runner.spec_algorithm.is_eagle()
+                or self.model_runner.spec_algorithm.is_standalone()
                 else max_num_tokens
             )
             index = bisect.bisect_left(self.capture_bs, max_batch_size)

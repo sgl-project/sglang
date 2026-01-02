@@ -8,6 +8,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use futures_util::StreamExt;
+use memchr::memmem;
 use reqwest::Client;
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -18,14 +19,15 @@ use super::pd_types::api_path;
 use crate::{
     config::types::RetryConfig,
     core::{
-        is_retryable_status, RetryExecutor, Worker, WorkerLoadGuard, WorkerRegistry, WorkerType,
+        is_retryable_status, HashRing, RetryExecutor, Worker, WorkerLoadGuard, WorkerRegistry,
+        WorkerType, UNKNOWN_MODEL_ID,
     },
     observability::{
         events::{self, Event},
         metrics::{bool_to_static_str, metrics_labels, Metrics},
         otel_trace::inject_trace_context_http,
     },
-    policies::{LoadBalancingPolicy, PolicyRegistry},
+    policies::{LoadBalancingPolicy, PolicyRegistry, SelectWorkerInfo},
     protocols::{
         chat::{ChatCompletionRequest, ChatMessage, MessageContent},
         common::{InputIds, StringOrArray},
@@ -58,6 +60,7 @@ struct PDRequestContext<'a> {
     return_logprob: bool,
     request_text: Option<String>,
     model_id: Option<&'a str>,
+    headers: Option<HeaderMap>,
 }
 
 impl PDRouter {
@@ -302,7 +305,11 @@ impl PDRouter {
                     let context = context.clone();
                     async move {
                         let (prefill, decode) = match self
-                            .select_pd_pair(context.request_text.as_deref(), context.model_id)
+                            .select_pd_pair(
+                                context.request_text.as_deref(),
+                                context.model_id,
+                                context.headers.as_ref(),
+                            )
                             .await
                         {
                             Ok(pair) => pair,
@@ -337,8 +344,8 @@ impl PDRouter {
                                 headers,
                                 json_request,
                                 context,
-                                prefill.as_ref(),
-                                decode.as_ref(),
+                                Arc::clone(&prefill),
+                                Arc::clone(&decode),
                                 start_time,
                             )
                             .await;
@@ -410,8 +417,8 @@ impl PDRouter {
         &self,
         res: reqwest::Response,
         context: &PDRequestContext<'_>,
-        prefill: &dyn Worker,
-        decode: &dyn Worker,
+        prefill: Arc<dyn Worker>,
+        decode: Arc<dyn Worker>,
     ) -> Response {
         let status = res.status();
 
@@ -526,17 +533,14 @@ impl PDRouter {
         headers: Option<&HeaderMap>,
         json_request: Value,
         context: PDRequestContext<'_>,
-        prefill: &dyn Worker,
-        decode: &dyn Worker,
+        prefill: Arc<dyn Worker>,
+        decode: Arc<dyn Worker>,
         _start_time: Instant,
     ) -> Response {
         // For non-streaming: use guard for automatic load management
         // For streaming: load will be managed in create_streaming_response
-        let _guard = if !context.is_stream {
-            Some(WorkerLoadGuard::new_multi(vec![prefill, decode]))
-        } else {
-            None
-        };
+        let _prefill_guard = (!context.is_stream).then(|| WorkerLoadGuard::new(prefill.clone()));
+        let _decode_guard = (!context.is_stream).then(|| WorkerLoadGuard::new(decode.clone()));
 
         let mut headers_with_trace = headers.cloned().unwrap_or_default();
         inject_trace_context_http(&mut headers_with_trace);
@@ -561,9 +565,10 @@ impl PDRouter {
         );
 
         // Send both requests concurrently and wait for both
+        // Note: Using borrowed references avoids heap allocation
         events::RequestPDSentEvent {
-            prefill_url: prefill.url().to_string(),
-            decode_url: decode.url().to_string(),
+            prefill_url: prefill.url(),
+            decode_url: decode.url(),
         }
         .emit();
 
@@ -694,6 +699,7 @@ impl PDRouter {
         &self,
         request_text: Option<&str>,
         model_id: Option<&str>,
+        headers: Option<&HeaderMap>,
     ) -> Result<(Arc<dyn Worker>, Arc<dyn Worker>), String> {
         let effective_model_id = if !self.enable_igw { None } else { model_id };
 
@@ -727,10 +733,17 @@ impl PDRouter {
         let prefill_policy = self.policy_registry.get_prefill_policy();
         let decode_policy = self.policy_registry.get_decode_policy();
 
+        // Get cached hash ring for consistent hashing
+        let hash_ring = self
+            .worker_registry
+            .get_hash_ring(effective_model_id.unwrap_or(UNKNOWN_MODEL_ID));
+
         let prefill = Self::pick_worker_by_policy_arc(
             &prefill_workers,
             &*prefill_policy,
             request_text,
+            headers,
+            hash_ring.clone(),
             "prefill",
         )?;
 
@@ -738,6 +751,8 @@ impl PDRouter {
             &decode_workers,
             &*decode_policy,
             request_text,
+            headers,
+            hash_ring,
             "decode",
         )?;
 
@@ -763,6 +778,8 @@ impl PDRouter {
         workers: &[Arc<dyn Worker>],
         policy: &dyn LoadBalancingPolicy,
         request_text: Option<&str>,
+        headers: Option<&HeaderMap>,
+        hash_ring: Option<Arc<HashRing>>,
         worker_type: &str,
     ) -> Result<Arc<dyn Worker>, String> {
         if workers.is_empty() {
@@ -786,7 +803,15 @@ impl PDRouter {
         }
 
         let selected_idx = policy
-            .select_worker(&available_workers, request_text)
+            .select_worker(
+                &available_workers,
+                &SelectWorkerInfo {
+                    request_text,
+                    tokens: None, // HTTP doesn't have tokens, use gRPC for PrefixHash
+                    headers,
+                    hash_ring,
+                },
+            )
             .ok_or_else(|| {
                 format!(
                     "Policy {} failed to select a {} worker",
@@ -807,30 +832,19 @@ impl PDRouter {
         return_logprob: bool,
         decode_url: Option<String>,
         headers: Option<HeaderMap>,
-        prefill: &dyn Worker,
-        decode: &dyn Worker,
+        prefill: Arc<dyn Worker>,
+        decode: Arc<dyn Worker>,
     ) -> Response {
-        prefill.increment_load();
-        decode.increment_load();
-
-        let prefill_url = prefill.url().to_string();
-        let decode_url_str = decode.url().to_string();
+        use crate::core::attach_guards_to_response;
 
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
 
-        let registry = self.worker_registry.clone();
-
         tokio::spawn(async move {
-            let mut stream_completed = false;
-
             futures_util::pin_mut!(stream);
             while let Some(chunk_result) = stream.next().await {
                 match chunk_result {
                     Ok(chunk) => {
-                        let is_done = chunk
-                            .as_ref()
-                            .windows(12)
-                            .any(|window| window == b"data: [DONE]");
+                        let is_done = memmem::find(&chunk, b"data: [DONE]").is_some();
 
                         let result = if return_logprob && prefill_logprobs.is_some() {
                             Self::merge_streaming_logprobs(prefill_logprobs.clone(), &chunk)
@@ -844,7 +858,6 @@ impl PDRouter {
                         }
 
                         if is_done {
-                            stream_completed = true;
                             break;
                         }
                     }
@@ -856,22 +869,6 @@ impl PDRouter {
                         break;
                     }
                 }
-            }
-
-            if let Some(worker) = registry.get_by_url(&prefill_url) {
-                worker.decrement_load();
-                debug!(
-                    "Decremented load for prefill worker: {} (stream_completed: {})",
-                    prefill_url, stream_completed
-                );
-            }
-
-            if let Some(worker) = registry.get_by_url(&decode_url_str) {
-                worker.decrement_load();
-                debug!(
-                    "Decremented load for decode worker: {} (stream_completed: {})",
-                    decode_url_str, stream_completed
-                );
             }
         });
 
@@ -885,7 +882,10 @@ impl PDRouter {
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
         *response.headers_mut() = headers;
 
-        response
+        // Attach load guards to response body for proper RAII lifecycle
+        // Guards are dropped when response body is consumed or client disconnects
+        let guards = vec![WorkerLoadGuard::new(prefill), WorkerLoadGuard::new(decode)];
+        attach_guards_to_response(guards, response)
     }
 
     // Helper to process non-streaming decode response with logprob merging
@@ -1147,7 +1147,7 @@ impl RouterTrait for PDRouter {
         // Note: This endpoint actually causes the model to generate tokens, so we only test one pair
 
         // Select a random worker pair using the policy
-        let (prefill, decode) = match self.select_pd_pair(None, None).await {
+        let (prefill, decode) = match self.select_pd_pair(None, None, None).await {
             Ok(pair) => pair,
             Err(e) => {
                 return error::service_unavailable(
@@ -1270,6 +1270,7 @@ impl RouterTrait for PDRouter {
             return_logprob,
             request_text,
             model_id,
+            headers: headers.cloned(),
         };
 
         self.execute_dual_dispatch(headers, body, context).await
@@ -1311,6 +1312,7 @@ impl RouterTrait for PDRouter {
             return_logprob,
             request_text,
             model_id,
+            headers: headers.cloned(),
         };
 
         self.execute_dual_dispatch(headers, body, context).await
@@ -1344,6 +1346,7 @@ impl RouterTrait for PDRouter {
             return_logprob,
             request_text,
             model_id,
+            headers: headers.cloned(),
         };
 
         self.execute_dual_dispatch(headers, body, context).await
@@ -1369,6 +1372,7 @@ impl RouterTrait for PDRouter {
             return_logprob: false,
             request_text: req_text,
             model_id,
+            headers: headers.cloned(),
         };
 
         self.execute_dual_dispatch(headers, body, context).await
@@ -1432,7 +1436,7 @@ mod tests {
         router.worker_registry.register(Arc::from(healthy_worker));
         router.worker_registry.register(Arc::from(decode_worker));
 
-        let result = router.select_pd_pair(None, None).await;
+        let result = router.select_pd_pair(None, None, None).await;
 
         assert!(result.is_ok());
         let (prefill, _decode) = result.unwrap();
@@ -1445,7 +1449,7 @@ mod tests {
     async fn test_empty_worker_lists() {
         let router = create_test_pd_router();
 
-        let result = router.select_pd_pair(None, None).await;
+        let result = router.select_pd_pair(None, None, None).await;
 
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("No prefill workers available"));
@@ -1453,23 +1457,27 @@ mod tests {
 
     #[test]
     fn test_worker_load_metrics() {
-        let prefill_worker = create_test_worker(
+        let prefill_worker: Arc<dyn Worker> = Arc::from(create_test_worker(
             "http://prefill".to_string(),
             WorkerType::Prefill {
                 bootstrap_port: None,
             },
             true,
-        );
-        let decode_worker =
-            create_test_worker("http://decode".to_string(), WorkerType::Decode, true);
+        ));
+        let decode_worker: Arc<dyn Worker> = Arc::from(create_test_worker(
+            "http://decode".to_string(),
+            WorkerType::Decode,
+            true,
+        ));
 
-        let _guard =
-            WorkerLoadGuard::new_multi(vec![prefill_worker.as_ref(), decode_worker.as_ref()]);
+        let _prefill_guard = WorkerLoadGuard::new(prefill_worker.clone());
+        let _decode_guard = WorkerLoadGuard::new(decode_worker.clone());
 
         assert_eq!(prefill_worker.load(), 1);
         assert_eq!(decode_worker.load(), 1);
 
-        drop(_guard);
+        drop(_prefill_guard);
+        drop(_decode_guard);
 
         assert_eq!(prefill_worker.load(), 0);
         assert_eq!(decode_worker.load(), 0);
@@ -1507,31 +1515,37 @@ mod tests {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let stream = UnboundedReceiverStream::new(rx);
 
-        let _response = router.create_streaming_response(
-            stream.map(Ok),
-            StatusCode::OK,
-            None,
-            false,
-            None,
-            None,
-            prefill_ref.as_ref(),
-            decode_ref.as_ref(),
-        );
+        {
+            let response = router.create_streaming_response(
+                stream.map(Ok),
+                StatusCode::OK,
+                None,
+                false,
+                None,
+                None,
+                prefill_ref.clone(),
+                decode_ref.clone(),
+            );
 
-        assert_eq!(prefill_ref.load(), 1);
-        assert_eq!(decode_ref.load(), 1);
+            // Guards are now attached to response body, so load should be 1
+            assert_eq!(prefill_ref.load(), 1);
+            assert_eq!(decode_ref.load(), 1);
 
-        tx.send(bytes::Bytes::from("test data")).unwrap();
+            tx.send(bytes::Bytes::from("test data")).unwrap();
 
-        sleep(Duration::from_millis(10)).await;
+            sleep(Duration::from_millis(10)).await;
 
-        assert_eq!(prefill_ref.load(), 1);
-        assert_eq!(decode_ref.load(), 1);
+            // Load still 1 while response body exists
+            assert_eq!(prefill_ref.load(), 1);
+            assert_eq!(decode_ref.load(), 1);
 
-        drop(tx);
+            drop(tx);
 
-        sleep(Duration::from_millis(100)).await;
+            // Response (and its body with guards) dropped here
+            drop(response);
+        }
 
+        // Guards dropped when response dropped
         assert_eq!(prefill_ref.load(), 0);
         assert_eq!(decode_ref.load(), 0);
     }

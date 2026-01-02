@@ -152,6 +152,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
             "skip_special_tokens": request.skip_special_tokens,
             "logit_bias": request.logit_bias,
             "custom_params": request.custom_params,
+            "sampling_seed": request.seed,
         }
 
         # Handle response_format constraints

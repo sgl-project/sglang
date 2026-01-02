@@ -1,7 +1,7 @@
 use std::{fs::File, io::Read, path::Path, sync::Arc};
 
 use anyhow::{Error, Result};
-use tracing::{debug, info};
+use tracing::debug;
 
 use super::{huggingface::HuggingFaceTokenizer, tiktoken::TiktokenTokenizer, traits};
 use crate::tokenizer::hub::download_tokenizer_from_hf;
@@ -215,10 +215,10 @@ fn resolve_and_log_chat_template(
 
     match (&provided_path, &final_chat_template) {
         (Some(provided), _) => {
-            info!("Using provided chat template: {}", provided);
+            debug!("Using provided chat template: {}", provided);
         }
         (None, Some(discovered)) => {
-            info!(
+            debug!(
                 "Auto-discovered chat template in '{}': {}",
                 discovery_dir.display(),
                 discovered
@@ -254,14 +254,27 @@ pub async fn create_tokenizer_async_with_chat_template(
     }
 
     // Check if it's a GPT model name that should use Tiktoken
-    if model_name_or_path.contains("gpt-")
+    // Only match specific OpenAI model patterns to avoid catching HuggingFace models like "openai/gpt-oss-20b"
+    if model_name_or_path.contains("gpt-4")
+        || model_name_or_path.contains("gpt-3.5")
+        || model_name_or_path.contains("gpt-3")
+        || model_name_or_path.contains("turbo")
         || model_name_or_path.contains("davinci")
         || model_name_or_path.contains("curie")
         || model_name_or_path.contains("babbage")
         || model_name_or_path.contains("ada")
+        || model_name_or_path.contains("codex")
     {
-        let tokenizer = TiktokenTokenizer::from_model_name(model_name_or_path)?;
-        return Ok(Arc::new(tokenizer));
+        // Try tiktoken first, but fall back to HuggingFace if it fails
+        match TiktokenTokenizer::from_model_name(model_name_or_path) {
+            Ok(tokenizer) => return Ok(Arc::new(tokenizer)),
+            Err(e) => {
+                debug!(
+                    "Tiktoken failed for '{}': {}, falling back to HuggingFace",
+                    model_name_or_path, e
+                );
+            }
+        }
     }
 
     // Try to download tokenizer files from HuggingFace
@@ -439,7 +452,7 @@ mod tests {
         assert!(tokenizer.vocab_size() > 0);
 
         let text = "Hello, world!";
-        let encoding = tokenizer.encode(text).unwrap();
+        let encoding = tokenizer.encode(text, false).unwrap();
         let decoded = tokenizer.decode(encoding.token_ids(), false).unwrap();
         assert_eq!(decoded, text);
     }

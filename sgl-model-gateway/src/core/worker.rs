@@ -8,12 +8,14 @@ use std::{
 };
 
 use async_trait::async_trait;
+use axum::body::Body;
 use serde::{Deserialize, Serialize};
 use serde_json;
 use tokio::{sync::OnceCell, time};
 
 use super::{
     CircuitBreaker, Endpoint, ModelCard, ModelType, ProviderType, WorkerError, WorkerResult,
+    UNKNOWN_MODEL_ID,
 };
 use crate::{
     core::{BasicWorkerBuilder, DPAwareWorkerBuilder},
@@ -179,7 +181,7 @@ pub trait Worker: Send + Sync + fmt::Debug {
                 // Fall back to labels
                 self.metadata().labels.get("model_id").map(|s| s.as_str())
             })
-            .unwrap_or("unknown")
+            .unwrap_or(UNKNOWN_MODEL_ID)
     }
 
     /// Get the priority of this worker (higher value = higher priority)
@@ -238,6 +240,40 @@ pub trait Worker: Send + Sync + fmt::Debug {
     /// Priority: ModelCard.provider > worker.default_provider
     fn provider_for_model(&self, model_id: &str) -> Option<&ProviderType> {
         self.metadata().provider_for_model(model_id)
+    }
+
+    /// Check if a model is a classifier (has id2label mapping).
+    fn is_classifier(&self, model_id: &str) -> bool {
+        self.metadata()
+            .find_model(model_id)
+            .map(|m| m.is_classifier())
+            .unwrap_or(false)
+    }
+
+    /// Get the id2label mapping for a classification model.
+    /// Returns None if model is not a classifier or not found.
+    fn id2label(&self, model_id: &str) -> Option<&std::collections::HashMap<u32, String>> {
+        self.metadata()
+            .find_model(model_id)
+            .filter(|m| m.is_classifier())
+            .map(|m| &m.id2label)
+    }
+
+    /// Get the number of classification labels for a model.
+    fn num_labels(&self, model_id: &str) -> u32 {
+        self.metadata()
+            .find_model(model_id)
+            .map(|m| m.num_labels)
+            .unwrap_or(0)
+    }
+
+    /// Get label for a class index from a classification model.
+    /// Returns generic label (LABEL_N) if model not found or index not in mapping.
+    fn get_label(&self, model_id: &str, class_idx: u32) -> String {
+        self.metadata()
+            .find_model(model_id)
+            .map(|m| m.get_label(class_idx))
+            .unwrap_or_else(|| format!("LABEL_{}", class_idx))
     }
 
     /// Check if this worker supports a specific model.
@@ -586,6 +622,7 @@ impl Worker for BasicWorker {
 
     fn set_healthy(&self, healthy: bool) {
         self.healthy.store(healthy, Ordering::Release);
+        Metrics::set_worker_health(self.url(), healthy);
     }
 
     async fn check_health_async(&self) -> WorkerResult<()> {
@@ -1052,54 +1089,118 @@ pub fn workers_to_urls(workers: &[Box<dyn Worker>]) -> Vec<String> {
     workers.iter().map(|w| w.url().to_string()).collect()
 }
 
-// TODO migrate code to V2 (and then remove this name suffix)
-pub struct WorkerLoadGuardV2 {
+/// RAII guard for worker load management
+///
+/// Automatically decrements worker load when dropped. Can be attached to
+/// an axum Response to tie the guard's lifetime to the response body,
+/// which is essential for streaming responses where the function returns
+/// immediately but the stream continues in the background.
+pub struct WorkerLoadGuard {
     worker: Arc<dyn Worker>,
 }
 
-impl WorkerLoadGuardV2 {
+impl WorkerLoadGuard {
     pub fn new(worker: Arc<dyn Worker>) -> Self {
         worker.increment_load();
         Self { worker }
     }
+
+    /// Attach this guard to a Response, tying the guard's lifetime to the response body.
+    ///
+    /// When the response body is fully consumed or dropped (e.g., client disconnects),
+    /// the guard is dropped and worker load is decremented automatically.
+    ///
+    /// This is the proper RAII pattern for SSE/streaming responses where the handler
+    /// returns immediately but the stream continues in a background task.
+    pub fn attach_to_response(
+        self,
+        response: axum::response::Response,
+    ) -> axum::response::Response {
+        let (parts, body) = response.into_parts();
+
+        // Wrap body with guard - guard drops when body drops
+        let guarded_body = GuardedBody {
+            inner: body,
+            _guard: self,
+        };
+
+        axum::response::Response::from_parts(parts, Body::new(guarded_body))
+    }
 }
 
-impl Drop for WorkerLoadGuardV2 {
+impl Drop for WorkerLoadGuard {
     fn drop(&mut self) {
         self.worker.decrement_load();
     }
 }
 
-/// RAII guard for worker load management
-pub struct WorkerLoadGuard<'a> {
-    workers: Vec<&'a dyn Worker>,
+/// Attach multiple guards to a Response (for dual prefill/decode workers)
+pub fn attach_guards_to_response(
+    guards: Vec<WorkerLoadGuard>,
+    response: axum::response::Response,
+) -> axum::response::Response {
+    let (parts, body) = response.into_parts();
+
+    let guarded_body = MultiGuardedBody {
+        inner: body,
+        _guards: guards,
+    };
+
+    axum::response::Response::from_parts(parts, Body::new(guarded_body))
 }
 
-impl<'a> WorkerLoadGuard<'a> {
-    /// Create a new load guard for a single worker
-    pub fn new(worker: &'a dyn Worker) -> Self {
-        worker.increment_load();
-        Self {
-            workers: vec![worker],
-        }
+/// Body wrapper that holds a WorkerLoadGuard
+///
+/// When this body is dropped (stream ends or client disconnects),
+/// the guard is dropped, decrementing worker load.
+struct GuardedBody {
+    inner: Body,
+    _guard: WorkerLoadGuard,
+}
+
+/// Body wrapper that holds multiple WorkerLoadGuards (for dual prefill/decode)
+struct MultiGuardedBody {
+    inner: Body,
+    _guards: Vec<WorkerLoadGuard>,
+}
+
+impl http_body::Body for GuardedBody {
+    type Data = bytes::Bytes;
+    type Error = axum::Error;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        std::pin::Pin::new(&mut self.inner).poll_frame(cx)
     }
 
-    /// Create a new load guard for multiple workers
-    pub fn new_multi(workers: Vec<&'a dyn Worker>) -> Self {
-        // Increment load counters for all workers
-        for worker in &workers {
-            worker.increment_load();
-        }
-        Self { workers }
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.inner.size_hint()
     }
 }
 
-impl<'a> Drop for WorkerLoadGuard<'a> {
-    fn drop(&mut self) {
-        // Decrement load counters for all workers
-        for worker in &self.workers {
-            worker.decrement_load();
-        }
+impl http_body::Body for MultiGuardedBody {
+    type Data = bytes::Bytes;
+    type Error = axum::Error;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        std::pin::Pin::new(&mut self.inner).poll_frame(cx)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.inner.size_hint()
     }
 }
 
@@ -1535,81 +1636,6 @@ mod tests {
         );
         assert_eq!(worker.url(), "http://decode:8080");
         assert_eq!(worker.worker_type(), &WorkerType::Decode);
-    }
-
-    #[test]
-    fn test_load_guard_single_worker() {
-        use crate::core::BasicWorkerBuilder;
-        let worker = BasicWorkerBuilder::new("http://test:8080")
-            .worker_type(WorkerType::Regular)
-            .build();
-        assert_eq!(worker.load(), 0);
-
-        {
-            let _guard = WorkerLoadGuard::new(&worker);
-            assert_eq!(worker.load(), 1);
-        }
-
-        assert_eq!(worker.load(), 0);
-    }
-
-    #[test]
-    fn test_load_guard_multiple_workers() {
-        let workers: Vec<Box<dyn Worker>> = vec![
-            Box::new(
-                BasicWorkerBuilder::new("http://w1:8080")
-                    .worker_type(WorkerType::Regular)
-                    .build(),
-            ),
-            Box::new(
-                BasicWorkerBuilder::new("http://w2:8080")
-                    .worker_type(WorkerType::Regular)
-                    .build(),
-            ),
-            Box::new(
-                BasicWorkerBuilder::new("http://w3:8080")
-                    .worker_type(WorkerType::Regular)
-                    .build(),
-            ),
-        ];
-
-        let worker_refs: Vec<&dyn Worker> = workers.iter().map(|w| w.as_ref()).collect();
-
-        {
-            let _guard = WorkerLoadGuard::new_multi(worker_refs);
-            assert_eq!(workers[0].load(), 1);
-            assert_eq!(workers[1].load(), 1);
-            assert_eq!(workers[2].load(), 1);
-        }
-
-        assert_eq!(workers[0].load(), 0);
-        assert_eq!(workers[1].load(), 0);
-        assert_eq!(workers[2].load(), 0);
-    }
-
-    #[test]
-    fn test_load_guard_panic_safety() {
-        use crate::core::BasicWorkerBuilder;
-        let worker = Arc::new(
-            BasicWorkerBuilder::new("http://test:8080")
-                .worker_type(WorkerType::Regular)
-                .build(),
-        );
-        assert_eq!(worker.load(), 0);
-
-        let worker_clone = Arc::clone(&worker);
-
-        use std::panic::AssertUnwindSafe;
-
-        let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
-            let _guard = WorkerLoadGuard::new(worker_clone.as_ref());
-            assert_eq!(worker_clone.load(), 1);
-            panic!("Test panic");
-        }));
-
-        assert!(result.is_err());
-
-        assert_eq!(worker.load(), 0);
     }
 
     #[test]

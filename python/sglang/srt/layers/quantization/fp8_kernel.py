@@ -26,7 +26,6 @@ import triton.language as tl
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.utils import (
     ceil_align,
-    direct_register_custom_op,
     get_bool_env_var,
     get_device_core_count,
     get_device_name,
@@ -34,8 +33,8 @@ from sglang.srt.utils import (
     is_cuda,
     is_hip,
     log_info_on_rank0,
-    supports_custom_op,
 )
+from sglang.srt.utils.custom_op import register_custom_op
 
 _is_hip = is_hip()
 _is_cuda = is_cuda()
@@ -90,32 +89,16 @@ else:
     fp8_max = torch.finfo(fp8_dtype).max
 fp8_min = -fp8_max
 
-if supports_custom_op():
 
-    def deep_gemm_fp8_fp8_bf16_nt(
-        A: torch.Tensor,
-        As: torch.Tensor,
-        B: torch.Tensor,
-        Bs: torch.Tensor,
-        C: torch.Tensor,
-    ) -> None:
-        deep_gemm_wrapper.gemm_nt_f8f8bf16((A, As), (B, Bs), C)
-
-    def deep_gemm_fp8_fp8_bf16_nt_fake(
-        A: torch.Tensor,
-        As: torch.Tensor,
-        B: torch.Tensor,
-        Bs: torch.Tensor,
-        C: torch.Tensor,
-    ) -> None:
-        return
-
-    direct_register_custom_op(
-        op_name="deep_gemm_fp8_fp8_bf16_nt",
-        op_func=deep_gemm_fp8_fp8_bf16_nt,
-        mutates_args=["C"],
-        fake_impl=deep_gemm_fp8_fp8_bf16_nt_fake,
-    )
+@register_custom_op(mutates_args=["C"])
+def deep_gemm_fp8_fp8_bf16_nt(
+    A: torch.Tensor,
+    As: torch.Tensor,
+    B: torch.Tensor,
+    Bs: torch.Tensor,
+    C: torch.Tensor,
+) -> None:
+    deep_gemm_wrapper.gemm_nt_f8f8bf16((A, As), (B, Bs), C)
 
 
 @triton.jit
@@ -1081,10 +1064,7 @@ def w8a8_block_fp8_matmul_deepgemm(
     # Deepgemm only supports output tensor type as bfloat16
     assert C.dtype == torch.bfloat16 and deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
 
-    if supports_custom_op():
-        torch.ops.sglang.deep_gemm_fp8_fp8_bf16_nt(A, As, B, Bs, C)
-    else:
-        deep_gemm_wrapper.gemm_nt_f8f8bf16((A, As), (B, Bs), C)
+    deep_gemm_fp8_fp8_bf16_nt(A, As, B, Bs, C)
 
     return C
 

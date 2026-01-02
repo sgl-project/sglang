@@ -199,6 +199,7 @@ impl ParserFactory {
         registry.register_pattern("qwen3", "qwen3");
         registry.register_pattern("qwen", "qwen3");
         registry.register_pattern("glm45", "glm45");
+        registry.register_pattern("glm47", "glm45"); // glm47 uses same reasoning format as glm45
         registry.register_pattern("kimi", "kimi");
         registry.register_pattern("step3", "step3");
         registry.register_pattern("minimax", "minimax");
