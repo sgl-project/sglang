@@ -18,6 +18,7 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
 from sglang.srt.layers.quantization.modelopt_quant import (
     FLASHINFER_FP4_GEMM_BACKEND,
     enable_flashinfer_fp4_gemm,
+    fp4_gemm,
     fp4_quantize,
 )
 from sglang.srt.layers.quantization.utils import swizzle_blockscale
@@ -153,7 +154,7 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsScheme):
             w = layer.weight_packed.T
             w_blockscale = layer.weight_scale.T
 
-        out = torch.ops.sglang.fp4_gemm(
+        out = fp4_gemm(
             x_fp4,
             w,
             x_blockscale,
