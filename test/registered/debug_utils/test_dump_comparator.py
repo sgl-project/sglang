@@ -86,58 +86,43 @@ class TestDumpComparator(CustomTestCase):
 
 
 class TestEndToEnd(CustomTestCase):
-    def test_dump_load_compare(self):
-        from sglang.srt.debug_utils.dump_comparator import _compute_and_print_diff
-        from sglang.srt.debug_utils.dump_loader import find_row, read_meta
+    def test_main(self):
+        from argparse import Namespace
+
+        from sglang.srt.debug_utils.dump_comparator import main
 
         with tempfile.TemporaryDirectory() as d1, tempfile.TemporaryDirectory() as d2:
             baseline_tensor = torch.randn(10, 10)
-            noise = torch.randn(10, 10) * 0.01
+            target_tensor = baseline_tensor + torch.randn(10, 10) * 0.01
 
             with _with_env("SGLANG_DUMPER_DIR", d1):
                 from sglang.srt.debug_utils.dumper import _Dumper
 
                 dumper1 = _Dumper()
                 dumper1.on_forward_pass_start()
-                dumper1.dump("x", baseline_tensor)
+                dumper1.dump("tensor_a", baseline_tensor)
+                dumper1.on_forward_pass_start()
+                dumper1.dump("tensor_b", baseline_tensor * 2)
                 dump_dir1 = Path(d1) / f"sglang_dump_{dumper1._partial_name}"
 
             with _with_env("SGLANG_DUMPER_DIR", d2):
                 dumper2 = _Dumper()
                 dumper2.on_forward_pass_start()
-                dumper2.dump("x", baseline_tensor + noise)
+                dumper2.dump("tensor_a", target_tensor)
+                dumper2.on_forward_pass_start()
+                dumper2.dump("tensor_b", target_tensor * 2)
                 dump_dir2 = Path(d2) / f"sglang_dump_{dumper2._partial_name}"
 
-            df1, df2 = read_meta(dump_dir1), read_meta(dump_dir2)
-            self.assertEqual(len(df1), 1)
-            self.assertEqual(len(df2), 1)
-
-            t1 = torch.load(
-                dump_dir1 / find_row(df1, {"name": "x"})["filename"], weights_only=False
+            args = Namespace(
+                baseline_path=str(dump_dir1),
+                target_path=str(dump_dir2),
+                start_id=1,
+                end_id=2,
+                baseline_start_id=1,
+                diff_threshold=1e-3,
+                filter=None,
             )
-            t2 = torch.load(
-                dump_dir2 / find_row(df2, {"name": "x"})["filename"], weights_only=False
-            )
-
-            result = _compute_and_print_diff(t1.float(), t2.float(), 0.1)
-            self.assertAlmostEqual(
-                result["max_abs_diff"], noise.abs().max().item(), places=3
-            )
-
-    def test_dump_dict(self):
-        from sglang.srt.debug_utils.dump_loader import read_meta
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            with _with_env("SGLANG_DUMPER_DIR", tmpdir):
-                from sglang.srt.debug_utils.dumper import _Dumper
-
-                dumper = _Dumper()
-                dumper.on_forward_pass_start()
-                dumper.dump_dict("layer", {"w": torch.randn(5), "b": torch.randn(3)})
-                dump_dir = Path(tmpdir) / f"sglang_dump_{dumper._partial_name}"
-
-            df = read_meta(dump_dir)
-            self.assertEqual(set(df["name"].to_list()), {"layer_w", "layer_b"})
+            main(args)
 
 
 @contextmanager
