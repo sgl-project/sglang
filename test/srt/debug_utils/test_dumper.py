@@ -54,10 +54,6 @@ class TestDumperDistributed(CustomTestCase):
     def test_http_enable(self):
         _run_distributed_test(_test_http_func)
 
-    def test_dump_dict(self):
-        tmpdir = tempfile.mkdtemp(prefix="test_dumper_")
-        _run_distributed_test(_test_dump_dict_func, tmpdir=tmpdir)
-
     def test_filter(self):
         tmpdir = tempfile.mkdtemp(prefix="test_dumper_")
         _run_distributed_test(_test_filter_func, tmpdir=tmpdir)
@@ -100,10 +96,13 @@ def _test_basic_func(rank, tmpdir):
     dumper.dump("tensor_skip", tensor)
     dumper.override_enable(True)
 
+    dumper.on_forward_pass_start()
+    dumper.dump_dict("obj", {"a": torch.randn(3, device=f"cuda:{rank}"), "b": 42})
+
     dist.barrier()
     filenames = _get_filenames(tmpdir)
 
-    _assert_file_exists(filenames, "tensor_a", "tensor_b", "arg=100", "ctx_arg=200")
+    _assert_file_exists(filenames, "tensor_a", "tensor_b", "arg=100", "ctx_arg=200", "obj_a", "obj_b")
     _assert_file_not_exists(filenames, "tensor_skip")
 
 
@@ -121,17 +120,6 @@ def _test_http_func(rank):
             requests.post("http://localhost:40000/dumper", json={"enable": enable}).raise_for_status()
         dist.barrier()
         assert dumper._enable == enable
-
-
-def _test_dump_dict_func(rank, tmpdir):
-    os.environ["SGLANG_DUMPER_DIR"] = tmpdir
-    from sglang.srt.debug_utils.dumper import dumper
-
-    dumper.on_forward_pass_start()
-    dumper.dump_dict("obj", {"a": torch.randn(3, device=f"cuda:{rank}"), "b": 42})
-
-    dist.barrier()
-    _assert_file_exists(_get_filenames(tmpdir), "obj_a", "obj_b")
 
 
 def _test_filter_func(rank, tmpdir):
