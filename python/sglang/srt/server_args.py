@@ -1310,7 +1310,10 @@ class ServerArgs:
                 f"Disable hybrid SWA memory for {model_arch} as it is not yet supported."
             )
             self.disable_hybrid_swa_memory = True
-        elif model_arch in ["Olmo2ForCausalLM"]:
+        elif model_arch in [
+            "Olmo2ForCausalLM",
+            "ExaoneMoEForCausalLM",
+        ]:
             # FIXME: https://github.com/sgl-project/sglang/pull/7367 is not compatible with Olmo3 model.
             logger.warning(
                 f"Disabling hybrid SWA memory for {model_arch} as it is not yet supported."
