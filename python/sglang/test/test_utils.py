@@ -560,32 +560,23 @@ def popen_with_error_check(command: list[str], allow_exit: bool = False):
 
 def _try_enable_offline_mode_if_cache_complete(model_name_or_path: str, env: dict):
     """
-    CI helper: Validate local cache and enable offline mode if complete.
+    CI helper: Check if model cache is validated and enable offline mode.
 
-    This function checks if the model is already cached locally with all
-    required files (config, tokenizer, weights). If so, it sets HF_HUB_OFFLINE=1
-    in the provided env dict to avoid HF Hub network requests during server init.
-
-    Uses snapshot-level markers to cache validation results, so heavy validation
-    is done at most once per snapshot per runner.
+    The heavy validation is done once during CI initialization (prepare_runner.sh
+    via prevalidate_cached_models.py). This function only reads the validation
+    marker to decide whether to enable offline mode.
 
     Args:
         model_name_or_path: Model identifier or path
-        env: Environment dict to modify (will add HF_HUB_OFFLINE=1 if cache is complete)
+        env: Environment dict to modify (will add HF_HUB_OFFLINE=1 if marker exists)
     """
-    import glob
-    import json
-
-    from sglang.srt.model_loader.ci_weight_validation import (
-        ci_validate_cache_and_enable_offline_if_complete,
-    )
+    from sglang.srt.model_loader.ci_weight_validation import _read_validation_marker
     from sglang.srt.utils import find_local_repo_dir
 
-    # Fast-path: If subprocess env already has HF_HUB_OFFLINE=1, skip validation
+    # Fast-path: If subprocess env already has HF_HUB_OFFLINE=1, skip
     if env.get("HF_HUB_OFFLINE") == "1":
         print(
-            f"CI_OFFLINE: Subprocess env already has HF_HUB_OFFLINE=1, "
-            f"skip validation - {model_name_or_path}"
+            f"CI_OFFLINE: Subprocess env already has HF_HUB_OFFLINE=1, skip - {model_name_or_path}"
         )
         return
 
@@ -597,94 +588,25 @@ def _try_enable_offline_mode_if_cache_complete(model_name_or_path: str, env: dic
     try:
         snapshot_dir = find_local_repo_dir(model_name_or_path, revision=None)
         if not snapshot_dir or not os.path.isdir(snapshot_dir):
-            print(f"CI: No local cache found for {model_name_or_path}")
             return
-    except Exception as e:
-        print(f"CI: Failed to find local snapshot for {model_name_or_path}: {e}")
+    except Exception:
         return
 
-    # Sanity check: ensure this is a HF snapshot path
-    if "snapshots" not in snapshot_dir:
-        print(f"CI: snapshot_dir not a HF snapshot path: ...{snapshot_dir[-50:]}")
-        return
-
-    # Scan for weight files - prioritize index files for sharded models
-    weight_files = []
-
-    # First, look for index files
-    index_patterns = ["*.safetensors.index.json", "pytorch_model.bin.index.json"]
-    index_files = []
-    for pattern in index_patterns:
-        index_files.extend(glob.glob(os.path.join(snapshot_dir, pattern)))
-
-    # If we have safetensors index, collect shards from it
-    for index_file in index_files:
-        if index_file.endswith(".safetensors.index.json"):
-            try:
-                with open(index_file, "r", encoding="utf-8") as f:
-                    index_data = json.load(f)
-                weight_map = index_data.get("weight_map", {})
-                for weight_file in set(weight_map.values()):
-                    weight_path = os.path.join(snapshot_dir, weight_file)
-                    if os.path.exists(weight_path):
-                        weight_files.append(weight_path)
-            except Exception as e:
-                print(f"CI: Failed to parse index {os.path.basename(index_file)}: {e}")
-
-    # If no index found or no shards from index, do recursive glob for safetensors
-    if not weight_files:
-        matched = glob.glob(
-            os.path.join(snapshot_dir, "**/*.safetensors"), recursive=True
-        )
-        # Limit to avoid scanning too many files
-        MAX_WEIGHT_FILES = 1000
-        if len(matched) > MAX_WEIGHT_FILES:
-            print(
-                f"CI: Too many safetensors files ({len(matched)} > {MAX_WEIGHT_FILES}), "
-                "will use online mode to be safe"
-            )
-            return
-
-        for f in matched:
-            if os.path.exists(f):  # Filter out broken symlinks
-                weight_files.append(f)
-
-    # Guard: require at least one weight file to enable offline mode
-    if not weight_files:
+    # Check validation marker (written by prepare_runner.sh prevalidation)
+    marker = _read_validation_marker(snapshot_dir)
+    if marker is not None:
+        # IMPORTANT: Set HF_HUB_OFFLINE=1 ONLY for this subprocess, not globally
+        env["HF_HUB_OFFLINE"] = "1"
+        snapshot_basename = os.path.basename(snapshot_dir)
         print(
-            f"CI_OFFLINE: No weight files found, skip offline, keep online allowed - {model_name_or_path}"
+            f"CI_OFFLINE: Enabled HF_HUB_OFFLINE=1 for subprocess - "
+            f"marker found for {model_name_or_path} (snapshot={snapshot_basename})"
         )
-        return
-
-    # Print cache info for verification
-    snapshot_basename = os.path.basename(snapshot_dir)
-    print(
-        f"CI_OFFLINE: Validating cache for {model_name_or_path} - "
-        f"snapshot={snapshot_basename}, weight_files={len(weight_files)}"
-    )
-
-    # Validate cache completeness (uses marker for result caching)
-    try:
-        cache_complete = ci_validate_cache_and_enable_offline_if_complete(
-            snapshot_dir=snapshot_dir,
-            weight_files=weight_files,
-            model_name_or_path=model_name_or_path,
+    else:
+        print(
+            f"CI_OFFLINE: No validation marker for {model_name_or_path}, "
+            "will use online mode (allows HF to download missing files)"
         )
-
-        if cache_complete:
-            # IMPORTANT: Set HF_HUB_OFFLINE=1 ONLY for this subprocess, not globally
-            env["HF_HUB_OFFLINE"] = "1"
-            print(
-                f"CI_OFFLINE: Enabled HF_HUB_OFFLINE=1 for subprocess only - "
-                f"cache validation passed for {model_name_or_path}"
-            )
-        else:
-            print(
-                f"CI_OFFLINE: Cache validation failed for {model_name_or_path}, "
-                "will use online mode (allows HF to download missing files)"
-            )
-    except Exception as e:
-        print(f"CI: Cache validation raised exception for {model_name_or_path}: {e}")
 
 
 def popen_launch_server(
