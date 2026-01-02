@@ -75,16 +75,11 @@ def _get_filenames(tmpdir):
     return {f.name for f in Path(tmpdir).glob("sglang_dump_*/*.pt")}
 
 
-def _assert_file_exists(filenames, *patterns):
-    for p in patterns:
+def _assert_files(filenames, *, exist=(), not_exist=()):
+    for p in exist:
         assert any(p in f for f in filenames), f"{p} not found in {filenames}"
-
-
-def _assert_file_not_exists(filenames, *patterns):
-    for p in patterns:
-        assert not any(
-            p in f for f in filenames
-        ), f"{p} should not exist in {filenames}"
+    for p in not_exist:
+        assert not any(p in f for f in filenames), f"{p} should not exist in {filenames}"
 
 
 def _test_basic_func(rank, tmpdir):
@@ -112,10 +107,11 @@ def _test_basic_func(rank, tmpdir):
     dist.barrier()
     filenames = _get_filenames(tmpdir)
 
-    _assert_file_exists(
-        filenames, "tensor_a", "tensor_b", "arg=100", "ctx_arg=200", "obj_a", "obj_b"
+    _assert_files(
+        filenames,
+        exist=["tensor_a", "tensor_b", "arg=100", "ctx_arg=200", "obj_a", "obj_b"],
+        not_exist=["tensor_skip"],
     )
-    _assert_file_not_exists(filenames, "tensor_skip")
 
 
 def _test_http_func(rank):
@@ -147,8 +143,7 @@ def _test_filter_func(rank, tmpdir):
 
     dist.barrier()
     filenames = _get_filenames(tmpdir)
-    _assert_file_exists(filenames, "keep_this")
-    _assert_file_not_exists(filenames, "skip_this")
+    _assert_files(filenames, exist=["keep_this"], not_exist=["skip_this"])
 
 
 def _test_write_disabled_func(rank, tmpdir):
