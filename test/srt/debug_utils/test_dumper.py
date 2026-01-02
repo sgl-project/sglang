@@ -12,27 +12,6 @@ import torch.multiprocessing as mp
 from sglang.test.test_utils import CustomTestCase
 
 
-class TestDumperDistributed(CustomTestCase):
-    def test_basic(self):
-        tmpdir = tempfile.mkdtemp(prefix="test_dumper_")
-        _run_distributed_test(_test_basic_func, tmpdir=tmpdir)
-
-    def test_disable_at_startup_use_http_to_enable(self):
-        _run_distributed_test(_test_http_func)
-
-    def test_dump_dict(self):
-        tmpdir = tempfile.mkdtemp(prefix="test_dumper_dump_dict_")
-        _run_distributed_test(_test_dump_dict_func, tmpdir=tmpdir)
-
-    def test_filter_env_var(self):
-        tmpdir = tempfile.mkdtemp(prefix="test_dumper_filter_")
-        _run_distributed_test(_test_filter_func, tmpdir=tmpdir)
-
-    def test_write_file_disabled(self):
-        tmpdir = tempfile.mkdtemp(prefix="test_dumper_no_write_")
-        _run_distributed_test(_test_write_file_disabled_func, tmpdir=tmpdir)
-
-
 class TestDumperUtils(CustomTestCase):
     def test_get_truncated_value_none(self):
         from sglang.srt.debug_utils.dumper import get_truncated_value
@@ -117,6 +96,27 @@ class TestDumperUtils(CustomTestCase):
         info = get_tensor_info(tensor)
         assert "shape=" in info
         assert "min=None" in info
+
+
+class TestDumperDistributed(CustomTestCase):
+    def test_basic(self):
+        tmpdir = tempfile.mkdtemp(prefix="test_dumper_")
+        _run_distributed_test(_test_basic_func, tmpdir=tmpdir)
+
+    def test_disable_at_startup_use_http_to_enable(self):
+        _run_distributed_test(_test_http_func)
+
+    def test_dump_dict(self):
+        tmpdir = tempfile.mkdtemp(prefix="test_dumper_dump_dict_")
+        _run_distributed_test(_test_dump_dict_func, tmpdir=tmpdir)
+
+    def test_filter_env_var(self):
+        tmpdir = tempfile.mkdtemp(prefix="test_dumper_filter_")
+        _run_distributed_test(_test_filter_func, tmpdir=tmpdir)
+
+    def test_write_file_disabled(self):
+        tmpdir = tempfile.mkdtemp(prefix="test_dumper_no_write_")
+        _run_distributed_test(_test_write_file_disabled_func, tmpdir=tmpdir)
 
 
 def _test_basic_func(rank, tmpdir):
