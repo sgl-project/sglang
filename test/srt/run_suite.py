@@ -135,6 +135,7 @@ suites = {
         TestFile("models/test_kimi_k2_models.py", 200),
         TestFile("test_deepseek_v32_basic.py", 275),
         TestFile("test_deepseek_v32_mtp.py", 275),
+        TestFile("test_deepseek_v32_cp_single_node.py", 360),
         TestFile("models/test_mimo_models.py", 200),
     ],
     "per-commit-8-gpu-h20": [
