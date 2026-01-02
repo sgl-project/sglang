@@ -104,7 +104,7 @@ class TestLoRAPrefetch(CustomTestCase):
             for dtype in TORCH_DTYPES:
                 self._run_mixed_batch_test(model_case, dtype)
 
-    def test_prefetch_one_by_one(self):
+    def test_prefetch_tp(self):
         for model_case in CI_MULTI_LORA_MODELS:
             # If skip_long_prompt is True, filter out prompts longer than 1000 characters
             prompts = (
@@ -112,6 +112,7 @@ class TestLoRAPrefetch(CustomTestCase):
                 if not model_case.skip_long_prompt
                 else [p for p in DEFAULT_PROMPTS if len(p) < 1000]
             )
+            model_case.tp_size = 2
             for dtype in TORCH_DTYPES:
                 run_lora_test_one_by_one(
                     prompts,
@@ -119,6 +120,7 @@ class TestLoRAPrefetch(CustomTestCase):
                     dtype,
                     max_new_tokens=32,
                     enable_lora_prefetch=True,
+                    test_tag=f"tp={model_case.tp_size}",
                 )
 
 
