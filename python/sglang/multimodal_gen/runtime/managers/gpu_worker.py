@@ -20,6 +20,7 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
 )
 from sglang.multimodal_gen.runtime.pipelines_core import (
     ComposedPipelineBase,
+    LoRAPipeline,
     Req,
     build_pipeline,
 )
@@ -203,7 +204,7 @@ class GPUWorker:
         lora_path: str | None = None,
         target: str = "all",
         strength: float = 1.0,
-    ) -> None:
+    ) -> OutputBatch:
         """
         Set the LoRA adapter for the pipeline.
 
@@ -213,10 +214,14 @@ class GPUWorker:
             target: Which transformer(s) to apply the LoRA to.
             strength: LoRA strength for merge, default 1.0.
         """
-        assert self.pipeline is not None
+        if not isinstance(self.pipeline, LoRAPipeline):
+            return OutputBatch(error="Lora is not enabled")
         self.pipeline.set_lora(lora_nickname, lora_path, target, strength)
+        return OutputBatch()
 
-    def merge_lora_weights(self, target: str = "all", strength: float = 1.0) -> None:
+    def merge_lora_weights(
+        self, target: str = "all", strength: float = 1.0
+    ) -> OutputBatch:
         """
         Merge LoRA weights.
 
@@ -224,18 +229,22 @@ class GPUWorker:
             target: Which transformer(s) to merge.
             strength: LoRA strength for merge, default 1.0.
         """
-        assert self.pipeline is not None
+        if not isinstance(self.pipeline, LoRAPipeline):
+            return OutputBatch(error="Lora is not enabled")
         self.pipeline.merge_lora_weights(target, strength)
+        return OutputBatch()
 
-    def unmerge_lora_weights(self, target: str = "all") -> None:
+    def unmerge_lora_weights(self, target: str = "all") -> OutputBatch:
         """
         Unmerge LoRA weights.
 
         Args:
             target: Which transformer(s) to unmerge.
         """
-        assert self.pipeline is not None
+        if not isinstance(self.pipeline, LoRAPipeline):
+            return OutputBatch(error="Lora is not enabled")
         self.pipeline.unmerge_lora_weights(target)
+        return OutputBatch()
 
 
 def run_scheduler_process(
