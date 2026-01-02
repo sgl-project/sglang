@@ -106,7 +106,6 @@ class TestDeepseekV32CPMode1(CustomTestCase):
             "--trust-remote-code",
             "--tp",
             "8",
-            "--enable-dp-attention",
             "--speculative-algorithm",
             "EAGLE",
             "--speculative-num-steps",

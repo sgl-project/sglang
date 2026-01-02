@@ -1080,6 +1080,7 @@ class ServerArgs:
                                 f"For in-seq split mode, we have the following restrictions: moe_dense_tp_size == 1, moe_a2a_backend == deepep, ep_size == tp_size, kv_cache_dtype == bf16, batch_size == 1"
                             )
                         else:
+                            self.moe_dense_tp_size = 1
                             assert (
                                 self.dp_size == 1
                             ), "For round-robin split mode, dp attention is not supported."
