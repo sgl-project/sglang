@@ -10,6 +10,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 from sgl_kernel import fused_add_rmsnorm, rmsnorm
 
+from sglang.jit_kernel.diffusion.fused_norm_scale_shift import fused_norm_scale_shift
+from sglang.jit_kernel.diffusion.fused_scale_residual_norm_scale_shift import (
+    fused_scale_residual_norm_scale_shift,
+)
 from sglang.jit_kernel.norm import can_use_fused_inplace_qknorm, fused_inplace_qknorm
 from sglang.multimodal_gen.runtime.layers.custom_op import CustomOp
 from sglang.multimodal_gen.runtime.layers.triton_ops import (
@@ -17,10 +21,15 @@ from sglang.multimodal_gen.runtime.layers.triton_ops import (
     norm_infer,
     rms_norm_fn,
 )
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.common import get_bool_env_var
+
+_is_cuda = current_platform.is_cuda()
 
 
 # Copied and adapted from sglang
+
+
 @CustomOp.register("rms_norm")
 class RMSNorm(CustomOp):
     """Root mean square normalization.
@@ -264,11 +273,14 @@ class FP32LayerNorm(nn.LayerNorm):
         ).to(origin_dtype)
 
 
-class ScaleResidualLayerNormScaleShift(nn.Module):
+################################################################################
+# Fused norm kernel
+################################################################################
+class _ScaleResidualNormScaleShift(nn.Module):
     """
     Fused operation that combines:
     1. Gated residual connection
-    2. LayerNorm
+    2. LayerNorm or RMSNorm
     3. Scale and shift operations
 
     This reduces memory bandwidth by combining memory-bound operations.
@@ -277,7 +289,7 @@ class ScaleResidualLayerNormScaleShift(nn.Module):
     def __init__(
         self,
         hidden_size: int,
-        norm_type: str = "rms",
+        norm_type: str,
         eps: float = 1e-6,
         elementwise_affine: bool = False,
         dtype: torch.dtype = torch.float32,
@@ -285,6 +297,8 @@ class ScaleResidualLayerNormScaleShift(nn.Module):
         prefix: str = "",
     ):
         super().__init__()
+        self.norm_type = norm_type
+        self.eps = eps
         if norm_type == "rms":
             self.norm = RMSNorm(
                 hidden_size, has_weight=elementwise_affine, eps=eps, dtype=dtype
@@ -322,45 +336,144 @@ class ScaleResidualLayerNormScaleShift(nn.Module):
             - residual value (value after residual connection
               but before normalization)
         """
-        # x.shape: [batch_size, seq_len, inner_dim]
-        # Apply residual connection with gating
-        if isinstance(gate, int):
-            # used by cross-attention, should be 1
-            assert gate == 1
-            residual_output = residual + x
-        elif isinstance(gate, torch.Tensor):
-            if gate.dim() == 4:
-                # gate.shape: [batch_size, num_frames, 1, inner_dim]
-                num_frames = gate.shape[1]
-                frame_seqlen = x.shape[1] // num_frames
-                residual_output = residual + (
-                    x.unflatten(dim=1, sizes=(num_frames, frame_seqlen)) * gate
-                ).flatten(1, 2)
+        can_use_cuda = _is_cuda and (x.shape[-1] % 4 == 0)
+        if can_use_cuda:
+            B, L, C = x.shape
+            M = B * L
+            x_2d = x.contiguous().view(-1, C)
+            residual_2d = residual.contiguous().view(-1, C)
+
+            # gamma/beta
+            gamma_opt = None
+            if getattr(self.norm, "weight", None) is not None:
+                gamma_opt = self.norm.weight.contiguous().to(
+                    dtype=x.dtype, device=x.device
+                )
+            beta_opt = None
+            if getattr(self.norm, "bias", None) is not None:
+                beta_opt = self.norm.bias.contiguous().to(
+                    dtype=x.dtype, device=x.device
+                )
+
+            def get_arg(t):
+                if t.dim() == 0 or (t.dim() == 1 and t.numel() == 1):
+                    return t.reshape(1).to(dtype=x.dtype, device=x.device)
+                elif (t.dim() == 2 and t.shape[0] == 1) or (
+                    t.dim() == 3 and t.shape[0] == 1 and t.shape[1] == 1
+                ):
+                    return t.contiguous().to(dtype=x.dtype, device=x.device)
+                elif t.dim() == 2 or t.dim() == 3:
+                    return (
+                        t.expand(B, L, C)
+                        .contiguous()
+                        .view(M, C)
+                        .to(dtype=x.dtype, device=x.device)
+                    )
+                elif t.dim() == 4:
+                    return t.contiguous().to(dtype=x.dtype, device=x.device)
+                else:
+                    raise ValueError(
+                        f"Scale/shift tensor dimension {t.dim()} not supported"
+                    )
+
+            scale_arg = get_arg(scale)
+            shift_arg = get_arg(shift)
+
+            gate_opt = None
+            if isinstance(gate, int):
+                # used by cross-attention, should be 1
+                assert gate == 1
+            elif isinstance(gate, torch.Tensor):
+                if (gate.dim() == 2 and gate.shape[0] == 1) or (
+                    gate.dim() == 3 and gate.shape[0] == 1 and gate.shape[1] == 1
+                ):
+                    gate_opt = gate.contiguous().to(dtype=x.dtype, device=x.device)
+                elif gate.dim() == 4:
+                    # gate.shape: [batch_size, num_frames, 1, inner_dim]
+                    gate_opt = gate.contiguous().to(dtype=x.dtype, device=x.device)
+                elif gate.dim() == 3:
+                    # gate.shape: [batch_size, 1, inner_dim]
+                    gate_opt = gate.contiguous().to(dtype=x.dtype, device=x.device)
+                elif gate.dim() == 2:
+                    gate_opt = (
+                        gate.expand(M, C)
+                        .contiguous()
+                        .view(M, C)
+                        .to(dtype=x.dtype, device=x.device)
+                    )
             else:
-                # used by bidirectional self attention
-                # gate.shape: [batch_size, 1, inner_dim]
-                residual_output = residual + x * gate
+                raise ValueError(f"Gate type {type(gate)} not supported")
+
+            y_2d, residual_output = fused_scale_residual_norm_scale_shift(
+                residual_2d,
+                x_2d,
+                gate_opt,
+                gamma_opt,
+                beta_opt,
+                scale_arg,
+                shift_arg,
+                self.norm_type,
+                self.eps,
+            )
+            return y_2d.view(B, L, C), residual_output.view(B, L, C)
+
         else:
-            raise ValueError(f"Gate type {type(gate)} not supported")
-        # residual_output.shape: [batch_size, seq_len, inner_dim]
+            # Fallback path for triton kernel (not fused)
+            # x.shape: [batch_size, seq_len, inner_dim]
+            # Compute residual_output to return (kernel also computes this internally)
+            if isinstance(gate, int):
+                # used by cross-attention, should be 1
+                assert gate == 1
+                residual_output = residual + x
+            elif isinstance(gate, torch.Tensor):
+                if gate.dim() == 4:
+                    # gate.shape: [batch_size, num_frames, 1, inner_dim]
+                    num_frames = gate.shape[1]
+                    frame_seqlen = x.shape[1] // num_frames
+                    residual_output = residual + (
+                        x.unflatten(dim=1, sizes=(num_frames, frame_seqlen)) * gate
+                    ).flatten(1, 2)
+                else:
+                    # gate.shape: [batch_size, 1, inner_dim]
+                    residual_output = residual + x * gate
+            else:
+                raise ValueError(f"Gate type {type(gate)} not supported")
+            normalized = self.norm(residual_output)
+            modulated = fuse_scale_shift_kernel(normalized, scale, shift)
+            return modulated, residual_output
 
-        # Apply normalization
-        normalized = self.norm(residual_output)
 
-        # modulated = fused_scale_shift(
-        #     normalized,
-        #     scale,
-        #     shift,
-        # )
-        modulated = fuse_scale_shift_kernel(
-            normalized,
-            scale,
-            shift,
+class ScaleResidualLayerNormScaleShift(_ScaleResidualNormScaleShift):
+    def __init__(
+        self,
+        hidden_size: int,
+        eps: float = 1e-6,
+        elementwise_affine: bool = False,
+        dtype: torch.dtype = torch.float32,
+        compute_dtype: torch.dtype | None = None,
+        prefix: str = "",
+    ):
+        super().__init__(
+            hidden_size, "layer", eps, elementwise_affine, dtype, compute_dtype, prefix
         )
-        return modulated, residual_output
 
 
-class LayerNormScaleShift(nn.Module):
+class ScaleResidualRMSNormScaleShift(_ScaleResidualNormScaleShift):
+    def __init__(
+        self,
+        hidden_size: int,
+        eps: float = 1e-6,
+        elementwise_affine: bool = False,
+        dtype: torch.dtype = torch.float32,
+        compute_dtype: torch.dtype | None = None,
+        prefix: str = "",
+    ):
+        super().__init__(
+            hidden_size, "rms", eps, elementwise_affine, dtype, compute_dtype, prefix
+        )
+
+
+class _NormScaleShift(nn.Module):
     """
     Fused operation that combines LayerNorm with scale and shift operations.
     This reduces memory bandwidth by combining memory-bound operations.
@@ -369,7 +482,7 @@ class LayerNormScaleShift(nn.Module):
     def __init__(
         self,
         hidden_size: int,
-        norm_type: str = "rms",
+        norm_type: str,
         eps: float = 1e-6,
         elementwise_affine: bool = False,
         dtype: torch.dtype = torch.float32,
@@ -378,6 +491,8 @@ class LayerNormScaleShift(nn.Module):
     ):
         super().__init__()
         self.compute_dtype = compute_dtype
+        self.norm_type = norm_type
+        self.eps = eps
         if norm_type == "rms":
             self.norm = RMSNorm(hidden_size, has_weight=elementwise_affine, eps=eps)
         elif norm_type == "layer":
@@ -395,33 +510,130 @@ class LayerNormScaleShift(nn.Module):
         else:
             raise NotImplementedError(f"Norm type {norm_type} not implemented")
 
+    def _get_arg(
+        self,
+        t: torch.Tensor,
+        x: torch.Tensor,
+        B: int,
+        L: int,
+        C: int,
+        M: int,
+    ) -> torch.Tensor:
+        if t.dim() == 0 or (t.dim() == 1 and t.numel() == 1):
+            return t.reshape(1).to(dtype=x.dtype, device=x.device)
+        elif (t.dim() == 2 and t.shape[0] == 1) or (
+            t.dim() == 3 and t.shape[0] == 1 and t.shape[1] == 1
+        ):
+            return t.contiguous().to(dtype=x.dtype, device=x.device)
+        elif t.dim() == 2 or t.dim() == 3:
+            return (
+                t.expand(B, L, C)
+                .contiguous()
+                .view(M, C)
+                .to(dtype=x.dtype, device=x.device)
+            )
+        elif t.dim() == 4:
+            return t.contiguous().to(dtype=x.dtype, device=x.device)
+        else:
+            raise ValueError(f"Scale/shift tensor dimension {t.dim()} not supported")
+
     def forward(
         self, x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor
     ) -> torch.Tensor:
         """Apply ln followed by scale and shift in a single fused operation."""
-        # x.shape: [batch_size, seq_len, inner_dim]
-        normalized = self.norm(x)
-        if self.compute_dtype == torch.float32:
-            normalized = normalized.float()
+        can_use_cuda = _is_cuda and (x.shape[-1] % 4 == 0)  # x.shape[-1]: hidden_size
+        if can_use_cuda:
+            B, L, C = x.shape
+            M = B * L
+            x_2d = x.contiguous().view(-1, C)
 
-        if scale.dim() == 4:
-            # scale.shape: [batch_size, num_frames, 1, inner_dim]
-            num_frames = scale.shape[1]
-            frame_seqlen = normalized.shape[1] // num_frames
-            output = (
-                normalized.unflatten(dim=1, sizes=(num_frames, frame_seqlen))
-                * (1.0 + scale)
-                + shift
-            ).flatten(1, 2)
+            if (
+                getattr(self.norm, "weight", None) is None
+                and getattr(self.norm, "bias", None) is None
+            ):
+
+                if scale.dim() == 4 or shift.dim() == 4:
+                    raise ValueError(
+                        "Only 2D scale/shift are supported by the no_affine kernel. "
+                    )
+
+                scale_arg = self._get_arg(scale, x, B, L, C, M)
+                shift_arg = self._get_arg(shift, x, B, L, C, M)
+
+                y_2d = fused_norm_scale_shift(
+                    x_2d, None, None, scale_arg, shift_arg, self.norm_type, self.eps
+                )
+                return y_2d.view(B, L, C)
+
+            # Standard path: use affine LayerNorm + fused scale/shift kernel.
+            gamma_opt = self.norm.weight.contiguous().to(dtype=x.dtype, device=x.device)
+            beta_opt = None
+            if self.norm.bias is not None:
+                beta_opt = self.norm.bias.contiguous().to(
+                    dtype=x.dtype, device=x.device
+                )
+
+            scale_arg = self._get_arg(scale, x, B, L, C, M)
+            shift_arg = self._get_arg(shift, x, B, L, C, M)
+
+            y_2d = fused_norm_scale_shift(
+                x_2d,
+                gamma_opt,
+                beta_opt,
+                scale_arg,
+                shift_arg,
+                self.norm_type,
+                self.eps,
+            )
+            return y_2d.view(B, L, C)
         else:
-            # scale.shape: [batch_size, 1, inner_dim]
-            # shift.shape: [batch_size, 1, inner_dim]
-            output = normalized * (1.0 + scale) + shift
+            # Fallback path for triton kernel (not fused)
+            normalized = self.norm(x)
+            if self.compute_dtype == torch.float32:
+                normalized = normalized.float()
+            if scale.dim() == 4:
+                num_frames = scale.shape[1]
+                frame_seqlen = normalized.shape[1] // num_frames
+                output = (
+                    normalized.unflatten(dim=1, sizes=(num_frames, frame_seqlen))
+                    * (1.0 + scale)
+                    + shift
+                ).flatten(1, 2)
+            else:
+                output = normalized * (1.0 + scale) + shift
+            if self.compute_dtype == torch.float32:
+                output = output.to(x.dtype)
+            return output
 
-        if self.compute_dtype == torch.float32:
-            output = output.to(x.dtype)
 
-        return output
+class LayerNormScaleShift(_NormScaleShift):
+    def __init__(
+        self,
+        hidden_size: int,
+        eps: float = 1e-6,
+        elementwise_affine: bool = False,
+        dtype: torch.dtype = torch.float32,
+        compute_dtype: torch.dtype | None = None,
+        prefix: str = "",
+    ):
+        super().__init__(
+            hidden_size, "layer", eps, elementwise_affine, dtype, compute_dtype, prefix
+        )
+
+
+class RMSNormScaleShift(_NormScaleShift):
+    def __init__(
+        self,
+        hidden_size: int,
+        eps: float = 1e-6,
+        elementwise_affine: bool = False,
+        dtype: torch.dtype = torch.float32,
+        compute_dtype: torch.dtype | None = None,
+        prefix: str = "",
+    ):
+        super().__init__(
+            hidden_size, "rms", eps, elementwise_affine, dtype, compute_dtype, prefix
+        )
 
 
 def apply_qk_norm(
@@ -462,3 +674,14 @@ def apply_qk_norm(
         "apply_qk_norm: fused inplace QK-norm is not applicable "
         "(expected CUDA, contiguous q/k, matching eps, and supported head_dim)"
     )
+
+
+# TODO: Workaround, fuse norm with new select01 kernel
+def apply_layernorm_only(x: torch.Tensor, layernorm_scale_shift: LayerNormScaleShift):
+    return norm_infer(
+        x.view(-1, x.shape[-1]),
+        layernorm_scale_shift.norm.weight,
+        layernorm_scale_shift.norm.bias,
+        eps=layernorm_scale_shift.eps,
+        is_rms_norm=False,
+    ).view(x.shape)
