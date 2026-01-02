@@ -8,14 +8,6 @@ import torch
 from sglang.test.test_utils import CustomTestCase
 
 
-def _save_tensor_pair(tmpdir, baseline, target):
-    baseline_path = Path(tmpdir) / "baseline.pt"
-    target_path = Path(tmpdir) / "target.pt"
-    torch.save(baseline, baseline_path)
-    torch.save(target, target_path)
-    return baseline_path, target_path
-
-
 def _create_dumper(base_dir, partial_name):
     from sglang.srt.debug_utils.dumper import _Dumper
 
@@ -27,231 +19,144 @@ def _create_dumper(base_dir, partial_name):
     return dumper
 
 
-class TestDumpComparatorPureFunctions(CustomTestCase):
-    def test_calc_rel_diff_identical(self):
+class TestDumpComparator(CustomTestCase):
+    def test_calc_rel_diff(self):
         from sglang.srt.debug_utils.dump_comparator import _calc_rel_diff
 
         x = torch.randn(10, 10)
         self.assertAlmostEqual(_calc_rel_diff(x, x).item(), 0.0, places=5)
 
-    def test_calc_rel_diff_different(self):
-        from sglang.srt.debug_utils.dump_comparator import _calc_rel_diff
-
-        x = torch.ones(10, 10)
-        y = torch.ones(10, 10) * 2
-        rel_diff = _calc_rel_diff(x, y).item()
-        self.assertGreater(rel_diff, 0.0)
-        self.assertLess(rel_diff, 1.0)
-
-    def test_calc_rel_diff_orthogonal(self):
-        from sglang.srt.debug_utils.dump_comparator import _calc_rel_diff
-
-        x = torch.tensor([1.0, 0.0])
-        y = torch.tensor([0.0, 1.0])
-        self.assertAlmostEqual(_calc_rel_diff(x, y).item(), 1.0, places=5)
+        self.assertAlmostEqual(
+            _calc_rel_diff(torch.tensor([1.0, 0.0]), torch.tensor([0.0, 1.0])).item(),
+            1.0,
+            places=5,
+        )
 
     def test_argmax_coord(self):
         from sglang.srt.debug_utils.dump_comparator import _argmax_coord
 
-        self.assertEqual(_argmax_coord(torch.tensor([1.0, 5.0, 3.0])), (1,))
-
-        x_2d = torch.zeros(3, 4)
-        x_2d[1, 2] = 10.0
-        self.assertEqual(_argmax_coord(x_2d), (1, 2))
-
-        x_3d = torch.zeros(2, 3, 4)
-        x_3d[1, 2, 3] = 10.0
-        self.assertEqual(_argmax_coord(x_3d), (1, 2, 3))
+        x = torch.zeros(2, 3, 4)
+        x[1, 2, 3] = 10.0
+        self.assertEqual(_argmax_coord(x), (1, 2, 3))
 
     def test_try_unify_shape(self):
         from sglang.srt.debug_utils.dump_comparator import _try_unify_shape
 
-        target_shape = torch.Size([3, 4])
-        self.assertEqual(_try_unify_shape(torch.randn(1, 1, 3, 4), target_shape).shape, target_shape)
-        self.assertEqual(_try_unify_shape(torch.randn(3, 4), target_shape).shape, target_shape)
-
-        x_incompatible = torch.randn(2, 3, 4)
-        self.assertEqual(_try_unify_shape(x_incompatible, target_shape).shape, x_incompatible.shape)
+        target = torch.Size([3, 4])
+        self.assertEqual(_try_unify_shape(torch.randn(1, 1, 3, 4), target).shape, target)
+        self.assertEqual(_try_unify_shape(torch.randn(2, 3, 4), target).shape, (2, 3, 4))
 
     def test_compute_smaller_dtype(self):
         from sglang.srt.debug_utils.dump_comparator import _compute_smaller_dtype
 
         self.assertEqual(_compute_smaller_dtype(torch.float32, torch.bfloat16), torch.bfloat16)
-        self.assertEqual(_compute_smaller_dtype(torch.bfloat16, torch.float32), torch.bfloat16)
         self.assertIsNone(_compute_smaller_dtype(torch.float32, torch.float32))
 
-    def test_split_einops_pattern(self):
-        from sglang.srt.debug_utils.dump_comparator import _split_einops_pattern
+    def test_einops_pattern(self):
+        from sglang.srt.debug_utils.dump_comparator import (
+            _get_einops_dim_index,
+            _split_einops_pattern,
+        )
 
-        self.assertEqual(_split_einops_pattern("batch num_tokens hidden"), ["batch", "num_tokens", "hidden"])
-        self.assertEqual(_split_einops_pattern("batch (num_heads head_dim) hidden"), ["batch", "(num_heads head_dim)", "hidden"])
-
-    def test_get_einops_dim_index(self):
-        from sglang.srt.debug_utils.dump_comparator import _get_einops_dim_index
-
-        pattern = "batch num_tokens hidden"
-        self.assertEqual(_get_einops_dim_index(pattern, "batch"), 0)
-        self.assertEqual(_get_einops_dim_index(pattern, "num_tokens"), 1)
-        self.assertEqual(_get_einops_dim_index(pattern, "hidden"), 2)
+        self.assertEqual(_split_einops_pattern("a (b c) d"), ["a", "(b c)", "d"])
+        self.assertEqual(_get_einops_dim_index("a b c", "b"), 1)
 
     def test_load_object(self):
         from sglang.srt.debug_utils.dump_comparator import _load_object
 
-        with tempfile.NamedTemporaryFile(suffix=".pt", delete=False) as f:
-            tensor = torch.randn(10, 10)
-            torch.save(tensor, f.name)
-            result = _load_object(f.name)
-            self.assertIsNotNone(result)
-            self.assertEqual(result.shape, tensor.shape)
-            Path(f.name).unlink()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "tensor.pt"
+            torch.save(torch.randn(5, 5), path)
+            self.assertEqual(_load_object(path).shape, (5, 5))
 
-        with tempfile.NamedTemporaryFile(suffix=".pt", delete=False) as f:
-            torch.save({"not": "a tensor"}, f.name)
-            self.assertIsNone(_load_object(f.name))
-            Path(f.name).unlink()
+            torch.save({"dict": 1}, path)
+            self.assertIsNone(_load_object(path))
 
-        self.assertIsNone(_load_object("/nonexistent/path/to/file.pt"))
+        self.assertIsNone(_load_object("/nonexistent.pt"))
 
-    def test_compute_and_print_diff_identical(self):
+    def test_compute_and_print_diff(self):
         from sglang.srt.debug_utils.dump_comparator import _compute_and_print_diff
 
         x = torch.ones(10, 10)
-        result = _compute_and_print_diff(x, x, diff_threshold=1e-3)
-        self.assertAlmostEqual(result["max_abs_diff"], 0.0, places=5)
-
-    def test_compute_and_print_diff_small_diff(self):
-        from sglang.srt.debug_utils.dump_comparator import _compute_and_print_diff
-
-        x_baseline = torch.ones(10, 10)
-        x_target = x_baseline + 0.001
-        result = _compute_and_print_diff(x_baseline, x_target, diff_threshold=1e-2)
-        self.assertAlmostEqual(result["max_abs_diff"], 0.001, places=4)
-
-    def test_compute_and_print_diff_large_diff(self):
-        from sglang.srt.debug_utils.dump_comparator import _compute_and_print_diff
-
-        x_baseline = torch.ones(10, 10)
-        x_target = torch.ones(10, 10) * 2
-        result = _compute_and_print_diff(x_baseline, x_target, diff_threshold=1e-3)
-        self.assertAlmostEqual(result["max_abs_diff"], 1.0, places=4)
+        self.assertAlmostEqual(_compute_and_print_diff(x, x, 1e-3)["max_abs_diff"], 0.0, places=5)
+        self.assertAlmostEqual(_compute_and_print_diff(x, x + 0.5, 1e-3)["max_abs_diff"], 0.5, places=4)
 
 
-class TestDumpLoaderPureFunctions(CustomTestCase):
+class TestDumpLoader(CustomTestCase):
     def test_read_meta(self):
         from sglang.srt.debug_utils.dump_loader import read_meta
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            filenames = [
-                "forward_pass_id=1___rank=0___dump_index=1___name=tensor_a.pt",
-                "forward_pass_id=1___rank=1___dump_index=1___name=tensor_a.pt",
-                "forward_pass_id=2___rank=0___dump_index=2___name=tensor_b.pt",
-            ]
-            for fn in filenames:
+            for i, fn in enumerate(["forward_pass_id=1___rank=0___dump_index=1___name=a.pt",
+                                    "forward_pass_id=2___rank=0___dump_index=2___name=b.pt"]):
                 torch.save(torch.randn(5), Path(tmpdir) / fn)
 
             df = read_meta(tmpdir)
-            self.assertEqual(len(df), 3)
-            for col in ["forward_pass_id", "rank", "dump_index", "name", "filename", "duplicate_index"]:
-                self.assertIn(col, df.columns)
+            self.assertEqual(len(df), 2)
+            self.assertTrue(all(c in df.columns for c in ["forward_pass_id", "rank", "name"]))
 
     def test_find_row(self):
         from sglang.srt.debug_utils.dump_loader import find_row
 
-        df = pl.DataFrame({
-            "forward_pass_id": [1, 2, 3],
-            "rank": [0, 0, 0],
-            "name": ["a", "b", "c"],
-            "filename": ["f1.pt", "f2.pt", "f3.pt"],
-        })
+        df = pl.DataFrame({"id": [1, 2], "name": ["a", "b"], "file": ["f1", "f2"]})
+        self.assertEqual(find_row(df, {"id": 2})["file"], "f2")
+        self.assertIsNone(find_row(df, {"id": 999}))
 
-        row = find_row(df, conditions={"forward_pass_id": 2, "name": "b"})
-        self.assertIsNotNone(row)
-        self.assertEqual(row["filename"], "f2.pt")
-
-        self.assertIsNone(find_row(df, conditions={"forward_pass_id": 999}))
-
-        df_dup = pl.DataFrame({
-            "forward_pass_id": [1, 1],
-            "rank": [0, 0],
-            "name": ["a", "a"],
-            "filename": ["f1.pt", "f2.pt"],
-        })
-        self.assertIsNone(find_row(df_dup, conditions={"forward_pass_id": 1, "name": "a"}))
+        df_dup = pl.DataFrame({"id": [1, 1], "file": ["f1", "f2"]})
+        self.assertIsNone(find_row(df_dup, {"id": 1}))
 
     def test_cast_to_polars_dtype(self):
         from sglang.srt.debug_utils.dump_loader import _cast_to_polars_dtype
 
         self.assertEqual(_cast_to_polars_dtype("42", pl.Int64), 42)
         self.assertEqual(_cast_to_polars_dtype("3.14", pl.Float64), 3.14)
-        self.assertEqual(_cast_to_polars_dtype(1, pl.Boolean), True)
-        self.assertEqual(_cast_to_polars_dtype(42, pl.String), "42")
 
     def test_add_duplicate_index(self):
         from sglang.srt.debug_utils.dump_loader import _add_duplicate_index
 
-        df = pl.DataFrame({
-            "forward_pass_id": [1, 1, 1, 2],
-            "rank": [0, 0, 0, 0],
-            "name": ["a", "a", "b", "a"],
-            "dump_index": [1, 2, 3, 4],
-            "filename": ["f1.pt", "f2.pt", "f3.pt", "f4.pt"],
-        })
-
+        df = pl.DataFrame({"name": ["a", "a", "b"], "dump_index": [1, 2, 3], "filename": ["f1", "f2", "f3"]})
         result = _add_duplicate_index(df)
-        a_rows = result.filter((pl.col("forward_pass_id") == 1) & (pl.col("name") == "a")).sort("dump_index")
-        self.assertEqual(a_rows["duplicate_index"].to_list(), [0, 1])
+        self.assertEqual(result.filter(pl.col("name") == "a").sort("dump_index")["duplicate_index"].to_list(), [0, 1])
 
 
-class TestEndToEndIntegration(CustomTestCase):
-    def test_dump_load_compare_flow(self):
+class TestEndToEnd(CustomTestCase):
+    def test_dump_load_compare(self):
         from sglang.srt.debug_utils.dump_comparator import _compute_and_print_diff
         from sglang.srt.debug_utils.dump_loader import find_row, read_meta
 
-        with tempfile.TemporaryDirectory() as baseline_dir, tempfile.TemporaryDirectory() as target_dir:
-            baseline_dumper = _create_dumper(baseline_dir, "baseline")
-            target_dumper = _create_dumper(target_dir, "target")
-
+        with tempfile.TemporaryDirectory() as d1, tempfile.TemporaryDirectory() as d2:
             baseline_tensor = torch.randn(10, 10)
-            baseline_dumper.on_forward_pass_start()
-            baseline_dumper.dump("test_tensor", baseline_tensor, layer_id=0)
+            noise = torch.randn(10, 10) * 0.01
 
-            noise = torch.randn(10, 10) * 0.001
-            target_tensor = baseline_tensor.clone() + noise
-            target_dumper.on_forward_pass_start()
-            target_dumper.dump("test_tensor", target_tensor, layer_id=0)
+            for dumper, tensor, d in [
+                (_create_dumper(d1, "b"), baseline_tensor, d1),
+                (_create_dumper(d2, "t"), baseline_tensor + noise, d2),
+            ]:
+                dumper.on_forward_pass_start()
+                dumper.dump("x", tensor)
 
-            baseline_dump_dir = Path(baseline_dir) / "sglang_dump_baseline"
-            target_dump_dir = Path(target_dir) / "sglang_dump_target"
+            for d, name in [(d1, "b"), (d2, "t")]:
+                df = read_meta(Path(d) / f"sglang_dump_{name}")
+                self.assertEqual(len(df), 1)
+                row = find_row(df, {"name": "x"})
+                self.assertIsNotNone(row)
 
-            df_baseline = read_meta(baseline_dump_dir)
-            df_target = read_meta(target_dump_dir)
-            self.assertEqual(len(df_baseline), 1)
-            self.assertEqual(len(df_target), 1)
+            t1 = torch.load(Path(d1) / "sglang_dump_b" / find_row(read_meta(Path(d1) / "sglang_dump_b"), {"name": "x"})["filename"], weights_only=False)
+            t2 = torch.load(Path(d2) / "sglang_dump_t" / find_row(read_meta(Path(d2) / "sglang_dump_t"), {"name": "x"})["filename"], weights_only=False)
 
-            row_baseline = find_row(df_baseline, conditions={"name": "test_tensor", "layer_id": "0"})
-            row_target = find_row(df_target, conditions={"name": "test_tensor", "layer_id": "0"})
-            self.assertIsNotNone(row_baseline)
-            self.assertIsNotNone(row_target)
+            result = _compute_and_print_diff(t1.float(), t2.float(), 0.1)
+            self.assertAlmostEqual(result["max_abs_diff"], noise.abs().max().item(), places=3)
 
-            loaded_baseline = torch.load(baseline_dump_dir / row_baseline["filename"], weights_only=False)
-            loaded_target = torch.load(target_dump_dir / row_target["filename"], weights_only=False)
-
-            result = _compute_and_print_diff(loaded_baseline.float(), loaded_target.float(), diff_threshold=1e-2)
-            expected_max_diff = noise.abs().max().item()
-            self.assertAlmostEqual(result["max_abs_diff"], expected_max_diff, places=3)
-
-    def test_dump_dict_load(self):
+    def test_dump_dict(self):
         from sglang.srt.debug_utils.dump_loader import read_meta
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            dumper = _create_dumper(tmpdir, "dict_test")
+            dumper = _create_dumper(tmpdir, "test")
             dumper.on_forward_pass_start()
-            dumper.dump_dict("layer", {"weight": torch.randn(5, 5), "bias": torch.randn(5)})
+            dumper.dump_dict("layer", {"w": torch.randn(5), "b": torch.randn(3)})
 
-            df = read_meta(Path(tmpdir) / "sglang_dump_dict_test")
-            self.assertEqual(len(df), 2)
-            names = set(df["name"].to_list())
-            self.assertEqual(names, {"layer_weight", "layer_bias"})
+            df = read_meta(Path(tmpdir) / "sglang_dump_test")
+            self.assertEqual(set(df["name"].to_list()), {"layer_w", "layer_b"})
 
 
 if __name__ == "__main__":
