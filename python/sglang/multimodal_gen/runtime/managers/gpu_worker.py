@@ -92,8 +92,13 @@ class GPUWorker:
         # otherwise empty offloaded weights could fail lora converting
         if self.server_args.dit_layerwise_offload:
             # enable layerwise offload if possible
-            for dit in filter(None,
-                              [self.pipeline.get_module("transformer"), self.pipeline.get_module("transformer_2")]):
+            for dit in filter(
+                None,
+                [
+                    self.pipeline.get_module("transformer"),
+                    self.pipeline.get_module("transformer_2"),
+                ],
+            ):
                 if isinstance(dit, OffloadableDiTMixin):
                     dit.configure_layerwise_offload(self.server_args)
                 else:
@@ -123,10 +128,10 @@ class GPUWorker:
 
             if self.rank == 0:
                 peak_memory_bytes = torch.cuda.max_memory_allocated()
-                output_batch.peak_memory_mb = peak_memory_bytes / (1024 ** 2)
-                peak_memory_gb = peak_memory_bytes / (1024 ** 3)
+                output_batch.peak_memory_mb = peak_memory_bytes / (1024**2)
+                peak_memory_gb = peak_memory_bytes / (1024**3)
                 remaining_gpu_mem_gb = (
-                    current_platform.get_device_total_memory() / (1024 ** 3)
+                    current_platform.get_device_total_memory() / (1024**3)
                     - peak_memory_gb
                 )
                 can_stay_resident = self.get_can_stay_resident_components(
@@ -173,7 +178,7 @@ class GPUWorker:
         # If the flag is True, it is currently offloaded, so it's a candidate to "stay resident".
         offload_flags = {
             "transformer": self.server_args.dit_cpu_offload
-                           or self.server_args.dit_layerwise_offload,
+            or self.server_args.dit_layerwise_offload,
             "vae": self.server_args.vae_cpu_offload,
             "text_encoder": self.server_args.text_encoder_cpu_offload,
             "text_encoder_2": self.server_args.text_encoder_cpu_offload,
