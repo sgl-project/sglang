@@ -1,4 +1,4 @@
-//! Connection mode detection step.
+//! Tokenizer registration step for local workers.
 
 use std::{collections::HashMap, sync::Arc};
 
