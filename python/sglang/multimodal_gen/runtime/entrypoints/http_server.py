@@ -16,7 +16,7 @@ from sglang.multimodal_gen.runtime.entrypoints.utils import (
     post_process_sample,
     prepare_request,
 )
-from sglang.multimodal_gen.runtime.scheduler_client import scheduler_client
+from sglang.multimodal_gen.runtime.scheduler_client import async_scheduler_client
 from sglang.multimodal_gen.runtime.server_args import ServerArgs, get_global_server_args
 from sglang.srt.managers.io_struct import VertexGenerateReqInput
 
@@ -27,13 +27,13 @@ VERTEX_ROUTE = os.environ.get("AIP_PREDICT_ROUTE", "/vertex_generate")
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     from sglang.multimodal_gen.runtime.scheduler_client import (
+        async_scheduler_client,
         run_zeromq_broker,
-        scheduler_client,
     )
 
     # 1. Initialize the singleton client that connects to the backend Scheduler
     server_args = app.state.server_args
-    scheduler_client.initialize(server_args)
+    async_scheduler_client.initialize(server_args)
 
     # 2. Start the ZMQ Broker in the background to handle offline requests
     broker_task = asyncio.create_task(run_zeromq_broker(server_args))
@@ -43,7 +43,7 @@ async def lifespan(app: FastAPI):
     # On shutdown
     print("FastAPI app is shutting down...")
     broker_task.cancel()
-    scheduler_client.close()
+    async_scheduler_client.close()
 
 
 # Health router
@@ -105,7 +105,7 @@ def encode_video_to_base64(file_path: str):
 async def forward_to_scheduler(req_obj, sp):
     """Forwards request to scheduler and processes the result."""
     try:
-        response = await scheduler_client.forward(req_obj)
+        response = await async_scheduler_client.forward(req_obj)
         if response.output is None:
             raise RuntimeError("Model generation returned no output.")
 

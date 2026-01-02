@@ -19,14 +19,15 @@ use super::pd_types::api_path;
 use crate::{
     config::types::RetryConfig,
     core::{
-        is_retryable_status, RetryExecutor, Worker, WorkerLoadGuard, WorkerRegistry, WorkerType,
+        is_retryable_status, HashRing, RetryExecutor, Worker, WorkerLoadGuard, WorkerRegistry,
+        WorkerType, UNKNOWN_MODEL_ID,
     },
     observability::{
         events::{self, Event},
         metrics::{bool_to_static_str, metrics_labels, Metrics},
         otel_trace::inject_trace_context_http,
     },
-    policies::{LoadBalancingPolicy, PolicyRegistry},
+    policies::{LoadBalancingPolicy, PolicyRegistry, SelectWorkerInfo},
     protocols::{
         chat::{ChatCompletionRequest, ChatMessage, MessageContent},
         common::{InputIds, StringOrArray},
@@ -59,6 +60,7 @@ struct PDRequestContext<'a> {
     return_logprob: bool,
     request_text: Option<String>,
     model_id: Option<&'a str>,
+    headers: Option<HeaderMap>,
 }
 
 impl PDRouter {
@@ -303,7 +305,11 @@ impl PDRouter {
                     let context = context.clone();
                     async move {
                         let (prefill, decode) = match self
-                            .select_pd_pair(context.request_text.as_deref(), context.model_id)
+                            .select_pd_pair(
+                                context.request_text.as_deref(),
+                                context.model_id,
+                                context.headers.as_ref(),
+                            )
                             .await
                         {
                             Ok(pair) => pair,
@@ -559,9 +565,10 @@ impl PDRouter {
         );
 
         // Send both requests concurrently and wait for both
+        // Note: Using borrowed references avoids heap allocation
         events::RequestPDSentEvent {
-            prefill_url: prefill.url().to_string(),
-            decode_url: decode.url().to_string(),
+            prefill_url: prefill.url(),
+            decode_url: decode.url(),
         }
         .emit();
 
@@ -692,6 +699,7 @@ impl PDRouter {
         &self,
         request_text: Option<&str>,
         model_id: Option<&str>,
+        headers: Option<&HeaderMap>,
     ) -> Result<(Arc<dyn Worker>, Arc<dyn Worker>), String> {
         let effective_model_id = if !self.enable_igw { None } else { model_id };
 
@@ -725,10 +733,17 @@ impl PDRouter {
         let prefill_policy = self.policy_registry.get_prefill_policy();
         let decode_policy = self.policy_registry.get_decode_policy();
 
+        // Get cached hash ring for consistent hashing
+        let hash_ring = self
+            .worker_registry
+            .get_hash_ring(effective_model_id.unwrap_or(UNKNOWN_MODEL_ID));
+
         let prefill = Self::pick_worker_by_policy_arc(
             &prefill_workers,
             &*prefill_policy,
             request_text,
+            headers,
+            hash_ring.clone(),
             "prefill",
         )?;
 
@@ -736,6 +751,8 @@ impl PDRouter {
             &decode_workers,
             &*decode_policy,
             request_text,
+            headers,
+            hash_ring,
             "decode",
         )?;
 
@@ -761,6 +778,8 @@ impl PDRouter {
         workers: &[Arc<dyn Worker>],
         policy: &dyn LoadBalancingPolicy,
         request_text: Option<&str>,
+        headers: Option<&HeaderMap>,
+        hash_ring: Option<Arc<HashRing>>,
         worker_type: &str,
     ) -> Result<Arc<dyn Worker>, String> {
         if workers.is_empty() {
@@ -784,7 +803,15 @@ impl PDRouter {
         }
 
         let selected_idx = policy
-            .select_worker(&available_workers, request_text)
+            .select_worker(
+                &available_workers,
+                &SelectWorkerInfo {
+                    request_text,
+                    tokens: None, // HTTP doesn't have tokens, use gRPC for PrefixHash
+                    headers,
+                    hash_ring,
+                },
+            )
             .ok_or_else(|| {
                 format!(
                     "Policy {} failed to select a {} worker",
@@ -1120,7 +1147,7 @@ impl RouterTrait for PDRouter {
         // Note: This endpoint actually causes the model to generate tokens, so we only test one pair
 
         // Select a random worker pair using the policy
-        let (prefill, decode) = match self.select_pd_pair(None, None).await {
+        let (prefill, decode) = match self.select_pd_pair(None, None, None).await {
             Ok(pair) => pair,
             Err(e) => {
                 return error::service_unavailable(
@@ -1243,6 +1270,7 @@ impl RouterTrait for PDRouter {
             return_logprob,
             request_text,
             model_id,
+            headers: headers.cloned(),
         };
 
         self.execute_dual_dispatch(headers, body, context).await
@@ -1284,6 +1312,7 @@ impl RouterTrait for PDRouter {
             return_logprob,
             request_text,
             model_id,
+            headers: headers.cloned(),
         };
 
         self.execute_dual_dispatch(headers, body, context).await
@@ -1317,6 +1346,7 @@ impl RouterTrait for PDRouter {
             return_logprob,
             request_text,
             model_id,
+            headers: headers.cloned(),
         };
 
         self.execute_dual_dispatch(headers, body, context).await
@@ -1342,6 +1372,7 @@ impl RouterTrait for PDRouter {
             return_logprob: false,
             request_text: req_text,
             model_id,
+            headers: headers.cloned(),
         };
 
         self.execute_dual_dispatch(headers, body, context).await
@@ -1405,7 +1436,7 @@ mod tests {
         router.worker_registry.register(Arc::from(healthy_worker));
         router.worker_registry.register(Arc::from(decode_worker));
 
-        let result = router.select_pd_pair(None, None).await;
+        let result = router.select_pd_pair(None, None, None).await;
 
         assert!(result.is_ok());
         let (prefill, _decode) = result.unwrap();
@@ -1418,7 +1449,7 @@ mod tests {
     async fn test_empty_worker_lists() {
         let router = create_test_pd_router();
 
-        let result = router.select_pd_pair(None, None).await;
+        let result = router.select_pd_pair(None, None, None).await;
 
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("No prefill workers available"));

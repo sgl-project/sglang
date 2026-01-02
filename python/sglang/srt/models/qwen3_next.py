@@ -49,6 +49,7 @@ from sglang.srt.utils import (
     make_layers,
     set_weight_attrs,
 )
+from sglang.srt.utils.custom_op import register_custom_op
 
 logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
@@ -59,7 +60,6 @@ import triton
 import triton.language as tl
 
 from sglang.srt.compilation.piecewise_context_manager import get_forward_context
-from sglang.srt.utils import direct_register_custom_op
 
 
 @triton.jit
@@ -371,7 +371,7 @@ class Qwen3GatedDeltaNet(nn.Module):
     ):
         output = torch.empty_like(hidden_states)
         if forward_batch.forward_mode.is_extend() and get_forward_context() is not None:
-            torch.ops.sglang.gdn_with_output(
+            gdn_with_output(
                 hidden_states,
                 output,
                 self.layer_id,
@@ -1046,6 +1046,7 @@ class Qwen3NextForCausalLM(nn.Module):
 EntryClass = Qwen3NextForCausalLM
 
 
+@register_custom_op(mutates_args=["output"])
 def gdn_with_output(
     hidden_states: torch.Tensor,
     output: torch.Tensor,
@@ -1064,19 +1065,3 @@ def gdn_with_output(
 
     output.view(ret.shape).copy_(ret)
     return
-
-
-def gdn_with_output_fake(
-    hidden_states: torch.Tensor,
-    output: torch.Tensor,
-    layer_id: int,
-) -> None:
-    return
-
-
-direct_register_custom_op(
-    op_name="gdn_with_output",
-    op_func=gdn_with_output,
-    mutates_args=["output"],
-    fake_impl=gdn_with_output_fake,
-)

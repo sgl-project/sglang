@@ -17,7 +17,7 @@ from enum import Enum, auto
 from typing import Any
 
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.multimodal_gen.utils import StoreBoolean, align_to
+from sglang.multimodal_gen.utils import StoreBoolean
 
 logger = init_logger(__name__)
 
@@ -69,7 +69,7 @@ class DataType(Enum):
 
     def get_default_extension(self) -> str:
         if self == DataType.IMAGE:
-            return "jpg"
+            return "png"
         else:
             return "mp4"
 
@@ -279,8 +279,10 @@ class SamplingParams:
 
         if pipeline_config.task_type.is_image_gen():
             # settle num_frames
-            logger.debug(f"num_frames set to 1 for image generation model")
-            self.num_frames = 1
+            if not server_args.pipeline_config.allow_set_num_frames():
+                logger.debug(f"Setting `num_frames` to 1 for image generation model")
+                self.num_frames = 1
+
         elif self.adjust_frames:
             # NOTE: We must apply adjust_num_frames BEFORE the SP alignment logic below.
             # If we apply it after, adjust_num_frames might modify the frame count
@@ -301,8 +303,6 @@ class SamplingParams:
 
             if use_temporal_scaling_frames:
                 orig_latent_num_frames = (num_frames - 1) // temporal_scale_factor + 1
-            else:  # stepvideo only
-                orig_latent_num_frames = self.num_frames // 17 * 3
 
             if orig_latent_num_frames % server_args.num_gpus != 0:
                 # Adjust latent frames to be divisible by number of GPUs
@@ -321,15 +321,6 @@ class SamplingParams:
                     new_num_frames = (
                         new_latent_num_frames - 1
                     ) * temporal_scale_factor + 1
-                else:  # stepvideo only
-                    # Find the least common multiple of 3 and num_gpus
-                    divisor = math.lcm(3, num_gpus)
-                    # Round up to the nearest multiple of this LCM
-                    new_latent_num_frames = (
-                        (new_latent_num_frames + divisor - 1) // divisor
-                    ) * divisor
-                    # Convert back to actual frames using the StepVideo formula
-                    new_num_frames = new_latent_num_frames // 3 * 17
 
                 logger.info(
                     "Adjusting number of frames from %s to %s based on number of GPUs (%s)",
@@ -340,7 +331,6 @@ class SamplingParams:
                 self.num_frames = new_num_frames
 
         self._set_output_file_name()
-        self.log(pipeline_config=server_args.pipeline_config)
 
     @classmethod
     def from_pretrained(cls, model_path: str, **kwargs) -> "SamplingParams":
@@ -679,37 +669,6 @@ class SamplingParams:
 
     def output_file_path(self):
         return os.path.join(self.output_path, self.output_file_name)
-
-    def log(self, pipeline_config):
-        # TODO: in some cases (e.g., TI2I), height and weight might be undecided at this moment
-        if self.height:
-            target_height = align_to(self.height, 16)
-        else:
-            target_height = -1
-        if self.width:
-            target_width = align_to(self.width, 16)
-        else:
-            target_width = -1
-
-        # Log sampling parameters
-        debug_str = f"""Sampling params:
-                       width: {target_width}
-                      height: {target_height}
-                  num_frames: {self.num_frames}
-                      prompt: {self.prompt}
-                  neg_prompt: {self.negative_prompt}
-                        seed: {self.seed}
-                 infer_steps: {self.num_inference_steps}
-      num_outputs_per_prompt: {self.num_outputs_per_prompt}
-              guidance_scale: {self.guidance_scale}
-     embedded_guidance_scale: {pipeline_config.embedded_cfg_scale}
-                    n_tokens: {self.n_tokens}
-                  flow_shift: {pipeline_config.flow_shift}
-                  image_path: {self.image_path}
-                 save_output: {self.save_output}
-            output_file_path: {self.output_file_path()}
-        """  # type: ignore[attr-defined]
-        logger.info(debug_str)
 
 
 @dataclass
