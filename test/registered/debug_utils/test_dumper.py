@@ -12,6 +12,10 @@ import torch.multiprocessing as mp
 from sglang.test.test_utils import CustomTestCase
 
 
+# TODO it needs 0 gpu
+register_cuda_ci(est_time=60, suite="nightly-1-gpu", nightly=True)
+
+
 class TestDumperPureFunctions(CustomTestCase):
     def test_get_truncated_value(self):
         from sglang.srt.debug_utils.dumper import get_truncated_value
