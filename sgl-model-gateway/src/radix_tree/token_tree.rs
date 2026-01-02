@@ -17,7 +17,7 @@ use std::{
     hash::{BuildHasherDefault, Hasher},
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc,
+        Arc, Weak,
     },
 };
 
@@ -161,14 +161,7 @@ fn next_timestamp() -> u64 {
 
 /// Node in the token-based radix tree.
 /// Uses parking_lot RwLock for better performance (no poisoning, smaller size).
-///
-/// # Design Note: No Parent Pointer
-/// Unlike StringTree which uses parent pointers (`Weak<Node>`) for upward traversal,
-/// TokenTree uses a path-based approach for eviction:
-/// - During eviction DFS, we collect `EvictionCandidate` with `path: Vec<TokenPageKey>`
-/// - To remove a node, traverse from root using path[0..n-1] to reach parent, then remove child
-/// - This avoids weak reference overhead and simplifies memory management
-/// - Both approaches are valid; path-based is preferred here for lock-free read optimization
+/// Parent pointers enable O(d) ancestor cleanup during eviction.
 struct Node {
     /// Token sequence stored at this node (always page-aligned length, multiple of PAGE_SIZE)
     tokens: ParkingLotRwLock<Vec<TokenId>>,
@@ -178,6 +171,10 @@ struct Node {
     tenant_last_access_time: DashMap<TenantId, u64>,
     /// Cached last tenant for fast access (probabilistic update)
     last_tenant: ParkingLotRwLock<Option<TenantId>>,
+    /// Parent node (Weak to avoid reference cycles). None for root.
+    parent: ParkingLotRwLock<Weak<Node>>,
+    /// This node's key in parent's children map (for O(1) removal)
+    page_key: ParkingLotRwLock<Option<TokenPageKey>>,
 }
 
 impl Node {
@@ -187,6 +184,8 @@ impl Node {
             children: new_children_map(),
             tenant_last_access_time: new_tenant_map(),
             last_tenant: ParkingLotRwLock::new(None),
+            parent: ParkingLotRwLock::new(Weak::new()),
+            page_key: ParkingLotRwLock::new(None),
         }
     }
 
@@ -199,7 +198,20 @@ impl Node {
             ),
             tenant_last_access_time: DashMap::with_shard_amount(ROOT_SHARD_COUNT),
             last_tenant: ParkingLotRwLock::new(None),
+            parent: ParkingLotRwLock::new(Weak::new()),
+            page_key: ParkingLotRwLock::new(None),
         }
+    }
+
+    /// Set parent pointer and page key for this node
+    fn set_parent(&self, parent: &NodeRef, key: TokenPageKey) {
+        *self.parent.write() = Arc::downgrade(parent);
+        *self.page_key.write() = Some(key);
+    }
+
+    /// Check if this node is empty (no tenants and no children)
+    fn is_empty(&self) -> bool {
+        self.tenant_last_access_time.is_empty() && self.children.is_empty()
     }
 
     /// Get any tenant that owns this node (for match results)
@@ -308,6 +320,7 @@ impl TokenTree {
                 dashmap::mapref::entry::Entry::Vacant(entry) => {
                     // No child with this page key - create new node
                     let new_node = Arc::new(Node::new(remaining.to_vec()));
+                    new_node.set_parent(&current, page_key);
                     new_node.touch_tenant(&tenant_id);
                     entry.insert(new_node);
                     InsertStep::Done(remaining.len())
@@ -364,9 +377,13 @@ impl TokenTree {
                             children: new_children_map(),
                             tenant_last_access_time: child.tenant_last_access_time.clone(),
                             last_tenant: ParkingLotRwLock::new(child.last_tenant.read().clone()),
+                            parent: ParkingLotRwLock::new(Arc::downgrade(&current)),
+                            page_key: ParkingLotRwLock::new(Some(page_key)),
                         });
 
                         // Add original child (now suffix) as child of intermediate
+                        // Update child's parent to point to intermediate
+                        child.set_parent(&intermediate_node, suffix_page_key);
                         intermediate_node
                             .children
                             .insert(suffix_page_key, Arc::clone(&child));
@@ -404,9 +421,13 @@ impl TokenTree {
                             children: new_children_map(),
                             tenant_last_access_time: child.tenant_last_access_time.clone(),
                             last_tenant: ParkingLotRwLock::new(child.last_tenant.read().clone()),
+                            parent: ParkingLotRwLock::new(Arc::downgrade(&current)),
+                            page_key: ParkingLotRwLock::new(Some(page_key)),
                         });
 
                         // Add original child (now suffix) as child of intermediate
+                        // Update child's parent to point to intermediate
+                        child.set_parent(&intermediate_node, child_suffix_page_key);
                         intermediate_node
                             .children
                             .insert(child_suffix_page_key, Arc::clone(&child));
@@ -415,8 +436,9 @@ impl TokenTree {
                         let new_remaining = &remaining[common_len..];
                         let new_branch_tokens = if new_remaining.len() >= PAGE_SIZE {
                             let new_node = Arc::new(Node::new(new_remaining.to_vec()));
-                            new_node.touch_tenant(&tenant_id);
                             let new_page_key = make_page_key(new_remaining);
+                            new_node.set_parent(&intermediate_node, new_page_key);
+                            new_node.touch_tenant(&tenant_id);
                             intermediate_node.children.insert(new_page_key, new_node);
                             new_remaining.len()
                         } else {
@@ -602,12 +624,7 @@ impl TokenTree {
     }
 
     /// Evict entries for a tenant to reduce to max_tokens.
-    ///
-    /// Uses **leaf-first LRU eviction** matching SGLang's behavior:
-    /// 1. Find tenant-specific leaves (nodes where tenant exists but no children have tenant)
-    /// 2. Evict oldest leaves first (by LRU timestamp)
-    /// 3. When a leaf is evicted, its parent may become a new leaf
-    /// 4. Repeat until quota is met
+    /// Uses leaf-first LRU eviction matching SGLang's behavior.
     pub fn evict_tenant(&self, tenant: &TenantId, max_tokens: usize) {
         use std::{cmp::Reverse, collections::BinaryHeap};
 
@@ -624,65 +641,38 @@ impl TokenTree {
         let to_evict = current_count - max_tokens;
         let mut evicted = 0;
 
-        // Collect initial tenant-specific leaves
         let mut leaves: Vec<(NodeRef, u64)> = Vec::new();
         self.collect_tenant_leaves(&self.root, tenant, &mut leaves);
 
-        // Build min-heap: oldest timestamp first (using Reverse for min-heap behavior)
+        // Min-heap by timestamp (oldest first)
         let mut heap: BinaryHeap<Reverse<(u64, usize)>> = BinaryHeap::new();
-        let mut leaf_nodes: Vec<NodeRef> = Vec::with_capacity(leaves.len());
+        let mut leaf_data: Vec<NodeRef> = Vec::with_capacity(leaves.len());
 
         for (node, ts) in leaves.drain(..) {
-            let idx = leaf_nodes.len();
-            leaf_nodes.push(node);
+            let idx = leaf_data.len();
+            leaf_data.push(node);
             heap.push(Reverse((ts, idx)));
         }
 
-        // Track which nodes we've already evicted (by index)
-        let mut evicted_indices: std::collections::HashSet<usize> =
-            std::collections::HashSet::new();
-
         while evicted < to_evict {
-            // Pop oldest leaf
             let Some(Reverse((_, idx))) = heap.pop() else {
-                // No more leaves - need to re-collect (parent became leaf)
-                leaves.clear();
-                self.collect_tenant_leaves(&self.root, tenant, &mut leaves);
-
-                if leaves.is_empty() {
-                    break; // No more nodes with this tenant
-                }
-
-                // Rebuild heap with new leaves
-                leaf_nodes.clear();
-                evicted_indices.clear();
-                for (node, ts) in leaves.drain(..) {
-                    let idx = leaf_nodes.len();
-                    leaf_nodes.push(node);
-                    heap.push(Reverse((ts, idx)));
-                }
-                continue;
+                break;
             };
 
-            // Skip if already evicted
-            if evicted_indices.contains(&idx) {
-                continue;
-            }
-
-            let node = &leaf_nodes[idx];
-            let node_tokens = node.tokens.read().len();
-
-            // Remove tenant from this leaf node
-            if self.remove_tenant_from_node(node, tenant) {
+            let node = &leaf_data[idx];
+            let (node_tokens, parent_became_leaf) = self.remove_tenant_and_cleanup(node, tenant);
+            if node_tokens > 0 {
                 evicted += node_tokens;
-                evicted_indices.insert(idx);
-            }
 
-            // Note: We don't immediately check if parent became leaf.
-            // When heap empties, we re-collect leaves which will find new ones.
+                // Incremental leaf promotion (matching SGLang's approach)
+                if let Some((parent_node, parent_ts)) = parent_became_leaf {
+                    let new_idx = leaf_data.len();
+                    leaf_data.push(parent_node);
+                    heap.push(Reverse((parent_ts, new_idx)));
+                }
+            }
         }
 
-        // Update tenant token count
         if let Some(mut count) = self.tenant_token_count.get_mut(tenant.as_ref()) {
             *count = count.saturating_sub(evicted);
         }
@@ -695,8 +685,7 @@ impl TokenTree {
         );
     }
 
-    /// Collect tenant-specific leaves: nodes where tenant exists but no children have tenant.
-    /// This matches SGLang's leaf collection for eviction.
+    /// Collect tenant-specific leaves (nodes where tenant exists but no children have tenant).
     fn collect_tenant_leaves(
         &self,
         node: &NodeRef,
@@ -709,7 +698,6 @@ impl TokenTree {
                 .tenant_last_access_time
                 .contains_key(tenant_id.as_ref());
 
-        // Check if any child has this tenant
         let mut any_child_has_tenant = false;
         for child_entry in node.children.iter() {
             let child = child_entry.value();
@@ -719,11 +707,9 @@ impl TokenTree {
             {
                 any_child_has_tenant = true;
             }
-            // Recurse into all children to find leaves deeper in tree
             self.collect_tenant_leaves(child, tenant_id, result);
         }
 
-        // If this node has tenant but no child does, it's a tenant-specific leaf
         if node_has_tenant && !any_child_has_tenant {
             if let Some(ts) = node.tenant_last_access_time.get(tenant_id.as_ref()) {
                 result.push((Arc::clone(node), *ts));
@@ -731,10 +717,90 @@ impl TokenTree {
         }
     }
 
-    fn remove_tenant_from_node(&self, node: &NodeRef, tenant_id: &TenantId) -> bool {
-        node.tenant_last_access_time
+    fn is_tenant_leaf(&self, node: &NodeRef, tenant_id: &TenantId) -> bool {
+        if !node
+            .tenant_last_access_time
+            .contains_key(tenant_id.as_ref())
+        {
+            return false;
+        }
+        for child_entry in node.children.iter() {
+            if child_entry
+                .value()
+                .tenant_last_access_time
+                .contains_key(tenant_id.as_ref())
+            {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Remove tenant from node and clean up empty ancestors.
+    /// Returns (tokens_removed, Option<(parent_node, ts)> if parent became a leaf).
+    fn remove_tenant_and_cleanup(
+        &self,
+        node: &NodeRef,
+        tenant_id: &TenantId,
+    ) -> (usize, Option<(NodeRef, u64)>) {
+        if node
+            .tenant_last_access_time
             .remove(tenant_id.as_ref())
-            .is_some()
+            .is_none()
+        {
+            return (0, None);
+        }
+
+        let node_tokens = node.tokens.read().len();
+        let parent_leaf_info = self.cleanup_empty_ancestors_with_parent(node, tenant_id);
+
+        (node_tokens, parent_leaf_info)
+    }
+
+    /// Remove empty nodes walking up via parent pointers.
+    /// Returns Some((parent_node, ts)) if a parent became a tenant-leaf.
+    fn cleanup_empty_ancestors_with_parent(
+        &self,
+        node: &NodeRef,
+        tenant_id: &TenantId,
+    ) -> Option<(NodeRef, u64)> {
+        let mut current = Arc::clone(node);
+        let mut parent_leaf_info: Option<(NodeRef, u64)> = None;
+
+        loop {
+            if !current.is_empty() {
+                if parent_leaf_info.is_none() && self.is_tenant_leaf(&current, tenant_id) {
+                    if let Some(ts) = current.tenant_last_access_time.get(tenant_id.as_ref()) {
+                        parent_leaf_info = Some((Arc::clone(&current), *ts));
+                    }
+                }
+                break;
+            }
+
+            let parent_weak = current.parent.read();
+            let Some(parent) = parent_weak.upgrade() else {
+                break;
+            };
+            drop(parent_weak);
+
+            let page_key_guard = current.page_key.read();
+            let Some(page_key) = *page_key_guard else {
+                break;
+            };
+            drop(page_key_guard);
+
+            parent.children.remove(&page_key);
+
+            if parent_leaf_info.is_none() && self.is_tenant_leaf(&parent, tenant_id) {
+                if let Some(ts) = parent.tenant_last_access_time.get(tenant_id.as_ref()) {
+                    parent_leaf_info = Some((Arc::clone(&parent), *ts));
+                }
+            }
+
+            current = parent;
+        }
+
+        parent_leaf_info
     }
 
     /// Get the token count for a specific tenant.
@@ -1461,6 +1527,62 @@ mod tests {
 
         // tenant2's path should still work
         let result = tree.match_prefix_with_counts(&tokens2);
+        assert_eq!(result.matched_token_count, 2 * PAGE_SIZE);
+        assert_eq!(result.tenant.as_ref(), "tenant2");
+    }
+
+    #[test]
+    fn test_empty_node_cleanup_after_eviction() {
+        // Test that empty nodes are removed from the tree after tenant eviction
+        // This prevents memory bloat from orphaned nodes
+        let tree = TokenTree::new();
+
+        // Insert a path only owned by tenant1
+        let tokens1 = make_tokens(500, 2); // Unique path
+        tree.insert_tokens(&tokens1, "tenant1");
+
+        // Verify tree has children before eviction
+        assert!(
+            !tree.root.children.is_empty(),
+            "Tree should have children after insert"
+        );
+
+        // Evict tenant1 completely
+        let tenant1_id: TenantId = Arc::from("tenant1");
+        tree.evict_tenant(&tenant1_id, 0);
+
+        // Verify empty nodes were cleaned up
+        assert!(
+            tree.root.children.is_empty(),
+            "Empty nodes should be removed after tenant eviction"
+        );
+
+        // Verify tenant count is zero
+        assert_eq!(tree.tenant_token_size(&tenant1_id), 0);
+    }
+
+    #[test]
+    fn test_partial_cleanup_shared_nodes() {
+        // Test that shared nodes are NOT cleaned up when still owned by other tenants
+        let tree = TokenTree::new();
+
+        // Both tenants share the same path
+        let tokens = make_tokens(100, 2);
+        tree.insert_tokens(&tokens, "tenant1");
+        tree.insert_tokens(&tokens, "tenant2");
+
+        // Evict tenant1
+        let tenant1_id: TenantId = Arc::from("tenant1");
+        tree.evict_tenant(&tenant1_id, 0);
+
+        // Tree should still have children (owned by tenant2)
+        assert!(
+            !tree.root.children.is_empty(),
+            "Shared nodes should NOT be removed when other tenants exist"
+        );
+
+        // tenant2 should still work
+        let result = tree.match_prefix_with_counts(&tokens);
         assert_eq!(result.matched_token_count, 2 * PAGE_SIZE);
         assert_eq!(result.tenant.as_ref(), "tenant2");
     }
