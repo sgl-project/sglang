@@ -99,9 +99,9 @@ class VBenchDataset(BaseDataset):
         self.items = self._load_data()
 
     def _load_data(self) -> List[Dict[str, Any]]:
-        if self.args.task_name in ["text-to-video", "text-to-image", "video-to-video"]:
+        if self.args.task_name in ("text-to-video", "text-to-image", "video-to-video"):
             return self._load_t2v_prompts()
-        elif self.args.task_name in ["image-to-video", "image-to-image"]:
+        elif self.args.task_name in ("image-to-video", "image-to-image"):
             return self._load_i2v_data()
         else:
             raise ValueError(
@@ -666,7 +666,7 @@ async def benchmark(args):
     if task_name in ("text-to-video", "image-to-video", "video-to-video"):
         api_url = f"{args.base_url}/v1/videos"
         request_func = async_request_video_sglang
-    elif task_name in ["text-to-image", "image-to-image"]:
+    elif task_name in ("text-to-image", "image-to-image"):
         if task_name == "image-to-image":
             api_url = f"{args.base_url}/v1/images/edits"
         else:
