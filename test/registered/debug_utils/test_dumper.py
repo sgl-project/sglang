@@ -62,8 +62,8 @@ class TestDumperDistributed(CustomTestCase):
         _run_distributed_test(_test_http_func)
 
     def test_filter(self):
-        tmpdir = tempfile.mkdtemp(prefix="test_dumper_")
-        _run_distributed_test(_test_filter_func, tmpdir=tmpdir)
+        with tempfile.TemporaryDirectory(prefix="test_dumper_") as tmpdir:
+            _run_distributed_test(_test_filter_func, tmpdir=tmpdir)
 
     def test_write_disabled(self):
         tmpdir = tempfile.mkdtemp(prefix="test_dumper_")
