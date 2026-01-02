@@ -132,7 +132,6 @@ If you want to know the meaning and usage of each parameter, click [Service Argu
 |----------------------------------------|---------------|-------------------------------------------------------------|:----------------------------------------:|:----------------------------------------:|
 | `--data-parallel-size`<br/>`--dp-size` | `1`           | Type: int                                                   | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | `--load-balance-method`                | `round_robin` | `round_robin`,<br/> `shortest_queue`,<br/> `minimum_tokens` | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| `--prefill-round-robin-balance`        | `False`       | bool flag<br/> (set to enable)                              | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 
 ## Multi-node distributed serving
 

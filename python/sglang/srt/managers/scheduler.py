@@ -740,8 +740,6 @@ class Scheduler(
         self.running_batch: ScheduleBatch = ScheduleBatch(reqs=[], batch_is_full=False)
         # The current forward batch
         self.cur_batch: Optional[ScheduleBatch] = None
-        # The current split prefill batch
-        self.split_prefill_batch: Optional[ScheduleBatch] = None
         # The last forward batch
         self.last_batch: Optional[ScheduleBatch] = None
         self.forward_ct = 0
@@ -1538,6 +1536,10 @@ class Scheduler(
             req.set_finish_with_abort(error_msg)
             self._add_request_to_queue(req)
             return
+
+        if not recv_req.return_logprob and recv_req.logprob_start_len != -1:
+            # When return_logprob is False, logprob_start_len should be ignored
+            recv_req.logprob_start_len = -1
 
         if recv_req.logprob_start_len == -1:
             if req.is_prefill_only:

@@ -166,6 +166,10 @@ struct CliArgs {
     #[arg(long, default_value_t = 67108864, help_heading = "Routing Policy")]
     max_tree_size: usize,
 
+    /// Maximum idle time in seconds before eviction (for manual policy)
+    #[arg(long, default_value_t = 14400, help_heading = "Routing Policy")]
+    max_idle_secs: u64,
+
     /// Number of prefix tokens to use for prefix_hash policy
     #[arg(long, default_value_t = 256, help_heading = "Routing Policy")]
     prefix_token_count: usize,
@@ -688,7 +692,10 @@ impl CliArgs {
                 prefix_token_count: self.prefix_token_count,
                 load_factor: self.prefix_hash_load_factor,
             },
-            "manual" => PolicyConfig::Manual,
+            "manual" => PolicyConfig::Manual {
+                eviction_interval_secs: self.eviction_interval,
+                max_idle_secs: self.max_idle_secs,
+            },
             _ => PolicyConfig::RoundRobin,
         }
     }
