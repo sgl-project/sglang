@@ -467,9 +467,9 @@ def _dp_gather_via_all_reduce(
         not local_tokens.dtype.is_floating_point
         and get_tensor_model_parallel_world_size() <= NUM_GPUS_PER_NODE
     ):
-        torch.ops.sglang.inplace_all_reduce(
-            global_tokens, group_name=get_tp_group().unique_name
-        )
+        from sglang.srt.distributed.parallel_state import inplace_all_reduce
+
+        inplace_all_reduce(global_tokens, group_name=get_tp_group().unique_name)
 
     else:
         global_tokens[:] = tensor_model_parallel_all_reduce(global_tokens)

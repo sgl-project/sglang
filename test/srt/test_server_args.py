@@ -25,6 +25,20 @@ class TestPrepareServerArgs(CustomTestCase):
         )
 
 
+class TestLoadBalanceMethod(unittest.TestCase):
+    def test_non_pd_defaults_to_round_robin(self):
+        server_args = ServerArgs(model_path="dummy", disaggregation_mode="null")
+        self.assertEqual(server_args.load_balance_method, "round_robin")
+
+    def test_pd_prefill_defaults_to_follow_bootstrap_room(self):
+        server_args = ServerArgs(model_path="dummy", disaggregation_mode="prefill")
+        self.assertEqual(server_args.load_balance_method, "follow_bootstrap_room")
+
+    def test_pd_decode_defaults_to_round_robin(self):
+        server_args = ServerArgs(model_path="dummy", disaggregation_mode="decode")
+        self.assertEqual(server_args.load_balance_method, "round_robin")
+
+
 class TestPortArgs(unittest.TestCase):
     @patch("sglang.srt.server_args.is_port_available")
     @patch("sglang.srt.server_args.tempfile.NamedTemporaryFile")

@@ -6,8 +6,8 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 import torch
 from einops import rearrange
 
-from sglang.srt.custom_op import CustomOp
 from sglang.srt.layers.layernorm import LayerNorm
+from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.utils import add_prefix, ceil_align, is_cuda, is_hip, is_npu
 
 global _use_multi_stream
@@ -93,7 +93,7 @@ def rotate_activation(x: torch.Tensor) -> torch.Tensor:
     return hadamard_transform(x, scale=hidden_size**-0.5)
 
 
-class Indexer(CustomOp):
+class Indexer(MultiPlatformOp):
     def __init__(
         self,
         hidden_size: int,

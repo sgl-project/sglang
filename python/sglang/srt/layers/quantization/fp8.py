@@ -667,6 +667,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 ),
                 requires_grad=False,
             )
+            # w13_weight and w2_weight are always requanted together
+            w13_weight_scale.format_ue8m0 = False
+            w2_weight_scale.format_ue8m0 = False
             layer.register_parameter("w13_weight_scale_inv", w13_weight_scale)
             layer.register_parameter("w2_weight_scale_inv", w2_weight_scale)
             assert self.quant_config.activation_scheme == "dynamic"
@@ -814,6 +817,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                         ),
                     )
                     and get_moe_runner_backend().is_deep_gemm()
+                    and not layer.w13_weight_scale_inv.format_ue8m0
                 ):
                     assert isinstance(
                         layer, DeepEPMoE
@@ -825,6 +829,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     requant_weight_ue8m0_inplace(
                         layer.w2_weight, layer.w2_weight_scale_inv, weight_block_size
                     )
+                    layer.w13_weight_scale_inv.format_ue8m0 = True
+                    layer.w2_weight_scale_inv.format_ue8m0 = True
             return
 
         # If checkpoint is fp16 or bfloat16, quantize in place.

@@ -1,10 +1,10 @@
 [build-system]
-requires = ["setuptools>=61.0", "wheel"]
+requires = ["setuptools>=61.0", "setuptools-scm>=8.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "sglang"
-version = "0.5.6.post2"
+dynamic = ["version"]
 description = "SGLang is a fast serving framework for large language models and vision language models."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -132,6 +132,11 @@ exclude = [
   "scripts*",
   "tests*",
 ]
+
+[tool.setuptools_scm]
+root = ".."
+version_file = "sglang/_version.py"
+git_describe_command = ["git", "describe", "--tags", "--long", "--match", "v*"]
 
 [tool.codespell]
 ignore-words-list = "ans, als, hel, boostrap, childs, te, vas, hsa, ment"

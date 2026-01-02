@@ -8,8 +8,8 @@ use std::{sync::Arc, time::Instant};
 use axum::response::{IntoResponse, Response};
 use tracing::{debug, error};
 
-// Import embedding-specific stages
-use super::regular::stages::embedding::preparation::EmbeddingPreparationStage;
+// Import embedding-specific and classify-specific stages
+use super::regular::stages::classify::ClassifyResponseProcessingStage;
 use super::{
     common::stages::*,
     context::*,
@@ -18,6 +18,7 @@ use super::{
         processor,
         stages::{
             embedding::{
+                preparation::EmbeddingPreparationStage,
                 request_building::EmbeddingRequestBuildingStage,
                 response_processing::EmbeddingResponseProcessingStage,
             },
@@ -33,6 +34,7 @@ use crate::{
     policies::PolicyRegistry,
     protocols::{
         chat::{ChatCompletionRequest, ChatCompletionResponse},
+        classify::ClassifyRequest,
         embedding::EmbeddingRequest,
         generate::GenerateRequest,
     },
@@ -224,6 +226,34 @@ impl RequestPipeline {
         }
     }
 
+    /// Create a classify pipeline
+    ///
+    /// Classify reuses embedding stages for preparation and request building,
+    /// but uses its own response processing for softmax + label mapping.
+    pub fn new_classify(
+        worker_registry: Arc<WorkerRegistry>,
+        policy_registry: Arc<PolicyRegistry>,
+    ) -> Self {
+        let stages: Vec<Box<dyn PipelineStage>> = vec![
+            Box::new(EmbeddingPreparationStage::new()),
+            Box::new(WorkerSelectionStage::new(
+                worker_registry,
+                policy_registry,
+                WorkerSelectionMode::Regular, // Classify is always single worker
+            )),
+            Box::new(ClientAcquisitionStage),
+            Box::new(EmbeddingRequestBuildingStage::new()),
+            Box::new(DispatchMetadataStage),
+            Box::new(RequestExecutionStage::new(ExecutionMode::Single)),
+            Box::new(ClassifyResponseProcessingStage::new()),
+        ];
+
+        Self {
+            stages: Arc::new(stages),
+            backend_type: metrics_labels::BACKEND_REGULAR,
+        }
+    }
+
     /// Execute the complete pipeline for a chat request
     pub async fn execute_chat(
         &self,
@@ -295,10 +325,12 @@ impl RequestPipeline {
                 );
                 axum::Json(response).into_response()
             }
-            Some(FinalResponse::Generate(_)) | Some(FinalResponse::Embedding(_)) => {
+            Some(FinalResponse::Generate(_))
+            | Some(FinalResponse::Embedding(_))
+            | Some(FinalResponse::Classify(_)) => {
                 error!(
                     function = "execute_chat",
-                    "Wrong response type: expected Chat, got Generate/Embedding"
+                    "Wrong response type: expected Chat, got Generate/Embedding/Classify"
                 );
                 Metrics::record_router_error(
                     metrics_labels::ROUTER_GRPC,
@@ -399,10 +431,12 @@ impl RequestPipeline {
                 );
                 axum::Json(response).into_response()
             }
-            Some(FinalResponse::Chat(_)) | Some(FinalResponse::Embedding(_)) => {
+            Some(FinalResponse::Chat(_))
+            | Some(FinalResponse::Embedding(_))
+            | Some(FinalResponse::Classify(_)) => {
                 error!(
                     function = "execute_generate",
-                    "Wrong response type: expected Generate, got Chat/Embedding"
+                    "Wrong response type: expected Generate, got Chat/Embedding/Classify"
                 );
                 Metrics::record_router_error(
                     metrics_labels::ROUTER_GRPC,
@@ -538,6 +572,110 @@ impl RequestPipeline {
         }
     }
 
+    /// Execute the complete pipeline for a classify request
+    pub async fn execute_classify(
+        &self,
+        request: Arc<ClassifyRequest>,
+        headers: Option<http::HeaderMap>,
+        model_id: Option<String>,
+        components: Arc<SharedComponents>,
+    ) -> Response {
+        debug!(
+            "execute_classify: Starting execution for model: {:?}",
+            model_id
+        );
+        let start = Instant::now();
+
+        // Record request start
+        Metrics::record_router_request(
+            metrics_labels::ROUTER_GRPC,
+            self.backend_type,
+            metrics_labels::CONNECTION_GRPC,
+            model_id.as_deref().unwrap_or("unknown"),
+            metrics_labels::ENDPOINT_CLASSIFY,
+            bool_to_static_str(false), // Classify is never streaming
+        );
+
+        let mut ctx = RequestContext::for_classify(request, headers, model_id.clone(), components);
+
+        for stage in self.stages.iter() {
+            debug!("execute_classify: Executing stage: {}", stage.name());
+            match stage.execute(&mut ctx).await {
+                Ok(Some(response)) => {
+                    debug!(
+                        "execute_classify: Stage {} returned final response.",
+                        stage.name()
+                    );
+                    Metrics::record_router_duration(
+                        metrics_labels::ROUTER_GRPC,
+                        self.backend_type,
+                        metrics_labels::CONNECTION_GRPC,
+                        model_id.as_deref().unwrap_or("unknown"),
+                        metrics_labels::ENDPOINT_CLASSIFY,
+                        start.elapsed(),
+                    );
+                    return response;
+                }
+                Ok(None) => {
+                    debug!(
+                        "execute_classify: Stage {} completed, continuing to next stage.",
+                        stage.name()
+                    );
+                    continue;
+                }
+                Err(response) => {
+                    error!(
+                        "execute_classify: Stage {} failed with status {:?}, returning error response.",
+                        stage.name(),
+                        response.status()
+                    );
+                    Metrics::record_router_error(
+                        metrics_labels::ROUTER_GRPC,
+                        self.backend_type,
+                        metrics_labels::CONNECTION_GRPC,
+                        model_id.as_deref().unwrap_or("unknown"),
+                        metrics_labels::ENDPOINT_CLASSIFY,
+                        error_type_from_status(response.status()),
+                    );
+                    return response;
+                }
+            }
+        }
+
+        debug!(
+            "execute_classify: Pipeline finished, processing final_response. Current state: {:?}",
+            ctx.state.response.final_response
+        );
+        match ctx.state.response.final_response {
+            Some(FinalResponse::Classify(_)) => {
+                error!("execute_classify: Classify FinalResponse found, but pipeline finished without returning response directly. This should be handled by the last stage.");
+                Metrics::record_router_duration(
+                    metrics_labels::ROUTER_GRPC,
+                    self.backend_type,
+                    metrics_labels::CONNECTION_GRPC,
+                    model_id.as_deref().unwrap_or("unknown"),
+                    metrics_labels::ENDPOINT_CLASSIFY,
+                    start.elapsed(),
+                );
+                error::internal_error(
+                    "pipeline_fallthrough",
+                    "Pipeline finished without returning response",
+                )
+            }
+            Some(_) => {
+                error!(function = "execute_classify", "Wrong response type");
+                error::internal_error("wrong_response_type", "Internal error: wrong response type")
+            }
+            None => {
+                error!(
+                    function = "execute_classify",
+                    "No final response produced by pipeline."
+                );
+                error::internal_error("no_response_produced", "No response produced")
+            }
+        }
+    }
+
     /// Execute chat pipeline for responses endpoint
     ///
     /// Used by ALL non-streaming /v1/responses requests.
@@ -584,10 +722,12 @@ impl RequestPipeline {
 
         match ctx.state.response.final_response {
             Some(FinalResponse::Chat(response)) => Ok(response),
-            Some(FinalResponse::Generate(_)) | Some(FinalResponse::Embedding(_)) => {
+            Some(FinalResponse::Generate(_))
+            | Some(FinalResponse::Embedding(_))
+            | Some(FinalResponse::Classify(_)) => {
                 error!(
                     function = "execute_chat_for_responses",
-                    "Wrong response type: expected Chat, got Generate/Embedding"
+                    "Wrong response type: expected Chat, got Generate/Embedding/Classify"
                 );
                 Err(error::internal_error(
                     "wrong_response_type",

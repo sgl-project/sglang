@@ -16,7 +16,7 @@ import pytest
 import requests
 from openai import OpenAI
 
-from sglang.multimodal_gen.runtime.utils.common import is_hip
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.perf_logger import RequestPerfRecord
 from sglang.multimodal_gen.test.server.conftest import _GLOBAL_PERF_RESULTS
@@ -38,7 +38,6 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
 from sglang.multimodal_gen.test.test_utils import (
     get_dynamic_server_port,
     is_image_url,
-    read_perf_logs,
     wait_for_req_perf_record,
 )
 
@@ -52,7 +51,11 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
 
     # Skip ring attention tests on AMD/ROCm - Ring Attention requires Flash Attention
     # which is not available on AMD. Use Ulysses parallelism instead.
-    if is_hip() and server_args.ring_degree is not None and server_args.ring_degree > 1:
+    if (
+        current_platform.is_hip()
+        and server_args.ring_degree is not None
+        and server_args.ring_degree > 1
+    ):
         pytest.skip(
             f"Skipping {case.id}: Ring Attention (ring_degree={server_args.ring_degree}) "
             "requires Flash Attention which is not available on AMD/ROCm"
@@ -70,6 +73,9 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
     if server_args.ulysses_degree is not None:
         extra_args += f" --ulysses-degree {server_args.ulysses_degree}"
 
+    if server_args.dit_layerwise_offload:
+        extra_args += f" --dit-layerwise-offload true"
+
     if server_args.ring_degree is not None:
         extra_args += f" --ring-degree {server_args.ring_degree}"
 
@@ -77,12 +83,18 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
     if server_args.lora_path:
         extra_args += f" --lora-path {server_args.lora_path}"
 
+    # Build custom environment variables
+    env_vars = {}
+    if server_args.enable_cache_dit:
+        env_vars["SGLANG_CACHE_DIT_ENABLED"] = "true"
+
     # start server
     manager = ServerManager(
         model=server_args.model_path,
         port=port,
         wait_deadline=float(os.environ.get("SGLANG_TEST_WAIT_SECS", "1200")),
         extra_args=extra_args,
+        env_vars=env_vars,
     )
     ctx = manager.start()
 
@@ -97,6 +109,7 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
             model=server_args.model_path,
             prompt=sampling_params.prompt or "A colorful raccoon icon",
             output_size=output_size,
+            output_format=sampling_params.output_format,
         )
         warmup.run_text_warmups(server_args.warmup_text)
 
@@ -187,15 +200,13 @@ Consider updating perf_baselines.json with the snippets below:
     ) -> RequestPerfRecord:
         """Run generation and collect performance records."""
         log_path = ctx.perf_log_path
-        prev_len = len(read_perf_logs(log_path))
         log_wait_timeout = 30
 
         client = self._client(ctx)
         rid = generate_fn(case_id, client)
 
-        req_perf_record, _ = wait_for_req_perf_record(
+        req_perf_record = wait_for_req_perf_record(
             rid,
-            prev_len,
             log_path,
             timeout=log_wait_timeout,
         )

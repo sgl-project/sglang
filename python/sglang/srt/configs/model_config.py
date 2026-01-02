@@ -160,6 +160,7 @@ class ModelConfig:
         self.attention_chunk_size = getattr(
             self.hf_text_config, "attention_chunk_size", None
         )
+        self.sliding_window_size = self._get_sliding_window_size()
         self.is_generation = is_generation_model(
             self.hf_config.architectures, is_embedding
         )
@@ -670,6 +671,12 @@ class ModelConfig:
         else:
             return "fp8"  # Default fallback
 
+    def _get_sliding_window_size(self) -> Optional[int]:
+        sliding_window_size = getattr(self.hf_text_config, "sliding_window_size", None)
+        if sliding_window_size is None:
+            sliding_window_size = getattr(self.hf_text_config, "sliding_window", None)
+        return sliding_window_size
+
     def _validate_quantize_and_serve_config(self):
         """Validate quantize_and_serve configuration."""
         if not self.quantize_and_serve:
@@ -1047,7 +1054,7 @@ multimodal_model_archs = [
     "Gemma3nForConditionalGeneration",
     "Glm4vForConditionalGeneration",
     "Glm4vMoeForConditionalGeneration",
-    "GlmasrForConditionalGeneration",
+    "GlmAsrForConditionalGeneration",
     "Grok1VForCausalLM",
     "Grok1AForCausalLM",
     "LlavaLlamaForCausalLM",
