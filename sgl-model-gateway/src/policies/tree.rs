@@ -554,7 +554,6 @@ impl Tree {
                 } else {
                     // Partial match - still use this node for tenant selection
                     matched_chars += shared_count;
-                    remaining = advance_by_chars(remaining, shared_count);
                     prev = matched_node;
                     break;
                 }
@@ -607,8 +606,10 @@ impl Tree {
                 .insert(Arc::clone(&tenant), epoch);
         }
 
-        // Compute input char count from matched + remaining (deferred from start)
-        let input_char_count = matched_chars + remaining.chars().count();
+        // Compute input char count directly from input text.
+        // This is equivalent to matched_chars + remaining.chars().count() but avoids
+        // needing to track remaining precisely through the traversal.
+        let input_char_count = text.chars().count();
 
         PrefixMatchResult {
             tenant,
