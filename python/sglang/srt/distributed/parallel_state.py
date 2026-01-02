@@ -41,7 +41,6 @@ from torch.distributed import Backend, ProcessGroup
 
 from sglang.srt.environ import envs
 from sglang.srt.utils import (
-    direct_register_custom_op,
     get_bool_env_var,
     get_current_device_stream_fast,
     get_int_env_var,
@@ -52,14 +51,12 @@ from sglang.srt.utils import (
     is_npu,
     is_shm_available,
     is_xpu,
-    supports_custom_op,
 )
+from sglang.srt.utils.custom_op import register_custom_op
 
 _is_npu = is_npu()
 _is_cpu = is_cpu()
 _is_xpu = is_xpu()
-_supports_custom_op = supports_custom_op()
-
 
 TensorMetadata = namedtuple("TensorMetadata", ["device", "dtype", "size"])
 
@@ -127,87 +124,46 @@ def _register_group(group: "GroupCoordinator") -> None:
     _groups[group.unique_name] = weakref.ref(group)
 
 
-if _supports_custom_op:
+@register_custom_op(mutates_args=["tensor"])
+def inplace_all_reduce(tensor: torch.Tensor, group_name: str) -> None:
+    assert group_name in _groups, f"Group {group_name} is not found."
+    group = _groups[group_name]()
+    if group is None:
+        raise ValueError(f"Group {group_name} is destroyed.")
+    group._all_reduce_in_place(tensor)
 
-    def inplace_all_reduce(tensor: torch.Tensor, group_name: str) -> None:
-        assert group_name in _groups, f"Group {group_name} is not found."
-        group = _groups[group_name]()
-        if group is None:
-            raise ValueError(f"Group {group_name} is destroyed.")
-        group._all_reduce_in_place(tensor)
 
-    def inplace_all_reduce_fake(tensor: torch.Tensor, group_name: str) -> None:
-        return
+@register_custom_op(out_shape="tensor")
+def outplace_all_reduce(
+    tensor: torch.Tensor, group_name: str, outplace_all_reduce_method: str
+) -> torch.Tensor:
+    assert group_name in _groups, f"Group {group_name} is not found."
+    group = _groups[group_name]()
+    if group is None:
+        raise ValueError(f"Group {group_name} is destroyed.")
+    return group._all_reduce_out_place(tensor, outplace_all_reduce_method)
 
-    direct_register_custom_op(
-        op_name="inplace_all_reduce",
-        op_func=inplace_all_reduce,
-        mutates_args=["tensor"],
-        fake_impl=inplace_all_reduce_fake,
-    )
 
-    def outplace_all_reduce(
-        tensor: torch.Tensor, group_name: str, outplace_all_reduce_method: str
-    ) -> torch.Tensor:
-        assert group_name in _groups, f"Group {group_name} is not found."
-        group = _groups[group_name]()
-        if group is None:
-            raise ValueError(f"Group {group_name} is destroyed.")
-        return group._all_reduce_out_place(tensor, outplace_all_reduce_method)
+@register_custom_op(mutates_args=["output"])
+def reg_all_gather_into_tensor(
+    output: torch.Tensor, input: torch.Tensor, group_name: str
+) -> None:
+    assert group_name in _groups, f"Group {group_name} is not found."
+    group = _groups[group_name]()
+    if group is None:
+        raise ValueError(f"Group {group_name} is destroyed.")
+    group._all_gather_into_tensor(output, input)
 
-    def outplace_all_reduce_fake(
-        tensor: torch.Tensor, group_name: str, outplace_all_reduce_method: str
-    ) -> torch.Tensor:
-        return torch.empty_like(tensor)
 
-    direct_register_custom_op(
-        op_name="outplace_all_reduce",
-        op_func=outplace_all_reduce,
-        mutates_args=[],
-        fake_impl=outplace_all_reduce_fake,
-    )
-
-    def reg_all_gather_into_tensor(
-        output: torch.Tensor, input: torch.Tensor, group_name: str
-    ) -> None:
-        assert group_name in _groups, f"Group {group_name} is not found."
-        group = _groups[group_name]()
-        if group is None:
-            raise ValueError(f"Group {group_name} is destroyed.")
-        group._all_gather_into_tensor(output, input)
-
-    def reg_all_gather_into_tensor_fake(
-        output: torch.Tensor, input: torch.Tensor, group_name: str
-    ) -> None:
-        pass
-
-    direct_register_custom_op(
-        op_name="reg_all_gather_into_tensor",
-        op_func=reg_all_gather_into_tensor,
-        mutates_args=["output"],
-        fake_impl=reg_all_gather_into_tensor_fake,
-    )
-
-    def reg_reduce_scatter_tensor(
-        output: torch.Tensor, input: torch.Tensor, group_name: str
-    ) -> None:
-        assert group_name in _groups, f"Group {group_name} is not found."
-        group = _groups[group_name]()
-        if group is None:
-            raise ValueError(f"Group {group_name} is destroyed.")
-        group._reduce_scatter_tensor(output, input)
-
-    def reg_reduce_scatter_tensor_fake(
-        output: torch.Tensor, input: torch.Tensor, group_name: str
-    ) -> None:
-        pass
-
-    direct_register_custom_op(
-        op_name="reg_reduce_scatter_tensor",
-        op_func=reg_reduce_scatter_tensor,
-        mutates_args=["output"],
-        fake_impl=reg_reduce_scatter_tensor_fake,
-    )
+@register_custom_op(mutates_args=["output"])
+def reg_reduce_scatter_tensor(
+    output: torch.Tensor, input: torch.Tensor, group_name: str
+) -> None:
+    assert group_name in _groups, f"Group {group_name} is not found."
+    group = _groups[group_name]()
+    if group is None:
+        raise ValueError(f"Group {group_name} is destroyed.")
+    group._reduce_scatter_tensor(output, input)
 
 
 class GroupCoordinator:
@@ -590,10 +546,6 @@ class GroupCoordinator:
                 torch.distributed.all_reduce(input_, group=self.device_group)
             return input_
 
-        if not _supports_custom_op:
-            self._all_reduce_in_place(input_)
-            return input_
-
         if self.hpu_communicator is not None and not self.hpu_communicator.disabled:
             return self.hpu_communicator.all_reduce(input_)
 
@@ -636,13 +588,13 @@ class GroupCoordinator:
         ):
             outplace_all_reduce_method = "torch_symm_mem"
         if outplace_all_reduce_method is not None:
-            return torch.ops.sglang.outplace_all_reduce(
+            return outplace_all_reduce(
                 input_,
                 group_name=self.unique_name,
                 outplace_all_reduce_method=outplace_all_reduce_method,
             )
         else:
-            torch.ops.sglang.inplace_all_reduce(input_, group_name=self.unique_name)
+            inplace_all_reduce(input_, group_name=self.unique_name)
             return input_
 
     def _all_reduce_out_place(
@@ -698,12 +650,10 @@ class GroupCoordinator:
         return output
 
     def reduce_scatter_tensor(self, output: torch.Tensor, input: torch.Tensor):
-        if _is_npu or not supports_custom_op():
+        if _is_npu:
             self._reduce_scatter_tensor(output, input)
         else:
-            torch.ops.sglang.reg_reduce_scatter_tensor(
-                output, input, group_name=self.unique_name
-            )
+            reg_reduce_scatter_tensor(output, input, group_name=self.unique_name)
 
     def reduce_scatter(
         self,
@@ -764,12 +714,10 @@ class GroupCoordinator:
             )
 
     def all_gather_into_tensor(self, output: torch.Tensor, input: torch.Tensor):
-        if _is_npu or _is_xpu or not _supports_custom_op:
+        if _is_npu or _is_xpu:
             self._all_gather_into_tensor(output, input)
         else:
-            torch.ops.sglang.reg_all_gather_into_tensor(
-                output, input, group_name=self.unique_name
-            )
+            reg_all_gather_into_tensor(output, input, group_name=self.unique_name)
 
     def cp_all_gather_into_tensor_async(
         self, output: torch.Tensor, input: torch.Tensor, stream=None
@@ -1893,6 +1841,16 @@ def destroy_model_parallel():
     if _PP:
         _PP.destroy()
     _PP = None
+
+    global _MOE_EP
+    if _MOE_EP:
+        _MOE_EP.destroy()
+    _MOE_EP = None
+
+    global _MOE_TP
+    if _MOE_TP:
+        _MOE_TP.destroy()
+    _MOE_TP = None
 
     global _PDMUX_PREFILL_TP_GROUP
     if _PDMUX_PREFILL_TP_GROUP:  # type: ignore[union-attr]
