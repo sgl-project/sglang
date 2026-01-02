@@ -39,6 +39,76 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 logger = init_logger(__name__)
 
 
+def _apply_rope_native_inplace(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    is_neox: bool,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Native PyTorch implementation of RoPE for fallback when FlashInfer is unavailable.
+
+    Args:
+        q: Query tensor [bsz, seqlen, nheads, head_size]
+        k: Key tensor [bsz, seqlen, nheads, head_size]
+        cos: Cosine cache [seqlen, head_size//2]
+        sin: Sine cache [seqlen, head_size//2]
+        is_neox: Whether to use neox-style (split halves) or interleaved rotation
+
+    Returns:
+        Rotated q and k tensors
+    """
+    # Expand cos/sin for broadcasting: [seqlen, head_size//2] -> [1, seqlen, 1, head_size//2]
+    cos = cos.unsqueeze(0).unsqueeze(2)
+    sin = sin.unsqueeze(0).unsqueeze(2)
+
+    if is_neox:
+        # Neox style: split into first half and second half
+        q1, q2 = q[..., : q.shape[-1] // 2], q[..., q.shape[-1] // 2 :]
+        k1, k2 = k[..., : k.shape[-1] // 2], k[..., k.shape[-1] // 2 :]
+    else:
+        # Interleaved style: split into even and odd indices
+        q1, q2 = q[..., ::2], q[..., 1::2]
+        k1, k2 = k[..., ::2], k[..., 1::2]
+
+    # Apply rotation
+    q_rot1 = q1 * cos - q2 * sin
+    q_rot2 = q2 * cos + q1 * sin
+    k_rot1 = k1 * cos - k2 * sin
+    k_rot2 = k2 * cos + k1 * sin
+
+    if is_neox:
+        q_out = torch.cat([q_rot1, q_rot2], dim=-1)
+        k_out = torch.cat([k_rot1, k_rot2], dim=-1)
+    else:
+        # Interleave back
+        q_out = torch.stack([q_rot1, q_rot2], dim=-1).flatten(-2)
+        k_out = torch.stack([k_rot1, k_rot2], dim=-1).flatten(-2)
+
+    return q_out, k_out
+
+
+# Cache for FlashInfer availability check
+_FLASHINFER_AVAILABLE: Optional[bool] = None
+
+
+def _check_flashinfer_available() -> bool:
+    """Check if FlashInfer is available (cached)."""
+    global _FLASHINFER_AVAILABLE
+    if _FLASHINFER_AVAILABLE is None:
+        try:
+            from flashinfer.rope import apply_rope_with_cos_sin_cache_inplace  # noqa: F401
+
+            _FLASHINFER_AVAILABLE = True
+        except ImportError:
+            _FLASHINFER_AVAILABLE = False
+            logger.info(
+                "FlashInfer not available for RoPE. Using native PyTorch fallback."
+            )
+    return _FLASHINFER_AVAILABLE
+
+
 def apply_flashinfer_rope_qk_inplace(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -67,13 +137,51 @@ def apply_flashinfer_rope_qk_inplace(
     if head_size != d:
         raise ValueError(f"head_size mismatch: inferred {d}, but head_size={head_size}")
 
-    try:
-        from flashinfer.rope import apply_rope_with_cos_sin_cache_inplace
-    except Exception as e:
-        raise RuntimeError(
-            "flashinfer is required for apply_flashinfer_rope_qk_inplace. "
-            "Please install flashinfer or disable this optimization."
-        ) from e
+    # Check if FlashInfer is available
+    if not _check_flashinfer_available():
+        # Use native PyTorch fallback
+        # cos_sin_cache is [max_seq_len, head_size] with cos in first half, sin in second half
+        half_size = cos_sin_cache.shape[-1] // 2
+        if positions is None:
+            cos = cos_sin_cache[:seqlen, :half_size].to(q.dtype)
+            sin = cos_sin_cache[:seqlen, half_size:].to(q.dtype)
+        else:
+            # Index into cache using positions
+            positions = positions.to(cos_sin_cache.device)
+            if positions.dim() == 1 and positions.numel() == bsz * seqlen:
+                positions = positions.view(bsz, seqlen)
+            cos = cos_sin_cache[positions, :half_size].to(q.dtype)
+            sin = cos_sin_cache[positions, half_size:].to(q.dtype)
+            # cos/sin now have shape [bsz, seqlen, half_size], need to add head dim
+            cos = cos.unsqueeze(2)  # [bsz, seqlen, 1, half_size]
+            sin = sin.unsqueeze(2)
+
+            # Apply rotation directly without the helper function for custom positions
+            if is_neox:
+                q1, q2 = q[..., :half_size], q[..., half_size:]
+                k1, k2 = k[..., :half_size], k[..., half_size:]
+            else:
+                q1, q2 = q[..., ::2], q[..., 1::2]
+                k1, k2 = k[..., ::2], k[..., 1::2]
+
+            q_rot1 = q1 * cos - q2 * sin
+            q_rot2 = q2 * cos + q1 * sin
+            k_rot1 = k1 * cos - k2 * sin
+            k_rot2 = k2 * cos + k1 * sin
+
+            if is_neox:
+                return torch.cat([q_rot1, q_rot2], dim=-1), torch.cat(
+                    [k_rot1, k_rot2], dim=-1
+                )
+            else:
+                return torch.stack([q_rot1, q_rot2], dim=-1).flatten(-2), torch.stack(
+                    [k_rot1, k_rot2], dim=-1
+                ).flatten(-2)
+
+        return _apply_rope_native_inplace(q, k, cos, sin, is_neox)
+
+    # FlashInfer path
+    from flashinfer.rope import apply_rope_with_cos_sin_cache_inplace
 
     if positions is None:
         pos_1d = torch.arange(seqlen, device="cpu", dtype=torch.long)
