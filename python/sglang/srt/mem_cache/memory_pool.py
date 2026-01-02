@@ -82,19 +82,19 @@ def _set_kv_buffer_impl(
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
     indices: torch.Tensor,
-    element_dim: int,
+    row_dim: int,  # head_num * head_dim
     store_dtype: torch.dtype,
     device_module: Any,
     alt_stream: Optional[torch.cuda.Stream] = None,
 ) -> None:
-    k = k.view(-1, element_dim)
-    v = v.view(-1, element_dim)
-    k_cache = k_cache.view(-1, element_dim)
-    v_cache = v_cache.view(-1, element_dim)
-    element_bytes = element_dim * store_dtype.itemsize
+    k = k.view(-1, row_dim)
+    v = v.view(-1, row_dim)
+    k_cache = k_cache.view(-1, row_dim)
+    v_cache = v_cache.view(-1, row_dim)
+    row_bytes = row_dim * store_dtype.itemsize
 
-    if _is_cuda and can_use_store_cache(element_bytes):
-        return store_cache(k, v, k_cache, v_cache, indices, element_bytes=element_bytes)
+    if _is_cuda and can_use_store_cache(row_bytes):
+        return store_cache(k, v, k_cache, v_cache, indices, row_bytes=row_bytes)
 
     from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 
@@ -686,7 +686,7 @@ class MHATokenToKVPool(KVCache):
             self._kv_copy_config = None
 
         self._finalize_allocation_log(size)
-        self.element_dim = self.head_num * self.head_dim
+        self.row_dim = self.head_num * self.head_dim
 
     def _init_kv_copy_and_warmup(self):
         # Heuristics for KV copy tiling
@@ -917,7 +917,7 @@ class MHATokenToKVPool(KVCache):
             self.k_buffer[layer_id - self.start_layer],
             self.v_buffer[layer_id - self.start_layer],
             loc,
-            element_dim=self.element_dim,
+            row_dim=self.row_dim,
             store_dtype=self.store_dtype,
             device_module=self.device_module,
             alt_stream=self.alt_stream,
