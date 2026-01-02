@@ -12,7 +12,7 @@ import torch.multiprocessing as mp
 from sglang.test.test_utils import CustomTestCase
 
 
-class TestDumperUtils(CustomTestCase):
+class TestDumperPureFunctions(CustomTestCase):
     def test_get_truncated_value_none(self):
         from sglang.srt.debug_utils.dumper import get_truncated_value
 
