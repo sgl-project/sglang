@@ -93,7 +93,7 @@ def _set_kv_buffer_impl(
     v_cache = v_cache.view(-1, element_dim)
     element_bytes = element_dim * store_dtype.itemsize
 
-    if can_use_store_cache(element_bytes):
+    if _is_cuda and can_use_store_cache(element_bytes):
         return store_cache(k, v, k_cache, v_cache, indices, element_bytes=element_bytes)
 
     from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
