@@ -55,7 +55,6 @@ from sglang.srt.mem_cache.memory_pool import (
     SWAKVPool,
 )
 from sglang.srt.tracing.trace import trace_event_batch, trace_slice, trace_slice_end
-from sglang.srt.utils import broadcast_pyobj, point_to_point_pyobj
 
 if TYPE_CHECKING:
     from torch.distributed import ProcessGroup
@@ -252,8 +251,6 @@ class PrefillBootstrapQueue:
                 # if req not in reqs_info_to_check, skip
                 if req.rid not in rids_to_check:
                     continue
-                # Either waiting for input or failed
-                assert poll == KVPoll.WaitingForInput or poll == KVPoll.Failed
 
             if poll == KVPoll.Bootstrapping:
                 continue
@@ -710,36 +707,3 @@ class SchedulerDisaggregationPrefillMixin:
             )
             return
         req.disagg_kv_sender.send(page_indices, state_indices)
-
-    def send_pyobj_to_next_stage(self, data):
-        if self.attn_tp_rank == 0:
-            dp_offset = self.attn_dp_rank * self.attn_tp_size
-            point_to_point_pyobj(
-                data,
-                self.pp_rank * self.tp_size + dp_offset,
-                self.world_group.device_group,
-                self.pp_rank * self.tp_size + dp_offset,
-                ((self.pp_rank + 1) % self.pp_size) * self.tp_size + dp_offset,
-            )
-
-    def recv_pyobj_from_prev_stage(self):
-        if self.attn_tp_rank == 0:
-            dp_offset = self.attn_dp_rank * self.attn_tp_size
-            data = point_to_point_pyobj(
-                [],
-                self.pp_rank * self.tp_size + dp_offset,
-                self.world_group.device_group,
-                ((self.pp_rank - 1) % self.pp_size) * self.tp_size + dp_offset,
-                self.pp_rank * self.tp_size + dp_offset,
-            )
-        else:
-            data = None
-
-        if self.attn_tp_size != 1:
-            data = broadcast_pyobj(
-                data,
-                self.attn_tp_group.rank,
-                self.attn_tp_cpu_group,
-                src=self.attn_tp_group.ranks[0],
-            )
-        return data

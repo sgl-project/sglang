@@ -21,7 +21,7 @@ import threading
 import time
 from collections import deque
 from enum import Enum, auto
-from typing import List, Optional
+from typing import Callable, List, Optional
 
 import psutil
 import setproctitle
@@ -49,6 +49,7 @@ from sglang.srt.tracing.trace import (
     trace_slice_end,
     trace_slice_start,
 )
+from sglang.srt.utils import numa_utils
 from sglang.srt.utils.common import (
     bind_port,
     configure_ipv6,
@@ -118,14 +119,19 @@ class DPBudget:
 class DataParallelController:
     """A controller that dispatches requests to multiple data parallel workers."""
 
-    def __init__(self, server_args: ServerArgs, port_args: PortArgs) -> None:
+    def __init__(
+        self,
+        server_args: ServerArgs,
+        port_args: PortArgs,
+        run_scheduler_process_func: Callable,
+    ) -> None:
         # Parse args
         self.server_args = server_args
         self.port_args = port_args
         self.load_balance_method = LoadBalanceMethod.from_str(
             server_args.load_balance_method
         )
-        self.run_scheduler_process = run_scheduler_process
+        self.run_scheduler_process_func = run_scheduler_process_func
 
         # For DP balance
         self.global_balance_id = 0
@@ -428,7 +434,7 @@ class DataParallelController:
                 moe_ep_rank = tp_rank // (server_args.tp_size // server_args.ep_size)
                 with self.env_lock, maybe_reindex_device_id(gpu_id) as gpu_id:
                     proc = mp.Process(
-                        target=self.run_scheduler_process,
+                        target=self.run_scheduler_process_func,
                         args=(
                             server_args,
                             rank_port_args,
@@ -440,7 +446,9 @@ class DataParallelController:
                             writer,
                         ),
                     )
-                    with memory_saver_adapter.configure_subprocess():
+                    with memory_saver_adapter.configure_subprocess(), numa_utils.configure_subprocess(
+                        server_args, gpu_id
+                    ):
                         proc.start()
                 self.scheduler_procs.append(proc)
                 scheduler_pipe_readers.append(reader)
@@ -508,7 +516,7 @@ def run_data_parallel_controller_process(
     server_args: ServerArgs,
     port_args: PortArgs,
     pipe_writer,
-    data_parallel_controller_class=DataParallelController,
+    run_scheduler_process_func: Callable = run_scheduler_process,
 ):
     setproctitle.setproctitle("sglang::data_parallel_controller")
     faulthandler.enable()
@@ -526,7 +534,9 @@ def run_data_parallel_controller_process(
         trace_set_thread_info(thread_label)
 
     try:
-        controller = data_parallel_controller_class(server_args, port_args)
+        controller = DataParallelController(
+            server_args, port_args, run_scheduler_process_func
+        )
         pipe_writer.send(
             {
                 "status": "ready",

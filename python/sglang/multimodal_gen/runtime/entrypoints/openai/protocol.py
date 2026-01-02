@@ -30,7 +30,8 @@ class ImageGenerationsRequest(BaseModel):
     # SGLang extensions
     num_inference_steps: Optional[int] = None
     guidance_scale: Optional[float] = None
-    seed: Optional[int] = None
+    seed: Optional[int] = 1024
+    generator_device: Optional[str] = "cuda"
     diffusers_kwargs: Optional[Dict[str, Any]] = None  # kwargs for diffusers backend
 
 
@@ -59,10 +60,11 @@ class VideoGenerationsRequest(BaseModel):
     size: Optional[str] = "720x1280"
     fps: Optional[int] = None
     num_frames: Optional[int] = None
+    seed: Optional[int] = 1024
+    generator_device: Optional[str] = "cuda"
     # SGLang extensions
     num_inference_steps: Optional[int] = None
     guidance_scale: Optional[float] = None
-    seed: Optional[int] = None
     diffusers_kwargs: Optional[Dict[str, Any]] = None  # kwargs for diffusers backend
 
 

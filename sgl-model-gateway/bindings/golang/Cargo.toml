@@ -1,0 +1,47 @@
+[package]
+name = "sgl-model-gateway-golang"
+version = "0.2.4"
+edition = "2021"
+
+[lib]
+name = "sgl_model_gateway_go"
+crate-type = ["cdylib"]
+
+[dependencies]
+tokio = { version = "1.42.0", features = ["full"] }
+serde_json = { version = "1.0", default-features = false, features = [
+    "std",
+    "preserve_order",
+] }
+uuid = { version = "1.10", features = ["v4", "serde"] }
+once_cell = "1.21.3"
+futures-util = "0.3"
+tracing = "0.1"
+
+[dependencies.sgl-model-gateway]
+path = "../.."
+default-features = true
+
+[features]
+default = []
+vendored-openssl = ["sgl-model-gateway/vendored-openssl"]
+
+[profile.release]
+opt-level = "z"     # Optimize for size
+lto = "fat"         # Full LTO for smaller binaries
+codegen-units = 1   # Better optimization, slower compile
+strip = true        # Strip debug symbols
+
+[profile.ci]
+inherits = "release"
+opt-level = 2       # Lighter optimization (still fast runtime, much faster compile)
+lto = "thin"        # Thin LTO - good balance
+codegen-units = 16  # More parallelization for faster builds
+strip = true
+
+[profile.dev]
+opt-level = 0
+debug = 1
+split-debuginfo = "unpacked"
+incremental = true
+codegen-units = 256

@@ -5,8 +5,8 @@ from typing import TYPE_CHECKING, Callable
 
 import torch
 
+from sglang.srt.batch_overlap.two_batch_overlap import TboDPAttentionPreparer
 from sglang.srt.managers.schedule_batch import ScheduleBatch
-from sglang.srt.two_batch_overlap import TboDPAttentionPreparer
 from sglang.srt.utils.common import require_mlp_tp_gather
 
 if TYPE_CHECKING:
@@ -131,6 +131,8 @@ def prepare_mlp_sync_batch_raw(
     ) and not disable_cuda_graph
 
     is_extend_in_batch = local_batch.forward_mode.is_extend() if local_batch else False
+    if local_batch is not None:
+        local_batch.is_extend_in_batch = is_extend_in_batch
 
     tbo_preparer = TboDPAttentionPreparer()
     if len(offload_tags) == 0 and disable_overlap_schedule:

@@ -21,6 +21,10 @@ class TestNightlyMiniMaxM2Performance(unittest.TestCase):
         cls.other_args = [
             "--tp",
             "8",
+            "--ep",
+            "8",
+            "--model-loader-extra-config",
+            '{"enable_multithread_load": true}',
             "--trust-remote-code",
         ]
 
@@ -34,6 +38,7 @@ class TestNightlyMiniMaxM2Performance(unittest.TestCase):
             input_lens=self.input_lens,
             output_lens=self.output_lens,
             other_args=self.other_args,
+            extra_bench_args=["--trust-remote-code"],
         )
 
         self.runner.add_report(results)

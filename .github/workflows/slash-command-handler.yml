@@ -17,7 +17,8 @@ jobs:
       github.event.issue.pull_request &&
       (startsWith(github.event.comment.body, '/tag-run-ci-label') ||
        startsWith(github.event.comment.body, '/rerun-failed-ci') ||
-       startsWith(github.event.comment.body, '/tag-and-rerun-ci'))
+       startsWith(github.event.comment.body, '/tag-and-rerun-ci') ||
+       startsWith(github.event.comment.body, '/rerun-stage'))
     runs-on: ubuntu-latest
 
     steps:

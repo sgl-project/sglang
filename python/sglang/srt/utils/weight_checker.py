@@ -1,7 +1,12 @@
 import logging
-from typing import Dict
+from typing import Dict, Iterable, Tuple
 
 import torch
+
+from sglang.srt.layers.quantization.fp8_utils import (
+    block_quant_dequant,
+    inverse_transform_scale_ue8m0,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -39,8 +44,8 @@ class WeightChecker:
         assert self._snapshot_tensors is not None
 
         _check_tensors(
-            expect_tensors=self._snapshot_tensors,
-            actual_tensors=dict(self._model_state()),
+            expect_tensors=_postprocess_tensors(self._snapshot_tensors),
+            actual_tensors=_postprocess_tensors(dict(self._model_state())),
         )
 
     def _model_state(self):
@@ -50,32 +55,46 @@ class WeightChecker:
 
 
 def _check_tensors(
-    expect_tensors: Dict[str, torch.Tensor], actual_tensors: Dict[str, torch.Tensor]
+    expect_tensors: Iterable[Tuple[str, bool, torch.Tensor]],
+    actual_tensors: Iterable[Tuple[str, bool, torch.Tensor]],
 ):
     from sglang.srt.debug_utils.dumper import get_tensor_info
 
-    assert len(expect_tensors) == len(actual_tensors)
-
     good_names = []
     error_messages = []
+    info_messages = []
 
-    for name in expect_tensors:
-        expect = expect_tensors[name].cuda()
-        actual = actual_tensors[name].cuda()
+    for (expect_name, expect_should_compare, expect), (
+        actual_name,
+        actual_should_compare,
+        actual,
+    ) in zip(expect_tensors, actual_tensors, strict=True):
+        assert expect_name == actual_name, f"{expect_name=} {actual_name=}"
+        assert (
+            expect_should_compare == actual_should_compare
+        ), f"{expect_should_compare=} {actual_should_compare=}"
+        name = expect_name
+        should_compare = expect_should_compare
+
+        expect = expect.cuda()
+        actual = actual.cuda()
 
         if torch.all(expect == actual):
             good_names.append(name)
         else:
             abs_diff = (actual.float() - expect.float()).abs()
-            error_messages.append(
+            msg = (
                 f"name={name} "
                 f"max_abs_err={abs_diff.max()} "
                 f"mean_abs_err={abs_diff.mean()} "
                 f"{get_tensor_info(expect)=} "
                 f"{get_tensor_info(actual)=} "
             )
+            (error_messages if should_compare else info_messages).append(msg)
 
-    logger.info(f"[check_tensors] passed: {good_names}")
+    logger.info(f"[check_tensors] equal tensors: {good_names}")
+    if len(info_messages) > 0:
+        logger.info(f"[check_tensors] info: {info_messages}")
     if len(error_messages) > 0:
         raise Exception(f"check tensor equality failed:\n" + "\n".join(error_messages))
 
@@ -95,3 +114,46 @@ def _random_like(t: torch.Tensor):
     return torch.randint(
         low=int(info.min), high=int(info.max), size=shape, device=device, dtype=dtype
     )
+
+
+def _postprocess_tensors(
+    raw: Dict[str, torch.Tensor]
+) -> Iterable[Tuple[str, bool, torch.Tensor]]:
+    from sglang.srt.debug_utils.dumper import get_tensor_info
+
+    skip_compare_names = []
+
+    # dequant fp8
+    quant_names = [
+        name
+        for name in raw
+        # Match: `something.weight`, `something.experts.w2_weight`
+        if name.endswith("weight") and name.replace("weight", "weight_scale_inv") in raw
+    ]
+    skip_compare_names += quant_names
+    for name in quant_names:
+        w_q = raw[name]
+        w_s = raw[name.replace("weight", "weight_scale_inv")]
+
+        try:
+            # TODO this is only needed for Blackwell
+            w_s_inverse_transformed = inverse_transform_scale_ue8m0(
+                w_s, mn=w_q.shape[-2]
+            )
+            w_dequant = block_quant_dequant(
+                w_q,
+                w_s_inverse_transformed,
+                # TODO do not hardcode
+                block_size=[128, 128],
+                dtype=torch.bfloat16,
+            )
+            yield name, True, w_dequant
+        except Exception as e:
+            e.add_note(
+                f"when handling {name=} {get_tensor_info(w_q)=} {get_tensor_info(w_s)=}"
+            )
+            raise
+
+    for name in raw:
+        should_compare = name not in skip_compare_names
+        yield name, should_compare, raw[name]

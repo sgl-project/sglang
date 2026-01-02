@@ -6,6 +6,7 @@ from __future__ import annotations
 import collections
 import dataclasses
 import fnmatch
+import gc
 import glob
 import json
 import logging
@@ -25,6 +26,7 @@ from typing import (
     List,
     Optional,
     Tuple,
+    Union,
     cast,
 )
 
@@ -32,6 +34,11 @@ import huggingface_hub
 import numpy as np
 import torch
 
+from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
+    RemoteInstanceWeightLoaderBackend,
+    get_remote_instance_transfer_engine_info_per_rank,
+    register_memory_region_v2,
+)
 from sglang.srt.server_args import get_global_server_args
 
 # Try to import accelerate (optional dependency)
@@ -61,6 +68,7 @@ from sglang.srt.connector.utils import parse_model_name
 from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
+    model_parallel_is_initialized,
 )
 from sglang.srt.layers.modelopt_utils import QUANT_CFG_CHOICES
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -111,6 +119,8 @@ if TYPE_CHECKING:
 _is_npu = is_npu()
 # ModelOpt: QUANT_CFG_CHOICES is imported from modelopt_utils.py
 # which contains the complete mapping of quantization config choices
+
+logger = logging.getLogger(__name__)
 
 
 @contextmanager
@@ -690,6 +700,479 @@ class LayeredModelLoader(DefaultModelLoader):
             model.torchao_applied = True
 
         return model.eval()
+
+
+class QuantizedRLModelLoader(DefaultModelLoader):
+    """
+    Model loader for RL training with FP8 quantization (profile-free, native SGLang).
+
+    Workflow:
+      1. Initial load: Load base model → Record state → Apply FP8 quantization
+      2. Training Actor in full precision
+      3. Reload: Trainer sends full precision weights → Quantize to FP8 → Copy to original memory
+      4. Use torch.as_strided to preserve memory locations across reloads
+
+    Usage:
+      --model-path Qwen/Qwen2.5-7B --quantization fp8 --load-format flash_rl
+    """
+
+    # Parameter attributes to record for weight reloading
+    RECORDED_LOADER_KEYS = [
+        "weight_loader",
+        "load_qkv_weight",
+        "load_column_parallel_weight",
+        "load_row_parallel_weight",
+        "load_merged_column_weight",
+        "output_dim",
+        "input_dim",
+        "_assert_and_load",
+    ]
+
+    # Parameters to skip during FP8 quantization (matches FlashRL's exclude_list)
+    SKIP_QUANTIZATION_PARAMS = [
+        "weight_scale",
+        "input_scale",
+        "output_scale",
+        ".bias",
+        "lm_head.weight",
+        "model.norm.weight",
+        "embed_tokens",  # BF16 params
+        "rotary_emb.inv_freq",
+        "rotary_emb.cos_cached",
+        "rotary_emb.sin_cached",
+        "projector",
+        "input_layernorm.weight",
+        "post_attention_layernorm.weight",  # LayerNorms
+    ]
+
+    # Stacked parameters (Qwen2): shards loaded separately, then combined
+    STACKED_PARAMS_MAPPING = [
+        ("qkv_proj", ["q_proj", "k_proj", "v_proj"]),
+        ("gate_up_proj", ["gate_proj", "up_proj"]),
+    ]
+    _QKV_SHARD_ALIASES = {
+        "q_proj": "q",
+        "k_proj": "k",
+        "v_proj": "v",
+    }
+
+    def __init__(self, load_config: LoadConfig):
+        super().__init__(load_config)
+        logger.info("[QuantizedRL] Profile-free FP8 quantization enabled")
+        self._initial_load_complete = False
+
+    def _prepare_weights(
+        self, model_name_or_path: str, revision: Optional[str], fall_back_to_pt: bool
+    ):
+        """Standard weight preparation using base model path."""
+        logger.info(f"[QuantizedRL] Loading from base model: {model_name_or_path}")
+        temp_config = LoadConfig(load_format=LoadFormat.AUTO)
+        temp_loader = DefaultModelLoader(temp_config)
+        return temp_loader._prepare_weights(
+            model_name_or_path, revision, fall_back_to_pt
+        )
+
+    @staticmethod
+    def _bind_method_to_cls(func, obj):
+        """Bind function to object instance (for weight_loader methods)."""
+        import types
+
+        if hasattr(func, "__self__") or not callable(func):
+            return func
+        return types.MethodType(func, obj)
+
+    def load_weights_and_postprocess(self, model, weights, target_device):
+        """
+        Initial load: Load BF16 → Record state → Apply FP8 quantization.
+        Called ONCE during model initialization.
+        """
+        logger.info("[QuantizedRL] Initial load with FP8 quantization")
+
+        original_load_weights = model.load_weights
+
+        def load_weights_proxy(weights):
+            if QuantizedRLModelLoader.is_reload_scenario(model):
+                logger.info("[QuantizedRL] Using fast path reload in load_weights")
+                QuantizedRLModelLoader.rebinding_and_load_weights(
+                    model, original_load_weights, weights
+                )
+            else:
+                original_load_weights(weights)
+
+        model.load_weights = load_weights_proxy
+
+        model.load_weights(weights)
+        original_weights = dict(model.named_parameters())
+
+        # Record pre-quantization state (shape/stride) for torch.as_strided reset
+
+        model.original_weights_rebuild_keys = {}
+        for name, p in original_weights.items():
+            model.original_weights_rebuild_keys[name] = {
+                "shape": p.shape,
+                "stride": p.stride(),
+                "dtype": p.dtype,
+                "nbytes": p.untyped_storage().nbytes(),
+            }
+
+        # Record parameter attributes (weight_loader, etc.) before quantization
+        recorded_loader = {
+            k: dict() for k in QuantizedRLModelLoader.RECORDED_LOADER_KEYS
+        }
+        for name, p in original_weights.items():
+            for key in QuantizedRLModelLoader.RECORDED_LOADER_KEYS:
+                if hasattr(p, key):
+                    attr = getattr(p, key)
+                    if not callable(attr):
+                        recorded_loader[key][name] = attr
+                    elif hasattr(attr, "__self__") and p is attr.__self__:
+                        recorded_loader[key][name] = attr.__func__  # Store unbound
+                    else:
+                        recorded_loader[key][name] = attr
+        model.recorded_loader = recorded_loader
+
+        # Apply FP8 quantization (creates new Parameters, loses attributes)
+        for _, module in model.named_modules():
+            quant_method = getattr(module, "quant_method", None)
+            if quant_method is not None:
+                with device_loading_context(module, target_device):
+                    quant_method.process_weights_after_loading(module)
+
+        model.flash_rl_initial_load_complete = True
+        self._initial_load_complete = True
+        logger.info("[QuantizedRL] Initial load complete")
+
+    @staticmethod
+    def is_reload_scenario(model):
+        """Check if model is ready for reloading (initial load completed)."""
+        return (
+            hasattr(model, "original_weights_rebuild_keys")
+            and hasattr(model, "recorded_loader")
+            and getattr(model, "flash_rl_initial_load_complete", False)
+        )
+
+    @staticmethod
+    def _is_stacked_param(name):
+        """Check if parameter is stacked (qkv_proj, gate_up_proj)."""
+        for stacked_name, _ in QuantizedRLModelLoader.STACKED_PARAMS_MAPPING:
+            if stacked_name in name:
+                return True
+        return False
+
+    @staticmethod
+    def _resolve_stacked_info(name: str) -> Tuple[str, Optional[str], Optional[Any]]:
+        for target, shard_names in QuantizedRLModelLoader.STACKED_PARAMS_MAPPING:
+            for idx, shard in enumerate(shard_names):
+                if shard in name:
+                    shard_id = (
+                        QuantizedRLModelLoader._QKV_SHARD_ALIASES.get(shard, shard)
+                        if target == "qkv_proj"
+                        else idx
+                    )
+                    return name.replace(shard, target), target, shard_id
+        return name, None, None
+
+    @staticmethod
+    def _store_quantized_scale(
+        scale_store: Dict[str, Union[torch.Tensor, Dict[Any, torch.Tensor]]],
+        name: str,
+        scale: torch.Tensor,
+    ) -> None:
+        param_name, stacked_key, shard_id = (
+            QuantizedRLModelLoader._resolve_stacked_info(name)
+        )
+        if stacked_key is None:
+            scale_store[param_name] = scale
+        else:
+            shard_dict = scale_store.setdefault(param_name, {})
+            assert isinstance(shard_dict, dict)
+            shard_dict[shard_id] = scale
+
+    @staticmethod
+    def _apply_scale_update(
+        all_params: Dict[str, torch.nn.Parameter],
+        param_name: str,
+        scale_info: Union[torch.Tensor, Dict[Any, torch.Tensor], None],
+    ) -> None:
+        if scale_info is None:
+            return
+        # Get tp rank and size
+        tp_rank = get_tensor_model_parallel_rank()
+        tp_size = get_tensor_model_parallel_world_size()
+
+        def _get_tp_sharded_scale(full_scale_tensor):
+            """Get tp sharded scale from full scale tensor"""
+            if tp_size == 1:
+                return full_scale_tensor
+
+            full_dim = full_scale_tensor.shape[0]
+            shard_dim = full_dim // tp_size
+            start_idx = tp_rank * shard_dim
+            end_idx = start_idx + shard_dim
+            return full_scale_tensor[start_idx:end_idx]
+
+        if param_name.endswith(".weight"):
+            scale_param_name = f"{param_name[:-7]}.weight_scale"
+        else:
+            scale_param_name = f"{param_name}.weight_scale"
+
+        scale_param = all_params.get(scale_param_name)
+        if scale_param is None:
+            logger.warning(
+                "[QuantizedRL] Scale parameter not found: %s", scale_param_name
+            )
+            return
+        if isinstance(scale_info, torch.Tensor):
+            new_scale = scale_info.t().contiguous()
+            if scale_param.data.shape == new_scale.shape:
+                scale_param.data.copy_(new_scale)
+            else:
+                logger.warning(
+                    "[QuantizedRL] Scale shape mismatch for %s: expected %s, got %s",
+                    scale_param_name,
+                    scale_param.data.shape,
+                    new_scale.shape,
+                )
+        else:
+            stacked_key = next(
+                (
+                    target
+                    for target, _ in QuantizedRLModelLoader.STACKED_PARAMS_MAPPING
+                    if target in param_name
+                ),
+                None,
+            )
+            shard_names = next(
+                (
+                    names
+                    for target, names in QuantizedRLModelLoader.STACKED_PARAMS_MAPPING
+                    if target == stacked_key
+                ),
+                [],
+            )
+            rows_per_shard = scale_param.data.shape[-1] // max(len(shard_names), 1)
+            if rows_per_shard * len(shard_names) != scale_param.data.shape[-1]:
+                logger.warning(
+                    f"Scale param shape {scale_param.data.shape[-1]} not divisible by {len(shard_names)}"
+                )
+            offset = 0
+            for idx, shard in enumerate(shard_names):
+                shard_id = (
+                    QuantizedRLModelLoader._QKV_SHARD_ALIASES.get(shard, shard)
+                    if stacked_key == "qkv_proj"
+                    else idx
+                )
+                shard_scale = scale_info.get(shard_id)
+                shard_scale = _get_tp_sharded_scale(shard_scale)
+                if shard_scale is None:
+                    offset += rows_per_shard
+                    continue
+                shard_rows = shard_scale.shape[0]
+                start = offset
+                end = start + shard_rows
+                scale_param.data[..., start:end] = shard_scale.t().contiguous()
+                offset = end
+
+    @staticmethod
+    def rebinding_and_load_weights(model, first_time_load_weights, weights):
+        """
+        Reload: VERL sends BF16 → Quantize to FP8 → Copy to original memory.
+
+        Flow: Reset params → Restore attributes → Quantize in iterator → Load → Copy back
+        """
+        logger.info("[QuantizedRL] Reload: Updating weights with FP8 quantization")
+
+        weights_list = list(weights)
+        updated_param_names, is_last_update = (
+            QuantizedRLModelLoader._get_updated_params(weights_list, model)
+        )
+
+        # Save current FP8 parameter data pointers
+        existing_params = dict(model.named_parameters())
+        current_param_data = {}
+        for name in updated_param_names:
+            if name in existing_params:
+                current_param_data[name] = existing_params[name].data
+
+        # Reset to pre-quantization shape using torch.as_strided
+        # Keeps same storage, just changes view - critical for memory preservation
+        for name, rebuild_info in model.original_weights_rebuild_keys.items():
+            if name in updated_param_names and name in existing_params:
+                existing_params[name].data = torch.as_strided(
+                    # Note: avoid clone here
+                    existing_params[name].data.clone(),
+                    rebuild_info["shape"],
+                    rebuild_info["stride"],
+                )
+
+        # Restore weight loader attributes (only if missing)
+        for k, loader_dict in model.recorded_loader.items():
+            for param_name, loader in loader_dict.items():
+                if param_name in updated_param_names and param_name in existing_params:
+                    param = existing_params[param_name]
+                    if not hasattr(param, k):
+                        if callable(loader):
+                            if hasattr(loader, "__self__"):
+                                setattr(param, k, loader)
+                            else:
+                                setattr(
+                                    param,
+                                    k,
+                                    QuantizedRLModelLoader._bind_method_to_cls(
+                                        loader, param
+                                    ),
+                                )
+                        else:
+                            setattr(param, k, loader)
+
+        del existing_params
+
+        # Quantize BF16 weights to FP8 in iterator (before weight_loader)
+        # Store scales for later update
+        quantized_scales: Dict[str, Union[torch.Tensor, Dict[Any, torch.Tensor]]] = {}
+
+        def quantize_weights_iterator(weights_iter):
+            """Quantize individual shards before weight_loader stacks them."""
+            from sglang.srt.layers.quantization.fp8_kernel import (
+                per_token_group_quant_fp8,
+            )
+
+            for name, weight in weights_iter:
+                if any(
+                    skip in name
+                    for skip in QuantizedRLModelLoader.SKIP_QUANTIZATION_PARAMS
+                ):
+                    logger.info(f"[QuantizedRL] Skip: {name} ({weight.dtype})")
+                    yield (name, weight)
+                elif weight.dtype in [torch.bfloat16, torch.float32, torch.float16]:
+                    qweight, scale = per_token_group_quant_fp8(weight, weight.shape[-1])
+                    logger.info(f"[QuantizedRL] Quantize: {name} {weight.dtype}→FP8")
+                    QuantizedRLModelLoader._store_quantized_scale(
+                        quantized_scales, name, scale
+                    )
+                    yield (name, qweight)
+                else:
+                    logger.info(f"[QuantizedRL] Keep: {name} ({weight.dtype})")
+                    yield (name, weight)
+
+        # Load quantized weights (weight_loader stacks FP8 shards)
+        first_time_load_weights(quantize_weights_iterator(iter(weights_list)))
+
+        # Copy back to original FP8 memory locations and update scales
+        all_params = dict(model.named_parameters())
+
+        for name in updated_param_names:
+            if name not in all_params or name not in current_param_data:
+                continue
+            if any(
+                skip in name for skip in QuantizedRLModelLoader.SKIP_QUANTIZATION_PARAMS
+            ):
+                continue
+
+            new_param = all_params[name]
+            old_fp8_data = current_param_data[name]
+
+            # Handle embeddings/lm_head (BF16) and quantized weights (FP8)
+            if "embed_tokens" in name or "lm_head" in name:
+                old_fp8_data.copy_(new_param.data)
+                new_param.data = old_fp8_data
+            elif (
+                new_param.dtype == torch.float8_e4m3fn
+                and old_fp8_data.dtype == torch.float8_e4m3fn
+            ):
+                # FP8: Use strided view for transposed storage
+                strided_data = torch.as_strided(
+                    new_param.data, old_fp8_data.shape, old_fp8_data.stride()
+                )
+                old_fp8_data.copy_(strided_data)
+                new_param.data = old_fp8_data
+                QuantizedRLModelLoader._apply_scale_update(
+                    all_params,
+                    name,
+                    quantized_scales.get(name),
+                )
+            elif new_param.dtype == old_fp8_data.dtype:
+                # Same dtype (LayerNorm, etc.): Direct copy
+                old_fp8_data.copy_(new_param.data)
+                new_param.data = old_fp8_data
+            else:
+                raise RuntimeError(
+                    f"Unexpected dtype mismatch for {name}: "
+                    f"new={new_param.dtype}, old={old_fp8_data.dtype}"
+                )
+
+        # Cleanup
+        del current_param_data
+        if is_last_update:
+            gc.collect()
+            torch.cuda.empty_cache()
+
+        logger.info("[QuantizedRL] Reload complete")
+        return updated_param_names, is_last_update
+
+    @staticmethod
+    def _get_updated_params(weights_list, model):
+        """Identify which parameters need updating from incoming weights."""
+        stacked_params_mapping = [
+            ("qkv_proj", "q_proj", "q"),
+            ("qkv_proj", "k_proj", "k"),
+            ("qkv_proj", "v_proj", "v"),
+            ("gate_up_proj", "gate_proj", 0),
+            ("gate_up_proj", "up_proj", 1),
+        ]
+
+        params_dict = dict(model.named_parameters())
+        updated_params = set()
+        is_last_update = False
+
+        for name, _ in weights_list:
+            if name == "lm_head.weight":
+                is_last_update = True
+
+            if any(
+                skip in name for skip in QuantizedRLModelLoader.SKIP_QUANTIZATION_PARAMS
+            ):
+                continue
+
+            from sglang.srt.layers.utils import get_layer_id
+
+            # Skip params outside layer range (for pipeline parallelism)
+            layer_id = get_layer_id(name)
+            if (
+                layer_id is not None
+                and hasattr(model, "start_layer")
+                and (layer_id < model.start_layer or layer_id >= model.end_layer)
+            ):
+                continue
+
+            # Skip tied embeddings and vision tower params
+            if (
+                hasattr(model, "config")
+                and model.config.tie_word_embeddings
+                and "lm_head.weight" in name
+            ):
+                continue
+            if name.startswith("model.vision_tower") and name not in params_dict:
+                continue
+
+            # Map stacked param shards (q/k/v_proj → qkv_proj)
+            mapped = False
+            for param_name, weight_name, shard_id in stacked_params_mapping:
+                if weight_name in name:
+                    name = name.replace(weight_name, param_name)
+                    if name.endswith(".bias") and name not in params_dict:
+                        continue
+                    updated_params.add(name)
+                    mapped = True
+                    break
+
+            if not mapped:
+                if name.endswith(".bias") and name not in params_dict:
+                    continue
+                if name in params_dict:
+                    updated_params.add(name)
+
+        return list(updated_params), is_last_update
 
 
 class DummyModelLoader(BaseModelLoader):
@@ -1509,6 +1992,7 @@ class RemoteInstanceModelLoader(BaseModelLoader):
                 f"Model loader extra config is not supported for "
                 f"load format {load_config.load_format}"
             )
+        self.remote_instance_transfer_engine_weight_info = None
 
     def download_model(self, model_config: ModelConfig) -> None:
         raise NotImplementedError
@@ -1527,16 +2011,19 @@ class RemoteInstanceModelLoader(BaseModelLoader):
             f"load format {load_config.load_format}"
         )
 
-        model_weights = f"instance://{load_config.remote_instance_weight_loader_seed_instance_ip}:{load_config.remote_instance_weight_loader_send_weights_group_ports[load_config.tp_rank]}"
-
         with set_default_torch_dtype(model_config.dtype):
             with torch.device(device_config.device):
                 model = _initialize_model(model_config, self.load_config)
 
+        if (
+            load_config.remote_instance_weight_loader_backend
+            == RemoteInstanceWeightLoaderBackend.NCCL
+        ):
+            model_weights = f"instance://{load_config.remote_instance_weight_loader_seed_instance_ip}:{load_config.remote_instance_weight_loader_send_weights_group_ports[load_config.tp_rank]}"
             with create_remote_connector(model_weights, device_config.device) as client:
                 connector_type = get_connector_type(client)
                 if connector_type == ConnectorType.INSTANCE:
-                    self.load_model_from_remote_instance(
+                    self.load_model_from_remote_instance_by_nccl(
                         model, client, model_config, device_config
                     )
                 else:
@@ -1544,9 +2031,45 @@ class RemoteInstanceModelLoader(BaseModelLoader):
                         f"Unsupported connector type {connector_type} for "
                         f"remote tensor model loading."
                     )
+        elif (
+            load_config.remote_instance_weight_loader_backend
+            == RemoteInstanceWeightLoaderBackend.TRANSFER_ENGINE
+        ):
+            if load_config.remote_instance_weight_loader_transfer_engine is None:
+                raise RuntimeError(
+                    "Transfer engine is not initialized for remote instance "
+                    "model loader with `transfer_engine` backend. "
+                )
+            logger.info(
+                "TransferEngine registering memory regions (this may take a few seconds)..."
+            )
+            # register memory region
+            self.remote_instance_transfer_engine_weight_info = (
+                register_memory_region_v2(
+                    model, load_config.remote_instance_weight_loader_transfer_engine
+                )
+            )
+            logger.info(
+                "TransferEngine memory regions have been successfully registered."
+            )
+
+            # transfer weights
+            success = self.load_model_from_remote_instance_by_transfer_engine(
+                model,
+                load_config.remote_instance_weight_loader_transfer_engine,
+                f"http://{load_config.remote_instance_weight_loader_seed_instance_ip}:{load_config.remote_instance_weight_loader_seed_instance_service_port}",
+                load_config.tp_rank,
+            )
+            if not success:
+                raise RuntimeError(
+                    "Failed to load weights from remote instance via transfer engine."
+                )
+        else:
+            raise ValueError("Invalid remote instance weight loader backend.")
+
         return model.eval()
 
-    def load_model_from_remote_instance(
+    def load_model_from_remote_instance_by_nccl(
         self, model, client, model_config: ModelConfig, device_config: DeviceConfig
     ) -> nn.Module:
         load_config = self.load_config
@@ -1596,6 +2119,63 @@ class RemoteInstanceModelLoader(BaseModelLoader):
             client._model_update_group
         )
         torch.cuda.empty_cache()
+
+    def load_model_from_remote_instance_by_transfer_engine(
+        self, model, transfer_engine, seed_url, tp_rank
+    ) -> bool:
+        # get remote weights metadata from source instance
+        seed_transfer_engine_session_id, seed_transfer_engine_weight_info = (
+            get_remote_instance_transfer_engine_info_per_rank(seed_url, tp_rank)
+        )
+        if (
+            seed_transfer_engine_session_id is None
+            or seed_transfer_engine_weight_info is None
+        ):
+            logger.error("Cannot get transfer engine session or weight info.")
+            return False
+
+        # prepare local/remote RDMA keys
+        seed_ptr_list = []
+        client_ptr_list = []
+        client_len_list = []
+        for name, tensor in model.named_parameters():
+            weight_info = seed_transfer_engine_weight_info.get(name, None)
+            if weight_info is None:
+                logger.error(f"Cannot find weight info for {name}.")
+                return False
+
+            seed_ptr, seed_numel, seed_element_size = weight_info
+            if (
+                seed_numel != tensor.numel()
+                or seed_element_size != tensor.element_size()
+            ):
+                logger.error(
+                    f"Weight info does not match for {name}, "
+                    f"expected ({seed_numel}, {seed_element_size}), "
+                    f"got ({tensor.numel()}, {tensor.element_size()})"
+                )
+                return False
+            client_ptr = tensor.data_ptr()
+            client_len = tensor.numel() * tensor.element_size()
+            seed_ptr_list.append(seed_ptr)
+            client_ptr_list.append(client_ptr)
+            client_len_list.append(client_len)
+
+        # load weights from source instance through TransferEngine
+        ret = transfer_engine.batch_transfer_sync_read(
+            seed_transfer_engine_session_id,
+            client_ptr_list,
+            seed_ptr_list,
+            client_len_list,
+        )
+        if ret < 0:
+            logger.error(f"batch transfer failed, error: {ret}")
+            return False
+
+        if hasattr(model, "post_load_weights"):
+            model.post_load_weights()
+
+        return True
 
 
 class RemoteModelLoader(BaseModelLoader):
@@ -1863,7 +2443,10 @@ class ModelOptModelLoader(DefaultModelLoader):
             # Apply quantization
             mtq.quantize(model, quant_cfg, forward_loop=calibrate_loop)
 
-            if get_tensor_model_parallel_rank() == 0:
+            if (
+                not model_parallel_is_initialized()
+                or get_tensor_model_parallel_rank() == 0
+            ):
                 mtq.print_quant_summary(model)
 
             # Save checkpoint if path provided
@@ -2090,10 +2673,40 @@ def get_model_loader(
     if load_config.load_format == LoadFormat.LAYERED:
         return LayeredModelLoader(load_config)
 
+    # Check for FLASH_RL format early
+    # FP8 approach: BF16/FP16 model with native FP8 quantization
+    if load_config.load_format == LoadFormat.FLASH_RL:
+        logger.info(
+            "Using QuantizedRLModelLoader for RL training with native FP8 quantization."
+        )
+        logger.info(
+            "FP8 approach: Model loads with native SGLang FP8 quantization. "
+            "Same model path for both training and inference."
+        )
+
+        # Set quantization to FP8 for native SGLang support
+        if model_config and not model_config.quantization:
+            logger.info(
+                "QuantizedRL: Setting quantization to fp8 (native SGLang support). "
+                "Model will be loaded with FP8 infrastructure"
+            )
+            model_config.quantization = "fp8"
+
+        return QuantizedRLModelLoader(load_config)
+
     if load_config.load_format == LoadFormat.REMOTE:
         return RemoteModelLoader(load_config)
 
     if load_config.load_format == LoadFormat.REMOTE_INSTANCE:
         return RemoteInstanceModelLoader(load_config)
+
+    if load_config.load_format == LoadFormat.PRIVATE:
+        import importlib
+
+        try:
+            module = importlib.import_module("sglang.private.private_model_loader")
+            return module.PrivateModelLoader(load_config)
+        except ImportError:
+            raise ValueError("Failed to import sglang.private.private_model_loader")
 
     return DefaultModelLoader(load_config)

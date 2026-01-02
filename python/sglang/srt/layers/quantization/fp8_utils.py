@@ -1,4 +1,8 @@
-from typing import Callable, List, Optional, Tuple
+from __future__ import annotations
+
+import logging
+from enum import Enum
+from typing import TYPE_CHECKING, Callable, List, Optional, Tuple
 
 import torch
 
@@ -6,7 +10,9 @@ from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.quantization.fp8_kernel import sglang_per_token_group_quant_fp8
 from sglang.srt.layers.quantization.mxfp4_tensor import MXFP4QuantizeUtil
-from sglang.srt.utils import ceil_div, is_blackwell_supported, offloader
+
+if TYPE_CHECKING:
+    from sglang.srt.server_args import ServerArgs
 
 try:
     from vllm import _custom_ops as ops
@@ -29,13 +35,19 @@ from sglang.srt.layers.quantization.fp8_kernel import (
 )
 from sglang.srt.utils import (
     ceil_align,
+    ceil_div,
     get_bool_env_var,
     get_cuda_version,
     get_device_capability,
+    is_blackwell_supported,
     is_cuda,
     is_flashinfer_available,
     is_hip,
+    is_sm90_supported,
+    offloader,
 )
+
+logger = logging.getLogger(__name__)
 
 _is_hip = is_hip()
 _is_cuda = is_cuda()
@@ -125,43 +137,167 @@ def normalize_e4m3fn_to_e4m3fnuz(
     return weight, weight_scale, input_scale
 
 
-# TODO(ch-wan): define these backends in --moe-runner-backend
-def cutlass_block_fp8_supported() -> bool:
-    if not get_bool_env_var("SGLANG_SUPPORT_CUTLASS_BLOCK_FP8"):
-        return False
-    if _is_cuda:
-        major, minor = torch.cuda.get_device_capability()
-        sm_version = major * 10 + minor
-        cuda_version = tuple(map(int, torch.version.cuda.split(".")))
-        if cuda_version >= (12, 0) and sm_version >= 90:
-            return True
-    return False
+class Fp8GemmRunnerBackend(Enum):
+    """Enum for FP8 GEMM runner backend selection."""
+
+    AUTO = "auto"
+    FLASHINFER = "flashinfer_trtllm"
+    CUTLASS = "cutlass"
+    DEEP_GEMM = "deep_gemm"
+    TRITON = "triton"
+    AITER = "aiter"
+
+    def is_auto(self) -> bool:
+        return self == Fp8GemmRunnerBackend.AUTO
+
+    def is_flashinfer(self) -> bool:
+        return self == Fp8GemmRunnerBackend.FLASHINFER
+
+    def is_cutlass(self) -> bool:
+        return self == Fp8GemmRunnerBackend.CUTLASS
+
+    def is_deep_gemm(self) -> bool:
+        return self == Fp8GemmRunnerBackend.DEEP_GEMM
+
+    def is_triton(self) -> bool:
+        return self == Fp8GemmRunnerBackend.TRITON
+
+    def is_aiter(self) -> bool:
+        return self == Fp8GemmRunnerBackend.AITER
 
 
-CUTLASS_BLOCK_FP8_SUPPORTED = cutlass_block_fp8_supported()
-ENABLE_FLASHINFER_FP8_GEMM = (
-    envs.SGLANG_ENABLE_FLASHINFER_FP8_GEMM.get()
-    and is_blackwell_supported()
-    and is_flashinfer_available()
-)
-if ENABLE_FLASHINFER_FP8_GEMM:
+FP8_GEMM_RUNNER_BACKEND: Fp8GemmRunnerBackend | None = None
+
+
+def _check_cutlass_block_fp8_hardware_support() -> bool:
+    """Return True if CUTLASS block FP8 is supported (Hopper or newer with CUDA 12.0+)."""
+    return is_sm90_supported() or is_blackwell_supported()
+
+
+if is_blackwell_supported() and is_flashinfer_available():
     from flashinfer.gemm import gemm_fp8_nt_groupwise
 
 
 def dispatch_w8a8_block_fp8_linear() -> Callable:
-    if ENABLE_FLASHINFER_FP8_GEMM:
-        return flashinfer_gemm_w8a8_block_fp8_linear
-    elif CUTLASS_BLOCK_FP8_SUPPORTED:
+    """
+    Dispatch to the appropriate FP8 block linear implementation.
+
+    This function selects the backend based on:
+    1. The --fp8-gemm-backend server argument (preferred)
+    2. Auto-detection based on hardware capabilities
+    """
+    backend = get_fp8_gemm_runner_backend()
+
+    # Handle explicit backend selection via --fp8-gemm-backend
+    if not backend.is_auto():
+        return _dispatch_explicit_backend(backend)
+
+    # Auto mode: Select based purely on hardware/backend availability
+    return _dispatch_auto_backend()
+
+
+def _dispatch_explicit_backend(backend: Fp8GemmRunnerBackend) -> Callable:
+    """Dispatch based on explicitly selected backend."""
+    if backend.is_flashinfer():
+        if not (is_blackwell_supported() and is_flashinfer_available()):
+            raise RuntimeError(
+                "FlashInfer FP8 GEMM requested via --fp8-gemm-backend=flashinfer_trtllm, "
+                "but FlashInfer is not available or not supported on this hardware. "
+                "FlashInfer FP8 GEMM requires Blackwell GPUs and FlashInfer to be installed."
+            )
+        return flashinfer_gemm_w8a8_block_fp8_linear_with_fallback
+
+    elif backend.is_cutlass():
+        if not _check_cutlass_block_fp8_hardware_support():
+            raise RuntimeError(
+                "CUTLASS block FP8 requested via --fp8-gemm-backend=cutlass, "
+                "but hardware does not support it. CUTLASS block FP8 requires "
+                "Hopper (SM90+) GPUs with CUDA 12.0+."
+            )
+        return cutlass_w8a8_block_fp8_linear_with_fallback
+
+    elif backend.is_aiter():
+        if not _use_aiter:
+            raise RuntimeError(
+                "AITER backend requested via --fp8-gemm-backend=aiter, "
+                "but AITER is not available. AITER requires AMD GPUs with "
+                "SGLANG_USE_AITER=1 environment variable set."
+            )
+        return aiter_w8a8_block_fp8_linear
+
+    elif backend.is_deep_gemm():
+        if not deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
+            raise RuntimeError(
+                "DeepGEMM backend requested via --fp8-gemm-backend=deep_gemm, "
+                "but DeepGEMM is not available. This usually means the deep_gemm package "
+                "is not installed or has been disabled via SGLANG_ENABLE_JIT_DEEPGEMM=0."
+            )
+        return deepgemm_w8a8_block_fp8_linear_with_fallback
+
+    elif backend.is_triton():
+        return triton_w8a8_block_fp8_linear
+
+    else:
+        raise ValueError(f"Unknown FP8 GEMM backend: {backend}")
+
+
+def _dispatch_auto_backend() -> Callable:
+    """Auto-select the best backend based on hardware capabilities."""
+    # Priority order for auto selection:
+    # 1. DeepGEMM (if enabled and available)
+    # 2. FlashInfer TRTLLM (if Blackwell GPU and FlashInfer available)
+    # 3. CUTLASS (if Hopper+ GPU and CUDA 12.0+)
+    # 4. AITER (if AMD GPU with AITER enabled)
+    # 5. Triton (fallback)
+
+    if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
+        return deepgemm_w8a8_block_fp8_linear_with_fallback
+    elif is_blackwell_supported() and is_flashinfer_available():
+        return flashinfer_gemm_w8a8_block_fp8_linear_with_fallback
+    elif _check_cutlass_block_fp8_hardware_support():
         return cutlass_w8a8_block_fp8_linear_with_fallback
     elif _use_aiter:
         return aiter_w8a8_block_fp8_linear
-    elif deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
-        return deepgemm_w8a8_block_fp8_linear_with_fallback
     else:
         return triton_w8a8_block_fp8_linear
 
 
-def flashinfer_gemm_w8a8_block_fp8_linear(
+def initialize_fp8_gemm_config(server_args: ServerArgs) -> None:
+    """Initialize FP8 GEMM configuration."""
+    global FP8_GEMM_RUNNER_BACKEND
+
+    backend = server_args.fp8_gemm_runner_backend
+
+    # TODO(brayden): Remove env-based overrides in v0.5.7, they will be fully removed in v0.5.7.
+    # Only check environment variables when the server args is not set, server args should take priority.
+    if backend == "auto":
+        if envs.SGLANG_ENABLE_FLASHINFER_FP8_GEMM.get():
+            backend = "flashinfer_trtllm"
+        elif envs.SGLANG_SUPPORT_CUTLASS_BLOCK_FP8.get():
+            backend = "cutlass"
+    else:
+        if (
+            envs.SGLANG_ENABLE_FLASHINFER_FP8_GEMM.get()
+            or envs.SGLANG_SUPPORT_CUTLASS_BLOCK_FP8.get()
+        ):
+            logger.warning(
+                f"FP8 GEMM backend set to '{backend}' via --fp8-gemm-backend overrides "
+                "environment variables SGLANG_ENABLE_FLASHINFER_FP8_GEMM and "
+                "SGLANG_SUPPORT_CUTLASS_BLOCK_FP8. Using server argument value."
+            )
+
+    FP8_GEMM_RUNNER_BACKEND = Fp8GemmRunnerBackend(backend)
+
+
+def get_fp8_gemm_runner_backend() -> Fp8GemmRunnerBackend:
+    """Get the current FP8 GEMM runner backend."""
+    global FP8_GEMM_RUNNER_BACKEND
+    if FP8_GEMM_RUNNER_BACKEND is None:
+        FP8_GEMM_RUNNER_BACKEND = Fp8GemmRunnerBackend.AUTO
+    return FP8_GEMM_RUNNER_BACKEND
+
+
+def flashinfer_gemm_w8a8_block_fp8_linear_with_fallback(
     input: torch.Tensor,
     weight: torch.Tensor,
     block_size: List[int],
@@ -171,7 +307,18 @@ def flashinfer_gemm_w8a8_block_fp8_linear(
 ) -> torch.Tensor:
     assert input_scale is None
 
+    # FlashInfer TRTLLM backend requires K dimension >= 256
+    # Check shape before quantizing, otherwise we run into Flashinfer assertion.
+    # TODO(brayden): make a better fallback here, maybe to cutlass backend?
     input_2d = input.view(-1, input.shape[-1])
+    k_dim = input_2d.shape[1]  # K dimension
+
+    if k_dim < 256:
+        # Fallback to Triton for shapes that don't meet TRTLLM constraint.
+        return triton_w8a8_block_fp8_linear(
+            input, weight, block_size, weight_scale, input_scale, bias
+        )
+
     output_shape = [*input.shape[:-1], weight.shape[0]]
 
     q_input, x_scale = sglang_per_token_group_quant_fp8(
@@ -244,6 +391,13 @@ def deepgemm_w8a8_block_fp8_linear_with_fallback(
 
     if not (shape_supported and dtype_supported):
         # fall back to triton
+        # If weight_scale is in UE8M0 packed format (int32), convert back to float32
+        # UE8M0 format has shape (N, K//block_k//4) with dtype int32
+        # Triton expects shape (N//block_n, K//block_k) with dtype float32
+        if weight_scale.dtype == torch.int32:
+            weight_scale = _unpack_ue8m0_scale_for_triton(
+                weight_scale, weight.shape, block_size
+            )
         return triton_w8a8_block_fp8_linear(
             input, weight, block_size, weight_scale, input_scale, bias
         )
@@ -265,6 +419,67 @@ def deepgemm_w8a8_block_fp8_linear_with_fallback(
     if bias is not None:
         output += bias
     return output.to(dtype=output_dtype).view(*output_shape)
+
+
+def _unpack_ue8m0_scale_for_triton(
+    sf_packed: torch.Tensor,
+    weight_shape: Tuple[int, int],
+    block_size: List[int],
+) -> torch.Tensor:
+    """
+    Unpack UE8M0 packed scale tensor back to float32 format for triton kernel.
+
+    The UE8M0 format packs scales as:
+    - Shape: (N, K//block_k//4) with dtype int32
+    - Each int32 contains 4 uint8 scale values
+
+    Triton expects:
+    - Shape: (N//block_n, K//block_k) with dtype float32
+
+    Args:
+        sf_packed: Packed scale tensor with shape (N, packed_k_groups) and dtype int32
+        weight_shape: (N, K) shape of the weight tensor
+        block_size: [block_n, block_k] quantization block size
+
+    Returns:
+        Unpacked scale tensor with shape (n_groups, k_groups) and dtype float32
+    """
+    assert sf_packed.dtype == torch.int32
+    assert len(sf_packed.shape) == 2
+
+    N, K = weight_shape
+    block_n, block_k = block_size
+    n_groups = ceil_div(N, block_n)
+    k_groups = ceil_div(K, block_k)
+
+    mn_repeat, k_div_4 = sf_packed.shape
+    k_packed = k_div_4 * 4
+
+    # Unpack int32 -> 4x uint8 -> float32
+    # Each uint8 represents an exponent in UE8M0 format
+    sf_u8 = sf_packed.contiguous().view(torch.uint8).view(mn_repeat, k_packed)
+    sf_fp32 = (sf_u8.to(torch.int32) << 23).view(torch.float32)
+
+    # Handle row dimension - may have 128x replication or direct mapping
+    if mn_repeat == N:
+        # Rows are replicated 128 times, take every 128th row
+        # sf_fp32 shape: (N, k_packed) -> (n_groups, k_packed)
+        # Select representative rows at indices 0, 128, 256, ...
+        indices = torch.arange(0, N, block_n, device=sf_packed.device)
+        sf_fp32 = sf_fp32.index_select(0, indices)
+    elif mn_repeat == n_groups:
+        # Already in the correct n_groups format
+        pass
+    else:
+        raise ValueError(
+            f"Unexpected scale shape: sf_packed.shape={sf_packed.shape}, "
+            f"weight_shape={weight_shape}, block_size={block_size}"
+        )
+
+    # Crop k dimension to expected size (remove padding if any)
+    sf_fp32 = sf_fp32[:, :k_groups].contiguous()
+
+    return sf_fp32
 
 
 def aiter_w8a8_block_fp8_linear(
@@ -507,21 +722,59 @@ def transform_scale_ue8m0_inplace(param, mn):
 
 
 # NOTE copy and modified from DeepGEMM
-def transform_scale_ue8m0(sf, mn):
+def transform_scale_ue8m0(sf, mn, use_torch_impl: bool = False):
     import deep_gemm.utils.layout
 
+    get_mn_major_tma_aligned_packed_ue8m0_tensor = (
+        _get_mn_major_tma_aligned_packed_ue8m0_tensor_torch_impl
+        if use_torch_impl
+        else deep_gemm.utils.layout.get_mn_major_tma_aligned_packed_ue8m0_tensor
+    )
+
     sf = sf.index_select(-2, torch.arange(mn, device=sf.device) // 128)
-    sf = deep_gemm.utils.layout.get_mn_major_tma_aligned_packed_ue8m0_tensor(sf)
+    sf = get_mn_major_tma_aligned_packed_ue8m0_tensor(sf)
     return sf
+
+
+# Copied from DeepGEMM tests
+def _get_mn_major_tma_aligned_packed_ue8m0_tensor_torch_impl(
+    x: torch.Tensor,
+) -> torch.Tensor:
+    from deep_gemm.utils import align, get_tma_aligned_size
+
+    assert x.dtype == torch.float and x.dim() in (2, 3)
+
+    # First, convert into UE8M0 `uint8_t`
+    ue8m0_tensor = (x.view(torch.int) >> 23).to(torch.uint8)
+
+    # Second, make padded packed tensors
+    mn, k = x.shape[-2], x.shape[-1]
+    remove_dim = False
+    if x.dim() == 2:
+        x, remove_dim = x.unsqueeze(0), True
+    b = x.shape[0]
+    aligned_mn = get_tma_aligned_size(mn, 4)
+    aligned_k = align(k, 4)
+    padded = torch.zeros((b, aligned_mn, aligned_k), device=x.device, dtype=torch.uint8)
+    padded[:, :mn, :k] = ue8m0_tensor
+    padded = padded.view(-1).view(dtype=torch.int).view(b, aligned_mn, aligned_k // 4)
+
+    # Finally, transpose
+    transposed = torch.zeros(
+        (b, aligned_k // 4, aligned_mn), device=x.device, dtype=torch.int
+    ).mT
+    transposed[:, :, :] = padded
+    aligned_x = transposed[:, :mn, :]
+    return aligned_x.squeeze(0) if remove_dim else aligned_x
 
 
 def inverse_transform_scale_ue8m0(sf_packed, mn):
     sf_fp32 = _inverse_transform_scale_ue8m0_impl(sf_packed)
     # Can call consistency check every time since this is only called on startup
-    sf_packed_recreated = transform_scale_ue8m0(sf_fp32, mn=mn)
+    sf_packed_recreated = transform_scale_ue8m0(sf_fp32, mn=mn, use_torch_impl=True)
     assert torch.all(
         sf_packed == sf_packed_recreated
-    ), f"{sf_packed=} {sf_packed_recreated}"
+    ), f"{sf_packed=} {sf_packed_recreated=} {sf_fp32=}"
     return sf_fp32
 
 
@@ -830,3 +1083,81 @@ def can_auto_enable_marlin_fp8() -> bool:
         return 80 <= sm < 89
     except Exception:
         return False
+
+
+def apply_fp8_ptpc_linear(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    input_scale: Optional[torch.Tensor] = None,
+    input_scale_ub: Optional[torch.Tensor] = None,
+    bias: Optional[torch.Tensor] = None,
+    cutlass_fp8_supported: bool = cutlass_fp8_supported(),
+    use_per_token_if_dynamic: bool = False,
+    pad_output: Optional[bool] = None,
+    compressed_tensor_quant: bool = False,
+) -> torch.Tensor:
+    # View input as 2D matrix for fp8 methods
+    input_2d = input.view(-1, input.shape[-1])
+
+    # weight is transposed (K, N)
+    output_shape = [*input.shape[:-1], weight.shape[1]]
+
+    q_input, x_scale = aiter.per_token_quant_hip(input_2d, quant_dtype=aiter.dtypes.fp8)
+
+    per_tensor_weights = (weight_scale.numel() == 1) and weight_scale.dim() < 2
+    per_tensor_activations = (x_scale.numel() == 1) and x_scale.dim() < 2
+
+    if not (per_tensor_weights and per_tensor_activations):
+        # weight is in (N, K)
+        output_shape = [*input.shape[:-1], weight.shape[0]]
+
+    output = aiter.gemm_a8w8_bpreshuffle(
+        q_input, weight, x_scale, weight_scale, None, input.dtype
+    )
+    if bias is not None:
+        output = output + bias
+    return output.view(*output_shape)
+
+
+def validate_fp8_block_shape(
+    layer: torch.nn.Module,
+    input_size: int,
+    output_size: int,
+    input_size_per_partition: int,
+    output_partition_sizes: list[int],
+    block_size: list[int],
+) -> None:
+    """Validate block quantization shapes for tensor parallelism."""
+    from sglang.srt.distributed import get_tensor_model_parallel_world_size
+
+    tp_size = getattr(layer, "tp_size", get_tensor_model_parallel_world_size())
+    block_n, block_k = block_size[0], block_size[1]
+
+    # Required by row parallel
+    if (
+        tp_size > 1
+        and input_size // input_size_per_partition == tp_size
+        and input_size_per_partition % block_k != 0
+    ):
+        raise ValueError(
+            f"Weight input_size_per_partition = {input_size_per_partition} "
+            f"is not divisible by weight quantization block_k = {block_k}."
+        )
+
+    # Required by column parallel or enabling merged weights
+    is_tp_split = tp_size > 1 and output_size // sum(output_partition_sizes) == tp_size
+    is_merged_gemm = len(output_partition_sizes) > 1
+    if is_tp_split or is_merged_gemm:
+        sizes_to_check = output_partition_sizes
+        if not is_tp_split and is_merged_gemm:
+            # In case of merged matrices, we allow the last
+            # matrix to not be a multiple of block size
+            sizes_to_check = output_partition_sizes[:-1]
+        for output_partition_size in sizes_to_check:
+            if output_partition_size % block_n != 0:
+                raise ValueError(
+                    f"Weight output_partition_size = "
+                    f"{output_partition_size} is not divisible by "
+                    f"weight quantization block_n = {block_n}."
+                )

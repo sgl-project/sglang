@@ -1,7 +1,7 @@
 # Usage (to build SGLang ROCm docker image):
-#   docker build --build-arg SGL_BRANCH=v0.5.5.post3 --build-arg GPU_ARCH=gfx942 -t v0.5.5.post3-rocm630-mi30x -f rocm.Dockerfile .
-#   docker build --build-arg SGL_BRANCH=v0.5.5.post3 --build-arg GPU_ARCH=gfx942-rocm700 -t v0.5.5.post3-rocm700-mi30x -f rocm.Dockerfile .
-#   docker build --build-arg SGL_BRANCH=v0.5.5.post3 --build-arg GPU_ARCH=gfx950 -t v0.5.5.post3-rocm700-mi35x -f rocm.Dockerfile .
+#   docker build --build-arg SGL_BRANCH=v0.5.6.post2 --build-arg GPU_ARCH=gfx942 -t v0.5.6.post2-rocm630-mi30x -f rocm.Dockerfile .
+#   docker build --build-arg SGL_BRANCH=v0.5.6.post2 --build-arg GPU_ARCH=gfx942-rocm700 -t v0.5.6.post2-rocm700-mi30x -f rocm.Dockerfile .
+#   docker build --build-arg SGL_BRANCH=v0.5.6.post2 --build-arg GPU_ARCH=gfx950 -t v0.5.6.post2-rocm700-mi35x -f rocm.Dockerfile .
 
 
 # Default base images
@@ -31,7 +31,7 @@ ENV BUILD_TRITON="0"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT="v0.1.7.post1"
+ENV AITER_COMMIT="v0.1.7.post5"
 ENV NO_DEPS_FLAG=""
 
 # ===============================
@@ -42,7 +42,7 @@ ENV BUILD_TRITON="0"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="0"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT="v0.1.7.post2"
+ENV AITER_COMMIT="v0.1.7.post5"
 ENV NO_DEPS_FLAG=""
 # ===============================
 # Chosen arch and args
@@ -199,14 +199,14 @@ RUN find /sgl-workspace/sglang/python/sglang/srt/layers/quantization/configs/ \
          /sgl-workspace/sglang/python/sglang/srt/layers/moe/fused_moe_triton/configs/ \
          -type f -name '*MI300X*' | xargs -I {} sh -c 'vf_config=$(echo "$1" | sed "s/MI300X/MI300X_VF/"); cp "$1" "$vf_config"' -- {}
 
-# Install Rust toolchain for sgl-router
+# Install Rust toolchain for sgl-model-gateway
 ENV PATH="/root/.cargo/bin:${PATH}"
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y \
     && rustc --version && cargo --version
 
-# Build and install sgl-router
+# Build and install sgl-model-gateway
 RUN python3 -m pip install --no-cache-dir setuptools-rust \
-    && cd /sgl-workspace/sglang/sgl-router/bindings/python \
+    && cd /sgl-workspace/sglang/sgl-model-gateway/bindings/python \
     && cargo build --release \
     && python3 -m pip install --no-cache-dir . \
     && rm -rf /root/.cache

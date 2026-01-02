@@ -6,7 +6,7 @@ Related documentation:
 * [Quick Start: SGLang HiCache with Mooncake Backend](https://kvcache-ai.github.io/Mooncake/getting_started/examples/sglang-integration/hicache-quick-start.html)
 * [Complete Guide: SGLang HiCache with Mooncake Backend](https://kvcache-ai.github.io/Mooncake/getting_started/examples/sglang-integration/hicache-integration-v1.html)
 * [Mooncake x SGLang HiCache System Design](https://kvcache-ai.github.io/Mooncake/design/hicache-design.html)
-* [HiCache System Design and Optimization](https://docs.sglang.ai/advanced_features/hicache_design.html)
+* [HiCache System Design and Optimization](https://docs.sglang.io/advanced_features/hicache_design.html)
 * [SGLang HiCache with Mooncake Backend Benchmark](https://kvcache-ai.github.io/Mooncake/performance/sglang-hicache-benchmark-results-v1.html)
 
 ## About Mooncake
@@ -252,7 +252,7 @@ In particular, for the `global segment size`, if at least one `store service` in
 
 **HiCache Related Parameters for SGLang Server**
 
-For a comprehensive overview of HiCache-related parameters, please refer to [this document](https://docs.sglang.ai/advanced_features/hicache_design.html#related-parameters).
+For a comprehensive overview of HiCache-related parameters, please refer to [this document](https://docs.sglang.io/advanced_features/hicache_design.html#related-parameters).
 
 
 Note that, for `--hicache-mem-layout {layer_first,page_first,page_first_direct}`, which specifies the memory layout for the host memory pool, `page_first` or `page_first_direct` are required if use Mooncake backend.

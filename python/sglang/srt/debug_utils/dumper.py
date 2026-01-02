@@ -154,6 +154,19 @@ def get_tensor_info(x):
     max = x.float().max() if x.numel() > 0 else None
     mean = x.float().mean() if x.numel() > 0 else None
     torch.set_printoptions(precision=10)
-    x_sample = str(x.flatten()[:5])
+    x_sample_head = str(x.flatten()[:5])
+    x_sample_tail = str(x.flatten()[-5:])
     torch.set_printoptions(precision=4)
-    return f"shape={x.shape} dtype={x.dtype} device={x.device} stride={x.stride()} req_grad={x.requires_grad} min={min} max={max} mean={mean} x_sample={x_sample}"
+    return (
+        f"type={type(x)} "
+        f"shape={x.shape} "
+        f"dtype={x.dtype} "
+        f"device={x.device} "
+        f"stride={x.stride()} "
+        f"req_grad={x.requires_grad} "
+        f"min={min} "
+        f"max={max} "
+        f"mean={mean} "
+        f"x_sample_head={x_sample_head} "
+        f"x_sample_tail={x_sample_tail}"
+    )

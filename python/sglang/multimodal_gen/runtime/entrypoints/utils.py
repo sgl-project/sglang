@@ -8,6 +8,7 @@ This module provides a consolidated interface for generating videos using
 diffusion models.
 """
 
+import dataclasses
 
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
@@ -37,7 +38,9 @@ def prepare_request(
 
     req.adjust_size(server_args)
 
-    if req.width <= 0 or req.height <= 0:
+    if (req.width is not None and req.width <= 0) or (
+        req.height is not None and req.height <= 0
+    ):
         raise ValueError(
             f"Height and width must be positive, got height={req.height}, width={req.width}"
         )

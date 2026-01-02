@@ -13,6 +13,7 @@ from typing import Any, Callable
 
 import openai
 import pytest
+import requests
 from openai import OpenAI
 
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -54,6 +55,9 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
     extra_args += (
         f" --num-gpus {server_args.num_gpus} --ulysses-degree {server_args.num_gpus}"
     )
+    # LoRA support
+    if server_args.lora_path:
+        extra_args += f" --lora-path {server_args.lora_path}"
 
     # start server
     manager = ServerManager(
@@ -358,6 +362,112 @@ Consider updating perf_baselines.json with the snippets below:
 """
         logger.error(output)
 
+    def _test_lora_api_functionality(
+        self,
+        ctx: ServerContext,
+        case: DiffusionTestCase,
+        generate_fn: Callable[[str, openai.Client], str],
+    ) -> None:
+        """
+        Test LoRA API functionality with end-to-end validation: merge, unmerge, and set_lora.
+        This test verifies that each API call succeeds AND that generation works after each operation.
+        """
+        base_url = f"http://localhost:{ctx.port}/v1"
+        client = OpenAI(base_url=base_url, api_key="dummy")
+
+        # Test 1: unmerge_lora_weights - API should succeed and generation should work
+        logger.info("[LoRA E2E] Testing unmerge_lora_weights for %s", case.id)
+        resp = requests.post(f"{base_url}/unmerge_lora_weights")
+        assert resp.status_code == 200, f"unmerge_lora_weights failed: {resp.text}"
+
+        logger.info("[LoRA E2E] Verifying generation after unmerge for %s", case.id)
+        output_after_unmerge = generate_fn(case.id, client)
+        assert output_after_unmerge is not None, "Generation after unmerge failed"
+        logger.info("[LoRA E2E] Generation after unmerge succeeded")
+
+        # Test 2: merge_lora_weights - API should succeed and generation should work
+        logger.info("[LoRA E2E] Testing merge_lora_weights for %s", case.id)
+        resp = requests.post(f"{base_url}/merge_lora_weights")
+        assert resp.status_code == 200, f"merge_lora_weights failed: {resp.text}"
+
+        logger.info("[LoRA E2E] Verifying generation after re-merge for %s", case.id)
+        output_after_merge = generate_fn(case.id, client)
+        assert output_after_merge is not None, "Generation after merge failed"
+        logger.info("[LoRA E2E] Generation after merge succeeded")
+
+        # Test 3: set_lora (re-set the same adapter) - API should succeed and generation should work
+        logger.info("[LoRA E2E] Testing set_lora for %s", case.id)
+        resp = requests.post(f"{base_url}/set_lora", json={"lora_nickname": "default"})
+        assert resp.status_code == 200, f"set_lora failed: {resp.text}"
+
+        logger.info("[LoRA E2E] Verifying generation after set_lora for %s", case.id)
+        output_after_set = generate_fn(case.id, client)
+        assert output_after_set is not None, "Generation after set_lora failed"
+        logger.info("[LoRA E2E] Generation after set_lora succeeded")
+
+        logger.info("[LoRA E2E] All LoRA API E2E tests passed for %s", case.id)
+
+    def _test_lora_dynamic_switch_e2e(
+        self,
+        ctx: ServerContext,
+        case: DiffusionTestCase,
+        generate_fn: Callable[[str, openai.Client], str],
+        second_lora_path: str,
+    ) -> None:
+        """
+        Test dynamic LoRA switching with end-to-end validation.
+        This test verifies that switching between LoRA adapters works correctly
+        and generation succeeds after each switch.
+        """
+        base_url = f"http://localhost:{ctx.port}/v1"
+        client = OpenAI(base_url=base_url, api_key="dummy")
+
+        # Test 1: Generate with initial LoRA
+        logger.info(
+            "[LoRA Switch E2E] Testing generation with initial LoRA for %s", case.id
+        )
+        output_initial = generate_fn(case.id, client)
+        assert output_initial is not None, "Generation with initial LoRA failed"
+        logger.info("[LoRA Switch E2E] Generation with initial LoRA succeeded")
+
+        # Test 2: Switch to second LoRA and generate
+        logger.info(
+            "[LoRA Switch E2E] Switching to second LoRA adapter for %s", case.id
+        )
+        resp = requests.post(
+            f"{base_url}/set_lora",
+            json={"lora_nickname": "lora2", "lora_path": second_lora_path},
+        )
+        assert (
+            resp.status_code == 200
+        ), f"set_lora to second adapter failed: {resp.text}"
+
+        logger.info(
+            "[LoRA Switch E2E] Verifying generation with second LoRA for %s", case.id
+        )
+        output_second = generate_fn(case.id, client)
+        assert output_second is not None, "Generation with second LoRA failed"
+        logger.info("[LoRA Switch E2E] Generation with second LoRA succeeded")
+
+        # Test 3: Switch back to original LoRA and generate
+        logger.info("[LoRA Switch E2E] Switching back to original LoRA for %s", case.id)
+        resp = requests.post(f"{base_url}/set_lora", json={"lora_nickname": "default"})
+        assert resp.status_code == 200, f"set_lora back to default failed: {resp.text}"
+
+        logger.info(
+            "[LoRA Switch E2E] Verifying generation after switching back for %s",
+            case.id,
+        )
+        output_switched_back = generate_fn(case.id, client)
+        assert (
+            output_switched_back is not None
+        ), "Generation after switching back failed"
+        logger.info("[LoRA Switch E2E] Generation after switching back succeeded")
+
+        logger.info(
+            "[LoRA Switch E2E] All dynamic switch E2E tests passed for %s", case.id
+        )
+
     def test_diffusion_perf(
         self,
         case: DiffusionTestCase,
@@ -382,3 +492,7 @@ Consider updating perf_baselines.json with the snippets below:
             generate_fn,
         )
         self._validate_and_record(case, perf_record)
+
+        # LoRA API functionality test with E2E validation (only for LoRA-enabled cases)
+        if case.server_args.lora_path:
+            self._test_lora_api_functionality(diffusion_server, case, generate_fn)

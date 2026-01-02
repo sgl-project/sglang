@@ -13,6 +13,7 @@ The SGLang-diffusion CLI provides a quick way to access the inference pipeline f
 ### Server Arguments
 
 - `--model-path {MODEL_PATH}`: Path to the model or model ID
+- `--vae-path {VAE_PATH}`: Path to a custom VAE model or HuggingFace model ID (e.g., `fal/FLUX.2-Tiny-AutoEncoder`). If not specified, the VAE will be loaded from the main model path.
 - `--num-gpus {NUM_GPUS}`: Number of GPUs to use
 - `--tp-size {TP_SIZE}`: Tensor parallelism size (only for the encoder; should not be larger than 1 if text encoder offload is enabled, as layer-wise offload plus prefetch is faster)
 - `--sp-size {SP_SIZE}`: Sequence parallelism size (typically should match the number of GPUs)
@@ -176,6 +177,9 @@ SAMPLING_ARGS=(
 )
 
 sglang generate "${SERVER_ARGS[@]}" "${SAMPLING_ARGS[@]}"
+
+# Or, users can set `SGLANG_CACHE_DIT_ENABLED` env as `true` to enable cache acceleration
+SGLANG_CACHE_DIT_ENABLED=true sglang generate "${SERVER_ARGS[@]}" "${SAMPLING_ARGS[@]}"
 ```
 
 Once the generation task has finished, the server will shut down automatically.

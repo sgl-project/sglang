@@ -104,6 +104,17 @@ class QwenImagePipelineConfig(ImagePipelineConfig):
         ]
     )
 
+    def prepare_sigmas(self, sigmas, num_inference_steps):
+        return self._prepare_sigmas(sigmas, num_inference_steps)
+
+    def prepare_image_processor_kwargs(self, batch):
+        if batch.prompt:
+            prompt_template_encode = "<|im_start|>system\nDescribe the key features of the input image (color, shape, size, texture, objects, background), then explain how the user's text instruction should alter or modify the image. Generate a new image that meets the user's requirements while maintaining consistency with the original input where appropriate.<|im_end|>\n<|im_start|>user\n<|vision_start|><|image_pad|><|vision_end|>{}<|im_end|>\n<|im_start|>assistant\n"
+            txt = prompt_template_encode.format(batch.prompt)
+            return dict(text=[txt], padding=True)
+        else:
+            return {}
+
     def get_vae_scale_factor(self):
         return self.vae_config.arch_config.vae_scale_factor
 
@@ -262,8 +273,40 @@ class QwenImageEditPipelineConfig(QwenImagePipelineConfig):
             "freqs_cis": ((img_cos, img_sin), (txt_cos, txt_sin)),
         }
 
-    def resize_condition_image(self, image, target_width, target_height):
-        return resize(image, target_height, target_width, resize_mode="default")
+    def preprocess_condition_image(
+        self, image, target_width, target_height, _vae_image_processor
+    ):
+        return resize(image, target_height, target_width, resize_mode="default"), (
+            target_width,
+            target_height,
+        )
+
+    def postprocess_image_latent(self, latent_condition, batch):
+        batch_size = batch.batch_size
+        if batch_size > latent_condition.shape[0]:
+            if batch_size % latent_condition.shape[0] == 0:
+                # expand init_latents for batch_size
+                additional_image_per_prompt = batch_size // latent_condition.shape[0]
+                image_latents = latent_condition.repeat(
+                    additional_image_per_prompt, 1, 1, 1
+                )
+            else:
+                raise ValueError(
+                    f"Cannot duplicate `image` of batch size {latent_condition.shape[0]} to {batch_size} text prompts."
+                )
+        else:
+            image_latents = latent_condition
+        image_latent_height, image_latent_width = image_latents.shape[3:]
+        num_channels_latents = self.dit_config.arch_config.in_channels // 4
+        image_latents = _pack_latents(
+            image_latents,
+            batch_size,
+            num_channels_latents,
+            image_latent_height,
+            image_latent_width,
+        )
+
+        return image_latents
 
     def prepare_pos_cond_kwargs(self, batch, device, rotary_emb, dtype):
         return self._prepare_edit_cond_kwargs(

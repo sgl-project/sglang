@@ -27,7 +27,6 @@ from sglang.multimodal_gen.configs.sample.teacache import (
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 
 if TYPE_CHECKING:
-    from torchcodec.decoders import VideoDecoder
 
     from sglang.multimodal_gen.runtime.utils.perf_logger import RequestTimings
 
@@ -89,6 +88,7 @@ class Req:
     num_outputs_per_prompt: int = 1
     seed: int | None = None
     seeds: list[int] | None = None
+    generator_device: str = "cuda"  # Device for random generator: "cuda" or "cpu"
 
     # Tracking if embeddings are already processed
     is_prompt_processed: bool = False
@@ -171,7 +171,8 @@ class Req:
 
     # profile
     profile: bool = False
-    num_profiled_timesteps: int = 8
+    profile_all_stages: bool = False
+    num_profiled_timesteps: int = None
 
     # debugging
     debug: bool = False
@@ -218,9 +219,7 @@ class Req:
             self.guidance_scale_2 = self.guidance_scale
 
     def adjust_size(self, server_args: ServerArgs):
-        if self.height is None or self.width is None:
-            self.width = 1280
-            self.height = 720
+        pass
 
     def __str__(self):
         return pprint.pformat(asdict(self), indent=2, width=120)
@@ -240,9 +239,3 @@ class OutputBatch:
 
     # logged timings info, directly from Req.timings
     timings: Optional["RequestTimings"] = None
-
-
-@dataclass
-class PreprocessBatch(Req):
-    video_loader: list["VideoDecoder"] | list[str] = field(default_factory=list)
-    video_file_name: list[str] = field(default_factory=list)

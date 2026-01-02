@@ -218,7 +218,17 @@ BASIC_TESTS = [
         base="meta-llama/Llama-3.1-8B-Instruct",
         enable_lora=True,
         max_lora_rank=256,
-        lora_target_modules=["all"],
+        # Need to list all lora modules, or "all" might include lora modules without assigning lora weights
+        # lora_target_modules=["all"],
+        lora_target_modules=[
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "o_proj",
+            "gate_proj",
+            "up_proj",
+            "down_proj",
+        ],
         max_loras_per_batch=4,
         all_adapters=[
             "philschmid/code-llama-3-1-8b-text-to-sql-lora",
@@ -337,6 +347,8 @@ TARGET_MODULE_TESTS = [
         description="Test explicitly specified lora-target-modules.",
         base="meta-llama/Llama-3.1-8B-Instruct",
         max_loras_per_batch=3,
+        # Need to list all lora modules, or "all" might include lora modules without assigning lora weights
+        # lora_target_modules=["all"],
         lora_target_modules=[
             "q_proj",
             "k_proj",
@@ -751,7 +763,17 @@ EVICTION_TESTS = [
         ],
         enable_lora=True,
         max_lora_rank=256,
-        lora_target_modules=["all"],
+        # Need to list all lora modules, or "all" might include lora modules without assigning lora weights
+        # lora_target_modules=["all"],
+        lora_target_modules=[
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "o_proj",
+            "gate_proj",
+            "up_proj",
+            "down_proj",
+        ],
         op_sequence=[
             Operation(
                 type=OperationType.LOAD,
@@ -1503,7 +1525,17 @@ class TestLoRADynamicUpdate(CustomTestCase):
             lora_paths=[],
             max_loras_per_batch=2,
             max_lora_rank=256,
-            lora_target_modules=["all"],
+            # Need to list all lora modules, or "all" might include lora modules without assigning lora weights
+            # lora_target_modules=["all"],
+            lora_target_modules=[
+                "q_proj",
+                "k_proj",
+                "v_proj",
+                "o_proj",
+                "gate_proj",
+                "up_proj",
+                "down_proj",
+            ],
             enable_lora=True,
         ) as session:
             # Test with no adapters loaded

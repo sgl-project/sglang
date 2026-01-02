@@ -15,7 +15,7 @@ from sglang.srt.managers.data_parallel_controller import (
 )
 from sglang.srt.managers.scheduler import run_scheduler_process
 from sglang.srt.server_args import PortArgs, ServerArgs
-from sglang.srt.utils import configure_logger, prepare_model_and_tokenizer
+from sglang.srt.utils import configure_logger, numa_utils, prepare_model_and_tokenizer
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 logger = logging.getLogger(__name__)
@@ -135,7 +135,9 @@ def launch_scheduler_process_only(
                     ),
                 )
 
-                with memory_saver_adapter.configure_subprocess():
+                with memory_saver_adapter.configure_subprocess(), numa_utils.configure_subprocess(
+                    server_args, gpu_id
+                ):
                     proc.start()
 
                 scheduler_procs.append(proc)

@@ -58,6 +58,8 @@ def is_deepseek_nsa(config: PretrainedConfig) -> bool:
             "DeepseekV3ForCausalLM",
             "DeepseekV32ForCausalLM",
             "DeepseekV3ForCausalLMNextN",
+            "MistralLarge3ForCausalLM",
+            "PixtralForConditionalGeneration",
         ]
         and getattr(config, "index_topk", None) is not None
     )
@@ -154,13 +156,13 @@ class ModelConfig:
         self.attention_chunk_size = getattr(
             self.hf_text_config, "attention_chunk_size", None
         )
-        self.is_hybrid = is_hybrid_model(
+        self.is_hybrid_swa = is_hybrid_model(
             self.hf_config.architectures,
             hybrid_kvcache_ratio=hybrid_kvcache_ratio,
             context_length=context_length,
             attention_chunk_size=self.attention_chunk_size,
         )
-        if self.is_hybrid is not None:
+        if self.is_hybrid_swa is not None:
             self.swa_attention_layer_ids, self.full_attention_layer_ids = (
                 get_hybrid_layer_ids(
                     self.hf_config.architectures, self.hf_text_config.num_hidden_layers
@@ -334,6 +336,9 @@ class ModelConfig:
             or "LongcatFlashForCausalLM" in self.hf_config.architectures
             or "LongcatFlashForCausalLMNextN" in self.hf_config.architectures
             or "DotsVLMForCausalLM" in self.hf_config.architectures
+            or "MistralLarge3ForCausalLM" in self.hf_config.architectures
+            or "PixtralForConditionalGeneration" in self.hf_config.architectures
+            or "MistralLarge3ForCausalLMEagle" in self.hf_config.architectures
         ):
             self.head_dim = 256
             self.attention_arch = AttentionArch.MLA
@@ -518,12 +523,18 @@ class ModelConfig:
             # example: https://huggingface.co/Barrrrry/DeepSeek-R1-W4AFP8/tree/main
             is_local = os.path.exists(self.model_path)
             if not is_local:
-                import huggingface_hub
+                # Conditional import based on SGLANG_USE_MODELSCOPE environment variable
+                if envs.SGLANG_USE_MODELSCOPE.get():
 
-                try:
+                    from modelscope import HubApi, model_file_download
+
+                    hf_api = HubApi()
+                else:
+                    import huggingface_hub
                     from huggingface_hub import HfApi, hf_hub_download
 
                     hf_api = HfApi()
+                try:
                     # Retry HF API call up to 3 times
                     file_exists = retry(
                         lambda: hf_api.file_exists(
@@ -535,11 +546,18 @@ class ModelConfig:
                     )
                     if file_exists:
                         # Download and parse the quantization config for remote models
-                        quant_config_file = hf_hub_download(
-                            repo_id=self.model_path,
-                            filename="hf_quant_config.json",
-                            revision=self.revision,
-                        )
+                        if envs.SGLANG_USE_MODELSCOPE.get():
+                            quant_config_file = model_file_download(
+                                model_id=self.model_path,
+                                file_path="hf_quant_config.json",
+                                revision=self.revision,
+                            )
+                        else:
+                            quant_config_file = hf_hub_download(
+                                repo_id=self.model_path,
+                                filename="hf_quant_config.json",
+                                revision=self.revision,
+                            )
                         with open(quant_config_file) as f:
                             quant_config_dict = json.load(f)
                         quant_cfg = self._parse_modelopt_quant_config(quant_config_dict)
@@ -698,7 +716,16 @@ class ModelConfig:
             if self.quantization is None:
                 self.quantization = quant_method
             elif self.quantization != quant_method:
-                if (
+                # Allow auto-detection of quantization from checkpoint for draft model
+                # even if it differs from main model's quantization
+                if self.is_draft_model:
+                    logger.info(
+                        f"Draft model quantization ({quant_method}) differs from "
+                        f"main model quantization ({self.quantization}). "
+                        f"Using draft model's detected quantization: {quant_method}"
+                    )
+                    self.quantization = quant_method
+                elif (
                     self.quantization not in compatible_quantization_methods
                     or quant_method
                     not in compatible_quantization_methods[self.quantization]
@@ -939,6 +966,7 @@ multimodal_model_archs = [
     "MultiModalityCausalLM",
     "MllamaForConditionalGeneration",
     "NemotronH_Nano_VL_V2",
+    "PixtralForConditionalGeneration",
     "Qwen2AudioForConditionalGeneration",
     "Qwen2VLForConditionalGeneration",
     "Qwen2_5_VLForConditionalGeneration",
@@ -958,6 +986,7 @@ multimodal_model_archs = [
     "NVILALiteForConditionalGeneration",
     "DeepseekOCRForCausalLM",
     "JetVLMForConditionalGeneration",
+    "PaddleOCRVLForConditionalGeneration",
 ]
 
 if envs.SGLANG_EXTERNAL_MM_MODEL_ARCH.value:

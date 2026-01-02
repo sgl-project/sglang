@@ -14,7 +14,7 @@ if _is_hip:
     MODELS = [SimpleNamespace(model="openbmb/MiniCPM-V-2_6", mmmu_accuracy=0.4)]
 else:
     MODELS = [
-        SimpleNamespace(model="google/gemma-3-27b-it", mmmu_accuracy=0.45),
+        SimpleNamespace(model="google/gemma-3-4b-it", mmmu_accuracy=0.38),
         SimpleNamespace(model="Qwen/Qwen2.5-VL-3B-Instruct", mmmu_accuracy=0.4),
         SimpleNamespace(model="openbmb/MiniCPM-V-2_6", mmmu_accuracy=0.4),
     ]

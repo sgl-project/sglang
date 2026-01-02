@@ -10,7 +10,7 @@ import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
-from sglang.srt import _custom_ops as ops
+import sglang.srt.distributed.device_communicators.custom_all_reduce_ops as ops
 from sglang.srt.distributed.device_communicators.cuda_wrapper import CudaRTLibrary
 from sglang.srt.distributed.device_communicators.custom_all_reduce_utils import (
     gpu_p2p_access_check,
@@ -20,16 +20,6 @@ from sglang.srt.distributed.device_communicators.custom_all_reduce_utils import 
 from sglang.srt.distributed.parallel_state import in_the_same_node_as
 from sglang.srt.environ import envs
 from sglang.srt.utils import get_bool_env_var, is_cuda, is_hip, log_info_on_rank0
-
-try:
-    # Use custom allreduce from sgl kernel (ROCM and TRT-LLM)
-    import sgl_kernel  # noqa: F401
-
-    custom_ar = True
-except ImportError:
-    # For CPUs
-    custom_ar = False
-
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
@@ -76,9 +66,10 @@ class CustomAllreduce:
         are in the same node.
         """
         self._IS_CAPTURING = False
-        self.disabled = True
+        self.disabled = True  # This can be modified in-place by context manager in piecewise cuda graph runner
+        self.original_disabled = True  # To store the original state
 
-        if not custom_ar:
+        if not ops.IS_CUSTOM_AR_AVAILABLE:
             # disable because of missing custom allreduce library
             # e.g. in a non-cuda environment
             return
@@ -206,6 +197,7 @@ class CustomAllreduce:
             self.register_buffer(self.buffer)
 
         self.disabled = False
+        self.original_disabled = False  # Ensure original_disabled == disabled
         self.tms_cudagraph = envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get()
 
     @staticmethod

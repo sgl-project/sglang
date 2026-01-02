@@ -170,6 +170,7 @@ class NSAIndexerMetadata(BaseIndexerMetadata):
         cu_seqlens_q: torch.Tensor = None,
         ke_offset: torch.Tensor = None,
         batch_idx_list: List[int] = None,
+        topk_indices_offset_override: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         from sgl_kernel import (
             fast_topk_transform_fused,
@@ -177,7 +178,10 @@ class NSAIndexerMetadata(BaseIndexerMetadata):
             fast_topk_v2,
         )
 
-        if cu_seqlens_q is not None:
+        if topk_indices_offset_override is not None:
+            cu_topk_indices_offset = topk_indices_offset_override
+            cu_seqlens_q_topk = None
+        elif cu_seqlens_q is not None:
             cu_seqlens_q = cu_seqlens_q.to(torch.int32)
             cu_seqlens_q_topk = compute_cu_seqlens(cu_seqlens_q)
             cu_topk_indices_offset = torch.repeat_interleave(
@@ -286,9 +290,11 @@ class NativeSparseAttnBackend(AttentionBackend):
         )
         self.speculative_step_id = speculative_step_id
 
+        self.device_capability = torch.cuda.get_device_capability()
+        self.device_sm_major = self.device_capability[0]
+
         # Allocate global workspace buffer for TRTLLm ragged attention kernel (SM100/B200)
-        device_sm_major = torch.cuda.get_device_capability()[0]
-        if device_sm_major >= 10:
+        if self.device_sm_major >= 10:
             global global_workspace_buffer
             if global_workspace_buffer is None:
                 global_workspace_buffer = torch.empty(
@@ -921,6 +927,11 @@ class NativeSparseAttnBackend(AttentionBackend):
             q_nope = q_all[:, :, : layer.v_head_dim]
             q_rope = q_all[:, :, layer.v_head_dim :]
 
+        # Align topk_indices with q dimensions
+        # This handles cases where q is padded (TP + partial DP attention)
+        if topk_indices is not None:
+            topk_indices = self._pad_topk_indices(topk_indices, q_nope.shape[0])
+
         # NOTE(dark): here, we use page size = 1
         topk_transform_method = self.get_topk_transform_method()
         if NSA_FUSE_TOPK:
@@ -1058,6 +1069,10 @@ class NativeSparseAttnBackend(AttentionBackend):
             q_nope = q_all[:, :, : layer.v_head_dim]
             q_rope = q_all[:, :, layer.v_head_dim :]
 
+        # Align topk_indices with q dimensions
+        if topk_indices is not None:
+            topk_indices = self._pad_topk_indices(topk_indices, q_nope.shape[0])
+
         if NSA_FUSE_TOPK:
             page_table_1 = topk_indices
         else:
@@ -1178,13 +1193,43 @@ class NativeSparseAttnBackend(AttentionBackend):
     ) -> torch.Tensor:
         from sgl_kernel.flash_mla import flash_mla_sparse_fwd
 
+        # FlashMLA sparse kernel requires num_heads to be a multiple of 64 (Hopper) or 128 (Blackwell)
+        # When using TP, num_heads might be smaller (e.g., 256//8=32)
+        num_tokens, num_heads, head_dim = q_all.shape
+
+        # Determine required padding based on GPU architecture (use cached value)
+        required_padding = 128 if self.device_sm_major >= 10 else 64
+
+        need_padding = num_heads % required_padding != 0
+
+        if need_padding:
+            assert required_padding % num_heads == 0, (
+                f"num_heads {num_heads} cannot be padded to {required_padding}. "
+                f"TP size may be too large for this model."
+            )
+
+            # Pad q to required size
+            q_padded = q_all.new_zeros((num_tokens, required_padding, head_dim))
+            q_padded[:, :num_heads, :] = q_all
+            q_input = q_padded
+        else:
+            q_input = q_all
+
+        # indices shape must be (s_q, h_kv=1, topk), keep h_kv=1 unchanged
+        indices_input = page_table_1.unsqueeze(1)
+
         o, _, _ = flash_mla_sparse_fwd(
-            q=q_all,
+            q=q_input,
             kv=kv_cache,
-            indices=page_table_1.unsqueeze(1),
+            indices=indices_input,
             sm_scale=sm_scale,
             d_v=v_head_dim,
         )
+
+        # Trim output back to original num_heads if we padded
+        if need_padding:
+            o = o[:, :num_heads, :]
+
         return o
 
     def _forward_flashmla_kv(
@@ -1259,8 +1304,7 @@ class NativeSparseAttnBackend(AttentionBackend):
         )
 
         # Use TRTLLm ragged attention for SM100 (Blackwell/B200) to avoid FA4 accuracy issues
-        device_sm_major = torch.cuda.get_device_capability()[0]
-        if device_sm_major >= 10:
+        if self.device_sm_major >= 10:
             import flashinfer
 
             seq_lens = metadata.cache_seqlens_int32
@@ -1357,6 +1401,27 @@ class NativeSparseAttnBackend(AttentionBackend):
         # kv_cache = kv_cache.view(-1, 1, layer.head_dim)
         return o
 
+    def _pad_topk_indices(
+        self, topk_indices: torch.Tensor, num_tokens: int
+    ) -> torch.Tensor:
+        current_tokens = topk_indices.shape[0]
+        if current_tokens == num_tokens:
+            return topk_indices
+
+        assert current_tokens <= num_tokens, (
+            f"topk_indices rows ({current_tokens}) > num_tokens ({num_tokens}); "
+            "this indicates a mismatch between indexer output and q layout."
+        )
+
+        pad_size = num_tokens - current_tokens
+        padding = torch.full(
+            (pad_size, topk_indices.shape[1]),
+            -1,
+            dtype=topk_indices.dtype,
+            device=topk_indices.device,
+        )
+        return torch.cat([topk_indices, padding], dim=0)
+
     def get_cuda_graph_seq_len_fill_value(self):
         """Get the fill value for sequence length in CUDA graph."""
         return 1
@@ -1377,8 +1442,9 @@ class NativeSparseAttnBackend(AttentionBackend):
 
             # Requirements: H200/B200, short sequences, supported dtype, fits in chunk
             self.use_mha = (
-                device_sm == 90
-                or (device_sm >= 100 and device_sm < 110)  # SM90/SM100f only
+                (
+                    device_sm == 90 or (device_sm >= 100 and device_sm < 110)
+                )  # SM90/SM100 only
                 and max_kv_len <= self.nsa_index_topk  # Short enough for MHA
                 and forward_batch.token_to_kv_pool.dtype
                 in [torch.bfloat16, torch.float8_e4m3fn]

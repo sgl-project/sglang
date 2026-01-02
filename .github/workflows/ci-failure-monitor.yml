@@ -8,7 +8,7 @@ on:
       limit:
         description: 'Number of workflow runs to analyze (across all workflows)'
         required: false
-        default: '800'
+        default: '1000'
         type: string
       threshold:
         description: 'Alert threshold for consecutive failures'
@@ -51,7 +51,7 @@ jobs:
           cd scripts/ci_monitor
           python ci_failures_analysis.py \
             --token $GITHUB_TOKEN \
-            --limit ${{ inputs.limit || '800' }} \
+            --limit ${{ inputs.limit || '1000' }} \
             --threshold ${{ inputs.threshold || '4' }} \
             --output ci_failure_analysis_$(date +%Y%m%d_%H%M%S).json
 

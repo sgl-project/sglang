@@ -117,6 +117,135 @@ def handle_rerun_failed_ci(gh_repo, pr, comment, user_perms, react_on_success=Tr
         return False
 
 
+def handle_rerun_stage(
+    gh_repo, pr, comment, user_perms, stage_name, react_on_success=True
+):
+    """
+    Handles the /rerun-stage <stage-name> command.
+    Triggers a workflow_dispatch to run only the specified stage, skipping dependencies.
+    Returns True if action was taken, False otherwise.
+    """
+    if not user_perms.get("can_rerun_stage", False):
+        print("Permission denied: can_rerun_stage is false.")
+        return False
+
+    if not stage_name:
+        print("Error: No stage name provided")
+        comment.create_reaction("confused")
+        pr.create_issue_comment(
+            f"❌ Please specify a stage name: `/rerun-stage <stage-name>`\n\n"
+            f"Examples: `/rerun-stage unit-test-backend-4-gpu`, `/rerun-stage accuracy-test-1-gpu`"
+        )
+        return False
+
+    print(f"Permission granted. Triggering workflow_dispatch for stage '{stage_name}'.")
+
+    # Valid NVIDIA stage names that support target_stage
+    nvidia_stages = [
+        "stage-a-test-1",
+        "stage-b-test-small-1-gpu",
+        "multimodal-gen-test-1-gpu",
+        "multimodal-gen-test-2-gpu",
+        "quantization-test",
+        "unit-test-backend-1-gpu",
+        "unit-test-backend-2-gpu",
+        "unit-test-backend-4-gpu",
+        "unit-test-backend-8-gpu-h200",
+        "unit-test-backend-8-gpu-h20",
+        "unit-test-backend-8-gpu-b200",
+        "performance-test-1-gpu-part-1",
+        "performance-test-1-gpu-part-2",
+        "performance-test-1-gpu-part-3",
+        "performance-test-2-gpu",
+        "accuracy-test-1-gpu",
+        "accuracy-test-2-gpu",
+        "unit-test-deepep-4-gpu",
+        "unit-test-deepep-8-gpu",
+        "unit-test-backend-4-gpu-b200",
+        "unit-test-backend-4-gpu-gb200",
+    ]
+
+    # Valid AMD stage names that support target_stage
+    amd_stages = [
+        "sgl-kernel-unit-test-amd",
+        "stage-a-test-1-amd",
+        "unit-test-backend-1-gpu-amd",
+        "unit-test-backend-2-gpu-amd",
+        "unit-test-backend-8-gpu-amd",
+        "performance-test-1-gpu-part-1-amd",
+        "performance-test-1-gpu-part-2-amd",
+        "performance-test-2-gpu-amd",
+        "accuracy-test-1-gpu-amd",
+        "accuracy-test-2-gpu-amd",
+    ]
+
+    valid_stages = nvidia_stages + amd_stages
+    is_amd_stage = stage_name in amd_stages
+
+    if stage_name not in valid_stages:
+        comment.create_reaction("confused")
+        pr.create_issue_comment(
+            f"❌ Stage `{stage_name}` doesn't support isolated runs yet.\n\n"
+            f"**NVIDIA stages:**\n"
+            + "\n".join(f"- `{s}`" for s in nvidia_stages)
+            + "\n\n**AMD stages:**\n"
+            + "\n".join(f"- `{s}`" for s in amd_stages)
+            + "\n\nOther stages will be added soon. For now, use `/rerun-failed-ci` for those stages."
+        )
+        return False
+
+    try:
+        # Get the appropriate workflow based on stage type
+        workflow_name = "PR Test (AMD)" if is_amd_stage else "PR Test"
+        workflows = gh_repo.get_workflows()
+        target_workflow = None
+        for wf in workflows:
+            if wf.name == workflow_name:
+                target_workflow = wf
+                break
+
+        if not target_workflow:
+            print(f"Error: {workflow_name} workflow not found")
+            return False
+
+        # Trigger workflow_dispatch on the PR's head branch
+        ref = pr.head.ref
+        print(f"Triggering {workflow_name} workflow on branch: {ref}")
+
+        # AMD workflow doesn't have version input, only target_stage
+        if is_amd_stage:
+            inputs = {"target_stage": stage_name}
+        else:
+            inputs = {"version": "release", "target_stage": stage_name}
+
+        success = target_workflow.create_dispatch(
+            ref=ref,
+            inputs=inputs,
+        )
+
+        if success:
+            print(f"Successfully triggered workflow for stage '{stage_name}'")
+            if react_on_success:
+                comment.create_reaction("+1")
+                pr.create_issue_comment(
+                    f"✅ Triggered `{stage_name}` to run independently (skipping dependencies).\n\n"
+                    f"Check the [Actions tab](https://github.com/{gh_repo.full_name}/actions) for progress."
+                )
+            return True
+        else:
+            print("Failed to trigger workflow_dispatch")
+            return False
+
+    except Exception as e:
+        print(f"Error triggering workflow_dispatch: {e}")
+        comment.create_reaction("confused")
+        pr.create_issue_comment(
+            f"❌ Failed to trigger workflow: {str(e)}\n\n"
+            f"Please check the logs or contact maintainers."
+        )
+        return False
+
+
 def main():
     # 1. Load Environment Variables
     token = get_env_var("GITHUB_TOKEN")
@@ -167,6 +296,12 @@ def main():
             print("Combined command processed successfully; reaction added.")
         else:
             print("Combined command finished, but no actions were taken.")
+
+    elif first_line.startswith("/rerun-stage"):
+        # Extract stage name from command
+        parts = first_line.split(maxsplit=1)
+        stage_name = parts[1].strip() if len(parts) > 1 else None
+        handle_rerun_stage(repo, pr, comment, user_perms, stage_name)
 
     else:
         print(f"Unknown or ignored command: {first_line}")

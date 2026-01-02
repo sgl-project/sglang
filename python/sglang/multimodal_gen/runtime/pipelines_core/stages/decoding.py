@@ -27,6 +27,26 @@ from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
 logger = init_logger(__name__)
 
 
+def _ensure_tensor_decode_output(decode_output):
+    """
+    Ensure VAE decode output is a tensor.
+
+    Some VAE implementations return DecoderOutput objects with a .sample attribute,
+    tuples, or tensors directly. This function normalizes the output to always be a tensor.
+
+    Args:
+        decode_output: Output from VAE.decode(), can be DecoderOutput, tuple, or torch.Tensor
+
+    Returns:
+        torch.Tensor: The decoded image tensor
+    """
+    if isinstance(decode_output, tuple):
+        return decode_output[0]
+    if hasattr(decode_output, "sample"):
+        return decode_output.sample
+    return decode_output
+
+
 class DecodingStage(PipelineStage):
     """
     Stage for decoding latent representations into pixel space.
@@ -106,7 +126,10 @@ class DecodingStage(PipelineStage):
 
         # scale and shift
         latents = self.scale_and_shift(latents, server_args)
-        latents = server_args.pipeline_config.preprocess_decoding(latents)
+        # Preprocess latents before decoding (e.g., unpatchify for standard Flux2 VAE)
+        latents = server_args.pipeline_config.preprocess_decoding(
+            latents, server_args, vae=self.vae
+        )
 
         # Decode latents
         with torch.autocast(
@@ -120,7 +143,8 @@ class DecodingStage(PipelineStage):
                 pass
             if not vae_autocast_enabled:
                 latents = latents.to(vae_dtype)
-            image = self.vae.decode(latents)
+            decode_output = self.vae.decode(latents)
+            image = _ensure_tensor_decode_output(decode_output)
 
         # De-normalize image to [0, 1] range
         image = (image / 2 + 0.5).clamp(0, 1)

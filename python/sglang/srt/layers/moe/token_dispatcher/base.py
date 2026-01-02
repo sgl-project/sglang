@@ -19,6 +19,7 @@ from typing import (
 import torch
 
 if TYPE_CHECKING:
+    from sglang.srt.batch_overlap.single_batch_overlap import CombineOverlapArgs
     from sglang.srt.layers.moe.token_dispatcher import (
         DeepEPLLCombineInput,
         DeepEPLLDispatchOutput,
@@ -28,7 +29,6 @@ if TYPE_CHECKING:
         StandardDispatchOutput,
     )
     from sglang.srt.layers.moe.topk import TopKOutput
-    from sglang.srt.single_batch_overlap import CombineOverlapArgs
 
 
 # ------------------------------ Dispatcher Hook -------------------------------------
@@ -49,7 +49,7 @@ class _RemovableDispatcherHandle:
             del hooks_dict[self.id]
 
 
-class _DispatcherBaseHooks:
+class DispatcherBaseHooks:
 
     def __init__(self):
         self.hook_dict = OrderedDict[int, Callable]()
@@ -63,7 +63,7 @@ class _DispatcherBaseHooks:
         raise NotImplementedError("This method should be overridden by subclasses")
 
 
-class _PreDispatchHooks(_DispatcherBaseHooks):
+class _PreDispatchHooks(DispatcherBaseHooks):
 
     def __call__(
         self,
@@ -78,7 +78,7 @@ class _PreDispatchHooks(_DispatcherBaseHooks):
         return hidden_states, topk_output
 
 
-class _PostDispatchHooks(_DispatcherBaseHooks):
+class _PostDispatchHooks(DispatcherBaseHooks):
 
     def __call__(
         self, dispatcher: BaseDispatcher, dispatch_output: DispatchOutput
@@ -90,7 +90,7 @@ class _PostDispatchHooks(_DispatcherBaseHooks):
         return dispatch_output
 
 
-class _PreCombineHooks(_DispatcherBaseHooks):
+class _PreCombineHooks(DispatcherBaseHooks):
 
     def __call__(
         self, dispatcher: BaseDispatcher, combine_input: CombineInput
@@ -102,7 +102,7 @@ class _PreCombineHooks(_DispatcherBaseHooks):
         return combine_input
 
 
-class _PostCombineHooks(_DispatcherBaseHooks):
+class _PostCombineHooks(DispatcherBaseHooks):
 
     def __call__(
         self, dispatcher: BaseDispatcher, hidden_states: torch.Tensor
