@@ -95,8 +95,23 @@ class TestEndToEnd(CustomTestCase):
             baseline_tensor = torch.randn(10, 10)
             target_tensor = baseline_tensor + torch.randn(10, 10) * 0.01
 
-            dump_dir1 = _create_dump(d1, baseline_tensor)
-            dump_dir2 = _create_dump(d2, target_tensor)
+            with _with_env("SGLANG_DUMPER_DIR", d1):
+                from sglang.srt.debug_utils.dumper import _Dumper
+
+                dumper1 = _Dumper()
+                dumper1.on_forward_pass_start()
+                dumper1.dump("tensor_a", baseline_tensor)
+                dumper1.on_forward_pass_start()
+                dumper1.dump("tensor_b", baseline_tensor * 2)
+                dump_dir1 = Path(d1) / f"sglang_dump_{dumper1._partial_name}"
+
+            with _with_env("SGLANG_DUMPER_DIR", d2):
+                dumper2 = _Dumper()
+                dumper2.on_forward_pass_start()
+                dumper2.dump("tensor_a", target_tensor)
+                dumper2.on_forward_pass_start()
+                dumper2.dump("tensor_b", target_tensor * 2)
+                dump_dir2 = Path(d2) / f"sglang_dump_{dumper2._partial_name}"
 
             args = Namespace(
                 baseline_path=str(dump_dir1),
@@ -108,18 +123,6 @@ class TestEndToEnd(CustomTestCase):
                 filter=None,
             )
             main(args)
-
-
-def _create_dump(base_dir: str, tensor: torch.Tensor) -> Path:
-    from sglang.srt.debug_utils.dumper import _Dumper
-
-    with _with_env("SGLANG_DUMPER_DIR", base_dir):
-        dumper = _Dumper()
-        dumper.on_forward_pass_start()
-        dumper.dump("tensor_a", tensor)
-        dumper.on_forward_pass_start()
-        dumper.dump("tensor_b", tensor * 2)
-        return Path(base_dir) / f"sglang_dump_{dumper._partial_name}"
 
 
 @contextmanager
