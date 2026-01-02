@@ -5,14 +5,14 @@ import unittest
 import requests
 
 from sglang.test.test_utils import (
-    DEFAULT_EAGLE_DRAFT_MODEL_FOR_TEST,
-    DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST,
+    DEFAULT_DRAFT_MODEL_EAGLE,
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_MODEL_NAME_FOR_TEST_FP8,
     DEFAULT_MOE_MODEL_NAME_FOR_TEST,
     DEFAULT_SMALL_EMBEDDING_MODEL_NAME_FOR_TEST,
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST_SCORE,
     DEFAULT_SMALL_VLM_MODEL_NAME_FOR_TEST,
+    DEFAULT_TARGET_MODEL_EAGLE,
     CustomTestCase,
     is_in_amd_ci,
     is_in_ci,
@@ -328,7 +328,7 @@ class TestBenchServing(CustomTestCase):
 
     def test_online_latency_eagle(self):
         res = run_bench_serving(
-            model=DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST,
+            model=DEFAULT_TARGET_MODEL_EAGLE,
             num_prompts=300,
             request_rate=8,
             sharegpt_context_len=3072,
@@ -338,7 +338,7 @@ class TestBenchServing(CustomTestCase):
                 "--speculative-algorithm",
                 "EAGLE",
                 "--speculative-draft-model-path",
-                DEFAULT_EAGLE_DRAFT_MODEL_FOR_TEST,
+                DEFAULT_DRAFT_MODEL_EAGLE,
                 "--speculative-num-steps",
                 "5",
                 "--speculative-eagle-topk",
