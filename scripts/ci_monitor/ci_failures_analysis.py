@@ -1269,7 +1269,9 @@ class SGLangFailuresAnalyzer:
                 return lines
 
             # Helper function to generate job section for GitHub markdown
-            def generate_job_section_md(title: str, data: Dict[str, Dict]):
+            def generate_job_section_md(
+                title: str, data: Dict[str, Dict], show_test_failures: bool = True
+            ):
                 sorted_data = sorted(
                     data.items(),
                     key=lambda x: (x[1]["current_streak"], x[1]["failure_rate"]),
@@ -1352,12 +1354,13 @@ class SGLangFailuresAnalyzer:
                                 f"{first_str} | {last_str} | {history_links} |"
                             )
 
-                    # Add test failure dropdowns after the table
+                    # Add test failure dropdowns after the table (only for scheduled runs)
                     summary_lines.append("")
-                    for job_name, d in broken[:15]:
-                        test_dropdown = generate_test_failure_dropdown(job_name)
-                        if test_dropdown:
-                            summary_lines.extend(test_dropdown)
+                    if show_test_failures:
+                        for job_name, d in broken[:15]:
+                            test_dropdown = generate_test_failure_dropdown(job_name)
+                            if test_dropdown:
+                                summary_lines.extend(test_dropdown)
                 else:
                     summary_lines.append(
                         "✅ **No jobs with active failure streaks (streak >= 2)**"
@@ -1396,12 +1399,13 @@ class SGLangFailuresAnalyzer:
                             f"| <span style='color:orange'>`{display_name}`</span> | <span style='color:orange'>{d['total_failures']}</span> | <span style='color:orange'>{d['failure_rate']:.1f}%</span> | <span style='color:orange'>{d['total_runs']}</span> | <span style='color:orange'>{history_links}</span> |"
                         )
 
-                    # Add test failure dropdowns after the table
+                    # Add test failure dropdowns after the table (only for scheduled runs)
                     summary_lines.append("")
-                    for job_name, d in high_failure_rate[:15]:
-                        test_dropdown = generate_test_failure_dropdown(job_name)
-                        if test_dropdown:
-                            summary_lines.extend(test_dropdown)
+                    if show_test_failures:
+                        for job_name, d in high_failure_rate[:15]:
+                            test_dropdown = generate_test_failure_dropdown(job_name)
+                            if test_dropdown:
+                                summary_lines.extend(test_dropdown)
 
                 # Show recently failed jobs in a collapsible section
                 if recently_failed:
@@ -1603,44 +1607,53 @@ class SGLangFailuresAnalyzer:
 
             gen_limit = report_data.get("general_limit", 100)
 
-            # PR Tests - General (5 workflows)
+            # PR Tests - General (5 workflows) - no test failure analysis
             generate_job_section_md(
                 f"10. PR Test NVIDIA - General (latest {gen_limit} runs)",
                 report_data.get("pr_test_nvidia_general_data", {}),
+                show_test_failures=False,
             )
             generate_job_section_md(
                 f"11. PR Test AMD - General (latest {gen_limit} runs)",
                 report_data.get("pr_test_amd_general_data", {}),
+                show_test_failures=False,
             )
             generate_job_section_md(
                 f"12. PR Test Xeon - General (latest {gen_limit} runs)",
                 report_data.get("pr_test_xeon_general_data", {}),
+                show_test_failures=False,
             )
             generate_job_section_md(
                 f"13. PR Test XPU - General (latest {gen_limit} runs)",
                 report_data.get("pr_test_xpu_general_data", {}),
+                show_test_failures=False,
             )
             generate_job_section_md(
                 f"14. PR Test NPU - General (latest {gen_limit} runs)",
                 report_data.get("pr_test_npu_general_data", {}),
+                show_test_failures=False,
             )
 
-            # Nightly Tests - General (4 workflows)
+            # Nightly Tests - General (4 workflows) - no test failure analysis
             generate_job_section_md(
                 f"15. Nightly NVIDIA - General (latest {gen_limit} runs)",
                 report_data.get("nightly_nvidia_general_data", {}),
+                show_test_failures=False,
             )
             generate_job_section_md(
                 f"16. Nightly AMD - General (latest {gen_limit} runs)",
                 report_data.get("nightly_amd_general_data", {}),
+                show_test_failures=False,
             )
             generate_job_section_md(
                 f"17. Nightly Intel - General (latest {gen_limit} runs)",
                 report_data.get("nightly_intel_general_data", {}),
+                show_test_failures=False,
             )
             generate_job_section_md(
                 f"18. Nightly NPU - General (latest {gen_limit} runs)",
                 report_data.get("nightly_npu_general_data", {}),
+                show_test_failures=False,
             )
 
             # Write summary
