@@ -157,11 +157,12 @@ class GetS:
 class GetKAndS:
     @classmethod
     def execute(cls, *args, **kwargs):
-        return cls.triton(*args, **kwargs)
+        cls.triton(*args, **kwargs)
 
     @classmethod
     def triton(
-        cls, pool: "NSATokenToKVPool", buf, seq_len: int, page_indices: torch.Tensor
+        cls, pool: "NSATokenToKVPool", buf, seq_len: int, page_indices: torch.Tensor, kv_cache: torch.Tensor, kv_scale: torch.Tensor,
+        kv_offset: int, kv_scale_offset: int,
     ):
         """
         Triton implementation for gathering both K and S data from paged buffer in a single call.
@@ -170,12 +171,16 @@ class GetKAndS:
                  k_fp8: (seq_len, index_head_dim), uint8
                  k_scale: (seq_len, 4), uint8
         """
-        return _get_k_and_s_triton(
+        _get_k_and_s_triton(
             buf=buf,
             page_indices=page_indices,
             seq_len=seq_len,
             page_size=pool.page_size,
             index_head_dim=pool.index_head_dim,
+            kv_offset=kv_offset,
+            kv_scale_offset=kv_scale_offset,
+            kv_cache=kv_cache,
+            kv_scale=kv_scale,
         )
 
 
@@ -585,6 +590,10 @@ def _get_k_and_s_triton(
     seq_len: int,
     page_size: int,
     index_head_dim: int,
+    kv_offset: int,
+    kv_scale_offset: int,
+    kv_cache: torch.Tensor,
+    kv_scale: torch.Tensor,
 ):
     """
     Fused gather of both K (key) and S (scale) data from paged buffer using Triton.
@@ -603,25 +612,25 @@ def _get_k_and_s_triton(
     s_offset_in_page = page_size * index_head_dim  # Scales start after K data
 
     # Allocate outputs
-    k_out = torch.empty((seq_len, index_head_dim), dtype=torch.uint8, device=buf.device)
-    s_out = torch.empty((seq_len, 4), dtype=torch.uint8, device=buf.device)
+    # k_out = torch.empty((seq_len, index_head_dim), dtype=torch.uint8, device=buf.device)
+    # s_out = torch.empty((seq_len, 4), dtype=torch.uint8, device=buf.device)
 
     # Launch kernel with one thread per token
     grid = (seq_len,)
     _get_k_and_s_triton_kernel[grid](
         buf,
         page_indices,
-        k_out,
-        s_out,
+        kv_cache,
+        kv_scale,
         seq_len,
         page_size,
         buf_numel_per_page,
         index_head_dim,
         s_offset_in_page,
+        kv_offset,
+        kv_scale_offset,
         BLOCK_SIZE_K=128,
     )
-
-    return k_out, s_out
 
 
 @triton.jit
@@ -635,6 +644,8 @@ def _get_k_and_s_triton_kernel(
     buf_numel_per_page: tl.constexpr,
     index_head_dim: tl.constexpr,
     s_offset_in_page: tl.constexpr,
+    kv_offset: tl.constexpr,
+    kv_scale_offset: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
 ):
     """
@@ -664,7 +675,7 @@ def _get_k_and_s_triton_kernel(
 
     # Store K to output
     k_dst_offset = token_id * index_head_dim
-    tl.store(k_out_ptr + k_dst_offset + k_offsets, k_data, mask=k_mask)
+    tl.store(k_out_ptr + k_dst_offset + k_offsets + kv_offset, k_data, mask=k_mask)
 
     # ===== Load S data (4 bytes) =====
     # Calculate source offset for S in buf
@@ -678,4 +689,4 @@ def _get_k_and_s_triton_kernel(
 
     # Store S to output
     s_dst_offset = token_id * 4
-    tl.store(s_out_ptr + s_dst_offset + s_offsets, s_data)
+    tl.store(s_out_ptr + s_dst_offset + s_offsets + kv_scale_offset, s_data)

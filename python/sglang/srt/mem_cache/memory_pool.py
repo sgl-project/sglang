@@ -1922,6 +1922,10 @@ class NSATokenToKVPool(MLATokenToKVPool):
         layer_id: int,
         seq_len: int,
         page_indices: torch.Tensor,
+        kv_fp8: torch.Tensor,
+        kv_scale: torch.Tensor,
+        kv_offset: int, 
+        kv_scale_offset: int,
     ):
         """
         Fused method to get both index K and scale data in a single call using Triton.
@@ -1936,7 +1940,8 @@ class NSATokenToKVPool(MLATokenToKVPool):
         """
         buf = self.index_k_with_scale_buffer[layer_id - self.start_layer]
         return index_buf_accessor.GetKAndS.execute(
-            self, buf, seq_len=seq_len, page_indices=page_indices
+            self, buf, seq_len=seq_len, page_indices=page_indices, kv_cache=kv_fp8, kv_scale=kv_scale,
+            kv_offset=kv_offset, kv_scale_offset=kv_scale_offset,
         )
 
     def set_index_k_scale_buffer(
