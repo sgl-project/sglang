@@ -170,11 +170,6 @@ harness = false
 path = "benches/tool_parser_benchmark.rs"
 
 [[bench]]
-name = "tree_benchmark"
-harness = false
-path = "benches/tree_benchmark.rs"
-
-[[bench]]
 name = "radix_tree_benchmark"
 harness = false
 path = "benches/radix_tree_benchmark.rs"

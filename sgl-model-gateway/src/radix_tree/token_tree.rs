@@ -161,6 +161,14 @@ fn next_timestamp() -> u64 {
 
 /// Node in the token-based radix tree.
 /// Uses parking_lot RwLock for better performance (no poisoning, smaller size).
+///
+/// # Design Note: No Parent Pointer
+/// Unlike StringTree which uses parent pointers (`Weak<Node>`) for upward traversal,
+/// TokenTree uses a path-based approach for eviction:
+/// - During eviction DFS, we collect `EvictionCandidate` with `path: Vec<TokenPageKey>`
+/// - To remove a node, traverse from root using path[0..n-1] to reach parent, then remove child
+/// - This avoids weak reference overhead and simplifies memory management
+/// - Both approaches are valid; path-based is preferred here for lock-free read optimization
 struct Node {
     /// Token sequence stored at this node (always page-aligned length, multiple of PAGE_SIZE)
     tokens: ParkingLotRwLock<Vec<TokenId>>,

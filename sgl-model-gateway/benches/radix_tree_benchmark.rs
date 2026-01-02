@@ -24,8 +24,8 @@ use rand::{
     rng as thread_rng, Rng,
 };
 // Import both old and new tree implementations
-use sgl_model_gateway::policies::tree::Tree as OldTree;
-use sgl_model_gateway::radix_tree::{StringTree, TokenTree};
+use smg::policies::tree::Tree as OldTree;
+use smg::radix_tree::{StringTree, TokenTree};
 
 // Global results storage for summary
 lazy_static::lazy_static! {
