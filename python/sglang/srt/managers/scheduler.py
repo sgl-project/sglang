@@ -317,7 +317,7 @@ class Scheduler(
         self.init_metrics(tp_rank, pp_rank, dp_rank)
 
         # Init inter-process communication
-        self.init_sockets(server_args, port_args)
+        self.init_ipc_channels(port_args)
 
         # Init PD-multiplexing context
         if self.enable_pdmux:
@@ -373,7 +373,7 @@ class Scheduler(
             else None
         )
 
-    def init_sockets(self, server_args: ServerArgs, port_args: PortArgs):
+    def init_ipc_channels(self, port_args: PortArgs):
         context = zmq.Context(2)
         self.idle_sleeper = None
 
@@ -388,7 +388,7 @@ class Scheduler(
             send_to_tokenizer = get_zmq_socket(
                 context, zmq.PUSH, port_args.tokenizer_ipc_name, False
             )
-            if server_args.skip_tokenizer_init:
+            if self.server_args.skip_tokenizer_init:
                 # Directly send to the TokenizerManager
                 send_to_detokenizer = get_zmq_socket(
                     context, zmq.PUSH, port_args.tokenizer_ipc_name, False
@@ -465,7 +465,7 @@ class Scheduler(
         # This must be called after initialize_moe_config
         self.require_mlp_sync = require_mlp_sync(self.server_args)
 
-    def init_model_worker(self):
+    def init_tp_model_worker(self):
         from sglang.srt.managers.tp_worker import TpModelWorker
 
         self.tp_worker = TpModelWorker(
@@ -478,6 +478,7 @@ class Scheduler(
             nccl_port=self.nccl_port,
         )
 
+    def init_draft_worker(self):
         # Launch a draft worker for speculative decoding
         draft_worker_kwargs = dict(
             server_args=self.server_args,
@@ -496,11 +497,6 @@ class Scheduler(
             logger.info(
                 f"Using draft model load_format: '{self.server_args.speculative_draft_load_format}'"
             )
-
-        # Draft workers are looked up via `SpeculativeAlgorithm` registry; new
-        # algorithms should register their factory instead of patching this code.
-        if self.spec_algorithm.is_eagle():
-            draft_worker_kwargs["enable_overlap"] = self.enable_overlap
 
         # FIXME: refactor the draft worker registration logic
         if self.server_args.enable_multi_layer_eagle:
@@ -533,9 +529,19 @@ class Scheduler(
                     dp_rank=self.dp_rank,
                 )
         else:
-            self.draft_worker = self.spec_algorithm.create_draft_worker(
-                **draft_worker_kwargs
+            WorkerClass = self.spec_algorithm.create_worker(
+                enable_overlap=self.enable_overlap
             )
+
+            # FIXME: optimize the init draft worker code path
+            if WorkerClass is not None:
+                self.draft_worker = WorkerClass(**draft_worker_kwargs)
+            else:
+                self.draft_worker = None
+
+    def init_model_worker(self):
+        self.init_tp_model_worker()
+        self.init_draft_worker()
 
         # Dispatch the model worker
         if self.spec_algorithm.is_none():
@@ -648,10 +654,8 @@ class Scheduler(
             else:
                 from sglang.srt.mem_cache.chunk_cache import SWAChunkCache
 
-                params.is_local_attention = (
-                    "Llama4ForConditionalGeneration"
-                    in self.model_config.hf_config.architectures
-                )
+                params.sliding_window_size = self.model_config.sliding_window_size
+                params.attention_chunk_size = self.model_config.attention_chunk_size
 
                 self.tree_cache = SWAChunkCache(params)
         else:
@@ -729,13 +733,9 @@ class Scheduler(
         self.running_batch: ScheduleBatch = ScheduleBatch(reqs=[], batch_is_full=False)
         # The current forward batch
         self.cur_batch: Optional[ScheduleBatch] = None
-        # The current split prefill batch
-        self.split_prefill_batch: Optional[ScheduleBatch] = None
         # The last forward batch
         self.last_batch: Optional[ScheduleBatch] = None
         self.forward_ct = 0
-        self.last_prefill_tokens = 0
-        self.last_prefill_cache_tokens = 0
         self.return_health_check_ct = 0
         self.num_retracted_reqs: int = 0
         self.num_paused_reqs: int = 0
@@ -856,7 +856,7 @@ class Scheduler(
 
         if self.draft_worker is None or self.spec_algorithm.is_ngram():
             draft_token_to_kv_pool = None
-        elif self.spec_algorithm.is_eagle() and self.enable_overlap:
+        elif self.spec_algorithm.supports_spec_v2() and self.enable_overlap:
             if self.server_args.enable_multi_layer_eagle:
                 draft_runner = self.draft_worker.draft_worker.draft_runner_list[0]
             else:
@@ -934,11 +934,13 @@ class Scheduler(
                 hidden_size=(
                     model_config.hidden_size
                     if self.spec_algorithm.is_eagle()
+                    or self.spec_algorithm.is_standalone()
                     else 16  # minimal padding size for RDMA
                 ),
                 hidden_states_dtype=(
                     model_config.dtype
                     if self.spec_algorithm.is_eagle()
+                    or self.spec_algorithm.is_standalone()
                     else torch.float32
                 ),
                 custom_mem_pool=self.token_to_kv_pool_allocator.get_kvcache().maybe_get_custom_mem_pool(),
@@ -1169,7 +1171,7 @@ class Scheduler(
         # TODO(lsyin): support overlap + spec + grammar
         need_grammar_sync = (
             batch
-            and batch.is_eagle_v2
+            and batch.is_spec_v2
             and batch.has_grammar
             and batch.forward_mode.is_decode()
             and len(self.result_queue) > 0
@@ -1528,24 +1530,27 @@ class Scheduler(
             self._add_request_to_queue(req)
             return
 
-        # Copy more attributes
-        if recv_req.logprob_start_len == -1 or not recv_req.return_logprob:
-            # By default, only return the logprobs for output tokens
-            # For prefill-only requests with logprob_start_len == -1, set logprob_start_len beyond input sequence
-            # to skip input logprob computation entirely
+        if not recv_req.return_logprob and recv_req.logprob_start_len != -1:
+            # When return_logprob is False, logprob_start_len should be ignored
+            recv_req.logprob_start_len = -1
+
+        if recv_req.logprob_start_len == -1:
             if req.is_prefill_only:
+                # For prefill-only requests with logprob_start_len == -1, set logprob_start_len
+                # beyond input sequence to skip input logprob computation entirely
                 req.logprob_start_len = len(req.origin_input_ids)
-            else:
-                # TODO: For text generation, evaluate setting logprob_start_len to len(req.origin_input_ids) as well
+            elif recv_req.return_logprob:
+                # If return_logprob is True, return the logprobs for output tokens by default
                 req.logprob_start_len = len(req.origin_input_ids) - 1
+            else:
+                # If return_logprob is False, only the last token requires logprob computation
+                req.logprob_start_len = -1
         else:
             req.logprob_start_len = recv_req.logprob_start_len
 
-        if not req.is_prefill_only and req.logprob_start_len >= len(
-            req.origin_input_ids
-        ):
+        if req.logprob_start_len > len(req.origin_input_ids):
             error_msg = f"{req.logprob_start_len=} is higher than the number of input tokens {len(req.origin_input_ids)=}. Please use a smaller logprob_start_len."
-            req.logprob_start_len = len(req.origin_input_ids) - 1
+            req.logprob_start_len = -1
             req.set_finish_with_abort(error_msg)
             self._add_request_to_queue(req)
             return
@@ -1764,7 +1769,7 @@ class Scheduler(
             return
 
         # Copy more attributes
-        req.logprob_start_len = len(req.origin_input_ids) - 1
+        req.logprob_start_len = -1
         self._add_request_to_queue(req)
 
     def handle_batch_embedding_request(
@@ -1832,7 +1837,9 @@ class Scheduler(
             # Before merging the new batch into running batch:
             # 1. All new batches are none -> need_mlp_sync remains true (sync is needed for decode batch).
             # 2. All new batches are some (prefill / idle) -> we do not need prepare mlp sync one more time.
-            new_batch = self.prepare_mlp_sync_batch(new_batch)
+            new_batch = self.maybe_prepare_mlp_sync_batch_and_log_stats(
+                new_batch, log_stats=False
+            )
             need_mlp_sync = new_batch is None
 
         if new_batch is not None:
@@ -1846,14 +1853,13 @@ class Scheduler(
             else:
                 ret = None
 
-        # Handle DP attention
-        if need_mlp_sync:
-            ret = self.prepare_mlp_sync_batch(ret)
+        # Handle DP attention and log stats
+        ret = self.maybe_prepare_mlp_sync_batch_and_log_stats(
+            ret, need_sync=need_mlp_sync
+        )
 
         if ret:
             trace_event_batch("schedule", ret.reqs)
-
-        self.log_prefill_stats_late(ret)
 
         return ret
 
@@ -2090,12 +2096,24 @@ class Scheduler(
                 self.decode_mem_cache_buf_multiplier
             )
         ) or (TEST_RETRACT and self.forward_ct % TEST_RETRACT_INTERVAL == 0):
-            old_available_tokens = self.token_to_kv_pool_allocator.available_size()
+            if self.is_hybrid_swa:
+                old_available_tokens = min(
+                    self.token_to_kv_pool_allocator.full_available_size(),
+                    self.token_to_kv_pool_allocator.swa_available_size(),
+                )
+            else:
+                old_available_tokens = self.token_to_kv_pool_allocator.available_size()
             old_ratio = self.new_token_ratio
             retracted_reqs, new_token_ratio, reqs_to_abort = batch.retract_decode(
                 self.server_args, self.decode_mem_cache_buf_multiplier
             )
-            new_available_tokens = self.token_to_kv_pool_allocator.available_size()
+            if self.is_hybrid_swa:
+                new_available_tokens = min(
+                    self.token_to_kv_pool_allocator.full_available_size(),
+                    self.token_to_kv_pool_allocator.swa_available_size(),
+                )
+            else:
+                new_available_tokens = self.token_to_kv_pool_allocator.available_size()
             new_token_gained = new_available_tokens - old_available_tokens
 
             self.num_retracted_reqs = len(retracted_reqs)
@@ -2217,8 +2235,8 @@ class Scheduler(
                 # FIXME(lsyin): move this assignment elsewhere
                 future_indices_or_next_token_ids = -future_indices.indices
 
-                if batch.is_eagle_v2:
-                    # FIXME(lsyin): tmp code for eagle v2
+                if batch.is_spec_v2:
+                    # FIXME(lsyin): tmp code for spec v2
                     # We only keep future indices for next draft input
 
                     batch.spec_info = batch_result.next_draft_input
@@ -2257,7 +2275,7 @@ class Scheduler(
             # These 2 values are needed for processing the output, but the values can be
             # modified by overlap schedule. So we have to copy them here so that
             # we can use the correct values in output processing.
-            if batch.return_logprob or self.spec_algorithm.is_eagle():
+            if batch.return_logprob:
                 batch_result.extend_input_len_per_req = [
                     req.extend_input_len for req in batch.reqs
                 ]
@@ -2324,9 +2342,7 @@ class Scheduler(
         elif batch.forward_mode.is_prebuilt():
             self.process_batch_result_prebuilt(batch)
         elif batch.forward_mode.is_idle():
-            if self.enable_overlap:
-                if result.copy_done is not None:
-                    result.copy_done.synchronize()
+            self.process_batch_result_idle(batch, result)
 
         self.log_batch_result_stats(batch, result)
         self.maybe_send_health_check_signal()
@@ -2577,7 +2593,10 @@ class Scheduler(
                 release_kv_cache(req, self.tree_cache)
 
             # For mamba radix cache
-            if req.mamba_pool_idx is not None:
+            if (
+                req.mamba_pool_idx is not None
+                and self.disaggregation_mode != DisaggregationMode.DECODE
+            ):
                 release_kv_cache(req, self.tree_cache, is_insert=False)
             logger.debug(f"Abort queued request. {req.rid=}")
 

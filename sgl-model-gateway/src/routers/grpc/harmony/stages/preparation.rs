@@ -123,7 +123,6 @@ impl HarmonyPreparationStage {
         // Step 4: Store results
         ctx.state.preparation = Some(PreparationOutput {
             original_text: None,
-            routing_id: request.routing_id.clone(),
             token_ids: build_output.input_ids,
             processed_messages: None,
             tool_constraints,
@@ -204,7 +203,6 @@ impl HarmonyPreparationStage {
         // Step 4: Store results with constraint
         ctx.state.preparation = Some(PreparationOutput {
             original_text: None,
-            routing_id: request.routing_id.clone(),
             token_ids: build_output.input_ids,
             processed_messages: None,
             tool_constraints: constraint,

@@ -105,8 +105,11 @@ impl Sequence {
     }
 
     /// Append text to the sequence by encoding it
-    pub fn append_text(&mut self, input: &str) -> Result<()> {
-        let encoding = self.tokenizer.encode(input)?;
+    ///
+    /// Set `add_special_tokens` to `true` for embeddings, or `false` for chat completion
+    /// where the chat template already handles special tokens.
+    pub fn append_text(&mut self, input: &str, add_special_tokens: bool) -> Result<()> {
+        let encoding = self.tokenizer.encode(input, add_special_tokens)?;
         self.token_ids.extend(encoding.token_ids());
         Ok(())
     }
@@ -222,7 +225,7 @@ mod tests {
         let tokenizer = Arc::new(MockTokenizer::new());
         let mut seq = Sequence::new(tokenizer);
 
-        seq.append_text("Hello").unwrap();
+        seq.append_text("Hello", false).unwrap();
         assert!(!seq.is_empty());
         assert!(!seq.is_empty());
 
@@ -253,7 +256,7 @@ mod tests {
         let tokenizer = Arc::new(MockTokenizer::new());
         let mut seq = Sequence::new(tokenizer);
 
-        seq.append_text("Hello world").unwrap();
+        seq.append_text("Hello world", false).unwrap();
         assert!(!seq.is_empty());
 
         seq.clear();
@@ -268,7 +271,7 @@ mod tests {
         let tokenizer = Arc::new(MockTokenizer::new());
         let mut seq = Sequence::new(tokenizer);
 
-        seq.append_text("Test").unwrap();
+        seq.append_text("Test", false).unwrap();
         let debug_str = format!("{:?}", seq);
         assert!(debug_str.contains("Sequence"));
         assert!(debug_str.contains("token count"));

@@ -5,7 +5,10 @@ import unittest
 from types import SimpleNamespace
 
 from sglang.srt.utils import is_hip
-from sglang.test.kits.mmmu_vlm_kit import DEFAULT_MEM_FRACTION_STATIC, MMMUVLMTestBase
+from sglang.test.kits.mmmu_vlm_kit import (
+    DEFAULT_MEM_FRACTION_STATIC,
+    MMMUMultiModelTestBase,
+)
 from sglang.test.test_utils import is_in_ci
 
 _is_hip = is_hip()
@@ -20,7 +23,7 @@ else:
     ]
 
 
-class TestVLMModels(MMMUVLMTestBase):
+class TestVLMModels(MMMUMultiModelTestBase):
     def _detect_eviction_in_logs(self, log_output: str) -> tuple[bool, int]:
         """Detect if eviction events occurred in the log output."""
         eviction_keyword = "Cache eviction"
