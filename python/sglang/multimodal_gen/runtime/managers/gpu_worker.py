@@ -98,13 +98,13 @@ class GPUWorker:
                 [
                     self.pipeline.get_module("transformer"),
                     self.pipeline.get_module("transformer_2"),
-                    logger.info(
-                        f"Module {type(dit).__name__} does not support layerwise offload. Skipping."
-                    )
+                ],
+            ):
+                if isinstance(dit, OffloadableDiTMixin):
                     dit.configure_layerwise_offload(self.server_args)
                 else:
                     logger.info(
-                        "Disabling layerwise offload since current model does not support this feature"
+                        f"Module {type(dit).__name__} does not support layerwise offload. Skipping."
                     )
 
         logger.info(
