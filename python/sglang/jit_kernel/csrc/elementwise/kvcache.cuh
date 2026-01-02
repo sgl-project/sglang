@@ -20,6 +20,7 @@ struct StoreKVCacheParams {
   int64_t stride_k_bytes;
   int64_t stride_v_bytes;
   int64_t stride_cache_bytes;
+  int64_t stride_indices;
   uint32_t batch_size;
 };
 
@@ -73,12 +74,16 @@ __global__ void store_kvcache(const __grid_constant__ StoreKVCacheParams params)
   const uint32_t warp_id = blockIdx.x * kNumWarps + threadIdx.x / kWarpThreads;
   const uint32_t item_id = warp_id / kSplit;
   const uint32_t split_id = warp_id % kSplit;
-  const auto& [k_input, v_input, k_cache, v_cache, indices, stride_k, stride_v, stride_cache, batch_size] = params;
+  const auto& [
+    k_input, v_input, k_cache, v_cache, indices, // ptr
+    stride_k, stride_v, stride_cache, stride_indices, batch_size // size
+  ] = params;
   if (item_id >= batch_size) return;
 
+  const auto index_ptr = static_cast<const T*>(indices) + item_id * stride_indices;
   PDLWaitPrimary<kUsePDL>();
 
-  const int64_t index = static_cast<const T*>(indices)[item_id];
+  const auto index = *index_ptr;
   const auto k_src = pointer::offset(k_input, item_id * stride_k, split_id * kSplitSize);
   const auto v_src = pointer::offset(v_input, item_id * stride_v, split_id * kSplitSize);
   const auto k_dst = pointer::offset(k_cache, index * stride_cache, split_id * kSplitSize);
@@ -122,6 +127,7 @@ struct StoreKVCacheKernel {
     auto KS = SymbolicSize{"k_stride"};
     auto VS = SymbolicSize{"v_stride"};
     auto S = SymbolicSize{"cache_stride"};
+    auto I = SymbolicSize{"indices_stride"};
     auto dtype = SymbolicDType{};
     auto device = SymbolicDevice{};
     device.set_options<kDLCUDA>();
@@ -143,6 +149,7 @@ struct StoreKVCacheKernel {
         .verify(k_cache)
         .verify(v_cache);
     TensorMatcher({B})  //
+        .with_strides({I})
         .with_dtype<int32_t, int64_t>()
         .with_device(device)
         .verify(indices);
@@ -160,6 +167,7 @@ struct StoreKVCacheKernel {
         .stride_k_bytes = KS.unwrap() * dtype_size,
         .stride_v_bytes = VS.unwrap() * dtype_size,
         .stride_cache_bytes = S.unwrap() * dtype_size,
+        .stride_indices = I.unwrap(),
         .batch_size = static_cast<uint32_t>(B.unwrap()),
     };
     // select kernel and update num_split if needed
