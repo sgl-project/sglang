@@ -1,8 +1,7 @@
-from typing import Optional, Tuple, Union
+from typing import Tuple, Union
 
 import torch
 
-from sglang.srt.lora.utils import LoRABatchInfo
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
@@ -19,6 +18,52 @@ class BaseLoRABackend:
     def __init__(self, max_loras_per_batch: int, device: torch.device):
         self.max_loras_per_batch = max_loras_per_batch
         self.device = device
+
+    def run_lora_a_embedding(
+        self,
+        input_ids: torch.Tensor,
+        weights: torch.Tensor,
+        vocab_size: int,
+        extra_embeddings: torch.Tensor = None,
+        *args,
+        **kwargs,
+    ) -> torch.Tensor:
+        """Run LoRA A embedding lookup with CUDA graph support.
+
+        Args:
+            input_ids: token IDs with shape (s,), where s is the sum of all sequence lengths
+            weights: LoRA A embedding weights with shape (num_loras, rank, vocab_size)
+            vocab_size: base vocabulary size (tokens >= vocab_size are extra tokens)
+            extra_embeddings: extra token embeddings with shape (num_loras, num_extra_tokens, rank)
+            Only needed if there are added tokens beyond base vocabulary.
+
+        Returns:
+            result with shape (s, rank)
+        """
+        pass
+
+    def run_extra_token_embedding(
+        self,
+        input_ids: torch.Tensor,
+        output: torch.Tensor,
+        extra_embeddings: torch.Tensor,
+        vocab_size: int,
+        *args,
+        **kwargs,
+    ) -> torch.Tensor:
+        """
+        Apply extra token embeddings to output in-place.
+
+        Args:
+            input_ids: (s,) token IDs
+            output: (s, embed_dim) output tensor to be modified
+            extra_embeddings: (num_loras, num_extra_tokens, embed_dim) extra embeddings
+            vocab_size: base vocabulary size
+
+        Returns:
+            output: modified output tensor
+        """
+        raise NotImplementedError
 
     def run_lora_a_sgemm(
         self, x: torch.Tensor, weights: torch.Tensor, *args, **kwargs
@@ -97,8 +142,8 @@ class BaseLoRABackend:
 
     def init_cuda_graph_batch_info(
         self,
-        cuda_graph_batch_info: LoRABatchInfo,
         max_bs_in_cuda_graph: int,
+        num_tokens_per_bs: int,
     ):
         """Initialize the batch info for CUDA Graph mode.
 
@@ -108,6 +153,7 @@ class BaseLoRABackend:
         Args:
             cuda_graph_batch_info: the LoRABatchInfo object created in LoraManager
             max_bs_in_cuda_graph: maximum batch size for CUDA Graph mode
+            num_tokens_per_bs: number of tokens per sequence (1 for decoding, >1 for target_verify)
         """
         pass
 
@@ -117,7 +163,7 @@ class BaseLoRABackend:
         weight_indices: list[int],
         lora_ranks: list[int],
         scalings: list[float],
-        batch_info: Optional[LoRABatchInfo] = None,
+        use_cuda_graph: bool,
     ):
         """Prepare the lora weights and batch info for current forward batch.
 
@@ -129,7 +175,6 @@ class BaseLoRABackend:
             weight_indices: list of indices of lora weights to be applied for current batch
             lora_ranks: list of lora ranks corresponding to weight_indices
             scalings: list of scaling factors corresponding to weight_indices
-            batch_info: optional LoRABatchInfo object, if not provided, the backend should use its own
-                        internal batch info (e.g., self.cuda_graph_batch_info for CUDA Graph mode)
+            use_cuda_graph: whether to use CUDA Graph for this batch
         """
         pass

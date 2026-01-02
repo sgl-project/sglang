@@ -19,9 +19,12 @@ import logging
 from typing import Iterable, Optional, Set, Tuple, Union
 
 import torch
+import triton
+import triton.language as tl
 from torch import nn
 from transformers import PretrainedConfig
 
+from sglang.srt.batch_overlap.two_batch_overlap import model_forward_maybe_tbo
 from sglang.srt.distributed import (
     get_moe_expert_parallel_world_size,
     get_pp_group,
@@ -31,7 +34,6 @@ from sglang.srt.distributed import (
 )
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
-from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
     LayerScatterModes,
@@ -39,7 +41,6 @@ from sglang.srt.layers.communicator import (
 )
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
-    MergedColumnParallelLinear,
     QKVParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
@@ -63,7 +64,6 @@ from sglang.srt.model_loader.weight_utils import (
     maybe_remap_kv_scale_name,
 )
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.two_batch_overlap import model_forward_maybe_tbo
 from sglang.srt.utils import (
     BumpAllocator,
     add_prefix,
@@ -73,6 +73,164 @@ from sglang.srt.utils import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+@triton.jit
+def rmsnorm_sumsq_kernel_serial(
+    x1_ptr,  # T* [B, D]
+    x2_ptr,  # T* [B, D]
+    stride_x1,  # int
+    stride_x2,  # int
+    sum_sq_ptr,  # float* [B]
+    B,  # int
+    D1,  # int
+    D2,  # int
+    BLOCK_SIZE1: tl.constexpr,
+    BLOCK_SIZE2: tl.constexpr,
+):
+    row_id = tl.program_id(0)
+    x1_row = x1_ptr + row_id * stride_x1
+    x2_row = x2_ptr + row_id * stride_x2
+
+    offsets1 = tl.arange(0, BLOCK_SIZE1)
+    mask1 = offsets1 < D1
+    offsets2 = tl.arange(0, BLOCK_SIZE2)
+    mask2 = offsets2 < D2
+
+    x1 = tl.load(x1_row + offsets1, mask=mask1, other=0.0)
+    x2 = tl.load(x2_row + offsets2, mask=mask2, other=0.0)
+
+    x1_f32 = x1.to(tl.float32)
+    sum_sq1 = tl.sum(x1_f32 * x1_f32, axis=0)
+
+    x2_f32 = x2.to(tl.float32)
+    sum_sq2 = tl.sum(x2_f32 * x2_f32, axis=0)
+
+    tl.store(sum_sq_ptr + row_id, sum_sq1)
+    tl.store(sum_sq_ptr + row_id + B, sum_sq2)
+
+
+@triton.jit
+def rmsnorm_apply_kernel_serial(
+    x1_ptr,  # T* [B, D]
+    x2_ptr,  # T* [B, D]
+    w1_ptr,  # T* [D]
+    w2_ptr,  # T* [D]
+    sum_sq_ptr,  # float* [B]
+    out1_ptr,  # T* [B, D]
+    out2_ptr,  # T* [B, D]
+    B,  # int
+    D1,  # int
+    D2,  # int
+    stride_x1,  # int
+    stride_x2,  # int
+    tp_world,  # int
+    eps,  # float
+    BLOCK_SIZE1: tl.constexpr,
+    BLOCK_SIZE2: tl.constexpr,
+):
+    row_id = tl.program_id(0)
+    x1_row = x1_ptr + row_id * stride_x1
+    x2_row = x2_ptr + row_id * stride_x2
+    out1_row = out1_ptr + row_id * stride_x1
+    out2_row = out2_ptr + row_id * stride_x2
+
+    sum_sq1 = tl.load(sum_sq_ptr + row_id)
+    sum_sq2 = tl.load(sum_sq_ptr + row_id + B)
+    inv_rms1 = tl.rsqrt(sum_sq1 / D1 / tp_world + eps)
+    inv_rms2 = tl.rsqrt(sum_sq2 / D2 / tp_world + eps)
+
+    offsets1 = tl.arange(0, BLOCK_SIZE1)
+    offsets2 = tl.arange(0, BLOCK_SIZE2)
+
+    mask1 = offsets1 < D1
+    mask2 = offsets2 < D2
+
+    x1 = tl.load(x1_row + offsets1, mask=mask1, other=0.0)
+    w1 = tl.load(w1_ptr + offsets1, mask=mask1, other=1.0)
+    x2 = tl.load(x2_row + offsets2, mask=mask2, other=0.0)
+    w2 = tl.load(w2_ptr + offsets2, mask=mask2, other=1.0)
+
+    out1 = (x1.to(tl.float32) * inv_rms1 * w1.to(tl.float32)).to(x1.dtype)
+    out2 = (x2.to(tl.float32) * inv_rms2 * w2.to(tl.float32)).to(x2.dtype)
+    tl.store(out1_row + offsets1, out1, mask=mask1)
+    tl.store(out2_row + offsets2, out2, mask=mask2)
+
+
+def rms_sumsq_serial(x1: torch.Tensor, x2: torch.Tensor) -> torch.Tensor:
+    assert x1.is_cuda and x2.is_cuda
+    B, D1 = x1.shape
+    B2, D2 = x2.shape
+    assert B == B2
+
+    stride_x1 = x1.stride(0)
+    stride_x2 = x2.stride(0)
+
+    sum_sq = torch.empty(B + B2, device=x1.device, dtype=torch.float32)
+
+    BLOCK_SIZE1 = triton.next_power_of_2(D1)
+    BLOCK_SIZE2 = triton.next_power_of_2(D2)
+
+    grid = (B,)
+
+    rmsnorm_sumsq_kernel_serial[grid](
+        x1,
+        x2,
+        stride_x1,
+        stride_x2,
+        sum_sq,
+        B,
+        D1,
+        D2,
+        BLOCK_SIZE1,
+        BLOCK_SIZE2,
+    )
+    return sum_sq
+
+
+def rms_apply_serial(
+    x1: torch.Tensor,
+    x2: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    sum_sq: torch.Tensor,
+    tp_world: int = 1,
+    eps: float = 1e-5,
+) -> torch.Tensor:
+    assert x1.is_cuda and x2.is_cuda and w1.is_cuda and w2.is_cuda and sum_sq.is_cuda
+    B, D1 = x1.shape
+    B2, D2 = x2.shape
+    assert B == B2
+
+    stride_x1 = x1.stride(0)
+    stride_x2 = x2.stride(0)
+    out1 = torch.empty(B, D1, device=x1.device, dtype=x1.dtype)
+    out2 = torch.empty(B, D2, device=x2.device, dtype=x2.dtype)
+
+    BLOCK_SIZE1 = triton.next_power_of_2(D1)
+    BLOCK_SIZE2 = triton.next_power_of_2(D2)
+
+    grid = (B,)
+
+    rmsnorm_apply_kernel_serial[grid](
+        x1,
+        x2,
+        w1,
+        w2,
+        sum_sq,
+        out1,
+        out2,
+        B,
+        D1,
+        D2,
+        stride_x1,
+        stride_x2,
+        tp_world,
+        eps,
+        BLOCK_SIZE1,
+        BLOCK_SIZE2,
+    )
+    return out1, out2
 
 
 class MiniMaxM2RMSNormTP(nn.Module):
@@ -126,39 +284,29 @@ class MiniMaxM2RMSNormTP(nn.Module):
 
         return x
 
+    @staticmethod
+    @torch.compile(dynamic=True, backend=get_compiler_backend())
+    def forward_qk(
+        q_norm: "MiniMaxM2RMSNormTP",
+        k_norm: "MiniMaxM2RMSNormTP",
+        q: torch.Tensor,
+        k: torch.Tensor,
+    ) -> torch.Tensor:
+        sum_sq = rms_sumsq_serial(q, k)
+        if q_norm.tp_world > 1:
+            sum_sq = tensor_model_parallel_all_reduce(sum_sq)
 
-class MiniMaxM2MLP(nn.Module):
-    def __init__(
-        self,
-        hidden_size: int,
-        intermediate_size: int,
-        quant_config: Optional[QuantizationConfig] = None,
-        prefix: str = "mlp",
-    ) -> None:
-        super().__init__()
-
-        self.gate_up_proj = MergedColumnParallelLinear(
-            hidden_size,
-            [intermediate_size] * 2,
-            bias=False,
-            quant_config=quant_config,
-            prefix=add_prefix("gate_up_proj", prefix),
+        q, k = rms_apply_serial(
+            q,
+            k,
+            q_norm.weight,
+            k_norm.weight,
+            sum_sq,
+            q_norm.tp_world,
+            q_norm.variance_epsilon,
         )
-        self.down_proj = RowParallelLinear(
-            intermediate_size,
-            hidden_size,
-            bias=False,
-            quant_config=quant_config,
-            prefix=add_prefix("down_proj", prefix),
-        )
-        self.act_fn = SiluAndMul()
-        return
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        gate_up, _ = self.gate_up_proj(x)
-        x = self.act_fn(gate_up)
-        x, _ = self.down_proj(x)
-        return x
+        return q, k
 
 
 class MiniMaxM2MoE(nn.Module):
@@ -203,9 +351,6 @@ class MiniMaxM2MoE(nn.Module):
             top_k=config.num_experts_per_tok,
             renormalize=True,
             scoring_func=config.scoring_func,
-            use_grouped_topk=True,  # TODO: Use "grouped top-k" flag only for hardcoded sigmoid scoring
-            num_expert_group=1,
-            topk_group=1,
             correction_bias=self.e_score_correction_bias,
             routed_scaling_factor=1.0,
         )
@@ -258,7 +403,7 @@ class MiniMaxM2MoE(nn.Module):
         if hidden_states.shape[0] > 0:
             # router_logits: (num_tokens, n_experts)
             router_logits, _ = self.gate(hidden_states.to(torch.float32))
-            topk_weights, topk_idx, _ = self.topk(
+            topk_output = self.topk(
                 hidden_states,
                 router_logits,
                 num_token_non_padded=forward_batch.num_token_non_padded,
@@ -267,14 +412,10 @@ class MiniMaxM2MoE(nn.Module):
                 ),
             )
         else:
-            topk_weights, topk_idx, _ = self.topk.empty_topk_output(
-                hidden_states.shape[0], self.top_k
-            )
+            topk_output = self.topk.empty_topk_output(device=hidden_states.device)
         final_hidden_states = self.experts(
             hidden_states=hidden_states,
-            topk_idx=topk_idx,
-            topk_weights=topk_weights,
-            forward_batch=forward_batch,
+            topk_output=topk_output,
         )
 
         return final_hidden_states
@@ -480,8 +621,11 @@ class MiniMaxM2Attention(nn.Module):
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         if self.use_qk_norm:
-            q = self.q_norm(q.contiguous())
-            k = self.k_norm(k.contiguous())
+            # q = self.q_norm(q.contiguous())
+            # k = self.k_norm(k.contiguous())
+            q, k = MiniMaxM2RMSNormTP.forward_qk(
+                self.q_norm, self.k_norm, q.contiguous(), k.contiguous()
+            )
         else:
             q, k = q.contiguous(), k.contiguous()
         q, k = self.rotary_emb(positions, q, k)
@@ -559,11 +703,13 @@ class MiniMaxM2DecoderLayer(nn.Module):
         )
 
         is_previous_layer_sparse = True
+        is_next_layer_sparse = True
         self.layer_scatter_modes = LayerScatterModes.init_new(
             layer_id=layer_id,
             num_layers=config.num_hidden_layers,
             is_layer_sparse=self.is_layer_sparse,
             is_previous_layer_sparse=is_previous_layer_sparse,
+            is_next_layer_sparse=is_next_layer_sparse,
         )
 
         self.layer_communicator = LayerCommunicator(
@@ -820,6 +966,9 @@ class MiniMaxM2ForCausalLM(nn.Module):
             ]  # Specific layers for EAGLE3 support
         else:
             self.model.layers_to_capture = [val + 1 for val in layer_ids]
+
+    def get_embed_and_head(self):
+        return self.model.embed_tokens.weight, self.lm_head.weight
 
     @torch.no_grad()
     def forward(

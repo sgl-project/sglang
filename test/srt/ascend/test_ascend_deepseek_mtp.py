@@ -1,16 +1,14 @@
-import os
 import unittest
 from types import SimpleNamespace
 from urllib.parse import urlparse
 
+from sglang.srt.environ import envs
 from sglang.srt.utils import kill_process_tree
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
 from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
-    is_in_ci,
     popen_launch_server,
-    run_bench_offline_throughput,
 )
 
 TEST_MODEL_MATRIX = {
@@ -35,7 +33,7 @@ class TestAscendDeepSeekMTP(CustomTestCase):
             "--attention-backend",
             "ascend",
             "--quantization",
-            "w8a8_int8",
+            "modelslim",
             "--mem-fraction-static",
             0.8,
             "--disable-radix-cache",
@@ -43,6 +41,9 @@ class TestAscendDeepSeekMTP(CustomTestCase):
             32768,
             "--tp-size",
             16,
+            "--dp-size",
+            2,
+            "--enable-dp-attention",
             "--speculative-algorithm",
             "NEXTN",
             "--speculative-num-steps",
@@ -53,10 +54,9 @@ class TestAscendDeepSeekMTP(CustomTestCase):
             2,
         ]
 
-        cls.extra_envs = {
-            "SGLANG_NPU_USE_MLAPO": "1",
-        }
-        os.environ.update(cls.extra_envs)
+        envs.SGLANG_NPU_USE_MLAPO.set(True)
+        envs.SGLANG_ENABLE_SPEC_V2.set(True)
+        envs.SGLANG_ENABLE_OVERLAP_PLAN_STREAM.set(True)
 
     def test_a_gsm8k(self):
         for model in self.models:
@@ -66,7 +66,7 @@ class TestAscendDeepSeekMTP(CustomTestCase):
                 process = popen_launch_server(
                     model,
                     self.base_url,
-                    timeout=1500,
+                    timeout=2400,
                     other_args=[
                         *self.common_args,
                     ],
@@ -90,26 +90,6 @@ class TestAscendDeepSeekMTP(CustomTestCase):
                     )
                 finally:
                     kill_process_tree(process.pid)
-
-    def test_b_throughput(self):
-        for model in self.models:
-            with self.subTest(model=model):
-                print(f"##=== Testing throughput: {model} ===##")
-
-                output_throughput = run_bench_offline_throughput(
-                    model,
-                    [
-                        *self.common_args,
-                    ],
-                )
-
-                print(f"##=== {model} throughput: {output_throughput} ===##")
-
-                if is_in_ci():
-                    self.assertGreater(
-                        output_throughput,
-                        TEST_MODEL_MATRIX[model]["output_throughput"],
-                    )
 
 
 if __name__ == "__main__":

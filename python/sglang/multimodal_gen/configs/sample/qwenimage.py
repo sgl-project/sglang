@@ -3,16 +3,35 @@
 # SPDX-License-Identifier: Apache-2.0
 from dataclasses import dataclass
 
-from sglang.multimodal_gen.configs.sample.base import SamplingParams
+from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 
 
 @dataclass
 class QwenImageSamplingParams(SamplingParams):
-    # Video parameters
-    # height: int = 1024
-    # width: int = 1024
     negative_prompt: str = " "
     num_frames: int = 1
     # Denoising stage
     guidance_scale: float = 4.0
     num_inference_steps: int = 50
+
+
+@dataclass
+class QwenImageEditPlusSamplingParams(QwenImageSamplingParams):
+    # Denoising stage
+    guidance_scale: float = 4.0
+    # true_cfg_scale: float = 4.0
+    num_inference_steps: int = 40
+
+
+@dataclass
+class QwenImageLayeredSamplingParams(QwenImageSamplingParams):
+    # num_frames: int = 4
+    height: int = 640
+    width: int = 640
+    prompt: str = " "
+    negative_prompt: str = " "
+
+    guidance_scale: float = 4.0
+    num_inference_steps: int = 50
+    cfg_normalize: bool = True
+    use_en_prompt: bool = True

@@ -6,7 +6,16 @@ python3 -m unittest test_vision_openai_server.TestOpenAIVisionServer.test_multi_
 
 import unittest
 
+import openai
 from test_vision_openai_server_common import *
+from test_vision_openai_server_common import (  # DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,; DEFAULT_URL_FOR_TEST,; IMAGE_MAN_IRONING_URL,; popen_launch_server,
+    AudioOpenAITestMixin,
+    CustomTestCase,
+    ImageOpenAITestMixin,
+    OmniOpenAITestMixin,
+    TestOpenAIMLLMServerBase,
+    VideoOpenAITestMixin,
+)
 
 
 class TestLlavaServer(ImageOpenAITestMixin):
@@ -153,6 +162,10 @@ class TestQwen2AudioServer(AudioOpenAITestMixin):
 class TestDeepseekOCRServer(TestOpenAIMLLMServerBase):
     model = "deepseek-ai/DeepSeek-OCR"
     trust_remote_code = False
+    extra_args = [
+        "--mem-fraction-static=0.70",
+        "--cuda-graph-max-bs=4",
+    ]
 
     def verify_single_image_response_for_ocr(self, response):
         """Verify DeepSeek-OCR grounding output with coordinates"""
@@ -206,13 +219,15 @@ class TestDeepseekOCRServer(TestOpenAIMLLMServerBase):
         self.verify_single_image_response_for_ocr(response)
 
 
+# Delete the mixin classes so that they are not collected by pytest
+del (
+    TestOpenAIMLLMServerBase,
+    ImageOpenAITestMixin,
+    VideoOpenAITestMixin,
+    AudioOpenAITestMixin,
+    OmniOpenAITestMixin,
+)
+
+
 if __name__ == "__main__":
-    # Note: Cannot delete mixin classes imported via * since they're not in local scope
-    # del (
-    #     TestOpenAIMLLMServerBase,
-    #     ImageOpenAITestMixin,
-    #     VideoOpenAITestMixin,
-    #     AudioOpenAITestMixin,
-    #     OmniOpenAITestMixin,
-    # )
     unittest.main()
