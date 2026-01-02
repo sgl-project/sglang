@@ -300,6 +300,9 @@ class ModelConfig:
         if is_draft_model and self.hf_config.architectures[0] == "Qwen3NextForCausalLM":
             self.hf_config.architectures[0] = "Qwen3NextForCausalLMMTP"
             self.hf_config.num_nextn_predict_layers = 1
+        if is_draft_model and self.hf_config.architectures[0] == "ExaoneMoEForCausalLM":
+            self.hf_config.architectures[0] = "ExaoneMoEForCausalLMMTP"
+            self.hf_config.num_nextn_predict_layers = 1
 
     def _derive_hybrid_model(self, hybrid_kvcache_ratio: Optional[float] = None):
         # Use self.context_len after it has been initialized to prevent using context_len which may be None.
