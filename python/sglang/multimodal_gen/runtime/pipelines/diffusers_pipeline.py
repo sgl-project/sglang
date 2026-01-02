@@ -367,6 +367,7 @@ class DiffusersPipeline(ComposedPipelineBase):
         self._stages: list[PipelineStage] = []
         self._stage_name_mapping: dict[str, PipelineStage] = {}
         self.modules: dict[str, Any] = {}
+        self.memory_usages: dict[str, float] = {}
         self.post_init_called = False
         self.executor = executor or SyncExecutor(server_args=server_args)
 
