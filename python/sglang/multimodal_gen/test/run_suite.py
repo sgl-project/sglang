@@ -198,7 +198,9 @@ def run_pytest(files, filter_expr=None):
             and "AssertionError" in full_output
         )
 
-        is_flaky_ci_assertion = "SafetensorError" in full_output
+        is_flaky_ci_assertion = (
+            "SafetensorError" in full_output or "FileNotFoundError" in full_output
+        )
 
         is_oom_error = (
             "out of memory" in full_output.lower()

@@ -151,6 +151,8 @@ class DiffusionServerArgs:
     ring_degree: int | None = None
     # LoRA
     lora_path: str | None = None  # LoRA adapter path (HF repo or local path)
+    # misc
+    enable_warmup: bool = False
 
     dit_layerwise_offload: bool = False
     enable_cache_dit: bool = False
@@ -356,6 +358,13 @@ ONE_GPU_CASES_A: list[DiffusionTestCase] = [
             modality="image",
             warmup_text=1,
             warmup_edit=0,
+        ),
+        T2I_sampling_params,
+    ),
+    DiffusionTestCase(
+        "zimage_image_t2i_warmup",
+        DiffusionServerArgs(
+            model_path="Tongyi-MAI/Z-Image-Turbo", modality="image", enable_warmup=True
         ),
         T2I_sampling_params,
     ),

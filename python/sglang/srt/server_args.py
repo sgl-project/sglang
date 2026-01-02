@@ -68,7 +68,6 @@ from sglang.utils import is_in_ci
 
 logger = logging.getLogger(__name__)
 
-
 # Define constants
 SAMPLING_BACKEND_CHOICES = {"flashinfer", "pytorch", "ascend"}
 LOAD_FORMAT_CHOICES = [
@@ -149,6 +148,8 @@ GRAMMAR_BACKEND_CHOICES = ["xgrammar", "outlines", "llguidance", "none"]
 DETERMINISTIC_ATTENTION_BACKEND_CHOICES = ["flashinfer", "fa3", "triton"]
 
 RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND = ["fa3", "triton"]
+
+NSA_PREFILL_CP_SPLIT_CHOICES = ["in-seq-split", "round-robin-split"]
 
 DEFAULT_LORA_EVICTION_POLICY = "lru"
 
@@ -576,6 +577,7 @@ class ServerArgs:
     enable_attn_tp_input_scattered: bool = False
     # Context parallelism used in the long sequence prefill phase of DeepSeek v3.2
     enable_nsa_prefill_context_parallel: bool = False
+    nsa_prefill_cp_mode: str = "in-seq-split"
     enable_fused_qk_norm_rope: bool = False
     enable_precise_embedding_interpolation: bool = False
 
@@ -1063,14 +1065,26 @@ class ServerArgs:
                     logger.info("Use nsa attention backend for DeepSeek NSA.")
 
                 if not is_npu():  # CUDA GPU
-                    self.enable_dp_attention = True
-                    logger.warning("DP attention is enabled for DeepSeek NSA.")
                     if self.enable_nsa_prefill_context_parallel:
-                        # TODO Supports moe_dense_tp_size != 1, kv cache dtype = "fp8",moe_a2a_backend non-deepep and cross-machine operation .
-                        self.moe_dense_tp_size = 1
-                        self.moe_a2a_backend = "deepep"
-                        self.ep_size = self.tp_size
-                        self.kv_cache_dtype = "bf16"
+                        logger.warning(
+                            f"Context parallel feature is still under experiment. It has only been verified on Hopper platform."
+                        )
+                        if self.nsa_prefill_cp_mode == "in-seq-split":
+                            # TODO Supports moe_dense_tp_size != 1, kv cache dtype = "fp8",moe_a2a_backend non-deepep and cross-machine operation .
+                            self.enable_dp_attention = True
+                            self.moe_dense_tp_size = 1
+                            self.moe_a2a_backend = "deepep"
+                            self.ep_size = self.tp_size
+                            self.kv_cache_dtype = "bf16"
+                            logger.warning(
+                                f"For in-seq split mode, we have the following restrictions: moe_dense_tp_size == 1, moe_a2a_backend == deepep, ep_size == tp_size, kv_cache_dtype == bf16, batch_size == 1"
+                            )
+                        else:
+                            self.enable_dp_attention = True
+                            self.moe_dense_tp_size = 1
+                            assert (
+                                self.dp_size == 1
+                            ), "For round-robin split mode, dp attention is not supported."
                         assert (
                             self.tp_size == 8
                         ), "Current multi-machine CP support suffers from precision issues. So context parallel only support Single machine(tp_size == 8)"
@@ -2324,6 +2338,9 @@ class ServerArgs:
                 "Enable deterministic inference because of rl_on_policy_target."
             )
             self.enable_deterministic_inference = True
+
+            # For VLM
+            os.environ["SGLANG_VLM_CACHE_SIZE_MB"] = "0"
             # TODO remove this environment variable as a whole
             os.environ["SGLANG_ENABLE_DETERMINISTIC_INFERENCE"] = "1"
 
@@ -4217,6 +4234,14 @@ class ServerArgs:
             help="Enable context parallelism used in the long sequence prefill phase of DeepSeek v3.2.",
         )
         parser.add_argument(
+            "--nsa-prefill-cp-mode",
+            type=str,
+            default=ServerArgs.nsa_prefill_cp_mode,
+            choices=NSA_PREFILL_CP_SPLIT_CHOICES,
+            help="Token splitting mode for the prefill phase of DeepSeek v3.2 under context parallelism. Optional values: 'in-seq-split' (default), 'round-robin-split'. "
+            "'round-robin-split' distributes tokens across ranks based on token_idx % cp_size. It supports multi-batch prefill, fused MoE, and FP8 KV cache.",
+        )
+        parser.add_argument(
             "--enable-fused-qk-norm-rope",
             action="store_true",
             help="Enable fused qk normalization and rope rotary embedding.",
@@ -4999,30 +5024,19 @@ def prepare_server_args(argv: List[str]) -> ServerArgs:
     Returns:
         The server arguments.
     """
-    # Import here to avoid circular imports
-    from sglang.srt.server_args_config_parser import ConfigArgumentMerger
+    parser = argparse.ArgumentParser()
+    ServerArgs.add_cli_args(parser)
 
     # Check for config file and merge arguments if present
     if "--config" in argv:
+        # Import here to avoid circular imports
+        from sglang.srt.server_args_config_parser import ConfigArgumentMerger
+
         # Extract boolean actions from the parser to handle them correctly
-        parser = argparse.ArgumentParser()
-        ServerArgs.add_cli_args(parser)
-
-        # Get boolean action destinations
-        boolean_actions = []
-        for action in parser._actions:
-            if hasattr(action, "dest") and hasattr(action, "action"):
-                if action.action in ["store_true", "store_false"]:
-                    boolean_actions.append(action.dest)
-
-        # Merge config file arguments with CLI arguments
-        config_merger = ConfigArgumentMerger(boolean_actions=boolean_actions)
+        config_merger = ConfigArgumentMerger(parser)
         argv = config_merger.merge_config_with_args(argv)
 
-    parser = argparse.ArgumentParser()
-    ServerArgs.add_cli_args(parser)
     raw_args = parser.parse_args(argv)
-
     return ServerArgs.from_cli_args(raw_args)
 
 
@@ -5210,4 +5224,4 @@ def auto_choose_speculative_params(self: ServerArgs):
         return (5, 4, 8)
     else:
         # The default value for all other models
-        return (5, 4, 8)
+        return (3, 1, 4)
