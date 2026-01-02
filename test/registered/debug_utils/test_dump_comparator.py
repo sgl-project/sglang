@@ -6,11 +6,10 @@ from pathlib import Path
 
 import torch
 
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-# TODO it needs 0 gpu
-register_cuda_ci(est_time=60, suite="nightly-1-gpu", nightly=True)
+register_cpu_ci(est_time=60, suite="default", nightly=True)
 
 
 class TestDumpComparator(CustomTestCase):
