@@ -11,12 +11,11 @@ import torch.nn as nn
 import triton
 import triton.language as tl
 
-from sglang.srt.custom_op import CustomOp
+from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
-    get_compiler_backend,
     is_cpu,
     is_cuda,
     is_hip,
@@ -89,7 +88,7 @@ def _apply_rotary_emb(
         return torch.stack((o1, o2), dim=-1).flatten(-2)
 
 
-class RotaryEmbedding(CustomOp):
+class RotaryEmbedding(MultiPlatformOp):
     """Original rotary positional embedding."""
 
     def __init__(
@@ -183,7 +182,7 @@ class RotaryEmbedding(CustomOp):
             return
 
         # Align to reduce realloc frequency
-        align = envs.SGLANG_ROPE_CACHE_ALIGN.value
+        align = envs.SGLANG_ROPE_CACHE_ALIGN.get()
         new_len = ((needed_max_pos + align) // align) * align
         device = self.cos_sin_cache.device
         dtype = self.cos_sin_cache.dtype
@@ -208,16 +207,42 @@ class RotaryEmbedding(CustomOp):
         )
 
     def get_cos_sin_with_position(self, positions):
-        cos_sin = self.cos_sin_cache.index_select(0, positions.flatten())
-        last_dim = cos_sin.size()[-1]
-        cos, sin = (
-            cos_sin.reshape(-1, 2, last_dim // 2).repeat(1, 1, 2).chunk(2, dim=-2)
-        )
-        # BSNH
-        self.position_cos, self.position_sin = (
-            cos.view(-1, 1, 1, last_dim).contiguous(),
-            sin.view(-1, 1, 1, last_dim).contiguous(),
-        )
+        assert positions.ndim == 1 or positions.ndim == 2
+        if positions.ndim == 1:
+            cos_sin = self.cos_sin_cache.index_select(0, positions.flatten())
+            last_dim = cos_sin.size()[-1]
+            cos, sin = (
+                cos_sin.reshape(-1, 2, last_dim // 2).repeat(1, 1, 2).chunk(2, dim=-2)
+            )
+            # BSNH
+            self.position_cos, self.position_sin = (
+                cos.view(-1, 1, 1, last_dim).contiguous(),
+                sin.view(-1, 1, 1, last_dim).contiguous(),
+            )
+        else:
+            assert self.mrope_section
+            cos_sin = self.cos_sin_cache[positions]
+            last_dim = cos_sin.size()[-1]
+            cos, sin = cos_sin.chunk(2, dim=-1)
+            if self.mrope_interleaved:
+                cos = apply_interleaved_rope(cos, self.mrope_section)
+                sin = apply_interleaved_rope(sin, self.mrope_section)
+            else:
+                cos = torch.cat(
+                    [m[i] for i, m in enumerate(cos.split(self.mrope_section, dim=-1))],
+                    dim=-1,
+                )
+                sin = torch.cat(
+                    [m[i] for i, m in enumerate(sin.split(self.mrope_section, dim=-1))],
+                    dim=-1,
+                )
+            self.position_cos = cos.repeat(1, 2).view(-1, 1, 1, last_dim).contiguous()
+            self.position_sin = sin.repeat(1, 2).view(-1, 1, 1, last_dim).contiguous()
+
+    def get_cos_sin(self, seqlen: int) -> tuple[torch.Tensor, torch.Tensor]:
+        cos_sin = self.cos_sin_cache[:seqlen]
+        cos, sin = cos_sin.chunk(2, dim=-1)
+        return cos, sin
 
     def forward_native(
         self,
@@ -526,13 +551,13 @@ def _yarn_find_correction_range(
     dim: int,
     base: float = 10000,
     max_position_embeddings: int = 2048,
+    truncate: bool = True,
 ) -> Tuple[int, int]:
-    low = math.floor(
-        _yarn_find_correction_dim(low_rot, dim, base, max_position_embeddings)
-    )
-    high = math.ceil(
-        _yarn_find_correction_dim(high_rot, dim, base, max_position_embeddings)
-    )
+    low = _yarn_find_correction_dim(low_rot, dim, base, max_position_embeddings)
+    high = _yarn_find_correction_dim(high_rot, dim, base, max_position_embeddings)
+    if truncate:
+        low = math.floor(low)
+        high = math.ceil(high)
     return max(low, 0), min(high, dim - 1)  # Clamp values just in case
 
 
@@ -573,12 +598,14 @@ class YaRNScalingRotaryEmbedding(RotaryEmbedding):
         attn_factor: float = 1,
         beta_fast: int = 32,
         beta_slow: int = 1,
+        truncate: bool = True,
     ) -> None:
         self.scaling_factor = scaling_factor
         self.extrapolation_factor = extrapolation_factor
         self.attn_factor = attn_factor
         self.beta_fast = beta_fast
         self.beta_slow = beta_slow
+        self.truncate = truncate
         # Get n-d magnitude scaling corrected for interpolation
         self.mscale = float(_yarn_get_mscale(self.scaling_factor) * attn_factor)
         super().__init__(
@@ -598,6 +625,7 @@ class YaRNScalingRotaryEmbedding(RotaryEmbedding):
             self.rotary_dim,
             self.base,
             self.max_position_embeddings,
+            self.truncate,
         )
         # Get n-d rotational scaling corrected for extrapolation
         inv_freq_mask = (
@@ -1430,6 +1458,9 @@ class MRotaryEmbedding(RotaryEmbedding):
                     f"Corrected mrope_section: {self.mrope_section} (sum={sum(self.mrope_section)})"
                 )
 
+        if get_global_server_args().rl_on_policy_target is not None:
+            self._forward_method = self.forward_native
+
     def _match_cos_sin_cache_dtype(self, query: torch.Tensor) -> None:
         # __setattr__ in nn.Module (called by `self.cos_sin_cache = ...`)
         # is expensive, so avoid calling it if possible
@@ -1439,8 +1470,7 @@ class MRotaryEmbedding(RotaryEmbedding):
         ):
             self.cos_sin_cache = self.cos_sin_cache.to(query.device, dtype=query.dtype)
 
-    @torch.compile(dynamic=True, backend=get_compiler_backend())
-    def _forward_native(
+    def forward_native(
         self,
         positions: torch.Tensor,
         query: torch.Tensor,
@@ -1497,7 +1527,7 @@ class MRotaryEmbedding(RotaryEmbedding):
         key = torch.cat((key_rot, key_pass), dim=-1).reshape(key_shape)
         return query, key
 
-    def forward(
+    def forward_cuda(
         self,
         positions: torch.Tensor,
         query: torch.Tensor,
@@ -1514,14 +1544,12 @@ class MRotaryEmbedding(RotaryEmbedding):
         """
         assert positions.ndim == 1 or positions.ndim == 2
 
-        if positions.ndim == 2 and self.mrope_section and _is_cuda:
-            return self._forward_triton(positions, query, key)
-        elif _is_npu:
-            return self._forward_npu(positions, query, key)
-        else:
-            return self._forward_native(positions, query, key)
+        # Use Triton kernel for multimodal (2D positions) with mrope
+        if positions.ndim == 2 and self.mrope_section:
+            return self.forward_triton(positions, query, key)
+        return self.forward_native(positions, query, key, fused_set_kv_buffer_arg)
 
-    def _forward_triton(
+    def forward_triton(
         self,
         positions: torch.Tensor,
         query: torch.Tensor,
@@ -1542,15 +1570,19 @@ class MRotaryEmbedding(RotaryEmbedding):
         )
         return query, key
 
-    def _forward_npu(
+    def forward_npu(
         self,
         positions: torch.Tensor,
         query: torch.Tensor,
         key: torch.Tensor,
+        fused_set_kv_buffer_arg: Optional[FusedSetKVBufferArg] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # TODO: remove this when npu_mrope supports QNumHeads * QHeadSize > 4096
+        assert (
+            fused_set_kv_buffer_arg is None
+        ), "fused_set_kv_buffer_arg is not supported for npu implementation"
         if query.shape[1] > 4096:
-            return self._forward_native(positions, query, key)
+            return self.forward_native(positions, query, key, fused_set_kv_buffer_arg)
         rotary_mode = "half"
         if self.is_neox_style:
             rotary_mode = "half"
@@ -2290,7 +2322,7 @@ class MRotaryEmbedding(RotaryEmbedding):
         return llm_pos_ids
 
 
-class DualChunkRotaryEmbedding(CustomOp):
+class DualChunkRotaryEmbedding(MultiPlatformOp):
     """Rotary positional embedding for Dual Chunk Attention."""
 
     def __init__(
@@ -2643,6 +2675,7 @@ def get_rope(
                 if k
                 in ("extrapolation_factor", "attn_factor", "beta_fast", "beta_slow")
             }
+            extra_kwargs["truncate"] = rope_scaling.get("truncate", True)
             rotary_emb = YaRNScalingRotaryEmbedding(
                 head_size,
                 rotary_dim,

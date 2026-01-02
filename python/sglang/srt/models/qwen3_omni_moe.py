@@ -614,7 +614,10 @@ class Qwen3OmniMoeForConditionalGeneration(PreTrainedModel):
                             and name_mapped not in params_dict
                         ):
                             continue
-                        param = params_dict[name_mapped]
+                        if name_mapped in params_dict.keys():
+                            param = params_dict[name_mapped]
+                        else:
+                            continue
                         # We should ask the weight loader to return success or
                         # not here since otherwise we may skip experts with
                         # # other available replicas.

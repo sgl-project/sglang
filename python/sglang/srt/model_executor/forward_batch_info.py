@@ -52,6 +52,7 @@ from sglang.srt.layers.dp_attention import (
     set_dp_buffer_len,
     set_is_extend_in_batch,
 )
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import get_compiler_backend, is_npu, support_triton
 from sglang.srt.utils.common import ceil_align
 
@@ -141,7 +142,7 @@ class ForwardMode(IntEnum):
         )
 
     def is_draft_extend_v2(self):
-        # For fixed shape logits output in v2 eagle worker
+        # For fixed shape logits output in eagle v2 worker
         return self == ForwardMode.DRAFT_EXTEND_V2
 
     def is_extend_or_draft_extend_or_mixed(self, include_draft_extend_v2: bool = False):
@@ -215,6 +216,10 @@ def compute_local_num_token_non_padded(
     attn_tp_rank = get_attention_tp_rank()
     attn_tp_size = get_attention_tp_size()
     tokens_per_rank = num_tokens_per_dp // attn_tp_size
+
+    # Make sure global_num_token_non_padded is tensor so torch.clamp doesn't break
+    if isinstance(global_num_token_non_padded, int):
+        global_num_token_non_padded = torch.tensor(global_num_token_non_padded)
 
     return torch.clamp(
         global_num_token_non_padded - tokens_per_rank * attn_tp_rank,
@@ -346,6 +351,7 @@ class ForwardBatch:
     attn_backend: AttentionBackend = None
 
     # For DP attention
+    original_global_num_tokens_cpu: Optional[List[int]] = None
     global_num_tokens_cpu: Optional[List[int]] = None
     global_num_tokens_gpu: Optional[torch.Tensor] = None
     # Has to be None when cuda graph is captured.
@@ -391,6 +397,9 @@ class ForwardBatch:
     # Record the split metadata of the sequence number of NSA context parallels.
     nsa_cp_metadata: Optional[NSAContextParallelMetadata] = None
 
+    # For hidden states before normal
+    return_hidden_states_before_norm: bool = False
+
     @classmethod
     def init_new(
         cls,
@@ -434,6 +443,7 @@ class ForwardBatch:
             token_type_ids=batch.token_type_ids,
             tbo_split_seq_index=batch.tbo_split_seq_index,
             dimensions=batch.dimensions,
+            return_hidden_states_before_norm=batch.return_hidden_states_before_norm,
         )
         device = model_runner.device
 
@@ -462,6 +472,7 @@ class ForwardBatch:
                 global_num_tokens = batch.global_num_tokens
                 global_num_tokens_for_logprob = batch.global_num_tokens_for_logprob
 
+            ret.original_global_num_tokens_cpu = batch.global_num_tokens
             ret.global_num_tokens_cpu = global_num_tokens
             ret.global_num_tokens_gpu = torch.tensor(
                 global_num_tokens, dtype=torch.int64
@@ -539,14 +550,15 @@ class ForwardBatch:
         from sglang.srt.utils.common import require_mlp_tp_gather
 
         dp_rank = get_attention_dp_rank()
+        assert self.global_num_tokens_cpu is not None
 
         if require_mlp_tp_gather(server_args):
-            num_tokens_per_dp = self.global_num_tokens_gpu[dp_rank]
+            num_tokens_per_dp = self.global_num_tokens_cpu[dp_rank]
         else:
-            num_tokens_per_dp = self.global_num_tokens_gpu[0]
+            num_tokens_per_dp = self.global_num_tokens_cpu[0]
 
         self.num_token_non_padded = compute_local_num_token_non_padded(
-            global_num_token_non_padded=self.num_token_non_padded,
+            global_num_token_non_padded=self.num_token_non_padded_cpu,
             num_tokens_per_dp=num_tokens_per_dp,
         )
 
@@ -679,7 +691,10 @@ class ForwardBatch:
             mm_input = batch.multimodal_inputs[batch_idx]
             if self.forward_mode.is_decode():
                 # 3 * N
-                if mm_input is None:
+                if (
+                    mm_input is None
+                    or get_global_server_args().rl_on_policy_target is not None
+                ):
                     mrope_positions_list[batch_idx] = torch.full(
                         (3, 1),
                         self.seq_lens_cpu[batch_idx] - 1,
@@ -696,7 +711,10 @@ class ForwardBatch:
                     batch.extend_seq_lens[batch_idx],
                     batch.extend_prefix_lens[batch_idx],
                 )
-                if mm_input is None:
+                if (
+                    mm_input is None
+                    or get_global_server_args().rl_on_policy_target is not None
+                ):
                     # text only
                     mrope_positions = torch.tensor(
                         [
