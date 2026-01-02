@@ -11,7 +11,6 @@ import torch.multiprocessing as mp
 
 from sglang.test.test_utils import CustomTestCase
 
-
 # TODO it needs 0 gpu
 register_cuda_ci(est_time=60, suite="nightly-1-gpu", nightly=True)
 
@@ -22,7 +21,9 @@ class TestDumperPureFunctions(CustomTestCase):
 
         self.assertIsNone(get_truncated_value(None))
         self.assertEqual(get_truncated_value(42), 42)
-        self.assertEqual(len(get_truncated_value((torch.randn(10), torch.randn(20)))), 2)
+        self.assertEqual(
+            len(get_truncated_value((torch.randn(10), torch.randn(20)))), 2
+        )
         self.assertEqual(get_truncated_value(torch.randn(10, 10)).shape, (10, 10))
         self.assertEqual(get_truncated_value(torch.randn(100, 100)).shape, (5, 5))
 
@@ -33,7 +34,9 @@ class TestDumperPureFunctions(CustomTestCase):
 
         class Obj:
             x, y = 10, 20
-            def method(self): pass
+
+            def method(self):
+                pass
 
         result = _obj_to_dict(Obj())
         self.assertEqual(result["x"], 10)
@@ -78,7 +81,9 @@ def _assert_file_exists(filenames, *patterns):
 
 def _assert_file_not_exists(filenames, *patterns):
     for p in patterns:
-        assert not any(p in f for f in filenames), f"{p} should not exist in {filenames}"
+        assert not any(
+            p in f for f in filenames
+        ), f"{p} should not exist in {filenames}"
 
 
 def _test_basic_func(rank, tmpdir):
@@ -106,7 +111,9 @@ def _test_basic_func(rank, tmpdir):
     dist.barrier()
     filenames = _get_filenames(tmpdir)
 
-    _assert_file_exists(filenames, "tensor_a", "tensor_b", "arg=100", "ctx_arg=200", "obj_a", "obj_b")
+    _assert_file_exists(
+        filenames, "tensor_a", "tensor_b", "arg=100", "ctx_arg=200", "obj_a", "obj_b"
+    )
     _assert_file_not_exists(filenames, "tensor_skip")
 
 
@@ -121,7 +128,9 @@ def _test_http_func(rank):
         dist.barrier()
         if rank == 0:
             time.sleep(0.1)
-            requests.post("http://localhost:40000/dumper", json={"enable": enable}).raise_for_status()
+            requests.post(
+                "http://localhost:40000/dumper", json={"enable": enable}
+            ).raise_for_status()
         dist.barrier()
         assert dumper._enable == enable
 
@@ -159,7 +168,9 @@ def _run_distributed_test(func, world_size=2, **kwargs):
     processes = []
 
     for rank in range(world_size):
-        p = ctx.Process(target=_run_worker, args=(rank, world_size, func, result_queue, kwargs))
+        p = ctx.Process(
+            target=_run_worker, args=(rank, world_size, func, result_queue, kwargs)
+        )
         p.start()
         processes.append(p)
 
@@ -173,7 +184,12 @@ def _run_distributed_test(func, world_size=2, **kwargs):
 
 
 def _run_worker(rank, world_size, func, result_queue, kwargs):
-    os.environ.update(MASTER_ADDR="localhost", MASTER_PORT="29500", RANK=str(rank), WORLD_SIZE=str(world_size))
+    os.environ.update(
+        MASTER_ADDR="localhost",
+        MASTER_PORT="29500",
+        RANK=str(rank),
+        WORLD_SIZE=str(world_size),
+    )
     torch.cuda.set_device(rank)
     dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
 
@@ -182,6 +198,7 @@ def _run_worker(rank, world_size, func, result_queue, kwargs):
         result_queue.put(None)
     except Exception as e:
         import traceback
+
         result_queue.put(f"Rank {rank}: {e}\n{traceback.format_exc()}")
     finally:
         dist.destroy_process_group()

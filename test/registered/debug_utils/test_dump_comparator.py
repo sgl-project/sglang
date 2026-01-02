@@ -9,9 +9,9 @@ import torch
 
 from sglang.test.test_utils import CustomTestCase
 
-
 # TODO it needs 0 gpu
 register_cuda_ci(est_time=60, suite="nightly-1-gpu", nightly=True)
+
 
 @contextmanager
 def with_env(name: str, value: str):
@@ -49,17 +49,26 @@ class TestDumpComparator(CustomTestCase):
         from sglang.srt.debug_utils.dump_comparator import _try_unify_shape
 
         target = torch.Size([3, 4])
-        self.assertEqual(_try_unify_shape(torch.randn(1, 1, 3, 4), target).shape, target)
-        self.assertEqual(_try_unify_shape(torch.randn(2, 3, 4), target).shape, (2, 3, 4))
+        self.assertEqual(
+            _try_unify_shape(torch.randn(1, 1, 3, 4), target).shape, target
+        )
+        self.assertEqual(
+            _try_unify_shape(torch.randn(2, 3, 4), target).shape, (2, 3, 4)
+        )
 
     def test_compute_smaller_dtype(self):
         from sglang.srt.debug_utils.dump_comparator import _compute_smaller_dtype
 
-        self.assertEqual(_compute_smaller_dtype(torch.float32, torch.bfloat16), torch.bfloat16)
+        self.assertEqual(
+            _compute_smaller_dtype(torch.float32, torch.bfloat16), torch.bfloat16
+        )
         self.assertIsNone(_compute_smaller_dtype(torch.float32, torch.float32))
 
     def test_einops_pattern(self):
-        from sglang.srt.debug_utils.dump_comparator import _get_einops_dim_index, _split_einops_pattern
+        from sglang.srt.debug_utils.dump_comparator import (
+            _get_einops_dim_index,
+            _split_einops_pattern,
+        )
 
         self.assertEqual(_split_einops_pattern("a (b c) d"), ["a", "(b c)", "d"])
         self.assertEqual(_get_einops_dim_index("a b c", "b"), 1)
@@ -81,8 +90,12 @@ class TestDumpComparator(CustomTestCase):
         from sglang.srt.debug_utils.dump_comparator import _compute_and_print_diff
 
         x = torch.ones(10, 10)
-        self.assertAlmostEqual(_compute_and_print_diff(x, x, 1e-3)["max_abs_diff"], 0.0, places=5)
-        self.assertAlmostEqual(_compute_and_print_diff(x, x + 0.5, 1e-3)["max_abs_diff"], 0.5, places=4)
+        self.assertAlmostEqual(
+            _compute_and_print_diff(x, x, 1e-3)["max_abs_diff"], 0.0, places=5
+        )
+        self.assertAlmostEqual(
+            _compute_and_print_diff(x, x + 0.5, 1e-3)["max_abs_diff"], 0.5, places=4
+        )
 
 
 class TestDumpLoader(CustomTestCase):
@@ -90,13 +103,17 @@ class TestDumpLoader(CustomTestCase):
         from sglang.srt.debug_utils.dump_loader import read_meta
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            for fn in ["forward_pass_id=1___rank=0___dump_index=1___name=a.pt",
-                       "forward_pass_id=2___rank=0___dump_index=2___name=b.pt"]:
+            for fn in [
+                "forward_pass_id=1___rank=0___dump_index=1___name=a.pt",
+                "forward_pass_id=2___rank=0___dump_index=2___name=b.pt",
+            ]:
                 torch.save(torch.randn(5), Path(tmpdir) / fn)
 
             df = read_meta(tmpdir)
             self.assertEqual(len(df), 2)
-            self.assertTrue(all(c in df.columns for c in ["forward_pass_id", "rank", "name"]))
+            self.assertTrue(
+                all(c in df.columns for c in ["forward_pass_id", "rank", "name"])
+            )
 
     def test_find_row(self):
         from sglang.srt.debug_utils.dump_loader import find_row
@@ -117,9 +134,20 @@ class TestDumpLoader(CustomTestCase):
     def test_add_duplicate_index(self):
         from sglang.srt.debug_utils.dump_loader import _add_duplicate_index
 
-        df = pl.DataFrame({"name": ["a", "a", "b"], "dump_index": [1, 2, 3], "filename": ["f1", "f2", "f3"]})
+        df = pl.DataFrame(
+            {
+                "name": ["a", "a", "b"],
+                "dump_index": [1, 2, 3],
+                "filename": ["f1", "f2", "f3"],
+            }
+        )
         result = _add_duplicate_index(df)
-        self.assertEqual(result.filter(pl.col("name") == "a").sort("dump_index")["duplicate_index"].to_list(), [0, 1])
+        self.assertEqual(
+            result.filter(pl.col("name") == "a")
+            .sort("dump_index")["duplicate_index"]
+            .to_list(),
+            [0, 1],
+        )
 
 
 class TestEndToEnd(CustomTestCase):
@@ -133,6 +161,7 @@ class TestEndToEnd(CustomTestCase):
 
             with with_env("SGLANG_DUMPER_DIR", d1):
                 from sglang.srt.debug_utils.dumper import _Dumper
+
                 dumper1 = _Dumper()
                 dumper1.on_forward_pass_start()
                 dumper1.dump("x", baseline_tensor)
@@ -148,11 +177,17 @@ class TestEndToEnd(CustomTestCase):
             self.assertEqual(len(df1), 1)
             self.assertEqual(len(df2), 1)
 
-            t1 = torch.load(dump_dir1 / find_row(df1, {"name": "x"})["filename"], weights_only=False)
-            t2 = torch.load(dump_dir2 / find_row(df2, {"name": "x"})["filename"], weights_only=False)
+            t1 = torch.load(
+                dump_dir1 / find_row(df1, {"name": "x"})["filename"], weights_only=False
+            )
+            t2 = torch.load(
+                dump_dir2 / find_row(df2, {"name": "x"})["filename"], weights_only=False
+            )
 
             result = _compute_and_print_diff(t1.float(), t2.float(), 0.1)
-            self.assertAlmostEqual(result["max_abs_diff"], noise.abs().max().item(), places=3)
+            self.assertAlmostEqual(
+                result["max_abs_diff"], noise.abs().max().item(), places=3
+            )
 
     def test_dump_dict(self):
         from sglang.srt.debug_utils.dump_loader import read_meta
@@ -160,6 +195,7 @@ class TestEndToEnd(CustomTestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             with with_env("SGLANG_DUMPER_DIR", tmpdir):
                 from sglang.srt.debug_utils.dumper import _Dumper
+
                 dumper = _Dumper()
                 dumper.on_forward_pass_start()
                 dumper.dump_dict("layer", {"w": torch.randn(5), "b": torch.randn(3)})
