@@ -738,15 +738,6 @@ class TransformerLoader(ComponentLoader):
 
         model = model.eval()
 
-        if server_args.dit_layerwise_offload:
-            # enable layerwise offload if possible
-            if isinstance(model, OffloadableDiTMixin):
-                model.configure_layerwise_offload(server_args)
-            else:
-                logger.info(
-                    "Disabling layerwise offload since current model does not support this feature"
-                )
-
         return model
 
 
