@@ -91,31 +91,25 @@ class TestEndToEnd(CustomTestCase):
 
         from sglang.srt.debug_utils.dump_comparator import main
 
+        from sglang.srt.debug_utils.dumper import _Dumper
+
         with tempfile.TemporaryDirectory() as d1, tempfile.TemporaryDirectory() as d2:
             baseline_tensor = torch.randn(10, 10)
             target_tensor = baseline_tensor + torch.randn(10, 10) * 0.01
 
-            with _with_env("SGLANG_DUMPER_DIR", d1):
-                from sglang.srt.debug_utils.dumper import _Dumper
-
-                dumper1 = _Dumper()
-                dumper1.on_forward_pass_start()
-                dumper1.dump("tensor_a", baseline_tensor)
-                dumper1.on_forward_pass_start()
-                dumper1.dump("tensor_b", baseline_tensor * 2)
-                dump_dir1 = Path(d1) / f"sglang_dump_{dumper1._partial_name}"
-
-            with _with_env("SGLANG_DUMPER_DIR", d2):
-                dumper2 = _Dumper()
-                dumper2.on_forward_pass_start()
-                dumper2.dump("tensor_a", target_tensor)
-                dumper2.on_forward_pass_start()
-                dumper2.dump("tensor_b", target_tensor * 2)
-                dump_dir2 = Path(d2) / f"sglang_dump_{dumper2._partial_name}"
+            dump_dirs = []
+            for d, tensor in [(d1, baseline_tensor), (d2, target_tensor)]:
+                with _with_env("SGLANG_DUMPER_DIR", d):
+                    dumper = _Dumper()
+                    dumper.on_forward_pass_start()
+                    dumper.dump("tensor_a", tensor)
+                    dumper.on_forward_pass_start()
+                    dumper.dump("tensor_b", tensor * 2)
+                    dump_dirs.append(Path(d) / f"sglang_dump_{dumper._partial_name}")
 
             args = Namespace(
-                baseline_path=str(dump_dir1),
-                target_path=str(dump_dir2),
+                baseline_path=str(dump_dirs[0]),
+                target_path=str(dump_dirs[1]),
                 start_id=1,
                 end_id=2,
                 baseline_start_id=1,
