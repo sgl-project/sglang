@@ -7,7 +7,6 @@ from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST_FP8_WITH_MOE,
     DEFAULT_MODEL_NAME_FOR_TEST_MOE_NVFP4,
     DEFAULT_MODEL_NAME_FOR_TEST_MXFP4_WITH_MOE,
-    DEFAULT_MODEL_NAME_FOR_TEST_W8A8_WITH_MOE,
     DEFAULT_SMALL_MOE_MODEL_NAME_FOR_TEST_CHAT,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -145,7 +144,7 @@ class TestMoERunner(CustomTestCase):
             ],
         },
         "moe_runner_cutlass_w4a8": {
-            "model": DEFAULT_MODEL_NAME_FOR_TEST_W8A8_WITH_MOE,
+            "model": "RedHatAI/Qwen3-30B-A3B-FP8-dynamic",  # FP8 W8A8 MoE model
             "other_args": [
                 "--trust-remote-code",
                 "--moe-runner-backend",
@@ -157,7 +156,7 @@ class TestMoERunner(CustomTestCase):
             ],
         },
         "moe_runner_cutlass_w4a8_deepep_normal": {
-            "model": DEFAULT_MODEL_NAME_FOR_TEST_W8A8_WITH_MOE,
+            "model": "RedHatAI/Qwen3-30B-A3B-FP8-dynamic",  # FP8 W8A8 MoE model
             "other_args": [
                 "--trust-remote-code",
                 "--moe-runner-backend",
@@ -173,7 +172,7 @@ class TestMoERunner(CustomTestCase):
             ],
         },
         "moe_runner_cutlass_w4a8_deepep_ll": {
-            "model": DEFAULT_MODEL_NAME_FOR_TEST_W8A8_WITH_MOE,
+            "model": "RedHatAI/Qwen3-30B-A3B-FP8-dynamic",  # FP8 W8A8 MoE model
             "other_args": [
                 "--trust-remote-code",
                 "--moe-runner-backend",
