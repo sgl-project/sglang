@@ -508,13 +508,15 @@ class Qwen2_5_VLModel(nn.Module):
     accepts_loss_kwargs = False
     _no_split_modules = ["Qwen2_5_VLDecoderLayer", "Qwen2_5_VLVisionBlock"]
 
-    def __init__(self, config):
+    def __init__(self, config, enable_image_understanding: bool = False):
         super().__init__()
-        self.visual = Qwen2_5_VisionTransformerPretrainedModel._from_config(
-            config.vision_config
-        )
         self.language_model = Qwen2_5_VLTextModel(config.text_config)
-        self.visual.to(torch.get_default_dtype())
+
+        if enable_image_understanding:
+            self.visual = Qwen2_5_VisionTransformerPretrainedModel._from_config(
+                config.vision_config
+            )
+            self.visual.to(torch.get_default_dtype())
         self.rope_deltas = None  # cache rope_deltas here
         self.config = config
         # Initialize weights and apply final processing
@@ -1056,13 +1058,18 @@ class Qwen2_5_VLForConditionalGeneration(TextEncoder):
         config: Qwen2_5VLConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        enable_image_understanding: bool = False,
     ) -> None:
         super().__init__(config)
         config = config.arch_config
-        self.model = Qwen2_5_VLModel(config)
+        self.model = Qwen2_5_VLModel(
+            config, enable_image_understanding=enable_image_understanding
+        )
         self.lm_head = nn.Linear(
             config.text_config.hidden_size, config.text_config.vocab_size, bias=False
         )
+
+        self.enable_image_understanding = enable_image_understanding
 
         self.config = config
 
@@ -1157,6 +1164,8 @@ class Qwen2_5_VLForConditionalGeneration(TextEncoder):
 
             name = name.replace("model.", "model.language_model.")
             if "visual." in name:
+                if not self.enable_image_understanding:
+                    continue
                 name = name.replace("visual.", "model.visual.")
             try:
                 # Skip loading extra bias for GPTQ models.
@@ -1164,7 +1173,6 @@ class Qwen2_5_VLForConditionalGeneration(TextEncoder):
                     continue
                 param = params_dict[name]
             except KeyError:
-                print(params_dict.keys())
                 raise
 
             weight_loader = getattr(param, "weight_loader", default_weight_loader)

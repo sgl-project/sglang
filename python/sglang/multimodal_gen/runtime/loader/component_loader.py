@@ -462,7 +462,7 @@ class TextEncoderLoader(ComponentLoader):
             with local_torch_device, skip_init_modules():
                 architectures = getattr(model_config, "architectures", [])
                 model_cls, _ = ModelRegistry.resolve_model_cls(architectures)
-                model = model_cls(model_config)
+                model = model_cls(model_config, enable_image_understanding=False)
 
             weights_to_load = {name for name, _ in model.named_parameters()}
             loaded_weights = model.load_weights(
