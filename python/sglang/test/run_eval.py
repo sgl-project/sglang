@@ -15,6 +15,7 @@ from sglang.test.simple_eval_common import (
     set_ulimit,
 )
 
+
 def get_thinking_kwargs(args):
     thinking_mode = getattr(args, "thinking_mode", None)
     if thinking_mode in THINKING_MODE_CHOICES:
