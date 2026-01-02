@@ -57,8 +57,8 @@ def _fused_scale_shift_4d_kernel(
     scale = tl.load(scale_ptrs, mask=mask, other=0.0)
     shift = tl.load(shift_ptrs, mask=mask, other=0.0)
 
-    one = tl.full([BLOCK_N], scale_constant, dtype=scale.dtype)
-    output = normalized * (one + scale) + shift
+    scale_const_tensor = tl.full([BLOCK_N], scale_constant, dtype=scale.dtype)
+    output = normalized * (scale_const_tensor + scale) + shift
 
     tl.store(out_ptrs, output, mask=mask)
 
