@@ -132,13 +132,17 @@ impl TiktokenTokenizer {
 }
 
 impl Encoder for TiktokenTokenizer {
-    fn encode(&self, input: &str) -> Result<Encoding> {
+    fn encode(&self, input: &str, _add_special_tokens: bool) -> Result<Encoding> {
+        // tiktoken uses encode_ordinary which doesn't add special tokens
         let tokens = self.tokenizer.encode_ordinary(input);
         Ok(Encoding::Tiktoken(tokens))
     }
 
-    fn encode_batch(&self, inputs: &[&str]) -> Result<Vec<Encoding>> {
-        inputs.iter().map(|input| self.encode(input)).collect()
+    fn encode_batch(&self, inputs: &[&str], add_special_tokens: bool) -> Result<Vec<Encoding>> {
+        inputs
+            .iter()
+            .map(|input| self.encode(input, add_special_tokens))
+            .collect()
     }
 }
 
@@ -216,7 +220,7 @@ mod tests {
         let tokenizer = TiktokenTokenizer::new(TiktokenModel::Cl100kBase).unwrap();
 
         let text = "Hello, world!";
-        let encoding = tokenizer.encode(text).unwrap();
+        let encoding = tokenizer.encode(text, false).unwrap();
 
         let decoded = tokenizer.decode(encoding.token_ids(), false).unwrap();
         assert_eq!(decoded, text);
@@ -227,7 +231,7 @@ mod tests {
         let tokenizer = TiktokenTokenizer::new(TiktokenModel::Cl100kBase).unwrap();
 
         let texts = vec!["Hello", "World", "Test"];
-        let encodings = tokenizer.encode_batch(&texts).unwrap();
+        let encodings = tokenizer.encode_batch(&texts, false).unwrap();
 
         assert_eq!(encodings.len(), 3);
         for (i, encoding) in encodings.iter().enumerate() {

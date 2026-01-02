@@ -12,6 +12,11 @@
 
 namespace device::warp {
 
+template <typename T, std::size_t N>
+struct device_vec {
+  T data[N];
+};
+
 namespace details {
 
 template <std::size_t kUnit>
