@@ -67,8 +67,6 @@ _DP: Optional[GroupCoordinator] = None
 _DIT: Optional[GroupCoordinator] = None
 _VAE: Optional[GroupCoordinator] = None
 
-logger = init_logger(__name__)
-
 TensorMetadata = namedtuple("TensorMetadata", ["device", "dtype", "size"])
 
 
@@ -342,7 +340,9 @@ def initialize_model_parallel(
     """
 
     if backend is None:
-        backend = envs.get_torch_distributed_backend()
+        from sglang.multimodal_gen.runtime.platforms import current_platform
+
+        backend = current_platform.get_torch_distributed_backend_str()
     # Get world size and rank. Ensure some consistencies.
     assert torch.distributed.is_initialized()
     world_size: int = torch.distributed.get_world_size()

@@ -46,6 +46,7 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
 )
 from sglang.srt.distributed.parallel_state import get_pp_group
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -74,7 +75,7 @@ from sglang.srt.models.utils import RotaryPosMixin, WeightsMapper, permute_inv
 from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
 from sglang.srt.multimodal.vit_cuda_graph_runner import ViTCudaGraphRunner
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import add_prefix, get_bool_env_var
+from sglang.srt.utils import add_prefix
 
 logger = logging.getLogger(__name__)
 
@@ -170,7 +171,6 @@ class Qwen2_5_VisionBlock(nn.Module):
         position_embeddings: torch.Tensor,
         output_ws=None,
     ) -> torch.Tensor:
-        ws = output_ws
         S, B, H = x.shape
         # norm1: flatten to 2D -> [S*B, H], then reshape back
         x2d = x.reshape(-1, H)
@@ -182,7 +182,7 @@ class Qwen2_5_VisionBlock(nn.Module):
             hidden_states,
             cu_seqlens=cu_seqlens,
             position_embeddings=position_embeddings,
-            output_ws=ws,
+            output_ws=output_ws,
         )
         attn = rearrange(attn, "b s h -> s b h")
 
@@ -390,7 +390,7 @@ class Qwen2_5_VisionTransformer(nn.Module, RotaryPosMixin):
         x: torch.Tensor,
         grid_thw: torch.Tensor,
     ) -> torch.Tensor:
-        if get_bool_env_var("SGLANG_VIT_ENABLE_CUDA_GRAPH") and self.tp_size == 1:
+        if envs.SGLANG_VIT_ENABLE_CUDA_GRAPH.get():
             return self.forward_with_cuda_graph(x, grid_thw)
 
         # patchify
@@ -783,7 +783,11 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
             if "rotary_emb.inv_freq" in name:
                 continue
 
-            if self.pp_group.is_last_rank and "model.embed_tokens.weight" in name:
+            if (
+                self.config.tie_word_embeddings
+                and self.pp_group.is_last_rank
+                and "model.embed_tokens.weight" in name
+            ):
                 if "lm_head.weight" in params_dict:
                     lm_head_param = params_dict["lm_head.weight"]
                     weight_loader = getattr(

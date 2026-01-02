@@ -77,12 +77,25 @@ impl GenerateResponseProcessingStage {
             })?
             .clone();
 
+        // Get cached tokenizer (resolved once in preparation stage)
+        let tokenizer = ctx.tokenizer_arc().ok_or_else(|| {
+            error!(
+                function = "GenerateResponseProcessingStage::process_generate_response",
+                "Tokenizer not cached in context"
+            );
+            error::internal_error(
+                "tokenizer_not_cached",
+                "Tokenizer not cached in context - preparation stage may have been skipped",
+            )
+        })?;
+
         if is_streaming {
             // Streaming: Use StreamingProcessor and return SSE response
             let response = self.streaming_processor.clone().process_streaming_generate(
                 execution_result,
                 ctx.generate_request_arc(), // Cheap Arc clone (8 bytes)
                 dispatch,
+                tokenizer,
             );
 
             // Attach load guards to response body for proper RAII lifecycle
