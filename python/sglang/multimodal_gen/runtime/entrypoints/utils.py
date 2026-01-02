@@ -38,8 +38,12 @@ def prepare_request(
         extra["diffusers_kwargs"] = diffusers_kwargs
         params_dict["extra"] = extra
 
+    # Filter to only fields that exist in Req
+    req_fields = {f.name for f in dataclasses.fields(Req)}
+    filtered_params = {k: v for k, v in params_dict.items() if k in req_fields}
+
     req = Req(
-        **params_dict,
+        **filtered_params,
         VSA_sparsity=server_args.VSA_sparsity,
     )
 
