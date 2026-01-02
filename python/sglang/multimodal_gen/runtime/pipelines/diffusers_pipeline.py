@@ -486,27 +486,23 @@ class DiffusersPipeline(ComposedPipelineBase):
     def _get_device_map(self, server_args: ServerArgs) -> str | None:
         """Determine device_map for pipeline loading.
 
-        Using device_map enables:
+        Using device_map="cuda" enables:
         1. Direct loading to GPU, warming up CUDA caching allocator
         2. Parallel shard loading via accelerate for faster init
 
+        Note: We only use "cuda" here, not "balanced" or other multi-GPU options.
+        SGLang handles multi-GPU distribution via its own parallelism (tp_size, sp_degree, etc.).
+        Using diffusers' device_map for multi-GPU would conflict with SGLang's distribution.
+
         Returns:
-            - "balanced": Multi-GPU, distributes across available GPUs
-            - "cuda:X" or "cuda": Single GPU loading
-            - None: Fall back to manual .to() call (legacy behavior)
+            - "cuda": Load to current CUDA device
+            - None: Fall back to manual .to() call (CPU/MPS)
         """
         if not torch.cuda.is_available():
             return None
 
-        num_gpus = getattr(server_args, "num_gpus", 1)
-
-        if num_gpus > 1:
-            # Multi-GPU: use balanced distribution
-            return "balanced"
-        else:
-            # Single GPU: load directly to cuda
-            # This still benefits from CUDA caching allocator warmup
-            return "cuda"
+        # Always use "cuda" - SGLang handles multi-GPU parallelism
+        return "cuda"
 
     def _get_dtype(self, server_args: ServerArgs) -> torch.dtype:
         """Determine the dtype to use for model loading.
