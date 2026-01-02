@@ -337,6 +337,11 @@ impl TokenTree {
                         let common_len = align_to_page(remaining.len());
                         let prefix_tokens: Vec<TokenId> = child_tokens[..common_len].to_vec();
                         let suffix_page_key = make_page_key(&child_tokens[common_len..]);
+
+                        // Check if tenant already owned the child (tokens already counted)
+                        let tenant_already_owned = child
+                            .tenant_last_access_time
+                            .contains_key(tenant_id.as_ref());
                         drop(child_tokens);
 
                         // Modify original child to hold only suffix tokens
@@ -362,13 +367,21 @@ impl TokenTree {
                         entry.insert(intermediate_node.clone());
 
                         intermediate_node.touch_tenant(&tenant_id);
-                        InsertStep::Done(common_len)
+
+                        // Only count new tokens if tenant didn't already own this path
+                        let new_tokens = if tenant_already_owned { 0 } else { common_len };
+                        InsertStep::Done(new_tokens)
                     } else {
                         // Partial match - need to split and add new branch at page boundary
                         // Strategy: Create NEW intermediate node with common prefix,
                         // keep original child as one suffix, create new node for other suffix
                         let prefix_tokens: Vec<TokenId> = child_tokens[..common_len].to_vec();
                         let child_suffix_page_key = make_page_key(&child_tokens[common_len..]);
+
+                        // Check if tenant already owned the child (common prefix already counted)
+                        let tenant_already_owned = child
+                            .tenant_last_access_time
+                            .contains_key(tenant_id.as_ref());
                         drop(child_tokens);
 
                         // Modify original child to hold only its suffix tokens
@@ -392,18 +405,24 @@ impl TokenTree {
 
                         // Create new node for the remaining input suffix
                         let new_remaining = &remaining[common_len..];
-                        if new_remaining.len() >= PAGE_SIZE {
+                        let new_branch_tokens = if new_remaining.len() >= PAGE_SIZE {
                             let new_node = Arc::new(Node::new(new_remaining.to_vec()));
                             new_node.touch_tenant(&tenant_id);
                             let new_page_key = make_page_key(new_remaining);
                             intermediate_node.children.insert(new_page_key, new_node);
-                        }
+                            new_remaining.len()
+                        } else {
+                            0
+                        };
 
                         // Replace entry with intermediate node
                         entry.insert(intermediate_node.clone());
 
                         intermediate_node.touch_tenant(&tenant_id);
-                        InsertStep::Done(remaining.len())
+
+                        // Count: new branch tokens + common prefix only if tenant is new
+                        let common_tokens = if tenant_already_owned { 0 } else { common_len };
+                        InsertStep::Done(new_branch_tokens + common_tokens)
                     }
                 }
             };
@@ -496,19 +515,31 @@ impl TokenTree {
                     } else {
                         let tenant = child.get_any_tenant();
 
-                        if match_len < child_tokens.len() {
-                            // Partial match within node (at page boundary)
-                            MatchStep::PartialMatch {
-                                matched: match_len,
-                                tenant,
-                            }
+                        // If node has no tenants (all evicted), stop matching here
+                        // This ensures we only route to workers that still have the prefix cached
+                        if tenant.is_none() {
+                            MatchStep::Done
                         } else {
-                            // Full match - continue
-                            drop(child_tokens);
-                            MatchStep::Continue {
-                                next: child,
-                                advance: match_len,
-                                tenant,
+                            // Update timestamp on match to keep LRU in sync with backend
+                            // SGLang does: child.last_access_time = access_time
+                            if let Some(ref t) = tenant {
+                                child.touch_tenant(t);
+                            }
+
+                            if match_len < child_tokens.len() {
+                                // Partial match within node (at page boundary)
+                                MatchStep::PartialMatch {
+                                    matched: match_len,
+                                    tenant,
+                                }
+                            } else {
+                                // Full match - continue
+                                drop(child_tokens);
+                                MatchStep::Continue {
+                                    next: child,
+                                    advance: match_len,
+                                    tenant,
+                                }
                             }
                         }
                     }
@@ -563,8 +594,15 @@ impl TokenTree {
     }
 
     /// Evict entries for a tenant to reduce to max_tokens.
+    ///
+    /// Uses **leaf-first LRU eviction** matching SGLang's behavior:
+    /// 1. Find tenant-specific leaves (nodes where tenant exists but no children have tenant)
+    /// 2. Evict oldest leaves first (by LRU timestamp)
+    /// 3. When a leaf is evicted, its parent may become a new leaf
+    /// 4. Repeat until quota is met
     pub fn evict_tenant(&self, tenant: &TenantId, max_tokens: usize) {
-        // Use borrowed lookup to avoid Arc hash overhead
+        use std::{cmp::Reverse, collections::BinaryHeap};
+
         let current_count = self
             .tenant_token_count
             .get(tenant.as_ref())
@@ -578,25 +616,65 @@ impl TokenTree {
         let to_evict = current_count - max_tokens;
         let mut evicted = 0;
 
-        // Collect nodes with timestamps for LRU eviction
-        let mut nodes_with_time: Vec<(NodeRef, u64)> = Vec::new();
-        self.collect_tenant_nodes(&self.root, tenant, &mut nodes_with_time);
+        // Collect initial tenant-specific leaves
+        let mut leaves: Vec<(NodeRef, u64)> = Vec::new();
+        self.collect_tenant_leaves(&self.root, tenant, &mut leaves);
 
-        // Sort by timestamp (oldest first)
-        nodes_with_time.sort_by_key(|(_, ts)| *ts);
+        // Build min-heap: oldest timestamp first (using Reverse for min-heap behavior)
+        let mut heap: BinaryHeap<Reverse<(u64, usize)>> = BinaryHeap::new();
+        let mut leaf_nodes: Vec<NodeRef> = Vec::with_capacity(leaves.len());
 
-        for (node, _) in nodes_with_time {
-            if evicted >= to_evict {
-                break;
-            }
-
-            let node_tokens = node.tokens.read().len();
-            if self.remove_tenant_from_node(&node, tenant) {
-                evicted += node_tokens;
-            }
+        for (node, ts) in leaves.drain(..) {
+            let idx = leaf_nodes.len();
+            leaf_nodes.push(node);
+            heap.push(Reverse((ts, idx)));
         }
 
-        // Update tenant token count using borrowed lookup when possible
+        // Track which nodes we've already evicted (by index)
+        let mut evicted_indices: std::collections::HashSet<usize> =
+            std::collections::HashSet::new();
+
+        while evicted < to_evict {
+            // Pop oldest leaf
+            let Some(Reverse((_, idx))) = heap.pop() else {
+                // No more leaves - need to re-collect (parent became leaf)
+                leaves.clear();
+                self.collect_tenant_leaves(&self.root, tenant, &mut leaves);
+
+                if leaves.is_empty() {
+                    break; // No more nodes with this tenant
+                }
+
+                // Rebuild heap with new leaves
+                leaf_nodes.clear();
+                evicted_indices.clear();
+                for (node, ts) in leaves.drain(..) {
+                    let idx = leaf_nodes.len();
+                    leaf_nodes.push(node);
+                    heap.push(Reverse((ts, idx)));
+                }
+                continue;
+            };
+
+            // Skip if already evicted
+            if evicted_indices.contains(&idx) {
+                continue;
+            }
+
+            let node = &leaf_nodes[idx];
+            let node_tokens = node.tokens.read().len();
+
+            // Remove tenant from this leaf node
+            if self.remove_tenant_from_node(node, tenant) {
+                evicted += node_tokens;
+                evicted_indices.insert(idx);
+            }
+
+            // Note: We don't immediately check if parent became leaf.
+            // When heap empties, we re-collect leaves which will find new ones.
+        }
+
+        // Update tenant token count
         if let Some(mut count) = self.tenant_token_count.get_mut(tenant.as_ref()) {
             *count = count.saturating_sub(evicted);
         }
@@ -605,31 +683,47 @@ impl TokenTree {
             tenant = %tenant.as_ref(),
             evicted = evicted,
             remaining = current_count.saturating_sub(evicted),
-            "Evicted tokens from tenant"
+            "Evicted tokens from tenant (leaf-first LRU)"
         );
     }
 
-    fn collect_tenant_nodes(
+    /// Collect tenant-specific leaves: nodes where tenant exists but no children have tenant.
+    /// This matches SGLang's leaf collection for eviction.
+    fn collect_tenant_leaves(
         &self,
         node: &NodeRef,
         tenant_id: &TenantId,
         result: &mut Vec<(NodeRef, u64)>,
     ) {
-        // Skip root
-        if !Arc::ptr_eq(node, &self.root) {
-            // Use borrowed lookup to avoid Arc hash overhead
+        let is_root = Arc::ptr_eq(node, &self.root);
+        let node_has_tenant = !is_root
+            && node
+                .tenant_last_access_time
+                .contains_key(tenant_id.as_ref());
+
+        // Check if any child has this tenant
+        let mut any_child_has_tenant = false;
+        for child_entry in node.children.iter() {
+            let child = child_entry.value();
+            if child
+                .tenant_last_access_time
+                .contains_key(tenant_id.as_ref())
+            {
+                any_child_has_tenant = true;
+            }
+            // Recurse into all children to find leaves deeper in tree
+            self.collect_tenant_leaves(child, tenant_id, result);
+        }
+
+        // If this node has tenant but no child does, it's a tenant-specific leaf
+        if node_has_tenant && !any_child_has_tenant {
             if let Some(ts) = node.tenant_last_access_time.get(tenant_id.as_ref()) {
                 result.push((Arc::clone(node), *ts));
             }
         }
-
-        for child in node.children.iter() {
-            self.collect_tenant_nodes(child.value(), tenant_id, result);
-        }
     }
 
     fn remove_tenant_from_node(&self, node: &NodeRef, tenant_id: &TenantId) -> bool {
-        // Use borrowed lookup to avoid Arc hash overhead
         node.tenant_last_access_time
             .remove(tenant_id.as_ref())
             .is_some()
@@ -1361,6 +1455,68 @@ mod tests {
         let result = tree.match_prefix_with_counts(&tokens2);
         assert_eq!(result.matched_token_count, 2 * PAGE_SIZE);
         assert_eq!(result.tenant.as_ref(), "tenant2");
+    }
+
+    #[test]
+    fn test_leaf_first_eviction() {
+        // Test that eviction follows leaf-first LRU like SGLang's radix cache
+        //
+        // Tree structure for tenant1:
+        //   root -> [A: page1] -> [B: page2] -> [C: page3]
+        //
+        // When we evict, C (leaf) should be evicted first, then B, then A.
+        // This ensures shared prefixes (like system prompts near root) survive longer.
+
+        let tree = TokenTree::new();
+
+        // Insert a 3-page path: A -> B -> C
+        let path_abc = make_tokens(1, 3); // 3 pages
+        tree.insert_tokens(&path_abc, "tenant1");
+
+        // Also insert just the first page (shared prefix)
+        let path_a = make_tokens(1, 1); // 1 page
+        tree.insert_tokens(&path_a, "tenant1");
+
+        // Initial count should be 3 pages (A, B, C share with the single A)
+        let initial_count = tree.tenant_token_size(&Arc::from("tenant1"));
+        assert_eq!(initial_count, 3 * PAGE_SIZE);
+
+        // Evict to keep only 2 pages - should evict C (the leaf)
+        let tenant1_id: TenantId = Arc::from("tenant1");
+        tree.evict_tenant(&tenant1_id, 2 * PAGE_SIZE);
+
+        // After evicting C, we should still match A and B
+        let result = tree.match_prefix_with_counts(&path_abc);
+        // Should match 2 pages (A and B), not 3
+        assert!(
+            result.matched_token_count <= 2 * PAGE_SIZE,
+            "Expected at most 2 pages matched after evicting leaf, got {}",
+            result.matched_token_count / PAGE_SIZE
+        );
+
+        // The prefix path should still work
+        let result = tree.match_prefix_with_counts(&path_a);
+        assert_eq!(
+            result.matched_token_count, PAGE_SIZE,
+            "Shared prefix A should still be cached"
+        );
+
+        // Evict more - should evict B (now the new leaf)
+        tree.evict_tenant(&tenant1_id, PAGE_SIZE);
+
+        // Now only A should remain
+        let result = tree.match_prefix_with_counts(&path_abc);
+        assert!(
+            result.matched_token_count <= PAGE_SIZE,
+            "Expected at most 1 page matched after evicting B"
+        );
+
+        // A should still work
+        let result = tree.match_prefix_with_counts(&path_a);
+        assert_eq!(
+            result.matched_token_count, PAGE_SIZE,
+            "Root prefix A should survive longest"
+        );
     }
 
     #[test]
