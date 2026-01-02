@@ -13,6 +13,7 @@ from typing import (
     NamedTuple,
     Optional,
     Tuple,
+    TypedDict,
     cast,
 )
 
@@ -62,7 +63,15 @@ logger = logging.getLogger(__name__)
 __all__ = ["CompressedTensorsLinearMethod"]
 
 SPARSITY_CONFIG_NAME: Literal["sparsity_config"] = "sparsity_config"
-QUANTIZATION_SCHEME_MAP_TYPE = Dict[str, Dict[str, Any]]
+
+
+class QuantizationSchemeEntry(TypedDict):
+    format: str
+    weights: QuantizationArgs
+    input_activations: Optional[QuantizationArgs]
+
+
+QUANTIZATION_SCHEME_MAP_TYPE = Dict[str, QuantizationSchemeEntry]
 
 
 class DeviceCapability(NamedTuple):
