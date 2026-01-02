@@ -18,8 +18,11 @@ from sglang.srt.layers.amx_utils import _amx_process_weight_after_loading
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
 from sglang.srt.layers.moe.moe_runner.deep_gemm import DeepGemmMoeQuantInfo
+from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
+    FlashInferTrtllmFp8MoeQuantInfo,
+)
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
-from sglang.srt.layers.moe.utils import get_moe_runner_backend
+from sglang.srt.layers.moe.utils import RoutingMethodType, get_moe_runner_backend
 from sglang.srt.layers.parameter import (
     BlockQuantScaleParameter,
     ModelWeightParameter,
@@ -75,11 +78,7 @@ from sglang.srt.utils import (
 )
 
 if TYPE_CHECKING:
-    from sglang.srt.layers.moe.token_dispatcher import (
-        CombineInput,
-        DispatchOutput,
-        StandardDispatchOutput,
-    )
+    from sglang.srt.layers.moe.token_dispatcher import CombineInput, DispatchOutput
     from sglang.srt.layers.moe.topk import TopKOutput
     from sglang.srt.layers.quantization.w4afp8 import W4AFp8Config
 
@@ -1051,11 +1050,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             or moe_runner_backend.is_triton()
             or moe_runner_backend.is_flashinfer_trtllm()
         ):
-            if moe_runner_backend.is_flashinfer_trtllm():
-                # Import to register the fused function
-                from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (  # noqa: F401
-                    FlashInferTrtllmFp8MoeQuantInfo,
-                )
             self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
         else:
             # TODO(cwan): refactor other backends
@@ -1181,6 +1175,51 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 w2_scale=w2_scale,
                 block_shape=block_shape,
             )
+        elif self.runner.runner_backend.is_flashinfer_trtllm():
+            # FlashInfer TRT-LLM backend only supports fused execution and consumes
+            # router logits directly (no separate apply_with_router_logits needed).
+            global_num_experts = int(getattr(layer, "num_experts"))
+            num_local_experts = int(getattr(layer, "num_local_experts"))
+            moe_ep_rank = int(getattr(layer, "moe_ep_rank"))
+
+            quant_info = FlashInferTrtllmFp8MoeQuantInfo(
+                w13_weight=layer.w13_weight,
+                w2_weight=layer.w2_weight,
+                global_num_experts=global_num_experts,
+                local_expert_offset=moe_ep_rank * num_local_experts,
+                local_num_experts=num_local_experts,
+                routing_method_type=int(
+                    getattr(layer, "routing_method_type", RoutingMethodType.DeepSeekV3)
+                ),
+                block_quant=self.block_quant,
+                weight_block_k=(
+                    None
+                    if self.quant_config.weight_block_size is None
+                    else self.quant_config.weight_block_size[1]
+                ),
+                w13_weight_scale_inv=(
+                    layer.w13_weight_scale_inv if self.block_quant else None
+                ),
+                w2_weight_scale_inv=(
+                    layer.w2_weight_scale_inv if self.block_quant else None
+                ),
+                w13_input_scale=layer.w13_input_scale if not self.block_quant else None,
+                output1_scales_scalar=(
+                    getattr(layer, "output1_scales_scalar", None)
+                    if not self.block_quant
+                    else None
+                ),
+                output1_scales_gate_scalar=(
+                    getattr(layer, "output1_scales_gate_scalar", None)
+                    if not self.block_quant
+                    else None
+                ),
+                output2_scales_scalar=(
+                    getattr(layer, "output2_scales_scalar", None)
+                    if not self.block_quant
+                    else None
+                ),
+            )
         elif self.runner.runner_backend.is_triton():
             quant_info = TritonMoeQuantInfo(
                 w13_weight=layer.w13_weight,
@@ -1251,62 +1290,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         )
 
         self._cutlass_buffers_ready = True
-
-    def apply_with_router_logits(
-        self,
-        layer: torch.nn.Module,
-        dispatch_output: StandardDispatchOutput,
-    ) -> torch.Tensor:
-        from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
-            FlashInferTrtllmFp8MoeQuantInfo,
-        )
-        from sglang.srt.layers.moe.utils import RoutingMethodType
-
-        assert hasattr(self, "runner") and self.runner is not None
-
-        global_num_experts = int(getattr(layer, "num_experts"))
-        num_local_experts = int(getattr(layer, "num_local_experts"))
-        moe_ep_rank = int(getattr(layer, "moe_ep_rank"))
-
-        quant_info = FlashInferTrtllmFp8MoeQuantInfo(
-            w13_weight=layer.w13_weight,
-            w2_weight=layer.w2_weight,
-            global_num_experts=global_num_experts,
-            local_expert_offset=moe_ep_rank * num_local_experts,
-            local_num_experts=num_local_experts,
-            routing_method_type=int(
-                getattr(layer, "routing_method_type", RoutingMethodType.DeepSeekV3)
-            ),
-            block_quant=self.block_quant,
-            weight_block_k=(
-                None
-                if self.quant_config.weight_block_size is None
-                else self.quant_config.weight_block_size[1]
-            ),
-            w13_weight_scale_inv=(
-                layer.w13_weight_scale_inv if self.block_quant else None
-            ),
-            w2_weight_scale_inv=layer.w2_weight_scale_inv if self.block_quant else None,
-            w13_input_scale=layer.w13_input_scale if not self.block_quant else None,
-            output1_scales_scalar=(
-                getattr(layer, "output1_scales_scalar", None)
-                if not self.block_quant
-                else None
-            ),
-            output1_scales_gate_scalar=(
-                getattr(layer, "output1_scales_gate_scalar", None)
-                if not self.block_quant
-                else None
-            ),
-            output2_scales_scalar=(
-                getattr(layer, "output2_scales_scalar", None)
-                if not self.block_quant
-                else None
-            ),
-        )
-
-        combine_input = self.runner.run(dispatch_output, quant_info)
-        return combine_input.hidden_states
 
     def maybe_apply_hip_fused_experts(
         self,
