@@ -16,11 +16,11 @@ Usage:
     # Image
     t2i:
     python3 -m sglang.multimodal_gen.benchmarks.bench_serving \
-         --backend sglang-image --dataset vbench --task t2v --num-prompts 20
+         --backend sglang-image --dataset vbench --task t2i --num-prompts 20
 
-    i2v:
+    ti2i(edit):
     python3 -m sglang.multimodal_gen.benchmarks.bench_serving \
-         --backend sglang-image --dataset vbench --task i2v --num-prompts 20
+         --backend sglang-image --dataset vbench --task ti2i --num-prompts 20
 
 
 """
@@ -63,6 +63,7 @@ class RequestFuncOutput:
     error: str = ""
     start_time: float = 0.0
     response_body: Dict[str, Any] = field(default_factory=dict)
+    peak_memory_mb: float = 0.0
 
 
 class BaseDataset(ABC):
@@ -99,7 +100,7 @@ class VBenchDataset(BaseDataset):
         self.items = self._load_data()
 
     def _load_data(self) -> List[Dict[str, Any]]:
-        if self.args.task == "t2v":
+        if self.args.task == "t2v" or self.args.task == "t2i":
             return self._load_t2v_prompts()
         elif self.args.task in ["i2v", "ti2v", "ti2i"]:
             return self._load_i2v_data()
@@ -371,6 +372,8 @@ async def async_request_image_sglang(
                     resp_json = await response.json()
                     output.response_body = resp_json
                     output.success = True
+                    if "peak_memory_mb" in resp_json:
+                        output.peak_memory_mb = resp_json["peak_memory_mb"]
                 else:
                     output.error = f"HTTP {response.status}: {await response.text()}"
                     output.success = False
@@ -398,6 +401,8 @@ async def async_request_image_sglang(
                     resp_json = await response.json()
                     output.response_body = resp_json
                     output.success = True
+                    if "peak_memory_mb" in resp_json:
+                        output.peak_memory_mb = resp_json["peak_memory_mb"]
                 else:
                     output.error = f"HTTP {response.status}: {await response.text()}"
                     output.success = False
@@ -406,6 +411,7 @@ async def async_request_image_sglang(
             output.success = False
 
     output.latency = time.perf_counter() - output.start_time
+
     if pbar:
         pbar.update(1)
     return output
@@ -421,7 +427,6 @@ async def async_request_video_sglang(
 
     # 1. Submit Job
     job_id = None
-
     # Check if we need to upload images (Multipart) or just send JSON
     if input.image_paths and len(input.image_paths) > 0:
         # Use multipart/form-data
@@ -537,6 +542,8 @@ async def async_request_video_sglang(
                     if status == "completed":
                         output.success = True
                         output.response_body = status_data
+                        if "peak_memory_mb" in status_data:
+                            output.peak_memory_mb = status_data["peak_memory_mb"]
                         break
                     elif status == "failed":
                         output.success = False
@@ -557,6 +564,7 @@ async def async_request_video_sglang(
             break
 
     output.latency = time.perf_counter() - output.start_time
+
     if pbar:
         pbar.update(1)
     return output
@@ -568,6 +576,7 @@ def calculate_metrics(outputs: List[RequestFuncOutput], total_duration: float):
 
     num_success = len(success_outputs)
     latencies = [o.latency for o in success_outputs]
+    peak_memories = [o.peak_memory_mb for o in success_outputs if o.peak_memory_mb > 0]
 
     metrics = {
         "duration": total_duration,
@@ -578,12 +587,15 @@ def calculate_metrics(outputs: List[RequestFuncOutput], total_duration: float):
         "latency_median": np.median(latencies) if latencies else 0,
         "latency_p99": np.percentile(latencies, 99) if latencies else 0,
         "latency_p50": np.percentile(latencies, 50) if latencies else 0,
+        "peak_memory_mb_max": max(peak_memories) if peak_memories else 0,
+        "peak_memory_mb_mean": np.mean(peak_memories) if peak_memories else 0,
+        "peak_memory_mb_median": np.median(peak_memories) if peak_memories else 0,
     }
 
     return metrics
 
 
-def wait_for_service(base_url: str, timeout: int = 120) -> None:
+def wait_for_service(base_url: str, timeout: int = 1200) -> None:
     print(f"Waiting for service at {base_url}...")
     start_time = time.time()
     while True:
@@ -625,12 +637,18 @@ async def benchmark(args):
 
     # Setup dataset
     if args.backend == "sglang-image":
-        if args.task == "i2v":
+        if args.task not in ["ti2i", "t2i"]:
+            raise Exception("sglang-image backend only support ti2i and t2i tasks.")
+        if args.task == "ti2i":
             api_url = f"{args.base_url}/v1/images/edits"
         else:
             api_url = f"{args.base_url}/v1/images/generations"
         request_func = async_request_image_sglang
     elif args.backend == "sglang-video":
+        if args.task not in ["t2v", "i2v", "ti2v"]:
+            raise Exception(
+                "sglang-video backend only support t2v, i2v and ti2v tasks."
+            )
         api_url = f"{args.base_url}/v1/videos"
         request_func = async_request_video_sglang
     else:
@@ -719,7 +737,25 @@ async def benchmark(args):
     print("{:<40} {:<15.4f}".format("Latency Median (s):", metrics["latency_median"]))
     print("{:<40} {:<15.4f}".format("Latency P99 (s):", metrics["latency_p99"]))
 
-    print("\n" + "=" * 60)
+    if metrics["peak_memory_mb_max"] > 0:
+        print(f"{'-' * 50}")
+        print(
+            "{:<40} {:<15.2f}".format(
+                "Peak Memory Max (MB):", metrics["peak_memory_mb_max"]
+            )
+        )
+        print(
+            "{:<40} {:<15.2f}".format(
+                "Peak Memory Mean (MB):", metrics["peak_memory_mb_mean"]
+            )
+        )
+        print(
+            "{:<40} {:<15.2f}".format(
+                "Peak Memory Median (MB):", metrics["peak_memory_mb_median"]
+            )
+        )
+
+    print("=" * 60)
 
     if args.output_file:
         with open(args.output_file, "w") as f:
@@ -758,8 +794,8 @@ if __name__ == "__main__":
         "--task",
         type=str,
         default="t2v",
-        choices=["t2v", "i2v", "ti2v", "ti2i"],
-        help="Task type.",
+        choices=["t2v", "i2v", "ti2v", "ti2i", "t2i"],
+        help="Task type. t2v, i2v, ti2v are used for video generation. ti2i, t2i are used for image generation. ti2i is image edit task and t2i is image generation task.",
     )
     parser.add_argument(
         "--dataset-path",

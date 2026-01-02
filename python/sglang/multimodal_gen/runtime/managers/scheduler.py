@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 import pickle
 from collections import deque
+from copy import deepcopy
 from typing import Any, List
 
 import zmq
@@ -22,7 +23,7 @@ from sglang.multimodal_gen.runtime.server_args import (
 )
 from sglang.multimodal_gen.runtime.utils.common import get_zmq_socket
 from sglang.multimodal_gen.runtime.utils.distributed import broadcast_pyobj
-from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.logging_utils import GREEN, RESET, init_logger
 
 logger = init_logger(__name__)
 
@@ -49,7 +50,7 @@ class Scheduler:
 
         # Inter-process Communication
         self.context = zmq.Context(io_threads=2)
-        endpoint = server_args.scheduler_endpoint()
+        endpoint = server_args.scheduler_endpoint
         if gpu_id == 0:
             # router allocates identify (envelope) for each connection
             self.receiver, actual_endpoint = get_zmq_socket(
@@ -82,30 +83,37 @@ class Scheduler:
         # FIFO, new reqs are appended
         self.waiting_queue: deque[tuple[bytes, Req]] = deque()
 
-    def _handle_set_lora(self, reqs: List[Any]):
+        self.warmed_up = False
+
+    def _handle_set_lora(self, reqs: List[Any]) -> OutputBatch:
         # TODO: return set status
+        # TODO: return with SetLoRAResponse or something more appropriate
         req = reqs[0]
-        self.worker.set_lora(req.lora_nickname, req.lora_path, req.target)
-        return {"status": "ok"}
+        return self.worker.set_lora(
+            req.lora_nickname, req.lora_path, req.target, req.strength
+        )
 
     def _handle_merge_lora(self, reqs: List[Any]):
         req = reqs[0]
-        self.worker.merge_lora_weights(req.target)
-        return {"status": "ok"}
+        return self.worker.merge_lora_weights(req.target, req.strength)
 
-    def _handle_unmerge_lora(self, reqs: List[Any]):
+    def _handle_unmerge_lora(self, reqs: List[Any]) -> OutputBatch:
         req = reqs[0]
-        self.worker.unmerge_lora_weights(req.target)
-        return {"status": "ok"}
+        return self.worker.unmerge_lora_weights(req.target)
 
     def _handle_generation(self, reqs: List[Req]):
         return self.worker.execute_forward(reqs)
 
-    def return_result(self, output_batch: OutputBatch, identity: bytes | None = None):
+    def return_result(
+        self,
+        output_batch: OutputBatch,
+        identity: bytes | None = None,
+        is_warmup: bool = False,
+    ):
         """
         replies to client, only on rank 0
         """
-        if self.receiver is not None and identity is not None:
+        if not is_warmup and self.receiver is not None and identity is not None:
             self.receiver.send_multipart([identity, b"", pickle.dumps(output_batch)])
 
     def get_next_batch_to_run(self) -> list[tuple[bytes, Req]] | None:
@@ -124,18 +132,22 @@ class Scheduler:
         """
         if self.receiver is not None:
             try:
-                identity, _, payload = self.receiver.recv_multipart()
-                recv_reqs = pickle.loads(payload)
+                try:
+                    identity, _, payload = self.receiver.recv_multipart(zmq.NOBLOCK)
+                    recv_reqs = pickle.loads(payload)
+                except zmq.Again:
+                    recv_reqs = []
             except zmq.ZMQError:
                 # re-raise or handle appropriately to let the outer loop continue
                 raise
 
-            # Ensure recv_reqs is a list
-            if not isinstance(recv_reqs, list):
-                recv_reqs = [recv_reqs]
+            if recv_reqs:
+                # Ensure recv_reqs is a list
+                if not isinstance(recv_reqs, list):
+                    recv_reqs = [recv_reqs]
 
-            # Pack with identity for rank 0
-            recv_reqs = [(identity, req) for req in recv_reqs]
+                # Pack with identity for rank 0
+                recv_reqs = [(identity, req) for req in recv_reqs]
         else:
             recv_reqs = None
 
@@ -166,6 +178,22 @@ class Scheduler:
 
         assert recv_reqs is not None
 
+        # handle server warmup by inserting an identical req to the beginning of the waiting queue
+        # only the very first req through server's lifetime will be warmup
+        if (
+            not self.warmed_up
+            and len(recv_reqs) == 1
+            and self.server_args.enable_warmup
+        ):
+            identity, req = recv_reqs[0]
+            if isinstance(req, Req):
+                warmup_req = deepcopy(req)
+                warmup_req.is_warmup = True
+                warmup_req.num_inference_steps = 1
+                recv_reqs.insert(0, (identity, warmup_req))
+                self.warmed_up = True
+                logger.info("Server warming up....")
+
         return recv_reqs
 
     def event_loop(self) -> None:
@@ -192,43 +220,51 @@ class Scheduler:
                 continue
 
             # 2: execute, make sure a reply is always sent
-            while self.waiting_queue:
-                items = self.get_next_batch_to_run()
-                if not items:
-                    break
+            items = self.get_next_batch_to_run()
+            if not items:
+                continue
 
-                identities = [item[0] for item in items]
-                reqs = [item[1] for item in items]
+            identities = [item[0] for item in items]
+            reqs = [item[1] for item in items]
 
-                try:
-                    first_req = reqs[0]
-                    handler = self.request_handlers.get(type(first_req))
-                    if handler:
-                        output_batch = handler(reqs)
-                    else:
-                        output_batch = {
-                            "status": "error",
-                            "message": f"Unknown request type: {type(first_req)}",
-                        }
-                except Exception as e:
-                    logger.error(
-                        f"Error executing request in scheduler event loop: {e}",
-                        exc_info=True,
+            try:
+                processed_req = reqs[0]
+                handler = self.request_handlers.get(type(processed_req))
+                if handler:
+                    output_batch = handler(reqs)
+                else:
+                    output_batch = OutputBatch(
+                        error=f"Unknown request type: {type(processed_req)}"
                     )
-                    # Determine appropriate error response format
-                    output_batch = (
-                        OutputBatch(error=str(e))
-                        if reqs and isinstance(reqs[0], Req)
-                        else {"status": "error", "message": str(e)}
+            except Exception as e:
+                logger.error(
+                    f"Error executing request in scheduler event loop: {e}",
+                    exc_info=True,
+                )
+                # Determine appropriate error response format
+                output_batch = (
+                    OutputBatch(error=str(e))
+                    if reqs and isinstance(reqs[0], Req)
+                    else OutputBatch(error=str(e))
+                )
+
+            # 3. return results
+            try:
+                # TODO: Support sending back to multiple identities if batched
+                is_warmup = (
+                    processed_req.is_warmup if isinstance(processed_req, Req) else False
+                )
+                if is_warmup:
+                    logger.info(
+                        f"Server warmup done in {GREEN}%.2f{RESET} seconds",
+                        output_batch.timings.total_duration_s,
                     )
 
-                try:
-                    # TODO: Support sending back to multiple identities if batched
-                    self.return_result(output_batch, identities[0])
-                except zmq.ZMQError as e:
-                    # Reply failed; log and keep loop alive to accept future requests
-                    logger.error(f"ZMQ error sending reply: {e}")
-                    continue
+                self.return_result(output_batch, identities[0], is_warmup=is_warmup)
+            except zmq.ZMQError as e:
+                # Reply failed; log and keep loop alive to accept future requests
+                logger.error(f"ZMQ error sending reply: {e}")
+                continue
 
         logger.info("Scheduler event loop terminated.")
         if self.receiver is not None:
@@ -242,16 +278,6 @@ class Scheduler:
         task = {"method": method, "kwargs": kwargs}
         for pipe in self.task_pipes_to_slaves:
             pipe.send(task)
-
-    def _execute_on_rank0(self, payload: dict[str, Any]) -> dict[str, Any]:
-        """Execute task locally on the rank 0 worker."""
-        method = payload["method"]
-        kwargs = {k: v for k, v in payload.items() if k != "method"}
-        handler = getattr(self.worker, method, None)
-        if handler:
-            result = handler(**kwargs)
-            return {"status": "ok", "result": result}
-        return {"status": "error", "error": f"Unknown method: {method}"}
 
     def _collect_slave_results(self) -> List[dict[str, Any]]:
         """Collect results from all slave worker processes."""
