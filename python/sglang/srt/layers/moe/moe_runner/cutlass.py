@@ -34,12 +34,16 @@ if is_cuda():
     from sgl_kernel import (
         apply_shuffle_mul_sum,
         cutlass_fp4_group_mm,
+        cutlass_w4a8_moe_mm,
+        es_fp8_blockwise_scaled_grouped_mm,
         fp8_blockwise_scaled_grouped_mm,
+        get_cutlass_w4a8_moe_mm_data,
         prepare_moe_input,
         scaled_fp4_experts_quant,
         shuffle_rows,
         silu_and_mul,
     )
+    from sgl_kernel.gemm import sgl_per_tensor_quant_fp8
 
 
 @dataclass
@@ -955,7 +959,10 @@ def pre_permute_standard_to_cutlass(
     runner_config: MoeRunnerConfig,
     running_state: Dict[str, torch.Tensor],
 ) -> CutlassRunnerInput:
-    hidden_states, topk_output = dispatch_output
+    hidden_states, topk_output = (
+        dispatch_output.hidden_states,
+        dispatch_output.topk_output,
+    )
     topk_weights, topk_ids, _ = topk_output
 
     device = hidden_states.device
@@ -1092,7 +1099,11 @@ def pre_permute_standard_to_cutlass(
         )
         from sglang.srt.layers.moe.ep_moe.kernels import (
             cutlass_w4_run_moe_ep_preproess,
+            deepep_ll_get_cutlass_w4a8_moe_mm_data,
+            deepep_permute_triton_kernel,
+            deepep_run_moe_deep_preprocess,
             pre_reorder_for_cutlass_moe,
+            silu_and_mul_masked_post_per_tensor_quant_fwd,
         )
 
         # Store state for post_permute
@@ -1369,7 +1380,7 @@ def pre_permute_deepep_normal_to_cutlass(
     runner_config: MoeRunnerConfig,
     running_state: Dict[str, torch.Tensor],
 ) -> CutlassRunnerInput:
-    hidden_states, _, topk_ids_, topk_weights, _, _ = dispatch_output
+    hidden_states, _, topk_ids_, topk_weights, _ = dispatch_output
 
     # Store state for post_permute
     running_state["topk_ids"] = topk_ids_
