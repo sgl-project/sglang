@@ -215,15 +215,38 @@ def handle_rerun_stage(
             print(f"Error: {workflow_name} workflow not found")
             return False
 
-        # Trigger workflow_dispatch on the PR's head branch
-        ref = pr.head.ref
-        print(f"Triggering {workflow_name} workflow on branch: {ref}")
+        # Check if PR is from a fork by comparing repo owners
+        # Handle case where fork repo may have been deleted (pr.head.repo is None)
+        is_fork = (
+            pr.head.repo is None or pr.head.repo.owner.login != gh_repo.owner.login
+        )
+        print(f"PR is from fork: {is_fork}")
 
-        # AMD workflow doesn't have version input, only target_stage
-        if is_amd_stage:
-            inputs = {"target_stage": stage_name}
+        if is_fork:
+            # For fork PRs: dispatch on main and pass SHA as input
+            # This is needed because fork branch names don't exist in the main repo
+            ref = "main"
+            pr_head_sha = pr.head.sha
+            print(
+                f"Triggering {workflow_name} workflow on ref: {ref}, PR head SHA: {pr_head_sha}"
+            )
+            if is_amd_stage:
+                inputs = {"target_stage": stage_name, "pr_head_sha": pr_head_sha}
+            else:
+                inputs = {
+                    "version": "release",
+                    "target_stage": stage_name,
+                    "pr_head_sha": pr_head_sha,
+                }
         else:
-            inputs = {"version": "release", "target_stage": stage_name}
+            # For non-fork PRs: dispatch on the PR branch directly
+            # This allows testing workflow changes before merge
+            ref = pr.head.ref
+            print(f"Triggering {workflow_name} workflow on branch: {ref}")
+            if is_amd_stage:
+                inputs = {"target_stage": stage_name}
+            else:
+                inputs = {"version": "release", "target_stage": stage_name}
 
         # Use requests directly as PyGithub's create_dispatch only accepts HTTP 204
         dispatch_url = f"https://api.github.com/repos/{gh_repo.full_name}/actions/workflows/{target_workflow.id}/dispatches"
