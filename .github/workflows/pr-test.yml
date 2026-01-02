@@ -299,7 +299,9 @@ jobs:
 
   sgl-kernel-mla-test:
     needs: [check-changes, call-gate, sgl-kernel-build-wheels]
-    if: needs.check-changes.outputs.sgl_kernel == 'true'
+    if: |
+      !inputs.target_stage &&
+      needs.check-changes.outputs.sgl_kernel == 'true'
     runs-on: 1-gpu-runner
     env:
       RUNNER_LABELS: 1-gpu-runner
@@ -332,7 +334,9 @@ jobs:
 
   sgl-kernel-benchmark-test:
     needs: [check-changes, call-gate, sgl-kernel-build-wheels]
-    if: needs.check-changes.outputs.sgl_kernel == 'true'
+    if: |
+      !inputs.target_stage &&
+      needs.check-changes.outputs.sgl_kernel == 'true'
     runs-on: 1-gpu-runner
     env:
       CI: true
@@ -378,7 +382,9 @@ jobs:
 
   sgl-kernel-b200-test:
     needs: [check-changes, sgl-kernel-build-wheels]
-    if: needs.check-changes.outputs.sgl_kernel == 'true'
+    if: |
+      !inputs.target_stage &&
+      needs.check-changes.outputs.sgl_kernel == 'true'
     runs-on: ${{ needs.check-changes.outputs.b200_runner }}
     env:
       RUNNER_LABELS: ${{ needs.check-changes.outputs.b200_runner }}
