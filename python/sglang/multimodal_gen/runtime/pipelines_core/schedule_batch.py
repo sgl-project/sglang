@@ -14,7 +14,7 @@ from __future__ import annotations
 import os
 import pprint
 from dataclasses import asdict, dataclass, field
-from typing import TYPE_CHECKING, Any, Optional
+from typing import Any, Optional
 
 import PIL.Image
 import torch
@@ -25,10 +25,11 @@ from sglang.multimodal_gen.configs.sample.teacache import (
     WanTeaCacheParams,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.perf_logger import RequestTimings
+from sglang.multimodal_gen.utils import align_to
 
-if TYPE_CHECKING:
-
-    from sglang.multimodal_gen.runtime.utils.perf_logger import RequestTimings
+logger = init_logger(__name__)
 
 
 @dataclass
@@ -51,7 +52,7 @@ class Req:
     generator: torch.Generator | list[torch.Generator] | None = None
 
     # Image inputs
-    image_path: str | None = None
+    image_path: str | list[str] | None = None
     # Image encoder hidden states
     image_embeds: list[torch.Tensor] = field(default_factory=list)
 
@@ -129,7 +130,10 @@ class Req:
     boundary_ratio: float | None = None
 
     # Scheduler parameters
-    num_inference_steps: int = 50
+    # Can be overridden via SGLANG_TEST_NUM_INFERENCE_STEPS env var for faster testing
+    num_inference_steps: int = int(
+        os.environ.get("SGLANG_TEST_NUM_INFERENCE_STEPS", "50")
+    )
     guidance_scale: float = 1.0
     guidance_scale_2: float | None = None
     guidance_rescale: float = 0.0
@@ -199,7 +203,7 @@ class Req:
         batch_size *= self.num_outputs_per_prompt
         return batch_size
 
-    def output_file_path(self, num_outputs, output_idx):
+    def output_file_path(self, num_outputs=1, output_idx=None):
         output_file_name = self.output_file_name
         if num_outputs > 1 and output_file_name:
             base, ext = os.path.splitext(output_file_name)
@@ -221,11 +225,44 @@ class Req:
         if self.guidance_scale_2 is None:
             self.guidance_scale_2 = self.guidance_scale
 
+        self.timings = RequestTimings(request_id=self.request_id)
+
     def adjust_size(self, server_args: ServerArgs):
         pass
 
     def __str__(self):
         return pprint.pformat(asdict(self), indent=2, width=120)
+
+    def log(self, server_args: ServerArgs):
+        # TODO: in some cases (e.g., TI2I), height and weight might be undecided at this moment
+        if self.height:
+            target_height = align_to(self.height, 16)
+        else:
+            target_height = -1
+        if self.width:
+            target_width = align_to(self.width, 16)
+        else:
+            target_width = -1
+
+        # Log sampling parameters
+        debug_str = f"""Sampling params:
+                       width: {target_width}
+                      height: {target_height}
+                  num_frames: {self.num_frames}
+                      prompt: {self.prompt}
+                  neg_prompt: {self.negative_prompt}
+                        seed: {self.seed}
+                 infer_steps: {self.num_inference_steps}
+      num_outputs_per_prompt: {self.num_outputs_per_prompt}
+              guidance_scale: {self.guidance_scale}
+     embedded_guidance_scale: {server_args.pipeline_config.embedded_cfg_scale}
+                    n_tokens: {self.n_tokens}
+                  flow_shift: {server_args.pipeline_config.flow_shift}
+                  image_path: {self.image_path}
+                 save_output: {self.save_output}
+            output_file_path: {self.output_file_path()}
+        """  # type: ignore[attr-defined]
+        logger.info(debug_str)
 
 
 @dataclass
@@ -242,3 +279,4 @@ class OutputBatch:
 
     # logged timings info, directly from Req.timings
     timings: Optional["RequestTimings"] = None
+    peak_memory_mb: float = 0.0

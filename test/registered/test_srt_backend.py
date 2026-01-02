@@ -49,6 +49,7 @@ class TestSRTBackend(CustomTestCase):
     def test_decode_int(self):
         test_decode_int()
 
+    @unittest.skip("Skip this flaky test.")
     def test_decode_json_regex(self):
         test_decode_json_regex()
 

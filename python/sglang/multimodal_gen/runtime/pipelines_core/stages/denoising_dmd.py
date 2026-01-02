@@ -89,7 +89,6 @@ class DmdDenoisingStage(DenoisingStage):
         )
 
         pos_cond_kwargs = prepared_vars["pos_cond_kwargs"]
-        prompt_embeds = prepared_vars["prompt_embeds"]
 
         denoising_loop_start_time = time.time()
         with self.progress_bar(total=len(timesteps)) as progress_bar:
@@ -99,7 +98,10 @@ class DmdDenoisingStage(DenoisingStage):
                     continue
 
                 with StageProfiler(
-                    f"denoising_step_{i}", logger=logger, timings=batch.timings
+                    f"denoising_step_{i}",
+                    logger=logger,
+                    timings=batch.timings,
+                    perf_dump_path_provided=batch.perf_dump_path is not None,
                 ):
                     # Expand latents for I2V
                     noise_latents = latents.clone()
@@ -142,9 +144,8 @@ class DmdDenoisingStage(DenoisingStage):
                         ):
                             # Run transformer
                             pred_noise = self.transformer(
-                                latent_model_input.permute(0, 2, 1, 3, 4),
-                                prompt_embeds,
-                                t_expand,
+                                hidden_states=latent_model_input.permute(0, 2, 1, 3, 4),
+                                timestep=t_expand,
                                 guidance=guidance_expand,
                                 **image_kwargs,
                                 **pos_cond_kwargs,
