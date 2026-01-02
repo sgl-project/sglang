@@ -13,12 +13,19 @@ To learn more details about R-Fork, please check **<a href=https://lmsys.org/blo
 | remote-instance-weight-loader-seed-instance-ip | IP address of the seed instance who will provide the model weight |
 | remote-instance-weight-loader-seed-instance-service-port | the port that the seed instance's HTTP server is listening on |
 | remote-instance-weight-loader-send-weights-group-ports | the list of available ports on the seed instance that will be used to build NCCL communication groups between seed and client instance. This argument is only needed by `nccl` backend.  |
+| remote-instance-weight-loader-start-seed-via-transfer-engine | set to start seed service that supports TransferEngine as backend. It is needed for seed instances when using `transfer_engine` as backend. |
 
 ### NCCL as backend
 
+seed instance:
+```shell
+python -m sglang.launch_server [args]
+```
+
+client instance:
 ```shell
 python -m sglang.launch_server [args] \
-  --load-format remote_instance	\
+  --load-format remote_instance \
   --remote-instance-weight-loader-seed-instance-ip [seed_instance_ip] \
   --remote-instance-weight-loader-seed-instance-service-port [seed_instance_service_port] \
   --remote-instance-weight-loader-send-weights-group-ports [send_weights_nccl_group_ports_list]  \
@@ -27,9 +34,15 @@ python -m sglang.launch_server [args] \
 
 ### TransferEngine as backend
 
+seed instance:
 ```shell
 python -m sglang.launch_server [args] \
-  --load-format remote_instance	\
+  --remote-instance-weight-loader-start-seed-via-transfer-engine
+```
+
+```shell
+python -m sglang.launch_server [args] \
+  --load-format remote_instance \
   --remote-instance-weight-loader-seed-instance-ip [seed_instance_ip] \
   --remote-instance-weight-loader-seed-instance-service-port [seed_instance_service_port] \
   --remote-instance-weight-loader-backend transfer_engine

@@ -660,9 +660,8 @@ impl McpManager {
 
                 // Create HTTP client with proxy support
                 let client = if token.is_some() {
-                    let mut builder = reqwest::Client::builder()
-                        .timeout(Duration::from_secs(30))
-                        .connect_timeout(Duration::from_secs(10));
+                    let mut builder =
+                        reqwest::Client::builder().connect_timeout(Duration::from_secs(10));
 
                     // Apply proxy configuration using proxy.rs helper
                     if let Some(proxy_cfg) = proxy_config {

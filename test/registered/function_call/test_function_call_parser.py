@@ -7,6 +7,7 @@ from sglang.srt.function_call.core_types import StreamingParseResult
 from sglang.srt.function_call.deepseekv3_detector import DeepSeekV3Detector
 from sglang.srt.function_call.deepseekv32_detector import DeepSeekV32Detector
 from sglang.srt.function_call.glm4_moe_detector import Glm4MoeDetector
+from sglang.srt.function_call.glm47_moe_detector import Glm47MoeDetector
 from sglang.srt.function_call.json_array_parser import JsonArrayParser
 from sglang.srt.function_call.kimik2_detector import KimiK2Detector
 from sglang.srt.function_call.llama32_detector import Llama32Detector
@@ -1158,6 +1159,10 @@ class TestDeepSeekV32Detector(unittest.TestCase):
             ),
         ]
         self.detector = DeepSeekV32Detector()
+        from transformers import AutoTokenizer
+
+        self.tokenizer = AutoTokenizer.from_pretrained("deepseek-ai/DeepSeek-V3.2")
+        self.interval = 1
 
     def test_detect_and_parse_xml_format(self):
         """Test parsing standard XML format (DSML)"""
@@ -1235,12 +1240,19 @@ class TestDeepSeekV32Detector(unittest.TestCase):
         text = """<｜DSML｜function_calls>
             <｜DSML｜invoke name="get_favorite_tourist_spot">
                 <｜DSML｜parameter name="city" string="true">San Francisco</｜DSML｜parameter>
+                <｜DSML｜parameter name="another_city" string="true">London</｜DSML｜parameter>
+                <｜DSML｜parameter name="topn" string="false">10</｜DSML｜parameter>
+                <｜DSML｜parameter name="obj" string="false">{"name": "John", "age": 30}</｜DSML｜parameter>
             </｜DSML｜invoke>
         </｜DSML｜function_calls>"""
 
-        chunks = [text[i : i + 5] for i in range(0, len(text), 5)]
+        input_ids = self.tokenizer.encode(text, add_special_tokens=False)
+        chunk_ids = [
+            input_ids[i : i + self.interval]
+            for i in range(0, len(input_ids), self.interval)
+        ]
+        chunks = [self.tokenizer.decode(chunk_id) for chunk_id in chunk_ids]
 
-        accumulated_calls = []
         tool_calls_by_index = {}
 
         for chunk in chunks:
@@ -1262,15 +1274,12 @@ class TestDeepSeekV32Detector(unittest.TestCase):
 
         self.assertEqual(len(tool_calls_by_index), 1)
         self.assertEqual(tool_calls_by_index[0]["name"], "get_favorite_tourist_spot")
-        # Note: The detector might accumulate partial JSON string which is valid,
-        # but for XML format it constructs JSON at the end.
-        # Let's check if the final parameters parse correctly.
-        try:
-            params = json.loads(tool_calls_by_index[0]["parameters"])
-            self.assertEqual(params["city"], "San Francisco")
-        except json.JSONDecodeError:
-            # In streaming XML, parameters might be constructed differently or incrementally
-            pass
+        params = json.loads(tool_calls_by_index[0]["parameters"])
+        self.assertEqual(params["city"], "San Francisco")
+        self.assertEqual(params["another_city"], "London")
+        self.assertEqual(params["topn"], 10)
+        self.assertEqual(params["obj"]["name"], "John")
+        self.assertEqual(params["obj"]["age"], 30)
 
     def test_streaming_json_format(self):
         """Test streaming parsing of JSON format"""
@@ -1282,7 +1291,12 @@ class TestDeepSeekV32Detector(unittest.TestCase):
             </｜DSML｜invoke>
         </｜DSML｜function_calls>"""
 
-        chunks = [text[i : i + 5] for i in range(0, len(text), 5)]
+        input_ids = self.tokenizer.encode(text, add_special_tokens=False)
+        chunk_ids = [
+            input_ids[i : i + self.interval]
+            for i in range(0, len(input_ids), self.interval)
+        ]
+        chunks = [self.tokenizer.decode(chunk_id) for chunk_id in chunk_ids]
 
         tool_calls_by_index = {}
 
@@ -1369,7 +1383,12 @@ class TestDeepSeekV32Detector(unittest.TestCase):
         self.detector = DeepSeekV32Detector()
 
         # Simulate streaming by splitting into small chunks
-        chunks = [text[i : i + 5] for i in range(0, len(text), 5)]
+        input_ids = self.tokenizer.encode(text, add_special_tokens=False)
+        chunk_ids = [
+            input_ids[i : i + self.interval]
+            for i in range(0, len(input_ids), self.interval)
+        ]
+        chunks = [self.tokenizer.decode(chunk_id) for chunk_id in chunk_ids]
 
         tool_calls_by_index = {}
 
@@ -1424,7 +1443,12 @@ class TestDeepSeekV32Detector(unittest.TestCase):
         # Reset detector state
         self.detector = DeepSeekV32Detector()
 
-        chunks = [text[i : i + 5] for i in range(0, len(text), 5)]
+        input_ids = self.tokenizer.encode(text, add_special_tokens=False)
+        chunk_ids = [
+            input_ids[i : i + self.interval]
+            for i in range(0, len(input_ids), self.interval)
+        ]
+        chunks = [self.tokenizer.decode(chunk_id) for chunk_id in chunk_ids]
 
         tool_calls_by_index = {}
 
@@ -2034,12 +2058,12 @@ class TestGlm4MoeDetector(unittest.TestCase):
                     and tool_call_chunk.tool_index is not None
                 ):
                     while len(tool_calls) <= tool_call_chunk.tool_index:
-                        tool_calls.append({"name": "", "parameters": {}})
+                        tool_calls.append({"name": "", "parameters": ""})
                     tc = tool_calls[tool_call_chunk.tool_index]
                     if tool_call_chunk.name:
                         tc["name"] = tool_call_chunk.name
                     if tool_call_chunk.parameters:
-                        tc["parameters"] = tool_call_chunk.parameters
+                        tc["parameters"] += tool_call_chunk.parameters
         self.assertEqual(len(tool_calls), 1)
         self.assertEqual(tool_calls[0]["name"], "get_weather")
         self.assertEqual(
@@ -2066,12 +2090,12 @@ class TestGlm4MoeDetector(unittest.TestCase):
                     and tool_call_chunk.tool_index is not None
                 ):
                     while len(tool_calls) <= tool_call_chunk.tool_index:
-                        tool_calls.append({"name": "", "parameters": {}})
+                        tool_calls.append({"name": "", "parameters": ""})
                     tc = tool_calls[tool_call_chunk.tool_index]
                     if tool_call_chunk.name:
                         tc["name"] = tool_call_chunk.name
                     if tool_call_chunk.parameters:
-                        tc["parameters"] = tool_call_chunk.parameters
+                        tc["parameters"] += tool_call_chunk.parameters
         self.assertEqual(len(tool_calls), 2)
         self.assertEqual(tool_calls[0]["name"], "get_weather")
         self.assertEqual(
@@ -2102,19 +2126,33 @@ class TestGlm4MoeDetector(unittest.TestCase):
 
     def test_partial_tool_call(self):
         """Test parsing a partial tool call that spans multiple chunks."""
-        text1 = "<tool_call>get_weather\n<arg_key>city</arg_key>\n"
-        result1 = self.detector.parse_streaming_increment(text1, self.tools)
-        self.assertEqual(result1.normal_text, "")
-        self.assertEqual(result1.calls, [])
-        self.assertEqual(self.detector._buffer, text1)
-        text2 = "<arg_value>Beijing</arg_value>\n<arg_key>date</arg_key>\n<arg_value>2024-06-27</arg_value>\n</tool_call>"
-        result2 = self.detector.parse_streaming_increment(text2, self.tools)
-        self.assertEqual(len(result2.calls), 1)
-        self.assertEqual(result2.calls[0].name, "get_weather")
+        chunks = [
+            "<tool_call>get_weather\n",
+            "<arg_key>city</arg_key>\n<arg_value>Beijing</arg_value>\n",
+            "<arg_key>date</arg_key>\n<arg_value>2024-06-27</arg_value>\n</tool_call>",
+        ]
+
+        tool_calls = []
+        for chunk in chunks:
+            result = self.detector.parse_streaming_increment(chunk, self.tools)
+            for tool_call_chunk in result.calls:
+                if (
+                    hasattr(tool_call_chunk, "tool_index")
+                    and tool_call_chunk.tool_index is not None
+                ):
+                    while len(tool_calls) <= tool_call_chunk.tool_index:
+                        tool_calls.append({"name": "", "parameters": ""})
+                    tc = tool_calls[tool_call_chunk.tool_index]
+                    if tool_call_chunk.name:
+                        tc["name"] = tool_call_chunk.name
+                    if tool_call_chunk.parameters:
+                        tc["parameters"] += tool_call_chunk.parameters
+
+        self.assertEqual(len(tool_calls), 1)
+        self.assertEqual(tool_calls[0]["name"], "get_weather")
         self.assertEqual(
-            result2.calls[0].parameters, '{"city": "Beijing", "date": "2024-06-27"}'
+            tool_calls[0]["parameters"], '{"city": "Beijing", "date": "2024-06-27"}'
         )
-        self.assertEqual(self.detector._buffer, "")
 
     def test_array_argument_with_escaped_json(self):
         """Test that array arguments with escaped JSON are properly handled without double-escaping."""
@@ -2215,6 +2253,297 @@ class TestGlm4MoeDetector(unittest.TestCase):
         check_single_todos(result, expected_output)
         result = self.detector.detect_and_parse(
             r"""<tool_call>todo_write\n<arg_key>todos</arg_key>\n<arg_value>[{\"id\": \"1\", \"task\": \"Print \\\\n to see newline\",\"status\": \"pending\"}]</arg_value></tool_call>""",
+            tools_with_array,
+        )
+        check_single_todos(result, expected_output)
+
+    def test_empty_function_name_handling(self):
+        """Test that empty function name is handled gracefully without assertion error."""
+        # This test simulates the issue where the model outputs only the start token without a function name
+        chunks = [
+            "<tool_call>",  # Start token only, no function name yet
+            "\n",  # More content without function name
+        ]
+
+        for chunk in chunks:
+            # Should not raise AssertionError: func_name should not be empty
+            result = self.detector.parse_streaming_increment(chunk, self.tools)
+            # Should return empty calls without error
+            self.assertIsInstance(result, StreamingParseResult)
+            self.assertEqual(result.calls, [])
+
+
+class TestGlm47MoeDetector(unittest.TestCase):
+    def setUp(self):
+        self.tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="get_weather",
+                    description="Get weather information",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "city": {"type": "string", "description": "City name"},
+                            "date": {"type": "string", "description": "Date"},
+                        },
+                        "required": ["city", "date"],
+                    },
+                ),
+            ),
+        ]
+        self.detector = Glm47MoeDetector()
+
+    def test_single_tool_call(self):
+        text = (
+            "<tool_call>get_weather"
+            "<arg_key>city</arg_key><arg_value>Beijing</arg_value>"
+            "<arg_key>date</arg_key><arg_value>2024-06-27</arg_value>"
+            "</tool_call>"
+        )
+        result = self.detector.detect_and_parse(text, self.tools)
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(result.calls[0].name, "get_weather")
+        self.assertEqual(
+            result.calls[0].parameters, '{"city": "Beijing", "date": "2024-06-27"}'
+        )
+        self.assertEqual(result.normal_text, "")
+
+    def test_multiple_tool_calls(self):
+        text = (
+            "<tool_call>get_weather"
+            "<arg_key>city</arg_key><arg_value>Beijing</arg_value>"
+            "<arg_key>date</arg_key><arg_value>2024-06-27</arg_value>"
+            "</tool_call>"
+            "<tool_call>get_weather"
+            "<arg_key>city</arg_key><arg_value>Shanghai</arg_value>"
+            "<arg_key>date</arg_key><arg_value>2024-06-28</arg_value>"
+            "</tool_call>"
+        )
+        result = self.detector.detect_and_parse(text, self.tools)
+        self.assertEqual(len(result.calls), 2)
+        self.assertEqual(result.calls[0].name, "get_weather")
+        self.assertEqual(
+            result.calls[0].parameters, '{"city": "Beijing", "date": "2024-06-27"}'
+        )
+        self.assertEqual(result.calls[1].name, "get_weather")
+        self.assertEqual(
+            result.calls[1].parameters, '{"city": "Shanghai", "date": "2024-06-28"}'
+        )
+        self.assertEqual(result.normal_text, "")
+
+    def test_streaming_tool_call(self):
+        """Test streaming incremental parsing of a tool call."""
+        chunks = [
+            "<tool_call>get_weather",
+            "<arg_key>city</arg_key><arg_value>Beijing</arg_value>",
+            "<arg_key>date</arg_key><arg_value>2024-06-27</arg_value>",
+            "</tool_call>",
+        ]
+        tool_calls = []
+        for chunk in chunks:
+            result = self.detector.parse_streaming_increment(chunk, self.tools)
+            for tool_call_chunk in result.calls:
+                if (
+                    hasattr(tool_call_chunk, "tool_index")
+                    and tool_call_chunk.tool_index is not None
+                ):
+                    while len(tool_calls) <= tool_call_chunk.tool_index:
+                        tool_calls.append({"name": "", "parameters": ""})
+                    tc = tool_calls[tool_call_chunk.tool_index]
+                    if tool_call_chunk.name:
+                        tc["name"] = tool_call_chunk.name
+                    if tool_call_chunk.parameters:
+                        tc["parameters"] += tool_call_chunk.parameters
+        self.assertEqual(len(tool_calls), 1)
+        self.assertEqual(tool_calls[0]["name"], "get_weather")
+        self.assertEqual(
+            tool_calls[0]["parameters"], '{"city": "Beijing", "date": "2024-06-27"}'
+        )
+
+    def test_streaming_multiple_tool_calls(self):
+        """Test streaming incremental parsing of multiple tool calls."""
+        chunks = [
+            "<tool_call>get_weather",
+            "<arg_key>city</arg_key><arg_value>Beijing</arg_value>",
+            "<arg_key>date</arg_key><arg_value>2024-06-27</arg_value>",
+            "</tool_call><tool_call>get_weather",
+            "<arg_key>city</arg_key><arg_value>Shanghai</arg_value>",
+            "<arg_key>date</arg_key><arg_value>2024-06-28</arg_value>",
+            "</tool_call>",
+        ]
+        tool_calls = []
+        for chunk in chunks:
+            result = self.detector.parse_streaming_increment(chunk, self.tools)
+            for tool_call_chunk in result.calls:
+                if (
+                    hasattr(tool_call_chunk, "tool_index")
+                    and tool_call_chunk.tool_index is not None
+                ):
+                    while len(tool_calls) <= tool_call_chunk.tool_index:
+                        tool_calls.append({"name": "", "parameters": ""})
+                    tc = tool_calls[tool_call_chunk.tool_index]
+                    if tool_call_chunk.name:
+                        tc["name"] = tool_call_chunk.name
+                    if tool_call_chunk.parameters:
+                        tc["parameters"] += tool_call_chunk.parameters
+        self.assertEqual(len(tool_calls), 2)
+        self.assertEqual(tool_calls[0]["name"], "get_weather")
+        self.assertEqual(
+            tool_calls[0]["parameters"], '{"city": "Beijing", "date": "2024-06-27"}'
+        )
+        self.assertEqual(tool_calls[1]["name"], "get_weather")
+        self.assertEqual(
+            tool_calls[1]["parameters"], '{"city": "Shanghai", "date": "2024-06-28"}'
+        )
+
+    def test_tool_call_id(self):
+        """Test that the buffer and state are reset after a tool call is completed."""
+        chunks = [
+            "<tool_call>get_weather",
+            "<arg_key>city</arg_key><arg_value>Beijing</arg_value>",
+            "<arg_key>date</arg_key><arg_value>2024-06-27</arg_value>",
+            "</tool_call>",
+        ]
+        for chunk in chunks:
+            result = self.detector.parse_streaming_increment(chunk, self.tools)
+        self.assertEqual(self.detector.current_tool_id, 1)
+
+    def test_invalid_tool_call(self):
+        """Test that invalid tool calls are handled correctly."""
+        text = "<tool_call>invalid_func<arg_key>city</arg_key><arg_value>Beijing</arg_value></tool_call>"
+        result = self.detector.detect_and_parse(text, self.tools)
+        self.assertEqual(len(result.calls), 0)
+
+    def test_partial_tool_call(self):
+        """Test parsing a partial tool call that spans multiple chunks."""
+        chunks = [
+            "<tool_call>get_weather",
+            "<arg_key>city</arg_key><arg_value>Beijing</arg_value>",
+            "<arg_key>date</arg_key><arg_value>2024-06-27</arg_value></tool_call>",
+        ]
+
+        tool_calls = []
+        for chunk in chunks:
+            result = self.detector.parse_streaming_increment(chunk, self.tools)
+            for tool_call_chunk in result.calls:
+                if (
+                    hasattr(tool_call_chunk, "tool_index")
+                    and tool_call_chunk.tool_index is not None
+                ):
+                    while len(tool_calls) <= tool_call_chunk.tool_index:
+                        tool_calls.append({"name": "", "parameters": ""})
+                    tc = tool_calls[tool_call_chunk.tool_index]
+                    if tool_call_chunk.name:
+                        tc["name"] = tool_call_chunk.name
+                    if tool_call_chunk.parameters:
+                        tc["parameters"] += tool_call_chunk.parameters
+
+        self.assertEqual(len(tool_calls), 1)
+        self.assertEqual(tool_calls[0]["name"], "get_weather")
+        self.assertEqual(
+            tool_calls[0]["parameters"], '{"city": "Beijing", "date": "2024-06-27"}'
+        )
+
+    def test_array_argument_with_escaped_json(self):
+        """Test that array arguments with escaped JSON are properly handled without double-escaping."""
+        # Add a tool with array parameter
+        tools_with_array = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="todo_write",
+                    description="Write todos",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "todos": {
+                                "type": "array",
+                                "description": "The updated todo list",
+                            }
+                        },
+                        "required": ["todos"],
+                    },
+                ),
+            ),
+        ]
+
+        def check_params(result):
+            self.assertEqual(1, len(result.calls))
+            self.assertEqual("todo_write", result.calls[0].name)
+            params = json.loads(result.calls[0].parameters)
+            self.assertIsInstance(params["todos"], list)
+            self.assertEqual(4, len(params["todos"]))
+            self.assertEqual("1", params["todos"][0]["id"])
+            self.assertEqual(
+                "Check for hard-coded issues in the backend code",
+                params["todos"][0]["task"],
+            )
+            self.assertEqual("in_progress", params["todos"][0]["status"])
+            self.assertEqual("2", params["todos"][1]["id"])
+            self.assertEqual(
+                "Check for hard-coded issues in the frontend code",
+                params["todos"][1]["task"],
+            )
+            self.assertEqual("pending", params["todos"][1]["status"])
+            self.assertEqual("3", params["todos"][2]["id"])
+            self.assertEqual(
+                "Check for code violating the Single Responsibility Principle",
+                params["todos"][2]["task"],
+            )
+            self.assertEqual("pending", params["todos"][2]["status"])
+            self.assertEqual("4", params["todos"][3]["id"])
+            self.assertEqual(
+                "Generate a rectification proposal report", params["todos"][3]["task"]
+            )
+            self.assertEqual("pending", params["todos"][3]["status"])
+
+        # Simulate the raw response from GLM-4.6 model with normal and escaped JSON in XML
+        result = self.detector.detect_and_parse(
+            """<tool_call>todo_write<arg_key>todos</arg_key><arg_value>[{\"id\": \"1\", \"task\": \"Check for hard-coded issues in the backend code\", \"status\": \"in_progress\"}, {\"id\": \"2\", \"task\": \"Check for hard-coded issues in the frontend code\", \"status\": \"pending\"}, {\"id\": \"3\", \"task\": \"Check for code violating the Single Responsibility Principle\", \"status\": \"pending\"}, {\"id\": \"4\", \"task\": \"Generate a rectification proposal report\", \"status\": \"pending\"}]</arg_value>
+</tool_call>""",
+            tools_with_array,
+        )
+        check_params(result)
+        result = self.detector.detect_and_parse(
+            r"""<tool_call>todo_write<arg_key>todos</arg_key><arg_value>[{\"id\": \"1\", \"task\": \"Check for hard-coded issues in the backend code\", \"status\": \"in_progress\"}, {\"id\": \"2\", \"task\": \"Check for hard-coded issues in the frontend code\", \"status\": \"pending\"}, {\"id\": \"3\", \"task\": \"Check for code violating the Single Responsibility Principle\", \"status\": \"pending\"}, {\"id\": \"4\", \"task\": \"Generate a rectification proposal report\", \"status\": \"pending\"}]</arg_value>
+</tool_call>""",
+            tools_with_array,
+        )
+        check_params(result)
+
+        def check_single_todos(tool_result, expected):
+            self.assertEqual(1, len(tool_result.calls))
+            self.assertEqual("todo_write", tool_result.calls[0].name)
+            params = json.loads(tool_result.calls[0].parameters)
+            self.assertIsInstance(params["todos"], list)
+            self.assertEqual(1, len(params["todos"]))
+            self.assertEqual("1", params["todos"][0]["id"])
+            self.assertEqual(expected, params["todos"][0]["task"])
+            self.assertEqual("pending", params["todos"][0]["status"])
+
+        # Test with escaped JSON containing backslashes in content (e.g., Windows paths)
+        expected_path = r"Check file at C:\Users\test.txt"
+        result = self.detector.detect_and_parse(
+            """<tool_call>todo_write<arg_key>todos</arg_key><arg_value>[{\"id\": \"1\", \"task\": \"Check file at C:\\\\Users\\\\test.txt\", \"status\": \"pending\"}]</arg_value></tool_call>""",
+            tools_with_array,
+        )
+        check_single_todos(result, expected_path)
+        result = self.detector.detect_and_parse(
+            r"""<tool_call>todo_write<arg_key>todos</arg_key><arg_value>[{\"id\": \"1\", \"task\": \"Check file at C:\\\\Users\\\\test.txt\", \"status\": \"pending\"}]</arg_value></tool_call>""",
+            tools_with_array,
+        )
+        check_single_todos(result, expected_path)
+
+        # Should contain literal \n, not actual newline
+        expected_output = r"Print \n to see newline"
+        result = self.detector.detect_and_parse(
+            """<tool_call>todo_write<arg_key>todos</arg_key><arg_value>[{\"id\": \"1\", \"task\": \"Print \\\\n to see newline\",\"status\": \"pending\"}]</arg_value></tool_call>""",
+            tools_with_array,
+        )
+        check_single_todos(result, expected_output)
+        result = self.detector.detect_and_parse(
+            r"""<tool_call>todo_write<arg_key>todos</arg_key><arg_value>[{\"id\": \"1\", \"task\": \"Print \\\\n to see newline\",\"status\": \"pending\"}]</arg_value></tool_call>""",
             tools_with_array,
         )
         check_single_todos(result, expected_output)

@@ -363,9 +363,10 @@ class LayerCommunicator:
         residual: torch.Tensor,
         forward_batch: ForwardBatch,
         captured_last_layer_outputs: Optional[List[torch.Tensor]] = None,
+        **kwargs,
     ):
         hidden_states, residual = self.prepare_attn(
-            hidden_states, residual, forward_batch
+            hidden_states, residual, forward_batch, **kwargs
         )
         if captured_last_layer_outputs is not None:
             gathered_last_layer_output = self._communicate_simple_fn(
@@ -385,6 +386,7 @@ class LayerCommunicator:
         residual: torch.Tensor,
         forward_batch: ForwardBatch,
         quant_format: str = "",
+        **kwargs,
     ):
         if get_attn_tp_context().input_scattered:
             hidden_states, residual = self._tp_reduce_scatter(
@@ -434,7 +436,7 @@ class LayerCommunicator:
                         )
 
                     else:
-                        hidden_states = self.input_layernorm(hidden_states)
+                        hidden_states = self.input_layernorm(hidden_states, **kwargs)
                 else:
 
                     if _use_aiter and _is_gfx95_supported and ("mxfp4" in quant_format):
@@ -466,7 +468,9 @@ class LayerCommunicator:
                         )
                     else:
                         hidden_states, residual = self.input_layernorm(
-                            hidden_states, residual
+                            hidden_states,
+                            residual,
+                            **kwargs,
                         )
 
         hidden_states = self._communicate_simple_fn(
@@ -545,6 +549,7 @@ class LayerCommunicator:
             return True
         return False
 
+    # NOTE: This function will cause torch recompilation
     def should_fuse_mlp_allreduce_with_next_layer(
         self, forward_batch: ForwardBatch
     ) -> bool:

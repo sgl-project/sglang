@@ -32,6 +32,8 @@ at::Tensor l2norm_cpu(at::Tensor& input, double eps);
 
 // rmsnorm
 at::Tensor rmsnorm_cpu(at::Tensor& input, at::Tensor& weight, double eps);
+at::Tensor gemma_rmsnorm_cpu(at::Tensor& input, at::Tensor& weight, double eps);
+at::Tensor gemma3_rmsnorm_cpu(at::Tensor& input, at::Tensor& weight, double eps);
 
 // layernorm
 void layernorm_cpu(at::Tensor& input, at::Tensor& weight, double eps);
@@ -41,6 +43,7 @@ at::Tensor fused_rmsnorm_gated_cpu(at::Tensor& input, at::Tensor& weight, at::Te
 
 // fused_add_rmsnorm
 void fused_add_rmsnorm_cpu(at::Tensor& input, at::Tensor& residual, at::Tensor& weight, double eps);
+void gemma_fused_add_rmsnorm_cpu(at::Tensor& input, at::Tensor& residual, at::Tensor& weight, double eps);
 
 // fused_add_layernorm
 void fused_add_layernorm_cpu(at::Tensor& input, at::Tensor& residual, at::Tensor& weight, double eps);
@@ -330,6 +333,10 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   // norm
   m.def("rmsnorm_cpu(Tensor input, Tensor weight, float eps) -> Tensor");
   m.impl("rmsnorm_cpu", torch::kCPU, &rmsnorm_cpu);
+  m.def("gemma_rmsnorm_cpu(Tensor input, Tensor weight, float eps) -> Tensor");
+  m.impl("gemma_rmsnorm_cpu", torch::kCPU, &gemma_rmsnorm_cpu);
+  m.def("gemma3_rmsnorm_cpu(Tensor input, Tensor weight, float eps) -> Tensor");
+  m.impl("gemma3_rmsnorm_cpu", torch::kCPU, &gemma3_rmsnorm_cpu);
   m.def("layernorm_cpu(Tensor(a!) input, Tensor weight, float eps) -> ()");
   m.impl("layernorm_cpu", torch::kCPU, &layernorm_cpu);
   m.def("l2norm_cpu(Tensor input, float eps) -> Tensor");
@@ -338,6 +345,8 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("fused_rmsnorm_gated_cpu", torch::kCPU, &fused_rmsnorm_gated_cpu);
   m.def("fused_add_rmsnorm_cpu(Tensor(a!) input, Tensor residual, Tensor weight, float eps) -> ()");
   m.impl("fused_add_rmsnorm_cpu", torch::kCPU, &fused_add_rmsnorm_cpu);
+  m.def("gemma_fused_add_rmsnorm_cpu(Tensor input, Tensor residual, Tensor weight, float eps) -> ()");
+  m.impl("gemma_fused_add_rmsnorm_cpu", torch::kCPU, &gemma_fused_add_rmsnorm_cpu);
   m.def("fused_add_layernorm_cpu(Tensor(a!) input, Tensor residual, Tensor weight, float eps) -> ()");
   m.impl("fused_add_layernorm_cpu", torch::kCPU, &fused_add_layernorm_cpu);
 

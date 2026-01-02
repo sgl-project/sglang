@@ -88,7 +88,7 @@ class RowwiseParallelMaybeWait(RowwiseParallel):
     A version of RowwiseParallel that waits for the output (establish dependency
     between comm stream and compute stream in CUDA sense) before going into the
     next op. This is needed to workaround the current interaction between
-    AsyncCollectiveTensor and custom ops, such as `class RMSNorm(CustomOp)`.
+    AsyncCollectiveTensor and multi-platform ops, such as `RMSNorm`.
     """
 
     def _partition_linear_fn(self, name, module, device_mesh):

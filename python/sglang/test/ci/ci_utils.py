@@ -5,10 +5,13 @@ import subprocess
 import threading
 import time
 from dataclasses import dataclass
-from typing import Callable, List, Optional
+from typing import Callable, List, Optional, Union
 
 from sglang.srt.utils.common import kill_process_tree
+from sglang.test.ci.ci_register import CIRegistry
 
+# Configure logger to output to stdout
+logging.basicConfig(level=logging.INFO, format="%(message)s")
 logger = logging.getLogger(__name__)
 
 
@@ -28,6 +31,7 @@ RETRIABLE_PATTERNS = [
     r"score",
     r"latency",
     r"throughput",
+    r"timeout",
 ]
 
 # Patterns that indicate non-retriable failures (real code errors)
@@ -106,7 +110,7 @@ def write_github_step_summary(content: str):
 
 
 def run_unittest_files(
-    files: List[TestFile],
+    files: Union[List[TestFile], List[CIRegistry]],
     timeout_per_file: float,
     continue_on_error: bool = False,
     enable_retry: bool = False,
@@ -133,7 +137,12 @@ def run_unittest_files(
     retried_tests = []  # Track which tests were retried
 
     for i, file in enumerate(files):
-        filename, estimated_time = file.name, file.estimated_time
+        if isinstance(file, CIRegistry):
+            filename, estimated_time = file.filename, file.est_time
+        else:
+            # FIXME: remove this branch after migrating all tests to use CIRegistry
+            filename, estimated_time = file.name, file.estimated_time
+
         process = None
         output_lines = []
 
@@ -154,6 +163,7 @@ def run_unittest_files(
                     stderr=subprocess.STDOUT,
                     env=os.environ,
                     text=True,
+                    errors="ignore",  # Ignore non-UTF-8 bytes to prevent UnicodeDecodeError
                 )
                 output_lines = []
                 for line in process.stdout:
@@ -273,14 +283,15 @@ def run_unittest_files(
             logger.info(f"  {test} ({attempts} attempts, {result})")
     logger.info(f"{'='*60}\n")
 
-    # Write GitHub Step Summary
+    # Write GitHub Step Summary only if retries occurred
     if retried_tests:
-        summary = "\n### CI Retry Summary\n\n"
-        summary += "| Test File | Attempts | Result |\n"
-        summary += "|-----------|----------|--------|\n"
-        for test, attempts, result in retried_tests:
-            summary += f"| `{test}` | {attempts} | {result} |\n"
-        summary += "\n"
+        passed_on_retry = [t for t, _, r in retried_tests if r == "passed"]
+        failed_after_retry = [t for t, _, r in retried_tests if r != "passed"]
+        summary = f"**↻ Retried {len(retried_tests)} test(s):**\n"
+        if passed_on_retry:
+            summary += f"- ✓ Passed on retry: {', '.join(passed_on_retry)}\n"
+        if failed_after_retry:
+            summary += f"- ✗ Still failed: {', '.join(failed_after_retry)}\n"
         write_github_step_summary(summary)
 
     return 0 if success else -1
