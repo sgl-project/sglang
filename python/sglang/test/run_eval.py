@@ -14,7 +14,6 @@ from sglang.test.simple_eval_common import (
     make_report,
     set_ulimit,
 )
-from sglang.test.test_utils import dump_metric
 
 def get_thinking_kwargs(args):
     thinking_mode = getattr(args, "thinking_mode", None)
@@ -51,6 +50,9 @@ def run_eval_once(args, base_url: str, eval_obj: Eval) -> dict:
 
 
 def run_eval(args):
+    # Lazy import to avoid circular dependency with test_utils
+    from sglang.test.test_utils import dump_metric
+
     set_ulimit()
 
     if "OPENAI_API_KEY" not in os.environ:
