@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Dict, Optional
+from typing import TYPE_CHECKING, Dict, Optional, Tuple
 
 import torch
 
@@ -16,6 +16,7 @@ from sglang.srt.layers.moe.moe_runner.base import (
     register_pre_permute,
 )
 from sglang.srt.layers.moe.utils import MoeRunnerBackend
+from sglang.srt.layers.quantization.fp8_utils import cutlass_fp8_supported
 from sglang.srt.utils import is_cuda, is_sm90_supported
 
 if TYPE_CHECKING:
@@ -117,7 +118,6 @@ class CutlassMoeQuantInfo(MoeQuantInfo):
 class CutlassRunnerCore(MoeRunnerCore):
     def __init__(self, config: MoeRunnerConfig):
         super().__init__(config)
-        from sglang.srt.layers.quantization.fp8_utils import cutlass_fp8_supported
 
         if not is_cuda():
             raise RuntimeError("Cutlass runner requires CUDA support.")
@@ -184,7 +184,7 @@ class CutlassRunnerCore(MoeRunnerCore):
             return CutlassRunnerOutput(hidden_states=down_output)
 
         elif moe_type == CutlassMoEType.DeepEP_Normal:
-            down_output = cutlass_w4a8_moe_deepep_normal(
+            down_output = self.cutlass_w4a8_moe_deepep_normal(
                 runner_input.hidden_states,
                 quant_info.w13_weight,
                 quant_info.w2_weight,
@@ -332,6 +332,10 @@ class CutlassRunnerCore(MoeRunnerCore):
         apply_router_weight_on_input: bool = False,
         routed_scaling_factor: float = 1.0,
     ) -> torch.Tensor:
+        from sglang.srt.layers.moe.ep_moe.kernels import (
+            silu_mul_static_tensorwise_quant_for_cutlass_moe,
+        )
+
         """
         This function computes a w4a8-quantized Mixture of Experts (MoE) layer
         using two sets of quantized weights, w1_q and w2_q, and top-k gating
@@ -502,6 +506,12 @@ class CutlassRunnerCore(MoeRunnerCore):
         topk = topk_ids_.size(1)
         m = gateup_input.shape[0] // topk  # number of tokens
 
+        device = a.device
+        c1 = torch.empty((m * topk, n * 2), device=device, dtype=torch.bfloat16)
+        c2 = torch.empty(
+            (m * topk, gateup_input.shape[1] // 2), device=device, dtype=torch.bfloat16
+        )
+
         cutlass_w4a8_moe_mm(
             c1,
             gateup_input,
@@ -566,6 +576,10 @@ class CutlassRunnerCore(MoeRunnerCore):
         a1_scale: Optional[torch.Tensor] = None,
         a2_scale: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        from sglang.srt.layers.moe.ep_moe.kernels import (
+            silu_and_mul_masked_post_per_tensor_quant_fwd,
+        )
+
         """
         This function computes a w4a8-quantized Mixture of Experts (MoE) layer
         using two sets of quantized weights, w1_q and w2_q, and top-k gating
@@ -681,6 +695,10 @@ class CutlassRunnerCore(MoeRunnerCore):
         output: Optional[torch.Tensor] = None,
         enable_es: Tuple[bool, bool] = (False, False),
     ) -> torch.Tensor:
+        from sglang.srt.layers.quantization.fp8_kernel import (
+            sglang_per_token_group_quant_fp8,
+        )
+
         """Performs Fused MoE computation using CUTLASS-like kernels with FP8 weights and activations.
 
         This function implements a Mixture of Experts (MoE) layer with a SwiGLU/SiLU
@@ -1163,7 +1181,7 @@ def pre_permute_standard_to_cutlass(
             gateup_input,
             src2dst,
             topk_ids,
-            quant_info.a1_scale,
+            quant_info.a1_gscale,
             num_local_experts,
             topk,
             m,
@@ -1285,6 +1303,10 @@ def pre_permute_deepep_ll_to_cutlass(
     runner_config: MoeRunnerConfig,
     running_state: Dict[str, torch.Tensor],
 ) -> CutlassRunnerInput:
+    from sglang.srt.layers.moe.ep_moe.kernels import (
+        deepep_ll_get_cutlass_w4a8_moe_mm_data,
+    )
+
     hidden_states, _, topk_ids, topk_weights, masked_m, expected_m = dispatch_output
 
     # Store for post_permute
@@ -1380,6 +1402,11 @@ def pre_permute_deepep_normal_to_cutlass(
     runner_config: MoeRunnerConfig,
     running_state: Dict[str, torch.Tensor],
 ) -> CutlassRunnerInput:
+    from sglang.srt.layers.moe.ep_moe.kernels import (
+        deepep_permute_triton_kernel,
+        deepep_run_moe_deep_preprocess,
+    )
+
     hidden_states, _, topk_ids_, topk_weights, _ = dispatch_output
 
     # Store state for post_permute
