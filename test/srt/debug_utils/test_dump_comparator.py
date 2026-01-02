@@ -112,8 +112,6 @@ class TestDumpComparatorPureFunctions(CustomTestCase):
         self.assertEqual(_get_einops_dim_index(pattern, "num_tokens"), 1)
         self.assertEqual(_get_einops_dim_index(pattern, "hidden"), 2)
 
-
-class TestDumpComparatorLoadObject(CustomTestCase):
     def test_load_object_success(self):
         from sglang.srt.debug_utils.dump_comparator import _load_object
 
@@ -140,8 +138,6 @@ class TestDumpComparatorLoadObject(CustomTestCase):
         result = _load_object("/nonexistent/path/to/file.pt")
         self.assertIsNone(result)
 
-
-class TestCheckTensorPair(CustomTestCase):
     def test_check_tensor_pair_same_shape(self):
         from sglang.srt.debug_utils.dump_comparator import check_tensor_pair
 
