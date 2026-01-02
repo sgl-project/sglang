@@ -1058,9 +1058,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     int4_rescale = (
                         layer.w13_weight_scale[expert_id][shard_id] / max_w13_scale_fp8
                     )
-                    layer.w13_weight_scale1[expert_id][
-                        start : start + shard_size
-                    ] *= int4_rescale
+                    layer.w13_weight_scale1[expert_id][start : start + shard_size] *= (
+                        int4_rescale
+                    )
                 start += shard_size
 
         layer.w13_weight_scale = torch.nn.Parameter(max_w13_scales, requires_grad=False)
@@ -1107,7 +1107,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
-
         from sglang.srt.layers import deep_gemm_wrapper
         from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 
@@ -1138,7 +1137,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         layer: torch.nn.Module,
         dispatch_output: DispatchOutput,
     ) -> CombineInput:
-
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
         x = dispatch_output.hidden_states
@@ -1182,7 +1180,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 return StandardCombineInput(hidden_states=ret)
 
         if self.runner.runner_backend.is_deep_gemm():
-
             w13_weight = layer.w13_weight
             w2_weight = layer.w2_weight
 
@@ -1229,10 +1226,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 expert_offsets=self.expert_offsets,
                 problem_sizes1=self.problem_sizes1,
                 problem_sizes2=self.problem_sizes2,
-                ab_strides_13=self.ab_strides_13,
-                ab_strides_2=self.ab_strides_2,
-                c_strides_13=self.c_strides_13,
-                c_strides_2=self.c_strides_2,
+                ab_strides_13=self.ab_strides1,
+                ab_strides_2=self.ab_strides2,
+                c_strides_13=self.c_strides1,
+                c_strides_2=self.c_strides2,
                 workspace=self.workspace,
                 a_ptrs=self.a_ptr,
                 b_ptrs=self.b_ptr,
@@ -1359,7 +1356,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         with use_symmetric_memory(
             get_tp_group(), disabled=not is_allocation_symmetric()
         ):
-
             if self.block_quant:
                 # FIXME: there is a bug in the trtllm_fp8_block_scale_moe.
                 # It ignored the `output`` argument. https://github.com/flashinfer-ai/flashinfer/blob/da01b1bd8f9f22aec8c0eea189ad54860b034947/flashinfer/fused_moe/core.py#L1323-L1325
