@@ -30,6 +30,7 @@ from sglang.srt.mem_cache.allocator import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
+from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
 from sglang.srt.server_args import ServerArgs
 
 if TYPE_CHECKING:
@@ -473,11 +474,11 @@ class PrefillAdder:
     @contextmanager
     def _lock_node(self, last_node: TreeNode):
         try:
-            swa_uuid_for_lock = self.tree_cache.inc_lock_ref(last_node)
+            ret = self.tree_cache.inc_lock_ref(last_node)
             yield None
         finally:
-            if swa_uuid_for_lock is not None:
-                self.tree_cache.dec_lock_ref(last_node, swa_uuid_for_lock)
+            if isinstance(self.tree_cache, SWARadixCache):
+                self.tree_cache.dec_lock_ref(last_node, ret)
             else:
                 self.tree_cache.dec_lock_ref(last_node)
 
