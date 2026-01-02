@@ -357,8 +357,14 @@ def alloc_for_extend(
         out_cache_loc = alloc_token_slots(batch.tree_cache, batch.extend_num_tokens)
     else:
         # Paged allocation - build last_loc
+        # Note: prefix_indices may be on CPU (initial empty tensor) or GPU (from radix cache).
+        # We must ensure all tensors are on the same device before torch.cat().
         last_loc = [
-            (t[-1:] if len(t) > 0 else torch.tensor([-1], device=batch.device))
+            (
+                t[-1:].to(batch.device, non_blocking=True)
+                if len(t) > 0
+                else torch.tensor([-1], dtype=torch.int64, device=batch.device)
+            )
             for t in prefix_tensors
         ]
         out_cache_loc = alloc_paged_token_slots_extend(
