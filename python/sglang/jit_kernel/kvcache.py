@@ -17,8 +17,8 @@ if TYPE_CHECKING:
 
 
 @cache_once
-def _jit_kvcache_module(element_bytes: int) -> Module:
-    args = make_cpp_args(element_bytes, is_arch_support_pdl())
+def _jit_kvcache_module(row_bytes: int) -> Module:
+    args = make_cpp_args(row_bytes, is_arch_support_pdl())
     return load_jit(
         "kvcache",
         *args,
@@ -32,7 +32,7 @@ def can_use_store_cache(size: int) -> bool:
     logger = logging.getLogger(__name__)
     if size % 4 != 0:
         logger.warning(
-            f"Unsupported element_bytes={size} for JIT KV-Cache kernel:"
+            f"Unsupported row_bytes={size} for JIT KV-Cache kernel:"
             " must be multiple of 4"
         )
         return False
@@ -41,7 +41,7 @@ def can_use_store_cache(size: int) -> bool:
         return True
     except Exception as e:
         logger.warning(
-            f"Failed to load JIT KV-Cache kernel " f"with element_bytes={size}: {e}"
+            f"Failed to load JIT KV-Cache kernel " f"with row_bytes={size}: {e}"
         )
         return False
 
@@ -53,7 +53,7 @@ def store_cache(
     v_cache: torch.Tensor,
     indices: torch.Tensor,
     *,
-    element_bytes: int = 0,
+    row_bytes: int = 0,
     num_split: int = 0,  # can be tuned for performance
 ) -> None:
     """Store key and value tensors into KV cache at specified indices.
@@ -65,12 +65,12 @@ def store_cache(
         v_cache (torch.Tensor): Value cache tensor of shape (num_pages, H * D).
         indices (torch.Tensor): Indices tensor of shape (batch_size,).
     """
-    element_bytes = element_bytes or k.shape[-1] * k.element_size()
-    module = _jit_kvcache_module(element_bytes)
+    row_bytes = row_bytes or k.shape[-1] * k.element_size()
+    module = _jit_kvcache_module(row_bytes)
     if num_split <= 0:
-        if element_bytes % 2048 == 0:
+        if row_bytes % 2048 == 0:
             num_split = 4
-        elif element_bytes % 1024 == 0:
+        elif row_bytes % 1024 == 0:
             num_split = 2
         else:
             num_split = 1
