@@ -90,7 +90,6 @@ class TestEndToEnd(CustomTestCase):
         from argparse import Namespace
 
         from sglang.srt.debug_utils.dump_comparator import main
-
         from sglang.srt.debug_utils.dumper import _Dumper
 
         with tempfile.TemporaryDirectory() as d1, tempfile.TemporaryDirectory() as d2:

@@ -9,8 +9,8 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from sglang.test.test_utils import CustomTestCase
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.test_utils import CustomTestCase
 
 # TODO it needs 0 gpu
 register_cuda_ci(est_time=60, suite="nightly-1-gpu", nightly=True)
@@ -79,7 +79,9 @@ def _assert_files(filenames, *, exist=(), not_exist=()):
     for p in exist:
         assert any(p in f for f in filenames), f"{p} not found in {filenames}"
     for p in not_exist:
-        assert not any(p in f for f in filenames), f"{p} should not exist in {filenames}"
+        assert not any(
+            p in f for f in filenames
+        ), f"{p} should not exist in {filenames}"
 
 
 def _test_basic_func(rank, tmpdir):
