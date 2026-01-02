@@ -71,19 +71,6 @@ class TestDumperDistributed(CustomTestCase):
         _run_distributed_test(_test_write_disabled_func, tmpdir=tmpdir)
 
 
-def _get_filenames(tmpdir):
-    return {f.name for f in Path(tmpdir).glob("sglang_dump_*/*.pt")}
-
-
-def _assert_files(filenames, *, exist=(), not_exist=()):
-    for p in exist:
-        assert any(p in f for f in filenames), f"{p} not found in {filenames}"
-    for p in not_exist:
-        assert not any(
-            p in f for f in filenames
-        ), f"{p} should not exist in {filenames}"
-
-
 def _test_basic_func(rank, tmpdir):
     os.environ["SGLANG_DUMPER_DIR"] = tmpdir
     from sglang.srt.debug_utils.dumper import dumper
@@ -158,6 +145,19 @@ def _test_write_disabled_func(rank, tmpdir):
 
     dist.barrier()
     assert len(_get_filenames(tmpdir)) == 0
+
+
+def _get_filenames(tmpdir):
+    return {f.name for f in Path(tmpdir).glob("sglang_dump_*/*.pt")}
+
+
+def _assert_files(filenames, *, exist=(), not_exist=()):
+    for p in exist:
+        assert any(p in f for f in filenames), f"{p} not found in {filenames}"
+    for p in not_exist:
+        assert not any(
+            p in f for f in filenames
+        ), f"{p} should not exist in {filenames}"
 
 
 def _run_distributed_test(func, world_size=2, **kwargs):
