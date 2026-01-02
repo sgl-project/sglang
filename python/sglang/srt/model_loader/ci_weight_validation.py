@@ -236,7 +236,10 @@ def _validate_config_and_tokenizer_files(snapshot_dir: str) -> Tuple[bool, List[
     - config.json (required)
     - tokenizer_config.json (required)
     - generation_config.json (optional but validated if present)
-    - hf_quant_config.json (optional but validated if present)
+    - hf_quant_config.json (optional but validated if present) - for FP4/FP8/ModelOpt
+    - quantize_config.json / quant_config.json (optional but validated if present) - for AWQ/GPTQ
+    - params.json (optional but validated if present) - for Mistral native format
+    - preprocessor_config.json (optional but validated if present) - for vision models
     - At least one tokenizer file: tokenizer.json, tokenizer.model, or tiktoken.model
 
     Args:
@@ -267,11 +270,40 @@ def _validate_config_and_tokenizer_files(snapshot_dir: str) -> Tuple[bool, List[
             missing_files.append("generation_config.json (exists but invalid)")
 
     # Check optional hf_quant_config.json (validate if exists)
-    # This file is needed for quantized models (FP4, GPTQ, etc.)
+    # This file is needed for quantized models (FP4/FP8/ModelOpt)
+    # Example: nvidia/Llama-3.1-8B-Instruct-FP8, Barrrrry/DeepSeek-R1-W4AFP8
     hf_quant_config_path = os.path.join(snapshot_dir, "hf_quant_config.json")
     if os.path.exists(hf_quant_config_path):
         if not _validate_json_file(hf_quant_config_path, "hf_quant_config.json"):
             missing_files.append("hf_quant_config.json (exists but invalid)")
+
+    # Check optional quantize_config.json / quant_config.json (validate if exists)
+    # These files are needed for AWQ/GPTQ/AutoRound quantized models
+    # Example: TheBloke/Llama-2-7B-AWQ, casperhansen/vicuna-7b-v1.5-awq
+    for quant_config_name in ["quantize_config.json", "quant_config.json"]:
+        quant_config_path = os.path.join(snapshot_dir, quant_config_name)
+        if os.path.exists(quant_config_path):
+            if not _validate_json_file(quant_config_path, quant_config_name):
+                missing_files.append(f"{quant_config_name} (exists but invalid)")
+            break  # Only need to check one of these
+
+    # Check optional params.json (validate if exists)
+    # This file is needed for Mistral native format models
+    # Example: mistralai/Mistral-7B-v0.1
+    params_json_path = os.path.join(snapshot_dir, "params.json")
+    if os.path.exists(params_json_path):
+        if not _validate_json_file(params_json_path, "params.json"):
+            missing_files.append("params.json (exists but invalid)")
+
+    # Check optional preprocessor_config.json (validate if exists)
+    # This file is needed for vision/multimodal models
+    # Example: llava-hf/llava-1.5-7b-hf, Qwen/Qwen2-VL-7B-Instruct
+    preprocessor_config_path = os.path.join(snapshot_dir, "preprocessor_config.json")
+    if os.path.exists(preprocessor_config_path):
+        if not _validate_json_file(
+            preprocessor_config_path, "preprocessor_config.json"
+        ):
+            missing_files.append("preprocessor_config.json (exists but invalid)")
 
     # Check for at least one tokenizer file
     tokenizer_files = [
