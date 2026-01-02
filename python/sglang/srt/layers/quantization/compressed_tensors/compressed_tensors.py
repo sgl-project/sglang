@@ -62,7 +62,7 @@ logger = logging.getLogger(__name__)
 __all__ = ["CompressedTensorsLinearMethod"]
 
 SPARSITY_CONFIG_NAME: Literal["sparsity_config"] = "sparsity_config"
-QUANTIZATION_SCHEME_MAP_TYPE = Dict[str, Optional[Dict[str, QuantizationArgs]]]
+QUANTIZATION_SCHEME_MAP_TYPE = Dict[str, Dict[str, Any]]
 
 
 class DeviceCapability(NamedTuple):
@@ -179,7 +179,7 @@ class CompressedTensorsConfig(QuantizationConfig):
     @classmethod
     def from_config(cls, config: Dict[str, Any]) -> CompressedTensorsConfig:
         ignore: List[str] = cast(List[str], config.get("ignore", []))
-        quant_format = cast(str, config.get("format"))
+        quant_format = cast(str, config.get("format", ""))
         target_scheme_map = cls._quantization_scheme_map_from_config(config=config)
         sparsity_scheme_map, sparsity_ignore_list = cls._parse_sparsity_config(
             config=config
@@ -245,7 +245,7 @@ class CompressedTensorsConfig(QuantizationConfig):
             quantization_args for weights and input activations
         """
         target_scheme_map: Dict[str, Any] = dict()
-        quant_format = cast(str, config.get("format"))
+        quant_format = cast(str, config.get("format", ""))
 
         # The quant_config has multiple config_groups, each containing
         # an input_activations key with details about how the activations are
@@ -258,15 +258,18 @@ class CompressedTensorsConfig(QuantizationConfig):
 
         config_groups = config.get("config_groups", dict())
         for _, quant_config in config_groups.items():
+            group_format = cast(str, quant_config.get("format") or quant_format or "")
             targets = quant_config.get("targets")
             for target in targets:
-                target_scheme_map[target] = {}
+                target_scheme_map[target] = {
+                    "format": group_format,
+                }
                 target_scheme_map[target]["weights"] = QuantizationArgs.model_validate(
                     quant_config.get("weights")
                 )
 
                 target_scheme_map[target]["input_activations"] = None
-                if is_activation_quantization_format(quant_format):
+                if is_activation_quantization_format(group_format):
                     input_activations = quant_config.get("input_activations")
                     # The only case where we have activation quant supported
                     # but no input_activations provided in the config
@@ -445,13 +448,13 @@ class CompressedTensorsConfig(QuantizationConfig):
         return is_channel_group and input_quant_none and is_symmetric and is_static
 
     def _get_scheme_from_parts(
-        self, weight_quant: BaseModel, input_quant: BaseModel
+        self, weight_quant: BaseModel, input_quant: BaseModel, quant_format: str
     ) -> CompressedTensorsScheme:
 
         # Detect If Mixed Precision
         if self._is_wNa16_group_channel(weight_quant, input_quant):
             if (
-                self.quant_format == CompressionFormat.pack_quantized.value
+                quant_format == CompressionFormat.pack_quantized.value
                 and weight_quant.num_bits in WNA16_SUPPORTED_BITS
             ):
                 return CompressedTensorsWNA16(
@@ -465,7 +468,7 @@ class CompressedTensorsConfig(QuantizationConfig):
                     "Other method (CompressedTensorsW4A16Sparse24) is not supported now"
                 )
 
-        if is_activation_quantization_format(self.quant_format):
+        if is_activation_quantization_format(quant_format):
             if self._is_fp4a4_nvfp4(weight_quant, input_quant):
                 is_fp4a4_nvfp4_supported = self._check_scheme_supported(
                     CompressedTensorsW4A4Fp4.get_min_capability(), error=False
@@ -555,6 +558,9 @@ class CompressedTensorsConfig(QuantizationConfig):
             scheme_dict = self.target_scheme_map[matched_target]
             weight_quant = scheme_dict.get("weights")
             input_quant = scheme_dict.get("input_activations")
+            quant_format = scheme_dict.get("format", self.quant_format)
+        else:
+            quant_format = self.quant_format
 
         # Find the sparsity scheme of the layer
         # assume that fused layers inerhit first component's sparsity scheme
@@ -590,6 +596,7 @@ class CompressedTensorsConfig(QuantizationConfig):
             scheme = self._get_scheme_from_parts(  # type: ignore
                 weight_quant=weight_quant,
                 input_quant=input_quant,
+                quant_format=quant_format,
             )
 
         # Raise error if device does not support the scheme
