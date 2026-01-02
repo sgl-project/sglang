@@ -41,6 +41,7 @@ from transformers import AutoConfig, PretrainedConfig
 from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_NAMES
 
 from sglang.multimodal_gen.runtime.loader.weight_utils import get_lock
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
@@ -230,6 +231,12 @@ def maybe_download_lora(
         return local_path
 
     weight_name = _best_guess_weight_name(local_path, file_extension=".safetensors")
+    # AMD workaround: PR 15813 changed from model_name_or_path to local_path,
+    # which can return None. Fall back to original behavior on ROCm.
+    if weight_name is None and current_platform.is_rocm():
+        weight_name = _best_guess_weight_name(
+            model_name_or_path, file_extension=".safetensors"
+        )
     return os.path.join(local_path, weight_name)
 
 
