@@ -801,7 +801,7 @@ if __name__ == "__main__":
         "--backend",
         type=str,
         default=None,
-        help="DEPRECATED, we don't use backend anymore, and we will auto infer backend from --model.",
+        help="DEPRECATED: --task is deprecated and will be ignored. The task will be inferred from --model.",
     )
     parser.add_argument(
         "--base-url",
@@ -830,7 +830,7 @@ if __name__ == "__main__":
             "video-to-video",
         ],
         default=None,
-        help="Task type. If no task is provided, we will use pipeline_tag from huggingface_hub",
+        help="The task will be inferred from huggingface pipeline_tag. When huggingface pipeline_tag is not provided, --task will be used.",
     )
     parser.add_argument(
         "--dataset-path",
