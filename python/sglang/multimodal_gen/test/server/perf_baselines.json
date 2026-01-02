@@ -529,6 +529,31 @@
             "expected_avg_denoise_ms": 94.15,
             "expected_median_denoise_ms": 102.03
         },
+        "zimage_image_t2i_warmup": {
+            "stages_ms": {
+                "InputValidationStage": 0.02,
+                "TextEncodingStage": 100.65,
+                "ConditioningStage": 0.01,
+                "TimestepPreparationStage": 0.98,
+                "LatentPreparationStage": 0.06,
+                "DenoisingStage": 889.42,
+                "DecodingStage": 37.81
+            },
+            "denoise_step_ms": {
+                "0": 16.49,
+                "1": 94.63,
+                "2": 109.65,
+                "3": 110.05,
+                "4": 109.39,
+                "5": 110.58,
+                "6": 109.52,
+                "7": 110.54,
+                "8": 115.24
+            },
+            "expected_e2e_ms": 1029.96,
+            "expected_avg_denoise_ms": 98.46,
+            "expected_median_denoise_ms": 109.65
+        },
         "qwen_image_edit_ti2i": {
             "stages_ms": {
                 "InputValidationStage": 38.62,
