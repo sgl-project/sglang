@@ -330,7 +330,7 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
         dispatch_output: DeepEPLLDispatchOutput,
     ) -> torch.Tensor:
         quant_info = CutlassMoeQuantInfo(
-            moe_type=CutlassMoEType.W4A8,
+            moe_type=CutlassMoEType.DeepEP_LL,
             w13_weight=layer.w13_weight,
             w2_weight=layer.w2_weight,
             w13_scale=layer.w13_weight_scale_inv,
@@ -366,7 +366,7 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
             return hidden_states
 
         quant_info = CutlassMoeQuantInfo(
-            moe_type=CutlassMoEType.W4A8,
+            moe_type=CutlassMoEType.DeepEP_Normal,
             w13_weight=layer.w13_weight,
             w2_weight=layer.w2_weight,
             w13_scale=layer.w13_weight_scale_inv,

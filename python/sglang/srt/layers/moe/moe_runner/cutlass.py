@@ -139,13 +139,10 @@ class CutlassRunnerCore(MoeRunnerCore):
         )
 
         # Common validation assertions for all CUTLASS MoE types
-        assert (
-            runner_input.topk_weights.shape == runner_input.topk_ids.shape
-        ), "topk shape mismatch"
-        assert runner_input.hidden_states.dtype in [
-            torch.half,
-            torch.bfloat16,
-        ], "Invalid input dtype - must be half or bfloat16"
+        if runner_input.topk_weights is not None:
+            assert (
+                runner_input.topk_weights.shape == runner_input.topk_ids.shape
+            ), "topk shape mismatch"
         assert (
             quant_info.w13_weight.shape[0] == quant_info.w2_weight.shape[0]
         ), "Expert number mismatch between w13 and w2"
@@ -185,26 +182,26 @@ class CutlassRunnerCore(MoeRunnerCore):
 
         elif moe_type == CutlassMoEType.DeepEP_Normal:
             down_output = self.cutlass_w4a8_moe_deepep_normal(
-                runner_input.hidden_states,
-                quant_info.w13_weight,
-                quant_info.w2_weight,
-                quant_info.w13_scale,
-                quant_info.w2_scale,
-                runner_input.topk_weights,
-                runner_input.topk_ids,
-                quant_info.a_strides1,
-                quant_info.b_strides1,
-                quant_info.c_strides1,
-                quant_info.a_strides2,
-                quant_info.b_strides2,
-                quant_info.c_strides2,
-                quant_info.s_strides13,
-                quant_info.s_strides2,
-                quant_info.expert_offsets,
-                quant_info.problem_sizes1,
-                quant_info.problem_sizes2,
-                quant_info.w13_input_scale,
-                quant_info.w2_input_scale,
+                a=runner_input.hidden_states,
+                w1_q=quant_info.w13_weight,
+                w2_q=quant_info.w2_weight,
+                w1_scale=quant_info.w13_scale,
+                w2_scale=quant_info.w2_scale,
+                topk_weights=runner_input.topk_weights,
+                topk_ids_=runner_input.topk_ids,
+                a_strides1=quant_info.a_strides1,
+                b_strides1=quant_info.b_strides1,
+                c_strides1=quant_info.c_strides1,
+                a_strides2=quant_info.a_strides2,
+                b_strides2=quant_info.b_strides2,
+                c_strides2=quant_info.c_strides2,
+                s_strides13=quant_info.s_strides13,
+                s_strides2=quant_info.s_strides2,
+                expert_offsets=quant_info.expert_offsets,
+                problem_sizes1=quant_info.problem_sizes1,
+                problem_sizes2=quant_info.problem_sizes2,
+                a1_scale=quant_info.w13_input_scale,
+                a2_scale=quant_info.w2_input_scale,
             )
             return CutlassRunnerOutput(hidden_states=down_output)
 
@@ -393,7 +390,7 @@ class CutlassRunnerCore(MoeRunnerCore):
         gateup_input = torch.empty(
             (m * topk, k),
             device=device,
-            dtype=torch.bfloat16,
+            dtype=torch.float8_e4m3fn,
         )
 
         cutlass_w4a8_moe_mm(
@@ -439,6 +436,7 @@ class CutlassRunnerCore(MoeRunnerCore):
         return c2
 
     def cutlass_w4a8_moe_deepep_normal(
+        self,
         a: torch.Tensor,
         w1_q: torch.Tensor,
         w2_q: torch.Tensor,
@@ -501,14 +499,14 @@ class CutlassRunnerCore(MoeRunnerCore):
         gateup_input = a
         num_local_experts = w1_q.size(0)
         n = w2_q.size(2) * 2  # w2_q is transposed and packed
+        k = w1_q.size(2) * 2  # w1_q is transposed and packed
+
         topk = topk_ids_.size(1)
         m = gateup_input.shape[0] // topk  # number of tokens
 
         device = a.device
         c1 = torch.empty((m * topk, n * 2), device=device, dtype=torch.bfloat16)
-        c2 = torch.empty(
-            (m * topk, gateup_input.shape[1] // 2), device=device, dtype=torch.bfloat16
-        )
+        c2 = torch.zeros((m * topk, k), device=device, dtype=torch.bfloat16)
 
         cutlass_w4a8_moe_mm(
             c1,
@@ -552,6 +550,7 @@ class CutlassRunnerCore(MoeRunnerCore):
         return c2
 
     def cutlass_w4a8_moe_deepep_ll(
+        self,
         a: torch.Tensor,
         w1_q: torch.Tensor,
         w2_q: torch.Tensor,
@@ -669,6 +668,7 @@ class CutlassRunnerCore(MoeRunnerCore):
         return c2
 
     def cutlass_fused_experts_fp8(
+        self,
         a: torch.Tensor,
         w1_q: torch.Tensor,
         w2_q: torch.Tensor,
@@ -1223,6 +1223,8 @@ def post_permute_cutlass_to_standard(
     runner_config: MoeRunnerConfig,
     running_state: Dict[str, torch.Tensor],
 ) -> StandardCombineInput:
+    from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
+
     down_output = runner_output.hidden_states
     moe_type = running_state["moe_type"]
 
@@ -1374,6 +1376,7 @@ def pre_permute_deepep_ll_to_cutlass(
         topk_ids=topk_ids,
         masked_m=masked_m,
         expected_m=expected_m,
+        rep_primary=gateup_input,  # Use preprocessed quantized input
     )
 
 
@@ -1488,6 +1491,12 @@ def pre_permute_deepep_normal_to_cutlass(
 
     a_map = torch.empty((local_topk_ids.numel()), dtype=torch.int32, device=device)
     c_map = torch.empty((local_topk_ids.numel()), dtype=torch.int32, device=device)
+
+    quant_info.problem_sizes1.zero_()
+    quant_info.problem_sizes2.zero_()
+    # Safely zero offsets too if the kernel calculates them via cumsum
+    quant_info.expert_offsets.zero_()
+
     get_cutlass_w4a8_moe_mm_data(
         local_topk_ids,
         quant_info.expert_offsets,
