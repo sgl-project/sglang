@@ -10,6 +10,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 from sglang.test.test_utils import CustomTestCase
+from sglang.test.ci.ci_register import register_cuda_ci
 
 # TODO it needs 0 gpu
 register_cuda_ci(est_time=60, suite="nightly-1-gpu", nightly=True)
