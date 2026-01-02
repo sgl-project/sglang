@@ -280,7 +280,7 @@ For context parallel in DeepSeek V3.2 model, we provide two different modes of s
 
 ### In sequence splitting (default setting)
 
-The first mode can be enabled by `--nsa-prefill-cp-mode in-seq-split`. This mode implements context parallel for DSA by splitting the sequence uniformly between context parallel ranks. At attention stage, each cp rank computes the indexer results of shareded sequence, and collects the whole kv cache through all gather operator.
+The first mode can be enabled by `--nsa-prefill-cp-mode in-seq-split`. This mode implements context parallel for DSA by splitting the sequence uniformly between context parallel ranks. At attention stage, each cp rank computes the indexer results of sharded sequence, and collects the whole kv cache through all gather operator.
 
 The communication group for context parallel reuses the one for attention tp,  thus `cp_size` equals to `atten_tp_size = tp_size / dp_size`.
 
