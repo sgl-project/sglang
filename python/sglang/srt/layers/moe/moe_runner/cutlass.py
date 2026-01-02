@@ -252,9 +252,9 @@ class CutlassRunnerCore(MoeRunnerCore):
             )
 
         elif moe_type == CutlassMoEType.W4A8:
-            from sglang.srt.layers.moe.cutlass_w4a8_moe import cutlass_w4a8_moe
 
-            down_output = cutlass_w4a8_moe(
+
+            down_output = self.cutlass_w4a8_moe(
                 runner_input.rep_primary,  # Use preprocessed input
                 quant_info.w13_weight,
                 quant_info.w2_weight,
