@@ -2,10 +2,14 @@ import random
 import unittest
 from typing import Sequence
 
-from lora_utils import TORCH_DTYPES, LoRAAdaptor, LoRAModelCase, ensure_reproducibility
-
 from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
 from sglang.srt.models.qwen3_vl_moe import Qwen3VLMoeForConditionalGeneration
+from sglang.test.lora_utils import (
+    TORCH_DTYPES,
+    LoRAAdaptor,
+    LoRAModelCase,
+    ensure_reproducibility,
+)
 from sglang.test.runners import HFRunner, SRTRunner
 from sglang.test.test_utils import CustomTestCase, calculate_rouge_l
 
