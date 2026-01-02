@@ -252,29 +252,27 @@ class CutlassRunnerCore(MoeRunnerCore):
             )
 
         elif moe_type == CutlassMoEType.W4A8:
-
-
             down_output = self.cutlass_w4a8_moe(
-                runner_input.rep_primary,  # Use preprocessed input
-                quant_info.w13_weight,
-                quant_info.w2_weight,
-                quant_info.w13_scale,
-                quant_info.w2_scale,
-                runner_input.topk_weights,
-                runner_input.topk_ids,
-                quant_info.a_strides1,
-                quant_info.b_strides1,
-                quant_info.c_strides1,
-                quant_info.a_strides2,
-                quant_info.b_strides2,
-                quant_info.c_strides2,
-                quant_info.s_strides13,
-                quant_info.s_strides2,
-                quant_info.expert_offsets,
-                quant_info.problem_sizes1,
-                quant_info.problem_sizes2,
-                quant_info.w13_input_scale,
-                quant_info.w2_input_scale,
+                a=runner_input.rep_primary,  # Use preprocessed input
+                w1_q=quant_info.w13_weight,
+                w2_q=quant_info.w2_weight,
+                w1_scale=quant_info.w13_scale,
+                w2_scale=quant_info.w2_scale,
+                topk_weights=runner_input.topk_weights,
+                topk_ids=runner_input.topk_ids,
+                a_strides1=quant_info.a_strides1,
+                b_strides1=quant_info.b_strides1,
+                c_strides1=quant_info.c_strides1,
+                a_strides2=quant_info.a_strides2,
+                b_strides2=quant_info.b_strides2,
+                c_strides2=quant_info.c_strides2,
+                s_strides13=quant_info.s_strides13,
+                s_strides2=quant_info.s_strides2,
+                expert_offsets=quant_info.expert_offsets,
+                problem_sizes1=quant_info.problem_sizes1,
+                problem_sizes2=quant_info.problem_sizes2,
+                a1_scale=quant_info.w13_input_scale,
+                a2_scale=quant_info.w2_input_scale,
                 apply_router_weight_on_input=self.config.apply_router_weight_on_input,
             )
             # Post-processing will be done in post_permute_cutlass_to_standard
