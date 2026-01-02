@@ -7,7 +7,7 @@ use super::*;
 #[test]
 fn test_mock_tokenizer_encode() {
     let tokenizer = mock::MockTokenizer::new();
-    let encoding = tokenizer.encode("Hello world").unwrap();
+    let encoding = tokenizer.encode("Hello world", false).unwrap();
     let token_ids = encoding.token_ids();
     assert_eq!(token_ids, &[1, 2]); // "Hello" -> 1, "world" -> 2
 }
@@ -37,7 +37,7 @@ fn test_tokenizer_wrapper() {
     let mock_tokenizer = Arc::new(mock::MockTokenizer::new());
     let tokenizer = Tokenizer::from_arc(mock_tokenizer);
 
-    let encoding = tokenizer.encode("Hello world").unwrap();
+    let encoding = tokenizer.encode("Hello world", false).unwrap();
     assert_eq!(encoding.token_ids(), &[1, 2]);
 
     let text = tokenizer.decode(&[1, 2], false).unwrap();
@@ -103,7 +103,7 @@ fn test_special_tokens() {
 fn test_batch_encode() {
     let tokenizer = mock::MockTokenizer::new();
     let inputs = vec!["Hello", "world", "test"];
-    let encodings = tokenizer.encode_batch(&inputs).unwrap();
+    let encodings = tokenizer.encode_batch(&inputs, false).unwrap();
 
     assert_eq!(encodings.len(), 3);
     assert_eq!(encodings[0].token_ids(), &[1]); // "Hello" -> 1
@@ -124,7 +124,7 @@ fn test_thread_safety() {
             let tokenizer_clone = tokenizer.clone();
             thread::spawn(move || {
                 let text = "Hello test".to_string();
-                let encoding = tokenizer_clone.encode(&text).unwrap();
+                let encoding = tokenizer_clone.encode(&text, false).unwrap();
                 let decoded = tokenizer_clone.decode(encoding.token_ids(), false).unwrap();
                 assert!(decoded.contains("Hello") || decoded.contains("test"));
                 i
