@@ -186,7 +186,6 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         kvcache: SWAKVPool,
         need_sort: bool,
     ):
-        super().__init__(size, page_size, dtype, device, kvcache, need_sort)
         assert isinstance(kvcache, SWAKVPool)
         self._size_full = size
         self._size_swa = size_swa
@@ -239,6 +238,13 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 torch.tensor([-1], dtype=torch.int64, device=device),
             ]
         )
+
+        self.need_sort = need_sort
+        self.free_pages = None
+        self.release_pages = None
+        self.is_not_in_free_group = True
+        self.free_group = []
+
         self.clear()
         self._kvcache = kvcache
         self._kvcache.register_mapping(weakref.proxy(self.full_to_swa_index_mapping))
