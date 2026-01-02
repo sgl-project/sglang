@@ -415,7 +415,9 @@ class DiffusersPipeline(ComposedPipelineBase):
             quant_config = getattr(config, "quantization_config", None)
             if quant_config is not None:
                 load_kwargs["quantization_config"] = quant_config
-                logger.info("Using quantization config: %s", type(quant_config).__name__)
+                logger.info(
+                    "Using quantization config: %s", type(quant_config).__name__
+                )
 
         try:
             pipe = DiffusionPipeline.from_pretrained(model_path, **load_kwargs)
@@ -426,9 +428,14 @@ class DiffusersPipeline(ComposedPipelineBase):
                     "Pipeline class not found in diffusers, trying custom_pipeline from repo..."
                 )
                 try:
-                    custom_kwargs = {**load_kwargs, "custom_pipeline": original_model_path}
+                    custom_kwargs = {
+                        **load_kwargs,
+                        "custom_pipeline": original_model_path,
+                    }
                     custom_kwargs["trust_remote_code"] = True
-                    pipe = DiffusionPipeline.from_pretrained(model_path, **custom_kwargs)
+                    pipe = DiffusionPipeline.from_pretrained(
+                        model_path, **custom_kwargs
+                    )
                 except Exception as e2:
                     match = re.search(r"has no attribute (\w+)", str(e))
                     class_name = match.group(1) if match else "unknown"
