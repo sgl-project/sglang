@@ -5,8 +5,8 @@ use sgl_model_gateway::{
     auth::{ApiKeyEntry, ControlPlaneAuthConfig, JwtConfig, Role},
     config::{
         CircuitBreakerConfig, ConfigError, ConfigResult, DiscoveryConfig, HealthCheckConfig,
-        HistoryBackend, MetricsConfig, OracleConfig, PolicyConfig, PostgresConfig, RetryConfig,
-        RouterConfig, RoutingMode, TokenizerCacheConfig, TraceConfig,
+        HistoryBackend, MetricsConfig, OracleConfig, PolicyConfig, PostgresConfig, RedisConfig,
+        RetryConfig, RouterConfig, RoutingMode, TokenizerCacheConfig, TraceConfig,
     },
     core::ConnectionMode,
     observability::{
@@ -419,7 +419,7 @@ struct CliArgs {
     backend: Backend,
 
     /// History storage backend
-    #[arg(long, default_value = "memory", value_parser = ["memory", "none", "oracle","postgres"], help_heading = "Backend")]
+    #[arg(long, default_value = "memory", value_parser = ["memory", "none", "oracle", "postgres", "redis"], help_heading = "Backend")]
     history_backend: String,
 
     /// Enable WebAssembly support
@@ -467,6 +467,15 @@ struct CliArgs {
     /// Maximum PostgreSQL connection pool size
     #[arg(long, help_heading = "PostgreSQL Database")]
     postgres_pool_max_size: Option<usize>,
+
+    // ==================== Redis Database ====================
+    /// Redis connection URL
+    #[arg(long, help_heading = "Redis Database")]
+    redis_url: Option<String>,
+
+    /// Maximum Redis connection pool size
+    #[arg(long, help_heading = "Redis Database")]
+    redis_pool_max_size: Option<usize>,
 
     // ==================== TLS/mTLS Security ====================
     /// Path to server TLS certificate (PEM format)
@@ -793,6 +802,18 @@ impl CliArgs {
         Ok(pcf)
     }
 
+    fn build_redis_config(&self) -> ConfigResult<RedisConfig> {
+        let url = self.redis_url.clone().unwrap_or_default();
+        let pool_max = self.redis_pool_max_size.unwrap_or(16);
+        let rcf = RedisConfig { url, pool_max };
+        rcf.validate().map_err(|e| ConfigError::ValidationFailed {
+            reason: e.to_string(),
+        })?;
+        Ok(rcf)
+    }
+
+    
+
     fn to_router_config(
         &self,
         prefill_urls: Vec<(String, Option<u16>)>,
@@ -869,6 +890,7 @@ impl CliArgs {
             "none" => HistoryBackend::None,
             "oracle" => HistoryBackend::Oracle,
             "postgres" => HistoryBackend::Postgres,
+            "redis" => HistoryBackend::Redis,
             _ => HistoryBackend::Memory,
         };
 
@@ -882,6 +904,12 @@ impl CliArgs {
         } else {
             None
         };
+        let redis = if history_backend == HistoryBackend::Redis {
+            Some(self.build_redis_config()?)
+        } else {
+            None
+        };
+
 
         let builder = RouterConfig::builder()
             .mode(mode)

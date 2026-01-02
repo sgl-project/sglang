@@ -117,6 +117,8 @@ class RouterArgs:
     oracle_pool_timeout_secs: int = 30
     postgres_db_url: Optional[str] = None
     postgres_pool_max: int = 16
+    redis_url: Optional[str] = None
+    redis_pool_max: int = 16
     # mTLS configuration for worker communication
     client_cert_path: Optional[str] = None
     client_key_path: Optional[str] = None
@@ -199,6 +201,9 @@ class RouterArgs:
         )
         postgres_group = parser.add_argument_group(
             "PostgreSQL Database", "PostgreSQL database backend configuration"
+        )
+        redis_group = parser.add_argument_group(
+            "Redis Database", "Redis database backend configuration"
         )
         tls_group = parser.add_argument_group(
             "TLS/mTLS Security", "TLS certificates for server and worker communication"
@@ -731,6 +736,20 @@ class RouterArgs:
             type=int,
             default=int(os.getenv("POSTGRES_POOL_MAX", RouterArgs.postgres_pool_max)),
             help="Maximum PostgreSQL connection pool size (default: 16, env: POSTGRES_POOL_MAX)",
+        )
+
+        # Redis configuration
+        redis_group.add_argument(
+            f"--{prefix}redis-url",
+            type=str,
+            default=os.getenv("REDIS_URL"),
+            help="Redis connection URL (env: REDIS_URL)",
+        )
+        redis_group.add_argument(
+            f"--{prefix}redis-pool-max",
+            type=int,
+            default=int(os.getenv("REDIS_POOL_MAX", RouterArgs.redis_pool_max)),
+            help="Maximum Redis connection pool size (default: 16, env: REDIS_POOL_MAX)",
         )
 
         # TLS/mTLS configuration

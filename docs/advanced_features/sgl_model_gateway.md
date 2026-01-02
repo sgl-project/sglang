@@ -858,6 +858,7 @@ Prefill pods can expose bootstrap ports via the `sglang.ai/bootstrap-port` annot
 | `none` | No persistence | `--history-backend none` |
 | `oracle` | Oracle Autonomous Database | `--history-backend oracle` |
 | `postgres` | PostgreSQL Database | `--history-backend postgres` |
+| `redis` | Redis | `--history-backend redis` |
 
 ### Oracle Configuration
 
@@ -890,6 +891,18 @@ python -m sglang_router.launch_router \
   --backend openai \
   --worker-urls https://api.openai.com \
   --history-backend postgres
+```
+
+### Redis Configuration
+
+```bash
+export REDIS_URL="redis://localhost:6379"
+export REDIS_POOL_MAX=16
+
+python -m sglang_router.launch_router \
+  --backend openai \
+  --worker-urls https://api.openai.com \
+  --history-backend redis
 ```
 
 ---
