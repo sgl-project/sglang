@@ -16,7 +16,7 @@ use std::{
     collections::HashMap,
     hash::{BuildHasherDefault, Hasher},
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicI32, AtomicU64, Ordering},
         Arc, Weak,
     },
 };
@@ -50,6 +50,25 @@ type NodeRef = Arc<Node>;
 const ROOT_SHARD_COUNT: usize = 32;
 /// Child nodes typically have few entries, minimize shard overhead.
 const NODE_SHARD_COUNT: usize = 4;
+
+/// Eviction policy matching SGLang's scheduler options.
+/// The gateway should use the same policy as the backend worker to stay in sync.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum EvictionPolicy {
+    /// Least Recently Used - evict oldest by last access time (default)
+    #[default]
+    Lru,
+    /// Least Frequently Used - evict by (hit_count, last_access_time)
+    Lfu,
+    /// First In First Out - evict oldest by creation time
+    Fifo,
+    /// Most Recently Used - evict newest by last access time
+    Mru,
+    /// First In Last Out (stack) - evict newest by creation time
+    Filo,
+    /// Priority-based - evict by (priority, last_access_time), lower priority first
+    Priority,
+}
 
 /// Align token count to page boundary (truncate to nearest page).
 /// Matches SGLang's: `page_aligned_len = len(key) // page_size * page_size`
@@ -175,6 +194,12 @@ struct Node {
     parent: ParkingLotRwLock<Weak<Node>>,
     /// This node's key in parent's children map (for O(1) removal)
     page_key: ParkingLotRwLock<Option<TokenPageKey>>,
+    /// Hit count for LFU eviction policy (incremented on each access)
+    hit_count: AtomicU64,
+    /// Creation timestamp for FIFO/FILO eviction policies
+    creation_time: u64,
+    /// Priority for priority-based eviction (higher = less likely to evict)
+    priority: AtomicI32,
 }
 
 impl Node {
@@ -186,6 +211,24 @@ impl Node {
             last_tenant: ParkingLotRwLock::new(None),
             parent: ParkingLotRwLock::new(Weak::new()),
             page_key: ParkingLotRwLock::new(None),
+            hit_count: AtomicU64::new(0),
+            creation_time: next_timestamp(),
+            priority: AtomicI32::new(0),
+        }
+    }
+
+    #[allow(dead_code)] // Reserved for priority-based eviction policy support
+    fn new_with_priority(tokens: Vec<TokenId>, priority: i32) -> Self {
+        Self {
+            tokens: ParkingLotRwLock::new(tokens),
+            children: new_children_map(),
+            tenant_last_access_time: new_tenant_map(),
+            last_tenant: ParkingLotRwLock::new(None),
+            parent: ParkingLotRwLock::new(Weak::new()),
+            page_key: ParkingLotRwLock::new(None),
+            hit_count: AtomicU64::new(0),
+            creation_time: next_timestamp(),
+            priority: AtomicI32::new(priority),
         }
     }
 
@@ -200,6 +243,9 @@ impl Node {
             last_tenant: ParkingLotRwLock::new(None),
             parent: ParkingLotRwLock::new(Weak::new()),
             page_key: ParkingLotRwLock::new(None),
+            hit_count: AtomicU64::new(0),
+            creation_time: 0,                   // Root is always oldest
+            priority: AtomicI32::new(i32::MIN), // Root has minimum priority (matches SGLang)
         }
     }
 
@@ -233,9 +279,18 @@ impl Node {
             .map(|entry| Arc::clone(entry.key()))
     }
 
-    /// Update tenant access and cache (with probabilistic update to reduce contention)
-    fn touch_tenant(&self, tenant: &TenantId) {
+    /// Update tenant access and cache (with probabilistic update to reduce contention).
+    ///
+    /// # Arguments
+    /// * `tenant` - The tenant to touch
+    /// * `track_lfu` - If true, increment hit_count for LFU policy (only needed when eviction_policy == LFU)
+    fn touch_tenant(&self, tenant: &TenantId, track_lfu: bool) {
         let ts = next_timestamp();
+
+        // Conditionally increment hit count (only for LFU policy to reduce contention)
+        if track_lfu {
+            self.hit_count.fetch_add(1, Ordering::Relaxed);
+        }
 
         // Fast path: try to update existing entry without Arc clone
         // DashMap supports Borrow<str> lookups, avoiding allocation
@@ -253,6 +308,13 @@ impl Node {
             }
         }
     }
+
+    /// Update priority (take max to propagate higher priority, matching SGLang)
+    #[allow(dead_code)] // Reserved for priority-based eviction policy support
+    fn update_priority(&self, new_priority: i32) {
+        // Use fetch_max for correct concurrent updates (avoids CAS race condition)
+        self.priority.fetch_max(new_priority, Ordering::Relaxed);
+    }
 }
 
 /// Token-based radix tree for cache-aware routing.
@@ -260,6 +322,8 @@ pub struct TokenTree {
     root: NodeRef,
     /// Track total tokens per tenant for eviction decisions
     tenant_token_count: DashMap<TenantId, usize>,
+    /// Eviction policy (should match the backend worker's policy)
+    eviction_policy: EvictionPolicy,
 }
 
 impl Default for TokenTree {
@@ -270,10 +334,22 @@ impl Default for TokenTree {
 
 impl TokenTree {
     pub fn new() -> Self {
+        Self::with_policy(EvictionPolicy::default())
+    }
+
+    /// Create a new TokenTree with a specific eviction policy.
+    /// The policy should match the backend worker's policy to stay in sync.
+    pub fn with_policy(policy: EvictionPolicy) -> Self {
         Self {
             root: Arc::new(Node::new_root()),
             tenant_token_count: DashMap::with_shard_amount(ROOT_SHARD_COUNT),
+            eviction_policy: policy,
         }
+    }
+
+    /// Get the current eviction policy.
+    pub fn eviction_policy(&self) -> EvictionPolicy {
+        self.eviction_policy
     }
 
     /// Insert a token sequence with associated tenant.
@@ -305,6 +381,9 @@ impl TokenTree {
         let mut current = Arc::clone(&self.root);
         let mut tokens_added = 0usize;
 
+        // Compute once: only track hit counts for LFU policy
+        let track_lfu = self.eviction_policy == EvictionPolicy::Lfu;
+
         // Result type to carry state out of the match block
         // This allows the entry guard to be dropped before we update current
         enum InsertStep {
@@ -321,7 +400,7 @@ impl TokenTree {
                     // No child with this page key - create new node
                     let new_node = Arc::new(Node::new(remaining.to_vec()));
                     new_node.set_parent(&current, page_key);
-                    new_node.touch_tenant(&tenant_id);
+                    new_node.touch_tenant(&tenant_id, track_lfu);
                     entry.insert(new_node);
                     InsertStep::Done(remaining.len())
                 }
@@ -346,7 +425,7 @@ impl TokenTree {
                     } else if common_len == child_len {
                         // Full match with child - continue traversal
                         drop(child_tokens);
-                        child.touch_tenant(&tenant_id);
+                        child.touch_tenant(&tenant_id, track_lfu);
                         InsertStep::Continue {
                             next: child,
                             advance: common_len,
@@ -372,6 +451,7 @@ impl TokenTree {
                         drop(child_tokens_write);
 
                         // Create intermediate node with prefix - clone tenant map (O(1))
+                        // Intermediate inherits metadata from child (represents same prefix)
                         let intermediate_node = Arc::new(Node {
                             tokens: ParkingLotRwLock::new(prefix_tokens),
                             children: new_children_map(),
@@ -379,6 +459,9 @@ impl TokenTree {
                             last_tenant: ParkingLotRwLock::new(child.last_tenant.read().clone()),
                             parent: ParkingLotRwLock::new(Arc::downgrade(&current)),
                             page_key: ParkingLotRwLock::new(Some(page_key)),
+                            hit_count: AtomicU64::new(child.hit_count.load(Ordering::Relaxed)),
+                            creation_time: child.creation_time,
+                            priority: AtomicI32::new(child.priority.load(Ordering::Relaxed)),
                         });
 
                         // Add original child (now suffix) as child of intermediate
@@ -391,7 +474,7 @@ impl TokenTree {
                         // Replace entry with intermediate node
                         entry.insert(intermediate_node.clone());
 
-                        intermediate_node.touch_tenant(&tenant_id);
+                        intermediate_node.touch_tenant(&tenant_id, track_lfu);
 
                         // Only count new tokens if tenant didn't already own this path
                         let new_tokens = if tenant_already_owned { 0 } else { common_len };
@@ -416,6 +499,7 @@ impl TokenTree {
                         drop(child_tokens_write);
 
                         // Create intermediate node with common prefix - clone tenant map (O(1))
+                        // Intermediate inherits metadata from child (represents same prefix)
                         let intermediate_node = Arc::new(Node {
                             tokens: ParkingLotRwLock::new(prefix_tokens),
                             children: new_children_map(),
@@ -423,6 +507,9 @@ impl TokenTree {
                             last_tenant: ParkingLotRwLock::new(child.last_tenant.read().clone()),
                             parent: ParkingLotRwLock::new(Arc::downgrade(&current)),
                             page_key: ParkingLotRwLock::new(Some(page_key)),
+                            hit_count: AtomicU64::new(child.hit_count.load(Ordering::Relaxed)),
+                            creation_time: child.creation_time,
+                            priority: AtomicI32::new(child.priority.load(Ordering::Relaxed)),
                         });
 
                         // Add original child (now suffix) as child of intermediate
@@ -438,7 +525,7 @@ impl TokenTree {
                             let new_node = Arc::new(Node::new(new_remaining.to_vec()));
                             let new_page_key = make_page_key(new_remaining);
                             new_node.set_parent(&intermediate_node, new_page_key);
-                            new_node.touch_tenant(&tenant_id);
+                            new_node.touch_tenant(&tenant_id, track_lfu);
                             intermediate_node.children.insert(new_page_key, new_node);
                             new_remaining.len()
                         } else {
@@ -448,7 +535,7 @@ impl TokenTree {
                         // Replace entry with intermediate node
                         entry.insert(intermediate_node.clone());
 
-                        intermediate_node.touch_tenant(&tenant_id);
+                        intermediate_node.touch_tenant(&tenant_id, track_lfu);
 
                         // Count: new branch tokens + common prefix only if tenant is new
                         let common_tokens = if tenant_already_owned { 0 } else { common_len };
@@ -506,6 +593,9 @@ impl TokenTree {
         let mut remaining = tokens;
         let mut current = Arc::clone(&self.root);
 
+        // Compute once: only track hit counts for LFU policy
+        let track_lfu = self.eviction_policy == EvictionPolicy::Lfu;
+
         enum MatchStep {
             Done,
             Continue {
@@ -553,7 +643,7 @@ impl TokenTree {
                             // Update timestamp on match to keep LRU in sync with backend
                             // SGLang does: child.last_access_time = access_time
                             if let Some(ref t) = tenant {
-                                child.touch_tenant(t);
+                                child.touch_tenant(t, track_lfu);
                             }
 
                             if match_len < child_tokens.len() {
@@ -623,8 +713,47 @@ impl TokenTree {
             .collect()
     }
 
+    /// Compute eviction priority for a node based on the configured policy.
+    /// Returns (primary_key, tiebreaker) where lower values are evicted first.
+    ///
+    /// Uses wrapping arithmetic for u64→i64 conversion. This preserves relative ordering
+    /// for values within i64::MAX of each other, which is sufficient since our timestamps
+    /// are monotonic counters starting from 0.
+    fn compute_eviction_priority(&self, node: &Node, last_access_time: u64) -> (i64, u64) {
+        match self.eviction_policy {
+            EvictionPolicy::Lru => {
+                // Lower last_access_time = older = evict first
+                // Wrapping cast preserves ordering for nearby values
+                (last_access_time as i64, 0)
+            }
+            EvictionPolicy::Lfu => {
+                // Lower hit_count = less used = evict first, tiebreak by last_access_time
+                let hit_count = node.hit_count.load(Ordering::Relaxed);
+                (hit_count as i64, last_access_time)
+            }
+            EvictionPolicy::Fifo => {
+                // Lower creation_time = older = evict first
+                (node.creation_time as i64, 0)
+            }
+            EvictionPolicy::Mru => {
+                // Higher last_access_time = newer = evict first (negate for min-heap)
+                // wrapping_neg handles i64::MIN correctly (wraps to itself)
+                ((last_access_time as i64).wrapping_neg(), 0)
+            }
+            EvictionPolicy::Filo => {
+                // Higher creation_time = newer = evict first (negate for min-heap)
+                ((node.creation_time as i64).wrapping_neg(), 0)
+            }
+            EvictionPolicy::Priority => {
+                // Lower priority = less important = evict first, tiebreak by last_access_time
+                let priority = node.priority.load(Ordering::Relaxed);
+                (priority as i64, last_access_time)
+            }
+        }
+    }
+
     /// Evict entries for a tenant to reduce to max_tokens.
-    /// Uses leaf-first LRU eviction matching SGLang's behavior.
+    /// Uses leaf-first eviction with the configured policy (matching SGLang's behavior).
     pub fn evict_tenant(&self, tenant: &TenantId, max_tokens: usize) {
         use std::{cmp::Reverse, collections::BinaryHeap};
 
@@ -644,14 +773,19 @@ impl TokenTree {
         let mut leaves: Vec<(NodeRef, u64)> = Vec::new();
         self.collect_tenant_leaves(&self.root, tenant, &mut leaves);
 
-        // Min-heap by timestamp (oldest first)
-        let mut heap: BinaryHeap<Reverse<(u64, usize)>> = BinaryHeap::new();
+        // Min-heap by eviction priority (policy-dependent)
+        let mut heap: BinaryHeap<Reverse<((i64, u64), usize)>> = BinaryHeap::new();
+
+        // Pre-allocate for initial leaves. Additional capacity for leaf promotions
+        // (when a parent becomes a leaf after child eviction) will be handled by
+        // Vec's amortized growth strategy.
         let mut leaf_data: Vec<NodeRef> = Vec::with_capacity(leaves.len());
 
         for (node, ts) in leaves.drain(..) {
+            let priority = self.compute_eviction_priority(&node, ts);
             let idx = leaf_data.len();
             leaf_data.push(node);
-            heap.push(Reverse((ts, idx)));
+            heap.push(Reverse((priority, idx)));
         }
 
         while evicted < to_evict {
@@ -666,9 +800,10 @@ impl TokenTree {
 
                 // Incremental leaf promotion (matching SGLang's approach)
                 if let Some((parent_node, parent_ts)) = parent_became_leaf {
+                    let priority = self.compute_eviction_priority(&parent_node, parent_ts);
                     let new_idx = leaf_data.len();
                     leaf_data.push(parent_node);
-                    heap.push(Reverse((parent_ts, new_idx)));
+                    heap.push(Reverse((priority, new_idx)));
                 }
             }
         }
@@ -681,7 +816,8 @@ impl TokenTree {
             tenant = %tenant.as_ref(),
             evicted = evicted,
             remaining = current_count.saturating_sub(evicted),
-            "Evicted tokens from tenant (leaf-first LRU)"
+            policy = ?self.eviction_policy,
+            "Evicted tokens from tenant (leaf-first)"
         );
     }
 
@@ -2106,5 +2242,195 @@ mod tests {
         RadixTree::reset(&tree);
 
         assert!(tree.get_tenant_token_counts().is_empty());
+    }
+
+    #[test]
+    fn test_eviction_policy_lru() {
+        // LRU: Evict oldest by last access time
+        let tree = TokenTree::with_policy(EvictionPolicy::Lru);
+
+        // Insert 3 paths, access them in order (oldest first)
+        let tokens1 = make_tokens(1, 1);
+        let tokens2 = make_tokens(100, 1);
+        let tokens3 = make_tokens(200, 1);
+
+        tree.insert_tokens(&tokens1, "tenant1"); // Oldest
+        tree.insert_tokens(&tokens2, "tenant1");
+        tree.insert_tokens(&tokens3, "tenant1"); // Newest
+
+        // Access tokens2 to make it newer
+        let _ = tree.match_prefix_with_counts(&tokens2);
+
+        // Evict 1 page - should evict tokens1 (oldest by last_access_time)
+        tree.evict_tenant(&Arc::from("tenant1"), 2 * PAGE_SIZE);
+
+        // tokens1 should be evicted, tokens2 and tokens3 should remain
+        let result = tree.match_prefix_with_counts(&tokens1);
+        assert_eq!(
+            result.matched_token_count, 0,
+            "tokens1 should be evicted (oldest)"
+        );
+
+        let result = tree.match_prefix_with_counts(&tokens2);
+        assert_eq!(
+            result.matched_token_count, PAGE_SIZE,
+            "tokens2 should remain"
+        );
+
+        let result = tree.match_prefix_with_counts(&tokens3);
+        assert_eq!(
+            result.matched_token_count, PAGE_SIZE,
+            "tokens3 should remain"
+        );
+    }
+
+    #[test]
+    fn test_eviction_policy_mru() {
+        // MRU: Evict newest by last access time (opposite of LRU)
+        let tree = TokenTree::with_policy(EvictionPolicy::Mru);
+
+        let tokens1 = make_tokens(1, 1);
+        let tokens2 = make_tokens(100, 1);
+        let tokens3 = make_tokens(200, 1);
+
+        tree.insert_tokens(&tokens1, "tenant1"); // Oldest
+        tree.insert_tokens(&tokens2, "tenant1");
+        tree.insert_tokens(&tokens3, "tenant1"); // Newest
+
+        // Evict 1 page - should evict tokens3 (newest by last_access_time)
+        tree.evict_tenant(&Arc::from("tenant1"), 2 * PAGE_SIZE);
+
+        // tokens3 should be evicted (newest), tokens1 and tokens2 should remain
+        let result = tree.match_prefix_with_counts(&tokens3);
+        assert_eq!(
+            result.matched_token_count, 0,
+            "tokens3 should be evicted (newest)"
+        );
+
+        let result = tree.match_prefix_with_counts(&tokens1);
+        assert_eq!(
+            result.matched_token_count, PAGE_SIZE,
+            "tokens1 should remain"
+        );
+    }
+
+    #[test]
+    fn test_eviction_policy_fifo() {
+        // FIFO: Evict oldest by creation time (not affected by access)
+        let tree = TokenTree::with_policy(EvictionPolicy::Fifo);
+
+        let tokens1 = make_tokens(1, 1);
+        let tokens2 = make_tokens(100, 1);
+        let tokens3 = make_tokens(200, 1);
+
+        tree.insert_tokens(&tokens1, "tenant1"); // First created
+        tree.insert_tokens(&tokens2, "tenant1");
+        tree.insert_tokens(&tokens3, "tenant1"); // Last created
+
+        // Access tokens1 multiple times (shouldn't affect FIFO)
+        for _ in 0..10 {
+            let _ = tree.match_prefix_with_counts(&tokens1);
+        }
+
+        // Evict 1 page - should evict tokens1 (oldest by creation_time)
+        tree.evict_tenant(&Arc::from("tenant1"), 2 * PAGE_SIZE);
+
+        // tokens1 should be evicted despite being accessed most recently
+        let result = tree.match_prefix_with_counts(&tokens1);
+        assert_eq!(
+            result.matched_token_count, 0,
+            "tokens1 should be evicted (oldest creation)"
+        );
+    }
+
+    #[test]
+    fn test_eviction_policy_filo() {
+        // FILO: Evict newest by creation time (stack-like)
+        let tree = TokenTree::with_policy(EvictionPolicy::Filo);
+
+        let tokens1 = make_tokens(1, 1);
+        let tokens2 = make_tokens(100, 1);
+        let tokens3 = make_tokens(200, 1);
+
+        tree.insert_tokens(&tokens1, "tenant1"); // First created
+        tree.insert_tokens(&tokens2, "tenant1");
+        tree.insert_tokens(&tokens3, "tenant1"); // Last created
+
+        // Evict 1 page - should evict tokens3 (newest by creation_time)
+        tree.evict_tenant(&Arc::from("tenant1"), 2 * PAGE_SIZE);
+
+        // tokens3 should be evicted (newest creation)
+        let result = tree.match_prefix_with_counts(&tokens3);
+        assert_eq!(
+            result.matched_token_count, 0,
+            "tokens3 should be evicted (newest creation)"
+        );
+
+        let result = tree.match_prefix_with_counts(&tokens1);
+        assert_eq!(
+            result.matched_token_count, PAGE_SIZE,
+            "tokens1 should remain"
+        );
+    }
+
+    #[test]
+    fn test_eviction_policy_lfu() {
+        // LFU: Evict least frequently used (by hit_count)
+        let tree = TokenTree::with_policy(EvictionPolicy::Lfu);
+
+        let tokens1 = make_tokens(1, 1);
+        let tokens2 = make_tokens(100, 1);
+        let tokens3 = make_tokens(200, 1);
+
+        tree.insert_tokens(&tokens1, "tenant1");
+        tree.insert_tokens(&tokens2, "tenant1");
+        tree.insert_tokens(&tokens3, "tenant1");
+
+        // Access tokens1 many times to increase its hit_count
+        for _ in 0..20 {
+            let _ = tree.match_prefix_with_counts(&tokens1);
+        }
+
+        // Access tokens3 a few times
+        for _ in 0..5 {
+            let _ = tree.match_prefix_with_counts(&tokens3);
+        }
+
+        // tokens2 has the lowest hit_count (only 1 from insert)
+
+        // Evict 1 page - should evict tokens2 (lowest hit_count)
+        tree.evict_tenant(&Arc::from("tenant1"), 2 * PAGE_SIZE);
+
+        // tokens2 should be evicted (least frequently used)
+        let result = tree.match_prefix_with_counts(&tokens2);
+        assert_eq!(
+            result.matched_token_count, 0,
+            "tokens2 should be evicted (lowest hit count)"
+        );
+
+        // tokens1 should remain (highest hit count)
+        let result = tree.match_prefix_with_counts(&tokens1);
+        assert_eq!(
+            result.matched_token_count, PAGE_SIZE,
+            "tokens1 should remain (high hit count)"
+        );
+    }
+
+    #[test]
+    fn test_eviction_policy_enum_default() {
+        // Default should be LRU
+        assert_eq!(EvictionPolicy::default(), EvictionPolicy::Lru);
+    }
+
+    #[test]
+    fn test_tree_with_policy_getter() {
+        let tree_lru = TokenTree::with_policy(EvictionPolicy::Lru);
+        assert_eq!(tree_lru.eviction_policy(), EvictionPolicy::Lru);
+
+        let tree_lfu = TokenTree::with_policy(EvictionPolicy::Lfu);
+        assert_eq!(tree_lfu.eviction_policy(), EvictionPolicy::Lfu);
+
+        let tree_fifo = TokenTree::with_policy(EvictionPolicy::Fifo);
+        assert_eq!(tree_fifo.eviction_policy(), EvictionPolicy::Fifo);
     }
 }
