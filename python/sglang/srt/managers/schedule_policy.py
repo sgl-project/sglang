@@ -30,6 +30,7 @@ from sglang.srt.mem_cache.allocator import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
+from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
 from sglang.srt.server_args import ServerArgs
 
 if TYPE_CHECKING:
@@ -454,7 +455,7 @@ class PrefillAdder:
         if _rem_tokens <= 0:
             _rem_tokens = self.rem_chunk_tokens
         truncated = req.extend_input_len > _rem_tokens
-        req.extend_input_len = min(req.extend_input_len, _rem_tokens)
+        req.set_extend_input_len(min(req.extend_input_len, _rem_tokens))
         req.fill_ids = req.fill_ids[: len(req.prefix_indices) + req.extend_input_len]
         self.can_run_list.append(req)
         self._update_prefill_budget(
@@ -472,17 +473,13 @@ class PrefillAdder:
 
     @contextmanager
     def _lock_node(self, last_node: TreeNode):
-        if self.is_hybrid_swa:
-            try:
-                swa_uuid_for_lock = self.tree_cache.inc_lock_ref(last_node)
-                yield None
-            finally:
-                self.tree_cache.dec_lock_ref(last_node, swa_uuid_for_lock)
-        else:
-            try:
-                self.tree_cache.inc_lock_ref(last_node)
-                yield None
-            finally:
+        try:
+            ret = self.tree_cache.inc_lock_ref(last_node)
+            yield None
+        finally:
+            if isinstance(self.tree_cache, SWARadixCache):
+                self.tree_cache.dec_lock_ref(last_node, ret)
+            else:
                 self.tree_cache.dec_lock_ref(last_node)
 
     def add_one_req_ignore_eos(self, req: Req):
@@ -559,7 +556,7 @@ class PrefillAdder:
             # Chunked prefill
             trunc_len = self.rem_chunk_tokens
 
-            req.extend_input_len = trunc_len
+            req.set_extend_input_len(trunc_len)
             req.fill_ids = req.fill_ids[:trunc_len]
             self.can_run_list.append(req)
             self.new_chunked_req = req
@@ -608,7 +605,7 @@ class PrefillAdder:
                     req.last_host_node, req.host_hit_length
                 )
                 req.prefix_indices = torch.cat([req.prefix_indices, new_indices])
-                req.extend_input_len = len(req.fill_ids) - len(req.prefix_indices)
+                req.set_extend_input_len(len(req.fill_ids) - len(req.prefix_indices))
                 prefix_len = len(req.prefix_indices)
                 req.cache_protected_len = prefix_len
 
@@ -651,7 +648,7 @@ class PrefillAdder:
                         )
 
                 # Chunked prefill
-                req.extend_input_len = trunc_len
+                req.set_extend_input_len(trunc_len)
                 req.fill_ids = req.fill_ids[: len(req.prefix_indices) + trunc_len]
 
                 self.can_run_list.append(req)

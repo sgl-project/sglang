@@ -2257,6 +2257,21 @@ class TestGlm4MoeDetector(unittest.TestCase):
         )
         check_single_todos(result, expected_output)
 
+    def test_empty_function_name_handling(self):
+        """Test that empty function name is handled gracefully without assertion error."""
+        # This test simulates the issue where the model outputs only the start token without a function name
+        chunks = [
+            "<tool_call>",  # Start token only, no function name yet
+            "\n",  # More content without function name
+        ]
+
+        for chunk in chunks:
+            # Should not raise AssertionError: func_name should not be empty
+            result = self.detector.parse_streaming_increment(chunk, self.tools)
+            # Should return empty calls without error
+            self.assertIsInstance(result, StreamingParseResult)
+            self.assertEqual(result.calls, [])
+
 
 class TestGlm47MoeDetector(unittest.TestCase):
     def setUp(self):
