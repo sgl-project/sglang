@@ -91,6 +91,308 @@ fn generate_worker_endpoints(count: usize) -> Vec<String> {
         .collect()
 }
 
+// ============================================================================
+// Benchmark Macros
+// ============================================================================
+
+/// Macro for INSERT benchmarks with string-based trees (OldTree, StringTree)
+macro_rules! bench_string_insert {
+    ($group:expr, $num_workers:expr, $char_size:expr, $workers:expr, $strings:expr,
+     $prefix:literal, $category:literal, $tree_new:expr, $insert_method:ident) => {{
+        let printed = Arc::new(AtomicBool::new(false));
+        let bench_name = format!(concat!($prefix, "_insert_{}w_{}c"), $num_workers, $char_size);
+        let workers_clone = $workers.clone();
+        let strings_clone = $strings.clone();
+
+        $group.bench_function(&bench_name, |b| {
+            let workers = workers_clone.clone();
+            let strings = strings_clone.clone();
+            let printed = printed.clone();
+
+            b.iter_custom(|iters| {
+                let tree = $tree_new;
+                let start = Instant::now();
+                for i in 0..iters {
+                    let tenant = &workers[i as usize % workers.len()];
+                    let text = &strings[i as usize % strings.len()];
+                    tree.$insert_method(black_box(text), tenant);
+                }
+                let duration = start.elapsed();
+
+                if !printed.swap(true, Ordering::Relaxed) {
+                    let ops_per_sec = iters as f64 / duration.as_secs_f64();
+                    let latency_us = duration.as_nanos() as f64 / iters as f64 / 1000.0;
+                    let throughput_mb = (ops_per_sec * $char_size as f64) / 1_000_000.0;
+                    add_result(
+                        $category,
+                        format!(
+                            "{:>3}w | {:>5} chars | INSERT | {:>8.0} ops/s | {:>6.1} µs | {:>7.1} MB/s",
+                            $num_workers, $char_size, ops_per_sec, latency_us, throughput_mb
+                        ),
+                    );
+                }
+
+                duration
+            });
+        });
+    }};
+}
+
+/// Macro for MATCH benchmarks with string-based trees
+macro_rules! bench_string_match {
+    ($group:expr, $num_workers:expr, $char_size:expr, $tree:expr, $strings:expr,
+     $prefix:literal, $category:literal, $match_method:ident) => {{
+        let printed = Arc::new(AtomicBool::new(false));
+        let bench_name = format!(concat!($prefix, "_match_{}w_{}c"), $num_workers, $char_size);
+        let tree_clone = $tree.clone();
+        let strings_clone = $strings.clone();
+
+        $group.bench_function(&bench_name, |b| {
+            let tree = tree_clone.clone();
+            let strings = strings_clone.clone();
+            let mut idx = 0;
+            let printed = printed.clone();
+
+            b.iter_custom(|iters| {
+                let start = Instant::now();
+                for _ in 0..iters {
+                    let result = tree.$match_method(black_box(&strings[idx % strings.len()]));
+                    black_box(result);
+                    idx += 1;
+                }
+                let duration = start.elapsed();
+
+                if !printed.swap(true, Ordering::Relaxed) {
+                    let ops_per_sec = iters as f64 / duration.as_secs_f64();
+                    let latency_us = duration.as_nanos() as f64 / iters as f64 / 1000.0;
+                    let throughput_mb = (ops_per_sec * $char_size as f64) / 1_000_000.0;
+                    add_result(
+                        $category,
+                        format!(
+                            "{:>3}w | {:>5} chars | MATCH  | {:>8.0} ops/s | {:>6.1} µs | {:>7.1} MB/s",
+                            $num_workers, $char_size, ops_per_sec, latency_us, throughput_mb
+                        ),
+                    );
+                }
+
+                duration
+            });
+        });
+    }};
+}
+
+/// Macro for CONCURRENT benchmarks with string-based trees
+macro_rules! bench_string_concurrent {
+    ($group:expr, $num_workers:expr, $workers:expr, $num_threads:expr, $ops_per_thread:expr,
+     $prefix:literal, $category:literal, $tree_new:expr, $insert_method:ident, $match_method:ident) => {{
+        let printed = Arc::new(AtomicBool::new(false));
+        let bench_name = format!(concat!($prefix, "_concurrent_{}w"), $num_workers);
+        let workers_clone = $workers.clone();
+
+        $group.bench_function(&bench_name, |b| {
+            let printed = printed.clone();
+            let workers = workers_clone.clone();
+
+            b.iter_custom(|iters| {
+                let start = Instant::now();
+                for _ in 0..iters {
+                    let tree = Arc::new($tree_new);
+                    let workers_ref = &workers;
+                    let handles: Vec<_> = (0..$num_threads)
+                        .map(|t| {
+                            let tree = Arc::clone(&tree);
+                            let worker = workers_ref[t % workers_ref.len()].clone();
+                            thread::spawn(move || {
+                                for i in 0..$ops_per_thread {
+                                    let text = format!(
+                                        "{}thread{}_request{}_padding{}",
+                                        CONVERSATION_PREFIXES[i % CONVERSATION_PREFIXES.len()],
+                                        t,
+                                        i,
+                                        "x".repeat(1000)
+                                    );
+                                    if i % 3 == 0 {
+                                        tree.$match_method(&text);
+                                    } else {
+                                        tree.$insert_method(&text, &worker);
+                                    }
+                                }
+                            })
+                        })
+                        .collect();
+
+                    for h in handles {
+                        h.join().unwrap();
+                    }
+                }
+                let duration = start.elapsed();
+
+                if !printed.swap(true, Ordering::Relaxed) {
+                    let total_ops = iters * $num_threads as u64 * $ops_per_thread as u64;
+                    let ops_per_sec = total_ops as f64 / duration.as_secs_f64();
+                    add_result(
+                        $category,
+                        format!(
+                            "{:>3}w | CONCURRENT | {:>7.0} ops/s | {} threads x {} ops",
+                            $num_workers, ops_per_sec, $num_threads, $ops_per_thread
+                        ),
+                    );
+                }
+
+                duration
+            });
+        });
+    }};
+}
+
+/// Macro for INSERT benchmarks with TokenTree
+macro_rules! bench_token_insert {
+    ($group:expr, $num_workers:expr, $token_size:expr, $workers:expr, $sequences:expr) => {{
+        let printed = Arc::new(AtomicBool::new(false));
+        let bench_name = format!("token_insert_{}w_{}tok", $num_workers, $token_size);
+        let workers_clone = $workers.clone();
+        let seqs_clone = $sequences.clone();
+
+        $group.bench_function(&bench_name, |b| {
+            let workers = workers_clone.clone();
+            let seqs = seqs_clone.clone();
+            let printed = printed.clone();
+
+            b.iter_custom(|iters| {
+                let tree = TokenTree::new();
+                let start = Instant::now();
+                for i in 0..iters {
+                    let tenant = &workers[i as usize % workers.len()];
+                    let tokens = &seqs[i as usize % seqs.len()];
+                    tree.insert_tokens(black_box(tokens), tenant);
+                }
+                let duration = start.elapsed();
+
+                if !printed.swap(true, Ordering::Relaxed) {
+                    let ops_per_sec = iters as f64 / duration.as_secs_f64();
+                    let latency_us = duration.as_nanos() as f64 / iters as f64 / 1000.0;
+                    let throughput_mtok = (ops_per_sec * $token_size as f64) / 1_000_000.0;
+                    add_result(
+                        "token",
+                        format!(
+                            "{:>3}w | {:>5} tokens | INSERT | {:>8.0} ops/s | {:>6.1} µs | {:>6.1} Mtok/s",
+                            $num_workers, $token_size, ops_per_sec, latency_us, throughput_mtok
+                        ),
+                    );
+                }
+
+                duration
+            });
+        });
+    }};
+}
+
+/// Macro for MATCH benchmarks with TokenTree
+macro_rules! bench_token_match {
+    ($group:expr, $num_workers:expr, $token_size:expr, $tree:expr, $sequences:expr) => {{
+        let printed = Arc::new(AtomicBool::new(false));
+        let bench_name = format!("token_match_{}w_{}tok", $num_workers, $token_size);
+        let tree_clone = $tree.clone();
+        let seqs_clone = $sequences.clone();
+
+        $group.bench_function(&bench_name, |b| {
+            let tree = tree_clone.clone();
+            let seqs = seqs_clone.clone();
+            let mut idx = 0;
+            let printed = printed.clone();
+
+            b.iter_custom(|iters| {
+                let start = Instant::now();
+                for _ in 0..iters {
+                    let result = tree.prefix_match_legacy(black_box(&seqs[idx % seqs.len()]));
+                    black_box(result);
+                    idx += 1;
+                }
+                let duration = start.elapsed();
+
+                if !printed.swap(true, Ordering::Relaxed) {
+                    let ops_per_sec = iters as f64 / duration.as_secs_f64();
+                    let latency_us = duration.as_nanos() as f64 / iters as f64 / 1000.0;
+                    let throughput_mtok = (ops_per_sec * $token_size as f64) / 1_000_000.0;
+                    add_result(
+                        "token",
+                        format!(
+                            "{:>3}w | {:>5} tokens | MATCH  | {:>8.0} ops/s | {:>6.1} µs | {:>6.1} Mtok/s",
+                            $num_workers, $token_size, ops_per_sec, latency_us, throughput_mtok
+                        ),
+                    );
+                }
+
+                duration
+            });
+        });
+    }};
+}
+
+/// Macro for CONCURRENT benchmarks with TokenTree
+macro_rules! bench_token_concurrent {
+    ($group:expr, $num_workers:expr, $workers:expr, $num_threads:expr, $ops_per_thread:expr) => {{
+        let printed = Arc::new(AtomicBool::new(false));
+        let bench_name = format!("token_concurrent_{}w", $num_workers);
+        let workers_clone = $workers.clone();
+
+        $group.bench_function(&bench_name, |b| {
+            let printed = printed.clone();
+            let workers = workers_clone.clone();
+
+            b.iter_custom(|iters| {
+                let start = Instant::now();
+                for _ in 0..iters {
+                    let tree = Arc::new(TokenTree::new());
+                    let workers_ref = &workers;
+                    let handles: Vec<_> = (0..$num_threads)
+                        .map(|t| {
+                            let tree = Arc::clone(&tree);
+                            let worker = workers_ref[t % workers_ref.len()].clone();
+                            thread::spawn(move || {
+                                for i in 0..$ops_per_thread {
+                                    // Generate deterministic token sequence
+                                    let tokens: Vec<TokenId> = (0..1024)
+                                        .map(|j| (t * 10000 + i * 100 + j) as u32)
+                                        .collect();
+                                    if i % 3 == 0 {
+                                        tree.prefix_match_legacy(&tokens);
+                                    } else {
+                                        tree.insert_tokens(&tokens, &worker);
+                                    }
+                                }
+                            })
+                        })
+                        .collect();
+
+                    for h in handles {
+                        h.join().unwrap();
+                    }
+                }
+                let duration = start.elapsed();
+
+                if !printed.swap(true, Ordering::Relaxed) {
+                    let total_ops = iters * $num_threads as u64 * $ops_per_thread as u64;
+                    let ops_per_sec = total_ops as f64 / duration.as_secs_f64();
+                    add_result(
+                        "token",
+                        format!(
+                            "{:>3}w | CONCURRENT | {:>7.0} ops/s | {} threads x {} ops",
+                            $num_workers, ops_per_sec, $num_threads, $ops_per_thread
+                        ),
+                    );
+                }
+
+                duration
+            });
+        });
+    }};
+}
+
+// ============================================================================
+// Main Benchmark
+// ============================================================================
+
 /// Main benchmark comparing StringTree vs TokenTree
 fn bench_summary(c: &mut Criterion) {
     let mut group = c.benchmark_group("benchmark_summary");
@@ -127,141 +429,41 @@ fn bench_summary(c: &mut Criterion) {
                 old_tree.insert(s, tenant);
             }
 
-            // OLD tree INSERT
-            let printed = Arc::new(AtomicBool::new(false));
-            let bench_name = format!("old_insert_{}w_{}c", num_workers, char_size);
-            let workers_clone = workers.clone();
-            let strings_clone = fixed_strings.clone();
-
-            group.bench_function(&bench_name, |b| {
-                let workers = workers_clone.clone();
-                let strings = strings_clone.clone();
-                let printed = printed.clone();
-
-                b.iter_custom(|iters| {
-                    let tree = OldTree::new();
-                    let start = Instant::now();
-                    for i in 0..iters {
-                        let tenant = &workers[i as usize % workers.len()];
-                        let text = &strings[i as usize % strings.len()];
-                        tree.insert(black_box(text), tenant);
-                    }
-                    let duration = start.elapsed();
-
-                    if !printed.swap(true, Ordering::Relaxed) {
-                        let ops_per_sec = iters as f64 / duration.as_secs_f64();
-                        let latency_us = duration.as_nanos() as f64 / iters as f64 / 1000.0;
-                        let throughput_mb = (ops_per_sec * char_size as f64) / 1_000_000.0;
-                        add_result(
-                            "old",
-                            format!(
-                                "{:>3}w | {:>5} chars | INSERT | {:>8.0} ops/s | {:>6.1} µs | {:>7.1} MB/s",
-                                num_workers, char_size, ops_per_sec, latency_us, throughput_mb
-                            ),
-                        );
-                    }
-
-                    duration
-                });
-            });
-
-            // OLD tree MATCH
-            let printed = Arc::new(AtomicBool::new(false));
-            let bench_name = format!("old_match_{}w_{}c", num_workers, char_size);
-            let tree_clone = old_tree.clone();
-            let strings_clone = fixed_strings.clone();
-
-            group.bench_function(&bench_name, |b| {
-                let tree = tree_clone.clone();
-                let strings = strings_clone.clone();
-                let mut idx = 0;
-                let printed = printed.clone();
-
-                b.iter_custom(|iters| {
-                    let start = Instant::now();
-                    for _ in 0..iters {
-                        let result = tree.prefix_match(black_box(&strings[idx % strings.len()]));
-                        black_box(result);
-                        idx += 1;
-                    }
-                    let duration = start.elapsed();
-
-                    if !printed.swap(true, Ordering::Relaxed) {
-                        let ops_per_sec = iters as f64 / duration.as_secs_f64();
-                        let latency_us = duration.as_nanos() as f64 / iters as f64 / 1000.0;
-                        let throughput_mb = (ops_per_sec * char_size as f64) / 1_000_000.0;
-                        add_result(
-                            "old",
-                            format!(
-                                "{:>3}w | {:>5} chars | MATCH  | {:>8.0} ops/s | {:>6.1} µs | {:>7.1} MB/s",
-                                num_workers, char_size, ops_per_sec, latency_us, throughput_mb
-                            ),
-                        );
-                    }
-
-                    duration
-                });
-            });
+            bench_string_insert!(
+                group,
+                num_workers,
+                char_size,
+                workers,
+                fixed_strings,
+                "old",
+                "old",
+                OldTree::new(),
+                insert
+            );
+            bench_string_match!(
+                group,
+                num_workers,
+                char_size,
+                old_tree,
+                fixed_strings,
+                "old",
+                "old",
+                prefix_match
+            );
         }
 
-        // OLD tree CONCURRENT
-        let printed = Arc::new(AtomicBool::new(false));
-        let bench_name = format!("old_concurrent_{}w", num_workers);
-        let workers_clone = workers.clone();
-
-        group.bench_function(&bench_name, |b| {
-            let printed = printed.clone();
-            let workers = workers_clone.clone();
-
-            b.iter_custom(|iters| {
-                let start = Instant::now();
-                for _ in 0..iters {
-                    let tree = Arc::new(OldTree::new());
-                    let workers_ref = &workers;
-                    let handles: Vec<_> = (0..NUM_THREADS)
-                        .map(|t| {
-                            let tree = Arc::clone(&tree);
-                            let worker = workers_ref[t % workers_ref.len()].clone();
-                            thread::spawn(move || {
-                                for i in 0..OPS_PER_THREAD {
-                                    let text = format!(
-                                        "{}thread{}_request{}_padding{}",
-                                        CONVERSATION_PREFIXES[i % CONVERSATION_PREFIXES.len()],
-                                        t,
-                                        i,
-                                        "x".repeat(1000)
-                                    );
-                                    if i % 3 == 0 {
-                                        tree.prefix_match(&text);
-                                    } else {
-                                        tree.insert(&text, &worker);
-                                    }
-                                }
-                            })
-                        })
-                        .collect();
-
-                    for h in handles {
-                        h.join().unwrap();
-                    }
-                }
-                let duration = start.elapsed();
-
-                if !printed.swap(true, Ordering::Relaxed) {
-                    let total_ops = iters * NUM_THREADS as u64 * OPS_PER_THREAD as u64;
-                    let ops_per_sec = total_ops as f64 / duration.as_secs_f64();
-                    add_result(
-                        "old",
-                        format!(
-                            "{:>3}w | CONCURRENT | {:>7.0} ops/s | {} threads x {} ops",
-                            num_workers, ops_per_sec, NUM_THREADS, OPS_PER_THREAD
-                        ),
-                    );
-                }
-
-                duration
-            });
-        });
+        bench_string_concurrent!(
+            group,
+            num_workers,
+            workers,
+            NUM_THREADS,
+            OPS_PER_THREAD,
+            "old",
+            "old",
+            OldTree::new(),
+            insert,
+            prefix_match
+        );
     }
 
     // ========================================================================
@@ -280,141 +482,41 @@ fn bench_summary(c: &mut Criterion) {
                 string_tree.insert_text(s, tenant);
             }
 
-            // StringTree INSERT
-            let printed = Arc::new(AtomicBool::new(false));
-            let bench_name = format!("string_insert_{}w_{}c", num_workers, char_size);
-            let workers_clone = workers.clone();
-            let strings_clone = fixed_strings.clone();
-
-            group.bench_function(&bench_name, |b| {
-                let workers = workers_clone.clone();
-                let strings = strings_clone.clone();
-                let printed = printed.clone();
-
-                b.iter_custom(|iters| {
-                    let tree = StringTree::new();
-                    let start = Instant::now();
-                    for i in 0..iters {
-                        let tenant = &workers[i as usize % workers.len()];
-                        let text = &strings[i as usize % strings.len()];
-                        tree.insert_text(black_box(text), tenant);
-                    }
-                    let duration = start.elapsed();
-
-                    if !printed.swap(true, Ordering::Relaxed) {
-                        let ops_per_sec = iters as f64 / duration.as_secs_f64();
-                        let latency_us = duration.as_nanos() as f64 / iters as f64 / 1000.0;
-                        let throughput_mb = (ops_per_sec * char_size as f64) / 1_000_000.0;
-                        add_result(
-                            "string",
-                            format!(
-                                "{:>3}w | {:>5} chars | INSERT | {:>8.0} ops/s | {:>6.1} µs | {:>7.1} MB/s",
-                                num_workers, char_size, ops_per_sec, latency_us, throughput_mb
-                            ),
-                        );
-                    }
-
-                    duration
-                });
-            });
-
-            // StringTree MATCH
-            let printed = Arc::new(AtomicBool::new(false));
-            let bench_name = format!("string_match_{}w_{}c", num_workers, char_size);
-            let tree_clone = string_tree.clone();
-            let strings_clone = fixed_strings.clone();
-
-            group.bench_function(&bench_name, |b| {
-                let tree = tree_clone.clone();
-                let strings = strings_clone.clone();
-                let mut idx = 0;
-                let printed = printed.clone();
-
-                b.iter_custom(|iters| {
-                    let start = Instant::now();
-                    for _ in 0..iters {
-                        let result = tree.prefix_match_legacy(black_box(&strings[idx % strings.len()]));
-                        black_box(result);
-                        idx += 1;
-                    }
-                    let duration = start.elapsed();
-
-                    if !printed.swap(true, Ordering::Relaxed) {
-                        let ops_per_sec = iters as f64 / duration.as_secs_f64();
-                        let latency_us = duration.as_nanos() as f64 / iters as f64 / 1000.0;
-                        let throughput_mb = (ops_per_sec * char_size as f64) / 1_000_000.0;
-                        add_result(
-                            "string",
-                            format!(
-                                "{:>3}w | {:>5} chars | MATCH  | {:>8.0} ops/s | {:>6.1} µs | {:>7.1} MB/s",
-                                num_workers, char_size, ops_per_sec, latency_us, throughput_mb
-                            ),
-                        );
-                    }
-
-                    duration
-                });
-            });
+            bench_string_insert!(
+                group,
+                num_workers,
+                char_size,
+                workers,
+                fixed_strings,
+                "string",
+                "string",
+                StringTree::new(),
+                insert_text
+            );
+            bench_string_match!(
+                group,
+                num_workers,
+                char_size,
+                string_tree,
+                fixed_strings,
+                "string",
+                "string",
+                prefix_match_legacy
+            );
         }
 
-        // StringTree CONCURRENT
-        let printed = Arc::new(AtomicBool::new(false));
-        let bench_name = format!("string_concurrent_{}w", num_workers);
-        let workers_clone = workers.clone();
-
-        group.bench_function(&bench_name, |b| {
-            let printed = printed.clone();
-            let workers = workers_clone.clone();
-
-            b.iter_custom(|iters| {
-                let start = Instant::now();
-                for _ in 0..iters {
-                    let tree = Arc::new(StringTree::new());
-                    let workers_ref = &workers;
-                    let handles: Vec<_> = (0..NUM_THREADS)
-                        .map(|t| {
-                            let tree = Arc::clone(&tree);
-                            let worker = workers_ref[t % workers_ref.len()].clone();
-                            thread::spawn(move || {
-                                for i in 0..OPS_PER_THREAD {
-                                    let text = format!(
-                                        "{}thread{}_request{}_padding{}",
-                                        CONVERSATION_PREFIXES[i % CONVERSATION_PREFIXES.len()],
-                                        t,
-                                        i,
-                                        "x".repeat(1000)
-                                    );
-                                    if i % 3 == 0 {
-                                        tree.prefix_match_legacy(&text);
-                                    } else {
-                                        tree.insert_text(&text, &worker);
-                                    }
-                                }
-                            })
-                        })
-                        .collect();
-
-                    for h in handles {
-                        h.join().unwrap();
-                    }
-                }
-                let duration = start.elapsed();
-
-                if !printed.swap(true, Ordering::Relaxed) {
-                    let total_ops = iters * NUM_THREADS as u64 * OPS_PER_THREAD as u64;
-                    let ops_per_sec = total_ops as f64 / duration.as_secs_f64();
-                    add_result(
-                        "string",
-                        format!(
-                            "{:>3}w | CONCURRENT | {:>7.0} ops/s | {} threads x {} ops",
-                            num_workers, ops_per_sec, NUM_THREADS, OPS_PER_THREAD
-                        ),
-                    );
-                }
-
-                duration
-            });
-        });
+        bench_string_concurrent!(
+            group,
+            num_workers,
+            workers,
+            NUM_THREADS,
+            OPS_PER_THREAD,
+            "string",
+            "string",
+            StringTree::new(),
+            insert_text,
+            prefix_match_legacy
+        );
     }
 
     // ========================================================================
@@ -433,138 +535,11 @@ fn bench_summary(c: &mut Criterion) {
                 token_tree.insert_tokens(seq, tenant);
             }
 
-            // TokenTree INSERT
-            let printed = Arc::new(AtomicBool::new(false));
-            let bench_name = format!("token_insert_{}w_{}tok", num_workers, token_size);
-            let workers_clone = workers.clone();
-            let seqs_clone = fixed_sequences.clone();
-
-            group.bench_function(&bench_name, |b| {
-                let workers = workers_clone.clone();
-                let seqs = seqs_clone.clone();
-                let printed = printed.clone();
-
-                b.iter_custom(|iters| {
-                    let tree = TokenTree::new();
-                    let start = Instant::now();
-                    for i in 0..iters {
-                        let tenant = &workers[i as usize % workers.len()];
-                        let tokens = &seqs[i as usize % seqs.len()];
-                        tree.insert_tokens(black_box(tokens), tenant);
-                    }
-                    let duration = start.elapsed();
-
-                    if !printed.swap(true, Ordering::Relaxed) {
-                        let ops_per_sec = iters as f64 / duration.as_secs_f64();
-                        let latency_us = duration.as_nanos() as f64 / iters as f64 / 1000.0;
-                        let throughput_mtok = (ops_per_sec * token_size as f64) / 1_000_000.0;
-                        add_result(
-                            "token",
-                            format!(
-                                "{:>3}w | {:>5} tokens | INSERT | {:>8.0} ops/s | {:>6.1} µs | {:>6.1} Mtok/s",
-                                num_workers, token_size, ops_per_sec, latency_us, throughput_mtok
-                            ),
-                        );
-                    }
-
-                    duration
-                });
-            });
-
-            // TokenTree MATCH
-            let printed = Arc::new(AtomicBool::new(false));
-            let bench_name = format!("token_match_{}w_{}tok", num_workers, token_size);
-            let tree_clone = token_tree.clone();
-            let seqs_clone = fixed_sequences.clone();
-
-            group.bench_function(&bench_name, |b| {
-                let tree = tree_clone.clone();
-                let seqs = seqs_clone.clone();
-                let mut idx = 0;
-                let printed = printed.clone();
-
-                b.iter_custom(|iters| {
-                    let start = Instant::now();
-                    for _ in 0..iters {
-                        let result = tree.prefix_match_legacy(black_box(&seqs[idx % seqs.len()]));
-                        black_box(result);
-                        idx += 1;
-                    }
-                    let duration = start.elapsed();
-
-                    if !printed.swap(true, Ordering::Relaxed) {
-                        let ops_per_sec = iters as f64 / duration.as_secs_f64();
-                        let latency_us = duration.as_nanos() as f64 / iters as f64 / 1000.0;
-                        let throughput_mtok = (ops_per_sec * token_size as f64) / 1_000_000.0;
-                        add_result(
-                            "token",
-                            format!(
-                                "{:>3}w | {:>5} tokens | MATCH  | {:>8.0} ops/s | {:>6.1} µs | {:>6.1} Mtok/s",
-                                num_workers, token_size, ops_per_sec, latency_us, throughput_mtok
-                            ),
-                        );
-                    }
-
-                    duration
-                });
-            });
+            bench_token_insert!(group, num_workers, token_size, workers, fixed_sequences);
+            bench_token_match!(group, num_workers, token_size, token_tree, fixed_sequences);
         }
 
-        // TokenTree CONCURRENT
-        let printed = Arc::new(AtomicBool::new(false));
-        let bench_name = format!("token_concurrent_{}w", num_workers);
-        let workers_clone = workers.clone();
-
-        group.bench_function(&bench_name, |b| {
-            let printed = printed.clone();
-            let workers = workers_clone.clone();
-
-            b.iter_custom(|iters| {
-                let start = Instant::now();
-                for _ in 0..iters {
-                    let tree = Arc::new(TokenTree::new());
-                    let workers_ref = &workers;
-                    let handles: Vec<_> = (0..NUM_THREADS)
-                        .map(|t| {
-                            let tree = Arc::clone(&tree);
-                            let worker = workers_ref[t % workers_ref.len()].clone();
-                            thread::spawn(move || {
-                                for i in 0..OPS_PER_THREAD {
-                                    // Generate deterministic token sequence
-                                    let tokens: Vec<TokenId> = (0..1024)
-                                        .map(|j| (t * 10000 + i * 100 + j) as u32)
-                                        .collect();
-                                    if i % 3 == 0 {
-                                        tree.prefix_match_legacy(&tokens);
-                                    } else {
-                                        tree.insert_tokens(&tokens, &worker);
-                                    }
-                                }
-                            })
-                        })
-                        .collect();
-
-                    for h in handles {
-                        h.join().unwrap();
-                    }
-                }
-                let duration = start.elapsed();
-
-                if !printed.swap(true, Ordering::Relaxed) {
-                    let total_ops = iters * NUM_THREADS as u64 * OPS_PER_THREAD as u64;
-                    let ops_per_sec = total_ops as f64 / duration.as_secs_f64();
-                    add_result(
-                        "token",
-                        format!(
-                            "{:>3}w | CONCURRENT | {:>7.0} ops/s | {} threads x {} ops",
-                            num_workers, ops_per_sec, NUM_THREADS, OPS_PER_THREAD
-                        ),
-                    );
-                }
-
-                duration
-            });
-        });
+        bench_token_concurrent!(group, num_workers, workers, NUM_THREADS, OPS_PER_THREAD);
     }
 
     group.finish();
