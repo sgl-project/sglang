@@ -1081,7 +1081,7 @@ class ServerArgs:
                             )
                         else:
                             assert (
-                                self.dp_size == self.tp_size
+                                self.dp_size == 1
                             ), "For round-robin split mode, dp attention is not supported."
                         assert (
                             self.tp_size == 8
