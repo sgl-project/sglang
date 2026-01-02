@@ -8,6 +8,7 @@ import logging
 import os
 import random
 import re
+import shlex
 import subprocess
 import sys
 import threading
@@ -91,18 +92,24 @@ DEFAULT_MODEL_NAME_FOR_TEST_AWQ_INT4 = (
     "hugging-quants/Meta-Llama-3.1-8B-Instruct-AWQ-INT4"
 )
 
-# EAGLE
-DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST = "meta-llama/Llama-2-7b-chat-hf"
-DEFAULT_EAGLE_DRAFT_MODEL_FOR_TEST = "lmsys/sglang-EAGLE-llama2-chat-7B"
-DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST_EAGLE3 = "meta-llama/Llama-3.1-8B-Instruct"
-DEFAULT_EAGLE_DP_ATTENTION_TARGET_MODEL_FOR_TEST = "Qwen/Qwen3-30B-A3B"
-DEFAULT_EAGLE_DP_ATTENTION_DRAFT_MODEL_FOR_TEST = "Tengyunw/qwen3_30b_moe_eagle3"
-DEFAULT_MODEL_NAME_FOR_TEST_EAGLE3 = "lmsys/sglang-EAGLE3-LLaMA3.1-Instruct-8B"
-DEFAULT_STANDALONE_SPECULATIVE_TARGET_MODEL_FOR_TEST = (
-    "meta-llama/Llama-3.1-8B-Instruct"
-)
-DEFAULT_STANDALONE_SPECULATIVE_DRAFT_MODEL_FOR_TEST = "meta-llama/Llama-3.2-1B-Instruct"
-DEFAULT_NGRAM_SPECULATIVE_TARGET_MODEL_FOR_TEST = "Qwen/Qwen2.5-Coder-7B-Instruct"
+# EAGLE2 algorithm models
+DEFAULT_TARGET_MODEL_EAGLE = "meta-llama/Llama-2-7b-chat-hf"
+DEFAULT_DRAFT_MODEL_EAGLE = "lmsys/sglang-EAGLE-llama2-chat-7B"
+
+# EAGLE3 model
+DEFAULT_TARGET_MODEL_EAGLE3 = "meta-llama/Llama-3.1-8B-Instruct"
+DEFAULT_DRAFT_MODEL_EAGLE3 = "lmsys/sglang-EAGLE3-LLaMA3.1-Instruct-8B"
+
+# EAGLE2 with DP-Attention models
+DEFAULT_TARGET_MODEL_EAGLE_DP_ATTN = "Qwen/Qwen3-30B-A3B"
+DEFAULT_DRAFT_MODEL_EAGLE_DP_ATTN = "Tengyunw/qwen3_30b_moe_eagle3"
+
+# Standalone speculative decoding models
+DEFAULT_TARGET_MODEL_STANDALONE = "meta-llama/Llama-3.1-8B-Instruct"
+DEFAULT_DRAFT_MODEL_STANDALONE = "meta-llama/Llama-3.2-1B-Instruct"
+
+# N-gram speculative decoding models
+DEFAULT_TARGET_MODEL_NGRAM = "Qwen/Qwen2.5-Coder-7B-Instruct"
 
 # Other use cases
 DEFAULT_AUTOROUND_MODEL_NAME_FOR_TEST = (
@@ -626,7 +633,7 @@ def popen_launch_server(
     if api_key:
         command += ["--api-key", api_key]
 
-    print(f"command={' '.join(command)}")
+    print(f"command={shlex.join(command)}")
 
     if return_stdout_stderr:
         process = subprocess.Popen(
@@ -677,6 +684,7 @@ def popen_launch_server(
                 response = session.get(
                     f"{base_url}/health_generate",
                     headers=headers,
+                    timeout=5,
                 )
                 if response.status_code == 200:
                     return process
@@ -1759,11 +1767,13 @@ class ModelLaunchSettings:
         tp_size: int = 1,
         extra_args: Optional[List[str]] = None,
         env: Optional[dict] = None,
+        variant: Optional[str] = None,
     ):
         self.model_path = model_path
         self.tp_size = tp_size
         self.extra_args = list(extra_args) if extra_args else []
         self.env = env
+        self.variant = variant
 
         if self.tp_size > 1 and "--tp" not in self.extra_args:
             self.extra_args.extend(["--tp", str(self.tp_size)])

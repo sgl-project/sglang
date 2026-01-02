@@ -26,6 +26,8 @@ def policy_from_str(policy_str: Optional[str]) -> PolicyType:
         "power_of_two": PolicyType.PowerOfTwo,
         "bucket": PolicyType.Bucket,
         "manual": PolicyType.Manual,
+        "consistent_hashing": PolicyType.ConsistentHashing,
+        "prefix_hash": PolicyType.PrefixHash,
     }
     return policy_map[policy_str]
 
