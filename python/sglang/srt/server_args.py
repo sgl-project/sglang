@@ -4782,8 +4782,10 @@ class ServerArgs:
                 assert (
                     self.max_loaded_loras is not None
                     and self.max_loaded_loras <= PREFETCH_MAX_LOADED_LORAS
-                ), "Enabling LoRA prefetch requires pinning LoRA adapter weights in CPU memory, "
-                f"so --max-loaded-loras must be less than or equal to {PREFETCH_MAX_LOADED_LORAS}"
+                ), (
+                    "Enabling LoRA prefetch requires pinning LoRA adapter weights in CPU memory, "
+                    f"so --max-loaded-loras must be less than or equal to {PREFETCH_MAX_LOADED_LORAS}"
+                )
 
             # Validate compatibility with speculative decoding
             if self.speculative_algorithm not in ["NGRAM", None]:

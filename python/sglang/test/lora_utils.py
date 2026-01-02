@@ -267,6 +267,7 @@ def run_lora_test_one_by_one(
     torch_dtype: torch.dtype,
     max_new_tokens: int,
     backend: str = "csgmv",
+    enable_lora_prefetch: Optional[bool] = None,
     disable_cuda_graph: bool = False,
     disable_radix_cache: bool = False,
     mem_fraction_static: float = 0.88,
@@ -313,7 +314,11 @@ def run_lora_test_one_by_one(
         lora_paths=[
             adaptor.name for adaptor in model_case.adaptors if adaptor.name is not None
         ],
+        enable_lora_prefetch=enable_lora_prefetch,
         max_loras_per_batch=model_case.max_loras_per_batch,
+        max_loaded_loras=(
+            model_case.max_loras_per_batch * 2 if enable_lora_prefetch else None
+        ),
         lora_backend=backend,
         disable_cuda_graph=disable_cuda_graph,
         disable_radix_cache=disable_radix_cache,
