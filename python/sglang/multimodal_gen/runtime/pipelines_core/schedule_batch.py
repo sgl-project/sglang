@@ -136,6 +136,7 @@ class Req:
     )
     guidance_scale: float = 1.0
     guidance_scale_2: float | None = None
+    true_cfg_scale: float | None = None  # for CFG vs guidance distillation (e.g., QwenImage)
     guidance_rescale: float = 0.0
     eta: float = 0.0
     sigmas: list[float] | None = None

@@ -59,16 +59,12 @@ def _build_sampling_params_from_request(
     image_path: Optional[list[str]] = None,
     seed: Optional[int] = None,
     generator_device: Optional[str] = None,
-<<<<<<< HEAD
     num_inference_steps: Optional[int] = None,
     guidance_scale: Optional[float] = None,
-=======
+    true_cfg_scale: Optional[float] = None,
     negative_prompt: Optional[str] = None,
-    guidance_scale: Optional[float] = None,
-    num_inference_steps: Optional[int] = None,
     enable_teacache: Optional[bool] = None,
     num_frames: int = 1,
->>>>>>> upstream/main
 ) -> SamplingParams:
     if size is None:
         width, height = None, None
@@ -82,11 +78,7 @@ def _build_sampling_params_from_request(
         request_id=request_id,
         prompt=prompt,
         image_path=image_path,
-<<<<<<< HEAD
-        num_frames=1,
-=======
-        num_frames=num_frames,  # image
->>>>>>> upstream/main
+        num_frames=num_frames,
         width=width,
         height=height,
         num_outputs_per_prompt=max(1, min(int(n or 1), 10)),
@@ -99,6 +91,7 @@ def _build_sampling_params_from_request(
         num_inference_steps=num_inference_steps,
         enable_teacache=enable_teacache,
         **({"negative_prompt": negative_prompt} if negative_prompt is not None else {}),
+        **({"true_cfg_scale": true_cfg_scale} if true_cfg_scale is not None else {}),
     )
 
     if num_inference_steps is not None:
@@ -131,27 +124,20 @@ async def generations(
         background=request.background,
         seed=request.seed,
         generator_device=request.generator_device,
-<<<<<<< HEAD
         num_inference_steps=request.num_inference_steps,
         guidance_scale=request.guidance_scale,
-=======
+        true_cfg_scale=request.true_cfg_scale,
         negative_prompt=request.negative_prompt,
-        guidance_scale=request.guidance_scale,
-        num_inference_steps=request.num_inference_steps,
         enable_teacache=request.enable_teacache,
->>>>>>> upstream/main
     )
     batch = prepare_request(
         server_args=get_global_server_args(),
         sampling_params=sampling,
     )
-<<<<<<< HEAD
     # Add diffusers_kwargs if provided
     if request.diffusers_kwargs:
         batch.extra["diffusers_kwargs"] = request.diffusers_kwargs
-=======
 
->>>>>>> upstream/main
     # Run synchronously for images and save to disk
     save_file_path_list, result = await process_generation_batch(
         async_scheduler_client, batch
@@ -209,6 +195,7 @@ async def edits(
     user: Optional[str] = Form(None),
     negative_prompt: Optional[str] = Form(None),
     guidance_scale: Optional[float] = Form(None),
+    true_cfg_scale: Optional[float] = Form(None),
     num_inference_steps: Optional[int] = Form(None),
     enable_teacache: Optional[bool] = Form(False),
     num_frames: int = Form(1),
@@ -253,9 +240,10 @@ async def edits(
         generator_device=generator_device,
         negative_prompt=negative_prompt,
         guidance_scale=guidance_scale,
+        true_cfg_scale=true_cfg_scale,
         num_inference_steps=num_inference_steps,
         enable_teacache=enable_teacache,
-        num_frames=num_frames,  # image
+        num_frames=num_frames,
     )
     batch = _build_req_from_sampling(sampling)
 

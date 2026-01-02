@@ -398,7 +398,6 @@ def _register_configs():
             "FastVideo/FastHunyuan-diffusers",
         ],
     )
-<<<<<<< HEAD
     # StepVideo
     register_configs(
         sampling_param_cls=StepVideoT2VSamplingParams,
@@ -408,9 +407,7 @@ def _register_configs():
         ],
         model_detectors=[lambda hf_id: "stepvideo" in hf_id.lower()],
     )
-=======
 
->>>>>>> upstream/main
     # Wan
     register_configs(
         sampling_param_cls=WanT2V_1_3B_SamplingParams,

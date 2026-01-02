@@ -7,6 +7,7 @@ Since diffusers handles its own model loading and configuration, this config is 
 """
 
 from dataclasses import dataclass, field
+from typing import Any
 
 from sglang.multimodal_gen.configs.models import DiTConfig, EncoderConfig, VAEConfig
 from sglang.multimodal_gen.configs.pipeline_configs.base import (
@@ -46,7 +47,19 @@ class DiffusersGenericPipelineConfig(PipelineConfig):
 
     # VAE settings
     vae_tiling: bool = False  # diffusers handles this
+    vae_slicing: bool = False  # slice VAE decode for lower memory usage
     vae_sp: bool = False
+
+    # Quantization config for pipeline-level quantization
+    # See: https://huggingface.co/docs/diffusers/main/en/quantization/overview
+    # Use PipelineQuantizationConfig for component-level control:
+    #   from diffusers.quantizers import PipelineQuantizationConfig
+    #   quantization_config = PipelineQuantizationConfig(
+    #       quant_backend="bitsandbytes_4bit",
+    #       quant_kwargs={"load_in_4bit": True, "bnb_4bit_compute_dtype": torch.bfloat16},
+    #       components_to_quantize=["transformer", "text_encoder_2"],
+    #   )
+    quantization_config: Any = None
 
     def check_pipeline_config(self) -> None:
         """

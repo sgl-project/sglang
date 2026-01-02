@@ -124,6 +124,7 @@ class SamplingParams:
     num_inference_steps: int = None
     guidance_scale: float = None
     guidance_scale_2: float = None
+    true_cfg_scale: float = None  # for CFG vs guidance distillation (e.g., QwenImage)
     guidance_rescale: float = 0.0
     boundary_ratio: float | None = None
 

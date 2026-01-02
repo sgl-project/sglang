@@ -32,17 +32,12 @@ class ImageGenerationsRequest(BaseModel):
     # SGLang extensions
     num_inference_steps: Optional[int] = None
     guidance_scale: Optional[float] = None
+    true_cfg_scale: Optional[float] = None  # for CFG vs guidance distillation (e.g., QwenImage)
     seed: Optional[int] = 1024
     generator_device: Optional[str] = "cuda"
-<<<<<<< HEAD
-    diffusers_kwargs: Optional[Dict[str, Any]] = None  # kwargs for diffusers backend
-=======
-    user: Optional[str] = None
     negative_prompt: Optional[str] = None
-    guidance_scale: Optional[float] = None
-    num_inference_steps: Optional[int] = None
     enable_teacache: Optional[bool] = False
->>>>>>> upstream/main
+    diffusers_kwargs: Optional[Dict[str, Any]] = None  # kwargs for diffusers backend
 
 
 # Video API protocol models
@@ -73,18 +68,14 @@ class VideoGenerationsRequest(BaseModel):
     num_frames: Optional[int] = None
     seed: Optional[int] = 1024
     generator_device: Optional[str] = "cuda"
-<<<<<<< HEAD
     # SGLang extensions
     num_inference_steps: Optional[int] = None
     guidance_scale: Optional[float] = None
-    diffusers_kwargs: Optional[Dict[str, Any]] = None  # kwargs for diffusers backend
-=======
-    num_inference_steps: Optional[int] = None
-    guidance_scale: Optional[float] = None
     guidance_scale_2: Optional[float] = None
+    true_cfg_scale: Optional[float] = None  # for CFG vs guidance distillation (e.g., QwenImage)
     negative_prompt: Optional[str] = None
     enable_teacache: Optional[bool] = False
->>>>>>> upstream/main
+    diffusers_kwargs: Optional[Dict[str, Any]] = None  # kwargs for diffusers backend
 
 
 class VideoListResponse(BaseModel):

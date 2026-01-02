@@ -7,6 +7,7 @@ through sglang's infrastructure using vanilla diffusers pipelines.
 """
 
 import argparse
+import inspect
 import re
 import warnings
 from io import BytesIO
@@ -41,7 +42,7 @@ logger = init_logger(__name__)
 class DiffusersExecutionStage(PipelineStage):
     """Pipeline stage that wraps diffusers pipeline execution."""
 
-    def __init__(self, diffusers_pipe: Any):
+    def __init__(self, diffusers_pipe: DiffusionPipeline):
         super().__init__()
         self.diffusers_pipe = diffusers_pipe
 
@@ -49,6 +50,9 @@ class DiffusersExecutionStage(PipelineStage):
         """Execute the diffusers pipeline."""
 
         kwargs = self._build_pipeline_kwargs(batch, server_args)
+
+        # Filter kwargs to only those supported by the pipeline, warn about ignored args
+        kwargs, _ = self._filter_pipeline_kwargs(kwargs)
 
         # Request tensor output for cleaner handling
         if "output_type" not in kwargs:
@@ -71,6 +75,52 @@ class DiffusersExecutionStage(PipelineStage):
             batch.output = self._postprocess_output(batch.output)
 
         return batch
+
+    def _filter_pipeline_kwargs(
+        self, kwargs: dict, *, strict: bool = False
+    ) -> tuple[dict, list[str]]:
+        """Filter kwargs to those accepted by the pipeline's __call__.
+
+        Args:
+            kwargs: Arguments to filter
+            strict: If True, raise ValueError on unsupported args; otherwise warn
+
+        Returns:
+            Tuple of (filtered_kwargs, ignored_keys)
+        """
+        try:
+            sig = inspect.signature(self.diffusers_pipe.__call__)
+        except (ValueError, TypeError):
+            return kwargs, []
+
+        params = sig.parameters
+        accepts_var_kwargs = any(
+            p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()
+        )
+        if accepts_var_kwargs:
+            return kwargs, []
+
+        valid = set(params.keys()) - {"self"}
+
+        filtered = {}
+        ignored = []
+        for k, v in kwargs.items():
+            if k in valid:
+                filtered[k] = v
+            else:
+                ignored.append(k)
+
+        if ignored:
+            pipe_name = type(self.diffusers_pipe).__name__
+            msg = (
+                f"Pipeline '{pipe_name}' does not support: {', '.join(sorted(ignored))}. "
+                "These arguments will be ignored."
+            )
+            if strict:
+                raise ValueError(msg)
+            logger.warning(msg)
+
+        return filtered, ignored
 
     def _extract_output(self, output: Any) -> torch.Tensor | None:
         """Extract tensor output from pipeline result."""
@@ -220,6 +270,9 @@ class DiffusersExecutionStage(PipelineStage):
         if batch.guidance_scale is not None:
             kwargs["guidance_scale"] = batch.guidance_scale
 
+        if batch.true_cfg_scale is not None:
+            kwargs["true_cfg_scale"] = batch.true_cfg_scale
+
         if batch.height is not None:
             kwargs["height"] = batch.height
 
@@ -322,22 +375,49 @@ class DiffusersPipeline(ComposedPipelineBase):
         self._detect_pipeline_type()
 
     def _load_diffusers_pipeline(self, model_path: str, server_args: ServerArgs) -> Any:
-        """Load the diffusers pipeline."""
+        """Load the diffusers pipeline.
+
+        Optimizations applied:
+        - device_map: Loads models directly to GPU, warming up CUDA caching allocator
+          to avoid small tensor allocations during inference.
+        - Parallel shard loading: When using device_map with accelerate, model shards
+          are loaded in parallel for faster initialization.
+        """
 
         original_model_path = model_path  # Keep original for custom_pipeline
         model_path = maybe_download_model(model_path)
         self.model_path = model_path
 
         dtype = self._get_dtype(server_args)
-        logger.info("Loading diffusers pipeline with dtype=%s", dtype)
+        device_map = self._get_device_map(server_args)
+        logger.info(
+            "Loading diffusers pipeline with dtype=%s, device_map=%s",
+            dtype,
+            device_map,
+        )
+
+        # Build common kwargs for from_pretrained
+        load_kwargs = {
+            "torch_dtype": dtype,
+            "trust_remote_code": server_args.trust_remote_code,
+            "revision": server_args.revision,
+        }
+
+        # Add device_map for direct GPU loading and parallel shard loading
+        # This warms up CUDA caching allocator and enables parallel loading via accelerate
+        if device_map is not None:
+            load_kwargs["device_map"] = device_map
+
+        # Add quantization config if provided (e.g., BitsAndBytesConfig for 4/8-bit)
+        config = getattr(server_args, "pipeline_config", None)
+        if config is not None:
+            quant_config = getattr(config, "quantization_config", None)
+            if quant_config is not None:
+                load_kwargs["quantization_config"] = quant_config
+                logger.info("Using quantization config: %s", type(quant_config).__name__)
 
         try:
-            pipe = DiffusionPipeline.from_pretrained(
-                model_path,
-                torch_dtype=dtype,
-                trust_remote_code=server_args.trust_remote_code,
-                revision=server_args.revision,
-            )
+            pipe = DiffusionPipeline.from_pretrained(model_path, **load_kwargs)
         except AttributeError as e:
             if "has no attribute" in str(e):
                 # Custom pipeline class not in diffusers - try loading with custom_pipeline
@@ -345,13 +425,9 @@ class DiffusersPipeline(ComposedPipelineBase):
                     "Pipeline class not found in diffusers, trying custom_pipeline from repo..."
                 )
                 try:
-                    pipe = DiffusionPipeline.from_pretrained(
-                        model_path,
-                        torch_dtype=dtype,
-                        custom_pipeline=original_model_path,
-                        trust_remote_code=True,
-                        revision=server_args.revision,
-                    )
+                    custom_kwargs = {**load_kwargs, "custom_pipeline": original_model_path}
+                    custom_kwargs["trust_remote_code"] = True
+                    pipe = DiffusionPipeline.from_pretrained(model_path, **custom_kwargs)
                 except Exception as e2:
                     match = re.search(r"has no attribute (\w+)", str(e))
                     class_name = match.group(1) if match else "unknown"
@@ -368,25 +444,76 @@ class DiffusersPipeline(ComposedPipelineBase):
                 logger.warning(
                     "Failed with dtype=%s, falling back to float32: %s", dtype, e
                 )
-                pipe = DiffusionPipeline.from_pretrained(
-                    model_path,
-                    torch_dtype=torch.float32,
-                    trust_remote_code=server_args.trust_remote_code,
-                    revision=server_args.revision,
-                )
+                load_kwargs["torch_dtype"] = torch.float32
+                pipe = DiffusionPipeline.from_pretrained(model_path, **load_kwargs)
             else:
                 raise
 
-        if torch.cuda.is_available():
-            pipe = pipe.to("cuda")
-        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-            pipe = pipe.to("mps")
+        # Only move to device if device_map wasn't used (already on device)
+        if device_map is None:
+            if torch.cuda.is_available():
+                pipe = pipe.to("cuda")
+            elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+                pipe = pipe.to("mps")
+
+        # Apply VAE memory optimizations from pipeline config
+        self._apply_vae_optimizations(pipe, server_args)
 
         logger.info("Loaded diffusers pipeline: %s", pipe.__class__.__name__)
         return pipe
 
+    def _apply_vae_optimizations(self, pipe: Any, server_args: ServerArgs) -> None:
+        """Apply VAE memory optimizations (tiling, slicing) from pipeline config."""
+        config = getattr(server_args, "pipeline_config", None)
+        if config is None:
+            return
+
+        # VAE slicing: decode latents slice-by-slice for lower peak memory
+        # https://huggingface.co/docs/diffusers/optimization/memory#vae-slicing
+        if getattr(config, "vae_slicing", False):
+            if hasattr(pipe, "enable_vae_slicing"):
+                pipe.enable_vae_slicing()
+                logger.info("Enabled VAE slicing for lower memory usage")
+
+        # VAE tiling: decode latents tile-by-tile for large images
+        # https://huggingface.co/docs/diffusers/optimization/memory#vae-tiling
+        if getattr(config, "vae_tiling", False):
+            if hasattr(pipe, "enable_vae_tiling"):
+                pipe.enable_vae_tiling()
+                logger.info("Enabled VAE tiling for large image support")
+
+    def _get_device_map(self, server_args: ServerArgs) -> str | None:
+        """Determine device_map for pipeline loading.
+
+        Using device_map enables:
+        1. Direct loading to GPU, warming up CUDA caching allocator
+        2. Parallel shard loading via accelerate for faster init
+
+        Returns:
+            - "balanced": Multi-GPU, distributes across available GPUs
+            - "cuda:X" or "cuda": Single GPU loading
+            - None: Fall back to manual .to() call (legacy behavior)
+        """
+        if not torch.cuda.is_available():
+            return None
+
+        num_gpus = getattr(server_args, "num_gpus", 1)
+
+        if num_gpus > 1:
+            # Multi-GPU: use balanced distribution
+            return "balanced"
+        else:
+            # Single GPU: load directly to cuda
+            # This still benefits from CUDA caching allocator warmup
+            return "cuda"
+
     def _get_dtype(self, server_args: ServerArgs) -> torch.dtype:
-        """Determine the dtype to use for model loading."""
+        """Determine the dtype to use for model loading.
+
+        Note: Some models (e.g., Gemma-based pipelines) do not support FP16 inference.
+        While they can technically run in FP16, the outputs will be garbled/corrupted.
+        For such models, use BF16 or FP32 via pipeline_config.dit_precision="bf16"/"fp32".
+        """
         dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
 
         if hasattr(server_args, "pipeline_config") and server_args.pipeline_config:
