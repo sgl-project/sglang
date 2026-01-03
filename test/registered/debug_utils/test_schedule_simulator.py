@@ -13,7 +13,9 @@ from sglang.srt.debug_utils.schedule_simulator import (
     RoundRobinRouter,
     ScheduleDecision,
     SimRequest,
+    SimulationResult,
     Simulator,
+    StepRecord,
     generate_random_requests,
     load_from_request_logger,
 )
@@ -311,9 +313,11 @@ class TestSimulator(CustomTestCase):
             ],
         )
 
-        summary = sim.run(requests)
-        self.assertIn("batch_size_balancedness_mean", summary)
-        self.assertIn("attention_balancedness_mean", summary)
+        result = sim.run(requests)
+        self.assertIsInstance(result, SimulationResult)
+        self.assertIn("batch_size_balancedness_mean", result.summary)
+        self.assertIn("attention_balancedness_mean", result.summary)
+        self.assertGreater(len(result.step_records), 0)
 
     def test_all_requests_complete(self):
         requests = [
@@ -338,8 +342,9 @@ class TestSimulator(CustomTestCase):
             router=RoundRobinRouter(),
             scheduler=FIFOScheduler(),
         )
-        summary = sim.run([])
-        self.assertEqual(summary, {})
+        result = sim.run([])
+        self.assertEqual(result.summary, {})
+        self.assertEqual(len(result.step_records), 0)
 
     def test_prefill_instant(self):
         # With output_len=2, request should complete in 2 steps (not 3)

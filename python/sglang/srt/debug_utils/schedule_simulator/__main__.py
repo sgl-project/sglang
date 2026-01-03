@@ -16,7 +16,7 @@ from sglang.srt.debug_utils.schedule_simulator import (
 )
 
 
-def create_parser() -> argparse.ArgumentParser:
+def create_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Schedule Simulator for analyzing request scheduling across GPUs"
     )
@@ -176,7 +176,7 @@ def main(args: argparse.Namespace) -> pl.DataFrame:
 
 
 if __name__ == "__main__":
-    parser = create_parser()
+    parser = create_arg_parser()
     args = parser.parse_args()
     df = main(args)
     print(f"\nDataFrame shape: {df.shape}")
