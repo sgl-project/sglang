@@ -38,6 +38,10 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 
+_JIT_ROPE_SPLIT_CAST_CACHE: "OrderedDict[tuple, tuple[torch.Tensor, torch.Tensor]]" = (
+    OrderedDict()
+)
+
 
 def apply_flashinfer_rope_qk_inplace(
     q: torch.Tensor,
@@ -128,16 +132,24 @@ def _split_cos_sin_from_cache(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Convert a 2D RoPE cache into (cos, sin) tensors."""
     if cache.is_complex():
-        cos = cache.real.to(dtype)
-        sin = cache.imag.to(dtype)
+        cos = cache.real
+        sin = cache.imag
+        if cos.dtype != dtype:
+            cos = cos.to(dtype)
+        if sin.dtype != dtype:
+            sin = sin.to(dtype)
         return cos, sin
     if cache.shape[1] % 2 != 0:
         raise ValueError(
             f"Expected complex freqs_cis or cat([cos,sin]) cache; got real cache with odd last dim={cache.shape[1]}"
         )
     half = cache.shape[1] // 2
-    cos = cache[:, :half].to(dtype)
-    sin = cache[:, half:].to(dtype)
+    cos = cache[:, :half]
+    sin = cache[:, half:]
+    if cos.dtype != dtype:
+        cos = cos.to(dtype)
+    if sin.dtype != dtype:
+        sin = sin.to(dtype)
     return cos, sin
 
 
@@ -181,51 +193,71 @@ def apply_sglang_jit_rope_qk_inplace(
 
     num_tokens = bsz * seqlen
 
-    if positions is None:
-        pos_1d = torch.arange(seqlen, device="cpu", dtype=torch.long)
-        positions = pos_1d if bsz == 1 else pos_1d.repeat(bsz)
-    else:
-        if not (
-            isinstance(positions, torch.Tensor)
-            and positions.dtype == torch.long
-            and positions.dim() == 1
-        ):
-            raise ValueError("positions must be a 1D torch.long Tensor")
-        if positions.numel() != num_tokens:
-            raise ValueError(
-                f"positions length must be bsz*seqlen={num_tokens}, got {positions.numel()}"
-            )
-    positions = positions.to(q.device, non_blocking=True)
-
-    if cos_sin_cache.shape[0] == seqlen:
-        cache_tok = (
-            cos_sin_cache[None, :, :]
-            .expand(bsz, seqlen, cos_sin_cache.shape[1])
-            .reshape(num_tokens, cos_sin_cache.shape[1])
-        )
-    elif cos_sin_cache.shape[0] == num_tokens:
+    cache_tok: torch.Tensor
+    if cos_sin_cache.shape[0] == num_tokens:
         cache_tok = cos_sin_cache
+    elif cos_sin_cache.shape[0] == seqlen and bsz == 1:
+        cache_tok = cos_sin_cache
+    elif cos_sin_cache.shape[0] >= seqlen and positions is None and bsz == 1:
+        # Treat the cache as [max_seq, ...] and slice for this seqlen.
+        cache_tok = cos_sin_cache[:seqlen]
     else:
+        if positions is None:
+            pos_1d = torch.arange(seqlen, device="cpu", dtype=torch.long)
+            positions = pos_1d if bsz == 1 else pos_1d.repeat(bsz)
+        else:
+            if not (
+                isinstance(positions, torch.Tensor)
+                and positions.dtype == torch.long
+                and positions.dim() == 1
+            ):
+                raise ValueError("positions must be a 1D torch.long Tensor")
+            if positions.numel() != num_tokens:
+                raise ValueError(
+                    f"positions length must be bsz*seqlen={num_tokens}, got {positions.numel()}"
+                )
+        positions = positions.to(q.device, non_blocking=True)
         cache_tok = cos_sin_cache.index_select(0, positions)
 
-    q3 = q.reshape(num_tokens, nheads, d).contiguous()
-    k3 = k.reshape(num_tokens, nheads, d).contiguous()
+    q3 = q.reshape(num_tokens, nheads, d)
+    if not q3.is_contiguous():
+        q3 = q3.contiguous()
+    k3 = k.reshape(num_tokens, nheads, d)
+    if not k3.is_contiguous():
+        k3 = k3.contiguous()
 
-    cos_half, sin_half = _split_cos_sin_from_cache(
-        cache_tok.contiguous(), dtype=q.dtype
+    cache_key = (
+        int(cache_tok.data_ptr()),
+        int(cache_tok.shape[0]),
+        int(cache_tok.shape[1]),
+        str(cache_tok.device),
+        cache_tok.dtype,
+        q.dtype,
     )
+    cached = _JIT_ROPE_SPLIT_CAST_CACHE.get(cache_key)
+    if cached is not None:
+        cos_half, sin_half = cached
+    else:
+        cos_half, sin_half = _split_cos_sin_from_cache(cache_tok, dtype=q.dtype)
+        if not cos_half.is_contiguous():
+            cos_half = cos_half.contiguous()
+        if not sin_half.is_contiguous():
+            sin_half = sin_half.contiguous()
+        _JIT_ROPE_SPLIT_CAST_CACHE[cache_key] = (cos_half, sin_half)
+        if len(_JIT_ROPE_SPLIT_CAST_CACHE) > 64:
+            _JIT_ROPE_SPLIT_CAST_CACHE.popitem(last=False)
 
     interleaved = not is_neox
     if interleaved:
-        cos = cos_half.contiguous()
-        sin = sin_half.contiguous()
+        cos = cos_half if cos_half.is_contiguous() else cos_half.contiguous()
+        sin = sin_half if sin_half.is_contiguous() else sin_half.contiguous()
     else:
         if cos_half.shape[1] * 2 == head_size:
             cos = torch.cat([cos_half, cos_half], dim=-1).contiguous()
             sin = torch.cat([sin_half, sin_half], dim=-1).contiguous()
         else:
-            cos = cos_half.contiguous()
-            sin = sin_half.contiguous()
+            cos = cos_half if cos_half.is_contiguous() else cos_half.contiguous()
+            sin = sin_half if sin_half.is_contiguous() else sin_half.contiguous()
 
     sglang_jit_rotary_embedding_cos_sin(cos, sin, q3, k3, head_size, interleaved)
     return q3.view(bsz, seqlen, nheads, d), k3.view(bsz, seqlen, nheads, d)

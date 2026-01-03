@@ -112,13 +112,19 @@ def rotary_embedding_cos_sin(
         raise ValueError("cos/sin must be 2D tensors: [num_tokens, rot_dim]")
     if cos.shape != sin.shape:
         raise ValueError("cos/sin shape mismatch")
-    if cos.shape[0] != query.shape[0]:
+    if query.dim() == 4:
+        expected_tokens = int(query.shape[0] * query.shape[1])
+    elif query.dim() in (2, 3):
+        expected_tokens = int(query.shape[0])
+    else:
+        raise ValueError("query must be a 2D, 3D or 4D tensor")
+    if cos.shape[0] != expected_tokens:
         raise ValueError(
-            f"cos/sin num_tokens mismatch with query: cos.shape[0]={cos.shape[0]} vs query.shape[0]={query.shape[0]}"
+            f"cos/sin num_tokens mismatch with query: cos.shape[0]={cos.shape[0]} vs expected_tokens={expected_tokens}"
         )
 
     if head_size == 0:
-        if query.dim() == 3:
+        if query.dim() in (3, 4):
             head_size = int(query.shape[-1])
         else:
             raise ValueError("head_size must be provided when query is 2D")
@@ -161,17 +167,24 @@ def rotary_embedding_cos_sin(
     embed_dim_for_rotation = rot_dim if effective_interleaved else (rot_dim // 2)
 
     def _as_3d(x: torch.Tensor, h: int) -> torch.Tensor:
+        if x.dim() == 4:
+            # [bsz, seqlen, num_heads, head_dim] -> [tokens, num_heads, head_dim]
+            if x.shape[-1] != head_size:
+                raise ValueError("head_size mismatch with query/key last dim")
+            return x.flatten(0, 1)
         if x.dim() == 3:
             if x.shape[-1] != head_size:
                 raise ValueError("head_size mismatch with query/key last dim")
             return x
         if x.dim() != 2:
-            raise ValueError("query/key must be 2D or 3D tensors")
+            raise ValueError("query/key must be 2D, 3D or 4D tensors")
         if x.shape[1] % head_size != 0:
             raise ValueError("hidden_size is not divisible by head_size")
         return x.view(x.shape[0], h, head_size)
 
-    if query.dim() == 3:
+    if query.dim() == 4:
+        num_heads = int(query.shape[2])
+    elif query.dim() == 3:
         num_heads = int(query.shape[1])
     else:
         num_heads = int(query.shape[1] // head_size)
@@ -181,7 +194,9 @@ def rotary_embedding_cos_sin(
 
     k3 = None
     if key is not None:
-        if key.dim() == 3:
+        if key.dim() == 4:
+            num_kv_heads = int(key.shape[2])
+        elif key.dim() == 3:
             num_kv_heads = int(key.shape[1])
         else:
             num_kv_heads = int(key.shape[1] // head_size)

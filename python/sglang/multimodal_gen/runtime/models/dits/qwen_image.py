@@ -3,7 +3,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import functools
-from math import prod
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
@@ -18,10 +17,14 @@ from diffusers.models.normalization import AdaLayerNormContinuous
 from sglang.multimodal_gen.configs.models.dits.qwenimage import QwenImageDitConfig
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.layers.attention import USPAttention
-from sglang.multimodal_gen.runtime.layers.layernorm import LayerNorm, RMSNorm
+from sglang.multimodal_gen.runtime.layers.layernorm import (
+    LayerNorm,
+    RMSNorm,
+    apply_qk_norm,
+)
 from sglang.multimodal_gen.runtime.layers.linear import ReplicatedLinear
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
-    apply_sglang_jit_rope_qk_inplace,
+    apply_flashinfer_rope_qk_inplace,
 )
 from sglang.multimodal_gen.runtime.layers.triton_ops import (
     fuse_scale_shift_gate_select01_kernel,
@@ -549,14 +552,23 @@ class QwenImageCrossAttention(nn.Module):
         txt_value = txt_value.unflatten(-1, (self.num_heads, -1))
 
         # Apply QK normalization
-        if self.norm_q is not None:
-            img_query = self.norm_q(img_query)
-        if self.norm_k is not None:
-            img_key = self.norm_k(img_key)
-        if self.norm_added_q is not None:
-            txt_query = self.norm_added_q(txt_query)
-        if self.norm_added_k is not None:
-            txt_key = self.norm_added_k(txt_key)
+        if self.qk_norm:
+            img_query, img_key = apply_qk_norm(
+                q=img_query,
+                k=img_key,
+                q_norm=self.norm_q,
+                k_norm=self.norm_k,
+                head_dim=img_query.shape[-1],
+                allow_inplace=True,
+            )
+            txt_query, txt_key = apply_qk_norm(
+                q=txt_query,
+                k=txt_key,
+                q_norm=self.norm_added_q,
+                k_norm=self.norm_added_k,
+                head_dim=txt_query.shape[-1],
+                allow_inplace=True,
+            )
 
         # Apply RoPE
         if image_rotary_emb is not None:
@@ -567,10 +579,11 @@ class QwenImageCrossAttention(nn.Module):
                 raise RuntimeError("image_rotary_emb must be cos_sin_cache tensors")
 
             img_cache, txt_cache = image_rotary_emb
-            img_query, img_key = apply_sglang_jit_rope_qk_inplace(
+
+            img_query, img_key = apply_flashinfer_rope_qk_inplace(
                 img_query, img_key, img_cache, is_neox=False
             )
-            txt_query, txt_key = apply_sglang_jit_rope_qk_inplace(
+            txt_query, txt_key = apply_flashinfer_rope_qk_inplace(
                 txt_query, txt_key, txt_cache, is_neox=False
             )
 
@@ -780,6 +793,12 @@ class QwenImageTransformerBlock(nn.Module):
         return encoder_hidden_states, hidden_states
 
 
+def to_hashable(obj):
+    if isinstance(obj, list):
+        return tuple(to_hashable(x) for x in obj)
+    return obj
+
+
 class QwenImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
     """
     The Transformer model introduced in Qwen.
@@ -929,16 +948,9 @@ class QwenImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
         timestep = (timestep / 1000).to(hidden_states.dtype)
 
         if self.zero_cond_t:
-            timestep = torch.cat([timestep, timestep * 0], dim=0)
-            # Use torch operations for GPU efficiency
-            modulate_index = torch.tensor(
-                [
-                    [0] * prod(sample[0]) + [1] * sum([prod(s) for s in sample[1:]])
-                    for sample in img_shapes
-                ],
-                device=timestep.device,
-                dtype=torch.int,
-            )
+            timestep = torch.cat([timestep, self.timestep_zero], dim=0)
+            device = timestep.device
+            modulate_index = self.build_modulate_index(to_hashable(img_shapes), device)
         else:
             modulate_index = None
 
