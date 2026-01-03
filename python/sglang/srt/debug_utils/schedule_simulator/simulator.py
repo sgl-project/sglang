@@ -38,39 +38,32 @@ class Simulator:
         self.router = router
         self.scheduler = scheduler
         self.recorders = recorders or []
-        self.gpu_states: List[GPUState] = []
         self.log_level = log_level
+        self.gpu_states: List[GPUState] = []
+        self.step = 0
 
     def run(self, requests: List[SimRequest]) -> SimulationResult:
         self.gpu_states = [GPUState(gpu_id=i) for i in range(self.num_gpus)]
-        incoming_requests = list(requests)
-        step = 0
+        self.step = 0
         step_records: List[StepRecord] = []
+        incoming_requests = list(requests)
 
         while self._has_work(incoming_requests):
             self._route_requests(incoming_requests)
             incoming_requests.clear()
-
             self._schedule_all_gpus()
             self._execute_step()
-            self._collect_step_records(step, step_records)
-            self._log_step(step)
-            self._record_metrics(step)
+            self._collect_step_records(step_records)
+            self._log_step()
+            self._record_metrics()
+            self.step += 1
 
-            step += 1
-
-        return SimulationResult(
-            step_records=step_records,
-            summary=self._get_summary(),
-        )
+        return SimulationResult(step_records=step_records, summary=self._get_summary())
 
     def _has_work(self, incoming_requests: List[SimRequest]) -> bool:
-        if incoming_requests:
-            return True
-        for gpu in self.gpu_states:
-            if gpu.pending_requests or gpu.running_requests:
-                return True
-        return False
+        return bool(incoming_requests) or any(
+            gpu.pending_requests or gpu.running_requests for gpu in self.gpu_states
+        )
 
     def _route_requests(self, incoming_requests: List[SimRequest]) -> None:
         for req in incoming_requests:
@@ -80,12 +73,10 @@ class Simulator:
     def _schedule_all_gpus(self) -> None:
         for gpu in self.gpu_states:
             decision = self.scheduler.schedule(gpu)
-
             for req in decision.to_preempt:
                 assert req in gpu.running_requests
                 gpu.running_requests.remove(req)
                 gpu.pending_requests.append(req)
-
             for req in decision.to_run:
                 assert req in gpu.pending_requests
                 gpu.pending_requests.remove(req)
@@ -97,41 +88,32 @@ class Simulator:
             for req in gpu.running_requests:
                 if req.stage == RequestStage.PREFILL:
                     req.stage = RequestStage.DECODE
-
                 req.decoded_tokens += 1
-
                 if req.is_finished():
                     finished.append(req)
-
             for req in finished:
                 gpu.running_requests.remove(req)
 
-    def _collect_step_records(self, step: int, step_records: List[StepRecord]) -> None:
+    def _collect_step_records(self, step_records: List[StepRecord]) -> None:
         for gpu in self.gpu_states:
-            step_records.append(
-                StepRecord(
-                    step=step,
-                    gpu_id=gpu.gpu_id,
-                    running_count=len(gpu.running_requests),
-                    pending_count=len(gpu.pending_requests),
-                    total_seq_len=gpu.total_seq_len(),
-                    running_req_ids=[r.request_id for r in gpu.running_requests],
-                    pending_req_ids=[r.request_id for r in gpu.pending_requests],
-                )
-            )
+            step_records.append(StepRecord(
+                step=self.step,
+                gpu_id=gpu.gpu_id,
+                running_count=len(gpu.running_requests),
+                pending_count=len(gpu.pending_requests),
+                total_seq_len=gpu.total_seq_len(),
+                running_req_ids=[r.request_id for r in gpu.running_requests],
+                pending_req_ids=[r.request_id for r in gpu.pending_requests],
+            ))
 
-    def _log_step(self, step: int) -> None:
+    def _log_step(self) -> None:
         if self.log_level == 0:
             return
-
-        parts = [f"step={step:<4}"]
-
+        parts = [f"step={self.step:<4}"]
         for gpu in self.gpu_states:
-            run_count = len(gpu.running_requests)
-            queue_count = len(gpu.pending_requests)
-
+            r, q = len(gpu.running_requests), len(gpu.pending_requests)
             if self.log_level == 1:
-                parts.append(f"GPU{gpu.gpu_id}[R={run_count:<3} Q={queue_count:<3}]")
+                parts.append(f"GPU{gpu.gpu_id}[R={r:<3} Q={q:<3}]")
             else:
                 run_ids = ",".join(r.request_id for r in gpu.running_requests[:5])
                 if len(gpu.running_requests) > 5:
@@ -139,13 +121,12 @@ class Simulator:
                 queue_ids = ",".join(r.request_id for r in gpu.pending_requests[:3])
                 if len(gpu.pending_requests) > 3:
                     queue_ids += f"...+{len(gpu.pending_requests)-3}"
-                parts.append(f"GPU{gpu.gpu_id}[R={run_count}:{run_ids or'-'} Q={queue_count}:{queue_ids or'-'}]")
-
+                parts.append(f"GPU{gpu.gpu_id}[R={r}:{run_ids or'-'} Q={q}:{queue_ids or'-'}]")
         print(" | ".join(parts))
 
-    def _record_metrics(self, step: int) -> None:
+    def _record_metrics(self) -> None:
         for recorder in self.recorders:
-            recorder.on_step_end(step, self.gpu_states)
+            recorder.on_step_end(self.step, self.gpu_states)
 
     def _get_summary(self) -> Dict[str, Any]:
         summary = {}
