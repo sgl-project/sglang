@@ -63,12 +63,14 @@ class TestMistralLarge3Unified(unittest.TestCase):
                 MISTRAL_LARGE3_MODEL_PATH,
                 tp_size=8,
                 extra_args=base_args,
+                variant="TP8",
             ),
             # Variant: "eagle" - TP=8 + trtllm_mla + EAGLE with draft model
             ModelLaunchSettings(
                 MISTRAL_LARGE3_MODEL_PATH,
                 tp_size=8,
                 extra_args=base_args + eagle_args,
+                variant="TP8+MTP",
             ),
         ]
 

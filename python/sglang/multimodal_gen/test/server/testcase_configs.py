@@ -151,8 +151,11 @@ class DiffusionServerArgs:
     ring_degree: int | None = None
     # LoRA
     lora_path: str | None = None  # LoRA adapter path (HF repo or local path)
+    # misc
+    enable_warmup: bool = False
 
     dit_layerwise_offload: bool = False
+    enable_cache_dit: bool = False
 
 
 @dataclass(frozen=True)
@@ -172,6 +175,9 @@ class DiffusionSamplingParams:
 
     # URL direct test flag - if True, don't pre-download URL images
     direct_url_test: bool = False
+
+    # output format
+    output_format: str | None = None  # "png", "jpeg", "mp4", etc.
 
     num_outputs_per_prompt: int = 1
 
@@ -269,6 +275,15 @@ MULTI_IMAGE_TI2I_sampling_params = DiffusionSamplingParams(
     ],
     direct_url_test=True,
 )
+MULTI_FRAME_I2I_sampling_params = DiffusionSamplingParams(
+    prompt="a high quality, cute halloween themed illustration, consistent style and lighting",
+    image_path=[
+        "https://raw.githubusercontent.com/QwenLM/Qwen-Image-Layered/main/assets/test_images/4.png"
+    ],
+    num_frames=4,
+    direct_url_test=True,
+    output_format="png",
+)
 
 T2V_PROMPT = "A curious raccoon"
 
@@ -289,6 +304,17 @@ ONE_GPU_CASES_A: list[DiffusionTestCase] = [
             modality="image",
             warmup_text=1,
             warmup_edit=0,
+        ),
+        T2I_sampling_params,
+    ),
+    DiffusionTestCase(
+        "qwen_image_t2i_cache_dit_enabled",
+        DiffusionServerArgs(
+            model_path="Qwen/Qwen-Image",
+            modality="image",
+            warmup_text=1,
+            warmup_edit=0,
+            enable_cache_dit=True,
         ),
         T2I_sampling_params,
     ),
@@ -335,6 +361,13 @@ ONE_GPU_CASES_A: list[DiffusionTestCase] = [
         ),
         T2I_sampling_params,
     ),
+    DiffusionTestCase(
+        "zimage_image_t2i_warmup",
+        DiffusionServerArgs(
+            model_path="Tongyi-MAI/Z-Image-Turbo", modality="image", enable_warmup=True
+        ),
+        T2I_sampling_params,
+    ),
     # === Text and Image to Image (TI2I) ===
     DiffusionTestCase(
         "qwen_image_edit_ti2i",
@@ -355,6 +388,16 @@ ONE_GPU_CASES_A: list[DiffusionTestCase] = [
             warmup_edit=1,
         ),
         MULTI_IMAGE_TI2I_sampling_params,
+    ),
+    DiffusionTestCase(
+        "qwen_image_layered_i2i",
+        DiffusionServerArgs(
+            model_path="Qwen/Qwen-Image-Layered",
+            modality="image",
+            warmup_text=0,
+            warmup_edit=1,
+        ),
+        MULTI_FRAME_I2I_sampling_params,
     ),
 ]
 
@@ -392,14 +435,14 @@ ONE_GPU_CASES_B: list[DiffusionTestCase] = [
     ),
     # NOTE(mick): flaky
     # DiffusionTestCase(
-    #     id="hunyuan_video",
-    #     model_path="hunyuanvideo-community/HunyuanVideo",
-    #     modality="video",
-    #     prompt="A curious raccoon",
-    #     output_size="720x480",
-    #     warmup_text=0,
-    #     warmup_edit=0,
-    #     custom_validator="video",
+    #     "hunyuan_video",
+    #     DiffusionServerArgs(
+    #         model_path="hunyuanvideo-community/HunyuanVideo",
+    #         modality="video",
+    #     ),
+    #     DiffusionSamplingParams(
+    #         prompt=T2V_PROMPT,
+    #     ),
     # ),
     DiffusionTestCase(
         "flux_2_ti2i",

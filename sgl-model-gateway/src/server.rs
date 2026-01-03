@@ -688,7 +688,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
                 json_format: false,
                 log_dir: config.log_dir.clone(),
                 colorize: true,
-                log_file_name: "sgl-model-gateway".to_string(),
+                log_file_name: "smg".to_string(),
                 log_targets: None,
             },
             config.router_config.trace_config.clone(),

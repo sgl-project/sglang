@@ -33,6 +33,10 @@ class RequestTimings:
         self.steps: list[float] = []
         self.total_duration_ms: float = 0.0
 
+    @property
+    def total_duration_s(self) -> float:
+        return self.total_duration_ms / 1000.0
+
     def record_stage(self, stage_name: str, duration_s: float):
         """Records the duration of a pipeline stage"""
         self.stages[stage_name] = duration_s * 1000  # Store as milliseconds
@@ -227,9 +231,9 @@ class PerformanceLogger:
             os.makedirs(os.path.dirname(abs_path), exist_ok=True)
             with open(abs_path, "w", encoding="utf-8") as f:
                 json.dump(report, f, indent=2)
-            logger.info(f"[Performance] Metrics dumped to: {abs_path}")
+            logger.info(f"Metrics dumped to: {abs_path}")
         except IOError as e:
-            logger.error(f"[Performance] Failed to dump metrics to {abs_path}: {e}")
+            logger.error(f"Failed to dump metrics to {abs_path}: {e}")
 
     @classmethod
     def log_request_summary(
