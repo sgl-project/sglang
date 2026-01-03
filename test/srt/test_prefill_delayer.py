@@ -1,3 +1,4 @@
+import os
 import unittest
 
 from sglang.bench_serving import run_benchmark
@@ -14,6 +15,8 @@ from sglang.test.test_utils import (
 
 class TestPrefillDelayerThroughput(CustomTestCase):
     def _run_throughput_test(self, with_prefill_delayer: bool):
+        os.environ["SGLANG_PREFILL_DELAYER_DEBUG_LOG"] = "1"
+
         model = "Qwen/Qwen3-0.6B"
         base_url = DEFAULT_URL_FOR_TEST
         other_args = [
