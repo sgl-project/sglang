@@ -186,16 +186,13 @@ pub fn extract_auth_header(
 
 #[inline]
 pub fn should_forward_request_header(name: &str) -> bool {
-    let lower_name = name.to_ascii_lowercase();
-    matches!(
-        lower_name.as_str(),
-        "authorization"
-            | "x-request-id"
-            | "x-correlation-id"
-            | "traceparent"
-            | "tracestate"
-            | "x-smg-routing-key"
-    ) || lower_name.starts_with("x-request-id-")
+    name.eq_ignore_ascii_case("authorization")
+        || name.eq_ignore_ascii_case("x-request-id")
+        || name.eq_ignore_ascii_case("x-correlation-id")
+        || name.eq_ignore_ascii_case("traceparent")
+        || name.eq_ignore_ascii_case("tracestate")
+        || name.eq_ignore_ascii_case("x-smg-routing-key")
+        || (name.len() >= 13 && name[..13].eq_ignore_ascii_case("x-request-id-"))
 }
 
 #[cfg(test)]
