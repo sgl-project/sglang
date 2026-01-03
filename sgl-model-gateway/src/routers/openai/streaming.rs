@@ -27,7 +27,8 @@ use super::{
     context::{RequestContext, StreamingEventContext, StreamingRequest},
     mcp::{
         build_resume_payload, execute_streaming_tool_calls, inject_mcp_metadata_streaming,
-        prepare_mcp_payload_for_streaming, send_mcp_list_tools_events,
+        prepare_mcp_payload_for_streaming, send_mcp_list_tools_events, McpLoopConfig,
+        ToolLoopState,
     },
     responses::{mask_tools_as_mcp, patch_streaming_response_json, rewrite_streaming_block},
     tool_handler::{StreamAction, StreamingToolHandler},
@@ -43,7 +44,7 @@ use crate::{
     routers::{
         conversations::persist_conversation_items,
         header_utils::{apply_request_headers, preserve_response_headers},
-        mcp::{ensure_request_mcp_client, McpLoopConfig},
+        mcp::ensure_request_mcp_client,
     },
 };
 
@@ -523,13 +524,13 @@ fn maybe_inject_mcp_in_progress(
     send_sse_event(tx, McpEvent::CALL_IN_PROGRESS, &event)
 }
 
-/// Send final `response.completed` event to client
+/// Send final response.completed event to client
 /// Returns false if client disconnected
 pub(super) fn send_final_response_event(
     handler: &StreamingToolHandler,
     tx: &mpsc::UnboundedSender<Result<Bytes, io::Error>>,
     sequence_number: &mut u64,
-    conversation_history: &[Value],
+    state: &ToolLoopState,
     active_mcp: Option<&Arc<crate::mcp::McpManager>>,
     ctx: &StreamingEventContext<'_>,
 ) -> bool {
@@ -548,12 +549,7 @@ pub(super) fn send_final_response_event(
     }
 
     if let Some(mcp) = active_mcp {
-        inject_mcp_metadata_streaming(
-            &mut final_response,
-            conversation_history,
-            mcp,
-            ctx.server_label,
-        );
+        inject_mcp_metadata_streaming(&mut final_response, state, mcp, ctx.server_label);
     }
 
     mask_tools_as_mcp(&mut final_response, ctx.original_request);
@@ -764,10 +760,7 @@ pub(super) async fn handle_streaming_with_tool_interception(
 
     // Spawn the streaming loop task
     tokio::spawn(async move {
-        // Local state for streaming loop (replaces ToolLoopState)
-        let mut conversation_history: Vec<Value> = Vec::new();
-        let original_input = original_request.input.clone();
-        let mut total_calls: usize = 0;
+        let mut state = ToolLoopState::new(original_request.input.clone());
         let loop_config = McpLoopConfig::default();
         let max_tool_calls = original_request.max_tool_calls.map(|n| n as usize);
         let tools_json = payload_clone.get("tools").cloned().unwrap_or(json!([]));
@@ -958,7 +951,7 @@ pub(super) async fn handle_streaming_with_tool_interception(
                     &handler,
                     &tx,
                     &mut sequence_number,
-                    &conversation_history,
+                    &state,
                     Some(&active_mcp_clone),
                     &streaming_ctx,
                 ) {
@@ -979,7 +972,7 @@ pub(super) async fn handle_streaming_with_tool_interception(
                     }
                     inject_mcp_metadata_streaming(
                         &mut response_json,
-                        &conversation_history,
+                        &state,
                         &active_mcp_clone,
                         server_label,
                     );
@@ -1015,15 +1008,16 @@ pub(super) async fn handle_streaming_with_tool_interception(
             // Execute tools
             let pending_calls = handler.take_pending_calls();
 
-            // Check tool call limit
-            total_calls += pending_calls.len();
+            // Check iteration limit
+            state.iteration += 1;
+            state.total_calls += pending_calls.len();
 
             let effective_limit = match max_tool_calls {
                 Some(user_max) => user_max.min(loop_config.max_iterations),
                 None => loop_config.max_iterations,
             };
 
-            if total_calls > effective_limit {
+            if state.total_calls > effective_limit {
                 warn!(
                     "Reached tool call limit during streaming: {}",
                     effective_limit
@@ -1039,7 +1033,7 @@ pub(super) async fn handle_streaming_with_tool_interception(
                 pending_calls,
                 &active_mcp_clone,
                 &tx,
-                &mut conversation_history,
+                &mut state,
                 server_label,
                 &mut sequence_number,
             )
@@ -1052,8 +1046,8 @@ pub(super) async fn handle_streaming_with_tool_interception(
             // Build resume payload
             match build_resume_payload(
                 &base_payload,
-                &conversation_history,
-                &original_input,
+                &state.conversation_history,
+                &state.original_input,
                 &tools_json,
                 true, // is_streaming = true
             ) {

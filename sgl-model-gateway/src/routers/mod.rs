@@ -26,9 +26,9 @@ pub mod factory;
 pub mod grpc;
 pub mod header_utils;
 pub mod http;
-pub mod mcp;
 pub mod openai;
 pub mod parse;
+pub mod mcp;
 pub mod router_manager;
 pub mod tokenize;
 

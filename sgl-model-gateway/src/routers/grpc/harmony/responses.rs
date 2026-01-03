@@ -42,7 +42,6 @@ use tokio::sync::mpsc;
 use tracing::{debug, error, warn};
 use uuid::Uuid;
 
-use super::mcp_backend::GrpcHarmonyMcpBackend;
 use crate::{
     data_connector::{ConversationItemStorage, ConversationStorage, ResponseId, ResponseStorage},
     mcp::{self, McpManager},
@@ -50,10 +49,10 @@ use crate::{
     protocols::{
         common::{Function, ToolCall, ToolChoice, ToolChoiceValue, Usage},
         responses::{
-            OutputTokensDetails, ResponseContentPart, ResponseInput, ResponseInputOutputItem,
-            ResponseOutputItem, ResponseReasoningContent, ResponseStatus, ResponseTool,
-            ResponseToolType, ResponseUsage, ResponsesRequest, ResponsesResponse, ResponsesUsage,
-            StringOrContentParts,
+            McpToolInfo, OutputTokensDetails, ResponseContentPart, ResponseInput,
+            ResponseInputOutputItem, ResponseOutputItem, ResponseReasoningContent, ResponseStatus,
+            ResponseTool, ResponseToolType, ResponseUsage, ResponsesRequest, ResponsesResponse,
+            ResponsesUsage, StringOrContentParts,
         },
     },
     routers::{
@@ -67,15 +66,75 @@ use crate::{
             harmony::{processor::ResponsesIterationResult, streaming::HarmonyStreamingProcessor},
             pipeline::RequestPipeline,
         },
-        mcp::{
-            tool_loop::{execute_mcp_loop, McpLoopConfig},
-            ToolExecutionResult,
-        },
     },
 };
 
 /// Maximum number of tool execution iterations to prevent infinite loops
 const MAX_TOOL_ITERATIONS: usize = 10;
+
+/// Record of a single MCP tool call execution
+///
+/// Stores metadata needed to build mcp_call output items for Responses API format
+#[derive(Debug, Clone)]
+struct McpCallRecord {
+    /// Tool call ID (stored for potential future use, currently generate new IDs)
+    #[allow(dead_code)]
+    call_id: String,
+    /// Tool name
+    tool_name: String,
+    /// JSON-encoded arguments
+    arguments: String,
+    /// JSON-encoded output/result
+    output: String,
+    /// Whether execution succeeded
+    success: bool,
+    /// Error message if execution failed
+    error: Option<String>,
+}
+
+/// Tracking structure for MCP tool calls across iterations
+///
+/// Accumulates all MCP tool call metadata during multi-turn conversation
+/// so we can build proper mcp_list_tools and mcp_call output items.
+#[derive(Debug, Clone)]
+struct McpCallTracking {
+    /// MCP server label (e.g., "sglang-mcp")
+    server_label: String,
+    /// All tool call records across all iterations
+    tool_calls: Vec<McpCallRecord>,
+}
+
+impl McpCallTracking {
+    pub fn new(server_label: String) -> Self {
+        Self {
+            server_label,
+            tool_calls: Vec::new(),
+        }
+    }
+
+    fn record_call(
+        &mut self,
+        call_id: String,
+        tool_name: String,
+        arguments: String,
+        output: String,
+        success: bool,
+        error: Option<String>,
+    ) {
+        self.tool_calls.push(McpCallRecord {
+            call_id,
+            tool_name,
+            arguments,
+            output,
+            success,
+            error,
+        });
+    }
+
+    fn total_calls(&self) -> usize {
+        self.tool_calls.len()
+    }
+}
 
 /// Context for Harmony Responses execution with MCP tool support
 ///
@@ -233,26 +292,232 @@ pub async fn serve_harmony_responses(
 
 /// Execute Harmony Responses with MCP tool loop
 ///
-/// Uses the shared MCP tool loop executor with Harmony-specific backend.
-/// Automatically executes MCP tools in a loop until no more tool calls or max iterations.
+/// Automatically executes MCP tools in a loop until no more tool calls or max iterations
 async fn execute_with_mcp_loop(
     ctx: &HarmonyResponsesContext,
-    current_request: ResponsesRequest,
+    mut current_request: ResponsesRequest,
 ) -> Result<ResponsesResponse, Response> {
-    // Create Harmony-specific backend for the shared executor
-    let mut backend = GrpcHarmonyMcpBackend::new(ctx, &current_request);
+    let mut iteration_count = 0;
 
-    // Create config from request parameters
-    let config = McpLoopConfig::from_request(current_request.max_tool_calls);
+    // Extract server_label from request tools
+    let server_label = extract_mcp_server_label(current_request.tools.as_deref());
+    let mut mcp_tracking = McpCallTracking::new(server_label.clone());
 
-    debug!(
-        model = %current_request.model,
-        max_tool_calls = ?current_request.max_tool_calls,
-        "Starting Harmony MCP tool loop with shared executor"
-    );
+    // Extract user's max_tool_calls limit (if set)
+    let max_tool_calls = current_request.max_tool_calls.map(|n| n as usize);
 
-    // Execute using shared MCP loop infrastructure
-    execute_mcp_loop(&mut backend, current_request, &ctx.mcp_manager, config).await
+    // Add static MCP tools from inventory to the request
+    let mcp_tools = ctx.mcp_manager.list_tools();
+    if !mcp_tools.is_empty() {
+        let mcp_response_tools = convert_mcp_tools_to_response_tools(&mcp_tools);
+
+        let mut all_tools = current_request.tools.clone().unwrap_or_default();
+        all_tools.extend(mcp_response_tools);
+        current_request.tools = Some(all_tools);
+
+        debug!(
+            mcp_tool_count = mcp_tools.len(),
+            total_tool_count = current_request.tools.as_ref().map(|t| t.len()).unwrap_or(0),
+            "MCP client available - added static MCP tools to Harmony Responses request"
+        );
+    }
+
+    loop {
+        iteration_count += 1;
+
+        // Record tool loop iteration metric
+        Metrics::record_mcp_tool_iteration(&current_request.model);
+
+        // Safety check: prevent infinite loops
+        if iteration_count > MAX_TOOL_ITERATIONS {
+            error!(
+                function = "execute_with_mcp_loop",
+                iteration_count = iteration_count,
+                max_iterations = MAX_TOOL_ITERATIONS,
+                "Maximum tool iterations exceeded"
+            );
+            return Err(error::internal_error(
+                "tool_iterations_exceeded",
+                format!("Maximum tool iterations ({}) exceeded", MAX_TOOL_ITERATIONS),
+            ));
+        }
+
+        debug!(
+            iteration = iteration_count,
+            "Harmony Responses serving iteration"
+        );
+
+        // Execute through full pipeline
+        // This includes:
+        // - HarmonyPreparationStage (builder.rs: construct_input_messages_with_harmony)
+        // - WorkerSelectionStage (FRESH selection based on current context)
+        // - ClientAcquisitionStage (NEW gRPC client if needed)
+        // - HarmonyRequestBuildingStage (encode to token_ids)
+        // - RequestExecutionStage (model generation)
+        // - HarmonyResponseProcessingStage (processor.rs: process_responses_iteration)
+        let iteration_result = ctx
+            .pipeline
+            .execute_harmony_responses(&current_request, ctx)
+            .await?;
+
+        match iteration_result {
+            ResponsesIterationResult::ToolCallsFound {
+                tool_calls,
+                analysis,
+                partial_text,
+                usage,
+                request_id,
+            } => {
+                debug!(
+                    tool_call_count = tool_calls.len(),
+                    has_analysis = analysis.is_some(),
+                    partial_text_len = partial_text.len(),
+                    "Tool calls found - separating MCP and function tools"
+                );
+
+                // Separate MCP and function tool calls based on tool type
+                let request_tools = current_request.tools.as_deref().unwrap_or(&[]);
+                let mcp_tool_names = build_mcp_tool_names_set(request_tools);
+                let (mcp_tool_calls, function_tool_calls): (Vec<_>, Vec<_>) = tool_calls
+                    .into_iter()
+                    .partition(|tc| mcp_tool_names.contains(tc.function.name.as_str()));
+
+                debug!(
+                    mcp_calls = mcp_tool_calls.len(),
+                    function_calls = function_tool_calls.len(),
+                    "Tool calls separated by type"
+                );
+
+                // Check combined limit (user's max_tool_calls vs safety limit)
+                let effective_limit = match max_tool_calls {
+                    Some(user_max) => user_max.min(MAX_TOOL_ITERATIONS),
+                    None => MAX_TOOL_ITERATIONS,
+                };
+
+                // Check if we would exceed the limit with these new MCP tool calls
+                let total_calls_after = mcp_tracking.total_calls() + mcp_tool_calls.len();
+                if total_calls_after > effective_limit {
+                    warn!(
+                        current_calls = mcp_tracking.total_calls(),
+                        new_calls = mcp_tool_calls.len() + function_tool_calls.len(),
+                        total_after = total_calls_after,
+                        effective_limit = effective_limit,
+                        user_max = ?max_tool_calls,
+                        "Reached tool call limit - returning incomplete response"
+                    );
+
+                    // Combine back for response
+                    let all_tool_calls: Vec<_> = mcp_tool_calls
+                        .into_iter()
+                        .chain(function_tool_calls)
+                        .collect();
+
+                    // Build response with incomplete status - no tools executed due to limit
+                    let mut response = build_tool_response(
+                        vec![],         // No MCP tools executed
+                        vec![],         // No MCP results
+                        all_tool_calls, // All tools returned as function calls (not executed)
+                        analysis,
+                        partial_text,
+                        usage,
+                        request_id,
+                        Arc::new(current_request),
+                    );
+
+                    // Mark as completed with incomplete_details
+                    response.status = ResponseStatus::Completed;
+                    response.incomplete_details = Some(json!({ "reason": "max_tool_calls" }));
+
+                    // Inject MCP metadata if any calls were executed
+                    if mcp_tracking.total_calls() > 0 {
+                        inject_mcp_metadata(&mut response, &mcp_tracking, &ctx.mcp_manager);
+                    }
+
+                    return Ok(response);
+                }
+
+                // Execute MCP tools (if any)
+                let mcp_results = if !mcp_tool_calls.is_empty() {
+                    execute_mcp_tools(
+                        &ctx.mcp_manager,
+                        &mcp_tool_calls,
+                        &mut mcp_tracking,
+                        &current_request.model,
+                    )
+                    .await?
+                } else {
+                    Vec::new()
+                };
+
+                // If there are function tools, exit MCP loop and return response
+                if !function_tool_calls.is_empty() {
+                    debug!(
+                        "Function tool calls present - exiting MCP loop and returning to caller"
+                    );
+
+                    // Build response that includes:
+                    // 1. Reasoning/message from this iteration
+                    // 2. MCP tools as completed (with output) - these were executed
+                    // 3. Function tools as completed (without output) - need caller execution
+                    let mut response = build_tool_response(
+                        mcp_tool_calls,
+                        mcp_results,
+                        function_tool_calls,
+                        analysis,
+                        partial_text,
+                        usage,
+                        request_id,
+                        Arc::new(current_request),
+                    );
+
+                    // Inject MCP metadata for all executed calls
+                    if mcp_tracking.total_calls() > 0 {
+                        inject_mcp_metadata(&mut response, &mcp_tracking, &ctx.mcp_manager);
+                    }
+
+                    return Ok(response);
+                }
+
+                // Only MCP tools - continue loop with their results
+                debug!("Only MCP tools - continuing loop with results");
+
+                // Build next request with appended history
+                current_request = build_next_request_with_tools(
+                    current_request,
+                    mcp_tool_calls,
+                    mcp_results,
+                    analysis,
+                    partial_text,
+                )
+                .map_err(|e| *e)?;
+
+                // Continue loop - next iteration will select workers and execute
+            }
+            ResponsesIterationResult::Completed {
+                mut response,
+                usage,
+            } => {
+                debug!(
+                    output_items = response.output.len(),
+                    input_tokens = usage.prompt_tokens,
+                    output_tokens = usage.completion_tokens,
+                    "MCP loop completed - no more tool calls"
+                );
+
+                // Inject MCP metadata into final response
+                inject_mcp_metadata(&mut response, &mcp_tracking, &ctx.mcp_manager);
+
+                debug!(
+                    mcp_calls = mcp_tracking.total_calls(),
+                    output_items_after = response.output.len(),
+                    "Injected MCP metadata into final response"
+                );
+
+                // No tool calls - this is the final response
+                return Ok(*response);
+            }
+        }
+    }
 }
 
 /// Execute Harmony Responses without MCP loop (single execution)
@@ -286,7 +551,7 @@ async fn execute_without_mcp_loop(
 
             Ok(build_tool_response(
                 vec![],
-                &[],
+                vec![],
                 tool_calls,
                 analysis,
                 partial_text,
@@ -398,8 +663,8 @@ async fn execute_mcp_tool_loop_streaming(
     // Set server label in emitter for MCP call items
     emitter.set_mcp_server_label(server_label.clone());
 
-    // Initialize MCP call counter for limit enforcement
-    let mut mcp_call_count: usize = 0;
+    // Initialize MCP call tracking
+    let mut mcp_tracking = McpCallTracking::new(server_label.clone());
 
     // Extract user's max_tool_calls limit (if set)
     let max_tool_calls = current_request.max_tool_calls.map(|n| n as usize);
@@ -592,10 +857,10 @@ async fn execute_mcp_tool_loop_streaming(
                 };
 
                 // Check if we would exceed the limit with these new MCP tool calls
-                let total_calls_after = mcp_call_count + mcp_tool_calls.len();
+                let total_calls_after = mcp_tracking.total_calls() + mcp_tool_calls.len();
                 if total_calls_after > effective_limit {
                     warn!(
-                        current_calls = mcp_call_count,
+                        current_calls = mcp_tracking.total_calls(),
                         new_calls = mcp_tool_calls.len() + function_tool_calls.len(),
                         total_after = total_calls_after,
                         effective_limit = effective_limit,
@@ -621,7 +886,7 @@ async fn execute_mcp_tool_loop_streaming(
                     match execute_mcp_tools(
                         &ctx.mcp_manager,
                         &mcp_tool_calls,
-                        &mut mcp_call_count,
+                        &mut mcp_tracking,
                         &current_request.model,
                     )
                     .await
@@ -670,7 +935,7 @@ async fn execute_mcp_tool_loop_streaming(
                 current_request = match build_next_request_with_tools(
                     current_request,
                     mcp_tool_calls,
-                    &mcp_results,
+                    mcp_results,
                     analysis,
                     partial_text,
                 ) {
@@ -807,7 +1072,7 @@ async fn execute_without_mcp_streaming(
 #[allow(clippy::too_many_arguments)]
 fn build_tool_response(
     mcp_tool_calls: Vec<ToolCall>,
-    mcp_results: &[ToolExecutionResult],
+    mcp_results: Vec<ToolResult>,
     function_tool_calls: Vec<ToolCall>,
     analysis: Option<String>, // Analysis channel content (reasoning)
     partial_text: String,     // Final channel content (message)
@@ -845,16 +1110,20 @@ fn build_tool_response(
 
     // Add MCP tool calls WITH output (these were executed)
     for (tool_call, result) in mcp_tool_calls.iter().zip(mcp_results.iter()) {
+        let output_str = to_string(&result.output).unwrap_or_else(|e| {
+            format!("{{\"error\": \"Failed to serialize tool output: {}\"}}", e)
+        });
+
         output.push(ResponseOutputItem::FunctionToolCall {
             id: tool_call.id.clone(),
             call_id: tool_call.id.clone(),
             name: tool_call.function.name.clone(),
             arguments: tool_call.function.arguments.clone().unwrap_or_default(),
-            output: Some(result.output.clone()), // Already a JSON string
-            status: if result.success {
-                "completed"
-            } else {
+            output: Some(output_str),
+            status: if result.is_error {
                 "failed"
+            } else {
+                "completed"
             }
             .to_string(),
         });
@@ -907,9 +1176,9 @@ fn build_tool_response(
 async fn execute_mcp_tools(
     mcp_manager: &Arc<McpManager>,
     tool_calls: &[ToolCall],
-    tool_count: &mut usize,
+    tracking: &mut McpCallTracking,
     model_id: &str,
-) -> Result<Vec<ToolExecutionResult>, Response> {
+) -> Result<Vec<ToolResult>, Response> {
     let mut results = Vec::new();
 
     for tool_call in tool_calls {
@@ -969,9 +1238,22 @@ async fn execute_mcp_tools(
                 };
 
                 let is_error = mcp_result.is_error.unwrap_or(false);
+                let output_str = to_string(&output)
+                    .unwrap_or_else(|_| r#"{"error": "Failed to serialize output"}"#.to_string());
 
-                // Increment tool count
-                *tool_count += 1;
+                // Record this call in tracking
+                tracking.record_call(
+                    tool_call.id.clone(),
+                    tool_call.function.name.clone(),
+                    args_str.to_string(),
+                    output_str.clone(),
+                    !is_error,
+                    if is_error {
+                        Some(output_str.clone())
+                    } else {
+                        None
+                    },
+                );
 
                 // Record MCP tool metrics
                 Metrics::record_mcp_tool_duration(
@@ -989,22 +1271,11 @@ async fn execute_mcp_tools(
                     },
                 );
 
-                // Serialize output to JSON string
-                let output_str = to_string(&output).unwrap_or_else(|e| {
-                    format!("{{\"error\": \"Failed to serialize tool output: {}\"}}", e)
-                });
-
-                results.push(ToolExecutionResult {
+                results.push(ToolResult {
                     call_id: tool_call.id.clone(),
-                    name: tool_call.function.name.clone(),
-                    arguments: tool_call.function.arguments.clone().unwrap_or_default(),
-                    output: output_str,
-                    success: !is_error,
-                    error: if is_error {
-                        Some("Tool returned error".to_string())
-                    } else {
-                        None
-                    },
+                    tool_name: tool_call.function.name.clone(),
+                    output,
+                    is_error,
                 });
             }
             Err(e) => {
@@ -1017,11 +1288,20 @@ async fn execute_mcp_tools(
 
                 let error_msg = format!("Tool execution failed: {}", e);
                 let error_output = json!({
-                    "error": error_msg
+                    "error": error_msg.clone()
                 });
+                let error_output_str = to_string(&error_output)
+                    .unwrap_or_else(|_| format!(r#"{{"error": "{}"}}"#, error_msg));
 
-                // Increment tool count
-                *tool_count += 1;
+                // Record failed call in tracking
+                tracking.record_call(
+                    tool_call.id.clone(),
+                    tool_call.function.name.clone(),
+                    args_str.to_string(),
+                    error_output_str.clone(),
+                    false,
+                    Some(error_msg),
+                );
 
                 // Record MCP tool metrics
                 Metrics::record_mcp_tool_duration(
@@ -1036,13 +1316,11 @@ async fn execute_mcp_tools(
                 );
 
                 // Return error result to model (let it handle gracefully)
-                results.push(ToolExecutionResult {
+                results.push(ToolResult {
                     call_id: tool_call.id.clone(),
-                    name: tool_call.function.name.clone(),
-                    arguments: tool_call.function.arguments.clone().unwrap_or_default(),
-                    output: error_output.to_string(),
-                    success: false,
-                    error: Some(error_msg),
+                    tool_name: tool_call.function.name.clone(),
+                    output: error_output,
+                    is_error: true,
                 });
             }
         }
@@ -1057,10 +1335,10 @@ async fn execute_mcp_tools(
 /// 1. Original input items (preserved)
 /// 2. Assistant message with analysis (reasoning) + partial_text + tool_calls
 /// 3. Tool result messages for each tool execution
-pub(super) fn build_next_request_with_tools(
+fn build_next_request_with_tools(
     mut request: ResponsesRequest,
     tool_calls: Vec<ToolCall>,
-    tool_results: &[ToolExecutionResult],
+    tool_results: Vec<ToolResult>,
     analysis: Option<String>, // Analysis channel content (becomes reasoning content)
     partial_text: String,     // Final channel content (becomes message content)
 ) -> Result<ResponsesRequest, Box<Response>> {
@@ -1124,6 +1402,11 @@ pub(super) fn build_next_request_with_tools(
 
     // Add tool results
     for tool_result in tool_results {
+        // Serialize tool output to string
+        let output_str = to_string(&tool_result.output).unwrap_or_else(|e| {
+            format!("{{\"error\": \"Failed to serialize tool output: {}\"}}", e)
+        });
+
         // Update the corresponding tool call with output and completed status
         // Find and update the matching FunctionToolCall
         if let Some(ResponseInputOutputItem::FunctionToolCall {
@@ -1134,12 +1417,11 @@ pub(super) fn build_next_request_with_tools(
             .iter_mut()
             .find(|item| matches!(item, ResponseInputOutputItem::FunctionToolCall { call_id, .. } if call_id == &tool_result.call_id))
         {
-            // output is already a JSON string from ToolExecutionResult
-            *output = Some(tool_result.output.clone());
-            *status = if tool_result.success {
-                Some("completed".to_string())
-            } else {
+            *output = Some(output_str);
+            *status = if tool_result.is_error {
                 Some("failed".to_string())
+            } else {
+                Some("completed".to_string())
             };
         }
     }
@@ -1153,6 +1435,24 @@ pub(super) fn build_next_request_with_tools(
     request.tool_choice = Some(ToolChoice::Value(ToolChoiceValue::Auto));
 
     Ok(request)
+}
+
+/// Tool execution result
+///
+/// Contains the result of executing a single MCP tool.
+pub(crate) struct ToolResult {
+    /// Tool call ID (for matching with request)
+    pub(crate) call_id: String,
+
+    /// Tool name
+    #[allow(dead_code)] // Kept for documentation and future use
+    pub(crate) tool_name: String,
+
+    /// Tool output (JSON value)
+    pub(crate) output: Value,
+
+    /// Whether this is an error result
+    pub(crate) is_error: bool,
 }
 
 /// Convert MCP tools to Responses API tool format
@@ -1178,6 +1478,72 @@ pub fn convert_mcp_tools_to_response_tools(mcp_tools: &[mcp::Tool]) -> Vec<Respo
             allowed_tools: None,
         })
         .collect()
+}
+
+/// Inject MCP metadata into final response
+///
+/// Adds mcp_list_tools and mcp_call output items to the response output array.
+/// Following non-Harmony pipeline pattern:
+/// 1. Prepend mcp_list_tools at the beginning
+/// 2. Append all mcp_call items at the end
+///
+/// # Arguments
+///
+/// * `response` - Final response to modify
+/// * `tracking` - MCP call tracking data
+/// * `mcp_manager` - MCP manager for listing tools
+fn inject_mcp_metadata(
+    response: &mut ResponsesResponse,
+    tracking: &McpCallTracking,
+    mcp_manager: &Arc<McpManager>,
+) {
+    // Build mcp_list_tools item
+    let tools = mcp_manager.list_tools();
+    let tools_info: Vec<McpToolInfo> = tools
+        .iter()
+        .map(|t| McpToolInfo {
+            name: t.name.to_string(),
+            description: t.description.as_ref().map(|d| d.to_string()),
+            input_schema: Value::Object((*t.input_schema).clone()),
+            annotations: Some(json!({
+                "read_only": false
+            })),
+        })
+        .collect();
+
+    let mcp_list_tools = ResponseOutputItem::McpListTools {
+        id: format!("mcpl_{}", Uuid::new_v4()),
+        server_label: tracking.server_label.clone(),
+        tools: tools_info,
+    };
+
+    // Build mcp_call items for each tracked call
+    let mcp_call_items: Vec<ResponseOutputItem> = tracking
+        .tool_calls
+        .iter()
+        .map(|record| ResponseOutputItem::McpCall {
+            id: format!("mcp_{}", Uuid::new_v4()),
+            status: if record.success {
+                "completed"
+            } else {
+                "failed"
+            }
+            .to_string(),
+            approval_request_id: None,
+            arguments: record.arguments.clone(),
+            error: record.error.clone(),
+            name: record.tool_name.clone(),
+            output: record.output.clone(),
+            server_label: tracking.server_label.clone(),
+        })
+        .collect();
+
+    // Inject into response output:
+    // 1. Prepend mcp_list_tools at the beginning
+    response.output.insert(0, mcp_list_tools);
+
+    // 2. Append all mcp_call items at the end
+    response.output.extend(mcp_call_items);
 }
 
 /// Extract MCP server label from request tools

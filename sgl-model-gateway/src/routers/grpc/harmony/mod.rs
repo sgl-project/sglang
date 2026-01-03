@@ -31,7 +31,6 @@
 
 pub mod builder;
 pub mod detector;
-mod mcp_backend;
 pub mod parser;
 pub mod processor;
 pub mod responses;

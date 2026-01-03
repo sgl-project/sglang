@@ -10,7 +10,6 @@
 mod accumulator;
 mod context;
 pub mod mcp;
-mod mcp_backend;
 pub mod provider;
 mod responses;
 mod router;
