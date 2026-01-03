@@ -3,10 +3,7 @@ use std::{sync::Arc, time::Instant};
 use axum::{
     body::{to_bytes, Body},
     extract::Request,
-    http::{
-        header::CONTENT_TYPE,
-        HeaderMap, HeaderValue, Method, StatusCode,
-    },
+    http::{header::CONTENT_TYPE, HeaderMap, HeaderValue, Method, StatusCode},
     response::{IntoResponse, Response},
     Json,
 };

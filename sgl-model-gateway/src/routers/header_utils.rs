@@ -189,11 +189,7 @@ pub fn should_forward_request_header(name: &str) -> bool {
     let lower_name = name.to_ascii_lowercase();
     matches!(
         lower_name.as_str(),
-        "authorization"
-            | "x-request-id"
-            | "x-correlation-id"
-            | "traceparent"
-            | "tracestate"
+        "authorization" | "x-request-id" | "x-correlation-id" | "traceparent" | "tracestate"
     ) || lower_name.starts_with("x-request-id-")
 }
 
