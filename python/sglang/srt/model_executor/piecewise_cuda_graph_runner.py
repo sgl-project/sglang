@@ -26,7 +26,7 @@ import tqdm
 
 from sglang.srt.batch_overlap.two_batch_overlap import TboCudaGraphRunnerPlugin
 from sglang.srt.compilation.compilation_config import CompilationConfig
-from sglang.srt.compilation.compile import install_torch_compiled, set_compiled
+from sglang.srt.compilation.compile import install_torch_compiled
 from sglang.srt.compilation.piecewise_context_manager import (
     enable_piecewise_cuda_graph,
     enable_piecewise_cuda_graph_compile,
@@ -227,7 +227,7 @@ class PiecewiseCudaGraphRunner:
                     graph_pool=get_global_graph_memory_pool(),
                 )
 
-                with set_compiled(True), enable_piecewise_cuda_graph_compile():
+                with enable_piecewise_cuda_graph_compile():
                     compile_range = (
                         tqdm.tqdm(list(reversed(self.capture_num_tokens)))
                         if get_tensor_model_parallel_rank() == 0
@@ -370,8 +370,7 @@ class PiecewiseCudaGraphRunner:
                             f"Capturing num tokens ({num_tokens=} {avail_mem=:.2f} GB)"
                         )
 
-                    with set_compiled(True):
-                        self.capture_one_batch_size(num_tokens)
+                    self.capture_one_batch_size(num_tokens)
 
     def capture_one_batch_size(self, num_tokens: int):
         bs = 1
@@ -593,13 +592,12 @@ class PiecewiseCudaGraphRunner:
                 self.quant_config,
                 self.moe_layers,
             ):
-                with set_compiled(True):
-                    output = self.model_runner.model.forward(
-                        static_forward_batch.input_ids,
-                        static_forward_batch.positions,
-                        static_forward_batch,
-                        **kwargs,
-                    )
+                output = self.model_runner.model.forward(
+                    static_forward_batch.input_ids,
+                    static_forward_batch.positions,
+                    static_forward_batch,
+                    **kwargs,
+                )
                 if isinstance(output, LogitsProcessorOutput):
                     return LogitsProcessorOutput(
                         next_token_logits=output.next_token_logits[

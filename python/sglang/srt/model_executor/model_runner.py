@@ -778,7 +778,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 pipeline_model_parallel_size=self.pp_size,
                 expert_model_parallel_size=self.moe_ep_size,
                 duplicate_tp_group=self.server_args.enable_pdmux,
-                torch_compile=self.server_args.enable_piecewise_cuda_graph,
+                torch_compile=not self.server_args.disable_piecewise_cuda_graph,
             )
             initialize_dp_attention(
                 server_args=self.server_args,
@@ -1505,29 +1505,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     def mambaish_config(self):
         return self.mamba2_config or self.hybrid_gdn_config or self.kimi_linear_config
 
-    def can_run_piecewise_cuda_graph(self):
-        if self.server_args.enable_torch_compile:
-            log_info_on_rank0(
-                logger,
-                "Disable piecewise CUDA graph because piecewise_cuda_graph has conflict with torch compile",
-            )
-            return False
-        if self.pp_size > 1:
-            # TODO(yuwei): support PP
-            log_info_on_rank0(
-                logger,
-                "Disable piecewise CUDA graph because piecewise_cuda_graph does not support PP",
-            )
-            return False
-        if get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake():
-            # TODO(yuwei): fix the compilation errors for MOE A2A backend
-            log_info_on_rank0(
-                logger,
-                "Disable piecewise CUDA graph due to existing compilation errors",
-            )
-            return False
-        return True
-
     def configure_kv_cache_dtype(self):
         if self.server_args.kv_cache_dtype == "auto":
             quant_config = getattr(self.model, "quant_config", None)
@@ -2005,10 +1982,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         """Initialize piecewise CUDA graph runner."""
         self.piecewise_cuda_graph_runner = None
 
-        if (
-            not self.server_args.enable_piecewise_cuda_graph
-            or not self.can_run_piecewise_cuda_graph()
-        ):
+        if self.server_args.disable_piecewise_cuda_graph:
             return
 
         # Collect attention layers and moe layers from the model

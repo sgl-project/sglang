@@ -630,7 +630,7 @@ class Qwen2MoeModel(nn.Module):
             for i in range(self.start_layer, self.end_layer):
                 ctx = (
                     nullcontext()
-                    if get_global_server_args().enable_piecewise_cuda_graph
+                    if not get_global_server_args().disable_piecewise_cuda_graph
                     else get_global_expert_distribution_recorder().with_current_layer(i)
                 )
                 with ctx:
