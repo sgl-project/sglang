@@ -7,7 +7,7 @@ use axum::{
 };
 use common::{
     mock_worker::{HealthStatus, MockWorker, MockWorkerConfig, WorkerType},
-    TestContext,
+    AppTestContext,
 };
 use serde_json::json;
 use smg::{config::RouterConfig, routers::RouterFactory};
@@ -19,7 +19,7 @@ mod health_tests {
 
     #[tokio::test]
     async fn test_liveness_endpoint() {
-        let ctx = TestContext::new(vec![]).await;
+        let ctx = AppTestContext::new(vec![]).await;
         let app = ctx.create_app().await;
 
         let req = Request::builder()
@@ -36,7 +36,7 @@ mod health_tests {
 
     #[tokio::test]
     async fn test_readiness_with_healthy_workers() {
-        let ctx = TestContext::new(vec![MockWorkerConfig {
+        let ctx = AppTestContext::new(vec![MockWorkerConfig {
             port: 18001,
             worker_type: WorkerType::Regular,
             health_status: HealthStatus::Healthy,
@@ -61,7 +61,7 @@ mod health_tests {
 
     #[tokio::test]
     async fn test_readiness_with_unhealthy_workers() {
-        let ctx = TestContext::new(vec![]).await;
+        let ctx = AppTestContext::new(vec![]).await;
 
         let app = ctx.create_app().await;
 
@@ -79,7 +79,7 @@ mod health_tests {
 
     #[tokio::test]
     async fn test_health_endpoint_details() {
-        let ctx = TestContext::new(vec![
+        let ctx = AppTestContext::new(vec![
             MockWorkerConfig {
                 port: 18003,
                 worker_type: WorkerType::Regular,
@@ -113,7 +113,7 @@ mod health_tests {
 
     #[tokio::test]
     async fn test_health_generate_endpoint() {
-        let ctx = TestContext::new(vec![MockWorkerConfig {
+        let ctx = AppTestContext::new(vec![MockWorkerConfig {
             port: 18005,
             worker_type: WorkerType::Regular,
             health_status: HealthStatus::Healthy,
@@ -149,7 +149,7 @@ mod generation_tests {
 
     #[tokio::test]
     async fn test_generate_success() {
-        let ctx = TestContext::new(vec![MockWorkerConfig {
+        let ctx = AppTestContext::new(vec![MockWorkerConfig {
             port: 18101,
             worker_type: WorkerType::Regular,
             health_status: HealthStatus::Healthy,
@@ -190,7 +190,7 @@ mod generation_tests {
 
     #[tokio::test]
     async fn test_generate_streaming() {
-        let ctx = TestContext::new(vec![MockWorkerConfig {
+        let ctx = AppTestContext::new(vec![MockWorkerConfig {
             port: 18102,
             worker_type: WorkerType::Regular,
             health_status: HealthStatus::Healthy,
@@ -226,7 +226,7 @@ mod generation_tests {
 
     #[tokio::test]
     async fn test_generate_with_worker_failure() {
-        let ctx = TestContext::new(vec![MockWorkerConfig {
+        let ctx = AppTestContext::new(vec![MockWorkerConfig {
             port: 18103,
             worker_type: WorkerType::Regular,
             health_status: HealthStatus::Healthy,
@@ -257,7 +257,7 @@ mod generation_tests {
 
     #[tokio::test]
     async fn test_v1_chat_completions_success() {
-        let ctx = TestContext::new(vec![MockWorkerConfig {
+        let ctx = AppTestContext::new(vec![MockWorkerConfig {
             port: 18104,
             worker_type: WorkerType::Regular,
             health_status: HealthStatus::Healthy,
@@ -302,7 +302,7 @@ mod model_info_tests {
 
     #[tokio::test]
     async fn test_get_server_info() {
-        let ctx = TestContext::new(vec![MockWorkerConfig {
+        let ctx = AppTestContext::new(vec![MockWorkerConfig {
             port: 18201,
             worker_type: WorkerType::Regular,
             health_status: HealthStatus::Healthy,
@@ -340,7 +340,7 @@ mod model_info_tests {
 
     #[tokio::test]
     async fn test_get_model_info() {
-        let ctx = TestContext::new(vec![MockWorkerConfig {
+        let ctx = AppTestContext::new(vec![MockWorkerConfig {
             port: 18202,
             worker_type: WorkerType::Regular,
             health_status: HealthStatus::Healthy,
@@ -385,7 +385,7 @@ mod model_info_tests {
 
     #[tokio::test]
     async fn test_v1_models() {
-        let ctx = TestContext::new(vec![MockWorkerConfig {
+        let ctx = AppTestContext::new(vec![MockWorkerConfig {
             port: 18203,
             worker_type: WorkerType::Regular,
             health_status: HealthStatus::Healthy,
@@ -441,7 +441,7 @@ mod model_info_tests {
 
     #[tokio::test]
     async fn test_model_info_with_no_workers() {
-        let ctx = TestContext::new(vec![]).await;
+        let ctx = AppTestContext::new(vec![]).await;
         let app = ctx.create_app().await;
 
         let req = Request::builder()
@@ -497,7 +497,7 @@ mod model_info_tests {
 
     #[tokio::test]
     async fn test_model_info_with_multiple_workers() {
-        let ctx = TestContext::new(vec![
+        let ctx = AppTestContext::new(vec![
             MockWorkerConfig {
                 port: 18204,
                 worker_type: WorkerType::Regular,
@@ -542,7 +542,7 @@ mod model_info_tests {
 
     #[tokio::test]
     async fn test_model_info_with_unhealthy_worker() {
-        let ctx = TestContext::new(vec![MockWorkerConfig {
+        let ctx = AppTestContext::new(vec![MockWorkerConfig {
             port: 18206,
             worker_type: WorkerType::Regular,
             health_status: HealthStatus::Healthy,
@@ -578,7 +578,7 @@ mod router_policy_tests {
 
     #[tokio::test]
     async fn test_random_policy() {
-        let ctx = TestContext::new(vec![
+        let ctx = AppTestContext::new(vec![
             MockWorkerConfig {
                 port: 18801,
                 worker_type: WorkerType::Regular,
@@ -621,7 +621,7 @@ mod router_policy_tests {
 
     #[tokio::test]
     async fn test_worker_selection() {
-        let ctx = TestContext::new(vec![MockWorkerConfig {
+        let ctx = AppTestContext::new(vec![MockWorkerConfig {
             port: 18207,
             worker_type: WorkerType::Regular,
             health_status: HealthStatus::Healthy,
@@ -651,7 +651,7 @@ mod responses_endpoint_tests {
 
     #[tokio::test]
     async fn test_v1_responses_non_streaming() {
-        let ctx = TestContext::new(vec![MockWorkerConfig {
+        let ctx = AppTestContext::new(vec![MockWorkerConfig {
             port: 18950,
             worker_type: WorkerType::Regular,
             health_status: HealthStatus::Healthy,
@@ -690,7 +690,7 @@ mod responses_endpoint_tests {
 
     #[tokio::test]
     async fn test_v1_responses_streaming() {
-        let ctx = TestContext::new(vec![MockWorkerConfig {
+        let ctx = AppTestContext::new(vec![MockWorkerConfig {
             port: 18951,
             worker_type: WorkerType::Regular,
             health_status: HealthStatus::Healthy,
@@ -731,7 +731,7 @@ mod responses_endpoint_tests {
 
     #[tokio::test]
     async fn test_v1_responses_get() {
-        let ctx = TestContext::new(vec![MockWorkerConfig {
+        let ctx = AppTestContext::new(vec![MockWorkerConfig {
             port: 18952,
             worker_type: WorkerType::Regular,
             health_status: HealthStatus::Healthy,
@@ -780,7 +780,7 @@ mod responses_endpoint_tests {
 
     #[tokio::test]
     async fn test_v1_responses_cancel() {
-        let ctx = TestContext::new(vec![MockWorkerConfig {
+        let ctx = AppTestContext::new(vec![MockWorkerConfig {
             port: 18953,
             worker_type: WorkerType::Regular,
             health_status: HealthStatus::Healthy,
@@ -829,7 +829,7 @@ mod responses_endpoint_tests {
 
     #[tokio::test]
     async fn test_v1_responses_delete_not_implemented() {
-        let ctx = TestContext::new(vec![MockWorkerConfig {
+        let ctx = AppTestContext::new(vec![MockWorkerConfig {
             port: 18954,
             worker_type: WorkerType::Regular,
             health_status: HealthStatus::Healthy,
@@ -872,7 +872,7 @@ mod responses_endpoint_tests {
             .queue_timeout_secs(60)
             .build_unchecked();
 
-        let ctx = TestContext::new_with_config(
+        let ctx = AppTestContext::new_with_config(
             config,
             vec![], // No workers needed
         )
@@ -926,7 +926,7 @@ mod responses_endpoint_tests {
     #[tokio::test]
     async fn test_v1_responses_get_multi_worker_fanout() {
         // Start two mock workers
-        let ctx = TestContext::new(vec![
+        let ctx = AppTestContext::new(vec![
             MockWorkerConfig {
                 port: 18960,
                 worker_type: WorkerType::Regular,
@@ -1001,7 +1001,7 @@ mod error_tests {
 
     #[tokio::test]
     async fn test_404_not_found() {
-        let ctx = TestContext::new(vec![MockWorkerConfig {
+        let ctx = AppTestContext::new(vec![MockWorkerConfig {
             port: 18401,
             worker_type: WorkerType::Regular,
             health_status: HealthStatus::Healthy,
@@ -1038,7 +1038,7 @@ mod error_tests {
 
     #[tokio::test]
     async fn test_method_not_allowed() {
-        let ctx = TestContext::new(vec![MockWorkerConfig {
+        let ctx = AppTestContext::new(vec![MockWorkerConfig {
             port: 18402,
             worker_type: WorkerType::Regular,
             health_status: HealthStatus::Healthy,
@@ -1090,7 +1090,7 @@ mod error_tests {
             .queue_timeout_secs(60)
             .build_unchecked();
 
-        let ctx = TestContext::new_with_config(
+        let ctx = AppTestContext::new_with_config(
             config,
             vec![MockWorkerConfig {
                 port: 18403,
@@ -1111,7 +1111,7 @@ mod error_tests {
 
     #[tokio::test]
     async fn test_invalid_json_payload() {
-        let ctx = TestContext::new(vec![MockWorkerConfig {
+        let ctx = AppTestContext::new(vec![MockWorkerConfig {
             port: 18404,
             worker_type: WorkerType::Regular,
             health_status: HealthStatus::Healthy,
@@ -1149,7 +1149,7 @@ mod error_tests {
 
     #[tokio::test]
     async fn test_invalid_model() {
-        let ctx = TestContext::new(vec![MockWorkerConfig {
+        let ctx = AppTestContext::new(vec![MockWorkerConfig {
             port: 18406,
             worker_type: WorkerType::Regular,
             health_status: HealthStatus::Healthy,
@@ -1187,7 +1187,7 @@ mod cache_tests {
 
     #[tokio::test]
     async fn test_flush_cache() {
-        let ctx = TestContext::new(vec![MockWorkerConfig {
+        let ctx = AppTestContext::new(vec![MockWorkerConfig {
             port: 18501,
             worker_type: WorkerType::Regular,
             health_status: HealthStatus::Healthy,
@@ -1224,7 +1224,7 @@ mod cache_tests {
 
     #[tokio::test]
     async fn test_get_loads() {
-        let ctx = TestContext::new(vec![
+        let ctx = AppTestContext::new(vec![
             MockWorkerConfig {
                 port: 18502,
                 worker_type: WorkerType::Regular,
@@ -1267,7 +1267,7 @@ mod cache_tests {
 
     #[tokio::test]
     async fn test_flush_cache_no_workers() {
-        let ctx = TestContext::new(vec![]).await;
+        let ctx = AppTestContext::new(vec![]).await;
 
         let app = ctx.create_app().await;
 
@@ -1294,7 +1294,7 @@ mod load_balancing_tests {
     #[tokio::test]
     async fn test_request_distribution() {
         // Create multiple workers
-        let ctx = TestContext::new(vec![
+        let ctx = AppTestContext::new(vec![
             MockWorkerConfig {
                 port: 18601,
                 worker_type: WorkerType::Regular,
@@ -1411,7 +1411,7 @@ mod request_id_tests {
 
     #[tokio::test]
     async fn test_request_id_generation() {
-        let ctx = TestContext::new(vec![MockWorkerConfig {
+        let ctx = AppTestContext::new(vec![MockWorkerConfig {
             port: 18901,
             worker_type: WorkerType::Regular,
             health_status: HealthStatus::Healthy,
@@ -1528,7 +1528,7 @@ mod request_id_tests {
             .queue_timeout_secs(60)
             .build_unchecked();
 
-        let ctx = TestContext::new_with_config(
+        let ctx = AppTestContext::new_with_config(
             config,
             vec![MockWorkerConfig {
                 port: 18902,
@@ -1573,7 +1573,7 @@ mod rerank_tests {
 
     #[tokio::test]
     async fn test_rerank_success() {
-        let ctx = TestContext::new(vec![MockWorkerConfig {
+        let ctx = AppTestContext::new(vec![MockWorkerConfig {
             port: 18105,
             worker_type: WorkerType::Regular,
             health_status: HealthStatus::Healthy,
@@ -1625,7 +1625,7 @@ mod rerank_tests {
 
     #[tokio::test]
     async fn test_rerank_with_top_k() {
-        let ctx = TestContext::new(vec![MockWorkerConfig {
+        let ctx = AppTestContext::new(vec![MockWorkerConfig {
             port: 18106,
             worker_type: WorkerType::Regular,
             health_status: HealthStatus::Healthy,
@@ -1672,7 +1672,7 @@ mod rerank_tests {
 
     #[tokio::test]
     async fn test_rerank_without_documents() {
-        let ctx = TestContext::new(vec![MockWorkerConfig {
+        let ctx = AppTestContext::new(vec![MockWorkerConfig {
             port: 18107,
             worker_type: WorkerType::Regular,
             health_status: HealthStatus::Healthy,
@@ -1716,7 +1716,7 @@ mod rerank_tests {
 
     #[tokio::test]
     async fn test_rerank_worker_failure() {
-        let ctx = TestContext::new(vec![MockWorkerConfig {
+        let ctx = AppTestContext::new(vec![MockWorkerConfig {
             port: 18108,
             worker_type: WorkerType::Regular,
             health_status: HealthStatus::Healthy,
@@ -1749,7 +1749,7 @@ mod rerank_tests {
 
     #[tokio::test]
     async fn test_v1_rerank_compatibility() {
-        let ctx = TestContext::new(vec![MockWorkerConfig {
+        let ctx = AppTestContext::new(vec![MockWorkerConfig {
             port: 18110,
             worker_type: WorkerType::Regular,
             health_status: HealthStatus::Healthy,
@@ -1806,7 +1806,7 @@ mod rerank_tests {
 
     #[tokio::test]
     async fn test_rerank_invalid_request() {
-        let ctx = TestContext::new(vec![MockWorkerConfig {
+        let ctx = AppTestContext::new(vec![MockWorkerConfig {
             port: 18111,
             worker_type: WorkerType::Regular,
             health_status: HealthStatus::Healthy,

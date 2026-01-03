@@ -2,13 +2,13 @@ mod common;
 
 use common::{
     mock_worker::{HealthStatus, MockWorkerConfig, WorkerType},
-    SimpleTestContext,
+    WorkerTestContext,
 };
 use reqwest::Client;
 use serde_json::json;
 
 async fn make_request(
-    ctx: &SimpleTestContext,
+    ctx: &WorkerTestContext,
     endpoint: &str,
     body: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
@@ -40,7 +40,7 @@ mod request_format_tests {
 
     #[tokio::test]
     async fn test_generate_request_formats() {
-        let ctx = SimpleTestContext::new(vec![MockWorkerConfig {
+        let ctx = WorkerTestContext::new(vec![MockWorkerConfig {
             port: 19001,
             worker_type: WorkerType::Regular,
             health_status: HealthStatus::Healthy,
@@ -87,7 +87,7 @@ mod request_format_tests {
 
     #[tokio::test]
     async fn test_v1_chat_completions_formats() {
-        let ctx = SimpleTestContext::new(vec![MockWorkerConfig {
+        let ctx = WorkerTestContext::new(vec![MockWorkerConfig {
             port: 19002,
             worker_type: WorkerType::Regular,
             health_status: HealthStatus::Healthy,
@@ -135,7 +135,7 @@ mod request_format_tests {
 
     #[tokio::test]
     async fn test_v1_completions_formats() {
-        let ctx = SimpleTestContext::new(vec![MockWorkerConfig {
+        let ctx = WorkerTestContext::new(vec![MockWorkerConfig {
             port: 19003,
             worker_type: WorkerType::Regular,
             health_status: HealthStatus::Healthy,
@@ -187,7 +187,7 @@ mod request_format_tests {
 
     #[tokio::test]
     async fn test_batch_requests() {
-        let ctx = SimpleTestContext::new(vec![MockWorkerConfig {
+        let ctx = WorkerTestContext::new(vec![MockWorkerConfig {
             port: 19004,
             worker_type: WorkerType::Regular,
             health_status: HealthStatus::Healthy,
@@ -221,7 +221,7 @@ mod request_format_tests {
 
     #[tokio::test]
     async fn test_special_parameters() {
-        let ctx = SimpleTestContext::new(vec![MockWorkerConfig {
+        let ctx = WorkerTestContext::new(vec![MockWorkerConfig {
             port: 19005,
             worker_type: WorkerType::Regular,
             health_status: HealthStatus::Healthy,
@@ -269,7 +269,7 @@ mod request_format_tests {
 
     #[tokio::test]
     async fn test_error_handling() {
-        let ctx = SimpleTestContext::new(vec![MockWorkerConfig {
+        let ctx = WorkerTestContext::new(vec![MockWorkerConfig {
             port: 19006,
             worker_type: WorkerType::Regular,
             health_status: HealthStatus::Healthy,

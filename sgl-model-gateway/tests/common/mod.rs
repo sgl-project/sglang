@@ -34,21 +34,21 @@ use smg::{
     tool_parser::ParserFactory as ToolParserFactory,
 };
 
-/// Test context that manages mock workers and provides common test infrastructure.
-pub struct TestContext {
+/// Test context for integration tests that go through the full axum app stack.
+pub struct AppTestContext {
     pub workers: Vec<MockWorker>,
     pub router: Arc<dyn RouterTrait>,
     pub config: RouterConfig,
     pub app_context: Arc<AppContext>,
 }
 
-/// Simplified test context for directly testing mock workers without full router setup.
-pub struct SimpleTestContext {
+/// Test context for directly testing mock workers without full router setup.
+pub struct WorkerTestContext {
     pub workers: Vec<MockWorker>,
     pub worker_urls: Vec<String>,
 }
 
-impl SimpleTestContext {
+impl WorkerTestContext {
     pub async fn new(worker_configs: Vec<MockWorkerConfig>) -> Self {
         let mut workers = Vec::new();
         let mut worker_urls = Vec::new();
@@ -83,7 +83,7 @@ impl SimpleTestContext {
     }
 }
 
-impl TestContext {
+impl AppTestContext {
     pub async fn new(worker_configs: Vec<MockWorkerConfig>) -> Self {
         let config = RouterConfig::builder()
             .regular_mode(vec![])

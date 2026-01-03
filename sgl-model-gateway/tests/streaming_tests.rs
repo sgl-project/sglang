@@ -2,14 +2,14 @@ mod common;
 
 use common::{
     mock_worker::{HealthStatus, MockWorkerConfig, WorkerType},
-    SimpleTestContext,
+    WorkerTestContext,
 };
 use futures_util::StreamExt;
 use reqwest::Client;
 use serde_json::json;
 
 async fn make_streaming_request(
-    ctx: &SimpleTestContext,
+    ctx: &WorkerTestContext,
     endpoint: &str,
     body: serde_json::Value,
 ) -> Result<Vec<String>, String> {
@@ -62,7 +62,7 @@ mod streaming_tests {
 
     #[tokio::test]
     async fn test_generate_streaming() {
-        let ctx = SimpleTestContext::new(vec![MockWorkerConfig {
+        let ctx = WorkerTestContext::new(vec![MockWorkerConfig {
             port: 20001,
             worker_type: WorkerType::Regular,
             health_status: HealthStatus::Healthy,
@@ -92,7 +92,7 @@ mod streaming_tests {
 
     #[tokio::test]
     async fn test_v1_chat_completions_streaming() {
-        let ctx = SimpleTestContext::new(vec![MockWorkerConfig {
+        let ctx = WorkerTestContext::new(vec![MockWorkerConfig {
             port: 20002,
             worker_type: WorkerType::Regular,
             health_status: HealthStatus::Healthy,
@@ -134,7 +134,7 @@ mod streaming_tests {
 
     #[tokio::test]
     async fn test_v1_completions_streaming() {
-        let ctx = SimpleTestContext::new(vec![MockWorkerConfig {
+        let ctx = WorkerTestContext::new(vec![MockWorkerConfig {
             port: 20003,
             worker_type: WorkerType::Regular,
             health_status: HealthStatus::Healthy,
@@ -161,7 +161,7 @@ mod streaming_tests {
 
     #[tokio::test]
     async fn test_streaming_with_error() {
-        let ctx = SimpleTestContext::new(vec![MockWorkerConfig {
+        let ctx = WorkerTestContext::new(vec![MockWorkerConfig {
             port: 20004,
             worker_type: WorkerType::Regular,
             health_status: HealthStatus::Healthy,
@@ -183,7 +183,7 @@ mod streaming_tests {
 
     #[tokio::test]
     async fn test_streaming_timeouts() {
-        let ctx = SimpleTestContext::new(vec![MockWorkerConfig {
+        let ctx = WorkerTestContext::new(vec![MockWorkerConfig {
             port: 20005,
             worker_type: WorkerType::Regular,
             health_status: HealthStatus::Healthy,
@@ -214,7 +214,7 @@ mod streaming_tests {
 
     #[tokio::test]
     async fn test_batch_streaming() {
-        let ctx = SimpleTestContext::new(vec![MockWorkerConfig {
+        let ctx = WorkerTestContext::new(vec![MockWorkerConfig {
             port: 20006,
             worker_type: WorkerType::Regular,
             health_status: HealthStatus::Healthy,
