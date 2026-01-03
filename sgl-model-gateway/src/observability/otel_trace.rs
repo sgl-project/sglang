@@ -116,10 +116,8 @@ pub fn otel_tracing_init(enable: bool, otlp_endpoint: Option<&str>) -> Result<()
         .with_batch_config(batch_config)
         .build();
 
-    let resource = Resource::default().merge(&Resource::new(vec![KeyValue::new(
-        "service.name",
-        "smg",
-    )]));
+    let resource =
+        Resource::default().merge(&Resource::new(vec![KeyValue::new("service.name", "smg")]));
 
     let provider = TracerProvider::builder()
         .with_span_processor(span_processor)
