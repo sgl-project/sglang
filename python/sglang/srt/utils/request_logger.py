@@ -157,13 +157,9 @@ class RequestLogger:
             self._log_json("request.finished", log_data)
         else:
             obj_str = _dataclass_to_string_truncated(obj, max_length, skip_names=skip_names)
+            out_str = "" if is_multimodal_gen else f", out={_dataclass_to_string_truncated(out, max_length, skip_names=out_skip_names)}"
             headers_str = f", headers={headers}" if headers else ""
-            if is_multimodal_gen:
-                msg = f"Finish: obj={obj_str}{headers_str}"
-            else:
-                out_str = _dataclass_to_string_truncated(out, max_length, skip_names=out_skip_names)
-                msg = f"Finish: obj={obj_str}{headers_str}, out={out_str}"
-            self._log(msg)
+            self._log(f"Finish: obj={obj_str}{headers_str}{out_str}")
 
     def _compute_metadata(
         self,
