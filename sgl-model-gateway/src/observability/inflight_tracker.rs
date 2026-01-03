@@ -309,12 +309,12 @@ mod tests {
         // After concurrent operations, some requests should remain
         // (threads 5-9 registered 100 each = 500, none of those were deregistered)
         // threads 0-4 registered 100 each but also got deregistered
-        // The exact count depends on timing, but it should be non-negative
-        assert!(tracker.len() >= 0);
+        // The exact count depends on timing, but tracker should be in a valid state
+        let _ = tracker.len(); // Just ensure len() doesn't panic
 
         // Verify we can still compute buckets without panic
         let counts = tracker.compute_bucket_counts();
-        assert!(counts[5] >= 0); // +Inf should be non-negative
+        let _ = counts[5]; // Just ensure +Inf bucket is accessible
     }
 
     #[test]
