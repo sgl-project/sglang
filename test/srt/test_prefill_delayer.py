@@ -23,6 +23,8 @@ class TestPrefillDelayerThroughput(CustomTestCase):
             "--enable-dp-attention",
             "--dp",
             "8",
+            "--chunked-prefill-size",
+            "65536",
         ]
 
         # TODO further fix mem leak
