@@ -26,7 +26,7 @@ mod request_format_tests {
             "stream": false
         });
 
-        let result = make_request(&ctx, "/generate", payload).await;
+        let result = ctx.make_request( "/generate", payload).await;
         assert!(result.is_ok());
 
         let payload = json!({
@@ -39,7 +39,7 @@ mod request_format_tests {
             "stream": false
         });
 
-        let result = make_request(&ctx, "/generate", payload).await;
+        let result = ctx.make_request( "/generate", payload).await;
         assert!(result.is_ok());
 
         let payload = json!({
@@ -51,7 +51,7 @@ mod request_format_tests {
             "stream": false
         });
 
-        let result = make_request(&ctx, "/generate", payload).await;
+        let result = ctx.make_request( "/generate", payload).await;
         assert!(result.is_ok());
 
         ctx.shutdown().await;
@@ -77,7 +77,7 @@ mod request_format_tests {
             "stream": false
         });
 
-        let result = make_request(&ctx, "/v1/chat/completions", payload).await;
+        let result = ctx.make_request( "/v1/chat/completions", payload).await;
         assert!(result.is_ok());
 
         let response = result.unwrap();
@@ -99,7 +99,7 @@ mod request_format_tests {
             "stream": false
         });
 
-        let result = make_request(&ctx, "/v1/chat/completions", payload).await;
+        let result = ctx.make_request( "/v1/chat/completions", payload).await;
         assert!(result.is_ok());
 
         ctx.shutdown().await;
@@ -123,7 +123,7 @@ mod request_format_tests {
             "stream": false
         });
 
-        let result = make_request(&ctx, "/v1/completions", payload).await;
+        let result = ctx.make_request( "/v1/completions", payload).await;
         assert!(result.is_ok());
 
         let response = result.unwrap();
@@ -140,7 +140,7 @@ mod request_format_tests {
             "stream": false
         });
 
-        let result = make_request(&ctx, "/v1/completions", payload).await;
+        let result = ctx.make_request( "/v1/completions", payload).await;
         assert!(result.is_ok());
 
         let payload = json!({
@@ -151,7 +151,7 @@ mod request_format_tests {
             "stream": false
         });
 
-        let result = make_request(&ctx, "/v1/completions", payload).await;
+        let result = ctx.make_request( "/v1/completions", payload).await;
         assert!(result.is_ok());
 
         ctx.shutdown().await;
@@ -177,7 +177,7 @@ mod request_format_tests {
             "stream": false
         });
 
-        let result = make_request(&ctx, "/generate", payload).await;
+        let result = ctx.make_request( "/generate", payload).await;
         assert!(result.is_ok());
 
         let payload = json!({
@@ -185,7 +185,7 @@ mod request_format_tests {
             "stream": false
         });
 
-        let result = make_request(&ctx, "/generate", payload).await;
+        let result = ctx.make_request( "/generate", payload).await;
         assert!(result.is_ok());
 
         ctx.shutdown().await;
@@ -208,7 +208,7 @@ mod request_format_tests {
             "stream": false
         });
 
-        let result = make_request(&ctx, "/generate", payload).await;
+        let result = ctx.make_request( "/generate", payload).await;
         assert!(result.is_ok());
 
         let payload = json!({
@@ -220,7 +220,7 @@ mod request_format_tests {
             "stream": false
         });
 
-        let result = make_request(&ctx, "/generate", payload).await;
+        let result = ctx.make_request( "/generate", payload).await;
         assert!(result.is_ok());
 
         let payload = json!({
@@ -233,7 +233,7 @@ mod request_format_tests {
             "stream": false
         });
 
-        let result = make_request(&ctx, "/generate", payload).await;
+        let result = ctx.make_request( "/generate", payload).await;
         assert!(result.is_ok());
 
         ctx.shutdown().await;
@@ -252,7 +252,7 @@ mod request_format_tests {
 
         let payload = json!({});
 
-        let result = make_request(&ctx, "/generate", payload).await;
+        let result = ctx.make_request( "/generate", payload).await;
         // Mock worker accepts empty body
         assert!(result.is_ok());
 
