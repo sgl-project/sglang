@@ -91,7 +91,7 @@ impl InFlightRequestTracker {
     fn sample_and_record(&self) {
         let counts = self.compute_bucket_counts();
         for (i, &label) in AGE_BUCKET_LABELS.iter().enumerate() {
-            Metrics::set_inflight_request_count(label, counts[i]);
+            Metrics::set_inflight_request_age_count(label, counts[i]);
         }
     }
 }
