@@ -5,6 +5,7 @@ python3 -m unittest openai_server.basic.test_openai_server.TestOpenAIServer.test
 python3 -m unittest openai_server.basic.test_openai_server.TestOpenAIServer.test_chat_completion_stream
 """
 
+import json
 import random
 import unittest
 from concurrent.futures import ThreadPoolExecutor
@@ -335,6 +336,36 @@ class TestOpenAIServer(CustomTestCase):
             for parallel_sample_num in [1, 2]:
                 self.run_chat_completion_stream(logprobs, parallel_sample_num)
 
+    def test_regex(self):
+        client = openai.Client(api_key=self.api_key, base_url=self.base_url)
+
+        regex = (
+            r"""\{\n"""
+            + r"""   "name": "[\w]+",\n"""
+            + r"""   "population": [\d]+\n"""
+            + r"""\}"""
+        )
+
+        response = client.chat.completions.create(
+            model=self.model,
+            messages=[
+                {"role": "system", "content": "You are a helpful AI assistant"},
+                {"role": "user", "content": "Introduce the capital of France."},
+            ],
+            temperature=0,
+            max_tokens=128,
+            extra_body={"regex": regex},
+        )
+        text = response.choices[0].message.content
+
+        try:
+            js_obj = json.loads(text)
+        except (TypeError, json.decoder.JSONDecodeError):
+            print("JSONDecodeError", text)
+            raise
+        assert isinstance(js_obj["name"], str)
+        assert isinstance(js_obj["population"], int)
+
     def test_penalty(self):
         client = openai.Client(api_key=self.api_key, base_url=self.base_url)
 
@@ -350,6 +381,44 @@ class TestOpenAIServer(CustomTestCase):
         )
         text = response.choices[0].message.content
         assert isinstance(text, str)
+
+    def test_response_prefill(self):
+        client = openai.Client(api_key=self.api_key, base_url=self.base_url)
+
+        response = client.chat.completions.create(
+            model="meta-llama/Llama-3.1-8B-Instruct",
+            messages=[
+                {"role": "system", "content": "You are a helpful AI assistant"},
+                {
+                    "role": "user",
+                    "content": """
+Extract the name, size, price, and color from this product description as a JSON object:
+
+<description>
+The SmartHome Mini is a compact smart home assistant available in black or white for only $49.99. At just 5 inches wide, it lets you control lights, thermostats, and other connected devices via voice or app—no matter where you place it in your home. This affordable little hub brings convenient hands-free control to your smart devices.
+</description>
+""",
+                },
+                {
+                    "role": "assistant",
+                    "content": "{\n",
+                },
+            ],
+            temperature=0,
+            extra_body={"continue_final_message": True},
+        )
+
+        assert (
+            response.choices[0]
+            .message.content.strip()
+            .startswith('"name": "SmartHome Mini",')
+        )
+
+    def test_model_list(self):
+        client = openai.Client(api_key=self.api_key, base_url=self.base_url)
+        models = list(client.models.list())
+        assert len(models) == 1
+        assert isinstance(getattr(models[0], "max_model_len", None), int)
 
     def test_retrieve_model(self):
         client = openai.Client(api_key=self.api_key, base_url=self.base_url)
@@ -599,6 +668,36 @@ class TestOpenAIServerv1Responses(CustomTestCase):
         assert saw_completed
         assert final_usage_ok or True  # final_usage's stats are not done for now
 
+    def test_regex(self):
+        client = openai.Client(api_key=self.api_key, base_url=self.base_url)
+
+        regex = (
+            r"""\{\n"""
+            + r"""   "name": "[\w]+",\n"""
+            + r"""   "population": [\d]+\n"""
+            + r"""\}"""
+        )
+
+        response = client.chat.completions.create(
+            model=self.model,
+            messages=[
+                {"role": "system", "content": "You are a helpful AI assistant"},
+                {"role": "user", "content": "Introduce the capital of France."},
+            ],
+            temperature=0,
+            max_tokens=128,
+            extra_body={"regex": regex},
+        )
+        text = response.choices[0].message.content
+
+        try:
+            js_obj = json.loads(text)
+        except (TypeError, json.decoder.JSONDecodeError):
+            print("JSONDecodeError", text)
+            raise
+        assert isinstance(js_obj["name"], str)
+        assert isinstance(js_obj["population"], int)
+
     def test_error(self):
         url = f"{self.base_url}/responses"
         headers = {
@@ -640,6 +739,44 @@ class TestOpenAIServerv1Responses(CustomTestCase):
         if "usage" in body:
             self.assertIn("prompt_tokens", body["usage"])
             self.assertIn("total_tokens", body["usage"])
+
+    def test_response_prefill(self):
+        client = openai.Client(api_key=self.api_key, base_url=self.base_url)
+
+        response = client.chat.completions.create(
+            model="meta-llama/Llama-3.1-8B-Instruct",
+            messages=[
+                {"role": "system", "content": "You are a helpful AI assistant"},
+                {
+                    "role": "user",
+                    "content": """
+Extract the name, size, price, and color from this product description as a JSON object:
+
+<description>
+The SmartHome Mini is a compact smart home assistant available in black or white for only $49.99. At just 5 inches wide, it lets you control lights, thermostats, and other connected devices via voice or app—no matter where you place it in your home. This affordable little hub brings convenient hands-free control to your smart devices.
+</description>
+""",
+                },
+                {
+                    "role": "assistant",
+                    "content": "{\n",
+                },
+            ],
+            temperature=0,
+            extra_body={"continue_final_message": True},
+        )
+
+        assert (
+            response.choices[0]
+            .message.content.strip()
+            .startswith('"name": "SmartHome Mini",')
+        )
+
+    def test_model_list(self):
+        client = openai.Client(api_key=self.api_key, base_url=self.base_url)
+        models = list(client.models.list())
+        assert len(models) == 1
+        assert isinstance(getattr(models[0], "max_model_len", None), int)
 
 
 class TestOpenAIV1Rerank(CustomTestCase):
