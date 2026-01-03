@@ -24,6 +24,10 @@ from sglang.srt.debug_utils.schedule_simulator.simulator import (
     Simulator,
     StepRecord,
 )
+from sglang.srt.debug_utils.schedule_simulator.entrypoint import (
+    create_arg_parser,
+    main,
+)
 
 __all__ = [
     "SimRequest",
@@ -43,5 +47,7 @@ __all__ = [
     "AttentionBalancednessRecorder",
     "load_from_request_logger",
     "generate_random_requests",
+    "create_arg_parser",
+    "main",
 ]
 
