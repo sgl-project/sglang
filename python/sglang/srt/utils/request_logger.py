@@ -42,6 +42,7 @@ class _RequestLoggerTarget:
     def _setup_logger(self) -> logging.Logger:
         if self.target.lower() == "stdout":
             json_logger = logging.getLogger(f"{__name__}.stdout")
+            json_logger.setLevel(logging.INFO)
             json_logger.propagate = False
             if not json_logger.handlers:
                 handler = logging.StreamHandler()
