@@ -1,0 +1,45 @@
+from abc import ABC, abstractmethod
+from typing import Any, Callable, Dict, List
+
+from sglang.srt.debug_utils.schedule_simulator.gpu_state import GPUState
+
+
+class MetricRecorder(ABC):
+    @abstractmethod
+    def on_step_end(self, step: int, gpu_states: List[GPUState]) -> None: ...
+
+    @abstractmethod
+    def get_summary(self) -> Dict[str, Any]: ...
+
+
+class BalancednessRecorder(MetricRecorder):
+    def __init__(self, name: str, value_fn: Callable[[GPUState], float]):
+        self._name = name
+        self._value_fn = value_fn
+        self._history: List[float] = []
+
+    def on_step_end(self, step: int, gpu_states: List[GPUState]) -> None:
+        values = [self._value_fn(gpu) for gpu in gpu_states]
+        max_val = max(values) if values else 0
+        mean_val = sum(values) / len(values) if values else 0
+        balancedness = mean_val / max_val if max_val > 0 else 1.0
+        self._history.append(balancedness)
+
+    def get_summary(self) -> Dict[str, Any]:
+        if not self._history:
+            return {f"{self._name}_mean": 0.0}
+        return {
+            f"{self._name}_mean": sum(self._history) / len(self._history),
+            f"{self._name}_min": min(self._history),
+            f"{self._name}_max": max(self._history),
+        }
+
+
+def BatchSizeBalancednessRecorder() -> BalancednessRecorder:
+    return BalancednessRecorder("batch_size_balancedness", lambda gpu: gpu.batch_size())
+
+
+def AttentionBalancednessRecorder() -> BalancednessRecorder:
+    return BalancednessRecorder(
+        "attention_balancedness", lambda gpu: gpu.total_seq_len()
+    )

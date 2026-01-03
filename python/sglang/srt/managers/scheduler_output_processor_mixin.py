@@ -71,6 +71,17 @@ class SchedulerOutputProcessorMixin:
             req_to_token_pool=self.req_to_token_pool,
         )
 
+    def maybe_collect_customized_info(
+        self: Scheduler, i: int, req: Req, logits_output: LogitsProcessorOutput
+    ):
+        if logits_output is not None and logits_output.customized_info is not None:
+            if req.customized_info is None:
+                req.customized_info = {}
+            for k, v in logits_output.customized_info.items():
+                if k not in req.customized_info:
+                    req.customized_info[k] = []
+                req.customized_info[k].append(v[i])
+
     def process_batch_result_prefill(
         self: Scheduler,
         batch: ScheduleBatch,
@@ -131,6 +142,8 @@ class SchedulerOutputProcessorMixin:
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
                         # This updates radix so others can match
                         self.tree_cache.cache_unfinished_req(req)
+
+                    self.maybe_collect_customized_info(i, req, logits_output)
 
                     if batch.return_logprob:
                         assert extend_logprob_start_len_per_req is not None
@@ -417,6 +430,8 @@ class SchedulerOutputProcessorMixin:
                     release_kv_cache(req, self.tree_cache)
 
                 req.time_stats.completion_time = time.perf_counter()
+
+            self.maybe_collect_customized_info(i, req, logits_output)
 
             if req.return_logprob and batch.spec_algorithm.is_none():
                 # speculative worker handles logprob in speculative decoding
@@ -860,6 +875,7 @@ class SchedulerOutputProcessorMixin:
         output_hidden_states = None
         load = self.get_load()
         output_routed_experts = None
+        customized_info = {}
 
         queue_times = []
         forward_entry_times = []
@@ -1060,6 +1076,12 @@ class SchedulerOutputProcessorMixin:
                         output_routed_experts = []
                     output_routed_experts.append(req.routed_experts)
 
+                if req.customized_info is not None:
+                    for k, v in req.customized_info.items():
+                        if k not in customized_info:
+                            customized_info[k] = []
+                        customized_info[k].append(v)
+
             if (
                 req.finished()
                 and self.attn_tp_rank == 0
@@ -1110,6 +1132,7 @@ class SchedulerOutputProcessorMixin:
                     output_token_entropy_val=None,
                     output_hidden_states=output_hidden_states,
                     output_routed_experts=output_routed_experts,
+                    customized_info=customized_info,
                     placeholder_tokens_idx=None,
                     placeholder_tokens_val=None,
                     retraction_counts=retraction_counts,
