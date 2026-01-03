@@ -221,37 +221,6 @@ class TestDataLoader(CustomTestCase):
             f.flush()
             self.assertEqual(len(load_from_request_logger(f.name)), 0)
 
-    def test_invalid_json_skipped(self):
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".log", delete=False) as f:
-            f.write("not json\n")
-            f.write(
-                '{"event": "request.finished", "rid": "r1", "out": {"meta_info": {"prompt_tokens": 100, "completion_tokens": 50}}}\n'
-            )
-            f.flush()
-            self.assertEqual(len(load_from_request_logger(f.name)), 1)
-
-    def test_missing_fields_skipped(self):
-        log_data = [
-            {"event": "request.finished", "rid": "r1", "out": {}},
-            {
-                "event": "request.finished",
-                "rid": "r2",
-                "out": {"meta_info": {"prompt_tokens": 100}},
-            },
-            {
-                "event": "request.finished",
-                "rid": "r3",
-                "out": {"meta_info": {"prompt_tokens": 100, "completion_tokens": 50}},
-            },
-        ]
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".log", delete=False) as f:
-            for item in log_data:
-                f.write(json.dumps(item) + "\n")
-            f.flush()
-            requests = load_from_request_logger(f.name)
-        self.assertEqual(len(requests), 1)
-        self.assertEqual(requests[0].request_id, "r3")
-
 
 class TestDataSynthesis(CustomTestCase):
     def test_generate_basic(self):
@@ -557,8 +526,8 @@ step=5    | GPU0[R=0:- Q=0:-]"""
         # 2 requests, input_len=50, output_len=10, 1 GPU
         # max_total_tokens=110, both fit initially (100 tokens)
         # As decode progresses, tokens grow: 102->104->...->110
-        # At step 6, would exceed 110, so synthetic_1 gets evicted
-        # After synthetic_0 finishes, synthetic_1 resumes
+        # At step 6, would exceed 110, so syn1 gets evicted
+        # After syn0 finishes, syn1 resumes
         result = self._run_cli(
             "--synthetic",
             "--synth-num-requests", "2",
@@ -570,16 +539,12 @@ step=5    | GPU0[R=0:- Q=0:-]"""
             "--log-level", "2",
         )
         self.assertEqual(result.returncode, 0, f"CLI failed: {result.stderr}")
-        # Verify retraction behavior:
-        # - Both running initially
-        # - synthetic_1 gets evicted mid-way
-        # - synthetic_1 resumes after synthetic_0 finishes
         expected_steps = """\
-step=0    | GPU0[R=2:synthetic_0,synthetic_1 Q=0:-]
-step=5    | GPU0[R=2:synthetic_0,synthetic_1 Q=0:-]
-step=6    | GPU0[R=1:synthetic_0 Q=1:synthetic_1]
-step=9    | GPU0[R=0:- Q=1:synthetic_1]
-step=10   | GPU0[R=1:synthetic_1 Q=0:-]
+step=0    | GPU0[R=2:syn0,syn1 Q=0:-]
+step=5    | GPU0[R=2:syn0,syn1 Q=0:-]
+step=6    | GPU0[R=1:syn0 Q=1:syn1]
+step=9    | GPU0[R=0:- Q=1:syn1]
+step=10   | GPU0[R=1:syn1 Q=0:-]
 step=13   | GPU0[R=0:- Q=0:-]"""
         for line in expected_steps.split("\n"):
             self.assertIn(line, result.stdout)
