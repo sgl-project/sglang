@@ -79,9 +79,9 @@ def _create_router(name: str):
     return RandomRouter() if name == "random" else RoundRobinRouter()
 
 
-def _create_scheduler(name: str, max_total_tokens: int):
+def _create_scheduler(name: str):
     if name == "fifo":
-        return FIFOScheduler(max_total_tokens=max_total_tokens)
+        return FIFOScheduler()
     raise ValueError(f"Unknown scheduler: {name}")
 
 
