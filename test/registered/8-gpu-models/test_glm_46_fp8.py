@@ -39,11 +39,13 @@ class TestGLM46FP8Unified(unittest.TestCase):
                 GLM_4_6_FP8_MODEL_PATH,
                 tp_size=8,
                 extra_args=base_args,
+                variant="TP8",
             ),
             ModelLaunchSettings(
                 GLM_4_6_FP8_MODEL_PATH,
                 tp_size=8,
                 extra_args=base_args + mtp_args,
+                variant="TP8+MTP",
             ),
         ]
 
