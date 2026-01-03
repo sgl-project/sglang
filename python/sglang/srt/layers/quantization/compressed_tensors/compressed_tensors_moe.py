@@ -14,7 +14,10 @@ from compressed_tensors.quantization import QuantizationStrategy
 from sglang.srt.distributed import (
     get_moe_expert_parallel_rank,
     get_tensor_model_parallel_world_size,
+    get_tp_group,
 )
+from sglang.srt.layers.dp_attention import is_allocation_symmetric
+
 from sglang.srt.layers.moe import (
     MoeRunner,
     MoeRunnerBackend,
@@ -48,6 +51,9 @@ from sglang.srt.utils import (
     is_hip,
     set_weight_attrs,
 )
+from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+    use_symmetric_memory,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
@@ -74,6 +80,8 @@ if is_flashinfer_available():
     from flashinfer.fused_moe import (
         convert_to_block_layout,
         trtllm_mxint4_block_scale_moe,
+        trtllm_bf16_moe,
+        WeightLayout,
     )
     from flashinfer.fused_moe.core import (
         _maybe_get_cached_w3_w1_permute_indices,
@@ -1218,7 +1226,7 @@ class CompressedTensorsMxInt4MoEMethod(CompressedTensorsMoEMethod):
 
             block_k = 128
             gemm1_weights_shuffled = convert_to_block_layout(
-                gemm1_weights_shuffled, block_k
+                gemm1_weights_shuffled.view(torch.uint8), block_k
             )
             gemm2_weights_shuffled = convert_to_block_layout(
                 gemm2_weights_shuffled.view(torch.uint8), block_k
@@ -1287,12 +1295,24 @@ class CompressedTensorsMxInt4MoEMethod(CompressedTensorsMoEMethod):
         )
 
         local_num_experts = self.moe_runner_config.num_local_experts
-        routing_method_type = self.moe_runner_config.routing_method_type
+        routing_method_type = layer.routing_method_type
+        assert routing_method_type is not None
         # DeepSeekV3 style routing requires float32 router logits,
         # see this PR for details: https://github.com/flashinfer-ai/flashinfer/commit/d84e1d560da0a27961c19ca788d96c19cb9dcfb6
         if routing_method_type == RoutingMethodType.DeepSeekV3:
             router_logits = router_logits.to(torch.float32)
+        routed_scaling_factor = self.moe_runner_config.routed_scaling_factor
+        routed_scaling_factor = (
+            routed_scaling_factor if routed_scaling_factor is not None else 1.0
+        )
 
+        with use_symmetric_memory(
+            get_tp_group(), disabled=not is_allocation_symmetric()
+        ):
+            num_tokens = x.shape[0]
+            hidden_size = x.shape[-1]
+            symm_output = torch.empty(num_tokens, hidden_size, dtype=torch.bfloat16, device=x.device)
+        
         output = trtllm_mxint4_block_scale_moe(
             routing_logits=router_logits,  # float
             routing_bias=correction_bias,
@@ -1311,8 +1331,9 @@ class CompressedTensorsMxInt4MoEMethod(CompressedTensorsMoEMethod):
             intermediate_size=self.moe_runner_config.intermediate_size_per_partition,
             local_expert_offset=self.moe_ep_rank * local_num_experts,
             local_num_experts=local_num_experts,
-            routed_scaling_factor=self.moe_runner_config.routed_scaling_factor,
+            routed_scaling_factor=routed_scaling_factor,
             routing_method_type=routing_method_type,
+            output=symm_output,
         )
 
         return StandardCombineInput(hidden_states=output)
