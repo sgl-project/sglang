@@ -669,7 +669,7 @@ class RouterArgs:
             f"--{prefix}history-backend",
             type=str,
             default=RouterArgs.history_backend,
-            choices=["memory", "none", "oracle", "postgres"],
+            choices=["memory", "none", "oracle", "postgres", "redis"],
             help="History storage backend for conversations and responses (default: memory)",
         )
 
