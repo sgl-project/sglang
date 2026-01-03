@@ -104,6 +104,14 @@ def _extract_field_by_index(
     if field is None:
         return None
 
+    if isinstance(field, dict):
+        new_field = {}
+        for k, v in field.items():
+            if len(v) <= index:
+                new_field[k] = None
+            new_field[k] = v[index]
+        return new_field
+
     if check_length:
         if len(field) <= index:
             return None
@@ -273,6 +281,9 @@ def _handle_output_by_index(output, i):
             output_routed_experts=_extract_field_by_index(
                 output, "output_routed_experts", i, check_length=False
             ),
+            customized_info=_extract_field_by_index(
+                output, "customized_info", i, check_length=False
+            ),
             placeholder_tokens_idx=None,
             placeholder_tokens_val=None,
             retraction_counts=_extract_field_by_index(output, "retraction_counts", i),
@@ -358,8 +369,8 @@ class MultiTokenizerRouter:
 
     async def router_worker_obj(self):
         while True:
-            recv_obj = await self.receive_from_worker.recv_pyobj()
-            await self.send_to_scheduler.send_pyobj(recv_obj)
+            parts = await self.receive_from_worker.recv_multipart(copy=False)
+            await self.send_to_scheduler.send_multipart(parts, copy=False)
 
     async def handle_loop(self):
         # special reqs will recv from scheduler, need to route to right worker
@@ -514,3 +525,10 @@ class SenderWrapper:
         if isinstance(obj, BaseReq):
             obj.http_worker_ipc = self.port_args.tokenizer_ipc_name
         self.send_to_scheduler.send_pyobj(obj)
+
+    def send_multipart(self, parts, copy=False):
+        obj = pickle.loads(parts[1])
+        if isinstance(obj, BaseReq):
+            obj.http_worker_ipc = self.port_args.tokenizer_ipc_name
+            parts = [parts[0], pickle.dumps(obj)] + list(parts[2:])
+        self.send_to_scheduler.send_multipart(parts, copy=copy)
