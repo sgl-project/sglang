@@ -41,12 +41,7 @@ suites = {
         TestFile("openai_server/validation/test_openai_server_ignore_eos.py", 6),
         TestFile("openai_server/validation/test_request_length_validation.py", 38),
         TestFile("ops/test_repeat_interleave.py", 60),
-        TestFile("quant/test_block_int8.py", 44),
-        TestFile("quant/test_fp8_kernel.py", 10),
-        TestFile("quant/test_int8_kernel.py", 8),
-        TestFile("quant/test_triton_scaled_mm.py", 8),
-        TestFile("quant/test_w8a8_quantization.py", 160),
-        TestFile("quant/test_autoround.py", 77),
+        # quant tests moved to test/registered/quant/
         TestFile("rl/test_fp32_lm_head.py", 9),
         # TestFile("rl/test_update_weights_from_disk.py", 210),  # Temporarily disabled, see https://github.com/sgl-project/sglang/pull/13998
         TestFile("rl/test_update_weights_from_tensor.py", 195),
@@ -226,10 +221,7 @@ suite_amd = {
         TestFile("openai_server/validation/test_openai_server_ignore_eos.py", 85),
         TestFile("openai_server/validation/test_request_length_validation.py", 31),
         TestFile("ops/test_repeat_interleave.py", 75),
-        TestFile("quant/test_awq_dequant.py", 2),
-        TestFile("quant/test_block_int8.py", 22),
-        TestFile("quant/test_fused_rms_fp8_group_quant.py", 10),
-        TestFile("quant/test_triton_scaled_mm.py", 12),
+        # quant tests moved to test/registered/quant/
         TestFile("rl/test_fp32_lm_head.py", 15),
         # TestFile("rl/test_update_weights_from_disk.py", 210),  # Temporarily disabled, see https://github.com/sgl-project/sglang/pull/13998
         TestFile("rotary_embedding/test_mrope.py", 15),
