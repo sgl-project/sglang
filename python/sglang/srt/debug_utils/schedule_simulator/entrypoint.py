@@ -4,6 +4,16 @@ from typing import List
 
 import polars as pl
 
+from sglang.srt.debug_utils.schedule_simulator import (
+    AttentionBalancednessRecorder,
+    BatchSizeBalancednessRecorder,
+    FIFOScheduler,
+    RandomRouter,
+    RoundRobinRouter,
+    Simulator,
+    generate_random_requests,
+    load_from_request_logger,
+)
 from sglang.srt.debug_utils.schedule_simulator.request import SimRequest
 
 
@@ -39,11 +49,6 @@ def create_arg_parser() -> argparse.ArgumentParser:
 
 
 def _load_requests(args: argparse.Namespace) -> List[SimRequest]:
-    from sglang.srt.debug_utils.schedule_simulator import (
-        generate_random_requests,
-        load_from_request_logger,
-    )
-
     if args.input:
         requests = load_from_request_logger(args.input)
         print(f"Loaded {len(requests)} requests from {args.input}")
@@ -65,26 +70,16 @@ def _load_requests(args: argparse.Namespace) -> List[SimRequest]:
 
 
 def _create_router(name: str):
-    from sglang.srt.debug_utils.schedule_simulator import RandomRouter, RoundRobinRouter
-
     return RandomRouter() if name == "random" else RoundRobinRouter()
 
 
 def _create_scheduler(name: str, max_total_tokens: int):
-    from sglang.srt.debug_utils.schedule_simulator import FIFOScheduler
-
     if name == "fifo":
         return FIFOScheduler(max_total_tokens=max_total_tokens)
     raise ValueError(f"Unknown scheduler: {name}")
 
 
 def main(args: argparse.Namespace) -> pl.DataFrame:
-    from sglang.srt.debug_utils.schedule_simulator import (
-        AttentionBalancednessRecorder,
-        BatchSizeBalancednessRecorder,
-        Simulator,
-    )
-
     requests = _load_requests(args)
     router = _create_router(args.router)
     scheduler = _create_scheduler(args.scheduler, args.max_total_tokens)
