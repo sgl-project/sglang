@@ -32,7 +32,6 @@ class KimiK2_5VLImageProcessor(SGLangBaseProcessor):
         *args,
         **kwargs,
     ):
-        print(f"32 image_data: {image_data}")
         base_output = self.load_mm_data(
             prompt=input_text,
             image_data=image_data,
@@ -40,12 +39,10 @@ class KimiK2_5VLImageProcessor(SGLangBaseProcessor):
         )
         prompt = base_output.input_text
 
-        # print(f"39 base_output: {base_output}")
         mm_items, input_ids, _ = self.process_and_combine_mm_data(
             base_output, self.mm_tokens
         )
-        print(f"43 mm_items: {mm_items}")
-        print(f"44 input_ids: {input_ids}")
+
         return {
             "input_ids": input_ids.tolist(),
             "mm_items": mm_items,
@@ -70,7 +67,6 @@ class KimiK2_5VLImageProcessor(SGLangBaseProcessor):
                 {"type": "image", "image": image}
             )
             result.append(self.mm_tokens.image_token * num_tokens + part)
-            print(f"70 num_tokens: {num_tokens}")
 
         input_text = "".join(result)
 

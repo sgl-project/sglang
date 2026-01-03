@@ -85,11 +85,11 @@ KIMIV_VT_INFER_MAX_PATCH_NUM = 16328
 logger = logging.getLogger(__name__)
 
 
-def _apply_rope_input_validation(x, freqs_cis):
-    assert x.ndim == freqs_cis.ndim + 1, (x.shape, freqs_cis.shape)
-    assert x.shape[:-2] == freqs_cis.shape[:-1], (x.shape, freqs_cis.shape)
-    assert x.shape[-1] == 2 * freqs_cis.shape[-1], (x.shape, freqs_cis.shape)
-    assert freqs_cis.dtype == torch.complex64, freqs_cis.dtype
+# def _apply_rope_input_validation(x, freqs_cis):
+#     assert x.ndim == freqs_cis.ndim + 1, (x.shape, freqs_cis.shape)
+#     assert x.shape[:-2] == freqs_cis.shape[:-1], (x.shape, freqs_cis.shape)
+#     assert x.shape[-1] == 2 * freqs_cis.shape[-1], (x.shape, freqs_cis.shape)
+#     assert freqs_cis.dtype == torch.complex64, freqs_cis.dtype
 
 
 def apply_rope(
@@ -103,8 +103,8 @@ def apply_rope(
     Returns:
         xq_out, xk_out: tensors of shape (..., num_heads, head_dim)
     """
-    _apply_rope_input_validation(xq, freqs_cis)
-    _apply_rope_input_validation(xk, freqs_cis)
+    # _apply_rope_input_validation(xq, freqs_cis)
+    # _apply_rope_input_validation(xk, freqs_cis)
 
     freqs_cis = freqs_cis.unsqueeze(-2)  # ..., 1, head_dim/2
     # ..., num_heads, head_dim/2
@@ -143,18 +143,6 @@ def tpool_patch_merger(
         pre_sum += t * h * w
 
     return outputs
-
-
-class ProjectorConfig:
-    """配置对象，用于初始化 mm projector"""
-
-    def __init__(self, config: K2VLConfig):
-        self.mm_projector_type = config.mm_projector_type
-        self.mm_hidden_size = config.mm_hidden_size
-        self.hidden_size = config.text_config.hidden_size
-        self.merge_kernel_size = config.merge_kernel_size
-        self.projector_hidden_act = config.projector_hidden_act
-        self.projector_ln_eps = config.projector_ln_eps
 
 
 class VisionTowerConfig(PretrainedConfig):
@@ -198,8 +186,6 @@ class MoonViTEncoderLayer(nn.Module):
         self.norm0 = nn.LayerNorm(hidden_dim)
         self.norm1 = nn.LayerNorm(hidden_dim)
         self.mlp = MLP2([hidden_dim, mlp_dim, hidden_dim], activation)
-        # self.wqkv = nn.Linear(hidden_dim, hidden_dim * 3, bias=attn_bias)
-        # self.wo = nn.Linear(hidden_dim, hidden_dim, bias=attn_bias)
 
         self.attn = VisionAttention(
             embed_dim=hidden_dim,
@@ -215,46 +201,6 @@ class MoonViTEncoderLayer(nn.Module):
             customized_position_embedding_applier=apply_rope,
         )
 
-    # def attention_qkvpacked(
-    #     self,
-    #     x: torch.Tensor,
-    #     cu_seqlens: torch.Tensor,
-    #     max_seqlen: torch.Tensor,
-    #     rope_freqs_cis: torch.Tensor | None = None,
-    # ):
-    #     """
-    #     Args:
-    #         x (torch.Tensor): (batch_size, seqlen, hidden_dim)
-    #         cu_seqlens (torch.Tensor):
-    #     """
-    #     xqkv = self.wqkv(x)
-
-    #     qkv_shape = xqkv.size()[:-1] + (
-    #         3,
-    #         self.num_heads,
-    #         self.hidden_size_per_attention_head,
-    #     )
-    #     # xqkv: (batch_size, seqlen, 3, nheads, headdim)
-    #     xqkv = xqkv.view(*qkv_shape)
-    #     xq, xk, xv = torch.unbind(xqkv, dim=-3)
-
-    #     xq, xk = apply_rope(xq, xk, rope_freqs_cis)
-
-    #     # attn_func = VL_VISION_ATTENTION_FUNCTIONS[self.attn_implementation]
-    #     # attn_out = attn_func(
-    #     #     xq,
-    #     #     xk,
-    #     #     xv,
-    #     #     q_cu_seqlens=cu_seqlens,
-    #     #     k_cu_seqlens=cu_seqlens,
-    #     #     max_seqlen_k=max_seqlen,
-    #     #     max_seqlen_q=max_seqlen,
-    #     #     # deterministic=self.use_deterministic_attn,
-    #     # )
-
-    #     attn_out = self.wo(attn_out)
-    #     return attn_out
-
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -265,10 +211,6 @@ class MoonViTEncoderLayer(nn.Module):
         residual = hidden_states
         hidden_states = self.norm0(hidden_states)
 
-        # hidden_states = self.attention_qkvpacked(
-        #     hidden_states, cu_seqlens, max_seqlen, rope_freqs_cis
-        # )
-        torch.save(hidden_states, "/sgl-workspace/sgl_before_attn.pt")
         hidden_states = self.attn(
             hidden_states,
             cu_seqlens=cu_seqlens,
@@ -348,15 +290,6 @@ def get_1d_sincos_pos_embed(embed_dim, t_size, cls_token=False):
     if cls_token:
         pos_embed = np.concatenate([np.zeros([1, embed_dim]), pos_embed], axis=0)
     return pos_embed
-
-
-class IdentityMap(nn.Module):
-
-    def __init__(self):
-        super().__init__()
-
-    def forward(self, x, *args, **kwargs):
-        return x
 
 
 class Learnable2DInterpPosEmbDivided_fixed(nn.Module):
@@ -596,16 +529,16 @@ class MoonViT3dEncoder(nn.Module):
         max_seqlen = lengths.max()
         cu_seqlens = lengths.to(hidden_states.device).cumsum(dim=0, dtype=torch.int32)
 
-        def custom(start, end):
+        # def custom(start, end):
 
-            def custom_forward(*args, **kwargs):
-                hidden_states_, *args = args
-                for index in range(start, end):
-                    layer = self.blocks[index]
-                    hidden_states_ = layer(hidden_states_, *args, **kwargs)
-                return hidden_states_
+        #     def custom_forward(*args, **kwargs):
+        #         hidden_states_, *args = args
+        #         for index in range(start, end):
+        #             layer = self.blocks[index]
+        #             hidden_states_ = layer(hidden_states_, *args, **kwargs)
+        #         return hidden_states_
 
-            return custom_forward
+        #     return custom_forward
 
         for block in self.blocks:
             hidden_states = block(
@@ -675,14 +608,10 @@ class MoonViT3dPretrainedModel(nn.Module):
         assert grid_thws.size(1) == 3, f"No support for _thw: {grid_thws}"
         hidden_states = self.patch_embed(pixel_values, grid_thws)
         hidden_states = self.encoder(hidden_states, grid_thws)
-        if (
-            self.merge_type == "sd2_tpool"
-        ):  # spatial downsampling 2x with temporal pooling all
-            hidden_states = tpool_patch_merger(
-                hidden_states, grid_thws, merge_kernel_size=self.merge_kernel_size
-            )
-        else:
-            raise NotImplementedError(f"Not support {self.merge_type}")
+        # spatial downsampling 2x with temporal pooling all
+        hidden_states = tpool_patch_merger(
+            hidden_states, grid_thws, merge_kernel_size=self.merge_kernel_size
+        )
 
         return hidden_states
 
@@ -723,7 +652,6 @@ class K2VLMultiModalProjector(nn.Module):
         hidden_states, _ = self.linear_1(hidden_states)
         hidden_states = self.act(hidden_states)
         hidden_states, _ = self.linear_2(hidden_states)
-        print(f"733 {hidden_states.shape=}")
         return hidden_states
 
 
@@ -806,19 +734,17 @@ class K2VLForConditionalGeneration(nn.Module):
     ) -> None:
         super().__init__()
         self.config = config
-        # 创建 vision tower
+        # Create vision tower
         vt_config = VisionTowerConfig(config)
         self.vision_tower = MoonViT3dPretrainedModel(vt_config)
 
-        # 创建 mm projector
+        # Create mm projector
         self.mm_projector = K2VLMultiModalProjector(config)
 
         self.language_model = DeepseekV3ForCausalLM(config.text_config, quant_config)
 
-        # print(f"{config.text_config=}")
-
-        # 确保vision_tower和mm_projector的dtype与language_model一致
-        # 这解决了使用device_map="auto"和torch_dtype时的dtype不匹配问题
+        # Ensure that the dtype of the vision_tower and mm_projector matches that of the language_model.
+        # This solves the dtype mismatch issue when using device_map="auto" and torch_dtype.
         if hasattr(self.language_model, "dtype"):
             target_dtype = self.language_model.dtype
             self.vision_tower = self.vision_tower.to(dtype=target_dtype)
@@ -834,20 +760,13 @@ class K2VLForConditionalGeneration(nn.Module):
 
         target_dtype = self.vision_tower.patch_embed.proj.weight.dtype
         pixel_values = pixel_values.to(target_dtype)
-        print(f"418 {pixel_values.shape=}\n{grid_thws.shape=}\n")
-        print(f"419 {grid_thws=}")
-        torch.save(pixel_values, "/sgl-workspace/sgl_pixel_values.pt")
         image_features = vision_tower_forward_auto(
             self.vision_tower,
             pixel_values,
             grid_thws,
             mm_projector=self.mm_projector,
         )
-        torch.save(image_features, "/sgl-workspace/sgl_image_features.pt")
-        # image_features = self.vision_tower(pixel_values, grid_thws)
-        print(f"421 {len(image_features)=}")
         image_features = torch.cat(image_features, dim=0)
-        print(f"423 {image_features.shape=}")
         return image_features
 
     def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
