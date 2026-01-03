@@ -74,11 +74,6 @@ __always_inline __device__ auto offset(const T* ptr, U... offset) -> const void*
 
 }  // namespace pointer
 
-template <typename T, std::size_t N>
-struct device_vec {
-  T data[N];
-};
-
 template <bool kUsePDL>
 __forceinline__ __device__ void PDLWaitPrimary() {
 #ifndef USE_ROCM
