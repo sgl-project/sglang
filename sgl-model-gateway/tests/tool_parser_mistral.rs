@@ -165,7 +165,7 @@ async fn test_mistral_streaming_closing_bracket() {
 
     let tools = vec![Tool {
         tool_type: "function".to_string(),
-        function: sgl_model_gateway::protocols::common::Function {
+        function: smg::protocols::common::Function {
             name: "get_weather".to_string(),
             description: Some("Get weather".to_string()),
             parameters: json!({}),
@@ -225,7 +225,7 @@ async fn test_mistral_streaming_bracket_in_text_after_tools() {
 
     let tools = vec![Tool {
         tool_type: "function".to_string(),
-        function: sgl_model_gateway::protocols::common::Function {
+        function: smg::protocols::common::Function {
             name: "get_weather".to_string(),
             description: Some("Get weather".to_string()),
             parameters: json!({}),

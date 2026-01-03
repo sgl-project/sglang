@@ -161,14 +161,14 @@ async fn test_router_with_tracing() {
             log_dir: None,
             colorize: false,
             log_file_name: "test-otel".to_string(),
-            log_targets: Some(vec!["sgl_model_gateway".to_string()]),
+            log_targets: Some(vec!["smg".to_string()]),
         },
         Some(trace_config),
     );
     println!("Logging initialized with OTEL layer");
 
     // 5. Create a span and sleep for a while
-    let _span = info_span!(target: "sgl_model_gateway::otel-trace", "test_router_with_tracing");
+    let _span = info_span!(target: "smg::otel-trace", "test_router_with_tracing");
     tokio::time::sleep(Duration::from_secs(1)).await;
     drop(_span);
 
@@ -315,7 +315,7 @@ async fn test_grpc_trace_context_injection() {
     // 4. Test within a span context
     tracing::subscriber::with_default(subscriber, || {
         // Create a span that will be exported to OTEL
-        let span = info_span!(target: "sgl_model_gateway::otel-trace", "test_grpc_span");
+        let span = info_span!(target: "smg::otel-trace", "test_grpc_span");
         let _guard = span.enter();
 
         // Create empty gRPC metadata

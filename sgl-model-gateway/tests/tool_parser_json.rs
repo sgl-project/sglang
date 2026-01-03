@@ -174,7 +174,7 @@ async fn test_json_array_streaming_required_mode() {
     // Define test tools
     let tools = vec![Tool {
         tool_type: "function".to_string(),
-        function: sgl_model_gateway::protocols::common::Function {
+        function: smg::protocols::common::Function {
             name: "get_weather".to_string(),
             description: Some("Get weather".to_string()),
             parameters: serde_json::json!({}),
@@ -248,7 +248,7 @@ async fn test_json_array_multiple_tools_streaming() {
     let tools = vec![
         Tool {
             tool_type: "function".to_string(),
-            function: sgl_model_gateway::protocols::common::Function {
+            function: smg::protocols::common::Function {
                 name: "get_weather".to_string(),
                 description: Some("Get weather".to_string()),
                 parameters: serde_json::json!({}),
@@ -257,7 +257,7 @@ async fn test_json_array_multiple_tools_streaming() {
         },
         Tool {
             tool_type: "function".to_string(),
-            function: sgl_model_gateway::protocols::common::Function {
+            function: smg::protocols::common::Function {
                 name: "get_news".to_string(),
                 description: Some("Get news".to_string()),
                 parameters: serde_json::json!({}),
@@ -312,7 +312,7 @@ async fn test_json_array_closing_bracket_separate_chunk() {
 
     let tools = vec![Tool {
         tool_type: "function".to_string(),
-        function: sgl_model_gateway::protocols::common::Function {
+        function: smg::protocols::common::Function {
             name: "get_weather".to_string(),
             description: Some("Get weather".to_string()),
             parameters: json!({}),
@@ -373,7 +373,7 @@ async fn test_json_single_object_with_trailing_text() {
 
     let tools = vec![Tool {
         tool_type: "function".to_string(),
-        function: sgl_model_gateway::protocols::common::Function {
+        function: smg::protocols::common::Function {
             name: "get_weather".to_string(),
             description: Some("Get weather".to_string()),
             parameters: serde_json::json!({}),
@@ -427,7 +427,7 @@ async fn test_json_single_object_with_bracket_in_text() {
 
     let tools = vec![Tool {
         tool_type: "function".to_string(),
-        function: sgl_model_gateway::protocols::common::Function {
+        function: smg::protocols::common::Function {
             name: "get_weather".to_string(),
             description: Some("Get weather".to_string()),
             parameters: serde_json::json!({}),
@@ -479,7 +479,7 @@ async fn test_json_array_bracket_in_text_after_tools() {
 
     let tools = vec![Tool {
         tool_type: "function".to_string(),
-        function: sgl_model_gateway::protocols::common::Function {
+        function: smg::protocols::common::Function {
             name: "get_weather".to_string(),
             description: Some("Get weather".to_string()),
             parameters: serde_json::json!({}),

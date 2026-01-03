@@ -95,10 +95,7 @@ pub async fn create_test_context(config: RouterConfig) -> Arc<AppContext> {
 
     // Initialize JobQueue after AppContext is created
     let weak_context = Arc::downgrade(&app_context);
-    let job_queue = sgl_model_gateway::core::JobQueue::new(
-        sgl_model_gateway::core::JobQueueConfig::default(),
-        weak_context,
-    );
+    let job_queue = smg::core::JobQueue::new(smg::core::JobQueueConfig::default(), weak_context);
     app_context
         .worker_job_queue
         .set(job_queue)
@@ -231,10 +228,7 @@ pub async fn create_test_context_with_parsers(config: RouterConfig) -> Arc<AppCo
 
     // Initialize JobQueue after AppContext is created
     let weak_context = Arc::downgrade(&app_context);
-    let job_queue = sgl_model_gateway::core::JobQueue::new(
-        sgl_model_gateway::core::JobQueueConfig::default(),
-        weak_context,
-    );
+    let job_queue = smg::core::JobQueue::new(smg::core::JobQueueConfig::default(), weak_context);
     app_context
         .worker_job_queue
         .set(job_queue)
@@ -367,10 +361,7 @@ pub async fn create_test_context_with_mcp_config(
 
     // Initialize JobQueue after AppContext is created
     let weak_context = Arc::downgrade(&app_context);
-    let job_queue = sgl_model_gateway::core::JobQueue::new(
-        sgl_model_gateway::core::JobQueueConfig::default(),
-        weak_context,
-    );
+    let job_queue = smg::core::JobQueue::new(smg::core::JobQueueConfig::default(), weak_context);
     app_context
         .worker_job_queue
         .set(job_queue)
