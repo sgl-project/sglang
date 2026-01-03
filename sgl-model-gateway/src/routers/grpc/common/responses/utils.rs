@@ -15,7 +15,7 @@ use crate::{
         responses::{ResponseTool, ResponseToolType, ResponsesRequest, ResponsesResponse},
     },
     routers::{
-        conversations::persist_conversation_items, error, responses::ensure_request_mcp_client,
+        conversations::persist_conversation_items, error, mcp::ensure_request_mcp_client,
     },
 };
 

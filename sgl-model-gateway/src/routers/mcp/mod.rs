@@ -1,6 +1,6 @@
-//! Shared responses module.
+//! Shared MCP (Model Context Protocol) utilities for routers.
 //!
-//! This module provides shared utilities for the Responses API that can be
+//! This module provides shared MCP-related functionality that can be
 //! used across different router implementations (OpenAI, gRPC regular, gRPC harmony).
 
 mod mcp_connection;

@@ -44,7 +44,7 @@ use crate::{
     routers::{
         conversations::persist_conversation_items,
         header_utils::{apply_request_headers, preserve_response_headers},
-        responses::ensure_request_mcp_client,
+        mcp::ensure_request_mcp_client,
     },
 };
 
