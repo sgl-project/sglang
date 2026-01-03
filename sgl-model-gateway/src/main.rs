@@ -812,8 +812,6 @@ impl CliArgs {
         Ok(rcf)
     }
 
-    
-
     fn to_router_config(
         &self,
         prefill_urls: Vec<(String, Option<u16>)>,
@@ -910,7 +908,6 @@ impl CliArgs {
             None
         };
 
-
         let builder = RouterConfig::builder()
             .mode(mode)
             .policy(policy)
@@ -967,6 +964,7 @@ impl CliArgs {
             .maybe_chat_template(self.chat_template.as_ref())
             .maybe_oracle(oracle)
             .maybe_postgres(postgres)
+            .maybe_redis(redis)
             .maybe_reasoning_parser(self.reasoning_parser.as_ref())
             .maybe_tool_call_parser(self.tool_call_parser.as_ref())
             .maybe_mcp_config_path(self.mcp_config_path.as_ref())

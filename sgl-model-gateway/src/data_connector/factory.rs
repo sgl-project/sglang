@@ -15,12 +15,15 @@ use super::{
 };
 use crate::{
     config::{HistoryBackend, OracleConfig, PostgresConfig, RedisConfig, RouterConfig},
-    data_connector::postgres::{
-        PostgresConversationItemStorage, PostgresConversationStorage, PostgresResponseStorage,
-        PostgresStore,
-    },
-    data_connector::redis::{
-        RedisConversationItemStorage, RedisConversationStorage, RedisResponseStorage, RedisStore,
+    data_connector::{
+        postgres::{
+            PostgresConversationItemStorage, PostgresConversationStorage, PostgresResponseStorage,
+            PostgresStore,
+        },
+        redis::{
+            RedisConversationItemStorage, RedisConversationStorage, RedisResponseStorage,
+            RedisStore,
+        },
     },
 };
 
