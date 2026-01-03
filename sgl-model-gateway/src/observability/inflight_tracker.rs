@@ -11,7 +11,6 @@ use dashmap::DashMap;
 use super::metrics::Metrics;
 use crate::policies::utils::PeriodicTask;
 
-// Age buckets in seconds: 30s, 1m, 3m, 5m, 10m, 20m, 1h, 2h, 4h, 8h, 24h
 const AGE_BUCKET_BOUNDS: &[u64] = &[30, 60, 180, 300, 600, 1200, 3600, 7200, 14400, 28800, 86400];
 const AGE_BUCKET_LABELS: &[&str] = &[
     "30", "60", "180", "300", "600", "1200", "3600", "7200", "14400", "28800", "86400", "+Inf",
