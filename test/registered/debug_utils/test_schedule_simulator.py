@@ -685,53 +685,34 @@ step=13   | GPU0[R=0:- Q=0:-]""",
         self.assertIn("step=2    | GPU0[R=0:- Q=0:-]", result.stdout)
 
     def test_e2e_gsp_shared_prefix_enables_batching(self):
-        result = self._run_cli(
-            "--synth-gsp",
-            "--synth-gsp-num-groups",
-            "1",
-            "--synth-gsp-prompts-per-group",
-            "2",
-            "--synth-gsp-system-prompt-len",
-            "50",
-            "--synth-gsp-question-len",
-            "10",
-            "--synth-gsp-output-len",
-            "2",
-            "--synth-seed",
-            "42",
-            "--num-gpus",
-            "1",
-            "--max-total-tokens",
-            "80",
-            "--log-level",
-            "2",
-        )
-        self.assertEqual(result.returncode, 0, f"CLI failed: {result.stderr}")
-        self.assertIn("R=2:", result.stdout)
-
-        result = self._run_cli(
-            "--synth-gsp",
-            "--synth-gsp-num-groups",
-            "1",
-            "--synth-gsp-prompts-per-group",
-            "2",
-            "--synth-gsp-system-prompt-len",
-            "10",
-            "--synth-gsp-question-len",
-            "50",
-            "--synth-gsp-output-len",
-            "2",
-            "--synth-seed",
-            "42",
-            "--num-gpus",
-            "1",
-            "--max-total-tokens",
-            "80",
-            "--log-level",
-            "2",
-        )
-        self.assertEqual(result.returncode, 0, f"CLI failed: {result.stderr}")
-        self.assertNotIn("R=2:", result.stdout)
+        for has_long_prefix in [True, False]:
+            prefix_len, question_len = (50, 10) if has_long_prefix else (10, 50)
+            result = self._run_cli(
+                "--synth-gsp",
+                "--synth-gsp-num-groups",
+                "1",
+                "--synth-gsp-prompts-per-group",
+                "2",
+                "--synth-gsp-system-prompt-len",
+                str(prefix_len),
+                "--synth-gsp-question-len",
+                str(question_len),
+                "--synth-gsp-output-len",
+                "2",
+                "--synth-seed",
+                "42",
+                "--num-gpus",
+                "1",
+                "--max-total-tokens",
+                "80",
+                "--log-level",
+                "2",
+            )
+            self.assertEqual(result.returncode, 0, f"CLI failed: {result.stderr}")
+            if has_long_prefix:
+                self.assertIn("R=2:", result.stdout)
+            else:
+                self.assertNotIn("R=2:", result.stdout)
 
 
 if __name__ == "__main__":
