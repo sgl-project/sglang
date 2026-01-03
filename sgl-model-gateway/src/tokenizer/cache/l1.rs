@@ -145,9 +145,9 @@ impl L1Cache {
         let mut hasher = blake3::Hasher::new();
         let mut prefix_hashes = Vec::with_capacity(boundaries.len());
         let mut last_pos = 0;
-
+        let bytes = input.as_bytes();
         for &boundary_pos in &boundaries {
-            hasher.update(input[last_pos..boundary_pos].as_bytes());
+            hasher.update(&input.as_bytes()[last_pos..boundary_pos]);
             prefix_hashes.push((boundary_pos, *hasher.clone().finalize().as_bytes()));
             last_pos = boundary_pos;
         }
@@ -193,12 +193,12 @@ impl L1Cache {
         let mut running_tokens = Vec::new();
         let mut last_pos = 0;
         let mut entries_to_insert = Vec::with_capacity(boundaries.len());
-
+        let bytes = input.as_bytes();
         for (i, &boundary_pos) in boundaries.iter().enumerate() {
             let delta_text = &input[last_pos..boundary_pos];
 
             // 1. Incremental Hash update
-            hasher.update(delta_text.as_bytes());
+            hasher.update(&bytes[last_pos..boundary_pos]);
             let hash_bytes: Blake3Hash = *hasher.clone().finalize().as_bytes();
 
             // 2. Incremental Tokenization

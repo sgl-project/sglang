@@ -1,7 +1,5 @@
-
 use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
-use sgl_model_gateway::tokenizer::cache::L1Cache;
-use sgl_model_gateway::tokenizer::mock::MockTokenizer;
+use sgl_model_gateway::tokenizer::{cache::L1Cache, mock::MockTokenizer};
 
 fn generate_prompt(turns: usize) -> String {
     let mut prompt = String::new();
