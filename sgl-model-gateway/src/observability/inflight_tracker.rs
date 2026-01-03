@@ -33,6 +33,13 @@ impl InFlightRequestTracker {
         tracker
     }
 
+    #[cfg(test)]
+    pub fn new_for_test() -> Self {
+        Self {
+            requests: DashMap::new(),
+        }
+    }
+
     /// Registers a request as in-flight.
     pub fn register(&self, request_id: &str) {
         self.requests.insert(request_id.to_string(), Instant::now());
