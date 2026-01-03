@@ -34,51 +34,40 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-class _RequestLoggerTarget:
-    def log(self, msg: str) -> None:
-        raise NotImplementedError
+def _create_target_stdout() -> logging.Logger:
+    log = logging.getLogger(f"{__name__}.stdout")
+    log.setLevel(logging.INFO)
+    log.propagate = False
+    if not log.handlers:
+        handler = logging.StreamHandler()
+        handler.setFormatter(logging.Formatter("%(message)s"))
+        log.addHandler(handler)
+    return log
 
 
-class _StdoutTarget(_RequestLoggerTarget):
-    def __init__(self):
-        self._logger = logging.getLogger(f"{__name__}.stdout")
-        self._logger.setLevel(logging.INFO)
-        self._logger.propagate = False
-        if not self._logger.handlers:
-            handler = logging.StreamHandler()
-            handler.setFormatter(logging.Formatter("%(message)s"))
-            self._logger.addHandler(handler)
+def _create_target_file(directory: str) -> logging.Logger:
+    os.makedirs(directory, exist_ok=True)
+    hostname = socket.gethostname()
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    filename = os.path.join(directory, f"{hostname}_{rank}.log")
 
-    def log(self, msg: str) -> None:
-        self._logger.info(msg)
+    log = logging.getLogger(f"{__name__}.file.{directory}.{hostname}_{rank}")
+    log.setLevel(logging.INFO)
+    log.propagate = False
 
-
-class _FileTarget(_RequestLoggerTarget):
-    def __init__(self, directory: str):
-        os.makedirs(directory, exist_ok=True)
-        hostname = socket.gethostname()
-        rank = dist.get_rank() if dist.is_initialized() else 0
-        filename = os.path.join(directory, f"{hostname}_{rank}.log")
-
-        self._logger = logging.getLogger(f"{__name__}.file.{directory}.{hostname}_{rank}")
-        self._logger.setLevel(logging.INFO)
-        self._logger.propagate = False
-
-        if not self._logger.handlers:
-            handler = TimedRotatingFileHandler(
-                filename, when="H", backupCount=0, encoding="utf-8"
-            )
-            handler.setFormatter(logging.Formatter("%(message)s"))
-            self._logger.addHandler(handler)
-
-    def log(self, msg: str) -> None:
-        self._logger.info(msg)
+    if not log.handlers:
+        handler = TimedRotatingFileHandler(
+            filename, when="H", backupCount=0, encoding="utf-8"
+        )
+        handler.setFormatter(logging.Formatter("%(message)s"))
+        log.addHandler(handler)
+    return log
 
 
-def _create_target(target: str) -> _RequestLoggerTarget:
+def _create_target(target: str) -> logging.Logger:
     if target.lower() == "stdout":
-        return _StdoutTarget()
-    return _FileTarget(target)
+        return _create_target_stdout()
+    return _create_target_file(target)
 
 
 class RequestLogger:
@@ -99,9 +88,9 @@ class RequestLogger:
         self.log_exceeded_ms = envs.SGLANG_LOG_REQUEST_EXCEEDED_MS.get()
         self._targets = self._setup_targets()
 
-    def _setup_targets(self) -> List[_RequestLoggerTarget]:
+    def _setup_targets(self) -> List[logging.Logger]:
         if not self.log_requests_target:
-            return [_StdoutTarget()]
+            return [_create_target_stdout()]
         return [_create_target(t) for t in self.log_requests_target]
 
     def configure(
@@ -130,7 +119,7 @@ class RequestLogger:
         }
         msg = json.dumps(log_data, ensure_ascii=False)
         for target in self._targets:
-            target.log(msg)
+            target.info(msg)
 
     def log_received_request(
         self, obj: Union["GenerateReqInput", "EmbeddingReqInput"], tokenizer: Any = None
