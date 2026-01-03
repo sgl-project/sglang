@@ -1357,6 +1357,8 @@ def pre_permute_deepep_ll_to_cutlass(
 @register_post_permute("cutlass", "deepep_ll")
 def post_permute_cutlass_to_deepep_ll(
     runner_output: CutlassRunnerOutput,
+    quant_info: CutlassMoeQuantInfo,
+    runner_config: MoeRunnerConfig,
     running_state: Dict[str, torch.Tensor],
 ) -> DeepEPLLCombineInput:
     from sglang.srt.layers.moe.token_dispatcher.deepep import DeepEPLLCombineInput
@@ -1493,6 +1495,7 @@ def pre_permute_deepep_normal_to_cutlass(
 @register_post_permute("cutlass", "deepep_normal")
 def post_permute_cutlass_to_deepep_normal(
     runner_output: CutlassRunnerOutput,
+    quant_info: CutlassMoeQuantInfo,
     runner_config: MoeRunnerConfig,
     running_state: Dict[str, torch.Tensor],
 ) -> DeepEPNormalCombineInput:
