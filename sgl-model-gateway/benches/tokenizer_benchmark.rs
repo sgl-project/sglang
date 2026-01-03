@@ -31,11 +31,9 @@ fn get_tokenizer_path() -> &'static PathBuf {
         // with special: true, normalized: false - perfect for demonstrating L1 cache
         let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
         let tokenizer_dir = rt.block_on(async {
-            sgl_model_gateway::tokenizer::hub::download_tokenizer_from_hf(
-                "Qwen/Qwen3-4B-Instruct-2507",
-            )
-            .await
-            .expect("Failed to download Qwen3-4B-Instruct tokenizer from HuggingFace")
+            smg::tokenizer::hub::download_tokenizer_from_hf("Qwen/Qwen3-4B-Instruct-2507")
+                .await
+                .expect("Failed to download Qwen3-4B-Instruct tokenizer from HuggingFace")
         });
 
         // The download_tokenizer_from_hf returns the directory containing tokenizer.json
