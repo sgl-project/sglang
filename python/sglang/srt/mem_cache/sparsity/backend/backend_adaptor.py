@@ -36,10 +36,10 @@ class BackendAdaptor(ABC):
     ) -> Any:
         """
         Adapt attention metadata for sparse KVCache access.
-        
+
         Transforms sparse retrieval results (logical indices of important KV pages/tokens)
         into backend-specific attention metadata format.
-            
+
         Returns:
             Modified attention metadata compatible with the backend
         """
@@ -101,10 +101,10 @@ class FlashAttentionAdaptor(BackendAdaptor):
     ) -> Any:
         """
         Adapt FlashAttention metadata for sparse KVCache access.
-        
+
         Modifies page_table, cache_seqlens, and related metadata to redirect
         FlashAttention to only process selected sparse pages.
-        
+
         # TODO: Optimize performance
         """
         if self._original_metadata is None:
@@ -151,9 +151,6 @@ class FlashAttentionAdaptor(BackendAdaptor):
             (1, 0),
         )
         current_metadata.max_seq_len_k = int(current_metadata.cache_seqlens_int32.max())
-
-        if layer_id == 0:
-            logger.info(f"Adapt for attn metadata, sparse_seq_lens: {sparse_seq_lens.tolist()}, original_cache_seqlens_int32: {self._original_metadata['cache_seqlens_int32'].tolist()}")
         return current_metadata
 
     def _logical_to_physical_pages_batch(

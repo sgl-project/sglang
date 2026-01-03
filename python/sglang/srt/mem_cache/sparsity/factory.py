@@ -70,14 +70,14 @@ def _parse_sparse_config(server_args) -> SparseConfig:
             algorithm = extra_config.pop("algorithm", "quest")
             backend = extra_config.pop("backend", "flashattention")
             min_sparse_prompt_len = extra_config.pop("min_sparse_prompt_len", 2048)
-            
+
             # Everything else goes to algorithm_extra_config
             sparse_extra_config = extra_config
         except json.JSONDecodeError as e:
             logger.warning(
                 f"Failed to parse hierarchical_sparse_attention_extra_config: {e}"
             )
-    
+
     config = SparseConfig(
         algorithm=algorithm,
         backend=backend,

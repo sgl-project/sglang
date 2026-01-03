@@ -54,27 +54,29 @@ class RequestTrackers:
 @dataclass
 class SparseConfig:
     """Configuration for sparse attention."""
-    
-    backend: str 
+
+    backend: str
     algorithm: str
     page_size: int = 64
     min_sparse_prompt_len: int = 2048
-    sparse_extra_config: dict = field(default_factory=dict) # Algorithm-specific config, parsed by each algorithm
-    
+    sparse_extra_config: dict = field(
+        default_factory=dict
+    )  # Algorithm-specific config, parsed by each algorithm
+
 
 class SparseCoordinator:
     """
     Coordinator for sparse attention with retrievable KV cache compression.
-    
+
     This coordinator framework is designed for decode-phase retrievable algorithms
     (e.g., Quest, PQCache, SnapKV) that dynamically select important KV cache entries
     based on current queries. It manages the lifecycle of sparse attention including
     representation construction, sparse retrieval, and token offloading.
-    
+
     Request Lifecycle and API Calls:
         1. Request Start:
            - on_request_begin(req) -> Register request and initialize state
-        
+
         2. Prefill Phase:
            - attention_end(...)    -> Construct representations
 
@@ -83,7 +85,7 @@ class SparseCoordinator:
            - attention_begin(...)  -> Identify important KV, load offloaded KVCache, adapt attention metadata
            - attention_end(...)    -> Construct/update representations
            - forward_end(batch)    -> Trigger KVCache offloading
-        
+
         4. Request End:
            - on_request_end(req) -> Clean up state and resources
     """
@@ -132,8 +134,8 @@ class SparseCoordinator:
 
     def on_request_begin(self, req: "Req") -> None:
         """
-        Handle request begin event. Called when a new request is created. 
-        
+        Handle request begin event. Called when a new request is created.
+
         Registers the request in the state tracker to enable sparse attention processing.
         """
         if req.req_pool_idx is not None:
@@ -141,21 +143,21 @@ class SparseCoordinator:
 
     def on_request_end(self, req: "Req") -> None:
         """
-        Handle request end event. Called when a request is completed or aborted. 
+        Handle request end event. Called when a request is completed or aborted.
         Cleans up request-specific state and releases resources.
         """
         if req.req_pool_idx is None:
             return
 
         self.states.clear(req.req_pool_idx)
-        
+
         # TODO: Implement request end handling
         # - Release host indices if any were allocated for offloading
 
     def forward_begin(self, forward_batch: "ForwardBatch") -> None:
         """
-        Handle forward pass begin event. Called before each forward pass starts. 
-        
+        Handle forward pass begin event. Called before each forward pass starts.
+
         Wait for pending KVCache offloading operations to complete before forward pass.
         Ensures memory consistency for subsequent sparse attention operations.
         """
@@ -165,8 +167,8 @@ class SparseCoordinator:
 
     def forward_end(self, forward_batch: "ForwardBatch") -> None:
         """
-        Handle forward pass end event. Called after each forward pass completes. 
-        
+        Handle forward pass end event. Called after each forward pass completes.
+
         Trigger async KVCache offloading operations.
         """
         # TODO: Implement forward end handling
@@ -185,9 +187,9 @@ class SparseCoordinator:
         **kwargs,
     ) -> Optional[Any]:
         """
-        Handle attention begin event. Called before each attention pass starts. 
-        
-        Identify important KV entries via sparse algorithm, load offloaded KVCache if needed, 
+        Handle attention begin event. Called before each attention pass starts.
+
+        Identify important KV entries via sparse algorithm, load offloaded KVCache if needed,
         and adapt attention metadata for the attention backend.
         """
         if layer.layer_id == self.start_layer:
@@ -204,8 +206,8 @@ class SparseCoordinator:
         forward_batch: "ForwardBatch",
     ) -> None:
         """
-        Handle attention end event. Called after each attention pass completes. 
-        
+        Handle attention end event. Called after each attention pass completes.
+
         Maybe construct and update sparse representations.
         """
         layer_id = layer.layer_id
