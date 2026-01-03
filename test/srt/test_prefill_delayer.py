@@ -24,7 +24,7 @@ class TestPrefillDelayerThroughput(CustomTestCase):
             "--dp",
             "8",
             "--chunked-prefill-size",
-            "131072",
+            "262144",
             "--mem-fraction-static",
             "0.6",
         ]
@@ -48,9 +48,9 @@ class TestPrefillDelayerThroughput(CustomTestCase):
             args = get_benchmark_args(
                 base_url=base_url,
                 dataset_name="random",
-                num_prompts=200,
-                random_input_len=8192,
-                random_output_len=128,
+                num_prompts=500,
+                random_input_len=30000,
+                random_output_len=256,
                 request_rate=32,
                 tokenizer=model,
             )
