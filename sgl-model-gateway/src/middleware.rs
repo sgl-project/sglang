@@ -667,9 +667,11 @@ where
             let active = ACTIVE_HTTP_CONNECTIONS.fetch_add(1, Ordering::Relaxed) + 1;
             Metrics::set_http_connections_active(active as usize);
 
-            // Track in-flight request
             let guard = tracker.track();
+
+            // Capture result before decrementing to ensure decrement happens on error too
             let result = inner.call(req).await;
+
             drop(guard);
 
             // Always decrement, regardless of success or failure
