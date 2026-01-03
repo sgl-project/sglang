@@ -1,8 +1,7 @@
-import glob
 import io
 import json
-import os
 import tempfile
+from pathlib import Path
 import time
 import unittest
 
@@ -78,14 +77,10 @@ class TestRequestLoggerText(BaseTestRequestLogger, CustomTestCase):
         self.assertIn("Receive:", combined_output)
         self.assertIn("Finish:", combined_output)
 
-        log_files = glob.glob(os.path.join(self.temp_dir, "*.log"))
+        log_files = list(Path(self.temp_dir).glob("*.log"))
         self.assertGreater(len(log_files), 0, "No log files found in temp directory")
 
-        file_content = ""
-        for log_file in log_files:
-            with open(log_file, "r") as f:
-                file_content += f.read()
-
+        file_content = "".join(f.read_text() for f in log_files)
         self.assertIn("Receive:", file_content)
         self.assertIn("Finish:", file_content)
 
@@ -119,14 +114,10 @@ class TestRequestLoggerJson(BaseTestRequestLogger, CustomTestCase):
 
         self._verify_json_logs(combined_output.splitlines(), "stdout")
 
-        log_files = glob.glob(os.path.join(self.temp_dir, "*.log"))
+        log_files = list(Path(self.temp_dir).glob("*.log"))
         self.assertGreater(len(log_files), 0, "No log files found in temp directory")
 
-        file_lines = []
-        for log_file in log_files:
-            with open(log_file, "r") as f:
-                file_lines.extend(f.readlines())
-
+        file_lines = [line for f in log_files for line in f.read_text().splitlines()]
         self._verify_json_logs(file_lines, "log files")
 
 
