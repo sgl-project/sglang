@@ -147,7 +147,7 @@ impl L1Cache {
         let mut last_pos = 0;
         let bytes = input.as_bytes();
         for &boundary_pos in &boundaries {
-            hasher.update(&input.as_bytes()[last_pos..boundary_pos]);
+            hasher.update(&bytes[last_pos..boundary_pos]);
             prefix_hashes.push((boundary_pos, *hasher.clone().finalize().as_bytes()));
             last_pos = boundary_pos;
         }
