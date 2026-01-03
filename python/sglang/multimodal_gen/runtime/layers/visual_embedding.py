@@ -6,6 +6,19 @@ import math
 
 import torch
 import torch.nn as nn
+from diffusers.models.embeddings import (
+    CombinedTimestepGuidanceTextProjEmbeddings as _CombinedTimestepGuidanceTextProjEmbeddings,
+)
+from diffusers.models.embeddings import (
+    CombinedTimestepTextProjEmbeddings as _CombinedTimestepTextProjEmbeddings,
+)
+from diffusers.models.embeddings import PixArtAlphaTextProjection, TimestepEmbedding
+from diffusers.models.embeddings import Timesteps as _Timesteps
+
+try:
+    from sgl_kernel.elementwise import timestep_embedding as timestep_embedding_cuda
+except Exception as _e:
+    pass
 
 from sglang.multimodal_gen.runtime.layers.activation import get_act_fn
 from sglang.multimodal_gen.runtime.layers.linear import ReplicatedLinear
@@ -64,6 +77,57 @@ class PatchEmbed(nn.Module):
             x = x.flatten(2).transpose(1, 2)  # BCHW -> BNC
         x = self.norm(x)
         return x
+
+
+class Timesteps(_Timesteps):
+    def forward(self, timesteps: torch.Tensor) -> torch.Tensor:
+        t_emb = timestep_embedding_cuda(
+            timesteps,
+            self.num_channels,
+            flip_sin_to_cos=self.flip_sin_to_cos,
+            downscale_freq_shift=self.downscale_freq_shift,
+            scale=self.scale,
+        )
+        return t_emb
+
+
+class CombinedTimestepGuidanceTextProjEmbeddings(
+    _CombinedTimestepGuidanceTextProjEmbeddings
+):
+    def __init__(self, embedding_dim, pooled_projection_dim):
+        nn.Module.__init__(self)
+
+        # use sgld op
+        self.time_proj = Timesteps(
+            num_channels=256, flip_sin_to_cos=True, downscale_freq_shift=0
+        )
+        # use diffusers op
+        self.timestep_embedder = TimestepEmbedding(
+            in_channels=256, time_embed_dim=embedding_dim
+        )
+        self.guidance_embedder = TimestepEmbedding(
+            in_channels=256, time_embed_dim=embedding_dim
+        )
+        self.text_embedder = PixArtAlphaTextProjection(
+            pooled_projection_dim, embedding_dim, act_fn="silu"
+        )
+
+
+class CombinedTimestepTextProjEmbeddings(_CombinedTimestepTextProjEmbeddings):
+    def __init__(self, embedding_dim, pooled_projection_dim):
+        nn.Module.__init__(self)
+
+        # use sgld op
+        self.time_proj = Timesteps(
+            num_channels=256, flip_sin_to_cos=True, downscale_freq_shift=0
+        )
+        # use diffusers op
+        self.timestep_embedder = TimestepEmbedding(
+            in_channels=256, time_embed_dim=embedding_dim
+        )
+        self.text_embedder = PixArtAlphaTextProjection(
+            pooled_projection_dim, embedding_dim, act_fn="silu"
+        )
 
 
 class TimestepEmbedder(nn.Module):

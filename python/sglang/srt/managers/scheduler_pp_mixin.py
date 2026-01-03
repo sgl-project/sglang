@@ -136,7 +136,7 @@ class SchedulerPPMixin:
 
             # When the server is idle, self-check and re-init some states
             if server_is_idle:
-                self.check_during_pp_idle()
+                self.self_check_during_idle()
 
     @DynamicGradMode()
     def event_loop_pp_disagg_prefill(self: Scheduler):
@@ -219,8 +219,7 @@ class SchedulerPPMixin:
 
                 self.process_prefill_chunk()
                 batch = self.get_new_batch_prefill()
-                if self.require_mlp_sync:
-                    batch = self.prepare_mlp_sync_batch(batch)
+                batch = self.maybe_prepare_mlp_sync_batch_and_log_stats(batch)
                 self.mbs[mb_id] = batch
                 self.running_mbs[mb_id] = self.running_batch
 
@@ -312,7 +311,7 @@ class SchedulerPPMixin:
 
             # When the server is idle, self-check and re-init some states
             if server_is_idle and len(self.disagg_prefill_inflight_queue) == 0:
-                self.check_during_pp_idle()
+                self.self_check_during_idle()
 
     @DynamicGradMode()
     def event_loop_pp_disagg_decode(self: Scheduler):
@@ -501,7 +500,7 @@ class SchedulerPPMixin:
                 queue_size += len(self.decode_offload_manager.ongoing_offload)
 
             if server_is_idle and queue_size == 0:
-                self.check_during_pp_idle()
+                self.self_check_during_idle()
 
     def init_pp_loop_state(self: Scheduler):
         self.pp_loop_size: int = self.pp_size + self.server_args.pp_async_batch_depth
@@ -564,8 +563,8 @@ class SchedulerPPMixin:
                     sampling_params=sampling_params,
                 )
                 req.fill_ids = req.origin_input_ids
-                req.extend_input_len = len(req.fill_ids) - len(req.prefix_indices)
-                req.logprob_start_len = len(req.origin_input_ids) - 1
+                req.logprob_start_len = -1
+                req.set_extend_input_len(len(req.fill_ids) - len(req.prefix_indices))
 
                 # Prepare batch
                 batch = ScheduleBatch.init_new(
@@ -666,7 +665,7 @@ class SchedulerPPMixin:
             f"Target latency: {self.length_predictor.target_latency:.2f}ms"
         )
 
-    def predict_next_chunk_size(self: "Scheduler", history_len: int) -> Optional[int]:
+    def predict_next_chunk_size(self: Scheduler, history_len: int) -> Optional[int]:
         """
         Predict next chunk size dynamically based on current history length.
 
@@ -699,12 +698,6 @@ class SchedulerPPMixin:
             )
 
         return predicted_size
-
-    def check_during_pp_idle(self: Scheduler):
-        self.check_memory()
-        self.check_tree_cache()
-        self.new_token_ratio = self.init_new_token_ratio
-        self.maybe_sleep_on_idle()
 
     def process_bootstrapped_queue(
         self: Scheduler, bootstrapped_rids: Optional[List[str]]
@@ -1349,7 +1342,8 @@ class ChunkSizePredictor:
         smoothed_chunk_size = base_chunk_size + smooth_coeff * (
             calculated_chunk_size_float - base_chunk_size
         )
-        calculated_chunk_size = int(smoothed_chunk_size)
+        # Make sure the dynamic chunk size is at least 1/4 of the base chunk size
+        calculated_chunk_size = max(int(smoothed_chunk_size), base_chunk_size // 4)
 
         # Align to page_size (minimum alignment size is 64)
         alignment_size = max(page_size, 64)

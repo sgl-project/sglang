@@ -52,7 +52,8 @@ from sglang.srt.layers.dp_attention import (
     set_dp_buffer_len,
     set_is_extend_in_batch,
 )
-from sglang.srt.utils import get_compiler_backend, is_npu, support_triton
+from sglang.srt.server_args import get_global_server_args
+from sglang.srt.utils import get_compiler_backend, is_hip, is_npu, support_triton
 from sglang.srt.utils.common import ceil_align
 
 if TYPE_CHECKING:
@@ -141,7 +142,7 @@ class ForwardMode(IntEnum):
         )
 
     def is_draft_extend_v2(self):
-        # For fixed shape logits output in v2 eagle worker
+        # For fixed shape logits output in eagle v2 worker
         return self == ForwardMode.DRAFT_EXTEND_V2
 
     def is_extend_or_draft_extend_or_mixed(self, include_draft_extend_v2: bool = False):
@@ -215,6 +216,10 @@ def compute_local_num_token_non_padded(
     attn_tp_rank = get_attention_tp_rank()
     attn_tp_size = get_attention_tp_size()
     tokens_per_rank = num_tokens_per_dp // attn_tp_size
+
+    # Make sure global_num_token_non_padded is tensor so torch.clamp doesn't break
+    if isinstance(global_num_token_non_padded, int):
+        global_num_token_non_padded = torch.tensor(global_num_token_non_padded)
 
     return torch.clamp(
         global_num_token_non_padded - tokens_per_rank * attn_tp_rank,
@@ -485,13 +490,15 @@ class ForwardBatch:
         # Override the positions with diffusion LLM or spec_info
         if batch.dllm_config is not None:
             block_size = batch.dllm_config.block_size
+            # Use int64 for AMD rotary embedding kernel compatibility
+            positions_dtype = torch.int64 if is_hip() else torch.int32
             ret.positions = torch.tensor(
                 [
                     i
                     for block_offset in batch.dllm_block_offsets
                     for i in range(block_offset, block_offset + block_size)
                 ],
-                dtype=torch.int32,
+                dtype=positions_dtype,
             ).to(device, non_blocking=True)
         elif (
             ret.spec_info is not None
@@ -545,14 +552,15 @@ class ForwardBatch:
         from sglang.srt.utils.common import require_mlp_tp_gather
 
         dp_rank = get_attention_dp_rank()
+        assert self.global_num_tokens_cpu is not None
 
         if require_mlp_tp_gather(server_args):
-            num_tokens_per_dp = self.global_num_tokens_gpu[dp_rank]
+            num_tokens_per_dp = self.global_num_tokens_cpu[dp_rank]
         else:
-            num_tokens_per_dp = self.global_num_tokens_gpu[0]
+            num_tokens_per_dp = self.global_num_tokens_cpu[0]
 
         self.num_token_non_padded = compute_local_num_token_non_padded(
-            global_num_token_non_padded=self.num_token_non_padded,
+            global_num_token_non_padded=self.num_token_non_padded_cpu,
             num_tokens_per_dp=num_tokens_per_dp,
         )
 
@@ -685,7 +693,10 @@ class ForwardBatch:
             mm_input = batch.multimodal_inputs[batch_idx]
             if self.forward_mode.is_decode():
                 # 3 * N
-                if mm_input is None:
+                if (
+                    mm_input is None
+                    or get_global_server_args().rl_on_policy_target is not None
+                ):
                     mrope_positions_list[batch_idx] = torch.full(
                         (3, 1),
                         self.seq_lens_cpu[batch_idx] - 1,
@@ -702,7 +713,10 @@ class ForwardBatch:
                     batch.extend_seq_lens[batch_idx],
                     batch.extend_prefix_lens[batch_idx],
                 )
-                if mm_input is None:
+                if (
+                    mm_input is None
+                    or get_global_server_args().rl_on_policy_target is not None
+                ):
                     # text only
                     mrope_positions = torch.tensor(
                         [
