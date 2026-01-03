@@ -186,13 +186,17 @@ pub fn extract_auth_header(
 
 #[inline]
 pub fn should_forward_request_header(name: &str) -> bool {
+    const REQUEST_ID_PREFIX: &str = "x-request-id-";
+
     name.eq_ignore_ascii_case("authorization")
         || name.eq_ignore_ascii_case("x-request-id")
         || name.eq_ignore_ascii_case("x-correlation-id")
         || name.eq_ignore_ascii_case("traceparent")
         || name.eq_ignore_ascii_case("tracestate")
         || name.eq_ignore_ascii_case("x-smg-routing-key")
-        || (name.len() >= 13 && name[..13].eq_ignore_ascii_case("x-request-id-"))
+        || name
+            .get(..REQUEST_ID_PREFIX.len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(REQUEST_ID_PREFIX))
 }
 
 #[cfg(test)]
