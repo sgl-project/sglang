@@ -443,21 +443,24 @@ class TestSimulator(CustomTestCase):
 
 
 class TestMain(CustomTestCase):
-    def test_main_returns_dataframe(self):
+    def test_main_returns_dataframe_with_expected_rows(self):
         import argparse
         import io
         import sys
 
         import polars as pl
 
-        from sglang.srt.debug_utils.schedule_simulator.__main__ import main
+        from sglang.srt.debug_utils.schedule_simulator.entrypoint import main
 
+        # 4 requests with output_len=2, distributed across 2 GPUs via round_robin
+        # r0 -> GPU0, r1 -> GPU1, r2 -> GPU0, r3 -> GPU1
+        # Each request needs 2 decode steps to complete
         args = argparse.Namespace(
             input=None,
             synthetic=True,
-            synth_num_requests=10,
-            synth_input_len=100,
-            synth_output_len=5,
+            synth_num_requests=4,
+            synth_input_len=10,
+            synth_output_len=2,
             synth_range_ratio=1.0,
             synth_seed=42,
             num_gpus=2,
@@ -477,12 +480,32 @@ class TestMain(CustomTestCase):
             sys.stdout = old_stdout
 
         self.assertIsInstance(df, pl.DataFrame)
-        self.assertIn("step", df.columns)
-        self.assertIn("gpu_id", df.columns)
-        self.assertIn("running_count", df.columns)
-        self.assertIn("pending_count", df.columns)
-        self.assertIn("total_seq_len", df.columns)
-        self.assertGreater(len(df), 0)
+        self.assertEqual(set(df.columns), {
+            "step", "gpu_id", "running_count", "pending_count",
+            "total_seq_len", "running_req_ids", "pending_req_ids"
+        })
+
+        # Expected behavior:
+        # step 0: GPU0 has r0,r2 running (2 reqs), GPU1 has r1,r3 running (2 reqs)
+        #         After decode, each has decoded_tokens=1, not finished yet
+        # step 1: All requests finish (decoded_tokens=2 == output_len)
+        #         GPU0 has 0 running, GPU1 has 0 running
+        expected_rows = [
+            {"step": 0, "gpu_id": 0, "running_count": 2, "pending_count": 0},
+            {"step": 0, "gpu_id": 1, "running_count": 2, "pending_count": 0},
+            {"step": 1, "gpu_id": 0, "running_count": 0, "pending_count": 0},
+            {"step": 1, "gpu_id": 1, "running_count": 0, "pending_count": 0},
+        ]
+
+        self.assertEqual(len(df), len(expected_rows))
+        for expected in expected_rows:
+            row = df.filter(
+                (pl.col("step") == expected["step"]) &
+                (pl.col("gpu_id") == expected["gpu_id"])
+            )
+            self.assertEqual(len(row), 1, f"Expected exactly one row for step={expected['step']}, gpu_id={expected['gpu_id']}")
+            self.assertEqual(row["running_count"][0], expected["running_count"])
+            self.assertEqual(row["pending_count"][0], expected["pending_count"])
 
 
 class TestCLI(CustomTestCase):
