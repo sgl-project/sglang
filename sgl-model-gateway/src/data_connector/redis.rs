@@ -485,36 +485,35 @@ impl ResponseStorage for RedisResponseStorage {
         
         let mut conn = self.store.pool.get().await.map_err(|e| ResponseStorageError::StorageError(e.to_string()))?;
         
-        let mut pipe = redis::pipe();
-        let mut pipe_ref = &mut pipe;
+        let mut pipe = redis::pipe();  
         
-        pipe_ref = pipe_ref.hset(&key, "id", response_id_str);
-        if let Some(prev) = &response.previous_response_id {
-            pipe_ref = pipe_ref.hset(&key, "previous_response_id", &prev.0);
-        }
-        pipe_ref = pipe_ref.hset(&key, "input", json_input);
-        if let Some(inst) = &response.instructions {
-            pipe_ref = pipe_ref.hset(&key, "instructions", inst);
-        }
-        pipe_ref = pipe_ref.hset(&key, "output", json_output);
-        pipe_ref = pipe_ref.hset(&key, "tool_calls", json_tool_calls);
-        pipe_ref = pipe_ref.hset(&key, "metadata", json_metadata);
-        pipe_ref = pipe_ref.hset(&key, "created_at", response.created_at.to_rfc3339());
-        if let Some(safety) = &response.safety_identifier {
-             pipe_ref = pipe_ref.hset(&key, "safety_identifier", safety);
-        }
-        if let Some(model) = &response.model {
-            pipe_ref = pipe_ref.hset(&key, "model", model);
-        }
-        if let Some(cid) = &response.conversation_id {
-             pipe_ref = pipe_ref.hset(&key, "conversation_id", cid);
-        }
-        pipe_ref = pipe_ref.hset(&key, "raw_response", json_raw_response);
+        pipe.hset(&key, "id", response_id_str);  
+        if let Some(prev) = &response.previous_response_id {  
+            pipe.hset(&key, "previous_response_id", &prev.0);  
+        }  
+        pipe.hset(&key, "input", json_input);  
+        if let Some(inst) = &response.instructions {  
+            pipe.hset(&key, "instructions", inst);  
+        }  
+        pipe.hset(&key, "output", json_output);  
+        pipe.hset(&key, "tool_calls", json_tool_calls);  
+        pipe.hset(&key, "metadata", json_metadata);  
+        pipe.hset(&key, "created_at", response.created_at.to_rfc3339());  
+        if let Some(safety) = &response.safety_identifier {  
+             pipe.hset(&key, "safety_identifier", safety);  
+        }  
+        if let Some(model) = &response.model {  
+            pipe.hset(&key, "model", model);  
+        }  
+        if let Some(cid) = &response.conversation_id {  
+             pipe.hset(&key, "conversation_id", cid);  
+        }  
+        pipe.hset(&key, "raw_response", json_raw_response);  
         
-        // Expire after 30 days
-        pipe_ref = pipe_ref.expire(&key, 30 * 24 * 60 * 60);
+        // Expire after 30 days  
+        pipe.expire(&key, 30 * 24 * 60 * 60);  
 
-        pipe_ref.query_async(&mut conn).await.map_err(|e| ResponseStorageError::StorageError(e.to_string()))?;
+        pipe.query_async(&mut conn).await.map_err(|e| ResponseStorageError::StorageError(e.to_string()))?; 
         
         // Index by safety identifier if present
         if let Some(safety) = &response.safety_identifier {
