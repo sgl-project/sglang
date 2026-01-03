@@ -3,7 +3,7 @@
 //! Tests for edge cases across parsers and mixed format scenarios
 
 use serde_json::json;
-use sgl_model_gateway::tool_parser::{
+use smg::tool_parser::{
     JsonParser, LlamaParser, MistralParser, PythonicParser, QwenParser, ToolParser,
 };
 
