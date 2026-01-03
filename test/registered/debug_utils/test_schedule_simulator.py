@@ -18,7 +18,11 @@ from sglang.srt.debug_utils.schedule_simulator import (
     generate_random_requests,
     load_from_request_logger,
 )
+from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
+
+register_cpu_ci(est_time=60, suite="default", nightly=True)
+
 
 # ==================== Non-E2E Tests ====================
 
