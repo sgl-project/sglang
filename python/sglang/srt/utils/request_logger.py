@@ -41,7 +41,7 @@ class RequestLogger:
         log_requests: bool,
         log_requests_level: int,
         log_requests_format: str,
-        log_requests_target: Optional[List[str]] = None,
+        log_requests_target: Optional[List[str]],
     ):
         self.log_requests = log_requests
         self.log_requests_level = log_requests_level
