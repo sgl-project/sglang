@@ -1,12 +1,9 @@
-import argparse
 import io
 import json
 import subprocess
 import sys
 import tempfile
 import unittest
-
-import polars as pl
 
 from sglang.srt.debug_utils.schedule_simulator import (
     AttentionBalancednessRecorder,
@@ -23,7 +20,6 @@ from sglang.srt.debug_utils.schedule_simulator import (
     generate_random_requests,
     load_from_request_logger,
 )
-from sglang.srt.debug_utils.schedule_simulator.entrypoint import main
 from sglang.test.test_utils import CustomTestCase
 
 
@@ -507,6 +503,52 @@ class TestCLI(CustomTestCase):
         )
         self.assertEqual(result.returncode, 0, f"CLI failed: {result.stderr}")
         self.assertIn("step=", result.stdout)
+
+    def test_e2e_simple_no_queuing(self):
+        # 4 requests, input_len=10, output_len=2, 2 GPUs, all fit in memory
+        result = self._run_cli(
+            "--synthetic",
+            "--synth-num-requests", "4",
+            "--synth-input-len", "10",
+            "--synth-output-len", "2",
+            "--synth-seed", "42",
+            "--num-gpus", "2",
+            "--max-total-tokens", "10000",
+            "--log-level", "2",
+        )
+        self.assertEqual(result.returncode, 0, f"CLI failed: {result.stderr}")
+        # Verify step logs (deterministic part of output)
+        self.assertIn(
+            "step=0    | GPU0[R=2:synthetic_0,synthetic_2 Q=0:-] | GPU1[R=2:synthetic_1,synthetic_3 Q=0:-]",
+            result.stdout,
+        )
+        self.assertIn("step=1    | GPU0[R=0:- Q=0:-] | GPU1[R=0:- Q=0:-]", result.stdout)
+        self.assertIn("batch_size_balancedness_mean: 1.0000", result.stdout)
+
+    def test_e2e_queuing_due_to_token_limit(self):
+        # 4 requests, input_len=100, output_len=3, 1 GPU
+        # max_total_tokens=210, so only 2 requests fit at a time
+        result = self._run_cli(
+            "--synthetic",
+            "--synth-num-requests", "4",
+            "--synth-input-len", "100",
+            "--synth-output-len", "3",
+            "--synth-seed", "42",
+            "--num-gpus", "1",
+            "--max-total-tokens", "210",
+            "--log-level", "2",
+        )
+        self.assertEqual(result.returncode, 0, f"CLI failed: {result.stderr}")
+        # Verify step logs show queuing behavior
+        expected_steps = """\
+step=0    | GPU0[R=2:synthetic_0,synthetic_1 Q=2:synthetic_2,synthetic_3]
+step=1    | GPU0[R=2:synthetic_0,synthetic_1 Q=2:synthetic_2,synthetic_3]
+step=2    | GPU0[R=0:- Q=2:synthetic_2,synthetic_3]
+step=3    | GPU0[R=2:synthetic_2,synthetic_3 Q=0:-]
+step=4    | GPU0[R=2:synthetic_2,synthetic_3 Q=0:-]
+step=5    | GPU0[R=0:- Q=0:-]"""
+        for line in expected_steps.split("\n"):
+            self.assertIn(line, result.stdout)
 
 
 if __name__ == "__main__":
