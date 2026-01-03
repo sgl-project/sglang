@@ -3238,8 +3238,8 @@ class ServerArgs:
                 "auto",
                 "round_robin",
                 "follow_bootstrap_room",
-                "shortest_queue",
-                "minimum_tokens",
+                "total_requests",
+                "total_tokens",
             ],
         )
         parser.add_argument(
