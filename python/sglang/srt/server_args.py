@@ -3017,7 +3017,7 @@ class ServerArgs:
         parser.add_argument(
             "--log-requests-target",
             type=str,
-            nargs="*",
+            nargs="+",
             default=ServerArgs.log_requests_target,
             help="Target(s) for request logging: 'stdout' and/or directory path(s) for file output. "
             "Can specify multiple targets, e.g., '--log-requests-target stdout /my/path'. "

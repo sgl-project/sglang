@@ -58,7 +58,7 @@ class _FileTarget(_RequestLoggerTarget):
         os.makedirs(directory, exist_ok=True)
         hostname = socket.gethostname()
         rank = dist.get_rank() if dist.is_initialized() else 0
-        filename = os.path.join(directory, f"{hostname}_{rank}.jsonl")
+        filename = os.path.join(directory, f"{hostname}_{rank}.log")
 
         self._logger = logging.getLogger(f"{__name__}.file.{directory}.{hostname}_{rank}")
         self._logger.setLevel(logging.INFO)

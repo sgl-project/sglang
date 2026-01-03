@@ -22,10 +22,10 @@ register_cuda_ci(est_time=120, suite="nightly-1-gpu", nightly=True)
 
 class BaseTestRequestLogger:
     log_requests_format = None
-    temp_dir = None
 
     @classmethod
     def setUpClass(cls):
+        cls.temp_dir = tempfile.mkdtemp()
         cls.stdout = io.StringIO()
         cls.stderr = io.StringIO()
         other_args = [
@@ -35,9 +35,10 @@ class BaseTestRequestLogger:
             "--log-requests-format",
             cls.log_requests_format,
             "--skip-server-warmup",
+            "--log-requests-target",
+            "stdout",
+            cls.temp_dir,
         ]
-        if cls.temp_dir is not None:
-            other_args.extend(["--log-requests-target", "stdout", cls.temp_dir])
         cls.process = popen_launch_server(
             "Qwen/Qwen3-0.6B",
             DEFAULT_URL_FOR_TEST,
@@ -51,6 +52,10 @@ class BaseTestRequestLogger:
         kill_process_tree(cls.process.pid)
         cls.stdout.close()
         cls.stderr.close()
+        if cls.temp_dir and os.path.exists(cls.temp_dir):
+            import shutil
+
+            shutil.rmtree(cls.temp_dir)
 
     def _send_request(self):
         response = requests.post(
@@ -90,13 +95,25 @@ class TestRequestLoggerText(BaseTestRequestLogger, CustomTestCase):
 
     def test_text_format_logging(self):
         combined_output = self._send_request()
+        time.sleep(1)
+
         self.assertIn("Receive:", combined_output)
         self.assertIn("Finish:", combined_output)
+
+        log_files = glob.glob(os.path.join(self.temp_dir, "*.log"))
+        self.assertGreater(len(log_files), 0, "No log files found in temp directory")
+
+        file_content = ""
+        for log_file in log_files:
+            with open(log_file, "r") as f:
+                file_content += f.read()
+
+        self.assertIn("Receive:", file_content)
+        self.assertIn("Finish:", file_content)
 
 
 class TestRequestLoggerJson(BaseTestRequestLogger, CustomTestCase):
     log_requests_format = "json"
-    temp_dir = tempfile.mkdtemp()
 
     def test_json_format_logging(self):
         combined_output = self._send_request()
@@ -104,12 +121,12 @@ class TestRequestLoggerJson(BaseTestRequestLogger, CustomTestCase):
 
         self._verify_json_logs(combined_output.splitlines(), "stdout")
 
-        jsonl_files = glob.glob(os.path.join(self.temp_dir, "*.jsonl"))
-        self.assertGreater(len(jsonl_files), 0, "No JSONL files found in temp directory")
+        log_files = glob.glob(os.path.join(self.temp_dir, "*.log"))
+        self.assertGreater(len(log_files), 0, "No log files found in temp directory")
 
         file_lines = []
-        for jsonl_file in jsonl_files:
-            with open(jsonl_file, "r") as f:
+        for log_file in log_files:
+            with open(log_file, "r") as f:
                 file_lines.extend(f.readlines())
 
         self._verify_json_logs(file_lines, "log files")
