@@ -16,6 +16,7 @@
 import faulthandler
 import logging
 import os
+import pickle
 import signal
 import sys
 import time
@@ -641,6 +642,8 @@ class Scheduler(
             enable_metrics=self.enable_metrics,
             enable_kv_cache_events=self.enable_kv_cache_events,
             enable_mamba_extra_buffer=server_args.enable_mamba_extra_buffer(),
+            pp_rank=self.pp_rank,
+            pp_size=self.pp_size,
         )
 
         if (
@@ -733,8 +736,6 @@ class Scheduler(
         self.running_batch: ScheduleBatch = ScheduleBatch(reqs=[], batch_is_full=False)
         # The current forward batch
         self.cur_batch: Optional[ScheduleBatch] = None
-        # The current split prefill batch
-        self.split_prefill_batch: Optional[ScheduleBatch] = None
         # The last forward batch
         self.last_batch: Optional[ScheduleBatch] = None
         self.forward_ct = 0
@@ -1186,6 +1187,41 @@ class Scheduler(
             return False
         return num_recv_reqs >= self.max_recv_per_poll
 
+    def _parse_multipart_message(self, parts):
+        # Check message type
+        msg_type = bytes(parts[0])
+
+        if msg_type == b"NORM":
+            # Normal message
+            recv_req = pickle.loads(parts[1])
+
+        elif msg_type == b"FEAT":
+            # Message with optimized feature tensors
+            recv_req = pickle.loads(parts[1])
+            feature_infos = pickle.loads(parts[2])
+
+            # Reconstruct tensors
+            for i, feature_info in enumerate(feature_infos):
+                buffer_idx = 3 + i
+                buffer = (
+                    parts[buffer_idx].buffer
+                    if hasattr(parts[buffer_idx], "buffer")
+                    else parts[buffer_idx]
+                )
+
+                dtype = feature_info["dtype"]
+                shape = feature_info["shape"]
+                tensor = torch.frombuffer(buffer, dtype=dtype).reshape(shape)
+
+                idx = feature_info["idx"]
+                if hasattr(recv_req, "mm_inputs") and recv_req.mm_inputs:
+                    mm_items = recv_req.mm_inputs.get("mm_items", [])
+                    if idx < len(mm_items):
+                        mm_items[idx].feature = tensor
+        else:
+            logger.warning(f"Unknown message type: {msg_type}")
+        return recv_req
+
     def recv_requests(
         self,
     ) -> List[Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput, Any]]:
@@ -1206,10 +1242,15 @@ class Scheduler(
                     try:
                         if self.recv_limit_reached(len(recv_reqs)):
                             break
-                        recv_req = self.recv_from_tokenizer.recv_pyobj(zmq.NOBLOCK)
-                    except zmq.ZMQError:
+                        parts = self.recv_from_tokenizer.recv_multipart(
+                            flags=zmq.NOBLOCK, copy=False
+                        )
+                        if not parts:
+                            break
+                        recv_req = self._parse_multipart_message(parts)
+                        recv_reqs.append(recv_req)
+                    except zmq.ZMQError as e:
                         break
-                    recv_reqs.append(recv_req)
 
                 while True:
                     try:
@@ -1532,6 +1573,10 @@ class Scheduler(
             self._add_request_to_queue(req)
             return
 
+        if not recv_req.return_logprob and recv_req.logprob_start_len != -1:
+            # When return_logprob is False, logprob_start_len should be ignored
+            recv_req.logprob_start_len = -1
+
         if recv_req.logprob_start_len == -1:
             if req.is_prefill_only:
                 # For prefill-only requests with logprob_start_len == -1, set logprob_start_len
@@ -1835,7 +1880,9 @@ class Scheduler(
             # Before merging the new batch into running batch:
             # 1. All new batches are none -> need_mlp_sync remains true (sync is needed for decode batch).
             # 2. All new batches are some (prefill / idle) -> we do not need prepare mlp sync one more time.
-            new_batch = self.prepare_mlp_sync_batch(new_batch)
+            new_batch = self.maybe_prepare_mlp_sync_batch_and_log_stats(
+                new_batch, log_stats=False
+            )
             need_mlp_sync = new_batch is None
 
         if new_batch is not None:
@@ -1849,14 +1896,13 @@ class Scheduler(
             else:
                 ret = None
 
-        # Handle DP attention
-        if need_mlp_sync:
-            ret = self.prepare_mlp_sync_batch(ret)
+        # Handle DP attention and log stats
+        ret = self.maybe_prepare_mlp_sync_batch_and_log_stats(
+            ret, need_sync=need_mlp_sync
+        )
 
         if ret:
             trace_event_batch("schedule", ret.reqs)
-
-        self.log_prefill_stats_late(ret)
 
         return ret
 

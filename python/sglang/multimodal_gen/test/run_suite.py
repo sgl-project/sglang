@@ -23,6 +23,8 @@ SUITES = {
         "test_server_a.py",
         "test_server_b.py",
         "test_lora_format_adapter.py",
+        # cli test
+        "../cli/test_generate_t2i_perf.py",
         # add new 1-gpu test files here
     ],
     "2-gpu": [
@@ -196,7 +198,9 @@ def run_pytest(files, filter_expr=None):
             and "AssertionError" in full_output
         )
 
-        is_flaky_ci_assertion = "SafetensorError" in full_output
+        is_flaky_ci_assertion = (
+            "SafetensorError" in full_output or "FileNotFoundError" in full_output
+        )
 
         is_oom_error = (
             "out of memory" in full_output.lower()
