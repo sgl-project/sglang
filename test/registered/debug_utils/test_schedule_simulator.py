@@ -14,6 +14,7 @@ from sglang.srt.debug_utils.schedule_simulator import (
     ScheduleDecision,
     SimRequest,
     Simulator,
+    generate_random_requests,
     load_from_request_logger,
 )
 from sglang.test.test_utils import CustomTestCase
@@ -243,6 +244,54 @@ class TestDataLoader(CustomTestCase):
         self.assertEqual(requests[0].request_id, "r3")
 
 
+class TestDataSynthesis(CustomTestCase):
+    def test_generate_basic(self):
+        requests = generate_random_requests(
+            num_requests=10,
+            input_len=100,
+            output_len=50,
+        )
+        self.assertEqual(len(requests), 10)
+        for req in requests:
+            self.assertEqual(req.input_len, 100)
+            self.assertEqual(req.output_len, 50)
+            self.assertTrue(req.request_id.startswith("synthetic_"))
+
+    def test_generate_with_range_ratio(self):
+        requests = generate_random_requests(
+            num_requests=100,
+            input_len=100,
+            output_len=50,
+            range_ratio=0.5,
+            seed=42,
+        )
+        self.assertEqual(len(requests), 100)
+        for req in requests:
+            self.assertGreaterEqual(req.input_len, 50)
+            self.assertLessEqual(req.input_len, 100)
+            self.assertGreaterEqual(req.output_len, 25)
+            self.assertLessEqual(req.output_len, 50)
+
+    def test_generate_with_seed(self):
+        requests1 = generate_random_requests(
+            num_requests=10,
+            input_len=100,
+            output_len=50,
+            range_ratio=0.5,
+            seed=42,
+        )
+        requests2 = generate_random_requests(
+            num_requests=10,
+            input_len=100,
+            output_len=50,
+            range_ratio=0.5,
+            seed=42,
+        )
+        for r1, r2 in zip(requests1, requests2):
+            self.assertEqual(r1.input_len, r2.input_len)
+            self.assertEqual(r1.output_len, r2.output_len)
+
+
 class TestSimulator(CustomTestCase):
     def test_basic_run(self):
         requests = [
@@ -357,6 +406,31 @@ class TestCLI(CustomTestCase):
 
         self.assertEqual(result.returncode, 0, f"CLI failed: {result.stderr}")
         self.assertIn("router=random", result.stdout)
+
+    def test_cli_synthetic(self):
+        import subprocess
+        import sys
+
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "sglang.srt.debug_utils.schedule_simulator",
+                "--synthetic",
+                "--num-requests", "100",
+                "--input-len", "512",
+                "--output-len", "128",
+                "--range-ratio", "0.5",
+                "--num-gpus", "4",
+            ],
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertEqual(result.returncode, 0, f"CLI failed: {result.stderr}")
+        self.assertIn("Generated 100 synthetic requests", result.stdout)
+        self.assertIn("input_len=512", result.stdout)
+        self.assertIn("output_len=128", result.stdout)
 
 
 if __name__ == "__main__":

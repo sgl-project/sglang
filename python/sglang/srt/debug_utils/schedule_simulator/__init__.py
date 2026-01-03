@@ -1,4 +1,5 @@
-from sglang.srt.debug_utils.schedule_simulator.data_loader import (
+from sglang.srt.debug_utils.schedule_simulator.data_source import (
+    generate_random_requests,
     load_from_request_logger,
 )
 from sglang.srt.debug_utils.schedule_simulator.gpu_state import GPUState
@@ -35,5 +36,6 @@ __all__ = [
     "BatchSizeBalancednessRecorder",
     "AttentionBalancednessRecorder",
     "load_from_request_logger",
+    "generate_random_requests",
 ]
 
