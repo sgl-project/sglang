@@ -49,6 +49,7 @@ from sglang.srt.utils import (
     next_power_of_2,
     round_up,
     set_weight_attrs,
+    get_torch_compile_disable_decorator,
 )
 from sglang.srt.utils.custom_op import register_custom_op
 
@@ -582,6 +583,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         )
         self.runner = MoeRunner(backend, moe_runner_config)
 
+    @get_torch_compile_disable_decorator(_is_hip)
     def apply(
         self,
         layer: torch.nn.Module,

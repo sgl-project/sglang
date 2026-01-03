@@ -3746,3 +3746,10 @@ def get_or_create_event_loop():
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         return loop
+
+
+def get_torch_compile_disable_decorator(is_disable) -> Callable:
+    if is_disable:
+        return torch._dynamo.disable
+    else:
+        return lambda func: func

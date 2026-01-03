@@ -2080,7 +2080,7 @@ class DeepseekV2AttentionMLA(nn.Module):
                     fp8_dtype if self.kv_cache_dtype == "fp8_e4m3" else q_nope_out.dtype
                 )
 
-                q, _, _, k = fused_qk_rope_cat_and_cache_mla(
+                q, _, _, k, _ = fused_qk_rope_cat_and_cache_mla(
                     q_nope_out,
                     q_pe,
                     k_nope,
