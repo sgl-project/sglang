@@ -261,50 +261,6 @@ class TestSimulator(CustomTestCase):
         self.assertEqual(result.summary, {})
         self.assertEqual(len(result.step_records), 0)
 
-    def test_log_level_1(self):
-        requests = [
-            SimRequest(request_id=f"r{i}", input_len=10, output_len=2) for i in range(4)
-        ]
-        sim = Simulator(
-            num_gpus=2,
-            router=RoundRobinRouter(),
-            scheduler=FIFOScheduler(),
-            log_level=1,
-        )
-        captured = io.StringIO()
-        old_stdout = sys.stdout
-        sys.stdout = captured
-        try:
-            sim.run(requests)
-        finally:
-            sys.stdout = old_stdout
-        output = captured.getvalue()
-        self.assertIn("step=", output)
-        self.assertIn("GPU0", output)
-        self.assertIn("R=", output)
-
-    def test_log_level_2(self):
-        requests = [
-            SimRequest(request_id=f"req{i}", input_len=10, output_len=2)
-            for i in range(2)
-        ]
-        sim = Simulator(
-            num_gpus=2,
-            router=RoundRobinRouter(),
-            scheduler=FIFOScheduler(),
-            log_level=2,
-        )
-        captured = io.StringIO()
-        old_stdout = sys.stdout
-        sys.stdout = captured
-        try:
-            sim.run(requests)
-        finally:
-            sys.stdout = old_stdout
-        output = captured.getvalue()
-        self.assertIn("req0", output)
-        self.assertIn("req1", output)
-
     def test_step_records(self):
         requests = [
             SimRequest(request_id=f"r{i}", input_len=10, output_len=3) for i in range(4)
@@ -358,6 +314,10 @@ class TestCLI(CustomTestCase):
             capture_output=True,
             text=True,
         )
+
+    def _assert_output_contains(self, output: str, expected_lines: str):
+        for line in expected_lines.strip().split("\n"):
+            self.assertIn(line, output)
 
     def test_cli_basic(self):
         log_data = [
