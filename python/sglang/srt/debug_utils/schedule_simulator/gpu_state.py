@@ -42,13 +42,9 @@ class GPUState:
         self.pending_requests.insert(0, req)
 
     def execute_step(self) -> None:
-        finished = []
         for req in self.running_requests:
             req.decoded_tokens += 1
-            if req.is_finished():
-                finished.append(req)
-        for req in finished:
-            self.running_requests.remove(req)
+        self.running_requests = [r for r in self.running_requests if not r.is_finished()]
 
     def get_step_record(self, step: int) -> StepRecord:
         return StepRecord(
