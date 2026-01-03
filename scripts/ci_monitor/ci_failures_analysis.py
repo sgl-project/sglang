@@ -1161,22 +1161,66 @@ class SGLangFailuresAnalyzer:
             summary_lines.append("")
 
             # Queue Time Summary - COLLAPSIBLE
-            if report_data.get("summary", {}).get("avg_queue_time_seconds") is not None:
-                avg_queue = report_data["summary"]["avg_queue_time_seconds"]
-                p90_queue = report_data["summary"]["p90_queue_time_seconds"]
+            runner_stats = report_data.get("runner_stats", {})
+            if runner_stats:
                 summary_lines.append("<details>")
                 summary_lines.append(
-                    "<summary>📊 Queue Time Summary (click to expand)</summary>"
+                    "<summary>📊 Queue Time Summary by Runner Type (click to expand)</summary>"
                 )
                 summary_lines.append("")
-                summary_lines.append("| Metric | Value |")
-                summary_lines.append("|--------|-------|")
                 summary_lines.append(
-                    f"| Average Queue Time (across all runners) | {avg_queue / 60:.1f} minutes ({avg_queue:.0f}s) |"
+                    "_High queue times indicate that runner type may need more workers._"
+                )
+                summary_lines.append("")
+                summary_lines.append(
+                    "| Runner Type | Avg Queue | P90 Queue | # of Jobs Processed | Jobs Using This Runner |"
                 )
                 summary_lines.append(
-                    f"| P90 Queue Time (across all runners) | {p90_queue / 60:.1f} minutes ({p90_queue:.0f}s) |"
+                    "|-------------|-----------|-----------|------|------------------------|"
                 )
+
+                # Sort by P90 queue time descending (longest waits first)
+                sorted_runners = sorted(
+                    runner_stats.items(),
+                    key=lambda x: x[1].get("p90_queue_time_seconds", 0),
+                    reverse=True,
+                )
+
+                for runner_key, stats in sorted_runners:
+                    avg_queue = stats.get("avg_queue_time_seconds", 0)
+                    p90_queue = stats.get("p90_queue_time_seconds", 0)
+                    total_jobs = stats.get("total_jobs", 0)
+
+                    # Get unique job names that run on this runner
+                    jobs_total = stats.get("jobs_total", {})
+                    unique_jobs = list(jobs_total.keys())
+                    # Truncate job names and limit to first 3
+                    job_names_short = [
+                        (j if len(j) <= 25 else j[:22] + "...") for j in unique_jobs[:3]
+                    ]
+                    jobs_str = ", ".join(f"`{j}`" for j in job_names_short)
+                    if len(unique_jobs) > 3:
+                        jobs_str += f" +{len(unique_jobs) - 3} more"
+
+                    # Format queue times
+                    avg_str = f"{avg_queue / 60:.1f}m" if avg_queue > 0 else "N/A"
+                    p90_str = f"{p90_queue / 60:.1f}m" if p90_queue > 0 else "N/A"
+
+                    # Truncate long runner labels
+                    display_name = (
+                        runner_key if len(runner_key) <= 35 else runner_key[:32] + "..."
+                    )
+
+                    # Highlight if P90 queue time > 10 minutes (potential bottleneck)
+                    if p90_queue > 600:
+                        summary_lines.append(
+                            f"| <span style='color:orange'>`{display_name}`</span> | <span style='color:orange'>{avg_str}</span> | <span style='color:orange'>{p90_str}</span> | <span style='color:orange'>{total_jobs}</span> | {jobs_str} |"
+                        )
+                    else:
+                        summary_lines.append(
+                            f"| `{display_name}` | {avg_str} | {p90_str} | {total_jobs} | {jobs_str} |"
+                        )
+
                 summary_lines.append("")
                 summary_lines.append("</details>")
                 summary_lines.append("")
