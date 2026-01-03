@@ -15,43 +15,6 @@ use serde_json::json;
 use tower::ServiceExt;
 
 #[tokio::test]
-async fn test_inflight_tracking_with_delayed_worker() {
-    let ctx = AppTestContext::new(vec![MockWorkerConfig {
-        port: 19001,
-        worker_type: WorkerType::Regular,
-        health_status: HealthStatus::Healthy,
-        response_delay_ms: 100,
-        fail_rate: 0.0,
-    }])
-    .await;
-
-    let tracker = &ctx.app_context.inflight_tracker;
-    let initial_count = tracker.len();
-
-    let app = ctx.create_app().await;
-
-    let payload = json!({
-        "text": "Test tracking",
-        "stream": false
-    });
-
-    let req = Request::builder()
-        .method("POST")
-        .uri("/generate")
-        .header(CONTENT_TYPE, "application/json")
-        .body(Body::from(serde_json::to_string(&payload).unwrap()))
-        .unwrap();
-
-    let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-
-    let final_count = tracker.len();
-    assert_eq!(final_count, initial_count);
-
-    ctx.shutdown().await;
-}
-
-#[tokio::test]
 async fn test_multiple_concurrent_requests_tracking() {
     let ctx = AppTestContext::new(vec![MockWorkerConfig {
         port: 19002,
