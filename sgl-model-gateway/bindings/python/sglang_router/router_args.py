@@ -755,7 +755,9 @@ class RouterArgs:
         redis_group.add_argument(
             f"--{prefix}redis-retention-days",
             type=int,
-            default=int(os.getenv("REDIS_RETENTION_DAYS", RouterArgs.redis_retention_days)),
+            default=int(
+                os.getenv("REDIS_RETENTION_DAYS", RouterArgs.redis_retention_days)
+            ),
             help="Redis data retention in days (-1 for persistent, default: 30, env: REDIS_RETENTION_DAYS)",
         )
 
