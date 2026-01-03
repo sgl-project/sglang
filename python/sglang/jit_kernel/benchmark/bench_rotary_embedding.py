@@ -19,7 +19,6 @@ IS_CI = (
     or os.getenv("GITHUB_ACTIONS", "false").lower() == "true"
 )
 
-IS_QUICK = os.getenv("SGL_BENCH_QUICK", "0").lower() in ("1", "true", "yes", "y")
 ONLY_PROVIDER = os.getenv("SGL_BENCH_PROVIDER", "").strip() or None
 SHOW_SPEEDUP = os.getenv("SGL_BENCH_SPEEDUP", "1").lower() in ("1", "true", "yes", "y")
 
@@ -39,7 +38,24 @@ except Exception:
     vLLMRotaryEmbedding = None
     HAS_VLLM = False
 
-if IS_CI or IS_QUICK:
+try:
+    from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
+        apply_flashinfer_rope_qk_inplace,
+    )
+
+    try:
+        from flashinfer.rope import (  # noqa: F401
+            apply_rope_with_cos_sin_cache_inplace as _,
+        )
+
+        HAS_FLASHINFER = True
+    except Exception:
+        HAS_FLASHINFER = False
+except Exception:
+    apply_flashinfer_rope_qk_inplace = None  # type: ignore
+    HAS_FLASHINFER = False
+
+if IS_CI:
     BS_RANGE = [16]
     SEQ_RANGE = [1, 128]
     HEAD_SIZE_RANGE = [128]
@@ -49,6 +65,42 @@ else:
     SEQ_RANGE = [1, 4, 128, 2048]
     HEAD_SIZE_RANGE = [64, 96, 128, 256]
     INTERLEAVED_RANGE = [True, False]
+
+
+def _is_flashinfer_unsupported_shape_error(e: BaseException) -> bool:
+    msg = str(e)
+    return ("Unsupported head_dim" in msg) or ("cos_sin_cache should be float32" in msg)
+
+
+def _bench(
+    fn,
+    *,
+    quantiles: list[float],
+    use_cudagraph: bool,
+) -> tuple[float, float, float]:
+    if use_cudagraph:
+        return triton.testing.do_bench_cudagraph(fn, quantiles=quantiles)  # type: ignore
+    return triton.testing.do_bench(fn, quantiles=quantiles)  # type: ignore
+
+
+def _bench_provider(
+    provider: str,
+    fn,
+    *,
+    quantiles: list[float],
+    use_cudagraph: bool,
+) -> tuple[float, float, float]:
+    """Bench a provider and return (median, min, max) in ms.
+
+    For FlashInfer, gracefully skip unsupported shapes by returning NaNs.
+    """
+    try:
+        return _bench(fn, quantiles=quantiles, use_cudagraph=use_cudagraph)
+    except Exception as e:  # noqa: BLE001
+        if provider == "flashinfer_rope" and _is_flashinfer_unsupported_shape_error(e):
+            nan = float("nan")
+            return nan, nan, nan
+        raise
 
 
 def _compute_cos_sin_cache_half(
@@ -166,13 +218,27 @@ def sglang_jit_rotary_cos_sin(
     rotary_embedding_cos_sin(cos, sin, q, k, head_size, interleaved)
 
 
-BASE_LINE_VALS = ["jit_cos_sin"]
-BASE_LINE_NAMES = ["SGL JIT (cos/sin)"]
-BASE_STYLES = [("blue", "-")]
+if HAS_FLASHINFER:
+    BASE_PROVIDER = "flashinfer_rope"
+    BASE_NAME = "FlashInfer RoPE"
+    BASE_STYLE = ("red", "-")
+else:
+    BASE_PROVIDER = "jit_cos_sin"
+    BASE_NAME = "SGL JIT (cos/sin)"
+    BASE_STYLE = ("blue", "-")
+
+BASE_LINE_VALS = [BASE_PROVIDER]
+BASE_LINE_NAMES = [BASE_NAME]
+BASE_STYLES = [BASE_STYLE]
 
 LINE_VALS = list(BASE_LINE_VALS)
 LINE_NAMES = list(BASE_LINE_NAMES)
 STYLES = list(BASE_STYLES)
+
+if "jit_cos_sin" not in LINE_VALS:
+    LINE_VALS.append("jit_cos_sin")
+    LINE_NAMES.append("SGL JIT (cos/sin)")
+    STYLES.append(("blue", "-"))
 
 if HAS_SGL_POS:
     LINE_VALS.append("aot_pos")
@@ -183,6 +249,11 @@ if HAS_VLLM:
     LINE_VALS.append("vllm_pos")
     LINE_NAMES.append("vLLM (positions)")
     STYLES.append(("green", "-."))
+
+if HAS_FLASHINFER and "flashinfer_rope" not in LINE_VALS:
+    LINE_VALS.append("flashinfer_rope")
+    LINE_NAMES.append("FlashInfer RoPE")
+    STYLES.append(("red", "--"))
 
 if ONLY_PROVIDER is not None:
     if ONLY_PROVIDER not in LINE_VALS:
@@ -275,6 +346,16 @@ def benchmark(
 
     cos_cache_half, sin_cache_half = _get_cos_sin_cache_half_cuda(rotary_dim)
     cos_sin_cache_aot = torch.cat([cos_cache_half, sin_cache_half], dim=-1).contiguous()
+    # FlashInfer requires cos_sin_cache to be float32.
+    if HAS_FLASHINFER:
+        cos_f32, sin_f32 = _compute_cos_sin_cache_half(
+            MAX_SEQ_LEN, rotary_dim, dtype=torch.float32
+        )
+        cos_sin_cache_flashinfer = (
+            torch.cat([cos_f32, sin_f32], dim=-1)
+            .to(device=DEVICE, dtype=torch.float32)
+            .contiguous()
+        )
 
     positions = torch.arange(seq_len, device=DEVICE, dtype=torch.int64).repeat(
         batch_size
@@ -288,8 +369,16 @@ def benchmark(
         cos = torch.cat([cos_half, cos_half], dim=-1).contiguous()
         sin = torch.cat([sin_half, sin_half], dim=-1).contiguous()
 
-    q = torch.randn(num_tokens, NUM_Q_HEADS, head_size, device=DEVICE, dtype=DTYPE)
-    k = torch.randn(num_tokens, NUM_KV_HEADS, head_size, device=DEVICE, dtype=DTYPE)
+    # Keep a canonical 4D layout for providers that require it (e.g. FlashInfer).
+    # View as 3D for providers that accept [num_tokens, nheads, head_size].
+    q4 = torch.randn(
+        batch_size, seq_len, NUM_Q_HEADS, head_size, device=DEVICE, dtype=DTYPE
+    ).contiguous()
+    k4 = torch.randn(
+        batch_size, seq_len, NUM_Q_HEADS, head_size, device=DEVICE, dtype=DTYPE
+    ).contiguous()
+    q = q4.view(num_tokens, NUM_Q_HEADS, head_size)
+    k = k4.view(num_tokens, NUM_Q_HEADS, head_size)
 
     global _SANITY_DONE
     if (
@@ -325,17 +414,28 @@ def benchmark(
             cos, sin, q, k, head_size, interleaved
         ),
     }
+    if HAS_FLASHINFER and apply_flashinfer_rope_qk_inplace is not None:
+        FN_MAP["flashinfer_rope"] = lambda: apply_flashinfer_rope_qk_inplace(
+            q4,
+            k4,
+            cos_sin_cache_flashinfer,
+            is_neox=not interleaved,
+        )
     if HAS_VLLM:
         vllm_rope = _get_vllm_rope(head_size, rotary_dim, interleaved, DTYPE)
         FN_MAP["vllm_pos"] = lambda: vllm_rope.forward_cuda(positions, q, k)
 
     fn = FN_MAP[provider]
     quantiles = [0.5, 0.2, 0.8]
-    ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(fn, quantiles=quantiles)  # type: ignore
+    # If FlashInfer is available, unify timing across providers by using do_bench for all.
+    use_cudagraph = not HAS_FLASHINFER
+    ms, min_ms, max_ms = _bench_provider(
+        provider, fn, quantiles=quantiles, use_cudagraph=use_cudagraph
+    )
     return 1000 * ms, 1000 * max_ms, 1000 * min_ms
 
 
-SPEEDUP_LINE_VALS = [p for p in LINE_VALS if p != "jit_cos_sin"]
+SPEEDUP_LINE_VALS = [p for p in LINE_VALS if p != BASE_PROVIDER]
 SPEEDUP_LINE_NAMES = [LINE_NAMES[LINE_VALS.index(p)] for p in SPEEDUP_LINE_VALS]
 SPEEDUP_STYLES = [STYLES[LINE_VALS.index(p)] for p in SPEEDUP_LINE_VALS]
 
@@ -348,8 +448,8 @@ SPEEDUP_STYLES = [STYLES[LINE_VALS.index(p)] for p in SPEEDUP_LINE_VALS]
         line_vals=SPEEDUP_LINE_VALS,
         line_names=SPEEDUP_LINE_NAMES,
         styles=SPEEDUP_STYLES,
-        ylabel="speedup (x) vs SGL JIT (cos/sin)",
-        plot_name="rotary-embedding-speedup-vs-jit",
+        ylabel=f"speedup (x) vs {BASE_NAME}",
+        plot_name=f"rotary-embedding-speedup-vs-{BASE_PROVIDER}",
         args={},
     )
 )
@@ -360,7 +460,7 @@ def benchmark_speedup_vs_jit(
     interleaved: bool,
     provider: str,
 ) -> Tuple[float, float, float]:
-    if provider == "jit_cos_sin":
+    if provider == BASE_PROVIDER:
         return 1.0, 1.0, 1.0
     if DEVICE == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA not available")
@@ -370,6 +470,15 @@ def benchmark_speedup_vs_jit(
 
     cos_cache_half, sin_cache_half = _get_cos_sin_cache_half_cuda(rotary_dim)
     cos_sin_cache_aot = torch.cat([cos_cache_half, sin_cache_half], dim=-1).contiguous()
+    if HAS_FLASHINFER:
+        cos_f32, sin_f32 = _compute_cos_sin_cache_half(
+            MAX_SEQ_LEN, rotary_dim, dtype=torch.float32
+        )
+        cos_sin_cache_flashinfer = (
+            torch.cat([cos_f32, sin_f32], dim=-1)
+            .to(device=DEVICE, dtype=torch.float32)
+            .contiguous()
+        )
 
     positions = torch.arange(seq_len, device=DEVICE, dtype=torch.int64).repeat(
         batch_size
@@ -383,10 +492,14 @@ def benchmark_speedup_vs_jit(
         cos = torch.cat([cos_half, cos_half], dim=-1).contiguous()
         sin = torch.cat([sin_half, sin_half], dim=-1).contiguous()
 
-    q_base = torch.randn(num_tokens, NUM_Q_HEADS, head_size, device=DEVICE, dtype=DTYPE)
-    k_base = torch.randn(
-        num_tokens, NUM_KV_HEADS, head_size, device=DEVICE, dtype=DTYPE
-    )
+    q_base4 = torch.randn(
+        batch_size, seq_len, NUM_Q_HEADS, head_size, device=DEVICE, dtype=DTYPE
+    ).contiguous()
+    k_base4 = torch.randn(
+        batch_size, seq_len, NUM_Q_HEADS, head_size, device=DEVICE, dtype=DTYPE
+    ).contiguous()
+    q_base = q_base4.view(num_tokens, NUM_Q_HEADS, head_size)
+    k_base = k_base4.view(num_tokens, NUM_Q_HEADS, head_size)
 
     q_jit = q_base.clone()
     k_jit = k_base.clone()
@@ -404,21 +517,41 @@ def benchmark_speedup_vs_jit(
             cos, sin, q_p, k_p, head_size, interleaved
         ),
     }
+    if HAS_FLASHINFER and apply_flashinfer_rope_qk_inplace is not None:
+        q_f = q_base4.clone()
+        k_f = k_base4.clone()
+        FN_MAP["flashinfer_rope"] = lambda: apply_flashinfer_rope_qk_inplace(
+            q_f,
+            k_f,
+            cos_sin_cache_flashinfer,
+            is_neox=not interleaved,
+        )
     if HAS_VLLM:
         vllm_rope = _get_vllm_rope(head_size, rotary_dim, interleaved, DTYPE)
         FN_MAP["vllm_pos"] = lambda: vllm_rope.forward_cuda(positions, q_p, k_p)
 
     quantiles = [0.5, 0.2, 0.8]
-    jit_ms, jit_min_ms, jit_max_ms = triton.testing.do_bench_cudagraph(
-        FN_MAP["jit_cos_sin"], quantiles=quantiles
-    )  # type: ignore
-    p_ms, p_min_ms, p_max_ms = triton.testing.do_bench_cudagraph(
-        FN_MAP[provider], quantiles=quantiles
-    )  # type: ignore
+    # If FlashInfer is available, use do_bench for all providers to keep methodology
+    # consistent and avoid CUDA-graph sensitivity.
+    use_cudagraph = not HAS_FLASHINFER
 
-    speed_med = float(jit_ms / p_ms)
-    speed_max = float(jit_max_ms / p_min_ms)
-    speed_min = float(jit_min_ms / p_max_ms)
+    base_ms, base_min_ms, base_max_ms = _bench_provider(
+        BASE_PROVIDER,
+        FN_MAP[BASE_PROVIDER],
+        quantiles=quantiles,
+        use_cudagraph=use_cudagraph,
+    )
+    if base_ms != base_ms:  # NaN
+        nan = float("nan")
+        return nan, nan, nan
+
+    p_ms, p_min_ms, p_max_ms = _bench_provider(
+        provider, FN_MAP[provider], quantiles=quantiles, use_cudagraph=use_cudagraph
+    )
+
+    speed_med = float(base_ms / p_ms)
+    speed_max = float(base_max_ms / p_min_ms)
+    speed_min = float(base_min_ms / p_max_ms)
     return speed_med, speed_max, speed_min
 
 
@@ -426,7 +559,7 @@ if __name__ == "__main__":
     benchmark.run(print_data=True)
     if (
         SHOW_SPEEDUP
-        and ("jit_cos_sin" in LINE_VALS)
+        and (BASE_PROVIDER in LINE_VALS)
         and (len(LINE_VALS) > 1)
         and (ONLY_PROVIDER is None)
     ):
