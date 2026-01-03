@@ -149,7 +149,7 @@ class TestFIFOScheduler(CustomTestCase):
 class TestMetrics(CustomTestCase):
     def test_batch_size_balancedness(self):
         recorder = BatchSizeBalancednessRecorder()
-        gpu_states = [GPUState(gpu_id=i) for i in range(2)]
+        gpu_states = [GPUState(gpu_id=i, max_total_tokens=10000) for i in range(2)]
         gpu_states[0].running_requests = [
             SimRequest(request_id="r1", input_len=100, output_len=50)
         ]
@@ -164,7 +164,7 @@ class TestMetrics(CustomTestCase):
 
     def test_attention_balancedness(self):
         recorder = AttentionBalancednessRecorder()
-        gpu_states = [GPUState(gpu_id=i) for i in range(2)]
+        gpu_states = [GPUState(gpu_id=i, max_total_tokens=10000) for i in range(2)]
         gpu_states[0].running_requests = [
             SimRequest(request_id="r1", input_len=100, output_len=50)
         ]
@@ -182,7 +182,7 @@ class TestMetrics(CustomTestCase):
 
     def test_all_zero_batch_size(self):
         recorder = BatchSizeBalancednessRecorder()
-        gpu_states = [GPUState(gpu_id=i) for i in range(2)]
+        gpu_states = [GPUState(gpu_id=i, max_total_tokens=10000) for i in range(2)]
         recorder.on_step_end(0, gpu_states)
         self.assertAlmostEqual(
             recorder.get_summary()["batch_size_balancedness_mean"], 1.0
@@ -522,9 +522,8 @@ class TestCLI(CustomTestCase):
             "--log-level", "2",
         )
         self.assertEqual(result.returncode, 0, f"CLI failed: {result.stderr}")
-        # Verify step logs (deterministic part of output)
         self.assertIn(
-            "step=0    | GPU0[R=2:synthetic_0,synthetic_2 Q=0:-] | GPU1[R=2:synthetic_1,synthetic_3 Q=0:-]",
+            "step=0    | GPU0[R=2:syn0,syn2 Q=0:-] | GPU1[R=2:syn1,syn3 Q=0:-]",
             result.stdout,
         )
         self.assertIn("step=1    | GPU0[R=0:- Q=0:-] | GPU1[R=0:- Q=0:-]", result.stdout)
@@ -544,13 +543,12 @@ class TestCLI(CustomTestCase):
             "--log-level", "2",
         )
         self.assertEqual(result.returncode, 0, f"CLI failed: {result.stderr}")
-        # Verify step logs show queuing behavior
         expected_steps = """\
-step=0    | GPU0[R=2:synthetic_0,synthetic_1 Q=2:synthetic_2,synthetic_3]
-step=1    | GPU0[R=2:synthetic_0,synthetic_1 Q=2:synthetic_2,synthetic_3]
-step=2    | GPU0[R=0:- Q=2:synthetic_2,synthetic_3]
-step=3    | GPU0[R=2:synthetic_2,synthetic_3 Q=0:-]
-step=4    | GPU0[R=2:synthetic_2,synthetic_3 Q=0:-]
+step=0    | GPU0[R=2:syn0,syn1 Q=2:syn2,syn3]
+step=1    | GPU0[R=2:syn0,syn1 Q=2:syn2,syn3]
+step=2    | GPU0[R=0:- Q=2:syn2,syn3]
+step=3    | GPU0[R=2:syn2,syn3 Q=0:-]
+step=4    | GPU0[R=2:syn2,syn3 Q=0:-]
 step=5    | GPU0[R=0:- Q=0:-]"""
         for line in expected_steps.split("\n"):
             self.assertIn(line, result.stdout)
