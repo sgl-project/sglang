@@ -61,7 +61,7 @@ class BaseTestRequestLogger:
         cls.stderr.close()
         cls._temp_dir_obj.cleanup()
 
-    def _verify_logs(self, content: str, source_name: str, with_header: bool = False):
+    def _verify_logs(self, content: str, source_name: str):
         raise NotImplementedError
 
     def _get_current_logs(self) -> str:
@@ -70,45 +70,34 @@ class BaseTestRequestLogger:
         file_content = "".join(f.read_text() for f in log_files) if log_files else ""
         return stdout_content + file_content
 
-    def _send_request(self, endpoint: str, body: dict, with_header: bool = True):
-        headers = {"X-SMG-Routing-Key": TEST_ROUTING_KEY} if with_header else {}
-        response = requests.post(
-            DEFAULT_URL_FOR_TEST + endpoint,
-            json=body,
-            headers=headers,
-            timeout=30,
-        )
-        self.assertEqual(response.status_code, 200)
-        time.sleep(1)
-        return self._get_current_logs()
-
     def test_endpoints_with_header(self):
         for endpoint, body in TEST_ENDPOINTS:
             with self.subTest(endpoint=endpoint):
-                content = self._send_request(endpoint, body, with_header=True)
-                self._verify_logs(content, endpoint, with_header=True)
-
-    def test_endpoint_without_header(self):
-        endpoint, body = TEST_ENDPOINTS[0]
-        content = self._send_request(endpoint, body, with_header=False)
-        self._verify_logs(content, f"{endpoint} without header", with_header=False)
+                response = requests.post(
+                    DEFAULT_URL_FOR_TEST + endpoint,
+                    json=body,
+                    headers={"X-SMG-Routing-Key": TEST_ROUTING_KEY},
+                    timeout=30,
+                )
+                self.assertEqual(response.status_code, 200)
+                time.sleep(1)
+                self._verify_logs(self._get_current_logs(), endpoint)
 
 
 class TestRequestLoggerText(BaseTestRequestLogger, CustomTestCase):
     log_requests_format = "text"
 
-    def _verify_logs(self, content: str, source_name: str, with_header: bool = False):
+    def _verify_logs(self, content: str, source_name: str):
         self.assertIn("Receive:", content, f"'Receive:' not found in {source_name}")
         self.assertIn("Finish:", content, f"'Finish:' not found in {source_name}")
-        if with_header:
-            self.assertIn(TEST_ROUTING_KEY, content, f"Routing key not found in {source_name}")
-            self.assertIn("x-smg-routing-key", content, f"Header name not found in {source_name}")
+        self.assertIn(TEST_ROUTING_KEY, content, f"Routing key not found in {source_name}")
+        self.assertIn("x-smg-routing-key", content, f"Header name not found in {source_name}")
 
 
 class TestRequestLoggerJson(BaseTestRequestLogger, CustomTestCase):
     log_requests_format = "json"
 
-    def _verify_logs(self, content: str, source_name: str, with_header: bool = False):
+    def _verify_logs(self, content: str, source_name: str):
         received_found, finished_found = False, False
         header_in_received, header_in_finished = False, False
         for line in content.splitlines():
@@ -135,9 +124,8 @@ class TestRequestLoggerJson(BaseTestRequestLogger, CustomTestCase):
 
         self.assertTrue(received_found, f"request.received not found in {source_name}")
         self.assertTrue(finished_found, f"request.finished not found in {source_name}")
-        if with_header:
-            self.assertTrue(header_in_received, f"Header not in request.received for {source_name}")
-            self.assertTrue(header_in_finished, f"Header not in request.finished for {source_name}")
+        self.assertTrue(header_in_received, f"Header not in request.received for {source_name}")
+        self.assertTrue(header_in_finished, f"Header not in request.finished for {source_name}")
 
 
 if __name__ == "__main__":
