@@ -621,6 +621,8 @@ mod tests {
         let worker_registry = Arc::new(crate::core::WorkerRegistry::new());
         let worker_job_queue = Arc::new(std::sync::OnceLock::new());
 
+        // Note: Using uninitialized queue for tests to avoid spawning background workers
+        // Jobs submitted during tests will queue but not be processed
         Arc::new(AppContext {
             client: reqwest::Client::new(),
             router_config: router_config.clone(),
