@@ -197,8 +197,6 @@ def disable_request_logging() -> bool:
     return get_bool_env_var("SGLANG_DISABLE_REQUEST_LOGGING")
 
 
-
-
 def _create_log_target(target: str) -> logging.Logger:
     if target.lower() == "stdout":
         return _create_log_target_stdout()
@@ -207,6 +205,7 @@ def _create_log_target(target: str) -> logging.Logger:
 
 def _create_log_target_stdout() -> logging.Logger:
     return _create_logger_with_handler(f"{__name__}.stdout", logging.StreamHandler())
+
 
 def _create_log_target_file(directory: str) -> logging.Logger:
     os.makedirs(directory, exist_ok=True)
@@ -219,6 +218,7 @@ def _create_log_target_file(directory: str) -> logging.Logger:
     return _create_logger_with_handler(
         f"{__name__}.file.{directory}.{hostname}_{rank}", handler
     )
+
 
 def _create_logger_with_handler(name: str, handler: logging.Handler) -> logging.Logger:
     logger = logging.getLogger(name)
