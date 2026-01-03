@@ -338,6 +338,76 @@ class TestSimulator(CustomTestCase):
         summary = sim.run([])
         self.assertEqual(summary, {})
 
+    def test_prefill_instant(self):
+        # With output_len=2, request should complete in 2 steps (not 3)
+        # because prefill is instant and decode starts immediately
+        requests = [SimRequest(request_id="r0", input_len=100, output_len=2)]
+        sim = Simulator(
+            num_gpus=1,
+            router=RoundRobinRouter(),
+            scheduler=FIFOScheduler(),
+        )
+        sim.run(requests)
+        # Request should be finished
+        self.assertEqual(len(sim.gpu_states[0].running_requests), 0)
+
+    def test_log_level_1(self):
+        import io
+        import sys
+
+        requests = [
+            SimRequest(request_id=f"r{i}", input_len=10, output_len=2)
+            for i in range(4)
+        ]
+        sim = Simulator(
+            num_gpus=2,
+            router=RoundRobinRouter(),
+            scheduler=FIFOScheduler(),
+            log_level=1,
+        )
+
+        captured = io.StringIO()
+        old_stdout = sys.stdout
+        sys.stdout = captured
+        try:
+            sim.run(requests)
+        finally:
+            sys.stdout = old_stdout
+
+        output = captured.getvalue()
+        self.assertIn("step=", output)
+        self.assertIn("GPU0", output)
+        self.assertIn("GPU1", output)
+        self.assertIn("R=", output)
+        self.assertIn("Q=", output)
+
+    def test_log_level_2(self):
+        import io
+        import sys
+
+        requests = [
+            SimRequest(request_id=f"req{i}", input_len=10, output_len=2)
+            for i in range(2)
+        ]
+        sim = Simulator(
+            num_gpus=2,
+            router=RoundRobinRouter(),
+            scheduler=FIFOScheduler(),
+            log_level=2,
+        )
+
+        captured = io.StringIO()
+        old_stdout = sys.stdout
+        sys.stdout = captured
+        try:
+            sim.run(requests)
+        finally:
+            sys.stdout = old_stdout
+
+        output = captured.getvalue()
+        self.assertIn("req0", output)
+        self.assertIn("req1", output)
+
 
 class TestCLI(CustomTestCase):
     def test_cli_basic(self):
@@ -431,6 +501,30 @@ class TestCLI(CustomTestCase):
         self.assertIn("Generated 100 synthetic requests", result.stdout)
         self.assertIn("input_len=512", result.stdout)
         self.assertIn("output_len=128", result.stdout)
+
+    def test_cli_log_level(self):
+        import subprocess
+        import sys
+
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "sglang.srt.debug_utils.schedule_simulator",
+                "--synthetic",
+                "--num-requests", "10",
+                "--output-len", "5",
+                "--num-gpus", "2",
+                "--log-level", "1",
+            ],
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertEqual(result.returncode, 0, f"CLI failed: {result.stderr}")
+        self.assertIn("step=", result.stdout)
+        self.assertIn("GPU0", result.stdout)
+        self.assertIn("R=", result.stdout)
 
 
 if __name__ == "__main__":
