@@ -189,7 +189,12 @@ pub fn should_forward_request_header(name: &str) -> bool {
     let lower_name = name.to_ascii_lowercase();
     matches!(
         lower_name.as_str(),
-        "authorization" | "x-request-id" | "x-correlation-id" | "traceparent" | "tracestate"
+        "authorization"
+            | "x-request-id"
+            | "x-correlation-id"
+            | "traceparent"
+            | "tracestate"
+            | "x-smg-routing-key"
     ) || lower_name.starts_with("x-request-id-")
 }
 
@@ -213,6 +218,8 @@ mod tests {
         assert!(should_forward_request_header("x-request-id-user"));
         assert!(should_forward_request_header("X-Request-ID-Span"));
         assert!(should_forward_request_header("x-request-id-123"));
+        assert!(should_forward_request_header("x-smg-routing-key"));
+        assert!(should_forward_request_header("X-SMG-Routing-Key"));
     }
 
     #[test]
@@ -230,7 +237,5 @@ mod tests {
         assert!(!should_forward_request_header("cookie"));
         assert!(!should_forward_request_header("x-custom-header"));
         assert!(!should_forward_request_header("x-api-key"));
-        assert!(!should_forward_request_header("x-smg-routing-key"));
-        assert!(!should_forward_request_header("X-SMG-Routing-Key"));
     }
 }
