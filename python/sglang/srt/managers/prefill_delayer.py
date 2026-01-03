@@ -17,16 +17,16 @@ class PrefillDelayer:
 
         assert (
             server_args.schedule_policy == "fcfs"
-        ), f"To use SCHEDULER_DECREASE_PREFILL_IDLE, schedule_policy must be 'fcfs'. '{server_args.schedule_policy}' is not supported."
+        ), f"To use PrefillDelayer, schedule_policy must be 'fcfs'. '{server_args.schedule_policy}' is not supported."
         assert (
             server_args.enable_dp_attention
-        ), "To use SCHEDULER_DECREASE_PREFILL_IDLE, enable_dp_attention must be enabled."
+        ), "To use PrefillDelayer, enable_dp_attention must be enabled."
         assert (
             server_args.disaggregation_mode == "null"
-        ), "To use SCHEDULER_DECREASE_PREFILL_IDLE, disaggregation_mode must be null."
+        ), "To use PrefillDelayer, disaggregation_mode must be null."
         assert (
             not server_args.disable_overlap_schedule
-        ), "To use SCHEDULER_DECREASE_PREFILL_IDLE, disable_overlap_schedule must be False."
+        ), "To use PrefillDelayer, disable_overlap_schedule must be False."
 
     def _gather_info(self, local_can_prefill: int, local_is_idle: bool):
         local_info = torch.tensor(
