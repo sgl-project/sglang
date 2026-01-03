@@ -290,6 +290,75 @@ class TestSimulator(CustomTestCase):
         self.assertEqual(summary, {})
 
 
+class TestCLI(CustomTestCase):
+    def test_cli_basic(self):
+        import subprocess
+        import sys
+
+        log_data = [
+            {"event": "request.finished", "rid": "r1", "out": {"meta_info": {"prompt_tokens": 100, "completion_tokens": 50}}},
+            {"event": "request.finished", "rid": "r2", "out": {"meta_info": {"prompt_tokens": 200, "completion_tokens": 100}}},
+        ]
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".log", delete=False) as f:
+            for item in log_data:
+                f.write(json.dumps(item) + "\n")
+            input_file = f.name
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+            output_file = f.name
+
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "sglang.srt.debug_utils.schedule_simulator",
+                "--input", input_file,
+                "--num-gpus", "2",
+                "--router", "round_robin",
+                "--output", output_file,
+            ],
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertEqual(result.returncode, 0, f"CLI failed: {result.stderr}")
+        self.assertIn("Loaded 2 requests", result.stdout)
+
+        with open(output_file) as f:
+            output = json.load(f)
+        self.assertIn("batch_size_balancedness_mean", output)
+        self.assertIn("attention_balancedness_mean", output)
+
+    def test_cli_random_router(self):
+        import subprocess
+        import sys
+
+        log_data = [
+            {"event": "request.finished", "rid": "r1", "out": {"meta_info": {"prompt_tokens": 100, "completion_tokens": 50}}},
+        ]
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".log", delete=False) as f:
+            for item in log_data:
+                f.write(json.dumps(item) + "\n")
+            input_file = f.name
+
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "sglang.srt.debug_utils.schedule_simulator",
+                "--input", input_file,
+                "--router", "random",
+            ],
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertEqual(result.returncode, 0, f"CLI failed: {result.stderr}")
+        self.assertIn("router=random", result.stdout)
+
+
 if __name__ == "__main__":
     unittest.main()
 
