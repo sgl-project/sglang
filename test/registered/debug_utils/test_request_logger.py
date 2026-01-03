@@ -102,6 +102,11 @@ class TestRequestLoggerJson(BaseTestRequestLogger, CustomTestCase):
             if not line.strip() or not line.startswith("{"):
                 continue
             data = json.loads(line)
+
+            rid = data.get("rid", "")
+            if rid.startswith("HEALTH_CHECK"):
+                continue
+
             if data.get("event") == "request.received":
                 self.assertIn("rid", data)
                 self.assertIn("obj", data)
