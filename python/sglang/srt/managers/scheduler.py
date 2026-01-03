@@ -16,6 +16,7 @@
 import faulthandler
 import logging
 import os
+import pickle
 import signal
 import sys
 import time
@@ -733,8 +734,6 @@ class Scheduler(
         self.running_batch: ScheduleBatch = ScheduleBatch(reqs=[], batch_is_full=False)
         # The current forward batch
         self.cur_batch: Optional[ScheduleBatch] = None
-        # The current split prefill batch
-        self.split_prefill_batch: Optional[ScheduleBatch] = None
         # The last forward batch
         self.last_batch: Optional[ScheduleBatch] = None
         self.forward_ct = 0
@@ -1186,6 +1185,41 @@ class Scheduler(
             return False
         return num_recv_reqs >= self.max_recv_per_poll
 
+    def _parse_multipart_message(self, parts):
+        # Check message type
+        msg_type = bytes(parts[0])
+
+        if msg_type == b"NORM":
+            # Normal message
+            recv_req = pickle.loads(parts[1])
+
+        elif msg_type == b"FEAT":
+            # Message with optimized feature tensors
+            recv_req = pickle.loads(parts[1])
+            feature_infos = pickle.loads(parts[2])
+
+            # Reconstruct tensors
+            for i, feature_info in enumerate(feature_infos):
+                buffer_idx = 3 + i
+                buffer = (
+                    parts[buffer_idx].buffer
+                    if hasattr(parts[buffer_idx], "buffer")
+                    else parts[buffer_idx]
+                )
+
+                dtype = feature_info["dtype"]
+                shape = feature_info["shape"]
+                tensor = torch.frombuffer(buffer, dtype=dtype).reshape(shape)
+
+                idx = feature_info["idx"]
+                if hasattr(recv_req, "mm_inputs") and recv_req.mm_inputs:
+                    mm_items = recv_req.mm_inputs.get("mm_items", [])
+                    if idx < len(mm_items):
+                        mm_items[idx].feature = tensor
+        else:
+            logger.warning(f"Unknown message type: {msg_type}")
+        return recv_req
+
     def recv_requests(
         self,
     ) -> List[Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput, Any]]:
@@ -1206,10 +1240,15 @@ class Scheduler(
                     try:
                         if self.recv_limit_reached(len(recv_reqs)):
                             break
-                        recv_req = self.recv_from_tokenizer.recv_pyobj(zmq.NOBLOCK)
-                    except zmq.ZMQError:
+                        parts = self.recv_from_tokenizer.recv_multipart(
+                            flags=zmq.NOBLOCK, copy=False
+                        )
+                        if not parts:
+                            break
+                        recv_req = self._parse_multipart_message(parts)
+                        recv_reqs.append(recv_req)
+                    except zmq.ZMQError as e:
                         break
-                    recv_reqs.append(recv_req)
 
                 while True:
                     try:
@@ -1531,6 +1570,10 @@ class Scheduler(
             req.set_finish_with_abort(error_msg)
             self._add_request_to_queue(req)
             return
+
+        if not recv_req.return_logprob and recv_req.logprob_start_len != -1:
+            # When return_logprob is False, logprob_start_len should be ignored
+            recv_req.logprob_start_len = -1
 
         if recv_req.logprob_start_len == -1:
             if req.is_prefill_only:

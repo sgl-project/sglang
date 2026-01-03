@@ -151,8 +151,11 @@ class DiffusionServerArgs:
     ring_degree: int | None = None
     # LoRA
     lora_path: str | None = None  # LoRA adapter path (HF repo or local path)
+    # misc
+    enable_warmup: bool = False
 
     dit_layerwise_offload: bool = False
+    enable_cache_dit: bool = False
 
 
 @dataclass(frozen=True)
@@ -305,6 +308,17 @@ ONE_GPU_CASES_A: list[DiffusionTestCase] = [
         T2I_sampling_params,
     ),
     DiffusionTestCase(
+        "qwen_image_t2i_cache_dit_enabled",
+        DiffusionServerArgs(
+            model_path="Qwen/Qwen-Image",
+            modality="image",
+            warmup_text=1,
+            warmup_edit=0,
+            enable_cache_dit=True,
+        ),
+        T2I_sampling_params,
+    ),
+    DiffusionTestCase(
         "flux_image_t2i",
         DiffusionServerArgs(
             model_path="black-forest-labs/FLUX.1-dev",
@@ -344,6 +358,13 @@ ONE_GPU_CASES_A: list[DiffusionTestCase] = [
             modality="image",
             warmup_text=1,
             warmup_edit=0,
+        ),
+        T2I_sampling_params,
+    ),
+    DiffusionTestCase(
+        "zimage_image_t2i_warmup",
+        DiffusionServerArgs(
+            model_path="Tongyi-MAI/Z-Image-Turbo", modality="image", enable_warmup=True
         ),
         T2I_sampling_params,
     ),
@@ -414,14 +435,14 @@ ONE_GPU_CASES_B: list[DiffusionTestCase] = [
     ),
     # NOTE(mick): flaky
     # DiffusionTestCase(
-    #     id="hunyuan_video",
-    #     model_path="hunyuanvideo-community/HunyuanVideo",
-    #     modality="video",
-    #     prompt="A curious raccoon",
-    #     output_size="720x480",
-    #     warmup_text=0,
-    #     warmup_edit=0,
-    #     custom_validator="video",
+    #     "hunyuan_video",
+    #     DiffusionServerArgs(
+    #         model_path="hunyuanvideo-community/HunyuanVideo",
+    #         modality="video",
+    #     ),
+    #     DiffusionSamplingParams(
+    #         prompt=T2V_PROMPT,
+    #     ),
     # ),
     DiffusionTestCase(
         "flux_2_ti2i",

@@ -69,11 +69,29 @@ def apply_flashinfer_rope_qk_inplace(
 
     try:
         from flashinfer.rope import apply_rope_with_cos_sin_cache_inplace
-    except Exception as e:
-        raise RuntimeError(
-            "flashinfer is required for apply_flashinfer_rope_qk_inplace. "
-            "Please install flashinfer or disable this optimization."
-        ) from e
+    except ImportError:
+        # Triton fallback for AMD/ROCm where FlashInfer is not available
+        import warnings
+
+        warnings.warn(
+            "FlashInfer not available, using Triton fallback for RoPE",
+            stacklevel=2,
+        )
+        half_size = cos_sin_cache.shape[-1] // 2
+        if positions is None:
+            cos = cos_sin_cache[:seqlen, :half_size].to(q.dtype)
+            sin = cos_sin_cache[:seqlen, half_size:].to(q.dtype)
+            cos = cos.unsqueeze(0).expand(bsz, -1, -1).reshape(bsz * seqlen, -1)
+            sin = sin.unsqueeze(0).expand(bsz, -1, -1).reshape(bsz * seqlen, -1)
+        else:
+            positions = positions.to(cos_sin_cache.device).view(-1)
+            cos = cos_sin_cache[positions, :half_size].to(q.dtype)
+            sin = cos_sin_cache[positions, half_size:].to(q.dtype)
+        q_flat = q.reshape(bsz * seqlen, nheads, d)
+        k_flat = k.reshape(bsz * seqlen, nheads, d)
+        q_rot = apply_rotary_embedding(q_flat, cos, sin, interleaved=not is_neox)
+        k_rot = apply_rotary_embedding(k_flat, cos, sin, interleaved=not is_neox)
+        return q_rot.view(bsz, seqlen, nheads, d), k_rot.view(bsz, seqlen, nheads, d)
 
     if positions is None:
         pos_1d = torch.arange(seqlen, device="cpu", dtype=torch.long)

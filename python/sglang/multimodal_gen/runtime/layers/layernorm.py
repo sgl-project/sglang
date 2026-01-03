@@ -434,37 +434,17 @@ def apply_qk_norm(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Apply QK normalization for query and key tensors.
 
-    Prefer the fused inplace QK-norm kernel when applicable;
-    otherwise fall back to PyTorch norms.
+    Uses JIT fused inplace kernel when available, falls back to standard RMSNorm.
     """
 
     batch_size = q.size(0)
     q_eps = q_norm.variance_epsilon
     k_eps = k_norm.variance_epsilon
-
-    def can_view_as_bnhd(x: torch.Tensor) -> bool:
-        """Whether `x` can be viewed as [batch, *, head_dim] without a copy."""
-        if (
-            x.dim() < 2
-            or x.size(0) != batch_size
-            or x.size(-1) != head_dim
-            or x.stride(-1) != 1
-            or x.stride(-2) != head_dim
-        ):
-            return False
-        try:
-            x.view(batch_size, -1, head_dim)
-            return True
-        except RuntimeError:
-            return False
-
+    # Only try fused path on CUDA and when it won't introduce implicit copies.
     if (
         q.is_cuda
-        and (torch.version.cuda is not None)
         and allow_inplace
         and (q_eps == k_eps)
-        and can_view_as_bnhd(q)
-        and can_view_as_bnhd(k)
         and can_use_fused_inplace_qknorm(head_dim)
     ):
         fused_inplace_qknorm(
@@ -477,8 +457,15 @@ def apply_qk_norm(
         )
         return q, k
 
-    # Fallback: apply the PyTorch norms.
-    q_out = q_norm(q)
-    k_out = k_norm(k)
+    # Fallback for AMD/ROCm: apply RMSNorm separately to q and k
+    import warnings
 
+    warnings.warn(
+        "Fused QK-norm not available, using RMSNorm fallback",
+        stacklevel=2,
+    )
+    q_shape = q.shape
+    k_shape = k.shape
+    q_out = q_norm(q.view(-1, head_dim)).view(q_shape)
+    k_out = k_norm(k.view(-1, head_dim)).view(k_shape)
     return q_out, k_out

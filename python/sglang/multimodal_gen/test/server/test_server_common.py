@@ -83,12 +83,21 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
     if server_args.lora_path:
         extra_args += f" --lora-path {server_args.lora_path}"
 
+    if server_args.enable_warmup:
+        extra_args += f" --enable-warmup"
+
+    # Build custom environment variables
+    env_vars = {}
+    if server_args.enable_cache_dit:
+        env_vars["SGLANG_CACHE_DIT_ENABLED"] = "true"
+
     # start server
     manager = ServerManager(
         model=server_args.model_path,
         port=port,
         wait_deadline=float(os.environ.get("SGLANG_TEST_WAIT_SECS", "1200")),
         extra_args=extra_args,
+        env_vars=env_vars,
     )
     ctx = manager.start()
 
