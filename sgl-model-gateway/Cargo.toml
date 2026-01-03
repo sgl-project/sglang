@@ -14,7 +14,7 @@ vendored-openssl = ["openssl/vendored"]
 unused_qualifications = "warn"
 
 [lib]
-name = "sgl_model_gateway"
+name = "smg"
 crate-type = ["rlib"]
 
 [[bin]]

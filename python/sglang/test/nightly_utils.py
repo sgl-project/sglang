@@ -309,14 +309,16 @@ class NightlyBenchmarkRunner:
             print(f"  Warning: Could not fetch spec accept length: {e}")
         return None
 
-    def add_report(self, results: List[BenchmarkResult]) -> None:
+    def add_report(
+        self, results: List[BenchmarkResult], variant: Optional[str] = None
+    ) -> None:
         """Add benchmark results to the full report.
 
         Args:
             results: List of BenchmarkResult objects to add to report
         """
         if results:
-            report_part = generate_markdown_report(self.profile_dir, results)
+            report_part = generate_markdown_report(self.profile_dir, results, variant)
             self.full_report += report_part + "\n"
 
     def write_final_report(self) -> None:

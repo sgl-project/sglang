@@ -185,7 +185,7 @@ impl WasmThreadPool {
         let num_workers = config.thread_pool_size.clamp(1, max_workers);
 
         debug!(
-            target: "sgl_model_gateway::wasm::runtime",
+            target: "smg::wasm::runtime",
             "Initializing WASM runtime with {} workers",
             num_workers
         );
@@ -200,7 +200,7 @@ impl WasmThreadPool {
                     Ok(rt) => rt,
                     Err(e) => {
                         error!(
-                            target: "sgl_model_gateway::wasm::runtime",
+                            target: "smg::wasm::runtime",
                             worker_id = worker_id,
                             "Failed to create tokio runtime: {}",
                             e
@@ -242,7 +242,7 @@ impl WasmThreadPool {
         config: WasmRuntimeConfig,
     ) {
         debug!(
-            target: "sgl_model_gateway::wasm::runtime",
+            target: "smg::wasm::runtime",
             worker_id = worker_id,
             thread_id = ?std::thread::current().id(),
             "Worker started"
@@ -270,7 +270,7 @@ impl WasmThreadPool {
             Ok(engine) => engine,
             Err(e) => {
                 error!(
-                    target: "sgl_model_gateway::wasm::runtime",
+                    target: "smg::wasm::runtime",
                     worker_id = worker_id,
                     "Failed to create engine: {}",
                     e
@@ -297,7 +297,7 @@ impl WasmThreadPool {
         });
 
         debug!(
-            target: "sgl_model_gateway::wasm::runtime",
+            target: "smg::wasm::runtime",
             worker_id = worker_id,
             epoch_interval_ms = EPOCH_INTERVAL_MS,
             "Epoch incrementer started for timeout enforcement"
@@ -308,7 +308,7 @@ impl WasmThreadPool {
                 Ok(task) => task,
                 Err(_) => {
                     debug!(
-                        target: "sgl_model_gateway::wasm::runtime",
+                        target: "smg::wasm::runtime",
                         worker_id = worker_id,
                         "Worker shutting down"
                     );

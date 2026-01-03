@@ -13,13 +13,16 @@
 //! ## Header
 //! - `X-SMG-Routing-Key`: The routing key for sticky session routing
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Instant};
 
 use dashmap::{mapref::entry::Entry, DashMap};
 use http::header::HeaderName;
 use rand::Rng;
+use tracing::info;
 
-use super::{get_healthy_worker_indices, LoadBalancingPolicy, SelectWorkerInfo};
+use super::{
+    get_healthy_worker_indices, utils::PeriodicTask, LoadBalancingPolicy, SelectWorkerInfo,
+};
 use crate::{core::Worker, observability::metrics::Metrics};
 
 /// Header for routing key based sticky sessions
@@ -28,10 +31,9 @@ static HEADER_ROUTING_KEY: HeaderName = HeaderName::from_static("x-smg-routing-k
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ExecutionBranch {
     NoHealthyWorkers,
-    FastPathHit,
-    SlowPathOccupiedHit,
-    SlowPathOccupiedMiss,
-    SlowPathVacant,
+    OccupiedHit,
+    OccupiedMiss,
+    Vacant,
     NoRoutingId,
 }
 
@@ -39,10 +41,9 @@ impl ExecutionBranch {
     fn as_str(&self) -> &'static str {
         match self {
             Self::NoHealthyWorkers => "no_healthy_workers",
-            Self::FastPathHit => "fast_path_hit",
-            Self::SlowPathOccupiedHit => "slow_path_occupied_hit",
-            Self::SlowPathOccupiedMiss => "slow_path_occupied_miss",
-            Self::SlowPathVacant => "slow_path_vacant",
+            Self::OccupiedHit => "occupied_hit",
+            Self::OccupiedMiss => "occupied_miss",
+            Self::Vacant => "vacant",
             Self::NoRoutingId => "no_routing_id",
         }
     }
@@ -60,11 +61,27 @@ impl RoutingId {
 const MAX_CANDIDATE_WORKERS: usize = 2;
 
 #[derive(Debug, Clone)]
-struct RoutingInfo {
-    candi_worker_urls: Vec<String>,
+pub struct ManualConfig {
+    pub eviction_interval_secs: u64,
+    pub max_idle_secs: u64,
 }
 
-impl RoutingInfo {
+impl Default for ManualConfig {
+    fn default() -> Self {
+        Self {
+            eviction_interval_secs: 60,
+            max_idle_secs: 4 * 3600,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct Node {
+    candi_worker_urls: Vec<String>,
+    last_access: Instant,
+}
+
+impl Node {
     fn push_bounded(&mut self, url: String) {
         while self.candi_worker_urls.len() >= MAX_CANDIDATE_WORKERS {
             self.candi_worker_urls.remove(0);
@@ -74,16 +91,60 @@ impl RoutingInfo {
 }
 
 // TODO may optimize performance
-// TODO evict old data periodically
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct ManualPolicy {
-    routing_map: DashMap<RoutingId, RoutingInfo>,
+    routing_map: Arc<DashMap<RoutingId, Node>>,
+    _eviction_task: Option<PeriodicTask>,
+}
+
+impl Default for ManualPolicy {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ManualPolicy {
     pub fn new() -> Self {
+        Self::with_config(ManualConfig::default())
+    }
+
+    pub fn with_config(config: ManualConfig) -> Self {
+        use std::time::Duration;
+
+        let routing_map = Arc::new(DashMap::<RoutingId, Node>::new());
+
+        let eviction_task = if config.eviction_interval_secs > 0 && config.max_idle_secs > 0 {
+            let routing_map_clone = Arc::clone(&routing_map);
+            let max_idle = Duration::from_secs(config.max_idle_secs);
+
+            Some(PeriodicTask::spawn(
+                config.eviction_interval_secs,
+                "ManualPolicyEviction",
+                move || {
+                    let now = Instant::now();
+                    let before_size = routing_map_clone.len();
+
+                    routing_map_clone
+                        .retain(|_, node| now.duration_since(node.last_access) < max_idle);
+
+                    let evicted_count = before_size - routing_map_clone.len();
+                    if evicted_count > 0 {
+                        info!(
+                            "ManualPolicy TTL eviction: evicted {} entries, remaining {} (max_idle: {}s)",
+                            evicted_count,
+                            routing_map_clone.len(),
+                            max_idle.as_secs()
+                        );
+                    }
+                },
+            ))
+        } else {
+            None
+        };
+
         Self {
-            routing_map: DashMap::new(),
+            routing_map,
+            _eviction_task: eviction_task,
         }
     }
 
@@ -95,35 +156,27 @@ impl ManualPolicy {
     ) -> (usize, ExecutionBranch) {
         let routing_id = RoutingId::new(routing_id);
 
-        // Fast path
-        if let Some(info) = self.routing_map.get(&routing_id) {
-            if let Some(idx) =
-                find_healthy_worker(&info.candi_worker_urls, workers, healthy_indices)
-            {
-                return (idx, ExecutionBranch::FastPathHit);
-            }
-        }
-
-        // Slow path
         match self.routing_map.entry(routing_id) {
             Entry::Occupied(mut entry) => {
+                let node = entry.get_mut();
+                node.last_access = Instant::now();
                 if let Some(idx) =
-                    find_healthy_worker(&entry.get().candi_worker_urls, workers, healthy_indices)
+                    find_healthy_worker(&node.candi_worker_urls, workers, healthy_indices)
                 {
-                    return (idx, ExecutionBranch::SlowPathOccupiedHit);
+                    (idx, ExecutionBranch::OccupiedHit)
+                } else {
+                    let selected_idx = random_select(healthy_indices);
+                    node.push_bounded(workers[selected_idx].url().to_string());
+                    (selected_idx, ExecutionBranch::OccupiedMiss)
                 }
-                let selected_idx = random_select(healthy_indices);
-                entry
-                    .get_mut()
-                    .push_bounded(workers[selected_idx].url().to_string());
-                (selected_idx, ExecutionBranch::SlowPathOccupiedMiss)
             }
             Entry::Vacant(entry) => {
                 let selected_idx = random_select(healthy_indices);
-                entry.insert(RoutingInfo {
+                entry.insert(Node {
                     candi_worker_urls: vec![workers[selected_idx].url().to_string()],
+                    last_access: Instant::now(),
                 });
-                (selected_idx, ExecutionBranch::SlowPathVacant)
+                (selected_idx, ExecutionBranch::Vacant)
             }
         }
     }
@@ -238,7 +291,7 @@ mod tests {
 
         let (first_result, branch) = policy.select_worker_impl(&workers, &info);
         let first_idx = first_result.unwrap();
-        assert_eq!(branch, ExecutionBranch::SlowPathVacant);
+        assert_eq!(branch, ExecutionBranch::Vacant);
 
         for _ in 0..10 {
             let (result, branch) = policy.select_worker_impl(&workers, &info);
@@ -247,7 +300,7 @@ mod tests {
                 Some(first_idx),
                 "Same routing_id should route to same worker"
             );
-            assert_eq!(branch, ExecutionBranch::FastPathHit);
+            assert_eq!(branch, ExecutionBranch::OccupiedHit);
         }
     }
 
@@ -264,7 +317,7 @@ mod tests {
                 ..Default::default()
             };
             let (result, branch) = policy.select_worker_impl(&workers, &info);
-            assert_eq!(branch, ExecutionBranch::SlowPathVacant);
+            assert_eq!(branch, ExecutionBranch::Vacant);
             *distribution.entry(result.unwrap()).or_insert(0) += 1;
         }
 
@@ -307,12 +360,12 @@ mod tests {
 
         let (result, branch) = policy.select_worker_impl(&workers, &info);
         assert_eq!(result, Some(1), "Should only select healthy worker");
-        assert_eq!(branch, ExecutionBranch::SlowPathVacant);
+        assert_eq!(branch, ExecutionBranch::Vacant);
 
         for _ in 0..10 {
             let (result, branch) = policy.select_worker_impl(&workers, &info);
             assert_eq!(result, Some(1), "Should only select healthy worker");
-            assert_eq!(branch, ExecutionBranch::FastPathHit);
+            assert_eq!(branch, ExecutionBranch::OccupiedHit);
         }
     }
 
@@ -371,14 +424,14 @@ mod tests {
 
         let (first_result, branch) = policy.select_worker_impl(&workers, &info);
         let first_idx = first_result.unwrap();
-        assert_eq!(branch, ExecutionBranch::SlowPathVacant);
+        assert_eq!(branch, ExecutionBranch::Vacant);
 
         workers[first_idx].set_healthy(false);
 
         let (new_result, branch) = policy.select_worker_impl(&workers, &info);
         let new_idx = new_result.unwrap();
         assert_ne!(new_idx, first_idx, "Should remap to healthy worker");
-        assert_eq!(branch, ExecutionBranch::SlowPathOccupiedMiss);
+        assert_eq!(branch, ExecutionBranch::OccupiedMiss);
 
         for _ in 0..10 {
             let (result, branch) = policy.select_worker_impl(&workers, &info);
@@ -387,7 +440,7 @@ mod tests {
                 Some(new_idx),
                 "Should consistently route to new worker"
             );
-            assert_eq!(branch, ExecutionBranch::FastPathHit);
+            assert_eq!(branch, ExecutionBranch::OccupiedHit);
         }
     }
 
@@ -418,12 +471,12 @@ mod tests {
 
         let (result, branch) = policy.select_worker_impl(&workers, &info);
         assert_eq!(result, Some(0));
-        assert_eq!(branch, ExecutionBranch::SlowPathVacant);
+        assert_eq!(branch, ExecutionBranch::Vacant);
 
         for _ in 0..10 {
             let (result, branch) = policy.select_worker_impl(&workers, &info);
             assert_eq!(result, Some(0));
-            assert_eq!(branch, ExecutionBranch::FastPathHit);
+            assert_eq!(branch, ExecutionBranch::OccupiedHit);
         }
     }
 
@@ -440,14 +493,14 @@ mod tests {
 
         let (first_result, branch) = policy.select_worker_impl(&workers, &info);
         let first_idx = first_result.unwrap();
-        assert_eq!(branch, ExecutionBranch::SlowPathVacant);
+        assert_eq!(branch, ExecutionBranch::Vacant);
 
         workers[first_idx].set_healthy(false);
 
         let (second_result, branch) = policy.select_worker_impl(&workers, &info);
         let second_idx = second_result.unwrap();
         assert_ne!(second_idx, first_idx);
-        assert_eq!(branch, ExecutionBranch::SlowPathOccupiedMiss);
+        assert_eq!(branch, ExecutionBranch::OccupiedMiss);
 
         workers[first_idx].set_healthy(true);
 
@@ -457,7 +510,7 @@ mod tests {
             Some(first_idx),
             "Should return to original worker after recovery since it's first in candidate list"
         );
-        assert_eq!(branch, ExecutionBranch::FastPathHit);
+        assert_eq!(branch, ExecutionBranch::OccupiedHit);
     }
 
     #[test]
@@ -473,14 +526,14 @@ mod tests {
 
         let (first_result, branch) = policy.select_worker_impl(&workers, &info);
         let first_idx = first_result.unwrap();
-        assert_eq!(branch, ExecutionBranch::SlowPathVacant);
+        assert_eq!(branch, ExecutionBranch::Vacant);
 
         workers[first_idx].set_healthy(false);
 
         let (second_result, branch) = policy.select_worker_impl(&workers, &info);
         let second_idx = second_result.unwrap();
         assert_ne!(second_idx, first_idx);
-        assert_eq!(branch, ExecutionBranch::SlowPathOccupiedMiss);
+        assert_eq!(branch, ExecutionBranch::OccupiedMiss);
 
         workers[second_idx].set_healthy(false);
 
@@ -491,7 +544,7 @@ mod tests {
             Some(remaining_idx),
             "Should select the only remaining healthy worker"
         );
-        assert_eq!(branch, ExecutionBranch::SlowPathOccupiedMiss);
+        assert_eq!(branch, ExecutionBranch::OccupiedMiss);
 
         workers[first_idx].set_healthy(true);
 
@@ -501,7 +554,7 @@ mod tests {
             Some(first_idx),
             "First worker should be evicted from candidates due to MAX_CANDIDATE_WORKERS=2"
         );
-        assert_eq!(branch, ExecutionBranch::FastPathHit);
+        assert_eq!(branch, ExecutionBranch::OccupiedHit);
     }
 
     #[test]
@@ -512,8 +565,9 @@ mod tests {
 
     #[test]
     fn test_manual_routing_info_push_bounded() {
-        let mut info = RoutingInfo {
+        let mut info = Node {
             candi_worker_urls: vec!["http://w1:8000".to_string()],
+            last_access: Instant::now(),
         };
 
         info.push_bounded("http://w2:8000".to_string());
@@ -581,5 +635,83 @@ mod tests {
             None,
             "Should return None for unknown URL"
         );
+    }
+
+    #[test]
+    fn test_manual_config_default() {
+        let config = ManualConfig::default();
+        assert_eq!(config.eviction_interval_secs, 60);
+        assert_eq!(config.max_idle_secs, 4 * 3600);
+    }
+
+    #[test]
+    fn test_manual_with_disabled_eviction() {
+        let config = ManualConfig {
+            eviction_interval_secs: 0,
+            max_idle_secs: 3600,
+        };
+        let policy = ManualPolicy::with_config(config);
+        assert!(policy._eviction_task.is_none());
+    }
+
+    #[test]
+    fn test_manual_last_access_updates() {
+        let policy = ManualPolicy::new();
+        let workers = create_workers(&["http://w1:8000", "http://w2:8000"]);
+        let headers = headers_with_routing_key("test-key");
+        let info = SelectWorkerInfo {
+            headers: Some(&headers),
+            ..Default::default()
+        };
+        let routing_id = RoutingId::new("test-key");
+
+        // Vacant: first access
+        let (result, branch) = policy.select_worker_impl(&workers, &info);
+        assert_eq!(branch, ExecutionBranch::Vacant);
+        let first_idx = result.unwrap();
+        let access_after_vacant = policy.routing_map.get(&routing_id).unwrap().last_access;
+        assert!(access_after_vacant.elapsed().as_millis() < 100);
+
+        std::thread::sleep(std::time::Duration::from_millis(10));
+
+        // OccupiedHit: same worker still healthy
+        let (_, branch) = policy.select_worker_impl(&workers, &info);
+        assert_eq!(branch, ExecutionBranch::OccupiedHit);
+        let access_after_hit = policy.routing_map.get(&routing_id).unwrap().last_access;
+        assert!(access_after_hit > access_after_vacant);
+
+        std::thread::sleep(std::time::Duration::from_millis(10));
+
+        // OccupiedMiss: worker becomes unhealthy
+        workers[first_idx].set_healthy(false);
+        let (_, branch) = policy.select_worker_impl(&workers, &info);
+        assert_eq!(branch, ExecutionBranch::OccupiedMiss);
+        let access_after_miss = policy.routing_map.get(&routing_id).unwrap().last_access;
+        assert!(access_after_miss > access_after_hit);
+    }
+
+    #[test]
+    fn test_manual_ttl_eviction_logic() {
+        use std::time::Duration;
+
+        let config = ManualConfig {
+            eviction_interval_secs: 2,
+            max_idle_secs: 2,
+        };
+        let policy = ManualPolicy::with_config(config);
+        let workers = create_workers(&["http://w1:8000", "http://w2:8000"]);
+
+        let headers = headers_with_routing_key("key-0");
+        let info = SelectWorkerInfo {
+            headers: Some(&headers),
+            ..Default::default()
+        };
+        policy.select_worker_impl(&workers, &info);
+
+        assert_eq!(policy.routing_map.len(), 1);
+
+        std::thread::sleep(Duration::from_secs(4));
+
+        assert_eq!(policy.routing_map.len(), 0);
     }
 }

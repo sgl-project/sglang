@@ -33,8 +33,9 @@ class RouterArgs:
     cache_threshold: float = 0.3
     balance_abs_threshold: int = 64
     balance_rel_threshold: float = 1.5
-    eviction_interval_secs: int = 120
+    eviction_interval_secs: int = 60
     max_tree_size: int = 2**26
+    max_idle_secs: int = 4 * 3600
     max_payload_size: int = 512 * 1024 * 1024  # 512MB default for large batches
     bucket_adjust_interval_secs: int = 5
     dp_aware: bool = False
@@ -296,6 +297,12 @@ class RouterArgs:
             type=int,
             default=RouterArgs.max_tree_size,
             help="Maximum size of the approximation tree for cache-aware routing",
+        )
+        routing_group.add_argument(
+            f"--{prefix}max-idle-secs",
+            type=int,
+            default=RouterArgs.max_idle_secs,
+            help="Maximum idle time in seconds before eviction (for manual policy)",
         )
         routing_group.add_argument(
             f"--{prefix}max-payload-size",

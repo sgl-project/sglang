@@ -3,7 +3,7 @@
 //! When tool call parsing fails, the original text should be preserved as normal text
 //! rather than being lost. This ensures graceful degradation.
 
-use sgl_model_gateway::tool_parser::{
+use smg::tool_parser::{
     DeepSeekParser, JsonParser, LlamaParser, MistralParser, QwenParser, ToolParser,
 };
 

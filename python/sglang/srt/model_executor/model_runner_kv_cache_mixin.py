@@ -33,7 +33,6 @@ from sglang.srt.utils.common import (
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
-    from sglang.srt.server_args import ServerArgs
 
 # the ratio of mamba cache pool size to max_running_requests
 MAMBA_CACHE_SIZE_MAX_RUNNING_REQUESTS_RATIO = 3
@@ -268,11 +267,9 @@ class ModelRunnerKVCacheMixin:
             f"Use sliding window memory pool. full_layer_tokens={self.full_max_total_num_tokens}, swa_layer_tokens={self.swa_max_total_num_tokens}"
         )
 
-    def init_memory_pool(
-        self: ModelRunner, total_gpu_memory: int, server_args: ServerArgs
-    ):
-        max_num_reqs = server_args.max_running_requests
-        max_total_tokens = server_args.max_total_tokens
+    def init_memory_pool(self: ModelRunner, total_gpu_memory: int):
+        max_num_reqs = self.server_args.max_running_requests
+        max_total_tokens = self.server_args.max_total_tokens
         self.max_total_num_tokens = self.profile_max_num_token(total_gpu_memory)
 
         if max_num_reqs is None:
@@ -303,7 +300,7 @@ class ModelRunnerKVCacheMixin:
                 max_num_reqs, self.server_args.max_mamba_cache_size // ratio
             )
 
-        if self.spec_algorithm.is_eagle() or self.spec_algorithm.is_standalone():
+        if not self.spec_algorithm.is_none():
             if self.is_draft_worker:
                 self.max_total_num_tokens = self.server_args.draft_runner_cache_size
                 max_num_reqs = self.server_args.max_num_reqs
@@ -520,6 +517,7 @@ class ModelRunnerKVCacheMixin:
                 self.token_to_kv_pool = SWAKVPool(
                     size=self.full_max_total_num_tokens,
                     size_swa=self.swa_max_total_num_tokens,
+                    page_size=self.page_size,
                     dtype=self.kv_cache_dtype,
                     head_num=self.model_config.get_num_kv_heads(
                         get_attention_tp_size()
@@ -617,17 +615,18 @@ class ModelRunnerKVCacheMixin:
                     need_sort=need_sort,
                 )
             else:
-                if self.page_size == 1:
-                    if self.is_hybrid_swa:
-                        self.token_to_kv_pool_allocator = SWATokenToKVPoolAllocator(
-                            self.full_max_total_num_tokens,
-                            self.swa_max_total_num_tokens,
-                            dtype=self.kv_cache_dtype,
-                            device=self.device,
-                            kvcache=self.token_to_kv_pool,
-                            need_sort=need_sort,
-                        )
-                    else:
+                if self.is_hybrid_swa:
+                    self.token_to_kv_pool_allocator = SWATokenToKVPoolAllocator(
+                        self.full_max_total_num_tokens,
+                        self.swa_max_total_num_tokens,
+                        page_size=self.page_size,
+                        dtype=self.kv_cache_dtype,
+                        device=self.device,
+                        kvcache=self.token_to_kv_pool,
+                        need_sort=need_sort,
+                    )
+                else:
+                    if self.page_size == 1:
                         self.token_to_kv_pool_allocator = TokenToKVPoolAllocator(
                             self.max_total_num_tokens,
                             dtype=self.kv_cache_dtype,
@@ -635,16 +634,16 @@ class ModelRunnerKVCacheMixin:
                             kvcache=self.token_to_kv_pool,
                             need_sort=need_sort,
                         )
-                else:
-                    assert not self.is_hybrid_swa
-                    self.token_to_kv_pool_allocator = PagedTokenToKVPoolAllocator(
-                        self.max_total_num_tokens,
-                        page_size=self.page_size,
-                        dtype=self.kv_cache_dtype,
-                        device=self.device,
-                        kvcache=self.token_to_kv_pool,
-                        need_sort=need_sort,
-                    )
+                    else:
+                        self.token_to_kv_pool_allocator = PagedTokenToKVPoolAllocator(
+                            self.max_total_num_tokens,
+                            page_size=self.page_size,
+                            dtype=self.kv_cache_dtype,
+                            device=self.device,
+                            kvcache=self.token_to_kv_pool,
+                            need_sort=need_sort,
+                        )
+
         else:
             assert self.is_draft_worker
             if self.is_hybrid_swa:

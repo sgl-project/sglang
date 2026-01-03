@@ -1,8 +1,4 @@
-"""
-The definition of CustomOps for multi hardware dispatching.
-
-TODO: Move this to python/sglang/srt/layers/custom_op.py
-"""
+from typing import Callable
 
 from torch import nn
 
@@ -23,10 +19,10 @@ _is_npu = is_npu()
 _is_xpu = is_xpu()
 
 
-class CustomOp(nn.Module):
+class MultiPlatformOp(nn.Module):
     def __init__(self):
         super().__init__()
-        self._forward_method = self.dispatch_forward()
+        self._forward_method: Callable = self.dispatch_forward()
 
         # States for torch.compile
         self._original_forward_method = None

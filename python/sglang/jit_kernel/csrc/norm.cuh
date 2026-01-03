@@ -2,6 +2,7 @@
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.cuh>
 #include <sgl_kernel/utils.h>
+#include <sgl_kernel/vec.cuh>
 #include <sgl_kernel/warp.cuh>
 
 #include <cuda_bf16.h>
@@ -9,6 +10,7 @@
 #include <dlpack/dlpack.h>
 #include <tvm/ffi/container/tensor.h>
 
+#include <cstddef>
 #include <cstdint>
 #include <type_traits>
 
@@ -52,18 +54,17 @@ template <int64_t kHeadDim, typename PackedFloat>
 __always_inline __device__ void apply_norm(void* __restrict__ input, const void* __restrict__ weight, float eps) {
   using namespace device;
 
-  constexpr auto kLoopCount = kHeadDim / (kWarpThreads * 2);
+  constexpr std::size_t kLoopCount = kHeadDim / (kWarpThreads * 2);
   static_assert(kHeadDim % (kWarpThreads * 2) == 0);
 
-  const auto lane_id = threadIdx.x % kWarpThreads;
   float sum_of_squares = 0.0f;
 
-  using vec_t = device_vec<PackedFloat, kLoopCount>;
-  auto input_vec = static_cast<const vec_t*>(input)[lane_id];
+  using vec_t = aligned_vector<PackedFloat, kLoopCount>;
+  const auto input_vec = warp::load<vec_t>(input);
 
 #pragma unroll
   for (auto i = 0u; i < kLoopCount; ++i) {
-    const auto fp16_input = input_vec.data[i];
+    const auto fp16_input = input_vec[i];
     const auto fp32_input = to_float2(fp16_input);
     sum_of_squares += fp32_input.x * fp32_input.x;
     sum_of_squares += fp32_input.y * fp32_input.y;
@@ -71,20 +72,20 @@ __always_inline __device__ void apply_norm(void* __restrict__ input, const void*
 
   sum_of_squares = warp::reduce_sum(sum_of_squares);
   const auto norm_factor = rsqrtf(sum_of_squares / kHeadDim + eps);
-  const auto weight_vec = static_cast<const vec_t*>(weight)[lane_id];
-
+  const auto weight_vec = warp::load<vec_t>(weight);
   vec_t output_vec;
+
 #pragma unroll
   for (auto i = 0u; i < kLoopCount; ++i) {
-    const auto fp32_weight = to_float2(weight_vec.data[i]);
-    const auto fp32_input = to_float2(input_vec.data[i]);
-    output_vec.data[i] = from_float2<PackedFloat>({
+    const auto fp32_input = to_float2(input_vec[i]);
+    const auto fp32_weight = to_float2(weight_vec[i]);
+    output_vec[i] = from_float2<PackedFloat>({
         fp32_input.x * norm_factor * fp32_weight.x,
         fp32_input.y * norm_factor * fp32_weight.y,
     });
   }
 
-  static_cast<vec_t*>(input)[lane_id] = output_vec;
+  warp::store(input, output_vec);
 }
 
 constexpr uint32_t kWarpsPerBlock = 4;

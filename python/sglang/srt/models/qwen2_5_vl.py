@@ -47,6 +47,7 @@ from sglang.srt.distributed import (
 )
 from sglang.srt.distributed.parallel_state import get_pp_group
 from sglang.srt.environ import envs
+from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -114,12 +115,21 @@ class Qwen2_5_VLMLP(nn.Module):
             tp_size=self.tp_size,
             tp_rank=self.tp_rank,
         )
-        self.act = ACT2FN[hidden_act]
+        self.hidden_act = hidden_act
+        if self.hidden_act == "silu":
+            self.act = SiluAndMul()
+        else:
+            base_act = ACT2FN[self.hidden_act]
+
+            def _act_fn(x: torch.Tensor) -> torch.Tensor:
+                gate, up = x.chunk(2, dim=-1)
+                return base_act(gate) * up
+
+            self.act = _act_fn
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         gate_up, _ = self.gate_up_proj(x)
-        gate, up = gate_up.chunk(2, dim=-1)
-        x = self.act(gate) * up
+        x = self.act(gate_up)
         x_down, _ = self.down_proj(x)
         return x_down
 
