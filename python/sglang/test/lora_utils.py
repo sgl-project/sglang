@@ -25,6 +25,7 @@ class LoRAModelCase:
     decode_tolerance: float = 1e-1
     rouge_l_tolerance: float = 1.0
     max_loras_per_batch: int = 1
+    max_loaded_loras: Optional[int] = None
     skip_long_prompt: bool = False
 
     def __post_init__(self):
@@ -314,6 +315,7 @@ def run_lora_test_one_by_one(
             adaptor.name for adaptor in model_case.adaptors if adaptor.name is not None
         ],
         max_loras_per_batch=model_case.max_loras_per_batch,
+        max_loaded_loras=model_case.max_loaded_loras,
         lora_backend=backend,
         disable_cuda_graph=disable_cuda_graph,
         disable_radix_cache=disable_radix_cache,
@@ -461,6 +463,7 @@ def run_lora_test_by_batch(
             adaptor.name for adaptor in model_case.adaptors if adaptor.name is not None
         ],
         max_loras_per_batch=model_case.max_loras_per_batch,
+        max_loaded_loras=model_case.max_loaded_loras,
         lora_backend=backend,
         disable_cuda_graph=disable_cuda_graph,
         disable_radix_cache=disable_radix_cache,
@@ -617,6 +620,7 @@ def run_lora_multiple_batch_on_model_cases(
     disable_cuda_graph: bool = True,
     enable_deterministic_inference: bool = False,
     disable_radix_cache: bool = True,
+    max_loras_per_batch_override: Optional[int] = None,
 ):
     for model_case in model_cases:
         for torch_dtype in TORCH_DTYPES:
@@ -645,12 +649,18 @@ def run_lora_multiple_batch_on_model_cases(
                     "speculative_ngram_max_match_window_size": 15,
                 }
             )
+            max_loras_per_batch = (
+                max_loras_per_batch_override
+                if max_loras_per_batch_override is not None
+                else len(lora_adapter_paths) + 1
+            )
             srt_runner = SRTRunner(
                 base_path,
                 torch_dtype=torch_dtype,
                 model_type="generation",
                 lora_paths=[lora_adapter_paths[0], lora_adapter_paths[1]],
-                max_loras_per_batch=len(lora_adapter_paths) + 1,
+                max_loras_per_batch=max_loras_per_batch,
+                max_loaded_loras=model_case.max_loaded_loras,
                 sleep_on_idle=True,  # Eliminate non-determinism by forcing all requests to be processed in one batch.
                 attention_backend=attention_backend,
                 enable_deterministic_inference=enable_deterministic_inference,
