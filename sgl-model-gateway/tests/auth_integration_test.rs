@@ -18,9 +18,7 @@ use jsonwebtoken::{encode, EncodingKey, Header};
 use rsa::{traits::PublicKeyParts, RsaPrivateKey};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use smg::auth::{
-    ApiKeyEntry, ControlPlaneAuthConfig, ControlPlaneAuthState, JwtConfig, Role,
-};
+use smg::auth::{ApiKeyEntry, ControlPlaneAuthConfig, ControlPlaneAuthState, JwtConfig, Role};
 use tokio::net::TcpListener;
 
 const TEST_KEY_ID: &str = "test-key-1";
