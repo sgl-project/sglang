@@ -14,6 +14,7 @@
 """Mooncake-specific utilities for custom memory pool management."""
 
 import logging
+import os
 from typing import Any, Optional, Tuple
 
 import torch
@@ -64,6 +65,8 @@ def init_mooncake_custom_mem_pool(
                     logger.info("Fabric memory not supported, falling back to default cudaMalloc")
                     # 不使用任何自定义分配器 → 等价于使用 cudaMalloc
                     # 直接返回 None，表示 fallback 到默认行为
+                    os.environ["MC_INTRANODE_NVLINK"] = "1"
+                    logger.info("set MC_INTRANODE_NVLINK env")
                     return False, None, None
                 else:
                     logger.info("Memory Backend Unknown")
