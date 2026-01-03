@@ -34,41 +34,6 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def _create_target_stdout() -> logging.Logger:
-    log = logging.getLogger(f"{__name__}.stdout")
-    log.setLevel(logging.INFO)
-    log.propagate = False
-    if not log.handlers:
-        handler = logging.StreamHandler()
-        handler.setFormatter(logging.Formatter("%(message)s"))
-        log.addHandler(handler)
-    return log
-
-
-def _create_target_file(directory: str) -> logging.Logger:
-    os.makedirs(directory, exist_ok=True)
-    hostname = socket.gethostname()
-    rank = dist.get_rank() if dist.is_initialized() else 0
-    filename = os.path.join(directory, f"{hostname}_{rank}.log")
-
-    log = logging.getLogger(f"{__name__}.file.{directory}.{hostname}_{rank}")
-    log.setLevel(logging.INFO)
-    log.propagate = False
-
-    if not log.handlers:
-        handler = TimedRotatingFileHandler(
-            filename, when="H", backupCount=0, encoding="utf-8"
-        )
-        handler.setFormatter(logging.Formatter("%(message)s"))
-        log.addHandler(handler)
-    return log
-
-
-def _create_target(target: str) -> logging.Logger:
-    if target.lower() == "stdout":
-        return _create_target_stdout()
-    return _create_target_file(target)
-
 
 class RequestLogger:
     def __init__(
@@ -86,12 +51,7 @@ class RequestLogger:
             self._compute_metadata()
         )
         self.log_exceeded_ms = envs.SGLANG_LOG_REQUEST_EXCEEDED_MS.get()
-        self._targets = self._setup_targets()
-
-    def _setup_targets(self) -> List[logging.Logger]:
-        if not self.log_requests_target:
-            return [_create_target_stdout()]
-        return [_create_target(t) for t in self.log_requests_target]
+        self._targets = [_create_log_target(t) for t in self.log_requests_target]
 
     def configure(
         self,
@@ -226,6 +186,41 @@ class RequestLogger:
 @lru_cache(maxsize=2)
 def disable_request_logging() -> bool:
     return get_bool_env_var("SGLANG_DISABLE_REQUEST_LOGGING")
+
+
+def _create_log_target(target: str) -> logging.Logger:
+    if target.lower() == "stdout":
+        return _create_log_target_stdout()
+    return _create_log_target_file(target)
+
+def _create_log_target_stdout() -> logging.Logger:
+    log = logging.getLogger(f"{__name__}.stdout")
+    log.setLevel(logging.INFO)
+    log.propagate = False
+    if not log.handlers:
+        handler = logging.StreamHandler()
+        handler.setFormatter(logging.Formatter("%(message)s"))
+        log.addHandler(handler)
+    return log
+
+
+def _create_log_target_file(directory: str) -> logging.Logger:
+    os.makedirs(directory, exist_ok=True)
+    hostname = socket.gethostname()
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    filename = os.path.join(directory, f"{hostname}_{rank}.log")
+
+    log = logging.getLogger(f"{__name__}.file.{directory}.{hostname}_{rank}")
+    log.setLevel(logging.INFO)
+    log.propagate = False
+
+    if not log.handlers:
+        handler = TimedRotatingFileHandler(
+            filename, when="H", backupCount=0, encoding="utf-8"
+        )
+        handler.setFormatter(logging.Formatter("%(message)s"))
+        log.addHandler(handler)
+    return log
 
 
 # TODO unify this w/ `_transform_data_for_logging` if we find performance enough
