@@ -123,8 +123,6 @@ class CutlassRunnerCore(MoeRunnerCore):
             raise RuntimeError("Cutlass runner requires CUDA support.")
         if not is_sm90_supported():
             raise RuntimeError("Cutlass runner requires NVIDIA SM90 or newer GPUs.")
-        if not cutlass_fp8_supported():
-            raise RuntimeError("CUTLASS FP8 kernels are not available on this system.")
         if self.config.activation not in ("silu", None):
             raise ValueError("Cutlass runner currently supports SiLU activation only.")
 
@@ -161,6 +159,7 @@ class CutlassRunnerCore(MoeRunnerCore):
                 quant_info.w2_weight,
                 quant_info.w13_scale,
                 quant_info.w2_scale,
+                runner_input.topk_ids,
                 runner_input.masked_m,
                 quant_info.a_strides1,
                 quant_info.b_strides1,
@@ -204,6 +203,10 @@ class CutlassRunnerCore(MoeRunnerCore):
             return CutlassRunnerOutput(hidden_states=down_output)
 
         elif moe_type == CutlassMoEType.BlockscaledFP8:
+            if not cutlass_fp8_supported():
+                raise RuntimeError(
+                    "CUTLASS FP8 kernels are not available on this system."
+                )
             down_output = self.cutlass_fused_experts_fp8(
                 a=runner_input.rep_primary,  # Use preprocessed quantized input
                 w1_q=quant_info.w13_weight,
@@ -1418,12 +1421,6 @@ def pre_permute_deepep_normal_to_cutlass(
     m = hidden_states.size(0)
     k = quant_info.w13_weight.size(2) * 2  # w1_q is transposed and packed
     n = quant_info.w2_weight.size(2) * 2  # w2_q is transposed and packed
-    topk = topk_ids_.size(1)
-
-    num_experts = quant_info.w13_weight.size(0)
-    m = hidden_states.size(0)
-    k = quant_info.w13_weight.size(2) * 2
-    n = quant_info.w2_weight.size(2) * 2
     topk = topk_ids_.size(1)
     device = hidden_states.device
 
