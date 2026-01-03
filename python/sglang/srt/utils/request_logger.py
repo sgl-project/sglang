@@ -16,23 +16,34 @@ from __future__ import annotations
 import dataclasses
 import json
 import logging
+import os
+import socket
 from datetime import datetime
 from functools import lru_cache
-from typing import TYPE_CHECKING, Any, Optional, Set, Tuple, Union
+from logging.handlers import TimedRotatingFileHandler
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple, Union
+
+import torch.distributed as dist
 
 from sglang.srt.environ import envs
 from sglang.srt.utils.common import get_bool_env_var
 
 if TYPE_CHECKING:
+    import fastapi
+
     from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
 
 logger = logging.getLogger(__name__)
 
-_json_logger = logging.getLogger(__name__ + ".json")
-_json_logger.propagate = False
-_json_handler = logging.StreamHandler()
-_json_handler.setFormatter(logging.Formatter("%(message)s"))
-_json_logger.addHandler(_json_handler)
+WHITELISTED_HEADERS = ["x-smg-routing-key"]
+
+
+def _extract_whitelisted_headers(
+    request: Optional["fastapi.Request"],
+) -> Optional[Dict[str, str]]:
+    if request is None:
+        return None
+    return {h: v for h in WHITELISTED_HEADERS if (v := request.headers.get(h))}
 
 
 class RequestLogger:
@@ -41,20 +52,31 @@ class RequestLogger:
         log_requests: bool,
         log_requests_level: int,
         log_requests_format: str,
+        log_requests_target: Optional[List[str]],
     ):
         self.log_requests = log_requests
         self.log_requests_level = log_requests_level
         self.log_requests_format = log_requests_format
+        self.log_requests_target = log_requests_target
+
         self.metadata: Tuple[Optional[int], Optional[Set[str]], Optional[Set[str]]] = (
             self._compute_metadata()
         )
+        self.targets = self._setup_targets()
+
         self.log_exceeded_ms = envs.SGLANG_LOG_REQUEST_EXCEEDED_MS.get()
+
+    def _setup_targets(self) -> List[logging.Logger]:
+        if not self.log_requests_target:
+            return [_create_log_target_stdout()]
+        return [_create_log_target(t) for t in self.log_requests_target]
 
     def configure(
         self,
         log_requests: Optional[bool] = None,
         log_requests_level: Optional[int] = None,
         log_requests_format: Optional[str] = None,
+        log_requests_target: Optional[List[str]] = None,
     ) -> None:
         if log_requests is not None:
             self.log_requests = log_requests
@@ -62,24 +84,35 @@ class RequestLogger:
             self.log_requests_level = log_requests_level
         if log_requests_format is not None:
             self.log_requests_format = log_requests_format
+        if log_requests_target is not None:
+            self.log_requests_target = log_requests_target
+
         self.metadata = self._compute_metadata()
+        self.targets = self._setup_targets()
 
     def log_received_request(
-        self, obj: Union["GenerateReqInput", "EmbeddingReqInput"], tokenizer: Any = None
+        self,
+        obj: Union["GenerateReqInput", "EmbeddingReqInput"],
+        tokenizer: Any = None,
+        request: Optional["fastapi.Request"] = None,
     ) -> None:
         if not self.log_requests:
             return
 
         max_length, skip_names, _ = self.metadata
+        headers = _extract_whitelisted_headers(request)
         if self.log_requests_format == "json":
             log_data = {
                 "rid": obj.rid,
                 "obj": _transform_data_for_logging(obj, max_length, skip_names),
             }
-            _log_json("request.received", log_data)
+            if headers:
+                log_data["headers"] = headers
+            self._log_json("request.received", log_data)
         else:
-            logger.info(
-                f"Receive: obj={_dataclass_to_string_truncated(obj, max_length, skip_names=skip_names)}"
+            headers_str = f", headers={headers}" if headers else ""
+            self._log(
+                f"Receive: obj={_dataclass_to_string_truncated(obj, max_length, skip_names=skip_names)}{headers_str}"
             )
 
         # FIXME: This is a temporary fix to get the text from the input ids.
@@ -98,6 +131,7 @@ class RequestLogger:
         obj: Union["GenerateReqInput", "EmbeddingReqInput"],
         out: Any,
         is_multimodal_gen: bool = False,
+        request: Optional["fastapi.Request"] = None,
     ) -> None:
         if not self.log_requests:
             return
@@ -107,22 +141,30 @@ class RequestLogger:
             return
 
         max_length, skip_names, out_skip_names = self.metadata
+        headers = _extract_whitelisted_headers(request)
         if self.log_requests_format == "json":
             log_data = {
                 "rid": obj.rid,
                 "obj": _transform_data_for_logging(obj, max_length, skip_names),
             }
+            if headers:
+                log_data["headers"] = headers
             if not is_multimodal_gen:
                 log_data["out"] = _transform_data_for_logging(
                     out, max_length, out_skip_names
                 )
-            _log_json("request.finished", log_data)
+            self._log_json("request.finished", log_data)
         else:
-            if is_multimodal_gen:
-                msg = f"Finish: obj={_dataclass_to_string_truncated(obj, max_length, skip_names=skip_names)}"
-            else:
-                msg = f"Finish: obj={_dataclass_to_string_truncated(obj, max_length, skip_names=skip_names)}, out={_dataclass_to_string_truncated(out, max_length, skip_names=out_skip_names)}"
-            logger.info(msg)
+            obj_str = _dataclass_to_string_truncated(
+                obj, max_length, skip_names=skip_names
+            )
+            out_str = (
+                ""
+                if is_multimodal_gen
+                else f", out={_dataclass_to_string_truncated(out, max_length, skip_names=out_skip_names)}"
+            )
+            headers_str = f", headers={headers}" if headers else ""
+            self._log(f"Finish: obj={obj_str}{headers_str}{out_str}")
 
     def _compute_metadata(
         self,
@@ -164,6 +206,18 @@ class RequestLogger:
                 )
         return max_length, skip_names, out_skip_names
 
+    def _log_json(self, event: str, data: dict) -> None:
+        log_data = {
+            "timestamp": datetime.now().isoformat(),
+            "event": event,
+            **data,
+        }
+        self._log(json.dumps(log_data, ensure_ascii=False))
+
+    def _log(self, msg: str) -> None:
+        for target in self.targets:
+            target.info(msg)
+
 
 # TODO remove this?
 @lru_cache(maxsize=2)
@@ -171,14 +225,37 @@ def disable_request_logging() -> bool:
     return get_bool_env_var("SGLANG_DISABLE_REQUEST_LOGGING")
 
 
-# TODO unify logging, e.g. allow normal logs to be JSON as well
-def _log_json(event: str, data: dict) -> None:
-    log_data = {
-        "timestamp": datetime.now().isoformat(),
-        "event": event,
-        **data,
-    }
-    _json_logger.info(json.dumps(log_data, ensure_ascii=False))
+def _create_log_target(target: str) -> logging.Logger:
+    if target.lower() == "stdout":
+        return _create_log_target_stdout()
+    return _create_log_target_file(target)
+
+
+def _create_log_target_stdout() -> logging.Logger:
+    return _create_logger_with_handler(f"{__name__}.stdout", logging.StreamHandler())
+
+
+def _create_log_target_file(directory: str) -> logging.Logger:
+    os.makedirs(directory, exist_ok=True)
+    hostname = socket.gethostname()
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    filename = os.path.join(directory, f"{hostname}_{rank}.log")
+    handler = TimedRotatingFileHandler(
+        filename, when="H", backupCount=0, encoding="utf-8"
+    )
+    return _create_logger_with_handler(
+        f"{__name__}.file.{directory}.{hostname}_{rank}", handler
+    )
+
+
+def _create_logger_with_handler(name: str, handler: logging.Handler) -> logging.Logger:
+    logger = logging.getLogger(name)
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    if not logger.handlers:
+        handler.setFormatter(logging.Formatter("%(message)s"))
+        logger.addHandler(handler)
+    return logger
 
 
 # TODO unify this w/ `_transform_data_for_logging` if we find performance enough

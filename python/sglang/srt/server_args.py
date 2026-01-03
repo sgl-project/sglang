@@ -339,6 +339,7 @@ class ServerArgs:
     log_requests: bool = False
     log_requests_level: int = 2
     log_requests_format: str = "text"
+    log_requests_target: Optional[List[str]] = None
     crash_dump_folder: Optional[str] = None
     show_time_cost: bool = False
     enable_metrics: bool = False
@@ -1516,7 +1517,7 @@ class ServerArgs:
                 f"Overlap scheduler is disabled when using sparse head for embedding model."
             )
 
-        # TRTLLM AllReduce Fusion supports SM90/100/120, enable it by default
+        # TRTLLM AllReduce Fusion supports SM90/100, enable it by default
         # for models with explicit support (DeepseekV3, GptOss, Glm4Moe, Qwen3Moe)
         # TODO: currently, it is only supported in the single node scenario. https://github.com/flashinfer-ai/flashinfer/issues/2006
         # TODO: there is currently a bug on H20 device specifically, https://github.com/flashinfer-ai/flashinfer/issues/2204
@@ -1533,7 +1534,7 @@ class ServerArgs:
                 "Glm4MoeForCausalLM",
                 "Qwen3MoeForCausalLM",
             ]
-            and (is_sm90_supported() or is_blackwell_supported())
+            and (is_sm90_supported() or is_sm100_supported())
             and not self.enable_dp_attention
             and self.nnodes == 1
             and not is_h20_device
@@ -3012,6 +3013,14 @@ class ServerArgs:
             default=ServerArgs.log_requests_format,
             choices=["text", "json"],
             help="Format for request logging: 'text' (human-readable) or 'json' (structured)",
+        )
+        parser.add_argument(
+            "--log-requests-target",
+            type=str,
+            nargs="+",
+            default=ServerArgs.log_requests_target,
+            help="Target(s) for request logging: 'stdout' and/or directory path(s) for file output. "
+            "Can specify multiple targets, e.g., '--log-requests-target stdout /my/path'. ",
         )
         parser.add_argument(
             "--crash-dump-folder",

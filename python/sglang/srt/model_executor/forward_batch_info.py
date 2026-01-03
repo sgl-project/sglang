@@ -668,15 +668,8 @@ class ForwardBatch:
         self,
         mm_input: MultimodalInputs,
         seq_len: int,
-        device: torch.device,
     ) -> torch.Tensor:
-        if mm_input.mrope_position_delta.device.type != device:
-            # transfer mrope_position_delta to device when the first running,
-            # avoiding successvie host-to-device data transfer
-            mm_input.mrope_position_delta = mm_input.mrope_position_delta.to(
-                device, non_blocking=True
-            )
-
+        # doing below compute on cpu to avoid frequent small kernels
         mrope_position_deltas = mm_input.mrope_position_delta.flatten()
         mrope_positions = (
             (mrope_position_deltas + seq_len - 1).unsqueeze(0).repeat(3, 1)
@@ -701,11 +694,10 @@ class ForwardBatch:
                         (3, 1),
                         self.seq_lens_cpu[batch_idx] - 1,
                         dtype=torch.int64,
-                        device=model_runner.device,
                     )
                 else:
                     mrope_positions = self._expand_mrope_from_input(
-                        mm_input, self.seq_lens_cpu[batch_idx], model_runner.device
+                        mm_input, self.seq_lens_cpu[batch_idx]
                     )
                     mrope_positions_list[batch_idx] = mrope_positions
             elif self.forward_mode.is_extend():
@@ -737,14 +729,14 @@ class ForwardBatch:
                     ]
                     if mrope_positions.numel() == 0:
                         mrope_positions = self._expand_mrope_from_input(
-                            mm_input, self.seq_lens[batch_idx], model_runner.device
+                            mm_input, self.seq_lens_cpu[batch_idx]
                         )
                 mrope_positions_list[batch_idx] = mrope_positions
 
         self.mrope_positions = torch.cat(
-            [pos.to(device=model_runner.device) for pos in mrope_positions_list],
+            [pos for pos in mrope_positions_list],
             dim=1,
-        ).to(dtype=torch.int64, device=model_runner.device)
+        ).to(dtype=torch.int64, device=model_runner.device, non_blocking=True)
 
     def get_max_chunk_capacity(self):
         # Maximum number of tokens in each chunk
