@@ -303,10 +303,8 @@ impl Router {
         let load_guard =
             (policy.name() == "cache_aware").then(|| WorkerLoadGuard::new(worker.clone()));
 
-        events::RequestSentEvent {
-            url: worker.url().to_string(),
-        }
-        .emit();
+        // Note: Using borrowed reference avoids heap allocation
+        events::RequestSentEvent { url: worker.url() }.emit();
         let mut headers_with_trace = headers.cloned().unwrap_or_default();
         inject_trace_context_http(&mut headers_with_trace);
         let headers = Some(&headers_with_trace);
@@ -687,7 +685,7 @@ fn convert_reqwest_error(e: reqwest::Error) -> Response {
             "call_upstream_decode_error",
         )
     } else if e.is_timeout() {
-        (StatusCode::INTERNAL_SERVER_ERROR, "call_upstream_timeout")
+        (StatusCode::GATEWAY_TIMEOUT, "call_upstream_timeout")
     } else if e.is_connect() {
         (
             StatusCode::INTERNAL_SERVER_ERROR,

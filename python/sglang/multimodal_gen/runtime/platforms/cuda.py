@@ -5,12 +5,12 @@
 """Code inside this file can safely assume cuda platform, e.g. importing
 pynvml. However, it should not initialize cuda context.
 """
-
 import os
 from collections.abc import Callable
 from functools import lru_cache, wraps
-from typing import TypeVar
+from typing import Any, TypeVar
 
+import psutil
 import torch
 from typing_extensions import ParamSpec
 
@@ -82,6 +82,7 @@ class CudaPlatformBase(Platform):
         raise NotImplementedError
 
     @classmethod
+    @lru_cache(maxsize=1)
     def get_device_total_memory(cls, device_id: int = 0) -> int:
         raise NotImplementedError
 
@@ -110,6 +111,38 @@ class CudaPlatformBase(Platform):
     ) -> float:
         torch.cuda.reset_peak_memory_stats(device)
         return float(torch.cuda.max_memory_allocated(device))
+
+    @classmethod
+    def get_available_gpu_memory(
+        cls,
+        device_id: int = 0,
+        distributed: bool = False,
+        empty_cache: bool = True,
+        cpu_group: Any = None,
+    ) -> float:
+        if empty_cache:
+            torch.cuda.empty_cache()
+
+        # Orin, Thor, Spark
+        # SM 8.7 is Orin, 11.0 is Thor, 12.1 is Spark
+        SHARED_SYSMEM_DEVICE_MEM_SMS = (87, 110, 121)
+        capability = cls.get_device_capability(device_id)
+        sm = capability.to_int() if capability else 0
+
+        if sm in SHARED_SYSMEM_DEVICE_MEM_SMS:
+
+            free_gpu_memory = psutil.virtual_memory().available
+        else:
+            free_gpu_memory, _ = torch.cuda.mem_get_info(device_id)
+
+        if distributed:
+            import torch.distributed as dist
+
+            tensor = torch.tensor(free_gpu_memory, dtype=torch.float32, device="cuda")
+            dist.all_reduce(tensor, op=dist.ReduceOp.MIN, group=cpu_group)
+            free_gpu_memory = float(tensor.item())
+
+        return free_gpu_memory / (1 << 30)
 
     @classmethod
     def get_attn_backend_cls_str(
@@ -409,6 +442,7 @@ class NonNvmlCudaPlatform(CudaPlatformBase):
         return str(torch.cuda.get_device_name(device_id))
 
     @classmethod
+    @lru_cache(maxsize=1)
     def get_device_total_memory(cls, device_id: int = 0) -> int:
         device_props = torch.cuda.get_device_properties(device_id)
         return int(device_props.total_memory)
