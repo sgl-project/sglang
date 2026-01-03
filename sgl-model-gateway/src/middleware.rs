@@ -27,7 +27,7 @@ use tracing::{debug, error, field::Empty, info, info_span, warn, Span};
 pub use crate::core::token_bucket::TokenBucket;
 use crate::{
     observability::{
-        inflight_tracker::get_tracker,
+        inflight_tracker::InFlightRequestTracker,
         metrics::{method_to_static_str, metrics_labels, Metrics},
     },
     routers::error::extract_error_code_from_response,
@@ -613,12 +613,14 @@ static ACTIVE_HTTP_CONNECTIONS: AtomicU64 = AtomicU64::new(0);
 static INFLIGHT_TRACKING_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Tower Layer for HTTP metrics collection (SMG Layer 1 metrics)
-#[derive(Clone, Copy, Default)]
-pub struct HttpMetricsLayer;
+#[derive(Clone)]
+pub struct HttpMetricsLayer {
+    tracker: Arc<InFlightRequestTracker>,
+}
 
 impl HttpMetricsLayer {
-    pub fn new() -> Self {
-        Self
+    pub fn new(tracker: Arc<InFlightRequestTracker>) -> Self {
+        Self { tracker }
     }
 }
 
@@ -626,7 +628,10 @@ impl<S> Layer<S> for HttpMetricsLayer {
     type Service = HttpMetricsMiddleware<S>;
 
     fn layer(&self, inner: S) -> Self::Service {
-        HttpMetricsMiddleware { inner }
+        HttpMetricsMiddleware {
+            inner,
+            tracker: self.tracker.clone(),
+        }
     }
 }
 
@@ -634,6 +639,7 @@ impl<S> Layer<S> for HttpMetricsLayer {
 #[derive(Clone)]
 pub struct HttpMetricsMiddleware<S> {
     inner: S,
+    tracker: Arc<InFlightRequestTracker>,
 }
 
 impl<S> Service<Request> for HttpMetricsMiddleware<S>
@@ -651,26 +657,20 @@ where
     }
 
     fn call(&mut self, req: Request) -> Self::Future {
-        // Convert method to static string to avoid allocation
         let method = method_to_static_str(req.method().as_str());
         let path = normalize_path_for_metrics(req.uri().path());
         let start = Instant::now();
         let tracking_id = INFLIGHT_TRACKING_COUNTER.fetch_add(1, Ordering::Relaxed);
         let mut inner = self.inner.clone();
+        let tracker = self.tracker.clone();
 
         Box::pin(async move {
             let active = ACTIVE_HTTP_CONNECTIONS.fetch_add(1, Ordering::Relaxed) + 1;
             Metrics::set_http_connections_active(active as usize);
 
-            if let Some(tracker) = get_tracker() {
-                tracker.register(tracking_id);
-            }
-
+            tracker.register(tracking_id);
             let result = inner.call(req).await;
-
-            if let Some(tracker) = get_tracker() {
-                tracker.deregister(tracking_id);
-            }
+            tracker.deregister(tracking_id);
 
             let active = ACTIVE_HTTP_CONNECTIONS.fetch_sub(1, Ordering::Relaxed) - 1;
             Metrics::set_http_connections_active(active as usize);

@@ -1,5 +1,5 @@
 use std::{
-    sync::{Arc, OnceLock},
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -9,13 +9,7 @@ use tracing::debug;
 
 use super::metrics::Metrics;
 
-static INFLIGHT_TRACKER: OnceLock<Arc<InFlightRequestTracker>> = OnceLock::new();
-
-/// Age bucket upper bounds in seconds, matching Prometheus histogram `le` label convention.
-/// Uses cumulative semantics: le="60" means age <= 60s.
 const AGE_BUCKET_BOUNDS: &[u64] = &[30, 60, 180, 300, 600];
-
-/// Label values for each bucket bound, plus "+Inf" for the total.
 const AGE_BUCKET_LABELS: &[&str] = &["30", "60", "180", "300", "600", "+Inf"];
 
 pub struct InFlightRequestTracker {
@@ -23,19 +17,16 @@ pub struct InFlightRequestTracker {
 }
 
 impl InFlightRequestTracker {
-    pub fn new(sample_interval: Duration) -> Arc<Self> {
-        let tracker = Arc::new(Self {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
             requests: DashMap::new(),
-        });
-        tracker.clone().spawn_sampler(sample_interval);
-        tracker
+        })
     }
 
-    #[doc(hidden)]
-    pub fn new_for_test() -> Self {
-        Self {
-            requests: DashMap::new(),
-        }
+    pub fn new_with_sampler(sample_interval: Duration) -> Arc<Self> {
+        let tracker = Self::new();
+        tracker.clone().spawn_sampler(sample_interval);
+        tracker
     }
 
     pub fn register(&self, request_id: u64) {
@@ -125,19 +116,6 @@ impl InFlightRequestTracker {
             }
         });
     }
-}
-
-/// Initializes the global in-flight request tracker.
-///
-/// Should be called once during metrics initialization.
-/// The background sampler task starts automatically.
-pub fn init_inflight_tracker(sample_interval: Duration) {
-    let _ = INFLIGHT_TRACKER.get_or_init(|| InFlightRequestTracker::new(sample_interval));
-}
-
-/// Returns a reference to the global tracker, if initialized.
-pub fn get_tracker() -> Option<&'static Arc<InFlightRequestTracker>> {
-    INFLIGHT_TRACKER.get()
 }
 
 #[cfg(test)]
