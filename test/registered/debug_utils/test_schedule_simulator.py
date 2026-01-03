@@ -439,6 +439,9 @@ class TestSimulator(CustomTestCase):
         self.assertEqual(len(step_0_records), 2)
 
 
+# ==================== E2E Tests ====================
+
+
 class TestMain(CustomTestCase):
     def test_main_returns_dataframe(self):
         import argparse
@@ -480,9 +483,6 @@ class TestMain(CustomTestCase):
         self.assertIn("pending_count", df.columns)
         self.assertIn("total_seq_len", df.columns)
         self.assertGreater(len(df), 0)
-
-
-# ==================== E2E Tests ====================
 
 
 class TestCLI(CustomTestCase):
