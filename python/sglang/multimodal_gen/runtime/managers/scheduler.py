@@ -11,8 +11,7 @@ import zmq
 from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     MergeLoraWeightsReq,
     SetLoraReq,
-    UnmergeLoraWeightsReq,
-    _parse_size,
+    UnmergeLoraWeightsReq, _parse_size,
 )
 from sglang.multimodal_gen.runtime.managers.gpu_worker import GPUWorker
 from sglang.multimodal_gen.runtime.pipelines_core import Req
@@ -140,7 +139,7 @@ class Scheduler:
         if self.server_args.warmup_resolutions is None:
             # handle server warmup by inserting an identical req to the beginning of the waiting queue
             # only the very first req through server's lifetime will be warmup
-            if len(recv_reqs) == 1:
+            if recv_reqs:
                 identity, req = recv_reqs[0]
                 if isinstance(req, Req):
                     warmup_req = deepcopy(req)
@@ -148,7 +147,17 @@ class Scheduler:
                     warmup_req.num_inference_steps = 1
                     recv_reqs.insert(0, (identity, warmup_req))
                     logger.info("Server warming up....")
-        else:
+
+        self.warmed_up = True
+        return recv_reqs
+
+    def recv_reqs(self) -> List[tuple[bytes, Any]]:
+        """
+        For non-main schedulers, reqs are broadcasted from main using broadcast_pyobj
+        """
+
+        recv_reqs = []
+        if self.server_args.enable_warmup and not self.warmed_up and self.server_args.warmup_resolutions is not None:
             # insert warmup reqs constructed with each warmup-resolution
             for resolution in self.server_args.warmup_resolutions:
                 width, height = _parse_size(resolution)
@@ -160,13 +169,9 @@ class Scheduler:
                     is_warmup=True,
                 )
                 recv_reqs.append((None, req))
-        self.warmed_up = True
-        return recv_reqs
+            self.warmed_up = True
+            return recv_reqs
 
-    def recv_reqs(self) -> List[tuple[bytes, Any]]:
-        """
-        For non-main schedulers, reqs are broadcasted from main using broadcast_pyobj
-        """
         if self.receiver is not None:
             try:
                 try:
