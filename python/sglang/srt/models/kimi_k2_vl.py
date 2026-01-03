@@ -608,6 +608,7 @@ class MoonViT3dPretrainedModel(nn.Module):
         assert grid_thws.size(1) == 3, f"No support for _thw: {grid_thws}"
         hidden_states = self.patch_embed(pixel_values, grid_thws)
         hidden_states = self.encoder(hidden_states, grid_thws)
+        hidden_states = hidden_states.squeeze(0)
         # spatial downsampling 2x with temporal pooling all
         hidden_states = tpool_patch_merger(
             hidden_states, grid_thws, merge_kernel_size=self.merge_kernel_size
