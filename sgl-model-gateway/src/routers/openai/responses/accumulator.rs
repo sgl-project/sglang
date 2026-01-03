@@ -3,7 +3,7 @@
 use serde_json::Value;
 use tracing::warn;
 
-use super::streaming::{extract_output_index, get_event_type};
+use super::common::{extract_output_index, get_event_type};
 use crate::protocols::event_types::{OutputItemEvent, ResponseEvent};
 
 // ============================================================================
@@ -12,7 +12,7 @@ use crate::protocols::event_types::{OutputItemEvent, ResponseEvent};
 
 /// Helper that parses SSE frames from the OpenAI responses stream and
 /// accumulates enough information to persist the final response locally.
-pub(super) struct StreamingResponseAccumulator {
+pub struct StreamingResponseAccumulator {
     /// The initial `response.created` payload (if emitted).
     initial_response: Option<Value>,
     /// The final `response.completed` payload (if emitted).
