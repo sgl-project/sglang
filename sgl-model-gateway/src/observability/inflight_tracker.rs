@@ -125,11 +125,11 @@ mod tests {
     fn test_request_age_tracking() {
         let tracker = InFlightRequestTracker::new();
         let _guard = tracker.track();
-        std::thread::sleep(Duration::from_millis(10));
+        std::thread::sleep(Duration::from_millis(100));
 
         let entry = tracker.requests.iter().next().unwrap();
         let age = entry.value().elapsed();
-        assert!(age >= Duration::from_millis(10));
+        assert!(age >= Duration::from_millis(100));
     }
 
     #[test]
