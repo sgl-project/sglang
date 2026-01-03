@@ -416,6 +416,71 @@ class TestSimulator(CustomTestCase):
         self.assertIn("req0", output)
         self.assertIn("req1", output)
 
+    def test_step_records(self):
+        requests = [
+            SimRequest(request_id=f"r{i}", input_len=10, output_len=3)
+            for i in range(4)
+        ]
+        sim = Simulator(
+            num_gpus=2,
+            router=RoundRobinRouter(),
+            scheduler=FIFOScheduler(max_running_requests=10),
+        )
+        result = sim.run(requests)
+
+        self.assertGreater(len(result.step_records), 0)
+        for record in result.step_records:
+            self.assertIsInstance(record, StepRecord)
+            self.assertIn(record.gpu_id, [0, 1])
+            self.assertGreaterEqual(record.running_count, 0)
+            self.assertGreaterEqual(record.pending_count, 0)
+
+        step_0_records = [r for r in result.step_records if r.step == 0]
+        self.assertEqual(len(step_0_records), 2)
+
+
+class TestMain(CustomTestCase):
+    def test_main_returns_dataframe(self):
+        import argparse
+        import io
+        import sys
+
+        import polars as pl
+
+        from sglang.srt.debug_utils.schedule_simulator.__main__ import main
+
+        args = argparse.Namespace(
+            input=None,
+            synthetic=True,
+            synth_num_requests=10,
+            synth_input_len=100,
+            synth_output_len=5,
+            synth_range_ratio=1.0,
+            synth_seed=42,
+            num_gpus=2,
+            router="round_robin",
+            scheduler="fifo",
+            max_running=256,
+            output=None,
+            log_level=0,
+        )
+
+        captured = io.StringIO()
+        old_stdout = sys.stdout
+        sys.stdout = captured
+        try:
+            df = main(args)
+        finally:
+            sys.stdout = old_stdout
+
+        self.assertIsInstance(df, pl.DataFrame)
+        self.assertIn("step", df.columns)
+        self.assertIn("gpu_id", df.columns)
+        self.assertIn("running_count", df.columns)
+        self.assertIn("pending_count", df.columns)
+        self.assertIn("total_seq_len", df.columns)
+        self.assertGreater(len(df), 0)
+
 
 # ==================== E2E Tests ====================
 
@@ -498,10 +563,10 @@ class TestCLI(CustomTestCase):
                 "-m",
                 "sglang.srt.debug_utils.schedule_simulator",
                 "--synthetic",
-                "--num-requests", "100",
-                "--input-len", "512",
-                "--output-len", "128",
-                "--range-ratio", "0.5",
+                "--synth-num-requests", "100",
+                "--synth-input-len", "512",
+                "--synth-output-len", "128",
+                "--synth-range-ratio", "0.5",
                 "--num-gpus", "4",
             ],
             capture_output=True,
@@ -510,8 +575,8 @@ class TestCLI(CustomTestCase):
 
         self.assertEqual(result.returncode, 0, f"CLI failed: {result.stderr}")
         self.assertIn("Generated 100 synthetic requests", result.stdout)
-        self.assertIn("input_len=512", result.stdout)
-        self.assertIn("output_len=128", result.stdout)
+        self.assertIn("synth_input_len=512", result.stdout)
+        self.assertIn("synth_output_len=128", result.stdout)
 
     def test_cli_log_level(self):
         import subprocess

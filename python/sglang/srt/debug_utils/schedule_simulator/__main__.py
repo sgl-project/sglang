@@ -34,31 +34,31 @@ def create_arg_parser() -> argparse.ArgumentParser:
     )
 
     parser.add_argument(
-        "--num-requests",
+        "--synth-num-requests",
         type=int,
         default=1000,
         help="Number of synthetic requests to generate (default: 1000)",
     )
     parser.add_argument(
-        "--input-len",
+        "--synth-input-len",
         type=int,
         default=1024,
         help="Target input length for synthetic data (default: 1024)",
     )
     parser.add_argument(
-        "--output-len",
+        "--synth-output-len",
         type=int,
         default=256,
         help="Target output length for synthetic data (default: 256)",
     )
     parser.add_argument(
-        "--range-ratio",
+        "--synth-range-ratio",
         type=float,
         default=1.0,
         help="Range ratio for synthetic data, e.g., 0.5 means [len*0.5, len] (default: 1.0)",
     )
     parser.add_argument(
-        "--seed",
+        "--synth-seed",
         type=int,
         default=None,
         help="Random seed for synthetic data (default: None)",
@@ -113,13 +113,13 @@ def main(args: argparse.Namespace) -> pl.DataFrame:
         print(f"Loaded {len(requests)} requests from {args.input}")
     else:
         requests = generate_random_requests(
-            num_requests=args.num_requests,
-            input_len=args.input_len,
-            output_len=args.output_len,
-            range_ratio=args.range_ratio,
-            seed=args.seed,
+            num_requests=args.synth_num_requests,
+            input_len=args.synth_input_len,
+            output_len=args.synth_output_len,
+            range_ratio=args.synth_range_ratio,
+            seed=args.synth_seed,
         )
-        print(f"Generated {len(requests)} synthetic requests (input_len={args.input_len}, output_len={args.output_len}, range_ratio={args.range_ratio})")
+        print(f"Generated {len(requests)} synthetic requests (input_len={args.synth_input_len}, output_len={args.synth_output_len}, range_ratio={args.synth_range_ratio})")
 
     if args.router == "random":
         router = RandomRouter()
