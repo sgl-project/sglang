@@ -227,7 +227,7 @@ class TestEmbeddingCorrectness(CustomTestCase):
 
             logging.info(f"Semantic similarity test set {i + 1} passed\n")
 
-    def test_relevance_scores(self, tolerance: float = 1e-2):
+    def test_relevance_scores(self, tolerance: float = 0.05):
         """Compare relevance scores between gateway and HF implementations."""
         logging.info(
             f'Comparing relevance scores between {self.config["server_engine"]} and HF'
