@@ -41,7 +41,7 @@ WHITELISTED_HEADERS = ["x-smg-routing-key"]
 def _extract_whitelisted_headers(request: Optional["fastapi.Request"]) -> Optional[Dict[str, str]]:
     if request is None:
         return None
-    result = {h: request.headers.get(h) for h in WHITELISTED_HEADERS if request.headers.get(h)}
+    result = {h: v for h in WHITELISTED_HEADERS if (v := request.headers.get(h))}
     return result if result else None
 
 
@@ -151,12 +151,10 @@ class RequestLogger:
                 )
             self._log_json("request.finished", log_data)
         else:
+            obj_str = _dataclass_to_string_truncated(obj, max_length, skip_names=skip_names)
+            out_str = "" if is_multimodal_gen else f", out={_dataclass_to_string_truncated(out, max_length, skip_names=out_skip_names)}"
             headers_str = f", headers={headers}" if headers else ""
-            if is_multimodal_gen:
-                msg = f"Finish: obj={_dataclass_to_string_truncated(obj, max_length, skip_names=skip_names)}{headers_str}"
-            else:
-                msg = f"Finish: obj={_dataclass_to_string_truncated(obj, max_length, skip_names=skip_names)}{headers_str}, out={_dataclass_to_string_truncated(out, max_length, skip_names=out_skip_names)}"
-            self._log(msg)
+            self._log(f"Finish: obj={obj_str}{headers_str}{out_str}")
 
     def _compute_metadata(
         self,

@@ -98,8 +98,6 @@ class TestRequestLoggerJson(BaseTestRequestLogger, CustomTestCase):
     def _verify_logs(self, content: str, source_name: str):
         received_found = False
         finished_found = False
-        header_in_received = False
-        header_in_finished = False
         for line in content.splitlines():
             if not line.strip() or not line.startswith("{"):
                 continue
@@ -107,28 +105,20 @@ class TestRequestLoggerJson(BaseTestRequestLogger, CustomTestCase):
             if data.get("event") == "request.received":
                 self.assertIn("rid", data)
                 self.assertIn("obj", data)
+                self.assertEqual(data.get("headers", {}).get("x-smg-routing-key"), TEST_ROUTING_KEY)
                 received_found = True
-                if data.get("headers", {}).get("x-smg-routing-key") == TEST_ROUTING_KEY:
-                    header_in_received = True
             elif data.get("event") == "request.finished":
                 self.assertIn("rid", data)
                 self.assertIn("obj", data)
                 self.assertIn("out", data)
+                self.assertEqual(data.get("headers", {}).get("x-smg-routing-key"), TEST_ROUTING_KEY)
                 finished_found = True
-                if data.get("headers", {}).get("x-smg-routing-key") == TEST_ROUTING_KEY:
-                    header_in_finished = True
 
         self.assertTrue(
             received_found, f"request.received event not found in {source_name}"
         )
         self.assertTrue(
             finished_found, f"request.finished event not found in {source_name}"
-        )
-        self.assertTrue(
-            header_in_received, f"Header not in request.received for {source_name}"
-        )
-        self.assertTrue(
-            header_in_finished, f"Header not in request.finished for {source_name}"
         )
 
 
