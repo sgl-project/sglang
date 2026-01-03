@@ -12,6 +12,7 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     MergeLoraWeightsReq,
     SetLoraReq,
     UnmergeLoraWeightsReq,
+    _parse_size,
 )
 from sglang.multimodal_gen.runtime.managers.gpu_worker import GPUWorker
 from sglang.multimodal_gen.runtime.pipelines_core import Req
@@ -83,6 +84,7 @@ class Scheduler:
         # FIFO, new reqs are appended
         self.waiting_queue: deque[tuple[bytes, Req]] = deque()
 
+        # whether we've send the necessary warmup reqs
         self.warmed_up = False
 
     def _handle_set_lora(self, reqs: List[Any]) -> OutputBatch:
@@ -125,6 +127,38 @@ class Scheduler:
         item = self.waiting_queue.popleft()
 
         return [item]
+
+    def process_received_reqs_with_warmup(
+        self, recv_reqs: List[tuple[bytes, Any]]
+    ) -> List[tuple[bytes, Any]]:
+
+        if not self.server_args.enable_warmup or self.warmed_up:
+            return recv_reqs
+        if self.server_args.warmup_resolutions is None:
+            # handle server warmup by inserting an identical req to the beginning of the waiting queue
+            # only the very first req through server's lifetime will be warmup
+            if len(recv_reqs) == 1:
+                identity, req = recv_reqs[0]
+                if isinstance(req, Req):
+                    warmup_req = deepcopy(req)
+                    warmup_req.is_warmup = True
+                    warmup_req.num_inference_steps = 1
+                    recv_reqs.insert(0, (identity, warmup_req))
+                    logger.info("Server warming up....")
+        else:
+            # insert warmup reqs constructed with each warmup-resolution
+            for resolution in self.server_args.warmup_resolutions:
+                width, height = _parse_size(resolution)
+                req = Req(
+                    data_type=self.server_args.pipeline_config.task_type.data_type(),
+                    width=width,
+                    height=height,
+                    prompt="",
+                    is_warmup=True,
+                )
+                recv_reqs.append((None, req))
+        self.warmed_up = True
+        return recv_reqs
 
     def recv_reqs(self) -> List[tuple[bytes, Any]]:
         """
@@ -178,21 +212,7 @@ class Scheduler:
 
         assert recv_reqs is not None
 
-        # handle server warmup by inserting an identical req to the beginning of the waiting queue
-        # only the very first req through server's lifetime will be warmup
-        if (
-            not self.warmed_up
-            and len(recv_reqs) == 1
-            and self.server_args.enable_warmup
-        ):
-            identity, req = recv_reqs[0]
-            if isinstance(req, Req):
-                warmup_req = deepcopy(req)
-                warmup_req.is_warmup = True
-                warmup_req.num_inference_steps = 1
-                recv_reqs.insert(0, (identity, warmup_req))
-                self.warmed_up = True
-                logger.info("Server warming up....")
+        recv_reqs = self.process_received_reqs_with_warmup(recv_reqs)
 
         return recv_reqs
 
@@ -255,10 +275,13 @@ class Scheduler:
                     processed_req.is_warmup if isinstance(processed_req, Req) else False
                 )
                 if is_warmup:
-                    logger.info(
-                        f"Server warmup done in {GREEN}%.2f{RESET} seconds",
-                        output_batch.timings.total_duration_s,
-                    )
+                    if output_batch.error is None:
+                        logger.info(
+                            f"Warmup req processed in {GREEN}%.2f{RESET} seconds",
+                            output_batch.timings.total_duration_s,
+                        )
+                    else:
+                        logger.info(f"Warmup req processing failed")
 
                 self.return_result(output_batch, identities[0], is_warmup=is_warmup)
             except zmq.ZMQError as e:
