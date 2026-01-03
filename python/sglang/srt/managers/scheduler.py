@@ -2073,7 +2073,12 @@ class Scheduler(
 
         # Print stats
         if self.current_scheduler_metrics_enabled:
-            self.log_prefill_stats(adder, can_run_list, running_bs, 0)
+            self.log_prefill_stats(
+                adder,
+                can_run_list,
+                running_bs=len(self.running_batch.reqs),
+                running_bs_offline_batch=0,
+            )
 
         # Record metrics
         for req in can_run_list:
