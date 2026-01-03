@@ -38,8 +38,8 @@ static ALLOWED_TARGETS: OnceLock<[&'static str; 3]> = OnceLock::new();
 fn get_allowed_targets() -> &'static [&'static str; 3] {
     ALLOWED_TARGETS.get_or_init(|| {
         [
-            "sgl_model_gateway::otel-trace",
-            "sgl_model_gateway::observability::otel_trace",
+            "smg::otel-trace",
+            "smg::observability::otel_trace",
             events_module_path(),
         ]
     })
@@ -118,7 +118,7 @@ pub fn otel_tracing_init(enable: bool, otlp_endpoint: Option<&str>) -> Result<()
 
     let resource = Resource::default().merge(&Resource::new(vec![KeyValue::new(
         "service.name",
-        "sgl-router",
+        "smg",
     )]));
 
     let provider = TracerProvider::builder()
@@ -130,7 +130,7 @@ pub fn otel_tracing_init(enable: bool, otlp_endpoint: Option<&str>) -> Result<()
         .set(provider.clone())
         .map_err(|_| anyhow::anyhow!("Provider already initialized"))?;
 
-    let tracer = provider.tracer("sgl-router");
+    let tracer = provider.tracer("smg");
 
     TRACER
         .set(tracer)
