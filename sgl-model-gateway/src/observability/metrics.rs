@@ -154,7 +154,7 @@ pub fn init_metrics() {
         "HTTP request duration by method and path"
     );
     describe_gauge!(
-        "smg_http_inflight_request_count",
+        "smg_http_inflight_request_age_count",
         "Count of currently in-flight HTTP requests by age"
     );
     describe_counter!(
@@ -499,7 +499,7 @@ impl Metrics {
     /// Uses `le` label to match Prometheus histogram convention.
     pub fn set_inflight_request_count(le: &'static str, count: usize) {
         gauge!(
-            "smg_http_inflight_request_count",
+            "smg_http_inflight_request_age_count",
             "le" => le
         )
         .set(count as f64);
