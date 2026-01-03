@@ -7,4 +7,3 @@ from sglang.srt.debug_utils.schedule_simulator.schedulers.fifo_scheduler import 
 )
 
 __all__ = ["ScheduleDecision", "SchedulerPolicy", "FIFOScheduler"]
-

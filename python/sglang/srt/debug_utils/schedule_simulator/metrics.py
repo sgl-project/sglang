@@ -1,5 +1,4 @@
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
 from typing import Any, Dict, List
 
 from sglang.srt.debug_utils.schedule_simulator.gpu_state import GPUState
@@ -7,12 +6,10 @@ from sglang.srt.debug_utils.schedule_simulator.gpu_state import GPUState
 
 class MetricRecorder(ABC):
     @abstractmethod
-    def on_step_end(self, step: int, gpu_states: List[GPUState]) -> None:
-        ...
+    def on_step_end(self, step: int, gpu_states: List[GPUState]) -> None: ...
 
     @abstractmethod
-    def get_summary(self) -> Dict[str, Any]:
-        ...
+    def get_summary(self) -> Dict[str, Any]: ...
 
 
 class BatchSizeBalancednessRecorder(MetricRecorder):
@@ -55,4 +52,3 @@ class AttentionBalancednessRecorder(MetricRecorder):
             "attention_balancedness_min": min(self._history),
             "attention_balancedness_max": max(self._history),
         }
-

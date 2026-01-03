@@ -16,7 +16,6 @@ from sglang.srt.debug_utils.schedule_simulator import (
     RandomRouter,
     RequestStage,
     RoundRobinRouter,
-    ScheduleDecision,
     SimRequest,
     SimulationResult,
     Simulator,
@@ -26,7 +25,6 @@ from sglang.srt.debug_utils.schedule_simulator import (
 )
 from sglang.srt.debug_utils.schedule_simulator.entrypoint import main
 from sglang.test.test_utils import CustomTestCase
-
 
 # ==================== Non-E2E Tests ====================
 
@@ -41,22 +39,31 @@ class TestSimRequest(CustomTestCase):
 
     def test_seq_len_decode(self):
         req = SimRequest(
-            request_id="r1", input_len=100, output_len=50,
-            stage=RequestStage.DECODE, decoded_tokens=10,
+            request_id="r1",
+            input_len=100,
+            output_len=50,
+            stage=RequestStage.DECODE,
+            decoded_tokens=10,
         )
         self.assertEqual(req.seq_len(), 110)
 
     def test_is_finished(self):
         req = SimRequest(
-            request_id="r1", input_len=100, output_len=50,
-            stage=RequestStage.DECODE, decoded_tokens=50,
+            request_id="r1",
+            input_len=100,
+            output_len=50,
+            stage=RequestStage.DECODE,
+            decoded_tokens=50,
         )
         self.assertTrue(req.is_finished())
 
     def test_copy(self):
         req = SimRequest(
-            request_id="r1", input_len=100, output_len=50,
-            stage=RequestStage.DECODE, decoded_tokens=10,
+            request_id="r1",
+            input_len=100,
+            output_len=50,
+            stage=RequestStage.DECODE,
+            decoded_tokens=10,
         )
         req_copy = req.copy()
         self.assertEqual(req_copy.request_id, req.request_id)
@@ -79,8 +86,13 @@ class TestGPUState(CustomTestCase):
         gpu = GPUState(gpu_id=0)
         gpu.running_requests = [
             SimRequest(request_id="r1", input_len=100, output_len=50),
-            SimRequest(request_id="r2", input_len=200, output_len=100,
-                       stage=RequestStage.DECODE, decoded_tokens=10),
+            SimRequest(
+                request_id="r2",
+                input_len=200,
+                output_len=100,
+                stage=RequestStage.DECODE,
+                decoded_tokens=10,
+            ),
         ]
         self.assertEqual(gpu.total_seq_len(), 100 + 210)
 
@@ -105,7 +117,10 @@ class TestFIFOScheduler(CustomTestCase):
     def test_basic(self):
         scheduler = FIFOScheduler(max_running_requests=2)
         gpu = GPUState(gpu_id=0)
-        gpu.pending_requests = [SimRequest(request_id=f"r{i}", input_len=100, output_len=50) for i in range(5)]
+        gpu.pending_requests = [
+            SimRequest(request_id=f"r{i}", input_len=100, output_len=50)
+            for i in range(5)
+        ]
         decision = scheduler.schedule(gpu)
         self.assertEqual(len(decision.to_run), 2)
         self.assertEqual(len(decision.to_preempt), 0)
@@ -113,8 +128,13 @@ class TestFIFOScheduler(CustomTestCase):
     def test_respects_running(self):
         scheduler = FIFOScheduler(max_running_requests=3)
         gpu = GPUState(gpu_id=0)
-        gpu.running_requests = [SimRequest(request_id="running", input_len=100, output_len=50)]
-        gpu.pending_requests = [SimRequest(request_id=f"r{i}", input_len=100, output_len=50) for i in range(5)]
+        gpu.running_requests = [
+            SimRequest(request_id="running", input_len=100, output_len=50)
+        ]
+        gpu.pending_requests = [
+            SimRequest(request_id=f"r{i}", input_len=100, output_len=50)
+            for i in range(5)
+        ]
         decision = scheduler.schedule(gpu)
         self.assertEqual(len(decision.to_run), 2)
 
@@ -123,21 +143,31 @@ class TestMetrics(CustomTestCase):
     def test_batch_size_balancedness(self):
         recorder = BatchSizeBalancednessRecorder()
         gpu_states = [GPUState(gpu_id=i) for i in range(2)]
-        gpu_states[0].running_requests = [SimRequest(request_id="r1", input_len=100, output_len=50)]
+        gpu_states[0].running_requests = [
+            SimRequest(request_id="r1", input_len=100, output_len=50)
+        ]
         gpu_states[1].running_requests = [
             SimRequest(request_id="r2", input_len=100, output_len=50),
             SimRequest(request_id="r3", input_len=100, output_len=50),
         ]
         recorder.on_step_end(0, gpu_states)
-        self.assertAlmostEqual(recorder.get_summary()["batch_size_balancedness_mean"], 0.75)
+        self.assertAlmostEqual(
+            recorder.get_summary()["batch_size_balancedness_mean"], 0.75
+        )
 
     def test_attention_balancedness(self):
         recorder = AttentionBalancednessRecorder()
         gpu_states = [GPUState(gpu_id=i) for i in range(2)]
-        gpu_states[0].running_requests = [SimRequest(request_id="r1", input_len=100, output_len=50)]
-        gpu_states[1].running_requests = [SimRequest(request_id="r2", input_len=200, output_len=50)]
+        gpu_states[0].running_requests = [
+            SimRequest(request_id="r1", input_len=100, output_len=50)
+        ]
+        gpu_states[1].running_requests = [
+            SimRequest(request_id="r2", input_len=200, output_len=50)
+        ]
         recorder.on_step_end(0, gpu_states)
-        self.assertAlmostEqual(recorder.get_summary()["attention_balancedness_mean"], 0.75)
+        self.assertAlmostEqual(
+            recorder.get_summary()["attention_balancedness_mean"], 0.75
+        )
 
     def test_empty_history(self):
         recorder = BatchSizeBalancednessRecorder()
@@ -147,15 +177,25 @@ class TestMetrics(CustomTestCase):
         recorder = BatchSizeBalancednessRecorder()
         gpu_states = [GPUState(gpu_id=i) for i in range(2)]
         recorder.on_step_end(0, gpu_states)
-        self.assertAlmostEqual(recorder.get_summary()["batch_size_balancedness_mean"], 1.0)
+        self.assertAlmostEqual(
+            recorder.get_summary()["batch_size_balancedness_mean"], 1.0
+        )
 
 
 class TestDataLoader(CustomTestCase):
     def test_load_from_request_logger(self):
         log_data = [
             {"event": "request.received", "rid": "r1", "obj": {"text": "hello"}},
-            {"event": "request.finished", "rid": "r1", "out": {"meta_info": {"prompt_tokens": 100, "completion_tokens": 50}}},
-            {"event": "request.finished", "rid": "r2", "out": {"meta_info": {"prompt_tokens": 200, "completion_tokens": 100}}},
+            {
+                "event": "request.finished",
+                "rid": "r1",
+                "out": {"meta_info": {"prompt_tokens": 100, "completion_tokens": 50}},
+            },
+            {
+                "event": "request.finished",
+                "rid": "r2",
+                "out": {"meta_info": {"prompt_tokens": 200, "completion_tokens": 100}},
+            },
         ]
         with tempfile.NamedTemporaryFile(mode="w", suffix=".log", delete=False) as f:
             for item in log_data:
@@ -177,15 +217,25 @@ class TestDataLoader(CustomTestCase):
     def test_invalid_json_skipped(self):
         with tempfile.NamedTemporaryFile(mode="w", suffix=".log", delete=False) as f:
             f.write("not json\n")
-            f.write('{"event": "request.finished", "rid": "r1", "out": {"meta_info": {"prompt_tokens": 100, "completion_tokens": 50}}}\n')
+            f.write(
+                '{"event": "request.finished", "rid": "r1", "out": {"meta_info": {"prompt_tokens": 100, "completion_tokens": 50}}}\n'
+            )
             f.flush()
             self.assertEqual(len(load_from_request_logger(f.name)), 1)
 
     def test_missing_fields_skipped(self):
         log_data = [
             {"event": "request.finished", "rid": "r1", "out": {}},
-            {"event": "request.finished", "rid": "r2", "out": {"meta_info": {"prompt_tokens": 100}}},
-            {"event": "request.finished", "rid": "r3", "out": {"meta_info": {"prompt_tokens": 100, "completion_tokens": 50}}},
+            {
+                "event": "request.finished",
+                "rid": "r2",
+                "out": {"meta_info": {"prompt_tokens": 100}},
+            },
+            {
+                "event": "request.finished",
+                "rid": "r3",
+                "out": {"meta_info": {"prompt_tokens": 100, "completion_tokens": 50}},
+            },
         ]
         with tempfile.NamedTemporaryFile(mode="w", suffix=".log", delete=False) as f:
             for item in log_data:
@@ -198,33 +248,47 @@ class TestDataLoader(CustomTestCase):
 
 class TestDataSynthesis(CustomTestCase):
     def test_generate_basic(self):
-        requests = generate_random_requests(num_requests=10, input_len=100, output_len=50)
+        requests = generate_random_requests(
+            num_requests=10, input_len=100, output_len=50
+        )
         self.assertEqual(len(requests), 10)
         for req in requests:
             self.assertEqual(req.input_len, 100)
             self.assertEqual(req.output_len, 50)
 
     def test_generate_with_range_ratio(self):
-        requests = generate_random_requests(num_requests=100, input_len=100, output_len=50, range_ratio=0.5, seed=42)
+        requests = generate_random_requests(
+            num_requests=100, input_len=100, output_len=50, range_ratio=0.5, seed=42
+        )
         for req in requests:
             self.assertGreaterEqual(req.input_len, 50)
             self.assertLessEqual(req.input_len, 100)
 
     def test_generate_with_seed(self):
-        r1 = generate_random_requests(num_requests=10, input_len=100, output_len=50, range_ratio=0.5, seed=42)
-        r2 = generate_random_requests(num_requests=10, input_len=100, output_len=50, range_ratio=0.5, seed=42)
+        r1 = generate_random_requests(
+            num_requests=10, input_len=100, output_len=50, range_ratio=0.5, seed=42
+        )
+        r2 = generate_random_requests(
+            num_requests=10, input_len=100, output_len=50, range_ratio=0.5, seed=42
+        )
         for a, b in zip(r1, r2):
             self.assertEqual(a.input_len, b.input_len)
 
 
 class TestSimulator(CustomTestCase):
     def test_basic_run(self):
-        requests = [SimRequest(request_id=f"r{i}", input_len=10, output_len=5) for i in range(10)]
+        requests = [
+            SimRequest(request_id=f"r{i}", input_len=10, output_len=5)
+            for i in range(10)
+        ]
         sim = Simulator(
             num_gpus=2,
             router=RoundRobinRouter(),
             scheduler=FIFOScheduler(max_running_requests=4),
-            recorders=[BatchSizeBalancednessRecorder(), AttentionBalancednessRecorder()],
+            recorders=[
+                BatchSizeBalancednessRecorder(),
+                AttentionBalancednessRecorder(),
+            ],
         )
         result = sim.run(requests)
         self.assertIsInstance(result, SimulationResult)
@@ -232,28 +296,45 @@ class TestSimulator(CustomTestCase):
         self.assertGreater(len(result.step_records), 0)
 
     def test_all_requests_complete(self):
-        requests = [SimRequest(request_id=f"r{i}", input_len=10, output_len=3) for i in range(4)]
-        sim = Simulator(num_gpus=2, router=RoundRobinRouter(), scheduler=FIFOScheduler(max_running_requests=10))
+        requests = [
+            SimRequest(request_id=f"r{i}", input_len=10, output_len=3) for i in range(4)
+        ]
+        sim = Simulator(
+            num_gpus=2,
+            router=RoundRobinRouter(),
+            scheduler=FIFOScheduler(max_running_requests=10),
+        )
         sim.run(requests)
         for gpu in sim.gpu_states:
             self.assertEqual(len(gpu.pending_requests), 0)
             self.assertEqual(len(gpu.running_requests), 0)
 
     def test_empty_requests(self):
-        sim = Simulator(num_gpus=2, router=RoundRobinRouter(), scheduler=FIFOScheduler())
+        sim = Simulator(
+            num_gpus=2, router=RoundRobinRouter(), scheduler=FIFOScheduler()
+        )
         result = sim.run([])
         self.assertEqual(result.summary, {})
         self.assertEqual(len(result.step_records), 0)
 
     def test_prefill_instant(self):
         requests = [SimRequest(request_id="r0", input_len=100, output_len=2)]
-        sim = Simulator(num_gpus=1, router=RoundRobinRouter(), scheduler=FIFOScheduler())
+        sim = Simulator(
+            num_gpus=1, router=RoundRobinRouter(), scheduler=FIFOScheduler()
+        )
         sim.run(requests)
         self.assertEqual(len(sim.gpu_states[0].running_requests), 0)
 
     def test_log_level_1(self):
-        requests = [SimRequest(request_id=f"r{i}", input_len=10, output_len=2) for i in range(4)]
-        sim = Simulator(num_gpus=2, router=RoundRobinRouter(), scheduler=FIFOScheduler(), log_level=1)
+        requests = [
+            SimRequest(request_id=f"r{i}", input_len=10, output_len=2) for i in range(4)
+        ]
+        sim = Simulator(
+            num_gpus=2,
+            router=RoundRobinRouter(),
+            scheduler=FIFOScheduler(),
+            log_level=1,
+        )
         captured = io.StringIO()
         old_stdout = sys.stdout
         sys.stdout = captured
@@ -267,8 +348,16 @@ class TestSimulator(CustomTestCase):
         self.assertIn("R=", output)
 
     def test_log_level_2(self):
-        requests = [SimRequest(request_id=f"req{i}", input_len=10, output_len=2) for i in range(2)]
-        sim = Simulator(num_gpus=2, router=RoundRobinRouter(), scheduler=FIFOScheduler(), log_level=2)
+        requests = [
+            SimRequest(request_id=f"req{i}", input_len=10, output_len=2)
+            for i in range(2)
+        ]
+        sim = Simulator(
+            num_gpus=2,
+            router=RoundRobinRouter(),
+            scheduler=FIFOScheduler(),
+            log_level=2,
+        )
         captured = io.StringIO()
         old_stdout = sys.stdout
         sys.stdout = captured
@@ -281,8 +370,14 @@ class TestSimulator(CustomTestCase):
         self.assertIn("req1", output)
 
     def test_step_records(self):
-        requests = [SimRequest(request_id=f"r{i}", input_len=10, output_len=3) for i in range(4)]
-        sim = Simulator(num_gpus=2, router=RoundRobinRouter(), scheduler=FIFOScheduler(max_running_requests=10))
+        requests = [
+            SimRequest(request_id=f"r{i}", input_len=10, output_len=3) for i in range(4)
+        ]
+        sim = Simulator(
+            num_gpus=2,
+            router=RoundRobinRouter(),
+            scheduler=FIFOScheduler(max_running_requests=10),
+        )
         result = sim.run(requests)
         self.assertGreater(len(result.step_records), 0)
         for record in result.step_records:
@@ -295,33 +390,63 @@ class TestSimulator(CustomTestCase):
 
 
 class TestMain(CustomTestCase):
-    def _run_and_verify(self, synth_num_requests: int, synth_output_len: int,
-                        num_gpus: int, max_running: int, expected_rows: list):
+    def _run_and_verify(
+        self,
+        synth_num_requests: int,
+        synth_output_len: int,
+        num_gpus: int,
+        max_running: int,
+        expected_rows: list,
+    ):
         args = argparse.Namespace(
-            input=None, synthetic=True,
-            synth_num_requests=synth_num_requests, synth_input_len=10,
-            synth_output_len=synth_output_len, synth_range_ratio=1.0, synth_seed=42,
-            num_gpus=num_gpus, router="round_robin", scheduler="fifo",
-            max_running=max_running, output=None, log_level=0,
+            input=None,
+            synthetic=True,
+            synth_num_requests=synth_num_requests,
+            synth_input_len=10,
+            synth_output_len=synth_output_len,
+            synth_range_ratio=1.0,
+            synth_seed=42,
+            num_gpus=num_gpus,
+            router="round_robin",
+            scheduler="fifo",
+            max_running=max_running,
+            output=None,
+            log_level=0,
         )
         df = main(args)
 
-        self.assertEqual(set(df.columns), {
-            "step", "gpu_id", "running_count", "pending_count",
-            "total_seq_len", "running_req_ids", "pending_req_ids"
-        })
+        self.assertEqual(
+            set(df.columns),
+            {
+                "step",
+                "gpu_id",
+                "running_count",
+                "pending_count",
+                "total_seq_len",
+                "running_req_ids",
+                "pending_req_ids",
+            },
+        )
         self.assertEqual(len(df), len(expected_rows))
 
         for expected in expected_rows:
-            row = df.filter((pl.col("step") == expected["step"]) & (pl.col("gpu_id") == expected["gpu_id"]))
-            self.assertEqual(len(row), 1, f"step={expected['step']}, gpu_id={expected['gpu_id']}")
+            row = df.filter(
+                (pl.col("step") == expected["step"])
+                & (pl.col("gpu_id") == expected["gpu_id"])
+            )
+            self.assertEqual(
+                len(row), 1, f"step={expected['step']}, gpu_id={expected['gpu_id']}"
+            )
             self.assertEqual(row["running_count"][0], expected["running_count"])
             self.assertEqual(row["pending_count"][0], expected["pending_count"])
 
     def test_simple_no_queuing(self):
         # 4 requests, output_len=2, 2 GPUs, no queuing
         self._run_and_verify(
-            synth_num_requests=4, synth_output_len=2, num_gpus=2, max_running=256,
+            synth_num_requests=4,
+            synth_output_len=2,
+            num_gpus=2,
+            max_running=256,
             expected_rows=[
                 {"step": 0, "gpu_id": 0, "running_count": 2, "pending_count": 0},
                 {"step": 0, "gpu_id": 1, "running_count": 2, "pending_count": 0},
@@ -333,7 +458,10 @@ class TestMain(CustomTestCase):
     def test_queuing_multiple_waves(self):
         # 8 requests, output_len=3, 2 GPUs, max_running=2 (causes queuing)
         self._run_and_verify(
-            synth_num_requests=8, synth_output_len=3, num_gpus=2, max_running=2,
+            synth_num_requests=8,
+            synth_output_len=3,
+            num_gpus=2,
+            max_running=2,
             expected_rows=[
                 {"step": 0, "gpu_id": 0, "running_count": 2, "pending_count": 2},
                 {"step": 0, "gpu_id": 1, "running_count": 2, "pending_count": 2},
@@ -355,13 +483,22 @@ class TestCLI(CustomTestCase):
     def _run_cli(self, *args):
         return subprocess.run(
             [sys.executable, "-m", "sglang.srt.debug_utils.schedule_simulator", *args],
-            capture_output=True, text=True,
+            capture_output=True,
+            text=True,
         )
 
     def test_cli_basic(self):
         log_data = [
-            {"event": "request.finished", "rid": "r1", "out": {"meta_info": {"prompt_tokens": 100, "completion_tokens": 50}}},
-            {"event": "request.finished", "rid": "r2", "out": {"meta_info": {"prompt_tokens": 200, "completion_tokens": 100}}},
+            {
+                "event": "request.finished",
+                "rid": "r1",
+                "out": {"meta_info": {"prompt_tokens": 100, "completion_tokens": 50}},
+            },
+            {
+                "event": "request.finished",
+                "rid": "r2",
+                "out": {"meta_info": {"prompt_tokens": 200, "completion_tokens": 100}},
+            },
         ]
         with tempfile.NamedTemporaryFile(mode="w", suffix=".log", delete=False) as f:
             for item in log_data:
@@ -370,14 +507,22 @@ class TestCLI(CustomTestCase):
         with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
             output_file = f.name
 
-        result = self._run_cli("--input", input_file, "--num-gpus", "2", "--output", output_file)
+        result = self._run_cli(
+            "--input", input_file, "--num-gpus", "2", "--output", output_file
+        )
         self.assertEqual(result.returncode, 0, f"CLI failed: {result.stderr}")
         self.assertIn("Loaded 2 requests", result.stdout)
         with open(output_file) as f:
             self.assertIn("batch_size_balancedness_mean", json.load(f))
 
     def test_cli_random_router(self):
-        log_data = [{"event": "request.finished", "rid": "r1", "out": {"meta_info": {"prompt_tokens": 100, "completion_tokens": 50}}}]
+        log_data = [
+            {
+                "event": "request.finished",
+                "rid": "r1",
+                "out": {"meta_info": {"prompt_tokens": 100, "completion_tokens": 50}},
+            }
+        ]
         with tempfile.NamedTemporaryFile(mode="w", suffix=".log", delete=False) as f:
             for item in log_data:
                 f.write(json.dumps(item) + "\n")
@@ -389,17 +534,32 @@ class TestCLI(CustomTestCase):
 
     def test_cli_synthetic(self):
         result = self._run_cli(
-            "--synthetic", "--synth-num-requests", "100",
-            "--synth-input-len", "512", "--synth-output-len", "128",
-            "--synth-range-ratio", "0.5", "--num-gpus", "4",
+            "--synthetic",
+            "--synth-num-requests",
+            "100",
+            "--synth-input-len",
+            "512",
+            "--synth-output-len",
+            "128",
+            "--synth-range-ratio",
+            "0.5",
+            "--num-gpus",
+            "4",
         )
         self.assertEqual(result.returncode, 0, f"CLI failed: {result.stderr}")
         self.assertIn("Generated 100 synthetic requests", result.stdout)
 
     def test_cli_log_level(self):
         result = self._run_cli(
-            "--synthetic", "--synth-num-requests", "10",
-            "--synth-output-len", "5", "--num-gpus", "2", "--log-level", "1",
+            "--synthetic",
+            "--synth-num-requests",
+            "10",
+            "--synth-output-len",
+            "5",
+            "--num-gpus",
+            "2",
+            "--log-level",
+            "1",
         )
         self.assertEqual(result.returncode, 0, f"CLI failed: {result.stderr}")
         self.assertIn("step=", result.stdout)

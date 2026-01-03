@@ -96,15 +96,17 @@ class Simulator:
 
     def _collect_step_records(self, step_records: List[StepRecord]) -> None:
         for gpu in self.gpu_states:
-            step_records.append(StepRecord(
-                step=self.step,
-                gpu_id=gpu.gpu_id,
-                running_count=len(gpu.running_requests),
-                pending_count=len(gpu.pending_requests),
-                total_seq_len=gpu.total_seq_len(),
-                running_req_ids=[r.request_id for r in gpu.running_requests],
-                pending_req_ids=[r.request_id for r in gpu.pending_requests],
-            ))
+            step_records.append(
+                StepRecord(
+                    step=self.step,
+                    gpu_id=gpu.gpu_id,
+                    running_count=len(gpu.running_requests),
+                    pending_count=len(gpu.pending_requests),
+                    total_seq_len=gpu.total_seq_len(),
+                    running_req_ids=[r.request_id for r in gpu.running_requests],
+                    pending_req_ids=[r.request_id for r in gpu.pending_requests],
+                )
+            )
 
     def _log_step(self) -> None:
         if self.log_level == 0:
@@ -121,7 +123,9 @@ class Simulator:
                 queue_ids = ",".join(r.request_id for r in gpu.pending_requests[:3])
                 if len(gpu.pending_requests) > 3:
                     queue_ids += f"...+{len(gpu.pending_requests)-3}"
-                parts.append(f"GPU{gpu.gpu_id}[R={r}:{run_ids or'-'} Q={q}:{queue_ids or'-'}]")
+                parts.append(
+                    f"GPU{gpu.gpu_id}[R={r}:{run_ids or'-'} Q={q}:{queue_ids or'-'}]"
+                )
         print(" | ".join(parts))
 
     def _record_metrics(self) -> None:

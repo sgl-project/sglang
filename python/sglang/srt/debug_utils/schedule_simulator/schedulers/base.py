@@ -13,9 +13,7 @@ class ScheduleDecision:
 
 class SchedulerPolicy(ABC):
     @abstractmethod
-    def schedule(self, gpu_state: "GPUState") -> ScheduleDecision:
-        ...
+    def schedule(self, gpu_state: "GPUState") -> ScheduleDecision: ...
 
 
 from sglang.srt.debug_utils.schedule_simulator.gpu_state import GPUState
-

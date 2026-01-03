@@ -5,4 +5,3 @@ from sglang.srt.debug_utils.schedule_simulator.routers.round_robin_router import
 )
 
 __all__ = ["RouterPolicy", "RandomRouter", "RoundRobinRouter"]
-

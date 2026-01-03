@@ -2,6 +2,7 @@ from sglang.srt.debug_utils.schedule_simulator.data_source import (
     generate_random_requests,
     load_from_request_logger,
 )
+from sglang.srt.debug_utils.schedule_simulator.entrypoint import create_arg_parser, main
 from sglang.srt.debug_utils.schedule_simulator.gpu_state import GPUState
 from sglang.srt.debug_utils.schedule_simulator.metrics import (
     AttentionBalancednessRecorder,
@@ -23,10 +24,6 @@ from sglang.srt.debug_utils.schedule_simulator.simulator import (
     SimulationResult,
     Simulator,
     StepRecord,
-)
-from sglang.srt.debug_utils.schedule_simulator.entrypoint import (
-    create_arg_parser,
-    main,
 )
 
 __all__ = [
@@ -50,4 +47,3 @@ __all__ = [
     "create_arg_parser",
     "main",
 ]
-

@@ -11,6 +11,4 @@ class RouterPolicy(ABC):
         self,
         incoming_request: SimRequest,
         gpu_states: List[GPUState],
-    ) -> int:
-        ...
-
+    ) -> int: ...

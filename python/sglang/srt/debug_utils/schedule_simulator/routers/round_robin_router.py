@@ -17,4 +17,3 @@ class RoundRobinRouter(RouterPolicy):
         gpu_id = self._counter % len(gpu_states)
         self._counter += 1
         return gpu_id
-

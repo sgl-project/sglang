@@ -15,4 +15,3 @@ class GPUState:
 
     def total_seq_len(self) -> int:
         return sum(req.seq_len() for req in self.running_requests)
-

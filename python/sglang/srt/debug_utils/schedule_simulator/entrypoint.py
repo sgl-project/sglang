@@ -13,8 +13,12 @@ def create_arg_parser() -> argparse.ArgumentParser:
     )
 
     data_group = parser.add_mutually_exclusive_group(required=True)
-    data_group.add_argument("--input", type=str, help="Path to request_logger JSON file")
-    data_group.add_argument("--synthetic", action="store_true", help="Use synthetic data generation")
+    data_group.add_argument(
+        "--input", type=str, help="Path to request_logger JSON file"
+    )
+    data_group.add_argument(
+        "--synthetic", action="store_true", help="Use synthetic data generation"
+    )
 
     parser.add_argument("--synth-num-requests", type=int, default=1000)
     parser.add_argument("--synth-input-len", type=int, default=1024)
@@ -23,7 +27,9 @@ def create_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--synth-seed", type=int, default=None)
 
     parser.add_argument("--num-gpus", type=int, default=8)
-    parser.add_argument("--router", type=str, choices=["random", "round_robin"], default="round_robin")
+    parser.add_argument(
+        "--router", type=str, choices=["random", "round_robin"], default="round_robin"
+    )
     parser.add_argument("--scheduler", type=str, choices=["fifo"], default="fifo")
     parser.add_argument("--max-running", type=int, default=256)
     parser.add_argument("--output", type=str, default=None)
@@ -49,10 +55,12 @@ def _load_requests(args: argparse.Namespace) -> List[SimRequest]:
             range_ratio=args.synth_range_ratio,
             seed=args.synth_seed,
         )
-        print(f"Generated {len(requests)} synthetic requests "
-              f"(synth_input_len={args.synth_input_len}, "
-              f"synth_output_len={args.synth_output_len}, "
-              f"synth_range_ratio={args.synth_range_ratio})")
+        print(
+            f"Generated {len(requests)} synthetic requests "
+            f"(synth_input_len={args.synth_input_len}, "
+            f"synth_output_len={args.synth_output_len}, "
+            f"synth_range_ratio={args.synth_range_ratio})"
+        )
     return requests
 
 
@@ -89,21 +97,25 @@ def main(args: argparse.Namespace) -> pl.DataFrame:
         log_level=args.log_level,
     )
 
-    print(f"Running simulation with {args.num_gpus} GPUs, router={args.router}, scheduler={args.scheduler}")
+    print(
+        f"Running simulation with {args.num_gpus} GPUs, router={args.router}, scheduler={args.scheduler}"
+    )
     result = sim.run(requests)
 
-    df = pl.DataFrame([
-        {
-            "step": r.step,
-            "gpu_id": r.gpu_id,
-            "running_count": r.running_count,
-            "pending_count": r.pending_count,
-            "total_seq_len": r.total_seq_len,
-            "running_req_ids": r.running_req_ids,
-            "pending_req_ids": r.pending_req_ids,
-        }
-        for r in result.step_records
-    ])
+    df = pl.DataFrame(
+        [
+            {
+                "step": r.step,
+                "gpu_id": r.gpu_id,
+                "running_count": r.running_count,
+                "pending_count": r.pending_count,
+                "total_seq_len": r.total_seq_len,
+                "running_req_ids": r.running_req_ids,
+                "pending_req_ids": r.pending_req_ids,
+            }
+            for r in result.step_records
+        ]
+    )
 
     print("\n=== Summary ===")
     for key, value in result.summary.items():

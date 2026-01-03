@@ -42,4 +42,3 @@ def load_from_request_logger(file_path: Union[str, Path]) -> List[SimRequest]:
             )
 
     return requests
-

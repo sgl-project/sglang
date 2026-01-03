@@ -13,4 +13,3 @@ class RandomRouter(RouterPolicy):
         gpu_states: List[GPUState],
     ) -> int:
         return random.randint(0, len(gpu_states) - 1)
-

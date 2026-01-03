@@ -19,4 +19,3 @@ class FIFOScheduler(SchedulerPolicy):
         for req in gpu_state.pending_requests[:available_slots]:
             to_run.append(req)
         return ScheduleDecision(to_run=to_run, to_preempt=[])
-

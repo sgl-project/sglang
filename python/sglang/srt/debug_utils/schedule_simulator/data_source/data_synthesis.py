@@ -46,4 +46,3 @@ def generate_random_requests(
 def _random_len(full_len: int, range_ratio: float) -> int:
     min_len = max(int(full_len * range_ratio), 1)
     return random.randint(min_len, full_len)
-
