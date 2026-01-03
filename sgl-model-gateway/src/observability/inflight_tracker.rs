@@ -3,14 +3,13 @@ use std::{
         atomic::{AtomicU64, Ordering},
         Arc,
     },
-    time::{Duration, Instant},
+    time::Instant,
 };
 
 use dashmap::DashMap;
-use tokio::time::interval;
-use tracing::debug;
 
 use super::metrics::Metrics;
+use crate::policies::utils::PeriodicTask;
 
 // Age buckets in seconds: 30s, 1m, 3m, 5m, 10m, 20m, 1h, 2h, 4h, 8h, 24h
 const AGE_BUCKET_BOUNDS: &[u64] = &[30, 60, 180, 300, 600, 1200, 3600, 7200, 14400, 28800, 86400];
@@ -42,19 +41,11 @@ impl InFlightRequestTracker {
         })
     }
 
-    pub fn start_sampler(self: &Arc<Self>, sample_interval: Duration) {
+    pub fn start_sampler(self: &Arc<Self>, interval_secs: u64) -> PeriodicTask {
         let tracker = self.clone();
-        tokio::spawn(async move {
-            let mut ticker = interval(sample_interval);
-            debug!(
-                "InFlightRequestTracker sampler started with {}ms interval",
-                sample_interval.as_millis()
-            );
-            loop {
-                ticker.tick().await;
-                tracker.sample_and_record();
-            }
-        });
+        PeriodicTask::spawn(interval_secs, "InFlightRequestSampler", move || {
+            tracker.sample_and_record();
+        })
     }
 
     pub fn track(self: &Arc<Self>) -> InFlightGuard {
