@@ -38,7 +38,9 @@ logger = logging.getLogger(__name__)
 WHITELISTED_HEADERS = ["x-smg-routing-key"]
 
 
-def _extract_whitelisted_headers(request: Optional["fastapi.Request"]) -> Optional[Dict[str, str]]:
+def _extract_whitelisted_headers(
+    request: Optional["fastapi.Request"],
+) -> Optional[Dict[str, str]]:
     if request is None:
         return None
     return {h: v for h in WHITELISTED_HEADERS if (v := request.headers.get(h))}
@@ -89,7 +91,10 @@ class RequestLogger:
         self.targets = self._setup_targets()
 
     def log_received_request(
-        self, obj: Union["GenerateReqInput", "EmbeddingReqInput"], tokenizer: Any = None, request: Optional["fastapi.Request"] = None
+        self,
+        obj: Union["GenerateReqInput", "EmbeddingReqInput"],
+        tokenizer: Any = None,
+        request: Optional["fastapi.Request"] = None,
     ) -> None:
         if not self.log_requests:
             return
@@ -150,8 +155,14 @@ class RequestLogger:
                 )
             self._log_json("request.finished", log_data)
         else:
-            obj_str = _dataclass_to_string_truncated(obj, max_length, skip_names=skip_names)
-            out_str = "" if is_multimodal_gen else f", out={_dataclass_to_string_truncated(out, max_length, skip_names=out_skip_names)}"
+            obj_str = _dataclass_to_string_truncated(
+                obj, max_length, skip_names=skip_names
+            )
+            out_str = (
+                ""
+                if is_multimodal_gen
+                else f", out={_dataclass_to_string_truncated(out, max_length, skip_names=out_skip_names)}"
+            )
             headers_str = f", headers={headers}" if headers else ""
             self._log(f"Finish: obj={obj_str}{headers_str}{out_str}")
 

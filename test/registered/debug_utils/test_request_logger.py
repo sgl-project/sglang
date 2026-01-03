@@ -88,8 +88,12 @@ class TestRequestLoggerText(BaseTestRequestLogger, CustomTestCase):
     def _verify_logs(self, content: str, source_name: str):
         self.assertIn("Receive:", content, f"'Receive:' not found in {source_name}")
         self.assertIn("Finish:", content, f"'Finish:' not found in {source_name}")
-        self.assertIn(TEST_ROUTING_KEY, content, f"Routing key not found in {source_name}")
-        self.assertIn("x-smg-routing-key", content, f"Header name not found in {source_name}")
+        self.assertIn(
+            TEST_ROUTING_KEY, content, f"Routing key not found in {source_name}"
+        )
+        self.assertIn(
+            "x-smg-routing-key", content, f"Header name not found in {source_name}"
+        )
 
 
 class TestRequestLoggerJson(BaseTestRequestLogger, CustomTestCase):
@@ -110,13 +114,17 @@ class TestRequestLoggerJson(BaseTestRequestLogger, CustomTestCase):
             if data.get("event") == "request.received":
                 self.assertIn("rid", data)
                 self.assertIn("obj", data)
-                self.assertEqual(data.get("headers", {}).get("x-smg-routing-key"), TEST_ROUTING_KEY)
+                self.assertEqual(
+                    data.get("headers", {}).get("x-smg-routing-key"), TEST_ROUTING_KEY
+                )
                 received_found = True
             elif data.get("event") == "request.finished":
                 self.assertIn("rid", data)
                 self.assertIn("obj", data)
                 self.assertIn("out", data)
-                self.assertEqual(data.get("headers", {}).get("x-smg-routing-key"), TEST_ROUTING_KEY)
+                self.assertEqual(
+                    data.get("headers", {}).get("x-smg-routing-key"), TEST_ROUTING_KEY
+                )
                 finished_found = True
 
         self.assertTrue(

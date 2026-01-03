@@ -1214,7 +1214,10 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                         "response_sent_to_client_ts"
                     ] = state.response_sent_to_client_ts
                 self.request_logger.log_finished_request(
-                    obj, out, is_multimodal_gen=self.model_config.is_multimodal_gen, request=request
+                    obj,
+                    out,
+                    is_multimodal_gen=self.model_config.is_multimodal_gen,
+                    request=request,
                 )
 
                 if self.request_metrics_exporter_manager.exporter_enabled():
