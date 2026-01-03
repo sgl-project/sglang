@@ -26,6 +26,7 @@ from sglang.srt.debug_utils.schedule_simulator import (
 from sglang.srt.debug_utils.schedule_simulator.entrypoint import main
 from sglang.test.test_utils import CustomTestCase
 
+
 # ==================== Non-E2E Tests ====================
 
 
@@ -114,8 +115,9 @@ class TestRouters(CustomTestCase):
 
 
 class TestFIFOScheduler(CustomTestCase):
-    def test_basic(self):
-        scheduler = FIFOScheduler(max_running_requests=2)
+    def test_basic_token_limit(self):
+        # max_total_tokens=200, each req has seq_len=100, so only 2 can run
+        scheduler = FIFOScheduler(max_total_tokens=200)
         gpu = GPUState(gpu_id=0)
         gpu.pending_requests = [
             SimRequest(request_id=f"r{i}", input_len=100, output_len=50)
@@ -125,8 +127,9 @@ class TestFIFOScheduler(CustomTestCase):
         self.assertEqual(len(decision.to_run), 2)
         self.assertEqual(len(decision.to_preempt), 0)
 
-    def test_respects_running(self):
-        scheduler = FIFOScheduler(max_running_requests=3)
+    def test_respects_running_tokens(self):
+        # max_total_tokens=300, running has 100 tokens, so 2 more pending can run
+        scheduler = FIFOScheduler(max_total_tokens=300)
         gpu = GPUState(gpu_id=0)
         gpu.running_requests = [
             SimRequest(request_id="running", input_len=100, output_len=50)
@@ -137,6 +140,26 @@ class TestFIFOScheduler(CustomTestCase):
         ]
         decision = scheduler.schedule(gpu)
         self.assertEqual(len(decision.to_run), 2)
+
+    def test_preemption_when_over_budget(self):
+        # Simulate: running requests grow beyond max_total_tokens
+        scheduler = FIFOScheduler(max_total_tokens=250)
+        gpu = GPUState(gpu_id=0)
+        # 3 requests with 100 tokens each = 300 tokens, over budget of 250
+        gpu.running_requests = [
+            SimRequest(
+                request_id=f"r{i}",
+                input_len=100,
+                output_len=50,
+                stage=RequestStage.DECODE,
+                decoded_tokens=0,
+            )
+            for i in range(3)
+        ]
+        decision = scheduler.schedule(gpu)
+        # Should preempt 1 request to get under 250
+        self.assertEqual(len(decision.to_preempt), 1)
+        self.assertEqual(decision.to_preempt[0].request_id, "r2")  # LIFO: last added
 
 
 class TestMetrics(CustomTestCase):
@@ -284,7 +307,7 @@ class TestSimulator(CustomTestCase):
         sim = Simulator(
             num_gpus=2,
             router=RoundRobinRouter(),
-            scheduler=FIFOScheduler(max_running_requests=4),
+            scheduler=FIFOScheduler(max_total_tokens=100),
             recorders=[
                 BatchSizeBalancednessRecorder(),
                 AttentionBalancednessRecorder(),
@@ -302,7 +325,7 @@ class TestSimulator(CustomTestCase):
         sim = Simulator(
             num_gpus=2,
             router=RoundRobinRouter(),
-            scheduler=FIFOScheduler(max_running_requests=10),
+            scheduler=FIFOScheduler(max_total_tokens=10000),
         )
         sim.run(requests)
         for gpu in sim.gpu_states:
@@ -376,7 +399,7 @@ class TestSimulator(CustomTestCase):
         sim = Simulator(
             num_gpus=2,
             router=RoundRobinRouter(),
-            scheduler=FIFOScheduler(max_running_requests=10),
+            scheduler=FIFOScheduler(max_total_tokens=10000),
         )
         result = sim.run(requests)
         self.assertGreater(len(result.step_records), 0)
@@ -384,6 +407,30 @@ class TestSimulator(CustomTestCase):
             self.assertIsInstance(record, StepRecord)
             self.assertIn(record.gpu_id, [0, 1])
         self.assertEqual(len([r for r in result.step_records if r.step == 0]), 2)
+
+    def test_preemption_due_to_token_growth(self):
+        # 2 requests on 1 GPU, each input_len=50, output_len=10
+        # max_total_tokens=110, so initially both can run (100 tokens)
+        # After 5 decode steps, total = 50+5 + 50+5 = 110, still ok
+        # After 6 decode steps, total = 50+6 + 50+6 = 112 > 110, need preempt
+        requests = [
+            SimRequest(request_id="r0", input_len=50, output_len=10),
+            SimRequest(request_id="r1", input_len=50, output_len=10),
+        ]
+        sim = Simulator(
+            num_gpus=1,
+            router=RoundRobinRouter(),
+            scheduler=FIFOScheduler(max_total_tokens=110),
+        )
+        result = sim.run(requests)
+
+        # Check that preemption happened at some point
+        found_preemption = False
+        for record in result.step_records:
+            if record.running_count == 1 and record.pending_count == 1:
+                found_preemption = True
+                break
+        self.assertTrue(found_preemption, "Expected preemption to occur due to token growth")
 
 
 # ==================== E2E Tests ====================
@@ -393,23 +440,24 @@ class TestMain(CustomTestCase):
     def _run_and_verify(
         self,
         synth_num_requests: int,
+        synth_input_len: int,
         synth_output_len: int,
         num_gpus: int,
-        max_running: int,
+        max_total_tokens: int,
         expected_rows: list,
     ):
         args = argparse.Namespace(
             input=None,
             synthetic=True,
             synth_num_requests=synth_num_requests,
-            synth_input_len=10,
+            synth_input_len=synth_input_len,
             synth_output_len=synth_output_len,
             synth_range_ratio=1.0,
             synth_seed=42,
             num_gpus=num_gpus,
             router="round_robin",
             scheduler="fifo",
-            max_running=max_running,
+            max_total_tokens=max_total_tokens,
             output=None,
             log_level=0,
         )
@@ -441,12 +489,14 @@ class TestMain(CustomTestCase):
             self.assertEqual(row["pending_count"][0], expected["pending_count"])
 
     def test_simple_no_queuing(self):
-        # 4 requests, output_len=2, 2 GPUs, no queuing
+        # 4 requests, input_len=10, output_len=2, 2 GPUs
+        # Each GPU gets 2 requests, total 20 tokens per GPU, well under 10000
         self._run_and_verify(
             synth_num_requests=4,
+            synth_input_len=10,
             synth_output_len=2,
             num_gpus=2,
-            max_running=256,
+            max_total_tokens=10000,
             expected_rows=[
                 {"step": 0, "gpu_id": 0, "running_count": 2, "pending_count": 0},
                 {"step": 0, "gpu_id": 1, "running_count": 2, "pending_count": 0},
@@ -455,26 +505,27 @@ class TestMain(CustomTestCase):
             ],
         )
 
-    def test_queuing_multiple_waves(self):
-        # 8 requests, output_len=3, 2 GPUs, max_running=2 (causes queuing)
+    def test_queuing_due_to_token_limit(self):
+        # 4 requests, input_len=100, output_len=3, 1 GPU
+        # max_total_tokens=200, so only 2 requests can run at a time
+        # step 0: r0,r1 running (200 tokens), r2,r3 pending
+        # step 1: still running (202 tokens but they complete soon)
+        # step 2: r0,r1 finish (decoded 3), r2,r3 start
+        # step 3-4: r2,r3 running
+        # step 5: all done
         self._run_and_verify(
-            synth_num_requests=8,
+            synth_num_requests=4,
+            synth_input_len=100,
             synth_output_len=3,
-            num_gpus=2,
-            max_running=2,
+            num_gpus=1,
+            max_total_tokens=200,
             expected_rows=[
                 {"step": 0, "gpu_id": 0, "running_count": 2, "pending_count": 2},
-                {"step": 0, "gpu_id": 1, "running_count": 2, "pending_count": 2},
                 {"step": 1, "gpu_id": 0, "running_count": 2, "pending_count": 2},
-                {"step": 1, "gpu_id": 1, "running_count": 2, "pending_count": 2},
                 {"step": 2, "gpu_id": 0, "running_count": 0, "pending_count": 2},
-                {"step": 2, "gpu_id": 1, "running_count": 0, "pending_count": 2},
                 {"step": 3, "gpu_id": 0, "running_count": 2, "pending_count": 0},
-                {"step": 3, "gpu_id": 1, "running_count": 2, "pending_count": 0},
                 {"step": 4, "gpu_id": 0, "running_count": 2, "pending_count": 0},
-                {"step": 4, "gpu_id": 1, "running_count": 2, "pending_count": 0},
                 {"step": 5, "gpu_id": 0, "running_count": 0, "pending_count": 0},
-                {"step": 5, "gpu_id": 1, "running_count": 0, "pending_count": 0},
             ],
         )
 
