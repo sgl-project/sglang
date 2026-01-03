@@ -242,6 +242,8 @@ class Envs:
 
     # Hi-Cache
     SGLANG_HICACHE_HF3FS_CONFIG_PATH = EnvStr(None)
+    SGLANG_HICACHE_LOG_LOAD_BANDWIDTH = EnvBool(False)
+    SGLANG_HICACHE_LOG_WRITE_BANDWIDTH = EnvBool(False)
 
     # Mooncake KV Transfer
     SGLANG_MOONCAKE_CUSTOM_MEM_POOL = EnvStr(None)

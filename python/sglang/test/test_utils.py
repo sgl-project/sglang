@@ -1952,3 +1952,8 @@ def intel_amx_benchmark(extra_args=None, min_throughput=None):
         return wrapper
 
     return decorator
+
+
+def set_hicache_env_vars():
+    os.environ["SGLANG_HICACHE_LOG_LOAD_BANDWIDTH"] = "1"
+    os.environ["SGLANG_HICACHE_LOG_WRITE_BANDWIDTH"] = "1"

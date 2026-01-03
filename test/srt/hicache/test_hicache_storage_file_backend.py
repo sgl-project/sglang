@@ -27,7 +27,10 @@ from sglang.test.test_utils import (
     CustomTestCase,
     is_in_ci,
     popen_launch_server,
+    set_hicache_env_vars,
 )
+
+set_hicache_env_vars()
 
 
 class HiCacheStorageBaseMixin:

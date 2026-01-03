@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 """
 Copyright 2023-2025 SGLang Team
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -12,6 +10,8 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 """
+
+from __future__ import annotations
 
 import logging
 import threading
@@ -34,6 +34,7 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
     get_attention_dp_rank,
     get_attention_tp_rank,
@@ -52,7 +53,11 @@ class LayerLoadingEvent:
     def __init__(self, num_layers: int):
         self._num_layers = num_layers
         self.load_events = [device_module.Event() for _ in range(num_layers)]
-        self.start_event = device_module.Event()  # start event on controller stream
+        if envs.SGLANG_HICACHE_LOG_LOAD_BANDWIDTH.get():
+            self.start_event = device_module.Event(enable_timing=True)
+            self.load_events[-1] = device_module.Event(enable_timing=True)
+        else:
+            self.start_event = device_module.Event()
 
     def complete(self, layer_index: int):
         assert 0 <= layer_index < self._num_layers
@@ -139,9 +144,10 @@ class CacheOperation:
 
 
 class HiCacheAck(NamedTuple):
-    start_event: device_module.Event
-    finish_event: device_module.Event
+    start_event: torch.Event
+    finish_event: torch.Event
     node_ids: List[int]
+    num_tokens: int
 
 
 class TransferBuffer:
@@ -461,8 +467,9 @@ class HiCacheController:
         host_indices, device_indices = self.move_indices(op)
         self.write_queue.clear()
 
-        start_event = device_module.Event()
-        finish_event = device_module.Event()
+        enable_timing = envs.SGLANG_HICACHE_LOG_WRITE_BANDWIDTH.get()
+        start_event = device_module.Event(enable_timing=enable_timing)
+        finish_event = device_module.Event(enable_timing=enable_timing)
 
         start_event.record()
         with device_module.stream(self.write_stream):
@@ -479,7 +486,14 @@ class HiCacheController:
             if device_indices.is_cuda:
                 device_indices.record_stream(self.write_stream)
 
-        self.ack_write_queue.append(HiCacheAck(start_event, finish_event, op.node_ids))
+        self.ack_write_queue.append(
+            HiCacheAck(
+                start_event=start_event,
+                finish_event=finish_event,
+                node_ids=op.node_ids,
+                num_tokens=len(op.device_indices),
+            )
+        )
 
     def load(
         self,
@@ -514,8 +528,9 @@ class HiCacheController:
                 return host_indices, device_indices.cpu()
         elif self.io_backend == "kernel_ascend":
             return host_indices, device_indices.cpu()
-        else:
-            raise ValueError(f"Unsupported io backend")
+
+        # unsupported io backend
+        raise ValueError(f"Unsupported io backend")
 
     def start_loading(self) -> int:
         if len(self.load_queue) == 0:
@@ -552,6 +567,7 @@ class HiCacheController:
                 start_event=producer_event.start_event,
                 finish_event=producer_event.finish_event,
                 node_ids=op.node_ids,
+                num_tokens=len(op.device_indices),
             )
         )
         return producer_id

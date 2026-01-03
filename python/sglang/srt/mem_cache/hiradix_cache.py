@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, List, Optional
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.managers.cache_controller import HiCacheController, PrefetchOperation
 from sglang.srt.mem_cache.base_prefix_cache import MatchResult
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, MLATokenToKVPool
@@ -132,6 +133,10 @@ class HiRadixCache(RadixCache):
         )
         self.load_back_threshold = 10
 
+        self._should_log_load: bool = envs.SGLANG_HICACHE_LOG_LOAD_BANDWIDTH.get()
+        self._should_log_write: bool = envs.SGLANG_HICACHE_LOG_WRITE_BANDWIDTH.get()
+
+        self.token_size = self.token_to_kv_pool_host.get_size_per_token()
         super().__init__(params=params)
 
     def _parse_storage_backend_extra_config(
@@ -267,12 +272,34 @@ class HiRadixCache(RadixCache):
                 # write to host if the node is not backuped
                 self.write_backup(node)
 
+    def _log_bandwidth(
+        self,
+        start: torch.Event,
+        finish: torch.Event,
+        num_tokens: int,
+        name: str,
+    ) -> None:
+        dur_ms = start.elapsed_time(finish)
+        bandwidth = (num_tokens * self.token_size / (1024**3)) / (dur_ms / 1000)
+        logger.info(
+            f"{name} {num_tokens} tokens took {dur_ms:.3f} ms, bandwidth: {bandwidth:.3f} GB/s"
+        )
+
     def writing_check(self, write_back=False):
         if write_back:
             # blocking till all write back complete
             while len(self.ongoing_write_through) > 0:
-                for _, finish_event, ack_list in self.cache_controller.ack_write_queue:
+                for (
+                    start_event,
+                    finish_event,
+                    ack_list,
+                    num_tokens,
+                ) in self.cache_controller.ack_write_queue:
                     finish_event.synchronize()
+                    if self._should_log_write:
+                        self._log_bandwidth(
+                            start_event, finish_event, num_tokens, "Write Back"
+                        )
                     for ack_id in ack_list:
                         del self.ongoing_write_through[ack_id]
                 self.cache_controller.ack_write_queue.clear()
@@ -284,7 +311,7 @@ class HiRadixCache(RadixCache):
             return
 
         finish_count = 0
-        for _, finish_event, ack_list in self.cache_controller.ack_write_queue:
+        for _, finish_event, _, _ in self.cache_controller.ack_write_queue:
             if not finish_event.query():
                 break
             finish_count += 1
@@ -297,23 +324,35 @@ class HiRadixCache(RadixCache):
                 group=self.tp_group,
             )
 
-        finish_count = int(queue_size.item())
-        while finish_count > 0:
-            _, finish_event, ack_list = self.cache_controller.ack_write_queue.pop(0)
+        # NOTE: ACK until all events are processed
+        for _ in range(int(queue_size.item())):
+            start_event, finish_event, ack_list, num_tokens = (
+                self.cache_controller.ack_write_queue.pop(0)
+            )
             finish_event.synchronize()
+            if self._should_log_write:
+                self._log_bandwidth(
+                    start_event, finish_event, num_tokens, "Write Through"
+                )
             for ack_id in ack_list:
                 backuped_node = self.ongoing_write_through.pop(ack_id)
                 self.dec_lock_ref(backuped_node)
                 if self.enable_storage:
                     self.write_backup_storage(backuped_node)
-            finish_count -= 1
 
     def loading_check(self):
         finish_count = 0
-        for _, finish_event, ack_list in self.cache_controller.ack_load_queue:
+        for (
+            start_event,
+            finish_event,
+            ack_list,
+            num_tokens,
+        ) in self.cache_controller.ack_load_queue:
             if not finish_event.query():
                 # the KV cache loading is still ongoing
                 break
+            if self._should_log_load:
+                self._log_bandwidth(start_event, finish_event, num_tokens, "Load Back")
             finish_count += 1
             # no need to sync across TP workers as batch forwarding is synced
             for ack_id in ack_list:
