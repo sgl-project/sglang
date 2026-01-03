@@ -3,6 +3,27 @@
 
 You can install SGLang using any of the methods below. Please go through `System Settings` section to ensure the clusters are roaring at max performance. Feel free to leave an issue [here at sglang](https://github.com/sgl-project/sglang/issues) if you encounter any issues or have any problems.
 
+## Component Version Mapping For SGLang
+| Component         | Version                 | Obtain Way                                                                                                                                                                                                                   |
+|-------------------|-------------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| HDK               | 25.2.1                  | [link](https://support.huawei.com/carrier/productNewOffering?col=product&path=PBI1-262732867/PBI1-262735886/PBI1-262735910/PBI1-261410188/PBI1-252764743&pVR=PBI1-263550357&pC=PBI1-264360782&pSPC=PBI1-266220744&resTab=SW) |
+| CANN              | 8.3.rc2                 | [Obtain Images](#obtain-cann-image)                                                                                                                                                                                          |
+| Pytorch Adapter   | 7.3.0                   | [link](https://gitcode.com/Ascend/pytorch/releases)                                                                                                                                                                          |
+| MemFabric         | 0.1.0                   | [link](https://gitcode.com/Ascend/memfabric_hybrid/releases)                                                                                                                                                                 |
+| Triton            | 3.2.0.dev2025112116     | [link](https://sglang-ascend.obs.cn-east-3.myhuaweicloud.com/sglang/triton_ascend/triton_ascend-3.2.0.dev2025112116-cp311-cp311-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl)                                           |
+| Bisheng           | 20251121                | [link](https://sglang-ascend.obs.cn-east-3.myhuaweicloud.com/sglang/triton_ascend/Ascend-BiSheng-toolkit_aarch64_20251121.run)                                                                                               |
+| SGLang NPU Kernel | NA                      | [link](https://github.com/sgl-project/sgl-kernel-npu/releases)                                                                                                                                                               |
+
+<a id="obtain-cann-image"></a>
+### Obtain CANN Image
+You can obtain the dependency of a specified version of CANN through an image.
+```shell
+# for Atlas 800I A3 and Ubuntu OS
+docker pull quay.io/ascend/cann:8.3.rc2-a3-ubuntu22.04-py3.11
+# for Atlas 800I A2 and Ubuntu OS
+docker pull quay.io/ascend/cann:8.3.rc2-910b-ubuntu22.04-py3.11
+```
+
 ## Preparing the Running Environment
 
 ### Method 1: Installing from source with prerequisites
