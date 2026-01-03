@@ -511,26 +511,26 @@ class TestCLI(CustomTestCase):
     def test_cli_synthetic(self):
         result = self._run_cli(
             "--synthetic",
-            "--synth-num-requests",
+            "--synth-random-num-requests",
             "100",
-            "--synth-input-len",
+            "--synth-random-input-len",
             "512",
-            "--synth-output-len",
+            "--synth-random-output-len",
             "128",
-            "--synth-range-ratio",
+            "--synth-random-range-ratio",
             "0.5",
             "--num-gpus",
             "4",
         )
         self.assertEqual(result.returncode, 0, f"CLI failed: {result.stderr}")
-        self.assertIn("Generated 100 synthetic requests", result.stdout)
+        self.assertIn("Generated 100 random requests", result.stdout)
 
     def test_cli_log_level(self):
         result = self._run_cli(
             "--synthetic",
-            "--synth-num-requests",
+            "--synth-random-num-requests",
             "10",
-            "--synth-output-len",
+            "--synth-random-output-len",
             "5",
             "--num-gpus",
             "2",
@@ -544,11 +544,11 @@ class TestCLI(CustomTestCase):
         # 4 requests, input_len=10, output_len=2, 2 GPUs, all fit in memory
         result = self._run_cli(
             "--synthetic",
-            "--synth-num-requests",
+            "--synth-random-num-requests",
             "4",
-            "--synth-input-len",
+            "--synth-random-input-len",
             "10",
-            "--synth-output-len",
+            "--synth-random-output-len",
             "2",
             "--synth-seed",
             "42",
@@ -572,11 +572,11 @@ class TestCLI(CustomTestCase):
     def test_e2e_queuing_due_to_token_limit(self):
         result = self._run_cli(
             "--synthetic",
-            "--synth-num-requests",
+            "--synth-random-num-requests",
             "4",
-            "--synth-input-len",
+            "--synth-random-input-len",
             "100",
-            "--synth-output-len",
+            "--synth-random-output-len",
             "3",
             "--synth-seed",
             "42",
@@ -602,11 +602,11 @@ step=5    | GPU0[R=0:- Q=0:-]""",
     def test_e2e_retraction_due_to_token_growth(self):
         result = self._run_cli(
             "--synthetic",
-            "--synth-num-requests",
+            "--synth-random-num-requests",
             "2",
-            "--synth-input-len",
+            "--synth-random-input-len",
             "50",
-            "--synth-output-len",
+            "--synth-random-output-len",
             "10",
             "--synth-seed",
             "42",
