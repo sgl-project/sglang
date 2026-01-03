@@ -14,12 +14,14 @@
 
 import concurrent.futures
 import torch
+import torch.nn as nn
 import tqdm
 from transformers import PretrainedConfig
 import logging
 from typing import Iterable, Tuple, Optional
 
 from sglang.srt.environ import envs
+from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -79,11 +81,19 @@ NVFP4_CKPT_FP8_ATTN_QUANT_MODULES = ["q_b_proj"]
 class DeepseekV2WeightLoader:
     def __init__(
         self,
+        model: nn.Module,
+        causal_lm_model: nn.Module,
+        pp_group: GroupCoordinator,
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
+        num_fused_shared_experts: int = 0,
     ):
+        self.model = model
+        self.causal_lm_model = causal_lm_model
+        self.pp_group = pp_group
         self.config = config
         self.quant_config = quant_config
+        self.num_fused_shared_experts = num_fused_shared_experts
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False):
         if is_nextn:
@@ -146,7 +156,7 @@ class DeepseekV2WeightLoader:
 
         with concurrent.futures.ThreadPoolExecutor() as executor:
             futures = []
-            params_dict = dict(self.named_parameters())
+            params_dict = dict(self.causal_lm_model.named_parameters())
             weight_names = []
             for name, loaded_weight in weights:
                 use_async_loading = should_async_load(loaded_weight)
@@ -615,4 +625,19 @@ class DeepseekV2WeightLoader:
 
         return list(weights_dict.items())
 
+    def _mark_nextn_moe_weights_as_ue8m0(self):
+        # Mark the ue8m0 flag of nextn moe weights as True to avoid requantization
+        experts = self.model.decoder.mlp.experts
+        w13_scale = (
+            experts.w13_weight_scale_inv
+            if hasattr(experts, "w13_weight_scale_inv")
+            else experts.w13_weight_scale
+        )
+        w2_scale = (
+            experts.w2_weight_scale_inv
+            if hasattr(experts, "w2_weight_scale_inv")
+            else experts.w2_weight_scale
+        )
+        w13_scale.format_ue8m0 = True
+        w2_scale.format_ue8m0 = True
 

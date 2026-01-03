@@ -160,7 +160,6 @@ if _use_aiter_gfx95:
         fused_rms_fp8_group_quant,
     )
 
-    from sglang.srt.layers.quantization.quark.utils import quark_post_load_weights
     from sglang.srt.layers.quantization.rocm_mxfp4_utils import (
         batched_gemm_afp4wfp4_pre_quant,
         fused_flatten_mxfp4_quant,
@@ -2723,8 +2722,6 @@ class DeepseekV2ForCausalLM(nn.Module):
     ) -> None:
         super().__init__()
 
-        self.weight_loader = DeepseekV2WeightLoader(config, quant_config)
-
         # for quark model load
         # Fuse q_a_proj and kv_a_proj_with_mqa along output dimension when q_lora_rank is not None
         self.fuse_qkv_a_proj = (
@@ -2745,6 +2742,7 @@ class DeepseekV2ForCausalLM(nn.Module):
         self.model = DeepseekV2Model(
             config, quant_config, prefix=add_prefix("model", prefix)
         )
+
         if self.pp_group.is_last_rank:
             if self.pp_group.world_size == 1 and config.tie_word_embeddings:
                 self.lm_head = self.model.embed_tokens
@@ -2760,6 +2758,15 @@ class DeepseekV2ForCausalLM(nn.Module):
             # ranks other than the last rank will have a placeholder layer
             self.lm_head = PPMissingLayer()
         self.logits_processor = LogitsProcessor(config)
+
+        self.weight_loader = DeepseekV2WeightLoader(
+            causal_lm_model=self,
+            model=self.model,
+            pp_group=self.pp_group,
+            config=self.config,
+            quant_config=self.quant_config,
+            num_fused_shared_experts=self.num_fused_shared_experts,
+        )
 
         self._routed_experts_weights_of_layer = LazyValue(
             lambda: {
@@ -2905,22 +2912,6 @@ class DeepseekV2ForCausalLM(nn.Module):
             # we plus 1 here because in sglang, for the ith layer, it takes the output
             # of the (i-1)th layer as aux hidden state
             self.model.layers_to_capture = [val + 1 for val in layer_ids]
-
-    # Mark the ue8m0 flag of nextn moe weights as True to avoid requantization
-    def _mark_nextn_moe_weights_as_ue8m0(self):
-        experts = self.model.decoder.mlp.experts
-        w13_scale = (
-            experts.w13_weight_scale_inv
-            if hasattr(experts, "w13_weight_scale_inv")
-            else experts.w13_weight_scale
-        )
-        w2_scale = (
-            experts.w2_weight_scale_inv
-            if hasattr(experts, "w2_weight_scale_inv")
-            else experts.w2_weight_scale
-        )
-        w13_scale.format_ue8m0 = True
-        w2_scale.format_ue8m0 = True
 
 
 class DeepseekV3ForCausalLM(DeepseekV2ForCausalLM):
