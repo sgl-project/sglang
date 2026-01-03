@@ -39,14 +39,19 @@ impl InFlightRequestTracker {
         })
     }
 
-    pub fn new_with_sampler(sample_interval: Duration) -> Arc<Self> {
-        let tracker = Self::new();
-        tracker.clone().spawn_sampler(sample_interval);
-        tracker
-    }
-
     pub fn start_sampler(self: &Arc<Self>, sample_interval: Duration) {
-        self.clone().spawn_sampler(sample_interval);
+        let tracker = self.clone();
+        tokio::spawn(async move {
+            let mut ticker = interval(sample_interval);
+            debug!(
+                "InFlightRequestTracker sampler started with {}ms interval",
+                sample_interval.as_millis()
+            );
+            loop {
+                ticker.tick().await;
+                tracker.sample_and_record();
+            }
+        });
     }
 
     pub fn track(self: &Arc<Self>) -> InFlightGuard {
@@ -58,112 +63,65 @@ impl InFlightRequestTracker {
         }
     }
 
-    #[doc(hidden)]
     pub fn len(&self) -> usize {
         self.requests.len()
     }
 
-    #[doc(hidden)]
     pub fn is_empty(&self) -> bool {
         self.requests.is_empty()
     }
 
-    #[doc(hidden)]
-    pub fn insert_with_time(&self, request_id: u64, start_time: Instant) {
-        self.requests.insert(request_id, start_time);
-    }
-
-    #[doc(hidden)]
     pub fn compute_bucket_counts(&self) -> [usize; 6] {
         let now = Instant::now();
-        let mut cumulative_counts = [0usize; AGE_BUCKET_LABELS.len()];
-        let total_buckets = AGE_BUCKET_LABELS.len();
+        let mut counts = [0usize; 6];
 
         for entry in self.requests.iter() {
             let age_secs = now.duration_since(*entry.value()).as_secs();
-
             for (i, &bound) in AGE_BUCKET_BOUNDS.iter().enumerate() {
                 if age_secs <= bound {
-                    cumulative_counts[i] += 1;
+                    counts[i] += 1;
                 }
             }
-            cumulative_counts[total_buckets - 1] += 1;
+            counts[5] += 1;
         }
 
-        cumulative_counts
+        counts
     }
 
-    /// Samples all in-flight requests and records cumulative counts per age bucket.
-    /// Uses histogram-style cumulative semantics: le="60" = count of requests with age <= 60s.
     fn sample_and_record(&self) {
-        let now = Instant::now();
-
-        // Initialize cumulative bucket counts (one extra for +Inf)
-        let mut cumulative_counts = [0usize; AGE_BUCKET_LABELS.len()];
-        let total_buckets = AGE_BUCKET_LABELS.len();
-
-        // Count requests into cumulative buckets
-        for entry in self.requests.iter() {
-            let age_secs = now.duration_since(*entry.value()).as_secs();
-
-            // Increment all buckets where age <= bound (cumulative)
-            for (i, &bound) in AGE_BUCKET_BOUNDS.iter().enumerate() {
-                if age_secs <= bound {
-                    cumulative_counts[i] += 1;
-                }
-            }
-            // Always increment +Inf bucket
-            cumulative_counts[total_buckets - 1] += 1;
-        }
-
-        // Set gauge for each bucket with le label
+        let counts = self.compute_bucket_counts();
         for (i, &label) in AGE_BUCKET_LABELS.iter().enumerate() {
-            Metrics::set_inflight_request_count(label, cumulative_counts[i]);
+            Metrics::set_inflight_request_count(label, counts[i]);
         }
-    }
-
-    /// Spawns the background sampler task.
-    fn spawn_sampler(self: Arc<Self>, sample_interval: Duration) {
-        tokio::spawn(async move {
-            let mut ticker = interval(sample_interval);
-            debug!(
-                "InFlightRequestTracker sampler started with {}ms interval",
-                sample_interval.as_millis()
-            );
-
-            loop {
-                ticker.tick().await;
-                self.sample_and_record();
-            }
-        });
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
+
+    impl InFlightRequestTracker {
+        fn insert_with_time(&self, request_id: u64, start_time: Instant) {
+            self.requests.insert(request_id, start_time);
+        }
+    }
 
     #[test]
     fn test_track_and_drop() {
         let tracker = InFlightRequestTracker::new();
-
         {
             let _guard1 = tracker.track();
             let _guard2 = tracker.track();
             assert_eq!(tracker.len(), 2);
         }
-
         assert_eq!(tracker.len(), 0);
     }
 
     #[test]
     fn test_guard_auto_deregister() {
         let tracker = InFlightRequestTracker::new();
-
         let guard = tracker.track();
         assert_eq!(tracker.len(), 1);
-
         drop(guard);
         assert_eq!(tracker.len(), 0);
     }
@@ -171,7 +129,6 @@ mod tests {
     #[test]
     fn test_request_age_tracking() {
         let tracker = InFlightRequestTracker::new();
-
         let _guard = tracker.track();
         std::thread::sleep(Duration::from_millis(10));
 
@@ -181,17 +138,17 @@ mod tests {
     }
 
     #[test]
-    fn test_sample_empty_tracker() {
+    fn test_empty_tracker_buckets() {
         let tracker = InFlightRequestTracker::new();
         let counts = tracker.compute_bucket_counts();
         assert_eq!(counts, [0, 0, 0, 0, 0, 0]);
     }
 
     #[test]
-    fn test_sample_and_record_cumulative_buckets() {
+    fn test_cumulative_bucket_counts() {
         let tracker = InFlightRequestTracker::new();
-
         let now = Instant::now();
+
         tracker.insert_with_time(1, now);
         tracker.insert_with_time(2, now - Duration::from_secs(45));
         tracker.insert_with_time(3, now - Duration::from_secs(100));
@@ -200,43 +157,39 @@ mod tests {
         tracker.insert_with_time(6, now - Duration::from_secs(700));
 
         let counts = tracker.compute_bucket_counts();
-        assert_eq!(counts[0], 1, "le=30 bucket");
-        assert_eq!(counts[1], 2, "le=60 bucket");
-        assert_eq!(counts[2], 3, "le=180 bucket");
-        assert_eq!(counts[3], 4, "le=300 bucket");
-        assert_eq!(counts[4], 5, "le=600 bucket");
-        assert_eq!(counts[5], 6, "+Inf bucket");
+        assert_eq!(counts[0], 1, "le=30");
+        assert_eq!(counts[1], 2, "le=60");
+        assert_eq!(counts[2], 3, "le=180");
+        assert_eq!(counts[3], 4, "le=300");
+        assert_eq!(counts[4], 5, "le=600");
+        assert_eq!(counts[5], 6, "+Inf");
     }
 
     #[test]
-    fn test_cumulative_bucket_boundary_values() {
+    fn test_bucket_boundary_values() {
         let tracker = InFlightRequestTracker::new();
-
         let now = Instant::now();
+
         tracker.insert_with_time(1, now - Duration::from_secs(30));
         tracker.insert_with_time(2, now - Duration::from_secs(31));
 
         let counts = tracker.compute_bucket_counts();
-        assert_eq!(counts[0], 1, "le=30 should include exact boundary");
-        assert_eq!(counts[1], 2, "le=60 should include both");
-        assert_eq!(counts[5], 2, "+Inf should include all");
+        assert_eq!(counts[0], 1, "le=30 includes exact boundary");
+        assert_eq!(counts[1], 2, "le=60 includes both");
+        assert_eq!(counts[5], 2, "+Inf includes all");
     }
 
     #[test]
-    fn test_concurrent_track() {
+    fn test_concurrent_tracking() {
         use std::thread;
 
         let tracker = InFlightRequestTracker::new();
         let mut handles = vec![];
 
         for _ in 0..10 {
-            let tracker_clone = tracker.clone();
+            let t = tracker.clone();
             handles.push(thread::spawn(move || {
-                let mut guards = vec![];
-                for _ in 0..100 {
-                    guards.push(tracker_clone.track());
-                }
-                guards
+                (0..100).map(|_| t.track()).collect::<Vec<_>>()
             }));
         }
 
@@ -253,14 +206,12 @@ mod tests {
     #[test]
     fn test_unique_ids() {
         let tracker = InFlightRequestTracker::new();
+        let g1 = tracker.track();
+        let g2 = tracker.track();
+        let g3 = tracker.track();
 
-        let guard1 = tracker.track();
-        let guard2 = tracker.track();
-        let guard3 = tracker.track();
-
-        assert_ne!(guard1.request_id, guard2.request_id);
-        assert_ne!(guard2.request_id, guard3.request_id);
+        assert_ne!(g1.request_id, g2.request_id);
+        assert_ne!(g2.request_id, g3.request_id);
         assert_eq!(tracker.len(), 3);
     }
 }
-
