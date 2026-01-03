@@ -30,7 +30,7 @@ mod streaming_tests {
             }
         });
 
-        let result = ctx.make_streaming_request( "/generate", payload).await;
+        let result = ctx.make_streaming_request("/generate", payload).await;
         assert!(result.is_ok());
 
         let events = result.unwrap();
@@ -60,7 +60,9 @@ mod streaming_tests {
             "max_tokens": 20
         });
 
-        let result = ctx.make_streaming_request( "/v1/chat/completions", payload).await;
+        let result = ctx
+            .make_streaming_request("/v1/chat/completions", payload)
+            .await;
         assert!(result.is_ok());
 
         let events = result.unwrap();
@@ -100,7 +102,7 @@ mod streaming_tests {
             "max_tokens": 15
         });
 
-        let result = ctx.make_streaming_request( "/v1/completions", payload).await;
+        let result = ctx.make_streaming_request("/v1/completions", payload).await;
         assert!(result.is_ok());
 
         let events = result.unwrap();
@@ -125,7 +127,7 @@ mod streaming_tests {
             "stream": true
         });
 
-        let result = ctx.make_streaming_request( "/generate", payload).await;
+        let result = ctx.make_streaming_request("/generate", payload).await;
         assert!(result.is_err());
 
         ctx.shutdown().await;
@@ -151,7 +153,7 @@ mod streaming_tests {
         });
 
         let start = std::time::Instant::now();
-        let result = ctx.make_streaming_request( "/generate", payload).await;
+        let result = ctx.make_streaming_request("/generate", payload).await;
         let elapsed = start.elapsed();
 
         assert!(result.is_ok());
@@ -181,7 +183,7 @@ mod streaming_tests {
             }
         });
 
-        let result = ctx.make_streaming_request( "/generate", payload).await;
+        let result = ctx.make_streaming_request("/generate", payload).await;
         assert!(result.is_ok());
 
         let events = result.unwrap();
