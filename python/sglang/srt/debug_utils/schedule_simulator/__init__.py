@@ -17,7 +17,6 @@ from sglang.srt.debug_utils.schedule_simulator.routers import (
 )
 from sglang.srt.debug_utils.schedule_simulator.schedulers import (
     FIFOScheduler,
-    ScheduleDecision,
     SchedulerPolicy,
 )
 from sglang.srt.debug_utils.schedule_simulator.simulator import (
@@ -30,7 +29,6 @@ __all__ = [
     "SimRequest",
     "RequestStage",
     "GPUState",
-    "ScheduleDecision",
     "Simulator",
     "SimulationResult",
     "StepRecord",
