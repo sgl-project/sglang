@@ -193,17 +193,18 @@ def _create_log_target(target: str) -> logging.Logger:
         return _create_log_target_stdout()
     return _create_log_target_file(target)
 
-def _create_log_target_stdout() -> logging.Logger:
-    logger = logging.getLogger(f"{__name__}.stdout")
+def _create_logger_with_handler(name: str, handler: logging.Handler) -> logging.Logger:
+    logger = logging.getLogger(name)
     logger.setLevel(logging.INFO)
     logger.propagate = False
-
     if not logger.handlers:
-        handler = logging.StreamHandler()
         handler.setFormatter(logging.Formatter("%(message)s"))
         logger.addHandler(handler)
-
     return logger
+
+
+def _create_log_target_stdout() -> logging.Logger:
+    return _create_logger_with_handler(f"{__name__}.stdout", logging.StreamHandler())
 
 
 def _create_log_target_file(directory: str) -> logging.Logger:
@@ -211,19 +212,8 @@ def _create_log_target_file(directory: str) -> logging.Logger:
     hostname = socket.gethostname()
     rank = dist.get_rank() if dist.is_initialized() else 0
     filename = os.path.join(directory, f"{hostname}_{rank}.log")
-
-    logger = logging.getLogger(f"{__name__}.file.{directory}.{hostname}_{rank}")
-    logger.setLevel(logging.INFO)
-    logger.propagate = False
-
-    if not logger.handlers:
-        handler = TimedRotatingFileHandler(
-            filename, when="H", backupCount=0, encoding="utf-8"
-        )
-        handler.setFormatter(logging.Formatter("%(message)s"))
-        logger.addHandler(handler)
-
-    return logger
+    handler = TimedRotatingFileHandler(filename, when="H", backupCount=0, encoding="utf-8")
+    return _create_logger_with_handler(f"{__name__}.file.{directory}.{hostname}_{rank}", handler)
 
 
 # TODO unify this w/ `_transform_data_for_logging` if we find performance enough
