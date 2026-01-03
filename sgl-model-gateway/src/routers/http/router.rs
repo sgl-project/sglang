@@ -685,7 +685,7 @@ fn convert_reqwest_error(e: reqwest::Error) -> Response {
             "call_upstream_decode_error",
         )
     } else if e.is_timeout() {
-        (StatusCode::INTERNAL_SERVER_ERROR, "call_upstream_timeout")
+        (StatusCode::GATEWAY_TIMEOUT, "call_upstream_timeout")
     } else if e.is_connect() {
         (
             StatusCode::INTERNAL_SERVER_ERROR,

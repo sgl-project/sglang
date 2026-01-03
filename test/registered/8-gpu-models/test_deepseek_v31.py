@@ -48,12 +48,14 @@ class TestDeepseekV31Unified(unittest.TestCase):
                 DEEPSEEK_V31_MODEL_PATH,
                 tp_size=8,
                 extra_args=base_args,
+                variant="TP8",
             ),
             # Variant: "mtp" - TP=8 + EAGLE speculative decoding
             ModelLaunchSettings(
                 DEEPSEEK_V31_MODEL_PATH,
                 tp_size=8,
                 extra_args=base_args + mtp_args,
+                variant="TP8+MTP",
             ),
         ]
 

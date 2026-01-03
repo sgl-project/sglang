@@ -18,8 +18,8 @@ on:
         default: ""
 
 concurrency:
-  group: nightly-test-intel-${{ github.ref }}
-  cancel-in-progress: true
+  group: nightly-test-intel-${{ inputs.ref || github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'workflow_call' }}
 
 jobs:
   # Placeholder for Intel GPU tests

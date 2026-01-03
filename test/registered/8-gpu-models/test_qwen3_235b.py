@@ -34,6 +34,7 @@ class TestQwen3235BUnified(unittest.TestCase):
                 QWEN3_235B_MODEL_PATH,
                 tp_size=8,
                 extra_args=base_args,
+                variant="TP8",
             ),
         ]
 

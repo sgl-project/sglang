@@ -157,7 +157,6 @@ python -m sglang.launch_server \
     --speculative-num-steps 3 \
     --speculative-eagle-topk 1 \
     --speculative-num-draft-tokens 4 \
-    --prefill-round-robin-balance \
     --disable-shared-experts-fusion \
     --dtype bfloat16 \
     --tokenizer-worker-num 4
@@ -293,7 +292,6 @@ do
       --speculative-eagle-topk 1 \
       --speculative-num-draft-tokens 3  \
       --tokenizer-worker-num 4 \
-      --prefill-round-robin-balance \
       --disable-shared-experts-fusion \
       --dtype bfloat16
 done

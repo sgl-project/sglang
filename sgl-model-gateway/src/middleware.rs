@@ -280,7 +280,7 @@ impl<B> MakeSpan<B> for RequestSpan {
         // Don't try to extract request ID here - it won't be available yet
         // The RequestIdLayer runs after TraceLayer creates the span
         info_span!(
-            target: "sgl_model_gateway::otel-trace",
+            target: "smg::otel-trace",
             "http_request",
             method = %request.method(),
             uri = %request.uri(),
@@ -289,7 +289,7 @@ impl<B> MakeSpan<B> for RequestSpan {
             status_code = Empty,
             latency = Empty,
             error = Empty,
-            module = "sgl_model_gateway"
+            module = "smg"
         )
     }
 }
@@ -314,7 +314,7 @@ impl<B> OnRequest<B> for RequestLogger {
 
         // Log the request start
         info!(
-            target: "sgl_model_gateway::request",
+            target: "smg::request",
             "started processing request"
         );
     }
@@ -353,17 +353,17 @@ impl<B> OnResponse<B> for ResponseLogger {
         let _enter = span.enter();
         if status.is_server_error() {
             error!(
-                target: "sgl_model_gateway::response",
+                target: "smg::response",
                 "request failed with server error"
             );
         } else if status.is_client_error() {
             warn!(
-                target: "sgl_model_gateway::response",
+                target: "smg::response",
                 "request failed with client error"
             );
         } else {
             info!(
-                target: "sgl_model_gateway::response",
+                target: "smg::response",
                 "finished processing request"
             );
         }

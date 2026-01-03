@@ -170,7 +170,7 @@ def run_sgl_diffusion_webui(server_args: ServerArgs):
 
             with gr.Column():
                 image_out = gr.Image(
-                    label="Generated Image", visible=image_visible_only
+                    label="Generated Image", visible=image_visible_only, format="png"
                 )
                 video_out = gr.Video(
                     label="Generated Video", visible=video_visible_only
