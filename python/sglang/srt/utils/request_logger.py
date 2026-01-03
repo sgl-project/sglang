@@ -41,8 +41,7 @@ WHITELISTED_HEADERS = ["x-smg-routing-key"]
 def _extract_whitelisted_headers(request: Optional["fastapi.Request"]) -> Optional[Dict[str, str]]:
     if request is None:
         return None
-    result = {h: v for h in WHITELISTED_HEADERS if (v := request.headers.get(h))}
-    return result if result else None
+    return {h: v for h in WHITELISTED_HEADERS if (v := request.headers.get(h))}
 
 
 class RequestLogger:
