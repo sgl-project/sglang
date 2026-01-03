@@ -72,12 +72,15 @@ impl InFlightRequestTracker {
 
         for entry in self.requests.iter() {
             let age_secs = now.duration_since(*entry.value()).as_secs();
-            for (i, &bound) in AGE_BUCKET_BOUNDS.iter().enumerate() {
-                if age_secs <= bound {
-                    counts[i] += 1;
-                }
+            // Buckets are cumulative and bounds are sorted ascending
+            // Once age <= bound, all subsequent buckets also include this request
+            let first_bucket = AGE_BUCKET_BOUNDS
+                .iter()
+                .position(|&bound| age_secs <= bound)
+                .unwrap_or(inf_idx);
+            for count in &mut counts[first_bucket..] {
+                *count += 1;
             }
-            counts[inf_idx] += 1;
         }
 
         counts
