@@ -629,6 +629,52 @@ step=10   | GPU0[R=1:syn1 Q=0:-]
 step=13   | GPU0[R=0:- Q=0:-]""",
         )
 
+    def test_cli_gsp_basic(self):
+        result = self._run_cli(
+            "--synth-gsp",
+            "--synth-gsp-num-groups",
+            "4",
+            "--synth-gsp-prompts-per-group",
+            "8",
+            "--synth-gsp-system-prompt-len",
+            "100",
+            "--synth-gsp-question-len",
+            "50",
+            "--synth-gsp-output-len",
+            "10",
+            "--synth-seed",
+            "42",
+            "--num-gpus",
+            "2",
+        )
+        self.assertEqual(result.returncode, 0, f"CLI failed: {result.stderr}")
+        self.assertIn("Generated 32 GSP requests", result.stdout)
+        self.assertIn("4 groups x 8 prompts", result.stdout)
+
+    def test_e2e_gsp_shared_prefix_kv_cache(self):
+        result = self._run_cli(
+            "--synth-gsp",
+            "--synth-gsp-num-groups",
+            "1",
+            "--synth-gsp-prompts-per-group",
+            "3",
+            "--synth-gsp-system-prompt-len",
+            "100",
+            "--synth-gsp-question-len",
+            "10",
+            "--synth-gsp-output-len",
+            "2",
+            "--synth-seed",
+            "42",
+            "--num-gpus",
+            "1",
+            "--max-total-tokens",
+            "200",
+            "--log-level",
+            "2",
+        )
+        self.assertEqual(result.returncode, 0, f"CLI failed: {result.stderr}")
+
 
 if __name__ == "__main__":
     unittest.main()
