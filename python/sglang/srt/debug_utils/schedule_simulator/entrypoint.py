@@ -31,7 +31,7 @@ def create_arg_parser() -> argparse.ArgumentParser:
         "--router", type=str, choices=["random", "round_robin"], default="round_robin"
     )
     parser.add_argument("--scheduler", type=str, choices=["fifo"], default="fifo")
-    parser.add_argument("--max-running", type=int, default=256)
+    parser.add_argument("--max-total-tokens", type=int, default=100000)
     parser.add_argument("--output", type=str, default=None)
     parser.add_argument("--log-level", type=int, choices=[0, 1, 2], default=0)
 
@@ -70,11 +70,11 @@ def _create_router(name: str):
     return RandomRouter() if name == "random" else RoundRobinRouter()
 
 
-def _create_scheduler(name: str, max_running: int):
+def _create_scheduler(name: str, max_total_tokens: int):
     from sglang.srt.debug_utils.schedule_simulator import FIFOScheduler
 
     if name == "fifo":
-        return FIFOScheduler(max_running_requests=max_running)
+        return FIFOScheduler(max_total_tokens=max_total_tokens)
     raise ValueError(f"Unknown scheduler: {name}")
 
 
@@ -87,7 +87,7 @@ def main(args: argparse.Namespace) -> pl.DataFrame:
 
     requests = _load_requests(args)
     router = _create_router(args.router)
-    scheduler = _create_scheduler(args.scheduler, args.max_running)
+    scheduler = _create_scheduler(args.scheduler, args.max_total_tokens)
 
     sim = Simulator(
         num_gpus=args.num_gpus,
