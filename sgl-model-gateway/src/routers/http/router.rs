@@ -4,7 +4,7 @@ use axum::{
     body::{to_bytes, Body},
     extract::Request,
     http::{
-        header::{CONTENT_LENGTH, CONTENT_TYPE},
+        header::CONTENT_TYPE,
         HeaderMap, HeaderValue, Method, StatusCode,
     },
     response::{IntoResponse, Response},
@@ -542,11 +542,9 @@ impl Router {
             request_builder = request_builder.header("Authorization", auth_header);
         }
 
-        // Copy all headers from original request if provided
         if let Some(headers) = headers {
             for (name, value) in headers {
-                // Skip Content-Type and Content-Length as .json() sets them
-                if *name != CONTENT_TYPE && *name != CONTENT_LENGTH {
+                if header_utils::should_forward_request_header(name.as_str()) {
                     request_builder = request_builder.header(name, value);
                 }
             }
