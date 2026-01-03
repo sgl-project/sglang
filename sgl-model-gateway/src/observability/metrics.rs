@@ -332,9 +332,6 @@ pub fn init_metrics() {
 pub fn start_prometheus(config: PrometheusConfig) {
     init_metrics();
 
-    // Initialize in-flight request tracker with 1 second sampling interval
-    super::inflight_tracker::init_inflight_tracker(Duration::from_secs(1));
-
     let duration_matcher = Matcher::Suffix(String::from("duration_seconds"));
     let duration_bucket: Vec<f64> = config.duration_buckets.unwrap_or_else(|| {
         vec![
