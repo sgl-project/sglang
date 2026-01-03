@@ -28,6 +28,7 @@ pub mod header_utils;
 pub mod http;
 pub mod openai;
 pub mod parse;
+pub mod responses;
 pub mod router_manager;
 pub mod tokenize;
 

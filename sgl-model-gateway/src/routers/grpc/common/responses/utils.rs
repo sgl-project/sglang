@@ -15,8 +15,7 @@ use crate::{
         responses::{ResponseTool, ResponseToolType, ResponsesRequest, ResponsesResponse},
     },
     routers::{
-        error,
-        openai::{conversations::persist_conversation_items, mcp::ensure_request_mcp_client},
+        conversations::persist_conversation_items, error, responses::ensure_request_mcp_client,
     },
 };
 

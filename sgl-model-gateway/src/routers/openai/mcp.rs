@@ -20,7 +20,7 @@ use crate::{
     mcp,
     protocols::{
         event_types::{is_function_call_type, ItemType, McpEvent, OutputItemEvent},
-        responses::{generate_id, ResponseInput, ResponseTool, ResponseToolType, ResponsesRequest},
+        responses::{generate_id, ResponseInput, ResponseToolType, ResponsesRequest},
     },
     routers::header_utils::apply_request_headers,
 };
@@ -123,69 +123,6 @@ impl FunctionCallInProgress {
 
     pub fn effective_output_index(&self) -> usize {
         self.assigned_output_index.unwrap_or(self.output_index)
-    }
-}
-
-// ============================================================================
-// MCP Manager Integration
-// ============================================================================
-
-/// Ensure a dynamic MCP client exists for request-scoped tools.
-///
-/// This function parses request tools to extract MCP server configuration,
-/// then ensures a dynamic client exists in the McpManager via `get_or_create_client()`.
-/// The McpManager itself is returned (cloned Arc) for convenience, though the main
-/// purpose is the side effect of registering the dynamic client.
-///
-/// Returns Some(manager) if a dynamic MCP tool was found and client was created/retrieved,
-/// None if no MCP tools were found or connection failed.
-pub async fn ensure_request_mcp_client(
-    mcp_manager: &Arc<mcp::McpManager>,
-    tools: &[ResponseTool],
-) -> Option<Arc<mcp::McpManager>> {
-    let tool = tools
-        .iter()
-        .find(|t| matches!(t.r#type, ResponseToolType::Mcp) && t.server_url.is_some())?;
-    let server_url = tool.server_url.as_ref()?.trim().to_string();
-    if !(server_url.starts_with("http://") || server_url.starts_with("https://")) {
-        warn!(
-            "Ignoring MCP server_url with unsupported scheme: {}",
-            server_url
-        );
-        return None;
-    }
-    let name = tool
-        .server_label
-        .clone()
-        .unwrap_or_else(|| "request-mcp".to_string());
-    let token = tool.authorization.clone();
-    let transport = if server_url.contains("/sse") {
-        mcp::McpTransport::Sse {
-            url: server_url.clone(),
-            token,
-        }
-    } else {
-        mcp::McpTransport::Streamable {
-            url: server_url.clone(),
-            token,
-        }
-    };
-
-    // Create server config
-    let server_config = mcp::McpServerConfig {
-        name,
-        transport,
-        proxy: None,
-        required: false,
-    };
-
-    // Use McpManager to get or create dynamic client
-    match mcp_manager.get_or_create_client(server_config).await {
-        Ok(_client) => Some(mcp_manager.clone()),
-        Err(err) => {
-            warn!("Failed to get/create MCP connection: {}", err);
-            None
-        }
     }
 }
 

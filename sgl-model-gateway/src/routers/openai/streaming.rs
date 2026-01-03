@@ -25,11 +25,10 @@ use tracing::warn;
 use super::accumulator::StreamingResponseAccumulator;
 use super::{
     context::{RequestContext, StreamingEventContext, StreamingRequest},
-    conversations::persist_conversation_items,
     mcp::{
-        build_resume_payload, ensure_request_mcp_client, execute_streaming_tool_calls,
-        inject_mcp_metadata_streaming, prepare_mcp_payload_for_streaming,
-        send_mcp_list_tools_events, McpLoopConfig, ToolLoopState,
+        build_resume_payload, execute_streaming_tool_calls, inject_mcp_metadata_streaming,
+        prepare_mcp_payload_for_streaming, send_mcp_list_tools_events, McpLoopConfig,
+        ToolLoopState,
     },
     responses::{mask_tools_as_mcp, patch_streaming_response_json, rewrite_streaming_block},
     tool_handler::{StreamAction, StreamingToolHandler},
@@ -42,7 +41,11 @@ use crate::{
         },
         responses::{ResponseToolType, ResponsesRequest},
     },
-    routers::header_utils::{apply_request_headers, preserve_response_headers},
+    routers::{
+        conversations::persist_conversation_items,
+        header_utils::{apply_request_headers, preserve_response_headers},
+        responses::ensure_request_mcp_client,
+    },
 };
 
 // ============================================================================
