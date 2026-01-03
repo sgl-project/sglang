@@ -50,6 +50,8 @@ class TestDeepseekV32CP(CustomTestCase):
             "--max-running-requests",
             "32",
             "--enable-nsa-prefill-context-parallel",
+            "--nsa-prefill-cp-mode",
+            "in-seq-split",
         ]
         cls.process = popen_launch_server(
             cls.model,
@@ -104,9 +106,6 @@ class TestDeepseekV32CPMode1(CustomTestCase):
             "--trust-remote-code",
             "--tp",
             "8",
-            "--dp",
-            "1",
-            "--enable-dp-attention",
             "--speculative-algorithm",
             "EAGLE",
             "--speculative-num-steps",

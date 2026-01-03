@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tracing::{debug, warn};
 
+use super::strip_protocol;
 use crate::{
     core::ConnectionMode,
     protocols::worker_spec::WorkerConfigRequest,
@@ -48,14 +49,6 @@ pub struct ModelInfo {
     pub is_generation: Option<bool>,
     pub model_type: Option<String>,
     pub architectures: Option<Vec<String>>,
-}
-
-/// Strip protocol prefix from URL.
-fn strip_protocol(url: &str) -> String {
-    url.trim_start_matches("http://")
-        .trim_start_matches("https://")
-        .trim_start_matches("grpc://")
-        .to_string()
 }
 
 /// Fallback function to GET JSON from old endpoint (with "get_" prefix) for backward compatibility.
