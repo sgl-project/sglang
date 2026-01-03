@@ -33,12 +33,14 @@ class Simulator:
         scheduler: SchedulerPolicy,
         recorders: Optional[List[MetricRecorder]] = None,
         log_level: int = 0,
+        max_total_tokens: int = 100000,
     ):
         self.num_gpus = num_gpus
         self.router = router
         self.scheduler = scheduler
         self.recorders = recorders or []
         self.log_level = log_level
+        self.max_total_tokens = max_total_tokens
         self.gpu_states: List[GPUState] = []
         self.step = 0
 
@@ -72,12 +74,19 @@ class Simulator:
 
     def _schedule_all_gpus(self) -> None:
         for gpu in self.gpu_states:
+            # First, evict running requests if over budget
+            while gpu.total_seq_len() > self.max_total_tokens:
+                victim = self.scheduler.select_victim(gpu)
+                if victim is None:
+                    break
+                gpu.running_requests.remove(victim)
+                gpu.pending_requests.insert(0, victim)  # Re-queue at front
+
+            # Then, schedule pending requests
             decision = self.scheduler.schedule(gpu)
-            for req in decision.to_preempt:
-                assert req in gpu.running_requests
-                gpu.running_requests.remove(req)
-                gpu.pending_requests.append(req)
             for req in decision.to_run:
+                if gpu.total_seq_len() + req.seq_len() > self.max_total_tokens:
+                    break  # Stop if adding this request would exceed budget
                 assert req in gpu.pending_requests
                 gpu.pending_requests.remove(req)
                 gpu.running_requests.append(req)
