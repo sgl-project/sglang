@@ -91,7 +91,6 @@ impl Router {
         }
     }
 
-    // Helper method to proxy GET requests to the first available worker
     async fn proxy_get_request(&self, req: Request<Body>, endpoint: &str) -> Response {
         let headers = header_utils::copy_request_headers(&req);
 
@@ -99,10 +98,7 @@ impl Router {
             Ok(worker_url) => {
                 let mut request_builder = self.client.get(format!("{}/{}", worker_url, endpoint));
                 for (name, value) in headers {
-                    // Use eq_ignore_ascii_case to avoid string allocation
-                    if !name.eq_ignore_ascii_case("content-type")
-                        && !name.eq_ignore_ascii_case("content-length")
-                    {
+                    if header_utils::should_forward_request_header(&name) {
                         request_builder = request_builder.header(name, value);
                     }
                 }
@@ -361,14 +357,10 @@ impl Router {
             return error::service_unavailable("no_workers", "No available workers");
         }
 
-        // Pre-filter headers once before the loop to avoid repeated lowercasing
         let filtered_headers: Vec<_> = headers
             .map(|hdrs| {
                 hdrs.iter()
-                    .filter(|(name, _)| {
-                        !name.as_str().eq_ignore_ascii_case("content-type")
-                            && !name.as_str().eq_ignore_ascii_case("content-length")
-                    })
+                    .filter(|(name, _)| header_utils::should_forward_request_header(name.as_str()))
                     .collect()
             })
             .unwrap_or_default();
