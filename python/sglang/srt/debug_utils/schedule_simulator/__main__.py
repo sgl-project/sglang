@@ -96,6 +96,13 @@ def main():
         default=None,
         help="Output file for results (default: stdout)",
     )
+    parser.add_argument(
+        "--log-level",
+        type=int,
+        choices=[0, 1, 2],
+        default=0,
+        help="Log level: 0=none, 1=counts per GPU, 2=request IDs (default: 0)",
+    )
 
     args = parser.parse_args()
 
@@ -132,6 +139,7 @@ def main():
         router=router,
         scheduler=scheduler,
         recorders=recorders,
+        log_level=args.log_level,
     )
 
     print(f"Running simulation with {args.num_gpus} GPUs, router={args.router}, scheduler={args.scheduler}")
