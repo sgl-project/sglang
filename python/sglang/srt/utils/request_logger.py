@@ -33,11 +33,42 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-_json_logger = logging.getLogger(__name__ + ".json")
-_json_logger.propagate = False
-_json_handler = logging.StreamHandler()
-_json_handler.setFormatter(logging.Formatter("%(message)s"))
-_json_logger.addHandler(_json_handler)
+
+class _RequestLoggerTarget:
+    def __init__(self, target: str):
+        self.target = target
+        self._logger = self._setup_logger()
+
+    def _setup_logger(self) -> logging.Logger:
+        if self.target.lower() == "stdout":
+            json_logger = logging.getLogger(f"{__name__}.stdout")
+            json_logger.propagate = False
+            if not json_logger.handlers:
+                handler = logging.StreamHandler()
+                handler.setFormatter(logging.Formatter("%(message)s"))
+                json_logger.addHandler(handler)
+            return json_logger
+        else:
+            os.makedirs(self.target, exist_ok=True)
+            hostname = socket.gethostname()
+            rank = dist.get_rank() if dist.is_initialized() else 0
+            filename = os.path.join(self.target, f"{hostname}_{rank}.jsonl")
+
+            file_logger = logging.getLogger(f"{__name__}.file.{self.target}.{hostname}_{rank}")
+            file_logger.setLevel(logging.INFO)
+            file_logger.propagate = False
+
+            if not file_logger.handlers:
+                handler = TimedRotatingFileHandler(
+                    filename, when="H", backupCount=0, encoding="utf-8"
+                )
+                handler.setFormatter(logging.Formatter("%(message)s"))
+                file_logger.addHandler(handler)
+
+            return file_logger
+
+    def log(self, msg: str) -> None:
+        self._logger.info(msg)
 
 
 class RequestLogger:
@@ -56,39 +87,12 @@ class RequestLogger:
             self._compute_metadata()
         )
         self.log_exceeded_ms = envs.SGLANG_LOG_REQUEST_EXCEEDED_MS.get()
-        self._log_to_stdout, self._file_loggers = self._setup_loggers()
+        self._targets = self._setup_targets()
 
-    def _setup_loggers(self) -> Tuple[bool, List[logging.Logger]]:
+    def _setup_targets(self) -> List[_RequestLoggerTarget]:
         if not self.log_requests_target:
-            return True, []
-
-        log_to_stdout = False
-        file_loggers: List[logging.Logger] = []
-
-        hostname = socket.gethostname()
-        rank = dist.get_rank() if dist.is_initialized() else 0
-
-        for target in self.log_requests_target:
-            if target.lower() == "stdout":
-                log_to_stdout = True
-            else:
-                os.makedirs(target, exist_ok=True)
-                filename = os.path.join(target, f"{hostname}_{rank}.jsonl")
-
-                file_logger = logging.getLogger(f"{__name__}.file.{target}.{hostname}_{rank}")
-                file_logger.setLevel(logging.INFO)
-                file_logger.propagate = False
-
-                if not file_logger.handlers:
-                    handler = TimedRotatingFileHandler(
-                        filename, when="H", backupCount=0, encoding="utf-8"
-                    )
-                    handler.setFormatter(logging.Formatter("%(message)s"))
-                    file_logger.addHandler(handler)
-
-                file_loggers.append(file_logger)
-
-        return log_to_stdout, file_loggers
+            return [_RequestLoggerTarget("stdout")]
+        return [_RequestLoggerTarget(t) for t in self.log_requests_target]
 
     def configure(
         self,
@@ -105,7 +109,7 @@ class RequestLogger:
             self.log_requests_format = log_requests_format
         if log_requests_target is not None:
             self.log_requests_target = log_requests_target
-            self._log_to_stdout, self._file_loggers = self._setup_loggers()
+            self._targets = self._setup_targets()
         self.metadata = self._compute_metadata()
 
     def _log_json(self, event: str, data: dict) -> None:
@@ -115,10 +119,8 @@ class RequestLogger:
             **data,
         }
         msg = json.dumps(log_data, ensure_ascii=False)
-        if self._log_to_stdout:
-            _json_logger.info(msg)
-        for file_logger in self._file_loggers:
-            file_logger.info(msg)
+        for target in self._targets:
+            target.log(msg)
 
     def log_received_request(
         self, obj: Union["GenerateReqInput", "EmbeddingReqInput"], tokenizer: Any = None
@@ -225,16 +227,6 @@ class RequestLogger:
 @lru_cache(maxsize=2)
 def disable_request_logging() -> bool:
     return get_bool_env_var("SGLANG_DISABLE_REQUEST_LOGGING")
-
-
-# TODO unify logging, e.g. allow normal logs to be JSON as well
-def _log_json(event: str, data: dict) -> None:
-    log_data = {
-        "timestamp": datetime.now().isoformat(),
-        "event": event,
-        **data,
-    }
-    _json_logger.info(json.dumps(log_data, ensure_ascii=False))
 
 
 # TODO unify this w/ `_transform_data_for_logging` if we find performance enough
