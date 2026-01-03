@@ -716,11 +716,9 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         AppContext::from_config(config.router_config.clone(), config.request_timeout_secs).await?,
     );
 
-    let _inflight_sampler = if config.prometheus_config.is_some() {
-        Some(app_context.inflight_tracker.start_sampler(20))
-    } else {
-        None
-    };
+    if config.prometheus_config.is_some() {
+        app_context.inflight_tracker.start_sampler(20);
+    }
 
     let weak_context = Arc::downgrade(&app_context);
     let worker_job_queue = JobQueue::new(JobQueueConfig::default(), weak_context);

@@ -1,7 +1,7 @@
 use std::{
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc,
+        Arc, OnceLock,
     },
     time::Instant,
 };
@@ -19,6 +19,7 @@ const AGE_BUCKET_LABELS: &[&str] = &[
 pub struct InFlightRequestTracker {
     requests: DashMap<u64, Instant>,
     next_id: AtomicU64,
+    sampler: OnceLock<PeriodicTask>,
 }
 
 pub struct InFlightGuard {
@@ -37,14 +38,16 @@ impl InFlightRequestTracker {
         Arc::new(Self {
             requests: DashMap::new(),
             next_id: AtomicU64::new(0),
+            sampler: OnceLock::new(),
         })
     }
 
-    pub fn start_sampler(self: &Arc<Self>, interval_secs: u64) -> PeriodicTask {
+    pub fn start_sampler(self: &Arc<Self>, interval_secs: u64) {
         let tracker = self.clone();
-        PeriodicTask::spawn(interval_secs, "InFlightRequestSampler", move || {
+        let task = PeriodicTask::spawn(interval_secs, "InFlightRequestSampler", move || {
             tracker.sample_and_record();
-        })
+        });
+        let _ = self.sampler.set(task);
     }
 
     pub fn track(self: &Arc<Self>) -> InFlightGuard {
