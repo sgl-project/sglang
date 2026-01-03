@@ -4,57 +4,7 @@ use common::{
     mock_worker::{HealthStatus, MockWorkerConfig, WorkerType},
     WorkerTestContext,
 };
-use futures_util::StreamExt;
-use reqwest::Client;
 use serde_json::json;
-
-async fn make_streaming_request(
-    ctx: &WorkerTestContext,
-    endpoint: &str,
-    body: serde_json::Value,
-) -> Result<Vec<String>, String> {
-    let client = Client::new();
-    let worker_url = ctx
-        .first_worker_url()
-        .ok_or_else(|| "No workers available".to_string())?;
-
-    let response = client
-        .post(format!("{}{}", worker_url, endpoint))
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| format!("Request failed: {}", e))?;
-
-    if !response.status().is_success() {
-        return Err(format!("Request failed with status: {}", response.status()));
-    }
-
-    let content_type = response
-        .headers()
-        .get("content-type")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-
-    if !content_type.contains("text/event-stream") {
-        return Err("Response is not a stream".to_string());
-    }
-
-    let mut stream = response.bytes_stream();
-    let mut events = Vec::new();
-
-    while let Some(chunk) = stream.next().await {
-        if let Ok(bytes) = chunk {
-            let text = String::from_utf8_lossy(&bytes);
-            for line in text.lines() {
-                if let Some(stripped) = line.strip_prefix("data: ") {
-                    events.push(stripped.to_string());
-                }
-            }
-        }
-    }
-
-    Ok(events)
-}
 
 #[cfg(test)]
 mod streaming_tests {
@@ -80,7 +30,7 @@ mod streaming_tests {
             }
         });
 
-        let result = make_streaming_request(&ctx, "/generate", payload).await;
+        let result = ctx.make_streaming_request( "/generate", payload).await;
         assert!(result.is_ok());
 
         let events = result.unwrap();
@@ -110,7 +60,7 @@ mod streaming_tests {
             "max_tokens": 20
         });
 
-        let result = make_streaming_request(&ctx, "/v1/chat/completions", payload).await;
+        let result = ctx.make_streaming_request( "/v1/chat/completions", payload).await;
         assert!(result.is_ok());
 
         let events = result.unwrap();
@@ -150,7 +100,7 @@ mod streaming_tests {
             "max_tokens": 15
         });
 
-        let result = make_streaming_request(&ctx, "/v1/completions", payload).await;
+        let result = ctx.make_streaming_request( "/v1/completions", payload).await;
         assert!(result.is_ok());
 
         let events = result.unwrap();
@@ -175,7 +125,7 @@ mod streaming_tests {
             "stream": true
         });
 
-        let result = make_streaming_request(&ctx, "/generate", payload).await;
+        let result = ctx.make_streaming_request( "/generate", payload).await;
         assert!(result.is_err());
 
         ctx.shutdown().await;
@@ -201,7 +151,7 @@ mod streaming_tests {
         });
 
         let start = std::time::Instant::now();
-        let result = make_streaming_request(&ctx, "/generate", payload).await;
+        let result = ctx.make_streaming_request( "/generate", payload).await;
         let elapsed = start.elapsed();
 
         assert!(result.is_ok());
@@ -231,7 +181,7 @@ mod streaming_tests {
             }
         });
 
-        let result = make_streaming_request(&ctx, "/generate", payload).await;
+        let result = ctx.make_streaming_request( "/generate", payload).await;
         assert!(result.is_ok());
 
         let events = result.unwrap();
