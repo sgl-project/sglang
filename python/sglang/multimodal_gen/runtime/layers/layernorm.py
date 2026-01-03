@@ -441,24 +441,45 @@ def apply_qk_norm(
     batch_size = q.size(0)
     q_eps = q_norm.variance_epsilon
     k_eps = k_norm.variance_epsilon
+
+    def can_view_as_bnhd(x: torch.Tensor) -> bool:
+        """Whether `x` can be viewed as [batch, *, head_dim] without a copy."""
+        if (
+            x.dim() < 2
+            or x.size(0) != batch_size
+            or x.size(-1) != head_dim
+            or x.stride(-1) != 1
+            or x.stride(-2) != head_dim
+        ):
+            return False
+        try:
+            x.view(batch_size, -1, head_dim)
+            return True
+        except RuntimeError:
+            return False
+
     if (
         q.is_cuda
         and (torch.version.cuda is not None)
         and allow_inplace
-        and q.is_contiguous()
-        and k.is_contiguous()
         and (q_eps == k_eps)
+        and can_view_as_bnhd(q)
+        and can_view_as_bnhd(k)
         and can_use_fused_inplace_qknorm(head_dim)
     ):
-        fused_inplace_qknorm(
-            q=q.view(batch_size, -1, head_dim),
-            k=k.view(batch_size, -1, head_dim),
-            q_weight=q_norm.weight,
-            k_weight=k_norm.weight,
-            head_dim=head_dim,
-            eps=q_eps,
-        )
-        return q, k
+        try:
+            fused_inplace_qknorm(
+                q=q.view(batch_size, -1, head_dim),
+                k=k.view(batch_size, -1, head_dim),
+                q_weight=q_norm.weight,
+                k_weight=k_norm.weight,
+                head_dim=head_dim,
+                eps=q_eps,
+            )
+            return q, k
+        except RuntimeError as e:
+            if "QK-norm is not applicable" not in str(e):
+                raise
 
     # Fallback: apply the PyTorch norms.
     q_out = q_norm(q)
