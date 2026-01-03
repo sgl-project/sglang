@@ -16,6 +16,7 @@ class DummyConfig:
 
 CompressedTensorsConfig = DummyConfig
 
+from python.sglang.srt.layers.quantization.quark_int4fp8_moe import QuarkInt4Fp8Config
 from sglang.srt.layers.quantization.auto_round import AutoRoundConfig
 from sglang.srt.layers.quantization.awq import AWQConfig, AWQMarlinConfig
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -68,6 +69,7 @@ BASE_QUANTIZATION_METHODS: Dict[str, Type[QuantizationConfig]] = {
     "fbgemm_fp8": FBGEMMFp8Config,
     "quark": QuarkConfig,
     "auto-round": AutoRoundConfig,
+    "quark_int4fp8_moe": QuarkInt4Fp8Config,
 }
 
 
