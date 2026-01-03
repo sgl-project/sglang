@@ -339,7 +339,7 @@ class ServerArgs:
     log_requests: bool = False
     log_requests_level: int = 2
     log_requests_format: str = "text"
-    log_requests_target: Optional[str] = None
+    log_requests_target: Optional[List[str]] = None
     crash_dump_folder: Optional[str] = None
     show_time_cost: bool = False
     enable_metrics: bool = False
@@ -3017,8 +3017,10 @@ class ServerArgs:
         parser.add_argument(
             "--log-requests-target",
             type=str,
+            nargs="*",
             default=ServerArgs.log_requests_target,
-            help="Target for request logging: 'stdout' or a directory path for file output. "
+            help="Target(s) for request logging: 'stdout' and/or directory path(s) for file output. "
+            "Can specify multiple targets, e.g., '--log-requests-target stdout /my/path'. "
             "File names are '{hostname}_{rank}.jsonl' with hourly rotation.",
         )
         parser.add_argument(

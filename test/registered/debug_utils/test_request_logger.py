@@ -158,5 +158,83 @@ class TestRequestLoggerFile(CustomTestCase):
         self.assertTrue(finished_found, "request.finished event not found in log files")
 
 
+class TestRequestLoggerMultiTarget(CustomTestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.temp_dir = tempfile.mkdtemp()
+        cls.stdout = io.StringIO()
+        cls.stderr = io.StringIO()
+        cls.process = popen_launch_server(
+            "Qwen/Qwen3-0.6B",
+            DEFAULT_URL_FOR_TEST,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=[
+                "--log-requests",
+                "--log-requests-level",
+                "2",
+                "--log-requests-format",
+                "json",
+                "--log-requests-target",
+                "stdout",
+                cls.temp_dir,
+                "--skip-server-warmup",
+            ],
+            return_stdout_stderr=(cls.stdout, cls.stderr),
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        kill_process_tree(cls.process.pid)
+        cls.stdout.close()
+        cls.stderr.close()
+
+    def test_multi_target_logging(self):
+        response = requests.post(
+            DEFAULT_URL_FOR_TEST + "/generate",
+            json={
+                "text": "Hello",
+                "sampling_params": {"max_new_tokens": 8, "temperature": 0},
+            },
+            timeout=30,
+        )
+        self.assertEqual(response.status_code, 200)
+
+        time.sleep(1)
+
+        combined_output = self.stdout.getvalue() + self.stderr.getvalue()
+        stdout_received = False
+        stdout_finished = False
+        for line in combined_output.splitlines():
+            if not line.startswith("{"):
+                continue
+            data = json.loads(line)
+            if data.get("event") == "request.received":
+                stdout_received = True
+            elif data.get("event") == "request.finished":
+                stdout_finished = True
+
+        self.assertTrue(stdout_received, "request.received not found in stdout")
+        self.assertTrue(stdout_finished, "request.finished not found in stdout")
+
+        jsonl_files = glob.glob(os.path.join(self.temp_dir, "*.jsonl"))
+        self.assertGreater(len(jsonl_files), 0, "No JSONL files found")
+
+        file_received = False
+        file_finished = False
+        for jsonl_file in jsonl_files:
+            with open(jsonl_file, "r") as f:
+                for line in f:
+                    if not line.strip():
+                        continue
+                    data = json.loads(line)
+                    if data.get("event") == "request.received":
+                        file_received = True
+                    elif data.get("event") == "request.finished":
+                        file_finished = True
+
+        self.assertTrue(file_received, "request.received not found in file")
+        self.assertTrue(file_finished, "request.finished not found in file")
+
+
 if __name__ == "__main__":
     unittest.main()
