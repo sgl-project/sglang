@@ -34,14 +34,6 @@ use smg::{
     tool_parser::ParserFactory as ToolParserFactory,
 };
 
-/// Test context for integration tests that go through the full axum app stack.
-pub struct AppTestContext {
-    pub workers: Vec<MockWorker>,
-    pub router: Arc<dyn RouterTrait>,
-    pub config: RouterConfig,
-    pub app_context: Arc<AppContext>,
-}
-
 /// Test context for directly testing mock workers without full router setup.
 pub struct WorkerTestContext {
     pub workers: Vec<MockWorker>,
@@ -81,6 +73,14 @@ impl WorkerTestContext {
         }
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
     }
+}
+
+/// Test context for integration tests that go through the full axum app stack.
+pub struct AppTestContext {
+    pub workers: Vec<MockWorker>,
+    pub router: Arc<dyn RouterTrait>,
+    pub config: RouterConfig,
+    pub app_context: Arc<AppContext>,
 }
 
 impl AppTestContext {
