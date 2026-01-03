@@ -249,26 +249,25 @@ impl ConversationItemStorage for RedisConversationItemStorage {
         let mut conn = self.store.pool.get().await.map_err(|e| ConversationItemStorageError::StorageError(e.to_string()))?;
         
         let mut pipe = redis::pipe();
-        let mut pipe_ref = &mut pipe;
         
-        pipe_ref = pipe_ref.hset(&key, "id", id_str);
+        pipe.hset(&key, "id", id_str);
         if let Some(rid) = &conversation_item.response_id {
-            pipe_ref = pipe_ref.hset(&key, "response_id", rid);
+            pipe.hset(&key, "response_id", rid);
         }
-        pipe_ref = pipe_ref.hset(&key, "item_type", &conversation_item.item_type);
+        pipe.hset(&key, "item_type", &conversation_item.item_type);
         if let Some(r) = &conversation_item.role {
-            pipe_ref = pipe_ref.hset(&key, "role", r);
+            pipe.hset(&key, "role", r);
         }
-        pipe_ref = pipe_ref.hset(&key, "content", content_json);
+        pipe.hset(&key, "content", content_json);
         if let Some(s) = &conversation_item.status {
-            pipe_ref = pipe_ref.hset(&key, "status", s);
+            pipe.hset(&key, "status", s);
         }
-        pipe_ref = pipe_ref.hset(&key, "created_at", created_at.to_rfc3339());
+        pipe.hset(&key, "created_at", created_at.to_rfc3339());
         
         // Expire after 30 days
-        pipe_ref = pipe_ref.expire(&key, 30 * 24 * 60 * 60);
+        pipe.expire(&key, 30 * 24 * 60 * 60);
         
-        pipe_ref.query_async(&mut conn).await.map_err(|e| ConversationItemStorageError::StorageError(e.to_string()))?;
+        pipe.query_async(&mut conn).await.map_err(|e| ConversationItemStorageError::StorageError(e.to_string()))?;
 
         Ok(conversation_item)
     }
