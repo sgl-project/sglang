@@ -47,13 +47,8 @@ class PrefillDelayer:
         global_can_prefill = tp0_info[:, 0]
         global_exists_cannot_prefill = global_can_prefill.min().item() == 0
         global_exists_can_prefill = global_can_prefill.max().item() > 0
-        global_exists_idle = bool(tp0_info[:, 1].max().item())
 
-        if (
-            (not global_exists_idle)
-            and global_exists_cannot_prefill
-            and global_exists_can_prefill
-        ):
+        if global_exists_cannot_prefill and global_exists_can_prefill:
             self.curr_delayed_count += 1
             if self.curr_delayed_count < self.max_delay_passes:
                 print("hi branch: delay prefill")
