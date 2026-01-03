@@ -38,6 +38,8 @@ class SageAttention3Backend(AttentionBackend):
 
 
 class SageAttention3Impl(AttentionImpl):
+    _warned_gqa_fallback_global: bool = False
+
     def __init__(
         self,
         num_heads: int,
@@ -51,7 +53,6 @@ class SageAttention3Impl(AttentionImpl):
         self.causal = causal
         self.softmax_scale = softmax_scale
         self.dropout = extra_impl_args.get("dropout_p", 0.0)
-        self._warned_gqa_fallback = False
 
     def forward(
         self,
@@ -71,11 +72,11 @@ class SageAttention3Impl(AttentionImpl):
                     "GQA/MQA requires query heads to be a multiple of KV heads, "
                     f"got q_heads={query.shape[1]} and kv_heads={key.shape[1]}"
                 )
-            if not self._warned_gqa_fallback:
+            if not type(self)._warned_gqa_fallback_global:
                 logger.warning(
                     "SageAttention3 does not support GQA/MQA (Hq != Hkv); falling back to torch SDPA."
                 )
-                self._warned_gqa_fallback = True
+                type(self)._warned_gqa_fallback_global = True
             output = F.scaled_dot_product_attention(
                 query,
                 key,
