@@ -18,9 +18,6 @@ from sglang.srt.layers.moe.topk import TopKOutput
 from sglang.srt.layers.moe.utils import DeepEPMode
 from sglang.srt.utils import get_int_env_var
 
-if TYPE_CHECKING:
-    from sglang.srt.batch_overlap.single_batch_overlap import CombineOverlapArgs
-
 from enum import Enum, auto
 
 import torch
@@ -235,14 +232,13 @@ class _MooncakeEPDispatcherImpl:
         hidden_states: torch.Tensor,
         topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,
-        overlap_args: Optional[CombineOverlapArgs] = None,
     ):
         hidden_states, event, hook = self._combine_core(
             hidden_states,
             topk_ids,
             topk_weights,
         )
-        return hidden_states, event, hook, overlap_args
+        return hidden_states, event, hook
 
     def combine_b(self, hidden_states, event, hook):
         hook() if self.return_recv_hook else event.current_stream_wait()
@@ -368,7 +364,6 @@ class MooncakeEPDispatcher(BaseDispatcher):
             hidden_states=hidden_states,
             topk_ids=topk_ids,
             topk_weights=topk_weights,
-            overlap_args=self.overlap_args,
         )
         self._combine_intermediate_state = inner_state
 

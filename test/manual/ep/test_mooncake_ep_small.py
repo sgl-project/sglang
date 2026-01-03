@@ -1,3 +1,4 @@
+import os
 import unittest
 from types import SimpleNamespace
 
@@ -35,7 +36,7 @@ class TestTP(CustomTestCase):
                 "--mooncake-ib-device",
                 ib_devices,
                 "--moe-a2a-backend",
-                "deepep",
+                "mooncake",
                 "--deepep-mode",
                 "low_latency",
                 "--chunked-prefill-size",
@@ -46,6 +47,13 @@ class TestTP(CustomTestCase):
                 "512",
                 "--mem-fraction-static",
                 "0.5",
+                "--disable-custom-all-reduce",
+                "--enable-eplb",
+                "--ep-num-redundant-experts",
+                "24",
+                "--enable-dp-lm-head",
+                "--moe-dense-tp-size",
+                "1",
                 *cls.extra_args,
             ],
         )
@@ -79,6 +87,10 @@ class TestPureDP(TestTP):
         "4",
     ]
 
+    def test_gsm8k_fault_1(self):
+        os.system("pkill -f sglang::scheduler_DP2_TP2_EP2")
+        super().test_gsm8k()
+
 
 class TestHybridDPTP(TestTP):
     extra_args = [
@@ -89,7 +101,12 @@ class TestHybridDPTP(TestTP):
         "2",
     ]
 
+    def test_gsm8k_fault_1(self):
+        os.system("pkill -f sglang::scheduler_DP0_TP0_EP0")
+        super().test_gsm8k()
 
+
+@unittest.skip("covered in TestTBO")
 class TestNoGatherdBuffer(TestTP):
     extra_args = [
         "--tp",
@@ -114,8 +131,12 @@ class TestTBO(TestTP):
         "--enable-two-batch-overlap",
     ]
 
+    def test_gsm8k_fault_1(self):
+        os.system("pkill -f sglang::scheduler_DP0_TP0_EP0")
+        super().test_gsm8k()
 
-class TestMooncakeWitchEPLB(TestTP):
+
+class TestMooncakeWithEPLB(TestTP):
     extra_args = [
         "--tp",
         "4",
