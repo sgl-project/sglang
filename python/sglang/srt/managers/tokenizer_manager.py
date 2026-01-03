@@ -501,7 +501,11 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             self._attach_multi_http_worker_info(obj)
 
         # Log the request
+<<<<<<< HEAD
         self.request_logger.log_received_request(obj, self.tokenizer, request)
+=======
+        self.request_logger.log_received_request(obj, self.tokenizer)
+>>>>>>> f9d658354 (clean)
 
         async with self.is_pause_cond:
             await self.is_pause_cond.wait_for(lambda: not self.is_pause)
@@ -694,8 +698,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             input_ids, token_type_ids = await self._tokenize_texts(
                 input_text, is_cross_encoder_request
             )
-        print(f"678 self.mm_processor: {self.mm_processor}")
-        print(f"679 obj.contains_mm_input(): {obj.contains_mm_input()}")
+
         if self.mm_processor and obj.contains_mm_input():
             if obj.image_data is not None and not isinstance(obj.image_data, list):
                 obj.image_data = [obj.image_data]
