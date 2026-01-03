@@ -222,6 +222,7 @@ def _create_log_target_file(directory: str) -> logging.Logger:
         )
         handler.setFormatter(logging.Formatter("%(message)s"))
         logger.addHandler(handler)
+
     return logger
 
 
