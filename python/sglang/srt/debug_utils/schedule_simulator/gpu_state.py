@@ -44,7 +44,9 @@ class GPUState:
     def execute_step(self) -> None:
         for req in self.running_requests:
             req.decoded_tokens += 1
-        self.running_requests = [r for r in self.running_requests if not r.is_finished()]
+        self.running_requests = [
+            r for r in self.running_requests if not r.is_finished()
+        ]
 
     def get_step_record(self, step: int) -> StepRecord:
         return StepRecord(

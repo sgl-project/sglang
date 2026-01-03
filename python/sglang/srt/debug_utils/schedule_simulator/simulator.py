@@ -7,6 +7,7 @@ from sglang.srt.debug_utils.schedule_simulator.request import SimRequest
 from sglang.srt.debug_utils.schedule_simulator.routers.base import RouterPolicy
 from sglang.srt.debug_utils.schedule_simulator.schedulers.base import SchedulerPolicy
 
+
 @dataclass
 class SimulationResult:
     step_records: List[StepRecord]
@@ -106,4 +107,3 @@ def _format_ids(requests: List[SimRequest], limit: int = 5) -> str:
     if len(requests) > limit:
         ids += f"...+{len(requests) - limit}"
     return ids
-
