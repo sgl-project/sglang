@@ -1,106 +1,37 @@
 mod common;
 
-use std::sync::Arc;
-
-use common::mock_worker::{HealthStatus, MockWorker, MockWorkerConfig, WorkerType};
+use common::{
+    mock_worker::{HealthStatus, MockWorkerConfig, WorkerType},
+    SimpleSimpleTestContext,
+};
 use reqwest::Client;
 use serde_json::json;
-use smg::{
-    config::{RouterConfig, RoutingMode},
-    routers::{RouterFactory, RouterTrait},
-};
 
-/// Test context that manages mock workers
-struct TestContext {
-    workers: Vec<MockWorker>,
-    _router: Arc<dyn RouterTrait>,
-    worker_urls: Vec<String>,
-}
+async fn make_request(
+    ctx: &SimpleSimpleTestContext,
+    endpoint: &str,
+    body: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let client = Client::new();
+    let worker_url = ctx
+        .first_worker_url()
+        .ok_or_else(|| "No workers available".to_string())?;
 
-impl TestContext {
-    async fn new(worker_configs: Vec<MockWorkerConfig>) -> Self {
-        let mut config = RouterConfig::builder()
-            .regular_mode(vec![])
-            .port(3003)
-            .worker_startup_timeout_secs(1)
-            .worker_startup_check_interval_secs(1)
-            .build_unchecked();
+    let response = client
+        .post(format!("{}{}", worker_url, endpoint))
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("Request failed: {}", e))?;
 
-        let mut workers = Vec::new();
-        let mut worker_urls = Vec::new();
-
-        for worker_config in worker_configs {
-            let mut worker = MockWorker::new(worker_config);
-            let url = worker.start().await.unwrap();
-            worker_urls.push(url);
-            workers.push(worker);
-        }
-
-        if !workers.is_empty() {
-            tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
-        }
-
-        config.mode = RoutingMode::Regular {
-            worker_urls: worker_urls.clone(),
-        };
-
-        let app_context = common::create_test_context(config.clone()).await;
-
-        let router = RouterFactory::create_router(&app_context).await.unwrap();
-        let router = Arc::from(router);
-
-        if !workers.is_empty() {
-            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-        }
-
-        Self {
-            workers,
-            _router: router,
-            worker_urls: worker_urls.clone(),
-        }
+    if !response.status().is_success() {
+        return Err(format!("Request failed with status: {}", response.status()));
     }
 
-    async fn shutdown(mut self) {
-        // Small delay to ensure any pending operations complete
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-
-        for worker in &mut self.workers {
-            worker.stop().await;
-        }
-
-        // Another small delay to ensure cleanup completes
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-    }
-
-    async fn make_request(
-        &self,
-        endpoint: &str,
-        body: serde_json::Value,
-    ) -> Result<serde_json::Value, String> {
-        let client = Client::new();
-
-        // Use the first worker URL from the context
-        let worker_url = self
-            .worker_urls
-            .first()
-            .ok_or_else(|| "No workers available".to_string())?;
-
-        let response = client
-            .post(format!("{}{}", worker_url, endpoint))
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| format!("Request failed: {}", e))?;
-
-        if !response.status().is_success() {
-            return Err(format!("Request failed with status: {}", response.status()));
-        }
-
-        response
-            .json::<serde_json::Value>()
-            .await
-            .map_err(|e| format!("Failed to parse response: {}", e))
-    }
+    response
+        .json::<serde_json::Value>()
+        .await
+        .map_err(|e| format!("Failed to parse response: {}", e))
 }
 
 #[cfg(test)]
@@ -109,7 +40,7 @@ mod request_format_tests {
 
     #[tokio::test]
     async fn test_generate_request_formats() {
-        let ctx = TestContext::new(vec![MockWorkerConfig {
+        let ctx = SimpleTestContext::new(vec![MockWorkerConfig {
             port: 19001,
             worker_type: WorkerType::Regular,
             health_status: HealthStatus::Healthy,
@@ -123,7 +54,7 @@ mod request_format_tests {
             "stream": false
         });
 
-        let result = ctx.make_request("/generate", payload).await;
+        let result = make_request(&ctx, "/generate", payload).await;
         assert!(result.is_ok());
 
         let payload = json!({
@@ -136,7 +67,7 @@ mod request_format_tests {
             "stream": false
         });
 
-        let result = ctx.make_request("/generate", payload).await;
+        let result = make_request(&ctx, "/generate", payload).await;
         assert!(result.is_ok());
 
         let payload = json!({
@@ -148,7 +79,7 @@ mod request_format_tests {
             "stream": false
         });
 
-        let result = ctx.make_request("/generate", payload).await;
+        let result = make_request(&ctx, "/generate", payload).await;
         assert!(result.is_ok());
 
         ctx.shutdown().await;
@@ -156,7 +87,7 @@ mod request_format_tests {
 
     #[tokio::test]
     async fn test_v1_chat_completions_formats() {
-        let ctx = TestContext::new(vec![MockWorkerConfig {
+        let ctx = SimpleTestContext::new(vec![MockWorkerConfig {
             port: 19002,
             worker_type: WorkerType::Regular,
             health_status: HealthStatus::Healthy,
@@ -174,7 +105,7 @@ mod request_format_tests {
             "stream": false
         });
 
-        let result = ctx.make_request("/v1/chat/completions", payload).await;
+        let result = make_request(&ctx, "/v1/chat/completions", payload).await;
         assert!(result.is_ok());
 
         let response = result.unwrap();
@@ -196,7 +127,7 @@ mod request_format_tests {
             "stream": false
         });
 
-        let result = ctx.make_request("/v1/chat/completions", payload).await;
+        let result = make_request(&ctx, "/v1/chat/completions", payload).await;
         assert!(result.is_ok());
 
         ctx.shutdown().await;
@@ -204,7 +135,7 @@ mod request_format_tests {
 
     #[tokio::test]
     async fn test_v1_completions_formats() {
-        let ctx = TestContext::new(vec![MockWorkerConfig {
+        let ctx = SimpleTestContext::new(vec![MockWorkerConfig {
             port: 19003,
             worker_type: WorkerType::Regular,
             health_status: HealthStatus::Healthy,
@@ -220,7 +151,7 @@ mod request_format_tests {
             "stream": false
         });
 
-        let result = ctx.make_request("/v1/completions", payload).await;
+        let result = make_request(&ctx, "/v1/completions", payload).await;
         assert!(result.is_ok());
 
         let response = result.unwrap();
@@ -237,7 +168,7 @@ mod request_format_tests {
             "stream": false
         });
 
-        let result = ctx.make_request("/v1/completions", payload).await;
+        let result = make_request(&ctx, "/v1/completions", payload).await;
         assert!(result.is_ok());
 
         let payload = json!({
@@ -248,7 +179,7 @@ mod request_format_tests {
             "stream": false
         });
 
-        let result = ctx.make_request("/v1/completions", payload).await;
+        let result = make_request(&ctx, "/v1/completions", payload).await;
         assert!(result.is_ok());
 
         ctx.shutdown().await;
@@ -256,7 +187,7 @@ mod request_format_tests {
 
     #[tokio::test]
     async fn test_batch_requests() {
-        let ctx = TestContext::new(vec![MockWorkerConfig {
+        let ctx = SimpleTestContext::new(vec![MockWorkerConfig {
             port: 19004,
             worker_type: WorkerType::Regular,
             health_status: HealthStatus::Healthy,
@@ -274,7 +205,7 @@ mod request_format_tests {
             "stream": false
         });
 
-        let result = ctx.make_request("/generate", payload).await;
+        let result = make_request(&ctx, "/generate", payload).await;
         assert!(result.is_ok());
 
         let payload = json!({
@@ -282,7 +213,7 @@ mod request_format_tests {
             "stream": false
         });
 
-        let result = ctx.make_request("/generate", payload).await;
+        let result = make_request(&ctx, "/generate", payload).await;
         assert!(result.is_ok());
 
         ctx.shutdown().await;
@@ -290,7 +221,7 @@ mod request_format_tests {
 
     #[tokio::test]
     async fn test_special_parameters() {
-        let ctx = TestContext::new(vec![MockWorkerConfig {
+        let ctx = SimpleTestContext::new(vec![MockWorkerConfig {
             port: 19005,
             worker_type: WorkerType::Regular,
             health_status: HealthStatus::Healthy,
@@ -305,7 +236,7 @@ mod request_format_tests {
             "stream": false
         });
 
-        let result = ctx.make_request("/generate", payload).await;
+        let result = make_request(&ctx, "/generate", payload).await;
         assert!(result.is_ok());
 
         let payload = json!({
@@ -317,7 +248,7 @@ mod request_format_tests {
             "stream": false
         });
 
-        let result = ctx.make_request("/generate", payload).await;
+        let result = make_request(&ctx, "/generate", payload).await;
         assert!(result.is_ok());
 
         let payload = json!({
@@ -330,7 +261,7 @@ mod request_format_tests {
             "stream": false
         });
 
-        let result = ctx.make_request("/generate", payload).await;
+        let result = make_request(&ctx, "/generate", payload).await;
         assert!(result.is_ok());
 
         ctx.shutdown().await;
@@ -338,7 +269,7 @@ mod request_format_tests {
 
     #[tokio::test]
     async fn test_error_handling() {
-        let ctx = TestContext::new(vec![MockWorkerConfig {
+        let ctx = SimpleTestContext::new(vec![MockWorkerConfig {
             port: 19006,
             worker_type: WorkerType::Regular,
             health_status: HealthStatus::Healthy,
@@ -349,7 +280,7 @@ mod request_format_tests {
 
         let payload = json!({});
 
-        let result = ctx.make_request("/generate", payload).await;
+        let result = make_request(&ctx, "/generate", payload).await;
         // Mock worker accepts empty body
         assert!(result.is_ok());
 

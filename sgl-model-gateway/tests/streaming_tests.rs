@@ -1,129 +1,59 @@
 mod common;
 
-use std::sync::Arc;
-
-use common::mock_worker::{HealthStatus, MockWorker, MockWorkerConfig, WorkerType};
+use common::{
+    mock_worker::{HealthStatus, MockWorkerConfig, WorkerType},
+    SimpleTestContext,
+};
 use futures_util::StreamExt;
 use reqwest::Client;
 use serde_json::json;
-use smg::{
-    config::{RouterConfig, RoutingMode},
-    routers::{RouterFactory, RouterTrait},
-};
 
-/// Test context that manages mock workers
-struct TestContext {
-    workers: Vec<MockWorker>,
-    _router: Arc<dyn RouterTrait>,
-    worker_urls: Vec<String>,
-}
+async fn make_streaming_request(
+    ctx: &SimpleTestContext,
+    endpoint: &str,
+    body: serde_json::Value,
+) -> Result<Vec<String>, String> {
+    let client = Client::new();
+    let worker_url = ctx
+        .first_worker_url()
+        .ok_or_else(|| "No workers available".to_string())?;
 
-impl TestContext {
-    async fn new(worker_configs: Vec<MockWorkerConfig>) -> Self {
-        let mut config = RouterConfig::builder()
-            .regular_mode(vec![])
-            .port(3004)
-            .worker_startup_timeout_secs(1)
-            .worker_startup_check_interval_secs(1)
-            .build_unchecked();
+    let response = client
+        .post(format!("{}{}", worker_url, endpoint))
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("Request failed: {}", e))?;
 
-        let mut workers = Vec::new();
-        let mut worker_urls = Vec::new();
-
-        for worker_config in worker_configs {
-            let mut worker = MockWorker::new(worker_config);
-            let url = worker.start().await.unwrap();
-            worker_urls.push(url);
-            workers.push(worker);
-        }
-
-        if !workers.is_empty() {
-            tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
-        }
-
-        config.mode = RoutingMode::Regular {
-            worker_urls: worker_urls.clone(),
-        };
-
-        let app_context = common::create_test_context(config.clone()).await;
-
-        let router = RouterFactory::create_router(&app_context).await.unwrap();
-        let router = Arc::from(router);
-
-        if !workers.is_empty() {
-            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-        }
-
-        Self {
-            workers,
-            _router: router,
-            worker_urls: worker_urls.clone(),
-        }
+    if !response.status().is_success() {
+        return Err(format!("Request failed with status: {}", response.status()));
     }
 
-    async fn shutdown(mut self) {
-        // Small delay to ensure any pending operations complete
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    let content_type = response
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
 
-        for worker in &mut self.workers {
-            worker.stop().await;
-        }
-
-        // Another small delay to ensure cleanup completes
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    if !content_type.contains("text/event-stream") {
+        return Err("Response is not a stream".to_string());
     }
 
-    async fn make_streaming_request(
-        &self,
-        endpoint: &str,
-        body: serde_json::Value,
-    ) -> Result<Vec<String>, String> {
-        let client = Client::new();
+    let mut stream = response.bytes_stream();
+    let mut events = Vec::new();
 
-        // Use the first worker URL from the context
-        let worker_url = self
-            .worker_urls
-            .first()
-            .ok_or_else(|| "No workers available".to_string())?;
-
-        let response = client
-            .post(format!("{}{}", worker_url, endpoint))
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| format!("Request failed: {}", e))?;
-
-        if !response.status().is_success() {
-            return Err(format!("Request failed with status: {}", response.status()));
-        }
-
-        // Check if it's a streaming response
-        let content_type = response
-            .headers()
-            .get("content-type")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
-
-        if !content_type.contains("text/event-stream") {
-            return Err("Response is not a stream".to_string());
-        }
-
-        let mut stream = response.bytes_stream();
-        let mut events = Vec::new();
-
-        while let Some(chunk) = stream.next().await {
-            if let Ok(bytes) = chunk {
-                let text = String::from_utf8_lossy(&bytes);
-                for line in text.lines() {
-                    if let Some(stripped) = line.strip_prefix("data: ") {
-                        events.push(stripped.to_string());
-                    }
+    while let Some(chunk) = stream.next().await {
+        if let Ok(bytes) = chunk {
+            let text = String::from_utf8_lossy(&bytes);
+            for line in text.lines() {
+                if let Some(stripped) = line.strip_prefix("data: ") {
+                    events.push(stripped.to_string());
                 }
             }
         }
-
-        Ok(events)
     }
+
+    Ok(events)
 }
 
 #[cfg(test)]
@@ -132,7 +62,7 @@ mod streaming_tests {
 
     #[tokio::test]
     async fn test_generate_streaming() {
-        let ctx = TestContext::new(vec![MockWorkerConfig {
+        let ctx = SimpleTestContext::new(vec![MockWorkerConfig {
             port: 20001,
             worker_type: WorkerType::Regular,
             health_status: HealthStatus::Healthy,
@@ -150,11 +80,10 @@ mod streaming_tests {
             }
         });
 
-        let result = ctx.make_streaming_request("/generate", payload).await;
+        let result = make_streaming_request(&ctx, "/generate", payload).await;
         assert!(result.is_ok());
 
         let events = result.unwrap();
-        // Should have at least one data chunk and [DONE]
         assert!(events.len() >= 2);
         assert_eq!(events.last().unwrap(), "[DONE]");
 
@@ -163,7 +92,7 @@ mod streaming_tests {
 
     #[tokio::test]
     async fn test_v1_chat_completions_streaming() {
-        let ctx = TestContext::new(vec![MockWorkerConfig {
+        let ctx = SimpleTestContext::new(vec![MockWorkerConfig {
             port: 20002,
             worker_type: WorkerType::Regular,
             health_status: HealthStatus::Healthy,
@@ -181,13 +110,11 @@ mod streaming_tests {
             "max_tokens": 20
         });
 
-        let result = ctx
-            .make_streaming_request("/v1/chat/completions", payload)
-            .await;
+        let result = make_streaming_request(&ctx, "/v1/chat/completions", payload).await;
         assert!(result.is_ok());
 
         let events = result.unwrap();
-        assert!(events.len() >= 2); // At least one chunk + [DONE]
+        assert!(events.len() >= 2);
 
         for event in &events {
             if event != "[DONE]" {
@@ -207,7 +134,7 @@ mod streaming_tests {
 
     #[tokio::test]
     async fn test_v1_completions_streaming() {
-        let ctx = TestContext::new(vec![MockWorkerConfig {
+        let ctx = SimpleTestContext::new(vec![MockWorkerConfig {
             port: 20003,
             worker_type: WorkerType::Regular,
             health_status: HealthStatus::Healthy,
@@ -223,23 +150,23 @@ mod streaming_tests {
             "max_tokens": 15
         });
 
-        let result = ctx.make_streaming_request("/v1/completions", payload).await;
+        let result = make_streaming_request(&ctx, "/v1/completions", payload).await;
         assert!(result.is_ok());
 
         let events = result.unwrap();
-        assert!(events.len() >= 2); // At least one chunk + [DONE]
+        assert!(events.len() >= 2);
 
         ctx.shutdown().await;
     }
 
     #[tokio::test]
     async fn test_streaming_with_error() {
-        let ctx = TestContext::new(vec![MockWorkerConfig {
+        let ctx = SimpleTestContext::new(vec![MockWorkerConfig {
             port: 20004,
             worker_type: WorkerType::Regular,
             health_status: HealthStatus::Healthy,
             response_delay_ms: 0,
-            fail_rate: 1.0, // Always fail
+            fail_rate: 1.0,
         }])
         .await;
 
@@ -248,8 +175,7 @@ mod streaming_tests {
             "stream": true
         });
 
-        let result = ctx.make_streaming_request("/generate", payload).await;
-        // With fail_rate: 1.0, the request should fail
+        let result = make_streaming_request(&ctx, "/generate", payload).await;
         assert!(result.is_err());
 
         ctx.shutdown().await;
@@ -257,11 +183,11 @@ mod streaming_tests {
 
     #[tokio::test]
     async fn test_streaming_timeouts() {
-        let ctx = TestContext::new(vec![MockWorkerConfig {
+        let ctx = SimpleTestContext::new(vec![MockWorkerConfig {
             port: 20005,
             worker_type: WorkerType::Regular,
             health_status: HealthStatus::Healthy,
-            response_delay_ms: 100, // Slow response
+            response_delay_ms: 100,
             fail_rate: 0.0,
         }])
         .await;
@@ -275,22 +201,20 @@ mod streaming_tests {
         });
 
         let start = std::time::Instant::now();
-        let result = ctx.make_streaming_request("/generate", payload).await;
+        let result = make_streaming_request(&ctx, "/generate", payload).await;
         let elapsed = start.elapsed();
 
         assert!(result.is_ok());
         let events = result.unwrap();
-
-        // Should have received multiple chunks over time
         assert!(!events.is_empty());
-        assert!(elapsed.as_millis() >= 100); // At least one delay
+        assert!(elapsed.as_millis() >= 100);
 
         ctx.shutdown().await;
     }
 
     #[tokio::test]
     async fn test_batch_streaming() {
-        let ctx = TestContext::new(vec![MockWorkerConfig {
+        let ctx = SimpleTestContext::new(vec![MockWorkerConfig {
             port: 20006,
             worker_type: WorkerType::Regular,
             health_status: HealthStatus::Healthy,
@@ -299,7 +223,6 @@ mod streaming_tests {
         }])
         .await;
 
-        // Batch request with streaming
         let payload = json!({
             "text": ["First", "Second", "Third"],
             "stream": true,
@@ -308,12 +231,11 @@ mod streaming_tests {
             }
         });
 
-        let result = ctx.make_streaming_request("/generate", payload).await;
+        let result = make_streaming_request(&ctx, "/generate", payload).await;
         assert!(result.is_ok());
 
         let events = result.unwrap();
-        // Should have multiple events for batch
-        assert!(events.len() >= 4); // At least 3 responses + [DONE]
+        assert!(events.len() >= 4);
 
         ctx.shutdown().await;
     }

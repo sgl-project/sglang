@@ -42,6 +42,47 @@ pub struct TestContext {
     pub app_context: Arc<AppContext>,
 }
 
+/// Simplified test context for directly testing mock workers without full router setup.
+pub struct SimpleTestContext {
+    pub workers: Vec<MockWorker>,
+    pub worker_urls: Vec<String>,
+}
+
+impl SimpleTestContext {
+    pub async fn new(worker_configs: Vec<MockWorkerConfig>) -> Self {
+        let mut workers = Vec::new();
+        let mut worker_urls = Vec::new();
+
+        for worker_config in worker_configs {
+            let mut worker = MockWorker::new(worker_config);
+            let url = worker.start().await.unwrap();
+            worker_urls.push(url);
+            workers.push(worker);
+        }
+
+        if !workers.is_empty() {
+            tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+        }
+
+        Self {
+            workers,
+            worker_urls,
+        }
+    }
+
+    pub fn first_worker_url(&self) -> Option<&str> {
+        self.worker_urls.first().map(|s| s.as_str())
+    }
+
+    pub async fn shutdown(mut self) {
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        for worker in &mut self.workers {
+            worker.stop().await;
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    }
+}
+
 impl TestContext {
     pub async fn new(worker_configs: Vec<MockWorkerConfig>) -> Self {
         let config = RouterConfig::builder()
