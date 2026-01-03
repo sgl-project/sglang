@@ -34,7 +34,6 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-
 class RequestLogger:
     def __init__(
         self,
@@ -47,11 +46,18 @@ class RequestLogger:
         self.log_requests_level = log_requests_level
         self.log_requests_format = log_requests_format
         self.log_requests_target = log_requests_target
+
         self.metadata: Tuple[Optional[int], Optional[Set[str]], Optional[Set[str]]] = (
             self._compute_metadata()
         )
+        self.targets = self._setup_targets()
+
         self.log_exceeded_ms = envs.SGLANG_LOG_REQUEST_EXCEEDED_MS.get()
-        self._targets = [_create_log_target(t) for t in self.log_requests_target]
+
+    def _setup_targets(self) -> List[logging.Logger]:
+        if not self.log_requests_target:
+            return [_create_log_target_stdout()]
+        return [_create_log_target(t) for t in self.log_requests_target]
 
     def configure(
         self,
@@ -68,8 +74,13 @@ class RequestLogger:
             self.log_requests_format = log_requests_format
         if log_requests_target is not None:
             self.log_requests_target = log_requests_target
-            self._targets = self._setup_targets()
+
         self.metadata = self._compute_metadata()
+        self.targets = self._setup_targets()
+
+    def _log(self, msg: str) -> None:
+        for target in self.targets:
+            target.info(msg)
 
     def _log_json(self, event: str, data: dict) -> None:
         log_data = {
@@ -77,9 +88,7 @@ class RequestLogger:
             "event": event,
             **data,
         }
-        msg = json.dumps(log_data, ensure_ascii=False)
-        for target in self._targets:
-            target.info(msg)
+        self._log(json.dumps(log_data, ensure_ascii=False))
 
     def log_received_request(
         self, obj: Union["GenerateReqInput", "EmbeddingReqInput"], tokenizer: Any = None
@@ -95,7 +104,7 @@ class RequestLogger:
             }
             self._log_json("request.received", log_data)
         else:
-            logger.info(
+            self._log(
                 f"Receive: obj={_dataclass_to_string_truncated(obj, max_length, skip_names=skip_names)}"
             )
 
@@ -139,7 +148,7 @@ class RequestLogger:
                 msg = f"Finish: obj={_dataclass_to_string_truncated(obj, max_length, skip_names=skip_names)}"
             else:
                 msg = f"Finish: obj={_dataclass_to_string_truncated(obj, max_length, skip_names=skip_names)}, out={_dataclass_to_string_truncated(out, max_length, skip_names=out_skip_names)}"
-            logger.info(msg)
+            self._log(msg)
 
     def _compute_metadata(
         self,
@@ -201,6 +210,7 @@ def _create_logger_with_handler(name: str, handler: logging.Handler) -> logging.
 def _create_log_target_stdout() -> logging.Logger:
     return _create_logger_with_handler(f"{__name__}.stdout", logging.StreamHandler())
 
+
 def _create_log_target(target: str) -> logging.Logger:
     if target.lower() == "stdout":
         return _create_log_target_stdout()
@@ -212,8 +222,12 @@ def _create_log_target_file(directory: str) -> logging.Logger:
     hostname = socket.gethostname()
     rank = dist.get_rank() if dist.is_initialized() else 0
     filename = os.path.join(directory, f"{hostname}_{rank}.log")
-    handler = TimedRotatingFileHandler(filename, when="H", backupCount=0, encoding="utf-8")
-    return _create_logger_with_handler(f"{__name__}.file.{directory}.{hostname}_{rank}", handler)
+    handler = TimedRotatingFileHandler(
+        filename, when="H", backupCount=0, encoding="utf-8"
+    )
+    return _create_logger_with_handler(
+        f"{__name__}.file.{directory}.{hostname}_{rank}", handler
+    )
 
 
 # TODO unify this w/ `_transform_data_for_logging` if we find performance enough
