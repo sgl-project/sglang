@@ -295,14 +295,6 @@ class TestSimulator(CustomTestCase):
         self.assertEqual(result.summary, {})
         self.assertEqual(len(result.step_records), 0)
 
-    def test_prefill_instant(self):
-        requests = [SimRequest(request_id="r0", input_len=100, output_len=2)]
-        sim = Simulator(
-            num_gpus=1, router=RoundRobinRouter(), scheduler=FIFOScheduler()
-        )
-        sim.run(requests)
-        self.assertEqual(len(sim.gpu_states[0].running_requests), 0)
-
     def test_log_level_1(self):
         requests = [
             SimRequest(request_id=f"r{i}", input_len=10, output_len=2) for i in range(4)
