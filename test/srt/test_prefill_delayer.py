@@ -25,6 +25,8 @@ class TestPrefillDelayerThroughput(CustomTestCase):
             "8",
             "--chunked-prefill-size",
             "131072",
+            "--mem-fraction-static",
+            "0.6",
         ]
 
         # TODO further fix mem leak
