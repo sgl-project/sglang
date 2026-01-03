@@ -36,7 +36,7 @@ impl InFlightRequestTracker {
         let task = PeriodicTask::spawn(interval_secs, "InFlightRequestSampler", move || {
             tracker.sample_and_record();
         });
-        let _ = self.sampler.set(task);
+        self.sampler.set(task).unwrap();
     }
 
     pub fn track(self: &Arc<Self>) -> InFlightGuard {
