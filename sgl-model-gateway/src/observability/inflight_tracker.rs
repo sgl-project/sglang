@@ -74,9 +74,10 @@ impl InFlightRequestTracker {
         self.requests.is_empty()
     }
 
-    pub fn compute_bucket_counts(&self) -> [usize; 12] {
+    pub fn compute_bucket_counts(&self) -> [usize; AGE_BUCKET_LABELS.len()] {
         let now = Instant::now();
-        let mut counts = [0usize; 12];
+        let mut counts = [0usize; AGE_BUCKET_LABELS.len()];
+        let inf_idx = AGE_BUCKET_LABELS.len() - 1;
 
         for entry in self.requests.iter() {
             let age_secs = now.duration_since(*entry.value()).as_secs();
@@ -85,7 +86,7 @@ impl InFlightRequestTracker {
                     counts[i] += 1;
                 }
             }
-            counts[11] += 1; // +Inf bucket
+            counts[inf_idx] += 1;
         }
 
         counts
@@ -144,7 +145,7 @@ mod tests {
     fn test_empty_tracker_buckets() {
         let tracker = InFlightRequestTracker::new();
         let counts = tracker.compute_bucket_counts();
-        assert_eq!(counts, [0, 0, 0, 0, 0, 0]);
+        assert!(counts.iter().all(|&c| c == 0));
     }
 
     #[test]
@@ -165,7 +166,8 @@ mod tests {
         assert_eq!(counts[2], 3, "bucket 2");
         assert_eq!(counts[3], 4, "bucket 3");
         assert_eq!(counts[4], 5, "bucket 4");
-        assert_eq!(counts[5], 6, "bucket +Inf");
+        assert_eq!(counts[5], 6, "bucket 5");
+        assert_eq!(*counts.last().unwrap(), 6, "bucket +Inf");
     }
 
     #[test]
@@ -179,7 +181,7 @@ mod tests {
         let counts = tracker.compute_bucket_counts();
         assert_eq!(counts[0], 1, "bucket 0 includes exact boundary");
         assert_eq!(counts[1], 2, "bucket 1 includes both");
-        assert_eq!(counts[5], 2, "bucket +Inf includes all");
+        assert_eq!(*counts.last().unwrap(), 2, "bucket +Inf includes all");
     }
 
     #[test]
