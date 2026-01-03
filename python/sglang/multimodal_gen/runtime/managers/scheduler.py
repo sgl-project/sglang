@@ -104,6 +104,9 @@ class Scheduler:
         return self.worker.unmerge_lora_weights(req.target)
 
     def _handle_generation(self, reqs: List[Req]):
+        has_warmup = any(req.is_warmup for req in reqs)
+        if has_warmup:
+            logger.info("Processing warmup req....")
         return self.worker.execute_forward(reqs)
 
     def return_result(
@@ -270,7 +273,7 @@ class Scheduler:
 
             # 3. return results
             try:
-                # TODO: Support sending back to multiple identities if batched
+                # log warmup info
                 is_warmup = (
                     processed_req.is_warmup if isinstance(processed_req, Req) else False
                 )
@@ -283,6 +286,7 @@ class Scheduler:
                     else:
                         logger.info(f"Warmup req processing failed")
 
+                # TODO: Support sending back to multiple identities if batched
                 self.return_result(output_batch, identities[0], is_warmup=is_warmup)
             except zmq.ZMQError as e:
                 # Reply failed; log and keep loop alive to accept future requests
