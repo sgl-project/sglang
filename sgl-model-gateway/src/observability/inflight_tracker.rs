@@ -93,6 +93,8 @@ impl InFlightRequestTracker {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
 
     impl InFlightRequestTracker {
