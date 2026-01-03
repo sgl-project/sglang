@@ -1,10 +1,6 @@
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING
 
-from sglang.srt.debug_utils.schedule_simulator.request import SimRequest
-from sglang.srt.debug_utils.schedule_simulator.schedulers.base import (
-    ScheduleDecision,
-    SchedulerPolicy,
-)
+from sglang.srt.debug_utils.schedule_simulator.schedulers.base import SchedulerPolicy
 
 if TYPE_CHECKING:
     from sglang.srt.debug_utils.schedule_simulator.gpu_state import GPUState
@@ -13,12 +9,13 @@ if TYPE_CHECKING:
 class FIFOScheduler(SchedulerPolicy):
     """FIFO scheduler: runs pending requests in order, evicts in LIFO order."""
 
-    def schedule(self, gpu_state: "GPUState") -> ScheduleDecision:
-        # Run all pending requests (Simulator handles token limits via eviction)
-        return ScheduleDecision(to_run=list(gpu_state.pending_requests))
+    def schedule(self, gpu_state: "GPUState", max_total_tokens: int) -> None:
+        # Evict running requests if over budget (LIFO order)
+        while not gpu_state.is_valid(max_total_tokens) and gpu_state.running_requests:
+            victim = gpu_state.running_requests[-1]
+            gpu_state.evict_request(victim)
 
-    def select_victim(self, gpu_state: "GPUState") -> Optional[SimRequest]:
-        # LIFO eviction: evict the last running request
-        if gpu_state.running_requests:
-            return gpu_state.running_requests[-1]
-        return None
+        # Run pending requests that fit (FIFO order)
+        for req in list(gpu_state.pending_requests):
+            if gpu_state.total_seq_len() + req.seq_len() <= max_total_tokens:
+                gpu_state.run_request(req)

@@ -111,34 +111,41 @@ class TestRouters(CustomTestCase):
 
 
 class TestFIFOScheduler(CustomTestCase):
-    def test_schedule_returns_all_pending(self):
-        # FIFOScheduler.schedule() returns all pending requests
+    def test_runs_pending_requests(self):
+        scheduler = FIFOScheduler()
+        gpu = GPUState(gpu_id=0)
+        gpu.pending_requests = [
+            SimRequest(request_id=f"r{i}", input_len=100, output_len=50)
+            for i in range(3)
+        ]
+        scheduler.schedule(gpu, max_total_tokens=10000)
+        self.assertEqual(len(gpu.running_requests), 3)
+        self.assertEqual(len(gpu.pending_requests), 0)
+
+    def test_respects_token_limit(self):
+        # max_total_tokens=250, each req has seq_len=100, so only 2 can run
         scheduler = FIFOScheduler()
         gpu = GPUState(gpu_id=0)
         gpu.pending_requests = [
             SimRequest(request_id=f"r{i}", input_len=100, output_len=50)
             for i in range(5)
         ]
-        decision = scheduler.schedule(gpu)
-        self.assertEqual(len(decision.to_run), 5)
+        scheduler.schedule(gpu, max_total_tokens=250)
+        self.assertEqual(len(gpu.running_requests), 2)
+        self.assertEqual(len(gpu.pending_requests), 3)
 
-    def test_select_victim_lifo(self):
-        # select_victim returns the last running request (LIFO)
+    def test_evicts_lifo_when_over_budget(self):
+        # Running requests exceed budget, should evict LIFO
         scheduler = FIFOScheduler()
         gpu = GPUState(gpu_id=0)
         gpu.running_requests = [
             SimRequest(request_id=f"r{i}", input_len=100, output_len=50)
             for i in range(3)
-        ]
-        victim = scheduler.select_victim(gpu)
-        self.assertEqual(victim.request_id, "r2")  # Last added
-
-    def test_select_victim_empty(self):
-        # select_victim returns None when no running requests
-        scheduler = FIFOScheduler()
-        gpu = GPUState(gpu_id=0)
-        victim = scheduler.select_victim(gpu)
-        self.assertIsNone(victim)
+        ]  # 300 tokens total
+        scheduler.schedule(gpu, max_total_tokens=250)
+        self.assertEqual(len(gpu.running_requests), 2)
+        self.assertEqual(len(gpu.pending_requests), 1)
+        self.assertEqual(gpu.pending_requests[0].request_id, "r2")  # LIFO eviction
 
 
 class TestMetrics(CustomTestCase):

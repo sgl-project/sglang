@@ -74,22 +74,11 @@ class Simulator:
 
     def _schedule_all_gpus(self) -> None:
         for gpu in self.gpu_states:
-            # First, evict running requests if over budget
-            while gpu.total_seq_len() > self.max_total_tokens:
-                victim = self.scheduler.select_victim(gpu)
-                if victim is None:
-                    break
-                gpu.running_requests.remove(victim)
-                gpu.pending_requests.insert(0, victim)  # Re-queue at front
-
-            # Then, schedule pending requests
-            decision = self.scheduler.schedule(gpu)
-            for req in decision.to_run:
-                if gpu.total_seq_len() + req.seq_len() > self.max_total_tokens:
-                    break  # Stop if adding this request would exceed budget
-                assert req in gpu.pending_requests
-                gpu.pending_requests.remove(req)
-                gpu.running_requests.append(req)
+            self.scheduler.schedule(gpu, self.max_total_tokens)
+            assert gpu.is_valid(self.max_total_tokens), (
+                f"GPU{gpu.gpu_id} invalid after scheduling: "
+                f"total_seq_len={gpu.total_seq_len()} > max={self.max_total_tokens}"
+            )
 
     def _execute_step(self) -> None:
         for gpu in self.gpu_states:
