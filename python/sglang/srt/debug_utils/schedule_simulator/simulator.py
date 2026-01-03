@@ -7,6 +7,17 @@ from sglang.srt.debug_utils.schedule_simulator.request import SimRequest
 from sglang.srt.debug_utils.schedule_simulator.routers.base import RouterPolicy
 from sglang.srt.debug_utils.schedule_simulator.schedulers.base import SchedulerPolicy
 
+_LOG_ID_LIMIT = 5
+
+
+def _format_ids(requests: List[SimRequest]) -> str:
+    if not requests:
+        return "-"
+    ids = ",".join(r.request_id for r in requests[:_LOG_ID_LIMIT])
+    if len(requests) > _LOG_ID_LIMIT:
+        ids += f"...+{len(requests) - _LOG_ID_LIMIT}"
+    return ids
+
 
 @dataclass
 class SimulationResult:
@@ -87,15 +98,9 @@ class Simulator:
             if self.log_level == 1:
                 parts.append(f"GPU{gpu.gpu_id}[R={r:<3} Q={q:<3}]")
             else:
-                run_ids = ",".join(r.request_id for r in gpu.running_requests[:5])
-                if len(gpu.running_requests) > 5:
-                    run_ids += f"...+{len(gpu.running_requests)-5}"
-                queue_ids = ",".join(r.request_id for r in gpu.pending_requests[:3])
-                if len(gpu.pending_requests) > 3:
-                    queue_ids += f"...+{len(gpu.pending_requests)-3}"
-                parts.append(
-                    f"GPU{gpu.gpu_id}[R={r}:{run_ids or'-'} Q={q}:{queue_ids or'-'}]"
-                )
+                run_ids = _format_ids(gpu.running_requests)
+                queue_ids = _format_ids(gpu.pending_requests)
+                parts.append(f"GPU{gpu.gpu_id}[R={r}:{run_ids} Q={q}:{queue_ids}]")
         print(" | ".join(parts))
 
     def _record_metrics(self) -> None:
