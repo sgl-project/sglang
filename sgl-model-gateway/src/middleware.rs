@@ -668,9 +668,8 @@ where
             let active = ACTIVE_HTTP_CONNECTIONS.fetch_add(1, Ordering::Relaxed) + 1;
             Metrics::set_http_connections_active(active as usize);
 
-            tracker.register(tracking_id);
+            let _guard = tracker.track(tracking_id);
             let result = inner.call(req).await;
-            tracker.deregister(tracking_id);
 
             let active = ACTIVE_HTTP_CONNECTIONS.fetch_sub(1, Ordering::Relaxed) - 1;
             Metrics::set_http_connections_active(active as usize);

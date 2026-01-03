@@ -16,6 +16,17 @@ pub struct InFlightRequestTracker {
     requests: DashMap<u64, Instant>,
 }
 
+pub struct InFlightGuard {
+    tracker: Arc<InFlightRequestTracker>,
+    request_id: u64,
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        self.tracker.requests.remove(&self.request_id);
+    }
+}
+
 impl InFlightRequestTracker {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
@@ -31,6 +42,14 @@ impl InFlightRequestTracker {
 
     pub fn start_sampler(self: &Arc<Self>, sample_interval: Duration) {
         self.clone().spawn_sampler(sample_interval);
+    }
+
+    pub fn track(self: &Arc<Self>, request_id: u64) -> InFlightGuard {
+        self.requests.insert(request_id, Instant::now());
+        InFlightGuard {
+            tracker: self.clone(),
+            request_id,
+        }
     }
 
     pub fn register(&self, request_id: u64) {
