@@ -135,7 +135,7 @@ from sglang.srt.models.deepseek_common.utils import (
     _use_aiter,
     _use_aiter_gfx95,
 )
-from sglang.srt.models.deepseek_common.deepseek_weight_loader import DeepseekV2WeightLoader
+from sglang.srt.models.deepseek_common.deepseek_weight_loader import DeepseekV2WeightLoaderMixin
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
@@ -2710,7 +2710,7 @@ class DeepseekV2Model(nn.Module):
         return hidden_states, aux_hidden_states
 
 
-class DeepseekV2ForCausalLM(nn.Module):
+class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
     # for quark model load
     packed_modules_mapping = {}
 
@@ -2758,15 +2758,6 @@ class DeepseekV2ForCausalLM(nn.Module):
             # ranks other than the last rank will have a placeholder layer
             self.lm_head = PPMissingLayer()
         self.logits_processor = LogitsProcessor(config)
-
-        self.weight_loader = DeepseekV2WeightLoader(
-            causal_lm_model=self,
-            model=self.model,
-            pp_group=self.pp_group,
-            config=self.config,
-            quant_config=self.quant_config,
-            num_fused_shared_experts=self.num_fused_shared_experts,
-        )
 
         self._routed_experts_weights_of_layer = LazyValue(
             lambda: {
@@ -2878,7 +2869,7 @@ class DeepseekV2ForCausalLM(nn.Module):
         return self.model.end_layer
         
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False):
-        self.weight_loader.load_weights(weights, is_nextn)
+        self.do_load_weights(weights, is_nextn)
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight
