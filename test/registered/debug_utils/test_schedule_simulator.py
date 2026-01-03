@@ -1,4 +1,3 @@
-import io
 import json
 import subprocess
 import sys
@@ -417,8 +416,6 @@ class TestCLI(CustomTestCase):
         self.assertIn("batch_size_balancedness_mean: 1.0000", result.stdout)
 
     def test_e2e_queuing_due_to_token_limit(self):
-        # 4 requests, input_len=100, output_len=3, 1 GPU
-        # max_total_tokens=210, so only 2 requests fit at a time
         result = self._run_cli(
             "--synthetic",
             "--synth-num-requests", "4",
@@ -430,22 +427,15 @@ class TestCLI(CustomTestCase):
             "--log-level", "2",
         )
         self.assertEqual(result.returncode, 0, f"CLI failed: {result.stderr}")
-        expected_steps = """\
+        self._assert_output_contains(result.stdout, """
 step=0    | GPU0[R=2:syn0,syn1 Q=2:syn2,syn3]
 step=1    | GPU0[R=2:syn0,syn1 Q=2:syn2,syn3]
 step=2    | GPU0[R=0:- Q=2:syn2,syn3]
 step=3    | GPU0[R=2:syn2,syn3 Q=0:-]
 step=4    | GPU0[R=2:syn2,syn3 Q=0:-]
-step=5    | GPU0[R=0:- Q=0:-]"""
-        for line in expected_steps.split("\n"):
-            self.assertIn(line, result.stdout)
+step=5    | GPU0[R=0:- Q=0:-]""")
 
     def test_e2e_retraction_due_to_token_growth(self):
-        # 2 requests, input_len=50, output_len=10, 1 GPU
-        # max_total_tokens=110, both fit initially (100 tokens)
-        # As decode progresses, tokens grow: 102->104->...->110
-        # At step 6, would exceed 110, so syn1 gets evicted
-        # After syn0 finishes, syn1 resumes
         result = self._run_cli(
             "--synthetic",
             "--synth-num-requests", "2",
@@ -457,15 +447,13 @@ step=5    | GPU0[R=0:- Q=0:-]"""
             "--log-level", "2",
         )
         self.assertEqual(result.returncode, 0, f"CLI failed: {result.stderr}")
-        expected_steps = """\
+        self._assert_output_contains(result.stdout, """
 step=0    | GPU0[R=2:syn0,syn1 Q=0:-]
 step=5    | GPU0[R=2:syn0,syn1 Q=0:-]
 step=6    | GPU0[R=1:syn0 Q=1:syn1]
 step=9    | GPU0[R=0:- Q=1:syn1]
 step=10   | GPU0[R=1:syn1 Q=0:-]
-step=13   | GPU0[R=0:- Q=0:-]"""
-        for line in expected_steps.split("\n"):
-            self.assertIn(line, result.stdout)
+step=13   | GPU0[R=0:- Q=0:-]""")
 
 
 if __name__ == "__main__":
