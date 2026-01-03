@@ -15,6 +15,7 @@ from sglang.srt.debug_utils.schedule_simulator import (
     SimulationResult,
     Simulator,
     StepRecord,
+    generate_gsp_requests,
     generate_random_requests,
     load_from_request_logger,
 )
@@ -66,6 +67,76 @@ class TestGPUState(CustomTestCase):
             ),
         ]
         self.assertEqual(gpu.total_seq_len(), 100 + 210)
+
+    def test_total_seq_len_shared_prefix(self):
+        gpu = GPUState(gpu_id=0, max_total_tokens=10000)
+        gpu.running_requests = [
+            SimRequest(
+                request_id="r1",
+                input_len=150,
+                output_len=50,
+                group_id="g0",
+                prefix_len=100,
+            ),
+            SimRequest(
+                request_id="r2",
+                input_len=150,
+                output_len=50,
+                group_id="g0",
+                prefix_len=100,
+            ),
+        ]
+        self.assertEqual(gpu.total_seq_len(), 150 + 50)
+
+    def test_total_seq_len_shared_prefix_with_decoded(self):
+        gpu = GPUState(gpu_id=0, max_total_tokens=10000)
+        gpu.running_requests = [
+            SimRequest(
+                request_id="r1",
+                input_len=150,
+                output_len=50,
+                decoded_tokens=10,
+                group_id="g0",
+                prefix_len=100,
+            ),
+            SimRequest(
+                request_id="r2",
+                input_len=150,
+                output_len=50,
+                decoded_tokens=5,
+                group_id="g0",
+                prefix_len=100,
+            ),
+        ]
+        self.assertEqual(gpu.total_seq_len(), 160 + 55)
+
+    def test_total_seq_len_multiple_groups(self):
+        gpu = GPUState(gpu_id=0, max_total_tokens=10000)
+        gpu.running_requests = [
+            SimRequest(
+                request_id="r1",
+                input_len=150,
+                output_len=50,
+                group_id="g0",
+                prefix_len=100,
+            ),
+            SimRequest(
+                request_id="r2",
+                input_len=150,
+                output_len=50,
+                group_id="g0",
+                prefix_len=100,
+            ),
+            SimRequest(
+                request_id="r3",
+                input_len=200,
+                output_len=50,
+                group_id="g1",
+                prefix_len=150,
+            ),
+            SimRequest(request_id="r4", input_len=80, output_len=20),
+        ]
+        self.assertEqual(gpu.total_seq_len(), 150 + 50 + 200 + 80)
 
 
 class TestRouters(CustomTestCase):
@@ -223,6 +294,69 @@ class TestDataSynthesis(CustomTestCase):
         )
         for a, b in zip(r1, r2):
             self.assertEqual(a.input_len, b.input_len)
+
+    def test_generate_gsp_basic(self):
+        requests = generate_gsp_requests(
+            num_groups=4,
+            prompts_per_group=3,
+            system_prompt_len=100,
+            question_len=50,
+            output_len=25,
+            seed=42,
+        )
+        self.assertEqual(len(requests), 12)
+        for req in requests:
+            self.assertIsNotNone(req.group_id)
+            self.assertEqual(req.prefix_len, 100)
+            self.assertEqual(req.input_len, 150)
+            self.assertEqual(req.output_len, 25)
+
+    def test_generate_gsp_group_assignment(self):
+        requests = generate_gsp_requests(
+            num_groups=3,
+            prompts_per_group=2,
+            system_prompt_len=100,
+            question_len=50,
+            output_len=25,
+            seed=42,
+        )
+        group_counts = {}
+        for req in requests:
+            group_counts[req.group_id] = group_counts.get(req.group_id, 0) + 1
+        self.assertEqual(len(group_counts), 3)
+        for count in group_counts.values():
+            self.assertEqual(count, 2)
+
+    def test_generate_gsp_with_range_ratio(self):
+        requests = generate_gsp_requests(
+            num_groups=4,
+            prompts_per_group=5,
+            system_prompt_len=100,
+            question_len=50,
+            output_len=25,
+            range_ratio=0.5,
+            seed=42,
+        )
+        for req in requests:
+            self.assertGreaterEqual(req.prefix_len, 50)
+            self.assertLessEqual(req.prefix_len, 100)
+            self.assertGreaterEqual(req.input_len - req.prefix_len, 25)
+            self.assertLessEqual(req.input_len - req.prefix_len, 50)
+
+    def test_generate_gsp_shuffled(self):
+        requests = generate_gsp_requests(
+            num_groups=4,
+            prompts_per_group=10,
+            system_prompt_len=100,
+            question_len=50,
+            output_len=25,
+            seed=42,
+        )
+        group_ids = [req.group_id for req in requests]
+        is_sorted = all(
+            group_ids[i] <= group_ids[i + 1] for i in range(len(group_ids) - 1)
+        )
+        self.assertFalse(is_sorted)
 
 
 class TestSimulator(CustomTestCase):

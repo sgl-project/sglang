@@ -9,6 +9,7 @@ from sglang.srt.debug_utils.schedule_simulator.data_source.data_loader import (
     load_from_request_logger,
 )
 from sglang.srt.debug_utils.schedule_simulator.data_source.data_synthesis import (
+    generate_gsp_requests,
     generate_random_requests,
 )
 from sglang.srt.debug_utils.schedule_simulator.metrics import (
@@ -36,12 +37,25 @@ def create_arg_parser() -> argparse.ArgumentParser:
     data_group.add_argument(
         "--synthetic", action="store_true", help="Use synthetic data generation"
     )
+    data_group.add_argument(
+        "--synth-gsp",
+        action="store_true",
+        help="Use generated-shared-prefix (GSP) data generation",
+    )
 
+    # Synthetic random dataset arguments (aligned with bench_serving.py)
     parser.add_argument("--synth-num-requests", type=int, default=1000)
     parser.add_argument("--synth-input-len", type=int, default=1024)
     parser.add_argument("--synth-output-len", type=int, default=256)
     parser.add_argument("--synth-range-ratio", type=float, default=1.0)
     parser.add_argument("--synth-seed", type=int, default=None)
+
+    # GSP dataset arguments (aligned with bench_serving.py --gsp-* options)
+    parser.add_argument("--synth-gsp-num-groups", type=int, default=64)
+    parser.add_argument("--synth-gsp-prompts-per-group", type=int, default=16)
+    parser.add_argument("--synth-gsp-system-prompt-len", type=int, default=2048)
+    parser.add_argument("--synth-gsp-question-len", type=int, default=128)
+    parser.add_argument("--synth-gsp-output-len", type=int, default=256)
 
     parser.add_argument("--num-gpus", type=int, default=8)
     parser.add_argument(
@@ -59,6 +73,23 @@ def _load_requests(args: argparse.Namespace) -> List[SimRequest]:
     if args.input:
         requests = load_from_request_logger(args.input)
         print(f"Loaded {len(requests)} requests from {args.input}")
+    elif args.synth_gsp:
+        requests = generate_gsp_requests(
+            num_groups=args.synth_gsp_num_groups,
+            prompts_per_group=args.synth_gsp_prompts_per_group,
+            system_prompt_len=args.synth_gsp_system_prompt_len,
+            question_len=args.synth_gsp_question_len,
+            output_len=args.synth_gsp_output_len,
+            range_ratio=args.synth_range_ratio,
+            seed=args.synth_seed,
+        )
+        print(
+            f"Generated {len(requests)} GSP requests "
+            f"({args.synth_gsp_num_groups} groups x {args.synth_gsp_prompts_per_group} prompts, "
+            f"system_prompt_len={args.synth_gsp_system_prompt_len}, "
+            f"question_len={args.synth_gsp_question_len}, "
+            f"output_len={args.synth_gsp_output_len})"
+        )
     else:
         requests = generate_random_requests(
             num_requests=args.synth_num_requests,

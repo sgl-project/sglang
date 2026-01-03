@@ -1,4 +1,5 @@
 from sglang.srt.debug_utils.schedule_simulator.data_source import (
+    generate_gsp_requests,
     generate_random_requests,
     load_from_request_logger,
 )
@@ -40,6 +41,7 @@ __all__ = [
     "AttentionBalancednessRecorder",
     "load_from_request_logger",
     "generate_random_requests",
+    "generate_gsp_requests",
     "create_arg_parser",
     "main",
 ]

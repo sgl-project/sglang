@@ -26,7 +26,16 @@ class GPUState:
         return len(self.running_requests)
 
     def total_seq_len(self) -> int:
-        return sum(req.seq_len() for req in self.running_requests)
+        seen_groups: set = set()
+        total = 0
+        for req in self.running_requests:
+            if req.group_id and req.group_id in seen_groups:
+                total += req.seq_len() - req.prefix_len
+            else:
+                total += req.seq_len()
+                if req.group_id:
+                    seen_groups.add(req.group_id)
+        return total
 
     def is_valid(self) -> bool:
         return self.total_seq_len() <= self.max_total_tokens
