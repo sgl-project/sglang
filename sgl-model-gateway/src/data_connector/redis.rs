@@ -101,17 +101,16 @@ impl ConversationStorage for RedisConversationStorage {
         let key = Self::conversation_key(id_str);
 
         let mut pipe = redis::pipe();
-        let mut pipe_ref = &mut pipe;
-        pipe_ref = pipe_ref.hset(&key, "id", id_str);
-        pipe_ref = pipe_ref.hset(&key, "created_at", created_at.to_rfc3339());
+        pipe.hset(&key, "id", id_str);
+        pipe.hset(&key, "created_at", created_at.to_rfc3339());
         if let Some(meta) = metadata_json {
-            pipe_ref = pipe_ref.hset(&key, "metadata", meta);
+            pipe.hset(&key, "metadata", meta);
         }
         
         // Expire after 30 days (optional, but good for cache)
-        pipe_ref = pipe_ref.expire(&key, 30 * 24 * 60 * 60);
+        pipe.expire(&key, 30 * 24 * 60 * 60);
 
-        pipe_ref.query_async(&mut conn).await.map_err(|e| ConversationStorageError::StorageError(e.to_string()))?;
+        pipe.query_async(&mut conn).await.map_err(|e| ConversationStorageError::StorageError(e.to_string()))?;
 
         Ok(conversation)
     }
