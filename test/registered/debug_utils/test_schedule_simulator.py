@@ -47,6 +47,21 @@ class TestSimRequest(CustomTestCase):
         )
         self.assertTrue(req.is_finished())
 
+    def test_copy(self):
+        req = SimRequest(
+            request_id="r1",
+            input_len=100,
+            output_len=50,
+            stage=RequestStage.DECODE,
+            decoded_tokens=10,
+        )
+        req_copy = req.copy()
+        self.assertEqual(req_copy.request_id, req.request_id)
+        self.assertEqual(req_copy.input_len, req.input_len)
+        self.assertEqual(req_copy.stage, req.stage)
+        req_copy.decoded_tokens = 20
+        self.assertEqual(req.decoded_tokens, 10)
+
 
 class TestGPUState(CustomTestCase):
     def test_batch_size(self):
@@ -150,6 +165,18 @@ class TestMetrics(CustomTestCase):
         summary = recorder.get_summary()
         self.assertAlmostEqual(summary["attention_balancedness_mean"], 0.75)
 
+    def test_empty_history(self):
+        recorder = BatchSizeBalancednessRecorder()
+        summary = recorder.get_summary()
+        self.assertEqual(summary["batch_size_balancedness_mean"], 0.0)
+
+    def test_all_zero_batch_size(self):
+        recorder = BatchSizeBalancednessRecorder()
+        gpu_states = [GPUState(gpu_id=i) for i in range(2)]
+        recorder.on_step_end(0, gpu_states)
+        summary = recorder.get_summary()
+        self.assertAlmostEqual(summary["batch_size_balancedness_mean"], 1.0)
+
 
 class TestDataLoader(CustomTestCase):
     def test_load_from_request_logger(self):
@@ -185,6 +212,35 @@ class TestDataLoader(CustomTestCase):
         self.assertEqual(requests[1].request_id, "r2")
         self.assertEqual(requests[1].input_len, 200)
         self.assertEqual(requests[1].output_len, 100)
+
+    def test_empty_file(self):
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".log", delete=False) as f:
+            f.write("")
+            f.flush()
+            requests = load_from_request_logger(f.name)
+        self.assertEqual(len(requests), 0)
+
+    def test_invalid_json_skipped(self):
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".log", delete=False) as f:
+            f.write("not json\n")
+            f.write('{"event": "request.finished", "rid": "r1", "out": {"meta_info": {"prompt_tokens": 100, "completion_tokens": 50}}}\n')
+            f.flush()
+            requests = load_from_request_logger(f.name)
+        self.assertEqual(len(requests), 1)
+
+    def test_missing_fields_skipped(self):
+        log_data = [
+            {"event": "request.finished", "rid": "r1", "out": {}},
+            {"event": "request.finished", "rid": "r2", "out": {"meta_info": {"prompt_tokens": 100}}},
+            {"event": "request.finished", "rid": "r3", "out": {"meta_info": {"prompt_tokens": 100, "completion_tokens": 50}}},
+        ]
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".log", delete=False) as f:
+            for item in log_data:
+                f.write(json.dumps(item) + "\n")
+            f.flush()
+            requests = load_from_request_logger(f.name)
+        self.assertEqual(len(requests), 1)
+        self.assertEqual(requests[0].request_id, "r3")
 
 
 class TestSimulator(CustomTestCase):
@@ -223,6 +279,15 @@ class TestSimulator(CustomTestCase):
         for gpu in sim.gpu_states:
             self.assertEqual(len(gpu.pending_requests), 0)
             self.assertEqual(len(gpu.running_requests), 0)
+
+    def test_empty_requests(self):
+        sim = Simulator(
+            num_gpus=2,
+            router=RoundRobinRouter(),
+            scheduler=FIFOScheduler(),
+        )
+        summary = sim.run([])
+        self.assertEqual(summary, {})
 
 
 if __name__ == "__main__":
