@@ -507,18 +507,20 @@ class TestMain(CustomTestCase):
 
     def test_queuing_due_to_token_limit(self):
         # 4 requests, input_len=100, output_len=3, 1 GPU
-        # max_total_tokens=200, so only 2 requests can run at a time
+        # max_total_tokens=210, so only 2 requests can fit initially (200 tokens)
+        # and they can grow to 206 before finishing (still under 210)
         # step 0: r0,r1 running (200 tokens), r2,r3 pending
-        # step 1: still running (202 tokens but they complete soon)
-        # step 2: r0,r1 finish (decoded 3), r2,r3 start
-        # step 3-4: r2,r3 running
-        # step 5: all done
+        # step 1: r0,r1 running (202 tokens)
+        # step 2: r0,r1 finish (after 3 decodes), running=0, pending=2
+        # step 3: r2,r3 start running
+        # step 4: r2,r3 continue
+        # step 5: r2,r3 finish
         self._run_and_verify(
             synth_num_requests=4,
             synth_input_len=100,
             synth_output_len=3,
             num_gpus=1,
-            max_total_tokens=200,
+            max_total_tokens=210,
             expected_rows=[
                 {"step": 0, "gpu_id": 0, "running_count": 2, "pending_count": 2},
                 {"step": 1, "gpu_id": 0, "running_count": 2, "pending_count": 2},
