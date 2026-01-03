@@ -134,7 +134,12 @@ class Scheduler:
     def process_received_reqs_with_warmup(
         self, recv_reqs: List[tuple[bytes, Any]]
     ) -> List[tuple[bytes, Any]]:
-        if self.warmed_up or not self.server_args.warmup or not recv_reqs or self.server_args.warmup_resolutions is not None:
+        if (
+            self.warmed_up
+            or not self.server_args.warmup
+            or not recv_reqs
+            or self.server_args.warmup_resolutions is not None
+        ):
             return recv_reqs
 
         # handle server req-based warmup by inserting an identical req to the beginning of the waiting queue
