@@ -776,7 +776,7 @@ __forceinline__ void dispatch_rotary_launch(
   }
 }
 
-template <typename scalar_t>
+template <int ROT, typename scalar_t>
 inline void launch_rotary(
     const tvm::ffi::TensorView cos,
     const tvm::ffi::TensorView sin,
@@ -813,9 +813,16 @@ inline void launch_rotary(
   }
   const int embed_dim_for_rotation = interleaved ? (int)r : (int)(r / 2);
   RuntimeCheck(embed_dim_for_rotation > 0, "embed_dim_for_rotation must be > 0");
+  if constexpr (ROT > 0) {
+    RuntimeCheck(
+        embed_dim_for_rotation == ROT,
+        "embed_dim_for_rotation mismatch: got ",
+        embed_dim_for_rotation,
+        " expected ROT=",
+        ROT);
+  }
   RuntimeCheck(2LL * embed_dim_for_rotation <= head_size, "rotate dim exceeds head_size");
 
-  // Strides: JIT wrapper guarantees contiguous [T, H, D] tensors.
   const int64_t query_token_stride = hq * d;
   const int64_t head_stride_query = d;
 
@@ -882,190 +889,36 @@ inline void launch_rotary(
   const dim3 grid1d((int)t);
   const dim3 block(threads_per_block);
 
-  // Compile-time specializations for common embed dims; fallback to runtime (ROT=0).
-  switch (embed_dim_for_rotation) {
-    case 32:
-      dispatch_rotary_launch<32, scalar_t>(
-          use_grid_2d,
-          grid2d,
-          grid1d,
-          block,
-          stream,
-          interleaved,
-          use_vec,
-          qk_aligned16,
-          cos_ptr,
-          sin_ptr,
-          q_ptr,
-          k_ptr,
-          (int)r,
-          embed_dim_for_rotation,
-          query_token_stride,
-          key_token_stride,
-          head_stride_query,
-          head_stride_key,
-          (int)hq,
-          (int)hk,
-          (int)head_size,
-          blocks_per_token);
-      break;
-    case 40:
-      dispatch_rotary_launch<40, scalar_t>(
-          use_grid_2d,
-          grid2d,
-          grid1d,
-          block,
-          stream,
-          interleaved,
-          use_vec,
-          qk_aligned16,
-          cos_ptr,
-          sin_ptr,
-          q_ptr,
-          k_ptr,
-          (int)r,
-          embed_dim_for_rotation,
-          query_token_stride,
-          key_token_stride,
-          head_stride_query,
-          head_stride_key,
-          (int)hq,
-          (int)hk,
-          (int)head_size,
-          blocks_per_token);
-      break;
-    case 64:
-      dispatch_rotary_launch<64, scalar_t>(
-          use_grid_2d,
-          grid2d,
-          grid1d,
-          block,
-          stream,
-          interleaved,
-          use_vec,
-          qk_aligned16,
-          cos_ptr,
-          sin_ptr,
-          q_ptr,
-          k_ptr,
-          (int)r,
-          embed_dim_for_rotation,
-          query_token_stride,
-          key_token_stride,
-          head_stride_query,
-          head_stride_key,
-          (int)hq,
-          (int)hk,
-          (int)head_size,
-          blocks_per_token);
-      break;
-    case 80:
-      dispatch_rotary_launch<80, scalar_t>(
-          use_grid_2d,
-          grid2d,
-          grid1d,
-          block,
-          stream,
-          interleaved,
-          use_vec,
-          qk_aligned16,
-          cos_ptr,
-          sin_ptr,
-          q_ptr,
-          k_ptr,
-          (int)r,
-          embed_dim_for_rotation,
-          query_token_stride,
-          key_token_stride,
-          head_stride_query,
-          head_stride_key,
-          (int)hq,
-          (int)hk,
-          (int)head_size,
-          blocks_per_token);
-      break;
-    case 128:
-      dispatch_rotary_launch<128, scalar_t>(
-          use_grid_2d,
-          grid2d,
-          grid1d,
-          block,
-          stream,
-          interleaved,
-          use_vec,
-          qk_aligned16,
-          cos_ptr,
-          sin_ptr,
-          q_ptr,
-          k_ptr,
-          (int)r,
-          embed_dim_for_rotation,
-          query_token_stride,
-          key_token_stride,
-          head_stride_query,
-          head_stride_key,
-          (int)hq,
-          (int)hk,
-          (int)head_size,
-          blocks_per_token);
-      break;
-    case 160:
-      dispatch_rotary_launch<160, scalar_t>(
-          use_grid_2d,
-          grid2d,
-          grid1d,
-          block,
-          stream,
-          interleaved,
-          use_vec,
-          qk_aligned16,
-          cos_ptr,
-          sin_ptr,
-          q_ptr,
-          k_ptr,
-          (int)r,
-          embed_dim_for_rotation,
-          query_token_stride,
-          key_token_stride,
-          head_stride_query,
-          head_stride_key,
-          (int)hq,
-          (int)hk,
-          (int)head_size,
-          blocks_per_token);
-      break;
-    default:
-      dispatch_rotary_launch<0, scalar_t>(
-          use_grid_2d,
-          grid2d,
-          grid1d,
-          block,
-          stream,
-          interleaved,
-          use_vec,
-          qk_aligned16,
-          cos_ptr,
-          sin_ptr,
-          q_ptr,
-          k_ptr,
-          (int)r,
-          embed_dim_for_rotation,
-          query_token_stride,
-          key_token_stride,
-          head_stride_query,
-          head_stride_key,
-          (int)hq,
-          (int)hk,
-          (int)head_size,
-          blocks_per_token);
-      break;
-  }
+  dispatch_rotary_launch<ROT, scalar_t>(
+      use_grid_2d,
+      grid2d,
+      grid1d,
+      block,
+      stream,
+      interleaved,
+      use_vec,
+      qk_aligned16,
+      cos_ptr,
+      sin_ptr,
+      q_ptr,
+      k_ptr,
+      (int)r,
+      embed_dim_for_rotation,
+      query_token_stride,
+      key_token_stride,
+      head_stride_query,
+      head_stride_key,
+      (int)hq,
+      (int)hk,
+      (int)head_size,
+      blocks_per_token);
 
   RuntimeDeviceCheck();
 }
 
 }  // namespace
 
+template <int ROT>
 struct RotaryEmbeddingCosSinKernel {
   static void run_q(
       const tvm::ffi::TensorView cos,
@@ -1075,11 +928,11 @@ struct RotaryEmbeddingCosSinKernel {
       bool interleaved) {
     const auto dt = query.dtype();
     if (host::is_type<half>(dt)) {
-      launch_rotary<half>(cos, sin, query, nullptr, head_size, interleaved);
+      launch_rotary<ROT, half>(cos, sin, query, nullptr, head_size, interleaved);
     } else if (host::is_type<nv_bfloat16>(dt)) {
-      launch_rotary<nv_bfloat16>(cos, sin, query, nullptr, head_size, interleaved);
+      launch_rotary<ROT, nv_bfloat16>(cos, sin, query, nullptr, head_size, interleaved);
     } else if (host::is_type<float>(dt)) {
-      launch_rotary<float>(cos, sin, query, nullptr, head_size, interleaved);
+      launch_rotary<ROT, float>(cos, sin, query, nullptr, head_size, interleaved);
     } else {
       host::Panic("Unsupported dtype for rotary_embedding_cos_sin");
     }
@@ -1094,11 +947,11 @@ struct RotaryEmbeddingCosSinKernel {
       bool interleaved) {
     const auto dt = query.dtype();
     if (host::is_type<half>(dt)) {
-      launch_rotary<half>(cos, sin, query, &key, head_size, interleaved);
+      launch_rotary<ROT, half>(cos, sin, query, &key, head_size, interleaved);
     } else if (host::is_type<nv_bfloat16>(dt)) {
-      launch_rotary<nv_bfloat16>(cos, sin, query, &key, head_size, interleaved);
+      launch_rotary<ROT, nv_bfloat16>(cos, sin, query, &key, head_size, interleaved);
     } else if (host::is_type<float>(dt)) {
-      launch_rotary<float>(cos, sin, query, &key, head_size, interleaved);
+      launch_rotary<ROT, float>(cos, sin, query, &key, head_size, interleaved);
     } else {
       host::Panic("Unsupported dtype for rotary_embedding_cos_sin");
     }

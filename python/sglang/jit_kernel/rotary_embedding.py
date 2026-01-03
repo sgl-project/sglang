@@ -1,10 +1,75 @@
 from __future__ import annotations
 
-from typing import Optional
+import logging
+from typing import TYPE_CHECKING, Optional
 
 import torch
 
 from sglang.jit_kernel.utils import cache_once, load_jit
+
+if TYPE_CHECKING:
+    from tvm_ffi.module import Module
+
+
+@cache_once
+def _jit_rotary_embedding_cos_sin_module(rot: int) -> Module:
+    # Compile one specialized template per rotary embed dim (ROT).
+    return load_jit(
+        "rotary_embedding_cos_sin",
+        str(rot),
+        cuda_files=["rotary_embedding_cos_sin.cuh"],
+        cuda_wrappers=[
+            (
+                "rotary_embedding_cos_sin_q",
+                f"RotaryEmbeddingCosSinKernel<{rot}>::run_q",
+            ),
+            (
+                "rotary_embedding_cos_sin_qk",
+                f"RotaryEmbeddingCosSinKernel<{rot}>::run_qk",
+            ),
+        ],
+    )
+
+
+@cache_once
+def can_use_rotary_embedding_cos_sin(rot: int) -> bool:
+    logger = logging.getLogger(__name__)
+    if rot <= 0:
+        logger.warning(f"Invalid rot={rot} for rotary_embedding_cos_sin")
+        return False
+    try:
+        _jit_rotary_embedding_cos_sin_module(rot)
+        return True
+    except Exception as e:
+        logger.warning(f"Failed to load JIT rotary_embedding_cos_sin (rot={rot}): {e}")
+        return False
+
+
+def rotary_embedding_cos_sin_q(
+    *,
+    rot: int,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    query: torch.Tensor,
+    head_size: int,
+    interleaved: bool,
+) -> None:
+    module = _jit_rotary_embedding_cos_sin_module(rot)
+    module.rotary_embedding_cos_sin_q(cos, sin, query, head_size, interleaved)
+
+
+def rotary_embedding_cos_sin_qk(
+    *,
+    rot: int,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    head_size: int,
+    interleaved: bool,
+) -> None:
+    module = _jit_rotary_embedding_cos_sin_module(rot)
+    module.rotary_embedding_cos_sin_qk(cos, sin, query, key, head_size, interleaved)
 
 
 def _resolve_interleaved(interleaved: Optional[bool], is_neox: Optional[bool]) -> bool:
@@ -17,18 +82,6 @@ def _resolve_interleaved(interleaved: Optional[bool], is_neox: Optional[bool]) -
     if interleaved is not None:
         return interleaved
     return True
-
-
-@cache_once
-def _jit_rotary_embedding_cos_sin_module():
-    return load_jit(
-        "rotary_embedding_cos_sin",
-        cuda_files=["rotary_embedding_cos_sin.cuh"],
-        cuda_wrappers=[
-            ("rotary_embedding_cos_sin_q", "RotaryEmbeddingCosSinKernel::run_q"),
-            ("rotary_embedding_cos_sin_qk", "RotaryEmbeddingCosSinKernel::run_qk"),
-        ],
-    )
 
 
 def rotary_embedding_cos_sin(
@@ -91,13 +144,11 @@ def rotary_embedding_cos_sin(
     if rot_dim <= 0:
         raise ValueError("cos/sin rot_dim must be > 0")
     if effective_interleaved:
-        # Pairwise layout: rotates 2*rot_dim elements.
         if 2 * rot_dim > head_size:
             raise ValueError(
                 f"rotate dim exceeds head_size for interleaved=True: 2*rot_dim={2*rot_dim} > head_size={head_size}"
             )
     else:
-        # Split-halves layout: kernel interprets cos/sin as [rot_dim] where embed_dim=rot_dim/2.
         if rot_dim % 2 != 0:
             raise ValueError(
                 f"non-interleaved requires even rot_dim (cos.shape[1]), got rot_dim={rot_dim}"
@@ -106,6 +157,8 @@ def rotary_embedding_cos_sin(
             raise ValueError(
                 f"rotate dim exceeds head_size for interleaved=False: rot_dim={rot_dim} > head_size={head_size}"
             )
+
+    embed_dim_for_rotation = rot_dim if effective_interleaved else (rot_dim // 2)
 
     def _as_3d(x: torch.Tensor, h: int) -> torch.Tensor:
         if x.dim() == 3:
@@ -124,7 +177,6 @@ def rotary_embedding_cos_sin(
         num_heads = int(query.shape[1] // head_size)
     q3 = _as_3d(query, num_heads)
     if not q3.is_contiguous():
-        # The CUDA kernel assumes contiguous [T, H, D] layout for fixed-stride addressing.
         raise ValueError("query must be contiguous (view must stay contiguous)")
 
     k3 = None
@@ -137,12 +189,22 @@ def rotary_embedding_cos_sin(
         if not k3.is_contiguous():
             raise ValueError("key must be contiguous (view must stay contiguous)")
 
-    module = _jit_rotary_embedding_cos_sin_module()
     if k3 is None:
-        module.rotary_embedding_cos_sin_q(
-            cos_to_use, sin_to_use, q3, head_size, effective_interleaved
+        rotary_embedding_cos_sin_q(
+            rot=embed_dim_for_rotation,
+            cos=cos_to_use,
+            sin=sin_to_use,
+            query=q3,
+            head_size=head_size,
+            interleaved=effective_interleaved,
         )
     else:
-        module.rotary_embedding_cos_sin_qk(
-            cos_to_use, sin_to_use, q3, k3, head_size, effective_interleaved
+        rotary_embedding_cos_sin_qk(
+            rot=embed_dim_for_rotation,
+            cos=cos_to_use,
+            sin=sin_to_use,
+            query=q3,
+            key=k3,
+            head_size=head_size,
+            interleaved=effective_interleaved,
         )

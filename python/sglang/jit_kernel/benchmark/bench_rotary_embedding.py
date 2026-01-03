@@ -90,10 +90,7 @@ def _bench_provider(
     quantiles: list[float],
     use_cudagraph: bool,
 ) -> tuple[float, float, float]:
-    """Bench a provider and return (median, min, max) in ms.
-
-    For FlashInfer, gracefully skip unsupported shapes by returning NaNs.
-    """
+    """Bench a provider and return (median, min, max) in ms."""
     try:
         return _bench(fn, quantiles=quantiles, use_cudagraph=use_cudagraph)
     except Exception as e:  # noqa: BLE001
@@ -218,14 +215,9 @@ def sglang_jit_rotary_cos_sin(
     rotary_embedding_cos_sin(cos, sin, q, k, head_size, interleaved)
 
 
-if HAS_FLASHINFER:
-    BASE_PROVIDER = "flashinfer_rope"
-    BASE_NAME = "FlashInfer RoPE"
-    BASE_STYLE = ("red", "-")
-else:
-    BASE_PROVIDER = "jit_cos_sin"
-    BASE_NAME = "SGL JIT (cos/sin)"
-    BASE_STYLE = ("blue", "-")
+BASE_PROVIDER = "jit_cos_sin"
+BASE_NAME = "SGL JIT (cos/sin)"
+BASE_STYLE = ("blue", "-")
 
 BASE_LINE_VALS = [BASE_PROVIDER]
 BASE_LINE_NAMES = [BASE_NAME]
@@ -234,11 +226,6 @@ BASE_STYLES = [BASE_STYLE]
 LINE_VALS = list(BASE_LINE_VALS)
 LINE_NAMES = list(BASE_LINE_NAMES)
 STYLES = list(BASE_STYLES)
-
-if "jit_cos_sin" not in LINE_VALS:
-    LINE_VALS.append("jit_cos_sin")
-    LINE_NAMES.append("SGL JIT (cos/sin)")
-    STYLES.append(("blue", "-"))
 
 if HAS_SGL_POS:
     LINE_VALS.append("aot_pos")
@@ -250,7 +237,7 @@ if HAS_VLLM:
     LINE_NAMES.append("vLLM (positions)")
     STYLES.append(("green", "-."))
 
-if HAS_FLASHINFER and "flashinfer_rope" not in LINE_VALS:
+if HAS_FLASHINFER:
     LINE_VALS.append("flashinfer_rope")
     LINE_NAMES.append("FlashInfer RoPE")
     STYLES.append(("red", "--"))
