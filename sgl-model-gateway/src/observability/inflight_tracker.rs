@@ -145,61 +145,51 @@ mod tests {
     use std::time::Duration;
 
     #[test]
-    fn test_register_deregister() {
-        let tracker = InFlightRequestTracker {
-            requests: DashMap::new(),
-        };
+    fn test_track_and_drop() {
+        let tracker = InFlightRequestTracker::new();
 
-        tracker.register(1);
-        tracker.register(2);
-        assert_eq!(tracker.len(), 2);
+        {
+            let _guard1 = tracker.track();
+            let _guard2 = tracker.track();
+            assert_eq!(tracker.len(), 2);
+        }
 
-        tracker.deregister(1);
-        assert_eq!(tracker.len(), 1);
-
-        tracker.deregister(2);
         assert_eq!(tracker.len(), 0);
     }
 
     #[test]
-    fn test_deregister_nonexistent() {
-        let tracker = InFlightRequestTracker {
-            requests: DashMap::new(),
-        };
+    fn test_guard_auto_deregister() {
+        let tracker = InFlightRequestTracker::new();
 
-        tracker.deregister(999);
+        let guard = tracker.track();
+        assert_eq!(tracker.len(), 1);
+
+        drop(guard);
         assert_eq!(tracker.len(), 0);
     }
 
     #[test]
     fn test_request_age_tracking() {
-        let tracker = InFlightRequestTracker {
-            requests: DashMap::new(),
-        };
+        let tracker = InFlightRequestTracker::new();
 
-        tracker.register(1);
+        let _guard = tracker.track();
         std::thread::sleep(Duration::from_millis(10));
 
-        let entry = tracker.requests.get(&1).unwrap();
+        let entry = tracker.requests.iter().next().unwrap();
         let age = entry.value().elapsed();
         assert!(age >= Duration::from_millis(10));
     }
 
     #[test]
     fn test_sample_empty_tracker() {
-        let tracker = InFlightRequestTracker {
-            requests: DashMap::new(),
-        };
-
+        let tracker = InFlightRequestTracker::new();
         let counts = tracker.compute_bucket_counts();
         assert_eq!(counts, [0, 0, 0, 0, 0, 0]);
     }
 
     #[test]
     fn test_sample_and_record_cumulative_buckets() {
-        let tracker = InFlightRequestTracker {
-            requests: DashMap::new(),
-        };
+        let tracker = InFlightRequestTracker::new();
 
         let now = Instant::now();
         tracker.insert_with_time(1, now);
@@ -220,9 +210,7 @@ mod tests {
 
     #[test]
     fn test_cumulative_bucket_boundary_values() {
-        let tracker = InFlightRequestTracker {
-            requests: DashMap::new(),
-        };
+        let tracker = InFlightRequestTracker::new();
 
         let now = Instant::now();
         tracker.insert_with_time(1, now - Duration::from_secs(30));
@@ -235,56 +223,44 @@ mod tests {
     }
 
     #[test]
-    fn test_concurrent_register_deregister() {
-        use std::sync::Arc;
+    fn test_concurrent_track() {
         use std::thread;
 
-        let tracker = Arc::new(InFlightRequestTracker {
-            requests: DashMap::new(),
-        });
-
+        let tracker = InFlightRequestTracker::new();
         let mut handles = vec![];
 
-        for i in 0..10u64 {
-            let tracker_clone = Arc::clone(&tracker);
+        for _ in 0..10 {
+            let tracker_clone = tracker.clone();
             handles.push(thread::spawn(move || {
-                for j in 0..100u64 {
-                    tracker_clone.register(i * 1000 + j);
+                let mut guards = vec![];
+                for _ in 0..100 {
+                    guards.push(tracker_clone.track());
                 }
+                guards
             }));
         }
 
-        for i in 0..5u64 {
-            let tracker_clone = Arc::clone(&tracker);
-            handles.push(thread::spawn(move || {
-                for j in 0..100u64 {
-                    tracker_clone.deregister(i * 1000 + j);
-                }
-            }));
-        }
+        let all_guards: Vec<_> = handles
+            .into_iter()
+            .flat_map(|h| h.join().unwrap())
+            .collect();
 
-        for handle in handles {
-            handle.join().expect("Thread should not panic");
-        }
-
-        let _ = tracker.len();
-        let counts = tracker.compute_bucket_counts();
-        let _ = counts[5];
+        assert_eq!(tracker.len(), 1000);
+        drop(all_guards);
+        assert_eq!(tracker.len(), 0);
     }
 
     #[test]
-    fn test_register_overwrites_existing() {
-        let tracker = InFlightRequestTracker {
-            requests: DashMap::new(),
-        };
+    fn test_unique_ids() {
+        let tracker = InFlightRequestTracker::new();
 
-        let now = Instant::now();
-        tracker.insert_with_time(1, now - Duration::from_secs(100));
-        tracker.register(1);
+        let guard1 = tracker.track();
+        let guard2 = tracker.track();
+        let guard3 = tracker.track();
 
-        assert_eq!(tracker.len(), 1);
-        let entry = tracker.requests.get(&1).unwrap();
-        assert!(entry.value().elapsed() < Duration::from_secs(1));
+        assert_ne!(guard1.request_id, guard2.request_id);
+        assert_ne!(guard2.request_id, guard3.request_id);
+        assert_eq!(tracker.len(), 3);
     }
 }
 
