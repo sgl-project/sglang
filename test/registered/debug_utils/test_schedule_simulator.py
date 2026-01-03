@@ -11,7 +11,6 @@ from sglang.srt.debug_utils.schedule_simulator import (
     FIFOScheduler,
     GPUState,
     RandomRouter,
-    RequestStage,
     RoundRobinRouter,
     SimRequest,
     SimulationResult,
@@ -29,44 +28,17 @@ from sglang.test.test_utils import CustomTestCase
 class TestSimRequest(CustomTestCase):
     def test_basic(self):
         req = SimRequest(request_id="r1", input_len=100, output_len=50)
-        self.assertEqual(req.stage, RequestStage.PREFILL)
         self.assertEqual(req.decoded_tokens, 0)
         self.assertEqual(req.seq_len(), 100)
         self.assertFalse(req.is_finished())
 
-    def test_seq_len_decode(self):
-        req = SimRequest(
-            request_id="r1",
-            input_len=100,
-            output_len=50,
-            stage=RequestStage.DECODE,
-            decoded_tokens=10,
-        )
+    def test_seq_len_with_decoded(self):
+        req = SimRequest(request_id="r1", input_len=100, output_len=50, decoded_tokens=10)
         self.assertEqual(req.seq_len(), 110)
 
     def test_is_finished(self):
-        req = SimRequest(
-            request_id="r1",
-            input_len=100,
-            output_len=50,
-            stage=RequestStage.DECODE,
-            decoded_tokens=50,
-        )
+        req = SimRequest(request_id="r1", input_len=100, output_len=50, decoded_tokens=50)
         self.assertTrue(req.is_finished())
-
-    def test_copy(self):
-        req = SimRequest(
-            request_id="r1",
-            input_len=100,
-            output_len=50,
-            stage=RequestStage.DECODE,
-            decoded_tokens=10,
-        )
-        req_copy = req.copy()
-        self.assertEqual(req_copy.request_id, req.request_id)
-        self.assertEqual(req_copy.input_len, req.input_len)
-        req_copy.decoded_tokens = 20
-        self.assertEqual(req.decoded_tokens, 10)
 
 
 class TestGPUState(CustomTestCase):
@@ -83,13 +55,7 @@ class TestGPUState(CustomTestCase):
         gpu = GPUState(gpu_id=0, max_total_tokens=10000)
         gpu.running_requests = [
             SimRequest(request_id="r1", input_len=100, output_len=50),
-            SimRequest(
-                request_id="r2",
-                input_len=200,
-                output_len=100,
-                stage=RequestStage.DECODE,
-                decoded_tokens=10,
-            ),
+            SimRequest(request_id="r2", input_len=200, output_len=100, decoded_tokens=10),
         ]
         self.assertEqual(gpu.total_seq_len(), 100 + 210)
 

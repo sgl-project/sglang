@@ -3,13 +3,13 @@ from sglang.srt.debug_utils.schedule_simulator.data_source import (
     load_from_request_logger,
 )
 from sglang.srt.debug_utils.schedule_simulator.entrypoint import create_arg_parser, main
-from sglang.srt.debug_utils.schedule_simulator.gpu_state import GPUState
+from sglang.srt.debug_utils.schedule_simulator.gpu_state import GPUState, StepRecord
 from sglang.srt.debug_utils.schedule_simulator.metrics import (
     AttentionBalancednessRecorder,
     BatchSizeBalancednessRecorder,
     MetricRecorder,
 )
-from sglang.srt.debug_utils.schedule_simulator.request import RequestStage, SimRequest
+from sglang.srt.debug_utils.schedule_simulator.request import SimRequest
 from sglang.srt.debug_utils.schedule_simulator.routers import (
     RandomRouter,
     RoundRobinRouter,
@@ -22,12 +22,10 @@ from sglang.srt.debug_utils.schedule_simulator.schedulers import (
 from sglang.srt.debug_utils.schedule_simulator.simulator import (
     SimulationResult,
     Simulator,
-    StepRecord,
 )
 
 __all__ = [
     "SimRequest",
-    "RequestStage",
     "GPUState",
     "Simulator",
     "SimulationResult",
