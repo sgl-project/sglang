@@ -3020,8 +3020,7 @@ class ServerArgs:
             nargs="+",
             default=ServerArgs.log_requests_target,
             help="Target(s) for request logging: 'stdout' and/or directory path(s) for file output. "
-            "Can specify multiple targets, e.g., '--log-requests-target stdout /my/path'. "
-            "File names are '{hostname}_{rank}.jsonl' with hourly rotation.",
+            "Can specify multiple targets, e.g., '--log-requests-target stdout /my/path'. ",
         )
         parser.add_argument(
             "--crash-dump-folder",
