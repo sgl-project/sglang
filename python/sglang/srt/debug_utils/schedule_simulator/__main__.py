@@ -119,7 +119,7 @@ def main(args: argparse.Namespace) -> pl.DataFrame:
             range_ratio=args.synth_range_ratio,
             seed=args.synth_seed,
         )
-        print(f"Generated {len(requests)} synthetic requests (input_len={args.synth_input_len}, output_len={args.synth_output_len}, range_ratio={args.synth_range_ratio})")
+        print(f"Generated {len(requests)} synthetic requests (synth_input_len={args.synth_input_len}, synth_output_len={args.synth_output_len}, synth_range_ratio={args.synth_range_ratio})")
 
     if args.router == "random":
         router = RandomRouter()
