@@ -2,6 +2,8 @@ import argparse
 import glob
 from pathlib import Path
 
+import tabulate
+
 from sglang.test.ci.ci_utils import TestFile, run_unittest_files
 
 # NOTE: please sort the test cases alphabetically by the test file name
@@ -538,7 +540,25 @@ def main():
     if args.auto_partition_size:
         files = auto_partition(files, args.auto_partition_id, args.auto_partition_size)
 
-    print("The running tests are ", [f.name for f in files])
+    # Print test info at beginning (similar to test/run_suite.py pretty_print_tests)
+    if args.auto_partition_size:
+        partition_info = (
+            f"{args.auto_partition_id + 1}/{args.auto_partition_size} "
+            f"(0-based id={args.auto_partition_id})"
+        )
+    else:
+        partition_info = "full"
+
+    headers = ["Suite", "Partition"]
+    rows = [[args.suite, partition_info]]
+    msg = tabulate.tabulate(rows, headers=headers, tablefmt="psql") + "\n"
+
+    total_est_time = sum(f.estimated_time for f in files)
+    msg += f"✅ Enabled {len(files)} test(s) (est total {total_est_time:.1f}s):\n"
+    for f in files:
+        msg += f"  - {f.name} (est_time={f.estimated_time})\n"
+
+    print(msg, flush=True)
 
     # Add extra timeout when retry is enabled
     timeout = args.timeout_per_file
@@ -553,6 +573,14 @@ def main():
         args.max_attempts,
         args.retry_wait_seconds,
     )
+
+    # Print tests again at the end for visibility
+    msg = "\n" + tabulate.tabulate(rows, headers=headers, tablefmt="psql") + "\n"
+    msg += f"✅ Executed {len(files)} test(s) (est total {total_est_time:.1f}s):\n"
+    for f in files:
+        msg += f"  - {f.name} (est_time={f.estimated_time})\n"
+    print(msg, flush=True)
+
     exit(exit_code)
 
 
