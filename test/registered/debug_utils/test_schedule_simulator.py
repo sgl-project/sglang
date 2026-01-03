@@ -71,7 +71,7 @@ class TestSimRequest(CustomTestCase):
 
 class TestGPUState(CustomTestCase):
     def test_batch_size(self):
-        gpu = GPUState(gpu_id=0)
+        gpu = GPUState(gpu_id=0, max_total_tokens=10000)
         self.assertEqual(gpu.batch_size(), 0)
         gpu.running_requests = [
             SimRequest(request_id="r1", input_len=100, output_len=50),
@@ -80,7 +80,7 @@ class TestGPUState(CustomTestCase):
         self.assertEqual(gpu.batch_size(), 2)
 
     def test_total_seq_len(self):
-        gpu = GPUState(gpu_id=0)
+        gpu = GPUState(gpu_id=0, max_total_tokens=10000)
         gpu.running_requests = [
             SimRequest(request_id="r1", input_len=100, output_len=50),
             SimRequest(
@@ -97,14 +97,14 @@ class TestGPUState(CustomTestCase):
 class TestRouters(CustomTestCase):
     def test_round_robin(self):
         router = RoundRobinRouter()
-        gpu_states = [GPUState(gpu_id=i) for i in range(4)]
+        gpu_states = [GPUState(gpu_id=i, max_total_tokens=10000) for i in range(4)]
         req = SimRequest(request_id="r1", input_len=100, output_len=50)
         results = [router.route(req, gpu_states) for _ in range(8)]
         self.assertEqual(results, [0, 1, 2, 3, 0, 1, 2, 3])
 
     def test_random_router(self):
         router = RandomRouter()
-        gpu_states = [GPUState(gpu_id=i) for i in range(4)]
+        gpu_states = [GPUState(gpu_id=i, max_total_tokens=10000) for i in range(4)]
         req = SimRequest(request_id="r1", input_len=100, output_len=50)
         results = [router.route(req, gpu_states) for _ in range(100)]
         self.assertTrue(all(0 <= r < 4 for r in results))
@@ -113,39 +113,37 @@ class TestRouters(CustomTestCase):
 class TestFIFOScheduler(CustomTestCase):
     def test_runs_pending_requests(self):
         scheduler = FIFOScheduler()
-        gpu = GPUState(gpu_id=0)
+        gpu = GPUState(gpu_id=0, max_total_tokens=10000)
         gpu.pending_requests = [
             SimRequest(request_id=f"r{i}", input_len=100, output_len=50)
             for i in range(3)
         ]
-        scheduler.schedule(gpu, max_total_tokens=10000)
+        scheduler.schedule(gpu)
         self.assertEqual(len(gpu.running_requests), 3)
         self.assertEqual(len(gpu.pending_requests), 0)
 
     def test_respects_token_limit(self):
-        # max_total_tokens=250, each req has seq_len=100, so only 2 can run
         scheduler = FIFOScheduler()
-        gpu = GPUState(gpu_id=0)
+        gpu = GPUState(gpu_id=0, max_total_tokens=250)
         gpu.pending_requests = [
             SimRequest(request_id=f"r{i}", input_len=100, output_len=50)
             for i in range(5)
         ]
-        scheduler.schedule(gpu, max_total_tokens=250)
+        scheduler.schedule(gpu)
         self.assertEqual(len(gpu.running_requests), 2)
         self.assertEqual(len(gpu.pending_requests), 3)
 
     def test_evicts_lifo_when_over_budget(self):
-        # Running requests exceed budget, should evict LIFO
         scheduler = FIFOScheduler()
-        gpu = GPUState(gpu_id=0)
+        gpu = GPUState(gpu_id=0, max_total_tokens=250)
         gpu.running_requests = [
             SimRequest(request_id=f"r{i}", input_len=100, output_len=50)
             for i in range(3)
         ]  # 300 tokens total
-        scheduler.schedule(gpu, max_total_tokens=250)
+        scheduler.schedule(gpu)
         self.assertEqual(len(gpu.running_requests), 2)
         self.assertEqual(len(gpu.pending_requests), 1)
-        self.assertEqual(gpu.pending_requests[0].request_id, "r2")  # LIFO eviction
+        self.assertEqual(gpu.pending_requests[0].request_id, "r2")
 
 
 class TestMetrics(CustomTestCase):

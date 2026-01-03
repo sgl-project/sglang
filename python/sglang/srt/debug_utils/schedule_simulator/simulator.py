@@ -79,8 +79,8 @@ class Simulator:
         for gpu in self.gpu_states:
             self.scheduler.schedule(gpu)
             assert gpu.is_valid(), (
-                f"GPU{gpu.gpu_id} invalid after scheduling: "
-                f"total_seq_len={gpu.total_seq_len()} > max={gpu.max_total_tokens}"
+                f"GPU{gpu.gpu_id} invalid after scheduling "
+                f"({gpu.total_seq_len()=}, {gpu.max_total_tokens=})"
             )
 
     def _execute_step(self) -> None:
