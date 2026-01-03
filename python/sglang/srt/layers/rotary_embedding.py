@@ -16,6 +16,7 @@ from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
+    get_device,
     is_cpu,
     is_cuda,
     is_hip,
@@ -817,7 +818,7 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
         beta_slow: int = 1,
         mscale: float = 1,
         mscale_all_dim: float = 0,
-        device: Optional[str] = "cuda" if not _is_npu else "npu",
+        device: Optional[str] = None,
     ) -> None:
         self.scaling_factor = scaling_factor
         self.extrapolation_factor = extrapolation_factor
@@ -830,11 +831,14 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
             / yarn_get_mscale(self.scaling_factor, float(mscale_all_dim))
             * attn_factor
         )
+        if device is not None:
+            self.device = device
+        else:
+            self.device = get_device()
         self.cos_cached_total = None
         self.sin_cached_total = None
         self.cos_cached = None
         self.sin_cached = None
-        self.device = device
         super().__init__(
             head_size, rotary_dim, max_position_embeddings, base, is_neox_style, dtype
         )
