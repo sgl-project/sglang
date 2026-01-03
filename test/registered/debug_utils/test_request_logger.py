@@ -1,5 +1,9 @@
+import glob
 import io
 import json
+import os
+import tempfile
+import time
 import unittest
 
 import requests
@@ -90,6 +94,68 @@ class TestRequestLoggerJson(BaseTestRequestLogger, CustomTestCase):
 
         self.assertTrue(received_found, "request.received event not found in logs")
         self.assertTrue(finished_found, "request.finished event not found in logs")
+
+
+class TestRequestLoggerFile(CustomTestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.temp_dir = tempfile.mkdtemp()
+        cls.process = popen_launch_server(
+            "Qwen/Qwen3-0.6B",
+            DEFAULT_URL_FOR_TEST,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=[
+                "--log-requests",
+                "--log-requests-level",
+                "2",
+                "--log-requests-format",
+                "json",
+                "--log-requests-target",
+                cls.temp_dir,
+                "--skip-server-warmup",
+            ],
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        kill_process_tree(cls.process.pid)
+
+    def test_file_logging(self):
+        response = requests.post(
+            DEFAULT_URL_FOR_TEST + "/generate",
+            json={
+                "text": "Hello",
+                "sampling_params": {"max_new_tokens": 8, "temperature": 0},
+            },
+            timeout=30,
+        )
+        self.assertEqual(response.status_code, 200)
+
+        time.sleep(1)
+
+        jsonl_files = glob.glob(os.path.join(self.temp_dir, "*.jsonl"))
+        self.assertGreater(len(jsonl_files), 0, "No JSONL files found in temp directory")
+
+        received_found = False
+        finished_found = False
+        for jsonl_file in jsonl_files:
+            with open(jsonl_file, "r") as f:
+                for line in f:
+                    if not line.strip():
+                        continue
+                    data = json.loads(line)
+                    if data.get("event") == "request.received":
+                        self.assertIn("rid", data)
+                        self.assertIn("obj", data)
+                        received_found = True
+                    elif data.get("event") == "request.finished":
+                        self.assertIn("rid", data)
+                        self.assertIn("obj", data)
+                        self.assertIn("out", data)
+                        finished_found = True
+
+        self.assertTrue(received_found, "request.received event not found in log files")
+        self.assertTrue(finished_found, "request.finished event not found in log files")
 
 
 if __name__ == "__main__":

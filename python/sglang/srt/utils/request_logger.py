@@ -16,9 +16,14 @@ from __future__ import annotations
 import dataclasses
 import json
 import logging
+import os
+import socket
 from datetime import datetime
 from functools import lru_cache
+from logging.handlers import TimedRotatingFileHandler
 from typing import TYPE_CHECKING, Any, Optional, Set, Tuple, Union
+
+import torch.distributed as dist
 
 from sglang.srt.environ import envs
 from sglang.srt.utils.common import get_bool_env_var
@@ -41,20 +46,52 @@ class RequestLogger:
         log_requests: bool,
         log_requests_level: int,
         log_requests_format: str,
+        log_requests_target: Optional[str] = None,
     ):
         self.log_requests = log_requests
         self.log_requests_level = log_requests_level
         self.log_requests_format = log_requests_format
+        self.log_requests_target = log_requests_target
         self.metadata: Tuple[Optional[int], Optional[Set[str]], Optional[Set[str]]] = (
             self._compute_metadata()
         )
         self.log_exceeded_ms = envs.SGLANG_LOG_REQUEST_EXCEEDED_MS.get()
+        self._file_logger = self._setup_file_logger()
+
+    def _setup_file_logger(self) -> Optional[logging.Logger]:
+        if (
+            self.log_requests_target is None
+            or self.log_requests_target.lower() == "stdout"
+        ):
+            return None
+
+        os.makedirs(self.log_requests_target, exist_ok=True)
+
+        hostname = socket.gethostname()
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        filename = os.path.join(
+            self.log_requests_target, f"{hostname}_{rank}.jsonl"
+        )
+
+        file_logger = logging.getLogger(f"{__name__}.file.{hostname}_{rank}")
+        file_logger.setLevel(logging.INFO)
+        file_logger.propagate = False
+
+        if not file_logger.handlers:
+            handler = TimedRotatingFileHandler(
+                filename, when="H", backupCount=0, encoding="utf-8"
+            )
+            handler.setFormatter(logging.Formatter("%(message)s"))
+            file_logger.addHandler(handler)
+
+        return file_logger
 
     def configure(
         self,
         log_requests: Optional[bool] = None,
         log_requests_level: Optional[int] = None,
         log_requests_format: Optional[str] = None,
+        log_requests_target: Optional[str] = None,
     ) -> None:
         if log_requests is not None:
             self.log_requests = log_requests
@@ -62,7 +99,22 @@ class RequestLogger:
             self.log_requests_level = log_requests_level
         if log_requests_format is not None:
             self.log_requests_format = log_requests_format
+        if log_requests_target is not None:
+            self.log_requests_target = log_requests_target
+            self._file_logger = self._setup_file_logger()
         self.metadata = self._compute_metadata()
+
+    def _log_json(self, event: str, data: dict) -> None:
+        log_data = {
+            "timestamp": datetime.now().isoformat(),
+            "event": event,
+            **data,
+        }
+        msg = json.dumps(log_data, ensure_ascii=False)
+        if self._file_logger is not None:
+            self._file_logger.info(msg)
+        else:
+            _json_logger.info(msg)
 
     def log_received_request(
         self, obj: Union["GenerateReqInput", "EmbeddingReqInput"], tokenizer: Any = None
@@ -76,7 +128,7 @@ class RequestLogger:
                 "rid": obj.rid,
                 "obj": _transform_data_for_logging(obj, max_length, skip_names),
             }
-            _log_json("request.received", log_data)
+            self._log_json("request.received", log_data)
         else:
             logger.info(
                 f"Receive: obj={_dataclass_to_string_truncated(obj, max_length, skip_names=skip_names)}"
@@ -116,7 +168,7 @@ class RequestLogger:
                 log_data["out"] = _transform_data_for_logging(
                     out, max_length, out_skip_names
                 )
-            _log_json("request.finished", log_data)
+            self._log_json("request.finished", log_data)
         else:
             if is_multimodal_gen:
                 msg = f"Finish: obj={_dataclass_to_string_truncated(obj, max_length, skip_names=skip_names)}"

@@ -339,6 +339,7 @@ class ServerArgs:
     log_requests: bool = False
     log_requests_level: int = 2
     log_requests_format: str = "text"
+    log_requests_target: Optional[str] = None
     crash_dump_folder: Optional[str] = None
     show_time_cost: bool = False
     enable_metrics: bool = False
@@ -3012,6 +3013,13 @@ class ServerArgs:
             default=ServerArgs.log_requests_format,
             choices=["text", "json"],
             help="Format for request logging: 'text' (human-readable) or 'json' (structured)",
+        )
+        parser.add_argument(
+            "--log-requests-target",
+            type=str,
+            default=ServerArgs.log_requests_target,
+            help="Target for request logging: 'stdout' or a directory path for file output. "
+            "File names are '{hostname}_{rank}.jsonl' with hourly rotation.",
         )
         parser.add_argument(
             "--crash-dump-folder",
