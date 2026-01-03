@@ -22,17 +22,6 @@ pub struct InFlightRequestTracker {
     sampler: OnceLock<PeriodicTask>,
 }
 
-pub struct InFlightGuard {
-    tracker: Arc<InFlightRequestTracker>,
-    request_id: u64,
-}
-
-impl Drop for InFlightGuard {
-    fn drop(&mut self) {
-        self.tracker.requests.remove(&self.request_id);
-    }
-}
-
 impl InFlightRequestTracker {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
@@ -93,6 +82,17 @@ impl InFlightRequestTracker {
         for (i, &label) in AGE_BUCKET_LABELS.iter().enumerate() {
             Metrics::set_inflight_request_age_count(label, counts[i]);
         }
+    }
+}
+
+pub struct InFlightGuard {
+    tracker: Arc<InFlightRequestTracker>,
+    request_id: u64,
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        self.tracker.requests.remove(&self.request_id);
     }
 }
 

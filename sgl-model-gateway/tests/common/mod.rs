@@ -66,6 +66,83 @@ impl WorkerTestContext {
         self.worker_urls.first().map(|s| s.as_str())
     }
 
+    pub async fn make_request(
+        &self,
+        endpoint: &str,
+        body: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        let client = reqwest::Client::new();
+        let worker_url = self
+            .first_worker_url()
+            .ok_or_else(|| "No workers available".to_string())?;
+
+        let response = client
+            .post(format!("{}{}", worker_url, endpoint))
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| format!("Request failed: {}", e))?;
+
+        if !response.status().is_success() {
+            return Err(format!("Request failed with status: {}", response.status()));
+        }
+
+        response
+            .json::<serde_json::Value>()
+            .await
+            .map_err(|e| format!("Failed to parse response: {}", e))
+    }
+
+    pub async fn make_streaming_request(
+        &self,
+        endpoint: &str,
+        body: serde_json::Value,
+    ) -> Result<Vec<String>, String> {
+        use futures_util::StreamExt;
+
+        let client = reqwest::Client::new();
+        let worker_url = self
+            .first_worker_url()
+            .ok_or_else(|| "No workers available".to_string())?;
+
+        let response = client
+            .post(format!("{}{}", worker_url, endpoint))
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| format!("Request failed: {}", e))?;
+
+        if !response.status().is_success() {
+            return Err(format!("Request failed with status: {}", response.status()));
+        }
+
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+
+        if !content_type.contains("text/event-stream") {
+            return Err("Response is not a stream".to_string());
+        }
+
+        let mut stream = response.bytes_stream();
+        let mut events = Vec::new();
+
+        while let Some(chunk) = stream.next().await {
+            if let Ok(bytes) = chunk {
+                let text = String::from_utf8_lossy(&bytes);
+                for line in text.lines() {
+                    if let Some(stripped) = line.strip_prefix("data: ") {
+                        events.push(stripped.to_string());
+                    }
+                }
+            }
+        }
+
+        Ok(events)
+    }
+
     pub async fn shutdown(mut self) {
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
         for worker in &mut self.workers {
