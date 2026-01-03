@@ -20,6 +20,9 @@ from sglang.srt.debug_utils.schedule_simulator import (
 from sglang.test.test_utils import CustomTestCase
 
 
+# ==================== Non-E2E Tests ====================
+
+
 class TestSimRequest(CustomTestCase):
     def test_basic(self):
         req = SimRequest(request_id="r1", input_len=100, output_len=50)
@@ -407,6 +410,9 @@ class TestSimulator(CustomTestCase):
         output = captured.getvalue()
         self.assertIn("req0", output)
         self.assertIn("req1", output)
+
+
+# ==================== E2E Tests ====================
 
 
 class TestCLI(CustomTestCase):
