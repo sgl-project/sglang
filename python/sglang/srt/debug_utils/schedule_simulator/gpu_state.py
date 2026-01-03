@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import List
+from typing import List, Optional
 
 from sglang.srt.debug_utils.schedule_simulator.request import SimRequest
 
@@ -25,21 +25,14 @@ class GPUState:
     def batch_size(self) -> int:
         return len(self.running_requests)
 
-    def total_seq_len(self) -> int:
+    def total_seq_len(self, extra_reqs: Optional[List[SimRequest]] = None) -> int:
         seen = set()
         total = 0
-        for req in self.running_requests:
+        for req in self.running_requests + (extra_reqs or []):
             dup = req.group_id in seen
             total += req.seq_len() - (req.prefix_len if dup else 0)
             seen.add(req.group_id)
         return total
-
-    def seq_len_if_add(self, req: SimRequest) -> int:
-        if req.group_id and any(
-            r.group_id == req.group_id for r in self.running_requests
-        ):
-            return req.seq_len() - req.prefix_len
-        return req.seq_len()
 
     def is_valid(self) -> bool:
         return self.total_seq_len() <= self.max_total_tokens
