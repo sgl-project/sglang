@@ -26,15 +26,12 @@ class GPUState:
         return len(self.running_requests)
 
     def total_seq_len(self) -> int:
-        seen_groups: set = set()
+        seen = set()
         total = 0
         for req in self.running_requests:
-            if req.group_id and req.group_id in seen_groups:
-                total += req.seq_len() - req.prefix_len
-            else:
-                total += req.seq_len()
-                if req.group_id:
-                    seen_groups.add(req.group_id)
+            dup = req.group_id in seen
+            total += req.seq_len() - (req.prefix_len if dup else 0)
+            seen.add(req.group_id)
         return total
 
     def seq_len_if_add(self, req: SimRequest) -> int:
