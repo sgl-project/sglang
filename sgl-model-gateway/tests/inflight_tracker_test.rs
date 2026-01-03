@@ -97,16 +97,8 @@ async fn test_inflight_request_appears_in_bucket() {
     );
 
     let buckets = tracker_clone.compute_bucket_counts();
-    assert!(
-        buckets[0] > 0,
-        "le=30 bucket should have requests (age < 30s): got {}",
-        buckets[0]
-    );
-    assert!(
-        buckets[5] > 0,
-        "+Inf bucket should have requests: got {}",
-        buckets[5]
-    );
+    assert!(buckets[0] > 0, "first bucket should have requests");
+    assert!(buckets[5] > 0, "+Inf bucket should have requests");
 
     let resp = response_future.await.unwrap().unwrap();
     assert_eq!(resp.status(), StatusCode::OK);

@@ -719,7 +719,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     if config.prometheus_config.is_some() {
         app_context
             .inflight_tracker
-            .start_sampler(Duration::from_secs(1));
+            .start_sampler(Duration::from_secs(20));
     }
 
     let weak_context = Arc::downgrade(&app_context);

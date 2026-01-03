@@ -12,8 +12,11 @@ use tracing::debug;
 
 use super::metrics::Metrics;
 
-const AGE_BUCKET_BOUNDS: &[u64] = &[30, 60, 180, 300, 600];
-const AGE_BUCKET_LABELS: &[&str] = &["30", "60", "180", "300", "600", "+Inf"];
+// Age buckets in seconds: 30s, 1m, 3m, 5m, 10m, 20m, 1h, 2h, 4h, 8h, 24h
+const AGE_BUCKET_BOUNDS: &[u64] = &[30, 60, 180, 300, 600, 1200, 3600, 7200, 14400, 28800, 86400];
+const AGE_BUCKET_LABELS: &[&str] = &[
+    "30", "60", "180", "300", "600", "1200", "3600", "7200", "14400", "28800", "86400", "+Inf",
+];
 
 pub struct InFlightRequestTracker {
     requests: DashMap<u64, Instant>,
@@ -71,9 +74,9 @@ impl InFlightRequestTracker {
         self.requests.is_empty()
     }
 
-    pub fn compute_bucket_counts(&self) -> [usize; 6] {
+    pub fn compute_bucket_counts(&self) -> [usize; 12] {
         let now = Instant::now();
-        let mut counts = [0usize; 6];
+        let mut counts = [0usize; 12];
 
         for entry in self.requests.iter() {
             let age_secs = now.duration_since(*entry.value()).as_secs();
@@ -82,7 +85,7 @@ impl InFlightRequestTracker {
                     counts[i] += 1;
                 }
             }
-            counts[5] += 1;
+            counts[11] += 1; // +Inf bucket
         }
 
         counts
