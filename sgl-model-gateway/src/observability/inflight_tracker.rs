@@ -29,6 +29,10 @@ impl InFlightRequestTracker {
         tracker
     }
 
+    pub fn start_sampler(self: &Arc<Self>, sample_interval: Duration) {
+        self.clone().spawn_sampler(sample_interval);
+    }
+
     pub fn register(&self, request_id: u64) {
         self.requests.insert(request_id, Instant::now());
     }
