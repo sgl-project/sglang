@@ -87,6 +87,8 @@ class Scheduler:
         # whether we've send the necessary warmup reqs
         self.warmed_up = False
 
+        self.prepare_server_warmup_reqs()
+
     def _handle_set_lora(self, reqs: List[Any]) -> OutputBatch:
         # TODO: return set status
         # TODO: return with SetLoRAResponse or something more appropriate
@@ -131,7 +133,27 @@ class Scheduler:
 
         return [item]
 
-    def process_received_reqs_with_warmup(
+    def prepare_server_warmup_reqs(self):
+        if (
+            self.server_args.warmup
+            and not self.warmed_up
+            and self.server_args.warmup_resolutions is not None
+        ):
+            # insert warmup reqs constructed with each warmup-resolution
+            for resolution in self.server_args.warmup_resolutions:
+                width, height = _parse_size(resolution)
+                req = Req(
+                    data_type=self.server_args.pipeline_config.task_type.data_type(),
+                    width=width,
+                    height=height,
+                    prompt="",
+                    is_warmup=True,
+                )
+                self.waiting_queue.append((None, req))
+            # if server is warmed-up, set this flag to avoid req-based warmup
+            self.warmed_up = True
+
+    def process_received_reqs_with_req_based_warmup(
         self, recv_reqs: List[tuple[bytes, Any]]
     ) -> List[tuple[bytes, Any]]:
         if (
@@ -158,28 +180,6 @@ class Scheduler:
         """
         For non-main schedulers, reqs are broadcasted from main using broadcast_pyobj
         """
-
-        recv_reqs = []
-        if (
-            self.server_args.warmup
-            and not self.warmed_up
-            and self.server_args.warmup_resolutions is not None
-        ):
-            # insert warmup reqs constructed with each warmup-resolution
-            for resolution in self.server_args.warmup_resolutions:
-                width, height = _parse_size(resolution)
-                req = Req(
-                    data_type=self.server_args.pipeline_config.task_type.data_type(),
-                    width=width,
-                    height=height,
-                    prompt="",
-                    is_warmup=True,
-                )
-                recv_reqs.append((None, req))
-            # if server is warmed-up, set this flag to avoid req-based warmup
-            self.warmed_up = True
-            return recv_reqs
-
         if self.receiver is not None:
             try:
                 try:
@@ -228,8 +228,6 @@ class Scheduler:
 
         assert recv_reqs is not None
 
-        recv_reqs = self.process_received_reqs_with_warmup(recv_reqs)
-
         return recv_reqs
 
     def event_loop(self) -> None:
@@ -246,7 +244,7 @@ class Scheduler:
             # 1: receive requests
             try:
                 new_reqs = self.recv_reqs()
-                # after processing input reqs
+                new_reqs = self.process_received_reqs_with_req_based_warmup(new_reqs)
                 self.waiting_queue.extend(new_reqs)
             except Exception as e:
                 logger.error(
