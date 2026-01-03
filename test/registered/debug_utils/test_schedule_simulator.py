@@ -443,7 +443,14 @@ class TestSimulator(CustomTestCase):
 
 
 class TestMain(CustomTestCase):
-    def test_main_returns_dataframe_with_expected_rows(self):
+    def _run_and_verify(
+        self,
+        synth_num_requests: int,
+        synth_output_len: int,
+        num_gpus: int,
+        max_running: int,
+        expected_rows: list,
+    ):
         import argparse
         import io
         import sys
@@ -452,21 +459,18 @@ class TestMain(CustomTestCase):
 
         from sglang.srt.debug_utils.schedule_simulator.entrypoint import main
 
-        # 4 requests with output_len=2, distributed across 2 GPUs via round_robin
-        # r0 -> GPU0, r1 -> GPU1, r2 -> GPU0, r3 -> GPU1
-        # Each request needs 2 decode steps to complete
         args = argparse.Namespace(
             input=None,
             synthetic=True,
-            synth_num_requests=4,
+            synth_num_requests=synth_num_requests,
             synth_input_len=10,
-            synth_output_len=2,
+            synth_output_len=synth_output_len,
             synth_range_ratio=1.0,
             synth_seed=42,
-            num_gpus=2,
+            num_gpus=num_gpus,
             router="round_robin",
             scheduler="fifo",
-            max_running=256,
+            max_running=max_running,
             output=None,
             log_level=0,
         )
@@ -479,112 +483,12 @@ class TestMain(CustomTestCase):
         finally:
             sys.stdout = old_stdout
 
-        self.assertIsInstance(df, pl.DataFrame)
         self.assertEqual(set(df.columns), {
             "step", "gpu_id", "running_count", "pending_count",
             "total_seq_len", "running_req_ids", "pending_req_ids"
         })
-
-        # Expected behavior:
-        # step 0: GPU0 has r0,r2 running (2 reqs), GPU1 has r1,r3 running (2 reqs)
-        #         After decode, each has decoded_tokens=1, not finished yet
-        # step 1: All requests finish (decoded_tokens=2 == output_len)
-        #         GPU0 has 0 running, GPU1 has 0 running
-        expected_rows = [
-            {"step": 0, "gpu_id": 0, "running_count": 2, "pending_count": 0},
-            {"step": 0, "gpu_id": 1, "running_count": 2, "pending_count": 0},
-            {"step": 1, "gpu_id": 0, "running_count": 0, "pending_count": 0},
-            {"step": 1, "gpu_id": 1, "running_count": 0, "pending_count": 0},
-        ]
-
         self.assertEqual(len(df), len(expected_rows))
-        for expected in expected_rows:
-            row = df.filter(
-                (pl.col("step") == expected["step"]) &
-                (pl.col("gpu_id") == expected["gpu_id"])
-            )
-            self.assertEqual(len(row), 1, f"Expected exactly one row for step={expected['step']}, gpu_id={expected['gpu_id']}")
-            self.assertEqual(row["running_count"][0], expected["running_count"])
-            self.assertEqual(row["pending_count"][0], expected["pending_count"])
 
-    def test_main_with_queuing_and_multiple_waves(self):
-        """Test a more complex scenario with request queuing and multiple completion waves."""
-        import argparse
-        import io
-        import sys
-
-        import polars as pl
-
-        from sglang.srt.debug_utils.schedule_simulator.entrypoint import main
-
-        # 8 requests with output_len=3, 2 GPUs, max_running=2
-        # This creates queuing: each GPU gets 4 requests but can only run 2 at a time
-        # Round-robin: r0,r2,r4,r6 -> GPU0; r1,r3,r5,r7 -> GPU1
-        args = argparse.Namespace(
-            input=None,
-            synthetic=True,
-            synth_num_requests=8,
-            synth_input_len=10,
-            synth_output_len=3,
-            synth_range_ratio=1.0,
-            synth_seed=42,
-            num_gpus=2,
-            router="round_robin",
-            scheduler="fifo",
-            max_running=2,
-            output=None,
-            log_level=0,
-        )
-
-        captured = io.StringIO()
-        old_stdout = sys.stdout
-        sys.stdout = captured
-        try:
-            df = main(args)
-        finally:
-            sys.stdout = old_stdout
-
-        # Expected behavior with max_running=2 and output_len=3:
-        #
-        # Step 0: Schedule r0,r2 on GPU0 (r4,r6 pending), r1,r3 on GPU1 (r5,r7 pending)
-        #         Execute: decoded_tokens=1
-        #         Record: running=2, pending=2 for both GPUs
-        #
-        # Step 1: No change in schedule (requests not finished)
-        #         Execute: decoded_tokens=2
-        #         Record: running=2, pending=2 for both GPUs
-        #
-        # Step 2: No change in schedule
-        #         Execute: decoded_tokens=3, r0,r1,r2,r3 finish and are removed
-        #         Record: running=0, pending=2 for both GPUs
-        #
-        # Step 3: Schedule r4,r6 on GPU0, r5,r7 on GPU1 (all pending->running)
-        #         Execute: decoded_tokens=1
-        #         Record: running=2, pending=0 for both GPUs
-        #
-        # Step 4: No change in schedule
-        #         Execute: decoded_tokens=2
-        #         Record: running=2, pending=0 for both GPUs
-        #
-        # Step 5: Execute: decoded_tokens=3, all finish
-        #         Record: running=0, pending=0 for both GPUs
-
-        expected_rows = [
-            {"step": 0, "gpu_id": 0, "running_count": 2, "pending_count": 2},
-            {"step": 0, "gpu_id": 1, "running_count": 2, "pending_count": 2},
-            {"step": 1, "gpu_id": 0, "running_count": 2, "pending_count": 2},
-            {"step": 1, "gpu_id": 1, "running_count": 2, "pending_count": 2},
-            {"step": 2, "gpu_id": 0, "running_count": 0, "pending_count": 2},
-            {"step": 2, "gpu_id": 1, "running_count": 0, "pending_count": 2},
-            {"step": 3, "gpu_id": 0, "running_count": 2, "pending_count": 0},
-            {"step": 3, "gpu_id": 1, "running_count": 2, "pending_count": 0},
-            {"step": 4, "gpu_id": 0, "running_count": 2, "pending_count": 0},
-            {"step": 4, "gpu_id": 1, "running_count": 2, "pending_count": 0},
-            {"step": 5, "gpu_id": 0, "running_count": 0, "pending_count": 0},
-            {"step": 5, "gpu_id": 1, "running_count": 0, "pending_count": 0},
-        ]
-
-        self.assertEqual(len(df), len(expected_rows))
         for expected in expected_rows:
             row = df.filter(
                 (pl.col("step") == expected["step"]) &
@@ -592,16 +496,62 @@ class TestMain(CustomTestCase):
             )
             self.assertEqual(
                 len(row), 1,
-                f"Expected exactly one row for step={expected['step']}, gpu_id={expected['gpu_id']}"
+                f"Expected one row for step={expected['step']}, gpu_id={expected['gpu_id']}"
             )
             self.assertEqual(
                 row["running_count"][0], expected["running_count"],
-                f"step={expected['step']}, gpu_id={expected['gpu_id']}: running_count mismatch"
+                f"step={expected['step']}, gpu_id={expected['gpu_id']}: running_count"
             )
             self.assertEqual(
                 row["pending_count"][0], expected["pending_count"],
-                f"step={expected['step']}, gpu_id={expected['gpu_id']}: pending_count mismatch"
+                f"step={expected['step']}, gpu_id={expected['gpu_id']}: pending_count"
             )
+
+    def test_simple_no_queuing(self):
+        # 4 requests, output_len=2, 2 GPUs, no queuing (max_running=256)
+        # round_robin: r0,r2 -> GPU0; r1,r3 -> GPU1
+        # step 0: all running, decoded_tokens=1
+        # step 1: all finish (decoded_tokens=2)
+        self._run_and_verify(
+            synth_num_requests=4,
+            synth_output_len=2,
+            num_gpus=2,
+            max_running=256,
+            expected_rows=[
+                {"step": 0, "gpu_id": 0, "running_count": 2, "pending_count": 0},
+                {"step": 0, "gpu_id": 1, "running_count": 2, "pending_count": 0},
+                {"step": 1, "gpu_id": 0, "running_count": 0, "pending_count": 0},
+                {"step": 1, "gpu_id": 1, "running_count": 0, "pending_count": 0},
+            ],
+        )
+
+    def test_queuing_multiple_waves(self):
+        # 8 requests, output_len=3, 2 GPUs, max_running=2 (causes queuing)
+        # round_robin: r0,r2,r4,r6 -> GPU0; r1,r3,r5,r7 -> GPU1
+        # step 0-1: first wave running (2 per GPU), 2 pending each
+        # step 2: first wave finishes, 0 running, 2 pending
+        # step 3-4: second wave running (2 per GPU), 0 pending
+        # step 5: all finish
+        self._run_and_verify(
+            synth_num_requests=8,
+            synth_output_len=3,
+            num_gpus=2,
+            max_running=2,
+            expected_rows=[
+                {"step": 0, "gpu_id": 0, "running_count": 2, "pending_count": 2},
+                {"step": 0, "gpu_id": 1, "running_count": 2, "pending_count": 2},
+                {"step": 1, "gpu_id": 0, "running_count": 2, "pending_count": 2},
+                {"step": 1, "gpu_id": 1, "running_count": 2, "pending_count": 2},
+                {"step": 2, "gpu_id": 0, "running_count": 0, "pending_count": 2},
+                {"step": 2, "gpu_id": 1, "running_count": 0, "pending_count": 2},
+                {"step": 3, "gpu_id": 0, "running_count": 2, "pending_count": 0},
+                {"step": 3, "gpu_id": 1, "running_count": 2, "pending_count": 0},
+                {"step": 4, "gpu_id": 0, "running_count": 2, "pending_count": 0},
+                {"step": 4, "gpu_id": 1, "running_count": 2, "pending_count": 0},
+                {"step": 5, "gpu_id": 0, "running_count": 0, "pending_count": 0},
+                {"step": 5, "gpu_id": 1, "running_count": 0, "pending_count": 0},
+            ],
+        )
 
 
 class TestCLI(CustomTestCase):
