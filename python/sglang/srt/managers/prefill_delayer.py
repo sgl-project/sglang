@@ -51,9 +51,7 @@ class PrefillDelayer:
         if global_exists_cannot_prefill and global_exists_can_prefill:
             self.curr_delayed_count += 1
             if self.curr_delayed_count < self.max_delay_passes:
-                print("hi branch: delay prefill")
                 return False
-            print("hi branch: cannot delay prefill since timeout")
 
         self.curr_delayed_count = 0
         return True
