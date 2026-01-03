@@ -7,18 +7,6 @@ from sglang.srt.debug_utils.schedule_simulator.request import SimRequest
 from sglang.srt.debug_utils.schedule_simulator.routers.base import RouterPolicy
 from sglang.srt.debug_utils.schedule_simulator.schedulers.base import SchedulerPolicy
 
-_LOG_ID_LIMIT = 5
-
-
-def _format_ids(requests: List[SimRequest]) -> str:
-    if not requests:
-        return "-"
-    ids = ",".join(r.request_id for r in requests[:_LOG_ID_LIMIT])
-    if len(requests) > _LOG_ID_LIMIT:
-        ids += f"...+{len(requests) - _LOG_ID_LIMIT}"
-    return ids
-
-
 @dataclass
 class SimulationResult:
     step_records: List[StepRecord]
@@ -108,7 +96,14 @@ class Simulator:
             recorder.on_step_end(self.step, self.gpu_states)
 
     def _get_summary(self) -> Dict[str, Any]:
-        summary = {}
-        for recorder in self.recorders:
-            summary.update(recorder.get_summary())
-        return summary
+        return {k: v for r in self.recorders for k, v in r.get_summary().items()}
+
+
+def _format_ids(requests: List[SimRequest], limit: int = 5) -> str:
+    if not requests:
+        return "-"
+    ids = ",".join(r.request_id for r in requests[:limit])
+    if len(requests) > limit:
+        ids += f"...+{len(requests) - limit}"
+    return ids
+
