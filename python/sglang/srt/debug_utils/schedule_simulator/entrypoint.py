@@ -77,7 +77,11 @@ def _load_requests(args: argparse.Namespace) -> List[SimRequest]:
 
 
 def _create_router(name: str):
-    return RandomRouter() if name == "random" else RoundRobinRouter()
+    if name == "random":
+        return RandomRouter()
+    if name == "round_robin":
+        return RoundRobinRouter()
+    raise ValueError(f"Unknown router: {name}")
 
 
 def _create_scheduler(name: str):
