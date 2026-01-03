@@ -78,18 +78,6 @@ class RequestLogger:
         self.metadata = self._compute_metadata()
         self.targets = self._setup_targets()
 
-    def _log(self, msg: str) -> None:
-        for target in self.targets:
-            target.info(msg)
-
-    def _log_json(self, event: str, data: dict) -> None:
-        log_data = {
-            "timestamp": datetime.now().isoformat(),
-            "event": event,
-            **data,
-        }
-        self._log(json.dumps(log_data, ensure_ascii=False))
-
     def log_received_request(
         self, obj: Union["GenerateReqInput", "EmbeddingReqInput"], tokenizer: Any = None
     ) -> None:
@@ -190,6 +178,18 @@ class RequestLogger:
                 )
         return max_length, skip_names, out_skip_names
 
+    def _log_json(self, event: str, data: dict) -> None:
+        log_data = {
+            "timestamp": datetime.now().isoformat(),
+            "event": event,
+            **data,
+        }
+        self._log(json.dumps(log_data, ensure_ascii=False))
+
+    def _log(self, msg: str) -> None:
+        for target in self.targets:
+            target.info(msg)
+
 
 # TODO remove this?
 @lru_cache(maxsize=2)
@@ -197,18 +197,6 @@ def disable_request_logging() -> bool:
     return get_bool_env_var("SGLANG_DISABLE_REQUEST_LOGGING")
 
 
-def _create_logger_with_handler(name: str, handler: logging.Handler) -> logging.Logger:
-    logger = logging.getLogger(name)
-    logger.setLevel(logging.INFO)
-    logger.propagate = False
-    if not logger.handlers:
-        handler.setFormatter(logging.Formatter("%(message)s"))
-        logger.addHandler(handler)
-    return logger
-
-
-def _create_log_target_stdout() -> logging.Logger:
-    return _create_logger_with_handler(f"{__name__}.stdout", logging.StreamHandler())
 
 
 def _create_log_target(target: str) -> logging.Logger:
@@ -216,6 +204,9 @@ def _create_log_target(target: str) -> logging.Logger:
         return _create_log_target_stdout()
     return _create_log_target_file(target)
 
+
+def _create_log_target_stdout() -> logging.Logger:
+    return _create_logger_with_handler(f"{__name__}.stdout", logging.StreamHandler())
 
 def _create_log_target_file(directory: str) -> logging.Logger:
     os.makedirs(directory, exist_ok=True)
@@ -228,6 +219,15 @@ def _create_log_target_file(directory: str) -> logging.Logger:
     return _create_logger_with_handler(
         f"{__name__}.file.{directory}.{hostname}_{rank}", handler
     )
+
+def _create_logger_with_handler(name: str, handler: logging.Handler) -> logging.Logger:
+    logger = logging.getLogger(name)
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    if not logger.handlers:
+        handler.setFormatter(logging.Formatter("%(message)s"))
+        logger.addHandler(handler)
+    return logger
 
 
 # TODO unify this w/ `_transform_data_for_logging` if we find performance enough

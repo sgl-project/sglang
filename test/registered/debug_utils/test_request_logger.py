@@ -1,9 +1,9 @@
 import io
 import json
 import tempfile
-from pathlib import Path
 import time
 import unittest
+from pathlib import Path
 
 import requests
 
@@ -107,8 +107,12 @@ class TestRequestLoggerJson(BaseTestRequestLogger, CustomTestCase):
                 self.assertIn("out", data)
                 finished_found = True
 
-        self.assertTrue(received_found, f"request.received event not found in {source_name}")
-        self.assertTrue(finished_found, f"request.finished event not found in {source_name}")
+        self.assertTrue(
+            received_found, f"request.received event not found in {source_name}"
+        )
+        self.assertTrue(
+            finished_found, f"request.finished event not found in {source_name}"
+        )
 
 
 if __name__ == "__main__":
