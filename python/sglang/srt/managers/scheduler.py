@@ -451,9 +451,7 @@ class Scheduler(
             self.default_stream.synchronize = lambda: None  # No-op for CPU
         self.forward_sleep_time = None
         # Batch collect delay for recv_requests (for benchmarking)
-        recv_sleep_time = float(
-            os.environ.get("SGLANG_SCHEDULER_BATCH_COLLECT_DELAY", "0")
-        )
+        recv_sleep_time = envs.SGLANG_SCHEDULER_BATCH_COLLECT_DELAY.get()
         self.recv_sleep_time = recv_sleep_time if recv_sleep_time > 0 else None
         self._engine_paused = False
 
@@ -1071,27 +1069,31 @@ class Scheduler(
             if not self.recv_skipper.handle(last_forward_mode):
                 return []
 
+        def collect_requests(recv_reqs: List) -> None:
+            """Helper function to collect requests from tokenizer and rpc."""
+            while True:
+                try:
+                    if self.recv_limit_reached(len(recv_reqs)):
+                        break
+                    recv_req = self.recv_from_tokenizer.recv_pyobj(zmq.NOBLOCK)
+                except zmq.ZMQError:
+                    break
+                recv_reqs.append(recv_req)
+
+            while True:
+                try:
+                    if self.recv_limit_reached(len(recv_reqs)):
+                        break
+                    recv_rpc = self.recv_from_rpc.recv_pyobj(zmq.NOBLOCK)
+                except zmq.ZMQError:
+                    break
+                recv_reqs.append(recv_rpc)
+
         if self.pp_rank == 0:
             if self.attn_tp_rank == 0:
                 recv_reqs = []
 
-                while True:
-                    try:
-                        if self.recv_limit_reached(len(recv_reqs)):
-                            break
-                        recv_req = self.recv_from_tokenizer.recv_pyobj(zmq.NOBLOCK)
-                    except zmq.ZMQError:
-                        break
-                    recv_reqs.append(recv_req)
-
-                while True:
-                    try:
-                        if self.recv_limit_reached(len(recv_reqs)):
-                            break
-                        recv_rpc = self.recv_from_rpc.recv_pyobj(zmq.NOBLOCK)
-                    except zmq.ZMQError:
-                        break
-                    recv_reqs.append(recv_rpc)
+                collect_requests(recv_reqs)
 
                 # If recv_sleep_time is set and we have requests, wait to accumulate more
                 if self.recv_sleep_time is not None and len(recv_reqs) > 0:
@@ -1100,22 +1102,7 @@ class Scheduler(
                     )
                     time.sleep(self.recv_sleep_time)
                     # Collect again after delay
-                    while True:
-                        try:
-                            if self.recv_limit_reached(len(recv_reqs)):
-                                break
-                            recv_req = self.recv_from_tokenizer.recv_pyobj(zmq.NOBLOCK)
-                        except zmq.ZMQError:
-                            break
-                        recv_reqs.append(recv_req)
-                    while True:
-                        try:
-                            if self.recv_limit_reached(len(recv_reqs)):
-                                break
-                            recv_rpc = self.recv_from_rpc.recv_pyobj(zmq.NOBLOCK)
-                        except zmq.ZMQError:
-                            break
-                        recv_reqs.append(recv_rpc)
+                    collect_requests(recv_reqs)
             else:
                 recv_reqs = None
         else:
