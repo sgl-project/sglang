@@ -16,8 +16,10 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
     get_tp_group,
 )
+from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+    use_symmetric_memory,
+)
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
-
 from sglang.srt.layers.moe import (
     MoeRunner,
     MoeRunnerBackend,
@@ -51,9 +53,6 @@ from sglang.srt.utils import (
     is_hip,
     set_weight_attrs,
 )
-from sglang.srt.distributed.device_communicators.pynccl_allocator import (
-    use_symmetric_memory,
-)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
@@ -80,8 +79,6 @@ if is_flashinfer_available():
     from flashinfer.fused_moe import (
         convert_to_block_layout,
         trtllm_mxint4_block_scale_moe,
-        trtllm_bf16_moe,
-        WeightLayout,
     )
     from flashinfer.fused_moe.core import (
         _maybe_get_cached_w3_w1_permute_indices,
@@ -1161,7 +1158,7 @@ class CompressedTensorsMxInt4MoEMethod(CompressedTensorsMoEMethod):
             shifts = torch.arange(0, 32, 4, dtype=torch.int32, device=w.device)
             w = (w.unsqueeze(2) >> shifts) & 0x0F
             w = (w - 8).to(torch.int8).reshape(w.shape[0], -1, 2)
-            w = (w[..., 0] & 0x0f) | ((w[..., 1] & 0x0f) << 4)
+            w = (w[..., 0] & 0x0F) | ((w[..., 1] & 0x0F) << 4)
             w = w.to(torch.uint8)
             return w
 
@@ -1182,10 +1179,9 @@ class CompressedTensorsMxInt4MoEMethod(CompressedTensorsMoEMethod):
                 cur_expert_gemm1_weight,
                 epilogue_tile_m,
             )
-            gemm1_weights_shuffled = (
-                cur_expert_gemm1_weight[permute_indices.to(gemm1_weights.device)]
-                .contiguous()
-            )
+            gemm1_weights_shuffled = cur_expert_gemm1_weight[
+                permute_indices.to(gemm1_weights.device)
+            ].contiguous()
             permute_sf_indices = _maybe_get_cached_w3_w1_permute_indices(
                 self._cache_permute_indices,
                 gemm1_scales[i].to(torch.bfloat16),
@@ -1205,10 +1201,9 @@ class CompressedTensorsMxInt4MoEMethod(CompressedTensorsMoEMethod):
                 cur_expert_gemm2_weight,
                 epilogue_tile_m,
             )
-            gemm2_weights_shuffled = (
-                cur_expert_gemm2_weight[permute_indices.to(gemm2_weights.device)]
-                .contiguous()
-            )
+            gemm2_weights_shuffled = cur_expert_gemm2_weight[
+                permute_indices.to(gemm2_weights.device)
+            ].contiguous()
 
             permute_sf_indices = get_w2_permute_indices_with_cache(
                 self._cache_permute_indices,
@@ -1311,8 +1306,10 @@ class CompressedTensorsMxInt4MoEMethod(CompressedTensorsMoEMethod):
         ):
             num_tokens = x.shape[0]
             hidden_size = x.shape[-1]
-            symm_output = torch.empty(num_tokens, hidden_size, dtype=torch.bfloat16, device=x.device)
-        
+            symm_output = torch.empty(
+                num_tokens, hidden_size, dtype=torch.bfloat16, device=x.device
+            )
+
         output = trtllm_mxint4_block_scale_moe(
             routing_logits=router_logits,  # float
             routing_bias=correction_bias,
