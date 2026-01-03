@@ -339,7 +339,7 @@ class ServerArgs:
     log_requests: bool = False
     log_requests_level: int = 2
     log_requests_format: str = "text"
-    log_requests_target: List[str] = ["stdout"]
+    log_requests_target: Optional[List[str]] = None
     crash_dump_folder: Optional[str] = None
     show_time_cost: bool = False
     enable_metrics: bool = False
