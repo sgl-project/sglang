@@ -98,13 +98,19 @@ async fn test_inflight_request_appears_in_bucket() {
 
     let buckets = tracker_clone.compute_bucket_counts();
     assert!(buckets[0] > 0, "first bucket should have requests");
-    assert!(*buckets.last().unwrap() > 0, "+Inf bucket should have requests");
+    assert!(
+        *buckets.last().unwrap() > 0,
+        "+Inf bucket should have requests"
+    );
 
     let resp = response_future.await.unwrap().unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 
     tokio::time::sleep(Duration::from_millis(50)).await;
-    assert!(tracker_clone.is_empty(), "Request should be deregistered after completion");
+    assert!(
+        tracker_clone.is_empty(),
+        "Request should be deregistered after completion"
+    );
 
     ctx.shutdown().await;
 }

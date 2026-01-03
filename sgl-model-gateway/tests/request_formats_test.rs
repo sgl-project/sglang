@@ -4,35 +4,7 @@ use common::{
     mock_worker::{HealthStatus, MockWorkerConfig, WorkerType},
     WorkerTestContext,
 };
-use reqwest::Client;
 use serde_json::json;
-
-async fn make_request(
-    ctx: &WorkerTestContext,
-    endpoint: &str,
-    body: serde_json::Value,
-) -> Result<serde_json::Value, String> {
-    let client = Client::new();
-    let worker_url = ctx
-        .first_worker_url()
-        .ok_or_else(|| "No workers available".to_string())?;
-
-    let response = client
-        .post(format!("{}{}", worker_url, endpoint))
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| format!("Request failed: {}", e))?;
-
-    if !response.status().is_success() {
-        return Err(format!("Request failed with status: {}", response.status()));
-    }
-
-    response
-        .json::<serde_json::Value>()
-        .await
-        .map_err(|e| format!("Failed to parse response: {}", e))
-}
 
 #[cfg(test)]
 mod request_format_tests {
