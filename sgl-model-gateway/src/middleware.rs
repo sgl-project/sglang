@@ -609,9 +609,6 @@ pub async fn concurrency_limit_middleware(
 /// Global counter for active HTTP connections (handlers currently executing)
 static ACTIVE_HTTP_CONNECTIONS: AtomicU64 = AtomicU64::new(0);
 
-/// Global counter for generating unique in-flight tracking IDs
-static INFLIGHT_TRACKING_COUNTER: AtomicU64 = AtomicU64::new(0);
-
 /// Tower Layer for HTTP metrics collection (SMG Layer 1 metrics)
 #[derive(Clone)]
 pub struct HttpMetricsLayer {
@@ -660,7 +657,6 @@ where
         let method = method_to_static_str(req.method().as_str());
         let path = normalize_path_for_metrics(req.uri().path());
         let start = Instant::now();
-        let tracking_id = INFLIGHT_TRACKING_COUNTER.fetch_add(1, Ordering::Relaxed);
         let mut inner = self.inner.clone();
         let tracker = self.tracker.clone();
 
@@ -668,7 +664,7 @@ where
             let active = ACTIVE_HTTP_CONNECTIONS.fetch_add(1, Ordering::Relaxed) + 1;
             Metrics::set_http_connections_active(active as usize);
 
-            let _guard = tracker.track(tracking_id);
+            let _guard = tracker.track();
             let result = inner.call(req).await;
 
             let active = ACTIVE_HTTP_CONNECTIONS.fetch_sub(1, Ordering::Relaxed) - 1;

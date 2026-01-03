@@ -1,5 +1,8 @@
 use std::{
-    sync::Arc,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
     time::{Duration, Instant},
 };
 
@@ -14,6 +17,7 @@ const AGE_BUCKET_LABELS: &[&str] = &["30", "60", "180", "300", "600", "+Inf"];
 
 pub struct InFlightRequestTracker {
     requests: DashMap<u64, Instant>,
+    next_id: AtomicU64,
 }
 
 pub struct InFlightGuard {
@@ -31,6 +35,7 @@ impl InFlightRequestTracker {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             requests: DashMap::new(),
+            next_id: AtomicU64::new(0),
         })
     }
 
@@ -44,20 +49,13 @@ impl InFlightRequestTracker {
         self.clone().spawn_sampler(sample_interval);
     }
 
-    pub fn track(self: &Arc<Self>, request_id: u64) -> InFlightGuard {
+    pub fn track(self: &Arc<Self>) -> InFlightGuard {
+        let request_id = self.next_id.fetch_add(1, Ordering::Relaxed);
         self.requests.insert(request_id, Instant::now());
         InFlightGuard {
             tracker: self.clone(),
             request_id,
         }
-    }
-
-    pub fn register(&self, request_id: u64) {
-        self.requests.insert(request_id, Instant::now());
-    }
-
-    pub fn deregister(&self, request_id: u64) {
-        self.requests.remove(&request_id);
     }
 
     #[doc(hidden)]
