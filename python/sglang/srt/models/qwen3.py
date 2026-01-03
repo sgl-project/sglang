@@ -276,10 +276,14 @@ class Qwen3DecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
+        **kwargs,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # Self Attention
         hidden_states, residual = self.layer_communicator.prepare_attn(
-            hidden_states, residual, forward_batch
+            hidden_states,
+            residual,
+            forward_batch,
+            **kwargs,
         )
         if hidden_states.shape[0] != 0:
             hidden_states = self.self_attn(
