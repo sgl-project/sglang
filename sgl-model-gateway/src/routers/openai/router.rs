@@ -23,7 +23,7 @@ use super::{
         ComponentRefs, PayloadState, RequestContext, ResponsesComponents, SharedComponents,
         WorkerSelection,
     },
-    mcp::{execute_tool_loop, prepare_mcp_payload_for_streaming, McpLoopConfig},
+    mcp::{execute_tool_loop, prepare_mcp_payload_for_streaming},
     provider::ProviderRegistry,
     responses::{mask_tools_as_mcp, patch_streaming_response_json},
     streaming::handle_streaming_response,
@@ -390,7 +390,6 @@ impl OpenAIRouter {
         let mut response_json: Value;
 
         if let Some(mcp) = active_mcp {
-            let config = McpLoopConfig::default();
             prepare_mcp_payload_for_streaming(&mut payload, mcp);
 
             match execute_tool_loop(
@@ -400,7 +399,6 @@ impl OpenAIRouter {
                 payload,
                 original_body,
                 mcp,
-                &config,
             )
             .await
             {

@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use axum::response::Response;
-use serde_json::to_value;
+use serde_json::{json, to_value, Value};
 use tracing::{debug, error, warn};
 
 use crate::{
@@ -12,11 +12,12 @@ use crate::{
     mcp::McpManager,
     protocols::{
         common::Tool,
-        responses::{ResponseTool, ResponseToolType, ResponsesRequest, ResponsesResponse},
+        responses::{
+            generate_id, McpToolInfo, ResponseOutputItem, ResponseTool, ResponseToolType,
+            ResponsesRequest, ResponsesResponse,
+        },
     },
-    routers::{
-        conversations::persist_conversation_items, error, mcp::ensure_request_mcp_client,
-    },
+    routers::{conversations::persist_conversation_items, error, mcp::ensure_request_mcp_client},
 };
 
 /// Ensure MCP connection succeeds if MCP tools are declared
@@ -149,5 +150,52 @@ pub async fn persist_response_if_needed(
         } else {
             debug!("Persisted response: {}", response.id);
         }
+    }
+}
+
+// ============================================================================
+// MCP Helper Functions
+// ============================================================================
+
+/// Build mcp_list_tools output item
+pub fn build_mcp_list_tools_item(mcp: &McpManager, server_label: &str) -> ResponseOutputItem {
+    let tools = mcp.list_tools();
+    let tools_info: Vec<McpToolInfo> = tools
+        .iter()
+        .map(|t| McpToolInfo {
+            name: t.name.to_string(),
+            description: t.description.as_ref().map(|d| d.to_string()),
+            input_schema: Value::Object((*t.input_schema).clone()),
+            annotations: Some(json!({
+                "read_only": false
+            })),
+        })
+        .collect();
+
+    ResponseOutputItem::McpListTools {
+        id: generate_id("mcpl"),
+        server_label: server_label.to_string(),
+        tools: tools_info,
+    }
+}
+
+/// Build mcp_call output item
+pub fn build_mcp_call_item(
+    tool_name: &str,
+    arguments: &str,
+    output: &str,
+    server_label: &str,
+    success: bool,
+    error: Option<&str>,
+) -> ResponseOutputItem {
+    ResponseOutputItem::McpCall {
+        id: generate_id("mcp"),
+        status: if success { "completed" } else { "failed" }.to_string(),
+        approval_request_id: None,
+        arguments: arguments.to_string(),
+        error: error.map(|e| e.to_string()),
+        name: tool_name.to_string(),
+        output: output.to_string(),
+        server_label: server_label.to_string(),
     }
 }

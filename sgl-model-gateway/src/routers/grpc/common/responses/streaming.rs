@@ -22,7 +22,7 @@ use crate::{
             ResponseOutputItem, ResponseStatus, ResponsesRequest, ResponsesResponse, ResponsesUsage,
         },
     },
-    routers::grpc::harmony::responses::ToolResult,
+    routers::mcp::ToolExecutionResult,
 };
 
 pub enum OutputItemType {
@@ -128,7 +128,7 @@ impl ResponseStreamEventEmitter {
     ///
     /// After MCP tools are executed, this updates the stored output items
     /// to include the output field from the tool results.
-    pub(crate) fn update_mcp_call_outputs(&mut self, tool_results: &[ToolResult]) {
+    pub(crate) fn update_mcp_call_outputs(&mut self, tool_results: &[ToolExecutionResult]) {
         for tool_result in tool_results {
             // Find the output item with matching call_id
             for item_state in self.output_items.iter_mut() {
@@ -139,12 +139,10 @@ impl ResponseStreamEventEmitter {
                             == Some(&tool_result.call_id)
                     {
                         // Add output field
-                        let output_str = serde_json::to_string(&tool_result.output)
-                            .unwrap_or_else(|_| "{}".to_string());
-                        item_data["output"] = json!(output_str);
+                        item_data["output"] = json!(tool_result.output);
 
                         // Update status based on success
-                        if tool_result.is_error {
+                        if !tool_result.success {
                             item_data["status"] = json!("failed");
                         }
                         break;

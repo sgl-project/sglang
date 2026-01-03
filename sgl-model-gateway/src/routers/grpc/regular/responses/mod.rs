@@ -11,6 +11,7 @@
 pub mod context;
 mod conversions;
 mod handlers;
+mod mcp_backend;
 pub mod tool_loop;
 pub mod types;
 
