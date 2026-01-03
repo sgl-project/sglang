@@ -4,17 +4,23 @@ from typing import List
 
 import polars as pl
 
-from sglang.srt.debug_utils.schedule_simulator import (
-    AttentionBalancednessRecorder,
-    BatchSizeBalancednessRecorder,
-    FIFOScheduler,
-    RandomRouter,
-    RoundRobinRouter,
-    Simulator,
-    generate_random_requests,
+from sglang.srt.debug_utils.schedule_simulator.data_source.data_loader import (
     load_from_request_logger,
 )
+from sglang.srt.debug_utils.schedule_simulator.data_source.data_synthesis import (
+    generate_random_requests,
+)
+from sglang.srt.debug_utils.schedule_simulator.metrics import (
+    AttentionBalancednessRecorder,
+    BatchSizeBalancednessRecorder,
+)
 from sglang.srt.debug_utils.schedule_simulator.request import SimRequest
+from sglang.srt.debug_utils.schedule_simulator.routers import (
+    RandomRouter,
+    RoundRobinRouter,
+)
+from sglang.srt.debug_utils.schedule_simulator.schedulers import FIFOScheduler
+from sglang.srt.debug_utils.schedule_simulator.simulator import Simulator
 
 
 def create_arg_parser() -> argparse.ArgumentParser:
