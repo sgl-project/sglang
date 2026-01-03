@@ -248,23 +248,37 @@ class CudaPlatformBase(Platform):
         elif selected_backend in [
             AttentionBackendEnum.FA,
         ]:
-            if cls.is_blackwell():
+            if cls.is_sm120():
+                logger.info(
+                    "FlashAttention is not supported on SM12.x in this build; falling back to Torch SDPA."
+                )
+                target_backend = AttentionBackendEnum.TORCH_SDPA
+            elif cls.is_blackwell():
                 from sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn import (
                     set_fa_ver,
                 )
 
                 set_fa_ver(4)
-            target_backend = AttentionBackendEnum.FA
+                target_backend = AttentionBackendEnum.FA
+            else:
+                target_backend = AttentionBackendEnum.FA
         elif selected_backend:
             raise ValueError(f"Invalid attention backend for {cls.device_name}")
         else:
-            if cls.is_blackwell():
+            if cls.is_sm120():
+                # On SM12.x, the sgl-kernel FlashAttention wheels may not include
+                # support yet. Default to Torch SDPA for correctness.
+                logger.info("Defaulting to Torch SDPA backend on SM12.x")
+                target_backend = AttentionBackendEnum.TORCH_SDPA
+            elif cls.is_blackwell():
                 from sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn import (
                     set_fa_ver,
                 )
 
                 set_fa_ver(4)
-            target_backend = AttentionBackendEnum.FA
+                target_backend = AttentionBackendEnum.FA
+            else:
+                target_backend = AttentionBackendEnum.FA
 
         # Ensure we have a target backend selected before validation/fallback.
         if target_backend is None:
