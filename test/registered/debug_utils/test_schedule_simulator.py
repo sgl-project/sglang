@@ -452,8 +452,6 @@ class TestMain(CustomTestCase):
         expected_rows: list,
     ):
         import argparse
-        import io
-        import sys
 
         import polars as pl
 
@@ -475,13 +473,7 @@ class TestMain(CustomTestCase):
             log_level=0,
         )
 
-        captured = io.StringIO()
-        old_stdout = sys.stdout
-        sys.stdout = captured
-        try:
-            df = main(args)
-        finally:
-            sys.stdout = old_stdout
+        df = main(args)
 
         self.assertEqual(set(df.columns), {
             "step", "gpu_id", "running_count", "pending_count",
