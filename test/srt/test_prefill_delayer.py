@@ -24,7 +24,7 @@ class TestPrefillDelayerThroughput(CustomTestCase):
             "--dp",
             "8",
             "--chunked-prefill-size",
-            "65536",
+            "131072",
         ]
 
         # TODO further fix mem leak
@@ -46,10 +46,10 @@ class TestPrefillDelayerThroughput(CustomTestCase):
             args = get_benchmark_args(
                 base_url=base_url,
                 dataset_name="random",
-                num_prompts=80,
-                random_input_len=4096,
+                num_prompts=200,
+                random_input_len=8192,
                 random_output_len=128,
-                request_rate=8,
+                request_rate=32,
                 tokenizer=model,
             )
             res = run_benchmark(args)
