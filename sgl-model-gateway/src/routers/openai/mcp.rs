@@ -20,29 +20,17 @@ use crate::{
     mcp,
     protocols::{
         event_types::{is_function_call_type, ItemType, McpEvent, OutputItemEvent},
-        responses::{generate_id, ResponseInput, ResponseToolType, ResponsesRequest},
+        responses::{generate_id, ResponseInput, ResponsesRequest},
     },
-    routers::header_utils::apply_request_headers,
+    routers::{
+        header_utils::apply_request_headers,
+        mcp_utils::{extract_server_label, McpLoopConfig},
+    },
 };
 
 // ============================================================================
 // Configuration and State Types
 // ============================================================================
-
-/// Configuration for MCP tool calling loops
-#[allow(dead_code)]
-#[derive(Debug, Clone)]
-pub(crate) struct McpLoopConfig {
-    /// Maximum iterations as safety limit (internal only, default: 10)
-    /// Prevents infinite loops when max_tool_calls is not set
-    pub max_iterations: usize,
-}
-
-impl Default for McpLoopConfig {
-    fn default() -> Self {
-        Self { max_iterations: 10 }
-    }
-}
 
 /// State for tracking multi-turn tool calling loop
 pub(crate) struct ToolLoopState {
@@ -642,19 +630,10 @@ pub(super) async fn execute_tool_loop(
 
             // Inject MCP output items if we executed any tools
             if state.total_calls > 0 {
-                let server_label = original_body
-                    .tools
-                    .as_ref()
-                    .and_then(|tools| {
-                        tools
-                            .iter()
-                            .find(|t| matches!(t.r#type, ResponseToolType::Mcp))
-                            .and_then(|t| t.server_label.as_deref())
-                    })
-                    .unwrap_or("mcp");
+                let server_label = extract_server_label(original_body.tools.as_deref(), "mcp");
 
                 // Build mcp_list_tools item
-                let list_tools_item = build_mcp_list_tools_item(active_mcp, server_label);
+                let list_tools_item = build_mcp_list_tools_item(active_mcp, &server_label);
 
                 // Insert at beginning of output array
                 if let Some(output_array) = response_json
@@ -665,7 +644,7 @@ pub(super) async fn execute_tool_loop(
 
                     // Build mcp_call items using helper function
                     let mcp_call_items =
-                        build_executed_mcp_call_items(&state.conversation_history, server_label);
+                        build_executed_mcp_call_items(&state.conversation_history, &server_label);
 
                     // Insert mcp_call items after mcp_list_tools using mutable position
                     let mut insert_pos = 1;
@@ -704,16 +683,7 @@ pub(super) fn build_incomplete_response(
 
     // Convert any function_call in output to mcp_call format
     if let Some(output_array) = obj.get_mut("output").and_then(|v| v.as_array_mut()) {
-        let server_label = original_body
-            .tools
-            .as_ref()
-            .and_then(|tools| {
-                tools
-                    .iter()
-                    .find(|t| matches!(t.r#type, ResponseToolType::Mcp))
-                    .and_then(|t| t.server_label.as_deref())
-            })
-            .unwrap_or("mcp");
+        let server_label = extract_server_label(original_body.tools.as_deref(), "mcp");
 
         // Find any function_call items and convert them to mcp_call (incomplete)
         let mut mcp_call_items = Vec::new();
@@ -731,7 +701,7 @@ pub(super) fn build_incomplete_response(
                     tool_name,
                     args,
                     "", // No output - wasn't executed
-                    server_label,
+                    &server_label,
                     false, // Not successful
                     Some("Not executed - response stopped due to limit"),
                 );
@@ -741,12 +711,12 @@ pub(super) fn build_incomplete_response(
 
         // Add mcp_list_tools and executed mcp_call items at the beginning
         if state.total_calls > 0 || !mcp_call_items.is_empty() {
-            let list_tools_item = build_mcp_list_tools_item(active_mcp, server_label);
+            let list_tools_item = build_mcp_list_tools_item(active_mcp, &server_label);
             output_array.insert(0, list_tools_item);
 
             // Add mcp_call items for executed calls using helper
             let executed_items =
-                build_executed_mcp_call_items(&state.conversation_history, server_label);
+                build_executed_mcp_call_items(&state.conversation_history, &server_label);
 
             let mut insert_pos = 1;
             for item in executed_items {
@@ -786,7 +756,7 @@ pub(super) fn build_incomplete_response(
 // Output Item Builders
 // ============================================================================
 
-/// Build an mcp_list_tools output item
+/// Build a mcp_list_tools output item
 pub(super) fn build_mcp_list_tools_item(mcp: &Arc<mcp::McpManager>, server_label: &str) -> Value {
     let tools = mcp.list_tools();
     let tools_json: Vec<Value> = tools
@@ -811,7 +781,7 @@ pub(super) fn build_mcp_list_tools_item(mcp: &Arc<mcp::McpManager>, server_label
     })
 }
 
-/// Build an mcp_call output item
+/// Build a mcp_call output item
 pub(super) fn build_mcp_call_item(
     tool_name: &str,
     arguments: &str,

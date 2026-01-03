@@ -27,8 +27,7 @@ use super::{
     context::{RequestContext, StreamingEventContext, StreamingRequest},
     mcp::{
         build_resume_payload, execute_streaming_tool_calls, inject_mcp_metadata_streaming,
-        prepare_mcp_payload_for_streaming, send_mcp_list_tools_events, McpLoopConfig,
-        ToolLoopState,
+        prepare_mcp_payload_for_streaming, send_mcp_list_tools_events, ToolLoopState,
     },
     responses::{mask_tools_as_mcp, patch_streaming_response_json, rewrite_streaming_block},
     tool_handler::{StreamAction, StreamingToolHandler},
@@ -44,7 +43,7 @@ use crate::{
     routers::{
         conversations::persist_conversation_items,
         header_utils::{apply_request_headers, preserve_response_headers},
-        mcp::ensure_request_mcp_client,
+        mcp_utils::{ensure_request_mcp_client, McpLoopConfig},
     },
 };
 
