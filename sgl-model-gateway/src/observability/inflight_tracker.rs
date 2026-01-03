@@ -157,12 +157,12 @@ mod tests {
         tracker.insert_with_time(6, now - Duration::from_secs(700));
 
         let counts = tracker.compute_bucket_counts();
-        assert_eq!(counts[0], 1, "le=30");
-        assert_eq!(counts[1], 2, "le=60");
-        assert_eq!(counts[2], 3, "le=180");
-        assert_eq!(counts[3], 4, "le=300");
-        assert_eq!(counts[4], 5, "le=600");
-        assert_eq!(counts[5], 6, "+Inf");
+        assert_eq!(counts[0], 1, "bucket 0");
+        assert_eq!(counts[1], 2, "bucket 1");
+        assert_eq!(counts[2], 3, "bucket 2");
+        assert_eq!(counts[3], 4, "bucket 3");
+        assert_eq!(counts[4], 5, "bucket 4");
+        assert_eq!(counts[5], 6, "bucket +Inf");
     }
 
     #[test]
@@ -174,9 +174,9 @@ mod tests {
         tracker.insert_with_time(2, now - Duration::from_secs(31));
 
         let counts = tracker.compute_bucket_counts();
-        assert_eq!(counts[0], 1, "le=30 includes exact boundary");
-        assert_eq!(counts[1], 2, "le=60 includes both");
-        assert_eq!(counts[5], 2, "+Inf includes all");
+        assert_eq!(counts[0], 1, "bucket 0 includes exact boundary");
+        assert_eq!(counts[1], 2, "bucket 1 includes both");
+        assert_eq!(counts[5], 2, "bucket +Inf includes all");
     }
 
     #[test]
