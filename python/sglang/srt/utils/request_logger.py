@@ -210,7 +210,7 @@ def _create_log_target_file(directory: str) -> logging.Logger:
     rank = dist.get_rank() if dist.is_initialized() else 0
     filename = os.path.join(directory, f"{hostname}_{rank}.log")
 
-    logger = logging.getLogger(f"{__name__}.file")
+    logger = logging.getLogger(f"{__name__}.file.{directory}.{hostname}_{rank}")
     logger.setLevel(logging.INFO)
     logger.propagate = False
 

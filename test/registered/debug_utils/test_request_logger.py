@@ -25,7 +25,8 @@ class BaseTestRequestLogger:
 
     @classmethod
     def setUpClass(cls):
-        cls.temp_dir = tempfile.mkdtemp()
+        cls._temp_dir_obj = tempfile.TemporaryDirectory()
+        cls.temp_dir = cls._temp_dir_obj.name
         cls.stdout = io.StringIO()
         cls.stderr = io.StringIO()
         other_args = [
@@ -52,10 +53,7 @@ class BaseTestRequestLogger:
         kill_process_tree(cls.process.pid)
         cls.stdout.close()
         cls.stderr.close()
-        if cls.temp_dir and os.path.exists(cls.temp_dir):
-            import shutil
-
-            shutil.rmtree(cls.temp_dir)
+        cls._temp_dir_obj.cleanup()
 
     def _send_request(self):
         response = requests.post(
