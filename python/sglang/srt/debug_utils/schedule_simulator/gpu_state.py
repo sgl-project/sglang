@@ -37,6 +37,13 @@ class GPUState:
                     seen_groups.add(req.group_id)
         return total
 
+    def seq_len_if_add(self, req: SimRequest) -> int:
+        if req.group_id and any(
+            r.group_id == req.group_id for r in self.running_requests
+        ):
+            return req.seq_len() - req.prefix_len
+        return req.seq_len()
+
     def is_valid(self) -> bool:
         return self.total_seq_len() <= self.max_total_tokens
 

@@ -12,5 +12,5 @@ class FIFOScheduler(SchedulerPolicy):
             gpu_state.evict_request(gpu_state.running_requests[-1])
 
         for req in list(gpu_state.pending_requests):
-            if gpu_state.total_seq_len() + req.seq_len() <= gpu_state.max_total_tokens:
+            if gpu_state.total_seq_len() + gpu_state.seq_len_if_add(req) <= gpu_state.max_total_tokens:
                 gpu_state.start_request(req)

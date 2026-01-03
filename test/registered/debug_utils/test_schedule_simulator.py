@@ -663,23 +663,26 @@ step=13   | GPU0[R=0:- Q=0:-]""",
             "--synth-gsp-num-groups",
             "1",
             "--synth-gsp-prompts-per-group",
-            "3",
+            "2",
             "--synth-gsp-system-prompt-len",
-            "100",
+            "50",
             "--synth-gsp-question-len",
             "10",
             "--synth-gsp-output-len",
-            "2",
+            "3",
             "--synth-seed",
             "42",
             "--num-gpus",
             "1",
             "--max-total-tokens",
-            "200",
+            "100",
             "--log-level",
             "2",
         )
         self.assertEqual(result.returncode, 0, f"CLI failed: {result.stderr}")
+        self.assertIn("R=2:", result.stdout)
+        self.assertIn("Q=0:-", result.stdout)
+        self.assertIn("step=2    | GPU0[R=0:- Q=0:-]", result.stdout)
 
 
 if __name__ == "__main__":
