@@ -76,7 +76,7 @@ class TestAscendW4A4(CustomTestCase):
         print(metrics)
 
         self.assertGreaterEqual(metrics["accuracy"], 0.80)
-        self.assertGreaterEqual(metrics["output_throughput"], 1000)
+        self.assertGreaterEqual(metrics["output_throughput"], 700)
 
     def run_decode(self, max_new_tokens):
         response = requests.post(
@@ -103,7 +103,7 @@ class TestAscendW4A4(CustomTestCase):
         print(f"Throughput: {throughput} tokens/s")
 
         if is_in_ci():
-            self.assertGreaterEqual(throughput, 35)
+            self.assertGreaterEqual(throughput, 25)
 
 
 if __name__ == "__main__":
