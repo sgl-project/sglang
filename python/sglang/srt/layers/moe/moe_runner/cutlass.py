@@ -298,6 +298,7 @@ class CutlassRunnerCore(MoeRunnerCore):
         return MoeRunnerBackend.CUTLASS
 
     def cutlass_w4a8_moe(
+        self,
         a: torch.Tensor,
         w1_q: torch.Tensor,
         w2_q: torch.Tensor,
@@ -483,7 +484,6 @@ class CutlassRunnerCore(MoeRunnerCore):
         """
         # Input 'a' is already preprocessed (permuted and quantized to fp8)
         gateup_input = a
-        num_local_experts = w1_q.size(0)
         n = w2_q.size(2) * 2  # w2_q is transposed and packed
         k = w1_q.size(2) * 2  # w1_q is transposed and packed
 
