@@ -14,7 +14,7 @@ from sglang.test.test_utils import (
 
 # OpenAI request length validation tests
 register_cuda_ci(est_time=38, suite="stage-b-test-small-1-gpu")
-register_amd_ci(est_time=31, suite="stage-a-test-1")
+register_amd_ci(est_time=31, suite="stage-b-test-small-1-gpu")
 
 
 class TestRequestLengthValidation(CustomTestCase):

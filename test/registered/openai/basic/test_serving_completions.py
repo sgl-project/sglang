@@ -15,7 +15,7 @@ from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 # OpenAI serving completions unit tests
 register_cuda_ci(est_time=10, suite="stage-b-test-small-1-gpu")
-register_amd_ci(est_time=10, suite="stage-a-test-1")
+register_amd_ci(est_time=10, suite="stage-b-test-small-1-gpu")
 
 
 class _MockTemplateManager:

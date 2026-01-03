@@ -24,7 +24,7 @@ from sglang.test.test_utils import (
 
 # OpenAI large max new tokens tests
 register_cuda_ci(est_time=41, suite="stage-b-test-small-1-gpu")
-register_amd_ci(est_time=41, suite="stage-a-test-1")
+register_amd_ci(est_time=41, suite="stage-b-test-small-1-gpu")
 
 
 class TestLargeMaxNewTokens(CustomTestCase):
