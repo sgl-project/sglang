@@ -1153,16 +1153,14 @@ class CompressedTensorsMxInt4MoEMethod(CompressedTensorsMoEMethod):
             shifts = torch.arange(0, 32, 4, dtype=torch.int32, device=w.device)
             w = (w.unsqueeze(2) >> shifts) & 0x0F
             w = (w - 8).to(torch.int8).reshape(w.shape[0], -1, 2)
-            w = w[..., 0] | (w[..., 1] << 4)
+            w = (w[..., 0] & 0x0f) | ((w[..., 1] & 0x0f) << 4)
             w = w.to(torch.uint8)
-            # w = w.reshape(w.shape[0], -1).to(torch.int8)
-            # w = torch.where(w >= 8, w - 16, w).to(torch.bfloat16)
             return w
 
         for i in range(num_experts):
             # NOTE(HandH1998):
-            # the huggingface weight format follows (w/s + 8) to pack, however,
-            # trtllm requires (w/s) to pack
+            # the huggingface weight format follows (w/s + 8) to pack,
+            # however, trtllm requires (w/s) to pack
             # we need to convert the weight to trtllm's format first
             cur_expert_gemm1_weight = repack(gemm1_weights[i])
             cur_expert_gemm2_weight = repack(gemm2_weights[i])
