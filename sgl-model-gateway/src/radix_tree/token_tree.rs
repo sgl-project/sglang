@@ -34,9 +34,13 @@ use super::{
 /// Token ID type (matches SGLang's token representation)
 pub type TokenId = u32;
 
-/// Page size for token grouping (matches SGLang's default radix cache page size).
+/// Default page size for token grouping (matches SGLang's default radix cache page size).
 /// SGLang supports: 1, 16, 32, 64, 128 depending on attention backend.
-/// TODO: Make configurable per-worker based on /server_info response.
+///
+/// Note: This is a compile-time constant used for the `TokenPageKey` type.
+/// The `TokenTree::with_config()` constructor accepts page_size as a parameter,
+/// but currently only page_size=16 is supported. Future versions may support
+/// other sizes via const generics or dynamic key types.
 pub const PAGE_SIZE: usize = 16;
 
 /// A page of tokens used as the children map key.
@@ -324,6 +328,8 @@ pub struct TokenTree {
     tenant_token_count: DashMap<TenantId, usize>,
     /// Eviction policy (should match the backend worker's policy)
     eviction_policy: EvictionPolicy,
+    /// Page size for token grouping (should match the backend worker's page size)
+    page_size: usize,
 }
 
 impl Default for TokenTree {
@@ -333,23 +339,50 @@ impl Default for TokenTree {
 }
 
 impl TokenTree {
+    /// Create a new TokenTree with default settings (page_size=16, eviction_policy=LRU).
     pub fn new() -> Self {
-        Self::with_policy(EvictionPolicy::default())
+        Self::with_config(PAGE_SIZE, EvictionPolicy::default())
     }
 
-    /// Create a new TokenTree with a specific eviction policy.
+    /// Create a new TokenTree with a specific eviction policy (uses default page_size=16).
     /// The policy should match the backend worker's policy to stay in sync.
     pub fn with_policy(policy: EvictionPolicy) -> Self {
+        Self::with_config(PAGE_SIZE, policy)
+    }
+
+    /// Create a new TokenTree with specific page size and eviction policy.
+    ///
+    /// # Arguments
+    /// * `page_size` - Token page size for grouping (must match backend worker's page size).
+    ///   SGLang supports: 1, 16, 32, 64, 128 depending on attention backend.
+    ///   **Note**: Currently only page_size=16 is supported at compile time.
+    /// * `policy` - Eviction policy (should match the backend worker's policy).
+    ///
+    /// # Panics
+    /// Panics if `page_size` != 16 (compile-time limitation, future versions may support other sizes).
+    pub fn with_config(page_size: usize, policy: EvictionPolicy) -> Self {
+        assert_eq!(
+            page_size, PAGE_SIZE,
+            "TokenTree currently only supports page_size={} (compile-time limitation). \
+             Got page_size={}. Future versions may support configurable page sizes.",
+            PAGE_SIZE, page_size
+        );
         Self {
             root: Arc::new(Node::new_root()),
             tenant_token_count: DashMap::with_shard_amount(ROOT_SHARD_COUNT),
             eviction_policy: policy,
+            page_size,
         }
     }
 
     /// Get the current eviction policy.
     pub fn eviction_policy(&self) -> EvictionPolicy {
         self.eviction_policy
+    }
+
+    /// Get the page size used for token grouping.
+    pub fn page_size(&self) -> usize {
+        self.page_size
     }
 
     /// Insert a token sequence with associated tenant.
@@ -2432,5 +2465,30 @@ mod tests {
 
         let tree_fifo = TokenTree::with_policy(EvictionPolicy::Fifo);
         assert_eq!(tree_fifo.eviction_policy(), EvictionPolicy::Fifo);
+    }
+
+    #[test]
+    fn test_tree_with_config() {
+        // Test with_config constructor with valid page_size
+        let tree = TokenTree::with_config(PAGE_SIZE, EvictionPolicy::Lfu);
+        assert_eq!(tree.page_size(), PAGE_SIZE);
+        assert_eq!(tree.eviction_policy(), EvictionPolicy::Lfu);
+
+        // Verify defaults: new() should use PAGE_SIZE=16 and LRU
+        let tree_default = TokenTree::new();
+        assert_eq!(tree_default.page_size(), 16);
+        assert_eq!(tree_default.eviction_policy(), EvictionPolicy::Lru);
+
+        // with_policy should use default page_size
+        let tree_policy = TokenTree::with_policy(EvictionPolicy::Fifo);
+        assert_eq!(tree_policy.page_size(), PAGE_SIZE);
+        assert_eq!(tree_policy.eviction_policy(), EvictionPolicy::Fifo);
+    }
+
+    #[test]
+    #[should_panic(expected = "TokenTree currently only supports page_size=16")]
+    fn test_tree_with_config_invalid_page_size() {
+        // Test that invalid page_size panics
+        let _tree = TokenTree::with_config(32, EvictionPolicy::Lru);
     }
 }
