@@ -2,13 +2,13 @@ mod common;
 
 use common::{
     mock_worker::{HealthStatus, MockWorkerConfig, WorkerType},
-    SimpleSimpleTestContext,
+    SimpleTestContext,
 };
 use reqwest::Client;
 use serde_json::json;
 
 async fn make_request(
-    ctx: &SimpleSimpleTestContext,
+    ctx: &SimpleTestContext,
     endpoint: &str,
     body: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
