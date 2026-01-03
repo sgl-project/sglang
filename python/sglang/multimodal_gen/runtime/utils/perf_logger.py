@@ -33,6 +33,10 @@ class RequestTimings:
         self.steps: list[float] = []
         self.total_duration_ms: float = 0.0
 
+    @property
+    def total_duration_s(self) -> float:
+        return self.total_duration_ms / 1000.0
+
     def record_stage(self, stage_name: str, duration_s: float):
         """Records the duration of a pipeline stage"""
         self.stages[stage_name] = duration_s * 1000  # Store as milliseconds
@@ -131,31 +135,26 @@ class StageProfiler:
         logger: _SGLDiffusionLogger,
         timings: Optional["RequestTimings"],
         simple_log: bool = False,
+        perf_dump_path_provided: bool = False,
     ):
         self.stage_name = stage_name
         self.timings = timings
         self.logger = logger
         self.simple_log = simple_log
         self.start_time = 0.0
-
-        self._metrics_enabled = StageProfiler.metrics_enabled()
-
-    @staticmethod
-    def metrics_enabled():
-        # Check env var at runtime to ensure we pick up changes (e.g. from CLI args)
-        return envs.SGLANG_DIFFUSION_STAGE_LOGGING
+        self.enabled = perf_dump_path_provided or envs.SGLANG_DIFFUSION_STAGE_LOGGING
 
     def __enter__(self):
         if self.simple_log:
             self.logger.info(f"[{self.stage_name}] started...")
 
-        if (self._metrics_enabled and self.timings) or self.simple_log:
+        if (self.enabled and self.timings) or self.simple_log:
             self.start_time = time.perf_counter()
 
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        if not ((self._metrics_enabled and self.timings) or self.simple_log):
+        if not ((self.enabled and self.timings) or self.simple_log):
             return False
 
         execution_time_s = time.perf_counter() - self.start_time
@@ -175,7 +174,7 @@ class StageProfiler:
                 f"[{self.stage_name}] finished in {execution_time_s:.4f} seconds",
             )
 
-        if self._metrics_enabled and self.timings:
+        if self.enabled and self.timings:
             if "denoising_step_" in self.stage_name:
                 index = int(self.stage_name[len("denoising_step_") :])
                 self.timings.record_steps(index, execution_time_s)
@@ -232,9 +231,9 @@ class PerformanceLogger:
             os.makedirs(os.path.dirname(abs_path), exist_ok=True)
             with open(abs_path, "w", encoding="utf-8") as f:
                 json.dump(report, f, indent=2)
-            logger.info(f"[Performance] Metrics dumped to: {abs_path}")
+            logger.info(f"Metrics dumped to: {abs_path}")
         except IOError as e:
-            logger.error(f"[Performance] Failed to dump metrics to {abs_path}: {e}")
+            logger.error(f"Failed to dump metrics to {abs_path}: {e}")
 
     @classmethod
     def log_request_summary(

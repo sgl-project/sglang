@@ -15,6 +15,7 @@
 
 import asyncio
 import copy
+import ctypes
 import dataclasses
 import logging
 import os
@@ -32,6 +33,7 @@ from http import HTTPStatus
 from typing import Any, Awaitable, Dict, List, Optional, Tuple, Union
 
 import fastapi
+import torch
 import uvloop
 import zmq
 import zmq.asyncio
@@ -117,6 +119,29 @@ from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
 logger = logging.getLogger(__name__)
+
+
+class TensorWrapper:
+    """Wrapper to keep tensor alive while exposing buffer for zero-copy."""
+
+    def __init__(self, tensor):
+        # Ensure tensor is on CPU and contiguous
+        if tensor.is_cuda:
+            tensor = tensor.cpu()
+        if not tensor.is_contiguous():
+            tensor = tensor.contiguous()
+
+        # Keep tensor reference
+        self.tensor = tensor
+        self.shape = list(tensor.shape)
+        self.dtype = tensor.dtype
+
+    def __buffer__(self):
+        data_ptr = self.tensor.data_ptr()
+        total_bytes = self.tensor.numel() * self.tensor.element_size()
+        c_obj = (ctypes.c_char * total_bytes).from_address(data_ptr)
+        c_obj._keep_alive_ref = self
+        return memoryview(c_obj)
 
 
 @dataclasses.dataclass
@@ -219,11 +244,12 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
 
     def init_model_config(self):
         server_args = self.server_args
+        model_config_class = getattr(self, "model_config_class", ModelConfig)
 
         # Read model args
         self.model_path = server_args.model_path
         self.served_model_name = server_args.served_model_name
-        self.model_config = ModelConfig.from_server_args(server_args)
+        self.model_config = model_config_class.from_server_args(server_args)
         self.is_generation = self.model_config.is_generation
         self.is_image_gen = self.model_config.is_image_gen
         self.context_len = self.model_config.context_len
@@ -232,11 +258,16 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         speculative_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
         )
-        self.reserve_input_token_num = (
-            0
-            if speculative_algorithm.is_none()
-            else server_args.speculative_num_draft_tokens
-        )
+        if speculative_algorithm.is_eagle():
+            # In the current eagle implementation, we store the draft tokens in the output token slots,
+            # so we need to reserve the space for the draft tokens.
+            self.num_reserved_tokens = max(
+                server_args.speculative_eagle_topk * server_args.speculative_num_steps,
+                server_args.speculative_num_draft_tokens,
+            )
+        else:
+            self.num_reserved_tokens = 0
+        self.validate_total_tokens = True
 
     def init_tokenizer_and_processor(self):
         server_args = self.server_args
@@ -424,7 +455,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
 
         if self.server_args.gc_warning_threshold_secs > 0.0:
             configure_gc_warning(self.server_args.gc_warning_threshold_secs)
-        self.watchdog = Watchdog.create(
+        self.soft_watchdog = Watchdog.create(
             debug_name="TokenizerManager",
             watchdog_timeout=self.server_args.soft_watchdog_timeout,
             soft=True,
@@ -456,11 +487,13 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         )
         self.init_communicators(self.server_args)
 
+        self.sampling_params_class = SamplingParams
+        self.signal_handler_class = SignalHandler
+
     async def generate_request(
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
         request: Optional[fastapi.Request] = None,
-        traceparent: Optional[str] = None,
     ):
         created_time = obj.received_time if obj.received_time else time.time()
         self.auto_create_handle_loop()
@@ -468,7 +501,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         # Normalize the request
         obj.normalize_batch_and_arguments()
         if self.enable_trace:
-            self._trace_request_start(obj, created_time, request, traceparent)
+            self._trace_request_start(obj, created_time, request)
         if self.server_args.language_only:
             self._handle_epd_disaggregation_encode_request(obj)
         if self.server_args.tokenizer_worker_num > 1:
@@ -723,9 +756,10 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         """Validates that the input token count and the requested token count doesn't exceed the model's context length."""
         # FIXME: unify the length validation logic with the one in the scheduler.
         _max_req_len = self.context_len
-
         input_token_num = len(input_ids) if input_ids is not None else 0
-        input_token_num += self.reserve_input_token_num
+        input_token_num += self.num_reserved_tokens
+
+        # Validate input length
         if input_token_num >= self.context_len:
             if self.server_args.allow_auto_truncate:
                 logger.warning(
@@ -741,16 +775,11 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                     f"model's context length ({self.context_len} tokens)."
                 )
 
-        if isinstance(obj, EmbeddingReqInput) and self.is_generation:
-            raise ValueError(
-                "This model does not appear to be an embedding model by default. "
-                "Please add `--is-embedding` when launching the server or try another model."
-            )
-
-        # Check total tokens (input + max_new_tokens)
+        # Validate total tokens (input + max_new_tokens)
         max_new_tokens = obj.sampling_params.get("max_new_tokens")
         if (
-            max_new_tokens is not None
+            self.validate_total_tokens
+            and max_new_tokens is not None
             and (max_new_tokens + input_token_num) >= _max_req_len
         ):
             if self.server_args.allow_auto_truncate:
@@ -773,10 +802,18 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 )
                 raise ValueError(error_msg)
 
-        # Matryoshka embeddings validations
+        # Validate embedding requests
+        if isinstance(obj, EmbeddingReqInput) and self.is_generation:
+            raise ValueError(
+                "This model does not appear to be an embedding model by default. "
+                "Please add `--is-embedding` when launching the server or try another model."
+            )
+
+        # Validate Matryoshka embeddings
         if isinstance(obj, EmbeddingReqInput):
             self._validate_for_matryoshka_dim(obj)
 
+        # Validate custom logit processor
         if isinstance(obj, GenerateReqInput):
             if (
                 obj.return_hidden_states
@@ -839,15 +876,22 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             )
 
     def _validate_input_ids_in_vocab(
-        self, input_ids: List[int], vocab_size: int
+        self, input_ids: Union[List[int], List[List[int]]], vocab_size: int
     ) -> None:
-        if any(id >= vocab_size for id in input_ids):
-            raise ValueError(
-                f"The input_ids {input_ids} contains values greater than the vocab size ({vocab_size})."
-            )
-
-    def _get_sampling_params(self, sampling_kwargs: Dict) -> SamplingParams:
-        return SamplingParams(**sampling_kwargs)
+        # Handle both single sequence and batch of sequences
+        if isinstance(input_ids[0], list):
+            # Batch of sequences
+            for seq in input_ids:
+                if any(id >= vocab_size for id in seq):
+                    raise ValueError(
+                        f"The input_ids {seq} contains values greater than the vocab size ({vocab_size})."
+                    )
+        else:
+            # Single sequence
+            if any(id >= vocab_size for id in input_ids):
+                raise ValueError(
+                    f"The input_ids {input_ids} contains values greater than the vocab size ({vocab_size})."
+                )
 
     def _create_tokenized_object(
         self,
@@ -866,7 +910,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             sampling_kwargs = {**self.preferred_sampling_params, **obj.sampling_params}
         else:
             sampling_kwargs = obj.sampling_params
-        sampling_params = self._get_sampling_params(sampling_kwargs)
+        sampling_params = self.sampling_params_class(**sampling_kwargs)
         sampling_params.normalize(self.tokenizer)
         sampling_params.verify(self.model_config.vocab_size)
 
@@ -1010,6 +1054,88 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             )
         )
 
+    @staticmethod
+    def extract_feature_tensors(tokenized_obj):
+        if not isinstance(tokenized_obj, TokenizedGenerateReqInput):
+            return False, None, None
+
+        has_feature_tensors = False
+        feature_wrappers = []
+        feature_infos = []
+
+        if hasattr(tokenized_obj, "mm_inputs") and tokenized_obj.mm_inputs:
+            mm_items = tokenized_obj.mm_inputs.get("mm_items", [])
+
+            for idx, item in enumerate(mm_items):
+                if (
+                    hasattr(item, "feature")
+                    and item.feature is not None
+                    and isinstance(item.feature, torch.Tensor)
+                ):
+                    has_feature_tensors = True
+
+                    # Create wrapper (handles CPU/contiguous conversion and keeps tensor alive)
+                    wrapper = TensorWrapper(item.feature)
+                    feature_wrappers.append(wrapper)
+
+                    # Store metadata (from wrapper for consistency)
+                    feature_info = {
+                        "idx": idx,
+                        "shape": wrapper.shape,
+                        "dtype": wrapper.dtype,
+                    }
+                    feature_infos.append(feature_info)
+
+                    # Clear original reference for pickling
+                    item.feature = None
+
+        return has_feature_tensors, feature_wrappers, feature_infos
+
+    def _send_multi_parts(self, sender, obj, copy=False):
+        has_feature_tensors = False
+        feature_wrappers = None
+        feature_infos = None
+        if not self.server_args.skip_tokenizer_init:
+            has_feature_tensors, feature_wrappers, feature_infos = (
+                TokenizerManager.extract_feature_tensors(obj)
+            )
+        if has_feature_tensors:
+            parts = [
+                b"FEAT",
+                pickle.dumps(obj),
+                pickle.dumps(feature_infos),
+            ]
+            # Add wrappers - they keep tensors alive and provide buffer interface
+            for wrapper in feature_wrappers:
+                parts.append(wrapper.__buffer__())
+            sender.send_multipart(parts, copy=copy)
+        else:
+            sender.send_multipart(
+                [
+                    b"NORM",
+                    pickle.dumps(obj),
+                ],
+                copy=False,
+            )
+
+    async def _send_multi_parts_async(self, sender, obj, copy=False):
+        has_feature_tensors = False
+        feature_wrappers = None
+        feature_infos = None
+
+        if not self.server_args.skip_tokenizer_init:
+            has_feature_tensors, feature_wrappers, feature_infos = (
+                TokenizerManager.extract_feature_tensors(obj)
+            )
+
+        if has_feature_tensors:
+            parts = [b"FEAT", pickle.dumps(obj), pickle.dumps(feature_infos)]
+            for wrapper in feature_wrappers:
+                parts.append(wrapper.__buffer__())
+            await sender.send_multipart(parts, copy=copy)
+        else:
+            await sender.send_multipart([b"NORM", pickle.dumps(obj)], copy=copy)
+
     def _send_one_request(
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
@@ -1018,7 +1144,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
     ):
         trace_slice_start(RequestStage.TOKENIZER_DISPATCH, obj.rid)
         tokenized_obj.trace_context = trace_get_proc_propagate_context(obj.rid)
-        self.send_to_scheduler.send_pyobj(tokenized_obj)
+        self._send_multi_parts(self.send_to_scheduler, tokenized_obj)
         state = ReqState([], False, asyncio.Event(), obj, created_time=created_time)
         state.request_sent_to_scheduler_ts = time.time()
         self.rid_to_state[obj.rid] = state
@@ -1040,8 +1166,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             batch_req = BatchTokenizedGenerateReqInput(batch=tokenized_objs)
         else:
             batch_req = BatchTokenizedEmbeddingReqInput(batch=tokenized_objs)
-
-        self.send_to_scheduler.send_pyobj(batch_req)
+        self._send_multi_parts(self.send_to_scheduler, batch_req)
         # Create states for each individual request in the batch
         for i, tokenized_obj in enumerate(tokenized_objs):
             tmp_obj = obj[i]
@@ -1264,7 +1389,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         if not abort_all and rid not in self.rid_to_state:
             return
         req = AbortReq(rid=rid, abort_all=abort_all)
-        self.send_to_scheduler.send_pyobj(req)
+        self._send_multi_parts(self.send_to_scheduler, req)
         if self.enable_metrics:
             # TODO: also use custom_labels from the request
             self.metrics_collector.observe_one_aborted_request(
@@ -1275,7 +1400,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         async with self.is_pause_cond:
             self.is_pause = True
             if obj.mode != "abort":
-                await self.send_to_scheduler.send_pyobj(obj)
+                await self._send_multi_parts_async(self.send_to_scheduler, obj)
             else:
                 # we are using the model_update_lock to check if there is still on-going requests.
                 while True:
@@ -1289,7 +1414,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
     async def continue_generation(self, obj: ContinueGenerationReqInput):
         async with self.is_pause_cond:
             self.is_pause = False
-            await self.send_to_scheduler.send_pyobj(obj)
+            await self._send_multi_parts_async(self.send_to_scheduler, obj)
             self.is_pause_cond.notify_all()
 
     async def update_weights_from_disk(
@@ -1334,7 +1459,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
     async def _wait_for_model_update_from_disk(
         self, obj: UpdateWeightFromDiskReqInput
     ) -> Tuple[bool, str]:
-        self.send_to_scheduler.send_pyobj(obj)
+        self._send_multi_parts(self.send_to_scheduler, obj)
         self.model_update_result = asyncio.Future()
         if self.server_args.dp_size == 1:
             result = await self.model_update_result
@@ -1369,7 +1494,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
 
     async def freeze_gc(self):
         """Send a freeze_gc message to the scheduler first, then freeze locally."""
-        self.send_to_scheduler.send_pyobj(FreezeGCReq())
+        self._send_multi_parts(self.send_to_scheduler, FreezeGCReq())
         freeze_gc("Tokenizer Manager")
         return None
 
@@ -1398,21 +1523,22 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         )
         self.event_loop = loop
 
-        # We cannot add signal handler when the tokenizer manager is not in
-        # the main thread due to the CPython limitation.
         if threading.current_thread() is threading.main_thread():
-            signal_handler = SignalHandler(self)
+            signal_handler = self.signal_handler_class(self)
             loop.add_signal_handler(signal.SIGTERM, signal_handler.sigterm_handler)
             # Update the signal handler for the process. It overrides the sigquit handler in the launch phase.
             loop.add_signal_handler(
                 signal.SIGQUIT, signal_handler.running_phase_sigquit_handler
             )
         else:
+            # We cannot add signal handler when the tokenizer manager is not in
+            # the main thread due to the CPython limitation.
             logger.warning(
                 "Signal handler is not added because the tokenizer manager is "
                 "not in the main thread. This disables graceful shutdown of the "
                 "tokenizer manager when SIGTERM is received."
             )
+
         self.asyncio_tasks.add(
             loop.create_task(print_exception_wrapper(self.sigterm_watchdog))
         )
@@ -1420,11 +1546,11 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
     async def handle_loop(self):
         """The event loop that handles requests"""
         while True:
-            with self.watchdog.disable():
+            with self.soft_watchdog.disable():
                 recv_obj = await self.recv_from_detokenizer.recv_pyobj()
             self._result_dispatcher(recv_obj)
             self.last_receive_tstamp = time.time()
-            self.watchdog.feed()
+            self.soft_watchdog.feed()
 
     def _handle_batch_output(
         self,
@@ -1486,9 +1612,11 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
 
             if getattr(recv_obj, "output_hidden_states", None):
                 meta_info["hidden_states"] = recv_obj.output_hidden_states[i]
-
             if getattr(recv_obj, "output_routed_experts", None):
                 meta_info["routed_experts"] = recv_obj.output_routed_experts[i]
+            if getattr(recv_obj, "customized_info", None):
+                for k, v in recv_obj.customized_info.items():
+                    meta_info[k] = v[i]
 
             if isinstance(recv_obj, BatchStrOutput):
                 state.text += recv_obj.output_strs[i]
@@ -1569,7 +1697,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             and recv_obj.load is not None
         ):
             load_update_req = WatchLoadUpdateReq(loads=[recv_obj.load])
-            self.send_to_scheduler.send_pyobj(load_update_req)
+            self._send_multi_parts(self.send_to_scheduler, load_update_req)
 
     def add_logprob_to_meta_info(
         self,
@@ -1819,6 +1947,14 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         ):
             meta_info[attr_name] = getattr(recv_obj, attr_name)[index]
 
+    def _request_has_grammar(self, obj: GenerateReqInput) -> bool:
+        return (
+            obj.sampling_params.get("json_schema", None)
+            or obj.sampling_params.get("regex", None)
+            or obj.sampling_params.get("ebnf", None)
+            or obj.sampling_params.get("structural_tag", None)
+        )
+
     def collect_metrics(self, state: ReqState, recv_obj: BatchStrOutput, i: int):
         completion_tokens = (
             recv_obj.completion_tokens[i]
@@ -1856,13 +1992,6 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 state.last_completion_tokens = completion_tokens
 
         if state.finished:
-            has_grammar = (
-                state.obj.sampling_params.get("json_schema", None)
-                or state.obj.sampling_params.get("regex", None)
-                or state.obj.sampling_params.get("ebnf", None)
-                or state.obj.sampling_params.get("structural_tag", None)
-            )
-
             retraction_count = (
                 recv_obj.retraction_counts[i]
                 if getattr(recv_obj, "retraction_counts", None)
@@ -1876,7 +2005,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 completion_tokens,
                 recv_obj.cached_tokens[i],
                 state.finished_time - state.created_time,
-                has_grammar,
+                self._request_has_grammar(state.obj),
                 retraction_count,
             )
 
@@ -2131,7 +2260,6 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         obj: Union[GenerateReqInput, EmbeddingReqInput],
         created_time: Optional[float] = None,
         request: Optional[fastapi.Request] = None,
-        traceparent: Optional[str] = None,
     ):
         external_trace_header = None
         if request:
@@ -2139,11 +2267,11 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 trace_set_remote_propagate_context(request.headers["trace_context"])
             else:
                 external_trace_header = extract_trace_headers(request.headers)
-        elif traceparent:
-            # When the request comes form the rust grpc server there isn't a
-            # real request object but we still need to propagate the traceparent from
-            # the traceparent that is explicitly passed in
-            external_trace_header = {"traceparent": traceparent}
+        elif obj.external_trace_header:
+            # When the request comes form the rust grpc server or Engine there isn't a
+            # real request object but we still need to propagate the trace context from
+            # the trace context that is explicitly passed in
+            external_trace_header = obj.external_trace_header
 
         if obj.is_single:
             bootstrap_room = (
