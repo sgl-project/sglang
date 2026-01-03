@@ -88,7 +88,7 @@ def _create_scheduler(name: str):
 def main(args: argparse.Namespace) -> pl.DataFrame:
     requests = _load_requests(args)
     router = _create_router(args.router)
-    scheduler = _create_scheduler(args.scheduler, args.max_total_tokens)
+    scheduler = _create_scheduler(args.scheduler)
 
     sim = Simulator(
         num_gpus=args.num_gpus,
@@ -96,6 +96,7 @@ def main(args: argparse.Namespace) -> pl.DataFrame:
         scheduler=scheduler,
         recorders=[BatchSizeBalancednessRecorder(), AttentionBalancednessRecorder()],
         log_level=args.log_level,
+        max_total_tokens=args.max_total_tokens,
     )
 
     print(

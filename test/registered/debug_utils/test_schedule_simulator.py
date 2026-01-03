@@ -115,51 +115,34 @@ class TestRouters(CustomTestCase):
 
 
 class TestFIFOScheduler(CustomTestCase):
-    def test_basic_token_limit(self):
-        # max_total_tokens=200, each req has seq_len=100, so only 2 can run
-        scheduler = FIFOScheduler(max_total_tokens=200)
+    def test_schedule_returns_all_pending(self):
+        # FIFOScheduler.schedule() returns all pending requests
+        scheduler = FIFOScheduler()
         gpu = GPUState(gpu_id=0)
         gpu.pending_requests = [
             SimRequest(request_id=f"r{i}", input_len=100, output_len=50)
             for i in range(5)
         ]
         decision = scheduler.schedule(gpu)
-        self.assertEqual(len(decision.to_run), 2)
-        self.assertEqual(len(decision.to_preempt), 0)
+        self.assertEqual(len(decision.to_run), 5)
 
-    def test_respects_running_tokens(self):
-        # max_total_tokens=300, running has 100 tokens, so 2 more pending can run
-        scheduler = FIFOScheduler(max_total_tokens=300)
+    def test_select_victim_lifo(self):
+        # select_victim returns the last running request (LIFO)
+        scheduler = FIFOScheduler()
         gpu = GPUState(gpu_id=0)
         gpu.running_requests = [
-            SimRequest(request_id="running", input_len=100, output_len=50)
-        ]
-        gpu.pending_requests = [
             SimRequest(request_id=f"r{i}", input_len=100, output_len=50)
-            for i in range(5)
-        ]
-        decision = scheduler.schedule(gpu)
-        self.assertEqual(len(decision.to_run), 2)
-
-    def test_preemption_when_over_budget(self):
-        # Simulate: running requests grow beyond max_total_tokens
-        scheduler = FIFOScheduler(max_total_tokens=250)
-        gpu = GPUState(gpu_id=0)
-        # 3 requests with 100 tokens each = 300 tokens, over budget of 250
-        gpu.running_requests = [
-            SimRequest(
-                request_id=f"r{i}",
-                input_len=100,
-                output_len=50,
-                stage=RequestStage.DECODE,
-                decoded_tokens=0,
-            )
             for i in range(3)
         ]
-        decision = scheduler.schedule(gpu)
-        # Should preempt 1 request to get under 250
-        self.assertEqual(len(decision.to_preempt), 1)
-        self.assertEqual(decision.to_preempt[0].request_id, "r2")  # LIFO: last added
+        victim = scheduler.select_victim(gpu)
+        self.assertEqual(victim.request_id, "r2")  # Last added
+
+    def test_select_victim_empty(self):
+        # select_victim returns None when no running requests
+        scheduler = FIFOScheduler()
+        gpu = GPUState(gpu_id=0)
+        victim = scheduler.select_victim(gpu)
+        self.assertIsNone(victim)
 
 
 class TestMetrics(CustomTestCase):
@@ -307,11 +290,12 @@ class TestSimulator(CustomTestCase):
         sim = Simulator(
             num_gpus=2,
             router=RoundRobinRouter(),
-            scheduler=FIFOScheduler(max_total_tokens=100),
+            scheduler=FIFOScheduler(),
             recorders=[
                 BatchSizeBalancednessRecorder(),
                 AttentionBalancednessRecorder(),
             ],
+            max_total_tokens=100,
         )
         result = sim.run(requests)
         self.assertIsInstance(result, SimulationResult)
