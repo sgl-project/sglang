@@ -609,6 +609,9 @@ pub async fn concurrency_limit_middleware(
 /// Global counter for active HTTP connections (handlers currently executing)
 static ACTIVE_HTTP_CONNECTIONS: AtomicU64 = AtomicU64::new(0);
 
+/// Global counter for generating unique in-flight tracking IDs
+static INFLIGHT_TRACKING_COUNTER: AtomicU64 = AtomicU64::new(0);
+
 /// Tower Layer for HTTP metrics collection (SMG Layer 1 metrics)
 #[derive(Clone, Copy, Default)]
 pub struct HttpMetricsLayer;
@@ -653,11 +656,8 @@ where
         let path = normalize_path_for_metrics(req.uri().path());
         let start = Instant::now();
 
-        // Extract request ID for in-flight tracking (set by RequestIdMiddleware)
-        let request_id = req
-            .extensions()
-            .get::<RequestId>()
-            .map(|r| r.0.clone());
+        // Generate a unique ID for in-flight tracking
+        let tracking_id = INFLIGHT_TRACKING_COUNTER.fetch_add(1, Ordering::Relaxed);
 
         let mut inner = self.inner.clone();
 
@@ -667,16 +667,17 @@ where
             Metrics::set_http_connections_active(active as usize);
 
             // Register request in in-flight tracker
-            if let (Some(ref req_id), Some(tracker)) = (&request_id, get_tracker()) {
-                tracker.register(req_id);
+            let tracking_key = tracking_id.to_string();
+            if let Some(tracker) = get_tracker() {
+                tracker.register(&tracking_key);
             }
 
             // Capture result before decrementing to ensure decrement happens on error too
             let result = inner.call(req).await;
 
             // Always deregister from in-flight tracker, regardless of success or failure
-            if let (Some(ref req_id), Some(tracker)) = (&request_id, get_tracker()) {
-                tracker.deregister(req_id);
+            if let Some(tracker) = get_tracker() {
+                tracker.deregister(&tracking_key);
             }
 
             // Always decrement, regardless of success or failure

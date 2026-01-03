@@ -33,7 +33,9 @@ impl InFlightRequestTracker {
         tracker
     }
 
-    #[cfg(test)]
+    /// Creates a new tracker without spawning the background sampler.
+    /// Used for testing purposes.
+    #[doc(hidden)]
     pub fn new_for_test() -> Self {
         Self {
             requests: DashMap::new(),
@@ -50,22 +52,22 @@ impl InFlightRequestTracker {
         self.requests.remove(request_id);
     }
 
-    #[cfg(test)]
+    #[doc(hidden)]
     pub fn len(&self) -> usize {
         self.requests.len()
     }
 
-    #[cfg(test)]
+    #[doc(hidden)]
     pub fn is_empty(&self) -> bool {
         self.requests.is_empty()
     }
 
-    #[cfg(test)]
+    #[doc(hidden)]
     pub fn insert_with_time(&self, request_id: &str, start_time: Instant) {
         self.requests.insert(request_id.to_string(), start_time);
     }
 
-    #[cfg(test)]
+    #[doc(hidden)]
     pub fn compute_bucket_counts(&self) -> [usize; 6] {
         let now = Instant::now();
         let mut cumulative_counts = [0usize; AGE_BUCKET_LABELS.len()];
