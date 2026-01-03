@@ -709,6 +709,30 @@ step=13   | GPU0[R=0:- Q=0:-]""",
         self.assertEqual(result.returncode, 0, f"CLI failed: {result.stderr}")
         self.assertIn("R=2:", result.stdout)
 
+        result = self._run_cli(
+            "--synth-gsp",
+            "--synth-gsp-num-groups",
+            "1",
+            "--synth-gsp-prompts-per-group",
+            "2",
+            "--synth-gsp-system-prompt-len",
+            "10",
+            "--synth-gsp-question-len",
+            "50",
+            "--synth-gsp-output-len",
+            "2",
+            "--synth-seed",
+            "42",
+            "--num-gpus",
+            "1",
+            "--max-total-tokens",
+            "80",
+            "--log-level",
+            "2",
+        )
+        self.assertEqual(result.returncode, 0, f"CLI failed: {result.stderr}")
+        self.assertNotIn("R=2:", result.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()
