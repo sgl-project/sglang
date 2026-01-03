@@ -1,3 +1,4 @@
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 from sglang.srt.debug_utils.schedule_simulator.gpu_state import GPUState
@@ -5,6 +6,23 @@ from sglang.srt.debug_utils.schedule_simulator.metrics import MetricRecorder
 from sglang.srt.debug_utils.schedule_simulator.request import RequestStage, SimRequest
 from sglang.srt.debug_utils.schedule_simulator.routers.base import RouterPolicy
 from sglang.srt.debug_utils.schedule_simulator.schedulers.base import SchedulerPolicy
+
+
+@dataclass
+class StepRecord:
+    step: int
+    gpu_id: int
+    running_count: int
+    pending_count: int
+    total_seq_len: int
+    running_req_ids: List[str] = field(default_factory=list)
+    pending_req_ids: List[str] = field(default_factory=list)
+
+
+@dataclass
+class SimulationResult:
+    step_records: List[StepRecord]
+    summary: Dict[str, Any]
 
 
 class Simulator:
@@ -23,10 +41,11 @@ class Simulator:
         self.gpu_states: List[GPUState] = []
         self.log_level = log_level
 
-    def run(self, requests: List[SimRequest]) -> Dict[str, Any]:
+    def run(self, requests: List[SimRequest]) -> SimulationResult:
         self.gpu_states = [GPUState(gpu_id=i) for i in range(self.num_gpus)]
         incoming_requests = list(requests)
         step = 0
+        step_records: List[StepRecord] = []
 
         while self._has_work(incoming_requests):
             self._route_requests(incoming_requests)
@@ -34,12 +53,16 @@ class Simulator:
 
             self._schedule_all_gpus()
             self._execute_step()
+            self._collect_step_records(step, step_records)
             self._log_step(step)
             self._record_metrics(step)
 
             step += 1
 
-        return self._get_summary()
+        return SimulationResult(
+            step_records=step_records,
+            summary=self._get_summary(),
+        )
 
     def _has_work(self, incoming_requests: List[SimRequest]) -> bool:
         if incoming_requests:
@@ -72,7 +95,6 @@ class Simulator:
         for gpu in self.gpu_states:
             finished = []
             for req in gpu.running_requests:
-                # Prefill is instant, immediately transition to decode
                 if req.stage == RequestStage.PREFILL:
                     req.stage = RequestStage.DECODE
 
@@ -83,6 +105,20 @@ class Simulator:
 
             for req in finished:
                 gpu.running_requests.remove(req)
+
+    def _collect_step_records(self, step: int, step_records: List[StepRecord]) -> None:
+        for gpu in self.gpu_states:
+            step_records.append(
+                StepRecord(
+                    step=step,
+                    gpu_id=gpu.gpu_id,
+                    running_count=len(gpu.running_requests),
+                    pending_count=len(gpu.pending_requests),
+                    total_seq_len=gpu.total_seq_len(),
+                    running_req_ids=[r.request_id for r in gpu.running_requests],
+                    pending_req_ids=[r.request_id for r in gpu.pending_requests],
+                )
+            )
 
     def _log_step(self, step: int) -> None:
         if self.log_level == 0:
