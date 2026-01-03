@@ -34,7 +34,7 @@ def generate_random_requests(
         osl = _random_len(output_len, range_ratio)
         requests.append(
             SimRequest(
-                request_id=f"synthetic_{i}",
+                request_id=f"syn{i}",
                 input_len=isl,
                 output_len=osl,
             )
