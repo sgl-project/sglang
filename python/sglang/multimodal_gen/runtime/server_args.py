@@ -208,7 +208,7 @@ class ServerArgs:
     enable_torch_compile: bool = False
 
     # warmup
-    enable_warmup: bool = False
+    warmup: bool = False
     warmup_resolutions: list[str] = None
 
     disable_autocast: bool | None = None
@@ -296,11 +296,11 @@ class ServerArgs:
 
         # handle warmup
         if self.warmup_resolutions is not None:
-            self.enable_warmup = True
+            self.warmup = True
 
-        if self.enable_warmup:
+        if self.warmup:
             logger.info(
-                "Warmup enabled, the launch time is expected be longer than usual"
+                "Warmup enabled, the launch time is expected to be longer than usual"
             )
 
         # network initialization: port and host
@@ -474,7 +474,7 @@ class ServerArgs:
         parser.add_argument(
             "--warmup",
             action=StoreBoolean,
-            default=ServerArgs.enable_warmup,
+            default=ServerArgs.warmup,
             help="Perform some warmup after server starts (if `--warmup-resolutions` is specified) or before processing the first request (if `--warmup-resolutions` is not specified)."
             "Recommended to enable when benchmarking to ensure fair comparison and best performance."
             "When enabled with `--warmup-resolutions` unspecified, look for the line ending with `(with warmup excluded)` for actual processing time.",
@@ -484,7 +484,7 @@ class ServerArgs:
             type=str,
             nargs="+",
             default=ServerArgs.warmup_resolutions,
-            help="Specify resolutions for server to warmup",
+            help="Specify resolutions for server to warmup. e.g., `--warmup-resolutions 256x256, 720x720`",
         )
 
         parser.add_argument(
