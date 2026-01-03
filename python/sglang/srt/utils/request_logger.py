@@ -21,7 +21,7 @@ import socket
 from datetime import datetime
 from functools import lru_cache
 from logging.handlers import TimedRotatingFileHandler
-from typing import TYPE_CHECKING, Any, List, Optional, Set, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple, Union
 
 import torch.distributed as dist
 
@@ -29,9 +29,22 @@ from sglang.srt.environ import envs
 from sglang.srt.utils.common import get_bool_env_var
 
 if TYPE_CHECKING:
+    import fastapi
+
     from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
 
 logger = logging.getLogger(__name__)
+
+WHITELISTED_HEADERS = ["x-smg-routing-key"]
+
+
+def _extract_whitelisted_headers(
+    request: Optional["fastapi.Request"],
+) -> Optional[Dict[str, str]]:
+    if request is None:
+        return None
+    result = {h: request.headers.get(h) for h in WHITELISTED_HEADERS if request.headers.get(h)}
+    return result if result else None
 
 
 class RequestLogger:
@@ -79,21 +92,28 @@ class RequestLogger:
         self.targets = self._setup_targets()
 
     def log_received_request(
-        self, obj: Union["GenerateReqInput", "EmbeddingReqInput"], tokenizer: Any = None
+        self,
+        obj: Union["GenerateReqInput", "EmbeddingReqInput"],
+        tokenizer: Any = None,
+        request: Optional["fastapi.Request"] = None,
     ) -> None:
         if not self.log_requests:
             return
 
         max_length, skip_names, _ = self.metadata
+        headers = _extract_whitelisted_headers(request)
         if self.log_requests_format == "json":
             log_data = {
                 "rid": obj.rid,
                 "obj": _transform_data_for_logging(obj, max_length, skip_names),
             }
+            if headers:
+                log_data["headers"] = headers
             self._log_json("request.received", log_data)
         else:
+            headers_str = f", headers={headers}" if headers else ""
             self._log(
-                f"Receive: obj={_dataclass_to_string_truncated(obj, max_length, skip_names=skip_names)}"
+                f"Receive: obj={_dataclass_to_string_truncated(obj, max_length, skip_names=skip_names)}{headers_str}"
             )
 
         # FIXME: This is a temporary fix to get the text from the input ids.
@@ -112,6 +132,7 @@ class RequestLogger:
         obj: Union["GenerateReqInput", "EmbeddingReqInput"],
         out: Any,
         is_multimodal_gen: bool = False,
+        request: Optional["fastapi.Request"] = None,
     ) -> None:
         if not self.log_requests:
             return
@@ -121,21 +142,25 @@ class RequestLogger:
             return
 
         max_length, skip_names, out_skip_names = self.metadata
+        headers = _extract_whitelisted_headers(request)
         if self.log_requests_format == "json":
             log_data = {
                 "rid": obj.rid,
                 "obj": _transform_data_for_logging(obj, max_length, skip_names),
             }
+            if headers:
+                log_data["headers"] = headers
             if not is_multimodal_gen:
                 log_data["out"] = _transform_data_for_logging(
                     out, max_length, out_skip_names
                 )
             self._log_json("request.finished", log_data)
         else:
+            headers_str = f", headers={headers}" if headers else ""
             if is_multimodal_gen:
-                msg = f"Finish: obj={_dataclass_to_string_truncated(obj, max_length, skip_names=skip_names)}"
+                msg = f"Finish: obj={_dataclass_to_string_truncated(obj, max_length, skip_names=skip_names)}{headers_str}"
             else:
-                msg = f"Finish: obj={_dataclass_to_string_truncated(obj, max_length, skip_names=skip_names)}, out={_dataclass_to_string_truncated(out, max_length, skip_names=out_skip_names)}"
+                msg = f"Finish: obj={_dataclass_to_string_truncated(obj, max_length, skip_names=skip_names)}, out={_dataclass_to_string_truncated(out, max_length, skip_names=out_skip_names)}{headers_str}"
             self._log(msg)
 
     def _compute_metadata(
