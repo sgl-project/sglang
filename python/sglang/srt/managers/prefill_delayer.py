@@ -1,6 +1,10 @@
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.utils import get_bool_env_var
+
+
+_DEBUG_LOG = get_bool_env_var("SGLANG_PREFILL_DELAYER_DEBUG_LOG")
 
 
 class PrefillDelayer:
@@ -28,9 +32,9 @@ class PrefillDelayer:
             not server_args.disable_overlap_schedule
         ), "To use PrefillDelayer, disable_overlap_schedule must be False."
 
-    def _gather_info(self, local_can_prefill: int):
+    def _gather_info(self, local_prefillable: int):
         local_info = torch.tensor(
-            [local_can_prefill],
+            [local_prefillable],
             device="cpu",
             dtype=torch.int64,
         )
@@ -42,13 +46,14 @@ class PrefillDelayer:
         tp0_info = self.global_info[:, 0, :]
         return tp0_info
 
-    def should_allow_prefill(self, local_can_prefill: int) -> bool:
-        tp0_info = self._gather_info(local_can_prefill=local_can_prefill)
-        global_can_prefill = tp0_info[:, 0]
-        global_exists_cannot_prefill = global_can_prefill.min().item() == 0
-        global_exists_can_prefill = global_can_prefill.max().item() > 0
+    def should_allow_prefill(self, local_prefillable: int) -> bool:
+        tp0_info = self._gather_info(local_prefillable=local_prefillable)
+        global_prefillable = tp0_info[:, 0]
+        global_exists_not_prefillable = global_prefillable.min().item() == 0
+        global_exists_prefillable = global_prefillable.max().item() > 0
+        global_mixed_prefillable = global_exists_not_prefillable and global_exists_prefillable
 
-        if global_exists_cannot_prefill and global_exists_can_prefill:
+        if global_mixed_prefillable:
             self.curr_delayed_count += 1
             if self.curr_delayed_count < self.max_delay_passes:
                 return False
