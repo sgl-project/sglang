@@ -67,8 +67,6 @@ _DP: Optional[GroupCoordinator] = None
 _DIT: Optional[GroupCoordinator] = None
 _VAE: Optional[GroupCoordinator] = None
 
-logger = init_logger(__name__)
-
 TensorMetadata = namedtuple("TensorMetadata", ["device", "dtype", "size"])
 
 
@@ -342,7 +340,9 @@ def initialize_model_parallel(
     """
 
     if backend is None:
-        backend = envs.get_torch_distributed_backend()
+        from sglang.multimodal_gen.runtime.platforms import current_platform
+
+        backend = current_platform.get_torch_distributed_backend_str()
     # Get world size and rank. Ensure some consistencies.
     assert torch.distributed.is_initialized()
     world_size: int = torch.distributed.get_world_size()
@@ -404,15 +404,25 @@ def initialize_model_parallel(
     global _SP
     assert _SP is None, "sequence parallel group is already initialized"
 
-    from yunchang import set_seq_parallel_pg
-    from yunchang.globals import PROCESS_GROUP
+    try:
+        from .yunchang import PROCESS_GROUP as _YC_PROCESS_GROUP
+        from .yunchang import set_seq_parallel_pg as _set_seq_parallel_pg
+    except ImportError:
+        _set_seq_parallel_pg = None
 
-    set_seq_parallel_pg(
-        sp_ulysses_degree=ulysses_degree,
-        sp_ring_degree=ring_degree,
-        rank=get_world_group().rank_in_group,
-        world_size=dit_parallel_size,
-    )
+        class _DummyProcessGroup:
+            ULYSSES_PG = torch.distributed.group.WORLD
+            RING_PG = torch.distributed.group.WORLD
+
+        PROCESS_GROUP = _DummyProcessGroup()
+    else:
+        _set_seq_parallel_pg(
+            sp_ulysses_degree=ulysses_degree,
+            sp_ring_degree=ring_degree,
+            rank=get_world_group().rank_in_group,
+            world_size=dit_parallel_size,
+        )
+        PROCESS_GROUP = _YC_PROCESS_GROUP
 
     _SP = init_parallel_group_coordinator(
         group_ranks=rank_generator.get_ranks("sp"),

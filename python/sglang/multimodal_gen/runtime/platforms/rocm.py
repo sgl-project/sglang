@@ -6,6 +6,8 @@
 This file is a platform abstraction for ROCm GPUs,
 adjusted to match the structure and interface of `cuda.py`.
 """
+from functools import lru_cache
+from typing import Any
 
 import torch
 
@@ -39,6 +41,7 @@ class RocmPlatform(Platform):
         return str(torch.cuda.get_device_name(device_id))
 
     @classmethod
+    @lru_cache(maxsize=1)
     def get_device_total_memory(cls, device_id: int = 0) -> int:
         return torch.cuda.get_device_properties(device_id).total_memory
 
@@ -62,6 +65,28 @@ class RocmPlatform(Platform):
         return float(torch.cuda.max_memory_allocated(device))
 
     @classmethod
+    def get_available_gpu_memory(
+        cls,
+        device_id: int = 0,
+        distributed: bool = False,
+        empty_cache: bool = True,
+        cpu_group: Any = None,
+    ) -> float:
+        if empty_cache:
+            torch.cuda.empty_cache()
+
+        free_gpu_memory, _ = torch.cuda.mem_get_info(device_id)
+
+        if distributed:
+            import torch.distributed as dist
+
+            tensor = torch.tensor(free_gpu_memory, dtype=torch.float32, device="cuda")
+            dist.all_reduce(tensor, op=dist.ReduceOp.MIN, group=cpu_group)
+            free_gpu_memory = float(tensor.item())
+
+        return free_gpu_memory / (1 << 30)
+
+    @classmethod
     def get_attn_backend_cls_str(
         cls,
         selected_backend: AttentionBackendEnum | None,
@@ -79,6 +104,19 @@ class RocmPlatform(Platform):
 
         elif selected_backend in (AttentionBackendEnum.FA, None):
             pass
+
+        elif selected_backend == AttentionBackendEnum.AITER:
+            if dtype not in (torch.float16, torch.bfloat16):
+                logger.warning(
+                    "AITer backend only supports fp16/bf16 inputs but got dtype=%s. "
+                    "Falling back to Torch SDPA backend.",
+                    dtype,
+                )
+                # TODO: need to compare triton with sdpa as an alternative backend
+                return "sglang.multimodal_gen.runtime.layers.attention.backends.sdpa.SDPABackend"
+
+            logger.info("Using AITer backend on ROCm.")
+            return "sglang.multimodal_gen.runtime.layers.attention.backends.aiter.AITerBackend"
 
         elif selected_backend in (
             AttentionBackendEnum.SLIDING_TILE_ATTN,

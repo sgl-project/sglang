@@ -12,13 +12,6 @@ from sglang.srt.layers.attention.fla.op import exp
 from sglang.srt.layers.attention.fla.utils import input_guard
 
 
-@triton.heuristics(
-    {
-        "USE_INITIAL_STATE": lambda args: args["h0"] is not None,
-        "STORE_FINAL_STATE": lambda args: args["ht"] is not None,
-        "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
-    }
-)
 @triton.jit(do_not_specialize=["T"])
 def fused_recurrent_gated_delta_rule_fwd_kernel(
     q,
@@ -175,8 +168,11 @@ def fused_recurrent_gated_delta_rule_fwd(
         V=V,
         BK=BK,
         BV=BV,
+        USE_INITIAL_STATE=initial_state is not None,
+        STORE_FINAL_STATE=final_state is not None,
         IS_BETA_HEADWISE=beta.ndim == v.ndim,
         USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
+        IS_VARLEN=cu_seqlens is not None,
         IS_KDA=False,
         num_warps=num_warps,
         num_stages=num_stages,
@@ -344,18 +340,6 @@ def fused_recurrent_gated_delta_rule(
 # 3
 # When calculating token 3's attention, it should attend to token 1 (parent) and token 0 (grand-parent)
 # When calculating token 2's attention, it should attend to token 0 (parent)
-@triton.heuristics(
-    {
-        "USE_INITIAL_STATE": lambda args: args["h0_source"] is not None,
-        "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
-        "CACHE_INTERMEDIATE_STATES": lambda args: args["intermediate_states_buffer"]
-        is not None,
-        "HAS_EAGLE_TREE_CUSTOM_ATTN_MASK": lambda args: args[
-            "retrieve_parent_token_ptr"
-        ]
-        is not None,
-    }
-)
 @triton.jit(do_not_specialize=["T"])
 def fused_recurrent_gated_delta_rule_update_fwd_kernel(
     q,
@@ -369,6 +353,7 @@ def fused_recurrent_gated_delta_rule_update_fwd_kernel(
     cu_seqlens,
     scale,
     intermediate_states_buffer,
+    intermediate_state_indices,
     cache_steps,
     retrieve_parent_token_ptr,
     stride_retrieve_parent_token_seq: tl.constexpr,
@@ -447,7 +432,7 @@ def fused_recurrent_gated_delta_rule_update_fwd_kernel(
     # Prepare intermediate state cache variables if enabled
     cache_idx = -1
     if CACHE_INTERMEDIATE_STATES:
-        cache_idx = tl.load(h0_indices + i_n)
+        cache_idx = tl.load(intermediate_state_indices + i_n)
 
     step_idx = 0
     for _ in range(0, T):
@@ -548,6 +533,7 @@ def fused_recurrent_gated_delta_rule_update_fwd(
     disable_state_update: bool = False,
     disable_output_calculation: bool = False,
     intermediate_states_buffer: Optional[torch.Tensor] = None,
+    intermediate_state_indices: Optional[torch.Tensor] = None,
     cache_steps: Optional[int] = None,
     retrieve_parent_token: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
@@ -590,6 +576,7 @@ def fused_recurrent_gated_delta_rule_update_fwd(
         cu_seqlens=cu_seqlens,
         scale=scale,
         intermediate_states_buffer=intermediate_states_buffer,
+        intermediate_state_indices=intermediate_state_indices,
         cache_steps=0 if cache_steps is None else cache_steps,
         retrieve_parent_token_ptr=retrieve_parent_token,
         stride_retrieve_parent_token_seq=stride_retrieve_parent_token_seq,
@@ -603,6 +590,10 @@ def fused_recurrent_gated_delta_rule_update_fwd(
         V=V,
         BK=BK,
         BV=BV,
+        USE_INITIAL_STATE=initial_state_source is not None,
+        IS_VARLEN=cu_seqlens is not None,
+        CACHE_INTERMEDIATE_STATES=intermediate_states_buffer is not None,
+        HAS_EAGLE_TREE_CUSTOM_ATTN_MASK=retrieve_parent_token is not None,
         IS_BETA_HEADWISE=beta.ndim == v.ndim,
         USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
         DISABLE_STATE_UPDATE=disable_state_update,
@@ -633,6 +624,7 @@ class FusedRecurrentUpdateFunction(torch.autograd.Function):
         disable_state_update: bool = False,
         disable_output_calculation: bool = False,
         intermediate_states_buffer: Optional[torch.Tensor] = None,
+        intermediate_state_indices: Optional[torch.Tensor] = None,
         cache_steps: Optional[int] = None,
         retrieve_parent_token: Optional[torch.Tensor] = None,
     ):
@@ -650,6 +642,7 @@ class FusedRecurrentUpdateFunction(torch.autograd.Function):
             disable_state_update=disable_state_update,
             disable_output_calculation=disable_output_calculation,
             intermediate_states_buffer=intermediate_states_buffer,
+            intermediate_state_indices=intermediate_state_indices,
             cache_steps=cache_steps,
             retrieve_parent_token=retrieve_parent_token,
         )
@@ -680,6 +673,7 @@ def fused_recurrent_gated_delta_rule_update(
     disable_state_update: bool = False,
     disable_output_calculation: bool = False,
     intermediate_states_buffer: Optional[torch.Tensor] = None,
+    intermediate_state_indices: Optional[torch.Tensor] = None,
     cache_steps: Optional[int] = None,
     retrieve_parent_token: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
@@ -689,14 +683,17 @@ def fused_recurrent_gated_delta_rule_update(
                 f"The batch size is expected to be 1 rather than {q.shape[0]} when using `cu_seqlens`."
                 f"Please flatten variable-length inputs before processing."
             )
-        if (
-            initial_state_source is not None
-            and initial_state_indices.shape[0] != len(cu_seqlens) - 1
-        ):
-            raise ValueError(
-                f"The number of initial states is expected to be equal to the number of input sequences, "
-                f"i.e., {len(cu_seqlens) - 1} rather than {initial_state_indices.shape[0]}."
-            )
+        if initial_state_source is not None:
+            if initial_state_indices.shape[0] != len(cu_seqlens) - 1:
+                raise ValueError(
+                    f"The number of initial states is expected to be equal to the number of input sequences, "
+                    f"i.e., {len(cu_seqlens) - 1} rather than {initial_state_indices.shape[0]}."
+                )
+            if initial_state_indices.shape[0] != intermediate_state_indices.shape[0]:
+                raise ValueError(
+                    f"The number of intermediate state indices is expected to be equal to the number of input sequences, "
+                    f"i.e., {initial_state_indices.shape[0]} != {intermediate_state_indices.shape[0]}."
+                )
     if scale is None:
         scale = k.shape[-1] ** -0.5
     else:
@@ -717,6 +714,7 @@ def fused_recurrent_gated_delta_rule_update(
         disable_state_update,
         disable_output_calculation,
         intermediate_states_buffer,
+        intermediate_state_indices,
         cache_steps,
         retrieve_parent_token,
     )

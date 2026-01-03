@@ -649,7 +649,6 @@ class RadixCache(BasePrefixCache):
     def _split_node(self, key: RadixKey, child: TreeNode, split_len: int):
         # new_node -> child
         # New node inherits child's priority (represents shared prefix)
-        self._record_remove_event(child)
         new_node = TreeNode(priority=child.priority)
         new_node.children = {self.get_child_key_fn(key[split_len:]): child}
         new_node.parent = child.parent
@@ -730,10 +729,10 @@ class RadixCache(BasePrefixCache):
                 ), f"{key=}, {self.get_child_key_fn(child.key)=}"
 
     def _delete_leaf(self, node):
-        for k, v in node.parent.children.items():
-            if v == node:
-                break
-        del node.parent.children[k]
+        key = self.get_child_key_fn(node.key)
+        v = node.parent.children.pop(key, None)
+        assert v == node, f"parent does not have child key, {key}"
+
         self.evictable_size_ -= len(node.key)
 
     def _total_size_helper(self):

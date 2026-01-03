@@ -3,11 +3,12 @@ from typing import Optional
 import torch
 
 from sglang.srt.utils import is_cuda
+from sglang.srt.utils.custom_op import register_custom_op
 
 _is_cuda = is_cuda()
 
 if _is_cuda:
-    from sgl_kernel import silu_and_mul
+    from sgl_kernel import moe_sum_reduce, silu_and_mul
 
 
 def get_scalar_type(num_bits: int, has_zp: bool):
@@ -20,6 +21,7 @@ def get_scalar_type(num_bits: int, has_zp: bool):
         return scalar_types.uint4b8 if num_bits == 4 else scalar_types.uint8b128
 
 
+@register_custom_op(out_shape="hidden_states")
 def fused_marlin_moe(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
@@ -41,7 +43,7 @@ def fused_marlin_moe(
     num_bits: int = 8,
     is_k_full: bool = True,
     inplace: bool = False,
-    routed_scaling_factor: float = None,
+    routed_scaling_factor: Optional[float] = None,
 ) -> torch.Tensor:
     """
     This function computes a Mixture of Experts (MoE) layer using two sets of
@@ -204,30 +206,13 @@ def fused_marlin_moe(
     ).view(-1, topk, K)
 
     output = hidden_states if inplace else torch.empty_like(hidden_states)
-    torch.sum(intermediate_cache3.view(*intermediate_cache3.shape), dim=1, out=output)
-    if routed_scaling_factor is not None:
-        output *= routed_scaling_factor
+
+    if routed_scaling_factor is None:
+        routed_scaling_factor = 1.0
+
+    moe_sum_reduce(
+        intermediate_cache3,
+        output,
+        routed_scaling_factor,
+    )
     return output
-
-
-def fused_marlin_moe_fake(
-    hidden_states: torch.Tensor,
-    w1: torch.Tensor,
-    w2: torch.Tensor,
-    w1_scale: torch.Tensor,
-    w2_scale: torch.Tensor,
-    gating_output: torch.Tensor,
-    topk_weights: torch.Tensor,
-    topk_ids: torch.Tensor,
-    g_idx1: Optional[torch.Tensor] = None,
-    g_idx2: Optional[torch.Tensor] = None,
-    sort_indices1: Optional[torch.Tensor] = None,
-    sort_indices2: Optional[torch.Tensor] = None,
-    w1_zeros: Optional[torch.Tensor] = None,
-    w2_zeros: Optional[torch.Tensor] = None,
-    num_bits: int = 8,
-    is_k_full: bool = True,
-    inplace: bool = False,
-    routed_scaling_factor: float = None,
-) -> torch.Tensor:
-    return torch.empty_like(hidden_states)

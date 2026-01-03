@@ -35,7 +35,7 @@ class TestAscendDeepEP(CustomTestCase):
             "--attention-backend",
             "ascend",
             "--quantization",
-            "w8a8_int8",
+            "modelslim",
             "--mem-fraction-static",
             0.8,
             "--disable-radix-cache",
@@ -47,6 +47,8 @@ class TestAscendDeepEP(CustomTestCase):
             1,
             "--ep-size",
             16,
+            "--max-running-requests",
+            24,
             "--moe-a2a-backend",
             "deepep",
             "--deepep-mode",
@@ -68,7 +70,7 @@ class TestAscendDeepEP(CustomTestCase):
                 process = popen_launch_server(
                     model,
                     self.base_url,
-                    timeout=1500,
+                    timeout=2400,
                     other_args=[
                         *self.common_args,
                     ],

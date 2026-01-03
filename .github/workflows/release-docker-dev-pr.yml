@@ -1,0 +1,116 @@
+name: Build PR Development Docker Images
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: 'PR number to build from'
+        required: true
+        type: string
+      pr_branch:
+        description: 'PR branch name to build from (e.g., my-feature-branch or refs/pull/123/head)'
+        required: true
+        type: string
+
+concurrency:
+  group: release-docker-dev-pr-${{ github.event.inputs.pr_number }}
+  cancel-in-progress: true
+
+jobs:
+  build-dev:
+    if: ${{ github.repository == 'sgl-project/sglang' }}
+    environment: "prod"
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        include:
+          - runner: x64-docker-build-node
+            platform: linux/amd64
+            build_type: all
+            grace_blackwell: 0
+            arch_tag: x86
+            version: 12.9.1
+          - runner: arm-docker-build-node
+            platform: linux/arm64
+            build_type: all
+            grace_blackwell: 1
+            arch_tag: arm64
+            version: 12.9.1
+    steps:
+      - name: Delete huge unnecessary tools folder
+        run: rm -rf /opt/hostedtoolcache
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.pr_branch }}
+
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          docker-images: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          swap-storage: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and Push Dev Image
+        run: |
+          tag=dev-${{ matrix.arch_tag }}-pr-${{ inputs.pr_number }}
+
+          docker buildx build \
+            --platform ${{ matrix.platform }} \
+            --push \
+            -f docker/Dockerfile \
+            --target framework \
+            --build-arg CUDA_VERSION=${{ matrix.version }} \
+            --build-arg BUILD_TYPE=${{ matrix.build_type }} \
+            --build-arg CMAKE_BUILD_PARALLEL_LEVEL=$(nproc) \
+            --build-arg GRACE_BLACKWELL=${{ matrix.grace_blackwell }} \
+            --build-arg BRANCH_TYPE=local \
+            --build-arg INSTALL_FLASHINFER_JIT_CACHE=1 \
+            -t lmsysorg/sglang:${tag} \
+            --no-cache \
+            .
+
+  create-manifests:
+    runs-on: ubuntu-22.04
+    needs: [build-dev]
+    if: ${{ github.repository == 'sgl-project/sglang' }}
+    environment: "prod"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Create multi-arch manifest
+        run: |
+          # Create PR dev manifest
+          docker buildx imagetools create \
+            -t lmsysorg/sglang:dev-pr-${{ inputs.pr_number }} \
+            lmsysorg/sglang:dev-x86-pr-${{ inputs.pr_number }} \
+            lmsysorg/sglang:dev-arm64-pr-${{ inputs.pr_number }}
+
+          echo "✓ Built Docker image: lmsysorg/sglang:dev-pr-${{ inputs.pr_number }}"
+          echo ""
+          echo "Usage:"
+          echo "  docker pull lmsysorg/sglang:dev-pr-${{ inputs.pr_number }}"

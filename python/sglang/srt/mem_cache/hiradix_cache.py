@@ -52,6 +52,7 @@ class HiRadixCache(RadixCache):
                 server_args.hicache_size,
                 self.page_size,
                 server_args.hicache_mem_layout,
+                allocator_type=server_args.hicache_storage_backend,
             )
         elif isinstance(self.kv_cache, MLATokenToKVPool):
             self.token_to_kv_pool_host = MLATokenToKVPoolHost(
@@ -60,6 +61,7 @@ class HiRadixCache(RadixCache):
                 server_args.hicache_size,
                 self.page_size,
                 server_args.hicache_mem_layout,
+                allocator_type=server_args.hicache_storage_backend,
             )
         else:
             raise ValueError(f"HiRadixCache only supports MHA and MLA yet")
@@ -399,10 +401,9 @@ class HiRadixCache(RadixCache):
 
             num_evicted += self.cache_controller.evict_host(x.host_value)
 
-            for k, v in x.parent.children.items():
-                if v == x:
-                    break
-            del x.parent.children[k]
+            key = self.get_child_key_fn(x.key)
+            v = x.parent.children.pop(key, None)
+            assert v == x, f"parent does not have child key, {key}"
 
             if len(x.parent.children) == 0 and x.parent.evicted:
                 new_priority = self.eviction_strategy.get_priority(x.parent)

@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the SGLang project
+from __future__ import annotations
+
 import logging
 from typing import Any, Iterable, Optional, Tuple
 
@@ -36,7 +38,7 @@ def tensor_torch2ms(x: torch.Tensor):
     return ms_tensor
 
 
-def tensor_ms2torch(x: ms.Tensor):
+def tensor_ms2torch(x: "ms.Tensor"):
     if x is None or not isinstance(x, ms.Tensor):
         return x
 
@@ -133,7 +135,7 @@ class LowerTriangularMask:
     def gen_attention_mask(
         self,
         is_prefill: bool,
-        position_ids: Tensor,
+        position_ids: "ms.Tensor",
         query_lens_np: np.ndarray,
         seq_lens_np: np.ndarray,
     ):
@@ -289,7 +291,7 @@ class MindSporeForCausalLM(torch.nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
-    ) -> Tensor:
+    ) -> "ms.Tensor":
         # prepare base inputs
         model_inputs = self.prepare_inputs(input_ids, positions, forward_batch)
         # prepare model inputs

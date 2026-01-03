@@ -149,6 +149,14 @@ void apply_rope_pos_ids_cos_sin_cache(
     const std::optional<at::Tensor>& v_buffer,
     const std::optional<at::Tensor>& kv_cache_loc);
 
+void rotary_embedding(
+    torch::Tensor& positions,
+    torch::Tensor& query,
+    std::optional<torch::Tensor> key,
+    int64_t head_size,
+    torch::Tensor& cos_sin_cache,
+    bool is_neox);
+
 void downcast_fp8(
     at::Tensor& k,
     at::Tensor& v,
@@ -393,7 +401,8 @@ void fused_qk_norm_rope(
     double factor,
     double low,
     double high,
-    double attention_factor);
+    double attention_factor,
+    int64_t rotary_dim);
 
 void cutlass_fp4_group_mm(
     torch::Tensor& output,
@@ -909,6 +918,24 @@ void es_fp8_blockwise_scaled_grouped_mm(
     const torch::Tensor& expert_offsets,
     const torch::Tensor& workspace);
 
+void es_sm100_mxfp8_blockscaled_grouped_mm(
+    const torch::Tensor& a,
+    const torch::Tensor& b,
+    const torch::Tensor& sfa,
+    const torch::Tensor& sfb,
+    torch::Tensor& d,
+    const torch::Tensor& problem_sizes,
+    const torch::Tensor& expert_offsets,
+    const torch::Tensor& blockscale_offsets);
+
+void es_sm100_mxfp8_blockscaled_grouped_quant(
+    const torch::Tensor& input,
+    const torch::Tensor& problem_sizes,
+    const torch::Tensor& expert_offsets,
+    const torch::Tensor& blockscale_offsets,
+    torch::Tensor& quant_output,
+    torch::Tensor& scale_factor);
+
 /*
  * From fast-hadamard-transform
  */
@@ -979,3 +1006,15 @@ std::vector<at::Tensor> fwd_kvcache_mla_fp8(
 
 std::vector<at::Tensor> get_mla_decoding_metadata_dense_fp8(
     at::Tensor& seqlens_k, const int64_t num_heads_per_head_k, const int64_t num_heads_k);
+
+/*
+ * From csrc/sgl_diffusion/elementwise
+ */
+torch::Tensor timestep_embedding(
+    const torch::Tensor& t,
+    torch::Tensor& output,
+    int64_t dim,
+    bool flip_sin_to_cos,
+    double downscale_freq_shift,
+    double scale,
+    int64_t max_period);

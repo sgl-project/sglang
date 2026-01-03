@@ -38,33 +38,40 @@ Permissions are assigned according to the following rules:
 Usage:
     export GH_TOKEN="your_github_token"
     python3 update_ci_permission.py
+
+    # Sort-only mode (no network calls, no GH_TOKEN required)
+    python3 update_ci_permission.py --sort-only
 """
 
+import argparse
 import json
 import os
 from collections import Counter
 from datetime import datetime, timedelta, timezone
 
-import requests
+try:
+    import requests
+except ImportError:
+    requests = None  # Only needed for non-sort-only runs
 
 # Configuration
 REPO_OWNER = "sgl-project"
 REPO_NAME = "sglang"
-FILE_NAME = "CI_PERMISSIONS.json"
-GH_TOKEN = os.getenv("GH_TOKEN")
-
-if not GH_TOKEN:
-    raise ValueError("Error: GH_TOKEN environment variable is not set.")
-
-HEADERS = {
-    "Authorization": f"Bearer {GH_TOKEN}",
-    "Accept": "application/vnd.github+json",
-    "X-GitHub-Api-Version": "2022-11-28",
-}
+FILE_NAME = os.path.join(os.path.dirname(__file__), "CI_PERMISSIONS.json")
+HEADERS = {}
 
 
 def github_api_get(endpoint, params=None):
     """Helper to make paginated GitHub API requests."""
+    if requests is None:
+        raise RuntimeError(
+            "The requests package is required. Install it or use --sort-only."
+        )
+    if not HEADERS:
+        raise RuntimeError(
+            "GitHub headers not initialized. Set GH_TOKEN or use --sort-only."
+        )
+
     results = []
     url = f"https://api.github.com/repos/{REPO_OWNER}/{REPO_NAME}/{endpoint}"
 
@@ -139,7 +146,46 @@ def load_existing_permissions():
     return {}
 
 
+def sort_permissions_file():
+    """Sort the existing CI permissions file alphabetically and exit."""
+    if not os.path.exists(FILE_NAME):
+        print(f"{FILE_NAME} not found. Nothing to sort.")
+        return
+
+    old_permissions = load_existing_permissions()
+    sorted_permissions = dict(sorted(old_permissions.items()))
+
+    with open(FILE_NAME, "w") as f:
+        json.dump(sorted_permissions, f, indent=4)
+        f.write("\n")
+
+    print(f"Sorted {FILE_NAME}. Total users: {len(sorted_permissions)}")
+
+
 def main():
+    parser = argparse.ArgumentParser(description="Update or sort CI permissions.")
+    parser.add_argument(
+        "--sort-only",
+        action="store_true",
+        help="Only sort CI_PERMISSIONS.json alphabetically without fetching data.",
+    )
+    args = parser.parse_args()
+
+    if args.sort_only:
+        sort_permissions_file()
+        return
+
+    gh_token = os.getenv("GH_TOKEN")
+    if not gh_token:
+        raise ValueError("Error: GH_TOKEN environment variable is not set.")
+
+    global HEADERS
+    HEADERS = {
+        "Authorization": f"Bearer {gh_token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+
     # Gather Data
     try:
         write_access_users = get_write_access_users()

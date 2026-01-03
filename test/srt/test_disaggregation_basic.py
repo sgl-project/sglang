@@ -8,17 +8,19 @@ import requests
 from transformers import AutoTokenizer
 
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
-from sglang.test.test_disaggregation_utils import TestDisaggregationBase
+from sglang.test.server_fixtures.disaggregation_fixture import (
+    PDDisaggregationServerBase,
+)
 from sglang.test.test_utils import (
-    DEFAULT_EAGLE_DRAFT_MODEL_FOR_TEST,
-    DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST,
+    DEFAULT_DRAFT_MODEL_EAGLE,
     DEFAULT_MODEL_NAME_FOR_TEST,
+    DEFAULT_TARGET_MODEL_EAGLE,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     popen_launch_pd_server,
 )
 
 
-class TestDisaggregationAccuracy(TestDisaggregationBase):
+class TestDisaggregationAccuracy(PDDisaggregationServerBase):
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
@@ -185,7 +187,7 @@ class TestDisaggregationAccuracy(TestDisaggregationBase):
         )
 
 
-class TestDisaggregationMooncakeFailure(TestDisaggregationBase):
+class TestDisaggregationMooncakeFailure(PDDisaggregationServerBase):
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
@@ -273,13 +275,13 @@ class TestDisaggregationMooncakeFailure(TestDisaggregationBase):
                 raise e from health_check_error
 
 
-class TestDisaggregationMooncakeSpec(TestDisaggregationBase):
+class TestDisaggregationMooncakeSpec(PDDisaggregationServerBase):
 
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
-        cls.model = DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST
-        cls.draft_model = DEFAULT_EAGLE_DRAFT_MODEL_FOR_TEST
+        cls.model = DEFAULT_TARGET_MODEL_EAGLE
+        cls.draft_model = DEFAULT_DRAFT_MODEL_EAGLE
         cls.spec_args = [
             "--speculative-algorithm",
             "EAGLE",
@@ -358,7 +360,7 @@ class TestDisaggregationMooncakeSpec(TestDisaggregationBase):
         self.assertGreater(metrics["accuracy"], 0.20)
 
 
-class TestDisaggregationSimulatedRetract(TestDisaggregationBase):
+class TestDisaggregationSimulatedRetract(PDDisaggregationServerBase):
     @classmethod
     def setUpClass(cls):
         super().setUpClass()

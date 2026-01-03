@@ -3,16 +3,14 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import torch
+from sageattn3 import sageattn3_blackwell
 
 from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
     AttentionBackend,
     AttentionImpl,
     AttentionMetadata,
-    AttentionMetadataBuilder,
 )
-from sglang.multimodal_gen.runtime.layers.attention.backends.sageattn.api import (
-    sageattn_blackwell,
-)
+from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
@@ -27,8 +25,8 @@ class SageAttention3Backend(AttentionBackend):
         return [64, 128, 256]
 
     @staticmethod
-    def get_name() -> str:
-        return "SAGE_ATTN_THREE"
+    def get_enum() -> AttentionBackendEnum:
+        return AttentionBackendEnum.SAGE_ATTN_3
 
     @staticmethod
     def get_impl_cls() -> type["SageAttention3Impl"]:
@@ -37,14 +35,6 @@ class SageAttention3Backend(AttentionBackend):
     @staticmethod
     def get_metadata_cls() -> type["AttentionMetadata"]:
         raise NotImplementedError
-
-    @staticmethod
-    def get_builder_cls() -> type["AttentionMetadataBuilder"]:
-        raise NotImplementedError
-
-    # @staticmethod
-    # def get_metadata_cls() -> Type["AttentionMetadata"]:
-    #     return FlashAttentionMetadata
 
 
 class SageAttention3Impl(AttentionImpl):
@@ -73,6 +63,6 @@ class SageAttention3Impl(AttentionImpl):
         query = query.transpose(1, 2)
         key = key.transpose(1, 2)
         value = value.transpose(1, 2)
-        output = sageattn_blackwell(query, key, value, is_causal=self.causal)
+        output = sageattn3_blackwell(query, key, value, is_causal=self.causal)
         output = output.transpose(1, 2)
         return output

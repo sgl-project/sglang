@@ -1,0 +1,68 @@
+name: Release Tag
+# Creates a git tag to trigger release workflows (PyPI, Docker)
+# Use this after testing on a release branch is complete
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to tag (without v prefix, e.g., 0.5.7)'
+        required: true
+        type: string
+      ref:
+        description: 'Branch or commit to tag (e.g., release/v0.5.7, main, or commit SHA)'
+        required: false
+        default: 'main'
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  create-tag:
+    if: github.repository == 'sgl-project/sglang'
+    runs-on: ubuntu-latest
+    environment: 'prod'
+    steps:
+      - name: Validate version format
+        run: |
+          VERSION="${{ github.event.inputs.version }}"
+          if [ -z "$VERSION" ]; then
+            echo "::error::Version is required"
+            exit 1
+          fi
+          if ! echo "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+'; then
+            echo "::error::Invalid version format: $VERSION (expected: X.Y.Z or X.Y.Z.postN)"
+            exit 1
+          fi
+          echo "Version validated: v$VERSION"
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.ref }}
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Check if tag already exists
+        run: |
+          TAG="v${{ github.event.inputs.version }}"
+          if git rev-parse "$TAG" >/dev/null 2>&1; then
+            echo "::error::Tag $TAG already exists"
+            exit 1
+          fi
+          echo "Tag $TAG does not exist, proceeding..."
+
+      - name: Create and push tag
+        run: |
+          TAG="v${{ github.event.inputs.version }}"
+          REF="${{ github.event.inputs.ref }}"
+
+          git config user.name "sglang-bot"
+          git config user.email "sglang-bot@users.noreply.github.com"
+
+          echo "Creating tag $TAG on ref $REF (commit: $(git rev-parse HEAD))"
+          git tag -a "$TAG" -m "Release $TAG"
+          git push origin "$TAG"
+
+          echo "::notice::Successfully created and pushed tag $TAG"
+          echo "This will trigger the release workflows (PyPI, Docker)"

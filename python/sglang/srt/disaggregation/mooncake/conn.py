@@ -283,7 +283,7 @@ class MooncakeKVManager(CommonKVManager):
 
         layers_params = None
 
-        # pp is not supported on the decode side yet
+        # Decode pp size should be equal to prefill pp size or 1
         if self.is_mla_backend:
             src_kv_ptrs, dst_kv_ptrs, layers_current_pp_stage = (
                 self.get_mla_kv_ptrs_with_pp(src_data_ptrs, dst_data_ptrs)
@@ -300,18 +300,24 @@ class MooncakeKVManager(CommonKVManager):
             src_k_ptrs, src_v_ptrs, dst_k_ptrs, dst_v_ptrs, layers_current_pp_stage = (
                 self.get_mha_kv_ptrs_with_pp(src_data_ptrs, dst_data_ptrs)
             )
+            # item_lens structure: [k_layer0, k_layer1, ..., k_layerN, v_layer0, v_layer1, ..., v_layerN]
+            # Use correct item lengths for K and V separately
+            if layers_current_pp_stage > len(dst_k_ptrs):
+                logger.error(
+                    f"layers_current_pp_stage is out of range: {layers_current_pp_stage=}, {len(dst_k_ptrs)}"
+                )
             layers_params = [
                 (
                     src_k_ptrs[layer_id],
                     dst_k_ptrs[layer_id],
-                    item_lens[layer_id],
+                    item_lens[layer_id],  # K item length
                 )
                 for layer_id in range(layers_current_pp_stage)
             ] + [
                 (
                     src_v_ptrs[layer_id],
                     dst_v_ptrs[layer_id],
-                    item_lens[layer_id],
+                    item_lens[layers_current_pp_stage + layer_id],  # V item length
                 )
                 for layer_id in range(layers_current_pp_stage)
             ]
@@ -807,13 +813,12 @@ class MooncakeKVManager(CommonKVManager):
                                     executor,
                                 )
 
-                            if self.pp_group.is_last_rank:
-                                # Only the last chunk we need to send the aux data
-                                ret = self.send_aux(
-                                    req,
-                                    kv_chunk.prefill_aux_index,
-                                    target_rank_registration_info.dst_aux_ptrs,
-                                )
+                            # Only the last chunk we need to send the aux data
+                            ret = self.send_aux(
+                                req,
+                                kv_chunk.prefill_aux_index,
+                                target_rank_registration_info.dst_aux_ptrs,
+                            )
                             polls.append(True if ret == 0 else False)
                             dst_ranks_infos.append(
                                 (req.endpoint, req.dst_port, req.room)
@@ -1199,7 +1204,7 @@ class MooncakeKVReceiver(CommonKVReceiver):
             packed_state_data_ptrs = b"".join(
                 struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.state_data_ptrs
             )
-            # Note(shangming): No need to add pp rank here since pp is not supported on the decode side yet
+            # Note(shangming): No need to add pp rank here since decode pp size should be equal to prefill pp size or 1
             tp_rank = self.kv_mgr.kv_args.engine_rank
             kv_item_len = self.kv_mgr.kv_args.kv_item_lens[0]
             dst_tp_rank = str(tp_rank).encode("ascii")

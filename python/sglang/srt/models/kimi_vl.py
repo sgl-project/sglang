@@ -142,6 +142,13 @@ class KimiVLForConditionalGeneration(nn.Module):
             .type(self.vision_tower.dtype)
             .to(self.vision_tower.device)
         )
+
+        if (
+            pixel_values.dim() == 2
+            and pixel_values.shape[-1] == self.config.text_config.hidden_size
+        ):
+            return pixel_values
+
         image_grid_hws = torch.cat([item.image_grid_hws for item in items], dim=0).to(
             self.vision_tower.device
         )

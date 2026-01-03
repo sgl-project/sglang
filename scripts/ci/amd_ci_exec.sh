@@ -53,8 +53,22 @@ for key in "${!ENV_MAP[@]}"; do
   ENV_ARGS+=("-e" "$key=${ENV_MAP[$key]}")
 done
 
-# Run docker exec
+# Run docker exec with retry logic for HF network issues
+# First attempt: normal mode
+if docker exec \
+  -w "$WORKDIR" \
+  "${ENV_ARGS[@]}" \
+  ci_sglang "$@"; then
+  exit 0
+fi
+
+FIRST_EXIT_CODE=$?
+echo "First attempt failed with exit code $FIRST_EXIT_CODE"
+echo "Retrying with HF_HUB_OFFLINE=1 (offline mode)..."
+
+# Second attempt: force HF offline mode to avoid network timeouts
 docker exec \
   -w "$WORKDIR" \
   "${ENV_ARGS[@]}" \
+  -e HF_HUB_OFFLINE=1 \
   ci_sglang "$@"

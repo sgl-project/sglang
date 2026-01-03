@@ -16,6 +16,18 @@ import torch
 from safetensors.torch import safe_open
 from tqdm.auto import tqdm
 
+try:
+    from runai_model_streamer import SafetensorsStreamer
+
+    HAS_RUNAI_MODEL_STREAMER = True
+except ImportError:
+    HAS_RUNAI_MODEL_STREAMER = False
+
+# Disable runai_model_streamer on AMD/ROCm due to global state issues
+# that cause "Streamer is handling previous request" errors
+if torch.version.hip is not None:
+    HAS_RUNAI_MODEL_STREAMER = False
+
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
@@ -142,6 +154,7 @@ def _validate_safetensors_file(file_path: str) -> bool:
 def safetensors_weights_iterator(
     hf_weights_files: list[str],
     to_cpu: bool = True,
+    use_runai_model_streamer: bool = HAS_RUNAI_MODEL_STREAMER,
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
     """Iterate over the weights in the model safetensor files."""
     enable_tqdm = (
@@ -185,16 +198,25 @@ def safetensors_weights_iterator(
             "Please retry - the files will be re-downloaded automatically."
         )
 
-    for st_file in tqdm(
-        hf_weights_files,
-        desc="Loading safetensors checkpoint shards",
-        disable=not enable_tqdm,
-        bar_format=_BAR_FORMAT,
-    ):
-        with safe_open(st_file, framework="pt", device=device) as f:
-            for name in f.keys():  # noqa: SIM118
-                param = f.get_tensor(name)
-                yield name, param
+    if use_runai_model_streamer:
+        with SafetensorsStreamer() as streamer:
+            streamer.stream_files(hf_weights_files)
+            for name, tensor in streamer.get_tensors():
+                if to_cpu:
+                    yield name, tensor.clone().detach()
+                else:
+                    yield name, tensor.to(device)
+    else:
+        for st_file in tqdm(
+            hf_weights_files,
+            desc="Loading safetensors checkpoint shards",
+            disable=not enable_tqdm,
+            bar_format=_BAR_FORMAT,
+        ):
+            with safe_open(st_file, framework="pt", device=device) as f:
+                for name in f.keys():  # noqa: SIM118
+                    param = f.get_tensor(name)
+                    yield name, param
 
 
 def pt_weights_iterator(
