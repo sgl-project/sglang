@@ -627,7 +627,7 @@ impl<S> Layer<S> for HttpMetricsLayer {
     fn layer(&self, inner: S) -> Self::Service {
         HttpMetricsMiddleware {
             inner,
-            tracker: self.tracker.clone(),
+            in_flight_request_tracker: self.tracker.clone(),
         }
     }
 }
@@ -636,7 +636,7 @@ impl<S> Layer<S> for HttpMetricsLayer {
 #[derive(Clone)]
 pub struct HttpMetricsMiddleware<S> {
     inner: S,
-    tracker: Arc<InFlightRequestTracker>,
+    in_flight_request_tracker: Arc<InFlightRequestTracker>,
 }
 
 impl<S> Service<Request> for HttpMetricsMiddleware<S>
@@ -660,14 +660,14 @@ where
         let start = Instant::now();
 
         let mut inner = self.inner.clone();
-        let tracker = self.tracker.clone();
+        let in_flight_request_tracker = self.in_flight_request_tracker.clone();
 
         Box::pin(async move {
             // Increment inside async block - ensures no leak if future is dropped before polling
             let active = ACTIVE_HTTP_CONNECTIONS.fetch_add(1, Ordering::Relaxed) + 1;
             Metrics::set_http_connections_active(active as usize);
 
-            let guard = tracker.track();
+            let guard = in_flight_request_tracker.track();
 
             // Capture result before decrementing to ensure decrement happens on error too
             let result = inner.call(req).await;
