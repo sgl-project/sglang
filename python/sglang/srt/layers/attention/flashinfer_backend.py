@@ -812,6 +812,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 v_scale=layer.v_scale_float,
             )
         else:
+            assert v is not None
             causal = True
             if (
                 layer.is_cross_attention
