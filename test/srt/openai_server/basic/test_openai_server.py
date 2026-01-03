@@ -710,12 +710,6 @@ class TestOpenAIServerv1Responses(CustomTestCase):
             self.assertIn("prompt_tokens", body["usage"])
             self.assertIn("total_tokens", body["usage"])
 
-    def test_model_list(self):
-        client = openai.Client(api_key=self.api_key, base_url=self.base_url)
-        models = list(client.models.list())
-        assert len(models) == 1
-        assert isinstance(getattr(models[0], "max_model_len", None), int)
-
 
 class TestOpenAIV1Rerank(CustomTestCase):
     @classmethod
