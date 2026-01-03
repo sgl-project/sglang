@@ -110,8 +110,11 @@ def _cached_get_attn_backend(
     # Check whether a particular choice of backend was
     # previously forced.
     #
-    # THIS SELECTION OVERRIDES THE SGLANG_DIFFUSION_ATTENTION_BACKEND
-    # ENVIRONMENT VARIABLE.
+    # Priority order:
+    # 1. Global forced backend (programmatic override)
+    # 2. Server args (--attention-backend CLI arg)
+    # 3. Environment variable (SGLANG_DIFFUSION_ATTENTION_BACKEND)
+    # 4. Platform-specific auto-selection
     from sglang.multimodal_gen.runtime.platforms import current_platform
 
     supported_attention_backends = set(supported_attention_backends)
@@ -134,6 +137,16 @@ def _cached_get_attn_backend(
                 raise ValueError(
                     f"Invalid attention backend '{server_args.attention_backend}' specified via command line. "
                     f"Available options are: {[e.name.lower() for e in AttentionBackendEnum]}"
+                )
+        else:
+            # Check the environment variable for a backend override
+            backend_by_env = get_env_variable_attn_backend()
+            if backend_by_env is not None:
+                selected_backend = backend_by_env
+                logger.info(
+                    "Using attention backend '%s' from environment variable %s",
+                    selected_backend.name,
+                    STR_BACKEND_ENV_VAR,
                 )
 
     # get device-specific attn_backend
