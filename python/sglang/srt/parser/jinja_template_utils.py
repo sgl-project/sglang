@@ -157,8 +157,6 @@ def process_content_for_template_format(
                     image_obj = chunk.get("image_url") or {}
                     mdp = image_obj.get("max_dynamic_patch", None)
                     # Also allow flat style: chunk["max_dynamic_patch"]
-                    if mdp is None:
-                        mdp = chunk.get("max_dynamic_patch", None)
                     image_data.append(
                         ImageData(
                             url=image_obj["url"],
@@ -166,6 +164,7 @@ def process_content_for_template_format(
                             max_dynamic_patch=mdp,
                         )
                     )
+
                     if chunk.get("modalities"):
                         modalities.append(chunk.get("modalities"))
                     # Normalize to simple 'image' type for template compatibility
@@ -174,14 +173,15 @@ def process_content_for_template_format(
                     video_obj = chunk.get("video_url") or {}
                     mdp = video_obj.get("max_dynamic_patch", None)
                     if mdp is None:
-                        mdp = chunk.get("max_dynamic_patch", None)
-                    # Keep structured info for backend, but template only sees {"type":"video"}
-                    video_data.append(
-                        {
-                            "url": video_obj["url"],
-                            "max_dynamic_patch": mdp,
-                        }
-                    )
+                        video_data.append(chunk["video_url"]["url"])
+                    else:
+                        # Keep structured info for backend, but template only sees {"type":"video"}
+                        video_data.append(
+                            {
+                                "url": video_obj["url"],
+                                "max_dynamic_patch": mdp,
+                            }
+                        )
                     if chunk.get("modalities"):
                         modalities.append(chunk.get("modalities"))
                     # Normalize to simple 'video' type for template compatibility

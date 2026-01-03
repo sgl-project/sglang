@@ -305,22 +305,10 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
         **kwargs,
     ):
         entry_time = time.perf_counter()
-
-        video_data = getattr(request_obj, "video_data", None) or []
-        video_cfgs = []
-        video_data_norm = []
-        for v in video_data:
-            if isinstance(v, dict):
-                video_data_norm.append(v.get("url") or v.get("path"))
-                video_cfgs.append(v)
-            else:
-                video_data_norm.append(v)
-                video_cfgs.append(None)
-
         base_output = self.load_mm_data(
             prompt=input_text,
             image_data=image_data,
-            video_data=video_data_norm,
+            video_data=request_obj.video_data,
             audio_data=request_obj.audio_data,
             multimodal_tokens=self.mm_tokens,
         )
