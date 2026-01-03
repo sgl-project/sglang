@@ -78,24 +78,18 @@ logger = logging.getLogger(__name__)
 # Optional quantization for DeepSeek nvfp4 checkpoint
 NVFP4_CKPT_FP8_ATTN_QUANT_MODULES = ["q_b_proj"]
 
-class DeepseekV2WeightLoader:
-    def __init__(
-        self,
-        model: nn.Module,
-        causal_lm_model: nn.Module,
-        pp_group: GroupCoordinator,
-        config: PretrainedConfig,
-        quant_config: Optional[QuantizationConfig] = None,
-        num_fused_shared_experts: int = 0,
-    ):
-        self.model = model
-        self.causal_lm_model = causal_lm_model
-        self.pp_group = pp_group
-        self.config = config
-        self.quant_config = quant_config
-        self.num_fused_shared_experts = num_fused_shared_experts
+class DeepseekV2WeightLoaderMixin:
+    model: nn.Module
+    config: PretrainedConfig
+    quant_config: Optional[QuantizationConfig]
+    pp_group: GroupCoordinator
+    num_fused_shared_experts: int
 
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False):
+    def do_load_weights(
+        self: nn.Module,
+        weights: Iterable[Tuple[str, torch.Tensor]],
+        is_nextn: bool = False,
+    ):
         if is_nextn:
             if hasattr(self.config, "num_nextn_predict_layers"):
                 num_nextn_layers = self.config.num_nextn_predict_layers
@@ -156,7 +150,7 @@ class DeepseekV2WeightLoader:
 
         with concurrent.futures.ThreadPoolExecutor() as executor:
             futures = []
-            params_dict = dict(self.causal_lm_model.named_parameters())
+            params_dict = dict(self.named_parameters())
             weight_names = []
             for name, loaded_weight in weights:
                 use_async_loading = should_async_load(loaded_weight)
@@ -374,7 +368,11 @@ class DeepseekV2WeightLoader:
 
         self._post_load_weights(is_nextn=is_nextn, weight_names=weight_names)
 
-    def _post_load_weights(self, is_nextn=False, weight_names=None):
+    def _post_load_weights(
+        self: nn.Module,
+        is_nextn: bool = False,
+        weight_names: Optional[Iterable[str]] = None,
+    ) -> None:
         # Perform post-processing after loading weights
         if is_nextn:
             layer_ids = [self.config.num_hidden_layers]
