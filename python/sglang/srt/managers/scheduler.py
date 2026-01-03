@@ -1881,7 +1881,6 @@ class Scheduler(
             self.prefill_delayer.should_allow_prefill(
                 # TODO: consider offline generation cases when there are a lot of waiting requests
                 local_can_prefill=len(self.waiting_queue) > 0,
-                local_is_idle=len(self.running_batch.reqs) == 0,
             )
             if self.prefill_delayer
             else True

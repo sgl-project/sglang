@@ -6,7 +6,7 @@ from sglang.srt.environ import envs
 class PrefillDelayer:
     def __init__(self, dp_size, attn_tp_size, tp_worker, server_args):
         self.global_info = torch.empty(
-            (dp_size, attn_tp_size, 2),
+            (dp_size, attn_tp_size, 1),
             dtype=torch.int64,
             device="cpu",
         )
@@ -28,9 +28,9 @@ class PrefillDelayer:
             not server_args.disable_overlap_schedule
         ), "To use PrefillDelayer, disable_overlap_schedule must be False."
 
-    def _gather_info(self, local_can_prefill: int, local_is_idle: bool):
+    def _gather_info(self, local_can_prefill: int):
         local_info = torch.tensor(
-            [local_can_prefill, int(local_is_idle)],
+            [local_can_prefill],
             device="cpu",
             dtype=torch.int64,
         )
@@ -42,10 +42,8 @@ class PrefillDelayer:
         tp0_info = self.global_info[:, 0, :]
         return tp0_info
 
-    def should_allow_prefill(self, local_can_prefill: int, local_is_idle: bool) -> bool:
-        tp0_info = self._gather_info(
-            local_can_prefill=local_can_prefill, local_is_idle=local_is_idle
-        )
+    def should_allow_prefill(self, local_can_prefill: int) -> bool:
+        tp0_info = self._gather_info(local_can_prefill=local_can_prefill)
         global_can_prefill = tp0_info[:, 0]
         global_exists_cannot_prefill = global_can_prefill.min().item() == 0
         global_exists_can_prefill = global_can_prefill.max().item() > 0
