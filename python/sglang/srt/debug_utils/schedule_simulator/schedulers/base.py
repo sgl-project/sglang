@@ -7,5 +7,4 @@ if TYPE_CHECKING:
 
 class SchedulerPolicy(ABC):
     @abstractmethod
-    def schedule(self, gpu_state: "GPUState") -> None:
-        ...
+    def schedule(self, gpu_state: "GPUState") -> None: ...

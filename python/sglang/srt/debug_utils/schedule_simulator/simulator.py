@@ -47,7 +47,9 @@ class Simulator:
             incoming_requests.clear()
             self._schedule_all_gpus()
             self._execute_step()
-            step_records.extend(gpu.get_step_record(self.step) for gpu in self.gpu_states)
+            step_records.extend(
+                gpu.get_step_record(self.step) for gpu in self.gpu_states
+            )
             self._log_step()
             self._record_metrics()
             self.step += 1

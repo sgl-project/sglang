@@ -20,7 +20,6 @@ from sglang.srt.debug_utils.schedule_simulator import (
 )
 from sglang.test.test_utils import CustomTestCase
 
-
 # ==================== Non-E2E Tests ====================
 
 
@@ -32,11 +31,15 @@ class TestSimRequest(CustomTestCase):
         self.assertFalse(req.is_finished())
 
     def test_seq_len_with_decoded(self):
-        req = SimRequest(request_id="r1", input_len=100, output_len=50, decoded_tokens=10)
+        req = SimRequest(
+            request_id="r1", input_len=100, output_len=50, decoded_tokens=10
+        )
         self.assertEqual(req.seq_len(), 110)
 
     def test_is_finished(self):
-        req = SimRequest(request_id="r1", input_len=100, output_len=50, decoded_tokens=50)
+        req = SimRequest(
+            request_id="r1", input_len=100, output_len=50, decoded_tokens=50
+        )
         self.assertTrue(req.is_finished())
 
 
@@ -54,7 +57,9 @@ class TestGPUState(CustomTestCase):
         gpu = GPUState(gpu_id=0, max_total_tokens=10000)
         gpu.running_requests = [
             SimRequest(request_id="r1", input_len=100, output_len=50),
-            SimRequest(request_id="r2", input_len=200, output_len=100, decoded_tokens=10),
+            SimRequest(
+                request_id="r2", input_len=200, output_len=100, decoded_tokens=10
+            ),
         ]
         self.assertEqual(gpu.total_seq_len(), 100 + 210)
 
@@ -300,7 +305,9 @@ class TestSimulator(CustomTestCase):
             if record.running_count == 1 and record.pending_count == 1:
                 found_preemption = True
                 break
-        self.assertTrue(found_preemption, "Expected preemption to occur due to token growth")
+        self.assertTrue(
+            found_preemption, "Expected preemption to occur due to token growth"
+        )
 
 
 # ==================== E2E Tests ====================
@@ -399,61 +406,90 @@ class TestCLI(CustomTestCase):
         # 4 requests, input_len=10, output_len=2, 2 GPUs, all fit in memory
         result = self._run_cli(
             "--synthetic",
-            "--synth-num-requests", "4",
-            "--synth-input-len", "10",
-            "--synth-output-len", "2",
-            "--synth-seed", "42",
-            "--num-gpus", "2",
-            "--max-total-tokens", "10000",
-            "--log-level", "2",
+            "--synth-num-requests",
+            "4",
+            "--synth-input-len",
+            "10",
+            "--synth-output-len",
+            "2",
+            "--synth-seed",
+            "42",
+            "--num-gpus",
+            "2",
+            "--max-total-tokens",
+            "10000",
+            "--log-level",
+            "2",
         )
         self.assertEqual(result.returncode, 0, f"CLI failed: {result.stderr}")
         self.assertIn(
             "step=0    | GPU0[R=2:syn0,syn2 Q=0:-] | GPU1[R=2:syn1,syn3 Q=0:-]",
             result.stdout,
         )
-        self.assertIn("step=1    | GPU0[R=0:- Q=0:-] | GPU1[R=0:- Q=0:-]", result.stdout)
+        self.assertIn(
+            "step=1    | GPU0[R=0:- Q=0:-] | GPU1[R=0:- Q=0:-]", result.stdout
+        )
         self.assertIn("batch_size_balancedness_mean: 1.0000", result.stdout)
 
     def test_e2e_queuing_due_to_token_limit(self):
         result = self._run_cli(
             "--synthetic",
-            "--synth-num-requests", "4",
-            "--synth-input-len", "100",
-            "--synth-output-len", "3",
-            "--synth-seed", "42",
-            "--num-gpus", "1",
-            "--max-total-tokens", "210",
-            "--log-level", "2",
+            "--synth-num-requests",
+            "4",
+            "--synth-input-len",
+            "100",
+            "--synth-output-len",
+            "3",
+            "--synth-seed",
+            "42",
+            "--num-gpus",
+            "1",
+            "--max-total-tokens",
+            "210",
+            "--log-level",
+            "2",
         )
         self.assertEqual(result.returncode, 0, f"CLI failed: {result.stderr}")
-        self._assert_output_contains(result.stdout, """
+        self._assert_output_contains(
+            result.stdout,
+            """
 step=0    | GPU0[R=2:syn0,syn1 Q=2:syn2,syn3]
 step=1    | GPU0[R=2:syn0,syn1 Q=2:syn2,syn3]
 step=2    | GPU0[R=0:- Q=2:syn2,syn3]
 step=3    | GPU0[R=2:syn2,syn3 Q=0:-]
 step=4    | GPU0[R=2:syn2,syn3 Q=0:-]
-step=5    | GPU0[R=0:- Q=0:-]""")
+step=5    | GPU0[R=0:- Q=0:-]""",
+        )
 
     def test_e2e_retraction_due_to_token_growth(self):
         result = self._run_cli(
             "--synthetic",
-            "--synth-num-requests", "2",
-            "--synth-input-len", "50",
-            "--synth-output-len", "10",
-            "--synth-seed", "42",
-            "--num-gpus", "1",
-            "--max-total-tokens", "110",
-            "--log-level", "2",
+            "--synth-num-requests",
+            "2",
+            "--synth-input-len",
+            "50",
+            "--synth-output-len",
+            "10",
+            "--synth-seed",
+            "42",
+            "--num-gpus",
+            "1",
+            "--max-total-tokens",
+            "110",
+            "--log-level",
+            "2",
         )
         self.assertEqual(result.returncode, 0, f"CLI failed: {result.stderr}")
-        self._assert_output_contains(result.stdout, """
+        self._assert_output_contains(
+            result.stdout,
+            """
 step=0    | GPU0[R=2:syn0,syn1 Q=0:-]
 step=5    | GPU0[R=2:syn0,syn1 Q=0:-]
 step=6    | GPU0[R=1:syn0 Q=1:syn1]
 step=9    | GPU0[R=0:- Q=1:syn1]
 step=10   | GPU0[R=1:syn1 Q=0:-]
-step=13   | GPU0[R=0:- Q=0:-]""")
+step=13   | GPU0[R=0:- Q=0:-]""",
+        )
 
 
 if __name__ == "__main__":
