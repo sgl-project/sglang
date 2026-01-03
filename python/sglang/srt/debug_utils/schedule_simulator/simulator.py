@@ -45,7 +45,10 @@ class Simulator:
         self.step = 0
 
     def run(self, requests: List[SimRequest]) -> SimulationResult:
-        self.gpu_states = [GPUState(gpu_id=i) for i in range(self.num_gpus)]
+        self.gpu_states = [
+            GPUState(gpu_id=i, max_total_tokens=self.max_total_tokens)
+            for i in range(self.num_gpus)
+        ]
         self.step = 0
         step_records: List[StepRecord] = []
         incoming_requests = list(requests)
@@ -74,10 +77,10 @@ class Simulator:
 
     def _schedule_all_gpus(self) -> None:
         for gpu in self.gpu_states:
-            self.scheduler.schedule(gpu, self.max_total_tokens)
-            assert gpu.is_valid(self.max_total_tokens), (
+            self.scheduler.schedule(gpu)
+            assert gpu.is_valid(), (
                 f"GPU{gpu.gpu_id} invalid after scheduling: "
-                f"total_seq_len={gpu.total_seq_len()} > max={self.max_total_tokens}"
+                f"total_seq_len={gpu.total_seq_len()} > max={gpu.max_total_tokens}"
             )
 
     def _execute_step(self) -> None:

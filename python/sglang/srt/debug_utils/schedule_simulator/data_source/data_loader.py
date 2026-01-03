@@ -9,35 +9,25 @@ def load_from_request_logger(file_path: Union[str, Path]) -> List[SimRequest]:
     requests = []
     file_path = Path(file_path)
 
-    with open(file_path, "r", encoding="utf-8") as f:
+    with file_path.open(encoding="utf-8") as f:
         for line_num, line in enumerate(f):
             line = line.strip()
             if not line or not line.startswith("{"):
                 continue
 
-            try:
-                data = json.loads(line)
-            except json.JSONDecodeError:
-                continue
+            data = json.loads(line)
 
             if data.get("event") != "request.finished":
                 continue
 
             rid = data.get("rid", f"req_{line_num}")
-            out = data.get("out", {})
-            meta_info = out.get("meta_info", {})
-
-            prompt_tokens = meta_info.get("prompt_tokens")
-            completion_tokens = meta_info.get("completion_tokens")
-
-            if prompt_tokens is None or completion_tokens is None:
-                continue
+            meta_info = data["out"]["meta_info"]
 
             requests.append(
                 SimRequest(
                     request_id=rid,
-                    input_len=prompt_tokens,
-                    output_len=completion_tokens,
+                    input_len=meta_info["prompt_tokens"],
+                    output_len=meta_info["completion_tokens"],
                 )
             )
 

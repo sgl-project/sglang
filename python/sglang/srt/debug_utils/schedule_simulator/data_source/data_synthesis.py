@@ -11,20 +11,6 @@ def generate_random_requests(
     range_ratio: float = 1.0,
     seed: Optional[int] = None,
 ) -> List[SimRequest]:
-    """
-    Generate random requests with random input/output lengths.
-
-    Args:
-        num_requests: Number of requests to generate
-        input_len: Target input length (max if range_ratio < 1)
-        output_len: Target output length (max if range_ratio < 1)
-        range_ratio: Ratio to determine min length. E.g., 0.5 means lengths
-                     are sampled from [input_len * 0.5, input_len]
-        seed: Random seed for reproducibility
-
-    Returns:
-        List of SimRequest objects
-    """
     if seed is not None:
         random.seed(seed)
 
