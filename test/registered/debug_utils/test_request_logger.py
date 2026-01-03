@@ -67,26 +67,6 @@ class BaseTestRequestLogger:
         self.assertEqual(response.status_code, 200)
         return self.stdout.getvalue() + self.stderr.getvalue()
 
-    def _verify_json_logs(self, lines, source_name):
-        received_found = False
-        finished_found = False
-        for line in lines:
-            if not line.strip() or not line.startswith("{"):
-                continue
-            data = json.loads(line)
-            if data.get("event") == "request.received":
-                self.assertIn("rid", data)
-                self.assertIn("obj", data)
-                received_found = True
-            elif data.get("event") == "request.finished":
-                self.assertIn("rid", data)
-                self.assertIn("obj", data)
-                self.assertIn("out", data)
-                finished_found = True
-
-        self.assertTrue(received_found, f"request.received event not found in {source_name}")
-        self.assertTrue(finished_found, f"request.finished event not found in {source_name}")
-
 
 class TestRequestLoggerText(BaseTestRequestLogger, CustomTestCase):
     log_requests_format = "text"
@@ -112,6 +92,26 @@ class TestRequestLoggerText(BaseTestRequestLogger, CustomTestCase):
 
 class TestRequestLoggerJson(BaseTestRequestLogger, CustomTestCase):
     log_requests_format = "json"
+
+    def _verify_json_logs(self, lines, source_name):
+        received_found = False
+        finished_found = False
+        for line in lines:
+            if not line.strip() or not line.startswith("{"):
+                continue
+            data = json.loads(line)
+            if data.get("event") == "request.received":
+                self.assertIn("rid", data)
+                self.assertIn("obj", data)
+                received_found = True
+            elif data.get("event") == "request.finished":
+                self.assertIn("rid", data)
+                self.assertIn("obj", data)
+                self.assertIn("out", data)
+                finished_found = True
+
+        self.assertTrue(received_found, f"request.received event not found in {source_name}")
+        self.assertTrue(finished_found, f"request.finished event not found in {source_name}")
 
     def test_json_format_logging(self):
         combined_output = self._send_request()
