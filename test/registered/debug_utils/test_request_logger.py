@@ -18,6 +18,8 @@ from sglang.test.test_utils import (
 
 register_cuda_ci(est_time=120, suite="nightly-1-gpu", nightly=True)
 
+TEST_ROUTING_KEY = "test-routing-key-12345"
+
 
 class BaseTestRequestLogger:
     log_requests_format = None
@@ -64,6 +66,7 @@ class BaseTestRequestLogger:
                 "text": "Hello",
                 "sampling_params": {"max_new_tokens": 8, "temperature": 0},
             },
+            headers={"X-SMG-Routing-Key": TEST_ROUTING_KEY},
             timeout=30,
         )
         self.assertEqual(response.status_code, 200)
@@ -85,6 +88,8 @@ class TestRequestLoggerText(BaseTestRequestLogger, CustomTestCase):
     def _verify_logs(self, content: str, source_name: str):
         self.assertIn("Receive:", content, f"'Receive:' not found in {source_name}")
         self.assertIn("Finish:", content, f"'Finish:' not found in {source_name}")
+        self.assertIn(TEST_ROUTING_KEY, content, f"Routing key not found in {source_name}")
+        self.assertIn("x-smg-routing-key", content, f"Header name not found in {source_name}")
 
 
 class TestRequestLoggerJson(BaseTestRequestLogger, CustomTestCase):
@@ -93,6 +98,8 @@ class TestRequestLoggerJson(BaseTestRequestLogger, CustomTestCase):
     def _verify_logs(self, content: str, source_name: str):
         received_found = False
         finished_found = False
+        header_in_received = False
+        header_in_finished = False
         for line in content.splitlines():
             if not line.strip() or not line.startswith("{"):
                 continue
@@ -101,17 +108,27 @@ class TestRequestLoggerJson(BaseTestRequestLogger, CustomTestCase):
                 self.assertIn("rid", data)
                 self.assertIn("obj", data)
                 received_found = True
+                if data.get("headers", {}).get("x-smg-routing-key") == TEST_ROUTING_KEY:
+                    header_in_received = True
             elif data.get("event") == "request.finished":
                 self.assertIn("rid", data)
                 self.assertIn("obj", data)
                 self.assertIn("out", data)
                 finished_found = True
+                if data.get("headers", {}).get("x-smg-routing-key") == TEST_ROUTING_KEY:
+                    header_in_finished = True
 
         self.assertTrue(
             received_found, f"request.received event not found in {source_name}"
         )
         self.assertTrue(
             finished_found, f"request.finished event not found in {source_name}"
+        )
+        self.assertTrue(
+            header_in_received, f"Header not in request.received for {source_name}"
+        )
+        self.assertTrue(
+            header_in_finished, f"Header not in request.finished for {source_name}"
         )
 
 
