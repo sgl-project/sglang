@@ -52,6 +52,20 @@ class TestParallelToolCallBug(unittest.TestCase):
         ]
         self.detector = JsonArrayParser()
 
+    def _accumulate_tool_calls(self, tool_calls, result):
+        """Helper method to accumulate tool call results from parsing output."""
+        if not result.calls:
+            return
+        for call in result.calls:
+            if call.tool_index is None:
+                continue
+            while len(tool_calls) <= call.tool_index:
+                tool_calls.append({"name": "", "parameters": ""})
+            if call.name:
+                tool_calls[call.tool_index]["name"] = call.name
+            if call.parameters:
+                tool_calls[call.tool_index]["parameters"] += call.parameters
+
     def test_parallel_tool_calls_with_array_parameters(self):
         """
         Test parsing two parallel tool calls where both have array parameters.
@@ -82,20 +96,8 @@ class TestParallelToolCallBug(unittest.TestCase):
         for i, chunk in enumerate(chunks):
             try:
                 result = self.detector.parse_streaming_increment(chunk, self.tools)
-
                 # Collect tool calls
-                if result.calls:
-                    for call in result.calls:
-                        # Track by tool_index to accumulate chunks
-                        if call.tool_index is not None:
-                            while len(tool_calls) <= call.tool_index:
-                                tool_calls.append({"name": "", "parameters": ""})
-                            if call.name:
-                                tool_calls[call.tool_index]["name"] = call.name
-                            if call.parameters:
-                                tool_calls[call.tool_index][
-                                    "parameters"
-                                ] += call.parameters
+                self._accumulate_tool_calls(tool_calls, result)
 
             except Exception as e:
                 errors.append(f"Chunk {i} ({repr(chunk)}): {type(e).__name__}: {e}")
@@ -149,15 +151,7 @@ class TestParallelToolCallBug(unittest.TestCase):
 
         for chunk in chunks:
             result = self.detector.parse_streaming_increment(chunk, self.tools)
-            if result.calls:
-                for call in result.calls:
-                    if call.tool_index is not None:
-                        while len(tool_calls) <= call.tool_index:
-                            tool_calls.append({"name": "", "parameters": ""})
-                        if call.name:
-                            tool_calls[call.tool_index]["name"] = call.name
-                        if call.parameters:
-                            tool_calls[call.tool_index]["parameters"] += call.parameters
+            self._accumulate_tool_calls(tool_calls, result)
 
         # Should parse both tools successfully
         self.assertEqual(len(tool_calls), 2, "Should parse 2 tool calls")
