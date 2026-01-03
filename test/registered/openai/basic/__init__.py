@@ -1,1 +1,0 @@
-# OpenAI basic tests

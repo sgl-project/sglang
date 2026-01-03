@@ -1,1 +1,0 @@
-# OpenAI function call tests

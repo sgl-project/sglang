@@ -1,1 +1,0 @@
-# OpenAI validation tests
