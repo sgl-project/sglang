@@ -56,14 +56,14 @@ class Simulator:
             decision = self.scheduler.schedule(gpu)
 
             for req in decision.to_preempt:
-                if req in gpu.running_requests:
-                    gpu.running_requests.remove(req)
-                    gpu.pending_requests.append(req)
+                assert req in gpu.running_requests
+                gpu.running_requests.remove(req)
+                gpu.pending_requests.append(req)
 
             for req in decision.to_run:
-                if req in gpu.pending_requests:
-                    gpu.pending_requests.remove(req)
-                    gpu.running_requests.append(req)
+                assert req in gpu.pending_requests
+                gpu.pending_requests.remove(req)
+                gpu.running_requests.append(req)
 
     def _execute_step(self) -> None:
         for gpu in self.gpu_states:
