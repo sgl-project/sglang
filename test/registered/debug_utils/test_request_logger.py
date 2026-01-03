@@ -70,33 +70,7 @@ class TestRequestLoggerText(BaseTestRequestLogger, CustomTestCase):
         self.assertIn("Finish:", combined_output)
 
 
-class TestRequestLoggerJson(BaseTestRequestLogger, CustomTestCase):
-    log_requests_format = "json"
-
-    def test_json_format_logging(self):
-        combined_output = self._send_request()
-
-        received_found = False
-        finished_found = False
-        for line in combined_output.splitlines():
-            if not line.startswith("{"):
-                continue
-            data = json.loads(line)
-            if data.get("event") == "request.received":
-                self.assertIn("rid", data)
-                self.assertIn("obj", data)
-                received_found = True
-            elif data.get("event") == "request.finished":
-                self.assertIn("rid", data)
-                self.assertIn("obj", data)
-                self.assertIn("out", data)
-                finished_found = True
-
-        self.assertTrue(received_found, "request.received event not found in logs")
-        self.assertTrue(finished_found, "request.finished event not found in logs")
-
-
-class TestRequestLoggerFile(CustomTestCase):
+class TestRequestLoggerJson(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.temp_dir = tempfile.mkdtemp()
@@ -126,7 +100,7 @@ class TestRequestLoggerFile(CustomTestCase):
         cls.stdout.close()
         cls.stderr.close()
 
-    def test_file_logging(self):
+    def test_json_format_logging(self):
         response = requests.post(
             DEFAULT_URL_FOR_TEST + "/generate",
             json={
@@ -140,8 +114,8 @@ class TestRequestLoggerFile(CustomTestCase):
         time.sleep(1)
 
         combined_output = self.stdout.getvalue() + self.stderr.getvalue()
-        stdout_received = False
-        stdout_finished = False
+        received_found = False
+        finished_found = False
         for line in combined_output.splitlines():
             if not line.startswith("{"):
                 continue
@@ -149,15 +123,15 @@ class TestRequestLoggerFile(CustomTestCase):
             if data.get("event") == "request.received":
                 self.assertIn("rid", data)
                 self.assertIn("obj", data)
-                stdout_received = True
+                received_found = True
             elif data.get("event") == "request.finished":
                 self.assertIn("rid", data)
                 self.assertIn("obj", data)
                 self.assertIn("out", data)
-                stdout_finished = True
+                finished_found = True
 
-        self.assertTrue(stdout_received, "request.received event not found in stdout")
-        self.assertTrue(stdout_finished, "request.finished event not found in stdout")
+        self.assertTrue(received_found, "request.received event not found in logs")
+        self.assertTrue(finished_found, "request.finished event not found in logs")
 
         jsonl_files = glob.glob(os.path.join(self.temp_dir, "*.jsonl"))
         self.assertGreater(len(jsonl_files), 0, "No JSONL files found in temp directory")
