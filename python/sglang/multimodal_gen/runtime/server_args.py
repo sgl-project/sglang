@@ -298,6 +298,11 @@ class ServerArgs:
         if self.warmup_resolutions is not None:
             self.enable_warmup = True
 
+        if self.enable_warmup:
+            logger.info(
+                "Warmup enabled, the launch time is expected be longer than usual"
+            )
+
         # network initialization: port and host
         self.port = self.settle_port(self.port)
         # Add randomization to avoid race condition when multiple servers start simultaneously
