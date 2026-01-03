@@ -1,5 +1,8 @@
 import argparse
 import json
+from typing import Optional
+
+import polars as pl
 
 from sglang.srt.debug_utils.schedule_simulator import (
     AttentionBalancednessRecorder,
@@ -13,12 +16,11 @@ from sglang.srt.debug_utils.schedule_simulator import (
 )
 
 
-def main():
+def create_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Schedule Simulator for analyzing request scheduling across GPUs"
     )
 
-    # Data source: either --input or --synthetic
     data_group = parser.add_mutually_exclusive_group(required=True)
     data_group.add_argument(
         "--input",
@@ -31,7 +33,6 @@ def main():
         help="Use synthetic data generation",
     )
 
-    # Synthetic data options
     parser.add_argument(
         "--num-requests",
         type=int,
@@ -63,7 +64,6 @@ def main():
         help="Random seed for synthetic data (default: None)",
     )
 
-    # Simulation options
     parser.add_argument(
         "--num-gpus",
         type=int,
@@ -104,8 +104,10 @@ def main():
         help="Log level: 0=none, 1=counts per GPU, 2=request IDs (default: 0)",
     )
 
-    args = parser.parse_args()
+    return parser
 
+
+def main(args: argparse.Namespace) -> pl.DataFrame:
     if args.input:
         requests = load_from_request_logger(args.input)
         print(f"Loaded {len(requests)} requests from {args.input}")
@@ -143,10 +145,23 @@ def main():
     )
 
     print(f"Running simulation with {args.num_gpus} GPUs, router={args.router}, scheduler={args.scheduler}")
-    summary = sim.run(requests)
+    result = sim.run(requests)
 
-    print("\n=== Results ===")
-    for key, value in summary.items():
+    df = pl.DataFrame([
+        {
+            "step": r.step,
+            "gpu_id": r.gpu_id,
+            "running_count": r.running_count,
+            "pending_count": r.pending_count,
+            "total_seq_len": r.total_seq_len,
+            "running_req_ids": r.running_req_ids,
+            "pending_req_ids": r.pending_req_ids,
+        }
+        for r in result.step_records
+    ])
+
+    print("\n=== Summary ===")
+    for key, value in result.summary.items():
         if isinstance(value, float):
             print(f"{key}: {value:.4f}")
         else:
@@ -154,9 +169,15 @@ def main():
 
     if args.output:
         with open(args.output, "w") as f:
-            json.dump(summary, f, indent=2)
-        print(f"\nResults saved to {args.output}")
+            json.dump(result.summary, f, indent=2)
+        print(f"\nSummary saved to {args.output}")
+
+    return df
 
 
 if __name__ == "__main__":
-    main()
+    parser = create_parser()
+    args = parser.parse_args()
+    df = main(args)
+    print(f"\nDataFrame shape: {df.shape}")
+    print(df.head(20))

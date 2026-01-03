@@ -19,7 +19,11 @@ from sglang.srt.debug_utils.schedule_simulator.schedulers import (
     ScheduleDecision,
     SchedulerPolicy,
 )
-from sglang.srt.debug_utils.schedule_simulator.simulator import Simulator
+from sglang.srt.debug_utils.schedule_simulator.simulator import (
+    SimulationResult,
+    Simulator,
+    StepRecord,
+)
 
 __all__ = [
     "SimRequest",
@@ -27,6 +31,8 @@ __all__ = [
     "GPUState",
     "ScheduleDecision",
     "Simulator",
+    "SimulationResult",
+    "StepRecord",
     "RouterPolicy",
     "RandomRouter",
     "RoundRobinRouter",
