@@ -307,13 +307,6 @@ class BaseMultimodalProcessor(ABC):
         """
         process multimodal data with transformers AutoProcessor
         """
-        if images:  # and is kimi k2 vl
-            mediums = []
-            for image in images:
-                mediums.append({"type": "image", "image": image})
-            key = "_medias"[1:]
-            kwargs[key] = mediums
-            images = None
         if images:
             kwargs["images"] = images
         if videos:

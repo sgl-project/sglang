@@ -43,7 +43,7 @@
 
 import logging
 from copy import deepcopy
-from typing import Iterable, List, Literal, Optional, Sequence, Tuple
+from typing import Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -69,6 +69,7 @@ except ImportError:
 from transformers import PretrainedConfig
 
 from sglang.srt.layers.attention.vision import VisionAttention
+from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.managers.schedule_batch import (
     Modality,
     MultimodalDataItem,
@@ -77,9 +78,10 @@ from sglang.srt.managers.schedule_batch import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_v2 import DeepseekV3ForCausalLM
-from sglang.srt.models.kimi_vl_moonvit import MLP2, VL_VISION_ATTENTION_FUNCTIONS
+from sglang.srt.models.kimi_vl_moonvit import MLP2
 from sglang.srt.utils import add_prefix
 
+KIMIV_VT_INFER_MAX_PATCH_NUM = 16328
 logger = logging.getLogger(__name__)
 
 
@@ -172,7 +174,6 @@ class VisionTowerConfig(PretrainedConfig):
         self.merge_kernel_size = config.merge_kernel_size
         self.video_attn_type = config.video_attn_type
         self.merge_type = config.merge_type
-        self._attn_implementation = config._attn_implementation
 
 
 class MoonViTEncoderLayer(nn.Module):
@@ -183,10 +184,8 @@ class MoonViTEncoderLayer(nn.Module):
         hidden_dim: int,
         mlp_dim: int,
         *,
-        attn_implementation: str = "flash_attention_2",
         activation=F.gelu,
         attn_bias: bool = False,
-        use_deterministic_attn: bool = False,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         use_data_parallel: bool = False,
@@ -195,8 +194,6 @@ class MoonViTEncoderLayer(nn.Module):
         self.num_heads = num_heads
         self.hidden_dim = hidden_dim
         self.hidden_size_per_attention_head = self.hidden_dim // self.num_heads
-        self.attn_implementation = attn_implementation
-        self.use_deterministic_attn = use_deterministic_attn
 
         self.norm0 = nn.LayerNorm(hidden_dim)
         self.norm1 = nn.LayerNorm(hidden_dim)
@@ -218,45 +215,45 @@ class MoonViTEncoderLayer(nn.Module):
             customized_position_embedding_applier=apply_rope,
         )
 
-    def attention_qkvpacked(
-        self,
-        x: torch.Tensor,
-        cu_seqlens: torch.Tensor,
-        max_seqlen: torch.Tensor,
-        rope_freqs_cis: torch.Tensor | None = None,
-    ):
-        """
-        Args:
-            x (torch.Tensor): (batch_size, seqlen, hidden_dim)
-            cu_seqlens (torch.Tensor):
-        """
-        xqkv = self.wqkv(x)
+    # def attention_qkvpacked(
+    #     self,
+    #     x: torch.Tensor,
+    #     cu_seqlens: torch.Tensor,
+    #     max_seqlen: torch.Tensor,
+    #     rope_freqs_cis: torch.Tensor | None = None,
+    # ):
+    #     """
+    #     Args:
+    #         x (torch.Tensor): (batch_size, seqlen, hidden_dim)
+    #         cu_seqlens (torch.Tensor):
+    #     """
+    #     xqkv = self.wqkv(x)
 
-        qkv_shape = xqkv.size()[:-1] + (
-            3,
-            self.num_heads,
-            self.hidden_size_per_attention_head,
-        )
-        # xqkv: (batch_size, seqlen, 3, nheads, headdim)
-        xqkv = xqkv.view(*qkv_shape)
-        xq, xk, xv = torch.unbind(xqkv, dim=-3)
+    #     qkv_shape = xqkv.size()[:-1] + (
+    #         3,
+    #         self.num_heads,
+    #         self.hidden_size_per_attention_head,
+    #     )
+    #     # xqkv: (batch_size, seqlen, 3, nheads, headdim)
+    #     xqkv = xqkv.view(*qkv_shape)
+    #     xq, xk, xv = torch.unbind(xqkv, dim=-3)
 
-        xq, xk = apply_rope(xq, xk, rope_freqs_cis)
+    #     xq, xk = apply_rope(xq, xk, rope_freqs_cis)
 
-        attn_func = VL_VISION_ATTENTION_FUNCTIONS[self.attn_implementation]
-        attn_out = attn_func(
-            xq,
-            xk,
-            xv,
-            q_cu_seqlens=cu_seqlens,
-            k_cu_seqlens=cu_seqlens,
-            max_seqlen_k=max_seqlen,
-            max_seqlen_q=max_seqlen,
-            deterministic=self.use_deterministic_attn,
-        )
+    #     # attn_func = VL_VISION_ATTENTION_FUNCTIONS[self.attn_implementation]
+    #     # attn_out = attn_func(
+    #     #     xq,
+    #     #     xk,
+    #     #     xv,
+    #     #     q_cu_seqlens=cu_seqlens,
+    #     #     k_cu_seqlens=cu_seqlens,
+    #     #     max_seqlen_k=max_seqlen,
+    #     #     max_seqlen_q=max_seqlen,
+    #     #     # deterministic=self.use_deterministic_attn,
+    #     # )
 
-        attn_out = self.wo(attn_out)
-        return attn_out
+    #     attn_out = self.wo(attn_out)
+    #     return attn_out
 
     def forward(
         self,
@@ -271,11 +268,13 @@ class MoonViTEncoderLayer(nn.Module):
         # hidden_states = self.attention_qkvpacked(
         #     hidden_states, cu_seqlens, max_seqlen, rope_freqs_cis
         # )
-        attn = self.attn(
+        torch.save(hidden_states, "/sgl-workspace/sgl_before_attn.pt")
+        hidden_states = self.attn(
             hidden_states,
             cu_seqlens=cu_seqlens,
             position_embeddings=rope_freqs_cis,
         )
+
         hidden_states = residual + hidden_states
 
         residual = hidden_states
@@ -563,25 +562,8 @@ class MoonViT3dEncoder(nn.Module):
         num_layers: int,
         block_cfg: dict,
         video_attn_type: str = "spatial_temporal",
-        use_checkpoint: bool = False,
-        recompute_method: Literal["uniform", "block", None] = "uniform",
-        recompute_num_layers: int = 1,
-        activation_cpu_offload: bool = False,
-        use_deterministic_attn: bool = False,
     ) -> None:
         super().__init__()
-
-        self.use_checkpoint = use_checkpoint
-        if recompute_method is None:
-            recompute_method = "uniform"
-        assert recompute_method in [
-            "uniform",
-            "block",
-        ], f'recompute_method must be in ["uniform", "block"], got {recompute_method}'
-        self.recompute_method = recompute_method
-        self.recompute_num_layers = recompute_num_layers
-        self.activation_cpu_offload = activation_cpu_offload
-        self.use_deterministic_attn = use_deterministic_attn
 
         assert (
             video_attn_type == "spatial_temporal"
@@ -591,12 +573,7 @@ class MoonViT3dEncoder(nn.Module):
             block_cfg["hidden_dim"] // block_cfg["num_heads"], 512, 512
         )
         self.blocks = nn.ModuleList(
-            [
-                MoonViTEncoderLayer(
-                    **block_cfg, use_deterministic_attn=self.use_deterministic_attn
-                )
-                for _ in range(num_layers)
-            ]
+            [MoonViTEncoderLayer(**block_cfg) for _ in range(num_layers)]
         )
         self.final_layernorm = nn.LayerNorm(hidden_dim)
 
@@ -641,7 +618,6 @@ class MoonViT3dEncoder(nn.Module):
 
 
 class MoonViT3dPretrainedModel(nn.Module):
-    config_class = None  # Will be set by K2VL dynamically
     model_type = "moonvit3d"
     _no_split_modules = ["PackingTransformer"]
     _supports_flash_attn_2 = True
@@ -672,13 +648,7 @@ class MoonViT3dPretrainedModel(nn.Module):
                 "mlp_dim": config.intermediate_size,
                 "activation": PytorchGELUTanh(),
                 "attn_bias": True,
-                "attn_implementation": config._attn_implementation,
             },
-            use_checkpoint=kwargs.get("use_checkpoint", False),
-            recompute_method=kwargs.get("recompute_method", None),
-            recompute_num_layers=kwargs.get("recompute_num_layers", 1),
-            activation_cpu_offload=kwargs.get("activation_cpu_offload", False),
-            use_deterministic_attn=kwargs.get("use_deterministic_attn", False),
             video_attn_type=config.video_attn_type,
         )
 
@@ -717,53 +687,113 @@ class MoonViT3dPretrainedModel(nn.Module):
         return hidden_states
 
 
-class MLP(nn.Module):
+class K2VLMultiModalProjector(nn.Module):
+    """Multi-modal projector with patch merging for K2-VL."""
 
-    def __init__(self, config):
+    def __init__(
+        self,
+        config: VisionTowerConfig,
+        use_data_parallel: bool = False,
+        prefix: str = "",
+    ):
         super().__init__()
-        # TODO, use faster LayerNorm
-        self.pre_norm = nn.LayerNorm(config.mm_hidden_size)
-        self.proj = nn.Sequential(
-            nn.Linear(config.mm_hidden_size, config.hidden_size),
-            nn.GELU(),
-            nn.Linear(config.hidden_size, config.hidden_size),
+        self.use_data_parallel = use_data_parallel
+
+        # Hidden size after patch merging
+        merge_h, merge_w = config.merge_kernel_size
+        self.hidden_size = config.vt_hidden_size * merge_h * merge_w
+
+        self.pre_norm = torch.nn.LayerNorm(config.vt_hidden_size, eps=1e-5)
+        self.linear_1 = ReplicatedLinear(
+            self.hidden_size,
+            self.hidden_size,
+            bias=True,
+            prefix=add_prefix(prefix, "linear_1"),
         )
-
-    def forward(self, x, *args, **kwargs):
-        assert isinstance(x, list | tuple), f"x is not a list or tuple: {type(x)}"
-        lengths = [item.shape[0] for item in x]
-        x = torch.cat(x, dim=0)
-        x = self.pre_norm(x)
-        x = self.proj(x)
-        x = torch.split(x, lengths, dim=0)
-
-        return x
-
-
-class PatchMergerMLP(nn.Module):
-
-    def __init__(self, config):
-        super().__init__()
-        eps = config.projector_ln_eps
-        self.hidden_size = config.mm_hidden_size * (
-            config.merge_kernel_size[0] * config.merge_kernel_size[1]
+        self.linear_2 = ReplicatedLinear(
+            self.hidden_size,
+            config.text_config.hidden_size,
+            bias=True,
+            prefix=add_prefix(prefix, "linear_2"),
         )
-        self.pre_norm = nn.LayerNorm(config.mm_hidden_size, eps=eps)
-        self.proj = nn.Sequential(
-            nn.Linear(self.hidden_size, self.hidden_size),
-            nn.GELU(),
-            nn.Linear(self.hidden_size, config.hidden_size),
-        )
+        self.act = nn.GELU()
 
-    def forward(self, x, *args, **kwargs):
-        if isinstance(x, list) or isinstance(x, tuple):
-            x = [self.proj(self.pre_norm(item).view(item.shape[0], -1)) for item in x]
+    def forward(self, image_features: torch.Tensor) -> torch.Tensor:
+        hidden_states = self.pre_norm(image_features).view(-1, self.hidden_size)
+        hidden_states, _ = self.linear_1(hidden_states)
+        hidden_states = self.act(hidden_states)
+        hidden_states, _ = self.linear_2(hidden_states)
+        print(f"733 {hidden_states.shape=}")
+        return hidden_states
+
+
+@torch.inference_mode()
+def mm_projection_auto(
+    mm_projector: torch.nn.Module | None, vt_output: list[torch.Tensor]
+):
+    """Apply MM projector to vision tower outputs."""
+    if mm_projector is None:
+        return vt_output
+
+    num_embedding_list = [x.shape[0] for x in vt_output]
+    batched = torch.cat(vt_output, dim=0)
+    proj_out = mm_projector(batched) if mm_projector else batched
+    proj_out = proj_out.reshape(-1, proj_out.shape[-1])
+    proj_out = torch.split(proj_out, num_embedding_list)
+    return proj_out
+
+
+@torch.inference_mode()
+def vision_tower_forward_auto(
+    vision_tower: torch.nn.Module,
+    pixel_values: torch.Tensor,
+    grid_thw: torch.Tensor,
+    mm_projector: torch.nn.Module | None = None,
+) -> list[torch.Tensor]:
+    """Auto-batched vision tower forward."""
+    assert isinstance(
+        pixel_values, torch.Tensor
+    ), "expect pixel_values to be a tensor, get {}".format(type(pixel_values))
+    n = grid_thw.shape[0]
+    n_patches_each_media = grid_thw.prod(-1)
+    max_infer_batch = max(n_patches_each_media.max(), KIMIV_VT_INFER_MAX_PATCH_NUM)
+    logger.debug(
+        "vt max_infer_batch: %s, KIMIV_VT_INFER_MAX_PATCH_NUM: %s",
+        max_infer_batch,
+        KIMIV_VT_INFER_MAX_PATCH_NUM,
+    )
+    tensors = []
+    pre_sum = 0
+    current_group_start = 0
+    current_group_patches = 0
+
+    for i in range(n):
+        current_media_patches = n_patches_each_media[i].item()
+        if current_group_patches + current_media_patches <= max_infer_batch:
+            current_group_patches += current_media_patches
         else:
-            # 不一定有4个维度，可能会把BxN合并在一起，我们只要关心第一个shape和最后一个shape不变就行了
-            # B, N, N_k, C = x.shape
-            B = x.shape[0]
-            x = self.proj(self.pre_norm(x).view(B, -1, self.hidden_size))
-        return x
+            if current_group_start < i:
+                group_grid_thw = grid_thw[current_group_start:i]
+                group_n_patches = n_patches_each_media[current_group_start:i].sum()
+                group_input = pixel_values[pre_sum : pre_sum + group_n_patches]
+                group_output = vision_tower(group_input, group_grid_thw)
+                proj_out = mm_projection_auto(mm_projector, group_output)
+                tensors.extend(proj_out)
+                pre_sum += group_n_patches
+
+            current_group_start = i
+            current_group_patches = current_media_patches
+
+    # Process the last group
+    if current_group_start < n:
+        group_grid_thw = grid_thw[current_group_start:n]
+        group_n_patches = n_patches_each_media[current_group_start:n].sum()
+        group_input = pixel_values[pre_sum : pre_sum + group_n_patches]
+        group_output = vision_tower(group_input, group_grid_thw)
+        proj_out = mm_projection_auto(mm_projector, group_output)
+        tensors.extend(proj_out)
+
+    return tensors
 
 
 class K2VLForConditionalGeneration(nn.Module):
@@ -781,17 +811,7 @@ class K2VLForConditionalGeneration(nn.Module):
         self.vision_tower = MoonViT3dPretrainedModel(vt_config)
 
         # 创建 mm projector
-        proj_config = ProjectorConfig(config)
-        if config.mm_projector_type == "identity":
-            self.mm_projector = IdentityMap()
-        elif config.mm_projector_type == "mlp":
-            self.mm_projector = MLP(proj_config)
-        elif config.mm_projector_type == "patchmerger":
-            self.mm_projector = PatchMergerMLP(proj_config)
-        else:
-            raise ValueError(
-                f"Unsupported mm_projector_type: {config.mm_projector_type}"
-            )
+        self.mm_projector = K2VLMultiModalProjector(config)
 
         self.language_model = DeepseekV3ForCausalLM(config.text_config, quant_config)
 
@@ -814,11 +834,20 @@ class K2VLForConditionalGeneration(nn.Module):
 
         target_dtype = self.vision_tower.patch_embed.proj.weight.dtype
         pixel_values = pixel_values.to(target_dtype)
-
-        image_features = self.vision_tower(pixel_values, grid_thws)
-        # print(f"{len(image_features)=}")
+        print(f"418 {pixel_values.shape=}\n{grid_thws.shape=}\n")
+        print(f"419 {grid_thws=}")
+        torch.save(pixel_values, "/sgl-workspace/sgl_pixel_values.pt")
+        image_features = vision_tower_forward_auto(
+            self.vision_tower,
+            pixel_values,
+            grid_thws,
+            mm_projector=self.mm_projector,
+        )
+        torch.save(image_features, "/sgl-workspace/sgl_image_features.pt")
+        # image_features = self.vision_tower(pixel_values, grid_thws)
+        print(f"421 {len(image_features)=}")
         image_features = torch.cat(image_features, dim=0)
-        print(f"{image_features.shape=}")
+        print(f"423 {image_features.shape=}")
         return image_features
 
     def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
@@ -857,6 +886,10 @@ class K2VLForConditionalGeneration(nn.Module):
                 # vision_name = name.replace(r"attn.qkv.", r"attn.qkv_proj.")
                 name = name.replace(r"wqkv.", r"attn.qkv_proj.")
                 name = name.replace(r"wo.", r"attn.proj.")
+                # "mm_projector.proj.0": "mm_projector.linear_1",
+                # "mm_projector.proj.2": "mm_projector.linear_2",
+                name = name.replace("mm_projector.proj.0", "mm_projector.linear_1")
+                name = name.replace("mm_projector.proj.2", "mm_projector.linear_2")
                 vision_weights.append((name, loaded_weight))
             else:
                 name = name.replace("language_model.", "")

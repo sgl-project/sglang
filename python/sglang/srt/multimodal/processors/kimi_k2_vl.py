@@ -1,6 +1,9 @@
 import re
-from typing import Dict, List, Union
+from typing import Dict, List, Tuple, Union
 
+import torch
+
+from sglang.srt.managers.schedule_batch import MultimodalDataItem
 from sglang.srt.models.kimi_k2_vl import K2VLForConditionalGeneration
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor as SGLangBaseProcessor,
@@ -35,7 +38,9 @@ class KimiK2_5VLImageProcessor(SGLangBaseProcessor):
             image_data=image_data,
             multimodal_tokens=self.mm_tokens,
         )
-        print(f"39 base_output: {base_output}")
+        prompt = base_output.input_text
+
+        # print(f"39 base_output: {base_output}")
         mm_items, input_ids, _ = self.process_and_combine_mm_data(
             base_output, self.mm_tokens
         )
@@ -46,3 +51,42 @@ class KimiK2_5VLImageProcessor(SGLangBaseProcessor):
             "mm_items": mm_items,
             "im_token_id": self.mm_tokens.image_token_id,
         }
+
+    def _process_and_collect_mm_items(
+        self, input_text: str, images=None, audios=None, videos=None, **kwargs
+    ) -> Tuple[List[MultimodalDataItem], torch.Tensor, dict]:
+        """
+        Helper method to process multimodal data and create mm_items in one step.
+
+        Returns:
+            Tuple of (created mm_items, input_ids)
+        """
+
+        parts = input_text.split(self.mm_tokens.image_token)
+
+        result = [parts[0]]
+        for image, part in zip(images, parts[1:]):
+            num_tokens = self._processor.media_processor.media_tokens_calculator(
+                {"type": "image", "image": image}
+            )
+            result.append(self.mm_tokens.image_token * num_tokens + part)
+            print(f"70 num_tokens: {num_tokens}")
+
+        input_text = "".join(result)
+
+        if images:  # for kimi k2 vl
+            mediums = []
+            for image in images:
+                mediums.append({"type": "image", "image": image})
+            key = "_medias"[1:]  # bypass lint
+            kwargs[key] = mediums
+            images = None
+
+        ret = self.process_mm_data(
+            input_text=input_text, images=images, audios=audios, videos=videos, **kwargs
+        )
+
+        input_ids = ret["input_ids"].flatten()
+        collected_items = self.collect_mm_items_from_processor_output(ret)
+
+        return collected_items, input_ids, ret
