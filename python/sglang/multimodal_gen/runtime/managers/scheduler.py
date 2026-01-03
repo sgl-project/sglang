@@ -106,7 +106,7 @@ class Scheduler:
     def _handle_generation(self, reqs: List[Req]):
         has_warmup = any(req.is_warmup for req in reqs)
         if has_warmup:
-            logger.info("Processing warmup req....")
+            logger.info("Processing warmup req...")
         return self.worker.execute_forward(reqs)
 
     def return_result(

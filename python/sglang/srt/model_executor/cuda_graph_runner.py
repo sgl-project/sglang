@@ -534,7 +534,7 @@ class CudaGraphRunner:
         )
         graph_fn = (
             partial(memory_saver_adapter.cuda_graph, tag=GPU_MEMORY_TYPE_CUDA_GRAPH)
-            if memory_saver_adapter.enabled
+            if memory_saver_adapter.log_timing
             else self.device_module.graph
         )
         with graph_fn(cuda_graph=graph, pool=pool, stream=stream):
