@@ -18,6 +18,8 @@ from sglang.test.test_utils import (
 
 register_cuda_ci(est_time=120, suite="nightly-1-gpu", nightly=True)
 
+TEST_ROUTING_KEY = "test-routing-key-12345"
+
 
 class BaseTestRequestLogger:
     log_requests_format = None
@@ -64,6 +66,7 @@ class BaseTestRequestLogger:
                 "text": "Hello",
                 "sampling_params": {"max_new_tokens": 8, "temperature": 0},
             },
+            headers={"X-SMG-Routing-Key": TEST_ROUTING_KEY},
             timeout=30,
         )
         self.assertEqual(response.status_code, 200)
@@ -85,6 +88,12 @@ class TestRequestLoggerText(BaseTestRequestLogger, CustomTestCase):
     def _verify_logs(self, content: str, source_name: str):
         self.assertIn("Receive:", content, f"'Receive:' not found in {source_name}")
         self.assertIn("Finish:", content, f"'Finish:' not found in {source_name}")
+        self.assertIn(
+            TEST_ROUTING_KEY, content, f"Routing key not found in {source_name}"
+        )
+        self.assertIn(
+            "x-smg-routing-key", content, f"Header name not found in {source_name}"
+        )
 
 
 class TestRequestLoggerJson(BaseTestRequestLogger, CustomTestCase):
@@ -97,14 +106,25 @@ class TestRequestLoggerJson(BaseTestRequestLogger, CustomTestCase):
             if not line.strip() or not line.startswith("{"):
                 continue
             data = json.loads(line)
+
+            rid = data.get("rid", "")
+            if rid.startswith("HEALTH_CHECK"):
+                continue
+
             if data.get("event") == "request.received":
                 self.assertIn("rid", data)
                 self.assertIn("obj", data)
+                self.assertEqual(
+                    data.get("headers", {}).get("x-smg-routing-key"), TEST_ROUTING_KEY
+                )
                 received_found = True
             elif data.get("event") == "request.finished":
                 self.assertIn("rid", data)
                 self.assertIn("obj", data)
                 self.assertIn("out", data)
+                self.assertEqual(
+                    data.get("headers", {}).get("x-smg-routing-key"), TEST_ROUTING_KEY
+                )
                 finished_found = True
 
         self.assertTrue(
