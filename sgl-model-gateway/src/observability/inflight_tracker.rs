@@ -58,7 +58,6 @@ impl InFlightRequestTracker {
 
     pub fn compute_bucket_counts(&self) -> [usize; AGE_BUCKET_LABELS.len()] {
         let now = Instant::now();
-        let mut counts = [0usize; AGE_BUCKET_LABELS.len()];
         let inf_idx = AGE_BUCKET_LABELS.len() - 1;
 
         let instants: Vec<Instant> = self.requests.iter().map(|entry| *entry.value()).collect();
@@ -73,6 +72,7 @@ impl InFlightRequestTracker {
             non_cumulative_counts[bucket_idx] += 1;
         }
 
+        let mut counts = [0usize; AGE_BUCKET_LABELS.len()];
         let mut cumulative = 0;
         for i in 0..counts.len() {
             cumulative += non_cumulative_counts[i];
