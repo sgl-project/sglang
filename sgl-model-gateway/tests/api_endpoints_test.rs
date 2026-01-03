@@ -1,164 +1,17 @@
 mod common;
 
-use std::sync::Arc;
-
 use axum::{
     body::Body,
     extract::Request,
     http::{header::CONTENT_TYPE, StatusCode},
 };
-use common::mock_worker::{HealthStatus, MockWorker, MockWorkerConfig, WorkerType};
-use reqwest::Client;
-use serde_json::json;
-use smg::{
-    app_context::AppContext,
-    config::{RouterConfig, RoutingMode},
-    core::Job,
-    routers::{RouterFactory, RouterTrait},
+use common::{
+    mock_worker::{HealthStatus, MockWorker, MockWorkerConfig, WorkerType},
+    TestContext,
 };
+use serde_json::json;
+use smg::{config::RouterConfig, routers::RouterFactory};
 use tower::ServiceExt;
-
-/// Test context that manages mock workers
-struct TestContext {
-    workers: Vec<MockWorker>,
-    router: Arc<dyn RouterTrait>,
-    _client: Client,
-    _config: RouterConfig,
-    app_context: Arc<AppContext>,
-}
-
-impl TestContext {
-    async fn new(worker_configs: Vec<MockWorkerConfig>) -> Self {
-        // Create default router config
-        let config = RouterConfig::builder()
-            .regular_mode(vec![])
-            .random_policy()
-            .host("127.0.0.1")
-            .port(3002)
-            .max_payload_size(256 * 1024 * 1024)
-            .request_timeout_secs(600)
-            .worker_startup_timeout_secs(1)
-            .worker_startup_check_interval_secs(1)
-            .max_concurrent_requests(64)
-            .queue_timeout_secs(60)
-            .build_unchecked();
-
-        Self::new_with_config(config, worker_configs).await
-    }
-
-    async fn new_with_config(
-        mut config: RouterConfig,
-        worker_configs: Vec<MockWorkerConfig>,
-    ) -> Self {
-        let mut workers = Vec::new();
-        let mut worker_urls = Vec::new();
-
-        // Start mock workers if any
-        for worker_config in worker_configs {
-            let mut worker = MockWorker::new(worker_config);
-            let url = worker.start().await.unwrap();
-            worker_urls.push(url);
-            workers.push(worker);
-        }
-
-        if !workers.is_empty() {
-            tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
-        }
-
-        // Update config with worker URLs if not already set
-        match &mut config.mode {
-            RoutingMode::Regular {
-                worker_urls: ref mut urls,
-            } => {
-                if urls.is_empty() {
-                    *urls = worker_urls.clone();
-                }
-            }
-            RoutingMode::OpenAI {
-                worker_urls: ref mut urls,
-            } => {
-                if urls.is_empty() {
-                    *urls = worker_urls.clone();
-                }
-            }
-            _ => {} // PrefillDecode mode has its own setup
-        }
-
-        let client = Client::builder()
-            .timeout(std::time::Duration::from_secs(config.request_timeout_secs))
-            .build()
-            .unwrap();
-
-        // Create app context
-        let app_context = common::create_test_context(config.clone()).await;
-
-        // Submit worker initialization job (same as real server does)
-        if !worker_urls.is_empty() {
-            let job_queue = app_context
-                .worker_job_queue
-                .get()
-                .expect("JobQueue should be initialized");
-            let job = Job::InitializeWorkersFromConfig {
-                router_config: Box::new(config.clone()),
-            };
-            job_queue
-                .submit(job)
-                .await
-                .expect("Failed to submit worker initialization job");
-
-            // Poll until all workers are healthy (up to 10 seconds)
-            let expected_count = worker_urls.len();
-            let start = tokio::time::Instant::now();
-            let timeout_duration = tokio::time::Duration::from_secs(10);
-            loop {
-                let healthy_workers = app_context
-                    .worker_registry
-                    .get_all()
-                    .iter()
-                    .filter(|w| w.is_healthy())
-                    .count();
-
-                if healthy_workers >= expected_count {
-                    break;
-                }
-
-                if start.elapsed() > timeout_duration {
-                    panic!(
-                        "Timeout waiting for {} workers to become healthy (only {} ready)",
-                        expected_count, healthy_workers
-                    );
-                }
-
-                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-            }
-        }
-
-        // Create router
-        let router = RouterFactory::create_router(&app_context).await.unwrap();
-        let router = Arc::from(router);
-
-        Self {
-            workers,
-            router,
-            _client: client,
-            _config: config,
-            app_context,
-        }
-    }
-
-    async fn create_app(&self) -> axum::Router {
-        common::test_app::create_test_app_with_context(
-            Arc::clone(&self.router),
-            Arc::clone(&self.app_context),
-        )
-    }
-
-    async fn shutdown(mut self) {
-        for worker in &mut self.workers {
-            worker.stop().await;
-        }
-    }
-}
 
 #[cfg(test)]
 mod health_tests {
