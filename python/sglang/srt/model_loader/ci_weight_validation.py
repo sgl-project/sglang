@@ -240,6 +240,7 @@ def _validate_config_and_tokenizer_files(snapshot_dir: str) -> Tuple[bool, List[
     - quantize_config.json / quant_config.json (optional but validated if present) - for AWQ/GPTQ
     - params.json (optional but validated if present) - for Mistral native format
     - preprocessor_config.json (optional but validated if present) - for vision models
+    - trust_remote_code dynamic modules (required if auto_map present in config.json)
     - At least one tokenizer file: tokenizer.json, tokenizer.model, or tiktoken.model
 
     Args:
@@ -304,6 +305,40 @@ def _validate_config_and_tokenizer_files(snapshot_dir: str) -> Tuple[bool, List[
             preprocessor_config_path, "preprocessor_config.json"
         ):
             missing_files.append("preprocessor_config.json (exists but invalid)")
+
+    # Check for trust_remote_code dynamic module files if needed
+    # When auto_map exists in config.json, the model requires custom Python files
+    # These files must be present for offline mode to work
+    config_path = os.path.join(snapshot_dir, "config.json")
+    if os.path.exists(config_path):
+        try:
+            with open(config_path, "r", encoding="utf-8") as f:
+                config = json.load(f)
+
+            auto_map = config.get("auto_map", {})
+            if auto_map and isinstance(auto_map, dict):
+                # Extract Python module files from auto_map
+                # auto_map format: {"AutoConfig": "configuration_xxx.ConfigClass", ...}
+                # We need to check if the .py files exist
+                custom_files = set()
+                for key, value in auto_map.items():
+                    if isinstance(value, str) and "." in value:
+                        # Extract module name (e.g., "configuration_xxx" from "configuration_xxx.ConfigClass")
+                        module_name = value.split(".")[0]
+                        custom_files.add(f"{module_name}.py")
+
+                # Check if all custom files exist
+                for custom_file in custom_files:
+                    custom_file_path = os.path.join(snapshot_dir, custom_file)
+                    if not os.path.exists(custom_file_path):
+                        missing_files.append(
+                            f"{custom_file} (required for trust_remote_code)"
+                        )
+                    elif not os.path.isfile(custom_file_path):
+                        missing_files.append(f"{custom_file} (exists but not a file)")
+        except (json.JSONDecodeError, OSError, KeyError) as e:
+            # If we can't read config.json, it will be caught by earlier validation
+            logger.debug("Failed to check auto_map in config.json: %s", e)
 
     # Check for at least one tokenizer file
     tokenizer_files = [
