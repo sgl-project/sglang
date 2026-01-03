@@ -1,5 +1,6 @@
 import argparse
 import json
+from dataclasses import asdict
 from typing import List
 
 import polars as pl
@@ -104,20 +105,7 @@ def main(args: argparse.Namespace) -> pl.DataFrame:
     )
     result = sim.run(requests)
 
-    df = pl.DataFrame(
-        [
-            {
-                "step": r.step,
-                "gpu_id": r.gpu_id,
-                "running_count": r.running_count,
-                "pending_count": r.pending_count,
-                "total_seq_len": r.total_seq_len,
-                "running_req_ids": r.running_req_ids,
-                "pending_req_ids": r.pending_req_ids,
-            }
-            for r in result.step_records
-        ]
-    )
+    df = pl.DataFrame([asdict(r) for r in result.step_records])
 
     print("\n=== Summary ===")
     for key, value in result.summary.items():

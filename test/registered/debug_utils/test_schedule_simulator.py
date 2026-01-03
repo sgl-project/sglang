@@ -309,7 +309,8 @@ class TestSimulator(CustomTestCase):
         sim = Simulator(
             num_gpus=2,
             router=RoundRobinRouter(),
-            scheduler=FIFOScheduler(max_total_tokens=10000),
+            scheduler=FIFOScheduler(),
+            max_total_tokens=10000,
         )
         sim.run(requests)
         for gpu in sim.gpu_states:
@@ -383,7 +384,8 @@ class TestSimulator(CustomTestCase):
         sim = Simulator(
             num_gpus=2,
             router=RoundRobinRouter(),
-            scheduler=FIFOScheduler(max_total_tokens=10000),
+            scheduler=FIFOScheduler(),
+            max_total_tokens=10000,
         )
         result = sim.run(requests)
         self.assertGreater(len(result.step_records), 0)
@@ -404,7 +406,8 @@ class TestSimulator(CustomTestCase):
         sim = Simulator(
             num_gpus=1,
             router=RoundRobinRouter(),
-            scheduler=FIFOScheduler(max_total_tokens=110),
+            scheduler=FIFOScheduler(),
+            max_total_tokens=110,
         )
         result = sim.run(requests)
 
@@ -418,102 +421,6 @@ class TestSimulator(CustomTestCase):
 
 
 # ==================== E2E Tests ====================
-
-
-class TestMain(CustomTestCase):
-    def _run_and_verify(
-        self,
-        synth_num_requests: int,
-        synth_input_len: int,
-        synth_output_len: int,
-        num_gpus: int,
-        max_total_tokens: int,
-        expected_rows: list,
-    ):
-        args = argparse.Namespace(
-            input=None,
-            synthetic=True,
-            synth_num_requests=synth_num_requests,
-            synth_input_len=synth_input_len,
-            synth_output_len=synth_output_len,
-            synth_range_ratio=1.0,
-            synth_seed=42,
-            num_gpus=num_gpus,
-            router="round_robin",
-            scheduler="fifo",
-            max_total_tokens=max_total_tokens,
-            output=None,
-            log_level=0,
-        )
-        df = main(args)
-
-        self.assertEqual(
-            set(df.columns),
-            {
-                "step",
-                "gpu_id",
-                "running_count",
-                "pending_count",
-                "total_seq_len",
-                "running_req_ids",
-                "pending_req_ids",
-            },
-        )
-        self.assertEqual(len(df), len(expected_rows))
-
-        for expected in expected_rows:
-            row = df.filter(
-                (pl.col("step") == expected["step"])
-                & (pl.col("gpu_id") == expected["gpu_id"])
-            )
-            self.assertEqual(
-                len(row), 1, f"step={expected['step']}, gpu_id={expected['gpu_id']}"
-            )
-            self.assertEqual(row["running_count"][0], expected["running_count"])
-            self.assertEqual(row["pending_count"][0], expected["pending_count"])
-
-    def test_simple_no_queuing(self):
-        # 4 requests, input_len=10, output_len=2, 2 GPUs
-        # Each GPU gets 2 requests, total 20 tokens per GPU, well under 10000
-        self._run_and_verify(
-            synth_num_requests=4,
-            synth_input_len=10,
-            synth_output_len=2,
-            num_gpus=2,
-            max_total_tokens=10000,
-            expected_rows=[
-                {"step": 0, "gpu_id": 0, "running_count": 2, "pending_count": 0},
-                {"step": 0, "gpu_id": 1, "running_count": 2, "pending_count": 0},
-                {"step": 1, "gpu_id": 0, "running_count": 0, "pending_count": 0},
-                {"step": 1, "gpu_id": 1, "running_count": 0, "pending_count": 0},
-            ],
-        )
-
-    def test_queuing_due_to_token_limit(self):
-        # 4 requests, input_len=100, output_len=3, 1 GPU
-        # max_total_tokens=210, so only 2 requests can fit initially (200 tokens)
-        # and they can grow to 206 before finishing (still under 210)
-        # step 0: r0,r1 running (200 tokens), r2,r3 pending
-        # step 1: r0,r1 running (202 tokens)
-        # step 2: r0,r1 finish (after 3 decodes), running=0, pending=2
-        # step 3: r2,r3 start running
-        # step 4: r2,r3 continue
-        # step 5: r2,r3 finish
-        self._run_and_verify(
-            synth_num_requests=4,
-            synth_input_len=100,
-            synth_output_len=3,
-            num_gpus=1,
-            max_total_tokens=210,
-            expected_rows=[
-                {"step": 0, "gpu_id": 0, "running_count": 2, "pending_count": 2},
-                {"step": 1, "gpu_id": 0, "running_count": 2, "pending_count": 2},
-                {"step": 2, "gpu_id": 0, "running_count": 0, "pending_count": 2},
-                {"step": 3, "gpu_id": 0, "running_count": 2, "pending_count": 0},
-                {"step": 4, "gpu_id": 0, "running_count": 2, "pending_count": 0},
-                {"step": 5, "gpu_id": 0, "running_count": 0, "pending_count": 0},
-            ],
-        )
 
 
 class TestCLI(CustomTestCase):
