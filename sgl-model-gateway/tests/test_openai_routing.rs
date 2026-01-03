@@ -17,7 +17,7 @@ use axum::{
     Json, Router,
 };
 use serde_json::json;
-use sgl_model_gateway::{
+use smg::{
     config::{
         ConfigError, ConfigValidator, HistoryBackend, OracleConfig, RouterConfig, RoutingMode,
     },

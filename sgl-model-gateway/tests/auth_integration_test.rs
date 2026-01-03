@@ -18,7 +18,7 @@ use jsonwebtoken::{encode, EncodingKey, Header};
 use rsa::{traits::PublicKeyParts, RsaPrivateKey};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use sgl_model_gateway::auth::{
+use smg::auth::{
     ApiKeyEntry, ControlPlaneAuthConfig, ControlPlaneAuthState, JwtConfig, Role,
 };
 use tokio::net::TcpListener;
@@ -572,7 +572,7 @@ async fn test_audit_logging_disabled() {
 
 #[tokio::test]
 async fn test_jwt_jti_replay_protection() {
-    use sgl_model_gateway::auth::JwtValidator;
+    use smg::auth::JwtValidator;
 
     let (addr, _server) = start_mock_jwks_server().await;
 
@@ -612,7 +612,7 @@ async fn test_jwt_jti_replay_protection() {
 
 #[tokio::test]
 async fn test_jwt_different_tokens_no_replay() {
-    use sgl_model_gateway::auth::JwtValidator;
+    use smg::auth::JwtValidator;
 
     let (addr, _server) = start_mock_jwks_server().await;
 

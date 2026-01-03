@@ -13,7 +13,7 @@ use std::{
 };
 
 use criterion::{black_box, criterion_group, BenchmarkId, Criterion, Throughput};
-use sgl_model_gateway::tokenizer::{
+use smg::tokenizer::{
     cache::{CacheConfig, CachedTokenizer},
     huggingface::HuggingFaceTokenizer,
     sequence::Sequence,

@@ -15,7 +15,7 @@ use axum::{
     extract::Request,
     http::{header::CONTENT_TYPE, StatusCode},
 };
-use sgl_model_gateway::{
+use smg::{
     app_context::AppContext,
     config::RouterConfig,
     core::{
@@ -111,7 +111,7 @@ async fn create_test_context_with_wasm() -> Arc<AppContext> {
         .expect("JobQueue should only be initialized once");
 
     // Initialize WorkflowEngine and register workflows
-    use sgl_model_gateway::{
+    use smg::{
         core::steps::{create_worker_registration_workflow, create_worker_removal_workflow},
         workflow::WorkflowEngine,
     };
@@ -134,7 +134,7 @@ async fn create_test_context_with_wasm() -> Arc<AppContext> {
         .expect("WorkflowEngine should only be initialized once");
 
     // Initialize MCP manager with empty config
-    use sgl_model_gateway::mcp::{McpConfig, McpManager};
+    use smg::mcp::{McpConfig, McpManager};
     let empty_config = McpConfig {
         servers: vec![],
         pool: Default::default(),
@@ -692,7 +692,7 @@ async fn test_wasm_module_execution() {
         .expect("Workflow engine should be initialized");
 
     // Create workflow context for registration
-    use sgl_model_gateway::{
+    use smg::{
         core::steps::WasmModuleConfigRequest,
         workflow::{WorkflowContext, WorkflowId, WorkflowInstanceId},
     };
@@ -764,7 +764,7 @@ async fn test_wasm_module_execution() {
     let (initial_total, initial_success, initial_failed, _, _) = wasm_manager.get_metrics();
 
     // Execute the module
-    use sgl_model_gateway::wasm::{
+    use smg::wasm::{
         spec::sgl::model_gateway::middleware_types,
         types::{WasmComponentInput, WasmComponentOutput},
     };

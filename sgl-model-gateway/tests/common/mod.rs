@@ -14,7 +14,7 @@ use std::{
 };
 
 use serde_json::json;
-use sgl_model_gateway::{
+use smg::{
     app_context::AppContext,
     config::{RouterConfig, RoutingMode},
     core::{
@@ -105,7 +105,7 @@ pub async fn create_test_context(config: RouterConfig) -> Arc<AppContext> {
         .expect("JobQueue should only be initialized once");
 
     // Initialize WorkflowEngine and register workflows
-    use sgl_model_gateway::{
+    use smg::{
         core::steps::{create_worker_registration_workflow, create_worker_removal_workflow},
         workflow::WorkflowEngine,
     };
@@ -142,7 +142,7 @@ pub async fn create_test_context(config: RouterConfig) -> Arc<AppContext> {
     }
 
     // Initialize MCP manager with empty config
-    use sgl_model_gateway::mcp::{McpConfig, McpManager};
+    use smg::mcp::{McpConfig, McpManager};
     let empty_config = McpConfig {
         servers: vec![],
         pool: Default::default(),
@@ -241,7 +241,7 @@ pub async fn create_test_context_with_parsers(config: RouterConfig) -> Arc<AppCo
         .expect("JobQueue should only be initialized once");
 
     // Initialize WorkflowEngine and register workflows
-    use sgl_model_gateway::{
+    use smg::{
         core::steps::{create_worker_registration_workflow, create_worker_removal_workflow},
         workflow::WorkflowEngine,
     };
@@ -278,7 +278,7 @@ pub async fn create_test_context_with_parsers(config: RouterConfig) -> Arc<AppCo
     }
 
     // Initialize MCP manager with empty config
-    use sgl_model_gateway::mcp::{McpConfig, McpManager};
+    use smg::mcp::{McpConfig, McpManager};
     let empty_config = McpConfig {
         servers: vec![],
         pool: Default::default(),
@@ -303,7 +303,7 @@ pub async fn create_test_context_with_mcp_config(
     config: RouterConfig,
     mcp_config_path: &str,
 ) -> Arc<AppContext> {
-    use sgl_model_gateway::mcp::{McpConfig, McpManager};
+    use smg::mcp::{McpConfig, McpManager};
 
     let client = reqwest::Client::new();
 
@@ -377,7 +377,7 @@ pub async fn create_test_context_with_mcp_config(
         .expect("JobQueue should only be initialized once");
 
     // Initialize WorkflowEngine and register workflows
-    use sgl_model_gateway::{
+    use smg::{
         core::steps::{create_worker_registration_workflow, create_worker_removal_workflow},
         workflow::WorkflowEngine,
     };

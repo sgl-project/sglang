@@ -17,7 +17,7 @@ use opentelemetry_proto::tonic::collector::trace::v1::{
 use portpicker::pick_unused_port;
 use serde_json::json;
 use serial_test::serial;
-use sgl_model_gateway::{
+use smg::{
     config::{RouterConfig, TraceConfig},
     core::Job,
     observability::{logging, otel_trace},

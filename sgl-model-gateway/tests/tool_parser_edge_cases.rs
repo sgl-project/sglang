@@ -2,7 +2,7 @@
 //!
 //! Tests for malformed input, edge cases, and error recovery
 
-use sgl_model_gateway::tool_parser::{
+use smg::tool_parser::{
     JsonParser, MistralParser, PythonicParser, QwenParser, ToolParser,
 };
 

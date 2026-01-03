@@ -9,12 +9,12 @@ use serde_json::Value;
 use tokio::runtime::Runtime;
 use once_cell::sync::Lazy;
 
-use sgl_model_gateway::tokenizer::traits::Tokenizer;
-use sgl_model_gateway::tokenizer::stream::DecodeStream;
-use sgl_model_gateway::tool_parser::ToolParser;
-use sgl_model_gateway::protocols::common::{Tool, ToolChoice, ToolChoiceValue, ToolCallDelta, FunctionCallDelta, Usage, StringOrArray};
-use sgl_model_gateway::tokenizer::stop::StopSequenceDecoder;
-use sgl_model_gateway::grpc_client::sglang_proto as proto;
+use smg::tokenizer::traits::Tokenizer;
+use smg::tokenizer::stream::DecodeStream;
+use smg::tool_parser::ToolParser;
+use smg::protocols::common::{Tool, ToolChoice, ToolChoiceValue, ToolCallDelta, FunctionCallDelta, Usage, StringOrArray};
+use smg::tokenizer::stop::StopSequenceDecoder;
+use smg::grpc_client::sglang_proto as proto;
 
 use super::error::{SglErrorCode, set_error_message, clear_error_message};
 use super::tokenizer::TokenizerHandle;
@@ -390,8 +390,8 @@ pub(crate) async fn convert_proto_chunk_to_openai(
     created: u64,
     system_fingerprint: Option<&str>,
 ) -> Result<Option<sgl_model_gateway::protocols::chat::ChatCompletionStreamResponse>, String> {
-    use sgl_model_gateway::grpc_client::sglang_proto::generate_response::Response::*;
-    use sgl_model_gateway::protocols::chat::{ChatCompletionStreamResponse, ChatMessageDelta, ChatStreamChoice};
+    use smg::grpc_client::sglang_proto::generate_response::Response::*;
+    use smg::protocols::chat::{ChatCompletionStreamResponse, ChatMessageDelta, ChatStreamChoice};
 
     match proto_response.response {
         Some(Chunk(chunk)) => {
