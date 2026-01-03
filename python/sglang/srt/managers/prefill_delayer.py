@@ -1,3 +1,5 @@
+import logging
+
 import torch
 
 from sglang.srt.environ import envs
@@ -6,6 +8,7 @@ from sglang.srt.utils import get_bool_env_var
 
 _DEBUG_LOG = get_bool_env_var("SGLANG_PREFILL_DELAYER_DEBUG_LOG")
 
+logger = logging.getLogger(__name__)
 
 class PrefillDelayer:
     def __init__(self, dp_size, attn_tp_size, tp_worker, server_args):
@@ -57,6 +60,9 @@ class PrefillDelayer:
             self.curr_delayed_count += 1
             if self.curr_delayed_count < self.max_delay_passes:
                 return False
+
+        if _DEBUG_LOG and global_mixed_prefillable:
+            logger.info(f"PrefillDelayer timeout thus not forbid prefill (prefillable: {global_prefillable.sum()})")
 
         self.curr_delayed_count = 0
         return True
