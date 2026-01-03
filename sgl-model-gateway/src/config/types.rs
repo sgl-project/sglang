@@ -257,10 +257,17 @@ pub struct RedisConfig {
     // Connection pool max size
     #[serde(default = "default_redis_pool_max")]
     pub pool_max: usize,
+    // Data retention in days. If None, data persists indefinitely.
+    #[serde(default = "default_redis_retention_days")]
+    pub retention_days: Option<u64>,
 }
 
 fn default_redis_pool_max() -> usize {
     16
+}
+
+fn default_redis_retention_days() -> Option<u64> {
+    Some(30)
 }
 
 impl RedisConfig {

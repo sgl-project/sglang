@@ -898,12 +898,16 @@ python -m sglang_router.launch_router \
 ```bash
 export REDIS_URL="redis://localhost:6379"
 export REDIS_POOL_MAX=16
+export REDIS_RETENTION_DAYS=30
 
 python -m sglang_router.launch_router \
   --backend openai \
   --worker-urls https://api.openai.com \
-  --history-backend redis
+  --history-backend redis \
+  --redis-retention-days 30
 ```
+
+Use `--redis-retention-days -1` for persistent storage (default is 30 days).
 
 ---
 

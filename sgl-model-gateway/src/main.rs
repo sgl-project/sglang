@@ -477,6 +477,10 @@ struct CliArgs {
     #[arg(long, help_heading = "Redis Database")]
     redis_pool_max_size: Option<usize>,
 
+    /// Redis data retention in days (-1 for persistent, default 30)
+    #[arg(long, help_heading = "Redis Database")]
+    redis_retention_days: Option<i64>,
+
     // ==================== TLS/mTLS Security ====================
     /// Path to server TLS certificate (PEM format)
     #[arg(long, help_heading = "TLS/mTLS Security")]
@@ -805,7 +809,18 @@ impl CliArgs {
     fn build_redis_config(&self) -> ConfigResult<RedisConfig> {
         let url = self.redis_url.clone().unwrap_or_default();
         let pool_max = self.redis_pool_max_size.unwrap_or(16);
-        let rcf = RedisConfig { url, pool_max };
+
+        let retention_days = match self.redis_retention_days {
+            Some(d) if d < 0 => None, // Persistent
+            Some(d) => Some(d as u64),
+            None => Some(30), // Default 30 days
+        };
+
+        let rcf = RedisConfig {
+            url,
+            pool_max,
+            retention_days,
+        };
         rcf.validate().map_err(|e| ConfigError::ValidationFailed {
             reason: e.to_string(),
         })?;

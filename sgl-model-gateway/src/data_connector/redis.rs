@@ -29,6 +29,7 @@ use crate::{
 
 pub(crate) struct RedisStore {
     pool: Pool,
+    retention_days: Option<u64>,
 }
 
 impl RedisStore {
@@ -38,7 +39,10 @@ impl RedisStore {
         let pool = cfg
             .create_pool(Some(Runtime::Tokio1))
             .map_err(|e| e.to_string())?;
-        Ok(Self { pool })
+        Ok(Self {
+            pool,
+            retention_days: config.retention_days,
+        })
     }
 }
 
@@ -46,6 +50,7 @@ impl Clone for RedisStore {
     fn clone(&self) -> Self {
         Self {
             pool: self.pool.clone(),
+            retention_days: self.retention_days,
         }
     }
 }
@@ -111,8 +116,10 @@ impl ConversationStorage for RedisConversationStorage {
             pipe.hset(&key, "metadata", meta);
         }
 
-        // Expire after 30 days (optional, but good for cache)
-        pipe.expire(&key, 30 * 24 * 60 * 60);
+        // Expire after configured retention days (optional)
+        if let Some(days) = self.store.retention_days {
+            pipe.expire(&key, (days * 24 * 60 * 60) as i64);
+        }
 
         pipe.query_async::<()>(&mut conn)
             .await
@@ -303,8 +310,10 @@ impl ConversationItemStorage for RedisConversationItemStorage {
         }
         pipe.hset(&key, "created_at", created_at.to_rfc3339());
 
-        // Expire after 30 days
-        pipe.expire(&key, 30 * 24 * 60 * 60);
+        // Expire after configured retention days
+        if let Some(days) = self.store.retention_days {
+            pipe.expire(&key, (days * 24 * 60 * 60) as i64);
+        }
 
         pipe.query_async::<()>(&mut conn)
             .await
@@ -608,8 +617,10 @@ impl ResponseStorage for RedisResponseStorage {
         }
         pipe.hset(&key, "raw_response", json_raw_response);
 
-        // Expire after 30 days
-        pipe.expire(&key, 30 * 24 * 60 * 60);
+        // Expire after configured retention days
+        if let Some(days) = self.store.retention_days {
+            pipe.expire(&key, (days * 24 * 60 * 60) as i64);
+        }
 
         pipe.query_async::<()>(&mut conn)
             .await

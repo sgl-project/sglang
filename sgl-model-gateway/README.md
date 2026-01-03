@@ -717,11 +717,13 @@ Provide Redis connection URL and optional pool sizing:
 ```bash
 export REDIS_URL="redis://localhost:6379"
 export REDIS_POOL_MAX=16
+export REDIS_RETENTION_DAYS=30
 ```
 
 Router flags map to these values:
 - `--redis-url` (env: `REDIS_URL`)
 - `--redis-pool-max` (env: `REDIS_POOL_MAX`)
+- `--redis-retention-days` (env: `REDIS_RETENTION_DAYS`). Set to `-1` for persistent storage (default: 30 days).
 
 ## Reliability & Flow Control
 - **Retries**: Default max retries = 5 with exponential backoff (`--retry-max-retries`, `--retry-initial-backoff-ms`, `--retry-max-backoff-ms`, `--retry-backoff-multiplier`, `--retry-jitter-factor`). Retries trigger on 408/429/500/502/503/504.

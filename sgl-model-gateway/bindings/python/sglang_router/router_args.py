@@ -119,6 +119,7 @@ class RouterArgs:
     postgres_pool_max: int = 16
     redis_url: Optional[str] = None
     redis_pool_max: int = 16
+    redis_retention_days: int = 30
     # mTLS configuration for worker communication
     client_cert_path: Optional[str] = None
     client_key_path: Optional[str] = None
@@ -750,6 +751,12 @@ class RouterArgs:
             type=int,
             default=int(os.getenv("REDIS_POOL_MAX", RouterArgs.redis_pool_max)),
             help="Maximum Redis connection pool size (default: 16, env: REDIS_POOL_MAX)",
+        )
+        redis_group.add_argument(
+            f"--{prefix}redis-retention-days",
+            type=int,
+            default=int(os.getenv("REDIS_RETENTION_DAYS", RouterArgs.redis_retention_days)),
+            help="Redis data retention in days (-1 for persistent, default: 30, env: REDIS_RETENTION_DAYS)",
         )
 
         # TLS/mTLS configuration

@@ -268,9 +268,14 @@ class Router:
         # Convert Redis config if needed
         redis_config = None
         if history_backend == HistoryBackendType.Redis:
+            retention_days = args_dict.get("redis_retention_days", 30)
+            # If retention_days is negative, it means persistent storage (None in Rust)
+            retention_arg = None if retention_days < 0 else retention_days
+
             redis_config = PyRedisConfig(
                 url=args_dict.get("redis_url"),
                 pool_max=args_dict.get("redis_pool_max", 16),
+                retention_days=retention_arg,
             )
         args_dict["redis_config"] = redis_config
 
@@ -292,6 +297,7 @@ class Router:
             "postgres_pool_max",
             "redis_url",
             "redis_pool_max",
+            "redis_retention_days",
             # Control plane auth fields (converted to control_plane_auth)
             "control_plane_api_keys",
             "control_plane_audit_enabled",

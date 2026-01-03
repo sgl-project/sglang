@@ -278,14 +278,20 @@ pub struct PyRedisConfig {
     pub url: String,
     #[pyo3(get, set)]
     pub pool_max: usize,
+    #[pyo3(get, set)]
+    pub retention_days: Option<u64>,
 }
 
 #[pymethods]
 impl PyRedisConfig {
     #[new]
-    #[pyo3(signature = (url, pool_max = 16))]
-    fn new(url: String, pool_max: usize) -> PyResult<Self> {
-        Ok(PyRedisConfig { url, pool_max })
+    #[pyo3(signature = (url, pool_max = 16, retention_days = Some(30)))]
+    fn new(url: String, pool_max: usize, retention_days: Option<u64>) -> PyResult<Self> {
+        Ok(PyRedisConfig {
+            url,
+            pool_max,
+            retention_days,
+        })
     }
 }
 
@@ -294,6 +300,7 @@ impl PyRedisConfig {
         config::RedisConfig {
             url: self.url.clone(),
             pool_max: self.pool_max,
+            retention_days: self.retention_days,
         }
     }
 }
