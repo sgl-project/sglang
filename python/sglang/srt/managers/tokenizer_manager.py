@@ -370,6 +370,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             log_requests=self.server_args.log_requests,
             log_requests_level=self.server_args.log_requests_level,
             log_requests_format=self.server_args.log_requests_format,
+            log_requests_target=self.server_args.log_requests_target,
         )
 
         # Dumping
