@@ -28,16 +28,16 @@ mod inflight_tracker_tests {
         assert!(tracker.is_empty());
         assert_eq!(tracker.len(), 0);
 
-        tracker.register("req-1");
+        tracker.register(1);
         assert_eq!(tracker.len(), 1);
 
-        tracker.register("req-2");
+        tracker.register(2);
         assert_eq!(tracker.len(), 2);
 
-        tracker.deregister("req-1");
+        tracker.deregister(1);
         assert_eq!(tracker.len(), 1);
 
-        tracker.deregister("req-2");
+        tracker.deregister(2);
         assert!(tracker.is_empty());
     }
 
@@ -52,13 +52,11 @@ mod inflight_tracker_tests {
     fn test_tracker_bucket_counts_fresh_requests() {
         let tracker = InFlightRequestTracker::new_for_test();
 
-        tracker.register("req-1");
-        tracker.register("req-2");
-        tracker.register("req-3");
+        tracker.register(1);
+        tracker.register(2);
+        tracker.register(3);
 
         let counts = tracker.compute_bucket_counts();
-
-        // All fresh requests (age ~0s) should be in all buckets
         assert_eq!(counts[0], 3, "le=30 should have 3");
         assert_eq!(counts[1], 3, "le=60 should have 3");
         assert_eq!(counts[2], 3, "le=180 should have 3");
@@ -72,23 +70,14 @@ mod inflight_tracker_tests {
         let tracker = InFlightRequestTracker::new_for_test();
         let now = Instant::now();
 
-        // Insert requests with different ages
-        tracker.insert_with_time("req-0s", now);
-        tracker.insert_with_time("req-45s", now - Duration::from_secs(45));
-        tracker.insert_with_time("req-100s", now - Duration::from_secs(100));
-        tracker.insert_with_time("req-250s", now - Duration::from_secs(250));
-        tracker.insert_with_time("req-500s", now - Duration::from_secs(500));
-        tracker.insert_with_time("req-700s", now - Duration::from_secs(700));
+        tracker.insert_with_time(1, now);
+        tracker.insert_with_time(2, now - Duration::from_secs(45));
+        tracker.insert_with_time(3, now - Duration::from_secs(100));
+        tracker.insert_with_time(4, now - Duration::from_secs(250));
+        tracker.insert_with_time(5, now - Duration::from_secs(500));
+        tracker.insert_with_time(6, now - Duration::from_secs(700));
 
         let counts = tracker.compute_bucket_counts();
-
-        // Verify cumulative semantics:
-        // le="30":  1 (only req-0s)
-        // le="60":  2 (req-0s, req-45s)
-        // le="180": 3 (req-0s, req-45s, req-100s)
-        // le="300": 4 (req-0s, req-45s, req-100s, req-250s)
-        // le="600": 5 (req-0s, req-45s, req-100s, req-250s, req-500s)
-        // +Inf:     6 (all)
         assert_eq!(counts[0], 1, "le=30");
         assert_eq!(counts[1], 2, "le=60");
         assert_eq!(counts[2], 3, "le=180");
@@ -101,9 +90,7 @@ mod inflight_tracker_tests {
     fn test_tracker_bucket_boundary_exact() {
         let tracker = InFlightRequestTracker::new_for_test();
         let now = Instant::now();
-
-        // Exact boundary: 30s should be included in le=30
-        tracker.insert_with_time("req-30s", now - Duration::from_secs(30));
+        tracker.insert_with_time(1, now - Duration::from_secs(30));
 
         let counts = tracker.compute_bucket_counts();
         assert_eq!(counts[0], 1, "le=30 should include exact boundary");
@@ -113,9 +100,7 @@ mod inflight_tracker_tests {
     fn test_tracker_bucket_boundary_just_over() {
         let tracker = InFlightRequestTracker::new_for_test();
         let now = Instant::now();
-
-        // Just over boundary: 31s should NOT be in le=30
-        tracker.insert_with_time("req-31s", now - Duration::from_secs(31));
+        tracker.insert_with_time(1, now - Duration::from_secs(31));
 
         let counts = tracker.compute_bucket_counts();
         assert_eq!(counts[0], 0, "le=30 should NOT include 31s");
@@ -130,22 +115,20 @@ mod inflight_tracker_tests {
             Arc::new(InFlightRequestTracker::new_for_test());
         let mut handles = vec![];
 
-        // Spawn register threads
-        for i in 0..5 {
+        for i in 0..5u64 {
             let t = Arc::clone(&tracker);
             handles.push(thread::spawn(move || {
-                for j in 0..50 {
-                    t.register(&format!("t{}-r{}", i, j));
+                for j in 0..50u64 {
+                    t.register(i * 1000 + j);
                 }
             }));
         }
 
-        // Spawn deregister threads (partial overlap)
-        for i in 0..2 {
+        for i in 0..2u64 {
             let t = Arc::clone(&tracker);
             handles.push(thread::spawn(move || {
-                for j in 0..50 {
-                    t.deregister(&format!("t{}-r{}", i, j));
+                for j in 0..50u64 {
+                    t.deregister(i * 1000 + j);
                 }
             }));
         }
@@ -154,7 +137,6 @@ mod inflight_tracker_tests {
             h.join().expect("Thread should not panic");
         }
 
-        // Should be able to compute bucket counts without panic
         let _counts = tracker.compute_bucket_counts();
     }
 

@@ -18,9 +18,8 @@ const AGE_BUCKET_BOUNDS: &[u64] = &[30, 60, 180, 300, 600];
 /// Label values for each bucket bound, plus "+Inf" for the total.
 const AGE_BUCKET_LABELS: &[&str] = &["30", "60", "180", "300", "600", "+Inf"];
 
-/// Tracks in-flight HTTP requests and their start times.
 pub struct InFlightRequestTracker {
-    requests: DashMap<String, Instant>,
+    requests: DashMap<u64, Instant>,
 }
 
 impl InFlightRequestTracker {
@@ -28,13 +27,10 @@ impl InFlightRequestTracker {
         let tracker = Arc::new(Self {
             requests: DashMap::new(),
         });
-
         tracker.clone().spawn_sampler(sample_interval);
         tracker
     }
 
-    /// Creates a new tracker without spawning the background sampler.
-    /// Used for testing purposes.
     #[doc(hidden)]
     pub fn new_for_test() -> Self {
         Self {
@@ -42,14 +38,12 @@ impl InFlightRequestTracker {
         }
     }
 
-    /// Registers a request as in-flight.
-    pub fn register(&self, request_id: &str) {
-        self.requests.insert(request_id.to_string(), Instant::now());
+    pub fn register(&self, request_id: u64) {
+        self.requests.insert(request_id, Instant::now());
     }
 
-    /// Deregisters a request when it completes.
-    pub fn deregister(&self, request_id: &str) {
-        self.requests.remove(request_id);
+    pub fn deregister(&self, request_id: u64) {
+        self.requests.remove(&request_id);
     }
 
     #[doc(hidden)]
@@ -63,8 +57,8 @@ impl InFlightRequestTracker {
     }
 
     #[doc(hidden)]
-    pub fn insert_with_time(&self, request_id: &str, start_time: Instant) {
-        self.requests.insert(request_id.to_string(), start_time);
+    pub fn insert_with_time(&self, request_id: u64, start_time: Instant) {
+        self.requests.insert(request_id, start_time);
     }
 
     #[doc(hidden)]
@@ -157,14 +151,14 @@ mod tests {
             requests: DashMap::new(),
         };
 
-        tracker.register("req-1");
-        tracker.register("req-2");
+        tracker.register(1);
+        tracker.register(2);
         assert_eq!(tracker.len(), 2);
 
-        tracker.deregister("req-1");
+        tracker.deregister(1);
         assert_eq!(tracker.len(), 1);
 
-        tracker.deregister("req-2");
+        tracker.deregister(2);
         assert_eq!(tracker.len(), 0);
     }
 
@@ -174,8 +168,7 @@ mod tests {
             requests: DashMap::new(),
         };
 
-        // Should not panic
-        tracker.deregister("nonexistent");
+        tracker.deregister(999);
         assert_eq!(tracker.len(), 0);
     }
 
@@ -185,10 +178,10 @@ mod tests {
             requests: DashMap::new(),
         };
 
-        tracker.register("req-1");
+        tracker.register(1);
         std::thread::sleep(Duration::from_millis(10));
 
-        let entry = tracker.requests.get("req-1").unwrap();
+        let entry = tracker.requests.get(&1).unwrap();
         let age = entry.value().elapsed();
         assert!(age >= Duration::from_millis(10));
     }
@@ -210,34 +203,14 @@ mod tests {
         };
 
         let now = Instant::now();
-
-        // Request with age ~0s (should be in all buckets: le=30, 60, 180, 300, 600, +Inf)
-        tracker.insert_with_time("req-fresh", now);
-
-        // Request with age ~45s (should be in: le=60, 180, 300, 600, +Inf, but NOT le=30)
-        tracker.insert_with_time("req-45s", now - Duration::from_secs(45));
-
-        // Request with age ~100s (should be in: le=180, 300, 600, +Inf, but NOT le=30, 60)
-        tracker.insert_with_time("req-100s", now - Duration::from_secs(100));
-
-        // Request with age ~250s (should be in: le=300, 600, +Inf, but NOT le=30, 60, 180)
-        tracker.insert_with_time("req-250s", now - Duration::from_secs(250));
-
-        // Request with age ~500s (should be in: le=600, +Inf, but NOT le=30, 60, 180, 300)
-        tracker.insert_with_time("req-500s", now - Duration::from_secs(500));
-
-        // Request with age ~700s (should only be in: +Inf)
-        tracker.insert_with_time("req-700s", now - Duration::from_secs(700));
+        tracker.insert_with_time(1, now);
+        tracker.insert_with_time(2, now - Duration::from_secs(45));
+        tracker.insert_with_time(3, now - Duration::from_secs(100));
+        tracker.insert_with_time(4, now - Duration::from_secs(250));
+        tracker.insert_with_time(5, now - Duration::from_secs(500));
+        tracker.insert_with_time(6, now - Duration::from_secs(700));
 
         let counts = tracker.compute_bucket_counts();
-
-        // Verify cumulative semantics:
-        // le="30":  1 (req-fresh)
-        // le="60":  2 (req-fresh, req-45s)
-        // le="180": 3 (req-fresh, req-45s, req-100s)
-        // le="300": 4 (req-fresh, req-45s, req-100s, req-250s)
-        // le="600": 5 (req-fresh, req-45s, req-100s, req-250s, req-500s)
-        // +Inf:     6 (all requests)
         assert_eq!(counts[0], 1, "le=30 bucket");
         assert_eq!(counts[1], 2, "le=60 bucket");
         assert_eq!(counts[2], 3, "le=180 bucket");
@@ -253,17 +226,10 @@ mod tests {
         };
 
         let now = Instant::now();
-
-        // Test exact boundary: age = 30s (should be included in le=30)
-        tracker.insert_with_time("req-30s", now - Duration::from_secs(30));
-
-        // Test just over boundary: age = 31s (should NOT be in le=30, but in le=60)
-        tracker.insert_with_time("req-31s", now - Duration::from_secs(31));
+        tracker.insert_with_time(1, now - Duration::from_secs(30));
+        tracker.insert_with_time(2, now - Duration::from_secs(31));
 
         let counts = tracker.compute_bucket_counts();
-
-        // le="30": 1 (req-30s is exactly at boundary, included)
-        // le="60": 2 (both requests)
         assert_eq!(counts[0], 1, "le=30 should include exact boundary");
         assert_eq!(counts[1], 2, "le=60 should include both");
         assert_eq!(counts[5], 2, "+Inf should include all");
@@ -280,24 +246,20 @@ mod tests {
 
         let mut handles = vec![];
 
-        // Spawn threads that register requests
-        for i in 0..10 {
+        for i in 0..10u64 {
             let tracker_clone = Arc::clone(&tracker);
             handles.push(thread::spawn(move || {
-                for j in 0..100 {
-                    let id = format!("thread-{}-req-{}", i, j);
-                    tracker_clone.register(&id);
+                for j in 0..100u64 {
+                    tracker_clone.register(i * 1000 + j);
                 }
             }));
         }
 
-        // Spawn threads that deregister requests
-        for i in 0..5 {
+        for i in 0..5u64 {
             let tracker_clone = Arc::clone(&tracker);
             handles.push(thread::spawn(move || {
-                for j in 0..100 {
-                    let id = format!("thread-{}-req-{}", i, j);
-                    tracker_clone.deregister(&id);
+                for j in 0..100u64 {
+                    tracker_clone.deregister(i * 1000 + j);
                 }
             }));
         }
@@ -306,15 +268,9 @@ mod tests {
             handle.join().expect("Thread should not panic");
         }
 
-        // After concurrent operations, some requests should remain
-        // (threads 5-9 registered 100 each = 500, none of those were deregistered)
-        // threads 0-4 registered 100 each but also got deregistered
-        // The exact count depends on timing, but tracker should be in a valid state
-        let _ = tracker.len(); // Just ensure len() doesn't panic
-
-        // Verify we can still compute buckets without panic
+        let _ = tracker.len();
         let counts = tracker.compute_bucket_counts();
-        let _ = counts[5]; // Just ensure +Inf bucket is accessible
+        let _ = counts[5];
     }
 
     #[test]
@@ -324,16 +280,11 @@ mod tests {
         };
 
         let now = Instant::now();
-        tracker.insert_with_time("req-1", now - Duration::from_secs(100));
+        tracker.insert_with_time(1, now - Duration::from_secs(100));
+        tracker.register(1);
 
-        // Re-register with new timestamp
-        tracker.register("req-1");
-
-        // Should still have only 1 entry
         assert_eq!(tracker.len(), 1);
-
-        // The new entry should be fresh (age near 0)
-        let entry = tracker.requests.get("req-1").unwrap();
+        let entry = tracker.requests.get(&1).unwrap();
         assert!(entry.value().elapsed() < Duration::from_secs(1));
     }
 }

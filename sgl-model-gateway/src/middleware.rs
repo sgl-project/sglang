@@ -655,37 +655,27 @@ where
         let method = method_to_static_str(req.method().as_str());
         let path = normalize_path_for_metrics(req.uri().path());
         let start = Instant::now();
-
-        // Generate a unique ID for in-flight tracking
         let tracking_id = INFLIGHT_TRACKING_COUNTER.fetch_add(1, Ordering::Relaxed);
-
         let mut inner = self.inner.clone();
 
         Box::pin(async move {
-            // Increment inside async block - ensures no leak if future is dropped before polling
             let active = ACTIVE_HTTP_CONNECTIONS.fetch_add(1, Ordering::Relaxed) + 1;
             Metrics::set_http_connections_active(active as usize);
 
-            // Register request in in-flight tracker
-            let tracking_key = tracking_id.to_string();
             if let Some(tracker) = get_tracker() {
-                tracker.register(&tracking_key);
+                tracker.register(tracking_id);
             }
 
-            // Capture result before decrementing to ensure decrement happens on error too
             let result = inner.call(req).await;
 
-            // Always deregister from in-flight tracker, regardless of success or failure
             if let Some(tracker) = get_tracker() {
-                tracker.deregister(&tracking_key);
+                tracker.deregister(tracking_id);
             }
 
-            // Always decrement, regardless of success or failure
             let active = ACTIVE_HTTP_CONNECTIONS.fetch_sub(1, Ordering::Relaxed) - 1;
             Metrics::set_http_connections_active(active as usize);
 
             let response = result?;
-
             let duration = start.elapsed();
             Metrics::record_http_duration(method, &path, duration);
 
