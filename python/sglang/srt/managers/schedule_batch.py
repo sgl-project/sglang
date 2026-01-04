@@ -2127,6 +2127,21 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if self.spec_info:
             self.spec_info.merge_batch(other.spec_info)
 
+    @staticmethod
+    def _resolve_capture_layers(req) -> Optional[Union[int, List[int]]]:
+        """Normalize attention layer selection to a canonical form.
+
+        Priority: attention_capture_layer_ids > attention_capture_layer_id
+        Returns: List[int] if layer_ids specified, int if layer_id specified, None otherwise
+        """
+        layer_ids = getattr(req, "attention_capture_layer_ids", None)
+        if layer_ids is not None:
+            return list(layer_ids) if not isinstance(layer_ids, list) else layer_ids
+        layer_id = getattr(req, "attention_capture_layer_id", None)
+        if layer_id is not None:
+            return int(layer_id)
+        return None
+
     def get_model_worker_batch(
         self, seq_lens_cpu_cache: Optional[torch.Tensor] = None
     ) -> ModelWorkerBatch:
@@ -2189,15 +2204,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 attention_top_k = req_top_k
 
             # Get layer override from first request that specifies one
-            # attention_capture_layer_ids takes precedence over attention_capture_layer_id
+            # Normalize to List[int] | None internally (layer_ids takes precedence)
             if attention_capture_layer_id is None:
-                layer_ids = getattr(req, "attention_capture_layer_ids", None)
-                if layer_ids is not None:
-                    attention_capture_layer_id = layer_ids  # Pass the list directly
-                else:
-                    layer_id = getattr(req, "attention_capture_layer_id", None)
-                    if layer_id is not None:
-                        attention_capture_layer_id = layer_id
+                attention_capture_layer_id = self._resolve_capture_layers(req)
 
         return ModelWorkerBatch(
             forward_mode=self.forward_mode,
