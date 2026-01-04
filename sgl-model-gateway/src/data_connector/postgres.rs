@@ -13,6 +13,7 @@ use chrono::{DateTime, Utc};
 use deadpool_postgres::{Manager, ManagerConfig, Pool, RecyclingMethod};
 use serde_json::Value;
 use tokio_postgres::{NoTls, Row};
+use tracing;
 
 use crate::{
     config::PostgresConfig,
@@ -588,7 +589,7 @@ impl ResponseStorage for PostgresResponseStorage {
                 &conversation_id,
                 &json_raw_response,
             ]).await.unwrap();
-        println!("INSERT INTO responses VALUES {insert_count}");
+        tracing::debug!(rows_affected = insert_count, "Response stored in Postgres");
         Ok(response_id)
     }
 
