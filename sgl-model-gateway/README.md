@@ -639,6 +639,7 @@ Supported tool parsers: `json`, `python`, `xml`.
 - `--history-backend none` disables persistence while keeping APIs.
 - `--history-backend oracle` uses Oracle Autonomous Database; provide credentials via flags or environment variables.
 - `--history-backend postgres` uses PostgreSQL Database.
+- `--history-backend redis` uses Redis.
 - Conversation item storage mirrors the history backend (Oracle or memory). The same storage powers OpenAI `/responses` and conversation APIs.
 
 ### History Backend (OpenAI Router Mode)
@@ -651,6 +652,7 @@ Store conversation and response data for tracking, debugging, or analytics.
 - **None**: No storage, minimal overhead.
 - **Oracle**: Persistent storage backed by Oracle Autonomous Database.
 - **Postgres**: Persistent storage backed by PostgreSQL Database.
+- **Redis**: Persistent storage backed by Redis.
 
 ```bash
 # Memory backend (default)
@@ -676,6 +678,12 @@ python3 -m sglang_router.launch_router \
   --backend openai \
   --worker-urls https://api.openai.com \
   --history-backend postgres
+
+# Redis backend
+python3 -m sglang_router.launch_router \
+  --backend openai \
+  --worker-urls https://api.openai.com \
+  --history-backend redis
 ```
 
 #### Oracle configuration
@@ -703,6 +711,19 @@ Router flags map to these values:
 - `--oracle-pool-min`, `--oracle-pool-max`, `--oracle-pool-timeout-secs`.
 
 Only one of `--oracle-dsn` or `--oracle-tns-alias` should be supplied.
+
+#### Redis configuration
+Provide Redis connection URL and optional pool sizing:
+```bash
+export REDIS_URL="redis://localhost:6379"
+export REDIS_POOL_MAX=16
+export REDIS_RETENTION_DAYS=30
+```
+
+Router flags map to these values:
+- `--redis-url` (env: `REDIS_URL`)
+- `--redis-pool-max` (env: `REDIS_POOL_MAX`)
+- `--redis-retention-days` (env: `REDIS_RETENTION_DAYS`). Set to `-1` for persistent storage (default: 30 days).
 
 ## Reliability & Flow Control
 - **Retries**: Default max retries = 5 with exponential backoff (`--retry-max-retries`, `--retry-initial-backoff-ms`, `--retry-max-backoff-ms`, `--retry-backoff-multiplier`, `--retry-jitter-factor`). Retries trigger on 408/429/500/502/503/504.

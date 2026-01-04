@@ -5,8 +5,8 @@ use smg::{
     auth::{ApiKeyEntry, ControlPlaneAuthConfig, JwtConfig, Role},
     config::{
         CircuitBreakerConfig, ConfigError, ConfigResult, DiscoveryConfig, HealthCheckConfig,
-        HistoryBackend, MetricsConfig, OracleConfig, PolicyConfig, PostgresConfig, RetryConfig,
-        RouterConfig, RoutingMode, TokenizerCacheConfig, TraceConfig,
+        HistoryBackend, MetricsConfig, OracleConfig, PolicyConfig, PostgresConfig, RedisConfig,
+        RetryConfig, RouterConfig, RoutingMode, TokenizerCacheConfig, TraceConfig,
     },
     core::ConnectionMode,
     observability::{
@@ -419,7 +419,7 @@ struct CliArgs {
     backend: Backend,
 
     /// History storage backend
-    #[arg(long, default_value = "memory", value_parser = ["memory", "none", "oracle","postgres"], help_heading = "Backend")]
+    #[arg(long, default_value = "memory", value_parser = ["memory", "none", "oracle", "postgres", "redis"], help_heading = "Backend")]
     history_backend: String,
 
     /// Enable WebAssembly support
@@ -467,6 +467,19 @@ struct CliArgs {
     /// Maximum PostgreSQL connection pool size
     #[arg(long, help_heading = "PostgreSQL Database")]
     postgres_pool_max_size: Option<usize>,
+
+    // ==================== Redis Database ====================
+    /// Redis connection URL
+    #[arg(long, help_heading = "Redis Database")]
+    redis_url: Option<String>,
+
+    /// Maximum Redis connection pool size
+    #[arg(long, help_heading = "Redis Database")]
+    redis_pool_max_size: Option<usize>,
+
+    /// Redis data retention in days (-1 for persistent, default 30)
+    #[arg(long, help_heading = "Redis Database")]
+    redis_retention_days: Option<i64>,
 
     // ==================== TLS/mTLS Security ====================
     /// Path to server TLS certificate (PEM format)
@@ -793,6 +806,27 @@ impl CliArgs {
         Ok(pcf)
     }
 
+    fn build_redis_config(&self) -> ConfigResult<RedisConfig> {
+        let url = self.redis_url.clone().unwrap_or_default();
+        let pool_max = self.redis_pool_max_size.unwrap_or(16);
+
+        let retention_days = match self.redis_retention_days {
+            Some(d) if d < 0 => None, // Persistent
+            Some(d) => Some(d as u64),
+            None => Some(30), // Default 30 days
+        };
+
+        let rcf = RedisConfig {
+            url,
+            pool_max,
+            retention_days,
+        };
+        rcf.validate().map_err(|e| ConfigError::ValidationFailed {
+            reason: e.to_string(),
+        })?;
+        Ok(rcf)
+    }
+
     fn to_router_config(
         &self,
         prefill_urls: Vec<(String, Option<u16>)>,
@@ -869,6 +903,7 @@ impl CliArgs {
             "none" => HistoryBackend::None,
             "oracle" => HistoryBackend::Oracle,
             "postgres" => HistoryBackend::Postgres,
+            "redis" => HistoryBackend::Redis,
             _ => HistoryBackend::Memory,
         };
 
@@ -879,6 +914,11 @@ impl CliArgs {
         };
         let postgres = if history_backend == HistoryBackend::Postgres {
             Some(self.build_postgres_config()?)
+        } else {
+            None
+        };
+        let redis = if history_backend == HistoryBackend::Redis {
+            Some(self.build_redis_config()?)
         } else {
             None
         };
@@ -939,6 +979,7 @@ impl CliArgs {
             .maybe_chat_template(self.chat_template.as_ref())
             .maybe_oracle(oracle)
             .maybe_postgres(postgres)
+            .maybe_redis(redis)
             .maybe_reasoning_parser(self.reasoning_parser.as_ref())
             .maybe_tool_call_parser(self.tool_call_parser.as_ref())
             .maybe_mcp_config_path(self.mcp_config_path.as_ref())
