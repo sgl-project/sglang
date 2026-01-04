@@ -1,3 +1,23 @@
+"""
+Benchmark for Rotary Embedding implementations.
+
+Key test scenarios:
+- jit_fused: JIT kernel with fused gathering (positions + full cache) - OPTIMIZED
+  * Avoids explicit index_select in Python
+  * Gathering happens inside the kernel
+  
+- jit_unfused: JIT kernel with explicit gathering (positions + full cache) - BASELINE
+  * Includes index_select overhead in Python
+  * Shows the cost we're trying to avoid
+  
+- jit_cos_sin: JIT kernel with pre-gathered cos/sin (backward compatibility)
+  * Traditional approach: cos/sin already gathered before kernel call
+  * Does not include gathering overhead in timing
+  
+- aot_pos: AOT kernel with positions
+- vllm_pos: vLLM's implementation
+- flashinfer_rope: FlashInfer's RoPE implementation
+"""
 import itertools
 import os
 from functools import lru_cache
@@ -215,8 +235,51 @@ def sglang_jit_rotary_cos_sin(
     rotary_embedding_cos_sin(cos, sin, q, k, head_size, interleaved)
 
 
-BASE_PROVIDER = "jit_cos_sin"
-BASE_NAME = "SGL JIT (cos/sin)"
+def sglang_jit_rotary_with_positions(
+    positions: torch.Tensor,
+    cos_cache: torch.Tensor,
+    sin_cache: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    head_size: int,
+    interleaved: bool,
+) -> None:
+    """
+    JIT kernel with fused gathering: positions + full cache.
+    This is the optimized version that avoids explicit index_select in Python.
+    """
+    from sglang.jit_kernel.rotary_embedding import rotary_embedding_cos_sin
+
+    rotary_embedding_cos_sin(
+        cos_cache, sin_cache, q, k, head_size, interleaved, positions=positions
+    )
+
+
+def sglang_jit_rotary_with_gather(
+    positions: torch.Tensor,
+    cos_cache: torch.Tensor,
+    sin_cache: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    head_size: int,
+    interleaved: bool,
+) -> None:
+    """
+    JIT kernel WITHOUT fused gathering: explicit index_select in Python.
+    This is the baseline version that includes the gathering overhead.
+    """
+    from sglang.jit_kernel.rotary_embedding import rotary_embedding_cos_sin
+
+    # Explicit gathering in Python (the overhead we want to avoid)
+    cos_gathered = cos_cache[positions].contiguous()
+    sin_gathered = sin_cache[positions].contiguous()
+    rotary_embedding_cos_sin(
+        cos_gathered, sin_gathered, q, k, head_size, interleaved
+    )
+
+
+BASE_PROVIDER = "jit_fused"
+BASE_NAME = "SGL JIT (fused)"
 BASE_STYLE = ("blue", "-")
 
 BASE_LINE_VALS = [BASE_PROVIDER]
@@ -226,6 +289,11 @@ BASE_STYLES = [BASE_STYLE]
 LINE_VALS = list(BASE_LINE_VALS)
 LINE_NAMES = list(BASE_LINE_NAMES)
 STYLES = list(BASE_STYLES)
+
+# Add unfused version for comparison
+LINE_VALS.append("jit_unfused")
+LINE_NAMES.append("SGL JIT (unfused)")
+STYLES.append(("purple", ":"))
 
 if HAS_SGL_POS:
     LINE_VALS.append("aot_pos")
@@ -331,8 +399,10 @@ def benchmark(
     num_tokens = batch_size * seq_len
     rotary_dim = head_size
 
+    # Prepare full cache (for fused gathering tests)
     cos_cache_half, sin_cache_half = _get_cos_sin_cache_half_cuda(rotary_dim)
     cos_sin_cache_aot = torch.cat([cos_cache_half, sin_cache_half], dim=-1).contiguous()
+    
     # FlashInfer requires cos_sin_cache to be float32.
     if HAS_FLASHINFER:
         cos_f32, sin_f32 = _compute_cos_sin_cache_half(
@@ -344,17 +414,27 @@ def benchmark(
             .contiguous()
         )
 
+    # Prepare positions (simulate real decoding scenario)
+    # Use arange for simplicity, but in real scenario this could be non-contiguous
     positions = torch.arange(seq_len, device=DEVICE, dtype=torch.int64).repeat(
         batch_size
     )
+    
+    # Pre-gathered cos/sin for unfused tests (traditional approach)
     cos_half = cos_cache_half[positions].contiguous()
     sin_half = sin_cache_half[positions].contiguous()
 
     if interleaved:
-        cos, sin = cos_half, sin_half
+        cos_gathered, sin_gathered = cos_half, sin_half
+        # For fused tests, prepare cache in interleaved format
+        cos_cache_for_fused = cos_cache_half
+        sin_cache_for_fused = sin_cache_half
     else:
-        cos = torch.cat([cos_half, cos_half], dim=-1).contiguous()
-        sin = torch.cat([sin_half, sin_half], dim=-1).contiguous()
+        cos_gathered = torch.cat([cos_half, cos_half], dim=-1).contiguous()
+        sin_gathered = torch.cat([sin_half, sin_half], dim=-1).contiguous()
+        # For fused tests, prepare cache in non-interleaved format
+        cos_cache_for_fused = torch.cat([cos_cache_half, cos_cache_half], dim=-1).contiguous()
+        sin_cache_for_fused = torch.cat([sin_cache_half, sin_cache_half], dim=-1).contiguous()
 
     # Keep a canonical 4D layout for providers that require it (e.g. FlashInfer).
     # View as 3D for providers that accept [num_tokens, nheads, head_size].
@@ -370,35 +450,60 @@ def benchmark(
     global _SANITY_DONE
     if (
         (not _SANITY_DONE)
-        and provider == "aot_pos"
+        and provider == "jit_fused"
         and batch_size == BS_RANGE[0]
         and seq_len == SEQ_RANGE[0]
         and head_size == HEAD_SIZE_RANGE[0]
         and interleaved == INTERLEAVED_RANGE[0]
     ):
+        # Reference implementation
         q_ref = q.clone()
         k_ref = k.clone()
-        torch_impl_rotary_fp32(cos, sin, q_ref, k_ref, head_size, interleaved)
-        q_out = q.clone()
-        k_out = k.clone()
-        sglang_aot_rotary_positions(
-            positions, q_out, k_out, head_size, interleaved, cos_sin_cache_aot
+        torch_impl_rotary_fp32(cos_gathered, sin_gathered, q_ref, k_ref, head_size, interleaved)
+        
+        # Test fused version
+        q_fused_test = q.clone()
+        k_fused_test = k.clone()
+        sglang_jit_rotary_with_positions(
+            positions, cos_cache_for_fused, sin_cache_for_fused, 
+            q_fused_test, k_fused_test, head_size, interleaved
         )
+        
+        # Test unfused version
+        q_unfused_test = q.clone()
+        k_unfused_test = k.clone()
+        sglang_jit_rotary_with_gather(
+            positions, cos_cache_for_fused, sin_cache_for_fused,
+            q_unfused_test, k_unfused_test, head_size, interleaved
+        )
+        
         ref_atol = 2e-2 if DTYPE == torch.bfloat16 else 2e-3
         ref_rtol = 2e-2 if DTYPE == torch.bfloat16 else 2e-3
-        _assert_close_gpu(q_out, q_ref, atol=ref_atol, rtol=ref_rtol, name="AOT(q)")
-        _assert_close_gpu(k_out, k_ref, atol=ref_atol, rtol=ref_rtol, name="AOT(k)")
+        _assert_close_gpu(q_fused_test, q_ref, atol=ref_atol, rtol=ref_rtol, name="JIT-fused(q)")
+        _assert_close_gpu(k_fused_test, k_ref, atol=ref_atol, rtol=ref_rtol, name="JIT-fused(k)")
+        _assert_close_gpu(q_unfused_test, q_ref, atol=ref_atol, rtol=ref_rtol, name="JIT-unfused(q)")
+        _assert_close_gpu(k_unfused_test, k_ref, atol=ref_atol, rtol=ref_rtol, name="JIT-unfused(k)")
+        print("✅ Sanity check passed: fused and unfused versions match reference!")
         _SANITY_DONE = True
 
     FN_MAP = {
         "aot_pos": lambda: sglang_aot_rotary_positions(
             positions, q, k, head_size, interleaved, cos_sin_cache_aot
         ),
+        # NEW: Fused gathering - positions + full cache (OPTIMIZED)
+        "jit_fused": lambda: sglang_jit_rotary_with_positions(
+            positions, cos_cache_for_fused, sin_cache_for_fused, q, k, head_size, interleaved
+        ),
+        # NEW: Unfused - explicit gathering in Python (BASELINE)
+        "jit_unfused": lambda: sglang_jit_rotary_with_gather(
+            positions, cos_cache_for_fused, sin_cache_for_fused, q, k, head_size, interleaved
+        ),
+        # OLD: Pre-gathered cos/sin (for backward compatibility)
         "jit_cos_sin": lambda: sglang_jit_rotary_cos_sin(
-            cos, sin, q, k, head_size, interleaved
+            cos_gathered, sin_gathered, q, k, head_size, interleaved
         ),
         "torch_fp32": lambda: torch_impl_rotary_fp32(
-            cos, sin, q, k, head_size, interleaved
+            cos_gathered, sin_gathered, q, k, head_size, interleaved
         ),
     }
     if HAS_FLASHINFER and apply_flashinfer_rope_qk_inplace is not None:
@@ -455,6 +560,7 @@ def benchmark_speedup_vs_jit(
     num_tokens = batch_size * seq_len
     rotary_dim = head_size
 
+    # Prepare full cache
     cos_cache_half, sin_cache_half = _get_cos_sin_cache_half_cuda(rotary_dim)
     cos_sin_cache_aot = torch.cat([cos_cache_half, sin_cache_half], dim=-1).contiguous()
     if HAS_FLASHINFER:
@@ -474,10 +580,14 @@ def benchmark_speedup_vs_jit(
     sin_half = sin_cache_half[positions].contiguous()
 
     if interleaved:
-        cos, sin = cos_half, sin_half
+        cos_gathered, sin_gathered = cos_half, sin_half
+        cos_cache_for_fused = cos_cache_half
+        sin_cache_for_fused = sin_cache_half
     else:
-        cos = torch.cat([cos_half, cos_half], dim=-1).contiguous()
-        sin = torch.cat([sin_half, sin_half], dim=-1).contiguous()
+        cos_gathered = torch.cat([cos_half, cos_half], dim=-1).contiguous()
+        sin_gathered = torch.cat([sin_half, sin_half], dim=-1).contiguous()
+        cos_cache_for_fused = torch.cat([cos_cache_half, cos_cache_half], dim=-1).contiguous()
+        sin_cache_for_fused = torch.cat([sin_cache_half, sin_cache_half], dim=-1).contiguous()
 
     q_base4 = torch.randn(
         batch_size, seq_len, NUM_Q_HEADS, head_size, device=DEVICE, dtype=DTYPE
@@ -488,20 +598,30 @@ def benchmark_speedup_vs_jit(
     q_base = q_base4.view(num_tokens, NUM_Q_HEADS, head_size)
     k_base = k_base4.view(num_tokens, NUM_Q_HEADS, head_size)
 
+    q_fused = q_base.clone()
+    k_fused = k_base.clone()
+    q_unfused = q_base.clone()
+    k_unfused = k_base.clone()
     q_jit = q_base.clone()
     k_jit = k_base.clone()
     q_p = q_base.clone()
     k_p = k_base.clone()
 
     FN_MAP = {
+        "jit_fused": lambda: sglang_jit_rotary_with_positions(
+            positions, cos_cache_for_fused, sin_cache_for_fused, q_fused, k_fused, head_size, interleaved
+        ),
+        "jit_unfused": lambda: sglang_jit_rotary_with_gather(
+            positions, cos_cache_for_fused, sin_cache_for_fused, q_unfused, k_unfused, head_size, interleaved
+        ),
         "jit_cos_sin": lambda: sglang_jit_rotary_cos_sin(
-            cos, sin, q_jit, k_jit, head_size, interleaved
+            cos_gathered, sin_gathered, q_jit, k_jit, head_size, interleaved
         ),
         "aot_pos": lambda: sglang_aot_rotary_positions(
             positions, q_p, k_p, head_size, interleaved, cos_sin_cache_aot
         ),
         "torch_fp32": lambda: torch_impl_rotary_fp32(
-            cos, sin, q_p, k_p, head_size, interleaved
+            cos_gathered, sin_gathered, q_p, k_p, head_size, interleaved
         ),
     }
     if HAS_FLASHINFER and apply_flashinfer_rope_qk_inplace is not None:
