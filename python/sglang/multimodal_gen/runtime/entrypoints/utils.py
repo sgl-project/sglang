@@ -30,24 +30,30 @@ def prepare_request(
     server_args: ServerArgs,
     sampling_params: SamplingParams,
 ) -> Req:
-    """
-    Settle SamplingParams according to ServerArgs
-
-    """
-    # Create a copy of inference args to avoid modifying the original.
-    # Filter out fields not defined in Req to avoid unexpected-kw TypeError.
     params_dict = shallow_asdict(sampling_params)
-    req_field_names = {f.name for f in dataclasses.fields(Req)}
-    filtered_params = {k: v for k, v in params_dict.items() if k in req_field_names}
-    req = Req(**filtered_params, VSA_sparsity=server_args.VSA_sparsity)
+
+    diffusers_kwargs = params_dict.pop("diffusers_kwargs", None)
+    extra = params_dict.get("extra") or {}
+    if diffusers_kwargs:
+        extra["diffusers_kwargs"] = diffusers_kwargs
+        params_dict["extra"] = extra
+
+    # Filter to only fields that exist in Req
+    req_fields = {f.name for f in dataclasses.fields(Req)}
+    filtered_params = {k: v for k, v in params_dict.items() if k in req_fields}
+
+    req = Req(
+        **filtered_params,
+        VSA_sparsity=server_args.VSA_sparsity,
+    )
+
     req.adjust_size(server_args)
 
     if (req.width is not None and req.width <= 0) or (
         req.height is not None and req.height <= 0
     ):
         raise ValueError(
-            f"Height, width must be positive integers, got "
-            f"height={req.height}, width={req.width}"
+            f"Height and width must be positive, got height={req.height}, width={req.width}"
         )
 
     return req
