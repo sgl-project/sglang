@@ -48,6 +48,9 @@ python -m http.server 8081
   - `auto`: Automatically select ~4 layers spread across depth [L/4, L/2, 3L/4, L-1]
   - Comma-separated indices: e.g., `0,10,20,30` for specific layers
 - `--attention-sketch-mode`: Return per-layer summary sketches instead of raw edges (bandwidth efficient for long outputs)
+- `--attention-fingerprint-mode`: Production mode - compute 20D feature vector on GPU (64 bytes vs 200KB/step)
+- `--attention-fingerprint-max-steps N`: Early exit for fingerprint mode after N decode steps (default: 256)
+- `--attention-sidecar-url URL`: ZMQ URL for streaming fingerprints to clustering sidecar
 - `--attention-backend triton`: Use triton backend (required for attention capture)
 
 ## Client Configuration
@@ -125,6 +128,69 @@ Distance histogram bins:
 - Bin 15: Distance 32768+ (very long range)
 
 This is ~500 bytes per layer vs ~200KB for raw edges, enabling efficient streaming for long generations.
+
+### Fingerprint Mode (Production)
+
+For production use at 100+ req/s, fingerprint mode compresses attention patterns into a tiny **20D feature vector** computed entirely on GPU, eliminating the CPU export bottleneck.
+
+```bash
+python -m sglang.launch_server \
+    --model-path your-model \
+    --return-attention-tokens \
+    --attention-fingerprint-mode \
+    --attention-fingerprint-max-steps 256 \
+    --disable-cuda-graph
+```
+
+#### Why Fingerprint Mode?
+
+| Mode | Output Size | CPU Sync | Use Case |
+|------|-------------|----------|----------|
+| **Raw (Debug)** | ~200KB/step | Yes | Visualization, debugging |
+| **Sketch** | ~500B/layer | Yes | Long output analysis |
+| **Fingerprint** | 80 bytes | **No** | Production routing, 100+ req/s |
+
+Fingerprint mode streams a 20D vector instead of raw indices, enabling real-time manifold discovery without impacting throughput.
+
+#### Response Format
+
+```javascript
+{
+  "fingerprint": [0.36, 0.64, 0.0, 0.40, ...],  // 20D feature vector
+  "manifold": "semantic_bridge",                 // Classified pattern
+  "step": 42,
+  "think_phase": "output"
+}
+```
+
+The 20D fingerprint contains:
+- `[0]` local_mass: Attention to immediate context (bins 0-2, offset < 8)
+- `[1]` mid_mass: Mid-range attention (bins 3-7, offset 8-255)
+- `[2]` long_mass: Long-range retrieval (bins 8+, offset 256+)
+- `[3]` entropy: Attention concentration (0=focused, 1=diffuse)
+- `[4:20]` histogram: 16-bin log-distance distribution
+
+#### Manifold Zones
+
+The `manifold` field classifies attention patterns into interpretable zones:
+
+| Manifold Zone | Signal | Typical Layer | Pattern |
+|--------------|--------|---------------|---------|
+| `syntax_floor` | High local_mass (>0.6) | Early layers | Grammar, BPE, local syntax |
+| `semantic_bridge` | High mid_mass (>0.4) | Middle layers | Reasoning, entity tracking |
+| `long_range` | High long_mass (>0.3) | Late layers | Retrieval, instruction following |
+| `diffuse` | High entropy (>0.7) | Any | No clear pattern |
+
+#### Early Exit Optimization
+
+The attention manifold typically stabilizes within the first few hundred tokens. Use `--attention-fingerprint-max-steps` to stop capture early and save ~90% of compute:
+
+```bash
+--attention-fingerprint-max-steps 256  # Default: stop after 256 decode steps
+--attention-fingerprint-max-steps 0    # Unlimited (capture all steps)
+```
+
+This is critical for long generations where you only need the manifold signature, not per-token tracking.
 
 ### Think Segmentation (Reasoning Models)
 
