@@ -1181,8 +1181,7 @@ class TokenizerMetricsCollector:
     ):
         self.prompt_tokens_total.labels(**labels).inc(prompt_tokens)
         self.generation_tokens_total.labels(**labels).inc(generation_tokens)
-        if cached_tokens > 0:
-            self.cached_tokens_total.labels(**labels).inc(cached_tokens)
+        self.cached_tokens_total.labels(**labels).inc(cached_tokens)
         self.num_requests_total.labels(**labels).inc(1)
         if has_grammar:
             self.num_so_requests_total.labels(**labels).inc(1)
