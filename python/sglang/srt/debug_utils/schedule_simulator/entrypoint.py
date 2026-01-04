@@ -69,6 +69,13 @@ def create_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--scheduler", type=str, choices=["fifo"], default="fifo")
     parser.add_argument("--max-total-tokens", type=int, default=100000)
+    parser.add_argument(
+        "--stop-criteria",
+        type=str,
+        choices=["all_done", "no_pending"],
+        default="all_done",
+        help="all_done: run until all requests complete; no_pending: stop when any GPU has no pending requests",
+    )
     parser.add_argument("--output", type=str, default=None)
     parser.add_argument("--log-level", type=int, choices=[0, 1, 2], default=0)
 
@@ -130,6 +137,7 @@ def main(args: argparse.Namespace) -> SimulationResult:
         recorders=[BatchSizeBalancednessRecorder(), AttentionComputeBalancednessRecorder(), AvgBatchSizeRecorder()],
         log_level=args.log_level,
         max_total_tokens=args.max_total_tokens,
+        stop_when_any_gpu_idle=(args.stop_criteria == "no_pending"),
     )
 
     print(

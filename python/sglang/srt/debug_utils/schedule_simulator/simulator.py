@@ -23,6 +23,7 @@ class Simulator:
         recorders: Optional[List[MetricRecorder]] = None,
         log_level: int = 0,
         max_total_tokens: int = 100000,
+        stop_when_any_gpu_idle: bool = False,
     ):
         self.num_gpus = num_gpus
         self.router = router
@@ -30,6 +31,7 @@ class Simulator:
         self.recorders = recorders or []
         self.log_level = log_level
         self.max_total_tokens = max_total_tokens
+        self.stop_when_any_gpu_idle = stop_when_any_gpu_idle
         self.gpu_states: List[GPUState] = []
         self.step = 0
 
@@ -46,6 +48,8 @@ class Simulator:
             self._route_requests(incoming_requests)
             incoming_requests.clear()
             self._schedule_all_gpus()
+            if self._should_stop():
+                break
             self._execute_step()
             step_records.extend(
                 gpu.get_step_record(self.step) for gpu in self.gpu_states
@@ -60,6 +64,11 @@ class Simulator:
         return bool(incoming_requests) or any(
             gpu.pending_requests or gpu.running_requests for gpu in self.gpu_states
         )
+
+    def _should_stop(self) -> bool:
+        if not self.stop_when_any_gpu_idle:
+            return False
+        return any(not gpu.pending_requests for gpu in self.gpu_states)
 
     def _route_requests(self, incoming_requests: List[SimRequest]) -> None:
         for req in incoming_requests:
