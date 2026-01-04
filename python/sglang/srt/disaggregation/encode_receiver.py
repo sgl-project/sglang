@@ -195,16 +195,6 @@ class WaitingImageRequest:
         self.recv_socket.close()
 
 
-def _determine_tensor_transport_mode(server_args):
-    is_cross_node = server_args.dist_init_addr
-
-    if is_cross_node:
-        # Fallback to default CPU transport for multi-node
-        return "default"
-    else:
-        return "cuda_ipc"
-
-
 class MMReceiver:
 
     def __init__(
@@ -238,7 +228,7 @@ class MMReceiver:
             self.hostname = get_local_ip_auto()
             self.waiting_list: List[WaitingImageRequest] = []
             if hf_config is not None:
-                transport_mode = _determine_tensor_transport_mode(server_args)
+                
                 import_processors("sglang.srt.multimodal.processors")
                 _processor = None
                 try:
