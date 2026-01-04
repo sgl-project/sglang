@@ -788,13 +788,13 @@ class TestLargerScale(CustomTestCase):
             "--synth-gsp-prompts-per-group", "20",
             "--synth-gsp-system-prompt-len", "31000",
             "--synth-gsp-question-len", "1000",
-            "--synth-gsp-output-len", "2000",
+            "--synth-gsp-output-len", "8000",
             "--synth-seed", "42",
             "--num-gpus", "8",
             "--router", router,
             "--max-total-tokens", "500000",
             "--stop-criteria", "exist_no_pending",
-            "--max-steps", "1000",
+            "--max-steps", "1500",
         )
 
     def test_gsp_workload_random_policy(self):
