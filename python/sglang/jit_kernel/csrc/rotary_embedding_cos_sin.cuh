@@ -805,58 +805,50 @@ inline void launch_rotary(
     bool interleaved) {
   using namespace host;
 
+  auto T = SymbolicSize{"T"};
   auto Hq = SymbolicSize{"Hq"};
   auto Hk = SymbolicSize{"Hk"};
   auto D = SymbolicSize{"D"};
+  auto R = SymbolicSize{"R"};
   auto dtype = SymbolicDType{};
   auto device = SymbolicDevice{};
 
   // Verify q first to establish device/dtype
   // q: [T, Hq, D]
-  TensorMatcher({})
+  TensorMatcher({T, Hq, D})
       .with_dtype<float, half, nv_bfloat16>(dtype)
       .with_device<kDLCUDA>(device)
       .verify(q);
 
-  if (q.ndim() != 3) {
-    host::Panic("q must be 3D [T, Hq, D]");
-  }
-  const int64_t t = q.size(0);
-  const int64_t hq = q.size(1);
-  const int64_t d = q.size(2);
+  const int64_t t = T.unwrap();
+  const int64_t hq = Hq.unwrap();
+  const int64_t d = D.unwrap();
 
   // Verify cos/sin
   // cos: [T_cache, R]
   // sin: [T_cache, R]
-  TensorMatcher({})
+  auto T_cache = SymbolicSize{"T_cache"};
+  TensorMatcher({T_cache, R})
       .with_dtype<float, half, nv_bfloat16>(dtype)
       .with_device<kDLCUDA>(device)
       .verify(cos)
       .verify(sin);
-  if (cos.ndim() != 2 || sin.ndim() != 2) {
-    host::Panic("cos/sin must be 2D");
-  }
-  const int64_t r = cos.size(1);
-  if (cos.size(0) != sin.size(0) || cos.size(1) != sin.size(1)) {
-    host::Panic("cos/sin shape mismatch");
-  }
+
+  const int64_t r = R.unwrap();
 
   // Handle positions
   const int64_t* positions_ptr = nullptr;
   if (positions != nullptr) {
-    TensorMatcher({})
+    auto T_pos = SymbolicSize{"T_pos"};
+    TensorMatcher({T_pos})
         .with_dtype<int64_t>()
         .with_device<kDLCUDA>(device)
         .verify(*positions);
-    if (positions->ndim() != 1 || positions->size(0) != t) {
-      host::Panic("positions must be 1D [T]");
-    }
+    RuntimeCheck(T_pos.unwrap() == t, "positions length mismatch");
     positions_ptr = static_cast<const int64_t*>(positions->data_ptr());
   } else {
     // If positions is null, cos/sin length must equal t
-    if (cos.size(0) != t) {
-      host::Panic("cos/sin length mismatch (expected ", t, ", got ", cos.size(0), ") when positions is None");
-    }
+    RuntimeCheck(T_cache.unwrap() == t, "cos/sin length mismatch (expected ", t, ", got ", T_cache.unwrap(), ") when positions is None");
   }
 
   RuntimeCheck(d == head_size, "head_size mismatch: got ", d, " expected ", head_size);
@@ -885,14 +877,11 @@ inline void launch_rotary(
   int hk = 0;
   if (k != nullptr) {
     // k: [T, Hk, D]
-    TensorMatcher({})
+    TensorMatcher({T, Hk, D})
         .with_dtype<float, half, nv_bfloat16>(dtype)
         .with_device<kDLCUDA>(device)
         .verify(*k);
-    if (k->ndim() != 3 || k->size(0) != t || k->size(2) != d) {
-      host::Panic("key shape mismatch");
-    }
-    hk = (int)k->size(1);
+    hk = (int)Hk.unwrap();
     RuntimeCheck(hk > 0, "invalid key shape");
     key_token_stride = (int64_t)hk * d;
   }
