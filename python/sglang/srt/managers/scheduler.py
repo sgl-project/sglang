@@ -120,6 +120,7 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.mm_utils import init_mm_embedding_cache
 from sglang.srt.managers.overlap_utils import FutureMap
+from sglang.srt.managers.prefill_delayer import PrefillDelayer
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
     ModelWorkerBatch,
@@ -134,7 +135,6 @@ from sglang.srt.managers.schedule_policy import (
     SchedulePolicy,
 )
 from sglang.srt.managers.scheduler_dp_attn_mixin import SchedulerDPAttnMixin
-from sglang.srt.managers.scheduler_enhancer import SchedulerEnhancer
 from sglang.srt.managers.scheduler_input_blocker import SchedulerInputBlocker
 from sglang.srt.managers.scheduler_metrics_mixin import (
     RECORD_STEP_TIME,
@@ -204,7 +204,6 @@ logger = logging.getLogger(__name__)
 TEST_RETRACT = envs.SGLANG_TEST_RETRACT.get()
 TEST_RETRACT_INTERVAL = envs.SGLANG_TEST_RETRACT_INTERVAL.get()
 TEST_RETRACT_NO_PREFILL_BS = envs.SGLANG_TEST_RETRACT_NO_PREFILL_BS.get()
-SCHEDULER_DECREASE_PREFILL_IDLE = envs.SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE.get()
 GRAMMAR_TIMEOUT = float(os.environ.get("SGLANG_GRAMMAR_TIMEOUT", 300))
 
 
@@ -796,14 +795,13 @@ class Scheduler(
             self.enable_priority_scheduling,
             self.schedule_low_priority_values_first,
         )
-        self.schedule_enhancer = None
-        if SCHEDULER_DECREASE_PREFILL_IDLE:
-            self.schedule_enhancer = SchedulerEnhancer(
-                self.dp_size,
-                self.attn_tp_size,
-                self.tp_worker,
-                self.max_running_requests,
-                self.server_args,
+        self.prefill_delayer: Optional[PrefillDelayer] = None
+        if envs.SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE.get():
+            self.prefill_delayer = PrefillDelayer(
+                dp_size=self.dp_size,
+                attn_tp_size=self.attn_tp_size,
+                tp_worker=self.tp_worker,
+                server_args=self.server_args,
             )
         # Enable preemption for priority scheduling.
         self.try_preemption = self.enable_priority_scheduling
@@ -1913,12 +1911,6 @@ class Scheduler(
         return res
 
     def get_new_batch_prefill(self) -> Optional[ScheduleBatch]:
-        if self.schedule_enhancer and not self.schedule_enhancer.get_schedule_decision(
-            self.running_batch
-        ):
-            # Decrease prefill idle as much as possible during high dp load.
-            return None
-
         # Check if the grammar is ready in the grammar queue
         if self.grammar_queue:
             self.move_ready_grammar_requests()
@@ -1927,9 +1919,19 @@ class Scheduler(
             # Reset batch_is_full to try preemption with a prefill adder.
             self.running_batch.batch_is_full = False
 
-        # Handle the cases where prefill is not allowed
+        # The `should_allow_prefill` needs to be called on all ranks since contains communication
+        delayer_allow_prefill = (
+            self.prefill_delayer.should_allow_prefill(
+                # TODO: consider offline generation cases when there are a lot of waiting requests
+                local_prefillable=len(self.waiting_queue)
+                > 0,
+            )
+            if self.prefill_delayer
+            else True
+        )
         if (
-            self.running_batch.batch_is_full or len(self.waiting_queue) == 0
+            (not delayer_allow_prefill)
+            or ((self.running_batch.batch_is_full or len(self.waiting_queue) == 0))
         ) and self.chunked_req is None:
             return None
 
@@ -2073,7 +2075,12 @@ class Scheduler(
 
         # Print stats
         if self.current_scheduler_metrics_enabled:
-            self.log_prefill_stats(adder, can_run_list, running_bs, 0)
+            self.log_prefill_stats(
+                adder,
+                can_run_list,
+                running_bs=len(self.running_batch.reqs),
+                running_bs_offline_batch=0,
+            )
 
         # Record metrics
         for req in can_run_list:
