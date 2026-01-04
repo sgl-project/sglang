@@ -153,25 +153,25 @@ def main():
         token_ids = generate_random_token_ids(max_batch_size, args.num_tokens, tokenizer)
         prompts = [tokenizer.decode(ids, clean_up_tokenization_spaces=True) for ids in token_ids]
         run_benchmark(
-            "encode",
-            prompts,
-            lambda batch: [tokenizer.encode(p) for p in batch],
-            lambda batch: tokenizer(batch),
-            args.batch_sizes,
-            args.num_runs,
-            args.no_batch,
+            name="encode",
+            data=prompts,
+            sequential_fn=lambda batch: [tokenizer.encode(p) for p in batch],
+            batch_fn=lambda batch: tokenizer(batch),
+            batch_sizes=args.batch_sizes,
+            num_runs=args.num_runs,
+            skip_batch=args.no_batch,
         )
 
     if "decode" in args.function:
         token_ids = generate_random_token_ids(max_batch_size, args.num_tokens, tokenizer)
         run_benchmark(
-            "decode",
-            token_ids,
-            lambda batch: [tokenizer.decode(ids) for ids in batch],
-            lambda batch: tokenizer.batch_decode(batch),
-            args.batch_sizes,
-            args.num_runs,
-            args.no_batch,
+            name="decode",
+            data=token_ids,
+            sequential_fn=lambda batch: [tokenizer.decode(ids) for ids in batch],
+            batch_fn=lambda batch: tokenizer.batch_decode(batch),
+            batch_sizes=args.batch_sizes,
+            num_runs=args.num_runs,
+            skip_batch=args.no_batch,
         )
 
 
