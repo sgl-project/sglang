@@ -240,6 +240,8 @@ class AscendAttnBackend(AttentionBackend):
             self.kv_lora_rank = model_runner.model_config.kv_lora_rank
             self.qk_rope_head_dim = model_runner.model_config.qk_rope_head_dim
             self.qk_nope_head_dim = model_runner.model_config.qk_nope_head_dim
+        else:
+            self.use_alibi = hasattr(model_runner.model_config, "use_alibi") and model_runner.model_config.use_alibi
         self.native_attn = TorchNativeAttnBackend(model_runner)
         self.graph_metadata = {}
         self.max_context_len = model_runner.model_config.context_len
@@ -420,6 +422,116 @@ class AscendAttnBackend(AttentionBackend):
     def get_cuda_graph_seq_len_fill_value(self):
         return 0
 
+    def _generate_alibi_bias(
+        self,
+        seq_len: int,
+        slopes: torch.Tensor,
+        num_heads: int,
+        device: torch.device,
+        dtype: torch.dtype = torch.bfloat16
+    ) -> torch.Tensor:
+        position_point = torch.arange(seq_len) - seq_len + 1
+        position_point = position_point.unsqueeze(0).unsqueeze(0).expand(num_heads, -1, -1)
+        diag = torch.diag(position_point[0])
+        position_point = position_point - diag.unsqueeze(0).unsqueeze(0).transpose(-1, -2)
+        position_point = position_point.to(device)
+        alibi = slopes.unsqueeze(1).unsqueeze(1) * position_point
+        alibi_bias = alibi.view(num_heads, 1, seq_len)
+        alibi_bias = alibi_bias.to(device).to(dtype)
+        return alibi_bias
+    
+    def generate_alibi_bias(
+        self,
+        q_seq_len: int,
+        kv_seq_len: int,
+        slopes: torch.Tensor,
+        num_heads: int,
+        device: torch.device,
+        is_extend: bool = True,
+        dtype: torch.dtype = torch.bfloat16
+    ) -> torch.Tensor:
+        if not hasattr(self, "alibi_bias") or self.alibi_bias is None:
+            MAX_LEN_ALB=5000
+            max_seq_len=max(kv_seq_len,q_seq_len)
+            max_seq_len=max(max_seq_len,MAX_LEN_ALB)
+            self.alibi_bias = self._generate_alibi_bias(max_seq_len,slopes,num_heads,device,dtype)
+            
+        if not hasattr(self, "super_mask") or self.super_mask is None:
+            MAX_LEN_ALB=5000
+            max_seq_len=max(kv_seq_len,q_seq_len)
+            max_seq_len=max(max_seq_len,MAX_LEN_ALB)
+            super_mask = torch.ones(size=(1, max_seq_len, max_seq_len), dtype=dtype)
+            super_mask = super_mask.float().fill_(float("-inf")).type_as(super_mask)
+            super_mask = torch.triu(super_mask, 1).to(device)
+            self.super_mask = super_mask
+        if is_extend:
+            return self.alibi_bias[:, :q_seq_len, :kv_seq_len] + self.super_mask[:, :q_seq_len, :kv_seq_len]
+        else:
+            return self.alibi_bias[:, :q_seq_len, :kv_seq_len]
+
+        
+    
+    def attn_alibi(self,q,k_cache,v_cache,block_tables,seq_lens,query_lens,scale_value,num_heads,slopes,is_extend):
+        curr=0
+        num_prompts=query_lens.shape[0]
+        head_size = k_cache.shape[3]
+        head_size_v = v_cache.shape[3]
+        block_size = k_cache.shape[1]
+        attn_output = []
+        for i in range(num_prompts):
+            seq_len = seq_lens[i].item()
+            block_table = block_tables[i]
+
+            j= torch.arange(seq_len,device=block_table.device)
+
+            block_number = block_table[j // block_size]
+            block_offset = j % block_size
+
+            k = k_cache[block_number,block_offset]
+            v = v_cache[block_number,block_offset]
+            k = k.view(seq_len, num_heads, head_size)
+            v = v.view(seq_len, num_heads, head_size_v)
+            
+            if is_extend:
+                q_len = query_lens[i].item()
+                querys = q[curr :curr + q_len]
+                assert q_len==seq_len, "Warning: Q sequence length is not consistant with KV sequence length during Prefill phase."
+            else:
+                q_len = 1
+                querys = q[curr :curr + 1]
+            
+            querys = querys.to(torch.float32)
+            querys = querys * scale_value
+            querys = querys.permute(1, 0, 2)
+            k = k.permute(1, 2, 0)
+
+            score = torch.bmm(querys, k)
+            score = score.to(torch.float32)
+            if slopes is not None:
+                alibi_bias = self.generate_alibi_bias(
+                    q_seq_len=q_len,
+                    kv_seq_len=seq_len,
+                    slopes=slopes,
+                    num_heads=num_heads,
+                    device=q.device,
+                    is_extend=is_extend,
+                    dtype=querys.dtype
+                )
+                score = score + alibi_bias
+            score = torch.max(
+                score, torch.tensor(torch.finfo(score.dtype).min)
+            )
+            p = torch.nn.functional.softmax(score, dim=-1)
+            v = v.permute(1,0,2)
+            out = torch.bmm(p, v)
+            out = out.permute(1, 0, 2)
+            out = out.reshape(-1, num_heads * head_size_v)
+            attn_output.append(out)
+            curr += q_len
+        attn_output = torch.cat(attn_output, dim=0).to(q.dtype).to(q.device)
+        attn_output = attn_output.view(-1, num_heads * head_size)
+        return attn_output
+    
     def do_cp_balance_attn(
         self,
         q_nope,
@@ -608,6 +720,7 @@ class AscendAttnBackend(AttentionBackend):
         q_rope: Optional[torch.Tensor] = None,
         k_rope: Optional[torch.Tensor] = None,
         topk_indices: Optional[torch.Tensor] = None,
+        slopes:  Optional[torch.Tensor] = None,
     ):
         if topk_indices is not None:
             return self.forward_sparse(
@@ -690,26 +803,40 @@ class AscendAttnBackend(AttentionBackend):
                     """When logit_cap > 0, use torch native attention backend instead
                     cause Ascend attn ops do not support soft-capping attention currently.
                     """
-                    query = q.reshape(-1, layer.tp_q_head_num * layer.qk_head_dim)
-                    attn_output = torch.empty(
-                        (query.shape[0], layer.tp_q_head_num * layer.v_head_dim),
-                        dtype=query.dtype,
-                        device=query.device,
-                    )
+                    if not self.use_alibi:
+                        query = q.reshape(-1, layer.tp_q_head_num * layer.qk_head_dim)
+                        attn_output = torch.empty(
+                            (query.shape[0], layer.tp_q_head_num * layer.v_head_dim),
+                            dtype=query.dtype,
+                            device=query.device,
+                        )
 
-                    torch_npu._npu_flash_attention_qlens(
-                        query=query,
-                        key_cache=k_cache,
-                        value_cache=v_cache,
-                        mask=self.mask,
-                        block_table=self.forward_metadata.block_tables,
-                        seq_len=self.forward_metadata.extend_seq_lens_cpu_int,
-                        context_lens=self.forward_metadata.seq_lens_cpu_int,
-                        scale_value=layer.scaling,
-                        num_heads=layer.tp_q_head_num,
-                        num_kv_heads=layer.tp_k_head_num,
-                        out=attn_output,
-                    )
+                        torch_npu._npu_flash_attention_qlens(
+                            query=query,
+                            key_cache=k_cache,
+                            value_cache=v_cache,
+                            mask=self.mask,
+                            block_table=self.forward_metadata.block_tables,
+                            seq_len=self.forward_metadata.extend_seq_lens_cpu_int,
+                            context_lens=self.forward_metadata.seq_lens_cpu_int,
+                            scale_value=layer.scaling,
+                            num_heads=layer.tp_q_head_num,
+                            num_kv_heads=layer.tp_k_head_num,
+                            out=attn_output,
+                        )
+                    else:
+                        attn_output = self.attn_alibi(
+                            q=q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim),
+                            k_cache=k_cache,
+                            v_cache=v_cache,
+                            block_tables=self.forward_metadata.block_tables,
+                            seq_lens=self.forward_metadata.seq_lens_cpu_int,
+                            query_lens=self.forward_metadata.extend_seq_lens_cpu_int,
+                            scale_value=layer.scaling,
+                            num_heads=layer.tp_q_head_num,
+                            slopes=slopes,
+                            is_extend=True
+                        )
                 else:
                     if layer.qk_head_dim != layer.v_head_dim:
                         attn_output = q.new_empty(
@@ -1252,6 +1379,7 @@ class AscendAttnBackend(AttentionBackend):
         q_rope: Optional[torch.Tensor] = None,
         k_rope: Optional[torch.Tensor] = None,
         topk_indices: Optional[torch.Tensor] = None,
+        slopes:  Optional[torch.Tensor] = None,
     ):
         if is_mla_preprocess_enabled():
             # MLAPO does saving kv_cache
@@ -1321,23 +1449,37 @@ class AscendAttnBackend(AttentionBackend):
             elif layer.logit_cap == 0:
                 query = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
                 num_tokens = query.shape[0]
-                attn_output = torch.empty(
-                    (num_tokens, layer.tp_q_head_num, layer.v_head_dim),
-                    dtype=query.dtype,
-                    device=query.device,
-                )
+                if not self.use_alibi:
+                    attn_output = torch.empty(
+                        (num_tokens, layer.tp_q_head_num, layer.v_head_dim),
+                        dtype=query.dtype,
+                        device=query.device,
+                    )
 
-                torch_npu._npu_paged_attention(
-                    query=query,
-                    key_cache=k_cache,
-                    value_cache=v_cache,
-                    num_heads=layer.tp_q_head_num,
-                    num_kv_heads=layer.tp_k_head_num,
-                    scale_value=layer.scaling,
-                    block_table=self.forward_metadata.block_tables,
-                    context_lens=self.forward_metadata.seq_lens_cpu_int,
-                    out=attn_output,
-                )
+                    torch_npu._npu_paged_attention(
+                        query=query,
+                        key_cache=k_cache,
+                        value_cache=v_cache,
+                        num_heads=layer.tp_q_head_num,
+                        num_kv_heads=layer.tp_k_head_num,
+                        scale_value=layer.scaling,
+                        block_table=self.forward_metadata.block_tables,
+                        context_lens=self.forward_metadata.seq_lens_cpu_int,
+                        out=attn_output,
+                    )
+                else:
+                    attn_output = self.attn_alibi(
+                        q=query,
+                        k_cache=k_cache,
+                        v_cache=v_cache,
+                        block_tables=self.forward_metadata.block_tables,
+                        seq_lens=self.forward_metadata.seq_lens_cpu_int,
+                        query_lens=torch.ones(num_tokens,dtype=torch.int32),
+                        scale_value=layer.scaling,
+                        num_heads=layer.tp_q_head_num,
+                        slopes=slopes,
+                        is_extend=False
+                    )
             else:
                 if layer.qk_head_dim != layer.v_head_dim:
                     attn_output = q.new_empty(
