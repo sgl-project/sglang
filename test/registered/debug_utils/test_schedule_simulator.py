@@ -15,6 +15,7 @@ from sglang.srt.debug_utils.schedule_simulator import (
     SimulationResult,
     Simulator,
     StepRecord,
+    StickyRouter,
     generate_gsp_requests,
     generate_random_requests,
     load_from_request_logger,
@@ -153,6 +154,42 @@ class TestRouters(CustomTestCase):
         req = SimRequest(request_id="r1", input_len=100, output_len=50)
         results = [router.route(req, gpu_states) for _ in range(100)]
         self.assertTrue(all(0 <= r < 4 for r in results))
+
+    def test_sticky_router_same_group_same_gpu(self):
+        router = StickyRouter()
+        gpu_states = [GPUState(gpu_id=i, max_total_tokens=10000) for i in range(4)]
+        reqs = [
+            SimRequest(request_id=f"r{i}", input_len=100, output_len=50, group_id="g0")
+            for i in range(10)
+        ]
+        results = [router.route(req, gpu_states) for req in reqs]
+        self.assertEqual(len(set(results)), 1)
+
+    def test_sticky_router_no_group_fallback(self):
+        router = StickyRouter()
+        gpu_states = [GPUState(gpu_id=i, max_total_tokens=10000) for i in range(4)]
+        reqs = [
+            SimRequest(request_id=f"r{i}", input_len=100, output_len=50)
+            for i in range(100)
+        ]
+        results = [router.route(req, gpu_states) for req in reqs]
+        self.assertTrue(all(0 <= r < 4 for r in results))
+
+    def test_sticky_router_multiple_groups(self):
+        router = StickyRouter()
+        gpu_states = [GPUState(gpu_id=i, max_total_tokens=10000) for i in range(4)]
+        for group_id in ["g0", "g1", "g2"]:
+            reqs = [
+                SimRequest(
+                    request_id=f"{group_id}_r{i}",
+                    input_len=100,
+                    output_len=50,
+                    group_id=group_id,
+                )
+                for i in range(5)
+            ]
+            results = [router.route(req, gpu_states) for req in reqs]
+            self.assertEqual(len(set(results)), 1)
 
 
 class TestFIFOScheduler(CustomTestCase):
@@ -507,6 +544,23 @@ class TestCLI(CustomTestCase):
         result = self._run_cli("--input", input_file, "--router", "random")
         self.assertEqual(result.returncode, 0, f"CLI failed: {result.stderr}")
         self.assertIn("router=random", result.stdout)
+
+    def test_cli_sticky_router(self):
+        result = self._run_cli(
+            "--synth-gsp",
+            "--synth-gsp-num-groups",
+            "2",
+            "--synth-gsp-prompts-per-group",
+            "3",
+            "--synth-seed",
+            "42",
+            "--num-gpus",
+            "4",
+            "--router",
+            "sticky",
+        )
+        self.assertEqual(result.returncode, 0, f"CLI failed: {result.stderr}")
+        self.assertIn("router=sticky", result.stdout)
 
     def test_cli_synthetic(self):
         result = self._run_cli(

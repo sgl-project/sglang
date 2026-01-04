@@ -15,6 +15,7 @@ from sglang.srt.debug_utils.schedule_simulator.routers import (
     RandomRouter,
     RoundRobinRouter,
     RouterPolicy,
+    StickyRouter,
 )
 from sglang.srt.debug_utils.schedule_simulator.schedulers import (
     FIFOScheduler,
@@ -34,6 +35,7 @@ __all__ = [
     "RouterPolicy",
     "RandomRouter",
     "RoundRobinRouter",
+    "StickyRouter",
     "SchedulerPolicy",
     "FIFOScheduler",
     "MetricRecorder",
