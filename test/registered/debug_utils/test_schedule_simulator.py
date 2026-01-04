@@ -545,23 +545,6 @@ class TestCLI(CustomTestCase):
         self.assertEqual(result.returncode, 0, f"CLI failed: {result.stderr}")
         self.assertIn("router=random", result.stdout)
 
-    def test_cli_sticky_router(self):
-        result = self._run_cli(
-            "--synth-gsp",
-            "--synth-gsp-num-groups",
-            "2",
-            "--synth-gsp-prompts-per-group",
-            "3",
-            "--synth-seed",
-            "42",
-            "--num-gpus",
-            "4",
-            "--router",
-            "sticky",
-        )
-        self.assertEqual(result.returncode, 0, f"CLI failed: {result.stderr}")
-        self.assertIn("router=sticky", result.stdout)
-
     def test_e2e_sticky_router_group_locality(self):
         result = self._run_cli(
             "--synth-gsp",
