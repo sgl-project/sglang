@@ -1431,6 +1431,7 @@ class Scheduler(
                 return_attention_tokens=recv_req.return_attention_tokens,
                 top_k_attention=getattr(recv_req, 'top_k_attention', 10),
                 attention_capture_layer_id=getattr(recv_req, 'attention_capture_layer_id', None),
+                attention_sketch_mode=getattr(recv_req, 'attention_sketch_mode', False),
                 eos_token_ids=self.model_config.hf_eos_token_id,
                 bootstrap_host=recv_req.bootstrap_host,
                 bootstrap_port=recv_req.bootstrap_port,

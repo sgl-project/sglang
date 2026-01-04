@@ -47,6 +47,7 @@ python -m http.server 8081
   - `last` (default): Only the last layer
   - `auto`: Automatically select ~4 layers spread across depth [L/4, L/2, 3L/4, L-1]
   - Comma-separated indices: e.g., `0,10,20,30` for specific layers
+- `--attention-sketch-mode`: Return per-layer summary sketches instead of raw edges (bandwidth efficient for long outputs)
 - `--attention-backend triton`: Use triton backend (required for attention capture)
 
 ## Client Configuration
@@ -87,6 +88,43 @@ This is useful for:
 - Understanding what fraction of attention is captured by the top-k tokens
 - Computing stable influence rankings (true_prob is stable across different k values)
 - Hub detection (tokens with high cumulative true probability across decode steps)
+
+### Sketch Mode
+
+For very long outputs (86k+ tokens), sketch mode provides bandwidth-efficient summaries:
+
+```javascript
+// Enable sketch mode via API
+extra_body: {
+  return_attention_tokens: true,
+  attention_sketch_mode: true  // Or use server flag --attention-sketch-mode
+}
+```
+
+Sketch mode response format (per decode step):
+```javascript
+{
+  "mode": "sketch",
+  "layer_sketches": {
+    "31": {  // Layer ID
+      "top_hubs": [[42, 0.15], [128, 0.12], ...],  // Top 32 positions by attention mass
+      "dist_hist": [0.05, 0.12, 0.23, ...],        // 16-bin log-distance histogram
+      "entropy": 3.45,                              // Attention entropy estimate
+      "mass_captured": 0.82                         // Fraction of total attention in top-k
+    }
+  },
+  "decode_step": 100
+}
+```
+
+Distance histogram bins:
+- Bin 0: Distance 0-1 (immediate context)
+- Bin 1: Distance 2-3
+- Bin 2: Distance 4-7
+- ...
+- Bin 15: Distance 32768+ (very long range)
+
+This is ~500 bytes per layer vs ~200KB for raw edges, enabling efficient streaming for long generations.
 
 ## Tensor Parallelism (TP) Behavior
 

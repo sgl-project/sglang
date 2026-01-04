@@ -245,6 +245,7 @@ class OpenAIServingChat(OpenAIServingBase):
             return_attention_tokens=request.return_attention_tokens,
             top_k_attention=request.top_k_attention,
             attention_capture_layer_id=request.attention_capture_layer_id,
+            attention_sketch_mode=request.attention_sketch_mode,
             rid=request.rid,
             extra_key=self._compute_extra_key(request),
             require_reasoning=self._get_reasoning_from_request(request),

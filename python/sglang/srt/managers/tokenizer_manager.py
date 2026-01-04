@@ -929,6 +929,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 return_attention_tokens=obj.return_attention_tokens,
                 top_k_attention=obj.top_k_attention,
                 attention_capture_layer_id=obj.attention_capture_layer_id,
+                attention_sketch_mode=obj.attention_sketch_mode,
                 data_parallel_rank=obj.data_parallel_rank,
                 priority=obj.priority,
                 extra_key=obj.extra_key,

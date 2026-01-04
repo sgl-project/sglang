@@ -208,6 +208,8 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
     top_k_attention: Union[List[int], int] = 10
     # Layer to capture attention from (-1 = last layer, None = use server default)
     attention_capture_layer_id: Optional[Union[List[int], int]] = None
+    # Return per-layer sketches instead of raw edges (bandwidth efficient for long outputs)
+    attention_sketch_mode: Union[List[bool], bool] = False
 
     # The modalities of the image data [image, multi-images, video]
     modalities: Optional[List[str]] = None
@@ -778,6 +780,8 @@ class TokenizedGenerateReqInput(BaseReq):
     top_k_attention: int = 10
     # Layer to capture attention from (-1 = last layer, None = use server default)
     attention_capture_layer_id: Optional[int] = None
+    # Return per-layer sketches instead of raw edges (bandwidth efficient)
+    attention_sketch_mode: bool = False
 
 
 @dataclass

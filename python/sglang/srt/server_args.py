@@ -616,6 +616,9 @@ class ServerArgs:
     # Production mode - 64 bytes vs ~200KB per step, for high-throughput routing
     attention_fingerprint_mode: bool = False
     attention_sidecar_url: str = ""  # ZMQ URL for fingerprint streaming (e.g., "tcp://localhost:9001")
+    # Sketch mode: compute per-layer summary sketches (top_hubs, dist_hist, entropy)
+    # Bandwidth-efficient for very long outputs (86k+) - ~500 bytes per layer vs raw edges
+    attention_sketch_mode: bool = False
 
     # PD disaggregation: can be "null" (not disaggregated), "prefill" (prefill-only), or "decode" (decode-only)
     disaggregation_mode: Literal["null", "prefill", "decode"] = "null"
@@ -4479,6 +4482,14 @@ class ServerArgs:
             default=ServerArgs.attention_sidecar_url,
             help="ZMQ URL for streaming attention fingerprints to sidecar process for clustering. "
                  "Example: 'tcp://localhost:9001'. Empty string disables streaming. (default: '')",
+        )
+        parser.add_argument(
+            "--attention-sketch-mode",
+            action="store_true",
+            default=ServerArgs.attention_sketch_mode,
+            help="Enable sketch mode for attention capture. Returns per-layer summary sketches "
+                 "(top_hubs, dist_hist, entropy) instead of raw edges. Bandwidth-efficient for "
+                 "very long outputs (86k+). ~500 bytes per layer. (default: False)",
         )
 
         # PD disaggregation
