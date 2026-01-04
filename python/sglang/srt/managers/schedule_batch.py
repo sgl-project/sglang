@@ -514,6 +514,7 @@ class Req:
         return_attention_tokens: bool = False,
         top_k_attention: int = 10,
         attention_capture_layer_id: Optional[int] = None,
+        attention_capture_layer_ids: Optional[List[int]] = None,
         attention_sketch_mode: bool = False,
         eos_token_ids: Optional[Set[int]] = None,
         bootstrap_host: Optional[str] = None,
@@ -579,6 +580,7 @@ class Req:
         self.return_attention_tokens = return_attention_tokens
         self.top_k_attention = top_k_attention
         self.attention_capture_layer_id = attention_capture_layer_id
+        self.attention_capture_layer_ids = attention_capture_layer_ids
         self.attention_sketch_mode = attention_sketch_mode
         self.attention_tokens: List[Dict] = []  # Per-token attention info
         self.attention_tokens_decode_step: int = 0  # Counter for stride calculation
@@ -2187,10 +2189,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 attention_top_k = req_top_k
 
             # Get layer override from first request that specifies one
+            # attention_capture_layer_ids takes precedence over attention_capture_layer_id
             if attention_capture_layer_id is None:
-                layer_id = getattr(req, "attention_capture_layer_id", None)
-                if layer_id is not None:
-                    attention_capture_layer_id = layer_id
+                layer_ids = getattr(req, "attention_capture_layer_ids", None)
+                if layer_ids is not None:
+                    attention_capture_layer_id = layer_ids  # Pass the list directly
+                else:
+                    layer_id = getattr(req, "attention_capture_layer_id", None)
+                    if layer_id is not None:
+                        attention_capture_layer_id = layer_id
 
         return ModelWorkerBatch(
             forward_mode=self.forward_mode,
@@ -2389,4 +2396,4 @@ class ModelWorkerBatch:
     # True only if at least one request in the batch requested attention tokens
     capture_attention_tokens: bool = False
     attention_top_k: int = 5
-    attention_capture_layer_id: Optional[int] = None  # Per-request layer override
+    attention_capture_layer_id: Optional[Union[int, List[int]]] = None  # Per-request layer override (single int or list)
