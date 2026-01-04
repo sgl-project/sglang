@@ -197,3 +197,72 @@ The attention capture uses a memory-efficient chunked algorithm:
 - For longer sequences: Chunked Triton kernel with O(batch x heads x num_chunks) memory
 
 For a 1M token context, this uses ~125KB vs ~256MB for a full attention matrix.
+
+## Clustering Sidecar
+
+For production use, the attention fingerprints can be streamed to a clustering sidecar for manifold discovery and sampling optimization.
+
+### Architecture
+
+```
+SGLang Scheduler  --fingerprints-->  RAPIDS Sidecar  --centroids-->  Proxy Router
+     (ZMQ PUSH)        (ZMQ PULL)           |
+     |<----------- manifold hints ----------|
+```
+
+### Starting the Sidecar
+
+```bash
+# Install dependencies
+pip install pyzmq hdbscan scikit-learn
+# OR for GPU acceleration: pip install cuml-cu12
+
+# Start sidecar with ZMQ receiver
+cd examples/attention_explorer
+python rapids_sidecar.py --zmq-bind tcp://*:9001 --port 9000
+
+# Start SGLang with fingerprint streaming
+python -m sglang.launch_server \
+    --model-path your-model \
+    --return-attention-tokens \
+    --attention-fingerprint-mode \
+    --attention-sidecar-url tcp://localhost:9001 \
+    --disable-cuda-graph
+```
+
+### Clustering Modes
+
+**Batch Mode (default)**: Periodically re-clusters buffer using HDBSCAN
+```bash
+python rapids_sidecar.py --zmq-bind tcp://*:9001 --recluster-interval 60
+```
+
+**Online Mode**: Real-time micro-cluster updates (no batching)
+```bash
+python rapids_sidecar.py --zmq-bind tcp://*:9001 --online --online-threshold 2.0
+```
+
+### Sidecar API
+
+Query centroids and statistics via HTTP:
+```bash
+# Get current cluster centroids
+curl http://localhost:9000/centroids
+
+# Get sidecar stats
+curl http://localhost:9000/stats
+
+# Predict cluster for a fingerprint
+curl -X POST http://localhost:9000/predict -d '{"vector": [0.7, 0.5, ...]}'
+```
+
+### Cluster Traits
+
+The sidecar interprets fingerprint patterns into semantic traits:
+- `syntax_floor` / `local_attention`: High attention to immediate context
+- `semantic_bridge` / `retrieval_heavy`: Mid-range attention (reasoning)
+- `long_range` / `context_aware`: Long-distance attention
+- `focused` / `diffuse`: Attention concentration
+- `periodic`: Regular attention patterns (code, repetition)
+
+These traits inform sampling hints (temperature, top_p) for optimized generation.
