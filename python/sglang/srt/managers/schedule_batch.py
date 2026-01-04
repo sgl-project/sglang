@@ -2128,18 +2128,20 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.spec_info.merge_batch(other.spec_info)
 
     @staticmethod
-    def _resolve_capture_layers(req) -> Optional[Union[int, List[int]]]:
+    def _resolve_capture_layers(req) -> Optional[List[int]]:
         """Normalize attention layer selection to a canonical form.
 
         Priority: attention_capture_layer_ids > attention_capture_layer_id
-        Returns: List[int] if layer_ids specified, int if layer_id specified, None otherwise
+        Returns: List[int] if specified, None otherwise (default policy)
         """
+        # 1. Try explicit list
         layer_ids = getattr(req, "attention_capture_layer_ids", None)
         if layer_ids is not None:
             return list(layer_ids) if not isinstance(layer_ids, list) else layer_ids
+        # 2. Try single layer legacy field (wrap in list for uniform handling)
         layer_id = getattr(req, "attention_capture_layer_id", None)
         if layer_id is not None:
-            return int(layer_id)
+            return [int(layer_id)]
         return None
 
     def get_model_worker_batch(
@@ -2167,7 +2169,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # This skips GPU work entirely on non-probe steps (stride=8 means 7/8 steps skip compute)
         capture_attention_tokens = False
         attention_top_k = 5
-        attention_capture_layer_id = None
+        capture_layers: Optional[List[int]] = None  # Normalized layer selection
 
         stride = self.attention_tokens_stride
         max_tokens = self.attention_tokens_max
@@ -2205,8 +2207,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
             # Get layer override from first request that specifies one
             # Normalize to List[int] | None internally (layer_ids takes precedence)
-            if attention_capture_layer_id is None:
-                attention_capture_layer_id = self._resolve_capture_layers(req)
+            if capture_layers is None:
+                capture_layers = self._resolve_capture_layers(req)
 
         return ModelWorkerBatch(
             forward_mode=self.forward_mode,
@@ -2265,7 +2267,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             mamba_track_seqlens=self.mamba_track_seqlens,
             capture_attention_tokens=capture_attention_tokens,
             attention_top_k=attention_top_k,
-            attention_capture_layer_id=attention_capture_layer_id,
+            attention_capture_layer_id=capture_layers,  # Pass normalized List[int] | None
         )
 
     def copy(self):
