@@ -1,3 +1,8 @@
+from sglang.test.ci.ci_register import register_cuda_ci
+
+# Vision OpenAI server tests (part A)
+register_cuda_ci(est_time=778, suite="stage-b-test-small-1-gpu")
+
 """
 Usage:
 python3 -m unittest test_vision_openai_server.TestOpenAIVisionServer.test_mixed_batch
