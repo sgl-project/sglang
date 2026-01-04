@@ -451,14 +451,21 @@ class SchedulerOutputProcessorMixin:
             # Two modes:
             # 1. Debug Mode: Export raw indices/scores (for visualization)
             # 2. Fingerprint Mode: Stream 20D feature vector to sidecar (production)
+            #
+            # COMPUTE-GATED STRIDE: The stride/max check is done BEFORE GPU compute
+            # in schedule_batch.py. If we have results here, we should always store them.
+            # The step counter is always incremented to track decode progress.
             fingerprint_mode = getattr(self.server_args, "attention_fingerprint_mode", False)
+
+            # Always increment step counter for attention-enabled requests
+            # This ensures stride calculation is correct even when we skip compute
+            if req.return_attention_tokens:
+                req.attention_tokens_decode_step += 1
 
             if fingerprint_mode and logits_output.attention_fingerprint is not None:
                 # FINGERPRINT MODE: Stream compressed fingerprint to sidecar
                 # This is the production path - 64 bytes vs ~200KB per step
                 if req.return_attention_tokens:
-                    req.attention_tokens_decode_step += 1
-
                     # Store fingerprint info (much smaller than raw indices)
                     fingerprint_info = {
                         "fingerprint": logits_output.attention_fingerprint[i].cpu().tolist(),
@@ -484,82 +491,73 @@ class SchedulerOutputProcessorMixin:
             ):
                 # DEBUG MODE: Export raw indices/scores
                 # WARNING: This is bandwidth-intensive, use fingerprint mode for production
-                # Get stride and max settings from server args
-                stride = getattr(self.server_args, "attention_tokens_stride", 1)
-                max_tokens = getattr(self.server_args, "attention_tokens_max", 4096)
+                #
+                # NOTE: Stride/max gating is done upstream in schedule_batch.py (compute-gated stride).
+                # If we have results here, it means we passed the stride/max check, so always store.
 
-                # Increment decode step counter
-                req.attention_tokens_decode_step += 1
+                # Slice to this request's actual top_k (batch may use max across requests)
+                req_top_k = getattr(req, "top_k_attention", 5)
 
-                # Apply stride: only record every Nth token
-                should_record = (stride <= 1) or (req.attention_tokens_decode_step % stride == 0)
-
-                # Apply max limit: stop recording if we've hit the cap
-                if max_tokens > 0 and len(req.attention_tokens) >= max_tokens:
-                    should_record = False
-
-                if should_record:
-                    # Slice to this request's actual top_k (batch may use max across requests)
-                    req_top_k = getattr(req, "top_k_attention", 10)
-
-                    # Check for multi-layer attention data
-                    if logits_output.attention_multi_layer:
-                        # Multi-layer capture: create entry with all layers
-                        layers_data = {}
-                        for layer_id, (positions, scores, logits, logsumexp) in logits_output.attention_multi_layer.items():
-                            layer_entry = {
-                                "token_positions": positions[i].cpu().tolist()[:req_top_k],
-                                "attention_scores": scores[i].cpu().tolist()[:req_top_k],
-                            }
-                            if logits is not None:
-                                layer_entry["topk_logits"] = logits[i].cpu().tolist()[:req_top_k]
-                            if logsumexp is not None:
-                                layer_entry["logsumexp_candidates"] = logsumexp[i].cpu().item()
-                            layers_data[layer_id] = layer_entry
-
-                        attention_info = {
-                            "layers": layers_data,
-                            # Also include last layer at top level for backward compatibility
-                            "layer_id": getattr(logits_output, "attention_layer_id", -1),
+                # Check for multi-layer attention data
+                if logits_output.attention_multi_layer:
+                    # Multi-layer capture: create entry with all layers
+                    layers_data = {}
+                    for layer_id, (positions, scores, logits, logsumexp) in logits_output.attention_multi_layer.items():
+                        layer_entry = {
+                            "token_positions": positions[i].cpu().tolist()[:req_top_k],
+                            "attention_scores": scores[i].cpu().tolist()[:req_top_k],
                         }
-                        # Copy last layer data to top level for backward compatibility
-                        if logits_output.attention_token_positions is not None:
-                            attention_info["token_positions"] = (
-                                logits_output.attention_token_positions[i].cpu().tolist()[:req_top_k]
-                            )
-                            attention_info["attention_scores"] = (
-                                logits_output.attention_token_scores[i].cpu().tolist()[:req_top_k]
-                            )
-                        if logits_output.attention_topk_logits is not None:
-                            attention_info["topk_logits"] = (
-                                logits_output.attention_topk_logits[i].cpu().tolist()[:req_top_k]
-                            )
-                        if logits_output.attention_logsumexp_candidates is not None:
-                            attention_info["logsumexp_candidates"] = (
-                                logits_output.attention_logsumexp_candidates[i].cpu().item()
-                            )
-                    else:
-                        # Single-layer capture (backward compatible format)
-                        attention_info = {
-                            "token_positions": logits_output.attention_token_positions[i]
-                            .cpu()
-                            .tolist()[:req_top_k],
-                            "attention_scores": logits_output.attention_token_scores[i]
-                            .cpu()
-                            .tolist()[:req_top_k],
-                            "layer_id": getattr(logits_output, "attention_layer_id", -1),
-                        }
-                        # Add true probability info if available
-                        if logits_output.attention_topk_logits is not None:
-                            attention_info["topk_logits"] = (
-                                logits_output.attention_topk_logits[i].cpu().tolist()[:req_top_k]
-                            )
-                        if logits_output.attention_logsumexp_candidates is not None:
-                            attention_info["logsumexp_candidates"] = (
-                                logits_output.attention_logsumexp_candidates[i].cpu().item()
-                            )
+                        if logits is not None:
+                            layer_entry["topk_logits"] = logits[i].cpu().tolist()[:req_top_k]
+                        if logsumexp is not None:
+                            layer_entry["logsumexp_candidates"] = logsumexp[i].cpu().item()
+                        layers_data[layer_id] = layer_entry
 
-                    req.attention_tokens.append(attention_info)
+                    attention_info = {
+                        "layers": layers_data,
+                        # Also include last layer at top level for backward compatibility
+                        "layer_id": getattr(logits_output, "attention_layer_id", -1),
+                    }
+                    # Copy last layer data to top level for backward compatibility
+                    if logits_output.attention_token_positions is not None:
+                        attention_info["token_positions"] = (
+                            logits_output.attention_token_positions[i].cpu().tolist()[:req_top_k]
+                        )
+                        attention_info["attention_scores"] = (
+                            logits_output.attention_token_scores[i].cpu().tolist()[:req_top_k]
+                        )
+                    if logits_output.attention_topk_logits is not None:
+                        attention_info["topk_logits"] = (
+                            logits_output.attention_topk_logits[i].cpu().tolist()[:req_top_k]
+                        )
+                    if logits_output.attention_logsumexp_candidates is not None:
+                        attention_info["logsumexp_candidates"] = (
+                            logits_output.attention_logsumexp_candidates[i].cpu().item()
+                        )
+                else:
+                    # Single-layer capture (backward compatible format)
+                    attention_info = {
+                        "token_positions": logits_output.attention_token_positions[i]
+                        .cpu()
+                        .tolist()[:req_top_k],
+                        "attention_scores": logits_output.attention_token_scores[i]
+                        .cpu()
+                        .tolist()[:req_top_k],
+                        "layer_id": getattr(logits_output, "attention_layer_id", -1),
+                    }
+                    # Add true probability info if available
+                    if logits_output.attention_topk_logits is not None:
+                        attention_info["topk_logits"] = (
+                            logits_output.attention_topk_logits[i].cpu().tolist()[:req_top_k]
+                        )
+                    if logits_output.attention_logsumexp_candidates is not None:
+                        attention_info["logsumexp_candidates"] = (
+                            logits_output.attention_logsumexp_candidates[i].cpu().item()
+                        )
+
+                # Add decode_step to the attention info for debugging
+                attention_info["decode_step"] = req.attention_tokens_decode_step
+                req.attention_tokens.append(attention_info)
 
             if req.grammar is not None:
                 # FIXME: this try-except block is for handling unexpected xgrammar issue.
