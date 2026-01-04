@@ -48,12 +48,13 @@ def AttentionComputeBalancednessRecorder() -> BalancednessRecorder:
 class AvgBatchSizeRecorder(MetricRecorder):
     def __init__(self):
         self._total_running = 0
-        self._num_steps = 0
+        self._num_records = 0
 
     def on_step_end(self, step: int, gpu_states: List[GPUState]) -> None:
-        self._total_running += sum(gpu.batch_size() for gpu in gpu_states)
-        self._num_steps += 1
+        for gpu in gpu_states:
+            self._total_running += gpu.batch_size()
+            self._num_records += 1
 
     def get_summary(self) -> Dict[str, Any]:
-        avg = self._total_running / self._num_steps if self._num_steps else 0.0
+        avg = self._total_running / self._num_records if self._num_records else 0.0
         return {"avg_batch_size": avg}
