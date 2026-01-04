@@ -412,9 +412,9 @@ RUN sh -c "$(curl --retry 3 --retry-delay 2 -fsSL https://raw.githubusercontent.
     && git clone --depth 1 https://github.com/zsh-users/zsh-syntax-highlighting.git ${ZSH_CUSTOM:-~/.oh-my-zsh/custom}/plugins/zsh-syntax-highlighting
 
 # These configs are optional; users can override them by mounting their own files
-COPY docker/configs/.vimrc /opt/sglang/.vimrc
-COPY docker/configs/.tmux.conf /opt/sglang/.tmux.conf
-COPY docker/configs/.gitconfig /opt/sglang/.gitconfig
+COPY docker/configs/opt/.vimrc /opt/sglang/.vimrc
+COPY docker/configs/opt/.tmux.conf /opt/sglang/.tmux.conf
+COPY docker/configs/opt/.gitconfig /opt/sglang/.gitconfig
 
 # Configure development environment
 COPY docker/configs/.zshrc /root/.zshrc
