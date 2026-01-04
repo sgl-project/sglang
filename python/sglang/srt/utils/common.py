@@ -1136,7 +1136,7 @@ def add_api_key_middleware(app, api_key: str):
 
 
 def configure_logger(server_args, prefix: str = ""):
-    if SGLANG_LOGGING_CONFIG_PATH := os.getenv("SGLANG_LOGGING_CONFIG_PATH"):
+    if SGLANG_LOGGING_CONFIG_PATH := envs.SGLANG_LOGGING_CONFIG_PATH.get():
         if not os.path.exists(SGLANG_LOGGING_CONFIG_PATH):
             raise Exception(
                 "Setting SGLANG_LOGGING_CONFIG_PATH from env with "
@@ -1678,7 +1678,7 @@ def get_npu_memory_capacity():
 
 def get_cpu_memory_capacity():
     # Per-rank memory capacity cannot be determined for customized core settings
-    if os.environ.get("SGLANG_CPU_OMP_THREADS_BIND", ""):
+    if envs.SGLANG_CPU_OMP_THREADS_BIND.get():
         return None
     n_numa_node: int = len(get_cpu_ids_by_node())
     if n_numa_node == 0:
@@ -2282,9 +2282,8 @@ def set_uvicorn_logging_configs():
 
 
 def get_open_port() -> int:
-    port = os.getenv("SGLANG_PORT")
+    port = envs.SGLANG_PORT.get()
     if port is not None:
-        port = int(port)
         while True:
             try:
                 with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -2573,7 +2572,7 @@ def bind_or_assign(target, source):
 
 
 def get_local_ip_by_nic(interface: str = None) -> Optional[str]:
-    if not (interface := interface or os.environ.get("SGLANG_LOCAL_IP_NIC", None)):
+    if not (interface := interface or envs.SGLANG_LOCAL_IP_NIC.get()):
         return None
     try:
         import netifaces
@@ -2656,7 +2655,7 @@ def get_local_ip_auto(fallback: str = None) -> str:
         3. Remote connection method via get_local_ip_by_remote()
     """
     # Try environment variable
-    host_ip = os.getenv("SGLANG_HOST_IP", "") or os.getenv("HOST_IP", "")
+    host_ip = envs.SGLANG_HOST_IP.get() or os.getenv("HOST_IP", "")
     if host_ip:
         return host_ip
     logger.debug("get_ip failed")
