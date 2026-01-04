@@ -94,39 +94,36 @@ def benchmark(data, batch_size, sequential_fn, batch_fn, num_runs, skip_batch):
     return out
 
 
-def print_results(results, func_name, skip_batch):
-    for result in results:
-        print(f"\nBatch size: {result['batch_size']}")
-        print(f"  Sequential {func_name}:")
-        for i, t in enumerate(result["sequential_runs"]):
-            print(f"    Run {i+1}: {t:.2f} ms")
-        print(f"    Average: {result['avg_sequential_ms']:.2f} ms")
+def print_runs(label, runs, avg):
+    print(f"  {label}:")
+    for i, t in enumerate(runs):
+        print(f"    Run {i+1}: {t:.2f} ms")
+    print(f"    Average: {avg:.2f} ms")
 
+
+def print_results(results, func_name, skip_batch):
+    for r in results:
+        print(f"\nBatch size: {r['batch_size']}")
+        print_runs(f"Sequential {func_name}", r["sequential_runs"], r["avg_sequential_ms"])
         if not skip_batch:
-            print(f"  Batch {func_name}:")
-            for i, t in enumerate(result["batch_runs"]):
-                print(f"    Run {i+1}: {t:.2f} ms")
-            print(f"    Average: {result['avg_batch_ms']:.2f} ms")
-            print(f"  Speedup factor: {result['speedup_factor']:.2f}x")
+            print_runs(f"Batch {func_name}", r["batch_runs"], r["avg_batch_ms"])
+            print(f"  Speedup factor: {r['speedup_factor']:.2f}x")
 
     print("\n" + "=" * 60)
     print(f"SUMMARY: {func_name.upper()}")
     print("=" * 60)
 
-    if skip_batch:
-        print(f"{'Batch Size':<10} {'Sequential (ms)':<18}")
-        print("-" * 30)
-        for r in results:
-            print(f"{r['batch_size']:<10} {r['avg_sequential_ms']:.2f} ms")
-    else:
-        print(
-            f"{'Batch Size':<10} {'Sequential (ms)':<18} {'Batch (ms)':<18} {'Speedup':<10}"
-        )
-        print("-" * 60)
-        for r in results:
-            print(
-                f"{r['batch_size']:<10} {r['avg_sequential_ms']:.2f} ms{' ' * 8} {r['avg_batch_ms']:.2f} ms{' ' * 8} {r['speedup_factor']:.2f}x"
-            )
+    headers = ["Batch Size", "Sequential (ms)"]
+    if not skip_batch:
+        headers += ["Batch (ms)", "Speedup"]
+    print("".join(f"{h:<18}" for h in headers))
+    print("-" * (18 * len(headers)))
+
+    for r in results:
+        row = [f"{r['batch_size']}", f"{r['avg_sequential_ms']:.2f} ms"]
+        if not skip_batch:
+            row += [f"{r['avg_batch_ms']:.2f} ms", f"{r['speedup_factor']:.2f}x"]
+        print("".join(f"{v:<18}" for v in row))
 
 
 def run_benchmark(
