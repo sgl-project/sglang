@@ -1,8 +1,6 @@
 """Tests for CuTe DSL fused sigmoid gating delta rule kernel (GDN)."""
 
 import argparse
-import importlib.util
-import os
 
 import numpy as np
 import pytest
@@ -24,20 +22,13 @@ try:
 except ImportError:
     TRITON_KERNEL_AVAILABLE = False
 
-_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-_CUTEDSL_GDN_PATH = os.path.join(
-    _SCRIPT_DIR, "..", "python", "sgl_kernel", "cutedsl_gdn.py"
-)
-
+# Import cutedsl_gdn module from parent directory
 cutedsl_gdn_module = None
-if os.path.exists(_CUTEDSL_GDN_PATH) and CUTEDSL_AVAILABLE:
+if CUTEDSL_AVAILABLE:
     try:
-        spec = importlib.util.spec_from_file_location("cutedsl_gdn", _CUTEDSL_GDN_PATH)
-        if spec and spec.loader:
-            cutedsl_gdn_module = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(cutedsl_gdn_module)
-    except Exception as e:
-        print(f"Warning: Failed to load cutedsl_gdn module: {e}")
+        from sglang.jit_kernel import cutedsl_gdn as cutedsl_gdn_module
+    except ImportError as e:
+        print(f"Warning: Failed to import cutedsl_gdn module: {e}")
         cutedsl_gdn_module = None
 
 

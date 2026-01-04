@@ -1,7 +1,6 @@
 """CuTe DSL Fused Sigmoid Gating Delta Rule Kernel for GDN Decode."""
 
 import logging
-import os
 from typing import Dict, Optional, Tuple
 
 import torch

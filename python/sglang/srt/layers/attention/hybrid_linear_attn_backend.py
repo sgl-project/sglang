@@ -56,7 +56,7 @@ def _check_cutedsl_gdn_available():
         return _cutedsl_gdn_available
 
     try:
-        from sgl_kernel.cutedsl_gdn import (
+        from sglang.jit_kernel.cutedsl_gdn import (
             cutedsl_fused_sigmoid_gating_delta_rule_update,
             is_cutedsl_gdn_available,
         )
