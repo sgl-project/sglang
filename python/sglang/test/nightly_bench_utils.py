@@ -148,7 +148,7 @@ def save_results_as_pydantic_models(
             decode_files.sort()
 
             total_trace_files = len(extend_files) + len(decode_files)
-            logger.info(
+            print(
                 f"Found {total_trace_files} trace files, selecting TP-0: "
                 f"extend={extend_files[0] if extend_files else 'N/A'}, "
                 f"decode={decode_files[0] if decode_files else 'N/A'}"
