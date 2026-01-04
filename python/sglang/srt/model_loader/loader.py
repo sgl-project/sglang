@@ -594,6 +594,7 @@ class DefaultModelLoader(BaseModelLoader):
             device_map=device_map,
             **model_kwargs,
             trust_remote_code=True,
+            local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
         )
         # Handle both legacy modelopt_quant and unified quantization flags
         if hasattr(model_config, "modelopt_quant") and model_config.modelopt_quant:
