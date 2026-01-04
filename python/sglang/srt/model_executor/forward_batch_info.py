@@ -593,12 +593,25 @@ class ForwardBatch:
             )
 
             # Determine which layers to capture
+            # Priority: 1) per-request override, 2) server arg layer ID, 3) server arg layers config
             num_layers = model_runner.model_config.num_hidden_layers
             layers_config = model_runner.server_args.attention_capture_layers
+            server_layer_id = getattr(model_runner.server_args, 'attention_capture_layer_id', None)
 
-            # Per-request layer override takes precedence
+            # Per-request layer override takes highest precedence
             if batch.attention_capture_layer_id is not None:
-                layer_ids = [batch.attention_capture_layer_id]
+                layer_id = batch.attention_capture_layer_id
+                # Handle -1 as "last layer"
+                if layer_id < 0:
+                    layer_id = num_layers + layer_id
+                layer_ids = [layer_id]
+            # Server arg specific layer ID takes second precedence
+            elif server_layer_id is not None:
+                layer_id = server_layer_id
+                # Handle -1 as "last layer"
+                if layer_id < 0:
+                    layer_id = num_layers + layer_id
+                layer_ids = [layer_id]
             elif layers_config == "last":
                 # Just the last layer
                 if hasattr(model_runner, 'attention_layers') and model_runner.attention_layers:
