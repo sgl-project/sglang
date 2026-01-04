@@ -263,6 +263,7 @@ class MultimodalDataItem:
         if self.hash is None:
             if self.feature is not None:
                 hashed_feature = self.feature
+                print(f"{hashed_feature.shape = } {hashed_feature = }")
             else:
                 hashed_feature = self.precomputed_embeddings
             self.hash = hash_feature(hashed_feature)
