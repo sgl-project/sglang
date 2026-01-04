@@ -27,7 +27,7 @@ class TestPrefillDelayerThroughput(CustomTestCase):
             "--dp",
             "8",
             "--chunked-prefill-size",
-            "262144",
+            "131072",
             "--mem-fraction-static",
             "0.6",
         ]
@@ -47,6 +47,7 @@ class TestPrefillDelayerThroughput(CustomTestCase):
                 base_url=base_url,
                 dataset_name="random",
                 num_prompts=500,
+                # trigger chunked prefill
                 random_input_len=30000,
                 random_output_len=256,
                 request_rate=32,
