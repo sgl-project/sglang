@@ -14,11 +14,11 @@ from sglang.test.test_utils import (
 
 
 class TestPrefillDelayerThroughput(CustomTestCase):
-    # def test_1_online_serving_has_prefill_delayer(self):
-    #     self._run_throughput_test_online_serving(prefill_delayer=True)
-    #
-    # def test_2_online_serving_no_prefill_delayer(self):
-    #     self._run_throughput_test_online_serving(prefill_delayer=False)
+    def test_1_online_serving_has_prefill_delayer(self):
+        self._run_throughput_test_online_serving(prefill_delayer=True)
+
+    def test_2_online_serving_no_prefill_delayer(self):
+        self._run_throughput_test_online_serving(prefill_delayer=False)
 
     def test_3_offline_gen_has_prefill_delayer(self):
         self._run_throughput_test_offline_gen(prefill_delayer=True)
