@@ -140,6 +140,7 @@ def compute_topk_attention_chunked(
     top_k: int = 10,
     chunk_size: int = 1024,
     window: int = 0,
+    exact_logsumexp: bool = True,  # Compute exact logsumexp over ALL tokens
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Compute top-k attention positions using chunked approach.
@@ -155,15 +156,16 @@ def compute_topk_attention_chunked(
         window: Context window size. If > 0, only consider the last `window` tokens
                 for attention capture. Useful for very long contexts (1M+) to limit
                 compute. Use 0 for all tokens.
+        exact_logsumexp: If True (default), compute logsumexp over ALL tokens for
+                        true probability calculation. If False, use approximate
+                        logsumexp over top chunks only (faster but approximate).
 
     Returns:
         topk_scores: [batch, top_k] - softmax normalized over top-k (for display)
         topk_indices: [batch, top_k] - sequence positions (in original context)
         topk_logits: [batch, top_k] - raw attention scores (for probability calculation)
-        logsumexp_candidates: [batch] - logsumexp over candidate scores (approximate normalizer)
-            Note: This is computed over top chunks only, not all tokens. For very long
-            contexts, this provides an approximation. Use for approximate probability:
-            approx_prob = exp(topk_logit - logsumexp_candidates)
+        logsumexp_all: [batch] - logsumexp over all scores (exact normalizer for true probability)
+            Use: true_prob = exp(topk_logit - logsumexp_all)
     """
     batch_size, num_heads, head_dim = q.shape
     num_kv_heads = k_buffer.shape[1]
@@ -246,8 +248,87 @@ def compute_topk_attention_chunked(
     # Rescan top chunks in PyTorch to get exact positions and scores
     return _rescan_top_chunks(
         q, k_buffer, kv_indptr, kv_indices,
-        sm_scale, topk_chunk_idx, chunk_size, top_k
+        sm_scale, topk_chunk_idx, chunk_size, top_k,
+        exact_logsumexp=exact_logsumexp,
     )
+
+
+def _compute_exact_logsumexp_all_chunks(
+    q: torch.Tensor,
+    k_buffer: torch.Tensor,
+    kv_indptr: torch.Tensor,
+    kv_indices: torch.Tensor,
+    sm_scale: float,
+    chunk_size: int,
+) -> torch.Tensor:
+    """
+    Compute EXACT logsumexp over ALL tokens using memory-efficient chunked iteration.
+
+    Uses online logsumexp: lse(a, b) = max(a, b) + log(exp(a - max) + exp(b - max))
+    This avoids storing all scores while giving exact results.
+
+    Returns:
+        logsumexp_all: [batch] - exact logsumexp over all attention scores
+    """
+    batch_size, num_heads, head_dim = q.shape
+    num_kv_heads = k_buffer.shape[1]
+    kv_group_num = num_heads // num_kv_heads
+    device = q.device
+
+    logsumexp_list = []
+
+    for b in range(batch_size):
+        kv_start = kv_indptr[b].item()
+        kv_end = kv_indptr[b + 1].item()
+        seq_len = kv_end - kv_start
+
+        if seq_len == 0:
+            logsumexp_list.append(torch.tensor(float('-inf'), device=device))
+            continue
+
+        # Online logsumexp accumulation
+        # We'll compute chunk-wise logsumexp and merge them
+        num_chunks = (seq_len + chunk_size - 1) // chunk_size
+        chunk_logsumexps = []
+
+        for chunk_idx in range(num_chunks):
+            chunk_start = chunk_idx * chunk_size
+            chunk_end = min(chunk_start + chunk_size, seq_len)
+
+            # Get positions in this chunk
+            kv_pos = kv_indices[kv_start + chunk_start:kv_start + chunk_end]
+
+            # Gather keys: [chunk_len, num_kv_heads, head_dim]
+            keys = k_buffer[kv_pos]
+
+            # Expand for GQA
+            if kv_group_num > 1:
+                keys = keys.repeat_interleave(kv_group_num, dim=1)
+
+            # Query: [num_heads, head_dim]
+            query = q[b]
+
+            # Attention scores: [num_heads, chunk_len]
+            scores = torch.einsum("hd,shd->hs", query.float(), keys.float()) * sm_scale
+
+            # Average across heads (consistent with top-k computation)
+            scores_avg = scores.mean(dim=0)  # [chunk_len]
+
+            # Compute logsumexp for this chunk
+            chunk_lse = torch.logsumexp(scores_avg, dim=0)
+            chunk_logsumexps.append(chunk_lse)
+
+        # Merge all chunk logsumexps using online algorithm
+        # logsumexp(a, b) = max(a, b) + log(exp(a - max) + exp(b - max))
+        if len(chunk_logsumexps) == 1:
+            total_lse = chunk_logsumexps[0]
+        else:
+            chunk_lses = torch.stack(chunk_logsumexps)
+            total_lse = torch.logsumexp(chunk_lses, dim=0)
+
+        logsumexp_list.append(total_lse)
+
+    return torch.stack(logsumexp_list)
 
 
 def _rescan_top_chunks(
@@ -259,22 +340,36 @@ def _rescan_top_chunks(
     topk_chunk_idx: torch.Tensor,  # [batch, k_chunks]
     chunk_size: int,
     top_k: int,
+    exact_logsumexp: bool = True,  # New parameter to control exact vs approximate
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Rescan the top chunks to find exact token positions.
     Only processes the top chunks, keeping memory bounded.
 
+    Args:
+        exact_logsumexp: If True, compute logsumexp over ALL tokens (exact).
+                        If False, use logsumexp only over top chunks (approximate, faster).
+
     Returns:
         topk_probs: [batch, top_k] - softmax normalized over top-k only (for display)
         topk_positions: [batch, top_k] - sequence positions
         topk_logits: [batch, top_k] - raw attention scores (for probability calculation)
-        logsumexp_candidates: [batch] - logsumexp over candidate chunks (approximate normalizer)
+        logsumexp_all: [batch] - logsumexp for true probability (exact if exact_logsumexp=True)
     """
     batch_size, num_heads, head_dim = q.shape
     num_kv_heads = k_buffer.shape[1]
     kv_group_num = num_heads // num_kv_heads
     device = q.device
     k_chunks = topk_chunk_idx.shape[1]
+
+    # Compute exact logsumexp over ALL tokens if requested
+    # This is more expensive but gives true probability
+    if exact_logsumexp:
+        exact_lse = _compute_exact_logsumexp_all_chunks(
+            q, k_buffer, kv_indptr, kv_indices, sm_scale, chunk_size
+        )
+    else:
+        exact_lse = None
 
     topk_scores_list = []
     topk_indices_list = []
@@ -337,10 +432,12 @@ def _rescan_top_chunks(
         all_scores = torch.cat(all_scores)
         all_positions = torch.cat(all_positions)
 
-        # Compute logsumexp over all scores for true probability calculation
-        # Note: This is an approximation since we only have scores from top chunks
-        # For accurate logsumexp, we'd need all chunks, but this is a good approximation
-        logsumexp_val = torch.logsumexp(all_scores, dim=0)
+        # Get logsumexp: use exact if computed, otherwise approximate from top chunks
+        if exact_lse is not None:
+            logsumexp_val = exact_lse[b]
+        else:
+            # Approximate logsumexp (only over top chunks)
+            logsumexp_val = torch.logsumexp(all_scores, dim=0)
 
         # Get top-k from the candidate positions
         actual_k = min(top_k, len(all_scores))
