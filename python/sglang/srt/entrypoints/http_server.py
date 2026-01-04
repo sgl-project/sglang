@@ -725,7 +725,8 @@ async def clear_hicache_storage_backend():
 #   -d '{
 #     "hicache_storage_backend": "file",
 #     "hicache_storage_backend_extra_config_json": "{}",
-#     "hicache_storage_prefetch_policy": "timeout"
+#     "hicache_storage_prefetch_policy": "timeout",
+#     "hicache_write_policy": "write_through"
 #   }'
 @app.api_route("/attach_hicache_storage_backend", methods=["POST"])
 async def attach_hicache_storage_backend(obj: AttachHiCacheStorageReqInput):
@@ -736,9 +737,8 @@ async def attach_hicache_storage_backend(obj: AttachHiCacheStorageReqInput):
     ret = await _global_state.tokenizer_manager.attach_hicache_storage(
         hicache_storage_backend=obj.hicache_storage_backend,
         hicache_storage_backend_extra_config_json=obj.hicache_storage_backend_extra_config_json,
-        hicache_storage_prefetch_policy=getattr(
-            obj, "hicache_storage_prefetch_policy", None
-        ),
+        hicache_storage_prefetch_policy=obj.hicache_storage_prefetch_policy,
+        hicache_write_policy=obj.hicache_write_policy,
     )
     msg = getattr(ret, "message", "")
     return Response(
@@ -778,8 +778,8 @@ async def detach_hicache_storage_backend():
 
 
 # example usage:
-# curl -s http://127.0.0.1:30000/hicache_storage_backend
-@app.get("/hicache_storage_backend")
+# curl -s http://127.0.0.1:30000/info_from_hicache_storage_backend
+@app.get("/info_from_hicache_storage_backend")
 async def hicache_storage_backend_status():
     """Get current HiCache storage backend status (tokenizer-side view)."""
     return {

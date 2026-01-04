@@ -151,6 +151,7 @@ class HiRadixCache(RadixCache):
         storage_backend_extra_config_json: Optional[str] = None,
         served_model_name: Optional[str] = None,
         hicache_storage_prefetch_policy: Optional[str] = None,
+        hicache_write_policy: Optional[str] = None,
     ) -> tuple[bool, str]:
         """Attach (enable) storage backend at runtime.
 
@@ -167,6 +168,15 @@ class HiRadixCache(RadixCache):
                 return (
                     False,
                     f"Invalid hicache_storage_prefetch_policy: {hicache_storage_prefetch_policy!r}. "
+                    f"Expected one of {allowed}.",
+                )
+
+        if hicache_write_policy is not None:
+            allowed = ["write_back", "write_through", "write_through_selective"]
+            if hicache_write_policy not in allowed:
+                return (
+                    False,
+                    f"Invalid hicache_write_policy: {hicache_write_policy!r}. "
                     f"Expected one of {allowed}.",
                 )
 
@@ -218,6 +228,11 @@ class HiRadixCache(RadixCache):
 
             # All steps succeeded: now atomically flip flags/state.
             self.enable_storage = True
+            if hicache_write_policy is not None:
+                self.cache_controller.write_policy = hicache_write_policy
+                self.write_through_threshold = (
+                    1 if hicache_write_policy == "write_through" else 2
+                )
             self.prefetch_threshold = prefetch_threshold
             self.prefetch_timeout_base = prefetch_timeout_base
             self.prefetch_timeout_per_page = prefetch_timeout_per_page

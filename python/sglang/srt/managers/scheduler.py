@@ -2481,9 +2481,8 @@ class Scheduler(
                 storage_backend=recv_req.hicache_storage_backend,
                 storage_backend_extra_config_json=recv_req.hicache_storage_backend_extra_config_json,
                 served_model_name=self.server_args.served_model_name,
-                hicache_storage_prefetch_policy=getattr(
-                    recv_req, "hicache_storage_prefetch_policy", None
-                ),
+                hicache_storage_prefetch_policy=recv_req.hicache_storage_prefetch_policy,
+                hicache_write_policy=recv_req.hicache_write_policy,
             )
         except Exception as e:
             logger.exception("Attach HiCache storage backend failed with exception.")
@@ -2494,10 +2493,12 @@ class Scheduler(
             self.server_args.hicache_storage_backend_extra_config = (
                 recv_req.hicache_storage_backend_extra_config_json
             )
-            if getattr(recv_req, "hicache_storage_prefetch_policy", None) is not None:
+            if recv_req.hicache_storage_prefetch_policy is not None:
                 self.server_args.hicache_storage_prefetch_policy = (
                     recv_req.hicache_storage_prefetch_policy
                 )
+            if recv_req.hicache_write_policy is not None:
+                self.server_args.hicache_write_policy = recv_req.hicache_write_policy
             logger.info(
                 f"Attached HiCache storage backend: {recv_req.hicache_storage_backend}"
             )

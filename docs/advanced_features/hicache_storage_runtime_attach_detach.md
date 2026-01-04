@@ -18,7 +18,7 @@ If the idle condition is not met, the API will fail fast (HTTP 400) and **will n
 The control path is:
 
 1. **HTTP Server** (`python/sglang/srt/entrypoints/http_server.py`)
-   - Exposes `/attach_hicache_storage_backend`, `/detach_hicache_storage_backend`, `/hicache_storage_backend`
+   - Exposes `/attach_hicache_storage_backend`, `/detach_hicache_storage_backend`, `/info_from_hicache_storage_backend`
 2. **TokenizerManager** (`python/sglang/srt/managers/tokenizer_communicator_mixin.py`)
    - Sends the request to the Scheduler via `_Communicator`
 3. **Scheduler** (`python/sglang/srt/managers/scheduler.py`)
@@ -72,7 +72,7 @@ The examples below assume your SGLang HTTP server is at `http://127.0.0.1:30000`
 ### 3.1 Query current storage backend status
 
 ```bash
-curl -s http://127.0.0.1:30000/hicache_storage_backend
+curl -s http://127.0.0.1:30000/info_from_hicache_storage_backend
 ```
 
 Example response:

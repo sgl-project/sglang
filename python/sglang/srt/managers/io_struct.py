@@ -1140,14 +1140,25 @@ class AttachHiCacheStorageReqInput(BaseReq):
     hicache_storage_backend: str
     hicache_storage_backend_extra_config_json: Optional[str] = None
     hicache_storage_prefetch_policy: Optional[str] = None
+    hicache_write_policy: Optional[str] = None
 
     def __post_init__(self):
         if self.hicache_storage_prefetch_policy is None:
+            pass
+        else:
+            allowed = ["best_effort", "wait_complete", "timeout"]
+            if self.hicache_storage_prefetch_policy not in allowed:
+                raise ValueError(
+                    f"Invalid hicache_storage_prefetch_policy: {self.hicache_storage_prefetch_policy!r}. "
+                    f"Expected one of {allowed}."
+                )
+
+        if self.hicache_write_policy is None:
             return
-        allowed = ["best_effort", "wait_complete", "timeout"]
-        if self.hicache_storage_prefetch_policy not in allowed:
+        allowed = ["write_back", "write_through", "write_through_selective"]
+        if self.hicache_write_policy not in allowed:
             raise ValueError(
-                f"Invalid hicache_storage_prefetch_policy: {self.hicache_storage_prefetch_policy!r}. "
+                f"Invalid hicache_write_policy: {self.hicache_write_policy!r}. "
                 f"Expected one of {allowed}."
             )
 

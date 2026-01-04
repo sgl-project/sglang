@@ -113,7 +113,7 @@ class TestHiCacheStorageRuntimeAttachDetach(CustomTestCase):
 
     def _get_backend_status(self):
         code, body = self._http_get(
-            f"{self.base_url}/hicache_storage_backend", timeout=10
+            f"{self.base_url}/info_from_hicache_storage_backend", timeout=10
         )
         self.assertEqual(code, 200, body)
         return json.loads(body)

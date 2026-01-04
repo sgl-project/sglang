@@ -338,6 +338,7 @@ class TokenizerCommunicatorMixin:
         hicache_storage_backend: str,
         hicache_storage_backend_extra_config_json: Optional[str] = None,
         hicache_storage_prefetch_policy: Optional[str] = None,
+        hicache_write_policy: Optional[str] = None,
     ) -> AttachHiCacheStorageReqOutput:
         """Attach (enable) HiCache storage backend at runtime."""
         results = await self.attach_hicache_storage_communicator(
@@ -345,6 +346,7 @@ class TokenizerCommunicatorMixin:
                 hicache_storage_backend=hicache_storage_backend,
                 hicache_storage_backend_extra_config_json=hicache_storage_backend_extra_config_json,
                 hicache_storage_prefetch_policy=hicache_storage_prefetch_policy,
+                hicache_write_policy=hicache_write_policy,
             )
         )
 
@@ -361,6 +363,8 @@ class TokenizerCommunicatorMixin:
                 self.server_args.hicache_storage_prefetch_policy = (
                     hicache_storage_prefetch_policy
                 )
+            if hicache_write_policy is not None:
+                self.server_args.hicache_write_policy = hicache_write_policy
         return out
 
     async def detach_hicache_storage(
