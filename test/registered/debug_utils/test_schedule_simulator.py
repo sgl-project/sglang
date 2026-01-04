@@ -775,7 +775,7 @@ class TestLargerScale(CustomTestCase):
             "--num-gpus", "8",
             "--router", "random",
             "--max-total-tokens", "2000000",
-            "--stop-criteria", "no_pending",
+            "--stop-criteria", "exist_no_pending",
         )
         self._assert_in_range(result.summary["attention_compute_balancedness_mean"], 0.95, 1.0, "attn")
         self._assert_in_range(result.summary["batch_size_balancedness_mean"], 0.95, 1.0, "bs")
@@ -792,10 +792,11 @@ class TestLargerScale(CustomTestCase):
             "--num-gpus", "8",
             "--router", "random",
             "--max-total-tokens", "500000",
-            "--stop-criteria", "no_pending",
+            "--stop-criteria", "exist_no_pending",
         )
         self._assert_in_range(result.summary["attention_compute_balancedness_mean"], 0.95, 1.0, "attn")
         self._assert_in_range(result.summary["batch_size_balancedness_mean"], 0.95, 1.0, "bs")
+        self._assert_in_range(result.summary["avg_batch_size"], 15, 25, "avg_bs")
 
     def test_gsp_workload_sticky_policy(self):
         result = self._run_main(
@@ -809,10 +810,11 @@ class TestLargerScale(CustomTestCase):
             "--num-gpus", "8",
             "--router", "sticky",
             "--max-total-tokens", "500000",
-            "--stop-criteria", "no_pending",
+            "--stop-criteria", "exist_no_pending",
         )
         self._assert_in_range(result.summary["attention_compute_balancedness_mean"], 0.35, 0.45, "attn")
         self._assert_in_range(result.summary["batch_size_balancedness_mean"], 0.35, 0.45, "bs")
+        self._assert_in_range(result.summary["avg_batch_size"], 25, 35, "avg_bs")
 
 
 if __name__ == "__main__":
