@@ -41,7 +41,7 @@ def BatchSizeBalancednessRecorder() -> BalancednessRecorder:
 
 def AttentionComputeBalancednessRecorder() -> BalancednessRecorder:
     return BalancednessRecorder(
-        "attention_compute_balancedness", lambda gpu: gpu.total_seq_len()
+        "attention_compute_balancedness", lambda gpu: gpu.total_attention_compute()
     )
 
 
