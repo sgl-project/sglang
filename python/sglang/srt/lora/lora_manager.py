@@ -72,6 +72,7 @@ class LoRAManager:
         self.tp_size: int = tp_size
         self.tp_rank: int = tp_rank
         self.lora_added_tokens_size: Optional[int] = None
+        self.enable_lora_prefetch: Optional[bool] = server_args.enable_lora_prefetch
 
         # Store eviction policy from server args
         self.eviction_policy = server_args.lora_eviction_policy
@@ -208,7 +209,7 @@ class LoRAManager:
 
         return self.create_lora_update_result(success=True)
 
-    def validate_lora_batch(self, lora_ids: set[str]) -> bool:
+    def validate_lora_batch(self, lora_ids: set[Optional[str]]) -> bool:
         """
         Validate if the LoRA IDs in the batch can be loaded into the current LoRA memory pool.
         """
@@ -239,9 +240,11 @@ class LoRAManager:
 
         return required_slots <= mem_pool_vacancy
 
-    def prepare_lora_batch(self, forward_batch: ForwardBatch):
+    def fetch_new_lora(
+        self, new_lora_id: Optional[str], running_loras: set[Optional[str]]
+    ):
         # Load active loras into lora memory pool
-        cur_uids = set(forward_batch.lora_ids)
+        cur_uids = {new_lora_id} | running_loras
 
         assert len(cur_uids) <= self.max_loras_per_batch
         self.memory_pool.prepare_lora_batch(
@@ -253,6 +256,7 @@ class LoRAManager:
             lora_lm_head_module=self.lm_head_module,  # merge into embedding or lora module
         )
 
+    def prepare_lora_batch(self, forward_batch: ForwardBatch):
         # set up batch info shared by all lora modules
         bs = forward_batch.batch_size
 
@@ -442,6 +446,11 @@ class LoRAManager:
             self.lora_backend,
         )
         lora_adapter.initialize_weights()
+
+        # If we want to prefetch LoRA adapters, they must be pinned in CPU memory
+        if self.enable_lora_prefetch:
+            lora_adapter.pin_weights()
+
         self.loras[lora_ref.lora_id] = lora_adapter
 
     def init_memory_pool(self):
@@ -458,6 +467,9 @@ class LoRAManager:
             eviction_policy=self.eviction_policy,
             lora_added_tokens_size=self.lora_added_tokens_size,
         )
+
+        # Initializing memory pool with base model
+        self.fetch_new_lora(None, set())
 
     def set_lora_module(self, module_name, module):
         lora_module = get_lora_layer(module, self.lora_backend)

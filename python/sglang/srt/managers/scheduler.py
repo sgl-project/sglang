@@ -68,6 +68,7 @@ from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_r
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.layers.moe import initialize_moe_config
 from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
+from sglang.srt.lora.lora_prefetcher import LoRAPrefetcher, LoRAPrefetchStatus
 from sglang.srt.managers.io_struct import (
     AbortReq,
     BaseBatchReq,
@@ -282,6 +283,7 @@ class Scheduler(
             server_args.priority_scheduling_preemption_threshold
         )
         self.enable_lora = server_args.enable_lora
+        self.enable_lora_prefetch = server_args.enable_lora_prefetch
         self.max_loras_per_batch = server_args.max_loras_per_batch
         self.enable_overlap = not server_args.disable_overlap_schedule
         self.enable_pdmux = server_args.enable_pdmux
@@ -368,6 +370,11 @@ class Scheduler(
 
         # Init request dispatcher
         self.init_request_dispatcher()
+
+        if self.enable_lora_prefetch:
+            self.lora_prefetcher = LoRAPrefetcher(
+                self.tp_worker.model_runner.lora_manager
+            )
 
     def init_model_config(self):
         self.model_config = ModelConfig.from_server_args(self.server_args)
@@ -1994,26 +2001,14 @@ class Scheduler(
             self.chunked_req = adder.add_chunked_req(self.chunked_req)
 
         if self.enable_lora:
-            lora_set = set([req.lora_id for req in self.running_batch.reqs])
+            running_loras = {req.lora_id for req in self.running_batch.reqs}
 
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
-
-            if self.enable_lora:
-                new_lora_set = (
-                    lora_set
-                    | set([req.lora_id for req in adder.can_run_list])
-                    | set([req.lora_id])
-                )
-                if not self.tp_worker.can_run_lora_batch(new_lora_set):
-                    # If this is a LoRA request that would exceed the LoRA slot limit,
-                    # skip it and continue to try scheduling non-LoRA requests.
-                    # Non-LoRA requests (lora_id=None) share a single reserved slot
-                    # and should never cause this check to fail.
-                    if req.lora_id is not None:
-                        # Skip this LoRA request - it would trigger adapter eviction/loading
-                        # which is slow. We'll try to schedule it in a future iteration.
-                        continue
+            if self.enable_lora and req.lora_id not in running_loras:
+                res = self.try_load_lora(req.lora_id, running_loras)
+                if not res:
+                    continue
 
             running_bs = len(self.running_batch.reqs)
             if len(adder.can_run_list) >= self.get_num_allocatable_reqs(running_bs):
@@ -2042,6 +2037,9 @@ class Scheduler(
                 has_chunked_req=(self.chunked_req is not None),
                 truncation_align_size=self.truncation_align_size,
             )
+
+            if self.enable_lora:
+                running_loras.add(req.lora_id)
 
             if res != AddReqResult.CONTINUE:
                 if res == AddReqResult.NO_TOKEN:
@@ -2402,6 +2400,30 @@ class Scheduler(
 
         self.log_batch_result_stats(batch, result)
         self.maybe_send_health_check_signal()
+
+    def try_load_lora(self, lora_id: Optional[str], running_loras: set[Optional[str]]):
+        if self.enable_lora_prefetch:
+            lora_prefetch_status = self.lora_prefetcher.check_prefetch_status(lora_id)
+            if lora_prefetch_status == LoRAPrefetchStatus.PREFETCHING:
+                return False
+            elif lora_prefetch_status == LoRAPrefetchStatus.NOT_PREFETCHED:
+                res = self.lora_prefetcher.try_start_prefetch(lora_id, running_loras)
+                if res:
+                    logger.debug(f"Prefetching LoRA: {lora_id}")
+
+                return False
+            else:
+                assert lora_prefetch_status == LoRAPrefetchStatus.LOADED
+                return True
+        else:
+            lora_manager = self.tp_worker.model_runner.lora_manager
+
+            new_lora_set = running_loras | {lora_id}
+            if not lora_manager.validate_lora_batch(new_lora_set):
+                return False
+
+            lora_manager.fetch_new_lora(lora_id, running_loras)
+            return True
 
     def maybe_send_health_check_signal(self):
         if self.return_health_check_ct:
