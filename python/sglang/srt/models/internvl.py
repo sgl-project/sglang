@@ -539,6 +539,7 @@ class InternVLChatModel(nn.Module):
 
         self.external_mm_data_embedding_funcs = {
             Modality.IMAGE: self.get_image_feature,
+            Modality.VIDEO: self.get_video_feature,
         }
 
         self.model = self.language_model.model
@@ -593,6 +594,13 @@ class InternVLChatModel(nn.Module):
         pixel_values = torch.cat([item.feature for item in items])
         image_features = self.extract_feature(pixel_values)
         return image_features
+
+    def get_video_feature(self, items: List[MultimodalDataItem]):
+        # items: each item corresponds to one video (recommended)
+        # item.feature shape: [num_frames, 3, 448, 448]  (or [num_tiles, 3, 448, 448])
+        pixel_values = torch.cat([item.feature for item in items], dim=0)
+        video_features = self.extract_feature(pixel_values)
+        return video_features
 
     @torch.no_grad()
     def forward(

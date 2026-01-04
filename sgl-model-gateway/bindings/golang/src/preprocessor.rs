@@ -12,9 +12,9 @@ use std::os::raw::{c_char, c_int};
 use std::ptr;
 use std::os::raw::c_uint;
 
-use sgl_model_gateway::tokenizer::create_tokenizer_from_file;
-use sgl_model_gateway::protocols::chat::ChatCompletionRequest;
-use sgl_model_gateway::routers::grpc::utils::{process_chat_messages, generate_tool_constraints};
+use smg::tokenizer::create_tokenizer_from_file;
+use smg::protocols::chat::ChatCompletionRequest;
+use smg::routers::grpc::utils::{process_chat_messages, generate_tool_constraints};
 
 use super::error::{SglErrorCode, set_error_message};
 use super::memory::{sgl_free_string, sgl_free_token_ids};
