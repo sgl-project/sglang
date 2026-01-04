@@ -448,18 +448,20 @@ class SchedulerOutputProcessorMixin:
                 )
 
             # Process attention token info for interpretability
+            # Schema matches frontend expectation: {token_positions, attention_scores, layer_id}
             if (
                 req.return_attention_tokens
                 and logits_output.attention_token_positions is not None
             ):
                 req.attention_tokens.append(
                     {
-                        "positions": logits_output.attention_token_positions[i]
+                        "token_positions": logits_output.attention_token_positions[i]
                         .cpu()
                         .tolist(),
-                        "scores": logits_output.attention_token_scores[i]
+                        "attention_scores": logits_output.attention_token_scores[i]
                         .cpu()
                         .tolist(),
+                        "layer_id": getattr(logits_output, "attention_layer_id", -1),
                     }
                 )
 
