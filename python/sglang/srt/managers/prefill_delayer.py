@@ -77,6 +77,13 @@ class PrefillDelayerSinglePassExecutor:
         self._prefill_delayer = prefill_delayer
         self._called = False
 
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.should_allow_prefill(local_prefillable=False)
+        return False
+
     def should_allow_prefill(self, local_prefillable: int) -> bool:
         assert not self._called
         self._called = True
