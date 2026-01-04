@@ -220,6 +220,9 @@ class TraceMetricContext(TraceReqContext):
                 except AttributeError:
                     pass
 
+            if auto_next_anon:
+                self.last_ts_stack.append(ts)
+
         self.trace_slice_end(
             stage.stage_name,
             ts=ts,
@@ -280,8 +283,10 @@ class TraceMetricScope:
             )
 
 
+@dataclass
 class NullContext:
-    __slots__ = ()
+    tracing_enable: bool = False
+    time_record_enable: bool = False
 
     def __getattr__(self, name):
         return self

@@ -1145,7 +1145,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         created_time: Optional[float] = None,
     ):
         with metric_trace_slice_batch_scope(
-            RequestStage.TOKENIZER_DISPATCH, [tokenized_obj], True
+            RequestStage.TOKENIZER_DISPATCH, [tokenized_obj], True, True
         ):
             self._send_multi_parts(self.send_to_scheduler, tokenized_obj)
         state = ReqState([], False, asyncio.Event(), obj, created_time=created_time)
@@ -1167,7 +1167,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         else:
             batch_req = BatchTokenizedEmbeddingReqInput(batch=tokenized_objs)
         with metric_trace_slice_batch_scope(
-            RequestStage.TOKENIZER_DISPATCH, tokenized_objs, True
+            RequestStage.TOKENIZER_DISPATCH, tokenized_objs, True, True
         ):
             self._send_multi_parts(self.send_to_scheduler, batch_req)
         # Create states for each individual request in the batch

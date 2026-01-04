@@ -222,10 +222,10 @@ class DataParallelController:
     def handle_load_update_req(self, obj):
         self.dp_budget.update_budget(obj)
 
-    def _reqs_trace_metric_ctx_init(
+    def _req_trace_metric_ctx_init(
         self, req: Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput]
     ):
-        if self.server_args.trace_level == 0 and not self.server_args.enable_metrics:
+        if self.server_args.trace_level == 0:
             req.trace_metric_ctx = NullContext()
             return
 
@@ -241,7 +241,7 @@ class DataParallelController:
         req.trace_metric_ctx.trace_set_proc_propagate_context(propagation_context)
 
     def dispatching_with_trace(self, req: Req):
-        self._reqs_trace_metric_ctx_init(req)
+        self._req_trace_metric_ctx_init(req)
 
         with metric_trace_slice_batch_scope(
             RequestStage.DC_DISPATCH, [req], True, True
