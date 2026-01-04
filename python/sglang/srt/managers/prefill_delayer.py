@@ -86,6 +86,9 @@ class PrefillDelayerSinglePassExecutor:
         return False
 
     def negotiate_should_allow_prefill(self, local_prefillable: bool) -> bool:
+        import traceback
+        traceback.print_stack()
+
         assert not self._called
         self._called = True
         return self._prefill_delayer._negotiate_should_allow_prefill(
