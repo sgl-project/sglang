@@ -467,6 +467,9 @@ class DiffusersPipeline(ComposedPipelineBase):
         # Apply VAE memory optimizations from pipeline config
         self._apply_vae_optimizations(pipe, server_args)
 
+        # Apply attention backend if specified
+        self._apply_attention_backend(pipe, server_args)
+
         logger.info("Loaded diffusers pipeline: %s", pipe.__class__.__name__)
         return pipe
 
@@ -490,33 +493,49 @@ class DiffusersPipeline(ComposedPipelineBase):
                 pipe.enable_vae_tiling()
                 logger.info("Enabled VAE tiling for large image support")
 
+    def _apply_attention_backend(self, pipe: Any, server_args: ServerArgs) -> None:
+        """Apply attention backend setting from pipeline config or server_args.
+
+        See: https://huggingface.co/docs/diffusers/main/en/optimization/attention_backends
+        Available backends: flash, _flash_3_hub, sage, xformers, native, etc.
+        """
+        backend = getattr(server_args, "diffusers_attention_backend", None)
+
+        if backend is None:
+            config = getattr(server_args, "pipeline_config", None)
+            if config is not None:
+                backend = getattr(config, "diffusers_attention_backend", None)
+
+        if backend is None:
+            return
+
+        for component_name in ["transformer", "unet"]:
+            component = getattr(pipe, component_name, None)
+            if component is not None and hasattr(component, "set_attention_backend"):
+                try:
+                    component.set_attention_backend(backend)
+                    logger.info(
+                        "Set attention backend '%s' on %s", backend, component_name
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "Failed to set attention backend '%s' on %s: %s",
+                        backend,
+                        component_name,
+                        e,
+                    )
+
     def _get_device_map(self, server_args: ServerArgs) -> str | None:
-        """Determine device_map for pipeline loading.
-
-        Using device_map="cuda" enables:
-        1. Direct loading to GPU, warming up CUDA caching allocator
-        2. Parallel shard loading via accelerate for faster init
-
-        Note: We only use "cuda" here, not "balanced" or other multi-GPU options.
-        SGLang handles multi-GPU distribution via its own parallelism (tp_size, sp_degree, etc.).
-        Using diffusers' device_map for multi-GPU would conflict with SGLang's distribution.
-
-        Returns:
-            - "cuda": Load to current CUDA device
-            - None: Fall back to manual .to() call (CPU/MPS)
+        """
+        Determine device_map for pipeline loading.
         """
         if not torch.cuda.is_available():
             return None
-
-        # Always use "cuda" - SGLang handles multi-GPU parallelism
         return "cuda"
 
     def _get_dtype(self, server_args: ServerArgs) -> torch.dtype:
-        """Determine the dtype to use for model loading.
-
-        Note: Some models (e.g., Gemma-based pipelines) do not support FP16 inference.
-        While they can technically run in FP16, the outputs will be garbled/corrupted.
-        For such models, use BF16 or FP32 via pipeline_config.dit_precision="bf16"/"fp32".
+        """
+        Determine the dtype to use for model loading.
         """
         dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
 

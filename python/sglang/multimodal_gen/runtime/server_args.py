@@ -234,6 +234,7 @@ class ServerArgs:
 
     # Attention
     attention_backend: str = None
+    diffusers_attention_backend: str = None  # for diffusers backend only
 
     # Distributed executor backend
     nccl_port: Optional[int] = None
@@ -425,6 +426,13 @@ class ServerArgs:
             default=None,
             choices=[e.name.lower() for e in AttentionBackendEnum] + ["fa3", "fa4"],
             help="The attention backend to use. If not specified, the backend is automatically selected based on hardware and installed packages.",
+        )
+        parser.add_argument(
+            "--diffusers-attention-backend",
+            type=str,
+            default=None,
+            help="Attention backend for diffusers pipelines (e.g., flash, _flash_3_hub, sage, xformers). "
+            "See: https://huggingface.co/docs/diffusers/main/en/optimization/attention_backends",
         )
 
         # HuggingFace specific parameters
