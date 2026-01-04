@@ -1,3 +1,9 @@
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+
+# RL Update Weights from Distributed tests (2-GPU)
+register_cuda_ci(est_time=103, suite="stage-b-test-large-2-gpu")
+register_amd_ci(est_time=103, suite="per-commit-2-gpu-amd")
+
 """Test distributed weight updates.
 
 This test suite simulates a distributed training environment to ensure
