@@ -102,7 +102,7 @@ def fused_experts_none_to_sonic_moe(
     b13 = quant_info.b13
     b2 = quant_info.b2
 
-    torch.cuda.synchronize()
+    s = torch.cuda.current_stream()
     with torch.no_grad():
         output = _sonic_moe_forward_placeholder(
             hidden_states=hidden_states,
@@ -114,8 +114,8 @@ def fused_experts_none_to_sonic_moe(
             selected_experts=topk_output.topk_ids,
             activation_type=activation_type,
             config=runner_config,
+            stream=s,
         )
-    torch.cuda.synchronize()
 
     return StandardCombineInput(hidden_states=output)
 
@@ -130,6 +130,7 @@ def _sonic_moe_forward_placeholder(
     selected_experts: torch.Tensor,
     activation_type: ActivationType,
     config: MoeRunnerConfig,
+    stream: torch.cuda.Stream,
 ) -> torch.Tensor:
     """
     Placeholder for actual SonicMoE kernel.
@@ -153,7 +154,6 @@ def _sonic_moe_forward_placeholder(
 
     T = hidden_states.size(0)
     K = config.top_k
-    stream_id = torch.cuda.current_stream().cuda_stream
 
     expert_frequency, expert_frequency_offset = count_cumsum(
         selected_experts.view(-1), config.num_experts, do_cumsum=True
@@ -173,7 +173,7 @@ def _sonic_moe_forward_placeholder(
         expert_frequency_offset,
         T * K,
         K,
-        stream_id,
+        stream.cuda_stream,
         x_gather_idx,
         s_scatter_idx,
         s_reverse_scatter_idx,
@@ -192,7 +192,7 @@ def _sonic_moe_forward_placeholder(
         expert_frequency_offset,
         T,
         K,
-        stream_id,
+        stream.cuda_stream,
         x_gather_idx,
         s_scatter_idx,
         s_reverse_scatter_idx,
