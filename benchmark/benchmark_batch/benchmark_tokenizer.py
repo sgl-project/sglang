@@ -12,7 +12,6 @@ def parse_args():
     )
     parser.add_argument(
         "--tokenizer",
-        "-t",
         type=str,
         required=True,
         help="Tokenizer name or path (e.g. nvidia/Kimi-K2-Thinking-NVFP4)",
