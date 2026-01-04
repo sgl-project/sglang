@@ -5,17 +5,24 @@ Support attention backend for TRTLLM MHA kernels from flashinfer.
 The kernel supports sm100 only, with sliding window and attention sink features.
 """
 
+import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.flashinfer_backend import (
     FlashInferAttnBackend,
     FlashInferMultiStepDraftBackend,
 )
+from sglang.srt.layers.attention.triton_ops.trtllm_fp8_kv_kernel import (
+    fused_fp8_set_kv_buffer,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.utils import is_flashinfer_available
+
+logger = logging.getLogger(__name__)
 
 if is_flashinfer_available():
     import flashinfer
@@ -26,9 +33,9 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.spec_info import SpecInput
 
 # Constants
-DEFAULT_WORKSPACE_SIZE_MB = (
-    512  # Memory workspace size in MB, todo(Yingyi): read from config
-)
+# Default workspace size in MB for TRTLLM MHA
+# Can be configured via SGLANG_FLASHINFER_WORKSPACE_SIZE environment variable
+DEFAULT_WORKSPACE_SIZE_MB = 512
 
 # Reuse this workspace buffer across all TRTLLM MHA wrappers
 global_zero_init_workspace_buffer = None
@@ -61,6 +68,15 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         kv_last_page_len_buf: Optional[torch.Tensor] = None,
         speculative_step_id: int = 0,
     ):
+        # Capture workspace size before super().__init__() to preserve user's
+        # SGLANG_FLASHINFER_WORKSPACE_SIZE setting (may be overridden by parent)
+        env_var = envs.SGLANG_FLASHINFER_WORKSPACE_SIZE
+        workspace_size_bytes = (
+            env_var.get()
+            if env_var.is_set()
+            else DEFAULT_WORKSPACE_SIZE_MB * 1024 * 1024
+        )
+
         super().__init__(
             model_runner, skip_prefill, kv_indptr_buf, kv_last_page_len_buf
         )
@@ -79,7 +95,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         self.device = model_runner.device
 
         # Workspace allocation
-        self.workspace_size = DEFAULT_WORKSPACE_SIZE_MB * 1024 * 1024
+        self.workspace_size = workspace_size_bytes
         # Allocate buffers
         global global_zero_init_workspace_buffer
         if global_zero_init_workspace_buffer is None:
@@ -411,6 +427,36 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         """Get the fill value for sequence lengths in CUDA graph."""
         return 1
 
+    def _should_use_fused_fp8_path(self, save_kv_cache: bool, k: torch.Tensor) -> bool:
+        """Check if we should use the fused FP8 KV cache write path."""
+        return save_kv_cache and k is not None and self.data_type == torch.float8_e4m3fn
+
+    def _fused_fp8_set_kv_buffer(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        **kwargs,
+    ):
+        """Fused FP8 quantization and KV cache write."""
+        cache_loc = forward_batch.out_cache_loc
+
+        # Get K/V cache buffers from token_to_kv_pool
+        k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+
+        fused_fp8_set_kv_buffer(
+            k=k,
+            v=v,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            cache_loc=cache_loc,
+            k_scale=layer.k_scale,  # May be None
+            v_scale=layer.v_scale,  # May be None
+            page_size=self.page_size,
+        )
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Initialize the metadata for a forward pass."""
 
@@ -493,7 +539,12 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 forward_batch.extend_prefix_lens_cpu
             ) or forward_batch.forward_mode.is_draft_extend(include_v2=True):
                 extend_seq_lens = forward_batch.extend_seq_lens
-                metadata.max_seq_len_q = max(forward_batch.extend_seq_lens_cpu)
+                # NOTE: in piecewise CUDA graph warmup, extend_seq_lens_cpu is a torch.Tensor;
+                # Python's max() returns a 0-d tensor, but flashinfer expects an int.
+                max_q = max(forward_batch.extend_seq_lens_cpu)
+                metadata.max_seq_len_q = (
+                    int(max_q.item()) if isinstance(max_q, torch.Tensor) else int(max_q)
+                )
                 metadata.cu_seqlens_q = torch.nn.functional.pad(
                     torch.cumsum(extend_seq_lens, dim=0, dtype=torch.int32), (1, 0)
                 )
@@ -524,10 +575,26 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
     ) -> torch.Tensor:
         """Run forward for decode using TRTLLM MHA kernel."""
         cache_loc = forward_batch.out_cache_loc
-        if save_kv_cache and k is not None:
-            forward_batch.token_to_kv_pool.set_kv_buffer(
-                layer, cache_loc, k, v, layer.k_scale, layer.v_scale
+
+        use_fused_fp8_path = self._should_use_fused_fp8_path(save_kv_cache, k)
+
+        if use_fused_fp8_path:
+            # Use fused FP8 quantization + KV cache write path
+            self._fused_fp8_set_kv_buffer(
+                q=q,
+                k=k,
+                v=v,
+                layer=layer,
+                forward_batch=forward_batch,
             )
+            k = None
+            v = None
+        else:
+            # Use original set_kv_buffer path
+            if save_kv_cache and k is not None:
+                forward_batch.token_to_kv_pool.set_kv_buffer(
+                    layer, cache_loc, k, v, layer.k_scale, layer.v_scale
+                )
 
         if self.data_type == torch.float8_e4m3fn:
             q = q.to(torch.float8_e4m3fn)
@@ -585,10 +652,26 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         **kwargs,
     ):
         cache_loc = forward_batch.out_cache_loc
-        if save_kv_cache and k is not None:
-            forward_batch.token_to_kv_pool.set_kv_buffer(
-                layer, cache_loc, k, v, layer.k_scale, layer.v_scale
+
+        use_fused_fp8_path = self._should_use_fused_fp8_path(save_kv_cache, k)
+
+        if use_fused_fp8_path:
+            # Use fused FP8 quantization + KV cache write path
+            self._fused_fp8_set_kv_buffer(
+                q=q,
+                k=k,
+                v=v,
+                layer=layer,
+                forward_batch=forward_batch,
             )
+            k = None
+            v = None
+        else:
+            # Use original set_kv_buffer path
+            if save_kv_cache and k is not None:
+                forward_batch.token_to_kv_pool.set_kv_buffer(
+                    layer, cache_loc, k, v, layer.k_scale, layer.v_scale
+                )
 
         if self.data_type == torch.float8_e4m3fn:
             q = q.to(torch.float8_e4m3fn)
