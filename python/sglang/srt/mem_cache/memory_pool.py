@@ -281,11 +281,6 @@ class MambaPool:
             self.mamba_cache.conv[i][:, select_index] = 0
         self.mamba_cache.temporal[:, select_index] = 0
 
-        # fill allocated slots with zeros
-        for i in range(len(self.mamba_cache.conv)):
-            self.mamba_cache.conv[i][:, select_index] = 0
-        self.mamba_cache.temporal[:, select_index] = 0
-
         return select_index
 
     def free(self, free_index: torch.Tensor):
