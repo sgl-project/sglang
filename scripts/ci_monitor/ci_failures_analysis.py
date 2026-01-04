@@ -154,12 +154,21 @@ class SGLangFailuresAnalyzer:
         """
         print("Fetching self-hosted runner status...")
         try:
+            # Use separate admin token if available (needs repo admin scope)
+            runner_token = os.environ.get("GH_PAT_FOR_RUNNER_ADMIN") or self.token
+            runner_headers = {
+                "Authorization": f"token {runner_token}",
+                "Accept": "application/vnd.github.v3+json",
+            }
+
             all_runners = []
             url = f"{self.base_url}/repos/{self.repo}/actions/runners"
             params = {"per_page": 100}
 
             while url:
-                response = self.session.get(url, params=params, timeout=30)
+                response = requests.get(
+                    url, headers=runner_headers, params=params, timeout=30
+                )
                 if response.status_code != 200:
                     print(
                         f"  Warning: Runner API returned {response.status_code}: {response.text[:200]}"
