@@ -268,7 +268,7 @@ class DiffGenerator:
         log_batch_completion(logger, len(results), total_gen_time)
 
         if results:
-            if self.server_args.enable_warmup:
+            if self.server_args.warmup:
                 total_duration_ms = results[0]["timings"]["total_duration_ms"]
                 logger.info(
                     f"Warmed-up request processed in {GREEN}%.2f{RESET} seconds (with warmup excluded)",

@@ -206,7 +206,10 @@ class ServerArgs:
 
     # Compilation
     enable_torch_compile: bool = False
-    enable_warmup: bool = False
+
+    # warmup
+    warmup: bool = False
+    warmup_resolutions: list[str] = None
 
     disable_autocast: bool | None = None
 
@@ -290,6 +293,15 @@ class ServerArgs:
 
         if self.attention_backend in ["fa3", "fa4"]:
             self.attention_backend = "fa"
+
+        # handle warmup
+        if self.warmup_resolutions is not None:
+            self.warmup = True
+
+        if self.warmup:
+            logger.info(
+                "Warmup enabled, the launch time is expected to be longer than usual"
+            )
 
         # network initialization: port and host
         self.port = self.settle_port(self.port)
@@ -457,14 +469,24 @@ class ServerArgs:
             help="Use torch.compile to speed up DiT inference."
             + "However, will likely cause precision drifts. See (https://github.com/pytorch/pytorch/issues/145213)",
         )
+
+        # warmup
         parser.add_argument(
-            "--enable-warmup",
+            "--warmup",
             action=StoreBoolean,
-            default=ServerArgs.enable_warmup,
-            help="Perform a 1-step end-to-end warmup request before the actual request. "
+            default=ServerArgs.warmup,
+            help="Perform some warmup after server starts (if `--warmup-resolutions` is specified) or before processing the first request (if `--warmup-resolutions` is not specified)."
             "Recommended to enable when benchmarking to ensure fair comparison and best performance."
-            "When enabled, look for the line ending with `with warmup excluded` for actual processing time.",
+            "When enabled with `--warmup-resolutions` unspecified, look for the line ending with `(with warmup excluded)` for actual processing time.",
         )
+        parser.add_argument(
+            "--warmup-resolutions",
+            type=str,
+            nargs="+",
+            default=ServerArgs.warmup_resolutions,
+            help="Specify resolutions for server to warmup. e.g., `--warmup-resolutions 256x256, 720x720`",
+        )
+
         parser.add_argument(
             "--dit-cpu-offload",
             action=StoreBoolean,
