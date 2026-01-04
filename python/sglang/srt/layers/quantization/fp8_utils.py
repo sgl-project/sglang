@@ -1041,7 +1041,9 @@ def apply_fp8_linear(
             return _process_scaled_mm_output(output, input_2d.shape, output_shape)
 
     if per_tensor_weights and per_tensor_activations:
-        # Fused GEMM_DQ
+        # Fused GEMM_DQ; _scaled_mm with torch.compile requires len(weight_scale.shape) == len(x_scale.shape)
+        if weight_scale.ndim == 0 and x_scale.ndim == 1:
+            weight_scale = weight_scale.unsqueeze(0)
         output = torch._scaled_mm(
             qinput,
             weight,
