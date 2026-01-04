@@ -682,7 +682,7 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
         )
 
         # For type checking
-        
+
         self.cnt = 0
         self.__post_init__()
 
@@ -711,7 +711,9 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
         **kwargs,
     ) -> torch.Tensor:
         forward_batch = get_forward_context().forward_batch
-        self.enable_teacache = forward_batch is not None and forward_batch.enable_teacache
+        self.enable_teacache = (
+            forward_batch is not None and forward_batch.enable_teacache
+        )
 
         orig_dtype = hidden_states.dtype
         if not isinstance(encoder_hidden_states, torch.Tensor):
@@ -875,7 +877,6 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
         temb = kwargs["temb"]
         modulated_inp = timestep_proj if use_ret_steps else temb
 
-        
         self.is_cfg_negative = ctx.is_cfg_negative
 
         # Wan uses ret_steps/cutoff_steps for boundary detection
@@ -889,7 +890,6 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
             teacache_thresh=ctx.teacache_thresh,
         )
 
-        
         if self.is_cfg_negative:
             self.previous_modulated_input_negative = modulated_inp.clone()
         else:

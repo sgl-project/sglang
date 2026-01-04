@@ -125,13 +125,15 @@ class CachableDiT(BaseDiT):
         self.cnt = 0
         self.enable_teacache = True
         # Flag indicating if this model supports CFG cache separation
-        self._supports_cfg_cache = self.config.prefix.lower() in self._CFG_SUPPORTED_PREFIXES
+        self._supports_cfg_cache = (
+            self.config.prefix.lower() in self._CFG_SUPPORTED_PREFIXES
+        )
 
         # Always initialize positive cache fields (used in all modes)
         self.previous_modulated_input: torch.Tensor | None = None
         self.previous_residual: torch.Tensor | None = None
         self.accumulated_rel_l1_distance: float = 0.0
-        
+
         self.is_cfg_negative = False
         # CFG-specific fields initialized to None (created when CFG is used)
         # These are only used when _supports_cfg_cache is True AND do_cfg is True
@@ -140,11 +142,6 @@ class CachableDiT(BaseDiT):
             self.previous_residual_negative: torch.Tensor | None = None
             self.accumulated_rel_l1_distance_negative: float = 0.0
         # Current branch marker (for maybe_cache_states / retrieve_cached_states)
-        
-
-
-       
-            
 
     def reset_teacache_state(self) -> None:
         """Reset all TeaCache state at the start of each generation task."""
@@ -163,12 +160,6 @@ class CachableDiT(BaseDiT):
             self.previous_modulated_input_negative = None
             self.previous_residual_negative = None
             self.accumulated_rel_l1_distance_negative = 0.0
-
-        
-
-       
-
-      
 
     def _compute_l1_and_decide(
         self,
@@ -190,18 +181,25 @@ class CachableDiT(BaseDiT):
             should_calc: True if forward computation is needed, False to use cache
         """
 
-       
         # Compute relative L1 distance
-        prev_modulated_inp = self.previous_modulated_input_negative if self.is_cfg_negative else self.previous_modulated_input
+        prev_modulated_inp = (
+            self.previous_modulated_input_negative
+            if self.is_cfg_negative
+            else self.previous_modulated_input
+        )
         diff = modulated_inp - prev_modulated_inp
         rel_l1 = (diff.abs().mean() / prev_modulated_inp.abs().mean()).cpu().item()
 
         # Apply polynomial rescaling
         rescale_func = np.poly1d(coefficients)
-        
-        accumulated_rel_l1_distance = self.accumulated_rel_l1_distance_negative if self.is_cfg_negative else self.accumulated_rel_l1_distance
+
+        accumulated_rel_l1_distance = (
+            self.accumulated_rel_l1_distance_negative
+            if self.is_cfg_negative
+            else self.accumulated_rel_l1_distance
+        )
         accumulated_rel_l1_distance = accumulated_rel_l1_distance + rescale_func(rel_l1)
-        
+
         should_calc = accumulated_rel_l1_distance >= teacache_thresh
         if not should_calc:
             if not self.is_cfg_negative:
@@ -214,7 +212,7 @@ class CachableDiT(BaseDiT):
             else:
                 self.accumulated_rel_l1_distance_negative = 0
         return should_calc
-        
+
     def _compute_teacache_decision(
         self,
         modulated_inp: torch.Tensor,
@@ -243,7 +241,7 @@ class CachableDiT(BaseDiT):
             if not self.is_cfg_negative:
                 self.accumulated_rel_l1_distance = 0.0
                 self.previous_modulated_input = modulated_inp.clone()
-            elif self._supports_cfg_cache :
+            elif self._supports_cfg_cache:
                 self.accumulated_rel_l1_distance_negative = 0.0
                 self.previous_modulated_input_negative = modulated_inp.clone()
             return True
@@ -252,10 +250,7 @@ class CachableDiT(BaseDiT):
             coefficients=coefficients,
             teacache_thresh=teacache_thresh,
         )
-        
-      
 
-    
     def _get_teacache_context(self) -> TeaCacheContext | None:
         """
         Check TeaCache preconditions and extract common context.
