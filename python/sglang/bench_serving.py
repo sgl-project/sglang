@@ -38,8 +38,10 @@ import aiohttp
 import numpy as np
 import pybase64
 import requests
-from datasets import load_dataset
+from datasets import config, load_dataset
+from datasets.exceptions import NonMatchingSplitsSizesError
 from PIL import Image
+from requests.exceptions import RequestException
 from tqdm.asyncio import tqdm
 from transformers import (
     AutoProcessor,
@@ -1126,20 +1128,36 @@ def sample_mmmu_requests(
 
     max_retries = 3
     retry_delay = 3
+    mmmu_cache_dir = Path(config.HF_DATASETS_CACHE) / "sglang_bench_mmmu"
     for attempt in range(max_retries):
         try:
             print(
                 f"Attempting to load MMMU Math dataset (attempt {attempt + 1}/{max_retries})..."
             )
             download_mode = "force_redownload" if attempt > 0 else None
+            if attempt > 0:
+                # Corrupted / partially-downloaded local cache is a common root cause of
+                # NonMatchingSplitsSizesError. Clear the MMMU cache before re-downloading.
+                try:
+                    shutil.rmtree(mmmu_cache_dir, ignore_errors=True)
+                    mmmu_cache_dir.mkdir(parents=True, exist_ok=True)
+                except OSError as e:
+                    # If cache cleanup fails, still proceed with force_redownload.
+                    print(
+                        f"Warning: failed to clear MMMU cache dir {mmmu_cache_dir}: {e}"
+                    )
             mmmu_dataset = load_dataset(
-                "MMMU/MMMU", "Math", split="test", download_mode=download_mode
+                "MMMU/MMMU",
+                "Math",
+                split="test",
+                download_mode=download_mode,
+                cache_dir=str(mmmu_cache_dir),
             )
             print(
                 f"Successfully loaded MMMU Math dataset from HuggingFace with {len(mmmu_dataset)} examples"
             )
             break
-        except Exception as e:
+        except (NonMatchingSplitsSizesError, RequestException, OSError, EOFError) as e:
             print(f"Failed to load MMMU Math dataset on attempt {attempt + 1}: {e}")
             if attempt < max_retries - 1:
                 print(f"Retrying in {retry_delay} seconds...")
@@ -1149,6 +1167,8 @@ def sample_mmmu_requests(
                 raise ValueError(
                     f"Failed to load MMMU dataset after {max_retries} attempts"
                 ) from e
+        except Exception:
+            raise
 
     # Sample from the dataset
     if len(mmmu_dataset) > num_requests:
