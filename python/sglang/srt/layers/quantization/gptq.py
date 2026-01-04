@@ -7,6 +7,9 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Union
 
 import torch
 
+from sglang.srt.hardware_backend.npu.quantization.fused_moe_method_npu import (
+    npu_fused_experts,
+)
 from sglang.srt.layers.moe import (
     MoeRunner,
     MoeRunnerBackend,
@@ -49,13 +52,8 @@ from sglang.srt.layers.quantization.utils import (
     replace_parameter,
     unpack_cols,
 )
-
-from sglang.srt.utils.patch_torch import register_fake_if_exists
-
-from sglang.srt.hardware_backend.npu.quantization.fused_moe_method_npu import (
-    npu_fused_experts,
-)
 from sglang.srt.utils import is_cuda, is_npu, set_weight_attrs
+from sglang.srt.utils.patch_torch import register_fake_if_exists
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
@@ -232,8 +230,8 @@ class GPTQConfig(QuantizationConfig):
         self, layer: torch.nn.Module, prefix: str
     ) -> Optional[LinearMethodBase]:
         # Delay the import to avoid circular dependency
-        from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
         from sglang.srt.layers.linear import LinearBase
+        from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 
         if _is_npu:
             if isinstance(layer, FusedMoE):
@@ -594,6 +592,7 @@ class GPTQLinearMethod(LinearMethodBase):
             output.add_(bias)
         return output.reshape(out_shape)
 
+
 def unpack_from_int32(
     weight: torch.Tensor,
     num_bits: int,
@@ -613,7 +612,7 @@ def unpack_from_int32(
     assert (
         num_bits <= 8
     ), f"Expecting `num_bits` should not be larger than 8 but got {num_bits}."
-    
+
     pack_factor = 32 // num_bits
     mask = (1 << num_bits) - 1
 
@@ -636,6 +635,7 @@ def unpack_from_int32(
     offset = pow(2, num_bits) // 2
     unpacked_weight = (unpacked_weight - offset).to(torch.int8)
     return unpacked_weight
+
 
 class GPTQLinearAscendMethod(GPTQLinearMethod):
     """Linear method for GPTQ on Ascend NPU."""
@@ -728,6 +728,7 @@ class GPTQLinearAscendMethod(GPTQLinearMethod):
 
         return out.reshape(out_shape)
 
+
 class GPTQMoEAscendMethod(FusedMoEMethodBase):
 
     def __init__(self, quant_config: GPTQConfig, use_v2_format: bool = True):
@@ -750,7 +751,7 @@ class GPTQMoEAscendMethod(FusedMoEMethodBase):
         pack_factor = self.quant_config.pack_factor
 
         num_groups_w13 = hidden_size // self.quant_config.group_size
-        num_groups_w2 = intermediate_size_per_partition // self.quant_config.group_size        
+        num_groups_w2 = intermediate_size_per_partition // self.quant_config.group_size
 
         extra_weight_attrs.update(
             {
@@ -840,82 +841,108 @@ class GPTQMoEAscendMethod(FusedMoEMethodBase):
         self.moe_runner_config = moe_runner_config
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        w13_qzeros_2d = layer.w13_qzeros.data.contiguous().reshape(-1, layer.w13_qzeros.shape[-1])
+        w13_qzeros_2d = layer.w13_qzeros.data.contiguous().reshape(
+            -1, layer.w13_qzeros.shape[-1]
+        )
         layer.w13_qzeros = torch.nn.Parameter(
             unpack_from_int32(
                 w13_qzeros_2d,
                 self.quant_config.weight_bits,
                 packed_dim=1,
-            ).reshape(layer.w13_qzeros.shape[0], layer.w13_qzeros.shape[1], -1).to(layer.w13_scales.dtype),
+            )
+            .reshape(layer.w13_qzeros.shape[0], layer.w13_qzeros.shape[1], -1)
+            .to(layer.w13_scales.dtype),
             requires_grad=False,
         )
         if not self.use_v2_format:
             layer.w13_qzeros += 1
 
-        w2_qzeros_2d = layer.w2_qzeros.data.contiguous().reshape(-1, layer.w2_qzeros.shape[-1])
+        w2_qzeros_2d = layer.w2_qzeros.data.contiguous().reshape(
+            -1, layer.w2_qzeros.shape[-1]
+        )
         layer.w2_qzeros = torch.nn.Parameter(
             unpack_from_int32(
                 w2_qzeros_2d,
                 self.quant_config.weight_bits,
                 packed_dim=1,
-            ).reshape(layer.w2_qzeros.shape[0], layer.w2_qzeros.shape[1], -1).to(layer.w2_scales.dtype),
+            )
+            .reshape(layer.w2_qzeros.shape[0], layer.w2_qzeros.shape[1], -1)
+            .to(layer.w2_scales.dtype),
             requires_grad=False,
         )
         if not self.use_v2_format:
-            layer.w2_qzeros += 1   
+            layer.w2_qzeros += 1
 
-        w13_qweight_2d = layer.w13_qweight.data.transpose(-1, -2).contiguous().reshape(-1, layer.w13_qweight.shape[-2])
+        w13_qweight_2d = (
+            layer.w13_qweight.data.transpose(-1, -2)
+            .contiguous()
+            .reshape(-1, layer.w13_qweight.shape[-2])
+        )
         w13_qweight_tmp = unpack_from_int32(
-            w13_qweight_2d, 
-            self.quant_config.weight_bits, 
-            packed_dim=1
+            w13_qweight_2d, self.quant_config.weight_bits, packed_dim=1
         )
         # use int8 to store weight by default
         if self.quant_config.weight_bits != 4:
             layer.w13_qweight = torch.nn.Parameter(
-                w13_qweight_tmp.reshape(layer.w13_qweight.shape[0], layer.w13_qweight.shape[2], -1).transpose(-1, -2).contiguous(),
+                w13_qweight_tmp.reshape(
+                    layer.w13_qweight.shape[0], layer.w13_qweight.shape[2], -1
+                )
+                .transpose(-1, -2)
+                .contiguous(),
                 requires_grad=False,
             )
             return
-        
+
         layer.w13_qweight = torch.nn.Parameter(
             torch_npu.npu_convert_weight_to_int4pack(
-                w13_qweight_tmp.reshape(layer.w13_qweight.shape[0], layer.w13_qweight.shape[2], -1)
+                w13_qweight_tmp.reshape(
+                    layer.w13_qweight.shape[0], layer.w13_qweight.shape[2], -1
+                )
                 .transpose(-1, -2)
                 .contiguous()
                 .reshape(-1, layer.w13_qweight.shape[2])
-                .to(torch.int32))
+                .to(torch.int32)
+            )
             .reshape(layer.w13_qweight.shape[0], layer.w13_qweight.shape[1] * 8, -1)
             .contiguous(),
             requires_grad=False,
         )
-        
-        w2_qweight_2d = layer.w2_qweight.data.transpose(-1, -2).contiguous().reshape(-1, layer.w2_qweight.shape[-2])
+
+        w2_qweight_2d = (
+            layer.w2_qweight.data.transpose(-1, -2)
+            .contiguous()
+            .reshape(-1, layer.w2_qweight.shape[-2])
+        )
         w2_qweight_tmp = unpack_from_int32(
-            w2_qweight_2d, 
-            self.quant_config.weight_bits, 
-            packed_dim=1
+            w2_qweight_2d, self.quant_config.weight_bits, packed_dim=1
         )
         # use int8 to store weight by default
         if self.quant_config.weight_bits != 4:
             layer.w2_qweight = torch.nn.Parameter(
-                w2_qweight_tmp.reshape(layer.w2_qweight.shape[0], layer.w2_qweight.shape[2], -1).transpose(-1, -2).contiguous(),
+                w2_qweight_tmp.reshape(
+                    layer.w2_qweight.shape[0], layer.w2_qweight.shape[2], -1
+                )
+                .transpose(-1, -2)
+                .contiguous(),
                 requires_grad=False,
             )
             return
-        
+
         layer.w2_qweight = torch.nn.Parameter(
             torch_npu.npu_convert_weight_to_int4pack(
-                w2_qweight_tmp.reshape(layer.w2_qweight.shape[0], layer.w2_qweight.shape[2], -1)
+                w2_qweight_tmp.reshape(
+                    layer.w2_qweight.shape[0], layer.w2_qweight.shape[2], -1
+                )
                 .transpose(-1, -2)
                 .contiguous()
                 .reshape(-1, layer.w2_qweight.shape[2])
-                .to(torch.int32))
+                .to(torch.int32)
+            )
             .reshape(layer.w2_qweight.shape[0], layer.w2_qweight.shape[1] * 8, -1)
             .contiguous(),
             requires_grad=False,
         )
-        
+
     def apply(
         self,
         layer: torch.nn.Module,
@@ -954,6 +981,7 @@ class GPTQMoEAscendMethod(FusedMoEMethodBase):
         )
 
         return StandardCombineInput(hidden_states=output)
+
 
 class GPTQMarlinLinearMethod(LinearMethodBase):
     """Linear method for GPTQ Marlin.
