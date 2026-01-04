@@ -1,5 +1,4 @@
 import asyncio
-import concurrent
 import concurrent.futures
 import ctypes
 import logging
@@ -44,7 +43,6 @@ from sglang.srt.utils import (
     load_audio,
     load_image,
     load_video,
-    logger,
     random_uuid,
 )
 
