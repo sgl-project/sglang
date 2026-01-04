@@ -55,6 +55,5 @@ class AvgBatchSizeRecorder(MetricRecorder):
         self._num_steps += 1
 
     def get_summary(self) -> Dict[str, Any]:
-        if self._num_steps == 0:
-            return {"avg_batch_size": 0.0}
-        return {"avg_batch_size": self._total_running / self._num_steps}
+        avg = self._total_running / self._num_steps if self._num_steps else 0.0
+        return {"avg_batch_size": avg}
