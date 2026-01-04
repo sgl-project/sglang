@@ -2037,7 +2037,6 @@ class Scheduler(
                     continue
 
             req.init_next_round_input(self.tree_cache)
-            print(f"hi [{torch.distributed.get_rank()}] going to call adder.add_one_req")
             res = adder.add_one_req(
                 req,
                 has_chunked_req=(self.chunked_req is not None),
