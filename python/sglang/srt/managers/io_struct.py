@@ -202,6 +202,8 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
     return_hidden_states: Union[List[bool], bool] = False
     # Whether to return captured routed experts
     return_routed_experts: bool = False
+    # Whether to return top-k attention tokens for interpretability
+    return_attention_tokens: Union[List[bool], bool] = False
 
     # The modalities of the image data [image, multi-images, video]
     modalities: Optional[List[str]] = None
@@ -672,6 +674,11 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
             return_bytes=self.return_bytes,
             return_entropy=self.return_entropy,
             external_trace_header=self.external_trace_header,
+            return_attention_tokens=(
+                self.return_attention_tokens[i]
+                if isinstance(self.return_attention_tokens, list)
+                else self.return_attention_tokens
+            ),
             http_worker_ipc=self.http_worker_ipc,
             **{
                 field: getattr(self, field)
@@ -754,6 +761,9 @@ class TokenizedGenerateReqInput(BaseReq):
 
     need_wait_for_image: bool = False
     num_items_assigned: Optional[List] = None
+
+    # Whether to return top-k attention tokens for interpretability
+    return_attention_tokens: bool = False
 
 
 @dataclass
@@ -985,6 +995,9 @@ class BatchTokenIDOutput(
     # Number of times each request was retracted.
     retraction_counts: List[int]
 
+    # Attention token info for interpretability (top-k positions and scores per token)
+    output_attention_tokens: Optional[List[List[Dict]]] = None
+
     # The trainer step id. Used to know which step's weights are used for sampling.
     token_steps: List[List[int]] = None
 
@@ -1071,6 +1084,9 @@ class BatchStrOutput(
 
     # Number of times each request was retracted.
     retraction_counts: List[int]
+
+    # Attention token info for interpretability (top-k positions and scores per token)
+    output_attention_tokens: Optional[List[List[Dict]]] = None
 
     # The trainer step id. Used to know which step's weights are used for sampling.
     token_steps: List[List[int]] = None

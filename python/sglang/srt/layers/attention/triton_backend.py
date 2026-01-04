@@ -1029,7 +1029,61 @@ class TritonAttnBackend(AttentionBackend):
             sinks=sinks,
             xai_temperature_len=layer.xai_temperature_len,
         )
+
+        # Compute top-k attention tokens for interpretability
+        # This overwrites on each layer, so we end up with the last attention layer
+        # For hybrid models (e.g., Qwen3-Next), only Gated Attention layers reach here
+        if forward_batch.capture_attention_tokens:
+            self._compute_attention_token_info(
+                q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+                forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
+                kv_indptr,
+                kv_indices,
+                layer.scaling,
+                forward_batch,
+                layer.layer_id,
+            )
+
         return o
+
+    def _compute_attention_token_info(
+        self,
+        q: torch.Tensor,
+        k_buffer: torch.Tensor,
+        kv_indptr: torch.Tensor,
+        kv_indices: torch.Tensor,
+        sm_scale: float,
+        forward_batch,
+        layer_id: int,
+    ):
+        """Compute top-k attention tokens for interpretability."""
+        from sglang.srt.layers.attention.triton_ops.topk_attention import (
+            compute_topk_attention_tokens,
+        )
+        from sglang.srt.model_executor.forward_batch_info import AttentionTokenInfo
+
+        try:
+            topk_scores, topk_indices = compute_topk_attention_tokens(
+                q,
+                k_buffer,
+                kv_indptr,
+                kv_indices,
+                sm_scale,
+                top_k=forward_batch.attention_top_k,
+            )
+
+            forward_batch.attention_token_info = AttentionTokenInfo(
+                token_positions=topk_indices,
+                attention_scores=topk_scores,
+                layer_id=layer_id,
+            )
+        except Exception as e:
+            # Don't let attention capture errors break inference
+            import logging
+            import traceback
+            logging.getLogger(__name__).warning(
+                f"Failed to compute attention tokens: {e}\n{traceback.format_exc()}"
+            )
 
 
 class TritonMultiStepDraftBackend:

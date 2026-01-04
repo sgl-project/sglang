@@ -598,6 +598,10 @@ class ServerArgs:
     debug_tensor_dump_input_file: Optional[str] = None
     debug_tensor_dump_inject: bool = False
 
+    # Attention token capture (for interpretability/visualization)
+    return_attention_tokens: bool = False
+    attention_tokens_top_k: int = 5
+
     # PD disaggregation: can be "null" (not disaggregated), "prefill" (prefill-only), or "decode" (decode-only)
     disaggregation_mode: Literal["null", "prefill", "decode"] = "null"
     disaggregation_transfer_backend: str = "mooncake"
@@ -4319,6 +4323,20 @@ class ServerArgs:
             type=str,
             default=ServerArgs.debug_tensor_dump_inject,
             help="Inject the outputs from jax as the input of every layer.",
+        )
+
+        # Attention token capture (for interpretability/visualization)
+        parser.add_argument(
+            "--return-attention-tokens",
+            action="store_true",
+            default=ServerArgs.return_attention_tokens,
+            help="Enable returning top-k attention tokens per generated token for interpretability.",
+        )
+        parser.add_argument(
+            "--attention-tokens-top-k",
+            type=int,
+            default=ServerArgs.attention_tokens_top_k,
+            help="Number of top attention tokens to return per generated token (default: 5).",
         )
 
         # PD disaggregation

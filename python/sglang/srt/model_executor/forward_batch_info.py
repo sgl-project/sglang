@@ -229,6 +229,18 @@ def compute_local_num_token_non_padded(
 
 
 @dataclass
+class AttentionTokenInfo:
+    """Container for top-k attention token information for interpretability."""
+
+    # Top-k token positions with highest attention scores [batch, top_k]
+    token_positions: torch.Tensor
+    # Corresponding normalized attention scores [batch, top_k]
+    attention_scores: torch.Tensor
+    # Which layer this came from (-1 = aggregated across layers)
+    layer_id: int = -1
+
+
+@dataclass
 class ForwardBatch:
     """Store all inputs of a forward pass."""
 
@@ -400,6 +412,11 @@ class ForwardBatch:
     # For hidden states before normal
     return_hidden_states_before_norm: bool = False
 
+    # For attention token capture (interpretability/visualization)
+    capture_attention_tokens: bool = False
+    attention_top_k: int = 5
+    attention_token_info: Optional[AttentionTokenInfo] = None
+
     @classmethod
     def init_new(
         cls,
@@ -544,6 +561,11 @@ class ForwardBatch:
         # Init lora information
         if model_runner.server_args.enable_lora:
             model_runner.lora_manager.prepare_lora_batch(ret)
+
+        # Init attention token capture
+        if model_runner.server_args.return_attention_tokens:
+            ret.capture_attention_tokens = True
+            ret.attention_top_k = model_runner.server_args.attention_tokens_top_k
 
         return ret
 
