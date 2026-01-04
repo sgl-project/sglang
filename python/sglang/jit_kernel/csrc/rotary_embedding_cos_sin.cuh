@@ -812,8 +812,10 @@ inline void launch_rotary(
 
   // Verify q first to establish device/dtype
   // q: [T, Hq, D]
-  TensorMatcher q_matcher = TensorMatcher();
-  q_matcher.with_dtype<float, half, nv_bfloat16>(dtype).with_device<kDLCUDA>(device).verify(q);
+  TensorMatcher()
+      .with_dtype<float, half, nv_bfloat16>(dtype)
+      .with_device<kDLCUDA>(device)
+      .verify(q);
 
   if (q.ndim() != 3) {
     host::Panic("q must be 3D [T, Hq, D]");
@@ -825,8 +827,11 @@ inline void launch_rotary(
   // Verify cos/sin
   // cos: [T_cache, R]
   // sin: [T_cache, R]
-  TensorMatcher c_matcher = TensorMatcher();
-  c_matcher.with_dtype(dtype).with_device(device).verify(cos).verify(sin);
+  TensorMatcher()
+      .with_dtype<float, half, nv_bfloat16>(dtype)
+      .with_device<kDLCUDA>(device)
+      .verify(cos)
+      .verify(sin);
   if (cos.ndim() != 2 || sin.ndim() != 2) {
     host::Panic("cos/sin must be 2D");
   }
@@ -838,8 +843,10 @@ inline void launch_rotary(
   // Handle positions
   const int64_t* positions_ptr = nullptr;
   if (positions != nullptr) {
-    TensorMatcher p_matcher = TensorMatcher();
-    p_matcher.with_dtype<int64_t>().with_device(device).verify(*positions);
+    TensorMatcher()
+        .with_dtype<int64_t>()
+        .with_device<kDLCUDA>(device)
+        .verify(*positions);
     if (positions->ndim() != 1 || positions->size(0) != t) {
       host::Panic("positions must be 1D [T]");
     }
@@ -877,8 +884,10 @@ inline void launch_rotary(
   int hk = 0;
   if (k != nullptr) {
     // k: [T, Hk, D]
-    TensorMatcher k_matcher = TensorMatcher();
-    k_matcher.with_dtype(dtype).with_device(device).verify(*k);
+    TensorMatcher()
+        .with_dtype<float, half, nv_bfloat16>(dtype)
+        .with_device<kDLCUDA>(device)
+        .verify(*k);
     if (k->ndim() != 3 || k->size(0) != t || k->size(2) != d) {
       host::Panic("key shape mismatch");
     }
@@ -966,110 +975,6 @@ inline void launch_rotary(
       blocks_per_token);
 
   RuntimeDeviceCheck();
-}
-const int embed_dim_for_rotation = interleaved ? (int)r : (int)(r / 2);
-RuntimeCheck(embed_dim_for_rotation > 0, "embed_dim_for_rotation must be > 0");
-if constexpr (ROT > 0) {
-  RuntimeCheck(
-      embed_dim_for_rotation == ROT,
-      "embed_dim_for_rotation mismatch: got ",
-      embed_dim_for_rotation,
-      " expected ROT=",
-      ROT);
-}
-RuntimeCheck(2LL * embed_dim_for_rotation <= head_size, "rotate dim exceeds head_size");
-
-const int64_t query_token_stride = hq * d;
-const int64_t head_stride_query = d;
-
-int64_t key_token_stride = 0;
-int64_t head_stride_key = d;
-int hk = 0;
-if (k != nullptr) {
-  TensorMatcher({T, Hk, D}).with_dtype<float, half, nv_bfloat16>(dtype).with_device<kDLCUDA>(device).verify(*k);
-  hk = (int)Hk.unwrap();
-  RuntimeCheck(hk > 0, "invalid key shape");
-  key_token_stride = (int64_t)hk * d;
-}
-
-const int max_pairs_to_rotate_per_token =
-    (k == nullptr) ? ((int)hq * embed_dim_for_rotation)
-                   : std::max((int)hq * embed_dim_for_rotation, (int)hk* embed_dim_for_rotation);
-
-constexpr int kVecBytes = 16;
-const int elem_bytes = (int)sizeof(scalar_t);
-const int kElePerVec = kVecBytes / elem_bytes;
-const int pairs_per_step = interleaved ? (kElePerVec / 2) : kElePerVec;
-
-bool can_vec_compute = true;
-if ((embed_dim_for_rotation % pairs_per_step) != 0) can_vec_compute = false;
-if ((reinterpret_cast<uintptr_t>(cos.data_ptr()) % kVecBytes) != 0) can_vec_compute = false;
-if ((reinterpret_cast<uintptr_t>(sin.data_ptr()) % kVecBytes) != 0) can_vec_compute = false;
-if (((r * elem_bytes) % kVecBytes) != 0) can_vec_compute = false;
-
-bool qk_aligned16 = true;
-if ((reinterpret_cast<uintptr_t>(q.data_ptr()) % kVecBytes) != 0) qk_aligned16 = false;
-if (((query_token_stride * elem_bytes) % kVecBytes) != 0) qk_aligned16 = false;
-if (((head_stride_query * elem_bytes) % kVecBytes) != 0) qk_aligned16 = false;
-if (k != nullptr) {
-  if ((reinterpret_cast<uintptr_t>(k->data_ptr()) % kVecBytes) != 0) qk_aligned16 = false;
-  if (((key_token_stride * elem_bytes) % kVecBytes) != 0) qk_aligned16 = false;
-  if (((head_stride_key * elem_bytes) % kVecBytes) != 0) qk_aligned16 = false;
-}
-
-const bool use_vec = can_vec_compute;
-const int launch_pairs_per_thread = use_vec ? pairs_per_step : 1;
-const int total_threads_needed =
-    (max_pairs_to_rotate_per_token + launch_pairs_per_thread - 1) / launch_pairs_per_thread;
-
-auto round_up32 = [](int x) { return ((x + 31) / 32) * 32; };
-
-// Case 1: 2D Grid (only when num_tokens<=4 and needs multiple blocks per token)
-const int threads_per_block_2d = std::min<int>(512, std::max(128, round_up32(std::min(total_threads_needed, 512))));
-const int blocks_per_token_2d = (total_threads_needed + threads_per_block_2d - 1) / threads_per_block_2d;
-const bool use_grid_2d = ((int)t <= 4) && (blocks_per_token_2d > 1);
-
-// Case 2: 1D Grid
-const int threads_per_block_1d = std::min<int>(512, std::max(128, round_up32(total_threads_needed)));
-
-const int threads_per_block = use_grid_2d ? threads_per_block_2d : threads_per_block_1d;
-const int blocks_per_token = use_grid_2d ? blocks_per_token_2d : 1;
-
-const auto stream = LaunchKernel::resolve_device(device.unwrap());
-const scalar_t* cos_ptr = static_cast<const scalar_t*>(cos.data_ptr());
-const scalar_t* sin_ptr = static_cast<const scalar_t*>(sin.data_ptr());
-scalar_t* q_ptr = static_cast<scalar_t*>(q.data_ptr());
-scalar_t* k_ptr = (k != nullptr) ? static_cast<scalar_t*>(k->data_ptr()) : nullptr;
-
-const dim3 grid2d((int)t, std::max(1, blocks_per_token));
-const dim3 grid1d((int)t);
-const dim3 block(threads_per_block);
-
-dispatch_rotary_launch<ROT, scalar_t>(
-    use_grid_2d,
-    grid2d,
-    grid1d,
-    block,
-    stream,
-    interleaved,
-    use_vec,
-    qk_aligned16,
-    cos_ptr,
-    sin_ptr,
-    q_ptr,
-    k_ptr,
-    (int)r,
-    embed_dim_for_rotation,
-    query_token_stride,
-    key_token_stride,
-    head_stride_query,
-    head_stride_key,
-    (int)hq,
-    (int)hk,
-    (int)head_size,
-    blocks_per_token);
-
-RuntimeDeviceCheck();
 }
 
 }  // namespace
