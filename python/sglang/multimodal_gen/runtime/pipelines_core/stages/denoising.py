@@ -1337,12 +1337,9 @@ class DenoisingStage(PipelineStage):
                 noise_pred_cond - noise_pred_uncond
             )
 
-            if batch.guidance_rescale > 0.0:
-                noise_pred = self.rescale_noise_cfg(
-                    noise_pred,
-                    noise_pred_cond,
-                    guidance_rescale=batch.guidance_rescale,
-                )
+            cond_norm = torch.norm(noise_pred_cond, dim=-1, keepdim=True)
+            noise_norm = torch.norm(noise_pred, dim=-1, keepdim=True)
+            noise_pred = noise_pred * (cond_norm / noise_norm)
             return noise_pred
 
     def prepare_sta_param(self, batch: Req, server_args: ServerArgs):
