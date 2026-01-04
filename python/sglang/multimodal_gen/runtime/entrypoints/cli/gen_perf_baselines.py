@@ -127,20 +127,28 @@ def _run_case(case: DiffusionTestCase) -> dict:
         )
         rid = gen(case.id, client)
         rec = wait_for_req_perf_record(
-            rid, ctx.perf_log_path, timeout=float(os.environ.get("SGLANG_PERF_TIMEOUT", "300"))
+            rid,
+            ctx.perf_log_path,
+            timeout=float(os.environ.get("SGLANG_PERF_TIMEOUT", "300")),
         )
         if rec is None:
             raise RuntimeError(f"missing perf record: {case.id}")
-        from sglang.multimodal_gen.test.server.testcase_configs import PerformanceSummary
+        from sglang.multimodal_gen.test.server.testcase_configs import (
+            PerformanceSummary,
+        )
 
-        perf = PerformanceSummary.from_req_perf_record(rec, BASELINE_CONFIG.step_fractions)
+        perf = PerformanceSummary.from_req_perf_record(
+            rec, BASELINE_CONFIG.step_fractions
+        )
         if case.server_args.modality == "video" and sp.num_frames and sp.num_frames > 0:
             if "per_frame_generation" not in perf.stage_metrics:
                 perf.stage_metrics["per_frame_generation"] = perf.e2e_ms / sp.num_frames
 
         return {
             "stages_ms": {k: round(v, 2) for k, v in perf.stage_metrics.items()},
-            "denoise_step_ms": {str(k): round(v, 2) for k, v in perf.all_denoise_steps.items()},
+            "denoise_step_ms": {
+                str(k): round(v, 2) for k, v in perf.all_denoise_steps.items()
+            },
             "expected_e2e_ms": round(perf.e2e_ms, 2),
             "expected_avg_denoise_ms": round(perf.avg_denoise_ms, 2),
             "expected_median_denoise_ms": round(perf.median_denoise_ms, 2),
@@ -151,29 +159,42 @@ def _run_case(case: DiffusionTestCase) -> dict:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
+    ap.add_argument("--baseline", default="")
     ap.add_argument("--out", default="")
     ap.add_argument("--match", default="")
     ap.add_argument("--case", action="append", default=[])
+    ap.add_argument("--all-from-baseline", action="store_true")
     ap.add_argument("--timeout", type=float, default=300.0)
     args = ap.parse_args()
 
     os.environ.setdefault("SGLANG_GEN_BASELINE", "1")
     os.environ["SGLANG_PERF_TIMEOUT"] = str(args.timeout)
 
-    out_path = Path(args.out) if args.out else _baseline_path()
-    data = json.loads(out_path.read_text(encoding="utf-8"))
+    baseline_path = Path(args.baseline) if args.baseline else _baseline_path()
+    out_path = Path(args.out) if args.out else baseline_path
+    data = json.loads(baseline_path.read_text(encoding="utf-8"))
     scenarios = data.setdefault("scenarios", {})
 
     ids = set(args.case) if args.case else None
     pat = re.compile(args.match) if args.match else None
+    if args.all_from_baseline:
+        ids = set(scenarios.keys())
+        pat = None
 
+    all_cases = _all_cases()
     cases = []
-    for c in _all_cases():
+    for c in all_cases:
         if ids and c.id not in ids:
             continue
         if pat and not pat.search(c.id):
             continue
         cases.append(c)
+
+    if args.all_from_baseline and ids:
+        case_ids = {c.id for c in all_cases}
+        missing = sorted([i for i in ids if i not in case_ids])
+        if missing:
+            sys.stderr.write(f"missing cases in testcase_configs.py: {len(missing)}\n")
 
     if not cases:
         return 0
