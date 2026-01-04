@@ -2088,6 +2088,8 @@ def main():
             args.limit,
         )
 
+        print(f"final report data: {report_data}")
+
         # Generate GitHub Actions summary
         analyzer.generate_github_summary(report_data)
 
