@@ -47,7 +47,7 @@ class RequestMetricsExporter(ABC):
                 value = getattr(obj, field_name)
                 # Convert to serializable format
                 if value is not None:
-                    request_params[field_name] = value
+                    request_params[field_name] = self._make_serializable(value)
 
         meta_info = out_dict.get("meta_info", {})
         filtered_out_meta_info = {
@@ -59,6 +59,17 @@ class RequestMetricsExporter(ABC):
             **filtered_out_meta_info,
         }
         return request_output_data
+
+    def _make_serializable(self, value):
+        """Convert non-serializable objects to serializable format."""
+        if dataclasses.is_dataclass(value):
+            return dataclasses.asdict(value)
+        elif isinstance(value, (list, tuple)):
+            return [self._make_serializable(item) for item in value]
+        elif isinstance(value, dict):
+            return {k: self._make_serializable(v) for k, v in value.items()}
+        else:
+            return value
 
     @abstractmethod
     async def write_record(
