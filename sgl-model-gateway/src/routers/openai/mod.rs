@@ -9,7 +9,6 @@
 
 mod accumulator;
 mod context;
-pub mod conversations;
 pub mod mcp;
 pub mod provider;
 mod responses;

@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import requests
 
 from sglang.srt.utils import kill_process_tree
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.few_shot_gsm8k import run_eval
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -12,6 +13,9 @@ from sglang.test.test_utils import (
     CustomTestCase,
     popen_launch_server,
 )
+
+# W8A8 quantization server integration tests
+register_cuda_ci(est_time=160, suite="stage-b-test-small-1-gpu")
 
 
 class BaseW8A8Test(CustomTestCase):
