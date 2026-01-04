@@ -863,6 +863,7 @@ class MHATokenToKVPool(KVCache):
         k_scale: Optional[float] = None,
         v_scale: Optional[float] = None,
         layer_id_override: Optional[int] = None,
+        dcp_kv_mask: Optional[torch.Tensor] = None,
     ):
         from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 
@@ -882,17 +883,37 @@ class MHATokenToKVPool(KVCache):
             cache_k = cache_k.view(self.store_dtype)
             cache_v = cache_v.view(self.store_dtype)
 
-        if get_is_capture_mode() and self.alt_stream is not None:
-            # Overlap the copy of K and V cache for small batch size
-            current_stream = self.device_module.current_stream()
-            self.alt_stream.wait_stream(current_stream)
-            self.k_buffer[layer_id - self.start_layer][loc] = cache_k
-            with self.device_module.stream(self.alt_stream):
-                self.v_buffer[layer_id - self.start_layer][loc] = cache_v
-            current_stream.wait_stream(self.alt_stream)
+        if dcp_kv_mask is not None:
+            N, H, D = cache_k.shape
+            grid = (N,)
+            masked_set_kv_buffer_kernel[grid](
+                cache_k,
+                cache_v,
+                self.k_buffer[layer_id - self.start_layer],
+                self.v_buffer[layer_id - self.start_layer],
+                loc,
+                dcp_kv_mask,
+                N,
+                H,
+                D,
+                128,
+                cache_k.stride(0),
+                cache_k.stride(1),
+                cache_v.stride(0),
+                cache_v.stride(1),
+            )
         else:
-            self.k_buffer[layer_id - self.start_layer][loc] = cache_k
-            self.v_buffer[layer_id - self.start_layer][loc] = cache_v
+            if get_is_capture_mode() and self.alt_stream is not None:
+                # Overlap the copy of K and V cache for small batch size
+                current_stream = self.device_module.current_stream()
+                self.alt_stream.wait_stream(current_stream)
+                self.k_buffer[layer_id - self.start_layer][loc] = cache_k
+                with self.device_module.stream(self.alt_stream):
+                    self.v_buffer[layer_id - self.start_layer][loc] = cache_v
+                current_stream.wait_stream(self.alt_stream)
+            else:
+                self.k_buffer[layer_id - self.start_layer][loc] = cache_k
+                self.v_buffer[layer_id - self.start_layer][loc] = cache_v
 
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
         if envs.SGLANG_NATIVE_MOVE_KV_CACHE.get():
@@ -2130,3 +2151,52 @@ def copy_all_layer_kv_cache_tiled(
     mask = mask_loc[:, None] & mask_byte[None, :]
     vals = tl.load(src_ptr, mask=mask)
     tl.store(tgt_ptr, vals, mask=mask)
+
+
+@triton.jit
+def masked_set_kv_buffer_kernel(
+    k_ptr,
+    v_ptr,
+    k_buffer_ptr,
+    v_buffer_ptr,
+    loc_ptr,
+    mask_ptr,
+    N: tl.constexpr,
+    H: tl.constexpr,
+    D: tl.constexpr,
+    CHUNK: tl.constexpr,
+    k_stride_B: tl.constexpr,
+    k_stride_H: tl.constexpr,
+    v_stride_B: tl.constexpr,
+    v_stride_H: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    if pid >= N:
+        return
+
+    do_write = tl.load(mask_ptr + pid) != 0
+    if not do_write:
+        return
+
+    loc = tl.load(loc_ptr + pid)
+
+    total = H * D
+    num_chunks = tl.cdiv(total, CHUNK)
+
+    for c in range(num_chunks):
+        offs = tl.arange(0, CHUNK)
+        idx = c * CHUNK + offs
+        mask = idx < total
+
+        row = idx // D
+        col = idx % D
+
+        k_addr = k_ptr + pid * k_stride_B + row * k_stride_H + col
+        key = tl.load(k_addr, mask=mask)
+        key_buffer_addr = k_buffer_ptr + loc * H * D + idx
+        tl.store(key_buffer_addr, key, mask=mask)
+
+        v_addr = v_ptr + pid * v_stride_B + row * v_stride_H + col
+        value = tl.load(v_addr, mask=mask)
+        value_buffer_addr = v_buffer_ptr + loc * H * D + idx
+        tl.store(value_buffer_addr, value, mask=mask)

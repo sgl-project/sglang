@@ -22,6 +22,7 @@ import numpy as np
 import torch
 
 from sglang.jit_kernel.norm import can_use_fused_inplace_qknorm, fused_inplace_qknorm
+from sglang.srt.distributed.parallel_state import get_dcp_group
 from sglang.srt.environ import envs
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
@@ -109,6 +110,7 @@ def enable_fused_set_kv_buffer(forward_batch: ForwardBatch):
         _is_cuda
         and hasattr(forward_batch.token_to_kv_pool, "dtype")
         and forward_batch.token_to_kv_pool.dtype == torch.bfloat16
+        and get_dcp_group().world_size == 1
     )
 
 
