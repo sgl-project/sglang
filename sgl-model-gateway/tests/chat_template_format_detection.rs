@@ -1,4 +1,4 @@
-use sgl_model_gateway::{
+use smg::{
     protocols::chat::{ChatMessage, MessageContent},
     tokenizer::chat_template::{
         detect_chat_template_content_format, ChatTemplateContentFormat, ChatTemplateParams,
