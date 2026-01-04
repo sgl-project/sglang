@@ -512,6 +512,8 @@ class Req:
         return_hidden_states: bool = False,
         return_routed_experts: bool = False,
         return_attention_tokens: bool = False,
+        top_k_attention: int = 10,
+        attention_capture_layer_id: Optional[int] = None,
         eos_token_ids: Optional[Set[int]] = None,
         bootstrap_host: Optional[str] = None,
         bootstrap_port: Optional[int] = None,
@@ -574,6 +576,8 @@ class Req:
         self.custom_logit_processor = custom_logit_processor
         self.return_hidden_states = return_hidden_states
         self.return_attention_tokens = return_attention_tokens
+        self.top_k_attention = top_k_attention
+        self.attention_capture_layer_id = attention_capture_layer_id
         self.attention_tokens: List[Dict] = []  # Per-token attention info
         self.attention_tokens_decode_step: int = 0  # Counter for stride calculation
 
@@ -2136,6 +2140,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             (getattr(req, "top_k_attention", 5) for req in self.reqs if getattr(req, "return_attention_tokens", False)),
             default=5,
         )
+        # Get per-request layer override (use first request's value that specifies a layer)
+        attention_capture_layer_id = None
+        for req in self.reqs:
+            if getattr(req, "return_attention_tokens", False):
+                layer_id = getattr(req, "attention_capture_layer_id", None)
+                if layer_id is not None:
+                    attention_capture_layer_id = layer_id
+                    break
 
         return ModelWorkerBatch(
             forward_mode=self.forward_mode,
@@ -2194,6 +2206,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             mamba_track_seqlens=self.mamba_track_seqlens,
             capture_attention_tokens=capture_attention_tokens,
             attention_top_k=attention_top_k,
+            attention_capture_layer_id=attention_capture_layer_id,
         )
 
     def copy(self):
@@ -2333,3 +2346,4 @@ class ModelWorkerBatch:
     # True only if at least one request in the batch requested attention tokens
     capture_attention_tokens: bool = False
     attention_top_k: int = 5
+    attention_capture_layer_id: Optional[int] = None  # Per-request layer override

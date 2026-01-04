@@ -927,6 +927,8 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 return_hidden_states=obj.return_hidden_states,
                 return_routed_experts=obj.return_routed_experts,
                 return_attention_tokens=obj.return_attention_tokens,
+                top_k_attention=obj.top_k_attention,
+                attention_capture_layer_id=obj.attention_capture_layer_id,
                 data_parallel_rank=obj.data_parallel_rank,
                 priority=obj.priority,
                 extra_key=obj.extra_key,

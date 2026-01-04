@@ -238,10 +238,12 @@ class AttentionTokenInfo:
     attention_scores: torch.Tensor
     # Which layer this came from (-1 = aggregated across layers)
     layer_id: int = -1
-    # Raw attention logits before softmax [batch, top_k] (for true probability calculation)
+    # Raw attention logits before softmax [batch, top_k] (for probability calculation)
     topk_logits: Optional[torch.Tensor] = None
-    # Logsumexp over all attention scores [batch] (normalizer for true probability)
-    logsumexp_all: Optional[torch.Tensor] = None
+    # Logsumexp over candidate attention scores [batch] (approximate normalizer)
+    # Note: For chunked computation, this is computed over top chunks only, not all tokens.
+    # Use for approximate probability: approx_prob = exp(topk_logit - logsumexp_candidates)
+    logsumexp_candidates: Optional[torch.Tensor] = None
 
 
 @dataclass
@@ -419,9 +421,13 @@ class ForwardBatch:
     # For attention token capture (interpretability/visualization)
     capture_attention_tokens: bool = False
     attention_top_k: int = 5
-    attention_token_info: Optional[AttentionTokenInfo] = None
-    # Layer gating: only capture attention on this layer (default: last attention layer)
-    attention_capture_layer_id: int = -1
+    attention_window: int = 0  # Context window for capture (0 = all tokens)
+    # Multi-layer capture: dict of layer_id -> AttentionTokenInfo
+    attention_token_infos: Optional[Dict[int, "AttentionTokenInfo"]] = None
+    # Legacy single-layer field (for backward compatibility)
+    attention_token_info: Optional["AttentionTokenInfo"] = None
+    # Layer IDs to capture attention from (empty = use attention_capture_layer_ids from init)
+    attention_capture_layer_ids: Optional[List[int]] = None
 
     @classmethod
     def init_new(
@@ -573,13 +579,45 @@ class ForwardBatch:
         if model_runner.server_args.return_attention_tokens and batch.capture_attention_tokens:
             ret.capture_attention_tokens = True
             ret.attention_top_k = batch.attention_top_k
-            # Store the last attention layer ID for layer gating
-            # For hybrid models (e.g., Qwen3-Next), this will be the last gated attention layer
-            if hasattr(model_runner, 'attention_layers') and model_runner.attention_layers:
-                ret.attention_capture_layer_id = model_runner.attention_layers[-1].layer_id
+            ret.attention_window = model_runner.server_args.attention_tokens_window
+            ret.attention_token_infos = {}  # Initialize multi-layer storage
+
+            # Determine which layers to capture
+            num_layers = model_runner.model_config.num_hidden_layers
+            layers_config = model_runner.server_args.attention_capture_layers
+
+            # Per-request layer override takes precedence
+            if batch.attention_capture_layer_id is not None:
+                layer_ids = [batch.attention_capture_layer_id]
+            elif layers_config == "last":
+                # Just the last layer
+                if hasattr(model_runner, 'attention_layers') and model_runner.attention_layers:
+                    layer_ids = [model_runner.attention_layers[-1].layer_id]
+                else:
+                    layer_ids = [num_layers - 1]
+            elif layers_config == "auto":
+                # Automatically select ~4 layers spread across depth
+                # [L/4, L/2, 3L/4, L-1] for semantic manifold coverage
+                layer_ids = [
+                    num_layers // 4,
+                    num_layers // 2,
+                    (3 * num_layers) // 4,
+                    num_layers - 1,
+                ]
+                # Remove duplicates and sort
+                layer_ids = sorted(set(layer_ids))
             else:
-                # Fallback to last hidden layer
-                ret.attention_capture_layer_id = model_runner.model_config.num_hidden_layers - 1
+                # Parse comma-separated layer indices
+                try:
+                    layer_ids = [int(x.strip()) for x in layers_config.split(",")]
+                    # Validate layer indices
+                    layer_ids = [l if l >= 0 else num_layers + l for l in layer_ids]
+                    layer_ids = [l for l in layer_ids if 0 <= l < num_layers]
+                except ValueError:
+                    # Fallback to last layer on parse error
+                    layer_ids = [num_layers - 1]
+
+            ret.attention_capture_layer_ids = layer_ids
 
         return ret
 

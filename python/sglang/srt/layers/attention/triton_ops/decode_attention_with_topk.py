@@ -139,6 +139,7 @@ def compute_topk_attention_chunked(
     sm_scale: float,
     top_k: int = 10,
     chunk_size: int = 1024,
+    window: int = 0,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Compute top-k attention positions using chunked approach.
@@ -150,11 +151,19 @@ def compute_topk_attention_chunked(
     Memory: O(batch × heads × num_chunks) intermediate
     For 1M context: ~125KB vs ~256MB with full matrix
 
+    Args:
+        window: Context window size. If > 0, only consider the last `window` tokens
+                for attention capture. Useful for very long contexts (1M+) to limit
+                compute. Use 0 for all tokens.
+
     Returns:
         topk_scores: [batch, top_k] - softmax normalized over top-k (for display)
-        topk_indices: [batch, top_k] - sequence positions
-        topk_logits: [batch, top_k] - raw attention scores (for true probability)
-        logsumexp_all: [batch] - logsumexp over all scores (for true probability normalizer)
+        topk_indices: [batch, top_k] - sequence positions (in original context)
+        topk_logits: [batch, top_k] - raw attention scores (for probability calculation)
+        logsumexp_candidates: [batch] - logsumexp over candidate scores (approximate normalizer)
+            Note: This is computed over top chunks only, not all tokens. For very long
+            contexts, this provides an approximation. Use for approximate probability:
+            approx_prob = exp(topk_logit - logsumexp_candidates)
     """
     batch_size, num_heads, head_dim = q.shape
     num_kv_heads = k_buffer.shape[1]
@@ -218,6 +227,18 @@ def compute_topk_attention_chunked(
     # Average scores across heads for interpretability
     avg_chunk_scores = chunk_max_scores.mean(dim=1)  # [batch, num_chunks]
 
+    # Apply window: mask out chunks outside the last `window` tokens
+    if window > 0:
+        # For each batch, compute which chunks fall within the window
+        for b in range(batch_size):
+            seq_len = (kv_indptr[b + 1] - kv_indptr[b]).item()
+            if seq_len > window:
+                # Tokens in window: [seq_len - window, seq_len)
+                # First valid chunk: (seq_len - window) // chunk_size
+                first_valid_chunk = (seq_len - window) // chunk_size
+                if first_valid_chunk > 0:
+                    avg_chunk_scores[b, :first_valid_chunk] = float('-inf')
+
     # Get top-k chunks (get extra in case we need to deduplicate)
     k_chunks = min(top_k * 2, num_chunks)
     _, topk_chunk_idx = torch.topk(avg_chunk_scores, k_chunks, dim=-1)
@@ -246,8 +267,8 @@ def _rescan_top_chunks(
     Returns:
         topk_probs: [batch, top_k] - softmax normalized over top-k only (for display)
         topk_positions: [batch, top_k] - sequence positions
-        topk_logits: [batch, top_k] - raw attention scores (for true probability)
-        logsumexp_all: [batch] - logsumexp over all scores (for true probability normalizer)
+        topk_logits: [batch, top_k] - raw attention scores (for probability calculation)
+        logsumexp_candidates: [batch] - logsumexp over candidate chunks (approximate normalizer)
     """
     batch_size, num_heads, head_dim = q.shape
     num_kv_heads = k_buffer.shape[1]

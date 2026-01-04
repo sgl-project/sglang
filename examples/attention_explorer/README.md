@@ -42,6 +42,11 @@ python -m http.server 8081
 - `--attention-tokens-top-k N`: Number of top attention positions to return (default: 5)
 - `--attention-tokens-max N`: Maximum tokens to record per request, 0=unlimited (default: 4096)
 - `--attention-tokens-stride N`: Record every Nth token, 1=all (default: 1)
+- `--attention-tokens-window N`: Context window for capture, 0=all tokens (default: 0). For very long contexts (1M+), set this to limit which tokens are considered (e.g., 8192 for last 8K tokens only)
+- `--attention-capture-layers MODE`: Which layers to capture. Options:
+  - `last` (default): Only the last layer
+  - `auto`: Automatically select ~4 layers spread across depth [L/4, L/2, 3L/4, L-1]
+  - Comma-separated indices: e.g., `0,10,20,30` for specific layers
 - `--attention-backend triton`: Use triton backend (required for attention capture)
 
 ## Client Configuration
@@ -63,29 +68,37 @@ Each entry in `attention_tokens` array contains:
 - `attention_scores`: Attention weights softmax-normalized over top-k only (list of floats)
 - `layer_id`: Which attention layer was captured (integer)
 - `topk_logits`: Raw attention logits before softmax (list of floats)
-- `logsumexp_all`: Logsumexp normalizer over all positions (float)
+- `logsumexp_candidates`: Approximate logsumexp normalizer over candidate attention scores (float)
 
-### Computing True Probabilities
+### Computing Approximate Probabilities
 
-The `attention_scores` field is softmax-normalized over only the top-k positions, which sums to 1.0 but doesn't represent the true probability mass. For true probabilities:
+The `attention_scores` field is softmax-normalized over only the top-k positions, which sums to 1.0 but doesn't represent the true probability mass. For approximate probabilities:
 
 ```javascript
-// True probability = exp(logit - logsumexp_all)
-const trueProbs = topk_logits.map(logit => Math.exp(logit - logsumexp_all));
-// Sum of trueProbs <= 1.0 (accounts for probability mass in non-top-k positions)
+// Approximate probability = exp(logit - logsumexp_candidates)
+// Note: logsumexp_candidates is computed over top chunks only (not all tokens),
+// so this is an approximation. For very long contexts (1M+ tokens), some
+// probability mass may be in chunks not included in the candidate set.
+const approxProbs = topk_logits.map(logit => Math.exp(logit - logsumexp_candidates));
+// Sum of approxProbs <= 1.0 (accounts for probability mass in non-top-k positions)
 ```
 
 This is useful for understanding what fraction of attention is captured by the top-k tokens.
 
 ## Tensor Parallelism (TP) Behavior
 
-### Current Limitations
-- Attention capture requires `--attention-backend triton` which is used by default
-- When using TP > 1, attention is captured on TP rank 0 only
-- The captured attention represents the full attention pattern averaged across all heads
+### How TP Affects Attention Capture
+
+When using tensor parallelism (TP > 1), attention heads are distributed across GPUs:
+- **TP rank 0 only**: Attention is captured only from the heads on TP rank 0
+- **Partial view**: With TP=2, you see ~50% of heads; with TP=4, ~25% of heads
+- **Head distribution**: Different heads may focus on different aspects (syntax vs semantics)
+
+This means TP > 1 gives you a partial, potentially biased view of the model's attention patterns. The captured attention represents only the heads assigned to rank 0, not an average across all heads.
 
 ### Recommended Setup
-For best results, use single GPU or TP=1 configuration when visualizing attention:
+
+For interpretability work, use single GPU or TP=1 to see all attention heads:
 
 ```bash
 python -m sglang.launch_server \
@@ -94,6 +107,14 @@ python -m sglang.launch_server \
     --disable-cuda-graph \
     --tp 1
 ```
+
+### When TP > 1 Is Acceptable
+
+- **Quick exploration**: Rank 0 heads often provide useful signal
+- **Large models**: When TP=1 is not possible due to memory constraints
+- **Comparative analysis**: Comparing attention patterns across prompts (relative differences are still informative)
+
+Note: Results with TP > 1 should be interpreted with caution for detailed interpretability work.
 
 ### Memory Efficiency
 The attention capture uses a memory-efficient chunked algorithm:

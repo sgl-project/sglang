@@ -609,6 +609,8 @@ class ServerArgs:
     attention_tokens_top_k: int = 5
     attention_tokens_max: int = 4096  # Max tokens to record (0 = unlimited)
     attention_tokens_stride: int = 1  # Record every Nth token (1 = all)
+    attention_tokens_window: int = 0  # Context window for capture (0 = all tokens)
+    attention_capture_layers: str = "last"  # "last", "auto", or comma-separated layer indices
 
     # PD disaggregation: can be "null" (not disaggregated), "prefill" (prefill-only), or "decode" (decode-only)
     disaggregation_mode: Literal["null", "prefill", "decode"] = "null"
@@ -4440,6 +4442,18 @@ class ServerArgs:
             type=int,
             default=ServerArgs.attention_tokens_stride,
             help="Record attention every Nth token. Use 1 to record all tokens. (default: 1)",
+        )
+        parser.add_argument(
+            "--attention-tokens-window",
+            type=int,
+            default=ServerArgs.attention_tokens_window,
+            help="Context window size for attention capture. Only the last N tokens are considered. Use 0 for all tokens. Useful for 1M+ context to limit compute. (default: 0)",
+        )
+        parser.add_argument(
+            "--attention-capture-layers",
+            type=str,
+            default=ServerArgs.attention_capture_layers,
+            help="Which layers to capture attention from. Options: 'last' (default, last layer only), 'auto' (automatically select ~4 layers spread across depth), or comma-separated layer indices like '0,10,20,30'. (default: last)",
         )
 
         # PD disaggregation

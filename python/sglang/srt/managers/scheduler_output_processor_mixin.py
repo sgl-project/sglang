@@ -469,24 +469,66 @@ class SchedulerOutputProcessorMixin:
                     should_record = False
 
                 if should_record:
-                    attention_info = {
-                        "token_positions": logits_output.attention_token_positions[i]
-                        .cpu()
-                        .tolist(),
-                        "attention_scores": logits_output.attention_token_scores[i]
-                        .cpu()
-                        .tolist(),
-                        "layer_id": getattr(logits_output, "attention_layer_id", -1),
-                    }
-                    # Add true probability info if available
-                    if logits_output.attention_topk_logits is not None:
-                        attention_info["topk_logits"] = (
-                            logits_output.attention_topk_logits[i].cpu().tolist()
-                        )
-                    if logits_output.attention_logsumexp_all is not None:
-                        attention_info["logsumexp_all"] = (
-                            logits_output.attention_logsumexp_all[i].cpu().item()
-                        )
+                    # Slice to this request's actual top_k (batch may use max across requests)
+                    req_top_k = getattr(req, "top_k_attention", 10)
+
+                    # Check for multi-layer attention data
+                    if logits_output.attention_multi_layer:
+                        # Multi-layer capture: create entry with all layers
+                        layers_data = {}
+                        for layer_id, (positions, scores, logits, logsumexp) in logits_output.attention_multi_layer.items():
+                            layer_entry = {
+                                "token_positions": positions[i].cpu().tolist()[:req_top_k],
+                                "attention_scores": scores[i].cpu().tolist()[:req_top_k],
+                            }
+                            if logits is not None:
+                                layer_entry["topk_logits"] = logits[i].cpu().tolist()[:req_top_k]
+                            if logsumexp is not None:
+                                layer_entry["logsumexp_candidates"] = logsumexp[i].cpu().item()
+                            layers_data[layer_id] = layer_entry
+
+                        attention_info = {
+                            "layers": layers_data,
+                            # Also include last layer at top level for backward compatibility
+                            "layer_id": getattr(logits_output, "attention_layer_id", -1),
+                        }
+                        # Copy last layer data to top level for backward compatibility
+                        if logits_output.attention_token_positions is not None:
+                            attention_info["token_positions"] = (
+                                logits_output.attention_token_positions[i].cpu().tolist()[:req_top_k]
+                            )
+                            attention_info["attention_scores"] = (
+                                logits_output.attention_token_scores[i].cpu().tolist()[:req_top_k]
+                            )
+                        if logits_output.attention_topk_logits is not None:
+                            attention_info["topk_logits"] = (
+                                logits_output.attention_topk_logits[i].cpu().tolist()[:req_top_k]
+                            )
+                        if logits_output.attention_logsumexp_candidates is not None:
+                            attention_info["logsumexp_candidates"] = (
+                                logits_output.attention_logsumexp_candidates[i].cpu().item()
+                            )
+                    else:
+                        # Single-layer capture (backward compatible format)
+                        attention_info = {
+                            "token_positions": logits_output.attention_token_positions[i]
+                            .cpu()
+                            .tolist()[:req_top_k],
+                            "attention_scores": logits_output.attention_token_scores[i]
+                            .cpu()
+                            .tolist()[:req_top_k],
+                            "layer_id": getattr(logits_output, "attention_layer_id", -1),
+                        }
+                        # Add true probability info if available
+                        if logits_output.attention_topk_logits is not None:
+                            attention_info["topk_logits"] = (
+                                logits_output.attention_topk_logits[i].cpu().tolist()[:req_top_k]
+                            )
+                        if logits_output.attention_logsumexp_candidates is not None:
+                            attention_info["logsumexp_candidates"] = (
+                                logits_output.attention_logsumexp_candidates[i].cpu().item()
+                            )
+
                     req.attention_tokens.append(attention_info)
 
             if req.grammar is not None:

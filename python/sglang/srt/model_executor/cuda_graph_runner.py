@@ -639,18 +639,12 @@ class CudaGraphRunner:
             assert self.enable_pdmux
             attn_backend = self.model_runner.decode_attn_backend_group[stream_idx]
 
-        # Check if attention token capture is enabled
-        server_args = self.model_runner.server_args
-        capture_attention_tokens = server_args.return_attention_tokens
-        attention_top_k = server_args.attention_tokens_top_k
-        # Layer gating: determine the last attention layer for capture
-        if capture_attention_tokens:
-            if hasattr(self.model_runner, 'attention_layers') and self.model_runner.attention_layers:
-                attention_capture_layer_id = self.model_runner.attention_layers[-1].layer_id
-            else:
-                attention_capture_layer_id = self.model_runner.model_config.num_hidden_layers - 1
-        else:
-            attention_capture_layer_id = -1
+        # Attention token capture must be disabled during CUDA graph capture
+        # because the capture code uses tensor.item() which is not supported during stream capture.
+        # Actual attention capture happens at runtime, not during graph capture.
+        capture_attention_tokens = False
+        attention_top_k = 5  # dummy value
+        attention_capture_layer_id = -1
 
         forward_batch = ForwardBatch(
             forward_mode=self.capture_forward_mode,

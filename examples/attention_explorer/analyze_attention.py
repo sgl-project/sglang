@@ -102,7 +102,7 @@ def analyze_attention(prompt: str, max_tokens: int = 20, api_base: str = "http:/
         positions = entry["token_positions"]
         scores = entry["attention_scores"]
         logits = entry.get("topk_logits", [])
-        logsumexp = entry.get("logsumexp_all", 0)
+        logsumexp = entry.get("logsumexp_candidates", 0)
 
         # Calculate attention to prompt vs output
         prompt_attn = sum(s for p, s in zip(positions, scores) if p < prompt_len)

@@ -204,6 +204,10 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
     return_routed_experts: bool = False
     # Whether to return top-k attention tokens for interpretability
     return_attention_tokens: Union[List[bool], bool] = False
+    # Number of top attention tokens to capture per output token
+    top_k_attention: Union[List[int], int] = 10
+    # Layer to capture attention from (-1 = last layer, None = use server default)
+    attention_capture_layer_id: Optional[Union[List[int], int]] = None
 
     # The modalities of the image data [image, multi-images, video]
     modalities: Optional[List[str]] = None
@@ -770,6 +774,10 @@ class TokenizedGenerateReqInput(BaseReq):
 
     # Whether to return top-k attention tokens for interpretability
     return_attention_tokens: bool = False
+    # Number of top attention tokens to capture per output token
+    top_k_attention: int = 10
+    # Layer to capture attention from (-1 = last layer, None = use server default)
+    attention_capture_layer_id: Optional[int] = None
 
 
 @dataclass
