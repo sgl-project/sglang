@@ -77,7 +77,7 @@ def print_performance_table(
         f"  {'CuTe DSL':<15} {cutedsl_mean:>12.3f} {cutedsl_std:>10.3f} {triton_mean/cutedsl_mean:>11.2f}x"
     )
     print("-" * 70)
-    print(f"  Winner: {faster} is {ratio:.2f}x faster")
+    print(f"  {faster} is {ratio:.2f}x faster")
     print("=" * 70 + "\n")
 
 
