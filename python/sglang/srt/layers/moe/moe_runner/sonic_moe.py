@@ -102,17 +102,20 @@ def fused_experts_none_to_sonic_moe(
     b13 = quant_info.b13
     b2 = quant_info.b2
 
-    output = _sonic_moe_forward_placeholder(
-        hidden_states=hidden_states,
-        w13=w13_weight.permute(1, 2, 0),
-        b13=b13,
-        w2=w2_weight.permute(1, 2, 0),
-        b2=b2,
-        router_weights=topk_output.topk_weights,
-        selected_experts=topk_output.topk_ids,
-        activation_type=activation_type,
-        config=runner_config,
-    )
+    torch.cuda.synchronize()
+    with torch.no_grad():
+        output = _sonic_moe_forward_placeholder(
+            hidden_states=hidden_states,
+            w13=w13_weight.permute(1, 2, 0),
+            b13=b13,
+            w2=w2_weight.permute(1, 2, 0),
+            b2=b2,
+            router_weights=topk_output.topk_weights,
+            selected_experts=topk_output.topk_ids,
+            activation_type=activation_type,
+            config=runner_config,
+        )
+    torch.cuda.synchronize()
 
     return StandardCombineInput(hidden_states=output)
 
