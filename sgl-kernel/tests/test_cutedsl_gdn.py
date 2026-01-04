@@ -281,7 +281,7 @@ def test_cutedsl_gdn_performance(B: int):
 
     scale = K**-0.5
     use_small_batch = N < 32
-    is_varlen_decode = True
+    is_varlen_decode = True  # Test varlen version, consistent with end-to-end model
     warmup_iters = 10
     bench_iters = 100
     run_iters = 10
@@ -296,7 +296,10 @@ def test_cutedsl_gdn_performance(B: int):
     initial_state_triton = initial_state_cutedsl.reshape(-1).contiguous()
     cu_seqlens = torch.zeros(N + 1, dtype=torch.int32, device="cuda")
     h0_source = initial_state_cutedsl
-    o_cutedsl = torch.zeros(1, N, HV, V, dtype=torch.bfloat16, device="cuda")
+    if is_varlen_decode:
+        o_cutedsl = torch.zeros(1, N, HV, V, dtype=torch.bfloat16, device="cuda")
+    else:
+        o_cutedsl = torch.zeros(N, 1, HV, V, dtype=torch.bfloat16, device="cuda")
 
     q_list, k_list, v_list, a_list, b_list = [], [], [], [], []
     q_tensor_list, k_tensor_list, v_tensor_list, a_tensor_list, b_tensor_list = (
@@ -308,17 +311,30 @@ def test_cutedsl_gdn_performance(B: int):
     )
     for ri in range(run_iters):
         torch.manual_seed(2025 + ri)
-        # Varlen decode format: (1, N, H, K), a/b are 2D (N, HV)
-        q_i = torch.randn(1, N, H, K, dtype=torch.bfloat16, device="cuda")
-        k_i = torch.randn(1, N, H, K, dtype=torch.bfloat16, device="cuda")
-        v_i = torch.randn(1, N, HV, V, dtype=torch.bfloat16, device="cuda")
-        a_i = torch.randn(N, HV, dtype=torch.bfloat16, device="cuda")
-        b_i = torch.randn(N, HV, dtype=torch.bfloat16, device="cuda")
+        if is_varlen_decode:
+            # Varlen decode format: (1, N, H, K), a/b are 2D (N, HV)
+            q_i = torch.randn(1, N, H, K, dtype=torch.bfloat16, device="cuda")
+            k_i = torch.randn(1, N, H, K, dtype=torch.bfloat16, device="cuda")
+            v_i = torch.randn(1, N, HV, V, dtype=torch.bfloat16, device="cuda")
+            a_i = torch.randn(N, HV, dtype=torch.bfloat16, device="cuda")
+            b_i = torch.randn(N, HV, dtype=torch.bfloat16, device="cuda")
+            # 2D (N, HV): strides = (HV, 1), leading_dim = 1
+            a_leading_dim = 1
+        else:
+            # Normal decode format: (N, 1, H, K), a/b are 3D (N, 1, HV)
+            q_i = torch.randn(N, 1, H, K, dtype=torch.bfloat16, device="cuda")
+            k_i = torch.randn(N, 1, H, K, dtype=torch.bfloat16, device="cuda")
+            v_i = torch.randn(N, 1, HV, V, dtype=torch.bfloat16, device="cuda")
+            a_i = torch.randn(N, 1, HV, dtype=torch.bfloat16, device="cuda")
+            b_i = torch.randn(N, 1, HV, dtype=torch.bfloat16, device="cuda")
+            # 3D (N, 1, HV): strides = (HV, HV, 1), leading_dim = 2 (last dim has stride=1)
+            a_leading_dim = 2
         q_list.append(q_i)
         k_list.append(k_i)
         v_list.append(v_i)
         a_list.append(a_i)
         b_list.append(b_i)
+        # No mark_layout_dynamic, consistent with original test_decode_fused_gdn.py
         q_tensor_list.append(from_dlpack(q_i, assumed_align=16))
         k_tensor_list.append(from_dlpack(k_i, assumed_align=16))
         v_tensor_list.append(from_dlpack(v_i, assumed_align=16))
@@ -501,12 +517,11 @@ def test_cutedsl_gdn_performance(B: int):
         B, kernel_type, triton_mean, triton_std, cutedsl_mean, cutedsl_std
     )
 
-    # TODO: Uncomment this
-    # speedup = triton_mean / cutedsl_mean
-    # min_speedup = 1.0 if B < 32 else 1.15
-    # assert speedup >= min_speedup, (
-    #     f"CuTe DSL speedup {speedup:.2f}x < {min_speedup}x for B={B} ({kernel_type})"
-    # )
+    speedup = triton_mean / cutedsl_mean
+    min_speedup = 1.0 if B < 32 else 1.15
+    assert (
+        speedup >= min_speedup
+    ), f"CuTe DSL speedup {speedup:.2f}x < {min_speedup}x for B={B} ({kernel_type})"
 
 
 def run_benchmark(
@@ -536,7 +551,7 @@ def run_benchmark(
 
     scale = K**-0.5
     use_small_batch = N < 32
-    is_varlen_decode = True
+    is_varlen_decode = True  # Test varlen version, consistent with end-to-end model
 
     A_log = torch.randn(HV, dtype=torch.float32, device="cuda")
     dt_bias = torch.randn(HV, dtype=torch.bfloat16, device="cuda")
@@ -548,8 +563,10 @@ def run_benchmark(
     initial_state_triton = initial_state_cutedsl.reshape(-1).contiguous()
     cu_seqlens = torch.zeros(N + 1, dtype=torch.int32, device="cuda")
     h0_source = initial_state_cutedsl  # (pool_size, HV, K, V)
-    # Varlen decode output: (1, N, HV, V)
-    o_cutedsl = torch.zeros(1, N, HV, V, dtype=torch.bfloat16, device="cuda")
+    if is_varlen_decode:
+        o_cutedsl = torch.zeros(1, N, HV, V, dtype=torch.bfloat16, device="cuda")
+    else:
+        o_cutedsl = torch.zeros(N, 1, HV, V, dtype=torch.bfloat16, device="cuda")
 
     q_list, k_list, v_list, a_list, b_list = [], [], [], [], []
     q_tensor_list, k_tensor_list, v_tensor_list, a_tensor_list, b_tensor_list = (
@@ -561,16 +578,30 @@ def run_benchmark(
     )
     for ri in range(run_iters):
         torch.manual_seed(2025 + ri)
-        q_i = torch.randn(1, N, H, K, dtype=torch.bfloat16, device="cuda")
-        k_i = torch.randn(1, N, H, K, dtype=torch.bfloat16, device="cuda")
-        v_i = torch.randn(1, N, HV, V, dtype=torch.bfloat16, device="cuda")
-        a_i = torch.randn(N, HV, dtype=torch.bfloat16, device="cuda")
-        b_i = torch.randn(N, HV, dtype=torch.bfloat16, device="cuda")
+        if is_varlen_decode:
+            # Varlen decode format: (1, N, H, K), a/b are 2D (N, HV)
+            q_i = torch.randn(1, N, H, K, dtype=torch.bfloat16, device="cuda")
+            k_i = torch.randn(1, N, H, K, dtype=torch.bfloat16, device="cuda")
+            v_i = torch.randn(1, N, HV, V, dtype=torch.bfloat16, device="cuda")
+            a_i = torch.randn(N, HV, dtype=torch.bfloat16, device="cuda")
+            b_i = torch.randn(N, HV, dtype=torch.bfloat16, device="cuda")
+            # 2D (N, HV): strides = (HV, 1), leading_dim = 1
+            a_leading_dim = 1
+        else:
+            # Normal decode format: (N, 1, H, K), a/b are 3D (N, 1, HV)
+            q_i = torch.randn(N, 1, H, K, dtype=torch.bfloat16, device="cuda")
+            k_i = torch.randn(N, 1, H, K, dtype=torch.bfloat16, device="cuda")
+            v_i = torch.randn(N, 1, HV, V, dtype=torch.bfloat16, device="cuda")
+            a_i = torch.randn(N, 1, HV, dtype=torch.bfloat16, device="cuda")
+            b_i = torch.randn(N, 1, HV, dtype=torch.bfloat16, device="cuda")
+            # 3D (N, 1, HV): strides = (HV, HV, 1), leading_dim = 2 (last dim has stride=1)
+            a_leading_dim = 2
         q_list.append(q_i)
         k_list.append(k_i)
         v_list.append(v_i)
         a_list.append(a_i)
         b_list.append(b_i)
+        # No mark_layout_dynamic, consistent with original test_decode_fused_gdn.py
         q_tensor_list.append(from_dlpack(q_i, assumed_align=16))
         k_tensor_list.append(from_dlpack(k_i, assumed_align=16))
         v_tensor_list.append(from_dlpack(v_i, assumed_align=16))
@@ -836,7 +867,7 @@ Examples:
         type=int,
         nargs="+",
         default=[1, 128],
-        help="Batch sizes for --bench mode (default: 16 128)",
+        help="Batch sizes for --bench mode (default: 1 128)",
     )
     parser.add_argument(
         "--samples",
@@ -850,7 +881,7 @@ Examples:
     parser.add_argument(
         "--evict-mb",
         type=int,
-        default=128,
+        default=0,
         help="L2 cache eviction buffer size in MB (0 to disable, default: 128)",
     )
     parser.add_argument(

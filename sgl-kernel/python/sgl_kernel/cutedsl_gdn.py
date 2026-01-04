@@ -17,6 +17,7 @@ _cuda = None
 _compiled_kernels: Dict[Tuple, object] = {}
 TILE_K = 128
 TILE_V = 32
+TILE_V_PADDED = 36  # TILE_V + 4 for bank conflict free (128-bit aligned padding)
 TILE_V_SMALL = 16
 NUM_STAGES = 2
 NUM_THREADS = 128
@@ -206,6 +207,7 @@ def _define_kernels():
         for i in range(vec_size):
             r_q[i] = r_q[i] * scale
 
+        # Mainloop: process each v_tile
         for v_tile_offset in range(num_v_tiles_per_block):
             v_tile = start_v_tile + v_tile_offset
             stage = v_tile_offset % NUM_STAGES
@@ -213,6 +215,7 @@ def _define_kernels():
             cute.arch.cp_async_wait_group(0)
             cute.arch.barrier()
 
+            # Prefetch next tile
             next_v_tile_offset = v_tile_offset + prefetch_count
             if next_v_tile_offset < num_v_tiles_per_block:
                 next_v_tile = start_v_tile + next_v_tile_offset
@@ -224,6 +227,7 @@ def _define_kernels():
                 cute.copy(tiled_copy_load, thr_gSrc, thr_sData)
                 cute.arch.cp_async_commit_group()
 
+            # Load v values
             v_base = warp_idx * v_per_warp
             v_loaded = 0.0
             if in_warp_tid < v_per_warp:
@@ -233,6 +237,7 @@ def _define_kernels():
             for v_off in range(v_per_warp):
                 r_v_local[v_off] = cute.arch.shuffle_sync(v_loaded, v_off)
 
+            # Compute for each V in this warp's range
             for v_off in range(v_per_warp):
                 v_local = v_base + v_off
                 sum_hk = 0.0
@@ -265,16 +270,18 @@ def _define_kernels():
 
             cute.arch.barrier()
 
+            # Write output
             if tidx < TILE_V_SMALL:
                 v_global = v_tile * TILE_V_SMALL + tidx
                 o[(i_n, 0, i_hv, v_global)] = cutlass.BFloat16(smem_o[tidx])
 
+            # Write h back from CURRENT stage
             for k_chunk in range(TILE_K // 8):
                 k_idx = k_chunk * 8 + warp_idx * 2 + in_warp_tid // 16
                 v_idx = in_warp_tid % 16
                 h_val = sData[(k_idx, v_idx, stage)]
-                v_global = v_tile * TILE_V_SMALL + v_idx
-                h0_source[(pool_idx, i_hv, k_idx, v_global)] = h_val
+                v_global_wb = v_tile * TILE_V_SMALL + v_idx
+                h0_source[(pool_idx, i_hv, k_idx, v_global_wb)] = h_val
 
             cute.arch.barrier()
 
@@ -417,6 +424,7 @@ def _define_kernels():
         for i in range(vec_size):
             r_q[i] = r_q[i] * scale
 
+        # Mainloop: process each v_tile
         for v_tile_offset in range(num_v_tiles_per_block):
             v_tile = start_v_tile + v_tile_offset
             stage = v_tile_offset % NUM_STAGES
@@ -424,6 +432,7 @@ def _define_kernels():
             cute.arch.cp_async_wait_group(0)
             cute.arch.barrier()
 
+            # Prefetch next tile
             next_v_tile_offset = v_tile_offset + prefetch_count
             if next_v_tile_offset < num_v_tiles_per_block:
                 next_v_tile = start_v_tile + next_v_tile_offset
@@ -435,6 +444,7 @@ def _define_kernels():
                 cute.copy(tiled_copy_load, thr_gSrc, thr_sData)
                 cute.arch.cp_async_commit_group()
 
+            # Load v values
             v_base = warp_idx * v_per_warp
             v_loaded = 0.0
             if in_warp_tid < v_per_warp:
@@ -444,6 +454,7 @@ def _define_kernels():
             for v_off in range(v_per_warp):
                 r_v_local[v_off] = cute.arch.shuffle_sync(v_loaded, v_off)
 
+            # Compute for each V in this warp's range
             for v_off in range(v_per_warp):
                 v_local = v_base + v_off
                 sum_hk = 0.0
@@ -476,16 +487,18 @@ def _define_kernels():
 
             cute.arch.barrier()
 
+            # Write output
             if tidx < TILE_V_SMALL:
                 v_global = v_tile * TILE_V_SMALL + tidx
                 o[(0, i_n, i_hv, v_global)] = cutlass.BFloat16(smem_o[tidx])
 
+            # Write h back from CURRENT stage
             for k_chunk in range(TILE_K // 8):
                 k_idx = k_chunk * 8 + warp_idx * 2 + in_warp_tid // 16
                 v_idx = in_warp_tid % 16
                 h_val = sData[(k_idx, v_idx, stage)]
-                v_global = v_tile * TILE_V_SMALL + v_idx
-                h0_source[(pool_idx, i_hv, k_idx, v_global)] = h_val
+                v_global_wb = v_tile * TILE_V_SMALL + v_idx
+                h0_source[(pool_idx, i_hv, k_idx, v_global_wb)] = h_val
 
             cute.arch.barrier()
 
@@ -645,11 +658,14 @@ def _define_kernels():
                 sQ[tidx] = sQ[tidx] * scale
             cute.arch.barrier()
 
+        # Mainloop: process each v_tile
         for v_tile in range(num_v_tiles):
             stage = v_tile % NUM_STAGES
+
             cute.arch.cp_async_wait_group(0)
             cute.arch.barrier()
 
+            # Prefetch next tile
             next_v_tile = v_tile + prefetch_count
             if next_v_tile < num_v_tiles:
                 next_stage = next_v_tile % NUM_STAGES
@@ -660,9 +676,11 @@ def _define_kernels():
                 cute.copy(tiled_copy_load, thr_gSrc, thr_sData)
                 cute.arch.cp_async_commit_group()
 
+            # Load v value for this thread's V position
             v_global = v_tile * TILE_V + v_idx
             r_v = cutlass.Float32(v[i_n, 0, i_hv, v_global])
 
+            # Phase 1: Compute sum_hk
             sum_hk = 0.0
             for k_iter in range(NUM_K_ITERS):
                 k_base = k_iter * ROWS_PER_ITER
@@ -679,6 +697,7 @@ def _define_kernels():
             v_new = (r_v - sum_hk) * r_beta
             v_new = cute.arch.shuffle_sync(v_new, v_local)
 
+            # Phase 2: Update h and compute sum_hq
             sum_hq = 0.0
             for k_iter in range(NUM_K_ITERS):
                 k_base = k_iter * ROWS_PER_ITER
@@ -695,12 +714,16 @@ def _define_kernels():
                     sum_hq, offset=offset * V_PER_WARP, mask=-1, mask_and_clamp=31
                 )
 
+            # Direct register → global write (skip smem_o)
             if k_local == 0:
                 v_global_out = v_tile * TILE_V + v_idx
                 o[(i_n, 0, i_hv, v_global_out)] = cutlass.BFloat16(sum_hq)
 
             cute.arch.barrier()
 
+            # Coalesced write h back to GMEM from CURRENT stage
+            # 256 threads write 128×32 = 4096 elements
+            # Each thread writes 4096/256 = 16 elements
             for elem in range(16):
                 flat_idx = tidx + elem * 256
                 k_write = flat_idx // TILE_V
@@ -869,11 +892,14 @@ def _define_kernels():
                 sQ[tidx] = sQ[tidx] * scale
             cute.arch.barrier()
 
+        # Mainloop: process each v_tile
         for v_tile in range(num_v_tiles):
             stage = v_tile % NUM_STAGES
+
             cute.arch.cp_async_wait_group(0)
             cute.arch.barrier()
 
+            # Prefetch next tile
             next_v_tile = v_tile + prefetch_count
             if next_v_tile < num_v_tiles:
                 next_stage = next_v_tile % NUM_STAGES
@@ -884,9 +910,11 @@ def _define_kernels():
                 cute.copy(tiled_copy_load, thr_gSrc, thr_sData)
                 cute.arch.cp_async_commit_group()
 
+            # Load v value for this thread's V position
             v_global = v_tile * TILE_V + v_idx
             r_v = cutlass.Float32(v[0, i_n, i_hv, v_global])
 
+            # Phase 1: Compute sum_hk
             sum_hk = 0.0
             for k_iter in range(NUM_K_ITERS):
                 k_base = k_iter * ROWS_PER_ITER
@@ -903,6 +931,7 @@ def _define_kernels():
             v_new = (r_v - sum_hk) * r_beta
             v_new = cute.arch.shuffle_sync(v_new, v_local)
 
+            # Phase 2: Update h and compute sum_hq
             sum_hq = 0.0
             for k_iter in range(NUM_K_ITERS):
                 k_base = k_iter * ROWS_PER_ITER
@@ -919,12 +948,16 @@ def _define_kernels():
                     sum_hq, offset=offset * V_PER_WARP, mask=-1, mask_and_clamp=31
                 )
 
+            # Direct register → global write (skip smem_o)
             if k_local == 0:
                 v_global_out = v_tile * TILE_V + v_idx
                 o[(0, i_n, i_hv, v_global_out)] = cutlass.BFloat16(sum_hq)
 
             cute.arch.barrier()
 
+            # Coalesced write h back to GMEM from CURRENT stage
+            # 256 threads write 128×32 = 4096 elements
+            # Each thread writes 4096/256 = 16 elements
             for elem in range(16):
                 flat_idx = tidx + elem * 256
                 k_write = flat_idx // TILE_V
@@ -1167,13 +1200,19 @@ def _create_jit_functions():
             num_bits_per_copy=128,
         )
         num_v_tiles = cute.ceil_div(v_dim, TILE_V)
+        # Use TILE_V_PADDED (36) instead of TILE_V (32) for bank conflict free
+        # PADDING: stride=(36, 1) with 128-bit alignment - reduces bank conflict
         base_smem_layout = cute.make_layout(
-            (TILE_K, TILE_V, NUM_STAGES), stride=(TILE_V, 1, TILE_K * TILE_V)
+            (TILE_K, TILE_V, NUM_STAGES),
+            stride=(TILE_V_PADDED, 1, TILE_K * TILE_V_PADDED),
         )
         thread_layout = cute.make_layout((32, 8), stride=(8, 1))
         val_layout = cute.make_layout((1, 4))
         tiled_copy_load = cute.make_tiled_copy_tv(copy_atom, thread_layout, val_layout)
-        smem_bytes = 4 * TILE_K * TILE_V * NUM_STAGES + 4 * TILE_V + 4 * TILE_K * 2 + 64
+        # smem_bytes uses TILE_V_PADDED for padded layout
+        smem_bytes = (
+            4 * TILE_K * TILE_V_PADDED * NUM_STAGES + 4 * TILE_V + 4 * TILE_K * 2 + 64
+        )
 
         big_kernel(
             tiled_copy_load,
@@ -1245,13 +1284,19 @@ def _create_jit_functions():
             num_bits_per_copy=128,
         )
         num_v_tiles = cute.ceil_div(v_dim, TILE_V)
+        # Use TILE_V_PADDED (36) instead of TILE_V (32) for bank conflict free
+        # PADDING: stride=(36, 1) with 128-bit alignment - reduces bank conflict
         base_smem_layout = cute.make_layout(
-            (TILE_K, TILE_V, NUM_STAGES), stride=(TILE_V, 1, TILE_K * TILE_V)
+            (TILE_K, TILE_V, NUM_STAGES),
+            stride=(TILE_V_PADDED, 1, TILE_K * TILE_V_PADDED),
         )
         thread_layout = cute.make_layout((32, 8), stride=(8, 1))
         val_layout = cute.make_layout((1, 4))
         tiled_copy_load = cute.make_tiled_copy_tv(copy_atom, thread_layout, val_layout)
-        smem_bytes = 4 * TILE_K * TILE_V * NUM_STAGES + 4 * TILE_V + 4 * TILE_K * 2 + 64
+        # smem_bytes uses TILE_V_PADDED for padded layout
+        smem_bytes = (
+            4 * TILE_K * TILE_V_PADDED * NUM_STAGES + 4 * TILE_V + 4 * TILE_K * 2 + 64
+        )
 
         big_kernel_varlen(
             tiled_copy_load,
