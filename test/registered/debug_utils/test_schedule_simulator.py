@@ -576,7 +576,7 @@ class TestCLI(CustomTestCase):
             "--synth-gsp-output-len",
             "2",
             "--synth-seed",
-            "42",
+            "123",
             "--num-gpus",
             "2",
             "--router",
@@ -588,10 +588,8 @@ class TestCLI(CustomTestCase):
         )
         self.assertEqual(result.returncode, 0, f"CLI failed: {result.stderr}")
         for expected in [
-            "step=0    | GPU0[R=2:gsp",
-            "step=0    | GPU1[R=2:gsp",
-            "step=1    | GPU0[R=0:- Q=0:-]",
-            "step=1    | GPU1[R=0:- Q=0:-]",
+            "step=0    | GPU0[R=2:gsp0,gsp1 Q=0:-] | GPU1[R=2:gsp2,gsp3 Q=0:-]",
+            "step=1    | GPU0[R=0:- Q=0:-] | GPU1[R=0:- Q=0:-]",
         ]:
             self.assertIn(expected, result.stdout)
 
