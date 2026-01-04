@@ -55,6 +55,8 @@ class TestPrefillDelayerThroughput(CustomTestCase):
             other_launch_args=[
                 "--max-total-tokens",
                 "1000000",
+                "--mem-fraction-static",
+                "0.6",
             ],
         )
 
