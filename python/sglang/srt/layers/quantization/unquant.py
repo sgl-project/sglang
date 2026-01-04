@@ -301,7 +301,6 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             w = layer.w13_weight.data
             assert w.size(1) % 2 == 0, f"w13_weight dim1 must be even, got {w.size(1)}"
             N = w.size(1) // 2
-            print(f"Reordering w13_weight for SonicMoE fused gated activation...{N}")
             device = w.device
 
             # Cache the permutation indices to avoid rebuilding every layer call
