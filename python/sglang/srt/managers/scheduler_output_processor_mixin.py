@@ -732,11 +732,11 @@ class SchedulerOutputProcessorMixin:
                             layer_entry["logsumexp_candidates"] = lse_val
                             # Compute topk_mass: fraction of attention captured by top-k
                             # topk_mass = sum(exp(logit - logsumexp)) for each top-k entry
+                            # Vectorized computation for efficiency
                             if logits is not None:
-                                import math
-                                topk_logits_list = logits[i].cpu().tolist()[:req_top_k]
-                                topk_mass = sum(math.exp(l - lse_val) for l in topk_logits_list if l is not None)
-                                layer_entry["topk_mass"] = min(topk_mass, 1.0)  # Clamp to [0, 1]
+                                logits_tensor = logits[i][:req_top_k]
+                                topk_mass = torch.exp(logits_tensor - lse_val).sum().clamp(max=1.0).item()
+                                layer_entry["topk_mass"] = topk_mass
                         layers_data[layer_id] = layer_entry
 
                     attention_info = {
@@ -785,11 +785,11 @@ class SchedulerOutputProcessorMixin:
                         lse_val = logits_output.attention_logsumexp_candidates[i].cpu().item()
                         attention_info["logsumexp_candidates"] = lse_val
                         # Compute topk_mass: fraction of attention captured by top-k
+                        # Vectorized computation for efficiency
                         if logits_output.attention_topk_logits is not None:
-                            import math
-                            topk_logits_list = logits_output.attention_topk_logits[i].cpu().tolist()[:req_top_k]
-                            topk_mass = sum(math.exp(l - lse_val) for l in topk_logits_list if l is not None)
-                            attention_info["topk_mass"] = min(topk_mass, 1.0)
+                            logits_tensor = logits_output.attention_topk_logits[i][:req_top_k]
+                            topk_mass = torch.exp(logits_tensor - lse_val).sum().clamp(max=1.0).item()
+                            attention_info["topk_mass"] = topk_mass
 
                 # Add decode_step and think phase to the attention info
                 attention_info["decode_step"] = req.attention_tokens_decode_step
