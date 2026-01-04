@@ -38,15 +38,15 @@ def parse_args():
         help="Batch sizes to test (default: 1 2 4 8)",
     )
     parser.add_argument(
+        "--no-batch",
+        action="store_true",
+        help="Skip batch benchmark, only run sequential",
+    )
+    parser.add_argument(
         "--num-runs",
         type=int,
         default=5,
         help="Number of runs per batch size (default: 5)",
-    )
-    parser.add_argument(
-        "--no-batch",
-        action="store_true",
-        help="Skip batch benchmark, only run sequential",
     )
     return parser.parse_args()
 
