@@ -75,7 +75,7 @@ class Simulator:
 
     def _route_requests(self, incoming_requests: List[SimRequest]) -> None:
         for req in incoming_requests:
-            gpu_id = self.router.route(req, self.gpu_states)
+            gpu_id = self.router.route(req)
             if gpu_id < self.num_gpus_per_engine:
                 self.gpu_states[gpu_id].pending_requests.append(req)
 

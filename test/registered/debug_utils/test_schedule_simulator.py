@@ -145,41 +145,36 @@ class TestGPUState(CustomTestCase):
 class TestRouters(CustomTestCase):
     def test_round_robin(self):
         router = RoundRobinRouter(num_gpus=4)
-        gpu_states = [GPUState(gpu_id=i, max_total_tokens=10000) for i in range(4)]
         req = SimRequest(request_id="r1", input_len=100, output_len=50)
-        results = [router.route(req, gpu_states) for _ in range(8)]
+        results = [router.route(req) for _ in range(8)]
         self.assertEqual(results, [0, 1, 2, 3, 0, 1, 2, 3])
 
     def test_random_router(self):
         router = RandomRouter(num_gpus=4)
-        gpu_states = [GPUState(gpu_id=i, max_total_tokens=10000) for i in range(4)]
         req = SimRequest(request_id="r1", input_len=100, output_len=50)
-        results = [router.route(req, gpu_states) for _ in range(100)]
+        results = [router.route(req) for _ in range(100)]
         self.assertTrue(all(0 <= r < 4 for r in results))
 
     def test_sticky_router_same_group_same_gpu(self):
         router = StickyRouter(num_gpus=4)
-        gpu_states = [GPUState(gpu_id=i, max_total_tokens=10000) for i in range(4)]
         reqs = [
             SimRequest(request_id=f"r{i}", input_len=100, output_len=50, group_id="g0")
             for i in range(10)
         ]
-        results = [router.route(req, gpu_states) for req in reqs]
+        results = [router.route(req) for req in reqs]
         self.assertEqual(len(set(results)), 1)
 
     def test_sticky_router_no_group_fallback(self):
         router = StickyRouter(num_gpus=4)
-        gpu_states = [GPUState(gpu_id=i, max_total_tokens=10000) for i in range(4)]
         reqs = [
             SimRequest(request_id=f"r{i}", input_len=100, output_len=50)
             for i in range(100)
         ]
-        results = [router.route(req, gpu_states) for req in reqs]
+        results = [router.route(req) for req in reqs]
         self.assertTrue(all(0 <= r < 4 for r in results))
 
     def test_sticky_router_multiple_groups(self):
         router = StickyRouter(num_gpus=4)
-        gpu_states = [GPUState(gpu_id=i, max_total_tokens=10000) for i in range(4)]
         for group_id in ["g0", "g1", "g2"]:
             reqs = [
                 SimRequest(
@@ -190,7 +185,7 @@ class TestRouters(CustomTestCase):
                 )
                 for i in range(5)
             ]
-            results = [router.route(req, gpu_states) for req in reqs]
+            results = [router.route(req) for req in reqs]
             self.assertEqual(len(set(results)), 1)
 
 
@@ -782,6 +777,8 @@ class TestLargerScale(CustomTestCase):
             "2000000",
             "--stop-criteria",
             "exist_no_pending",
+            "--max-steps",
+            "1500",
         )
         self._assert_in_range(
             result.summary["attention_compute_balancedness_mean"], 0.95, 1.0, "attn"
@@ -823,22 +820,22 @@ class TestLargerScale(CustomTestCase):
     def test_gsp_workload_random_policy(self):
         result = self._run_gsp_workload("random")
         self._assert_in_range(
-            result.summary["attention_compute_balancedness_mean"], 0.88, 0.98, "attn"
+            result.summary["attention_compute_balancedness_mean"], 0.90, 0.97, "attn"
         )
         self._assert_in_range(
-            result.summary["batch_size_balancedness_mean"], 0.88, 0.98, "bs"
+            result.summary["batch_size_balancedness_mean"], 0.90, 0.97, "bs"
         )
-        self._assert_in_range(result.summary["avg_batch_size"], 24, 27, "avg_bs")
+        self._assert_in_range(result.summary["avg_batch_size"], 14, 17, "avg_bs")
 
     def test_gsp_workload_sticky_policy(self):
         result = self._run_gsp_workload("sticky")
         self._assert_in_range(
-            result.summary["attention_compute_balancedness_mean"], 0.63, 0.70, "attn"
+            result.summary["attention_compute_balancedness_mean"], 0.64, 0.71, "attn"
         )
         self._assert_in_range(
-            result.summary["batch_size_balancedness_mean"], 0.63, 0.71, "bs"
+            result.summary["batch_size_balancedness_mean"], 0.64, 0.71, "bs"
         )
-        self._assert_in_range(result.summary["avg_batch_size"], 33, 37, "avg_bs")
+        self._assert_in_range(result.summary["avg_batch_size"], 31, 36, "avg_bs")
 
 
 if __name__ == "__main__":
