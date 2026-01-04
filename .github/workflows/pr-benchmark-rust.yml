@@ -183,106 +183,33 @@ jobs:
 
       - name: Generate summary
         run: |
+          generate_section() {
+            local title="$1" dir_name="$2" lines="${3:-100}"
+            local dir="benchmark-results/${dir_name}-${{ github.sha }}"
+            echo "### $title" >> summary.md
+            if [ -d "$dir" ]; then
+              echo "✅ **Completed**" >> summary.md
+              if [ -f "$dir/benchmark_output.txt" ]; then
+                echo -e "\n<details>\n<summary>View Results</summary>\n\n\`\`\`" >> summary.md
+                tail -"$lines" "$dir/benchmark_output.txt" >> summary.md
+                echo -e "\`\`\`\n</details>" >> summary.md
+              fi
+            else
+              echo "❌ Failed or skipped" >> summary.md
+            fi
+            echo "" >> summary.md
+          }
+
           echo "## 🚀 Benchmark Results Summary" > summary.md
           echo "" >> summary.md
 
-          echo "### Request Processing" >> summary.md
-          REQ_DIR="benchmark-results/request-processing-results-${{ github.sha }}"
-          if [ -d "$REQ_DIR" ]; then
-            echo "✅ **Completed**" >> summary.md
-            if [ -f "$REQ_DIR/benchmark_output.txt" ]; then
-              echo "" >> summary.md
-              echo "<details>" >> summary.md
-              echo "<summary>View Results</summary>" >> summary.md
-              echo "" >> summary.md
-              echo '```' >> summary.md
-              grep -A 100 "SGLang Model Gateway\|Quick Performance\|Performance Insights" "$REQ_DIR/benchmark_output.txt" | head -50 >> summary.md || cat "$REQ_DIR/benchmark_output.txt" | tail -60 >> summary.md
-              echo '```' >> summary.md
-              echo "</details>" >> summary.md
-            fi
-          else
-            echo "❌ Failed or skipped" >> summary.md
-          fi
-          echo "" >> summary.md
+          generate_section "Request Processing" "request-processing-results" 60
+          generate_section "Tokenizer" "tokenizer-results" 100
+          generate_section "Tool Parser" "tool-parser-results" 100
+          generate_section "Radix Tree (Cache-Aware Routing)" "tree-results" 50
+          generate_section "Manual Policy (Sticky Sessions)" "manual-policy-results" 100
 
-          echo "### Tokenizer" >> summary.md
-          TOK_DIR="benchmark-results/tokenizer-results-${{ github.sha }}"
-          if [ -d "$TOK_DIR" ]; then
-            echo "✅ **Completed**" >> summary.md
-            if [ -f "$TOK_DIR/benchmark_output.txt" ]; then
-              echo "" >> summary.md
-              echo "<details>" >> summary.md
-              echo "<summary>View Results</summary>" >> summary.md
-              echo "" >> summary.md
-              echo '```' >> summary.md
-              grep -A 200 "TOKENIZER BENCHMARK SUMMARY\|ENCODING THROUGHPUT" "$TOK_DIR/benchmark_output.txt" | head -100 >> summary.md || cat "$TOK_DIR/benchmark_output.txt" | tail -100 >> summary.md
-              echo '```' >> summary.md
-              echo "</details>" >> summary.md
-            fi
-          else
-            echo "❌ Failed or skipped" >> summary.md
-          fi
-          echo "" >> summary.md
-
-          echo "### Tool Parser" >> summary.md
-          TOOL_DIR="benchmark-results/tool-parser-results-${{ github.sha }}"
-          if [ -d "$TOOL_DIR" ]; then
-            echo "✅ **Completed**" >> summary.md
-            if [ -f "$TOOL_DIR/benchmark_output.txt" ]; then
-              echo "" >> summary.md
-              echo "<details>" >> summary.md
-              echo "<summary>View Results</summary>" >> summary.md
-              echo "" >> summary.md
-              echo '```' >> summary.md
-              grep -A 200 "TOOL PARSER BENCHMARK SUMMARY\|REGISTRY OPERATIONS\|COMPLETE PARSING" "$TOOL_DIR/benchmark_output.txt" | head -100 >> summary.md || cat "$TOOL_DIR/benchmark_output.txt" | tail -100 >> summary.md
-              echo '```' >> summary.md
-              echo "</details>" >> summary.md
-            fi
-          else
-            echo "❌ Failed or skipped" >> summary.md
-          fi
-          echo "" >> summary.md
-
-          echo "### Radix Tree (Cache-Aware Routing)" >> summary.md
-          TREE_DIR="benchmark-results/tree-results-${{ github.sha }}"
-          if [ -d "$TREE_DIR" ]; then
-            echo "✅ **Completed**" >> summary.md
-            if [ -f "$TREE_DIR/benchmark_output.txt" ]; then
-              echo "" >> summary.md
-              echo "<details>" >> summary.md
-              echo "<summary>View Results</summary>" >> summary.md
-              echo "" >> summary.md
-              echo '```' >> summary.md
-              grep -A 50 "RADIX TREE BENCHMARK SUMMARY" "$TREE_DIR/benchmark_output.txt" | head -50 >> summary.md || cat "$TREE_DIR/benchmark_output.txt" | tail -50 >> summary.md
-              echo '```' >> summary.md
-              echo "</details>" >> summary.md
-            fi
-          else
-            echo "❌ Failed or skipped" >> summary.md
-          fi
-          echo "" >> summary.md
-
-          echo "### Manual Policy (Sticky Sessions)" >> summary.md
-          MANUAL_DIR="benchmark-results/manual-policy-results-${{ github.sha }}"
-          if [ -d "$MANUAL_DIR" ]; then
-            echo "✅ **Completed**" >> summary.md
-            if [ -f "$MANUAL_DIR/benchmark_output.txt" ]; then
-              echo "" >> summary.md
-              echo "<details>" >> summary.md
-              echo "<summary>View Results</summary>" >> summary.md
-              echo "" >> summary.md
-              echo '```' >> summary.md
-              cat "$MANUAL_DIR/benchmark_output.txt" | tail -100 >> summary.md
-              echo '```' >> summary.md
-              echo "</details>" >> summary.md
-            fi
-          else
-            echo "❌ Failed or skipped" >> summary.md
-          fi
-
-          echo "" >> summary.md
-          echo "---" >> summary.md
-          echo "_Generated at $(date -u '+%Y-%m-%d %H:%M:%S UTC')_" >> summary.md
+          echo -e "---\n_Generated at $(date -u '+%Y-%m-%d %H:%M:%S UTC')_" >> summary.md
 
           cat summary.md
           cat summary.md >> $GITHUB_STEP_SUMMARY
