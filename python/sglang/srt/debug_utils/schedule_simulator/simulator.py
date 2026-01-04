@@ -44,7 +44,7 @@ class Simulator:
         step_records: List[StepRecord] = []
         incoming_requests = list(requests)
 
-        while self._has_work(incoming_requests):
+        while True:
             self._route_requests(incoming_requests)
             incoming_requests.clear()
             self._schedule_all_gpus()
@@ -60,15 +60,14 @@ class Simulator:
 
         return SimulationResult(step_records=step_records, summary=self._get_summary())
 
-    def _has_work(self, incoming_requests: List[SimRequest]) -> bool:
-        return bool(incoming_requests) or any(
-            gpu.pending_requests or gpu.running_requests for gpu in self.gpu_states
-        )
-
     def _should_stop(self) -> bool:
         if self.stop_criteria == "exist_no_pending":
             return any(not gpu.pending_requests for gpu in self.gpu_states)
-        return False
+        if self.stop_criteria == "all_done":
+            return not any(
+                gpu.pending_requests or gpu.running_requests for gpu in self.gpu_states
+            )
+        raise ValueError(f"Unknown stop criteria: {self.stop_criteria}")
 
     def _route_requests(self, incoming_requests: List[SimRequest]) -> None:
         for req in incoming_requests:
