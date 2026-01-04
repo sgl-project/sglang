@@ -148,9 +148,10 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
         self.draft_tp_context = (
             draft_tp_context if server_args.enable_dp_attention else empty_context
         )
-        with self.draft_tp_context(
-            self.draft_runner_list[0].tp_group
-        ), speculative_moe_backend_context():
+        with (
+            self.draft_tp_context(self.draft_runner_list[0].tp_group),
+            speculative_moe_backend_context(),
+        ):
             self.init_attention_backend()
             self.init_cuda_graphs()
 
@@ -168,19 +169,20 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
             self.draft_runner_list[i].model.set_embed_and_head(embed, head)
 
     def init_attention_backend(self):
-        # Create attn backends
+        # Create attn backends using DraftBackendFactory for backend flexibility
+        # This allows MTP to work with non-FA3 backends (e.g., Triton, FlashInfer)
+        from sglang.srt.speculative.draft_utils import DraftBackendFactory
+
         self.draft_extend_attn_backend_list = []
         for step in range(self.speculative_num_steps):
-            from sglang.srt.layers.attention.flashattention_backend import (
-                FlashAttentionBackend,
+            draft_backend_factory = DraftBackendFactory(
+                self.server_args,
+                self.draft_runner_list[step],
+                self.topk,
+                self.speculative_num_steps,
             )
-
             self.draft_extend_attn_backend_list.append(
-                FlashAttentionBackend(
-                    model_runner=self.draft_runner_list[step],
-                    skip_prefill=False,
-                    speculative_step_id=step,
-                )
+                draft_backend_factory.create_draft_extend_backend()
             )
             self.draft_runner_list[step].attn_backend = (
                 self.draft_extend_attn_backend_list[-1]
