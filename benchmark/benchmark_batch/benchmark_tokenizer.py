@@ -43,11 +43,15 @@ def main():
         token_ids = generate_random_token_ids(
             max_batch_size, args.num_tokens, tokenizer
         )
+        decode_kwargs = dict(
+            skip_special_tokens=True,
+            spaces_between_special_tokens=True,
+        )
         run_benchmark(
             name="decode",
             data=token_ids,
-            sequential_fn=lambda batch: [tokenizer.decode(ids) for ids in batch],
-            batch_fn=lambda batch: tokenizer.batch_decode(batch),
+            sequential_fn=lambda batch: [tokenizer.decode(ids, **decode_kwargs) for ids in batch],
+            batch_fn=lambda batch: tokenizer.batch_decode(batch, **decode_kwargs),
             batch_sizes=args.batch_sizes,
             num_runs=args.num_runs,
             skip_batch=args.no_batch,
