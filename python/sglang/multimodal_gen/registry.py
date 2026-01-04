@@ -25,7 +25,10 @@ from sglang.multimodal_gen.configs.pipeline_configs import (
     ZImagePipelineConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
-from sglang.multimodal_gen.configs.pipeline_configs.flux import Flux2PipelineConfig
+from sglang.multimodal_gen.configs.pipeline_configs.flux import (
+    Flux2PipelineConfig,
+    FluxKontextPipelineConfig,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
     QwenImageEditPipelineConfig,
     QwenImageEditPlus_2511_PipelineConfig,
@@ -265,6 +268,14 @@ def get_model_info(model_path: str) -> Optional[ModelInfo]:
         logger.error(f"'_class_name' not found in model_index.json for '{model_path}'")
         return None
 
+    # Special handling for Flux Kontext: override pipeline class if needed
+    # This ensures we use FluxKontextPipeline even if model_index.json has a different _class_name
+    if "kontext" in model_path.lower() and pipeline_class_name != "FluxKontextPipeline":
+        logger.info(
+            f"Detected Kontext model path, overriding pipeline class from '{pipeline_class_name}' to 'FluxKontextPipeline'"
+        )
+        pipeline_class_name = "FluxKontextPipeline"
+
     pipeline_cls = _PIPELINE_REGISTRY.get(pipeline_class_name)
     if not pipeline_cls:
         logger.error(
@@ -407,7 +418,17 @@ def _register_configs():
         hf_model_paths=[
             "black-forest-labs/FLUX.1-dev",
         ],
-        model_detectors=[lambda hf_id: "flux.1" in hf_id.lower()],
+        model_detectors=[
+            lambda hf_id: "flux.1" in hf_id.lower() and "kontext" not in hf_id.lower()
+        ],
+    )
+    register_configs(
+        sampling_param_cls=FluxSamplingParams,
+        pipeline_config_cls=FluxKontextPipelineConfig,
+        hf_model_paths=[
+            "black-forest-labs/FLUX.1-Kontext-dev",
+        ],
+        model_detectors=[lambda hf_id: "kontext" in hf_id.lower()],
     )
     register_configs(
         sampling_param_cls=FluxSamplingParams,

@@ -4,7 +4,10 @@ from sglang.multimodal_gen.configs.pipeline_configs.base import (
     PipelineConfig,
     SlidingTileAttnConfig,
 )
-from sglang.multimodal_gen.configs.pipeline_configs.flux import FluxPipelineConfig
+from sglang.multimodal_gen.configs.pipeline_configs.flux import (
+    FluxKontextPipelineConfig,
+    FluxPipelineConfig,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.flux_finetuned import (
     Flux2FinetunedPipelineConfig,
 )
@@ -24,6 +27,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.zimage import ZImagePipeline
 __all__ = [
     "HunyuanConfig",
     "FastHunyuanConfig",
+    "FluxKontextPipelineConfig",
     "FluxPipelineConfig",
     "Flux2FinetunedPipelineConfig",
     "PipelineConfig",
