@@ -28,7 +28,10 @@ use tracing::{debug, error, field::Empty, info, info_span, warn, Span};
 
 pub use crate::core::token_bucket::TokenBucket;
 use crate::{
-    observability::metrics::{method_to_static_str, metrics_labels, Metrics},
+    observability::{
+        inflight_tracker::InFlightRequestTracker,
+        metrics::{method_to_static_str, metrics_labels, Metrics},
+    },
     routers::error::extract_error_code_from_response,
     server::AppState,
     wasm::{
@@ -282,7 +285,7 @@ impl<B> MakeSpan<B> for RequestSpan {
         // Don't try to extract request ID here - it won't be available yet
         // The RequestIdLayer runs after TraceLayer creates the span
         info_span!(
-            target: "sgl_model_gateway::otel-trace",
+            target: "smg::otel-trace",
             "http_request",
             method = %request.method(),
             uri = %request.uri(),
@@ -291,7 +294,7 @@ impl<B> MakeSpan<B> for RequestSpan {
             status_code = Empty,
             latency = Empty,
             error = Empty,
-            module = "sgl_model_gateway"
+            module = "smg"
         )
     }
 }
@@ -316,7 +319,7 @@ impl<B> OnRequest<B> for RequestLogger {
 
         // Log the request start
         info!(
-            target: "sgl_model_gateway::request",
+            target: "smg::request",
             "started processing request"
         );
     }
@@ -355,17 +358,17 @@ impl<B> OnResponse<B> for ResponseLogger {
         let _enter = span.enter();
         if status.is_server_error() {
             error!(
-                target: "sgl_model_gateway::response",
+                target: "smg::response",
                 "request failed with server error"
             );
         } else if status.is_client_error() {
             warn!(
-                target: "sgl_model_gateway::response",
+                target: "smg::response",
                 "request failed with client error"
             );
         } else {
             info!(
-                target: "sgl_model_gateway::response",
+                target: "smg::response",
                 "finished processing request"
             );
         }
@@ -630,12 +633,14 @@ pub async fn concurrency_limit_middleware(
 static ACTIVE_HTTP_CONNECTIONS: AtomicU64 = AtomicU64::new(0);
 
 /// Tower Layer for HTTP metrics collection (SMG Layer 1 metrics)
-#[derive(Clone, Copy, Default)]
-pub struct HttpMetricsLayer;
+#[derive(Clone)]
+pub struct HttpMetricsLayer {
+    tracker: Arc<InFlightRequestTracker>,
+}
 
 impl HttpMetricsLayer {
-    pub fn new() -> Self {
-        Self
+    pub fn new(tracker: Arc<InFlightRequestTracker>) -> Self {
+        Self { tracker }
     }
 }
 
@@ -643,7 +648,10 @@ impl<S> Layer<S> for HttpMetricsLayer {
     type Service = HttpMetricsMiddleware<S>;
 
     fn layer(&self, inner: S) -> Self::Service {
-        HttpMetricsMiddleware { inner }
+        HttpMetricsMiddleware {
+            inner,
+            in_flight_request_tracker: self.tracker.clone(),
+        }
     }
 }
 
@@ -651,6 +659,7 @@ impl<S> Layer<S> for HttpMetricsLayer {
 #[derive(Clone)]
 pub struct HttpMetricsMiddleware<S> {
     inner: S,
+    in_flight_request_tracker: Arc<InFlightRequestTracker>,
 }
 
 impl<S> Service<Request> for HttpMetricsMiddleware<S>
@@ -674,14 +683,19 @@ where
         let start = Instant::now();
 
         let mut inner = self.inner.clone();
+        let in_flight_request_tracker = self.in_flight_request_tracker.clone();
 
         Box::pin(async move {
             // Increment inside async block - ensures no leak if future is dropped before polling
             let active = ACTIVE_HTTP_CONNECTIONS.fetch_add(1, Ordering::Relaxed) + 1;
             Metrics::set_http_connections_active(active as usize);
 
+            let guard = in_flight_request_tracker.track();
+
             // Capture result before decrementing to ensure decrement happens on error too
             let result = inner.call(req).await;
+
+            drop(guard);
 
             // Always decrement, regardless of success or failure
             let active = ACTIVE_HTTP_CONNECTIONS.fetch_sub(1, Ordering::Relaxed) - 1;

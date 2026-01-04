@@ -341,8 +341,16 @@ pub enum PolicyConfig {
     /// - X-SMG-Routing-Key: Routes to a cached worker or assigns a new one
     /// - Provides true sticky sessions with zero key redistribution on worker add
     /// - Falls back to random selection if no routing key is provided
+    /// - Supports LRU eviction when cache size exceeds max_entries
     #[serde(rename = "manual")]
-    Manual,
+    Manual {
+        /// Interval between TTL eviction cycles (seconds, default: 60)
+        #[serde(default = "default_manual_eviction_interval_secs")]
+        eviction_interval_secs: u64,
+        /// Maximum idle time before eviction (seconds, default: 14400 = 4 hours)
+        #[serde(default = "default_manual_max_idle_secs")]
+        max_idle_secs: u64,
+    },
 
     /// Consistent hashing policy using hash ring for session affinity:
     /// - X-SMG-Target-Worker: Direct routing to a specific worker by URL
@@ -376,6 +384,14 @@ fn default_load_factor() -> f64 {
     1.25
 }
 
+fn default_manual_eviction_interval_secs() -> u64 {
+    60
+}
+
+fn default_manual_max_idle_secs() -> u64 {
+    4 * 3600
+}
+
 impl PolicyConfig {
     pub fn name(&self) -> &'static str {
         match self {
@@ -384,7 +400,7 @@ impl PolicyConfig {
             PolicyConfig::CacheAware { .. } => "cache_aware",
             PolicyConfig::PowerOfTwo { .. } => "power_of_two",
             PolicyConfig::Bucket { .. } => "bucket",
-            PolicyConfig::Manual => "manual",
+            PolicyConfig::Manual { .. } => "manual",
             PolicyConfig::ConsistentHashing => "consistent_hashing",
             PolicyConfig::PrefixHash { .. } => "prefix_hash",
         }
