@@ -105,6 +105,7 @@ class MultiModalStaticCache(MultimodalCache):
         embedding: EmbeddingResult,
         loc: Optional[torch.Tensor] = None,
     ) -> bool:
+        assert isinstance(embedding, EmbeddingResult), embedding
         if mm_hash in self.mm_cache:
             self.mm_cache.move_to_end(mm_hash)
             return True
