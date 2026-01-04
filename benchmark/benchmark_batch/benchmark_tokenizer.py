@@ -175,6 +175,36 @@ def print_results(results, func_name):
         )
 
 
+def run_encode_benchmark(tokenizer, num_tokens, batch_sizes, num_runs):
+    max_batch_size = max(batch_sizes)
+    all_prompts = generate_random_prompts(max_batch_size, num_tokens, tokenizer)
+    print("\n" + "=" * 60)
+    print("ENCODE BENCHMARK")
+    print("=" * 60)
+
+    results = []
+    for batch_size in batch_sizes:
+        result = benchmark_encode(all_prompts, batch_size, tokenizer, num_runs)
+        results.append(result)
+
+    print_results(results, "encode")
+
+
+def run_decode_benchmark(tokenizer, num_tokens, batch_sizes, num_runs):
+    max_batch_size = max(batch_sizes)
+    all_token_ids = generate_random_token_ids(max_batch_size, num_tokens, tokenizer)
+    print("\n" + "=" * 60)
+    print("DECODE BENCHMARK")
+    print("=" * 60)
+
+    results = []
+    for batch_size in batch_sizes:
+        result = benchmark_decode(all_token_ids, batch_size, tokenizer, num_runs)
+        results.append(result)
+
+    print_results(results, "decode")
+
+
 def main():
     args = parse_args()
 
@@ -188,33 +218,11 @@ def main():
 
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer, trust_remote_code=True)
 
-    max_batch_size = max(args.batch_sizes)
-
     if "encode" in args.function:
-        all_prompts = generate_random_prompts(max_batch_size, args.num_tokens, tokenizer)
-        print("\n" + "=" * 60)
-        print("ENCODE BENCHMARK")
-        print("=" * 60)
-
-        encode_results = []
-        for batch_size in args.batch_sizes:
-            result = benchmark_encode(all_prompts, batch_size, tokenizer, args.num_runs)
-            encode_results.append(result)
-
-        print_results(encode_results, "encode")
+        run_encode_benchmark(tokenizer, args.num_tokens, args.batch_sizes, args.num_runs)
 
     if "decode" in args.function:
-        all_token_ids = generate_random_token_ids(max_batch_size, args.num_tokens, tokenizer)
-        print("\n" + "=" * 60)
-        print("DECODE BENCHMARK")
-        print("=" * 60)
-
-        decode_results = []
-        for batch_size in args.batch_sizes:
-            result = benchmark_decode(all_token_ids, batch_size, tokenizer, args.num_runs)
-            decode_results.append(result)
-
-        print_results(decode_results, "decode")
+        run_decode_benchmark(tokenizer, args.num_tokens, args.batch_sizes, args.num_runs)
 
 
 if __name__ == "__main__":
