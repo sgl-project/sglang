@@ -5,7 +5,7 @@ import tempfile
 import unittest
 
 from sglang.srt.debug_utils.schedule_simulator import (
-    AttentionBalancednessRecorder,
+    AttentionComputeBalancednessRecorder,
     BatchSizeBalancednessRecorder,
     FIFOScheduler,
     GPUState,
@@ -246,8 +246,8 @@ class TestMetrics(CustomTestCase):
             recorder.get_summary()["batch_size_balancedness_mean"], 0.75
         )
 
-    def test_attention_balancedness(self):
-        recorder = AttentionBalancednessRecorder()
+    def test_attention_compute_balancedness(self):
+        recorder = AttentionComputeBalancednessRecorder()
         gpu_states = [GPUState(gpu_id=i, max_total_tokens=10000) for i in range(2)]
         gpu_states[0].running_requests = [
             SimRequest(request_id="r1", input_len=100, output_len=50)
@@ -257,7 +257,7 @@ class TestMetrics(CustomTestCase):
         ]
         recorder.on_step_end(0, gpu_states)
         self.assertAlmostEqual(
-            recorder.get_summary()["attention_balancedness_mean"], 0.75
+            recorder.get_summary()["attention_compute_balancedness_mean"], 0.75
         )
 
     def test_empty_history(self):
@@ -410,7 +410,7 @@ class TestSimulator(CustomTestCase):
             scheduler=FIFOScheduler(),
             recorders=[
                 BatchSizeBalancednessRecorder(),
-                AttentionBalancednessRecorder(),
+                AttentionComputeBalancednessRecorder(),
             ],
             max_total_tokens=100,
         )
@@ -772,7 +772,7 @@ class TestLargerScale(CustomTestCase):
             "--router", "random",
             "--max-total-tokens", "2000000",
         )
-        self.assertGreater(result.summary["attention_balancedness_mean"], 0.7)
+        self.assertGreater(result.summary["attention_compute_balancedness_mean"], 0.7)
         self.assertGreater(result.summary["batch_size_balancedness_mean"], 0.7)
 
     def test_gsp_random_policy(self):
@@ -788,7 +788,7 @@ class TestLargerScale(CustomTestCase):
             "--router", "random",
             "--max-total-tokens", "2000000",
         )
-        self.assertGreater(result.summary["attention_balancedness_mean"], 0.7)
+        self.assertGreater(result.summary["attention_compute_balancedness_mean"], 0.7)
         self.assertGreater(result.summary["batch_size_balancedness_mean"], 0.7)
 
     def test_gsp_sticky_policy(self):
@@ -804,7 +804,7 @@ class TestLargerScale(CustomTestCase):
             "--router", "sticky",
             "--max-total-tokens", "2000000",
         )
-        self.assertLess(result.summary["attention_balancedness_mean"], 0.7)
+        self.assertLess(result.summary["attention_compute_balancedness_mean"], 0.7)
         self.assertLess(result.summary["batch_size_balancedness_mean"], 0.7)
 
 

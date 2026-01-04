@@ -10,7 +10,7 @@ from sglang.srt.debug_utils.schedule_simulator.data_source.data_synthesis import
     generate_random_requests,
 )
 from sglang.srt.debug_utils.schedule_simulator.metrics import (
-    AttentionBalancednessRecorder,
+    AttentionComputeBalancednessRecorder,
     BatchSizeBalancednessRecorder,
 )
 from sglang.srt.debug_utils.schedule_simulator.request import SimRequest
@@ -123,7 +123,7 @@ def main(args: argparse.Namespace) -> SimulationResult:
         num_gpus=args.num_gpus,
         router=router,
         scheduler=scheduler,
-        recorders=[BatchSizeBalancednessRecorder(), AttentionBalancednessRecorder()],
+        recorders=[BatchSizeBalancednessRecorder(), AttentionComputeBalancednessRecorder()],
         log_level=args.log_level,
         max_total_tokens=args.max_total_tokens,
     )
