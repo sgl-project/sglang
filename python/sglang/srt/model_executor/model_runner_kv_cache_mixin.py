@@ -10,7 +10,6 @@ from sglang.srt.distributed.parallel_state import get_world_group
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.mem_cache.allocator import (
     PagedTokenToKVPoolAllocator,
-    SWATokenToKVPoolAllocator,
     TokenToKVPoolAllocator,
 )
 from sglang.srt.mem_cache.memory_pool import (
@@ -23,8 +22,8 @@ from sglang.srt.mem_cache.memory_pool import (
     MLATokenToKVPoolFP4,
     NSATokenToKVPool,
     ReqToTokenPool,
-    SWAKVPool,
 )
+from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool, SWATokenToKVPoolAllocator
 from sglang.srt.utils.common import (
     get_available_gpu_memory,
     is_float4_e2m1fn_x2,

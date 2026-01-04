@@ -49,11 +49,8 @@ from sglang.srt.managers.schedule_batch import (
     ScheduleBatch,
 )
 from sglang.srt.mem_cache.common import release_kv_cache
-from sglang.srt.mem_cache.memory_pool import (
-    HybridLinearKVPool,
-    NSATokenToKVPool,
-    SWAKVPool,
-)
+from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, NSATokenToKVPool
+from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.tracing.trace import trace_event_batch, trace_slice, trace_slice_end
 
 if TYPE_CHECKING:
