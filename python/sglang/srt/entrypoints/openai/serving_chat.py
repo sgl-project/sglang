@@ -243,6 +243,8 @@ class OpenAIServingChat(OpenAIServingBase):
             data_parallel_rank=request.data_parallel_rank,
             return_hidden_states=request.return_hidden_states,
             return_attention_tokens=request.return_attention_tokens,
+            top_k_attention=request.top_k_attention,
+            attention_capture_layer_id=request.attention_capture_layer_id,
             rid=request.rid,
             extra_key=self._compute_extra_key(request),
             require_reasoning=self._get_reasoning_from_request(request),

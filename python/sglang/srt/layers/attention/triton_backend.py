@@ -1031,11 +1031,11 @@ class TritonAttnBackend(AttentionBackend):
         )
 
         # Compute top-k attention tokens for interpretability
-        # Layer gating: only compute on the specified layer (default: last attention layer)
-        # This avoids computing on every layer and only keeping the last result
+        # Multi-layer capture: compute on all specified layers
         if (
             forward_batch.capture_attention_tokens
-            and layer.layer_id == forward_batch.attention_capture_layer_id
+            and forward_batch.attention_capture_layer_ids
+            and layer.layer_id in forward_batch.attention_capture_layer_ids
         ):
             self._compute_attention_token_info(
                 q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
@@ -1075,7 +1075,7 @@ class TritonAttnBackend(AttentionBackend):
         from sglang.srt.model_executor.forward_batch_info import AttentionTokenInfo
 
         try:
-            topk_scores, topk_indices, topk_logits, logsumexp_all = compute_topk_attention_chunked(
+            topk_scores, topk_indices, topk_logits, logsumexp_candidates = compute_topk_attention_chunked(
                 q,
                 k_buffer,
                 kv_indptr,
@@ -1083,15 +1083,25 @@ class TritonAttnBackend(AttentionBackend):
                 sm_scale,
                 top_k=forward_batch.attention_top_k,
                 chunk_size=2048,  # Tuned for memory/accuracy tradeoff
+                window=forward_batch.attention_window,
             )
 
-            forward_batch.attention_token_info = AttentionTokenInfo(
+            info = AttentionTokenInfo(
                 token_positions=topk_indices,
                 attention_scores=topk_scores,
                 topk_logits=topk_logits,
-                logsumexp_all=logsumexp_all,
+                logsumexp_candidates=logsumexp_candidates,
                 layer_id=layer_id,
             )
+
+            # Store in multi-layer dict
+            if forward_batch.attention_token_infos is not None:
+                forward_batch.attention_token_infos[layer_id] = info
+
+            # Also set single-layer field for backward compatibility
+            # (keeps the last layer's info, which is typically the most useful)
+            forward_batch.attention_token_info = info
+
         except Exception as e:
             # Don't let attention capture errors break inference
             import logging
