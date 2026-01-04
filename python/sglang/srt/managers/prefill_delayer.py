@@ -73,5 +73,8 @@ class PrefillDelayer:
 
 
 class PrefillDelayerSinglePassExecutor:
+    def __init__(self, prefill_delayer: PrefillDelayer):
+        self._prefill_delayer = prefill_delayer
+
     def should_allow_prefill(self, local_prefillable: int) -> bool:
         return TODO

@@ -22,6 +22,7 @@ import sys
 import time
 from collections import deque
 from concurrent import futures
+from contextlib import nullcontext
 from dataclasses import dataclass
 from http import HTTPStatus
 from typing import Any, Deque, Dict, List, Optional, Tuple, Union
@@ -1911,7 +1912,11 @@ class Scheduler(
         return res
 
     def get_new_batch_prefill(self) -> Optional[ScheduleBatch]:
-        with PrefillDelayerSinglePassExecutor(self.prefill_delayer) as prefill_delayer_single_pass:
+        with (
+            PrefillDelayerSinglePassExecutor(self.prefill_delayer)
+            if self.prefill_delayer
+            else nullcontext()
+        ) as prefill_delayer_single_pass:
             return self._get_new_batch_prefill_raw(prefill_delayer_single_pass=prefill_delayer_single_pass)
 
     def _get_new_batch_prefill_raw(self, prefill_delayer_single_pass: PrefillDelayerSinglePassExecutor) -> Optional[ScheduleBatch]:
