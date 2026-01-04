@@ -45,6 +45,17 @@ class TextEncodingStage(PipelineStage):
         self.tokenizers = tokenizers
         self.text_encoders = text_encoders
 
+    def load_model(self):
+        if self.server_args.text_encoder_cpu_offload:
+            device = get_local_torch_device()
+            for text_encoder in self.text_encoders:
+                text_encoder.to(device)
+
+    def offload_model(self):
+        if self.server_args.text_encoder_cpu_offload:
+            for text_encoder in self.text_encoders:
+                text_encoder.to("cpu", non_blocking=True)
+
     @torch.no_grad()
     def forward(
         self,
@@ -68,6 +79,8 @@ class TextEncodingStage(PipelineStage):
 
         # Encode positive prompt with all available encoders
         assert batch.prompt is not None
+
+        self.load_model()
         prompt_text: str | list[str] = batch.prompt
 
         all_indices: list[int] = list(range(len(self.text_encoders)))
@@ -108,6 +121,8 @@ class TextEncodingStage(PipelineStage):
             if batch.negative_attention_mask is not None:
                 for nm in neg_masks_list:
                     batch.negative_attention_mask.append(nm)
+
+        self.offload_model()
 
         return batch
 
