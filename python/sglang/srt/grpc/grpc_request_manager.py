@@ -8,7 +8,6 @@ import copy
 import dataclasses
 import logging
 import os
-import pickle
 import signal
 import sys
 import threading
@@ -801,9 +800,7 @@ class GrpcRequestManager:
     async def _send_to_scheduler(self, obj):
         """Send an object to the scheduler via ZMQ."""
         try:
-            self.send_to_scheduler.send_multipart(
-                [b"NORM", pickle.dumps(obj)], copy=False
-            )
+            self.send_to_scheduler.send_pyobj(obj)
         except Exception as e:
             logger.error(f"Failed to send to scheduler: {e}")
             raise
