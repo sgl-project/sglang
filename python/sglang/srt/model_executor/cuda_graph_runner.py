@@ -639,6 +639,11 @@ class CudaGraphRunner:
             assert self.enable_pdmux
             attn_backend = self.model_runner.decode_attn_backend_group[stream_idx]
 
+        # Check if attention token capture is enabled
+        server_args = self.model_runner.server_args
+        capture_attention_tokens = server_args.return_attention_tokens
+        attention_top_k = server_args.attention_tokens_top_k
+
         forward_batch = ForwardBatch(
             forward_mode=self.capture_forward_mode,
             batch_size=bs,
@@ -670,6 +675,8 @@ class CudaGraphRunner:
             num_token_non_padded=buffers.num_token_non_padded,
             global_forward_mode=self.capture_forward_mode,
             lora_ids=lora_ids,
+            capture_attention_tokens=capture_attention_tokens,
+            attention_top_k=attention_top_k,
         )
         self.tbo_plugin.capture_one_batch_size(forward_batch, num_tokens=num_tokens)
 

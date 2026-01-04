@@ -1056,20 +1056,30 @@ class TritonAttnBackend(AttentionBackend):
         forward_batch,
         layer_id: int,
     ):
-        """Compute top-k attention tokens for interpretability."""
-        from sglang.srt.layers.attention.triton_ops.topk_attention import (
-            compute_topk_attention_tokens,
+        """
+        Compute top-k attention tokens for interpretability.
+
+        Uses memory-efficient chunked approach:
+        - For small sequences (<2K tokens): Direct PyTorch computation
+        - For large sequences: Chunked Triton kernel
+
+        Memory usage: O(batch × heads × num_chunks) instead of O(batch × heads × seq_len)
+        For 1M context: ~125KB vs ~256MB
+        """
+        from sglang.srt.layers.attention.triton_ops.decode_attention_with_topk import (
+            compute_topk_attention_chunked,
         )
         from sglang.srt.model_executor.forward_batch_info import AttentionTokenInfo
 
         try:
-            topk_scores, topk_indices = compute_topk_attention_tokens(
+            topk_scores, topk_indices = compute_topk_attention_chunked(
                 q,
                 k_buffer,
                 kv_indptr,
                 kv_indices,
                 sm_scale,
                 top_k=forward_batch.attention_top_k,
+                chunk_size=2048,  # Tuned for memory/accuracy tradeoff
             )
 
             forward_batch.attention_token_info = AttentionTokenInfo(

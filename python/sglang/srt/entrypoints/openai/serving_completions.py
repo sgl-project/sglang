@@ -204,6 +204,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
         completion_tokens = {}
         cached_tokens = {}
         hidden_states = {}
+        attention_tokens = {}
 
         try:
             async for content in self.tokenizer_manager.generate_request(
@@ -216,6 +217,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
                 completion_tokens[index] = content["meta_info"]["completion_tokens"]
                 cached_tokens[index] = content["meta_info"].get("cached_tokens", 0)
                 hidden_states[index] = content["meta_info"].get("hidden_states", None)
+                attention_tokens[index] = content["meta_info"].get("attention_tokens", None)
 
                 stream_buffer = stream_buffers.get(index, "")
                 # Handle echo for first chunk
@@ -311,6 +313,26 @@ class OpenAIServingCompletion(OpenAIServingBase):
                             model=request.model,
                         )
                         yield f"data: {hidden_states_chunk.model_dump_json()}\n\n"
+
+            # Send attention tokens if requested (for interpretability)
+            if request.return_attention_tokens and attention_tokens:
+                for index, choice_attention_tokens in attention_tokens.items():
+                    if choice_attention_tokens:
+                        attention_tokens_chunk = CompletionStreamResponse(
+                            id=content["meta_info"]["id"],
+                            created=created,
+                            object="text_completion",
+                            choices=[
+                                CompletionResponseStreamChoice(
+                                    index=index,
+                                    text="",
+                                    attention_tokens=choice_attention_tokens,
+                                    finish_reason=None,
+                                )
+                            ],
+                            model=request.model,
+                        )
+                        yield f"data: {attention_tokens_chunk.model_dump_json()}\n\n"
 
             # Handle final usage chunk
             if request.stream_options and request.stream_options.include_usage:

@@ -318,12 +318,16 @@ class CompletionResponseStreamChoice(BaseModel):
     finish_reason: Optional[Literal["stop", "length", "content_filter", "abort"]] = None
     matched_stop: Union[None, int, str] = None
     hidden_states: Optional[object] = None
+    # Top-k attention tokens per generated token for interpretability
+    attention_tokens: Optional[List[Dict]] = None
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
         data = handler(self)
         if self.hidden_states is None:
             data.pop("hidden_states", None)
+        if self.attention_tokens is None:
+            data.pop("attention_tokens", None)
         return data
 
 
@@ -498,6 +502,8 @@ class ChatCompletionRequest(BaseModel):
         default="auto", examples=["none"]
     )  # noqa
     return_hidden_states: bool = False
+    # For attention token capture (interpretability)
+    return_attention_tokens: bool = False
     reasoning_effort: Optional[Literal["low", "medium", "high"]] = Field(
         default="medium",
         description="Constrains effort on reasoning for reasoning models. "
@@ -727,12 +733,16 @@ class ChatCompletionResponseChoice(BaseModel):
     ] = None
     matched_stop: Union[None, int, str] = None
     hidden_states: Optional[object] = None
+    # Top-k attention tokens per generated token for interpretability
+    attention_tokens: Optional[List[Dict]] = None
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
         data = handler(self)
         if self.hidden_states is None:
             data.pop("hidden_states", None)
+        if self.attention_tokens is None:
+            data.pop("attention_tokens", None)
         return data
 
 
@@ -752,12 +762,16 @@ class DeltaMessage(BaseModel):
     reasoning_content: Optional[str] = None
     tool_calls: Optional[List[ToolCall]] = Field(default=None, examples=[None])
     hidden_states: Optional[object] = None
+    # Top-k attention tokens per generated token for interpretability
+    attention_tokens: Optional[List[Dict]] = None
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
         data = handler(self)
         if self.hidden_states is None:
             data.pop("hidden_states", None)
+        if self.attention_tokens is None:
+            data.pop("attention_tokens", None)
         return data
 
 

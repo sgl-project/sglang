@@ -242,6 +242,7 @@ class OpenAIServingChat(OpenAIServingBase):
             bootstrap_room=request.bootstrap_room,
             data_parallel_rank=request.data_parallel_rank,
             return_hidden_states=request.return_hidden_states,
+            return_attention_tokens=request.return_attention_tokens,
             rid=request.rid,
             extra_key=self._compute_extra_key(request),
             require_reasoning=self._get_reasoning_from_request(request),
@@ -548,6 +549,7 @@ class OpenAIServingChat(OpenAIServingBase):
         completion_tokens = {}
         cached_tokens = {}
         hidden_states = {}
+        attention_tokens = {}
 
         try:
             async for content in self.tokenizer_manager.generate_request(
@@ -559,6 +561,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 completion_tokens[index] = content["meta_info"]["completion_tokens"]
                 cached_tokens[index] = content["meta_info"].get("cached_tokens", 0)
                 hidden_states[index] = content["meta_info"].get("hidden_states", None)
+                attention_tokens[index] = content["meta_info"].get("attention_tokens", None)
 
                 # Handle logprobs
                 choice_logprobs = None
@@ -740,6 +743,26 @@ class OpenAIServingChat(OpenAIServingBase):
                         )
                         yield f"data: {hidden_states_chunk.model_dump_json()}\n\n"
 
+            # Send attention tokens if requested (for interpretability)
+            if request.return_attention_tokens and attention_tokens:
+                for index, choice_attention_tokens in attention_tokens.items():
+                    if choice_attention_tokens:
+                        attention_tokens_chunk = ChatCompletionStreamResponse(
+                            id=content["meta_info"]["id"],
+                            created=int(time.time()),
+                            choices=[
+                                ChatCompletionResponseStreamChoice(
+                                    index=index,
+                                    delta=DeltaMessage(
+                                        attention_tokens=choice_attention_tokens
+                                    ),
+                                    finish_reason=None,
+                                )
+                            ],
+                            model=request.model,
+                        )
+                        yield f"data: {attention_tokens_chunk.model_dump_json()}\n\n"
+
             # Additional usage chunk
             if request.stream_options and request.stream_options.include_usage:
                 usage = UsageProcessor.calculate_streaming_usage(
@@ -807,6 +830,11 @@ class OpenAIServingChat(OpenAIServingBase):
             # Handle hidden states
             hidden_states = process_hidden_states_from_ret(ret_item, request)
 
+            # Handle attention tokens (interpretability)
+            attention_tokens = None
+            if request.return_attention_tokens:
+                attention_tokens = ret_item["meta_info"].get("attention_tokens")
+
             finish_reason = ret_item["meta_info"]["finish_reason"]
             text = ret_item["text"]
 
@@ -865,6 +893,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     else None
                 ),
                 hidden_states=hidden_states,
+                attention_tokens=attention_tokens,
             )
             choices.append(choice_data)
 

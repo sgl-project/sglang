@@ -74,6 +74,7 @@ class LogitsProcessorOutput:
     # Top-k attention token info for interpretability [batch, top_k] positions and scores
     attention_token_positions: Optional[torch.Tensor] = None
     attention_token_scores: Optional[torch.Tensor] = None
+    attention_layer_id: int = -1  # Which layer the attention came from (-1 = aggregated)
 
     ## Part 2: This part will be assigned in python/sglang/srt/layers/sampler.py::Sampler
     # he log probs of output tokens, if SGLANG_RETURN_ORIGINAL_LOGPROB = True, will get the log probs before applying temperature. If False, will get the log probs before applying temperature.
@@ -391,6 +392,7 @@ class LogitsProcessor(nn.Module):
         # Extract attention token info before converting ForwardBatch
         attention_token_positions = None
         attention_token_scores = None
+        attention_layer_id = -1
         if isinstance(logits_metadata, ForwardBatch):
             if (
                 logits_metadata.capture_attention_tokens
@@ -402,6 +404,7 @@ class LogitsProcessor(nn.Module):
                 attention_token_scores = (
                     logits_metadata.attention_token_info.attention_scores
                 )
+                attention_layer_id = logits_metadata.attention_token_info.layer_id
             logits_metadata = LogitsMetadata.from_forward_batch(logits_metadata)
 
         # Check if multi-item scoring is enabled via server args (only for prefill-only requests)
@@ -602,6 +605,7 @@ class LogitsProcessor(nn.Module):
                 hidden_states=hidden_states_to_store,
                 attention_token_positions=attention_token_positions,
                 attention_token_scores=attention_token_scores,
+                attention_layer_id=attention_layer_id,
             )
 
         # Start to process input logprobs
@@ -659,6 +663,7 @@ class LogitsProcessor(nn.Module):
             hidden_states=hidden_states_to_store,
             attention_token_positions=attention_token_positions,
             attention_token_scores=attention_token_scores,
+            attention_layer_id=attention_layer_id,
             input_token_logprobs=logprobs_result.input_token_logprobs,
             input_top_logprobs_val=logprobs_result.input_top_logprobs_val,
             input_top_logprobs_idx=logprobs_result.input_top_logprobs_idx,
