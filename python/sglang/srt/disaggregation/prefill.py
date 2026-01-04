@@ -309,6 +309,13 @@ class PrefillBootstrapQueue:
         else:
             return bootstrapped_reqs, failed_reqs
 
+    def release_memory_occupation(self):
+        if hasattr(self.kv_manager, "close"):
+            self.kv_manager.close()
+
+    def resume_memory_occupation(self):
+        self.kv_manager = self._init_kv_manager()
+
 
 class SchedulerDisaggregationPrefillMixin:
     """
