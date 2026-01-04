@@ -991,11 +991,9 @@ struct RotaryEmbeddingCosSinKernel {
       bool interleaved) {
     // Convert AnyView to TensorView pointer
     const tvm::ffi::TensorView* positions = nullptr;
-    if (!positions_any.is_none()) {
-      auto positions_opt = positions_any.try_cast<tvm::ffi::TensorView>();
-      if (positions_opt.has_value()) {
-        positions = &positions_opt.value();
-      }
+    auto positions_opt = positions_any.try_cast<tvm::ffi::TensorView>();
+    if (positions_opt.has_value()) {
+      positions = &positions_opt.value();
     }
     
     const auto dt = query.dtype();
@@ -1020,11 +1018,9 @@ struct RotaryEmbeddingCosSinKernel {
       bool interleaved) {
     // Convert AnyView to TensorView pointer
     const tvm::ffi::TensorView* positions = nullptr;
-    if (!positions_any.is_none()) {
-      auto positions_opt = positions_any.try_cast<tvm::ffi::TensorView>();
-      if (positions_opt.has_value()) {
-        positions = &positions_opt.value();
-      }
+    auto positions_opt = positions_any.try_cast<tvm::ffi::TensorView>();
+    if (positions_opt.has_value()) {
+      positions = &positions_opt.value();
     }
     
     const auto dt = query.dtype();
