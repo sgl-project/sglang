@@ -1031,9 +1031,12 @@ class TritonAttnBackend(AttentionBackend):
         )
 
         # Compute top-k attention tokens for interpretability
-        # This overwrites on each layer, so we end up with the last attention layer
-        # For hybrid models (e.g., Qwen3-Next), only Gated Attention layers reach here
-        if forward_batch.capture_attention_tokens:
+        # Layer gating: only compute on the specified layer (default: last attention layer)
+        # This avoids computing on every layer and only keeping the last result
+        if (
+            forward_batch.capture_attention_tokens
+            and layer.layer_id == forward_batch.attention_capture_layer_id
+        ):
             self._compute_attention_token_info(
                 q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
                 forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
