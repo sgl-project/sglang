@@ -6,7 +6,8 @@ from sglang.srt.debug_utils.schedule_simulator.data_source import (
 from sglang.srt.debug_utils.schedule_simulator.entrypoint import create_arg_parser, main
 from sglang.srt.debug_utils.schedule_simulator.gpu_state import GPUState, StepRecord
 from sglang.srt.debug_utils.schedule_simulator.metrics import (
-    AttentionBalancednessRecorder,
+    AttentionComputeBalancednessRecorder,
+    AvgBatchSizeRecorder,
     BatchSizeBalancednessRecorder,
     MetricRecorder,
 )
@@ -40,7 +41,8 @@ __all__ = [
     "FIFOScheduler",
     "MetricRecorder",
     "BatchSizeBalancednessRecorder",
-    "AttentionBalancednessRecorder",
+    "AttentionComputeBalancednessRecorder",
+    "AvgBatchSizeRecorder",
     "load_from_request_logger",
     "generate_random_requests",
     "generate_gsp_requests",

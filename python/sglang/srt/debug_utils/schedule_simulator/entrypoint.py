@@ -1,9 +1,7 @@
 import argparse
 import json
-from dataclasses import asdict
+import random
 from typing import List
-
-import polars as pl
 
 from sglang.srt.debug_utils.schedule_simulator.data_source.data_loader import (
     load_from_request_logger,
@@ -13,7 +11,8 @@ from sglang.srt.debug_utils.schedule_simulator.data_source.data_synthesis import
     generate_random_requests,
 )
 from sglang.srt.debug_utils.schedule_simulator.metrics import (
-    AttentionBalancednessRecorder,
+    AttentionComputeBalancednessRecorder,
+    AvgBatchSizeRecorder,
     BatchSizeBalancednessRecorder,
 )
 from sglang.srt.debug_utils.schedule_simulator.request import SimRequest
@@ -23,7 +22,10 @@ from sglang.srt.debug_utils.schedule_simulator.routers import (
     StickyRouter,
 )
 from sglang.srt.debug_utils.schedule_simulator.schedulers import FIFOScheduler
-from sglang.srt.debug_utils.schedule_simulator.simulator import Simulator
+from sglang.srt.debug_utils.schedule_simulator.simulator import (
+    SimulationResult,
+    Simulator,
+)
 
 
 def create_arg_parser() -> argparse.ArgumentParser:
@@ -61,7 +63,8 @@ def create_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--synth-gsp-output-len", type=int, default=256)
     parser.add_argument("--synth-gsp-range-ratio", type=float, default=1.0)
 
-    parser.add_argument("--num-gpus", type=int, default=8)
+    parser.add_argument("--num-gpus-per-engine", type=int, default=8)
+    parser.add_argument("--num-engines", type=int, default=1)
     parser.add_argument(
         "--router",
         type=str,
@@ -70,6 +73,14 @@ def create_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--scheduler", type=str, choices=["fifo"], default="fifo")
     parser.add_argument("--max-total-tokens", type=int, default=100000)
+    parser.add_argument(
+        "--stop-criteria",
+        type=str,
+        choices=["all_done", "exist_no_pending"],
+        default="all_done",
+        help="all_done: run until all requests complete; exist_no_pending: stop when any GPU has no pending requests",
+    )
+    parser.add_argument("--max-steps", type=int, default=None)
     parser.add_argument("--output", type=str, default=None)
     parser.add_argument("--log-level", type=int, choices=[0, 1, 2], default=0)
 
@@ -101,13 +112,13 @@ def _load_requests(args: argparse.Namespace) -> List[SimRequest]:
     return requests
 
 
-def _create_router(name: str, num_gpus: int):
+def _create_router(name: str, total_gpus: int):
     if name == "random":
-        return RandomRouter()
+        return RandomRouter(total_gpus)
     if name == "round_robin":
-        return RoundRobinRouter()
+        return RoundRobinRouter(total_gpus)
     if name == "sticky":
-        return StickyRouter(num_gpus)
+        return StickyRouter(total_gpus)
     raise ValueError(f"Unknown router: {name}")
 
 
@@ -117,26 +128,33 @@ def _create_scheduler(name: str):
     raise ValueError(f"Unknown scheduler: {name}")
 
 
-def main(args: argparse.Namespace) -> pl.DataFrame:
+def main(args: argparse.Namespace) -> SimulationResult:
+    if args.synth_seed is not None:
+        random.seed(args.synth_seed)
     requests = _load_requests(args)
-    router = _create_router(args.router, args.num_gpus)
+    total_gpus = args.num_gpus_per_engine * args.num_engines
+    router = _create_router(args.router, total_gpus)
     scheduler = _create_scheduler(args.scheduler)
 
     sim = Simulator(
-        num_gpus=args.num_gpus,
+        num_gpus_per_engine=args.num_gpus_per_engine,
         router=router,
         scheduler=scheduler,
-        recorders=[BatchSizeBalancednessRecorder(), AttentionBalancednessRecorder()],
+        recorders=[
+            BatchSizeBalancednessRecorder(),
+            AttentionComputeBalancednessRecorder(),
+            AvgBatchSizeRecorder(),
+        ],
         log_level=args.log_level,
         max_total_tokens=args.max_total_tokens,
+        stop_criteria=args.stop_criteria,
+        max_steps=args.max_steps,
     )
 
     print(
-        f"Running simulation with {args.num_gpus} GPUs, router={args.router}, scheduler={args.scheduler}"
+        f"Running simulation with {args.num_gpus_per_engine} GPUs/engine x {args.num_engines} engines, router={args.router}, scheduler={args.scheduler}"
     )
     result = sim.run(requests)
-
-    df = pl.DataFrame([asdict(r) for r in result.step_records])
 
     print("\n=== Summary ===")
     for key, value in result.summary.items():
@@ -147,4 +165,4 @@ def main(args: argparse.Namespace) -> pl.DataFrame:
             json.dump(result.summary, f, indent=2)
         print(f"\nSummary saved to {args.output}")
 
-    return df
+    return result

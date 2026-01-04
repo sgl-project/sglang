@@ -20,29 +20,17 @@ use crate::{
     mcp,
     protocols::{
         event_types::{is_function_call_type, ItemType, McpEvent, OutputItemEvent},
-        responses::{generate_id, ResponseInput, ResponseTool, ResponseToolType, ResponsesRequest},
+        responses::{generate_id, ResponseInput, ResponsesRequest},
     },
-    routers::header_utils::apply_request_headers,
+    routers::{
+        header_utils::apply_request_headers,
+        mcp_utils::{extract_server_label, McpLoopConfig},
+    },
 };
 
 // ============================================================================
 // Configuration and State Types
 // ============================================================================
-
-/// Configuration for MCP tool calling loops
-#[allow(dead_code)]
-#[derive(Debug, Clone)]
-pub(crate) struct McpLoopConfig {
-    /// Maximum iterations as safety limit (internal only, default: 10)
-    /// Prevents infinite loops when max_tool_calls is not set
-    pub max_iterations: usize,
-}
-
-impl Default for McpLoopConfig {
-    fn default() -> Self {
-        Self { max_iterations: 10 }
-    }
-}
 
 /// State for tracking multi-turn tool calling loop
 pub(crate) struct ToolLoopState {
@@ -123,69 +111,6 @@ impl FunctionCallInProgress {
 
     pub fn effective_output_index(&self) -> usize {
         self.assigned_output_index.unwrap_or(self.output_index)
-    }
-}
-
-// ============================================================================
-// MCP Manager Integration
-// ============================================================================
-
-/// Ensure a dynamic MCP client exists for request-scoped tools.
-///
-/// This function parses request tools to extract MCP server configuration,
-/// then ensures a dynamic client exists in the McpManager via `get_or_create_client()`.
-/// The McpManager itself is returned (cloned Arc) for convenience, though the main
-/// purpose is the side effect of registering the dynamic client.
-///
-/// Returns Some(manager) if a dynamic MCP tool was found and client was created/retrieved,
-/// None if no MCP tools were found or connection failed.
-pub async fn ensure_request_mcp_client(
-    mcp_manager: &Arc<mcp::McpManager>,
-    tools: &[ResponseTool],
-) -> Option<Arc<mcp::McpManager>> {
-    let tool = tools
-        .iter()
-        .find(|t| matches!(t.r#type, ResponseToolType::Mcp) && t.server_url.is_some())?;
-    let server_url = tool.server_url.as_ref()?.trim().to_string();
-    if !(server_url.starts_with("http://") || server_url.starts_with("https://")) {
-        warn!(
-            "Ignoring MCP server_url with unsupported scheme: {}",
-            server_url
-        );
-        return None;
-    }
-    let name = tool
-        .server_label
-        .clone()
-        .unwrap_or_else(|| "request-mcp".to_string());
-    let token = tool.authorization.clone();
-    let transport = if server_url.contains("/sse") {
-        mcp::McpTransport::Sse {
-            url: server_url.clone(),
-            token,
-        }
-    } else {
-        mcp::McpTransport::Streamable {
-            url: server_url.clone(),
-            token,
-        }
-    };
-
-    // Create server config
-    let server_config = mcp::McpServerConfig {
-        name,
-        transport,
-        proxy: None,
-        required: false,
-    };
-
-    // Use McpManager to get or create dynamic client
-    match mcp_manager.get_or_create_client(server_config).await {
-        Ok(_client) => Some(mcp_manager.clone()),
-        Err(err) => {
-            warn!("Failed to get/create MCP connection: {}", err);
-            None
-        }
     }
 }
 
@@ -705,19 +630,10 @@ pub(super) async fn execute_tool_loop(
 
             // Inject MCP output items if we executed any tools
             if state.total_calls > 0 {
-                let server_label = original_body
-                    .tools
-                    .as_ref()
-                    .and_then(|tools| {
-                        tools
-                            .iter()
-                            .find(|t| matches!(t.r#type, ResponseToolType::Mcp))
-                            .and_then(|t| t.server_label.as_deref())
-                    })
-                    .unwrap_or("mcp");
+                let server_label = extract_server_label(original_body.tools.as_deref(), "mcp");
 
                 // Build mcp_list_tools item
-                let list_tools_item = build_mcp_list_tools_item(active_mcp, server_label);
+                let list_tools_item = build_mcp_list_tools_item(active_mcp, &server_label);
 
                 // Insert at beginning of output array
                 if let Some(output_array) = response_json
@@ -728,7 +644,7 @@ pub(super) async fn execute_tool_loop(
 
                     // Build mcp_call items using helper function
                     let mcp_call_items =
-                        build_executed_mcp_call_items(&state.conversation_history, server_label);
+                        build_executed_mcp_call_items(&state.conversation_history, &server_label);
 
                     // Insert mcp_call items after mcp_list_tools using mutable position
                     let mut insert_pos = 1;
@@ -767,16 +683,7 @@ pub(super) fn build_incomplete_response(
 
     // Convert any function_call in output to mcp_call format
     if let Some(output_array) = obj.get_mut("output").and_then(|v| v.as_array_mut()) {
-        let server_label = original_body
-            .tools
-            .as_ref()
-            .and_then(|tools| {
-                tools
-                    .iter()
-                    .find(|t| matches!(t.r#type, ResponseToolType::Mcp))
-                    .and_then(|t| t.server_label.as_deref())
-            })
-            .unwrap_or("mcp");
+        let server_label = extract_server_label(original_body.tools.as_deref(), "mcp");
 
         // Find any function_call items and convert them to mcp_call (incomplete)
         let mut mcp_call_items = Vec::new();
@@ -794,7 +701,7 @@ pub(super) fn build_incomplete_response(
                     tool_name,
                     args,
                     "", // No output - wasn't executed
-                    server_label,
+                    &server_label,
                     false, // Not successful
                     Some("Not executed - response stopped due to limit"),
                 );
@@ -804,12 +711,12 @@ pub(super) fn build_incomplete_response(
 
         // Add mcp_list_tools and executed mcp_call items at the beginning
         if state.total_calls > 0 || !mcp_call_items.is_empty() {
-            let list_tools_item = build_mcp_list_tools_item(active_mcp, server_label);
+            let list_tools_item = build_mcp_list_tools_item(active_mcp, &server_label);
             output_array.insert(0, list_tools_item);
 
             // Add mcp_call items for executed calls using helper
             let executed_items =
-                build_executed_mcp_call_items(&state.conversation_history, server_label);
+                build_executed_mcp_call_items(&state.conversation_history, &server_label);
 
             let mut insert_pos = 1;
             for item in executed_items {
@@ -849,7 +756,7 @@ pub(super) fn build_incomplete_response(
 // Output Item Builders
 // ============================================================================
 
-/// Build an mcp_list_tools output item
+/// Build a mcp_list_tools output item
 pub(super) fn build_mcp_list_tools_item(mcp: &Arc<mcp::McpManager>, server_label: &str) -> Value {
     let tools = mcp.list_tools();
     let tools_json: Vec<Value> = tools
@@ -874,7 +781,7 @@ pub(super) fn build_mcp_list_tools_item(mcp: &Arc<mcp::McpManager>, server_label
     })
 }
 
-/// Build an mcp_call output item
+/// Build a mcp_call output item
 pub(super) fn build_mcp_call_item(
     tool_name: &str,
     arguments: &str,
