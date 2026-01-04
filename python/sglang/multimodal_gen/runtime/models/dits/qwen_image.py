@@ -3,27 +3,36 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import functools
-from math import prod
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from diffusers.models.attention import FeedForward
 from diffusers.models.embeddings import TimestepEmbedding, Timesteps
 from diffusers.models.modeling_outputs import Transformer2DModelOutput
 from diffusers.models.normalization import AdaLayerNormContinuous
 
 from sglang.multimodal_gen.configs.models.dits.qwenimage import QwenImageDitConfig
+from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.layers.attention import USPAttention
-from sglang.multimodal_gen.runtime.layers.layernorm import LayerNorm, RMSNorm
+from sglang.multimodal_gen.runtime.layers.layernorm import (
+    LayerNorm,
+    RMSNorm,
+    apply_qk_norm,
+)
 from sglang.multimodal_gen.runtime.layers.linear import ReplicatedLinear
+from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
+    apply_flashinfer_rope_qk_inplace,
+)
 from sglang.multimodal_gen.runtime.layers.triton_ops import (
-    apply_rotary_embedding,
+    fuse_scale_shift_gate_select01_kernel,
     fuse_scale_shift_kernel,
 )
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
+from sglang.multimodal_gen.runtime.utils.layerwise_offload import OffloadableDiTMixin
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)  # pylint: disable=invalid-name
@@ -32,13 +41,15 @@ logger = init_logger(__name__)  # pylint: disable=invalid-name
 def _get_qkv_projections(
     attn: "QwenImageCrossAttention", hidden_states, encoder_hidden_states=None
 ):
-    img_qkv, _ = attn.to_qkv(hidden_states)
-    img_query, img_key, img_value = img_qkv.chunk(3, dim=-1)
+    img_query, _ = attn.to_q(hidden_states)
+    img_key, _ = attn.to_k(hidden_states)
+    img_value, _ = attn.to_v(hidden_states)
 
     txt_query = txt_key = txt_value = None
     if encoder_hidden_states is not None and attn.added_kv_proj_dim is not None:
-        txt_qkv, _ = attn.to_added_qkv(encoder_hidden_states)
-        txt_query, txt_key, txt_value = txt_qkv.chunk(3, dim=-1)
+        txt_query, _ = attn.add_q_proj(encoder_hidden_states)
+        txt_key, _ = attn.add_k_proj(encoder_hidden_states)
+        txt_value, _ = attn.add_v_proj(encoder_hidden_states)
 
     return img_query, img_key, img_value, txt_query, txt_key, txt_value
 
@@ -464,20 +475,27 @@ class QwenImageCrossAttention(nn.Module):
         self.parallel_attention = parallel_attention
         self.added_kv_proj_dim = added_kv_proj_dim
 
-        # Use ReplicatedLinear for fused QKV projections
-        qkv_dim = num_heads * head_dim * 3
-        self.to_qkv = ReplicatedLinear(dim, qkv_dim, bias=True)
+        # Use separate Q/K/V projections
+        self.inner_dim = out_dim if out_dim is not None else head_dim * num_heads
+        self.inner_kv_dim = self.inner_dim
+        self.to_q = ReplicatedLinear(dim, self.inner_dim, bias=True)
+        self.to_k = ReplicatedLinear(dim, self.inner_dim, bias=True)
+        self.to_v = ReplicatedLinear(dim, self.inner_dim, bias=True)
 
         if self.qk_norm:
             self.norm_q = RMSNorm(head_dim, eps=eps) if qk_norm else nn.Identity()
             self.norm_k = RMSNorm(head_dim, eps=eps) if qk_norm else nn.Identity()
 
-        self.inner_dim = out_dim if out_dim is not None else head_dim * num_heads
-        self.inner_kv_dim = self.inner_dim
-
         if added_kv_proj_dim is not None:
-            # Use ReplicatedLinear for added (encoder) QKV projections
-            self.to_added_qkv = ReplicatedLinear(added_kv_proj_dim, qkv_dim, bias=True)
+            self.add_q_proj = ReplicatedLinear(
+                added_kv_proj_dim, self.inner_dim, bias=True
+            )
+            self.add_k_proj = ReplicatedLinear(
+                added_kv_proj_dim, self.inner_dim, bias=True
+            )
+            self.add_v_proj = ReplicatedLinear(
+                added_kv_proj_dim, self.inner_dim, bias=True
+            )
 
         if context_pre_only is not None and not context_pre_only:
             self.to_add_out = ReplicatedLinear(self.inner_dim, self.dim, bias=out_bias)
@@ -534,29 +552,39 @@ class QwenImageCrossAttention(nn.Module):
         txt_value = txt_value.unflatten(-1, (self.num_heads, -1))
 
         # Apply QK normalization
-        if self.norm_q is not None:
-            img_query = self.norm_q(img_query)
-        if self.norm_k is not None:
-            img_key = self.norm_k(img_key)
-        if self.norm_added_q is not None:
-            txt_query = self.norm_added_q(txt_query)
-        if self.norm_added_k is not None:
-            txt_key = self.norm_added_k(txt_key)
+        if self.qk_norm:
+            img_query, img_key = apply_qk_norm(
+                q=img_query,
+                k=img_key,
+                q_norm=self.norm_q,
+                k_norm=self.norm_k,
+                head_dim=img_query.shape[-1],
+                allow_inplace=True,
+            )
+            txt_query, txt_key = apply_qk_norm(
+                q=txt_query,
+                k=txt_key,
+                q_norm=self.norm_added_q,
+                k_norm=self.norm_added_k,
+                head_dim=txt_query.shape[-1],
+                allow_inplace=True,
+            )
 
         # Apply RoPE
         if image_rotary_emb is not None:
-            (img_cos, img_sin), (txt_cos, txt_sin) = image_rotary_emb
-            img_query = apply_rotary_embedding(
-                img_query, img_cos, img_sin, interleaved=True
+            if not (
+                isinstance(image_rotary_emb[0], torch.Tensor)
+                and image_rotary_emb[0].dim() == 2
+            ):
+                raise RuntimeError("image_rotary_emb must be cos_sin_cache tensors")
+
+            img_cache, txt_cache = image_rotary_emb
+
+            img_query, img_key = apply_flashinfer_rope_qk_inplace(
+                img_query, img_key, img_cache, is_neox=False
             )
-            img_key = apply_rotary_embedding(
-                img_key, img_cos, img_sin, interleaved=True
-            )
-            txt_query = apply_rotary_embedding(
-                txt_query, txt_cos, txt_sin, interleaved=True
-            )
-            txt_key = apply_rotary_embedding(
-                txt_key, txt_cos, txt_sin, interleaved=True
+            txt_query, txt_key = apply_flashinfer_rope_qk_inplace(
+                txt_query, txt_key, txt_cache, is_neox=False
             )
 
         # Concatenate for joint attention
@@ -645,32 +673,66 @@ class QwenImageTransformerBlock(nn.Module):
     def _modulate(self, x, mod_params, index=None):
         shift, scale, gate = mod_params.chunk(3, dim=-1)
         if index is not None:
-            shift_result = shift[index]
-            scale_result = scale[index]
-            gate_result = gate[index]
-        else:
-            shift_result = shift
-            scale_result = scale
-            gate_result = gate[:1].unsqueeze(1)
+            actual_batch = x.shape[0]
+            shift0, shift1 = (
+                shift[:actual_batch],
+                shift[actual_batch : 2 * actual_batch],
+            )
+            scale0, scale1 = (
+                scale[:actual_batch],
+                scale[actual_batch : 2 * actual_batch],
+            )
+            gate0, gate1 = gate[:actual_batch], gate[actual_batch : 2 * actual_batch]
 
-        return fuse_scale_shift_kernel(x, scale_result, shift_result), gate_result
+            if x.is_cuda:
+                if not x.is_contiguous():
+                    x = x.contiguous()
+                if not index.is_contiguous():
+                    index = index.contiguous()
+                x, gate_result = fuse_scale_shift_gate_select01_kernel(
+                    x,
+                    scale0=scale0.contiguous(),
+                    shift0=shift0.contiguous(),
+                    gate0=gate0.contiguous(),
+                    scale1=scale1.contiguous(),
+                    shift1=shift1.contiguous(),
+                    gate1=gate1.contiguous(),
+                    index=index,
+                )
+                return x, gate_result
+            else:
+                mask = (index == 0).unsqueeze(-1)
+                shift_result = torch.where(
+                    mask, shift0.unsqueeze(1), shift1.unsqueeze(1)
+                )
+                scale_result = torch.where(
+                    mask, scale0.unsqueeze(1), scale1.unsqueeze(1)
+                )
+                gate_result = torch.where(mask, gate0.unsqueeze(1), gate1.unsqueeze(1))
+                return (
+                    fuse_scale_shift_kernel(x, scale_result, shift_result),
+                    gate_result,
+                )
+        else:
+            shift_result = shift.unsqueeze(1)
+            scale_result = scale.unsqueeze(1)
+            gate_result = gate.unsqueeze(1)
+            return fuse_scale_shift_kernel(x, scale_result, shift_result), gate_result
 
     def forward(
         self,
         hidden_states: torch.Tensor,
         encoder_hidden_states: torch.Tensor,
         encoder_hidden_states_mask: torch.Tensor,
-        temb: torch.Tensor,
+        temb_img_silu: torch.Tensor,
+        temb_txt_silu: torch.Tensor,
         image_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         joint_attention_kwargs: Optional[Dict[str, Any]] = None,
         modulate_index: Optional[List[int]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # Get modulation parameters for both streams
-        img_mod_params = self.img_mod(temb)  # [B, 6*dim]
-
-        if self.zero_cond_t:
-            temb = torch.chunk(temb, 2, dim=0)[0]
-        txt_mod_params = self.txt_mod(temb)  # [B, 6*dim]
+        img_mod_params = self.img_mod[1](temb_img_silu)  # [B, 6*dim]
+        txt_mod_params = self.txt_mod[1](temb_txt_silu)  # [B, 6*dim]
 
         # Split modulation parameters for norm1 and norm2
         img_mod1, img_mod2 = img_mod_params.chunk(2, dim=-1)  # Each [B, 3*dim]
@@ -731,7 +793,13 @@ class QwenImageTransformerBlock(nn.Module):
         return encoder_hidden_states, hidden_states
 
 
-class QwenImageTransformer2DModel(CachableDiT):
+def to_hashable(obj):
+    if isinstance(obj, list):
+        return tuple(to_hashable(x) for x in obj)
+    return obj
+
+
+class QwenImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
     """
     The Transformer model introduced in Qwen.
 
@@ -807,6 +875,24 @@ class QwenImageTransformer2DModel(CachableDiT):
             self.inner_dim, patch_size * patch_size * self.out_channels, bias=True
         )
 
+        self.timestep_zero = torch.zeros(
+            (1,), dtype=torch.int, device=get_local_torch_device()
+        )
+
+        self.layer_names = ["transformer_blocks"]
+
+    @functools.lru_cache(maxsize=50)
+    def build_modulate_index(self, img_shapes: tuple[int, int, int], device):
+        modulate_index_list = []
+        for sample in img_shapes:
+            first_size = sample[0][0] * sample[0][1] * sample[0][2]
+            total_size = sum(s[0] * s[1] * s[2] for s in sample)
+            idx = (torch.arange(total_size, device=device) >= first_size).int()
+            modulate_index_list.append(idx)
+
+        modulate_index = torch.stack(modulate_index_list)
+        return modulate_index
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -862,16 +948,9 @@ class QwenImageTransformer2DModel(CachableDiT):
         timestep = (timestep / 1000).to(hidden_states.dtype)
 
         if self.zero_cond_t:
-            timestep = torch.cat([timestep, timestep * 0], dim=0)
-            # Use torch operations for GPU efficiency
-            modulate_index = torch.tensor(
-                [
-                    [0] * prod(sample[0]) + [1] * sum([prod(s) for s in sample[1:]])
-                    for sample in img_shapes
-                ],
-                device=timestep.device,
-                dtype=torch.int,
-            )
+            timestep = torch.cat([timestep, self.timestep_zero], dim=0)
+            device = timestep.device
+            modulate_index = self.build_modulate_index(to_hashable(img_shapes), device)
         else:
             modulate_index = None
 
@@ -880,13 +959,22 @@ class QwenImageTransformer2DModel(CachableDiT):
 
         temb = self.time_text_embed(timestep, hidden_states, additional_t_cond)
 
+        temb_img_silu = F.silu(temb)
+        if self.zero_cond_t:
+            temb_txt = temb.chunk(2, dim=0)[0]
+            temb_txt_silu = temb_img_silu.chunk(2, dim=0)[0]
+        else:
+            temb_txt = temb
+            temb_txt_silu = temb_img_silu
+
         image_rotary_emb = freqs_cis
         for index_block, block in enumerate(self.transformer_blocks):
             encoder_hidden_states, hidden_states = block(
                 hidden_states=hidden_states,
                 encoder_hidden_states=encoder_hidden_states,
                 encoder_hidden_states_mask=encoder_hidden_states_mask,
-                temb=temb,
+                temb_img_silu=temb_img_silu,
+                temb_txt_silu=temb_txt_silu,
                 image_rotary_emb=image_rotary_emb,
                 joint_attention_kwargs=attention_kwargs,
                 modulate_index=modulate_index,
@@ -902,10 +990,8 @@ class QwenImageTransformer2DModel(CachableDiT):
                     hidden_states
                     + controlnet_block_samples[index_block // interval_control]
                 )
-        if self.zero_cond_t:
-            temb = temb.chunk(2, dim=0)[0]
         # Use only the image part (hidden_states) from the dual-stream blocks
-        hidden_states = self.norm_out(hidden_states, temb)
+        hidden_states = self.norm_out(hidden_states, temb_txt)
 
         output = self.proj_out(hidden_states)
         return output
