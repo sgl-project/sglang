@@ -17,6 +17,7 @@ from diffusers.models.normalization import AdaLayerNormContinuous
 from sglang.multimodal_gen.configs.models.dits.qwenimage import QwenImageDitConfig
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.layers.attention import USPAttention
+from sglang.multimodal_gen.runtime.layers.elementwise import MulAdd
 from sglang.multimodal_gen.runtime.layers.layernorm import (
     LayerNorm,
     RMSNorm,
@@ -29,9 +30,6 @@ from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
 from sglang.multimodal_gen.runtime.layers.triton_ops import (
     fuse_scale_shift_gate_select01_kernel,
     fuse_scale_shift_kernel,
-)
-from sglang.multimodal_gen.runtime.layers.elementwise import (
-    MulAdd,
 )
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
@@ -783,9 +781,7 @@ class QwenImageTransformerBlock(nn.Module):
             img_normed2, img_mod2, modulate_index
         )
         img_mlp_output = self.img_mlp(img_modulated2)
-        hidden_states = self.fuse_mul_add(
-            img_mlp_output, img_gate2, hidden_states
-        )
+        hidden_states = self.fuse_mul_add(img_mlp_output, img_gate2, hidden_states)
 
         # Process text stream - norm2 + MLP
         txt_normed2 = self.txt_norm2(encoder_hidden_states)

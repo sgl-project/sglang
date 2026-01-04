@@ -15,13 +15,11 @@ from sglang.multimodal_gen.runtime.layers.attention import (
     LocalAttention,
     UlyssesAttention,
 )
+from sglang.multimodal_gen.runtime.layers.elementwise import MulAdd
 from sglang.multimodal_gen.runtime.layers.layernorm import (
     LayerNormScaleShift,
     RMSNorm,
     ScaleResidualLayerNormScaleShift,
-)
-from sglang.multimodal_gen.runtime.layers.elementwise import (
-    MulAdd,
 )
 from sglang.multimodal_gen.runtime.layers.linear import ReplicatedLinear
 from sglang.multimodal_gen.runtime.layers.mlp import MLP

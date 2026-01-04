@@ -1,4 +1,5 @@
 import torch
+
 from sglang.multimodal_gen.runtime.layers.custom_op import CustomOp
 from sglang.multimodal_gen.runtime.layers.triton_ops import fuse_scale_shift_kernel
 
@@ -9,6 +10,7 @@ class MulAdd(CustomOp):
     Input: a, b, c
     Output: a * b + c
     """
+
     def __init__(self, prefix: str = ""):
         super().__init__()
 
@@ -26,6 +28,6 @@ class MulAdd(CustomOp):
         else:
             # b.shape: [batch_size, 1, inner_dim]
             return c + a * b
-    
+
     def forward_cuda(self, a: torch.Tensor, b: torch.Tensor, c: torch.Tensor):
         return fuse_scale_shift_kernel(a, b, c, scale_constant=0.0)
