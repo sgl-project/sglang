@@ -1927,6 +1927,7 @@ class Scheduler(
     def _get_new_batch_prefill_raw(
         self, prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor]
     ) -> Optional[ScheduleBatch]:
+        print(f"hi [{torch.distributed.get_rank()}] _get_new_batch_prefill_raw start")
         # Check if the grammar is ready in the grammar queue
         if self.grammar_queue:
             self.move_ready_grammar_requests()
@@ -2037,6 +2038,7 @@ class Scheduler(
                     continue
 
             req.init_next_round_input(self.tree_cache)
+            print(f"hi [{torch.distributed.get_rank()}] going to call adder.add_one_req")
             res = adder.add_one_req(
                 req,
                 has_chunked_req=(self.chunked_req is not None),
