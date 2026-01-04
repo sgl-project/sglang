@@ -75,12 +75,12 @@ pub fn extract_server_label(tools: Option<&[ResponseTool]>, default_label: &str)
 /// This function extracts MCP server configuration from request tools (server_url, authorization)
 /// and ensures a client connection is established via the connection pool.
 ///
-/// Returns `Some(manager)` if a dynamic MCP tool was found and client was created/retrieved,
+/// Returns `Some(())` if a dynamic MCP tool was found and client was created/retrieved,
 /// `None` if no MCP tools with server_url were found or connection failed.
 pub async fn ensure_request_mcp_client(
     mcp_manager: &Arc<McpManager>,
     tools: &[ResponseTool],
-) -> Option<Arc<McpManager>> {
+) -> Option<()> {
     // Find an MCP tool with a server_url
     let tool = tools
         .iter()
@@ -127,7 +127,7 @@ pub async fn ensure_request_mcp_client(
 
     // Use get_or_create_client to establish connection
     match mcp_manager.get_or_create_client(server_config).await {
-        Ok(_client) => Some(Arc::clone(mcp_manager)),
+        Ok(_client) => Some(()),
         Err(err) => {
             warn!("Failed to get/create MCP connection: {}", err);
             None

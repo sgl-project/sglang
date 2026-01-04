@@ -43,7 +43,6 @@ use crate::{
     routers::{
         header_utils::{apply_request_headers, preserve_response_headers},
         mcp_utils::{ensure_request_mcp_client, McpLoopConfig},
-        openai::context::{RequestContext, StreamingEventContext, StreamingRequest},
         persistence_utils::persist_conversation_items,
     },
 };
