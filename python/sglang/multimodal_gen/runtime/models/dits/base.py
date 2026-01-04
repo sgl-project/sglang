@@ -201,12 +201,19 @@ class CachableDiT(BaseDiT):
         
         accumulated_rel_l1_distance = self.accumulated_rel_l1_distance_negative if self.is_cfg_negative else self.accumulated_rel_l1_distance
         accumulated_rel_l1_distance = accumulated_rel_l1_distance + rescale_func(rel_l1)
-        if not self.is_cfg_negative:
-            self.accumulated_rel_l1_distance = accumulated_rel_l1_distance
-        else:
-            self.accumulated_rel_l1_distance_negative = accumulated_rel_l1_distance
         
-        return not (accumulated_rel_l1_distance < teacache_thresh)
+        should_calc = accumulated_rel_l1_distance >= teacache_thresh
+        if not should_calc:
+            if not self.is_cfg_negative:
+                self.accumulated_rel_l1_distance = accumulated_rel_l1_distance
+            else:
+                self.accumulated_rel_l1_distance_negative = accumulated_rel_l1_distance
+        else:
+            if not self.is_cfg_negative:
+                self.accumulated_rel_l1_distance = 0
+            else:
+                self.accumulated_rel_l1_distance_negative = 0
+        return should_calc
         
     def _compute_teacache_decision(
         self,
