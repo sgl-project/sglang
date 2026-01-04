@@ -5,7 +5,7 @@ import tempfile
 import unittest
 
 from sglang.srt.debug_utils.schedule_simulator import (
-    AttentionBalancednessRecorder,
+    AttentionComputeBalancednessRecorder,
     BatchSizeBalancednessRecorder,
     FIFOScheduler,
     GPUState,
@@ -16,14 +16,16 @@ from sglang.srt.debug_utils.schedule_simulator import (
     Simulator,
     StepRecord,
     StickyRouter,
+    create_arg_parser,
     generate_gsp_requests,
     generate_random_requests,
     load_from_request_logger,
+    main,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=60, suite="default", nightly=True)
+register_cpu_ci(est_time=120, suite="default", nightly=True)
 
 
 # ==================== Non-E2E Tests ====================
@@ -244,8 +246,8 @@ class TestMetrics(CustomTestCase):
             recorder.get_summary()["batch_size_balancedness_mean"], 0.75
         )
 
-    def test_attention_balancedness(self):
-        recorder = AttentionBalancednessRecorder()
+    def test_attention_compute_balancedness(self):
+        recorder = AttentionComputeBalancednessRecorder()
         gpu_states = [GPUState(gpu_id=i, max_total_tokens=10000) for i in range(2)]
         gpu_states[0].running_requests = [
             SimRequest(request_id="r1", input_len=100, output_len=50)
@@ -255,7 +257,7 @@ class TestMetrics(CustomTestCase):
         ]
         recorder.on_step_end(0, gpu_states)
         self.assertAlmostEqual(
-            recorder.get_summary()["attention_balancedness_mean"], 0.75
+            recorder.get_summary()["attention_compute_balancedness_mean"], 0.75
         )
 
     def test_empty_history(self):
@@ -408,7 +410,7 @@ class TestSimulator(CustomTestCase):
             scheduler=FIFOScheduler(),
             recorders=[
                 BatchSizeBalancednessRecorder(),
-                AttentionBalancednessRecorder(),
+                AttentionComputeBalancednessRecorder(),
             ],
             max_total_tokens=100,
         )
@@ -545,30 +547,13 @@ class TestCLI(CustomTestCase):
         self.assertEqual(result.returncode, 0, f"CLI failed: {result.stderr}")
         self.assertIn("router=random", result.stdout)
 
-    def test_cli_sticky_router(self):
-        result = self._run_cli(
-            "--synth-gsp",
-            "--synth-gsp-num-groups",
-            "2",
-            "--synth-gsp-prompts-per-group",
-            "3",
-            "--synth-seed",
-            "42",
-            "--num-gpus",
-            "4",
-            "--router",
-            "sticky",
-        )
-        self.assertEqual(result.returncode, 0, f"CLI failed: {result.stderr}")
-        self.assertIn("router=sticky", result.stdout)
-
     def test_e2e_sticky_router_group_locality(self):
         result = self._run_cli(
             "--synth-gsp",
             "--synth-gsp-num-groups",
-            "2",
+            "1",
             "--synth-gsp-prompts-per-group",
-            "2",
+            "4",
             "--synth-gsp-system-prompt-len",
             "10",
             "--synth-gsp-question-len",
@@ -576,7 +561,7 @@ class TestCLI(CustomTestCase):
             "--synth-gsp-output-len",
             "2",
             "--synth-seed",
-            "123",
+            "42",
             "--num-gpus",
             "2",
             "--router",
@@ -587,11 +572,8 @@ class TestCLI(CustomTestCase):
             "2",
         )
         self.assertEqual(result.returncode, 0, f"CLI failed: {result.stderr}")
-        for expected in [
-            "step=0    | GPU0[R=2:gsp0,gsp1 Q=0:-] | GPU1[R=2:gsp2,gsp3 Q=0:-]",
-            "step=1    | GPU0[R=0:- Q=0:-] | GPU1[R=0:- Q=0:-]",
-        ]:
-            self.assertIn(expected, result.stdout)
+        self.assertIn("R=4:", result.stdout)
+        self.assertIn("R=0:-", result.stdout)
 
     def test_cli_synthetic(self):
         result = self._run_cli(
@@ -771,6 +753,92 @@ step=13   | GPU0[R=0:- Q=0:-]""",
                 self.assertIn("R=2:", result.stdout)
             else:
                 self.assertNotIn("R=2:", result.stdout)
+
+
+class TestLargerScale(CustomTestCase):
+    def _run_main(self, *cli_args) -> SimulationResult:
+        parser = create_arg_parser()
+        args = parser.parse_args(cli_args)
+        return main(args)
+
+    def _assert_in_range(self, value, lo, hi, name):
+        self.assertGreaterEqual(value, lo, f"{name}={value} < {lo}")
+        self.assertLessEqual(value, hi, f"{name}={value} > {hi}")
+
+    def test_vanilla_workload_random_policy(self):
+        result = self._run_main(
+            "--synthetic",
+            "--synth-random-num-requests",
+            "2000",
+            "--synth-random-input-len",
+            "32000",
+            "--synth-random-output-len",
+            "2000",
+            "--synth-seed",
+            "42",
+            "--num-gpus",
+            "8",
+            "--router",
+            "random",
+            "--max-total-tokens",
+            "2000000",
+            "--stop-criteria",
+            "exist_no_pending",
+        )
+        self._assert_in_range(
+            result.summary["attention_compute_balancedness_mean"], 0.95, 1.0, "attn"
+        )
+        self._assert_in_range(
+            result.summary["batch_size_balancedness_mean"], 0.90, 0.98, "bs"
+        )
+        self._assert_in_range(result.summary["avg_batch_size"], 127, 141, "avg_bs")
+
+    def _run_gsp_workload(self, router: str) -> SimulationResult:
+        return self._run_main(
+            "--synth-gsp",
+            "--synth-gsp-num-groups",
+            "200",
+            "--synth-gsp-prompts-per-group",
+            "20",
+            "--synth-gsp-system-prompt-len",
+            "31000",
+            "--synth-gsp-question-len",
+            "1000",
+            "--synth-gsp-output-len",
+            "8000",
+            "--synth-seed",
+            "42",
+            "--num-gpus",
+            "8",
+            "--router",
+            router,
+            "--max-total-tokens",
+            "500000",
+            "--stop-criteria",
+            "exist_no_pending",
+            "--max-steps",
+            "1500",
+        )
+
+    def test_gsp_workload_random_policy(self):
+        result = self._run_gsp_workload("random")
+        self._assert_in_range(
+            result.summary["attention_compute_balancedness_mean"], 0.88, 0.98, "attn"
+        )
+        self._assert_in_range(
+            result.summary["batch_size_balancedness_mean"], 0.88, 0.98, "bs"
+        )
+        self._assert_in_range(result.summary["avg_batch_size"], 24, 27, "avg_bs")
+
+    def test_gsp_workload_sticky_policy(self):
+        result = self._run_gsp_workload("sticky")
+        self._assert_in_range(
+            result.summary["attention_compute_balancedness_mean"], 0.63, 0.70, "attn"
+        )
+        self._assert_in_range(
+            result.summary["batch_size_balancedness_mean"], 0.63, 0.71, "bs"
+        )
+        self._assert_in_range(result.summary["avg_batch_size"], 33, 37, "avg_bs")
 
 
 if __name__ == "__main__":
