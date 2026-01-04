@@ -63,6 +63,10 @@ class ParallelTiledVAE(ABC, nn.Module):
     def scaling_factor(self) -> float | torch.Tensor:
         return cast(float | torch.Tensor, self.config.scaling_factor)
 
+    @property
+    def shift_factor(self) -> float | torch.Tensor | None:
+        return getattr(self.config, "shift_factor", None)
+
     @abstractmethod
     def _encode(self, *args, **kwargs) -> torch.Tensor:
         pass

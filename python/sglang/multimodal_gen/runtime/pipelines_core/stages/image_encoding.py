@@ -239,25 +239,33 @@ class ImageVAEEncodingStage(PipelineStage):
                 image,
             ).to(get_local_torch_device(), dtype=torch.float32)
 
-            # (B, C, H, W) -> (B, C, 1, H, W)
-            image = image.unsqueeze(2)
-
-            if num_frames == 1:
+            # For image generation tasks (T2I, I2I), VAE expects 4D input (B, C, H, W)
+            # For video generation tasks, VAE expects 5D input (B, C, T, H, W)
+            is_image_task = server_args.pipeline_config.task_type.is_image_gen()
+            
+            if is_image_task:
+                # Keep as 4D for image VAE
                 video_condition = image
             else:
-                video_condition = torch.cat(
-                    [
-                        image,
-                        image.new_zeros(
-                            image.shape[0],
-                            image.shape[1],
-                            num_frames - 1,
-                            image.shape[3],
-                            image.shape[4],
-                        ),
-                    ],
-                    dim=2,
-                )
+                # (B, C, H, W) -> (B, C, 1, H, W)
+                image = image.unsqueeze(2)
+
+                if num_frames == 1:
+                    video_condition = image
+                else:
+                    video_condition = torch.cat(
+                        [
+                            image,
+                            image.new_zeros(
+                                image.shape[0],
+                                image.shape[1],
+                                num_frames - 1,
+                                image.shape[3],
+                                image.shape[4],
+                            ),
+                        ],
+                        dim=2,
+                    )
             video_condition = video_condition.to(
                 device=get_local_torch_device(), dtype=torch.float32
             )
@@ -309,13 +317,14 @@ class ImageVAEEncodingStage(PipelineStage):
             )
 
             # apply shift & scale if needed
-            if isinstance(shift_factor, torch.Tensor):
-                shift_factor = shift_factor.to(latent_condition.device)
+            if shift_factor is not None:
+                if isinstance(shift_factor, torch.Tensor):
+                    shift_factor = shift_factor.to(latent_condition.device)
+                latent_condition = latent_condition - shift_factor
 
             if isinstance(scaling_factor, torch.Tensor):
                 scaling_factor = scaling_factor.to(latent_condition.device)
 
-            latent_condition -= shift_factor
             latent_condition = latent_condition * scaling_factor
 
             image_latent = server_args.pipeline_config.postprocess_image_latent(
