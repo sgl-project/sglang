@@ -8,7 +8,6 @@ import torch
 from sglang.srt.layers.quantization.marlin_utils import (
     USE_FP32_REDUCE_DEFAULT,
     marlin_make_workspace,
-    marlin_permute_bias,
     marlin_permute_scales,
     should_use_atomic_add_reduce,
 )
@@ -168,10 +167,10 @@ def prepare_fp8_layer_for_marlin(
     marlin_scales = fp8_fused_exponent_bias_into_scales(marlin_scales)
     layer.weight_scale = torch.nn.Parameter(marlin_scales, requires_grad=False)
 
+    # don't permute bias - it's added after the kernel
     if hasattr(layer, "bias") and layer.bias is not None:
         assert layer.bias.shape == (part_size_n,)
-        bias = marlin_permute_bias(layer.bias)
-        layer.bias = torch.nn.Parameter(bias, requires_grad=False)
+        layer.bias = torch.nn.Parameter(layer.bias.detach(), requires_grad=False)
 
 
 def prepare_moe_fp8_layer_for_marlin(
@@ -286,20 +285,12 @@ def prepare_moe_fp8_layer_for_marlin(
 
         setattr(layer, name + "_weight_scale", scales)
 
-    # BIAS
-    # Permute bias
+    # don't permute bias - it's added after the kernel
     for name in ["w13_bias", "w2_bias"]:
         if not hasattr(layer, name):
             continue
         bias = getattr(layer, name).to(layer.orig_dtype)
 
-        tensor_list = []
-        for i in range(e):
-            expert_bias = bias[i]
-
-            tensor_list.append(marlin_permute_bias(expert_bias))
-
-        bias = torch.cat([x.unsqueeze(0) for x in tensor_list], 0)
         bias = torch.nn.Parameter(bias, requires_grad=False)
         setattr(layer, name, bias)
 
