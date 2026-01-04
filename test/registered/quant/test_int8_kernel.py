@@ -8,7 +8,11 @@ from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_moe
 from sglang.srt.layers.moe.topk import TopKConfig, select_experts
 from sglang.srt.layers.quantization.int8_kernel import per_token_quant_int8
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
+
+# INT8 quantization kernel tests
+register_cuda_ci(est_time=8, suite="stage-b-test-small-1-gpu")
 
 
 def native_w8a8_per_token_matmul(A, B, As, Bs, output_dtype=torch.float16):

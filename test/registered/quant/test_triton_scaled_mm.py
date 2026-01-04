@@ -5,7 +5,12 @@ import torch
 import torch.testing
 
 from sglang.srt.layers.quantization.fp8_kernel import triton_scaled_mm
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
+
+# Triton scaled matrix multiplication tests
+register_cuda_ci(est_time=8, suite="stage-b-test-small-1-gpu")
+register_amd_ci(est_time=12, suite="stage-a-test-1")
 
 
 def torch_scaled_mm(
