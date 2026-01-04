@@ -29,7 +29,7 @@ use super::{
     utils::error_type_from_status,
 };
 use crate::{
-    core::WorkerRegistry,
+    core::{WorkerRegistry, UNKNOWN_MODEL_ID},
     observability::metrics::{bool_to_static_str, metrics_labels, Metrics},
     policies::PolicyRegistry,
     protocols::{
@@ -475,8 +475,8 @@ impl RequestPipeline {
         components: Arc<SharedComponents>,
     ) -> Response {
         debug!(
-            "execute_embeddings: Starting execution for model: {:?}",
-            model_id
+            "execute_embeddings: Starting execution for model: {}",
+            model_id.as_deref().unwrap_or(UNKNOWN_MODEL_ID)
         );
         let start = Instant::now();
 
@@ -485,7 +485,7 @@ impl RequestPipeline {
             metrics_labels::ROUTER_GRPC,
             self.backend_type,
             metrics_labels::CONNECTION_GRPC,
-            model_id.as_deref().unwrap_or("unknown"),
+            model_id.as_deref().unwrap_or(UNKNOWN_MODEL_ID),
             metrics_labels::ENDPOINT_EMBEDDINGS,
             bool_to_static_str(false),
         );
@@ -504,7 +504,7 @@ impl RequestPipeline {
                         metrics_labels::ROUTER_GRPC,
                         self.backend_type,
                         metrics_labels::CONNECTION_GRPC,
-                        model_id.as_deref().unwrap_or("unknown"),
+                        model_id.as_deref().unwrap_or(UNKNOWN_MODEL_ID),
                         metrics_labels::ENDPOINT_EMBEDDINGS,
                         start.elapsed(),
                     );
@@ -527,7 +527,7 @@ impl RequestPipeline {
                         metrics_labels::ROUTER_GRPC,
                         self.backend_type,
                         metrics_labels::CONNECTION_GRPC,
-                        model_id.as_deref().unwrap_or("unknown"),
+                        model_id.as_deref().unwrap_or(UNKNOWN_MODEL_ID),
                         metrics_labels::ENDPOINT_EMBEDDINGS,
                         error_type_from_status(response.status()),
                     );
@@ -548,7 +548,7 @@ impl RequestPipeline {
                     metrics_labels::ROUTER_GRPC,
                     self.backend_type,
                     metrics_labels::CONNECTION_GRPC,
-                    model_id.as_deref().unwrap_or("unknown"),
+                    model_id.as_deref().unwrap_or(UNKNOWN_MODEL_ID),
                     metrics_labels::ENDPOINT_EMBEDDINGS,
                     start.elapsed(),
                 );
@@ -581,8 +581,8 @@ impl RequestPipeline {
         components: Arc<SharedComponents>,
     ) -> Response {
         debug!(
-            "execute_classify: Starting execution for model: {:?}",
-            model_id
+            "execute_classify: Starting execution for model: {}",
+            model_id.as_deref().unwrap_or(UNKNOWN_MODEL_ID)
         );
         let start = Instant::now();
 
@@ -591,7 +591,7 @@ impl RequestPipeline {
             metrics_labels::ROUTER_GRPC,
             self.backend_type,
             metrics_labels::CONNECTION_GRPC,
-            model_id.as_deref().unwrap_or("unknown"),
+            model_id.as_deref().unwrap_or(UNKNOWN_MODEL_ID),
             metrics_labels::ENDPOINT_CLASSIFY,
             bool_to_static_str(false), // Classify is never streaming
         );
@@ -610,7 +610,7 @@ impl RequestPipeline {
                         metrics_labels::ROUTER_GRPC,
                         self.backend_type,
                         metrics_labels::CONNECTION_GRPC,
-                        model_id.as_deref().unwrap_or("unknown"),
+                        model_id.as_deref().unwrap_or(UNKNOWN_MODEL_ID),
                         metrics_labels::ENDPOINT_CLASSIFY,
                         start.elapsed(),
                     );
@@ -633,7 +633,7 @@ impl RequestPipeline {
                         metrics_labels::ROUTER_GRPC,
                         self.backend_type,
                         metrics_labels::CONNECTION_GRPC,
-                        model_id.as_deref().unwrap_or("unknown"),
+                        model_id.as_deref().unwrap_or(UNKNOWN_MODEL_ID),
                         metrics_labels::ENDPOINT_CLASSIFY,
                         error_type_from_status(response.status()),
                     );
@@ -653,7 +653,7 @@ impl RequestPipeline {
                     metrics_labels::ROUTER_GRPC,
                     self.backend_type,
                     metrics_labels::CONNECTION_GRPC,
-                    model_id.as_deref().unwrap_or("unknown"),
+                    model_id.as_deref().unwrap_or(UNKNOWN_MODEL_ID),
                     metrics_labels::ENDPOINT_CLASSIFY,
                     start.elapsed(),
                 );

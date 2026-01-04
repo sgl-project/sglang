@@ -1045,17 +1045,7 @@ impl PDRouter {
         }
         if let Some(headers) = headers {
             for (name, value) in headers.iter() {
-                let name_lc = name.as_str().to_ascii_lowercase();
-                // Whitelist important end-to-end headers, skip hop-by-hop
-                let forward = matches!(
-                    name_lc.as_str(),
-                    "authorization"
-                    | "x-request-id"
-                    | "x-correlation-id"
-                    | "traceparent"      // W3C Trace Context
-                    | "tracestate" // W3C Trace Context
-                ) || name_lc.starts_with("x-request-id-");
-                if forward {
+                if header_utils::should_forward_request_header(name.as_str()) {
                     if let Ok(val) = value.to_str() {
                         request = request.header(name, val);
                     }

@@ -1,5 +1,5 @@
 use pyo3::prelude::*;
-use sgl_model_gateway::*;
+use smg::*;
 use once_cell::sync::OnceCell;
 use std::collections::HashMap;
 

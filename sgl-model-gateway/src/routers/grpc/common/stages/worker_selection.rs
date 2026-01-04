@@ -86,15 +86,16 @@ impl PipelineStage for WorkerSelectionStage {
                 ) {
                     Some(w) => WorkerSelection::Single { worker: w },
                     None => {
+                        let model = ctx.input.model_id.as_deref().unwrap_or(UNKNOWN_MODEL_ID);
                         error!(
                             function = "WorkerSelectionStage::execute",
                             mode = "Regular",
-                            model_id = ?ctx.input.model_id,
+                            model_id = %model,
                             "No available workers for model"
                         );
                         return Err(error::service_unavailable(
                             "no_available_workers",
-                            format!("No available workers for model: {:?}", ctx.input.model_id),
+                            format!("No available workers for model: {}", model),
                         ));
                     }
                 }
@@ -103,18 +104,16 @@ impl PipelineStage for WorkerSelectionStage {
                 match self.select_pd_pair(ctx.input.model_id.as_deref(), text, tokens, headers) {
                     Some((prefill, decode)) => WorkerSelection::Dual { prefill, decode },
                     None => {
+                        let model = ctx.input.model_id.as_deref().unwrap_or(UNKNOWN_MODEL_ID);
                         error!(
                             function = "WorkerSelectionStage::execute",
                             mode = "PrefillDecode",
-                            model_id = ?ctx.input.model_id,
+                            model_id = %model,
                             "No available PD worker pairs for model"
                         );
                         return Err(error::service_unavailable(
                             "no_available_pd_worker_pairs",
-                            format!(
-                                "No available PD worker pairs for model: {:?}",
-                                ctx.input.model_id
-                            ),
+                            format!("No available PD worker pairs for model: {}", model),
                         ));
                     }
                 }

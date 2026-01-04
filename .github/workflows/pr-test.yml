@@ -177,9 +177,7 @@ jobs:
 
   sgl-kernel-build-wheels:
     needs: [check-changes, call-gate]
-    if: |
-      !inputs.target_stage &&
-      needs.check-changes.outputs.sgl_kernel == 'true'
+    if: needs.check-changes.outputs.sgl_kernel == 'true'
     runs-on: x64-kernel-build-node
     strategy:
       matrix:
@@ -220,9 +218,7 @@ jobs:
 
   sgl-kernel-build-wheels-arm:
     needs: [check-changes, call-gate]
-    if: |
-      !inputs.target_stage &&
-      needs.check-changes.outputs.sgl_kernel == 'true'
+    if: needs.check-changes.outputs.sgl_kernel == 'true'
     runs-on: arm-kernel-build-node
     strategy:
       matrix:

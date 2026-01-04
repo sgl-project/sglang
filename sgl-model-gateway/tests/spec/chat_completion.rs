@@ -1,5 +1,5 @@
 use serde_json::json;
-use sgl_model_gateway::protocols::{
+use smg::protocols::{
     chat::{ChatCompletionRequest, ChatMessage, MessageContent},
     common::{
         Function, FunctionCall, FunctionChoice, StreamOptions, Tool, ToolChoice, ToolChoiceValue,

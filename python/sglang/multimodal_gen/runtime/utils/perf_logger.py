@@ -10,6 +10,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, Optional
 
+import torch
 from dateutil.tz import UTC
 
 import sglang
@@ -149,6 +150,12 @@ class StageProfiler:
             self.logger.info(f"[{self.stage_name}] started...")
 
         if (self.enabled and self.timings) or self.simple_log:
+            if (
+                os.environ.get("SGLANG_DIFFUSION_SYNC_STAGE_PROFILING", "0") == "1"
+                and self.stage_name.startswith("denoising_step_")
+                and torch.cuda.is_available()
+            ):
+                torch.cuda.synchronize()
             self.start_time = time.perf_counter()
 
         return self
@@ -157,6 +164,12 @@ class StageProfiler:
         if not ((self.enabled and self.timings) or self.simple_log):
             return False
 
+        if (
+            os.environ.get("SGLANG_DIFFUSION_SYNC_STAGE_PROFILING", "0") == "1"
+            and self.stage_name.startswith("denoising_step_")
+            and torch.cuda.is_available()
+        ):
+            torch.cuda.synchronize()
         execution_time_s = time.perf_counter() - self.start_time
 
         if exc_type:
