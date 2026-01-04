@@ -132,7 +132,7 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
                     new_image_path_list.append(download_image_from_url(str(image_path)))
                 else:
                     new_image_path_list.append(Path(image_path))
-                    if not image_path.exists():
+                    if not Path(image_path).exists(): 
                         pytest.skip(f"{case.id}: file missing: {image_path}")
 
             image_path_list = new_image_path_list

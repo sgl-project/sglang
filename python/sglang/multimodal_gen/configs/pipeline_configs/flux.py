@@ -703,7 +703,7 @@ class FluxKontextPipelineConfig(FluxPipelineConfig):
         return best_width, best_height
 
     def preprocess_condition_image(
-        self, image, target_width, target_height, vae_image_processor
+        self, image, vae_image_processor
     ):
         """Preprocess condition image for VAE encoding.
         
