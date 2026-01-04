@@ -9,7 +9,7 @@ You are welcome to enable various models based on your business requirements.
 | Models                                    | Model Family                   |               A2 Supported               |               A3 Supported               |
 |-------------------------------------------|--------------------------------|:----------------------------------------:|:----------------------------------------:|
 | DeepSeek V3/V3.1                          | DeepSeek                       | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| DeepSeek V3.2                             | DeepSeek                       |  **<span style="color: red;">×</span>**  | **<span style="color: green;">√</span>** |
+| DeepSeek V3.2                             | DeepSeek                       | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | DeepSeek R1                               | DeepSeek                       | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | DeepSeek V2                               | DeepSeek                       | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | Qwen3                                     | Qwen                           | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
@@ -26,9 +26,9 @@ You are welcome to enable various models based on your business requirements.
 | microsoft/Phi-4-multimodal-instruct       | Phi                            | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | allenai/OLMoE-1B-7B-0924                  | OLMoE                          | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | stabilityai/stablelm-2-1_6b               | StableLM                       | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| CohereForAI/c4ai-command-r-v01            | Command-R                      |  **<span style="color: red;">×</span>**  | **<span style="color: green;">√</span>** |
+| CohereForAI/c4ai-command-r-v01            | Command-R                      | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | huihui-ai/grok-2                          | Grok                           |  **<span style="color: red;">×</span>**  | **<span style="color: green;">√</span>** |
-| ZhipuAI/chatglm2-6b                       | ChatGLM                        |  **<span style="color: red;">×</span>**  | **<span style="color: green;">√</span>** |
+| ZhipuAI/chatglm2-6b                       | ChatGLM                        | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | Shanghai_AI_Laboratory/internlm2-7b       | InternLM 2                     | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | LGAI-EXAONE/EXAONE-3.5-7.8B-Instruct      | ExaONE 3                       | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | xverse/XVERSE-MoE-A36B                    | XVERSE                         | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
@@ -50,45 +50,45 @@ You are welcome to enable various models based on your business requirements.
 
 | Models                                        | Model Family (Variants)   | A2 Supported                             |               A3 Supported               |
 |-----------------------------------------------|---------------------------|------------------------------------------|:----------------------------------------:|
-| Qwen2.5-VL-72B-Instruct-w8a8                  | Qwen-VL                   | **<span style="color: red;">×</span>**   | **<span style="color: green;">√</span>** |
-| Qwen3-VL-30B-A3B-Instruct                     | Qwen-VL                   | **<span style="color: red;">×</span>**   | **<span style="color: green;">√</span>** |
-| Qwen3-VL-8B-Instruct                          | Qwen-VL                   | **<span style="color: red;">×</span>**   | **<span style="color: green;">√</span>** |
-| Qwen3-VL-4B-Instruct                          | Qwen-VL                   | **<span style="color: red;">×</span>**   | **<span style="color: green;">√</span>** |
-| Qwen3-VL-235B-A22B-Instruct                   | Qwen-VL                   | **<span style="color: red;">×</span>**   | **<span style="color: green;">√</span>** |
-| deepseek-ai/deepseek-vl2                      | DeepSeek-VL2              | **<span style="color: red;">×</span>**   | **<span style="color: green;">√</span>** |
+| Qwen2.5-VL-72B-Instruct-w8a8                  | Qwen-VL                   | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
+| Qwen3-VL-30B-A3B-Instruct                     | Qwen-VL                   | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
+| Qwen3-VL-8B-Instruct                          | Qwen-VL                   | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
+| Qwen3-VL-4B-Instruct                          | Qwen-VL                   | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
+| Qwen3-VL-235B-A22B-Instruct                   | Qwen-VL                   | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
+| deepseek-ai/deepseek-vl2                      | DeepSeek-VL2              | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | deepseek-ai/Janus-Pro-7B                      | Janus-Pro (1B, 7B)        | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| openbmb/MiniCPM-V-2_6                         | MiniCPM-V / MiniCPM-o     | **<span style="color: red;">×</span>**   | **<span style="color: green;">√</span>** |
+| openbmb/MiniCPM-V-2_6                         | MiniCPM-V / MiniCPM-o     | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | google/gemma-3-4b-it                          | Gemma 3 (Multimodal)      | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| mistralai/Mistral-Small-3.1-24B-Instruct-2503 | Mistral-Small-3.1-24B     | **<span style="color: red;">×</span>**   | **<span style="color: green;">√</span>** |
-| microsoft/Phi-4-multimodal-instruct           | Phi-4-multimodal-instruct | **<span style="color: red;">×</span>**   | **<span style="color: green;">√</span>** |
-| XiaomiMiMo/MiMo-VL-7B-RL                      | MiMo-VL (7B)              | **<span style="color: red;">×</span>**   | **<span style="color: green;">√</span>** |
+| mistralai/Mistral-Small-3.1-24B-Instruct-2503 | Mistral-Small-3.1-24B     | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
+| microsoft/Phi-4-multimodal-instruct           | Phi-4-multimodal-instruct | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
+| XiaomiMiMo/MiMo-VL-7B-RL                      | MiMo-VL (7B)              | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | AI-ModelScope/llava-v1.6-34b                  | LLaVA (v1.5 & v1.6)       | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | lmms-lab/llava-next-72b                       | LLaVA-NeXT (8B, 72B)      | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| lmms-lab/llava-onevision-qwen2-7b-ov          | LLaVA-OneVision           | **<span style="color: red;">×</span>**   | **<span style="color: green;">√</span>** |
-| Kimi/Kimi-VL-A3B-Instruct                     | Kimi-VL (A3B)             | **<span style="color: red;">×</span>**   | **<span style="color: green;">√</span>** |
-| ZhipuAI/GLM-4.5V                              | GLM-4.5V (106B)           | **<span style="color: red;">×</span>**   | **<span style="color: green;">√</span>** |
+| lmms-lab/llava-onevision-qwen2-7b-ov          | LLaVA-OneVision           | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
+| Kimi/Kimi-VL-A3B-Instruct                     | Kimi-VL (A3B)             | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
+| ZhipuAI/GLM-4.5V                              | GLM-4.5V (106B)           | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | meta-llama/Llama-3.2-11B-Vision-Instruct      | Llama 3.2 Vision (11B)    | **<span style="color: red;">×</span>**   |  **<span style="color: red;">×</span>**  |
 
 ## Embedding Models
 
 | Models                                    | Model Family             | A2 Supported                             |               A3 Supported               |
 |-------------------------------------------|--------------------------|------------------------------------------|:----------------------------------------:|
-| 	intfloat/e5-mistral-7b-instruct          | E5 (Llama/Mistral based) | **<span style="color: red;">×</span>**   | **<span style="color: green;">√</span>** |
-| 	iic/gte_Qwen2-1.5B-instruct              | GTE-Qwen2                | **<span style="color: red;">×</span>**   | **<span style="color: green;">√</span>** |
+| 	intfloat/e5-mistral-7b-instruct          | E5 (Llama/Mistral based) | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
+| 	iic/gte_Qwen2-1.5B-instruct              | GTE-Qwen2                | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | 	Qwen/Qwen3-Embedding-8B                  | Qwen3-Embedding          | **<span style="color: red;">×</span>**   |  **<span style="color: red;">×</span>**  |
-| 	Alibaba-NLP/gme-Qwen2-VL-2B-Instruct     | GME (Multimodal)         | **<span style="color: red;">×</span>**   | **<span style="color: green;">√</span>** |
+| 	Alibaba-NLP/gme-Qwen2-VL-2B-Instruct     | GME (Multimodal)         | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | 	AI-ModelScope/clip-vit-large-patch14-336 | CLIP                     | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | 	BAAI/bge-large-en-v1.5                   | BGE                      | **<span style="color: red;">×</span>**   |  **<span style="color: red;">×</span>**  |
 
 ## Reward Models
 
-| Models                                      | Model Family              | A2 Supported                           |               A3 Supported               |
-|---------------------------------------------|---------------------------|----------------------------------------|:----------------------------------------:|
-| 	Skywork/Skywork-Reward-Llama-3.1-8B-v0.2   | Llama3.1 Reward           | **<span style="color: red;">×</span>** | **<span style="color: green;">√</span>** |
-| 	Shanghai_AI_Laboratory/internlm2-7b-reward | InternLM 2 Reward         | **<span style="color: red;">×</span>** | **<span style="color: green;">√</span>** |
-| 	Qwen/Qwen2.5-Math-RM-72B                   | Qwen2.5 Reward - Math     | **<span style="color: red;">×</span>** | **<span style="color: green;">√</span>** |
-| 	jason9693/Qwen2.5-1.5B-apeach              | Qwen2.5 Reward - Sequence | **<span style="color: red;">×</span>** | **<span style="color: green;">√</span>** |
-| 	Skywork/Skywork-Reward-Gemma-2-27B-v0.2    | Gemma 2-27B Reward        | **<span style="color: red;">×</span>** |  **<span style="color: red;">×</span>**  |
+| Models                                      | Model Family              | A2 Supported                             |               A3 Supported               |
+|---------------------------------------------|---------------------------|------------------------------------------|:----------------------------------------:|
+| 	Skywork/Skywork-Reward-Llama-3.1-8B-v0.2   | Llama3.1 Reward           | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
+| 	Shanghai_AI_Laboratory/internlm2-7b-reward | InternLM 2 Reward         | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
+| 	Qwen/Qwen2.5-Math-RM-72B                   | Qwen2.5 Reward - Math     | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
+| 	jason9693/Qwen2.5-1.5B-apeach              | Qwen2.5 Reward - Sequence | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
+| 	Skywork/Skywork-Reward-Gemma-2-27B-v0.2    | Gemma 2-27B Reward        | **<span style="color: red;">×</span>**   |  **<span style="color: red;">×</span>**  |
 
 ## Rerank Models
 
