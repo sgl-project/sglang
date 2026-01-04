@@ -74,7 +74,6 @@ class TestOpenAIEmbedding(CustomTestCase):
         self.assertEqual(len(response.data), 1)
         self.assertTrue(len(response.data[0].embedding) > 0)
 
-        client = openai.Client(api_key=self.api_key, base_url=self.base_url)
         response = client.embeddings.create(
             model=self.model,
             input=[15339, 314, 703, 284, 612, 262, 10658, 10188, 286, 2061],

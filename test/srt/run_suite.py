@@ -23,7 +23,6 @@ suites = {
         TestFile("models/test_reward_models.py", 103),
         TestFile("models/test_transformers_models.py", 245),
         TestFile("models/test_vlm_models.py", 270),
-        # openai_server tests moved to test/registered/openai/
         TestFile("ops/test_repeat_interleave.py", 60),
         TestFile("quant/test_block_int8.py", 44),
         TestFile("quant/test_fp8_kernel.py", 10),
@@ -194,7 +193,6 @@ suite_amd = {
         TestFile("models/test_reward_models.py", 132),
         TestFile("models/test_transformers_models.py", 320),
         TestFile("models/test_vlm_models.py", 387),
-        # openai_server tests moved to test/registered/openai/
         TestFile("ops/test_repeat_interleave.py", 75),
         TestFile("quant/test_awq_dequant.py", 2),
         TestFile("quant/test_block_int8.py", 22),
