@@ -30,7 +30,7 @@ def test_header_forwarding_whitelist(mock_workers, router_manager):
         assert h.get("x-correlation-id") == "corr-789"
         assert h.get("traceparent") == "00-trace-span-01"
         assert h.get("tracestate") == "vendor=value"
+        assert h.get("x-smg-routing-key") == "routing-123"
 
-        assert "x-smg-routing-key" not in h
         assert "x-custom-header" not in h
         assert "cookie" not in h
