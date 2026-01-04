@@ -54,7 +54,6 @@ RUN --mount=type=cache,id=sgl-kernel-cmake,target=/cmake-downloads \
     cmake --version
 
 # Install ccache
-# Install ccache
 RUN if [ "${USE_CCACHE}" = "1" ]; then \
     set -eux && \
     cd /tmp && \
@@ -85,8 +84,8 @@ RUN --mount=type=cache,id=sgl-kernel-pip,target=/root/.cache/pip \
       12.8) TORCH_VER=2.9.1; CU_TAG=cu128 ;; \
       *)    TORCH_VER=2.9.1; CU_TAG=cu126 ;; \
     esac; \
-    ${PYTHON_ROOT_PATH}/bin/pip install --no-cache-dir torch==${TORCH_VER} --index-url https://${PYTORCH_MIRROR}/whl/${CU_TAG}; \
-    ${PYTHON_ROOT_PATH}/bin/pip install --no-cache-dir ninja setuptools==75.0.0 wheel==0.41.0 numpy uv scikit-build-core --index-url ${PIP_DEFAULT_INDEX}
+    ${PYTHON_ROOT_PATH}/bin/pip install torch==${TORCH_VER} --index-url https://${PYTORCH_MIRROR}/whl/${CU_TAG}; \
+    ${PYTHON_ROOT_PATH}/bin/pip install ninja setuptools==75.0.0 wheel==0.41.0 numpy uv scikit-build-core --index-url ${PIP_DEFAULT_INDEX}
 
 # Build stage: copy source and build wheel
 FROM deps AS build
@@ -134,30 +133,30 @@ RUN --mount=type=cache,id=sgl-kernel-ccache,target=/ccache \
     if [ -n "${ENABLE_BUILD_PROFILE:-}" ] && [ -f /sgl-kernel/build/.ninja_log ]; then \
       echo "Ninja build profiling enabled - will save to /sgl-kernel/build-trace.json"; \
       wget --progress=dot https://raw.githubusercontent.com/cradleapps/ninjatracing/084212eaf68f25c70579958a2ed67fb4ec2a9ca4/ninjatracing -O /tmp/ninjatracing; \
-      if [ -f /tmp/ninjatracing ]; then ${PYTHON_ROOT_PATH}/bin/python /tmp/ninjatracing /sgl-kernel/build/.ninja_log > /sgl-kernel/build-trace.json; fi; \
-        if [ -f /sgl-kernel/build-trace.json ]; then \
-          gzip -9 -k /sgl-kernel/build-trace.json 2>/dev/null || true; \
-          echo "Build trace saved to: build-trace.json"; \
-          if [ -f /sgl-kernel/build-trace.json.gz ]; then \
-            ORIGINAL_SIZE=$(stat -f%z /sgl-kernel/build-trace.json 2>/dev/null || stat -c%s /sgl-kernel/build-trace.json); \
-            COMPRESSED_SIZE=$(stat -f%z /sgl-kernel/build-trace.json.gz 2>/dev/null || stat -c%s /sgl-kernel/build-trace.json.gz); \
-            RATIO=$(( (ORIGINAL_SIZE - COMPRESSED_SIZE) * 100 / ORIGINAL_SIZE )); \
-            echo "Compressed to: build-trace.json.gz (${RATIO}% smaller)"; \
-          fi; \
-          echo ""; \
-          echo "View in browser:"; \
-          echo "  - chrome://tracing (load JSON file)"; \
-          echo "  - ui.perfetto.dev (recommended, supports .gz files)"; \
-          echo ""; \
-          echo "Shows:"; \
-          echo "  - Compilation time per file"; \
-          echo "  - Parallelism utilization"; \
-          echo "  - Critical path (longest dependency chain)"; \
-          echo "  - Where the 2-hour build time went"; \
+      if [ -f /tmp/ninjatracing ]; then \
+        ${PYTHON_ROOT_PATH}/bin/python /tmp/ninjatracing /sgl-kernel/build/.ninja_log > /sgl-kernel/build-trace.json; \
+      fi; \
+      if [ -f /sgl-kernel/build-trace.json ]; then \
+        gzip -9 -k /sgl-kernel/build-trace.json 2>/dev/null || true; \
+        echo "Build trace saved to: build-trace.json"; \
+        if [ -f /sgl-kernel/build-trace.json.gz ]; then \
+          ORIGINAL_SIZE=$(stat -f%z /sgl-kernel/build-trace.json 2>/dev/null || stat -c%s /sgl-kernel/build-trace.json); \
+          COMPRESSED_SIZE=$(stat -f%z /sgl-kernel/build-trace.json.gz 2>/dev/null || stat -c%s /sgl-kernel/build-trace.json.gz); \
+          RATIO=$(( (ORIGINAL_SIZE - COMPRESSED_SIZE) * 100 / ORIGINAL_SIZE )); \
+          echo "Compressed to: build-trace.json.gz (${RATIO}% smaller)"; \
         fi; \
-    fi;
-
-RUN set -eux; \
+        echo ""; \
+        echo "View in browser:"; \
+        echo "  - chrome://tracing (load JSON file)"; \
+        echo "  - ui.perfetto.dev (recommended, supports .gz files)"; \
+        echo ""; \
+        echo "Shows:"; \
+        echo "  - Compilation time per file"; \
+        echo "  - Parallelism utilization"; \
+        echo "  - Critical path (longest dependency chain)"; \
+        echo "  - Where the 2-hour build time went"; \
+      fi; \
+    fi; \
     if [ "${USE_CCACHE}" = "1" ]; then \
       echo "ccache Statistics"; \
       ccache -s; \
