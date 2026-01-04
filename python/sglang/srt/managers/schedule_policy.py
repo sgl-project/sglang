@@ -369,6 +369,7 @@ class PrefillAdder:
         )
         self.nsa_prefill_cp_in_seq_split = is_nsa_prefill_cp_in_seq_split()
         self.prefill_max_requests = prefill_max_requests
+        self.prefill_delayer_single_pass = prefill_delayer_single_pass
 
     def _get_running_request_total_token_offset(self, req: Req) -> int:
         return (
