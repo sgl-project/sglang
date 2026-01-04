@@ -558,6 +558,57 @@ def popen_with_error_check(command: list[str], allow_exit: bool = False):
     return process
 
 
+def _try_enable_offline_mode_if_cache_complete(model_name_or_path: str, env: dict):
+    """
+    CI helper: Check if model cache is validated and enable offline mode.
+
+    The heavy validation is done once during CI initialization (prepare_runner.sh
+    via prevalidate_cached_models.py). This function only reads the validation
+    marker to decide whether to enable offline mode.
+
+    Args:
+        model_name_or_path: Model identifier or path
+        env: Environment dict to modify (will add HF_HUB_OFFLINE=1 if marker exists)
+    """
+    from sglang.srt.model_loader.ci_weight_validation import _read_validation_marker
+    from sglang.srt.utils import find_local_repo_dir
+
+    # Fast-path: If subprocess env already has HF_HUB_OFFLINE=1, skip
+    if env.get("HF_HUB_OFFLINE") == "1":
+        print(
+            f"CI_OFFLINE: Subprocess env already has HF_HUB_OFFLINE=1, skip - {model_name_or_path}"
+        )
+        return
+
+    # Skip if already a local path
+    if os.path.isdir(model_name_or_path):
+        return
+
+    # Try to find local snapshot
+    try:
+        snapshot_dir = find_local_repo_dir(model_name_or_path, revision=None)
+        if not snapshot_dir or not os.path.isdir(snapshot_dir):
+            return
+    except Exception:
+        return
+
+    # Check validation marker (written by prepare_runner.sh prevalidation)
+    marker = _read_validation_marker(snapshot_dir)
+    if marker is not None:
+        # IMPORTANT: Set HF_HUB_OFFLINE=1 ONLY for this subprocess, not globally
+        env["HF_HUB_OFFLINE"] = "1"
+        snapshot_basename = os.path.basename(snapshot_dir)
+        print(
+            f"CI_OFFLINE: Enabled HF_HUB_OFFLINE=1 for subprocess - "
+            f"marker found for {model_name_or_path} (snapshot={snapshot_basename})"
+        )
+    else:
+        print(
+            f"CI_OFFLINE: No validation marker for {model_name_or_path}, "
+            "will use online mode (allows HF to download missing files)"
+        )
+
+
 def popen_launch_server(
     model: str,
     base_url: str,
@@ -583,6 +634,22 @@ def popen_launch_server(
         device = auto_config_device()
         other_args = list(other_args)
         other_args += ["--device", str(device)]
+
+    # CI-specific: Validate cache and enable offline mode if complete
+    # This avoids HF Hub network requests during server initialization
+    if env is None:
+        env = os.environ.copy()
+    else:
+        env = env.copy()
+
+    try:
+        from sglang.utils import is_in_ci
+
+        if is_in_ci():
+            _try_enable_offline_mode_if_cache_complete(model, env)
+    except Exception as e:
+        # Don't fail the test if cache validation fails
+        print(f"CI cache validation failed (non-fatal): {e}")
 
     _, host, port = base_url.split(":")
     host = host[2:]
@@ -634,6 +701,10 @@ def popen_launch_server(
         command += ["--api-key", api_key]
 
     print(f"command={shlex.join(command)}")
+
+    # Log critical env info for debugging offline mode in CI
+    hf_hub_offline = env.get("HF_HUB_OFFLINE", "0")
+    print(f"CI_OFFLINE: Launching server HF_HUB_OFFLINE={hf_hub_offline} model={model}")
 
     if return_stdout_stderr:
         process = subprocess.Popen(

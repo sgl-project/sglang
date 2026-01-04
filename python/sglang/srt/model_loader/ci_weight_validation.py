@@ -7,6 +7,7 @@ These functions handle:
 - Checking for missing shards in sharded models
 - Cleaning up corrupted files (selective or full cache deletion)
 - Automatic retry logic for corrupted downloads
+- Validating config/tokenizer files completeness to enable offline mode
 
 For regular users, weight_utils.py provides simple download functionality without
 the overhead of validation and automatic cleanup. The CI-specific behavior is
@@ -14,11 +15,13 @@ gated by is_in_ci() checks in weight_utils.py.
 """
 
 import glob as glob_module
+import hashlib
 import json
 import logging
 import os
 import re
 import shutil
+import tempfile
 from typing import List, Optional, Tuple
 
 import safetensors
@@ -26,6 +29,451 @@ import safetensors
 from sglang.srt.utils import log_info_on_rank0
 
 logger = logging.getLogger(__name__)
+
+# Validation marker version - increment when validation logic changes
+# v2: Added trust_remote_code module validation (modeling_*.py must exist in snapshot)
+VALIDATION_MARKER_VERSION = "2"
+
+
+def _get_validation_marker_path(snapshot_dir: str) -> Optional[str]:
+    """
+    Get the path to validation marker file for a snapshot.
+
+    Marker is stored in /tmp to avoid permission issues with HF cache directory.
+    Marker key is sha256(snapshot_dir) to avoid any collisions regardless of
+    model_name_or_path format.
+
+    Args:
+        snapshot_dir: Path to snapshot directory
+
+    Returns:
+        Path to marker file or None if snapshot_dir is invalid
+    """
+    if not snapshot_dir or not os.path.isdir(snapshot_dir):
+        return None
+
+    # Normalize path to avoid marker misses due to trailing slashes or symlinks
+    # realpath resolves symlinks, rstrip removes trailing slashes
+    normalized_dir = os.path.realpath(snapshot_dir).rstrip("/")
+
+    # Use sha256 of normalized snapshot_dir path as unique key
+    # This avoids any collision issues with repo naming or snapshot hash reuse
+    dir_hash = hashlib.sha256(normalized_dir.encode("utf-8")).hexdigest()[:12]
+
+    # Store in /tmp with directory hash
+    return f"/tmp/sglang_hf_validation_{dir_hash}.json"
+
+
+def _read_validation_marker(snapshot_dir: str) -> Optional[dict]:
+    """
+    Read validation marker for a snapshot.
+
+    Args:
+        snapshot_dir: Path to snapshot directory
+
+    Returns:
+        Marker dict with keys: version, validated_at, validation_passed
+        None if marker doesn't exist or is invalid or validation_passed is not True
+    """
+    marker_path = _get_validation_marker_path(snapshot_dir)
+    if not marker_path:
+        return None
+
+    if not os.path.exists(marker_path):
+        return None
+
+    try:
+        with open(marker_path, "r", encoding="utf-8") as f:
+            marker = json.load(f)
+
+        # Validate marker structure
+        if not isinstance(marker, dict):
+            return None
+
+        required_keys = ["version", "validated_at", "validation_passed"]
+        if not all(key in marker for key in required_keys):
+            return None
+
+        # Check version match
+        if marker["version"] != VALIDATION_MARKER_VERSION:
+            logger.debug(
+                "Validation marker version mismatch: %s != %s, will re-validate",
+                marker["version"],
+                VALIDATION_MARKER_VERSION,
+            )
+            return None
+
+        # Explicitly check validation_passed is True (defensive check)
+        # Even though we only write markers on success, this guards against
+        # manual edits or future code changes
+        if marker.get("validation_passed") is not True:
+            logger.debug(
+                "Validation marker has validation_passed=%s, treating as invalid",
+                marker.get("validation_passed"),
+            )
+            return None
+
+        return marker
+    except (json.JSONDecodeError, OSError) as e:
+        logger.debug("Failed to read validation marker at %s: %s", marker_path, e)
+        return None
+
+
+def _write_validation_marker(snapshot_dir: str, passed: bool) -> None:
+    """
+    Write validation marker for a snapshot (atomic write).
+
+    IMPORTANT: We only cache successful validations. Failed validations are NOT
+    cached to allow retry after files are downloaded.
+
+    Args:
+        snapshot_dir: Path to snapshot directory
+        passed: Whether validation passed
+    """
+    if not passed:
+        # Don't cache failures - allow retry on next launch
+        return
+
+    marker_path = _get_validation_marker_path(snapshot_dir)
+    if not marker_path:
+        logger.debug("Cannot write marker: invalid snapshot_dir")
+        return
+
+    from datetime import datetime
+
+    marker = {
+        "version": VALIDATION_MARKER_VERSION,
+        "validated_at": datetime.utcnow().isoformat() + "Z",
+        "validation_passed": passed,
+    }
+
+    try:
+        # Atomic write: write to temp file then os.replace
+        marker_dir = os.path.dirname(marker_path)
+        os.makedirs(marker_dir, exist_ok=True)
+
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=marker_dir,
+            delete=False,
+            suffix=".tmp",
+        ) as f:
+            temp_path = f.name
+            json.dump(marker, f, indent=2)
+
+        # Atomic replace (overwrites existing file if any)
+        os.replace(temp_path, marker_path)
+        logger.debug("Wrote validation marker to %s (passed=%s)", marker_path, passed)
+    except Exception as e:
+        logger.warning("Failed to write validation marker to %s: %s", marker_path, e)
+        # Clean up temp file if it exists
+        try:
+            if "temp_path" in locals() and os.path.exists(temp_path):
+                os.remove(temp_path)
+        except Exception:
+            pass
+
+
+def _validate_json_file(file_path: str, file_name: str) -> bool:
+    """
+    Validate that a JSON file exists, is non-empty, and can be parsed.
+
+    Args:
+        file_path: Path to the JSON file
+        file_name: Name of the file (for logging)
+
+    Returns:
+        True if the file is valid, False otherwise
+    """
+    if not os.path.exists(file_path):
+        logger.debug("CI cache validation: %s not found at %s", file_name, file_path)
+        return False
+
+    if not os.path.isfile(file_path):
+        logger.warning(
+            "CI cache validation: %s is not a file: %s", file_name, file_path
+        )
+        return False
+
+    # Check if file is non-empty
+    try:
+        file_size = os.path.getsize(file_path)
+        if file_size == 0:
+            logger.warning("CI cache validation: %s is empty: %s", file_name, file_path)
+            return False
+    except OSError as e:
+        logger.warning("CI cache validation: Cannot get size of %s: %s", file_name, e)
+        return False
+
+    # Try to parse JSON
+    try:
+        with open(file_path, "r", encoding="utf-8") as f:
+            json.load(f)
+        return True
+    except json.JSONDecodeError as e:
+        logger.warning(
+            "CI cache validation: %s is not valid JSON: %s - %s",
+            file_name,
+            file_path,
+            e,
+        )
+        return False
+    except Exception as e:
+        logger.warning(
+            "CI cache validation: Failed to read %s: %s - %s",
+            file_name,
+            file_path,
+            e,
+        )
+        return False
+
+
+def _validate_config_and_tokenizer_files(snapshot_dir: str) -> Tuple[bool, List[str]]:
+    """
+    Validate that critical config and tokenizer files exist and are valid.
+
+    This checks for:
+    - config.json (required)
+    - tokenizer_config.json (required)
+    - generation_config.json (optional but validated if present)
+    - hf_quant_config.json (optional but validated if present) - for FP4/FP8/ModelOpt
+    - quantize_config.json / quant_config.json (optional but validated if present) - for AWQ/GPTQ
+    - params.json (optional but validated if present) - for Mistral native format
+    - preprocessor_config.json (optional but validated if present) - for vision models
+    - trust_remote_code dynamic modules (required if auto_map present in config.json)
+    - At least one tokenizer file: tokenizer.json, tokenizer.model, or tiktoken.model
+
+    Args:
+        snapshot_dir: Path to the model snapshot directory
+
+    Returns:
+        Tuple of (is_valid, missing_files)
+        - is_valid: True if all required files are present and valid
+        - missing_files: List of missing or invalid file names
+    """
+    missing_files = []
+
+    # Check required config files
+    required_files = [
+        "config.json",
+        "tokenizer_config.json",
+    ]
+
+    for file_name in required_files:
+        file_path = os.path.join(snapshot_dir, file_name)
+        if not _validate_json_file(file_path, file_name):
+            missing_files.append(file_name)
+
+    # Check optional generation_config.json (validate if exists)
+    generation_config_path = os.path.join(snapshot_dir, "generation_config.json")
+    if os.path.exists(generation_config_path):
+        if not _validate_json_file(generation_config_path, "generation_config.json"):
+            missing_files.append("generation_config.json (exists but invalid)")
+
+    # Check optional hf_quant_config.json (validate if exists)
+    # This file is needed for quantized models (FP4/FP8/ModelOpt)
+    # Example: nvidia/Llama-3.1-8B-Instruct-FP8, Barrrrry/DeepSeek-R1-W4AFP8
+    hf_quant_config_path = os.path.join(snapshot_dir, "hf_quant_config.json")
+    if os.path.exists(hf_quant_config_path):
+        if not _validate_json_file(hf_quant_config_path, "hf_quant_config.json"):
+            missing_files.append("hf_quant_config.json (exists but invalid)")
+
+    # Check optional quantize_config.json / quant_config.json (validate if exists)
+    # These files are needed for AWQ/GPTQ/AutoRound quantized models
+    # Example: TheBloke/Llama-2-7B-AWQ, casperhansen/vicuna-7b-v1.5-awq
+    for quant_config_name in ["quantize_config.json", "quant_config.json"]:
+        quant_config_path = os.path.join(snapshot_dir, quant_config_name)
+        if os.path.exists(quant_config_path):
+            if not _validate_json_file(quant_config_path, quant_config_name):
+                missing_files.append(f"{quant_config_name} (exists but invalid)")
+            break  # Only need to check one of these
+
+    # Check optional params.json (validate if exists)
+    # This file is needed for Mistral native format models
+    # Example: mistralai/Mistral-7B-v0.1
+    params_json_path = os.path.join(snapshot_dir, "params.json")
+    if os.path.exists(params_json_path):
+        if not _validate_json_file(params_json_path, "params.json"):
+            missing_files.append("params.json (exists but invalid)")
+
+    # Check optional preprocessor_config.json (validate if exists)
+    # This file is needed for vision/multimodal models
+    # Example: llava-hf/llava-1.5-7b-hf, Qwen/Qwen2-VL-7B-Instruct
+    preprocessor_config_path = os.path.join(snapshot_dir, "preprocessor_config.json")
+    if os.path.exists(preprocessor_config_path):
+        if not _validate_json_file(
+            preprocessor_config_path, "preprocessor_config.json"
+        ):
+            missing_files.append("preprocessor_config.json (exists but invalid)")
+
+    # Check for trust_remote_code dynamic module files if needed
+    # When auto_map exists in config.json, the model requires custom Python files
+    # These files must be present for offline mode to work
+    config_path = os.path.join(snapshot_dir, "config.json")
+    if os.path.exists(config_path):
+        try:
+            with open(config_path, "r", encoding="utf-8") as f:
+                config = json.load(f)
+
+            auto_map = config.get("auto_map", {})
+            if auto_map and isinstance(auto_map, dict):
+                # Extract Python module files from auto_map
+                # auto_map format: {"AutoConfig": "configuration_xxx.ConfigClass", ...}
+                # We need to check if the .py files exist
+                custom_files = set()
+                for key, value in auto_map.items():
+                    if isinstance(value, str) and "." in value:
+                        # Extract module name (e.g., "configuration_xxx" from "configuration_xxx.ConfigClass")
+                        module_name = value.split(".")[0]
+                        custom_files.add(f"{module_name}.py")
+
+                # Check if all custom files exist in snapshot directory
+                # NOTE: Some models (like nvidia/DeepSeek-V3-0324-FP4) have auto_map
+                # but don't include modeling_*.py in their repo, relying on transformers
+                # to fetch it from the base model. We MUST mark these as missing to
+                # prevent offline mode, which would fail to load the dynamic modules.
+                for custom_file in custom_files:
+                    custom_file_path = os.path.join(snapshot_dir, custom_file)
+                    if not os.path.exists(custom_file_path):
+                        missing_files.append(
+                            f"{custom_file} (required for trust_remote_code)"
+                        )
+                        logger.debug(
+                            f"Custom module file not in snapshot: {custom_file} for {snapshot_dir}"
+                        )
+                    elif not os.path.isfile(custom_file_path):
+                        missing_files.append(f"{custom_file} (exists but not a file)")
+        except (json.JSONDecodeError, OSError, KeyError) as e:
+            # If we can't read config.json, it will be caught by earlier validation
+            logger.debug("Failed to check auto_map in config.json: %s", e)
+
+    # Check for at least one tokenizer file
+    tokenizer_files = [
+        "tokenizer.json",
+        "tokenizer.model",
+        "tiktoken.model",
+    ]
+
+    tokenizer_found = False
+    for tokenizer_file in tokenizer_files:
+        tokenizer_path = os.path.join(snapshot_dir, tokenizer_file)
+        if os.path.exists(tokenizer_path) and os.path.isfile(tokenizer_path):
+            # For tokenizer.json, validate it's proper JSON
+            if tokenizer_file == "tokenizer.json":
+                if _validate_json_file(tokenizer_path, tokenizer_file):
+                    tokenizer_found = True
+                    break
+            else:
+                # For .model files, just check they're non-empty
+                try:
+                    if os.path.getsize(tokenizer_path) > 0:
+                        tokenizer_found = True
+                        break
+                except OSError:
+                    pass
+
+    if not tokenizer_found:
+        missing_files.append(
+            "tokenizer file (none of: tokenizer.json, tokenizer.model, tiktoken.model)"
+        )
+
+    is_valid = len(missing_files) == 0
+    return is_valid, missing_files
+
+
+def ci_validate_cache_and_enable_offline_if_complete(
+    snapshot_dir: str,
+    weight_files: List[str],
+    model_name_or_path: str,
+) -> bool:
+    """
+    Validate local cache completeness (config/tokenizer/weights) and determine
+    if offline mode can be safely enabled.
+
+    This function uses a snapshot-level marker to cache validation results,
+    so the heavy validation is done at most once per snapshot per runner.
+
+    This function checks:
+    1. Validation marker (if exists and version matches, skip re-validation)
+    2. Config and tokenizer files (config.json, tokenizer_config.json, etc.)
+    3. Weight files (safetensors shards, index files, corruption check)
+
+    If all are present and valid, it returns True to signal that offline
+    mode can be safely enabled.
+
+    IMPORTANT: This should be called BEFORE any HF operations, and if it
+    returns True, the caller should set HF_HUB_OFFLINE=1 for the server
+    subprocess env ONLY (not global environment).
+
+    Args:
+        snapshot_dir: Path to the model snapshot directory
+        weight_files: List of weight file paths to validate (must be non-empty)
+        model_name_or_path: Model identifier for logging
+
+    Returns:
+        True if cache is complete and offline mode can be enabled, False otherwise
+    """
+    # Guard: weight_files is required
+    if not weight_files:
+        log_info_on_rank0(
+            logger,
+            f"CI_OFFLINE: No weight files provided, skip offline, keep online allowed - {model_name_or_path}",
+        )
+        return False
+
+    # Fast-path: Check if validation marker exists and is valid
+    # We only cache successful validations, so if marker exists, it means cache is complete
+    marker = _read_validation_marker(snapshot_dir)
+    if marker is not None:
+        marker_path = _get_validation_marker_path(snapshot_dir)
+        marker_name = os.path.basename(marker_path) if marker_path else "unknown"
+        log_info_on_rank0(
+            logger,
+            f"CI_OFFLINE: Marker hit (marker={marker_name}), skip re-validation, offline mode will be enabled - {model_name_or_path}",
+        )
+        return True
+
+    # No marker - perform full validation
+    # (Failures are not cached, so we'll retry validation each time until success)
+    log_info_on_rank0(
+        logger,
+        f"CI_OFFLINE: No marker found, performing full validation - {model_name_or_path}",
+    )
+
+    # Validate config and tokenizer files
+    config_valid, missing_config_files = _validate_config_and_tokenizer_files(
+        snapshot_dir
+    )
+
+    if not config_valid:
+        log_info_on_rank0(
+            logger,
+            f"CI_OFFLINE: Missing config/tokenizer files {missing_config_files}, skip offline, keep online allowed - {model_name_or_path}",
+        )
+        # Don't write marker for failures - allow retry after download
+        return False
+
+    # Validate weight files using existing validation from PR #15216
+    # This checks for missing shards, corrupted safetensors, etc.
+    weights_valid, error_msg, _ = _validate_sharded_model(snapshot_dir, weight_files)
+    if not weights_valid:
+        log_info_on_rank0(
+            logger,
+            f"CI_OFFLINE: Weight validation failed ({error_msg}), skip offline, keep online allowed - {model_name_or_path}",
+        )
+        # Don't write marker for failures - allow retry after download
+        return False
+
+    log_info_on_rank0(
+        logger,
+        f"CI_OFFLINE: Cache validation PASSED, offline mode will be enabled - {model_name_or_path}",
+    )
+
+    # Write marker with passed=True for future reuse
+    # (Failures are not cached, so this only happens on success)
+    _write_validation_marker(snapshot_dir, passed=True)
+    return True
 
 
 def _validate_safetensors_file(file_path: str) -> bool:
