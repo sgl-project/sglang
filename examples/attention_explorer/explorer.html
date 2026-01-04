@@ -1,0 +1,1253 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SGLang Attention Explorer</title>
+    <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@300;400;500;600;700&family=Outfit:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --void: #030308;
+            --abyss: #08080f;
+            --deep: #0c0c14;
+            --surface: #12121c;
+            --elevated: #1a1a28;
+            --border: #252538;
+            --border-glow: #3a3a55;
+
+            --cyan: #00e5ff;
+            --magenta: #ff0099;
+            --lime: #b4ff00;
+            --amber: #ffaa00;
+            --violet: #aa00ff;
+
+            --text: #e8e8f4;
+            --text-dim: #707090;
+            --text-muted: #50506a;
+        }
+
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+
+        html, body {
+            font-family: 'IBM Plex Mono', monospace;
+            background: var(--void);
+            color: var(--text);
+            height: 100vh;
+            overflow: hidden;
+        }
+
+        /* Layout */
+        .app {
+            display: grid;
+            grid-template-rows: 60px 1fr;
+            grid-template-columns: 380px 1fr 320px;
+            height: 100vh;
+        }
+
+        /* Header */
+        .header {
+            grid-column: 1 / -1;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 0 24px;
+            background: var(--abyss);
+            border-bottom: 1px solid var(--border);
+        }
+
+        .logo {
+            display: flex;
+            align-items: center;
+            gap: 14px;
+        }
+
+        .logo-icon {
+            width: 38px;
+            height: 38px;
+            background: linear-gradient(135deg, var(--cyan), var(--magenta));
+            border-radius: 10px;
+            display: grid;
+            place-items: center;
+            font-weight: 800;
+            font-size: 18px;
+            color: var(--void);
+        }
+
+        .logo h1 {
+            font-family: 'Outfit', sans-serif;
+            font-size: 18px;
+            font-weight: 700;
+            background: linear-gradient(90deg, var(--text), var(--cyan));
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+
+        .logo span {
+            font-size: 10px;
+            color: var(--text-dim);
+            text-transform: uppercase;
+            letter-spacing: 2px;
+        }
+
+        .header-actions {
+            display: flex;
+            align-items: center;
+            gap: 16px;
+        }
+
+        .status-badge {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 8px 16px;
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 100px;
+            font-size: 11px;
+        }
+
+        .status-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: var(--lime);
+            box-shadow: 0 0 8px var(--lime);
+        }
+
+        .status-dot.error { background: var(--magenta); box-shadow: 0 0 8px var(--magenta); }
+        .status-dot.loading { background: var(--amber); animation: blink 1s infinite; }
+
+        @keyframes blink { 50% { opacity: 0.4; } }
+
+        /* Left Panel - Input */
+        .panel-left {
+            background: var(--abyss);
+            border-right: 1px solid var(--border);
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+        }
+
+        .panel-section {
+            padding: 20px;
+            border-bottom: 1px solid var(--border);
+        }
+
+        .panel-section:last-child { border-bottom: none; }
+
+        .section-title {
+            font-family: 'Outfit', sans-serif;
+            font-size: 11px;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 1.5px;
+            color: var(--text-dim);
+            margin-bottom: 14px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .section-title::before {
+            content: '';
+            width: 4px;
+            height: 4px;
+            background: var(--cyan);
+            border-radius: 1px;
+        }
+
+        textarea {
+            width: 100%;
+            height: 160px;
+            background: var(--deep);
+            border: 1px solid var(--border);
+            border-radius: 10px;
+            padding: 14px;
+            color: var(--text);
+            font-family: inherit;
+            font-size: 12px;
+            line-height: 1.6;
+            resize: none;
+        }
+
+        textarea:focus {
+            outline: none;
+            border-color: var(--cyan);
+            box-shadow: 0 0 0 3px rgba(0, 229, 255, 0.1);
+        }
+
+        .btn-row {
+            display: flex;
+            gap: 10px;
+            margin-top: 14px;
+        }
+
+        .btn {
+            flex: 1;
+            padding: 12px;
+            border: none;
+            border-radius: 8px;
+            font-family: inherit;
+            font-size: 11px;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+
+        .btn-primary {
+            background: linear-gradient(135deg, var(--cyan), #00b8d4);
+            color: var(--void);
+        }
+
+        .btn-primary:hover:not(:disabled) {
+            box-shadow: 0 0 30px rgba(0, 229, 255, 0.4);
+            transform: translateY(-1px);
+        }
+
+        .btn-primary:disabled { opacity: 0.4; cursor: not-allowed; }
+
+        .btn-ghost {
+            background: transparent;
+            color: var(--text-dim);
+            border: 1px solid var(--border);
+        }
+
+        .btn-ghost:hover { border-color: var(--magenta); color: var(--magenta); }
+
+        /* Settings */
+        .settings-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 10px;
+        }
+
+        .setting {
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+        }
+
+        .setting.full { grid-column: span 2; }
+
+        .setting label {
+            font-size: 10px;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            color: var(--text-muted);
+        }
+
+        .setting input, .setting select {
+            background: var(--deep);
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            padding: 10px;
+            color: var(--text);
+            font-family: inherit;
+            font-size: 12px;
+        }
+
+        .setting input:focus, .setting select:focus {
+            outline: none;
+            border-color: var(--cyan);
+        }
+
+        /* Stats */
+        .stats-row {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 10px;
+        }
+
+        .stat {
+            background: var(--deep);
+            border-radius: 10px;
+            padding: 14px;
+            text-align: center;
+        }
+
+        .stat-value {
+            font-family: 'Outfit', sans-serif;
+            font-size: 22px;
+            font-weight: 700;
+            color: var(--cyan);
+        }
+
+        .stat-label {
+            font-size: 9px;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            color: var(--text-muted);
+            margin-top: 4px;
+        }
+
+        /* Main Canvas Area */
+        .main-view {
+            background: var(--deep);
+            position: relative;
+            overflow: hidden;
+        }
+
+        .canvas-container {
+            position: absolute;
+            inset: 0;
+        }
+
+        #edgeCanvas {
+            position: absolute;
+            inset: 0;
+            pointer-events: none;
+        }
+
+        .token-viewport {
+            position: absolute;
+            inset: 0;
+            overflow: auto;
+            padding: 24px;
+        }
+
+        /* Token Display */
+        .token-segments {
+            display: flex;
+            flex-direction: column;
+            gap: 20px;
+        }
+
+        .segment {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            overflow: hidden;
+        }
+
+        .segment-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 12px 16px;
+            background: var(--elevated);
+            border-bottom: 1px solid var(--border);
+            font-size: 11px;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+        }
+
+        .segment-header.prompt { color: var(--cyan); }
+        .segment-header.think { color: var(--amber); }
+        .segment-header.output { color: var(--lime); }
+
+        .segment-toggle {
+            background: none;
+            border: none;
+            color: inherit;
+            cursor: pointer;
+            font-size: 14px;
+        }
+
+        .segment-body {
+            padding: 16px;
+        }
+
+        .token-flow {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 4px;
+        }
+
+        .token {
+            position: relative;
+            padding: 6px 10px;
+            background: var(--elevated);
+            border: 1px solid var(--border);
+            border-radius: 4px;
+            font-size: 12px;
+            cursor: pointer;
+            transition: all 0.15s;
+            white-space: pre;
+        }
+
+        .token:hover {
+            border-color: var(--cyan);
+            background: var(--surface);
+            z-index: 10;
+        }
+
+        .token.selected {
+            border-color: var(--magenta);
+            box-shadow: 0 0 20px rgba(255, 0, 153, 0.3);
+            z-index: 20;
+        }
+
+        .token.attended-to {
+            border-color: var(--cyan);
+            background: rgba(0, 229, 255, 0.15);
+        }
+
+        .token.attends-from {
+            border-color: var(--lime);
+            background: rgba(180, 255, 0, 0.15);
+        }
+
+        .token[data-idx]::before {
+            content: attr(data-idx);
+            position: absolute;
+            top: -6px;
+            right: -4px;
+            font-size: 8px;
+            padding: 1px 4px;
+            background: var(--border);
+            border-radius: 3px;
+            color: var(--text-muted);
+            opacity: 0;
+            transition: opacity 0.15s;
+        }
+
+        .token:hover::before { opacity: 1; }
+
+        /* Right Panel - Details */
+        .panel-right {
+            background: var(--abyss);
+            border-left: 1px solid var(--border);
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+        }
+
+        .detail-header {
+            padding: 20px;
+            border-bottom: 1px solid var(--border);
+        }
+
+        .selected-token {
+            font-family: 'Outfit', sans-serif;
+            font-size: 28px;
+            font-weight: 700;
+            color: var(--magenta);
+            word-break: break-all;
+        }
+
+        .selected-meta {
+            font-size: 11px;
+            color: var(--text-dim);
+            margin-top: 6px;
+        }
+
+        .detail-tabs {
+            display: flex;
+            border-bottom: 1px solid var(--border);
+        }
+
+        .detail-tab {
+            flex: 1;
+            padding: 12px;
+            background: none;
+            border: none;
+            color: var(--text-dim);
+            font-family: inherit;
+            font-size: 10px;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            cursor: pointer;
+            border-bottom: 2px solid transparent;
+            transition: all 0.2s;
+        }
+
+        .detail-tab:hover { color: var(--text); }
+        .detail-tab.active {
+            color: var(--cyan);
+            border-bottom-color: var(--cyan);
+        }
+
+        .detail-content {
+            flex: 1;
+            overflow-y: auto;
+            padding: 16px;
+        }
+
+        .attention-list {
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+        }
+
+        .attention-item {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            padding: 12px;
+            background: var(--deep);
+            border-radius: 8px;
+            cursor: pointer;
+            transition: all 0.15s;
+        }
+
+        .attention-item:hover {
+            background: var(--surface);
+        }
+
+        .attn-rank {
+            width: 24px;
+            height: 24px;
+            background: var(--surface);
+            border-radius: 6px;
+            display: grid;
+            place-items: center;
+            font-size: 10px;
+            font-weight: 700;
+            color: var(--text-dim);
+        }
+
+        .attn-token {
+            flex: 1;
+            font-weight: 500;
+            min-width: 0;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+        .attn-score {
+            font-size: 11px;
+            color: var(--cyan);
+            font-weight: 600;
+        }
+
+        .attn-bar {
+            width: 60px;
+            height: 4px;
+            background: var(--surface);
+            border-radius: 2px;
+            overflow: hidden;
+        }
+
+        .attn-bar-fill {
+            height: 100%;
+            background: linear-gradient(90deg, var(--cyan), var(--lime));
+            border-radius: 2px;
+        }
+
+        /* Empty/Loading States */
+        .state-empty, .state-loading {
+            position: absolute;
+            inset: 0;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            gap: 20px;
+        }
+
+        .state-icon {
+            font-size: 64px;
+            opacity: 0.2;
+        }
+
+        .state-text {
+            color: var(--text-dim);
+            font-size: 13px;
+            text-align: center;
+            max-width: 300px;
+            line-height: 1.6;
+        }
+
+        .spinner {
+            width: 48px;
+            height: 48px;
+            border: 3px solid var(--border);
+            border-top-color: var(--cyan);
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+        }
+
+        @keyframes spin { to { transform: rotate(360deg); } }
+
+        /* Scrollbar */
+        ::-webkit-scrollbar { width: 6px; height: 6px; }
+        ::-webkit-scrollbar-track { background: var(--abyss); }
+        ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+        ::-webkit-scrollbar-thumb:hover { background: var(--border-glow); }
+
+        /* Toggle */
+        .toggle-row {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            padding: 10px 12px;
+            background: var(--deep);
+            border-radius: 8px;
+            margin-top: 10px;
+            cursor: pointer;
+        }
+
+        .toggle {
+            width: 36px;
+            height: 20px;
+            background: var(--border);
+            border-radius: 100px;
+            position: relative;
+            transition: all 0.2s;
+        }
+
+        .toggle::after {
+            content: '';
+            position: absolute;
+            top: 3px;
+            left: 3px;
+            width: 14px;
+            height: 14px;
+            background: var(--text);
+            border-radius: 50%;
+            transition: all 0.2s;
+        }
+
+        .toggle.active { background: var(--cyan); }
+        .toggle.active::after { left: 19px; }
+
+        .toggle-label { font-size: 11px; }
+    </style>
+</head>
+<body>
+    <div class="app">
+        <header class="header">
+            <div class="logo">
+                <div class="logo-icon">⬡</div>
+                <div>
+                    <h1>SGLang Attention Explorer</h1>
+                    <span>Real Attention Token Visualization</span>
+                </div>
+            </div>
+            <div class="header-actions">
+                <div class="status-badge">
+                    <div class="status-dot" id="statusDot"></div>
+                    <span id="statusText">Connecting...</span>
+                </div>
+            </div>
+        </header>
+
+        <aside class="panel-left">
+            <div class="panel-section">
+                <div class="section-title">Input Text</div>
+                <textarea id="inputText" placeholder="Enter text to analyze attention patterns...">What is the capital of France?</textarea>
+                <div class="btn-row">
+                    <button class="btn btn-primary" id="analyzeBtn" onclick="analyze()">Analyze</button>
+                    <button class="btn btn-ghost" onclick="clearAll()">Clear</button>
+                </div>
+            </div>
+
+            <div class="panel-section">
+                <div class="section-title">Configuration</div>
+                <div class="settings-grid">
+                    <div class="setting">
+                        <label>Max Tokens</label>
+                        <input type="number" id="maxTokens" value="100" min="1" max="4096">
+                    </div>
+                    <div class="setting">
+                        <label>Attention Top-K</label>
+                        <input type="number" id="attentionTopK" value="5" min="1" max="64">
+                    </div>
+                    <div class="setting">
+                        <label>Temperature</label>
+                        <input type="number" id="temperature" value="0.6" min="0" max="2" step="0.1">
+                    </div>
+                    <div class="setting">
+                        <label>Edge Threshold</label>
+                        <input type="number" id="edgeThreshold" value="0.05" min="0" max="1" step="0.01">
+                    </div>
+                    <div class="toggle-row setting full" onclick="toggleWordMode()">
+                        <div class="toggle" id="wordModeToggle"></div>
+                        <span class="toggle-label">Aggregate to word-level</span>
+                    </div>
+                </div>
+            </div>
+
+            <div class="panel-section">
+                <div class="section-title">Statistics</div>
+                <div class="stats-row">
+                    <div class="stat">
+                        <div class="stat-value" id="statTokens">0</div>
+                        <div class="stat-label">Tokens</div>
+                    </div>
+                    <div class="stat">
+                        <div class="stat-value" id="statEdges">0</div>
+                        <div class="stat-label">Edges</div>
+                    </div>
+                    <div class="stat">
+                        <div class="stat-value" id="statLayers">0</div>
+                        <div class="stat-label">Layers</div>
+                    </div>
+                </div>
+            </div>
+        </aside>
+
+        <main class="main-view" id="mainView">
+            <div class="state-empty" id="emptyState">
+                <div class="state-icon">⬡</div>
+                <div class="state-text">
+                    Enter text and click <strong>Analyze</strong> to visualize real attention patterns from the model.
+                </div>
+            </div>
+
+            <div class="state-loading" id="loadingState" style="display: none;">
+                <div class="spinner"></div>
+                <div class="state-text" id="loadingText">Generating with attention capture...</div>
+            </div>
+
+            <div class="canvas-container" id="canvasContainer" style="display: none;">
+                <canvas id="edgeCanvas"></canvas>
+                <div class="token-viewport" id="tokenViewport">
+                    <div class="token-segments" id="tokenSegments"></div>
+                </div>
+            </div>
+        </main>
+
+        <aside class="panel-right">
+            <div class="detail-header">
+                <div class="selected-token" id="selectedTokenText">Select a token</div>
+                <div class="selected-meta" id="selectedTokenMeta">Click any token to see its attention patterns</div>
+            </div>
+
+            <div class="detail-tabs">
+                <button class="detail-tab active" data-tab="attends" onclick="switchDetailTab('attends')">
+                    Attends To
+                </button>
+                <button class="detail-tab" data-tab="attendedBy" onclick="switchDetailTab('attendedBy')">
+                    Attended By
+                </button>
+            </div>
+
+            <div class="detail-content" id="detailContent">
+                <div class="attention-list" id="attentionList">
+                    <div style="color: var(--text-dim); font-size: 12px; text-align: center; padding: 40px;">
+                        Select a token to view attention details
+                    </div>
+                </div>
+            </div>
+        </aside>
+    </div>
+
+    <script>
+        // Configuration - UPDATE THIS TO YOUR ENDPOINT
+        const CONFIG = {
+            apiBase: 'http://localhost:8000',
+            modelId: 'Qwen/Qwen3-Next-80B-A3B-Thinking-FP8'
+        };
+
+        // State
+        const state = {
+            tokens: [],
+            edges: [],
+            adjacencyOut: {},
+            adjacencyIn: {},
+            selectedToken: null,
+            detailTab: 'attends',
+            wordMode: false,
+        };
+
+        // Initialization
+        async function init() {
+            await checkConnection();
+            setupCanvas();
+            window.addEventListener('resize', () => {
+                setupCanvas();
+                if (state.tokens.length) renderEdges();
+            });
+        }
+
+        async function checkConnection() {
+            const dot = document.getElementById('statusDot');
+            const text = document.getElementById('statusText');
+
+            try {
+                const res = await fetch(`${CONFIG.apiBase}/v1/models`);
+                const data = await res.json();
+                dot.classList.remove('error', 'loading');
+                text.textContent = data.data[0]?.id?.split('/')[1] || 'Connected';
+            } catch (e) {
+                dot.classList.add('error');
+                text.textContent = 'Connection failed';
+            }
+        }
+
+        function setupCanvas() {
+            const canvas = document.getElementById('edgeCanvas');
+            const container = document.getElementById('canvasContainer');
+            canvas.width = container.clientWidth;
+            canvas.height = container.clientHeight;
+        }
+
+        // Get prompt token texts by tokenizing the chat-formatted prompt
+        async function getPromptTokenTexts(text) {
+            try {
+                // Build the chat template (Qwen3 format)
+                const chatPrompt = `<|im_start|>user\n${text}<|im_end|>\n<|im_start|>assistant\n`;
+
+                // First tokenize the full prompt with chat template
+                const tokenizeRes = await fetch(`${CONFIG.apiBase}/v1/tokenize`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ model: CONFIG.modelId, prompt: chatPrompt })
+                });
+                if (!tokenizeRes.ok) return null;
+                const tokenData = await tokenizeRes.json();
+
+                // Detokenize each token individually to get text
+                const tokenTexts = [];
+                for (const tokenId of tokenData.tokens) {
+                    const detokRes = await fetch(`${CONFIG.apiBase}/v1/detokenize`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ model: CONFIG.modelId, tokens: [tokenId] })
+                    });
+                    if (detokRes.ok) {
+                        const detokData = await detokRes.json();
+                        tokenTexts.push(detokData.text);
+                    } else {
+                        tokenTexts.push(`[${tokenId}]`);
+                    }
+                }
+                return tokenTexts;
+            } catch (e) {
+                console.warn('Could not get prompt token texts:', e);
+                return null;
+            }
+        }
+
+        // Analysis
+        async function analyze() {
+            const text = document.getElementById('inputText').value.trim();
+            if (!text) return;
+
+            const maxTokens = parseInt(document.getElementById('maxTokens').value);
+            const temperature = parseFloat(document.getElementById('temperature').value);
+
+            showLoading('Sending request with attention capture...');
+            document.getElementById('analyzeBtn').disabled = true;
+
+            try {
+                // Get prompt token texts in parallel with the main request
+                const promptTokensPromise = getPromptTokenTexts(text);
+
+                const response = await fetch(`${CONFIG.apiBase}/v1/chat/completions`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        model: CONFIG.modelId,
+                        messages: [{ role: 'user', content: text }],
+                        max_tokens: maxTokens,
+                        temperature: temperature,
+                        return_attention_tokens: true,
+                        logprobs: true,
+                        top_logprobs: 1,
+                    })
+                });
+
+                if (!response.ok) throw new Error(`API error: ${response.status}`);
+
+                const data = await response.json();
+                console.log('API Response:', data);
+
+                // Wait for prompt tokens
+                const promptTokenTexts = await promptTokensPromise;
+                console.log('Prompt token texts:', promptTokenTexts);
+
+                showLoading('Parsing attention data...');
+                parseResponse(data, text, promptTokenTexts);
+
+                showLoading('Rendering visualization...');
+                render();
+
+                hideLoading();
+                updateStats();
+
+            } catch (error) {
+                console.error('Analysis error:', error);
+                alert(`Error: ${error.message}`);
+                hideLoading();
+            }
+
+            document.getElementById('analyzeBtn').disabled = false;
+        }
+
+        function parseResponse(data, originalText, promptTokenTexts = null) {
+            const choice = data.choices?.[0];
+            if (!choice) throw new Error('No response choice');
+
+            state.tokens = [];
+            state.edges = [];
+            state.adjacencyOut = {};
+            state.adjacencyIn = {};
+            state.selectedToken = null;
+
+            const generatedText = choice.message?.content || '';
+            const attentionTokens = choice.attention_tokens || [];
+            const logprobs = choice.logprobs?.content || [];
+            const usage = data.usage || {};
+
+            // Get actual token count from API
+            const promptTokenCount = usage.prompt_tokens || 0;
+            const completionTokenCount = usage.completion_tokens || 0;
+
+            let tokens = [];
+
+            // Create prompt tokens - use actual token texts if available
+            // Note: There may be a mismatch between our tokenized count and the API's prompt_tokens
+            // because the API may add BOS token or apply different template processing
+            const tokenOffset = promptTokenTexts ? Math.max(0, promptTokenCount - promptTokenTexts.length) : 0;
+
+            for (let i = 0; i < promptTokenCount; i++) {
+                let tokenText;
+                const adjustedIdx = i - tokenOffset;
+                if (promptTokenTexts && adjustedIdx >= 0 && adjustedIdx < promptTokenTexts.length) {
+                    tokenText = promptTokenTexts[adjustedIdx];
+                    // Clean up special tokens for display
+                    if (tokenText === '') tokenText = '⟨special⟩';
+                    else if (tokenText === '\n') tokenText = '⏎';
+                } else if (i < tokenOffset) {
+                    tokenText = '⟨bos⟩';  // Likely BOS or prepended tokens
+                } else {
+                    tokenText = i === 0 ? `[P:${originalText.substring(0, 15)}...]` : `[P${i}]`;
+                }
+                tokens.push({
+                    idx: i,
+                    text: tokenText,
+                    segment: 'prompt',
+                    isPlaceholder: !promptTokenTexts
+                });
+            }
+
+            // If we have logprobs, use actual token text for output
+            if (logprobs.length > 0) {
+                let inThinkMode = false;
+                logprobs.forEach((lp, i) => {
+                    let tokenText = lp.token || `[T${i}]`;
+                    // Detect thinking tokens
+                    if (tokenText.includes('<think>')) inThinkMode = true;
+                    if (tokenText.includes('</think>')) inThinkMode = false;
+
+                    // Clean up display
+                    let displayText = tokenText;
+                    if (displayText === '\n') displayText = '⏎';
+                    else if (displayText === '') displayText = '⟨empty⟩';
+
+                    tokens.push({
+                        idx: promptTokenCount + i,
+                        text: displayText,
+                        rawText: tokenText,
+                        segment: inThinkMode ? 'think' : 'output'
+                    });
+                });
+            } else {
+                // Fallback: split generated text on whitespace
+                let inThink = false;
+                const genParts = generatedText.split(/(<think>|<\/think>)/);
+                let genIdx = 0;
+
+                genParts.forEach(part => {
+                    if (part === '<think>') { inThink = true; return; }
+                    if (part === '</think>') { inThink = false; return; }
+                    if (!part) return;
+
+                    const partTokens = part.split(/(\s+)/);
+                    partTokens.forEach(t => {
+                        if (t) {
+                            tokens.push({
+                                idx: promptTokenCount + genIdx++,
+                                text: t,
+                                segment: inThink ? 'think' : 'output'
+                            });
+                        }
+                    });
+                });
+            }
+
+            state.tokens = tokens;
+
+            // Parse attention_tokens into edges
+            // Note: srcIdx is promptTokenCount + genIdx (API uses absolute positions)
+            if (Array.isArray(attentionTokens)) {
+                attentionTokens.forEach((attnInfo, genIdx) => {
+                    // Source is the generated token at this index
+                    const srcIdx = promptTokenCount + genIdx;
+
+                    if (attnInfo.token_positions && attnInfo.attention_scores) {
+                        attnInfo.token_positions.forEach((dstIdx, i) => {
+                            const weight = attnInfo.attention_scores[i];
+                            if (weight > 0 && dstIdx < tokens.length) {
+                                addEdge(srcIdx, dstIdx, weight, attnInfo.layer_id);
+                            }
+                        });
+                    }
+                });
+            }
+
+            console.log(`Parsed ${state.tokens.length} tokens, ${state.edges.length} edges`);
+        }
+
+        function addEdge(src, dst, weight, layer = 0) {
+            const edge = { src, dst, weight, layer };
+            state.edges.push(edge);
+
+            if (!state.adjacencyOut[src]) state.adjacencyOut[src] = [];
+            state.adjacencyOut[src].push(edge);
+
+            if (!state.adjacencyIn[dst]) state.adjacencyIn[dst] = [];
+            state.adjacencyIn[dst].push(edge);
+        }
+
+        // Rendering
+        function render() {
+            renderTokens();
+            renderEdges();
+        }
+
+        function renderTokens() {
+            const container = document.getElementById('tokenSegments');
+            container.innerHTML = '';
+
+            const segments = {
+                prompt: state.tokens.filter(t => t.segment === 'prompt'),
+                think: state.tokens.filter(t => t.segment === 'think'),
+                output: state.tokens.filter(t => t.segment === 'output')
+            };
+
+            const segmentNames = {
+                prompt: 'Prompt (Input)',
+                think: 'Thinking (Hidden)',
+                output: 'Response (Output)'
+            };
+
+            ['prompt', 'think', 'output'].forEach(seg => {
+                if (segments[seg].length === 0) return;
+
+                const segEl = document.createElement('div');
+                segEl.className = 'segment';
+                segEl.innerHTML = `
+                    <div class="segment-header ${seg}">
+                        <span>${segmentNames[seg]} (${segments[seg].length} tokens)</span>
+                        <button class="segment-toggle" onclick="toggleSegment(this)">-</button>
+                    </div>
+                    <div class="segment-body">
+                        <div class="token-flow" id="segment-${seg}"></div>
+                    </div>
+                `;
+                container.appendChild(segEl);
+
+                const flowEl = segEl.querySelector('.token-flow');
+                segments[seg].forEach(token => {
+                    const tokenEl = document.createElement('span');
+                    tokenEl.className = 'token';
+                    tokenEl.dataset.idx = token.idx;
+                    tokenEl.textContent = token.text;
+                    tokenEl.onclick = () => selectToken(token.idx);
+                    flowEl.appendChild(tokenEl);
+                });
+            });
+        }
+
+        function renderEdges() {
+            const canvas = document.getElementById('edgeCanvas');
+            const ctx = canvas.getContext('2d');
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+            if (state.selectedToken === null) return;
+
+            const threshold = parseFloat(document.getElementById('edgeThreshold').value);
+
+            const getTokenPos = (idx) => {
+                const el = document.querySelector(`.token[data-idx="${idx}"]`);
+                if (!el) return null;
+                const rect = el.getBoundingClientRect();
+                const containerRect = canvas.getBoundingClientRect();
+                return {
+                    x: rect.left - containerRect.left + rect.width / 2,
+                    y: rect.top - containerRect.top + rect.height / 2
+                };
+            };
+
+            const srcPos = getTokenPos(state.selectedToken);
+            if (!srcPos) return;
+
+            // Draw edges this token attends to (cyan)
+            const outEdges = state.adjacencyOut[state.selectedToken] || [];
+            outEdges.filter(e => e.weight >= threshold).forEach(edge => {
+                const dstPos = getTokenPos(edge.dst);
+                if (!dstPos) return;
+
+                ctx.beginPath();
+                ctx.moveTo(srcPos.x, srcPos.y);
+                const midX = (srcPos.x + dstPos.x) / 2;
+                const midY = Math.min(srcPos.y, dstPos.y) - 30;
+                ctx.quadraticCurveTo(midX, midY, dstPos.x, dstPos.y);
+                ctx.strokeStyle = `rgba(0, 229, 255, ${edge.weight})`;
+                ctx.lineWidth = 1 + edge.weight * 3;
+                ctx.stroke();
+
+                ctx.beginPath();
+                ctx.arc(dstPos.x, dstPos.y, 4, 0, Math.PI * 2);
+                ctx.fillStyle = `rgba(0, 229, 255, ${edge.weight})`;
+                ctx.fill();
+            });
+
+            // Draw edges that attend to this token (lime)
+            const inEdges = state.adjacencyIn[state.selectedToken] || [];
+            inEdges.filter(e => e.weight >= threshold).forEach(edge => {
+                const dstPos = getTokenPos(edge.src);
+                if (!dstPos) return;
+
+                ctx.beginPath();
+                ctx.moveTo(srcPos.x, srcPos.y);
+                const midX = (srcPos.x + dstPos.x) / 2;
+                const midY = Math.max(srcPos.y, dstPos.y) + 30;
+                ctx.quadraticCurveTo(midX, midY, dstPos.x, dstPos.y);
+                ctx.strokeStyle = `rgba(180, 255, 0, ${edge.weight})`;
+                ctx.lineWidth = 1 + edge.weight * 3;
+                ctx.stroke();
+
+                ctx.beginPath();
+                ctx.arc(dstPos.x, dstPos.y, 4, 0, Math.PI * 2);
+                ctx.fillStyle = `rgba(180, 255, 0, ${edge.weight})`;
+                ctx.fill();
+            });
+        }
+
+        function selectToken(idx) {
+            document.querySelectorAll('.token').forEach(el => {
+                el.classList.remove('selected', 'attended-to', 'attends-from');
+            });
+
+            state.selectedToken = idx;
+            const token = state.tokens.find(t => t.idx === idx);
+
+            const selectedEl = document.querySelector(`.token[data-idx="${idx}"]`);
+            if (selectedEl) selectedEl.classList.add('selected');
+
+            const outEdges = state.adjacencyOut[idx] || [];
+            outEdges.forEach(edge => {
+                const el = document.querySelector(`.token[data-idx="${edge.dst}"]`);
+                if (el) el.classList.add('attended-to');
+            });
+
+            const inEdges = state.adjacencyIn[idx] || [];
+            inEdges.forEach(edge => {
+                const el = document.querySelector(`.token[data-idx="${edge.src}"]`);
+                if (el) el.classList.add('attends-from');
+            });
+
+            document.getElementById('selectedTokenText').textContent = token ? token.text : '';
+            document.getElementById('selectedTokenMeta').textContent =
+                `Position: ${idx} | Segment: ${token?.segment || ''} | Out: ${outEdges.length} | In: ${inEdges.length}`;
+
+            renderDetailList();
+            renderEdges();
+        }
+
+        function renderDetailList() {
+            const list = document.getElementById('attentionList');
+            list.innerHTML = '';
+
+            if (state.selectedToken === null) {
+                list.innerHTML = '<div style="color: var(--text-dim); font-size: 12px; text-align: center; padding: 40px;">Select a token</div>';
+                return;
+            }
+
+            const edges = state.detailTab === 'attends'
+                ? (state.adjacencyOut[state.selectedToken] || [])
+                : (state.adjacencyIn[state.selectedToken] || []);
+
+            const sorted = [...edges].sort((a, b) => b.weight - a.weight);
+
+            if (sorted.length === 0) {
+                list.innerHTML = '<div style="color: var(--text-dim); font-size: 12px; text-align: center; padding: 40px;">No attention edges</div>';
+                return;
+            }
+
+            sorted.forEach((edge, i) => {
+                const targetIdx = state.detailTab === 'attends' ? edge.dst : edge.src;
+                const targetToken = state.tokens.find(t => t.idx === targetIdx);
+
+                const item = document.createElement('div');
+                item.className = 'attention-item';
+                item.innerHTML = `
+                    <span class="attn-rank">${i + 1}</span>
+                    <span class="attn-token">${targetToken?.text || `[${targetIdx}]`}</span>
+                    <span class="attn-score">${(edge.weight * 100).toFixed(1)}%</span>
+                    <div class="attn-bar">
+                        <div class="attn-bar-fill" style="width: ${edge.weight * 100}%"></div>
+                    </div>
+                `;
+                item.onclick = () => {
+                    const el = document.querySelector(`.token[data-idx="${targetIdx}"]`);
+                    if (el) el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                };
+                list.appendChild(item);
+            });
+        }
+
+        function switchDetailTab(tab) {
+            state.detailTab = tab;
+            document.querySelectorAll('.detail-tab').forEach(t => {
+                t.classList.toggle('active', t.dataset.tab === tab);
+            });
+            renderDetailList();
+        }
+
+        function toggleSegment(btn) {
+            const body = btn.closest('.segment').querySelector('.segment-body');
+            const isHidden = body.style.display === 'none';
+            body.style.display = isHidden ? 'block' : 'none';
+            btn.textContent = isHidden ? '-' : '+';
+            setTimeout(renderEdges, 100);
+        }
+
+        function toggleWordMode() {
+            state.wordMode = !state.wordMode;
+            document.getElementById('wordModeToggle').classList.toggle('active', state.wordMode);
+        }
+
+        // UI Helpers
+        function showLoading(text) {
+            document.getElementById('emptyState').style.display = 'none';
+            document.getElementById('loadingState').style.display = 'flex';
+            document.getElementById('loadingText').textContent = text;
+            document.getElementById('canvasContainer').style.display = 'none';
+        }
+
+        function hideLoading() {
+            document.getElementById('loadingState').style.display = 'none';
+            document.getElementById('canvasContainer').style.display = 'block';
+        }
+
+        function updateStats() {
+            document.getElementById('statTokens').textContent = state.tokens.length;
+            document.getElementById('statEdges').textContent = state.edges.length;
+            const layers = new Set(state.edges.map(e => e.layer));
+            document.getElementById('statLayers').textContent = layers.size || 1;
+        }
+
+        function clearAll() {
+            document.getElementById('inputText').value = '';
+            state.tokens = [];
+            state.edges = [];
+            state.adjacencyOut = {};
+            state.adjacencyIn = {};
+            state.selectedToken = null;
+
+            document.getElementById('canvasContainer').style.display = 'none';
+            document.getElementById('emptyState').style.display = 'flex';
+            document.getElementById('selectedTokenText').textContent = 'Select a token';
+            document.getElementById('selectedTokenMeta').textContent = 'Click any token to see its attention patterns';
+            document.getElementById('attentionList').innerHTML = '';
+            updateStats();
+        }
+
+        // Initialize
+        init();
+
+        document.getElementById('tokenViewport').addEventListener('scroll', () => {
+            if (state.selectedToken !== null) renderEdges();
+        });
+    </script>
+</body>
+</html>
