@@ -79,12 +79,12 @@ class Simulator:
             gpu.execute_step()
 
     def _log_step(self) -> None:
-        if self.log_level == 0:
+        if self.log_level == 0 and self.step % 100 != 0:
             return
         parts = [f"step={self.step:<4}"]
         for gpu in self.gpu_states:
             r, q = len(gpu.running_requests), len(gpu.pending_requests)
-            if self.log_level == 1:
+            if self.log_level <= 1:
                 parts.append(f"GPU{gpu.gpu_id}[R={r:<3} Q={q:<3}]")
             else:
                 run_ids = _format_ids(gpu.running_requests)
