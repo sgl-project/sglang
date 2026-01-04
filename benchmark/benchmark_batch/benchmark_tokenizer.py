@@ -43,11 +43,6 @@ def parse_args():
         default=5,
         help="Number of runs per batch size (default: 5)",
     )
-    parser.add_argument(
-        "--trust-remote-code",
-        action="store_true",
-        help="Trust remote code when loading tokenizer",
-    )
     return parser.parse_args()
 
 
@@ -191,9 +186,7 @@ def main():
     print(f"Number of runs per batch size: {args.num_runs}")
     print("-" * 60)
 
-    tokenizer = AutoTokenizer.from_pretrained(
-        args.tokenizer, trust_remote_code=args.trust_remote_code
-    )
+    tokenizer = AutoTokenizer.from_pretrained(args.tokenizer, trust_remote_code=True)
 
     max_batch_size = max(args.batch_sizes)
 
