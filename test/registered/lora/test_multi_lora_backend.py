@@ -44,7 +44,10 @@ PROMPTS = [
 
 class TestMultiLoRABackend(CustomTestCase):
     def test_ci_lora_models(self):
-        run_lora_multiple_batch_on_model_cases(CI_MULTI_LORA_MODELS)
+        for max_loras_batch_sz in [1, 2, 3]:
+            run_lora_multiple_batch_on_model_cases(
+                CI_MULTI_LORA_MODELS, max_loras_per_batch_override=max_loras_batch_sz
+            )
 
     def test_all_lora_models(self):
         if is_in_ci():
