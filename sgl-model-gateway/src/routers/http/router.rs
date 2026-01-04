@@ -3,10 +3,7 @@ use std::{sync::Arc, time::Instant};
 use axum::{
     body::{to_bytes, Body},
     extract::Request,
-    http::{
-        header::{CONTENT_LENGTH, CONTENT_TYPE},
-        HeaderMap, HeaderValue, Method, StatusCode,
-    },
+    http::{header::CONTENT_TYPE, HeaderMap, HeaderValue, Method, StatusCode},
     response::{IntoResponse, Response},
     Json,
 };
@@ -20,14 +17,14 @@ use crate::{
     config::types::RetryConfig,
     core::{
         is_retryable_status, ConnectionMode, RetryExecutor, Worker, WorkerLoadGuard,
-        WorkerRegistry, WorkerType,
+        WorkerRegistry, WorkerType, UNKNOWN_MODEL_ID,
     },
     observability::{
         events::{self, Event},
         metrics::{bool_to_static_str, metrics_labels, Metrics},
         otel_trace::inject_trace_context_http,
     },
-    policies::PolicyRegistry,
+    policies::{PolicyRegistry, SelectWorkerInfo},
     protocols::{
         chat::ChatCompletionRequest,
         classify::ClassifyRequest,
@@ -35,14 +32,13 @@ use crate::{
         completion::CompletionRequest,
         embedding::EmbeddingRequest,
         generate::GenerateRequest,
-        parser::{ParseFunctionCallRequest, SeparateReasoningRequest},
         rerank::{RerankRequest, RerankResponse, RerankResult},
         responses::{ResponsesGetParams, ResponsesRequest},
     },
     routers::{
         error::{self, extract_error_code_from_response},
         grpc::utils::{error_type_from_status, route_to_endpoint},
-        header_utils, parse, RouterTrait,
+        header_utils, RouterTrait,
     },
 };
 
@@ -54,7 +50,6 @@ pub struct Router {
     dp_aware: bool,
     enable_igw: bool,
     retry_config: RetryConfig,
-    context: Option<Arc<AppContext>>,
 }
 
 impl std::fmt::Debug for Router {
@@ -66,7 +61,6 @@ impl std::fmt::Debug for Router {
             .field("dp_aware", &self.dp_aware)
             .field("enable_igw", &self.enable_igw)
             .field("retry_config", &self.retry_config)
-            .field("context", &"<AppContext>")
             .finish()
     }
 }
@@ -81,7 +75,6 @@ impl Router {
             dp_aware: ctx.router_config.dp_aware,
             enable_igw: ctx.router_config.enable_igw,
             retry_config: ctx.router_config.effective_retry_config(),
-            context: Some(ctx.clone()),
         })
     }
 
@@ -95,7 +88,6 @@ impl Router {
         }
     }
 
-    // Helper method to proxy GET requests to the first available worker
     async fn proxy_get_request(&self, req: Request<Body>, endpoint: &str) -> Response {
         let headers = header_utils::copy_request_headers(&req);
 
@@ -103,10 +95,7 @@ impl Router {
             Ok(worker_url) => {
                 let mut request_builder = self.client.get(format!("{}/{}", worker_url, endpoint));
                 for (name, value) in headers {
-                    // Use eq_ignore_ascii_case to avoid string allocation
-                    if !name.eq_ignore_ascii_case("content-type")
-                        && !name.eq_ignore_ascii_case("content-length")
-                    {
+                    if header_utils::should_forward_request_header(&name) {
                         request_builder = request_builder.header(name, value);
                     }
                 }
@@ -145,6 +134,7 @@ impl Router {
         &self,
         model_id: Option<&str>,
         text: Option<&str>,
+        headers: Option<&HeaderMap>,
     ) -> Option<Arc<dyn Worker>> {
         let effective_model_id = if !self.enable_igw { None } else { model_id };
 
@@ -172,7 +162,20 @@ impl Router {
             None => self.policy_registry.get_default_policy(),
         };
 
-        let idx = policy.select_worker(&available, text)?;
+        // Get cached hash ring for consistent hashing (O(log n) lookup)
+        let hash_ring = self
+            .worker_registry
+            .get_hash_ring(effective_model_id.unwrap_or(UNKNOWN_MODEL_ID));
+
+        let idx = policy.select_worker(
+            &available,
+            &SelectWorkerInfo {
+                request_text: text,
+                tokens: None, // HTTP doesn't have tokens, use gRPC for PrefixHash
+                headers,
+                hash_ring,
+            },
+        )?;
 
         // Record worker selection metric (Layer 3)
         Metrics::record_worker_selection(
@@ -273,7 +276,7 @@ impl Router {
         is_stream: bool,
         text: &str,
     ) -> Response {
-        let worker = match self.select_worker_for_model(model_id, Some(text)) {
+        let worker = match self.select_worker_for_model(model_id, Some(text), headers) {
             Some(w) => w,
             None => {
                 return error::service_unavailable(
@@ -293,10 +296,8 @@ impl Router {
         let load_guard =
             (policy.name() == "cache_aware").then(|| WorkerLoadGuard::new(worker.clone()));
 
-        events::RequestSentEvent {
-            url: worker.url().to_string(),
-        }
-        .emit();
+        // Note: Using borrowed reference avoids heap allocation
+        events::RequestSentEvent { url: worker.url() }.emit();
         let mut headers_with_trace = headers.cloned().unwrap_or_default();
         inject_trace_context_http(&mut headers_with_trace);
         let headers = Some(&headers_with_trace);
@@ -353,14 +354,10 @@ impl Router {
             return error::service_unavailable("no_workers", "No available workers");
         }
 
-        // Pre-filter headers once before the loop to avoid repeated lowercasing
         let filtered_headers: Vec<_> = headers
             .map(|hdrs| {
                 hdrs.iter()
-                    .filter(|(name, _)| {
-                        !name.as_str().eq_ignore_ascii_case("content-type")
-                            && !name.as_str().eq_ignore_ascii_case("content-length")
-                    })
+                    .filter(|(name, _)| header_utils::should_forward_request_header(name.as_str()))
                     .collect()
             })
             .unwrap_or_default();
@@ -534,11 +531,9 @@ impl Router {
             request_builder = request_builder.header("Authorization", auth_header);
         }
 
-        // Copy all headers from original request if provided
         if let Some(headers) = headers {
             for (name, value) in headers {
-                // Skip Content-Type and Content-Length as .json() sets them
-                if *name != CONTENT_TYPE && *name != CONTENT_LENGTH {
+                if header_utils::should_forward_request_header(name.as_str()) {
                     request_builder = request_builder.header(name, value);
                 }
             }
@@ -677,7 +672,7 @@ fn convert_reqwest_error(e: reqwest::Error) -> Response {
             "call_upstream_decode_error",
         )
     } else if e.is_timeout() {
-        (StatusCode::INTERNAL_SERVER_ERROR, "call_upstream_timeout")
+        (StatusCode::GATEWAY_TIMEOUT, "call_upstream_timeout")
     } else if e.is_connect() {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -817,14 +812,6 @@ impl RouterTrait for Router {
         }
     }
 
-    async fn parse_function_call(&self, req: &ParseFunctionCallRequest) -> Response {
-        parse::parse_function_call(self.context.as_ref(), req).await
-    }
-
-    async fn parse_reasoning(&self, req: &SeparateReasoningRequest) -> Response {
-        parse::parse_reasoning(self.context.as_ref(), req).await
-    }
-
     fn router_type(&self) -> &'static str {
         "regular"
     }
@@ -859,7 +846,6 @@ mod tests {
             client: Client::new(),
             retry_config: RetryConfig::default(),
             enable_igw: false,
-            context: None,
         }
     }
 

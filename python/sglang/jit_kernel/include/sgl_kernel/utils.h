@@ -2,6 +2,9 @@
 
 // ref: https://forums.developer.nvidia.com/t/c-20s-source-location-compilation-error-when-using-nvcc-12-1/258026/3
 #ifdef __CUDACC__
+#include <cuda.h>
+#if CUDA_VERSION <= 12010
+
 #pragma push_macro("__cpp_consteval")
 #pragma push_macro("_NODISCARD")
 #pragma push_macro("__builtin_LINE")
@@ -18,13 +21,16 @@
 
 #define consteval constexpr
 
-#include <source_location>
+#include "source_location.h"
 
 #undef consteval
 #pragma pop_macro("__cpp_consteval")
 #pragma pop_macro("_NODISCARD")
-#else
-#include <source_location>
+#else  // __CUDACC__ && CUDA_VERSION > 12010
+#include "source_location.h"
+#endif
+#else  // no __CUDACC__
+#include "source_location.h"
 #endif
 
 #include <dlpack/dlpack.h>
@@ -33,14 +39,13 @@
 #include <cstddef>
 #include <ostream>
 #include <ranges>
-#include <source_location>
 #include <sstream>
 #include <utility>
 
 namespace host {
 
-struct DebugInfo : public std::source_location {
-  DebugInfo(std::source_location loc = std::source_location::current()) : std::source_location(loc) {}
+struct DebugInfo : public source_location_t {
+  DebugInfo(source_location_t loc = source_location_t::current()) : source_location_t(loc) {}
 };
 
 struct PanicError : public std::runtime_error {

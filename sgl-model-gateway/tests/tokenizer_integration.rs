@@ -7,7 +7,7 @@ mod common;
 use std::sync::Arc;
 
 use common::{ensure_tokenizer_cached, EXPECTED_HASHES, TEST_PROMPTS};
-use sgl_model_gateway::tokenizer::{
+use smg::tokenizer::{
     factory, huggingface::HuggingFaceTokenizer, sequence::Sequence, stop::*, stream::DecodeStream,
     traits::*,
 };
@@ -33,7 +33,7 @@ fn compute_hashes_for_tokenizer<E: Encoder>(tokenizer: &E, prompts: &[&str]) -> 
         .iter()
         .map(|&prompt| {
             tokenizer
-                .encode(prompt)
+                .encode(prompt, false)
                 .expect("Failed to encode prompt")
                 .get_hash()
         })
@@ -63,7 +63,9 @@ fn test_tokenizer_encode_decode_lifecycle() {
         .expect("Failed to load HuggingFace tokenizer");
 
     for prompt in TEST_PROMPTS.iter() {
-        let encoding = tokenizer.encode(prompt).expect("Failed to encode prompt");
+        let encoding = tokenizer
+            .encode(prompt, false)
+            .expect("Failed to encode prompt");
 
         let decoded = tokenizer
             .decode(encoding.token_ids(), false)
@@ -82,10 +84,14 @@ fn test_sequence_operations() {
     );
 
     for prompt in TEST_PROMPTS.iter() {
-        let encoding = tokenizer.encode(prompt).expect("Failed to encode prompt");
+        let encoding = tokenizer
+            .encode(prompt, false)
+            .expect("Failed to encode prompt");
 
         let mut sequence = Sequence::new(tokenizer.clone());
-        sequence.append_text(prompt).expect("Failed to append text");
+        sequence
+            .append_text(prompt, false)
+            .expect("Failed to append text");
 
         assert_eq!(
             sequence.len(),
@@ -123,7 +129,9 @@ fn test_decode_stream() {
     );
 
     for prompt in TEST_PROMPTS.iter() {
-        let encoding = tokenizer.encode(prompt).expect("Failed to encode prompt");
+        let encoding = tokenizer
+            .encode(prompt, false)
+            .expect("Failed to encode prompt");
 
         let mut decoder = DecodeStream::new(tokenizer.clone(), &[], false);
         let mut output = String::new();
@@ -148,11 +156,11 @@ fn test_long_sequence_incremental_decode_with_prefill() {
 
     for (input_text, output_text) in LONG_TEST_PROMPTS.iter() {
         let input_encoding = tokenizer
-            .encode(input_text)
+            .encode(input_text, false)
             .expect("Failed to encode input");
 
         let output_encoding = tokenizer
-            .encode(output_text)
+            .encode(output_text, false)
             .expect("Failed to encode output");
 
         let mut decoder = DecodeStream::new(tokenizer.clone(), input_encoding.token_ids(), false);
@@ -191,7 +199,7 @@ fn test_stop_sequence_decoder() {
 
         let mut decoder = StopSequenceDecoder::new(tokenizer.clone(), config, false);
 
-        let encoding = tokenizer.encode(input).expect("Failed to encode");
+        let encoding = tokenizer.encode(input, false).expect("Failed to encode");
         let mut output = String::new();
         let mut stopped = false;
 
@@ -238,7 +246,9 @@ fn test_factory_creation() {
     let tokenizer = factory::create_tokenizer(tokenizer_path.to_str().unwrap())
         .expect("Failed to create tokenizer via factory");
 
-    let encoding = tokenizer.encode(TEST_PROMPTS[0]).expect("Failed to encode");
+    let encoding = tokenizer
+        .encode(TEST_PROMPTS[0], false)
+        .expect("Failed to encode");
 
     let decoded = tokenizer
         .decode(encoding.token_ids(), false)
@@ -254,7 +264,7 @@ fn test_batch_encoding() {
         .expect("Failed to load tokenizer");
 
     let encodings = tokenizer
-        .encode_batch(&TEST_PROMPTS)
+        .encode_batch(&TEST_PROMPTS, false)
         .expect("Failed to batch encode");
 
     assert_eq!(encodings.len(), TEST_PROMPTS.len());
@@ -269,7 +279,7 @@ fn test_batch_encoding() {
 
 #[test]
 fn test_special_tokens() {
-    use sgl_model_gateway::tokenizer::traits::Tokenizer as TokenizerTrait;
+    use smg::tokenizer::traits::Tokenizer as TokenizerTrait;
 
     let tokenizer_path = ensure_tokenizer_cached();
     let tokenizer = HuggingFaceTokenizer::from_file(tokenizer_path.to_str().unwrap())
@@ -300,7 +310,7 @@ fn test_thread_safety() {
             let tokenizer_clone = tokenizer.clone();
             thread::spawn(move || {
                 let encoding = tokenizer_clone
-                    .encode(prompt)
+                    .encode(prompt, false)
                     .expect("Failed to encode in thread");
                 let decoded = tokenizer_clone
                     .decode(encoding.token_ids(), false)
@@ -398,7 +408,7 @@ fn test_load_chat_template_from_local_file() {
 
 #[tokio::test]
 async fn test_tinyllama_embedded_template() {
-    use sgl_model_gateway::tokenizer::hub::download_tokenizer_from_hf;
+    use smg::tokenizer::hub::download_tokenizer_from_hf;
 
     // Skip in CI without HF_TOKEN
 
@@ -434,7 +444,7 @@ async fn test_tinyllama_embedded_template() {
 
 #[tokio::test]
 async fn test_qwen3_next_embedded_template() {
-    use sgl_model_gateway::tokenizer::hub::download_tokenizer_from_hf;
+    use smg::tokenizer::hub::download_tokenizer_from_hf;
 
     // Test 3: Qwen3-Next has chat template in tokenizer_config.json
     match download_tokenizer_from_hf("Qwen/Qwen3-Next-80B-A3B-Instruct").await {
@@ -466,7 +476,7 @@ async fn test_qwen3_next_embedded_template() {
 
 #[tokio::test]
 async fn test_qwen3_vl_json_template_priority() {
-    use sgl_model_gateway::tokenizer::hub::download_tokenizer_from_hf;
+    use smg::tokenizer::hub::download_tokenizer_from_hf;
 
     // Test 4: Qwen3-VL has both tokenizer_config.json template and chat_template.json
     // Should prioritize chat_template.json
@@ -508,7 +518,7 @@ async fn test_qwen3_vl_json_template_priority() {
 
 #[tokio::test]
 async fn test_llava_separate_jinja_template() {
-    use sgl_model_gateway::tokenizer::hub::download_tokenizer_from_hf;
+    use smg::tokenizer::hub::download_tokenizer_from_hf;
 
     // Test 5: llava has chat_template.jinja as a separate file, not in tokenizer_config.json
     match download_tokenizer_from_hf("llava-hf/llava-1.5-7b-hf").await {
