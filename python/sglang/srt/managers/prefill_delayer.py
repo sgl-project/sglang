@@ -49,7 +49,7 @@ class PrefillDelayer:
         tp0_info = self.global_info[:, 0, :]
         return tp0_info
 
-    def should_allow_prefill(self, local_prefillable: int) -> bool:
+    def _should_allow_prefill(self, local_prefillable: int) -> bool:
         tp0_info = self._gather_info(local_prefillable=local_prefillable)
         global_prefillable = tp0_info[:, 0]
         global_exists_not_prefillable = global_prefillable.min().item() == 0
