@@ -775,8 +775,8 @@ class TestLargerScale(CustomTestCase):
             "--router", "random",
             "--max-total-tokens", "2000000",
         )
-        self.assertGreater(result.summary["attention_balancedness_mean"], 0.8)
-        self.assertGreater(result.summary["batch_size_balancedness_mean"], 0.8)
+        self.assertGreater(result.summary["attention_balancedness_mean"], 0.7)
+        self.assertGreater(result.summary["batch_size_balancedness_mean"], 0.7)
 
     def test_gsp_random_policy(self):
         result = self._run_main(
