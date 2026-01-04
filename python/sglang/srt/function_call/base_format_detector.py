@@ -166,15 +166,22 @@ class BaseFormatDetector(ABC):
 
         try:
             try:
-                tool_call_pos = current_text.find(self.bot_token)
-                if tool_call_pos != -1:
-                    start_idx = tool_call_pos + len(self.bot_token)
-                elif self.current_tool_id > 0 and current_text.startswith(
+                # Priority check: if we're processing a subsequent tool (current_tool_id > 0),
+                # first check if text starts with the tool separator. This is critical for
+                # parallel tool calls because the bot_token (e.g., '[') can also
+                # appear inside array parameters of the current tool, and we must not
+                # mistakenly identify that as the start of a new tool.
+                if self.current_tool_id > 0 and current_text.startswith(
                     self.tool_call_separator
                 ):
                     start_idx = len(self.tool_call_separator)
                 else:
-                    start_idx = 0
+                    # Only search for bot_token if not processing subsequent tool
+                    tool_call_pos = current_text.find(self.bot_token)
+                    if tool_call_pos != -1:
+                        start_idx = tool_call_pos + len(self.bot_token)
+                    else:
+                        start_idx = 0
 
                 if start_idx >= len(current_text):
                     return StreamingParseResult()
