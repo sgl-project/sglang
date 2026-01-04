@@ -8,6 +8,9 @@ from sglang.test.ci.ci_utils import TestFile, run_unittest_files
 suites = {
     "per-commit-1-gpu": [
         TestFile("debug_utils/test_tensor_dump_forward_hook.py", 9),
+        TestFile("compilation/fusion/passes/test_fused_activation.py", 30),
+        TestFile("compilation/fusion/passes/test_rmsnorm_quant.py", 30),
+        TestFile("compilation/fusion/triton_ops/test_triton_fused_swiglu.py", 60),
         TestFile("hicache/test_hicache_storage.py", 96),
         TestFile("hicache/test_hicache_variants.py", 368),
         TestFile("layers/attention/mamba/test_causal_conv1d.py", 25),

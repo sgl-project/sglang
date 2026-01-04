@@ -6,6 +6,7 @@ import json
 import logging
 import time
 import types
+from abc import abstractmethod
 from contextlib import contextmanager
 from typing import Any, Callable, Optional, Union
 
@@ -13,6 +14,13 @@ import torch
 from torch import fx
 from torch._dynamo.utils import lazy_format_graph_code
 from torch._inductor.custom_graph_pass import CustomGraphPass
+from torch._inductor.pattern_matcher import (
+    PatternMatcherPass,
+    fwd_only,
+    register_replacement,
+)
+
+from sglang.srt.compilation.pass_config import PassConfig
 
 logger = logging.getLogger(__name__)
 
@@ -138,3 +146,50 @@ class PrinterInductorPass(SGLangInductorPass):
 
     def __call__(self, graph: torch.fx.Graph):
         self.dump_graph(graph, self.name)
+
+
+class SGLangPatternMatcherInductorPass(SGLangInductorPass):
+    def __init__(self, pass_config: PassConfig):
+        self.pass_config = pass_config
+        self.pass_name = self.__class__.__name__
+        self.patterns = PatternMatcherPass(self.pass_name)
+        self.build_pass()
+
+    def __call__(self, graph: torch.fx.graph):
+        if self.pass_config.enable_torch_compile_graph_trace_logs:
+            graph_before_str = str(self.dump_graph(graph, f"Before_{self.pass_name}"))
+
+        self.begin()
+        count = self.patterns.apply(graph)
+        self.end_and_log(count)
+
+        if count > 0 and self.pass_config.enable_torch_compile_graph_trace_logs:
+            graph_after_str = str(self.dump_graph(graph, f"After_{self.pass_name}"))
+            logger.info("%s", graph_before_str)
+            logger.info("%s", graph_after_str)
+
+    @abstractmethod
+    def build_pass(self) -> None:
+        pass
+
+    def register_replacement_pattern(
+        self, pattern: Callable, replacement: Callable, example_inputs: Any, **kwargs
+    ) -> None:
+        register_replacement(
+            search_fn=pattern,
+            replace_fn=replacement,
+            example_inputs=example_inputs,
+            trace_fn=fwd_only,
+            pass_dicts=self.patterns,
+            **kwargs,
+        )
+
+    def end_and_log(self, count: int):
+        self._end_time = time.perf_counter_ns()
+        duration_ms = float(self._end_time - self._start_time) / 1.0e6
+        logger.debug(
+            "%s completed in %.1f ms, matched %s times",
+            self.pass_name,
+            duration_ms,
+            count,
+        )
