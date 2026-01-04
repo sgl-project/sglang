@@ -3,7 +3,7 @@ import html
 import json
 import logging
 import re
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from sglang.srt.entrypoints.openai.protocol import Tool
 from sglang.srt.environ import envs
@@ -18,7 +18,17 @@ logger = logging.getLogger(__name__)
 
 
 def _safe_val(raw: str) -> Any:
+    """
+    Fallback value parsing when no schema is available.
+
+    Tries JSON parsing, then ast.literal_eval, then returns raw string.
+    """
     raw = html.unescape(raw.strip())
+
+    # Handle explicit null
+    if raw.lower() == "null":
+        return None
+
     try:
         return json.loads(raw)
     except Exception:
@@ -52,8 +62,10 @@ class Qwen3CoderDetector(BaseFormatDetector):
         self.tool_call_function_regex = re.compile(
             r"<function=(.*?)</function>|<function=(.*)$", re.DOTALL
         )
+        # More robust regex: handles missing </parameter> by using next <parameter= or </function> as delimiter
         self.tool_call_parameter_regex = re.compile(
-            r"<parameter=(.*?)</parameter>|<parameter=(.*?)$", re.DOTALL
+            r"<parameter=(.*?)(?:</parameter>|(?=<parameter=)|(?=</function>)|$)",
+            re.DOTALL,
         )
         self._buf: str = ""
 
@@ -66,8 +78,195 @@ class Qwen3CoderDetector(BaseFormatDetector):
         self._in_tool_call: bool = False
         self._function_name_sent: bool = False
 
+        # Cache for tool schema
+        self._tools_schema_cache: Dict[str, Dict[str, Any]] = {}
+
     def has_tool_call(self, text: str) -> bool:
         return self.tool_call_start_token in text
+
+    def _get_arguments_config(
+        self, func_name: str, tools: Optional[List[Tool]]
+    ) -> Dict[str, Any]:
+        """
+        Extract argument configuration (schema) for a function from tools.
+
+        Args:
+            func_name: The function name to look up
+            tools: List of available tools
+
+        Returns:
+            Dictionary of parameter configurations with type info
+        """
+        if tools is None:
+            return {}
+
+        # Check cache first
+        if func_name in self._tools_schema_cache:
+            return self._tools_schema_cache[func_name]
+
+        for tool in tools:
+            if not hasattr(tool, "type") or not hasattr(tool, "function"):
+                continue
+            if tool.type == "function" and tool.function.name == func_name:
+                if not hasattr(tool.function, "parameters"):
+                    self._tools_schema_cache[func_name] = {}
+                    return {}
+                params = tool.function.parameters
+                if isinstance(params, dict) and "properties" in params:
+                    result = params["properties"]
+                    self._tools_schema_cache[func_name] = result
+                    return result
+                elif isinstance(params, dict):
+                    self._tools_schema_cache[func_name] = params
+                    return params
+                else:
+                    self._tools_schema_cache[func_name] = {}
+                    return {}
+
+        logger.debug("Tool '%s' is not defined in the tools list.", func_name)
+        self._tools_schema_cache[func_name] = {}
+        return {}
+
+    def _convert_param_value(
+        self,
+        param_value: str,
+        param_name: str,
+        param_config: Dict[str, Any],
+        func_name: str,
+    ) -> Any:
+        """
+        Convert parameter value based on its type in the schema.
+
+        This method provides schema-aware type conversion similar to vLLM's implementation.
+
+        Args:
+            param_value: Raw string value from XML
+            param_name: Name of the parameter
+            param_config: Schema configuration for all parameters
+            func_name: Name of the function (for logging)
+
+        Returns:
+            Converted value with appropriate Python type
+        """
+        # Strip and unescape HTML entities
+        param_value = html.unescape(param_value.strip())
+
+        # Get the type from schema first (needed for null handling)
+        param_type = "string"  # default
+        if param_name in param_config:
+            param_schema = param_config[param_name]
+            if isinstance(param_schema, dict) and "type" in param_schema:
+                param_type = str(param_schema["type"]).strip().lower()
+
+        # Handle null value - return string "null" for string types, None for others
+        if param_value.lower() == "null":
+            if param_type in ["string", "str", "text", "varchar", "char", "enum"]:
+                return "null"  # Keep as string literal for string types
+            return None
+
+        # If parameter not in schema, try generic parsing then fall back to string
+        if param_name not in param_config:
+            if param_config:
+                logger.debug(
+                    "Parameter '%s' not defined in schema for tool '%s', "
+                    "attempting generic parsing.",
+                    param_name,
+                    func_name,
+                )
+            return _safe_val(param_value)
+
+        # String types - return as-is
+        if param_type in ["string", "str", "text", "varchar", "char", "enum"]:
+            return param_value
+
+        # Integer types
+        if (
+            param_type.startswith("int")
+            or param_type.startswith("uint")
+            or param_type.startswith("long")
+            or param_type.startswith("short")
+            or param_type.startswith("unsigned")
+            or param_type == "integer"
+        ):
+            try:
+                return int(param_value)
+            except (ValueError, TypeError):
+                logger.debug(
+                    "Value '%s' for parameter '%s' is not an integer in tool '%s', "
+                    "returning as string.",
+                    param_value,
+                    param_name,
+                    func_name,
+                )
+                return param_value
+
+        # Float/Number types
+        if (
+            param_type.startswith("num")
+            or param_type.startswith("float")
+            or param_type == "number"
+            or param_type == "double"
+        ):
+            try:
+                float_value = float(param_value)
+                return float_value
+            except (ValueError, TypeError):
+                logger.debug(
+                    "Value '%s' for parameter '%s' is not a number in tool '%s', "
+                    "returning as string.",
+                    param_value,
+                    param_name,
+                    func_name,
+                )
+                return param_value
+
+        # Boolean types
+        if param_type in ["boolean", "bool", "binary"]:
+            lower_val = param_value.lower()
+            if lower_val == "true":
+                return True
+            elif lower_val == "false":
+                return False
+            else:
+                logger.debug(
+                    "Value '%s' for parameter '%s' is not a boolean in tool '%s', "
+                    "returning False.",
+                    param_value,
+                    param_name,
+                    func_name,
+                )
+                return False
+
+        # Object/Array types - try JSON parsing
+        if (
+            param_type in ["object", "array", "arr"]
+            or param_type.startswith("dict")
+            or param_type.startswith("list")
+        ):
+            try:
+                return json.loads(param_value)
+            except (json.JSONDecodeError, TypeError, ValueError):
+                logger.debug(
+                    "Value '%s' for parameter '%s' cannot be parsed as JSON in tool '%s', "
+                    "trying ast.literal_eval.",
+                    param_value,
+                    param_name,
+                    func_name,
+                )
+                try:
+                    return ast.literal_eval(param_value)
+                except (ValueError, SyntaxError, TypeError):
+                    logger.debug(
+                        "Value '%s' for parameter '%s' cannot be parsed, "
+                        "returning as string.",
+                        param_value,
+                        param_name,
+                        func_name,
+                    )
+                    return param_value
+
+        # Unknown type - try generic parsing
+        return _safe_val(param_value)
 
     def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
         normal, calls = self._extract(text, tools)
@@ -169,7 +368,7 @@ class Qwen3CoderDetector(BaseFormatDetector):
             # Parse parameters incrementally
             if self._function_name_sent:
                 # Process parameters and get any calls to emit
-                parameter_calls = self._parse_and_stream_parameters(self._buf)
+                parameter_calls = self._parse_and_stream_parameters(self._buf, tools)
                 calls.extend(parameter_calls)
 
                 # Check if tool call is complete
@@ -205,18 +404,21 @@ class Qwen3CoderDetector(BaseFormatDetector):
 
         return StreamingParseResult(normal_text=normal, calls=calls)
 
-    def _parse_and_stream_parameters(self, text_to_parse: str) -> List[ToolCallItem]:
+    def _parse_and_stream_parameters(
+        self, text_to_parse: str, tools: List[Tool]
+    ) -> List[ToolCallItem]:
         """
-        Parse complete parameter blocks from text and return any tool call items to emit.
+        Parse complete parameter blocks with schema-based type conversion.
 
         This method:
         1. Finds all complete <parameter> blocks
-        2. Parses them into a dictionary
+        2. Parses them into a dictionary with schema-aware type conversion
         3. Compares with current parameters and generates diff if needed
         4. Updates internal state
 
         Args:
             text_to_parse: The text to search for parameter blocks
+            tools: List of available tools for schema lookup
 
         Returns:
             List of ToolCallItem objects to emit (may be empty)
@@ -230,12 +432,21 @@ class Qwen3CoderDetector(BaseFormatDetector):
             )
         )
 
-        # Build new parameters dictionary
+        # Get schema for current function
+        param_config = self._get_arguments_config(self._current_function_name, tools)
+
+        # Build new parameters dictionary with type conversion
         new_params = {}
         for match in param_matches:
             param_name = match.group(1).strip()
             param_value = match.group(2)
-            new_params[param_name] = _safe_val(param_value)
+            # Strip leading/trailing newlines from value
+            param_value = param_value.lstrip("\n").rstrip("\n")
+
+            # Use schema-based type conversion
+            new_params[param_name] = self._convert_param_value(
+                param_value, param_name, param_config, self._current_function_name
+            )
 
         # Calculate parameter diff to stream with proper incremental JSON building
         if new_params != self._current_parameters:
@@ -328,15 +539,23 @@ class Qwen3CoderDetector(BaseFormatDetector):
             idx = txt.index(">")
             fname = txt[:idx].strip()
             body = txt[idx + 1 :]
+
+            # Get schema for this function
+            param_config = self._get_arguments_config(fname, tools)
+
             params: Dict[str, Any] = {}
             for pm in self.tool_call_parameter_regex.findall(body):
-                ptxt = pm[0] if pm[0] else pm[1]
+                ptxt = pm if isinstance(pm, str) else (pm[0] if pm[0] else pm[1])
                 if ">" not in ptxt:
                     continue
                 pidx = ptxt.index(">")
                 pname = ptxt[:pidx].strip()
                 pval = ptxt[pidx + 1 :].lstrip("\n").rstrip("\n")
-                params[pname] = _safe_val(pval)
+
+                # Use schema-based type conversion
+                params[pname] = self._convert_param_value(
+                    pval, pname, param_config, fname
+                )
             raw = {"name": fname, "arguments": params}
             try:
                 # TODO: fix idx in function call, the index for a function
