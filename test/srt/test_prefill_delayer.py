@@ -15,14 +15,33 @@ from sglang.test.test_utils import (
 
 class TestPrefillDelayerThroughput(CustomTestCase):
     def test_1_online_serving_has_prefill_delayer(self):
-        self._run_throughput_test(prefill_delayer=True)
+        self._run_throughput_test_online_serving(prefill_delayer=True)
 
     def test_2_online_serving_no_prefill_delayer(self):
-        self._run_throughput_test(prefill_delayer=False)
+        self._run_throughput_test_online_serving(prefill_delayer=False)
+
+    def test_3_offline_gen_has_prefill_delayer(self):
+        self._run_throughput_test_offline_gen(prefill_delayer=True)
+
+    def test_4_offline_gen_no_prefill_delayer(self):
+        self._run_throughput_test_offline_gen(prefill_delayer=False)
 
     def _run_throughput_test_online_serving(self, prefill_delayer: bool):
         self._run_throughput_test(
             debug_name=f"online_serving ({prefill_delayer=})",
+            prefill_delayer=prefill_delayer,
+            other_benchmark_args=dict(
+                num_prompts=500,
+                # trigger chunked prefill
+                random_input_len=30000,
+                random_output_len=256,
+                request_rate=32,
+            ),
+        )
+
+    def _run_throughput_test_offline_gen(self, prefill_delayer: bool):
+        self._run_throughput_test(
+            debug_name=f"offline_gen ({prefill_delayer=})",
             prefill_delayer=prefill_delayer,
             other_benchmark_args=dict(
                 num_prompts=500,
