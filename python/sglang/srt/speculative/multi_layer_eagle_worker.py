@@ -119,6 +119,8 @@ class MultiLayerEagleWorker(TpModelWorker):
         else:
             self.hot_token_id = None
 
+        self.vocab_mapper = None
+
         # Init draft worker
         if server_args.enable_dp_attention and self.speculative_algorithm.is_eagle3():
             ctx = draft_tp_context(get_attention_tp_group())
@@ -518,6 +520,7 @@ class MultiLayerEagleWorker(TpModelWorker):
             self.token_to_kv_pool_allocator,
             self.page_size,
             vocab_mask,
+            vocab_mapper=self.vocab_mapper,
         )
 
         # Post process based on verified outputs.

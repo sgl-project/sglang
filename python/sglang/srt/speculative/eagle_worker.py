@@ -130,6 +130,8 @@ class EAGLEWorker(TpModelWorker):
         else:
             self.hot_token_id = None
 
+        self.vocab_mapper = None
+
         # Init draft worker
         if server_args.enable_dp_attention and self.speculative_algorithm.is_eagle3():
             ctx = draft_tp_context(get_attention_tp_group())
@@ -664,7 +666,12 @@ class EAGLEWorker(TpModelWorker):
             ).logits_output
             if self.server_args.enable_nan_detection:
                 detect_nan(logits_output)
-            probs = torch.softmax(logits_output.next_token_logits, dim=-1)
+
+            next_token_logits = logits_output.next_token_logits
+            if self.vocab_mapper is not None:
+                self.vocab_mapper.mask_draft_logits_inplace(next_token_logits)
+
+            probs = torch.softmax(next_token_logits, dim=-1)
             topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
             if self.hot_token_id is not None:
                 topk_index = self.hot_token_id[topk_index]
@@ -743,6 +750,7 @@ class EAGLEWorker(TpModelWorker):
             self.token_to_kv_pool_allocator,
             self.page_size,
             vocab_mask,
+            vocab_mapper=self.vocab_mapper,
         )
 
         # Post process based on verified outputs.
@@ -980,7 +988,11 @@ class EAGLEWorker(TpModelWorker):
     def capture_for_decode(
         self, logits_output: LogitsProcessorOutput, draft_input: EagleDraftInput
     ):
-        probs = torch.softmax(logits_output.next_token_logits, dim=-1)
+        next_token_logits = logits_output.next_token_logits
+        if self.vocab_mapper is not None:
+            self.vocab_mapper.mask_draft_logits_inplace(next_token_logits)
+
+        probs = torch.softmax(next_token_logits, dim=-1)
         draft_input.topk_p, draft_input.topk_index = fast_topk(probs, self.topk, dim=-1)
         draft_input.hidden_states = logits_output.hidden_states
 
