@@ -1,3 +1,4 @@
+import re
 from functools import lru_cache
 from typing import TYPE_CHECKING, Optional
 
@@ -9,6 +10,24 @@ from sglang.srt.utils import get_bool_env_var
 
 if TYPE_CHECKING:
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
+
+
+def _mlaprolog_process_weight_after_loading(layer):
+    if (
+        "fused_qkv_a_proj_with_mqa" in layer.prefix
+        and is_mla_preprocess_enabled()
+        and not hasattr(layer.quant_method, "quant_config")
+    ):
+        layer.weight.data = layer.weight.data.transpose(0, 1)
+        fused_qkv_a_proj_with_mqa_weight_q = layer.weight.data[
+            :, : layer.q_lora_rank
+        ].clone()
+        fused_qkv_a_proj_with_mqa_weight_kv = layer.weight.data[
+            :, layer.q_lora_rank :
+        ].clone()
+        del layer.weight
+        layer.weight_q = npu_format_cast(fused_qkv_a_proj_with_mqa_weight_q)
+        layer.weight_kv = npu_format_cast(fused_qkv_a_proj_with_mqa_weight_kv)
 
 
 @lru_cache(maxsize=1)
@@ -72,6 +91,7 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
         num_local_heads,
         qk_nope_head_dim,
         qk_rope_head_dim,
+        v_head_dim,
         quant_config: Optional["QuantizationConfig"] = None,
     ):
         super().__init__()
@@ -92,6 +112,10 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
         self.qk_nope_head_dim = qk_nope_head_dim  # 128
         self.qk_rope_head_dim = qk_rope_head_dim  # 64
         self.qk_head_dim = qk_nope_head_dim + qk_rope_head_dim
+        self.v_head_dim = v_head_dim
+        self.dequant_scale_w_uq_qr = self.q_b_proj.weight_scale.view(1, -1).to(
+            torch.float
+        )
 
     def preprocess_weights(self, hidden_states):
         self.dummy = torch.zeros(
@@ -399,6 +423,44 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
             positions,
         )
 
+    def forward_mlaprolog(self, positions, hidden_states, forward_batch):
+        self.cos, self.sin = self.get_sin_cos(positions)
+        k_cache, v_cache, slot_mapping = self.get_kv_cache_and_cache_idx(forward_batch)
+        mla_prolog_input_args = {
+            "token_x": hidden_states,
+            "weight_dq": self.qkv_a_proj.weight_q,
+            "weight_uq_qr": self.q_b_proj.weight,
+            "weight_uk": self.w_kc,
+            "weight_dkv_kr": self.qkv_a_proj.weight_kv,
+            "rmsnorm_gamma_cq": self.q_a_layernorm.weight,
+            "rmsnorm_gamma_ckv": self.kv_a_layernorm.weight,
+            "rope_sin": self.sin,
+            "rope_cos": self.cos,
+            "kv_cache": k_cache,
+            "kr_cache": v_cache,
+            "cache_index": slot_mapping.to(dtype=torch.int64),
+            "dequant_scale_w_uq_qr": self.dequant_scale_w_uq_qr,
+            "rmsnorm_epsilon_cq": self.q_a_layernorm.variance_epsilon,
+            "rmsnorm_epsilon_ckv": self.kv_a_layernorm.variance_epsilon,
+            "cache_mode": "PA_BSND",
+            "query_norm_flag": True,
+            "weight_quant_mode": 1,  # 0:no quant; 1:uq_qr: quant; 2: weight_dq,weight_uq_qr,weight_dkv_kr: quant
+        }
+        q_nope, q_pe, dequant_scale_q_nope, qr, dequant_q_norm = (
+            torch.ops.custom.npu_mla_prolog_v3(**mla_prolog_input_args)
+        )
+        dequant_q_norm = dequant_q_norm.view(hidden_states.shape[0])
+        return (
+            q_pe,
+            v_cache,
+            q_nope,
+            k_cache,
+            qr,
+            forward_batch,
+            positions,
+            dequant_q_norm,
+        )
+
     def forward(self, positions, hidden_states, forward_batch, zero_allocator):
         assert self.quant_config and self.quant_config.get_name() == "modelslim"
         # route by `qkv_a_proj` quant type as MTP layers can be unquantized
@@ -406,10 +468,16 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
             hasattr(self.qkv_a_proj.quant_method, "quant_config")
             and self.qkv_a_proj.quant_method.quant_config.get_name() == "modelslim"
         )
+        # with the mlaprolog enabled, the kv_b_proj layers are unquantized
+        _is_mlaprolog = hasattr(self.quant_config, "ignore") and any(
+            re.fullmatch(r".*kv_b_proj", l) for l in self.quant_config.ignore
+        )
         if _is_w8a8:
             return self.forward_mlapo(
                 positions, hidden_states, forward_batch, zero_allocator
             )
+        elif _is_mlaprolog:
+            return self.forward_mlaprolog(positions, hidden_states, forward_batch)
         else:
             return self.forward_absorb_prepare_npu_rms_norm_cache(
                 positions, hidden_states, forward_batch, zero_allocator

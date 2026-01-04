@@ -1329,6 +1329,7 @@ class DeepseekV2AttentionMLA(nn.Module):
                 bias=False,
                 quant_config=quant_config,
                 prefix=add_prefix("fused_qkv_a_proj_with_mqa", prefix),
+                q_lora_rank=self.q_lora_rank,
             )
             self.q_a_layernorm = RMSNorm(self.q_lora_rank, eps=config.rms_norm_eps)
             self.q_b_proj = ColumnParallelLinear(
