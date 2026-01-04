@@ -12,19 +12,9 @@ import torch
 
 from sglang.srt.compilation.compilation_config import CompilationConfig
 from sglang.srt.utils.common import rank0_log
+from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cuda_graph
 
 logger = logging.getLogger(__name__)
-
-_COMPILE_ENABLED = contextvars.ContextVar("_COMPILE_ENABLED", default=False)
-
-
-@contextmanager
-def set_compiled(enabled: bool = True):
-    token = _COMPILE_ENABLED.set(enabled)
-    try:
-        yield
-    finally:
-        _COMPILE_ENABLED.reset(token)
 
 
 @dataclass
@@ -200,7 +190,7 @@ def install_torch_compiled(
         state["compiled_callable"] = compiled_callable
 
     def trampoline(self, *args, **kwargs):
-        use_compiled = _COMPILE_ENABLED.get()
+        use_compiled = is_in_piecewise_cuda_graph()
         if use_compiled:
             if not state["compiled"]:
                 _ensure_compiled(self, *args, **kwargs)
