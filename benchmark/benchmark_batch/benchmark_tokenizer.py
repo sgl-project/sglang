@@ -94,7 +94,9 @@ def benchmark(data, batch_size, sequential_fn, batch_fn, num_runs, skip_batch):
 def print_results(results, func_name, skip_batch):
     for r in results:
         print(f"\nBatch size: {r['batch_size']}")
-        print_runs(f"Sequential {func_name}", r["sequential_runs"], r["avg_sequential_ms"])
+        print_runs(
+            f"Sequential {func_name}", r["sequential_runs"], r["avg_sequential_ms"]
+        )
         if not skip_batch:
             print_runs(f"Batch {func_name}", r["batch_runs"], r["avg_batch_ms"])
             print(f"  Speedup factor: {r['speedup_factor']:.2f}x")
