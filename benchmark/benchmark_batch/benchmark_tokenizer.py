@@ -71,22 +71,20 @@ def run_benchmark(
 def benchmark(data, batch_size, sequential_fn, batch_fn, num_runs, skip_batch):
     batch_data = data[:batch_size]
     sequential_times = measure_times(lambda: sequential_fn(batch_data), num_runs)
+    avg_seq = mean(sequential_times)
 
     out = {
         "batch_size": batch_size,
-        "avg_sequential_ms": mean(sequential_times),
+        "avg_sequential_ms": avg_seq,
         "sequential_runs": sequential_times,
     }
 
     if not skip_batch:
         batch_times = measure_times(lambda: batch_fn(batch_data), num_runs)
+        avg_batch = mean(batch_times)
         out |= {
-            "avg_batch_ms": mean(batch_times),
-            "speedup_factor": (
-                mean(sequential_times) / mean(batch_times)
-                if mean(batch_times) > 0
-                else 0
-            ),
+            "avg_batch_ms": avg_batch,
+            "speedup_factor": avg_seq / avg_batch if avg_batch > 0 else 0,
             "batch_runs": batch_times,
         }
 
