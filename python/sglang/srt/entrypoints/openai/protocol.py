@@ -27,9 +27,6 @@ from openai.types.responses import (
     ResponseOutputText,
     ResponseReasoningItem,
 )
-
-# from openai.types.responses.response import ToolChoice
-# from openai.types.responses.tool import Tool
 from pydantic import (
     BaseModel,
     Field,
