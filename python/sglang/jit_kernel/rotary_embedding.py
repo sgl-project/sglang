@@ -53,9 +53,10 @@ def rotary_embedding_cos_sin_q(
     query: torch.Tensor,
     head_size: int,
     interleaved: bool,
+    positions: Optional[torch.Tensor] = None,
 ) -> None:
     module = _jit_rotary_embedding_cos_sin_module(rot)
-    module.rotary_embedding_cos_sin_q(cos, sin, query, head_size, interleaved)
+    module.rotary_embedding_cos_sin_q(cos, sin, query, positions, head_size, interleaved)
 
 
 def rotary_embedding_cos_sin_qk(
@@ -67,9 +68,12 @@ def rotary_embedding_cos_sin_qk(
     key: torch.Tensor,
     head_size: int,
     interleaved: bool,
+    positions: Optional[torch.Tensor] = None,
 ) -> None:
     module = _jit_rotary_embedding_cos_sin_module(rot)
-    module.rotary_embedding_cos_sin_qk(cos, sin, query, key, head_size, interleaved)
+    module.rotary_embedding_cos_sin_qk(
+        cos, sin, query, key, positions, head_size, interleaved
+    )
 
 
 def _resolve_interleaved(interleaved: Optional[bool], is_neox: Optional[bool]) -> bool:
@@ -91,6 +95,7 @@ def rotary_embedding_cos_sin(
     key: Optional[torch.Tensor] = None,
     head_size: int = 0,
     interleaved: Optional[bool] = None,
+    positions: Optional[torch.Tensor] = None,
     *,
     is_neox: Optional[bool] = None,
 ) -> None:
@@ -118,7 +123,7 @@ def rotary_embedding_cos_sin(
         expected_tokens = int(query.shape[0])
     else:
         raise ValueError("query must be a 2D, 3D or 4D tensor")
-    if cos.shape[0] != expected_tokens:
+    if positions is None and cos.shape[0] != expected_tokens:
         raise ValueError(
             f"cos/sin num_tokens mismatch with query: cos.shape[0]={cos.shape[0]} vs expected_tokens={expected_tokens}"
         )
@@ -212,6 +217,7 @@ def rotary_embedding_cos_sin(
             query=q3,
             head_size=head_size,
             interleaved=effective_interleaved,
+            positions=positions,
         )
     else:
         rotary_embedding_cos_sin_qk(
@@ -222,4 +228,5 @@ def rotary_embedding_cos_sin(
             key=k3,
             head_size=head_size,
             interleaved=effective_interleaved,
+            positions=positions,
         )

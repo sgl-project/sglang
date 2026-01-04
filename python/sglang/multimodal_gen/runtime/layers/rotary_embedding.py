@@ -194,30 +194,31 @@ def apply_sglang_jit_rope_qk_inplace(
     num_tokens = bsz * seqlen
 
     cache_tok: torch.Tensor
-    if cos_sin_cache.shape[0] == num_tokens:
-        cache_tok = cos_sin_cache
-    elif cos_sin_cache.shape[0] == seqlen and bsz == 1:
-        cache_tok = cos_sin_cache
-    elif cos_sin_cache.shape[0] >= seqlen and positions is None and bsz == 1:
-        # Treat the cache as [max_seq, ...] and slice for this seqlen.
-        cache_tok = cos_sin_cache[:seqlen]
-    else:
-        if positions is None:
-            pos_1d = torch.arange(seqlen, device="cpu", dtype=torch.long)
-            positions = pos_1d if bsz == 1 else pos_1d.repeat(bsz)
+    if cos_sin_cache.shape[0] < seqlen:
+         # Should not happen if cache is sufficient
+         pass
+
+    if positions is None:
+        if bsz > 1:
+            # For bsz > 1, we need explicit positions [0..seqlen, 0..seqlen]
+            # Create directly on device to avoid CPU overhead
+            pos_1d = torch.arange(seqlen, device=q.device, dtype=torch.long)
+            positions = pos_1d.repeat(bsz)
         else:
-            if not (
-                isinstance(positions, torch.Tensor)
-                and positions.dtype == torch.long
-                and positions.dim() == 1
-            ):
-                raise ValueError("positions must be a 1D torch.long Tensor")
-            if positions.numel() != num_tokens:
-                raise ValueError(
-                    f"positions length must be bsz*seqlen={num_tokens}, got {positions.numel()}"
-                )
+            # For bsz == 1, positions=None implies 0..seqlen, which Kernel supports natively
+            pass
+    else:
+        if not (
+            isinstance(positions, torch.Tensor)
+            and positions.dtype == torch.long
+            and positions.dim() == 1
+        ):
+            raise ValueError("positions must be a 1D torch.long Tensor")
+        if positions.numel() != num_tokens:
+            raise ValueError(
+                f"positions length must be bsz*seqlen={num_tokens}, got {positions.numel()}"
+            )
         positions = positions.to(q.device, non_blocking=True)
-        cache_tok = cos_sin_cache.index_select(0, positions)
 
     q3 = q.reshape(num_tokens, nheads, d)
     if not q3.is_contiguous():
@@ -226,40 +227,44 @@ def apply_sglang_jit_rope_qk_inplace(
     if not k3.is_contiguous():
         k3 = k3.contiguous()
 
+    # Use the FULL cache (no index_select)
+    cache_full = cos_sin_cache
+
+    # Include is_neox in key because it affects how we process (cat vs contiguous)
+    interleaved = not is_neox
     cache_key = (
-        int(cache_tok.data_ptr()),
-        int(cache_tok.shape[0]),
-        int(cache_tok.shape[1]),
-        str(cache_tok.device),
-        cache_tok.dtype,
+        int(cache_full.data_ptr()),
+        int(cache_full.shape[0]),
+        int(cache_full.shape[1]),
+        str(cache_full.device),
+        cache_full.dtype,
         q.dtype,
+        interleaved,
     )
     cached = _JIT_ROPE_SPLIT_CAST_CACHE.get(cache_key)
     if cached is not None:
-        cos_half, sin_half = cached
+        cos, sin = cached
     else:
-        cos_half, sin_half = _split_cos_sin_from_cache(cache_tok, dtype=q.dtype)
-        if not cos_half.is_contiguous():
-            cos_half = cos_half.contiguous()
-        if not sin_half.is_contiguous():
-            sin_half = sin_half.contiguous()
-        _JIT_ROPE_SPLIT_CAST_CACHE[cache_key] = (cos_half, sin_half)
+        # Split and Cast the FULL cache
+        cos_full, sin_full = _split_cos_sin_from_cache(cache_full, dtype=q.dtype)
+        
+        # Process layout (Contiguous or Cat)
+        if interleaved:
+            cos = cos_full.contiguous()
+            sin = sin_full.contiguous()
+        else:
+            if cos_full.shape[1] * 2 == head_size:
+                cos = torch.cat([cos_full, cos_full], dim=-1).contiguous()
+                sin = torch.cat([sin_full, sin_full], dim=-1).contiguous()
+            else:
+                cos = cos_full.contiguous()
+                sin = sin_full.contiguous()
+        
+        _JIT_ROPE_SPLIT_CAST_CACHE[cache_key] = (cos, sin)
         if len(_JIT_ROPE_SPLIT_CAST_CACHE) > 64:
             _JIT_ROPE_SPLIT_CAST_CACHE.popitem(last=False)
 
-    interleaved = not is_neox
-    if interleaved:
-        cos = cos_half if cos_half.is_contiguous() else cos_half.contiguous()
-        sin = sin_half if sin_half.is_contiguous() else sin_half.contiguous()
-    else:
-        if cos_half.shape[1] * 2 == head_size:
-            cos = torch.cat([cos_half, cos_half], dim=-1).contiguous()
-            sin = torch.cat([sin_half, sin_half], dim=-1).contiguous()
-        else:
-            cos = cos_half if cos_half.is_contiguous() else cos_half.contiguous()
-            sin = sin_half if sin_half.is_contiguous() else sin_half.contiguous()
-
-    sglang_jit_rotary_embedding_cos_sin(cos, sin, q3, k3, head_size, interleaved)
+    sglang_jit_rotary_embedding_cos_sin(cos, sin, q3, k3, head_size, interleaved, positions=positions)
     return q3.view(bsz, seqlen, nheads, d), k3.view(bsz, seqlen, nheads, d)
 
 
