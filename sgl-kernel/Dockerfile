@@ -56,16 +56,16 @@ RUN --mount=type=cache,id=sgl-kernel-cmake,target=/cmake-downloads \
 # Install ccache
 # Install ccache
 RUN if [ "${USE_CCACHE}" = "1" ]; then \
-    set -eux; \
-    cd /tmp; \
-    wget --progress=dot https://${GITHUB_ARTIFACTORY}/ccache/ccache/releases/download/v${CCACHE_VERSION}/ccache-${CCACHE_VERSION}.tar.xz; \
-    tar -xf ccache-${CCACHE_VERSION}.tar.xz; \
-    cd ccache-${CCACHE_VERSION}; \
-    mkdir build && cd build; \
-    cmake -D CMAKE_BUILD_TYPE=Release -D CMAKE_INSTALL_PREFIX=/usr -D ENABLE_TESTING=OFF -D REDIS_STORAGE_BACKEND=OFF -D HTTP_STORAGE_BACKEND=OFF -D ENABLE_DOCUMENTATION=OFF .. >/dev/null; \
-    make -j"$(nproc)" >/dev/null; \
-    make install >/dev/null; \
-    ccache --version; \
+    set -eux && \
+    cd /tmp && \
+    wget --progress=dot https://${GITHUB_ARTIFACTORY}/ccache/ccache/releases/download/v${CCACHE_VERSION}/ccache-${CCACHE_VERSION}.tar.xz && \
+    tar -xf ccache-${CCACHE_VERSION}.tar.xz && \
+    cd ccache-${CCACHE_VERSION} && \
+    mkdir build && cd build && \
+    cmake -D CMAKE_BUILD_TYPE=Release -D CMAKE_INSTALL_PREFIX=/usr -D ENABLE_TESTING=OFF -D REDIS_STORAGE_BACKEND=OFF -D HTTP_STORAGE_BACKEND=OFF -D ENABLE_DOCUMENTATION=OFF .. && \
+    make -j"$(nproc)" && \
+    make install && \
+    ccache --version && \
     rm -rf /tmp/ccache-${CCACHE_VERSION}*; \
   else \
     echo "Skipping ccache build (USE_CCACHE=${USE_CCACHE})"; \
@@ -123,7 +123,7 @@ RUN --mount=type=cache,id=sgl-kernel-ccache,target=/ccache \
       export NINJAFLAGS="-j2"; \
       echo "ARM detected: Using extra conservative settings (2 parallel jobs)"; \
     else \
-      export CMAKE_BUILD_PARALLEL_LEVEL=$(( $(nproc)/3 < 48 ? $(nproc)/3 : 48 )); \
+      export CMAKE_BUILD_PARALLEL_LEVEL=$(echo "$(( $(nproc) / 3 )) 48" | awk '{print ($1 < $2) ? $1 : $2}'); \
     fi; \
     if [ -n "${ENABLE_CMAKE_PROFILE:-}" ]; then \
       echo "CMake profiling enabled - will save to /sgl-kernel/cmake-profile.json"; \
