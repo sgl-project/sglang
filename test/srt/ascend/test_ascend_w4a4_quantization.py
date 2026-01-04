@@ -20,7 +20,7 @@ from sglang.test.test_utils import (
 )
 
 if "ASCEND_RT_VISIBLE_DEVICES" not in os.environ:
-    os.environ["ASCEND_RT_VISIBLE_DEVICES"] = "0"
+    os.environ["ASCEND_RT_VISIBLE_DEVICES"] = "0,1,2,3"
 DEFAULT_PORT_FOR_SRT_TEST_RUNNER = (
     7000 + int(os.environ.get("ASCEND_RT_VISIBLE_DEVICES", "0")[0]) * 100
 )
@@ -43,7 +43,7 @@ class TestAscendW4A4(CustomTestCase):
                 "--attention-backend",
                 "ascend",
                 "--tp-size",
-                "1",
+                "4",
                 "--mem-fraction-static",
                 "0.8",
                 "--cuda-graph-bs",
@@ -72,7 +72,7 @@ class TestAscendW4A4(CustomTestCase):
         print(metrics)
 
         self.assertGreaterEqual(metrics["accuracy"], 0.80)
-        self.assertGreaterEqual(metrics["output_throughput"], 500)
+        self.assertGreaterEqual(metrics["output_throughput"], 1000)
 
     def test_throughput(self):
         max_tokens = 256
@@ -85,7 +85,7 @@ class TestAscendW4A4(CustomTestCase):
         print(f"Throughput: {throughput} tokens/s")
 
         if is_in_ci():
-            self.assertGreaterEqual(throughput, 15)
+            self.assertGreaterEqual(throughput, 35)
 
 
 if __name__ == "__main__":
