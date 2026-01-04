@@ -2270,17 +2270,32 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def _resolve_capture_layers(req) -> Optional[List[int]]:
         """Normalize attention layer selection to a canonical form.
 
-        Priority: attention_capture_layer_ids > attention_capture_layer_id
+        Priority (highest to lowest):
+        1. semantic_memory.next_capture_layers (dynamic sidecar override)
+        2. attention_capture_layer_ids (per-request explicit list)
+        3. attention_capture_layer_id (per-request single layer)
+        4. None (use server default)
+
         Returns: List[int] if specified, None otherwise (default policy)
         """
-        # 1. Try explicit list
+        # 1. Check semantic_memory for dynamic sidecar override (highest priority)
+        # This allows the routing loop to dynamically adjust capture layers
+        semantic_memory = getattr(req, "semantic_memory", None)
+        if semantic_memory is not None:
+            next_layers = getattr(semantic_memory, "next_capture_layers", None)
+            if next_layers is not None:
+                return list(next_layers) if not isinstance(next_layers, list) else next_layers
+
+        # 2. Try explicit list from request
         layer_ids = getattr(req, "attention_capture_layer_ids", None)
         if layer_ids is not None:
             return list(layer_ids) if not isinstance(layer_ids, list) else layer_ids
-        # 2. Try single layer legacy field (wrap in list for uniform handling)
+
+        # 3. Try single layer legacy field (wrap in list for uniform handling)
         layer_id = getattr(req, "attention_capture_layer_id", None)
         if layer_id is not None:
             return [int(layer_id)]
+
         return None
 
     def get_model_worker_batch(
