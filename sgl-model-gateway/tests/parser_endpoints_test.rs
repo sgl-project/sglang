@@ -10,7 +10,7 @@ use axum::{
 use common::mock_worker::{MockWorker, MockWorkerConfig};
 use reqwest::Client;
 use serde_json::json;
-use sgl_model_gateway::{
+use smg::{
     app_context::AppContext,
     config::{RouterConfig, RoutingMode},
     routers::{RouterFactory, RouterTrait},

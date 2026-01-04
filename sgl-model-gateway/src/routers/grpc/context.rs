@@ -17,6 +17,7 @@ use crate::{
     core::{attach_guards_to_response, Worker, WorkerLoadGuard},
     protocols::{
         chat::{ChatCompletionRequest, ChatCompletionResponse},
+        classify::{ClassifyRequest, ClassifyResponse},
         embedding::{EmbeddingRequest, EmbeddingResponse},
         generate::{GenerateRequest, GenerateResponse},
         responses::ResponsesRequest,
@@ -51,6 +52,7 @@ pub enum RequestType {
     Generate(Arc<GenerateRequest>),
     Responses(Arc<ResponsesRequest>),
     Embedding(Arc<EmbeddingRequest>),
+    Classify(Arc<ClassifyRequest>),
 }
 
 /// Shared components (injected once at creation)
@@ -93,9 +95,6 @@ pub struct ProcessingState {
 pub struct PreparationOutput {
     /// Original text (for chat) or resolved text (for generate)
     pub original_text: Option<String>,
-
-    /// Routing ID for manual routing policy
-    pub routing_id: Option<String>,
 
     /// Tokenized input
     pub token_ids: Vec<u32>,
@@ -323,6 +322,24 @@ impl RequestContext {
         }
     }
 
+    /// Create context for classify request
+    pub fn for_classify(
+        request: Arc<ClassifyRequest>,
+        headers: Option<HeaderMap>,
+        model_id: Option<String>,
+        components: Arc<SharedComponents>,
+    ) -> Self {
+        Self {
+            input: RequestInput {
+                request_type: RequestType::Classify(request),
+                headers,
+                model_id,
+            },
+            components,
+            state: ProcessingState::default(),
+        }
+    }
+
     /// Get reference to original request (type-safe)
     pub fn request(&self) -> &RequestType {
         &self.input.request_type
@@ -392,6 +409,22 @@ impl RequestContext {
         }
     }
 
+    /// Get classify request (panics if not classify)
+    pub fn classify_request(&self) -> &ClassifyRequest {
+        match &self.input.request_type {
+            RequestType::Classify(req) => req.as_ref(),
+            _ => panic!("Expected classify request"),
+        }
+    }
+
+    /// Get Arc clone of classify request (panics if not classify)
+    pub fn classify_request_arc(&self) -> Arc<ClassifyRequest> {
+        match &self.input.request_type {
+            RequestType::Classify(req) => Arc::clone(req),
+            _ => panic!("Expected classify request"),
+        }
+    }
+
     /// Check if request is streaming
     pub fn is_streaming(&self) -> bool {
         match &self.input.request_type {
@@ -399,6 +432,7 @@ impl RequestContext {
             RequestType::Generate(req) => req.stream,
             RequestType::Responses(req) => req.stream.unwrap_or(false),
             RequestType::Embedding(_) => false, // Embeddings are never streaming
+            RequestType::Classify(_) => false,  // Classification is never streaming
         }
     }
 
@@ -551,4 +585,6 @@ pub enum FinalResponse {
     Generate(Vec<GenerateResponse>),
     /// Embedding response
     Embedding(EmbeddingResponse),
+    /// Classification response
+    Classify(ClassifyResponse),
 }

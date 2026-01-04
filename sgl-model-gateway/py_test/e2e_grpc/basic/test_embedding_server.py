@@ -1,6 +1,5 @@
 """
 gRPC Router E2E Test - Embedding Server
-
 Test the embedding functionality of the gRPC router.
 """
 
