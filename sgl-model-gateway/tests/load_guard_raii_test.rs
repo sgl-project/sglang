@@ -11,9 +11,7 @@ use axum::{body::Body, response::Response};
 use bytes::Bytes;
 use futures_util::StreamExt;
 use http_body_util::BodyExt;
-use sgl_model_gateway::core::{
-    attach_guards_to_response, BasicWorkerBuilder, Worker, WorkerLoadGuard,
-};
+use smg::core::{attach_guards_to_response, BasicWorkerBuilder, Worker, WorkerLoadGuard};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 

@@ -203,6 +203,8 @@ def create_app(args: argparse.Namespace) -> FastAPI:
         except (json.JSONDecodeError, ValueError):
             data = {}
 
+        received_headers = {k.lower(): v for k, v in request.headers.items()}
+
         now = time.time()
         ret = {
             "id": f"cmpl-{int(now*1000)}",
@@ -218,6 +220,7 @@ def create_app(args: argparse.Namespace) -> FastAPI:
             ],
             "worker_id": worker_id,
             "echo": data,
+            "received_headers": received_headers,
         }
         return make_json_response(ret, status_code=200)
 

@@ -217,7 +217,11 @@ class FlashAttentionImpl(AttentionImpl):
                 seqlen,
                 softmax_scale=self.softmax_scale,
                 causal=self.causal,
+                return_attn_probs=return_softmax_lse,
             )
+            if return_softmax_lse:
+                out, softmax_lse = out
+                return out.reshape(bsz, seqlen, nheads_q, -1), softmax_lse
             return out.reshape(bsz, seqlen, nheads_q, d)
 
         output = flash_attn_func(

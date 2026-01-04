@@ -1,4 +1,4 @@
-use sgl_model_gateway::{
+use smg::{
     protocols::{
         chat::{ChatMessage, MessageContent},
         common::{ContentPart, ImageUrl},

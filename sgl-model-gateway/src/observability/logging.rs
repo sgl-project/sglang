@@ -16,7 +16,7 @@ use super::otel_trace::get_otel_layer;
 use crate::config::TraceConfig;
 
 const TIME_FORMAT: &str = "%Y-%m-%d %H:%M:%S";
-const DEFAULT_LOG_TARGET: &str = "sgl_model_gateway";
+const DEFAULT_LOG_TARGET: &str = "smg";
 
 #[derive(Debug, Clone)]
 pub struct LoggingConfig {
@@ -36,7 +36,7 @@ impl Default for LoggingConfig {
             json_format: false,
             log_dir: None,
             colorize: true,
-            log_file_name: "sgl-model-gateway".to_string(),
+            log_file_name: "smg".to_string(),
             log_targets: Some(vec![DEFAULT_LOG_TARGET.to_string()]),
         }
     }

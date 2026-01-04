@@ -42,6 +42,7 @@ make build MAX_JOBS=2
 
 # Additionally limit NVCC internal threads (reduces CPU and peak memory)
 make build MAX_JOBS=2 CMAKE_ARGS="-DSGL_KERNEL_COMPILE_THREADS=1"
+```
 
 ## Contribution
 

@@ -23,11 +23,7 @@ use super::{
         ComponentRefs, PayloadState, RequestContext, ResponsesComponents, SharedComponents,
         WorkerSelection,
     },
-    conversations::persist_conversation_items,
-    mcp::{
-        ensure_request_mcp_client, execute_tool_loop, prepare_mcp_payload_for_streaming,
-        McpLoopConfig,
-    },
+    mcp::{execute_tool_loop, prepare_mcp_payload_for_streaming},
     provider::ProviderRegistry,
     responses::{mask_tools_as_mcp, patch_streaming_response_json},
     streaming::handle_streaming_response,
@@ -48,7 +44,11 @@ use crate::{
             ResponsesGetParams, ResponsesRequest,
         },
     },
-    routers::header_utils::{apply_provider_headers, extract_auth_header},
+    routers::{
+        header_utils::{apply_provider_headers, extract_auth_header},
+        mcp_utils::{ensure_request_mcp_client, McpLoopConfig},
+        persistence_utils::persist_conversation_items,
+    },
 };
 
 pub struct OpenAIRouter {

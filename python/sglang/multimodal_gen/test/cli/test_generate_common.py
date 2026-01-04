@@ -24,19 +24,13 @@ logger = init_logger(__name__)
 class TestResult:
     name: str
     key: str
-    duration: Optional[float]
     succeed: bool
-
-    @property
-    def duration_str(self):
-        return f"{self.duration:.4f}" if self.duration else "NA"
 
 
 def run_command(command) -> Optional[float]:
     """Runs a command and returns the execution time and status."""
     print(f"Running command: {shlex.join(command)}")
 
-    duration = None
     with subprocess.Popen(
         command,
         stdout=subprocess.PIPE,
@@ -46,15 +40,11 @@ def run_command(command) -> Optional[float]:
     ) as process:
         for line in process.stdout:
             sys.stdout.write(line)
-            if "Pixel data generated" in line:
-                words = line.split(" ")
-                duration = float(words[-2])
-
-    if process.returncode == 0:
-        return duration
-    else:
+        process.wait()
+        if process.returncode == 0:
+            return True
         print(f"Command failed with exit code {process.returncode}")
-        return None
+    return False
 
 
 class CLIBase(unittest.TestCase):
@@ -80,13 +70,7 @@ class CLIBase(unittest.TestCase):
             f"--output-path={self.output_path}",
         ]
 
-    results = []
-
-    @classmethod
-    def setUpClass(cls):
-        cls.results = []
-
-    def _run_command(self, name: str, model_path: str, test_key: str = "", args=[]):
+    def _run_command(self, name: str, model_path: str, args=[]):
         command = (
             self.get_base_command()
             + [f"--model-path={model_path}"]
@@ -94,28 +78,21 @@ class CLIBase(unittest.TestCase):
             + ["--output-file-name", f"{name}"]
             + self.extra_args
         )
-        duration = run_command(command)
-        status = "Success" if duration else "Failed"
-        succeed = duration is not None
+        succeed = run_command(command)
+        status = "Success" if succeed else "Failed"
 
-        duration = float(duration) if succeed else None
-        self.results.append(TestResult(name, test_key, duration, succeed))
-
-        return name, duration, status
+        return name, status
 
     def _run_test(self, name: str, args, model_path: str, test_key: str):
-        name, duration, status = self._run_command(
-            name, args=args, model_path=model_path, test_key=test_key
-        )
-        self.verify(status, name, duration)
+        name, status = self._run_command(name, args=args, model_path=model_path)
+        self.verify(status, name)
 
-    def verify(self, status, name, duration):
+    def verify(self, status, name):
         print("-" * 80)
         print("\n" * 3)
 
         # test task status
         self.assertEqual(status, "Success", f"{name} command failed")
-        self.assertIsNotNone(duration, f"Could not parse duration for {name}")
 
         # test output file
         path = os.path.join(
@@ -125,7 +102,6 @@ class CLIBase(unittest.TestCase):
         if self.data_type == DataType.IMAGE:
             with Image.open(path) as image:
                 check_image_size(self, image, self.width, self.height)
-        logger.info(f"{name} passed in {duration:.4f}s")
 
     def model_name(self):
         return self.model_path.split("/")[-1]

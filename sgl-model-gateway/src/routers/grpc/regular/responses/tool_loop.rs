@@ -31,13 +31,13 @@ use crate::{
         common::{Function, FunctionCallResponse, Tool, ToolCall, ToolChoice, ToolChoiceValue},
         responses::{
             self, McpToolInfo, ResponseContentPart, ResponseInput, ResponseInputOutputItem,
-            ResponseOutputItem, ResponseStatus, ResponseToolType, ResponsesRequest,
-            ResponsesResponse,
+            ResponseOutputItem, ResponseStatus, ResponsesRequest, ResponsesResponse,
         },
     },
     routers::{
         error,
         grpc::common::responses::streaming::{OutputItemType, ResponseStreamEventEmitter},
+        mcp_utils::{extract_server_label, DEFAULT_MAX_ITERATIONS},
     },
 };
 
@@ -219,28 +219,18 @@ pub(super) async fn execute_tool_loop(
     response_id: Option<String>,
 ) -> Result<ResponsesResponse, Response> {
     // Get server label from original request tools
-    let server_label = original_request
-        .tools
-        .as_ref()
-        .and_then(|tools| {
-            tools
-                .iter()
-                .find(|t| matches!(t.r#type, ResponseToolType::Mcp))
-                .and_then(|t| t.server_label.clone())
-        })
-        .unwrap_or_else(|| "request-mcp".to_string());
+    let server_label = extract_server_label(original_request.tools.as_deref(), "request-mcp");
 
     let mut state = ToolLoopState::new(original_request.input.clone(), server_label.clone());
 
     // Configuration: max iterations as safety limit
-    const MAX_ITERATIONS: usize = 10;
     let max_tool_calls = original_request.max_tool_calls.map(|n| n as usize);
 
     trace!(
         "Starting MCP tool loop: server_label={}, max_tool_calls={:?}, max_iterations={}",
         server_label,
         max_tool_calls,
-        MAX_ITERATIONS
+        DEFAULT_MAX_ITERATIONS
     );
 
     // Get MCP tools and convert to chat format (do this once before loop)
@@ -336,8 +326,8 @@ pub(super) async fn execute_tool_loop(
 
             // All MCP tools - check combined limit BEFORE executing
             let effective_limit = match max_tool_calls {
-                Some(user_max) => user_max.min(MAX_ITERATIONS),
-                None => MAX_ITERATIONS,
+                Some(user_max) => user_max.min(DEFAULT_MAX_ITERATIONS),
+                None => DEFAULT_MAX_ITERATIONS,
             };
 
             if state.total_calls + mcp_tool_calls.len() > effective_limit {
@@ -347,7 +337,7 @@ pub(super) async fn execute_tool_loop(
                     mcp_tool_calls.len(),
                     effective_limit,
                     max_tool_calls,
-                    MAX_ITERATIONS
+                    DEFAULT_MAX_ITERATIONS
                 );
 
                 // Convert chat response to responses format and mark as incomplete
@@ -624,18 +614,8 @@ async fn execute_tool_loop_streaming_internal(
     tx: mpsc::UnboundedSender<Result<Bytes, std::io::Error>>,
 ) -> Result<(), String> {
     // Extract server label from original request tools
-    let server_label = original_request
-        .tools
-        .as_ref()
-        .and_then(|tools| {
-            tools
-                .iter()
-                .find(|t| matches!(t.r#type, ResponseToolType::Mcp))
-                .and_then(|t| t.server_label.clone())
-        })
-        .unwrap_or_else(|| "request-mcp".to_string());
+    let server_label = extract_server_label(original_request.tools.as_deref(), "request-mcp");
 
-    const MAX_ITERATIONS: usize = 10;
     let mut state = ToolLoopState::new(original_request.input.clone(), server_label.clone());
     let max_tool_calls = original_request.max_tool_calls.map(|n| n as usize);
 
@@ -672,10 +652,10 @@ async fn execute_tool_loop_streaming_internal(
         // Record tool loop iteration metric
         Metrics::record_mcp_tool_iteration(&model);
 
-        if state.iteration > MAX_ITERATIONS {
+        if state.iteration > DEFAULT_MAX_ITERATIONS {
             return Err(format!(
                 "Tool loop exceeded maximum iterations ({})",
-                MAX_ITERATIONS
+                DEFAULT_MAX_ITERATIONS
             ));
         }
 
@@ -784,8 +764,8 @@ async fn execute_tool_loop_streaming_internal(
 
             // Check combined limit (only count MCP tools since function tools will be returned)
             let effective_limit = match max_tool_calls {
-                Some(user_max) => user_max.min(MAX_ITERATIONS),
-                None => MAX_ITERATIONS,
+                Some(user_max) => user_max.min(DEFAULT_MAX_ITERATIONS),
+                None => DEFAULT_MAX_ITERATIONS,
             };
 
             if state.total_calls + mcp_tool_calls.len() > effective_limit {
@@ -795,7 +775,7 @@ async fn execute_tool_loop_streaming_internal(
                     mcp_tool_calls.len(),
                     effective_limit,
                     max_tool_calls,
-                    MAX_ITERATIONS
+                    DEFAULT_MAX_ITERATIONS
                 );
                 break;
             }

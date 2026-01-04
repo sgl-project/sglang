@@ -1,6 +1,6 @@
 //! MiniMax M2 Parser Integration Tests
 
-use sgl_model_gateway::tool_parser::{MinimaxM2Parser, ToolParser};
+use smg::tool_parser::{MinimaxM2Parser, ToolParser};
 
 mod common;
 use common::create_test_tools;

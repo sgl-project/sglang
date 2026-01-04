@@ -153,6 +153,10 @@ pub fn init_metrics() {
         "smg_http_request_duration_seconds",
         "HTTP request duration by method and path"
     );
+    describe_gauge!(
+        "smg_http_inflight_request_age_count",
+        "Count of currently in-flight HTTP requests by age"
+    );
     describe_counter!(
         "smg_http_responses_total",
         "Total HTTP responses by status_code and error_code"
@@ -491,7 +495,17 @@ impl Metrics {
         .record(duration.as_secs_f64());
     }
 
-    /// Set active HTTP connections count.
+    /// Set the cumulative count of in-flight requests for a given age bucket.
+    /// Uses `le` label to match Prometheus histogram convention.
+    pub fn set_inflight_request_age_count(le: &'static str, count: usize) {
+        gauge!(
+            "smg_http_inflight_request_age_count",
+            "le" => le
+        )
+        .set(count as f64);
+    }
+
+    /// Set active HTTP connections count
     pub fn set_http_connections_active(count: usize) {
         gauge!("smg_http_connections_active").set(count as f64);
     }

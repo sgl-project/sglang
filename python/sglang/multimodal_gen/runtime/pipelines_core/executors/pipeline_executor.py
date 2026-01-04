@@ -81,8 +81,7 @@ class PipelineExecutor(ABC):
         """
         Context manager for profiling execution.
         """
-        do_profile = batch.profile
-
+        do_profile = batch.profile and not batch.is_warmup
         if not do_profile:
             # fast forward
             yield

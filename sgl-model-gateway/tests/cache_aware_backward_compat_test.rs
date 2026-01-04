@@ -1,6 +1,6 @@
 use std::{collections::HashMap, sync::Arc};
 
-use sgl_model_gateway::{
+use smg::{
     core::{BasicWorkerBuilder, Worker, WorkerType},
     policies::{CacheAwareConfig, CacheAwarePolicy, LoadBalancingPolicy, SelectWorkerInfo},
 };

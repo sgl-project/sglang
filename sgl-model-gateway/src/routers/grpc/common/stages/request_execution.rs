@@ -90,7 +90,7 @@ impl PipelineStage for RequestExecutionStage {
 
         // Create OTEL span for gRPC request execution
         let span = info_span!(
-            target: "sgl_model_gateway::otel-trace",
+            target: "smg::otel-trace",
             "grpc_generate",
             request_id = %request_id,
             model = %model,

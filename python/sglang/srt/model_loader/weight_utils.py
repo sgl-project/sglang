@@ -269,6 +269,54 @@ def get_quant_config(
         return quant_cls.from_config(config)
 
 
+def _check_index_files_exist(snapshot_dir: str) -> Tuple[bool, Optional[str]]:
+    """
+    Check if all files listed in safetensors index files actually exist on disk.
+
+    This catches cases where the snapshot directory exists but files are missing
+    (e.g., due to incomplete downloads or corrupted cache).
+
+    Args:
+        snapshot_dir: Path to the model snapshot directory
+
+    Returns:
+        Tuple of (all_exist, error_message)
+    """
+    index_files = [
+        f for f in os.listdir(snapshot_dir) if f.endswith(".safetensors.index.json")
+    ]
+
+    if not index_files:
+        return True, None  # Not a sharded model
+
+    for index_file in index_files:
+        index_path = os.path.join(snapshot_dir, index_file)
+        if not os.path.exists(index_path):
+            continue
+        try:
+            with open(index_path) as f:
+                weight_map = json.load(f).get("weight_map", {})
+            if not weight_map:
+                continue
+            required_files = set(weight_map.values())
+            missing_files = [
+                fn
+                for fn in required_files
+                if not os.path.exists(os.path.join(snapshot_dir, fn))
+            ]
+            if missing_files:
+                return (
+                    False,
+                    f"Missing {len(missing_files)} file(s) from index {index_file}: "
+                    f"{missing_files[:3]}{'...' if len(missing_files) > 3 else ''}",
+                )
+        except Exception as e:
+            logger.warning("Failed to read index file %s: %s", index_file, e)
+            continue
+
+    return True, None
+
+
 def _find_local_hf_snapshot_dir_unlocked(
     model_name_or_path: str,
     cache_dir: Optional[str],
@@ -349,6 +397,18 @@ def _find_local_hf_snapshot_dir_unlocked(
             e,
         )
         local_weight_files = []
+
+    # Check for missing files from index (lightweight, for all users)
+    # This catches incomplete downloads before they cause cryptic load errors
+    if local_weight_files:
+        is_complete, error_msg = _check_index_files_exist(found_local_snapshot_dir)
+        if not is_complete:
+            log_info_on_rank0(
+                logger,
+                f"Local snapshot incomplete for {model_name_or_path}: {error_msg}. "
+                f"Will download missing files.",
+            )
+            return None  # Triggers snapshot_download() which handles partial downloads
 
     # Only perform cache validation and cleanup in CI to avoid
     # unnecessary overhead for regular users

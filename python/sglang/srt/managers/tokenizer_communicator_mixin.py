@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import logging
+import pickle
 import time
 import uuid
 from collections import deque
@@ -105,7 +106,12 @@ class _Communicator(Generic[T]):
             assert self._result_values is None
 
         if obj:
-            self._sender.send_pyobj(obj)
+            self._sender.send_multipart(
+                [
+                    b"NORM",
+                    pickle.dumps(obj),
+                ]
+            )
 
         self._result_event = asyncio.Event()
         self._result_values = []
@@ -125,7 +131,12 @@ class _Communicator(Generic[T]):
             self._result_event = asyncio.Event()
 
             if obj:
-                self._sender.send_pyobj(obj)
+                self._sender.send_multipart(
+                    [
+                        b"NORM",
+                        pickle.dumps(obj),
+                    ]
+                )
 
         await self._result_event.wait()
         result_values = copy.deepcopy(self._result_values)
