@@ -228,7 +228,7 @@ class CachableDiT(BaseDiT):
 
         Args:
             modulated_inp: Current timestep's modulated input
-            use_positive_cache: True for positive branch, False for negative
+            modulated_inp: Current timestep's modulated input
             is_boundary_step: True for boundary timesteps that always compute
             coefficients: Polynomial coefficients for L1 rescaling
             teacache_thresh: Threshold for cache decision
