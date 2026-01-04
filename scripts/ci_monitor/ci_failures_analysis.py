@@ -174,7 +174,6 @@ class SGLangFailuresAnalyzer:
                         f"  Warning: Runner API returned {response.status_code}: {response.text[:200]}"
                     )
                     return {}
-                response.raise_for_status()
                 data = response.json()
                 runners = data.get("runners", [])
                 all_runners.extend(runners)
@@ -1252,14 +1251,14 @@ class SGLangFailuresAnalyzer:
                 )
                 summary_lines.append("")
                 summary_lines.append(
-                    "_High queue times indicate that runner type may need more workers. Offline column shows machines currently down._"
+                    "_High queue times indicate that runner type may need more workers. Online column shows current runner availability._"
                 )
                 summary_lines.append("")
                 summary_lines.append(
-                    "| Runner Type | Offline | Avg Queue | P90 Queue | # of Jobs Processed | Jobs Using This Runner |"
+                    "| Runner Type | Online | Avg Queue | P90 Queue | # of Jobs Processed | Jobs Using This Runner |"
                 )
                 summary_lines.append(
-                    "|-------------|---------|-----------|-----------|---------------------|------------------------|"
+                    "|-------------|--------|-----------|-----------|---------------------|------------------------|"
                 )
 
                 # Sort by P90 queue time descending (longest waits first)
@@ -1289,8 +1288,7 @@ class SGLangFailuresAnalyzer:
                                     best_match_len = len(online_key)
                         online_count = best_match
                     if online_count:
-                        offline = online_count["total"] - online_count["online"]
-                        online_str = f"{offline}/{online_count['total']}"
+                        online_str = f"{online_count['online']}/{online_count['total']}"
                     else:
                         online_str = "N/A"
 
@@ -2108,8 +2106,6 @@ def main():
             nightly_scheduled_limit,
             args.limit,
         )
-
-        print(f"final report data: {report_data}")
 
         # Generate GitHub Actions summary
         analyzer.generate_github_summary(report_data)
