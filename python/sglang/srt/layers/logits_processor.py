@@ -80,6 +80,10 @@ class LogitsProcessorOutput:
     attention_logsumexp_candidates: Optional[torch.Tensor] = None  # [batch] (approx, from top chunks)
     # Multi-layer attention capture: dict of layer_id -> (positions, scores, logits, logsumexp)
     attention_multi_layer: Optional[Dict[int, tuple]] = None
+    # In-kernel fingerprint: compressed attention pattern (20D feature vector)
+    # Production mode - replaces raw indices for high-throughput routing
+    attention_fingerprint: Optional[torch.Tensor] = None  # [batch, 20]
+    attention_manifold: Optional[List[str]] = None  # Manifold classification per batch
 
     ## Part 2: This part will be assigned in python/sglang/srt/layers/sampler.py::Sampler
     # he log probs of output tokens, if SGLANG_RETURN_ORIGINAL_LOGPROB = True, will get the log probs before applying temperature. If False, will get the log probs before applying temperature.
@@ -401,6 +405,8 @@ class LogitsProcessor(nn.Module):
         attention_topk_logits = None
         attention_logsumexp_candidates = None
         attention_multi_layer = None
+        attention_fingerprint = None
+        attention_manifold = None
         if isinstance(logits_metadata, ForwardBatch):
             if logits_metadata.capture_attention_tokens:
                 # Extract multi-layer attention info
@@ -429,6 +435,12 @@ class LogitsProcessor(nn.Module):
                     attention_logsumexp_candidates = (
                         logits_metadata.attention_token_info.logsumexp_candidates
                     )
+
+                # Extract fingerprint if available (production mode)
+                if hasattr(logits_metadata, 'attention_fingerprint') and logits_metadata.attention_fingerprint is not None:
+                    attention_fingerprint = logits_metadata.attention_fingerprint
+                if hasattr(logits_metadata, 'attention_manifold') and logits_metadata.attention_manifold is not None:
+                    attention_manifold = logits_metadata.attention_manifold
             logits_metadata = LogitsMetadata.from_forward_batch(logits_metadata)
 
         # Check if multi-item scoring is enabled via server args (only for prefill-only requests)
@@ -633,6 +645,8 @@ class LogitsProcessor(nn.Module):
                 attention_topk_logits=attention_topk_logits,
                 attention_logsumexp_candidates=attention_logsumexp_candidates,
                 attention_multi_layer=attention_multi_layer,
+                attention_fingerprint=attention_fingerprint,
+                attention_manifold=attention_manifold,
             )
 
         # Start to process input logprobs
@@ -694,6 +708,8 @@ class LogitsProcessor(nn.Module):
             attention_topk_logits=attention_topk_logits,
             attention_logsumexp_candidates=attention_logsumexp_candidates,
             attention_multi_layer=attention_multi_layer,
+            attention_fingerprint=attention_fingerprint,
+            attention_manifold=attention_manifold,
             input_token_logprobs=logprobs_result.input_token_logprobs,
             input_top_logprobs_val=logprobs_result.input_top_logprobs_val,
             input_top_logprobs_idx=logprobs_result.input_top_logprobs_idx,

@@ -1062,6 +1062,10 @@ class TritonAttnBackend(AttentionBackend):
         """
         Compute top-k attention tokens for interpretability.
 
+        Supports two modes:
+        1. Debug Mode: Returns raw indices/scores (for visualization)
+        2. Fingerprint Mode: Returns 20D feature vector (for production routing)
+
         Uses memory-efficient chunked approach:
         - For small sequences (<2K tokens): Direct PyTorch computation
         - For large sequences: Chunked Triton kernel
@@ -1071,6 +1075,9 @@ class TritonAttnBackend(AttentionBackend):
         """
         from sglang.srt.layers.attention.triton_ops.decode_attention_with_topk import (
             compute_topk_attention_chunked,
+            compute_fingerprint_gpu,
+            compute_fingerprint_features,
+            classify_manifold_gpu,
         )
         from sglang.srt.model_executor.forward_batch_info import AttentionTokenInfo
 
@@ -1086,6 +1093,29 @@ class TritonAttnBackend(AttentionBackend):
                 window=forward_batch.attention_window,
             )
 
+            # Compute fingerprint if fingerprint mode is enabled (production path)
+            # This computes the 20D feature vector ON GPU, avoiding CPU export bottleneck
+            if getattr(forward_batch, 'attention_fingerprint_mode', False):
+                # Get current positions for fingerprint computation
+                # Use seq_lens as current positions (decode position)
+                current_pos = forward_batch.seq_lens.clone()
+
+                # Compute fingerprint: 16-bin log-distance histogram
+                fingerprint = compute_fingerprint_gpu(
+                    topk_indices, topk_scores, current_pos
+                )
+                # Extract 20D feature vector for clustering
+                features = compute_fingerprint_features(fingerprint)
+                # Classify manifold zone
+                manifolds, _ = classify_manifold_gpu(fingerprint)
+
+                # Store fingerprint (replaces raw indices in production)
+                # Only store once (last layer typically) to avoid redundancy
+                if forward_batch.attention_fingerprint is None:
+                    forward_batch.attention_fingerprint = features
+                    forward_batch.attention_manifold = manifolds
+
+            # Store raw attention info (for debug mode / backward compatibility)
             info = AttentionTokenInfo(
                 token_positions=topk_indices,
                 attention_scores=topk_scores,
