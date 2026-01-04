@@ -1089,7 +1089,6 @@ jobs:
     runs-on: 8-gpu-h200
     env:
       RUNNER_LABELS: 8-gpu-h200
-      IS_H200: "1"
     strategy:
       fail-fast: false
       matrix:
@@ -1590,7 +1589,6 @@ jobs:
     runs-on: 8-gpu-h200
     env:
       RUNNER_LABELS: 8-gpu-h200
-      IS_H200: "1"
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
