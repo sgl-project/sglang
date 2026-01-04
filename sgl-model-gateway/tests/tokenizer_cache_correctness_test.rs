@@ -9,7 +9,7 @@ use std::{
     sync::{Arc, OnceLock},
 };
 
-use sgl_model_gateway::tokenizer::{
+use smg::tokenizer::{
     cache::{CacheConfig, CachedTokenizer},
     hub::download_tokenizer_from_hf,
     huggingface::HuggingFaceTokenizer,

@@ -41,6 +41,7 @@ jobs:
         uses: mozilla-actions/sccache-action@v0.0.9
         with:
           version: "v0.12.0"
+          disable_annotations: true
 
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
@@ -88,6 +89,7 @@ jobs:
         uses: mozilla-actions/sccache-action@v0.0.9
         with:
           version: "v0.12.0"
+          disable_annotations: true
 
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
@@ -162,6 +164,7 @@ jobs:
         uses: mozilla-actions/sccache-action@v0.0.9
         with:
           version: "v0.12.0"
+          disable_annotations: true
 
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
@@ -231,6 +234,7 @@ jobs:
         uses: mozilla-actions/sccache-action@v0.0.9
         with:
           version: "v0.12.0"
+          disable_annotations: true
 
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
@@ -305,6 +309,7 @@ jobs:
         uses: mozilla-actions/sccache-action@v0.0.9
         with:
           version: "v0.10.0"
+          disable_annotations: true
 
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
@@ -448,12 +453,8 @@ jobs:
               echo "<summary>View Results</summary>" >> summary.md
               echo "" >> summary.md
               echo '```' >> summary.md
-              # Extract benchmark results (printed incrementally during run)
-              echo "=== Summary Results ===" >> summary.md
-              grep "\[BENCH_RESULT\] summary" "$TREE_DIR/benchmark_output.txt" | sed 's/\[BENCH_RESULT\] //' >> summary.md || true
-              echo "" >> summary.md
-              # Also show the full summary table if available
-              grep -A 100 "RADIX TREE BENCHMARK SUMMARY\|CI SUMMARY" "$TREE_DIR/benchmark_output.txt" | head -60 >> summary.md || cat "$TREE_DIR/benchmark_output.txt" | tail -60 >> summary.md
+              # Extract the full summary table (avoids duplication with [BENCH_RESULT] lines)
+              grep -A 50 "RADIX TREE BENCHMARK SUMMARY" "$TREE_DIR/benchmark_output.txt" | head -50 >> summary.md || cat "$TREE_DIR/benchmark_output.txt" | tail -50 >> summary.md
               echo '```' >> summary.md
               echo "</details>" >> summary.md
             fi
