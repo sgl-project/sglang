@@ -2,13 +2,29 @@
 
 # SPDX-License-Identifier: Apache-2.0
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from typing import Any
 
+import numpy as np
 import torch
 from torch import nn
 
 from sglang.multimodal_gen.configs.models import DiTConfig
+from sglang.multimodal_gen.configs.sample.teacache import TeaCacheParams
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
+
+
+@dataclass
+class TeaCacheContext:
+    """Common context extracted for TeaCache skip decision."""
+
+    current_timestep: int
+    num_inference_steps: int
+    do_cfg: bool
+    is_cfg_negative: bool  # For CFG branch selection
+    teacache_thresh: float
+    coefficients: list[float]
+    teacache_params: TeaCacheParams  # Full params for model-specific access
 
 
 # TODO
@@ -98,29 +114,204 @@ class CachableDiT(BaseDiT):
         DiTConfig()._supported_attention_backends
     )
 
+    # Models that support CFG cache separation (wan/hunyuan/zimage)
+    # Models not in this set (flux/qwen) auto-disable TeaCache when CFG is enabled
+    _CFG_SUPPORTED_PREFIXES: set[str] = {"wan", "hunyuan", "zimage"}
+
     def __init__(self, config: DiTConfig, **kwargs) -> None:
         super().__init__(config, **kwargs)
 
+        # Common TeaCache state
         self.cnt = 0
-        self.teacache_thresh = 0
-        self.coefficients: list[float] = []
+        self.enable_teacache = True
+        # Flag indicating if this model supports CFG cache separation
+        self._supports_cfg_cache = self.config.prefix.lower() in self._CFG_SUPPORTED_PREFIXES
 
-        # NOTE(will): Only wan2.1 needs these, so we are hardcoding it here
-        if self.config.prefix == "wan":
+        # Always initialize positive cache fields (used in all modes)
+        self.previous_modulated_input: torch.Tensor | None = None
+        self.previous_residual: torch.Tensor | None = None
+        self.accumulated_rel_l1_distance: float = 0.0
+        
+        self.is_cfg_negative = False
+        # CFG-specific fields initialized to None (created when CFG is used)
+        # These are only used when _supports_cfg_cache is True AND do_cfg is True
+        if self._supports_cfg_cache:
+            self.previous_modulated_input_negative: torch.Tensor | None = None
+            self.previous_residual_negative: torch.Tensor | None = None
+            self.accumulated_rel_l1_distance_negative: float = 0.0
+        # Current branch marker (for maybe_cache_states / retrieve_cached_states)
+        
+
+        # For models that don't support CFG, track if TeaCache was disabled due to CFG
+        self._teacache_disabled_for_cfg = False
+
+        # Wan-specific fields (ret_steps related)
+        if self.config.prefix.lower() == "wan":
             self.use_ret_steps = self.config.cache_config.use_ret_steps
-            self.is_even = False
-            self.previous_residual_even: torch.Tensor | None = None
-            self.previous_residual_odd: torch.Tensor | None = None
-            self.accumulated_rel_l1_distance_even = 0
-            self.accumulated_rel_l1_distance_odd = 0
-            self.should_calc_even = True
-            self.should_calc_odd = True
-        else:
-            self.accumulated_rel_l1_distance = 0
-            self.previous_modulated_input = None
-            self.previous_resiual = None
-        self.previous_e0_even: torch.Tensor | None = None
-        self.previous_e0_odd: torch.Tensor | None = None
+            
+
+    def reset_teacache_state(self) -> None:
+        """Reset all TeaCache state at the start of each generation task."""
+        # Common fields
+        self.cnt = 0
+
+        # Primary cache fields (always present)
+        self.previous_modulated_input = None
+        self.previous_residual = None
+        self.accumulated_rel_l1_distance = 0.0
+        self.is_cfg_negative = False
+        # Branch marker
+        self.enable_teacache = True
+        # CFG negative cache fields (always reset, may be unused)
+        if self._supports_cfg_cache:
+            self.previous_modulated_input_negative = None
+            self.previous_residual_negative = None
+            self.accumulated_rel_l1_distance_negative = 0.0
+
+        
+
+        # CFG disable marker (for non-CFG-supporting models)
+        self._teacache_disabled_for_cfg = False
+
+      
+
+    def _compute_l1_and_decide(
+        self,
+        modulated_inp: torch.Tensor,
+        prev_modulated_inp: str,
+        accumulated_rel_l1_distance: float,
+        coefficients: list[float],
+        teacache_thresh: float,
+    ) -> bool:
+        """
+        Compute L1 distance and decide whether to calculate or use cache.
+
+        Args:
+            modulated_inp: Current timestep's modulated input
+            prev_input_attr: Attribute name for previous modulated input
+            distance_attr: Attribute name for accumulated L1 distance
+            coefficients: Polynomial coefficients for L1 rescaling
+            teacache_thresh: Threshold for cache decision
+
+        Returns:
+            should_calc: True if forward computation is needed, False to use cache
+        """
+
+       
+        # Compute relative L1 distance
+        diff = modulated_inp - prev_modulated_inp
+        rel_l1 = (diff.abs().mean() / prev_modulated_inp.abs().mean()).cpu().item()
+
+        # Apply polynomial rescaling
+        rescale_func = np.poly1d(coefficients)
+        accumulated = accumulated_rel_l1_distance + rescale_func(rel_l1)
+
+        # Decision based on threshold
+        if accumulated < teacache_thresh:
+            return False
+        
+        return True
+        
+
+
+    def _compute_teacache_decision(
+        self,
+        modulated_inp: torch.Tensor,
+        is_boundary_step: bool,
+        coefficients: list[float],
+        teacache_thresh: float,
+    ) -> bool:
+        """
+        Compute cache decision for TeaCache.
+
+
+        Args:
+            modulated_inp: Current timestep's modulated input
+            use_positive_cache: True for positive branch, False for negative
+            is_boundary_step: True for boundary timesteps that always compute
+            coefficients: Polynomial coefficients for L1 rescaling
+            teacache_thresh: Threshold for cache decision
+
+        Returns:
+            should_calc: True if forward computation is needed, False to use cache
+        """
+        # Boundary steps always compute (early return)
+        if not self.enable_teacache:
+            return True
+        if is_boundary_step:
+            if not self.is_cfg_negative:
+                self.accumulated_rel_l1_distance = 0.0
+                self.previous_modulated_input = modulated_inp.clone()
+            elif self._supports_cfg_cache :
+                self.accumulated_rel_l1_distance_negative = 0.0
+                self.previous_modulated_input_negative = modulated_inp.clone()
+            return True
+
+        # Non-boundary: compute L1 distance and decide
+        if not self.is_cfg_negative:
+            return self._compute_l1_and_decide(
+                modulated_inp=modulated_inp,
+                prev_modulated_inp=self.previous_modulated_input,
+                accumulated_rel_l1_distance=self.accumulated_rel_l1_distance,
+                coefficients=coefficients,
+                teacache_thresh=teacache_thresh,
+            )
+        
+        return self._compute_l1_and_decide(
+                modulated_inp=modulated_inp,
+                prev_modulated_inp=self.previous_modulated_input_negative,
+                accumulated_rel_l1_distance=self.accumulated_rel_l1_distance_negative,
+                coefficients=coefficients,
+                teacache_thresh=teacache_thresh,
+                )
+
+    
+    def _get_teacache_context(self) -> TeaCacheContext | None:
+        """
+        Check TeaCache preconditions and extract common context.
+
+        Returns:
+            TeaCacheContext if TeaCache is enabled and properly configured,
+            None if should return False (skip TeaCache logic entirely).
+
+        This helper reduces code duplication in should_skip_forward_for_cached_states.
+        """
+        from sglang.multimodal_gen.runtime.managers.forward_context import (
+            get_forward_context,
+        )
+
+        forward_context = get_forward_context()
+        forward_batch = forward_context.forward_batch
+
+        # Early return checks (combined)
+        if (
+            forward_batch is None
+            or not forward_batch.enable_teacache
+            or forward_batch.teacache_params is None
+        ):
+            return None
+
+        teacache_params = forward_batch.teacache_params
+
+        # Extract common values
+        current_timestep = forward_context.current_timestep
+        num_inference_steps = forward_batch.num_inference_steps
+        do_cfg = forward_batch.do_classifier_free_guidance
+        is_cfg_negative = forward_batch.is_cfg_negative
+
+        # Reset at first timestep
+        if current_timestep == 0:
+            self.reset_teacache_state()
+
+        return TeaCacheContext(
+            current_timestep=current_timestep,
+            num_inference_steps=num_inference_steps,
+            do_cfg=do_cfg,
+            is_cfg_negative=is_cfg_negative,
+            teacache_thresh=teacache_params.teacache_thresh,
+            coefficients=teacache_params.coefficients,
+            teacache_params=teacache_params,
+        )
 
     def maybe_cache_states(
         self, hidden_states: torch.Tensor, original_hidden_states: torch.Tensor
