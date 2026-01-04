@@ -55,6 +55,21 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _preprocess_tools_for_gpt_oss(
+    tools: Optional[List[Dict]],
+) -> Optional[List[Dict]]:
+    """Preprocess tools for GPT-OSS to ensure description is not None."""
+    if tools is None:
+        return None
+    processed = []
+    for tool in tools:
+        tool_copy = tool.copy()
+        if tool_copy.get("description") is None:
+            tool_copy["description"] = ""
+        processed.append(tool_copy)
+    return processed
+
+
 class OpenAIServingChat(OpenAIServingBase):
     """Handler for /v1/chat/completions requests"""
 
@@ -274,7 +289,11 @@ class OpenAIServingChat(OpenAIServingBase):
         tools: Optional[List[Dict]],
         is_multimodal: bool,
     ) -> MessageProcessingResult:
-        """Apply Jinja chat template"""
+        """Apply Jinja chat template with GPT-OSS tool preprocessing."""
+        # Preprocess tools for GPT-OSS to ensure required fields have defaults
+        if self.is_gpt_oss:
+            tools = _preprocess_tools_for_gpt_oss(tools)
+
         prompt = ""
         prompt_ids = []
         openai_compatible_messages = []
