@@ -259,6 +259,8 @@ class HiCacheController:
         prefetch_threshold: int = 256,
         model_name: Optional[str] = None,
         storage_backend_extra_config: Optional[dict] = None,
+        pp_rank: int = 0,
+        pp_size: int = 1,
     ):
         self.tp_group = tp_group
         self.mem_pool_device_allocator = token_to_kv_pool_allocator
@@ -270,6 +272,8 @@ class HiCacheController:
         self.enable_storage = False
         self.storage_backend = None
         self.storage_backend_type = None
+        self.pp_rank = pp_rank
+        self.pp_size = pp_size
 
         # Default storage page IO functions (may be overridden by attach).
         self.page_get_func = self._generic_page_get
@@ -583,6 +587,8 @@ class HiCacheController:
         return HiCacheStorageConfig(
             tp_rank=self.tp_rank,
             tp_size=self.tp_size,
+            pp_rank=self.pp_rank,
+            pp_size=self.pp_size,
             is_mla_model=is_mla_backend,
             is_page_first_layout=self.mem_pool_host.layout == "page_first",
             model_name=model_name,
