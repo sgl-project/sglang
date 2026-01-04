@@ -186,11 +186,17 @@ pub fn extract_auth_header(
 
 #[inline]
 pub fn should_forward_request_header(name: &str) -> bool {
-    let lower_name = name.to_ascii_lowercase();
-    matches!(
-        lower_name.as_str(),
-        "authorization" | "x-request-id" | "x-correlation-id" | "traceparent" | "tracestate"
-    ) || lower_name.starts_with("x-request-id-")
+    const REQUEST_ID_PREFIX: &str = "x-request-id-";
+
+    name.eq_ignore_ascii_case("authorization")
+        || name.eq_ignore_ascii_case("x-request-id")
+        || name.eq_ignore_ascii_case("x-correlation-id")
+        || name.eq_ignore_ascii_case("traceparent")
+        || name.eq_ignore_ascii_case("tracestate")
+        || name.eq_ignore_ascii_case("x-smg-routing-key")
+        || name
+            .get(..REQUEST_ID_PREFIX.len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(REQUEST_ID_PREFIX))
 }
 
 #[cfg(test)]
@@ -213,6 +219,8 @@ mod tests {
         assert!(should_forward_request_header("x-request-id-user"));
         assert!(should_forward_request_header("X-Request-ID-Span"));
         assert!(should_forward_request_header("x-request-id-123"));
+        assert!(should_forward_request_header("x-smg-routing-key"));
+        assert!(should_forward_request_header("X-SMG-Routing-Key"));
     }
 
     #[test]
@@ -230,7 +238,5 @@ mod tests {
         assert!(!should_forward_request_header("cookie"));
         assert!(!should_forward_request_header("x-custom-header"));
         assert!(!should_forward_request_header("x-api-key"));
-        assert!(!should_forward_request_header("x-smg-routing-key"));
-        assert!(!should_forward_request_header("X-SMG-Routing-Key"));
     }
 }
