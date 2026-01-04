@@ -93,6 +93,7 @@ from sglang.srt.environ import envs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.managers.io_struct import (
     AbortReq,
+    AttachHiCacheStorageReqInput,
     CheckWeightsReqInput,
     CloseSessionReqInput,
     ConfigureLoggingReq,
@@ -716,6 +717,77 @@ async def clear_hicache_storage_backend():
         content="Hierarchical cache storage backend cleared.\n",
         status_code=200 if ret.success else HTTPStatus.BAD_REQUEST,
     )
+
+
+# example usage:
+# curl -s -X POST http://127.0.0.1:30000/attach_hicache_storage_backend \
+#  -H 'Content-Type: application/json' \
+#   -d '{
+#     "hicache_storage_backend": "file",
+#     "hicache_storage_backend_extra_config_json": "{}",
+#     "hicache_storage_prefetch_policy": "timeout",
+#     "hicache_write_policy": "write_through"
+#   }'
+@app.api_route("/attach_hicache_storage_backend", methods=["POST"])
+async def attach_hicache_storage_backend(obj: AttachHiCacheStorageReqInput):
+    """Attach (enable) HiCache storage backend at runtime.
+
+    Only allowed when there are NO running / queued requests.
+    """
+    ret = await _global_state.tokenizer_manager.attach_hicache_storage(
+        hicache_storage_backend=obj.hicache_storage_backend,
+        hicache_storage_backend_extra_config_json=obj.hicache_storage_backend_extra_config_json,
+        hicache_storage_prefetch_policy=obj.hicache_storage_prefetch_policy,
+        hicache_write_policy=obj.hicache_write_policy,
+    )
+    msg = getattr(ret, "message", "")
+    return Response(
+        content=(
+            (
+                "HiCache storage backend attached.\n"
+                if ret.success
+                else "Failed to attach HiCache storage backend.\n"
+            )
+            + (msg + "\n" if msg else "")
+        ),
+        status_code=200 if ret.success else HTTPStatus.BAD_REQUEST,
+    )
+
+
+# example usage:
+# curl -s -X POST http://127.0.0.1:30000/detach_hicache_storage_backend
+@app.api_route("/detach_hicache_storage_backend", methods=["POST"])
+async def detach_hicache_storage_backend():
+    """Detach (disable) HiCache storage backend at runtime.
+
+    Only allowed when there are NO running / queued requests.
+    """
+    ret = await _global_state.tokenizer_manager.detach_hicache_storage()
+    msg = getattr(ret, "message", "")
+    return Response(
+        content=(
+            (
+                "HiCache storage backend detached.\n"
+                if ret.success
+                else "Failed to detach HiCache storage backend.\n"
+            )
+            + (msg + "\n" if msg else "")
+        ),
+        status_code=200 if ret.success else HTTPStatus.BAD_REQUEST,
+    )
+
+
+# example usage:
+# curl -s http://127.0.0.1:30000/info_from_hicache_storage_backend
+@app.get("/info_from_hicache_storage_backend")
+async def hicache_storage_backend_status():
+    """Get current HiCache storage backend status (tokenizer-side view)."""
+    return {
+        "hicache_storage_backend": _global_state.tokenizer_manager.server_args.hicache_storage_backend,
+        "hicache_storage_backend_extra_config": _global_state.tokenizer_manager.server_args.hicache_storage_backend_extra_config,
+        "hicache_storage_prefetch_policy": _global_state.tokenizer_manager.server_args.hicache_storage_prefetch_policy,
+        "hicache_write_policy": _global_state.tokenizer_manager.server_args.hicache_write_policy,
+    }
 
 
 @app.api_route("/start_profile", methods=["GET", "POST"])
