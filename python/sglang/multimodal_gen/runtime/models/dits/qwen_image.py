@@ -346,7 +346,7 @@ class QwenEmbedLayer3DRope(nn.Module):
             if idx != layer_num:
                 video_freq = self._compute_video_freqs(frame, height, width, idx)
             else:
-                ### For the condition image, we set the layer index to -1
+                # For the condition image, we set the layer index to -1
                 video_freq = self._compute_condition_freqs(frame, height, width)
             video_freq = video_freq.to(device)
             vid_freqs.append(video_freq)
@@ -710,7 +710,7 @@ class QwenImageTransformerBlock(nn.Module):
                 )
                 gate_result = torch.where(mask, gate0.unsqueeze(1), gate1.unsqueeze(1))
                 return (
-                    fuse_scale_shift_kernel(x, scale_result, shift_result),
+                    x * (1 + scale_result) + shift_result,
                     gate_result,
                 )
         else:
@@ -755,8 +755,10 @@ class QwenImageTransformerBlock(nn.Module):
         # 4. Splits results back to separate streams
         joint_attention_kwargs = joint_attention_kwargs or {}
         attn_output = self.attn(
-            hidden_states=img_modulated,  # Image stream (will be processed as "sample")
-            encoder_hidden_states=txt_modulated,  # Text stream (will be processed as "context")
+            # Image stream (will be processed as "sample")
+            hidden_states=img_modulated,
+            # Text stream (will be processed as "context")
+            encoder_hidden_states=txt_modulated,
             encoder_hidden_states_mask=encoder_hidden_states_mask,
             image_rotary_emb=image_rotary_emb,
             **joint_attention_kwargs,
@@ -776,13 +778,17 @@ class QwenImageTransformerBlock(nn.Module):
             img_normed2, img_mod2, modulate_index
         )
         img_mlp_output = self.img_mlp(img_modulated2)
-        hidden_states = hidden_states + img_gate2 * img_mlp_output
+        hidden_states = fuse_scale_shift_kernel(
+            img_mlp_output, img_gate2, hidden_states, scale_constant=0.0
+        )
 
         # Process text stream - norm2 + MLP
         txt_normed2 = self.txt_norm2(encoder_hidden_states)
         txt_modulated2, txt_gate2 = self._modulate(txt_normed2, txt_mod2)
         txt_mlp_output = self.txt_mlp(txt_modulated2)
-        encoder_hidden_states = encoder_hidden_states + txt_gate2 * txt_mlp_output
+        encoder_hidden_states = fuse_scale_shift_kernel(
+            txt_mlp_output, txt_gate2, encoder_hidden_states, scale_constant=0.0
+        )
 
         # Clip to prevent overflow for fp16
         if encoder_hidden_states.dtype == torch.float16:
