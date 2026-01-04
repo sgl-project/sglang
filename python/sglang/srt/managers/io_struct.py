@@ -262,6 +262,12 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
     need_wait_for_image: Optional[bool] = None
     num_items_assigned: Optional[List] = None
 
+    # Multimodal tiling controls (extensions)
+    max_dynamic_patch: Optional[int] = None
+    min_dynamic_patch: Optional[int] = None
+    image_max_dynamic_patch: Optional[int] = None
+    video_max_dynamic_patch: Optional[int] = None
+
     def contains_mm_input(self) -> bool:
         return (
             has_valid_data(self.image_data)
