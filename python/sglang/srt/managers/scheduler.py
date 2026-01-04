@@ -1912,9 +1912,9 @@ class Scheduler(
 
     def get_new_batch_prefill(self) -> Optional[ScheduleBatch]:
         with PrefillDelayerSinglePassExecutor(self.prefill_delayer) as prefill_delayer_single_pass:
-            return self._get_new_batch_prefill_raw()
+            return self._get_new_batch_prefill_raw(prefill_delayer_single_pass=prefill_delayer_single_pass)
 
-    def _get_new_batch_prefill_raw(self) -> Optional[ScheduleBatch]:
+    def _get_new_batch_prefill_raw(self, prefill_delayer_single_pass: PrefillDelayerSinglePassExecutor) -> Optional[ScheduleBatch]:
         # Check if the grammar is ready in the grammar queue
         if self.grammar_queue:
             self.move_ready_grammar_requests()
