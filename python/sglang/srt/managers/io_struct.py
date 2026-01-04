@@ -262,6 +262,12 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
     need_wait_for_image: Optional[bool] = None
     num_items_assigned: Optional[List] = None
 
+    # Multimodal tiling controls (extensions)
+    max_dynamic_patch: Optional[int] = None
+    min_dynamic_patch: Optional[int] = None
+    image_max_dynamic_patch: Optional[int] = None
+    video_max_dynamic_patch: Optional[int] = None
+
     def contains_mm_input(self) -> bool:
         return (
             has_valid_data(self.image_data)
@@ -984,6 +990,8 @@ class BatchTokenIDOutput(
 
     # Load for DP balance
     load: GetLoadReqOutput = None
+    # Customized info
+    customized_info: Optional[Dict[str, List[Any]]] = None
 
 
 @dataclass
@@ -1069,6 +1077,9 @@ class BatchStrOutput(
 
     # Load for DP balance
     load: GetLoadReqOutput = None
+
+    # Customized info
+    customized_info: Optional[Dict[str, List[Any]]] = None
 
 
 @dataclass
