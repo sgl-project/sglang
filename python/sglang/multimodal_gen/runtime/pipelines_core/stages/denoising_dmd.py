@@ -98,7 +98,10 @@ class DmdDenoisingStage(DenoisingStage):
                     continue
 
                 with StageProfiler(
-                    f"denoising_step_{i}", logger=logger, timings=batch.timings
+                    f"denoising_step_{i}",
+                    logger=logger,
+                    timings=batch.timings,
+                    perf_dump_path_provided=batch.perf_dump_path is not None,
                 ):
                     # Expand latents for I2V
                     noise_latents = latents.clone()

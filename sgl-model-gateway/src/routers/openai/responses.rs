@@ -1,18 +1,10 @@
 use serde_json::{json, Map, Value};
 use tracing::warn;
 
-use crate::{
-    data_connector::{ResponseId, StoredResponse},
-    protocols::{
-        event_types::is_response_event,
-        responses::{ResponseToolType, ResponsesRequest},
-    },
+use crate::protocols::{
+    event_types::is_response_event,
+    responses::{ResponseToolType, ResponsesRequest},
 };
-
-/// Extract a string field from JSON, returning owned String
-fn get_string(json: &Value, key: &str) -> Option<String> {
-    json.get(key).and_then(|v| v.as_str()).map(String::from)
-}
 
 /// Check if a JSON value is missing, null, or an empty string
 fn is_missing_or_empty(value: Option<&Value>) -> bool {
@@ -30,48 +22,6 @@ where
     if condition(obj) {
         obj.insert(key.to_string(), Value::String(value.to_string()));
     }
-}
-
-/// Build a StoredResponse from response JSON and original request
-pub(super) fn build_stored_response(
-    response_json: &Value,
-    original_body: &ResponsesRequest,
-) -> StoredResponse {
-    let mut stored = StoredResponse::new(None);
-
-    // Initialize empty arrays - will be populated by persist_items_with_storages
-    stored.input = Value::Array(vec![]);
-    stored.output = Value::Array(vec![]);
-
-    stored.instructions =
-        get_string(response_json, "instructions").or_else(|| original_body.instructions.clone());
-
-    stored.model = get_string(response_json, "model").or_else(|| Some(original_body.model.clone()));
-
-    stored.safety_identifier = original_body.user.clone();
-    stored.conversation_id = original_body.conversation.clone();
-
-    stored.metadata = response_json
-        .get("metadata")
-        .and_then(|v| v.as_object())
-        .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
-        .unwrap_or_else(|| original_body.metadata.clone().unwrap_or_default());
-
-    stored.previous_response_id = get_string(response_json, "previous_response_id")
-        .map(|s| ResponseId::from(s.as_str()))
-        .or_else(|| {
-            original_body
-                .previous_response_id
-                .as_deref()
-                .map(ResponseId::from)
-        });
-
-    if let Some(id_str) = get_string(response_json, "id") {
-        stored.id = ResponseId::from(id_str.as_str());
-    }
-
-    stored.raw_response = response_json.clone();
-    stored
 }
 
 /// Patch streaming response JSON with metadata from original request

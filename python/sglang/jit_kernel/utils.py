@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import functools
 import pathlib
 from functools import lru_cache
-from typing import TYPE_CHECKING, List, Tuple, TypeAlias, Union
+from typing import TYPE_CHECKING, Any, Callable, List, Tuple, TypeAlias, TypeVar, Union
 
 if TYPE_CHECKING:
     from tvm_ffi import Module
@@ -131,3 +132,31 @@ def load_jit(
         extra_include_paths=DEFAULT_INCLUDE + extra_include_paths,
         build_directory=build_directory,
     )
+
+
+F = TypeVar("F", bound=Callable[..., Any])
+
+
+def cache_once(fn: F) -> F:
+    """
+    NOTE: `functools.lru_cache` is not compatible with `torch.compile`
+    So we manually implement a simple cache_once decorator to replace it.
+    """
+    result_map = {}
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        key = (args, tuple(sorted(kwargs.items(), key=lambda x: x[0])))
+        if key not in result_map:
+            result_map[key] = fn(*args, **kwargs)
+        return result_map[key]
+
+    return wrapper  # type: ignore
+
+
+@cache_once
+def is_arch_support_pdl() -> bool:
+    import torch
+
+    device = torch.cuda.current_device()
+    return torch.cuda.get_device_capability(device)[0] >= 9

@@ -1,17 +1,13 @@
 name: Release Docker Images (NPU)
 on:
   push:
-    branches:
-      - main
-    paths:
-      - "python/sglang/version.py"
-  pull_request:
-    branches:
-      - main
-    paths:
-      - ".github/workflows/release-docker-npu.yml"
-      - "docker/npu.Dockerfile"
+    tags:
+      - 'v[0-9]+.*'
   workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to build (without v prefix, e.g., 0.5.7)'
+        required: true
 
 jobs:
   build:
@@ -51,11 +47,26 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Get version
-        id: get_version
+      - name: Get version from tag
+        id: version
         run: |
-          version=$(cat python/sglang/version.py | cut -d'"' -f2)
-          echo "TAG=lmsysorg/sglang:v$version-cann${{ matrix.cann_version }}-${{ matrix.device_type }}" >> $GITHUB_OUTPUT
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            VERSION="${{ github.event.inputs.version }}"
+          else
+            # Extract version from tag (e.g., v0.5.7 -> 0.5.7)
+            VERSION="${GITHUB_REF_NAME#v}"
+          fi
+          # Validate version format
+          if [ -z "$VERSION" ]; then
+            echo "::error::Version is empty"
+            exit 1
+          fi
+          if ! echo "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+'; then
+            echo "::error::Invalid version format: $VERSION (expected: X.Y.Z)"
+            exit 1
+          fi
+          echo "version=v${VERSION}" >> $GITHUB_OUTPUT
+          echo "TAG=lmsysorg/sglang:v${VERSION}-cann${{ matrix.cann_version }}-${{ matrix.device_type }}" >> $GITHUB_OUTPUT
 
       - name: Build and push Docker image
         id: build-and-push
@@ -66,10 +77,11 @@ jobs:
           # TODO: need add x86 platforms support when memfabric is ready
           platforms: linux/arm64
           labels: ${{ steps.meta.outputs.labels }}
-          tags: ${{ steps.meta.outputs.tags || steps.get_version.outputs.TAG }}
+          tags: ${{ steps.meta.outputs.tags || steps.version.outputs.TAG }}
           push: ${{ github.repository == 'sgl-project/sglang' && github.event_name != 'pull_request' }}
           provenance: false
           build-args: |
             SGLANG_KERNEL_NPU_TAG=20251206
             CANN_VERSION=${{ matrix.cann_version }}
             DEVICE_TYPE=${{ matrix.device_type }}
+            SGLANG_TAG=${{ steps.version.outputs.version }}

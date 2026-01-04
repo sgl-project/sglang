@@ -17,7 +17,7 @@
 use std::{fs::File, io::Read, path::Path};
 
 use ndarray::{Array4, Array5};
-use sgl_model_gateway::multimodal::vision::{
+use smg::multimodal::vision::{
     image_processor::ModelSpecificValue, ImagePreProcessor, Llama4VisionProcessor, LlavaProcessor,
     Phi3VisionProcessor, Phi4VisionProcessor, PixtralProcessor, PreProcessorConfig,
     Qwen2VLProcessor, Qwen3VLProcessor,

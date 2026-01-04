@@ -34,8 +34,6 @@ from sglang.multimodal_gen.utils import FlexibleArgumentParser, StoreBoolean
 
 logger = init_logger(__name__)
 
-ZMQ_TCP_PORT_DELTA = 233
-
 
 def _is_torch_tensor(obj: Any) -> tuple[bool, Any]:
     """Return (is_tensor, torch_module_or_None) without importing torch at module import time."""
@@ -145,31 +143,6 @@ def _sanitize_for_logging(obj: Any, key_hint: str | None = None) -> Any:
         return "<unserializable>"
 
 
-class ExecutionMode(str, Enum):
-    """
-    Enumeration for different pipeline modes.
-
-    Inherits from str to allow string comparison for backward compatibility.
-    """
-
-    INFERENCE = "inference"
-
-    @classmethod
-    def from_string(cls, value: str) -> "ExecutionMode":
-        """Convert string to ExecutionMode enum."""
-        try:
-            return cls(value.lower())
-        except ValueError:
-            raise ValueError(
-                f"Invalid mode: {value}. Must be one of: {', '.join([m.value for m in cls])}"
-            ) from None
-
-    @classmethod
-    def choices(cls) -> list[str]:
-        """Get all available choices as strings for argparse."""
-        return [mode.value for mode in cls]
-
-
 @dataclasses.dataclass
 class ServerArgs:
     # Model and path configuration (for convenience)
@@ -178,14 +151,7 @@ class ServerArgs:
     # Attention
     attention_backend: str = None
 
-    # Running mode
-    mode: ExecutionMode = ExecutionMode.INFERENCE
-
-    # Cache strategy
-    cache_strategy: str = "none"
-
     # Distributed executor backend
-    distributed_executor_backend: str = "mp"
     nccl_port: Optional[int] = None
 
     # HuggingFace specific parameters
@@ -224,15 +190,13 @@ class ServerArgs:
     # Will adapt only q, k, v, o by default.
     lora_target_modules: list[str] | None = None
 
-    output_type: str = "pil"
-
     # CPU offload parameters
-    dit_cpu_offload: bool = True
+    dit_cpu_offload: bool | None = None
+    dit_layerwise_offload: bool | None = None
+    text_encoder_cpu_offload: bool | None = None
+    image_encoder_cpu_offload: bool | None = None
+    vae_cpu_offload: bool | None = None
     use_fsdp_inference: bool = False
-    dit_layerwise_offload: bool = False
-    text_encoder_cpu_offload: bool = True
-    image_encoder_cpu_offload: bool = True
-    vae_cpu_offload: bool = True
     pin_cpu_memory: bool = True
 
     # STA (Sliding Tile Attention) parameters
@@ -242,6 +206,7 @@ class ServerArgs:
 
     # Compilation
     enable_torch_compile: bool = False
+    enable_warmup: bool = False
 
     disable_autocast: bool | None = None
 
@@ -256,18 +221,15 @@ class ServerArgs:
     # TODO: do not hard code
     master_port: int | None = None
 
-    # http server endpoint config, would be ignored in local mode
-    host: str | None = None
-    port: int | None = None
+    # http server endpoint config
+    host: str | None = "127.0.0.1"
+    port: int | None = 30000
 
     # TODO: webui and their endpoint, check if webui_port is available.
     webui: bool = False
     webui_port: int | None = 12312
 
     scheduler_port: int = 5555
-
-    # Stage verification
-    enable_stage_verification: bool = True
 
     # Prompt text file for batch processing
     prompt_file_path: str | None = None
@@ -280,7 +242,6 @@ class ServerArgs:
             "vae": True,
         }
     )
-    override_transformer_cls_name: str | None = None
 
     # # DMD parameters
     # dmd_denoising_steps: List[int] | None = field(default=None)
@@ -302,11 +263,37 @@ class ServerArgs:
         """
         return self.host is None or self.port is None
 
+    def adjust_offload(self):
+        if self.pipeline_config.task_type.is_image_gen():
+            logger.info(
+                "Disabling some offloading (except dit, text_encoder) for image generation model"
+            )
+            if self.dit_cpu_offload is None:
+                self.dit_cpu_offload = True
+            if self.text_encoder_cpu_offload is None:
+                self.text_encoder_cpu_offload = True
+            if self.image_encoder_cpu_offload is None:
+                self.image_encoder_cpu_offload = False
+            if self.vae_cpu_offload is None:
+                self.vae_cpu_offload = False
+        else:
+            self.dit_cpu_offload = True
+            self.text_encoder_cpu_offload = True
+            self.image_encoder_cpu_offload = True
+            self.vae_cpu_offload = True
+
     def __post_init__(self):
-        # Add randomization to avoid race condition when multiple servers start simultaneously
+        # configure logger before use
+        configure_logger(server_args=self)
+
+        self.adjust_offload()
+
         if self.attention_backend in ["fa3", "fa4"]:
             self.attention_backend = "fa"
 
+        # network initialization: port and host
+        self.port = self.settle_port(self.port)
+        # Add randomization to avoid race condition when multiple servers start simultaneously
         initial_scheduler_port = self.scheduler_port + random.randint(0, 100)
         self.scheduler_port = self.settle_port(initial_scheduler_port)
         # TODO: remove hard code
@@ -322,9 +309,8 @@ class ServerArgs:
                     "Failed to load V-MoBA config from %s: %s", self.moba_config_path, e
                 )
                 raise
-        self.check_server_args()
 
-        configure_logger(server_args=self)
+        self.check_server_args()
 
         # log clean server_args
         try:
@@ -343,11 +329,6 @@ class ServerArgs:
             help="The path of the model weights. This can be a local folder or a Hugging Face repo ID.",
         )
         parser.add_argument(
-            "--model-dir",
-            type=str,
-            help="Directory containing StepVideo model",
-        )
-        parser.add_argument(
             "--vae-path",
             type=str,
             default=ServerArgs.vae_path,
@@ -361,24 +342,6 @@ class ServerArgs:
             default=None,
             choices=[e.name.lower() for e in AttentionBackendEnum] + ["fa3", "fa4"],
             help="The attention backend to use. If not specified, the backend is automatically selected based on hardware and installed packages.",
-        )
-
-        # Running mode
-        parser.add_argument(
-            "--mode",
-            type=str,
-            choices=ExecutionMode.choices(),
-            default=ServerArgs.mode.value,
-            help="The mode to run SGLang-diffusion",
-        )
-
-        # distributed_executor_backend
-        parser.add_argument(
-            "--distributed-executor-backend",
-            type=str,
-            choices=["mp"],
-            default=ServerArgs.distributed_executor_backend,
-            help="The distributed executor backend to use",
         )
 
         # HuggingFace specific parameters
@@ -460,15 +423,6 @@ class ServerArgs:
             help="Set timeout for torch.distributed initialization.",
         )
 
-        # Output type
-        parser.add_argument(
-            "--output-type",
-            type=str,
-            default=ServerArgs.output_type,
-            choices=["pil"],
-            help="Output type for the generated video",
-        )
-
         # Prompt text file for batch processing
         parser.add_argument(
             "--prompt-file-path",
@@ -502,6 +456,14 @@ class ServerArgs:
             default=ServerArgs.enable_torch_compile,
             help="Use torch.compile to speed up DiT inference."
             + "However, will likely cause precision drifts. See (https://github.com/pytorch/pytorch/issues/145213)",
+        )
+        parser.add_argument(
+            "--enable-warmup",
+            action=StoreBoolean,
+            default=ServerArgs.enable_warmup,
+            help="Perform a 1-step end-to-end warmup request before the actual request. "
+            "Recommended to enable when benchmarking to ensure fair comparison and best performance."
+            "When enabled, look for the line ending with `with warmup excluded` for actual processing time.",
         )
         parser.add_argument(
             "--dit-cpu-offload",
@@ -594,19 +556,6 @@ class ServerArgs:
             help="Whether to use webui for better display",
         )
 
-        # Stage verification
-        parser.add_argument(
-            "--enable-stage-verification",
-            action=StoreBoolean,
-            default=ServerArgs.enable_stage_verification,
-            help="Enable input/output verification for pipeline stages",
-        )
-        parser.add_argument(
-            "--override-transformer-cls-name",
-            type=str,
-            default=ServerArgs.override_transformer_cls_name,
-            help="Override transformer cls name",
-        )
         # LoRA
         parser.add_argument(
             "--lora-path",
@@ -638,12 +587,15 @@ class ServerArgs:
         else:
             return f"http://{self.host}:{self.port}"
 
+    @property
     def scheduler_endpoint(self):
         """
-        Internal endpoint for scheduler
-
+        Internal endpoint for scheduler.
+        Prefers the configured host but normalizes localhost -> 127.0.0.1 to avoid ZMQ issues.
         """
-        scheduler_host = self.host or "localhost"
+        scheduler_host = self.host
+        if scheduler_host is None or scheduler_host == "localhost":
+            scheduler_host = "127.0.0.1"
         return f"tcp://{scheduler_host}:{self.scheduler_port}"
 
     def settle_port(
@@ -685,16 +637,6 @@ class ServerArgs:
             f"Failed to find available port after {max_attempts} attempts "
             f"(started from port {original_port})"
         )
-
-    def post_init_serve(self):
-        """
-        Post init when in serve mode
-        """
-        if self.host is None:
-            self.host = "localhost"
-        if self.port is None:
-            self.port = 3000
-        self.port = self.settle_port(self.port)
 
     @classmethod
     def from_cli_args(
@@ -754,10 +696,6 @@ class ServerArgs:
 
     @classmethod
     def from_kwargs(cls, **kwargs: Any) -> "ServerArgs":
-        # Convert mode string to enum if necessary
-        if "mode" in kwargs and isinstance(kwargs["mode"], str):
-            kwargs["mode"] = ExecutionMode.from_string(kwargs["mode"])
-
         kwargs["pipeline_config"] = PipelineConfig.from_kwargs(kwargs)
         return cls(**kwargs)
 
@@ -809,13 +747,13 @@ class ServerArgs:
 
         if self.ulysses_degree is None:
             self.ulysses_degree = 1
-            logger.info(
+            logger.debug(
                 f"Ulysses degree not set, using default value {self.ulysses_degree}"
             )
 
         if self.ring_degree is None:
             self.ring_degree = 1
-            logger.info(f"Ring degree not set, using default value {self.ring_degree}")
+            logger.debug(f"Ring degree not set, using default value {self.ring_degree}")
 
         if self.ring_degree > 1:
             if self.attention_backend is not None and self.attention_backend != "fa":
@@ -844,7 +782,7 @@ class ServerArgs:
         assert self.dp_size >= 1, "--dp-size must be natural number"
         # NOTE: disable temporarily
         # self.dp_degree = self.num_gpus // self.dp_size
-        logger.info(f"Setting dp_degree to: {self.dp_degree}")
+        logger.debug(f"Setting dp_degree to: {self.dp_degree}")
         if self.dp_size > 1:
             raise ValueError("DP is not yet supported")
 
@@ -878,14 +816,6 @@ class ServerArgs:
             self.disable_autocast = not self.pipeline_config.enable_autocast
         else:
             self.disable_autocast = False
-
-        # Validate mode consistency
-        assert isinstance(
-            self.mode, ExecutionMode
-        ), f"Mode must be an ExecutionMode enum, got {type(self.mode)}"
-        assert (
-            self.mode in ExecutionMode.choices()
-        ), f"Invalid execution mode: {self.mode}"
 
         if self.tp_size == -1:
             self.tp_size = 1
@@ -1041,7 +971,7 @@ def set_global_server_args(server_args: ServerArgs):
     _global_server_args = server_args
 
 
-def get_current_server_args() -> ServerArgs:
+def get_current_server_args() -> ServerArgs | None:
     if _current_server_args is None:
         # in ci, usually when we test custom ops/modules directly,
         # we don't set the sgl_diffusion config. In that case, we set a default
@@ -1051,7 +981,7 @@ def get_current_server_args() -> ServerArgs:
     return _current_server_args
 
 
-def get_global_server_args() -> ServerArgs:
+def get_global_server_args() -> ServerArgs | None:
     if _global_server_args is None:
         # in ci, usually when we test custom ops/modules directly,
         # we don't set the sgl_diffusion config. In that case, we set a default

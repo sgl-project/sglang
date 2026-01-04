@@ -66,11 +66,9 @@ use crate::{
             harmony::{processor::ResponsesIterationResult, streaming::HarmonyStreamingProcessor},
             pipeline::RequestPipeline,
         },
+        mcp_utils::{extract_server_label, DEFAULT_MAX_ITERATIONS},
     },
 };
-
-/// Maximum number of tool execution iterations to prevent infinite loops
-const MAX_TOOL_ITERATIONS: usize = 10;
 
 /// Record of a single MCP tool call execution
 ///
@@ -300,7 +298,7 @@ async fn execute_with_mcp_loop(
     let mut iteration_count = 0;
 
     // Extract server_label from request tools
-    let server_label = extract_mcp_server_label(current_request.tools.as_deref());
+    let server_label = extract_server_label(current_request.tools.as_deref(), "sglang-mcp");
     let mut mcp_tracking = McpCallTracking::new(server_label.clone());
 
     // Extract user's max_tool_calls limit (if set)
@@ -329,16 +327,19 @@ async fn execute_with_mcp_loop(
         Metrics::record_mcp_tool_iteration(&current_request.model);
 
         // Safety check: prevent infinite loops
-        if iteration_count > MAX_TOOL_ITERATIONS {
+        if iteration_count > DEFAULT_MAX_ITERATIONS {
             error!(
                 function = "execute_with_mcp_loop",
                 iteration_count = iteration_count,
-                max_iterations = MAX_TOOL_ITERATIONS,
+                max_iterations = DEFAULT_MAX_ITERATIONS,
                 "Maximum tool iterations exceeded"
             );
             return Err(error::internal_error(
                 "tool_iterations_exceeded",
-                format!("Maximum tool iterations ({}) exceeded", MAX_TOOL_ITERATIONS),
+                format!(
+                    "Maximum tool iterations ({}) exceeded",
+                    DEFAULT_MAX_ITERATIONS
+                ),
             ));
         }
 
@@ -390,8 +391,8 @@ async fn execute_with_mcp_loop(
 
                 // Check combined limit (user's max_tool_calls vs safety limit)
                 let effective_limit = match max_tool_calls {
-                    Some(user_max) => user_max.min(MAX_TOOL_ITERATIONS),
-                    None => MAX_TOOL_ITERATIONS,
+                    Some(user_max) => user_max.min(DEFAULT_MAX_ITERATIONS),
+                    None => DEFAULT_MAX_ITERATIONS,
                 };
 
                 // Check if we would exceed the limit with these new MCP tool calls
@@ -658,7 +659,7 @@ async fn execute_mcp_tool_loop_streaming(
     tx: &mpsc::UnboundedSender<Result<Bytes, std::io::Error>>,
 ) {
     // Extract server_label from request tools
-    let server_label = extract_mcp_server_label(current_request.tools.as_deref());
+    let server_label = extract_server_label(current_request.tools.as_deref(), "sglang-mcp");
 
     // Set server label in emitter for MCP call items
     emitter.set_mcp_server_label(server_label.clone());
@@ -773,9 +774,12 @@ async fn execute_mcp_tool_loop_streaming(
         Metrics::record_mcp_tool_iteration(&current_request.model);
 
         // Safety check: prevent infinite loops
-        if iteration_count > MAX_TOOL_ITERATIONS {
+        if iteration_count > DEFAULT_MAX_ITERATIONS {
             emitter.emit_error(
-                &format!("Maximum tool iterations ({}) exceeded", MAX_TOOL_ITERATIONS),
+                &format!(
+                    "Maximum tool iterations ({}) exceeded",
+                    DEFAULT_MAX_ITERATIONS
+                ),
                 Some("max_iterations_exceeded"),
                 tx,
             );
@@ -852,8 +856,8 @@ async fn execute_mcp_tool_loop_streaming(
 
                 // Check combined limit (user's max_tool_calls vs safety limit)
                 let effective_limit = match max_tool_calls {
-                    Some(user_max) => user_max.min(MAX_TOOL_ITERATIONS),
-                    None => MAX_TOOL_ITERATIONS,
+                    Some(user_max) => user_max.min(DEFAULT_MAX_ITERATIONS),
+                    None => DEFAULT_MAX_ITERATIONS,
                 };
 
                 // Check if we would exceed the limit with these new MCP tool calls
@@ -1544,24 +1548,6 @@ fn inject_mcp_metadata(
 
     // 2. Append all mcp_call items at the end
     response.output.extend(mcp_call_items);
-}
-
-/// Extract MCP server label from request tools
-///
-/// Searches for the first MCP tool in the tools array and returns its server_label.
-/// Falls back to "sglang-mcp" if no MCP tool with server_label is found.
-fn extract_mcp_server_label(tools: Option<&[ResponseTool]>) -> String {
-    tools
-        .and_then(|tools| {
-            tools.iter().find_map(|tool| {
-                if matches!(tool.r#type, ResponseToolType::Mcp) {
-                    tool.server_label.clone()
-                } else {
-                    None
-                }
-            })
-        })
-        .unwrap_or_else(|| "sglang-mcp".to_string())
 }
 
 /// Load previous conversation messages from storage

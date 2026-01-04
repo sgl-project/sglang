@@ -130,3 +130,7 @@ nsys profile \
 - **Reduce trace size**: Use `--num-profiled-timesteps` with smaller values or `--delay`/`--duration` with Nsight Systems
 - **Stage-specific analysis**: Use `--profile` alone for denoising stage, add `--profile-all-stages` for full pipeline
 - **Multiple runs**: Profile with different prompts and resolutions to identify bottlenecks across workloads
+
+## FAQ
+
+- If you are profiling `sglang generate` with Nsight Systems and find that the generated profiler file did not capture any CUDA kernels, you can resolve this issue by increasing the model's inference steps to extend the execution time.

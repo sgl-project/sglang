@@ -1,32 +1,49 @@
-//! Manual routing policy based on routing_id
+//! Manual routing policy based on routing key header
+//!
+//! This policy provides sticky session routing where each unique routing key
+//! is consistently mapped to the same worker. Unlike consistent hashing,
+//! this policy:
+//! - Does NOT redistribute any sessions when workers are added
+//! - Only remaps sessions when their assigned worker becomes unhealthy
+//! - Maintains up to 2 candidate workers per routing key for fast failover
+//!
+//! Use this when you need stronger stickiness guarantees than consistent hashing,
+//! for example with stateful chat sessions where context is stored on the worker.
+//!
+//! ## Header
+//! - `X-SMG-Routing-Key`: The routing key for sticky session routing
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Instant};
 
 use dashmap::{mapref::entry::Entry, DashMap};
+use http::header::HeaderName;
 use rand::Rng;
+use tracing::info;
 
-use super::{get_healthy_worker_indices, LoadBalancingPolicy, SelectWorkerInfo};
+use super::{
+    get_healthy_worker_indices, utils::PeriodicTask, LoadBalancingPolicy, SelectWorkerInfo,
+};
 use crate::{core::Worker, observability::metrics::Metrics};
+
+/// Header for routing key based sticky sessions
+static HEADER_ROUTING_KEY: HeaderName = HeaderName::from_static("x-smg-routing-key");
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ExecutionBranch {
     NoHealthyWorkers,
-    FastPathHit,
-    SlowPathOccupiedHit,
-    SlowPathOccupiedMiss,
-    SlowPathVacant,
+    OccupiedHit,
+    OccupiedMiss,
+    Vacant,
     NoRoutingId,
 }
 
 impl ExecutionBranch {
-    // TODO auto generate
     fn as_str(&self) -> &'static str {
         match self {
             Self::NoHealthyWorkers => "no_healthy_workers",
-            Self::FastPathHit => "fast_path_hit",
-            Self::SlowPathOccupiedHit => "slow_path_occupied_hit",
-            Self::SlowPathOccupiedMiss => "slow_path_occupied_miss",
-            Self::SlowPathVacant => "slow_path_vacant",
+            Self::OccupiedHit => "occupied_hit",
+            Self::OccupiedMiss => "occupied_miss",
+            Self::Vacant => "vacant",
             Self::NoRoutingId => "no_routing_id",
         }
     }
@@ -44,11 +61,27 @@ impl RoutingId {
 const MAX_CANDIDATE_WORKERS: usize = 2;
 
 #[derive(Debug, Clone)]
-struct RoutingInfo {
-    candi_worker_urls: Vec<String>,
+pub struct ManualConfig {
+    pub eviction_interval_secs: u64,
+    pub max_idle_secs: u64,
 }
 
-impl RoutingInfo {
+impl Default for ManualConfig {
+    fn default() -> Self {
+        Self {
+            eviction_interval_secs: 60,
+            max_idle_secs: 4 * 3600,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct Node {
+    candi_worker_urls: Vec<String>,
+    last_access: Instant,
+}
+
+impl Node {
     fn push_bounded(&mut self, url: String) {
         while self.candi_worker_urls.len() >= MAX_CANDIDATE_WORKERS {
             self.candi_worker_urls.remove(0);
@@ -58,16 +91,60 @@ impl RoutingInfo {
 }
 
 // TODO may optimize performance
-// TODO evict old data periodically
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct ManualPolicy {
-    routing_map: DashMap<RoutingId, RoutingInfo>,
+    routing_map: Arc<DashMap<RoutingId, Node>>,
+    _eviction_task: Option<PeriodicTask>,
+}
+
+impl Default for ManualPolicy {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ManualPolicy {
     pub fn new() -> Self {
+        Self::with_config(ManualConfig::default())
+    }
+
+    pub fn with_config(config: ManualConfig) -> Self {
+        use std::time::Duration;
+
+        let routing_map = Arc::new(DashMap::<RoutingId, Node>::new());
+
+        let eviction_task = if config.eviction_interval_secs > 0 && config.max_idle_secs > 0 {
+            let routing_map_clone = Arc::clone(&routing_map);
+            let max_idle = Duration::from_secs(config.max_idle_secs);
+
+            Some(PeriodicTask::spawn(
+                config.eviction_interval_secs,
+                "ManualPolicyEviction",
+                move || {
+                    let now = Instant::now();
+                    let before_size = routing_map_clone.len();
+
+                    routing_map_clone
+                        .retain(|_, node| now.duration_since(node.last_access) < max_idle);
+
+                    let evicted_count = before_size - routing_map_clone.len();
+                    if evicted_count > 0 {
+                        info!(
+                            "ManualPolicy TTL eviction: evicted {} entries, remaining {} (max_idle: {}s)",
+                            evicted_count,
+                            routing_map_clone.len(),
+                            max_idle.as_secs()
+                        );
+                    }
+                },
+            ))
+        } else {
+            None
+        };
+
         Self {
-            routing_map: DashMap::new(),
+            routing_map,
+            _eviction_task: eviction_task,
         }
     }
 
@@ -79,35 +156,27 @@ impl ManualPolicy {
     ) -> (usize, ExecutionBranch) {
         let routing_id = RoutingId::new(routing_id);
 
-        // Fast path
-        if let Some(info) = self.routing_map.get(&routing_id) {
-            if let Some(idx) =
-                find_healthy_worker(&info.candi_worker_urls, workers, healthy_indices)
-            {
-                return (idx, ExecutionBranch::FastPathHit);
-            }
-        }
-
-        // Slow path
         match self.routing_map.entry(routing_id) {
             Entry::Occupied(mut entry) => {
+                let node = entry.get_mut();
+                node.last_access = Instant::now();
                 if let Some(idx) =
-                    find_healthy_worker(&entry.get().candi_worker_urls, workers, healthy_indices)
+                    find_healthy_worker(&node.candi_worker_urls, workers, healthy_indices)
                 {
-                    return (idx, ExecutionBranch::SlowPathOccupiedHit);
+                    (idx, ExecutionBranch::OccupiedHit)
+                } else {
+                    let selected_idx = random_select(healthy_indices);
+                    node.push_bounded(workers[selected_idx].url().to_string());
+                    (selected_idx, ExecutionBranch::OccupiedMiss)
                 }
-                let selected_idx = random_select(healthy_indices);
-                entry
-                    .get_mut()
-                    .push_bounded(workers[selected_idx].url().to_string());
-                (selected_idx, ExecutionBranch::SlowPathOccupiedMiss)
             }
             Entry::Vacant(entry) => {
                 let selected_idx = random_select(healthy_indices);
-                entry.insert(RoutingInfo {
+                entry.insert(Node {
                     candi_worker_urls: vec![workers[selected_idx].url().to_string()],
+                    last_access: Instant::now(),
                 });
-                (selected_idx, ExecutionBranch::SlowPathVacant)
+                (selected_idx, ExecutionBranch::Vacant)
             }
         }
     }
@@ -122,12 +191,16 @@ impl ManualPolicy {
             return (None, ExecutionBranch::NoHealthyWorkers);
         }
 
-        if let Some(routing_id) = info.routing_id {
-            if !routing_id.is_empty() {
-                let (idx, branch) =
-                    self.select_by_routing_id(workers, routing_id, &healthy_indices);
-                return (Some(idx), branch);
-            }
+        // Extract routing key from header
+        let routing_id = info
+            .headers
+            .and_then(|h| h.get(&HEADER_ROUTING_KEY))
+            .and_then(|v| v.to_str().ok())
+            .filter(|s| !s.is_empty());
+
+        if let Some(routing_id) = routing_id {
+            let (idx, branch) = self.select_by_routing_id(workers, routing_id, &healthy_indices);
+            return (Some(idx), branch);
         }
 
         (
@@ -141,15 +214,12 @@ impl LoadBalancingPolicy for ManualPolicy {
     fn select_worker(&self, workers: &[Arc<dyn Worker>], info: &SelectWorkerInfo) -> Option<usize> {
         let (result, branch) = self.select_worker_impl(workers, info);
         Metrics::record_worker_manual_policy_branch(branch.as_str());
+        Metrics::set_manual_policy_cache_entries(self.routing_map.len());
         result
     }
 
     fn name(&self) -> &'static str {
         "manual"
-    }
-
-    fn needs_routing_id(&self) -> bool {
-        true
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
@@ -190,35 +260,38 @@ mod tests {
     use super::*;
     use crate::core::{BasicWorkerBuilder, WorkerType};
 
+    fn create_workers(urls: &[&str]) -> Vec<Arc<dyn Worker>> {
+        urls.iter()
+            .map(|url| {
+                Arc::new(
+                    BasicWorkerBuilder::new(*url)
+                        .worker_type(WorkerType::Regular)
+                        .build(),
+                ) as Arc<dyn Worker>
+            })
+            .collect()
+    }
+
+    fn headers_with_routing_key(key: &str) -> http::HeaderMap {
+        let mut headers = http::HeaderMap::new();
+        headers.insert("x-smg-routing-key", key.parse().unwrap());
+        headers
+    }
+
     #[test]
     fn test_manual_consistent_routing() {
         let policy = ManualPolicy::new();
-        let workers: Vec<Arc<dyn Worker>> = vec![
-            Arc::new(
-                BasicWorkerBuilder::new("http://w1:8000")
-                    .worker_type(WorkerType::Regular)
-                    .build(),
-            ),
-            Arc::new(
-                BasicWorkerBuilder::new("http://w2:8000")
-                    .worker_type(WorkerType::Regular)
-                    .build(),
-            ),
-            Arc::new(
-                BasicWorkerBuilder::new("http://w3:8000")
-                    .worker_type(WorkerType::Regular)
-                    .build(),
-            ),
-        ];
+        let workers = create_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
 
+        let headers = headers_with_routing_key("user-123");
         let info = SelectWorkerInfo {
-            routing_id: Some("user-123"),
+            headers: Some(&headers),
             ..Default::default()
         };
 
         let (first_result, branch) = policy.select_worker_impl(&workers, &info);
         let first_idx = first_result.unwrap();
-        assert_eq!(branch, ExecutionBranch::SlowPathVacant);
+        assert_eq!(branch, ExecutionBranch::Vacant);
 
         for _ in 0..10 {
             let (result, branch) = policy.select_worker_impl(&workers, &info);
@@ -227,40 +300,24 @@ mod tests {
                 Some(first_idx),
                 "Same routing_id should route to same worker"
             );
-            assert_eq!(branch, ExecutionBranch::FastPathHit);
+            assert_eq!(branch, ExecutionBranch::OccupiedHit);
         }
     }
 
     #[test]
     fn test_manual_different_routing_ids() {
         let policy = ManualPolicy::new();
-        let workers: Vec<Arc<dyn Worker>> = vec![
-            Arc::new(
-                BasicWorkerBuilder::new("http://w1:8000")
-                    .worker_type(WorkerType::Regular)
-                    .build(),
-            ),
-            Arc::new(
-                BasicWorkerBuilder::new("http://w2:8000")
-                    .worker_type(WorkerType::Regular)
-                    .build(),
-            ),
-            Arc::new(
-                BasicWorkerBuilder::new("http://w3:8000")
-                    .worker_type(WorkerType::Regular)
-                    .build(),
-            ),
-        ];
+        let workers = create_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
 
         let mut distribution = HashMap::new();
         for i in 0..100 {
-            let routing_id = format!("user-{}", i);
+            let headers = headers_with_routing_key(&format!("user-{}", i));
             let info = SelectWorkerInfo {
-                routing_id: Some(&routing_id),
+                headers: Some(&headers),
                 ..Default::default()
             };
             let (result, branch) = policy.select_worker_impl(&workers, &info);
-            assert_eq!(branch, ExecutionBranch::SlowPathVacant);
+            assert_eq!(branch, ExecutionBranch::Vacant);
             *distribution.entry(result.unwrap()).or_insert(0) += 1;
         }
 
@@ -273,18 +330,7 @@ mod tests {
     #[test]
     fn test_manual_fallback_random() {
         let policy = ManualPolicy::new();
-        let workers: Vec<Arc<dyn Worker>> = vec![
-            Arc::new(
-                BasicWorkerBuilder::new("http://w1:8000")
-                    .worker_type(WorkerType::Regular)
-                    .build(),
-            ),
-            Arc::new(
-                BasicWorkerBuilder::new("http://w2:8000")
-                    .worker_type(WorkerType::Regular)
-                    .build(),
-            ),
-        ];
+        let workers = create_workers(&["http://w1:8000", "http://w2:8000"]);
 
         let mut counts = HashMap::new();
         for _ in 0..100 {
@@ -302,49 +348,36 @@ mod tests {
     #[test]
     fn test_manual_with_unhealthy_workers() {
         let policy = ManualPolicy::new();
-        let workers: Vec<Arc<dyn Worker>> = vec![
-            Arc::new(
-                BasicWorkerBuilder::new("http://w1:8000")
-                    .worker_type(WorkerType::Regular)
-                    .build(),
-            ),
-            Arc::new(
-                BasicWorkerBuilder::new("http://w2:8000")
-                    .worker_type(WorkerType::Regular)
-                    .build(),
-            ),
-        ];
+        let workers = create_workers(&["http://w1:8000", "http://w2:8000"]);
 
         workers[0].set_healthy(false);
 
+        let headers = headers_with_routing_key("test-routing-id");
         let info = SelectWorkerInfo {
-            routing_id: Some("test-routing-id"),
+            headers: Some(&headers),
             ..Default::default()
         };
 
         let (result, branch) = policy.select_worker_impl(&workers, &info);
         assert_eq!(result, Some(1), "Should only select healthy worker");
-        assert_eq!(branch, ExecutionBranch::SlowPathVacant);
+        assert_eq!(branch, ExecutionBranch::Vacant);
 
         for _ in 0..10 {
             let (result, branch) = policy.select_worker_impl(&workers, &info);
             assert_eq!(result, Some(1), "Should only select healthy worker");
-            assert_eq!(branch, ExecutionBranch::FastPathHit);
+            assert_eq!(branch, ExecutionBranch::OccupiedHit);
         }
     }
 
     #[test]
     fn test_manual_no_healthy_workers() {
         let policy = ManualPolicy::new();
-        let workers: Vec<Arc<dyn Worker>> = vec![Arc::new(
-            BasicWorkerBuilder::new("http://w1:8000")
-                .worker_type(WorkerType::Regular)
-                .build(),
-        )];
+        let workers = create_workers(&["http://w1:8000"]);
 
         workers[0].set_healthy(false);
+        let headers = headers_with_routing_key("test");
         let info = SelectWorkerInfo {
-            routing_id: Some("test"),
+            headers: Some(&headers),
             ..Default::default()
         };
         let (result, branch) = policy.select_worker_impl(&workers, &info);
@@ -355,23 +388,13 @@ mod tests {
     #[test]
     fn test_manual_empty_routing_id() {
         let policy = ManualPolicy::new();
-        let workers: Vec<Arc<dyn Worker>> = vec![
-            Arc::new(
-                BasicWorkerBuilder::new("http://w1:8000")
-                    .worker_type(WorkerType::Regular)
-                    .build(),
-            ),
-            Arc::new(
-                BasicWorkerBuilder::new("http://w2:8000")
-                    .worker_type(WorkerType::Regular)
-                    .build(),
-            ),
-        ];
+        let workers = create_workers(&["http://w1:8000", "http://w2:8000"]);
 
         let mut counts = HashMap::new();
         for _ in 0..100 {
+            let headers = headers_with_routing_key("");
             let info = SelectWorkerInfo {
-                routing_id: Some(""),
+                headers: Some(&headers),
                 ..Default::default()
             };
             let (result, branch) = policy.select_worker_impl(&workers, &info);
@@ -391,34 +414,24 @@ mod tests {
     #[test]
     fn test_manual_remaps_when_worker_becomes_unhealthy() {
         let policy = ManualPolicy::new();
-        let workers: Vec<Arc<dyn Worker>> = vec![
-            Arc::new(
-                BasicWorkerBuilder::new("http://w1:8000")
-                    .worker_type(WorkerType::Regular)
-                    .build(),
-            ),
-            Arc::new(
-                BasicWorkerBuilder::new("http://w2:8000")
-                    .worker_type(WorkerType::Regular)
-                    .build(),
-            ),
-        ];
+        let workers = create_workers(&["http://w1:8000", "http://w2:8000"]);
 
+        let headers = headers_with_routing_key("sticky-user");
         let info = SelectWorkerInfo {
-            routing_id: Some("sticky-user"),
+            headers: Some(&headers),
             ..Default::default()
         };
 
         let (first_result, branch) = policy.select_worker_impl(&workers, &info);
         let first_idx = first_result.unwrap();
-        assert_eq!(branch, ExecutionBranch::SlowPathVacant);
+        assert_eq!(branch, ExecutionBranch::Vacant);
 
         workers[first_idx].set_healthy(false);
 
         let (new_result, branch) = policy.select_worker_impl(&workers, &info);
         let new_idx = new_result.unwrap();
         assert_ne!(new_idx, first_idx, "Should remap to healthy worker");
-        assert_eq!(branch, ExecutionBranch::SlowPathOccupiedMiss);
+        assert_eq!(branch, ExecutionBranch::OccupiedMiss);
 
         for _ in 0..10 {
             let (result, branch) = policy.select_worker_impl(&workers, &info);
@@ -427,7 +440,7 @@ mod tests {
                 Some(new_idx),
                 "Should consistently route to new worker"
             );
-            assert_eq!(branch, ExecutionBranch::FastPathHit);
+            assert_eq!(branch, ExecutionBranch::OccupiedHit);
         }
     }
 
@@ -435,8 +448,9 @@ mod tests {
     fn test_manual_empty_workers() {
         let policy = ManualPolicy::new();
         let workers: Vec<Arc<dyn Worker>> = vec![];
+        let headers = headers_with_routing_key("test");
         let info = SelectWorkerInfo {
-            routing_id: Some("test"),
+            headers: Some(&headers),
             ..Default::default()
         };
         let (result, branch) = policy.select_worker_impl(&workers, &info);
@@ -447,59 +461,46 @@ mod tests {
     #[test]
     fn test_manual_single_worker() {
         let policy = ManualPolicy::new();
-        let workers: Vec<Arc<dyn Worker>> = vec![Arc::new(
-            BasicWorkerBuilder::new("http://w1:8000")
-                .worker_type(WorkerType::Regular)
-                .build(),
-        )];
+        let workers = create_workers(&["http://w1:8000"]);
 
+        let headers = headers_with_routing_key("single-test");
         let info = SelectWorkerInfo {
-            routing_id: Some("single-test"),
+            headers: Some(&headers),
             ..Default::default()
         };
 
         let (result, branch) = policy.select_worker_impl(&workers, &info);
         assert_eq!(result, Some(0));
-        assert_eq!(branch, ExecutionBranch::SlowPathVacant);
+        assert_eq!(branch, ExecutionBranch::Vacant);
 
         for _ in 0..10 {
             let (result, branch) = policy.select_worker_impl(&workers, &info);
             assert_eq!(result, Some(0));
-            assert_eq!(branch, ExecutionBranch::FastPathHit);
+            assert_eq!(branch, ExecutionBranch::OccupiedHit);
         }
     }
 
     #[test]
     fn test_manual_worker_recovery() {
         let policy = ManualPolicy::new();
-        let workers: Vec<Arc<dyn Worker>> = vec![
-            Arc::new(
-                BasicWorkerBuilder::new("http://w1:8000")
-                    .worker_type(WorkerType::Regular)
-                    .build(),
-            ),
-            Arc::new(
-                BasicWorkerBuilder::new("http://w2:8000")
-                    .worker_type(WorkerType::Regular)
-                    .build(),
-            ),
-        ];
+        let workers = create_workers(&["http://w1:8000", "http://w2:8000"]);
 
+        let headers = headers_with_routing_key("recovery-test");
         let info = SelectWorkerInfo {
-            routing_id: Some("recovery-test"),
+            headers: Some(&headers),
             ..Default::default()
         };
 
         let (first_result, branch) = policy.select_worker_impl(&workers, &info);
         let first_idx = first_result.unwrap();
-        assert_eq!(branch, ExecutionBranch::SlowPathVacant);
+        assert_eq!(branch, ExecutionBranch::Vacant);
 
         workers[first_idx].set_healthy(false);
 
         let (second_result, branch) = policy.select_worker_impl(&workers, &info);
         let second_idx = second_result.unwrap();
         assert_ne!(second_idx, first_idx);
-        assert_eq!(branch, ExecutionBranch::SlowPathOccupiedMiss);
+        assert_eq!(branch, ExecutionBranch::OccupiedMiss);
 
         workers[first_idx].set_healthy(true);
 
@@ -509,45 +510,30 @@ mod tests {
             Some(first_idx),
             "Should return to original worker after recovery since it's first in candidate list"
         );
-        assert_eq!(branch, ExecutionBranch::FastPathHit);
+        assert_eq!(branch, ExecutionBranch::OccupiedHit);
     }
 
     #[test]
     fn test_manual_max_candidate_workers_eviction() {
         let policy = ManualPolicy::new();
-        let workers: Vec<Arc<dyn Worker>> = vec![
-            Arc::new(
-                BasicWorkerBuilder::new("http://w1:8000")
-                    .worker_type(WorkerType::Regular)
-                    .build(),
-            ),
-            Arc::new(
-                BasicWorkerBuilder::new("http://w2:8000")
-                    .worker_type(WorkerType::Regular)
-                    .build(),
-            ),
-            Arc::new(
-                BasicWorkerBuilder::new("http://w3:8000")
-                    .worker_type(WorkerType::Regular)
-                    .build(),
-            ),
-        ];
+        let workers = create_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
 
+        let headers = headers_with_routing_key("eviction-test");
         let info = SelectWorkerInfo {
-            routing_id: Some("eviction-test"),
+            headers: Some(&headers),
             ..Default::default()
         };
 
         let (first_result, branch) = policy.select_worker_impl(&workers, &info);
         let first_idx = first_result.unwrap();
-        assert_eq!(branch, ExecutionBranch::SlowPathVacant);
+        assert_eq!(branch, ExecutionBranch::Vacant);
 
         workers[first_idx].set_healthy(false);
 
         let (second_result, branch) = policy.select_worker_impl(&workers, &info);
         let second_idx = second_result.unwrap();
         assert_ne!(second_idx, first_idx);
-        assert_eq!(branch, ExecutionBranch::SlowPathOccupiedMiss);
+        assert_eq!(branch, ExecutionBranch::OccupiedMiss);
 
         workers[second_idx].set_healthy(false);
 
@@ -558,7 +544,7 @@ mod tests {
             Some(remaining_idx),
             "Should select the only remaining healthy worker"
         );
-        assert_eq!(branch, ExecutionBranch::SlowPathOccupiedMiss);
+        assert_eq!(branch, ExecutionBranch::OccupiedMiss);
 
         workers[first_idx].set_healthy(true);
 
@@ -568,125 +554,20 @@ mod tests {
             Some(first_idx),
             "First worker should be evicted from candidates due to MAX_CANDIDATE_WORKERS=2"
         );
-        assert_eq!(branch, ExecutionBranch::FastPathHit);
+        assert_eq!(branch, ExecutionBranch::OccupiedHit);
     }
 
     #[test]
-    fn test_manual_execution_branch_fast_path_hit() {
+    fn test_manual_policy_name() {
         let policy = ManualPolicy::new();
-        let workers: Vec<Arc<dyn Worker>> = vec![
-            Arc::new(
-                BasicWorkerBuilder::new("http://w1:8000")
-                    .worker_type(WorkerType::Regular)
-                    .build(),
-            ),
-            Arc::new(
-                BasicWorkerBuilder::new("http://w2:8000")
-                    .worker_type(WorkerType::Regular)
-                    .build(),
-            ),
-        ];
-
-        let info = SelectWorkerInfo {
-            routing_id: Some("fast-path-test"),
-            ..Default::default()
-        };
-
-        let _ = policy.select_worker_impl(&workers, &info);
-
-        let (result, branch) = policy.select_worker_impl(&workers, &info);
-        assert!(result.is_some());
-        assert_eq!(branch, ExecutionBranch::FastPathHit);
-    }
-
-    #[test]
-    fn test_manual_execution_branch_no_routing_id() {
-        let policy = ManualPolicy::new();
-        let workers: Vec<Arc<dyn Worker>> = vec![Arc::new(
-            BasicWorkerBuilder::new("http://w1:8000")
-                .worker_type(WorkerType::Regular)
-                .build(),
-        )];
-
-        let info = SelectWorkerInfo::default();
-        let (result, branch) = policy.select_worker_impl(&workers, &info);
-        assert!(result.is_some());
-        assert_eq!(branch, ExecutionBranch::NoRoutingId);
-    }
-
-    #[test]
-    fn test_manual_execution_branch_slow_path_occupied_miss() {
-        let policy = ManualPolicy::new();
-        let workers: Vec<Arc<dyn Worker>> = vec![
-            Arc::new(
-                BasicWorkerBuilder::new("http://w1:8000")
-                    .worker_type(WorkerType::Regular)
-                    .build(),
-            ),
-            Arc::new(
-                BasicWorkerBuilder::new("http://w2:8000")
-                    .worker_type(WorkerType::Regular)
-                    .build(),
-            ),
-        ];
-
-        let info = SelectWorkerInfo {
-            routing_id: Some("occupied-miss-test"),
-            ..Default::default()
-        };
-
-        let (first_result, branch) = policy.select_worker_impl(&workers, &info);
-        let first_idx = first_result.unwrap();
-        assert_eq!(branch, ExecutionBranch::SlowPathVacant);
-
-        workers[first_idx].set_healthy(false);
-
-        let (result, branch) = policy.select_worker_impl(&workers, &info);
-        assert!(result.is_some());
-        assert_eq!(branch, ExecutionBranch::SlowPathOccupiedMiss);
-    }
-
-    #[test]
-    fn test_manual_execution_branch_slow_path_occupied_hit() {
-        let policy = ManualPolicy::new();
-        let workers: Vec<Arc<dyn Worker>> = vec![
-            Arc::new(
-                BasicWorkerBuilder::new("http://w1:8000")
-                    .worker_type(WorkerType::Regular)
-                    .build(),
-            ),
-            Arc::new(
-                BasicWorkerBuilder::new("http://w2:8000")
-                    .worker_type(WorkerType::Regular)
-                    .build(),
-            ),
-        ];
-
-        let info = SelectWorkerInfo {
-            routing_id: Some("occupied-hit-test"),
-            ..Default::default()
-        };
-
-        let _ = policy.select_worker_impl(&workers, &info);
-
-        policy.routing_map.clear();
-
-        policy.routing_map.insert(
-            RoutingId::new("occupied-hit-test"),
-            RoutingInfo {
-                candi_worker_urls: vec!["http://w1:8000".to_string()],
-            },
-        );
-
-        let (result, branch) = policy.select_worker_impl(&workers, &info);
-        assert!(result.is_some());
-        assert_eq!(branch, ExecutionBranch::FastPathHit);
+        assert_eq!(policy.name(), "manual");
     }
 
     #[test]
     fn test_manual_routing_info_push_bounded() {
-        let mut info = RoutingInfo {
+        let mut info = Node {
             candi_worker_urls: vec!["http://w1:8000".to_string()],
+            last_access: Instant::now(),
         };
 
         info.push_bounded("http://w2:8000".to_string());
@@ -705,23 +586,7 @@ mod tests {
 
     #[test]
     fn test_manual_find_healthy_worker_priority() {
-        let workers: Vec<Arc<dyn Worker>> = vec![
-            Arc::new(
-                BasicWorkerBuilder::new("http://w1:8000")
-                    .worker_type(WorkerType::Regular)
-                    .build(),
-            ),
-            Arc::new(
-                BasicWorkerBuilder::new("http://w2:8000")
-                    .worker_type(WorkerType::Regular)
-                    .build(),
-            ),
-            Arc::new(
-                BasicWorkerBuilder::new("http://w3:8000")
-                    .worker_type(WorkerType::Regular)
-                    .build(),
-            ),
-        ];
+        let workers = create_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
 
         let urls = vec![
             "http://w1:8000".to_string(),
@@ -755,18 +620,7 @@ mod tests {
 
     #[test]
     fn test_manual_find_worker_index_by_url() {
-        let workers: Vec<Arc<dyn Worker>> = vec![
-            Arc::new(
-                BasicWorkerBuilder::new("http://w1:8000")
-                    .worker_type(WorkerType::Regular)
-                    .build(),
-            ),
-            Arc::new(
-                BasicWorkerBuilder::new("http://w2:8000")
-                    .worker_type(WorkerType::Regular)
-                    .build(),
-            ),
-        ];
+        let workers = create_workers(&["http://w1:8000", "http://w2:8000"]);
 
         assert_eq!(
             find_worker_index_by_url(&workers, "http://w1:8000"),
@@ -784,60 +638,80 @@ mod tests {
     }
 
     #[test]
-    fn test_manual_policy_name() {
-        let policy = ManualPolicy::new();
-        assert_eq!(policy.name(), "manual");
+    fn test_manual_config_default() {
+        let config = ManualConfig::default();
+        assert_eq!(config.eviction_interval_secs, 60);
+        assert_eq!(config.max_idle_secs, 4 * 3600);
     }
 
     #[test]
-    fn test_manual_policy_needs_routing_id() {
-        let policy = ManualPolicy::new();
-        assert!(policy.needs_routing_id());
+    fn test_manual_with_disabled_eviction() {
+        let config = ManualConfig {
+            eviction_interval_secs: 0,
+            max_idle_secs: 3600,
+        };
+        let policy = ManualPolicy::with_config(config);
+        assert!(policy._eviction_task.is_none());
     }
 
     #[test]
-    fn test_manual_all_workers_become_unhealthy_then_recover() {
+    fn test_manual_last_access_updates() {
         let policy = ManualPolicy::new();
-        let workers: Vec<Arc<dyn Worker>> = vec![
-            Arc::new(
-                BasicWorkerBuilder::new("http://w1:8000")
-                    .worker_type(WorkerType::Regular)
-                    .build(),
-            ),
-            Arc::new(
-                BasicWorkerBuilder::new("http://w2:8000")
-                    .worker_type(WorkerType::Regular)
-                    .build(),
-            ),
-        ];
-
+        let workers = create_workers(&["http://w1:8000", "http://w2:8000"]);
+        let headers = headers_with_routing_key("test-key");
         let info = SelectWorkerInfo {
-            routing_id: Some("all-unhealthy-test"),
+            headers: Some(&headers),
             ..Default::default()
         };
+        let routing_id = RoutingId::new("test-key");
 
-        let (first_result, branch) = policy.select_worker_impl(&workers, &info);
-        let first_idx = first_result.unwrap();
-        assert_eq!(branch, ExecutionBranch::SlowPathVacant);
-
-        workers[0].set_healthy(false);
-        workers[1].set_healthy(false);
-
+        // Vacant: first access
         let (result, branch) = policy.select_worker_impl(&workers, &info);
-        assert_eq!(
-            result, None,
-            "Should return None when all workers are unhealthy"
-        );
-        assert_eq!(branch, ExecutionBranch::NoHealthyWorkers);
+        assert_eq!(branch, ExecutionBranch::Vacant);
+        let first_idx = result.unwrap();
+        let access_after_vacant = policy.routing_map.get(&routing_id).unwrap().last_access;
+        assert!(access_after_vacant.elapsed().as_millis() < 100);
 
-        workers[first_idx].set_healthy(true);
+        std::thread::sleep(std::time::Duration::from_millis(10));
 
-        let (after_recovery, branch) = policy.select_worker_impl(&workers, &info);
-        assert_eq!(
-            after_recovery,
-            Some(first_idx),
-            "Should route to recovered worker in candidate list"
-        );
-        assert_eq!(branch, ExecutionBranch::FastPathHit);
+        // OccupiedHit: same worker still healthy
+        let (_, branch) = policy.select_worker_impl(&workers, &info);
+        assert_eq!(branch, ExecutionBranch::OccupiedHit);
+        let access_after_hit = policy.routing_map.get(&routing_id).unwrap().last_access;
+        assert!(access_after_hit > access_after_vacant);
+
+        std::thread::sleep(std::time::Duration::from_millis(10));
+
+        // OccupiedMiss: worker becomes unhealthy
+        workers[first_idx].set_healthy(false);
+        let (_, branch) = policy.select_worker_impl(&workers, &info);
+        assert_eq!(branch, ExecutionBranch::OccupiedMiss);
+        let access_after_miss = policy.routing_map.get(&routing_id).unwrap().last_access;
+        assert!(access_after_miss > access_after_hit);
+    }
+
+    #[test]
+    fn test_manual_ttl_eviction_logic() {
+        use std::time::Duration;
+
+        let config = ManualConfig {
+            eviction_interval_secs: 2,
+            max_idle_secs: 2,
+        };
+        let policy = ManualPolicy::with_config(config);
+        let workers = create_workers(&["http://w1:8000", "http://w2:8000"]);
+
+        let headers = headers_with_routing_key("key-0");
+        let info = SelectWorkerInfo {
+            headers: Some(&headers),
+            ..Default::default()
+        };
+        policy.select_worker_impl(&workers, &info);
+
+        assert_eq!(policy.routing_map.len(), 1);
+
+        std::thread::sleep(Duration::from_secs(4));
+
+        assert_eq!(policy.routing_map.len(), 0);
     }
 }

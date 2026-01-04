@@ -45,8 +45,8 @@ on:
         default: 'all'
 
 concurrency:
-  group: nightly-test-nvidia-${{ github.ref }}
-  cancel-in-progress: true
+  group: nightly-test-nvidia-${{ inputs.ref || github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'workflow_call' }}
 
 env:
   SGLANG_IS_IN_CI: true

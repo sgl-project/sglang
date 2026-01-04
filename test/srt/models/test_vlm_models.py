@@ -5,7 +5,10 @@ import unittest
 from types import SimpleNamespace
 
 from sglang.srt.utils import is_hip
-from sglang.test.kits.mmmu_vlm_kit import DEFAULT_MEM_FRACTION_STATIC, MMMUVLMTestBase
+from sglang.test.kits.mmmu_vlm_kit import (
+    DEFAULT_MEM_FRACTION_STATIC,
+    MMMUMultiModelTestBase,
+)
 from sglang.test.test_utils import is_in_ci
 
 _is_hip = is_hip()
@@ -20,7 +23,7 @@ else:
     ]
 
 
-class TestVLMModels(MMMUVLMTestBase):
+class TestVLMModels(MMMUMultiModelTestBase):
     def test_vlm_mmmu_benchmark(self):
         """Test VLM models against MMMU benchmark."""
         models_to_test = MODELS

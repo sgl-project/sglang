@@ -1,7 +1,7 @@
 // Integration test for Responses API
 
 use axum::http::StatusCode;
-use sgl_model_gateway::protocols::{
+use smg::protocols::{
     common::{GenerationRequest, ToolChoice, ToolChoiceValue, UsageInfo},
     responses::{
         ReasoningEffort, ResponseInput, ResponseReasoningParam, ResponseTool, ResponseToolType,
@@ -14,7 +14,7 @@ use common::{
     mock_mcp_server::MockMCPServer,
     mock_worker::{HealthStatus, MockWorker, MockWorkerConfig, WorkerType},
 };
-use sgl_model_gateway::{
+use smg::{
     config::RouterConfig,
     routers::{conversations, RouterFactory},
 };
@@ -105,7 +105,6 @@ async fn test_non_streaming_mcp_minimal_e2e_with_persistence() {
         min_p: 0.0,
         repetition_penalty: 1.0,
         conversation: None,
-        routing_id: None,
     };
 
     let resp = router
@@ -329,7 +328,6 @@ fn test_responses_request_creation() {
         min_p: 0.0,
         repetition_penalty: 1.0,
         conversation: None,
-        routing_id: None,
     };
 
     assert!(!request.is_stream());
@@ -374,7 +372,6 @@ fn test_responses_request_sglang_extensions() {
         min_p: 0.05,
         repetition_penalty: 1.1,
         conversation: None,
-        routing_id: None,
     };
 
     // Verify SGLang extensions are present
@@ -400,7 +397,7 @@ fn test_usage_conversion() {
         completion_tokens: 25,
         total_tokens: 40,
         reasoning_tokens: Some(8),
-        prompt_tokens_details: Some(sgl_model_gateway::protocols::common::PromptTokenUsageInfo {
+        prompt_tokens_details: Some(smg::protocols::common::PromptTokenUsageInfo {
             cached_tokens: 3,
         }),
     };
@@ -490,7 +487,6 @@ fn test_json_serialization() {
         min_p: 0.1,
         repetition_penalty: 1.2,
         conversation: None,
-        routing_id: None,
     };
 
     let json = serde_json::to_string(&request).expect("Serialization should work");
@@ -597,7 +593,6 @@ async fn test_multi_turn_loop_with_mcp() {
         min_p: 0.0,
         repetition_penalty: 1.0,
         conversation: None,
-        routing_id: None,
     };
 
     // Execute the request (this should trigger the multi-turn loop)
@@ -747,7 +742,6 @@ async fn test_max_tool_calls_limit() {
         min_p: 0.0,
         repetition_penalty: 1.0,
         conversation: None,
-        routing_id: None,
     };
 
     let response = router.route_responses(None, &req, None).await;
@@ -791,7 +785,7 @@ async fn test_max_tool_calls_limit() {
 async fn setup_streaming_mcp_test() -> (
     MockMCPServer,
     MockWorker,
-    Box<dyn sgl_model_gateway::routers::RouterTrait>,
+    Box<dyn smg::routers::RouterTrait>,
     tempfile::TempDir,
 ) {
     let mcp = MockMCPServer::start().await.expect("start mcp");
@@ -920,7 +914,6 @@ async fn test_streaming_with_mcp_tool_calls() {
         min_p: 0.0,
         repetition_penalty: 1.0,
         conversation: None,
-        routing_id: None,
     };
 
     let response = router.route_responses(None, &req, None).await;
@@ -1201,7 +1194,6 @@ async fn test_streaming_multi_turn_with_mcp() {
         min_p: 0.0,
         repetition_penalty: 1.0,
         conversation: None,
-        routing_id: None,
     };
 
     let response = router.route_responses(None, &req, None).await;

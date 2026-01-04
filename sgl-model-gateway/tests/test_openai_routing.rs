@@ -17,7 +17,7 @@ use axum::{
     Json, Router,
 };
 use serde_json::json;
-use sgl_model_gateway::{
+use smg::{
     config::{
         ConfigError, ConfigValidator, HistoryBackend, OracleConfig, RouterConfig, RoutingMode,
     },
@@ -89,7 +89,6 @@ fn create_minimal_completion_request() -> CompletionRequest {
         return_hidden_states: false,
         sampling_seed: None,
         other: serde_json::Map::new(),
-        routing_id: None,
     }
 }
 
@@ -580,14 +579,11 @@ async fn test_router_factory_openai_mode() {
         worker_urls: vec!["https://api.openai.com".to_string()],
     };
 
-    let router_config = RouterConfig::new(
-        routing_mode,
-        sgl_model_gateway::config::PolicyConfig::Random,
-    );
+    let router_config = RouterConfig::new(routing_mode, smg::config::PolicyConfig::Random);
 
     let app_context = common::create_test_context(router_config).await;
 
-    let router = sgl_model_gateway::routers::RouterFactory::create_router(&app_context).await;
+    let router = smg::routers::RouterFactory::create_router(&app_context).await;
     assert!(
         router.is_ok(),
         "Router factory should create OpenAI router successfully"
@@ -640,7 +636,6 @@ async fn test_unsupported_endpoints() {
         return_bytes: false,
         return_entropy: false,
         rid: None,
-        routing_id: None,
     };
 
     let response = router.route_generate(None, &generate_request, None).await;

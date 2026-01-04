@@ -30,6 +30,7 @@ class WanVideoArchConfig(DiTArchConfig):
             r"^blocks\.(\d+)\.attn1\.to_out\.0\.(.*)$": r"blocks.\1.to_out.\2",
             r"^blocks\.(\d+)\.attn1\.norm_q\.(.*)$": r"blocks.\1.norm_q.\2",
             r"^blocks\.(\d+)\.attn1\.norm_k\.(.*)$": r"blocks.\1.norm_k.\2",
+            r"^blocks\.(\d+)\.attn1\.attn_op\.local_attn\.proj_l\.(.*)$": r"blocks.\1.attn1.local_attn.proj_l.\2",
             r"^blocks\.(\d+)\.attn2\.to_out\.0\.(.*)$": r"blocks.\1.attn2.to_out.\2",
             r"^blocks\.(\d+)\.ffn\.net\.0\.proj\.(.*)$": r"blocks.\1.ffn.fc_in.\2",
             r"^blocks\.(\d+)\.ffn\.net\.2\.(.*)$": r"blocks.\1.ffn.fc_out.\2",
@@ -87,6 +88,8 @@ class WanVideoArchConfig(DiTArchConfig):
     )
     num_frames_per_block: int = 3
     sliding_window_num_frames: int = 21
+    attention_type: str = "original"
+    sla_topk: float = 0.1
 
     def __post_init__(self):
         super().__post_init__()

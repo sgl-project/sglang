@@ -6,9 +6,9 @@ import openai
 from sglang.srt.utils import kill_process_tree
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 from sglang.test.test_utils import (
-    DEFAULT_EAGLE_DRAFT_MODEL_FOR_TEST,
-    DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST,
+    DEFAULT_DRAFT_MODEL_EAGLE,
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
+    DEFAULT_TARGET_MODEL_EAGLE,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -259,10 +259,10 @@ class TestOpenAIServerWithEAGLEAndHiddenStatesEnabled(
 ):
     @classmethod
     def setUpClass(cls):
-        cls.model = DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST
+        cls.model = DEFAULT_TARGET_MODEL_EAGLE
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.api_key = "sk-123456"
-        cls.speculative_draft_model = DEFAULT_EAGLE_DRAFT_MODEL_FOR_TEST
+        cls.speculative_draft_model = DEFAULT_DRAFT_MODEL_EAGLE
         cls.speculative_algorithm = "EAGLE"
         cls.process = popen_launch_server(
             cls.model,
@@ -272,7 +272,7 @@ class TestOpenAIServerWithEAGLEAndHiddenStatesEnabled(
                 "--speculative-algorithm",
                 "EAGLE",
                 "--speculative-draft-model-path",
-                DEFAULT_EAGLE_DRAFT_MODEL_FOR_TEST,
+                DEFAULT_DRAFT_MODEL_EAGLE,
                 "--speculative-num-steps",
                 5,
                 "--speculative-eagle-topk",
@@ -289,7 +289,7 @@ class TestOpenAIServerWithEAGLEAndHiddenStatesEnabled(
             ],
         )
         cls.base_url += "/v1"
-        cls.tokenizer = get_tokenizer(DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST)
+        cls.tokenizer = get_tokenizer(DEFAULT_TARGET_MODEL_EAGLE)
         cls.return_hidden_states = [False, True]
         cls.use_list_input = [True, False]
         cls.parallel_sample_nums = [1]
