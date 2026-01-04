@@ -728,7 +728,15 @@ class SchedulerOutputProcessorMixin:
                         if logits is not None:
                             layer_entry["topk_logits"] = logits[i].cpu().tolist()[:req_top_k]
                         if logsumexp is not None:
-                            layer_entry["logsumexp_candidates"] = logsumexp[i].cpu().item()
+                            lse_val = logsumexp[i].cpu().item()
+                            layer_entry["logsumexp_candidates"] = lse_val
+                            # Compute topk_mass: fraction of attention captured by top-k
+                            # topk_mass = sum(exp(logit - logsumexp)) for each top-k entry
+                            if logits is not None:
+                                import math
+                                topk_logits_list = logits[i].cpu().tolist()[:req_top_k]
+                                topk_mass = sum(math.exp(l - lse_val) for l in topk_logits_list if l is not None)
+                                layer_entry["topk_mass"] = min(topk_mass, 1.0)  # Clamp to [0, 1]
                         layers_data[layer_id] = layer_entry
 
                     attention_info = {
@@ -749,9 +757,14 @@ class SchedulerOutputProcessorMixin:
                             logits_output.attention_topk_logits[i].cpu().tolist()[:req_top_k]
                         )
                     if logits_output.attention_logsumexp_candidates is not None:
-                        attention_info["logsumexp_candidates"] = (
-                            logits_output.attention_logsumexp_candidates[i].cpu().item()
-                        )
+                        lse_val = logits_output.attention_logsumexp_candidates[i].cpu().item()
+                        attention_info["logsumexp_candidates"] = lse_val
+                        # Compute topk_mass for top-level (backward compat)
+                        if logits_output.attention_topk_logits is not None:
+                            import math
+                            topk_logits_list = logits_output.attention_topk_logits[i].cpu().tolist()[:req_top_k]
+                            topk_mass = sum(math.exp(l - lse_val) for l in topk_logits_list if l is not None)
+                            attention_info["topk_mass"] = min(topk_mass, 1.0)
                 else:
                     # Single-layer capture (backward compatible format)
                     attention_info = {
@@ -769,9 +782,14 @@ class SchedulerOutputProcessorMixin:
                             logits_output.attention_topk_logits[i].cpu().tolist()[:req_top_k]
                         )
                     if logits_output.attention_logsumexp_candidates is not None:
-                        attention_info["logsumexp_candidates"] = (
-                            logits_output.attention_logsumexp_candidates[i].cpu().item()
-                        )
+                        lse_val = logits_output.attention_logsumexp_candidates[i].cpu().item()
+                        attention_info["logsumexp_candidates"] = lse_val
+                        # Compute topk_mass: fraction of attention captured by top-k
+                        if logits_output.attention_topk_logits is not None:
+                            import math
+                            topk_logits_list = logits_output.attention_topk_logits[i].cpu().tolist()[:req_top_k]
+                            topk_mass = sum(math.exp(l - lse_val) for l in topk_logits_list if l is not None)
+                            attention_info["topk_mass"] = min(topk_mass, 1.0)
 
                 # Add decode_step and think phase to the attention info
                 attention_info["decode_step"] = req.attention_tokens_decode_step
