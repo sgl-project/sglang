@@ -668,6 +668,15 @@ class HiRadixCache(RadixCache):
 
         return True
 
+    def terminate_prefetch(self, req_id: str):
+        if req_id not in self.ongoing_prefetch:
+            return
+
+        _, _, _, operation = self.ongoing_prefetch[req_id]
+        if operation.host_indices is None:
+            return
+        operation.mark_terminate()
+
     def match_prefix(self, key: RadixKey, **kwargs):
         empty_value = torch.empty((0,), dtype=torch.int64, device=self.device)
         key, _ = self.maybe_bigram_convert(key)
@@ -730,9 +739,17 @@ class HiRadixCache(RadixCache):
             self.evict_host(prefetch_length)
             host_indices = self.cache_controller.mem_pool_host.alloc(prefetch_length)
         if host_indices is None:
-            last_host_node.release_host()
-            # no sufficient host memory for prefetch
-            return
+            avaliable_size = self.cache_controller.mem_pool_host.available_size()
+            prefetch_length = avaliable_size - (avaliable_size % self.page_size)
+            if prefetch_length >= self.prefetch_threshold:
+                new_input_tokens = new_input_tokens[:prefetch_length]
+                host_indices = self.cache_controller.mem_pool_host.alloc(
+                    prefetch_length
+                )
+            else:
+                last_host_node.release_host()
+                # no sufficient host memory for prefetch
+                return
         operation = self.cache_controller.prefetch(
             req_id, host_indices, new_input_tokens, last_hash, prefix_keys
         )
