@@ -449,21 +449,37 @@ class SchedulerOutputProcessorMixin:
 
             # Process attention token info for interpretability
             # Schema matches frontend expectation: {token_positions, attention_scores, layer_id}
+            # Apply stride and max limits to avoid memory issues with long outputs
             if (
                 req.return_attention_tokens
                 and logits_output.attention_token_positions is not None
             ):
-                req.attention_tokens.append(
-                    {
-                        "token_positions": logits_output.attention_token_positions[i]
-                        .cpu()
-                        .tolist(),
-                        "attention_scores": logits_output.attention_token_scores[i]
-                        .cpu()
-                        .tolist(),
-                        "layer_id": getattr(logits_output, "attention_layer_id", -1),
-                    }
-                )
+                # Get stride and max settings from server args
+                stride = getattr(self.server_args, "attention_tokens_stride", 1)
+                max_tokens = getattr(self.server_args, "attention_tokens_max", 4096)
+
+                # Increment decode step counter
+                req.attention_tokens_decode_step += 1
+
+                # Apply stride: only record every Nth token
+                should_record = (stride <= 1) or (req.attention_tokens_decode_step % stride == 0)
+
+                # Apply max limit: stop recording if we've hit the cap
+                if max_tokens > 0 and len(req.attention_tokens) >= max_tokens:
+                    should_record = False
+
+                if should_record:
+                    req.attention_tokens.append(
+                        {
+                            "token_positions": logits_output.attention_token_positions[i]
+                            .cpu()
+                            .tolist(),
+                            "attention_scores": logits_output.attention_token_scores[i]
+                            .cpu()
+                            .tolist(),
+                            "layer_id": getattr(logits_output, "attention_layer_id", -1),
+                        }
+                    )
 
             if req.grammar is not None:
                 # FIXME: this try-except block is for handling unexpected xgrammar issue.
