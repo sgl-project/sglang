@@ -1643,7 +1643,7 @@ def unpatchify(x, patch_size):
     return x
 
 
-class AutoencoderKLWan(ParallelTiledVAE):
+class AutoencoderKLWan(nn.Module, ParallelTiledVAE):
     r"""
     A VAE model with KL loss for encoding videos into latents and decoding latent representations into videos.
     Introduced in [Wan 2.1].
