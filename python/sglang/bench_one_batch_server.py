@@ -393,6 +393,18 @@ def should_skip_due_to_token_capacity(
         return True
     return False
 
+def should_skip_due_to_max_running_requests(
+    batch_size, skip_max_running_requests_threshold
+):
+    if batch_size > skip_max_running_requests_threshold:
+        print(
+            "=" * 8
+            + f"Skip benchmark {batch_size=} > {skip_max_running_requests_threshold=} due to max running requests limit."
+            + "=" * 8
+        )
+        return True
+    return False
+
 
 def get_report_summary(
     results: List[BenchOneCaseResult], bench_args: BenchArgs, server_args: ServerArgs
@@ -478,12 +490,25 @@ def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
     skip_token_capacity_threshold = (
         internal_state[0].get("memory_usage", {}).get("token_capacity", 1000000000)
     )
+    # Get effective max running requests
+    max_running_requests_per_dp = internal_state[0].get(
+        "effective_max_running_requests_per_dp", -1
+    )
+    dp_size = server_info.get("dp_size", None) or 1
+    assert (
+        max_running_requests_per_dp > 0
+    ), f"effective_max_running_requests_per_dp is not set, {max_running_requests_per_dp=}"
+    skip_max_running_requests_threshold = max_running_requests_per_dp * dp_size
 
     # Warmup
     if not bench_args.skip_warmup:
         print("=" * 8 + " Warmup Begin " + "=" * 8)
         print(f"Warmup with batch_size={bench_args.batch_size}")
         for bs in bench_args.batch_size:
+            if should_skip_due_to_max_running_requests(
+                bs, skip_max_running_requests_threshold
+            ):
+                continue
             run_one_case(
                 base_url,
                 batch_size=bs,
@@ -509,6 +534,10 @@ def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
         for bs, il, ol in itertools.product(
             bench_args.batch_size, bench_args.input_len, bench_args.output_len
         ):
+            if should_skip_due_to_max_running_requests(
+                bs, skip_max_running_requests_threshold
+            ):
+                continue
             if should_skip_due_to_token_capacity(
                 bs, il, ol, skip_token_capacity_threshold
             ):
@@ -538,6 +567,10 @@ def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
                 for bs, il, ol in itertools.product(
                     bench_args.batch_size, bench_args.input_len, bench_args.output_len
                 ):
+                    if should_skip_due_to_max_running_requests(
+                        bs, skip_max_running_requests_threshold
+                    ):
+                        continue
                     if should_skip_due_to_token_capacity(
                         bs, il, ol, skip_token_capacity_threshold
                     ):
