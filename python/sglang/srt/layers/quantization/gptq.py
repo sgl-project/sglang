@@ -49,8 +49,13 @@ from sglang.srt.layers.quantization.utils import (
     replace_parameter,
     unpack_cols,
 )
-from sglang.srt.utils import is_cuda
+
 from sglang.srt.utils.patch_torch import register_fake_if_exists
+
+from sglang.srt.hardware_backend.npu.quantization.fused_moe_method_npu import (
+    npu_fused_experts,
+)
+from sglang.srt.utils import is_cuda, is_npu, set_weight_attrs
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
@@ -59,6 +64,10 @@ if TYPE_CHECKING:
     )
 
 _is_cuda = is_cuda()
+_is_npu = is_npu()
+
+if _is_npu:
+    import torch_npu
 
 if _is_cuda:
     from sgl_kernel import gptq_gemm, gptq_marlin_repack, gptq_shuffle
@@ -119,6 +128,7 @@ class GPTQConfig(QuantizationConfig):
         desc_act: bool,
         lm_head_quantized: bool,
         dynamic: Dict[str, Dict[str, Union[int, bool]]],
+        checkpoint_format: str = "",
     ) -> None:
         # GPTQModel use `dynamic` config property to allow per module
         # quantization config so each module can be individually optimized.
@@ -151,6 +161,7 @@ class GPTQConfig(QuantizationConfig):
         self.desc_act = desc_act
         self.lm_head_quantized = lm_head_quantized
         self.pack_factor = Fraction(32, self.weight_bits)
+        self.checkpoint_format = checkpoint_format
         if self.weight_bits not in [2, 3, 4, 8]:
             raise ValueError(
                 "Currently, only 2/3/4/8-bit weight quantization is "
@@ -163,7 +174,8 @@ class GPTQConfig(QuantizationConfig):
             f"group_size={self.group_size}, "
             f"desc_act={self.desc_act}),"
             f"lm_head_quantized={self.lm_head_quantized}), "
-            f"dynamic={self.dynamic}"
+            f"dynamic={self.dynamic},"
+            f"checkpoint_format={self.checkpoint_format})"
         )
 
     def get_scaled_act_names(self) -> List[str]:
@@ -179,12 +191,17 @@ class GPTQConfig(QuantizationConfig):
 
     @classmethod
     def get_supported_act_dtypes(cls) -> List[torch.dtype]:
-        return [torch.half]
+        return [torch.half] if not _is_npu else [torch.half, torch.bfloat16]
 
     @classmethod
     # Need to figure it out
     def get_min_capability(cls) -> int:
-        return 60
+        if _is_npu:
+            raise NotImplementedError(
+                'NPU hardware does not support "get_min_capability" feature.'
+            )
+        else:
+            return 60
 
     @classmethod
     def get_config_filenames(cls) -> List[str]:
@@ -199,13 +216,31 @@ class GPTQConfig(QuantizationConfig):
         group_size = cls.get_from_keys(config, ["group_size"])
         desc_act = cls.get_from_keys(config, ["desc_act"])
         lm_head_quantized = cls.get_from_keys_or(config, ["lm_head"], default=False)
-        return cls(weight_bits, group_size, desc_act, lm_head_quantized, dynamic)
+        checkpoint_format = cls.get_from_keys_or(
+            config, ["checkpoint_format"], default=""
+        )
+        return cls(
+            weight_bits,
+            group_size,
+            desc_act,
+            lm_head_quantized,
+            dynamic,
+            checkpoint_format,
+        )
 
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
     ) -> Optional[LinearMethodBase]:
         # Delay the import to avoid circular dependency
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+        from sglang.srt.layers.linear import LinearBase
+
+        if _is_npu:
+            if isinstance(layer, FusedMoE):
+                return GPTQMoEAscendMethod(self)
+            if isinstance(layer, LinearBase):
+                return GPTQLinearAscendMethod(self)
+            return None
 
         if isinstance(layer, FusedMoE):
             raise TypeError("GPTQ Method does not support MoE, please use gptq_marlin")
@@ -406,6 +441,7 @@ class GPTQLinearMethod(LinearMethodBase):
 
     def __init__(self, quant_config: GPTQConfig):
         self.quant_config = quant_config
+        self.use_v2_format = quant_config.checkpoint_format == "gptq_v2"
 
     def create_weights(
         self,
@@ -558,6 +594,366 @@ class GPTQLinearMethod(LinearMethodBase):
             output.add_(bias)
         return output.reshape(out_shape)
 
+def unpack_from_int32(
+    weight: torch.Tensor,
+    num_bits: int,
+    packed_dim: int = 1,
+) -> torch.Tensor:
+    """
+    Unpacks quantized weights from int32 format back to original bits.
+
+    :param weight: The packed int32 tensor containing quantized weights
+    :param num_bits: The number of bits used for quantization (<= 8)
+    :param packed_dim: Dimension along which weights are packed (0 or 1), defaults to 1
+    :return: Unpacked tensor with int8 dtype after applying offset correction
+    """
+    assert (
+        weight.dtype == torch.int32
+    ), f"Expecting `weight.dtype` is torch.int32 but got {weight.dtype}."
+    assert (
+        num_bits <= 8
+    ), f"Expecting `num_bits` should not be larger than 8 but got {num_bits}."
+    
+    pack_factor = 32 // num_bits
+    mask = (1 << num_bits) - 1
+
+    if packed_dim == 1:
+        unpacked_weight = torch.zeros(
+            (weight.shape[0], weight.shape[1] * pack_factor),
+            device=weight.device,
+            dtype=torch.int32,
+        )
+        for i in range(pack_factor):
+            unpacked_weight[:, i::pack_factor] = (weight >> (num_bits * i)) & mask
+    else:
+        unpacked_weight = torch.zeros(
+            (weight.shape[0] * pack_factor, weight.shape[1]),
+            device=weight.device,
+            dtype=torch.int32,
+        )
+        for i in range(pack_factor):
+            unpacked_weight[i::pack_factor, :] = (weight >> (num_bits * i)) & mask
+    offset = pow(2, num_bits) // 2
+    unpacked_weight = (unpacked_weight - offset).to(torch.int8)
+    return unpacked_weight
+
+class GPTQLinearAscendMethod(GPTQLinearMethod):
+    """Linear method for GPTQ on Ascend NPU."""
+
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        input_size_per_partition: int,
+        output_partition_sizes: list[int],
+        input_size: int,
+        output_size: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ):
+        super().create_weights(
+            layer,
+            input_size_per_partition,
+            output_partition_sizes,
+            input_size,
+            output_size,
+            params_dtype,
+            **extra_weight_attrs,
+        )
+        set_weight_attrs(layer.qzeros, {"pack_factor": self.quant_config.pack_factor})
+        set_weight_attrs(layer.qweight, {"pack_factor": self.quant_config.pack_factor})
+
+        if self.quant_config.desc_act:
+            raise ValueError(
+                "Currently, desc_act (True) is not supported by GPTQ quantization on npu."
+            )
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        layer.qzeros = torch.nn.Parameter(
+            unpack_from_int32(
+                layer.qzeros.data.contiguous(),
+                self.quant_config.weight_bits,
+                packed_dim=1,
+            ).to(layer.scales.dtype),
+            requires_grad=False,
+        )
+        if not self.use_v2_format:
+            layer.qzeros += 1
+
+        qweight_tmp = unpack_from_int32(
+            layer.qweight.data.contiguous(), self.quant_config.weight_bits, packed_dim=0
+        )
+        # use int8 to store weight by default
+        if self.quant_config.weight_bits != 4:
+            layer.qweight = torch.nn.Parameter(
+                qweight_tmp,
+                requires_grad=False,
+            )
+            return
+
+        # for 4bit case we need to pack 4bit weight to int32 to save memory
+        layer.qweight = torch.nn.Parameter(
+            torch_npu.npu_convert_weight_to_int4pack(qweight_tmp.to(torch.int32)),
+            requires_grad=False,
+        )
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        qweight = layer.qweight
+        scales = layer.scales
+        qzeros = layer.qzeros
+
+        reshaped_x = x.reshape(-1, x.shape[-1])
+
+        if bias is not None and bias.dtype == torch.bfloat16:
+            bias = bias.float()
+
+        # 4bit weight is packed to int32(8 x int4)
+        if self.quant_config.weight_bits == 4:
+            out_shape = x.shape[:-1] + (qweight.shape[-1] * 8,)
+        else:
+            out_shape = x.shape[:-1] + (qweight.shape[-1],)
+
+        out = torch_npu.npu_weight_quant_batchmatmul(
+            reshaped_x,
+            qweight,
+            antiquant_scale=scales,
+            antiquant_offset=qzeros,
+            antiquant_group_size=self.quant_config.group_size,
+            bias=bias,
+        )
+
+        return out.reshape(out_shape)
+
+class GPTQMoEAscendMethod(FusedMoEMethodBase):
+
+    def __init__(self, quant_config: GPTQConfig, use_v2_format: bool = True):
+        super().__init__()
+        self.quant_config = quant_config
+        self.use_v2_format = quant_config.checkpoint_format == "gptq_v2"
+        self.moe_runner_config: Optional[MoeRunnerConfig] = None
+
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        num_experts: int,
+        hidden_size: int,
+        intermediate_size_per_partition: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ):
+        from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
+
+        pack_factor = self.quant_config.pack_factor
+
+        num_groups_w13 = hidden_size // self.quant_config.group_size
+        num_groups_w2 = intermediate_size_per_partition // self.quant_config.group_size        
+
+        extra_weight_attrs.update(
+            {
+                "is_transposed": True,
+                "quant_method": FusedMoeWeightScaleSupported.GROUP.value,
+            }
+        )
+
+        w13_qweight = torch.nn.Parameter(
+            torch.empty(
+                num_experts,
+                hidden_size // pack_factor,
+                2 * intermediate_size_per_partition,
+                dtype=torch.int32,
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w13_qweight", w13_qweight)
+        set_weight_attrs(w13_qweight, extra_weight_attrs)
+
+        w2_qweight = torch.nn.Parameter(
+            torch.empty(
+                num_experts,
+                intermediate_size_per_partition // pack_factor,
+                hidden_size,
+                dtype=torch.int32,
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w2_qweight", w2_qweight)
+        set_weight_attrs(w2_qweight, extra_weight_attrs)
+
+        w13_scales = torch.nn.Parameter(
+            torch.empty(
+                num_experts,
+                num_groups_w13,
+                2 * intermediate_size_per_partition,
+                dtype=params_dtype,
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w13_scales", w13_scales)
+        set_weight_attrs(w13_scales, extra_weight_attrs)
+
+        w2_scales = torch.nn.Parameter(
+            torch.empty(
+                num_experts,
+                num_groups_w2,
+                hidden_size,
+                dtype=params_dtype,
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w2_scales", w2_scales)
+        set_weight_attrs(w2_scales, extra_weight_attrs)
+
+        w13_qzeros = torch.nn.Parameter(
+            torch.empty(
+                num_experts,
+                num_groups_w13,
+                2 * intermediate_size_per_partition // pack_factor,
+                dtype=torch.int32,
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w13_qzeros", w13_qzeros)
+        set_weight_attrs(w13_qzeros, extra_weight_attrs)
+
+        w2_qzeros = torch.nn.Parameter(
+            torch.empty(
+                num_experts,
+                num_groups_w2,
+                hidden_size // pack_factor,
+                dtype=torch.int32,
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w2_qzeros", w2_qzeros)
+        set_weight_attrs(w2_qzeros, extra_weight_attrs)
+
+    def create_moe_runner(
+        self,
+        layer: torch.nn.Module,
+        moe_runner_config: MoeRunnerConfig,
+        **extra_weight_attrs,
+    ):
+        self.moe_runner_config = moe_runner_config
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        w13_qzeros_2d = layer.w13_qzeros.data.contiguous().reshape(-1, layer.w13_qzeros.shape[-1])
+        layer.w13_qzeros = torch.nn.Parameter(
+            unpack_from_int32(
+                w13_qzeros_2d,
+                self.quant_config.weight_bits,
+                packed_dim=1,
+            ).reshape(layer.w13_qzeros.shape[0], layer.w13_qzeros.shape[1], -1).to(layer.w13_scales.dtype),
+            requires_grad=False,
+        )
+        if not self.use_v2_format:
+            layer.w13_qzeros += 1
+
+        w2_qzeros_2d = layer.w2_qzeros.data.contiguous().reshape(-1, layer.w2_qzeros.shape[-1])
+        layer.w2_qzeros = torch.nn.Parameter(
+            unpack_from_int32(
+                w2_qzeros_2d,
+                self.quant_config.weight_bits,
+                packed_dim=1,
+            ).reshape(layer.w2_qzeros.shape[0], layer.w2_qzeros.shape[1], -1).to(layer.w2_scales.dtype),
+            requires_grad=False,
+        )
+        if not self.use_v2_format:
+            layer.w2_qzeros += 1   
+
+        w13_qweight_2d = layer.w13_qweight.data.transpose(-1, -2).contiguous().reshape(-1, layer.w13_qweight.shape[-2])
+        w13_qweight_tmp = unpack_from_int32(
+            w13_qweight_2d, 
+            self.quant_config.weight_bits, 
+            packed_dim=1
+        )
+        # use int8 to store weight by default
+        if self.quant_config.weight_bits != 4:
+            layer.w13_qweight = torch.nn.Parameter(
+                w13_qweight_tmp.reshape(layer.w13_qweight.shape[0], layer.w13_qweight.shape[2], -1).transpose(-1, -2).contiguous(),
+                requires_grad=False,
+            )
+            return
+        
+        layer.w13_qweight = torch.nn.Parameter(
+            torch_npu.npu_convert_weight_to_int4pack(
+                w13_qweight_tmp.reshape(layer.w13_qweight.shape[0], layer.w13_qweight.shape[2], -1)
+                .transpose(-1, -2)
+                .contiguous()
+                .reshape(-1, layer.w13_qweight.shape[2])
+                .to(torch.int32))
+            .reshape(layer.w13_qweight.shape[0], layer.w13_qweight.shape[1] * 8, -1)
+            .contiguous(),
+            requires_grad=False,
+        )
+        
+        w2_qweight_2d = layer.w2_qweight.data.transpose(-1, -2).contiguous().reshape(-1, layer.w2_qweight.shape[-2])
+        w2_qweight_tmp = unpack_from_int32(
+            w2_qweight_2d, 
+            self.quant_config.weight_bits, 
+            packed_dim=1
+        )
+        # use int8 to store weight by default
+        if self.quant_config.weight_bits != 4:
+            layer.w2_qweight = torch.nn.Parameter(
+                w2_qweight_tmp.reshape(layer.w2_qweight.shape[0], layer.w2_qweight.shape[2], -1).transpose(-1, -2).contiguous(),
+                requires_grad=False,
+            )
+            return
+        
+        layer.w2_qweight = torch.nn.Parameter(
+            torch_npu.npu_convert_weight_to_int4pack(
+                w2_qweight_tmp.reshape(layer.w2_qweight.shape[0], layer.w2_qweight.shape[2], -1)
+                .transpose(-1, -2)
+                .contiguous()
+                .reshape(-1, layer.w2_qweight.shape[2])
+                .to(torch.int32))
+            .reshape(layer.w2_qweight.shape[0], layer.w2_qweight.shape[1] * 8, -1)
+            .contiguous(),
+            requires_grad=False,
+        )
+        
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        dispatch_output: StandardDispatchOutput,
+    ) -> torch.Tensor:
+        from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+
+        assert (
+            self.moe_runner_config is not None
+        ), "moe_runner_config is not set. Did you forget to call create_weights/create_moe_runner?"
+
+        assert self.moe_runner_config.activation in ("silu", "swiglu"), (
+            f"Only SiLU/Swiglu activation is supported, "
+            f"got {self.moe_runner_config.activation!r}."
+        )
+
+        x = dispatch_output.hidden_states
+        topk_output = dispatch_output.topk_output
+        topk_weights, topk_ids, _ = topk_output
+
+        topk_ids = topk_ids.to(torch.int32)
+        topk_weights = topk_weights.to(x.dtype)
+
+        output = npu_fused_experts(
+            hidden_states=x,
+            w13=layer.w13_qweight,
+            w13_scale=layer.w13_scales,
+            w13_offset=layer.w13_qzeros,
+            w2=layer.w2_qweight,
+            w2_scale=layer.w2_scales,
+            w2_offset=layer.w2_qzeros,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            top_k=topk_ids.shape[1],
+            use_wna16=True,
+        )
+
+        return StandardCombineInput(hidden_states=output)
 
 class GPTQMarlinLinearMethod(LinearMethodBase):
     """Linear method for GPTQ Marlin.
