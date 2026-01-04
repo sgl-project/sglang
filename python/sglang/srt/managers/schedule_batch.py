@@ -44,7 +44,7 @@ import time
 from enum import Enum, auto
 from http import HTTPStatus
 from itertools import chain
-from typing import TYPE_CHECKING, Any, List, Optional, Set, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple, Union
 
 import numpy as np
 import torch
@@ -488,6 +488,142 @@ class RequestStage(str, enum.Enum):
     DECODE_QUICK_FINISH = "quick_finish"
 
 
+class SemanticMemory:
+    """Memory structure for semantic routing and steering.
+
+    This class enables the "Semantic Discovery Routing Loop" where attention
+    analysis results can influence future decode steps. It provides:
+
+    1. Attention biases: Additive logit biases to steer attention toward/away
+       from specific token positions (applied before softmax)
+    2. Activation injections: Steering vectors to add to hidden states at
+       specific layers (for representation engineering)
+    3. Dynamic layer capture: Allow sidecar to request different layers
+       for the next decode step
+    4. Semantic anchors: Track important token positions identified by
+       the clustering sidecar
+
+    The memory persists across decode steps within a request, enabling
+    real-time feedback from the analysis sidecar to the model.
+    """
+
+    def __init__(self):
+        # Attention biases: layer_id -> {token_pos: bias_value}
+        # Applied as additive bias to attention logits before softmax
+        # Positive values increase attention, negative values decrease
+        self.attention_biases: Dict[int, Dict[int, float]] = {}
+
+        # Activation injections: layer_id -> steering vector tensor
+        # Added to hidden states at the specified layer
+        # Used for representation engineering / activation steering
+        self.activation_injections: Dict[int, torch.Tensor] = {}
+
+        # Dynamic layer capture: which layers to probe next step
+        # If set, overrides the request's default capture layers
+        # Allows sidecar to dynamically adjust based on observations
+        self.next_capture_layers: Optional[List[int]] = None
+
+        # Semantic anchors: token positions identified as important
+        # Maps position -> (label, importance_score)
+        # e.g., {42: ("system_constraint", 0.95), 128: ("entity_ref", 0.87)}
+        self.semantic_anchors: Dict[int, Tuple[str, float]] = {}
+
+        # Hub tokens: high-cardinality nodes from attention graph
+        # Updated by sidecar based on cross-layer consensus
+        self.hub_tokens: List[int] = []
+
+        # Manifold state: current cluster/zone classification
+        # Updated by sidecar after fingerprint analysis
+        self.manifold_zone: Optional[str] = None  # e.g., "semantic_bridge", "syntax_floor"
+        self.manifold_confidence: float = 0.0
+
+        # Steering history: track applied modifications for debugging
+        self.steering_history: List[Dict] = []
+
+    def add_attention_bias(self, layer_id: int, token_pos: int, bias: float):
+        """Add an attention bias for a specific layer and token position."""
+        if layer_id not in self.attention_biases:
+            self.attention_biases[layer_id] = {}
+        self.attention_biases[layer_id][token_pos] = bias
+        self.steering_history.append({
+            "type": "attention_bias",
+            "layer": layer_id,
+            "pos": token_pos,
+            "bias": bias,
+        })
+
+    def add_activation_injection(self, layer_id: int, vector: torch.Tensor):
+        """Add a steering vector to inject at a specific layer."""
+        self.activation_injections[layer_id] = vector
+        self.steering_history.append({
+            "type": "activation_injection",
+            "layer": layer_id,
+            "norm": vector.norm().item(),
+        })
+
+    def set_semantic_anchor(self, token_pos: int, label: str, importance: float):
+        """Mark a token position as a semantic anchor."""
+        self.semantic_anchors[token_pos] = (label, importance)
+
+    def update_from_sidecar(self, sidecar_response: Dict):
+        """Update memory state from sidecar analysis response.
+
+        Expected sidecar_response format:
+        {
+            "manifold_zone": "semantic_bridge",
+            "manifold_confidence": 0.92,
+            "hub_tokens": [42, 128, 256],
+            "suggested_biases": {layer_id: {pos: bias}},
+            "next_capture_layers": [8, 16, 24],
+            "anchors": {pos: (label, score)},
+        }
+        """
+        if "manifold_zone" in sidecar_response:
+            self.manifold_zone = sidecar_response["manifold_zone"]
+        if "manifold_confidence" in sidecar_response:
+            self.manifold_confidence = sidecar_response["manifold_confidence"]
+        if "hub_tokens" in sidecar_response:
+            self.hub_tokens = sidecar_response["hub_tokens"]
+        if "next_capture_layers" in sidecar_response:
+            self.next_capture_layers = sidecar_response["next_capture_layers"]
+        if "suggested_biases" in sidecar_response:
+            for layer_id, pos_biases in sidecar_response["suggested_biases"].items():
+                for pos, bias in pos_biases.items():
+                    self.add_attention_bias(int(layer_id), int(pos), float(bias))
+        if "anchors" in sidecar_response:
+            for pos, (label, score) in sidecar_response["anchors"].items():
+                self.set_semantic_anchor(int(pos), label, float(score))
+
+    def get_layer_biases(self, layer_id: int) -> Dict[int, float]:
+        """Get attention biases for a specific layer."""
+        return self.attention_biases.get(layer_id, {})
+
+    def get_layer_injection(self, layer_id: int) -> Optional[torch.Tensor]:
+        """Get activation injection vector for a specific layer."""
+        return self.activation_injections.get(layer_id)
+
+    def clear_steering(self):
+        """Clear all steering modifications (biases and injections)."""
+        self.attention_biases.clear()
+        self.activation_injections.clear()
+        self.next_capture_layers = None
+
+    def to_dict(self) -> Dict:
+        """Serialize memory state for debugging/logging."""
+        return {
+            "attention_biases": self.attention_biases,
+            "activation_injections": {
+                k: v.shape for k, v in self.activation_injections.items()
+            },
+            "next_capture_layers": self.next_capture_layers,
+            "semantic_anchors": self.semantic_anchors,
+            "hub_tokens": self.hub_tokens,
+            "manifold_zone": self.manifold_zone,
+            "manifold_confidence": self.manifold_confidence,
+            "steering_history_len": len(self.steering_history),
+        }
+
+
 class Req:
     """The input and output status of a request."""
 
@@ -588,6 +724,9 @@ class Req:
         # Phase: "think" = inside <think>...</think>, "output" = after </think>
         self.attention_think_phase: str = "output"  # Current phase
         self.attention_think_boundary: int = -1  # Decode step when phase changed to "output"
+
+        # Semantic memory for routing loop feedback (steering, anchors, manifold state)
+        self.semantic_memory = SemanticMemory()
 
         # extra key for classifying the request (e.g. cache_salt)
         if lora_id is not None:
