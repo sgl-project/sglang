@@ -88,6 +88,8 @@ class HiCacheControllerDirect:
         page_size: int,
         tp_group: torch.distributed.ProcessGroup,
         storage_backend: str,
+        pp_rank: int = 0,
+        pp_size: int = 1,
         device_id: int = 0,
     ):
         self.mem_pool_device_allocator = token_to_kv_pool_allocator
@@ -116,12 +118,16 @@ class HiCacheControllerDirect:
             self.tp_size = get_tensor_model_parallel_world_size()
             self.dp_rank = 0
 
+        self.pp_rank = pp_rank
+        self.pp_size = pp_size
         # for MLA models, only one rank needs to backup the KV cache
         self.backup_skip = self.is_mla_model and self.tp_rank != 0
 
         self.storage_config = HiCacheStorageConfig(
             tp_rank=self.tp_rank,
             tp_size=self.tp_size,
+            pp_rank=self.pp_rank,
+            pp_size=self.pp_size,
             is_mla_model=self.is_mla_model,
             is_page_first_layout=False,
             model_name=None,

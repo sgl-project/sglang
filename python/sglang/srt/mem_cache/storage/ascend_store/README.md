@@ -121,9 +121,9 @@ python3 -m sglang.launch_server \
     --enable-hierarchical-cache-direct \
     --hicache-storage-backend memcache &
 
-# 3. launch decode sglang with --hicache-storage-backend=memcache# set local service config
+# 3. launch decode sglang with --enable-hierarchical-cache-direct, --disaggregation-decode-enable-offload-kvcache and --hicache-storage-backend=memcache
+# set local service config
 export MMC_LOCAL_CONFIG_PATH=/usr/local/memcache_hybrid/latest/config/mmc-local.conf
-export SGLANG_ENABLE_DECODE_DISTRIBUTED_KV_POOL=1
 python3 -m sglang.launch_server \
     --model-path /data/Qwen3-32B \
     --host 127.0.0.1 \
@@ -141,6 +141,8 @@ python3 -m sglang.launch_server \
     --context-length 3800 \
     --chunked-prefill-size 57344 \
     --max-prefill-tokens 30400 \
+    --enable-hierarchical-cache-direct \
+    --disaggregation-decode-enable-offload-kvcache \
     --hicache-storage-backend memcache &
 ```
 
@@ -151,4 +153,4 @@ For more detailed introduction of configuration items, please refer to [MemCache
 2). LocalService is integrated into the tp worker process.
 LocalService communication supports certificate-based secure authentication.
 However, you can disable certificate verification by setting xxx.xxx.tls.enable to false to achieve better performance, which may be accompanied by security risks.<br>
-3). In disaggregation mode, the decode sglang instance can also be launched without memcache by removing `--hicache-storage-backend` and `unset SGLANG_ENABLE_DECODE_DISTRIBUTED_KV_POOL`
+3). In disaggregation mode, the decode sglang instance can also be launched without kvcache offloading by removing `--enable-hierarchical-cache-direct`, `--disaggregation-decode-enable-offload-kvcache` and `--hicache-storage-backend=memcache`

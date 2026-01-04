@@ -2234,7 +2234,9 @@ class ServerArgs:
 
             self.disable_radix_cache = True
             self.enable_hierarchical_cache = False
-            self.enable_hierarchical_cache_direct = False
+            if self.enable_hierarchical_cache_direct:
+                os.environ["SGLANG_ENABLE_DECODE_KVCACHE_OFFLOAD_DIRECT"] = "1"
+                self.enable_hierarchical_cache_direct = False
             logger.warning("KV cache is forced as chunk cache for decode server")
 
         elif self.disaggregation_mode == "prefill":

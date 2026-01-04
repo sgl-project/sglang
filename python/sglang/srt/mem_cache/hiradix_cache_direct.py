@@ -31,11 +31,15 @@ class HiRadixCacheDirect(RadixCache):
         self.enable_storage = True
         self.enable_storage_metrics = self.enable_storage and params.enable_metrics
         self.hicache_storage_pass_prefix_keys = False
+        self.pp_rank = params.pp_rank
+        self.pp_size = params.pp_size
         self.cache_controller = HiCacheControllerDirect(
             params.token_to_kv_pool_allocator,
             self.page_size,
             params.tp_cache_group,
             storage_backend=server_args.hicache_storage_backend,
+            pp_rank=self.pp_rank,
+            pp_size=self.pp_size,
             device_id=params.gpu_id,
         )
         if self.enable_storage_metrics:
