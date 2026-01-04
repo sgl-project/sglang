@@ -1062,6 +1062,10 @@ class Scheduler(
             # Receive requests
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
+
+            # Process sidecar feedback (non-blocking)
+            self._process_sidecar_feedback()
+
             if self._engine_paused:
                 continue
 
@@ -1098,6 +1102,10 @@ class Scheduler(
             # Receive requests
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
+
+            # Process sidecar feedback (non-blocking)
+            self._process_sidecar_feedback()
+
             if self._engine_paused:
                 continue
 

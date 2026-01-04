@@ -1581,3 +1581,130 @@ class SchedulerOutputProcessorMixin:
             self._fingerprint_publisher.send(message, flags=1)  # zmq.NOBLOCK
         except Exception:
             pass  # Silently drop on failure - don't block inference
+
+    # =========================================================================
+    # SIDECAR FEEDBACK CHANNEL (Routing Loop)
+    # =========================================================================
+
+    def _init_feedback_subscriber(self: "Scheduler"):
+        """
+        Initialize ZMQ subscriber for receiving feedback from sidecar.
+
+        Called lazily on first use. Listens on a separate port for sidecar responses.
+        The feedback URL is derived from sidecar URL by adding 1 to the port.
+        e.g., tcp://localhost:9001 -> tcp://localhost:9002
+        """
+        sidecar_url = getattr(self.server_args, "attention_sidecar_url", "")
+        if not sidecar_url:
+            self._feedback_subscriber = None
+            return
+
+        try:
+            import zmq
+
+            # Derive feedback port from sidecar URL (sidecar_port + 1)
+            # e.g., tcp://localhost:9001 -> tcp://localhost:9002
+            feedback_url = getattr(self.server_args, "attention_feedback_url", "")
+            if not feedback_url:
+                # Derive from sidecar URL
+                parts = sidecar_url.rsplit(":", 1)
+                if len(parts) == 2:
+                    try:
+                        port = int(parts[1])
+                        feedback_url = f"{parts[0]}:{port + 1}"
+                    except ValueError:
+                        logger.warning(f"Could not parse sidecar port from {sidecar_url}")
+                        self._feedback_subscriber = None
+                        return
+
+            # Reuse existing ZMQ context or create new one
+            if not hasattr(self, '_zmq_context') or self._zmq_context is None:
+                self._zmq_context = zmq.Context()
+
+            self._feedback_subscriber = self._zmq_context.socket(zmq.PULL)
+            self._feedback_subscriber.bind(feedback_url)
+            self._feedback_subscriber.setsockopt(zmq.RCVHWM, 1000)  # High water mark
+            logger.info(f"Listening for sidecar feedback on {feedback_url}")
+        except ImportError:
+            logger.warning("ZMQ not available, feedback channel disabled")
+            self._feedback_subscriber = None
+        except Exception as e:
+            logger.warning(f"Failed to initialize feedback subscriber: {e}")
+            self._feedback_subscriber = None
+
+    def _process_sidecar_feedback(self: "Scheduler"):
+        """
+        Non-blocking poll for sidecar feedback and update request semantic memory.
+
+        This should be called each scheduler iteration. Messages are processed
+        without blocking - if no feedback is available, returns immediately.
+
+        Expected feedback message format:
+        {
+            "request_id": "abc123",
+            "manifold_zone": "semantic_bridge",
+            "manifold_confidence": 0.92,
+            "hub_tokens": [42, 128, 256],
+            "next_capture_layers": [15, 16, 17],
+            "attention_biases": {"12": {"42": 0.3}},
+            "semantic_anchors": {"128": ["entity", 0.95]}
+        }
+        """
+        if not hasattr(self, '_feedback_subscriber'):
+            self._init_feedback_subscriber()
+
+        if self._feedback_subscriber is None:
+            return
+
+        import json
+
+        # Process all available feedback messages (non-blocking)
+        while True:
+            try:
+                message = self._feedback_subscriber.recv(flags=1)  # zmq.NOBLOCK
+                feedback = json.loads(message.decode())
+
+                request_id = feedback.get("request_id")
+                if not request_id:
+                    continue
+
+                # Find the request in running batch
+                req = self._find_request_by_id(request_id)
+                if req is None:
+                    continue
+
+                # Update semantic memory with sidecar response
+                semantic_memory = getattr(req, "semantic_memory", None)
+                if semantic_memory is not None:
+                    semantic_memory.update_from_sidecar(feedback)
+
+            except Exception:
+                # No more messages available or error - stop polling
+                break
+
+    def _find_request_by_id(self: "Scheduler", request_id: str):
+        """
+        Find a request by its ID across running and waiting batches.
+
+        Returns the Req object if found, None otherwise.
+        """
+        # Check running batch
+        if hasattr(self, 'running_batch') and self.running_batch is not None:
+            for req in self.running_batch.reqs:
+                if req.rid == request_id:
+                    return req
+
+        # Check current batch if different
+        if hasattr(self, 'cur_batch') and self.cur_batch is not None:
+            if self.cur_batch is not self.running_batch:
+                for req in self.cur_batch.reqs:
+                    if req.rid == request_id:
+                        return req
+
+        # Check waiting queue
+        if hasattr(self, 'waiting_queue'):
+            for req in self.waiting_queue:
+                if req.rid == request_id:
+                    return req
+
+        return None
