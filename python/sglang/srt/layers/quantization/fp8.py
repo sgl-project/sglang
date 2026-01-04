@@ -17,6 +17,8 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 from sglang.srt.layers.amx_utils import _amx_process_weight_after_loading
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
+from sglang.srt.layers.moe.cutlass_moe_params import CutlassMoEType
+from sglang.srt.layers.moe.moe_runner.cutlass import CutlassMoeQuantInfo
 from sglang.srt.layers.moe.moe_runner.deep_gemm import DeepGemmMoeQuantInfo
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
 from sglang.srt.layers.moe.utils import get_moe_runner_backend
@@ -1056,9 +1058,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     int4_rescale = (
                         layer.w13_weight_scale[expert_id][shard_id] / max_w13_scale_fp8
                     )
-                    layer.w13_weight_scale1[expert_id][
-                        start : start + shard_size
-                    ] *= int4_rescale
+                    layer.w13_weight_scale1[expert_id][start : start + shard_size] *= (
+                        int4_rescale
+                    )
                 start += shard_size
 
         layer.w13_weight_scale = torch.nn.Parameter(max_w13_scales, requires_grad=False)
@@ -1105,7 +1107,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
-
         from sglang.srt.layers import deep_gemm_wrapper
         from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 
@@ -1117,9 +1118,15 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake()
             ):
                 moe_runner_backend = MoeRunnerBackend.DEEP_GEMM
+            elif self.use_cutlass_fused_experts_fp8:
+                moe_runner_backend = MoeRunnerBackend.CUTLASS
             else:
                 moe_runner_backend = MoeRunnerBackend.TRITON
-        if moe_runner_backend.is_deep_gemm() or moe_runner_backend.is_triton():
+        if (
+            moe_runner_backend.is_deep_gemm()
+            or moe_runner_backend.is_cutlass()
+            or moe_runner_backend.is_triton()
+        ):
             self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
         else:
             # TODO(cwan): refactor other backends
@@ -1130,7 +1137,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         layer: torch.nn.Module,
         dispatch_output: DispatchOutput,
     ) -> CombineInput:
-
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
         x = dispatch_output.hidden_states
@@ -1173,43 +1179,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             if ret is not None:
                 return StandardCombineInput(hidden_states=ret)
 
-        if get_moe_runner_backend().is_cutlass():
-            from sglang.srt.layers.moe.cutlass_moe import cutlass_fused_experts_fp8
-
-            with use_symmetric_memory(
-                get_tp_group(), disabled=not is_allocation_symmetric()
-            ):
-                symm_output = torch.empty_like(x)
-
-            topk_weights, topk_ids, _ = dispatch_output.topk_output
-            output = cutlass_fused_experts_fp8(
-                x,
-                layer.w13_weight.transpose(1, 2),
-                layer.w2_weight.transpose(1, 2),
-                layer.w13_weight_scale_inv.transpose(1, 2),
-                layer.w2_weight_scale_inv.transpose(1, 2),
-                topk_weights,
-                topk_ids,
-                self.ab_strides1,
-                self.c_strides1,
-                self.ab_strides2,
-                self.c_strides2,
-                self.workspace,
-                self.a_ptr,
-                self.b_ptr,
-                self.out_ptr,
-                self.a_scales_ptr,
-                self.b_scales_ptr,
-                self.expert_offsets,
-                self.problem_sizes1,
-                self.problem_sizes2,
-                use_fp8_blockscale=True,
-                output=symm_output,
-            )
-            return StandardCombineInput(hidden_states=output)
-
         if self.runner.runner_backend.is_deep_gemm():
-
             w13_weight = layer.w13_weight
             w2_weight = layer.w2_weight
 
@@ -1244,6 +1214,28 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 w13_scale=w13_scale,
                 w2_scale=w2_scale,
                 block_shape=block_shape,
+            )
+
+        elif self.runner.runner_backend.is_cutlass():
+            quant_info = CutlassMoeQuantInfo(
+                moe_type=CutlassMoEType.BlockscaledFP8,
+                w13_weight=layer.w13_weight.transpose(1, 2),
+                w2_weight=layer.w2_weight.transpose(1, 2),
+                w13_scale=layer.w13_weight_scale_inv.transpose(1, 2),
+                w2_scale=layer.w2_weight_scale_inv.transpose(1, 2),
+                expert_offsets=self.expert_offsets,
+                problem_sizes1=self.problem_sizes1,
+                problem_sizes2=self.problem_sizes2,
+                ab_strides_13=self.ab_strides1,
+                ab_strides_2=self.ab_strides2,
+                c_strides_13=self.c_strides1,
+                c_strides_2=self.c_strides2,
+                workspace=self.workspace,
+                a_ptrs=self.a_ptr,
+                b_ptrs=self.b_ptr,
+                out_ptrs=self.out_ptr,
+                a_scales_ptrs=self.a_scales_ptr,
+                b_scales_ptrs=self.b_scales_ptr,
             )
         elif self.runner.runner_backend.is_triton():
             quant_info = TritonMoeQuantInfo(
@@ -1364,7 +1356,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         with use_symmetric_memory(
             get_tp_group(), disabled=not is_allocation_symmetric()
         ):
-
             if self.block_quant:
                 # FIXME: there is a bug in the trtllm_fp8_block_scale_moe.
                 # It ignored the `output`` argument. https://github.com/flashinfer-ai/flashinfer/blob/da01b1bd8f9f22aec8c0eea189ad54860b034947/flashinfer/fused_moe/core.py#L1323-L1325
