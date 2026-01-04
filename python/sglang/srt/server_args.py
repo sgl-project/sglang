@@ -611,6 +611,7 @@ class ServerArgs:
     attention_tokens_stride: int = 1  # Record every Nth token (1 = all)
     attention_tokens_window: int = 0  # Context window for capture (0 = all tokens)
     attention_capture_layers: str = "last"  # "last", "auto", or comma-separated layer indices
+    attention_capture_layer_id: Optional[int] = None  # Specific layer ID to capture (overrides attention_capture_layers)
     # Fingerprint mode: compute in-kernel histogram instead of exporting raw indices
     # Production mode - 64 bytes vs ~200KB per step, for high-throughput routing
     attention_fingerprint_mode: bool = False
@@ -4458,6 +4459,12 @@ class ServerArgs:
             type=str,
             default=ServerArgs.attention_capture_layers,
             help="Which layers to capture attention from. Options: 'last' (default, last layer only), 'auto' (automatically select ~4 layers spread across depth), or comma-separated layer indices like '0,10,20,30'. (default: last)",
+        )
+        parser.add_argument(
+            "--attention-capture-layer-id",
+            type=int,
+            default=ServerArgs.attention_capture_layer_id,
+            help="Specific layer ID to capture attention from. Overrides --attention-capture-layers. Use -1 for last layer. (default: None, use --attention-capture-layers)",
         )
         parser.add_argument(
             "--attention-fingerprint-mode",
