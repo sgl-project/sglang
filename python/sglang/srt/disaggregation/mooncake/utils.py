@@ -52,7 +52,7 @@ def init_mooncake_custom_mem_pool(
         try:
             if custom_mem_pool_type == "NVLINK":
                 from mooncake.allocator import NVLinkAllocator
-                mem_backend = NVLinkAllocator.detect_mem_bankend()
+                mem_backend = NVLinkAllocator.detect_mem_backend()
                 if mem_backend == MEMORY_BACKEND_USE_CUMEMCREATE:
                     logger.info("I support fabric mem, using NVLink memory pool")
                     allocator = NVLinkAllocator.get_allocator(device)
@@ -63,13 +63,9 @@ def init_mooncake_custom_mem_pool(
                     return True, custom_mem_pool, custom_mem_pool_type
                 elif  mem_backend == MEMORY_BACKEND_USE_CUDAMALLOC:
                     logger.info("Fabric memory not supported, falling back to default cudaMalloc")
-                    # 不使用任何自定义分配器 → 等价于使用 cudaMalloc
-                    # 直接返回 None，表示 fallback 到默认行为
-                    os.environ["MC_INTRANODE_NVLINK"] = "1"
-                    logger.info("set MC_INTRANODE_NVLINK env")
                     return False, None, None
                 else:
-                    logger.info("Memory Backend Unknown")
+                    logger.info("Memory Backend Unknown or UnSupported")
                     return False, None, None
 
             elif custom_mem_pool_type == "BAREX":
