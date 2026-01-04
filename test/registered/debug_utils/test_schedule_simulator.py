@@ -551,9 +551,9 @@ class TestCLI(CustomTestCase):
         result = self._run_cli(
             "--synth-gsp",
             "--synth-gsp-num-groups",
-            "2",
+            "1",
             "--synth-gsp-prompts-per-group",
-            "2",
+            "4",
             "--synth-gsp-system-prompt-len",
             "10",
             "--synth-gsp-question-len",
@@ -561,7 +561,7 @@ class TestCLI(CustomTestCase):
             "--synth-gsp-output-len",
             "2",
             "--synth-seed",
-            "123",
+            "42",
             "--num-gpus",
             "2",
             "--router",
@@ -573,6 +573,7 @@ class TestCLI(CustomTestCase):
         )
         self.assertEqual(result.returncode, 0, f"CLI failed: {result.stderr}")
         self.assertIn("R=4:", result.stdout)
+        self.assertIn("R=0:-", result.stdout)
 
     def test_cli_synthetic(self):
         result = self._run_cli(
