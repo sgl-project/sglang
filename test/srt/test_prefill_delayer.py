@@ -50,11 +50,11 @@ class TestPrefillDelayerThroughput(CustomTestCase):
             other_benchmark_args=dict(
                 num_prompts=800,
                 random_input_len=30000,
-                random_output_len=256,
+                random_output_len=500,
             ),
             other_launch_args=[
                 "--max-total-tokens",
-                "500000",
+                "200000",
                 "--mem-fraction-static",
                 "0.6",
             ],
