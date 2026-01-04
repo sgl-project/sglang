@@ -121,7 +121,10 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.mm_utils import init_mm_embedding_cache
 from sglang.srt.managers.overlap_utils import FutureMap
-from sglang.srt.managers.prefill_delayer import PrefillDelayer, PrefillDelayerSinglePassExecutor
+from sglang.srt.managers.prefill_delayer import (
+    PrefillDelayer,
+    PrefillDelayerSinglePassExecutor,
+)
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
     ModelWorkerBatch,
@@ -1917,9 +1920,13 @@ class Scheduler(
             if self.prefill_delayer
             else nullcontext()
         ) as prefill_delayer_single_pass:
-            return self._get_new_batch_prefill_raw(prefill_delayer_single_pass=prefill_delayer_single_pass)
+            return self._get_new_batch_prefill_raw(
+                prefill_delayer_single_pass=prefill_delayer_single_pass
+            )
 
-    def _get_new_batch_prefill_raw(self, prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor]) -> Optional[ScheduleBatch]:
+    def _get_new_batch_prefill_raw(
+        self, prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor]
+    ) -> Optional[ScheduleBatch]:
         # Check if the grammar is ready in the grammar queue
         if self.grammar_queue:
             self.move_ready_grammar_requests()
@@ -1928,7 +1935,9 @@ class Scheduler(
             # Reset batch_is_full to try preemption with a prefill adder.
             self.running_batch.batch_is_full = False
 
-        if (self.running_batch.batch_is_full or len(self.waiting_queue) == 0) and self.chunked_req is None:
+        if (
+            self.running_batch.batch_is_full or len(self.waiting_queue) == 0
+        ) and self.chunked_req is None:
             return None
 
         running_bs = len(self.running_batch.reqs)

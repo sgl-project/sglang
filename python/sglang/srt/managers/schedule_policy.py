@@ -618,7 +618,9 @@ class PrefillAdder:
             if input_tokens >= self.rem_input_tokens and len(self.can_run_list) != 0:
                 return AddReqResult.OTHER
 
-            if not self.prefill_delayer_single_pass.negotiate_should_allow_prefill(local_prefillable=True):
+            if not self.prefill_delayer_single_pass.negotiate_should_allow_prefill(
+                local_prefillable=True
+            ):
                 return AddReqResult.OTHER
 
             if self.rem_chunk_tokens is None or input_tokens <= self.rem_chunk_tokens:

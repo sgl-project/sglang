@@ -88,4 +88,6 @@ class PrefillDelayerSinglePassExecutor:
     def negotiate_should_allow_prefill(self, local_prefillable: bool) -> bool:
         assert not self._called
         self._called = True
-        return self._prefill_delayer._negotiate_should_allow_prefill(local_prefillable=local_prefillable)
+        return self._prefill_delayer._negotiate_should_allow_prefill(
+            local_prefillable=local_prefillable
+        )
