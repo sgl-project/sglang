@@ -469,3 +469,140 @@ def apply_qk_norm(
     q_out = q_norm(q.view(-1, head_dim)).view(q_shape)
     k_out = k_norm(k.view(-1, head_dim)).view(k_shape)
     return q_out, k_out
+
+
+# ========== New Fused RMSNorm Classes for ZImage ==========
+
+class FusedRMSNormAddRMSNorm(nn.Module):
+    """
+    Fused operation: RMSNorm(residual) + x -> output1, then RMSNorm(output1) -> output2
+    This fuses: x = x + self.attention_norm2(attn_out); self.ffn_norm1(x)
+
+    Note: This class does NOT create its own parameters. Weights are passed directly
+    to the forward method to avoid parameter registration issues during model loading.
+    """
+
+    def __init__(
+        self,
+        hidden_size: int,
+        eps: float = 1e-6,
+    ):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.eps = eps
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        residual: torch.Tensor,
+        weight1: Optional[torch.Tensor] = None,
+        weight2: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Args:
+            x: input tensor [batch_size, seq_len, hidden_size]
+            residual: residual tensor to normalize and add [batch_size, seq_len, hidden_size]
+            weight1: weight for first RMSNorm (optional)
+            weight2: weight for second RMSNorm (optional)
+
+        Returns:
+            output1: intermediate result (x + RMSNorm(residual)) [batch_size, seq_len, hidden_size]
+            output2: final result (RMSNorm(output1)) [batch_size, seq_len, hidden_size]
+        """
+        can_use_cuda = _is_cuda and (x.shape[-1] % 4 == 0)
+
+        if can_use_cuda:
+            from sglang.jit_kernel.diffusion.fused_rmsnorm_add_rmsnorm import (
+                fused_rmsnorm_add_rmsnorm,
+            )
+
+            B, L, C = x.shape
+            x_2d = x.contiguous().view(-1, C)
+            residual_2d = residual.contiguous().view(-1, C)
+
+            gamma1 = weight1.contiguous() if weight1 is not None else None
+            gamma2 = weight2.contiguous() if weight2 is not None else None
+
+            output1_2d, output2_2d = fused_rmsnorm_add_rmsnorm(
+                x_2d, residual_2d, gamma1, gamma2, self.eps
+            )
+
+            return output1_2d.view(B, L, C), output2_2d.view(B, L, C)
+        else:
+            # Fallback: sequential operations
+            # Step 1: RMSNorm(residual)
+            residual_normalized = self._rmsnorm(residual, weight1)
+            # Step 2: Add x
+            output1 = x + residual_normalized
+            # Step 3: RMSNorm(output1)
+            output2 = self._rmsnorm(output1, weight2)
+            return output1, output2
+
+    def _rmsnorm(self, x: torch.Tensor, weight: Optional[torch.Tensor]) -> torch.Tensor:
+        """Fallback RMSNorm implementation"""
+        variance = x.float().pow(2).mean(dim=-1, keepdim=True)
+        x_normalized = x * torch.rsqrt(variance + self.eps)
+        if weight is not None:
+            x_normalized = x_normalized * weight
+        return x_normalized.to(x.dtype)
+
+
+class FusedRMSNormAdd(nn.Module):
+    """
+    Fused operation: RMSNorm(residual) + x -> output
+    This fuses: x = x + self.ffn_norm2(ffn_out)
+
+    Note: This class does NOT create its own parameters. Weight is passed directly
+    to the forward method to avoid parameter registration issues during model loading.
+    """
+
+    def __init__(
+        self,
+        hidden_size: int,
+        eps: float = 1e-6,
+    ):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.eps = eps
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        residual: torch.Tensor,
+        weight: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Args:
+            x: input tensor [batch_size, seq_len, hidden_size]
+            residual: residual tensor to normalize and add [batch_size, seq_len, hidden_size]
+            weight: weight for RMSNorm (optional)
+
+        Returns:
+            output: result (x + RMSNorm(residual)) [batch_size, seq_len, hidden_size]
+        """
+        can_use_cuda = _is_cuda and (x.shape[-1] % 4 == 0)
+
+        if can_use_cuda:
+            from sglang.jit_kernel.diffusion.fused_rmsnorm_add import fused_rmsnorm_add
+
+            B, L, C = x.shape
+            x_2d = x.contiguous().view(-1, C)
+            residual_2d = residual.contiguous().view(-1, C)
+
+            gamma = weight.contiguous() if weight is not None else None
+
+            output_2d = fused_rmsnorm_add(x_2d, residual_2d, gamma, self.eps)
+
+            return output_2d.view(B, L, C)
+        else:
+            # Fallback: sequential operations
+            residual_normalized = self._rmsnorm(residual, weight)
+            return x + residual_normalized
+
+    def _rmsnorm(self, x: torch.Tensor, weight: Optional[torch.Tensor]) -> torch.Tensor:
+        """Fallback RMSNorm implementation"""
+        variance = x.float().pow(2).mean(dim=-1, keepdim=True)
+        x_normalized = x * torch.rsqrt(variance + self.eps)
+        if weight is not None:
+            x_normalized = x_normalized * weight
+        return x_normalized.to(x.dtype)
