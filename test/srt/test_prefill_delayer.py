@@ -58,7 +58,13 @@ class TestPrefillDelayerThroughput(CustomTestCase):
             ],
         )
 
-    def _run_throughput_test(self, debug_name: str, prefill_delayer: bool, other_launch_args, other_benchmark_args):
+    def _run_throughput_test(
+        self,
+        debug_name: str,
+        prefill_delayer: bool,
+        other_launch_args,
+        other_benchmark_args,
+    ):
         os.environ["SGLANG_PREFILL_DELAYER_DEBUG_LOG"] = "1"
 
         model = "Qwen/Qwen3-0.6B"
@@ -71,7 +77,7 @@ class TestPrefillDelayerThroughput(CustomTestCase):
                 model,
                 base_url,
                 timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-                other_args = [
+                other_args=[
                     "--trust-remote-code",
                     "--tp",
                     "8",
