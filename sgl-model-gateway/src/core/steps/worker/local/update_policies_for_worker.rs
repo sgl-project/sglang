@@ -35,7 +35,7 @@ impl StepExecutor for UpdatePoliciesForWorkerStep {
         );
 
         for model_id in &affected_models {
-            let workers = app_context.worker_registry.get_by_model_fast(model_id);
+            let workers = app_context.worker_registry.get_by_model(model_id);
 
             if let Some(policy) = app_context.policy_registry.get_policy(model_id) {
                 if policy.name() == "cache_aware" && !workers.is_empty() {
