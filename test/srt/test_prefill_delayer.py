@@ -27,19 +27,14 @@ class TestPrefillDelayerThroughput(CustomTestCase):
             "--dp",
             "8",
             "--chunked-prefill-size",
-            "262144",
+            "131072",
             "--mem-fraction-static",
             "0.6",
         ]
 
-        # TODO further fix mem leak
         with envs.SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE.override(
             with_prefill_delayer
-        ), envs.SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES.override(
-            100
-        ), envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE.override(
-            False
-        ):
+        ), envs.SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES.override(100):
             process = popen_launch_server(
                 model,
                 base_url,
@@ -52,6 +47,7 @@ class TestPrefillDelayerThroughput(CustomTestCase):
                 base_url=base_url,
                 dataset_name="random",
                 num_prompts=500,
+                # trigger chunked prefill
                 random_input_len=30000,
                 random_output_len=256,
                 request_rate=32,
