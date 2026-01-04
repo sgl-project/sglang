@@ -17,7 +17,6 @@ click [Service Arguments](https://docs.sglang.io/advanced_features/server_argume
 | `--skip-tokenizer-init`                | `False`  | bool flag (set to enable)             | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | `--load-format`                        | `auto`   | `auto`, `safetensors`                 | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | `--model-loader-` <br/> `extra-config` | {}       | Type: str                             | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| `--model-loader-` <br/> `extra-config` | {}       | Type: str                             | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | `--trust-remote-code`                  | `False`  | bool flag (set to enable)             | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | `--context-length`                     | `None`   | Type: int                             | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | `--is-embedding`                       | `False`  | bool flag (set to enable)             | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
@@ -66,7 +65,6 @@ click [Service Arguments](https://docs.sglang.io/advanced_features/server_argume
 | `--chunked-prefill-size`                            | `None`   | Type: int                      | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | `--max-prefill-tokens`                              | `16384`  | Type: int                      | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | `--schedule-policy`                                 | `fcfs`   | `lpm`, `fcfs`                  | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| `--schedule-policy`                                 | `fcfs`   | `lpm`, `fcfs`                  | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | `--enable-priority-`<br/>`scheduling`               | `False`  | bool flag<br/> (set to enable) | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | `--schedule-low-priority-`<br/>`values-first`       | `False`  | bool flag<br/> (set to enable) | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | `--priority-scheduling-`<br/>`preemption-threshold` | `10`     | Type: int                      | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
@@ -108,7 +106,7 @@ click [Service Arguments](https://docs.sglang.io/advanced_features/server_argume
 | `--log-level-http`                                 | `None`            | Type: str                      | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | `--log-requests`                                   | `False`           | bool flag<br/> (set to enable) | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | `--log-requests-level`                             | `2`               | `0`, `1`, `2`, `3`             | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| `--log-requests-format`                            | text              | text， json                     |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
+| `--log-requests-format`                            | text              | text, json                     |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
 | `--crash-dump-folder`                              | `None`            | Type: str                      |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
 | `--crash-on-nan`                                   | `False`           | Type: str                      |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
 | `--enable-metrics`                                 | `False`           | bool flag<br/> (set to enable) |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
@@ -454,14 +452,14 @@ click [Service Arguments](https://docs.sglang.io/advanced_features/server_argume
 
 ## For Multi-Modal
 
-| Argument                                      | Defaults | Options           | A2                                        | A3                                       |
-|-----------------------------------------------|----------|-------------------|-------------------------------------------|------------------------------------------|
-| `--mm-max-concurrent-calls`                   |          |                   | **<span style="color: red;">×</span>**    | **<span style="color: red;">×</span>**   |
-| `-mm-per-request-timeout`                     |          |                   | **<span style="color: red;">×</span>**    | **<span style="color: red;">×</span>**   |
-| `--enable-broadcast-mm-`<br/>`inputs-process` |          |                   | **<span style="color: red;">×</span>**    | **<span style="color: red;">×</span>**   |
-| `--mm-process-config`                         |          |                   | **<span style="color: red;">×</span>**    | **<span style="color: red;">×</span>**   |
-| `--mm-enable-dp-encoder`                      |          |                   | **<span style="color: red;">×</span>**    | **<span style="color: red;">×</span>**   |
-| `--limit-mm-data-per-requestr`                | `None`   | Type: JSON / Dict | **<span style="color: green;">√</span>*** | **<span style="color: green;">√</span>** |
+| Argument                                      | Defaults | Options           | A2                                       | A3                                       |
+|-----------------------------------------------|----------|-------------------|------------------------------------------|------------------------------------------|
+| `--mm-max-concurrent-calls`                   |          |                   | **<span style="color: red;">×</span>**   | **<span style="color: red;">×</span>**   |
+| `--mm-per-request-timeout`                    |          |                   | **<span style="color: red;">×</span>**   | **<span style="color: red;">×</span>**   |
+| `--enable-broadcast-mm-`<br/>`inputs-process` |          |                   | **<span style="color: red;">×</span>**   | **<span style="color: red;">×</span>**   |
+| `--mm-process-config`                         |          |                   | **<span style="color: red;">×</span>**   | **<span style="color: red;">×</span>**   |
+| `--mm-enable-dp-encoder`                      |          |                   | **<span style="color: red;">×</span>**   | **<span style="color: red;">×</span>**   |
+| `--limit-mm-data-per-request`                 | `None`   | Type: JSON / Dict | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 
 ## For checkpoint decryption
 
