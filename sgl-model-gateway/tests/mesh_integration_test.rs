@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use sgl_model_gateway::mesh::{
+use smg::mesh::{
     crdt::SKey,
     gossip::NodeStatus,
     stores::{
