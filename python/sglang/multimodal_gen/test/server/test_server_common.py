@@ -513,6 +513,60 @@ Consider updating perf_baselines.json with the snippets below:
             "[LoRA Switch E2E] All dynamic switch E2E tests passed for %s", case.id
         )
 
+    def _test_v1_models_endpoint(
+        self, ctx: ServerContext, case: DiffusionTestCase
+    ) -> None:
+        """
+        Test /v1/models endpoint returns OpenAI-compatible response.
+        This endpoint is required for sgl-model-gateway router compatibility.
+        """
+        base_url = f"http://localhost:{ctx.port}"
+
+        # Test GET /v1/models
+        logger.info("[Models API] Testing GET /v1/models for %s", case.id)
+        resp = requests.get(f"{base_url}/v1/models")
+        assert resp.status_code == 200, f"/v1/models failed: {resp.text}"
+
+        data = resp.json()
+        assert (
+            data["object"] == "list"
+        ), f"Expected object='list', got {data.get('object')}"
+        assert len(data["data"]) >= 1, "Expected at least one model in response"
+
+        model = data["data"][0]
+        assert "id" in model, "Model missing 'id' field"
+        assert (
+            model["object"] == "model"
+        ), f"Expected object='model', got {model.get('object')}"
+        assert (
+            model["id"] == case.server_args.model_path
+        ), f"Model ID mismatch: expected {case.server_args.model_path}, got {model['id']}"
+        logger.info("[Models API] GET /v1/models returned valid response")
+
+        # Test GET /v1/models/{model_path}
+        model_path = model["id"]
+        logger.info("[Models API] Testing GET /v1/models/%s", model_path)
+        resp = requests.get(f"{base_url}/v1/models/{model_path}")
+        assert resp.status_code == 200, f"/v1/models/{model_path} failed: {resp.text}"
+
+        single_model = resp.json()
+        assert single_model["id"] == model_path, "Single model ID mismatch"
+        assert single_model["object"] == "model", "Single model object type mismatch"
+        logger.info("[Models API] GET /v1/models/{model_path} returned valid response")
+
+        # Test GET /v1/models/{non_existent_model} returns 404
+        logger.info("[Models API] Testing GET /v1/models/non_existent_model")
+        resp = requests.get(f"{base_url}/v1/models/non_existent_model")
+        assert resp.status_code == 404, f"Expected 404, got {resp.status_code}"
+        error_data = resp.json()
+        assert "error" in error_data, "404 response missing 'error' field"
+        assert (
+            error_data["error"]["code"] == "model_not_found"
+        ), f"Incorrect error code: {error_data['error'].get('code')}"
+        logger.info("[Models API] GET /v1/models/non_existent returns 404 as expected")
+
+        logger.info("[Models API] All /v1/models tests passed for %s", case.id)
+
     def test_diffusion_perf(
         self,
         case: DiffusionTestCase,
@@ -538,6 +592,9 @@ Consider updating perf_baselines.json with the snippets below:
         )
 
         self._validate_and_record(case, perf_record)
+
+        # Test /v1/models endpoint for router compatibility
+        self._test_v1_models_endpoint(diffusion_server, case)
 
         # LoRA API functionality test with E2E validation (only for LoRA-enabled cases)
         if case.server_args.lora_path:

@@ -1,6 +1,7 @@
 from typing import Any, Optional
 
 from fastapi import APIRouter, Body, HTTPException
+from fastapi.responses import ORJSONResponse
 
 from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     MergeLoraWeightsReq,
@@ -11,6 +12,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBa
 from sglang.multimodal_gen.runtime.scheduler_client import async_scheduler_client
 from sglang.multimodal_gen.runtime.server_args import get_global_server_args
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.srt.entrypoints.openai.protocol import ModelCard, ModelList
 
 router = APIRouter(prefix="/v1")
 logger = init_logger(__name__)
@@ -117,3 +119,46 @@ async def model_info():
         "model_path": server_args.model_path,
     }
     return result
+
+
+@router.get("/models", response_class=ORJSONResponse)
+async def available_models():
+    """Show available models. OpenAI-compatible endpoint."""
+    server_args = get_global_server_args()
+    if not server_args:
+        raise HTTPException(status_code=500, detail="Server args not initialized")
+
+    model_cards = [
+        ModelCard(
+            id=server_args.model_path,
+            root=server_args.model_path,
+        )
+    ]
+
+    return ModelList(data=model_cards)
+
+
+@router.get("/models/{model:path}", response_class=ORJSONResponse)
+async def retrieve_model(model: str):
+    """Retrieve a model instance. OpenAI-compatible endpoint."""
+    server_args = get_global_server_args()
+    if not server_args:
+        raise HTTPException(status_code=500, detail="Server args not initialized")
+
+    if model != server_args.model_path:
+        return ORJSONResponse(
+            status_code=404,
+            content={
+                "error": {
+                    "message": f"The model '{model}' does not exist",
+                    "type": "invalid_request_error",
+                    "param": "model",
+                    "code": "model_not_found",
+                }
+            },
+        )
+
+    return ModelCard(
+        id=model,
+        root=model,
+    )
