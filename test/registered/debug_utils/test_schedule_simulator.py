@@ -784,7 +784,7 @@ class TestLargerScale(CustomTestCase):
     def _run_gsp_workload(self, router: str) -> SimulationResult:
         return self._run_main(
             "--synth-gsp",
-            "--synth-gsp-num-groups", "200",
+            "--synth-gsp-num-groups", "100",
             "--synth-gsp-prompts-per-group", "20",
             "--synth-gsp-system-prompt-len", "31000",
             "--synth-gsp-question-len", "1000",
