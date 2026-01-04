@@ -26,12 +26,13 @@ class GPUState:
         return len(self.running_requests)
 
     def total_seq_len(self, extra_reqs: Optional[List[SimRequest]] = None) -> int:
-        seen = set()
+        seen_groups = set()
         total = 0
         for req in self.running_requests + (extra_reqs or []):
-            dup = req.group_id in seen
-            total += req.seq_len() - (req.prefix_len if dup else 0)
-            seen.add(req.group_id)
+            is_shared = req.group_id is not None and req.group_id in seen_groups
+            total += req.seq_len() - (req.prefix_len if is_shared else 0)
+            if req.group_id is not None:
+                seen_groups.add(req.group_id)
         return total
 
     def is_valid(self) -> bool:
