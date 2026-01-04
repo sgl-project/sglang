@@ -6,6 +6,7 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <dlpack/dlpack.h>
+#include <tvm/ffi/any.h>
 #include <tvm/ffi/container/tensor.h>
 
 #include <algorithm>
@@ -812,7 +813,7 @@ inline void launch_rotary(
 
   // Verify q first to establish device/dtype
   // q: [T, Hq, D]
-  TensorMatcher()
+  TensorMatcher({})
       .with_dtype<float, half, nv_bfloat16>(dtype)
       .with_device<kDLCUDA>(device)
       .verify(q);
@@ -827,7 +828,7 @@ inline void launch_rotary(
   // Verify cos/sin
   // cos: [T_cache, R]
   // sin: [T_cache, R]
-  TensorMatcher()
+  TensorMatcher({})
       .with_dtype<float, half, nv_bfloat16>(dtype)
       .with_device<kDLCUDA>(device)
       .verify(cos)
@@ -843,7 +844,7 @@ inline void launch_rotary(
   // Handle positions
   const int64_t* positions_ptr = nullptr;
   if (positions != nullptr) {
-    TensorMatcher()
+    TensorMatcher({})
         .with_dtype<int64_t>()
         .with_device<kDLCUDA>(device)
         .verify(*positions);
@@ -884,7 +885,7 @@ inline void launch_rotary(
   int hk = 0;
   if (k != nullptr) {
     // k: [T, Hk, D]
-    TensorMatcher()
+    TensorMatcher({})
         .with_dtype<float, half, nv_bfloat16>(dtype)
         .with_device<kDLCUDA>(device)
         .verify(*k);
@@ -985,9 +986,18 @@ struct RotaryEmbeddingCosSinKernel {
       const tvm::ffi::TensorView cos,
       const tvm::ffi::TensorView sin,
       const tvm::ffi::TensorView query,
-      const tvm::ffi::TensorView* positions,
+      const tvm::ffi::AnyView positions_any,
       int64_t head_size,
       bool interleaved) {
+    // Convert AnyView to TensorView pointer
+    const tvm::ffi::TensorView* positions = nullptr;
+    if (!positions_any.is_none()) {
+      auto positions_opt = positions_any.try_cast<tvm::ffi::TensorView>();
+      if (positions_opt.has_value()) {
+        positions = &positions_opt.value();
+      }
+    }
+    
     const auto dt = query.dtype();
     if (host::is_type<half>(dt)) {
       launch_rotary<ROT, half>(cos, sin, query, nullptr, positions, head_size, interleaved);
@@ -1005,9 +1015,18 @@ struct RotaryEmbeddingCosSinKernel {
       const tvm::ffi::TensorView sin,
       const tvm::ffi::TensorView query,
       const tvm::ffi::TensorView key,
-      const tvm::ffi::TensorView* positions,
+      const tvm::ffi::AnyView positions_any,
       int64_t head_size,
       bool interleaved) {
+    // Convert AnyView to TensorView pointer
+    const tvm::ffi::TensorView* positions = nullptr;
+    if (!positions_any.is_none()) {
+      auto positions_opt = positions_any.try_cast<tvm::ffi::TensorView>();
+      if (positions_opt.has_value()) {
+        positions = &positions_opt.value();
+      }
+    }
+    
     const auto dt = query.dtype();
     if (host::is_type<half>(dt)) {
       launch_rotary<ROT, half>(cos, sin, query, &key, positions, head_size, interleaved);
