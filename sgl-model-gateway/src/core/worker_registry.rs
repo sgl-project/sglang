@@ -17,7 +17,7 @@ use dashmap::DashMap;
 use uuid::Uuid;
 
 use crate::{
-    core::{ConnectionMode, RuntimeType, Worker, WorkerType},
+    core::{CircuitState, ConnectionMode, RuntimeType, Worker, WorkerType},
     observability::metrics::Metrics,
 };
 
@@ -356,12 +356,6 @@ impl WorkerRegistry {
             .unwrap_or_else(|| Arc::from(Self::EMPTY_WORKERS))
     }
 
-    /// Alias for get_by_model for backwards compatibility
-    #[inline]
-    pub fn get_by_model_fast(&self, model_id: &str) -> Arc<[Arc<dyn Worker>]> {
-        self.get_by_model(model_id)
-    }
-
     /// Get all workers by worker type
     pub fn get_by_type(&self, worker_type: &WorkerType) -> Vec<Arc<dyn Worker>> {
         self.type_workers
@@ -471,7 +465,7 @@ impl WorkerRegistry {
         // Start with the most efficient collection based on filters
         // Use model index when possible as it's O(1) lookup
         let workers: Vec<Arc<dyn Worker>> = if let Some(model) = model_id {
-            self.get_by_model_fast(model).to_vec()
+            self.get_by_model(model).to_vec()
         } else {
             self.get_all()
         };
@@ -526,6 +520,10 @@ impl WorkerRegistry {
         let mut regular_count = 0;
         let mut prefill_count = 0;
         let mut decode_count = 0;
+        let mut http_count = 0;
+        let mut grpc_count = 0;
+        let mut cb_open_count = 0;
+        let mut cb_half_open_count = 0;
 
         // Iterate DashMap directly to avoid cloning all workers via get_all()
         for entry in self.workers.iter() {
@@ -540,16 +538,32 @@ impl WorkerRegistry {
                 WorkerType::Prefill { .. } => prefill_count += 1,
                 WorkerType::Decode => decode_count += 1,
             }
+
+            match worker.connection_mode() {
+                ConnectionMode::Http => http_count += 1,
+                ConnectionMode::Grpc { .. } => grpc_count += 1,
+            }
+
+            match worker.circuit_breaker().state() {
+                CircuitState::Open => cb_open_count += 1,
+                CircuitState::HalfOpen => cb_half_open_count += 1,
+                CircuitState::Closed => {}
+            }
         }
 
         WorkerRegistryStats {
             total_workers,
             total_models,
             healthy_workers: healthy_count,
+            unhealthy_workers: total_workers.saturating_sub(healthy_count),
             total_load,
             regular_workers: regular_count,
             prefill_workers: prefill_count,
             decode_workers: decode_count,
+            http_workers: http_count,
+            grpc_workers: grpc_count,
+            circuit_breaker_open: cb_open_count,
+            circuit_breaker_half_open: cb_half_open_count,
         }
     }
 
@@ -631,13 +645,30 @@ impl Default for WorkerRegistry {
 /// Statistics for the worker registry
 #[derive(Debug, Clone)]
 pub struct WorkerRegistryStats {
+    /// Total number of registered workers
     pub total_workers: usize,
+    /// Number of unique models served
     pub total_models: usize,
+    /// Number of workers passing health checks
     pub healthy_workers: usize,
+    /// Number of workers failing health checks
+    pub unhealthy_workers: usize,
+    /// Sum of current load across all workers
     pub total_load: usize,
+    /// Number of regular (non-PD) workers
     pub regular_workers: usize,
+    /// Number of prefill workers (PD mode)
     pub prefill_workers: usize,
+    /// Number of decode workers (PD mode)
     pub decode_workers: usize,
+    /// Number of HTTP-connected workers
+    pub http_workers: usize,
+    /// Number of gRPC-connected workers
+    pub grpc_workers: usize,
+    /// Number of workers with circuit breaker in Open state (not accepting requests)
+    pub circuit_breaker_open: usize,
+    /// Number of workers with circuit breaker in HalfOpen state (testing recovery)
+    pub circuit_breaker_half_open: usize,
 }
 
 #[cfg(test)]
@@ -727,24 +758,21 @@ mod tests {
         registry.register(Arc::from(worker2));
         registry.register(Arc::from(worker3));
 
-        let llama_workers = registry.get_by_model_fast("llama-3");
+        let llama_workers = registry.get_by_model("llama-3");
         assert_eq!(llama_workers.len(), 2);
         let urls: Vec<String> = llama_workers.iter().map(|w| w.url().to_string()).collect();
         assert!(urls.contains(&"http://worker1:8080".to_string()));
         assert!(urls.contains(&"http://worker2:8080".to_string()));
 
-        let gpt_workers = registry.get_by_model_fast("gpt-4");
+        let gpt_workers = registry.get_by_model("gpt-4");
         assert_eq!(gpt_workers.len(), 1);
         assert_eq!(gpt_workers[0].url(), "http://worker3:8080");
 
-        let unknown_workers = registry.get_by_model_fast("unknown-model");
+        let unknown_workers = registry.get_by_model("unknown-model");
         assert_eq!(unknown_workers.len(), 0);
 
-        let llama_workers_slow = registry.get_by_model("llama-3");
-        assert_eq!(llama_workers.len(), llama_workers_slow.len());
-
         registry.remove_by_url("http://worker1:8080");
-        let llama_workers_after = registry.get_by_model_fast("llama-3");
+        let llama_workers_after = registry.get_by_model("llama-3");
         assert_eq!(llama_workers_after.len(), 1);
         assert_eq!(llama_workers_after[0].url(), "http://worker2:8080");
     }

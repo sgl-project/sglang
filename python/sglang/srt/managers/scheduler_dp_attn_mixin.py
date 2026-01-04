@@ -207,6 +207,27 @@ class SchedulerDPAttnMixin:
             offload_tags=self.offload_tags,
         )
 
+    def maybe_prepare_mlp_sync_batch_and_log_stats(
+        self: Scheduler,
+        batch: Optional[ScheduleBatch],
+        need_sync: Optional[bool] = None,
+        log_stats: bool = True,
+    ) -> Optional[ScheduleBatch]:
+        """
+        Helper to pair log_prefill_stats with log_prefill_stats_late.
+        Should be called after get_new_batch_prefill() to ensure proper pairing.
+
+        Args:
+            batch: The batch to process
+            need_sync: If specified, overrides self.require_mlp_sync for prepare_mlp_sync_batch decision
+            log_stats: Whether to call log_prefill_stats_late. Set to False for intermediate calls.
+        """
+        if need_sync if need_sync is not None else self.require_mlp_sync:
+            batch = self.prepare_mlp_sync_batch(batch)
+        if log_stats:
+            self.log_prefill_stats_late(batch)
+        return batch
+
     def get_idle_batch(self: Scheduler) -> ScheduleBatch:
         idle_batch = ScheduleBatch.init_new(
             [],
