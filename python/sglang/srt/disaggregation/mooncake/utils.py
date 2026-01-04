@@ -25,9 +25,6 @@ logger = logging.getLogger(__name__)
 
 # Global constants for custom memory pool types
 SUPPORTED_MOONCAKE_CUSTOM_MEM_POOL_TYPES = ["NVLINK", "BAREX"]
-MEMORY_BACKEND_USE_CUDAMALLOC  = 0
-MEMORY_BACKEND_USE_CUMEMCREATE = 1
-MEMORY_BACKEND_UNKNOWN         = -1
 
 
 def init_mooncake_custom_mem_pool(
@@ -52,8 +49,9 @@ def init_mooncake_custom_mem_pool(
         try:
             if custom_mem_pool_type == "NVLINK":
                 from mooncake.allocator import NVLinkAllocator
+                from mooncake.allocator import MemoryBackend
                 mem_backend = NVLinkAllocator.detect_mem_backend()
-                if mem_backend == MEMORY_BACKEND_USE_CUMEMCREATE:
+                if mem_backend == MemoryBackend.USE_CUMEMCREATE:
                     logger.info("I support fabric mem, using NVLink memory pool")
                     allocator = NVLinkAllocator.get_allocator(device)
                     custom_mem_pool = torch.cuda.MemPool(allocator.allocator())
@@ -61,7 +59,7 @@ def init_mooncake_custom_mem_pool(
                         f"Initialized NVLink memory pool on device {device}"
                     )
                     return True, custom_mem_pool, custom_mem_pool_type
-                elif  mem_backend == MEMORY_BACKEND_USE_CUDAMALLOC:
+                elif  mem_backend == MemoryBackend.USE_CUDAMALLOC:
                     logger.info("Fabric memory not supported, falling back to default cudaMalloc")
                     return False, None, None
                 else:
