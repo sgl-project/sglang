@@ -245,8 +245,10 @@ class SchedulerDPAttnMixin:
             batch = self.prepare_mlp_sync_batch(batch)
         if log_stats:
             self.log_prefill_stats_late(batch)
-        if batch is not None and hasattr(batch, "global_forward_mode"):
-            if self.recv_skipper is not None:
+        if self.recv_skipper is not None:
+            if batch is None or not hasattr(batch, "global_forward_mode"):
+                self.recv_skipper.update_counter_dp(None)
+            else:
                 self.recv_skipper.update_counter_dp(batch.global_forward_mode)
         return batch
 
