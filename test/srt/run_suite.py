@@ -355,6 +355,7 @@ suite_ascend = {
         TestFile("ascend/test_ascend_sampling_backend.py", 400),
         TestFile("ascend/test_ascend_tp1_bf16.py", 400),
         TestFile("ascend/test_ascend_compile_graph_tp1_bf16.py", 400),
+        TestFile("ascend/test_ascend_w4a4_quantization.py", 400),
         TestFile("ascend/test_ascend_w8a8_quantization.py", 400),
         TestFile("test_embed_interpolate_unittest.py", 400),
     ],
@@ -365,7 +366,6 @@ suite_ascend = {
         TestFile("ascend/test_ascend_tp2_fia_bf16.py", 400),
     ],
     "per-commit-4-npu-a2": [
-        TestFile("ascend/test_ascend_w4a4_quantization.py", 400),
         TestFile("ascend/test_ascend_mla_w8a8int8.py", 400),
         TestFile("ascend/test_ascend_hicache_mla.py", 400),
         TestFile("ascend/test_ascend_tp4_bf16.py", 400),

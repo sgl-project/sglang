@@ -21,10 +21,8 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-os.environ["SGLANG_USE_MODELSCOPE"] = "true"
-
 if "ASCEND_RT_VISIBLE_DEVICES" not in os.environ:
-    os.environ["ASCEND_RT_VISIBLE_DEVICES"] = "0,1,2,3"
+    os.environ["ASCEND_RT_VISIBLE_DEVICES"] = "0"
 DEFAULT_PORT_FOR_SRT_TEST_RUNNER = (
     7000 + int(os.environ.get("ASCEND_RT_VISIBLE_DEVICES", "0")[0]) * 100
 )
@@ -47,11 +45,11 @@ class TestAscendW4A4(CustomTestCase):
                 "--attention-backend",
                 "ascend",
                 "--tp-size",
-                "4",
+                "1",
                 "--mem-fraction-static",
                 "0.8",
                 "--cuda-graph-bs",
-                "64",
+                "16",
                 "--disable-radix-cache",
             ],
         )
@@ -68,7 +66,7 @@ class TestAscendW4A4(CustomTestCase):
             data_path=None,
             num_questions=1319,
             max_new_tokens=512,
-            parallel=64,
+            parallel=16,
             host=f"http://{url.hostname}",
             port=int(url.port),
         )
@@ -76,7 +74,7 @@ class TestAscendW4A4(CustomTestCase):
         print(metrics)
 
         self.assertGreaterEqual(metrics["accuracy"], 0.80)
-        self.assertGreaterEqual(metrics["output_throughput"], 700)
+        self.assertGreaterEqual(metrics["output_throughput"], 500)
 
     def run_decode(self, max_new_tokens):
         response = requests.post(
@@ -103,7 +101,7 @@ class TestAscendW4A4(CustomTestCase):
         print(f"Throughput: {throughput} tokens/s")
 
         if is_in_ci():
-            self.assertGreaterEqual(throughput, 25)
+            self.assertGreaterEqual(throughput, 15)
 
 
 if __name__ == "__main__":
