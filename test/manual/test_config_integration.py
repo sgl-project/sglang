@@ -2,20 +2,23 @@
 Test script to verify SGLang config file integration.
 """
 
+import argparse
 import os
 import tempfile
 
 import pytest
 import yaml
 
-from sglang.srt.server_args import prepare_server_args
+from sglang.srt.server_args import ServerArgs, prepare_server_args
 from sglang.srt.server_args_config_parser import ConfigArgumentMerger
 
 
 @pytest.fixture
 def merger():
     """Fixture providing a ConfigArgumentMerger instance."""
-    return ConfigArgumentMerger()
+    parser = argparse.ArgumentParser()
+    ServerArgs.add_cli_args(parser)
+    return ConfigArgumentMerger(parser)
 
 
 def test_server_args_config_parser(merger):
@@ -156,3 +159,7 @@ def test_error_handling():
             prepare_server_args(argv)
     finally:
         os.unlink(invalid_yaml_file)
+
+
+if __name__ == "__main__":
+    pytest.main([__file__])
