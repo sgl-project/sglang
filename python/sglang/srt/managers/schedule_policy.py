@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from sglang.srt.managers.prefill_delayer import PrefillDelayerSinglePassExecutor
+
 # Copyright 2023-2024 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -327,6 +329,7 @@ class PrefillAdder:
         mixed_with_decode_tokens: int = 0,
         priority_scheduling_preemption_threshold: int = 0,
         prefill_max_requests: Optional[int] = None,
+        prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor] = None,
     ):
         self.page_size = page_size
         self.tree_cache = tree_cache

@@ -1919,7 +1919,7 @@ class Scheduler(
         ) as prefill_delayer_single_pass:
             return self._get_new_batch_prefill_raw(prefill_delayer_single_pass=prefill_delayer_single_pass)
 
-    def _get_new_batch_prefill_raw(self, prefill_delayer_single_pass: PrefillDelayerSinglePassExecutor) -> Optional[ScheduleBatch]:
+    def _get_new_batch_prefill_raw(self, prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor]) -> Optional[ScheduleBatch]:
         # Check if the grammar is ready in the grammar queue
         if self.grammar_queue:
             self.move_ready_grammar_requests()
@@ -1977,6 +1977,7 @@ class Scheduler(
             running_bs if self.is_mixed_chunk else 0,
             self.priority_scheduling_preemption_threshold,
             prefill_max_requests=self.server_args.prefill_max_requests,
+            prefill_delayer_single_pass=prefill_delayer_single_pass,
         )
 
         if self.chunked_req is not None:
