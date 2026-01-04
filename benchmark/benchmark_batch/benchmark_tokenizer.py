@@ -21,9 +21,7 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer, trust_remote_code=True)
     max_batch_size = max(args.batch_sizes)
 
-    token_ids = generate_random_token_ids(
-        max_batch_size, args.num_tokens, tokenizer
-    )
+    token_ids = generate_random_token_ids(max_batch_size, args.num_tokens, tokenizer)
 
     if "encode" in args.function:
         prompts = [
