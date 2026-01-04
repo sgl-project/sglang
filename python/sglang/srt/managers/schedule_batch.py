@@ -1293,6 +1293,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # Metrics
     dp_cooperation_info: Optional[DPCooperationInfo] = None
 
+    # Attention token capture gating (compute-gated stride)
+    # These are set from server_args and used to skip GPU compute on non-probe steps
+    attention_tokens_stride: int = 1  # Only capture every Nth decode step
+    attention_tokens_max: int = 0     # Max tokens to capture (0 = unlimited)
+
     @classmethod
     def init_new(
         cls,
@@ -2133,21 +2138,44 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         )
 
         # Check if any request in the batch wants attention tokens (per-request gating)
-        capture_attention_tokens = any(
-            getattr(req, "return_attention_tokens", False) for req in self.reqs
-        )
-        attention_top_k = max(
-            (getattr(req, "top_k_attention", 5) for req in self.reqs if getattr(req, "return_attention_tokens", False)),
-            default=5,
-        )
-        # Get per-request layer override (use first request's value that specifies a layer)
+        # COMPUTE-GATED STRIDE: Only enable capture if at least one request needs it THIS step
+        # This skips GPU work entirely on non-probe steps (stride=8 means 7/8 steps skip compute)
+        capture_attention_tokens = False
+        attention_top_k = 5
         attention_capture_layer_id = None
+
+        stride = self.attention_tokens_stride
+        max_tokens = self.attention_tokens_max
+
         for req in self.reqs:
-            if getattr(req, "return_attention_tokens", False):
+            if not getattr(req, "return_attention_tokens", False):
+                continue
+
+            # Check if this request needs capture on its NEXT decode step
+            # (we pre-check here, step will be incremented in output processor)
+            next_step = req.attention_tokens_decode_step + 1
+
+            # Apply stride: only capture every Nth step
+            if stride > 1 and (next_step % stride != 0):
+                continue
+
+            # Apply max: stop if we've hit the cap
+            if max_tokens > 0 and len(req.attention_tokens) >= max_tokens:
+                continue
+
+            # This request needs capture this step - enable GPU compute
+            capture_attention_tokens = True
+
+            # Track the max top_k needed
+            req_top_k = getattr(req, "top_k_attention", 5)
+            if req_top_k > attention_top_k:
+                attention_top_k = req_top_k
+
+            # Get layer override from first request that specifies one
+            if attention_capture_layer_id is None:
                 layer_id = getattr(req, "attention_capture_layer_id", None)
                 if layer_id is not None:
                     attention_capture_layer_id = layer_id
-                    break
 
         return ModelWorkerBatch(
             forward_mode=self.forward_mode,

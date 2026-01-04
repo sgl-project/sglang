@@ -1799,7 +1799,13 @@ class Scheduler(
             # Run decode
             if not self.running_batch.is_empty():
                 self.running_batch = self.update_running_batch(self.running_batch)
-                ret = self.running_batch if not self.running_batch.is_empty() else None
+                if not self.running_batch.is_empty():
+                    # Ensure stride/max are set for compute-gated stride
+                    self.running_batch.attention_tokens_stride = self.server_args.attention_tokens_stride
+                    self.running_batch.attention_tokens_max = self.server_args.attention_tokens_max
+                    ret = self.running_batch
+                else:
+                    ret = None
             else:
                 ret = None
 
@@ -2020,6 +2026,10 @@ class Scheduler(
             chunked_req=self.chunked_req,
             dllm_config=self.dllm_config,
         )
+        # Set attention token capture gating parameters (compute-gated stride)
+        new_batch.attention_tokens_stride = self.server_args.attention_tokens_stride
+        new_batch.attention_tokens_max = self.server_args.attention_tokens_max
+
         if self.enable_hierarchical_cache:
             # todo (zhiqiang): disable cuda graph execution if hicache loading triggered
             new_batch.hicache_consumer_index = (

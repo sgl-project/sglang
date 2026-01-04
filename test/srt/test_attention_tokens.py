@@ -85,7 +85,8 @@ class TestAttentionTokens(CustomTestCase):
             self.assertIsInstance(token_info["token_positions"], list)
             self.assertIsInstance(token_info["attention_scores"], list)
             # Should have top_k entries (or fewer if sequence is shorter)
-            self.assertLessEqual(len(token_info["token_positions"]), 5)
+            # Default top_k_attention is 10 per the protocol
+            self.assertLessEqual(len(token_info["token_positions"]), 10)
 
     def test_completion_attention_tokens_disabled(self):
         """Test that attention_tokens is not returned when not requested."""
