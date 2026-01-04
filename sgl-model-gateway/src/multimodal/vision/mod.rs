@@ -15,7 +15,7 @@
 //! # Usage
 //!
 //! ```rust,ignore
-//! use sgl_model_gateway::multimodal::vision::{
+//! use smg::multimodal::vision::{
 //!     PreProcessorConfig,
 //!     processors::LlavaProcessor,
 //!     ImagePreProcessor,
