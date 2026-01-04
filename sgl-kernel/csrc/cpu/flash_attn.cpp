@@ -37,9 +37,6 @@
 #include "vec_pack.h"
 
 // [NOTE]: flash_attn_varlen_func for CPU
-//
-//   this one is the same as 2nd stage of `extend_attention`
-//
 
 namespace {
 
@@ -121,15 +118,13 @@ void flash_attn_varlen_kernel_impl(
     // s_i and s_delta: [BLOCK_M, BLOCK_N]
     float* __restrict__ s_i = reinterpret_cast<float*>((char*)(buffer) + tid * buffer_size_per_thread);
     float* __restrict__ s_delta = s_i;
+    scalar_t* __restrict__ s_delta2 = reinterpret_cast<scalar_t*>(s_i);
 
     // v_prime: [BLOCK_M, head_size_v]
     float* __restrict__ v_prime = s_i + BLOCK_M * BLOCK_N;
 
-    // s_delta2: [BLOCK_M, BLOCK_N]; copy of s_delta in scalar_t
-    scalar_t* __restrict__ s_delta2 = reinterpret_cast<scalar_t*>(v_prime + BLOCK_M * head_size_v);
-
     // Btmp: [BLOCK_N, max(head_size, head_size_v)]
-    scalar_t* __restrict__ Btmp = s_delta2 + BLOCK_M * BLOCK_N;
+    scalar_t* __restrict__ Btmp = reinterpret_cast<scalar_t*>(v_prime + BLOCK_M * head_size_v);
 
     // init Btmp just once for each thread to prevent NaN
     fill_stub(Btmp, 0.f, BLOCK_N * ldb_tmp);
@@ -265,7 +260,6 @@ inline int resize_buffer(at::Tensor& buffer, int num_threads, int head_size, int
   const int size_per_thread =
       /* s_i     */ BLOCK_M * BLOCK_N * sizeof(float) +
       /* v_prime */ BLOCK_M * head_size_v * sizeof(float) +
-      /* s_delta */ BLOCK_M * BLOCK_N * sizeof(uint16_t) +
       /* Btmp    */ BLOCK_N * std::max(head_size, head_size_v) * sizeof(uint16_t);
 
   buffer.resize_({num_threads, size_per_thread});
@@ -341,7 +335,7 @@ at::Tensor flash_attn_varlen_func(
   // check whether the batch has variant lengths
   const bool is_varlen =
       has_varlen_sequences<int32_t>(cu_seqlens_q, cu_seqlens_k, num_seqs, max_seqlen_q, max_seqlen_k);
-  std::cout << "### flash_attn_varlen_func: is_varlen: " << (is_varlen ? " true" : "false") << std::endl;
+  // std::cout << "### flash_attn_varlen_func: is_varlen: " << (is_varlen ? " true" : "false") << std::endl;
 
   int num_threads = at::get_num_threads();
   at::Tensor buffer = at::empty({}, q.options().dtype(at::kChar));
@@ -349,7 +343,7 @@ at::Tensor flash_attn_varlen_func(
   at::Tensor out = at::empty({num_tokens, num_heads, head_size_v}, q.options());
 
   // TODO: tune the block size
-  constexpr int BLOCK_M = 256;
+  constexpr int BLOCK_M = 512;
   constexpr int BLOCK_N = 768;
 
   AT_DISPATCH_REDUCED_FLOATING_TYPES(q.scalar_type(), "flash_attn_varlen_func", [&] {
