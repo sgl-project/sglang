@@ -611,6 +611,10 @@ class ServerArgs:
     attention_tokens_stride: int = 1  # Record every Nth token (1 = all)
     attention_tokens_window: int = 0  # Context window for capture (0 = all tokens)
     attention_capture_layers: str = "last"  # "last", "auto", or comma-separated layer indices
+    # Fingerprint mode: compute in-kernel histogram instead of exporting raw indices
+    # Production mode - 64 bytes vs ~200KB per step, for high-throughput routing
+    attention_fingerprint_mode: bool = False
+    attention_sidecar_url: str = ""  # ZMQ URL for fingerprint streaming (e.g., "tcp://localhost:9001")
 
     # PD disaggregation: can be "null" (not disaggregated), "prefill" (prefill-only), or "decode" (decode-only)
     disaggregation_mode: Literal["null", "prefill", "decode"] = "null"
@@ -4454,6 +4458,20 @@ class ServerArgs:
             type=str,
             default=ServerArgs.attention_capture_layers,
             help="Which layers to capture attention from. Options: 'last' (default, last layer only), 'auto' (automatically select ~4 layers spread across depth), or comma-separated layer indices like '0,10,20,30'. (default: last)",
+        )
+        parser.add_argument(
+            "--attention-fingerprint-mode",
+            action="store_true",
+            default=ServerArgs.attention_fingerprint_mode,
+            help="Enable fingerprint mode for attention capture. Computes in-kernel log-binned histogram "
+                 "instead of exporting raw indices. Production mode - 64 bytes vs ~200KB per step. (default: False)",
+        )
+        parser.add_argument(
+            "--attention-sidecar-url",
+            type=str,
+            default=ServerArgs.attention_sidecar_url,
+            help="ZMQ URL for streaming attention fingerprints to sidecar process for clustering. "
+                 "Example: 'tcp://localhost:9001'. Empty string disables streaming. (default: '')",
         )
 
         # PD disaggregation

@@ -448,12 +448,42 @@ class SchedulerOutputProcessorMixin:
                 )
 
             # Process attention token info for interpretability
-            # Schema matches frontend expectation: {token_positions, attention_scores, layer_id}
-            # Apply stride and max limits to avoid memory issues with long outputs
-            if (
+            # Two modes:
+            # 1. Debug Mode: Export raw indices/scores (for visualization)
+            # 2. Fingerprint Mode: Stream 20D feature vector to sidecar (production)
+            fingerprint_mode = getattr(self.server_args, "attention_fingerprint_mode", False)
+
+            if fingerprint_mode and logits_output.attention_fingerprint is not None:
+                # FINGERPRINT MODE: Stream compressed fingerprint to sidecar
+                # This is the production path - 64 bytes vs ~200KB per step
+                if req.return_attention_tokens:
+                    req.attention_tokens_decode_step += 1
+
+                    # Store fingerprint info (much smaller than raw indices)
+                    fingerprint_info = {
+                        "fingerprint": logits_output.attention_fingerprint[i].cpu().tolist(),
+                        "manifold": logits_output.attention_manifold[i] if logits_output.attention_manifold else "unknown",
+                        "step": req.attention_tokens_decode_step,
+                    }
+
+                    # Stream to sidecar if configured
+                    sidecar_url = getattr(self.server_args, "attention_sidecar_url", "")
+                    if sidecar_url and hasattr(self, '_fingerprint_publisher'):
+                        self._stream_fingerprint_to_sidecar(
+                            request_id=req.rid,
+                            fingerprint=fingerprint_info["fingerprint"],
+                            manifold=fingerprint_info["manifold"],
+                        )
+
+                    # Also store locally for API response (optional, for debugging)
+                    req.attention_tokens.append(fingerprint_info)
+
+            elif (
                 req.return_attention_tokens
                 and logits_output.attention_token_positions is not None
             ):
+                # DEBUG MODE: Export raw indices/scores
+                # WARNING: This is bandwidth-intensive, use fingerprint mode for production
                 # Get stride and max settings from server args
                 stride = getattr(self.server_args, "attention_tokens_stride", 1)
                 max_tokens = getattr(self.server_args, "attention_tokens_max", 4096)
@@ -1259,3 +1289,60 @@ class SchedulerOutputProcessorMixin:
                 retraction_counts=retraction_counts,
             )
         )
+
+    # =========================================================================
+    # ATTENTION FINGERPRINT STREAMING (Production Mode)
+    # =========================================================================
+
+    def _init_fingerprint_publisher(self: "Scheduler"):
+        """
+        Initialize ZMQ publisher for streaming fingerprints to sidecar.
+
+        Called lazily on first use if attention_sidecar_url is configured.
+        """
+        sidecar_url = getattr(self.server_args, "attention_sidecar_url", "")
+        if not sidecar_url:
+            return
+
+        try:
+            import zmq
+            self._zmq_context = zmq.Context()
+            self._fingerprint_publisher = self._zmq_context.socket(zmq.PUSH)
+            self._fingerprint_publisher.connect(sidecar_url)
+            self._fingerprint_publisher.setsockopt(zmq.SNDHWM, 1000)  # High water mark
+            logger.info(f"Connected fingerprint publisher to {sidecar_url}")
+        except ImportError:
+            logger.warning("ZMQ not available, fingerprint streaming disabled")
+            self._fingerprint_publisher = None
+        except Exception as e:
+            logger.warning(f"Failed to connect fingerprint publisher: {e}")
+            self._fingerprint_publisher = None
+
+    def _stream_fingerprint_to_sidecar(
+        self: "Scheduler",
+        request_id: str,
+        fingerprint: list,
+        manifold: str,
+    ):
+        """
+        Stream a single fingerprint to the sidecar for clustering.
+
+        This is non-blocking - fingerprints are dropped if sidecar is slow.
+        """
+        if not hasattr(self, '_fingerprint_publisher'):
+            self._init_fingerprint_publisher()
+
+        if self._fingerprint_publisher is None:
+            return
+
+        try:
+            import json
+            message = json.dumps({
+                "request_id": request_id,
+                "vector": fingerprint,
+                "manifold": manifold,
+            }).encode()
+            # Non-blocking send - drop if buffer full
+            self._fingerprint_publisher.send(message, flags=1)  # zmq.NOBLOCK
+        except Exception:
+            pass  # Silently drop on failure - don't block inference
