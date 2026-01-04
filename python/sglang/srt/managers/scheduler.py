@@ -741,8 +741,6 @@ class Scheduler(
         self.cur_batch: Optional[ScheduleBatch] = None
         # The last forward batch
         self.last_batch: Optional[ScheduleBatch] = None
-        # The last global forward mode for dp_attention mode (used by recv_skipper)
-        self.last_global_forward_mode: Optional[int] = None
         self.forward_ct = 0
         self.return_health_check_ct = 0
         self.num_retracted_reqs: int = 0
@@ -1235,9 +1233,7 @@ class Scheduler(
             last_forward_mode = (
                 self.last_batch.forward_mode if self.last_batch is not None else None
             )
-            if not self.recv_skipper.handle(
-                last_forward_mode, self.last_global_forward_mode
-            ):
+            if not self.recv_skipper.handle(last_forward_mode):
                 return []
 
         if self.pp_rank == 0:

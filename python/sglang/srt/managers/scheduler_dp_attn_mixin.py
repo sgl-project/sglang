@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable, Optional
 
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 import torch
 
 from sglang.srt.batch_overlap.two_batch_overlap import TboDPAttentionPreparer
@@ -100,6 +101,19 @@ def _update_gather_batch(
     # Check forward mode for cuda graph
     batch.can_run_dp_cuda_graph = mlp_sync_info.can_cuda_graph
 
+def _get_global_forward_mode(forward_modes):
+    forward_modes_excluding_idle = [
+        x for x in forward_modes if x != ForwardMode.IDLE.value
+    ]
+
+    if not forward_modes_excluding_idle:
+        return ForwardMode.IDLE
+
+    forward_mode_agree = all(value == forward_modes_excluding_idle[0] for value in forward_modes_excluding_idle)
+    global_forward_mode = (
+        ForwardMode(forward_modes_excluding_idle[0]) if forward_mode_agree else None
+    )
+    return global_forward_mode
 
 def prepare_mlp_sync_batch_raw(
     local_batch: ScheduleBatch,
@@ -175,12 +189,9 @@ def prepare_mlp_sync_batch_raw(
             )
         )
 
-        # Calculate global_forward_mode for recv_skipper even when tbo is not enabled
         if mlp_sync_info.global_forward_mode is None:
             forward_modes = mlp_sync_info.tp0_info[:, 5].tolist()
-            global_forward_mode, _ = (
-                TboDPAttentionPreparer._compute_global_forward_mode(forward_modes)
-            )
+            global_forward_mode = _get_global_forward_mode(forward_modes)
             mlp_sync_info.global_forward_mode = global_forward_mode
 
     need_idle_batch = skip_all_gather or max(mlp_sync_info.global_num_tokens) > 0
@@ -234,9 +245,9 @@ class SchedulerDPAttnMixin:
             batch = self.prepare_mlp_sync_batch(batch)
         if log_stats:
             self.log_prefill_stats_late(batch)
-        # Save global_forward_mode for recv_skipper in dp_attention mode
         if batch is not None and hasattr(batch, "global_forward_mode"):
-            self.last_global_forward_mode = batch.global_forward_mode
+            if self.recv_skipper is not None:
+                self.recv_skipper.update_counter_dp(batch.global_forward_mode)
         return batch
 
     def get_idle_batch(self: Scheduler) -> ScheduleBatch:
