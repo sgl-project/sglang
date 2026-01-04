@@ -21,7 +21,9 @@ except ImportError as e:
 
 
 try:
-    from flash_attn_interface import flash_attn_func as flash_attn_varlen_func_upstream
+    from flash_attn_interface import (
+        flash_attn_varlen_func as flash_attn_varlen_func_upstream,
+    )
 except Exception:
     flash_attn_varlen_func_upstream = None
 
@@ -206,6 +208,10 @@ class FlashAttentionImpl(AttentionImpl):
                 q_,
                 k_,
                 v_,
+                None,
+                None,
+                seqlen,
+                seqlen,
                 softmax_scale=self.softmax_scale,
                 causal=self.causal,
                 return_attn_probs=return_softmax_lse,
