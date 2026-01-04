@@ -11,7 +11,6 @@ from typing import Any
 
 import torch
 
-import sglang.multimodal_gen.envs as envs
 from sglang.multimodal_gen.runtime.platforms.interface import (
     AttentionBackendEnum,
     DeviceCapability,
@@ -93,11 +92,6 @@ class RocmPlatform(Platform):
         head_size: int,
         dtype: torch.dtype,
     ) -> str:
-        logger.info(
-            "Trying SGLANG_DIFFUSION_ATTENTION_BACKEND=%s",
-            envs.SGLANG_DIFFUSION_ATTENTION_BACKEND,
-        )
-
         if selected_backend == AttentionBackendEnum.TORCH_SDPA:
             logger.info("Using Torch SDPA backend.")
             return "sglang.multimodal_gen.runtime.layers.attention.backends.sdpa.SDPABackend"
