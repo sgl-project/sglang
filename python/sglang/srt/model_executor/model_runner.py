@@ -35,6 +35,7 @@ from sglang.srt.configs import (
     JetNemotronConfig,
     JetVLMConfig,
     KimiLinearConfig,
+    Lfm2Config,
     NemotronH_Nano_VL_V2_Config,
     NemotronHConfig,
     Qwen3NextConfig,
@@ -1476,7 +1477,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     @property
     def hybrid_gdn_config(self):
         config = self.model_config.hf_config
-        if isinstance(config, Qwen3NextConfig | JetNemotronConfig | JetVLMConfig):
+        if isinstance(
+            config, Qwen3NextConfig | JetNemotronConfig | JetVLMConfig | Lfm2Config
+        ):
             return config
         return None
 

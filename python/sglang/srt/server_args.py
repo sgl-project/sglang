@@ -1486,6 +1486,7 @@ class ServerArgs:
         elif model_arch in [
             "FalconH1ForCausalLM",
             "JetNemotronForCausalLM",
+            "Lfm2ForCausalLM",
             "JetVLMForConditionalGeneration",
         ]:
             assert (
