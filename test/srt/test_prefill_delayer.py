@@ -14,7 +14,7 @@ from sglang.test.test_utils import (
 
 
 class TestPrefillDelayerThroughput(CustomTestCase):
-    def _run_throughput_test(self, with_prefill_delayer: bool):
+    def _run_throughput_test(self, prefill_delayer: bool):
         os.environ["SGLANG_PREFILL_DELAYER_DEBUG_LOG"] = "1"
 
         model = "Qwen/Qwen3-0.6B"
@@ -33,7 +33,7 @@ class TestPrefillDelayerThroughput(CustomTestCase):
         ]
 
         with envs.SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE.override(
-            with_prefill_delayer
+            prefill_delayer
         ), envs.SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES.override(100):
             process = popen_launch_server(
                 model,
@@ -57,15 +57,15 @@ class TestPrefillDelayerThroughput(CustomTestCase):
         finally:
             kill_process_tree(process.pid)
 
-        print(f"=== {with_prefill_delayer=} ===")
+        print(f"=== {prefill_delayer=} ===")
         print(f"Input throughput: {res['input_throughput']:.2f} token/s")
         print(f"Output throughput: {res['output_throughput']:.2f} token/s")
 
-    def test_1_dp_attention_throughput_with_prefill_delayer(self):
-        self._run_throughput_test(with_prefill_delayer=True)
+    def test_1_online_serving_has_prefill_delayer(self):
+        self._run_throughput_test(prefill_delayer=True)
 
-    def test_2_dp_attention_throughput_without_prefill_delayer(self):
-        self._run_throughput_test(with_prefill_delayer=False)
+    def test_2_online_serving_no_prefill_delayer(self):
+        self._run_throughput_test(prefill_delayer=False)
 
 
 if __name__ == "__main__":
