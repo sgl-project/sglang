@@ -1,0 +1,79 @@
+name: 'e2e nightly test single_node (Ascend NPU)'
+
+on:
+  workflow_call:
+    inputs:
+      runner:
+        required: true
+        type: string
+      image:
+        required: false
+        type: string
+        description: image for pods
+        default: "swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:main-cann8.3.rc1-a3"
+      test_config_name:
+        required: true
+        type: string
+        description: test config name
+      test_case:
+        required: true
+        type: string
+        description: path of test case file
+
+concurrency:
+  group: ascend-nightly-singlenode-${{ github.workflow_ref }}-${{ github.ref }}--${{ inputs.test_config_name }}
+  cancel-in-progress: true
+
+jobs:
+  e2e:
+    name: ${{ inputs.test_config_name }}
+    runs-on: ${{ inputs.runner }}
+    container:
+      image: ${{ inputs.image }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Check npu info
+        run: |
+          npu-smi info
+
+      - name: Run test
+        timeout-minutes: 300
+        env:
+          SGLANG_USE_MODELSCOPE: true
+          SGLANG_IS_IN_CI: true
+          HF_ENDPOINT: https://hf-mirror.com
+        run: |
+          current_path=$(pwd)
+          test_case=${{ inputs.test_case }}
+
+          # prepare for output data
+          current_date=$(date +%Y%m%d)
+          commit_id=${{ github.sha }}
+          test_data_output_path=/data/.cache/tests/output/${current_date}
+          mkdir -p ${test_data_output_path}
+          echo "commit id: ${commit_id}" > ${test_data_output_path}/commit_id
+          tc_name=${test_case##*/}
+          tc_name=${tc_name%.*}
+          export METRICS_DATA_FILE=${test_data_output_path}/${tc_name}.txt
+          echo "Metrics file: ${METRICS_DATA_FILE}"
+
+          # speed up by using infra cache services
+          CACHING_URL="cache-service.nginx-pypi-cache.svc.cluster.local"
+          sed -Ei "s@(ports|archive).ubuntu.com@${CACHING_URL}:8081@g" /etc/apt/sources.list
+          pip config set global.index-url http://${CACHING_URL}/pypi/simple
+          pip config set global.extra-index-url "https://pypi.tuna.tsinghua.edu.cn/simple"
+          pip config set global.trusted-host "${CACHING_URL} pypi.tuna.tsinghua.edu.cn"
+
+          # copy required file from our daily cache
+          cp ~/.cache/modelscope/hub/datasets/otavia/ShareGPT_Vicuna_unfiltered/ShareGPT_V3_unfiltered_cleaned_split.json /tmp
+          # copy download through proxy
+          curl -o /tmp/test.jsonl -L https://gh-proxy.test.osinfra.cn/https://raw.githubusercontent.com/openai/grade-school-math/master/grade_school_math/data/test.jsonl
+
+          export PYTHONPATH=${current_path}/python:$PYTHONPATH
+          . /usr/local/Ascend/8.5.0/bisheng_toolkit/set_env.sh || true
+
+          echo "Running test case ${test_case}"
+          python3 -u ${test_case}
+          echo "Finished test case ${test_case}"
