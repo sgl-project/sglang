@@ -582,6 +582,10 @@ class Req:
         self.attention_sketch_mode = attention_sketch_mode
         self.attention_tokens: List[Dict] = []  # Per-token attention info
         self.attention_tokens_decode_step: int = 0  # Counter for stride calculation
+        # Think phase tracking for attention segmentation (reasoning models)
+        # Phase: "think" = inside <think>...</think>, "output" = after </think>
+        self.attention_think_phase: str = "output"  # Current phase
+        self.attention_think_boundary: int = -1  # Decode step when phase changed to "output"
 
         # extra key for classifying the request (e.g. cache_salt)
         if lora_id is not None:

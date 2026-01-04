@@ -126,6 +126,40 @@ Distance histogram bins:
 
 This is ~500 bytes per layer vs ~200KB for raw edges, enabling efficient streaming for long generations.
 
+### Think Segmentation (Reasoning Models)
+
+For reasoning models (Qwen3, DeepSeek-R1, etc.) that use `<think>...</think>` tags, attention data is automatically segmented by phase:
+
+```bash
+# Enable reasoning parser for think segmentation
+python -m sglang.launch_server \
+    --model-path your-model \
+    --return-attention-tokens \
+    --disable-cuda-graph \
+    --reasoning-parser qwen3  # or deepseek-r1, etc.
+```
+
+Each attention entry includes a `think_phase` field:
+- `"think"`: Token generated inside `<think>...</think>` block
+- `"output"`: Token generated after `</think>` (the actual response)
+
+Example response:
+```javascript
+{
+  "token_positions": [42, 128, 256],
+  "attention_scores": [0.15, 0.12, 0.08],
+  "decode_step": 100,
+  "think_phase": "think"  // or "output"
+}
+```
+
+This enables:
+- Separate analysis of thinking vs output attention patterns
+- Filtering attention data by phase for visualization
+- Comparing reasoning strategies across different outputs
+
+Supported reasoning parsers: `qwen3`, `qwen3-thinking`, `deepseek-r1`, `deepseek-v3`, `kimi`, `glm45`, `step3`, `minimax`
+
 ## Tensor Parallelism (TP) Behavior
 
 ### How TP Affects Attention Capture

@@ -550,6 +550,21 @@ class SchedulerOutputProcessorMixin:
             # Update Mamba last track seqlen
             self._mamba_prefix_cache_update(req, batch, result, i)
 
+            # Track think phase transitions for attention segmentation
+            # Detects <think> and </think> tokens to segment attention data
+            if req.return_attention_tokens and hasattr(self, 'tokenizer') and self.tokenizer:
+                think_start_id = getattr(self.tokenizer, 'think_start_id', None)
+                think_end_id = getattr(self.tokenizer, 'think_end_id', None)
+
+                # Handle single token or list of tokens (speculative decoding)
+                tokens_to_check = [next_token_id] if isinstance(next_token_id, int) else next_token_id
+                for tok in tokens_to_check:
+                    if think_start_id is not None and tok == think_start_id:
+                        req.attention_think_phase = "think"
+                    elif think_end_id is not None and tok == think_end_id:
+                        req.attention_think_phase = "output"
+                        req.attention_think_boundary = req.attention_tokens_decode_step
+
             req.check_finished(new_accepted_len)
 
             if req.finished():
@@ -616,6 +631,7 @@ class SchedulerOutputProcessorMixin:
                         "fingerprint": logits_output.attention_fingerprint[i].cpu().tolist(),
                         "manifold": logits_output.attention_manifold[i] if logits_output.attention_manifold else "unknown",
                         "step": req.attention_tokens_decode_step,
+                        "think_phase": req.attention_think_phase,
                     }
 
                     # Stream to sidecar if configured
@@ -659,6 +675,7 @@ class SchedulerOutputProcessorMixin:
                         "mode": "sketch",
                         "layer_sketches": layer_sketches,
                         "decode_step": req.attention_tokens_decode_step,
+                        "think_phase": req.attention_think_phase,
                     }
                 else:
                     # Single layer: compute one sketch
@@ -681,6 +698,7 @@ class SchedulerOutputProcessorMixin:
                         "sketch": sketch,
                         "layer_id": getattr(logits_output, "attention_layer_id", -1),
                         "decode_step": req.attention_tokens_decode_step,
+                        "think_phase": req.attention_think_phase,
                     }
 
                 req.attention_tokens.append(attention_info)
@@ -755,8 +773,9 @@ class SchedulerOutputProcessorMixin:
                             logits_output.attention_logsumexp_candidates[i].cpu().item()
                         )
 
-                # Add decode_step to the attention info for debugging
+                # Add decode_step and think phase to the attention info
                 attention_info["decode_step"] = req.attention_tokens_decode_step
+                attention_info["think_phase"] = req.attention_think_phase
                 req.attention_tokens.append(attention_info)
 
             if req.grammar is not None:
