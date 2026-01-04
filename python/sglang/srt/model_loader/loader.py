@@ -80,6 +80,7 @@ from sglang.srt.model_loader.utils import (
     post_load_weights,
     set_default_torch_dtype,
 )
+from sglang.srt.utils import remote_instance_destroy_process_group
 
 # Constants for memory management
 DEFAULT_GPU_MEMORY_FRACTION_FOR_CALIBRATION = (
@@ -2100,12 +2101,15 @@ class RemoteInstanceModelLoader(BaseModelLoader):
         self, model, client, model_config: ModelConfig, device_config: DeviceConfig
     ) -> nn.Module:
         load_config = self.load_config
-        instance_ip = socket.gethostbyname(socket.gethostname())
+        client_id = (
+            load_config.remote_instance_weight_loader_client_id
+            or socket.gethostbyname(socket.gethostname())
+        )
         start_build_group_tic = time.time()
         client.build_group(
             gpu_id=device_config.gpu_id,
             tp_rank=load_config.tp_rank,
-            instance_ip=instance_ip,
+            instance_ip=client_id,
         )
         torch.cuda.synchronize()
         end_build_group_tic = time.time()
@@ -2120,19 +2124,32 @@ class RemoteInstanceModelLoader(BaseModelLoader):
                     load_config.remote_instance_weight_loader_seed_instance_ip,
                     load_config.remote_instance_weight_loader_seed_instance_service_port,
                     load_config.remote_instance_weight_loader_send_weights_group_ports,
-                    instance_ip,
+                    client_id,
                 ),
             )
             t.start()
 
         start_get_weights_tic = time.time()
         with set_default_torch_dtype(model_config.dtype):
-            for _, tensor in model.named_parameters():
-                torch.distributed.broadcast(
-                    tensor.data,
-                    src=0,
-                    group=client._model_update_group,
+            bucket_cap_mb = int(
+                os.environ.get("SGLANG_REMOTE_INSTANCE_COALESCE_BROADCAST_MB", "0")
+            )
+
+            if bucket_cap_mb > 0 and hasattr(torch.distributed, "_broadcast_coalesced"):
+                tensors = [p.detach() for _, p in model.named_parameters()]
+                torch.distributed._broadcast_coalesced(
+                    client._model_update_group,
+                    tensors,
+                    bucket_cap_mb,
+                    0,
                 )
+            else:
+                for _, tensor in model.named_parameters():
+                    torch.distributed.broadcast(
+                        tensor.data,
+                        src=0,
+                        group=client._model_update_group,
+                    )
             torch.cuda.synchronize()
 
             if hasattr(model, "post_load_weights"):
@@ -2142,8 +2159,9 @@ class RemoteInstanceModelLoader(BaseModelLoader):
             f"finish getting all weights from remote instance, time used: {(end_get_weights_tic - start_get_weights_tic):.4f}s"
         )
         # destroy the process group after loading weights
-        torch.distributed.distributed_c10d.destroy_process_group(
-            client._model_update_group
+        remote_instance_destroy_process_group(
+            client._model_update_group,
+            tag=f"client_receive tp_rank={load_config.tp_rank} seed={load_config.remote_instance_weight_loader_seed_instance_ip}:{load_config.remote_instance_weight_loader_seed_instance_service_port}",
         )
         torch.cuda.empty_cache()
 

@@ -123,6 +123,7 @@ class MMEncoder:
             load_format=server_args.load_format,
             download_dir=server_args.download_dir,
             model_loader_extra_config=server_args.model_loader_extra_config,
+            remote_instance_weight_loader_client_id=server_args.remote_instance_weight_loader_client_id,
             remote_instance_weight_loader_seed_instance_ip=server_args.remote_instance_weight_loader_seed_instance_ip,
             remote_instance_weight_loader_seed_instance_service_port=server_args.remote_instance_weight_loader_seed_instance_service_port,
             remote_instance_weight_loader_send_weights_group_ports=server_args.remote_instance_weight_loader_send_weights_group_ports,
