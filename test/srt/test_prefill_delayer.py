@@ -48,13 +48,13 @@ class TestPrefillDelayerThroughput(CustomTestCase):
             debug_name=f"offline_gen ({prefill_delayer=})",
             prefill_delayer=prefill_delayer,
             other_benchmark_args=dict(
-                num_prompts=500,
+                num_prompts=800,
                 random_input_len=30000,
                 random_output_len=256,
             ),
             other_launch_args=[
                 "--max-total-tokens",
-                "1000000",
+                "500000",
                 "--mem-fraction-static",
                 "0.6",
             ],
