@@ -53,6 +53,7 @@ suites = {
         TestFile("dllm/test_llada2_mini.py", 520),
         TestFile("test_abort.py", 131),
         TestFile("test_chunked_prefill.py", 312),
+        TestFile("test_deepseek_ocr_pdf_input.py", 5),
         TestFile("test_deterministic.py", 228),
         TestFile("test_constrained_decoding.py", 111),
         TestFile("test_eval_fp8_accuracy.py", 250),
