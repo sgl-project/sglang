@@ -3,5 +3,6 @@ from sglang.srt.debug_utils.schedule_simulator.routers.random_router import Rand
 from sglang.srt.debug_utils.schedule_simulator.routers.round_robin_router import (
     RoundRobinRouter,
 )
+from sglang.srt.debug_utils.schedule_simulator.routers.sticky_router import StickyRouter
 
-__all__ = ["RouterPolicy", "RandomRouter", "RoundRobinRouter"]
+__all__ = ["RouterPolicy", "RandomRouter", "RoundRobinRouter", "StickyRouter"]
