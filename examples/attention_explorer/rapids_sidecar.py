@@ -3,33 +3,44 @@
 RAPIDS cuML Sidecar for GPU-Accelerated Attention Clustering
 
 A separate background process that:
-1. Receives fingerprint vectors from SGLang scheduler
+1. Receives fingerprint vectors from SGLang scheduler (via ZMQ or HTTP)
 2. Runs GPU-accelerated HDBSCAN clustering via cuML
 3. Publishes cluster centroids back to scheduler for online routing
 
 Architecture:
     SGLang Scheduler  --fingerprints-->  RAPIDS Sidecar  --centroids-->  Proxy Router
-         |                                      |
+         (ZMQ PUSH)        (ZMQ PULL)           |
          |<----------- manifold hints ----------|
 
 Requirements:
+    pip install pyzmq  # For ZMQ streaming
     pip install cuml-cu12  # or cuml-cu11 for CUDA 11
     # OR use CPU fallback: pip install hdbscan scikit-learn
 
 Usage:
-    # Start sidecar
-    python rapids_sidecar.py --port 9000
+    # Start sidecar with ZMQ listener (matches SGLang's --attention-sidecar-url)
+    python rapids_sidecar.py --zmq-bind tcp://*:9001 --port 9000
 
-    # In another process, send fingerprints
-    import requests
-    requests.post("http://localhost:9000/fingerprint", json={
+    # SGLang server connects to sidecar via ZMQ
+    python -m sglang.launch_server \\
+        --model-path your-model \\
+        --return-attention-tokens \\
+        --attention-fingerprint-mode \\
+        --attention-sidecar-url tcp://localhost:9001 \\
+        --disable-cuda-graph
+
+    # Query centroids via HTTP
+    curl http://localhost:9000/centroids
+
+Alternative HTTP-only mode (for debugging):
+    python rapids_sidecar.py --port 9000  # No ZMQ
+
+    # Send fingerprints via HTTP
+    curl -X POST http://localhost:9000/fingerprint -d '{
         "request_id": "req-123",
-        "vector": [0.7, 0.5, 0.6, 1.2, ...],  # 20D vector
+        "vector": [0.7, 0.5, 0.6, 1.2, ...],
         "metadata": {"prompt_type": "code"}
-    })
-
-    # Get current centroids
-    requests.get("http://localhost:9000/centroids")
+    }'
 """
 
 import argparse
@@ -41,6 +52,13 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 from dataclasses import dataclass, asdict
 from enum import Enum
+
+# Try ZMQ for high-performance streaming
+try:
+    import zmq
+    HAS_ZMQ = True
+except ImportError:
+    HAS_ZMQ = False
 
 # Try RAPIDS cuML first, fallback to CPU
 try:
@@ -66,7 +84,57 @@ import urllib.parse
 class ClusteringBackend(Enum):
     RAPIDS = "rapids"
     CPU = "cpu"
+    ONLINE = "online"  # Lightweight online clustering (no scipy/sklearn needed)
     NONE = "none"
+
+
+class OnlineMicroCluster:
+    """
+    Micro-cluster for online clustering (DenStream-style).
+
+    Maintains running statistics that can be updated incrementally:
+    - Centroid (weighted average of points)
+    - Weight (decayed sum of points)
+    - Radius (approximate cluster spread)
+    """
+
+    def __init__(self, point: np.ndarray, cluster_id: int, decay: float = 0.99):
+        self.cluster_id = cluster_id
+        self.decay = decay
+        self.centroid = point.copy()
+        self.weight = 1.0
+        self.sq_sum = np.sum(point ** 2)
+        self.n_points = 1
+        self.last_update = time.time()
+
+    def distance(self, point: np.ndarray) -> float:
+        """Euclidean distance from point to centroid."""
+        return float(np.linalg.norm(point - self.centroid))
+
+    def add_point(self, point: np.ndarray):
+        """Add point to cluster with decay on old points."""
+        # Decay existing weight
+        self.weight *= self.decay
+        self.sq_sum *= self.decay
+
+        # Add new point
+        self.centroid = (self.centroid * self.weight + point) / (self.weight + 1)
+        self.weight += 1
+        self.sq_sum += np.sum(point ** 2)
+        self.n_points += 1
+        self.last_update = time.time()
+
+    @property
+    def radius(self) -> float:
+        """Approximate cluster radius (std dev from centroid)."""
+        if self.weight < 2:
+            return 0.0
+        variance = max(0, self.sq_sum / self.weight - np.sum(self.centroid ** 2))
+        return float(np.sqrt(variance))
+
+    def is_stale(self, max_age: float = 300) -> bool:
+        """Check if cluster hasn't been updated recently."""
+        return time.time() - self.last_update > max_age
 
 
 @dataclass
@@ -94,6 +162,10 @@ class RAPIDSSidecar:
 
     Maintains a buffer of fingerprints and periodically re-clusters
     to discover attention manifolds.
+
+    Supports two modes for receiving fingerprints:
+    - ZMQ PULL: High-performance streaming from SGLang scheduler
+    - HTTP POST: For debugging and manual testing
     """
 
     def __init__(
@@ -102,11 +174,19 @@ class RAPIDSSidecar:
         min_cluster_size: int = 10,
         recluster_interval: float = 60.0,
         feature_dim: int = 20,
+        zmq_bind: Optional[str] = None,
+        online_mode: bool = False,
+        online_threshold: float = 2.0,  # Distance threshold for new cluster
+        online_max_clusters: int = 50,
     ):
         self.buffer_size = buffer_size
         self.min_cluster_size = min_cluster_size
         self.recluster_interval = recluster_interval
         self.feature_dim = feature_dim
+        self.zmq_bind = zmq_bind
+        self.online_mode = online_mode
+        self.online_threshold = online_threshold
+        self.online_max_clusters = online_max_clusters
 
         # Fingerprint buffer (ring buffer)
         self.fingerprints: deque = deque(maxlen=buffer_size)
@@ -117,8 +197,21 @@ class RAPIDSSidecar:
         self.last_cluster_time = 0
         self.cluster_labels: Optional[np.ndarray] = None
 
+        # Online clustering state
+        self._micro_clusters: Dict[int, OnlineMicroCluster] = {}
+        self._next_cluster_id = 0
+
+        # ZMQ receiver state
+        self._zmq_context = None
+        self._zmq_socket = None
+        self._zmq_thread = None
+        self._zmq_received = 0
+
         # Backend selection
-        if HAS_RAPIDS:
+        if online_mode:
+            self.backend = ClusteringBackend.ONLINE
+            print("Using ONLINE clustering mode (real-time updates)")
+        elif HAS_RAPIDS:
             self.backend = ClusteringBackend.RAPIDS
             print("Using RAPIDS cuML backend (GPU)")
         elif HAS_SKLEARN:
@@ -133,13 +226,67 @@ class RAPIDSSidecar:
         self._cluster_thread = threading.Thread(target=self._cluster_loop, daemon=True)
 
     def start(self):
-        """Start background clustering thread."""
+        """Start background threads (clustering + optional ZMQ receiver)."""
         self._cluster_thread.start()
 
+        # Start ZMQ receiver if configured
+        if self.zmq_bind and HAS_ZMQ:
+            self._start_zmq_receiver()
+
     def stop(self):
-        """Stop background thread."""
+        """Stop all background threads."""
         self._stop_event.set()
         self._cluster_thread.join(timeout=5)
+
+        # Stop ZMQ receiver
+        if self._zmq_socket:
+            self._zmq_socket.close()
+        if self._zmq_context:
+            self._zmq_context.term()
+        if self._zmq_thread:
+            self._zmq_thread.join(timeout=2)
+
+    def _start_zmq_receiver(self):
+        """Start ZMQ PULL socket to receive fingerprints from scheduler."""
+        try:
+            self._zmq_context = zmq.Context()
+            self._zmq_socket = self._zmq_context.socket(zmq.PULL)
+            self._zmq_socket.bind(self.zmq_bind)
+            self._zmq_socket.setsockopt(zmq.RCVHWM, 10000)  # High water mark
+            print(f"ZMQ receiver bound to {self.zmq_bind}")
+
+            self._zmq_thread = threading.Thread(target=self._zmq_loop, daemon=True)
+            self._zmq_thread.start()
+        except Exception as e:
+            print(f"Failed to start ZMQ receiver: {e}")
+            self._zmq_socket = None
+
+    def _zmq_loop(self):
+        """Background loop to receive fingerprints via ZMQ."""
+        poller = zmq.Poller()
+        poller.register(self._zmq_socket, zmq.POLLIN)
+
+        while not self._stop_event.is_set():
+            try:
+                # Poll with 100ms timeout so we can check stop_event
+                socks = dict(poller.poll(100))
+
+                if self._zmq_socket in socks:
+                    message = self._zmq_socket.recv(flags=zmq.NOBLOCK)
+                    data = json.loads(message.decode())
+
+                    self.add_fingerprint(
+                        request_id=data.get("request_id", "unknown"),
+                        vector=data["vector"],
+                        metadata=data.get("metadata"),
+                    )
+                    self._zmq_received += 1
+
+            except zmq.Again:
+                pass  # No message available
+            except Exception as e:
+                if not self._stop_event.is_set():
+                    print(f"ZMQ receive error: {e}")
 
     def add_fingerprint(
         self,
@@ -147,15 +294,71 @@ class RAPIDSSidecar:
         vector: List[float],
         metadata: Optional[Dict] = None,
     ):
-        """Add a fingerprint to the buffer."""
+        """Add a fingerprint to the buffer (and update online clusters if enabled)."""
+        vec = np.array(vector, dtype=np.float32)
         entry = FingerprintEntry(
             request_id=request_id,
-            vector=np.array(vector, dtype=np.float32),
+            vector=vec,
             timestamp=time.time(),
             metadata=metadata or {},
         )
         with self.lock:
             self.fingerprints.append(entry)
+
+            # Update online clusters in real-time
+            if self.online_mode:
+                self._update_online_clusters(vec)
+
+    def _update_online_clusters(self, point: np.ndarray):
+        """Update online micro-clusters with a new point (called with lock held)."""
+        # Find nearest micro-cluster
+        best_cluster = None
+        best_dist = float('inf')
+
+        for mc in self._micro_clusters.values():
+            dist = mc.distance(point)
+            if dist < best_dist:
+                best_dist = dist
+                best_cluster = mc
+
+        # Decide: add to existing cluster or create new one
+        if best_cluster is not None and best_dist < self.online_threshold:
+            # Add to nearest cluster
+            best_cluster.add_point(point)
+        else:
+            # Create new cluster
+            if len(self._micro_clusters) < self.online_max_clusters:
+                new_mc = OnlineMicroCluster(point, self._next_cluster_id)
+                self._micro_clusters[self._next_cluster_id] = new_mc
+                self._next_cluster_id += 1
+            else:
+                # Too many clusters - merge with nearest
+                if best_cluster is not None:
+                    best_cluster.add_point(point)
+
+        # Prune stale clusters periodically
+        if len(self._micro_clusters) > 0:
+            stale_ids = [cid for cid, mc in self._micro_clusters.items() if mc.is_stale()]
+            for cid in stale_ids:
+                del self._micro_clusters[cid]
+
+        # Update centroids from micro-clusters
+        self._sync_centroids_from_microclusters()
+
+    def _sync_centroids_from_microclusters(self):
+        """Convert micro-clusters to ClusterCentroid objects."""
+        new_centroids = {}
+        for cid, mc in self._micro_clusters.items():
+            traits = self._interpret_centroid(mc.centroid)
+            sampling_hint = self._get_sampling_hint(traits)
+            new_centroids[cid] = ClusterCentroid(
+                cluster_id=cid,
+                centroid=mc.centroid.tolist(),
+                size=mc.n_points,
+                traits=traits,
+                sampling_hint=sampling_hint,
+            )
+        self.centroids = new_centroids
 
     def get_centroids(self) -> Dict[int, Dict]:
         """Get current cluster centroids."""
@@ -366,13 +569,16 @@ class RAPIDSSidecar:
 
     def get_stats(self) -> Dict:
         """Get sidecar statistics."""
-        return {
+        stats = {
             "backend": self.backend.value,
             "buffer_size": len(self.fingerprints),
             "buffer_capacity": self.buffer_size,
             "n_clusters": len(self.centroids),
             "last_cluster_time": self.last_cluster_time,
+            "zmq_enabled": self.zmq_bind is not None,
+            "zmq_received": self._zmq_received,
         }
+        return stats
 
 
 class SidecarHandler(BaseHTTPRequestHandler):
@@ -450,21 +656,42 @@ class SidecarHandler(BaseHTTPRequestHandler):
 
 def main():
     parser = argparse.ArgumentParser(description="RAPIDS clustering sidecar")
-    parser.add_argument("--port", type=int, default=9000, help="HTTP port")
+    parser.add_argument("--port", type=int, default=9000,
+                        help="HTTP port for querying centroids (default: 9000)")
+    parser.add_argument("--zmq-bind", type=str, default=None,
+                        help="ZMQ bind address for fingerprint streaming. "
+                             "Example: 'tcp://*:9001'. Must match SGLang's --attention-sidecar-url "
+                             "(but use '*' instead of 'localhost' for binding)")
     parser.add_argument("--buffer-size", type=int, default=10000,
-                        help="Fingerprint buffer size")
+                        help="Fingerprint buffer size (default: 10000)")
     parser.add_argument("--min-cluster-size", type=int, default=10,
-                        help="Minimum cluster size")
+                        help="Minimum cluster size for HDBSCAN (default: 10)")
     parser.add_argument("--recluster-interval", type=float, default=60.0,
-                        help="Seconds between reclustering")
+                        help="Seconds between reclustering (default: 60)")
+    parser.add_argument("--online", action="store_true",
+                        help="Enable online clustering mode (real-time updates, no batching)")
+    parser.add_argument("--online-threshold", type=float, default=2.0,
+                        help="Distance threshold for creating new cluster in online mode (default: 2.0)")
+    parser.add_argument("--online-max-clusters", type=int, default=50,
+                        help="Maximum number of clusters in online mode (default: 50)")
 
     args = parser.parse_args()
+
+    # Check ZMQ availability
+    if args.zmq_bind and not HAS_ZMQ:
+        print("ERROR: pyzmq not installed. Install with: pip install pyzmq")
+        print("Falling back to HTTP-only mode.")
+        args.zmq_bind = None
 
     # Create sidecar
     sidecar = RAPIDSSidecar(
         buffer_size=args.buffer_size,
         min_cluster_size=args.min_cluster_size,
         recluster_interval=args.recluster_interval,
+        zmq_bind=args.zmq_bind,
+        online_mode=args.online,
+        online_threshold=args.online_threshold,
+        online_max_clusters=args.online_max_clusters,
     )
     sidecar.start()
 
@@ -473,10 +700,29 @@ def main():
 
     # Start server
     server = HTTPServer(('0.0.0.0', args.port), SidecarHandler)
-    print(f"RAPIDS Sidecar listening on port {args.port}")
-    print(f"Backend: {sidecar.backend.value}")
-    print(f"Buffer size: {args.buffer_size}")
-    print(f"Recluster interval: {args.recluster_interval}s")
+    print(f"\n{'='*60}")
+    print(f"RAPIDS Clustering Sidecar")
+    print(f"{'='*60}")
+    print(f"HTTP API:         http://0.0.0.0:{args.port}")
+    if args.zmq_bind:
+        print(f"ZMQ Receiver:     {args.zmq_bind}")
+    else:
+        print(f"ZMQ Receiver:     disabled (use --zmq-bind to enable)")
+    print(f"Backend:          {sidecar.backend.value}")
+    if args.online:
+        print(f"Online mode:      threshold={args.online_threshold}, max_clusters={args.online_max_clusters}")
+    else:
+        print(f"Buffer size:      {args.buffer_size}")
+        print(f"Recluster:        every {args.recluster_interval}s")
+    print(f"{'='*60}")
+    print(f"\nEndpoints:")
+    print(f"  GET  /centroids  - Current cluster centroids")
+    print(f"  GET  /stats      - Sidecar statistics")
+    print(f"  GET  /health     - Health check")
+    print(f"  POST /fingerprint - Submit fingerprint (HTTP mode)")
+    print(f"  POST /predict    - Predict cluster for fingerprint")
+    print(f"  POST /recluster  - Force recluster")
+    print(f"\nPress Ctrl+C to stop\n")
 
     try:
         server.serve_forever()
