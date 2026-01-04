@@ -5,10 +5,23 @@ Attention Fingerprinting for Self-Discovery Loop
 Computes compact "cognitive fingerprints" from sparse attention data
 for UMAP/HDBSCAN manifold discovery without storing full matrices.
 
-Three axes:
-- Hubness (X): Concentration of attention on "anchor" tokens (SpaceSaving approx)
-- Consensus (Y): Cross-layer agreement on important tokens
+Feature axes (8-16 dimensions):
+- Hubness (X): Concentration of attention on "anchor" tokens (Gini coefficient)
+- Consensus (Y): Cross-layer agreement via weighted pairwise Jaccard
 - Spectral (Z): FFT of offset histogram (local syntax vs long-range reasoning)
+- Offset histogram: Log2-binned attention distance distribution (8-16 bins)
+
+Supports multi-layer format:
+{
+  "layers": {
+    "6": {"token_positions": [...], "attention_scores": [...], ...},
+    "12": {...},
+    "18": {...},
+    "23": {...}
+  },
+  "layer_id": 23,  # backward compat
+  "token_positions": [...]
+}
 
 Usage:
     python attention_fingerprint.py --input attention_trace.json
@@ -19,7 +32,7 @@ import argparse
 import json
 import numpy as np
 from collections import Counter
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict, Tuple, Optional, Union
 import sys
 
 try:
@@ -29,13 +42,62 @@ except ImportError:
     HAS_SCIPY = False
 
 
+def normalize_attention_data(attention_tokens: Union[List[Dict], Dict]) -> Tuple[List[Dict], Dict[int, List[Dict]]]:
+    """
+    Normalize attention data to both flat list and per-layer dict.
+
+    Handles both:
+    - List of entries (old format)
+    - Single entry with "layers" dict (multi-layer format)
+
+    Returns:
+        flat_list: List of entries (for backward compat)
+        per_layer: Dict of layer_id -> list of entries
+    """
+    flat_list = []
+    per_layer: Dict[int, List[Dict]] = {}
+
+    if isinstance(attention_tokens, dict):
+        # Single multi-layer entry or single entry
+        if "layers" in attention_tokens:
+            layers = attention_tokens["layers"]
+            for layer_id_str, entry in layers.items():
+                layer_id = int(layer_id_str)
+                entry_with_layer = {**entry, "layer_id": layer_id}
+                flat_list.append(entry_with_layer)
+                per_layer.setdefault(layer_id, []).append(entry_with_layer)
+        else:
+            # Single entry without layers
+            flat_list.append(attention_tokens)
+            layer_id = attention_tokens.get("layer_id", 0)
+            per_layer.setdefault(layer_id, []).append(attention_tokens)
+    elif isinstance(attention_tokens, list):
+        # List of entries (could be list of multi-layer entries)
+        for item in attention_tokens:
+            if isinstance(item, dict) and "layers" in item:
+                # Multi-layer entry in list
+                layers = item["layers"]
+                for layer_id_str, entry in layers.items():
+                    layer_id = int(layer_id_str)
+                    entry_with_layer = {**entry, "layer_id": layer_id}
+                    flat_list.append(entry_with_layer)
+                    per_layer.setdefault(layer_id, []).append(entry_with_layer)
+            else:
+                # Regular entry
+                flat_list.append(item)
+                layer_id = item.get("layer_id", 0)
+                per_layer.setdefault(layer_id, []).append(item)
+
+    return flat_list, per_layer
+
+
 class AttentionFingerprint:
     """Compute compact fingerprints from attention token traces."""
 
-    def __init__(self, num_offset_bins: int = 24, hub_capacity: int = 64):
+    def __init__(self, num_offset_bins: int = 16, hub_capacity: int = 64):
         """
         Args:
-            num_offset_bins: Number of log2 bins for offset histogram (covers 2^24 = 16M tokens)
+            num_offset_bins: Number of log2 bins for offset histogram (16 covers 2^16 = 64K tokens)
             hub_capacity: Max hubs to track for SpaceSaving algorithm
         """
         self.num_offset_bins = num_offset_bins
@@ -75,32 +137,27 @@ class AttentionFingerprint:
         return float(np.clip(gini, 0, 1))
 
     def compute_consensus(self, attention_tokens: List[Dict],
-                          early_layers: range = range(0, 10),
-                          late_layers: range = range(20, 32)) -> float:
+                          per_layer: Optional[Dict[int, List[Dict]]] = None) -> float:
         """
-        Axis Y: Consensus - Do early/mid layers agree with late layers?
+        Axis Y: Consensus - Weighted pairwise Jaccard across layers.
+
+        Formula: For layer pair (i,j):
+            weighted_jaccard(A_i, A_j) = sum(min(w_i[k], w_j[k])) / sum(max(w_i[k], w_j[k]))
+            where w_i[k] is attention weight for position k in layer i
 
         High consensus = rigid structure (JSON, code)
         Low consensus = fluid generation (creative, chat)
         """
-        early_positions = set()
-        late_positions = set()
+        if per_layer is None:
+            _, per_layer = normalize_attention_data(attention_tokens)
 
-        for entry in attention_tokens:
-            layer_id = entry.get("layer_id", -1)
-            positions = set(entry.get("token_positions", []))
+        layer_ids = sorted(per_layer.keys())
 
-            if layer_id in early_layers:
-                early_positions.update(positions)
-            elif layer_id in late_layers:
-                late_positions.update(positions)
-
-        if not early_positions or not late_positions:
-            # If single layer, use self-consistency over time
+        if len(layer_ids) < 2:
+            # Single layer: use temporal consistency
             all_positions = [set(e.get("token_positions", [])) for e in attention_tokens]
             if len(all_positions) < 2:
                 return 0.5
-            # Jaccard similarity between consecutive steps
             similarities = []
             for i in range(1, len(all_positions)):
                 intersection = len(all_positions[i-1] & all_positions[i])
@@ -109,10 +166,35 @@ class AttentionFingerprint:
                     similarities.append(intersection / union)
             return float(np.mean(similarities)) if similarities else 0.5
 
-        # Jaccard similarity between layer groups
-        intersection = len(early_positions & late_positions)
-        union = len(early_positions | late_positions)
-        return intersection / union if union > 0 else 0.0
+        # Build weighted position dict for each layer
+        layer_weights: Dict[int, Dict[int, float]] = {}
+        for layer_id in layer_ids:
+            weights: Dict[int, float] = {}
+            for entry in per_layer[layer_id]:
+                positions = entry.get("token_positions", [])
+                scores = entry.get("attention_scores", [])
+                for pos, score in zip(positions, scores):
+                    weights[pos] = weights.get(pos, 0) + score
+            layer_weights[layer_id] = weights
+
+        # Weighted pairwise Jaccard
+        pairwise_scores = []
+        for i, layer_i in enumerate(layer_ids):
+            for layer_j in layer_ids[i+1:]:
+                w_i = layer_weights[layer_i]
+                w_j = layer_weights[layer_j]
+                all_positions = set(w_i.keys()) | set(w_j.keys())
+
+                if not all_positions:
+                    continue
+
+                min_sum = sum(min(w_i.get(k, 0), w_j.get(k, 0)) for k in all_positions)
+                max_sum = sum(max(w_i.get(k, 0), w_j.get(k, 0)) for k in all_positions)
+
+                if max_sum > 0:
+                    pairwise_scores.append(min_sum / max_sum)
+
+        return float(np.mean(pairwise_scores)) if pairwise_scores else 0.5
 
     def compute_spectral(self, attention_tokens: List[Dict]) -> float:
         """
@@ -219,17 +301,22 @@ class AttentionFingerprint:
 
         return hist
 
-    def fingerprint(self, attention_tokens: List[Dict]) -> Dict:
+    def fingerprint(self, attention_tokens: Union[List[Dict], Dict]) -> Dict:
         """
         Compute full cognitive fingerprint from attention trace.
 
+        Args:
+            attention_tokens: Either list of attention entries or multi-layer dict
+
         Returns dict with all metrics for clustering.
         """
-        hubness = self.compute_hubness(attention_tokens)
-        consensus = self.compute_consensus(attention_tokens)
-        spectral = self.compute_spectral(attention_tokens)
-        entropy = self.compute_entropy(attention_tokens)
-        histogram = self.compute_offset_histogram(attention_tokens)
+        flat_list, per_layer = normalize_attention_data(attention_tokens)
+
+        hubness = self.compute_hubness(flat_list)
+        consensus = self.compute_consensus(flat_list, per_layer)
+        spectral = self.compute_spectral(flat_list)
+        entropy = self.compute_entropy(flat_list)
+        histogram = self.compute_offset_histogram(flat_list)
 
         return {
             "hubness": hubness,
@@ -237,35 +324,46 @@ class AttentionFingerprint:
             "spectral": spectral,
             "entropy": entropy,
             "offset_histogram": histogram.tolist(),
-            "vector": [hubness, consensus, spectral],  # For clustering
-            "n_tokens": len(attention_tokens),
+            "vector": [hubness, consensus, spectral],  # 3D for visualization
+            "full_vector": [hubness, consensus, spectral, entropy] + histogram.tolist(),  # Full for clustering
+            "n_tokens": len(flat_list),
+            "n_layers": len(per_layer),
+            "layer_ids": sorted(per_layer.keys()),
         }
 
-    def fingerprint_vector(self, attention_tokens: List[Dict]) -> np.ndarray:
+    def fingerprint_vector(self, attention_tokens: Union[List[Dict], Dict],
+                           include_histogram: bool = True) -> np.ndarray:
         """
         Compute fingerprint as a feature vector for clustering.
 
-        Returns: [hubness, consensus, spectral, entropy, histogram...]
+        Args:
+            attention_tokens: Attention data
+            include_histogram: If True, include offset histogram (20D total)
+                             If False, just core metrics (4D)
+
+        Returns: numpy array suitable for HDBSCAN/UMAP
         """
         fp = self.fingerprint(attention_tokens)
-        base = [fp["hubness"], fp["consensus"], fp["spectral"], fp["entropy"]]
-        return np.array(base + fp["offset_histogram"], dtype=np.float32)
+        if include_histogram:
+            return np.array(fp["full_vector"], dtype=np.float32)
+        else:
+            return np.array([fp["hubness"], fp["consensus"], fp["spectral"], fp["entropy"]], dtype=np.float32)
 
 
 def test_fingerprint():
-    """Test with synthetic attention data."""
-    # Simulate attention tokens from a focused code generation
+    """Test with synthetic and multi-layer attention data."""
+    print("=" * 60)
+    print("Fingerprint Tests")
+    print("=" * 60)
+
+    # Test 1: Focused code generation (single layer)
     attention_tokens = []
     for t in range(20):
-        # Focused attention: mostly looking at positions 0-3 (anchors)
         if t < 5:
             positions = [0, 1, 2, 3, 4]
         else:
-            # Later tokens look back at anchors + recent tokens
             positions = [0, 1, t-1, t-2, t-3]
-
         scores = [0.4, 0.3, 0.15, 0.1, 0.05]
-
         attention_tokens.append({
             "token_positions": positions,
             "attention_scores": scores,
@@ -275,38 +373,82 @@ def test_fingerprint():
     fp = AttentionFingerprint()
     result = fp.fingerprint(attention_tokens)
 
-    print("Fingerprint for focused code generation:")
-    print(f"  Hubness:   {result['hubness']:.3f} (high = focused on anchors)")
-    print(f"  Consensus: {result['consensus']:.3f} (high = stable pattern)")
-    print(f"  Spectral:  {result['spectral']:.3f} (high = long-range)")
-    print(f"  Entropy:   {result['entropy']:.3f} (low = concentrated)")
-    print(f"  Vector:    {result['vector']}")
-    print()
+    print("\n1. Focused code generation (single layer):")
+    print(f"   Hubness:   {result['hubness']:.3f} (high = focused on anchors)")
+    print(f"   Consensus: {result['consensus']:.3f} (temporal consistency)")
+    print(f"   Spectral:  {result['spectral']:.3f} (high = long-range)")
+    print(f"   Entropy:   {result['entropy']:.3f} (low = concentrated)")
+    print(f"   N_layers:  {result['n_layers']}")
 
-    # Simulate diffuse chat-like attention
-    attention_tokens_chat = []
-    for t in range(20):
-        # Random-ish positions, recent tokens
-        positions = list(range(max(0, t-4), t+1))[:5]
-        scores = [0.2] * len(positions)
-        if len(positions) < 5:
-            positions = positions + [0] * (5 - len(positions))
-            scores = scores + [0.0] * (5 - len(scores))
+    # Test 2: Multi-layer format (simulating real server output)
+    multi_layer_entry = {
+        "layers": {
+            "6": {
+                "token_positions": [0, 1, 2, 5, 8],
+                "attention_scores": [0.35, 0.25, 0.2, 0.12, 0.08],
+                "topk_logits": [2.5, 2.0, 1.8, 1.2, 0.9],
+                "logsumexp_candidates": 3.2,
+            },
+            "12": {
+                "token_positions": [0, 1, 3, 5, 10],
+                "attention_scores": [0.40, 0.25, 0.15, 0.12, 0.08],
+                "topk_logits": [2.8, 2.1, 1.5, 1.2, 0.8],
+                "logsumexp_candidates": 3.5,
+            },
+            "18": {
+                "token_positions": [0, 2, 4, 7, 12],
+                "attention_scores": [0.30, 0.28, 0.20, 0.14, 0.08],
+                "topk_logits": [2.3, 2.2, 1.9, 1.4, 0.9],
+                "logsumexp_candidates": 3.3,
+            },
+            "23": {
+                "token_positions": [0, 1, 2, 8, 15],
+                "attention_scores": [0.38, 0.22, 0.18, 0.14, 0.08],
+                "topk_logits": [2.6, 1.9, 1.7, 1.3, 0.8],
+                "logsumexp_candidates": 3.4,
+            },
+        },
+        "layer_id": 23,
+        "token_positions": [0, 1, 2, 8, 15],
+        "attention_scores": [0.38, 0.22, 0.18, 0.14, 0.08],
+    }
 
-        attention_tokens_chat.append({
-            "token_positions": positions,
-            "attention_scores": scores,
-            "layer_id": 23,
-        })
+    result_multi = fp.fingerprint(multi_layer_entry)
 
-    result_chat = fp.fingerprint(attention_tokens_chat)
+    print("\n2. Multi-layer format (4 layers: 6, 12, 18, 23):")
+    print(f"   Hubness:   {result_multi['hubness']:.3f}")
+    print(f"   Consensus: {result_multi['consensus']:.3f} (weighted cross-layer Jaccard)")
+    print(f"   Spectral:  {result_multi['spectral']:.3f}")
+    print(f"   Entropy:   {result_multi['entropy']:.3f}")
+    print(f"   N_layers:  {result_multi['n_layers']}")
+    print(f"   Layer IDs: {result_multi['layer_ids']}")
 
-    print("Fingerprint for diffuse chat:")
-    print(f"  Hubness:   {result_chat['hubness']:.3f}")
-    print(f"  Consensus: {result_chat['consensus']:.3f}")
-    print(f"  Spectral:  {result_chat['spectral']:.3f}")
-    print(f"  Entropy:   {result_chat['entropy']:.3f}")
-    print(f"  Vector:    {result_chat['vector']}")
+    # Test 3: Stream of multi-layer entries
+    stream_entries = []
+    for t in range(10):
+        entry = {
+            "layers": {
+                "6": {"token_positions": [0, max(0, t-1)], "attention_scores": [0.6, 0.4]},
+                "23": {"token_positions": [0, max(0, t-2)], "attention_scores": [0.5, 0.5]},
+            }
+        }
+        stream_entries.append(entry)
+
+    result_stream = fp.fingerprint(stream_entries)
+
+    print("\n3. Stream of multi-layer entries (10 tokens, 2 layers each):")
+    print(f"   Hubness:   {result_stream['hubness']:.3f}")
+    print(f"   Consensus: {result_stream['consensus']:.3f}")
+    print(f"   Spectral:  {result_stream['spectral']:.3f}")
+    print(f"   N_tokens:  {result_stream['n_tokens']}")
+    print(f"   N_layers:  {result_stream['n_layers']}")
+
+    # Test 4: Full vector for clustering
+    vec = fp.fingerprint_vector(multi_layer_entry, include_histogram=True)
+    print(f"\n4. Full fingerprint vector dimensions: {len(vec)}")
+    print(f"   (4 core metrics + {fp.num_offset_bins} histogram bins)")
+
+    print("\n" + "=" * 60)
 
 
 def main():
