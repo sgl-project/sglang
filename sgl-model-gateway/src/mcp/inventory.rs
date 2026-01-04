@@ -77,9 +77,9 @@ impl ToolInventory {
     }
 
     /// Insert or update a tool
-    pub fn insert_tool(&self, tool_name: String, server_name: String, tool: Tool) {
+    pub fn insert_tool(&self, qualified_tool_name: String, server_name: String, tool: Tool) {
         self.tools
-            .insert(tool_name, CachedTool { server_name, tool });
+            .insert(qualified_tool_name, CachedTool { server_name, tool });
     }
 
     /// Get all tools
@@ -273,9 +273,13 @@ mod tests {
         let inventory = ToolInventory::new();
         let tool = create_test_tool("test_tool");
 
-        inventory.insert_tool("test_tool".to_string(), "server1".to_string(), tool.clone());
+        inventory.insert_tool(
+            "server1_test_tool".to_string(),
+            "server1".to_string(),
+            tool.clone(),
+        );
 
-        let result = inventory.get_tool("test_tool");
+        let result = inventory.get_tool("server1_test_tool");
         assert!(result.is_some());
 
         let (server_name, retrieved_tool) = result.unwrap();
@@ -288,11 +292,15 @@ mod tests {
         let inventory = ToolInventory::new();
         let tool = create_test_tool("check_tool");
 
-        assert!(!inventory.has_tool("check_tool"));
+        assert!(!inventory.has_tool("server1_check_tool"));
 
-        inventory.insert_tool("check_tool".to_string(), "server1".to_string(), tool);
+        inventory.insert_tool(
+            "server1_check_tool".to_string(),
+            "server1".to_string(),
+            tool,
+        );
 
-        assert!(inventory.has_tool("check_tool"));
+        assert!(inventory.has_tool("server1_check_tool"));
     }
 
     #[test]
@@ -300,17 +308,17 @@ mod tests {
         let inventory = ToolInventory::new();
 
         inventory.insert_tool(
-            "tool1".to_string(),
+            "server1_tool1".to_string(),
             "server1".to_string(),
             create_test_tool("tool1"),
         );
         inventory.insert_tool(
-            "tool2".to_string(),
+            "server1_tool2".to_string(),
             "server1".to_string(),
             create_test_tool("tool2"),
         );
         inventory.insert_tool(
-            "tool3".to_string(),
+            "server2_tool3".to_string(),
             "server2".to_string(),
             create_test_tool("tool3"),
         );
@@ -324,12 +332,12 @@ mod tests {
         let inventory = ToolInventory::new();
 
         inventory.insert_tool(
-            "tool1".to_string(),
+            "server1_tool1".to_string(),
             "server1".to_string(),
             create_test_tool("tool1"),
         );
         inventory.insert_tool(
-            "tool2".to_string(),
+            "server2_tool2".to_string(),
             "server2".to_string(),
             create_test_tool("tool2"),
         );
@@ -340,7 +348,7 @@ mod tests {
 
         let tools = inventory.list_tools();
         assert_eq!(tools.len(), 1);
-        assert_eq!(tools[0].0, "tool2");
+        assert_eq!(tools[0].0, "server2_tool2");
     }
 
     #[test]
@@ -349,14 +357,14 @@ mod tests {
         let prompt = create_test_prompt("test_prompt");
 
         inventory.insert_prompt(
-            "test_prompt".to_string(),
+            "server1_test_prompt".to_string(),
             "server1".to_string(),
             prompt.clone(),
         );
 
-        assert!(inventory.has_prompt("test_prompt"));
+        assert!(inventory.has_prompt("server1_test_prompt"));
 
-        let result = inventory.get_prompt("test_prompt");
+        let result = inventory.get_prompt("server1_test_prompt");
         assert!(result.is_some());
 
         let (server_name, retrieved_prompt) = result.unwrap();
@@ -397,7 +405,9 @@ mod tests {
             let inv = Arc::clone(&inventory);
             let handle = tokio::spawn(async move {
                 let tool = create_test_tool(&format!("tool_{}", i));
-                inv.insert_tool(format!("tool_{}", i), format!("server_{}", i % 3), tool);
+                let server_name = format!("server_{}", i % 3);
+                let qualified_tool_name = format!("{}_tool_{}", server_name, i);
+                inv.insert_tool(qualified_tool_name, server_name, tool);
             });
             handles.push(handle);
         }
@@ -417,12 +427,12 @@ mod tests {
         let inventory = ToolInventory::new();
 
         inventory.insert_tool(
-            "tool1".to_string(),
+            "_tool1".to_string(),
             "server1".to_string(),
             create_test_tool("tool1"),
         );
         inventory.insert_prompt(
-            "prompt1".to_string(),
+            "server1_prompt1".to_string(),
             "server1".to_string(),
             create_test_prompt("prompt1"),
         );
