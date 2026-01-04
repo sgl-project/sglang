@@ -160,6 +160,11 @@ class SGLangFailuresAnalyzer:
 
             while url:
                 response = self.session.get(url, params=params, timeout=30)
+                if response.status_code != 200:
+                    print(
+                        f"  Warning: Runner API returned {response.status_code}: {response.text[:200]}"
+                    )
+                    return {}
                 response.raise_for_status()
                 data = response.json()
                 runners = data.get("runners", [])
