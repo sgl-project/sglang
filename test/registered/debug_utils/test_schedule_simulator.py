@@ -761,6 +761,10 @@ class TestLargerScale(CustomTestCase):
         args = parser.parse_args(cli_args)
         return main(args)
 
+    def _assert_in_range(self, value, lo, hi, name):
+        self.assertGreaterEqual(value, lo, f"{name}={value} < {lo}")
+        self.assertLessEqual(value, hi, f"{name}={value} > {hi}")
+
     def test_non_gsp_random_policy(self):
         result = self._run_main(
             "--synthetic",
@@ -772,8 +776,8 @@ class TestLargerScale(CustomTestCase):
             "--router", "random",
             "--max-total-tokens", "2000000",
         )
-        self.assertGreater(result.summary["attention_compute_balancedness_mean"], 0.7)
-        self.assertGreater(result.summary["batch_size_balancedness_mean"], 0.7)
+        self._assert_in_range(result.summary["attention_compute_balancedness_mean"], 0.7, 0.85, "attn")
+        self._assert_in_range(result.summary["batch_size_balancedness_mean"], 0.7, 0.85, "bs")
 
     def test_gsp_random_policy(self):
         result = self._run_main(
@@ -788,8 +792,8 @@ class TestLargerScale(CustomTestCase):
             "--router", "random",
             "--max-total-tokens", "2000000",
         )
-        self.assertGreater(result.summary["attention_compute_balancedness_mean"], 0.7)
-        self.assertGreater(result.summary["batch_size_balancedness_mean"], 0.7)
+        self._assert_in_range(result.summary["attention_compute_balancedness_mean"], 0.9, 1.0, "attn")
+        self._assert_in_range(result.summary["batch_size_balancedness_mean"], 0.9, 1.0, "bs")
 
     def test_gsp_sticky_policy(self):
         result = self._run_main(
@@ -804,8 +808,8 @@ class TestLargerScale(CustomTestCase):
             "--router", "sticky",
             "--max-total-tokens", "2000000",
         )
-        self.assertLess(result.summary["attention_compute_balancedness_mean"], 0.7)
-        self.assertLess(result.summary["batch_size_balancedness_mean"], 0.7)
+        self._assert_in_range(result.summary["attention_compute_balancedness_mean"], 0.2, 0.5, "attn")
+        self._assert_in_range(result.summary["batch_size_balancedness_mean"], 0.2, 0.5, "bs")
 
 
 if __name__ == "__main__":
