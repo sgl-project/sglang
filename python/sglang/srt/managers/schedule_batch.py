@@ -550,7 +550,7 @@ class Req:
         self.require_reasoning = require_reasoning
 
         # State indicating whether the reasoning phase has finished (only meaningful when require_reasoning is True)
-        self._reasoning_over = False
+        self._is_reasoning_over = False
         self.reasoning_tokens = 0
 
         # Sampling info
@@ -1152,11 +1152,11 @@ class Req:
         if not isinstance(token_id, list):
             token_id = [token_id]
 
-        if not self._reasoning_over:
+        if not self._is_reasoning_over:
             for tok_id in token_id:
                 self.reasoning_tokens += 1
                 if tok_id == think_end_id:
-                    self._reasoning_over = True
+                    self._is_reasoning_over = True
 
     def __repr__(self):
         return (
