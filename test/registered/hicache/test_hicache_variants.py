@@ -1,3 +1,8 @@
+from sglang.test.ci.ci_register import register_cuda_ci
+
+# HiCache variant tests (standard, MLA, EAGLE, page size)
+register_cuda_ci(est_time=368, suite="stage-b-test-small-1-gpu")
+
 """
 Consolidated HiCache variant tests.
 Tests HiCache with different configurations: standard, MLA, EAGLE, and page size variants.

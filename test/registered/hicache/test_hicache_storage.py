@@ -1,3 +1,8 @@
+from sglang.test.ci.ci_register import register_cuda_ci
+
+# HiCache storage tests (1-GPU)
+register_cuda_ci(est_time=96, suite="stage-b-test-small-1-gpu")
+
 import time
 import unittest
 from types import SimpleNamespace
