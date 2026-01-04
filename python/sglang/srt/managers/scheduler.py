@@ -120,7 +120,7 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.mm_utils import init_mm_embedding_cache
 from sglang.srt.managers.overlap_utils import FutureMap
-from sglang.srt.managers.prefill_delayer import PrefillDelayer
+from sglang.srt.managers.prefill_delayer import PrefillDelayer, PrefillDelayerSinglePassExecutor
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
     ModelWorkerBatch,
@@ -1911,7 +1911,8 @@ class Scheduler(
         return res
 
     def get_new_batch_prefill(self) -> Optional[ScheduleBatch]:
-        return self._get_new_batch_prefill_raw()
+        with PrefillDelayerSinglePassExecutor(self.prefill_delayer) as prefill_delayer_single_pass:
+            return self._get_new_batch_prefill_raw()
 
     def _get_new_batch_prefill_raw(self) -> Optional[ScheduleBatch]:
         # Check if the grammar is ready in the grammar queue

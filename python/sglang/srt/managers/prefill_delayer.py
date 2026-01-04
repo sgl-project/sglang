@@ -70,3 +70,8 @@ class PrefillDelayer:
 
         self.curr_delayed_count = 0
         return True
+
+
+class PrefillDelayerSinglePassExecutor:
+    def should_allow_prefill(self, local_prefillable: int) -> bool:
+        return TODO
