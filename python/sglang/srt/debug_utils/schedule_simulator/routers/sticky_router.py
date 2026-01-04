@@ -22,5 +22,5 @@ class StickyRouter(RouterPolicy):
     ) -> int:
         group_id = incoming_request.group_id
         if group_id is None:
-            return random.randint(0, len(gpu_states) - 1)
+            return random.randint(0, self._num_gpus - 1)
         return self._group_to_gpu[group_id]

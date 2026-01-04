@@ -7,9 +7,12 @@ from sglang.srt.debug_utils.schedule_simulator.routers.base import RouterPolicy
 
 
 class RandomRouter(RouterPolicy):
+    def __init__(self, num_gpus: int):
+        self._num_gpus = num_gpus
+
     def route(
         self,
         incoming_request: SimRequest,
         gpu_states: List[GPUState],
     ) -> int:
-        return random.randint(0, len(gpu_states) - 1)
+        return random.randint(0, self._num_gpus - 1)

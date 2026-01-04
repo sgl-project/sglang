@@ -144,14 +144,14 @@ class TestGPUState(CustomTestCase):
 
 class TestRouters(CustomTestCase):
     def test_round_robin(self):
-        router = RoundRobinRouter()
+        router = RoundRobinRouter(num_gpus=4)
         gpu_states = [GPUState(gpu_id=i, max_total_tokens=10000) for i in range(4)]
         req = SimRequest(request_id="r1", input_len=100, output_len=50)
         results = [router.route(req, gpu_states) for _ in range(8)]
         self.assertEqual(results, [0, 1, 2, 3, 0, 1, 2, 3])
 
     def test_random_router(self):
-        router = RandomRouter()
+        router = RandomRouter(num_gpus=4)
         gpu_states = [GPUState(gpu_id=i, max_total_tokens=10000) for i in range(4)]
         req = SimRequest(request_id="r1", input_len=100, output_len=50)
         results = [router.route(req, gpu_states) for _ in range(100)]
@@ -405,8 +405,8 @@ class TestSimulator(CustomTestCase):
             for i in range(10)
         ]
         sim = Simulator(
-            num_gpus=2,
-            router=RoundRobinRouter(),
+            num_gpus_per_engine=2,
+            router=RoundRobinRouter(num_gpus=2),
             scheduler=FIFOScheduler(),
             recorders=[
                 BatchSizeBalancednessRecorder(),
@@ -424,8 +424,8 @@ class TestSimulator(CustomTestCase):
             SimRequest(request_id=f"r{i}", input_len=10, output_len=3) for i in range(4)
         ]
         sim = Simulator(
-            num_gpus=2,
-            router=RoundRobinRouter(),
+            num_gpus_per_engine=2,
+            router=RoundRobinRouter(num_gpus=2),
             scheduler=FIFOScheduler(),
             max_total_tokens=10000,
         )
@@ -436,7 +436,9 @@ class TestSimulator(CustomTestCase):
 
     def test_empty_requests(self):
         sim = Simulator(
-            num_gpus=2, router=RoundRobinRouter(), scheduler=FIFOScheduler()
+            num_gpus_per_engine=2,
+            router=RoundRobinRouter(num_gpus=2),
+            scheduler=FIFOScheduler(),
         )
         result = sim.run([])
         self.assertEqual(result.summary, {})
@@ -447,8 +449,8 @@ class TestSimulator(CustomTestCase):
             SimRequest(request_id=f"r{i}", input_len=10, output_len=3) for i in range(4)
         ]
         sim = Simulator(
-            num_gpus=2,
-            router=RoundRobinRouter(),
+            num_gpus_per_engine=2,
+            router=RoundRobinRouter(num_gpus=2),
             scheduler=FIFOScheduler(),
             max_total_tokens=10000,
         )
@@ -460,23 +462,18 @@ class TestSimulator(CustomTestCase):
         self.assertEqual(len([r for r in result.step_records if r.step == 0]), 2)
 
     def test_preemption_due_to_token_growth(self):
-        # 2 requests on 1 GPU, each input_len=50, output_len=10
-        # max_total_tokens=110, so initially both can run (100 tokens)
-        # After 5 decode steps, total = 50+5 + 50+5 = 110, still ok
-        # After 6 decode steps, total = 50+6 + 50+6 = 112 > 110, need preempt
         requests = [
             SimRequest(request_id="r0", input_len=50, output_len=10),
             SimRequest(request_id="r1", input_len=50, output_len=10),
         ]
         sim = Simulator(
-            num_gpus=1,
-            router=RoundRobinRouter(),
+            num_gpus_per_engine=1,
+            router=RoundRobinRouter(num_gpus=1),
             scheduler=FIFOScheduler(),
             max_total_tokens=110,
         )
         result = sim.run(requests)
 
-        # Check that preemption happened at some point
         found_preemption = False
         for record in result.step_records:
             if record.running_count == 1 and record.pending_count == 1:
@@ -523,7 +520,7 @@ class TestCLI(CustomTestCase):
             output_file = f.name
 
         result = self._run_cli(
-            "--input", input_file, "--num-gpus", "2", "--output", output_file
+            "--input", input_file, "--num-gpus-per-engine", "2", "--output", output_file
         )
         self.assertEqual(result.returncode, 0, f"CLI failed: {result.stderr}")
         self.assertIn("Loaded 2 requests", result.stdout)
@@ -562,7 +559,7 @@ class TestCLI(CustomTestCase):
             "2",
             "--synth-seed",
             "42",
-            "--num-gpus",
+            "--num-gpus-per-engine",
             "2",
             "--router",
             "sticky",
@@ -586,7 +583,7 @@ class TestCLI(CustomTestCase):
             "128",
             "--synth-random-range-ratio",
             "0.5",
-            "--num-gpus",
+            "--num-gpus-per-engine",
             "4",
         )
         self.assertEqual(result.returncode, 0, f"CLI failed: {result.stderr}")
@@ -599,7 +596,7 @@ class TestCLI(CustomTestCase):
             "10",
             "--synth-random-output-len",
             "5",
-            "--num-gpus",
+            "--num-gpus-per-engine",
             "2",
             "--log-level",
             "1",
@@ -608,7 +605,6 @@ class TestCLI(CustomTestCase):
         self.assertIn("step=", result.stdout)
 
     def test_e2e_simple_no_queuing(self):
-        # 4 requests, input_len=10, output_len=2, 2 GPUs, all fit in memory
         result = self._run_cli(
             "--synthetic",
             "--synth-random-num-requests",
@@ -621,7 +617,7 @@ class TestCLI(CustomTestCase):
             "1.0",
             "--synth-seed",
             "42",
-            "--num-gpus",
+            "--num-gpus-per-engine",
             "2",
             "--max-total-tokens",
             "10000",
@@ -651,7 +647,7 @@ class TestCLI(CustomTestCase):
             "1.0",
             "--synth-seed",
             "42",
-            "--num-gpus",
+            "--num-gpus-per-engine",
             "1",
             "--max-total-tokens",
             "210",
@@ -683,7 +679,7 @@ step=5    | GPU0[R=0:- Q=0:-]""",
             "1.0",
             "--synth-seed",
             "42",
-            "--num-gpus",
+            "--num-gpus-per-engine",
             "1",
             "--max-total-tokens",
             "110",
@@ -717,7 +713,7 @@ step=13   | GPU0[R=0:- Q=0:-]""",
             "10",
             "--synth-seed",
             "42",
-            "--num-gpus",
+            "--num-gpus-per-engine",
             "2",
         )
         self.assertEqual(result.returncode, 0, f"CLI failed: {result.stderr}")
@@ -741,7 +737,7 @@ step=13   | GPU0[R=0:- Q=0:-]""",
                 "2",
                 "--synth-seed",
                 "42",
-                "--num-gpus",
+                "--num-gpus-per-engine",
                 "1",
                 "--max-total-tokens",
                 "80",
@@ -769,15 +765,17 @@ class TestLargerScale(CustomTestCase):
         result = self._run_main(
             "--synthetic",
             "--synth-random-num-requests",
-            "2000",
+            "500000",
             "--synth-random-input-len",
             "32000",
             "--synth-random-output-len",
             "2000",
             "--synth-seed",
             "42",
-            "--num-gpus",
+            "--num-gpus-per-engine",
             "8",
+            "--num-engines",
+            "250",
             "--router",
             "random",
             "--max-total-tokens",
@@ -797,9 +795,9 @@ class TestLargerScale(CustomTestCase):
         return self._run_main(
             "--synth-gsp",
             "--synth-gsp-num-groups",
-            "200",
+            "50000",
             "--synth-gsp-prompts-per-group",
-            "20",
+            "100",
             "--synth-gsp-system-prompt-len",
             "31000",
             "--synth-gsp-question-len",
@@ -808,8 +806,10 @@ class TestLargerScale(CustomTestCase):
             "8000",
             "--synth-seed",
             "42",
-            "--num-gpus",
+            "--num-gpus-per-engine",
             "8",
+            "--num-engines",
+            "250",
             "--router",
             router,
             "--max-total-tokens",

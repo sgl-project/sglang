@@ -17,7 +17,7 @@ class SimulationResult:
 class Simulator:
     def __init__(
         self,
-        num_gpus: int,
+        num_gpus_per_engine: int,
         router: RouterPolicy,
         scheduler: SchedulerPolicy,
         recorders: Optional[List[MetricRecorder]] = None,
@@ -26,7 +26,7 @@ class Simulator:
         stop_criteria: str = "all_done",
         max_steps: Optional[int] = None,
     ):
-        self.num_gpus = num_gpus
+        self.num_gpus_per_engine = num_gpus_per_engine
         self.router = router
         self.scheduler = scheduler
         self.recorders = recorders or []
@@ -40,7 +40,7 @@ class Simulator:
     def run(self, requests: List[SimRequest]) -> SimulationResult:
         self.gpu_states = [
             GPUState(gpu_id=i, max_total_tokens=self.max_total_tokens)
-            for i in range(self.num_gpus)
+            for i in range(self.num_gpus_per_engine)
         ]
         self.step = 0
         step_records: List[StepRecord] = []
@@ -76,7 +76,8 @@ class Simulator:
     def _route_requests(self, incoming_requests: List[SimRequest]) -> None:
         for req in incoming_requests:
             gpu_id = self.router.route(req, self.gpu_states)
-            self.gpu_states[gpu_id].pending_requests.append(req)
+            if gpu_id < self.num_gpus_per_engine:
+                self.gpu_states[gpu_id].pending_requests.append(req)
 
     def _schedule_all_gpus(self) -> None:
         for gpu in self.gpu_states:
