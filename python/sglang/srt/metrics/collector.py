@@ -895,23 +895,35 @@ class SchedulerMetricsCollector:
 
         self.realtime_tokens_total = Counter(
             name="sglang:realtime_tokens_total",
-            documentation="Total number of tokens processed (updated on each log interval).",
+            documentation=(
+                "Total number of tokens processed (updated on each log interval). "
+                "mode: prefill_compute, prefill_cache, decode."
+            ),
             labelnames=list(labels.keys()) + ["mode"],
         )
         self.gpu_execution_seconds_total = Counter(
             name="sglang:gpu_execution_seconds_total",
-            documentation="Total time that GPU is busy executing a workload.",
+            documentation=(
+                "Total time that GPU is busy executing a workload. "
+                "Refer to ForwardMode for category labels."
+            ),
             labelnames=list(labels.keys()) + ["category"],
         )
 
         self.dp_cooperation_realtime_tokens_total = Counter(
             name="sglang:dp_cooperation_realtime_tokens_total",
-            documentation="Total number of tokens processed with labels about DP cooperation.",
+            documentation=(
+                "Total number of tokens processed with labels about DP cooperation. "
+                "mode: prefill_compute, prefill_cache, decode."
+            ),
             labelnames=list(labels.keys()) + ["mode", "num_prefill_ranks"],
         )
         self.dp_cooperation_gpu_execution_seconds_total = Counter(
             name="sglang:dp_cooperation_gpu_execution_seconds_total",
-            documentation="Total time that GPU is busy executing a workload with labels about DP cooperation.",
+            documentation=(
+                "Total time that GPU is busy executing a workload with labels about DP cooperation. "
+                "Refer to ForwardMode for category labels."
+            ),
             labelnames=list(labels.keys()) + ["category", "num_prefill_ranks"],
         )
 
