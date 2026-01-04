@@ -21,8 +21,8 @@ from typing import TYPE_CHECKING, Any, Optional, Tuple
 import numpy as np
 import torch
 
-from sglang.srt.distributed.parallel_state import get_dcp_group
 from sglang.jit_kernel.norm import can_use_fused_inplace_qknorm, fused_inplace_qknorm
+from sglang.srt.distributed.parallel_state import get_dcp_group
 from sglang.srt.environ import envs
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
