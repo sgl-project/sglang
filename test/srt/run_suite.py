@@ -134,8 +134,9 @@ suites = {
         TestFile("test_deepseek_v3_mtp.py", 275),
         TestFile("test_disaggregation_hybrid_attention.py", 600),
         TestFile("models/test_kimi_k2_models.py", 200),
-        TestFile("test_deepseek_v32_basic.py", 275),
-        TestFile("test_deepseek_v32_mtp.py", 275),
+        TestFile("test_deepseek_v32_basic.py", 360),
+        TestFile("test_deepseek_v32_mtp.py", 360),
+        TestFile("test_deepseek_v32_cp_single_node.py", 360),
         TestFile("models/test_mimo_models.py", 200),
     ],
     "per-commit-8-gpu-h20": [
@@ -188,6 +189,7 @@ suites = {
         TestFile("test_profile_v2.py"),
         TestFile("models/test_ministral3_models.py"),
         TestFile("test_mistral_large3_basic.py"),
+        TestFile("test_prefill_delayer.py"),
     ],
 }
 
@@ -203,6 +205,7 @@ suite_amd = {
         # TestFile("lora/test_lora_backend.py", 99), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/13107
         # TestFile("lora/test_lora_cuda_graph.py", 250), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/13107
         # TestFile("lora/test_lora_qwen3.py", 97), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/13107
+        TestFile("dllm/test_llada2_mini_amd.py", 520),
         TestFile("models/test_compressed_tensors_models.py", 42),
         TestFile("models/test_cross_encoder_models.py", 150),
         TestFile("models/test_qwen_models.py", 82),
