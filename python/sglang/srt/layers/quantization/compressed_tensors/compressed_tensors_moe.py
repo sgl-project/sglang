@@ -859,7 +859,8 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
         self.quant_config = quant_config
         # TODO: @dsikka: refactor this to use schemes as other kernels
         # are supported + check if the layer is being ignored.
-        config = self.quant_config.target_scheme_map["Linear"].get("weights")
+        scheme = self.quant_config.target_scheme_map["Linear"]
+        config = scheme.get("weights")
         self.num_bits = config.num_bits
         self.packed_factor = 32 // config.num_bits
         self.strategy = config.strategy
@@ -867,8 +868,9 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
         self.actorder = config.actorder
         assert config.symmetric, "Only symmetric quantization is supported for MoE"
 
+        scheme_format = scheme.get("format", self.quant_config.quant_format)
         if not (
-            self.quant_config.quant_format == CompressionFormat.pack_quantized.value
+            scheme_format == CompressionFormat.pack_quantized.value
             and self.num_bits in WNA16_SUPPORTED_BITS
         ):
             raise ValueError(
