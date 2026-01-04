@@ -3,6 +3,5 @@ from sglang.srt.debug_utils.schedule_simulator.entrypoint import create_arg_pars
 if __name__ == "__main__":
     parser = create_arg_parser()
     args = parser.parse_args()
-    df = main(args)
-    print(f"\nDataFrame shape: {df.shape}")
-    print(df.head(20))
+    result = main(args)
+    print(f"\nTotal steps: {len(result.step_records)}")
