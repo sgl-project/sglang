@@ -469,17 +469,25 @@ class SchedulerOutputProcessorMixin:
                     should_record = False
 
                 if should_record:
-                    req.attention_tokens.append(
-                        {
-                            "token_positions": logits_output.attention_token_positions[i]
-                            .cpu()
-                            .tolist(),
-                            "attention_scores": logits_output.attention_token_scores[i]
-                            .cpu()
-                            .tolist(),
-                            "layer_id": getattr(logits_output, "attention_layer_id", -1),
-                        }
-                    )
+                    attention_info = {
+                        "token_positions": logits_output.attention_token_positions[i]
+                        .cpu()
+                        .tolist(),
+                        "attention_scores": logits_output.attention_token_scores[i]
+                        .cpu()
+                        .tolist(),
+                        "layer_id": getattr(logits_output, "attention_layer_id", -1),
+                    }
+                    # Add true probability info if available
+                    if logits_output.attention_topk_logits is not None:
+                        attention_info["topk_logits"] = (
+                            logits_output.attention_topk_logits[i].cpu().tolist()
+                        )
+                    if logits_output.attention_logsumexp_all is not None:
+                        attention_info["logsumexp_all"] = (
+                            logits_output.attention_logsumexp_all[i].cpu().item()
+                        )
+                    req.attention_tokens.append(attention_info)
 
             if req.grammar is not None:
                 # FIXME: this try-except block is for handling unexpected xgrammar issue.

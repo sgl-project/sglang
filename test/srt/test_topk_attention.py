@@ -141,8 +141,8 @@ class TestTopkAttention(CustomTestCase):
 
         sm_scale = 1.0 / (head_dim**0.5)
 
-        # Run the chunked kernel
-        topk_scores, topk_indices = compute_topk_attention_chunked(
+        # Run the chunked kernel (returns 4-tuple: scores, indices, logits, logsumexp)
+        topk_scores, topk_indices, topk_logits, logsumexp_all = compute_topk_attention_chunked(
             q, k_buffer, kv_indptr, kv_indices, sm_scale, top_k
         )
 
@@ -150,6 +150,10 @@ class TestTopkAttention(CustomTestCase):
         ref_scores, ref_indices = topk_attention_reference(
             q, k_buffer, kv_indptr, kv_indices, sm_scale, top_k
         )
+
+        # Verify logits and logsumexp shapes
+        self.assertEqual(topk_logits.shape, (batch_size, top_k))
+        self.assertEqual(logsumexp_all.shape, (batch_size,))
 
         # Check shapes
         self.assertEqual(topk_scores.shape, (batch_size, top_k))
@@ -249,13 +253,15 @@ class TestTopkAttention(CustomTestCase):
         kv_indices = torch.zeros(0, dtype=torch.int32, device=device)
         sm_scale = 1.0 / (head_dim**0.5)
 
-        topk_scores, topk_indices = compute_topk_attention_chunked(
+        topk_scores, topk_indices, topk_logits, logsumexp_all = compute_topk_attention_chunked(
             q, k_buffer, kv_indptr, kv_indices, sm_scale, top_k
         )
 
         # Should return zeros for empty sequences
         self.assertEqual(topk_scores.shape, (batch_size, top_k))
         self.assertEqual(topk_indices.shape, (batch_size, top_k))
+        self.assertEqual(topk_logits.shape, (batch_size, top_k))
+        self.assertEqual(logsumexp_all.shape, (batch_size,))
         self.assertTrue(torch.all(topk_scores == 0))
         self.assertTrue(torch.all(topk_indices == 0))
 
@@ -298,7 +304,7 @@ class TestTopkAttention(CustomTestCase):
         sm_scale = 1.0 / (head_dim ** 0.5)
 
         # This should not OOM due to chunked approach
-        topk_scores, topk_indices = compute_topk_attention_chunked(
+        topk_scores, topk_indices, topk_logits, logsumexp_all = compute_topk_attention_chunked(
             q, k_buffer, kv_indptr, kv_indices, sm_scale,
             top_k=top_k, chunk_size=2048
         )
@@ -306,6 +312,8 @@ class TestTopkAttention(CustomTestCase):
         # Verify results
         self.assertEqual(topk_scores.shape, (batch_size, top_k))
         self.assertEqual(topk_indices.shape, (batch_size, top_k))
+        self.assertEqual(topk_logits.shape, (batch_size, top_k))
+        self.assertEqual(logsumexp_all.shape, (batch_size,))
 
         # Indices should be within valid range
         self.assertTrue(torch.all(topk_indices >= 0))
@@ -352,8 +360,20 @@ class TestTopkAttention(CustomTestCase):
         # Check result structure
         self.assertIn("scores", result)
         self.assertIn("indices", result)
+        self.assertIn("logits", result)
+        self.assertIn("logsumexp", result)
         self.assertEqual(result["scores"].shape, (batch_size, top_k))
         self.assertEqual(result["indices"].shape, (batch_size, top_k))
+        self.assertEqual(result["logits"].shape, (batch_size, top_k))
+        self.assertEqual(result["logsumexp"].shape, (batch_size,))
+
+        # Verify true probability calculation works
+        for b in range(batch_size):
+            logits = result["logits"][b]
+            logsumexp = result["logsumexp"][b]
+            true_probs = torch.exp(logits - logsumexp)
+            # True probs should sum to <= 1 (since we only have top-k)
+            self.assertLessEqual(true_probs.sum().item(), 1.0 + 1e-5)
 
         # Test format_for_response (matches frontend schema)
         formatted = capture.format_for_response(result, layer_id=42)
@@ -361,9 +381,13 @@ class TestTopkAttention(CustomTestCase):
         for item in formatted:
             self.assertIn("token_positions", item)
             self.assertIn("attention_scores", item)
+            self.assertIn("topk_logits", item)
+            self.assertIn("logsumexp_all", item)
             self.assertIn("layer_id", item)
             self.assertEqual(len(item["token_positions"]), top_k)
             self.assertEqual(len(item["attention_scores"]), top_k)
+            self.assertEqual(len(item["topk_logits"]), top_k)
+            self.assertIsInstance(item["logsumexp_all"], float)
             self.assertEqual(item["layer_id"], 42)
 
 
