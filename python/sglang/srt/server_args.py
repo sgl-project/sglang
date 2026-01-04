@@ -607,6 +607,8 @@ class ServerArgs:
     # Attention token capture (for interpretability/visualization)
     return_attention_tokens: bool = False
     attention_tokens_top_k: int = 5
+    attention_tokens_max: int = 4096  # Max tokens to record (0 = unlimited)
+    attention_tokens_stride: int = 1  # Record every Nth token (1 = all)
 
     # PD disaggregation: can be "null" (not disaggregated), "prefill" (prefill-only), or "decode" (decode-only)
     disaggregation_mode: Literal["null", "prefill", "decode"] = "null"
@@ -4426,6 +4428,18 @@ class ServerArgs:
             type=int,
             default=ServerArgs.attention_tokens_top_k,
             help="Number of top attention tokens to return per generated token (default: 5).",
+        )
+        parser.add_argument(
+            "--attention-tokens-max",
+            type=int,
+            default=ServerArgs.attention_tokens_max,
+            help="Maximum number of tokens to record attention for. Use 0 for unlimited. (default: 4096)",
+        )
+        parser.add_argument(
+            "--attention-tokens-stride",
+            type=int,
+            default=ServerArgs.attention_tokens_stride,
+            help="Record attention every Nth token. Use 1 to record all tokens. (default: 1)",
         )
 
         # PD disaggregation

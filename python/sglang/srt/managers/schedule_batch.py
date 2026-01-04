@@ -575,6 +575,7 @@ class Req:
         self.return_hidden_states = return_hidden_states
         self.return_attention_tokens = return_attention_tokens
         self.attention_tokens: List[Dict] = []  # Per-token attention info
+        self.attention_tokens_decode_step: int = 0  # Counter for stride calculation
 
         # extra key for classifying the request (e.g. cache_salt)
         if lora_id is not None:
