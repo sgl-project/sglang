@@ -5,7 +5,7 @@ set -euo pipefail
 SGLANG_VERSION="v0.5.5"   # Default version, will be overridden if git tags are found
 
 # Fetch tags from origin to ensure we have the latest
-if git fetch --tags origin 2>/dev/null; then
+if git fetch --tags origin; then
   # Get the latest version tag sorted by version number (e.g., v0.5.7)
   VERSION_FROM_TAG=$(git tag -l 'v[0-9]*' --sort=-v:refname | head -1)
   if [ -n "$VERSION_FROM_TAG" ]; then
