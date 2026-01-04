@@ -53,8 +53,8 @@ class TestPrefillDelayerThroughput(CustomTestCase):
                 random_output_len=256,
             ),
             other_launch_args=[
-                "--max-running-requests",
-                "10",
+                "--max-total-tokens",
+                "1000000",
             ],
         )
 
