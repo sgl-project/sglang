@@ -634,12 +634,9 @@ def _prepare_kontext_latent_ids(
 
     latent_image_ids = torch.zeros(height, width, 3)
     latent_image_ids[..., 0] = t_coord  # time coordinate
-    latent_image_ids[..., 1] = (
-        latent_image_ids[..., 1] + torch.arange(height)[:, None]
-    )
-    latent_image_ids[..., 2] = (
-        latent_image_ids[..., 2] + torch.arange(width)[None, :]
-    )
+    latent_image_ids[..., 1] = torch.arange(height)[:, None]
+    latent_image_ids[..., 2] = torch.arange(width)[None, :]
+
 
     latent_image_ids = latent_image_ids.reshape(height * width, 3)
     return latent_image_ids
