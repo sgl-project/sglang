@@ -285,8 +285,8 @@ jobs:
         if: always()
         run: sccache --show-stats
 
-  benchmark-tree:
-    name: Tree Benchmark
+  benchmark-radix-tree:
+    name: Radix Tree Benchmark (StringTree vs TokenTree)
     if: |
       github.repository == 'sgl-project/sglang' &&
       (github.event_name == 'push' ||
@@ -322,7 +322,7 @@ jobs:
           # Save cache even on failure
           save-if: true
 
-      - name: Run tree benchmark
+      - name: Run radix tree benchmark
         timeout-minutes: 30
         run: |
           source "$HOME/.cargo/env"
@@ -343,16 +343,14 @@ jobs:
           else
             echo "sccache not available, using regular cargo"
           fi
-          # Run summary benchmark for quick validation in CI
-          # Note: Don't use --exact because benchmark names are prefixed (benchmark_summary/insert_realistic)
-          # Capture output to file for CI summary
-          cargo bench --bench tree_benchmark -- benchmark_summary 2>&1 | tee benchmark_output.txt
+          # Run StringTree vs TokenTree comparison benchmark
+          cargo bench --bench radix_tree_benchmark -- benchmark_summary 2>&1 | tee benchmark_output.txt
 
       - name: Upload benchmark results
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: tree-results-${{ github.sha }}
+          name: radix-tree-results-${{ github.sha }}
           path: |
             sgl-model-gateway/target/criterion/benchmark_summary*/
             sgl-model-gateway/benchmark_output.txt
@@ -364,7 +362,7 @@ jobs:
 
   benchmark-summary:
     name: Benchmark Summary
-    needs: [benchmark-request-processing, benchmark-tokenizer, benchmark-tool-parser, benchmark-tree]
+    needs: [benchmark-request-processing, benchmark-tokenizer, benchmark-tool-parser, benchmark-radix-tree]
     if: always() && (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request')
     runs-on: ubuntu-latest
     steps:
@@ -442,19 +440,19 @@ jobs:
           fi
           echo "" >> summary.md
 
-          # Tree Benchmark
-          echo "### Radix Tree (Cache-Aware Routing)" >> summary.md
-          TREE_DIR="benchmark-results/tree-results-${{ github.sha }}"
-          if [ -d "$TREE_DIR" ]; then
+          # Radix Tree Benchmark (StringTree vs TokenTree)
+          echo "### Radix Tree - StringTree vs TokenTree" >> summary.md
+          RADIX_DIR="benchmark-results/radix-tree-results-${{ github.sha }}"
+          if [ -d "$RADIX_DIR" ]; then
             echo "✅ **Completed**" >> summary.md
-            if [ -f "$TREE_DIR/benchmark_output.txt" ]; then
+            if [ -f "$RADIX_DIR/benchmark_output.txt" ]; then
               echo "" >> summary.md
               echo "<details>" >> summary.md
               echo "<summary>View Results</summary>" >> summary.md
               echo "" >> summary.md
               echo '```' >> summary.md
-              # Extract the full summary table (avoids duplication with [BENCH_RESULT] lines)
-              grep -A 50 "RADIX TREE BENCHMARK SUMMARY" "$TREE_DIR/benchmark_output.txt" | head -50 >> summary.md || cat "$TREE_DIR/benchmark_output.txt" | tail -50 >> summary.md
+              # Extract the full summary table
+              grep -A 80 "RADIX TREE BENCHMARK SUMMARY" "$RADIX_DIR/benchmark_output.txt" | head -80 >> summary.md || cat "$RADIX_DIR/benchmark_output.txt" | tail -80 >> summary.md
               echo '```' >> summary.md
               echo "</details>" >> summary.md
             fi

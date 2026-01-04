@@ -10,6 +10,7 @@ pub mod multimodal;
 pub mod observability;
 pub mod policies;
 pub mod protocols;
+pub mod radix_tree;
 pub mod reasoning_parser;
 pub mod routers;
 pub mod server;
