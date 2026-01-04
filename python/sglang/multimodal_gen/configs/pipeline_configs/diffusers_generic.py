@@ -29,7 +29,7 @@ class DiffusersGenericPipelineConfig(PipelineConfig):
     task_type: ModelTaskType = ModelTaskType.T2I
 
     dit_precision: str = "bf16"
-    vae_precision: str = "fp32"
+    vae_precision: str = "bf16"
 
     should_use_guidance: bool = True
     embedded_cfg_scale: float = 1.0
