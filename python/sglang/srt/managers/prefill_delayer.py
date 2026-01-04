@@ -35,9 +35,9 @@ class PrefillDelayer:
             not server_args.disable_overlap_schedule
         ), "To use PrefillDelayer, disable_overlap_schedule must be False."
 
-    def _gather_info(self, local_prefillable: int):
+    def _gather_info(self, local_prefillable: bool):
         local_info = torch.tensor(
-            [local_prefillable],
+            [int(local_prefillable)],
             device="cpu",
             dtype=torch.int64,
         )
@@ -49,7 +49,7 @@ class PrefillDelayer:
         tp0_info = self.global_info[:, 0, :]
         return tp0_info
 
-    def _should_allow_prefill(self, local_prefillable: int) -> bool:
+    def _should_allow_prefill(self, local_prefillable: bool) -> bool:
         tp0_info = self._gather_info(local_prefillable=local_prefillable)
         global_prefillable = tp0_info[:, 0]
         global_exists_not_prefillable = global_prefillable.min().item() == 0
@@ -84,7 +84,7 @@ class PrefillDelayerSinglePassExecutor:
         self.should_allow_prefill(local_prefillable=False)
         return False
 
-    def should_allow_prefill(self, local_prefillable: int) -> bool:
+    def should_allow_prefill(self, local_prefillable: bool) -> bool:
         assert not self._called
         self._called = True
         return self._prefill_delayer._should_allow_prefill(local_prefillable=local_prefillable)
