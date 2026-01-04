@@ -97,9 +97,7 @@ def benchmark(*, data, batch_size, sequential_fn, batch_fn, num_runs, batch_mode
         }
 
     if run_batch:
-        batch_times = measure_times(
-            fn=lambda: batch_fn(batch_data), num_runs=num_runs
-        )
+        batch_times = measure_times(fn=lambda: batch_fn(batch_data), num_runs=num_runs)
         out |= {
             "avg_batch_ms": mean(batch_times),
             "batch_runs": batch_times,
