@@ -1138,14 +1138,12 @@ def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
 
 def is_hybrid_swa_model(model_architectures: List[str]):
 
-    if (
-        "Llama4ForConditionalGeneration" in model_architectures
-        or "MiMoV2FlashForCausalLM" in model_architectures
-        or "MiMoV2MTP" in model_architectures
-    ):
-        return True
-    else:
-        return False
+    hybrid_swa_archs = {
+        "Llama4ForConditionalGeneration",
+        "MiMoV2FlashForCausalLM",
+        "MiMoV2MTP",
+    }
+    return any(arch in hybrid_swa_archs for arch in model_architectures)
 
 
 def get_hybrid_layer_ids(
