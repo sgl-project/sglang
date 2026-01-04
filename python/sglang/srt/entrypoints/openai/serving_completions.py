@@ -118,6 +118,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
             bootstrap_room=request.bootstrap_room,
             data_parallel_rank=request.data_parallel_rank,
             return_hidden_states=request.return_hidden_states,
+            return_attention_tokens=request.return_attention_tokens,
             rid=request.rid,
             extra_key=self._compute_extra_key(request),
             priority=request.priority,
@@ -410,6 +411,11 @@ class OpenAIServingCompletion(OpenAIServingBase):
             # Handle hidden states
             hidden_states = process_hidden_states_from_ret(ret_item, request)
 
+            # Handle attention tokens (interpretability)
+            attention_tokens = None
+            if request.return_attention_tokens:
+                attention_tokens = ret_item["meta_info"].get("attention_tokens")
+
             finish_reason = ret_item["meta_info"]["finish_reason"]
 
             choice_data = CompletionResponseChoice(
@@ -423,6 +429,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
                     else None
                 ),
                 hidden_states=hidden_states,
+                attention_tokens=attention_tokens,
             )
             choices.append(choice_data)
 

@@ -272,6 +272,9 @@ class CompletionRequest(BaseModel):
     # For custom metric labels
     custom_labels: Optional[Dict[str, str]] = None
 
+    # For attention token capture (interpretability)
+    return_attention_tokens: bool = False
+
     @field_validator("max_tokens")
     @classmethod
     def validate_max_tokens_positive(cls, v):
@@ -287,6 +290,8 @@ class CompletionResponseChoice(BaseModel):
     finish_reason: Optional[Literal["stop", "length", "content_filter", "abort"]] = None
     matched_stop: Union[None, int, str] = None
     hidden_states: Optional[object] = None
+    # Top-k attention tokens per generated token for interpretability
+    attention_tokens: Optional[List[Dict]] = None
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler):

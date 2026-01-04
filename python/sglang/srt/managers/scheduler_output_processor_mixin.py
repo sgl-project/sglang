@@ -447,6 +447,22 @@ class SchedulerOutputProcessorMixin:
                     logits_output.hidden_states[i].cpu().clone().tolist()
                 )
 
+            # Process attention token info for interpretability
+            if (
+                req.return_attention_tokens
+                and logits_output.attention_token_positions is not None
+            ):
+                req.attention_tokens.append(
+                    {
+                        "positions": logits_output.attention_token_positions[i]
+                        .cpu()
+                        .tolist(),
+                        "scores": logits_output.attention_token_scores[i]
+                        .cpu()
+                        .tolist(),
+                    }
+                )
+
             if req.grammar is not None:
                 # FIXME: this try-except block is for handling unexpected xgrammar issue.
                 try:
@@ -854,6 +870,7 @@ class SchedulerOutputProcessorMixin:
         load = self.get_load()
         output_routed_experts = None
         customized_info = {}
+        output_attention_tokens = None
 
         queue_times = []
         forward_entry_times = []
@@ -1059,6 +1076,11 @@ class SchedulerOutputProcessorMixin:
                             customized_info[k] = []
                         customized_info[k].append(v)
 
+                if req.return_attention_tokens:
+                    if output_attention_tokens is None:
+                        output_attention_tokens = []
+                    output_attention_tokens.append(req.attention_tokens)
+
             if (
                 req.finished()
                 and self.attn_tp_rank == 0
@@ -1109,6 +1131,7 @@ class SchedulerOutputProcessorMixin:
                     output_hidden_states=output_hidden_states,
                     output_routed_experts=output_routed_experts,
                     customized_info=customized_info,
+                    output_attention_tokens=output_attention_tokens,
                     placeholder_tokens_idx=None,
                     placeholder_tokens_val=None,
                     retraction_counts=retraction_counts,
