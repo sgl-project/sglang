@@ -406,7 +406,7 @@ class TestReleaseMemoryOccupation(CustomTestCase):
         engine.shutdown()
 
     def test_hybrid_mamba_model_release_and_resume(self):
-        # Test with MoE model
+        # Test with Hybrid Mamba model
         model_name = DEFAULT_HYBRID_MAMBA_MODEL_NAME_FOR_TEST
 
         tp_size = 4
