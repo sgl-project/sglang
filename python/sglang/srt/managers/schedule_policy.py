@@ -33,7 +33,7 @@ from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
 from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
-from sglang.srt.server_args import ServerArgs
+from sglang.srt.server_args import ServerArgs, get_global_server_args
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
@@ -333,6 +333,9 @@ class PrefillAdder:
     ):
         self.page_size = page_size
         self.tree_cache = tree_cache
+        self.enable_hierarchical_cache_direct = (
+            get_global_server_args().enable_hierarchical_cache_direct
+        )
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         self.running_batch = running_batch
         self.new_token_ratio = new_token_ratio
@@ -604,14 +607,17 @@ class PrefillAdder:
             if total_tokens >= self.rem_total_tokens:
                 return AddReqResult.NO_TOKEN
 
-            if req.host_hit_length > 0:
+            if req.host_hit_length > 0 or self.enable_hierarchical_cache_direct:
                 new_indices, req.last_node = self.tree_cache.init_load_back(
-                    req.last_host_node, req.host_hit_length
+                    req.last_host_node, req.host_hit_length, req
                 )
-                req.prefix_indices = torch.cat([req.prefix_indices, new_indices])
-                req.set_extend_input_len(len(req.fill_ids) - len(req.prefix_indices))
-                prefix_len = len(req.prefix_indices)
-                req.cache_protected_len = prefix_len
+                if new_indices is not None:
+                    req.prefix_indices = torch.cat([req.prefix_indices, new_indices])
+                    req.set_extend_input_len(
+                        len(req.fill_ids) - len(req.prefix_indices)
+                    )
+                    prefix_len = len(req.prefix_indices)
+                    req.cache_protected_len = prefix_len
 
             input_tokens = self.ceil_paged_tokens(req.extend_input_len)
 
