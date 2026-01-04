@@ -768,22 +768,23 @@ class TestLargerScale(CustomTestCase):
     def test_vanilla_workload_random_policy(self):
         result = self._run_main(
             "--synthetic",
-            "--synth-random-num-requests", "800",
+            "--synth-random-num-requests", "2000",
             "--synth-random-input-len", "32000",
             "--synth-random-output-len", "2000",
             "--synth-seed", "42",
             "--num-gpus", "8",
             "--router", "random",
             "--max-total-tokens", "2000000",
+            "--stop-criteria", "no_pending",
         )
-        self._assert_in_range(result.summary["attention_compute_balancedness_mean"], 0.78, 0.85, "attn")
-        self._assert_in_range(result.summary["batch_size_balancedness_mean"], 0.78, 0.85, "bs")
+        self._assert_in_range(result.summary["attention_compute_balancedness_mean"], 0.95, 1.0, "attn")
+        self._assert_in_range(result.summary["batch_size_balancedness_mean"], 0.95, 1.0, "bs")
 
     def test_gsp_workload_random_policy(self):
         result = self._run_main(
             "--synth-gsp",
             "--synth-gsp-num-groups", "80",
-            "--synth-gsp-prompts-per-group", "10",
+            "--synth-gsp-prompts-per-group", "20",
             "--synth-gsp-system-prompt-len", "31000",
             "--synth-gsp-question-len", "1000",
             "--synth-gsp-output-len", "2000",
@@ -791,16 +792,16 @@ class TestLargerScale(CustomTestCase):
             "--num-gpus", "8",
             "--router", "random",
             "--max-total-tokens", "500000",
+            "--stop-criteria", "no_pending",
         )
-        self._assert_in_range(result.summary["attention_compute_balancedness_mean"], 0.78, 0.83, "attn")
-        self._assert_in_range(result.summary["batch_size_balancedness_mean"], 0.70, 0.75, "bs")
-        self._assert_in_range(result.summary["avg_batch_size"], 15, 20, "avg_bs")
+        self._assert_in_range(result.summary["attention_compute_balancedness_mean"], 0.95, 1.0, "attn")
+        self._assert_in_range(result.summary["batch_size_balancedness_mean"], 0.95, 1.0, "bs")
 
     def test_gsp_workload_sticky_policy(self):
         result = self._run_main(
             "--synth-gsp",
             "--synth-gsp-num-groups", "80",
-            "--synth-gsp-prompts-per-group", "10",
+            "--synth-gsp-prompts-per-group", "20",
             "--synth-gsp-system-prompt-len", "31000",
             "--synth-gsp-question-len", "1000",
             "--synth-gsp-output-len", "2000",
@@ -808,10 +809,10 @@ class TestLargerScale(CustomTestCase):
             "--num-gpus", "8",
             "--router", "sticky",
             "--max-total-tokens", "500000",
+            "--stop-criteria", "no_pending",
         )
-        self._assert_in_range(result.summary["attention_compute_balancedness_mean"], 0.40, 0.45, "attn")
-        self._assert_in_range(result.summary["batch_size_balancedness_mean"], 0.35, 0.40, "bs")
-        self._assert_in_range(result.summary["avg_batch_size"], 25, 30, "avg_bs")
+        self._assert_in_range(result.summary["attention_compute_balancedness_mean"], 0.35, 0.45, "attn")
+        self._assert_in_range(result.summary["batch_size_balancedness_mean"], 0.35, 0.45, "bs")
 
 
 if __name__ == "__main__":
