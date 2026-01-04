@@ -760,11 +760,11 @@ class SchedulerOutputProcessorMixin:
                         lse_val = logits_output.attention_logsumexp_candidates[i].cpu().item()
                         attention_info["logsumexp_candidates"] = lse_val
                         # Compute topk_mass for top-level (backward compat)
+                        # Use vectorized torch ops (not Python loop)
                         if logits_output.attention_topk_logits is not None:
-                            import math
-                            topk_logits_list = logits_output.attention_topk_logits[i].cpu().tolist()[:req_top_k]
-                            topk_mass = sum(math.exp(l - lse_val) for l in topk_logits_list if l is not None)
-                            attention_info["topk_mass"] = min(topk_mass, 1.0)
+                            logits_tensor = logits_output.attention_topk_logits[i][:req_top_k]
+                            topk_mass = torch.exp(logits_tensor - lse_val).sum().clamp(max=1.0).item()
+                            attention_info["topk_mass"] = topk_mass
                 else:
                     # Single-layer capture (backward compatible format)
                     attention_info = {
