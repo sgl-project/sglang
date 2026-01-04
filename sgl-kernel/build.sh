@@ -55,6 +55,7 @@ docker run --rm \
    -e ENABLE_CMAKE_PROFILE="${ENABLE_CMAKE_PROFILE:-}" \
    -e ENABLE_BUILD_PROFILE="${ENABLE_BUILD_PROFILE:-}" \
    -e USE_CCACHE="${USE_CCACHE:-1}" \
+   -e CMAKE_EXTRA_ARGS="${CMAKE_EXTRA_ARGS:-}" \
    ${DOCKER_IMAGE} \
    bash -c "
    set -e
@@ -174,6 +175,10 @@ docker run --rm \
    if [ -n \"${ENABLE_BUILD_PROFILE}\" ]; then
       echo \"Ninja build profiling enabled - will save to /sgl-kernel/build-trace.json\"
    fi
+
+   # Merge Extra CMake options into CMAKE_ARGS
+   export CMAKE_ARGS=\"\${CMAKE_ARGS:+\${CMAKE_ARGS} }\${CMAKE_EXTRA_ARGS:-}\"
+   echo \"CMAKE_ARGS= \$CMAKE_ARGS\"
 
    PYTHONPATH=${PYTHON_ROOT_PATH}/lib/python${PYTHON_VERSION}/site-packages ${PYTHON_ROOT_PATH}/bin/python -m uv build --wheel -Cbuild-dir=build . --color=always --no-build-isolation && \
    ./rename_wheels.sh
