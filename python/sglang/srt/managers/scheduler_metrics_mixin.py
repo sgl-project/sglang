@@ -222,6 +222,7 @@ class SchedulerMetricsMixin:
             self.stats.cache_hit_rate = cache_hit_rate
 
             self.stats.max_total_num_tokens = self.max_total_num_tokens
+            self.stats.kv_size_bytes = self.kv_size_bytes
 
             # Retract
             self.stats.num_retracted_reqs = self.num_retracted_reqs

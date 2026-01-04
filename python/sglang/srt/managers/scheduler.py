@@ -619,6 +619,20 @@ class Scheduler(
             self.tp_worker.get_memory_pool()
         )
 
+        try:
+            kv_size_bytes = (
+                self.token_to_kv_pool_allocator.get_kvcache().get_kv_size_bytes()
+            )
+
+            # Handle both tuple (K, V) and single value returns
+            if isinstance(kv_size_bytes, tuple):
+                kv_size_bytes = sum(kv_size_bytes)
+
+            self.kv_size_bytes = int(kv_size_bytes)
+
+        except Exception as e:
+            logger.warning(f"Failed to get KV cache size from scheduler: {e}")
+
         # Create cache
         params = CacheInitParams(
             disable=server_args.disable_radix_cache,
@@ -2911,11 +2925,21 @@ def run_scheduler_process(
             pp_rank,
             dp_rank,
         )
+
         result_dict = {
             "status": "ready",
             "max_total_num_tokens": scheduler.max_total_num_tokens,
             "max_req_input_len": scheduler.max_req_input_len,
         }
+
+        # Add kv size info if exists
+        if hasattr(scheduler, "kv_size_bytes") and scheduler.kv_size_bytes is not None:
+            result_dict.update(
+                {
+                    "kv_size_bytes": scheduler.kv_size_bytes,  # Initialized in init_metrics
+                    "kv_size_gb": scheduler.kv_size_bytes / (1024**3),  # in GB
+                }
+            )
         if server_args.remote_instance_weight_loader_use_transfer_engine():
             (
                 remote_instance_transfer_engine_session_id,

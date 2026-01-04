@@ -209,6 +209,7 @@ class SchedulerStats:
     cache_hit_rate: float = 0.0
 
     max_total_num_tokens: int = 0
+    kv_size_bytes: int = 0
 
     # Speculative decoding
     spec_accept_length: float = 0.0
@@ -355,6 +356,13 @@ class SchedulerMetricsCollector:
         self.max_total_num_tokens = Gauge(
             name="sglang:max_total_num_tokens",
             documentation="Maximum total number of tokens in the KV cache pool.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+
+        self.kv_size_bytes = Gauge(
+            name="sglang:kv_size_bytes",
+            documentation="KV Cache size in bytes.",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
@@ -849,6 +857,7 @@ class SchedulerMetricsCollector:
         self._log_gauge(self.cache_hit_rate, stats.cache_hit_rate)
 
         self._log_gauge(self.max_total_num_tokens, stats.max_total_num_tokens)
+        self._log_gauge(self.kv_size_bytes, stats.kv_size_bytes)
 
         # Speculative decoding
         self._log_gauge(self.spec_accept_length, stats.spec_accept_length)
