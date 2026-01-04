@@ -81,7 +81,8 @@ class PrefillDelayerSinglePassExecutor:
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        self.should_allow_prefill(local_prefillable=False)
+        if not self._called:
+            self.should_allow_prefill(local_prefillable=False)
         return False
 
     def should_allow_prefill(self, local_prefillable: bool) -> bool:
