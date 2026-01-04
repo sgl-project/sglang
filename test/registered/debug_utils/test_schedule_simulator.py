@@ -765,7 +765,7 @@ class TestLargerScale(CustomTestCase):
         self.assertGreaterEqual(value, lo, f"{name}={value} < {lo}")
         self.assertLessEqual(value, hi, f"{name}={value} > {hi}")
 
-    def test_non_gsp_random_policy(self):
+    def test_vanilla_workload_random_policy(self):
         result = self._run_main(
             "--synthetic",
             "--synth-random-num-requests", "1000",
@@ -779,7 +779,7 @@ class TestLargerScale(CustomTestCase):
         self._assert_in_range(result.summary["attention_compute_balancedness_mean"], 0.7, 0.85, "attn")
         self._assert_in_range(result.summary["batch_size_balancedness_mean"], 0.7, 0.85, "bs")
 
-    def test_gsp_random_policy(self):
+    def test_gsp_workload_random_policy(self):
         result = self._run_main(
             "--synth-gsp",
             "--synth-gsp-num-groups", "10",
@@ -795,7 +795,7 @@ class TestLargerScale(CustomTestCase):
         self._assert_in_range(result.summary["attention_compute_balancedness_mean"], 0.9, 1.0, "attn")
         self._assert_in_range(result.summary["batch_size_balancedness_mean"], 0.9, 1.0, "bs")
 
-    def test_gsp_sticky_policy(self):
+    def test_gsp_workload_sticky_policy(self):
         result = self._run_main(
             "--synth-gsp",
             "--synth-gsp-num-groups", "10",
