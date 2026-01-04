@@ -1911,6 +1911,9 @@ class Scheduler(
         return res
 
     def get_new_batch_prefill(self) -> Optional[ScheduleBatch]:
+        return self._get_new_batch_prefill_raw()
+
+    def _get_new_batch_prefill_raw(self) -> Optional[ScheduleBatch]:
         # Check if the grammar is ready in the grammar queue
         if self.grammar_queue:
             self.move_ready_grammar_requests()
