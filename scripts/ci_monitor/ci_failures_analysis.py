@@ -180,31 +180,24 @@ class SGLangFailuresAnalyzer:
             print(f"  Found {len(all_runners)} self-hosted runners")
 
             # Group runners by their labels (excluding common labels like "self-hosted")
+            # A runner can have multiple labels, so count it for each relevant label
             runner_stats_by_label = defaultdict(
                 lambda: {"online": 0, "total": 0, "busy": 0}
             )
 
+            # Common labels to exclude (not useful for grouping)
+            excluded_labels = {"self-hosted", "Linux", "X64", "ARM64"}
+
             for runner in all_runners:
-                # Get custom labels (filter out generic ones)
+                # Get all custom/relevant labels for this runner
                 labels = [
                     label.get("name", "")
                     for label in runner.get("labels", [])
-                    if label.get("type") == "custom"
-                    or label.get("name", "").endswith("-runner")
+                    if label.get("name", "") not in excluded_labels
                 ]
 
-                # Use the most specific label (usually the one with GPU info)
-                # Prioritize labels with "gpu" in them
-                runner_label = None
-                for label in labels:
-                    if "gpu" in label.lower() or label.endswith("-runner"):
-                        runner_label = label
-                        break
-
-                if not runner_label and labels:
-                    runner_label = labels[0]
-
-                if runner_label:
+                # Count this runner for EACH of its relevant labels
+                for runner_label in labels:
                     runner_stats_by_label[runner_label]["total"] += 1
                     if runner.get("status") == "online":
                         runner_stats_by_label[runner_label]["online"] += 1
