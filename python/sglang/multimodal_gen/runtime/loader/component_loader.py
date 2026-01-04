@@ -269,6 +269,7 @@ class ComponentLoader(ABC):
             "image_processor": (ImageProcessorLoader, "transformers"),
             "image_encoder": (ImageEncoderLoader, "transformers"),
             "processor": (AutoProcessorLoader, "transformers"),
+            "controlnet": (ControlNetLoader, "diffusers"),
         }
 
         if module_type in module_loaders:
@@ -772,6 +773,108 @@ class SchedulerLoader(ComponentLoader):
             scheduler.set_shift(server_args.pipeline_config.flow_shift)
 
         return scheduler
+
+
+class ControlNetLoader(ComponentLoader):
+    """Loader for ControlNet models."""
+
+    def should_offload(self, server_args, model_config=None):
+        """ControlNet follows the same offload policy as the transformer."""
+        return server_args.dit_cpu_offload
+
+    def _load_single_controlnet(
+        self, component_model_path: str, server_args: ServerArgs
+    ):
+        """Load a single ControlNet model from path."""
+        config = get_diffusers_component_config(model_path=component_model_path)
+        hf_config = deepcopy(config)
+        cls_name = config.pop("_class_name")
+        if cls_name is None:
+            raise ValueError(
+                "ControlNet config does not contain a _class_name attribute. "
+                "Only diffusers format is supported."
+            )
+
+        logger.info("ControlNet cls_name: %s", cls_name)
+
+        # Config from Diffusers supersedes sgl_diffusion's model config
+        dit_config = server_args.pipeline_config.dit_config
+
+        model_cls, _ = ModelRegistry.resolve_model_cls(cls_name)
+
+        # Find all safetensors files
+        safetensors_list = _list_safetensors_files(component_model_path)
+        if not safetensors_list:
+            raise ValueError(f"No safetensors files found in {component_model_path}")
+
+        logger.info(
+            "Loading ControlNet from %s safetensors files: %s",
+            len(safetensors_list),
+            safetensors_list,
+        )
+
+        default_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.dit_precision]
+
+        # Load the ControlNet model using FSDP loader
+        logger.info("Loading %s, default_dtype: %s", cls_name, default_dtype)
+        assert server_args.hsdp_shard_dim is not None
+        model = maybe_load_fsdp_model(
+            model_cls=model_cls,
+            init_params={"config": dit_config, "hf_config": hf_config},
+            weight_dir_list=safetensors_list,
+            device=get_local_torch_device(),
+            hsdp_replicate_dim=server_args.hsdp_replicate_dim,
+            hsdp_shard_dim=server_args.hsdp_shard_dim,
+            cpu_offload=server_args.dit_cpu_offload,
+            pin_cpu_memory=server_args.pin_cpu_memory,
+            fsdp_inference=server_args.use_fsdp_inference,
+            default_dtype=default_dtype,
+            param_dtype=torch.bfloat16,
+            reduce_dtype=torch.float32,
+            output_dtype=None,
+        )
+
+        total_params = sum(p.numel() for p in model.parameters())
+        logger.info("Loaded ControlNet with %.2fB parameters", total_params / 1e9)
+
+        model = model.eval()
+        return model
+
+    def load_customized(
+        self, component_model_path: str, server_args: ServerArgs, *args
+    ):
+        """Load ControlNet based on the model path.
+
+        Supports both single path (str) and multiple paths (list).
+        For multiple paths, returns a QwenImageMultiControlNetModel wrapper.
+        """
+        # Check if we have multiple controlnet paths
+        controlnet_paths = server_args.controlnet_paths
+
+        if controlnet_paths and len(controlnet_paths) > 1:
+            # Load multiple ControlNets and wrap in MultiControlNet
+            from sglang.multimodal_gen.runtime.models.controlnets import (
+                QwenImageMultiControlNetModel,
+            )
+
+            logger.info("Loading %d ControlNet models...", len(controlnet_paths))
+            controlnets = []
+            for i, path in enumerate(controlnet_paths):
+                logger.info(
+                    "Loading ControlNet %d/%d from %s",
+                    i + 1,
+                    len(controlnet_paths),
+                    path,
+                )
+                controlnet = self._load_single_controlnet(path, server_args)
+                controlnets.append(controlnet)
+
+            multi_controlnet = QwenImageMultiControlNetModel(controlnets)
+            logger.info("Created MultiControlNet with %d models", len(controlnets))
+            return multi_controlnet
+        else:
+            # Single controlnet - load normally
+            return self._load_single_controlnet(component_model_path, server_args)
 
 
 class GenericComponentLoader(ComponentLoader):

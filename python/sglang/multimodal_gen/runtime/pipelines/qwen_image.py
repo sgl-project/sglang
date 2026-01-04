@@ -24,6 +24,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages import (
 from sglang.multimodal_gen.runtime.pipelines_core.stages.conditioning import (
     ConditioningStage,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stages.control_encoding import (
+    ControlEncodingStage,
+)
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
@@ -93,6 +96,14 @@ class QwenImagePipeline(LoRAPipeline, ComposedPipelineBase):
             ),
         )
 
+        # Add ControlNet encoding stage if controlnet is available
+        if self.has_module("controlnet"):
+            logger.info("ControlNet detected, adding control encoding stage")
+            self.add_stage(
+                stage_name="control_encoding_stage",
+                stage=ControlEncodingStage(vae=self.get_module("vae")),
+            )
+
         self.add_stage(stage_name="conditioning_stage", stage=ConditioningStage())
 
         self.add_stage(
@@ -111,11 +122,17 @@ class QwenImagePipeline(LoRAPipeline, ComposedPipelineBase):
             ),
         )
 
+        # Get controlnet if available (optional)
+        controlnet = (
+            self.get_module("controlnet") if self.has_module("controlnet") else None
+        )
+
         self.add_stage(
             stage_name="denoising_stage",
             stage=DenoisingStage(
                 transformer=self.get_module("transformer"),
                 scheduler=self.get_module("scheduler"),
+                controlnet=controlnet,
             ),
         )
 
@@ -164,6 +181,14 @@ class QwenImageEditPipeline(LoRAPipeline, ComposedPipelineBase):
             ),
         )
 
+        # Add ControlNet encoding stage if controlnet is available
+        if self.has_module("controlnet"):
+            logger.info("ControlNet detected, adding control encoding stage")
+            self.add_stage(
+                stage_name="control_encoding_stage",
+                stage=ControlEncodingStage(vae=self.get_module("vae")),
+            )
+
         self.add_stage(
             stage_name="timestep_preparation_stage",
             stage=TimestepPreparationStage(
@@ -182,11 +207,17 @@ class QwenImageEditPipeline(LoRAPipeline, ComposedPipelineBase):
 
         self.add_stage(stage_name="conditioning_stage", stage=ConditioningStage())
 
+        # Get controlnet if available (optional)
+        controlnet = (
+            self.get_module("controlnet") if self.has_module("controlnet") else None
+        )
+
         self.add_stage(
             stage_name="denoising_stage",
             stage=DenoisingStage(
                 transformer=self.get_module("transformer"),
                 scheduler=self.get_module("scheduler"),
+                controlnet=controlnet,
             ),
         )
 
