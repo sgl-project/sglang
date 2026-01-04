@@ -2551,6 +2551,7 @@ class Scheduler(
             "token_capacity": int(self.max_total_num_tokens),
             "graph": round(self.tp_worker.model_runner.graph_mem_usage, 2),
         }
+        ret["effective_max_running_requests_per_dp"] = self.max_running_requests
 
         if not self.spec_algorithm.is_none() and self.spec_total_num_forward_ct > 0:
             ret["avg_spec_accept_length"] = (
