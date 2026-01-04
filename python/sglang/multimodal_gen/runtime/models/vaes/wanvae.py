@@ -592,6 +592,72 @@ class WanResample(nn.Module):
         return x
 
 
+def _residual_block_forward(self, x):
+    # Apply shortcut connection
+    h = self.conv_shortcut(x)
+
+    # First normalization and activation
+    x = self.norm1(x)
+    x = self.nonlinearity(x)
+
+    _feat_cache = feat_cache.get()
+    _feat_idx = feat_idx.get()
+    if _feat_cache is not None:
+        idx = _feat_idx
+        cache_x = x[:, :, -CACHE_T:, :, :].clone()
+        if cache_x.shape[2] < 2 and _feat_cache[idx] is not None:
+            cache_x = torch.cat(
+                [
+                    _feat_cache[idx][:, :, -1, :, :]
+                    .unsqueeze(2)
+                    .to(cache_x.device),
+                    cache_x,
+                ],
+                dim=2,
+            )
+
+        x = self.conv1(x, _feat_cache[idx])
+        _feat_cache[idx] = cache_x
+        _feat_idx += 1
+        feat_cache.set(_feat_cache)
+        feat_idx.set(_feat_idx)
+    else:
+        x = self.conv1(x)
+
+    # Second normalization and activation
+    x = self.norm2(x)
+    x = self.nonlinearity(x)
+
+    # Dropout
+    x = self.dropout(x)
+
+    _feat_cache = feat_cache.get()
+    _feat_idx = feat_idx.get()
+    if _feat_cache is not None:
+        idx = _feat_idx
+        cache_x = x[:, :, -CACHE_T:, :, :].clone()
+        if cache_x.shape[2] < 2 and _feat_cache[idx] is not None:
+            cache_x = torch.cat(
+                [
+                    _feat_cache[idx][:, :, -1, :, :]
+                    .unsqueeze(2)
+                    .to(cache_x.device),
+                    cache_x,
+                ],
+                dim=2,
+            )
+
+        x = self.conv2(x, _feat_cache[idx])
+        _feat_cache[idx] = cache_x
+        _feat_idx += 1
+        feat_cache.set(_feat_cache)
+        feat_idx.set(_feat_idx)
+    else:
+        x = self.conv2(x)
+
+    # Add residual connection
+    return x + h
+
 class WanResidualBlock(nn.Module):
     r"""
     A custom residual block module.
@@ -626,70 +692,8 @@ class WanResidualBlock(nn.Module):
         )
 
     def forward(self, x):
-        # Apply shortcut connection
-        h = self.conv_shortcut(x)
+        return _residual_block_forward(self, x)
 
-        # First normalization and activation
-        x = self.norm1(x)
-        x = self.nonlinearity(x)
-
-        _feat_cache = feat_cache.get()
-        _feat_idx = feat_idx.get()
-        if _feat_cache is not None:
-            idx = _feat_idx
-            cache_x = x[:, :, -CACHE_T:, :, :].clone()
-            if cache_x.shape[2] < 2 and _feat_cache[idx] is not None:
-                cache_x = torch.cat(
-                    [
-                        _feat_cache[idx][:, :, -1, :, :]
-                        .unsqueeze(2)
-                        .to(cache_x.device),
-                        cache_x,
-                    ],
-                    dim=2,
-                )
-
-            x = self.conv1(x, _feat_cache[idx])
-            _feat_cache[idx] = cache_x
-            _feat_idx += 1
-            feat_cache.set(_feat_cache)
-            feat_idx.set(_feat_idx)
-        else:
-            x = self.conv1(x)
-
-        # Second normalization and activation
-        x = self.norm2(x)
-        x = self.nonlinearity(x)
-
-        # Dropout
-        x = self.dropout(x)
-
-        _feat_cache = feat_cache.get()
-        _feat_idx = feat_idx.get()
-        if _feat_cache is not None:
-            idx = _feat_idx
-            cache_x = x[:, :, -CACHE_T:, :, :].clone()
-            if cache_x.shape[2] < 2 and _feat_cache[idx] is not None:
-                cache_x = torch.cat(
-                    [
-                        _feat_cache[idx][:, :, -1, :, :]
-                        .unsqueeze(2)
-                        .to(cache_x.device),
-                        cache_x,
-                    ],
-                    dim=2,
-                )
-
-            x = self.conv2(x, _feat_cache[idx])
-            _feat_cache[idx] = cache_x
-            _feat_idx += 1
-            feat_cache.set(_feat_cache)
-            feat_idx.set(_feat_idx)
-        else:
-            x = self.conv2(x)
-
-        # Add residual connection
-        return x + h
 
 class WanDistResidualBlock(nn.Module):
     r"""
@@ -725,70 +729,39 @@ class WanDistResidualBlock(nn.Module):
         )
 
     def forward(self, x):
-        # Apply shortcut connection
-        h = self.conv_shortcut(x)
+        return _residual_block_forward(self, x)
 
-        # First normalization and activation
-        x = self.norm1(x)
-        x = self.nonlinearity(x)
 
-        _feat_cache = feat_cache.get()
-        _feat_idx = feat_idx.get()
-        if _feat_cache is not None:
-            idx = _feat_idx
-            cache_x = x[:, :, -CACHE_T:, :, :].clone()
-            if cache_x.shape[2] < 2 and _feat_cache[idx] is not None:
-                cache_x = torch.cat(
-                    [
-                        _feat_cache[idx][:, :, -1, :, :]
-                        .unsqueeze(2)
-                        .to(cache_x.device),
-                        cache_x,
-                    ],
-                    dim=2,
-                )
+def attention_block_forward(self, x):
+    identity = x
+    batch_size, channels, time, height, width = x.size()
 
-            x = self.conv1(x, _feat_cache[idx])
-            _feat_cache[idx] = cache_x
-            _feat_idx += 1
-            feat_cache.set(_feat_cache)
-            feat_idx.set(_feat_idx)
-        else:
-            x = self.conv1(x)
+    x = x.permute(0, 2, 1, 3, 4).reshape(batch_size * time, channels, height, width)
+    x = self.norm(x)
 
-        # Second normalization and activation
-        x = self.norm2(x)
-        x = self.nonlinearity(x)
+    # compute query, key, value
+    qkv = self.to_qkv(x)
+    qkv = qkv.reshape(batch_size * time, 1, channels * 3, -1)
+    qkv = qkv.permute(0, 1, 3, 2).contiguous()
+    q, k, v = qkv.chunk(3, dim=-1)
 
-        # Dropout
-        x = self.dropout(x)
+    # apply attention
+    x = F.scaled_dot_product_attention(q, k, v)
 
-        _feat_cache = feat_cache.get()
-        _feat_idx = feat_idx.get()
-        if _feat_cache is not None:
-            idx = _feat_idx
-            cache_x = x[:, :, -CACHE_T:, :, :].clone()
-            if cache_x.shape[2] < 2 and _feat_cache[idx] is not None:
-                cache_x = torch.cat(
-                    [
-                        _feat_cache[idx][:, :, -1, :, :]
-                        .unsqueeze(2)
-                        .to(cache_x.device),
-                        cache_x,
-                    ],
-                    dim=2,
-                )
+    x = (
+        x.squeeze(1)
+        .permute(0, 2, 1)
+        .reshape(batch_size * time, channels, height, width)
+    )
 
-            x = self.conv2(x, _feat_cache[idx])
-            _feat_cache[idx] = cache_x
-            _feat_idx += 1
-            feat_cache.set(_feat_cache)
-            feat_idx.set(_feat_idx)
-        else:
-            x = self.conv2(x)
+    # output projection
+    x = self.proj(x)
 
-        # Add residual connection
-        return x + h
+    # Reshape back: [(b*t), c, h, w] -> [b, c, t, h, w]
+    x = x.view(batch_size, time, channels, height, width)
+    x = x.permute(0, 2, 1, 3, 4)
+
+    return x + identity
 
 
 class WanAttentionBlock(nn.Module):
@@ -809,35 +782,7 @@ class WanAttentionBlock(nn.Module):
         self.proj = nn.Conv2d(dim, dim, 1)
 
     def forward(self, x):
-        identity = x
-        batch_size, channels, time, height, width = x.size()
-
-        x = x.permute(0, 2, 1, 3, 4).reshape(batch_size * time, channels, height, width)
-        x = self.norm(x)
-
-        # compute query, key, value
-        qkv = self.to_qkv(x)
-        qkv = qkv.reshape(batch_size * time, 1, channels * 3, -1)
-        qkv = qkv.permute(0, 1, 3, 2).contiguous()
-        q, k, v = qkv.chunk(3, dim=-1)
-
-        # apply attention
-        x = F.scaled_dot_product_attention(q, k, v)
-
-        x = (
-            x.squeeze(1)
-            .permute(0, 2, 1)
-            .reshape(batch_size * time, channels, height, width)
-        )
-
-        # output projection
-        x = self.proj(x)
-
-        # Reshape back: [(b*t), c, h, w] -> [b, c, t, h, w]
-        x = x.view(batch_size, time, channels, height, width)
-        x = x.permute(0, 2, 1, 3, 4)
-
-        return x + identity
+        return attention_block_forward(self, x)
 
 
 class WanDistAttentionBlock(nn.Module):
@@ -858,35 +803,21 @@ class WanDistAttentionBlock(nn.Module):
         self.proj = WanDistConv2d(dim, dim, 1)
 
     def forward(self, x):
-        identity = x
-        batch_size, channels, time, height, width = x.size()
+        return attention_block_forward(self, x)
 
-        x = x.permute(0, 2, 1, 3, 4).reshape(batch_size * time, channels, height, width)
-        x = self.norm(x)
 
-        # compute query, key, value
-        qkv = self.to_qkv(x)
-        qkv = qkv.reshape(batch_size * time, 1, channels * 3, -1)
-        qkv = qkv.permute(0, 1, 3, 2).contiguous()
-        q, k, v = qkv.chunk(3, dim=-1)
+def mid_block_forward(self, x):
+    # First residual block
+    x = self.resnets[0](x)
 
-        # apply attention
-        x = F.scaled_dot_product_attention(q, k, v)
+    # Process through attention and residual blocks
+    for attn, resnet in zip(self.attentions, self.resnets[1:], strict=True):
+        if attn is not None:
+            x = attn(x)
 
-        x = (
-            x.squeeze(1)
-            .permute(0, 2, 1)
-            .reshape(batch_size * time, channels, height, width)
-        )
+        x = resnet(x)
 
-        # output projection
-        x = self.proj(x)
-
-        # Reshape back: [(b*t), c, h, w] -> [b, c, t, h, w]
-        x = x.view(batch_size, time, channels, height, width)
-        x = x.permute(0, 2, 1, 3, 4)
-
-        return x + identity
+    return x
 
 
 class WanMidBlock(nn.Module):
@@ -921,17 +852,7 @@ class WanMidBlock(nn.Module):
         self.gradient_checkpointing = False
 
     def forward(self, x):
-        # First residual block
-        x = self.resnets[0](x)
-
-        # Process through attention and residual blocks
-        for attn, resnet in zip(self.attentions, self.resnets[1:], strict=True):
-            if attn is not None:
-                x = attn(x)
-
-            x = resnet(x)
-
-        return x
+        return mid_block_forward(self, x)
 
 
 class WanDistMidBlock(nn.Module):
@@ -966,18 +887,17 @@ class WanDistMidBlock(nn.Module):
         self.gradient_checkpointing = False
 
     def forward(self, x):
-        # First residual block
-        x = self.resnets[0](x)
+        return mid_block_forward(self, x)
 
-        # Process through attention and residual blocks
-        for attn, resnet in zip(self.attentions, self.resnets[1:], strict=True):
-            if attn is not None:
-                x = attn(x)
 
-            x = resnet(x)
+def residual_down_block_forward(self, x):
+    x_copy = x.clone()
+    for resnet in self.resnets:
+        x = resnet(x)
+    if self.downsampler is not None:
+        x = self.downsampler(x)
 
-        return x
-
+    return x + self.avg_shortcut(x_copy)
 
 class WanResidualDownBlock(nn.Module):
 
@@ -1015,13 +935,7 @@ class WanResidualDownBlock(nn.Module):
             self.downsampler = None
 
     def forward(self, x):
-        x_copy = x.clone()
-        for resnet in self.resnets:
-            x = resnet(x)
-        if self.downsampler is not None:
-            x = self.downsampler(x)
-
-        return x + self.avg_shortcut(x_copy)
+        return residual_down_block_forward(self, x)
 
 class WanDistResidualDownBlock(nn.Module):
 
@@ -1059,13 +973,7 @@ class WanDistResidualDownBlock(nn.Module):
             self.downsampler = None
 
     def forward(self, x):
-        x_copy = x.clone()
-        for resnet in self.resnets:
-            x = resnet(x)
-        if self.downsampler is not None:
-            x = self.downsampler(x)
-
-        return x + self.avg_shortcut(x_copy)
+        return residual_down_block_forward(self, x)
 
 
 class WanEncoder3d(nn.Module):
@@ -1214,6 +1122,30 @@ class WanEncoder3d(nn.Module):
         return x
 
 
+def residual_up_block_forward(self, x):
+    """
+    Forward pass through the upsampling block.
+    Args:
+        x (torch.Tensor): Input tensor
+        feat_cache (list, optional): Feature cache for causal convolutions
+        feat_idx (list, optional): Feature index for cache management
+    Returns:
+        torch.Tensor: Output tensor
+    """
+    if self.avg_shortcut is not None:
+        x_copy = x.clone()
+
+    for resnet in self.resnets:
+        x = resnet(x)
+
+    if self.upsampler is not None:
+        x = self.upsampler(x)
+
+    if self.avg_shortcut is not None:
+        x = x + self.avg_shortcut(x_copy)
+
+    return x
+
 # adapted from: https://github.com/huggingface/diffusers/blob/main/src/diffusers/models/autoencoders/autoencoder_kl_wan.py
 class WanResidualUpBlock(nn.Module):
     """
@@ -1275,28 +1207,7 @@ class WanResidualUpBlock(nn.Module):
         self.gradient_checkpointing = False
 
     def forward(self, x):
-        """
-        Forward pass through the upsampling block.
-        Args:
-            x (torch.Tensor): Input tensor
-            feat_cache (list, optional): Feature cache for causal convolutions
-            feat_idx (list, optional): Feature index for cache management
-        Returns:
-            torch.Tensor: Output tensor
-        """
-        if self.avg_shortcut is not None:
-            x_copy = x.clone()
-
-        for resnet in self.resnets:
-            x = resnet(x)
-
-        if self.upsampler is not None:
-            x = self.upsampler(x)
-
-        if self.avg_shortcut is not None:
-            x = x + self.avg_shortcut(x_copy)
-
-        return x
+        return residual_up_block_forward(self, x)
 
 class WanDistResidualUpBlock(nn.Module):
     """
@@ -1358,28 +1269,27 @@ class WanDistResidualUpBlock(nn.Module):
         self.gradient_checkpointing = False
 
     def forward(self, x):
-        """
-        Forward pass through the upsampling block.
-        Args:
-            x (torch.Tensor): Input tensor
-            feat_cache (list, optional): Feature cache for causal convolutions
-            feat_idx (list, optional): Feature index for cache management
-        Returns:
-            torch.Tensor: Output tensor
-        """
-        if self.avg_shortcut is not None:
-            x_copy = x.clone()
+        return residual_up_block_forward(self, x)
 
-        for resnet in self.resnets:
-            x = resnet(x)
 
-        if self.upsampler is not None:
-            x = self.upsampler(x)
+def up_block_forward(self, x):
+    """
+    Forward pass through the upsampling block.
 
-        if self.avg_shortcut is not None:
-            x = x + self.avg_shortcut(x_copy)
+    Args:
+        x (torch.Tensor): Input tensor
+        feat_cache (list, optional): Feature cache for causal convolutions
+        feat_idx (list, optional): Feature index for cache management
 
-        return x
+    Returns:
+        torch.Tensor: Output tensor
+    """
+    for resnet in self.resnets:
+        x = resnet(x)
+
+    if self.upsamplers is not None:
+        x = self.upsamplers[0](x)
+    return x
 
 class WanUpBlock(nn.Module):
     """
@@ -1427,23 +1337,7 @@ class WanUpBlock(nn.Module):
         self.gradient_checkpointing = False
 
     def forward(self, x):
-        """
-        Forward pass through the upsampling block.
-
-        Args:
-            x (torch.Tensor): Input tensor
-            feat_cache (list, optional): Feature cache for causal convolutions
-            feat_idx (list, optional): Feature index for cache management
-
-        Returns:
-            torch.Tensor: Output tensor
-        """
-        for resnet in self.resnets:
-            x = resnet(x)
-
-        if self.upsamplers is not None:
-            x = self.upsamplers[0](x)
-        return x
+        return up_block_forward(self, x)
 
 
 class WanDistUpBlock(nn.Module):
@@ -1492,23 +1386,7 @@ class WanDistUpBlock(nn.Module):
         self.gradient_checkpointing = False
 
     def forward(self, x):
-        """
-        Forward pass through the upsampling block.
-
-        Args:
-            x (torch.Tensor): Input tensor
-            feat_cache (list, optional): Feature cache for causal convolutions
-            feat_idx (list, optional): Feature index for cache management
-
-        Returns:
-            torch.Tensor: Output tensor
-        """
-        for resnet in self.resnets:
-            x = resnet(x)
-
-        if self.upsamplers is not None:
-            x = self.upsamplers[0](x)
-        return x
+        return up_block_forward(self, x)
 
 
 class WanDecoder3d(nn.Module):
