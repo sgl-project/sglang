@@ -15,10 +15,16 @@ from sglang.srt.debug_utils.schedule_simulator import (
     SimulationResult,
     Simulator,
     StepRecord,
+    StickyRouter,
+    generate_gsp_requests,
     generate_random_requests,
     load_from_request_logger,
 )
+from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
+
+register_cpu_ci(est_time=60, suite="default", nightly=True)
+
 
 # ==================== Non-E2E Tests ====================
 
@@ -63,6 +69,76 @@ class TestGPUState(CustomTestCase):
         ]
         self.assertEqual(gpu.total_seq_len(), 100 + 210)
 
+    def test_total_seq_len_shared_prefix(self):
+        gpu = GPUState(gpu_id=0, max_total_tokens=10000)
+        gpu.running_requests = [
+            SimRequest(
+                request_id="r1",
+                input_len=150,
+                output_len=50,
+                group_id="g0",
+                prefix_len=100,
+            ),
+            SimRequest(
+                request_id="r2",
+                input_len=150,
+                output_len=50,
+                group_id="g0",
+                prefix_len=100,
+            ),
+        ]
+        self.assertEqual(gpu.total_seq_len(), 150 + 50)
+
+    def test_total_seq_len_shared_prefix_with_decoded(self):
+        gpu = GPUState(gpu_id=0, max_total_tokens=10000)
+        gpu.running_requests = [
+            SimRequest(
+                request_id="r1",
+                input_len=150,
+                output_len=50,
+                decoded_tokens=10,
+                group_id="g0",
+                prefix_len=100,
+            ),
+            SimRequest(
+                request_id="r2",
+                input_len=150,
+                output_len=50,
+                decoded_tokens=5,
+                group_id="g0",
+                prefix_len=100,
+            ),
+        ]
+        self.assertEqual(gpu.total_seq_len(), 160 + 55)
+
+    def test_total_seq_len_multiple_groups(self):
+        gpu = GPUState(gpu_id=0, max_total_tokens=10000)
+        gpu.running_requests = [
+            SimRequest(
+                request_id="r1",
+                input_len=150,
+                output_len=50,
+                group_id="g0",
+                prefix_len=100,
+            ),
+            SimRequest(
+                request_id="r2",
+                input_len=150,
+                output_len=50,
+                group_id="g0",
+                prefix_len=100,
+            ),
+            SimRequest(
+                request_id="r3",
+                input_len=200,
+                output_len=50,
+                group_id="g1",
+                prefix_len=150,
+            ),
+            SimRequest(request_id="r4", input_len=80, output_len=20),
+        ]
+        self.assertEqual(gpu.total_seq_len(), 150 + 50 + 200 + 80)
+
 
 class TestRouters(CustomTestCase):
     def test_round_robin(self):
@@ -78,6 +154,42 @@ class TestRouters(CustomTestCase):
         req = SimRequest(request_id="r1", input_len=100, output_len=50)
         results = [router.route(req, gpu_states) for _ in range(100)]
         self.assertTrue(all(0 <= r < 4 for r in results))
+
+    def test_sticky_router_same_group_same_gpu(self):
+        router = StickyRouter(num_gpus=4)
+        gpu_states = [GPUState(gpu_id=i, max_total_tokens=10000) for i in range(4)]
+        reqs = [
+            SimRequest(request_id=f"r{i}", input_len=100, output_len=50, group_id="g0")
+            for i in range(10)
+        ]
+        results = [router.route(req, gpu_states) for req in reqs]
+        self.assertEqual(len(set(results)), 1)
+
+    def test_sticky_router_no_group_fallback(self):
+        router = StickyRouter(num_gpus=4)
+        gpu_states = [GPUState(gpu_id=i, max_total_tokens=10000) for i in range(4)]
+        reqs = [
+            SimRequest(request_id=f"r{i}", input_len=100, output_len=50)
+            for i in range(100)
+        ]
+        results = [router.route(req, gpu_states) for req in reqs]
+        self.assertTrue(all(0 <= r < 4 for r in results))
+
+    def test_sticky_router_multiple_groups(self):
+        router = StickyRouter(num_gpus=4)
+        gpu_states = [GPUState(gpu_id=i, max_total_tokens=10000) for i in range(4)]
+        for group_id in ["g0", "g1", "g2"]:
+            reqs = [
+                SimRequest(
+                    request_id=f"{group_id}_r{i}",
+                    input_len=100,
+                    output_len=50,
+                    group_id=group_id,
+                )
+                for i in range(5)
+            ]
+            results = [router.route(req, gpu_states) for req in reqs]
+            self.assertEqual(len(set(results)), 1)
 
 
 class TestFIFOScheduler(CustomTestCase):
@@ -219,6 +331,69 @@ class TestDataSynthesis(CustomTestCase):
         )
         for a, b in zip(r1, r2):
             self.assertEqual(a.input_len, b.input_len)
+
+    def test_generate_gsp_basic(self):
+        requests = generate_gsp_requests(
+            num_groups=4,
+            prompts_per_group=3,
+            system_prompt_len=100,
+            question_len=50,
+            output_len=25,
+            seed=42,
+        )
+        self.assertEqual(len(requests), 12)
+        for req in requests:
+            self.assertIsNotNone(req.group_id)
+            self.assertEqual(req.prefix_len, 100)
+            self.assertEqual(req.input_len, 150)
+            self.assertEqual(req.output_len, 25)
+
+    def test_generate_gsp_group_assignment(self):
+        requests = generate_gsp_requests(
+            num_groups=3,
+            prompts_per_group=2,
+            system_prompt_len=100,
+            question_len=50,
+            output_len=25,
+            seed=42,
+        )
+        group_counts = {}
+        for req in requests:
+            group_counts[req.group_id] = group_counts.get(req.group_id, 0) + 1
+        self.assertEqual(len(group_counts), 3)
+        for count in group_counts.values():
+            self.assertEqual(count, 2)
+
+    def test_generate_gsp_with_range_ratio(self):
+        requests = generate_gsp_requests(
+            num_groups=4,
+            prompts_per_group=5,
+            system_prompt_len=100,
+            question_len=50,
+            output_len=25,
+            range_ratio=0.5,
+            seed=42,
+        )
+        for req in requests:
+            self.assertGreaterEqual(req.prefix_len, 50)
+            self.assertLessEqual(req.prefix_len, 100)
+            self.assertGreaterEqual(req.input_len - req.prefix_len, 25)
+            self.assertLessEqual(req.input_len - req.prefix_len, 50)
+
+    def test_generate_gsp_shuffled(self):
+        requests = generate_gsp_requests(
+            num_groups=4,
+            prompts_per_group=10,
+            system_prompt_len=100,
+            question_len=50,
+            output_len=25,
+            seed=42,
+        )
+        group_ids = [req.group_id for req in requests]
+        is_sorted = all(
+            group_ids[i] <= group_ids[i + 1] for i in range(len(group_ids) - 1)
+        )
+        self.assertFalse(is_sorted)
 
 
 class TestSimulator(CustomTestCase):
@@ -370,29 +545,77 @@ class TestCLI(CustomTestCase):
         self.assertEqual(result.returncode, 0, f"CLI failed: {result.stderr}")
         self.assertIn("router=random", result.stdout)
 
+    def test_cli_sticky_router(self):
+        result = self._run_cli(
+            "--synth-gsp",
+            "--synth-gsp-num-groups",
+            "2",
+            "--synth-gsp-prompts-per-group",
+            "3",
+            "--synth-seed",
+            "42",
+            "--num-gpus",
+            "4",
+            "--router",
+            "sticky",
+        )
+        self.assertEqual(result.returncode, 0, f"CLI failed: {result.stderr}")
+        self.assertIn("router=sticky", result.stdout)
+
+    def test_e2e_sticky_router_group_locality(self):
+        result = self._run_cli(
+            "--synth-gsp",
+            "--synth-gsp-num-groups",
+            "2",
+            "--synth-gsp-prompts-per-group",
+            "2",
+            "--synth-gsp-system-prompt-len",
+            "10",
+            "--synth-gsp-question-len",
+            "10",
+            "--synth-gsp-output-len",
+            "2",
+            "--synth-seed",
+            "123",
+            "--num-gpus",
+            "2",
+            "--router",
+            "sticky",
+            "--max-total-tokens",
+            "1000",
+            "--log-level",
+            "2",
+        )
+        self.assertEqual(result.returncode, 0, f"CLI failed: {result.stderr}")
+        for expected in [
+            "step=0    | GPU0[R=2:gsp0,gsp1 Q=0:-] | GPU1[R=2:gsp2,gsp3 Q=0:-]",
+            "step=1    | GPU0[R=0:- Q=0:-] | GPU1[R=0:- Q=0:-]",
+        ]:
+            self.assertIn(expected, result.stdout)
+
     def test_cli_synthetic(self):
         result = self._run_cli(
             "--synthetic",
-            "--synth-num-requests",
+            "--synth-random-num-requests",
             "100",
-            "--synth-input-len",
+            "--synth-random-input-len",
             "512",
-            "--synth-output-len",
+            "--synth-random-output-len",
             "128",
-            "--synth-range-ratio",
+            "--synth-random-range-ratio",
             "0.5",
             "--num-gpus",
             "4",
         )
         self.assertEqual(result.returncode, 0, f"CLI failed: {result.stderr}")
-        self.assertIn("Generated 100 synthetic requests", result.stdout)
+        self.assertIn("Generated 100 random requests", result.stdout)
 
     def test_cli_log_level(self):
         result = self._run_cli(
             "--synthetic",
-            "--synth-num-requests",
+            "--synth-random-num-requests",
             "10",
-            "--synth-output-len",
+            "--synth-random-output-len",
             "5",
             "--num-gpus",
             "2",
@@ -406,12 +629,14 @@ class TestCLI(CustomTestCase):
         # 4 requests, input_len=10, output_len=2, 2 GPUs, all fit in memory
         result = self._run_cli(
             "--synthetic",
-            "--synth-num-requests",
+            "--synth-random-num-requests",
             "4",
-            "--synth-input-len",
+            "--synth-random-input-len",
             "10",
-            "--synth-output-len",
+            "--synth-random-output-len",
             "2",
+            "--synth-random-range-ratio",
+            "1.0",
             "--synth-seed",
             "42",
             "--num-gpus",
@@ -434,12 +659,14 @@ class TestCLI(CustomTestCase):
     def test_e2e_queuing_due_to_token_limit(self):
         result = self._run_cli(
             "--synthetic",
-            "--synth-num-requests",
+            "--synth-random-num-requests",
             "4",
-            "--synth-input-len",
+            "--synth-random-input-len",
             "100",
-            "--synth-output-len",
+            "--synth-random-output-len",
             "3",
+            "--synth-random-range-ratio",
+            "1.0",
             "--synth-seed",
             "42",
             "--num-gpus",
@@ -464,12 +691,14 @@ step=5    | GPU0[R=0:- Q=0:-]""",
     def test_e2e_retraction_due_to_token_growth(self):
         result = self._run_cli(
             "--synthetic",
-            "--synth-num-requests",
+            "--synth-random-num-requests",
             "2",
-            "--synth-input-len",
+            "--synth-random-input-len",
             "50",
-            "--synth-output-len",
+            "--synth-random-output-len",
             "10",
+            "--synth-random-range-ratio",
+            "1.0",
             "--synth-seed",
             "42",
             "--num-gpus",
@@ -490,6 +719,58 @@ step=9    | GPU0[R=0:- Q=1:syn1]
 step=10   | GPU0[R=1:syn1 Q=0:-]
 step=13   | GPU0[R=0:- Q=0:-]""",
         )
+
+    def test_cli_gsp_basic(self):
+        result = self._run_cli(
+            "--synth-gsp",
+            "--synth-gsp-num-groups",
+            "4",
+            "--synth-gsp-prompts-per-group",
+            "8",
+            "--synth-gsp-system-prompt-len",
+            "100",
+            "--synth-gsp-question-len",
+            "50",
+            "--synth-gsp-output-len",
+            "10",
+            "--synth-seed",
+            "42",
+            "--num-gpus",
+            "2",
+        )
+        self.assertEqual(result.returncode, 0, f"CLI failed: {result.stderr}")
+        self.assertIn("Generated 32 GSP requests", result.stdout)
+        self.assertIn("4 groups x 8 prompts", result.stdout)
+
+    def test_e2e_gsp_shared_prefix_enables_batching(self):
+        for has_long_prefix in [True, False]:
+            prefix_len, question_len = (50, 10) if has_long_prefix else (10, 50)
+            result = self._run_cli(
+                "--synth-gsp",
+                "--synth-gsp-num-groups",
+                "1",
+                "--synth-gsp-prompts-per-group",
+                "2",
+                "--synth-gsp-system-prompt-len",
+                str(prefix_len),
+                "--synth-gsp-question-len",
+                str(question_len),
+                "--synth-gsp-output-len",
+                "2",
+                "--synth-seed",
+                "42",
+                "--num-gpus",
+                "1",
+                "--max-total-tokens",
+                "80",
+                "--log-level",
+                "2",
+            )
+            self.assertEqual(result.returncode, 0, f"CLI failed: {result.stderr}")
+            if has_long_prefix:
+                self.assertIn("R=2:", result.stdout)
+            else:
+                self.assertNotIn("R=2:", result.stdout)
 
 
 if __name__ == "__main__":
