@@ -838,6 +838,7 @@ def load_audio(
 class ImageData:
     url: str
     detail: Optional[Literal["auto", "low", "high"]] = "auto"
+    max_dynamic_patch: Optional[int] = None
 
 
 def load_image(
@@ -2411,10 +2412,6 @@ def launch_dummy_health_check_server(host, port, enable_metrics):
     logger.info(
         f"Dummy health check server started in background thread at {host}:{port}"
     )
-
-
-def create_checksum(directory: str):
-    raise NotImplementedError()
 
 
 def set_cuda_arch():

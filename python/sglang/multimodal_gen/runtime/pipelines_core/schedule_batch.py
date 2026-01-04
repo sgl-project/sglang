@@ -162,6 +162,7 @@ class Req:
     # Misc
     save_output: bool = True
     return_frames: bool = False
+    is_warmup: bool = False
 
     # TeaCache parameters
     enable_teacache: bool = False
@@ -237,6 +238,8 @@ class Req:
         return pprint.pformat(asdict(self), indent=2, width=120)
 
     def log(self, server_args: ServerArgs):
+        if self.is_warmup:
+            return
         # TODO: in some cases (e.g., TI2I), height and weight might be undecided at this moment
         if self.height:
             target_height = align_to(self.height, 16)

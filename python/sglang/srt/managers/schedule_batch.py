@@ -63,7 +63,6 @@ from sglang.srt.mem_cache.allocator import (
     SWATokenToKVPoolAllocator,
 )
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
-from sglang.srt.mem_cache.chunk_cache import SWAChunkCache
 from sglang.srt.mem_cache.common import (
     alloc_for_decode,
     alloc_for_extend,
@@ -73,7 +72,6 @@ from sglang.srt.mem_cache.common import (
 from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
-from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
 from sglang.srt.metrics.collector import (
     DPCooperationInfo,
     SchedulerMetricsCollector,
@@ -1299,11 +1297,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         is_hybrid_swa = False
         if isinstance(token_to_kv_pool_allocator, SWATokenToKVPoolAllocator):
-            assert (
-                tree_cache is None
-                or isinstance(tree_cache, SWARadixCache)
-                or isinstance(tree_cache, SWAChunkCache)
-            ), "SWARadixCache or SWAChunkCache is required for SWATokenToKVPoolAllocator"
             is_hybrid_swa = True
 
         return cls(
