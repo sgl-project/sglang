@@ -159,9 +159,7 @@ class HiRadixCache(RadixCache):
         prefetch/backup paths. Caller must ensure there are no running/queued
         requests to avoid races.
         """
-        if self.enable_storage:
-            return False, "HiCache storage backend is already enabled."
-
+        # Validate inputs first (no side effects).
         if hicache_storage_prefetch_policy is not None:
             allowed = ["best_effort", "wait_complete", "timeout"]
             if hicache_storage_prefetch_policy not in allowed:
@@ -180,6 +178,50 @@ class HiRadixCache(RadixCache):
                     f"Expected one of {allowed}.",
                 )
 
+        # If already enabled:
+        # - backend unchanged: treat as success, update policies only.
+        # - backend changed: treat as failure, do NOT update policies.
+        if self.enable_storage:
+            current_backend = self.cache_controller.storage_backend_type
+
+            if current_backend == storage_backend:
+                if hicache_storage_prefetch_policy is not None:
+                    self.prefetch_stop_policy = hicache_storage_prefetch_policy
+                    logger.info(
+                        f"Set hicache_storage_prefetch_policy to {hicache_storage_prefetch_policy}"
+                    )
+                if hicache_write_policy is not None:
+                    self.cache_controller.write_policy = hicache_write_policy
+                    self.write_through_threshold = (
+                        1 if hicache_write_policy == "write_through" else 2
+                    )
+                    logger.info(f"Set hicache_write_policy to {hicache_write_policy}")
+                return (
+                    True,
+                    "HiCache storage backend already enabled with same backend; policies updated.",
+                )
+
+            return (
+                False,
+                f"HiCache storage backend is already enabled with backend '{current_backend}'. "
+                f"Cannot attach different backend '{storage_backend}'. Detach first.",
+            )
+
+        # Not enabled: update policies before controller attach so storage threads observe new values.
+        if hicache_storage_prefetch_policy is not None:
+            self.prefetch_stop_policy = hicache_storage_prefetch_policy
+            logger.info(
+                f"Set hicache_storage_prefetch_policy to {hicache_storage_prefetch_policy}"
+            )
+
+        if hicache_write_policy is not None:
+            self.cache_controller.write_policy = hicache_write_policy
+            self.write_through_threshold = (
+                1 if hicache_write_policy == "write_through" else 2
+            )
+            logger.info(f"Set hicache_write_policy to {hicache_write_policy}")
+
+        logger.info(f"Attaching HiCache storage backend: {storage_backend}")
         try:
             (
                 extra_config,
@@ -191,7 +233,11 @@ class HiRadixCache(RadixCache):
                 storage_backend_extra_config_json
             )
         except Exception as e:
-            return False, f"Invalid storage_backend_extra_config_json: {e}"
+            logger.exception(f"Failed to parse storage_backend_extra_config_json: {e}")
+            return (
+                False,
+                f"Failed to parse storage_backend_extra_config_json '{storage_backend_extra_config_json}': {e}",
+            )
 
         try:
             self.cache_controller.attach_storage_backend(
@@ -201,7 +247,9 @@ class HiRadixCache(RadixCache):
                 storage_backend_extra_config=extra_config,
             )
         except Exception as e:
-            logger.exception("Failed to attach storage backend.")
+            logger.exception(
+                f"Failed to attach storage backend '{storage_backend}': {e}"
+            )
             return False, f"Failed to attach storage backend '{storage_backend}': {e}"
 
         # Commit/rollback boundary:
@@ -228,17 +276,10 @@ class HiRadixCache(RadixCache):
 
             # All steps succeeded: now atomically flip flags/state.
             self.enable_storage = True
-            if hicache_write_policy is not None:
-                self.cache_controller.write_policy = hicache_write_policy
-                self.write_through_threshold = (
-                    1 if hicache_write_policy == "write_through" else 2
-                )
             self.prefetch_threshold = prefetch_threshold
             self.prefetch_timeout_base = prefetch_timeout_base
             self.prefetch_timeout_per_page = prefetch_timeout_per_page
             self.hicache_storage_pass_prefix_keys = hicache_storage_pass_prefix_keys
-            if hicache_storage_prefetch_policy is not None:
-                self.prefetch_stop_policy = hicache_storage_prefetch_policy
 
             self.enable_storage_metrics = enable_storage_metrics
             if self.enable_storage_metrics:

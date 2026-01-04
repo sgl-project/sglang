@@ -356,9 +356,10 @@ class TokenizerCommunicatorMixin:
         if all_success:
             # Keep tokenizer side server_info consistent with scheduler side.
             self.server_args.hicache_storage_backend = hicache_storage_backend
-            self.server_args.hicache_storage_backend_extra_config = (
-                hicache_storage_backend_extra_config_json
-            )
+            if hicache_storage_backend_extra_config_json is not None:
+                self.server_args.hicache_storage_backend_extra_config = (
+                    hicache_storage_backend_extra_config_json
+                )
             if hicache_storage_prefetch_policy is not None:
                 self.server_args.hicache_storage_prefetch_policy = (
                     hicache_storage_prefetch_policy

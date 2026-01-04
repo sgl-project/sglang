@@ -2464,12 +2464,6 @@ class Scheduler(
                 ),
             )
 
-        # Already enabled
-        if self.enable_hicache_storage:
-            return AttachHiCacheStorageReqOutput(
-                success=False, message="HiCache storage backend is already enabled."
-            )
-
         if not hasattr(self.tree_cache, "attach_storage_backend"):
             return AttachHiCacheStorageReqOutput(
                 success=False,
@@ -2490,9 +2484,10 @@ class Scheduler(
         if ok:
             self.enable_hicache_storage = True
             self.server_args.hicache_storage_backend = recv_req.hicache_storage_backend
-            self.server_args.hicache_storage_backend_extra_config = (
-                recv_req.hicache_storage_backend_extra_config_json
-            )
+            if recv_req.hicache_storage_backend_extra_config_json is not None:
+                self.server_args.hicache_storage_backend_extra_config = (
+                    recv_req.hicache_storage_backend_extra_config_json
+                )
             if recv_req.hicache_storage_prefetch_policy is not None:
                 self.server_args.hicache_storage_prefetch_policy = (
                     recv_req.hicache_storage_prefetch_policy

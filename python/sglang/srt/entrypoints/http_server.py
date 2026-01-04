@@ -786,6 +786,7 @@ async def hicache_storage_backend_status():
         "hicache_storage_backend": _global_state.tokenizer_manager.server_args.hicache_storage_backend,
         "hicache_storage_backend_extra_config": _global_state.tokenizer_manager.server_args.hicache_storage_backend_extra_config,
         "hicache_storage_prefetch_policy": _global_state.tokenizer_manager.server_args.hicache_storage_prefetch_policy,
+        "hicache_write_policy": _global_state.tokenizer_manager.server_args.hicache_write_policy,
     }
 
 
