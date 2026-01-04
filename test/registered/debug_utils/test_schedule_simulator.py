@@ -25,7 +25,6 @@ from sglang.srt.debug_utils.schedule_simulator import (
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-
 register_cpu_ci(est_time=120, suite="default", nightly=True)
 
 
@@ -769,45 +768,76 @@ class TestLargerScale(CustomTestCase):
     def test_vanilla_workload_random_policy(self):
         result = self._run_main(
             "--synthetic",
-            "--synth-random-num-requests", "2000",
-            "--synth-random-input-len", "32000",
-            "--synth-random-output-len", "2000",
-            "--synth-seed", "42",
-            "--num-gpus", "8",
-            "--router", "random",
-            "--max-total-tokens", "2000000",
-            "--stop-criteria", "exist_no_pending",
+            "--synth-random-num-requests",
+            "2000",
+            "--synth-random-input-len",
+            "32000",
+            "--synth-random-output-len",
+            "2000",
+            "--synth-seed",
+            "42",
+            "--num-gpus",
+            "8",
+            "--router",
+            "random",
+            "--max-total-tokens",
+            "2000000",
+            "--stop-criteria",
+            "exist_no_pending",
         )
-        self._assert_in_range(result.summary["attention_compute_balancedness_mean"], 0.95, 1.0, "attn")
-        self._assert_in_range(result.summary["batch_size_balancedness_mean"], 0.90, 0.98, "bs")
+        self._assert_in_range(
+            result.summary["attention_compute_balancedness_mean"], 0.95, 1.0, "attn"
+        )
+        self._assert_in_range(
+            result.summary["batch_size_balancedness_mean"], 0.90, 0.98, "bs"
+        )
         self._assert_in_range(result.summary["avg_batch_size"], 127, 141, "avg_bs")
 
     def _run_gsp_workload(self, router: str) -> SimulationResult:
         return self._run_main(
             "--synth-gsp",
-            "--synth-gsp-num-groups", "200",
-            "--synth-gsp-prompts-per-group", "20",
-            "--synth-gsp-system-prompt-len", "31000",
-            "--synth-gsp-question-len", "1000",
-            "--synth-gsp-output-len", "8000",
-            "--synth-seed", "42",
-            "--num-gpus", "8",
-            "--router", router,
-            "--max-total-tokens", "500000",
-            "--stop-criteria", "exist_no_pending",
-            "--max-steps", "1500",
+            "--synth-gsp-num-groups",
+            "200",
+            "--synth-gsp-prompts-per-group",
+            "20",
+            "--synth-gsp-system-prompt-len",
+            "31000",
+            "--synth-gsp-question-len",
+            "1000",
+            "--synth-gsp-output-len",
+            "8000",
+            "--synth-seed",
+            "42",
+            "--num-gpus",
+            "8",
+            "--router",
+            router,
+            "--max-total-tokens",
+            "500000",
+            "--stop-criteria",
+            "exist_no_pending",
+            "--max-steps",
+            "1500",
         )
 
     def test_gsp_workload_random_policy(self):
         result = self._run_gsp_workload("random")
-        self._assert_in_range(result.summary["attention_compute_balancedness_mean"], 0.88, 0.98, "attn")
-        self._assert_in_range(result.summary["batch_size_balancedness_mean"], 0.88, 0.98, "bs")
+        self._assert_in_range(
+            result.summary["attention_compute_balancedness_mean"], 0.88, 0.98, "attn"
+        )
+        self._assert_in_range(
+            result.summary["batch_size_balancedness_mean"], 0.88, 0.98, "bs"
+        )
         self._assert_in_range(result.summary["avg_batch_size"], 24, 27, "avg_bs")
 
     def test_gsp_workload_sticky_policy(self):
         result = self._run_gsp_workload("sticky")
-        self._assert_in_range(result.summary["attention_compute_balancedness_mean"], 0.63, 0.70, "attn")
-        self._assert_in_range(result.summary["batch_size_balancedness_mean"], 0.63, 0.71, "bs")
+        self._assert_in_range(
+            result.summary["attention_compute_balancedness_mean"], 0.63, 0.70, "attn"
+        )
+        self._assert_in_range(
+            result.summary["batch_size_balancedness_mean"], 0.63, 0.71, "bs"
+        )
         self._assert_in_range(result.summary["avg_batch_size"], 33, 37, "avg_bs")
 
 

@@ -22,7 +22,10 @@ from sglang.srt.debug_utils.schedule_simulator.routers import (
     StickyRouter,
 )
 from sglang.srt.debug_utils.schedule_simulator.schedulers import FIFOScheduler
-from sglang.srt.debug_utils.schedule_simulator.simulator import SimulationResult, Simulator
+from sglang.srt.debug_utils.schedule_simulator.simulator import (
+    SimulationResult,
+    Simulator,
+)
 
 
 def create_arg_parser() -> argparse.ArgumentParser:
@@ -135,7 +138,11 @@ def main(args: argparse.Namespace) -> SimulationResult:
         num_gpus=args.num_gpus,
         router=router,
         scheduler=scheduler,
-        recorders=[BatchSizeBalancednessRecorder(), AttentionComputeBalancednessRecorder(), AvgBatchSizeRecorder()],
+        recorders=[
+            BatchSizeBalancednessRecorder(),
+            AttentionComputeBalancednessRecorder(),
+            AvgBatchSizeRecorder(),
+        ],
         log_level=args.log_level,
         max_total_tokens=args.max_total_tokens,
         stop_criteria=args.stop_criteria,
