@@ -1,4 +1,5 @@
 import unittest
+import os
 from types import SimpleNamespace
 
 from sglang.srt.utils import kill_process_tree
@@ -17,7 +18,7 @@ from sglang.test.test_utils import (
 
 class TestMoERunner(CustomTestCase):
     BASE_URL = DEFAULT_URL_FOR_TEST
-    TIMEOUT = DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
+    TIMEOUT = 6000
     DEFAULT_EVAL_KWARGS = {
         "eval_name": "mmlu",
         "num_examples": 5,
@@ -131,6 +132,71 @@ class TestMoERunner(CustomTestCase):
                 "pytorch",
             ],
         },
+        "moe_runner_cutlass_fp8": {
+            "model": DEFAULT_MODEL_NAME_FOR_TEST_FP8_WITH_MOE,
+            "timeout": 3600,
+            "other_args": [
+                "--trust-remote-code",
+                "--moe-runner-backend",
+                "cutlass",
+                "--attention-backend",
+                "triton",
+                "--sampling-backend",
+                "pytorch",
+                "--disable-cuda-graph",
+            ],
+        },
+        "moe_runner_cutlass_w4a8": {
+            "model": "tencent/DeepSeek-V3.1-Terminus-W4AFP8",  # FP8 W8A8 MoE model
+            "other_args": [
+                "--trust-remote-code",
+                "--moe-runner-backend",
+                "cutlass",
+                "--attention-backend",
+                "triton",
+                "--sampling-backend",
+                "pytorch",
+                "--tp-size",
+                "4",
+            ],
+        },
+        "moe_runner_cutlass_w4a8_deepep_normal": {
+            "model": "tencent/DeepSeek-V3.1-Terminus-W4AFP8",  # FP8 W8A8 MoE model
+            "other_args": [
+                "--trust-remote-code",
+                "--moe-runner-backend",
+                "cutlass",
+                "--moe-a2a-backend",
+                "deepep",
+                "--deepep-mode",
+                "normal",
+                "--attention-backend",
+                "triton",
+                "--sampling-backend",
+                "pytorch",
+                "--tp-size",
+                "4",
+            ],
+        },
+        "moe_runner_cutlass_w4a8_deepep_ll": {
+            "model": "tencent/DeepSeek-V3.1-Terminus-W4AFP8",  # FP8 W8A8 MoE model
+            "env_overrides": {"SGLANG_DEEPEP_BF16_DISPATCH": "1"},
+            "other_args": [
+                "--trust-remote-code",
+                "--moe-runner-backend",
+                "cutlass",
+                "--moe-a2a-backend",
+                "deepep",
+                "--deepep-mode",
+                "low_latency",
+                "--attention-backend",
+                "triton",
+                "--sampling-backend",
+                "pytorch",
+                "--tp-size",
+                "4",
+            ],
+        },
         "moe_runner_speculative": {
             "model": DEFAULT_SMALL_MOE_MODEL_NAME_FOR_TEST_CHAT,
             "other_args": [
@@ -159,12 +225,18 @@ class TestMoERunner(CustomTestCase):
         model = config["model"]
         other_args = config.get("other_args", [])
         eval_kwargs = self.DEFAULT_EVAL_KWARGS
+        env = dict(os.environ)
+        env["SGLANG_ENABLE_JIT_DEEPGEMM"] = "1"
+        env["SGLANG_JIT_DEEPGEMM_PRECOMPILE"] = "0"
+        env.update(config.get("env_overrides", {}))
+        timeout = config.get("timeout", self.TIMEOUT)
 
         process = popen_launch_server(
             model,
             self.BASE_URL,
-            timeout=self.TIMEOUT,
+            timeout=timeout,
             other_args=other_args,
+            env=env,
         )
         try:
             args = SimpleNamespace(
