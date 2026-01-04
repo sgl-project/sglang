@@ -175,6 +175,14 @@ def prepare_mlp_sync_batch_raw(
             )
         )
 
+        # Calculate global_forward_mode for recv_skipper even when tbo is not enabled
+        if mlp_sync_info.global_forward_mode is None:
+            forward_modes = mlp_sync_info.tp0_info[:, 5].tolist()
+            global_forward_mode, _ = (
+                TboDPAttentionPreparer._compute_global_forward_mode(forward_modes)
+            )
+            mlp_sync_info.global_forward_mode = global_forward_mode
+
     need_idle_batch = skip_all_gather or max(mlp_sync_info.global_num_tokens) > 0
     if need_idle_batch:
         batch_to_gather = local_batch
@@ -226,6 +234,9 @@ class SchedulerDPAttnMixin:
             batch = self.prepare_mlp_sync_batch(batch)
         if log_stats:
             self.log_prefill_stats_late(batch)
+        # Save global_forward_mode for recv_skipper in dp_attention mode
+        if batch is not None and hasattr(batch, "global_forward_mode"):
+            self.last_global_forward_mode = batch.global_forward_mode
         return batch
 
     def get_idle_batch(self: Scheduler) -> ScheduleBatch:
