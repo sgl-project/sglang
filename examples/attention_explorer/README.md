@@ -68,22 +68,25 @@ Each entry in `attention_tokens` array contains:
 - `attention_scores`: Attention weights softmax-normalized over top-k only (list of floats)
 - `layer_id`: Which attention layer was captured (integer)
 - `topk_logits`: Raw attention logits before softmax (list of floats)
-- `logsumexp_candidates`: Approximate logsumexp normalizer over candidate attention scores (float)
+- `logsumexp_candidates`: Exact logsumexp normalizer over ALL attention scores (float)
+- `decode_step`: Which decode step this entry corresponds to (integer)
 
-### Computing Approximate Probabilities
+### Computing True Probabilities
 
-The `attention_scores` field is softmax-normalized over only the top-k positions, which sums to 1.0 but doesn't represent the true probability mass. For approximate probabilities:
+The `attention_scores` field is softmax-normalized over only the top-k positions, which sums to 1.0 but doesn't represent the true probability mass. For **true probabilities**:
 
 ```javascript
-// Approximate probability = exp(logit - logsumexp_candidates)
-// Note: logsumexp_candidates is computed over top chunks only (not all tokens),
-// so this is an approximation. For very long contexts (1M+ tokens), some
-// probability mass may be in chunks not included in the candidate set.
-const approxProbs = topk_logits.map(logit => Math.exp(logit - logsumexp_candidates));
-// Sum of approxProbs <= 1.0 (accounts for probability mass in non-top-k positions)
+// True probability = exp(logit - logsumexp_candidates)
+// logsumexp_candidates is computed over ALL tokens (exact, not approximate)
+const trueProbs = topk_logits.map(logit => Math.exp(logit - logsumexp_candidates));
+// Sum of trueProbs represents the fraction of attention captured by top-k
+// (typically 70-95% of total attention mass)
 ```
 
-This is useful for understanding what fraction of attention is captured by the top-k tokens.
+This is useful for:
+- Understanding what fraction of attention is captured by the top-k tokens
+- Computing stable influence rankings (true_prob is stable across different k values)
+- Hub detection (tokens with high cumulative true probability across decode steps)
 
 ## Tensor Parallelism (TP) Behavior
 
