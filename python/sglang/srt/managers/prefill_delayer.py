@@ -1,4 +1,5 @@
 import logging
+from typing import Optional
 
 import torch
 
@@ -75,7 +76,11 @@ class PrefillDelayer:
 class PrefillDelayerSinglePassExecutor:
     def __init__(self, prefill_delayer: PrefillDelayer):
         self._prefill_delayer = prefill_delayer
-        self._called = False
+        self._result: Optional[bool] = None
+
+    @property
+    def _called(self) -> bool:
+        return self._result is not None
 
     def __enter__(self):
         return self
@@ -86,11 +91,8 @@ class PrefillDelayerSinglePassExecutor:
         return False
 
     def negotiate_should_allow_prefill(self, local_prefillable: bool) -> bool:
-        import traceback
-        traceback.print_stack()
-
-        assert not self._called
-        self._called = True
-        return self._prefill_delayer._negotiate_should_allow_prefill(
-            local_prefillable=local_prefillable
-        )
+        if not self._called:
+            self._result = self._prefill_delayer._negotiate_should_allow_prefill(
+                local_prefillable=local_prefillable
+            )
+        return self._result
