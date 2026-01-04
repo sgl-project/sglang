@@ -783,7 +783,7 @@ class EAGLEWorker(TpModelWorker):
             torch.tensor(
                 res.accept_length_per_req_cpu,
                 device=logits_output.hidden_states.device,
-                dtype=torch.int64,
+                dtype=torch.int32,
             )
             + 1
         )
