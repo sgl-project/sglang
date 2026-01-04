@@ -2,9 +2,7 @@
 //!
 //! Tests for malformed input, edge cases, and error recovery
 
-use sgl_model_gateway::tool_parser::{
-    JsonParser, MistralParser, PythonicParser, QwenParser, ToolParser,
-};
+use smg::tool_parser::{JsonParser, MistralParser, PythonicParser, QwenParser, ToolParser};
 
 mod common;
 use common::create_test_tools;
