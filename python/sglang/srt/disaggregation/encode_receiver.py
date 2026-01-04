@@ -228,7 +228,7 @@ class MMReceiver:
             self.hostname = get_local_ip_auto()
             self.waiting_list: List[WaitingImageRequest] = []
             if hf_config is not None:
-                
+
                 import_processors("sglang.srt.multimodal.processors")
                 _processor = None
                 try:
