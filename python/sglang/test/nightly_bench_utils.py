@@ -147,13 +147,6 @@ def save_results_as_pydantic_models(
             extend_files.sort()
             decode_files.sort()
 
-            total_trace_files = len(extend_files) + len(decode_files)
-            print(
-                f"Found {total_trace_files} trace files, selecting TP-0: "
-                f"extend={extend_files[0] if extend_files else 'N/A'}, "
-                f"decode={decode_files[0] if decode_files else 'N/A'}"
-            )
-
             if extend_files:
                 profile_link_extend = os.path.join(res.profile_link, extend_files[0])
             if decode_files:
