@@ -8,7 +8,6 @@ from typing import Optional, Tuple, Union
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from sgl_kernel import fused_add_rmsnorm, rmsnorm
 
 from sglang.jit_kernel.norm import can_use_fused_inplace_qknorm, fused_inplace_qknorm
 from sglang.multimodal_gen.runtime.layers.custom_op import CustomOp
@@ -67,11 +66,14 @@ class RMSNorm(CustomOp):
             out = self.forward_triton(x, residual)
         elif self.variance_size_override is not None:
             return self.forward_native(x, residual)
-        elif residual is not None:
-            fused_add_rmsnorm(x, residual, self.weight.data, self.variance_epsilon)
-            return x.view(shape), residual.view(residual_shape)
         else:
-            out = rmsnorm(x, self.weight.data, self.variance_epsilon)
+            from sgl_kernel import fused_add_rmsnorm, rmsnorm
+
+            if residual is not None:
+                fused_add_rmsnorm(x, residual, self.weight.data, self.variance_epsilon)
+                return x.view(shape), residual.view(residual_shape)
+            else:
+                out = rmsnorm(x, self.weight.data, self.variance_epsilon)
         out = out.view(shape)
         return out
 
