@@ -282,7 +282,7 @@ async def lifespan(fast_api_app: FastAPI):
         _global_state.tokenizer_manager
     )
     fast_api_app.state.openai_serving_rerank = OpenAIServingRerank(
-        _global_state.tokenizer_manager
+        _global_state.tokenizer_manager, _global_state.template_manager
     )
     fast_api_app.state.openai_serving_tokenize = OpenAIServingTokenize(
         _global_state.tokenizer_manager
