@@ -2,16 +2,17 @@
 """
 Analyze attention patterns to find influential input tokens.
 
-Fixes over previous version:
+Features:
 - Uses local tokenizer (no per-token HTTP calls)
+- True probability scoring for influence ranking (not just renormalized top-k)
+- Decodes generated tokens (not just prompt tokens)
+- Layer selection support for semantic vs syntax analysis
 - Proper error handling with timeouts
-- Correct labels for stride/max-limited attention steps
-- True probability computation with proper null checks
-- CLI args for model, top-k, timeout
 
 Usage:
     python analyze_attention.py "Your prompt here" --max-tokens 20
-    python analyze_attention.py "def factorial(n):" --model Qwen/Qwen2.5-0.5B-Instruct
+    python analyze_attention.py "def factorial(n):" --layer-id 16
+    python analyze_attention.py "Hello world" --layer-id -1  # last layer
 """
 
 import argparse
@@ -133,19 +134,25 @@ class AttentionAnalyzer:
         max_tokens: int = 20,
         top_k_attention: int = 10,
         temperature: float = 0.0,
+        layer_id: Optional[int] = None,
     ) -> Dict:
         """Get completion with attention token capture."""
         try:
+            request_body = {
+                "model": self.model,
+                "prompt": prompt,
+                "max_tokens": max_tokens,
+                "temperature": temperature,
+                "return_attention_tokens": True,
+                "top_k_attention": top_k_attention,
+            }
+            # Add layer selection if specified
+            if layer_id is not None:
+                request_body["attention_capture_layer_id"] = layer_id
+
             resp = requests.post(
                 f"{self.api_base}/v1/completions",
-                json={
-                    "model": self.model,
-                    "prompt": prompt,
-                    "max_tokens": max_tokens,
-                    "temperature": temperature,
-                    "return_attention_tokens": True,
-                    "top_k_attention": top_k_attention,
-                },
+                json=request_body,
                 timeout=self.timeout,
             )
             resp.raise_for_status()
@@ -183,20 +190,22 @@ class AttentionAnalyzer:
         max_tokens: int = 20,
         top_k_attention: int = 10,
         max_output_breakdown: int = 5,
+        layer_id: Optional[int] = None,
     ) -> Dict:
         """
         Analyze attention patterns for a prompt.
 
         Returns analysis dict with:
         - prompt_tokens: List of prompt token strings
+        - output_tokens: List of generated token strings
         - attention_steps: Number of recorded attention steps
-        - influence_ranking: Top tokens by attention received
+        - influence_ranking: Top tokens by attention received (ranked by true prob if available)
         - output_breakdown: Per-output-token attention analysis
         - captured_mass: Estimated total attention mass captured
         """
         # Get completion
         data = self.get_completion_with_attention(
-            prompt, max_tokens, top_k_attention
+            prompt, max_tokens, top_k_attention, layer_id=layer_id
         )
 
         choice = data.get("choices", [{}])[0]
@@ -206,6 +215,15 @@ class AttentionAnalyzer:
         # Tokenize prompt
         prompt_token_ids, prompt_tokens = self.tokenize(prompt)
         prompt_len = len(prompt_token_ids)
+
+        # Tokenize generated text for proper labeling
+        if text:
+            _, output_tokens = self.tokenize(text)
+        else:
+            output_tokens = []
+
+        # Combined token list for position lookup
+        all_tokens = prompt_tokens + output_tokens
 
         # Calculate influence scores
         position_total_score = defaultdict(float)
@@ -254,17 +272,28 @@ class AttentionAnalyzer:
                             position_true_prob_sum[pos] += true_prob
 
         # Build influence ranking
+        # Prefer true_prob_sum for ranking when available, fall back to total_score
+        has_true_probs = any(position_true_prob_sum.values())
+
         influence_ranking = []
-        for pos, total in sorted(position_total_score.items(), key=lambda x: -x[1]):
-            tok_text = prompt_tokens[pos] if pos < len(prompt_tokens) else f"[{pos}]"
+        for pos in position_total_score.keys():
+            tok_text = all_tokens[pos] if pos < len(all_tokens) else f"[{pos}]"
+            true_prob = position_true_prob_sum.get(pos, 0)
             influence_ranking.append({
                 "position": pos,
                 "token": tok_text,
-                "total_score": total,
+                "total_score": position_total_score[pos],
                 "count": position_count[pos],
                 "max_score": position_max_score[pos],
-                "true_prob_sum": position_true_prob_sum.get(pos, 0),
+                "true_prob_sum": true_prob,
+                "is_prompt": pos < prompt_len,
             })
+
+        # Sort by true_prob_sum if available, otherwise by total_score
+        if has_true_probs:
+            influence_ranking.sort(key=lambda x: -x["true_prob_sum"])
+        else:
+            influence_ranking.sort(key=lambda x: -x["total_score"])
 
         # Build output breakdown
         output_breakdown = []
@@ -285,10 +314,8 @@ class AttentionAnalyzer:
 
             top_attended = []
             for j, (pos, score) in enumerate(zip(positions[:5], scores[:5])):
-                tok_text = (
-                    prompt_tokens[pos] if pos < len(prompt_tokens)
-                    else f"[out_{pos - prompt_len}]"
-                )
+                # Use combined token list for proper labeling
+                tok_text = all_tokens[pos] if pos < len(all_tokens) else f"[{pos}]"
                 true_prob = None
                 if j < len(logits) and logsumexp is not None and logits[j] is not None:
                     true_prob = self.compute_true_probability(logits[j], logsumexp)
@@ -298,6 +325,7 @@ class AttentionAnalyzer:
                     "token": tok_text,
                     "score": score,
                     "true_prob": true_prob,
+                    "is_prompt": pos < prompt_len,
                 })
 
             output_breakdown.append({
@@ -309,25 +337,37 @@ class AttentionAnalyzer:
 
         avg_captured_mass = total_captured_mass / mass_samples if mass_samples > 0 else None
 
+        # Get layer info from first attention entry if available
+        captured_layer_id = None
+        if attention_tokens:
+            captured_layer_id = attention_tokens[0].get("layer_id")
+
         return {
             "prompt": prompt,
             "output_text": text,
             "prompt_len": prompt_len,
+            "output_len": len(output_tokens),
             "prompt_tokens": prompt_tokens,
+            "output_tokens": output_tokens,
             "attention_steps": len(attention_tokens),
             "influence_ranking": influence_ranking,
             "output_breakdown": output_breakdown,
             "avg_captured_mass": avg_captured_mass,
+            "layer_id": captured_layer_id,
+            "ranked_by": "true_prob" if has_true_probs else "attention_score",
         }
 
     def print_analysis(self, analysis: Dict):
         """Pretty print analysis results."""
         print(f"Prompt: \"{analysis['prompt']}\"")
         print(f"Output: \"{analysis['output_text'][:100]}{'...' if len(analysis['output_text']) > 100 else ''}\"")
-        print(f"Prompt tokens: {analysis['prompt_len']}")
+        print(f"Prompt tokens: {analysis['prompt_len']}, Output tokens: {analysis.get('output_len', '?')}")
         print(f"Recorded attention steps: {analysis['attention_steps']} (stride/max limits may apply)")
+        if analysis.get('layer_id') is not None:
+            print(f"Captured from layer: {analysis['layer_id']}")
         if analysis['avg_captured_mass'] is not None:
             print(f"Avg captured mass (top-k): {analysis['avg_captured_mass']:.1%}")
+        print(f"Ranking method: {analysis.get('ranked_by', 'attention_score')}")
         print()
 
         # Print prompt tokens
@@ -336,21 +376,35 @@ class AttentionAnalyzer:
             print(f"  {i:3d}: {repr(tok)}")
         if len(analysis['prompt_tokens']) > 20:
             print(f"  ... ({len(analysis['prompt_tokens']) - 20} more)")
+
+        # Print output tokens if available
+        output_tokens = analysis.get('output_tokens', [])
+        if output_tokens:
+            print(f"\nOutput tokens ({len(output_tokens)}):")
+            for i, tok in enumerate(output_tokens[:10]):
+                print(f"  {analysis['prompt_len'] + i:3d}: {repr(tok)}")
+            if len(output_tokens) > 10:
+                print(f"  ... ({len(output_tokens) - 10} more)")
         print()
 
         # Print influence ranking
         print("=" * 70)
-        print("INPUT TOKEN INFLUENCE (ranked by total attention received)")
+        ranked_by = analysis.get('ranked_by', 'attention_score')
+        if ranked_by == 'true_prob':
+            print("TOKEN INFLUENCE (ranked by TRUE PROBABILITY - stable across k)")
+        else:
+            print("TOKEN INFLUENCE (ranked by attention score - renormalized over top-k)")
         print("=" * 70)
-        print(f"{'Pos':>4} {'Token':<20} {'Total':>8} {'Count':>6} {'MaxScore':>8} {'TrueProb':>10}")
+        print(f"{'Pos':>4} {'Type':<6} {'Token':<20} {'Score':>8} {'Count':>6} {'TrueProb':>10}")
         print("-" * 70)
 
         for item in analysis['influence_ranking'][:15]:
             true_prob_str = f"{item['true_prob_sum']:.4f}" if item['true_prob_sum'] > 0 else "-"
+            pos_type = "prompt" if item.get('is_prompt', True) else "output"
             print(
-                f"{item['position']:4d} {repr(item['token']):<20} "
+                f"{item['position']:4d} {pos_type:<6} {repr(item['token']):<20} "
                 f"{item['total_score']:8.3f} {item['count']:6d} "
-                f"{item['max_score']:8.3f} {true_prob_str:>10}"
+                f"{true_prob_str:>10}"
             )
 
         print()
@@ -386,6 +440,8 @@ def main():
                         help="Number of top attention positions to capture")
     parser.add_argument("--max-output-breakdown", type=int, default=5,
                         help="Number of output tokens to show detailed breakdown")
+    parser.add_argument("--layer-id", type=int, default=None,
+                        help="Layer to capture attention from (-1 for last layer, default: server default)")
     parser.add_argument("--model", default="default", help="Model name for API calls")
     parser.add_argument("--api-base", default="http://localhost:8000", help="API base URL")
     parser.add_argument("--timeout", type=int, default=60, help="Request timeout in seconds")
@@ -404,6 +460,7 @@ def main():
         max_tokens=args.max_tokens,
         top_k_attention=args.top_k_attention,
         max_output_breakdown=args.max_output_breakdown,
+        layer_id=args.layer_id,
     )
 
     if args.json:
