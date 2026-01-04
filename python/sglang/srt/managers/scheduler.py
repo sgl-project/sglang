@@ -154,9 +154,7 @@ from sglang.srt.managers.session_controller import Session
 from sglang.srt.managers.utils import GenerationBatchResult, validate_input_length
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.common import release_kv_cache
-from sglang.srt.mem_cache.hicache_storage import HiCacheStorageConfig
 from sglang.srt.mem_cache.radix_cache import RadixCache
-from sglang.srt.mem_cache.storage import StorageBackendFactory
 from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
 from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
 from sglang.srt.parser.reasoning_parser import ReasoningParser
@@ -720,13 +718,13 @@ class Scheduler(
         ):
             if envs.SGLANG_ENABLE_DECODE_KVCACHE_OFFLOAD_DIRECT.get():
                 from sglang.srt.disaggregation.decode_kvcache_offload_manager import (
-                    DecodeKVCacheOffloadManagerDirect
+                    DecodeKVCacheOffloadManagerDirect,
                 )
 
                 offload_class = DecodeKVCacheOffloadManagerDirect
             else:
                 from sglang.srt.disaggregation.decode_kvcache_offload_manager import (
-                    DecodeKVCacheOffloadManager
+                    DecodeKVCacheOffloadManager,
                 )
 
                 offload_class = DecodeKVCacheOffloadManager

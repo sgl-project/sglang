@@ -56,7 +56,7 @@ class DecodeKVCacheOffloadManager:
         self.tp_world_size = torch.distributed.get_world_size(group=self.tp_group)
         if envs.SGLANG_ENABLE_DECODE_KVCACHE_OFFLOAD_DIRECT.get():
             from sglang.srt.mem_cache.cache_controller_direct import (
-                HiCacheControllerDirect
+                HiCacheControllerDirect,
             )
 
             self.cache_controller = HiCacheControllerDirect(
