@@ -77,4 +77,4 @@ class PrefillDelayerSinglePassExecutor:
         self._prefill_delayer = prefill_delayer
 
     def should_allow_prefill(self, local_prefillable: int) -> bool:
-        return TODO
+        return self._prefill_delayer._should_allow_prefill(local_prefillable=local_prefillable)
