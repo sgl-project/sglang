@@ -117,7 +117,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromIPCReqInput,
     UpdateWeightsFromTensorReqInput,
 )
-from sglang.srt.managers.mm_utils import init_mm_embedding_cache
+from sglang.srt.managers.mm_utils import init_mm_embedding_cache, unwrap_mm_features
 from sglang.srt.managers.overlap_utils import FutureMap
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
@@ -1205,6 +1205,11 @@ class Scheduler(
                         if self.recv_limit_reached(len(recv_reqs)):
                             break
                         recv_req = self.recv_from_tokenizer.recv_pyobj(zmq.NOBLOCK)
+                        recv_req = unwrap_mm_features(recv_req)
+                        if isinstance(recv_req, TokenizedGenerateReqInput):
+                            end_time = time.perf_counter()
+                            duration = (end_time - recv_req.start_time) * 1000
+                            print(f"Time taken: {duration:.4f} ms")
                     except zmq.ZMQError:
                         break
                     recv_reqs.append(recv_req)

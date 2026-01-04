@@ -26,7 +26,9 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import flatten_nested_list, is_npu, print_warning_once
 from sglang.utils import logger
-
+from sglang.srt.managers.io_struct import TokenizedGenerateReqInput
+import ctypes
+import time
 _is_npu = is_npu()
 
 # NOTE: Using the shared logger from sglang.utils instead of creating a module-specific logger
@@ -1460,3 +1462,52 @@ def get_new_expanded_mm_items(original_mm_items):
         else:
             expanded_mm_items.append(item)
     return expanded_mm_items
+class ZeroCopyMMData:
+    def __init__(self, tensor: torch.Tensor):
+        if tensor.is_cuda:
+            tensor = tensor.cpu()
+        if not tensor.is_contiguous():
+            tensor = tensor.contiguous()
+        self.tensor = tensor
+
+    def __getstate__(self):
+        data_ptr = self.tensor.data_ptr()
+        total_bytes = self.tensor.numel() * self.tensor.element_size()
+        
+        raw_ptr_obj = (ctypes.c_char * total_bytes).from_address(data_ptr)
+        
+        mview = memoryview(raw_ptr_obj)
+        
+        return {
+            "data": pickle.PickleBuffer(mview),
+            "shape": self.tensor.shape,
+            "dtype": self.tensor.dtype,
+        }
+
+    def __setstate__(self, state):
+
+        self.tensor = torch.frombuffer(
+            state["data"], 
+            dtype=state["dtype"]
+        ).reshape(state["shape"])
+
+def wrap_zero_copy_features(obj):
+    if hasattr(obj, "mm_inputs") and obj.mm_inputs:
+        mm_items = obj.mm_inputs.get("mm_items", [])
+        for item in mm_items:
+            if hasattr(item, "feature") and isinstance(item.feature, torch.Tensor):
+                item.feature = ZeroCopyMMData(item.feature)
+    return obj
+
+def unwrap_mm_features(obj):
+    """Unwrap ZeroCopyMMData back into Tensors after receiving."""
+    if not isinstance(obj, TokenizedGenerateReqInput):
+        return obj
+    if hasattr(obj, "mm_inputs") and obj.mm_inputs:
+        mm_items = obj.mm_inputs.get("mm_items", [])
+        for item in mm_items:
+            if isinstance(item.feature, ZeroCopyMMData):
+                # Restore the original tensor object
+                item.feature = item.feature.tensor
+
+    return obj

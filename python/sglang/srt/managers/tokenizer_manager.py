@@ -69,7 +69,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightFromDiskReqOutput,
     WatchLoadUpdateReq,
 )
-from sglang.srt.managers.mm_utils import TensorTransportMode
+from sglang.srt.managers.mm_utils import TensorTransportMode, ZeroCopyMMData, wrap_zero_copy_features
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
 from sglang.srt.managers.request_metrics_exporter import RequestMetricsExporterManager
 from sglang.srt.managers.schedule_batch import MultimodalDataItem, RequestStage
@@ -1037,7 +1037,9 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
     ):
         trace_slice_start(RequestStage.TOKENIZER_DISPATCH, obj.rid)
         tokenized_obj.trace_context = trace_get_proc_propagate_context(obj.rid)
-        self.send_to_scheduler.send_pyobj(tokenized_obj)
+        tokenized_obj = wrap_zero_copy_features(tokenized_obj)
+        tokenized_obj.start_time = time.perf_counter()
+        self.send_to_scheduler.send_pyobj(tokenized_obj, protocol=5, copy=False)
         state = ReqState([], False, asyncio.Event(), obj, created_time=created_time)
         state.request_sent_to_scheduler_ts = time.time()
         self.rid_to_state[obj.rid] = state
