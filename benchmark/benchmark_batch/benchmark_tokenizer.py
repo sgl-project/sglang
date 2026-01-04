@@ -21,7 +21,9 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer, trust_remote_code=True)
     max_batch_size = max(args.batch_sizes)
 
-    token_ids = generate_random_token_ids(max_batch_size, args.num_tokens, tokenizer)
+    token_ids = generate_random_token_ids(
+        num_prompts=max_batch_size, num_tokens=args.num_tokens, tokenizer=tokenizer
+    )
 
     if "encode" in args.function:
         prompts = [
@@ -58,20 +60,27 @@ def main():
 
 
 def run_benchmark(
-    name, data, sequential_fn, batch_fn, batch_sizes, num_runs, batch_mode
+    *, name, data, sequential_fn, batch_fn, batch_sizes, num_runs, batch_mode
 ):
     print("\n" + "=" * 60)
     print(f"{name.upper()} BENCHMARK")
     print("=" * 60)
 
     results = [
-        benchmark(data, bs, sequential_fn, batch_fn, num_runs, batch_mode)
+        benchmark(
+            data=data,
+            batch_size=bs,
+            sequential_fn=sequential_fn,
+            batch_fn=batch_fn,
+            num_runs=num_runs,
+            batch_mode=batch_mode,
+        )
         for bs in batch_sizes
     ]
-    print_results(results, name, batch_mode)
+    print_results(results=results, func_name=name, batch_mode=batch_mode)
 
 
-def benchmark(data, batch_size, sequential_fn, batch_fn, num_runs, batch_mode):
+def benchmark(*, data, batch_size, sequential_fn, batch_fn, num_runs, batch_mode):
     batch_data = data[:batch_size]
     run_single = "single" in batch_mode
     run_batch = "batch" in batch_mode
@@ -79,14 +88,18 @@ def benchmark(data, batch_size, sequential_fn, batch_fn, num_runs, batch_mode):
     out = {"batch_size": batch_size}
 
     if run_single:
-        sequential_times = measure_times(lambda: sequential_fn(batch_data), num_runs)
+        sequential_times = measure_times(
+            fn=lambda: sequential_fn(batch_data), num_runs=num_runs
+        )
         out |= {
             "avg_sequential_ms": mean(sequential_times),
             "sequential_runs": sequential_times,
         }
 
     if run_batch:
-        batch_times = measure_times(lambda: batch_fn(batch_data), num_runs)
+        batch_times = measure_times(
+            fn=lambda: batch_fn(batch_data), num_runs=num_runs
+        )
         out |= {
             "avg_batch_ms": mean(batch_times),
             "batch_runs": batch_times,
@@ -102,7 +115,7 @@ def benchmark(data, batch_size, sequential_fn, batch_fn, num_runs, batch_mode):
     return out
 
 
-def print_results(results, func_name, batch_mode):
+def print_results(*, results, func_name, batch_mode):
     run_single = "single" in batch_mode
     run_batch = "batch" in batch_mode
 
@@ -110,10 +123,14 @@ def print_results(results, func_name, batch_mode):
         print(f"\nBatch size: {r['batch_size']}")
         if run_single:
             print_runs(
-                f"Sequential {func_name}", r["sequential_runs"], r["avg_sequential_ms"]
+                label=f"Sequential {func_name}",
+                runs=r["sequential_runs"],
+                avg=r["avg_sequential_ms"],
             )
         if run_batch:
-            print_runs(f"Batch {func_name}", r["batch_runs"], r["avg_batch_ms"])
+            print_runs(
+                label=f"Batch {func_name}", runs=r["batch_runs"], avg=r["avg_batch_ms"]
+            )
         if run_single and run_batch:
             print(f"  Speedup factor: {r['speedup_factor']:.2f}x")
 
@@ -142,14 +159,14 @@ def print_results(results, func_name, batch_mode):
         print("".join(f"{v:<18}" for v in row))
 
 
-def print_runs(label, runs, avg):
+def print_runs(*, label, runs, avg):
     print(f"  {label}:")
     for i, t in enumerate(runs):
         print(f"    Run {i+1}: {t:.2f} ms")
     print(f"    Average: {avg:.2f} ms")
 
 
-def measure_times(fn, num_runs):
+def measure_times(*, fn, num_runs):
     times = []
     for _ in range(num_runs):
         start = time.perf_counter()
@@ -158,7 +175,7 @@ def measure_times(fn, num_runs):
     return times
 
 
-def generate_random_token_ids(num_prompts, num_tokens, tokenizer):
+def generate_random_token_ids(*, num_prompts, num_tokens, tokenizer):
     vocab_size = tokenizer.vocab_size
     print(f"Generating {num_prompts} random sequences with {num_tokens} tokens each...")
     return [
