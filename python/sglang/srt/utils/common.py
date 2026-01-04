@@ -312,11 +312,13 @@ def get_bool_env_var(name: str, default: str = "false") -> bool:
     falsy_values = ("false", "0")
 
     if (value not in truthy_values) and (value not in falsy_values):
-        if value not in _warned_bool_env_var_keys:
+        # Warn once per env var key (not per value), otherwise different keys that share the
+        # same invalid value may suppress warnings incorrectly.
+        if name not in _warned_bool_env_var_keys:
             logger.warning(
                 f"get_bool_env_var({name}) see non-understandable value={value} and treat as false"
             )
-        _warned_bool_env_var_keys.add(value)
+        _warned_bool_env_var_keys.add(name)
 
     return value in truthy_values
 
@@ -1968,12 +1970,6 @@ def get_compiler_backend(mode=None) -> str:
 
 
 sglang_lib = Library("sglang", "FRAGMENT")  # noqa
-
-
-# Some backends use pytorch version < 2.4.0 which doesn't
-# support `torch.library.custom_op`.
-def supports_custom_op() -> bool:
-    return hasattr(torch.library, "custom_op")
 
 
 def direct_register_custom_op(

@@ -41,5 +41,5 @@ pub use worker::{
 };
 pub use worker_builder::{BasicWorkerBuilder, DPAwareWorkerBuilder};
 pub use worker_manager::{LoadMonitor, WorkerManager};
-pub use worker_registry::{WorkerId, WorkerRegistry, WorkerRegistryStats};
+pub use worker_registry::{HashRing, WorkerId, WorkerRegistry, WorkerRegistryStats};
 pub use worker_service::{WorkerService, WorkerServiceError};

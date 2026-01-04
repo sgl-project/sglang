@@ -3,10 +3,7 @@ use std::{sync::Arc, time::Instant};
 use axum::{
     body::{to_bytes, Body},
     extract::Request,
-    http::{
-        header::{CONTENT_LENGTH, CONTENT_TYPE},
-        HeaderMap, HeaderValue, Method, StatusCode,
-    },
+    http::{header::CONTENT_TYPE, HeaderMap, HeaderValue, Method, StatusCode},
     response::{IntoResponse, Response},
     Json,
 };
@@ -20,14 +17,14 @@ use crate::{
     config::types::RetryConfig,
     core::{
         is_retryable_status, ConnectionMode, RetryExecutor, Worker, WorkerLoadGuard,
-        WorkerRegistry, WorkerType,
+        WorkerRegistry, WorkerType, UNKNOWN_MODEL_ID,
     },
     observability::{
         events::{self, Event},
         metrics::{bool_to_static_str, metrics_labels, Metrics},
         otel_trace::inject_trace_context_http,
     },
-    policies::PolicyRegistry,
+    policies::{PolicyRegistry, SelectWorkerInfo},
     protocols::{
         chat::ChatCompletionRequest,
         classify::ClassifyRequest,
@@ -39,7 +36,7 @@ use crate::{
         responses::{ResponsesGetParams, ResponsesRequest},
     },
     routers::{
-        error,
+        error::{self, extract_error_code_from_response},
         grpc::utils::{error_type_from_status, route_to_endpoint},
         header_utils, RouterTrait,
     },
@@ -91,7 +88,6 @@ impl Router {
         }
     }
 
-    // Helper method to proxy GET requests to the first available worker
     async fn proxy_get_request(&self, req: Request<Body>, endpoint: &str) -> Response {
         let headers = header_utils::copy_request_headers(&req);
 
@@ -99,10 +95,7 @@ impl Router {
             Ok(worker_url) => {
                 let mut request_builder = self.client.get(format!("{}/{}", worker_url, endpoint));
                 for (name, value) in headers {
-                    // Use eq_ignore_ascii_case to avoid string allocation
-                    if !name.eq_ignore_ascii_case("content-type")
-                        && !name.eq_ignore_ascii_case("content-length")
-                    {
+                    if header_utils::should_forward_request_header(&name) {
                         request_builder = request_builder.header(name, value);
                     }
                 }
@@ -140,7 +133,8 @@ impl Router {
     fn select_worker_for_model(
         &self,
         model_id: Option<&str>,
-        info: &crate::policies::SelectWorkerInfo,
+        text: Option<&str>,
+        headers: Option<&HeaderMap>,
     ) -> Option<Arc<dyn Worker>> {
         let effective_model_id = if !self.enable_igw { None } else { model_id };
 
@@ -168,7 +162,20 @@ impl Router {
             None => self.policy_registry.get_default_policy(),
         };
 
-        let idx = policy.select_worker(&available, info)?;
+        // Get cached hash ring for consistent hashing (O(log n) lookup)
+        let hash_ring = self
+            .worker_registry
+            .get_hash_ring(effective_model_id.unwrap_or(UNKNOWN_MODEL_ID));
+
+        let idx = policy.select_worker(
+            &available,
+            &SelectWorkerInfo {
+                request_text: text,
+                tokens: None, // HTTP doesn't have tokens, use gRPC for PrefixHash
+                headers,
+                hash_ring,
+            },
+        )?;
 
         // Record worker selection metric (Layer 3)
         Metrics::record_worker_selection(
@@ -191,11 +198,6 @@ impl Router {
         let start = Instant::now();
         let is_stream = typed_req.is_stream();
         let text = typed_req.extract_text_for_routing();
-        let routing_id = typed_req.get_routing_id().map(|s| s.to_string());
-        let info = crate::policies::SelectWorkerInfo {
-            request_text: Some(&text),
-            routing_id: routing_id.as_deref(),
-        };
         let model = model_id.unwrap_or("default");
         let endpoint = route_to_endpoint(route);
 
@@ -214,7 +216,7 @@ impl Router {
             // operation per attempt
             |_: u32| async {
                 let res = self
-                    .route_typed_request_once(headers, typed_req, route, model_id, is_stream, &info)
+                    .route_typed_request_once(headers, typed_req, route, model_id, is_stream, &text)
                     .await;
 
                 // Need to be outside `route_typed_request_once` because that function has multiple return paths
@@ -272,9 +274,9 @@ impl Router {
         route: &'static str,
         model_id: Option<&str>,
         is_stream: bool,
-        info: &crate::policies::SelectWorkerInfo<'_>,
+        text: &str,
     ) -> Response {
-        let worker = match self.select_worker_for_model(model_id, info) {
+        let worker = match self.select_worker_for_model(model_id, Some(text), headers) {
             Some(w) => w,
             None => {
                 return error::service_unavailable(
@@ -294,10 +296,8 @@ impl Router {
         let load_guard =
             (policy.name() == "cache_aware").then(|| WorkerLoadGuard::new(worker.clone()));
 
-        events::RequestSentEvent {
-            url: worker.url().to_string(),
-        }
-        .emit();
+        // Note: Using borrowed reference avoids heap allocation
+        events::RequestSentEvent { url: worker.url() }.emit();
         let mut headers_with_trace = headers.cloned().unwrap_or_default();
         inject_trace_context_http(&mut headers_with_trace);
         let headers = Some(&headers_with_trace);
@@ -354,14 +354,10 @@ impl Router {
             return error::service_unavailable("no_workers", "No available workers");
         }
 
-        // Pre-filter headers once before the loop to avoid repeated lowercasing
         let filtered_headers: Vec<_> = headers
             .map(|hdrs| {
                 hdrs.iter()
-                    .filter(|(name, _)| {
-                        !name.as_str().eq_ignore_ascii_case("content-type")
-                            && !name.as_str().eq_ignore_ascii_case("content-length")
-                    })
+                    .filter(|(name, _)| header_utils::should_forward_request_header(name.as_str()))
                     .collect()
             })
             .unwrap_or_default();
@@ -535,11 +531,9 @@ impl Router {
             request_builder = request_builder.header("Authorization", auth_header);
         }
 
-        // Copy all headers from original request if provided
         if let Some(headers) = headers {
             for (name, value) in headers {
-                // Skip Content-Type and Content-Length as .json() sets them
-                if *name != CONTENT_TYPE && *name != CONTENT_LENGTH {
+                if header_utils::should_forward_request_header(name.as_str()) {
                     request_builder = request_builder.header(name, value);
                 }
             }
@@ -678,7 +672,7 @@ fn convert_reqwest_error(e: reqwest::Error) -> Response {
             "call_upstream_decode_error",
         )
     } else if e.is_timeout() {
-        (StatusCode::INTERNAL_SERVER_ERROR, "call_upstream_timeout")
+        (StatusCode::GATEWAY_TIMEOUT, "call_upstream_timeout")
     } else if e.is_connect() {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -695,8 +689,6 @@ fn convert_reqwest_error(e: reqwest::Error) -> Response {
 }
 
 use async_trait::async_trait;
-
-use crate::routers::error::extract_error_code_from_response;
 
 #[async_trait]
 impl RouterTrait for Router {

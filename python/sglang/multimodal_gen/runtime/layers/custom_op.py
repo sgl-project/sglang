@@ -8,22 +8,10 @@ from typing import Any
 
 import torch.nn as nn
 
-from sglang.multimodal_gen.runtime.utils.common import (
-    is_cpu,
-    is_cuda,
-    is_hip,
-    is_npu,
-    is_xpu,
-)
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
-
-_is_cuda = is_cuda()
-_is_hip = is_hip()
-_is_cpu = is_cpu()
-_is_npu = is_npu()
-_is_xpu = is_xpu()
 
 
 class CustomOp(nn.Module):
@@ -70,13 +58,13 @@ class CustomOp(nn.Module):
         return self.forward_native(*args, **kwargs)
 
     def dispatch_forward(self) -> Callable:
-        if _is_cuda:
+        if current_platform.is_cuda():
             return self.forward_cuda
-        elif _is_hip:
+        elif current_platform.is_hip():
             return self.forward_hip
-        elif _is_npu:
+        elif current_platform.is_npu():
             return self.forward_npu
-        elif _is_xpu:
+        elif current_platform.is_xpu():
             return self.forward_xpu
         else:
             return self.forward_native

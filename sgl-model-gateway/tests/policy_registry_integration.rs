@@ -2,7 +2,7 @@
 
 use std::{collections::HashMap, sync::Arc};
 
-use sgl_model_gateway::{
+use smg::{
     config::PolicyConfig, core::WorkerRegistry, policies::PolicyRegistry,
     protocols::worker_spec::WorkerConfigRequest, routers::router_manager::RouterManager,
 };
@@ -115,7 +115,7 @@ async fn test_policy_registry_with_router_manager() {
 
 #[test]
 fn test_policy_registry_cleanup() {
-    use sgl_model_gateway::{config::PolicyConfig, policies::PolicyRegistry};
+    use smg::{config::PolicyConfig, policies::PolicyRegistry};
 
     let registry = PolicyRegistry::new(PolicyConfig::RoundRobin);
 
@@ -142,7 +142,7 @@ fn test_policy_registry_cleanup() {
 
 #[test]
 fn test_policy_registry_multiple_models() {
-    use sgl_model_gateway::{config::PolicyConfig, policies::PolicyRegistry};
+    use smg::{config::PolicyConfig, policies::PolicyRegistry};
 
     let registry = PolicyRegistry::new(PolicyConfig::RoundRobin);
 
