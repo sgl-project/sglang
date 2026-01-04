@@ -781,26 +781,8 @@ class TestLargerScale(CustomTestCase):
         self._assert_in_range(result.summary["batch_size_balancedness_mean"], 0.90, 1.0, "bs")
         self._assert_in_range(result.summary["avg_batch_size"], 120, 150, "avg_bs")
 
-    def test_gsp_workload_random_policy(self):
-        result = self._run_main(
-            "--synth-gsp",
-            "--synth-gsp-num-groups", "80",
-            "--synth-gsp-prompts-per-group", "20",
-            "--synth-gsp-system-prompt-len", "31000",
-            "--synth-gsp-question-len", "1000",
-            "--synth-gsp-output-len", "2000",
-            "--synth-seed", "42",
-            "--num-gpus", "8",
-            "--router", "random",
-            "--max-total-tokens", "500000",
-            "--stop-criteria", "exist_no_pending",
-        )
-        self._assert_in_range(result.summary["attention_compute_balancedness_mean"], 0.90, 1.0, "attn")
-        self._assert_in_range(result.summary["batch_size_balancedness_mean"], 0.80, 0.95, "bs")
-        self._assert_in_range(result.summary["avg_batch_size"], 25, 40, "avg_bs")
-
-    def test_gsp_workload_sticky_policy(self):
-        result = self._run_main(
+    def _run_gsp_workload(self, router: str) -> SimulationResult:
+        return self._run_main(
             "--synth-gsp",
             "--synth-gsp-num-groups", "200",
             "--synth-gsp-prompts-per-group", "20",
@@ -809,13 +791,23 @@ class TestLargerScale(CustomTestCase):
             "--synth-gsp-output-len", "2000",
             "--synth-seed", "42",
             "--num-gpus", "8",
-            "--router", "sticky",
+            "--router", router,
             "--max-total-tokens", "500000",
-            "--max-steps", "5000",
+            "--stop-criteria", "exist_no_pending",
+            "--max-steps", "1000",
         )
-        self._assert_in_range(result.summary["attention_compute_balancedness_mean"], 0.30, 0.60, "attn")
-        self._assert_in_range(result.summary["batch_size_balancedness_mean"], 0.30, 0.60, "bs")
-        self._assert_in_range(result.summary["avg_batch_size"], 40, 80, "avg_bs")
+
+    def test_gsp_workload_random_policy(self):
+        result = self._run_gsp_workload("random")
+        self._assert_in_range(result.summary["attention_compute_balancedness_mean"], 0.95, 1.0, "attn")
+        self._assert_in_range(result.summary["batch_size_balancedness_mean"], 0.95, 1.0, "bs")
+        self._assert_in_range(result.summary["avg_batch_size"], 20, 30, "avg_bs")
+
+    def test_gsp_workload_sticky_policy(self):
+        result = self._run_gsp_workload("sticky")
+        self._assert_in_range(result.summary["attention_compute_balancedness_mean"], 0.95, 1.0, "attn")
+        self._assert_in_range(result.summary["batch_size_balancedness_mean"], 0.50, 0.75, "bs")
+        self._assert_in_range(result.summary["avg_batch_size"], 30, 45, "avg_bs")
 
 
 if __name__ == "__main__":
