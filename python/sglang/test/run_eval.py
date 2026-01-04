@@ -51,6 +51,9 @@ def run_eval_once(args, base_url: str, eval_obj: Eval) -> dict:
 
 
 def run_eval(args):
+    # Lazy import to avoid circular dependency with test_utils
+    from sglang.test.test_utils import dump_metric
+
     set_ulimit()
 
     if "OPENAI_API_KEY" not in os.environ:
@@ -132,6 +135,18 @@ def run_eval(args):
         metrics = result.metrics | {"score": result.score}
         print(f"Total latency: {latency:.3f} s")
         print(f"Score: {metrics['score']:.3f}")
+
+        # Report metrics to unified collection framework
+        dump_metric(
+            f"{args.eval_name}_score",
+            metrics["score"],
+            labels={"model": sampler.model, "eval": args.eval_name},
+        )
+        dump_metric(
+            f"{args.eval_name}_latency",
+            latency,
+            labels={"model": sampler.model, "eval": args.eval_name},
+        )
     else:
         from concurrent.futures import ThreadPoolExecutor
 
@@ -156,6 +171,17 @@ def run_eval(args):
         print("=" * 20)
         metrics = result.metrics | {"scores": scores_repeat}
         metrics = metrics | {"mean_score": mean_score}
+
+        # Report metrics to unified collection framework
+        dump_metric(
+            f"{args.eval_name}_mean_score",
+            mean_score,
+            labels={
+                "model": sampler.model,
+                "eval": args.eval_name,
+                "repeat": args.repeat,
+            },
+        )
 
         executor.shutdown()
 

@@ -470,7 +470,7 @@ class VisionAscendAttention(nn.Module):
         Returns:
              [b * s, h, head_size]
         """
-        cu_seqlens = resolve_seqlens(cu_seqlens, bsz, seq_len, device=q.device)
+        cu_seqlens = resolve_seqlens(cu_seqlens, bsz, seq_len, device="cpu")
 
         seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
         if seq_lens.is_npu:

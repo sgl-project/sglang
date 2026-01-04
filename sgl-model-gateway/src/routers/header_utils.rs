@@ -183,3 +183,60 @@ pub fn extract_auth_header(
             .and_then(|k| HeaderValue::from_str(&format!("Bearer {}", k)).ok())
     })
 }
+
+#[inline]
+pub fn should_forward_request_header(name: &str) -> bool {
+    const REQUEST_ID_PREFIX: &str = "x-request-id-";
+
+    name.eq_ignore_ascii_case("authorization")
+        || name.eq_ignore_ascii_case("x-request-id")
+        || name.eq_ignore_ascii_case("x-correlation-id")
+        || name.eq_ignore_ascii_case("traceparent")
+        || name.eq_ignore_ascii_case("tracestate")
+        || name.eq_ignore_ascii_case("x-smg-routing-key")
+        || name
+            .get(..REQUEST_ID_PREFIX.len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(REQUEST_ID_PREFIX))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_should_forward_request_header_whitelist() {
+        assert!(should_forward_request_header("authorization"));
+        assert!(should_forward_request_header("Authorization"));
+        assert!(should_forward_request_header("AUTHORIZATION"));
+        assert!(should_forward_request_header("x-request-id"));
+        assert!(should_forward_request_header("X-Request-Id"));
+        assert!(should_forward_request_header("x-correlation-id"));
+        assert!(should_forward_request_header("X-Correlation-ID"));
+        assert!(should_forward_request_header("traceparent"));
+        assert!(should_forward_request_header("Traceparent"));
+        assert!(should_forward_request_header("tracestate"));
+        assert!(should_forward_request_header("Tracestate"));
+        assert!(should_forward_request_header("x-request-id-user"));
+        assert!(should_forward_request_header("X-Request-ID-Span"));
+        assert!(should_forward_request_header("x-request-id-123"));
+        assert!(should_forward_request_header("x-smg-routing-key"));
+        assert!(should_forward_request_header("X-SMG-Routing-Key"));
+    }
+
+    #[test]
+    fn test_should_forward_request_header_blocked() {
+        assert!(!should_forward_request_header("content-type"));
+        assert!(!should_forward_request_header("Content-Type"));
+        assert!(!should_forward_request_header("content-length"));
+        assert!(!should_forward_request_header("host"));
+        assert!(!should_forward_request_header("Host"));
+        assert!(!should_forward_request_header("connection"));
+        assert!(!should_forward_request_header("transfer-encoding"));
+        assert!(!should_forward_request_header("accept"));
+        assert!(!should_forward_request_header("accept-encoding"));
+        assert!(!should_forward_request_header("user-agent"));
+        assert!(!should_forward_request_header("cookie"));
+        assert!(!should_forward_request_header("x-custom-header"));
+        assert!(!should_forward_request_header("x-api-key"));
+    }
+}

@@ -509,7 +509,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             self._attach_multi_http_worker_info(obj)
 
         # Log the request
-        self.request_logger.log_received_request(obj, self.tokenizer)
+        self.request_logger.log_received_request(obj, self.tokenizer, request)
 
         async with self.is_pause_cond:
             await self.is_pause_cond.wait_for(lambda: not self.is_pause)
@@ -1214,7 +1214,10 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                         "response_sent_to_client_ts"
                     ] = state.response_sent_to_client_ts
                 self.request_logger.log_finished_request(
-                    obj, out, is_multimodal_gen=self.model_config.is_multimodal_gen
+                    obj,
+                    out,
+                    is_multimodal_gen=self.model_config.is_multimodal_gen,
+                    request=request,
                 )
 
                 if self.request_metrics_exporter_manager.exporter_enabled():
