@@ -579,7 +579,7 @@ class GrpcRequestManager:
                     ),
                     "reasoning_tokens": (
                         batch_out.reasoning_tokens[i]
-                        if getattr(batch_out, "reasoning_tokens", None)
+                        if batch_out.reasoning_tokens
                         else 0
                     ),
                     "finish_reason": (
