@@ -31,7 +31,8 @@ from sglang.srt.utils import log_info_on_rank0
 logger = logging.getLogger(__name__)
 
 # Validation marker version - increment when validation logic changes
-VALIDATION_MARKER_VERSION = "1"
+# v2: Added trust_remote_code module validation (modeling_*.py must exist in snapshot)
+VALIDATION_MARKER_VERSION = "2"
 
 
 def _get_validation_marker_path(snapshot_dir: str) -> Optional[str]:
@@ -327,12 +328,19 @@ def _validate_config_and_tokenizer_files(snapshot_dir: str) -> Tuple[bool, List[
                         module_name = value.split(".")[0]
                         custom_files.add(f"{module_name}.py")
 
-                # Check if all custom files exist
+                # Check if all custom files exist in snapshot directory
+                # NOTE: Some models (like nvidia/DeepSeek-V3-0324-FP4) have auto_map
+                # but don't include modeling_*.py in their repo, relying on transformers
+                # to fetch it from the base model. We MUST mark these as missing to
+                # prevent offline mode, which would fail to load the dynamic modules.
                 for custom_file in custom_files:
                     custom_file_path = os.path.join(snapshot_dir, custom_file)
                     if not os.path.exists(custom_file_path):
                         missing_files.append(
                             f"{custom_file} (required for trust_remote_code)"
+                        )
+                        logger.debug(
+                            f"Custom module file not in snapshot: {custom_file} for {snapshot_dir}"
                         )
                     elif not os.path.isfile(custom_file_path):
                         missing_files.append(f"{custom_file} (exists but not a file)")
