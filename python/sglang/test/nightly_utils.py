@@ -192,23 +192,6 @@ class NightlyBenchmarkRunner:
                 f"Loaded {len(benchmark_results)} benchmark results from {json_output_file}"
             )
 
-            # Log trace file selections (only TP-0 traces are published)
-            for result in benchmark_results:
-                if result.profile_link_extend or result.profile_link_decode:
-                    extend_file = (
-                        os.path.basename(result.profile_link_extend)
-                        if result.profile_link_extend
-                        else "N/A"
-                    )
-                    decode_file = (
-                        os.path.basename(result.profile_link_decode)
-                        if result.profile_link_decode
-                        else "N/A"
-                    )
-                    print(
-                        f"  Trace selection: extend={extend_file}, decode={decode_file}"
-                    )
-
             # Clean up JSON file
             os.remove(json_output_file)
 
