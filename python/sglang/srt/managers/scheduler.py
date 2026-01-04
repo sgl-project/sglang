@@ -1929,10 +1929,10 @@ class Scheduler(
             if self.prefill_delayer
             else True
         )
-        if (
-            (not delayer_allow_prefill)
-            or ((self.running_batch.batch_is_full or len(self.waiting_queue) == 0))
-        ) and self.chunked_req is None:
+        if (not delayer_allow_prefill) or (
+            (self.running_batch.batch_is_full or len(self.waiting_queue) == 0)
+            and self.chunked_req is None
+        ):
             return None
 
         running_bs = len(self.running_batch.reqs)
