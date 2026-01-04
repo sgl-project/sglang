@@ -265,7 +265,7 @@ class MMReceiver:
                     else:
                         raise e
                 self.mm_processor = get_mm_processor(
-                    hf_config, server_args, _processor, transport_mode
+                    hf_config, server_args, _processor, "default"
                 )
 
     # For zmq_to_scheduler
