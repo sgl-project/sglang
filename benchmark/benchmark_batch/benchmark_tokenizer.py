@@ -83,7 +83,11 @@ def benchmark(data, batch_size, sequential_fn, batch_fn, num_runs, skip_batch):
         batch_times = measure_times(lambda: batch_fn(batch_data), num_runs)
         out |= {
             "avg_batch_ms": mean(batch_times),
-            "speedup_factor": mean(sequential_times) / mean(batch_times) if mean(batch_times) > 0 else 0,
+            "speedup_factor": (
+                mean(sequential_times) / mean(batch_times)
+                if mean(batch_times) > 0
+                else 0
+            ),
             "batch_runs": batch_times,
         }
 
@@ -115,13 +119,19 @@ def print_results(results, func_name, skip_batch):
         for r in results:
             print(f"{r['batch_size']:<10} {r['avg_sequential_ms']:.2f} ms")
     else:
-        print(f"{'Batch Size':<10} {'Sequential (ms)':<18} {'Batch (ms)':<18} {'Speedup':<10}")
+        print(
+            f"{'Batch Size':<10} {'Sequential (ms)':<18} {'Batch (ms)':<18} {'Speedup':<10}"
+        )
         print("-" * 60)
         for r in results:
-            print(f"{r['batch_size']:<10} {r['avg_sequential_ms']:.2f} ms{' ' * 8} {r['avg_batch_ms']:.2f} ms{' ' * 8} {r['speedup_factor']:.2f}x")
+            print(
+                f"{r['batch_size']:<10} {r['avg_sequential_ms']:.2f} ms{' ' * 8} {r['avg_batch_ms']:.2f} ms{' ' * 8} {r['speedup_factor']:.2f}x"
+            )
 
 
-def run_benchmark(name, data, sequential_fn, batch_fn, batch_sizes, num_runs, skip_batch):
+def run_benchmark(
+    name, data, sequential_fn, batch_fn, batch_sizes, num_runs, skip_batch
+):
     print("\n" + "=" * 60)
     print(f"{name.upper()} BENCHMARK")
     print("=" * 60)
@@ -149,8 +159,13 @@ def main():
     max_batch_size = max(args.batch_sizes)
 
     if "encode" in args.function:
-        token_ids = generate_random_token_ids(max_batch_size, args.num_tokens, tokenizer)
-        prompts = [tokenizer.decode(ids, clean_up_tokenization_spaces=True) for ids in token_ids]
+        token_ids = generate_random_token_ids(
+            max_batch_size, args.num_tokens, tokenizer
+        )
+        prompts = [
+            tokenizer.decode(ids, clean_up_tokenization_spaces=True)
+            for ids in token_ids
+        ]
         run_benchmark(
             name="encode",
             data=prompts,
@@ -162,7 +177,9 @@ def main():
         )
 
     if "decode" in args.function:
-        token_ids = generate_random_token_ids(max_batch_size, args.num_tokens, tokenizer)
+        token_ids = generate_random_token_ids(
+            max_batch_size, args.num_tokens, tokenizer
+        )
         run_benchmark(
             name="decode",
             data=token_ids,
