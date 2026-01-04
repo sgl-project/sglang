@@ -22,6 +22,7 @@ import sys
 import time
 from collections import deque
 from concurrent import futures
+from contextlib import nullcontext
 from dataclasses import dataclass
 from http import HTTPStatus
 from typing import Any, Deque, Dict, List, Optional, Tuple, Union
@@ -120,7 +121,10 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.mm_utils import init_mm_embedding_cache
 from sglang.srt.managers.overlap_utils import FutureMap
-from sglang.srt.managers.prefill_delayer import PrefillDelayer
+from sglang.srt.managers.prefill_delayer import (
+    PrefillDelayer,
+    PrefillDelayerSinglePassExecutor,
+)
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
     ModelWorkerBatch,
@@ -1911,6 +1915,18 @@ class Scheduler(
         return res
 
     def get_new_batch_prefill(self) -> Optional[ScheduleBatch]:
+        with (
+            PrefillDelayerSinglePassExecutor(self.prefill_delayer)
+            if self.prefill_delayer
+            else nullcontext()
+        ) as prefill_delayer_single_pass:
+            return self._get_new_batch_prefill_raw(
+                prefill_delayer_single_pass=prefill_delayer_single_pass
+            )
+
+    def _get_new_batch_prefill_raw(
+        self, prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor]
+    ) -> Optional[ScheduleBatch]:
         # Check if the grammar is ready in the grammar queue
         if self.grammar_queue:
             self.move_ready_grammar_requests()
@@ -1919,19 +1935,8 @@ class Scheduler(
             # Reset batch_is_full to try preemption with a prefill adder.
             self.running_batch.batch_is_full = False
 
-        # The `should_allow_prefill` needs to be called on all ranks since contains communication
-        delayer_allow_prefill = (
-            self.prefill_delayer.should_allow_prefill(
-                # TODO: consider offline generation cases when there are a lot of waiting requests
-                local_prefillable=len(self.waiting_queue)
-                > 0,
-            )
-            if self.prefill_delayer
-            else True
-        )
         if (
-            (not delayer_allow_prefill)
-            or ((self.running_batch.batch_is_full or len(self.waiting_queue) == 0))
+            self.running_batch.batch_is_full or len(self.waiting_queue) == 0
         ) and self.chunked_req is None:
             return None
 
@@ -1981,6 +1986,7 @@ class Scheduler(
             running_bs if self.is_mixed_chunk else 0,
             self.priority_scheduling_preemption_threshold,
             prefill_max_requests=self.server_args.prefill_max_requests,
+            prefill_delayer_single_pass=prefill_delayer_single_pass,
         )
 
         if self.chunked_req is not None:
