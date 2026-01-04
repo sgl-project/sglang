@@ -185,7 +185,7 @@ class MMEncoder:
     async def _encode(self, mm_items) -> torch.Tensor:
         images = load_images(mm_items)
 
-        images_input = self.image_processor(images=images)
+        images_input = self.image_processor(images=images, device=self.device)
         feature = images_input["pixel_values"]
         mm_item = MultimodalDataItem.from_dict(
             {
