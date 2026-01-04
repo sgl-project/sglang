@@ -1303,6 +1303,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # These are set from server_args and used to skip GPU compute on non-probe steps
     attention_tokens_stride: int = 1  # Only capture every Nth decode step
     attention_tokens_max: int = 0     # Max tokens to capture (0 = unlimited)
+    attention_fingerprint_mode: bool = False  # Fingerprint mode: 64 bytes vs 200KB per step
+    attention_fingerprint_max_steps: int = 256  # Early exit: stop after N steps
 
     @classmethod
     def init_new(
@@ -2167,6 +2169,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
             # Apply max: stop if we've hit the cap
             if max_tokens > 0 and len(req.attention_tokens) >= max_tokens:
+                continue
+
+            # Early exit for fingerprint mode: stop after N decode steps
+            # The attention manifold typically stabilizes early (within ~256 steps)
+            if (self.attention_fingerprint_mode and
+                self.attention_fingerprint_max_steps > 0 and
+                next_step > self.attention_fingerprint_max_steps):
                 continue
 
             # This request needs capture this step - enable GPU compute

@@ -615,6 +615,7 @@ class ServerArgs:
     # Fingerprint mode: compute in-kernel histogram instead of exporting raw indices
     # Production mode - 64 bytes vs ~200KB per step, for high-throughput routing
     attention_fingerprint_mode: bool = False
+    attention_fingerprint_max_steps: int = 256  # Early exit: only capture first N decode steps (manifold stabilizes early)
     attention_sidecar_url: str = ""  # ZMQ URL for fingerprint streaming (e.g., "tcp://localhost:9001")
     # Sketch mode: compute per-layer summary sketches (top_hubs, dist_hist, entropy)
     # Bandwidth-efficient for very long outputs (86k+) - ~500 bytes per layer vs raw edges
@@ -4475,6 +4476,14 @@ class ServerArgs:
             default=ServerArgs.attention_fingerprint_mode,
             help="Enable fingerprint mode for attention capture. Computes in-kernel log-binned histogram "
                  "instead of exporting raw indices. Production mode - 64 bytes vs ~200KB per step. (default: False)",
+        )
+        parser.add_argument(
+            "--attention-fingerprint-max-steps",
+            type=int,
+            default=ServerArgs.attention_fingerprint_max_steps,
+            help="Early exit for fingerprint mode: only capture first N decode steps. "
+                 "The attention manifold typically stabilizes early, so stopping after 256 steps "
+                 "saves ~90%% of compute overhead. Use 0 for unlimited. (default: 256)",
         )
         parser.add_argument(
             "--attention-sidecar-url",

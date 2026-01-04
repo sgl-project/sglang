@@ -1808,6 +1808,8 @@ class Scheduler(
                     # Ensure stride/max are set for compute-gated stride
                     self.running_batch.attention_tokens_stride = self.server_args.attention_tokens_stride
                     self.running_batch.attention_tokens_max = self.server_args.attention_tokens_max
+                    self.running_batch.attention_fingerprint_mode = self.server_args.attention_fingerprint_mode
+                    self.running_batch.attention_fingerprint_max_steps = self.server_args.attention_fingerprint_max_steps
                     ret = self.running_batch
                 else:
                     ret = None
@@ -2034,6 +2036,8 @@ class Scheduler(
         # Set attention token capture gating parameters (compute-gated stride)
         new_batch.attention_tokens_stride = self.server_args.attention_tokens_stride
         new_batch.attention_tokens_max = self.server_args.attention_tokens_max
+        new_batch.attention_fingerprint_mode = self.server_args.attention_fingerprint_mode
+        new_batch.attention_fingerprint_max_steps = self.server_args.attention_fingerprint_max_steps
 
         if self.enable_hierarchical_cache:
             # todo (zhiqiang): disable cuda graph execution if hicache loading triggered
