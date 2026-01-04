@@ -15,16 +15,6 @@ suites = {
         TestFile("layers/attention/mamba/test_causal_conv1d.py", 25),
         TestFile("layers/attention/mamba/test_mamba_ssm.py", 7),
         TestFile("layers/attention/mamba/test_mamba_ssm_ssd.py", 13),
-        TestFile("models/test_compressed_tensors_models.py", 42),
-        TestFile("models/test_cross_encoder_models.py", 100),
-        TestFile("models/test_embedding_models.py", 73),
-        TestFile("models/test_encoder_embedding_models.py", 221),
-        TestFile("models/test_generation_models.py", 103),
-        TestFile("models/test_nvidia_nemotron_nano_v2_vl.py", 214),  # GSM8k + MMMU
-        TestFile("models/test_qwen_models.py", 90),
-        TestFile("models/test_reward_models.py", 103),
-        TestFile("models/test_transformers_models.py", 245),
-        TestFile("models/test_vlm_models.py", 270),
         TestFile("openai_server/basic/test_openai_embedding.py", 70),
         TestFile("openai_server/basic/test_openai_server.py", 184),
         TestFile("openai_server/basic/test_protocol.py", 3),
@@ -195,12 +185,6 @@ suite_amd = {
         # TestFile("lora/test_lora_cuda_graph.py", 250), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/13107
         # TestFile("lora/test_lora_qwen3.py", 97), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/13107
         TestFile("dllm/test_llada2_mini_amd.py", 520),
-        TestFile("models/test_compressed_tensors_models.py", 42),
-        TestFile("models/test_cross_encoder_models.py", 150),
-        TestFile("models/test_qwen_models.py", 82),
-        TestFile("models/test_reward_models.py", 132),
-        TestFile("models/test_transformers_models.py", 320),
-        TestFile("models/test_vlm_models.py", 387),
         TestFile("openai_server/basic/test_openai_embedding.py", 141),
         TestFile("openai_server/basic/test_openai_server.py", 149),
         TestFile("openai_server/basic/test_protocol.py", 10),
@@ -261,7 +245,6 @@ suite_amd = {
         TestFile("test_video_utils.py", 8),
         # Disabled temporarily
         # TestFile("test_vlm_input_format.py", 300),
-        # TestFile("models/test_embedding_models.py", 73), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/11127
         # TestFile("openai_server/features/test_openai_server_hidden_states.py", 240),
         # TestFile("rl/test_update_weights_from_tensor.py", 48),
         # TestFile("test_no_overlap_scheduler.py", 234), # Disabled temporarily and track in #7703
