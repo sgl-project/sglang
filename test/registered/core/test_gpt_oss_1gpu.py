@@ -1,6 +1,16 @@
+import sys
 import unittest
+from pathlib import Path
+
+# Add test/srt to path for importing test_gpt_oss_common
+sys.path.insert(0, str(Path(__file__).parent.parent.parent / "srt"))
 
 from test_gpt_oss_common import BaseTestGptOss
+
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+
+register_cuda_ci(est_time=402, suite="stage-b-test-small-1-gpu")
+register_amd_ci(est_time=750, suite="stage-b-test-small-1-gpu-amd")
 
 
 class TestGptOss1Gpu(BaseTestGptOss):
