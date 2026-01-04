@@ -777,9 +777,9 @@ class TestLargerScale(CustomTestCase):
             "--max-total-tokens", "2000000",
             "--stop-criteria", "exist_no_pending",
         )
-        self._assert_in_range(result.summary["attention_compute_balancedness_mean"], 0.90, 1.0, "attn")
-        self._assert_in_range(result.summary["batch_size_balancedness_mean"], 0.90, 1.0, "bs")
-        self._assert_in_range(result.summary["avg_batch_size"], 120, 150, "avg_bs")
+        self._assert_in_range(result.summary["attention_compute_balancedness_mean"], 0.95, 1.0, "attn")
+        self._assert_in_range(result.summary["batch_size_balancedness_mean"], 0.90, 0.98, "bs")
+        self._assert_in_range(result.summary["avg_batch_size"], 127, 141, "avg_bs")
 
     def _run_gsp_workload(self, router: str) -> SimulationResult:
         return self._run_main(
@@ -799,15 +799,15 @@ class TestLargerScale(CustomTestCase):
 
     def test_gsp_workload_random_policy(self):
         result = self._run_gsp_workload("random")
-        self._assert_in_range(result.summary["attention_compute_balancedness_mean"], 0.80, 0.95, "attn")
-        self._assert_in_range(result.summary["batch_size_balancedness_mean"], 0.80, 0.95, "bs")
-        self._assert_in_range(result.summary["avg_batch_size"], 20, 30, "avg_bs")
+        self._assert_in_range(result.summary["attention_compute_balancedness_mean"], 0.88, 0.98, "attn")
+        self._assert_in_range(result.summary["batch_size_balancedness_mean"], 0.88, 0.98, "bs")
+        self._assert_in_range(result.summary["avg_batch_size"], 24, 27, "avg_bs")
 
     def test_gsp_workload_sticky_policy(self):
         result = self._run_gsp_workload("sticky")
-        self._assert_in_range(result.summary["attention_compute_balancedness_mean"], 0.50, 0.80, "attn")
-        self._assert_in_range(result.summary["batch_size_balancedness_mean"], 0.50, 0.80, "bs")
-        self._assert_in_range(result.summary["avg_batch_size"], 30, 50, "avg_bs")
+        self._assert_in_range(result.summary["attention_compute_balancedness_mean"], 0.63, 0.70, "attn")
+        self._assert_in_range(result.summary["batch_size_balancedness_mean"], 0.63, 0.71, "bs")
+        self._assert_in_range(result.summary["avg_batch_size"], 33, 37, "avg_bs")
 
 
 if __name__ == "__main__":
