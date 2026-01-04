@@ -142,12 +142,8 @@ class CachableDiT(BaseDiT):
         # Current branch marker (for maybe_cache_states / retrieve_cached_states)
         
 
-        # For models that don't support CFG, track if TeaCache was disabled due to CFG
-        self._teacache_disabled_for_cfg = False
 
-        # Wan-specific fields (ret_steps related)
-        if self.config.prefix.lower() == "wan":
-            self.use_ret_steps = self.config.cache_config.use_ret_steps
+       
             
 
     def reset_teacache_state(self) -> None:
@@ -170,16 +166,13 @@ class CachableDiT(BaseDiT):
 
         
 
-        # CFG disable marker (for non-CFG-supporting models)
-        self._teacache_disabled_for_cfg = False
+       
 
       
 
     def _compute_l1_and_decide(
         self,
         modulated_inp: torch.Tensor,
-        prev_modulated_inp: str,
-        accumulated_rel_l1_distance: float,
         coefficients: list[float],
         teacache_thresh: float,
     ) -> bool:
@@ -199,21 +192,22 @@ class CachableDiT(BaseDiT):
 
        
         # Compute relative L1 distance
+        prev_modulated_inp = self.previous_modulated_input_negative if self.is_cfg_negative else self.previous_modulated_input
         diff = modulated_inp - prev_modulated_inp
         rel_l1 = (diff.abs().mean() / prev_modulated_inp.abs().mean()).cpu().item()
 
         # Apply polynomial rescaling
         rescale_func = np.poly1d(coefficients)
-        accumulated = accumulated_rel_l1_distance + rescale_func(rel_l1)
-
-        # Decision based on threshold
-        if accumulated < teacache_thresh:
-            return False
         
-        return True
+        accumulated_rel_l1_distance = self.accumulated_rel_l1_distance_negative if self.is_cfg_negative else self.accumulated_rel_l1_distance
+        accumulated_rel_l1_distance = accumulated_rel_l1_distance + rescale_func(rel_l1)
+        if not self.is_cfg_negative:
+            self.accumulated_rel_l1_distance = accumulated_rel_l1_distance
+        else:
+            self.accumulated_rel_l1_distance_negative = accumulated_rel_l1_distance
         
-
-
+        return not (accumulated_rel_l1_distance < teacache_thresh)
+        
     def _compute_teacache_decision(
         self,
         modulated_inp: torch.Tensor,
@@ -246,24 +240,13 @@ class CachableDiT(BaseDiT):
                 self.accumulated_rel_l1_distance_negative = 0.0
                 self.previous_modulated_input_negative = modulated_inp.clone()
             return True
-
-        # Non-boundary: compute L1 distance and decide
-        if not self.is_cfg_negative:
-            return self._compute_l1_and_decide(
-                modulated_inp=modulated_inp,
-                prev_modulated_inp=self.previous_modulated_input,
-                accumulated_rel_l1_distance=self.accumulated_rel_l1_distance,
-                coefficients=coefficients,
-                teacache_thresh=teacache_thresh,
-            )
-        
         return self._compute_l1_and_decide(
-                modulated_inp=modulated_inp,
-                prev_modulated_inp=self.previous_modulated_input_negative,
-                accumulated_rel_l1_distance=self.accumulated_rel_l1_distance_negative,
-                coefficients=coefficients,
-                teacache_thresh=teacache_thresh,
-                )
+            modulated_inp=modulated_inp,
+            coefficients=coefficients,
+            teacache_thresh=teacache_thresh,
+        )
+        
+      
 
     
     def _get_teacache_context(self) -> TeaCacheContext | None:
@@ -300,7 +283,7 @@ class CachableDiT(BaseDiT):
         is_cfg_negative = forward_batch.is_cfg_negative
 
         # Reset at first timestep
-        if current_timestep == 0:
+        if current_timestep == 0 and not self.is_cfg_negative:
             self.reset_teacache_state()
 
         return TeaCacheContext(

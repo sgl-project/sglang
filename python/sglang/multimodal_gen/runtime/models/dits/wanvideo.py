@@ -962,6 +962,10 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
         )
 
         self.cnt += 1
+        if self.is_cfg_negative:
+            self.previous_modulated_input_negative = modulated_inp.clone()
+        else:
+            self.previous_modulated_input = modulated_inp.clone()
 
         return not should_calc
 
