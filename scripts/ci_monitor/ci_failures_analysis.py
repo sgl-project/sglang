@@ -1252,14 +1252,14 @@ class SGLangFailuresAnalyzer:
                 )
                 summary_lines.append("")
                 summary_lines.append(
-                    "_High queue times indicate that runner type may need more workers. Online column shows current runner availability._"
+                    "_High queue times indicate that runner type may need more workers. Offline column shows machines currently down._"
                 )
                 summary_lines.append("")
                 summary_lines.append(
-                    "| Runner Type | Online | Avg Queue | P90 Queue | # of Jobs Processed | Jobs Using This Runner |"
+                    "| Runner Type | Offline | Avg Queue | P90 Queue | # of Jobs Processed | Jobs Using This Runner |"
                 )
                 summary_lines.append(
-                    "|-------------|--------|-----------|-----------|---------------------|------------------------|"
+                    "|-------------|---------|-----------|-----------|---------------------|------------------------|"
                 )
 
                 # Sort by P90 queue time descending (longest waits first)
@@ -1275,15 +1275,22 @@ class SGLangFailuresAnalyzer:
                     total_jobs = stats.get("total_jobs", 0)
 
                     # Get online runner count for this runner type
-                    # Try to match runner_key with online_runners keys
-                    online_count = None
-                    for online_key, online_stats in online_runners.items():
-                        # Match if the online_key is contained in runner_key or vice versa
-                        if online_key in runner_key or runner_key in online_key:
-                            online_count = online_stats
-                            break
+                    # First try exact match, then fall back to substring match
+                    online_count = online_runners.get(runner_key)
+                    if not online_count:
+                        # Fall back to substring match (but prefer longer matches)
+                        best_match = None
+                        best_match_len = 0
+                        for online_key, online_stats in online_runners.items():
+                            if online_key in runner_key or runner_key in online_key:
+                                # Prefer longer matching keys (more specific)
+                                if len(online_key) > best_match_len:
+                                    best_match = online_stats
+                                    best_match_len = len(online_key)
+                        online_count = best_match
                     if online_count:
-                        online_str = f"{online_count['online']}/{online_count['total']}"
+                        offline = online_count["total"] - online_count["online"]
+                        online_str = f"{offline}/{online_count['total']}"
                     else:
                         online_str = "N/A"
 
