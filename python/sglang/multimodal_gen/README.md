@@ -66,7 +66,7 @@ sglang generate --model-path Wan-AI/Wan2.1-T2V-1.3B-Diffusers \
 
 ### LoRA support
 
-Support LoRA adapters via `--lora-path`:
+Apply LoRA adapters via `--lora-path`:
 
 ```bash
 sglang generate \
