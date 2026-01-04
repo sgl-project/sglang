@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import TYPE_CHECKING, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
+import math
 
 import torch
 
@@ -36,6 +37,148 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 DEFAULT_FORCE_STREAM_INTERVAL = 50
+
+# Sketch configuration
+SKETCH_TOP_HUBS_K = 32  # Number of top positions to track by attention mass
+SKETCH_DIST_BINS = 16   # Number of bins for distance histogram (log scale)
+SKETCH_DIST_MAX = 20    # Max log2 distance for binning (covers 1M+ tokens)
+
+
+def compute_attention_sketch(
+    token_positions: List[int],
+    attention_scores: List[float],
+    topk_logits: Optional[List[float]],
+    logsumexp: Optional[float],
+    current_pos: int,
+) -> Dict:
+    """
+    Compute a compact sketch from attention data for a single decode step.
+
+    The sketch contains:
+    - top_hubs: List of (position, score) for highest-attention positions
+    - dist_hist: Log-distance histogram showing attention distribution
+    - entropy: Estimated attention entropy
+    - mass_captured: Total probability mass captured by top-k
+
+    This is bandwidth-efficient: ~500 bytes per layer vs ~200 bytes per top-k position.
+    For long outputs (86k+ tokens), sketch mode saves 100x+ bandwidth.
+
+    Args:
+        token_positions: Top-k attended positions
+        attention_scores: Softmax scores (normalized over top-k only)
+        topk_logits: Raw attention logits (for true probability calculation)
+        logsumexp: Logsumexp over all tokens (for true probability)
+        current_pos: Current decode position (for distance calculation)
+
+    Returns:
+        Sketch dictionary with top_hubs, dist_hist, entropy, mass_captured
+    """
+    if not token_positions or not attention_scores:
+        return {
+            "top_hubs": [],
+            "dist_hist": [0.0] * SKETCH_DIST_BINS,
+            "entropy": 0.0,
+            "mass_captured": 0.0,
+        }
+
+    # Compute true probabilities if logsumexp is available
+    if topk_logits is not None and logsumexp is not None:
+        true_probs = [math.exp(logit - logsumexp) for logit in topk_logits]
+        mass_captured = sum(true_probs)
+    else:
+        # Fall back to top-k normalized scores
+        true_probs = attention_scores
+        mass_captured = 1.0  # By definition for softmax-normalized scores
+
+    # Top hubs: positions with highest attention scores
+    # Keep as (position, score) pairs for hub tracking across steps
+    hub_pairs = list(zip(token_positions, true_probs))
+    hub_pairs.sort(key=lambda x: -x[1])
+    top_hubs = hub_pairs[:SKETCH_TOP_HUBS_K]
+
+    # Distance histogram: bin attention mass by log2(distance)
+    # Bin i covers distances [2^i, 2^(i+1))
+    # Bin 0 is special: covers distance 0 (self-attention) and 1
+    dist_hist = [0.0] * SKETCH_DIST_BINS
+    for pos, prob in zip(token_positions, true_probs):
+        dist = current_pos - pos
+        if dist <= 0:
+            # Self or future attention (shouldn't happen in causal, but handle it)
+            bin_idx = 0
+        elif dist == 1:
+            bin_idx = 0
+        else:
+            # log2(dist), clamped to valid bin range
+            bin_idx = min(int(math.log2(dist)), SKETCH_DIST_BINS - 1)
+        dist_hist[bin_idx] += prob
+
+    # Entropy estimate from top-k probabilities
+    # This is a lower bound since we're missing the tail
+    entropy = 0.0
+    for prob in true_probs:
+        if prob > 1e-10:
+            entropy -= prob * math.log2(prob)
+
+    return {
+        "top_hubs": [(pos, round(score, 6)) for pos, score in top_hubs],
+        "dist_hist": [round(x, 6) for x in dist_hist],
+        "entropy": round(entropy, 4),
+        "mass_captured": round(mass_captured, 4),
+    }
+
+
+def merge_sketches(sketches: List[Dict]) -> Dict:
+    """
+    Merge multiple sketches into an aggregate summary.
+
+    This is useful for:
+    - Aggregating across decode steps (server-side before streaming)
+    - Aggregating across layers (cross-layer hub analysis)
+
+    Args:
+        sketches: List of sketch dictionaries
+
+    Returns:
+        Merged sketch with aggregated statistics
+    """
+    if not sketches:
+        return {
+            "top_hubs": [],
+            "dist_hist": [0.0] * SKETCH_DIST_BINS,
+            "avg_entropy": 0.0,
+            "avg_mass_captured": 0.0,
+            "num_steps": 0,
+        }
+
+    # Aggregate hub scores across all steps
+    hub_scores: Dict[int, float] = {}
+    for sketch in sketches:
+        for pos, score in sketch.get("top_hubs", []):
+            hub_scores[pos] = hub_scores.get(pos, 0.0) + score
+
+    # Get top hubs by cumulative score
+    top_hubs = sorted(hub_scores.items(), key=lambda x: -x[1])[:SKETCH_TOP_HUBS_K]
+
+    # Aggregate distance histograms (average)
+    dist_hist = [0.0] * SKETCH_DIST_BINS
+    for sketch in sketches:
+        for i, val in enumerate(sketch.get("dist_hist", [])):
+            if i < SKETCH_DIST_BINS:
+                dist_hist[i] += val
+    n = len(sketches)
+    dist_hist = [round(x / n, 6) for x in dist_hist]
+
+    # Average entropy and mass
+    avg_entropy = sum(s.get("entropy", 0.0) for s in sketches) / n
+    avg_mass = sum(s.get("mass_captured", 0.0) for s in sketches) / n
+
+    return {
+        "top_hubs": [(pos, round(score, 6)) for pos, score in top_hubs],
+        "dist_hist": dist_hist,
+        "avg_entropy": round(avg_entropy, 4),
+        "avg_mass_captured": round(avg_mass, 4),
+        "num_steps": n,
+    }
 
 
 class SchedulerOutputProcessorMixin:
@@ -448,14 +591,16 @@ class SchedulerOutputProcessorMixin:
                 )
 
             # Process attention token info for interpretability
-            # Two modes:
+            # Three modes:
             # 1. Debug Mode: Export raw indices/scores (for visualization)
             # 2. Fingerprint Mode: Stream 20D feature vector to sidecar (production)
+            # 3. Sketch Mode: Per-layer summaries (top_hubs, dist_hist, entropy) for long outputs
             #
             # COMPUTE-GATED STRIDE: The stride/max check is done BEFORE GPU compute
             # in schedule_batch.py. If we have results here, we should always store them.
             # The step counter is always incremented to track decode progress.
             fingerprint_mode = getattr(self.server_args, "attention_fingerprint_mode", False)
+            sketch_mode = getattr(self.server_args, "attention_sketch_mode", False)
 
             # Always increment step counter for attention-enabled requests
             # This ensures stride calculation is correct even when we skip compute
@@ -484,6 +629,61 @@ class SchedulerOutputProcessorMixin:
 
                     # Also store locally for API response (optional, for debugging)
                     req.attention_tokens.append(fingerprint_info)
+
+            elif (
+                (sketch_mode or getattr(req, "attention_sketch_mode", False))
+                and req.return_attention_tokens
+                and logits_output.attention_token_positions is not None
+            ):
+                # SKETCH MODE: Per-layer summary sketches for bandwidth efficiency
+                # Can be enabled server-wide (--attention-sketch-mode) or per-request
+                # Computes top_hubs, dist_hist, entropy per layer
+                # ~500 bytes per layer vs ~200KB for raw edges
+                req_top_k = getattr(req, "top_k_attention", 5)
+                current_pos = len(req.origin_input_ids) + len(req.output_ids) - 1
+
+                if logits_output.attention_multi_layer:
+                    # Multi-layer: compute sketch for each layer
+                    layer_sketches = {}
+                    for layer_id, (positions, scores, logits, logsumexp) in logits_output.attention_multi_layer.items():
+                        pos_list = positions[i].cpu().tolist()[:req_top_k]
+                        score_list = scores[i].cpu().tolist()[:req_top_k]
+                        logit_list = logits[i].cpu().tolist()[:req_top_k] if logits is not None else None
+                        lse_val = logsumexp[i].cpu().item() if logsumexp is not None else None
+
+                        layer_sketches[layer_id] = compute_attention_sketch(
+                            pos_list, score_list, logit_list, lse_val, current_pos
+                        )
+
+                    attention_info = {
+                        "mode": "sketch",
+                        "layer_sketches": layer_sketches,
+                        "decode_step": req.attention_tokens_decode_step,
+                    }
+                else:
+                    # Single layer: compute one sketch
+                    pos_list = logits_output.attention_token_positions[i].cpu().tolist()[:req_top_k]
+                    score_list = logits_output.attention_token_scores[i].cpu().tolist()[:req_top_k]
+                    logit_list = (
+                        logits_output.attention_topk_logits[i].cpu().tolist()[:req_top_k]
+                        if logits_output.attention_topk_logits is not None else None
+                    )
+                    lse_val = (
+                        logits_output.attention_logsumexp_candidates[i].cpu().item()
+                        if logits_output.attention_logsumexp_candidates is not None else None
+                    )
+
+                    sketch = compute_attention_sketch(
+                        pos_list, score_list, logit_list, lse_val, current_pos
+                    )
+                    attention_info = {
+                        "mode": "sketch",
+                        "sketch": sketch,
+                        "layer_id": getattr(logits_output, "attention_layer_id", -1),
+                        "decode_step": req.attention_tokens_decode_step,
+                    }
+
+                req.attention_tokens.append(attention_info)
 
             elif (
                 req.return_attention_tokens

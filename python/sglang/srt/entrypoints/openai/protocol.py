@@ -276,6 +276,7 @@ class CompletionRequest(BaseModel):
     return_attention_tokens: bool = False
     top_k_attention: int = 10  # Number of top attended tokens to return per output token
     attention_capture_layer_id: Optional[int] = None  # Layer to capture attention from (-1 = last, None = default)
+    attention_sketch_mode: bool = False  # Return per-layer sketches instead of raw edges (bandwidth efficient)
 
     @field_validator("max_tokens")
     @classmethod
@@ -508,6 +509,7 @@ class ChatCompletionRequest(BaseModel):
     return_attention_tokens: bool = False
     top_k_attention: int = 10  # Number of top attended tokens to return per output token
     attention_capture_layer_id: Optional[int] = None  # Layer to capture attention from (-1 = last, None = default)
+    attention_sketch_mode: bool = False  # Return per-layer sketches instead of raw edges (bandwidth efficient)
     reasoning_effort: Optional[Literal["low", "medium", "high"]] = Field(
         default="medium",
         description="Constrains effort on reasoning for reasoning models. "
