@@ -75,7 +75,7 @@ class Hf3fsUsrBioClient(Hf3fsClient):
         self.bytes_per_page = bytes_per_page
         self.entries = entries
         self.client_timeout = client_timeout
-
+        os.makedirs(os.path.dirname(self.path), exist_ok=True)
         self.file = os.open(self.path, os.O_RDWR | os.O_CREAT)
         os.ftruncate(self.file, size)
         register_fd(self.file)
