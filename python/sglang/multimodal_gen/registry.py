@@ -63,7 +63,10 @@ from sglang.multimodal_gen.configs.sample.wan import (
     WanT2V_1_3B_SamplingParams,
     WanT2V_14B_SamplingParams,
 )
-from sglang.multimodal_gen.configs.sample.zimage import ZImageSamplingParams
+from sglang.multimodal_gen.configs.sample.zimage import (
+    ZImageOmniSamplingParams,
+    ZImageSamplingParams,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
 )
@@ -422,6 +425,17 @@ def _register_configs():
         pipeline_config_cls=ZImagePipelineConfig,
         hf_model_paths=[
             "Tongyi-MAI/Z-Image-Turbo",
+        ],
+        model_detectors=[lambda hf_id: "z-image" in hf_id.lower()],
+    )
+
+    # TODO: review
+    # all class is dulplicated from zimage for now
+    register_configs(
+        sampling_param_cls=ZImageOmniSamplingParams,
+        pipeline_config_cls=ZImagePipelineConfig,
+        hf_model_paths=[
+            "Tongyi-MAI/Z-Image-Omni-Base",
         ],
         model_detectors=[lambda hf_id: "z-image" in hf_id.lower()],
     )

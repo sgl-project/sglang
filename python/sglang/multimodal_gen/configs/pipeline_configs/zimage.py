@@ -25,6 +25,19 @@ def zimage_preprocess_text(prompt: str):
 
 
 def zimage_postprocess_text(outputs: BaseEncoderOutput, _text_inputs) -> torch.Tensor:
+
+    # # TODO:: flatten => batching
+    # start_idx = 0
+    # for i in range(len(prompt_list_lengths)):
+    #     batch_embeddings = []
+    #     end_idx = start_idx + prompt_list_lengths[i]
+    #     for j in range(start_idx, end_idx):
+    #         batch_embeddings.append(prompt_embeds[j][prompt_masks[j]])
+    #     embeddings_list.append(batch_embeddings)
+    #     start_idx = end_idx
+
+    # TODO: review
+    # what is outputs.hidden_states and why outputs.hidden_states[-2]?
     device = outputs.hidden_states[-2].device
     prompt_mask = _text_inputs.attention_mask.to(device).bool()
     return outputs.hidden_states[-2][0][prompt_mask[0]]
@@ -55,18 +68,42 @@ class ZImagePipelineConfig(ImagePipelineConfig):
     )
 
     def tokenize_prompt(self, prompts: list[str], tokenizer, tok_kwargs) -> dict:
-        # flatten to 1-d list
-        inputs = tokenizer.apply_chat_template(
-            prompts,
-            tokenize=True,
-            add_generation_prompt=True,
-            enable_thinking=True,
-            padding="max_length",
-            max_length=512,  # TODO (yhyang201): set max length according to config
-            truncation=True,
-            return_tensors="pt",
-            return_dict=True,
-        )
+        num_condition_images = tok_kwargs.get("num_condition_images", 0)
+        # TODO: review condition by num_condition_images looks bad
+        if num_condition_images == 0:
+            # flatten to 1-d list
+            inputs = tokenizer.apply_chat_template(
+                prompts,
+                tokenize=True,
+                add_generation_prompt=True,
+                enable_thinking=True,
+                padding="max_length",
+                max_length=512,  # TODO (yhyang201): set max length according to config
+                truncation=True,
+                return_tensors="pt",
+                return_dict=True,
+            )
+        else:
+            # NOTE: all batch flattened
+            flattened_prompt = []
+            prompt_list_lengths = []
+
+            # NOTE:
+            # flattened_prompt
+            for i in range(len(prompts)):
+                prompt_list_lengths.append(len(prompts[i]))
+                # NOTE: all batch flattened
+                flattened_prompt.extend(prompts[i])
+
+            inputs = tokenizer(
+                flattened_prompt,
+                padding="max_length",
+                # TODO: review ???
+                max_length=512,  # TODO (yhyang201): set max length according to config
+                truncation=True,
+                return_tensors="pt",
+            )
+
         return inputs
 
     def post_denoising_loop(self, latents, batch):

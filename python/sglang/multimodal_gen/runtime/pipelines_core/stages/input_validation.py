@@ -191,6 +191,10 @@ class InputValidationStage(PipelineStage):
             The validated batch information.
         """
 
+        # TODO: hard code debug for now.
+        batch.image_path = ["./australia.jpg"]
+        batch.num_images_per_prompt = 1
+
         self._generate_seeds(batch, server_args)
 
         # Ensure prompt is properly formatted
