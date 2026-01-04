@@ -578,6 +578,22 @@ def popen_launch_server(
     """
     other_args = other_args or []
 
+    # Enable multithread loading on H200 for faster weight loading
+    if is_h200_system():
+        other_args = list(other_args)
+        h200_config = {"enable_multithread_load": True, "num_threads": 64}
+
+        # Extract existing config if present, then merge
+        existing_config = {}
+        if "--model-loader-extra-config" in other_args:
+            idx = other_args.index("--model-loader-extra-config")
+            existing_config = json.loads(other_args.pop(idx + 1))
+            other_args.pop(idx)
+
+        # Merge: existing config takes precedence over h200 defaults
+        merged_config = {**h200_config, **existing_config}
+        other_args += ["--model-loader-extra-config", json.dumps(merged_config)]
+
     # Auto-detect device if needed
     if device == "auto":
         device = auto_config_device()
