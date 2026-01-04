@@ -56,7 +56,9 @@ def rotary_embedding_cos_sin_q(
     positions: Optional[torch.Tensor] = None,
 ) -> None:
     module = _jit_rotary_embedding_cos_sin_module(rot)
-    module.rotary_embedding_cos_sin_q(cos, sin, query, positions, head_size, interleaved)
+    module.rotary_embedding_cos_sin_q(
+        cos, sin, query, positions, head_size, interleaved
+    )
 
 
 def rotary_embedding_cos_sin_qk(

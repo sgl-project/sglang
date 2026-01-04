@@ -195,8 +195,8 @@ def apply_sglang_jit_rope_qk_inplace(
 
     cache_tok: torch.Tensor
     if cos_sin_cache.shape[0] < seqlen:
-         # Should not happen if cache is sufficient
-         pass
+        # Should not happen if cache is sufficient
+        pass
 
     if positions is None:
         if bsz > 1:
@@ -247,7 +247,7 @@ def apply_sglang_jit_rope_qk_inplace(
     else:
         # Split and Cast the FULL cache
         cos_full, sin_full = _split_cos_sin_from_cache(cache_full, dtype=q.dtype)
-        
+
         # Process layout (Contiguous or Cat)
         if interleaved:
             cos = cos_full.contiguous()
@@ -259,12 +259,14 @@ def apply_sglang_jit_rope_qk_inplace(
             else:
                 cos = cos_full.contiguous()
                 sin = sin_full.contiguous()
-        
+
         _JIT_ROPE_SPLIT_CAST_CACHE[cache_key] = (cos, sin)
         if len(_JIT_ROPE_SPLIT_CAST_CACHE) > 64:
             _JIT_ROPE_SPLIT_CAST_CACHE.popitem(last=False)
 
-    sglang_jit_rotary_embedding_cos_sin(cos, sin, q3, k3, head_size, interleaved, positions=positions)
+    sglang_jit_rotary_embedding_cos_sin(
+        cos, sin, q3, k3, head_size, interleaved, positions=positions
+    )
     return q3.view(bsz, seqlen, nheads, d), k3.view(bsz, seqlen, nheads, d)
 
 
