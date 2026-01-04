@@ -24,6 +24,7 @@ class Simulator:
         log_level: int = 0,
         max_total_tokens: int = 100000,
         stop_criteria: str = "all_done",
+        max_steps: Optional[int] = None,
     ):
         self.num_gpus = num_gpus
         self.router = router
@@ -32,6 +33,7 @@ class Simulator:
         self.log_level = log_level
         self.max_total_tokens = max_total_tokens
         self.stop_criteria = stop_criteria
+        self.max_steps = max_steps
         self.gpu_states: List[GPUState] = []
         self.step = 0
 
@@ -61,6 +63,8 @@ class Simulator:
         return SimulationResult(step_records=step_records, summary=self._get_summary())
 
     def _should_stop(self) -> bool:
+        if self.max_steps is not None and self.step >= self.max_steps:
+            return True
         if self.stop_criteria == "exist_no_pending":
             return any(not gpu.pending_requests for gpu in self.gpu_states)
         if self.stop_criteria == "all_done":

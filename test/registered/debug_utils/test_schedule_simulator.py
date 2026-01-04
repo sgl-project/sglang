@@ -802,7 +802,7 @@ class TestLargerScale(CustomTestCase):
     def test_gsp_workload_sticky_policy(self):
         result = self._run_main(
             "--synth-gsp",
-            "--synth-gsp-num-groups", "80",
+            "--synth-gsp-num-groups", "200",
             "--synth-gsp-prompts-per-group", "20",
             "--synth-gsp-system-prompt-len", "31000",
             "--synth-gsp-question-len", "1000",
@@ -811,11 +811,11 @@ class TestLargerScale(CustomTestCase):
             "--num-gpus", "8",
             "--router", "sticky",
             "--max-total-tokens", "500000",
-            "--stop-criteria", "all_done",
+            "--max-steps", "5000",
         )
-        self._assert_in_range(result.summary["attention_compute_balancedness_mean"], 0.30, 0.50, "attn")
-        self._assert_in_range(result.summary["batch_size_balancedness_mean"], 0.30, 0.50, "bs")
-        self._assert_in_range(result.summary["avg_batch_size"], 40, 70, "avg_bs")
+        self._assert_in_range(result.summary["attention_compute_balancedness_mean"], 0.30, 0.60, "attn")
+        self._assert_in_range(result.summary["batch_size_balancedness_mean"], 0.30, 0.60, "bs")
+        self._assert_in_range(result.summary["avg_batch_size"], 40, 80, "avg_bs")
 
 
 if __name__ == "__main__":

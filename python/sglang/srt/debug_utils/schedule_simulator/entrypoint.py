@@ -76,6 +76,7 @@ def create_arg_parser() -> argparse.ArgumentParser:
         default="all_done",
         help="all_done: run until all requests complete; exist_no_pending: stop when any GPU has no pending requests",
     )
+    parser.add_argument("--max-steps", type=int, default=None)
     parser.add_argument("--output", type=str, default=None)
     parser.add_argument("--log-level", type=int, choices=[0, 1, 2], default=0)
 
@@ -138,6 +139,7 @@ def main(args: argparse.Namespace) -> SimulationResult:
         log_level=args.log_level,
         max_total_tokens=args.max_total_tokens,
         stop_criteria=args.stop_criteria,
+        max_steps=args.max_steps,
     )
 
     print(
