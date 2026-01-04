@@ -16,9 +16,11 @@ from sglang.srt.debug_utils.schedule_simulator import (
     Simulator,
     StepRecord,
     StickyRouter,
+    create_arg_parser,
     generate_gsp_requests,
     generate_random_requests,
     load_from_request_logger,
+    main,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -754,6 +756,59 @@ step=13   | GPU0[R=0:- Q=0:-]""",
                 self.assertIn("R=2:", result.stdout)
             else:
                 self.assertNotIn("R=2:", result.stdout)
+
+
+class TestLargerScale(CustomTestCase):
+    def _run_main(self, *cli_args) -> SimulationResult:
+        parser = create_arg_parser()
+        args = parser.parse_args(cli_args)
+        return main(args)
+
+    def test_non_gsp_random_policy(self):
+        result = self._run_main(
+            "--synthetic",
+            "--synth-random-num-requests", "1000",
+            "--synth-random-input-len", "32000",
+            "--synth-random-output-len", "2000",
+            "--synth-seed", "42",
+            "--num-gpus", "8",
+            "--router", "random",
+            "--max-total-tokens", "2000000",
+        )
+        self.assertGreater(result.summary["attention_balancedness_mean"], 0.8)
+        self.assertGreater(result.summary["batch_size_balancedness_mean"], 0.8)
+
+    def test_gsp_random_policy(self):
+        result = self._run_main(
+            "--synth-gsp",
+            "--synth-gsp-num-groups", "10",
+            "--synth-gsp-prompts-per-group", "100",
+            "--synth-gsp-system-prompt-len", "31000",
+            "--synth-gsp-question-len", "1000",
+            "--synth-gsp-output-len", "2000",
+            "--synth-seed", "42",
+            "--num-gpus", "8",
+            "--router", "random",
+            "--max-total-tokens", "2000000",
+        )
+        self.assertGreater(result.summary["attention_balancedness_mean"], 0.7)
+        self.assertGreater(result.summary["batch_size_balancedness_mean"], 0.7)
+
+    def test_gsp_sticky_policy(self):
+        result = self._run_main(
+            "--synth-gsp",
+            "--synth-gsp-num-groups", "10",
+            "--synth-gsp-prompts-per-group", "100",
+            "--synth-gsp-system-prompt-len", "31000",
+            "--synth-gsp-question-len", "1000",
+            "--synth-gsp-output-len", "2000",
+            "--synth-seed", "42",
+            "--num-gpus", "8",
+            "--router", "sticky",
+            "--max-total-tokens", "2000000",
+        )
+        self.assertLess(result.summary["attention_balancedness_mean"], 0.7)
+        self.assertLess(result.summary["batch_size_balancedness_mean"], 0.7)
 
 
 if __name__ == "__main__":

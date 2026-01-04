@@ -1,9 +1,6 @@
 import argparse
 import json
-from dataclasses import asdict
 from typing import List
-
-import polars as pl
 
 from sglang.srt.debug_utils.schedule_simulator.data_source.data_loader import (
     load_from_request_logger,
@@ -23,7 +20,7 @@ from sglang.srt.debug_utils.schedule_simulator.routers import (
     StickyRouter,
 )
 from sglang.srt.debug_utils.schedule_simulator.schedulers import FIFOScheduler
-from sglang.srt.debug_utils.schedule_simulator.simulator import Simulator
+from sglang.srt.debug_utils.schedule_simulator.simulator import SimulationResult, Simulator
 
 
 def create_arg_parser() -> argparse.ArgumentParser:
@@ -117,7 +114,7 @@ def _create_scheduler(name: str):
     raise ValueError(f"Unknown scheduler: {name}")
 
 
-def main(args: argparse.Namespace) -> pl.DataFrame:
+def main(args: argparse.Namespace) -> SimulationResult:
     requests = _load_requests(args)
     router = _create_router(args.router, args.num_gpus)
     scheduler = _create_scheduler(args.scheduler)
@@ -136,8 +133,6 @@ def main(args: argparse.Namespace) -> pl.DataFrame:
     )
     result = sim.run(requests)
 
-    df = pl.DataFrame([asdict(r) for r in result.step_records])
-
     print("\n=== Summary ===")
     for key, value in result.summary.items():
         print(f"{key}: {value:.4f}" if isinstance(value, float) else f"{key}: {value}")
@@ -147,4 +142,4 @@ def main(args: argparse.Namespace) -> pl.DataFrame:
             json.dump(result.summary, f, indent=2)
         print(f"\nSummary saved to {args.output}")
 
-    return df
+    return result
