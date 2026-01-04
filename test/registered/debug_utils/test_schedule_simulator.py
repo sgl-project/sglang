@@ -156,7 +156,7 @@ class TestRouters(CustomTestCase):
         self.assertTrue(all(0 <= r < 4 for r in results))
 
     def test_sticky_router_same_group_same_gpu(self):
-        router = StickyRouter()
+        router = StickyRouter(num_gpus=4)
         gpu_states = [GPUState(gpu_id=i, max_total_tokens=10000) for i in range(4)]
         reqs = [
             SimRequest(request_id=f"r{i}", input_len=100, output_len=50, group_id="g0")
@@ -166,7 +166,7 @@ class TestRouters(CustomTestCase):
         self.assertEqual(len(set(results)), 1)
 
     def test_sticky_router_no_group_fallback(self):
-        router = StickyRouter()
+        router = StickyRouter(num_gpus=4)
         gpu_states = [GPUState(gpu_id=i, max_total_tokens=10000) for i in range(4)]
         reqs = [
             SimRequest(request_id=f"r{i}", input_len=100, output_len=50)
@@ -176,7 +176,7 @@ class TestRouters(CustomTestCase):
         self.assertTrue(all(0 <= r < 4 for r in results))
 
     def test_sticky_router_multiple_groups(self):
-        router = StickyRouter()
+        router = StickyRouter(num_gpus=4)
         gpu_states = [GPUState(gpu_id=i, max_total_tokens=10000) for i in range(4)]
         for group_id in ["g0", "g1", "g2"]:
             reqs = [
@@ -561,6 +561,39 @@ class TestCLI(CustomTestCase):
         )
         self.assertEqual(result.returncode, 0, f"CLI failed: {result.stderr}")
         self.assertIn("router=sticky", result.stdout)
+
+    def test_e2e_sticky_router_group_locality(self):
+        result = self._run_cli(
+            "--synth-gsp",
+            "--synth-gsp-num-groups",
+            "2",
+            "--synth-gsp-prompts-per-group",
+            "2",
+            "--synth-gsp-system-prompt-len",
+            "10",
+            "--synth-gsp-question-len",
+            "10",
+            "--synth-gsp-output-len",
+            "2",
+            "--synth-seed",
+            "42",
+            "--num-gpus",
+            "2",
+            "--router",
+            "sticky",
+            "--max-total-tokens",
+            "1000",
+            "--log-level",
+            "2",
+        )
+        self.assertEqual(result.returncode, 0, f"CLI failed: {result.stderr}")
+        for expected in [
+            "step=0    | GPU0[R=2:gsp",
+            "step=0    | GPU1[R=2:gsp",
+            "step=1    | GPU0[R=0:- Q=0:-]",
+            "step=1    | GPU1[R=0:- Q=0:-]",
+        ]:
+            self.assertIn(expected, result.stdout)
 
     def test_cli_synthetic(self):
         result = self._run_cli(

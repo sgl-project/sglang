@@ -101,13 +101,13 @@ def _load_requests(args: argparse.Namespace) -> List[SimRequest]:
     return requests
 
 
-def _create_router(name: str):
+def _create_router(name: str, num_gpus: int):
     if name == "random":
         return RandomRouter()
     if name == "round_robin":
         return RoundRobinRouter()
     if name == "sticky":
-        return StickyRouter()
+        return StickyRouter(num_gpus)
     raise ValueError(f"Unknown router: {name}")
 
 
@@ -119,7 +119,7 @@ def _create_scheduler(name: str):
 
 def main(args: argparse.Namespace) -> pl.DataFrame:
     requests = _load_requests(args)
-    router = _create_router(args.router)
+    router = _create_router(args.router, args.num_gpus)
     scheduler = _create_scheduler(args.scheduler)
 
     sim = Simulator(
