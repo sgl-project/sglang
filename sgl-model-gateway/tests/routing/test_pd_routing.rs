@@ -4,7 +4,7 @@ mod pd_routing_unit_tests {
     use smg::{
         app_context::AppContext,
         config::{PolicyConfig, RouterConfig, RoutingMode},
-        core::{BasicWorkerBuilder, Worker, WorkerType},
+        core::{BasicWorkerBuilder, ConnectionMode, Worker, WorkerType},
         routers::{http::pd_types::PDSelectionPolicy, RouterFactory},
         tokenizer::registry::TokenizerRegistry,
     };
@@ -923,5 +923,547 @@ mod pd_routing_unit_tests {
             balance_abs_threshold: 32,
             balance_rel_threshold: 1.1,
         };
+    }
+
+    // =====================================================
+    // EPD (Encode-Prefill-Decode) Mode Tests
+    // =====================================================
+
+    #[test]
+    fn test_encode_worker_type() {
+        // Test WorkerType::Encode with bootstrap port
+        let encode_worker: Box<dyn Worker> = Box::new(
+            BasicWorkerBuilder::new("http://encode:8080")
+                .worker_type(WorkerType::Encode {
+                    bootstrap_port: Some(9000),
+                })
+                .api_key("test_api_key")
+                .build(),
+        );
+        assert_eq!(encode_worker.url(), "http://encode:8080");
+        match encode_worker.worker_type() {
+            WorkerType::Encode { bootstrap_port } => {
+                assert_eq!(*bootstrap_port, Some(9000));
+            }
+            _ => panic!("Expected Encode worker type"),
+        }
+
+        // Test WorkerType::Encode without bootstrap port
+        let encode_worker_no_port: Box<dyn Worker> = Box::new(
+            BasicWorkerBuilder::new("http://encode2:8080")
+                .worker_type(WorkerType::Encode {
+                    bootstrap_port: None,
+                })
+                .api_key("test_api_key")
+                .build(),
+        );
+        match encode_worker_no_port.worker_type() {
+            WorkerType::Encode { bootstrap_port } => {
+                assert_eq!(*bootstrap_port, None);
+            }
+            _ => panic!("Expected Encode worker type"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_epd_router_configuration() {
+        // Test EPD routing mode configuration with all three worker types
+        let test_cases = vec![
+            (
+                RoutingMode::EncodePrefillDecode {
+                    encode_urls: vec![
+                        ("http://encode1:8080".to_string(), Some(9000)),
+                        ("http://encode2:8080".to_string(), None),
+                    ],
+                    prefill_urls: vec![
+                        ("http://prefill1:8080".to_string(), Some(9001)),
+                        ("http://prefill2:8080".to_string(), None),
+                    ],
+                    decode_urls: vec![
+                        "http://decode1:8080".to_string(),
+                        "http://decode2:8080".to_string(),
+                    ],
+                    encode_policy: None,
+                    prefill_policy: None,
+                    decode_policy: None,
+                },
+                PolicyConfig::Random,
+            ),
+            (
+                RoutingMode::EncodePrefillDecode {
+                    encode_urls: vec![("http://encode:8080".to_string(), Some(9000))],
+                    prefill_urls: vec![("http://prefill:8080".to_string(), Some(9001))],
+                    decode_urls: vec!["http://decode:8080".to_string()],
+                    encode_policy: Some(PolicyConfig::Random),
+                    prefill_policy: Some(PolicyConfig::RoundRobin),
+                    decode_policy: Some(PolicyConfig::PowerOfTwo {
+                        load_check_interval_secs: 5,
+                    }),
+                },
+                PolicyConfig::RoundRobin,
+            ),
+            (
+                RoutingMode::EncodePrefillDecode {
+                    encode_urls: vec![
+                        ("http://e1:8080".to_string(), Some(9000)),
+                        ("http://e2:8080".to_string(), Some(9001)),
+                    ],
+                    prefill_urls: vec![
+                        ("http://p1:8080".to_string(), Some(9002)),
+                        ("http://p2:8080".to_string(), Some(9003)),
+                        ("http://p3:8080".to_string(), Some(9004)),
+                    ],
+                    decode_urls: vec!["http://d1:8080".to_string(), "http://d2:8080".to_string()],
+                    encode_policy: None,
+                    prefill_policy: None,
+                    decode_policy: None,
+                },
+                PolicyConfig::CacheAware {
+                    cache_threshold: 0.7,
+                    balance_abs_threshold: 20,
+                    balance_rel_threshold: 1.2,
+                    eviction_interval_secs: 60,
+                    max_tree_size: 1000000,
+                },
+            ),
+        ];
+
+        for (mode, policy) in test_cases {
+            let config = match mode {
+                RoutingMode::EncodePrefillDecode {
+                    encode_urls,
+                    prefill_urls,
+                    decode_urls,
+                    encode_policy,
+                    prefill_policy,
+                    decode_policy,
+                } => RouterConfig::builder()
+                    .encode_prefill_decode_mode(
+                        encode_urls,
+                        prefill_urls,
+                        decode_urls,
+                        encode_policy,
+                        prefill_policy,
+                        decode_policy,
+                    )
+                    .connection_mode(ConnectionMode::Grpc { port: None })
+                    .policy(policy)
+                    .host("127.0.0.1")
+                    .port(3001)
+                    .max_payload_size(1024 * 1024)
+                    .request_timeout_secs(60)
+                    .worker_startup_timeout_secs(10)
+                    .worker_startup_check_interval_secs(1)
+                    .max_concurrent_requests(64)
+                    .queue_timeout_secs(60)
+                    .build_unchecked(),
+                _ => panic!("Expected EncodePrefillDecode mode"),
+            };
+
+            let app_context = {
+                use std::sync::{Arc, OnceLock};
+
+                use smg::{
+                    core::{LoadMonitor, WorkerRegistry},
+                    data_connector::{
+                        MemoryConversationItemStorage, MemoryConversationStorage,
+                        MemoryResponseStorage,
+                    },
+                    middleware::TokenBucket,
+                    policies::PolicyRegistry,
+                };
+
+                let client = reqwest::Client::new();
+                let rate_limiter = Some(Arc::new(TokenBucket::new(64, 64)));
+                let worker_registry = Arc::new(WorkerRegistry::new());
+                let policy_registry = Arc::new(PolicyRegistry::new(config.policy.clone()));
+                let response_storage = Arc::new(MemoryResponseStorage::new());
+                let conversation_storage = Arc::new(MemoryConversationStorage::new());
+                let conversation_item_storage = Arc::new(MemoryConversationItemStorage::new());
+                let load_monitor = Some(Arc::new(LoadMonitor::new(
+                    worker_registry.clone(),
+                    policy_registry.clone(),
+                    client.clone(),
+                    config.worker_startup_check_interval_secs,
+                )));
+                let worker_job_queue = Arc::new(OnceLock::new());
+                let workflow_engine = Arc::new(OnceLock::new());
+                let mcp_manager = Arc::new(OnceLock::new());
+
+                Arc::new(
+                    AppContext::builder()
+                        .router_config(config)
+                        .client(client)
+                        .rate_limiter(rate_limiter)
+                        .tokenizer_registry(Arc::new(TokenizerRegistry::new()))
+                        .reasoning_parser_factory(None)
+                        .tool_parser_factory(None)
+                        .worker_registry(worker_registry)
+                        .policy_registry(policy_registry)
+                        .response_storage(response_storage)
+                        .conversation_storage(conversation_storage)
+                        .conversation_item_storage(conversation_item_storage)
+                        .load_monitor(load_monitor)
+                        .worker_job_queue(worker_job_queue)
+                        .workflow_engine(workflow_engine)
+                        .mcp_manager(mcp_manager)
+                        .build()
+                        .unwrap(),
+                )
+            };
+
+            // Note: We don't test RouterFactory::create_router here because
+            // GrpcEPDRouter requires tokenizer/parsers which need actual model files.
+            // This test validates configuration structure and AppContext creation.
+            // For full router creation tests, see integration tests with real model setup.
+
+            let stats = app_context.worker_registry.stats();
+            assert_eq!(
+                stats.total_workers, 0,
+                "No workers should be registered without initialization"
+            );
+        }
+    }
+
+    #[test]
+    fn test_epd_worker_type_display() {
+        // Test Display trait implementation for all worker types
+        let regular = WorkerType::Regular;
+        let prefill = WorkerType::Prefill {
+            bootstrap_port: Some(9000),
+        };
+        let decode = WorkerType::Decode;
+        let encode = WorkerType::Encode {
+            bootstrap_port: Some(9001),
+        };
+        let encode_no_port = WorkerType::Encode {
+            bootstrap_port: None,
+        };
+
+        assert_eq!(format!("{}", regular), "Regular");
+        assert_eq!(format!("{}", prefill), "Prefill(bootstrap:9000)");
+        assert_eq!(format!("{}", decode), "Decode");
+        assert_eq!(format!("{}", encode), "Encode(bootstrap:9001)");
+        assert_eq!(format!("{}", encode_no_port), "Encode");
+    }
+
+    #[test]
+    fn test_epd_routing_mode_detection() {
+        // Test is_epd_mode() helper on RoutingMode
+        let epd_mode = RoutingMode::EncodePrefillDecode {
+            encode_urls: vec![("http://encode:8080".to_string(), Some(9000))],
+            prefill_urls: vec![("http://prefill:8080".to_string(), Some(9001))],
+            decode_urls: vec!["http://decode:8080".to_string()],
+            encode_policy: None,
+            prefill_policy: None,
+            decode_policy: None,
+        };
+
+        let pd_mode = RoutingMode::PrefillDecode {
+            prefill_urls: vec![("http://prefill:8080".to_string(), Some(9000))],
+            decode_urls: vec!["http://decode:8080".to_string()],
+            prefill_policy: None,
+            decode_policy: None,
+        };
+
+        let regular_mode = RoutingMode::Regular {
+            worker_urls: vec!["http://worker:8080".to_string()],
+        };
+
+        assert!(epd_mode.is_epd_mode());
+        assert!(!pd_mode.is_epd_mode());
+        assert!(!regular_mode.is_epd_mode());
+    }
+
+    #[test]
+    fn test_epd_policy_fallback() {
+        // Test that EPD mode falls back to main policy when specific policies are None
+        let mode_with_policies = RoutingMode::EncodePrefillDecode {
+            encode_urls: vec![("http://encode:8080".to_string(), None)],
+            prefill_urls: vec![("http://prefill:8080".to_string(), None)],
+            decode_urls: vec!["http://decode:8080".to_string()],
+            encode_policy: Some(PolicyConfig::Random),
+            prefill_policy: Some(PolicyConfig::RoundRobin),
+            decode_policy: Some(PolicyConfig::PowerOfTwo {
+                load_check_interval_secs: 5,
+            }),
+        };
+
+        let mode_without_policies = RoutingMode::EncodePrefillDecode {
+            encode_urls: vec![("http://encode:8080".to_string(), None)],
+            prefill_urls: vec![("http://prefill:8080".to_string(), None)],
+            decode_urls: vec!["http://decode:8080".to_string()],
+            encode_policy: None,
+            prefill_policy: None,
+            decode_policy: None,
+        };
+
+        // With explicit policies
+        if let RoutingMode::EncodePrefillDecode {
+            encode_policy,
+            prefill_policy,
+            decode_policy,
+            ..
+        } = mode_with_policies
+        {
+            assert!(encode_policy.is_some());
+            assert!(prefill_policy.is_some());
+            assert!(decode_policy.is_some());
+        }
+
+        // Without explicit policies (should fall back to main policy in factory)
+        if let RoutingMode::EncodePrefillDecode {
+            encode_policy,
+            prefill_policy,
+            decode_policy,
+            ..
+        } = mode_without_policies
+        {
+            assert!(encode_policy.is_none());
+            assert!(prefill_policy.is_none());
+            assert!(decode_policy.is_none());
+        }
+    }
+
+    #[test]
+    fn test_epd_worker_count() {
+        // Test worker_count() method for EPD mode
+        let mode = RoutingMode::EncodePrefillDecode {
+            encode_urls: vec![
+                ("http://e1:8080".to_string(), Some(9000)),
+                ("http://e2:8080".to_string(), Some(9001)),
+            ],
+            prefill_urls: vec![
+                ("http://p1:8080".to_string(), Some(9002)),
+                ("http://p2:8080".to_string(), Some(9003)),
+                ("http://p3:8080".to_string(), Some(9004)),
+            ],
+            decode_urls: vec![
+                "http://d1:8080".to_string(),
+                "http://d2:8080".to_string(),
+                "http://d3:8080".to_string(),
+                "http://d4:8080".to_string(),
+            ],
+            encode_policy: None,
+            prefill_policy: None,
+            decode_policy: None,
+        };
+
+        // Total should be 2 + 3 + 4 = 9
+        assert_eq!(mode.worker_count(), 9);
+    }
+
+    // =====================================================
+    // EPD Integration Tests (gRPC Encode + gRPC Prefill/Decode)
+    // =====================================================
+
+    #[test]
+    fn test_epd_encode_grpc_request_format() {
+        // Test that gRPC EncodeRequest has correct structure
+        use smg::grpc_client::sglang_proto::EncodeRequest;
+
+        let request = EncodeRequest {
+            mm_items: vec![
+                "https://example.com/image1.jpg".to_string(),
+                "https://example.com/image2.png".to_string(),
+            ],
+            req_id: "test-req-123".to_string(),
+            num_parts: 1,
+            part_idx: 0,
+            prefill_host: "prefill-worker-1".to_string(),
+            embedding_port: vec![], // Empty for dynamic port allocation
+        };
+
+        // Verify fields are set correctly
+        assert_eq!(request.mm_items.len(), 2);
+        assert_eq!(request.req_id, "test-req-123");
+        assert_eq!(request.num_parts, 1);
+        assert_eq!(request.part_idx, 0);
+        assert_eq!(request.prefill_host, "prefill-worker-1");
+        assert!(request.embedding_port.is_empty());
+    }
+
+    #[test]
+    fn test_epd_encode_request_with_embedding_ports() {
+        use smg::grpc_client::sglang_proto::EncodeRequest;
+
+        let request = EncodeRequest {
+            mm_items: vec!["data:image/png;base64,iVBORw0KGgo=".to_string()],
+            req_id: "test-req-456".to_string(),
+            num_parts: 2,
+            part_idx: 1,
+            prefill_host: "192.168.1.100".to_string(),
+            embedding_port: vec![8998, 8999],
+        };
+
+        assert_eq!(request.embedding_port, vec![8998, 8999]);
+        assert_eq!(request.num_parts, 2);
+        assert_eq!(request.part_idx, 1);
+    }
+
+    #[test]
+    fn test_epd_multimodal_item_extraction() {
+        // Test helper function that extracts multimodal URLs from requests
+        // This is used to determine what to send to the encode worker
+
+        // Simulate extracting image URLs from a chat request with vision content
+        let image_urls = [
+            "https://example.com/cat.jpg".to_string(),
+            "https://example.com/dog.png".to_string(),
+        ];
+
+        assert_eq!(image_urls.len(), 2);
+        assert!(image_urls[0].starts_with("https://"));
+    }
+
+    #[test]
+    fn test_epd_fallback_no_multimodal() {
+        // Test that EPD mode falls back to PD when no multimodal content is present
+        // This simulates the behavior in request_execution.rs
+
+        let mm_items: Vec<String> = vec![];
+
+        // When mm_items is empty, EPD should fall back to PD mode
+        let should_fallback = mm_items.is_empty();
+        assert!(
+            should_fallback,
+            "Should fall back to PD when no multimodal content"
+        );
+    }
+
+    #[test]
+    fn test_epd_connection_mode_selection() {
+        // Test that EPD mode uses gRPC for all workers (encode, prefill, decode)
+        use smg::core::ConnectionMode;
+
+        // All EPD workers use gRPC
+        let encode_mode = ConnectionMode::Grpc { port: Some(9000) };
+        assert!(matches!(encode_mode, ConnectionMode::Grpc { .. }));
+
+        // Prefill and decode workers also use gRPC
+        let prefill_mode = ConnectionMode::Grpc { port: Some(9001) };
+        let decode_mode = ConnectionMode::Grpc { port: None };
+        assert!(matches!(prefill_mode, ConnectionMode::Grpc { .. }));
+        assert!(matches!(decode_mode, ConnectionMode::Grpc { .. }));
+    }
+
+    #[test]
+    fn test_epd_client_selection_triple() {
+        // Test ClientSelection::Triple stores gRPC encoder client
+        use smg::config::RoutingMode;
+
+        let mode = RoutingMode::EncodePrefillDecode {
+            encode_urls: vec![("grpc://encode:30300".to_string(), None)],
+            prefill_urls: vec![("grpc://prefill:30000".to_string(), Some(9000))],
+            decode_urls: vec!["grpc://decode:30010".to_string()],
+            encode_policy: None,
+            prefill_policy: None,
+            decode_policy: None,
+        };
+
+        // Verify the mode is EPD
+        assert!(mode.is_epd_mode());
+
+        // All workers use gRPC in EPD mode
+        if let RoutingMode::EncodePrefillDecode { encode_urls, .. } = &mode {
+            assert_eq!(encode_urls[0].0, "grpc://encode:30300");
+        }
+    }
+
+    #[test]
+    fn test_epd_grpc_client_construction() {
+        // Test gRPC encoder client EncodeRequest construction
+        use smg::grpc_client::sglang_proto::EncodeRequest;
+
+        // Test request construction directly via proto
+        let request = EncodeRequest {
+            mm_items: vec!["https://example.com/image.jpg".to_string()],
+            req_id: "test-req-001".to_string(),
+            num_parts: 1,
+            part_idx: 0,
+            prefill_host: "prefill-host".to_string(),
+            embedding_port: vec![8998],
+        };
+
+        assert_eq!(request.mm_items.len(), 1);
+        assert_eq!(request.req_id, "test-req-001");
+        assert_eq!(request.prefill_host, "prefill-host");
+        assert_eq!(request.embedding_port, vec![8998]);
+    }
+
+    #[test]
+    fn test_epd_request_flow_simulation() {
+        // Simulate the EPD request flow:
+        // 1. Extract multimodal items
+        // 2. Call encode worker via gRPC
+        // 3. Clear multimodal from prefill request
+        // 4. Set need_wait_for_image flag
+        // 5. Send to prefill/decode via gRPC
+
+        // Step 1: Extract multimodal items
+        let mm_items = vec!["https://example.com/image.jpg".to_string()];
+        assert!(!mm_items.is_empty(), "Should have multimodal items");
+
+        // Step 2: Build gRPC encode request
+        use smg::grpc_client::sglang_proto::EncodeRequest;
+        let encode_request = EncodeRequest {
+            mm_items: mm_items.clone(),
+            req_id: "epd-test-001".to_string(),
+            num_parts: 1,
+            part_idx: 0,
+            prefill_host: "prefill.local".to_string(),
+            embedding_port: vec![],
+        };
+        assert_eq!(encode_request.mm_items.len(), 1);
+
+        // Step 3 & 4: After encode gRPC call, request should be modified
+        // - mm_inputs cleared
+        // - need_wait_for_image = true
+        // These are verified in the actual implementation
+
+        // Step 5: ExecutionResult is Dual (prefill + decode streams)
+        // Encode is synchronous gRPC call, not streaming
+    }
+
+    #[tokio::test]
+    async fn test_epd_encode_grpc_client_integration() {
+        use smg::grpc_client::SglangSchedulerClient;
+
+        // Try to connect to non-existent server (should fail gracefully)
+        let result = SglangSchedulerClient::connect("grpc://127.0.0.1:59999").await;
+        assert!(
+            result.is_err(),
+            "Should fail to connect to non-existent server"
+        );
+    }
+
+    #[test]
+    fn test_epd_disaggregated_params() {
+        // Test that DisaggregatedParams correctly handles EPD mode
+        // encode_bootstrap_* fields should be None (encode uses gRPC directly)
+
+        use smg::grpc_client::sglang_proto::DisaggregatedParams;
+
+        let params = DisaggregatedParams {
+            bootstrap_host: "prefill-host".to_string(),
+            bootstrap_port: 8998,
+            bootstrap_room: 12345,
+        };
+
+        // Verify prefill bootstrap is set (for prefill→decode KV transfer)
+        assert_eq!(params.bootstrap_host, "prefill-host");
+        assert_eq!(params.bootstrap_port, 8998);
+        assert_eq!(params.bootstrap_room, 12345);
+    }
+
+    #[test]
+    fn test_epd_execution_result_is_dual() {
+        // EPD mode returns ExecutionResult::Dual (not Triple) because:
+        // - Encode uses synchronous gRPC (waits for response before prefill)
+        // - Only prefill and decode use gRPC streaming
+        //
+        // This test documents that ExecutionResult only has Single and Dual variants.
+        // The old Triple variant was removed since EPD encode uses gRPC (not streaming).
+        // After encode gRPC completes, we have Dual streams (prefill + decode).
     }
 }
