@@ -1,5 +1,6 @@
 import argparse
 import json
+import random
 from typing import List
 
 from sglang.srt.debug_utils.schedule_simulator.data_source.data_loader import (
@@ -11,6 +12,7 @@ from sglang.srt.debug_utils.schedule_simulator.data_source.data_synthesis import
 )
 from sglang.srt.debug_utils.schedule_simulator.metrics import (
     AttentionComputeBalancednessRecorder,
+    AvgBatchSizeRecorder,
     BatchSizeBalancednessRecorder,
 )
 from sglang.srt.debug_utils.schedule_simulator.request import SimRequest
@@ -115,6 +117,8 @@ def _create_scheduler(name: str):
 
 
 def main(args: argparse.Namespace) -> SimulationResult:
+    if args.synth_seed is not None:
+        random.seed(args.synth_seed)
     requests = _load_requests(args)
     router = _create_router(args.router, args.num_gpus)
     scheduler = _create_scheduler(args.scheduler)
@@ -123,7 +127,7 @@ def main(args: argparse.Namespace) -> SimulationResult:
         num_gpus=args.num_gpus,
         router=router,
         scheduler=scheduler,
-        recorders=[BatchSizeBalancednessRecorder(), AttentionComputeBalancednessRecorder()],
+        recorders=[BatchSizeBalancednessRecorder(), AttentionComputeBalancednessRecorder(), AvgBatchSizeRecorder()],
         log_level=args.log_level,
         max_total_tokens=args.max_total_tokens,
     )

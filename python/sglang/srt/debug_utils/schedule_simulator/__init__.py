@@ -7,6 +7,7 @@ from sglang.srt.debug_utils.schedule_simulator.entrypoint import create_arg_pars
 from sglang.srt.debug_utils.schedule_simulator.gpu_state import GPUState, StepRecord
 from sglang.srt.debug_utils.schedule_simulator.metrics import (
     AttentionComputeBalancednessRecorder,
+    AvgBatchSizeRecorder,
     BatchSizeBalancednessRecorder,
     MetricRecorder,
 )
@@ -41,6 +42,7 @@ __all__ = [
     "MetricRecorder",
     "BatchSizeBalancednessRecorder",
     "AttentionComputeBalancednessRecorder",
+    "AvgBatchSizeRecorder",
     "load_from_request_logger",
     "generate_random_requests",
     "generate_gsp_requests",

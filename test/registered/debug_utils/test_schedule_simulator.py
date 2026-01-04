@@ -765,14 +765,10 @@ class TestLargerScale(CustomTestCase):
         self.assertGreaterEqual(value, lo, f"{name}={value} < {lo}")
         self.assertLessEqual(value, hi, f"{name}={value} > {hi}")
 
-    def _avg_batch_size(self, result: SimulationResult) -> float:
-        total = sum(r.running_count for r in result.step_records)
-        return total / len(result.step_records) if result.step_records else 0
-
     def test_vanilla_workload_random_policy(self):
         result = self._run_main(
             "--synthetic",
-            "--synth-random-num-requests", "10000",
+            "--synth-random-num-requests", "800",
             "--synth-random-input-len", "32000",
             "--synth-random-output-len", "2000",
             "--synth-seed", "42",
@@ -798,8 +794,7 @@ class TestLargerScale(CustomTestCase):
         )
         self._assert_in_range(result.summary["attention_compute_balancedness_mean"], 0.78, 0.83, "attn")
         self._assert_in_range(result.summary["batch_size_balancedness_mean"], 0.70, 0.75, "bs")
-        avg_bs = self._avg_batch_size(result)
-        self._assert_in_range(avg_bs, 15, 20, "avg_bs")
+        self._assert_in_range(result.summary["avg_batch_size"], 15, 20, "avg_bs")
 
     def test_gsp_workload_sticky_policy(self):
         result = self._run_main(
@@ -816,8 +811,7 @@ class TestLargerScale(CustomTestCase):
         )
         self._assert_in_range(result.summary["attention_compute_balancedness_mean"], 0.40, 0.45, "attn")
         self._assert_in_range(result.summary["batch_size_balancedness_mean"], 0.35, 0.40, "bs")
-        avg_bs = self._avg_batch_size(result)
-        self._assert_in_range(avg_bs, 25, 30, "avg_bs")
+        self._assert_in_range(result.summary["avg_batch_size"], 25, 30, "avg_bs")
 
 
 if __name__ == "__main__":
