@@ -25,6 +25,9 @@ class GPUState:
     def batch_size(self) -> int:
         return len(self.running_requests)
 
+    def total_attention_compute(self) -> int:
+        return sum(req.seq_len() for req in self.running_requests)
+
     def total_seq_len(self, extra_reqs: Optional[List[SimRequest]] = None) -> int:
         seen_groups = set()
         total = 0
