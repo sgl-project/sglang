@@ -2127,6 +2127,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             seq_lens_cpu_cache if seq_lens_cpu_cache is not None else self.seq_lens_cpu
         )
 
+        # Check if any request in the batch wants attention tokens (per-request gating)
+        capture_attention_tokens = any(
+            getattr(req, "return_attention_tokens", False) for req in self.reqs
+        )
+        attention_top_k = max(
+            (getattr(req, "top_k_attention", 5) for req in self.reqs if getattr(req, "return_attention_tokens", False)),
+            default=5,
+        )
+
         return ModelWorkerBatch(
             forward_mode=self.forward_mode,
             input_ids=self.input_ids,
@@ -2182,6 +2191,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             mamba_track_indices=self.mamba_track_indices,
             mamba_track_mask=self.mamba_track_mask,
             mamba_track_seqlens=self.mamba_track_seqlens,
+            capture_attention_tokens=capture_attention_tokens,
+            attention_top_k=attention_top_k,
         )
 
     def copy(self):
@@ -2316,3 +2327,8 @@ class ModelWorkerBatch:
     mamba_track_indices: Optional[torch.Tensor] = None  # shape: [b], int64
     mamba_track_mask: Optional[torch.Tensor] = None  # shape: [b], bool
     mamba_track_seqlens: Optional[torch.Tensor] = None  # shape: [b], int64
+
+    # For attention token capture (interpretability)
+    # True only if at least one request in the batch requested attention tokens
+    capture_attention_tokens: bool = False
+    attention_top_k: int = 5

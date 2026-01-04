@@ -416,6 +416,8 @@ class ForwardBatch:
     capture_attention_tokens: bool = False
     attention_top_k: int = 5
     attention_token_info: Optional[AttentionTokenInfo] = None
+    # Layer gating: only capture attention on this layer (default: last attention layer)
+    attention_capture_layer_id: int = -1
 
     @classmethod
     def init_new(
@@ -562,10 +564,18 @@ class ForwardBatch:
         if model_runner.server_args.enable_lora:
             model_runner.lora_manager.prepare_lora_batch(ret)
 
-        # Init attention token capture
-        if model_runner.server_args.return_attention_tokens:
+        # Init attention token capture (per-request gating)
+        # Only capture if feature is enabled on server AND at least one request in batch wants it
+        if model_runner.server_args.return_attention_tokens and batch.capture_attention_tokens:
             ret.capture_attention_tokens = True
-            ret.attention_top_k = model_runner.server_args.attention_tokens_top_k
+            ret.attention_top_k = batch.attention_top_k
+            # Store the last attention layer ID for layer gating
+            # For hybrid models (e.g., Qwen3-Next), this will be the last gated attention layer
+            if hasattr(model_runner, 'attention_layers') and model_runner.attention_layers:
+                ret.attention_capture_layer_id = model_runner.attention_layers[-1].layer_id
+            else:
+                # Fallback to last hidden layer
+                ret.attention_capture_layer_id = model_runner.model_config.num_hidden_layers - 1
 
         return ret
 
