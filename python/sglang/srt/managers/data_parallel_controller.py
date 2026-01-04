@@ -22,7 +22,7 @@ import threading
 import time
 from collections import deque
 from enum import Enum, auto
-from typing import Callable, List, Optional
+from typing import Callable, List, Optional, Union
 
 import psutil
 import setproctitle
@@ -37,20 +37,19 @@ from sglang.srt.managers.io_struct import (
     TokenizedGenerateReqInput,
     WatchLoadUpdateReq,
 )
-from sglang.srt.managers.schedule_batch import Req, RequestStage
+from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler import run_scheduler_process
 from sglang.srt.server_args import (
     DP_ATTENTION_HANDSHAKE_PORT_DELTA,
     PortArgs,
     ServerArgs,
 )
-from sglang.srt.tracing.trace import (
-    process_tracing_init,
-    trace_get_proc_propagate_context,
-    trace_set_proc_propagate_context,
-    trace_set_thread_info,
-    trace_slice_end,
-    trace_slice_start,
+from sglang.srt.tracing.trace import process_tracing_init, trace_set_thread_info
+from sglang.srt.tracing.trace_metric_wrapper import (
+    NullContext,
+    RequestStage,
+    TraceMetricContext,
+    metric_trace_slice_batch_scope,
 )
 from sglang.srt.utils import numa_utils
 from sglang.srt.utils.common import (
@@ -223,16 +222,31 @@ class DataParallelController:
     def handle_load_update_req(self, obj):
         self.dp_budget.update_budget(obj)
 
+    def _req_trace_metric_ctx_init(
+        self, req: Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput]
+    ):
+        if self.server_args.trace_level == 0:
+            req.trace_metric_ctx = NullContext()
+            return
+
+        bootstrap_room = req.bootstrap_room if hasattr(req, "bootstrap_room") else None
+
+        propagation_context = req.trace_metric_ctx
+        req.trace_metric_ctx = TraceMetricContext(
+            req.rid,
+            bootstrap_room,
+            module_name="request",
+            server_args=self.server_args,
+        )
+        req.trace_metric_ctx.trace_set_proc_propagate_context(propagation_context)
+
     def dispatching_with_trace(self, req: Req):
-        if self.server_args.enable_trace:
-            trace_set_proc_propagate_context(req.rid, req.trace_context)
-            trace_slice_start(RequestStage.DC_DISPATCH, req.rid)
-            req.trace_context = trace_get_proc_propagate_context(req.rid)
+        self._req_trace_metric_ctx_init(req)
 
-        self.dispatching(req)
-
-        if self.server_args.enable_trace:
-            trace_slice_end(RequestStage.DC_DISPATCH, req.rid, thread_finish_flag=True)
+        with metric_trace_slice_batch_scope(
+            RequestStage.DC_DISPATCH, [req], True, True
+        ):
+            self.dispatching(req)
 
     def init_dispatcher(self):
         self._request_dispatcher = TypeBasedDispatcher(
@@ -663,7 +677,7 @@ def run_data_parallel_controller_process(
     parent_process = psutil.Process().parent()
 
     configure_logger(server_args)
-    if server_args.enable_trace:
+    if server_args.trace_level > 0:
         process_tracing_init(server_args.otlp_traces_endpoint, "sglang")
         thread_label = "DP Controller"
         if server_args.disaggregation_mode == "prefill":
