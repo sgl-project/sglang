@@ -22,6 +22,15 @@ from sglang.srt.utils.hf_transformers_utils import get_processor
 
 logger = logging.getLogger(__name__)
 
+def _determine_tensor_transport_mode(server_args):
+    is_cross_node = server_args.dist_init_addr
+
+    if is_cross_node:
+        # Fallback to default CPU transport for multi-node
+        return "default"
+    else:
+        return "cuda_ipc"
+
 
 class EmbeddingData:
     def __init__(self, req_id, num_parts, part_idx, image_grid_dim, embedding=None):
@@ -228,6 +237,7 @@ class MMReceiver:
             self.hostname = get_local_ip_auto()
             self.waiting_list: List[WaitingImageRequest] = []
             if hf_config is not None:
+                transport_mode = _determine_tensor_transport_mode(server_args)
 
                 import_processors("sglang.srt.multimodal.processors")
                 _processor = None
@@ -255,7 +265,7 @@ class MMReceiver:
                     else:
                         raise e
                 self.mm_processor = get_mm_processor(
-                    hf_config, server_args, _processor, "default"
+                    hf_config, server_args, _processor, transport_mode, skip_mm_pool=False
                 )
 
     # For zmq_to_scheduler
