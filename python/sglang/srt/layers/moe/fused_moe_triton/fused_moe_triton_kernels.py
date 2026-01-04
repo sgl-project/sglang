@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import functools
 import os
 from typing import Any, Dict, List, Optional
 
@@ -20,6 +21,7 @@ from sglang.srt.layers.quantization.int8_kernel import (
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
+    get_device_name,
     is_cpu,
     is_cuda,
     is_hip,
@@ -51,6 +53,24 @@ padding_size = 128 if bool(int(os.getenv("SGLANG_MOE_PADDING", "0"))) else 0
 
 def support_tensor_descriptor():
     return _support_tensor_descriptor
+
+
+# In theory, swap_ab should benefit all SM90 GPUs.
+# However, since it has only been verified on H20 (not H100/H200),
+# it is currently enabled only on H20.
+@functools.lru_cache(maxsize=8)
+def should_enable_swap_ab(
+    BLOCK_SIZE_M: int,
+    BLOCK_SIZE_N: int,
+) -> bool:
+    device_name = get_device_name()
+    is_h20_device = device_name and "H20" in device_name and "H200" not in device_name
+    return (
+        is_h20_device
+        and is_sm90_supported()
+        and BLOCK_SIZE_M < 64
+        and BLOCK_SIZE_N >= 64
+    )
 
 
 @triton.jit
@@ -628,14 +648,10 @@ def invoke_fused_moe_kernel(
     assert topk_weights.stride(1) == 1
     assert sorted_token_ids.stride(0) == 1
 
-    swap_ab = False
-    if (
-        use_fp8_w8a8
-        and is_sm90_supported()
-        and config["BLOCK_SIZE_M"] < 64
-        and config["BLOCK_SIZE_N"] >= 64
-    ):
-        swap_ab = True
+    if use_fp8_w8a8:
+        swap_ab = should_enable_swap_ab(config["BLOCK_SIZE_M"], config["BLOCK_SIZE_N"])
+    else:
+        swap_ab = False
 
     padded_size = 0
     if use_fp8_w8a8:
