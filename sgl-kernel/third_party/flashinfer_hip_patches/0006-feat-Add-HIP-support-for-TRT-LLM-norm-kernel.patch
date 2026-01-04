@@ -1,0 +1,112 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: SGLang <sglang@example.com>
+Date: Sat, 4 Jan 2026 00:00:00 +0000
+Subject: [PATCH] feat: Add HIP support for TRT-LLM norm kernel dependencies
+
+Add HIP/ROCm compatibility to the TRT-LLM common files used by norm.cuh:
+- reduceKernelUtils.cuh: Add HIP cooperative_groups and header guards
+- cudaUtils.h: Guard cuBLAS includes for HIP
+- norm.cuh: Add PDL (Programmatic Dependent Launch) guards for HIP
+
+These changes enable FlashInfer's RMSNorm kernel to compile on AMD GPUs.
+
+---
+ include/flashinfer/norm.cuh                              | 15 ++++++++++++
+ include/flashinfer/trtllm/common/cudaUtils.h             |  8 +++++++
+ include/flashinfer/trtllm/common/reduceKernelUtils.cuh   | 25 +++++++++++++++++---
+ 3 files changed, 45 insertions(+), 3 deletions(-)
+
+diff --git a/include/flashinfer/norm.cuh b/include/flashinfer/norm.cuh
+index 0000000..1111111 100644
+--- a/include/flashinfer/norm.cuh
++++ b/include/flashinfer/norm.cuh
+@@ -19,6 +19,21 @@
+ #include <cstdint>
+ #include <numeric>
+ 
++// HIP/ROCm compatibility for norm kernel
++#ifdef __HIP_PLATFORM_AMD__
++#include <hip/hip_runtime.h>
++// PDL (Programmatic Dependent Launch) is not supported on HIP
++#define FLASHINFER_PDL_SUPPORTED 0
++// CUDA to HIP API mappings
++#define cudaFuncSetAttribute hipFuncSetAttribute
++#define cudaFuncAttributeMaxDynamicSharedMemorySize hipFuncAttributeMaxDynamicSharedMemorySize
++#define cudaOccupancyMaxActiveBlocksPerMultiprocessor hipOccupancyMaxActiveBlocksPerMultiprocessor
++#define cudaGetDevice hipGetDevice
++#define cudaDeviceGetAttribute hipDeviceGetAttribute
++#define cudaDevAttrMultiProcessorCount hipDeviceAttributeMultiprocessorCount
++#define cudaSuccess hipSuccess
++#endif
++
+ #include "flashinfer/trtllm/common/cudaTypeUtils.cuh"
+ #include "flashinfer/trtllm/common/cudaUtils.h"
+ #include "flashinfer/trtllm/common/reduceKernelUtils.cuh"
+diff --git a/include/flashinfer/trtllm/common/cudaUtils.h b/include/flashinfer/trtllm/common/cudaUtils.h
+index 0000000..1111111 100644
+--- a/include/flashinfer/trtllm/common/cudaUtils.h
++++ b/include/flashinfer/trtllm/common/cudaUtils.h
+@@ -22,9 +22,17 @@
+ // #include "tensorrt_llm/common/cudaFp8Utils.h"
+ // #include "tensorrt_llm/common/logger.h"
+ // #include "tensorrt_llm/common/tllmException.h"
+ 
++#ifdef __HIP_PLATFORM_AMD__
++#include <hip/hip_runtime.h>
++// HIP doesn't have cuBLAS - these are only needed for GEMM operations
++// which use different paths on AMD
++using cudaStream_t = hipStream_t;
++using cudaError_t = hipError_t;
++#else
+ #include <cublasLt.h>
+ #include <cublas_v2.h>
++#endif
+ #include <cuda.h>
+ #include <cuda_runtime.h>
+ #include <driver_types.h>
+diff --git a/include/flashinfer/trtllm/common/reduceKernelUtils.cuh b/include/flashinfer/trtllm/common/reduceKernelUtils.cuh
+index 0000000..1111111 100644
+--- a/include/flashinfer/trtllm/common/reduceKernelUtils.cuh
++++ b/include/flashinfer/trtllm/common/reduceKernelUtils.cuh
+@@ -16,14 +16,33 @@
+ #pragma once
+ #include <assert.h>
+ 
+ #include <array>
++
++#ifdef __HIP_PLATFORM_AMD__
++// HIP cooperative groups support
++#include <hip/hip_runtime.h>
++#include <hip/hip_fp16.h>
++#include <hip/hip_cooperative_groups.h>
++// Note: hiprand not needed for reduce operations in norm kernel
++#include <float.h>
++#include <type_traits>
++
++namespace cg = cooperative_groups;
++
++#else
++// CUDA includes
+ #if ((__CUDACC_VER_MAJOR__ > 11) || (__CUDACC_VER_MAJOR__ == 11 && __CUDACC_VER_MINOR__ >= 0))
+ #include <cooperative_groups/reduce.h>
+ #else
+ #include <cooperative_groups.h>
+ #endif
+ #include <cuda_fp16.h>
+ #include <cuda_runtime.h>
+ #include <curand_kernel.h>
+ #include <float.h>
+-
+ #include <type_traits>
+ 
++namespace cg = cooperative_groups;
++#endif
++
+ #include "flashinfer/trtllm/common/cudaTypeUtils.cuh"
+ 
+-namespace cg = cooperative_groups;
+-
+ namespace tensorrt_llm {
+ namespace common {
+-- 
+2.34.1

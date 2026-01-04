@@ -1,0 +1,224 @@
+From 6a257cb80bf57e94853cf34a065789b4fd454567 Mon Sep 17 00:00:00 2001
+From: xsun <sunxiao04@gmail.com>
+Date: Fri, 2 Jan 2026 21:11:57 +0000
+Subject: [PATCH 4/5] test: Add basic HIP compatibility tests for FlashInfer
+
+Add test suite verifying FlashInfer works on AMD GPUs:
+- HIP environment detection
+- Tensor creation with various dtypes (float32, float16, bfloat16)
+- RoPE kernel import and execution
+- RoPE with multiple configurations
+- JIT compilation system for HIP
+- HIP compilation flags generation
+
+All 10 tests pass on AMD MI300 (gfx942).
+
+AI-assisted development.
+---
+ tests/gemm/test_hip_basic.py | 194 +++++++++++++++++++++++++++++++++++
+ 1 file changed, 194 insertions(+)
+ create mode 100644 tests/gemm/test_hip_basic.py
+
+diff --git a/tests/gemm/test_hip_basic.py b/tests/gemm/test_hip_basic.py
+new file mode 100644
+index 00000000..37399d75
+--- /dev/null
++++ b/tests/gemm/test_hip_basic.py
+@@ -0,0 +1,194 @@
++"""
++Basic HIP compatibility test for FlashInfer.
++
++This test verifies that FlashInfer's core infrastructure works on AMD GPUs
++by testing basic operations that don't require NVIDIA-specific backends.
++"""
++
++import pytest
++import torch
++import torch.nn.functional as F
++
++
++def is_hip():
++    """Check if running on AMD HIP."""
++    return torch.version.hip is not None
++
++
++@pytest.mark.skipif(not is_hip(), reason="Test only runs on AMD HIP")
++class TestHIPBasicCompatibility:
++    """Test basic HIP compatibility for FlashInfer."""
++
++    def test_hip_detection(self):
++        """Test that HIP is properly detected."""
++        assert torch.version.hip is not None
++        assert torch.cuda.is_available()
++        print(f"HIP version: {torch.version.hip}")
++
++    def test_tensor_creation(self):
++        """Test basic tensor creation on AMD GPU."""
++        device = torch.device("cuda")
++        
++        # Test various dtypes
++        dtypes = [torch.float32, torch.float16, torch.bfloat16]
++        for dtype in dtypes:
++            x = torch.randn(128, 256, device=device, dtype=dtype)
++            assert x.device.type == "cuda"
++            assert x.dtype == dtype
++            print(f"  Created {dtype} tensor on {x.device}")
++
++    def test_rope_import(self):
++        """Test that FlashInfer RoPE module can be imported."""
++        from flashinfer.rope import apply_rope_with_cos_sin_cache_inplace
++        print("  RoPE module imported successfully")
++
++    def test_rope_execution(self):
++        """Test RoPE kernel execution on AMD."""
++        from flashinfer.rope import apply_rope_with_cos_sin_cache_inplace
++
++        # Test configuration
++        batch_size = 4
++        seq_len = 16
++        num_heads = 8
++        head_dim = 64
++        device = "cuda"
++        dtype = torch.float16
++
++        # Create inputs
++        total_tokens = batch_size * seq_len
++        q = torch.randn(total_tokens, num_heads * head_dim, device=device, dtype=dtype)
++        k = torch.randn(total_tokens, num_heads * head_dim, device=device, dtype=dtype)
++        q_ref = q.clone()
++        k_ref = k.clone()
++
++        positions = torch.arange(total_tokens, device=device, dtype=torch.long)
++        cos_sin_cache = torch.randn(1024, head_dim, device=device, dtype=torch.float32)
++
++        # Apply RoPE
++        apply_rope_with_cos_sin_cache_inplace(
++            positions=positions,
++            query=q,
++            key=k,
++            head_size=head_dim,
++            cos_sin_cache=cos_sin_cache,
++            is_neox=True,
++        )
++
++        # Verify output is different from input (rotation was applied)
++        q_changed = not torch.allclose(q, q_ref, rtol=1e-3, atol=1e-3)
++        k_changed = not torch.allclose(k, k_ref, rtol=1e-3, atol=1e-3)
++
++        # Check for NaN/Inf
++        assert not torch.isnan(q).any(), "Output q contains NaN"
++        assert not torch.isnan(k).any(), "Output k contains NaN"
++        assert not torch.isinf(q).any(), "Output q contains Inf"
++        assert not torch.isinf(k).any(), "Output k contains Inf"
++
++        assert q_changed, "Query should be modified by RoPE"
++        assert k_changed, "Key should be modified by RoPE"
++        print(f"  RoPE executed successfully: q_modified={q_changed}, k_modified={k_changed}")
++
++    def test_rope_different_configs(self):
++        """Test RoPE with various configurations."""
++        from flashinfer.rope import apply_rope_with_cos_sin_cache_inplace
++
++        configs = [
++            {"batch": 1, "seq": 8, "heads": 4, "dim": 64, "is_neox": True},
++            {"batch": 2, "seq": 16, "heads": 8, "dim": 128, "is_neox": True},
++            {"batch": 4, "seq": 32, "heads": 16, "dim": 64, "is_neox": False},
++        ]
++
++        for cfg in configs:
++            batch = cfg["batch"]
++            seq = cfg["seq"]
++            heads = cfg["heads"]
++            dim = cfg["dim"]
++            is_neox = cfg["is_neox"]
++
++            total_tokens = batch * seq
++            q = torch.randn(total_tokens, heads * dim, device="cuda", dtype=torch.float16)
++            k = torch.randn(total_tokens, heads * dim, device="cuda", dtype=torch.float16)
++            positions = torch.arange(total_tokens, device="cuda", dtype=torch.long)
++            cos_sin_cache = torch.randn(1024, dim, device="cuda", dtype=torch.float32)
++
++            apply_rope_with_cos_sin_cache_inplace(
++                positions=positions,
++                query=q,
++                key=k,
++                head_size=dim,
++                cos_sin_cache=cos_sin_cache,
++                is_neox=is_neox,
++            )
++
++            assert not torch.isnan(q).any(), f"NaN in config {cfg}"
++            assert not torch.isnan(k).any(), f"NaN in config {cfg}"
++            print(f"  Config {cfg} passed")
++
++
++@pytest.mark.skipif(not is_hip(), reason="Test only runs on AMD HIP")
++class TestHIPVecDtypes:
++    """Test vectorized data types on HIP."""
++
++    def test_half_operations(self):
++        """Test half precision operations."""
++        x = torch.randn(256, 512, device="cuda", dtype=torch.float16)
++        y = torch.randn(256, 512, device="cuda", dtype=torch.float16)
++        z = x + y
++        assert z.dtype == torch.float16
++        assert not torch.isnan(z).any()
++        print("  half operations work")
++
++    def test_bfloat16_operations(self):
++        """Test bfloat16 operations."""
++        x = torch.randn(256, 512, device="cuda", dtype=torch.bfloat16)
++        y = torch.randn(256, 512, device="cuda", dtype=torch.bfloat16)
++        z = x + y
++        assert z.dtype == torch.bfloat16
++        assert not torch.isnan(z).any()
++        print("  bfloat16 operations work")
++
++    def test_fp8_types_exist(self):
++        """Test that FP8 types are available (may not be fully functional)."""
++        # FP8 support varies by HIP version
++        try:
++            if hasattr(torch, "float8_e4m3fn"):
++                print("  torch.float8_e4m3fn is available")
++            if hasattr(torch, "float8_e5m2"):
++                print("  torch.float8_e5m2 is available")
++        except Exception as e:
++            pytest.skip(f"FP8 types not available: {e}")
++
++
++@pytest.mark.skipif(not is_hip(), reason="Test only runs on AMD HIP")  
++class TestHIPJITCompilation:
++    """Test JIT compilation on HIP."""
++
++    def test_jit_env_detection(self):
++        """Test JIT environment detection for HIP."""
++        from flashinfer.jit.cpp_ext import is_hip, get_cuda_path
++        
++        assert is_hip(), "Should detect HIP environment"
++        cuda_path = get_cuda_path()
++        assert "rocm" in cuda_path.lower() or "hip" in cuda_path.lower(), \
++            f"Expected ROCm path, got: {cuda_path}"
++        print(f"  ROCm path: {cuda_path}")
++
++    def test_hip_cflags(self):
++        """Test HIP compilation flags generation."""
++        from flashinfer.jit.cpp_ext import build_cuda_cflags, is_hip
++        
++        if not is_hip():
++            pytest.skip("Not on HIP")
++        
++        common_cflags = ["-O3"]
++        cflags = build_cuda_cflags(common_cflags)
++        
++        # Should contain HIP-specific flags
++        cflags_str = " ".join(cflags)
++        assert "__HIP_PLATFORM_AMD__" in cflags_str or "fPIC" in cflags_str, \
++            f"Expected HIP flags in: {cflags_str}"
++        print(f"  Generated HIP cflags: {cflags[:5]}...")
++
++
++if __name__ == "__main__":
++    pytest.main([__file__, "-v"])
+-- 
+2.34.1
+

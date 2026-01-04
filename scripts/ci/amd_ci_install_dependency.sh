@@ -99,6 +99,12 @@ docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache git+https://gi
 # Install cache-dit for qwen_image_t2i_cache_dit_enabled test (added in PR 16204)
 docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache cache-dit || echo "cache-dit installation failed"
 
+# FlashInfer HIP build is experimental - skip for now until FP8 vec_t issues are resolved
+# The multimodal code will use Triton fallback for RMSNorm and RoPE on AMD
+# TODO: Enable once flashinfer_hip_patches support FP8 vector types
+# echo "Building FlashInfer with HIP patches for AMD..."
+# docker exec ci_sglang bash -c "cd /sglang-checkout/sgl-kernel/third_party/flashinfer_hip_patches && ./build_flashinfer_hip.sh --install" || echo "FlashInfer HIP build failed"
+
 # Detect AITER version
 #############################################
 # Detect correct AITER_COMMIT for this runner

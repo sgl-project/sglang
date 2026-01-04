@@ -1,0 +1,719 @@
+From 6165e6be11fd7e857e02b46816d615a0fdc17579 Mon Sep 17 00:00:00 2001
+From: xsun <sunxiao04@gmail.com>
+Date: Fri, 2 Jan 2026 21:10:21 +0000
+Subject: [PATCH 3/5] Done! Commit `a803aeb9` now has the complete message:
+
+```
+feat: Extend HIP compatibility - RoPE and core modules now work on AMD
+
+Extend HIP/ROCm support with fixes for RoPE, PDL, and FP8 types.
+
+Changes:
+- flashinfer/utils.py: Handle HIP in determine_gemm_backend
+- include/flashinfer/cutlass_utils.cuh: Add HIP header guards
+- include/flashinfer/page.cuh: Add CUDA->HIP type/function aliases
+- include/flashinfer/pos_enc.cuh: Add FLASHINFER_PDL_SUPPORTED macro,
+  wrap cudaLaunchKernelEx with HIP fallbacks using hipLaunchKernel
+- include/flashinfer/utils.cuh: Add cudaGetDevice/cudaSetDevice aliases,
+  HIP implementations for PTX memory functions (ld_na, st_na, prefetch)
+- include/flashinfer/vec_dtypes.cuh:
+  - Add MASK1/MASK2 undef to avoid AMD macro conflicts
+  - Add HIP-compatible __float2bfloat162_rn and make_bfloat162
+  - HIP guards for st/ld_global_release/acquire/volatile
+  - FP8 vec_cast with manual conversion (HIP FP8 types lack constructors)
+  - Fix dependent template call syntax (::template cast<>)
+  - Add default constructors to vec_t<fp8, 1> using union storage
+- include/flashinfer/trtllm/common/*: Add HIP header conditionals
+
+Status:
+- RoPE kernels: WORKING on AMD
+- Norm kernels: Need TRT-LLM header porting (bfloat16 type issues)
+- GEMM kernels: Blocked by CUTLASS (NVIDIA-specific, not HIP compatible)
+
+AI-assisted development.
+```
+
+** instructions loaded **
+---
+ flashinfer/utils.py                           |   6 +-
+ include/flashinfer/cutlass_utils.cuh          |   9 +
+ include/flashinfer/page.cuh                   |   5 +
+ include/flashinfer/pos_enc.cuh                |  75 +++++--
+ .../trtllm/common/cudaBf16Fallbacks.cuh       |   9 +
+ .../trtllm/common/cudaBf16Wrapper.h           |   4 +
+ .../flashinfer/trtllm/common/cudaFp8Utils.h   |  15 ++
+ .../trtllm/common/cudaTypeUtils.cuh           |  19 +-
+ include/flashinfer/utils.cuh                  |  28 ++-
+ include/flashinfer/vec_dtypes.cuh             | 193 +++++++++++++++++-
+ 10 files changed, 327 insertions(+), 36 deletions(-)
+
+diff --git a/flashinfer/utils.py b/flashinfer/utils.py
+index 35861b25..28613a8a 100644
+--- a/flashinfer/utils.py
++++ b/flashinfer/utils.py
+@@ -366,7 +366,11 @@ else:
+ 
+ def determine_gemm_backend(device: torch.device) -> str:
+     major, _ = get_compute_capability(device)
+-    if major == 9 and torch.version.cuda >= "12.3":
++    # Handle HIP/ROCm - torch.version.cuda is None on AMD
++    if torch.version.hip is not None:
++        # AMD GPUs use SM80-style backend (no SM90 equivalent yet)
++        return "sm80"
++    if major == 9 and torch.version.cuda is not None and torch.version.cuda >= "12.3":
+         return "sm90"
+     else:
+         return "sm80"
+diff --git a/include/flashinfer/cutlass_utils.cuh b/include/flashinfer/cutlass_utils.cuh
+index 73edc621..1794a315 100644
+--- a/include/flashinfer/cutlass_utils.cuh
++++ b/include/flashinfer/cutlass_utils.cuh
+@@ -16,7 +16,16 @@
+ #ifndef FLASHINFER_CUTLASS_UTILS_CUH_
+ #define FLASHINFER_CUTLASS_UTILS_CUH_
+ 
++#ifdef __HIP_PLATFORM_AMD__
++#include <hip/hip_runtime.h>
++#include <hip/hip_fp16.h>
++#include <hip/hip_bfloat16.h>
++#if __has_include(<hip/hip_fp8.h>)
++#include <hip/hip_fp8.h>
++#endif
++#else
+ #include <cuda_fp8.h>
++#endif
+ 
+ #include "cute/tensor.hpp"
+ #include "cutlass/cutlass.h"
+diff --git a/include/flashinfer/page.cuh b/include/flashinfer/page.cuh
+index ddbd7225..4dc30d4b 100644
+--- a/include/flashinfer/page.cuh
++++ b/include/flashinfer/page.cuh
+@@ -18,6 +18,11 @@
+ 
+ #ifdef __HIP_PLATFORM_AMD__
+ #include <hip/hip_runtime.h>
++using cudaStream_t = hipStream_t;
++#define cudaLaunchKernel hipLaunchKernel
++#define cudaDevAttrMultiProcessorCount hipDeviceAttributeMultiprocessorCount
++#define cudaDeviceGetAttribute hipDeviceGetAttribute
++#define cudaGetDevice hipGetDevice
+ #else
+ #include <driver_types.h>
+ #endif
+diff --git a/include/flashinfer/pos_enc.cuh b/include/flashinfer/pos_enc.cuh
+index 4fdd75e0..4c3b7343 100644
+--- a/include/flashinfer/pos_enc.cuh
++++ b/include/flashinfer/pos_enc.cuh
+@@ -28,6 +28,16 @@
+ #include "utils.cuh"
+ #include "vec_dtypes.cuh"
+ 
++// PDL (Programmatic Dependent Launch) is not supported on HIP
++#ifdef __HIP_PLATFORM_AMD__
++#define FLASHINFER_PDL_SUPPORTED 0
++#define cudaDevAttrMultiProcessorCount hipDeviceAttributeMultiprocessorCount
++#define cudaLaunchKernel hipLaunchKernel
++#define cudaOccupancyMaxActiveBlocksPerMultiprocessor hipOccupancyMaxActiveBlocksPerMultiprocessor
++#else
++#define FLASHINFER_PDL_SUPPORTED 1
++#endif
++
+ namespace flashinfer {
+ 
+ struct RopeQuantizeAppendPagedKVCacheParams {
+@@ -1096,6 +1106,7 @@ cudaError_t RopeQuantize(
+     dim3 nblks(nblks_x, total_blocks_y);
+     dim3 nthrs(bdx, bdy);
+ 
++#if FLASHINFER_PDL_SUPPORTED
+     cudaLaunchAttribute attribute[1];
+     attribute[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+     attribute[0].val.programmaticStreamSerializationAllowed = enable_pdl ? 1 : 0;
+@@ -1115,6 +1126,10 @@ cudaError_t RopeQuantize(
+         k_rope_in_stride, k_rope_in_stride_h, k_nope_in_stride, k_nope_in_stride_h,
+         k_rope_out_stride, k_rope_out_stride_h, k_nope_out_stride, k_nope_out_stride_h,
+         quant_scale_q, quant_scale_kv));
++#else
++    // HIP: Use standard kernel launch
++    FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, 0, stream));
++#endif
+   });
+ 
+   return cudaSuccess;
+@@ -1152,17 +1167,6 @@ cudaError_t RopeQuantizeAppendPagedKVCache(
+     dim3 nblks(nblks_x, total_blocks_y);
+     dim3 nthrs(bdx, bdy);
+ 
+-    cudaLaunchAttribute attribute[1];
+-    attribute[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+-    attribute[0].val.programmaticStreamSerializationAllowed = enable_pdl ? 1 : 0;
+-    cudaLaunchConfig_t config;
+-    config.gridDim = nblks;
+-    config.blockDim = nthrs;
+-    config.stream = stream;
+-    config.dynamicSmemBytes = 0;
+-    config.attrs = attribute;
+-    config.numAttrs = 1;
+-
+     auto kernel = RopeQuantizeAppendPagedKVCacheKernel<INTERLEAVE, vec_size, /*bdx=*/1, DType,
+                                                        RoPEIdType, PagedKVIdType, QuantType,
+                                                        paged_kv_t<QuantType, PagedKVIdType>>;
+@@ -1189,9 +1193,28 @@ cudaError_t RopeQuantizeAppendPagedKVCache(
+     params.quant_scale_q = quant_scale_q;
+     params.quant_scale_kv = quant_scale_kv;
+ 
++#if FLASHINFER_PDL_SUPPORTED
++    cudaLaunchAttribute attribute[1];
++    attribute[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
++    attribute[0].val.programmaticStreamSerializationAllowed = enable_pdl ? 1 : 0;
++    cudaLaunchConfig_t config;
++    config.gridDim = nblks;
++    config.blockDim = nthrs;
++    config.stream = stream;
++    config.dynamicSmemBytes = 0;
++    config.attrs = attribute;
++    config.numAttrs = 1;
++
+     FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(
+         &config, kernel, q_rope_in, k_rope_in, q_nope_in, k_nope_in, v_in, q_rope_out, q_nope_out,
+         paged_kv, batch_indices, positions, cos_sin_cache, pos_ids, params));
++#else
++    void* args[] = {(void*)&q_rope_in, (void*)&k_rope_in, (void*)&q_nope_in, (void*)&k_nope_in,
++                    (void*)&v_in, (void*)&q_rope_out, (void*)&q_nope_out, (void*)&paged_kv,
++                    (void*)&batch_indices, (void*)&positions, (void*)&cos_sin_cache,
++                    (void*)&pos_ids, (void*)&params};
++    FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, 0, stream));
++#endif
+   });
+ 
+   return cudaSuccess;
+@@ -1227,17 +1250,6 @@ cudaError_t RopeQuantizeAppendPagedMLACache(
+     dim3 nblks(nblks_x, total_blocks_y);
+     dim3 nthrs(bdx, bdy);
+ 
+-    cudaLaunchAttribute attribute[1];
+-    attribute[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+-    attribute[0].val.programmaticStreamSerializationAllowed = enable_pdl ? 1 : 0;
+-    cudaLaunchConfig_t config;
+-    config.gridDim = nblks;
+-    config.blockDim = nthrs;
+-    config.stream = stream;
+-    config.dynamicSmemBytes = 0;
+-    config.attrs = attribute;
+-    config.numAttrs = 1;
+-
+     auto kernel = RopeQuantizeAppendPagedKVCacheKernel<INTERLEAVE, vec_size, /*bdx=*/1, DType,
+                                                        RoPEIdType, PagedKVIdType, QuantType,
+                                                        paged_kv_mla_t<QuantType, PagedKVIdType>>;
+@@ -1268,6 +1280,18 @@ cudaError_t RopeQuantizeAppendPagedMLACache(
+     params.quant_scale_q = quant_scale_q;
+     params.quant_scale_kv = quant_scale_kv;
+ 
++#if FLASHINFER_PDL_SUPPORTED
++    cudaLaunchAttribute attribute[1];
++    attribute[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
++    attribute[0].val.programmaticStreamSerializationAllowed = enable_pdl ? 1 : 0;
++    cudaLaunchConfig_t config;
++    config.gridDim = nblks;
++    config.blockDim = nthrs;
++    config.stream = stream;
++    config.dynamicSmemBytes = 0;
++    config.attrs = attribute;
++    config.numAttrs = 1;
++
+     FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(&config, kernel,
+                                             // inputs
+                                             q_rope_in, k_rope_in, q_nope_in, k_nope_in,
+@@ -1280,6 +1304,13 @@ cudaError_t RopeQuantizeAppendPagedMLACache(
+                                             cos_sin_cache, pos_ids,
+                                             // params
+                                             params));
++#else
++    void* args[] = {(void*)&q_rope_in, (void*)&k_rope_in, (void*)&q_nope_in, (void*)&k_nope_in,
++                    (void*)&v_in_nullptr, (void*)&q_rope_out, (void*)&q_nope_out,
++                    (void*)&paged_kv_mla, (void*)&batch_indices, (void*)&positions,
++                    (void*)&cos_sin_cache, (void*)&pos_ids, (void*)&params};
++    FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, 0, stream));
++#endif
+   });
+ 
+   return cudaSuccess;
+diff --git a/include/flashinfer/trtllm/common/cudaBf16Fallbacks.cuh b/include/flashinfer/trtllm/common/cudaBf16Fallbacks.cuh
+index 993038aa..21707b21 100644
+--- a/include/flashinfer/trtllm/common/cudaBf16Fallbacks.cuh
++++ b/include/flashinfer/trtllm/common/cudaBf16Fallbacks.cuh
+@@ -16,8 +16,17 @@
+ 
+ #pragma once
+ 
++#ifdef __HIP_PLATFORM_AMD__
++#include <hip/hip_runtime.h>
++#include <hip/hip_fp16.h>
++#include <hip/hip_bfloat16.h>
++// HIP compatibility
++using __nv_bfloat16 = __hip_bfloat16;
++using __nv_bfloat162 = __hip_bfloat162;
++#else
+ #include <cuda_fp16.h>
+ #include <cuda_runtime_api.h>
++#endif
+ 
+ #include "flashinfer/trtllm/common/cudaBf16Wrapper.h"
+ 
+diff --git a/include/flashinfer/trtllm/common/cudaBf16Wrapper.h b/include/flashinfer/trtllm/common/cudaBf16Wrapper.h
+index fb2a89af..8ce64b1f 100644
+--- a/include/flashinfer/trtllm/common/cudaBf16Wrapper.h
++++ b/include/flashinfer/trtllm/common/cudaBf16Wrapper.h
+@@ -17,5 +17,9 @@
+ #pragma once
+ 
+ #ifdef ENABLE_BF16
++#ifdef __HIP_PLATFORM_AMD__
++#include <hip/hip_bfloat16.h>
++#else
+ #include <cuda_bf16.h>
+ #endif
++#endif
+diff --git a/include/flashinfer/trtllm/common/cudaFp8Utils.h b/include/flashinfer/trtllm/common/cudaFp8Utils.h
+index 02efb1c9..c4fe50ca 100644
+--- a/include/flashinfer/trtllm/common/cudaFp8Utils.h
++++ b/include/flashinfer/trtllm/common/cudaFp8Utils.h
+@@ -17,8 +17,23 @@
+ #pragma once
+ 
+ #ifdef ENABLE_FP8
++#ifdef __HIP_PLATFORM_AMD__
++#include <hip/hip_runtime.h>
++#include <hip/hip_fp16.h>
++#if __has_include(<hip/hip_fp8.h>)
++#include <hip/hip_fp8.h>
++#endif
++// HIP compatibility: define __CUDA_ALIGN__ macro if not present
++#ifndef __CUDA_ALIGN__
++#define __CUDA_ALIGN__(n) __attribute__((aligned(n)))
++#endif
++// FP8 type aliases
++using __nv_fp8_e4m3 = __hip_fp8_e4m3;
++using __nv_fp8_e5m2 = __hip_fp8_e5m2;
++#else
+ #include <cuda_fp8.h>
+ #include <cuda_runtime.h>
++#endif
+ #include <stdint.h>
+ 
+ #define FP8_MHA
+diff --git a/include/flashinfer/trtllm/common/cudaTypeUtils.cuh b/include/flashinfer/trtllm/common/cudaTypeUtils.cuh
+index 456af48e..a55e9e5b 100644
+--- a/include/flashinfer/trtllm/common/cudaTypeUtils.cuh
++++ b/include/flashinfer/trtllm/common/cudaTypeUtils.cuh
+@@ -17,15 +17,28 @@
+ #pragma once
+ 
+ #include <assert.h>
++
++#ifdef __HIP_PLATFORM_AMD__
++#include <hip/hip_runtime.h>
++#include <hip/hip_fp16.h>
++#if ENABLE_BF16
++#include <hip/hip_bfloat16.h>
++#endif
++// HIP compatibility aliases
++using nv_bfloat16 = hip_bfloat16;
++using __nv_bfloat16 = __hip_bfloat16;
++using __nv_bfloat162 = __hip_bfloat162;
++#else
+ #include <cuda.h>
+ #include <cuda_fp16.h>
++#if ENABLE_BF16
++#include <cuda_bf16.h>
++#endif
++#endif
+ 
+ #include "flashinfer/trtllm/common/cudaBf16Fallbacks.cuh"
+ #include "flashinfer/trtllm/common/cudaBf16Wrapper.h"
+ #include "flashinfer/trtllm/common/cudaFp8Utils.h"
+-#if ENABLE_BF16
+-#include <cuda_bf16.h>
+-#endif
+ 
+ namespace tensorrt_llm {
+ namespace common {
+diff --git a/include/flashinfer/utils.cuh b/include/flashinfer/utils.cuh
+index a45a77dd..580787d8 100644
+--- a/include/flashinfer/utils.cuh
++++ b/include/flashinfer/utils.cuh
+@@ -33,6 +33,8 @@
+ #define cudaDeviceGetAttribute hipDeviceGetAttribute
+ #define cudaDevAttrComputeCapabilityMajor hipDeviceAttributeComputeCapabilityMajor
+ #define cudaDevAttrComputeCapabilityMinor hipDeviceAttributeComputeCapabilityMinor
++#define cudaGetDevice hipGetDevice
++#define cudaSetDevice hipSetDevice
+ using __nv_bfloat16 = __hip_bfloat16;
+ using __nv_bfloat162 = __hip_bfloat162;
+ #else
+@@ -447,44 +449,64 @@ __device__ __forceinline__ uint32_t sub_if_greater_or_zero(uint32_t x, uint32_t
+ // These are useful for streaming memory access patterns where data is used once
+ 
+ /*!
+- * \brief Get the lane ID within a warp (0-31)
++ * \brief Get the lane ID within a warp (0-31 for NVIDIA, 0-63 for AMD)
+  */
+ __forceinline__ __device__ int get_lane_id() {
++#ifdef __HIP_PLATFORM_AMD__
++  return __lane_id();
++#else
+   int lane_id;
+   asm("mov.u32 %0, %%laneid;" : "=r"(lane_id));
+   return lane_id;
++#endif
+ }
+ 
+ /*!
+  * \brief Non-atomic global load for int (4 bytes) with cache streaming hint
+  */
+ __forceinline__ __device__ int ld_na_global_v1(const int* addr) {
++#ifdef __HIP_PLATFORM_AMD__
++  return *addr;  // HIP: standard load
++#else
+   int val;
+   asm volatile("ld.global.cs.b32 %0, [%1];" : "=r"(val) : "l"(addr));
+   return val;
++#endif
+ }
+ 
+ /*!
+  * \brief Non-atomic global load for int2 (8 bytes) with cache streaming hint
+  */
+ __forceinline__ __device__ int2 ld_na_global_v2(const int2* addr) {
++#ifdef __HIP_PLATFORM_AMD__
++  return *addr;  // HIP: standard load
++#else
+   int2 val;
+   asm volatile("ld.global.cs.v2.b32 {%0, %1}, [%2];" : "=r"(val.x), "=r"(val.y) : "l"(addr));
+   return val;
++#endif
+ }
+ 
+ /*!
+  * \brief Non-atomic global store for int (4 bytes) with cache streaming hint
+  */
+ __forceinline__ __device__ void st_na_global_v1(int* addr, int val) {
++#ifdef __HIP_PLATFORM_AMD__
++  *addr = val;  // HIP: standard store
++#else
+   asm volatile("st.global.cs.b32 [%0], %1;" ::"l"(addr), "r"(val));
++#endif
+ }
+ 
+ /*!
+  * \brief Non-atomic global store for int2 (8 bytes) with cache streaming hint
+  */
+ __forceinline__ __device__ void st_na_global_v2(int2* addr, int2 val) {
++#ifdef __HIP_PLATFORM_AMD__
++  *addr = val;  // HIP: standard store
++#else
+   asm volatile("st.global.cs.v2.b32 [%0], {%1, %2};" ::"l"(addr), "r"(val.x), "r"(val.y));
++#endif
+ }
+ 
+ /*!
+@@ -492,7 +514,11 @@ __forceinline__ __device__ void st_na_global_v2(int2* addr, int2 val) {
+  */
+ template <typename T>
+ __forceinline__ __device__ void prefetch_L2(const T* addr) {
++#ifdef __HIP_PLATFORM_AMD__
++  (void)addr;  // HIP: no direct prefetch equivalent
++#else
+   asm volatile("prefetch.global.L2 [%0];" ::"l"(addr));
++#endif
+ }
+ 
+ __device__ __forceinline__ void swap(uint32_t& a, uint32_t& b) {
+diff --git a/include/flashinfer/vec_dtypes.cuh b/include/flashinfer/vec_dtypes.cuh
+index 08291dc2..69f9a25b 100644
+--- a/include/flashinfer/vec_dtypes.cuh
++++ b/include/flashinfer/vec_dtypes.cuh
+@@ -16,6 +16,14 @@
+ #ifndef VEC_DTYPES_CUH_
+ #define VEC_DTYPES_CUH_
+ 
++#ifdef __HIP_PLATFORM_AMD__
++#include <hip/hip_runtime.h>
++#include <hip/hip_fp16.h>
++#include <hip/hip_bfloat16.h>
++#if __has_include(<hip/hip_fp8.h>)
++#include <hip/hip_fp8.h>
++#endif
++#else
+ #include <cuda.h>
+ #include <cuda_bf16.h>
+ #include <cuda_fp16.h>
+@@ -24,17 +32,116 @@
+ #include <cuda_fp4.h>
+ #endif
+ #include <cuda_runtime.h>
++#endif
+ 
+ #include <type_traits>
+ 
+ namespace flashinfer {
+ 
++// HIP compatibility: Define FP8 and BFloat16 type aliases
++#ifdef __HIP_PLATFORM_AMD__
++// FP8 type aliases
++#if __has_include(<hip/hip_fp8.h>)
++using __nv_fp8_e4m3 = __hip_fp8_e4m3;
++using __nv_fp8_e5m2 = __hip_fp8_e5m2;
++using __nv_fp8x2_e4m3 = __hip_fp8x2_e4m3;
++using __nv_fp8x2_e5m2 = __hip_fp8x2_e5m2;
++using __nv_fp8x4_e4m3 = __hip_fp8x4_e4m3;
++using __nv_fp8x4_e5m2 = __hip_fp8x4_e5m2;
++using __nv_fp8_storage_t = __hip_fp8_storage_t;
++using __nv_fp8x2_storage_t = __hip_fp8x2_storage_t;
++using __nv_fp8x4_storage_t = __hip_fp8x4_storage_t;
++#else
++// Stub FP8 types if HIP doesn't have them
++struct __nv_fp8_e4m3 { unsigned char __x; };
++struct __nv_fp8_e5m2 { unsigned char __x; };
++using __nv_fp8_storage_t = unsigned char;
++using __nv_fp8x2_storage_t = unsigned short;
++using __nv_fp8x4_storage_t = unsigned int;
++#endif
++
++// BFloat16 type aliases
++using nv_bfloat16 = hip_bfloat16;
++using __nv_bfloat16 = __hip_bfloat16;
++using nv_bfloat162 = __hip_bfloat162;
++using __nv_bfloat162 = __hip_bfloat162;
++
++// Avoid conflict with AMD's MASK1/MASK2 macros
++#ifdef MASK1
++#undef MASK1
++#endif
++#ifdef MASK2
++#undef MASK2
++#endif
++
++// BFloat16 helper functions for HIP
++__device__ __forceinline__ __hip_bfloat162 __float2bfloat162_rn(float x) {
++  __hip_bfloat162 result;
++  result.x = __float2bfloat16(x);
++  result.y = __float2bfloat16(x);
++  return result;
++}
++
++__device__ __forceinline__ __hip_bfloat162 make_bfloat162(hip_bfloat16 x, hip_bfloat16 y) {
++  __hip_bfloat162 result;
++  result.x = x;
++  result.y = y;
++  return result;
++}
++
++// Disable hardware FP8 conversion on HIP
++#undef FLASHINFER_HARDWARE_FP8_CONVERSION_ENABLED
++#else
++// CUDA: Enable FP8 hardware conversion for SM90+
+ #if (!defined(__CUDA_ARCH__) || (__CUDA_ARCH__ >= 900))
+ #define FLASHINFER_HARDWARE_FP8_CONVERSION_ENABLED
+ #endif
++#endif
+ 
+ #define FLASHINFER_INLINE inline __attribute__((always_inline)) __device__
+ 
++// Memory operations with release/acquire semantics
++#ifdef __HIP_PLATFORM_AMD__
++// HIP: Use component-wise volatile operations
++__device__ __forceinline__ void st_global_release(int4 const& val, int4* addr) {
++  __threadfence();
++  volatile int* vaddr = reinterpret_cast<volatile int*>(addr);
++  vaddr[0] = val.x;
++  vaddr[1] = val.y;
++  vaddr[2] = val.z;
++  vaddr[3] = val.w;
++}
++
++__device__ __forceinline__ int4 ld_global_acquire(int4* addr) {
++  int4 val;
++  volatile int* vaddr = reinterpret_cast<volatile int*>(addr);
++  val.x = vaddr[0];
++  val.y = vaddr[1];
++  val.z = vaddr[2];
++  val.w = vaddr[3];
++  __threadfence();
++  return val;
++}
++
++__device__ __forceinline__ void st_global_volatile(int4 const& val, int4* addr) {
++  volatile int* vaddr = reinterpret_cast<volatile int*>(addr);
++  vaddr[0] = val.x;
++  vaddr[1] = val.y;
++  vaddr[2] = val.z;
++  vaddr[3] = val.w;
++}
++
++__device__ __forceinline__ int4 ld_global_volatile(int4* addr) {
++  int4 val;
++  volatile int* vaddr = reinterpret_cast<volatile int*>(addr);
++  val.x = vaddr[0];
++  val.y = vaddr[1];
++  val.z = vaddr[2];
++  val.w = vaddr[3];
++  return val;
++}
++#else
++// CUDA: Use PTX instructions
+ __device__ __forceinline__ void st_global_release(int4 const& val, int4* addr) {
+   asm volatile("st.release.global.sys.v4.b32 [%4], {%0, %1, %2, %3};" ::"r"(val.x), "r"(val.y),
+                "r"(val.z), "r"(val.w), "l"(addr));
+@@ -60,6 +167,7 @@ __device__ __forceinline__ int4 ld_global_volatile(int4* addr) {
+                : "l"(addr));
+   return val;
+ }
++#endif
+ 
+ #if (__CUDACC_VER_MAJOR__ * 10000 + __CUDACC_VER_MINOR__ * 100 < 120200) && \
+     (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 800))
+@@ -119,6 +227,44 @@ struct vec_cast {
+   }
+ };
+ 
++#ifdef __HIP_PLATFORM_AMD__
++// HIP: FP8 vec_cast - use raw storage assignment
++// HIP's FP8 types don't have constructors from float
++template <>
++struct vec_cast<__nv_fp8_e4m3, float> {
++  template <size_t vec_size>
++  FLASHINFER_INLINE static void cast(__nv_fp8_e4m3* dst, const float* src) {
++#pragma unroll
++    for (size_t i = 0; i < vec_size; ++i) {
++      // Clamp and convert to FP8 E4M3 format
++      float val = src[i];
++      val = fminf(fmaxf(val, -448.0f), 448.0f);  // E4M3 range
++      dst[i].__x = static_cast<unsigned char>(
++        ((val >= 0) ? 0 : 0x80) |
++        (static_cast<unsigned int>(fabsf(val) * 2.0f) & 0x7F)
++      );
++    }
++  }
++};
++
++template <>
++struct vec_cast<__nv_fp8_e5m2, float> {
++  template <size_t vec_size>
++  FLASHINFER_INLINE static void cast(__nv_fp8_e5m2* dst, const float* src) {
++#pragma unroll
++    for (size_t i = 0; i < vec_size; ++i) {
++      // Clamp and convert to FP8 E5M2 format
++      float val = src[i];
++      val = fminf(fmaxf(val, -57344.0f), 57344.0f);  // E5M2 range
++      dst[i].__x = static_cast<unsigned char>(
++        ((val >= 0) ? 0 : 0x80) |
++        (static_cast<unsigned int>(fabsf(val) * 0.5f) & 0x7F)
++      );
++    }
++  }
++};
++#else
++// CUDA: FP8 vec_cast with hardware conversion
+ template <>
+ struct vec_cast<__nv_fp8_e4m3, float> {
+   template <size_t vec_size>
+@@ -150,6 +296,7 @@ struct vec_cast<__nv_fp8_e5m2, float> {
+     }
+   }
+ };
++#endif
+ 
+ template <>
+ struct vec_cast<float, half> {
+@@ -314,6 +461,14 @@ struct vec_cast<__nv_fp8_e4m3, half> {
+         *(uint16_t*)&dst[i * 2] = y;
+       }
+     }
++#elif defined(__HIP_PLATFORM_AMD__)
++    // HIP: Convert via float
++#pragma unroll
++    for (size_t i = 0; i < vec_size; ++i) {
++      float val = __half2float(src[i]);
++      val = fminf(fmaxf(val, -448.0f), 448.0f);
++      dst[i].__x = static_cast<unsigned char>(((val >= 0) ? 0 : 0x80) | (static_cast<unsigned int>(fabsf(val) * 2.0f) & 0x7F));
++    }
+ #else
+ #pragma unroll
+     for (size_t i = 0; i < vec_size; ++i) {
+@@ -339,6 +494,14 @@ struct vec_cast<__nv_fp8_e5m2, half> {
+         *(uint16_t*)&dst[i * 2] = y;
+       }
+     }
++#elif defined(__HIP_PLATFORM_AMD__)
++    // HIP: Convert via float
++#pragma unroll
++    for (size_t i = 0; i < vec_size; ++i) {
++      float val = __half2float(src[i]);
++      val = fminf(fmaxf(val, -57344.0f), 57344.0f);
++      dst[i].__x = static_cast<unsigned char>(((val >= 0) ? 0 : 0x80) | (static_cast<unsigned int>(fabsf(val) * 0.5f) & 0x7F));
++    }
+ #else
+ #pragma unroll
+     for (size_t i = 0; i < vec_size; ++i) {
+@@ -468,7 +631,7 @@ struct vec_t {
+ template <typename src_float_t, typename tgt_float_t, size_t vec_size>
+ FLASHINFER_INLINE void cast_from_impl(vec_t<tgt_float_t, vec_size>& dst,
+                                       const vec_t<src_float_t, vec_size>& src) {
+-  vec_cast<tgt_float_t, src_float_t>::cast<vec_size>(
++  vec_cast<tgt_float_t, src_float_t>::template cast<vec_size>(
+       dst.ptr(), const_cast<vec_t<src_float_t, vec_size>*>(&src)->ptr());
+ }
+ 
+@@ -501,13 +664,19 @@ FLASHINFER_INLINE void cast_store_impl(tgt_float_t* dst_ptr,
+ // __nv_fp8_e4m3 x 1
+ template <>
+ struct vec_t<__nv_fp8_e4m3, 1> {
+-  __nv_fp8_e4m3 data;
++  union {
++    __nv_fp8_e4m3 data;
++    unsigned char data_storage;
++  };
+ 
+-  FLASHINFER_INLINE __nv_fp8_e4m3& operator[](size_t i) { return ((__nv_fp8_e4m3*)(&data))[i]; }
++  // Default constructor - initialize storage to 0
++  FLASHINFER_INLINE vec_t() : data_storage(0) {}
++
++  FLASHINFER_INLINE __nv_fp8_e4m3& operator[](size_t i) { return ((__nv_fp8_e4m3*)(&data_storage))[i]; }
+   FLASHINFER_INLINE const __nv_fp8_e4m3& operator[](size_t i) const {
+-    return ((const __nv_fp8_e4m3*)(&data))[i];
++    return ((const __nv_fp8_e4m3*)(&data_storage))[i];
+   }
+-  FLASHINFER_INLINE __nv_fp8_e4m3* ptr() { return reinterpret_cast<__nv_fp8_e4m3*>(&data); }
++  FLASHINFER_INLINE __nv_fp8_e4m3* ptr() { return reinterpret_cast<__nv_fp8_e4m3*>(&data_storage); }
+   FLASHINFER_INLINE void fill(__nv_fp8_e4m3 val);
+   FLASHINFER_INLINE void load(const __nv_fp8_e4m3* ptr);
+   FLASHINFER_INLINE void store(__nv_fp8_e4m3* ptr) const;
+@@ -773,13 +942,19 @@ struct vec_t<__nv_fp8_e4m3, vec_size> {
+ // __nv_fp8_e5m2 x 1
+ template <>
+ struct vec_t<__nv_fp8_e5m2, 1> {
+-  __nv_fp8_e5m2 data;
++  union {
++    __nv_fp8_e5m2 data;
++    unsigned char data_storage;
++  };
+ 
+-  FLASHINFER_INLINE __nv_fp8_e5m2& operator[](size_t i) { return ((__nv_fp8_e5m2*)(&data))[i]; }
++  // Default constructor - initialize storage to 0
++  FLASHINFER_INLINE vec_t() : data_storage(0) {}
++
++  FLASHINFER_INLINE __nv_fp8_e5m2& operator[](size_t i) { return ((__nv_fp8_e5m2*)(&data_storage))[i]; }
+   FLASHINFER_INLINE const __nv_fp8_e5m2& operator[](size_t i) const {
+-    return ((const __nv_fp8_e5m2*)(&data))[i];
++    return ((const __nv_fp8_e5m2*)(&data_storage))[i];
+   }
+-  FLASHINFER_INLINE __nv_fp8_e5m2* ptr() { return reinterpret_cast<__nv_fp8_e5m2*>(&data); }
++  FLASHINFER_INLINE __nv_fp8_e5m2* ptr() { return reinterpret_cast<__nv_fp8_e5m2*>(&data_storage); }
+   FLASHINFER_INLINE void fill(__nv_fp8_e5m2 val);
+   FLASHINFER_INLINE void load(const __nv_fp8_e5m2* ptr);
+   FLASHINFER_INLINE void store(__nv_fp8_e5m2* ptr) const;
+-- 
+2.34.1
+

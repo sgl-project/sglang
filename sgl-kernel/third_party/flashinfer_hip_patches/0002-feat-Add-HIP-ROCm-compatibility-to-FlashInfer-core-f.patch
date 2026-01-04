@@ -1,0 +1,470 @@
+From 278d922cb62d1b090ea8a2406acb5484add265d3 Mon Sep 17 00:00:00 2001
+From: xsun <sunxiao04@gmail.com>
+Date: Fri, 2 Jan 2026 20:54:30 +0000
+Subject: [PATCH 2/5] feat: Add HIP/ROCm compatibility to FlashInfer core files
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Add HIP/ROCm support to enable FlashInfer to compile on AMD GPUs.
+This is partial support focused on the JIT build system and core headers.
+
+Changes:
+- csrc/tvm_ffi_utils.h: Add HIP CUDADeviceGuard and type aliases
+- flashinfer/jit/cpp_ext.py: Add ROCm detection, hipcc compilation,
+  filter NVCC-only flags
+- include/flashinfer/layout.cuh: Add HIP runtime includes
+- include/flashinfer/math.cuh: PTX→GCN translations for math ops
+- include/flashinfer/page.cuh: HIP header includes
+- include/flashinfer/utils.cuh: CUDA→HIP type aliases
+
+Note: Additional work needed in utils.cuh and vec_dtypes.cuh for
+complete HIP support (PTX assembly replacement, cudaGetDevice macros).
+
+AI-assisted development.
+---
+ csrc/tvm_ffi_utils.h          | 40 +++++++++++++++++-
+ flashinfer/jit/cpp_ext.py     | 77 +++++++++++++++++++++++++++--------
+ include/flashinfer/layout.cuh |  6 +++
+ include/flashinfer/math.cuh   | 55 +++++++++++++++++++++++++
+ include/flashinfer/page.cuh   |  4 ++
+ include/flashinfer/utils.cuh  | 22 ++++++++++
+ 6 files changed, 186 insertions(+), 18 deletions(-)
+
+diff --git a/csrc/tvm_ffi_utils.h b/csrc/tvm_ffi_utils.h
+index cb49ffa1..2c413a90 100644
+--- a/csrc/tvm_ffi_utils.h
++++ b/csrc/tvm_ffi_utils.h
+@@ -18,9 +18,47 @@
+ #include <tvm/ffi/dtype.h>
+ #include <tvm/ffi/error.h>
+ #include <tvm/ffi/extra/c_env_api.h>
+-#include <tvm/ffi/extra/cuda/device_guard.h>
+ #include <tvm/ffi/function.h>
+ 
++#ifdef __HIP_PLATFORM_AMD__
++#include <hip/hip_runtime.h>
++#include <hip/hip_fp16.h>
++#include <hip/hip_bfloat16.h>
++// Provide CUDA-like type aliases for HIP
++using cudaStream_t = hipStream_t;
++using cudaError_t = hipError_t;
++using nv_half = __half;
++using nv_bfloat16 = hip_bfloat16;
++#define cudaGetDevice hipGetDevice
++#define cudaSetDevice hipSetDevice
++#define cudaSuccess hipSuccess
++#define kDLCUDA kDLROCM
++
++// HIP Device Guard - equivalent to ffi::CUDADeviceGuard
++namespace tvm {
++namespace ffi {
++class CUDADeviceGuard {
++ public:
++  explicit CUDADeviceGuard(int device_id) : prev_device_(-1) {
++    hipGetDevice(&prev_device_);
++    if (prev_device_ != device_id) {
++      hipSetDevice(device_id);
++    }
++  }
++  ~CUDADeviceGuard() {
++    if (prev_device_ >= 0) {
++      hipSetDevice(prev_device_);
++    }
++  }
++ private:
++  int prev_device_;
++};
++}  // namespace ffi
++}  // namespace tvm
++#else
++#include <tvm/ffi/extra/cuda/device_guard.h>
++#endif
++
+ #include "dlpack/dlpack.h"
+ 
+ using tvm::ffi::Tensor;
+diff --git a/flashinfer/jit/cpp_ext.py b/flashinfer/jit/cpp_ext.py
+index 57e80e44..1f1f0a39 100644
+--- a/flashinfer/jit/cpp_ext.py
++++ b/flashinfer/jit/cpp_ext.py
+@@ -192,6 +192,28 @@ def build_cflags(
+     return cflags
+ 
+ 
++def _is_nvcc_only_flag(flag: str) -> bool:
++    """Check if a flag is NVCC-specific and should be filtered for HIP."""
++    nvcc_only_patterns = [
++        "-gencode",
++        "--expt-",
++        "--compiler-options",
++        "--threads",
++        "-use_fast_math",  # Use -ffast-math instead for HIP
++        "-Xcompiler",
++        "-Xlinker",
++        "-ccbin",
++        "--generate-dependencies",
++        "--dependency-output",
++        "-static-global-template-stub",
++        "-maxrregcount",
++    ]
++    for pattern in nvcc_only_patterns:
++        if pattern in flag:
++            return True
++    return False
++
++
+ def build_hip_cflags(
+     common_cflags: List[str],
+     extra_cuda_cflags: Optional[List[str]] = None,
+@@ -205,8 +227,6 @@ def build_hip_cflags(
+         "-ffast-math",
+     ]
+ 
+-    # Get HIP architecture flags
+-    cpp_ext_initial_compilation_context = CompilationContext()
+     # AMD architectures - gfx908 (MI100), gfx90a (MI200), gfx942 (MI300)
+     hip_arch_flags = ["--offload-arch=gfx908", "--offload-arch=gfx90a", "--offload-arch=gfx942"]
+     hip_cflags += hip_arch_flags
+@@ -214,13 +234,13 @@ def build_hip_cflags(
+     if extra_cuda_cflags is not None:
+         # Filter out NVIDIA-specific flags
+         for flag in extra_cuda_cflags:
+-            if not flag.startswith("-gencode") and not flag.startswith("--expt-") and "--compiler-options" not in flag:
++            if not _is_nvcc_only_flag(flag):
+                 hip_cflags.append(flag)
+ 
+     env_extra_cuda_cflags = parse_env_flags("FLASHINFER_EXTRA_CUDAFLAGS")
+     if env_extra_cuda_cflags is not None:
+         for flag in env_extra_cuda_cflags:
+-            if not flag.startswith("-gencode") and not flag.startswith("--expt-"):
++            if not _is_nvcc_only_flag(flag):
+                 hip_cflags.append(flag)
+ 
+     return hip_cflags
+@@ -292,13 +312,20 @@ def generate_ninja_build_for_op(
+     cflags = build_cflags(common_cflags, extra_cflags)
+     cuda_cflags = build_cuda_cflags(common_cflags, extra_cuda_cflags)
+ 
+-    ldflags = [
+-        "-shared",
+-        "-L$cuda_home/lib64",
+-        "-L$cuda_home/lib64/stubs",
+-        "-lcudart",
+-        "-lcuda",
+-    ]
++    if is_hip():
++        ldflags = [
++            "-shared",
++            "-L$cuda_home/lib",
++            "-lamdhip64",
++        ]
++    else:
++        ldflags = [
++            "-shared",
++            "-L$cuda_home/lib64",
++            "-L$cuda_home/lib64/stubs",
++            "-lcudart",
++            "-lcuda",
++        ]
+ 
+     env_extra_ldflags = parse_env_flags("FLASHINFER_EXTRA_LDFLAGS")
+     if env_extra_ldflags is not None:
+@@ -308,7 +335,10 @@ def generate_ninja_build_for_op(
+         ldflags += extra_ldflags
+ 
+     cxx = os.environ.get("CXX", "c++")
+-    nvcc = os.environ.get("FLASHINFER_NVCC", "$cuda_home/bin/nvcc")
++    if is_hip():
++        nvcc = os.environ.get("FLASHINFER_HIPCC", "$cuda_home/bin/hipcc")
++    else:
++        nvcc = os.environ.get("FLASHINFER_NVCC", "$cuda_home/bin/nvcc")
+ 
+     lines = [
+         "ninja_required_version = 1.3",
+@@ -329,13 +359,26 @@ def generate_ninja_build_for_op(
+         "  depfile = $out.d",
+         "  deps = gcc",
+         "",
+-        "rule cuda_compile",
+-        "  command = $nvcc --generate-dependencies-with-compile --dependency-output $out.d $cuda_cflags -c $in -o $out $cuda_post_cflags",
+-        "  depfile = $out.d",
+-        "  deps = gcc",
+-        "",
+     ]
+ 
++    if is_hip():
++        # HIP uses hipcc which accepts different flags for dependencies
++        lines.extend([
++            "rule cuda_compile",
++            "  command = $nvcc -MMD -MF $out.d $cuda_cflags -c $in -o $out $cuda_post_cflags",
++            "  depfile = $out.d",
++            "  deps = gcc",
++            "",
++        ])
++    else:
++        lines.extend([
++            "rule cuda_compile",
++            "  command = $nvcc --generate-dependencies-with-compile --dependency-output $out.d $cuda_cflags -c $in -o $out $cuda_post_cflags",
++            "  depfile = $out.d",
++            "  deps = gcc",
++            "",
++        ])
++
+     # Add nvcc linking rule for device code
+     if needs_device_linking:
+         lines.extend(
+diff --git a/include/flashinfer/layout.cuh b/include/flashinfer/layout.cuh
+index aeaf26b5..3223764d 100644
+--- a/include/flashinfer/layout.cuh
++++ b/include/flashinfer/layout.cuh
+@@ -16,6 +16,12 @@
+ #ifndef FLASHINFER_LAYOUT_CUH_
+ #define FLASHINFER_LAYOUT_CUH_
+ 
++#ifdef __HIP_PLATFORM_AMD__
++#include <hip/hip_runtime.h>
++#else
++#include <cuda_runtime.h>
++#endif
++
+ #include <cstdint>
+ #include <string>
+ #include <tuple>
+diff --git a/include/flashinfer/math.cuh b/include/flashinfer/math.cuh
+index 27c6351e..19e4aaef 100644
+--- a/include/flashinfer/math.cuh
++++ b/include/flashinfer/math.cuh
+@@ -16,8 +16,13 @@
+ #ifndef FLASHINFER_MATH_CUH_
+ #define FLASHINFER_MATH_CUH_
+ 
++#ifdef __HIP_PLATFORM_AMD__
++#include <hip/hip_runtime.h>
++#include <hip/hip_fp16.h>
++#else
+ #include <cuda_fp16.h>
+ #include <cuda_runtime.h>
++#endif
+ 
+ #include <cstdint>
+ 
+@@ -40,9 +45,13 @@ __forceinline__ __device__ uint32_t half2_as_uint32(half2 x) { return *(uint32_t
+  * \param x input
+  */
+ __forceinline__ __device__ float ptx_exp2(float x) {
++#ifdef __HIP_PLATFORM_AMD__
++  return __builtin_amdgcn_exp2f(x);
++#else
+   float y;
+   asm volatile("ex2.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
+   return y;
++#endif
+ }
+ 
+ /*!
+@@ -50,9 +59,13 @@ __forceinline__ __device__ float ptx_exp2(float x) {
+  * \param x input
+  */
+ __forceinline__ __device__ float ptx_log2(float x) {
++#ifdef __HIP_PLATFORM_AMD__
++  return __builtin_amdgcn_logf(x) * 1.4426950408889634f; // log(x) * log2(e)
++#else
+   float y;
+   asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
+   return y;
++#endif
+ }
+ 
+ /*!
+@@ -60,10 +73,17 @@ __forceinline__ __device__ float ptx_log2(float x) {
+  * \param x input
+  */
+ __forceinline__ __device__ half2 ptx_exp2(half2 x) {
++#ifdef __HIP_PLATFORM_AMD__
++  float2 f;
++  f.x = __builtin_amdgcn_exp2f(__half2float(x.x));
++  f.y = __builtin_amdgcn_exp2f(__half2float(x.y));
++  return half2(__float2half(f.x), __float2half(f.y));
++#else
+   uint32_t y_u32;
+   uint32_t x_u32 = half2_as_uint32(x);
+   asm volatile("ex2.approx.f16x2 %0, %1;" : "=r"(y_u32) : "r"(x_u32));
+   return uint32_as_half2(y_u32);
++#endif
+ }
+ 
+ /*!
+@@ -71,9 +91,13 @@ __forceinline__ __device__ half2 ptx_exp2(half2 x) {
+  * \param x input
+  */
+ __forceinline__ __device__ half ptx_exp2(half x) {
++#ifdef __HIP_PLATFORM_AMD__
++  return __float2half(__builtin_amdgcn_exp2f(__half2float(x)));
++#else
+   ushort y_u16;
+   asm volatile("ex2.approx.f16 %0, %1;" : "=h"(y_u16) : "h"(__half_as_ushort(x)));
+   return __ushort_as_half(y_u16);
++#endif
+ }
+ 
+ /*!
+@@ -81,9 +105,13 @@ __forceinline__ __device__ half ptx_exp2(half x) {
+  * \param x input
+  */
+ __forceinline__ __device__ float ptx_rcp(float x) {
++#ifdef __HIP_PLATFORM_AMD__
++  return __builtin_amdgcn_rcpf(x);
++#else
+   float y;
+   asm volatile("rcp.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
+   return y;
++#endif
+ }
+ 
+ /*!
+@@ -93,11 +121,15 @@ __forceinline__ __device__ float ptx_rcp(float x) {
+  * \param lane_mask The mask to perform thread index xor with: y[i] <- x[i ^ delta]
+  */
+ __forceinline__ __device__ float shfl_xor_sync(float x, int lane_mask) {
++#ifdef __HIP_PLATFORM_AMD__
++  return __shfl_xor(x, lane_mask);
++#else
+   float y;
+   asm volatile("shfl.sync.bfly.b32 %0, %1, %2, 0x1f, 0xffffffff;"
+                : "=f"(y)
+                : "f"(x), "r"(lane_mask));
+   return y;
++#endif
+ }
+ 
+ /*!
+@@ -107,7 +139,11 @@ __forceinline__ __device__ float shfl_xor_sync(float x, int lane_mask) {
+  * \param lane_mask The mask to perform thread index xor with: y[i] <- x[i ^ lane_mask]
+  */
+ __forceinline__ __device__ half2 shfl_xor_sync(half2 x, int lane_mask) {
++#ifdef __HIP_PLATFORM_AMD__
++  return __shfl_xor(x, lane_mask);
++#else
+   return __shfl_xor_sync(0xffffffff, x, lane_mask);
++#endif
+ }
+ 
+ /*!
+@@ -115,9 +151,13 @@ __forceinline__ __device__ half2 shfl_xor_sync(half2 x, int lane_mask) {
+  * \param x input
+  */
+ __forceinline__ __device__ float rsqrt(float x) {
++#ifdef __HIP_PLATFORM_AMD__
++  return __builtin_amdgcn_rsqf(x);
++#else
+   float y;
+   asm volatile("rsqrt.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
+   return y;
++#endif
+ }
+ 
+ /*!
+@@ -125,9 +165,13 @@ __forceinline__ __device__ float rsqrt(float x) {
+  * \param x input
+  */
+ __forceinline__ __device__ float tanh(float x) {
++#ifdef __HIP_PLATFORM_AMD__
++  return tanhf(x);
++#else
+   float y;
+   asm volatile("tanh.approx.f32 %0, %1;" : "=f"(y) : "f"(x));
+   return y;
++#endif
+ }
+ 
+ /*!
+@@ -135,10 +179,17 @@ __forceinline__ __device__ float tanh(float x) {
+  * \param x input
+  */
+ __forceinline__ __device__ half2 tanh(half2 x) {
++#ifdef __HIP_PLATFORM_AMD__
++  float2 f;
++  f.x = tanhf(__half2float(x.x));
++  f.y = tanhf(__half2float(x.y));
++  return half2(__float2half(f.x), __float2half(f.y));
++#else
+   uint32_t y_u32;
+   uint32_t x_u32 = half2_as_uint32(x);
+   asm volatile("tanh.approx.f16x2 %0, %1;" : "=r"(y_u32) : "r"(x_u32));
+   return uint32_as_half2(y_u32);
++#endif
+ }
+ 
+ /*!
+@@ -146,9 +197,13 @@ __forceinline__ __device__ half2 tanh(half2 x) {
+  * \param x input
+  */
+ __forceinline__ __device__ half tanh(half x) {
++#ifdef __HIP_PLATFORM_AMD__
++  return __float2half(tanhf(__half2float(x)));
++#else
+   ushort y_u16;
+   asm volatile("tanh.approx.f16 %0, %1;" : "=h"(y_u16) : "h"(__half_as_ushort(x)));
+   return __ushort_as_half(y_u16);
++#endif
+ }
+ 
+ }  // namespace math
+diff --git a/include/flashinfer/page.cuh b/include/flashinfer/page.cuh
+index efc224b4..ddbd7225 100644
+--- a/include/flashinfer/page.cuh
++++ b/include/flashinfer/page.cuh
+@@ -16,7 +16,11 @@
+ #ifndef FLASHINFER_PAGE_CUH_
+ #define FLASHINFER_PAGE_CUH_
+ 
++#ifdef __HIP_PLATFORM_AMD__
++#include <hip/hip_runtime.h>
++#else
+ #include <driver_types.h>
++#endif
+ 
+ #include <vector>
+ 
+diff --git a/include/flashinfer/utils.cuh b/include/flashinfer/utils.cuh
+index 89fa79cf..a45a77dd 100644
+--- a/include/flashinfer/utils.cuh
++++ b/include/flashinfer/utils.cuh
+@@ -15,11 +15,33 @@
+  */
+ #ifndef FLASHINFER_UTILS_CUH_
+ #define FLASHINFER_UTILS_CUH_
++
++#ifdef __HIP_PLATFORM_AMD__
++#include <hip/hip_runtime.h>
++#include <hip/hip_fp16.h>
++#include <hip/amd_detail/amd_hip_bf16.h>
++// HIP compatibility macros
++#define cudaError_t hipError_t
++#define cudaSuccess hipSuccess
++#define cudaGetErrorString hipGetErrorString
++#define cudaMemcpy hipMemcpy
++#define cudaMemcpyDeviceToHost hipMemcpyDeviceToHost
++#define cudaMemcpyHostToDevice hipMemcpyHostToDevice
++#define cudaMemcpyDeviceToDevice hipMemcpyDeviceToDevice
++#define cudaDeviceProp hipDeviceProp_t
++#define cudaGetDeviceProperties hipGetDeviceProperties
++#define cudaDeviceGetAttribute hipDeviceGetAttribute
++#define cudaDevAttrComputeCapabilityMajor hipDeviceAttributeComputeCapabilityMajor
++#define cudaDevAttrComputeCapabilityMinor hipDeviceAttributeComputeCapabilityMinor
++using __nv_bfloat16 = __hip_bfloat16;
++using __nv_bfloat162 = __hip_bfloat162;
++#else
+ #include <cuda_bf16.h>
+ #include <cuda_device_runtime_api.h>
+ #include <cuda_fp16.h>
+ #include <cuda_fp8.h>
+ #include <cuda_runtime.h>
++#endif
+ 
+ #include <atomic>
+ #include <cstdint>
+-- 
+2.34.1
+

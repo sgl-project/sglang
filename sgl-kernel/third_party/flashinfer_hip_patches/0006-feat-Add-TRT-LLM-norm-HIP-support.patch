@@ -1,0 +1,847 @@
+diff --git a/csrc/tvm_ffi_utils.h b/csrc/tvm_ffi_utils.h
+index 2c413a90..e6b1e02b 100644
+--- a/csrc/tvm_ffi_utils.h
++++ b/csrc/tvm_ffi_utils.h
+@@ -23,12 +23,20 @@
+ #ifdef __HIP_PLATFORM_AMD__
+ #include <hip/hip_runtime.h>
+ #include <hip/hip_fp16.h>
+-#include <hip/hip_bfloat16.h>
++// Use amd_hip_bf16.h for __hip_bfloat16 type
++#include <hip/amd_detail/amd_hip_bf16.h>
++// Include HIP FP8 if available
++#if __has_include(<hip/hip_fp8.h>)
++#include <hip/hip_fp8.h>
++// FP8 type aliases for CUDA compatibility
++using __nv_fp8_e4m3 = __hip_fp8_e4m3;
++using __nv_fp8_e5m2 = __hip_fp8_e5m2;
++#endif
+ // Provide CUDA-like type aliases for HIP
+ using cudaStream_t = hipStream_t;
+ using cudaError_t = hipError_t;
+ using nv_half = __half;
+-using nv_bfloat16 = hip_bfloat16;
++using nv_bfloat16 = __hip_bfloat16;
+ #define cudaGetDevice hipGetDevice
+ #define cudaSetDevice hipSetDevice
+ #define cudaSuccess hipSuccess
+diff --git a/include/flashinfer/norm.cuh b/include/flashinfer/norm.cuh
+index 6814e892..7ad89122 100644
+--- a/include/flashinfer/norm.cuh
++++ b/include/flashinfer/norm.cuh
+@@ -19,6 +19,30 @@
+ #include <cstdint>
+ #include <numeric>
+ 
++// HIP/ROCm compatibility for norm kernel
++#ifdef __HIP_PLATFORM_AMD__
++#include <hip/hip_runtime.h>
++// PDL (Programmatic Dependent Launch) is not supported on HIP
++#define FLASHINFER_NORM_PDL_SUPPORTED 0
++// CUDA to HIP API mappings
++using cudaStream_t = hipStream_t;
++using cudaError_t = hipError_t;
++#define cudaSuccess hipSuccess
++// hipFuncSetAttribute takes const void* so we need a wrapper
++template <typename F>
++inline hipError_t cudaFuncSetAttribute(F func, hipFuncAttribute attr, int val) {
++  return hipFuncSetAttribute((const void*)func, attr, val);
++}
++#define cudaFuncAttributeMaxDynamicSharedMemorySize hipFuncAttributeMaxDynamicSharedMemorySize
++#define cudaOccupancyMaxActiveBlocksPerMultiprocessor hipOccupancyMaxActiveBlocksPerMultiprocessor
++#define cudaGetDevice hipGetDevice
++#define cudaDeviceGetAttribute hipDeviceGetAttribute
++#define cudaDevAttrMultiProcessorCount hipDeviceAttributeMultiprocessorCount
++#define cudaGetLastError hipGetLastError
++#else
++#define FLASHINFER_NORM_PDL_SUPPORTED 1
++#endif
++
+ #include "flashinfer/trtllm/common/cudaTypeUtils.cuh"
+ #include "flashinfer/trtllm/common/cudaUtils.h"
+ #include "flashinfer/trtllm/common/reduceKernelUtils.cuh"
+@@ -124,6 +148,7 @@ cudaError_t RMSNorm(T* input, T* weight, T* output, uint32_t batch_size, uint32_
+   float weight_bias = 0.f;
+   void* args[] = {&input, &weight, &output, &d, &stride_input, &stride_output, &weight_bias, &eps};
+ 
++#if FLASHINFER_NORM_PDL_SUPPORTED
+   cudaLaunchConfig_t config;
+   config.gridDim = nblks;
+   config.blockDim = nthrs;
+@@ -142,6 +167,17 @@ cudaError_t RMSNorm(T* input, T* weight, T* output, uint32_t batch_size, uint32_
+     FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(&config, kernel, input, weight, output, d, stride_input,
+                                             stride_output, weight_bias, eps));
+   });
++#else
++  // HIP: Use standard kernel launch without PDL
++  DISPATCH_ALIGNED_VEC_SIZE(vec_size, VEC_SIZE, {
++    auto kernel = RMSNormKernel<VEC_SIZE, T>;
++    FLASHINFER_CUDA_CALL(
++        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
++    kernel<<<nblks, nthrs, smem_size, stream>>>(input, weight, output, d, stride_input,
++                                                 stride_output, weight_bias, eps);
++    FLASHINFER_CUDA_CALL(cudaGetLastError());
++  });
++#endif
+   return cudaSuccess;
+ }
+ 
+@@ -239,6 +275,7 @@ cudaError_t RMSNormQuant(T* input, T* weight, O* output, uint32_t batch_size, ui
+   const uint32_t smem_size = num_warps * sizeof(float);
+   float weight_bias = 0.f;
+ 
++#if FLASHINFER_NORM_PDL_SUPPORTED
+   cudaLaunchConfig_t config;
+   config.gridDim = nblks;
+   config.blockDim = nthrs;
+@@ -257,6 +294,16 @@ cudaError_t RMSNormQuant(T* input, T* weight, O* output, uint32_t batch_size, ui
+     FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(&config, kernel, input, weight, output, d, stride_input,
+                                             stride_output, weight_bias, scale, eps));
+   });
++#else
++  DISPATCH_ALIGNED_VEC_SIZE(vec_size, VEC_SIZE, {
++    auto kernel = RMSNormQuantKernel<VEC_SIZE, T, O>;
++    FLASHINFER_CUDA_CALL(
++        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
++    kernel<<<nblks, nthrs, smem_size, stream>>>(input, weight, output, d, stride_input,
++                                                 stride_output, weight_bias, scale, eps);
++    FLASHINFER_CUDA_CALL(cudaGetLastError());
++  });
++#endif
+   return cudaSuccess;
+ }
+ 
+@@ -350,15 +397,6 @@ cudaError_t QKRMSNorm(T* input, T* weight, T* output, uint32_t batch_size, uint3
+ 
+   float weight_bias = 0.f;
+ 
+-  cudaLaunchConfig_t config;
+-  config.dynamicSmemBytes = smem_size;
+-  config.stream = stream;
+-  cudaLaunchAttribute attrs[1];
+-  attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+-  attrs[0].val.programmaticStreamSerializationAllowed = enable_pdl;
+-  config.numAttrs = 1;
+-  config.attrs = attrs;
+-
+   DISPATCH_ALIGNED_VEC_SIZE(vec_size, VEC_SIZE, {
+     auto kernel = QKRMSNormKernel<VEC_SIZE, T>;
+ 
+@@ -372,13 +410,27 @@ cudaError_t QKRMSNorm(T* input, T* weight, T* output, uint32_t batch_size, uint3
+     const int needed_blocks = ceil_div(batch_size * num_heads, num_warps);
+     dim3 nblks(std::min(num_blocks_per_sm * num_sms, needed_blocks));
+     dim3 nthrs(32, num_warps);
++
++#if FLASHINFER_NORM_PDL_SUPPORTED
++    cudaLaunchConfig_t config;
++    config.dynamicSmemBytes = smem_size;
++    config.stream = stream;
++    cudaLaunchAttribute attrs[1];
++    attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
++    attrs[0].val.programmaticStreamSerializationAllowed = enable_pdl;
++    config.numAttrs = 1;
++    config.attrs = attrs;
+     config.gridDim = nblks;
+     config.blockDim = nthrs;
+-
+-    // execute kernel
+     FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(&config, kernel, input, weight, output, d, batch_size,
+                                             num_heads, stride_input_n, stride_input_h,
+                                             stride_output_n, stride_output_h, weight_bias, eps));
++#else
++    kernel<<<nblks, nthrs, smem_size, stream>>>(input, weight, output, d, batch_size,
++                                                num_heads, stride_input_n, stride_input_h,
++                                                stride_output_n, stride_output_h, weight_bias, eps);
++    FLASHINFER_CUDA_CALL(cudaGetLastError());
++#endif
+   });
+   return cudaSuccess;
+ }
+@@ -491,6 +543,7 @@ cudaError_t FusedAddRMSNorm(T* input, T* residual, T* weight, uint32_t batch_siz
+   void* args[] = {&input,        &residual,        &weight,      &d,
+                   &stride_input, &stride_residual, &weight_bias, &eps};
+ 
++#if FLASHINFER_NORM_PDL_SUPPORTED
+   cudaLaunchConfig_t config;
+   config.gridDim = nblks;
+   config.blockDim = nthrs;
+@@ -509,6 +562,16 @@ cudaError_t FusedAddRMSNorm(T* input, T* residual, T* weight, uint32_t batch_siz
+     FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(&config, kernel, input, residual, weight, d,
+                                             stride_input, stride_residual, weight_bias, eps));
+   });
++#else
++  DISPATCH_ALIGNED_VEC_SIZE(vec_size, VEC_SIZE, {
++    auto kernel = FusedAddRMSNormKernel<VEC_SIZE, T>;
++    FLASHINFER_CUDA_CALL(
++        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
++    kernel<<<nblks, nthrs, smem_size, stream>>>(input, residual, weight, d,
++                                                stride_input, stride_residual, weight_bias, eps);
++    FLASHINFER_CUDA_CALL(cudaGetLastError());
++  });
++#endif
+ 
+   return cudaSuccess;
+ }
+@@ -624,6 +687,7 @@ cudaError_t FusedAddRMSNormQuant(T* input, T* residual, T* weight, O* output, ui
+   const uint32_t smem_size = (ceil_div(num_warps, 4) * 4 + d) * sizeof(float);
+   float weight_bias = 0.f;
+ 
++#if FLASHINFER_NORM_PDL_SUPPORTED
+   cudaLaunchConfig_t config;
+   config.gridDim = nblks;
+   config.blockDim = nthrs;
+@@ -643,6 +707,17 @@ cudaError_t FusedAddRMSNormQuant(T* input, T* residual, T* weight, O* output, ui
+                                             stride_input, stride_residual, stride_output,
+                                             weight_bias, scale, eps));
+   });
++#else
++  DISPATCH_ALIGNED_VEC_SIZE(vec_size, VEC_SIZE, {
++    auto kernel = FusedAddRMSNormQuantKernel<VEC_SIZE, T, O>;
++    FLASHINFER_CUDA_CALL(
++        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
++    kernel<<<nblks, nthrs, smem_size, stream>>>(input, residual, weight, output, d,
++                                                stride_input, stride_residual, stride_output,
++                                                weight_bias, scale, eps);
++    FLASHINFER_CUDA_CALL(cudaGetLastError());
++  });
++#endif
+ 
+   return cudaSuccess;
+ }
+@@ -661,6 +736,7 @@ cudaError_t GemmaRMSNorm(T* input, T* weight, T* output, uint32_t batch_size, ui
+   float weight_bias = 1.f;
+   void* args[] = {&input, &weight, &output, &d, &stride_input, &stride_output, &weight_bias, &eps};
+ 
++#if FLASHINFER_NORM_PDL_SUPPORTED
+   cudaLaunchConfig_t config;
+   config.gridDim = nblks;
+   config.blockDim = nthrs;
+@@ -679,6 +755,16 @@ cudaError_t GemmaRMSNorm(T* input, T* weight, T* output, uint32_t batch_size, ui
+     FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(&config, kernel, input, weight, output, d, stride_input,
+                                             stride_output, weight_bias, eps));
+   });
++#else
++  DISPATCH_ALIGNED_VEC_SIZE(vec_size, VEC_SIZE, {
++    auto kernel = RMSNormKernel<VEC_SIZE, T>;
++    FLASHINFER_CUDA_CALL(
++        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
++    kernel<<<nblks, nthrs, smem_size, stream>>>(input, weight, output, d, stride_input,
++                                                stride_output, weight_bias, eps);
++    FLASHINFER_CUDA_CALL(cudaGetLastError());
++  });
++#endif
+   return cudaSuccess;
+ }
+ 
+@@ -698,6 +784,7 @@ cudaError_t GemmaFusedAddRMSNorm(T* input, T* residual, T* weight, uint32_t batc
+   void* args[] = {&input,        &residual,        &weight,      &d,
+                   &stride_input, &stride_residual, &weight_bias, &eps};
+ 
++#if FLASHINFER_NORM_PDL_SUPPORTED
+   cudaLaunchConfig_t config;
+   config.gridDim = nblks;
+   config.blockDim = nthrs;
+@@ -716,6 +803,16 @@ cudaError_t GemmaFusedAddRMSNorm(T* input, T* residual, T* weight, uint32_t batc
+     FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(&config, kernel, input, residual, weight, d,
+                                             stride_input, stride_residual, weight_bias, eps));
+   });
++#else
++  DISPATCH_ALIGNED_VEC_SIZE(vec_size, VEC_SIZE, {
++    auto kernel = FusedAddRMSNormKernel<VEC_SIZE, T>;
++    FLASHINFER_CUDA_CALL(
++        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
++    kernel<<<nblks, nthrs, smem_size, stream>>>(input, residual, weight, d,
++                                                stride_input, stride_residual, weight_bias, eps);
++    FLASHINFER_CUDA_CALL(cudaGetLastError());
++  });
++#endif
+ 
+   return cudaSuccess;
+ }
+diff --git a/include/flashinfer/trtllm/common/cudaBf16Fallbacks.cuh b/include/flashinfer/trtllm/common/cudaBf16Fallbacks.cuh
+index 21707b21..1c068c55 100644
+--- a/include/flashinfer/trtllm/common/cudaBf16Fallbacks.cuh
++++ b/include/flashinfer/trtllm/common/cudaBf16Fallbacks.cuh
+@@ -19,10 +19,39 @@
+ #ifdef __HIP_PLATFORM_AMD__
+ #include <hip/hip_runtime.h>
+ #include <hip/hip_fp16.h>
+-#include <hip/hip_bfloat16.h>
++// Use amd_hip_bf16.h for __hip_bfloat16 and __hip_bfloat162 types
++#include <hip/amd_detail/amd_hip_bf16.h>
+ // HIP compatibility
+ using __nv_bfloat16 = __hip_bfloat16;
+ using __nv_bfloat162 = __hip_bfloat162;
++
++// Define missing bfloat16 helper functions for HIP
++__device__ __forceinline__ float __low2float(const __hip_bfloat162& val) {
++  return __bfloat162float(val.x);
++}
++__device__ __forceinline__ float __high2float(const __hip_bfloat162& val) {
++  return __bfloat162float(val.y);
++}
++__device__ __forceinline__ __hip_bfloat162 __floats2bfloat162_rn(float a, float b) {
++  __hip_bfloat162 result;
++  result.x = __float2bfloat16(a);
++  result.y = __float2bfloat16(b);
++  return result;
++}
++// Broadcast single float to bfloat162
++__device__ __forceinline__ __hip_bfloat162 __float2bfloat162_rn(float val) {
++  return __floats2bfloat162_rn(val, val);
++}
++// Construct bfloat162 from two bfloat16 values (HIP doesn't have make_bfloat162)
++__device__ __forceinline__ __hip_bfloat162 make_bfloat162(__hip_bfloat16 x, __hip_bfloat16 y) {
++  __hip_bfloat162 result;
++  result.x = x;
++  result.y = y;
++  return result;
++}
++
++// Force HIP to use fallback paths (no native bfloat162 intrinsics like __hmin2, make_bfloat162)
++#define FLASHINFER_HIP_BF16_FALLBACK 1
+ #else
+ #include <cuda_fp16.h>
+ #include <cuda_runtime_api.h>
+@@ -35,7 +64,7 @@ namespace common {
+ 
+ #ifdef ENABLE_BF16
+ inline __device__ float2 bf1622float2(const __nv_bfloat162 val) {
+-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
++#if defined(FLASHINFER_HIP_BF16_FALLBACK) || (defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800)
+   float2 f_val;
+   f_val.x = __low2float(val);
+   f_val.y = __high2float(val);
+@@ -46,7 +75,7 @@ inline __device__ float2 bf1622float2(const __nv_bfloat162 val) {
+ }
+ 
+ inline __device__ int16_t bf1622int16(__nv_bfloat162 val) {
+-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
++#if defined(FLASHINFER_HIP_BF16_FALLBACK) || (defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800)
+   float2 f_val;
+   f_val.x = max(min(__low2float(val), 127.f), -128.f);
+   f_val.y = max(min(__high2float(val), 127.f), -128.f);
+@@ -75,7 +104,7 @@ inline __device__ int16_t bf1622int16(__nv_bfloat162 val) {
+ }
+ 
+ inline __device__ __nv_bfloat162 float22bf162(const float2 val) {
+-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
++#if defined(FLASHINFER_HIP_BF16_FALLBACK) || (defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800)
+   return __floats2bfloat162_rn(val.x, val.y);
+ #else
+   return __float22bfloat162_rn(val);
+@@ -83,7 +112,7 @@ inline __device__ __nv_bfloat162 float22bf162(const float2 val) {
+ }
+ 
+ inline __device__ __nv_bfloat162 bf162bf162(const __nv_bfloat16 val) {
+-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
++#if defined(FLASHINFER_HIP_BF16_FALLBACK) || (defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800)
+   __nv_bfloat162 val2;
+   val2.x = val;
+   val2.y = val;
+@@ -94,7 +123,7 @@ inline __device__ __nv_bfloat162 bf162bf162(const __nv_bfloat16 val) {
+ }
+ 
+ inline __device__ __nv_bfloat162 bf16hadd2(const __nv_bfloat162 x, const __nv_bfloat162 y) {
+-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
++#if defined(FLASHINFER_HIP_BF16_FALLBACK) || (defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800)
+   float fxl, fxh, fyl, fyh;
+   fxl = __low2float(x);
+   fxh = __high2float(x);
+@@ -107,7 +136,7 @@ inline __device__ __nv_bfloat162 bf16hadd2(const __nv_bfloat162 x, const __nv_bf
+ }
+ 
+ inline __device__ __nv_bfloat16 bf16hadd(const __nv_bfloat16 x, const __nv_bfloat16 y) {
+-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
++#if defined(FLASHINFER_HIP_BF16_FALLBACK) || (defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800)
+   return __float2bfloat16(__bfloat162float(x) + __bfloat162float(y));
+ #else
+   return __hadd(x, y);
+@@ -115,7 +144,7 @@ inline __device__ __nv_bfloat16 bf16hadd(const __nv_bfloat16 x, const __nv_bfloa
+ }
+ 
+ inline __device__ __nv_bfloat162 bf16hsub2(const __nv_bfloat162 x, const __nv_bfloat162 y) {
+-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
++#if defined(FLASHINFER_HIP_BF16_FALLBACK) || (defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800)
+   float fxl, fxh, fyl, fyh;
+   fxl = __low2float(x);
+   fxh = __high2float(x);
+@@ -128,7 +157,7 @@ inline __device__ __nv_bfloat162 bf16hsub2(const __nv_bfloat162 x, const __nv_bf
+ }
+ 
+ inline __device__ __nv_bfloat16 bf16hsub(const __nv_bfloat16 x, const __nv_bfloat16 y) {
+-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
++#if defined(FLASHINFER_HIP_BF16_FALLBACK) || (defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800)
+   return __float2bfloat16(__bfloat162float(x) - __bfloat162float(y));
+ #else
+   return __hsub(x, y);
+@@ -136,7 +165,7 @@ inline __device__ __nv_bfloat16 bf16hsub(const __nv_bfloat16 x, const __nv_bfloa
+ }
+ 
+ inline __device__ __nv_bfloat162 bf16hmul2(const __nv_bfloat162 x, const __nv_bfloat162 y) {
+-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
++#if defined(FLASHINFER_HIP_BF16_FALLBACK) || (defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800)
+   float fxl, fxh, fyl, fyh;
+   fxl = __low2float(x);
+   fxh = __high2float(x);
+@@ -149,7 +178,7 @@ inline __device__ __nv_bfloat162 bf16hmul2(const __nv_bfloat162 x, const __nv_bf
+ }
+ 
+ inline __device__ __nv_bfloat16 bf16hmul(const __nv_bfloat16 x, const __nv_bfloat16 y) {
+-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
++#if defined(FLASHINFER_HIP_BF16_FALLBACK) || (defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800)
+   return __float2bfloat16(__bfloat162float(x) * __bfloat162float(y));
+ #else
+   return __hmul(x, y);
+@@ -158,7 +187,7 @@ inline __device__ __nv_bfloat16 bf16hmul(const __nv_bfloat16 x, const __nv_bfloa
+ 
+ inline __device__ __nv_bfloat162 bf16hfma2(const __nv_bfloat162 x, const __nv_bfloat162 y,
+                                            const __nv_bfloat162 z) {
+-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
++#if defined(FLASHINFER_HIP_BF16_FALLBACK) || (defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800)
+   float fxl, fxh, fyl, fyh, fzl, fzh;
+   fxl = __low2float(x);
+   fxh = __high2float(x);
+@@ -174,7 +203,7 @@ inline __device__ __nv_bfloat162 bf16hfma2(const __nv_bfloat162 x, const __nv_bf
+ 
+ inline __device__ __nv_bfloat16 bf16hfma(const __nv_bfloat16 x, const __nv_bfloat16 y,
+                                          const __nv_bfloat16 z) {
+-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
++#if defined(FLASHINFER_HIP_BF16_FALLBACK) || (defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800)
+   return __float2bfloat16(__bfloat162float(x) * __bfloat162float(y) + __bfloat162float(z));
+ #else
+   return __hfma(x, y, z);
+@@ -182,7 +211,7 @@ inline __device__ __nv_bfloat16 bf16hfma(const __nv_bfloat16 x, const __nv_bfloa
+ }
+ 
+ inline __device__ __nv_bfloat162 bf16exp2(const __nv_bfloat162 x) {
+-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
++#if defined(FLASHINFER_HIP_BF16_FALLBACK) || (defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800)
+   float fxl, fxh;
+   fxl = __low2float(x);
+   fxh = __high2float(x);
+@@ -206,7 +235,7 @@ inline __device__ __nv_bfloat162 make_bfloat162(const __nv_bfloat16 x, const __n
+ #endif
+ 
+ inline __device__ __nv_bfloat16 bf16hadd(__nv_bfloat16 a, __nv_bfloat16 b, __nv_bfloat16 c) {
+-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
++#if defined(FLASHINFER_HIP_BF16_FALLBACK) || (defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800)
+   return __float2bfloat16(__bfloat162float(a) + __bfloat162float(b) + __bfloat162float(c));
+ #else
+   return a + b + c;
+@@ -215,7 +244,7 @@ inline __device__ __nv_bfloat16 bf16hadd(__nv_bfloat16 a, __nv_bfloat16 b, __nv_
+ 
+ inline __device__ __nv_bfloat16 bf16hadd(__nv_bfloat16 a, __nv_bfloat16 b, __nv_bfloat16 c,
+                                          __nv_bfloat16 d) {
+-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
++#if defined(FLASHINFER_HIP_BF16_FALLBACK) || (defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800)
+   return __float2bfloat16(__bfloat162float(a) + __bfloat162float(b) + __bfloat162float(c) +
+                           __bfloat162float(d));
+ #else
+@@ -224,7 +253,7 @@ inline __device__ __nv_bfloat16 bf16hadd(__nv_bfloat16 a, __nv_bfloat16 b, __nv_
+ }
+ 
+ inline __device__ __nv_bfloat162 bf16hadd2(__nv_bfloat162 a, __nv_bfloat162 b, __nv_bfloat162 c) {
+-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
++#if defined(FLASHINFER_HIP_BF16_FALLBACK) || (defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800)
+   float fal, fah, fbl, fbh, fcl, fch;
+   fal = __low2float(a);
+   fah = __high2float(a);
+@@ -239,7 +268,7 @@ inline __device__ __nv_bfloat162 bf16hadd2(__nv_bfloat162 a, __nv_bfloat162 b, _
+ }
+ 
+ inline __device__ __nv_bfloat16 bf16hmul(__nv_bfloat16 a, __nv_bfloat16 b, __nv_bfloat16 c) {
+-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
++#if defined(FLASHINFER_HIP_BF16_FALLBACK) || (defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800)
+   return __float2bfloat16(__bfloat162float(a) * __bfloat162float(b) * __bfloat162float(c));
+ #else
+   return a * b * c;
+@@ -247,7 +276,7 @@ inline __device__ __nv_bfloat16 bf16hmul(__nv_bfloat16 a, __nv_bfloat16 b, __nv_
+ }
+ 
+ inline __device__ __nv_bfloat162 bf16hmul2(__nv_bfloat162 a, __nv_bfloat162 b, __nv_bfloat162 c) {
+-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
++#if defined(FLASHINFER_HIP_BF16_FALLBACK) || (defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800)
+   float fal, fah, fbl, fbh, fcl, fch;
+   fal = __low2float(a);
+   fah = __high2float(a);
+@@ -263,7 +292,7 @@ inline __device__ __nv_bfloat162 bf16hmul2(__nv_bfloat162 a, __nv_bfloat162 b, _
+ 
+ inline __device__ __nv_bfloat162 bf16hfma2(__nv_bfloat162 a, __nv_bfloat162 b, __nv_bfloat162 c,
+                                            __nv_bfloat162 d) {
+-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
++#if defined(FLASHINFER_HIP_BF16_FALLBACK) || (defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800)
+   float fal, fah, fbl, fbh, fcl, fch, fdl, fdh;
+   fal = __low2float(a);
+   fah = __high2float(a);
+diff --git a/include/flashinfer/trtllm/common/cudaBf16Wrapper.h b/include/flashinfer/trtllm/common/cudaBf16Wrapper.h
+index 8ce64b1f..df276a28 100644
+--- a/include/flashinfer/trtllm/common/cudaBf16Wrapper.h
++++ b/include/flashinfer/trtllm/common/cudaBf16Wrapper.h
+@@ -18,7 +18,8 @@
+ 
+ #ifdef ENABLE_BF16
+ #ifdef __HIP_PLATFORM_AMD__
+-#include <hip/hip_bfloat16.h>
++// Use amd_hip_bf16.h for __hip_bfloat16 and __hip_bfloat162 types
++#include <hip/amd_detail/amd_hip_bf16.h>
+ #else
+ #include <cuda_bf16.h>
+ #endif
+diff --git a/include/flashinfer/trtllm/common/cudaFp8Utils.h b/include/flashinfer/trtllm/common/cudaFp8Utils.h
+index c4fe50ca..2e04b94b 100644
+--- a/include/flashinfer/trtllm/common/cudaFp8Utils.h
++++ b/include/flashinfer/trtllm/common/cudaFp8Utils.h
+@@ -27,9 +27,15 @@
+ #ifndef __CUDA_ALIGN__
+ #define __CUDA_ALIGN__(n) __attribute__((aligned(n)))
+ #endif
+-// FP8 type aliases
++// CUDA to HIP type alias
++using cudaStream_t = hipStream_t;
++// FP8 type aliases - use native HIP FP8 types
+ using __nv_fp8_e4m3 = __hip_fp8_e4m3;
+ using __nv_fp8_e5m2 = __hip_fp8_e5m2;
++using __nv_fp8x2_e4m3 = __hip_fp8x2_e4m3;
++using __nv_fp8x2_e5m2 = __hip_fp8x2_e5m2;
++using __nv_fp8x4_e4m3 = __hip_fp8x4_e4m3;
++using __nv_fp8x4_e5m2 = __hip_fp8x4_e5m2;
+ #else
+ #include <cuda_fp8.h>
+ #include <cuda_runtime.h>
+diff --git a/include/flashinfer/trtllm/common/cudaTypeUtils.cuh b/include/flashinfer/trtllm/common/cudaTypeUtils.cuh
+index a55e9e5b..feec9f59 100644
+--- a/include/flashinfer/trtllm/common/cudaTypeUtils.cuh
++++ b/include/flashinfer/trtllm/common/cudaTypeUtils.cuh
+@@ -22,10 +22,11 @@
+ #include <hip/hip_runtime.h>
+ #include <hip/hip_fp16.h>
+ #if ENABLE_BF16
+-#include <hip/hip_bfloat16.h>
++// Use amd_hip_bf16.h for __hip_bfloat16 and __hip_bfloat162 types
++#include <hip/amd_detail/amd_hip_bf16.h>
+ #endif
+ // HIP compatibility aliases
+-using nv_bfloat16 = hip_bfloat16;
++using nv_bfloat16 = __hip_bfloat16;
+ using __nv_bfloat16 = __hip_bfloat16;
+ using __nv_bfloat162 = __hip_bfloat162;
+ #else
+@@ -45,13 +46,17 @@ namespace common {
+ 
+ template <typename T>
+ inline __device__ T ldg(T const* val) {
++#ifdef __HIP_PLATFORM_AMD__
++  return val[0];  // HIP __ldg has limited type support
++#else
+   return __ldg(val);
++#endif
+ }
+ 
+ #if ENABLE_BF16
+ template <>
+ inline __device__ __nv_bfloat162 ldg(__nv_bfloat162 const* val) {
+-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
++#if defined(__HIP_PLATFORM_AMD__) || (defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800)
+   return val[0];
+ #else
+   return __ldg(val);
+@@ -60,7 +65,7 @@ inline __device__ __nv_bfloat162 ldg(__nv_bfloat162 const* val) {
+ 
+ template <>
+ inline __device__ __nv_bfloat16 ldg(__nv_bfloat16 const* val) {
+-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
++#if defined(__HIP_PLATFORM_AMD__) || (defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800)
+   return val[0];
+ #else
+   return __ldg(val);
+@@ -299,6 +304,13 @@ __device__ inline half2 cuda_cast<half2, half>(half val) {
+ 
+ template <>
+ __device__ inline int8_t cuda_cast<int8_t, half>(half val) {
++#ifdef __HIP_PLATFORM_AMD__
++  // HIP: convert half to int8 with rounding and saturation
++  float f = __half2float(val);
++  f = rintf(f);
++  f = fminf(fmaxf(f, -128.f), 127.f);
++  return static_cast<int8_t>(f);
++#else
+   union {
+     int8_t int8[2];
+     int16_t int16;
+@@ -312,6 +324,7 @@ __device__ inline int8_t cuda_cast<int8_t, half>(half val) {
+   fp16 = val;
+   asm volatile("cvt.rni.sat.s8.f16 %0, %1;" : "=h"(int16) : "h"(int16_in));
+   return int8[0];
++#endif
+ }
+ 
+ template <>
+@@ -328,6 +341,12 @@ __device__ inline int16_t cuda_cast<int16_t, half2>(half2 val) {
+ 
+ template <>
+ __device__ inline int8_t cuda_cast<int8_t, float>(float val) {
++#ifdef __HIP_PLATFORM_AMD__
++  // HIP: convert float to int8 with rounding and saturation
++  float f = rintf(val);
++  f = fminf(fmaxf(f, -128.f), 127.f);
++  return static_cast<int8_t>(f);
++#else
+   union {
+     int8_t int8[2];
+     int16_t int16;
+@@ -335,6 +354,7 @@ __device__ inline int8_t cuda_cast<int8_t, float>(float val) {
+ 
+   asm volatile("cvt.rni.sat.s8.f32 %0, %1;" : "=h"(int16) : "f"(val));
+   return int8[0];
++#endif
+ }
+ 
+ template <>
+@@ -524,7 +544,10 @@ __device__ inline half cuda_max(half2 val) {
+ #ifdef ENABLE_BF16
+ template <>
+ __device__ inline __nv_bfloat16 cuda_max(__nv_bfloat162 val) {
+-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800))
++#ifdef __HIP_PLATFORM_AMD__
++  // HIP: manual bfloat16 max
++  return (__bfloat162float(val.x) > __bfloat162float(val.y)) ? val.x : val.y;
++#elif (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800))
+   return __hmax(val.x, val.y);
+ #else
+   assert(0);
+@@ -550,13 +573,29 @@ __device__ inline float2 cuda_max(float2 val1, float2 val2) {
+ 
+ template <>
+ __device__ inline half2 cuda_max(half2 val1, half2 val2) {
++#ifdef __HIP_PLATFORM_AMD__
++  // HIP's __hmax2 is for bfloat162, use manual half2 max
++  half2 result;
++  result.x = (__half2float(val1.x) > __half2float(val2.x)) ? val1.x : val2.x;
++  result.y = (__half2float(val1.y) > __half2float(val2.y)) ? val1.y : val2.y;
++  return result;
++#else
+   return __hmax2(val1, val2);
++#endif
+ }
+ 
+ #ifdef ENABLE_BF16
+ template <>
+ __device__ inline __nv_bfloat162 cuda_max(__nv_bfloat162 val1, __nv_bfloat162 val2) {
++#ifdef __HIP_PLATFORM_AMD__
++  // HIP: manual bfloat162 max
++  __nv_bfloat162 result;
++  result.x = (__bfloat162float(val1.x) > __bfloat162float(val2.x)) ? val1.x : val2.x;
++  result.y = (__bfloat162float(val1.y) > __bfloat162float(val2.y)) ? val1.y : val2.y;
++  return result;
++#else
+   return __hmax2(val1, val2);
++#endif
+ }
+ #endif  // ENABLE_BF16
+ 
+@@ -576,13 +615,29 @@ __device__ inline float2 cuda_min(float2 val1, float2 val2) {
+ 
+ template <>
+ __device__ inline half2 cuda_min(half2 val1, half2 val2) {
++#ifdef __HIP_PLATFORM_AMD__
++  // HIP's __hmin2 is for bfloat162, use manual half2 min
++  half2 result;
++  result.x = (__half2float(val1.x) < __half2float(val2.x)) ? val1.x : val2.x;
++  result.y = (__half2float(val1.y) < __half2float(val2.y)) ? val1.y : val2.y;
++  return result;
++#else
+   return __hmin2(val1, val2);
++#endif
+ }
+ 
+ #ifdef ENABLE_BF16
+ template <>
+ __device__ inline __nv_bfloat162 cuda_min(__nv_bfloat162 val1, __nv_bfloat162 val2) {
++#ifdef __HIP_PLATFORM_AMD__
++  // HIP: manual bfloat162 min
++  __nv_bfloat162 result;
++  result.x = (__bfloat162float(val1.x) < __bfloat162float(val2.x)) ? val1.x : val2.x;
++  result.y = (__bfloat162float(val1.y) < __bfloat162float(val2.y)) ? val1.y : val2.y;
++  return result;
++#else
+   return __hmin2(val1, val2);
++#endif
+ }
+ #endif  // ENABLE_BF16
+ 
+@@ -593,6 +648,8 @@ inline __device__ T cuda_clamp(T val, T minVal, T maxVal) {
+ }
+ 
+ #ifdef ENABLE_FP8
++#ifndef __HIP_PLATFORM_AMD__
++// FP8x2 conversions - CUDA only (HIP has limited FP8 packed type support)
+ template <>
+ __device__ inline float2 cuda_cast<float2, __nv_fp8x2_e4m3>(__nv_fp8x2_e4m3 val) {
+   return bf1622float2(fp8x2_e4m3_to_bfloat2(&val));
+@@ -617,6 +674,7 @@ template <>
+ __device__ inline __nv_fp8x2_e4m3 cuda_cast<__nv_fp8x2_e4m3, __nv_bfloat162>(__nv_bfloat162 val) {
+   return __nv_fp8x2_e4m3(cuda_cast<float2>(val));
+ }
++#endif  // !__HIP_PLATFORM_AMD__
+ 
+ template <>
+ __device__ inline __nv_fp8_e4m3 cuda_cast<__nv_fp8_e4m3, half>(half val) {
+diff --git a/include/flashinfer/trtllm/common/cudaUtils.h b/include/flashinfer/trtllm/common/cudaUtils.h
+index d10c4055..1464ffeb 100644
+--- a/include/flashinfer/trtllm/common/cudaUtils.h
++++ b/include/flashinfer/trtllm/common/cudaUtils.h
+@@ -22,11 +22,26 @@
+ // #include "tensorrt_llm/common/logger.h"
+ // #include "tensorrt_llm/common/tllmException.h"
+ 
++#ifdef __HIP_PLATFORM_AMD__
++#include <hip/hip_runtime.h>
++// HIP doesn't have cuBLAS - GEMM operations use different paths on AMD
++// CUDA to HIP type/function aliases
++using cudaStream_t = hipStream_t;
++using cudaError_t = hipError_t;
++using cudaStreamCaptureStatus = hipStreamCaptureStatus;
++#define cudaStreamIsCapturing hipStreamIsCapturing
++#define cudaStreamSynchronize hipStreamSynchronize
++#define cudaGetLastError hipGetLastError
++#define cudaGetErrorString hipGetErrorString
++#define cudaSuccess hipSuccess
++#define cudaStreamCaptureStatusActive hipStreamCaptureStatusActive
++#else
+ #include <cublasLt.h>
+ #include <cublas_v2.h>
+ #include <cuda.h>
+ #include <cuda_runtime.h>
+ #include <driver_types.h>
++#endif
+ 
+ #include <algorithm>
+ #include <cassert>
+diff --git a/include/flashinfer/trtllm/common/reduceKernelUtils.cuh b/include/flashinfer/trtllm/common/reduceKernelUtils.cuh
+index b227488c..051226c0 100644
+--- a/include/flashinfer/trtllm/common/reduceKernelUtils.cuh
++++ b/include/flashinfer/trtllm/common/reduceKernelUtils.cuh
+@@ -17,6 +17,17 @@
+ #include <assert.h>
+ 
+ #include <array>
++#include <float.h>
++#include <type_traits>
++
++#ifdef __HIP_PLATFORM_AMD__
++// HIP cooperative groups and runtime
++#include <hip/hip_runtime.h>
++#include <hip/hip_fp16.h>
++#include <hip/hip_cooperative_groups.h>
++// Note: hiprand not needed for reduce operations in norm kernel
++#else
++// CUDA cooperative groups
+ #if ((__CUDACC_VER_MAJOR__ > 11) || (__CUDACC_VER_MAJOR__ == 11 && __CUDACC_VER_MINOR__ >= 0))
+ #include <cooperative_groups/reduce.h>
+ #else
+@@ -25,9 +36,7 @@
+ #include <cuda_fp16.h>
+ #include <cuda_runtime.h>
+ #include <curand_kernel.h>
+-#include <float.h>
+-
+-#include <type_traits>
++#endif
+ 
+ #include "flashinfer/trtllm/common/cudaTypeUtils.cuh"
+ 
+@@ -74,7 +83,12 @@ __device__ inline void copy(void const* local, void* data) {
+ }
+ 
+ static float constexpr HALF_FLT_MAX = 65504.F;
++#ifdef __HIP_PLATFORM_AMD__
++// HIP AMD requires 64-bit mask for warp shuffle functions
++#define FINAL_MASK 0xffffffffffffffffULL
++#else
+ #define FINAL_MASK 0xffffffff
++#endif
+ 
+ template <typename T>
+ __inline__ __device__ T warpReduceSum(T val) {
+diff --git a/include/flashinfer/vec_dtypes.cuh b/include/flashinfer/vec_dtypes.cuh
+index 69f9a25b..53807440 100644
+--- a/include/flashinfer/vec_dtypes.cuh
++++ b/include/flashinfer/vec_dtypes.cuh
+@@ -20,28 +20,11 @@
+ #include <hip/hip_runtime.h>
+ #include <hip/hip_fp16.h>
+ #include <hip/hip_bfloat16.h>
++// Use amd_hip_bf16.h for __hip_bfloat16 types
++#include <hip/amd_detail/amd_hip_bf16.h>
+ #if __has_include(<hip/hip_fp8.h>)
+ #include <hip/hip_fp8.h>
+-#endif
+-#else
+-#include <cuda.h>
+-#include <cuda_bf16.h>
+-#include <cuda_fp16.h>
+-#include <cuda_fp8.h>
+-#if CUDA_VERSION >= 12080
+-#include <cuda_fp4.h>
+-#endif
+-#include <cuda_runtime.h>
+-#endif
+-
+-#include <type_traits>
+-
+-namespace flashinfer {
+-
+-// HIP compatibility: Define FP8 and BFloat16 type aliases
+-#ifdef __HIP_PLATFORM_AMD__
+-// FP8 type aliases
+-#if __has_include(<hip/hip_fp8.h>)
++// FP8 type aliases at global namespace (CUDA-compatible names)
+ using __nv_fp8_e4m3 = __hip_fp8_e4m3;
+ using __nv_fp8_e5m2 = __hip_fp8_e5m2;
+ using __nv_fp8x2_e4m3 = __hip_fp8x2_e4m3;
+@@ -59,12 +42,41 @@ using __nv_fp8_storage_t = unsigned char;
+ using __nv_fp8x2_storage_t = unsigned short;
+ using __nv_fp8x4_storage_t = unsigned int;
+ #endif
+-
+-// BFloat16 type aliases
+-using nv_bfloat16 = hip_bfloat16;
++// BFloat16 type aliases at global namespace
++using nv_bfloat16 = __hip_bfloat16;
+ using __nv_bfloat16 = __hip_bfloat16;
+ using nv_bfloat162 = __hip_bfloat162;
+ using __nv_bfloat162 = __hip_bfloat162;
++#else
++#include <cuda.h>
++#include <cuda_bf16.h>
++#include <cuda_fp16.h>
++#include <cuda_fp8.h>
++#if CUDA_VERSION >= 12080
++#include <cuda_fp4.h>
++#endif
++#include <cuda_runtime.h>
++#endif
++
++#include <type_traits>
++
++namespace flashinfer {
++
++// For HIP, import global namespace type aliases into flashinfer namespace
++#ifdef __HIP_PLATFORM_AMD__
++using ::__nv_fp8_e4m3;
++using ::__nv_fp8_e5m2;
++using ::__nv_fp8x2_e4m3;
++using ::__nv_fp8x2_e5m2;
++using ::__nv_fp8x4_e4m3;
++using ::__nv_fp8x4_e5m2;
++using ::__nv_fp8_storage_t;
++using ::__nv_fp8x2_storage_t;
++using ::__nv_fp8x4_storage_t;
++using ::nv_bfloat16;
++using ::__nv_bfloat16;
++using ::nv_bfloat162;
++using ::__nv_bfloat162;
+ 
+ // Avoid conflict with AMD's MASK1/MASK2 macros
+ #ifdef MASK1

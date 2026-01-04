@@ -1,0 +1,109 @@
+From 738c4f2db0037da356954695300b10c9c52f335f Mon Sep 17 00:00:00 2001
+From: xsun <sunxiao04@gmail.com>
+Date: Fri, 2 Jan 2026 21:13:46 +0000
+Subject: [PATCH 5/5] test: Add HIP matmul tests for AMD GPUs
+
+Extend HIP compatibility tests with matrix multiplication operations:
+- Basic mm tests with float16, bfloat16, float32 dtypes
+- Batched mm (bmm) tests with various batch sizes
+- Accuracy test comparing GPU results to CPU reference
+- Broadcast matmul test
+- Linear layer test
+
+All 34 tests pass on AMD MI300 (gfx942) using rocBLAS.
+
+AI-assisted development.
+---
+ tests/gemm/test_hip_basic.py | 77 ++++++++++++++++++++++++++++++++++++
+ 1 file changed, 77 insertions(+)
+
+diff --git a/tests/gemm/test_hip_basic.py b/tests/gemm/test_hip_basic.py
+index 37399d75..b962096e 100644
+--- a/tests/gemm/test_hip_basic.py
++++ b/tests/gemm/test_hip_basic.py
+@@ -190,5 +190,82 @@ class TestHIPJITCompilation:
+         print(f"  Generated HIP cflags: {cflags[:5]}...")
+ 
+ 
++@pytest.mark.skipif(not is_hip(), reason="Test only runs on AMD HIP")
++class TestHIPMatMul:
++    """Test matrix multiplication operations on HIP (via rocBLAS)."""
++
++    @pytest.mark.parametrize("m,n,k", [(32, 64, 128), (128, 256, 512), (1, 1024, 1024)])
++    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
++    def test_mm(self, m, n, k, dtype):
++        """Test basic matrix multiplication."""
++        a = torch.randn(m, k, device="cuda", dtype=dtype)
++        b = torch.randn(k, n, device="cuda", dtype=dtype)
++        c = torch.mm(a, b)
++        
++        assert c.shape == (m, n)
++        assert c.dtype == dtype
++        assert not torch.isnan(c).any(), "Result contains NaN"
++        assert not torch.isinf(c).any(), "Result contains Inf"
++
++    @pytest.mark.parametrize("batch", [1, 4, 16])
++    @pytest.mark.parametrize("m,n,k", [(32, 64, 128), (64, 128, 256)])
++    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
++    def test_bmm(self, batch, m, n, k, dtype):
++        """Test batched matrix multiplication."""
++        a = torch.randn(batch, m, k, device="cuda", dtype=dtype)
++        b = torch.randn(batch, k, n, device="cuda", dtype=dtype)
++        c = torch.bmm(a, b)
++        
++        assert c.shape == (batch, m, n)
++        assert c.dtype == dtype
++        assert not torch.isnan(c).any(), "Result contains NaN"
++        assert not torch.isinf(c).any(), "Result contains Inf"
++
++    def test_mm_accuracy(self):
++        """Test matrix multiplication accuracy against CPU reference."""
++        m, n, k = 64, 128, 256
++        
++        # Create inputs
++        a_cpu = torch.randn(m, k, dtype=torch.float32)
++        b_cpu = torch.randn(k, n, dtype=torch.float32)
++        
++        # CPU reference
++        c_ref = torch.mm(a_cpu, b_cpu)
++        
++        # GPU computation
++        a_gpu = a_cpu.to(device="cuda", dtype=torch.float16)
++        b_gpu = b_cpu.to(device="cuda", dtype=torch.float16)
++        c_gpu = torch.mm(a_gpu, b_gpu).float().cpu()
++        
++        # Check cosine similarity
++        cos_sim = F.cosine_similarity(
++            c_ref.reshape(-1), c_gpu.reshape(-1), dim=0
++        )
++        assert cos_sim > 0.99, f"Accuracy too low: {cos_sim}"
++        print(f"  MM accuracy (cos_sim): {cos_sim:.6f}")
++
++    def test_matmul_broadcast(self):
++        """Test matmul with broadcasting."""
++        # (batch, m, k) @ (k, n) -> (batch, m, n)
++        a = torch.randn(4, 32, 64, device="cuda", dtype=torch.float16)
++        b = torch.randn(64, 128, device="cuda", dtype=torch.float16)
++        c = torch.matmul(a, b)
++        
++        assert c.shape == (4, 32, 128)
++        assert not torch.isnan(c).any()
++
++    def test_linear_layer(self):
++        """Test nn.Linear which uses matmul internally."""
++        batch, in_features, out_features = 16, 512, 256
++        
++        linear = torch.nn.Linear(in_features, out_features, dtype=torch.float16, device="cuda")
++        x = torch.randn(batch, in_features, device="cuda", dtype=torch.float16)
++        y = linear(x)
++        
++        assert y.shape == (batch, out_features)
++        assert not torch.isnan(y).any()
++        print(f"  Linear layer works: {x.shape} -> {y.shape}")
++
++
+ if __name__ == "__main__":
+     pytest.main([__file__, "-v"])
+-- 
+2.34.1
+

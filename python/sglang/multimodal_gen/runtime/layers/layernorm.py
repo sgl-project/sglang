@@ -8,7 +8,6 @@ from typing import Optional, Tuple, Union
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from sgl_kernel import fused_add_rmsnorm, rmsnorm
 
 from sglang.jit_kernel.norm import can_use_fused_inplace_qknorm, fused_inplace_qknorm
 from sglang.multimodal_gen.runtime.layers.custom_op import CustomOp
@@ -17,7 +16,29 @@ from sglang.multimodal_gen.runtime.layers.triton_ops import (
     norm_infer,
     rms_norm_fn,
 )
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.common import get_bool_env_var
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+
+logger = init_logger(__name__)
+
+# Try to import FlashInfer RMSNorm (works on CUDA, experimental on HIP)
+_flashinfer_rmsnorm_available = False
+try:
+    from flashinfer.norm import rmsnorm as flashinfer_rmsnorm
+
+    _flashinfer_rmsnorm_available = True
+    logger.debug("FlashInfer RMSNorm available")
+except ImportError:
+    flashinfer_rmsnorm = None
+    logger.debug("FlashInfer RMSNorm not available")
+
+# Import sgl_kernel RMSNorm (CUDA only)
+try:
+    from sgl_kernel import fused_add_rmsnorm, rmsnorm
+except ImportError:
+    fused_add_rmsnorm = None
+    rmsnorm = None
 
 
 # Copied and adapted from sglang
@@ -126,8 +147,17 @@ class RMSNorm(CustomOp):
         x: torch.Tensor,
         residual: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        # ROCm builds of sgl-kernel do not expose rmsnorm custom ops yet.
-        return self.forward_native(x, residual)
+        # Try FlashInfer first (if built with HIP patches), fall back to Triton
+        if _flashinfer_rmsnorm_available:
+            if residual is not None:
+                x = x + residual
+                residual = x
+            out = flashinfer_rmsnorm(x, self.weight.data, self.variance_epsilon)
+            if residual is None:
+                return out
+            return out, residual
+        # Triton fallback - works well on AMD GPUs
+        return self.forward_triton(x, residual)
 
     def extra_repr(self) -> str:
         s = f"hidden_size={self.weight.data.size(0)}"

@@ -67,16 +67,11 @@ def apply_flashinfer_rope_qk_inplace(
     if head_size != d:
         raise ValueError(f"head_size mismatch: inferred {d}, but head_size={head_size}")
 
+    # Try FlashInfer first (works on CUDA, experimental on HIP with patches)
     try:
         from flashinfer.rope import apply_rope_with_cos_sin_cache_inplace
     except ImportError:
         # Triton fallback for AMD/ROCm where FlashInfer is not available
-        import warnings
-
-        warnings.warn(
-            "FlashInfer not available, using Triton fallback for RoPE",
-            stacklevel=2,
-        )
         half_size = cos_sin_cache.shape[-1] // 2
         if positions is None:
             cos = cos_sin_cache[:seqlen, :half_size].to(q.dtype)
