@@ -101,6 +101,13 @@ jobs:
             sccache_version: "v0.10.0"
             artifact_name: tree-results
             artifact_path: criterion/benchmark_summary*/
+          - name: Manual Policy
+            bench_name: manual_policy_benchmark
+            bench_args: ""
+            runner: ubuntu-latest
+            sccache_version: "v0.12.0"
+            artifact_name: manual-policy-results
+            artifact_path: criterion/manual_policy*/
     runs-on: ${{ matrix.runner }}
     steps:
       - name: Checkout code
@@ -247,6 +254,25 @@ jobs:
               echo "" >> summary.md
               echo '```' >> summary.md
               grep -A 50 "RADIX TREE BENCHMARK SUMMARY" "$TREE_DIR/benchmark_output.txt" | head -50 >> summary.md || cat "$TREE_DIR/benchmark_output.txt" | tail -50 >> summary.md
+              echo '```' >> summary.md
+              echo "</details>" >> summary.md
+            fi
+          else
+            echo "❌ Failed or skipped" >> summary.md
+          fi
+          echo "" >> summary.md
+
+          echo "### Manual Policy (Sticky Sessions)" >> summary.md
+          MANUAL_DIR="benchmark-results/manual-policy-results-${{ github.sha }}"
+          if [ -d "$MANUAL_DIR" ]; then
+            echo "✅ **Completed**" >> summary.md
+            if [ -f "$MANUAL_DIR/benchmark_output.txt" ]; then
+              echo "" >> summary.md
+              echo "<details>" >> summary.md
+              echo "<summary>View Results</summary>" >> summary.md
+              echo "" >> summary.md
+              echo '```' >> summary.md
+              cat "$MANUAL_DIR/benchmark_output.txt" | tail -100 >> summary.md
               echo '```' >> summary.md
               echo "</details>" >> summary.md
             fi
