@@ -30,6 +30,9 @@ from sglang.multimodal_gen.runtime.layers.triton_ops import (
     fuse_scale_shift_gate_select01_kernel,
     fuse_scale_shift_kernel,
 )
+from sglang.multimodal_gen.runtime.layers.elementwise import (
+    MulAdd,
+)
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.utils.layerwise_offload import OffloadableDiTMixin
@@ -669,6 +672,8 @@ class QwenImageTransformerBlock(nn.Module):
         self.txt_mlp = FeedForward(
             dim=dim, dim_out=dim, activation_fn="gelu-approximate"
         )
+        # Utils
+        self.fuse_mul_add = MulAdd()
 
     def _modulate(self, x, mod_params, index=None):
         shift, scale, gate = mod_params.chunk(3, dim=-1)
@@ -778,16 +783,16 @@ class QwenImageTransformerBlock(nn.Module):
             img_normed2, img_mod2, modulate_index
         )
         img_mlp_output = self.img_mlp(img_modulated2)
-        hidden_states = fuse_scale_shift_kernel(
-            img_mlp_output, img_gate2, hidden_states, scale_constant=0.0
+        hidden_states = self.fuse_mul_add(
+            img_mlp_output, img_gate2, hidden_states
         )
 
         # Process text stream - norm2 + MLP
         txt_normed2 = self.txt_norm2(encoder_hidden_states)
         txt_modulated2, txt_gate2 = self._modulate(txt_normed2, txt_mod2)
         txt_mlp_output = self.txt_mlp(txt_modulated2)
-        encoder_hidden_states = fuse_scale_shift_kernel(
-            txt_mlp_output, txt_gate2, encoder_hidden_states, scale_constant=0.0
+        encoder_hidden_states = self.fuse_mul_add(
+            txt_mlp_output, txt_gate2, encoder_hidden_states
         )
 
         # Clip to prevent overflow for fp16

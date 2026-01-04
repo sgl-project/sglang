@@ -30,8 +30,10 @@ from sglang.multimodal_gen.runtime.layers.layernorm import (
     FP32LayerNorm,
     LayerNormScaleShift,
     RMSNorm,
-    ScaleResidual,
     ScaleResidualLayerNormScaleShift,
+)
+from sglang.multimodal_gen.runtime.layers.elementwise import (
+    MulAdd,
 )
 from sglang.multimodal_gen.runtime.layers.linear import ReplicatedLinear
 from sglang.multimodal_gen.runtime.layers.mlp import MLP
@@ -318,7 +320,7 @@ class CausalWanTransformerBlock(nn.Module):
 
         # 3. Feed-forward
         self.ffn = MLP(dim, ffn_dim, act_type="gelu_pytorch_tanh")
-        self.mlp_residual = ScaleResidual()
+        self.mlp_residual = MulAdd()
 
         self.scale_shift_table = nn.Parameter(torch.randn(1, 6, dim) / dim**0.5)
 
@@ -417,7 +419,7 @@ class CausalWanTransformerBlock(nn.Module):
 
         # 3. Feed-forward
         ff_output = self.ffn(norm_hidden_states)
-        hidden_states = self.mlp_residual(hidden_states, ff_output, c_gate_msa)
+        hidden_states = self.mlp_residual(ff_output, c_gate_msa, hidden_states)
         hidden_states = hidden_states.to(orig_dtype)
 
         return hidden_states
