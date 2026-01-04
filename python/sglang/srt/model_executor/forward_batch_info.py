@@ -445,6 +445,7 @@ class ForwardBatch:
             dimensions=batch.dimensions,
             return_hidden_states_before_norm=batch.return_hidden_states_before_norm,
         )
+
         device = model_runner.device
 
         if batch.extend_input_logprob_token_ids is not None:
