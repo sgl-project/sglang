@@ -14,6 +14,7 @@ _cpasync = None
 _from_dlpack = None
 _cuda = None
 _compiled_kernels: Dict[Tuple, object] = {}
+_cu_seqlens_cache: Dict[Tuple, torch.Tensor] = {}
 TILE_K = 128
 TILE_V = 32
 TILE_V_PADDED = 36  # TILE_V + 4 for bank conflict free (128-bit aligned padding)
@@ -1500,7 +1501,17 @@ def cutedsl_fused_sigmoid_gating_delta_rule_update(
     else:
         o = q.new_empty(N, 1, HV, V, dtype=torch.bfloat16)
 
-    cu_seqlens_to_use = torch.arange(N + 1, dtype=torch.int32, device=q.device)
+    # Handle cu_seqlens
+    global _cu_seqlens_cache
+    if cu_seqlens is not None:
+        cu_seqlens_to_use = cu_seqlens
+    else:
+        cache_key = (N, str(q.device))
+        if cache_key not in _cu_seqlens_cache:
+            _cu_seqlens_cache[cache_key] = torch.arange(
+                N + 1, dtype=torch.int32, device=q.device
+            )
+        cu_seqlens_to_use = _cu_seqlens_cache[cache_key]
 
     cu_seqlens_tensor = from_dlpack(
         cu_seqlens_to_use.detach(), assumed_align=16
