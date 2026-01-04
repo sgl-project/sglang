@@ -29,6 +29,8 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
  ****************************************************************************************/
+#include "flash_attn.h"
+
 #include "common.h"
 #include "gemm.h"
 #include "vec.h"
@@ -41,57 +43,13 @@
 
 namespace {
 
-template <typename scalar_t>
-inline void fill_stub(scalar_t* __restrict__ out, float val, int size) {
-  using Vec = at::vec::Vectorized<scalar_t>;
-  constexpr int kVecSize = Vec::size();
-  const Vec data_vec = Vec(static_cast<scalar_t>(val));
-  int d = 0;
-#pragma GCC unroll 4
-  for (; d <= size - kVecSize; d += kVecSize) {
-    data_vec.store(out + d);
-  }
-  if (size - d > 0) {
-    data_vec.store(out + d, size - d);
-  }
-}
-
-template <typename scalar_t, int BLOCK_N>
-inline void copy_stub(scalar_t* __restrict__ out, const float* __restrict__ input) {
-  static_assert(BLOCK_N % 32 == 0);
-  using bVec = at::vec::Vectorized<scalar_t>;
-  using fVec = at::vec::Vectorized<float>;
-
-  constexpr int COLS = BLOCK_N / 16;
-  auto store = [&](auto i) {
-    constexpr int col = i % COLS;
-    // for COLS = 2, 4 use 512bit store
-    if constexpr (col % 2 == 0) {
-      fVec a_fvec0 = fVec::loadu(input + col * 16);
-      fVec a_fvec1 = fVec::loadu(input + col * 16 + 16);
-      bVec out_bvec = convert_from_float_ext<scalar_t>(a_fvec0, a_fvec1);
-      out_bvec.store(out + col * 16);
+template <typename T>
+void print_array(const T* data, int M, int N, int lda) {
+  for (int m = 0; m < M; ++m) {
+    for (int n = 0; n < N; ++n) {
+      std::cout << " " << float(data[m * lda + n]);
     }
-  };
-  Unroll<COLS>{}(store);
-}
-
-template <typename scalar_t>
-inline void copy_stub(scalar_t* __restrict__ out, const float* __restrict__ acc, float s, int size) {
-  using bVec = at::vec::Vectorized<scalar_t>;
-  using fVec = at::vec::Vectorized<float>;
-  constexpr int kVecSize = bVec::size();
-  const fVec s_fvec = fVec(s);
-  int d = 0;
-#pragma GCC unroll 4
-  for (; d <= size - kVecSize; d += kVecSize) {
-    fVec a_fvec0 = fVec::loadu(acc + d) * s_fvec;
-    fVec a_fvec1 = fVec::loadu(acc + d + fVec::size()) * s_fvec;
-    bVec out_bvec = convert_from_float_ext<scalar_t>(a_fvec0, a_fvec1);
-    out_bvec.store(out + d);
-  }
-  for (; d < size; ++d) {
-    out[d] = static_cast<scalar_t>(acc[d] * s);
+    std::cout << std::endl;
   }
 }
 
@@ -241,42 +199,8 @@ void flash_attn_varlen_kernel_impl(
           }
         }
 
-        const Vec scale_vec = Vec(sm_scale);
-        for (int row = 0; row < m_size; ++row) {
-          // s_i <- s_i * scale
-          at::vec::map<float>(
-              [scale_vec](Vec x) { return x * scale_vec; }, s_i + row * BLOCK_N, s_i + row * BLOCK_N, n_size);
-
-          // m_i: max value per row
-          float m_i = at::vec::reduce_all<float>(
-              [](Vec& x, Vec& y) { return at::vec::maximum(x, y); }, s_i + row * BLOCK_N, n_size);
-          m_i = std::max(m_i, m_prime[row]);
-
-          // m_delta <- exp(m' - m_i)
-          float m_delta = std::exp(m_prime[row] - m_i);
-
-          // s_delta <- exp(s_i - m_i)
-          at::vec::map<float>(
-              [m_i](Vec x) { return (x - Vec(m_i)).fexp_u20(); }, s_delta + row * BLOCK_N, s_i + row * BLOCK_N, n_size);
-
-          // s' <- s' * m_delta + sum(s_delta)
-          s_prime[row] *= m_delta;
-          s_prime[row] +=
-              at::vec::reduce_all<float>([](Vec& x, Vec& y) { return x + y; }, s_delta + row * BLOCK_N, n_size);
-
-          m_prime[row] = m_i;
-
-          // v' <- v' * m_delta
-          at::vec::map<float>(
-              [m_delta](Vec x) { return x * Vec(m_delta); },
-              v_prime + row * head_size_v,
-              v_prime + row * head_size_v,
-              head_size_v);
-
-          // pad s_delta with 0 first and then convert to scalar_t
-          fill_stub(s_delta + row * BLOCK_N + n_size, 0.f, padded_n_size - n_size);
-          copy_stub<scalar_t, BLOCK_N>(s_delta2 + row * BLOCK_N, s_delta + row * BLOCK_N);
-        }
+        flash_attn_softmax<scalar_t, BLOCK_M, BLOCK_N>::apply(
+            s_i, s_delta, s_delta2, v_prime, s_prime, m_prime, m_size, n_size, padded_n_size, head_size_v, sm_scale);
 
         // get value and pack
         pack_vnni2<scalar_t>(
@@ -315,6 +239,26 @@ void flash_attn_varlen_kernel_impl(
 }
 
 }  // anonymous namespace
+
+template <typename index_t>
+inline bool has_varlen_sequences(
+    const at::Tensor& cu_seqlens_q,
+    const at::Tensor& cu_seqlens_k,
+    int batches,
+    index_t max_seqlen_q,
+    index_t max_seqlen_k) {
+  const index_t* cu_seqlens_q_data = cu_seqlens_q.data_ptr<index_t>();
+  const index_t* cu_seqlens_k_data = cu_seqlens_k.data_ptr<index_t>();
+
+  for (int bs = 0; bs < batches; ++bs) {
+    index_t seqlen_q = cu_seqlens_q_data[bs + 1] - cu_seqlens_q_data[bs];
+    index_t seqlen_k = cu_seqlens_k_data[bs + 1] - cu_seqlens_k_data[bs];
+    if (seqlen_q != max_seqlen_q || seqlen_k != max_seqlen_k) {
+      return true;
+    }
+  }
+  return false;
+}
 
 template <int BLOCK_M, int BLOCK_N>
 inline int resize_buffer(at::Tensor& buffer, int num_threads, int head_size, int head_size_v) {
@@ -393,6 +337,11 @@ at::Tensor flash_attn_varlen_func(
 
   // softmax scale
   double sm_scale = 1.0 / std::sqrt(static_cast<double>(head_size));
+
+  // check whether the batch has variant lengths
+  const bool is_varlen =
+      has_varlen_sequences<int32_t>(cu_seqlens_q, cu_seqlens_k, num_seqs, max_seqlen_q, max_seqlen_k);
+  std::cout << "### flash_attn_varlen_func: is_varlen: " << (is_varlen ? " true" : "false") << std::endl;
 
   int num_threads = at::get_num_threads();
   at::Tensor buffer = at::empty({}, q.options().dtype(at::kChar));
