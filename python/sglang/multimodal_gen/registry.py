@@ -47,6 +47,7 @@ from sglang.multimodal_gen.configs.sample.hunyuan import (
     HunyuanSamplingParams,
 )
 from sglang.multimodal_gen.configs.sample.qwenimage import (
+    QwenImage2512SamplingParams,
     QwenImageEditPlusSamplingParams,
     QwenImageLayeredSamplingParams,
     QwenImageSamplingParams,
@@ -430,6 +431,11 @@ def _register_configs():
         sampling_param_cls=QwenImageSamplingParams,
         pipeline_config_cls=QwenImagePipelineConfig,
         hf_model_paths=["Qwen/Qwen-Image"],
+    )
+    register_configs(
+        sampling_param_cls=QwenImage2512SamplingParams,
+        pipeline_config_cls=QwenImagePipelineConfig,
+        hf_model_paths=["Qwen/Qwen-Image-2512"],
     )
     register_configs(
         sampling_param_cls=QwenImageSamplingParams,
