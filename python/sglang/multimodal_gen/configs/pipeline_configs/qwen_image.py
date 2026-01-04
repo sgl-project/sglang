@@ -6,7 +6,10 @@ from typing import Callable
 import torch
 
 from sglang.multimodal_gen.configs.models import DiTConfig, EncoderConfig, VAEConfig
-from sglang.multimodal_gen.configs.models.dits.qwenimage import QwenImageDitConfig
+from sglang.multimodal_gen.configs.models.dits.qwenimage import (
+    QwenImageDitConfig,
+    QwenImageEditPlus_2511_DitConfig,
+)
 from sglang.multimodal_gen.configs.models.encoders.qwen_image import Qwen2_5VLConfig
 from sglang.multimodal_gen.configs.models.vaes.qwenimage import QwenImageVAEConfig
 from sglang.multimodal_gen.configs.pipeline_configs.base import (
@@ -156,6 +159,7 @@ class QwenImagePipelineConfig(ImagePipelineConfig):
         # img_shapes: for global entire image
         img_freqs, txt_freqs = rotary_emb(img_shapes, txt_seq_lens, device=device)
 
+        # flashinfer RoPE expects a float32 cos/sin cache concatenated on the last dim
         img_cos_half = img_freqs.real.to(dtype=torch.float32).contiguous()
         img_sin_half = img_freqs.imag.to(dtype=torch.float32).contiguous()
         txt_cos_half = txt_freqs.real.to(dtype=torch.float32).contiguous()
@@ -414,7 +418,6 @@ class QwenImageEditPlusPipelineConfig(QwenImageEditPipelineConfig):
         assert batch_size == 1
         height = batch.height
         width = batch.width
-        image_size = batch.original_condition_image_size
 
         vae_scale_factor = self.get_vae_scale_factor()
 
@@ -474,6 +477,11 @@ class QwenImageEditPlusPipelineConfig(QwenImageEditPipelineConfig):
 
 
 @dataclass
+class QwenImageEditPlus_2511_PipelineConfig(QwenImageEditPlusPipelineConfig):
+    dit_config: DiTConfig = field(default_factory=QwenImageEditPlus_2511_DitConfig)
+
+
+@dataclass
 class QwenImageLayeredPipelineConfig(QwenImageEditPipelineConfig):
     resolution: int = 640  # TODO: allow user to set resolution
     vae_precision: str = "bf16"
@@ -492,31 +500,25 @@ class QwenImageLayeredPipelineConfig(QwenImageEditPipelineConfig):
         img_shapes = batch.img_shapes
         txt_seq_lens = batch.txt_seq_lens
 
-        (img_cos, img_sin), (txt_cos, txt_sin) = (
-            QwenImageEditPlusPipelineConfig.get_freqs_cis(
-                img_shapes, txt_seq_lens, rotary_emb, device, dtype
-            )
+        freqs_cis = QwenImageEditPlusPipelineConfig.get_freqs_cis(
+            img_shapes, txt_seq_lens, rotary_emb, device, dtype
         )
 
         # perform sp shard on noisy image tokens
         noisy_img_seq_len = (
             1 * (height // vae_scale_factor // 2) * (width // vae_scale_factor // 2)
         )
-        noisy_img_cos = shard_rotary_emb_for_sp(img_cos[:noisy_img_seq_len, :])
-        noisy_img_sin = shard_rotary_emb_for_sp(img_sin[:noisy_img_seq_len, :])
 
-        # concat back the img_cos for input image (since it is not sp-shared later)
-        img_cos = torch.cat([noisy_img_cos, img_cos[noisy_img_seq_len:, :]], dim=0).to(
-            device=device
-        )
-        img_sin = torch.cat([noisy_img_sin, img_sin[noisy_img_seq_len:, :]], dim=0).to(
-            device=device
-        )
+        img_cache, txt_cache = freqs_cis
+        noisy_img_cache = shard_rotary_emb_for_sp(img_cache[:noisy_img_seq_len, :])
+        img_cache = torch.cat(
+            [noisy_img_cache, img_cache[noisy_img_seq_len:, :]], dim=0
+        ).to(device=device)
 
         return {
             "txt_seq_lens": txt_seq_lens,
             "img_shapes": img_shapes,
-            "freqs_cis": ((img_cos, img_sin), (txt_cos, txt_sin)),
+            "freqs_cis": (img_cache, txt_cache),
             "additional_t_cond": torch.tensor([0], device=device, dtype=torch.long),
         }
 
