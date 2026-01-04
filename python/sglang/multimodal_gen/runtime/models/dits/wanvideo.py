@@ -879,6 +879,7 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
             # if teacache is enabled, we need to cache the original hidden states
             if self.enable_teacache:
                 self.maybe_cache_states(hidden_states, original_hidden_states)
+        self.cnt += 1
         # 5. Output norm, projection & unpatchify
         if temb.dim() == 3:
             # batch_size, seq_len, inner_dim (wan 2.2 ti2v)
@@ -961,7 +962,7 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
             teacache_thresh=ctx.teacache_thresh,
         )
 
-        self.cnt += 1
+        
         if self.is_cfg_negative:
             self.previous_modulated_input_negative = modulated_inp.clone()
         else:
