@@ -119,10 +119,12 @@ __global__ void fused_qknorm(const QKNormParams __grid_constant__ params) {
   PDLTriggerSecondary<kUsePDL>();  // launch secondary kernel
 }
 
-template <int64_t kHeadDim, bool kUsePDL>
+template <int64_t kHeadDim, bool kUsePDL, typename DType>
 struct QKNormKernel {
-  template <typename PackedFloat, typename Float>
-  static constexpr auto qknorm_kernel = fused_qknorm<kHeadDim, kUsePDL, PackedFloat, Float>;
+  using DType2 = host::PackedDType<DType, 2>::type;
+
+  // only initialize once (static variable) to avoid overhead
+  static constexpr auto kernel = fused_qknorm<kHeadDim, kUsePDL, DType2, DType>;
 
   static void
   run(const tvm::ffi::TensorView q,
@@ -177,19 +179,10 @@ struct QKNormKernel {
         .num_tokens = num_tokens,
     };
 
-    // only initialize once (static variable) to avoid overhead
-    static constexpr auto bf16_kernel = qknorm_kernel<nv_bfloat162, nv_bfloat16>;
-    static constexpr auto fp16_kernel = qknorm_kernel<half2, half>;
-    static const uint32_t kMaxOccupancyTable[2] = {
-        runtime::get_blocks_per_sm(fp16_kernel, kThreadsPerBlock),
-        runtime::get_blocks_per_sm(bf16_kernel, kThreadsPerBlock),
-    };
+    static const uint32_t max_occupancy = runtime::get_blocks_per_sm(kernel, kThreadsPerBlock);
     static const uint32_t kNumSM = runtime::get_sm_count(device.unwrap().device_id);
 
     // choose kernel based on dtype
-    const bool use_bf16 = dtype.is_type<nv_bfloat16>();
-    const auto kernel = use_bf16 ? bf16_kernel : fp16_kernel;
-    const auto max_occupancy = kMaxOccupancyTable[use_bf16 ? 1 : 0];
     const auto num_works = (num_qo_heads + num_kv_heads) * num_tokens;
     const auto needed_blocks = div_ceil(num_works, kWarpsPerBlock);
 
