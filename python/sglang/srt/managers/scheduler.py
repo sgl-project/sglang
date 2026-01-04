@@ -719,11 +719,15 @@ class Scheduler(
             and server_args.disaggregation_decode_enable_offload_kvcache
         ):
             if envs.SGLANG_ENABLE_DECODE_KVCACHE_OFFLOAD_DIRECT.get():
-                from sglang.srt.disaggregation.decode_kvcache_offload_manager import DecodeKVCacheOffloadManagerDirect
+                from sglang.srt.disaggregation.decode_kvcache_offload_manager import (
+                    DecodeKVCacheOffloadManagerDirect
+                )
 
                 offload_class = DecodeKVCacheOffloadManagerDirect
             else:
-                from sglang.srt.disaggregation.decode_kvcache_offload_manager import DecodeKVCacheOffloadManager
+                from sglang.srt.disaggregation.decode_kvcache_offload_manager import (
+                    DecodeKVCacheOffloadManager
+                )
 
                 offload_class = DecodeKVCacheOffloadManager
 

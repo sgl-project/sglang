@@ -55,7 +55,9 @@ class DecodeKVCacheOffloadManager:
         self.tp_group = tp_group
         self.tp_world_size = torch.distributed.get_world_size(group=self.tp_group)
         if envs.SGLANG_ENABLE_DECODE_KVCACHE_OFFLOAD_DIRECT.get():
-            from sglang.srt.mem_cache.cache_controller_direct import HiCacheControllerDirect
+            from sglang.srt.mem_cache.cache_controller_direct import (
+                HiCacheControllerDirect
+            )
 
             self.cache_controller = HiCacheControllerDirect(
                 params.token_to_kv_pool_allocator,
@@ -254,6 +256,7 @@ class DecodeKVCacheOffloadManager:
             last_hash = get_hash_str(page_tokens, last_hash)
             page_hashes.append(last_hash)
         return page_hashes
+
 
 class DecodeKVCacheOffloadManagerDirect(DecodeKVCacheOffloadManager):
     """Manage decode-side KV cache offloading into storage from HBM bypass DRAM lifecycle and operations."""
