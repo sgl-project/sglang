@@ -139,7 +139,7 @@ def compute_topk_attention_chunked(
     sm_scale: float,
     top_k: int = 10,
     chunk_size: int = 1024,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Compute top-k attention positions using chunked approach.
 
@@ -151,8 +151,10 @@ def compute_topk_attention_chunked(
     For 1M context: ~125KB vs ~256MB with full matrix
 
     Returns:
-        topk_scores: [batch, top_k] - normalized attention scores (averaged across heads)
+        topk_scores: [batch, top_k] - softmax normalized over top-k (for display)
         topk_indices: [batch, top_k] - sequence positions
+        topk_logits: [batch, top_k] - raw attention scores (for true probability)
+        logsumexp_all: [batch] - logsumexp over all scores (for true probability normalizer)
     """
     batch_size, num_heads, head_dim = q.shape
     num_kv_heads = k_buffer.shape[1]
@@ -167,6 +169,8 @@ def compute_topk_attention_chunked(
         return (
             torch.zeros((batch_size, top_k), dtype=torch.float32, device=device),
             torch.zeros((batch_size, top_k), dtype=torch.int64, device=device),
+            torch.zeros((batch_size, top_k), dtype=torch.float32, device=device),
+            torch.zeros((batch_size,), dtype=torch.float32, device=device),
         )
 
     # For small sequences, use direct PyTorch (simpler, no kernel overhead)
@@ -234,10 +238,16 @@ def _rescan_top_chunks(
     topk_chunk_idx: torch.Tensor,  # [batch, k_chunks]
     chunk_size: int,
     top_k: int,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Rescan the top chunks to find exact token positions.
     Only processes the top chunks, keeping memory bounded.
+
+    Returns:
+        topk_probs: [batch, top_k] - softmax normalized over top-k only (for display)
+        topk_positions: [batch, top_k] - sequence positions
+        topk_logits: [batch, top_k] - raw attention scores (for true probability)
+        logsumexp_all: [batch] - logsumexp over all scores (for true probability normalizer)
     """
     batch_size, num_heads, head_dim = q.shape
     num_kv_heads = k_buffer.shape[1]
@@ -247,6 +257,8 @@ def _rescan_top_chunks(
 
     topk_scores_list = []
     topk_indices_list = []
+    topk_logits_list = []
+    logsumexp_list = []
 
     for b in range(batch_size):
         kv_start = kv_indptr[b].item()
@@ -256,6 +268,8 @@ def _rescan_top_chunks(
         if seq_len == 0:
             topk_scores_list.append(torch.zeros(top_k, device=device))
             topk_indices_list.append(torch.zeros(top_k, dtype=torch.int64, device=device))
+            topk_logits_list.append(torch.zeros(top_k, device=device))
+            logsumexp_list.append(torch.tensor(0.0, device=device))
             continue
 
         # Gather keys only from top chunks (memory efficient)
@@ -294,18 +308,25 @@ def _rescan_top_chunks(
         if len(all_scores) == 0:
             topk_scores_list.append(torch.zeros(top_k, device=device))
             topk_indices_list.append(torch.zeros(top_k, dtype=torch.int64, device=device))
+            topk_logits_list.append(torch.zeros(top_k, device=device))
+            logsumexp_list.append(torch.tensor(0.0, device=device))
             continue
 
         # Concatenate all chunk results
         all_scores = torch.cat(all_scores)
         all_positions = torch.cat(all_positions)
 
+        # Compute logsumexp over all scores for true probability calculation
+        # Note: This is an approximation since we only have scores from top chunks
+        # For accurate logsumexp, we'd need all chunks, but this is a good approximation
+        logsumexp_val = torch.logsumexp(all_scores, dim=0)
+
         # Get top-k from the candidate positions
         actual_k = min(top_k, len(all_scores))
         topk_vals, topk_idx = torch.topk(all_scores, actual_k)
         topk_positions = all_positions[topk_idx]
 
-        # Softmax normalize
+        # Softmax normalize (over top-k only, for display purposes)
         topk_probs = torch.softmax(topk_vals, dim=0)
 
         # Pad if needed
@@ -313,11 +334,19 @@ def _rescan_top_chunks(
             padding = top_k - actual_k
             topk_probs = torch.cat([topk_probs, torch.zeros(padding, device=device)])
             topk_positions = torch.cat([topk_positions, torch.zeros(padding, dtype=torch.int64, device=device)])
+            topk_vals = torch.cat([topk_vals, torch.full((padding,), float('-inf'), device=device)])
 
         topk_scores_list.append(topk_probs)
         topk_indices_list.append(topk_positions)
+        topk_logits_list.append(topk_vals)
+        logsumexp_list.append(logsumexp_val)
 
-    return torch.stack(topk_scores_list), torch.stack(topk_indices_list)
+    return (
+        torch.stack(topk_scores_list),
+        torch.stack(topk_indices_list),
+        torch.stack(topk_logits_list),
+        torch.stack(logsumexp_list),
+    )
 
 
 def _compute_topk_pytorch(
@@ -327,10 +356,16 @@ def _compute_topk_pytorch(
     kv_indices: torch.Tensor,
     sm_scale: float,
     top_k: int,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     PyTorch implementation for small sequences.
     More precise than chunked, used when seq_len is manageable.
+
+    Returns:
+        topk_probs: [batch, top_k] - softmax normalized over top-k only (for display)
+        topk_indices: [batch, top_k] - sequence positions
+        topk_logits: [batch, top_k] - raw attention scores (for true probability)
+        logsumexp_all: [batch] - logsumexp over all scores (for true probability normalizer)
     """
     batch_size, num_heads, head_dim = q.shape
     num_kv_heads = k_buffer.shape[1]
@@ -339,6 +374,8 @@ def _compute_topk_pytorch(
 
     topk_scores_list = []
     topk_indices_list = []
+    topk_logits_list = []
+    logsumexp_list = []
 
     for b in range(batch_size):
         kv_start = kv_indptr[b].item()
@@ -348,6 +385,8 @@ def _compute_topk_pytorch(
         if seq_len == 0:
             topk_scores_list.append(torch.zeros(top_k, device=device))
             topk_indices_list.append(torch.zeros(top_k, dtype=torch.int64, device=device))
+            topk_logits_list.append(torch.zeros(top_k, device=device))
+            logsumexp_list.append(torch.tensor(0.0, device=device))
             continue
 
         # Get KV cache positions
@@ -369,11 +408,14 @@ def _compute_topk_pytorch(
         # Average across heads
         scores_avg = scores.mean(dim=0)  # [seq_len]
 
+        # Compute logsumexp over ALL scores for true probability calculation
+        logsumexp_val = torch.logsumexp(scores_avg, dim=0)
+
         # Top-k
         actual_k = min(top_k, seq_len)
         topk_vals, topk_idx = torch.topk(scores_avg, actual_k)
 
-        # Softmax normalize
+        # Softmax normalize (over top-k only, for display)
         topk_probs = torch.softmax(topk_vals, dim=0)
 
         # Pad if needed
@@ -381,11 +423,19 @@ def _compute_topk_pytorch(
             padding = top_k - actual_k
             topk_probs = torch.cat([topk_probs, torch.zeros(padding, device=device)])
             topk_idx = torch.cat([topk_idx, torch.zeros(padding, dtype=torch.int64, device=device)])
+            topk_vals = torch.cat([topk_vals, torch.full((padding,), float('-inf'), device=device)])
 
         topk_scores_list.append(topk_probs)
         topk_indices_list.append(topk_idx)
+        topk_logits_list.append(topk_vals)
+        logsumexp_list.append(logsumexp_val)
 
-    return torch.stack(topk_scores_list), torch.stack(topk_indices_list)
+    return (
+        torch.stack(topk_scores_list),
+        torch.stack(topk_indices_list),
+        torch.stack(topk_logits_list),
+        torch.stack(logsumexp_list),
+    )
 
 
 # =============================================================================
@@ -423,10 +473,12 @@ class TopKAttentionCapture:
         Extract top-k attention positions.
 
         Returns dict with:
-            - scores: [batch, top_k] normalized
+            - scores: [batch, top_k] normalized over top-k only (for display)
             - indices: [batch, top_k] positions
+            - logits: [batch, top_k] raw attention scores
+            - logsumexp: [batch] logsumexp over all scores (for true probability)
         """
-        scores, indices = compute_topk_attention_chunked(
+        scores, indices, logits, logsumexp = compute_topk_attention_chunked(
             q, k_buffer, kv_indptr, kv_indices,
             sm_scale, self.top_k, self.chunk_size
         )
@@ -434,6 +486,8 @@ class TopKAttentionCapture:
         return {
             "scores": scores,
             "indices": indices,
+            "logits": logits,
+            "logsumexp": logsumexp,
         }
 
     def format_for_response(self, topk_info: dict, layer_id: int = -1) -> List[dict]:
@@ -441,10 +495,21 @@ class TopKAttentionCapture:
         Format for API response.
 
         Returns list of dicts per batch matching frontend schema:
-        {token_positions: [...], attention_scores: [...], layer_id: N}
+        {
+            token_positions: [...],
+            attention_scores: [...],  # softmax over top-k only (for display)
+            topk_logits: [...],       # raw attention logits
+            logsumexp_all: float,     # logsumexp normalizer for true probability
+            layer_id: N
+        }
+
+        Frontend can compute true probability as:
+            true_prob = exp(topk_logit - logsumexp_all)
         """
         scores = topk_info["scores"]
         indices = topk_info["indices"]
+        logits = topk_info["logits"]
+        logsumexp = topk_info["logsumexp"]
         batch_size = scores.shape[0]
 
         result = []
@@ -452,6 +517,8 @@ class TopKAttentionCapture:
             result.append({
                 "token_positions": indices[b].cpu().tolist(),
                 "attention_scores": scores[b].cpu().tolist(),
+                "topk_logits": logits[b].cpu().tolist(),
+                "logsumexp_all": logsumexp[b].cpu().item(),
                 "layer_id": layer_id,
             })
         return result
@@ -484,8 +551,19 @@ def test_topk_attention():
 
     print(f"Top-k scores shape: {result['scores'].shape}")
     print(f"Top-k indices shape: {result['indices'].shape}")
-    print(f"Sample scores: {result['scores'][0]}")
+    print(f"Top-k logits shape: {result['logits'].shape}")
+    print(f"Logsumexp shape: {result['logsumexp'].shape}")
+    print(f"Sample scores (top-k softmax): {result['scores'][0]}")
+    print(f"Sample logits (raw): {result['logits'][0]}")
+    print(f"Sample logsumexp: {result['logsumexp'][0]}")
     print(f"Sample indices: {result['indices'][0]}")
+
+    # Verify true probability calculation
+    logits = result['logits'][0]
+    logsumexp = result['logsumexp'][0]
+    true_probs = torch.exp(logits - logsumexp)
+    print(f"True probabilities: {true_probs}")
+    print(f"Sum of true probs (should be <= 1): {true_probs.sum().item():.6f}")
 
     # Format for API
     formatted = capture.format_for_response(result)

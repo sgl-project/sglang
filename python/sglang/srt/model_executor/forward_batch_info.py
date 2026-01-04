@@ -234,10 +234,14 @@ class AttentionTokenInfo:
 
     # Top-k token positions with highest attention scores [batch, top_k]
     token_positions: torch.Tensor
-    # Corresponding normalized attention scores [batch, top_k]
+    # Corresponding normalized attention scores [batch, top_k] (softmax over top-k only)
     attention_scores: torch.Tensor
     # Which layer this came from (-1 = aggregated across layers)
     layer_id: int = -1
+    # Raw attention logits before softmax [batch, top_k] (for true probability calculation)
+    topk_logits: Optional[torch.Tensor] = None
+    # Logsumexp over all attention scores [batch] (normalizer for true probability)
+    logsumexp_all: Optional[torch.Tensor] = None
 
 
 @dataclass

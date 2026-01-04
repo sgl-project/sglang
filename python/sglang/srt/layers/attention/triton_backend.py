@@ -1075,7 +1075,7 @@ class TritonAttnBackend(AttentionBackend):
         from sglang.srt.model_executor.forward_batch_info import AttentionTokenInfo
 
         try:
-            topk_scores, topk_indices = compute_topk_attention_chunked(
+            topk_scores, topk_indices, topk_logits, logsumexp_all = compute_topk_attention_chunked(
                 q,
                 k_buffer,
                 kv_indptr,
@@ -1088,6 +1088,8 @@ class TritonAttnBackend(AttentionBackend):
             forward_batch.attention_token_info = AttentionTokenInfo(
                 token_positions=topk_indices,
                 attention_scores=topk_scores,
+                topk_logits=topk_logits,
+                logsumexp_all=logsumexp_all,
                 layer_id=layer_id,
             )
         except Exception as e:
