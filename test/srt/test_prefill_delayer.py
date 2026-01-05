@@ -63,6 +63,7 @@ class TestPrefillDelayerThroughputOfflineGen(CustomTestCase):
             ],
         )
 
+
 def _run_throughput_test(
     debug_name: str,
     prefill_delayer: bool,
