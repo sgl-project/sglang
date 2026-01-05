@@ -536,6 +536,11 @@ class SemanticMemory:
         # Updated by sidecar after fingerprint analysis
         self.manifold_zone: Optional[str] = None  # e.g., "semantic_bridge", "syntax_floor"
         self.manifold_confidence: float = 0.0
+        self.cluster_id: Optional[int] = None  # Cluster assignment from sidecar
+
+        # Dynamic capture control from sidecar
+        self.attention_stride: Optional[int] = None  # Override stride for next steps
+        self.max_attention_steps: Optional[int] = None  # Override max steps
 
         # Steering history: track applied modifications for debugging
         self.steering_history: List[Dict] = []
@@ -568,7 +573,9 @@ class SemanticMemory:
     def update_from_sidecar(self, sidecar_response: Dict):
         """Update memory state from sidecar analysis response.
 
-        Expected sidecar_response format:
+        Supports both legacy format and schema v1:
+
+        Legacy format:
         {
             "manifold_zone": "semantic_bridge",
             "manifold_confidence": 0.92,
@@ -577,22 +584,71 @@ class SemanticMemory:
             "next_capture_layers": [8, 16, 24],
             "anchors": {pos: (label, score)},
         }
+
+        Schema v1 format:
+        {
+            "schema_version": 1,
+            "manifold": {
+                "zone": "semantic_bridge",
+                "cluster_id": 12,
+                "cluster_conf": 0.92
+            },
+            "control": {
+                "next_capture_layer_ids": [8, 16, 24],
+                "attention_stride": 4,
+                "max_attention_steps": 256,
+                "attention_biases": {layer_id: {pos: bias}},
+                "hub_tokens": [42, 128, 256]
+            }
+        }
         """
-        if "manifold_zone" in sidecar_response:
-            self.manifold_zone = sidecar_response["manifold_zone"]
-        if "manifold_confidence" in sidecar_response:
-            self.manifold_confidence = sidecar_response["manifold_confidence"]
-        if "hub_tokens" in sidecar_response:
-            self.hub_tokens = sidecar_response["hub_tokens"]
-        if "next_capture_layers" in sidecar_response:
-            self.next_capture_layers = sidecar_response["next_capture_layers"]
-        if "suggested_biases" in sidecar_response:
-            for layer_id, pos_biases in sidecar_response["suggested_biases"].items():
-                for pos, bias in pos_biases.items():
-                    self.add_attention_bias(int(layer_id), int(pos), float(bias))
-        if "anchors" in sidecar_response:
-            for pos, (label, score) in sidecar_response["anchors"].items():
-                self.set_semantic_anchor(int(pos), label, float(score))
+        # Detect schema version
+        schema_version = sidecar_response.get("schema_version", 0)
+
+        if schema_version >= 1:
+            # Schema v1: nested manifold and control objects
+            manifold = sidecar_response.get("manifold", {})
+            control = sidecar_response.get("control", {})
+
+            # Manifold state
+            if "zone" in manifold:
+                self.manifold_zone = manifold["zone"]
+            if "cluster_conf" in manifold:
+                self.manifold_confidence = manifold["cluster_conf"]
+            if "cluster_id" in manifold:
+                self.cluster_id = manifold["cluster_id"]
+
+            # Control signals
+            if "next_capture_layer_ids" in control:
+                self.next_capture_layers = control["next_capture_layer_ids"]
+            if "attention_stride" in control:
+                self.attention_stride = control["attention_stride"]
+            if "max_attention_steps" in control:
+                self.max_attention_steps = control["max_attention_steps"]
+            if "hub_tokens" in control:
+                self.hub_tokens = control["hub_tokens"]
+            if "attention_biases" in control:
+                for layer_id, pos_biases in control["attention_biases"].items():
+                    for pos, bias in pos_biases.items():
+                        self.add_attention_bias(int(layer_id), int(pos), float(bias))
+
+        else:
+            # Legacy format: flat structure
+            if "manifold_zone" in sidecar_response:
+                self.manifold_zone = sidecar_response["manifold_zone"]
+            if "manifold_confidence" in sidecar_response:
+                self.manifold_confidence = sidecar_response["manifold_confidence"]
+            if "hub_tokens" in sidecar_response:
+                self.hub_tokens = sidecar_response["hub_tokens"]
+            if "next_capture_layers" in sidecar_response:
+                self.next_capture_layers = sidecar_response["next_capture_layers"]
+            if "suggested_biases" in sidecar_response:
+                for layer_id, pos_biases in sidecar_response["suggested_biases"].items():
+                    for pos, bias in pos_biases.items():
+                        self.add_attention_bias(int(layer_id), int(pos), float(bias))
+            if "anchors" in sidecar_response:
+                for pos, (label, score) in sidecar_response["anchors"].items():
+                    self.set_semantic_anchor(int(pos), label, float(score))
 
     def get_layer_biases(self, layer_id: int) -> Dict[int, float]:
         """Get attention biases for a specific layer."""
@@ -2333,12 +2389,27 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         attention_top_k = 5
         capture_layers: Optional[List[int]] = None  # Normalized layer selection
 
-        stride = self.attention_tokens_stride
-        max_tokens = self.attention_tokens_max
+        # Default stride/max from batch settings
+        default_stride = self.attention_tokens_stride
+        default_max_tokens = self.attention_tokens_max
 
         for req in self.reqs:
             if not getattr(req, "return_attention_tokens", False):
                 continue
+
+            # Check for sidecar overrides in semantic_memory
+            semantic_memory = getattr(req, "semantic_memory", None)
+            stride = default_stride
+            max_tokens = default_max_tokens
+
+            if semantic_memory is not None:
+                # Sidecar can dynamically adjust capture frequency
+                sm_stride = getattr(semantic_memory, "attention_stride", None)
+                if sm_stride is not None:
+                    stride = sm_stride
+                sm_max = getattr(semantic_memory, "max_attention_steps", None)
+                if sm_max is not None:
+                    max_tokens = sm_max
 
             # Check if this request needs capture on its NEXT decode step
             # (we pre-check here, step will be incremented in output processor)
