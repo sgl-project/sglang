@@ -32,8 +32,7 @@ from sglang.srt.managers.schedule_batch import BaseFinishReason
 from sglang.srt.multimodal.mm_utils import has_valid_data
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.utils import ImageData
-import ctypes
-import torch
+
 # Handle serialization of Image for pydantic
 if TYPE_CHECKING:
     from PIL.Image import Image
@@ -749,8 +748,6 @@ class TokenizedGenerateReqInput(BaseReq):
 
     need_wait_for_image: bool = False
     num_items_assigned: Optional[List] = None
-
-    send_time = None
 
 
 @dataclass

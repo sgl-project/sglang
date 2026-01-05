@@ -7,6 +7,7 @@ import hashlib
 import pickle
 from abc import abstractmethod
 from collections import defaultdict
+from multiprocessing import shared_memory
 from typing import Any, Callable, Dict, List, Literal, Optional, Tuple
 
 import numpy as np
@@ -26,9 +27,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import flatten_nested_list, is_npu, print_warning_once
 from sglang.utils import logger
-from sglang.srt.managers.io_struct import TokenizedGenerateReqInput
-import ctypes
-import time
+
 _is_npu = is_npu()
 
 # NOTE: Using the shared logger from sglang.utils instead of creating a module-specific logger
@@ -1462,52 +1461,71 @@ def get_new_expanded_mm_items(original_mm_items):
         else:
             expanded_mm_items.append(item)
     return expanded_mm_items
-class ZeroCopyMMData:
+
+
+class ShmPointerMMData:
+    """
+    Wraps a tensor to be sent via a shared memory handle.
+    This acts as a "pointer" to the tensor data across process boundaries.
+    """
+
     def __init__(self, tensor: torch.Tensor):
-        if tensor.is_cuda:
-            tensor = tensor.cpu()
-        if not tensor.is_contiguous():
-            tensor = tensor.contiguous()
-        self.tensor = tensor
+        self.cpu_tensor = tensor.cpu().contiguous()
+        self.shape = self.cpu_tensor.shape
+        self.dtype = self.cpu_tensor.dtype
+
+        nbytes = self.cpu_tensor.numel() * self.cpu_tensor.element_size()
+
+        self.shm = shared_memory.SharedMemory(create=True, size=nbytes)
+
+        try:
+            shm_view = np.ndarray((nbytes,), dtype=np.uint8, buffer=self.shm.buf)
+
+            shm_view[:] = self.cpu_tensor.view(torch.uint8).numpy().flatten()
+        finally:
+            self.shm.close()
 
     def __getstate__(self):
-        data_ptr = self.tensor.data_ptr()
-        total_bytes = self.tensor.numel() * self.tensor.element_size()
-        
-        raw_ptr_obj = (ctypes.c_char * total_bytes).from_address(data_ptr)
-        
-        mview = memoryview(raw_ptr_obj)
-        
         return {
-            "data": pickle.PickleBuffer(mview),
-            "shape": self.tensor.shape,
-            "dtype": self.tensor.dtype,
+            "shm_name": self.shm.name,
+            "shape": self.shape,
+            "dtype": self.dtype,
         }
 
     def __setstate__(self, state):
+        self.shm_name = state["shm_name"]
 
-        self.tensor = torch.frombuffer(
-            state["data"], 
-            dtype=state["dtype"]
-        ).reshape(state["shape"])
+        shm_handle = shared_memory.SharedMemory(name=self.shm_name)
+        try:
+            self.tensor = (
+                torch.frombuffer(shm_handle.buf, dtype=state["dtype"])
+                .reshape(state["shape"])
+                .clone()
+            )
+        finally:
+            shm_handle.close()
+            shm_handle.unlink()
 
-def wrap_zero_copy_features(obj):
+
+def wrap_shm_features(obj):
+    """
+    Scan the object for multimodal tensors and wrap them in SHM pointers.
+    """
     if hasattr(obj, "mm_inputs") and obj.mm_inputs:
         mm_items = obj.mm_inputs.get("mm_items", [])
         for item in mm_items:
             if hasattr(item, "feature") and isinstance(item.feature, torch.Tensor):
-                item.feature = ZeroCopyMMData(item.feature)
+                item.feature = ShmPointerMMData(item.feature)
     return obj
 
-def unwrap_mm_features(obj):
-    """Unwrap ZeroCopyMMData back into Tensors after receiving."""
-    if not isinstance(obj, TokenizedGenerateReqInput):
-        return obj
+
+def unwrap_shm_features(obj):
+    """
+    Restore ShmPointerMMData wrappers back into standard torch.Tensors.
+    """
     if hasattr(obj, "mm_inputs") and obj.mm_inputs:
         mm_items = obj.mm_inputs.get("mm_items", [])
         for item in mm_items:
-            if isinstance(item.feature, ZeroCopyMMData):
-                # Restore the original tensor object
+            if isinstance(item.feature, ShmPointerMMData):
                 item.feature = item.feature.tensor
-
     return obj
