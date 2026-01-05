@@ -217,8 +217,8 @@ pub(super) fn prepare_mcp_payload_for_streaming(
         }
 
         // Build function tools for all discovered MCP tools
-        let mut tools_json = Vec::new();
         let tools = active_mcp.list_tools();
+        let mut tools_json = Vec::with_capacity(tools.len());
         for t in tools {
             let parameters = Value::Object((*t.input_schema).clone());
             let tool = serde_json::json!({
@@ -252,7 +252,8 @@ pub(super) fn build_resume_payload(
         .ok_or_else(|| "payload not an object".to_string())?;
 
     // Build input array: start with original user input
-    let mut input_array = Vec::new();
+    // Pre-allocate: 1 for user message + conversation history
+    let mut input_array = Vec::with_capacity(1 + conversation_history.len());
 
     // Add original user message
     // For structured input, serialize the original input items
