@@ -7,6 +7,7 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     SetLoraReq,
     UnmergeLoraWeightsReq,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 from sglang.multimodal_gen.runtime.scheduler_client import async_scheduler_client
 from sglang.multimodal_gen.runtime.server_args import get_global_server_args
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -17,15 +18,11 @@ logger = init_logger(__name__)
 
 async def _handle_lora_request(req: Any, success_msg: str, failure_msg: str):
     try:
-        response = await async_scheduler_client.forward(req)
-        if isinstance(response, dict) and response.get("status") == "ok":
+        output: OutputBatch = await async_scheduler_client.forward(req)
+        if output.error is None:
             return {"status": "ok", "message": success_msg}
         else:
-            error_msg = (
-                response.get("message", "Unknown error")
-                if isinstance(response, dict)
-                else "Unknown response format"
-            )
+            error_msg = output.error
             raise HTTPException(status_code=500, detail=f"{failure_msg}: {error_msg}")
     except Exception as e:
         if isinstance(e, HTTPException):
