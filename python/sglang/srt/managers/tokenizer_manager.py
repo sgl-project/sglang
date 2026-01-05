@@ -69,10 +69,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightFromDiskReqOutput,
     WatchLoadUpdateReq,
 )
-from sglang.srt.managers.mm_utils import (
-    TensorTransportMode,
-    wrap_shm_features,
-)
+from sglang.srt.managers.mm_utils import TensorTransportMode, wrap_shm_features
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
 from sglang.srt.managers.request_metrics_exporter import RequestMetricsExporterManager
 from sglang.srt.managers.schedule_batch import MultimodalDataItem, RequestStage
