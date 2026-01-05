@@ -1,0 +1,25 @@
+[project]
+name = "sgl-model-gateway-e2e-tests"
+version = "0.1.0"
+description = "E2E tests for sgl-model-gateway"
+requires-python = ">=3.9"
+
+dependencies = [
+  "httpx",
+  "openai",
+  "pytest",
+  "pytest-rerunfailures",
+]
+
+[project.optional-dependencies]
+dev = [
+  "ruff",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["."]
+markers = [
+  "e2e: mark test as end-to-end test requiring GPU workers",
+  "slow: mark test as slow-running",
+]
+addopts = "-v"
