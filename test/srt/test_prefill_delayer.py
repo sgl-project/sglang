@@ -16,21 +16,15 @@ from sglang.test.test_utils import (
 )
 
 
-class TestPrefillDelayerThroughput(CustomTestCase):
-    def test_1_online_serving_has_prefill_delayer(self):
-        self._run_throughput_test_online_serving(prefill_delayer=True)
+class TestPrefillDelayerThroughputOnlineServing(CustomTestCase):
+    def test_1_has_prefill_delayer(self):
+        self._run(prefill_delayer=True)
 
-    def test_2_online_serving_no_prefill_delayer(self):
-        self._run_throughput_test_online_serving(prefill_delayer=False)
+    def test_2_no_prefill_delayer(self):
+        self._run(prefill_delayer=False)
 
-    def test_3_offline_gen_has_prefill_delayer(self):
-        self._run_throughput_test_offline_gen(prefill_delayer=True)
-
-    def test_4_offline_gen_no_prefill_delayer(self):
-        self._run_throughput_test_offline_gen(prefill_delayer=False)
-
-    def _run_throughput_test_online_serving(self, prefill_delayer: bool):
-        self._run_throughput_test(
+    def _run(self, prefill_delayer: bool):
+        _run_throughput_test(
             debug_name=f"online_serving ({prefill_delayer=})",
             prefill_delayer=prefill_delayer,
             other_launch_args=[
@@ -46,8 +40,16 @@ class TestPrefillDelayerThroughput(CustomTestCase):
             ),
         )
 
-    def _run_throughput_test_offline_gen(self, prefill_delayer: bool):
-        self._run_throughput_test(
+
+class TestPrefillDelayerThroughputOfflineGen(CustomTestCase):
+    def test_1_has_prefill_delayer(self):
+        self._run(prefill_delayer=True)
+
+    def test_2_no_prefill_delayer(self):
+        self._run(prefill_delayer=False)
+
+    def _run(self, prefill_delayer: bool):
+        _run_throughput_test(
             debug_name=f"offline_gen ({prefill_delayer=})",
             prefill_delayer=prefill_delayer,
             other_benchmark_args=dict(
@@ -61,37 +63,36 @@ class TestPrefillDelayerThroughput(CustomTestCase):
             ],
         )
 
-    def _run_throughput_test(
-        self,
-        debug_name: str,
-        prefill_delayer: bool,
-        other_launch_args,
-        other_benchmark_args,
-    ):
-        model = "Qwen/Qwen3-0.6B"
-        base_url = DEFAULT_URL_FOR_TEST
+def _run_throughput_test(
+    debug_name: str,
+    prefill_delayer: bool,
+    other_launch_args,
+    other_benchmark_args,
+):
+    model = "Qwen/Qwen3-0.6B"
+    base_url = DEFAULT_URL_FOR_TEST
 
-        process = _launch_server(
-            prefill_delayer=prefill_delayer,
-            model=model,
+    process = _launch_server(
+        prefill_delayer=prefill_delayer,
+        model=model,
+        base_url=base_url,
+        other_args=other_launch_args,
+    )
+
+    try:
+        args = get_benchmark_args(
             base_url=base_url,
-            other_args=other_launch_args,
+            dataset_name="random",
+            tokenizer=model,
+            **other_benchmark_args,
         )
+        res = run_benchmark(args)
+    finally:
+        kill_process_tree(process.pid)
 
-        try:
-            args = get_benchmark_args(
-                base_url=base_url,
-                dataset_name="random",
-                tokenizer=model,
-                **other_benchmark_args,
-            )
-            res = run_benchmark(args)
-        finally:
-            kill_process_tree(process.pid)
-
-        print(f"=== {debug_name} ===")
-        print(f"Input throughput: {res['input_throughput']:.2f} token/s")
-        print(f"Output throughput: {res['output_throughput']:.2f} token/s")
+    print(f"=== {debug_name} ===")
+    print(f"Input throughput: {res['input_throughput']:.2f} token/s")
+    print(f"Output throughput: {res['output_throughput']:.2f} token/s")
 
 
 class TestPrefillDelayerAccuracy(CustomTestCase):
