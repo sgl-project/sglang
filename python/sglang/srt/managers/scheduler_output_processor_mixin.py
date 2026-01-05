@@ -636,7 +636,7 @@ class SchedulerOutputProcessorMixin:
 
                     # Stream to sidecar if configured
                     sidecar_url = getattr(self.server_args, "attention_sidecar_url", "")
-                    if sidecar_url and hasattr(self, '_fingerprint_publisher'):
+                    if sidecar_url:
                         self._stream_fingerprint_to_sidecar(
                             request_id=req.rid,
                             fingerprint=fingerprint_info["fingerprint"],
@@ -1653,9 +1653,9 @@ class SchedulerOutputProcessorMixin:
                 self._zmq_context = zmq.Context()
 
             self._feedback_subscriber = self._zmq_context.socket(zmq.PULL)
-            self._feedback_subscriber.bind(feedback_url)
+            self._feedback_subscriber.connect(feedback_url)  # Connect to sidecar's PUSH socket
             self._feedback_subscriber.setsockopt(zmq.RCVHWM, 1000)  # High water mark
-            logger.info(f"Listening for sidecar feedback on {feedback_url}")
+            logger.info(f"Connected to sidecar feedback on {feedback_url}")
         except ImportError:
             logger.warning("ZMQ not available, feedback channel disabled")
             self._feedback_subscriber = None

@@ -1303,6 +1303,122 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
         self._cutlass_buffers_ready = True
 
+    def apply_with_router_logits(
+        self,
+        layer: torch.nn.Module,
+        dispatch_output: StandardDispatchOutput,
+    ) -> torch.Tensor:
+        x = dispatch_output.hidden_states
+        topk_output = dispatch_output.topk_output
+
+        activation = self.moe_runner_config.activation
+        routed_scaling_factor = self.moe_runner_config.routed_scaling_factor
+
+        from flashinfer.fused_moe import (
+            trtllm_fp8_block_scale_moe,
+            trtllm_fp8_per_tensor_scale_moe,
+        )
+
+        from sglang.srt.layers.moe.topk import TopKOutputChecker
+        from sglang.srt.layers.moe.utils import RoutingMethodType
+
+        assert TopKOutputChecker.format_is_bypassed(topk_output)
+        router_logits = topk_output.router_logits
+        topk_config = topk_output.topk_config
+        assert (
+            activation == "silu"
+        ), "Only silu is supported for flashinfer blockscale fp8 moe"
+
+        if self.block_quant:
+            a_q, a_sf = per_token_group_quant_fp8(
+                x, self.quant_config.weight_block_size[1]
+            )
+            # NOTE: scales of hidden states have to be transposed!
+            a_sf_t = a_sf.t().contiguous()
+        else:
+            a_q, _ = scaled_fp8_quant(x, layer.w13_input_scale)
+
+        correction_bias = (
+            None
+            if topk_config.correction_bias is None
+            else topk_config.correction_bias.to(x.dtype)
+        )
+
+        routing_method_type = getattr(
+            layer, "routing_method_type", RoutingMethodType.DeepSeekV3
+        )
+
+        with use_symmetric_memory(
+            get_tp_group(), disabled=not is_allocation_symmetric()
+        ):
+
+            if self.block_quant:
+                # FIXME: there is a bug in the trtllm_fp8_block_scale_moe.
+                # It ignored the `output`` argument. https://github.com/flashinfer-ai/flashinfer/blob/da01b1bd8f9f22aec8c0eea189ad54860b034947/flashinfer/fused_moe/core.py#L1323-L1325
+                # so we put the whole function under the ``use_symmetric_memory`` context manager.
+                # If the bug is fixed, we can only put the output tensor allocation under the context manager.
+                return trtllm_fp8_block_scale_moe(
+                    routing_logits=(
+                        router_logits.to(torch.float32)
+                        if routing_method_type == RoutingMethodType.DeepSeekV3
+                        else router_logits
+                    ),
+                    routing_bias=correction_bias,
+                    hidden_states=a_q,
+                    hidden_states_scale=a_sf_t,
+                    gemm1_weights=layer.w13_weight,
+                    gemm1_weights_scale=layer.w13_weight_scale_inv,
+                    gemm2_weights=layer.w2_weight,
+                    gemm2_weights_scale=layer.w2_weight_scale_inv,
+                    num_experts=layer.num_experts,
+                    top_k=topk_config.top_k,
+                    n_group=topk_config.num_expert_group,
+                    topk_group=topk_config.topk_group,
+                    intermediate_size=layer.w2_weight.shape[2],
+                    local_expert_offset=layer.moe_ep_rank * layer.num_local_experts,
+                    local_num_experts=layer.num_local_experts,
+                    routed_scaling_factor=(
+                        routed_scaling_factor
+                        if routed_scaling_factor is not None
+                        else 1.0
+                    ),
+                    routing_method_type=routing_method_type,
+                    use_shuffled_weight=False,
+                    tune_max_num_tokens=next_power_of_2(a_q.shape[0]),
+                )
+            else:
+                routing_bias_cast = (
+                    None
+                    if correction_bias is None
+                    else correction_bias.to(torch.bfloat16)
+                )
+
+                return trtllm_fp8_per_tensor_scale_moe(
+                    routing_logits=router_logits.to(torch.bfloat16),
+                    routing_bias=routing_bias_cast,
+                    hidden_states=a_q,
+                    gemm1_weights=layer.w13_weight,
+                    output1_scales_scalar=layer.output1_scales_scalar,
+                    output1_scales_gate_scalar=layer.output1_scales_gate_scalar,
+                    gemm2_weights=layer.w2_weight,
+                    output2_scales_scalar=layer.output2_scales_scalar,
+                    num_experts=layer.num_experts,
+                    top_k=topk_config.top_k,
+                    n_group=topk_config.num_expert_group,
+                    topk_group=topk_config.topk_group,
+                    intermediate_size=layer.w2_weight.shape[2],
+                    local_expert_offset=layer.moe_ep_rank * layer.num_local_experts,
+                    local_num_experts=layer.num_local_experts,
+                    routed_scaling_factor=(
+                        routed_scaling_factor
+                        if routed_scaling_factor is not None
+                        else 1.0
+                    ),
+                    use_routing_scales_on_input=False,
+                    routing_method_type=routing_method_type,
+                    tune_max_num_tokens=next_power_of_2(a_q.shape[0]),
+                )
+
     def maybe_apply_hip_fused_experts(
         self,
         layer: torch.nn.Module,

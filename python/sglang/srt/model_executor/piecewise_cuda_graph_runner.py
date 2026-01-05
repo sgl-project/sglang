@@ -375,6 +375,9 @@ class PiecewiseCudaGraphRunner:
             ):
                 if start_len is not None and start_len < seq_len:
                     return False
+        # Attention capture requires dynamic computation that cannot be replayed
+        if getattr(forward_batch, "capture_attention_tokens", False):
+            return False
         if num_tokens <= self.max_num_tokens:
             return True
         return False

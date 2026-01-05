@@ -432,12 +432,19 @@ class CudaGraphRunner:
             else True
         )
 
+        # Attention capture requires dynamic computation that cannot be replayed
+        # from CUDA graphs, so skip graphs when capture is enabled
+        is_attention_capture_disabled = not getattr(
+            forward_batch, "capture_attention_tokens", False
+        )
+
         return (
             is_bs_supported
             and is_encoder_lens_supported
             and is_tbo_supported
             and capture_hidden_mode_matches
             and is_ngram_supported
+            and is_attention_capture_disabled
         )
 
     def _init_profile_context_and_memory_record(self):
