@@ -397,6 +397,18 @@ ONE_GPU_CASES_B: list[DiffusionTestCase] = [
             prompt=T2V_PROMPT,
         ),
     ),
+    DiffusionTestCase(
+        "turbo_wan2_1_t2v_1.3b",
+        DiffusionServerArgs(
+            model_path="IPostYellow/TurboWan2.1-T2V-1.3B-Diffusers",
+            modality="video",
+            warmup=0,
+            custom_validator="video",
+        ),
+        DiffusionSamplingParams(
+            prompt=T2V_PROMPT,
+        ),
+    ),
     # LoRA test case for single transformer + merge/unmerge API test
     DiffusionTestCase(
         "wan2_1_t2v_1_3b_lora_1gpu",
@@ -472,6 +484,16 @@ TWO_GPU_CASES_A = [
         "wan2_2_i2v_a14b_2gpu",
         DiffusionServerArgs(
             model_path="Wan-AI/Wan2.2-I2V-A14B-Diffusers",
+            modality="video",
+            warmup=0,
+            custom_validator="video",
+        ),
+        TI2V_sampling_params,
+    ),
+    DiffusionTestCase(
+        "turbo_wan2_2_i2v_a14b_2gpu",
+        DiffusionServerArgs(
+            model_path="IPostYellow/TurboWan2.2-I2V-A14B-Diffusers",
             modality="video",
             warmup=0,
             custom_validator="video",
