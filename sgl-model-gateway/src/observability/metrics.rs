@@ -156,7 +156,7 @@ pub fn init_metrics() {
     );
     describe_gauge!(
         "smg_http_inflight_request_age_count",
-        "Count of currently in-flight HTTP requests by age"
+        "In-flight HTTP requests per age bucket (gt < age <= le, non-cumulative)"
     );
     describe_counter!(
         "smg_http_responses_total",
@@ -496,11 +496,10 @@ impl Metrics {
         .record(duration.as_secs_f64());
     }
 
-    /// Set the cumulative count of in-flight requests for a given age bucket.
-    /// Uses `le` label to match Prometheus histogram convention.
-    pub fn set_inflight_request_age_count(le: &'static str, count: usize) {
+    pub fn set_inflight_request_age_count(gt: &'static str, le: &'static str, count: usize) {
         gauge!(
             "smg_http_inflight_request_age_count",
+            "gt" => gt,
             "le" => le
         )
         .set(count as f64);

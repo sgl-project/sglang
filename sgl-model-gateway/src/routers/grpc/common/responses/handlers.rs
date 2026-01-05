@@ -11,7 +11,7 @@ use tracing::{debug, error, warn};
 
 use crate::{
     data_connector::ResponseId,
-    routers::{error, grpc::regular::responses::context::ResponsesContext},
+    routers::{error, grpc::regular::responses::ResponsesContext},
 };
 
 /// Implementation for GET /v1/responses/{response_id}
