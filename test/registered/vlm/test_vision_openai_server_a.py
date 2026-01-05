@@ -1,6 +1,5 @@
 from sglang.test.ci.ci_register import register_cuda_ci
 
-# Vision OpenAI server tests (part A)
 register_cuda_ci(est_time=778, suite="stage-b-test-small-1-gpu")
 
 """
@@ -12,8 +11,9 @@ python3 -m unittest test_vision_openai_server.TestOpenAIVisionServer.test_multi_
 import unittest
 
 import openai
-from test_vision_openai_server_common import *
-from test_vision_openai_server_common import (  # DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,; DEFAULT_URL_FOR_TEST,; IMAGE_MAN_IRONING_URL,; popen_launch_server,
+
+from sglang.test.vlm_utils import *
+from sglang.test.vlm_utils import (
     AudioOpenAITestMixin,
     CustomTestCase,
     ImageOpenAITestMixin,
