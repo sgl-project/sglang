@@ -8,30 +8,48 @@ from sglang.srt.utils.patch_tokenizer import (
 )
 
 
+PATCHED_ATTRS = ["all_special_tokens", "all_special_ids", "add_special_tokens", "add_tokens"]
+
+
+def _get_attr_id(cls, name):
+    attr = getattr(cls, name)
+    if isinstance(attr, property):
+        return id(attr.fget)
+    return id(attr)
+
+
+def _get_all_patched_attr_ids(cls):
+    return {name: _get_attr_id(cls, name) for name in PATCHED_ATTRS}
+
+
 class TestPatchTokenizer(unittest.TestCase):
     def test_patch_unpatch_restores_original(self):
         tokenizer = AutoTokenizer.from_pretrained("gpt2")
         cls = type(tokenizer)
 
-        original_ids = {
-            "all_special_tokens": id(cls.all_special_tokens.fget),
-            "all_special_ids": id(cls.all_special_ids.fget),
-            "add_special_tokens": id(cls.add_special_tokens),
-            "add_tokens": id(cls.add_tokens),
-        }
+        original_ids = _get_all_patched_attr_ids(cls)
 
         _SpecialTokensCachePatcher.patch(tokenizer)
         self.assertTrue(getattr(cls, "_sglang_special_tokens_patched", False))
 
+        patched_ids = _get_all_patched_attr_ids(cls)
+        for name in PATCHED_ATTRS:
+            self.assertNotEqual(
+                patched_ids[name],
+                original_ids[name],
+                f"{name} should be patched (id should change)",
+            )
+
         unpatch_tokenizer(tokenizer)
         self.assertFalse(getattr(cls, "_sglang_special_tokens_patched", False))
 
-        self.assertEqual(
-            id(cls.all_special_tokens.fget), original_ids["all_special_tokens"]
-        )
-        self.assertEqual(id(cls.all_special_ids.fget), original_ids["all_special_ids"])
-        self.assertEqual(id(cls.add_special_tokens), original_ids["add_special_tokens"])
-        self.assertEqual(id(cls.add_tokens), original_ids["add_tokens"])
+        restored_ids = _get_all_patched_attr_ids(cls)
+        for name in PATCHED_ATTRS:
+            self.assertEqual(
+                restored_ids[name],
+                original_ids[name],
+                f"{name} should be restored to original",
+            )
 
     def test_patch_caches_special_tokens(self):
         tokenizer = AutoTokenizer.from_pretrained("gpt2")
