@@ -87,14 +87,16 @@ def _set_kv_buffer_impl(
     device_module: Any,
     alt_stream: Optional[torch.cuda.Stream] = None,
 ) -> None:
-    k = k.view(-1, row_dim)
-    v = v.view(-1, row_dim)
-    k_cache = k_cache.view(-1, row_dim)
-    v_cache = v_cache.view(-1, row_dim)
     row_bytes = row_dim * store_dtype.itemsize
-
     if _is_cuda and can_use_store_cache(row_bytes):
-        return store_cache(k, v, k_cache, v_cache, indices, row_bytes=row_bytes)
+        return store_cache(
+            k.view(-1, row_dim),
+            v.view(-1, row_dim),
+            k_cache.view(-1, row_dim),
+            v_cache.view(-1, row_dim),
+            indices,
+            row_bytes=row_bytes,
+        )
 
     from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 
