@@ -148,23 +148,21 @@ class ModelRunnerKVCacheMixin:
         assert config is not None
 
         # reserve the memory for the intermediate mamba states used for spec dec
-        def _handle_mamba_cache_with_spec_algorithm(total_rest_memory: int):
-            if not self.spec_algorithm.is_none():
-                assert server_args.speculative_num_draft_tokens is not None
-                assert server_args.max_running_requests is not None
+        if not self.spec_algorithm.is_none():
+            assert server_args.speculative_num_draft_tokens is not None
+            assert server_args.max_running_requests is not None
 
-                max_running_requests = server_args.max_running_requests // (
-                    self.dp_size if server_args.enable_dp_attention else 1
-                )
-                mamba_state_intermediate_size = (
-                    config.mamba2_cache_params.mamba_cache_per_req
-                    * max_running_requests
-                    * server_args.speculative_num_draft_tokens
-                )
-                total_rest_memory = total_rest_memory - (
-                    mamba_state_intermediate_size / (1 << 30)
-                )
-            return total_rest_memory
+            max_running_requests = server_args.max_running_requests // (
+                self.dp_size if server_args.enable_dp_attention else 1
+            )
+            mamba_state_intermediate_size = (
+                config.mamba2_cache_params.mamba_cache_per_req
+                * max_running_requests
+                * server_args.speculative_num_draft_tokens
+            )
+            total_rest_memory = total_rest_memory - (
+                mamba_state_intermediate_size / (1 << 30)
+            )
 
         if (
             server_args.disable_radix_cache
@@ -179,14 +177,8 @@ class ModelRunnerKVCacheMixin:
             server_args.max_mamba_cache_size = server_args.max_mamba_cache_size // (
                 server_args.dp_size if server_args.enable_dp_attention else 1
             )
-            total_rest_memory = _handle_mamba_cache_with_spec_algorithm(
-                total_rest_memory
-            )
         else:
             assert config.mamba2_cache_params.mamba_cache_per_req > 0
-            total_rest_memory = _handle_mamba_cache_with_spec_algorithm(
-                total_rest_memory
-            )
 
             # allocate the memory based on the ratio between mamba state memory vs. full kv cache memory
             # solve the equations:
