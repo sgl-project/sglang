@@ -15,9 +15,9 @@ pub(crate) mod utils; // Used by routers/http
 
 /// Processed chat messages ready for gRPC generation
 #[derive(Debug)]
-#[allow(dead_code)]
 pub(crate) struct ProcessedMessages {
     pub text: String,
     pub multimodal_inputs: Option<MultimodalInputs>,
+    #[allow(dead_code)]
     pub stop_sequences: Option<StringOrArray>,
 }
