@@ -4,6 +4,9 @@ import unittest
 import torch
 
 from sglang.srt.configs.mamba_utils import Mamba2CacheParams, Mamba2StateShape
+from sglang.test.ci.ci_register import register_cuda_ci
+
+register_cuda_ci(est_time=9, suite="stage-b-test-small-1-gpu")
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
