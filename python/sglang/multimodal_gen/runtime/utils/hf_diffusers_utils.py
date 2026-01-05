@@ -390,14 +390,88 @@ def maybe_download_lora(
     if os.path.isfile(local_path):
         return local_path
 
-    weight_name = _best_guess_weight_name(local_path, file_extension=".safetensors")
+    def _list_local_lora_weights(path: str) -> list[str]:
+        try:
+            entries = os.listdir(path)
+        except OSError as e:
+            logger.warning("Failed to list LoRA directory %s: %s", path, e)
+            return []
+        unallowed_substrings = {"scheduler", "optimizer", "checkpoint"}
+        candidates = [
+            f
+            for f in entries
+            if f.endswith(".safetensors")
+            and all(sub not in f for sub in unallowed_substrings)
+            and os.path.isfile(os.path.join(path, f))
+        ]
+        return sorted(candidates)
+
+    def _redownload_lora_if_needed(path: str) -> str:
+        if not download or os.path.exists(model_name_or_path):
+            return path
+        logger.warning(
+            "LoRA weights missing in cache for %s. Re-downloading...",
+            model_name_or_path,
+        )
+        with get_lock(model_name_or_path).acquire(poll_interval=2):
+            # Another process might have repaired the cache while we waited.
+            if _list_local_lora_weights(path):
+                return path
+            return snapshot_download(
+                repo_id=model_name_or_path,
+                ignore_patterns=["*.onnx", "*.msgpack"],
+                allow_patterns=allow_patterns,
+                local_dir=local_dir,
+                resume_download=True,
+                max_workers=8,
+                etag_timeout=120,
+                force_download=True,
+            )
+
+    weight_name = None
+    try:
+        weight_name = _best_guess_weight_name(local_path, file_extension=".safetensors")
+    except ValueError:
+        weight_name = None
     # AMD workaround: PR 15813 changed from model_name_or_path to local_path,
     # which can return None. Fall back to original behavior on ROCm.
     if weight_name is None and current_platform.is_rocm():
-        weight_name = _best_guess_weight_name(
-            model_name_or_path, file_extension=".safetensors"
+        try:
+            weight_name = _best_guess_weight_name(
+                model_name_or_path, file_extension=".safetensors"
+            )
+        except ValueError:
+            weight_name = None
+
+    if weight_name is not None:
+        weight_path = os.path.join(local_path, weight_name)
+        if os.path.isfile(weight_path):
+            return weight_path
+        logger.warning(
+            "Best-guess LoRA weight %s not found under %s", weight_name, local_path
         )
-    return os.path.join(local_path, weight_name)
+        local_path = _redownload_lora_if_needed(local_path)
+        weight_path = os.path.join(local_path, weight_name)
+        if os.path.isfile(weight_path):
+            return weight_path
+
+    candidates = _list_local_lora_weights(local_path)
+    if not candidates:
+        local_path = _redownload_lora_if_needed(local_path)
+        candidates = _list_local_lora_weights(local_path)
+    if candidates:
+        if len(candidates) > 1:
+            logger.warning(
+                "Provided path contains more than one weights file in the .safetensors format. "
+                "`%s` is going to be loaded, for precise control, specify a `weight_name` in `load_lora_weights`.",
+                candidates[0],
+            )
+        return os.path.join(local_path, candidates[0])
+
+    raise ValueError(
+        f"LoRA weights not found in {local_path}. "
+        "Please ensure the repo contains a .safetensors LoRA checkpoint."
+    )
 
 
 def verify_model_config_and_directory(model_path: str) -> dict[str, Any]:
