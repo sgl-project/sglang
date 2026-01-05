@@ -409,6 +409,14 @@ def main():
             print(
                 f"No cases assigned to partition {args.partition_id}. Exiting success."
             )
+            # Write empty execution report for coverage tracking
+            write_execution_report(
+                suite=args.suite,
+                partition_id=args.partition_id,
+                total_partitions=args.total_partitions,
+                executed_cases=[],
+                is_standalone=False,
+            )
             sys.exit(0)
 
         # Print partition info
