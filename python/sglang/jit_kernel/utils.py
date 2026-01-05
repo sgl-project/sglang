@@ -56,7 +56,7 @@ def make_cpp_args(*args: CPP_TEMPLATE_TYPE) -> CPPArgList:
             return "true" if arg else "false"
         if isinstance(arg, (int, float)):
             return str(arg)
-        if isinstance(arg, (torch.dtype)):
+        if isinstance(arg, torch.dtype):
             if arg == torch.float:
                 return "float"
             if arg == torch.float16:
