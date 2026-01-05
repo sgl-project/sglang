@@ -279,6 +279,11 @@ class CompletionRequest(BaseModel):
     attention_capture_layer_ids: Optional[List[int]] = None  # Specific layers to capture (overrides attention_capture_layer_id)
     attention_sketch_mode: bool = False  # Return per-layer sketches instead of raw edges (bandwidth efficient)
 
+    # For attention steering (semantic routing loop)
+    # Format: {"layer_id": {"token_pos": bias_value, ...}, ...}
+    # Biases are added to attention logits before softmax
+    attention_biases: Optional[Dict[str, Dict[str, float]]] = None
+
     @field_validator("max_tokens")
     @classmethod
     def validate_max_tokens_positive(cls, v):
@@ -512,6 +517,12 @@ class ChatCompletionRequest(BaseModel):
     attention_capture_layer_id: Optional[int] = None  # Layer to capture attention from (-1 = last, None = default)
     attention_capture_layer_ids: Optional[List[int]] = None  # Specific layers to capture (overrides attention_capture_layer_id)
     attention_sketch_mode: bool = False  # Return per-layer sketches instead of raw edges (bandwidth efficient)
+
+    # For attention steering (semantic routing loop)
+    # Format: {"layer_id": {"token_pos": bias_value, ...}, ...}
+    # Biases are added to attention logits before softmax
+    attention_biases: Optional[Dict[str, Dict[str, float]]] = None
+
     reasoning_effort: Optional[Literal["low", "medium", "high"]] = Field(
         default="medium",
         description="Constrains effort on reasoning for reasoning models. "
