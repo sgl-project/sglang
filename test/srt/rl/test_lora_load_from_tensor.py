@@ -1,0 +1,173 @@
+import unittest
+import json
+import os
+from safetensors.torch import load_file
+from huggingface_hub import snapshot_download
+import torch
+
+import sglang as sgl
+
+from sglang.srt.managers.io_struct import LoadLoRAAdapterFromTensorsReqInput
+from sglang.srt.utils import MultiprocessingSerializer
+from sglang.test.test_utils import CustomTestCase
+
+
+MODEL_PATH = "Qwen/Qwen3-0.6B"
+LORA_REPO = "charent/self_cognition_Alice"
+TEST_PROMPT = "Hello, my name is"
+EXPECTED_OUTPUT = (
+    " Alice, and I am a software engineer. I am excited to share my journey"
+)
+MAX_NEW_TOKENS = 16
+
+class TestLoRALoadFromTensor(CustomTestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.engine = sgl.Engine(model_path=MODEL_PATH, enable_lora=True,
+            max_lora_rank=64,
+            lora_target_modules=[
+                "q_proj",
+                "k_proj",
+                "v_proj",
+                "o_proj",
+                "gate_proj",
+                "up_proj",
+                "down_proj",
+            ],
+            mem_fraction_static=0.6,
+            log_level="error")
+        
+        lora_adapter = snapshot_download(
+            repo_id=LORA_REPO,
+            allow_patterns=["adapter_model.safetensors", "adapter_config.json"],
+        )
+        # Load tensors and config from downloaded adapter
+        cls.lora_tensors = load_file(os.path.join(lora_adapter, "adapter_model.safetensors"))
+        with open(os.path.join(lora_adapter, "adapter_config.json"), "r") as f:
+            cls.lora_config_dict = json.load(f)
+
+    def test_e2e_lora_load_from_tensor_params(self):
+        print("[Test]Testing LoRA load from tensor params...")
+
+        serialized_tensors = MultiprocessingSerializer.serialize(
+                self.lora_tensors, output_str=True
+            )
+
+        lora_req = LoadLoRAAdapterFromTensorsReqInput(
+                lora_name="self_cognition_Alice",
+                config_dict=self.lora_config_dict,
+                serialized_tensors=serialized_tensors,
+        )
+
+        # Load LoRA adapter from tensors
+        result = self.engine.loop.run_until_complete(
+                self.engine.tokenizer_manager.load_lora_adapter_from_tensors(lora_req, None)
+        )
+        self.assertTrue(
+            result.success,
+            f"Failed to load LoRA from tensors: {result.error_message}",
+        )
+
+        output_without_lora = self.engine.generate(
+            prompt=[TEST_PROMPT],
+            sampling_params={
+                "max_new_tokens": MAX_NEW_TOKENS,
+                "temperature": 0.0,
+            },
+        )
+
+        output_lora = self.engine.generate(
+            prompt=[TEST_PROMPT],
+            sampling_params={
+                "max_new_tokens": MAX_NEW_TOKENS,
+                "temperature": 0.0,
+            },
+            lora_path=["self_cognition_Alice"],
+        )
+
+        print(f"[Without LoRA] {output_without_lora[0]}")
+        print(f"[With LoRA]  {output_lora[0]}")
+        self.assertNotEqual(
+            output_without_lora[0]["text"][: len(EXPECTED_OUTPUT)],
+            EXPECTED_OUTPUT,
+            "Output before applying LoRA should not match expected result",
+        )
+
+        self.assertEqual(
+            output_lora[0]["text"][: len(EXPECTED_OUTPUT)],
+            EXPECTED_OUTPUT,
+            "Output after applying LoRA does not match expected result",
+        )
+    
+    def test_lora_load_unload_load_from_tensor_params(self):
+        print("[Test]Testing LoRA load, unload, load from tensor params...")
+
+        serialized_tensors = MultiprocessingSerializer.serialize(
+                self.lora_tensors, output_str=True
+            )
+
+        lora_req = LoadLoRAAdapterFromTensorsReqInput(
+            lora_name="self_cognition_Alice_multiple",
+            config_dict=self.lora_config_dict,
+            serialized_tensors=serialized_tensors,
+        )
+
+        # Load LoRA adapter from tensors
+        result = self.engine.loop.run_until_complete(
+                self.engine.tokenizer_manager.load_lora_adapter_from_tensors(lora_req, None)
+        )
+        self.assertTrue(
+            result.success,
+            f"Failed to load LoRA from tensors: {result.error_message}",
+        )
+
+        # Unload LoRA adapter
+        result = self.engine.unload_lora_adapter("self_cognition_Alice_multiple")
+        self.assertTrue(result.success, f"Failed to unload LoRA: {result.error_message}")
+        with self.assertRaises(ValueError) as context:
+            output_lora = self.engine.generate(
+                prompt=[TEST_PROMPT],
+                sampling_params={
+                    "max_new_tokens": MAX_NEW_TOKENS,
+                    "temperature": 0.0,
+                },
+                lora_path=["self_cognition_Alice_multiple"],
+            )
+        # Load LoRA adapter again
+        serialized_tensors_again = MultiprocessingSerializer.serialize(
+            self.lora_tensors, output_str=True
+        )
+        lora_req_again = LoadLoRAAdapterFromTensorsReqInput(
+            lora_name="self_cognition_Alice_multiple",
+            config_dict=self.lora_config_dict,
+            serialized_tensors=serialized_tensors_again,
+        )
+        result_again = self.engine.loop.run_until_complete(
+                    self.engine.tokenizer_manager.load_lora_adapter_from_tensors(lora_req_again, None)
+            )
+        self.assertTrue(
+            result_again.success,
+            f"Failed to load LoRA from tensors: {result_again.error_message}",
+        )
+        output_lora_loaded_again = self.engine.generate(
+            prompt=[TEST_PROMPT],
+            sampling_params={
+                "max_new_tokens": MAX_NEW_TOKENS,
+                "temperature": 0.0,
+            },
+            lora_path=["self_cognition_Alice_multiple"],
+        )
+
+        print(f"[With LoRA Loaded again]  {output_lora_loaded_again[0]}")
+        self.assertEqual(
+            output_lora_loaded_again[0]["text"][: len(EXPECTED_OUTPUT)],
+            EXPECTED_OUTPUT,
+            "Output after applying LoRA does not match expected result",
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.engine.shutdown()
+
+if __name__ == "__main__":
+    unittest.main()
