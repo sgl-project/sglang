@@ -113,6 +113,9 @@ class TestPrefillDelayerAccuracy(CustomTestCase):
                 # Not really needed, only to test support non-FCFS algorithms
                 "--schedule-policy",
                 "lpm",
+                # Use this to ensure prefill delayer will be run
+                "--max-total-tokens",
+                "4096",
             ],
         )
         try:
