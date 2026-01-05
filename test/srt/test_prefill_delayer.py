@@ -88,6 +88,9 @@ class TestPrefillDelayerThroughput(CustomTestCase):
                     "8",
                     "--chunked-prefill-size",
                     "131072",
+                    # Not really needed, just to ensure non-fcfs works
+                    "--schedule-policy",
+                    "lpm",
                     *other_launch_args,
                 ],
             )
