@@ -25,6 +25,11 @@ on:
         required: false
         type: boolean
         default: false
+      pr_head_sha:
+        description: "PR head SHA to checkout (for /rerun-stage on fork PRs)"
+        required: false
+        type: string
+        default: ""
   workflow_call:
     inputs:
       ref:
@@ -39,8 +44,9 @@ on:
         default: false
 
 concurrency:
-  group: pr-test-${{ github.ref }}
-  cancel-in-progress: true
+  # Include pr_head_sha in group for /rerun-stage dispatches to avoid collisions with main branch runs
+  group: pr-test-${{ inputs.pr_head_sha || inputs.ref || github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'workflow_call' }}
 
 env:
   SGLANG_IS_IN_CI: true
@@ -62,7 +68,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
 
       - name: Determine run mode
         id: run-mode
@@ -190,7 +196,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: "recursive"
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
 
       - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v5
@@ -204,11 +210,17 @@ jobs:
         env:
           USE_CCACHE: 1
 
+      - name: Verify wheel artifacts
+        run: |
+          ls -alh sgl-kernel/dist
+          ls -alh sgl-kernel/dist/*.whl
+
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: wheel-python${{ matrix.python-version }}-cuda${{ matrix.cuda-version }}
           path: sgl-kernel/dist/*
+          if-no-files-found: error
 
   sgl-kernel-build-wheels-arm:
     needs: [check-changes, call-gate]
@@ -232,7 +244,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: "recursive"
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
 
       - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v5
@@ -246,22 +258,30 @@ jobs:
         env:
           USE_CCACHE: 1
 
+      - name: Verify wheel artifacts
+        run: |
+          ls -alh sgl-kernel/dist
+          ls -alh sgl-kernel/dist/*.whl
+
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: wheel-python${{ matrix.python-version }}-cuda${{ matrix.cuda-version }}-aarch64
           path: sgl-kernel/dist/*
+          if-no-files-found: error
 
   sgl-kernel-unit-test:
     needs: [check-changes, call-gate, sgl-kernel-build-wheels]
-    if: needs.check-changes.outputs.sgl_kernel == 'true'
+    if: |
+      !inputs.target_stage &&
+      needs.check-changes.outputs.sgl_kernel == 'true'
     runs-on: 1-gpu-runner
     env:
       RUNNER_LABELS: 1-gpu-runner
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
 
       - name: Cleanup
         run: |
@@ -287,14 +307,16 @@ jobs:
 
   sgl-kernel-mla-test:
     needs: [check-changes, call-gate, sgl-kernel-build-wheels]
-    if: needs.check-changes.outputs.sgl_kernel == 'true'
+    if: |
+      !inputs.target_stage &&
+      needs.check-changes.outputs.sgl_kernel == 'true'
     runs-on: 1-gpu-runner
     env:
       RUNNER_LABELS: 1-gpu-runner
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
 
       - name: Cleanup
         run: |
@@ -320,7 +342,9 @@ jobs:
 
   sgl-kernel-benchmark-test:
     needs: [check-changes, call-gate, sgl-kernel-build-wheels]
-    if: needs.check-changes.outputs.sgl_kernel == 'true'
+    if: |
+      !inputs.target_stage &&
+      needs.check-changes.outputs.sgl_kernel == 'true'
     runs-on: 1-gpu-runner
     env:
       CI: true
@@ -328,7 +352,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
 
       - name: Cleanup
         run: |
@@ -366,14 +390,16 @@ jobs:
 
   sgl-kernel-b200-test:
     needs: [check-changes, sgl-kernel-build-wheels]
-    if: needs.check-changes.outputs.sgl_kernel == 'true'
+    if: |
+      !inputs.target_stage &&
+      needs.check-changes.outputs.sgl_kernel == 'true'
     runs-on: ${{ needs.check-changes.outputs.b200_runner }}
     env:
       RUNNER_LABELS: ${{ needs.check-changes.outputs.b200_runner }}
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
 
       - name: Cleanup
         run: |
@@ -432,14 +458,16 @@ jobs:
 
   jit-kernel-unit-test:
     needs: [check-changes, call-gate]
-    if: needs.check-changes.outputs.jit_kernel == 'true'
+    if: |
+      !inputs.target_stage &&
+      needs.check-changes.outputs.jit_kernel == 'true'
     runs-on: 1-gpu-runner
     env:
       RUNNER_LABELS: 1-gpu-runner
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
 
       - name: Install dependencies
         run: |
@@ -472,7 +500,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
@@ -516,12 +544,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        partition: [0, 1, 2, 3]
+        partition: [0, 1, 2, 3, 4, 5, 6, 7]
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
@@ -543,7 +571,7 @@ jobs:
           if [[ "${{ needs.check-changes.outputs.continue_on_error }}" == "true" ]]; then
             CONTINUE_ON_ERROR_FLAG="--continue-on-error"
           fi
-          python3 run_suite.py --hw cuda --suite stage-b-test-small-1-gpu --auto-partition-id ${{ matrix.partition }} --auto-partition-size 4 $CONTINUE_ON_ERROR_FLAG
+          python3 run_suite.py --hw cuda --suite stage-b-test-small-1-gpu --auto-partition-id ${{ matrix.partition }} --auto-partition-size 8 $CONTINUE_ON_ERROR_FLAG
 
   stage-b-test-large-1-gpu:
     needs: [check-changes, call-gate, stage-a-test-1, sgl-kernel-build-wheels]
@@ -564,7 +592,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
@@ -607,7 +635,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
@@ -650,7 +678,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
@@ -693,7 +721,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
@@ -734,7 +762,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
@@ -783,7 +811,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
@@ -828,7 +856,7 @@ jobs:
         - name: Checkout code
           uses: actions/checkout@v4
           with:
-            ref: ${{ inputs.ref || github.ref }}
+            ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
 
         - name: Download artifacts
           if: needs.check-changes.outputs.sgl_kernel == 'true'
@@ -875,12 +903,12 @@ jobs:
       fail-fast: false
       max-parallel: ${{ fromJson(needs.check-changes.outputs.max_parallel) }}
       matrix:
-        part: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+        part: [0, 1, 2, 3, 4, 5]
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
@@ -906,7 +934,7 @@ jobs:
           if [[ "${{ needs.check-changes.outputs.continue_on_error }}" == "true" ]]; then
             CONTINUE_ON_ERROR_FLAG="--continue-on-error"
           fi
-          python3 run_suite.py --suite per-commit-1-gpu --auto-partition-id ${{ matrix.part }} --auto-partition-size 13 $RETRY_FLAG $CONTINUE_ON_ERROR_FLAG
+          python3 run_suite.py --suite per-commit-1-gpu --auto-partition-id ${{ matrix.part }} --auto-partition-size 6 $RETRY_FLAG $CONTINUE_ON_ERROR_FLAG
 
 
   stage-b-test-4-gpu-b200:
@@ -931,7 +959,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
@@ -979,7 +1007,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
@@ -1030,7 +1058,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
@@ -1076,12 +1104,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        part: [0, 1, 2]
+        part: [0, 1, 2, 3]
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
@@ -1113,7 +1141,7 @@ jobs:
           if [[ "${{ needs.check-changes.outputs.continue_on_error }}" == "true" ]]; then
             CONTINUE_ON_ERROR_FLAG="--continue-on-error"
           fi
-          python3 run_suite.py --suite per-commit-8-gpu-h200 --auto-partition-id ${{ matrix.part }} --auto-partition-size 3 $RETRY_FLAG $CONTINUE_ON_ERROR_FLAG
+          python3 run_suite.py --suite per-commit-8-gpu-h200 --auto-partition-id ${{ matrix.part }} --auto-partition-size 4 $RETRY_FLAG $CONTINUE_ON_ERROR_FLAG
 
   unit-test-backend-8-gpu-h20:
     needs: [check-changes, call-gate, unit-test-backend-1-gpu, stage-b-test-4-gpu-b200]
@@ -1139,7 +1167,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
@@ -1186,7 +1214,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
@@ -1257,7 +1285,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
@@ -1320,7 +1348,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
@@ -1377,7 +1405,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
@@ -1446,7 +1474,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
@@ -1488,7 +1516,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
@@ -1530,7 +1558,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
@@ -1577,7 +1605,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
@@ -1629,7 +1657,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
@@ -1678,7 +1706,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'

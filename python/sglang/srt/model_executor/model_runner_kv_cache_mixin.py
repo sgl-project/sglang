@@ -10,7 +10,6 @@ from sglang.srt.distributed.parallel_state import get_world_group
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.mem_cache.allocator import (
     PagedTokenToKVPoolAllocator,
-    SWATokenToKVPoolAllocator,
     TokenToKVPoolAllocator,
 )
 from sglang.srt.mem_cache.memory_pool import (
@@ -23,8 +22,8 @@ from sglang.srt.mem_cache.memory_pool import (
     MLATokenToKVPoolFP4,
     NSATokenToKVPool,
     ReqToTokenPool,
-    SWAKVPool,
 )
+from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool, SWATokenToKVPoolAllocator
 from sglang.srt.utils.common import (
     get_available_gpu_memory,
     is_float4_e2m1fn_x2,
@@ -517,6 +516,7 @@ class ModelRunnerKVCacheMixin:
                 self.token_to_kv_pool = SWAKVPool(
                     size=self.full_max_total_num_tokens,
                     size_swa=self.swa_max_total_num_tokens,
+                    page_size=self.page_size,
                     dtype=self.kv_cache_dtype,
                     head_num=self.model_config.get_num_kv_heads(
                         get_attention_tp_size()
@@ -614,17 +614,18 @@ class ModelRunnerKVCacheMixin:
                     need_sort=need_sort,
                 )
             else:
-                if self.page_size == 1:
-                    if self.is_hybrid_swa:
-                        self.token_to_kv_pool_allocator = SWATokenToKVPoolAllocator(
-                            self.full_max_total_num_tokens,
-                            self.swa_max_total_num_tokens,
-                            dtype=self.kv_cache_dtype,
-                            device=self.device,
-                            kvcache=self.token_to_kv_pool,
-                            need_sort=need_sort,
-                        )
-                    else:
+                if self.is_hybrid_swa:
+                    self.token_to_kv_pool_allocator = SWATokenToKVPoolAllocator(
+                        self.full_max_total_num_tokens,
+                        self.swa_max_total_num_tokens,
+                        page_size=self.page_size,
+                        dtype=self.kv_cache_dtype,
+                        device=self.device,
+                        kvcache=self.token_to_kv_pool,
+                        need_sort=need_sort,
+                    )
+                else:
+                    if self.page_size == 1:
                         self.token_to_kv_pool_allocator = TokenToKVPoolAllocator(
                             self.max_total_num_tokens,
                             dtype=self.kv_cache_dtype,
@@ -632,16 +633,16 @@ class ModelRunnerKVCacheMixin:
                             kvcache=self.token_to_kv_pool,
                             need_sort=need_sort,
                         )
-                else:
-                    assert not self.is_hybrid_swa
-                    self.token_to_kv_pool_allocator = PagedTokenToKVPoolAllocator(
-                        self.max_total_num_tokens,
-                        page_size=self.page_size,
-                        dtype=self.kv_cache_dtype,
-                        device=self.device,
-                        kvcache=self.token_to_kv_pool,
-                        need_sort=need_sort,
-                    )
+                    else:
+                        self.token_to_kv_pool_allocator = PagedTokenToKVPoolAllocator(
+                            self.max_total_num_tokens,
+                            page_size=self.page_size,
+                            dtype=self.kv_cache_dtype,
+                            device=self.device,
+                            kvcache=self.token_to_kv_pool,
+                            need_sort=need_sort,
+                        )
+
         else:
             assert self.is_draft_worker
             if self.is_hybrid_swa:
