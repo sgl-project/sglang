@@ -650,6 +650,13 @@
         "reason": "top contributor",
         "can_rerun_stage": true
     },
+    "liusy58": {
+        "can_tag_run_ci_label": true,
+        "can_rerun_failed_ci": true,
+        "cooldown_interval_minutes": 60,
+        "reason": "custom override",
+        "can_rerun_stage": true
+    },
     "liz-badada": {
         "can_tag_run_ci_label": true,
         "can_rerun_failed_ci": true,

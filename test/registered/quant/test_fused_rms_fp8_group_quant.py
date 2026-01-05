@@ -1,11 +1,14 @@
-# test/srt/quant/test_fused_rms_fp8_group_quant.py
 import itertools
 import unittest
 
 import torch
 import torch.nn.functional as F
 
+from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
+
+# Fused RMS FP8 group quantization tests (AMD/ROCm only)
+register_amd_ci(est_time=10, suite="stage-a-test-1")
 
 
 def _fp8_available() -> bool:
