@@ -246,4 +246,24 @@ mod tests {
         assert_ne!(g2.request_id, g3.request_id);
         assert_eq!(tracker.len(), 3);
     }
+
+    #[test]
+    fn test_age_buckets_labels() {
+        let buckets = AgeBuckets::new(&[10, 30, 60]);
+
+        assert_eq!(buckets.le_labels, vec!["10", "30", "60", "+Inf"]);
+        assert_eq!(buckets.gt_labels, vec!["0", "10", "30", "60"]);
+        assert_eq!(buckets.bucket_count(), 4);
+    }
+
+    #[test]
+    fn test_age_buckets_global() {
+        let buckets = &*AGE_BUCKETS;
+
+        assert_eq!(buckets.le_labels.first(), Some(&"30"));
+        assert_eq!(buckets.le_labels.last(), Some(&"+Inf"));
+        assert_eq!(buckets.gt_labels.first(), Some(&"0"));
+        assert_eq!(buckets.gt_labels.last(), Some(&"86400"));
+        assert_eq!(buckets.le_labels.len(), buckets.gt_labels.len());
+    }
 }
