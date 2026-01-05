@@ -11,24 +11,25 @@ use dashmap::DashMap;
 use super::metrics::Metrics;
 use crate::policies::utils::PeriodicTask;
 
-struct AgeBuckets {
-    bounds: &'static [u64],
+struct NumericalBuckets {
+    upper_bounds: &'static [u64],
     le_labels: Vec<&'static str>,
     gt_labels: Vec<&'static str>,
 }
 
-impl AgeBuckets {
-    fn new(bounds: &'static [u64]) -> Self {
+impl NumericalBuckets {
+    fn new(upper_bounds: &'static [u64]) -> Self {
         let leak_str = |n: u64| Box::leak(n.to_string().into_boxed_str()) as &'static str;
 
-        let mut le_labels: Vec<&'static str> = bounds.iter().map(|&b| leak_str(b)).collect();
+        let mut le_labels: Vec<&'static str> =
+            upper_bounds.iter().map(|&b| leak_str(b)).collect();
         le_labels.push("+Inf");
 
         let mut gt_labels: Vec<&'static str> = vec!["0"];
-        gt_labels.extend(bounds.iter().map(|&b| leak_str(b)));
+        gt_labels.extend(upper_bounds.iter().map(|&b| leak_str(b)));
 
         Self {
-            bounds,
+            upper_bounds,
             le_labels,
             gt_labels,
         }
@@ -40,7 +41,7 @@ impl AgeBuckets {
 }
 
 const AGE_BUCKET_BOUNDS: &[u64] = &[30, 60, 180, 300, 600, 1200, 3600, 7200, 14400, 28800, 86400];
-static AGE_BUCKETS: LazyLock<AgeBuckets> = LazyLock::new(|| AgeBuckets::new(AGE_BUCKET_BOUNDS));
+static AGE_BUCKETS: LazyLock<NumericalBuckets> = LazyLock::new(|| NumericalBuckets::new(AGE_BUCKET_BOUNDS));
 
 pub struct InFlightRequestTracker {
     requests: DashMap<u64, Instant>,
@@ -91,7 +92,7 @@ impl InFlightRequestTracker {
         for entry in self.requests.iter() {
             let age_secs = now.duration_since(*entry.value()).as_secs();
             let bucket_idx = buckets
-                .bounds
+                .upper_bounds
                 .iter()
                 .position(|&bound| age_secs <= bound)
                 .unwrap_or(inf_idx);
@@ -104,13 +105,13 @@ impl InFlightRequestTracker {
     fn sample_and_record(&self) {
         let buckets = &*AGE_BUCKETS;
         let counts = self.compute_bucket_counts();
-        for (i, (&le, &gt)) in buckets
-            .le_labels
-            .iter()
-            .zip(buckets.gt_labels.iter())
-            .enumerate()
-        {
-            Metrics::set_inflight_request_age_count(gt, le, counts[i]);
+        debug_assert_eq!(buckets.le_labels.len(), buckets.gt_labels.len());
+        debug_assert_eq!(buckets.le_labels.len(), counts.len());
+        for ((&le, &gt), &count) in std::iter::zip(
+            std::iter::zip(&buckets.le_labels, &buckets.gt_labels),
+            &counts,
+        ) {
+            Metrics::set_inflight_request_age_count(gt, le, count);
         }
     }
 }
@@ -249,7 +250,7 @@ mod tests {
 
     #[test]
     fn test_age_buckets_labels() {
-        let buckets = AgeBuckets::new(&[10, 30, 60]);
+        let buckets = NumericalBuckets::new(&[10, 30, 60]);
 
         assert_eq!(buckets.le_labels, vec!["10", "30", "60", "+Inf"]);
         assert_eq!(buckets.gt_labels, vec!["0", "10", "30", "60"]);
