@@ -17,6 +17,9 @@ use crate::{
     },
 };
 
+/// Type alias for EPD (Encode-Prefill-Decode) worker triple selection result
+type EpdWorkerTriple = (Arc<dyn Worker>, Arc<dyn Worker>, Arc<dyn Worker>);
+
 /// Worker selection stage: Select appropriate worker(s) based on routing mode
 pub(crate) struct WorkerSelectionStage {
     worker_registry: Arc<WorkerRegistry>,
@@ -29,6 +32,8 @@ pub(crate) enum WorkerSelectionMode {
     Regular,
     /// PD mode: select prefill + decode workers
     PrefillDecode,
+    /// EPD mode: select encode + prefill + decode workers
+    EncodePrefillDecode,
 }
 
 impl WorkerSelectionStage {
@@ -115,6 +120,30 @@ impl PipelineStage for WorkerSelectionStage {
                         return Err(error::service_unavailable(
                             "no_available_pd_worker_pairs",
                             format!("No available PD worker pairs for model: {}", model),
+                        ));
+                    }
+                }
+            }
+            WorkerSelectionMode::EncodePrefillDecode => {
+                match self.select_epd_triple(ctx.input.model_id.as_deref(), text) {
+                    Some((encode, prefill, decode)) => WorkerSelection::Triple {
+                        encode,
+                        prefill,
+                        decode,
+                    },
+                    None => {
+                        error!(
+                            function = "WorkerSelectionStage::execute",
+                            mode = "EncodePrefillDecode",
+                            model_id = ?ctx.input.model_id,
+                            "No available EPD worker triple for model"
+                        );
+                        return Err(error::service_unavailable(
+                            "no_available_encode_prefill_decode_workers_for_model",
+                            format!(
+                                "No available Encode-Prefill-Decode workers for model: {:?}",
+                                ctx.input.model_id
+                            ),
                         ));
                     }
                 }
@@ -268,6 +297,110 @@ impl WorkerSelectionStage {
         );
 
         Some((
+            available_prefill[prefill_idx].clone(),
+            available_decode[decode_idx].clone(),
+        ))
+    }
+
+    fn select_epd_triple(
+        &self,
+        model_id: Option<&str>,
+        text: Option<&str>,
+    ) -> Option<EpdWorkerTriple> {
+        // For EPD mode:
+        // - All workers (encode, prefill, decode) use gRPC
+
+        // Get gRPC encode workers
+        let encode_workers = self.worker_registry.get_workers_filtered(
+            model_id,
+            Some(WorkerType::Encode {
+                bootstrap_port: None,
+            }),
+            Some(ConnectionMode::Grpc { port: None }), // Encode workers use gRPC
+            None,
+            false,
+        );
+
+        let available_encode: Vec<Arc<dyn Worker>> = encode_workers
+            .into_iter()
+            .filter(|w| w.is_available())
+            .collect();
+
+        if available_encode.is_empty() {
+            warn!("No available gRPC encode workers for EPD mode");
+            return None;
+        }
+
+        // Get gRPC prefill and decode workers
+        let grpc_workers = self.worker_registry.get_workers_filtered(
+            model_id,
+            None,
+            Some(ConnectionMode::Grpc { port: None }), // Prefill and decode use gRPC
+            None,
+            false,
+        );
+
+        let (available_prefill, available_decode): (Vec<_>, Vec<_>) = grpc_workers
+            .into_iter()
+            .fold((Vec::new(), Vec::new()), |mut acc, w| {
+                if w.is_available() {
+                    match w.metadata().worker_type {
+                        WorkerType::Prefill { .. } => acc.0.push(w),
+                        WorkerType::Decode => acc.1.push(w),
+                        _ => {}
+                    }
+                }
+                acc
+            });
+
+        if available_prefill.is_empty() {
+            warn!("No available prefill workers for EPD mode");
+            return None;
+        }
+
+        if available_decode.is_empty() {
+            warn!("No available decode workers for EPD mode");
+            return None;
+        }
+
+        let encode_policy = self.policy_registry.get_encode_policy();
+        let prefill_policy = self.policy_registry.get_prefill_policy();
+        let decode_policy = self.policy_registry.get_decode_policy();
+
+        let info = SelectWorkerInfo {
+            request_text: text,
+            tokens: None,
+            headers: None,
+            hash_ring: None,
+        };
+        let encode_idx = encode_policy.select_worker(&available_encode, &info)?;
+        let prefill_idx = prefill_policy.select_worker(&available_prefill, &info)?;
+        let decode_idx = decode_policy.select_worker(&available_decode, &info)?;
+
+        let model = model_id.unwrap_or("default");
+
+        // Record worker selection metrics
+        Metrics::record_worker_selection(
+            metrics_labels::WORKER_ENCODE,
+            metrics_labels::CONNECTION_HTTP, // Encode uses HTTP
+            model,
+            encode_policy.name(),
+        );
+        Metrics::record_worker_selection(
+            metrics_labels::WORKER_PREFILL,
+            metrics_labels::CONNECTION_GRPC,
+            model,
+            prefill_policy.name(),
+        );
+        Metrics::record_worker_selection(
+            metrics_labels::WORKER_DECODE,
+            metrics_labels::CONNECTION_GRPC,
+            model,
+            decode_policy.name(),
+        );
+
+        Some((
+            available_encode[encode_idx].clone(),
             available_prefill[prefill_idx].clone(),
             available_decode[decode_idx].clone(),
         ))
