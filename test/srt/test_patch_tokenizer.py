@@ -8,30 +8,47 @@ from sglang.srt.utils.patch_tokenizer import (
 )
 
 
+def _get_class_attr_ids(cls):
+    """Get id of all class attributes, unwrapping property.fget"""
+    result = {}
+    for name, value in vars(cls).items():
+        if isinstance(value, property):
+            result[name] = id(value.fget)
+        else:
+            result[name] = id(value)
+    return result
+
+
 class TestPatchTokenizer(unittest.TestCase):
     def test_patch_unpatch_restores_original(self):
         tokenizer = AutoTokenizer.from_pretrained("gpt2")
-        c = type(tokenizer)
+        cls = type(tokenizer)
 
-        original_ids = {
-            "all_special_tokens": id(c.all_special_tokens.fget),
-            "all_special_ids": id(c.all_special_ids.fget),
-            "add_special_tokens": id(c.add_special_tokens),
-            "add_tokens": id(c.add_tokens),
-        }
+        original_ids = _get_class_attr_ids(cls)
 
         _SpecialTokensCachePatcher.patch(tokenizer)
-        self.assertTrue(getattr(c, "_sglang_special_tokens_patched", False))
+        self.assertTrue(getattr(cls, "_sglang_special_tokens_patched", False))
+
+        patched_ids = _get_class_attr_ids(cls)
+        changed_attrs = [
+            name
+            for name in original_ids
+            if name in patched_ids and patched_ids[name] != original_ids[name]
+        ]
+        self.assertGreater(len(changed_attrs), 0, "Patch should change some attributes")
 
         unpatch_tokenizer(tokenizer)
-        self.assertFalse(getattr(c, "_sglang_special_tokens_patched", False))
+        self.assertFalse(getattr(cls, "_sglang_special_tokens_patched", False))
 
-        self.assertEqual(
-            id(c.all_special_tokens.fget), original_ids["all_special_tokens"]
-        )
-        self.assertEqual(id(c.all_special_ids.fget), original_ids["all_special_ids"])
-        self.assertEqual(id(c.add_special_tokens), original_ids["add_special_tokens"])
-        self.assertEqual(id(c.add_tokens), original_ids["add_tokens"])
+        restored_ids = _get_class_attr_ids(cls)
+        for name in original_ids:
+            if name.startswith("_sglang") or name.startswith("_original"):
+                continue
+            self.assertEqual(
+                restored_ids.get(name),
+                original_ids[name],
+                f"Attribute {name} should be restored to original",
+            )
 
     def test_patch_caches_special_tokens(self):
         tokenizer = AutoTokenizer.from_pretrained("gpt2")
