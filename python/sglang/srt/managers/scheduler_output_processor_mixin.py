@@ -1618,13 +1618,63 @@ class SchedulerOutputProcessorMixin:
     # SIDECAR FEEDBACK CHANNEL (Routing Loop)
     # =========================================================================
 
+    def _parse_feedback_url(self, sidecar_url: str) -> str:
+        """
+        Derive feedback URL from sidecar URL by incrementing port by 1.
+
+        Handles:
+        - tcp://host:port -> tcp://host:port+1
+        - tcp://[ipv6]:port -> tcp://[ipv6]:port+1
+        - ipc:// -> returns empty (use explicit --attention-feedback-url)
+
+        Returns empty string if parsing fails.
+        """
+        if not sidecar_url:
+            return ""
+
+        # IPC sockets don't have ports - require explicit feedback URL
+        if sidecar_url.startswith("ipc://"):
+            logger.warning("IPC sidecar URL detected - use --attention-feedback-url")
+            return ""
+
+        # Handle IPv6: tcp://[::1]:9001 or tcp://[2001:db8::1]:9001
+        if "]:" in sidecar_url:
+            # IPv6 with port
+            bracket_pos = sidecar_url.rfind("]:")
+            base = sidecar_url[:bracket_pos + 1]
+            port_str = sidecar_url[bracket_pos + 2:]
+            try:
+                port = int(port_str)
+                return f"{base}:{port + 1}"
+            except ValueError:
+                return ""
+
+        # Standard tcp://host:port
+        last_colon = sidecar_url.rfind(":")
+        if last_colon == -1:
+            return ""
+
+        # Make sure we're not splitting the scheme (tcp:)
+        base = sidecar_url[:last_colon]
+        port_str = sidecar_url[last_colon + 1:]
+
+        # Validate it looks like a port number
+        if not port_str.isdigit():
+            return ""
+
+        try:
+            port = int(port_str)
+            return f"{base}:{port + 1}"
+        except ValueError:
+            return ""
+
     def _init_feedback_subscriber(self: "Scheduler"):
         """
         Initialize ZMQ subscriber for receiving feedback from sidecar.
 
-        Called lazily on first use. Listens on a separate port for sidecar responses.
-        The feedback URL is derived from sidecar URL by adding 1 to the port.
-        e.g., tcp://localhost:9001 -> tcp://localhost:9002
+        Called lazily on first use. Connects to sidecar's feedback PUSH socket.
+        The feedback URL is derived from sidecar URL by adding 1 to the port,
+        or can be explicitly set via --attention-feedback-url.
         """
         sidecar_url = getattr(self.server_args, "attention_sidecar_url", "")
         if not sidecar_url:
@@ -1634,20 +1684,17 @@ class SchedulerOutputProcessorMixin:
         try:
             import zmq
 
-            # Derive feedback port from sidecar URL (sidecar_port + 1)
-            # e.g., tcp://localhost:9001 -> tcp://localhost:9002
+            # Use explicit feedback URL if provided, otherwise derive from sidecar URL
             feedback_url = getattr(self.server_args, "attention_feedback_url", "")
             if not feedback_url:
-                # Derive from sidecar URL
-                parts = sidecar_url.rsplit(":", 1)
-                if len(parts) == 2:
-                    try:
-                        port = int(parts[1])
-                        feedback_url = f"{parts[0]}:{port + 1}"
-                    except ValueError:
-                        logger.warning(f"Could not parse sidecar port from {sidecar_url}")
-                        self._feedback_subscriber = None
-                        return
+                feedback_url = self._parse_feedback_url(sidecar_url)
+                if not feedback_url:
+                    logger.warning(
+                        f"Could not derive feedback URL from {sidecar_url}. "
+                        "Use --attention-feedback-url to specify explicitly."
+                    )
+                    self._feedback_subscriber = None
+                    return
 
             # Reuse existing ZMQ context or create new one
             if not hasattr(self, '_zmq_context') or self._zmq_context is None:
@@ -1657,13 +1704,21 @@ class SchedulerOutputProcessorMixin:
             self._feedback_subscriber.connect(feedback_url)  # Connect to sidecar's PUSH socket
             self._feedback_subscriber.setsockopt(zmq.RCVHWM, 1000)  # High water mark
             self._feedback_subscriber.setsockopt(zmq.LINGER, 0)  # Don't hang on shutdown
+            self._feedback_subscriber.setsockopt(zmq.RCVTIMEO, 0)  # Non-blocking
             logger.info(f"Connected to sidecar feedback on {feedback_url}")
+
+            # Track last seen sequence per request for ordering
+            self._feedback_last_seq: dict = {}
+
         except ImportError:
             logger.warning("ZMQ not available, feedback channel disabled")
             self._feedback_subscriber = None
         except Exception as e:
             logger.warning(f"Failed to initialize feedback subscriber: {e}")
             self._feedback_subscriber = None
+
+    # Supported feedback schema versions
+    _FEEDBACK_SCHEMA_VERSIONS = {1}
 
     def _process_sidecar_feedback(self: "Scheduler"):
         """
@@ -1672,16 +1727,26 @@ class SchedulerOutputProcessorMixin:
         This should be called each scheduler iteration. Messages are processed
         without blocking - if no feedback is available, returns immediately.
 
-        Expected feedback message format:
+        Expected feedback message format (v1):
         {
+            "schema_version": 1,
             "request_id": "abc123",
-            "manifold_zone": "semantic_bridge",
-            "manifold_confidence": 0.92,
-            "hub_tokens": [42, 128, 256],
-            "next_capture_layers": [15, 16, 17],
-            "attention_biases": {"12": {"42": 0.3}},
-            "semantic_anchors": {"128": ["entity", 0.95]}
+            "seq": 7,                    # Monotonic per request, for ordering
+            "ts_ms": 1736000000000,      # Timestamp for observability
+            "manifold": {
+                "cluster_id": 12,
+                "cluster_conf": 0.82,
+                "zone": "semantic_bridge"
+            },
+            "control": {
+                "next_capture_layer_ids": [7, 15, 23, 31],
+                "attention_stride": 8,
+                "max_attention_steps": 256,
+                "attention_biases": {"12": {"42": 0.3}}
+            }
         }
+
+        Legacy format (no schema_version) is also accepted for backwards compatibility.
         """
         if not hasattr(self, '_feedback_subscriber'):
             self._init_feedback_subscriber()
@@ -1690,30 +1755,79 @@ class SchedulerOutputProcessorMixin:
             return
 
         import json
+        import zmq
+
+        # Initialize sequence tracking if needed
+        if not hasattr(self, '_feedback_last_seq'):
+            self._feedback_last_seq = {}
 
         # Process all available feedback messages (non-blocking)
-        while True:
+        messages_processed = 0
+        max_messages_per_iteration = 100  # Prevent infinite loop on high traffic
+
+        while messages_processed < max_messages_per_iteration:
             try:
-                message = self._feedback_subscriber.recv(flags=1)  # zmq.NOBLOCK
+                message = self._feedback_subscriber.recv(flags=zmq.NOBLOCK)
+                messages_processed += 1
+
+            except zmq.Again:
+                # No more messages available - normal exit
+                break
+            except zmq.ZMQError as e:
+                logger.warning(f"ZMQ error receiving feedback: {e}")
+                break
+
+            # Parse message
+            try:
                 feedback = json.loads(message.decode())
+            except json.JSONDecodeError as e:
+                logger.warning(f"Invalid JSON in feedback message: {e}")
+                continue
+            except UnicodeDecodeError as e:
+                logger.warning(f"Invalid encoding in feedback message: {e}")
+                continue
 
-                request_id = feedback.get("request_id")
-                if not request_id:
+            # Validate request_id
+            request_id = feedback.get("request_id")
+            if not request_id:
+                logger.debug("Feedback missing request_id, skipping")
+                continue
+
+            # Check schema version (accept legacy format without version)
+            schema_version = feedback.get("schema_version", 1)
+            if schema_version not in self._FEEDBACK_SCHEMA_VERSIONS:
+                logger.warning(
+                    f"Unsupported feedback schema version {schema_version}, "
+                    f"supported: {self._FEEDBACK_SCHEMA_VERSIONS}"
+                )
+                continue
+
+            # Check sequence ordering (ignore out-of-order messages)
+            seq = feedback.get("seq")
+            if seq is not None:
+                last_seq = self._feedback_last_seq.get(request_id, -1)
+                if seq <= last_seq:
+                    logger.debug(
+                        f"Out-of-order feedback for {request_id}: "
+                        f"seq={seq} <= last_seq={last_seq}"
+                    )
                     continue
+                self._feedback_last_seq[request_id] = seq
 
-                # Find the request in running batch
-                req = self._find_request_by_id(request_id)
-                if req is None:
-                    continue
+            # Find the request in running batch
+            req = self._find_request_by_id(request_id)
+            if req is None:
+                # Request may have completed - clean up sequence tracking
+                self._feedback_last_seq.pop(request_id, None)
+                continue
 
-                # Update semantic memory with sidecar response
+            # Update semantic memory with sidecar response
+            try:
                 semantic_memory = getattr(req, "semantic_memory", None)
                 if semantic_memory is not None:
                     semantic_memory.update_from_sidecar(feedback)
-
-            except Exception:
-                # No more messages available or error - stop polling
-                break
+            except Exception as e:
+                logger.warning(f"Error updating semantic memory for {request_id}: {e}")
 
     def _find_request_by_id(self: "Scheduler", request_id: str):
         """
