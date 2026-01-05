@@ -502,44 +502,13 @@ class Scheduler(
                 f"Using draft model load_format: '{self.server_args.speculative_draft_load_format}'"
             )
 
-        # FIXME: refactor the draft worker registration logic
-        if self.server_args.enable_multi_layer_eagle:
-            if self.enable_overlap:
-                from sglang.srt.speculative.multi_layer_eagle_worker_v2 import (
-                    MultiLayerEagleWorkerV2,
-                )
+        DraftWorkerClass = self.spec_algorithm.create_worker(self.server_args)
 
-                self.draft_worker = MultiLayerEagleWorkerV2(
-                    gpu_id=self.gpu_id,
-                    tp_rank=self.tp_rank,
-                    moe_ep_rank=self.moe_ep_rank,
-                    server_args=self.server_args,
-                    nccl_port=self.nccl_port,
-                    target_worker=self.tp_worker,
-                    dp_rank=self.dp_rank,
-                )
-            else:
-                from sglang.srt.speculative.multi_layer_eagle_worker import (
-                    MultiLayerEagleWorker,
-                )
-
-                self.draft_worker = MultiLayerEagleWorker(
-                    gpu_id=self.gpu_id,
-                    tp_rank=self.tp_rank,
-                    moe_ep_rank=self.moe_ep_rank,
-                    server_args=self.server_args,
-                    nccl_port=self.nccl_port,
-                    target_worker=self.tp_worker,
-                    dp_rank=self.dp_rank,
-                )
+        # FIXME: optimize the init draft worker code path
+        if DraftWorkerClass is not None:
+            self.draft_worker = DraftWorkerClass(**draft_worker_kwargs)
         else:
-            DraftWorkerClass = self.spec_algorithm.create_worker(self.server_args)
-
-            # FIXME: optimize the init draft worker code path
-            if DraftWorkerClass is not None:
-                self.draft_worker = DraftWorkerClass(**draft_worker_kwargs)
-            else:
-                self.draft_worker = None
+            self.draft_worker = None
 
     def init_model_worker(self):
         self.init_tp_model_worker()

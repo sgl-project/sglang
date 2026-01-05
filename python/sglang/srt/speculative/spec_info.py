@@ -57,7 +57,22 @@ class SpeculativeAlgorithm(Enum):
             return None
 
         enable_overlap = not server_args.disable_overlap_schedule
-        if self.is_eagle():
+        if self.is_eagle() and server_args.enable_multi_layer_eagle:
+            # FIXME: migrate to EagleWorker
+            if enable_overlap:
+                from sglang.srt.speculative.multi_layer_eagle_worker_v2 import (
+                    MultiLayerEagleWorkerV2,
+                )
+
+                return MultiLayerEagleWorkerV2
+
+            from sglang.srt.speculative.multi_layer_eagle_worker import (
+                MultiLayerEagleWorker,
+            )
+
+            return MultiLayerEagleWorker
+
+        elif self.is_eagle():
             if enable_overlap:
                 from sglang.srt.speculative.eagle_worker_v2 import EAGLEWorkerV2
 
