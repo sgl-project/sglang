@@ -2,11 +2,11 @@ from __future__ import annotations
 
 import logging
 from http import HTTPStatus
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, List
 
 import torch
 
-from sglang.srt.disaggregation.utils import prepare_abort
+from sglang.srt.disaggregation.utils import prepare_abort, NVSHMEM_PWRITE_MODE
 from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sglang.srt.managers.overlap_utils import FutureMap
-    from sglang.srt.managers.schedule_batch import ScheduleBatch
+    from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
     from sglang.srt.server_args import ServerArgs
 
 
@@ -29,6 +29,9 @@ class ScheduleBatchDisaggregationDecodeMixin:
 
         self.forward_mode = ForwardMode.PREBUILT
         reqs = self.reqs
+        if reqs and NVSHMEM_PWRITE_MODE:
+            self._prepare_for_prebuilt_pwrite(reqs)
+            return
         input_ids = [r.fill_ids[len(r.prefix_indices) :] for r in reqs]
         extend_num_tokens = sum(len(ids) for ids in input_ids)
         seq_lens = []
@@ -97,6 +100,62 @@ class ScheduleBatchDisaggregationDecodeMixin:
         self.multimodal_inputs = [r.multimodal_inputs for r in reqs]
 
         # Build sampling info
+        self.sampling_info = SamplingBatchInfo.from_schedule_batch(
+            self,
+            self.model_config.vocab_size,
+        )
+
+    def _prepare_for_prebuilt_pwrite(self: ScheduleBatch, reqs: List["Req"]) -> None:
+        req_pool_indices = []
+        seq_lens = []
+        prefix_lens = []
+        extend_lens = []
+        extend_logprob_start_lens = []
+        extend_num_tokens = 0
+
+        for req in reqs:
+            pre_len = len(req.prefix_indices)
+            seq_len = len(req.origin_input_ids) + max(0, len(req.output_ids) - 1)
+            if len(req.output_ids) == 0:
+                assert (
+                    seq_len - pre_len == req.extend_input_len
+                ), f"seq_len={seq_len}, pre_len={pre_len}, extend_input_len={req.extend_input_len}"
+            if not req.retracted_stain:
+                req.cached_tokens += pre_len - req.already_computed
+                req.already_computed = seq_len
+            req.is_retracted = False
+            req.extend_logprob_start_len = 0
+
+            req_pool_indices.append(req.req_pool_idx)
+            seq_lens.append(seq_len)
+            prefix_lens.append(pre_len)
+            extend_lens.append(req.extend_input_len)
+            extend_logprob_start_lens.append(req.extend_logprob_start_len)
+            extend_num_tokens += req.extend_input_len
+
+        device = self.device
+        self.req_pool_indices = torch.tensor(
+            req_pool_indices, dtype=torch.int64, device=device
+        )
+        self.seq_lens = torch.tensor(seq_lens, dtype=torch.int64, device=device)
+        self.seq_lens_cpu = torch.tensor(seq_lens, dtype=torch.int64)
+        self.orig_seq_lens = self.seq_lens.to(torch.int32)
+        self.seq_lens_sum = int(sum(seq_lens))
+        self.extend_num_tokens = extend_num_tokens
+        self.prefix_lens = prefix_lens
+        self.extend_lens = extend_lens
+        self.extend_logprob_start_lens = extend_logprob_start_lens
+        self.extend_input_logprob_token_ids = None
+        self.multimodal_inputs = [req.multimodal_inputs for req in reqs]
+
+        # Prebuilt fast path does not need actual tensors; keep placeholders for copying logic.
+        self.input_ids = torch.empty(0, dtype=torch.int32, device=device)
+        self.out_cache_loc = torch.empty(0, dtype=torch.int64, device=device)
+
+        if self.return_logprob:
+            self.top_logprobs_nums = [r.top_logprobs_num for r in reqs]
+            self.token_ids_logprobs = [r.token_ids_logprob for r in reqs]
+
         self.sampling_info = SamplingBatchInfo.from_schedule_batch(
             self,
             self.model_config.vocab_size,

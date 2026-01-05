@@ -139,7 +139,8 @@ ATTENTION_BACKEND_CHOICES = [
 
 LORA_BACKEND_CHOICES = ["triton", "csgmv", "ascend", "torch_native"]
 
-DISAGG_TRANSFER_BACKEND_CHOICES = ["mooncake", "nixl", "ascend", "fake"]
+DISAGG_TRANSFER_BACKEND_CHOICES = ["mooncake", "nixl", "ascend", "fake", "nvshmem"]
+
 
 ENCODER_TRANSFER_BACKEND_CHOICES = ["zmq_to_scheduler", "zmq_to_tokenizer", "mooncake"]
 
@@ -598,9 +599,11 @@ class ServerArgs:
     # PD disaggregation: can be "null" (not disaggregated), "prefill" (prefill-only), or "decode" (decode-only)
     disaggregation_mode: Literal["null", "prefill", "decode"] = "null"
     disaggregation_transfer_backend: str = "mooncake"
+    disaggregation_bootstrap_host: Optional[str] = None
     disaggregation_bootstrap_port: int = 8998
     disaggregation_decode_tp: Optional[int] = None
     disaggregation_decode_dp: Optional[int] = None
+    disaggregation_prefill_tp: Optional[int] = None
     disaggregation_prefill_pp: Optional[int] = 1
     disaggregation_ib_device: Optional[str] = None
     disaggregation_decode_enable_offload_kvcache: bool = False
@@ -2216,6 +2219,30 @@ class ServerArgs:
                 )
                 self.load_format = "auto"
 
+    def _handle_disaggregation(self):
+        nvshmem_backend = (
+            self.disaggregation_transfer_backend.lower() == "nvshmem"
+        )
+        if self.enable_prefix_mm_cache and not self.encoder_only:
+            raise ValueError(
+                "--enable-prefix-mm-cache requires --encoder-only to be enabled"
+            )
+        if self.encoder_only and self.language_only:
+            raise ValueError("Cannot set --encoder-only and --language-only together")
+        if self.encoder_only and not self.disaggregation_mode == "null":
+            raise ValueError(
+                "Cannot set --encoder-only and --disaggregation-mode prefill/decode together"
+            )
+        if (
+            self.language_only
+            and self.encoder_transfer_backend == "zmq_to_scheduler"
+            and self.pp_size > 1
+        ):
+            raise ValueError("zmq_to_scheduler not support pp_size > 1")
+
+        if self.language_only and len(self.encoder_urls) == 0:
+            raise ValueError(
+                "requires at least one encoder urls to be set via --encoder-urls"
         # Check whether TransferEngine can be used when users want to start seed service that supports TransferEngine backend.
         if self.remote_instance_weight_loader_start_seed_via_transfer_engine:
             self.remote_instance_weight_loader_start_seed_via_transfer_engine = (
@@ -2224,23 +2251,39 @@ class ServerArgs:
 
     def _handle_pd_disaggregation(self):
         if self.disaggregation_mode == "decode":
-            assert (
-                self.disaggregation_decode_tp is None
-            ), "Cannot set --disaggregation-decode-tp for the decode engine."
-            assert (
-                self.disaggregation_decode_dp is None
-            ), "Cannot set --disaggregation-decode-dp for the decode engine."
+            if self.disaggregation_decode_tp is None:
+                self.disaggregation_decode_tp = self.tp_size
+            if self.disaggregation_decode_dp is None:
+                self.disaggregation_decode_dp = self.dp_size
+            if self.disaggregation_prefill_tp is None:
+                if nvshmem_backend:
+                    raise ValueError(
+                        "--disaggregation-prefill-tp must be specified for NVSHMEM decode servers "
+                        "to describe the remote prefill tensor parallel size."
+                    )
+                self.disaggregation_prefill_tp = self.tp_size
 
             self.disable_radix_cache = True
             logger.warning("KV cache is forced as chunk cache for decode server")
 
         elif self.disaggregation_mode == "prefill":
+            if self.disaggregation_prefill_tp is None:
+                self.disaggregation_prefill_tp = self.tp_size
             if self.disaggregation_decode_tp is None:
+                if nvshmem_backend:
+                    raise ValueError(
+                        "--disaggregation-decode-tp must be specified for NVSHMEM prefill servers "
+                        "to describe the remote decode tensor parallel size."
+                    )
                 self.disaggregation_decode_tp = self.tp_size
             if self.disaggregation_decode_dp is None:
                 self.disaggregation_decode_dp = self.dp_size
 
             self.disaggregation_prefill_pp = self.pp_size
+
+            self.validate_disagg_tp_size(
+                self.disaggregation_prefill_tp, self.disaggregation_decode_tp
+            )
             self.validate_disagg_tp_size(self.tp_size, self.disaggregation_decode_tp)
 
             if not self.enable_piecewise_cuda_graph:
@@ -4340,6 +4383,12 @@ class ServerArgs:
             help="Bootstrap server port on the prefill server. Default is 8998.",
         )
         parser.add_argument(
+            "--disaggregation-bootstrap-host",
+            type=str,
+            default=ServerArgs.disaggregation_bootstrap_host,
+            help="Override the NVSHMEM bootstrap host. Defaults to --host when not provided.",
+        )
+        parser.add_argument(
             "--disaggregation-decode-tp",
             type=int,
             default=ServerArgs.disaggregation_decode_tp,
@@ -4350,6 +4399,12 @@ class ServerArgs:
             type=int,
             default=ServerArgs.disaggregation_decode_dp,
             help="Decode dp size. If not set, it matches the dp size of the current engine. This is only set on the prefill server.",
+        )
+        parser.add_argument(
+            "--disaggregation-prefill-tp",
+            type=int,
+            default=ServerArgs.disaggregation_prefill_tp,
+            help="Prefill tp size. If not set, it matches the tp size of the current engine. This is only set on the decode server.",
         )
         parser.add_argument(
             "--disaggregation-prefill-pp",
