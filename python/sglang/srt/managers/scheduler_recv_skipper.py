@@ -14,8 +14,8 @@ class SchedulerRecvSkipper:
 
     def __init__(self, server_args: ServerArgs):
         self._enable_dp_attention = server_args.enable_dp_attention
-        self._counter = -1
         self._threshold = server_args.scheduler_recv_interval
+        self._counter = self._threshold
         # All can be tuned if needed
         self._default_weight = envs.SGLANG_SCHEDULER_RECV_SKIPPER_WEIGHT_DEFAULT.get()
         self._weight_of_forward_mode = {
@@ -33,7 +33,9 @@ class SchedulerRecvSkipper:
         Args:
             global_forward_mode: The global forward mode synchronized across DP ranks.
         """
-        self._counter += self._weight_of_forward_mode.get(global_forward_mode, self._default_weight)
+        self._counter += self._weight_of_forward_mode.get(
+            global_forward_mode, self._default_weight
+        )
 
     def handle(
         self,
@@ -56,10 +58,6 @@ class SchedulerRecvSkipper:
             bool: True if should receive requests, False otherwise.
         """
         if self._enable_dp_attention:
-            if self._counter == -1:
-                self._counter = 0
-                return True
-
             if self._counter >= self._threshold:
                 self._counter = 0
                 return True
