@@ -34,8 +34,6 @@ class TestPrefillDelayerThroughput(CustomTestCase):
             debug_name=f"online_serving ({prefill_delayer=})",
             prefill_delayer=prefill_delayer,
             other_launch_args=[
-                "--mem-fraction-static",
-                "0.6",
                 # Not really needed, only to test support non-FCFS algorithms
                 "--schedule-policy",
                 "lpm",
@@ -60,8 +58,6 @@ class TestPrefillDelayerThroughput(CustomTestCase):
             other_launch_args=[
                 "--max-total-tokens",
                 "200000",
-                "--mem-fraction-static",
-                "0.6",
             ],
         )
 
@@ -152,6 +148,8 @@ def _launch_server(*, model, base_url, prefill_delayer: bool, other_args):
                 "8",
                 "--chunked-prefill-size",
                 "131072",
+                "--mem-fraction-static",
+                "0.6",
                 *(other_args or []),
             ],
         )
