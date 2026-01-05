@@ -146,6 +146,14 @@ struct QKNormKernel {
     auto dtype = SymbolicDType{};
     auto device = SymbolicDevice{};
 
+    /*
+     * We need the .template disambiguator here because this call happens in a dependent context.
+     * After switching to with_dtype<DType>(...) (where DType is a template parameter), the chained expression becomes
+     * dependent. In C++, when calling a member function template via ./-> on a dependent expression, the compiler may
+     * otherwise parse <kDLCUDA> as the < operator instead of template arguments. Adding .template forces correct
+     * parsing and fixes compilation errors (often seen with NVCC/clang). Ref:
+     * https://en.cppreference.com/w/cpp/language/dependent_name
+     */
     TensorMatcher({N, Q, D})  // q input
         .with_strides({Sq, D, 1})
         .with_dtype<DType>(dtype)
