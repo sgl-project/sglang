@@ -83,7 +83,7 @@ class BaseFormatDetector(ABC):
 
             results.append(
                 ToolCallItem(
-                    tool_index=tool_indices[name],
+                    tool_index=tool_indices.get(name, -1),
                     name=name,
                     parameters=json.dumps(
                         act.get("parameters") or act.get("arguments", {}),
