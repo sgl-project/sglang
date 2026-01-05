@@ -657,6 +657,55 @@ impl SglangSchedulerClient {
 
         Ok(sampling)
     }
+
+    // =====================
+    // Encoder RPCs (for EPD mode)
+    // =====================
+
+    /// Encode multimodal items (images/videos/audio) - for encoder workers in EPD mode
+    pub async fn encode(
+        &self,
+        req: proto::EncodeRequest,
+    ) -> Result<proto::EncodeResponse, Box<dyn std::error::Error + Send + Sync>> {
+        debug!("Sending gRPC encode request to encoder");
+        let mut client = self.client.clone();
+        let mut request = Request::new(req);
+
+        // Inject W3C trace context into gRPC metadata
+        inject_trace_context_grpc(request.metadata_mut());
+
+        let response = client.encode(request).await?;
+        debug!("Encode response received");
+        Ok(response.into_inner())
+    }
+
+    /// Send encoded embeddings to prefill server (for mooncake backend)
+    pub async fn encode_send(
+        &self,
+        req: proto::EncodeSendRequest,
+    ) -> Result<proto::EncodeSendResponse, Box<dyn std::error::Error + Send + Sync>> {
+        debug!("Sending gRPC encode_send request");
+        let mut client = self.client.clone();
+        let request = Request::new(req);
+
+        let response = client.encode_send(request).await?;
+        debug!("EncodeSend response received");
+        Ok(response.into_inner())
+    }
+
+    /// Register scheduler receive URL (for zmq_to_scheduler backend)
+    pub async fn scheduler_receive_url(
+        &self,
+        req: proto::SchedulerReceiveUrlRequest,
+    ) -> Result<proto::SchedulerReceiveUrlResponse, Box<dyn std::error::Error + Send + Sync>> {
+        debug!("Sending gRPC scheduler_receive_url request");
+        let mut client = self.client.clone();
+        let request = Request::new(req);
+
+        let response = client.scheduler_receive_url(request).await?;
+        debug!("SchedulerReceiveUrl response received");
+        Ok(response.into_inner())
+    }
 }
 
 #[cfg(test)]
