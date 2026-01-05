@@ -91,7 +91,7 @@ def generate_cmd(args: argparse.Namespace):
     server_args = ServerArgs.from_cli_args(args)
     sampling_params_kwargs = SamplingParams.get_cli_args(args)
     generator = DiffGenerator.from_pretrained(
-        model_path=server_args.model_path, server_args=server_args
+        model_path=server_args.model_path, server_args=server_args, local_mode=True
     )
 
     results = generator.generate(sampling_params_kwargs=sampling_params_kwargs)

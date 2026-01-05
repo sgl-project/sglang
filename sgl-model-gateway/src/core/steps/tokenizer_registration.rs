@@ -41,13 +41,8 @@ pub struct ValidateTokenizerConfigStep;
 #[async_trait]
 impl StepExecutor for ValidateTokenizerConfigStep {
     async fn execute(&self, context: &mut WorkflowContext) -> WorkflowResult<StepResult> {
-        let config: Arc<TokenizerConfigRequest> = context
-            .get("tokenizer_config")
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("tokenizer_config".to_string()))?;
-
-        let app_context: Arc<AppContext> = context
-            .get("app_context")
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("app_context".to_string()))?;
+        let config: Arc<TokenizerConfigRequest> = context.get_or_err("tokenizer_config")?;
+        let app_context: Arc<AppContext> = context.get_or_err("app_context")?;
 
         debug!(
             "Validating tokenizer config: name={}, source={}",
@@ -93,13 +88,8 @@ pub struct LoadTokenizerStep;
 #[async_trait]
 impl StepExecutor for LoadTokenizerStep {
     async fn execute(&self, context: &mut WorkflowContext) -> WorkflowResult<StepResult> {
-        let config: Arc<TokenizerConfigRequest> = context
-            .get("tokenizer_config")
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("tokenizer_config".to_string()))?;
-
-        let app_context: Arc<AppContext> = context
-            .get("app_context")
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("app_context".to_string()))?;
+        let config: Arc<TokenizerConfigRequest> = context.get_or_err("tokenizer_config")?;
+        let app_context: Arc<AppContext> = context.get_or_err("app_context")?;
 
         info!(
             "Loading tokenizer '{}' (id: {}) from source: {}",

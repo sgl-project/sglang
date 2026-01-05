@@ -31,7 +31,7 @@ from sglang.srt.distributed.parallel_state import (
 from sglang.srt.layers.dp_attention import initialize_dp_attention
 from sglang.srt.managers.io_struct import ProfileReq, ProfileReqInput, ProfileReqType
 from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
-from sglang.srt.mem_cache.multimodal_cache import MultiModalStaticCache
+from sglang.srt.mem_cache.multimodal_cache import EmbeddingResult, MultiModalStaticCache
 from sglang.srt.model_loader import get_model
 from sglang.srt.server_args import (
     PortArgs,
@@ -209,7 +209,7 @@ class MMEncoder:
             async with self.mm_cache_lock:
                 mm_cache = self.mm_cache.get([mm_item.hash])
                 if mm_cache is not None:
-                    mm_embedding = mm_cache
+                    mm_embedding = mm_cache.embedding
 
         if mm_embedding is None:
             with torch.inference_mode():
@@ -220,7 +220,7 @@ class MMEncoder:
 
         if self.server_args.enable_prefix_mm_cache:
             async with self.mm_cache_lock:
-                self.mm_cache.set(mm_hash, mm_embedding)
+                self.mm_cache.set(mm_hash, EmbeddingResult(embedding=mm_embedding))
         end_time = time.perf_counter()
         logger.info(
             f"Vit time : {(end_time - start_time)*1000:.2f} ms {mm_embedding.shape = }"

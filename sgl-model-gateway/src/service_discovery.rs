@@ -609,7 +609,10 @@ mod tests {
     }
 
     async fn create_test_app_context() -> Arc<AppContext> {
-        use crate::{config::RouterConfig, core::WorkerService, middleware::TokenBucket};
+        use crate::{
+            config::RouterConfig, core::WorkerService, middleware::TokenBucket,
+            observability::inflight_tracker::InFlightRequestTracker,
+        };
 
         let router_config = RouterConfig::builder()
             .worker_startup_timeout_secs(1)
@@ -649,6 +652,7 @@ mod tests {
                 worker_job_queue,
                 router_config,
             )),
+            inflight_tracker: InFlightRequestTracker::new(),
         })
     }
 

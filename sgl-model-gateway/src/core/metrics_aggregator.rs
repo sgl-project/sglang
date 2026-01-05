@@ -16,7 +16,7 @@ pub fn aggregate_metrics(metric_packs: Vec<MetricPack>) -> anyhow::Result<String
     let mut expositions = vec![];
     for metric_pack in metric_packs {
         let metrics_text = &metric_pack.metrics_text;
-        // Hacky workaround since the parser do not understand `:`, should improve later
+        // openmetrics_parser doesn't handle colons in metric names; replace with underscores
         let metrics_text = metrics_text.replace(":", "_");
 
         let exposition = match openmetrics_parser::prometheus::parse_prometheus(&metrics_text) {

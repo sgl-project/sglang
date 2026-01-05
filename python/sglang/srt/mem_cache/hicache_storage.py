@@ -47,6 +47,8 @@ def hash_str_to_int64(hash_str: str) -> int:
 class HiCacheStorageConfig:
     tp_rank: int
     tp_size: int
+    pp_rank: int
+    pp_size: int
     is_mla_model: bool
     is_page_first_layout: bool
     model_name: Optional[str]

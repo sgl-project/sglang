@@ -66,7 +66,7 @@ class TestAscendDeepSeekMTP(CustomTestCase):
                 process = popen_launch_server(
                     model,
                     self.base_url,
-                    timeout=1500,
+                    timeout=2400,
                     other_args=[
                         *self.common_args,
                     ],

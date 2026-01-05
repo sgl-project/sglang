@@ -434,8 +434,7 @@ def apply_qk_norm(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Apply QK normalization for query and key tensors.
 
-    Minimal multimodal_gen-only implementation: only the JIT fused inplace
-    QK-norm kernel path is supported (no fallback).
+    Uses JIT fused inplace kernel when available, falls back to standard RMSNorm.
     """
 
     batch_size = q.size(0)
@@ -458,7 +457,15 @@ def apply_qk_norm(
         )
         return q, k
 
-    raise RuntimeError(
-        "apply_qk_norm: fused inplace QK-norm is not applicable "
-        "(expected CUDA, contiguous q/k, matching eps, and supported head_dim)"
+    # Fallback for AMD/ROCm: apply RMSNorm separately to q and k
+    import warnings
+
+    warnings.warn(
+        "Fused QK-norm not available, using RMSNorm fallback",
+        stacklevel=2,
     )
+    q_shape = q.shape
+    k_shape = k.shape
+    q_out = q_norm(q.view(-1, head_dim)).view(q_shape)
+    k_out = k_norm(k.view(-1, head_dim)).view(k_shape)
+    return q_out, k_out

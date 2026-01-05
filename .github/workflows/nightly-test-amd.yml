@@ -42,8 +42,8 @@ on:
         default: 'all'
 
 concurrency:
-  group: nightly-test-amd-${{ github.ref }}
-  cancel-in-progress: true
+  group: nightly-test-amd-${{ inputs.ref || github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'workflow_call' }}
 
 jobs:
   # 2-GPU tests (TP=2)

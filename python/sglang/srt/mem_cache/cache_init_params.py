@@ -30,3 +30,6 @@ class CacheInitParams:
     # For SWAChunkCache
     sliding_window_size: Optional[int] = None
     attention_chunk_size: Optional[int] = None
+
+    pp_rank: int = 0
+    pp_size: int = 1

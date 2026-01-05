@@ -780,9 +780,6 @@ class TestGlm47MoeDetector(unittest.TestCase):
         Scenario: Parse text with normal text before and after tool calls.
         Purpose: Verify normal text segments are correctly separated from tool call parsing
                 and preserved in the normal_text output.
-
-        NOTE: Currently, the detector only captures text BEFORE the first tool call.
-              Text after tool calls is not returned (known limitation).
         """
         tools = [
             Tool(
@@ -802,9 +799,8 @@ class TestGlm47MoeDetector(unittest.TestCase):
 
         self.assertEqual(len(result.calls), 1)
         self.assertEqual(result.calls[0].name, "action")
-        # Currently only text before tool call is captured
+        # Verify both text before and after tool calls are preserved
         self.assertIn("First I'll do this.", result.normal_text)
-        # TODO: Text after tool call should also be preserved but currently isn't
         self.assertIn("Then I'll do that.", result.normal_text)
 
     def test_boundary_number_edge_values(self):

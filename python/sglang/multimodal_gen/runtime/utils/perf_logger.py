@@ -10,6 +10,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, Optional
 
+import torch
 from dateutil.tz import UTC
 
 import sglang
@@ -32,6 +33,10 @@ class RequestTimings:
         self.stages: Dict[str, float] = {}
         self.steps: list[float] = []
         self.total_duration_ms: float = 0.0
+
+    @property
+    def total_duration_s(self) -> float:
+        return self.total_duration_ms / 1000.0
 
     def record_stage(self, stage_name: str, duration_s: float):
         """Records the duration of a pipeline stage"""
@@ -145,6 +150,12 @@ class StageProfiler:
             self.logger.info(f"[{self.stage_name}] started...")
 
         if (self.enabled and self.timings) or self.simple_log:
+            if (
+                os.environ.get("SGLANG_DIFFUSION_SYNC_STAGE_PROFILING", "0") == "1"
+                and self.stage_name.startswith("denoising_step_")
+                and torch.cuda.is_available()
+            ):
+                torch.cuda.synchronize()
             self.start_time = time.perf_counter()
 
         return self
@@ -153,6 +164,12 @@ class StageProfiler:
         if not ((self.enabled and self.timings) or self.simple_log):
             return False
 
+        if (
+            os.environ.get("SGLANG_DIFFUSION_SYNC_STAGE_PROFILING", "0") == "1"
+            and self.stage_name.startswith("denoising_step_")
+            and torch.cuda.is_available()
+        ):
+            torch.cuda.synchronize()
         execution_time_s = time.perf_counter() - self.start_time
 
         if exc_type:
@@ -227,9 +244,9 @@ class PerformanceLogger:
             os.makedirs(os.path.dirname(abs_path), exist_ok=True)
             with open(abs_path, "w", encoding="utf-8") as f:
                 json.dump(report, f, indent=2)
-            logger.info(f"[Performance] Metrics dumped to: {abs_path}")
+            logger.info(f"Metrics dumped to: {abs_path}")
         except IOError as e:
-            logger.error(f"[Performance] Failed to dump metrics to {abs_path}: {e}")
+            logger.error(f"Failed to dump metrics to {abs_path}: {e}")
 
     @classmethod
     def log_request_summary(
