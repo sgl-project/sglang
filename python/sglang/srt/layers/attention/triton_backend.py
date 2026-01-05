@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Optional
 
 import torch
+import torch.nn.functional as F
 import triton
 import triton.language as tl
 
@@ -1013,22 +1014,49 @@ class TritonAttnBackend(AttentionBackend):
             kv_indptr = self.forward_metadata.kv_indptr
             kv_indices = self.forward_metadata.kv_indices
 
-        self.decode_attention_fwd(
-            q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
-            forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
-            forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
-            o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
-            kv_indptr,
-            kv_indices,
-            self.forward_metadata.attn_logits,
-            self.forward_metadata.attn_lse,
-            self.forward_metadata.num_kv_splits,
-            self.max_kv_splits,
-            layer.scaling,
-            logit_cap=logits_soft_cap,
-            sinks=sinks,
-            xai_temperature_len=layer.xai_temperature_len,
-        )
+        # Check if this layer has attention biases for steering
+        use_bias_fallback = forward_batch.has_attention_biases_for_layer(layer.layer_id)
+
+        if use_bias_fallback:
+            # Use PyTorch fallback with bias support
+            # Get max sequence length for this batch
+            max_seq_len = (kv_indptr[1:] - kv_indptr[:-1]).max().item()
+            attention_bias = forward_batch.get_attention_bias_tensor(layer.layer_id, max_seq_len)
+
+            if attention_bias is not None:
+                self._decode_attention_with_bias_pytorch(
+                    q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+                    forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
+                    forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
+                    o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+                    kv_indptr,
+                    kv_indices,
+                    layer.scaling,
+                    attention_bias,
+                    logit_cap=logits_soft_cap,
+                )
+            else:
+                # Fallback to fast path if bias tensor creation failed
+                use_bias_fallback = False
+
+        if not use_bias_fallback:
+            # Fast path: use optimized Triton kernel
+            self.decode_attention_fwd(
+                q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+                forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
+                forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
+                o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+                kv_indptr,
+                kv_indices,
+                self.forward_metadata.attn_logits,
+                self.forward_metadata.attn_lse,
+                self.forward_metadata.num_kv_splits,
+                self.max_kv_splits,
+                layer.scaling,
+                logit_cap=logits_soft_cap,
+                sinks=sinks,
+                xai_temperature_len=layer.xai_temperature_len,
+            )
 
         # Compute top-k attention tokens for interpretability
         # Multi-layer capture: compute on all specified layers
@@ -1048,6 +1076,89 @@ class TritonAttnBackend(AttentionBackend):
             )
 
         return o
+
+    def _decode_attention_with_bias_pytorch(
+        self,
+        q: torch.Tensor,
+        k_buffer: torch.Tensor,
+        v_buffer: torch.Tensor,
+        o: torch.Tensor,
+        kv_indptr: torch.Tensor,
+        kv_indices: torch.Tensor,
+        sm_scale: float,
+        attention_bias: torch.Tensor,
+        logit_cap: float = 0.0,
+    ):
+        """
+        PyTorch fallback for decode attention with attention bias.
+
+        Used when steering biases are present for this layer.
+        Computes attention with additive bias before softmax.
+
+        Args:
+            q: [batch, num_heads, head_dim]
+            k_buffer: [max_tokens, num_kv_heads, head_dim]
+            v_buffer: [max_tokens, num_kv_heads, head_dim]
+            o: [batch, num_heads, head_dim] output tensor
+            kv_indptr: [batch + 1] CSR format indptr
+            kv_indices: [total_kv_tokens] KV cache locations
+            sm_scale: attention scale factor
+            attention_bias: [batch, max_seq_len] additive bias tensor
+            logit_cap: optional logit capping value (0 = disabled)
+        """
+        batch_size = q.shape[0]
+        num_heads = q.shape[1]
+        num_kv_heads = k_buffer.shape[1]
+        head_dim = q.shape[2]
+
+        # GQA: heads per KV head
+        heads_per_kv = num_heads // num_kv_heads
+
+        for b in range(batch_size):
+            # Get KV cache indices for this batch element
+            kv_start = kv_indptr[b].item()
+            kv_end = kv_indptr[b + 1].item()
+            seq_len = kv_end - kv_start
+
+            if seq_len == 0:
+                continue
+
+            # Gather K, V from cache
+            kv_locs = kv_indices[kv_start:kv_end]
+            k = k_buffer[kv_locs]  # [seq_len, num_kv_heads, head_dim]
+            v = v_buffer[kv_locs]  # [seq_len, num_kv_heads, head_dim]
+
+            # Get query for this batch element
+            q_b = q[b]  # [num_heads, head_dim]
+
+            # Get bias for this batch element (truncate to seq_len)
+            bias_b = attention_bias[b, :seq_len]  # [seq_len]
+
+            # Compute attention per head (or per KV head group for GQA)
+            for kv_h in range(num_kv_heads):
+                k_h = k[:, kv_h, :]  # [seq_len, head_dim]
+                v_h = v[:, kv_h, :]  # [seq_len, head_dim]
+
+                # Process all heads that share this KV head
+                for h_offset in range(heads_per_kv):
+                    h = kv_h * heads_per_kv + h_offset
+                    q_h = q_b[h]  # [head_dim]
+
+                    # Compute attention logits: q @ k^T
+                    attn_logits = torch.matmul(q_h, k_h.t()) * sm_scale  # [seq_len]
+
+                    # Apply logit capping if enabled
+                    if logit_cap > 0:
+                        attn_logits = logit_cap * torch.tanh(attn_logits / logit_cap)
+
+                    # Add steering bias before softmax
+                    attn_logits = attn_logits + bias_b
+
+                    # Softmax
+                    attn_weights = F.softmax(attn_logits, dim=-1)  # [seq_len]
+
+                    # Compute output: weights @ v
+                    o[b, h, :] = torch.matmul(attn_weights, v_h)  # [head_dim]
 
     def _compute_attention_token_info(
         self,
