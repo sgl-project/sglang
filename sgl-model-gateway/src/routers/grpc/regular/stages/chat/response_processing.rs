@@ -19,8 +19,6 @@ use crate::routers::{
 };
 
 /// Chat response processing stage
-///
-/// Extracts chat-specific response processing logic from the old unified ResponseProcessingStage.
 pub(crate) struct ChatResponseProcessingStage {
     processor: processor::ResponseProcessor,
     streaming_processor: Arc<streaming::StreamingProcessor>,
