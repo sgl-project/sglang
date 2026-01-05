@@ -1498,7 +1498,9 @@ def fbgemm_preprocess_kernel(
     offsets_ptr,
     output_ptr,
     output_group_id_ptr,
-    M, K, m_max,
+    M,
+    K,
+    m_max,
     lhs_row_stride,
     lhs_col_stride,
     output_row_stride,
@@ -1527,7 +1529,9 @@ def fbgemm_preprocess_kernel(
                 tl.store(out_row + cols * output_col_stride, val, mask=mask)
 
 
-def run_fbgemm_preprocess(lhs: torch.Tensor, m_sizes: torch.Tensor, output: torch.Tensor):
+def run_fbgemm_preprocess(
+    lhs: torch.Tensor, m_sizes: torch.Tensor, output: torch.Tensor
+):
     """
     Args:
         lhs: [num_groups, m_max, k], bf16
@@ -1548,13 +1552,21 @@ def run_fbgemm_preprocess(lhs: torch.Tensor, m_sizes: torch.Tensor, output: torc
     group_id = torch.empty(M, dtype=torch.int32, device=lhs.device)
 
     BLOCK_SIZE = 512
-    grid = (M, )
+    grid = (M,)
     fbgemm_preprocess_kernel[grid](
-        lhs, m_sizes, offsets, output, group_id,
-        M, k, m_max,
-        lhs.stride(0), lhs.stride(1),
-        output.stride(0), output.stride(1),
-        BLOCK_SIZE
+        lhs,
+        m_sizes,
+        offsets,
+        output,
+        group_id,
+        M,
+        k,
+        m_max,
+        lhs.stride(0),
+        lhs.stride(1),
+        output.stride(0),
+        output.stride(1),
+        BLOCK_SIZE,
     )
 
     return output, group_id
@@ -1567,7 +1579,9 @@ def fbgemm_postprocess_kernel(
     offsets_ptr,
     output_ptr,
     group_id_ptr,
-    M, K, m_max,
+    M,
+    K,
+    m_max,
     total_m_ptr,
     lhs_row_stride,
     lhs_col_stride,
@@ -1592,7 +1606,13 @@ def fbgemm_postprocess_kernel(
             tl.store(out_row + cols * output_col_stride, val, mask=mask)
 
 
-def run_fbgemm_postprocess(lhs: torch.Tensor, m_sizes: torch.Tensor, m_max: int, output: torch.Tensor, group_id: torch.Tensor):
+def run_fbgemm_postprocess(
+    lhs: torch.Tensor,
+    m_sizes: torch.Tensor,
+    m_max: int,
+    output: torch.Tensor,
+    group_id: torch.Tensor,
+):
     """
     Args:
         lhs: [num_groups * m_max, k], bf16
@@ -1606,21 +1626,28 @@ def run_fbgemm_postprocess(lhs: torch.Tensor, m_sizes: torch.Tensor, m_max: int,
     num_groups = m_sizes.shape[0]
     k = output.shape[1]
     M = num_groups * m_max
- 
+
     # Precompute offsets
     offsets = torch.zeros(num_groups + 1, dtype=torch.int32, device=m_sizes.device)
     offsets[1:] = torch.cumsum(m_sizes, dim=0)
 
     BLOCK_SIZE = 512
-    grid = (M, )
+    grid = (M,)
     fbgemm_postprocess_kernel[grid](
-        lhs, m_sizes, offsets,
-        output, group_id,
-        M, k, m_max,
+        lhs,
+        m_sizes,
+        offsets,
+        output,
+        group_id,
+        M,
+        k,
+        m_max,
         offsets[-1],
-        lhs.stride(0), lhs.stride(1),
-        output.stride(0), output.stride(1),
-        BLOCK_SIZE
+        lhs.stride(0),
+        lhs.stride(1),
+        output.stride(0),
+        output.stride(1),
+        BLOCK_SIZE,
     )
 
     return output.view(num_groups, m_max, k)

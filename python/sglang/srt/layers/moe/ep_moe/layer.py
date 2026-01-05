@@ -17,8 +17,8 @@ from sglang.srt.layers.moe import (
     get_moe_runner_backend,
 )
 from sglang.srt.layers.moe.ep_moe.kernels import (
-    run_fbgemm_preprocess,
     run_fbgemm_postprocess,
+    run_fbgemm_preprocess,
     silu_and_mul_masked_fwd,
 )
 from sglang.srt.layers.moe.fused_moe_triton.layer import (
@@ -101,9 +101,13 @@ class DeepEPMoE(FusedMoE):
             routed_scaling_factor=routed_scaling_factor,
             **kwargs,
         )
-        self.use_fb_grouped_gemm = get_moe_a2a_backend().is_deepep() and quant_config is None
+        self.use_fb_grouped_gemm = (
+            get_moe_a2a_backend().is_deepep() and quant_config is None
+        )
         if self.use_fb_grouped_gemm:
-            self.w13_weight_flatten = self.w13_weight.view(-1, self.w13_weight.shape[-1])
+            self.w13_weight_flatten = self.w13_weight.view(
+                -1, self.w13_weight.shape[-1]
+            )
             self.w2_weight_flatten = self.w2_weight.view(-1, self.w2_weight.shape[-1])
 
         if _use_aiter or _is_npu:
