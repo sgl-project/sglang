@@ -38,7 +38,8 @@ class BaseReasoningFormatDetector:
         One-time parsing: Detects and parses reasoning sections in the provided text.
         Returns both reasoning content and normal text separately.
         """
-        in_reasoning = self._in_reasoning or self.think_start_token in text
+        # self._in_reasoning is only for streaming parsing
+        in_reasoning = self.think_start_token in text or self.think_end_token in text
 
         if not in_reasoning:
             return StreamingParseResult(normal_text=text)
@@ -315,6 +316,7 @@ class ReasoningParser:
         "step3": DeepSeekR1Detector,
         "nano_v3": NanoV3Detector,
         "interns1": Qwen3Detector,
+        "mimo": Qwen3Detector,
     }
 
     def __init__(
