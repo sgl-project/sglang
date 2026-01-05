@@ -11,9 +11,13 @@ from sgl_kernel_npu.attention.sinks_attention import (
 )
 
 from sglang.srt.configs.model_config import AttentionArch
+<<<<<<< HEAD
 from sglang.srt.hardware_backend.npu.attention.ascend_torch_native_backend import (
     AscendTorchNativeAttnBackend,
 )
+=======
+from sglang.srt.dllm.config import DllmConfig
+>>>>>>> f0f60a812 ([NPU] support DLLM ascend backend on NPU, with LLaDA2 testing)
 from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
     is_fia_nz,
     is_mla_preprocess_enabled,
@@ -246,6 +250,12 @@ class AscendAttnBackend(AttentionBackend):
         )
         if self.use_mla:
             self.ringmla_mask = self.ascend_attn_mask_builder.ringmla_mask
+
+        # dllm model config
+        self.dllm_config = DllmConfig.from_server_args(model_runner.server_args)
+        self.is_dllm_model = False
+        if self.dllm_config is not None:
+            self.is_dllm_model = True
 
     def get_verify_buffers_to_fill_after_draft(self):
         """
@@ -818,13 +828,13 @@ class AscendAttnBackend(AttentionBackend):
                     or layer.attn_type == AttentionType.ENCODER_ONLY
                 ):
                     causal = False
-
                 # there are some accuracy issues in cross attention scene to use torch_npu._npu_flash_attention_qlens
                 # forward_batch.encoder_lens is not None in cross attention scend, we add native attn to solve accuracy issues
                 if (
                     layer.qk_head_dim <= 128
                     and causal
                     and forward_batch.encoder_lens is None
+                    and not self.is_dllm_model
                 ):
                     if not self.use_alibi:
                         query = q.reshape(-1, layer.tp_q_head_num * layer.qk_head_dim)

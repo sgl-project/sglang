@@ -247,7 +247,7 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
             # num_fused_shared_experts=self.num_fused_shared_experts,
             topk_group=self.topk_group,
             correction_bias=self.correction_bias,
-            routed_scaling_factor=self.routed_scaling_factor,
+            # routed_scaling_factor=self.routed_scaling_factor,
         )
 
         self.experts = get_moe_impl_class(quant_config)(
@@ -257,7 +257,7 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
             hidden_size=config.hidden_size,
             intermediate_size=config.moe_intermediate_size,
             quant_config=quant_config,
-            routed_scaling_factor=self.routed_scaling_factor,
+            # routed_scaling_factor=self.routed_scaling_factor,
             prefix=add_prefix("experts", prefix),
         )
         # shared expert
@@ -362,6 +362,9 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
             shared_output = self._forward_shared_experts(hidden_states)
             final_hidden_states = self._forward_router_experts(hidden_states)
 
+        # manually scales the hidden states as not all moe runner support fuse scaling factor
+        final_hidden_states.mul_(self.routed_scaling_factor)
+
         if self.num_shared_experts > 0:
             final_hidden_states = final_hidden_states + shared_output
 
@@ -395,8 +398,12 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
             topk_output=topk_output,
         )
 
+        # manually scales the hidden states as not all moe runner support fuse scaling factor
+        final_hidden_states.mul_(self.routed_scaling_factor)
+
         if shared_output is not None:
             final_hidden_states += shared_output
+
         return final_hidden_states
 
 

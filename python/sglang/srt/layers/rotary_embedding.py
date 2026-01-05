@@ -301,6 +301,11 @@ class RotaryEmbedding(MultiPlatformOp):
         ), "fused_set_kv_buffer_arg is not supported for npu implementation"
         if query.dtype == torch.bfloat16 and self.cos_sin_cache.dtype == torch.float:
             return self.forward_native(positions, query, key, offsets)
+
+        # cast the position dtype to int64 for npu_mrope call
+        if positions.dtype != torch.int64:
+            positions = positions.to(torch.int64)
+
         if self.is_neox_style:
             rotary_mode = "half"
         else:
