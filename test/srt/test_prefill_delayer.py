@@ -17,32 +17,6 @@ from sglang.test.test_utils import (
 )
 
 
-@contextmanager
-def prefill_delayer_env(enabled: bool):
-    with envs.SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE.override(
-        enabled
-    ), envs.SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES.override(100):
-        yield
-
-
-def launch_dp_attention_server(model, base_url, other_args=None):
-    return popen_launch_server(
-        model,
-        base_url,
-        timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-        other_args=[
-            "--trust-remote-code",
-            "--tp",
-            "8",
-            "--enable-dp-attention",
-            "--dp",
-            "8",
-            "--chunked-prefill-size",
-            "131072",
-            *(other_args or []),
-        ],
-    )
-
 
 class TestPrefillDelayerThroughput(CustomTestCase):
     def test_1_online_serving_has_prefill_delayer(self):
@@ -98,12 +72,12 @@ class TestPrefillDelayerThroughput(CustomTestCase):
         model = "Qwen/Qwen3-0.6B"
         base_url = DEFAULT_URL_FOR_TEST
 
-        with prefill_delayer_env(prefill_delayer):
-            process = launch_dp_attention_server(
-                model,
-                base_url,
-                ["--schedule-policy", "lpm", *other_launch_args],
-            )
+        process = _launch_server(
+            prefill_delayer=prefill_delayer,
+            model=model,
+            base_url=base_url,
+            other_args=["--schedule-policy", "lpm", *other_launch_args],
+        )
 
         try:
             args = get_benchmark_args(
@@ -126,8 +100,12 @@ class TestPrefillDelayerAccuracy(CustomTestCase):
     def setUpClass(cls):
         cls.model = DEFAULT_MLA_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
-        with prefill_delayer_env(True):
-            cls.process = launch_dp_attention_server(cls.model, cls.base_url)
+        cls.process = _launch_server(
+            prefill_delayer=prefill_delayer,
+            model=cls.model,
+            base_url=cls.base_url,
+            other_args=[],
+        )
 
     @classmethod
     def tearDownClass(cls):
@@ -144,6 +122,26 @@ class TestPrefillDelayerAccuracy(CustomTestCase):
         metrics = run_eval(args)
         print(f"{metrics=}")
         self.assertGreater(metrics["score"], 0.8)
+
+
+def _launch_server(*, model, base_url,prefill_delayer: bool, other_args):
+    with envs.SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE.override(prefill_delayer), envs.SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES.override(100):
+        return popen_launch_server(
+            model,
+            base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=[
+                "--trust-remote-code",
+                "--tp",
+                "8",
+                "--enable-dp-attention",
+                "--dp",
+                "8",
+                "--chunked-prefill-size",
+                "131072",
+                *(other_args or []),
+            ],
+        )
 
 
 if __name__ == "__main__":
