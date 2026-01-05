@@ -12,7 +12,7 @@ from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_r
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.attention.fla.layernorm_gated import RMSNorm as RMSNormGated
 from sglang.srt.layers.attention.mamba.mamba import mamba_v2_sharded_weight_loader
-from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
+from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes, ScatterMode
 from sglang.srt.layers.dp_attention import (
     get_attention_tp_rank,
     get_attention_tp_size,
@@ -50,6 +50,8 @@ from sglang.srt.utils import (
     set_weight_attrs,
 )
 from sglang.srt.utils.custom_op import register_custom_op
+from sglang.srt.batch_overlap.two_batch_overlap import model_forward_maybe_tbo
+
 
 logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
@@ -468,7 +470,106 @@ class Qwen3GatedDeltaNet(nn.Module):
 
         output, _ = self.out_proj(core_attn_out)
         return output
+    
+    
 
+    def op_prepare(self, state):
+        # FIXME
+        hidden_states: torch.Tensor = state.pop("hidden_states_after_comm_pre_attn")
+        forward_batch = state.forward_batch
+
+        if forward_batch.forward_mode.is_idle():
+            state.attn_intermediate_state = hidden_states, None
+            return
+
+        seq_len, _ = hidden_states.shape
+        is_cuda_graph = forward_batch.forward_mode.is_cuda_graph()
+
+        projected_states_qkvz, projected_states_ba = self._forward_input_proj(
+            hidden_states
+        )
+
+        if self.num_v_heads // self.num_k_heads in [1, 2, 4] and is_cuda_graph:
+            mixed_qkv, z, b, a = fused_qkvzba_split_reshape_cat(
+                projected_states_qkvz,
+                projected_states_ba,
+                triton.cdiv(self.num_k_heads, self.attn_tp_size),
+                triton.cdiv(self.num_v_heads, self.attn_tp_size),
+                self.head_k_dim,
+                self.head_v_dim,
+            )
+        else:
+            query, key, value, z, b, a = self.fix_query_key_value_ordering(
+                projected_states_qkvz, projected_states_ba
+            )
+            query, key, value = map(
+                lambda x: x.reshape(x.shape[0], -1), (query, key, value)
+            )
+            mixed_qkv = torch.cat((query, key, value), dim=-1)
+            
+            # if(query.device.index == 0): 
+            #    print(f"query:{query[0,:]}")
+        # mixed_qkv = rearrange(mixed_qkv, "b l d -> b d l")
+
+        # 2. Convolution sequence transformation
+        conv_weights = self.conv1d.weight.view(
+            self.conv1d.weight.size(0), self.conv1d.weight.size(2)
+        )
+
+        kwargs = {
+            "mixed_qkv": mixed_qkv,
+            "conv_weights": conv_weights,
+            "bias": self.conv1d.bias,
+            "activation": self.activation,
+            "key_dim": self.key_dim,
+            "value_dim": self.value_dim,
+            "attention_tp_size": self.attn_tp_size,
+            "head_k_dim": self.head_k_dim,
+            "head_v_dim": self.head_v_dim,
+            "a": a,
+            "b": b,
+            "A_log": self.A_log,
+            "dt_bias": self.dt_bias,
+            "layer_id": self.layer_id,
+            "seq_len": seq_len,
+            "z": z,
+        }
+
+        state.attn_intermediate_state = None, kwargs
+
+    def op_core(self, state):
+        hidden_state, kwargs = state.pop("attn_intermediate_state")
+        forward_batch = state.forward_batch
+        if forward_batch.forward_mode.is_idle():
+            state.hidden_states_after_attn = hidden_state
+            return
+
+        core_attn_out = forward_batch.attn_backend.forward(
+            q=None,
+            k=None,
+            v=None,
+            layer=None,
+            forward_batch=forward_batch,
+            **kwargs,
+        )
+
+        z = kwargs.get("z")
+        z_shape_og = z.shape
+        # reshape input data into 2D tensor
+        core_attn_out = core_attn_out.reshape(-1, core_attn_out.shape[-1])
+        z = z.reshape(-1, z.shape[-1])
+        core_attn_out = self.norm(core_attn_out, z)
+        core_attn_out = core_attn_out.reshape(z_shape_og)
+        if core_attn_out.numel() == 0:
+            # if core_attn_out is None , return
+            state.hidden_states_after_attn = hidden_state
+            return
+        
+        core_attn_out = core_attn_out.reshape(*core_attn_out.shape[:-2], -1)
+
+        output, _ = self.out_proj(core_attn_out)
+
+        state.hidden_states_after_attn = output
 
 class Qwen3HybridLinearDecoderLayer(nn.Module):
 
@@ -559,6 +660,73 @@ class Qwen3HybridLinearDecoderLayer(nn.Module):
         )
 
         return hidden_states, residual
+    def op_comm_prepare_attn(
+        self,
+        state,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        residual: Optional[torch.Tensor],
+        tbo_subbatch_index: Optional[int] = None,
+    ):
+        state.hidden_states_after_comm_pre_attn, state.residual_after_input_ln = (
+            self.layer_communicator.prepare_attn(hidden_states, residual, forward_batch)
+        )
+        state.update(
+            dict(
+                forward_batch=forward_batch,
+                positions=positions,
+                tbo_subbatch_index=tbo_subbatch_index,
+            )
+        )
+    
+    def op_attn_prepare(self, state):
+        self.linear_attn.op_prepare(state)
+
+    def op_attn_core(self, state):
+         self.linear_attn.op_core(state)
+
+    def op_comm_prepare_mlp(self, state):
+        state.hidden_states_mlp_input, state.residual_after_comm_pre_mlp = (
+            self.layer_communicator.prepare_mlp(
+                state.pop("hidden_states_after_attn"),
+                state.pop("residual_after_input_ln"),
+                state.forward_batch,
+            )
+        )
+
+    def op_mlp(self, state):
+        use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
+            state.forward_batch
+        )
+        hidden_states = state.pop("hidden_states_mlp_input")
+        state.hidden_states_mlp_output = self.mlp(
+            hidden_states, state.forward_batch, use_reduce_scatter
+        )
+
+    def op_comm_postprocess_layer(self, state):
+        hidden_states, residual = self.layer_communicator.postprocess_layer(
+            state.pop("hidden_states_mlp_output"),
+            state.pop("residual_after_comm_pre_mlp"),
+            state.forward_batch,
+        )
+
+        output = dict(
+            positions=state.positions,
+            hidden_states=hidden_states,
+            residual=residual,
+            forward_batch=state.forward_batch,
+            tbo_subbatch_index=state.tbo_subbatch_index,
+        )
+
+        state.clear(
+            expect_keys={
+                "positions",
+                "forward_batch",
+                "tbo_subbatch_index",
+            }
+        )
+        return output
 
 
 class Qwen3HybridAttentionDecoderLayer(nn.Module):
@@ -780,6 +948,115 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
         )
 
         return hidden_states, residual
+       
+    def op_comm_prepare_attn(
+        self,
+        state,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        residual: Optional[torch.Tensor],
+        tbo_subbatch_index: Optional[int] = None,
+    ):
+        state.hidden_states_after_comm_pre_attn, state.residual_after_input_ln = (
+            self.layer_communicator.prepare_attn(hidden_states, residual, forward_batch)
+        )
+        state.update(
+            dict(
+                forward_batch=forward_batch,
+                positions=positions,
+                tbo_subbatch_index=tbo_subbatch_index,
+            )
+        )
+
+    def op_attn_prepare(self, state):
+        hidden_states = state.pop("hidden_states_after_comm_pre_attn")
+        if hidden_states.shape[0] == 0:
+            state.attn_intermediate_state = hidden_states, None
+            return
+
+        qkv, _ = self.qkv_proj(hidden_states)
+
+        if self.attn_output_gate:
+            q_gate, k, v = qkv.split(
+                [self.q_size * 2, self.kv_size, self.kv_size], dim=-1
+            )
+            orig_shape = q_gate.shape[:-1]
+            q_gate = q_gate.view(*orig_shape, self.num_heads, -1)
+            q, gate = torch.chunk(q_gate, 2, dim=-1)
+            q = q.reshape(*orig_shape, -1)
+            gate = gate.reshape(*orig_shape, -1)
+        else:
+            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+            gate = None
+
+        q, k = self._apply_qk_norm(q, k)
+
+        q, k = self.rotary_emb(state.positions, q, k)
+
+        state.attn_intermediate_state = None, (q, k, v, gate)
+    
+    def op_attn_core(self, state):
+        hidden_states, inner_state = state.pop("attn_intermediate_state")
+
+        if inner_state is None:
+            state.hidden_states_after_attn = hidden_states
+            return
+
+        q, k, v, gate = inner_state
+
+        attn_output = self.attn(q, k, v, state.forward_batch)
+
+        if self.attn_output_gate:
+            gate = torch.sigmoid(gate)
+            attn_output = attn_output * gate
+
+        output, _ = self.o_proj(attn_output)
+
+        state.hidden_states_after_attn = output
+
+
+    def op_comm_prepare_mlp(self, state):
+        state.hidden_states_mlp_input, state.residual_after_comm_pre_mlp = (
+            self.layer_communicator.prepare_mlp(
+                state.pop("hidden_states_after_attn"),
+                state.pop("residual_after_input_ln"),
+                state.forward_batch,
+            )
+        )
+
+    def op_mlp(self, state):
+        use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
+            state.forward_batch
+        )
+        hidden_states = state.pop("hidden_states_mlp_input")
+        state.hidden_states_mlp_output = self.mlp(
+            hidden_states, state.forward_batch, use_reduce_scatter
+        )
+
+    def op_comm_postprocess_layer(self, state):
+        hidden_states, residual = self.layer_communicator.postprocess_layer(
+            state.pop("hidden_states_mlp_output"),
+            state.pop("residual_after_comm_pre_mlp"),
+            state.forward_batch,
+        )
+
+        output = dict(
+            positions=state.positions,
+            hidden_states=hidden_states,
+            residual=residual,
+            forward_batch=state.forward_batch,
+            tbo_subbatch_index=state.tbo_subbatch_index,
+        )
+
+        state.clear(
+            expect_keys={
+                "positions",
+                "forward_batch",
+                "tbo_subbatch_index",
+            }
+        )
+        return output
 
 
 ALL_DECODER_LAYER_TYPES = {
@@ -846,16 +1123,27 @@ class Qwen3NextModel(nn.Module):
             hidden_states = self.embed_tokens(input_ids)
 
         residual = None
-        for i in range(len(self.layers)):
-            layer = self.layers[i]
-            with get_global_expert_distribution_recorder().with_current_layer(i):
-                hidden_states, residual = layer(
-                    layer_id=i,
-                    positions=positions,
-                    hidden_states=hidden_states,
-                    residual=residual,
-                    forward_batch=forward_batch,
-                )
+        if forward_batch.can_run_tbo:
+            hidden_states, residual = model_forward_maybe_tbo(
+                layers=self.layers,
+                enable_tbo=True,  #  debuging
+                positions=positions,
+                forward_batch=forward_batch,
+                hidden_states=hidden_states,
+                residual=residual,
+                input_data_scatter_mode=ScatterMode.model_input_output(),
+            )            
+        else:
+            for i in range(len(self.layers)):
+                layer = self.layers[i]
+                with get_global_expert_distribution_recorder().with_current_layer(i):
+                    hidden_states, residual = layer(
+                        layer_id=i,
+                        positions=positions,
+                        hidden_states=hidden_states,
+                        residual=residual,
+                        forward_batch=forward_batch,
+                    )
 
         if not forward_batch.forward_mode.is_idle():
             if residual is None:

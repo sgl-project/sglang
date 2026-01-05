@@ -223,6 +223,9 @@ class MambaAttnBackendBase(AttentionBackend):
                     forward_batch.extend_start_loc[-1]
                     + forward_batch.extend_seq_lens[-1]
                 )
+                # to adapt variable length split 
+                query_start_loc -= forward_batch.extend_start_loc[0]
+                
                 if (
                     forward_batch.mamba_track_mask is not None
                     and forward_batch.mamba_track_mask.any()
@@ -1040,7 +1043,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
         value = value.view(1, actual_seq_len, num_value_heads, head_v_dim)
 
         g, beta = fused_gdn_gating(A_log, a, b, dt_bias)
-
+        query_start_loc = self.forward_metadata.query_start_loc
+        
         if is_target_verify:
             core_attn_out = fused_recurrent_gated_delta_rule_update(
                 q=query,
