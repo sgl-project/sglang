@@ -8,16 +8,14 @@ from sglang.srt.utils.patch_tokenizer import (
     unpatch_tokenizer,
 )
 
-KIMI_TOKENIZER = "nvidia/Kimi-K2-Thinking-NVFP4"
-
 
 def _get_class_attr_ids(cls):
-    """Get id of all class attributes, unwrapping property.fget"""
     return {n: id(v.fget if isinstance(v, property) else v) for n, v in vars(cls).items()}
 
 
 def _load_tokenizer():
-    return AutoTokenizer.from_pretrained(KIMI_TOKENIZER, trust_remote_code=True)
+    # The slowness is mainly observed in Kimi
+    return AutoTokenizer.from_pretrained("nvidia/Kimi-K2-Thinking-NVFP4", trust_remote_code=True)
 
 
 @contextmanager
