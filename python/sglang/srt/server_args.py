@@ -388,7 +388,7 @@ class ServerArgs:
 
     # LoRA
     enable_lora: Optional[bool] = None
-    enable_lora_prefetch: Optional[bool] = None
+    enable_lora_overlap_loading: Optional[bool] = None
     max_lora_rank: Optional[int] = None
     lora_target_modules: Optional[Union[set[str], List[str]]] = None
     lora_paths: Optional[
@@ -3257,10 +3257,10 @@ class ServerArgs:
             help="Enable LoRA support for the model. This argument is automatically set to True if `--lora-paths` is provided for backward compatibility.",
         )
         parser.add_argument(
-            "--enable-lora-prefetch",
-            default=ServerArgs.enable_lora_prefetch,
+            "--enable-lora-overlap-loading",
+            default=ServerArgs.enable_lora_overlap_loading,
             action="store_true",
-            help="Enable asynchronous LoRA weight loading to overlap H2D transfers with GPU compute.",
+            help="Enable asynchronous LoRA weight loading in order to overlap H2D transfers with GPU compute. This should be enabled if you find that your LoRA workloads are bottlenecked by adapter weight loading, for example when frequently loading large LoRA adapters.",
         )
         parser.add_argument(
             "--max-lora-rank",
@@ -4765,18 +4765,18 @@ class ServerArgs:
                 )
 
         if self.enable_lora:
-            if self.enable_lora_prefetch is None:
-                self.enable_lora_prefetch = False
+            if self.enable_lora_overlap_loading is None:
+                self.enable_lora_overlap_loading = False
 
-            if self.enable_lora_prefetch:
-                # TODO (glenliu21): use some sort of buffer with eviction instead of hardcoding a limit
-                PREFETCH_MAX_LOADED_LORAS = 32
+            if self.enable_lora_overlap_loading:
+                # TODO (glenliu21): use some sort of buffer with eviction instead of enforcing a limit
+                max_loaded_loras_limit = self.max_loras_per_batch * 2
                 assert (
                     self.max_loaded_loras is not None
-                    and self.max_loaded_loras <= PREFETCH_MAX_LOADED_LORAS
+                    and self.max_loaded_loras <= max_loaded_loras_limit
                 ), (
-                    "Enabling LoRA prefetch requires pinning LoRA adapter weights in CPU memory, "
-                    f"so --max-loaded-loras must be less than or equal to {PREFETCH_MAX_LOADED_LORAS}"
+                    "Enabling LoRA overlap loading requires pinning LoRA adapter weights in CPU memory, "
+                    f"so --max-loaded-loras must be less than or equal to double --max-loras-per-batch: {max_loaded_loras_limit}"
                 )
 
             # Validate compatibility with speculative decoding

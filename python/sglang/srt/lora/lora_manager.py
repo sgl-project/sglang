@@ -72,7 +72,9 @@ class LoRAManager:
         self.tp_size: int = tp_size
         self.tp_rank: int = tp_rank
         self.lora_added_tokens_size: Optional[int] = None
-        self.enable_lora_prefetch: Optional[bool] = server_args.enable_lora_prefetch
+        self.enable_lora_overlap_loading: Optional[bool] = (
+            server_args.enable_lora_overlap_loading
+        )
 
         # Store eviction policy from server args
         self.eviction_policy = server_args.lora_eviction_policy
@@ -240,11 +242,11 @@ class LoRAManager:
 
         return required_slots <= mem_pool_vacancy
 
-    def fetch_new_lora(
-        self, new_lora_id: Optional[str], running_loras: set[Optional[str]]
+    def fetch_new_loras(
+        self, new_loras: set[Optional[str]], running_loras: set[Optional[str]] = set()
     ):
         # Load active loras into lora memory pool
-        cur_uids = {new_lora_id} | running_loras
+        cur_uids = new_loras | running_loras
 
         assert len(cur_uids) <= self.max_loras_per_batch
         self.memory_pool.prepare_lora_batch(
@@ -447,9 +449,9 @@ class LoRAManager:
         )
         lora_adapter.initialize_weights()
 
-        # If we want to prefetch LoRA adapters, they must be pinned in CPU memory
-        if self.enable_lora_prefetch:
-            lora_adapter.pin_weights()
+        # If we want to overlap loading LoRA adapters with compute, they must be pinned in CPU memory
+        if self.enable_lora_overlap_loading:
+            lora_adapter.pin_weights_in_cpu()
 
         self.loras[lora_ref.lora_id] = lora_adapter
 
@@ -469,7 +471,7 @@ class LoRAManager:
         )
 
         # Initializing memory pool with base model
-        self.fetch_new_lora(None, set())
+        self.fetch_new_loras({None})
 
     def set_lora_module(self, module_name, module):
         lora_module = get_lora_layer(module, self.lora_backend)

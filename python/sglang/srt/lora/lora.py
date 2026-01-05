@@ -198,7 +198,7 @@ class LoRAAdapter(nn.Module):
                     weights[gate_up_name] = weights[gate_up_name].repeat(2, 1)
                 # else: no-op as LoRA B weight is already stacked.
 
-    def pin_weights(self):
+    def pin_weights_in_cpu(self):
         for layer in self.layers:
             for name, weight in layer.weights.items():
                 layer.weights[name] = weight.pin_memory()
