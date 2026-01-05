@@ -121,6 +121,9 @@ __global__ void fused_qknorm(const QKNormParams __grid_constant__ params) {
 
 template <int64_t kHeadDim, bool kUsePDL, typename DType>
 struct QKNormKernel {
+  static_assert(
+      std::is_same_v<DType, half> || std::is_same_v<DType, nv_bfloat16>,
+      "Unsupported DType: QKNormKernel only supports half and nv_bfloat16.");
   using DType2 = host::PackedDType<DType, 2>::type;
 
   // only initialize once (static variable) to avoid overhead
@@ -145,17 +148,17 @@ struct QKNormKernel {
 
     TensorMatcher({N, Q, D})  // q input
         .with_strides({Sq, D, 1})
-        .with_dtype<nv_bfloat16, half>(dtype)
-        .with_device<kDLCUDA>(device)
+        .with_dtype<DType>(dtype)
+        .template with_device<kDLCUDA>(device)
         .verify(q);
     TensorMatcher({N, K, D})  // k input
         .with_strides({Sk, D, 1})
-        .with_dtype<nv_bfloat16, half>(dtype)
-        .with_device<kDLCUDA>(device)
+        .with_dtype<DType>(dtype)
+        .template with_device<kDLCUDA>(device)
         .verify(k);
     TensorMatcher({D})  // weight
-        .with_dtype<nv_bfloat16, half>(dtype)
-        .with_device<kDLCUDA>(device)
+        .with_dtype<DType>(dtype)
+        .template with_device<kDLCUDA>(device)
         .verify(q_weight)
         .verify(k_weight);
 

@@ -49,50 +49,6 @@ namespace host {
 template <typename>
 inline constexpr bool dependent_false_v = false;
 
-// DType
-template <typename DType, int Pack>
-struct PackedDType {
-  static_assert(dependent_false_v<DType>, "Unsupported dtype for Packed");
-};
-
-template <>
-struct PackedDType<float, 2> {
-  using type = float2;
-};
-
-template <>
-struct PackedDType<float, 4> {
-  using type = float4;
-};
-
-template <>
-struct PackedDType<__half, 2> {
-  using type = __half2;
-};
-
-struct alignas(8) half4 {
-  __half x, y, z, w;
-};
-
-template <>
-struct PackedDType<__half, 4> {
-  using type = half4;
-};
-
-template <>
-struct PackedDType<nv_bfloat16, 2> {
-  using type = nv_bfloat162;
-};
-
-struct alignas(8) bf16_4 {
-  nv_bfloat16 x, y, z, w;
-};
-
-template <>
-struct PackedDType<nv_bfloat16, 4> {
-  using type = bf16_4;
-};
-
 struct DebugInfo : public source_location_t {
   DebugInfo(source_location_t loc = source_location_t::current()) : source_location_t(loc) {}
 };
