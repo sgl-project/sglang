@@ -8,7 +8,6 @@ use std::{collections::HashMap, sync::Arc};
 use tokio::{sync::RwLock, task::JoinHandle};
 
 use crate::{
-    core::WorkerRegistry,
     data_connector::{ConversationItemStorage, ConversationStorage, ResponseStorage},
     grpc_client::SglangSchedulerClient,
     mcp::McpManager,
@@ -36,12 +35,8 @@ pub(crate) struct ResponsesContext {
     /// Chat pipeline for executing requests
     pub pipeline: Arc<RequestPipeline>,
 
-    /// Shared components (tokenizer, parsers, worker_registry)
+    /// Shared components (tokenizer, parsers)
     pub components: Arc<SharedComponents>,
-
-    /// Worker registry for validation
-    #[allow(dead_code)]
-    pub worker_registry: Arc<WorkerRegistry>,
 
     /// Response storage backend
     pub response_storage: Arc<dyn ResponseStorage>,
@@ -64,7 +59,6 @@ impl ResponsesContext {
     pub fn new(
         pipeline: Arc<RequestPipeline>,
         components: Arc<SharedComponents>,
-        worker_registry: Arc<WorkerRegistry>,
         response_storage: Arc<dyn ResponseStorage>,
         conversation_storage: Arc<dyn ConversationStorage>,
         conversation_item_storage: Arc<dyn ConversationItemStorage>,
@@ -73,7 +67,6 @@ impl ResponsesContext {
         Self {
             pipeline,
             components,
-            worker_registry,
             response_storage,
             conversation_storage,
             conversation_item_storage,
