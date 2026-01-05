@@ -497,6 +497,7 @@ TWO_GPU_CASES_A = [
             modality="video",
             warmup=0,
             custom_validator="video",
+            num_gpus=2,
         ),
         TI2V_sampling_params,
     ),
