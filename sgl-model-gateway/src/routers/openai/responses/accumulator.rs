@@ -3,7 +3,7 @@
 use serde_json::Value;
 use tracing::warn;
 
-use super::streaming::{extract_output_index, get_event_type};
+use super::common::{extract_output_index, get_event_type};
 use crate::protocols::event_types::{OutputItemEvent, ResponseEvent};
 
 // ============================================================================
