@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from sglang.srt.managers.prefill_delayer import PrefillDelayerSinglePassExecutor
+
 # Copyright 2023-2024 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -26,10 +28,10 @@ import torch
 
 from sglang.srt.layers.attention.nsa.utils import is_nsa_prefill_cp_in_seq_split
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
-from sglang.srt.mem_cache.allocator import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
+from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
 from sglang.srt.server_args import ServerArgs
 
@@ -327,6 +329,7 @@ class PrefillAdder:
         mixed_with_decode_tokens: int = 0,
         priority_scheduling_preemption_threshold: int = 0,
         prefill_max_requests: Optional[int] = None,
+        prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor] = None,
     ):
         self.page_size = page_size
         self.tree_cache = tree_cache
@@ -366,6 +369,7 @@ class PrefillAdder:
         )
         self.nsa_prefill_cp_in_seq_split = is_nsa_prefill_cp_in_seq_split()
         self.prefill_max_requests = prefill_max_requests
+        self.prefill_delayer_single_pass = prefill_delayer_single_pass
 
     def _get_running_request_total_token_offset(self, req: Req) -> int:
         return (
@@ -612,6 +616,13 @@ class PrefillAdder:
             input_tokens = self.ceil_paged_tokens(req.extend_input_len)
 
             if input_tokens >= self.rem_input_tokens and len(self.can_run_list) != 0:
+                return AddReqResult.OTHER
+
+            if (self.prefill_delayer_single_pass is not None) and (
+                not self.prefill_delayer_single_pass.negotiate_should_allow_prefill(
+                    local_prefillable=True
+                )
+            ):
                 return AddReqResult.OTHER
 
             if self.rem_chunk_tokens is None or input_tokens <= self.rem_chunk_tokens:

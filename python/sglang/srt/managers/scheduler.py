@@ -16,12 +16,12 @@
 import faulthandler
 import logging
 import os
-import pickle
 import signal
 import sys
 import time
 from collections import deque
 from concurrent import futures
+from contextlib import nullcontext
 from dataclasses import dataclass
 from http import HTTPStatus
 from typing import Any, Deque, Dict, List, Optional, Tuple, Union
@@ -120,6 +120,10 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.mm_utils import init_mm_embedding_cache
 from sglang.srt.managers.overlap_utils import FutureMap
+from sglang.srt.managers.prefill_delayer import (
+    PrefillDelayer,
+    PrefillDelayerSinglePassExecutor,
+)
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
     ModelWorkerBatch,
@@ -134,7 +138,6 @@ from sglang.srt.managers.schedule_policy import (
     SchedulePolicy,
 )
 from sglang.srt.managers.scheduler_dp_attn_mixin import SchedulerDPAttnMixin
-from sglang.srt.managers.scheduler_enhancer import SchedulerEnhancer
 from sglang.srt.managers.scheduler_input_blocker import SchedulerInputBlocker
 from sglang.srt.managers.scheduler_metrics_mixin import (
     RECORD_STEP_TIME,
@@ -204,7 +207,6 @@ logger = logging.getLogger(__name__)
 TEST_RETRACT = envs.SGLANG_TEST_RETRACT.get()
 TEST_RETRACT_INTERVAL = envs.SGLANG_TEST_RETRACT_INTERVAL.get()
 TEST_RETRACT_NO_PREFILL_BS = envs.SGLANG_TEST_RETRACT_NO_PREFILL_BS.get()
-SCHEDULER_DECREASE_PREFILL_IDLE = envs.SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE.get()
 GRAMMAR_TIMEOUT = float(os.environ.get("SGLANG_GRAMMAR_TIMEOUT", 300))
 
 
@@ -797,14 +799,13 @@ class Scheduler(
             self.enable_priority_scheduling,
             self.schedule_low_priority_values_first,
         )
-        self.schedule_enhancer = None
-        if SCHEDULER_DECREASE_PREFILL_IDLE:
-            self.schedule_enhancer = SchedulerEnhancer(
-                self.dp_size,
-                self.attn_tp_size,
-                self.tp_worker,
-                self.max_running_requests,
-                self.server_args,
+        self.prefill_delayer: Optional[PrefillDelayer] = None
+        if envs.SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE.get():
+            self.prefill_delayer = PrefillDelayer(
+                dp_size=self.dp_size,
+                attn_tp_size=self.attn_tp_size,
+                tp_worker=self.tp_worker,
+                server_args=self.server_args,
             )
         # Enable preemption for priority scheduling.
         self.try_preemption = self.enable_priority_scheduling
@@ -1188,41 +1189,6 @@ class Scheduler(
             return False
         return num_recv_reqs >= self.max_recv_per_poll
 
-    def _parse_multipart_message(self, parts):
-        # Check message type
-        msg_type = bytes(parts[0])
-
-        if msg_type == b"NORM":
-            # Normal message
-            recv_req = pickle.loads(parts[1])
-
-        elif msg_type == b"FEAT":
-            # Message with optimized feature tensors
-            recv_req = pickle.loads(parts[1])
-            feature_infos = pickle.loads(parts[2])
-
-            # Reconstruct tensors
-            for i, feature_info in enumerate(feature_infos):
-                buffer_idx = 3 + i
-                buffer = (
-                    parts[buffer_idx].buffer
-                    if hasattr(parts[buffer_idx], "buffer")
-                    else parts[buffer_idx]
-                )
-
-                dtype = feature_info["dtype"]
-                shape = feature_info["shape"]
-                tensor = torch.frombuffer(buffer, dtype=dtype).reshape(shape)
-
-                idx = feature_info["idx"]
-                if hasattr(recv_req, "mm_inputs") and recv_req.mm_inputs:
-                    mm_items = recv_req.mm_inputs.get("mm_items", [])
-                    if idx < len(mm_items):
-                        mm_items[idx].feature = tensor
-        else:
-            logger.warning(f"Unknown message type: {msg_type}")
-        return recv_req
-
     def recv_requests(
         self,
     ) -> List[Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput, Any]]:
@@ -1243,15 +1209,10 @@ class Scheduler(
                     try:
                         if self.recv_limit_reached(len(recv_reqs)):
                             break
-                        parts = self.recv_from_tokenizer.recv_multipart(
-                            flags=zmq.NOBLOCK, copy=False
-                        )
-                        if not parts:
-                            break
-                        recv_req = self._parse_multipart_message(parts)
-                        recv_reqs.append(recv_req)
-                    except zmq.ZMQError as e:
+                        recv_req = self.recv_from_tokenizer.recv_pyobj(zmq.NOBLOCK)
+                    except zmq.ZMQError:
                         break
+                    recv_reqs.append(recv_req)
 
                 while True:
                     try:
@@ -1914,12 +1875,18 @@ class Scheduler(
         return res
 
     def get_new_batch_prefill(self) -> Optional[ScheduleBatch]:
-        if self.schedule_enhancer and not self.schedule_enhancer.get_schedule_decision(
-            self.running_batch
-        ):
-            # Decrease prefill idle as much as possible during high dp load.
-            return None
+        with (
+            PrefillDelayerSinglePassExecutor(self.prefill_delayer)
+            if self.prefill_delayer
+            else nullcontext()
+        ) as prefill_delayer_single_pass:
+            return self._get_new_batch_prefill_raw(
+                prefill_delayer_single_pass=prefill_delayer_single_pass
+            )
 
+    def _get_new_batch_prefill_raw(
+        self, prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor]
+    ) -> Optional[ScheduleBatch]:
         # Check if the grammar is ready in the grammar queue
         if self.grammar_queue:
             self.move_ready_grammar_requests()
@@ -1928,7 +1895,6 @@ class Scheduler(
             # Reset batch_is_full to try preemption with a prefill adder.
             self.running_batch.batch_is_full = False
 
-        # Handle the cases where prefill is not allowed
         if (
             self.running_batch.batch_is_full or len(self.waiting_queue) == 0
         ) and self.chunked_req is None:
@@ -1980,6 +1946,7 @@ class Scheduler(
             running_bs if self.is_mixed_chunk else 0,
             self.priority_scheduling_preemption_threshold,
             prefill_max_requests=self.server_args.prefill_max_requests,
+            prefill_delayer_single_pass=prefill_delayer_single_pass,
         )
 
         if self.chunked_req is not None:
@@ -2544,6 +2511,7 @@ class Scheduler(
             "token_capacity": int(self.max_total_num_tokens),
             "graph": round(self.tp_worker.model_runner.graph_mem_usage, 2),
         }
+        ret["effective_max_running_requests_per_dp"] = self.max_running_requests
 
         if not self.spec_algorithm.is_none() and self.spec_total_num_forward_ct > 0:
             ret["avg_spec_accept_length"] = (

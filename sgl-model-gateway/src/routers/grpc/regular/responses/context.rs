@@ -1,19 +1,32 @@
-//! Context for /v1/responses endpoint handlers
+//! Context and types for /v1/responses endpoint handlers
 //!
 //! Bundles all dependencies needed by responses handlers to avoid passing
 //! 10+ parameters to every function.
 
 use std::{collections::HashMap, sync::Arc};
 
-use tokio::sync::RwLock;
+use tokio::{sync::RwLock, task::JoinHandle};
 
-use super::types::BackgroundTaskInfo;
 use crate::{
     core::WorkerRegistry,
     data_connector::{ConversationItemStorage, ConversationStorage, ResponseStorage},
+    grpc_client::SglangSchedulerClient,
     mcp::McpManager,
     routers::grpc::{context::SharedComponents, pipeline::RequestPipeline},
 };
+
+/// Information stored for background tasks to enable end-to-end cancellation
+///
+/// This struct enables cancelling both the Rust task AND the Python scheduler processing.
+/// The client field is lazily initialized during pipeline execution.
+pub struct BackgroundTaskInfo {
+    /// Tokio task handle for aborting the Rust task
+    pub handle: JoinHandle<()>,
+    /// gRPC request_id sent to Python scheduler (chatcmpl-* prefix)
+    pub grpc_request_id: String,
+    /// gRPC client for sending abort requests to Python (set after client acquisition)
+    pub client: Arc<RwLock<Option<SglangSchedulerClient>>>,
+}
 
 /// Context for /v1/responses endpoint
 ///
