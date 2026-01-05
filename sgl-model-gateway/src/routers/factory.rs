@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use super::{
-    grpc::{pd_router::GrpcPDRouter, router::GrpcRouter},
+    grpc::{epd_router::GrpcEPDRouter, pd_router::GrpcPDRouter, router::GrpcRouter},
     http::{pd_router::PDRouter, router::Router},
     openai::OpenAIRouter,
     RouterTrait,
@@ -37,22 +37,23 @@ impl RouterFactory {
                     )
                     .await
                 }
-                RoutingMode::OpenAI { .. } => {
-                    Err("OpenAI mode requires HTTP connection_mode".to_string())
-                }
-                // EPD mode falls back to PD router for now (EPD router added in separate PR)
                 RoutingMode::EncodePrefillDecode {
+                    encode_policy,
                     prefill_policy,
                     decode_policy,
                     ..
                 } => {
-                    Self::create_grpc_pd_router(
+                    Self::create_grpc_epd_router(
+                        encode_policy.as_ref(),
                         prefill_policy.as_ref(),
                         decode_policy.as_ref(),
                         &ctx.router_config.policy,
                         ctx,
                     )
                     .await
+                }
+                RoutingMode::OpenAI { .. } => {
+                    Err("OpenAI mode requires HTTP connection_mode".to_string())
                 }
             },
             ConnectionMode::Http => match &ctx.router_config.mode {
@@ -70,21 +71,13 @@ impl RouterFactory {
                     )
                     .await
                 }
+                RoutingMode::EncodePrefillDecode { .. } => Err(
+                    "EPD (Encode-Prefill-Decode) mode requires gRPC connection_mode. \
+                         Use --connection-mode grpc or configure connection_mode: grpc in config."
+                        .to_string(),
+                ),
+
                 RoutingMode::OpenAI { .. } => Self::create_openai_router(ctx).await,
-                // EPD mode falls back to PD router for now (EPD router added in separate PR)
-                RoutingMode::EncodePrefillDecode {
-                    prefill_policy,
-                    decode_policy,
-                    ..
-                } => {
-                    Self::create_pd_router(
-                        prefill_policy.as_ref(),
-                        decode_policy.as_ref(),
-                        &ctx.router_config.policy,
-                        ctx,
-                    )
-                    .await
-                }
             },
         }
     }
@@ -140,6 +133,30 @@ impl RouterFactory {
         ctx.policy_registry.set_prefill_policy(prefill_policy);
         ctx.policy_registry.set_decode_policy(decode_policy);
         let router = GrpcPDRouter::new(ctx).await?;
+
+        Ok(Box::new(router))
+    }
+
+    /// Create a gRPC EPD router with encode, prefill, and decode policies
+    pub async fn create_grpc_epd_router(
+        encode_policy_config: Option<&PolicyConfig>,
+        prefill_policy_config: Option<&PolicyConfig>,
+        decode_policy_config: Option<&PolicyConfig>,
+        main_policy_config: &PolicyConfig,
+        ctx: &Arc<AppContext>,
+    ) -> Result<Box<dyn RouterTrait>, String> {
+        let encode_policy =
+            PolicyFactory::create_from_config(encode_policy_config.unwrap_or(main_policy_config));
+        let prefill_policy =
+            PolicyFactory::create_from_config(prefill_policy_config.unwrap_or(main_policy_config));
+        let decode_policy =
+            PolicyFactory::create_from_config(decode_policy_config.unwrap_or(main_policy_config));
+
+        ctx.policy_registry.set_encode_policy(encode_policy);
+        ctx.policy_registry.set_prefill_policy(prefill_policy);
+        ctx.policy_registry.set_decode_policy(decode_policy);
+
+        let router = GrpcEPDRouter::new(ctx).await?;
 
         Ok(Box::new(router))
     }
