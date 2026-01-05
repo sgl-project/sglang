@@ -987,9 +987,9 @@ class Scheduler(
 
     def init_overlap(self):
         self.device_module = torch.get_device_module(self.device)
-        self.default_stream: CudaStream = self.device_module.current_stream()
+        self.schedule_stream: CudaStream = self.device_module.current_stream()
         if self.device == "cpu":
-            self.default_stream.synchronize = lambda: None  # No-op for CPU
+            self.schedule_stream.synchronize = lambda: None  # No-op for CPU
 
         self.forward_stream: CudaStream = self.device_module.Stream()
         self.forward_stream_ctx: CudaStreamContext = self.device_module.stream(
@@ -2273,7 +2273,7 @@ class Scheduler(
                 future_indices = self.future_map.alloc_future_indices(bs)
 
                 with self.forward_stream_ctx:
-                    self.forward_stream.wait_stream(self.default_stream)
+                    self.forward_stream.wait_stream(self.schedule_stream)
                     self.future_map.resolve_future(model_worker_batch)
                     with self.record_forward_metrics(batch):
                         batch_result = self.model_worker.forward_batch_generation(
@@ -2349,7 +2349,7 @@ class Scheduler(
             if self.enable_overlap:
                 self.record_batch_in_overlap(model_worker_batch)
                 with self.forward_stream_ctx:
-                    self.forward_stream.wait_stream(self.default_stream)
+                    self.forward_stream.wait_stream(self.schedule_stream)
                     embeddings = self.tp_worker.forward_batch_embedding(
                         model_worker_batch
                     )
@@ -2376,7 +2376,7 @@ class Scheduler(
             return
 
         with self.forward_stream_ctx:
-            self.forward_stream.wait_stream(self.default_stream)
+            self.forward_stream.wait_stream(self.schedule_stream)
             _batch_result = batch_result.delay_sample_func()
             assert _batch_result is batch_result
             self.future_map.store_to_map(batch_result.future_indices, batch_result)
