@@ -503,16 +503,12 @@ class Scheduler(
             )
 
         DraftWorkerClass = self.spec_algorithm.create_worker(self.server_args)
-
-        # FIXME: optimize the init draft worker code path
-        if DraftWorkerClass is not None:
-            self.draft_worker = DraftWorkerClass(**draft_worker_kwargs)
-        else:
-            self.draft_worker = None
+        self.draft_worker = DraftWorkerClass(**draft_worker_kwargs)
 
     def init_model_worker(self):
         self.init_tp_model_worker()
-        self.init_draft_worker()
+        if not self.spec_algorithm.is_none():
+            self.init_draft_worker()
 
         # Dispatch the model worker
         if self.spec_algorithm.is_none():

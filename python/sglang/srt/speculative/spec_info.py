@@ -53,8 +53,9 @@ class SpeculativeAlgorithm(Enum):
     def create_worker(
         self, server_args: ServerArgs
     ) -> Optional[Union[Type[BaseSpecWorker], Type[TpModelWorker], Type[NGRAMWorker]]]:
-        if self.is_none():
-            return None
+        assert (
+            not self.is_none()
+        ), "Cannot create worker for NONE speculative algorithm."
 
         enable_overlap = not server_args.disable_overlap_schedule
         if self.is_eagle() and server_args.enable_multi_layer_eagle:
