@@ -428,6 +428,12 @@ message GetModelInfoResponse {
   int32 bos_token_id = 13;
   int32 max_req_input_len = 14;
   repeated string architectures = 15;
+
+  // Classification model support (from HuggingFace config.json)
+  // id2label maps class indices to label names, e.g., {"0": "negative", "1": "positive"}
+  string id2label_json = 16;
+  // Number of classification labels (0 if not a classifier)
+  int32 num_labels = 17;
 }
 
 // Get server information

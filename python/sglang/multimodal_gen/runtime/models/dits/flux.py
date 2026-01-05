@@ -40,10 +40,11 @@ from sglang.multimodal_gen.runtime.layers.linear import ColumnParallelLinear
 from sglang.multimodal_gen.runtime.layers.mlp import MLP
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
     NDRotaryEmbedding,
-    _apply_rotary_emb,
+    apply_flashinfer_rope_qk_inplace,
 )
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 from sglang.multimodal_gen.runtime.platforms import current_platform
+from sglang.multimodal_gen.runtime.utils.layerwise_offload import OffloadableDiTMixin
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)  # pylint: disable=invalid-name
@@ -182,11 +183,15 @@ class FluxAttention(torch.nn.Module, AttentionModuleMixin):
 
         if freqs_cis is not None:
             cos, sin = freqs_cis
-            query = _apply_rotary_emb(
-                query, cos, sin, is_neox_style=False, interleaved=False
+            cos_sin_cache = torch.cat(
+                [
+                    cos.to(dtype=torch.float32).contiguous(),
+                    sin.to(dtype=torch.float32).contiguous(),
+                ],
+                dim=-1,
             )
-            key = _apply_rotary_emb(
-                key, cos, sin, is_neox_style=False, interleaved=False
+            query, key = apply_flashinfer_rope_qk_inplace(
+                query, key, cos_sin_cache, is_neox=False
             )
 
         x = self.attn(query, key, value)
@@ -403,7 +408,7 @@ class FluxPosEmbed(nn.Module):
         return freqs_cos.contiguous().float(), freqs_sin.contiguous().float()
 
 
-class FluxTransformer2DModel(CachableDiT):
+class FluxTransformer2DModel(CachableDiT, OffloadableDiTMixin):
     """
     The Transformer model introduced in Flux.
 
@@ -422,10 +427,6 @@ class FluxTransformer2DModel(CachableDiT):
         self.inner_dim = (
             self.config.num_attention_heads * self.config.attention_head_dim
         )
-        self.dit_module_names = [
-            "transformer_blocks",
-            "single_transformer_blocks",
-        ]
 
         self.rotary_emb = FluxPosEmbed(theta=10000, axes_dim=self.config.axes_dims_rope)
 
@@ -479,6 +480,11 @@ class FluxTransformer2DModel(CachableDiT):
             bias=True,
             gather_output=True,
         )
+
+        self.layer_names = [
+            "transformer_blocks",
+            "single_transformer_blocks",
+        ]
 
     def forward(
         self,
@@ -537,46 +543,22 @@ class FluxTransformer2DModel(CachableDiT):
             ip_hidden_states = self.encoder_hid_proj(ip_adapter_image_embeds)
             joint_attention_kwargs.update({"ip_hidden_states": ip_hidden_states})
 
-        offload_mgr = getattr(self, "_layerwise_offload_manager", None)
-        if offload_mgr is not None and getattr(offload_mgr, "enabled", False):
-            for i, block in enumerate(self.transformer_blocks):
-                with offload_mgr.layer_scope(
-                    prefetch_layer_idx=i + 1,
-                    release_layer_idx=i,
-                    non_blocking=True,
-                ):
-                    encoder_hidden_states, hidden_states = block(
-                        hidden_states=hidden_states,
-                        encoder_hidden_states=encoder_hidden_states,
-                        temb=temb,
-                        freqs_cis=freqs_cis,
-                        joint_attention_kwargs=joint_attention_kwargs,
-                    )
-            for block in self.single_transformer_blocks:
-                encoder_hidden_states, hidden_states = block(
-                    hidden_states=hidden_states,
-                    encoder_hidden_states=encoder_hidden_states,
-                    temb=temb,
-                    freqs_cis=freqs_cis,
-                    joint_attention_kwargs=joint_attention_kwargs,
-                )
-        else:
-            for block in self.transformer_blocks:
-                encoder_hidden_states, hidden_states = block(
-                    hidden_states=hidden_states,
-                    encoder_hidden_states=encoder_hidden_states,
-                    temb=temb,
-                    freqs_cis=freqs_cis,
-                    joint_attention_kwargs=joint_attention_kwargs,
-                )
-            for block in self.single_transformer_blocks:
-                encoder_hidden_states, hidden_states = block(
-                    hidden_states=hidden_states,
-                    encoder_hidden_states=encoder_hidden_states,
-                    temb=temb,
-                    freqs_cis=freqs_cis,
-                    joint_attention_kwargs=joint_attention_kwargs,
-                )
+        for block in self.transformer_blocks:
+            encoder_hidden_states, hidden_states = block(
+                hidden_states=hidden_states,
+                encoder_hidden_states=encoder_hidden_states,
+                temb=temb,
+                freqs_cis=freqs_cis,
+                joint_attention_kwargs=joint_attention_kwargs,
+            )
+        for block in self.single_transformer_blocks:
+            encoder_hidden_states, hidden_states = block(
+                hidden_states=hidden_states,
+                encoder_hidden_states=encoder_hidden_states,
+                temb=temb,
+                freqs_cis=freqs_cis,
+                joint_attention_kwargs=joint_attention_kwargs,
+            )
 
         hidden_states = self.norm_out(hidden_states, temb)
 
