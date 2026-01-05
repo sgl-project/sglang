@@ -19,6 +19,7 @@ pub enum ProtoRequest {
     Embed(ProtoEmbedRequest),
 }
 
+#[allow(dead_code)]
 impl ProtoRequest {
     pub fn as_generate(&self) -> &ProtoGenerateRequest {
         match self {

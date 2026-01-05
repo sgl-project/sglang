@@ -37,7 +37,7 @@ use crate::{
 ///
 /// The stage is stateless - id2label mapping is obtained from the
 /// selected worker's model card at runtime.
-pub struct ClassifyResponseProcessingStage;
+pub(crate) struct ClassifyResponseProcessingStage;
 
 impl ClassifyResponseProcessingStage {
     /// Create a new classify response processing stage.

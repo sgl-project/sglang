@@ -20,7 +20,7 @@ use crate::{
 };
 
 /// Response processing stage for embedding requests
-pub struct EmbeddingResponseProcessingStage;
+pub(crate) struct EmbeddingResponseProcessingStage;
 
 impl EmbeddingResponseProcessingStage {
     pub fn new() -> Self {

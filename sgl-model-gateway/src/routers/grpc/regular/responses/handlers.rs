@@ -46,7 +46,7 @@ use crate::{
 /// Main handler for POST /v1/responses
 ///
 /// Validates request, determines execution mode (sync/streaming), and delegates
-pub async fn route_responses(
+pub(crate) async fn route_responses(
     ctx: &ResponsesContext,
     request: Arc<ResponsesRequest>,
     headers: Option<http::HeaderMap>,

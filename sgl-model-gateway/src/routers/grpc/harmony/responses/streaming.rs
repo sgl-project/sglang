@@ -36,7 +36,7 @@ use crate::{
 ///
 /// This is the streaming equivalent of `serve_harmony_responses()`.
 /// Emits SSE events for lifecycle, MCP list_tools, and per-iteration streaming.
-pub async fn serve_harmony_responses_stream(
+pub(crate) async fn serve_harmony_responses_stream(
     ctx: &HarmonyResponsesContext,
     request: ResponsesRequest,
 ) -> Response {

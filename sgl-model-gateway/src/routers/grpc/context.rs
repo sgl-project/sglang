@@ -32,14 +32,14 @@ use crate::{
 /// This is the single source of truth for all request state as it flows
 /// through the pipeline stages. Uses Rust's type system to enforce proper
 /// stage ordering at compile time.
-pub struct RequestContext {
+pub(crate) struct RequestContext {
     pub input: RequestInput,
     pub components: Arc<SharedComponents>,
     pub state: ProcessingState,
 }
 
 /// Immutable request input
-pub struct RequestInput {
+pub(crate) struct RequestInput {
     pub request_type: RequestType,
     pub headers: Option<HeaderMap>,
     pub model_id: Option<String>,
@@ -47,7 +47,7 @@ pub struct RequestInput {
 
 /// Request type variants
 /// Using Arc instead of Box to enable cheap cloning for background tasks
-pub enum RequestType {
+pub(crate) enum RequestType {
     Chat(Arc<ChatCompletionRequest>),
     Generate(Arc<GenerateRequest>),
     Responses(Arc<ResponsesRequest>),
@@ -56,7 +56,8 @@ pub enum RequestType {
 }
 
 /// Shared components (injected once at creation)
-pub struct SharedComponents {
+#[allow(dead_code)]
+pub(crate) struct SharedComponents {
     pub tokenizer_registry: Arc<TokenizerRegistry>,
     pub tool_parser_factory: ToolParserFactory,
     pub reasoning_parser_factory: ReasoningParserFactory,
@@ -64,7 +65,7 @@ pub struct SharedComponents {
 
 /// Mutable processing state (evolves through pipeline stages)
 #[derive(Default)]
-pub struct ProcessingState {
+pub(crate) struct ProcessingState {
     // Stage 1: Preparation outputs
     pub preparation: Option<PreparationOutput>,
 
@@ -92,7 +93,8 @@ pub struct ProcessingState {
 }
 
 /// Output from preparation stage (Step 1)
-pub struct PreparationOutput {
+#[allow(dead_code)]
+pub(crate) struct PreparationOutput {
     /// Original text (for chat) or resolved text (for generate)
     pub original_text: Option<String>,
 
@@ -123,7 +125,7 @@ pub struct PreparationOutput {
 }
 
 /// Worker selection (Step 2)
-pub enum WorkerSelection {
+pub(crate) enum WorkerSelection {
     Single {
         worker: Arc<dyn Worker>,
     },
@@ -134,7 +136,7 @@ pub enum WorkerSelection {
 }
 
 /// Client selection (Step 3)
-pub enum ClientSelection {
+pub(crate) enum ClientSelection {
     Single {
         client: GrpcClient,
     },
@@ -146,7 +148,8 @@ pub enum ClientSelection {
 
 /// Dispatch metadata (Step 5)
 #[derive(Clone)]
-pub struct DispatchMetadata {
+#[allow(dead_code)]
+pub(crate) struct DispatchMetadata {
     pub request_id: String,
     pub model: String,
     pub created: u64,
@@ -156,7 +159,7 @@ pub struct DispatchMetadata {
 
 /// Load guards for worker load tracking
 /// Automatically decrements load when dropped
-pub enum LoadGuards {
+pub(crate) enum LoadGuards {
     Single(WorkerLoadGuard),
     Dual {
         prefill: WorkerLoadGuard,
@@ -200,7 +203,8 @@ impl LoadGuards {
 
 /// Response processing state (Step 6)
 #[derive(Default)]
-pub struct ResponseState {
+#[allow(dead_code)]
+pub(crate) struct ResponseState {
     /// Stop sequence decoder
     pub stop_decoder: Option<StopSequenceDecoder>,
 
@@ -232,7 +236,8 @@ pub struct ResponseState {
 
 /// Streaming state (per-choice tracking)
 #[derive(Default)]
-pub struct StreamingState {
+#[allow(dead_code)]
+pub(crate) struct StreamingState {
     pub is_firsts: HashMap<u32, bool>,
     pub stream_buffers: HashMap<u32, String>,
     pub finish_reasons: HashMap<u32, String>,
@@ -249,6 +254,7 @@ pub struct StreamingState {
     pub has_tool_calls: HashMap<u32, bool>,
 }
 
+#[allow(dead_code)]
 impl RequestContext {
     /// Create context for chat completion request
     pub fn for_chat(
@@ -445,6 +451,7 @@ impl RequestContext {
     }
 }
 
+#[allow(dead_code)]
 impl WorkerSelection {
     pub fn is_dual(&self) -> bool {
         matches!(self, Self::Dual { .. })
@@ -499,6 +506,7 @@ impl WorkerSelection {
     }
 }
 
+#[allow(dead_code)]
 impl ClientSelection {
     pub fn is_dual(&self) -> bool {
         matches!(self, Self::Dual { .. })
@@ -563,7 +571,7 @@ impl ClientSelection {
 
 /// Result of request execution (streams from workers)
 /// Uses ProtoStream to automatically abort on cancellation
-pub enum ExecutionResult {
+pub(crate) enum ExecutionResult {
     Single {
         stream: ProtoStream,
     },
@@ -579,7 +587,8 @@ pub enum ExecutionResult {
 
 /// Final processed response
 #[derive(Debug)]
-pub enum FinalResponse {
+#[allow(dead_code)]
+pub(crate) enum FinalResponse {
     Chat(ChatCompletionResponse),
     /// Generate response is a Vec of GenerateResponse (n=1 returns single item, n>1 returns multiple)
     Generate(Vec<GenerateResponse>),

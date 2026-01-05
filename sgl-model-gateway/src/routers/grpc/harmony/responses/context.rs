@@ -15,7 +15,7 @@ use crate::{
 /// Contains all dependencies needed for multi-turn Responses API execution.
 /// Cheap to clone (all Arc references).
 #[derive(Clone)]
-pub struct HarmonyResponsesContext {
+pub(crate) struct HarmonyResponsesContext {
     /// Pipeline for executing Harmony requests
     pub pipeline: Arc<RequestPipeline>,
 
@@ -35,9 +35,11 @@ pub struct HarmonyResponsesContext {
     pub conversation_item_storage: Arc<dyn ConversationItemStorage>,
 
     /// Optional streaming sender (for future streaming support)
+    #[allow(dead_code)]
     pub stream_tx: Option<mpsc::UnboundedSender<Result<String, String>>>,
 }
 
+#[allow(dead_code)]
 impl HarmonyResponsesContext {
     /// Create a new Harmony Responses context
     pub fn new(

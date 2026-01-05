@@ -48,7 +48,7 @@ use crate::{
 /// Orchestrates all stages from request preparation to response delivery.
 /// Configured differently for regular vs PD mode.
 #[derive(Clone)]
-pub struct RequestPipeline {
+pub(crate) struct RequestPipeline {
     stages: Arc<Vec<Box<dyn PipelineStage>>>,
     /// Backend type for metrics labeling
     backend_type: &'static str,
@@ -129,6 +129,7 @@ impl RequestPipeline {
     }
 
     /// Create a Harmony PD (prefill-decode) pipeline
+    #[allow(dead_code)]
     pub fn new_harmony_pd(
         worker_registry: Arc<WorkerRegistry>,
         policy_registry: Arc<PolicyRegistry>,

@@ -19,14 +19,14 @@
 //! - `execution` - MCP tool execution logic
 //! - `common` - Shared helpers and state tracking
 
-mod common;
-mod context;
-mod execution;
-mod non_streaming;
-mod streaming;
+pub(crate) mod common;
+pub(crate) mod context;
+pub(crate) mod execution;
+pub(crate) mod non_streaming;
+pub(crate) mod streaming;
 
-// Public exports
-pub use context::HarmonyResponsesContext;
-pub use execution::{convert_mcp_tools_to_response_tools, ToolResult};
-pub use non_streaming::serve_harmony_responses;
-pub use streaming::serve_harmony_responses_stream;
+// Re-export types accessed via harmony::responses::TypeName
+pub(crate) use context::HarmonyResponsesContext;
+pub(crate) use execution::ToolResult;
+pub(crate) use non_streaming::serve_harmony_responses;
+pub(crate) use streaming::serve_harmony_responses_stream;
