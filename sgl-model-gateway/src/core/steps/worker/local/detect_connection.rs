@@ -9,6 +9,7 @@ use tracing::debug;
 use super::strip_protocol;
 use crate::{
     core::{steps::workflow_data::LocalWorkerWorkflowData, ConnectionMode},
+    grpc_client::SglangSchedulerClient,
     routers::grpc::client::GrpcClient,
     workflow::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, WorkflowResult},
 };
@@ -56,7 +57,34 @@ async fn do_grpc_health_check(
     Ok(())
 }
 
-/// Try gRPC health check (tries SGLang first, then vLLM if not specified).
+/// Try gRPC health check for encoder workers (uses SglangSchedulerClient)
+async fn try_encoder_grpc_health_check(url: &str, timeout_secs: u64) -> Result<(), String> {
+    let grpc_url = if url.starts_with("grpc://") {
+        url.to_string()
+    } else {
+        format!("grpc://{}", strip_protocol(url))
+    };
+
+    let connect_future = SglangSchedulerClient::connect(&grpc_url);
+    let client = tokio::time::timeout(Duration::from_secs(timeout_secs), connect_future)
+        .await
+        .map_err(|_| "Encoder gRPC connection timeout".to_string())?
+        .map_err(|e| format!("Encoder gRPC connection failed: {}", e))?;
+
+    let health_future = client.health_check();
+    let response = tokio::time::timeout(Duration::from_secs(timeout_secs), health_future)
+        .await
+        .map_err(|_| "Encoder gRPC health check timeout".to_string())?
+        .map_err(|e| format!("Encoder gRPC health check failed: {}", e))?;
+
+    if response.healthy {
+        Ok(())
+    } else {
+        Err(format!("Encoder not healthy: {}", response.message))
+    }
+}
+
+/// Try gRPC health check (tries Encoder first for grpc:// URLs, then SGLang, then vLLM).
 async fn try_grpc_health_check(
     url: &str,
     timeout_secs: u64,
@@ -71,13 +99,21 @@ async fn try_grpc_health_check(
     match runtime_type {
         Some(runtime) => do_grpc_health_check(&grpc_url, timeout_secs, runtime).await,
         None => {
-            // Try SGLang first, then vLLM as fallback
+            // For grpc:// URLs, try encoder health check first (EPD encode workers)
+            if url.starts_with("grpc://") {
+                if let Ok(()) = try_encoder_grpc_health_check(url, timeout_secs).await {
+                    debug!("{} detected as Encoder gRPC", url);
+                    return Ok(());
+                }
+            }
+
+            // Try SGLang scheduler, then vLLM as fallback
             if let Ok(()) = do_grpc_health_check(&grpc_url, timeout_secs, "sglang").await {
                 return Ok(());
             }
             do_grpc_health_check(&grpc_url, timeout_secs, "vllm")
                 .await
-                .map_err(|e| format!("gRPC failed (tried SGLang and vLLM): {}", e))
+                .map_err(|e| format!("gRPC failed (tried Encoder, SGLang and vLLM): {}", e))
         }
     }
 }

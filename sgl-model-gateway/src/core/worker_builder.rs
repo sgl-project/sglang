@@ -203,6 +203,7 @@ impl BasicWorkerBuilder {
                 self.url.clone(),
             ),
             grpc_client,
+            encoder_client: Arc::new(OnceCell::new()),
             models_override: Arc::new(StdRwLock::new(None)),
         }
     }
