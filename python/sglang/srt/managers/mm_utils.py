@@ -1092,6 +1092,16 @@ def general_mm_embed_routine(
                             feature = getattr(mm_item, "feature", None)
                             if isinstance(feature, torch.Tensor) and feature.is_cuda:
                                 mm_item.feature = feature.to("cpu", non_blocking=True)
+                            precomputed_embeddings = getattr(
+                                mm_item, "precomputed_embeddings", None
+                            )
+                            if (
+                                isinstance(precomputed_embeddings, torch.Tensor)
+                                and precomputed_embeddings.is_cuda
+                            ):
+                                mm_item.precomputed_embeddings = (
+                                    precomputed_embeddings.to("cpu", non_blocking=True)
+                                )
             forward_batch.mm_inputs = None
         else:
             input_embeds = embed_tokens(input_ids)

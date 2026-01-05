@@ -1570,6 +1570,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     mm_item.feature = pixel_values.reconstruct_on_target_device(
                         torch.cuda.current_device()
                     )
+                if pixel_values is None:
+                    precomputed_embeddings = getattr(
+                        mm_item, "precomputed_embeddings", None
+                    )
+                    if isinstance(precomputed_embeddings, torch.Tensor):
+                        mm_item.precomputed_embeddings = precomputed_embeddings.to(
+                            self.device, non_blocking=True
+                        )
         self.multimodal_inputs = multimodal_inputs
         self.token_type_ids = token_type_ids_tensor
         self.seq_lens_sum = sum(seq_lens)
