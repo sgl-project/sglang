@@ -417,7 +417,7 @@ class Envs:
     SGLANG_ENABLE_METRICS_DP_ATTENTION = EnvBool(False)
 
     # Tokenizer
-    SGLANG_PATCH_TOKENIZER = EnvBool(True)
+    SGLANG_PATCH_TOKENIZER = EnvBool(False)  # TODO enable by default
 
     # fmt: on
 
