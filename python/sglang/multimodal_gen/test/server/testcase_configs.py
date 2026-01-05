@@ -374,6 +374,14 @@ ONE_GPU_CASES_A: list[DiffusionTestCase] = [
         MULTI_IMAGE_TI2I_sampling_params,
     ),
     DiffusionTestCase(
+        "qwen_image_edit_2511_ti2i",
+        DiffusionServerArgs(
+            model_path="Qwen/Qwen-Image-Edit-2511",
+            modality="image",
+        ),
+        TI2I_sampling_params,
+    ),
+    DiffusionTestCase(
         "qwen_image_layered_i2i",
         DiffusionServerArgs(
             model_path="Qwen/Qwen-Image-Layered",

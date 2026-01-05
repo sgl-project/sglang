@@ -5,8 +5,7 @@
 use serde_json::json;
 use smg::tool_parser::{PythonicParser, ToolParser};
 
-mod common;
-use common::create_test_tools;
+use crate::common::create_test_tools;
 
 #[tokio::test]
 async fn test_pythonic_single_function() {
