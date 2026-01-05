@@ -127,6 +127,7 @@ class TestEnableMetrics(CustomTestCase):
             "sglang:time_to_first_token_seconds",
             "sglang:inter_token_latency_seconds",
             "sglang:e2e_request_latency_seconds",
+            "sglang:http_requests_active",
         ]
         for metric in essential_metrics:
             self.assertIn(metric, metrics_text, f"Missing metric: {metric}")

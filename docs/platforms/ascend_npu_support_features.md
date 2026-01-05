@@ -39,19 +39,19 @@ click [Service Arguments](https://docs.sglang.io/advanced_features/server_argume
 
 ## Quantization and data type
 
-| Argument                                        | Defaults | Options                                 |                    A2                    |                    A3                    |
-|-------------------------------------------------|----------|-----------------------------------------|:----------------------------------------:|:----------------------------------------:|
-| `--dtype`                                       | `auto`   | `auto`,<br/> `float16`,<br/> `bfloat16` | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| `--quantization`                                | `None`   | `modelslim`                             | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| `--quantization-param-path`                     | `None`   | Type: str                               |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--kv-cache-dtype`                              | `auto`   | `auto`                                  | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| `--enable-fp32-lm-head`                         | FALSE    | bool flag <br/> (set to enable)         |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--modelopt-quant`                              |          |                                         |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--modelopt-checkpoint-`<br/>`restore-path`     |          |                                         |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--modelopt-checkpoint-`<br/>`save-path`        |          |                                         |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--modelopt-export-path`                        |          |                                         |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--quantize-and-serve--`<br/>`rl-quant-profile` |          |                                         |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--load-format flash_rl`                        |          |                                         |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
+| Argument                                    | Defaults | Options                                 |                    A2                    |                    A3                    |
+|---------------------------------------------|----------|-----------------------------------------|:----------------------------------------:|:----------------------------------------:|
+| `--dtype`                                   | `auto`   | `auto`,<br/> `float16`,<br/> `bfloat16` | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
+| `--quantization`                            | `None`   | `modelslim`                             | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
+| `--quantization-param-path`                 | `None`   | Type: str                               |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
+| `--kv-cache-dtype`                          | `auto`   | `auto`                                  | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
+| `--enable-fp32-lm-head`                     | FALSE    | bool flag <br/> (set to enable)         |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
+| `--modelopt-quant`                          |          |                                         |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
+| `--modelopt-checkpoint-`<br/>`restore-path` |          |                                         |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
+| `--modelopt-checkpoint-`<br/>`save-path`    |          |                                         |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
+| `--modelopt-export-path`                    |          |                                         |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
+| `--quantize-and-serve`                      |          |                                         |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
+| `--rl-quant-profile`                        |          |                                         |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
 
 ## Memory and scheduling
 
