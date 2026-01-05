@@ -57,6 +57,7 @@ class Req:
     image_embeds: list[torch.Tensor] = field(default_factory=list)
 
     original_condition_image_size: tuple[int, int] = None
+    # TODO: maybe a list?
     condition_image: torch.Tensor | PIL.Image.Image | None = None
     vae_image: torch.Tensor | PIL.Image.Image | None = None
     pixel_values: torch.Tensor | PIL.Image.Image | None = None
@@ -189,6 +190,14 @@ class Req:
 
     # results
     output: torch.Tensor | None = None
+
+    # TODO:
+    # hard code for zimage
+    # refactor and tiny later
+    condition_images: list | None = None
+    resized_images: list | None = None
+    condition_siglip_embeds: list | None = None
+    negative_condition_siglip_embeds: list | None = None
 
     @property
     def batch_size(self):
