@@ -390,6 +390,36 @@
             background: rgba(180, 255, 0, 0.15);
         }
 
+        /* Manifold colors for fingerprint mode */
+        .token.manifold-semantic-bridge {
+            border-color: var(--cyan);
+            background: rgba(0, 229, 255, 0.2);
+            box-shadow: 0 0 8px rgba(0, 229, 255, 0.3);
+        }
+
+        .token.manifold-syntax-floor {
+            border-color: var(--amber);
+            background: rgba(255, 170, 0, 0.2);
+            box-shadow: 0 0 8px rgba(255, 170, 0, 0.3);
+        }
+
+        .token.manifold-exploration {
+            border-color: var(--magenta);
+            background: rgba(255, 0, 153, 0.2);
+            box-shadow: 0 0 8px rgba(255, 0, 153, 0.3);
+        }
+
+        .token.manifold-steering {
+            border-color: var(--lime);
+            background: rgba(180, 255, 0, 0.2);
+            box-shadow: 0 0 8px rgba(180, 255, 0, 0.3);
+        }
+
+        .token.manifold-unknown {
+            border-color: var(--border-glow);
+            background: rgba(58, 58, 85, 0.2);
+        }
+
         .token[data-idx]::before {
             content: attr(data-idx);
             position: absolute;
@@ -679,6 +709,28 @@
                     </div>
                 </div>
             </div>
+
+            <div class="panel-section" id="manifoldLegend" style="display: none;">
+                <div class="section-title">Attention Zones</div>
+                <div style="display: flex; flex-direction: column; gap: 8px;">
+                    <div style="display: flex; align-items: center; gap: 10px;">
+                        <div style="width: 12px; height: 12px; border-radius: 3px; background: var(--cyan);"></div>
+                        <span style="font-size: 11px; color: var(--text-dim);">Semantic Bridge</span>
+                    </div>
+                    <div style="display: flex; align-items: center; gap: 10px;">
+                        <div style="width: 12px; height: 12px; border-radius: 3px; background: var(--amber);"></div>
+                        <span style="font-size: 11px; color: var(--text-dim);">Syntax Floor</span>
+                    </div>
+                    <div style="display: flex; align-items: center; gap: 10px;">
+                        <div style="width: 12px; height: 12px; border-radius: 3px; background: var(--magenta);"></div>
+                        <span style="font-size: 11px; color: var(--text-dim);">Exploration</span>
+                    </div>
+                    <div style="display: flex; align-items: center; gap: 10px;">
+                        <div style="width: 12px; height: 12px; border-radius: 3px; background: var(--lime);"></div>
+                        <span style="font-size: 11px; color: var(--text-dim);">Steering</span>
+                    </div>
+                </div>
+            </div>
         </aside>
 
         <main class="main-view" id="mainView">
@@ -964,25 +1016,54 @@
 
             state.tokens = tokens;
 
-            // Parse attention_tokens into edges
-            // Note: srcIdx is promptTokenCount + genIdx (API uses absolute positions)
-            if (Array.isArray(attentionTokens)) {
-                attentionTokens.forEach((attnInfo, genIdx) => {
-                    // Source is the generated token at this index
-                    const srcIdx = promptTokenCount + genIdx;
+            // Parse attention_tokens into edges OR fingerprints
+            // Supports two modes:
+            // 1. Raw token mode: token_positions + attention_scores (for debugging)
+            // 2. Fingerprint mode: fingerprint + manifold (for production)
+            state.fingerprints = [];  // Store fingerprints for visualization
 
-                    if (attnInfo.token_positions && attnInfo.attention_scores) {
-                        attnInfo.token_positions.forEach((dstIdx, i) => {
-                            const weight = attnInfo.attention_scores[i];
-                            if (weight > 0 && dstIdx < tokens.length) {
-                                addEdge(srcIdx, dstIdx, weight, attnInfo.layer_id);
-                            }
+            if (Array.isArray(attentionTokens) && attentionTokens.length > 0) {
+                const firstItem = attentionTokens[0];
+                const isFingerPrintMode = firstItem.fingerprint !== undefined;
+
+                if (isFingerPrintMode) {
+                    // FINGERPRINT MODE: Store fingerprints and manifold classifications
+                    console.log('Detected fingerprint mode');
+                    attentionTokens.forEach((attnInfo, genIdx) => {
+                        const srcIdx = promptTokenCount + genIdx;
+                        state.fingerprints.push({
+                            idx: srcIdx,
+                            fingerprint: attnInfo.fingerprint,
+                            manifold: attnInfo.manifold || 'unknown',
+                            step: attnInfo.step || genIdx + 1,
+                            think_phase: attnInfo.think_phase || 'output'
                         });
-                    }
-                });
+
+                        // Assign manifold color to the token
+                        if (srcIdx < tokens.length) {
+                            tokens[srcIdx].manifold = attnInfo.manifold;
+                            tokens[srcIdx].fingerprint = attnInfo.fingerprint;
+                        }
+                    });
+                } else {
+                    // RAW TOKEN MODE: Parse into edges
+                    console.log('Detected raw token mode');
+                    attentionTokens.forEach((attnInfo, genIdx) => {
+                        const srcIdx = promptTokenCount + genIdx;
+
+                        if (attnInfo.token_positions && attnInfo.attention_scores) {
+                            attnInfo.token_positions.forEach((dstIdx, i) => {
+                                const weight = attnInfo.attention_scores[i];
+                                if (weight > 0 && dstIdx < tokens.length) {
+                                    addEdge(srcIdx, dstIdx, weight, attnInfo.layer_id);
+                                }
+                            });
+                        }
+                    });
+                }
             }
 
-            console.log(`Parsed ${state.tokens.length} tokens, ${state.edges.length} edges`);
+            console.log(`Parsed ${state.tokens.length} tokens, ${state.edges.length} edges, ${state.fingerprints.length} fingerprints`);
         }
 
         function addEdge(src, dst, weight, layer = 0) {
@@ -1041,6 +1122,13 @@
                     tokenEl.dataset.idx = token.idx;
                     tokenEl.textContent = token.text;
                     tokenEl.onclick = () => selectToken(token.idx);
+
+                    // Apply manifold color if in fingerprint mode
+                    if (token.manifold) {
+                        tokenEl.classList.add(`manifold-${token.manifold.replace(/_/g, '-')}`);
+                        tokenEl.title = `Manifold: ${token.manifold}`;
+                    }
+
                     flowEl.appendChild(tokenEl);
                 });
             });
@@ -1136,8 +1224,16 @@
             });
 
             document.getElementById('selectedTokenText').textContent = token ? token.text : '';
-            document.getElementById('selectedTokenMeta').textContent =
-                `Position: ${idx} | Segment: ${token?.segment || ''} | Out: ${outEdges.length} | In: ${inEdges.length}`;
+
+            // Build meta text - include manifold info if available
+            let metaText = `Position: ${idx} | Segment: ${token?.segment || ''}`;
+            if (token?.manifold) {
+                metaText += ` | Zone: ${token.manifold}`;
+            }
+            if (outEdges.length > 0 || inEdges.length > 0) {
+                metaText += ` | Out: ${outEdges.length} | In: ${inEdges.length}`;
+            }
+            document.getElementById('selectedTokenMeta').textContent = metaText;
 
             renderDetailList();
             renderEdges();
@@ -1152,37 +1248,211 @@
                 return;
             }
 
+            const token = state.tokens.find(t => t.idx === state.selectedToken);
             const edges = state.detailTab === 'attends'
                 ? (state.adjacencyOut[state.selectedToken] || [])
                 : (state.adjacencyIn[state.selectedToken] || []);
 
             const sorted = [...edges].sort((a, b) => b.weight - a.weight);
 
-            if (sorted.length === 0) {
-                list.innerHTML = '<div style="color: var(--text-dim); font-size: 12px; text-align: center; padding: 40px;">No attention edges</div>';
+            // In fingerprint mode with no edges, show fingerprint visualization
+            if (sorted.length === 0 && token?.fingerprint) {
+                list.innerHTML = renderFingerprintView(token);
                 return;
             }
+
+            if (sorted.length === 0) {
+                const msg = state.fingerprints.length > 0
+                    ? 'Fingerprint mode: no edge data (manifold colors show attention patterns)'
+                    : 'No attention edges';
+                list.innerHTML = `<div style="color: var(--text-dim); font-size: 12px; text-align: center; padding: 40px;">${msg}</div>`;
+                return;
+            }
+
+            // Add summary section showing the attention pattern
+            const summaryDiv = document.createElement('div');
+            summaryDiv.style.cssText = 'padding: 12px; background: var(--deep); border-radius: 8px; margin-bottom: 12px;';
+
+            const topTokens = sorted.slice(0, 3).map(edge => {
+                const targetIdx = state.detailTab === 'attends' ? edge.dst : edge.src;
+                const t = state.tokens.find(tok => tok.idx === targetIdx);
+                return `<strong style="color: var(--cyan);">"${t?.text || '[?]'}"</strong>`;
+            }).join(', ');
+
+            const directionText = state.detailTab === 'attends'
+                ? `When generating <strong style="color: var(--lime);">"${token?.text}"</strong>, the model looked at: ${topTokens}`
+                : `<strong style="color: var(--lime);">"${token?.text}"</strong> influenced these later tokens: ${topTokens}`;
+
+            summaryDiv.innerHTML = `
+                <div style="font-size: 11px; color: var(--text); line-height: 1.5;">
+                    ${directionText}
+                </div>
+            `;
+            list.appendChild(summaryDiv);
+
+            // Add section header
+            const headerDiv = document.createElement('div');
+            headerDiv.style.cssText = 'font-size: 10px; color: var(--text-muted); text-transform: uppercase; letter-spacing: 1px; margin-bottom: 8px; padding: 0 4px;';
+            headerDiv.textContent = state.detailTab === 'attends' ? 'Top Attended Tokens (click to scroll)' : 'Tokens That Attend Here';
+            list.appendChild(headerDiv);
 
             sorted.forEach((edge, i) => {
                 const targetIdx = state.detailTab === 'attends' ? edge.dst : edge.src;
                 const targetToken = state.tokens.find(t => t.idx === targetIdx);
 
+                // Calculate distance and context
+                const distance = Math.abs(state.selectedToken - targetIdx);
+                const direction = targetIdx < state.selectedToken ? '←' : '→';
+                const distanceLabel = distance === 0 ? 'self' :
+                    distance <= 5 ? `${distance} ${direction}` :
+                    distance <= 20 ? `${distance} ${direction}` :
+                    `${distance} ${direction}`;
+
+                // Get surrounding context
+                const contextTokens = [];
+                for (let j = Math.max(0, targetIdx - 1); j <= Math.min(state.tokens.length - 1, targetIdx + 1); j++) {
+                    const t = state.tokens.find(tok => tok.idx === j);
+                    if (t) {
+                        const highlight = j === targetIdx ? 'font-weight: 700; color: var(--cyan);' : 'color: var(--text-dim);';
+                        contextTokens.push(`<span style="${highlight}">${t.text}</span>`);
+                    }
+                }
+
                 const item = document.createElement('div');
                 item.className = 'attention-item';
+                item.style.cursor = 'pointer';
                 item.innerHTML = `
-                    <span class="attn-rank">${i + 1}</span>
-                    <span class="attn-token">${targetToken?.text || `[${targetIdx}]`}</span>
-                    <span class="attn-score">${(edge.weight * 100).toFixed(1)}%</span>
-                    <div class="attn-bar">
-                        <div class="attn-bar-fill" style="width: ${edge.weight * 100}%"></div>
+                    <div style="display: flex; align-items: center; gap: 8px; flex: 1;">
+                        <span class="attn-rank">${i + 1}</span>
+                        <div style="flex: 1; min-width: 0;">
+                            <div style="display: flex; align-items: center; gap: 6px;">
+                                <span class="attn-token">${targetToken?.text || `[${targetIdx}]`}</span>
+                                <span style="font-size: 10px; color: var(--text-muted);">${distanceLabel}</span>
+                            </div>
+                            <div style="font-size: 10px; color: var(--text-muted); margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">
+                                ...${contextTokens.join('')}...
+                            </div>
+                        </div>
+                    </div>
+                    <div style="display: flex; flex-direction: column; align-items: flex-end; gap: 2px;">
+                        <span class="attn-score">${(edge.weight * 100).toFixed(1)}%</span>
+                        <div class="attn-bar" style="width: 60px;">
+                            <div class="attn-bar-fill" style="width: ${edge.weight * 100}%"></div>
+                        </div>
                     </div>
                 `;
                 item.onclick = () => {
                     const el = document.querySelector(`.token[data-idx="${targetIdx}"]`);
-                    if (el) el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                    if (el) {
+                        el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                        // Flash highlight
+                        el.style.transition = 'box-shadow 0.2s';
+                        el.style.boxShadow = '0 0 12px var(--cyan)';
+                        setTimeout(() => el.style.boxShadow = '', 500);
+                    }
                 };
                 list.appendChild(item);
             });
+        }
+
+        // Render fingerprint visualization for a token
+        function renderFingerprintView(token) {
+            if (!token.fingerprint) return '<div>No fingerprint data</div>';
+
+            const fp = token.fingerprint;
+            const manifold = token.manifold || 'unknown';
+
+            // Manifold color map
+            const manifoldColors = {
+                'semantic_bridge': 'var(--cyan)',
+                'syntax_floor': 'var(--amber)',
+                'exploration': 'var(--magenta)',
+                'steering': 'var(--lime)',
+                'unknown': 'var(--text-dim)'
+            };
+
+            const color = manifoldColors[manifold] || manifoldColors.unknown;
+
+            // First 8 values are distance bins, rest are derived features
+            const distBins = fp.slice(0, 8);
+            const features = fp.slice(8);
+
+            // Create sparkline for distance distribution
+            const maxDist = Math.max(...distBins, 0.01);
+            const sparkline = distBins.map((v, i) => {
+                const height = Math.round((v / maxDist) * 100);
+                return `<div style="width: 12px; height: ${height}%; background: ${color}; border-radius: 2px;" title="Bin ${i}: ${(v * 100).toFixed(1)}%"></div>`;
+            }).join('');
+
+            return `
+                <div style="padding: 16px;">
+                    <div style="margin-bottom: 16px;">
+                        <div style="font-size: 11px; color: var(--text-muted); text-transform: uppercase; letter-spacing: 1px; margin-bottom: 8px;">Attention Zone</div>
+                        <div style="display: flex; align-items: center; gap: 10px;">
+                            <div style="width: 16px; height: 16px; border-radius: 4px; background: ${color};"></div>
+                            <span style="font-size: 14px; font-weight: 600; color: ${color};">${manifold.replace(/_/g, ' ')}</span>
+                        </div>
+                    </div>
+
+                    <div style="margin-bottom: 16px;">
+                        <div style="font-size: 11px; color: var(--text-muted); text-transform: uppercase; letter-spacing: 1px; margin-bottom: 8px;">
+                            Distance Distribution
+                            <span style="font-size: 9px; font-weight: normal; color: var(--text-muted); margin-left: 4px;" title="Shows how far back the model looks: left = recent tokens, right = earlier tokens">ⓘ</span>
+                        </div>
+                        <div style="display: flex; align-items: flex-end; gap: 4px; height: 60px; padding: 8px; background: var(--deep); border-radius: 8px;">
+                            ${sparkline}
+                        </div>
+                        <div style="display: flex; justify-content: space-between; font-size: 9px; color: var(--text-muted); margin-top: 4px;">
+                            <span>1-8 tokens back</span>
+                            <span>64+ tokens back</span>
+                        </div>
+                        <div style="font-size: 10px; color: var(--text-muted); margin-top: 8px; line-height: 1.4;">
+                            ${getDistanceExplanation(distBins)}
+                        </div>
+                    </div>
+
+                    <div>
+                        <div style="font-size: 11px; color: var(--text-muted); text-transform: uppercase; letter-spacing: 1px; margin-bottom: 8px;">Interpretation</div>
+                        <div style="font-size: 12px; color: var(--text-dim); line-height: 1.5;">
+                            ${getManifoldDescription(manifold)}
+                        </div>
+                    </div>
+                </div>
+            `;
+        }
+
+        function getManifoldDescription(manifold) {
+            const descriptions = {
+                'semantic_bridge': 'Model is attending to semantically related tokens across the context. Typical during reasoning or concept retrieval.',
+                'syntax_floor': 'Attention focused on nearby tokens. Typical during structured output or syntax-constrained generation.',
+                'exploration': 'Diffuse attention pattern. Model exploring multiple possibilities or uncertain about next token.',
+                'steering': 'Focused attention on steering/instruction tokens. Model following explicit directives.',
+                'unknown': 'Attention pattern does not match known manifolds.'
+            };
+            return descriptions[manifold] || descriptions.unknown;
+        }
+
+        function getDistanceExplanation(distBins) {
+            if (!distBins || distBins.length < 2) return '';
+
+            // Find the peak bin
+            const maxVal = Math.max(...distBins);
+            const peakIdx = distBins.indexOf(maxVal);
+            const nearSum = distBins.slice(0, 3).reduce((a, b) => a + b, 0);
+            const farSum = distBins.slice(5).reduce((a, b) => a + b, 0);
+
+            // Distance ranges for each bin (0: 1-8, 1: 9-16, 2: 17-24, 3: 25-32, 4: 33-40, 5: 41-48, 6: 49-56, 7: 57-64+)
+            const binLabels = ['1-8', '9-16', '17-24', '25-32', '33-40', '41-48', '49-56', '57+'];
+
+            if (nearSum > 0.7) {
+                return `📍 Local focus: ${Math.round(nearSum * 100)}% attention within 24 tokens. Model is building on recent context.`;
+            } else if (farSum > 0.5) {
+                return `🔭 Long-range: ${Math.round(farSum * 100)}% attention to tokens 40+ back. Model recalling earlier context.`;
+            } else if (maxVal > 0.4) {
+                return `🎯 Peak at ${binLabels[peakIdx]} tokens back (${Math.round(maxVal * 100)}%). Focused retrieval.`;
+            } else {
+                return `🌐 Distributed: attention spread across context. Model integrating multiple sources.`;
+            }
         }
 
         function switchDetailTab(tab) {
@@ -1221,15 +1491,24 @@
 
         function updateStats() {
             document.getElementById('statTokens').textContent = state.tokens.length;
-            document.getElementById('statEdges').textContent = state.edges.length;
+            // Show fingerprint count if in fingerprint mode, otherwise show edges
+            document.getElementById('statEdges').textContent =
+                state.fingerprints.length > 0 ? state.fingerprints.length : state.edges.length;
             const layers = new Set(state.edges.map(e => e.layer));
             document.getElementById('statLayers').textContent = layers.size || 1;
+
+            // Show manifold legend if in fingerprint mode
+            const legend = document.getElementById('manifoldLegend');
+            if (legend) {
+                legend.style.display = state.fingerprints.length > 0 ? 'block' : 'none';
+            }
         }
 
         function clearAll() {
             document.getElementById('inputText').value = '';
             state.tokens = [];
             state.edges = [];
+            state.fingerprints = [];
             state.adjacencyOut = {};
             state.adjacencyIn = {};
             state.selectedToken = null;

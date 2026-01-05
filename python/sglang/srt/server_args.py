@@ -1481,9 +1481,10 @@ class ServerArgs:
                     and self.moe_a2a_backend == "none"
                     and self.moe_runner_backend == "auto"
                 ):
-                    self.moe_runner_backend = "flashinfer_trtllm"
+                    # Use triton instead of flashinfer_trtllm which doesn't support sm100
+                    self.moe_runner_backend = "triton"
                     logger.info(
-                        "Use flashinfer_trtllm as MoE runner backend on sm100 for Qwen3NextForCausalLM"
+                        "Use triton as MoE runner backend on sm100 for Qwen3NextForCausalLM"
                     )
                 if self.attention_backend is None:
                     self.attention_backend = "triton"
