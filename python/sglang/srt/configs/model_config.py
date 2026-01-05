@@ -409,6 +409,8 @@ class ModelConfig:
             self.attention_arch = AttentionArch.MLA
             self.kv_lora_rank = self.hf_config.kv_lora_rank
             self.qk_rope_head_dim = self.hf_config.qk_rope_head_dim
+            self.qk_nope_head_dim = self.hf_config.qk_nope_head_dim
+            self.not_use_fused_infer_attention_score = True
         elif "DeepseekVL2ForCausalLM" in self.hf_config.architectures and getattr(
             self.hf_text_config, "use_mla", True
         ):
