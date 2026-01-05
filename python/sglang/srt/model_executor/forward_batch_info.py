@@ -642,11 +642,26 @@ class ForwardBatch:
                     layer_id = num_layers + layer_id
                 layer_ids = [layer_id]
             elif layers_config == "last":
-                # Just the last layer
+                # Just the last layer (mostly syntax/format repair patterns)
                 if hasattr(model_runner, 'attention_layers') and model_runner.attention_layers:
                     layer_ids = [model_runner.attention_layers[-1].layer_id]
                 else:
                     layer_ids = [num_layers - 1]
+            elif layers_config in ("mid", "mid_full"):
+                # Mid-depth layer for semantic discovery (~60-80% depth)
+                # This is better for semantic manifold discovery than last layer
+                # For hybrid models, selects mid-depth full attention layer
+                full_attn_layers = getattr(model_runner.model_config, 'full_attention_layer_ids', None)
+
+                if full_attn_layers and len(full_attn_layers) > 0:
+                    # HYBRID MODEL: Select mid-depth full attention layer
+                    n_full = len(full_attn_layers)
+                    # Target ~60-70% depth for semantic bridge patterns
+                    mid_idx = (2 * n_full) // 3
+                    layer_ids = [full_attn_layers[mid_idx]]
+                else:
+                    # STANDARD MODEL: Select layer at ~70% depth
+                    layer_ids = [(7 * num_layers) // 10]
             elif layers_config == "auto":
                 # Automatically select ~4 layers spread across depth for semantic manifold coverage
                 # For hybrid models (Qwen3-Next, Llama4, etc.), only use full attention layers

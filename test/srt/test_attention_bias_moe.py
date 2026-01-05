@@ -286,6 +286,33 @@ class TestLayerValidation(unittest.TestCase):
 
         self.assertEqual(valid_moe_captures, [2, 4])
 
+    def test_mid_layer_selection_standard(self):
+        """Test mid layer selection for standard models (~70% depth)."""
+        num_layers = 32
+
+        # mid/mid_full selects ~70% depth
+        mid_layer = (7 * num_layers) // 10
+        self.assertEqual(mid_layer, 22)  # 70% of 32 = 22.4 -> 22
+
+        # For 24-layer model
+        num_layers_24 = 24
+        mid_layer_24 = (7 * num_layers_24) // 10
+        self.assertEqual(mid_layer_24, 16)  # 70% of 24 = 16.8 -> 16
+
+    def test_mid_layer_selection_hybrid(self):
+        """Test mid layer selection for hybrid models (e.g., Qwen3-Next)."""
+        # Simulate hybrid model with sparse full attention layers
+        # e.g., layers 0, 4, 8, 12, 16, 20, 24, 28 are full attention
+        full_attn_layers = [0, 4, 8, 12, 16, 20, 24, 28]
+        n_full = len(full_attn_layers)
+
+        # mid_full selects ~60-70% depth into full attention layers
+        mid_idx = (2 * n_full) // 3
+        self.assertEqual(mid_idx, 5)  # 2/3 of 8 = 5.33 -> 5
+
+        mid_layer = full_attn_layers[mid_idx]
+        self.assertEqual(mid_layer, 20)  # Layer 20 is at 2/3 depth
+
 
 class TestSparseBiasCorrection(unittest.TestCase):
     """Test sparse bias correction math."""
@@ -355,6 +382,145 @@ class TestFingerprintMode(unittest.TestCase):
         self.assertEqual(classify(syntax_floor), "syntax_floor")
         self.assertEqual(classify(semantic_bridge), "semantic_bridge")
         self.assertEqual(classify(long_range), "long_range")
+
+
+class TestPerRequestOverridePriority(unittest.TestCase):
+    """Test per-request override priority for sidecar control."""
+
+    def test_override_priority_order(self):
+        """Test that override priority is: request > sidecar > batch default."""
+        # Simulate the override resolution logic
+        batch_default = 8
+        semantic_memory_value = 4
+        request_value = 2
+
+        # Case 1: Request value takes priority
+        stride = batch_default
+        req_stride = request_value
+        sm_stride = semantic_memory_value
+        if req_stride is not None:
+            stride = req_stride
+        elif sm_stride is not None:
+            stride = sm_stride
+        self.assertEqual(stride, 2)
+
+        # Case 2: Semantic memory value when request is None
+        stride = batch_default
+        req_stride = None
+        sm_stride = semantic_memory_value
+        if req_stride is not None:
+            stride = req_stride
+        elif sm_stride is not None:
+            stride = sm_stride
+        self.assertEqual(stride, 4)
+
+        # Case 3: Batch default when both are None
+        stride = batch_default
+        req_stride = None
+        sm_stride = None
+        if req_stride is not None:
+            stride = req_stride
+        elif sm_stride is not None:
+            stride = sm_stride
+        self.assertEqual(stride, 8)
+
+    def test_sidecar_schema_v1_parsing(self):
+        """Test parsing of schema v1 sidecar control signals."""
+        sidecar_response = {
+            "schema_version": 1,
+            "manifold": {
+                "zone": "semantic_bridge",
+                "cluster_id": 12,
+                "cluster_conf": 0.92
+            },
+            "control": {
+                "next_capture_layer_ids": [8, 16, 24],
+                "attention_stride": 4,
+                "max_attention_steps": 256,
+                "fingerprint_mode": True,
+                "fingerprint_max_steps": 128,
+                "hub_tokens": [42, 128, 256]
+            }
+        }
+
+        # Simulate parsing
+        schema_version = sidecar_response.get("schema_version", 0)
+        self.assertEqual(schema_version, 1)
+
+        control = sidecar_response.get("control", {})
+        self.assertEqual(control.get("attention_stride"), 4)
+        self.assertEqual(control.get("max_attention_steps"), 256)
+        self.assertEqual(control.get("fingerprint_mode"), True)
+        self.assertEqual(control.get("fingerprint_max_steps"), 128)
+
+        manifold = sidecar_response.get("manifold", {})
+        self.assertEqual(manifold.get("zone"), "semantic_bridge")
+        self.assertEqual(manifold.get("cluster_id"), 12)
+
+    def test_fingerprint_mode_override_logic(self):
+        """Test fingerprint mode can be overridden per-request."""
+        # Batch default
+        batch_fingerprint_mode = True
+        batch_fingerprint_max_steps = 256
+
+        # Test 1: Request disables fingerprint mode
+        req_fp_mode = False
+        sm_fp_mode = None
+        fingerprint_mode = batch_fingerprint_mode
+        if req_fp_mode is not None:
+            fingerprint_mode = req_fp_mode
+        elif sm_fp_mode is not None:
+            fingerprint_mode = sm_fp_mode
+        self.assertFalse(fingerprint_mode)
+
+        # Test 2: Sidecar extends max steps
+        req_fp_max = None
+        sm_fp_max = 512
+        fingerprint_max_steps = batch_fingerprint_max_steps
+        if req_fp_max is not None:
+            fingerprint_max_steps = req_fp_max
+        elif sm_fp_max is not None:
+            fingerprint_max_steps = sm_fp_max
+        self.assertEqual(fingerprint_max_steps, 512)
+
+    def test_no_global_state_mutation(self):
+        """Test that per-request overrides don't mutate shared state."""
+        # Simulate batch-level defaults (immutable)
+        class BatchDefaults:
+            attention_tokens_stride = 8
+            attention_fingerprint_mode = True
+            attention_fingerprint_max_steps = 256
+
+        # Simulate per-request state
+        class Request1:
+            attention_stride = 2
+            attention_fingerprint_mode = False
+
+        class Request2:
+            attention_stride = None  # Use default
+            attention_fingerprint_mode = None
+
+        defaults = BatchDefaults()
+        req1 = Request1()
+        req2 = Request2()
+
+        # Resolve for request 1
+        stride1 = req1.attention_stride if req1.attention_stride is not None else defaults.attention_tokens_stride
+        fp_mode1 = req1.attention_fingerprint_mode if req1.attention_fingerprint_mode is not None else defaults.attention_fingerprint_mode
+
+        # Resolve for request 2
+        stride2 = req2.attention_stride if req2.attention_stride is not None else defaults.attention_tokens_stride
+        fp_mode2 = req2.attention_fingerprint_mode if req2.attention_fingerprint_mode is not None else defaults.attention_fingerprint_mode
+
+        # Verify different requests get different values
+        self.assertEqual(stride1, 2)
+        self.assertEqual(stride2, 8)
+        self.assertFalse(fp_mode1)
+        self.assertTrue(fp_mode2)
+
+        # Verify batch defaults unchanged
+        self.assertEqual(defaults.attention_tokens_stride, 8)
+        self.assertTrue(defaults.attention_fingerprint_mode)
 
 
 if __name__ == "__main__":

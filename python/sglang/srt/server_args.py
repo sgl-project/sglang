@@ -4473,7 +4473,10 @@ class ServerArgs:
             "--attention-capture-layers",
             type=str,
             default=ServerArgs.attention_capture_layers,
-            help="Which layers to capture attention from. Options: 'last' (default, last layer only), 'auto' (automatically select ~4 layers spread across depth), or comma-separated layer indices like '0,10,20,30'. (default: last)",
+            help="Which layers to capture attention from. Options: 'last' (last layer only, syntax patterns), "
+                 "'mid' or 'mid_full' (mid-depth layer ~70%%, recommended for semantic discovery), "
+                 "'auto' (4 layers spread across depth), or comma-separated layer indices like '0,10,20,30'. "
+                 "For hybrid models (Qwen3-Next), 'mid' auto-selects mid-depth full-attention layer. (default: last)",
         )
         parser.add_argument(
             "--attention-capture-layer-id",

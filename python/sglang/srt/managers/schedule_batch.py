@@ -538,9 +538,12 @@ class SemanticMemory:
         self.manifold_confidence: float = 0.0
         self.cluster_id: Optional[int] = None  # Cluster assignment from sidecar
 
-        # Dynamic capture control from sidecar
+        # Dynamic capture control from sidecar (per-request overrides)
+        # These override batch-level defaults from server_args
         self.attention_stride: Optional[int] = None  # Override stride for next steps
         self.max_attention_steps: Optional[int] = None  # Override max steps
+        self.fingerprint_mode: Optional[bool] = None  # Override fingerprint mode
+        self.fingerprint_max_steps: Optional[int] = None  # Override fingerprint early exit
 
         # Steering history: track applied modifications for debugging
         self.steering_history: List[Dict] = []
@@ -597,6 +600,8 @@ class SemanticMemory:
                 "next_capture_layer_ids": [8, 16, 24],
                 "attention_stride": 4,
                 "max_attention_steps": 256,
+                "fingerprint_mode": true,
+                "fingerprint_max_steps": 128,
                 "attention_biases": {layer_id: {pos: bias}},
                 "hub_tokens": [42, 128, 256]
             }
@@ -625,6 +630,10 @@ class SemanticMemory:
                 self.attention_stride = control["attention_stride"]
             if "max_attention_steps" in control:
                 self.max_attention_steps = control["max_attention_steps"]
+            if "fingerprint_mode" in control:
+                self.fingerprint_mode = control["fingerprint_mode"]
+            if "fingerprint_max_steps" in control:
+                self.fingerprint_max_steps = control["fingerprint_max_steps"]
             if "hub_tokens" in control:
                 self.hub_tokens = control["hub_tokens"]
             if "attention_biases" in control:
@@ -779,6 +788,12 @@ class Req:
         self.attention_sketch_mode = attention_sketch_mode
         self.attention_tokens: List[Dict] = []  # Per-token attention info
         self.attention_tokens_decode_step: int = 0  # Counter for stride calculation
+        # Per-request capture control (None = use batch defaults from server_args)
+        # These can be set via API or overridden by sidecar feedback
+        self.attention_fingerprint_mode: Optional[bool] = None
+        self.attention_fingerprint_max_steps: Optional[int] = None
+        self.attention_stride: Optional[int] = None  # Override stride for this request
+        self.attention_max_tokens: Optional[int] = None  # Override max tokens for this request
         # MoE routing capture
         self.return_moe_routing = return_moe_routing
         self.moe_routing_top_k = moe_routing_top_k
@@ -2345,6 +2360,30 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         4. None (use server default)
 
         Returns: List[int] if specified, None otherwise (default policy)
+
+        Layer ID Semantics (IMPORTANT for hybrid models):
+        ------------------------------------------------
+        All layer IDs in this system are "MODEL layer IDs" (0 to num_hidden_layers-1),
+        NOT "KV-cache layer indices". For hybrid models like Qwen3-Next:
+
+        - Model layer ID: The actual transformer layer index (e.g., 0-31 for 32-layer)
+        - KV layer index: Index into the KV-cache (may differ for sliding-window/hybrid)
+
+        For hybrid models with mixed full-attention and sliding-window layers:
+        - Only "full attention" layers support proper attention capture
+        - Use model config's `full_attention_layers` to identify valid capture layers
+        - The ForwardBatchInfo layer validation will filter invalid layer IDs
+
+        The translation from model layer ID to KV layer index is handled internally
+        by ForwardBatchInfo when building the capture request.
+
+        API Layer Specification:
+        - --attention-capture-layer-id N      : Model layer ID (0-indexed)
+        - --attention-capture-layer-ids 0,10  : List of model layer IDs
+        - Sidecar control.next_capture_layer_ids: Model layer IDs
+
+        For semantic discovery, prefer mid-depth full-attention layers (~60-80% depth)
+        rather than last layer, which often reflects syntax repair patterns.
         """
         # 1. Check semantic_memory for dynamic sidecar override (highest priority)
         # This allows the routing loop to dynamically adjust capture layers
@@ -2401,19 +2440,51 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             if not getattr(req, "return_attention_tokens", False):
                 continue
 
-            # Check for sidecar overrides in semantic_memory
+            # Resolve per-request capture settings with priority:
+            # 1. Request-level fields (from API)
+            # 2. SemanticMemory fields (from sidecar feedback)
+            # 3. Batch-level defaults (from server_args)
             semantic_memory = getattr(req, "semantic_memory", None)
-            stride = default_stride
-            max_tokens = default_max_tokens
 
-            if semantic_memory is not None:
-                # Sidecar can dynamically adjust capture frequency
+            # Stride: req.attention_stride > semantic_memory.attention_stride > batch default
+            stride = default_stride
+            req_stride = getattr(req, "attention_stride", None)
+            if req_stride is not None:
+                stride = req_stride
+            elif semantic_memory is not None:
                 sm_stride = getattr(semantic_memory, "attention_stride", None)
                 if sm_stride is not None:
                     stride = sm_stride
+
+            # Max tokens: req > semantic_memory > batch default
+            max_tokens = default_max_tokens
+            req_max = getattr(req, "attention_max_tokens", None)
+            if req_max is not None:
+                max_tokens = req_max
+            elif semantic_memory is not None:
                 sm_max = getattr(semantic_memory, "max_attention_steps", None)
                 if sm_max is not None:
                     max_tokens = sm_max
+
+            # Fingerprint mode: req > semantic_memory > batch default
+            fingerprint_mode = self.attention_fingerprint_mode
+            req_fp_mode = getattr(req, "attention_fingerprint_mode", None)
+            if req_fp_mode is not None:
+                fingerprint_mode = req_fp_mode
+            elif semantic_memory is not None:
+                sm_fp_mode = getattr(semantic_memory, "fingerprint_mode", None)
+                if sm_fp_mode is not None:
+                    fingerprint_mode = sm_fp_mode
+
+            # Fingerprint max steps: req > semantic_memory > batch default
+            fingerprint_max_steps = self.attention_fingerprint_max_steps
+            req_fp_max = getattr(req, "attention_fingerprint_max_steps", None)
+            if req_fp_max is not None:
+                fingerprint_max_steps = req_fp_max
+            elif semantic_memory is not None:
+                sm_fp_max = getattr(semantic_memory, "fingerprint_max_steps", None)
+                if sm_fp_max is not None:
+                    fingerprint_max_steps = sm_fp_max
 
             # Check if this request needs capture on its NEXT decode step
             # (we pre-check here, step will be incremented in output processor)
@@ -2429,9 +2500,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
             # Early exit for fingerprint mode: stop after N decode steps
             # The attention manifold typically stabilizes early (within ~256 steps)
-            if (self.attention_fingerprint_mode and
-                self.attention_fingerprint_max_steps > 0 and
-                next_step > self.attention_fingerprint_max_steps):
+            if (fingerprint_mode and
+                fingerprint_max_steps > 0 and
+                next_step > fingerprint_max_steps):
                 continue
 
             # This request needs capture this step - enable GPU compute
