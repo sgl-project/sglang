@@ -942,38 +942,27 @@ class GDNAttnBackend(MambaAttnBackendBase):
             logger.info(f"Using CuTe DSL GDN kernel for decode: {use_cutedsl}")
             _cutedsl_gdn_logged = True
 
-        if use_cutedsl:
-            core_attn_out = _cutedsl_fused_sigmoid_gating_delta_rule_update(
-                A_log=A_log,
-                dt_bias=dt_bias,
-                q=query,
-                k=key,
-                v=value,
-                a=a,
-                b=b,
-                initial_state_source=ssm_states,
-                initial_state_indices=cache_indices,
-                cu_seqlens=query_start_loc,
-                use_qk_l2norm_in_kernel=True,
-                softplus_beta=1.0,
-                softplus_threshold=20.0,
-            )
-        else:
-            core_attn_out = fused_sigmoid_gating_delta_rule_update(
-                A_log=A_log,
-                dt_bias=dt_bias,
-                q=query,
-                k=key,
-                v=value,
-                a=a,
-                b=b,
-                initial_state_source=ssm_states,
-                initial_state_indices=cache_indices,
-                cu_seqlens=query_start_loc,
-                use_qk_l2norm_in_kernel=True,
-                softplus_beta=1.0,
-                softplus_threshold=20.0,
-            )
+        # Select kernel based on use_cutedsl flag
+        kernel_func = (
+            _cutedsl_fused_sigmoid_gating_delta_rule_update
+            if use_cutedsl
+            else fused_sigmoid_gating_delta_rule_update
+        )
+        core_attn_out = kernel_func(
+            A_log=A_log,
+            dt_bias=dt_bias,
+            q=query,
+            k=key,
+            v=value,
+            a=a,
+            b=b,
+            initial_state_source=ssm_states,
+            initial_state_indices=cache_indices,
+            cu_seqlens=query_start_loc,
+            use_qk_l2norm_in_kernel=True,
+            softplus_beta=1.0,
+            softplus_threshold=20.0,
+        )
 
         self._track_mamba_state_decode(
             forward_batch, conv_states, ssm_states, cache_indices

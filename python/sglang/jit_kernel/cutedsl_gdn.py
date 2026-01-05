@@ -1503,12 +1503,18 @@ def cutedsl_fused_sigmoid_gating_delta_rule_update(
         )
 
     if is_varlen_decode:
+        # Varlen kernel expects a/b as 2D (N, HV)
         if a.dim() == 3:
             a = a.squeeze(0)  # (1, N, HV) -> (N, HV)
         if b.dim() == 3:
             b = b.squeeze(0)
         o = q.new_empty(1, N, HV, V, dtype=torch.bfloat16)
     else:
+        # Non-varlen kernel expects a/b as 3D (N, 1, HV)
+        if a.dim() == 2:
+            a = a.unsqueeze(1)  # (N, HV) -> (N, 1, HV)
+        if b.dim() == 2:
+            b = b.unsqueeze(1)
         o = q.new_empty(N, 1, HV, V, dtype=torch.bfloat16)
 
     # Handle cu_seqlens
