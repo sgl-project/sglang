@@ -1,6 +1,5 @@
 import os
 import unittest
-from contextlib import contextmanager
 from types import SimpleNamespace
 
 from sglang.bench_serving import run_benchmark
@@ -15,7 +14,6 @@ from sglang.test.test_utils import (
     get_benchmark_args,
     popen_launch_server,
 )
-
 
 
 class TestPrefillDelayerThroughput(CustomTestCase):
@@ -124,8 +122,10 @@ class TestPrefillDelayerAccuracy(CustomTestCase):
         self.assertGreater(metrics["score"], 0.8)
 
 
-def _launch_server(*, model, base_url,prefill_delayer: bool, other_args):
-    with envs.SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE.override(prefill_delayer), envs.SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES.override(100):
+def _launch_server(*, model, base_url, prefill_delayer: bool, other_args):
+    with envs.SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE.override(
+        prefill_delayer
+    ), envs.SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES.override(100):
         return popen_launch_server(
             model,
             base_url,
