@@ -128,7 +128,7 @@ class TestPrefillDelayerAccuracy(CustomTestCase):
             metrics = run_eval(args)
             print(f"=== mgsm_en ({prefill_delayer=}) ===")
             print(f"{metrics=}")
-            self.assertGreater(metrics["score"], 0.8)
+            self.assertGreater(metrics["score"], 0.87)
         finally:
             kill_process_tree(process.pid)
 
