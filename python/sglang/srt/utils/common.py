@@ -1079,6 +1079,94 @@ def kill_process_tree(parent_pid, include_parent: bool = True, skip_pid: int = N
             pass
 
 
+def graceful_kill_process_tree(
+    parent_pid=None,
+    include_parent: bool = False,
+    skip_pid: int = None,
+    timeout: float = 10.0,
+):
+    """
+    Gracefully kill the process tree by first sending SIGTERM to allow cleanup,
+    then SIGKILL after timeout.
+
+    This is useful for processes like hicache that need time to do garbage collection
+    when receiving SIGTERM.
+
+    Args:
+        parent_pid: The parent process ID. If None, uses current process.
+        include_parent: Whether to kill the parent process as well.
+        skip_pid: Process ID to skip.
+        timeout: Time in seconds to wait for graceful shutdown before SIGKILL.
+    """
+    import logging
+
+    logger = logging.getLogger(__name__)
+
+    # Remove sigchld handler to avoid spammy logs.
+    if threading.current_thread() is threading.main_thread():
+        signal.signal(signal.SIGCHLD, signal.SIG_DFL)
+
+    if parent_pid is None:
+        parent_pid = os.getpid()
+        include_parent = False
+
+    try:
+        itself = psutil.Process(parent_pid)
+    except psutil.NoSuchProcess:
+        return
+
+    children = itself.children(recursive=True)
+    if not children:
+        return
+
+    # Step 1: Send SIGTERM to all children for graceful shutdown
+    alive_children = []
+    for child in children:
+        if child.pid == skip_pid:
+            continue
+        try:
+            logger.info(f"Sending SIGTERM to child process {child.pid} ({child.name()})")
+            child.terminate()  # Send SIGTERM
+            alive_children.append(child)
+        except psutil.NoSuchProcess:
+            pass
+
+    # Step 2: Wait for processes to terminate gracefully
+    if alive_children:
+        logger.info(
+            f"Waiting up to {timeout}s for {len(alive_children)} child processes to terminate gracefully..."
+        )
+        gone, alive = psutil.wait_procs(alive_children, timeout=timeout)
+
+        if gone:
+            logger.info(f"{len(gone)} child processes terminated gracefully")
+
+        # Step 3: Force kill any remaining processes
+        if alive:
+            logger.warning(
+                f"{len(alive)} child processes did not terminate gracefully, sending SIGKILL"
+            )
+            for child in alive:
+                try:
+                    logger.info(f"Sending SIGKILL to child process {child.pid}")
+                    child.kill()
+                except psutil.NoSuchProcess:
+                    pass
+
+            # Wait a bit for SIGKILL to take effect
+            psutil.wait_procs(alive, timeout=3)
+
+    # Handle parent process if requested (not recommended for graceful shutdown)
+    if include_parent:
+        try:
+            if parent_pid == os.getpid():
+                itself.kill()
+                sys.exit(0)
+            itself.kill()
+        except psutil.NoSuchProcess:
+            pass
+
+
 def monkey_patch_p2p_access_check():
     """
     Monkey patch the slow p2p access check.

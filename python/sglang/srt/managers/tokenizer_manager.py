@@ -104,6 +104,7 @@ from sglang.srt.utils import (
     get_bool_env_var,
     get_or_create_event_loop,
     get_zmq_socket,
+    graceful_kill_process_tree,
     kill_process_tree,
 )
 from sglang.srt.utils.aio_rwlock import RWLock
@@ -1474,8 +1475,17 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 self.dump_requests_before_crash()
                 break
 
-        kill_process_tree(os.getpid(), include_parent=True)
-        sys.exit(0)
+        # Gracefully terminate child processes (e.g., hicache, scheduler, detokenizer)
+        # by first sending SIGTERM to allow them time to do cleanup/garbage collection,
+        # then SIGKILL after timeout if they don't exit.
+        # The timeout can be configured via SGLANG_CHILD_PROCESS_SHUTDOWN_TIMEOUT env var.
+        shutdown_timeout = float(os.environ.get("SGLANG_CHILD_PROCESS_SHUTDOWN_TIMEOUT", "10"))
+        graceful_kill_process_tree(os.getpid(), include_parent=False, timeout=shutdown_timeout)
+        # Use os._exit() instead of sys.exit() to avoid SystemExit exception
+        # being caught by asyncio event loop, which would interrupt FastAPI's
+        # lifespan cleanup and prevent graceful shutdown of uvicorn server.
+        # Exit code 0 indicates successful graceful shutdown.
+        os._exit(0)
 
     async def handle_loop(self):
         """The event loop that handles requests"""
