@@ -9,7 +9,6 @@ from sglang.srt.utils.patch_tokenizer import (
 
 
 def _get_class_attr_ids(cls):
-    """Get id of all class attributes, unwrapping property.fget"""
     result = {}
     for name, value in vars(cls).items():
         if isinstance(value, property):
