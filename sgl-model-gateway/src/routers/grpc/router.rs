@@ -37,7 +37,6 @@ use crate::{
 
 /// gRPC router implementation for SGLang
 #[derive(Clone)]
-#[allow(dead_code)]
 pub struct GrpcRouter {
     worker_registry: Arc<WorkerRegistry>,
     pipeline: RequestPipeline,

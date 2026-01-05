@@ -52,6 +52,8 @@ class TestDeepseekV32CP(CustomTestCase):
             "--enable-nsa-prefill-context-parallel",
             "--nsa-prefill-cp-mode",
             "in-seq-split",
+            "--model-loader-extra-config",
+            '{"enable_multithread_load": true, "num_threads": 64}',
         ]
         cls.process = popen_launch_server(
             cls.model,
@@ -123,6 +125,8 @@ class TestDeepseekV32CPMode1(CustomTestCase):
             "--enable-nsa-prefill-context-parallel",
             "--nsa-prefill-cp-mode",
             "round-robin-split",
+            "--model-loader-extra-config",
+            '{"enable_multithread_load": true, "num_threads": 64}',
         ]
         cls.process = popen_launch_server(
             cls.model,
