@@ -14,6 +14,20 @@
   overflow: hidden;
 }
 
+.main-content {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.sidebar {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  overflow: hidden;
+}
+
 /* TopBar */
 .topbar {
   display: flex;
@@ -138,6 +152,11 @@
   display: flex;
   flex-direction: column;
   min-height: 0;
+  flex: 1;
+}
+
+.chat-view {
+  max-height: 100%;
 }
 
 .card-header {
