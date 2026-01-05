@@ -419,9 +419,6 @@ class Envs:
     # Tokenizer
     SGLANG_PATCH_TOKENIZER = EnvBool(False)  # TODO enable by default
 
-    # TokenizerManager
-    SGLANG_REQUEST_STATE_WAIT_TIMEOUT = EnvInt(4)
-
     # fmt: on
 
 
