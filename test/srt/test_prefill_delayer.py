@@ -100,32 +100,35 @@ class TestPrefillDelayerThroughput(CustomTestCase):
 
 
 class TestPrefillDelayerAccuracy(CustomTestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.model = DEFAULT_MLA_MODEL_NAME_FOR_TEST
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.process = _launch_server(
+    def test_1_mgsm_en_has_prefill_delayer(self):
+        self._run_accuracy_test(prefill_delayer=True)
+
+    def test_2_mgsm_en_no_prefill_delayer(self):
+        self._run_accuracy_test(prefill_delayer=False)
+
+    def _run_accuracy_test(self, prefill_delayer: bool):
+        model = DEFAULT_MLA_MODEL_NAME_FOR_TEST
+        base_url = DEFAULT_URL_FOR_TEST
+        process = _launch_server(
             prefill_delayer=prefill_delayer,
-            model=cls.model,
-            base_url=cls.base_url,
+            model=model,
+            base_url=base_url,
             other_args=[],
         )
-
-    @classmethod
-    def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
-
-    def test_mgsm_en(self):
-        args = SimpleNamespace(
-            base_url=self.base_url,
-            model=self.model,
-            eval_name="mgsm_en",
-            num_examples=None,
-            num_threads=1024,
-        )
-        metrics = run_eval(args)
-        print(f"{metrics=}")
-        self.assertGreater(metrics["score"], 0.8)
+        try:
+            args = SimpleNamespace(
+                base_url=base_url,
+                model=model,
+                eval_name="mgsm_en",
+                num_examples=None,
+                num_threads=1024,
+            )
+            metrics = run_eval(args)
+            print(f"=== mgsm_en ({prefill_delayer=}) ===")
+            print(f"{metrics=}")
+            self.assertGreater(metrics["score"], 0.8)
+        finally:
+            kill_process_tree(process.pid)
 
 
 def _launch_server(*, model, base_url, prefill_delayer: bool, other_args):
