@@ -10,7 +10,7 @@ export interface UseAttentionStreamOptions {
 }
 
 export function useAttentionStream(options: UseAttentionStreamOptions = {}) {
-  const { baseUrl = 'http://localhost:30000', model = 'meta-llama/Llama-3.1-8B-Instruct' } = options;
+  const { baseUrl = 'http://localhost:30000', model = 'Qwen/Qwen3-Next-80B-A3B-Thinking-FP8' } = options;
 
   const [isStreaming, setIsStreaming] = useState(false);
   const [error, setError] = useState<Error | null>(null);

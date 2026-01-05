@@ -20,13 +20,13 @@ test.describe('SGLang API', () => {
     expect(data.object).toBe('list');
     expect(data.data).toBeInstanceOf(Array);
     expect(data.data.length).toBeGreaterThan(0);
-    expect(data.data[0].id).toContain('Llama');
+    expect(data.data[0].id).toContain('Qwen3-Next');
   });
 
   test('chat completions endpoint works (non-streaming)', async ({ request }) => {
     const response = await request.post(`${SGLANG_URL}/v1/chat/completions`, {
       data: {
-        model: 'meta-llama/Llama-3.1-8B-Instruct',
+        model: 'Qwen/Qwen3-Next-80B-A3B-Thinking-FP8',
         messages: [{ role: 'user', content: 'Say "test" and nothing else.' }],
         max_tokens: 10,
         stream: false,
@@ -42,7 +42,7 @@ test.describe('SGLang API', () => {
   test('attention tokens endpoint accepts attention params', async ({ request }) => {
     const response = await request.post(`${SGLANG_URL}/v1/chat/completions`, {
       data: {
-        model: 'meta-llama/Llama-3.1-8B-Instruct',
+        model: 'Qwen/Qwen3-Next-80B-A3B-Thinking-FP8',
         messages: [{ role: 'user', content: 'Count to three.' }],
         max_tokens: 20,
         stream: false,
@@ -62,7 +62,7 @@ test.describe('SGLang API', () => {
   test('streaming chat completions work', async ({ request }) => {
     const response = await request.post(`${SGLANG_URL}/v1/chat/completions`, {
       data: {
-        model: 'meta-llama/Llama-3.1-8B-Instruct',
+        model: 'Qwen/Qwen3-Next-80B-A3B-Thinking-FP8',
         messages: [{ role: 'user', content: 'Say hello.' }],
         max_tokens: 10,
         stream: true,

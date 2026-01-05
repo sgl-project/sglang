@@ -23,7 +23,7 @@ interface UIState {
 
 export const useUIStore = create<UIState>((set) => ({
   view: 'chat',
-  program: 'prod',
+  program: 'discovery',
   selectedTokenIndex: null,
   hoveredTokenIndex: null,
   selectedLayerId: -1,
