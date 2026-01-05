@@ -177,9 +177,7 @@ jobs:
 
   sgl-kernel-build-wheels:
     needs: [check-changes, call-gate]
-    if: |
-      !inputs.target_stage &&
-      needs.check-changes.outputs.sgl_kernel == 'true'
+    if: needs.check-changes.outputs.sgl_kernel == 'true'
     runs-on: x64-kernel-build-node
     strategy:
       matrix:
@@ -212,17 +210,21 @@ jobs:
         env:
           USE_CCACHE: 1
 
+      - name: Verify wheel artifacts
+        run: |
+          ls -alh sgl-kernel/dist
+          ls -alh sgl-kernel/dist/*.whl
+
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: wheel-python${{ matrix.python-version }}-cuda${{ matrix.cuda-version }}
           path: sgl-kernel/dist/*
+          if-no-files-found: error
 
   sgl-kernel-build-wheels-arm:
     needs: [check-changes, call-gate]
-    if: |
-      !inputs.target_stage &&
-      needs.check-changes.outputs.sgl_kernel == 'true'
+    if: needs.check-changes.outputs.sgl_kernel == 'true'
     runs-on: arm-kernel-build-node
     strategy:
       matrix:
@@ -256,11 +258,17 @@ jobs:
         env:
           USE_CCACHE: 1
 
+      - name: Verify wheel artifacts
+        run: |
+          ls -alh sgl-kernel/dist
+          ls -alh sgl-kernel/dist/*.whl
+
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: wheel-python${{ matrix.python-version }}-cuda${{ matrix.cuda-version }}-aarch64
           path: sgl-kernel/dist/*
+          if-no-files-found: error
 
   sgl-kernel-unit-test:
     needs: [check-changes, call-gate, sgl-kernel-build-wheels]
@@ -536,7 +544,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        partition: [0, 1, 2, 3, 4]
+        partition: [0, 1, 2, 3, 4, 5, 6, 7]
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -563,7 +571,7 @@ jobs:
           if [[ "${{ needs.check-changes.outputs.continue_on_error }}" == "true" ]]; then
             CONTINUE_ON_ERROR_FLAG="--continue-on-error"
           fi
-          python3 run_suite.py --hw cuda --suite stage-b-test-small-1-gpu --auto-partition-id ${{ matrix.partition }} --auto-partition-size 5 $CONTINUE_ON_ERROR_FLAG
+          python3 run_suite.py --hw cuda --suite stage-b-test-small-1-gpu --auto-partition-id ${{ matrix.partition }} --auto-partition-size 8 $CONTINUE_ON_ERROR_FLAG
 
   stage-b-test-large-1-gpu:
     needs: [check-changes, call-gate, stage-a-test-1, sgl-kernel-build-wheels]
@@ -895,7 +903,7 @@ jobs:
       fail-fast: false
       max-parallel: ${{ fromJson(needs.check-changes.outputs.max_parallel) }}
       matrix:
-        part: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+        part: [0, 1, 2, 3, 4, 5]
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -926,7 +934,7 @@ jobs:
           if [[ "${{ needs.check-changes.outputs.continue_on_error }}" == "true" ]]; then
             CONTINUE_ON_ERROR_FLAG="--continue-on-error"
           fi
-          python3 run_suite.py --suite per-commit-1-gpu --auto-partition-id ${{ matrix.part }} --auto-partition-size 13 $RETRY_FLAG $CONTINUE_ON_ERROR_FLAG
+          python3 run_suite.py --suite per-commit-1-gpu --auto-partition-id ${{ matrix.part }} --auto-partition-size 6 $RETRY_FLAG $CONTINUE_ON_ERROR_FLAG
 
 
   stage-b-test-4-gpu-b200:

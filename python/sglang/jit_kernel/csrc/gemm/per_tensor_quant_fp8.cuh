@@ -104,31 +104,51 @@ template <bool kIsStatic>
 void per_tensor_quant_fp8(tvm::ffi::TensorView input, tvm::ffi::TensorView output_q, tvm::ffi::TensorView output_s) {
   using namespace host;
 
-  SymbolicSize num_tokens = {"num_tokens"};
-  SymbolicSize hidden_dim = {"hidden_dim"};
-  SymbolicDevice device_;
-  SymbolicDType input_dtype;
+  const DLDevice device = input.device();
+  RuntimeCheck(device.device_type == kDLCUDA, "input must be on CUDA");
+  RuntimeCheck(input.is_contiguous(), "input must be contiguous");
 
-  TensorMatcher({num_tokens, hidden_dim})  //
-      .with_dtype<float, __half, __nv_bfloat16>(input_dtype)
-      .with_device<kDLCUDA>(device_)
-      .verify(input);
+  const int64_t ndim = input.dim();
+  RuntimeCheck(ndim >= 1, "input.ndim must be >= 1, but got ", ndim);
 
-  TensorMatcher({num_tokens, hidden_dim})  //
-      .with_dtype<__nv_fp8_e4m3>()
-      .with_device<kDLCUDA>(device_)
-      .verify(output_q);
+  RuntimeCheck(output_q.device() == device, "output_q must be on the same device as input");
+  RuntimeCheck(output_q.is_contiguous(), "output_q must be contiguous");
+  RuntimeCheck(output_q.dim() == ndim, "output_q.ndim must match input.ndim");
+  for (int64_t i = 0; i < ndim; ++i) {
+    RuntimeCheck(
+        output_q.size(i) == input.size(i),
+        "output_q.shape mismatch at dim ",
+        i,
+        ": expected ",
+        input.size(i),
+        " but got ",
+        output_q.size(i));
+  }
 
   TensorMatcher({1})  //
       .with_dtype<float>()
-      .with_device<kDLCUDA>(device_)
+      .with_device<kDLCUDA>()
       .verify(output_s);
+  RuntimeCheck(output_s.device() == device, "output_s must be on the same device as input");
 
-  const size_t total_elements = num_tokens.unwrap() * hidden_dim.unwrap();
+  const DLDataType in_dtype = input.dtype();
+  const bool in_ok = (in_dtype.code == kDLFloat && in_dtype.bits == 32) ||
+                     (in_dtype.code == kDLFloat && in_dtype.bits == 16) ||
+                     (in_dtype.code == kDLBfloat && in_dtype.bits == 16);
+  RuntimeCheck(in_ok, "input dtype must be fp32/fp16/bf16, but got ", in_dtype);
+
+  const DLDataType out_dtype = output_q.dtype();
+  RuntimeCheck(
+      out_dtype.code == kDLFloat8_e4m3fn && out_dtype.bits == 8,
+      "output_q dtype must be fp8_e4m3fn, but got ",
+      out_dtype);
+
+  size_t total_elements = 1;
+  for (const auto s : input.shape()) {
+    RuntimeCheck(s > 0, "Input tensor must be non-empty");
+    total_elements *= static_cast<size_t>(s);
+  }
   const size_t num_blocks = std::min((total_elements + kBlockSize - 1) / kBlockSize, size_t(1024));
-  const DLDevice device = device_.unwrap();
-
-  RuntimeCheck(total_elements > 0, "Input tensor must be non-empty");
 
   auto launch_kernels = [&]<typename T>() {
     if constexpr (!kIsStatic) {
@@ -147,12 +167,11 @@ void per_tensor_quant_fp8(tvm::ffi::TensorView input, tvm::ffi::TensorView outpu
         static_cast<int64_t>(total_elements));
   };
 
-  const DLDataType dtype = input_dtype.unwrap();
-  if (dtype.code == kDLFloat && dtype.bits == 32) {
+  if (in_dtype.code == kDLFloat && in_dtype.bits == 32) {
     launch_kernels.template operator()<float>();
-  } else if (dtype.code == kDLBfloat && dtype.bits == 16) {
+  } else if (in_dtype.code == kDLBfloat && in_dtype.bits == 16) {
     launch_kernels.template operator()<__nv_bfloat16>();
-  } else if (dtype.code == kDLFloat && dtype.bits == 16) {
+  } else if (in_dtype.code == kDLFloat && in_dtype.bits == 16) {
     launch_kernels.template operator()<__half>();
   }
 }
