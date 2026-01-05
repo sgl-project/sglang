@@ -1462,6 +1462,11 @@ class Scheduler(
             )
             req.tokenizer = self.tokenizer
 
+            # Populate semantic_memory with API-provided attention biases
+            api_biases = getattr(recv_req, 'attention_biases', None)
+            if api_biases and hasattr(req, 'semantic_memory') and req.semantic_memory:
+                req.semantic_memory.attention_biases = api_biases
+
             if self.disaggregation_mode != DisaggregationMode.NULL:
                 # Invalid request for disaggregated mode
                 if recv_req.bootstrap_room is None:

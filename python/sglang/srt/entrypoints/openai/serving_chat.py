@@ -247,6 +247,7 @@ class OpenAIServingChat(OpenAIServingBase):
             attention_capture_layer_id=request.attention_capture_layer_id,
             attention_capture_layer_ids=request.attention_capture_layer_ids,
             attention_sketch_mode=request.attention_sketch_mode,
+            attention_biases=self._convert_attention_biases(request.attention_biases),
             rid=request.rid,
             extra_key=self._compute_extra_key(request),
             require_reasoning=self._get_reasoning_from_request(request),
@@ -1125,6 +1126,17 @@ class OpenAIServingChat(OpenAIServingBase):
                 tool_calls = getattr(msg, "tool_calls", None)
                 idx += len(list(tool_calls)) if tool_calls is not None else 0  # noqa
         return idx
+
+    def _convert_attention_biases(
+        self, biases: Optional[Dict[str, Dict[str, float]]]
+    ) -> Optional[Dict[int, Dict[int, float]]]:
+        """Convert string-keyed attention biases from API to int-keyed internal format."""
+        if biases is None:
+            return None
+        return {
+            int(layer_id): {int(token_pos): bias for token_pos, bias in token_biases.items()}
+            for layer_id, token_biases in biases.items()
+        }
 
     def _get_reasoning_from_request(self, request: ChatCompletionRequest) -> bool:
         """Judge whether the request needs reasoning"""

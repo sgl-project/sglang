@@ -212,6 +212,8 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
     attention_capture_layer_ids: Optional[Union[List[List[int]], List[int]]] = None
     # Return per-layer sketches instead of raw edges (bandwidth efficient for long outputs)
     attention_sketch_mode: Union[List[bool], bool] = False
+    # Attention biases for steering: Dict[layer_id -> Dict[token_pos -> bias]]
+    attention_biases: Optional[Union[List[Dict[int, Dict[int, float]]], Dict[int, Dict[int, float]]]] = None
 
     # The modalities of the image data [image, multi-images, video]
     modalities: Optional[List[str]] = None
@@ -786,6 +788,8 @@ class TokenizedGenerateReqInput(BaseReq):
     attention_capture_layer_ids: Optional[List[int]] = None
     # Return per-layer sketches instead of raw edges (bandwidth efficient)
     attention_sketch_mode: bool = False
+    # Attention biases for steering: Dict[layer_id -> Dict[token_pos -> bias]]
+    attention_biases: Optional[Dict[int, Dict[int, float]]] = None
 
 
 @dataclass
