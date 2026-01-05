@@ -54,6 +54,7 @@ class MockAttentionSidecar:
 
         # Request tracking
         self.request_history: Dict[str, list] = {}
+        self.request_seq: Dict[str, int] = {}  # Sequence counter per request
 
         # Steering rules (can be customized)
         self.steering_rules = {
@@ -144,12 +145,28 @@ class MockAttentionSidecar:
         except Exception as e:
             print(f"[Sidecar] Error processing fingerprint: {e}")
 
+    def _get_next_seq(self, request_id: str) -> int:
+        """Get next sequence number for a request."""
+        seq = self.request_seq.get(request_id, 0) + 1
+        self.request_seq[request_id] = seq
+        return seq
+
     def _compute_feedback(self, request_id: str, fingerprint: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """
         Compute feedback based on fingerprint analysis.
 
         This is where the "intelligence" of the sidecar lives.
         Override this method for custom steering logic.
+
+        Returns feedback in schema v1 format:
+        {
+            "schema_version": 1,
+            "request_id": "...",
+            "seq": N,
+            "ts_ms": ...,
+            "manifold": { "zone": "...", "cluster_id": N, "cluster_conf": 0.X },
+            "control": { "next_capture_layer_ids": [...], ... }
+        }
         """
         history = self.request_history.get(request_id, [])
         step = len(history)
@@ -159,24 +176,40 @@ class MockAttentionSidecar:
         # Rule 1: After N fingerprints, suggest probing different layers
         if step == self.steering_rules["probe_after_n"]:
             return {
+                "schema_version": 1,
                 "request_id": request_id,
-                "manifold_zone": "exploration",
-                "manifold_confidence": 0.8,
-                "next_capture_layers": self.steering_rules["probe_layers"],
+                "seq": self._get_next_seq(request_id),
+                "ts_ms": int(time.time() * 1000),
+                "manifold": {
+                    "zone": "exploration",
+                    "cluster_id": 0,
+                    "cluster_conf": 0.8,
+                },
+                "control": {
+                    "next_capture_layer_ids": self.steering_rules["probe_layers"],
+                },
             }
 
         # Rule 2: After more steps, add attention biases
         if step == self.steering_rules["probe_after_n"] + 2:
             return {
+                "schema_version": 1,
                 "request_id": request_id,
-                "manifold_zone": "steering",
-                "manifold_confidence": 0.9,
-                "suggested_biases": {  # Note: uses "suggested_biases" to match update_from_sidecar
-                    str(self.steering_rules["bias_layer"]): {
-                        str(self.steering_rules["bias_token"]): self.steering_rules["bias_value"]
-                    }
+                "seq": self._get_next_seq(request_id),
+                "ts_ms": int(time.time() * 1000),
+                "manifold": {
+                    "zone": "steering",
+                    "cluster_id": 1,
+                    "cluster_conf": 0.9,
                 },
-                "hub_tokens": [0, 1, 2],  # Mark first few tokens as hubs
+                "control": {
+                    "attention_biases": {
+                        str(self.steering_rules["bias_layer"]): {
+                            str(self.steering_rules["bias_token"]): self.steering_rules["bias_value"]
+                        }
+                    },
+                    "hub_tokens": [0, 1, 2],  # Mark first few tokens as hubs
+                },
             }
 
         return None
@@ -190,8 +223,11 @@ class MockAttentionSidecar:
 
             if self.verbose:
                 rid = feedback.get("request_id", "unknown")[:8]
-                zone = feedback.get("manifold_zone", "?")
-                print(f"[Feedback] -> rid={rid}... zone={zone}")
+                # Support both old and new schema format
+                manifold = feedback.get("manifold", {})
+                zone = manifold.get("zone") or feedback.get("manifold_zone", "?")
+                seq = feedback.get("seq", "?")
+                print(f"[Feedback] -> rid={rid}... zone={zone} seq={seq}")
 
         except zmq.Again:
             print("[Sidecar] Feedback buffer full, dropping message")
@@ -201,9 +237,14 @@ class MockAttentionSidecar:
     def inject_bias(self, request_id: str, layer_id: int, token_pos: int, bias: float):
         """Manually inject an attention bias for a specific request."""
         feedback = {
+            "schema_version": 1,
             "request_id": request_id,
-            "attention_biases": {
-                str(layer_id): {str(token_pos): bias}
+            "seq": self._get_next_seq(request_id),
+            "ts_ms": int(time.time() * 1000),
+            "control": {
+                "attention_biases": {
+                    str(layer_id): {str(token_pos): bias}
+                }
             },
         }
         self._send_feedback(feedback)
