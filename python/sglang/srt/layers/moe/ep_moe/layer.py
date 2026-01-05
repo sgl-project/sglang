@@ -16,6 +16,11 @@ from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
     get_moe_runner_backend,
 )
+from sglang.srt.layers.moe.ep_moe.kernels import (
+    run_fbgemm_preprocess,
+    run_fbgemm_postprocess,
+    silu_and_mul_masked_fwd,
+)
 from sglang.srt.layers.moe.fused_moe_triton.layer import (
     FlashInferFusedMoE,
     FusedMoE,
@@ -29,6 +34,7 @@ from sglang.srt.layers.moe.topk import TopKOutput, TopKOutputChecker
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
+from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
 from sglang.srt.layers.quantization.w4afp8 import W4AFp8Config, W4AFp8MoEMethod
 from sglang.srt.utils import get_bool_env_var, is_hip, is_npu
 
@@ -95,6 +101,11 @@ class DeepEPMoE(FusedMoE):
             routed_scaling_factor=routed_scaling_factor,
             **kwargs,
         )
+        self.use_fb_grouped_gemm = get_moe_a2a_backend().is_deepep() and quant_config is None
+        if self.use_fb_grouped_gemm:
+            self.w13_weight_flatten = self.w13_weight.view(-1, self.w13_weight.shape[-1])
+            self.w2_weight_flatten = self.w2_weight.view(-1, self.w2_weight.shape[-1])
+
         if _use_aiter or _is_npu:
             self.deprecate_flag = False
         elif deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and isinstance(
@@ -235,6 +246,8 @@ class DeepEPMoE(FusedMoE):
                 output = self.forward_flashinfer_cutedsl(dispatch_output)
             elif self.use_w4afp8:
                 output = self.forward_cutlass_w4afp8_masked(dispatch_output)
+            elif self.use_fb_grouped_gemm:
+                output = self.forward_fb_grouped_gemm_bf16(dispatch_output)
             else:
                 assert False, "forward_deepgemm_masked is deprecated"
 
@@ -337,6 +350,61 @@ class DeepEPMoE(FusedMoE):
             layer=self,
             dispatch_output=dispatch_output,
         )
+
+    def forward_fb_grouped_gemm_bf16(
+        self,
+        dispatch_output,
+    ):
+        assert self.moe_runner_config.activation == "silu"
+        assert isinstance(self.quant_method, UnquantizedFusedMoEMethod)
+        assert (
+            envs.SGLANG_DEEPEP_BF16_DISPATCH.get()
+        ), "FB Grouped GEMM does not support FP8 dispatch; please set SGLANG_DEEPEP_BF16_DISPATCH=1."
+
+        try:
+            from fbgemm_gpu.experimental.gemm.triton_gemm.grouped_gemm import (
+                grouped_gemm as fb_grouped_gemm,
+            )
+        except ImportError as e:
+            raise ImportError(
+                "fbgemm-gpu-genai is not installed. Please install it to use FB grouped gemm."
+            ) from e
+        hidden_states, _, _, _, masked_m, _ = dispatch_output
+        if hidden_states.dtype != self.w13_weight_flatten.dtype:
+            hidden_states = hidden_states.to(self.w13_weight_flatten.dtype)
+
+        num_groups, m, k = hidden_states.size()
+        n = self.w13_weight.shape[1]
+
+        # GroupGemm-0
+        output_cache = torch.empty(
+            (num_groups * m, k), dtype=hidden_states.dtype, device=hidden_states.device
+        )
+        hidden_states, group_id = run_fbgemm_preprocess(
+            hidden_states, masked_m, output_cache
+        )
+        gate_output = fb_grouped_gemm(hidden_states, self.w13_weight_flatten, masked_m)
+
+        # Silu and mul
+        down_input = torch.empty(
+            (
+                gate_output.shape[0],
+                gate_output.shape[1] // 2,
+            ),
+            device=gate_output.device,
+            dtype=torch.bfloat16,
+        )
+        silu_and_mul_masked_fwd(gate_output, down_input, masked_m)
+        del gate_output
+
+        # GroupGemm-1
+        down_output = fb_grouped_gemm(down_input, self.w2_weight_flatten, masked_m)
+        down_output = run_fbgemm_postprocess(
+            down_output, masked_m, m, output_cache, group_id
+        )
+        assert down_output.shape == torch.Size([num_groups, m, k])
+
+        return down_output
 
     def forward_npu(
         self,

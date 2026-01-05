@@ -1381,3 +1381,246 @@ def silu_and_mul_masked_post_per_tensor_quant_fwd(
         NUM_STAGE=NUM_STAGES,
     )
     return output
+
+
+@triton.jit
+def _silu_and_mul_kernel(
+    input_ptr,
+    stride_input_0,
+    stride_input_1,
+    output_ptr,
+    stride_output_0,
+    stride_output_1,
+    masked_m_ptr,
+    offsets_ptr,
+    size_n,
+    BLOCK_N: tl.constexpr,
+    NUM_STAGE: tl.constexpr,
+):
+    expert_id = tl.program_id(2)
+    token_id = tl.program_id(1)
+    hidden_dim_block_index = tl.program_id(0)
+
+    block_num_per_expert = tl.num_programs(1)
+
+    token_num_cur_expert = tl.load(masked_m_ptr + expert_id)
+    offsets_cur_expert = tl.load(offsets_ptr + expert_id)
+
+    stride_input_0 = tl.cast(stride_input_0, dtype=tl.int64)
+    stride_output_0 = tl.cast(stride_output_0, dtype=tl.int64)
+
+    offs_in_d = hidden_dim_block_index * BLOCK_N + tl.arange(0, BLOCK_N)
+    input_ptr_offs = input_ptr + offsets_cur_expert * stride_input_0 + offs_in_d
+    output_ptr_offs = output_ptr + offsets_cur_expert * stride_output_0 + offs_in_d
+
+    for token_index in tl.range(
+        token_id, token_num_cur_expert, block_num_per_expert, num_stages=NUM_STAGE
+    ):
+        gate = tl.load(
+            input_ptr_offs + token_index * stride_input_0,
+            mask=offs_in_d < size_n,
+            other=0.0,
+        ).to(tl.float32)
+        up = tl.load(
+            input_ptr_offs + token_index * stride_input_0 + size_n,
+            mask=offs_in_d < size_n,
+            other=0.0,
+        )
+        gate = gate / (1 + tl.exp(-gate))
+        gate = gate.to(input_ptr.dtype.element_ty)
+        gate_up = up * gate
+        tl.store(
+            output_ptr_offs + token_index * stride_output_0,
+            gate_up,
+            mask=offs_in_d < size_n,
+        )
+
+
+def silu_and_mul_masked_fwd(
+    input: torch.Tensor,
+    output: torch.Tensor,
+    masked_m: torch.Tensor,
+):
+    """
+    input shape [expert_num, token_num_padded, hidden_dim]
+    output shape [expert_num, token_num_padded, hidden_dim // 2], dtype bf16
+    masked_m shape [expert_num],
+    """
+
+    assert input.is_contiguous()
+    assert output.dtype == torch.bfloat16
+    assert output.is_contiguous()
+    assert len(input.shape) == 2
+    assert input.shape[1] % 2 == 0
+
+    size_n = input.shape[1] // 2
+
+    expert_num = len(masked_m)
+
+    if expert_num < 4:
+        BLOCK_NUM_PER_EXPERT = 64
+    else:
+        BLOCK_NUM_PER_EXPERT = 32
+
+    BLOCK_N = 128
+    num_warps = 1
+    NUM_STAGES = 6
+    hidden_dim_split_block_num = triton.cdiv(size_n, BLOCK_N)
+
+    grid = (
+        hidden_dim_split_block_num,
+        BLOCK_NUM_PER_EXPERT,
+        expert_num,
+    )
+
+    offsets = torch.zeros_like(masked_m)
+    offsets[1:] = torch.cumsum(masked_m[:-1], dim=0)
+
+    _silu_and_mul_kernel[grid](
+        input,
+        *input.stride(),
+        output,
+        *output.stride(),
+        masked_m,
+        offsets,
+        size_n,
+        BLOCK_N=BLOCK_N,
+        NUM_STAGE=NUM_STAGES,
+        num_warps=num_warps,
+    )
+    return
+
+
+@triton.jit
+def fbgemm_preprocess_kernel(
+    lhs_ptr,
+    m_sizes_ptr,
+    offsets_ptr,
+    output_ptr,
+    output_group_id_ptr,
+    M, K, m_max,
+    lhs_row_stride,
+    lhs_col_stride,
+    output_row_stride,
+    output_col_stride,
+    BLOCK_SIZE: tl.constexpr,
+):
+    row_id = tl.program_id(0)
+
+    if row_id < M:
+        group_id = row_id // m_max
+        local_row_id = row_id % m_max
+
+        m_size = tl.load(m_sizes_ptr + group_id)
+        offset = tl.load(offsets_ptr + group_id)
+
+        if local_row_id < m_size:
+            valid_row_id = offset + local_row_id
+
+            lhs_row = lhs_ptr + row_id * lhs_row_stride
+            out_row = output_ptr + valid_row_id * output_row_stride
+            tl.store(output_group_id_ptr + valid_row_id, group_id)
+            for j in range(0, K, BLOCK_SIZE):
+                cols = j + tl.arange(0, BLOCK_SIZE)
+                mask = cols < K
+                val = tl.load(lhs_row + cols * lhs_col_stride, mask=mask)
+                tl.store(out_row + cols * output_col_stride, val, mask=mask)
+
+
+def run_fbgemm_preprocess(lhs: torch.Tensor, m_sizes: torch.Tensor, output: torch.Tensor):
+    """
+    Args:
+        lhs: [num_groups, m_max, k], bf16
+        m_sizes: [num_groups], int32
+        output_cache: [num_groups * m_max, k], bf16
+
+    Returns:
+        output: [num_groups * m_max, k], same dtype as lhs
+        group_id: [num_groups * m_max], int32
+    """
+    num_groups, m_max, k = lhs.shape
+    assert m_sizes.shape[0] == num_groups
+    M = num_groups * m_max
+    lhs = lhs.view(M, k)
+    output = output.view(M, k)
+    offsets = torch.zeros(num_groups + 1, dtype=torch.int32, device=m_sizes.device)
+    offsets[1:] = torch.cumsum(m_sizes, dim=0)
+    group_id = torch.empty(M, dtype=torch.int32, device=lhs.device)
+
+    BLOCK_SIZE = 512
+    grid = (M, )
+    fbgemm_preprocess_kernel[grid](
+        lhs, m_sizes, offsets, output, group_id,
+        M, k, m_max,
+        lhs.stride(0), lhs.stride(1),
+        output.stride(0), output.stride(1),
+        BLOCK_SIZE
+    )
+
+    return output, group_id
+
+
+@triton.jit
+def fbgemm_postprocess_kernel(
+    lhs_ptr,
+    m_sizes_ptr,
+    offsets_ptr,
+    output_ptr,
+    group_id_ptr,
+    M, K, m_max,
+    total_m_ptr,
+    lhs_row_stride,
+    lhs_col_stride,
+    output_row_stride,
+    output_col_stride,
+    BLOCK_SIZE: tl.constexpr,
+):
+    row_id = tl.program_id(0)
+    total_m = tl.load(total_m_ptr)
+    if row_id < total_m:
+        group_id = tl.load(group_id_ptr + row_id)
+        local_row_id = row_id - tl.load(offsets_ptr + group_id)
+        out_row_idx = group_id * m_max + local_row_id
+
+        lhs_row = lhs_ptr + row_id * lhs_row_stride
+        out_row = output_ptr + out_row_idx * output_row_stride
+
+        for j in range(0, K, BLOCK_SIZE):
+            cols = j + tl.arange(0, BLOCK_SIZE)
+            mask = cols < K
+            val = tl.load(lhs_row + cols * lhs_col_stride, mask=mask)
+            tl.store(out_row + cols * output_col_stride, val, mask=mask)
+
+
+def run_fbgemm_postprocess(lhs: torch.Tensor, m_sizes: torch.Tensor, m_max: int, output: torch.Tensor, group_id: torch.Tensor):
+    """
+    Args:
+        lhs: [num_groups * m_max, k], bf16
+        m_sizes: [num_groups], int32
+        m_max: max m for each group
+        output: [num_groups * m_max, k], bf16
+        group_id: [num_groups * m_max], int32
+    Returns:
+        output: [num_groups, m_max, k]
+    """
+    num_groups = m_sizes.shape[0]
+    k = output.shape[1]
+    M = num_groups * m_max
+ 
+    # Precompute offsets
+    offsets = torch.zeros(num_groups + 1, dtype=torch.int32, device=m_sizes.device)
+    offsets[1:] = torch.cumsum(m_sizes, dim=0)
+
+    BLOCK_SIZE = 512
+    grid = (M, )
+    fbgemm_postprocess_kernel[grid](
+        lhs, m_sizes, offsets,
+        output, group_id,
+        M, k, m_max,
+        offsets[-1],
+        lhs.stride(0), lhs.stride(1),
+        output.stride(0), output.stride(1),
+        BLOCK_SIZE
+    )
+
+    return output.view(num_groups, m_max, k)
