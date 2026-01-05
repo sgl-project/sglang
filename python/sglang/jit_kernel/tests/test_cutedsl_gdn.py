@@ -325,7 +325,6 @@ def test_cutedsl_gdn_performance(B: int):
         v_list.append(v_i)
         a_list.append(a_i)
         b_list.append(b_i)
-        # No mark_layout_dynamic, consistent with original test_decode_fused_gdn.py
         q_tensor_list.append(from_dlpack(q_i, assumed_align=16))
         k_tensor_list.append(from_dlpack(k_i, assumed_align=16))
         v_tensor_list.append(from_dlpack(v_i, assumed_align=16))
@@ -592,7 +591,6 @@ def run_benchmark(
         v_list.append(v_i)
         a_list.append(a_i)
         b_list.append(b_i)
-        # No mark_layout_dynamic, consistent with original test_decode_fused_gdn.py
         q_tensor_list.append(from_dlpack(q_i, assumed_align=16))
         k_tensor_list.append(from_dlpack(k_i, assumed_align=16))
         v_tensor_list.append(from_dlpack(v_i, assumed_align=16))

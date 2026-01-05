@@ -1517,7 +1517,9 @@ def cutedsl_fused_sigmoid_gating_delta_rule_update(
             b = b.unsqueeze(1)
         o = q.new_empty(N, 1, HV, V, dtype=torch.bfloat16)
 
-    # Handle cu_seqlens
+    # Todo
+    q, k, v = [t.contiguous() for t in (q, k, v)]
+
     global _cu_seqlens_cache
     if cu_seqlens is not None:
         cu_seqlens_to_use = cu_seqlens
