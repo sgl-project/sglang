@@ -31,6 +31,7 @@ static STRING_INTERNER: Lazy<DashMap<String, Arc<str>>> = Lazy::new(DashMap::new
 ///
 /// This function is designed for high-throughput scenarios where the same
 /// strings (model IDs, worker URLs) appear repeatedly. The first call allocates,
+/// subsequent calls just clone the Arc (very cheap - just a ref count increment).
 pub fn intern_string(s: &str) -> Arc<str> {
     // Fast path: check if already interned
     if let Some(entry) = STRING_INTERNER.get(s) {
