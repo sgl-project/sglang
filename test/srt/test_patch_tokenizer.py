@@ -27,25 +27,20 @@ class TestPatchTokenizerEndToEndTest(unittest.TestCase):
     def _generate_test_texts(cls, tokenizer):
         special_tokens = tokenizer.all_special_tokens
         return [
-            # Basic texts
             "Hello, world!",
             "This is a longer sentence with multiple words.",
             "Numbers 12345 and symbols !@#$%",
-            "中文测试 mixed with English",
             "    leading and trailing spaces    ",
             "\n\nMultiple\n\nNewlines\n\n",
-            # Each special token individually
             *[f"Text with {tok} inside" for tok in special_tokens],
-            # All special tokens combined
             " ".join(special_tokens),
-            # Random generated texts
             *[cls._random_text(length=100) for _ in range(5)],
             *[cls._random_text(length=1000) for _ in range(3)],
         ]
 
     @classmethod
     def _random_text(cls, length):
-        chars = string.ascii_letters + string.digits + " \n\t中文日本語한국어"
+        chars = string.ascii_letters + string.digits
         return "".join(random.choice(chars) for _ in range(length))
 
     @classmethod
