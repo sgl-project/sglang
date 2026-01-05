@@ -48,25 +48,21 @@ class _SpecialTokensCachePatcher:
         tokenizer_cls._original_add_special_tokens = tokenizer_cls.add_special_tokens
         tokenizer_cls._original_add_tokens = tokenizer_cls.add_tokens
 
-        @property
-        def patched_all_special_tokens(self):
-            if getattr(self, cls._CACHED_TOKENS_ATTR, None) is None:
-                setattr(
-                    self,
-                    cls._CACHED_TOKENS_ATTR,
-                    tokenizer_cls._original_all_special_tokens(self),
-                )
-            return getattr(self, cls._CACHED_TOKENS_ATTR)
+        def make_cached_property(cache_attr, original_fn):
+            @property
+            def cached_prop(self):
+                if getattr(self, cache_attr, None) is None:
+                    setattr(self, cache_attr, original_fn(self))
+                return getattr(self, cache_attr)
 
-        @property
-        def patched_all_special_ids(self):
-            if getattr(self, cls._CACHED_IDS_ATTR, None) is None:
-                setattr(
-                    self,
-                    cls._CACHED_IDS_ATTR,
-                    tokenizer_cls._original_all_special_ids(self),
-                )
-            return getattr(self, cls._CACHED_IDS_ATTR)
+            return cached_prop
+
+        patched_all_special_tokens = make_cached_property(
+            cls._CACHED_TOKENS_ATTR, tokenizer_cls._original_all_special_tokens
+        )
+        patched_all_special_ids = make_cached_property(
+            cls._CACHED_IDS_ATTR, tokenizer_cls._original_all_special_ids
+        )
 
         def patched_add_special_tokens(self, *args, **kwargs):
             assert (

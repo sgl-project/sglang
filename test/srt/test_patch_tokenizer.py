@@ -3,7 +3,7 @@ import unittest
 from transformers import AutoTokenizer
 
 from sglang.srt.utils.patch_tokenizer import (
-    _patch_special_tokens_cache,
+    _SpecialTokensCachePatcher,
     unpatch_tokenizer,
 )
 
@@ -20,7 +20,7 @@ class TestPatchTokenizer(unittest.TestCase):
             "add_tokens": id(cls.add_tokens),
         }
 
-        _patch_special_tokens_cache(tokenizer)
+        _SpecialTokensCachePatcher.patch(tokenizer)
         self.assertTrue(getattr(cls, "_sglang_special_tokens_patched", False))
 
         unpatch_tokenizer(tokenizer)
@@ -35,7 +35,7 @@ class TestPatchTokenizer(unittest.TestCase):
 
     def test_patch_caches_special_tokens(self):
         tokenizer = AutoTokenizer.from_pretrained("gpt2")
-        _patch_special_tokens_cache(tokenizer)
+        _SpecialTokensCachePatcher.patch(tokenizer)
 
         tokens1 = tokenizer.all_special_tokens
         ids1 = tokenizer.all_special_ids
@@ -49,7 +49,7 @@ class TestPatchTokenizer(unittest.TestCase):
 
     def test_patch_blocks_add_special_tokens(self):
         tokenizer = AutoTokenizer.from_pretrained("gpt2")
-        _patch_special_tokens_cache(tokenizer)
+        _SpecialTokensCachePatcher.patch(tokenizer)
 
         with self.assertRaises(AssertionError) as ctx:
             tokenizer.add_special_tokens({"pad_token": "<pad>"})
@@ -59,7 +59,7 @@ class TestPatchTokenizer(unittest.TestCase):
 
     def test_patch_blocks_add_tokens_with_special_flag(self):
         tokenizer = AutoTokenizer.from_pretrained("gpt2")
-        _patch_special_tokens_cache(tokenizer)
+        _SpecialTokensCachePatcher.patch(tokenizer)
 
         with self.assertRaises(AssertionError) as ctx:
             tokenizer.add_tokens(["<new>"], special_tokens=True)
@@ -71,7 +71,7 @@ class TestPatchTokenizer(unittest.TestCase):
 
     def test_unpatch_clears_cache(self):
         tokenizer = AutoTokenizer.from_pretrained("gpt2")
-        _patch_special_tokens_cache(tokenizer)
+        _SpecialTokensCachePatcher.patch(tokenizer)
 
         _ = tokenizer.all_special_tokens
         _ = tokenizer.all_special_ids
@@ -84,8 +84,8 @@ class TestPatchTokenizer(unittest.TestCase):
 
     def test_double_patch_is_idempotent(self):
         tokenizer = AutoTokenizer.from_pretrained("gpt2")
-        _patch_special_tokens_cache(tokenizer)
-        _patch_special_tokens_cache(tokenizer)
+        _SpecialTokensCachePatcher.patch(tokenizer)
+        _SpecialTokensCachePatcher.patch(tokenizer)
 
         self.assertTrue(
             getattr(type(tokenizer), "_sglang_special_tokens_patched", False)
