@@ -58,8 +58,8 @@ from sglang.srt.mem_cache.memory_pool import (
     KVCache,
     NSATokenToKVPool,
     ReqToTokenPool,
-    SWAKVPool,
 )
+from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.tracing.trace_metric_wrapper import RequestStage, trace_event_batch
 from sglang.srt.utils import get_int_env_var
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
