@@ -18,8 +18,6 @@ import subprocess
 import sys
 import xml.etree.ElementTree as ET
 from pathlib import Path
-
-import tabulate
 from typing import List
 
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -53,9 +51,11 @@ PARAMETRIZED_FILES = {
 # Standalone test files (each gets its own partition, no filter, run last)
 # NOTE: This is parsed by diffusion_case_parser.py using AST
 STANDALONE_FILES = {
-    "1-gpu": ["test_lora_format_adapter.py",
+    "1-gpu": [
+        "test_lora_format_adapter.py",
         # cli test
-        "../cli/test_generate_t2i_perf.py"],
+        "../cli/test_generate_t2i_perf.py",
+    ],
     "2-gpu": [],
 }
 
@@ -201,118 +201,6 @@ def parse_args():
         help="Continue running remaining tests even if one fails (for CI consistency; pytest already continues by default)",
     )
     return parser.parse_args()
-
-
-def collect_test_items(files, filter_expr=None):
-    """Collect test item node IDs from the given files using pytest --collect-only.
-
-    Raises:
-        RuntimeError: If pytest collection fails due to errors (e.g., syntax errors,
-            import errors, or other collection failures).
-    """
-    cmd = [sys.executable, "-m", "pytest", "--collect-only", "-q"]
-    if filter_expr:
-        cmd.extend(["-k", filter_expr])
-    cmd.extend(files)
-
-    print(f"Collecting tests with command: {' '.join(cmd)}")
-    result = subprocess.run(cmd, capture_output=True, text=True)
-
-    # Check for collection errors
-    # pytest exit codes:
-    #   0: success
-    #   1: tests collected but some had errors during collection
-    #   2: test execution interrupted
-    #   3: internal error
-    #   4: command line usage error
-    #   5: no tests collected (may be expected with filters)
-    if result.returncode not in (0, 5):
-        error_msg = (
-            f"pytest --collect-only failed with exit code {result.returncode}\n"
-            f"Command: {' '.join(cmd)}\n"
-        )
-        if result.stderr:
-            error_msg += f"stderr:\n{result.stderr}\n"
-        if result.stdout:
-            error_msg += f"stdout:\n{result.stdout}\n"
-        logger.error(error_msg)
-        raise RuntimeError(error_msg)
-
-    if result.returncode == 5:
-        print(
-            "No tests were collected (exit code 5). This may be expected with filters."
-        )
-
-    # Parse the output to extract test node IDs
-    # pytest -q outputs lines like: test_file.py::TestClass::test_method[param]
-    test_items = []
-    for line in result.stdout.strip().split("\n"):
-        line = line.strip()
-        # Skip empty lines and summary lines
-        if line and "::" in line and not line.startswith(("=", "-", " ")):
-            # Handle lines that might have extra info after the test ID
-            test_id = line.split()[0] if " " in line else line
-            if "::" in test_id:
-                test_items.append(test_id)
-
-    print(f"Collected {len(test_items)} test items")
-    return test_items
-
-
-def collect_test_items(files, filter_expr=None):
-    """Collect test item node IDs from the given files using pytest --collect-only.
-
-    Raises:
-        RuntimeError: If pytest collection fails due to errors (e.g., syntax errors,
-            import errors, or other collection failures).
-    """
-    cmd = [sys.executable, "-m", "pytest", "--collect-only", "-q"]
-    if filter_expr:
-        cmd.extend(["-k", filter_expr])
-    cmd.extend(files)
-
-    print(f"Collecting tests with command: {' '.join(cmd)}")
-    result = subprocess.run(cmd, capture_output=True, text=True)
-
-    # Check for collection errors
-    # pytest exit codes:
-    #   0: success
-    #   1: tests collected but some had errors during collection
-    #   2: test execution interrupted
-    #   3: internal error
-    #   4: command line usage error
-    #   5: no tests collected (may be expected with filters)
-    if result.returncode not in (0, 5):
-        error_msg = (
-            f"pytest --collect-only failed with exit code {result.returncode}\n"
-            f"Command: {' '.join(cmd)}\n"
-        )
-        if result.stderr:
-            error_msg += f"stderr:\n{result.stderr}\n"
-        if result.stdout:
-            error_msg += f"stdout:\n{result.stdout}\n"
-        logger.error(error_msg)
-        raise RuntimeError(error_msg)
-
-    if result.returncode == 5:
-        print(
-            "No tests were collected (exit code 5). This may be expected with filters."
-        )
-
-    # Parse the output to extract test node IDs
-    # pytest -q outputs lines like: test_file.py::TestClass::test_method[param]
-    test_items = []
-    for line in result.stdout.strip().split("\n"):
-        line = line.strip()
-        # Skip empty lines and summary lines
-        if line and "::" in line and not line.startswith(("=", "-", " ")):
-            # Handle lines that might have extra info after the test ID
-            test_id = line.split()[0] if " " in line else line
-            if "::" in test_id:
-                test_items.append(test_id)
-
-    print(f"Collected {len(test_items)} test items")
-    return test_items
 
 
 def parse_junit_xml_for_executed_cases(xml_path: str) -> list[str]:
