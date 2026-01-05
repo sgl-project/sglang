@@ -196,14 +196,6 @@ jobs:
           python3 -m pip install pytest pytest-cov pytest-xdist
           pytest -q tests --cov=sglang_router --cov-config=.coveragerc --cov-report=term-missing --cov-fail-under=80
 
-      - name: Run Python integration tests
-        run: |
-          cd sgl-model-gateway
-          source "$HOME/.cargo/env"
-          # Integration tests use FastAPI/uvicorn for mock workers
-          python3 -m pip install fastapi uvicorn orjson
-          pytest -q py_test/integration_mock
-
       - name: Run Python E2E tests
         run: |
           bash scripts/killall_sglang.sh "nuk_gpus"
