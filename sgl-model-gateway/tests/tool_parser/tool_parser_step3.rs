@@ -2,8 +2,7 @@
 
 use smg::tool_parser::{Step3Parser, ToolParser};
 
-mod common;
-use common::create_test_tools;
+use crate::common::create_test_tools;
 
 #[tokio::test]
 async fn test_step3_complete_parsing() {
