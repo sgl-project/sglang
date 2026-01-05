@@ -368,14 +368,14 @@ jobs:
 
       - name: Install e2e test dependencies
         run: |
-          python3 -m pip install pytest pytest-rerunfailures httpx openai
+          python3 -m pip install pytest pytest-rerunfailures httpx openai grpcio grpcio-health-checking
 
       - name: Run router e2e tests
         run: |
           bash scripts/killall_sglang.sh "nuk_gpus"
           cd sgl-model-gateway
           source "$HOME/.cargo/env"
-          SHOW_WORKER_LOGS=0 SHOW_ROUTER_LOGS=1 pytest --reruns 2 --reruns-delay 5 e2e_test/router -s -vv -o log_cli=true --log-cli-level=INFO
+          ROUTER_LOCAL_MODEL_PATH="/home/ubuntu/models" SHOW_WORKER_LOGS=0 SHOW_ROUTER_LOGS=1 pytest --reruns 2 --reruns-delay 5 e2e_test/router -s -vv -o log_cli=true --log-cli-level=INFO
 
   docker-build-test:
     if: |
