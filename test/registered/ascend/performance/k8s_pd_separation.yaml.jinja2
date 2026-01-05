@@ -211,7 +211,7 @@ spec:
           command: ["/bin/bash", "-c"]
           args:
             - |
-               bash $SGLANG_SOURCE_PATH/test/nightly/ascend/performance/run_ascend_testcase.sh {{ test_case }}
+               bash $SGLANG_SOURCE_PATH/test/registered/ascend/performance/run_ascend_testcase.sh {{ test_case }}
           resources:
             requests:
               huawei.com/ascend-1980: 16
@@ -295,7 +295,7 @@ spec:
           command: ["/bin/bash", "-c"]
           args:
             - |
-               bash $SGLANG_SOURCE_PATH/test/nightly/ascend/performance/run_ascend_testcase.sh {{ test_case }}
+               bash $SGLANG_SOURCE_PATH/test/registered/ascend/performance/run_ascend_testcase.sh {{ test_case }}
           resources:
             requests:
               cpu: "4"

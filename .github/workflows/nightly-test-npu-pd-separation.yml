@@ -77,6 +77,7 @@ jobs:
           test_data_output_path=/data/.cache/tests/output/${current_date}
           mkdir -p ${test_data_output_path}
           echo "commit id: ${commit_id}" > ${test_data_output_path}/commit_id
+          test_case="${{ inputs.test_case }}"
           tc_name=${test_case##*/}
           tc_name=${tc_name%.*}
           metrics_data_file=${test_data_output_path}/${tc_name}.txt
@@ -92,7 +93,6 @@ jobs:
           prefill_size="${{ inputs.prefill_size }}"
           decode_size="${{ inputs.decode_size }}"
           router_size="${{ inputs.router_size }}"
-          test_case="${{ inputs.test_case }}"
           echo "{ \"image\": $image,                                        \
                   \"name_space\": \"$NAMESPACE\",                           \
                   \"kube_job_name\": \"$KUBE_JOB_NAME\",                    \

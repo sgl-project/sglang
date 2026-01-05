@@ -17,7 +17,8 @@ apt update -y && apt install -y \
     clang \
     locales \
     ccache \
-    ca-certificates
+    ca-certificates \
+    unzip
 update-ca-certificates
 ${PIP_INSTALL} --upgrade pip
 # Pin wheel to 0.45.1, REF: https://github.com/pypa/wheel/issues/662
