@@ -2,8 +2,6 @@
 
 use std::sync::Arc;
 
-use tokio::sync::mpsc;
-
 use crate::{
     data_connector::{ConversationItemStorage, ConversationStorage, ResponseStorage},
     mcp::McpManager,
@@ -33,13 +31,8 @@ pub(crate) struct HarmonyResponsesContext {
 
     /// Conversation item storage for persisting conversation items
     pub conversation_item_storage: Arc<dyn ConversationItemStorage>,
-
-    /// Optional streaming sender (for future streaming support)
-    #[allow(dead_code)]
-    pub stream_tx: Option<mpsc::UnboundedSender<Result<String, String>>>,
 }
 
-#[allow(dead_code)]
 impl HarmonyResponsesContext {
     /// Create a new Harmony Responses context
     pub fn new(
@@ -57,28 +50,6 @@ impl HarmonyResponsesContext {
             response_storage,
             conversation_storage,
             conversation_item_storage,
-            stream_tx: None,
-        }
-    }
-
-    /// Create with streaming support
-    pub fn with_streaming(
-        pipeline: Arc<RequestPipeline>,
-        components: Arc<SharedComponents>,
-        mcp_manager: Arc<McpManager>,
-        response_storage: Arc<dyn ResponseStorage>,
-        conversation_storage: Arc<dyn ConversationStorage>,
-        conversation_item_storage: Arc<dyn ConversationItemStorage>,
-        stream_tx: mpsc::UnboundedSender<Result<String, String>>,
-    ) -> Self {
-        Self {
-            pipeline,
-            components,
-            mcp_manager,
-            response_storage,
-            conversation_storage,
-            conversation_item_storage,
-            stream_tx: Some(stream_tx),
         }
     }
 }
