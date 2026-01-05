@@ -12,8 +12,11 @@ use super::metrics::Metrics;
 use crate::policies::utils::PeriodicTask;
 
 const AGE_BUCKET_BOUNDS: &[u64] = &[30, 60, 180, 300, 600, 1200, 3600, 7200, 14400, 28800, 86400];
-const AGE_BUCKET_LABELS: &[&str] = &[
+const AGE_BUCKET_LE_LABELS: &[&str] = &[
     "30", "60", "180", "300", "600", "1200", "3600", "7200", "14400", "28800", "86400", "+Inf",
+];
+const AGE_BUCKET_GT_LABELS: &[&str] = &[
+    "0", "30", "60", "180", "300", "600", "1200", "3600", "7200", "14400", "28800", "86400",
 ];
 
 pub struct InFlightRequestTracker {
@@ -56,11 +59,11 @@ impl InFlightRequestTracker {
         self.requests.is_empty()
     }
 
-    pub fn compute_bucket_counts(&self) -> [usize; AGE_BUCKET_LABELS.len()] {
+    pub fn compute_bucket_counts(&self) -> [usize; AGE_BUCKET_LE_LABELS.len()] {
         let now = Instant::now();
-        let inf_idx = AGE_BUCKET_LABELS.len() - 1;
+        let inf_idx = AGE_BUCKET_LE_LABELS.len() - 1;
 
-        let mut counts = [0usize; AGE_BUCKET_LABELS.len()];
+        let mut counts = [0usize; AGE_BUCKET_LE_LABELS.len()];
         for entry in self.requests.iter() {
             let age_secs = now.duration_since(*entry.value()).as_secs();
             let bucket_idx = AGE_BUCKET_BOUNDS
@@ -75,8 +78,12 @@ impl InFlightRequestTracker {
 
     fn sample_and_record(&self) {
         let counts = self.compute_bucket_counts();
-        for (i, &label) in AGE_BUCKET_LABELS.iter().enumerate() {
-            Metrics::set_inflight_request_age_count(label, counts[i]);
+        for (i, (&le, &gt)) in AGE_BUCKET_LE_LABELS
+            .iter()
+            .zip(AGE_BUCKET_GT_LABELS.iter())
+            .enumerate()
+        {
+            Metrics::set_inflight_request_age_count(gt, le, counts[i]);
         }
     }
 }
