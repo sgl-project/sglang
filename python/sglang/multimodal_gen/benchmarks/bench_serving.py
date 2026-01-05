@@ -637,11 +637,6 @@ async def benchmark(args):
     if args.base_url is None:
         args.base_url = f"http://{args.host}:{args.port}"
 
-    if args.backend is not None:
-        logger.info(
-            f"DEPRECATED, we don't use backend anymore, and we will auto infer backend from --model."
-        )
-
     # Wait for service
     wait_for_service(args.base_url)
 
@@ -726,71 +721,65 @@ async def benchmark(args):
     # Calculate metrics
     metrics = calculate_metrics(outputs, total_duration)
 
-    logger.info("\n{s:{c}^{n}}".format(s=" Serving Benchmark Result ", n=60, c="="))
+    print("\n{s:{c}^{n}}".format(s=" Serving Benchmark Result ", n=60, c="="))
 
     # Section 1: Configuration
-    logger.info("{:<40} {:<15}".format("Task:", task_name))
-    logger.info("{:<40} {:<15}".format("Model:", args.model))
-    logger.info("{:<40} {:<15}".format("Dataset:", args.dataset))
+    print("{:<40} {:<15}".format("Task:", task_name))
+    print("{:<40} {:<15}".format("Model:", args.model))
+    print("{:<40} {:<15}".format("Dataset:", args.dataset))
 
     # Section 2: Execution & Traffic
-    logger.info(f"{'-' * 50}")
-    logger.info(
-        "{:<40} {:<15.2f}".format("Benchmark duration (s):", metrics["duration"])
-    )
-    logger.info("{:<40} {:<15}".format("Request rate:", str(args.request_rate)))
-    logger.info(
+    print(f"{'-' * 50}")
+    print("{:<40} {:<15.2f}".format("Benchmark duration (s):", metrics["duration"]))
+    print("{:<40} {:<15}".format("Request rate:", str(args.request_rate)))
+    print(
         "{:<40} {:<15}".format(
             "Max request concurrency:",
             str(args.max_concurrency) if args.max_concurrency else "not set",
         )
     )
-    logger.info(
+    print(
         "{:<40} {}/{:<15}".format(
             "Successful requests:", metrics["completed_requests"], len(requests_list)
         )
     )
 
     # Section 3: Performance Metrics
-    logger.info(f"{'-' * 50}")
+    print(f"{'-' * 50}")
 
-    logger.info(
+    print(
         "{:<40} {:<15.2f}".format(
             "Request throughput (req/s):", metrics["throughput_qps"]
         )
     )
-    logger.debug(
-        "{:<40} {:<15.4f}".format("Latency Mean (s):", metrics["latency_mean"])
-    )
-    logger.info(
-        "{:<40} {:<15.4f}".format("Latency Median (s):", metrics["latency_median"])
-    )
-    logger.info("{:<40} {:<15.4f}".format("Latency P99 (s):", metrics["latency_p99"]))
+    print("{:<40} {:<15.4f}".format("Latency Mean (s):", metrics["latency_mean"]))
+    print("{:<40} {:<15.4f}".format("Latency Median (s):", metrics["latency_median"]))
+    print("{:<40} {:<15.4f}".format("Latency P99 (s):", metrics["latency_p99"]))
 
     if metrics["peak_memory_mb_max"] > 0:
-        logger.info(f"{'-' * 50}")
-        logger.info(
+        print(f"{'-' * 50}")
+        print(
             "{:<40} {:<15.2f}".format(
                 "Peak Memory Max (MB):", metrics["peak_memory_mb_max"]
             )
         )
-        logger.info(
+        print(
             "{:<40} {:<15.2f}".format(
                 "Peak Memory Mean (MB):", metrics["peak_memory_mb_mean"]
             )
         )
-        logger.info(
+        print(
             "{:<40} {:<15.2f}".format(
                 "Peak Memory Median (MB):", metrics["peak_memory_mb_median"]
             )
         )
 
-    logger.info("=" * 60)
+    print("=" * 60)
 
     if args.output_file:
         with open(args.output_file, "w") as f:
             json.dump(metrics, f, indent=2)
-        logger.info(f"Metrics saved to {args.output_file}")
+        print(f"Metrics saved to {args.output_file}")
 
 
 if __name__ == "__main__":
