@@ -3,14 +3,14 @@
 //! These tests download the TinyLlama tokenizer from HuggingFace to verify our tokenizer
 //! implementation works correctly with real-world tokenizer files.
 
-mod common;
 use std::sync::Arc;
 
-use common::{ensure_tokenizer_cached, EXPECTED_HASHES, TEST_PROMPTS};
 use smg::tokenizer::{
     factory, huggingface::HuggingFaceTokenizer, sequence::Sequence, stop::*, stream::DecodeStream,
     traits::*,
 };
+
+use crate::common::{ensure_tokenizer_cached, EXPECTED_HASHES, TEST_PROMPTS};
 
 const LONG_TEST_PROMPTS: [(&str, &str); 6] = [
     ("Tell me about the following text.", "Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat."),

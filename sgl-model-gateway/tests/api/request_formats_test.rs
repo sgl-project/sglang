@@ -1,10 +1,9 @@
-mod common;
+use serde_json::json;
 
-use common::{
+use crate::common::{
     mock_worker::{HealthStatus, MockWorkerConfig, WorkerType},
     WorkerTestContext,
 };
-use serde_json::json;
 
 #[cfg(test)]
 mod request_format_tests {

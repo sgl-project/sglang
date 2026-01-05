@@ -1,5 +1,3 @@
-mod common;
-
 use std::sync::Arc;
 
 use axum::{
@@ -7,7 +5,6 @@ use axum::{
     extract::Request,
     http::{header::CONTENT_TYPE, StatusCode},
 };
-use common::mock_worker::{MockWorker, MockWorkerConfig};
 use reqwest::Client;
 use serde_json::json;
 use smg::{
@@ -16,6 +13,8 @@ use smg::{
     routers::{RouterFactory, RouterTrait},
 };
 use tower::ServiceExt;
+
+use crate::common::mock_worker::{MockWorker, MockWorkerConfig};
 
 /// Test context that manages mock workers and app
 struct ParserTestContext {
@@ -89,7 +88,7 @@ impl ParserTestContext {
             .unwrap();
 
         // Create app context with parser factories initialized
-        let app_context = common::create_test_context_with_parsers(config.clone()).await;
+        let app_context = crate::common::create_test_context_with_parsers(config.clone()).await;
 
         // Create router
         let router = RouterFactory::create_router(&app_context).await.unwrap();
@@ -105,7 +104,7 @@ impl ParserTestContext {
     }
 
     async fn create_app(&self) -> axum::Router {
-        common::test_app::create_test_app_with_context(
+        crate::common::test_app::create_test_app_with_context(
             Arc::clone(&self.router),
             Arc::clone(&self.app_context),
         )

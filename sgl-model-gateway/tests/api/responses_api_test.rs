@@ -1,22 +1,21 @@
 // Integration test for Responses API
 
 use axum::http::StatusCode;
-use smg::protocols::{
-    common::{GenerationRequest, ToolChoice, ToolChoiceValue, UsageInfo},
-    responses::{
-        ReasoningEffort, ResponseInput, ResponseReasoningParam, ResponseTool, ResponseToolType,
-        ResponsesRequest, ServiceTier, Truncation,
-    },
-};
-
-mod common;
-use common::{
-    mock_mcp_server::MockMCPServer,
-    mock_worker::{HealthStatus, MockWorker, MockWorkerConfig, WorkerType},
-};
 use smg::{
     config::RouterConfig,
+    protocols::{
+        common::{GenerationRequest, ToolChoice, ToolChoiceValue, UsageInfo},
+        responses::{
+            ReasoningEffort, ResponseInput, ResponseReasoningParam, ResponseTool, ResponseToolType,
+            ResponsesRequest, ServiceTier, Truncation,
+        },
+    },
     routers::{conversations, RouterFactory},
+};
+
+use crate::common::{
+    mock_mcp_server::MockMCPServer,
+    mock_worker::{HealthStatus, MockWorker, MockWorkerConfig, WorkerType},
 };
 
 #[tokio::test]
@@ -60,7 +59,8 @@ async fn test_non_streaming_mcp_minimal_e2e_with_persistence() {
 
     // Create router and context with MCP config from file
     let ctx =
-        common::create_test_context_with_mcp_config(router_cfg, cfg_path.to_str().unwrap()).await;
+        crate::common::create_test_context_with_mcp_config(router_cfg, cfg_path.to_str().unwrap())
+            .await;
     let router = RouterFactory::create_router(&ctx).await.expect("router");
 
     // Build a simple ResponsesRequest that will trigger the tool call
@@ -236,7 +236,7 @@ async fn test_conversations_crud_basic() {
         .queue_timeout_secs(5)
         .build_unchecked();
 
-    let ctx = common::create_test_context(router_cfg).await;
+    let ctx = crate::common::create_test_context(router_cfg).await;
     let _router = RouterFactory::create_router(&ctx).await.expect("router");
 
     // Create
@@ -550,7 +550,7 @@ async fn test_multi_turn_loop_with_mcp() {
         .queue_timeout_secs(5)
         .build_unchecked();
 
-    let ctx = common::create_test_context(router_cfg).await;
+    let ctx = crate::common::create_test_context(router_cfg).await;
     let router = RouterFactory::create_router(&ctx).await.expect("router");
 
     // Build request with MCP tools
@@ -702,7 +702,7 @@ async fn test_max_tool_calls_limit() {
         .queue_timeout_secs(5)
         .build_unchecked();
 
-    let ctx = common::create_test_context(router_cfg).await;
+    let ctx = crate::common::create_test_context(router_cfg).await;
     let router = RouterFactory::create_router(&ctx).await.expect("router");
 
     let req = ResponsesRequest {
@@ -821,7 +821,8 @@ async fn setup_streaming_mcp_test() -> (
         .build_unchecked();
 
     let ctx =
-        common::create_test_context_with_mcp_config(router_cfg, cfg_path.to_str().unwrap()).await;
+        crate::common::create_test_context_with_mcp_config(router_cfg, cfg_path.to_str().unwrap())
+            .await;
     let router = RouterFactory::create_router(&ctx).await.expect("router");
 
     (mcp, worker, router, dir)
@@ -1239,7 +1240,7 @@ async fn test_conversation_items_create_and_get() {
         .queue_timeout_secs(5)
         .build_unchecked();
 
-    let ctx = common::create_test_context(router_cfg).await;
+    let ctx = crate::common::create_test_context(router_cfg).await;
     let _router = RouterFactory::create_router(&ctx).await.expect("router");
 
     // Create conversation
@@ -1325,7 +1326,7 @@ async fn test_conversation_items_delete() {
         .queue_timeout_secs(5)
         .build_unchecked();
 
-    let ctx = common::create_test_context(router_cfg).await;
+    let ctx = crate::common::create_test_context(router_cfg).await;
     let _router = RouterFactory::create_router(&ctx).await.expect("router");
 
     // Create conversation
@@ -1433,7 +1434,7 @@ async fn test_conversation_items_max_limit() {
         .queue_timeout_secs(5)
         .build_unchecked();
 
-    let ctx = common::create_test_context(router_cfg).await;
+    let ctx = crate::common::create_test_context(router_cfg).await;
     let _router = RouterFactory::create_router(&ctx).await.expect("router");
 
     // Create conversation
@@ -1490,7 +1491,7 @@ async fn test_conversation_items_unsupported_type() {
         .queue_timeout_secs(5)
         .build_unchecked();
 
-    let ctx = common::create_test_context(router_cfg).await;
+    let ctx = crate::common::create_test_context(router_cfg).await;
     let _router = RouterFactory::create_router(&ctx).await.expect("router");
 
     // Create conversation
@@ -1546,7 +1547,7 @@ async fn test_conversation_items_multi_conversation_sharing() {
         .queue_timeout_secs(5)
         .build_unchecked();
 
-    let ctx = common::create_test_context(router_cfg).await;
+    let ctx = crate::common::create_test_context(router_cfg).await;
     let _router = RouterFactory::create_router(&ctx).await.expect("router");
 
     // Create two conversations

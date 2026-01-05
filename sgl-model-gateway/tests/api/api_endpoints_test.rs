@@ -1,17 +1,16 @@
-mod common;
-
 use axum::{
     body::Body,
     extract::Request,
     http::{header::CONTENT_TYPE, StatusCode},
 };
-use common::{
-    mock_worker::{HealthStatus, MockWorker, MockWorkerConfig, WorkerType},
-    AppTestContext,
-};
 use serde_json::json;
 use smg::{config::RouterConfig, routers::RouterFactory};
 use tower::ServiceExt;
+
+use crate::common::{
+    mock_worker::{HealthStatus, MockWorker, MockWorkerConfig, WorkerType},
+    AppTestContext,
+};
 
 #[cfg(test)]
 mod health_tests {
@@ -1391,7 +1390,7 @@ mod pd_mode_tests {
             .build_unchecked();
 
         // Create app context
-        let app_context = common::create_test_context(config).await;
+        let app_context = crate::common::create_test_context(config).await;
 
         // Create router - this might fail due to health check issues
         let router_result = RouterFactory::create_router(&app_context).await;

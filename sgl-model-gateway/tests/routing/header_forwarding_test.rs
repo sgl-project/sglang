@@ -2,20 +2,19 @@
 //!
 //! Tests for header propagation through the router to workers.
 
-mod common;
-
 use axum::{
     body::Body,
     extract::Request,
     http::{header::CONTENT_TYPE, StatusCode},
 };
-use common::{
-    mock_worker::{HealthStatus, MockWorkerConfig, WorkerType},
-    AppTestContext,
-};
 use serde_json::json;
 use smg::config::RouterConfig;
 use tower::ServiceExt;
+
+use crate::common::{
+    mock_worker::{HealthStatus, MockWorkerConfig, WorkerType},
+    AppTestContext,
+};
 
 #[cfg(test)]
 mod header_forwarding_tests {

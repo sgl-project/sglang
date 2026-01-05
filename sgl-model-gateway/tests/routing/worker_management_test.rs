@@ -6,16 +6,15 @@
 //! - GET /workers - list workers
 //! - DELETE /workers/{worker_id} - remove a worker
 
-mod common;
-
 use axum::{
     body::Body,
     extract::Request,
     http::{header::CONTENT_TYPE, StatusCode},
 };
-use common::{AppTestContext, TestRouterConfig, TestWorkerConfig};
 use serde_json::json;
 use tower::ServiceExt;
+
+use crate::common::{AppTestContext, TestRouterConfig, TestWorkerConfig};
 
 #[cfg(test)]
 mod worker_management_tests {
