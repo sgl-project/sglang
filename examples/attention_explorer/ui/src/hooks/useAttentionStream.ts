@@ -17,12 +17,54 @@ export function useAttentionStream(options: UseAttentionStreamOptions = {}) {
 
   const program = useUIStore((state) => state.program);
   const setConnected = useUIStore((state) => state.setConnected);
+  const setModelName = useUIStore((state) => state.setModelName);
   const addMessage = useSessionStore((state) => state.addMessage);
   const appendToken = useSessionStore((state) => state.appendToken);
   const setFingerprint = useSessionStore((state) => state.setFingerprint);
 
   const clientRef = useRef<AttentionStreamClient | null>(null);
   const alignerRef = useRef<TokenAttentionAligner>(new TokenAttentionAligner());
+
+  // Check server health and fetch model info
+  useEffect(() => {
+    let cancelled = false;
+
+    const checkConnection = async () => {
+      try {
+        // Check health endpoint
+        const healthRes = await fetch(`${baseUrl}/health`, { method: 'GET' });
+        if (!healthRes.ok) throw new Error('Server not healthy');
+
+        // Get model info
+        const modelsRes = await fetch(`${baseUrl}/v1/models`, { method: 'GET' });
+        if (modelsRes.ok) {
+          const data = await modelsRes.json();
+          if (data.data?.[0]?.id && !cancelled) {
+            setModelName(data.data[0].id);
+          }
+        }
+
+        if (!cancelled) {
+          setConnected(true);
+        }
+      } catch (err) {
+        console.warn('Server connection check failed:', err);
+        if (!cancelled) {
+          setConnected(false);
+          setModelName('Not connected');
+        }
+      }
+    };
+
+    checkConnection();
+    // Re-check every 10 seconds
+    const interval = setInterval(checkConnection, 10000);
+
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
+  }, [baseUrl, setConnected, setModelName]);
 
   useEffect(() => {
     const client = new AttentionStreamClient({
@@ -53,13 +95,11 @@ export function useAttentionStream(options: UseAttentionStreamOptions = {}) {
     });
 
     clientRef.current = client;
-    setConnected(true);
 
     return () => {
       client.abort();
-      setConnected(false);
     };
-  }, [baseUrl, model, program, appendToken, setFingerprint, setConnected]);
+  }, [baseUrl, model, program, appendToken, setFingerprint]);
 
   useEffect(() => {
     clientRef.current?.setProgram(program);
