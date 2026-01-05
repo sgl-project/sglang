@@ -62,6 +62,11 @@ class LoadConfig:
     modelopt_checkpoint_restore_path: Optional[str] = None
     modelopt_checkpoint_save_path: Optional[str] = None
     modelopt_export_path: Optional[str] = None
+
+    # AutoRound-specific loading options
+    inc_save_path: Optional[str] = None
+    inc_tuning_iters: Optional[int] = 0
+    inc_disable_opt_rtn: Optional[bool] = False
     """
 
     load_format: Union[str, LoadFormat] = LoadFormat.AUTO
@@ -84,6 +89,11 @@ class LoadConfig:
 
     # ModelOpt configuration object
     modelopt_config: Optional[ModelOptConfig] = None
+
+    # AutoRound-specific loading options
+    inc_save_path: Optional[str] = None
+    inc_tuning_iters: Optional[int] = 0
+    inc_disable_opt_rtn: Optional[bool] = False
 
     # QuantizedRL-specific options (for FlashRL-style quantization)
     rl_quant_profile: Optional[str] = (

@@ -2426,6 +2426,77 @@ def load_model_with_cpu_quantization(
     return model.eval()
 
 
+class IncModelLoader(DefaultModelLoader):
+    """
+    Model loader that applies Intel AutoRound quantization
+    """
+
+    def __init__(self, load_config: LoadConfig):
+        super().__init__(load_config)
+
+    def load_model(
+        self,
+        *,
+        model_config: ModelConfig,
+        device_config: DeviceConfig,
+    ) -> nn.Module:
+
+        logger.info("IncModelLoader: Loading base model...")
+
+        # Check if model is already quantized
+        if model_config._is_already_quantized():
+            logger.info("Model is already quantized, loading directly...")
+            # Use default loading for pre-quantized models
+            return super().load_model(
+                model_config=model_config, device_config=device_config
+            )
+
+        logger.info("Standard quantization mode: Will quantize and save")
+        return self._autoround_quantization_workflow(model_config, device_config)
+
+    def _parse_quantization(self, quantization: str):
+        """Map quantization to AutoRound's scheme and format."""
+        AR_QUANT_CFG_CHOICES = {
+            "autoround_w4a16": ("W4A16", "auto_round"),
+        }
+        quant_cfg = AR_QUANT_CFG_CHOICES.get(quantization)
+        if not quant_cfg:
+            raise ValueError(
+                f"Invalid quantization choice: '{quantization}'. "
+                f"Available choices: {list(AR_QUANT_CFG_CHOICES.keys())}"
+            )
+        return quant_cfg
+
+    def _autoround_quantization_workflow(
+        self, model_config: ModelConfig, device_config: DeviceConfig
+    ) -> nn.Module:
+        """Auto-round quantization workflow: quantize, save checkpoint, then return model."""
+        try:
+            from auto_round import AutoRound
+        except ImportError:
+            logger.error(
+                "auto-round library not found. "
+                "Please install it to use AutoRound quantization."
+            )
+            raise
+
+        scheme, format = self._parse_quantization(model_config.quantization)
+
+        try:
+            autoround = AutoRound(
+                model_config.model_path,
+                scheme=scheme,
+                iters=self.load_config.inc_tuning_iters,
+                disable_opt_rtn=self.load_config.inc_disable_opt_rtn,
+            )
+            autoround.quantize_and_save(output_dir=self.load_config.inc_save_path)
+            model = autoround.model
+        except Exception as e:
+            raise ValueError(f"AutoRound quantization failed: {e}")
+
+        return model.eval()
+
+
 class ModelOptModelLoader(DefaultModelLoader):
     """
     Model loader that applies NVIDIA Model Optimizer quantization
@@ -2705,6 +2776,10 @@ def get_model_loader(
 
     if load_config.load_format == LoadFormat.DUMMY:
         return DummyModelLoader(load_config)
+
+    if model_config.quantization in ["autoround_w4a16"]:
+        logger.info("Using IncModelLoader due to AutoRound quantization config.")
+        return IncModelLoader(load_config)
 
     if model_config and (
         (hasattr(model_config, "modelopt_quant") and model_config.modelopt_quant)
