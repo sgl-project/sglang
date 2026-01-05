@@ -1,7 +1,7 @@
 // Integration test for Responses API
 
 use axum::http::StatusCode;
-use sgl_model_gateway::protocols::{
+use smg::protocols::{
     common::{GenerationRequest, ToolChoice, ToolChoiceValue, UsageInfo},
     responses::{
         ReasoningEffort, ResponseInput, ResponseReasoningParam, ResponseTool, ResponseToolType,
@@ -14,7 +14,7 @@ use common::{
     mock_mcp_server::MockMCPServer,
     mock_worker::{HealthStatus, MockWorker, MockWorkerConfig, WorkerType},
 };
-use sgl_model_gateway::{
+use smg::{
     config::RouterConfig,
     routers::{conversations, RouterFactory},
 };
@@ -397,7 +397,7 @@ fn test_usage_conversion() {
         completion_tokens: 25,
         total_tokens: 40,
         reasoning_tokens: Some(8),
-        prompt_tokens_details: Some(sgl_model_gateway::protocols::common::PromptTokenUsageInfo {
+        prompt_tokens_details: Some(smg::protocols::common::PromptTokenUsageInfo {
             cached_tokens: 3,
         }),
     };
@@ -785,7 +785,7 @@ async fn test_max_tool_calls_limit() {
 async fn setup_streaming_mcp_test() -> (
     MockMCPServer,
     MockWorker,
-    Box<dyn sgl_model_gateway::routers::RouterTrait>,
+    Box<dyn smg::routers::RouterTrait>,
     tempfile::TempDir,
 ) {
     let mcp = MockMCPServer::start().await.expect("start mcp");
