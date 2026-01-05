@@ -39,8 +39,8 @@ class TestPatchTokenizerEndToEndTest(unittest.TestCase):
             # All special tokens combined
             " ".join(special_tokens),
             # Random generated texts
-            *[_random_text(length=100) for _ in range(5)],
-            *[_random_text(length=1000) for _ in range(3)],
+            *[cls._random_text(length=100) for _ in range(5)],
+            *[cls._random_text(length=1000) for _ in range(3)],
         ]
 
     @classmethod
@@ -55,8 +55,13 @@ class TestPatchTokenizerEndToEndTest(unittest.TestCase):
         return {
             "encode": encode_results,
             "batch_encode": batch_encode_results,
-            "decode": [tokenizer.decode(ids, skip_special_tokens=True) for ids in encode_results],
-            "batch_decode": tokenizer.batch_decode(encode_results, skip_special_tokens=True),
+            "decode": [
+                tokenizer.decode(ids, skip_special_tokens=True)
+                for ids in encode_results
+            ],
+            "batch_decode": tokenizer.batch_decode(
+                encode_results, skip_special_tokens=True
+            ),
             "special_tokens": tokenizer.all_special_tokens,
             "special_ids": tokenizer.all_special_ids,
         }
@@ -141,14 +146,17 @@ class TestPatchTokenizerUnitTest(unittest.TestCase):
         unpatch_tokenizer(tokenizer)
 
 
-
 def _get_class_attr_ids(cls):
-    return {n: id(v.fget if isinstance(v, property) else v) for n, v in vars(cls).items()}
+    return {
+        n: id(v.fget if isinstance(v, property) else v) for n, v in vars(cls).items()
+    }
 
 
 def _load_tokenizer():
     # The slowness is mainly observed in Kimi
-    return AutoTokenizer.from_pretrained("nvidia/Kimi-K2-Thinking-NVFP4", trust_remote_code=True)
+    return AutoTokenizer.from_pretrained(
+        "nvidia/Kimi-K2-Thinking-NVFP4", trust_remote_code=True
+    )
 
 
 @contextmanager
