@@ -55,10 +55,16 @@ class _SpecialTokensCachePatcher:
             cls._CACHED_IDS_ATTR, tokenizer_cls._original_all_special_ids
         )
 
+        def patched_add_special_tokens(self, *args, **kwargs):
+            _raise_special_tokens_immutable("add_special_tokens")
+
+        def patched_add_tokens(self, *args, **kwargs):
+            _raise_special_tokens_immutable("add_tokens")
+
         tokenizer_cls.all_special_tokens = patched_all_special_tokens
         tokenizer_cls.all_special_ids = patched_all_special_ids
-        tokenizer_cls.add_special_tokens = _raise_special_tokens_immutable
-        tokenizer_cls.add_tokens = _raise_special_tokens_immutable
+        tokenizer_cls.add_special_tokens = patched_add_special_tokens
+        tokenizer_cls.add_tokens = patched_add_tokens
         setattr(tokenizer_cls, cls._PATCHED_FLAG, True)
 
         return tokenizer
@@ -104,7 +110,7 @@ def _make_cached_property(cache_attr, original_fn):
     return cached_prop
 
 
-def _raise_special_tokens_immutable(*args, **kwargs):
+def _raise_special_tokens_immutable(method_name):
     raise AssertionError(
-        f"Cannot mutate tokenizer after patch. Call unpatch_tokenizer first."
+        f"Cannot call {method_name} after patch. Call unpatch_tokenizer first."
     )
