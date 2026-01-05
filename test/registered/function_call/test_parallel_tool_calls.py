@@ -1,32 +1,33 @@
 import json
 
 """
-Test case for parallel tool call parsing bug.
+Test case for parallel tool call parsing.
 
-This test reproduces a bug where parser incorrectly identifies
-a '[' character inside an array parameter as the start of a new tool call
-when processing the second tool in a parallel tool call sequence.
+This test verifies that the parser correctly handles parallel tool calls
+with array parameters in JSON array format.
 
-Bug scenario:
+Scenario:
 - Model outputs two parallel tool calls in JSON array format
-- First tool has an array parameter (e.g., "title": ["7.8.9 H-9 ..."])
-- Tool separator comma ends the first tool
-- Second tool also has an array parameter (e.g., "title": ["4.8. ..."])
-- Bug: Parser finds '[' in "title": ["4" and incorrectly treats it as
-  a new tool start instead of parsing the second tool correctly
+- Both tools have array parameters (e.g., "title": ["7.8.9 H-9 ..."])
+- First tool completes with closing braces
+- Second tool starts with opening brace
+- The parser must correctly handle the '[' characters in array parameters
+  without confusing them with the JSON array start
 
 Expected behavior: Both tools should be parsed correctly.
-Actual behavior (before fix): Parser fails with AssertionError on second tool.
 """
 
 import unittest
 
 from sglang.srt.entrypoints.openai.protocol import Function, Tool
 from sglang.srt.function_call.json_array_parser import JsonArrayParser
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(1.0, "default")
 
 
-class TestParallelToolCallBug(unittest.TestCase):
-    """Test case for parallel tool call parsing bug with array parameters."""
+class TestParallelToolCalls(unittest.TestCase):
+    """Test case for parallel tool call parsing with array parameters."""
 
     def setUp(self):
         """Set up test tools and detector."""
@@ -70,13 +71,12 @@ class TestParallelToolCallBug(unittest.TestCase):
         """
         Test parsing two parallel tool calls where both have array parameters.
 
-        This test reproduces the specific bug scenario from the log:
+        This test reproduces the specific scenario:
         - Two tool calls separated by comma
         - Both tools have array parameters containing '[' character
         - First tool completes with '}},'
         - Second tool starts with '{"name": ..., "parameters": {"title": ["'
-        - Bug: Parser incorrectly finds '[' in title array as bot_token
-
+        
         Expected: Both tools should be parsed correctly without errors.
         """
         # Simulate more realistic streaming chunks where
@@ -137,7 +137,7 @@ class TestParallelToolCallBug(unittest.TestCase):
         """
         Test a simpler case of two parallel tool calls with array parameters.
 
-        This is a minimal test case that still triggers the bug.
+        This is a minimal test case that still tests the core functionality.
         """
         chunks = [
             "[\n",
