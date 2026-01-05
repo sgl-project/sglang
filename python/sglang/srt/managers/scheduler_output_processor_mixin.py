@@ -1611,6 +1611,8 @@ class SchedulerOutputProcessorMixin:
             - top_experts: {layer_id: [expert_ids]} - top-k experts per layer
             - entropy: {layer_id: float} - routing entropy (decisiveness)
             - expert_churn: float - how often top expert changes vs previous step
+            - hubness: {layer_id: float} - expert concentration (0=uniform, 1=single expert)
+            - top_hubs: {layer_id: [expert_id, count]} - most frequently selected expert
         """
         import math
 
@@ -1625,6 +1627,12 @@ class SchedulerOutputProcessorMixin:
         churn_count = 0
         layer_count = 0
 
+        # Initialize hubness tracking if not present
+        if not hasattr(req, "_moe_expert_hubness") or req._moe_expert_hubness is None:
+            req._moe_expert_hubness = {}
+        if not hasattr(req, "_moe_total_steps"):
+            req._moe_total_steps = 0
+
         for layer_id, topk_ids, topk_weights in moe_routing_buffer:
             if batch_idx >= topk_ids.shape[0]:
                 continue
@@ -1633,6 +1641,15 @@ class SchedulerOutputProcessorMixin:
             expert_ids = topk_ids[batch_idx].tolist()
             telemetry["top_experts"][layer_id] = expert_ids
             current_top_experts[layer_id] = expert_ids[0] if expert_ids else -1
+
+            # Update hubness tracking - count top-1 expert selections
+            if layer_id not in req._moe_expert_hubness:
+                req._moe_expert_hubness[layer_id] = {}
+            if expert_ids:
+                top_expert = expert_ids[0]
+                req._moe_expert_hubness[layer_id][top_expert] = (
+                    req._moe_expert_hubness[layer_id].get(top_expert, 0) + 1
+                )
 
             # Compute entropy from weights if available
             if topk_weights is not None:
@@ -1655,10 +1672,37 @@ class SchedulerOutputProcessorMixin:
 
         # Store current top experts for next step
         req._moe_prev_top_experts = current_top_experts
+        req._moe_total_steps += 1
 
         # Compute overall churn rate
         if layer_count > 0 and prev_top_experts:
             telemetry["expert_churn"] = round(churn_count / layer_count, 3)
+
+        # Compute hubness metrics (accumulated over all steps)
+        # Hubness = 1 - (num_unique_experts / total_steps) - higher = more concentrated
+        if req._moe_total_steps > 0 and req._moe_expert_hubness:
+            hubness = {}
+            top_hubs = {}
+            for layer_id, expert_counts in req._moe_expert_hubness.items():
+                if expert_counts:
+                    # Find the most frequent expert (top hub)
+                    top_expert = max(expert_counts, key=expert_counts.get)
+                    top_count = expert_counts[top_expert]
+                    top_hubs[layer_id] = [top_expert, top_count]
+
+                    # Compute concentration (Gini-like)
+                    # 1 = all selections go to one expert, 0 = uniform across all
+                    total_selections = sum(expert_counts.values())
+                    num_unique = len(expert_counts)
+                    if total_selections > 0:
+                        # Max concentration = top expert gets all
+                        concentration = top_count / total_selections
+                        hubness[layer_id] = round(concentration, 3)
+
+            if hubness:
+                telemetry["hubness"] = hubness
+            if top_hubs:
+                telemetry["top_hubs"] = top_hubs
 
         return telemetry if telemetry["top_experts"] else {}
 

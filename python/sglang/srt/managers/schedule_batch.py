@@ -784,6 +784,10 @@ class Req:
         self.moe_routing_top_k = moe_routing_top_k
         self.moe_capture_layer_ids = moe_capture_layer_ids
         self.moe_routing: List[Dict] = []  # Per-token MoE routing info
+        # MoE sketch fingerprint: accumulated hubness tracking per layer
+        # hubness[layer_id] = {expert_id: count} - tracks expert selection frequency
+        self._moe_expert_hubness: Dict[int, Dict[int, int]] = {}
+        self._moe_total_steps: int = 0  # Total decode steps for hubness normalization
         # Think phase tracking for attention segmentation (reasoning models)
         # Phase: "think" = inside <think>...</think>, "output" = after </think>
         self.attention_think_phase: str = "output"  # Current phase
