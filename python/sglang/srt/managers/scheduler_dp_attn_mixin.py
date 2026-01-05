@@ -146,7 +146,7 @@ def prepare_mlp_sync_batch_raw(
         local_batch.is_extend_in_batch = is_extend_in_batch
 
     tbo_preparer = TboDPAttentionPreparer()
-    if len(offload_tags) == 0 and disable_overlap_schedule:
+    if len(offload_tags) == 0:
         group = tp_group.device_group
         device = tp_group.device
     else:
