@@ -634,6 +634,14 @@ class SchedulerOutputProcessorMixin:
                         "think_phase": req.attention_think_phase,
                     }
 
+                    # Add MoE telemetry if available (for hybrid models like Qwen3-Next)
+                    if logits_output.moe_routing_buffer:
+                        moe_telemetry = self._compute_moe_telemetry(
+                            logits_output.moe_routing_buffer, i, req
+                        )
+                        if moe_telemetry:
+                            fingerprint_info["moe"] = moe_telemetry
+
                     # Stream to sidecar if configured
                     sidecar_url = getattr(self.server_args, "attention_sidecar_url", "")
                     if sidecar_url:
@@ -641,6 +649,7 @@ class SchedulerOutputProcessorMixin:
                             request_id=req.rid,
                             fingerprint=fingerprint_info["fingerprint"],
                             manifold=fingerprint_info["manifold"],
+                            moe_telemetry=fingerprint_info.get("moe"),
                         )
 
                     # Also store locally for API response (optional, for debugging)
@@ -1585,11 +1594,80 @@ class SchedulerOutputProcessorMixin:
             logger.warning(f"Failed to connect fingerprint publisher: {e}")
             self._fingerprint_publisher = None
 
+    def _compute_moe_telemetry(
+        self: "Scheduler",
+        moe_routing_buffer: list,
+        batch_idx: int,
+        req,
+    ) -> dict:
+        """
+        Compute MoE telemetry signals for fingerprinting.
+
+        For hybrid models like Qwen3-Next, MoE routing is often a cleaner
+        semantic signature than attention patterns alone.
+
+        Returns:
+            dict with:
+            - top_experts: {layer_id: [expert_ids]} - top-k experts per layer
+            - entropy: {layer_id: float} - routing entropy (decisiveness)
+            - expert_churn: float - how often top expert changes vs previous step
+        """
+        import math
+
+        telemetry = {
+            "top_experts": {},
+            "entropy": {},
+        }
+
+        # Track previous top experts for churn calculation
+        prev_top_experts = getattr(req, "_moe_prev_top_experts", {})
+        current_top_experts = {}
+        churn_count = 0
+        layer_count = 0
+
+        for layer_id, topk_ids, topk_weights in moe_routing_buffer:
+            if batch_idx >= topk_ids.shape[0]:
+                continue
+
+            # Top expert IDs for this layer
+            expert_ids = topk_ids[batch_idx].tolist()
+            telemetry["top_experts"][layer_id] = expert_ids
+            current_top_experts[layer_id] = expert_ids[0] if expert_ids else -1
+
+            # Compute entropy from weights if available
+            if topk_weights is not None:
+                weights = topk_weights[batch_idx].tolist()
+                # Normalize weights and compute entropy
+                total = sum(w for w in weights if w > 0)
+                if total > 0:
+                    entropy = 0.0
+                    for w in weights:
+                        if w > 0:
+                            p = w / total
+                            entropy -= p * math.log2(p + 1e-10)
+                    telemetry["entropy"][layer_id] = round(entropy, 3)
+
+            # Check for expert churn
+            if layer_id in prev_top_experts:
+                if prev_top_experts[layer_id] != current_top_experts[layer_id]:
+                    churn_count += 1
+            layer_count += 1
+
+        # Store current top experts for next step
+        req._moe_prev_top_experts = current_top_experts
+
+        # Compute overall churn rate
+        if layer_count > 0 and prev_top_experts:
+            telemetry["expert_churn"] = round(churn_count / layer_count, 3)
+
+        return telemetry if telemetry["top_experts"] else {}
+
     def _stream_fingerprint_to_sidecar(
         self: "Scheduler",
         request_id: str,
         fingerprint: list,
         manifold: str,
+        moe_telemetry: dict = None,
     ):
         """
         Stream a single fingerprint to the sidecar for clustering.
@@ -1604,11 +1682,16 @@ class SchedulerOutputProcessorMixin:
 
         try:
             import json
-            message = json.dumps({
+            payload = {
                 "request_id": request_id,
                 "vector": fingerprint,
                 "manifold": manifold,
-            }).encode()
+            }
+            # Include MoE telemetry for hybrid models
+            if moe_telemetry:
+                payload["moe"] = moe_telemetry
+
+            message = json.dumps(payload).encode()
             # Non-blocking send - drop if buffer full
             self._fingerprint_publisher.send(message, flags=1)  # zmq.NOBLOCK
         except Exception:
