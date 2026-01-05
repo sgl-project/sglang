@@ -28,6 +28,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBa
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import PortArgs, ServerArgs
 from sglang.multimodal_gen.runtime.utils.common import set_cuda_arch
+from sglang.multimodal_gen.runtime.utils.layerwise_offload import OffloadableDiTMixin
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
     configure_logger,
     globally_suppress_loggers,
@@ -87,6 +88,24 @@ class GPUWorker:
         )
 
         self.pipeline = build_pipeline(self.server_args)
+
+        # apply layerwise offload after lora is applied while building LoRAPipeline
+        # otherwise empty offloaded weights could fail lora converting
+        if self.server_args.dit_layerwise_offload:
+            # enable layerwise offload if possible
+            for dit in filter(
+                None,
+                [
+                    self.pipeline.get_module("transformer"),
+                    self.pipeline.get_module("transformer_2"),
+                ],
+            ):
+                if isinstance(dit, OffloadableDiTMixin):
+                    dit.configure_layerwise_offload(self.server_args)
+                else:
+                    logger.info(
+                        f"Module {type(dit).__name__} does not support layerwise offload. Skipping."
+                    )
 
         logger.info(
             f"Worker {self.rank}: Initialized device, model, and distributed environment."
