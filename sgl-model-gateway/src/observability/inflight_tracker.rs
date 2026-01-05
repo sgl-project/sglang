@@ -105,8 +105,8 @@ impl InFlightRequestTracker {
     fn sample_and_record(&self) {
         let buckets = &*AGE_BUCKETS;
         let counts = self.compute_bucket_counts();
-        for ((&le, &gt), &count) in std::iter::zip(
-            std::iter::zip(&buckets.le_labels, &buckets.gt_labels),
+        for ((&gt, &le), &count) in std::iter::zip(
+            std::iter::zip(&buckets.gt_labels, &buckets.le_labels),
             &counts,
         ) {
             Metrics::set_inflight_request_age_count(gt, le, count);
