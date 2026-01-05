@@ -23,9 +23,9 @@ pub mod tiktoken;
 #[cfg(test)]
 mod tests;
 
-// Re-export types used outside this module
 // Internal imports for Tokenizer struct
 use factory::{create_tokenizer_from_file, create_tokenizer_with_chat_template};
+// Re-export types used outside this module
 pub use huggingface::HuggingFaceTokenizer;
 pub use registry::TokenizerRegistry;
 pub use stop::StopSequenceDecoder;
