@@ -1,5 +1,6 @@
 import os
 import unittest
+from contextlib import contextmanager
 from types import SimpleNamespace
 
 from sglang.bench_serving import run_benchmark
@@ -14,6 +15,33 @@ from sglang.test.test_utils import (
     get_benchmark_args,
     popen_launch_server,
 )
+
+
+@contextmanager
+def prefill_delayer_env(enabled: bool):
+    with envs.SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE.override(
+        enabled
+    ), envs.SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES.override(100):
+        yield
+
+
+def launch_dp_attention_server(model, base_url, other_args=None):
+    return popen_launch_server(
+        model,
+        base_url,
+        timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+        other_args=[
+            "--trust-remote-code",
+            "--tp",
+            "8",
+            "--enable-dp-attention",
+            "--dp",
+            "8",
+            "--chunked-prefill-size",
+            "131072",
+            *(other_args or []),
+        ],
+    )
 
 
 class TestPrefillDelayerThroughput(CustomTestCase):
@@ -33,13 +61,9 @@ class TestPrefillDelayerThroughput(CustomTestCase):
         self._run_throughput_test(
             debug_name=f"online_serving ({prefill_delayer=})",
             prefill_delayer=prefill_delayer,
-            other_launch_args=[
-                "--mem-fraction-static",
-                "0.6",
-            ],
+            other_launch_args=["--mem-fraction-static", "0.6"],
             other_benchmark_args=dict(
                 num_prompts=500,
-                # trigger chunked prefill
                 random_input_len=30000,
                 random_output_len=256,
                 request_rate=32,
@@ -71,31 +95,14 @@ class TestPrefillDelayerThroughput(CustomTestCase):
         other_benchmark_args,
     ):
         os.environ["SGLANG_PREFILL_DELAYER_DEBUG_LOG"] = "1"
-
         model = "Qwen/Qwen3-0.6B"
         base_url = DEFAULT_URL_FOR_TEST
 
-        with envs.SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE.override(
-            prefill_delayer
-        ), envs.SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES.override(100):
-            process = popen_launch_server(
+        with prefill_delayer_env(prefill_delayer):
+            process = launch_dp_attention_server(
                 model,
                 base_url,
-                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-                other_args=[
-                    "--trust-remote-code",
-                    "--tp",
-                    "8",
-                    "--enable-dp-attention",
-                    "--dp",
-                    "8",
-                    "--chunked-prefill-size",
-                    "131072",
-                    # Not really needed, just to ensure non-fcfs works
-                    "--schedule-policy",
-                    "lpm",
-                    *other_launch_args,
-                ],
+                ["--schedule-policy", "lpm", *other_launch_args],
             )
 
         try:
@@ -119,24 +126,8 @@ class TestPrefillDelayerAccuracy(CustomTestCase):
     def setUpClass(cls):
         cls.model = DEFAULT_MLA_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
-        with envs.SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE.override(
-            True
-        ), envs.SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES.override(100):
-            cls.process = popen_launch_server(
-                cls.model,
-                cls.base_url,
-                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-                other_args=[
-                    "--trust-remote-code",
-                    "--tp",
-                    "8",
-                    "--enable-dp-attention",
-                    "--dp",
-                    "8",
-                    "--chunked-prefill-size",
-                    "131072",
-                ],
-            )
+        with prefill_delayer_env(True):
+            cls.process = launch_dp_attention_server(cls.model, cls.base_url)
 
     @classmethod
     def tearDownClass(cls):
