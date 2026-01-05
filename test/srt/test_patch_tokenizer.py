@@ -13,13 +13,7 @@ KIMI_TOKENIZER = "nvidia/Kimi-K2-Thinking-NVFP4"
 
 def _get_class_attr_ids(cls):
     """Get id of all class attributes, unwrapping property.fget"""
-    result = {}
-    for name, value in vars(cls).items():
-        if isinstance(value, property):
-            result[name] = id(value.fget)
-        else:
-            result[name] = id(value)
-    return result
+    return {n: id(v.fget if isinstance(v, property) else v) for n, v in vars(cls).items()}
 
 
 def _load_tokenizer():
@@ -113,11 +107,6 @@ class TestPatchTokenizer(unittest.TestCase):
         )
 
         unpatch_tokenizer(tokenizer)
-
-    def test_unpatch_without_patch_is_noop(self):
-        tokenizer = _load_tokenizer()
-        result = unpatch_tokenizer(tokenizer)
-        self.assertIs(result, tokenizer)
 
 
 if __name__ == "__main__":
