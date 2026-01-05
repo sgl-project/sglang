@@ -172,7 +172,6 @@ class CUDAPiecewiseBackend:
                     stack.enter_context(patch("torch.cuda.empty_cache", lambda: None))
                 # mind-exploding: carefully manage the reference and memory.
                 stream = get_pcg_capture_stream()
-                assert stream is not None, "PCG capture stream is not set"
                 with torch.cuda.graph(cudagraph, pool=self.graph_pool, stream=stream):
                     # `output` is managed by pytorch's cudagraph pool
                     output = entry.runnable(*args)
