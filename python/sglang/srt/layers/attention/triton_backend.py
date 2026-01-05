@@ -1,9 +1,17 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Optional
 
 import torch
+
+logger = logging.getLogger(__name__)
+
+# Maximum sequence length for PyTorch fallback with attention bias
+# Beyond this, the nested Python loops become too slow
+_ATTENTION_BIAS_MAX_SEQ_LEN = 32768
+_warned_attention_bias_seq_len = False
 import torch.nn.functional as F
 import triton
 import triton.language as tl
@@ -1021,23 +1029,36 @@ class TritonAttnBackend(AttentionBackend):
             # Use PyTorch fallback with bias support
             # Get max sequence length for this batch
             max_seq_len = (kv_indptr[1:] - kv_indptr[:-1]).max().item()
-            attention_bias = forward_batch.get_attention_bias_tensor(layer.layer_id, max_seq_len)
 
-            if attention_bias is not None:
-                self._decode_attention_with_bias_pytorch(
-                    q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
-                    forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
-                    forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
-                    o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
-                    kv_indptr,
-                    kv_indices,
-                    layer.scaling,
-                    attention_bias,
-                    logit_cap=logits_soft_cap,
-                )
-            else:
-                # Fallback to fast path if bias tensor creation failed
+            # Skip bias fallback for very long sequences - too slow
+            if max_seq_len > _ATTENTION_BIAS_MAX_SEQ_LEN:
+                global _warned_attention_bias_seq_len
+                if not _warned_attention_bias_seq_len:
+                    logger.warning(
+                        f"Attention bias requested but seq_len={max_seq_len} exceeds "
+                        f"max={_ATTENTION_BIAS_MAX_SEQ_LEN}. Skipping bias (PyTorch "
+                        f"fallback too slow). Use router biases for long-context steering."
+                    )
+                    _warned_attention_bias_seq_len = True
                 use_bias_fallback = False
+            else:
+                attention_bias = forward_batch.get_attention_bias_tensor(layer.layer_id, max_seq_len)
+
+                if attention_bias is not None:
+                    self._decode_attention_with_bias_pytorch(
+                        q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+                        forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
+                        forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
+                        o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+                        kv_indptr,
+                        kv_indices,
+                        layer.scaling,
+                        attention_bias,
+                        logit_cap=logits_soft_cap,
+                    )
+                else:
+                    # Fallback to fast path if bias tensor creation failed
+                    use_bias_fallback = False
 
         if not use_bias_fallback:
             # Fast path: use optimized Triton kernel
