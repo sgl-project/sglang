@@ -980,7 +980,9 @@ def select_experts(
             N,  # base id for shared experts
         )
 
-    get_global_expert_distribution_recorder().on_select_experts(topk_ids=topk_ids)
+    get_global_expert_distribution_recorder().on_select_experts(
+        topk_ids=topk_ids, topk_weights=topk_weights
+    )
     get_global_experts_capturer().capture(
         layer_id=layer_id,
         topk_ids=topk_ids,

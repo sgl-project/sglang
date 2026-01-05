@@ -441,6 +441,16 @@ class ForwardBatch:
     attention_bias_values: Optional[torch.Tensor] = None   # [num_biases] bias values
     attention_bias_layers: Optional[List[int]] = None      # Which layers have biases
 
+    # For MoE routing capture (interpretability/semantic telemetry)
+    # Captures which experts were selected and with what weights
+    capture_moe_routing: bool = False
+    moe_routing_top_k: int = 2  # How many top experts to capture per token
+    # Buffer for captured routing: List[(layer_id, topk_ids, topk_weights)]
+    # topk_ids: [num_tokens, top_k], topk_weights: [num_tokens, top_k]
+    moe_routing_buffer: Optional[List[Tuple[int, torch.Tensor, torch.Tensor]]] = None
+    # Layers to capture MoE routing from (None = all MoE layers)
+    moe_capture_layer_ids: Optional[List[int]] = None
+
     @classmethod
     def init_new(
         cls,
@@ -678,6 +688,13 @@ class ForwardBatch:
                     device=model_runner.device,
                 )
                 ret.attention_bias_layers = layer_ids_with_biases
+
+        # Init MoE routing capture
+        if batch.capture_moe_routing:
+            ret.capture_moe_routing = True
+            ret.moe_routing_top_k = batch.moe_routing_top_k
+            ret.moe_capture_layer_ids = batch.moe_capture_layer_ids
+            ret.moe_routing_buffer = []  # Initialize empty list to accumulate routing data
 
         return ret
 
