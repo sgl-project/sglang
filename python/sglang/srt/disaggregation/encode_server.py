@@ -57,6 +57,7 @@ use_image_processor_gpu = (
     int(os.getenv("SGLANG_ENCODER_IMAGE_PROCESSOR_USE_GPU", "0")) == 1
 )
 
+
 class TensorWrapper:
     """Wrapper to keep tensor alive while exposing buffer for zero-copy."""
 
