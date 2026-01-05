@@ -30,6 +30,7 @@ import torch
 import torch.distributed as dist
 from torch import nn
 
+from python.sglang.srt.configs.parallelism_config import RankParallelismConfig
 from sglang.srt.configs import (
     FalconH1Config,
     JetNemotronConfig,
@@ -316,6 +317,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.remote_instance_transfer_engine = None
         self.remote_instance_transfer_engine_session_id = ""
         self.remote_instance_transfer_engine_weight_info = None
+        self.parallelism_config = None
         # auxiliary hidden capture mode. TODO: expose this to server args?
         self.eagle_use_aux_hidden_state = False
         if self.spec_algorithm.is_eagle3() and not self.is_draft_worker:
@@ -420,6 +422,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         if self.server_args.remote_instance_weight_loader_use_transfer_engine():
             self.remote_instance_init_transfer_engine()
+            self.parallelism_config = RankParallelismConfig.from_parallel_state(
+                self.tp_rank
+            )
 
         if not self.is_draft_worker:
             set_global_expert_location_metadata(

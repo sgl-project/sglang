@@ -28,18 +28,19 @@ import os
 import pickle
 import weakref
 from collections import namedtuple
-from contextlib import contextmanager, nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import timedelta
 from multiprocessing import shared_memory
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import torch
 import torch.distributed
 from torch.distributed import Backend, ProcessGroup
 
 from sglang.srt.compilation.compilation_config import register_split_op
+from sglang.srt.configs.parallelism_config import RankParallelismConfig
 from sglang.srt.environ import envs
 from sglang.srt.utils import (
     get_bool_env_var,
@@ -1978,3 +1979,76 @@ def monkey_patch_vllm_parallel_state(reverse: bool = False):
         setattr(vllm_parrlel_state, "get_pp_group", get_pp_group)
         setattr(vllm_parrlel_state, "get_tp_group", get_tp_group)
         setattr(vllm_parrlel_state, "get_world_group", get_world_group)
+
+
+class ParallelismContext:
+    """Context manager for creating model replicas with specific parallelism settings."""
+
+    def __init__(self, parallelism_config: RankParallelismConfig):
+        self.config = parallelism_config
+        self.stack = ExitStack()
+        self._original_globals = {}
+
+    def __enter__(self):
+        conf = self.config
+        p_state = "sglang.srt.distributed.parallel_state"
+
+        patch_map = {
+            f"{p_state}.get_tensor_model_parallel_world_size": conf.tp_size,
+            f"{p_state}.get_tensor_model_parallel_rank": conf.tp_rank,
+            f"{p_state}.get_pipeline_model_parallel_world_size": conf.pp_size,
+            f"{p_state}.get_pipeline_model_parallel_rank": conf.pp_rank,
+            f"{p_state}.get_expert_model_parallel_world_size": conf.ep_size,
+            f"{p_state}.get_expert_model_parallel_rank": conf.ep_rank,
+            f"{p_state}.get_tp_group": MagicMock(
+                world_size=conf.tp_size, rank_in_group=conf.tp_rank
+            ),
+            f"{p_state}.get_pp_group": MagicMock(
+                world_size=conf.pp_size, rank_in_group=conf.pp_rank
+            ),
+            f"{p_state}.get_ep_group": MagicMock(
+                world_size=conf.ep_size, rank_in_group=conf.ep_rank
+            ),
+        }
+
+        if conf.has_dp_attention:
+            from sglang.srt.layers import dp_attention
+
+            attn_map = {
+                "get_attention_tp_size": conf.attn_tp_size,
+                "get_attention_tp_rank": conf.attn_tp_rank,
+                "get_attention_dp_size": conf.attn_dp_size,
+                "get_attention_dp_rank": conf.attn_dp_rank,
+            }
+            for func, val in attn_map.items():
+                patch_map[f"sglang.srt.layers.dp_attention.{func}"] = val
+
+            for attr in [
+                "_ATTN_TP_SIZE",
+                "_ATTN_TP_RANK",
+                "_ATTN_DP_SIZE",
+                "_ATTN_DP_RANK",
+            ]:
+                self._original_globals[attr] = getattr(dp_attention, attr, None)
+                setattr(dp_attention, attr, getattr(conf, attr.lower()[1:]))
+
+        for target, value in patch_map.items():
+            try:
+                self.stack.enter_context(patch(target, return_value=value))
+            except (ImportError, AttributeError):
+                continue
+
+        logger.info(
+            f"[ReplicaContext] Activated: TP={conf.tp_rank}/{conf.tp_size}, PP={conf.pp_rank}/{conf.pp_size}"
+        )
+        return self
+
+    def __exit__(self, *args):
+        if self._original_globals:
+            from sglang.srt.layers import dp_attention
+
+            for attr, val in self._original_globals.items():
+                setattr(dp_attention, attr, val)
+
+        self.stack.close()
+        logger.info("[ReplicaContext] Deactivated")
