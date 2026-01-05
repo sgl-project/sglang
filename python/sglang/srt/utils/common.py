@@ -1525,6 +1525,8 @@ def add_prometheus_track_response_middleware(app):
 
     @app.middleware("http")
     async def track_http_status_code(request, call_next):
+        # With recording all requests, we have the risk of high cardinality if requests have arbitrary unhandled paths.
+        # But given that SGLang engines with metrics enabled are usually behind routers this looks safe.
         path, is_handled_path = _get_fastapi_request_path(request)
         method = request.method
 
