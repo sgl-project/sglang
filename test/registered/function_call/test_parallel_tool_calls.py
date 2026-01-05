@@ -76,7 +76,7 @@ class TestParallelToolCalls(unittest.TestCase):
         - Both tools have array parameters containing '[' character
         - First tool completes with '}},'
         - Second tool starts with '{"name": ..., "parameters": {"title": ["'
-        
+
         Expected: Both tools should be parsed correctly without errors.
         """
         # Simulate more realistic streaming chunks where
