@@ -98,10 +98,9 @@ class _SpecialTokensCachePatcher:
         del tokenizer_cls._original_add_tokens
         delattr(tokenizer_cls, cls._PATCHED_FLAG)
 
-        if hasattr(tokenizer, cls._CACHED_TOKENS_ATTR):
-            delattr(tokenizer, cls._CACHED_TOKENS_ATTR)
-        if hasattr(tokenizer, cls._CACHED_IDS_ATTR):
-            delattr(tokenizer, cls._CACHED_IDS_ATTR)
+        for attr in [cls._CACHED_TOKENS_ATTR, cls._CACHED_IDS_ATTR]:
+            if hasattr(tokenizer, attr):
+                delattr(tokenizer, attr)
 
         logger.info(f"Unpatched special tokens cache for {tokenizer_cls.__name__}")
         return tokenizer
