@@ -963,11 +963,6 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
             teacache_thresh=ctx.teacache_thresh,
         )
 
-        if self.is_cfg_negative:
-            self.previous_modulated_input_negative = modulated_inp.clone()
-        else:
-            self.previous_modulated_input = modulated_inp.clone()
-
         return not should_calc
 
     def retrieve_cached_states(self, hidden_states: torch.Tensor) -> torch.Tensor:
