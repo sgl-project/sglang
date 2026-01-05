@@ -191,18 +191,10 @@ jobs:
 
       - name: Run Python unit tests
         run: |
-          cd sgl-model-gateway
+          cd sgl-model-gateway/bindings/python
           source "$HOME/.cargo/env"
           python3 -m pip install pytest pytest-cov pytest-xdist
-          pytest -q py_test/unit --cov=sglang_router --cov-config=bindings/python/.coveragerc --cov-report=term-missing --cov-fail-under=80
-
-      - name: Run Python integration tests
-        run: |
-          cd sgl-model-gateway
-          source "$HOME/.cargo/env"
-          # Integration tests use FastAPI/uvicorn for mock workers
-          python3 -m pip install fastapi uvicorn orjson
-          pytest -q py_test/integration_mock
+          pytest -q tests --cov=sglang_router --cov-config=.coveragerc --cov-report=term-missing --cov-fail-under=80
 
       - name: Run Python E2E tests
         run: |

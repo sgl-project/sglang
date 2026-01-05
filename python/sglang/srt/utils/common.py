@@ -2414,10 +2414,6 @@ def launch_dummy_health_check_server(host, port, enable_metrics):
     )
 
 
-def create_checksum(directory: str):
-    raise NotImplementedError()
-
-
 def set_cuda_arch():
     if is_flashinfer_available():
         capability = torch.cuda.get_device_capability()
