@@ -21,8 +21,7 @@ impl NumericalBuckets {
     fn new(upper_bounds: &'static [u64]) -> Self {
         let leak_str = |n: u64| Box::leak(n.to_string().into_boxed_str()) as &'static str;
 
-        let mut le_labels: Vec<&'static str> =
-            upper_bounds.iter().map(|&b| leak_str(b)).collect();
+        let mut le_labels: Vec<&'static str> = upper_bounds.iter().map(|&b| leak_str(b)).collect();
         le_labels.push("+Inf");
 
         let mut gt_labels: Vec<&'static str> = vec!["0"];
@@ -41,7 +40,8 @@ impl NumericalBuckets {
 }
 
 const AGE_BUCKET_BOUNDS: &[u64] = &[30, 60, 180, 300, 600, 1200, 3600, 7200, 14400, 28800, 86400];
-static AGE_BUCKETS: LazyLock<NumericalBuckets> = LazyLock::new(|| NumericalBuckets::new(AGE_BUCKET_BOUNDS));
+static AGE_BUCKETS: LazyLock<NumericalBuckets> =
+    LazyLock::new(|| NumericalBuckets::new(AGE_BUCKET_BOUNDS));
 
 pub struct InFlightRequestTracker {
     requests: DashMap<u64, Instant>,
