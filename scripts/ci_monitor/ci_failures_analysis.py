@@ -144,6 +144,85 @@ class SGLangFailuresAnalyzer:
             print(f"Error fetching logs for job {job_id}: {e}")
             return ""
 
+    def get_online_runners(self) -> Dict[str, Dict]:
+        """
+        Fetch all self-hosted runners and their online status from GitHub API.
+
+        Returns:
+            Dict mapping runner label sets to their online/total counts.
+            E.g., {"8-gpu-h200-runner": {"online": 2, "total": 3, "busy": 1}}
+        """
+        print("Fetching self-hosted runner status...")
+        try:
+            # Use separate admin token if available (needs repo admin scope)
+            runner_token = os.environ.get("GH_PAT_FOR_RUNNER_ADMIN") or self.token
+            runner_headers = {
+                "Authorization": f"token {runner_token}",
+                "Accept": "application/vnd.github.v3+json",
+            }
+
+            all_runners = []
+            url = f"{self.base_url}/repos/{self.repo}/actions/runners"
+            params = {"per_page": 100}
+
+            while url:
+                response = requests.get(
+                    url, headers=runner_headers, params=params, timeout=30
+                )
+                if response.status_code != 200:
+                    print(
+                        f"  Warning: Runner API returned {response.status_code}: {response.text[:200]}"
+                    )
+                    return {}
+                data = response.json()
+                runners = data.get("runners", [])
+                all_runners.extend(runners)
+
+                # Check for next page in Link header
+                link_header = response.headers.get("Link", "")
+                next_url = None
+                if link_header:
+                    links = link_header.split(", ")
+                    for link in links:
+                        if 'rel="next"' in link:
+                            next_url = link.split(";")[0].strip("<>")
+                            break
+                url = next_url
+                params = {}  # Clear params for subsequent requests
+
+            print(f"  Found {len(all_runners)} self-hosted runners")
+
+            # Group runners by their labels (excluding common labels like "self-hosted")
+            # A runner can have multiple labels, so count it for each relevant label
+            runner_stats_by_label = defaultdict(
+                lambda: {"online": 0, "total": 0, "busy": 0}
+            )
+
+            # Common labels to exclude (not useful for grouping)
+            excluded_labels = {"self-hosted", "Linux", "X64", "ARM64"}
+
+            for runner in all_runners:
+                # Get all custom/relevant labels for this runner
+                labels = [
+                    label.get("name", "")
+                    for label in runner.get("labels", [])
+                    if label.get("name", "") not in excluded_labels
+                ]
+
+                # Count this runner for EACH of its relevant labels
+                for runner_label in labels:
+                    runner_stats_by_label[runner_label]["total"] += 1
+                    if runner.get("status") == "online":
+                        runner_stats_by_label[runner_label]["online"] += 1
+                    if runner.get("busy", False):
+                        runner_stats_by_label[runner_label]["busy"] += 1
+
+            return dict(runner_stats_by_label)
+
+        except requests.exceptions.RequestException as e:
+            print(f"Error fetching runners: {e}")
+            return {}
+
     def parse_test_summary(self, logs: str) -> Optional[Dict]:
         """
         Parse the test summary block from job logs.
@@ -967,6 +1046,7 @@ class SGLangFailuresAnalyzer:
         runner_instance_data: Optional[Dict[str, Dict]] = None,
         runner_streak_data: Optional[Dict[str, Dict]] = None,
         runner_instance_streak_data: Optional[Dict[str, Dict]] = None,
+        online_runners: Optional[Dict[str, Dict]] = None,
         # Test failures (per job -> per test)
         job_test_failures: Optional[Dict[str, Dict[str, Dict]]] = None,
         # Config
@@ -1090,6 +1170,7 @@ class SGLangFailuresAnalyzer:
                 runner_instance_streak_data if runner_instance_streak_data else {}
             ),
             "job_test_failures": job_test_failures if job_test_failures else {},
+            "online_runners": online_runners if online_runners else {},
         }
 
         # Save to JSON only if output file is specified
@@ -1160,23 +1241,24 @@ class SGLangFailuresAnalyzer:
             summary_lines.append("</details>")
             summary_lines.append("")
 
-            # Queue Time Summary - COLLAPSIBLE
+            # Runner Statistics - COLLAPSIBLE
             runner_stats = report_data.get("runner_stats", {})
+            online_runners = report_data.get("online_runners", {})
             if runner_stats:
                 summary_lines.append("<details>")
                 summary_lines.append(
-                    "<summary>📊 Queue Time Summary by Runner Type (click to expand)</summary>"
+                    "<summary>📊 Runner Statistics (by type) (click to expand)</summary>"
                 )
                 summary_lines.append("")
                 summary_lines.append(
-                    "_High queue times indicate that runner type may need more workers._"
+                    "_High queue times indicate that runner type may need more workers. Online column shows current runner availability._"
                 )
                 summary_lines.append("")
                 summary_lines.append(
-                    "| Runner Type | Avg Queue | P90 Queue | # of Jobs Processed | Jobs Using This Runner |"
+                    "| Runner Type | Online | Avg Queue | P90 Queue | # of Jobs Processed | Jobs Using This Runner |"
                 )
                 summary_lines.append(
-                    "|-------------|-----------|-----------|------|------------------------|"
+                    "|-------------|--------|-----------|-----------|---------------------|------------------------|"
                 )
 
                 # Sort by P90 queue time descending (longest waits first)
@@ -1190,6 +1272,25 @@ class SGLangFailuresAnalyzer:
                     avg_queue = stats.get("avg_queue_time_seconds", 0)
                     p90_queue = stats.get("p90_queue_time_seconds", 0)
                     total_jobs = stats.get("total_jobs", 0)
+
+                    # Get online runner count for this runner type
+                    # First try exact match, then fall back to substring match
+                    online_count = online_runners.get(runner_key)
+                    if not online_count:
+                        # Fall back to substring match (but prefer longer matches)
+                        best_match = None
+                        best_match_len = 0
+                        for online_key, online_stats in online_runners.items():
+                            if online_key in runner_key or runner_key in online_key:
+                                # Prefer longer matching keys (more specific)
+                                if len(online_key) > best_match_len:
+                                    best_match = online_stats
+                                    best_match_len = len(online_key)
+                        online_count = best_match
+                    if online_count:
+                        online_str = f"{online_count['online']}/{online_count['total']}"
+                    else:
+                        online_str = "N/A"
 
                     # Get unique job names that run on this runner
                     jobs_total = stats.get("jobs_total", {})
@@ -1214,11 +1315,11 @@ class SGLangFailuresAnalyzer:
                     # Highlight if P90 queue time > 10 minutes (potential bottleneck)
                     if p90_queue > 600:
                         summary_lines.append(
-                            f"| <span style='color:orange'>`{display_name}`</span> | <span style='color:orange'>{avg_str}</span> | <span style='color:orange'>{p90_str}</span> | <span style='color:orange'>{total_jobs}</span> | {jobs_str} |"
+                            f"| <span style='color:orange'>`{display_name}`</span> | <span style='color:orange'>{online_str}</span> | <span style='color:orange'>{avg_str}</span> | <span style='color:orange'>{p90_str}</span> | <span style='color:orange'>{total_jobs}</span> | {jobs_str} |"
                         )
                     else:
                         summary_lines.append(
-                            f"| `{display_name}` | {avg_str} | {p90_str} | {total_jobs} | {jobs_str} |"
+                            f"| `{display_name}` | {online_str} | {avg_str} | {p90_str} | {total_jobs} | {jobs_str} |"
                         )
 
                 summary_lines.append("")
@@ -1949,6 +2050,9 @@ def main():
             runner_instance_streak_data,
         ) = analyzer.analyze_runner_health(runner_runs)
 
+        # Fetch online runner status
+        online_runners = analyzer.get_online_runners()
+
         # Analyze test-level failures for broken/high-failure-rate jobs
         # Combine all scheduled data for test failure analysis (main branch, most important)
         all_scheduled_data = {
@@ -1993,6 +2097,7 @@ def main():
             runner_instance_data,
             runner_streak_data,
             runner_instance_streak_data,
+            online_runners,
             # Test failures
             job_test_failures,
             # Config

@@ -40,6 +40,8 @@ class TestDeepseekV32DPMTP(CustomTestCase):
             "4",
             "--mem-frac",
             "0.7",
+            "--model-loader-extra-config",
+            '{"enable_multithread_load": true, "num_threads": 64}',
         ]
         cls.process = popen_launch_server(
             cls.model,
@@ -120,6 +122,8 @@ class TestDeepseekV32TPMTP(CustomTestCase):
             "4",
             "--mem-frac",
             "0.7",
+            "--model-loader-extra-config",
+            '{"enable_multithread_load": true, "num_threads": 64}',
         ]
         cls.process = popen_launch_server(
             cls.model,
