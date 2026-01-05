@@ -93,12 +93,19 @@ class FastDiffuser(DllmAlgorithm):
             x = torch.where(mask_index, x, forward_batch.input_ids)
             confidence = torch.where(mask_index, x0_p, -np.inf)
 
-            # Transfer tokens above threshold
-            transfer_index = (confidence > self.threshold) | (iteration == self.max_steps - 1)
-            if transfer_index.sum().item() == 0:
-                # If no tokens above threshold, take the best one
+            # Transfer tokens based on threshold
+            if self.threshold is None or self.threshold == "None":
+                # When threshold is None, denoise exactly 1 token per step
                 _, select_index = torch.topk(confidence, k=1)
+                transfer_index = torch.zeros_like(confidence, dtype=torch.bool)
                 transfer_index[select_index] = True
+            else:
+                # Original threshold-based logic
+                transfer_index = (confidence > self.threshold) | (iteration == self.max_steps - 1)
+                if transfer_index.sum().item() == 0:
+                    # If no tokens above threshold, take the best one
+                    _, select_index = torch.topk(confidence, k=1)
+                    transfer_index[select_index] = True
 
             # Update input_ids
             forward_batch.input_ids[transfer_index] = x[transfer_index]
