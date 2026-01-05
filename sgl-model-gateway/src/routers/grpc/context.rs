@@ -13,7 +13,8 @@ use super::{
     proto_wrapper::{ProtoEmbedComplete, ProtoRequest, ProtoStream},
 };
 use crate::{
-    core::{Worker, WorkerLoadGuard},
+    core::{attach_guards_to_response, Worker, WorkerLoadGuard},
+    grpc_client::SglangSchedulerClient,
     protocols::{
         chat::{ChatCompletionRequest, ChatCompletionResponse},
         classify::{ClassifyRequest, ClassifyResponse},
@@ -133,6 +134,11 @@ pub(crate) enum WorkerSelection {
         prefill: Arc<dyn Worker>,
         decode: Arc<dyn Worker>,
     },
+    Triple {
+        encode: Arc<dyn Worker>,
+        prefill: Arc<dyn Worker>,
+        decode: Arc<dyn Worker>,
+    },
 }
 
 /// Client selection (Step 3)
@@ -141,6 +147,13 @@ pub(crate) enum ClientSelection {
         client: GrpcClient,
     },
     Dual {
+        prefill: GrpcClient,
+        decode: GrpcClient,
+    },
+    /// EPD mode: encode, prefill, and decode all use gRPC
+    Triple {
+        /// gRPC client for encode worker
+        encode: SglangSchedulerClient,
         prefill: GrpcClient,
         decode: GrpcClient,
     },
@@ -165,6 +178,11 @@ pub(crate) enum LoadGuards {
         _prefill: WorkerLoadGuard,
         _decode: WorkerLoadGuard,
     },
+    Triple {
+        encode: WorkerLoadGuard,
+        prefill: WorkerLoadGuard,
+        decode: WorkerLoadGuard,
+    },
 }
 
 impl LoadGuards {
@@ -177,7 +195,41 @@ impl LoadGuards {
                 _prefill: WorkerLoadGuard::new(prefill.clone(), headers),
                 _decode: WorkerLoadGuard::new(decode.clone(), headers),
             },
+            WorkerSelection::Triple {
+                encode,
+                prefill,
+                decode,
+            } => LoadGuards::Triple {
+                encode: WorkerLoadGuard::new(encode.clone()),
+                prefill: WorkerLoadGuard::new(prefill.clone()),
+                decode: WorkerLoadGuard::new(decode.clone()),
+            },
         }
+    }
+}
+
+impl LoadGuards {
+    /// Attach these load guards to a Response, tying their lifetime to the response body.
+    ///
+    /// When the response body is fully consumed or dropped (e.g., client disconnects),
+    /// the guards are dropped and worker load is decremented automatically.
+    ///
+    /// This is the proper RAII pattern for SSE/streaming responses.
+    pub fn attach_to_response(
+        self,
+        response: axum::response::Response,
+    ) -> axum::response::Response {
+        let guards = match self {
+            LoadGuards::Single { _guard } => vec![_guard],
+            LoadGuards::Dual { _prefill, _decode } => vec![_prefill, _decode],
+            LoadGuards::Triple {
+                encode,
+                prefill,
+                decode,
+            } => vec![encode, prefill, decode],
+        };
+
+        attach_guards_to_response(guards, response)
     }
 }
 
@@ -355,6 +407,10 @@ impl WorkerSelection {
         matches!(self, Self::Dual { .. })
     }
 
+    pub fn is_triple(&self) -> bool {
+        matches!(self, Self::Triple { .. })
+    }
+
     pub fn single(&self) -> Option<&Arc<dyn Worker>> {
         match self {
             Self::Single { worker } => Some(worker),
@@ -370,12 +426,40 @@ impl WorkerSelection {
                 prefill.record_outcome(success);
                 decode.record_outcome(success);
             }
+            Self::Triple {
+                encode,
+                prefill,
+                decode,
+            } => {
+                encode.record_outcome(success);
+                prefill.record_outcome(success);
+                decode.record_outcome(success);
+            }
         }
     }
 
     /// Record circuit breaker outcomes for dual dispatch (individual tracking)
     pub fn record_dual_outcomes(&self, prefill_success: bool, decode_success: bool) {
         if let Self::Dual { prefill, decode } = self {
+            prefill.record_outcome(prefill_success);
+            decode.record_outcome(decode_success);
+        }
+    }
+
+    /// Record circuit breaker outcomes for triple dispatch (individual tracking)
+    pub fn record_triple_outcomes(
+        &self,
+        encode_success: bool,
+        prefill_success: bool,
+        decode_success: bool,
+    ) {
+        if let Self::Triple {
+            encode,
+            prefill,
+            decode,
+        } = self
+        {
+            encode.record_outcome(encode_success);
             prefill.record_outcome(prefill_success);
             decode.record_outcome(decode_success);
         }
@@ -389,16 +473,35 @@ impl WorkerSelection {
         }
     }
 
+    #[allow(clippy::type_complexity)]
+    pub fn triple(&self) -> Option<(&Arc<dyn Worker>, &Arc<dyn Worker>, &Arc<dyn Worker>)> {
+        match self {
+            Self::Triple {
+                encode,
+                prefill,
+                decode,
+            } => Some((encode, prefill, decode)),
+            _ => None,
+        }
+    }
+
     pub fn prefill_worker(&self) -> Option<&Arc<dyn Worker>> {
         match self {
-            Self::Dual { prefill, .. } => Some(prefill),
+            Self::Dual { prefill, .. } | Self::Triple { prefill, .. } => Some(prefill),
+            _ => None,
+        }
+    }
+
+    pub fn encode_worker(&self) -> Option<&Arc<dyn Worker>> {
+        match self {
+            Self::Triple { encode, .. } => Some(encode),
             _ => None,
         }
     }
 
     pub fn decode_worker(&self) -> Option<&Arc<dyn Worker>> {
         match self {
-            Self::Dual { decode, .. } => Some(decode),
+            Self::Dual { decode, .. } | Self::Triple { decode, .. } => Some(decode),
             _ => None,
         }
     }
@@ -407,6 +510,14 @@ impl WorkerSelection {
 /// Some methods are kept for API completeness even if currently unused.
 #[allow(dead_code)]
 impl ClientSelection {
+    pub fn is_dual(&self) -> bool {
+        matches!(self, Self::Dual { .. })
+    }
+
+    pub fn is_triple(&self) -> bool {
+        matches!(self, Self::Triple { .. })
+    }
+
     pub fn single(&self) -> Option<&GrpcClient> {
         match self {
             Self::Single { client } => Some(client),
@@ -428,30 +539,38 @@ impl ClientSelection {
         }
     }
 
-    pub fn prefill_client(&self) -> Option<&GrpcClient> {
+    pub fn triple(&self) -> Option<(&SglangSchedulerClient, &GrpcClient, &GrpcClient)> {
         match self {
-            Self::Dual { prefill, .. } => Some(prefill),
+            Self::Triple {
+                encode,
+                prefill,
+                decode,
+            } => Some((encode, prefill, decode)),
             _ => None,
         }
     }
 
-    pub fn prefill_client_mut(&mut self) -> Option<&mut GrpcClient> {
+    pub fn triple_mut(&mut self) -> Option<(&SglangSchedulerClient, &mut GrpcClient, &mut GrpcClient)> {
         match self {
-            Self::Dual { prefill, .. } => Some(prefill),
+            Self::Triple {
+                encode,
+                prefill,
+                decode,
+            } => Some((encode, prefill, decode)),
             _ => None,
         }
     }
 
     pub fn decode_client(&self) -> Option<&GrpcClient> {
         match self {
-            Self::Dual { decode, .. } => Some(decode),
+            Self::Dual { decode, .. } | Self::Triple { decode, .. } => Some(decode),
             _ => None,
         }
     }
 
     pub fn decode_client_mut(&mut self) -> Option<&mut GrpcClient> {
         match self {
-            Self::Dual { decode, .. } => Some(decode),
+            Self::Dual { decode, .. } | Self::Triple { decode, .. } => Some(decode),
             _ => None,
         }
     }
@@ -459,6 +578,9 @@ impl ClientSelection {
 
 /// Result of request execution (streams from workers)
 /// Uses ProtoStream to automatically abort on cancellation
+///
+/// Note: EPD mode uses Dual (prefill + decode) since encode happens
+/// synchronously via gRPC before the prefill/decode streams are created.
 pub(crate) enum ExecutionResult {
     Single {
         stream: ProtoStream,
