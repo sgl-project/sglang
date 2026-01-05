@@ -1,5 +1,4 @@
 import random
-import string
 import unittest
 from contextlib import contextmanager
 
@@ -34,14 +33,14 @@ class TestPatchTokenizerEndToEndTest(unittest.TestCase):
             "\n\nMultiple\n\nNewlines\n\n",
             *[f"Text with {tok} inside" for tok in special_tokens],
             " ".join(special_tokens),
-            *[cls._random_text(length=100) for _ in range(5)],
-            *[cls._random_text(length=1000) for _ in range(3)],
+            *[cls._random_text_from_tokens(tokenizer, num_tokens=100) for _ in range(5)],
+            *[cls._random_text_from_tokens(tokenizer, num_tokens=1000) for _ in range(3)],
         ]
 
     @classmethod
-    def _random_text(cls, length):
-        chars = string.ascii_letters + string.digits
-        return "".join(random.choice(chars) for _ in range(length))
+    def _random_text_from_tokens(cls, tokenizer, num_tokens):
+        token_ids = [random.randint(0, tokenizer.vocab_size - 1) for _ in range(num_tokens)]
+        return tokenizer.decode(token_ids)
 
     @classmethod
     def _run_tokenizer_ops(cls, tokenizer, texts):
