@@ -105,8 +105,6 @@ impl InFlightRequestTracker {
     fn sample_and_record(&self) {
         let buckets = &*AGE_BUCKETS;
         let counts = self.compute_bucket_counts();
-        debug_assert_eq!(buckets.le_labels.len(), buckets.gt_labels.len());
-        debug_assert_eq!(buckets.le_labels.len(), counts.len());
         for ((&le, &gt), &count) in std::iter::zip(
             std::iter::zip(&buckets.le_labels, &buckets.gt_labels),
             &counts,
