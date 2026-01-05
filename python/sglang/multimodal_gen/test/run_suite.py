@@ -481,11 +481,19 @@ def main():
             standalone_files, target_dir, standalone_idx
         )
 
+        if standalone_idx >= len(standalone_files):
+            print(
+                f"ERROR: Standalone partition index {standalone_idx} exceeds available "
+                f"standalone files ({len(standalone_files)}) for suite '{args.suite}'."
+            )
+            sys.exit(1)
+
         if not standalone_file:
             print(
-                f"No standalone file at index {standalone_idx} for suite '{args.suite}'."
+                f"ERROR: Standalone test file '{standalone_files[standalone_idx]}' "
+                f"not found on disk for suite '{args.suite}'."
             )
-            sys.exit(0)
+            sys.exit(1)
 
         print(f"Running standalone test file: {os.path.basename(standalone_file)}")
         print()
