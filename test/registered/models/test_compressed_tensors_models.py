@@ -1,3 +1,9 @@
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+
+# Model tests for compressed tensors (FP8)
+register_cuda_ci(est_time=42, suite="stage-b-test-small-1-gpu")
+register_amd_ci(est_time=42, suite="stage-b-test-small-1-gpu")
+
 import unittest
 from types import SimpleNamespace
 
@@ -11,19 +17,16 @@ from sglang.test.test_utils import (
 )
 
 
-class TestGLM4MoE(CustomTestCase):
+class TestCompressedTensorsLlama3FP8(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = "zai-org/GLM-4.5-Air-FP8"
+        cls.model = "RedHatAI/Meta-Llama-3.1-8B-FP8"
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=[
-                "--tp-size",
-                "2",
-            ],
+            other_args=[],
         )
 
     @classmethod
@@ -34,7 +37,7 @@ class TestGLM4MoE(CustomTestCase):
         args = SimpleNamespace(
             num_shots=5,
             data_path=None,
-            num_questions=100,
+            num_questions=200,
             max_new_tokens=512,
             parallel=128,
             host="http://127.0.0.1",
@@ -42,7 +45,7 @@ class TestGLM4MoE(CustomTestCase):
         )
         metrics = run_eval(args)
         print(f"{metrics=}")
-        self.assertGreater(metrics["accuracy"], 0.8)
+        self.assertGreaterEqual(metrics["accuracy"], 0.45)
 
 
 if __name__ == "__main__":
