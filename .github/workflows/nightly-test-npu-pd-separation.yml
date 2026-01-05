@@ -10,7 +10,7 @@ on:
       runner:
         required: false
         type: string
-        default: linux-amd64-cpu-0
+        default: linux-aarch64-910a3-0
       image:
         required: false
         type: string

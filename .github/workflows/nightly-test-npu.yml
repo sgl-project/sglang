@@ -6,6 +6,7 @@ on:
   pull_request:
     branches:
       - main
+      - ifmn/eagle-dp-attn
     paths:
       - ".github/workflows/nightly-test-npu.yml"
   workflow_dispatch:
@@ -29,7 +30,7 @@ concurrency:
 jobs:
   nightly-1-npu-a3:
     if: ${{ (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') }}
-    runs-on: linux-aarch64-910c-2
+    runs-on: linux-aarch64-910a3-2
     strategy:
       fail-fast: false
       matrix:
@@ -75,7 +76,7 @@ jobs:
 
   nightly-2-npu-a3:
     if: ${{ (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') }}
-    runs-on: linux-aarch64-910c-2
+    runs-on: linux-aarch64-910a3-2
     strategy:
       fail-fast: false
       matrix:
@@ -121,7 +122,7 @@ jobs:
 
   nightly-4-npu-a3:
     if: ${{ (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') }}
-    runs-on: linux-aarch64-910c-4
+    runs-on: linux-aarch64-910a3-4
     strategy:
       fail-fast: false
       matrix:
@@ -197,7 +198,7 @@ jobs:
     uses: ./.github/workflows/nightly-test-npu-pd-separation.yml
     with:
       soc_version: a3
-      runner: linux-aarch64-910c-0
+      runner: linux-aarch64-910a3-0
       image: 'swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann8.3.rc2-a3-release20260104'
       test_config_name: ${{ matrix.test_config.name }}
       prefill_size: ${{ matrix.test_config.prefill_size }}
@@ -220,7 +221,7 @@ jobs:
     uses: ./.github/workflows/nightly-test-npu-multi-node.yml
     with:
       soc_version: a3
-      runner: linux-aarch64-910c-0
+      runner: linux-aarch64-910a3-0
       image: 'swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann8.3.rc2-a3-release20260104'
       test_config_name: ${{ matrix.test_config.name }}
       node_size: ${{ matrix.test_config.node_size }}
@@ -236,32 +237,24 @@ jobs:
       matrix:
         test_config:
           - name: test_ascend_qwen3_480b_w8a8_8p_in3k5_out1k5_50ms
-            os: linux-aarch64-910c-16
             test_case: test/registered/ascend/performance/test_ascend_qwen3_480b_w8a8_8p_in3k5_out1k5_50ms.py
           - name: test_ascend_qwen3_30b_a3b_1p_in3k5_out1k5_50ms
-            os: linux-aarch64-910c-16
             test_case: test/registered/ascend/performance/test_ascend_qwen3_30b_w8a8_1p_in3k5_out1k5_50ms.py
           - name: test_ascend_deepseek_r1_w4a8_8p_in2k_out2k_50ms
-            os: linux-aarch64-910c-16
             test_case: test/registered/ascend/performance/test_ascend_deepseek_r1_w4a8_8p_in2k_out2k_50ms.py
           - name: test_ascend_deepseek_r1_w4a8_8p_in3k5_out1k5_50ms
-            os: linux-aarch64-910c-16
             test_case: test/registered/ascend/performance/test_ascend_deepseek_r1_w4a8_8p_in3k5_out1k5_50ms.py
           - name: test_ascend_qwen3_32b_4p_in4k_out1k5_11ms
-            os: linux-aarch64-910c-16
             test_case: test/registered/ascend/performance/test_ascend_qwen3_32b_bf16_4p_in4k_out1k5_11ms.py
           - name: test_ascend_qwen3_32b_8p_in18k_out4k_7ms
-            os: linux-aarch64-910c-16
             test_case: test/registered/ascend/performance/test_ascend_qwen3_32b_bf16_8p_in18k_out4k_7ms.py
           - name: test_ascend_qwen3_32b_2p_in3k5_out1k5_50ms
-            os: linux-aarch64-910c-16
             test_case: test/registered/ascend/performance/test_ascend_qwen3_32b_w8a8_2p_in3k5_out1k5_50ms.py
           - name: test_ascend_qwen3_32b_2p_in2k_out2k_50ms
-            os: linux-aarch64-910c-16
             test_case: test/registered/ascend/performance/test_ascend_qwen3_32b_w8a8_2p_in2k_out2k_50ms.py
     uses: ./.github/workflows/nightly-test-npu-single-node.yml
     with:
-      runner:  ${{ matrix.test_config.os }}
+      runner:  linux-aarch64-910a3-16
       image: 'swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann8.3.rc2-a3-release20260104'
       test_config_name: ${{ matrix.test_config.name }}
       test_case: ${{ matrix.test_config.test_case }}
