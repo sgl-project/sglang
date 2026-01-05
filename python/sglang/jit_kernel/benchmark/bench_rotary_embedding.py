@@ -23,11 +23,21 @@ DEVICE = "cuda"
 DTYPE = torch.bfloat16
 MAX_SEQ_LEN = 8192
 NUM_HEADS = 32
-BS_RANGE = [1, 64]
-if not os.getenv("CI"):
+
+IS_CI = (
+    os.getenv("CI", "false").lower() == "true"
+    or os.getenv("GITHUB_ACTIONS", "false").lower() == "true"
+)
+
+if IS_CI:
+    BS_RANGE = [1]
+    SEQ_RANGE = [1]
+    HEAD_SIZE_RANGE = [128]
+else:
     BS_RANGE = [1, 2, 4, 8, 16, 32, 64, 128]
-SEQ_RANGE = [1, 2048]
-HEAD_SIZE_RANGE = [128]
+    SEQ_RANGE = [1, 16, 64, 256, 1024, 2048]
+    HEAD_SIZE_RANGE = [64, 128, 256]
+
 INTERLEAVED_RANGE = [True, False]
 
 ONLY_PROVIDER = os.getenv("SGL_BENCH_PROVIDER", "").strip() or None
