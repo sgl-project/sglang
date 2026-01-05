@@ -19,7 +19,7 @@ use crate::{
 ///
 /// This struct enables cancelling both the Rust task AND the Python scheduler processing.
 /// The client field is lazily initialized during pipeline execution.
-pub struct BackgroundTaskInfo {
+pub(crate) struct BackgroundTaskInfo {
     /// Tokio task handle for aborting the Rust task
     pub handle: JoinHandle<()>,
     /// gRPC request_id sent to Python scheduler (chatcmpl-* prefix)
@@ -32,7 +32,7 @@ pub struct BackgroundTaskInfo {
 ///
 /// All fields are Arc/shared references, so cloning this context is cheap.
 #[derive(Clone)]
-pub struct ResponsesContext {
+pub(crate) struct ResponsesContext {
     /// Chat pipeline for executing requests
     pub pipeline: Arc<RequestPipeline>,
 
@@ -40,6 +40,7 @@ pub struct ResponsesContext {
     pub components: Arc<SharedComponents>,
 
     /// Worker registry for validation
+    #[allow(dead_code)]
     pub worker_registry: Arc<WorkerRegistry>,
 
     /// Response storage backend

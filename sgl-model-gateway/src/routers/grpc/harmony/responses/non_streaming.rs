@@ -46,7 +46,7 @@ use crate::{
 ///    - Build next request with tool results
 ///    - Repeat from step 1 (full pipeline re-execution)
 /// 4. If no tool calls, return final response
-pub async fn serve_harmony_responses(
+pub(crate) async fn serve_harmony_responses(
     ctx: &HarmonyResponsesContext,
     request: ResponsesRequest,
 ) -> Result<ResponsesResponse, Response> {

@@ -19,5 +19,5 @@ mod non_streaming;
 mod streaming;
 
 // Public exports
-pub use context::{BackgroundTaskInfo, ResponsesContext};
-pub use handlers::route_responses;
+pub(crate) use context::ResponsesContext;
+pub(crate) use handlers::route_responses;

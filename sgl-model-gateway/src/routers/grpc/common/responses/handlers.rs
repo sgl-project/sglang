@@ -18,7 +18,7 @@ use crate::{
 ///
 /// Retrieves a stored response from the database.
 /// Used by both regular and harmony implementations.
-pub async fn get_response_impl(ctx: &ResponsesContext, response_id: &str) -> Response {
+pub(crate) async fn get_response_impl(ctx: &ResponsesContext, response_id: &str) -> Response {
     let resp_id = ResponseId::from(response_id);
 
     // Retrieve response from storage
@@ -38,7 +38,7 @@ pub async fn get_response_impl(ctx: &ResponsesContext, response_id: &str) -> Res
 /// Implementation for POST /v1/responses/{response_id}/cancel
 ///
 /// Cancels a background response if it's still in progress.
-pub async fn cancel_response_impl(ctx: &ResponsesContext, response_id: &str) -> Response {
+pub(crate) async fn cancel_response_impl(ctx: &ResponsesContext, response_id: &str) -> Response {
     let resp_id = ResponseId::from(response_id);
 
     // Retrieve response from storage to check if it exists and get current status
