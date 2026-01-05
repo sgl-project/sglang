@@ -60,11 +60,9 @@ impl InFlightRequestTracker {
         let now = Instant::now();
         let inf_idx = AGE_BUCKET_LABELS.len() - 1;
 
-        let instants: Vec<Instant> = self.requests.iter().map(|entry| *entry.value()).collect();
-
         let mut non_cumulative_counts = [0usize; AGE_BUCKET_LABELS.len()];
-        for inst in instants {
-            let age_secs = now.duration_since(inst).as_secs();
+        for entry in self.requests.iter() {
+            let age_secs = now.duration_since(*entry.value()).as_secs();
             let bucket_idx = AGE_BUCKET_BOUNDS
                 .iter()
                 .position(|&bound| age_secs <= bound)
