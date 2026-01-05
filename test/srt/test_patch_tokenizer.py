@@ -9,25 +9,6 @@ from sglang.srt.utils.patch_tokenizer import (
 )
 
 
-def _get_class_attr_ids(cls):
-    return {n: id(v.fget if isinstance(v, property) else v) for n, v in vars(cls).items()}
-
-
-def _load_tokenizer():
-    # The slowness is mainly observed in Kimi
-    return AutoTokenizer.from_pretrained("nvidia/Kimi-K2-Thinking-NVFP4", trust_remote_code=True)
-
-
-@contextmanager
-def _patched_tokenizer():
-    tokenizer = _load_tokenizer()
-    _SpecialTokensCachePatcher.patch(tokenizer)
-    try:
-        yield tokenizer
-    finally:
-        unpatch_tokenizer(tokenizer)
-
-
 class TestPatchTokenizer(unittest.TestCase):
     def test_patch_unpatch_restores_original(self):
         tokenizer = _load_tokenizer()
@@ -104,6 +85,25 @@ class TestPatchTokenizer(unittest.TestCase):
             getattr(type(tokenizer), "_sglang_special_tokens_patched", False)
         )
 
+        unpatch_tokenizer(tokenizer)
+
+
+def _get_class_attr_ids(cls):
+    return {n: id(v.fget if isinstance(v, property) else v) for n, v in vars(cls).items()}
+
+
+def _load_tokenizer():
+    # The slowness is mainly observed in Kimi
+    return AutoTokenizer.from_pretrained("nvidia/Kimi-K2-Thinking-NVFP4", trust_remote_code=True)
+
+
+@contextmanager
+def _patched_tokenizer():
+    tokenizer = _load_tokenizer()
+    _SpecialTokensCachePatcher.patch(tokenizer)
+    try:
+        yield tokenizer
+    finally:
         unpatch_tokenizer(tokenizer)
 
 
