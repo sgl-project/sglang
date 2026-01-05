@@ -31,6 +31,7 @@ static STRING_INTERNER: Lazy<DashMap<String, Arc<str>>> = Lazy::new(DashMap::new
 ///
 /// This function is designed for high-throughput scenarios where the same
 /// strings (model IDs, worker URLs) appear repeatedly. The first call allocates,
+/// subsequent calls just clone the Arc (very cheap - just a ref count increment).
 pub fn intern_string(s: &str) -> Arc<str> {
     // Fast path: check if already interned
     if let Some(entry) = STRING_INTERNER.get(s) {
@@ -152,6 +153,10 @@ pub fn init_metrics() {
     describe_histogram!(
         "smg_http_request_duration_seconds",
         "HTTP request duration by method and path"
+    );
+    describe_gauge!(
+        "smg_http_inflight_request_age_count",
+        "Count of currently in-flight HTTP requests by age"
     );
     describe_counter!(
         "smg_http_responses_total",
@@ -491,7 +496,17 @@ impl Metrics {
         .record(duration.as_secs_f64());
     }
 
-    /// Set active HTTP connections count.
+    /// Set the cumulative count of in-flight requests for a given age bucket.
+    /// Uses `le` label to match Prometheus histogram convention.
+    pub fn set_inflight_request_age_count(le: &'static str, count: usize) {
+        gauge!(
+            "smg_http_inflight_request_age_count",
+            "le" => le
+        )
+        .set(count as f64);
+    }
+
+    /// Set active HTTP connections count
     pub fn set_http_connections_active(count: usize) {
         gauge!("smg_http_connections_active").set(count as f64);
     }

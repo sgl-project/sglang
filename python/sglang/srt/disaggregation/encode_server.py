@@ -31,7 +31,7 @@ from sglang.srt.distributed.parallel_state import (
 from sglang.srt.layers.dp_attention import initialize_dp_attention
 from sglang.srt.managers.io_struct import ProfileReq, ProfileReqInput, ProfileReqType
 from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
-from sglang.srt.mem_cache.multimodal_cache import MultiModalStaticCache
+from sglang.srt.mem_cache.multimodal_cache import EmbeddingResult, MultiModalStaticCache
 from sglang.srt.model_loader import get_model
 from sglang.srt.server_args import (
     PortArgs,
@@ -53,6 +53,9 @@ rid_lock = asyncio.Lock()
 rid_to_receive_endpoint: Dict[str, List[str]] = dict()
 rid_to_receive_count: Dict[str, int] = dict()
 
+use_image_processor_gpu = (
+    int(os.getenv("SGLANG_ENCODER_IMAGE_PROCESSOR_USE_GPU", "0")) == 1
+)
 
 class TensorWrapper:
     """Wrapper to keep tensor alive while exposing buffer for zero-copy."""
@@ -144,6 +147,8 @@ class MMEncoder:
         )
 
         torch.get_device_module(self.device).set_device(self.gpu_id)
+
+        self.use_image_processor_gpu = use_image_processor_gpu
 
         init_distributed_environment(
             world_size=server_args.tp_size,
@@ -287,7 +292,8 @@ class MMEncoder:
     async def _encode(self, mm_items) -> torch.Tensor:
         images = await self._flatten_and_load_images(mm_items)
 
-        images_input = self.image_processor(images=images)
+        kwargs = {"device": self.device} if self.use_image_processor_gpu else {}
+        images_input = self.image_processor(images=images, **kwargs)
         feature = images_input["pixel_values"]
         mm_item = MultimodalDataItem.from_dict(
             {
@@ -311,7 +317,7 @@ class MMEncoder:
             async with self.mm_cache_lock:
                 mm_cache = self.mm_cache.get([mm_item.hash])
                 if mm_cache is not None:
-                    mm_embedding = mm_cache
+                    mm_embedding = mm_cache.embedding
 
         if mm_embedding is None:
             with torch.inference_mode():
@@ -322,7 +328,7 @@ class MMEncoder:
 
         if self.server_args.enable_prefix_mm_cache:
             async with self.mm_cache_lock:
-                self.mm_cache.set(mm_hash, mm_embedding)
+                self.mm_cache.set(mm_hash, EmbeddingResult(embedding=mm_embedding))
         end_time = time.perf_counter()
         logger.info(
             f"Vit time : {(end_time - start_time)*1000:.2f} ms {mm_embedding.shape = }"
