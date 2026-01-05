@@ -11,7 +11,21 @@ from .gpu_allocator import (
     wait_for_gpu_memory_to_clear,
 )
 from .model_pool import ModelInstance, ModelPool
-from .model_specs import MODEL_SPECS
+from .model_specs import (  # Default model paths; Model groups
+    CHAT_MODELS,
+    DEFAULT_EMBEDDING_MODEL_PATH,
+    DEFAULT_ENABLE_THINKING_MODEL_PATH,
+    DEFAULT_GPT_OSS_MODEL_PATH,
+    DEFAULT_MISTRAL_FUNCTION_CALLING_MODEL_PATH,
+    DEFAULT_MODEL_PATH,
+    DEFAULT_QWEN_FUNCTION_CALLING_MODEL_PATH,
+    DEFAULT_REASONING_MODEL_PATH,
+    DEFAULT_SMALL_MODEL_PATH,
+    EMBEDDING_MODELS,
+    FUNCTION_CALLING_MODELS,
+    MODEL_SPECS,
+    REASONING_MODELS,
+)
 
 __all__ = [
     # GPU allocation
@@ -28,4 +42,18 @@ __all__ = [
     "ModelInstance",
     "ModelPool",
     "MODEL_SPECS",
+    # Default model paths
+    "DEFAULT_MODEL_PATH",
+    "DEFAULT_SMALL_MODEL_PATH",
+    "DEFAULT_REASONING_MODEL_PATH",
+    "DEFAULT_ENABLE_THINKING_MODEL_PATH",
+    "DEFAULT_QWEN_FUNCTION_CALLING_MODEL_PATH",
+    "DEFAULT_MISTRAL_FUNCTION_CALLING_MODEL_PATH",
+    "DEFAULT_GPT_OSS_MODEL_PATH",
+    "DEFAULT_EMBEDDING_MODEL_PATH",
+    # Model groups
+    "CHAT_MODELS",
+    "EMBEDDING_MODELS",
+    "REASONING_MODELS",
+    "FUNCTION_CALLING_MODELS",
 ]

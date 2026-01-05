@@ -47,6 +47,10 @@ def pytest_configure(config: pytest.Config) -> None:
     )
     config.addinivalue_line(
         "markers",
+        "backend(name): mark test to use a specific backend (grpc, openai, etc.)",
+    )
+    config.addinivalue_line(
+        "markers",
         "e2e: mark test as an end-to-end test requiring GPU workers",
     )
     config.addinivalue_line(
@@ -189,3 +193,97 @@ def model_base_url(request: pytest.FixtureRequest, model_pool: "ModelPool") -> s
         return model_pool.get_base_url(model_id)
     except KeyError:
         pytest.skip(f"Model {model_id} not available in model pool")
+
+
+# ---------------------------------------------------------------------------
+# Backend fixtures (class-scoped)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="class")
+def setup_backend(request: pytest.FixtureRequest):
+    """Class-scoped fixture for launching backend clusters.
+
+    This fixture is used with pytest.mark.parametrize to run tests
+    against multiple backends.
+
+    Usage:
+        @pytest.mark.parametrize("setup_backend", ["grpc", "openai"], indirect=True)
+        class TestChatCompletions:
+            def test_basic(self, setup_backend):
+                backend, model, client = setup_backend
+                response = client.chat.completions.create(...)
+
+    Environment variables:
+        - SKIP_BACKEND_SETUP: Skip backend startup (for dry runs)
+        - SHOW_ROUTER_LOGS: Show subprocess output
+    """
+    import openai
+    from backends import BACKENDS, ClusterInfo, launch_backend
+
+    backend_name = request.param
+
+    # Skip if requested
+    if os.environ.get("SKIP_BACKEND_SETUP", "").lower() in ("1", "true", "yes"):
+        pytest.skip("SKIP_BACKEND_SETUP is set")
+
+    # Check if backend requires API key
+    cfg = BACKENDS.get(backend_name)
+    if cfg is None:
+        pytest.fail(f"Unknown backend: {backend_name}")
+
+    api_key_env = cfg.get("api_key_env")
+    if api_key_env and not os.environ.get(api_key_env):
+        pytest.skip(f"{api_key_env} not set, skipping {backend_name} tests")
+
+    logger.info("Setting up backend: %s", backend_name)
+
+    # Launch the backend
+    cluster: ClusterInfo = launch_backend(backend_name)
+
+    # Create OpenAI client
+    api_key = os.environ.get(api_key_env) if api_key_env else "not-used"
+    client = openai.OpenAI(
+        base_url=f"{cluster.base_url}/v1",
+        api_key=api_key,
+    )
+
+    # Yield to test
+    try:
+        yield backend_name, cfg["model"], client
+    finally:
+        logger.info("Tearing down backend: %s", backend_name)
+        cluster.shutdown()
+
+
+@pytest.fixture
+def backend_cluster(request: pytest.FixtureRequest):
+    """Function-scoped fixture for launching a fresh backend per test.
+
+    Unlike setup_backend (class-scoped), this creates a new cluster
+    for each test function. Use for tests that modify cluster state.
+
+    Usage:
+        @pytest.mark.parametrize("backend_cluster", ["grpc"], indirect=True)
+        def test_add_worker(backend_cluster):
+            cluster = backend_cluster
+            # cluster.base_url, cluster.router_process, etc.
+    """
+    from backends import BACKENDS, launch_backend
+
+    backend_name = request.param
+
+    cfg = BACKENDS.get(backend_name)
+    if cfg is None:
+        pytest.fail(f"Unknown backend: {backend_name}")
+
+    api_key_env = cfg.get("api_key_env")
+    if api_key_env and not os.environ.get(api_key_env):
+        pytest.skip(f"{api_key_env} not set")
+
+    cluster = launch_backend(backend_name)
+
+    try:
+        yield cluster
+    finally:
+        cluster.shutdown()
