@@ -482,7 +482,11 @@ class Scheduler(
             nccl_port=self.nccl_port,
         )
 
-    def init_draft_worker(self):
+    def maybe_init_draft_worker(self):
+        if self.spec_algorithm.is_none():
+            self.draft_worker = None
+            return
+
         # Launch a draft worker for speculative decoding
         draft_worker_kwargs = dict(
             server_args=self.server_args,
@@ -507,8 +511,7 @@ class Scheduler(
 
     def init_model_worker(self):
         self.init_tp_model_worker()
-        if not self.spec_algorithm.is_none():
-            self.init_draft_worker()
+        self.maybe_init_draft_worker()
 
         # Dispatch the model worker
         if self.spec_algorithm.is_none():
