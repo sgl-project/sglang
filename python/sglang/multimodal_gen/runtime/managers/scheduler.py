@@ -9,6 +9,7 @@ from typing import Any, List
 import zmq
 
 from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
+    ListLorasReq,
     MergeLoraWeightsReq,
     SetLoraReq,
     UnmergeLoraWeightsReq,
@@ -78,6 +79,7 @@ class Scheduler:
             UnmergeLoraWeightsReq: self._handle_unmerge_lora,
             Req: self._handle_generation,
             List[Req]: self._handle_generation,
+            ListLorasReq: self._handle_list_loras,
         }
 
         # FIFO, new reqs are appended
@@ -100,6 +102,9 @@ class Scheduler:
     def _handle_unmerge_lora(self, reqs: List[Any]) -> OutputBatch:
         req = reqs[0]
         return self.worker.unmerge_lora_weights(req.target)
+
+    def _handle_list_loras(self, _reqs: List[Any]) -> OutputBatch:
+        return self.worker.list_loras()
 
     def _handle_generation(self, reqs: List[Req]):
         return self.worker.execute_forward(reqs)

@@ -41,6 +41,12 @@ class UnmergeLoraWeightsReq:
     target: str = "all"  # "all", "transformer", "transformer_2", "critic"
 
 
+@dataclasses.dataclass
+class ListLorasReq:
+    # Empty payload; used only as a type marker for listing LoRA status
+    pass
+
+
 def _parse_size(size: str) -> tuple[int, int] | tuple[None, None]:
     try:
         parts = size.lower().replace(" ", "").split("x")
