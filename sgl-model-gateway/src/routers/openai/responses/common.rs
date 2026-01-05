@@ -12,13 +12,13 @@ use serde_json::Value;
 
 /// Extract output_index from a JSON value
 #[inline]
-pub fn extract_output_index(value: &Value) -> Option<usize> {
+pub(super) fn extract_output_index(value: &Value) -> Option<usize> {
     value.get("output_index")?.as_u64().map(|v| v as usize)
 }
 
 /// Get event type from event name or parsed JSON, returning a reference to avoid allocation
 #[inline]
-pub fn get_event_type<'a>(event_name: Option<&'a str>, parsed: &'a Value) -> &'a str {
+pub(super) fn get_event_type<'a>(event_name: Option<&'a str>, parsed: &'a Value) -> &'a str {
     event_name
         .or_else(|| parsed.get("type").and_then(|v| v.as_str()))
         .unwrap_or("")
@@ -30,7 +30,7 @@ pub fn get_event_type<'a>(event_name: Option<&'a str>, parsed: &'a Value) -> &'a
 
 /// Processes incoming byte chunks into complete SSE blocks.
 /// Handles buffering of partial chunks and CRLF normalization.
-pub struct ChunkProcessor {
+pub(super) struct ChunkProcessor {
     pending: String,
 }
 
@@ -91,7 +91,7 @@ impl ChunkProcessor {
 ///
 /// Returns borrowed strings when possible to avoid allocations in hot paths.
 /// Only allocates when multiple data lines need to be joined.
-pub fn parse_sse_block(block: &str) -> (Option<&str>, Cow<'_, str>) {
+pub(super) fn parse_sse_block(block: &str) -> (Option<&str>, Cow<'_, str>) {
     let mut event_name: Option<&str> = None;
     let mut data_lines: Vec<&str> = Vec::new();
 

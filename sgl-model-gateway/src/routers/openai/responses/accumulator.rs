@@ -12,7 +12,7 @@ use crate::protocols::event_types::{OutputItemEvent, ResponseEvent};
 
 /// Helper that parses SSE frames from the OpenAI responses stream and
 /// accumulates enough information to persist the final response locally.
-pub struct StreamingResponseAccumulator {
+pub(super) struct StreamingResponseAccumulator {
     /// The initial `response.created` payload (if emitted).
     initial_response: Option<Value>,
     /// The final `response.completed` payload (if emitted).

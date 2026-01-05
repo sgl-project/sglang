@@ -33,7 +33,7 @@ use crate::{
 // ============================================================================
 
 /// State for tracking multi-turn tool calling loop
-pub struct ToolLoopState {
+pub(super) struct ToolLoopState {
     /// Current iteration number (starts at 0, increments with each tool call)
     pub iteration: usize,
     /// Total number of tool calls executed
@@ -83,7 +83,7 @@ impl ToolLoopState {
 
 /// Represents a function call being accumulated across delta events
 #[derive(Debug, Clone)]
-pub struct FunctionCallInProgress {
+pub(super) struct FunctionCallInProgress {
     pub call_id: String,
     pub name: String,
     pub arguments_buffer: String,
@@ -120,7 +120,7 @@ impl FunctionCallInProgress {
 
 /// Execute detected tool calls and send completion events to client
 /// Returns false if client disconnected during execution
-pub async fn execute_streaming_tool_calls(
+pub(super) async fn execute_streaming_tool_calls(
     pending_calls: Vec<FunctionCallInProgress>,
     active_mcp: &Arc<mcp::McpManager>,
     tx: &mpsc::UnboundedSender<Result<Bytes, io::Error>>,
@@ -199,7 +199,10 @@ pub async fn execute_streaming_tool_calls(
 // ============================================================================
 
 /// Transform payload to replace MCP tools with function tools for streaming
-pub fn prepare_mcp_payload_for_streaming(payload: &mut Value, active_mcp: &Arc<mcp::McpManager>) {
+pub(super) fn prepare_mcp_payload_for_streaming(
+    payload: &mut Value,
+    active_mcp: &Arc<mcp::McpManager>,
+) {
     if let Some(obj) = payload.as_object_mut() {
         // Remove any non-function tools from outgoing payload
         if let Some(v) = obj.get_mut("tools") {
@@ -234,7 +237,7 @@ pub fn prepare_mcp_payload_for_streaming(payload: &mut Value, active_mcp: &Arc<m
 }
 
 /// Build a resume payload with conversation history
-pub fn build_resume_payload(
+pub(super) fn build_resume_payload(
     base_payload: &Value,
     conversation_history: &[Value],
     original_input: &ResponseInput,
@@ -301,7 +304,7 @@ pub fn build_resume_payload(
 
 /// Send mcp_list_tools events to client at the start of streaming
 /// Returns false if client disconnected
-pub fn send_mcp_list_tools_events(
+pub(super) fn send_mcp_list_tools_events(
     tx: &mpsc::UnboundedSender<Result<Bytes, io::Error>>,
     mcp: &Arc<mcp::McpManager>,
     server_label: &str,
@@ -389,7 +392,7 @@ pub fn send_mcp_list_tools_events(
 
 /// Send mcp_call completion events after tool execution
 /// Returns false if client disconnected
-pub fn send_mcp_call_completion_events_with_error(
+pub(super) fn send_mcp_call_completion_events_with_error(
     tx: &mpsc::UnboundedSender<Result<Bytes, io::Error>>,
     call: &FunctionCallInProgress,
     output: &str,
@@ -456,7 +459,7 @@ pub fn send_mcp_call_completion_events_with_error(
 // ============================================================================
 
 /// Inject MCP metadata into a streaming response
-pub fn inject_mcp_metadata_streaming(
+pub(super) fn inject_mcp_metadata_streaming(
     response: &mut Value,
     state: &ToolLoopState,
     mcp: &Arc<mcp::McpManager>,
@@ -493,7 +496,7 @@ pub fn inject_mcp_metadata_streaming(
 // ============================================================================
 
 /// Execute the tool calling loop
-pub async fn execute_tool_loop(
+pub(super) async fn execute_tool_loop(
     client: &reqwest::Client,
     url: &str,
     headers: Option<&HeaderMap>,
@@ -659,7 +662,7 @@ pub async fn execute_tool_loop(
 }
 
 /// Build an incomplete response when limits are exceeded
-pub fn build_incomplete_response(
+pub(super) fn build_incomplete_response(
     mut response: Value,
     state: ToolLoopState,
     reason: &str,
@@ -755,7 +758,7 @@ pub fn build_incomplete_response(
 // ============================================================================
 
 /// Build a mcp_list_tools output item
-pub fn build_mcp_list_tools_item(mcp: &Arc<mcp::McpManager>, server_label: &str) -> Value {
+pub(super) fn build_mcp_list_tools_item(mcp: &Arc<mcp::McpManager>, server_label: &str) -> Value {
     let tools = mcp.list_tools();
     let tools_json: Vec<Value> = tools
         .iter()
@@ -780,7 +783,7 @@ pub fn build_mcp_list_tools_item(mcp: &Arc<mcp::McpManager>, server_label: &str)
 }
 
 /// Build a mcp_call output item
-pub fn build_mcp_call_item(
+pub(super) fn build_mcp_call_item(
     tool_name: &str,
     arguments: &str,
     output: &str,
@@ -802,7 +805,7 @@ pub fn build_mcp_call_item(
 }
 
 /// Helper function to build mcp_call items from executed tool calls in conversation history
-pub fn build_executed_mcp_call_items(
+pub(super) fn build_executed_mcp_call_items(
     conversation_history: &[Value],
     server_label: &str,
 ) -> Vec<Value> {
@@ -856,7 +859,7 @@ pub fn build_executed_mcp_call_items(
 // ============================================================================
 
 /// Extract function call from a response
-pub fn extract_function_call(resp: &Value) -> Option<(String, String, String)> {
+pub(super) fn extract_function_call(resp: &Value) -> Option<(String, String, String)> {
     let output = resp.get("output")?.as_array()?;
     for item in output {
         let obj = item.as_object()?;

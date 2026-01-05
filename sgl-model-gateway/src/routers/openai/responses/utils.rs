@@ -27,7 +27,7 @@ where
 }
 
 /// Patch streaming response JSON with metadata from original request
-pub fn patch_streaming_response_json(
+pub(super) fn patch_streaming_response_json(
     response_json: &mut Value,
     original_body: &ResponsesRequest,
     original_previous_response_id: Option<&str>,
@@ -127,7 +127,7 @@ fn rebuild_sse_block(block: &str, new_payload: &str) -> String {
 }
 
 /// Rewrite streaming SSE block to include metadata from original request
-pub fn rewrite_streaming_block(
+pub(super) fn rewrite_streaming_block(
     block: &str,
     original_body: &ResponsesRequest,
     original_previous_response_id: Option<&str>,
@@ -194,7 +194,7 @@ fn insert_optional_string(map: &mut Map<String, Value>, key: &str, value: &Optio
 }
 
 /// Mask function tools as MCP tools in response for client
-pub fn mask_tools_as_mcp(resp: &mut Value, original_body: &ResponsesRequest) {
+pub(super) fn mask_tools_as_mcp(resp: &mut Value, original_body: &ResponsesRequest) {
     let mcp_tool = original_body.tools.as_ref().and_then(|tools| {
         tools
             .iter()

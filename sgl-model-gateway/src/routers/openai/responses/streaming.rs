@@ -54,7 +54,7 @@ use crate::{
 /// Apply all transformations to event data in-place (rewrite + transform)
 /// Optimized to parse JSON only once instead of multiple times
 /// Returns true if any changes were made
-pub fn apply_event_transformations_inplace(
+pub(super) fn apply_event_transformations_inplace(
     parsed_data: &mut Value,
     ctx: &StreamingEventContext<'_>,
 ) -> bool {
@@ -284,7 +284,7 @@ fn send_buffered_arguments(
 
 /// Forward and transform a streaming event to the client
 /// Returns false if client disconnected
-pub fn forward_streaming_event(
+pub(super) fn forward_streaming_event(
     raw_block: &str,
     event_name: Option<&str>,
     data: &str,
@@ -419,7 +419,7 @@ fn maybe_inject_mcp_in_progress(
 
 /// Send final response.completed event to client
 /// Returns false if client disconnected
-pub fn send_final_response_event(
+pub(super) fn send_final_response_event(
     handler: &StreamingToolHandler,
     tx: &mpsc::UnboundedSender<Result<Bytes, io::Error>>,
     sequence_number: &mut u64,
@@ -476,7 +476,7 @@ pub fn send_final_response_event(
 // ============================================================================
 
 /// Simple pass-through streaming without MCP interception
-pub async fn handle_simple_streaming_passthrough(
+pub(super) async fn handle_simple_streaming_passthrough(
     client: &reqwest::Client,
     circuit_breaker: &crate::core::CircuitBreaker,
     headers: Option<&HeaderMap>,
@@ -627,7 +627,7 @@ pub async fn handle_simple_streaming_passthrough(
 }
 
 /// Handle streaming WITH MCP tool call interception and execution
-pub async fn handle_streaming_with_tool_interception(
+pub(super) async fn handle_streaming_with_tool_interception(
     client: &reqwest::Client,
     headers: Option<&HeaderMap>,
     req: StreamingRequest,

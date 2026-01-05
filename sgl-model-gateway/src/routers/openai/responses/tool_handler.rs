@@ -20,7 +20,7 @@ use crate::protocols::event_types::{
 
 /// Action to take based on streaming event processing
 #[derive(Debug)]
-pub enum StreamAction {
+pub(super) enum StreamAction {
     Forward,      // Pass event to client
     Buffer,       // Accumulate for tool execution
     ExecuteTools, // Function call complete, execute now
@@ -32,7 +32,7 @@ pub enum StreamAction {
 
 /// Maps upstream output indices to sequential downstream indices
 #[derive(Debug, Default)]
-pub struct OutputIndexMapper {
+pub(super) struct OutputIndexMapper {
     next_index: usize,
     // Map upstream output_index -> remapped output_index
     assigned: HashMap<usize, usize>,
@@ -74,7 +74,7 @@ impl OutputIndexMapper {
 // ============================================================================
 
 /// Handles streaming responses with MCP tool call interception
-pub struct StreamingToolHandler {
+pub(super) struct StreamingToolHandler {
     /// Accumulator for response persistence
     pub accumulator: StreamingResponseAccumulator,
     /// Function calls being built from deltas
