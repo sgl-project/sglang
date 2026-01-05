@@ -352,6 +352,14 @@ class CudaGraphRunner:
         if model_runner.spec_algorithm.is_eagle3():
             self.model_runner.model.set_eagle3_layers_to_capture()
 
+        gc.collect()
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+        peak_bytes = torch.cuda.max_memory_allocated()
+        log_info_on_rank0(
+            logger,
+            f"Peak memory allocated before cg capture: {peak_bytes / 1024 / 1024:.2f} MB",
+        )
         # Capture
         try:
             with model_capture_mode():
@@ -360,6 +368,14 @@ class CudaGraphRunner:
             raise Exception(
                 f"Capture cuda graph failed: {e}\n{CUDA_GRAPH_CAPTURE_FAILED_MSG}"
             )
+        gc.collect()
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+        peak_bytes = torch.cuda.max_memory_allocated()
+        log_info_on_rank0(
+            logger,
+            f"Peak memory allocated after cg capture: {peak_bytes / 1024 / 1024:.2f} MB",
+        )
 
     def maybe_init_pdmux(self):
         if self.enable_pdmux:

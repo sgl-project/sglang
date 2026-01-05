@@ -585,7 +585,23 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.model.set_eagle3_layers_to_capture(eagle_aux_hidden_state_layer_ids)
 
         # Initialize piecewise CUDA graph
+        gc.collect()
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+        peak_bytes = torch.cuda.max_memory_allocated()
+        log_info_on_rank0(
+            logger,
+            f"Peak memory allocated before piecewise cg init: {peak_bytes / 1024 / 1024:.2f} MB",
+        )
         self.init_piecewise_cuda_graphs()
+        gc.collect()
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+        peak_bytes = torch.cuda.max_memory_allocated()
+        log_info_on_rank0(
+            logger,
+            f"Peak memory allocated after piecewise cg init: {peak_bytes / 1024 / 1024:.2f} MB",
+        )
 
     def init_routed_experts_capturer(self):
         # TODO: the redundant logic with TpModelWorker
