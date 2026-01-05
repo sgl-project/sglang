@@ -56,14 +56,10 @@ class _SpecialTokensCachePatcher:
         )
 
         def patched_add_special_tokens(self, *args, **kwargs):
-            assert (
-                False
-            ), "Cannot modify special tokens after patch. Call unpatch_tokenizer first."
+            _raise_special_tokens_immutable("add_special_tokens")
 
-        def patched_add_tokens(self, new_tokens, special_tokens=False):
-            assert (
-                not special_tokens
-            ), "Cannot add special tokens after patch. Call unpatch_tokenizer first."
+        def patched_add_tokens(self, *args, **kwargs):
+            _raise_special_tokens_immutable("add_tokens")
 
         tokenizer_cls.all_special_tokens = patched_all_special_tokens
         tokenizer_cls.all_special_ids = patched_all_special_ids
@@ -112,3 +108,9 @@ def _make_cached_property(cache_attr, original_fn):
         return getattr(self, cache_attr)
 
     return cached_prop
+
+
+def _raise_special_tokens_immutable(method_name):
+    raise AssertionError(
+        f"Cannot call {method_name} after patch. Call unpatch_tokenizer first."
+    )
