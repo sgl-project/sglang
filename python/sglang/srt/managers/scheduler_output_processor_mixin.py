@@ -1576,6 +1576,7 @@ class SchedulerOutputProcessorMixin:
             self._fingerprint_publisher = self._zmq_context.socket(zmq.PUSH)
             self._fingerprint_publisher.connect(sidecar_url)
             self._fingerprint_publisher.setsockopt(zmq.SNDHWM, 1000)  # High water mark
+            self._fingerprint_publisher.setsockopt(zmq.LINGER, 0)  # Don't hang on shutdown
             logger.info(f"Connected fingerprint publisher to {sidecar_url}")
         except ImportError:
             logger.warning("ZMQ not available, fingerprint streaming disabled")
@@ -1655,6 +1656,7 @@ class SchedulerOutputProcessorMixin:
             self._feedback_subscriber = self._zmq_context.socket(zmq.PULL)
             self._feedback_subscriber.connect(feedback_url)  # Connect to sidecar's PUSH socket
             self._feedback_subscriber.setsockopt(zmq.RCVHWM, 1000)  # High water mark
+            self._feedback_subscriber.setsockopt(zmq.LINGER, 0)  # Don't hang on shutdown
             logger.info(f"Connected to sidecar feedback on {feedback_url}")
         except ImportError:
             logger.warning("ZMQ not available, feedback channel disabled")
