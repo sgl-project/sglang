@@ -148,7 +148,10 @@ class Indexer(MultiPlatformOp):
         if is_cuda():
             self.sm_count = deep_gemm.get_num_sms()
             self.half_device_sm_count = ceil_align(self.sm_count // 2, 8)
-            self.pp_size = get_global_server_args().pp_size
+            pp_size = get_global_server_args().pp_size
+            self.logits_with_pp_recv = pp_size > 1 and not get_pp_group().is_last_rank
+        else:
+            self.logits_with_pp_recv = False
 
         self.wq_b = ReplicatedLinear(
             self.q_lora_rank,
@@ -193,7 +196,7 @@ class Indexer(MultiPlatformOp):
         # request to receive the PP proxy tensor or output from the previous stage, occupying one SM resource.
         # Model execution runs in parallel with the recv operation, so the SMs available to the indexer must be reduced
         # by 1. Currently, the last rank starts the send result + recv request only after waiting for execution results.
-        if is_cuda() and self.pp_size > 1 and not get_pp_group().is_last_rank:
+        if self.logits_with_pp_recv:
             pp_recv_sm_count = 1
             with deep_gemm_wrapper.configure_deep_gemm_num_sms(
                 self.sm_count - pp_recv_sm_count
