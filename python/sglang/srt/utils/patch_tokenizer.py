@@ -9,7 +9,7 @@ def patch_tokenizer(tokenizer):
     if not envs.SGLANG_PATCH_TOKENIZER.get():
         return tokenizer
 
-    if _is_kimi_tokenizer(tokenizer):
+    if _is_kimi_tiktoken_tokenizer(tokenizer):
         logger.info(
             f"Applying special tokens cache patch for Kimi tokenizer: {type(tokenizer).__name__}"
         )
@@ -44,10 +44,11 @@ def unpatch_tokenizer(tokenizer):
     return tokenizer
 
 
-def _is_kimi_tokenizer(tokenizer):
-    name = getattr(tokenizer, "name_or_path", "") or ""
-    class_name = type(tokenizer).__name__
-    return ("kimi" in name.lower()) and (class_name == "TikTokenTokenizer")
+def _is_kimi_tiktoken_tokenizer(tokenizer):
+    cls = type(tokenizer)
+    class_name = cls.__name__
+    module_name = cls.__module__ or ""
+    return class_name == "TikTokenTokenizer" and "tokenization_kimi" in module_name
 
 
 def _patch_special_tokens_cache(tokenizer):
