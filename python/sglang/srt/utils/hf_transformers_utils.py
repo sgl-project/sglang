@@ -502,7 +502,8 @@ def get_tokenizer(
         )
 
     attach_additional_stop_token_ids(tokenizer)
-    return patch_tokenizer(tokenizer)
+    tokenizer = patch_tokenizer(tokenizer)
+    return tokenizer
 
 
 # Some models doesn't have an available processor, e.g.: InternVL
