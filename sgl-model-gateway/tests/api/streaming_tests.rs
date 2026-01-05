@@ -1,13 +1,12 @@
-mod common;
+use serde_json::json;
 
-use common::{
+use crate::common::{
     mock_worker::{HealthStatus, MockWorkerConfig, WorkerType},
     WorkerTestContext,
 };
-use serde_json::json;
 
 #[cfg(test)]
-mod streaming_tests {
+mod tests {
     use super::*;
 
     #[tokio::test]
