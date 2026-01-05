@@ -36,7 +36,7 @@
 #include "vec.h"
 #include "vec_pack.h"
 
-// [NOTE]: flash_attn_varlen_func for CPU
+// [NOTE]: flash attention interface for CPU
 
 namespace {
 
@@ -48,6 +48,165 @@ void print_array(const T* data, int M, int N, int lda) {
     }
     std::cout << std::endl;
   }
+}
+
+template <typename scalar_t, int BLOCK_M, int BLOCK_N>
+void flash_attn_kernel_impl(
+    scalar_t* __restrict__ out,
+    const scalar_t* __restrict__ q,
+    const scalar_t* __restrict__ k,
+    const scalar_t* __restrict__ v,
+    void* __restrict__ buffer,
+    int seqlen_q,
+    int seqlen_k,
+    int batches,
+    int num_heads,
+    int num_heads_kv,
+    int head_size,
+    int head_size_v,
+    int q_strideM,
+    int q_strideH,
+    int k_strideN,
+    int k_strideH,
+    int v_strideN,
+    int v_strideH,
+    float sm_scale,
+    int buffer_size_per_thread,
+    bool causal) {
+  using Vec = at::vec::Vectorized<float>;
+
+  // strides
+  const int o_strideM = num_heads * head_size_v;
+  const int o_strideH = head_size_v;
+
+  // we use same buffer for packed key and value
+  const int ldb_tmp = std::max(head_size, head_size_v);
+
+  const int num_groups = num_heads / num_heads_kv;
+  TORCH_CHECK(num_groups * num_heads_kv == num_heads);
+
+  // number of super locks along M
+  int MB = div_up(seqlen_q, BLOCK_M);
+
+  // parallel on [batches, num_heads, MB]
+  parallel_for(batches * num_heads * MB, [&](int begin, int end) {
+    int bs{0}, head_id{0}, mb{0};
+    data_index_init(begin, bs, batches, head_id, num_heads, mb, MB);
+
+    int tid = get_thread_num();
+    // s_i and s_delta: [BLOCK_M, BLOCK_N]
+    float* __restrict__ s_i = reinterpret_cast<float*>((char*)(buffer) + tid * buffer_size_per_thread);
+    float* __restrict__ s_delta = s_i;
+    scalar_t* __restrict__ s_delta2 = reinterpret_cast<scalar_t*>(s_i);
+
+    // v_prime: [BLOCK_M, head_size_v]
+    float* __restrict__ v_prime = s_i + BLOCK_M * BLOCK_N;
+
+    // Btmp: [BLOCK_N, max(head_size, head_size_v)]
+    scalar_t* __restrict__ Btmp = reinterpret_cast<scalar_t*>(v_prime + BLOCK_M * head_size_v);
+
+    // init Btmp and Btmp2 just once for each thread to prevent NaN
+    fill_stub(Btmp, 0.f, BLOCK_N * ldb_tmp);
+
+    alignas(64) float s_prime[BLOCK_M];
+    alignas(64) float m_prime[BLOCK_M];
+
+    for (int i = begin; i < end; ++i) {
+      int seq_q_start_loc = bs * seqlen_q;
+      int seq_k_start_loc = bs * seqlen_k;
+
+      // offset and size in MB
+      int m = mb * BLOCK_M;
+      int m_size = std::min(BLOCK_M, seqlen_q - m);
+
+      assert(m_size > 0);
+
+      int head_kv_id = head_id / num_groups;
+
+      // get query
+      const scalar_t* __restrict__ q_ptr = q + (seq_q_start_loc + m) * q_strideM + head_id * q_strideH;
+
+      // init v', s' and m'
+      fill_stub(v_prime, 0.f, m_size * head_size_v);
+      fill_stub(s_prime, 0.f, m_size);
+      fill_stub(m_prime, -std::numeric_limits<scalar_t>::infinity(), m_size);
+
+      int num_keys = causal ? std::min(m + m_size, seqlen_k) : seqlen_k;
+      for (int n = 0; n < num_keys; n += BLOCK_N) {
+        int n_size = std::min(BLOCK_N, num_keys - n);
+
+        // `n_size` is K in 2nd gemm, pad to TILE_K;
+        const int padded_n_size = div_up(n_size, TILE_K) * TILE_K;
+
+        // get key and pack
+        pack_vnni<scalar_t>(
+            /*    dst */ Btmp,
+            /*    src */ k + (seq_k_start_loc + n) * k_strideN + head_kv_id * k_strideH,
+            /*     N  */ n_size,
+            /*     K  */ head_size,
+            /* ld_src */ k_strideN,
+            /* ld_dst */ BLOCK_N);
+
+        // calculate s_i <- Q @ K
+        at::native::cpublas::brgemm(
+            /* M     */ m_size,
+            /* N     */ n_size,
+            /* K     */ head_size,
+            /* lda   */ q_strideM,
+            /* ldb   */ BLOCK_N,
+            /* ldc   */ BLOCK_N,
+            /* add_C */ false,
+            /* A     */ q_ptr,
+            /* B     */ Btmp,
+            /* C     */ s_i);
+
+        // apply causal mask
+        if (causal && num_keys - n <= BLOCK_N) {
+          for (int row = 0; row < m_size; ++row) {
+            int last_col = m + row - n;
+            // fill [last_col + 1, n_size) to -inf
+            float* row_ptr = s_i + row * BLOCK_N;
+            fill_stub(row_ptr + last_col + 1, -std::numeric_limits<float>::infinity(), n_size - last_col - 1);
+          }
+        }
+
+        flash_attn_softmax<scalar_t, BLOCK_M, BLOCK_N>::apply(
+            s_i, s_delta, s_delta2, v_prime, s_prime, m_prime, m_size, n_size, padded_n_size, head_size_v, sm_scale);
+
+        // get value and pack
+        pack_vnni2<scalar_t>(
+            /*    dst */ Btmp,
+            /*    src */ v + (seq_k_start_loc + n) * v_strideN + head_kv_id * v_strideH,
+            /*     K  */ n_size,
+            /*     N  */ head_size_v,
+            /* ld_src */ v_strideN,
+            /* ld_dst */ head_size_v);
+
+        // calculate V' <- s_delta @ V + V'
+        at::native::cpublas::brgemm(
+            /* M     */ m_size,
+            /* N     */ head_size_v,
+            /* K     */ padded_n_size,  // n_size
+            /* lda   */ BLOCK_N,
+            /* ldb   */ head_size_v,
+            /* ldc   */ head_size_v,
+            /* add_C */ true,
+            /* A     */ s_delta2,
+            /* B     */ Btmp,
+            /* C     */ v_prime);
+      }  // loop with seqlen_k
+
+      scalar_t* __restrict__ out_ptr = out + (seq_q_start_loc + m) * o_strideM + head_id * o_strideH;
+      for (int row = 0; row < m_size; ++row) {
+        float s = 1 / s_prime[row];
+        copy_stub<scalar_t>(out_ptr + row * o_strideM, v_prime + row * head_size_v, s, head_size_v);
+      }
+
+      // move to the next index
+      data_index_step(bs, batches, head_id, num_heads, mb, MB);
+    }
+    at::native::cpublas::brgemm_release();
+  });
 }
 
 template <typename scalar_t, int BLOCK_M, int BLOCK_N>
@@ -335,7 +494,6 @@ at::Tensor flash_attn_varlen_func(
   // check whether the batch has variant lengths
   const bool is_varlen =
       has_varlen_sequences<int32_t>(cu_seqlens_q, cu_seqlens_k, num_seqs, max_seqlen_q, max_seqlen_k);
-  // std::cout << "### flash_attn_varlen_func: is_varlen: " << (is_varlen ? " true" : "false") << std::endl;
 
   int num_threads = at::get_num_threads();
   at::Tensor buffer = at::empty({}, q.options().dtype(at::kChar));
@@ -348,33 +506,58 @@ at::Tensor flash_attn_varlen_func(
 
   AT_DISPATCH_REDUCED_FLOATING_TYPES(q.scalar_type(), "flash_attn_varlen_func", [&] {
     int sz = resize_buffer<BLOCK_M, BLOCK_N>(buffer, num_threads, head_size, head_size_v);
-    resize_indices<BLOCK_M>(indices, num_seqs, max_seqlen_q);
 
-    flash_attn_varlen_kernel_impl<scalar_t, BLOCK_M, BLOCK_N>(
-        out.data_ptr<scalar_t>(),
-        q.data_ptr<scalar_t>(),
-        k.data_ptr<scalar_t>(),
-        v.data_ptr<scalar_t>(),
-        cu_seqlens_q.data_ptr<int32_t>(),
-        cu_seqlens_k.data_ptr<int32_t>(),
-        buffer.data_ptr(),
-        indices.data_ptr<int32_t>(),
-        max_seqlen_q,
-        max_seqlen_k,
-        num_seqs,
-        num_heads,
-        num_heads_kv,
-        head_size,
-        head_size_v,
-        q_strideM,
-        q_strideH,
-        k_strideN,
-        k_strideH,
-        v_strideN,
-        v_strideH,
-        sm_scale,
-        sz,
-        causal);
+    if (is_varlen) {
+      resize_indices<BLOCK_M>(indices, num_seqs, max_seqlen_q);
+      flash_attn_varlen_kernel_impl<scalar_t, BLOCK_M, BLOCK_N>(
+          out.data_ptr<scalar_t>(),
+          q.data_ptr<scalar_t>(),
+          k.data_ptr<scalar_t>(),
+          v.data_ptr<scalar_t>(),
+          cu_seqlens_q.data_ptr<int32_t>(),
+          cu_seqlens_k.data_ptr<int32_t>(),
+          buffer.data_ptr(),
+          indices.data_ptr<int32_t>(),
+          max_seqlen_q,
+          max_seqlen_k,
+          num_seqs,
+          num_heads,
+          num_heads_kv,
+          head_size,
+          head_size_v,
+          q_strideM,
+          q_strideH,
+          k_strideN,
+          k_strideH,
+          v_strideN,
+          v_strideH,
+          sm_scale,
+          sz,
+          causal);
+    } else {
+      flash_attn_kernel_impl<scalar_t, BLOCK_M, BLOCK_N>(
+          out.data_ptr<scalar_t>(),
+          q.data_ptr<scalar_t>(),
+          k.data_ptr<scalar_t>(),
+          v.data_ptr<scalar_t>(),
+          buffer.data_ptr(),
+          max_seqlen_q,
+          max_seqlen_k,
+          num_seqs,
+          num_heads,
+          num_heads_kv,
+          head_size,
+          head_size_v,
+          q_strideM,
+          q_strideH,
+          k_strideN,
+          k_strideH,
+          v_strideN,
+          v_strideH,
+          sm_scale,
+          sz,
+          causal);
+    }
   });
 
   return out;

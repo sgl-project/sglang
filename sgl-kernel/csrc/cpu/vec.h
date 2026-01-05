@@ -148,7 +148,7 @@ inline __attribute__((always_inline)) __m512bh CVT_FP8_TO_BF16_EXT(__m256i a) {
 #endif
 
 // vector to scalar reduction
-#if defined(CPU_CAPABILITY_AVX512) && 0
+#if defined(CPU_CAPABILITY_AVX512)
 inline float vec_reduce_sum(const Vectorized<float>& a) {
   return _mm512_reduce_add_ps(__m512(a));
 }

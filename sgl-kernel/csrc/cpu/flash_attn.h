@@ -56,6 +56,37 @@ inline void copy_stub(scalar_t* __restrict__ out, const float* __restrict__ acc,
   }
 }
 
+#if defined(CPU_CAPABILITY_AVX512)
+template <>
+inline void copy_stub<at::BFloat16>(at::BFloat16* __restrict__ out, const float* __restrict__ acc, float s, int size) {
+  const __m512 vscale = _mm512_set1_ps(s);
+  int d = 0;
+#pragma GCC unroll 4
+  for (; d <= size - 32; d += 32) {
+    __m512 va0 = _mm512_mul_ps(_mm512_loadu_ps(acc + d), vscale);
+    __m512 va1 = _mm512_mul_ps(_mm512_loadu_ps(acc + d + 16), vscale);
+    __m512i vb = (__m512i)(_mm512_cvtne2ps_pbh(va1, va0));
+    _mm512_storeu_si512(out + d, vb);
+  }
+  int remainder = size - d;
+  if (remainder > 0) {
+    if (remainder <= 16) {
+      const __mmask16 vmask = (1ULL << remainder) - 1;
+      __m512 va = _mm512_mul_ps(_mm512_maskz_loadu_ps(vmask, acc + d), vscale);
+      __m256i vb = (__m256i)(_mm512_cvtneps_pbh(va));
+      _mm256_mask_storeu_epi16(reinterpret_cast<__m256i*>(out + d), vmask, vb);
+    } else {  // remainder > 16
+      const __mmask16 vmask = (1ULL << (remainder - 16)) - 1;
+      __m512 va0 = _mm512_mul_ps(_mm512_loadu_ps(acc + d), vscale);
+      __m512 va1 = _mm512_mul_ps(_mm512_maskz_loadu_ps(vmask, acc + d + 16), vscale);
+      __m512i vb = (__m512i)(_mm512_cvtne2ps_pbh(va1, va0));
+      const __mmask32 vmask2 = (1ULL << remainder) - 1;
+      _mm512_mask_storeu_epi16(reinterpret_cast<__m512i*>(out + d), vmask2, vb);
+    }
+  }
+}
+#endif
+
 template <typename scalar_t, int BLOCK_M, int BLOCK_N>
 struct flash_attn_softmax {
   static inline void apply(
