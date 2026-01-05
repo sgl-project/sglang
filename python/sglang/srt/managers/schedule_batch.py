@@ -2364,6 +2364,27 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             if capture_layers is None:
                 capture_layers = self._resolve_capture_layers(req)
 
+        # Collect attention biases from semantic_memory (for steering)
+        # Format: Dict[layer_id -> List[Dict[token_pos -> bias]]]
+        attention_biases: Optional[Dict[int, List[Dict[int, float]]]] = None
+        for batch_idx, req in enumerate(self.reqs):
+            semantic_memory = getattr(req, "semantic_memory", None)
+            if semantic_memory is None:
+                continue
+            req_biases = getattr(semantic_memory, "attention_biases", None)
+            if not req_biases:
+                continue
+            # req_biases is Dict[layer_id -> Dict[token_pos -> bias]]
+            for layer_id, token_biases in req_biases.items():
+                if not token_biases:
+                    continue
+                if attention_biases is None:
+                    attention_biases = {}
+                if layer_id not in attention_biases:
+                    # Initialize with empty dicts for all requests
+                    attention_biases[layer_id] = [{} for _ in range(len(self.reqs))]
+                attention_biases[layer_id][batch_idx] = token_biases
+
         return ModelWorkerBatch(
             forward_mode=self.forward_mode,
             input_ids=self.input_ids,
@@ -2422,6 +2443,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             capture_attention_tokens=capture_attention_tokens,
             attention_top_k=attention_top_k,
             attention_capture_layer_id=capture_layers,  # Pass normalized List[int] | None
+            attention_biases=attention_biases,  # Steering biases from semantic_memory
         )
 
     def copy(self):
@@ -2562,3 +2584,8 @@ class ModelWorkerBatch:
     capture_attention_tokens: bool = False
     attention_top_k: int = 5
     attention_capture_layer_id: Optional[Union[int, List[int]]] = None  # Per-request layer override (single int or list)
+
+    # For attention steering (semantic routing loop)
+    # Dict[layer_id -> List[Dict[token_pos -> bias_value]]] (one dict per request in batch)
+    # Biases are added to attention logits before softmax
+    attention_biases: Optional[Dict[int, List[Dict[int, float]]]] = None

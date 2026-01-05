@@ -434,6 +434,13 @@ class ForwardBatch:
     attention_fingerprint: Optional["torch.Tensor"] = None  # [batch, 20] feature vector
     attention_manifold: Optional[List[str]] = None  # Manifold classification
 
+    # For attention steering (semantic routing loop)
+    # Sparse representation: (batch_indices, token_positions, bias_values) tensors
+    # Applied as additive bias to attention logits before softmax
+    attention_bias_indices: Optional[torch.Tensor] = None  # [num_biases, 2] (batch_idx, token_pos)
+    attention_bias_values: Optional[torch.Tensor] = None   # [num_biases] bias values
+    attention_bias_layers: Optional[List[int]] = None      # Which layers have biases
+
     @classmethod
     def init_new(
         cls,
@@ -642,7 +649,76 @@ class ForwardBatch:
 
             ret.attention_capture_layer_ids = layer_ids
 
+        # Init attention biases for steering (semantic routing loop)
+        if batch.attention_biases is not None:
+            # Convert sparse dict format to GPU tensors
+            # batch.attention_biases: Dict[layer_id -> List[Dict[token_pos -> bias]]]
+            batch_indices = []
+            token_positions = []
+            bias_values = []
+            layer_ids_with_biases = sorted(batch.attention_biases.keys())
+
+            for layer_id in layer_ids_with_biases:
+                per_request_biases = batch.attention_biases[layer_id]
+                for batch_idx, token_biases in enumerate(per_request_biases):
+                    for token_pos, bias in token_biases.items():
+                        batch_indices.append(batch_idx)
+                        token_positions.append(token_pos)
+                        bias_values.append(bias)
+
+            if bias_values:
+                ret.attention_bias_indices = torch.tensor(
+                    [[b, t] for b, t in zip(batch_indices, token_positions)],
+                    dtype=torch.int64,
+                    device=model_runner.device,
+                )
+                ret.attention_bias_values = torch.tensor(
+                    bias_values,
+                    dtype=torch.float32,
+                    device=model_runner.device,
+                )
+                ret.attention_bias_layers = layer_ids_with_biases
+
         return ret
+
+    def has_attention_biases_for_layer(self, layer_id: int) -> bool:
+        """Check if this layer has attention biases to apply."""
+        if self.attention_bias_layers is None:
+            return False
+        return layer_id in self.attention_bias_layers
+
+    def get_attention_bias_tensor(
+        self, layer_id: int, max_seq_len: int
+    ) -> Optional[torch.Tensor]:
+        """
+        Get attention bias tensor for a specific layer.
+
+        Returns a (batch_size, max_seq_len) tensor with bias values.
+        Positions without biases have value 0.
+        Returns None if no biases for this layer.
+        """
+        if not self.has_attention_biases_for_layer(layer_id):
+            return None
+
+        # Create dense bias tensor
+        bias_tensor = torch.zeros(
+            (self.batch_size, max_seq_len),
+            dtype=self.attention_bias_values.dtype,
+            device=self.attention_bias_values.device,
+        )
+
+        # Scatter bias values to positions
+        batch_indices = self.attention_bias_indices[:, 0]
+        token_positions = self.attention_bias_indices[:, 1]
+
+        # Mask for valid positions (within max_seq_len)
+        valid_mask = token_positions < max_seq_len
+        if valid_mask.any():
+            bias_tensor[
+                batch_indices[valid_mask], token_positions[valid_mask]
+            ] = self.attention_bias_values[valid_mask]
+
+        return bias_tensor
 
     def adjust_num_token_non_padded_for_attn_tp(self, server_args) -> None:
         """Make num_token_non_padded local to this attention-TP rank."""
