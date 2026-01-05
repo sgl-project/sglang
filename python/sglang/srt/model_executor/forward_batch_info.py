@@ -435,11 +435,13 @@ class ForwardBatch:
     attention_manifold: Optional[List[str]] = None  # Manifold classification
 
     # For attention steering (semantic routing loop)
-    # Sparse representation: (batch_indices, token_positions, bias_values) tensors
+    # Sparse representation: (layer_id, batch_idx, token_pos, bias_value) tensors
     # Applied as additive bias to attention logits before softmax
-    attention_bias_indices: Optional[torch.Tensor] = None  # [num_biases, 2] (batch_idx, token_pos)
+    attention_bias_indices: Optional[torch.Tensor] = None  # [num_biases, 3] (layer_id, batch_idx, token_pos)
     attention_bias_values: Optional[torch.Tensor] = None   # [num_biases] bias values
     attention_bias_layers: Optional[List[int]] = None      # Which layers have biases
+    # CSR-style per-layer indexing for efficient lookup
+    attention_bias_layer_indptr: Optional[torch.Tensor] = None  # [num_layers+1] CSR indptr
 
     # For MoE routing capture (interpretability/semantic telemetry)
     # Captures which experts were selected and with what weights
@@ -450,6 +452,10 @@ class ForwardBatch:
     moe_routing_buffer: Optional[List[Tuple[int, torch.Tensor, torch.Tensor]]] = None
     # Layers to capture MoE routing from (None = all MoE layers)
     moe_capture_layer_ids: Optional[List[int]] = None
+    # Stride and max limits for MoE routing capture
+    moe_routing_stride: int = 1  # Capture every Nth token (1 = all)
+    moe_routing_max_steps: int = 0  # Max decode steps to capture (0 = unlimited)
+    moe_routing_current_step: int = 0  # Current decode step counter
 
     @classmethod
     def init_new(
@@ -690,24 +696,31 @@ class ForwardBatch:
 
         # Init attention biases for steering (semantic routing loop)
         if batch.attention_biases is not None:
-            # Convert sparse dict format to GPU tensors
+            # Convert sparse dict format to GPU tensors with CSR-style per-layer indexing
             # batch.attention_biases: Dict[layer_id -> List[Dict[token_pos -> bias]]]
+            layer_ids = []
             batch_indices = []
             token_positions = []
             bias_values = []
             layer_ids_with_biases = sorted(batch.attention_biases.keys())
 
+            # Build CSR-style indptr for per-layer lookup
+            layer_indptr = [0]
+
             for layer_id in layer_ids_with_biases:
                 per_request_biases = batch.attention_biases[layer_id]
+                layer_start_count = len(bias_values)
                 for batch_idx, token_biases in enumerate(per_request_biases):
                     for token_pos, bias in token_biases.items():
+                        layer_ids.append(layer_id)
                         batch_indices.append(batch_idx)
                         token_positions.append(token_pos)
                         bias_values.append(bias)
+                layer_indptr.append(len(bias_values))
 
             if bias_values:
                 ret.attention_bias_indices = torch.tensor(
-                    [[b, t] for b, t in zip(batch_indices, token_positions)],
+                    [[l, b, t] for l, b, t in zip(layer_ids, batch_indices, token_positions)],
                     dtype=torch.int64,
                     device=model_runner.device,
                 )
@@ -717,13 +730,22 @@ class ForwardBatch:
                     device=model_runner.device,
                 )
                 ret.attention_bias_layers = layer_ids_with_biases
+                ret.attention_bias_layer_indptr = torch.tensor(
+                    layer_indptr,
+                    dtype=torch.int64,
+                    device=model_runner.device,
+                )
 
-        # Init MoE routing capture
+        # Init MoE routing capture with stride/max limits from server_args
         if batch.capture_moe_routing:
             ret.capture_moe_routing = True
             ret.moe_routing_top_k = batch.moe_routing_top_k
             ret.moe_capture_layer_ids = batch.moe_capture_layer_ids
             ret.moe_routing_buffer = []  # Initialize empty list to accumulate routing data
+            # Get limits from server_args
+            ret.moe_routing_stride = getattr(model_runner.server_args, 'moe_routing_stride', 1)
+            ret.moe_routing_max_steps = getattr(model_runner.server_args, 'moe_routing_max_steps', 0)
+            ret.moe_routing_current_step = 0
 
         return ret
 
@@ -746,6 +768,19 @@ class ForwardBatch:
         if not self.has_attention_biases_for_layer(layer_id):
             return None
 
+        # Find layer index in our sorted list
+        try:
+            layer_idx = self.attention_bias_layers.index(layer_id)
+        except ValueError:
+            return None
+
+        # Use CSR indptr to get bias entries for this layer
+        start_idx = self.attention_bias_layer_indptr[layer_idx].item()
+        end_idx = self.attention_bias_layer_indptr[layer_idx + 1].item()
+
+        if start_idx == end_idx:
+            return None  # No biases for this layer
+
         # Create dense bias tensor
         bias_tensor = torch.zeros(
             (self.batch_size, max_seq_len),
@@ -753,18 +788,59 @@ class ForwardBatch:
             device=self.attention_bias_values.device,
         )
 
-        # Scatter bias values to positions
-        batch_indices = self.attention_bias_indices[:, 0]
-        token_positions = self.attention_bias_indices[:, 1]
+        # Get only this layer's biases using CSR indexing
+        layer_indices = self.attention_bias_indices[start_idx:end_idx]
+        layer_values = self.attention_bias_values[start_idx:end_idx]
+
+        # Extract batch and token positions (indices are [layer_id, batch_idx, token_pos])
+        batch_indices = layer_indices[:, 1]
+        token_positions = layer_indices[:, 2]
 
         # Mask for valid positions (within max_seq_len)
         valid_mask = token_positions < max_seq_len
         if valid_mask.any():
             bias_tensor[
                 batch_indices[valid_mask], token_positions[valid_mask]
-            ] = self.attention_bias_values[valid_mask]
+            ] = layer_values[valid_mask]
 
         return bias_tensor
+
+    def get_sparse_attention_biases(
+        self, layer_id: int
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+        """
+        Get sparse attention biases for a specific layer.
+
+        Returns (batch_indices, token_positions, bias_values) tensors for this layer only.
+        Returns None if no biases for this layer.
+
+        This is more efficient than get_attention_bias_tensor for sparse bias correction.
+        """
+        if not self.has_attention_biases_for_layer(layer_id):
+            return None
+
+        # Find layer index in our sorted list
+        try:
+            layer_idx = self.attention_bias_layers.index(layer_id)
+        except ValueError:
+            return None
+
+        # Use CSR indptr to get bias entries for this layer
+        start_idx = self.attention_bias_layer_indptr[layer_idx].item()
+        end_idx = self.attention_bias_layer_indptr[layer_idx + 1].item()
+
+        if start_idx == end_idx:
+            return None  # No biases for this layer
+
+        # Get only this layer's biases using CSR indexing
+        layer_indices = self.attention_bias_indices[start_idx:end_idx]
+        layer_values = self.attention_bias_values[start_idx:end_idx]
+
+        # Extract batch and token positions (indices are [layer_id, batch_idx, token_pos])
+        batch_indices = layer_indices[:, 1]
+        token_positions = layer_indices[:, 2]
+
+        return batch_indices, token_positions, layer_values
 
     def adjust_num_token_non_padded_for_attn_tp(self, server_args) -> None:
         """Make num_token_non_padded local to this attention-TP rank."""

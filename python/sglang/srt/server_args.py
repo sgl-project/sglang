@@ -621,6 +621,16 @@ class ServerArgs:
     # Bandwidth-efficient for very long outputs (86k+) - ~500 bytes per layer vs raw edges
     attention_sketch_mode: bool = False
 
+    # Attention steering bias caps (prevent OOM from unbounded bias payloads)
+    attention_bias_max_layers: int = 8  # Max layers that can have biases
+    attention_bias_max_entries_per_layer: int = 1024  # Max bias entries per layer
+    attention_bias_max_seq_len: int = 32768  # Max seq_len for dense fallback (beyond uses sparse)
+
+    # MoE routing capture caps (prevent unbounded buffer growth for long outputs)
+    moe_routing_max_steps: int = 2048  # Max decode steps to capture routing (0 = unlimited)
+    moe_routing_stride: int = 1  # Capture every Nth token (1 = all, 8 = every 8th)
+    moe_routing_max_bytes: int = 0  # Hard limit on routing buffer size in bytes (0 = unlimited)
+
     # PD disaggregation: can be "null" (not disaggregated), "prefill" (prefill-only), or "decode" (decode-only)
     disaggregation_mode: Literal["null", "prefill", "decode"] = "null"
     disaggregation_transfer_backend: str = "mooncake"
