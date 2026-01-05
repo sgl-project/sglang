@@ -9,6 +9,7 @@ from typing import List
 from sglang.multimodal_gen.runtime.pipelines_core.executors.pipeline_executor import (
     PipelineExecutor,
     SGLDiffusionProfiler,
+    Timer,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages import PipelineStage
@@ -30,7 +31,9 @@ class SyncExecutor(PipelineExecutor):
         Execute all pipeline stages sequentially.
         """
         for stage in stages:
-            batch = stage(batch, server_args)
+            with Timer(stage.__class__.__name__):
+                batch = stage(batch, server_args)
+
             profiler = SGLDiffusionProfiler.get_instance()
             if profiler:
                 profiler.step_stage()
