@@ -23,6 +23,9 @@ from transformers import AutoImageProcessor, AutoProcessor, AutoTokenizer
 from transformers.utils import SAFE_WEIGHTS_INDEX_NAME
 
 from sglang.multimodal_gen.configs.models import EncoderConfig, ModelConfig
+from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
+    QwenImageEditPipelineConfig,
+)
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.loader.fsdp_load import (
     maybe_load_fsdp_model,
@@ -43,7 +46,6 @@ from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
     get_diffusers_component_config,
     get_hf_config,
 )
-from sglang.multimodal_gen.runtime.utils.layerwise_offload import OffloadableDiTMixin
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
 
@@ -463,6 +465,14 @@ class TextEncoderLoader(ComponentLoader):
             with local_torch_device, skip_init_modules():
                 architectures = getattr(model_config, "architectures", [])
                 model_cls, _ = ModelRegistry.resolve_model_cls(architectures)
+                enable_image_understanding = (
+                    True
+                    if isinstance(
+                        server_args.pipeline_config, QwenImageEditPipelineConfig
+                    )
+                    else False
+                )
+                model_config.enable_image_understanding = enable_image_understanding
                 model = model_cls(model_config)
 
             weights_to_load = {name for name, _ in model.named_parameters()}
@@ -737,15 +747,6 @@ class TransformerLoader(ComponentLoader):
         ), "Model dtype does not match default dtype"
 
         model = model.eval()
-
-        if server_args.dit_layerwise_offload:
-            # enable layerwise offload if possible
-            if isinstance(model, OffloadableDiTMixin):
-                model.configure_layerwise_offload(server_args)
-            else:
-                logger.info(
-                    "Disabling layerwise offload since current model does not support this feature"
-                )
 
         return model
 

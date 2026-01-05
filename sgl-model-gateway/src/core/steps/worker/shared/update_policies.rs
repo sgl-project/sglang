@@ -102,11 +102,10 @@ impl StepExecutor for UpdatePoliciesStep {
                 .on_worker_added(&model_id, policy_hint);
 
             // Initialize cache-aware policy if configured
-            let all_workers = app_context.worker_registry.get_by_model_fast(&model_id);
+            let all_workers = app_context.worker_registry.get_by_model(&model_id);
 
             // Check for configuration conflicts between prefill and decode
             self.check_worker_conflicts(&model_id, &all_workers);
-
             if let Some(policy) = app_context.policy_registry.get_policy(&model_id) {
                 if policy.name() == "cache_aware" {
                     app_context
