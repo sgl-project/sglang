@@ -647,6 +647,19 @@ async fn responses_handler(
             );
             let rid = request_id.clone();
 
+            let server_label = payload
+                .get("tools")
+                .and_then(|v| v.as_array())
+                .and_then(|tools| {
+                    tools.iter().find(|t| {
+                        t.get("type").and_then(|ty| ty.as_str()) == Some("mcp")
+                            || t.get("type").and_then(|ty| ty.as_str()) == Some("function")
+                    })
+                })
+                .and_then(|t| t.get("server_label").and_then(|l| l.as_str()))
+                .unwrap_or("mock");
+            let qualified_tool_name = format!("{}_brave_web_search", server_label);
+
             let events = vec![
                 // response.created
                 Ok::<_, Infallible>(
@@ -686,7 +699,7 @@ async fn responses_handler(
                         "item": {
                             "id": call_id.clone(),
                             "type": "function_tool_call",
-                            "name": "brave_web_search",
+                            "name": qualified_tool_name,
                             "arguments": "",
                             "status": "in_progress"
                         }
@@ -757,7 +770,7 @@ async fn responses_handler(
                         "item": {
                             "id": call_id.clone(),
                             "type": "function_tool_call",
-                            "name": "brave_web_search",
+                            "name": qualified_tool_name,
                             "arguments": "{\"query\":\"SGLang router MCP integration\"}",
                             "status": "completed"
                         }
@@ -1001,6 +1014,19 @@ async fn responses_handler(
             .unwrap_or(false);
 
         if has_tools && !has_function_output {
+            let server_label = payload
+                .get("tools")
+                .and_then(|v| v.as_array())
+                .and_then(|tools| {
+                    tools.iter().find(|t| {
+                        t.get("type").and_then(|ty| ty.as_str()) == Some("mcp")
+                            || t.get("type").and_then(|ty| ty.as_str()) == Some("function")
+                    })
+                })
+                .and_then(|t| t.get("server_label").and_then(|l| l.as_str()))
+                .unwrap_or("mock");
+            let qualified_tool_name = format!("{}_brave_web_search", server_label);
+
             let rid = format!("resp-{}", Uuid::new_v4());
             Json(json!({
                 "id": rid,
@@ -1010,7 +1036,7 @@ async fn responses_handler(
                 "output": [{
                     "type": "function_tool_call",
                     "id": "call_1",
-                    "name": "brave_web_search",
+                    "name": qualified_tool_name,
                     "arguments": "{\"query\":\"SGLang router MCP integration\"}",
                     "status": "in_progress"
                 }],

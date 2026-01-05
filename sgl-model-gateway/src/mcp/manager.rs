@@ -28,6 +28,7 @@ use crate::mcp::{
     connection_pool::McpConnectionPool,
     error::{McpError, McpResult},
     inventory::ToolInventory,
+    namespace::{qualify_name, ServerIdentity},
     tool_args::ToolArgs,
 };
 
@@ -72,8 +73,13 @@ impl McpManager {
             match Self::connect_server(server_config, global_proxy).await {
                 Ok(client) => {
                     let client_arc = Arc::new(client);
+                    // For static servers, the name is both the key and the label.
+                    let identity = ServerIdentity {
+                        key: server_config.name.clone(),
+                        label: server_config.name.clone(),
+                    };
                     // Load inventory for this server
-                    Self::load_server_inventory(&inventory, &server_config.name, &client_arc).await;
+                    Self::load_server_inventory(&inventory, &identity, &client_arc).await;
                     static_clients.insert(server_config.name.clone(), client_arc);
                     info!("Connected to static server '{}'", server_config.name);
                 }
@@ -113,17 +119,30 @@ impl McpManager {
         &self,
         server_config: McpServerConfig,
     ) -> McpResult<Arc<McpClient>> {
-        let server_name = server_config.name.clone();
-
-        if let Some(client) = self.static_clients.get(&server_name) {
-            return Ok(Arc::clone(client.value()));
+        // For dynamic clients, the server_config.name is the desired label.
+        // The server_key (URL or command) is used for connection pooling.
+        if !server_config.name.is_empty() {
+            if let Some(client) = self.static_clients.get(&server_config.name) {
+                return Ok(Arc::clone(client.value()));
+            }
         }
 
         let server_key = Self::server_key(&server_config);
+        let server_label = if server_config.name.is_empty() {
+            server_key.clone()
+        } else {
+            server_config.name.clone()
+        };
+
+        let identity = ServerIdentity {
+            key: server_key,
+            label: server_label,
+        };
+
         let client = self
             .connection_pool
             .get_or_create(
-                &server_key,
+                &identity.key,
                 server_config,
                 |config, global_proxy| async move {
                     Self::connect_server(&config, global_proxy.as_ref()).await
@@ -131,8 +150,8 @@ impl McpManager {
             )
             .await?;
 
-        self.inventory.clear_server_tools(&server_key);
-        Self::load_server_inventory(&self.inventory, &server_key, &client).await;
+        self.inventory.clear_server_tools(&identity.key);
+        Self::load_server_inventory(&self.inventory, &identity, &client).await;
         Ok(client)
     }
 
@@ -157,7 +176,10 @@ impl McpManager {
         self.inventory
             .list_tools()
             .into_iter()
-            .map(|(_tool_name, _server_name, tool_info)| tool_info)
+            .map(|(tool_name, _server_key, mut tool_info)| {
+                tool_info.name = Cow::Owned(tool_name);
+                tool_info
+            })
             .collect()
     }
 
@@ -191,7 +213,7 @@ impl McpManager {
 
         // Call the tool
         let request = CallToolRequestParam {
-            name: Cow::Owned(tool_name.to_string()),
+            name: Cow::Owned(tool_info.name.to_string()),
             arguments: args_map,
         };
 
@@ -215,7 +237,7 @@ impl McpManager {
         args: Option<Map<String, serde_json::Value>>,
     ) -> McpResult<GetPromptResult> {
         // Get server that owns this prompt
-        let (server_name, _prompt_info) = self
+        let (server_name, prompt_info) = self
             .inventory
             .get_prompt(prompt_name)
             .ok_or_else(|| McpError::PromptNotFound(prompt_name.to_string()))?;
@@ -228,7 +250,7 @@ impl McpManager {
 
         // Get the prompt
         let request = GetPromptRequestParam {
-            name: prompt_name.to_string(),
+            name: prompt_info.name.to_string(),
             arguments: args,
         };
 
@@ -243,7 +265,10 @@ impl McpManager {
         self.inventory
             .list_prompts()
             .into_iter()
-            .map(|(_prompt_name, _server_name, prompt_info)| prompt_info)
+            .map(|(prompt_name, _server_name, mut prompt_info)| {
+                prompt_info.name = prompt_name;
+                prompt_info
+            })
             .collect()
     }
 
@@ -281,16 +306,38 @@ impl McpManager {
             .collect()
     }
 
-    /// Refresh inventory for a specific server
-    pub async fn refresh_server_inventory(&self, server_name: &str) -> McpResult<()> {
+    /// Refresh inventory for a specific server, specified by its static name or dynamic key.
+    pub async fn refresh_server_inventory(&self, server_id: &str) -> McpResult<()> {
         let client = self
-            .get_client(server_name)
+            .get_client(server_id)
             .await
-            .ok_or_else(|| McpError::ServerNotFound(server_name.to_string()))?;
+            .ok_or_else(|| McpError::ServerNotFound(server_id.to_string()))?;
 
-        info!("Refreshing inventory for server: {}", server_name);
-        self.load_server_inventory_internal(server_name, &client)
-            .await;
+        info!("Refreshing inventory for server: {}", server_id);
+
+        let (key, label) = if self.is_static_server(server_id) {
+            // For a static server, its ID is its name, which serves as both key and label.
+            (server_id.to_string(), server_id.to_string())
+        } else {
+            // For a dynamic server, the ID is its key (URL/command). We get the label from the pool.
+            let config = self
+                .connection_pool
+                .get_config(server_id)
+                .ok_or_else(|| McpError::ServerNotFound(server_id.to_string()))?;
+            // If the user didn't provide a label, fall back to the key.
+            let label = if config.name.is_empty() {
+                server_id.to_string()
+            } else {
+                config.name
+            };
+            (server_id.to_string(), label)
+        };
+
+        let identity = ServerIdentity { key, label };
+
+        // Clear old inventory and reload.
+        self.inventory.clear_server_tools(&identity.key);
+        Self::load_server_inventory(&self.inventory, &identity, &client).await;
         Ok(())
     }
 
@@ -473,79 +520,63 @@ impl McpManager {
     /// It discovers all tools, prompts, and resources from the client and caches them in the inventory.
     pub async fn load_server_inventory(
         inventory: &Arc<ToolInventory>,
-        server_key: &str,
+        identity: &ServerIdentity,
         client: &Arc<McpClient>,
     ) {
         // Tools
         match client.peer().list_all_tools().await {
             Ok(ts) => {
-                info!("Discovered {} tools from '{}'", ts.len(), server_key);
+                info!(
+                    "Discovered {} tools from server '{}' with label '{}'",
+                    ts.len(),
+                    identity.key,
+                    identity.label
+                );
                 for t in ts {
-                    inventory.insert_tool(t.name.to_string(), server_key.to_string(), t);
+                    let qualified_tool_name = qualify_name(&identity.label, &t.name);
+                    inventory.insert_tool(qualified_tool_name, identity.key.clone(), t);
                 }
             }
-            Err(e) => warn!("Failed to list tools from '{}': {}", server_key, e),
+            Err(e) => warn!("Failed to list tools from server '{}': {}", identity.key, e),
         }
 
         // Prompts
         match client.peer().list_all_prompts().await {
             Ok(ps) => {
-                info!("Discovered {} prompts from '{}'", ps.len(), server_key);
+                info!(
+                    "Discovered {} prompts from server '{}' with label '{}'",
+                    ps.len(),
+                    identity.key,
+                    identity.label
+                );
                 for p in ps {
-                    inventory.insert_prompt(p.name.clone(), server_key.to_string(), p);
+                    let qualified_prompt_name = qualify_name(&identity.label, &p.name);
+                    inventory.insert_prompt(qualified_prompt_name, identity.key.clone(), p);
                 }
             }
-            Err(e) => debug!("No prompts or failed to list on '{}': {}", server_key, e),
+            Err(e) => debug!(
+                "No prompts or failed to list on server '{}': {}",
+                identity.key, e
+            ),
         }
 
         // Resources
         match client.peer().list_all_resources().await {
             Ok(rs) => {
-                info!("Discovered {} resources from '{}'", rs.len(), server_key);
+                info!(
+                    "Discovered {} resources from server '{}' with label '{}'",
+                    rs.len(),
+                    identity.key,
+                    identity.label
+                );
                 for r in rs {
-                    inventory.insert_resource(r.uri.clone(), server_key.to_string(), r.raw);
+                    inventory.insert_resource(r.uri.clone(), identity.key.clone(), r.raw);
                 }
             }
-            Err(e) => debug!("No resources or failed to list on '{}': {}", server_key, e),
-        }
-    }
-
-    /// Discover and cache tools/prompts/resources for a connected server (internal wrapper)
-    async fn load_server_inventory_internal(&self, server_name: &str, client: &McpClient) {
-        // Tools
-        match client.peer().list_all_tools().await {
-            Ok(ts) => {
-                info!("Discovered {} tools from '{}'", ts.len(), server_name);
-                for t in ts {
-                    self.inventory
-                        .insert_tool(t.name.to_string(), server_name.to_string(), t);
-                }
-            }
-            Err(e) => warn!("Failed to list tools from '{}': {}", server_name, e),
-        }
-
-        // Prompts
-        match client.peer().list_all_prompts().await {
-            Ok(ps) => {
-                info!("Discovered {} prompts from '{}'", ps.len(), server_name);
-                for p in ps {
-                    self.inventory
-                        .insert_prompt(p.name.clone(), server_name.to_string(), p);
-                }
-            }
-            Err(e) => debug!("No prompts or failed to list on '{}': {}", server_name, e),
-        }
-
-        // Resources
-        match client.peer().list_all_resources().await {
-            Ok(rs) => {
-                info!("Discovered {} resources from '{}'", rs.len(), server_name);
-                for r in rs {
-                    self.inventory
-                        .insert_resource(r.uri.clone(), server_name.to_string(), r.raw);
-                }
-            }
-            Err(e) => debug!("No resources or failed to list on '{}': {}", server_name, e),
+            Err(e) => debug!(
+                "No resources or failed to list on server '{}': {}",
+                identity.key, e
+            ),
         }
     }
 

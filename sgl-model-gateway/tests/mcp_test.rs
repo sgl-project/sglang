@@ -77,8 +77,8 @@ async fn test_server_connection_with_mock() {
     let tools = manager.list_tools();
     assert_eq!(tools.len(), 2, "Should have 2 tools from mock server");
 
-    assert!(manager.has_tool("brave_web_search"));
-    assert!(manager.has_tool("brave_local_search"));
+    assert!(manager.has_tool("mock_server_brave_web_search"));
+    assert!(manager.has_tool("mock_server_brave_local_search"));
 
     manager.shutdown().await;
 }
@@ -105,11 +105,15 @@ async fn test_tool_availability_checking() {
 
     let manager = McpManager::with_defaults(config).await.unwrap();
 
-    let test_tools = vec!["brave_web_search", "brave_local_search", "calculator"];
+    let test_tools = vec![
+        "mock_server_brave_web_search",
+        "mock_server_brave_local_search",
+        "calculator",
+    ];
     for tool in test_tools {
         let available = manager.has_tool(tool);
         match tool {
-            "brave_web_search" | "brave_local_search" => {
+            "mock_server_brave_web_search" | "mock_server_brave_local_search" => {
                 assert!(
                     available,
                     "Tool {} should be available from mock server",
@@ -201,7 +205,7 @@ async fn test_tool_execution_with_mock() {
 
     let result = manager
         .call_tool(
-            "brave_web_search",
+            "mock_server_brave_web_search",
             Some(
                 json!({
                     "query": "rust programming",
@@ -258,8 +262,8 @@ async fn test_concurrent_tool_execution() {
 
     // Execute tools sequentially (true concurrent execution would require Arc<Mutex>)
     let tool_calls = vec![
-        ("brave_web_search", json!({"query": "test1"})),
-        ("brave_local_search", json!({"query": "test2"})),
+        ("mock_server_brave_web_search", json!({"query": "test1"})),
+        ("mock_server_brave_local_search", json!({"query": "test2"})),
     ];
 
     for (tool_name, args) in tool_calls {
@@ -373,10 +377,10 @@ async fn test_tool_info_structure() {
     let tools = manager.list_tools();
     let brave_search = tools
         .iter()
-        .find(|t| t.name.as_ref() == "brave_web_search")
+        .find(|t| t.name.as_ref() == "mock_server_brave_web_search")
         .expect("Should have brave_web_search tool");
 
-    assert_eq!(brave_search.name.as_ref(), "brave_web_search");
+    assert_eq!(brave_search.name.as_ref(), "mock_server_brave_web_search");
     assert!(brave_search
         .description
         .as_ref()
@@ -501,14 +505,14 @@ async fn test_complete_workflow() {
     assert_eq!(tools.len(), 2);
 
     // 5. Verify specific tools exist
-    assert!(manager.has_tool("brave_web_search"));
-    assert!(manager.has_tool("brave_local_search"));
+    assert!(manager.has_tool("integration_test_brave_web_search"));
+    assert!(manager.has_tool("integration_test_brave_local_search"));
     assert!(!manager.has_tool("nonexistent_tool"));
 
     // 6. Execute a tool
     let result = manager
         .call_tool(
-            "brave_web_search",
+            "integration_test_brave_web_search",
             Some(
                 json!({
                     "query": "SGLang router MCP integration",
