@@ -152,7 +152,7 @@ def test_mrope(
         num_tokens, num_heads, num_kv_heads, head_dim, max_position, dtype, device
     )
 
-    query_native, key_native = mrope_helper_class._forward_native(
+    query_native, key_native = mrope_helper_class.forward_native(
         positions,
         query.clone(),
         key.clone(),
