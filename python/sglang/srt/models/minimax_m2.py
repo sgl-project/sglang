@@ -166,7 +166,9 @@ def rms_sumsq_serial(x1: torch.Tensor, x2: torch.Tensor) -> torch.Tensor:
     stride_x1 = x1.stride(0)
     stride_x2 = x2.stride(0)
 
-    sum_sq = torch.empty(B + B2, device=x1.device, dtype=torch.float32)
+    B_padded = (B + B2 + 3) // 4 * 4  # align to 16 bytes
+
+    sum_sq = torch.empty(B_padded, device=x1.device, dtype=torch.float32)
 
     BLOCK_SIZE1 = triton.next_power_of_2(D1)
     BLOCK_SIZE2 = triton.next_power_of_2(D2)
@@ -285,7 +287,6 @@ class MiniMaxM2RMSNormTP(nn.Module):
         return x
 
     @staticmethod
-    @torch.compile(dynamic=True, backend=get_compiler_backend())
     def forward_qk(
         q_norm: "MiniMaxM2RMSNormTP",
         k_norm: "MiniMaxM2RMSNormTP",
