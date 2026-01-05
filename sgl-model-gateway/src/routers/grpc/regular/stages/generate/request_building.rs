@@ -52,10 +52,11 @@ impl PipelineStage for GenerateRequestBuildingStage {
 
         let generate_request = ctx.generate_request_arc();
 
-        // Get client for building request (use prefill client if PD mode)
+        // Get client for building request (use upstream stage client for PD/EPD)
         let builder_client = match clients {
             ClientSelection::Single { client } => client,
             ClientSelection::Dual { prefill, .. } => prefill,
+            ClientSelection::Triple { prefill, .. } => prefill,
         };
 
         // Build generate request
@@ -98,8 +99,19 @@ impl PipelineStage for GenerateRequestBuildingStage {
 
         // Inject PD metadata if needed
         if self.inject_pd_metadata {
-            if let WorkerSelection::Dual { prefill, .. } = ctx.state.workers.as_ref().unwrap() {
-                helpers::inject_bootstrap_metadata(&mut proto_request, prefill);
+            if let Some(prefill_worker) =
+                ctx.state
+                    .workers
+                    .as_ref()
+                    .and_then(|selection| match selection {
+                        WorkerSelection::Dual { prefill, .. } => Some(prefill),
+                        WorkerSelection::Triple { prefill, .. } => Some(prefill),
+                        _ => None,
+                    })
+            {
+                // Inject PD bootstrap metadata for prefill->decode KV cache transfer
+                // Note: For EPD mode, encode worker uses HTTP REST API, not gRPC bootstrap
+                helpers::inject_bootstrap_metadata(&mut proto_request, prefill_worker);
             }
         }
 
