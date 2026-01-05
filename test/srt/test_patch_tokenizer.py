@@ -11,27 +11,27 @@ from sglang.srt.utils.patch_tokenizer import (
 class TestPatchTokenizer(unittest.TestCase):
     def test_patch_unpatch_restores_original(self):
         tokenizer = AutoTokenizer.from_pretrained("gpt2")
-        cls = type(tokenizer)
+        c = type(tokenizer)
 
         original_ids = {
-            "all_special_tokens": id(cls.all_special_tokens.fget),
-            "all_special_ids": id(cls.all_special_ids.fget),
-            "add_special_tokens": id(cls.add_special_tokens),
-            "add_tokens": id(cls.add_tokens),
+            "all_special_tokens": id(c.all_special_tokens.fget),
+            "all_special_ids": id(c.all_special_ids.fget),
+            "add_special_tokens": id(c.add_special_tokens),
+            "add_tokens": id(c.add_tokens),
         }
 
         _SpecialTokensCachePatcher.patch(tokenizer)
-        self.assertTrue(getattr(cls, "_sglang_special_tokens_patched", False))
+        self.assertTrue(getattr(c, "_sglang_special_tokens_patched", False))
 
         unpatch_tokenizer(tokenizer)
-        self.assertFalse(getattr(cls, "_sglang_special_tokens_patched", False))
+        self.assertFalse(getattr(c, "_sglang_special_tokens_patched", False))
 
         self.assertEqual(
-            id(cls.all_special_tokens.fget), original_ids["all_special_tokens"]
+            id(c.all_special_tokens.fget), original_ids["all_special_tokens"]
         )
-        self.assertEqual(id(cls.all_special_ids.fget), original_ids["all_special_ids"])
-        self.assertEqual(id(cls.add_special_tokens), original_ids["add_special_tokens"])
-        self.assertEqual(id(cls.add_tokens), original_ids["add_tokens"])
+        self.assertEqual(id(c.all_special_ids.fget), original_ids["all_special_ids"])
+        self.assertEqual(id(c.add_special_tokens), original_ids["add_special_tokens"])
+        self.assertEqual(id(c.add_tokens), original_ids["add_tokens"])
 
     def test_patch_caches_special_tokens(self):
         tokenizer = AutoTokenizer.from_pretrained("gpt2")
