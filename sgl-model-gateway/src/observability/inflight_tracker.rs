@@ -19,7 +19,7 @@ struct AgeBuckets {
 
 impl AgeBuckets {
     fn new(bounds: &'static [u64]) -> Self {
-        let leak_str = |n: u64|  Box::leak(n.to_string().into_boxed_str()) as &'static str;
+        let leak_str = |n: u64| Box::leak(n.to_string().into_boxed_str()) as &'static str;
 
         let mut le_labels: Vec<&'static str> = bounds.iter().map(|&b| leak_str(b)).collect();
         le_labels.push("+Inf");
