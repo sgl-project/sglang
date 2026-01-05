@@ -9,21 +9,21 @@ you encounter issues or have any questions, please [open an issue](https://githu
 
 | Model         | Hardware      | CardNum | Deploy Mode   | Dataset   | Quantization | TPOT(ms) | Output TPS(per card) | Configuration                                            |
 |---------------|---------------|---------|---------------|-----------|--------------|:--------:|:--------------------:|----------------------------------------------------------|
-| Deepseek-R1   | Atlas 800I A3 | 32      | PD Separation | 6K-1.6K   | W8A8         |  19.81   |        36.906        | [Optimal Configuration](#DeepSeek-R1-Low-Latency-20ms-1) |
-| Deepseek-R1   | Atlas 800I A3 | 32      | PD Separation | 3.9K-1K   | W8A8         |  19.77   |        35.625        | [Optimal Configuration](#DeepSeek-R1-Low-Latency-20ms-2) |
-| Deepseek-R1   | Atlas 800I A3 | 32      | PD Separation | 3.5K-1.5K | W8A8         |  19.92   |        36.980        | [Optimal Configuration](#DeepSeek-R1-Low-Latency-20ms-3) |
-| Deepseek-R1   | Atlas 800I A3 | 32      | PD Separation | 3.5K-1K   | W8A8         |  19.52   |        36.344        | [Optimal Configuration](#DeepSeek-R1-Low-Latency-20ms-4) |
-| Deepseek-V3.2 | Atlas 800I A3 | 32      | PD Separation | 64K-1K    | W8A8         |  25.36   |        14.74         | [Optimal Configuration](#Deepseek-V32-Low-Latency-30ms)  |
+| Deepseek-R1   | Atlas 800I A3 | 32      | PD Separation | 6K-1.6K   | W8A8         |  19.81   |        36.906        | [Optimal Configuration](#deepSeek-r1-low-latency-20ms-1) |
+| Deepseek-R1   | Atlas 800I A3 | 32      | PD Separation | 3.9K-1K   | W8A8         |  19.77   |        35.625        | [Optimal Configuration](#deepSeek-r1-low-latency-20ms-2) |
+| Deepseek-R1   | Atlas 800I A3 | 32      | PD Separation | 3.5K-1.5K | W8A8         |  19.92   |        36.980        | [Optimal Configuration](#deepSeek-r1-low-latency-20ms-3) |
+| Deepseek-R1   | Atlas 800I A3 | 32      | PD Separation | 3.5K-1K   | W8A8         |  19.52   |        36.344        | [Optimal Configuration](#deepSeek-r1-low-latency-20ms-4) |
+| Deepseek-V3.2 | Atlas 800I A3 | 32      | PD Separation | 64K-1K    | W8A8         |  25.36   |        14.74         | [Optimal Configuration](#deepseek-v32-low-latency-30ms)  |
 
 ### High Throughput
 
 | Model       | Hardware      | CardNum | Deploy Mode   | Dataset   | Quantization | TPOT(ms) | Output TPS(per card) | Configuration                                                 |
 |-------------|---------------|---------|---------------|-----------|--------------|:--------:|:--------------------:|---------------------------------------------------------------|
-| Deepseek-R1 | Atlas 800I A3 | 32      | PD Separation | 3.5K-1.5K | W8A8         |  48.10   |       396.796        | [Optimal Configuration](#DeepSeek-R1-High-Performance-50ms-1) |
-| Deepseek-R1 | Atlas 800I A3 | 8       | PD Mixed      | 2K-2K     | W4A8         |  49.67   |       528.375        | [Optimal Configuration](#DeepSeek-R1-High-Performance-50ms-2) |
-| Deepseek-R1 | Atlas 800I A3 | 16      | PD Separation | 2K-2K     | W4A8         |  47.76   |       452.227        | [Optimal Configuration](#DeepSeek-R1-High-Performance-50ms-3) |
-| Deepseek-R1 | Atlas 800I A3 | 8       | PD Mixed      | 3.5K-1.5K | W4A8         |  49.77   |       312.077        | [Optimal Configuration](#DeepSeek-R1-High-Performance-50ms-4) |
-| Deepseek-R1 | Atlas 800I A3 | 16      | PD Separation | 3.5K-1.5K | W4A8         |  49.43   |       361.500        | [Optimal Configuration](#DeepSeek-R1-High-Performance-50ms-5) |
+| Deepseek-R1 | Atlas 800I A3 | 32      | PD Separation | 3.5K-1.5K | W8A8         |  48.10   |       396.796        | [Optimal Configuration](#deepSeek-r1-high-performance-50ms-1) |
+| Deepseek-R1 | Atlas 800I A3 | 8       | PD Mixed      | 2K-2K     | W4A8         |  49.67   |       528.375        | [Optimal Configuration](#deepSeek-r1-high-performance-50ms-2) |
+| Deepseek-R1 | Atlas 800I A3 | 16      | PD Separation | 2K-2K     | W4A8         |  47.76   |       452.227        | [Optimal Configuration](#deepSeek-r1-high-performance-50ms-3) |
+| Deepseek-R1 | Atlas 800I A3 | 8       | PD Mixed      | 3.5K-1.5K | W4A8         |  49.77   |       312.077        | [Optimal Configuration](#deepSeek-r1-high-performance-50ms-4) |
+| Deepseek-R1 | Atlas 800I A3 | 16      | PD Separation | 3.5K-1.5K | W4A8         |  49.43   |       361.500        | [Optimal Configuration](#deepSeek-r1-high-performance-50ms-5) |
 
 ## Qwen Series Models
 
@@ -31,30 +31,30 @@ you encounter issues or have any questions, please [open an issue](https://githu
 
 | Model      | Hardware      | CardNum | Deploy Mode | Dataset | Quantization | TPOT(ms) | Output TPS(per card) | Configuration                                           |
 |------------|---------------|---------|-------------|---------|--------------|:--------:|:--------------------:|---------------------------------------------------------|
-| Qwen3-235B | Atlas 800I A3 | 8       | PD Mixed    | 11K-1K  | BF16         |   9.70   |        11.690        | [Optimal Configuration](#Qwen3-235B-Low-Latency-10ms)   |
-| Qwen3-32B  | Atlas 800I A3 | 4       | PD Mixed    | 6K-1.5K | W8A8         |  16.87   |       311.750        | [Optimal Configuration](#Qwen3-32B-Low-Latency-18m)     |
-| Qwen3-32B  | Atlas 800I A3 | 4       | PD Mixed    | 4K-1.5K | BF16         |   9.46   |        25.850        | [Optimal Configuration](#Qwen3-32B-Low-Latency-11m)     |
-| Qwen3-32B  | Atlas 800I A3 | 8       | PD Mixed    | 18K-4K  | BF16         |  12.27   |        9.955         | [Optimal Configuration](#Qwen3-32B-Low-Latency-12m)     |
-| Qwen3-32B  | Atlas 800I A2 | 8       | PD Mixed    | 6K-1.5K | W8A8         |  16.46   |         296          | [Optimal Configuration](#Qwen3-32B-A2-Low-Latency-18m)  |
-| Qwen3-32B  | Atlas 800I A2 | 8       | PD Mixed    | 4K-1.5K | BF16         |  10.18   |          12          | [Optimal Configuration](#Qwen3-32B-A2-Low-Latency-11ms) |
+| Qwen3-235B | Atlas 800I A3 | 8       | PD Mixed    | 11K-1K  | BF16         |   9.70   |        11.690        | [Optimal Configuration](#qwen3-235b-low-latency-10ms)   |
+| Qwen3-32B  | Atlas 800I A3 | 4       | PD Mixed    | 6K-1.5K | W8A8         |  16.87   |       311.750        | [Optimal Configuration](#qwen3-32b-low-latency-18ms)    |
+| Qwen3-32B  | Atlas 800I A3 | 4       | PD Mixed    | 4K-1.5K | BF16         |   9.46   |        25.850        | [Optimal Configuration](#qwen3-32b-low-latency-11ms)    |
+| Qwen3-32B  | Atlas 800I A3 | 8       | PD Mixed    | 18K-4K  | BF16         |  12.27   |        9.955         | [Optimal Configuration](#qwen3-32b-low-latency-12ms)    |
+| Qwen3-32B  | Atlas 800I A2 | 8       | PD Mixed    | 6K-1.5K | W8A8         |  16.46   |         296          | [Optimal Configuration](#qwen3-32b-a2-low-latency-18ms) |
+| Qwen3-32B  | Atlas 800I A2 | 8       | PD Mixed    | 4K-1.5K | BF16         |  10.18   |          12          | [Optimal Configuration](#qwen3-32b-a2-low-latency-11ms) |
 
 ### High Throughput
 
 | Model      | Hardware      | CardNum | Deploy Mode   | Dataset   | Quantization | TPOT(ms) | Output TPS(per card) | Configuration                                                 |
 |------------|---------------|---------|---------------|-----------|--------------|:--------:|:--------------------:|---------------------------------------------------------------|
-| Qwen3-235B | Atlas 800I A3 | 24      | PD Separation | 3.5K-1.5K | W8A8         |  40.75   |       467.416        | [Optimal Configuration](#Qwen3-235B-High-Throughput-50ms-1)   |
-| Qwen3-235B | Atlas 800I A3 | 8       | PD Mixed      | 3.5K-1.5K | W8A8         |  51.51   |       477.625        | [Optimal Configuration](#Qwen3-235B-High-Throughput-50ms-2)   |
-| Qwen3-235B | Atlas 800I A3 | 8       | PD Mixed      | 2K-2K     | W8A8         |  54.78   |       790.071        | [Optimal Configuration](#Qwen3-235B-High-Throughput-50ms-3)   |
-| Qwen3-235B | Atlas 800I A3 | 16      | PD Mixed      | 2K-2K     | W8A8         |  50.12   |       519.625        | [Optimal Configuration](#Qwen3-235B-High-Throughput-50ms-4)   |
-| Qwen3-32B  | Atlas 800I A3 | 2       | PD Mixed      | 3.5K-1.5K | W8A8         |  49.20   |       707.500        | [Optimal Configuration](#Qwen3-32B-High-Throughput-50ms-1)    |
-| Qwen3-32B  | Atlas 800I A3 | 2       | PD Mixed      | 2K-2K     | W8A8         |  48.30   |       986.150        | [Optimal Configuration](#Qwen3-32B-High-Throughput-50ms-2)    |
-| Qwen3-30B  | Atlas 800I A3 | 1       | PD Mixed      | 3.5K-1.5K | W8A8         |  44.35   |       3166.030       | [Optimal Configuration](#Qwen3-32B-High-Throughput-50ms-3)    |
-| Qwen3-480B | Atlas 800I A3 | 24      | PD Separation | 3.5K-1.5K | W8A8         |  48.27   |       266.250        | [Optimal Configuration](#Qwen3-480B-High-Throughput-50ms-1)   |
-| Qwen3-480B | Atlas 800I A3 | 16      | PD Mixed      | 3.5K-1.5K | W8A8         |  50.34   |       289.813        | [Optimal Configuration](#Qwen3-480B-High-Throughput-50ms-2)   |
-| Qwen3-480B | Atlas 800I A3 | 8       | PD Mixed      | 3.5K-1.5K | W8A8         |  48.20   |       187.500        | [Optimal Configuration](#Qwen3-480B-High-Throughput-50ms-3)   |
-| Qwen3-Next | Atlas 800I A3 | 2       | PD Mixed      | 3.5K-1.5K | W8A8         |  49.91   |        702.83        | [Optimal Configuration](#Qwen3-Next-High-Throughput-50ms)     |                                                         |
-| Qwen3-32B  | Atlas 800I A2 | 8       | PD Mixed      | 3.5K-1.5K | W8A8         |  48.97   |        348.75        | [Optimal Configuration](#Qwen3-32B-A2-High-Throughput-50ms-1) |
-| Qwen3-32B  | Atlas 800I A2 | 8       | PD Mixed      | 2K-2K     | W8A8         |  45.88   |         512          | [Optimal Configuration](#Qwen3-32B-A2-High-Throughput-50ms-2) |
+| Qwen3-235B | Atlas 800I A3 | 24      | PD Separation | 3.5K-1.5K | W8A8         |  40.75   |       467.416        | [Optimal Configuration](#qwen3-235b-high-throughput-50ms-1)   |
+| Qwen3-235B | Atlas 800I A3 | 8       | PD Mixed      | 3.5K-1.5K | W8A8         |  51.51   |       477.625        | [Optimal Configuration](#qwen3-235b-high-throughput-50ms-2)   |
+| Qwen3-235B | Atlas 800I A3 | 8       | PD Mixed      | 2K-2K     | W8A8         |  54.78   |       790.071        | [Optimal Configuration](#qwen3-235b-high-throughput-50ms-3)   |
+| Qwen3-235B | Atlas 800I A3 | 16      | PD Mixed      | 2K-2K     | W8A8         |  50.12   |       519.625        | [Optimal Configuration](#qwen3-235b-high-throughput-50ms-4)   |
+| Qwen3-32B  | Atlas 800I A3 | 2       | PD Mixed      | 3.5K-1.5K | W8A8         |  49.20   |       707.500        | [Optimal Configuration](#qwen3-32b-high-throughput-50ms-1)    |
+| Qwen3-32B  | Atlas 800I A3 | 2       | PD Mixed      | 2K-2K     | W8A8         |  48.30   |       986.150        | [Optimal Configuration](#qwen3-32b-high-throughput-50ms-2)    |
+| Qwen3-30B  | Atlas 800I A3 | 1       | PD Mixed      | 3.5K-1.5K | W8A8         |  44.35   |       3166.030       | [Optimal Configuration](#qwen3-32b-high-throughput-50ms-3)    |
+| Qwen3-480B | Atlas 800I A3 | 24      | PD Separation | 3.5K-1.5K | W8A8         |  48.27   |       266.250        | [Optimal Configuration](#qwen3-480b-high-throughput-50ms-1)   |
+| Qwen3-480B | Atlas 800I A3 | 16      | PD Mixed      | 3.5K-1.5K | W8A8         |  50.34   |       289.813        | [Optimal Configuration](#qwen3-480b-high-throughput-50ms-2)   |
+| Qwen3-480B | Atlas 800I A3 | 8       | PD Mixed      | 3.5K-1.5K | W8A8         |  48.20   |       187.500        | [Optimal Configuration](#qwen3-480b-high-throughput-50ms-3)   |
+| Qwen3-Next | Atlas 800I A3 | 2       | PD Mixed      | 3.5K-1.5K | W8A8         |  49.91   |        702.83        | [Optimal Configuration](#qwen3-next-high-throughput-50ms)     |                                                         |
+| Qwen3-32B  | Atlas 800I A2 | 8       | PD Mixed      | 3.5K-1.5K | W8A8         |  48.97   |        348.75        | [Optimal Configuration](#qwen3-32b-a2-high-throughput-50ms-1) |
+| Qwen3-32B  | Atlas 800I A2 | 8       | PD Mixed      | 2K-2K     | W8A8         |  45.88   |         512          | [Optimal Configuration](#qwen3-32b-a2-high-throughput-50ms-2) |
 
 ## Optimal Configuration
 
@@ -372,7 +372,7 @@ TPOT: 20ms
 
 #### Model Deployment
 
-Please Turn to [DeepSeek R1 Low Latency 20ms](#DeepSeek-R1-Low-Latency-20ms-1)
+Please Turn to [DeepSeek R1 Low Latency 20ms](#deepSeek-r1-low-latency-20ms-1)
 
 #### Benchmark
 
@@ -432,7 +432,7 @@ TPOT: 20ms
 
 #### Model Deployment
 
-Please Turn to [DeepSeek R1 Low Latency 20ms](#DeepSeek-R1-Low-Latency-20ms-1)
+Please Turn to [DeepSeek R1 Low Latency 20ms](#deepSeek-r1-low-latency-20ms-1)
 
 #### Benchmark
 
@@ -493,7 +493,7 @@ TPOT: 20ms
 
 #### Model Deployment
 
-Please Turn to [DeepSeek R1 Low Latency 20ms](#DeepSeek-R1-Low-Latency-20ms-1)
+Please Turn to [DeepSeek R1 Low Latency 20ms](#deepSeek-r1-low-latency-20ms-1)
 
 #### Benchmark
 
@@ -2065,7 +2065,7 @@ P99 ITL (ms): 14.99
 Max ITL (ms): 19.83
 ```
 
-### Qwen3 32B Low Latency 18m
+### Qwen3 32B Low Latency 18ms
 
 Model: Qwen3 32B
 
@@ -2176,7 +2176,7 @@ P99 ITL (ms): 32.62
 Max ITL (ms): 7912.53
 ```
 
-### Qwen3 32B Low Latency 11m
+### Qwen3 32B Low Latency 11ms
 
 Model: Qwen3 32B
 
@@ -2286,7 +2286,7 @@ P99 ITL (ms): 20.73
 Max ITL (ms): 33.84
 ```
 
-### Qwen3 32B Low Latency 12m
+### Qwen3 32B Low Latency 12ms
 
 Model: Qwen3 32B
 
@@ -3192,7 +3192,7 @@ P99 ITL (ms): 46.08
 Max ITL (ms): 17803.50
 ```
 
-### Qwen3 32B A2 Low Latency 18m
+### Qwen3 32B A2 Low Latency 18ms
 
 Model: Qwen3 32B
 
