@@ -33,7 +33,13 @@ class TestPrefillDelayerThroughput(CustomTestCase):
         self._run_throughput_test(
             debug_name=f"online_serving ({prefill_delayer=})",
             prefill_delayer=prefill_delayer,
-            other_launch_args=["--mem-fraction-static", "0.6"],
+            other_launch_args=[
+                "--mem-fraction-static",
+                "0.6",
+                # Not really needed, only to test support non-FCFS algorithms
+                "--schedule-policy",
+                "lpm",
+            ],
             other_benchmark_args=dict(
                 num_prompts=500,
                 random_input_len=30000,
@@ -74,7 +80,7 @@ class TestPrefillDelayerThroughput(CustomTestCase):
             prefill_delayer=prefill_delayer,
             model=model,
             base_url=base_url,
-            other_args=["--schedule-policy", "lpm", *other_launch_args],
+            other_args=other_launch_args,
         )
 
         try:
