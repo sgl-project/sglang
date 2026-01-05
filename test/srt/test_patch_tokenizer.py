@@ -71,7 +71,7 @@ class TestPatchTokenizer(unittest.TestCase):
 
         with self.assertRaises(AssertionError) as ctx:
             tokenizer.add_special_tokens({"pad_token": "<pad>"})
-        self.assertIn("Cannot modify special tokens after patch", str(ctx.exception))
+        self.assertIn("Cannot call add_special_tokens after patch", str(ctx.exception))
 
         unpatch_tokenizer(tokenizer)
 
@@ -81,7 +81,7 @@ class TestPatchTokenizer(unittest.TestCase):
 
         with self.assertRaises(AssertionError) as ctx:
             tokenizer.add_tokens(["<new>"], special_tokens=True)
-        self.assertIn("Cannot add special tokens after patch", str(ctx.exception))
+        self.assertIn("Cannot call add_tokens", str(ctx.exception))
 
         tokenizer.add_tokens(["<regular>"], special_tokens=False)
 
