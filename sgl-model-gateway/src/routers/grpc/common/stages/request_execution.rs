@@ -2,16 +2,21 @@
 
 use async_trait::async_trait;
 use axum::response::Response;
-use tracing::{error, info_span, Instrument};
+use tracing::{debug, error, info_span, warn, Instrument};
 
-use super::PipelineStage;
-use crate::routers::{
-    error,
-    grpc::{
-        context::{ClientSelection, ExecutionResult, LoadGuards, RequestContext, WorkerSelection},
-        proto_wrapper::{
-            ProtoEmbedRequest, ProtoEmbedResponseVariant, ProtoGenerateRequest, ProtoRequest,
-            ProtoStream,
+use super::{helpers, PipelineStage};
+use crate::{
+    grpc_client::encoder_proto,
+    routers::{
+        error,
+        grpc::{
+            context::{
+                ClientSelection, ExecutionResult, LoadGuards, RequestContext, WorkerSelection,
+            },
+            proto_wrapper::{
+                ProtoEmbedRequest, ProtoEmbedResponseVariant, ProtoGenerateRequest, ProtoRequest,
+                ProtoStream,
+            },
         },
     },
 };
@@ -29,6 +34,8 @@ pub(crate) enum ExecutionMode {
     Single,
     /// PD mode: dual dispatch to prefill + decode workers
     DualDispatch,
+    /// EPD mode: encode + prefill + decode workers
+    TripleDispatch,
 }
 
 impl RequestExecutionStage {
@@ -103,6 +110,10 @@ impl PipelineStage for RequestExecutionStage {
                     ExecutionMode::Single => self.execute_single(req, clients, workers).await,
                     ExecutionMode::DualDispatch => {
                         self.execute_dual_dispatch(req, clients, workers).await
+                    }
+                    ExecutionMode::TripleDispatch => {
+                        self.execute_triple_dispatch(req, clients, Some(workers))
+                            .await
                     }
                 },
                 ProtoRequest::Embed(req) => self.execute_single_embed(req, clients).await,
@@ -232,6 +243,135 @@ impl RequestExecutionStage {
             )
         })?;
 
+        let result =
+            Self::execute_prefill_decode_grpc(proto_request, prefill_client, decode_client).await;
+
+        // Record circuit breaker outcomes for each worker
+        workers.record_dual_outcomes(result.is_ok(), result.is_ok());
+
+        result
+    }
+
+    /// Execute triple dispatch for EPD (Encode-Prefill-Decode) mode
+    ///
+    /// EPD Flow with gRPC Encode + gRPC Prefill/Decode:
+    /// 1. Extract multimodal items from request
+    /// 2. Call encode worker gRPC Encode() RPC (wait for ack)
+    /// 3. Encode worker processes images and sends embeddings to prefill via ZMQ
+    /// 4. Send gRPC requests to prefill and decode workers in parallel
+    /// 5. Prefill receives embeddings via ZMQ, computes KV cache, sends to decode
+    /// 6. Decode generates output tokens
+    ///
+    /// Returns ExecutionResult::Dual since encode doesn't produce a streaming response.
+    async fn execute_triple_dispatch(
+        &self,
+        mut proto_request: ProtoGenerateRequest,
+        clients: &mut ClientSelection,
+        workers: Option<&WorkerSelection>,
+    ) -> Result<ExecutionResult, Response> {
+        let (encode_client, prefill_client, decode_client) =
+            clients.triple_mut().ok_or_else(|| {
+                error!(
+                    function = "execute_triple_dispatch",
+                    "Expected triple clients but selection differed"
+                );
+                error::internal_error(
+                    "expected_encode/prefill/decode_clients_but_selection_differed",
+                    "Expected encode/prefill/decode clients but selection differed",
+                )
+            })?;
+
+        let prefill_worker = workers.and_then(|w| w.prefill_worker()).ok_or_else(|| {
+            error!(
+                function = "execute_triple_dispatch",
+                "Prefill worker not found in context"
+            );
+            error::internal_error(
+                "prefill_worker_not_found",
+                "Prefill worker not found in context",
+            )
+        })?;
+
+        let request_id = uuid::Uuid::new_v4().to_string();
+
+        // Extract multimodal items for encode worker
+        let mm_items = helpers::extract_multimodal_items(&proto_request);
+
+        if mm_items.is_empty() {
+            // No multimodal content - fall back to PD mode
+            warn!(
+                request_id = %request_id,
+                "EPD mode but no multimodal content - falling back to PD mode"
+            );
+            // Clear mm_inputs and proceed with PD-like dual dispatch
+            helpers::clear_multimodal_inputs(&mut proto_request);
+            return Self::execute_prefill_decode_grpc(proto_request, prefill_client, decode_client)
+                .await;
+        }
+
+        debug!(
+            request_id = %request_id,
+            mm_items_count = mm_items.len(),
+            "EPD dispatch: calling encode worker gRPC endpoint"
+        );
+
+        // Step 1: Call encode worker gRPC Encode() RPC
+        let encode_request = encoder_proto::EncodeRequest {
+            mm_items,
+            req_id: request_id.clone(),
+            num_parts: 1, // Single encode worker for now
+            part_idx: 0,
+            prefill_host: prefill_worker.bootstrap_host().to_string(),
+            embedding_port: vec![], // Let runtime allocate ZMQ ports dynamically
+        };
+
+        if let Err(e) = encode_client.encode(encode_request).await {
+            error!(
+                request_id = %request_id,
+                error = %e,
+                "Encode worker gRPC call failed"
+            );
+            if let Some(w) = workers {
+                w.record_triple_outcomes(false, true, true);
+            }
+            return Err(error::internal_error(
+                "encode_worker_grpc_failed",
+                format!("Encode worker gRPC call failed: {}", e),
+            ));
+        }
+
+        debug!(
+            request_id = %request_id,
+            "Encode gRPC call completed - embeddings being sent via ZMQ"
+        );
+
+        // Step 2: Clear multimodal inputs from prefill request
+        helpers::clear_multimodal_inputs(&mut proto_request);
+
+        // Step 3: Mark request as waiting for image embeddings
+        Self::set_wait_for_image(&mut proto_request, true);
+
+        // Step 4: Execute prefill and decode in parallel via gRPC
+        let result =
+            Self::execute_prefill_decode_grpc(proto_request, prefill_client, decode_client).await;
+
+        // Record circuit breaker outcomes for all workers
+        if let Some(w) = workers {
+            // Encode succeeded (we got here), prefill/decode success based on result
+            w.record_triple_outcomes(true, result.is_ok(), result.is_ok());
+        }
+
+        result
+    }
+
+    /// Execute gRPC requests to prefill and decode workers in parallel
+    ///
+    /// Shared logic for PD mode and EPD mode (after encode completes).
+    async fn execute_prefill_decode_grpc(
+        proto_request: ProtoGenerateRequest,
+        prefill_client: &mut crate::routers::grpc::client::GrpcClient,
+        decode_client: &mut crate::routers::grpc::client::GrpcClient,
+    ) -> Result<ExecutionResult, Response> {
         let prefill_request = proto_request.clone_inner();
         let decode_request = proto_request;
 
@@ -240,44 +380,45 @@ impl RequestExecutionStage {
             decode_client.generate(decode_request)
         );
 
-        // Record circuit breaker outcomes for each worker individually
-        workers.record_dual_outcomes(prefill_result.is_ok(), decode_result.is_ok());
-
         // Handle prefill result
-        let prefill_stream = match prefill_result {
-            Ok(s) => s,
-            Err(e) => {
-                error!(
-                    function = "execute_dual_dispatch",
-                    error = %e,
-                    "Prefill worker failed to start"
-                );
-                return Err(error::internal_error(
-                    "prefill_worker_failed_to_start",
-                    format!("Prefill worker failed to start: {}", e),
-                ));
-            }
-        };
+        let prefill_stream = prefill_result.map_err(|e| {
+            error!(
+                function = "execute_prefill_decode_grpc",
+                error = %e,
+                "Prefill worker failed to start"
+            );
+            error::internal_error(
+                "prefill_worker_failed_to_start",
+                format!("Prefill worker failed to start: {}", e),
+            )
+        })?;
 
         // Handle decode result
-        let decode_stream = match decode_result {
-            Ok(s) => s,
-            Err(e) => {
-                error!(
-                    function = "execute_dual_dispatch",
-                    error = %e,
-                    "Decode worker failed to start"
-                );
-                return Err(error::internal_error(
-                    "decode_worker_failed_to_start",
-                    format!("Decode worker failed to start: {}", e),
-                ));
-            }
-        };
+        let decode_stream = decode_result.map_err(|e| {
+            error!(
+                function = "execute_prefill_decode_grpc",
+                error = %e,
+                "Decode worker failed to start"
+            );
+            error::internal_error(
+                "decode_worker_failed_to_start",
+                format!("Decode worker failed to start: {}", e),
+            )
+        })?;
 
         Ok(ExecutionResult::Dual {
             prefill: prefill_stream,
             decode: Box::new(decode_stream),
         })
+    }
+
+    /// Set the need_wait_for_image flag on a proto request
+    ///
+    /// This tells the prefill scheduler to wait for image embeddings
+    /// from the encode worker via ZMQ before processing.
+    fn set_wait_for_image(proto_request: &mut ProtoGenerateRequest, wait: bool) {
+        if let ProtoGenerateRequest::Sglang(req) = proto_request {
+            req.need_wait_for_image = Some(wait);
+        }
     }
 }
