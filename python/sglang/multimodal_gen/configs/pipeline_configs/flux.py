@@ -607,3 +607,259 @@ class Flux2PipelineConfig(FluxPipelineConfig):
         # remove noise over input image
         noise = noise[:, : latents.size(1) :]
         return noise
+
+
+def _prepare_kontext_latent_ids(
+    latents: torch.Tensor,  # (B, C, H, W)
+    t_coord: int = 0,
+):
+    """
+    Generates position coordinates for Flux Kontext latent tensors.
+
+    Args:
+        latents: Latent tensor of shape (B, C, H, W) or (B, C, T, H, W)
+        t_coord: Time coordinate (0 for noise latents, 1 for image latents)
+
+    Returns:
+        torch.Tensor: Position IDs tensor of shape (H//2 * W//2, 3)
+    """
+    # Handle both 4D and 5D tensors
+    if latents.ndim == 5:
+        latents = latents.squeeze(2)
+
+    _, _, height, width = latents.shape
+    # Flux uses packed latents, so height and width are halved
+    height = height // 2
+    width = width // 2
+
+    latent_image_ids = torch.zeros(height, width, 3)
+    latent_image_ids[..., 0] = t_coord  # time coordinate
+    latent_image_ids[..., 1] = torch.arange(height)[:, None]
+    latent_image_ids[..., 2] = torch.arange(width)[None, :]
+
+    latent_image_ids = latent_image_ids.reshape(height * width, 3)
+    return latent_image_ids
+
+
+@dataclass
+class FluxKontextPipelineConfig(FluxPipelineConfig):
+    """Configuration for the FLUX Kontext pipeline (Image-to-Image editing)."""
+
+    task_type: ModelTaskType = ModelTaskType.I2I
+
+    # Preferred resolutions for Flux Kontext (from official HuggingFace implementation)
+    PREFERRED_KONTEXT_RESOLUTIONS = [
+        (672, 1568),
+        (688, 1504),
+        (720, 1456),
+        (752, 1392),
+        (800, 1328),
+        (832, 1248),
+        (880, 1184),
+        (944, 1104),
+        (1024, 1024),
+        (1104, 944),
+        (1184, 880),
+        (1248, 832),
+        (1328, 800),
+        (1392, 752),
+        (1456, 720),
+        (1504, 688),
+        (1568, 672),
+    ]
+
+    def calculate_condition_image_size(
+        self, image, width, height
+    ) -> Optional[tuple[int, int]]:
+        """Calculate target size for condition image.
+
+        For Kontext, the input image will be resized to match the output dimensions.
+        This method returns the image's original size - the actual target size
+        will be determined based on batch.width/batch.height in the pipeline.
+        """
+        # Return original size; actual resizing happens in preprocess_condition_image
+        # using the output dimensions from batch
+        if width is not None and height is not None:
+            return width, height
+        return None
+
+    def prepare_calculated_size(self, image):
+        """Prepare calculated size based on input image aspect ratio.
+
+        Following official Flux Kontext implementation:
+        Find the best matching resolution from PREFERRED_KONTEXT_RESOLUTIONS
+        based on input image aspect ratio, then align to multiple of 16.
+        """
+        if image is None:
+            return None
+
+        vae_scale_factor = self.vae_config.arch_config.vae_scale_factor
+        multiple_of = vae_scale_factor * 2  # 16 for Flux
+
+        image_width, image_height = image.width, image.height
+        aspect_ratio = image_width / image_height
+
+        # Find the closest matching resolution (official implementation)
+        _, best_width, best_height = min(
+            (abs(aspect_ratio - w / h), w, h)
+            for w, h in self.PREFERRED_KONTEXT_RESOLUTIONS
+        )
+
+        # Align to multiple of 16
+        best_width = best_width // multiple_of * multiple_of
+        best_height = best_height // multiple_of * multiple_of
+
+        return best_width, best_height
+
+    def preprocess_condition_image(
+        self, image, target_width, target_height, vae_image_processor
+    ):
+        """Preprocess condition image for VAE encoding.
+
+        Following official Flux Kontext implementation:
+        1. Get input image aspect ratio (using get_default_height_width for consistency)
+        2. Find the closest matching resolution from PREFERRED_KONTEXT_RESOLUTIONS
+        3. Align to multiple of 16
+        4. Resize and preprocess
+
+        Note: target_width and target_height are ignored for Kontext pipeline,
+        as it uses its own resolution selection based on PREFERRED_KONTEXT_RESOLUTIONS.
+        """
+        if vae_image_processor is None:
+            raise ValueError("vae_image_processor cannot be None for Kontext pipeline")
+
+        vae_scale_factor = self.vae_config.arch_config.vae_scale_factor
+        multiple_of = vae_scale_factor * 2  # 16 for Flux
+
+        # Get input image dimensions using get_default_height_width for consistency with official impl
+        # This aligns dimensions to vae_scale_factor multiples before calculating aspect ratio
+        image_height, image_width = vae_image_processor.get_default_height_width(image)
+        aspect_ratio = image_width / image_height
+
+        # Find the closest matching resolution from PREFERRED_KONTEXT_RESOLUTIONS
+        # Official: (abs(aspect_ratio - w / h), w, h) for w, h in PREFERRED_KONTEXT_RESOLUTIONS
+        _, image_width, image_height = min(
+            (abs(aspect_ratio - w / h), w, h)
+            for w, h in self.PREFERRED_KONTEXT_RESOLUTIONS
+        )
+
+        # Align to multiple of 16
+        image_width = image_width // multiple_of * multiple_of
+        image_height = image_height // multiple_of * multiple_of
+
+        # Resize image using vae_image_processor (official uses self.image_processor.resize)
+        # Note: resize takes (height, width) order
+        img = vae_image_processor.resize(image, height=image_height, width=image_width)
+
+        # Preprocess image (official uses self.image_processor.preprocess)
+        # Note: preprocess takes (height, width) order, same as resize
+        img = vae_image_processor.preprocess(
+            img, height=image_height, width=image_width
+        )
+
+        return img, (image_width, image_height)
+
+    def postprocess_image_latent(self, latent_condition, batch):
+        """Process encoded image latent for Kontext pipeline.
+
+        For Kontext, we pack the image latents the same way as noise latents
+        and prepare position IDs with t=1 coordinate.
+
+        Note: Input image and output image can have different sizes.
+        They are concatenated along the sequence dimension (L).
+        """
+        batch_size = batch.batch_size
+
+        # Handle both 4D (B, C, H, W) and 5D (B, C, T, H, W) tensors
+        if latent_condition.ndim == 5:
+            # Squeeze the time dimension for image task (T=1)
+            latent_condition = latent_condition.squeeze(2)
+
+        _, num_channels, latent_height, latent_width = latent_condition.shape
+
+        # Prepare image latent position IDs (with t=1 coordinate)
+        image_latent_ids = _prepare_kontext_latent_ids(latent_condition, t_coord=1)
+        image_latent_ids = image_latent_ids.unsqueeze(0).expand(batch_size, -1, -1)
+        image_latent_ids = image_latent_ids.to(get_local_torch_device())
+        batch.condition_image_latent_ids = image_latent_ids
+
+        # Pack latents using the actual input image latent dimensions, NOT batch.height/width
+        # Input: (B, C, H, W) -> Output: (B, H*W/4, C*4)
+        # Use _pack_latents directly with the correct dimensions from latent_condition
+        packed = _pack_latents(
+            latent_condition,
+            batch_size,
+            num_channels,  # Use actual channels from latent
+            latent_height,  # Use actual height from latent (NOT batch.height)
+            latent_width,  # Use actual width from latent (NOT batch.width)
+        )
+
+        # Expand for batch size if needed
+        if batch_size > packed.shape[0]:
+            if batch_size % packed.shape[0] == 0:
+                additional_per_prompt = batch_size // packed.shape[0]
+                packed = packed.repeat(additional_per_prompt, 1, 1)
+            else:
+                raise ValueError(
+                    f"Cannot duplicate image latents of batch size {packed.shape[0]} "
+                    f"to {batch_size} prompts."
+                )
+
+        return packed
+
+    def _prepare_latent_image_ids(self, original_height, original_width, device):
+        """Prepare latent image IDs with t=0 coordinate for noise latents."""
+        vae_scale_factor = self.vae_config.arch_config.vae_scale_factor
+        height = int(original_height) // (vae_scale_factor * 2)
+        width = int(original_width) // (vae_scale_factor * 2)
+        latent_image_ids = torch.zeros(height, width, 3, device=device)
+        latent_image_ids[..., 0] = 0  # t=0 for noise latents
+        latent_image_ids[..., 1] = (
+            latent_image_ids[..., 1] + torch.arange(height, device=device)[:, None]
+        )
+        latent_image_ids[..., 2] = (
+            latent_image_ids[..., 2] + torch.arange(width, device=device)[None, :]
+        )
+
+        latent_image_ids = latent_image_ids.reshape(height * width, 3)
+        return latent_image_ids
+
+    def get_freqs_cis(self, prompt_embeds, width, height, device, rotary_emb, batch):
+        """Get frequency embeddings for RoPE, including image latent positions."""
+        txt_ids = torch.zeros(prompt_embeds.shape[1], 3, device=device)
+
+        # Noise latent position IDs (t=0)
+        img_ids = self._prepare_latent_image_ids(
+            original_height=height,
+            original_width=width,
+            device=device,
+        )
+
+        # If we have image latents, concatenate their position IDs
+        if batch.image_latent is not None and hasattr(
+            batch, "condition_image_latent_ids"
+        ):
+            image_latent_ids = batch.condition_image_latent_ids
+            if image_latent_ids.ndim == 3:
+                image_latent_ids = image_latent_ids[0]  # Take first batch
+            img_ids = torch.cat([img_ids, image_latent_ids.to(device)], dim=0)
+
+        # Compute RoPE embeddings
+        img_cos, img_sin = rotary_emb.forward(img_ids)
+        img_cos = shard_rotary_emb_for_sp(img_cos)
+        img_sin = shard_rotary_emb_for_sp(img_sin)
+
+        txt_cos, txt_sin = rotary_emb.forward(txt_ids)
+
+        cos = torch.cat([txt_cos, img_cos], dim=0).to(device=device)
+        sin = torch.cat([txt_sin, img_sin], dim=0).to(device=device)
+        return cos, sin
+
+    def slice_noise_pred(self, noise, latents):
+        """Remove noise prediction over input image tokens.
+
+        In Kontext, the transformer outputs predictions for both noise and image tokens.
+        We only want the predictions for the noise tokens.
+        """
+        noise = noise[:, : latents.size(1)]
+        return noise

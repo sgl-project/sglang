@@ -329,6 +329,14 @@ ONE_GPU_CASES_A: list[DiffusionTestCase] = [
         ),
         T2I_sampling_params,
     ),
+    DiffusionTestCase(
+        "flux_kontext_ti2i",
+        DiffusionServerArgs(
+            model_path="black-forest-labs/FLUX.1-Kontext-dev",
+            modality="image",
+        ),
+        TI2I_sampling_params,
+    ),
     # TODO: replace with a faster model to test the --dit-layerwise-offload
     # TODO: currently, we don't support sending more than one request in test, and setting `num_outputs_per_prompt` to 2 doesn't guarantee the denoising be executed twice,
     # so we do one warmup and send one request instead

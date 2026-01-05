@@ -47,6 +47,14 @@ class VAEConfig(ModelConfig):
             self.tile_sample_min_num_frames - self.tile_sample_stride_num_frames
         )
 
+    @property
+    def scaling_factor(self) -> float | torch.Tensor:
+        return self.arch_config.scaling_factor
+
+    @property
+    def shift_factor(self) -> float | torch.Tensor | None:
+        return getattr(self.arch_config, "shift_factor", None)
+
     def post_init(self):
         pass
 

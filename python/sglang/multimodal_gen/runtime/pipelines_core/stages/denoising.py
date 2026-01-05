@@ -318,17 +318,29 @@ class DenoisingStage(PipelineStage):
             * 1000.0
         )
 
-    def get_or_build_guidance(self, bsz: int, dtype, device):
+    def get_or_build_guidance(
+        self, bsz: int, dtype, device, batch_guidance_scale: float = None
+    ):
         """
         Get the guidance tensor, using a cached version if available.
 
         This method retrieves a cached guidance tensor using `_build_guidance`.
         The caching is based on batch size, dtype, device, and the guidance value,
         preventing repeated tensor creation within the denoising loop.
+
+        Args:
+            bsz: Batch size
+            dtype: Target dtype
+            device: Target device
+            batch_guidance_scale: User-provided guidance scale from the request.
+                                  If None, falls back to pipeline config's embedded_cfg_scale.
         """
         if self.server_args.pipeline_config.should_use_guidance:
-            # TODO: should the guidance_scale be picked-up from sampling_params?
-            guidance_val = self.server_args.pipeline_config.embedded_cfg_scale
+            # Use user-provided guidance_scale if available, otherwise fall back to config default
+            if batch_guidance_scale is not None and batch_guidance_scale > 0:
+                guidance_val = batch_guidance_scale
+            else:
+                guidance_val = self.server_args.pipeline_config.embedded_cfg_scale
             return self._build_guidance(bsz, dtype, device, guidance_val)
         else:
             return None
@@ -347,7 +359,14 @@ class DenoisingStage(PipelineStage):
         assert batch.image_latent is None, "TI2V task should not have image latents"
         assert self.vae is not None, "VAE is not provided for TI2V task"
         self.vae = self.vae.to(batch.condition_image.device)
-        z = self.vae.encode(batch.condition_image).mean.float()
+        encode_result = self.vae.encode(batch.condition_image)
+        # Handle both DiagonalGaussianDistribution and AutoencoderKLOutput
+        if hasattr(encode_result, "latent_dist"):
+            # AutoencoderKLOutput from diffusers
+            z = encode_result.latent_dist.mean.float()
+        else:
+            # DiagonalGaussianDistribution
+            z = encode_result.mean.float()
         if self.vae.device != "cpu" and server_args.vae_cpu_offload:
             self.vae = self.vae.to("cpu")
         if hasattr(self.vae, "shift_factor") and self.vae.shift_factor is not None:
@@ -588,6 +607,7 @@ class DenoisingStage(PipelineStage):
             latents.shape[0],
             latents.dtype,
             latents.device,
+            batch_guidance_scale=batch.guidance_scale,
         )
 
         image_kwargs = self.prepare_extra_func_kwargs(
