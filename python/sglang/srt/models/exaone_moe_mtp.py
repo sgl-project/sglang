@@ -51,10 +51,10 @@ class ExaoneMoEForCausalLMMTP(ExaoneMoEForCausalLM):
         self.pp_group = get_pp_group()
 
         self.fc = nn.Linear(2 * config.hidden_size, config.hidden_size, bias=False)
-        self.pre_fc_norm_embedding = RMSNorm(config.hidden_size,
-                                                      eps=config.rms_norm_eps)
-        self.pre_fc_norm_hidden = RMSNorm(config.hidden_size,
-                                                   eps=config.rms_norm_eps)
+        self.pre_fc_norm_embedding = RMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps
+        )
+        self.pre_fc_norm_hidden = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.model = ExaoneMoEModel(
             config, quant_config, prefix=add_prefix("model", prefix)
         )
@@ -104,4 +104,3 @@ class ExaoneMoEForCausalLMMTP(ExaoneMoEForCausalLM):
 
 
 EntryClass = ExaoneMoEForCausalLMMTP
-

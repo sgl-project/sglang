@@ -18,46 +18,40 @@
 
 import logging
 from collections.abc import Iterable
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, Optional, Tuple, Union
 
 import torch
 from torch import nn
 from transformers import PretrainedConfig
 
 from sglang.srt.distributed import (
-    get_tensor_model_parallel_world_size,
     get_moe_expert_parallel_world_size,
     get_pp_group,
+    get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
-from sglang.srt.server_args import get_global_server_args
-
+from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.dp_attention import (
     get_attention_tp_rank,
     get_attention_tp_size,
     is_dp_attention_enabled,
 )
-from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
-    ReplicatedLinear,
     MergedColumnParallelLinear,
     QKVParallelLinear,
+    ReplicatedLinear,
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorOutput
-
-from sglang.srt.layers.moe import (
-    get_moe_a2a_backend,
-)
+from sglang.srt.layers.moe import get_moe_a2a_backend
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
-from sglang.srt.layers.moe.utils import RoutingMethodType
-from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
-
+from sglang.srt.layers.moe.topk import TopK
+from sglang.srt.layers.moe.utils import RoutingMethodType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
@@ -69,7 +63,8 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.utils import LazyValue, add_prefix, make_layers, is_cuda
+from sglang.srt.server_args import get_global_server_args
+from sglang.srt.utils import LazyValue, add_prefix, is_cuda, make_layers
 
 logger = logging.getLogger(__name__)
 
@@ -152,7 +147,8 @@ class ExaoneMoESparseMoEBlock(nn.Module):
         if self.tp_size > config.num_experts:
             raise ValueError(
                 f"Tensor parallel size {self.tp_size} is greater than "
-                f"the number of experts {config.num_experts}.")
+                f"the number of experts {config.num_experts}."
+            )
 
         self.gate = ReplicatedLinear(
             config.hidden_size,
@@ -163,7 +159,8 @@ class ExaoneMoESparseMoEBlock(nn.Module):
         )
 
         self.e_score_correction_bias = nn.Parameter(
-            torch.empty(config.num_experts, dtype=torch.float32))
+            torch.empty(config.num_experts, dtype=torch.float32)
+        )
 
         self.experts = get_moe_impl_class(quant_config)(
             num_experts=config.num_experts
@@ -181,8 +178,8 @@ class ExaoneMoESparseMoEBlock(nn.Module):
             top_k=config.num_experts_per_tok,
             renormalize=config.norm_topk_prob,
             use_grouped_topk=True,
-            num_expert_group=config.n_group, 
-            topk_group=config.topk_group, 
+            num_expert_group=config.n_group,
+            topk_group=config.topk_group,
             correction_bias=self.e_score_correction_bias,
             quant_config=quant_config,
             routed_scaling_factor=self.routed_scaling_factor,
@@ -191,8 +188,7 @@ class ExaoneMoESparseMoEBlock(nn.Module):
         )
 
         if config.num_shared_experts is not None:
-            intermediate_size = (config.moe_intermediate_size *
-                                 config.num_shared_experts)
+            intermediate_size = config.moe_intermediate_size * config.num_shared_experts
             self.shared_experts = ExaoneMoEMLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=intermediate_size,
@@ -206,7 +202,7 @@ class ExaoneMoESparseMoEBlock(nn.Module):
                     else {}
                 ),
             )
-        
+
         if get_moe_a2a_backend().is_deepep():
             self.ep_size = get_moe_expert_parallel_world_size()
             self.num_experts = (
@@ -249,7 +245,7 @@ class ExaoneMoESparseMoEBlock(nn.Module):
             final_hidden_states.add_(shared_output)
 
         return final_hidden_states
-    
+
     def _forward_router_experts(self, hidden_states: torch.Tensor) -> torch.Tensor:
         router_logits, _ = self.gate(hidden_states)
         topk_output = self.topk(hidden_states, router_logits)
@@ -324,7 +320,6 @@ class ExaoneMoEAttention(nn.Module):
         attn_tp_rank = get_attention_tp_rank()
         attn_tp_size = get_attention_tp_size()
 
-
         self.total_num_heads = num_heads
         assert self.total_num_heads % attn_tp_size == 0
         self.num_heads = self.total_num_heads // attn_tp_size
@@ -375,7 +370,7 @@ class ExaoneMoEAttention(nn.Module):
             rope_is_neox_style = False
 
         self.sliding_window = config.layer_types[layer_id] == "sliding_attention"
-        
+
         # apply rotary embeddings to every layer in full attention models
         self.apply_rope_all_layers = "sliding_attention" not in config.layer_types
 
@@ -395,11 +390,12 @@ class ExaoneMoEAttention(nn.Module):
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
             prefix=add_prefix("attn", prefix),
-            sliding_window_size=(config.sliding_window if self.sliding_window else None),
+            sliding_window_size=(
+                config.sliding_window if self.sliding_window else None
+            ),
         )
         self.layer_id = layer_id
 
-    
     def forward(
         self,
         positions: torch.Tensor,
@@ -487,7 +483,9 @@ class ExaoneMoEDecoderLayer(nn.Module):
                 prefix=add_prefix("mlp", prefix),
             )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = RMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps
+        )
 
     def forward(
         self,
@@ -540,7 +538,7 @@ class ExaoneMoEModel(nn.Module):
             )
         else:
             self.embed_tokens = PPMissingLayer()
-        
+
         self.layers, self.start_layer, self.end_layer = make_layers(
             config.num_hidden_layers,
             lambda idx, prefix: ExaoneMoEDecoderLayer(
@@ -623,8 +621,8 @@ class ExaoneMoEForCausalLM(nn.Module):
         self.quant_config = quant_config
         alt_stream = torch.cuda.Stream() if _is_cuda else None
         self.model = ExaoneMoEModel(
-            config, 
-            quant_config=quant_config, 
+            config,
+            quant_config=quant_config,
             prefix=add_prefix("model", prefix),
             alt_stream=alt_stream,
         )
@@ -664,7 +662,10 @@ class ExaoneMoEForCausalLM(nn.Module):
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> LogitsProcessorOutput:
         hidden_states = self.model(
-            input_ids, positions, forward_batch, input_embeds,
+            input_ids,
+            positions,
+            forward_batch,
+            input_embeds,
             pp_proxy_tensors=pp_proxy_tensors,
         )
 
@@ -683,7 +684,6 @@ class ExaoneMoEForCausalLM(nn.Module):
         else:
             return hidden_states
 
-    
     @torch.no_grad()
     def forward_split_prefill(
         self,
@@ -731,7 +731,7 @@ class ExaoneMoEForCausalLM(nn.Module):
 
     @property
     def end_layer(self):
-        return self.model.end_layer        
+        return self.model.end_layer
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight
@@ -744,7 +744,9 @@ class ExaoneMoEForCausalLM(nn.Module):
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
 
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_mtp: bool = False):
+    def load_weights(
+        self, weights: Iterable[Tuple[str, torch.Tensor]], is_mtp: bool = False
+    ):
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("qkv_proj", "q_proj", "q"),
@@ -778,7 +780,7 @@ class ExaoneMoEForCausalLM(nn.Module):
 
             if not is_mtp and "mtp" in name:
                 continue
-            
+
             if "rotary_emb.inv_freq" in name or "projector" in name:
                 continue
             if "rotary_emb.cos_cached" in name or "rotary_emb.sin_cached" in name:
@@ -813,15 +815,15 @@ class ExaoneMoEForCausalLM(nn.Module):
                     param = params_dict[name]
                     weight_loader = param.weight_loader
                     weight_loader(
-                        param, 
-                        loaded_weight, 
-                        name, 
+                        param,
+                        loaded_weight,
+                        name,
                         expert_id=expert_id,
                         shard_id=shard_id,
                     )
                     break
                 else:
-                # Skip loading extra bias for GPTQ models.
+                    # Skip loading extra bias for GPTQ models.
                     if name.endswith(".bias") and name not in params_dict:
                         continue
 
@@ -830,11 +832,12 @@ class ExaoneMoEForCausalLM(nn.Module):
 
                     if name in params_dict.keys():
                         param = params_dict[name]
-                        weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                        weight_loader = getattr(
+                            param, "weight_loader", default_weight_loader
+                        )
                         weight_loader(param, loaded_weight)
                     else:
                         logger.warning(f"Parameter {name} not found in params_dict")
-
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):
@@ -861,4 +864,3 @@ class ExaoneMoEForCausalLM(nn.Module):
 
 
 EntryClass = ExaoneMoEForCausalLM
-
