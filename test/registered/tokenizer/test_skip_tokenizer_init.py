@@ -7,6 +7,12 @@ import json
 import unittest
 
 import requests
+
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+
+# Skip tokenizer initialization tests
+register_cuda_ci(est_time=77, suite="stage-b-test-small-1-gpu")
+register_amd_ci(est_time=117, suite="stage-b-test-small-1-gpu")
 from transformers import AutoProcessor, AutoTokenizer
 
 from sglang.lang.chat_template import get_chat_template_by_model_path
