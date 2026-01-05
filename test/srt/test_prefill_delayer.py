@@ -68,7 +68,6 @@ class TestPrefillDelayerThroughput(CustomTestCase):
         other_launch_args,
         other_benchmark_args,
     ):
-        os.environ["SGLANG_PREFILL_DELAYER_DEBUG_LOG"] = "1"
         model = "Qwen/Qwen3-0.6B"
         base_url = DEFAULT_URL_FOR_TEST
 
@@ -135,6 +134,8 @@ class TestPrefillDelayerAccuracy(CustomTestCase):
 
 
 def _launch_server(*, model, base_url, prefill_delayer: bool, other_args):
+    os.environ["SGLANG_PREFILL_DELAYER_DEBUG_LOG"] = "1"
+
     with envs.SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE.override(
         prefill_delayer
     ), envs.SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES.override(100):
