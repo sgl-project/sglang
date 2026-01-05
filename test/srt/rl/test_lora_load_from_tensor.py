@@ -164,6 +164,147 @@ class TestLoRALoadFromTensor(CustomTestCase):
             EXPECTED_OUTPUT,
             "Output after applying LoRA does not match expected result",
         )
+    
+    def test_lora_logp_diff_with_huggingface(self):
+        """
+        Test comparing SGLang and HuggingFace LoRA logprobs when loading LoRA from tensors.
+        This verifies that loading LoRA adapters from tensors produces consistent logprobs
+        with HuggingFace.
+        """
+        from sglang.test.runners import SRTRunner, HFRunner
+        from sglang.test.test_utils import DEFAULT_PORT_FOR_SRT_TEST_RUNNER
+        import numpy as np
+        
+        print("[Test]Testing LoRA logprob difference with HuggingFace...")
+        
+        lora_name = "self_cognition_Alice_logprob_test"
+        prompts = [TEST_PROMPT]
+        
+        # Step 1: Run SGLang with LoRA loaded from tensors
+        print("[Test]Running SGLang with LoRA from tensors...")
+        with SRTRunner(
+            MODEL_PATH,
+            torch_dtype=torch.float16,
+            model_type="generation",
+            tp_size=1,
+            max_loras_per_batch=1,
+            lora_backend="triton",
+            disable_cuda_graph=False,
+            disable_radix_cache=True,
+            port=DEFAULT_PORT_FOR_SRT_TEST_RUNNER,
+            mem_fraction_static=0.6,
+            enable_lora=True,
+            max_lora_rank=64,
+            lora_target_modules=[
+                "q_proj",
+                "k_proj",
+                "v_proj",
+                "o_proj",
+                "gate_proj",
+                "up_proj",
+                "down_proj",
+            ],
+        ) as srt_runner:
+            # Serialize tensors and create request
+            serialized_tensors = MultiprocessingSerializer.serialize(
+                self.lora_tensors, output_str=True
+            )
+            
+            lora_req = LoadLoRAAdapterFromTensorsReqInput(
+                lora_name=lora_name,
+                config_dict=self.lora_config_dict,
+                serialized_tensors=serialized_tensors,
+            )
+            
+            # Load LoRA adapter from tensors
+            result = srt_runner.engine.loop.run_until_complete(
+                srt_runner.engine.tokenizer_manager.load_lora_adapter_from_tensors(
+                    lora_req, None
+                )
+            )
+            if not result.success:
+                raise RuntimeError(
+                    f"Failed to load LoRA from tensors: {result.error_message}"
+                )
+            
+            # Run inference with loaded LoRA
+            srt_outputs = srt_runner.forward(
+                prompts,
+                max_new_tokens=MAX_NEW_TOKENS,
+                lora_paths=[lora_name],
+            )
+        
+        # Step 2: Run HuggingFace with LoRA
+        print("[Test]Running HuggingFace with LoRA...")
+        torch.cuda.empty_cache()
+        
+        with HFRunner(
+            MODEL_PATH,
+            torch_dtype=torch.float16,
+            model_type="generation",
+            patch_model_do_sample_false=True,
+        ) as hf_runner:
+            hf_outputs = hf_runner.forward(
+                prompts,
+                max_new_tokens=MAX_NEW_TOKENS,
+                lora_paths=[LORA_REPO],
+            )
+        
+        # Step 3: Compare results
+        sglang_text = srt_outputs.output_strs[0]
+        hf_text = hf_outputs.output_strs[0]
+        
+        print(f"[Text Output]")
+        print(f"  SGLang:      {sglang_text}")
+        print(f"  HuggingFace: {hf_text}")
+        
+        # Compare prefill (input) logprobs
+        sglang_prefill = torch.tensor(srt_outputs.top_input_logprobs[0])
+        hf_prefill = torch.tensor(hf_outputs.top_input_logprobs[0])
+        
+        prefill_diff = torch.abs(sglang_prefill - hf_prefill)
+        prefill_max_diff = torch.max(prefill_diff).item()
+        prefill_mean_diff = torch.mean(prefill_diff).item()
+        
+        print(f"\n[Prefill Logprob Comparison]")
+        print(f"  Shape:           {list(sglang_prefill.shape)}")
+        print(f"  Max difference:  {prefill_max_diff:.6e}")
+        print(f"  Mean difference: {prefill_mean_diff:.6e}")
+        
+        # Compare decode (output) logprobs
+        sglang_decode = torch.tensor(srt_outputs.top_output_logprobs[0])
+        hf_decode = torch.tensor(hf_outputs.top_output_logprobs[0])
+        
+        decode_diff = torch.abs(sglang_decode - hf_decode)
+        decode_max_diff = torch.max(decode_diff).item()
+        decode_mean_diff = torch.mean(decode_diff).item()
+        
+        print(f"\n[Decode Logprob Comparison]")
+        print(f"  Shape:           {list(sglang_decode.shape)}")
+        print(f"  Max difference:  {decode_max_diff:.6e}")
+        print(f"  Mean difference: {decode_mean_diff:.6e}")
+        
+        # Assert logprobs are close (threshold 1e-1)
+        LOGPROB_THRESHOLD = 1e-1
+        self.assertLess(
+            prefill_max_diff,
+            LOGPROB_THRESHOLD,
+            f"Prefill logprob max difference too large: {prefill_max_diff:.6e} > {LOGPROB_THRESHOLD:.0e}",
+        )
+        self.assertLess(
+            decode_max_diff,
+            LOGPROB_THRESHOLD,
+            f"Decode logprob max difference too large: {decode_max_diff:.6e} > {LOGPROB_THRESHOLD:.0e}",
+        )
+        
+        # Verify text outputs match expected
+        self.assertEqual(
+            sglang_text[:len(EXPECTED_OUTPUT)],
+            EXPECTED_OUTPUT,
+            "SGLang output does not match expected result",
+        )
+        
+        print("\n[Test]LoRA logprob comparison test passed!")
 
     @classmethod
     def tearDownClass(cls):
