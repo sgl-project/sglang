@@ -410,6 +410,7 @@ class LogitsProcessor(nn.Module):
         attention_multi_layer = None
         attention_fingerprint = None
         attention_manifold = None
+        moe_routing_buffer = None
         if isinstance(logits_metadata, ForwardBatch):
             if logits_metadata.capture_attention_tokens:
                 # Extract multi-layer attention info
