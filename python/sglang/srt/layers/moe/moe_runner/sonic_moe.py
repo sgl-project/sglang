@@ -103,7 +103,7 @@ def fused_experts_none_to_sonic_moe(
     b2 = quant_info.b2
 
     s = torch.cuda.current_stream()
-    with torch.no_grad():
+    with torch.inference_mode():
         output = _sonic_moe_forward_placeholder(
             hidden_states=hidden_states,
             w13=w13_weight.permute(1, 2, 0),
@@ -120,6 +120,7 @@ def fused_experts_none_to_sonic_moe(
     return StandardCombineInput(hidden_states=output)
 
 
+@torch.compile
 def _sonic_moe_forward_placeholder(
     hidden_states: torch.Tensor,
     w13: torch.Tensor,
