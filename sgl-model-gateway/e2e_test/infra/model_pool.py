@@ -85,20 +85,44 @@ class ModelInstance:
             return False
 
     def _grpc_health_check(self, timeout: float = 5.0) -> bool:
-        """Check health via gRPC channel connectivity."""
+        """Check health via gRPC health check protocol."""
         try:
             import grpc
             from grpc_health.v1 import health_pb2, health_pb2_grpc
+        except ImportError as e:
+            logger.debug("gRPC libraries not available: %s", e)
+            return False
 
+        try:
             channel = grpc.insecure_channel(f"{DEFAULT_HOST}:{self.port}")
             try:
                 stub = health_pb2_grpc.HealthStub(channel)
                 request = health_pb2.HealthCheckRequest(service="")
                 response = stub.Check(request, timeout=timeout)
-                return response.status == health_pb2.HealthCheckResponse.SERVING
+                is_serving = response.status == health_pb2.HealthCheckResponse.SERVING
+                if is_serving:
+                    logger.debug(
+                        "gRPC health check passed for port %d (status: SERVING)",
+                        self.port,
+                    )
+                return is_serving
             finally:
                 channel.close()
-        except Exception:
+        except grpc.RpcError as e:
+            # gRPC-specific errors (connection refused, deadline exceeded, etc.)
+            logger.debug(
+                "gRPC health check failed for port %d: %s",
+                self.port,
+                e.code() if hasattr(e, "code") else str(e),
+            )
+            return False
+        except Exception as e:
+            # Other errors
+            logger.debug(
+                "gRPC health check error for port %d: %s",
+                self.port,
+                str(e),
+            )
             return False
 
     def terminate(self, timeout: float = 10.0) -> None:
@@ -336,15 +360,26 @@ class ModelPool:
         """Wait for all model instances to become healthy."""
         start_time = time.time()
         pending = set(self.instances.keys())
+        check_count = 0
+
+        logger.info(
+            "Waiting for %d workers to become healthy (timeout: %ds)...",
+            len(pending),
+            self._startup_timeout,
+        )
 
         while pending and (time.time() - start_time) < self._startup_timeout:
+            check_count += 1
+            elapsed = time.time() - start_time
+
             for key in list(pending):
                 instance = self.instances[key]
 
                 # Check if process died
                 if not instance.is_alive():
                     logger.error(
-                        "%s (PID %d) died during startup",
+                        "[%.1fs] %s (PID %d) died during startup",
+                        elapsed,
                         key,
                         instance.process.pid,
                     )
@@ -358,15 +393,31 @@ class ModelPool:
 
                 # Check health
                 if instance.health_check():
-                    logger.info("%s is healthy at %s", key, instance.base_url)
+                    logger.info(
+                        "[%.1fs] %s is healthy at %s (check #%d)",
+                        elapsed,
+                        key,
+                        instance.base_url,
+                        check_count,
+                    )
                     pending.discard(key)
 
             if pending:
+                # Log progress every 30 seconds
+                if check_count % 15 == 0:  # ~30s at 2s interval
+                    logger.info(
+                        "[%.1fs] Still waiting for %d workers: %s",
+                        elapsed,
+                        len(pending),
+                        list(pending),
+                    )
                 time.sleep(HEALTH_CHECK_INTERVAL)
 
         if pending:
+            elapsed = time.time() - start_time
             logger.error(
-                "Models failed to start within %ds: %s",
+                "[%.1fs] Models failed to start within %ds: %s",
+                elapsed,
                 self._startup_timeout,
                 pending,
             )
@@ -374,6 +425,14 @@ class ModelPool:
             for key in pending:
                 self.instances[key].terminate()
                 del self.instances[key]
+        else:
+            elapsed = time.time() - start_time
+            logger.info(
+                "[%.1fs] All %d workers healthy after %d health checks",
+                elapsed,
+                len(self.instances),
+                check_count,
+            )
 
     def get(
         self,
@@ -454,20 +513,52 @@ class ModelPool:
         if model_id not in MODEL_SPECS:
             raise ValueError(f"Unknown model: {model_id}")
 
+        spec = get_model_spec(model_id)
         ib_device = detect_ib_device()
         if ib_device:
             logger.info("Detected InfiniBand device: %s", ib_device)
+
+        # Build allocation specs for all PD workers
+        # Each worker needs its own GPU slot
+        allocation_specs = {}
+        for i in range(num_prefill):
+            key = f"{model_id}:{mode.value}:prefill_{i}"
+            allocation_specs[key] = {
+                "model": spec["model"],
+                "memory_gb": spec.get("memory_gb", 16),
+                "tp": spec.get("tp", 1),
+            }
+        for i in range(num_decode):
+            key = f"{model_id}:{mode.value}:decode_{i}"
+            allocation_specs[key] = {
+                "model": spec["model"],
+                "memory_gb": spec.get("memory_gb", 16),
+                "tp": spec.get("tp", 1),
+            }
+
+        # Allocate GPU slots
+        slots = self.allocator.allocate_slots(allocation_specs)
+        slot_map = {slot.assigned_model: slot for slot in slots}
+
+        if not slots:
+            logger.warning(
+                "No GPU slots allocated for PD workers, launching without GPU assignment"
+            )
+
+        logger.info(self.allocator.summary())
 
         prefill_instances: list[ModelInstance] = []
         decode_instances: list[ModelInstance] = []
 
         # Launch prefill workers
         for i in range(num_prefill):
+            key = f"{model_id}:{mode.value}:prefill_{i}"
+            gpu_slot = slot_map.get(key)
             bootstrap_port = get_open_port()
             instance = self._launch_model(
                 model_id=model_id,
                 mode=mode,
-                gpu_slot=None,  # Let CUDA auto-assign or use base_gpu_id
+                gpu_slot=gpu_slot,
                 worker_type=WorkerType.PREFILL,
                 bootstrap_port=bootstrap_port,
                 ib_device=ib_device,
@@ -476,10 +567,12 @@ class ModelPool:
 
         # Launch decode workers
         for i in range(num_decode):
+            key = f"{model_id}:{mode.value}:decode_{i}"
+            gpu_slot = slot_map.get(key)
             instance = self._launch_model(
                 model_id=model_id,
                 mode=mode,
-                gpu_slot=None,
+                gpu_slot=gpu_slot,
                 worker_type=WorkerType.DECODE,
                 ib_device=ib_device,
             )

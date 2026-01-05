@@ -25,3 +25,7 @@ markers = [
   "slow: mark test as slow-running",
 ]
 addopts = "-v"
+log_cli = true
+log_cli_level = "INFO"
+log_cli_format = "%(asctime)s.%(msecs)03d %(levelname)s [%(name)s] %(message)s"
+log_cli_date_format = "%H:%M:%S"
