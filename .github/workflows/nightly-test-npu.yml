@@ -168,7 +168,6 @@ jobs:
           STREAMS_PER_DEVICE: 32
         run: |
           export PATH="/usr/local/Ascend/8.3.RC1/compiler/bishengir/bin:${PATH}"
-          hf download lmms-lab/MMMU --repo-type dataset
           pip install sentence_transformers torchaudio==2.8.0 torch_npu==2.8.0
           pip install protobuf==6.31.1 zss pre-commit wandb>=0.16.0 tenacity==8.3.0 loguru openpyxl latex2sympy2 zstandard transformers-stream-generator tqdm-multiprocess pycocoevalcap
           pip install yt-dlp sentencepiece==0.1.99 nltk av ftfy sqlitedict==2.1.0 sacrebleu>=1.5.0 pytablewriter peft==0.2.0 black==24.1.0 isort==5.13.2 peft>=0.2.0 accelerate>=0.29.1
