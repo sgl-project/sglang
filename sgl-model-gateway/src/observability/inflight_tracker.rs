@@ -19,18 +19,13 @@ struct AgeBuckets {
 
 impl AgeBuckets {
     fn new(bounds: &'static [u64]) -> Self {
-        let mut le_labels: Vec<&'static str> = bounds
-            .iter()
-            .map(|&b| Box::leak(b.to_string().into_boxed_str()) as &'static str)
-            .collect();
+        let leak_str = |n: u64|  Box::leak(n.to_string().into_boxed_str()) as &'static str;
+
+        let mut le_labels: Vec<&'static str> = bounds.iter().map(|&b| leak_str(b)).collect();
         le_labels.push("+Inf");
 
         let mut gt_labels: Vec<&'static str> = vec!["0"];
-        gt_labels.extend(
-            bounds
-                .iter()
-                .map(|&b| Box::leak(b.to_string().into_boxed_str()) as &'static str),
-        );
+        gt_labels.extend(bounds.iter().map(|&b| leak_str(b)));
 
         Self {
             bounds,
