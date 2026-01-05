@@ -7,7 +7,7 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
-use futures_util::StreamExt;
+use futures_util::{stream, StreamExt};
 use reqwest::Client;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::{debug, error};
@@ -362,46 +362,65 @@ impl Router {
             })
             .unwrap_or_default();
 
-        let mut last_response: Option<Response> = None;
-        for worker in workers {
-            let worker_url = worker.url();
-            let base = self.worker_base_url(worker_url);
+        let futures: Vec<_> = workers
+            .into_iter()
+            .map(|worker| {
+                let worker_url = worker.url();
+                let base = self.worker_base_url(worker_url);
+                let url = format!("{}/{}", base, endpoint);
+                let client = self.client.clone();
+                let method = method.clone();
 
-            let url = format!("{}/{}", base, endpoint);
-            let mut request_builder = match method {
-                Method::GET => self.client.get(url),
-                Method::POST => self.client.post(url),
-                _ => {
-                    return error::method_not_allowed(
-                        "unsupported_method",
-                        "Unsupported method for simple routing",
-                    )
+                let headers = filtered_headers.clone();
+
+                let api_key = worker.api_key().clone();
+
+                async move {
+                    let mut request_builder = match method {
+                        Method::GET => client.get(url),
+                        Method::POST => client.post(url),
+                        _ => {
+                            return Err(error::method_not_allowed(
+                                "unsupported_method",
+                                "Unsupported method for simple routing",
+                            ))
+                        }
+                    };
+
+                    if let Some(key) = api_key {
+                        let mut auth_header = String::with_capacity(7 + key.len());
+                        auth_header.push_str("Bearer ");
+                        auth_header.push_str(&key);
+                        request_builder = request_builder.header("Authorization", auth_header);
+                    }
+
+                    for (name, value) in headers {
+                        request_builder = request_builder.header(name.clone(), value.clone());
+                    }
+
+                    request_builder.send().await.map_err(convert_reqwest_error)
                 }
-            };
+            })
+            .collect();
 
-            if let Some(api_key) = worker.api_key() {
-                // Pre-allocate string with capacity to avoid reallocation
-                let mut auth_header = String::with_capacity(7 + api_key.len());
-                auth_header.push_str("Bearer ");
-                auth_header.push_str(api_key);
-                request_builder = request_builder.header("Authorization", auth_header);
-            }
+        // Now execute the collected futures concurrently
+        let mut stream = stream::iter(futures).buffer_unordered(32);
+        let mut last_response: Option<Response> = None;
 
-            // Apply pre-filtered headers
-            for (name, value) in &filtered_headers {
-                request_builder = request_builder.header(*name, *value);
-            }
-
-            match request_builder.send().await {
+        while let Some(result) = stream.next().await {
+            match result {
                 Ok(res) => {
                     let status = StatusCode::from_u16(res.status().as_u16())
                         .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+
                     let response_headers = header_utils::preserve_response_headers(res.headers());
+
                     match res.bytes().await {
                         Ok(body) => {
                             let mut response = Response::new(Body::from(body));
                             *response.status_mut() = status;
                             *response.headers_mut() = response_headers;
+
                             if status.is_success() {
                                 return response;
                             }
@@ -416,7 +435,7 @@ impl Router {
                     }
                 }
                 Err(e) => {
-                    last_response = Some(convert_reqwest_error(e));
+                    last_response = Some(e);
                 }
             }
         }

@@ -190,6 +190,9 @@ class ModelConfig:
             and is_multimodal_chunked_prefill_supported(self.hf_config.architectures)
         )
         self.is_encoder_decoder = is_encoder_decoder_model(self.hf_config.architectures)
+        self.is_local_attention_model = is_local_attention_model(
+            self.hf_config.architectures
+        )
         self.dtype = _get_and_verify_dtype(self.hf_text_config, dtype)
 
         # Derive context length and model shapes
@@ -1146,6 +1149,10 @@ def is_audio_model(model_architectures: List[str]):
 
 def is_encoder_decoder_model(model_architectures: List[str]):
     return "MllamaForConditionalGeneration" in model_architectures
+
+
+def is_local_attention_model(model_architectures: List[str]):
+    return "Llama4ForConditionalGeneration" in model_architectures
 
 
 def is_multimodal_chunked_prefill_supported(model_architectures: List[str]):
