@@ -19,22 +19,8 @@ pub enum ProtoRequest {
     Embed(ProtoEmbedRequest),
 }
 
-#[allow(dead_code)]
 impl ProtoRequest {
-    pub fn as_generate(&self) -> &ProtoGenerateRequest {
-        match self {
-            Self::Generate(req) => req,
-            _ => panic!("Expected Generate request"),
-        }
-    }
-
-    pub fn as_embed(&self) -> &ProtoEmbedRequest {
-        match self {
-            Self::Embed(req) => req,
-            _ => panic!("Expected Embed request"),
-        }
-    }
-
+    /// Get request ID from either variant
     pub fn request_id(&self) -> &str {
         match self {
             Self::Generate(req) => req.request_id(),
