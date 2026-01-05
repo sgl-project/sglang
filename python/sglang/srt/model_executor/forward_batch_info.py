@@ -740,12 +740,27 @@ class ForwardBatch:
         if batch.capture_moe_routing:
             ret.capture_moe_routing = True
             ret.moe_routing_top_k = batch.moe_routing_top_k
-            ret.moe_capture_layer_ids = batch.moe_capture_layer_ids
             ret.moe_routing_buffer = []  # Initialize empty list to accumulate routing data
             # Get limits from server_args
             ret.moe_routing_stride = getattr(model_runner.server_args, 'moe_routing_stride', 1)
             ret.moe_routing_max_steps = getattr(model_runner.server_args, 'moe_routing_max_steps', 0)
             ret.moe_routing_current_step = 0
+
+            # Validate moe_capture_layer_ids against model configuration
+            num_layers = model_runner.model_config.num_hidden_layers
+            if batch.moe_capture_layer_ids is not None:
+                # Filter out invalid layer IDs (out of range or negative)
+                valid_layer_ids = [
+                    lid for lid in batch.moe_capture_layer_ids
+                    if 0 <= lid < num_layers
+                ]
+                if valid_layer_ids:
+                    ret.moe_capture_layer_ids = valid_layer_ids
+                else:
+                    # All layer IDs were invalid, capture all MoE layers
+                    ret.moe_capture_layer_ids = None
+            else:
+                ret.moe_capture_layer_ids = None
 
         return ret
 
