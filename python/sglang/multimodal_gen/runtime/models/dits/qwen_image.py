@@ -3,7 +3,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import functools
-from math import prod
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
@@ -16,24 +15,27 @@ from diffusers.models.modeling_outputs import Transformer2DModelOutput
 from diffusers.models.normalization import AdaLayerNormContinuous
 
 from sglang.multimodal_gen.configs.models.dits.qwenimage import QwenImageDitConfig
+from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.layers.attention import USPAttention
-from sglang.multimodal_gen.runtime.layers.layernorm import LayerNorm, RMSNorm
+from sglang.multimodal_gen.runtime.layers.layernorm import (
+    LayerNorm,
+    RMSNorm,
+    apply_qk_norm,
+)
 from sglang.multimodal_gen.runtime.layers.linear import ReplicatedLinear
+from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
+    apply_flashinfer_rope_qk_inplace,
+)
 from sglang.multimodal_gen.runtime.layers.triton_ops import (
     fuse_scale_shift_gate_select01_kernel,
     fuse_scale_shift_kernel,
 )
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
+from sglang.multimodal_gen.runtime.utils.layerwise_offload import OffloadableDiTMixin
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)  # pylint: disable=invalid-name
-
-
-try:
-    from flashinfer.rope import apply_rope_with_cos_sin_cache_inplace
-except Exception:
-    apply_rope_with_cos_sin_cache_inplace = None
 
 
 def _get_qkv_projections(
@@ -550,20 +552,26 @@ class QwenImageCrossAttention(nn.Module):
         txt_value = txt_value.unflatten(-1, (self.num_heads, -1))
 
         # Apply QK normalization
-        if self.norm_q is not None:
-            img_query = self.norm_q(img_query)
-        if self.norm_k is not None:
-            img_key = self.norm_k(img_key)
-        if self.norm_added_q is not None:
-            txt_query = self.norm_added_q(txt_query)
-        if self.norm_added_k is not None:
-            txt_key = self.norm_added_k(txt_key)
+        if self.qk_norm:
+            img_query, img_key = apply_qk_norm(
+                q=img_query,
+                k=img_key,
+                q_norm=self.norm_q,
+                k_norm=self.norm_k,
+                head_dim=img_query.shape[-1],
+                allow_inplace=True,
+            )
+            txt_query, txt_key = apply_qk_norm(
+                q=txt_query,
+                k=txt_key,
+                q_norm=self.norm_added_q,
+                k_norm=self.norm_added_k,
+                head_dim=txt_query.shape[-1],
+                allow_inplace=True,
+            )
 
         # Apply RoPE
         if image_rotary_emb is not None:
-            if apply_rope_with_cos_sin_cache_inplace is None:
-                raise RuntimeError("flashinfer is required")
-
             if not (
                 isinstance(image_rotary_emb[0], torch.Tensor)
                 and image_rotary_emb[0].dim() == 2
@@ -572,41 +580,12 @@ class QwenImageCrossAttention(nn.Module):
 
             img_cache, txt_cache = image_rotary_emb
 
-            def _apply_flashinfer_rope(
-                q_4d: torch.Tensor, k_4d: torch.Tensor, cache: torch.Tensor
-            ):
-                bsz, seqlen, nheads, d = q_4d.shape
-
-                pos_1d = torch.arange(seqlen, device="cpu", dtype=torch.long)
-                if bsz == 1:
-                    positions = pos_1d.to(q_4d.device, non_blocking=True)
-                    q2 = q_4d.squeeze(0).reshape(seqlen, nheads * d).contiguous()
-                    k2 = k_4d.squeeze(0).reshape(seqlen, nheads * d).contiguous()
-                    apply_rope_with_cos_sin_cache_inplace(
-                        positions=positions,
-                        query=q2,
-                        key=k2,
-                        head_size=d,
-                        cos_sin_cache=cache,
-                        is_neox=False,
-                    )
-                    return q2.view(1, seqlen, nheads, d), k2.view(1, seqlen, nheads, d)
-
-                positions = pos_1d.repeat(bsz).to(q_4d.device, non_blocking=True)
-                q2 = q_4d.reshape(bsz * seqlen, nheads * d).contiguous()
-                k2 = k_4d.reshape(bsz * seqlen, nheads * d).contiguous()
-                apply_rope_with_cos_sin_cache_inplace(
-                    positions=positions,
-                    query=q2,
-                    key=k2,
-                    head_size=d,
-                    cos_sin_cache=cache,
-                    is_neox=False,
-                )
-                return q2.view(bsz, seqlen, nheads, d), k2.view(bsz, seqlen, nheads, d)
-
-            img_query, img_key = _apply_flashinfer_rope(img_query, img_key, img_cache)
-            txt_query, txt_key = _apply_flashinfer_rope(txt_query, txt_key, txt_cache)
+            img_query, img_key = apply_flashinfer_rope_qk_inplace(
+                img_query, img_key, img_cache, is_neox=False
+            )
+            txt_query, txt_key = apply_flashinfer_rope_qk_inplace(
+                txt_query, txt_key, txt_cache, is_neox=False
+            )
 
         # Concatenate for joint attention
         # Order: [text, image]
@@ -814,7 +793,13 @@ class QwenImageTransformerBlock(nn.Module):
         return encoder_hidden_states, hidden_states
 
 
-class QwenImageTransformer2DModel(CachableDiT):
+def to_hashable(obj):
+    if isinstance(obj, list):
+        return tuple(to_hashable(x) for x in obj)
+    return obj
+
+
+class QwenImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
     """
     The Transformer model introduced in Qwen.
 
@@ -890,6 +875,24 @@ class QwenImageTransformer2DModel(CachableDiT):
             self.inner_dim, patch_size * patch_size * self.out_channels, bias=True
         )
 
+        self.timestep_zero = torch.zeros(
+            (1,), dtype=torch.int, device=get_local_torch_device()
+        )
+
+        self.layer_names = ["transformer_blocks"]
+
+    @functools.lru_cache(maxsize=50)
+    def build_modulate_index(self, img_shapes: tuple[int, int, int], device):
+        modulate_index_list = []
+        for sample in img_shapes:
+            first_size = sample[0][0] * sample[0][1] * sample[0][2]
+            total_size = sum(s[0] * s[1] * s[2] for s in sample)
+            idx = (torch.arange(total_size, device=device) >= first_size).int()
+            modulate_index_list.append(idx)
+
+        modulate_index = torch.stack(modulate_index_list)
+        return modulate_index
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -945,16 +948,9 @@ class QwenImageTransformer2DModel(CachableDiT):
         timestep = (timestep / 1000).to(hidden_states.dtype)
 
         if self.zero_cond_t:
-            timestep = torch.cat([timestep, timestep * 0], dim=0)
-            # Use torch operations for GPU efficiency
-            modulate_index = torch.tensor(
-                [
-                    [0] * prod(sample[0]) + [1] * sum([prod(s) for s in sample[1:]])
-                    for sample in img_shapes
-                ],
-                device=timestep.device,
-                dtype=torch.int,
-            )
+            timestep = torch.cat([timestep, self.timestep_zero], dim=0)
+            device = timestep.device
+            modulate_index = self.build_modulate_index(to_hashable(img_shapes), device)
         else:
             modulate_index = None
 

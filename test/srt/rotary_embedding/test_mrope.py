@@ -84,7 +84,7 @@ def create_yarn_rope_scaling(original_config, scaling_factor=2.0):
     return yarn_config
 
 
-@pytest.mark.skipif(not _is_cuda, reason="Skipping CUDA/ROCm only tests.")
+@pytest.mark.skipif(not (_is_cuda or _is_hip), reason="Skipping CUDA/ROCm only tests.")
 @pytest.mark.parametrize(
     "model_info, model_name",
     [

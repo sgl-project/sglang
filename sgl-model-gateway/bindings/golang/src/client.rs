@@ -8,11 +8,11 @@ use tokio::runtime::Runtime;
 use once_cell::sync::Lazy;
 use uuid::Uuid;
 
-use sgl_model_gateway::tokenizer::create_tokenizer_from_file;
-use sgl_model_gateway::tokenizer::traits::Tokenizer;
-use sgl_model_gateway::grpc_client::sglang_scheduler::SglangSchedulerClient;
-use sgl_model_gateway::protocols::chat::ChatCompletionRequest;
-use sgl_model_gateway::routers::grpc::utils::{process_chat_messages, generate_tool_constraints};
+use smg::tokenizer::create_tokenizer_from_file;
+use smg::tokenizer::traits::Tokenizer;
+use smg::grpc_client::sglang_scheduler::SglangSchedulerClient;
+use smg::protocols::chat::ChatCompletionRequest;
+use smg::routers::grpc::utils::{process_chat_messages, generate_tool_constraints};
 
 use super::error::{SglErrorCode, set_error_message};
 use super::grpc_converter::sgl_grpc_response_converter_create;

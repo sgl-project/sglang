@@ -49,11 +49,8 @@ from sglang.srt.managers.schedule_batch import (
     ScheduleBatch,
 )
 from sglang.srt.mem_cache.common import release_kv_cache
-from sglang.srt.mem_cache.memory_pool import (
-    HybridLinearKVPool,
-    NSATokenToKVPool,
-    SWAKVPool,
-)
+from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, NSATokenToKVPool
+from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.tracing.trace import trace_event_batch, trace_slice, trace_slice_end
 
 if TYPE_CHECKING:
@@ -325,13 +322,10 @@ class SchedulerDisaggregationPrefillMixin:
         self.process_prefill_chunk()
 
         batch = self.get_new_batch_prefill()
-        if self.require_mlp_sync:
-            batch = self.prepare_mlp_sync_batch(batch)
+        batch = self.maybe_prepare_mlp_sync_batch_and_log_stats(batch)
 
         if batch:
             trace_event_batch("schedule", batch.reqs)
-
-        self.log_prefill_stats_late(batch)
 
         return batch
 
