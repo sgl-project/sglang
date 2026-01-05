@@ -1,3 +1,4 @@
+import os
 import unittest
 from types import SimpleNamespace
 
@@ -8,7 +9,6 @@ from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST_MOE_NVFP4,
     DEFAULT_MODEL_NAME_FOR_TEST_MXFP4_WITH_MOE,
     DEFAULT_SMALL_MOE_MODEL_NAME_FOR_TEST_CHAT,
-    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     popen_launch_server,
@@ -17,7 +17,7 @@ from sglang.test.test_utils import (
 
 class TestMoERunner(CustomTestCase):
     BASE_URL = DEFAULT_URL_FOR_TEST
-    TIMEOUT = DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
+    TIMEOUT = 6000
     DEFAULT_EVAL_KWARGS = {
         "eval_name": "mmlu",
         "num_examples": 5,
@@ -131,6 +131,20 @@ class TestMoERunner(CustomTestCase):
                 "pytorch",
             ],
         },
+        "moe_runner_cutlass_fp8": {
+            "model": DEFAULT_MODEL_NAME_FOR_TEST_FP8_WITH_MOE,
+            "timeout": 3600,
+            "other_args": [
+                "--trust-remote-code",
+                "--moe-runner-backend",
+                "cutlass",
+                "--attention-backend",
+                "triton",
+                "--sampling-backend",
+                "pytorch",
+                "--disable-cuda-graph",
+            ],
+        },
         "moe_runner_speculative": {
             "model": DEFAULT_SMALL_MOE_MODEL_NAME_FOR_TEST_CHAT,
             "other_args": [
@@ -159,12 +173,18 @@ class TestMoERunner(CustomTestCase):
         model = config["model"]
         other_args = config.get("other_args", [])
         eval_kwargs = self.DEFAULT_EVAL_KWARGS
+        env = dict(os.environ)
+        env["SGLANG_ENABLE_JIT_DEEPGEMM"] = "1"
+        env["SGLANG_JIT_DEEPGEMM_PRECOMPILE"] = "0"
+        env.update(config.get("env_overrides", {}))
+        timeout = config.get("timeout", self.TIMEOUT)
 
         process = popen_launch_server(
             model,
             self.BASE_URL,
-            timeout=self.TIMEOUT,
+            timeout=timeout,
             other_args=other_args,
+            env=env,
         )
         try:
             args = SimpleNamespace(
