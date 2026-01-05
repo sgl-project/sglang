@@ -64,6 +64,9 @@ class _SpecialTokensCachePatcher:
             assert (
                 not special_tokens
             ), "Cannot add special tokens after patch. Call unpatch_tokenizer first."
+            return tokenizer_cls._original_add_tokens(
+                self, new_tokens, special_tokens=False
+            )
 
         tokenizer_cls.all_special_tokens = patched_all_special_tokens
         tokenizer_cls.all_special_ids = patched_all_special_ids
