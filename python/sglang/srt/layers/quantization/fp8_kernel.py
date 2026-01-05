@@ -42,7 +42,11 @@ _is_cpu = is_cpu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 if _is_cuda:
-    from sgl_kernel import sgl_per_tensor_quant_fp8, sgl_per_token_quant_fp8
+    from sgl_kernel import sgl_per_token_quant_fp8
+
+    from sglang.jit_kernel.per_tensor_quant_fp8 import (
+        per_tensor_quant_fp8 as sgl_per_tensor_quant_fp8,
+    )
 
     # Temporary
     try:
@@ -1864,7 +1868,3 @@ if _is_cuda:
         @torch.library.register_fake("sgl_kernel::sgl_per_token_quant_fp8")
         def _(input, output_q, output_s):
             return
-
-    @torch.library.register_fake("sgl_kernel::sgl_per_tensor_quant_fp8")
-    def _sgl_per_tensor_quant_fp8(input, output_q, output_s, is_static):
-        return

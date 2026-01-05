@@ -141,8 +141,7 @@ class DiffusionServerArgs:
     model_path: str  # HF repo or local path
     modality: str = "image"  # "image" or "video" or "3d"
 
-    warmup_text: int = 1  # number of text-to-image/video warmups
-    warmup_edit: int = 0  # number of image/video-edit warmups
+    warmup: int = 1  # number of warmup requests
     custom_validator: str | None = None  # optional custom validator name
     # resources
     num_gpus: int = 1
@@ -302,8 +301,6 @@ ONE_GPU_CASES_A: list[DiffusionTestCase] = [
         DiffusionServerArgs(
             model_path="Qwen/Qwen-Image",
             modality="image",
-            warmup_text=1,
-            warmup_edit=0,
         ),
         T2I_sampling_params,
     ),
@@ -312,8 +309,6 @@ ONE_GPU_CASES_A: list[DiffusionTestCase] = [
         DiffusionServerArgs(
             model_path="Qwen/Qwen-Image",
             modality="image",
-            warmup_text=1,
-            warmup_edit=0,
             enable_cache_dit=True,
         ),
         T2I_sampling_params,
@@ -323,8 +318,6 @@ ONE_GPU_CASES_A: list[DiffusionTestCase] = [
         DiffusionServerArgs(
             model_path="black-forest-labs/FLUX.1-dev",
             modality="image",
-            warmup_text=1,
-            warmup_edit=0,
         ),
         T2I_sampling_params,
     ),
@@ -333,8 +326,6 @@ ONE_GPU_CASES_A: list[DiffusionTestCase] = [
         DiffusionServerArgs(
             model_path="black-forest-labs/FLUX.2-dev",
             modality="image",
-            warmup_text=1,
-            warmup_edit=0,
         ),
         T2I_sampling_params,
     ),
@@ -347,7 +338,6 @@ ONE_GPU_CASES_A: list[DiffusionTestCase] = [
             model_path="black-forest-labs/FLUX.2-dev",
             modality="image",
             dit_layerwise_offload=True,
-            warmup_text=1,
         ),
         T2I_sampling_params,
     ),
@@ -356,8 +346,6 @@ ONE_GPU_CASES_A: list[DiffusionTestCase] = [
         DiffusionServerArgs(
             model_path="Tongyi-MAI/Z-Image-Turbo",
             modality="image",
-            warmup_text=1,
-            warmup_edit=0,
         ),
         T2I_sampling_params,
     ),
@@ -374,8 +362,6 @@ ONE_GPU_CASES_A: list[DiffusionTestCase] = [
         DiffusionServerArgs(
             model_path="Qwen/Qwen-Image-Edit",
             modality="image",
-            warmup_text=0,
-            warmup_edit=1,
         ),
         TI2I_sampling_params,
     ),
@@ -384,18 +370,22 @@ ONE_GPU_CASES_A: list[DiffusionTestCase] = [
         DiffusionServerArgs(
             model_path="Qwen/Qwen-Image-Edit-2509",
             modality="image",
-            warmup_text=0,
-            warmup_edit=1,
         ),
         MULTI_IMAGE_TI2I_sampling_params,
+    ),
+    DiffusionTestCase(
+        "qwen_image_edit_2511_ti2i",
+        DiffusionServerArgs(
+            model_path="Qwen/Qwen-Image-Edit-2511",
+            modality="image",
+        ),
+        TI2I_sampling_params,
     ),
     DiffusionTestCase(
         "qwen_image_layered_i2i",
         DiffusionServerArgs(
             model_path="Qwen/Qwen-Image-Layered",
             modality="image",
-            warmup_text=0,
-            warmup_edit=1,
         ),
         MULTI_FRAME_I2I_sampling_params,
     ),
@@ -408,8 +398,7 @@ ONE_GPU_CASES_B: list[DiffusionTestCase] = [
         DiffusionServerArgs(
             model_path="Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
             modality="video",
-            warmup_text=0,
-            warmup_edit=0,
+            warmup=0,
             custom_validator="video",
         ),
         DiffusionSamplingParams(
@@ -422,8 +411,7 @@ ONE_GPU_CASES_B: list[DiffusionTestCase] = [
         DiffusionServerArgs(
             model_path="Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
             modality="video",
-            warmup_text=0,
-            warmup_edit=0,
+            warmup=0,
             custom_validator="video",
             num_gpus=1,
             lora_path="Cseti/Wan-LoRA-Arcane-Jinx-v1",
@@ -449,8 +437,6 @@ ONE_GPU_CASES_B: list[DiffusionTestCase] = [
         DiffusionServerArgs(
             model_path="black-forest-labs/FLUX.2-dev",
             modality="image",
-            warmup_text=0,
-            warmup_edit=1,
         ),
         TI2I_sampling_params,
     ),
@@ -459,8 +445,7 @@ ONE_GPU_CASES_B: list[DiffusionTestCase] = [
         DiffusionServerArgs(
             model_path="FastVideo/FastHunyuan-diffusers",
             modality="video",
-            warmup_text=0,
-            warmup_edit=0,
+            warmup=0,
             custom_validator="video",
         ),
         DiffusionSamplingParams(
@@ -473,8 +458,7 @@ ONE_GPU_CASES_B: list[DiffusionTestCase] = [
         DiffusionServerArgs(
             model_path="Wan-AI/Wan2.2-TI2V-5B-Diffusers",
             modality="video",
-            warmup_text=0,
-            warmup_edit=0,
+            warmup=0,
             custom_validator="video",
         ),
         TI2V_sampling_params,
@@ -484,8 +468,7 @@ ONE_GPU_CASES_B: list[DiffusionTestCase] = [
         DiffusionServerArgs(
             model_path="FastVideo/FastWan2.2-TI2V-5B-FullAttn-Diffusers",
             modality="video",
-            warmup_text=0,
-            warmup_edit=0,
+            warmup=0,
             custom_validator="video",
         ),
         TI2V_sampling_params,
@@ -498,8 +481,7 @@ TWO_GPU_CASES_A = [
         DiffusionServerArgs(
             model_path="Wan-AI/Wan2.2-I2V-A14B-Diffusers",
             modality="video",
-            warmup_text=0,
-            warmup_edit=0,
+            warmup=0,
             custom_validator="video",
         ),
         TI2V_sampling_params,
@@ -509,8 +491,7 @@ TWO_GPU_CASES_A = [
         DiffusionServerArgs(
             model_path="Wan-AI/Wan2.2-T2V-A14B-Diffusers",
             modality="video",
-            warmup_text=0,
-            warmup_edit=0,
+            warmup=0,
             custom_validator="video",
             num_gpus=2,
         ),
@@ -524,8 +505,7 @@ TWO_GPU_CASES_A = [
         DiffusionServerArgs(
             model_path="Wan-AI/Wan2.2-T2V-A14B-Diffusers",
             modality="video",
-            warmup_text=0,
-            warmup_edit=0,
+            warmup=0,
             custom_validator="video",
             num_gpus=2,
             lora_path="Cseti/wan2.2-14B-Arcane_Jinx-lora-v1",
@@ -538,8 +518,7 @@ TWO_GPU_CASES_A = [
         "wan2_1_t2v_14b_2gpu",
         DiffusionServerArgs(
             model_path="Wan-AI/Wan2.1-T2V-14B-Diffusers",
-            warmup_text=0,
-            warmup_edit=0,
+            warmup=0,
             modality="video",
             num_gpus=2,
             custom_validator="video",
@@ -556,8 +535,7 @@ TWO_GPU_CASES_B = [
         "wan2_1_i2v_14b_480P_2gpu",
         DiffusionServerArgs(
             model_path="Wan-AI/Wan2.1-I2V-14B-480P-Diffusers",
-            warmup_text=0,
-            warmup_edit=0,
+            warmup=0,
             modality="video",
             custom_validator="video",
             num_gpus=2,
@@ -570,8 +548,7 @@ TWO_GPU_CASES_B = [
         DiffusionServerArgs(
             model_path="Wan-AI/Wan2.1-I2V-14B-720P-Diffusers",
             modality="video",
-            warmup_text=0,
-            warmup_edit=0,
+            warmup=0,
             custom_validator="video",
             num_gpus=2,
             lora_path="starsfriday/Wan2.1-Divine-Power-LoRA",
@@ -583,8 +560,7 @@ TWO_GPU_CASES_B = [
         DiffusionServerArgs(
             model_path="Wan-AI/Wan2.1-I2V-14B-720P-Diffusers",
             modality="video",
-            warmup_text=0,
-            warmup_edit=0,
+            warmup=0,
             custom_validator="video",
             num_gpus=2,
         ),
@@ -595,8 +571,6 @@ TWO_GPU_CASES_B = [
         DiffusionServerArgs(
             model_path="Qwen/Qwen-Image",
             modality="image",
-            warmup_text=1,
-            warmup_edit=0,
             num_gpus=2,
             # test ring attn
             ulysses_degree=1,
@@ -609,8 +583,6 @@ TWO_GPU_CASES_B = [
         DiffusionServerArgs(
             model_path="black-forest-labs/FLUX.1-dev",
             modality="image",
-            warmup_text=1,
-            warmup_edit=0,
             num_gpus=2,
         ),
         T2I_sampling_params,
@@ -620,8 +592,6 @@ TWO_GPU_CASES_B = [
         DiffusionServerArgs(
             model_path="black-forest-labs/FLUX.2-dev",
             modality="image",
-            warmup_text=1,
-            warmup_edit=0,
             num_gpus=2,
             tp_size=2,
         ),

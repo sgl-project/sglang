@@ -844,6 +844,7 @@ def load_audio(
 class ImageData:
     url: str
     detail: Optional[Literal["auto", "low", "high"]] = "auto"
+    max_dynamic_patch: Optional[int] = None
 
 
 def load_image(
@@ -1507,7 +1508,7 @@ def add_prometheus_middleware(app):
 
 
 def add_prometheus_track_response_middleware(app):
-    from prometheus_client import Counter
+    from prometheus_client import Counter, Gauge
 
     http_request_counter = Counter(
         name="sglang:http_requests_total",
@@ -1521,6 +1522,13 @@ def add_prometheus_track_response_middleware(app):
         labelnames=["endpoint", "status_code", "method"],
     )
 
+    http_requests_active = Gauge(
+        name="sglang:http_requests_active",
+        documentation="Number of currently active HTTP requests",
+        labelnames=["endpoint", "method"],
+        multiprocess_mode="livesum",
+    )
+
     @app.middleware("http")
     async def track_http_status_code(request, call_next):
         # With recording all requests, we have the risk of high cardinality if requests have arbitrary unhandled paths.
@@ -1529,16 +1537,20 @@ def add_prometheus_track_response_middleware(app):
         method = request.method
 
         http_request_counter.labels(endpoint=path, method=method).inc()
+        http_requests_active.labels(endpoint=path, method=method).inc()
 
-        response = await call_next(request)
+        try:
+            response = await call_next(request)
 
-        http_response_counter.labels(
-            endpoint=path,
-            method=method,
-            status_code=str(response.status_code),
-        ).inc()
+            http_response_counter.labels(
+                endpoint=path,
+                method=method,
+                status_code=str(response.status_code),
+            ).inc()
 
-        return response
+            return response
+        finally:
+            http_requests_active.labels(endpoint=path, method=method).dec()
 
 
 # https://github.com/blueswen/fastapi-observability/blob/132a3c576f8b09e5311c68bd553215013bc75685/fastapi_app/utils.py#L98
@@ -2417,10 +2429,6 @@ def launch_dummy_health_check_server(host, port, enable_metrics):
     logger.info(
         f"Dummy health check server started in background thread at {host}:{port}"
     )
-
-
-def create_checksum(directory: str):
-    raise NotImplementedError()
 
 
 def set_cuda_arch():
