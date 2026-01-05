@@ -1,6 +1,5 @@
 from sglang.test.ci.ci_register import register_cuda_ci
 
-# Vision chunked prefill tests
 register_cuda_ci(est_time=150, suite="stage-b-test-small-1-gpu")
 
 """

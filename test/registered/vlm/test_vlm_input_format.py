@@ -1,6 +1,5 @@
 from sglang.test.ci.ci_register import register_cuda_ci
 
-# VLM input format tests
 register_cuda_ci(est_time=166, suite="stage-b-test-small-1-gpu")
 
 import json
