@@ -42,6 +42,7 @@ suites = {
         TestFile("test_chunked_prefill.py", 312),
         TestFile("test_constrained_decoding.py", 111),
         TestFile("test_eval_fp8_accuracy.py", 250),
+        TestFile("test_evs.py", 20),
         TestFile("test_external_models.py", 30),
         TestFile("test_fp8_utils.py", 9),
         TestFile("rotary_embedding/test_mrope.py", 10),
