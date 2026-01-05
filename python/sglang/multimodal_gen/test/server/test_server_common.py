@@ -541,7 +541,31 @@ Consider updating perf_baselines.json with the snippets below:
         assert (
             model["id"] == case.server_args.model_path
         ), f"Model ID mismatch: expected {case.server_args.model_path}, got {model['id']}"
-        logger.info("[Models API] GET /v1/models returned valid response")
+
+        # Verify extended diffusion-specific fields
+        assert "num_gpus" in model, "Model missing 'num_gpus' field"
+        assert "task_type" in model, "Model missing 'task_type' field"
+        assert "dit_precision" in model, "Model missing 'dit_precision' field"
+        assert "vae_precision" in model, "Model missing 'vae_precision' field"
+        assert (
+            model["num_gpus"] == case.server_args.num_gpus
+        ), f"num_gpus mismatch: expected {case.server_args.num_gpus}, got {model['num_gpus']}"
+        # Verify task_type is consistent with the modality specified in the test config.
+        # We can't access pipeline_config from test config, but we can validate against modality.
+        modality_to_valid_task_types = {
+            "image": {"T2I", "I2I", "TI2I"},
+            "video": {"T2V", "I2V", "TI2V"},
+        }
+        valid_task_types = modality_to_valid_task_types.get(
+            case.server_args.modality, set()
+        )
+        assert model["task_type"] in valid_task_types, (
+            f"task_type '{model['task_type']}' not valid for modality "
+            f"'{case.server_args.modality}'. Expected one of: {valid_task_types}"
+        )
+        logger.info(
+            "[Models API] GET /v1/models returned valid response with extended fields"
+        )
 
         # Test GET /v1/models/{model_path}
         model_path = model["id"]
@@ -552,7 +576,17 @@ Consider updating perf_baselines.json with the snippets below:
         single_model = resp.json()
         assert single_model["id"] == model_path, "Single model ID mismatch"
         assert single_model["object"] == "model", "Single model object type mismatch"
-        logger.info("[Models API] GET /v1/models/{model_path} returned valid response")
+
+        # Verify extended fields on single model endpoint too
+        assert "num_gpus" in single_model, "Single model missing 'num_gpus' field"
+        assert "task_type" in single_model, "Single model missing 'task_type' field"
+        assert single_model["task_type"] in valid_task_types, (
+            f"Single model task_type '{single_model['task_type']}' not valid for modality "
+            f"'{case.server_args.modality}'. Expected one of: {valid_task_types}"
+        )
+        logger.info(
+            "[Models API] GET /v1/models/{model_path} returned valid response with extended fields"
+        )
 
         # Test GET /v1/models/{non_existent_model} returns 404
         logger.info("[Models API] Testing GET /v1/models/non_existent_model")
