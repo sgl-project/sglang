@@ -4,19 +4,24 @@ from typing import Any, List, Optional, Tuple
 import torch
 import torch.nn as nn
 
+from sglang.jit_kernel.norm import can_use_fused_inplace_qknorm
 from sglang.multimodal_gen.configs.models.dits.zimage import ZImageDitConfig
 from sglang.multimodal_gen.runtime.layers.activation import SiluAndMul
 from sglang.multimodal_gen.runtime.layers.attention import USPAttention
-from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm
+from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm, apply_qk_norm
 from sglang.multimodal_gen.runtime.layers.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
 )
-from sglang.multimodal_gen.runtime.layers.rotary_embedding import _apply_rotary_emb
+from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
+    _apply_rotary_emb,
+    apply_flashinfer_rope_qk_inplace,
+)
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 from sglang.multimodal_gen.runtime.platforms import current_platform
+from sglang.multimodal_gen.runtime.utils.layerwise_offload import OffloadableDiTMixin
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
@@ -150,23 +155,40 @@ class ZImageAttention(nn.Module):
         k = k.view(*k.shape[:-1], self.num_kv_heads, self.head_dim)
         v = v.view(*v.shape[:-1], self.num_kv_heads, self.head_dim)
 
-        if self.norm_q is not None:
-            q = self.norm_q(q)
-        if self.norm_k is not None:
-            k = self.norm_k(k)
-
-        # Apply RoPE
-        def apply_rotary_emb(
-            x_in: torch.Tensor,
-            freqs_cis: torch.Tensor,
-        ) -> Tuple[torch.Tensor, torch.Tensor]:
-            cos, sin = freqs_cis
-            x_out = _apply_rotary_emb(x_in, cos, sin, is_neox_style=False)
-            return x_out
+        if self.qk_norm:
+            if (
+                q.is_cuda
+                and (self.norm_q.variance_epsilon == self.norm_k.variance_epsilon)
+                and can_use_fused_inplace_qknorm(self.head_dim)
+            ):
+                q, k = apply_qk_norm(
+                    q=q,
+                    k=k,
+                    q_norm=self.norm_q,
+                    k_norm=self.norm_k,
+                    head_dim=self.head_dim,
+                    allow_inplace=True,
+                )
+            else:
+                q = self.norm_q(q)
+                k = self.norm_k(k)
 
         if freqs_cis is not None:
-            q = apply_rotary_emb(q, freqs_cis)
-            k = apply_rotary_emb(k, freqs_cis)
+            cos, sin = freqs_cis
+            if q.is_cuda and q.shape == k.shape:
+                cos_sin_cache = torch.cat(
+                    [
+                        cos.to(dtype=torch.float32).contiguous(),
+                        sin.to(dtype=torch.float32).contiguous(),
+                    ],
+                    dim=-1,
+                )
+                q, k = apply_flashinfer_rope_qk_inplace(
+                    q, k, cos_sin_cache, is_neox=False
+                )
+            else:
+                q = _apply_rotary_emb(q, cos, sin, is_neox_style=False)
+                k = _apply_rotary_emb(k, cos, sin, is_neox_style=False)
 
         hidden_states = self.attn(q, k, v)
         hidden_states = hidden_states.flatten(2)
@@ -350,7 +372,7 @@ class RopeEmbedder:
         return torch.cat(cos_out, dim=-1), torch.cat(sin_out, dim=-1)
 
 
-class ZImageTransformer2DModel(CachableDiT):
+class ZImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
     _supports_gradient_checkpointing = True
     _no_split_modules = ["ZImageTransformerBlock"]
     param_names_mapping = ZImageDitConfig().arch_config.param_names_mapping
@@ -465,6 +487,7 @@ class ZImageTransformer2DModel(CachableDiT):
         self.rotary_emb = RopeEmbedder(
             theta=self.rope_theta, axes_dims=self.axes_dims, axes_lens=self.axes_lens
         )
+        self.layer_names = ["layers"]
 
     def unpatchify(
         self, x: List[torch.Tensor], size: List[Tuple], patch_size, f_patch_size
