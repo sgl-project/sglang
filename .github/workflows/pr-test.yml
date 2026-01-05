@@ -885,9 +885,13 @@ jobs:
     needs: [check-changes, multimodal-gen-test-1-gpu, multimodal-gen-test-2-gpu]
     if: |
       always() &&
-      (needs.multimodal-gen-test-1-gpu.result == 'success' || needs.multimodal-gen-test-1-gpu.result == 'failure') &&
-      (needs.multimodal-gen-test-2-gpu.result == 'success' || needs.multimodal-gen-test-2-gpu.result == 'failure') &&
-      needs.check-changes.outputs.multimodal_gen == 'true'
+        needs.check-changes.outputs.multimodal_gen == 'true' &&
+        (
+          needs.multimodal-gen-test-1-gpu.result == 'success' ||
+          needs.multimodal-gen-test-1-gpu.result == 'failure' ||
+          needs.multimodal-gen-test-2-gpu.result == 'success' ||
+          needs.multimodal-gen-test-2-gpu.result == 'failure'
+        )
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
