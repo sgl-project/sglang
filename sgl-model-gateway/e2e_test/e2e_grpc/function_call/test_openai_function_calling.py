@@ -9,7 +9,7 @@ with minimal changes:
 - All test logic and assertions remain identical
 
 Run with:
-    pytest py_test/e2e_grpc/e2e_grpc/function_call/test_openai_function_calling.py -v
+    pytest e2e_test/e2e_grpc/e2e_grpc/function_call/test_openai_function_calling.py -v
 """
 
 import json

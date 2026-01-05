@@ -9,7 +9,7 @@ with minimal changes:
 - All test logic and assertions remain identical
 
 Run with:
-    pytest py_test/e2e_grpc/e2e_grpc/validation/test_openai_server_ignore_eos.py -v
+    pytest e2e_test/e2e_grpc/e2e_grpc/validation/test_openai_server_ignore_eos.py -v
 """
 
 import sys
