@@ -17,8 +17,7 @@ import logging
 from types import SimpleNamespace
 
 import pytest
-
-from sglang.test.run_eval import run_eval
+from infra import run_eval
 
 logger = logging.getLogger(__name__)
 

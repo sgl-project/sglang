@@ -15,7 +15,34 @@ import pytest
 if TYPE_CHECKING:
     from infra import ModelPool
 
-# Logger for this module (pytest handles log configuration via --log-cli-level)
+
+# ---------------------------------------------------------------------------
+# Logging setup (clean output without pytest's "---- live log ----" dividers)
+# ---------------------------------------------------------------------------
+def _setup_logging() -> None:
+    """Configure clean logging to stdout with timestamps."""
+    # Custom format: timestamp [logger] message
+    fmt = "%(asctime)s.%(msecs)03d [%(name)s] %(message)s"
+    datefmt = "%H:%M:%S"
+
+    # Create handler for stdout
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(logging.Formatter(fmt, datefmt))
+
+    # Configure our e2e_test and infra modules for INFO level
+    for logger_name in ("e2e_test", "infra"):
+        log = logging.getLogger(logger_name)
+        log.setLevel(logging.INFO)
+        log.addHandler(handler)
+        log.propagate = False  # Don't double-log
+
+    # Suppress noisy third-party loggers
+    for logger_name in ("openai", "httpx", "httpcore", "numexpr"):
+        logging.getLogger(logger_name).setLevel(logging.WARNING)
+
+
+_setup_logging()
+
 logger = logging.getLogger(__name__)
 
 # Path setup for imports

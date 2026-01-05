@@ -24,8 +24,7 @@ markers = [
   "e2e: mark test as end-to-end test requiring GPU workers",
   "slow: mark test as slow-running",
 ]
-addopts = "-v"
-log_cli = true
-log_cli_level = "INFO"
-log_cli_format = "%(asctime)s.%(msecs)03d %(levelname)s [%(name)s] %(message)s"
-log_cli_date_format = "%H:%M:%S"
+addopts = "-v -s"
+# Explicitly disable live log to avoid "---- live log ----" dividers
+# We configure logging manually in conftest.py
+log_cli = false

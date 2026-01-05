@@ -57,6 +57,7 @@ from .process_utils import (
     wait_for_health,
     wait_for_workers_ready,
 )
+from .run_eval import run_eval
 
 __all__ = [
     # Enums
@@ -120,4 +121,6 @@ __all__ = [
     "EMBEDDING_MODELS",
     "REASONING_MODELS",
     "FUNCTION_CALLING_MODELS",
+    # Evaluation
+    "run_eval",
 ]

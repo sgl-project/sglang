@@ -1,12 +1,16 @@
 # Adapted from https://github.com/openai/simple-evals/
+"""Common utilities for simple evaluations."""
 
+from __future__ import annotations
+
+import logging
 import os
 import resource
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
 from multiprocessing.pool import ThreadPool
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
 
 import httpx
 import jinja2
@@ -16,6 +20,8 @@ import requests
 from openai import OpenAI
 from tqdm import tqdm
 
+logger = logging.getLogger(__name__)
+
 OPENAI_SYSTEM_MESSAGE_API = "You are a helpful assistant."
 OPENAI_SYSTEM_MESSAGE_CHATGPT = (
     "You are ChatGPT, a large language model trained by OpenAI, based on the GPT-4 architecture."
@@ -23,8 +29,8 @@ OPENAI_SYSTEM_MESSAGE_CHATGPT = (
 )
 
 
-Message = Dict[str, Any]  # keys role, content
-MessageList = List[Message]
+Message = dict[str, Any]  # keys role, content
+MessageList = list[Message]
 
 
 class SamplerBase:
@@ -39,26 +45,22 @@ class SamplerBase:
 
 @dataclass
 class EvalResult:
-    """
-    Result of running an evaluation (usually consisting of many samples)
-    """
+    """Result of running an evaluation (usually consisting of many samples)."""
 
-    score: Optional[float]  # top-line metric
-    metrics: Optional[Dict[str, float]]  # other metrics
-    htmls: List[str]  # strings of valid HTML
-    convos: List[MessageList]  # sampled conversations
+    score: float | None  # top-line metric
+    metrics: dict[str, float] | None  # other metrics
+    htmls: list[str]  # strings of valid HTML
+    convos: list[MessageList]  # sampled conversations
 
 
 @dataclass
 class SingleEvalResult:
-    """
-    Result of evaluating a single sample
-    """
+    """Result of evaluating a single sample."""
 
-    score: Optional[float]
-    metrics: Dict[str, float] = field(default_factory=dict)
-    html: Optional[str] = None
-    convo: Optional[MessageList] = None  # sampled conversation
+    score: float | None
+    metrics: dict[str, float] = field(default_factory=dict)
+    html: str | None = None
+    convo: MessageList | None = None  # sampled conversation
 
 
 class Eval:
@@ -81,19 +83,17 @@ class LargerHttpxClient(httpx.Client):
 
 
 class ChatCompletionSampler(SamplerBase):
-    """
-    Sample from OpenAI's chat completion API
-    """
+    """Sample from OpenAI's chat completion API."""
 
     def __init__(
         self,
-        base_url: str = None,
-        model: Optional[str] = None,
-        system_message: Optional[str] = None,
+        base_url: str | None = None,
+        model: str | None = None,
+        system_message: str | None = None,
         temperature: float = 0.0,
-        reasoning_effort: Optional[str] = None,
+        reasoning_effort: str | None = None,
         max_tokens: int = 2048,
-        extra_body: Optional[Dict[str, Any]] = None,
+        extra_body: dict[str, Any] | None = None,
     ):
         self.client = OpenAI(base_url=base_url, http_client=LargerHttpxClient())
 
@@ -107,8 +107,11 @@ class ChatCompletionSampler(SamplerBase):
         self.reasoning_effort = reasoning_effort
         self.extra_body = extra_body
         self.image_format = "url"
-        print(
-            f"ChatCompletionSampler initialized with {self.system_message=} {self.temperature=} {self.max_tokens=} {self.reasoning_effort=} {self.extra_body=}"
+        logger.debug(
+            "ChatCompletionSampler: model=%s, temp=%.2f, max_tokens=%d",
+            self.model,
+            self.temperature,
+            self.max_tokens,
         )
 
     def _handle_image(
@@ -149,20 +152,20 @@ class ChatCompletionSampler(SamplerBase):
                     extra_body=self.extra_body,
                 )
                 return response.choices[0].message.content or ""
-            # NOTE: BadRequestError is triggered once for MMMU, please uncomment if you are rerunning MMMU
             except openai.BadRequestError as e:
-                print("Bad Request Error", e)
+                logger.warning("Bad request error: %s", e)
                 return ""
             except Exception as e:
-                exception_backoff = 2**trial  # expontial back off
-                print(
-                    f"Rate limit exception so wait and retry {trial} after {exception_backoff} sec",
+                exception_backoff = 2**trial  # exponential back off
+                logger.debug(
+                    "Rate limit, retry %d after %ds: %s",
+                    trial,
+                    exception_backoff,
                     e,
                 )
                 time.sleep(exception_backoff)
                 trial += 1
-        # If all retries are exhausted, return empty string instead of None
-        print(f"All retry attempts exhausted for request. Returning empty response.")
+        logger.warning("All retry attempts exhausted, returning empty response")
         return ""
 
 
@@ -280,9 +283,9 @@ def _compute_stat(values: list, stat: str):
 
 
 def aggregate_results(
-    single_eval_results: List[SingleEvalResult],
-    default_stats: Tuple[str] = ("mean", "std"),
-    name2stats: Optional[Dict[str, Tuple[str]]] = None,
+    single_eval_results: list[SingleEvalResult],
+    default_stats: tuple[str, ...] = ("mean", "std"),
+    name2stats: dict[str, tuple[str, ...]] | None = None,
 ) -> EvalResult:
     """
     Aggregate results from multiple evaluations into a single EvalResult.
@@ -315,15 +318,14 @@ def aggregate_results(
     )
 
 
-def map_with_progress(f: callable, xs: List[Any], num_threads: int):
-    """
-    Apply f to each element of xs, using a ThreadPool, and show progress.
-    """
+def map_with_progress(f: callable, xs: list[Any], num_threads: int) -> list[Any]:
+    """Apply f to each element of xs, using a ThreadPool, and show progress."""
+    # Use quiet progress bar that doesn't pollute logs
     if os.getenv("debug"):
-        return list(map(f, tqdm(xs, total=len(xs))))
+        return list(map(f, tqdm(xs, total=len(xs), leave=False)))
     else:
         with ThreadPool(min(num_threads, len(xs))) as pool:
-            return list(tqdm(pool.imap(f, xs), total=len(xs)))
+            return list(tqdm(pool.imap(f, xs), total=len(xs), leave=False))
 
 
 jinja_env = jinja2.Environment(
@@ -444,8 +446,9 @@ def make_report_from_example_htmls(htmls: List[str]):
     )
 
 
-def download_dataset(path, url):
-    print(f"Downloading dataset {path} from {url}")
+def download_dataset(path: str, url: str) -> None:
+    """Download a dataset from URL to path."""
+    logger.info("Downloading dataset from %s", url)
     try:
         response = requests.get(url, stream=True)
         response.raise_for_status()
@@ -459,17 +462,19 @@ def download_dataset(path, url):
             unit="iB",
             unit_scale=True,
             unit_divisor=1024,
+            leave=False,
         ) as progress_bar:
             for data in response.iter_content(block_size):
                 size = f.write(data)
                 progress_bar.update(size)
 
-        print(f"Dataset downloaded and saved to {path}")
+        logger.debug("Dataset saved to %s", path)
     except requests.RequestException as e:
-        raise Exception(f"Failed to download dataset: {e}")
+        raise RuntimeError(f"Failed to download dataset: {e}") from e
 
 
-def set_ulimit(target_soft_limit=65535):
+def set_ulimit(target_soft_limit: int = 65535) -> None:
+    """Set the file descriptor limit for parallel requests."""
     resource_type = resource.RLIMIT_NOFILE
     current_soft, current_hard = resource.getrlimit(resource_type)
 
@@ -477,4 +482,4 @@ def set_ulimit(target_soft_limit=65535):
         try:
             resource.setrlimit(resource_type, (target_soft_limit, current_hard))
         except ValueError as e:
-            print(f"Fail to set RLIMIT_NOFILE: {e}")
+            logger.debug("Could not set RLIMIT_NOFILE: %s", e)
