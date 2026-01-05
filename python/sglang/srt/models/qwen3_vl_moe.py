@@ -274,6 +274,9 @@ class Qwen3VLMoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                     # attempted to load as other weights later
                     is_expert_weight = True
                     name_mapped = name.replace(weight_name, param_name)
+                    if name_mapped not in params_dict:                                                                                                                                                             
+                        # Expert weight not on this rank, will be skipped below                                                                                                                                   
+                        continue
                     if is_fused_expert:
                         loaded_weight = loaded_weight.transpose(-1, -2)  # no bias
                         if "experts.gate_up_proj" in name:
