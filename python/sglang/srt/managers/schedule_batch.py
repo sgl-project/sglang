@@ -376,7 +376,7 @@ class MultimodalInputs:
         if envs.SGLANG_MM_BUFFER_SIZE_MB.get() > 0:
             for item in ret.mm_items:
                 if item.feature is not None:
-                    item.feature = item.feature.to("cpu", non_blocking=True)
+                    item.feature = item.feature.to("cpu")
 
         optional_args = [
             "mrope_positions",

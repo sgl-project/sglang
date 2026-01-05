@@ -171,7 +171,7 @@ class DecodingStage(PipelineStage):
         self.maybe_free_model_hooks()
 
         if self.server_args.vae_cpu_offload:
-            self.vae.to("cpu", non_blocking=True)
+            self.vae.to("cpu")
 
         if torch.backends.mps.is_available():
             del self.vae
