@@ -34,7 +34,7 @@ impl AgeBuckets {
         }
     }
 
-    fn bucket_count(&self) -> usize {
+    fn len(&self) -> usize {
         self.le_labels.len()
     }
 }
@@ -85,9 +85,9 @@ impl InFlightRequestTracker {
     pub fn compute_bucket_counts(&self) -> Vec<usize> {
         let buckets = &*AGE_BUCKETS;
         let now = Instant::now();
-        let inf_idx = buckets.bucket_count() - 1;
+        let inf_idx = buckets.len() - 1;
 
-        let mut counts = vec![0usize; buckets.bucket_count()];
+        let mut counts = vec![0usize; buckets.len()];
         for entry in self.requests.iter() {
             let age_secs = now.duration_since(*entry.value()).as_secs();
             let bucket_idx = buckets
@@ -253,7 +253,7 @@ mod tests {
 
         assert_eq!(buckets.le_labels, vec!["10", "30", "60", "+Inf"]);
         assert_eq!(buckets.gt_labels, vec!["0", "10", "30", "60"]);
-        assert_eq!(buckets.bucket_count(), 4);
+        assert_eq!(buckets.len(), 4);
     }
 
     #[test]
