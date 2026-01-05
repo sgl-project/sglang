@@ -330,11 +330,10 @@ class ComposedPipelineBase(ABC):
         batch.log(server_args=server_args)
 
         # Execute each stage
-        if not batch.is_warmup:
-            logger.info(
-                "Running pipeline stages: %s",
-                list(self._stage_name_mapping.keys()),
-                main_process_only=True,
-            )
+        logger.info(
+            "Running pipeline stages: %s",
+            list(self._stage_name_mapping.keys()),
+            main_process_only=True,
+        )
 
         return self.executor.execute_with_profiling(self.stages, batch, server_args)
