@@ -646,6 +646,7 @@ class Scheduler(
             enable_mamba_extra_buffer=server_args.enable_mamba_extra_buffer(),
             pp_rank=self.pp_rank,
             pp_size=self.pp_size,
+            chunked_prefill_size=server_args.chunked_prefill_size,
         )
 
         if (
