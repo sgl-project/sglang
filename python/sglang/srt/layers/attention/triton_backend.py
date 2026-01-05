@@ -1351,6 +1351,47 @@ class TritonAttnBackend(AttentionBackend):
         from sglang.srt.model_executor.forward_batch_info import AttentionTokenInfo
 
         try:
+            # Validate inputs to prevent CUDA device-side asserts
+            batch_size = q.shape[0]
+            if batch_size == 0:
+                return  # Nothing to do for empty batch
+
+            # Synchronize to catch any pending CUDA errors before we start
+            import torch
+            torch.cuda.synchronize()
+
+            # Check kv_indptr has correct size
+            if kv_indptr.shape[0] != batch_size + 1:
+                import logging
+                logging.getLogger(__name__).warning(
+                    f"Skipping attention capture: kv_indptr size mismatch "
+                    f"(expected {batch_size + 1}, got {kv_indptr.shape[0]})"
+                )
+                return
+
+            # Validate kv_indices bounds to prevent out-of-bounds access
+            max_kv_idx = kv_indptr[-1].item()
+            if max_kv_idx > 0 and kv_indices.shape[0] > 0:
+                if max_kv_idx > kv_indices.shape[0]:
+                    import logging
+                    logging.getLogger(__name__).warning(
+                        f"Skipping attention capture: kv_indptr max ({max_kv_idx}) > "
+                        f"kv_indices size ({kv_indices.shape[0]})"
+                    )
+                    return
+
+                # Check kv_indices values are within k_buffer bounds (sync first to get accurate values)
+                indices_to_check = kv_indices[:max_kv_idx]
+                max_idx = indices_to_check.max().item()
+                min_idx = indices_to_check.min().item()
+                if max_idx >= k_buffer.shape[0] or min_idx < 0:
+                    import logging
+                    logging.getLogger(__name__).warning(
+                        f"Skipping attention capture: kv_indices out of bounds "
+                        f"(min={min_idx}, max={max_idx}, k_buffer_size={k_buffer.shape[0]})"
+                    )
+                    return
+
             topk_scores, topk_indices, topk_logits, logsumexp_candidates = compute_topk_attention_chunked(
                 q,
                 k_buffer,
@@ -1401,6 +1442,20 @@ class TritonAttnBackend(AttentionBackend):
             # (keeps the last layer's info, which is typically the most useful)
             forward_batch.attention_token_info = info
 
+            # Synchronize to catch any CUDA errors before they propagate
+            torch.cuda.synchronize()
+
+        except (RuntimeError, torch.cuda.CudaError) as e:
+            # Catch CUDA errors specifically - they can be fatal
+            import logging
+            logging.getLogger(__name__).error(
+                f"CUDA error during attention capture (disabling for this request): {e}"
+            )
+            # Try to recover by clearing CUDA error state
+            try:
+                torch.cuda.synchronize()
+            except:
+                pass
         except Exception as e:
             # Don't let attention capture errors break inference
             import logging

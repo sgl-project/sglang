@@ -168,9 +168,32 @@ def compute_topk_attention_chunked(
             Use: true_prob = exp(topk_logit - logsumexp_all)
     """
     batch_size, num_heads, head_dim = q.shape
+    device = q.device
+
+    # Handle empty batch
+    if batch_size == 0:
+        return (
+            torch.zeros((0, top_k), dtype=torch.float32, device=device),
+            torch.zeros((0, top_k), dtype=torch.int64, device=device),
+            torch.zeros((0, top_k), dtype=torch.float32, device=device),
+            torch.zeros((0,), dtype=torch.float32, device=device),
+        )
+
+    # Validate kv_indptr size
+    if kv_indptr.shape[0] != batch_size + 1:
+        logger.warning(
+            f"kv_indptr size mismatch: expected {batch_size + 1}, got {kv_indptr.shape[0]}. "
+            "Returning zeros."
+        )
+        return (
+            torch.zeros((batch_size, top_k), dtype=torch.float32, device=device),
+            torch.zeros((batch_size, top_k), dtype=torch.int64, device=device),
+            torch.zeros((batch_size, top_k), dtype=torch.float32, device=device),
+            torch.zeros((batch_size,), dtype=torch.float32, device=device),
+        )
+
     num_kv_heads = k_buffer.shape[1]
     kv_group_num = num_heads // num_kv_heads
-    device = q.device
 
     # Compute max sequence length
     seq_lens = kv_indptr[1:] - kv_indptr[:-1]
@@ -183,6 +206,36 @@ def compute_topk_attention_chunked(
             torch.zeros((batch_size, top_k), dtype=torch.float32, device=device),
             torch.zeros((batch_size,), dtype=torch.float32, device=device),
         )
+
+    # Validate kv_indices bounds (synchronize to ensure GPU values are ready)
+    max_kv_idx = kv_indptr[-1].item()
+    if max_kv_idx > 0:
+        if max_kv_idx > kv_indices.shape[0]:
+            logger.warning(
+                f"kv_indptr max ({max_kv_idx}) > kv_indices size ({kv_indices.shape[0]}). "
+                "Returning zeros."
+            )
+            return (
+                torch.zeros((batch_size, top_k), dtype=torch.float32, device=device),
+                torch.zeros((batch_size, top_k), dtype=torch.int64, device=device),
+                torch.zeros((batch_size, top_k), dtype=torch.float32, device=device),
+                torch.zeros((batch_size,), dtype=torch.float32, device=device),
+            )
+        # Validate kv_indices values are within k_buffer bounds (need sync for GPU tensors)
+        indices_slice = kv_indices[:max_kv_idx]
+        max_idx = indices_slice.max().item()
+        min_idx = indices_slice.min().item()
+        if max_idx >= k_buffer.shape[0] or min_idx < 0:
+            logger.warning(
+                f"kv_indices out of bounds: min={min_idx}, max={max_idx}, "
+                f"k_buffer size={k_buffer.shape[0]}. Returning zeros."
+            )
+            return (
+                torch.zeros((batch_size, top_k), dtype=torch.float32, device=device),
+                torch.zeros((batch_size, top_k), dtype=torch.int64, device=device),
+                torch.zeros((batch_size, top_k), dtype=torch.float32, device=device),
+                torch.zeros((batch_size,), dtype=torch.float32, device=device),
+            )
 
     # For small sequences, use direct PyTorch (simpler, no kernel overhead)
     if max_seq_len <= chunk_size * 2:
@@ -274,6 +327,7 @@ def _compute_exact_logsumexp_all_chunks(
     num_kv_heads = k_buffer.shape[1]
     kv_group_num = num_heads // num_kv_heads
     device = q.device
+    k_buffer_size = k_buffer.shape[0]
 
     logsumexp_list = []
 
@@ -297,6 +351,17 @@ def _compute_exact_logsumexp_all_chunks(
 
             # Get positions in this chunk
             kv_pos = kv_indices[kv_start + chunk_start:kv_start + chunk_end]
+
+            # Validate indices before indexing (prevent CUDA assert)
+            if kv_pos.numel() > 0:
+                max_pos = kv_pos.max().item()
+                min_pos = kv_pos.min().item()
+                if max_pos >= k_buffer_size or min_pos < 0:
+                    logger.warning(
+                        f"LSE batch {b} chunk {chunk_idx}: kv_pos out of bounds "
+                        f"(min={min_pos}, max={max_pos}, k_buffer_size={k_buffer_size}). Skipping."
+                    )
+                    continue
 
             # Gather keys: [chunk_len, num_kv_heads, head_dim]
             keys = k_buffer[kv_pos]
@@ -361,6 +426,7 @@ def _rescan_top_chunks(
     kv_group_num = num_heads // num_kv_heads
     device = q.device
     k_chunks = topk_chunk_idx.shape[1]
+    k_buffer_size = k_buffer.shape[0]
 
     # Compute exact logsumexp over ALL tokens if requested
     # This is more expensive but gives true probability
@@ -401,6 +467,17 @@ def _rescan_top_chunks(
             # Get positions in this chunk
             positions = torch.arange(chunk_start, chunk_end, device=device)
             kv_pos = kv_indices[kv_start + chunk_start:kv_start + chunk_end]
+
+            # Validate indices before indexing (prevent CUDA assert)
+            if kv_pos.numel() > 0:
+                max_pos = kv_pos.max().item()
+                min_pos = kv_pos.min().item()
+                if max_pos >= k_buffer_size or min_pos < 0:
+                    logger.warning(
+                        f"Rescan batch {b} chunk {chunk_idx}: kv_pos out of bounds "
+                        f"(min={min_pos}, max={max_pos}, k_buffer_size={k_buffer_size}). Skipping chunk."
+                    )
+                    continue
 
             # Gather keys: [chunk_len, num_kv_heads, head_dim]
             keys = k_buffer[kv_pos]
@@ -489,6 +566,7 @@ def _compute_topk_pytorch(
     num_kv_heads = k_buffer.shape[1]
     kv_group_num = num_heads // num_kv_heads
     device = q.device
+    k_buffer_size = k_buffer.shape[0]
 
     topk_scores_list = []
     topk_indices_list = []
@@ -509,6 +587,21 @@ def _compute_topk_pytorch(
 
         # Get KV cache positions
         kv_pos = kv_indices[kv_start:kv_end]
+
+        # Validate indices before indexing (prevent CUDA assert)
+        if kv_pos.numel() > 0:
+            max_pos = kv_pos.max().item()
+            min_pos = kv_pos.min().item()
+            if max_pos >= k_buffer_size or min_pos < 0:
+                logger.warning(
+                    f"Batch {b}: kv_pos out of bounds (min={min_pos}, max={max_pos}, "
+                    f"k_buffer_size={k_buffer_size}). Skipping."
+                )
+                topk_scores_list.append(torch.zeros(top_k, device=device))
+                topk_indices_list.append(torch.zeros(top_k, dtype=torch.int64, device=device))
+                topk_logits_list.append(torch.zeros(top_k, device=device))
+                logsumexp_list.append(torch.tensor(0.0, device=device))
+                continue
 
         # Gather keys: [seq_len, num_kv_heads, head_dim]
         keys = k_buffer[kv_pos]
