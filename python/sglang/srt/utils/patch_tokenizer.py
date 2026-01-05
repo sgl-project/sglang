@@ -13,35 +13,13 @@ def patch_tokenizer(tokenizer):
         logger.info(
             f"Applying special tokens cache patch for Kimi tokenizer: {type(tokenizer).__name__}"
         )
-        return _patch_special_tokens_cache(tokenizer)
+        return _SpecialTokensCachePatcher.patch(tokenizer)
 
     return tokenizer
 
 
 def unpatch_tokenizer(tokenizer):
-    cls = type(tokenizer)
-
-    if not getattr(cls, "_sglang_special_tokens_patched", False):
-        return tokenizer
-
-    cls.all_special_tokens = property(cls._original_all_special_tokens)
-    cls.all_special_ids = property(cls._original_all_special_ids)
-    cls.add_special_tokens = cls._original_add_special_tokens
-    cls.add_tokens = cls._original_add_tokens
-
-    del cls._original_all_special_tokens
-    del cls._original_all_special_ids
-    del cls._original_add_special_tokens
-    del cls._original_add_tokens
-    del cls._sglang_special_tokens_patched
-
-    if hasattr(tokenizer, "_sglang_cached_special_tokens"):
-        del tokenizer._sglang_cached_special_tokens
-    if hasattr(tokenizer, "_sglang_cached_special_ids"):
-        del tokenizer._sglang_cached_special_ids
-
-    logger.info(f"Unpatched special tokens cache for {cls.__name__}")
-    return tokenizer
+    return _SpecialTokensCachePatcher.unpatch(tokenizer)
 
 
 def _is_kimi_tiktoken_tokenizer(tokenizer):
@@ -51,45 +29,92 @@ def _is_kimi_tiktoken_tokenizer(tokenizer):
     return class_name == "TikTokenTokenizer" and "tokenization_kimi" in module_name
 
 
-def _patch_special_tokens_cache(tokenizer):
-    cls = type(tokenizer)
+class _SpecialTokensCachePatcher:
+    _PATCHED_FLAG = "_sglang_special_tokens_patched"
+    _CACHED_TOKENS_ATTR = "_sglang_cached_special_tokens"
+    _CACHED_IDS_ATTR = "_sglang_cached_special_ids"
 
-    if getattr(cls, "_sglang_special_tokens_patched", False):
+    @classmethod
+    def patch(cls, tokenizer):
+        tokenizer_cls = type(tokenizer)
+
+        if getattr(tokenizer_cls, cls._PATCHED_FLAG, False):
+            return tokenizer
+
+        tokenizer_cls._original_all_special_tokens = (
+            tokenizer_cls.all_special_tokens.fget
+        )
+        tokenizer_cls._original_all_special_ids = tokenizer_cls.all_special_ids.fget
+        tokenizer_cls._original_add_special_tokens = tokenizer_cls.add_special_tokens
+        tokenizer_cls._original_add_tokens = tokenizer_cls.add_tokens
+
+        @property
+        def patched_all_special_tokens(self):
+            if getattr(self, cls._CACHED_TOKENS_ATTR, None) is None:
+                setattr(
+                    self,
+                    cls._CACHED_TOKENS_ATTR,
+                    tokenizer_cls._original_all_special_tokens(self),
+                )
+            return getattr(self, cls._CACHED_TOKENS_ATTR)
+
+        @property
+        def patched_all_special_ids(self):
+            if getattr(self, cls._CACHED_IDS_ATTR, None) is None:
+                setattr(
+                    self,
+                    cls._CACHED_IDS_ATTR,
+                    tokenizer_cls._original_all_special_ids(self),
+                )
+            return getattr(self, cls._CACHED_IDS_ATTR)
+
+        def patched_add_special_tokens(self, *args, **kwargs):
+            assert (
+                False
+            ), "Cannot modify special tokens after patch. Call unpatch_tokenizer first."
+
+        def patched_add_tokens(self, new_tokens, special_tokens=False):
+            assert (
+                not special_tokens
+            ), "Cannot add special tokens after patch. Call unpatch_tokenizer first."
+            return tokenizer_cls._original_add_tokens(
+                self, new_tokens, special_tokens=False
+            )
+
+        tokenizer_cls.all_special_tokens = patched_all_special_tokens
+        tokenizer_cls.all_special_ids = patched_all_special_ids
+        tokenizer_cls.add_special_tokens = patched_add_special_tokens
+        tokenizer_cls.add_tokens = patched_add_tokens
+        setattr(tokenizer_cls, cls._PATCHED_FLAG, True)
+
         return tokenizer
 
-    cls._original_all_special_tokens = cls.all_special_tokens.fget
-    cls._original_all_special_ids = cls.all_special_ids.fget
-    cls._original_add_special_tokens = cls.add_special_tokens
-    cls._original_add_tokens = cls.add_tokens
+    @classmethod
+    def unpatch(cls, tokenizer):
+        tokenizer_cls = type(tokenizer)
 
-    @property
-    def patched_all_special_tokens(self):
-        if getattr(self, "_sglang_cached_special_tokens", None) is None:
-            self._sglang_cached_special_tokens = cls._original_all_special_tokens(self)
-        return self._sglang_cached_special_tokens
+        if not getattr(tokenizer_cls, cls._PATCHED_FLAG, False):
+            return tokenizer
 
-    @property
-    def patched_all_special_ids(self):
-        if getattr(self, "_sglang_cached_special_ids", None) is None:
-            self._sglang_cached_special_ids = cls._original_all_special_ids(self)
-        return self._sglang_cached_special_ids
+        tokenizer_cls.all_special_tokens = property(
+            tokenizer_cls._original_all_special_tokens
+        )
+        tokenizer_cls.all_special_ids = property(
+            tokenizer_cls._original_all_special_ids
+        )
+        tokenizer_cls.add_special_tokens = tokenizer_cls._original_add_special_tokens
+        tokenizer_cls.add_tokens = tokenizer_cls._original_add_tokens
 
-    def patched_add_special_tokens(self, *args, **kwargs):
-        assert (
-            False
-        ), "Cannot modify special tokens after patch. Call unpatch_tokenizer first."
+        del tokenizer_cls._original_all_special_tokens
+        del tokenizer_cls._original_all_special_ids
+        del tokenizer_cls._original_add_special_tokens
+        del tokenizer_cls._original_add_tokens
+        delattr(tokenizer_cls, cls._PATCHED_FLAG)
 
-    def patched_add_tokens(self, new_tokens, special_tokens=False):
-        assert (
-            not special_tokens
-        ), "Cannot add special tokens after patch. Call unpatch_tokenizer first."
-        return cls._original_add_tokens(self, new_tokens, special_tokens=False)
+        if hasattr(tokenizer, cls._CACHED_TOKENS_ATTR):
+            delattr(tokenizer, cls._CACHED_TOKENS_ATTR)
+        if hasattr(tokenizer, cls._CACHED_IDS_ATTR):
+            delattr(tokenizer, cls._CACHED_IDS_ATTR)
 
-    cls.all_special_tokens = patched_all_special_tokens
-    cls.all_special_ids = patched_all_special_ids
-    cls.add_special_tokens = patched_add_special_tokens
-    cls.add_tokens = patched_add_tokens
-    cls._sglang_special_tokens_patched = True
-
-    return tokenizer
-
+        logger.info(f"Unpatched special tokens cache for {tokenizer_cls.__name__}")
+        return tokenizer
