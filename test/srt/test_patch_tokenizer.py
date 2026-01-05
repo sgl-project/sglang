@@ -14,14 +14,52 @@ from sglang.srt.utils.patch_tokenizer import (
 class TestPatchTokenizerEndToEndTest(unittest.TestCase):
     def test_patched_produces_same_results_as_raw(self):
         tokenizer = _load_tokenizer()
-        test_texts = _generate_test_texts(tokenizer)
-        raw_results = _run_tokenizer_ops(tokenizer, test_texts)
+        test_texts = self._generate_test_texts(tokenizer)
+        raw_results = self._run_tokenizer_ops(tokenizer, test_texts)
 
         _SpecialTokensCachePatcher.patch(tokenizer)
-        patched_results = _run_tokenizer_ops(tokenizer, test_texts)
+        patched_results = self._run_tokenizer_ops(tokenizer, test_texts)
         unpatch_tokenizer(tokenizer)
 
         self.assertEqual(raw_results, patched_results)
+
+    @classmethod
+    def _generate_test_texts(cls, tokenizer):
+        special_tokens = tokenizer.all_special_tokens
+        return [
+            # Basic texts
+            "Hello, world!",
+            "This is a longer sentence with multiple words.",
+            "Numbers 12345 and symbols !@#$%",
+            "中文测试 mixed with English",
+            "    leading and trailing spaces    ",
+            "\n\nMultiple\n\nNewlines\n\n",
+            # Each special token individually
+            *[f"Text with {tok} inside" for tok in special_tokens],
+            # All special tokens combined
+            " ".join(special_tokens),
+            # Random generated texts
+            *[_random_text(length=100) for _ in range(5)],
+            *[_random_text(length=1000) for _ in range(3)],
+        ]
+
+    @classmethod
+    def _random_text(cls, length):
+        chars = string.ascii_letters + string.digits + " \n\t中文日本語한국어"
+        return "".join(random.choice(chars) for _ in range(length))
+
+    @classmethod
+    def _run_tokenizer_ops(cls, tokenizer, texts):
+        encode_results = [tokenizer.encode(t) for t in texts]
+        batch_encode_results = tokenizer(texts)["input_ids"]
+        return {
+            "encode": encode_results,
+            "batch_encode": batch_encode_results,
+            "decode": [tokenizer.decode(ids, skip_special_tokens=True) for ids in encode_results],
+            "batch_decode": tokenizer.batch_decode(encode_results, skip_special_tokens=True),
+            "special_tokens": tokenizer.all_special_tokens,
+            "special_ids": tokenizer.all_special_ids,
+        }
 
 
 class TestPatchTokenizerUnitTest(unittest.TestCase):
@@ -102,43 +140,6 @@ class TestPatchTokenizerUnitTest(unittest.TestCase):
 
         unpatch_tokenizer(tokenizer)
 
-
-def _generate_test_texts(tokenizer):
-    special_tokens = tokenizer.all_special_tokens
-    return [
-        # Basic texts
-        "Hello, world!",
-        "This is a longer sentence with multiple words.",
-        "Numbers 12345 and symbols !@#$%",
-        "中文测试 mixed with English",
-        "    leading and trailing spaces    ",
-        "\n\nMultiple\n\nNewlines\n\n",
-        # Each special token individually
-        *[f"Text with {tok} inside" for tok in special_tokens],
-        # All special tokens combined
-        " ".join(special_tokens),
-        # Random generated texts
-        *[_random_text(length=100) for _ in range(5)],
-        *[_random_text(length=1000) for _ in range(3)],
-    ]
-
-
-def _random_text(length):
-    chars = string.ascii_letters + string.digits + " \n\t中文日本語한국어"
-    return "".join(random.choice(chars) for _ in range(length))
-
-
-def _run_tokenizer_ops(tokenizer, texts):
-    encode_results = [tokenizer.encode(t) for t in texts]
-    batch_encode_results = tokenizer(texts)["input_ids"]
-    return {
-        "encode": encode_results,
-        "batch_encode": batch_encode_results,
-        "decode": [tokenizer.decode(ids, skip_special_tokens=True) for ids in encode_results],
-        "batch_decode": tokenizer.batch_decode(encode_results, skip_special_tokens=True),
-        "special_tokens": tokenizer.all_special_tokens,
-        "special_ids": tokenizer.all_special_ids,
-    }
 
 
 def _get_class_attr_ids(cls):
