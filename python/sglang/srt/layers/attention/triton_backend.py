@@ -8,10 +8,8 @@ import torch
 
 logger = logging.getLogger(__name__)
 
-# Maximum sequence length for PyTorch fallback with attention bias
-# Beyond this, the nested Python loops become too slow
-_ATTENTION_BIAS_MAX_SEQ_LEN = 32768
-_warned_attention_bias_seq_len = False
+# Note: Sparse bias correction is used instead of dense PyTorch fallback
+# This allows attention steering to work efficiently at any sequence length
 import torch.nn.functional as F
 import triton
 import triton.language as tl
@@ -1023,60 +1021,49 @@ class TritonAttnBackend(AttentionBackend):
             kv_indices = self.forward_metadata.kv_indices
 
         # Check if this layer has attention biases for steering
-        use_bias_fallback = forward_batch.has_attention_biases_for_layer(layer.layer_id)
+        has_sparse_biases = forward_batch.has_attention_biases_for_layer(layer.layer_id)
+        sparse_biases = None
+        if has_sparse_biases:
+            sparse_biases = forward_batch.get_sparse_attention_biases(layer.layer_id)
 
-        if use_bias_fallback:
-            # Use PyTorch fallback with bias support
-            # Get max sequence length for this batch
-            max_seq_len = (kv_indptr[1:] - kv_indptr[:-1]).max().item()
+        # Always run the fast Triton kernel first
+        # If sparse biases exist, we'll apply correction afterward
+        self.decode_attention_fwd(
+            q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+            forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
+            forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
+            o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+            kv_indptr,
+            kv_indices,
+            self.forward_metadata.attn_logits,
+            self.forward_metadata.attn_lse,
+            self.forward_metadata.num_kv_splits,
+            self.max_kv_splits,
+            layer.scaling,
+            logit_cap=logits_soft_cap,
+            sinks=sinks,
+            xai_temperature_len=layer.xai_temperature_len,
+        )
 
-            # Skip bias fallback for very long sequences - too slow
-            if max_seq_len > _ATTENTION_BIAS_MAX_SEQ_LEN:
-                global _warned_attention_bias_seq_len
-                if not _warned_attention_bias_seq_len:
-                    logger.warning(
-                        f"Attention bias requested but seq_len={max_seq_len} exceeds "
-                        f"max={_ATTENTION_BIAS_MAX_SEQ_LEN}. Skipping bias (PyTorch "
-                        f"fallback too slow). Use router biases for long-context steering."
-                    )
-                    _warned_attention_bias_seq_len = True
-                use_bias_fallback = False
-            else:
-                attention_bias = forward_batch.get_attention_bias_tensor(layer.layer_id, max_seq_len)
-
-                if attention_bias is not None:
-                    self._decode_attention_with_bias_pytorch(
-                        q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
-                        forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
-                        forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
-                        o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
-                        kv_indptr,
-                        kv_indices,
-                        layer.scaling,
-                        attention_bias,
-                        logit_cap=logits_soft_cap,
-                    )
-                else:
-                    # Fallback to fast path if bias tensor creation failed
-                    use_bias_fallback = False
-
-        if not use_bias_fallback:
-            # Fast path: use optimized Triton kernel
-            self.decode_attention_fwd(
+        # Apply sparse bias correction if biases exist
+        # This is O(|S| * head_dim) where |S| is number of biased positions
+        # Much faster than the old dense PyTorch fallback for sparse biases
+        if sparse_biases is not None:
+            batch_indices, token_positions, bias_values = sparse_biases
+            self._apply_sparse_bias_correction(
                 q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
                 forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
                 forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
                 o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
                 kv_indptr,
                 kv_indices,
-                self.forward_metadata.attn_logits,
+                layer.scaling,
                 self.forward_metadata.attn_lse,
                 self.forward_metadata.num_kv_splits,
-                self.max_kv_splits,
-                layer.scaling,
+                batch_indices,
+                token_positions,
+                bias_values,
                 logit_cap=logits_soft_cap,
-                sinks=sinks,
-                xai_temperature_len=layer.xai_temperature_len,
             )
 
         # Compute top-k attention tokens for interpretability
@@ -1098,6 +1085,156 @@ class TritonAttnBackend(AttentionBackend):
 
         return o
 
+    def _apply_sparse_bias_correction(
+        self,
+        q: torch.Tensor,
+        k_buffer: torch.Tensor,
+        v_buffer: torch.Tensor,
+        o: torch.Tensor,
+        kv_indptr: torch.Tensor,
+        kv_indices: torch.Tensor,
+        sm_scale: float,
+        attn_lse: torch.Tensor,
+        num_kv_splits: torch.Tensor,
+        batch_indices: torch.Tensor,
+        token_positions: torch.Tensor,
+        bias_values: torch.Tensor,
+        logit_cap: float = 0.0,
+    ):
+        """
+        Apply sparse bias correction to unbiased attention output.
+
+        This is much more efficient than the dense PyTorch fallback for sparse biases.
+        Math: Given unbiased output O0 with LSE0, and sparse biases b_j for j∈S:
+          - Z0 = exp(LSE0)
+          - Z = Z0 + Σ_{j∈S} exp(l_j) * (exp(b_j)-1)
+          - O = (O0*Z0 + Σ_{j∈S} exp(l_j) * v_j * (exp(b_j)-1)) / Z
+
+        Complexity: O(|S| * head_dim) per head per token, where |S| is number of biased positions.
+
+        Args:
+            q: [batch, num_heads, head_dim] query
+            k_buffer: [max_tokens, num_kv_heads, head_dim] key cache
+            v_buffer: [max_tokens, num_kv_heads, head_dim] value cache
+            o: [batch, num_heads, head_dim] output tensor (modified in-place)
+            kv_indptr: [batch + 1] CSR format indptr for KV cache
+            kv_indices: [total_kv_tokens] KV cache locations
+            sm_scale: attention scale factor
+            attn_lse: [batch, num_heads, max_kv_splits] log-sum-exp from Triton kernel
+            num_kv_splits: [batch] number of splits per batch element
+            batch_indices: [num_biases] batch index for each bias
+            token_positions: [num_biases] token position for each bias
+            bias_values: [num_biases] bias values
+            logit_cap: optional logit capping value (0 = disabled)
+        """
+        batch_size = q.shape[0]
+        num_heads = q.shape[1]
+        num_kv_heads = k_buffer.shape[1]
+        head_dim = q.shape[2]
+        v_head_dim = v_buffer.shape[2]
+
+        # GQA: heads per KV head
+        heads_per_kv = num_heads // num_kv_heads
+
+        # Compute final LSE by reducing across splits (log-sum-exp reduction)
+        # attn_lse: [batch, num_heads, max_kv_splits]
+        # We need to reduce to [batch, num_heads]
+        max_splits = attn_lse.shape[2]
+        final_lse = torch.full(
+            (batch_size, num_heads), float('-inf'),
+            dtype=attn_lse.dtype, device=attn_lse.device
+        )
+        for b in range(batch_size):
+            n_splits = num_kv_splits[b].item()
+            if n_splits > 0:
+                # Log-sum-exp reduction: LSE = log(sum(exp(lse_i)))
+                final_lse[b] = torch.logsumexp(attn_lse[b, :, :n_splits], dim=-1)
+
+        # Z0 = exp(LSE0) - the normalization constant
+        z0 = torch.exp(final_lse)  # [batch, num_heads]
+
+        # Group biases by batch index for efficient processing
+        unique_batches = batch_indices.unique()
+
+        for b_idx in unique_batches:
+            b = b_idx.item()
+
+            # Get biases for this batch element
+            mask = batch_indices == b_idx
+            positions = token_positions[mask]
+            biases = bias_values[mask]
+
+            if len(positions) == 0:
+                continue
+
+            # Get KV cache range for this batch
+            kv_start = kv_indptr[b].item()
+            kv_end = kv_indptr[b + 1].item()
+            seq_len = kv_end - kv_start
+
+            if seq_len == 0:
+                continue
+
+            # Filter positions that are within sequence length
+            valid_mask = positions < seq_len
+            if not valid_mask.any():
+                continue
+
+            positions = positions[valid_mask]
+            biases = biases[valid_mask]
+
+            # Get KV cache locations for biased positions
+            kv_locs = kv_indices[kv_start:kv_end]
+            biased_kv_locs = kv_locs[positions]
+
+            # Gather K, V for biased positions only
+            k_biased = k_buffer[biased_kv_locs]  # [num_biased, num_kv_heads, head_dim]
+            v_biased = v_buffer[biased_kv_locs]  # [num_biased, num_kv_heads, v_head_dim]
+
+            # Get query for this batch
+            q_b = q[b]  # [num_heads, head_dim]
+
+            # exp(b_j) - 1 for each biased position
+            exp_bias_minus_1 = torch.exp(biases) - 1  # [num_biased]
+
+            # Process each KV head group
+            for kv_h in range(num_kv_heads):
+                k_h = k_biased[:, kv_h, :]  # [num_biased, head_dim]
+                v_h = v_biased[:, kv_h, :]  # [num_biased, v_head_dim]
+
+                # Process all heads that share this KV head
+                for h_offset in range(heads_per_kv):
+                    h = kv_h * heads_per_kv + h_offset
+                    q_h = q_b[h]  # [head_dim]
+
+                    # Compute logits for biased positions: l_j = q @ k_j * scale
+                    logits = torch.matmul(k_h, q_h) * sm_scale  # [num_biased]
+
+                    # Apply logit capping if enabled
+                    if logit_cap > 0:
+                        logits = logit_cap * torch.tanh(logits / logit_cap)
+
+                    # exp(l_j) for biased positions
+                    exp_logits = torch.exp(logits)  # [num_biased]
+
+                    # Correction terms:
+                    # weight_delta_j = exp(l_j) * (exp(b_j) - 1)
+                    weight_delta = exp_logits * exp_bias_minus_1  # [num_biased]
+
+                    # Z_delta = sum of weight deltas
+                    z_delta = weight_delta.sum()
+
+                    # Value correction: sum of weight_delta_j * v_j
+                    # [num_biased] @ [num_biased, v_head_dim] -> [v_head_dim]
+                    v_correction = torch.matmul(weight_delta, v_h)
+
+                    # Apply correction: O = (O0 * Z0 + v_correction) / (Z0 + Z_delta)
+                    z0_h = z0[b, h]
+                    o0_h = o[b, h].clone()
+
+                    # New output
+                    o[b, h] = (o0_h * z0_h + v_correction) / (z0_h + z_delta)
+
     def _decode_attention_with_bias_pytorch(
         self,
         q: torch.Tensor,
@@ -1113,8 +1250,8 @@ class TritonAttnBackend(AttentionBackend):
         """
         PyTorch fallback for decode attention with attention bias.
 
-        Used when steering biases are present for this layer.
-        Computes attention with additive bias before softmax.
+        DEPRECATED: Use _apply_sparse_bias_correction instead for better performance.
+        This is kept for backwards compatibility and very dense bias patterns.
 
         Args:
             q: [batch, num_heads, head_dim]
