@@ -3488,6 +3488,8 @@ def maybe_reindex_device_id(gpu_id: int):
         return
 
     original_cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
+    original_hip_visible_devices = os.environ.get("HIP_VISIBLE_DEVICES")
+
     if original_cuda_visible_devices:
         cuda_visible_devices = original_cuda_visible_devices.split(",")
     else:
@@ -3496,7 +3498,14 @@ def maybe_reindex_device_id(gpu_id: int):
     str_gpu_id = cuda_visible_devices[gpu_id] if cuda_visible_devices else str(gpu_id)
     os.environ["CUDA_VISIBLE_DEVICES"] = str_gpu_id
 
-    logger.debug(f"Set CUDA_VISIBLE_DEVICES to {str_gpu_id}")
+    # Also set HIP_VISIBLE_DEVICES for AMD GPUs
+    if is_hip():
+        os.environ["HIP_VISIBLE_DEVICES"] = str_gpu_id
+        logger.debug(
+            f"Set CUDA_VISIBLE_DEVICES and HIP_VISIBLE_DEVICES to {str_gpu_id}"
+        )
+    else:
+        logger.debug(f"Set CUDA_VISIBLE_DEVICES to {str_gpu_id}")
 
     yield 0
 
@@ -3504,6 +3513,13 @@ def maybe_reindex_device_id(gpu_id: int):
         os.environ["CUDA_VISIBLE_DEVICES"] = original_cuda_visible_devices
     else:
         del os.environ["CUDA_VISIBLE_DEVICES"]
+
+    # Restore HIP_VISIBLE_DEVICES for AMD GPUs
+    if is_hip():
+        if original_hip_visible_devices:
+            os.environ["HIP_VISIBLE_DEVICES"] = original_hip_visible_devices
+        elif "HIP_VISIBLE_DEVICES" in os.environ:
+            del os.environ["HIP_VISIBLE_DEVICES"]
 
 
 def get_extend_input_len_swa_limit(
