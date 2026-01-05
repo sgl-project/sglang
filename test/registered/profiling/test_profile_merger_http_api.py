@@ -2,6 +2,10 @@ import json
 import unittest
 
 from sglang.srt.managers.io_struct import ProfileReqInput
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+
+register_cuda_ci(est_time=9, suite="stage-b-test-small-1-gpu")
+register_amd_ci(est_time=15, suite="stage-b-test-small-1-gpu")
 
 
 class TestProfileMergerHTTPAPI(unittest.TestCase):
