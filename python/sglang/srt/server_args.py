@@ -339,12 +339,12 @@ class ServerArgs:
     log_level_http: Optional[str] = None
     log_requests: bool = False
     log_requests_level: int = 2
+    log_requests_format: str = "text"
+    log_requests_target: Optional[List[str]] = None
     enable_uvicorn_access_log_filter: bool = True
     uvicorn_access_log_exclude_prefixes: List[str] = dataclasses.field(
         default_factory=lambda: list(DEFAULT_UVICORN_ACCESS_LOG_EXCLUDE_PREFIXES)
     )
-    log_requests_format: str = "text"
-    log_requests_target: Optional[List[str]] = None
     crash_dump_folder: Optional[str] = None
     show_time_cost: bool = False
     enable_metrics: bool = False
@@ -3013,6 +3013,21 @@ class ServerArgs:
             choices=[0, 1, 2, 3],
         )
         parser.add_argument(
+            "--log-requests-format",
+            type=str,
+            default=ServerArgs.log_requests_format,
+            choices=["text", "json"],
+            help="Format for request logging: 'text' (human-readable) or 'json' (structured)",
+        )
+        parser.add_argument(
+            "--log-requests-target",
+            type=str,
+            nargs="+",
+            default=ServerArgs.log_requests_target,
+            help="Target(s) for request logging: 'stdout' and/or directory path(s) for file output. "
+            "Can specify multiple targets, e.g., '--log-requests-target stdout /my/path'. ",
+        )
+        parser.add_argument(
             "--uvicorn-access-log-exclude-prefixes",
             type=str,
             nargs="*",
@@ -3029,19 +3044,6 @@ class ServerArgs:
             action="store_false",
             default=ServerArgs.enable_uvicorn_access_log_filter,
             help="Disable uvicorn access-log path filtering entirely (restore original behavior).",
-            "--log-requests-format",
-            type=str,
-            default=ServerArgs.log_requests_format,
-            choices=["text", "json"],
-            help="Format for request logging: 'text' (human-readable) or 'json' (structured)",
-        )
-        parser.add_argument(
-            "--log-requests-target",
-            type=str,
-            nargs="+",
-            default=ServerArgs.log_requests_target,
-            help="Target(s) for request logging: 'stdout' and/or directory path(s) for file output. "
-            "Can specify multiple targets, e.g., '--log-requests-target stdout /my/path'. ",
         )
         parser.add_argument(
             "--crash-dump-folder",
