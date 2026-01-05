@@ -85,7 +85,11 @@ if _is_cuda:
 
 TConfig = TypeVar("TConfig", bound=PretrainedConfig)
 
-Qwen3MoeConfig = None
+# Qwen3Moe shares architecture with Qwen2Moe, so we use the same config class
+try:
+    from transformers import Qwen2MoeConfig as Qwen3MoeConfig
+except ImportError:
+    Qwen3MoeConfig = None
 
 _is_flashinfer_available = is_flashinfer_available()
 
