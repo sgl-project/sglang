@@ -89,7 +89,9 @@ class ExpertDistributionRecorder(ABC):
     def with_forward_pass(self, forward_pass_id: int, forward_batch: ForwardBatch):
         yield {}
 
-    def on_select_experts(self, topk_ids: torch.Tensor):
+    def on_select_experts(
+        self, topk_ids: torch.Tensor, topk_weights: Optional[torch.Tensor] = None
+    ):
         pass
 
     def on_deepep_dispatch_normal(
@@ -126,7 +128,47 @@ class ExpertDistributionRecorder(ABC):
 
 
 class _ExpertDistributionRecorderNoop(ExpertDistributionRecorder):
-    pass
+    """Noop recorder that still supports MoE routing capture for telemetry."""
+
+    def __init__(self):
+        self._current_forward_batch: Optional[ForwardBatch] = None
+        self._current_layer_idx = Withable()
+
+    @contextmanager
+    def with_forward_pass(self, forward_pass_id: int, forward_batch: ForwardBatch):
+        self._current_forward_batch = forward_batch
+        try:
+            yield
+        finally:
+            self._current_forward_batch = None
+
+    @contextmanager
+    def with_current_layer(self, layer_idx):
+        with self._current_layer_idx.with_value(layer_idx):
+            yield
+
+    def on_select_experts(
+        self, topk_ids: torch.Tensor, topk_weights: Optional[torch.Tensor] = None
+    ):
+        # Capture MoE routing to forward_batch buffer if enabled
+        fb = self._current_forward_batch
+        if (
+            fb is not None
+            and fb.capture_moe_routing
+            and fb.moe_routing_buffer is not None
+        ):
+            layer_idx = self._current_layer_idx.value
+            # Check if this layer should be captured
+            if fb.moe_capture_layer_ids is None or layer_idx in fb.moe_capture_layer_ids:
+                # Limit to top-k experts as requested
+                top_k = min(fb.moe_routing_top_k, topk_ids.shape[-1])
+                captured_ids = topk_ids[:, :top_k].clone().cpu()
+                captured_weights = (
+                    topk_weights[:, :top_k].clone().cpu()
+                    if topk_weights is not None
+                    else None
+                )
+                fb.moe_routing_buffer.append((layer_idx, captured_ids, captured_weights))
 
 
 class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
@@ -144,6 +186,7 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
         self._current_forward_pass_id = Withable()
         self._current_layer_idx = Withable()
         self._current_debug_name = Withable()
+        self._current_forward_batch: Optional[ForwardBatch] = None
         self._accumulator = _Accumulator.init_new(
             server_args, expert_location_metadata, rank
         )
@@ -168,11 +211,13 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
     def with_forward_pass(self, forward_pass_id: int, forward_batch: ForwardBatch):
         outputs = {}
         with self._current_forward_pass_id.with_value(forward_pass_id):
+            self._current_forward_batch = forward_batch
             self._on_forward_pass_start(forward_batch)
             try:
                 yield outputs
             finally:
                 self._on_forward_pass_end(forward_pass_id, outputs)
+                self._current_forward_batch = None
 
     @contextmanager
     def disable_this_region(self):
@@ -200,7 +245,29 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
                 forward_pass_id, gatherer_key, single_pass_data, outputs
             )
 
-    def on_select_experts(self, topk_ids: torch.Tensor):
+    def on_select_experts(
+        self, topk_ids: torch.Tensor, topk_weights: Optional[torch.Tensor] = None
+    ):
+        # Capture MoE routing to forward_batch buffer if enabled
+        fb = self._current_forward_batch
+        if (
+            fb is not None
+            and fb.capture_moe_routing
+            and fb.moe_routing_buffer is not None
+        ):
+            layer_idx = self._current_layer_idx.value
+            # Check if this layer should be captured
+            if fb.moe_capture_layer_ids is None or layer_idx in fb.moe_capture_layer_ids:
+                # Limit to top-k experts as requested
+                top_k = min(fb.moe_routing_top_k, topk_ids.shape[-1])
+                captured_ids = topk_ids[:, :top_k].clone().cpu()
+                captured_weights = (
+                    topk_weights[:, :top_k].clone().cpu()
+                    if topk_weights is not None
+                    else None
+                )
+                fb.moe_routing_buffer.append((layer_idx, captured_ids, captured_weights))
+
         self._on_hook("on_select_experts", topk_ids=topk_ids)
 
     def on_deepep_dispatch_normal(

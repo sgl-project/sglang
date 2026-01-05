@@ -284,6 +284,12 @@ class CompletionRequest(BaseModel):
     # Biases are added to attention logits before softmax
     attention_biases: Optional[Dict[str, Dict[str, float]]] = None
 
+    # For MoE routing capture (interpretability/semantic telemetry)
+    # Returns which experts were selected for each token
+    return_moe_routing: bool = False
+    moe_routing_top_k: int = 2  # How many top experts to capture per token
+    moe_capture_layer_ids: Optional[List[int]] = None  # Which layers to capture (None = all MoE layers)
+
     @field_validator("max_tokens")
     @classmethod
     def validate_max_tokens_positive(cls, v):
@@ -522,6 +528,12 @@ class ChatCompletionRequest(BaseModel):
     # Format: {"layer_id": {"token_pos": bias_value, ...}, ...}
     # Biases are added to attention logits before softmax
     attention_biases: Optional[Dict[str, Dict[str, float]]] = None
+
+    # For MoE routing capture (interpretability/semantic telemetry)
+    # Returns which experts were selected for each token
+    return_moe_routing: bool = False
+    moe_routing_top_k: int = 2  # How many top experts to capture per token
+    moe_capture_layer_ids: Optional[List[int]] = None  # Which layers to capture (None = all MoE layers)
 
     reasoning_effort: Optional[Literal["low", "medium", "high"]] = Field(
         default="medium",

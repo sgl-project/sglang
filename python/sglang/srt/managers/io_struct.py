@@ -214,6 +214,10 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
     attention_sketch_mode: Union[List[bool], bool] = False
     # Attention biases for steering: Dict[layer_id -> Dict[token_pos -> bias]]
     attention_biases: Optional[Union[List[Dict[int, Dict[int, float]]], Dict[int, Dict[int, float]]]] = None
+    # MoE routing capture: which experts were selected for each token
+    return_moe_routing: Union[List[bool], bool] = False
+    moe_routing_top_k: Union[List[int], int] = 2
+    moe_capture_layer_ids: Optional[Union[List[List[int]], List[int]]] = None
 
     # The modalities of the image data [image, multi-images, video]
     modalities: Optional[List[str]] = None
@@ -790,6 +794,10 @@ class TokenizedGenerateReqInput(BaseReq):
     attention_sketch_mode: bool = False
     # Attention biases for steering: Dict[layer_id -> Dict[token_pos -> bias]]
     attention_biases: Optional[Dict[int, Dict[int, float]]] = None
+    # MoE routing capture: which experts were selected for each token
+    return_moe_routing: bool = False
+    moe_routing_top_k: int = 2
+    moe_capture_layer_ids: Optional[List[int]] = None
 
 
 @dataclass
@@ -1026,6 +1034,9 @@ class BatchTokenIDOutput(
     # Attention token info for interpretability (top-k positions and scores per token)
     output_attention_tokens: Optional[List[List[Dict]]] = None
 
+    # MoE routing info for interpretability (which experts were selected per token)
+    output_moe_routing: Optional[List[List[Dict]]] = None
+
     # The trainer step id. Used to know which step's weights are used for sampling.
     token_steps: List[List[int]] = None
 
@@ -1115,6 +1126,9 @@ class BatchStrOutput(
 
     # Attention token info for interpretability (top-k positions and scores per token)
     output_attention_tokens: Optional[List[List[Dict]]] = None
+
+    # MoE routing info for interpretability (which experts were selected per token)
+    output_moe_routing: Optional[List[List[Dict]]] = None
 
     # The trainer step id. Used to know which step's weights are used for sampling.
     token_steps: List[List[int]] = None

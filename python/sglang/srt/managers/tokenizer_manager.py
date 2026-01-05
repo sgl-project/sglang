@@ -1537,6 +1537,11 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 if recv_obj.output_attention_tokens[i] is not None:
                     meta_info["attention_tokens"] = recv_obj.output_attention_tokens[i]
 
+            # Handle MoE routing for interpretability
+            if getattr(recv_obj, "output_moe_routing", None):
+                if recv_obj.output_moe_routing[i] is not None:
+                    meta_info["moe_routing"] = recv_obj.output_moe_routing[i]
+
             if isinstance(recv_obj, BatchStrOutput):
                 state.text += recv_obj.output_strs[i]
                 # Not all request types have `stream` (e.g., EmbeddingReqInput). Default to non-streaming.

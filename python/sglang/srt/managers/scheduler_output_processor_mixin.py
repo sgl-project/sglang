@@ -796,6 +796,30 @@ class SchedulerOutputProcessorMixin:
                 attention_info["think_phase"] = req.attention_think_phase
                 req.attention_tokens.append(attention_info)
 
+            # Process MoE routing capture
+            if (
+                req.return_moe_routing
+                and logits_output.moe_routing_buffer
+            ):
+                # Extract routing info for this request (token index i in decode mode)
+                moe_routing_info = {}
+                for layer_id, topk_ids, topk_weights in logits_output.moe_routing_buffer:
+                    # In decode mode, each token corresponds to one request
+                    # topk_ids: [batch, top_k], topk_weights: [batch, top_k]
+                    if i < topk_ids.shape[0]:
+                        layer_routing = {
+                            "expert_ids": topk_ids[i].tolist(),
+                        }
+                        if topk_weights is not None:
+                            layer_routing["expert_weights"] = topk_weights[i].tolist()
+                        moe_routing_info[layer_id] = layer_routing
+
+                if moe_routing_info:
+                    req.moe_routing.append({
+                        "decode_step": len(req.output_ids),
+                        "layers": moe_routing_info,
+                    })
+
             if req.grammar is not None:
                 # FIXME: this try-except block is for handling unexpected xgrammar issue.
                 try:
@@ -1204,6 +1228,7 @@ class SchedulerOutputProcessorMixin:
         output_routed_experts = None
         customized_info = {}
         output_attention_tokens = None
+        output_moe_routing = None
 
         queue_times = []
         forward_entry_times = []
@@ -1414,6 +1439,11 @@ class SchedulerOutputProcessorMixin:
                         output_attention_tokens = []
                     output_attention_tokens.append(req.attention_tokens)
 
+                if req.return_moe_routing:
+                    if output_moe_routing is None:
+                        output_moe_routing = []
+                    output_moe_routing.append(req.moe_routing)
+
             if (
                 req.finished()
                 and self.attn_tp_rank == 0
@@ -1465,6 +1495,7 @@ class SchedulerOutputProcessorMixin:
                     output_routed_experts=output_routed_experts,
                     customized_info=customized_info,
                     output_attention_tokens=output_attention_tokens,
+                    output_moe_routing=output_moe_routing,
                     placeholder_tokens_idx=None,
                     placeholder_tokens_val=None,
                     retraction_counts=retraction_counts,

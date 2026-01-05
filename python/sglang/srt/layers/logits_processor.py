@@ -84,6 +84,9 @@ class LogitsProcessorOutput:
     # Production mode - replaces raw indices for high-throughput routing
     attention_fingerprint: Optional[torch.Tensor] = None  # [batch, 20]
     attention_manifold: Optional[List[str]] = None  # Manifold classification per batch
+    # MoE routing capture: List[(layer_id, topk_ids, topk_weights)]
+    # topk_ids: [num_tokens, top_k], topk_weights: [num_tokens, top_k]
+    moe_routing_buffer: Optional[List[tuple]] = None
 
     ## Part 2: This part will be assigned in python/sglang/srt/layers/sampler.py::Sampler
     # he log probs of output tokens, if SGLANG_RETURN_ORIGINAL_LOGPROB = True, will get the log probs before applying temperature. If False, will get the log probs before applying temperature.
@@ -441,6 +444,11 @@ class LogitsProcessor(nn.Module):
                     attention_fingerprint = logits_metadata.attention_fingerprint
                 if hasattr(logits_metadata, 'attention_manifold') and logits_metadata.attention_manifold is not None:
                     attention_manifold = logits_metadata.attention_manifold
+
+            # Extract MoE routing buffer if captured
+            if logits_metadata.capture_moe_routing and logits_metadata.moe_routing_buffer:
+                moe_routing_buffer = logits_metadata.moe_routing_buffer
+
             logits_metadata = LogitsMetadata.from_forward_batch(logits_metadata)
 
         # Check if multi-item scoring is enabled via server args (only for prefill-only requests)
@@ -647,6 +655,7 @@ class LogitsProcessor(nn.Module):
                 attention_multi_layer=attention_multi_layer,
                 attention_fingerprint=attention_fingerprint,
                 attention_manifold=attention_manifold,
+                moe_routing_buffer=moe_routing_buffer,
             )
 
         # Start to process input logprobs
@@ -710,6 +719,7 @@ class LogitsProcessor(nn.Module):
             attention_multi_layer=attention_multi_layer,
             attention_fingerprint=attention_fingerprint,
             attention_manifold=attention_manifold,
+            moe_routing_buffer=moe_routing_buffer,
             input_token_logprobs=logprobs_result.input_token_logprobs,
             input_top_logprobs_val=logprobs_result.input_top_logprobs_val,
             input_top_logprobs_idx=logprobs_result.input_top_logprobs_idx,

@@ -652,6 +652,9 @@ class Req:
         attention_capture_layer_id: Optional[int] = None,
         attention_capture_layer_ids: Optional[List[int]] = None,
         attention_sketch_mode: bool = False,
+        return_moe_routing: bool = False,
+        moe_routing_top_k: int = 2,
+        moe_capture_layer_ids: Optional[List[int]] = None,
         eos_token_ids: Optional[Set[int]] = None,
         bootstrap_host: Optional[str] = None,
         bootstrap_port: Optional[int] = None,
@@ -720,6 +723,11 @@ class Req:
         self.attention_sketch_mode = attention_sketch_mode
         self.attention_tokens: List[Dict] = []  # Per-token attention info
         self.attention_tokens_decode_step: int = 0  # Counter for stride calculation
+        # MoE routing capture
+        self.return_moe_routing = return_moe_routing
+        self.moe_routing_top_k = moe_routing_top_k
+        self.moe_capture_layer_ids = moe_capture_layer_ids
+        self.moe_routing: List[Dict] = []  # Per-token MoE routing info
         # Think phase tracking for attention segmentation (reasoning models)
         # Phase: "think" = inside <think>...</think>, "output" = after </think>
         self.attention_think_phase: str = "output"  # Current phase
@@ -2385,6 +2393,22 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     attention_biases[layer_id] = [{} for _ in range(len(self.reqs))]
                 attention_biases[layer_id][batch_idx] = token_biases
 
+        # Check if any request wants MoE routing capture
+        capture_moe_routing = False
+        moe_routing_top_k = 2
+        moe_capture_layer_ids: Optional[List[int]] = None
+
+        for req in self.reqs:
+            if getattr(req, "return_moe_routing", False):
+                capture_moe_routing = True
+                # Use the max top_k from any request
+                req_top_k = getattr(req, "moe_routing_top_k", 2)
+                if req_top_k > moe_routing_top_k:
+                    moe_routing_top_k = req_top_k
+                # Use layer IDs from first request that specifies them
+                if moe_capture_layer_ids is None:
+                    moe_capture_layer_ids = getattr(req, "moe_capture_layer_ids", None)
+
         return ModelWorkerBatch(
             forward_mode=self.forward_mode,
             input_ids=self.input_ids,
@@ -2444,6 +2468,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             attention_top_k=attention_top_k,
             attention_capture_layer_id=capture_layers,  # Pass normalized List[int] | None
             attention_biases=attention_biases,  # Steering biases from semantic_memory
+            capture_moe_routing=capture_moe_routing,
+            moe_routing_top_k=moe_routing_top_k,
+            moe_capture_layer_ids=moe_capture_layer_ids,
         )
 
     def copy(self):
@@ -2589,3 +2616,9 @@ class ModelWorkerBatch:
     # Dict[layer_id -> List[Dict[token_pos -> bias_value]]] (one dict per request in batch)
     # Biases are added to attention logits before softmax
     attention_biases: Optional[Dict[int, List[Dict[int, float]]]] = None
+
+    # For MoE routing capture (interpretability/semantic telemetry)
+    # Captures which experts were selected for each token
+    capture_moe_routing: bool = False
+    moe_routing_top_k: int = 2  # How many top experts to capture
+    moe_capture_layer_ids: Optional[List[int]] = None  # Which layers to capture (None = all)
