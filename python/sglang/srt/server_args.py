@@ -4511,6 +4511,42 @@ class ServerArgs:
                  "(top_hubs, dist_hist, entropy) instead of raw edges. Bandwidth-efficient for "
                  "very long outputs (86k+). ~500 bytes per layer. (default: False)",
         )
+        parser.add_argument(
+            "--attention-bias-max-layers",
+            type=int,
+            default=ServerArgs.attention_bias_max_layers,
+            help="Maximum number of layers that can have attention biases applied. (default: 8)",
+        )
+        parser.add_argument(
+            "--attention-bias-max-entries-per-layer",
+            type=int,
+            default=ServerArgs.attention_bias_max_entries_per_layer,
+            help="Maximum number of bias entries per layer. (default: 1024)",
+        )
+        parser.add_argument(
+            "--attention-bias-max-seq-len",
+            type=int,
+            default=ServerArgs.attention_bias_max_seq_len,
+            help="Maximum sequence length for attention bias targets. (default: 32768)",
+        )
+        parser.add_argument(
+            "--moe-routing-max-steps",
+            type=int,
+            default=ServerArgs.moe_routing_max_steps,
+            help="Maximum number of MoE routing capture steps. 0 = unlimited. (default: 2048)",
+        )
+        parser.add_argument(
+            "--moe-routing-stride",
+            type=int,
+            default=ServerArgs.moe_routing_stride,
+            help="Only capture MoE routing every Nth step. (default: 1)",
+        )
+        parser.add_argument(
+            "--moe-routing-max-bytes",
+            type=int,
+            default=ServerArgs.moe_routing_max_bytes,
+            help="Maximum bytes for MoE routing data per request. 0 = unlimited. (default: 0)",
+        )
 
         # PD disaggregation
         parser.add_argument(
