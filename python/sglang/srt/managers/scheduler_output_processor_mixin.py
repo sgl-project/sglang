@@ -628,6 +628,8 @@ class SchedulerOutputProcessorMixin:
                 if req.return_attention_tokens:
                     # Store fingerprint info (much smaller than raw indices)
                     fingerprint_info = {
+                        "schema_version": 1,  # Version for UI compatibility
+                        "mode": "fingerprint",
                         "fingerprint": logits_output.attention_fingerprint[i].cpu().tolist(),
                         "manifold": logits_output.attention_manifold[i] if logits_output.attention_manifold else "unknown",
                         "step": req.attention_tokens_decode_step,
@@ -681,6 +683,7 @@ class SchedulerOutputProcessorMixin:
                         )
 
                     attention_info = {
+                        "schema_version": 1,
                         "mode": "sketch",
                         "layer_sketches": layer_sketches,
                         "decode_step": req.attention_tokens_decode_step,
@@ -703,6 +706,7 @@ class SchedulerOutputProcessorMixin:
                         pos_list, score_list, logit_list, lse_val, current_pos
                     )
                     attention_info = {
+                        "schema_version": 1,
                         "mode": "sketch",
                         "sketch": sketch,
                         "layer_id": getattr(logits_output, "attention_layer_id", -1),
@@ -749,6 +753,8 @@ class SchedulerOutputProcessorMixin:
                         layers_data[layer_id] = layer_entry
 
                     attention_info = {
+                        "schema_version": 1,
+                        "mode": "raw",
                         "layers": layers_data,
                         # Also include last layer at top level for backward compatibility
                         "layer_id": getattr(logits_output, "attention_layer_id", -1),
@@ -777,6 +783,8 @@ class SchedulerOutputProcessorMixin:
                 else:
                     # Single-layer capture (backward compatible format)
                     attention_info = {
+                        "schema_version": 1,
+                        "mode": "raw",
                         "token_positions": logits_output.attention_token_positions[i]
                         .cpu()
                         .tolist()[:req_top_k],
