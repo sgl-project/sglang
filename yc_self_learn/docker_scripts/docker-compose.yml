@@ -1,0 +1,57 @@
+version: '3.8'
+
+services:
+  sglang:
+    image: lmsysorg/sglang:latest
+    container_name: sglang_server
+    volumes:
+      # Windows 路径映射
+      # 注意：Windows 路径在 Docker Compose 中需要使用正斜杠或双反斜杠
+      - I:/yc_research/docker_data/huggingface:/root/.cache/huggingface
+      - I:/yc_research/docker_data/models:/models
+      - I:/yc_research/docker_data/data:/data
+      - I:/yc_research/docker_data/outputs:/outputs
+      # 如果需要开发模式，取消下面的注释
+      # - I:/yc_research/sglang:/sgl-workspace/sglang
+    restart: unless-stopped
+    ports:
+      - "30000:30000"
+    # 如果需要 RDMA，使用 network_mode: host 并取消下面的注释
+    # network_mode: host
+    # privileged: true
+    environment:
+      # 从环境变量读取，或直接写在这里
+      HF_TOKEN: ${HF_TOKEN}
+      # 如果使用 modelscope，取消下面的注释
+      # SGLANG_USE_MODELSCOPE: "true"
+    entrypoint: python3 -m sglang.launch_server
+    command: 
+      - --model-path
+      - qwen/qwen2.5-0.5b-instruct
+      - --host
+      - 0.0.0.0
+      - --port
+      - "30000"
+      # 添加其他参数，例如：
+      # - --tp
+      # - "1"
+      # - --trust-remote-code
+    ulimits:
+      memlock: -1
+      stack: 67108864
+    ipc: host
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              # 使用所有 GPU，或指定 ["0", "1"] 使用特定 GPU
+              device_ids: ["all"]
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:30000/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
