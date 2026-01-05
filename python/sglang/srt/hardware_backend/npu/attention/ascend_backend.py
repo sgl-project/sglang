@@ -7,6 +7,7 @@ import torch
 import torch_npu
 
 from sglang.srt.configs.model_config import AttentionArch
+from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
     is_fia_nz,
     is_mla_preprocess_enabled,
@@ -233,6 +234,12 @@ class AscendAttnBackend(AttentionBackend):
         )
         if self.use_mla:
             self.ringmla_mask = self.ascend_attn_mask_builder.ringmla_mask
+
+        # dllm model config
+        self.dllm_config = DllmConfig.from_server_args(model_runner.server_args)
+        self.is_dllm_model = False
+        if self.dllm_config is not None:
+            self.is_dllm_model = True
 
     def get_verify_buffers_to_fill_after_draft(self):
         """
@@ -647,7 +654,7 @@ class AscendAttnBackend(AttentionBackend):
                 )
 
             else:
-                if layer.qk_head_dim <= 128:
+                if layer.qk_head_dim <= 128 and not self.is_dllm_model:
                     query = q.reshape(-1, layer.tp_q_head_num * layer.qk_head_dim)
                     attn_output = torch.empty(
                         (query.shape[0], layer.tp_q_head_num * layer.v_head_dim),

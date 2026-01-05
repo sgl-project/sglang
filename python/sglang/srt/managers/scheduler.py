@@ -376,6 +376,15 @@ class Scheduler(
             if self.server_args.dllm_algorithm is not None
             else None
         )
+        if self.dllm_config:
+            # make sure the page size is not larger than block_size and chunked_prefill_size
+            if self.dllm_config.block_size < self.page_size:
+                logger.warning(
+                    "WARNING: "
+                    f"The page size {self.page_size} should not be larger than dllm block size {self.dllm_config.block_size}."
+                    f"Page size now falls back to {self.dllm_config.block_size}"
+                )
+                self.page_size = self.dllm_config.block_size
 
     def init_ipc_channels(self, port_args: PortArgs):
         context = zmq.Context(2)
