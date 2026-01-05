@@ -1,3 +1,5 @@
+import random
+import string
 import unittest
 from contextlib import contextmanager
 
@@ -11,17 +13,25 @@ from sglang.srt.utils.patch_tokenizer import (
 
 class TestPatchTokenizerEndToEndTest(unittest.TestCase):
     def test_patched_produces_same_results_as_raw(self):
+        tokenizer = _load_tokenizer()
+
+        # Generate test texts with special tokens from the tokenizer
+        special_tokens = tokenizer.all_special_tokens[:10]
         test_texts = [
             "Hello, world!",
             "This is a longer sentence with multiple words.",
-            "Special chars: <|im_start|> <|im_end|> [BOS] [EOS]",
             "Numbers 12345 and symbols !@#$%",
             "中文测试 mixed with English",
             "    leading and trailing spaces    ",
             "\n\nMultiple\n\nNewlines\n\n",
+            # Texts with special tokens
+            f"Start {special_tokens[0]} middle {special_tokens[1]} end",
+            " ".join(special_tokens),
+            f"Mixed {special_tokens[0]} text {special_tokens[2]} with 中文 and {special_tokens[3]}",
+            # Random generated texts
+            *[_random_text(length=100) for _ in range(5)],
+            *[_random_text(length=1000) for _ in range(3)],
         ]
-
-        tokenizer = _load_tokenizer()
         raw_results = _run_tokenizer_ops(tokenizer, test_texts)
 
         _SpecialTokensCachePatcher.patch(tokenizer)
@@ -108,6 +118,11 @@ class TestPatchTokenizerUnitTest(unittest.TestCase):
         )
 
         unpatch_tokenizer(tokenizer)
+
+
+def _random_text(length):
+    chars = string.ascii_letters + string.digits + " \n\t中文日本語한국어"
+    return "".join(random.choice(chars) for _ in range(length))
 
 
 def _run_tokenizer_ops(tokenizer, texts):
