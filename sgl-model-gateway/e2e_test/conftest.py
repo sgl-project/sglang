@@ -262,6 +262,22 @@ def model_pool(request: pytest.FixtureRequest) -> "ModelPool":
     startup_timeout = int(os.environ.get(ENV_STARTUP_TIMEOUT, "300"))
     _model_pool.startup(requirements=requirements, startup_timeout=startup_timeout)
 
+    # Pre-launch PD workers if 'pd' backend is detected
+    if "pd" in _scanned_backends:
+        logger.info("PD backend detected, pre-launching PD workers")
+        # Use default model for PD workers
+        pd_model = next(iter(_scanned_models), DEFAULT_MODEL)
+        if pd_model in MODEL_SPECS:
+            try:
+                _model_pool.launch_pd_workers(
+                    model_id=pd_model,
+                    num_prefill=1,
+                    num_decode=1,
+                    startup_timeout=startup_timeout,
+                )
+            except Exception as e:
+                logger.warning("Failed to pre-launch PD workers: %s", e)
+
     # Register cleanup
     request.addfinalizer(_model_pool.shutdown)
 
@@ -624,13 +640,32 @@ def setup_backend(request: pytest.FixtureRequest, model_pool: "ModelPool"):
                 f"({num_prefill} prefill + {num_decode} decode), found {gpu_count}"
             )
 
-        # Launch PD workers
-        prefills, decodes = model_pool.launch_pd_workers(
-            model_id=model_id,
-            num_prefill=num_prefill,
-            num_decode=num_decode,
-            startup_timeout=300,
-        )
+        # Try to use pre-launched PD workers, or launch new ones if needed
+        from infra import WorkerType
+
+        existing_prefills = model_pool.get_workers_by_type(model_id, WorkerType.PREFILL)
+        existing_decodes = model_pool.get_workers_by_type(model_id, WorkerType.DECODE)
+
+        if (
+            len(existing_prefills) >= num_prefill
+            and len(existing_decodes) >= num_decode
+        ):
+            # Use pre-launched workers
+            prefills = existing_prefills[:num_prefill]
+            decodes = existing_decodes[:num_decode]
+            logger.info(
+                "Using pre-launched PD workers: %d prefill, %d decode",
+                len(prefills),
+                len(decodes),
+            )
+        else:
+            # Launch new PD workers (custom config or not pre-launched)
+            prefills, decodes = model_pool.launch_pd_workers(
+                model_id=model_id,
+                num_prefill=num_prefill,
+                num_decode=num_decode,
+                startup_timeout=300,
+            )
 
         model_path = prefills[0].model_path if prefills else None
 
