@@ -488,9 +488,7 @@ class ModelPool:
 
         # Verify worker is still alive and healthy
         if not instance.is_alive():
-            raise RuntimeError(
-                f"Worker {key} process died (was healthy at startup)"
-            )
+            raise RuntimeError(f"Worker {key} process died (was healthy at startup)")
 
         if not instance.deep_health_check(timeout=30.0):
             raise RuntimeError(

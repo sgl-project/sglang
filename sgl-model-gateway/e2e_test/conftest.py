@@ -45,6 +45,19 @@ _setup_logging()
 
 logger = logging.getLogger(__name__)
 
+
+# ---------------------------------------------------------------------------
+# Test visibility hooks
+# ---------------------------------------------------------------------------
+def pytest_runtest_logstart(nodeid: str, location: tuple) -> None:
+    """Print clear test header at start of each test."""
+    # Extract test name from nodeid (e.g., "test_mmlu.py::TestMMLU::test_mmlu_basic[grpc]")
+    test_name = nodeid.split("::")[-1] if "::" in nodeid else nodeid
+    print(f"\n{'='*60}")
+    print(f"TEST: {test_name}")
+    print(f"{'='*60}")
+
+
 # Path setup for imports
 _ROOT = Path(__file__).resolve().parents[1]  # sgl-model-gateway/
 _E2E_TEST = Path(__file__).resolve().parent  # e2e_test/
