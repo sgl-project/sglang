@@ -84,6 +84,22 @@ class ModelInstance:
         except (httpx.RequestError, httpx.TimeoutException):
             return False
 
+    def deep_health_check(self, timeout: float = 30.0) -> bool:
+        """Deep health check that verifies the model can actually generate.
+
+        Uses /health_generate for HTTP workers (runs actual inference).
+        For gRPC workers, falls back to standard health check.
+        """
+        if self.mode == ConnectionMode.GRPC:
+            # For gRPC, use standard health check (no /health_generate equivalent)
+            return self._grpc_health_check(timeout)
+
+        try:
+            resp = httpx.get(f"{self.base_url}/health_generate", timeout=timeout)
+            return resp.status_code == 200
+        except (httpx.RequestError, httpx.TimeoutException):
+            return False
+
     def _grpc_health_check(self, timeout: float = 5.0) -> bool:
         """Check health via gRPC health check protocol."""
         try:
@@ -467,7 +483,23 @@ class ModelPool:
             raise KeyError(
                 f"{key} not running. Available: {list(self.instances.keys())}"
             )
-        return self.instances[key]
+
+        instance = self.instances[key]
+
+        # Verify worker is still alive and healthy
+        if not instance.is_alive():
+            raise RuntimeError(
+                f"Worker {key} process died (was healthy at startup)"
+            )
+
+        if not instance.deep_health_check(timeout=30.0):
+            raise RuntimeError(
+                f"Worker {key} failed deep health check (health_generate) - "
+                "model may be stuck or crashed"
+            )
+
+        logger.info("Worker %s passed deep health check", key)
+        return instance
 
     def get_workers_by_type(
         self, model_id: str, worker_type: WorkerType
