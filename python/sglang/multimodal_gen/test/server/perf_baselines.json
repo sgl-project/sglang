@@ -529,6 +529,31 @@
             "expected_avg_denoise_ms": 94.15,
             "expected_median_denoise_ms": 102.03
         },
+        "zimage_image_t2i_2_gpus": {
+            "stages_ms": {
+                "InputValidationStage": 0.08,
+                "TextEncodingStage": 118.66,
+                "ConditioningStage": 0.01,
+                "TimestepPreparationStage": 1.5,
+                "LatentPreparationStage": 0.12,
+                "DenoisingStage": 1304.07,
+                "DecodingStage": 37.83
+            },
+            "denoise_step_ms": {
+                "0": 49.76,
+                "1": 155.22,
+                "2": 155.98,
+                "3": 156.16,
+                "4": 157.04,
+                "5": 156.54,
+                "6": 156.29,
+                "7": 157.36,
+                "8": 156.05
+            },
+            "expected_e2e_ms": 1464.87,
+            "expected_avg_denoise_ms": 144.49,
+            "expected_median_denoise_ms": 156.16
+        },
         "zimage_image_t2i_warmup": {
             "stages_ms": {
                 "InputValidationStage": 0.02,
