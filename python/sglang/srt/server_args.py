@@ -5047,7 +5047,7 @@ class ServerArgs:
         if self.get_model_config().is_multimodal:
             import torch
 
-            if torch_release == (2, 9, 1):
+            if torch_release[:3] == (2, 9, 1):
                 cudnn_version = None
                 try:
                     cudnn_version = torch.backends.cudnn.version()
