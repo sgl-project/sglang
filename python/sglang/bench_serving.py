@@ -1953,9 +1953,23 @@ def calculate_metrics(
                 tokenizer.encode(outputs[i].generated_text, add_special_tokens=False)
             )
             retokenized_output_lens.append(retokenized_output_len)
-            total_input += input_requests[i].prompt_len
-            total_input_text += input_requests[i].text_prompt_len
-            total_input_vision += input_requests[i].vision_prompt_len
+            if isinstance(input_requests[i], dict):
+                # Dict format (e.g., Mooncake or other trace-based datasets)
+                prompt_len = (
+                    outputs[i].prompt_len
+                    if outputs[i].prompt_len > 0
+                    else input_requests[i].get("input_length", 0)
+                )
+                # Support optional text/vision split in dict format
+                text_prompt_len = input_requests[i].get("text_prompt_len", prompt_len)
+                vision_prompt_len = input_requests[i].get("vision_prompt_len", 0)
+                total_input += prompt_len
+                total_input_text += text_prompt_len
+                total_input_vision += vision_prompt_len
+            else:
+                total_input += input_requests[i].prompt_len
+                total_input_text += input_requests[i].text_prompt_len
+                total_input_vision += input_requests[i].vision_prompt_len
             if output_len > 1:
                 tpots.append((outputs[i].latency - outputs[i].ttft) / (output_len - 1))
             if use_retokenized_itl:
