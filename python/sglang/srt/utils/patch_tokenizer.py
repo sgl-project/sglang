@@ -11,7 +11,7 @@ def patch_tokenizer(tokenizer):
 
     if _is_kimi_tiktoken_tokenizer(tokenizer):
         logger.info(
-            f"Applying special tokens cache patch for Kimi tokenizer: {type(tokenizer).__name__}"
+            f"Applying special tokens cache patch for Kimi tokenizer: {type(tokenizer)}"
         )
         return _SpecialTokensCachePatcher.patch(tokenizer)
 
