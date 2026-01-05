@@ -53,6 +53,9 @@ rid_lock = asyncio.Lock()
 rid_to_receive_endpoint: Dict[str, List[str]] = dict()
 rid_to_receive_count: Dict[str, int] = dict()
 
+use_image_processor_gpu = (
+    int(os.getenv("SGLANG_ENCODER_IMAGE_PROCESSOR_USE_GPU", "0")) == 1
+)
 
 class TensorWrapper:
     """Wrapper to keep tensor alive while exposing buffer for zero-copy."""
@@ -144,6 +147,8 @@ class MMEncoder:
         )
 
         torch.get_device_module(self.device).set_device(self.gpu_id)
+
+        self.use_image_processor_gpu = use_image_processor_gpu
 
         init_distributed_environment(
             world_size=server_args.tp_size,
@@ -287,7 +292,8 @@ class MMEncoder:
     async def _encode(self, mm_items) -> torch.Tensor:
         images = await self._flatten_and_load_images(mm_items)
 
-        images_input = self.image_processor(images=images)
+        kwargs = {"device": self.device} if self.use_image_processor_gpu else {}
+        images_input = self.image_processor(images=images, **kwargs)
         feature = images_input["pixel_values"]
         mm_item = MultimodalDataItem.from_dict(
             {
