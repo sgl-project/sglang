@@ -1,20 +1,26 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 import base64
+import dataclasses
 import json
 import os
+import shlex
 import socket
 import time
+import unittest
 from pathlib import Path
+from typing import Optional
 
 import cv2
 from PIL import Image
 
+from sglang.multimodal_gen.configs.sample.sampling_params import DataType
 from sglang.multimodal_gen.runtime.utils.common import get_bool_env_var
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.perf_logger import (
     RequestPerfRecord,
     get_diffusion_perf_log_dir,
 )
+from sglang.multimodal_gen.test.cli.test_generate_common import run_command
 
 logger = init_logger(__name__)
 
