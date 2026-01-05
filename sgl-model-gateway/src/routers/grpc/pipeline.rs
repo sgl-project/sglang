@@ -370,9 +370,6 @@ impl RequestPipeline {
         components: Arc<SharedComponents>,
     ) -> Response {
         let start = Instant::now();
-        // Clone model_id for metrics before moving into context
-        // GenerateRequest doesn't have a model field, so we use model_id
-        let model_for_metrics = model_id.clone();
         let streaming = request.stream;
 
         // Record request start
@@ -380,12 +377,12 @@ impl RequestPipeline {
             metrics_labels::ROUTER_GRPC,
             self.backend_type,
             metrics_labels::CONNECTION_GRPC,
-            model_for_metrics.as_deref().unwrap_or("unknown"),
+            model_id.as_deref().unwrap_or(UNKNOWN_MODEL_ID),
             metrics_labels::ENDPOINT_GENERATE,
             bool_to_static_str(streaming),
         );
 
-        let mut ctx = RequestContext::for_generate(request, headers, model_id, components);
+        let mut ctx = RequestContext::for_generate(request, headers, model_id.clone(), components);
 
         for stage in self.stages.iter() {
             match stage.execute(&mut ctx).await {
@@ -394,7 +391,7 @@ impl RequestPipeline {
                         metrics_labels::ROUTER_GRPC,
                         self.backend_type,
                         metrics_labels::CONNECTION_GRPC,
-                        model_for_metrics.as_deref().unwrap_or("unknown"),
+                        model_id.as_deref().unwrap_or(UNKNOWN_MODEL_ID),
                         metrics_labels::ENDPOINT_GENERATE,
                         start.elapsed(),
                     );
@@ -406,7 +403,7 @@ impl RequestPipeline {
                         metrics_labels::ROUTER_GRPC,
                         self.backend_type,
                         metrics_labels::CONNECTION_GRPC,
-                        model_for_metrics.as_deref().unwrap_or("unknown"),
+                        model_id.as_deref().unwrap_or(UNKNOWN_MODEL_ID),
                         metrics_labels::ENDPOINT_GENERATE,
                         error_type_from_status(response.status()),
                     );
@@ -426,7 +423,7 @@ impl RequestPipeline {
                     metrics_labels::ROUTER_GRPC,
                     self.backend_type,
                     metrics_labels::CONNECTION_GRPC,
-                    model_for_metrics.as_deref().unwrap_or("unknown"),
+                    model_id.as_deref().unwrap_or(UNKNOWN_MODEL_ID),
                     metrics_labels::ENDPOINT_GENERATE,
                     start.elapsed(),
                 );
@@ -443,7 +440,7 @@ impl RequestPipeline {
                     metrics_labels::ROUTER_GRPC,
                     self.backend_type,
                     metrics_labels::CONNECTION_GRPC,
-                    model_for_metrics.as_deref().unwrap_or("unknown"),
+                    model_id.as_deref().unwrap_or(UNKNOWN_MODEL_ID),
                     metrics_labels::ENDPOINT_GENERATE,
                     metrics_labels::ERROR_INTERNAL,
                 );
@@ -458,7 +455,7 @@ impl RequestPipeline {
                     metrics_labels::ROUTER_GRPC,
                     self.backend_type,
                     metrics_labels::CONNECTION_GRPC,
-                    model_for_metrics.as_deref().unwrap_or("unknown"),
+                    model_id.as_deref().unwrap_or(UNKNOWN_MODEL_ID),
                     metrics_labels::ENDPOINT_GENERATE,
                     metrics_labels::ERROR_INTERNAL,
                 );
