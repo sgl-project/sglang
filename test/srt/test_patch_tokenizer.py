@@ -112,8 +112,10 @@ class TestPatchTokenizerUnitTest(unittest.TestCase):
 
 def _run_tokenizer_ops(tokenizer, texts):
     encode_results = [tokenizer.encode(t) for t in texts]
+    batch_encode_results = tokenizer(texts)["input_ids"]
     return {
         "encode": encode_results,
+        "batch_encode": batch_encode_results,
         "decode": [tokenizer.decode(ids, skip_special_tokens=True) for ids in encode_results],
         "batch_decode": tokenizer.batch_decode(encode_results, skip_special_tokens=True),
         "special_tokens": tokenizer.all_special_tokens,
