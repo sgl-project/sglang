@@ -5,8 +5,7 @@
 use serde_json::json;
 use smg::tool_parser::{JsonParser, ToolParser};
 
-mod common;
-use common::{create_test_tools, streaming_helpers::*};
+use crate::common::{create_test_tools, streaming_helpers::*};
 
 #[tokio::test]
 async fn test_simple_json_tool_call() {

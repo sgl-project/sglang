@@ -2,8 +2,7 @@
 
 use smg::tool_parser::{KimiK2Parser, ToolParser};
 
-mod common;
-use common::create_test_tools;
+use crate::common::create_test_tools;
 
 #[tokio::test]
 async fn test_kimik2_complete_parsing() {

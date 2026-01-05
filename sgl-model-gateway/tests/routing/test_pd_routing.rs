@@ -1,5 +1,5 @@
 #[cfg(test)]
-mod test_pd_routing {
+mod pd_routing_unit_tests {
     use serde_json::json;
     use smg::{
         app_context::AppContext,

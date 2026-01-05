@@ -5,8 +5,7 @@
 use serde_json::json;
 use smg::tool_parser::{QwenParser, ToolParser};
 
-mod common;
-use common::{create_test_tools, streaming_helpers::*};
+use crate::common::{create_test_tools, streaming_helpers::*};
 
 #[tokio::test]
 async fn test_qwen_single_tool() {
