@@ -5,6 +5,8 @@ description = "E2E tests for sgl-model-gateway"
 requires-python = ">=3.9"
 
 dependencies = [
+  "grpcio",
+  "grpcio-health-checking",
   "httpx",
   "openai",
   "pytest",

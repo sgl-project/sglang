@@ -15,11 +15,7 @@ import pytest
 if TYPE_CHECKING:
     from infra import ModelPool
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)8s] %(name)s: %(message)s",
-)
+# Logger for this module (pytest handles log configuration via --log-cli-level)
 logger = logging.getLogger(__name__)
 
 # Path setup for imports

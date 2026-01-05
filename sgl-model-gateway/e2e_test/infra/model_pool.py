@@ -68,11 +68,37 @@ class ModelInstance:
         return self.process.poll() is None
 
     def health_check(self, timeout: float = 5.0) -> bool:
-        """Check if the model server is healthy via HTTP."""
+        """Check if the model server is healthy.
+
+        Uses HTTP /health endpoint for HTTP workers, gRPC health check for gRPC workers.
+        """
+        if self.mode == ConnectionMode.GRPC:
+            return self._grpc_health_check(timeout)
+        return self._http_health_check(timeout)
+
+    def _http_health_check(self, timeout: float = 5.0) -> bool:
+        """Check health via HTTP /health endpoint."""
         try:
             resp = httpx.get(f"{self.base_url}/health", timeout=timeout)
             return resp.status_code == 200
         except (httpx.RequestError, httpx.TimeoutException):
+            return False
+
+    def _grpc_health_check(self, timeout: float = 5.0) -> bool:
+        """Check health via gRPC channel connectivity."""
+        try:
+            import grpc
+            from grpc_health.v1 import health_pb2, health_pb2_grpc
+
+            channel = grpc.insecure_channel(f"{DEFAULT_HOST}:{self.port}")
+            try:
+                stub = health_pb2_grpc.HealthStub(channel)
+                request = health_pb2.HealthCheckRequest(service="")
+                response = stub.Check(request, timeout=timeout)
+                return response.status == health_pb2.HealthCheckResponse.SERVING
+            finally:
+                channel.close()
+        except Exception:
             return False
 
     def terminate(self, timeout: float = 10.0) -> None:
