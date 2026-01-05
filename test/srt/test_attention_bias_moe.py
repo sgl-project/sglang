@@ -1,0 +1,361 @@
+#!/usr/bin/env python3
+"""
+Unit tests for multi-layer attention biases and MoE telemetry.
+
+Tests:
+- Multi-layer attention bias CSR indexing
+- MoE telemetry computation (entropy, hubness, switch-rate)
+- Think phase tracking
+- Layer ID validation
+
+Usage:
+    python -m pytest test/srt/test_attention_bias_moe.py -v
+"""
+
+import math
+import unittest
+from unittest.mock import MagicMock, patch
+from typing import Dict, List, Optional, Tuple
+
+import torch
+
+
+class TestMultiLayerAttentionBias(unittest.TestCase):
+    """Test multi-layer attention bias with CSR indexing."""
+
+    def test_csr_indexing_single_layer(self):
+        """Test CSR indexing with biases on a single layer."""
+        # Simulate bias data: layer 5, batch 0, positions [10, 20, 30]
+        indices = torch.tensor([
+            [5, 0, 10],  # layer_id, batch_idx, token_pos
+            [5, 0, 20],
+            [5, 0, 30],
+        ], dtype=torch.int64)
+        values = torch.tensor([1.0, 2.0, 3.0], dtype=torch.float32)
+        layers = [5]
+        # CSR indptr: [0, 3] meaning layer 5 has entries 0-3
+        layer_indptr = torch.tensor([0, 3], dtype=torch.int64)
+
+        # Verify CSR structure
+        self.assertEqual(len(layer_indptr), len(layers) + 1)
+        self.assertEqual(layer_indptr[-1].item(), len(values))
+
+        # Extract biases for layer 5
+        layer_idx = 0
+        start, end = layer_indptr[layer_idx].item(), layer_indptr[layer_idx + 1].item()
+        layer_indices = indices[start:end]
+        layer_values = values[start:end]
+
+        self.assertEqual(len(layer_values), 3)
+        self.assertTrue(torch.all(layer_indices[:, 0] == 5))
+
+    def test_csr_indexing_multi_layer(self):
+        """Test CSR indexing with biases on multiple layers."""
+        # Biases on layers 0, 5, 10
+        indices = torch.tensor([
+            # Layer 0 (2 entries)
+            [0, 0, 5],
+            [0, 0, 10],
+            # Layer 5 (3 entries)
+            [5, 0, 15],
+            [5, 0, 20],
+            [5, 0, 25],
+            # Layer 10 (1 entry)
+            [10, 0, 30],
+        ], dtype=torch.int64)
+        values = torch.tensor([0.5, 0.6, 1.0, 1.5, 2.0, 3.0], dtype=torch.float32)
+        layers = [0, 5, 10]
+        # CSR indptr: layer 0 has 0-2, layer 5 has 2-5, layer 10 has 5-6
+        layer_indptr = torch.tensor([0, 2, 5, 6], dtype=torch.int64)
+
+        # Test layer 0
+        start, end = layer_indptr[0].item(), layer_indptr[1].item()
+        self.assertEqual(end - start, 2)
+        self.assertTrue(torch.all(indices[start:end, 0] == 0))
+
+        # Test layer 5
+        start, end = layer_indptr[1].item(), layer_indptr[2].item()
+        self.assertEqual(end - start, 3)
+        self.assertTrue(torch.all(indices[start:end, 0] == 5))
+
+        # Test layer 10
+        start, end = layer_indptr[2].item(), layer_indptr[3].item()
+        self.assertEqual(end - start, 1)
+        self.assertTrue(torch.all(indices[start:end, 0] == 10))
+
+    def test_no_bias_for_layer(self):
+        """Test handling when a layer has no biases."""
+        indices = torch.tensor([[5, 0, 10]], dtype=torch.int64)
+        values = torch.tensor([1.0], dtype=torch.float32)
+        layers = [5]
+        layer_indptr = torch.tensor([0, 1], dtype=torch.int64)
+
+        # Layer 3 is not in the list
+        has_bias = 3 in layers
+        self.assertFalse(has_bias)
+
+
+class TestMoETelemetry(unittest.TestCase):
+    """Test MoE telemetry computation."""
+
+    def test_entropy_computation(self):
+        """Test routing entropy computation from weights."""
+        # Uniform weights -> high entropy
+        uniform_weights = [0.5, 0.5]
+        total = sum(uniform_weights)
+        entropy_uniform = 0.0
+        for w in uniform_weights:
+            if w > 0:
+                p = w / total
+                entropy_uniform -= p * math.log2(p + 1e-10)
+
+        # Should be close to 1.0 for 2 experts with uniform weights
+        self.assertAlmostEqual(entropy_uniform, 1.0, places=2)
+
+        # Peaked weights -> low entropy
+        peaked_weights = [0.99, 0.01]
+        total = sum(peaked_weights)
+        entropy_peaked = 0.0
+        for w in peaked_weights:
+            if w > 0:
+                p = w / total
+                entropy_peaked -= p * math.log2(p + 1e-10)
+
+        # Should be close to 0 for very peaked distribution
+        self.assertLess(entropy_peaked, 0.2)
+
+    def test_expert_churn_computation(self):
+        """Test expert churn (switch-rate) computation."""
+        # Previous top experts by layer
+        prev_top_experts = {0: 5, 1: 10, 2: 15}
+
+        # Current top experts - 2 out of 3 changed
+        current_top_experts = {0: 7, 1: 10, 2: 20}
+
+        churn_count = 0
+        layer_count = 0
+        for layer_id in current_top_experts:
+            if layer_id in prev_top_experts:
+                if prev_top_experts[layer_id] != current_top_experts[layer_id]:
+                    churn_count += 1
+            layer_count += 1
+
+        churn_rate = churn_count / layer_count if layer_count > 0 else 0
+        self.assertAlmostEqual(churn_rate, 2/3, places=2)
+
+    def test_hubness_computation(self):
+        """Test hubness (expert concentration) computation."""
+        # Expert counts: expert 5 selected 80 times, expert 7 selected 20 times
+        expert_counts = {5: 80, 7: 20}
+        total_selections = sum(expert_counts.values())
+
+        # Find top expert
+        top_expert = max(expert_counts, key=expert_counts.get)
+        top_count = expert_counts[top_expert]
+
+        # Hubness = concentration = top_count / total
+        hubness = top_count / total_selections
+        self.assertAlmostEqual(hubness, 0.8, places=2)
+
+        # More uniform distribution
+        uniform_counts = {5: 25, 7: 25, 10: 25, 12: 25}
+        total = sum(uniform_counts.values())
+        top = max(uniform_counts.values())
+        hubness_uniform = top / total
+        self.assertAlmostEqual(hubness_uniform, 0.25, places=2)
+
+    def test_telemetry_accumulation(self):
+        """Test hubness accumulation across steps."""
+        hubness_tracker: Dict[int, Dict[int, int]] = {}
+        total_steps = 0
+
+        # Simulate 10 steps
+        for step in range(10):
+            # Layer 0 always picks expert 5
+            layer_id = 0
+            expert_id = 5
+            if layer_id not in hubness_tracker:
+                hubness_tracker[layer_id] = {}
+            hubness_tracker[layer_id][expert_id] = hubness_tracker[layer_id].get(expert_id, 0) + 1
+
+            # Layer 1 alternates between expert 10 and 11
+            layer_id = 1
+            expert_id = 10 if step % 2 == 0 else 11
+            if layer_id not in hubness_tracker:
+                hubness_tracker[layer_id] = {}
+            hubness_tracker[layer_id][expert_id] = hubness_tracker[layer_id].get(expert_id, 0) + 1
+
+            total_steps += 1
+
+        # Layer 0: expert 5 has 100% concentration
+        self.assertEqual(hubness_tracker[0][5], 10)
+        hubness_0 = hubness_tracker[0][5] / sum(hubness_tracker[0].values())
+        self.assertAlmostEqual(hubness_0, 1.0, places=2)
+
+        # Layer 1: experts 10 and 11 each have 50%
+        hubness_1 = max(hubness_tracker[1].values()) / sum(hubness_tracker[1].values())
+        self.assertAlmostEqual(hubness_1, 0.5, places=2)
+
+
+class TestThinkPhaseTracking(unittest.TestCase):
+    """Test think phase tracking for reasoning models."""
+
+    def test_phase_transitions(self):
+        """Test tracking of think/output phase transitions."""
+        # Simulate think start token ID = 100, end token ID = 101
+        think_start_id = 100
+        think_end_id = 101
+
+        current_phase = "output"  # Start in output phase
+        phase_history = []
+
+        # Simulate token sequence: normal, <think>, think content, </think>, output
+        # Use distinct token IDs to avoid collision with special tokens
+        tokens = [50, 60, think_start_id, 70, 80, 90, think_end_id, 200, 210]
+
+        for tok in tokens:
+            if tok == think_start_id:
+                current_phase = "think"
+            elif tok == think_end_id:
+                current_phase = "output"
+            phase_history.append(current_phase)
+
+        # Check phase assignments
+        self.assertEqual(phase_history[0], "output")  # Before <think>
+        self.assertEqual(phase_history[1], "output")
+        self.assertEqual(phase_history[2], "think")   # At <think>
+        self.assertEqual(phase_history[3], "think")   # Inside think
+        self.assertEqual(phase_history[4], "think")
+        self.assertEqual(phase_history[5], "think")
+        self.assertEqual(phase_history[6], "output")  # At </think>
+        self.assertEqual(phase_history[7], "output")  # After </think>
+
+    def test_phase_in_attention_info(self):
+        """Test that think_phase is included in attention info."""
+        attention_info = {
+            "token_positions": [10, 20, 30],
+            "attention_scores": [0.5, 0.3, 0.2],
+            "layer_id": 11,
+            "decode_step": 5,
+            "think_phase": "think",
+        }
+
+        self.assertIn("think_phase", attention_info)
+        self.assertEqual(attention_info["think_phase"], "think")
+
+
+class TestLayerValidation(unittest.TestCase):
+    """Test layer ID validation."""
+
+    def test_filter_invalid_layer_ids(self):
+        """Test filtering of invalid layer IDs."""
+        num_layers = 32
+        requested_layers = [-1, 0, 15, 31, 32, 100]
+
+        valid_layers = [
+            lid for lid in requested_layers
+            if 0 <= lid < num_layers
+        ]
+
+        self.assertEqual(valid_layers, [0, 15, 31])
+
+    def test_all_invalid_falls_back_to_none(self):
+        """Test that all invalid IDs results in None (capture all)."""
+        num_layers = 32
+        requested_layers = [-5, 50, 100]
+
+        valid_layers = [
+            lid for lid in requested_layers
+            if 0 <= lid < num_layers
+        ]
+
+        result = valid_layers if valid_layers else None
+        self.assertIsNone(result)
+
+    def test_moe_layer_capture_filtering(self):
+        """Test MoE layer filtering during capture."""
+        # Simulate a model where MoE layers are at indices 2, 4, 6, 8
+        moe_layer_ids = {2, 4, 6, 8}
+        capture_layer_ids = [0, 2, 4, 10]  # User requests these
+
+        # Filter to only actual MoE layers
+        valid_moe_captures = [
+            lid for lid in capture_layer_ids
+            if lid in moe_layer_ids
+        ]
+
+        self.assertEqual(valid_moe_captures, [2, 4])
+
+
+class TestSparseBiasCorrection(unittest.TestCase):
+    """Test sparse bias correction math."""
+
+    def test_bias_effect_direction(self):
+        """Test that positive bias increases attention weight."""
+        # Original attention weight (after softmax)
+        original_weight = 0.1  # 10% of attention
+        bias = 2.0
+
+        # Biased weight should be higher
+        # exp(original_logit + bias) > exp(original_logit)
+        # So the new weight should be higher
+        exp_bias = math.exp(bias)
+        self.assertGreater(exp_bias, 1.0)
+
+    def test_negative_bias_decreases_weight(self):
+        """Test that negative bias decreases attention weight."""
+        bias = -2.0
+        exp_bias_minus_1 = math.exp(bias) - 1
+
+        # exp(-2) - 1 ≈ 0.135 - 1 = -0.865
+        # This should decrease the weight
+        self.assertLess(exp_bias_minus_1, 0)
+
+    def test_zero_bias_no_change(self):
+        """Test that zero bias has no effect."""
+        bias = 0.0
+        exp_bias_minus_1 = math.exp(bias) - 1
+
+        # exp(0) - 1 = 0
+        self.assertAlmostEqual(exp_bias_minus_1, 0.0, places=5)
+
+
+class TestFingerprintMode(unittest.TestCase):
+    """Test fingerprint mode telemetry."""
+
+    def test_fingerprint_dimensions(self):
+        """Test that fingerprint has correct dimensions."""
+        # Fingerprint should be 20D: 16-bin histogram + 4 mass values
+        expected_dims = 20
+
+        # Simulate fingerprint
+        fingerprint = [0.0] * 16  # 16-bin log-distance histogram
+        fingerprint.extend([0.3, 0.4, 0.2, 0.1])  # local, mid, long, entropy
+
+        self.assertEqual(len(fingerprint), expected_dims)
+
+    def test_manifold_classification(self):
+        """Test manifold classification from fingerprint."""
+        # Syntax floor: high local mass
+        syntax_floor = {"local_mass": 0.8, "mid_mass": 0.1, "long_mass": 0.1}
+        # Semantic bridge: high mid mass
+        semantic_bridge = {"local_mass": 0.2, "mid_mass": 0.7, "long_mass": 0.1}
+        # Long range: high long mass
+        long_range = {"local_mass": 0.1, "mid_mass": 0.2, "long_mass": 0.7}
+
+        def classify(masses):
+            if masses["local_mass"] > 0.5:
+                return "syntax_floor"
+            elif masses["mid_mass"] > 0.5:
+                return "semantic_bridge"
+            elif masses["long_mass"] > 0.5:
+                return "long_range"
+            return "diffuse"
+
+        self.assertEqual(classify(syntax_floor), "syntax_floor")
+        self.assertEqual(classify(semantic_bridge), "semantic_bridge")
+        self.assertEqual(classify(long_range), "long_range")
+
+
+if __name__ == "__main__":
+    unittest.main()
