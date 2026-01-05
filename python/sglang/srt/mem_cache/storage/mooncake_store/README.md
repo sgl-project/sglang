@@ -263,6 +263,89 @@ Distributed deployment of Mooncake is straightforward. Similar to the single-nod
 
 Mooncake also supports high availability mode. This mode enhances fault tolerance by running the `master service` as a cluster of multiple master nodes coordinated through an `etcd` cluster. The master nodes use `etcd` to elect a leader, which is responsible for handling client requests. For more details about how to deploy in this mode, please refer to our [documents](https://kvcache-ai.github.io/Mooncake/).
 
+### Deployment with Dummy Client (Experimental)
+
+In addition to the standard deployment where SGLang acts as a full Mooncake node, you can use the **Dummy Client** mode. In this mode, SGLang connects to a local **Mooncake Store Service** (Real Client) via RPC/IPC. This decouples the SGLang process from the heavy RDMA and memory management, potentially improving stability and allowing the cache to persist even if the SGLang process restarts.
+
+**Architecture:**
+* **Mooncake Master**: Manages the cluster topology (same as standard).
+* **Mooncake Store Service (Real Client)**: Manages the actual memory pool and RDMA connections. Must be running locally.
+* **SGLang Server (Dummy Client)**: Connects to the local Store Service to access the cache.
+
+#### 1. Launch Services (Master & Store)
+
+First, start the `master service` and the `store service`. The `store service` acts as the Real Client.
+
+**Start Master:**
+```bash
+mooncake_master --eviction_high_watermark_ratio=0.95
+```
+
+**Start Store Service (Real Client):** Crucially, the default port (50052) is used for internal RPC, which the Dummy Client will connect to.
+```bash
+mooncake_client --global_segment_size=4GB
+```
+
+**Parameter Explanation:**
+
+- **`host`**: (string, default: "0.0.0.0"): The hostname of the client.
+
+- **`port`**: (int, default: 50052): The port number the client service listens on.
+
+- **`global_segment_size`**: (string, default: "4GB"): The size of the global segment to be allocated by the client.
+
+- **`master_server_address`**: (string, default: "localhost:50051"): The address of the Master Service.
+
+- **`metadata_server`**: (string, default: "http://localhost:8080/metadata"): The address of the metadata service.
+
+- **`protocol`**: (string, default: "tcp"): The protocol used by the Transfer Engine.
+
+- **`device_name`**: (string, default: ""): The device name used by the Transfer Engine.
+
+- **`threads`**: (int, default: 1): The number of threads used by the client.
+
+#### 2. Launch SGLang (Dummy Client)
+Configure SGLang to connect to the Real Client using the client_server_address parameter.
+
+**Using extra-config of sglang arguments to configure Mooncake**
+
+```bash
+python -m sglang.launch_server \
+    --enable-hierarchical-cache \
+    --hicache-storage-backend mooncake \
+    --model-path [model_path] \
+    --hicache-storage-backend-extra-config '{"standalone_storage": true, "client_server_address": "127.0.0.1:50052"}'
+```
+
+**Using JSON file to configure Mooncake**
+
+SGLang server can load Mooncake config from `SGLANG_HICACHE_MOONCAKE_CONFIG_PATH`.
+
+```bash
+export SGLANG_HICACHE_MOONCAKE_CONFIG_PATH=/sgl-workspace/sglang/benchmark/hicache/mooncake_config.json
+
+echo '{
+    "standalone_storage": true,
+    "client_server_address": "127.0.0.1:50052"
+}' > ${SGLANG_HICACHE_MOONCAKE_CONFIG_PATH}
+
+python -m sglang.launch_server \
+    --enable-hierarchical-cache \
+    --hicache-storage-backend mooncake \
+    --model-path [model_path]
+```
+
+**Using env variables to configure Mooncake**
+
+```bash
+MOONCAKE_STANDALONE_STORAGE=1
+MOONCAKE_CLIENT="127.0.0.1:50052"
+python -m sglang.launch_server \
+    --enable-hierarchical-cache \
+    --hicache-storage-backend mooncake \
+    --model-path [model_path]
+```
+
 ### Prefill/Decode Disaggregation
 
 In **PD disaggregation**, the configurations for the `metadata service`, `mooncake master`, and the optional `store service` remain the same as described above. The difference is that SGLang introduces three distinct roles: `prefill worker`, `decode worker`, and `router`.

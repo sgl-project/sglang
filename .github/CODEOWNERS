@@ -2,6 +2,7 @@
 /docker @Fridge003 @ispobock @HaiShaw @ishandhanani
 /docker/npu.Dockerfile @ping1jing2 @iforgetmyname
 /python/pyproject.toml @merrymercy @Fridge003 @ispobock
+/python/sglang/jit_kernel @DarkSharpness @BBuf
 /python/sglang/multimodal_gen @mickqian @yhyang201
 /python/sglang/srt/batch_invariant_ops @Fridge003 @hebiao064
 /python/sglang/srt/constrained @hnyls2002 @DarkSharpness
@@ -33,7 +34,7 @@
 /sgl-model-gateway @slin1237 @CatherineSue
 /sgl-model-gateway/benches @slin1237
 /sgl-model-gateway/bindings/python @CatherineSue @key4ng @slin1237
-/sgl-model-gateway/py_test @CatherineSue @key4ng
+/sgl-model-gateway/e2e_test @CatherineSue @key4ng
 /sgl-model-gateway/src/config @slin1237
 /sgl-model-gateway/src/core @slin1237
 /sgl-model-gateway/src/data_connector @key4ng
