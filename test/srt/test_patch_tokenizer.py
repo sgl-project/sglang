@@ -9,7 +9,55 @@ from sglang.srt.utils.patch_tokenizer import (
 )
 
 
-class TestPatchTokenizer(unittest.TestCase):
+class TestPatchTokenizerEndToEndTest(unittest.TestCase):
+    def test_patched_produces_same_results_as_raw(self):
+        test_texts = [
+            "Hello, world!",
+            "This is a longer sentence with multiple words.",
+            "Special chars: <|im_start|> <|im_end|> [BOS] [EOS]",
+            "Numbers 12345 and symbols !@#$%",
+            "中文测试 mixed with English",
+            "    leading and trailing spaces    ",
+            "\n\nMultiple\n\nNewlines\n\n",
+        ]
+
+        # Get results from raw tokenizer
+        raw_tokenizer = _load_tokenizer()
+        raw_encode_results = [raw_tokenizer.encode(t) for t in test_texts]
+        raw_decode_results = [
+            raw_tokenizer.decode(ids, skip_special_tokens=True)
+            for ids in raw_encode_results
+        ]
+        raw_batch_decode_results = raw_tokenizer.batch_decode(
+            raw_encode_results, skip_special_tokens=True
+        )
+        raw_special_tokens = raw_tokenizer.all_special_tokens
+        raw_special_ids = raw_tokenizer.all_special_ids
+
+        # Get results from patched tokenizer
+        _SpecialTokensCachePatcher.patch(raw_tokenizer)
+        patched_encode_results = [raw_tokenizer.encode(t) for t in test_texts]
+        patched_decode_results = [
+            raw_tokenizer.decode(ids, skip_special_tokens=True)
+            for ids in patched_encode_results
+        ]
+        patched_batch_decode_results = raw_tokenizer.batch_decode(
+            patched_encode_results, skip_special_tokens=True
+        )
+        patched_special_tokens = raw_tokenizer.all_special_tokens
+        patched_special_ids = raw_tokenizer.all_special_ids
+
+        unpatch_tokenizer(raw_tokenizer)
+
+        # Compare results
+        self.assertEqual(raw_encode_results, patched_encode_results)
+        self.assertEqual(raw_decode_results, patched_decode_results)
+        self.assertEqual(raw_batch_decode_results, patched_batch_decode_results)
+        self.assertEqual(raw_special_tokens, patched_special_tokens)
+        self.assertEqual(raw_special_ids, patched_special_ids)
+
+
+class TestPatchTokenizerUnitTest(unittest.TestCase):
     def test_patch_unpatch_restores_original(self):
         tokenizer = _load_tokenizer()
         cls = type(tokenizer)
@@ -86,53 +134,6 @@ class TestPatchTokenizer(unittest.TestCase):
         )
 
         unpatch_tokenizer(tokenizer)
-
-    def test_patched_produces_same_results_as_raw(self):
-        """End-to-end test: patched tokenizer should produce identical results"""
-        test_texts = [
-            "Hello, world!",
-            "This is a longer sentence with multiple words.",
-            "Special chars: <|im_start|> <|im_end|> [BOS] [EOS]",
-            "Numbers 12345 and symbols !@#$%",
-            "中文测试 mixed with English",
-            "    leading and trailing spaces    ",
-            "\n\nMultiple\n\nNewlines\n\n",
-        ]
-
-        # Get results from raw tokenizer
-        raw_tokenizer = _load_tokenizer()
-        raw_encode_results = [raw_tokenizer.encode(t) for t in test_texts]
-        raw_decode_results = [
-            raw_tokenizer.decode(ids, skip_special_tokens=True)
-            for ids in raw_encode_results
-        ]
-        raw_batch_decode_results = raw_tokenizer.batch_decode(
-            raw_encode_results, skip_special_tokens=True
-        )
-        raw_special_tokens = raw_tokenizer.all_special_tokens
-        raw_special_ids = raw_tokenizer.all_special_ids
-
-        # Get results from patched tokenizer
-        _SpecialTokensCachePatcher.patch(raw_tokenizer)
-        patched_encode_results = [raw_tokenizer.encode(t) for t in test_texts]
-        patched_decode_results = [
-            raw_tokenizer.decode(ids, skip_special_tokens=True)
-            for ids in patched_encode_results
-        ]
-        patched_batch_decode_results = raw_tokenizer.batch_decode(
-            patched_encode_results, skip_special_tokens=True
-        )
-        patched_special_tokens = raw_tokenizer.all_special_tokens
-        patched_special_ids = raw_tokenizer.all_special_ids
-
-        unpatch_tokenizer(raw_tokenizer)
-
-        # Compare results
-        self.assertEqual(raw_encode_results, patched_encode_results)
-        self.assertEqual(raw_decode_results, patched_decode_results)
-        self.assertEqual(raw_batch_decode_results, patched_batch_decode_results)
-        self.assertEqual(raw_special_tokens, patched_special_tokens)
-        self.assertEqual(raw_special_ids, patched_special_ids)
 
 
 def _get_class_attr_ids(cls):
