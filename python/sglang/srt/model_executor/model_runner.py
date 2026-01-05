@@ -2022,6 +2022,7 @@ class ModelRunner:
                         if use_elasticmem:
                             swa_allocator_class = ElasticSWATokenToKVPoolAllocator
                             swa_kwargs["emem_orch"] = self.emem_orch
+                            swa_kwargs["sliding_window_size"] = self.sliding_window_size
                         self.token_to_kv_pool_allocator = swa_allocator_class(
                             self.full_max_total_num_tokens,
                             self.swa_max_total_num_tokens,

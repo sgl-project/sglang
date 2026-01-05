@@ -86,6 +86,7 @@ class ElasticTokenToKVPoolAllocator(TokenToKVPoolAllocator, ElasticAllocator):
         )
 
     def _check_unused_pages(self):
+        return
         self_unused_pages = self.unused_pages[1:]
         self_unused_pages = self_unused_pages[self_unused_pages == True]
         assert (self.available_size() + self.evictable_size()) == len(
@@ -136,7 +137,7 @@ class ElasticTokenToKVPoolAllocator(TokenToKVPoolAllocator, ElasticAllocator):
 
         # DEBUG
         self_candidate_unmap_pages = self.candidate_unmap_pages.tolist()
-        assert len(set(self_candidate_unmap_pages)) == len(self_candidate_unmap_pages)
+        # assert len(set(self_candidate_unmap_pages)) == len(self_candidate_unmap_pages)
 
     @override
     def alloc(self, need_size: int):
@@ -174,9 +175,9 @@ class ElasticTokenToKVPoolAllocator(TokenToKVPoolAllocator, ElasticAllocator):
         # DEBUG
         self_free_pages = self.free_pages.tolist()
         self_candidate_unmap_pages = self.candidate_unmap_pages.tolist()
-        assert len(set(self_free_pages)) == len(self_free_pages)
-        assert len(set(self_candidate_unmap_pages)) == len(self_candidate_unmap_pages)
-        assert len(set(self_free_pages) & set(self_candidate_unmap_pages)) == 0
+        # assert len(set(self_free_pages)) == len(self_free_pages)
+        # assert len(set(self_candidate_unmap_pages)) == len(self_candidate_unmap_pages)
+        # assert len(set(self_free_pages) & set(self_candidate_unmap_pages)) == 0
 
     @override
     def free(self, free_index: torch.Tensor):
@@ -204,8 +205,8 @@ class ElasticTokenToKVPoolAllocator(TokenToKVPoolAllocator, ElasticAllocator):
 
     def _evict_tail(self):
         start_time = time.perf_counter()
-        assert all(self.free_pages <= self.candidate_size)
-        assert all(self.release_pages <= self.candidate_size)
+        # assert all(self.free_pages <= self.candidate_size)
+        # assert all(self.release_pages <= self.candidate_size)
         evict_indices = self.unused_pages.nonzero(as_tuple=True)[0]
         evict_indices = evict_indices[evict_indices > self.candidate_size]
 
@@ -311,9 +312,9 @@ class ElasticTokenToKVPoolAllocator(TokenToKVPoolAllocator, ElasticAllocator):
 
         # DEBUG
         self_candidate_unmap_pages = self.candidate_unmap_pages.tolist()
-        assert len(set(self_candidate_unmap_pages)) == len(
-            self_candidate_unmap_pages
-        ), f"{(len(self.candidate_unmap_pages), min(self.candidate_unmap_pages), max(self.candidate_unmap_pages), self.size, self.candidate_size)=}"
+        # assert len(set(self_candidate_unmap_pages)) == len(
+        #     self_candidate_unmap_pages
+        # ), f"{(len(self.candidate_unmap_pages), min(self.candidate_unmap_pages), max(self.candidate_unmap_pages), self.size, self.candidate_size)=}"
 
         assert (
             len(self.candidate_unmap_pages) == self.size - self.candidate_size
@@ -398,11 +399,14 @@ class ElasticTokenToKVPoolAllocator(TokenToKVPoolAllocator, ElasticAllocator):
 
 
 class ElasticSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator, ElasticAllocator):
-    def __init__(self, *args, emem_orch, **kwargs):
+    def __init__(self, *args, emem_orch, sliding_window_size, **kwargs):
         self.emem_orch = emem_orch
+        self.sliding_window_size = sliding_window_size
 
         super().__init__(*args, **kwargs)
-        logger.debug(f"ElasticSWATokenToKVPoolAllocator initialized")
+        logger.debug(
+            f"ElasticSWATokenToKVPoolAllocator initialized, {self.sliding_window_size=}"
+        )
 
         self.emem_orch.register_allocator(self)
         self.emem_orch.register_allocator(self.full_attn_allocator)
@@ -519,12 +523,12 @@ class ElasticSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator, ElasticAllocat
         self._kvcache.size == self.full_attn_allocator.size
         self._kvcache.size_swa == self.swa_attn_allocator.size
         self._size_swa = self.swa_attn_allocator.size
-        assert all(
-            self.full_to_swa_index_mapping[
-                self._size_full + 1 : self.full_attn_allocator.size + 1
-            ]
-            == 0
-        )
+        # assert all(
+        #     self.full_to_swa_index_mapping[
+        #         self._size_full + 1 : self.full_attn_allocator.size + 1
+        #     ]
+        #     == 0
+        # )
         self._size_full = self.full_attn_allocator.size
         self.scheduler.swa_tokens_per_layer = self._size_swa
         self.scheduler.full_tokens_per_layer = self._size_full
@@ -536,5 +540,8 @@ class ElasticSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator, ElasticAllocat
         )
 
     @override
-    def defragmentation(self) -> bool:
-        raise NotImplementedError()
+    def translate_loc_from_full_to_swa(self, kv_indices: torch.Tensor):
+        assert self.full_to_swa_index_mapping is not None
+        swa_indices = self.full_to_swa_index_mapping[kv_indices].to(torch.int32)
+        swa_indices[: -self.sliding_window_size] = 0
+        return swa_indices

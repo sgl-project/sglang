@@ -1,19 +1,38 @@
 import os
 import re
+import statistics
+from datetime import datetime
 
 import matplotlib.pyplot as plt
 
 
-def parse_log_file(file_path, label_prefix):
-    """Parse log file and extract full token usage, swa token usage, running requests, and generation throughput data"""
+def parse_log_file(file_path):
+    """Parse log file and extract token usage, running requests, throughput, and timing data"""
     full_token_usage = []
     swa_token_usage = []
     running_req = []
-    gen_throughput = []  # New data for generation throughput
+    gen_throughput = []
     timestamps = []
 
+    # Data for timing measurements
+    timing_timestamps = []
+    timing_values = []
+    timing_labels = []
+
     with open(file_path, "r") as f:
+        start_time = None
         for line in f:
+            # Extract timestamp from the beginning of the line
+            timestamp_match = re.match(r"\[([0-9-]+ [0-9:]+)\]", line)
+            actual_timestamp = None
+            if timestamp_match:
+                timestamp_str = timestamp_match.group(1)
+                actual_timestamp = datetime.strptime(timestamp_str, "%Y-%m-%d %H:%M:%S")
+                if start_time is None:
+                    start_time = actual_timestamp
+            else:
+                continue
+
             # Look for prefill or decode batch lines
             if "Prefill batch" in line or "Decode batch" in line:
                 # Extract full token usage and swa token usage
@@ -32,259 +51,222 @@ def parse_log_file(file_path, label_prefix):
                     running_req.append(int(req_match.group(1)))
 
                     # Add generation throughput if available, otherwise 0
-                    if gen_throughput_match:
-                        gen_throughput.append(float(gen_throughput_match.group(1)))
-                    else:
-                        gen_throughput.append(0.0)
+                    gen_throughput.append(
+                        float(gen_throughput_match.group(1))
+                        if gen_throughput_match
+                        else 0.0
+                    )
 
-                    timestamps.append(len(timestamps))
+                    # Calculate time intervals in seconds from the first timestamp
+                    interval = (actual_timestamp - start_time).total_seconds()
+                    timestamps.append(interval)
 
-    return timestamps, full_token_usage, swa_token_usage, running_req, gen_throughput
+            # Extract timing information (took xxx ms)
+            took_match = re.search(r"took ([0-9.]+) ms", line)
+            if took_match:
+                timing_value = float(took_match.group(1))
+                timing_values.append(timing_value)
+
+                # Extract the operation name before "took"
+                operation_match = re.search(r"\] ([^,]*?) took", line)
+                if operation_match:
+                    operation = operation_match.group(1).strip()
+                else:
+                    operation = "operation"
+                timing_labels.append(operation)
+
+                # Store actual timestamp for timing data
+                if actual_timestamp:
+                    interval = (actual_timestamp - start_time).total_seconds()
+                    timing_timestamps.append(interval)
+
+    return (
+        timestamps,
+        full_token_usage,
+        swa_token_usage,
+        running_req,
+        gen_throughput,
+        timing_timestamps,
+        timing_values,
+        timing_labels,
+    )
+
+
+def plot_data(
+    ax_token,
+    ax_perf,
+    ax_timing,
+    timestamps,
+    full,
+    swa,
+    req,
+    gen_throughput,
+    timing_timestamps,
+    timing_values,
+    timing_labels,
+    title_prefix,
+):
+    """Plot data on given subplots"""
+    # Token usage plot
+    ax_token.plot(timestamps, full, label="Full Token Usage", marker="o", markersize=3)
+    ax_token.plot(timestamps, swa, label="SWA Token Usage", marker="s", markersize=3)
+    ax_token.set_title(f"{title_prefix} - Token Usage vs Time")
+    ax_token.set_ylabel("Token Usage")
+    # With shared x-axis, only the bottom subplot needs x-label
+    ax_token.grid(True)
+    ax_token.legend()
+
+    # Performance metrics plot
+    ax_perf.plot(
+        timestamps,
+        req,
+        label="#Running Requests",
+        color="red",
+        marker="^",
+        markersize=3,
+    )
+
+    # Calculate mean for running requests
+    req_mean = statistics.mean(req) if req else 0
+    ax_perf.axhline(
+        y=req_mean,
+        color="red",
+        linestyle="--",
+        alpha=0.7,
+        label=f"Mean Running Requests: {req_mean:.2f}",
+    )
+
+    ax_perf_twin = ax_perf.twinx()
+    ax_perf_twin.fill_between(
+        timestamps,
+        gen_throughput,
+        alpha=0.3,
+        label="Gen Throughput (token/s)",
+        color="olive",
+    )
+
+    # Calculate mean for gen throughput
+    gen_throughput_mean = (
+        statistics.mean([v for v in gen_throughput if v > 0]) if gen_throughput else 0
+    )
+    ax_perf_twin.axhline(
+        y=gen_throughput_mean,
+        color="olive",
+        linestyle="--",
+        alpha=0.7,
+        label=f"Mean Gen Throughput: {gen_throughput_mean:.2f} token/s",
+    )
+
+    ax_perf.set_title(f"{title_prefix} - Performance Metrics vs Time")
+    ax_perf.set_ylabel("#Running Requests", color="red")
+    ax_perf.tick_params(axis="y", labelcolor="red")
+    ax_perf_twin.set_ylabel("Gen Throughput (token/s)", color="olive")
+    ax_perf_twin.tick_params(axis="y", labelcolor="olive")
+    # With shared x-axis, only the bottom subplot needs x-label
+    ax_perf.grid(True)
+
+    # Combined legend
+    lines1, labels1 = ax_perf.get_legend_handles_labels()
+    lines2, labels2 = ax_perf_twin.get_legend_handles_labels()
+    ax_perf.legend(lines1 + lines2, labels1 + labels2)
+
+    # Timing plot
+    if timing_values:
+        ax_timing.scatter(
+            timing_timestamps,
+            timing_values,
+            label="Operation Time (ms)",
+            alpha=0.6,
+            s=20,
+        )
+        # Add labels to some points to avoid overcrowding
+        for i in range(
+            0, len(timing_values), max(1, len(timing_values) // 10)
+        ):  # Label every 10th point or so
+            ax_timing.annotate(
+                f"{timing_labels[i]}",
+                (timing_timestamps[i], timing_values[i]),
+                textcoords="offset points",
+                xytext=(0, 10),
+                ha="center",
+                fontsize=8,
+            )
+    else:
+        # Create an empty plot with the label so legend works
+        ax_timing.scatter([], [], label="Operation Time (ms)", alpha=0.6, s=20)
+    ax_timing.set_title(f"{title_prefix} - Operation Times (ms)")
+    ax_timing.set_ylabel("Time (ms)")
+    # With shared x-axis, only the bottom subplot needs x-label
+    ax_timing.set_xlabel("Time (seconds)")
+    ax_timing.grid(True)
+    ax_timing.legend()
 
 
 def plot_token_usage():
     """Plot token usage from log files"""
     # File paths
-    file_false_06 = "nohup.emem.false.ratio.0.6.out"
-    file_false_10 = "nohup.emem.false.ratio.1.0.out"
-    file_true_10 = "nohup.emem.true.ratio.1.0.v4.out"
+    file_false = "nohup.emem.0.out"
+    file_true = "nohup.emem.1.out"
 
-    # Create figure with subplots (2 columns x 3 rows)
-    fig, axes = plt.subplots(3, 2, figsize=(16, 15))
+    # Create figure with subplots (3 rows x 2 columns) with shared x-axis
+    fig, axes = plt.subplots(3, 2, figsize=(20, 18), sharex=True)
     fig.suptitle("Token Usage and Performance Analysis", fontsize=16)
 
-    # Collect all data for consistent y-axis scaling
-    all_full_data = []
-    all_swa_data = []
-    all_req_data = []
-    all_gen_throughput_data = []
-
-    # Plot for emem=false, ratio=0.6
-    if os.path.exists(file_false_06):
-        timestamps1, full1, swa1, req1, gen_throughput1 = parse_log_file(
-            file_false_06, "emem=false,ratio=0.6"
-        )
-        all_full_data.extend(full1)
-        all_swa_data.extend(swa1)
-        all_req_data.extend(req1)
-        all_gen_throughput_data.extend(gen_throughput1)
-
-    # Plot for emem=false, ratio=1.0
-    if os.path.exists(file_false_10):
-        timestamps2, full2, swa2, req2, gen_throughput2 = parse_log_file(
-            file_false_10, "emem=false,ratio=1.0"
-        )
-        all_full_data.extend(full2)
-        all_swa_data.extend(swa2)
-        all_req_data.extend(req2)
-        all_gen_throughput_data.extend(gen_throughput2)
-
-    # Plot for emem=true, ratio=1.0
-    if os.path.exists(file_true_10):
-        timestamps3, full3, swa3, req3, gen_throughput3 = parse_log_file(
-            file_true_10, "emem=true,ratio=1.0"
-        )
-        all_full_data.extend(full3)
-        all_swa_data.extend(swa3)
-        all_req_data.extend(req3)
-        all_gen_throughput_data.extend(gen_throughput3)
-
-    # Determine shared y-axis limits
-    token_min = (
-        min(min(all_full_data), min(all_swa_data))
-        if all_full_data and all_swa_data
-        else 0
-    )
-    token_max = (
-        max(max(all_full_data), max(all_swa_data))
-        if all_full_data and all_swa_data
-        else 1
-    )
-    req_min = min(all_req_data) if all_req_data else 0
-    req_max = max(all_req_data) if all_req_data else 1
-    gen_throughput_min = min(all_gen_throughput_data) if all_gen_throughput_data else 0
-    gen_throughput_max = max(all_gen_throughput_data) if all_gen_throughput_data else 1
-
-    # Add some padding
-    token_padding = (token_max - token_min) * 0.1
-    req_padding = (req_max - req_min) * 0.1
-    gen_throughput_padding = (gen_throughput_max - gen_throughput_min) * 0.1
-
-    # Plot for emem=false, ratio=0.6
-    if os.path.exists(file_false_06):
-        timestamps1, full1, swa1, req1, gen_throughput1 = parse_log_file(
-            file_false_06, "emem=false,ratio=0.6"
-        )
-
-        # Left column - Token usage
-        ax1_left = axes[0, 0]
-        ax1_left.plot(
-            timestamps1, full1, label="Full Token Usage", marker="o", markersize=3
-        )
-        ax1_left.plot(
-            timestamps1, swa1, label="SWA Token Usage", marker="s", markersize=3
-        )
-        ax1_left.set_title("emem=false, ratio=0.6 - Token Usage")
-        ax1_left.set_ylabel("Token Usage")
-        ax1_left.grid(True)
-        ax1_left.set_ylim(token_min - token_padding, token_max + token_padding)
-        ax1_left.legend(loc="upper left")
-
-        # Right column - Running requests and generation throughput
-        ax1_right = axes[0, 1]
-        ax1_right.plot(
+    # Process and plot emem=false data
+    if os.path.exists(file_false):
+        (
             timestamps1,
+            full1,
+            swa1,
             req1,
-            label="#Running Requests",
-            color="red",
-            marker="^",
-            markersize=3,
-            zorder=2,
-        )
-        ax1_right_twin = ax1_right.twinx()
-        ax1_right_twin.fill_between(
-            timestamps1,
             gen_throughput1,
-            alpha=0.3,
-            label="Gen Throughput (token/s)",
-            color="olive",
-            zorder=1,
-        )
-        ax1_right.set_title("emem=false, ratio=0.6 - Performance Metrics")
-        ax1_right.set_ylabel("#Running Requests", color="red")
-        ax1_right.tick_params(axis="y", labelcolor="red")
-        ax1_right_twin.set_ylabel("Gen Throughput (token/s)", color="olive")
-        ax1_right_twin.tick_params(axis="y", labelcolor="olive")
-        ax1_right.set_ylim(req_min - req_padding, req_max + req_padding)
-        ax1_right_twin.set_ylim(
-            gen_throughput_min - gen_throughput_padding,
-            gen_throughput_max + gen_throughput_padding,
-        )
-        ax1_right.grid(True)
-        ax1_right_twin.grid(True)
+            timing_timestamps1,
+            timing_values1,
+            timing_labels1,
+        ) = parse_log_file(file_false)
+        if timestamps1:  # Check if timestamps exist
+            plot_data(
+                axes[0, 0],
+                axes[1, 0],
+                axes[2, 0],
+                timestamps1,
+                full1,
+                swa1,
+                req1,
+                gen_throughput1,
+                timing_timestamps1,
+                timing_values1,
+                timing_labels1,
+                "emem=false",
+            )
 
-        # Combined legend
-        lines1, labels1 = ax1_right.get_legend_handles_labels()
-        lines2, labels2 = ax1_right_twin.get_legend_handles_labels()
-        ax1_right.legend(lines1 + lines2, labels1 + labels2, loc="upper left")
-
-    # Plot for emem=false, ratio=1.0
-    if os.path.exists(file_false_10):
-        timestamps2, full2, swa2, req2, gen_throughput2 = parse_log_file(
-            file_false_10, "emem=false,ratio=1.0"
-        )
-
-        # Left column - Token usage
-        ax2_left = axes[1, 0]
-        ax2_left.plot(
-            timestamps2, full2, label="Full Token Usage", marker="o", markersize=3
-        )
-        ax2_left.plot(
-            timestamps2, swa2, label="SWA Token Usage", marker="s", markersize=3
-        )
-        ax2_left.set_title("emem=false, ratio=1.0 - Token Usage")
-        ax2_left.set_ylabel("Token Usage")
-        ax2_left.grid(True)
-        ax2_left.set_ylim(token_min - token_padding, token_max + token_padding)
-        ax2_left.legend(loc="upper left")
-
-        # Right column - Running requests and generation throughput
-        ax2_right = axes[1, 1]
-        ax2_right.plot(
+    # Process and plot emem=true data
+    if os.path.exists(file_true):
+        (
             timestamps2,
+            full2,
+            swa2,
             req2,
-            label="#Running Requests",
-            color="red",
-            marker="^",
-            markersize=3,
-            zorder=2,
-        )
-        ax2_right_twin = ax2_right.twinx()
-        ax2_right_twin.fill_between(
-            timestamps2,
             gen_throughput2,
-            alpha=0.3,
-            label="Gen Throughput (token/s)",
-            color="olive",
-            zorder=1,
-        )
-        ax2_right.set_title("emem=false, ratio=1.0 - Performance Metrics")
-        ax2_right.set_ylabel("#Running Requests", color="red")
-        ax2_right.tick_params(axis="y", labelcolor="red")
-        ax2_right_twin.set_ylabel("Gen Throughput (token/s)", color="olive")
-        ax2_right_twin.tick_params(axis="y", labelcolor="olive")
-        ax2_right.set_ylim(req_min - req_padding, req_max + req_padding)
-        ax2_right_twin.set_ylim(
-            gen_throughput_min - gen_throughput_padding,
-            gen_throughput_max + gen_throughput_padding,
-        )
-        ax2_right.grid(True)
-        ax2_right_twin.grid(True)
-
-        # Combined legend
-        lines1, labels1 = ax2_right.get_legend_handles_labels()
-        lines2, labels2 = ax2_right_twin.get_legend_handles_labels()
-        ax2_right.legend(lines1 + lines2, labels1 + labels2, loc="upper left")
-
-    # Plot for emem=true, ratio=1.0
-    if os.path.exists(file_true_10):
-        timestamps3, full3, swa3, req3, gen_throughput3 = parse_log_file(
-            file_true_10, "emem=true,ratio=1.0"
-        )
-
-        # Left column - Token usage
-        ax3_left = axes[2, 0]
-        ax3_left.plot(
-            timestamps3, full3, label="Full Token Usage", marker="o", markersize=3
-        )
-        ax3_left.plot(
-            timestamps3, swa3, label="SWA Token Usage", marker="s", markersize=3
-        )
-        ax3_left.set_title("emem=true, ratio=1.0 - Token Usage")
-        ax3_left.set_ylabel("Token Usage")
-        ax3_left.set_xlabel("Time Steps")
-        ax3_left.grid(True)
-        ax3_left.set_ylim(token_min - token_padding, token_max + token_padding)
-        ax3_left.legend(loc="upper left")
-
-        # Right column - Running requests and generation throughput
-        ax3_right = axes[2, 1]
-        ax3_right.plot(
-            timestamps3,
-            req3,
-            label="#Running Requests",
-            color="red",
-            marker="^",
-            markersize=3,
-            zorder=2,
-        )
-        ax3_right_twin = ax3_right.twinx()
-        ax3_right_twin.fill_between(
-            timestamps3,
-            gen_throughput3,
-            alpha=0.3,
-            label="Gen Throughput (token/s)",
-            color="olive",
-            zorder=1,
-        )
-        ax3_right.set_title("emem=true, ratio=1.0 - Performance Metrics")
-        ax3_right.set_ylabel("#Running Requests", color="red")
-        ax3_right.tick_params(axis="y", labelcolor="red")
-        ax3_right_twin.set_ylabel("Gen Throughput (token/s)", color="olive")
-        ax3_right_twin.tick_params(axis="y", labelcolor="olive")
-        ax3_right.set_xlabel("Time Steps")
-        ax3_right.set_ylim(req_min - req_padding, req_max + req_padding)
-        ax3_right_twin.set_ylim(
-            gen_throughput_min - gen_throughput_padding,
-            gen_throughput_max + gen_throughput_padding,
-        )
-        ax3_right.grid(True)
-        ax3_right_twin.grid(True)
-
-        # Combined legend
-        lines1, labels1 = ax3_right.get_legend_handles_labels()
-        lines2, labels2 = ax3_right_twin.get_legend_handles_labels()
-        ax3_right.legend(lines1 + lines2, labels1 + labels2, loc="upper left")
+            timing_timestamps2,
+            timing_values2,
+            timing_labels2,
+        ) = parse_log_file(file_true)
+        if timestamps2:  # Check if timestamps exist
+            plot_data(
+                axes[0, 1],
+                axes[1, 1],
+                axes[2, 1],
+                timestamps2,
+                full2,
+                swa2,
+                req2,
+                gen_throughput2,
+                timing_timestamps2,
+                timing_values2,
+                timing_labels2,
+                "emem=true",
+            )
 
     # Adjust layout and save
     plt.tight_layout()

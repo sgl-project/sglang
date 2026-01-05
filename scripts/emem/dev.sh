@@ -61,6 +61,24 @@ nohup python3 -m sglang.launch_server \
   --hybrid-kvcache-ratio 1.0 \
   --context-length 65536 &
 
+export CONFIG_PATH=/tmp/bench_mix_config.json
+
+echo '{
+  "num_rounds": 5,
+  "num_clients": 256,
+  "round_ratios": [1, 1, 1, 1, 1],
+  "mean_new_tokens_per_round": [1024, 1024, 1024, 1024, 1024],
+  "mean_return_tokens_per_round": [1024, 1024, 1024, 1024, 1024],
+  "mean_inter_round_interval": [0, 0, 0, 0, 0]
+}' > ${CONFIG_PATH}
+
+python3 /sgl-workspace/sglang/benchmark/hicache/bench_mix.py \
+    --log-level debug \
+    --model-path /data-mnt/gpt-oss-20b-bf16/ \
+    --dataset-path /data-mnt/ShareGPT_V3_unfiltered_cleaned_split.json \
+    --port 30000 \
+    --duration 18000
+
 python3 -m sglang.bench_serving --backend sglang \
   --dataset-name random --dataset-path /data-mnt/ShareGPT_V3_unfiltered_cleaned_split.json \
   --num-prompts 512 --random-input 8192 --random-output 1024 --random-range-ratio 0.5 \
@@ -217,3 +235,57 @@ python3 -m sglang.bench_serving --backend sglang \
   --max-concurrency 384 --seed 2 \
   --port ${PORT} \
   >> nohup.bench.${SGLANG_ELASTIC_MEM_POOL}.ratio.${SGLANG_RATIO}.port.${PORT}.out 2>&1
+
+##########
+
+for _ in {1..2}; do
+  ps aux | grep "sglang.launch_server" | grep -v grep | awk '{print $2}' | xargs kill -9
+  ps aux | grep "sglang::" | grep -v grep | awk '{print $2}' | xargs kill -9
+  sleep 1
+done
+
+export ENABLE_EMEM=1
+export CUDA_VISIBLE_DEVICES=${ENABLE_EMEM}
+export CUDA_LAUNCH_BLOCKING=1
+export TORCH_USE_CUDA_DSA=1
+export CUDA_ENABLE_COREDUMP_ON_EXCEPTION=1
+export CUDA_COREDUMP_SHOW_PROGRESS=1
+export CUDA_COREDUMP_GENERATION_FLAGS='skip_nonrelocated_elf_images,skip_global_memory,skip_shared_memory,skip_local_memory,skip_constbank_memory'
+export CUDA_COREDUMP_FILE="/tmp/cuda_coredump_%h.%p.%t"
+export SGLANG_ELASTIC_MEM_POOL=${ENABLE_EMEM}
+export SGLANG_CAN_UNMAP=0.8
+export SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1
+export SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1
+export SGLANG_PORT=$((30000+ENABLE_EMEM))
+rm -rf nohup.out
+nohup python3 -m sglang.launch_server \
+  --log-level debug \
+  --model /home/t4/models/lvm-data/gpt-oss-20b-bf16/ \
+  --tp 1 \
+  --attention-backend triton \
+  --cuda-graph-max-bs 1024 \
+  --mem-fraction-static 0.7 \
+  --hybrid-kvcache-ratio 1.0 \
+  --port ${SGLANG_PORT} \
+  --context-length 65536 > nohup.emem.${ENABLE_EMEM}.out &
+
+
+export ENABLE_EMEM=1
+export SGLANG_PORT=$((30000+ENABLE_EMEM))
+export CONFIG_PATH=/tmp/bench_mix_config.json
+
+echo '{
+  "num_rounds": 5,
+  "num_clients": 256,
+  "round_ratios": [1, 1, 1, 1, 1],
+  "mean_new_tokens_per_round": [2048, 2048, 2048, 2048, 2048],
+  "mean_return_tokens_per_round": [2048, 2048, 2048, 2048, 2048],
+  "mean_inter_round_interval": [0, 0, 0, 0, 0]
+}' > ${CONFIG_PATH}
+
+python3 /sgl-workspace/sglang/benchmark/hicache/bench_mix.py \
+    --log-level debug \
+    --model-path /home/t4/models/lvm-data/gpt-oss-20b-bf16/ \
+    --dataset-path /home/t4/models/lvm-data/ShareGPT_V3_unfiltered_cleaned_split.json \
+    --port ${SGLANG_PORT} \
+    --duration 18000 > bench.emem.${ENABLE_EMEM}.out &

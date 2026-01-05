@@ -31,7 +31,8 @@ use_elasticmem = get_bool_env_var("SGLANG_ELASTIC_MEM_POOL", "false")
 cu_page_size = get_int_env_var("SGLANG_CU_PAGE_SIZE", 2 << 20)
 
 can_map_threshold = get_float_env_var("SGLANG_CAN_MAP", 0.9)
-can_unmap_threshold = get_float_env_var("SGLANG_CAN_UNMAP", 0.9)
+can_unmap_threshold = get_float_env_var("SGLANG_CAN_UNMAP", 0.8)
+resize_trigger_diff_ratio = get_float_env_var("SGLANG_RESIZE_TRIGGER_DIFF_RATIO", 0.2)
 
 if use_elasticmem:
     import kvcached.vmm_ops as vmm_ops
@@ -209,6 +210,11 @@ class ElasticMempoolOrchestrator:
 
     def try_resize(self) -> None:
         map_candidate, unmap_candidate = self._get_candidate_allocator()
+
+        diff = map_candidate.token_usage() - unmap_candidate.token_usage()
+        if diff < resize_trigger_diff_ratio:
+            self._reset_unmap_cadidate()
+            return
 
         if map_candidate is None or unmap_candidate is None:
             self._reset_unmap_cadidate()
