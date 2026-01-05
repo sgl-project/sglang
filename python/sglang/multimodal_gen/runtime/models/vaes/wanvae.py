@@ -1416,6 +1416,7 @@ class WanDecoder3d(nn.Module):
         non_linearity: str = "silu",
         out_channels: int = 3,
         is_residual: bool = False,
+        use_parallel_decode: bool = False,
     ):
         super().__init__()
         self.dim = dim
@@ -1427,13 +1428,14 @@ class WanDecoder3d(nn.Module):
         self.temperal_upsample = list(temperal_upsample)
 
         self.nonlinearity = get_act_fn(non_linearity)
+        self.use_parallel_decode = use_parallel_decode
 
         # dimensions
         dims = [dim * u for u in [dim_mult[-1]] + dim_mult[::-1]]
 
         world_size = get_sp_world_size()
 
-        if world_size > 1:
+        if use_parallel_decode and world_size > 1:
             # init block
             self.conv_in = WanDistCausalConv3d(z_dim, dims[0], 3, padding=1)
 
@@ -1538,7 +1540,8 @@ class WanDecoder3d(nn.Module):
         rank = get_sp_parallel_rank()
         world_size = get_sp_world_size()
 
-        x = torch.chunk(x, world_size, dim=-2)[rank]
+        if self.use_parallel_decode and world_size > 1:
+            x = torch.chunk(x, world_size, dim=-2)[rank]
 
         ## conv1
         _feat_cache = feat_cache.get()
@@ -1599,7 +1602,7 @@ class WanDecoder3d(nn.Module):
         else:
             x = self.conv_out(x)
 
-        if world_size > 1:
+        if self.use_parallel_decode and world_size > 1:
             tensor_list = [torch.empty_like(x) for _ in range(world_size)]
             dist.all_gather(tensor_list, x)
             torch.concat(tensor_list, dim=-2)
@@ -1670,6 +1673,7 @@ class AutoencoderKLWan(nn.Module, ParallelTiledVAE):
         self.latents_mean = list(config.latents_mean)
         self.latents_std = list(config.latents_std)
         self.shift_factor = config.shift_factor
+        self.use_parallel_decode = config.use_parallel_decode
 
         if config.load_encoder:
             self.encoder = WanEncoder3d(
@@ -1697,6 +1701,7 @@ class AutoencoderKLWan(nn.Module, ParallelTiledVAE):
                 dropout=config.dropout,
                 out_channels=config.out_channels,
                 is_residual=config.is_residual,
+                use_parallel_decode=self.use_parallel_decode,
             )
 
         self.use_feature_cache = config.use_feature_cache
