@@ -2,8 +2,7 @@
 
 use smg::tool_parser::{DeepSeekParser, ToolParser};
 
-mod common;
-use common::create_test_tools;
+use crate::common::create_test_tools;
 
 #[tokio::test]
 async fn test_deepseek_complete_parsing() {

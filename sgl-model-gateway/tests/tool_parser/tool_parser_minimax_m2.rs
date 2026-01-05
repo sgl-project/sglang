@@ -2,8 +2,7 @@
 
 use smg::tool_parser::{MinimaxM2Parser, ToolParser};
 
-mod common;
-use common::create_test_tools;
+use crate::common::create_test_tools;
 
 #[tokio::test]
 async fn test_minimax_complete_parsing() {

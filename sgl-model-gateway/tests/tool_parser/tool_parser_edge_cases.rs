@@ -4,8 +4,7 @@
 
 use smg::tool_parser::{JsonParser, MistralParser, PythonicParser, QwenParser, ToolParser};
 
-mod common;
-use common::create_test_tools;
+use crate::common::create_test_tools;
 
 #[tokio::test]
 async fn test_empty_input() {

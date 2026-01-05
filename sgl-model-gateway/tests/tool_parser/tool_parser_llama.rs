@@ -4,8 +4,7 @@
 
 use smg::tool_parser::{LlamaParser, ToolParser};
 
-mod common;
-use common::{create_test_tools, streaming_helpers::*};
+use crate::common::{create_test_tools, streaming_helpers::*};
 
 #[tokio::test]
 async fn test_llama_python_tag_format() {
