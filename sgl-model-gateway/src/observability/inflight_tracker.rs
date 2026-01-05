@@ -1,7 +1,7 @@
 use std::{
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc, OnceLock,
+        Arc, LazyLock, OnceLock,
     },
     time::Instant,
 };
@@ -11,13 +11,41 @@ use dashmap::DashMap;
 use super::metrics::Metrics;
 use crate::policies::utils::PeriodicTask;
 
+struct AgeBuckets {
+    bounds: &'static [u64],
+    le_labels: Vec<&'static str>,
+    gt_labels: Vec<&'static str>,
+}
+
+impl AgeBuckets {
+    fn new(bounds: &'static [u64]) -> Self {
+        let mut le_labels: Vec<&'static str> = bounds
+            .iter()
+            .map(|&b| Box::leak(b.to_string().into_boxed_str()) as &'static str)
+            .collect();
+        le_labels.push("+Inf");
+
+        let mut gt_labels: Vec<&'static str> = vec!["0"];
+        gt_labels.extend(
+            bounds
+                .iter()
+                .map(|&b| Box::leak(b.to_string().into_boxed_str()) as &'static str),
+        );
+
+        Self {
+            bounds,
+            le_labels,
+            gt_labels,
+        }
+    }
+
+    fn bucket_count(&self) -> usize {
+        self.le_labels.len()
+    }
+}
+
 const AGE_BUCKET_BOUNDS: &[u64] = &[30, 60, 180, 300, 600, 1200, 3600, 7200, 14400, 28800, 86400];
-const AGE_BUCKET_LE_LABELS: &[&str] = &[
-    "30", "60", "180", "300", "600", "1200", "3600", "7200", "14400", "28800", "86400", "+Inf",
-];
-const AGE_BUCKET_GT_LABELS: &[&str] = &[
-    "0", "30", "60", "180", "300", "600", "1200", "3600", "7200", "14400", "28800", "86400",
-];
+static AGE_BUCKETS: LazyLock<AgeBuckets> = LazyLock::new(|| AgeBuckets::new(AGE_BUCKET_BOUNDS));
 
 pub struct InFlightRequestTracker {
     requests: DashMap<u64, Instant>,
@@ -59,14 +87,16 @@ impl InFlightRequestTracker {
         self.requests.is_empty()
     }
 
-    pub fn compute_bucket_counts(&self) -> [usize; AGE_BUCKET_LE_LABELS.len()] {
+    pub fn compute_bucket_counts(&self) -> Vec<usize> {
+        let buckets = &*AGE_BUCKETS;
         let now = Instant::now();
-        let inf_idx = AGE_BUCKET_LE_LABELS.len() - 1;
+        let inf_idx = buckets.bucket_count() - 1;
 
-        let mut counts = [0usize; AGE_BUCKET_LE_LABELS.len()];
+        let mut counts = vec![0usize; buckets.bucket_count()];
         for entry in self.requests.iter() {
             let age_secs = now.duration_since(*entry.value()).as_secs();
-            let bucket_idx = AGE_BUCKET_BOUNDS
+            let bucket_idx = buckets
+                .bounds
                 .iter()
                 .position(|&bound| age_secs <= bound)
                 .unwrap_or(inf_idx);
@@ -77,10 +107,12 @@ impl InFlightRequestTracker {
     }
 
     fn sample_and_record(&self) {
+        let buckets = &*AGE_BUCKETS;
         let counts = self.compute_bucket_counts();
-        for (i, (&le, &gt)) in AGE_BUCKET_LE_LABELS
+        for (i, (&le, &gt)) in buckets
+            .le_labels
             .iter()
-            .zip(AGE_BUCKET_GT_LABELS.iter())
+            .zip(buckets.gt_labels.iter())
             .enumerate()
         {
             Metrics::set_inflight_request_age_count(gt, le, counts[i]);
