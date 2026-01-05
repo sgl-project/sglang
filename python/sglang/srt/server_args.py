@@ -1352,24 +1352,7 @@ class ServerArgs:
                 f"Using {self.attention_backend} as attention backend for {model_arch}."
             )
         elif model_arch in ["KimiLinearForCausalLM"]:
-            # Mamba radix cache v2
-            if self.enable_mamba_extra_buffer():
-                assert (
-                    is_cuda()
-                ), "Mamba extra_buffer is only supported on CUDA devices with FLA backend"
-                if self.page_size is not None:
-                    assert (
-                        self.mamba_track_interval % self.page_size == 0
-                    ), f"mamba_track_interval {self.mamba_track_interval} must be divisible by page_size {self.page_size}"
-                    assert (
-                        FLA_CHUNK_SIZE % self.page_size == 0
-                    ), f"Page size for KimiLinear model must be divisible by {FLA_CHUNK_SIZE}, got {self.page_size}"
-            elif not self.disable_radix_cache:
-                logger.warning(
-                    "Disabling overlap schedule since MambaRadixCache no_buffer is not compatible with "
-                    "overlap schedule currently, try to use --mamba-scheduler-strategy extra_buffer to enable overlap schedule"
-                )
-                self.disable_overlap_schedule = True
+            self._validate_mamba_radix_cache_v2("KimiLinear")
         elif model_arch in ["NemotronHForCausalLM"]:
             assert (
                 not self.enable_mamba_extra_buffer()
@@ -1472,30 +1455,7 @@ class ServerArgs:
                     self.disable_radix_cache = True
                     self.disable_overlap_schedule = False
 
-            # Mamba radix cache v2
-            if self.enable_mamba_extra_buffer():
-                assert (
-                    is_cuda()
-                ), "Mamba extra_buffer is only supported on CUDA devices with FLA backend"
-                if self.speculative_num_draft_tokens is not None:
-                    assert (
-                        self.mamba_track_interval >= self.speculative_num_draft_tokens
-                    ), f"mamba_track_interval {self.mamba_track_interval} must be greater than or equal to speculative_num_draft_tokens {self.speculative_num_draft_tokens}"
-
-                if self.page_size is not None:
-                    assert (
-                        self.mamba_track_interval % self.page_size == 0
-                    ), f"mamba_track_interval {self.mamba_track_interval} must be divisible by page_size {self.page_size}"
-                    assert (
-                        FLA_CHUNK_SIZE % self.page_size == 0
-                    ), f"Page size for hybrid GDN model must be divisible by {FLA_CHUNK_SIZE}, got {self.page_size}"
-
-            elif not self.disable_radix_cache:
-                logger.warning(
-                    "Disabling overlap schedule since MambaRadixCache no_buffer is not compatible with "
-                    "overlap schedule currently, try to use --mamba-scheduler-strategy extra_buffer to enable overlap schedule"
-                )
-                self.disable_overlap_schedule = True
+            self._validate_mamba_radix_cache_v2("hybrid GDN", check_speculative=True)
 
         elif model_arch in [
             "FalconH1ForCausalLM",
@@ -4619,6 +4579,33 @@ class ServerArgs:
 
     def enable_mamba_extra_buffer(self) -> bool:
         return self.mamba_scheduler_strategy == "extra_buffer"
+
+    def _validate_mamba_radix_cache_v2(
+        self, model_name: str, check_speculative: bool = False
+    ):
+        if self.enable_mamba_extra_buffer():
+            assert (
+                is_cuda()
+            ), "Mamba extra_buffer is only supported on CUDA devices with FLA backend"
+            if check_speculative and self.speculative_num_draft_tokens is not None:
+                assert (
+                    self.mamba_track_interval >= self.speculative_num_draft_tokens
+                ), f"mamba_track_interval {self.mamba_track_interval} must be greater than or equal to speculative_num_draft_tokens {self.speculative_num_draft_tokens}"
+
+            if self.page_size is not None:
+                assert (
+                    self.mamba_track_interval % self.page_size == 0
+                ), f"mamba_track_interval {self.mamba_track_interval} must be divisible by page_size {self.page_size}"
+                assert (
+                    FLA_CHUNK_SIZE % self.page_size == 0
+                ), f"Page size for {model_name} model must be divisible by {FLA_CHUNK_SIZE}, got {self.page_size}"
+
+        elif not self.disable_radix_cache:
+            logger.warning(
+                "Disabling overlap schedule since MambaRadixCache no_buffer is not compatible with "
+                "overlap schedule currently, try to use --mamba-scheduler-strategy extra_buffer to enable overlap schedule"
+            )
+            self.disable_overlap_schedule = True
 
     def check_server_args(self):
         # Check parallel size constraints
