@@ -494,7 +494,7 @@ class DenoisingStage(PipelineStage):
                 server_args.model_paths["transformer"],
                 server_args,
                 "transformer",
-                "transformers",
+                "diffusers",
             )
             # enable cache-dit before torch.compile (delayed mounting)
             self._maybe_enable_cache_dit(batch.num_inference_steps)
