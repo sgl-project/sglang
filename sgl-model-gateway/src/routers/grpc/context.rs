@@ -517,10 +517,8 @@ pub(crate) enum FinalResponse {
     Chat(ChatCompletionResponse),
     /// Generate response is a Vec of GenerateResponse (n=1 returns single item, n>1 returns multiple)
     Generate(Vec<GenerateResponse>),
-    /// Embedding response (inner data written but never read - response comes from execution result)
-    #[allow(dead_code)]
+    /// Embedding response
     Embedding(EmbeddingResponse),
-    /// Classification response (inner data written but never read - response comes from execution result)
-    #[allow(dead_code)]
+    /// Classification response
     Classify(ClassifyResponse),
 }

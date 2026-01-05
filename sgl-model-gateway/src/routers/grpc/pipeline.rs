@@ -542,9 +542,7 @@ impl RequestPipeline {
             ctx.state.response.final_response
         );
         match ctx.state.response.final_response {
-            Some(FinalResponse::Embedding(_)) => {
-                error!("execute_embeddings: Embedding FinalResponse found, but pipeline finished without returning response directly. This should be handled by the last stage.");
-                // Already handled in ResponseProcessingStage, but just in case
+            Some(FinalResponse::Embedding(response)) => {
                 Metrics::record_router_duration(
                     metrics_labels::ROUTER_GRPC,
                     self.backend_type,
@@ -553,11 +551,7 @@ impl RequestPipeline {
                     metrics_labels::ENDPOINT_EMBEDDINGS,
                     start.elapsed(),
                 );
-                // The response should have been returned by the last stage
-                error::internal_error(
-                    "pipeline_fallthrough",
-                    "Pipeline finished without returning response",
-                )
+                axum::Json(response).into_response()
             }
             Some(_) => {
                 error!(function = "execute_embeddings", "Wrong response type");
@@ -648,8 +642,7 @@ impl RequestPipeline {
             ctx.state.response.final_response
         );
         match ctx.state.response.final_response {
-            Some(FinalResponse::Classify(_)) => {
-                error!("execute_classify: Classify FinalResponse found, but pipeline finished without returning response directly. This should be handled by the last stage.");
+            Some(FinalResponse::Classify(response)) => {
                 Metrics::record_router_duration(
                     metrics_labels::ROUTER_GRPC,
                     self.backend_type,
@@ -658,10 +651,7 @@ impl RequestPipeline {
                     metrics_labels::ENDPOINT_CLASSIFY,
                     start.elapsed(),
                 );
-                error::internal_error(
-                    "pipeline_fallthrough",
-                    "Pipeline finished without returning response",
-                )
+                axum::Json(response).into_response()
             }
             Some(_) => {
                 error!(function = "execute_classify", "Wrong response type");
