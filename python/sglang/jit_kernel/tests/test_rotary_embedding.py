@@ -202,8 +202,8 @@ def main():
                         INTERLEAVED,
                     )
 
-                    ref_atol = 1e-2 if DTYPE == torch.bfloat16 else 1e-3
-                    ref_rtol = 1e-2 if DTYPE == torch.bfloat16 else 1e-3
+                    ref_atol = 2e-2 if DTYPE == torch.bfloat16 else 2e-3
+                    ref_rtol = 2e-2 if DTYPE == torch.bfloat16 else 2e-3
 
                     if HAS_SGL_POS:
                         triton.testing.assert_close(

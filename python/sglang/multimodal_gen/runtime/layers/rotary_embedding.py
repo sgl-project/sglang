@@ -38,10 +38,6 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 
-_JIT_ROPE_SPLIT_CAST_CACHE: "OrderedDict[tuple, tuple[torch.Tensor, torch.Tensor]]" = (
-    OrderedDict()
-)
-
 
 def apply_flashinfer_rope_qk_inplace(
     q: torch.Tensor,
@@ -182,14 +178,9 @@ def apply_sglang_jit_rope_qk_inplace(
     if head_size != d:
         raise ValueError(f"head_size mismatch: inferred {d}, but head_size={head_size}")
 
-    try:
-        from sglang.jit_kernel.rotary_embedding import (
-            rotary_embedding_cos_sin as sglang_jit_rotary_embedding_cos_sin,
-        )
-    except Exception as e:
-        raise RuntimeError(
-            "SGLang JIT RoPE is required for apply_sglang_jit_rope_qk_inplace."
-        ) from e
+    from sglang.jit_kernel.rotary_embedding import (
+        rotary_embedding_cos_sin as sglang_jit_rotary_embedding_cos_sin,
+    )
 
     num_tokens = bsz * seqlen
 
@@ -220,49 +211,29 @@ def apply_sglang_jit_rope_qk_inplace(
             )
         positions = positions.to(q.device, non_blocking=True)
 
-    q3 = q.reshape(num_tokens, nheads, d)
-    if not q3.is_contiguous():
-        q3 = q3.contiguous()
-    k3 = k.reshape(num_tokens, nheads, d)
-    if not k3.is_contiguous():
-        k3 = k3.contiguous()
+    q3 = q.view(num_tokens, nheads, d)
+    k3 = k.view(num_tokens, nheads, d)
 
     # Use the FULL cache (no index_select)
     cache_full = cos_sin_cache
 
     # Include is_neox in key because it affects how we process (cat vs contiguous)
     interleaved = not is_neox
-    cache_key = (
-        int(cache_full.data_ptr()),
-        int(cache_full.shape[0]),
-        int(cache_full.shape[1]),
-        str(cache_full.device),
-        cache_full.dtype,
-        q.dtype,
-        interleaved,
-    )
-    cached = _JIT_ROPE_SPLIT_CAST_CACHE.get(cache_key)
-    if cached is not None:
-        cos, sin = cached
-    else:
-        # Split and Cast the FULL cache
-        cos_full, sin_full = _split_cos_sin_from_cache(cache_full, dtype=q.dtype)
 
-        # Process layout (Contiguous or Cat)
-        if interleaved:
+    # Split and Cast the FULL cache
+    cos_full, sin_full = _split_cos_sin_from_cache(cache_full, dtype=q.dtype)
+
+    # Process layout (Contiguous or Cat)
+    if interleaved:
+        cos = cos_full.contiguous()
+        sin = sin_full.contiguous()
+    else:
+        if cos_full.shape[1] * 2 == head_size:
+            cos = torch.cat([cos_full, cos_full], dim=-1).contiguous()
+            sin = torch.cat([sin_full, sin_full], dim=-1).contiguous()
+        else:
             cos = cos_full.contiguous()
             sin = sin_full.contiguous()
-        else:
-            if cos_full.shape[1] * 2 == head_size:
-                cos = torch.cat([cos_full, cos_full], dim=-1).contiguous()
-                sin = torch.cat([sin_full, sin_full], dim=-1).contiguous()
-            else:
-                cos = cos_full.contiguous()
-                sin = sin_full.contiguous()
-
-        _JIT_ROPE_SPLIT_CAST_CACHE[cache_key] = (cos, sin)
-        if len(_JIT_ROPE_SPLIT_CAST_CACHE) > 64:
-            _JIT_ROPE_SPLIT_CAST_CACHE.popitem(last=False)
 
     sglang_jit_rotary_embedding_cos_sin(
         cos, sin, q3, k3, head_size, interleaved, positions=positions

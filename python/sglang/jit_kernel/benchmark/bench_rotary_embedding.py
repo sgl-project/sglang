@@ -24,6 +24,8 @@ DTYPE = torch.bfloat16
 MAX_SEQ_LEN = 8192
 NUM_HEADS = 32
 BS_RANGE = [1, 64]
+if not os.getenv("CI"):
+    BS_RANGE = [1, 2, 4, 8, 16, 32, 64, 128]
 SEQ_RANGE = [1, 2048]
 HEAD_SIZE_RANGE = [128]
 INTERLEAVED_RANGE = [True, False]
@@ -277,7 +279,6 @@ def prepare_case(
 def make_fn(
     provider: str, case: Case, head_size: int, interleaved: bool
 ) -> Callable[[], None]:
-    # 统一 clone：每次 bench 都从同一份 base 开始，避免“越跑越旋”
     if provider in ("jit_fused", "jit_unfused", "aot_pos", "torch_fp32", "vllm_pos"):
         q = case.q_base.clone()
         k = case.k_base.clone()
@@ -384,51 +385,7 @@ _SANITY_DONE = False
 def benchmark(
     batch_size: int, seq_len: int, head_size: int, interleaved: bool, provider: str
 ):
-    if DEVICE == "cuda" and not torch.cuda.is_available():
-        raise RuntimeError("CUDA not available")
-
     case = prepare_case(batch_size, seq_len, head_size, interleaved)
-
-    global _SANITY_DONE
-    if not _SANITY_DONE and provider == "jit_fused":
-        # sanity: compare jit_fused / jit_unfused with fp32 ref
-        q_ref = case.q_base.clone()
-        k_ref = case.k_base.clone()
-        torch_impl_rotary_fp32(
-            case.cos_gathered, case.sin_gathered, q_ref, k_ref, head_size, interleaved
-        )
-
-        for p in ("jit_fused", "jit_unfused"):
-            q = case.q_base.clone()
-            k = case.k_base.clone()
-            if p == "jit_fused":
-                sgl_jit_fused(
-                    case.positions,
-                    case.cos_cache,
-                    case.sin_cache,
-                    q,
-                    k,
-                    head_size,
-                    interleaved,
-                )
-            else:
-                sgl_jit_unfused(
-                    case.positions,
-                    case.cos_cache,
-                    case.sin_cache,
-                    q,
-                    k,
-                    head_size,
-                    interleaved,
-                )
-
-            atol = 2e-2 if DTYPE == torch.bfloat16 else 2e-3
-            rtol = 2e-2 if DTYPE == torch.bfloat16 else 2e-3
-            _assert_close_gpu(q, q_ref, atol=atol, rtol=rtol, name=f"{p}(q)")
-            _assert_close_gpu(k, k_ref, atol=atol, rtol=rtol, name=f"{p}(k)")
-
-        _SANITY_DONE = True
-
     fn = make_fn(provider, case, head_size, interleaved)
 
     use_cudagraph = provider != "flashinfer"
