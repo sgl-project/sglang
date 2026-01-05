@@ -156,7 +156,7 @@ pub fn init_metrics() {
     );
     describe_gauge!(
         "smg_http_inflight_request_age_count",
-        "Count of currently in-flight HTTP requests by age"
+        "Count of currently in-flight HTTP requests per age bucket (non-cumulative)"
     );
     describe_counter!(
         "smg_http_responses_total",

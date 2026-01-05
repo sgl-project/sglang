@@ -60,21 +60,14 @@ impl InFlightRequestTracker {
         let now = Instant::now();
         let inf_idx = AGE_BUCKET_LABELS.len() - 1;
 
-        let mut non_cumulative_counts = [0usize; AGE_BUCKET_LABELS.len()];
+        let mut counts = [0usize; AGE_BUCKET_LABELS.len()];
         for entry in self.requests.iter() {
             let age_secs = now.duration_since(*entry.value()).as_secs();
             let bucket_idx = AGE_BUCKET_BOUNDS
                 .iter()
                 .position(|&bound| age_secs <= bound)
                 .unwrap_or(inf_idx);
-            non_cumulative_counts[bucket_idx] += 1;
-        }
-
-        let mut counts = [0usize; AGE_BUCKET_LABELS.len()];
-        let mut cumulative = 0;
-        for i in 0..counts.len() {
-            cumulative += non_cumulative_counts[i];
-            counts[i] = cumulative;
+            counts[bucket_idx] += 1;
         }
 
         counts
@@ -150,7 +143,7 @@ mod tests {
     }
 
     #[test]
-    fn test_cumulative_bucket_counts() {
+    fn test_bucket_counts() {
         let tracker = InFlightRequestTracker::new();
         let now = Instant::now();
 
@@ -162,13 +155,13 @@ mod tests {
         tracker.insert_with_time(6, now - Duration::from_secs(700));
 
         let counts = tracker.compute_bucket_counts();
-        assert_eq!(counts[0], 1, "bucket 0");
-        assert_eq!(counts[1], 2, "bucket 1");
-        assert_eq!(counts[2], 3, "bucket 2");
-        assert_eq!(counts[3], 4, "bucket 3");
-        assert_eq!(counts[4], 5, "bucket 4");
-        assert_eq!(counts[5], 6, "bucket 5");
-        assert_eq!(*counts.last().unwrap(), 6, "bucket +Inf");
+        assert_eq!(counts[0], 1, "bucket <=30s");
+        assert_eq!(counts[1], 1, "bucket <=60s");
+        assert_eq!(counts[2], 1, "bucket <=180s");
+        assert_eq!(counts[3], 1, "bucket <=300s");
+        assert_eq!(counts[4], 1, "bucket <=600s");
+        assert_eq!(counts[5], 1, "bucket <=1200s");
+        assert_eq!(*counts.last().unwrap(), 0, "bucket +Inf");
     }
 
     #[test]
@@ -180,9 +173,8 @@ mod tests {
         tracker.insert_with_time(2, now - Duration::from_secs(31));
 
         let counts = tracker.compute_bucket_counts();
-        assert_eq!(counts[0], 1, "bucket 0 includes exact boundary");
-        assert_eq!(counts[1], 2, "bucket 1 includes both");
-        assert_eq!(*counts.last().unwrap(), 2, "bucket +Inf includes all");
+        assert_eq!(counts[0], 1, "bucket <=30s includes exact boundary");
+        assert_eq!(counts[1], 1, "bucket <=60s has one request (31s)");
     }
 
     #[test]
