@@ -64,14 +64,8 @@ struct RotaryVecData<scalar_t, false> {
   float4 sin_y;
 };
 
-// Vector load helper:
-//   - load a 16B tile from q/k (either aligned float4 or scalar gather)
-//   - always vector-load cos/sin (aligned by launch-time checks)
-//
-// rot_offset is the "pair index":
-//   - interleaved:     pair i -> q[2*i], q[2*i+1]
-//   - non-interleaved: pair i -> q[i], q[i + embed_dim]
-// embed_dim is the number of pairs per head.
+// Per-thread temporary storage for a 16B tile and its cos/sin values.
+// Layout depends on interleaved vs split-halves format.
 template <typename scalar_t, bool interleaved, bool aligned_qk>
 __device__ __forceinline__ RotaryVecData<scalar_t, interleaved> load_rotary_vec(
     const scalar_t* __restrict__ arr,
@@ -132,16 +126,7 @@ __device__ __forceinline__ RotaryVecData<scalar_t, interleaved> load_rotary_vec(
   return data;
 }
 
-// Vector compute + store:
-// Apply RoPE to the loaded 16B tile and write back to q/k.
-//
-// Interleaved math (per pair):
-//   x' = x*cos - y*sin
-//   y' = y*cos + x*sin
-//
-// Non-interleaved math (general form, allows distinct cos/sin for x and y halves):
-//   x' = x*cos_x - y*sin_x
-//   y' = y*cos_y + x*sin_y
+// Apply RoPE to the loaded 16B tile and write back to q/k
 template <typename scalar_t, bool interleaved, bool aligned_qk>
 __device__ __forceinline__ void compute_store_rotary_vec(
     scalar_t* __restrict__ arr, const RotaryVecData<scalar_t, interleaved>& data, int rot_offset, int embed_dim) {
@@ -263,12 +248,9 @@ inline __device__ void apply_token_rotary_embedding(
   }
 }
 
-// 2D-grid kernel:
-//   blockIdx.x -> token index
-//   blockIdx.y -> "sub-block" index within the token (tile along pairs dimension)
-//
-// For very small T (few tokens) but large per-token work, using multiple blocks
-// per token can improve occupancy/throughput compared to one-block-per-token.
+// RoPE kernel with 2D grid: (token_idx, sub_block_idx).
+// Each block processes a strided subset of rotary pairs across all heads for one token.
+// Supports optional key tensor (nullptr means Q-only).
 template <typename scalar_t, bool interleaved, bool vectorized, bool aligned_qk, int ROT_EMBED_DIM>
 __global__ void rotary_embedding_kernel_2d(
     const scalar_t* __restrict__ cos_data,  // [num_tokens, rot_dim_arg]
@@ -399,11 +381,7 @@ __global__ void rotary_embedding_kernel_2d(
   }
 }
 
-// 1D-grid kernel:
-//   blockIdx.x -> token index
-//   exactly one block per token
-//
-// The default path for most sizes.
+// RoPE kernel with 1D grid: one block per token.
 template <typename scalar_t, bool interleaved, bool vectorized, bool aligned_qk, int ROT_EMBED_DIM>
 __launch_bounds__(512) __global__ void rotary_embedding_kernel_1d(
     const scalar_t* __restrict__ cos_data,  // [num_tokens, rot_dim_arg]
@@ -452,7 +430,7 @@ __launch_bounds__(512) __global__ void rotary_embedding_kernel_1d(
 
     int next_i = i + stride;
     for (; i < nq_pairs; i += stride, next_i += stride) {
-      RotaryVecData<scalar_t, interleaved> next_data;
+      RotaryVecData<scalar_t, interleaved> next_data = curr_data;
       if (next_i < nq_pairs) {
         const int head_idx = next_i / embed_dim_for_rotation;
         const int rot_offset = next_i % embed_dim_for_rotation;
@@ -485,7 +463,7 @@ __launch_bounds__(512) __global__ void rotary_embedding_kernel_1d(
 
       int next_k_i = k_i + stride;
       for (; k_i < nk_pairs; k_i += stride, next_k_i += stride) {
-        RotaryVecData<scalar_t, interleaved> next_data_k;
+        RotaryVecData<scalar_t, interleaved> next_data_k = curr_data_k;
         if (next_k_i < nk_pairs) {
           const int head_idx = next_k_i / embed_dim_for_rotation;
           const int rot_offset = next_k_i % embed_dim_for_rotation;
@@ -527,19 +505,15 @@ __launch_bounds__(512) __global__ void rotary_embedding_kernel_1d(
   }
 }
 
-// Kernel variant dispatcher:
-// Select one of:
-//   - grid shape: 2D (multi-block per token) vs 1D (one-block per token)
-//   - layout: interleaved vs non-interleaved
-//   - compute: vectorized 16B tiles vs scalar
-//   - memory: q/k aligned 16B load/store vs scalar gather/scatter
+// Dispatch kernel specialization by layout (interleaved), vectorization, and alignment.
+// Selects 1D vs 2D grid based on launch configuration.
 template <int ROT, typename scalar_t>
 __forceinline__ void dispatch_rotary_launch(
     bool use_grid_2d,
     dim3 grid2d,
     dim3 grid1d,
     dim3 block,
-    const decltype(host::LaunchKernel::resolve_device(std::declval<DLDevice>())) stream,
+    cudaStream_t stream,
     bool interleaved,
     bool use_vec,
     bool qk_aligned16,
@@ -558,169 +532,35 @@ __forceinline__ void dispatch_rotary_launch(
     int num_kv_heads,
     int head_size,
     int blocks_per_token) {
-  // 2D grid path
-  if (use_grid_2d) {
+  auto dispatch_all = [&](auto f) {
     if (interleaved) {
       if (use_vec) {
-        if (qk_aligned16) {
-          host::LaunchKernel(grid2d, block, stream)(
-              rotary_embedding_kernel_2d<scalar_t, true, true, true, ROT>,
-              cos_ptr,
-              sin_ptr,
-              q_ptr,
-              k_ptr,
-              positions_ptr,
-              rot_dim_from_cache,
-              embed_dim_for_rotation,
-              query_token_stride,
-              key_token_stride,
-              head_stride_query,
-              head_stride_key,
-              num_heads,
-              num_kv_heads,
-              head_size,
-              blocks_per_token);
-        } else {
-          host::LaunchKernel(grid2d, block, stream)(
-              rotary_embedding_kernel_2d<scalar_t, true, true, false, ROT>,
-              cos_ptr,
-              sin_ptr,
-              q_ptr,
-              k_ptr,
-              positions_ptr,
-              rot_dim_from_cache,
-              embed_dim_for_rotation,
-              query_token_stride,
-              key_token_stride,
-              head_stride_query,
-              head_stride_key,
-              num_heads,
-              num_kv_heads,
-              head_size,
-              blocks_per_token);
-        }
+        if (qk_aligned16)
+          f(std::true_type{}, std::true_type{}, std::true_type{});
+        else
+          f(std::true_type{}, std::true_type{}, std::false_type{});
       } else {
-        host::LaunchKernel(grid2d, block, stream)(
-            rotary_embedding_kernel_2d<scalar_t, true, false, true, ROT>,
-            cos_ptr,
-            sin_ptr,
-            q_ptr,
-            k_ptr,
-            positions_ptr,
-            rot_dim_from_cache,
-            embed_dim_for_rotation,
-            query_token_stride,
-            key_token_stride,
-            head_stride_query,
-            head_stride_key,
-            num_heads,
-            num_kv_heads,
-            head_size,
-            blocks_per_token);
+        f(std::true_type{}, std::false_type{}, std::true_type{});
       }
     } else {
       if (use_vec) {
-        if (qk_aligned16) {
-          host::LaunchKernel(grid2d, block, stream)(
-              rotary_embedding_kernel_2d<scalar_t, false, true, true, ROT>,
-              cos_ptr,
-              sin_ptr,
-              q_ptr,
-              k_ptr,
-              positions_ptr,
-              rot_dim_from_cache,
-              embed_dim_for_rotation,
-              query_token_stride,
-              key_token_stride,
-              head_stride_query,
-              head_stride_key,
-              num_heads,
-              num_kv_heads,
-              head_size,
-              blocks_per_token);
-        } else {
-          host::LaunchKernel(grid2d, block, stream)(
-              rotary_embedding_kernel_2d<scalar_t, false, true, false, ROT>,
-              cos_ptr,
-              sin_ptr,
-              q_ptr,
-              k_ptr,
-              positions_ptr,
-              rot_dim_from_cache,
-              embed_dim_for_rotation,
-              query_token_stride,
-              key_token_stride,
-              head_stride_query,
-              head_stride_key,
-              num_heads,
-              num_kv_heads,
-              head_size,
-              blocks_per_token);
-        }
+        if (qk_aligned16)
+          f(std::false_type{}, std::true_type{}, std::true_type{});
+        else
+          f(std::false_type{}, std::true_type{}, std::false_type{});
       } else {
-        host::LaunchKernel(grid2d, block, stream)(
-            rotary_embedding_kernel_2d<scalar_t, false, false, true, ROT>,
-            cos_ptr,
-            sin_ptr,
-            q_ptr,
-            k_ptr,
-            positions_ptr,
-            rot_dim_from_cache,
-            embed_dim_for_rotation,
-            query_token_stride,
-            key_token_stride,
-            head_stride_query,
-            head_stride_key,
-            num_heads,
-            num_kv_heads,
-            head_size,
-            blocks_per_token);
+        f(std::false_type{}, std::false_type{}, std::true_type{});
       }
     }
-    return;
-  }
+  };
 
-  // 1D grid path
-  if (interleaved) {
-    if (use_vec) {
-      if (qk_aligned16) {
-        host::LaunchKernel(grid1d, block, stream)(
-            rotary_embedding_kernel_1d<scalar_t, true, true, true, ROT>,
-            cos_ptr,
-            sin_ptr,
-            q_ptr,
-            k_ptr,
-            positions_ptr,
-            rot_dim_from_cache,
-            embed_dim_for_rotation,
-            query_token_stride,
-            key_token_stride,
-            head_stride_query,
-            head_stride_key,
-            num_heads,
-            num_kv_heads,
-            head_size);
-      } else {
-        host::LaunchKernel(grid1d, block, stream)(
-            rotary_embedding_kernel_1d<scalar_t, true, true, false, ROT>,
-            cos_ptr,
-            sin_ptr,
-            q_ptr,
-            k_ptr,
-            positions_ptr,
-            rot_dim_from_cache,
-            embed_dim_for_rotation,
-            query_token_stride,
-            key_token_stride,
-            head_stride_query,
-            head_stride_key,
-            num_heads,
-            num_kv_heads,
-            head_size);
-      }
-    } else {
-      host::LaunchKernel(grid1d, block, stream)(
-          rotary_embedding_kernel_1d<scalar_t, true, false, true, ROT>,
+  if (use_grid_2d) {
+    dispatch_all([&](auto i_v, auto v_v, auto a_v) {
+      constexpr bool I = decltype(i_v)::value;
+      constexpr bool V = decltype(v_v)::value;
+      constexpr bool A = decltype(a_v)::value;
+      host::LaunchKernel(grid2d, block, stream)(
+          rotary_embedding_kernel_2d<scalar_t, I, V, A, ROT>,
           cos_ptr,
           sin_ptr,
           q_ptr,
@@ -734,48 +574,16 @@ __forceinline__ void dispatch_rotary_launch(
           head_stride_key,
           num_heads,
           num_kv_heads,
-          head_size);
-    }
+          head_size,
+          blocks_per_token);
+    });
   } else {
-    if (use_vec) {
-      if (qk_aligned16) {
-        host::LaunchKernel(grid1d, block, stream)(
-            rotary_embedding_kernel_1d<scalar_t, false, true, true, ROT>,
-            cos_ptr,
-            sin_ptr,
-            q_ptr,
-            k_ptr,
-            positions_ptr,
-            rot_dim_from_cache,
-            embed_dim_for_rotation,
-            query_token_stride,
-            key_token_stride,
-            head_stride_query,
-            head_stride_key,
-            num_heads,
-            num_kv_heads,
-            head_size);
-      } else {
-        host::LaunchKernel(grid1d, block, stream)(
-            rotary_embedding_kernel_1d<scalar_t, false, true, false, ROT>,
-            cos_ptr,
-            sin_ptr,
-            q_ptr,
-            k_ptr,
-            positions_ptr,
-            rot_dim_from_cache,
-            embed_dim_for_rotation,
-            query_token_stride,
-            key_token_stride,
-            head_stride_query,
-            head_stride_key,
-            num_heads,
-            num_kv_heads,
-            head_size);
-      }
-    } else {
+    dispatch_all([&](auto i_v, auto v_v, auto a_v) {
+      constexpr bool I = decltype(i_v)::value;
+      constexpr bool V = decltype(v_v)::value;
+      constexpr bool A = decltype(a_v)::value;
       host::LaunchKernel(grid1d, block, stream)(
-          rotary_embedding_kernel_1d<scalar_t, false, false, true, ROT>,
+          rotary_embedding_kernel_1d<scalar_t, I, V, A, ROT>,
           cos_ptr,
           sin_ptr,
           q_ptr,
@@ -790,10 +598,13 @@ __forceinline__ void dispatch_rotary_launch(
           num_heads,
           num_kv_heads,
           head_size);
-    }
+    });
   }
 }
 
+// Validate inputs, choose vectorization/alignment path, and launch the RoPE kernel.
+// cos/sin are indexed by either positions[t] (if provided) or token index t.
+// Rotates the first 2*embed_dim_for_rotation elements of each head.
 template <int ROT, typename scalar_t>
 inline void launch_rotary(
     const tvm::ffi::TensorView cos,
@@ -813,20 +624,14 @@ inline void launch_rotary(
   auto dtype = SymbolicDType{};
   auto device = SymbolicDevice{};
 
-  // Verify q first to establish device/dtype
-  // q: [T, Hq, D]
-  TensorMatcher({T, Hq, D})
-      .with_dtype<float, half, nv_bfloat16>(dtype)
-      .with_device<kDLCUDA>(device)
-      .verify(q);
+  // Verify q: [T, Hq, D] first to establish device/dtype
+  TensorMatcher({T, Hq, D}).with_dtype<float, half, nv_bfloat16>(dtype).with_device<kDLCUDA>(device).verify(q);
 
   const int64_t t = T.unwrap();
   const int64_t hq = Hq.unwrap();
   const int64_t d = D.unwrap();
 
-  // Verify cos/sin
-  // cos: [T_cache, R]
-  // sin: [T_cache, R]
+  // Verify cos/sin: [T_cache, R]
   auto T_cache = SymbolicSize{"T_cache"};
   TensorMatcher({T_cache, R})
       .with_dtype<float, half, nv_bfloat16>(dtype)
@@ -836,23 +641,24 @@ inline void launch_rotary(
 
   const int64_t r = R.unwrap();
 
-  // Handle positions
   const int64_t* positions_ptr = nullptr;
   if (positions != nullptr) {
     auto T_pos = SymbolicSize{"T_pos"};
-    TensorMatcher({T_pos})
-        .with_dtype<int64_t>()
-        .with_device<kDLCUDA>(device)
-        .verify(*positions);
+    TensorMatcher({T_pos}).with_dtype<int64_t>().with_device<kDLCUDA>(device).verify(*positions);
     RuntimeCheck(T_pos.unwrap() == t, "positions length mismatch");
     positions_ptr = static_cast<const int64_t*>(positions->data_ptr());
   } else {
-    // If positions is null, cos/sin length must equal t
-    RuntimeCheck(T_cache.unwrap() == t, "cos/sin length mismatch (expected ", t, ", got ", T_cache.unwrap(), ") when positions is None");
+    // If positions is null, cos/sin length must equal to t
+    RuntimeCheck(
+        T_cache.unwrap() == t,
+        "cos/sin length mismatch (expected ",
+        t,
+        ", got ",
+        T_cache.unwrap(),
+        ") when positions is None");
   }
 
   RuntimeCheck(d == head_size, "head_size mismatch: got ", d, " expected ", head_size);
-
   RuntimeCheck(t > 0 && hq > 0 && d > 0 && r > 0, "invalid shape");
   if (!interleaved) {
     RuntimeCheck(r % 2 == 0, "non-interleaved requires even R, got ", r);
@@ -876,11 +682,7 @@ inline void launch_rotary(
   int64_t head_stride_key = d;
   int hk = 0;
   if (k != nullptr) {
-    // k: [T, Hk, D]
-    TensorMatcher({T, Hk, D})
-        .with_dtype<float, half, nv_bfloat16>(dtype)
-        .with_device<kDLCUDA>(device)
-        .verify(*k);
+    TensorMatcher({T, Hk, D}).with_dtype<float, half, nv_bfloat16>(dtype).with_device<kDLCUDA>(device).verify(*k);
     hk = (int)Hk.unwrap();
     RuntimeCheck(hk > 0, "invalid key shape");
     key_token_stride = (int64_t)hk * d;
@@ -975,23 +777,18 @@ struct RotaryEmbeddingCosSinKernel {
       const tvm::ffi::TensorView cos,
       const tvm::ffi::TensorView sin,
       const tvm::ffi::TensorView query,
-      const tvm::ffi::AnyView positions_any,
+      const tvm::ffi::Optional<tvm::ffi::TensorView> positions,
       int64_t head_size,
       bool interleaved) {
-    // Convert AnyView to TensorView pointer
-    const tvm::ffi::TensorView* positions = nullptr;
-    auto positions_opt = positions_any.try_cast<tvm::ffi::TensorView>();
-    if (positions_opt.has_value()) {
-      positions = &positions_opt.value();
-    }
-    
+    const tvm::ffi::TensorView* positions_ptr = positions.has_value() ? &positions.value() : nullptr;
+
     const auto dt = query.dtype();
     if (host::is_type<half>(dt)) {
-      launch_rotary<ROT, half>(cos, sin, query, nullptr, positions, head_size, interleaved);
+      launch_rotary<ROT, half>(cos, sin, query, nullptr, positions_ptr, head_size, interleaved);
     } else if (host::is_type<nv_bfloat16>(dt)) {
-      launch_rotary<ROT, nv_bfloat16>(cos, sin, query, nullptr, positions, head_size, interleaved);
+      launch_rotary<ROT, nv_bfloat16>(cos, sin, query, nullptr, positions_ptr, head_size, interleaved);
     } else if (host::is_type<float>(dt)) {
-      launch_rotary<ROT, float>(cos, sin, query, nullptr, positions, head_size, interleaved);
+      launch_rotary<ROT, float>(cos, sin, query, nullptr, positions_ptr, head_size, interleaved);
     } else {
       host::Panic("Unsupported dtype for rotary_embedding_cos_sin");
     }
@@ -1002,23 +799,18 @@ struct RotaryEmbeddingCosSinKernel {
       const tvm::ffi::TensorView sin,
       const tvm::ffi::TensorView query,
       const tvm::ffi::TensorView key,
-      const tvm::ffi::AnyView positions_any,
+      const tvm::ffi::Optional<tvm::ffi::TensorView> positions,
       int64_t head_size,
       bool interleaved) {
-    // Convert AnyView to TensorView pointer
-    const tvm::ffi::TensorView* positions = nullptr;
-    auto positions_opt = positions_any.try_cast<tvm::ffi::TensorView>();
-    if (positions_opt.has_value()) {
-      positions = &positions_opt.value();
-    }
-    
+    const tvm::ffi::TensorView* positions_ptr = positions.has_value() ? &positions.value() : nullptr;
+
     const auto dt = query.dtype();
     if (host::is_type<half>(dt)) {
-      launch_rotary<ROT, half>(cos, sin, query, &key, positions, head_size, interleaved);
+      launch_rotary<ROT, half>(cos, sin, query, &key, positions_ptr, head_size, interleaved);
     } else if (host::is_type<nv_bfloat16>(dt)) {
-      launch_rotary<ROT, nv_bfloat16>(cos, sin, query, &key, positions, head_size, interleaved);
+      launch_rotary<ROT, nv_bfloat16>(cos, sin, query, &key, positions_ptr, head_size, interleaved);
     } else if (host::is_type<float>(dt)) {
-      launch_rotary<ROT, float>(cos, sin, query, &key, positions, head_size, interleaved);
+      launch_rotary<ROT, float>(cos, sin, query, &key, positions_ptr, head_size, interleaved);
     } else {
       host::Panic("Unsupported dtype for rotary_embedding_cos_sin");
     }

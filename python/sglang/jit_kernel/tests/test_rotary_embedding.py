@@ -47,9 +47,10 @@ def sglang_aot_rotary_positions(
     )
 
 
-def sglang_jit_rotary_cos_sin(
-    cos: torch.Tensor,
-    sin: torch.Tensor,
+def sglang_jit_rotary_with_positions(
+    positions: torch.Tensor,
+    cos_cache: torch.Tensor,
+    sin_cache: torch.Tensor,
     q: torch.Tensor,
     k: torch.Tensor,
     head_size: int,
@@ -57,7 +58,9 @@ def sglang_jit_rotary_cos_sin(
 ) -> None:
     from sglang.jit_kernel.rotary_embedding import rotary_embedding_cos_sin
 
-    rotary_embedding_cos_sin(cos, sin, q, k, head_size, interleaved)
+    rotary_embedding_cos_sin(
+        cos_cache, sin_cache, q, k, head_size, interleaved, positions=positions
+    )
 
 
 @torch.no_grad()
@@ -152,10 +155,19 @@ def main():
                     sin_half = sin_cache[positions].contiguous()
 
                     if INTERLEAVED:
-                        cos, sin = cos_half, sin_half
+                        # interleaved: cache R = embed_dim = head_size/2
+                        cos_g, sin_g = cos_half, sin_half
+                        cos_cache_for_jit, sin_cache_for_jit = cos_cache, sin_cache
                     else:
-                        cos = torch.cat([cos_half, cos_half], dim=-1).contiguous()
-                        sin = torch.cat([sin_half, sin_half], dim=-1).contiguous()
+                        # non-interleaved: kernel expects R = head_size (x/y halves)
+                        cos_g = torch.cat([cos_half, cos_half], dim=-1).contiguous()
+                        sin_g = torch.cat([sin_half, sin_half], dim=-1).contiguous()
+                        cos_cache_for_jit = torch.cat(
+                            [cos_cache, cos_cache], dim=-1
+                        ).contiguous()
+                        sin_cache_for_jit = torch.cat(
+                            [sin_cache, sin_cache], dim=-1
+                        ).contiguous()
 
                     q = torch.randn(
                         BS, NUM_Q_HEADS, HEAD_SIZE, device=DEVICE, dtype=DTYPE
@@ -166,7 +178,7 @@ def main():
 
                     q_ref_fp32, k_ref_fp32 = q.clone(), k.clone()
                     torch_impl_rotary_fp32(
-                        cos, sin, q_ref_fp32, k_ref_fp32, HEAD_SIZE, INTERLEAVED
+                        cos_g, sin_g, q_ref_fp32, k_ref_fp32, HEAD_SIZE, INTERLEAVED
                     )
 
                     q_k_aot = (q.clone(), k.clone())
@@ -180,12 +192,18 @@ def main():
                             INTERLEAVED,
                             aot_cos_sin_cache,
                         )
-                    sglang_jit_rotary_cos_sin(
-                        cos, sin, q_k_jit[0], q_k_jit[1], HEAD_SIZE, INTERLEAVED
+                    sglang_jit_rotary_with_positions(
+                        positions,
+                        cos_cache_for_jit,
+                        sin_cache_for_jit,
+                        q_k_jit[0],
+                        q_k_jit[1],
+                        HEAD_SIZE,
+                        INTERLEAVED,
                     )
 
-                    ref_atol = 2e-2 if DTYPE == torch.bfloat16 else 2e-3
-                    ref_rtol = 2e-2 if DTYPE == torch.bfloat16 else 2e-3
+                    ref_atol = 1e-2 if DTYPE == torch.bfloat16 else 1e-3
+                    ref_rtol = 1e-2 if DTYPE == torch.bfloat16 else 1e-3
 
                     if HAS_SGL_POS:
                         triton.testing.assert_close(
