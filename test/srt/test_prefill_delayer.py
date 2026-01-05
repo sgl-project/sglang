@@ -113,7 +113,11 @@ class TestPrefillDelayerAccuracy(CustomTestCase):
             prefill_delayer=prefill_delayer,
             model=model,
             base_url=base_url,
-            other_args=[],
+            other_args=[
+                # Not really needed, only to test support non-FCFS algorithms
+                "--schedule-policy",
+                "lpm",
+            ],
         )
         try:
             args = SimpleNamespace(
