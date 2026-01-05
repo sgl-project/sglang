@@ -249,6 +249,22 @@ class SchedulerMetricsMixin:
                     self.disagg_decode_transfer_queue.queue
                 )
 
+            # Cache monitoring metrics
+            # Only call get_cache_stats if tree_cache supports it (e.g., RadixCache)
+            if (
+                hasattr(self, "tree_cache")
+                and self.tree_cache is not None
+                and self.tree_cache.metrics_collector is not None
+                and hasattr(self.tree_cache, "get_cache_stats")
+            ):
+                cache_stats = self.tree_cache.get_cache_stats()
+                self.tree_cache.metrics_collector.set_cache_entry_count(
+                    cache_stats["entry_count"]
+                )
+                self.tree_cache.metrics_collector.set_cache_total_tokens(
+                    cache_stats["total_tokens"]
+                )
+
             # Others
             self.calculate_utilization()
             self.update_lora_metrics()

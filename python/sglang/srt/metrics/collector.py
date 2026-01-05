@@ -1350,7 +1350,7 @@ class RadixCacheMetricsCollector:
         labels: Dict[str, str],
     ) -> None:
         # We need to import prometheus_client after setting the env variable `PROMETHEUS_MULTIPROC_DIR`
-        from prometheus_client import Counter, Histogram
+        from prometheus_client import Counter, Gauge, Histogram
 
         self.labels = labels
 
@@ -1428,6 +1428,21 @@ class RadixCacheMetricsCollector:
             labelnames=labels.keys(),
         )
 
+        # Cache monitoring metrics
+        self.cache_entry_count = Gauge(
+            name="sglang:cache_entry_count",
+            documentation="Number of entries in the prefix cache.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+
+        self.cache_total_tokens = Gauge(
+            name="sglang:cache_total_tokens",
+            documentation="Total tokens stored in the prefix cache.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+
     def increment_eviction_num_tokens(self, num_tokens: int) -> None:
         self.eviction_num_tokens.labels(**self.labels).inc(num_tokens)
 
@@ -1439,3 +1454,9 @@ class RadixCacheMetricsCollector:
 
     def observe_load_back_duration(self, duration_seconds: float) -> None:
         self.load_back_duration_seconds.labels(**self.labels).observe(duration_seconds)
+
+    def set_cache_entry_count(self, count: int) -> None:
+        self.cache_entry_count.labels(**self.labels).set(count)
+
+    def set_cache_total_tokens(self, tokens: int) -> None:
+        self.cache_total_tokens.labels(**self.labels).set(tokens)
