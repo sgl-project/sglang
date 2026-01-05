@@ -456,15 +456,15 @@ class ServerArgs:
             action=StoreBoolean,
             default=ServerArgs.enable_torch_compile,
             help="Use torch.compile to speed up DiT inference."
-                 + "However, will likely cause precision drifts. See (https://github.com/pytorch/pytorch/issues/145213)",
+            + "However, will likely cause precision drifts. See (https://github.com/pytorch/pytorch/issues/145213)",
         )
         parser.add_argument(
             "--enable-warmup",
             action=StoreBoolean,
             default=ServerArgs.enable_warmup,
             help="Perform a 1-step end-to-end warmup request before the actual request. "
-                 "Recommended to enable when benchmarking to ensure fair comparison and best performance."
-                 "When enabled, look for the line ending with `with warmup excluded` for actual processing time.",
+            "Recommended to enable when benchmarking to ensure fair comparison and best performance."
+            "When enabled, look for the line ending with `with warmup excluded` for actual processing time.",
         )
         parser.add_argument(
             "--dit-cpu-offload",
@@ -476,7 +476,7 @@ class ServerArgs:
             action=StoreBoolean,
             default=ServerArgs.dit_layerwise_offload,
             help="Enable layerwise CPU offload with async H2D prefetch overlap for supported DiT models (e.g., Wan). "
-                 "Cannot be used together with cache-dit (SGLANG_CACHE_DIT_ENABLED), dit_cpu_offload, or use_fsdp_inference.",
+            "Cannot be used together with cache-dit (SGLANG_CACHE_DIT_ENABLED), dit_cpu_offload, or use_fsdp_inference.",
         )
         parser.add_argument(
             "--use-fsdp-inference",
@@ -502,7 +502,7 @@ class ServerArgs:
             "--pin-cpu-memory",
             action=StoreBoolean,
             help='Pin memory for CPU offload. Only added as a temp workaround if it throws "CUDA error: invalid argument". '
-                 "Should be enabled in almost all cases",
+            "Should be enabled in almost all cases",
         )
         parser.add_argument(
             "--disable-autocast",
