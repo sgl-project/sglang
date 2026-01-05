@@ -533,9 +533,7 @@ class Scheduler(
                     dp_rank=self.dp_rank,
                 )
         else:
-            DraftWorkerClass = self.spec_algorithm.create_worker(
-                enable_overlap=self.enable_overlap
-            )
+            DraftWorkerClass = self.spec_algorithm.create_worker(self.server_args)
 
             # FIXME: optimize the init draft worker code path
             if DraftWorkerClass is not None:

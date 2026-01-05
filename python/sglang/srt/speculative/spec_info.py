@@ -4,6 +4,8 @@ from abc import ABC, abstractmethod
 from enum import Enum, IntEnum, auto
 from typing import TYPE_CHECKING, List, Optional, Tuple, Type, Union
 
+from sglang.srt.server_args import ServerArgs
+
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ModelWorkerBatch
     from sglang.srt.managers.tp_worker import TpModelWorker
@@ -49,11 +51,12 @@ class SpeculativeAlgorithm(Enum):
         return self.is_eagle() or self.is_standalone()
 
     def create_worker(
-        self, enable_overlap: bool = False
+        self, server_args: ServerArgs
     ) -> Optional[Union[Type[BaseSpecWorker], Type[TpModelWorker], Type[NGRAMWorker]]]:
         if self.is_none():
             return None
 
+        enable_overlap = not server_args.disable_overlap_schedule
         if self.is_eagle():
             if enable_overlap:
                 from sglang.srt.speculative.eagle_worker_v2 import EAGLEWorkerV2
